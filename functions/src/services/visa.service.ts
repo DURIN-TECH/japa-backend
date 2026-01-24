@@ -95,6 +95,7 @@ class VisaService {
       visaTypesCount: 0,
       minProcessingDays: 0,
       minCostUsd: 0,
+      popularityRank: 999, // Default rank for new countries
       createdAt: now,
       updatedAt: now,
     };
@@ -391,6 +392,50 @@ class VisaService {
     return results
       .sort((a, b) => (b.totalApplications || 0) - (a.totalApplications || 0))
       .slice(0, limit);
+  }
+
+  /**
+   * Get all visa types across all countries with optional filtering
+   */
+  async getAllVisaTypes(options?: {
+    category?: VisaCategory;
+    limit?: number;
+    offset?: number;
+  }): Promise<{ visaTypes: VisaType[]; total: number }> {
+    const results: VisaType[] = [];
+    const countries = await this.getCountries();
+
+    for (const country of countries) {
+      let visaTypes: VisaType[];
+      if (options?.category) {
+        visaTypes = await this.getVisaTypesByCategory(
+          country.code,
+          options.category
+        );
+      } else {
+        visaTypes = await this.getVisaTypesByCountry(country.code);
+      }
+      results.push(...visaTypes);
+    }
+
+    // Sort by country popularity rank, then by category
+    results.sort((a, b) => {
+      const countryA = countries.find((c) => c.code === a.countryCode);
+      const countryB = countries.find((c) => c.code === b.countryCode);
+      const rankDiff =
+        (countryA?.popularityRank || 999) - (countryB?.popularityRank || 999);
+      if (rankDiff !== 0) return rankDiff;
+      return a.category.localeCompare(b.category);
+    });
+
+    const total = results.length;
+    const limit = options?.limit || 20;
+    const offset = options?.offset || 0;
+
+    return {
+      visaTypes: results.slice(offset, offset + limit),
+      total,
+    };
   }
 
   /**

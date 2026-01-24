@@ -94,7 +94,8 @@ app.post(
   (req, res) => visaController.createRequirement(req, res)
 );
 
-// Visa Search
+// All Visas & Search
+app.get("/visas", (req, res) => visaController.getAllVisaTypes(req, res));
 app.get("/visas/search", (req, res) =>
   visaController.searchVisaTypes(req, res)
 );
@@ -147,7 +148,7 @@ app.put("/agents/:id/verification", verifyAuth, verifyAdmin, (req, res) =>
 // ============================================
 // ERROR HANDLING
 // ============================================
-app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error("Unhandled error:", err);
   res.status(500).json({
     success: false,

@@ -300,6 +300,27 @@ export class VisaController {
   // ============================================
 
   /**
+   * GET /visas
+   * Get all visa types across all countries with optional filtering
+   */
+  async getAllVisaTypes(req: Request, res: Response): Promise<void> {
+    try {
+      const { category, limit, offset } = req.query;
+
+      const result = await visaService.getAllVisaTypes({
+        category: category as VisaCategory | undefined,
+        limit: limit ? parseInt(limit as string) : undefined,
+        offset: offset ? parseInt(offset as string) : undefined,
+      });
+
+      sendSuccess(res, result);
+    } catch (error) {
+      console.error("Error getting all visa types:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * GET /visas/search
    * Search visa types across all countries
    */
