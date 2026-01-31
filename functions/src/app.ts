@@ -5,6 +5,8 @@ import cors from "cors";
 import { userController } from "./controllers/user.controller";
 import { visaController } from "./controllers/visa.controller";
 import { agentController } from "./controllers/agent.controller";
+import { applicationController } from "./controllers/application.controller";
+import { documentController } from "./controllers/document.controller";
 
 // Middleware
 import { verifyAuth, verifyAdmin } from "./middleware/auth";
@@ -143,6 +145,68 @@ app.post("/agents/:id/reviews", verifyAuth, (req, res) =>
 // Admin endpoints
 app.put("/agents/:id/verification", verifyAuth, verifyAdmin, (req, res) =>
   agentController.updateVerificationStatus(req, res)
+);
+
+// ============================================
+// APPLICATION ROUTES
+// ============================================
+
+// Application CRUD
+app.post("/applications", verifyAuth, (req, res) =>
+  applicationController.createApplication(req, res)
+);
+app.get("/applications", verifyAuth, (req, res) =>
+  applicationController.getApplications(req, res)
+);
+app.get("/applications/:id", verifyAuth, (req, res) =>
+  applicationController.getApplication(req, res)
+);
+app.put("/applications/:id", verifyAuth, (req, res) =>
+  applicationController.updateApplication(req, res)
+);
+app.delete("/applications/:id", verifyAuth, (req, res) =>
+  applicationController.deleteApplication(req, res)
+);
+
+// Application status & timeline
+app.put("/applications/:id/status", verifyAuth, (req, res) =>
+  applicationController.updateStatus(req, res)
+);
+app.get("/applications/:id/timeline", verifyAuth, (req, res) =>
+  applicationController.getTimeline(req, res)
+);
+
+// Application documents
+app.get("/applications/:applicationId/documents", verifyAuth, (req, res) =>
+  documentController.getApplicationDocuments(req, res)
+);
+
+// ============================================
+// DOCUMENT ROUTES
+// ============================================
+
+// Get signed upload URL
+app.post("/documents/upload-url", verifyAuth, (req, res) =>
+  documentController.getUploadUrl(req, res)
+);
+
+// Document CRUD
+app.post("/documents", verifyAuth, (req, res) =>
+  documentController.createDocument(req, res)
+);
+app.get("/documents/:id", verifyAuth, (req, res) =>
+  documentController.getDocument(req, res)
+);
+app.get("/documents/:id/download", verifyAuth, (req, res) =>
+  documentController.getDownloadUrl(req, res)
+);
+app.delete("/documents/:id", verifyAuth, (req, res) =>
+  documentController.deleteDocument(req, res)
+);
+
+// Document status (for agents)
+app.put("/documents/:id/status", verifyAuth, (req, res) =>
+  documentController.updateDocumentStatus(req, res)
 );
 
 // ============================================
