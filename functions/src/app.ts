@@ -7,6 +7,7 @@ import { visaController } from "./controllers/visa.controller";
 import { agentController } from "./controllers/agent.controller";
 import { applicationController } from "./controllers/application.controller";
 import { documentController } from "./controllers/document.controller";
+import { eligibilityController } from "./controllers/eligibility.controller";
 
 // Middleware
 import { verifyAuth, verifyAdmin } from "./middleware/auth";
@@ -208,6 +209,94 @@ app.delete("/documents/:id", verifyAuth, (req, res) =>
 app.put("/documents/:id/status", verifyAuth, (req, res) =>
   documentController.updateDocumentStatus(req, res)
 );
+
+// ============================================
+// ELIGIBILITY ROUTES
+// ============================================
+
+// Pre-check: Does user need a visa?
+app.post("/eligibility/pre-check", (req, res) =>
+  eligibilityController.preCheck(req, res)
+);
+
+// Get eligibility questions for a visa type
+app.get("/eligibility/questions/:visaTypeId", (req, res) =>
+  eligibilityController.getQuestions(req, res)
+);
+
+// Submit eligibility check
+app.post("/eligibility/check", verifyAuth, (req, res) =>
+  eligibilityController.submitCheck(req, res)
+);
+
+// Get user's eligibility check history
+app.get("/eligibility/checks", verifyAuth, (req, res) =>
+  eligibilityController.getUserChecks(req, res)
+);
+
+// Get a specific eligibility check
+app.get("/eligibility/checks/:checkId", verifyAuth, (req, res) =>
+  eligibilityController.getCheck(req, res)
+);
+
+// Get latest check for a visa type
+app.get("/eligibility/checks/latest/:visaTypeId", verifyAuth, (req, res) =>
+  eligibilityController.getLatestCheck(req, res)
+);
+
+// Admin: List all questions
+app.get("/admin/eligibility/questions", verifyAuth, verifyAdmin, (req, res) =>
+  eligibilityController.listQuestions(req, res)
+);
+
+// Admin: Create eligibility question
+app.post("/admin/eligibility/questions", verifyAuth, verifyAdmin, (req, res) =>
+  eligibilityController.createQuestion(req, res)
+);
+
+// Admin: Update a question
+app.put("/admin/eligibility/questions/:questionId", verifyAuth, verifyAdmin, (req, res) =>
+  eligibilityController.updateQuestion(req, res)
+);
+
+// Admin: Delete a question
+app.delete("/admin/eligibility/questions/:questionId", verifyAuth, verifyAdmin, (req, res) =>
+  eligibilityController.deleteQuestion(req, res)
+);
+
+// Admin: Seed questions for a visa type
+app.post("/admin/eligibility/seed", verifyAuth, verifyAdmin, (req, res) =>
+  eligibilityController.seedQuestions(req, res)
+);
+
+// Admin: Seed Nigeria → Ireland questions
+app.post("/admin/eligibility/seed/nigeria-ireland", verifyAuth, verifyAdmin, (req, res) =>
+  eligibilityController.seedNigeriaIreland(req, res)
+);
+
+// DEV ONLY: Seed endpoints without auth (remove in production!)
+app.post("/dev/seed/eligibility", async (req, res) => {
+  if (process.env.NODE_ENV === "production") {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  await eligibilityController.seedNigeriaIreland(req as any, res);
+});
+
+app.post("/dev/seed/ireland-visa", async (req, res) => {
+  if (process.env.NODE_ENV === "production") {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  try {
+    const { seedIrelandVisaData } = await import("./data/seed-ireland-visa");
+    const result = await seedIrelandVisaData();
+    res.json({ success: true, data: result, message: "Ireland visa data seeded" });
+  } catch (error) {
+    console.error("Seed error:", error);
+    res.status(500).json({ success: false, error: String(error) });
+  }
+});
 
 // ============================================
 // ERROR HANDLING

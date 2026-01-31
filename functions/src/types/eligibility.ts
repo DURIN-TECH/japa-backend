@@ -116,11 +116,13 @@ export interface EligibilityAnswer {
   answer: string | string[] | number | boolean;
 }
 
+export type TravelPurpose = "tourism" | "business" | "work" | "study" | "family" | "transit" | "other";
+
 export interface EligibilityCheckInput {
   visaTypeId: string;
   countryCode: string;       // Destination country
   nationality: string;       // Applicant's nationality
-  travelPurpose?: string;    // tourism, business, work, study, etc.
+  travelPurpose?: TravelPurpose;
   answers: EligibilityAnswer[];
 }
 
@@ -194,7 +196,7 @@ export interface EligibilityResult {
 export interface VisaPreCheckInput {
   nationality: string;
   destinationCountry: string;
-  travelPurpose: "tourism" | "business" | "work" | "study" | "family" | "transit" | "other";
+  travelPurpose: TravelPurpose;
   intendedStayDays?: number;
 }
 

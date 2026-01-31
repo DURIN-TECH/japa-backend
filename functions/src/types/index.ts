@@ -1,5 +1,8 @@
 import { Timestamp } from "firebase-admin/firestore";
 
+// Re-export eligibility types
+export * from "./eligibility";
+
 // ============================================
 // USER TYPES
 // ============================================
@@ -133,39 +136,43 @@ export interface Country {
 export interface VisaType {
   id: string;
   countryCode: string;
-  
+
   // Basic info
   name: string; // e.g., "H-1B Work Visa"
   code: string; // e.g., "H1B"
   description: string;
   category: VisaCategory;
-  
+
   // Timing & Cost
   processingTime: string; // e.g., "6-8 months"
   processingDaysMin: number;
   processingDaysMax: number;
   baseCostUsd: number; // Government fees
-  
+
   // Validity
   validityPeriod: string; // e.g., "3 years"
   isExtendable: boolean;
   maxExtensions?: number;
-  
+
   // Eligibility
   eligibilityCriteria: string[];
-  
+
+  // Official application
+  applicationUrl?: string; // URL to official online application form (e.g., AVATS for Ireland)
+  applicationInstructions?: string; // Brief instructions for completing official application
+
   // Stats
   successRate?: number;
   totalApplications?: number;
-  
+
   // Availability
   isActive: boolean;
   quotaLimit?: number;
   currentQuotaUsed?: number;
-  
+
   // Agents who handle this visa
   agentIds: string[];
-  
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }

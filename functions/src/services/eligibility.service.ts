@@ -5,6 +5,10 @@ import {
   EligibilityCheckInput,
   EligibilityResult,
   EligibilityAnswer,
+  VisaPreCheckInput,
+  VisaPreCheckResult,
+  VisaExemption,
+  VisaRequirementType,
 } from "../types/eligibility";
 import { VisaCategory } from "../types";
 
@@ -13,34 +17,216 @@ const db = getFirestore();
 export class EligibilityService {
   private questionsCollection = db.collection("eligibilityQuestions");
   private checksCollection = db.collection("eligibilityChecks");
+  private exemptionsCollection = db.collection("visaExemptions");
+
+  /**
+   * Pre-check: Does the user need a visa at all?
+   * Checks the exemptions matrix based on nationality and destination
+   */
+  async preCheck(input: VisaPreCheckInput): Promise<VisaPreCheckResult> {
+    const { nationality, destinationCountry, travelPurpose, intendedStayDays } = input;
+
+    // Look up exemption for this nationality → destination
+    const exemptionSnapshot = await this.exemptionsCollection
+      .where("nationality", "==", nationality)
+      .where("destinationCountry", "==", destinationCountry)
+      .limit(1)
+      .get();
+
+    if (exemptionSnapshot.empty) {
+      // No exemption found - assume visa required
+      return this.getVisaRequiredResult(destinationCountry, travelPurpose);
+    }
+
+    const exemption = {
+      id: exemptionSnapshot.docs[0].id,
+      ...exemptionSnapshot.docs[0].data(),
+    } as VisaExemption;
+
+    // Check if purpose is allowed for visa-free entry
+    const purposeAllowed = !exemption.purposesAllowed ||
+      exemption.purposesAllowed.includes(travelPurpose);
+
+    // Check if stay duration exceeds visa-free limit
+    const stayExceedsLimit = intendedStayDays &&
+      exemption.maxStayDays &&
+      intendedStayDays > exemption.maxStayDays;
+
+    // Check if work/study requires permit even for visa-free countries
+    const needsWorkPermit = travelPurpose === "work" && exemption.workPermitRequired;
+    const needsStudyPermit = travelPurpose === "study" && exemption.studyPermitRequired;
+
+    const visaRequired = exemption.requirementType === "visa_required" ||
+      !purposeAllowed ||
+      stayExceedsLimit ||
+      needsWorkPermit ||
+      needsStudyPermit;
+
+    const warnings: string[] = [];
+    if (stayExceedsLimit) {
+      warnings.push(`Your intended stay of ${intendedStayDays} days exceeds the visa-free limit of ${exemption.maxStayDays} days.`);
+    }
+    if (needsWorkPermit) {
+      warnings.push("Work authorization is required even for visa-free nationalities.");
+    }
+    if (needsStudyPermit) {
+      warnings.push("A study permit is required even for visa-free nationalities.");
+    }
+
+    if (!visaRequired) {
+      // User doesn't need a visa
+      return {
+        visaRequired: false,
+        requirementType: exemption.requirementType,
+        maxStayDays: exemption.maxStayDays,
+        conditions: exemption.conditions,
+        warnings: warnings.length > 0 ? warnings : undefined,
+        nextSteps: [
+          `You can enter ${destinationCountry} without a visa for up to ${exemption.maxStayDays} days.`,
+          "Ensure your passport is valid for at least 6 months.",
+          ...(exemption.conditions || []),
+        ],
+      };
+    }
+
+    // Visa is required - get recommended visa types
+    return this.getVisaRequiredResult(destinationCountry, travelPurpose, warnings);
+  }
+
+  private async getVisaRequiredResult(
+    destinationCountry: string,
+    travelPurpose: string,
+    warnings?: string[]
+  ): Promise<VisaPreCheckResult> {
+    // Get recommended visa types for this purpose and country
+    const visaTypesSnapshot = await db.collection("visaTypes")
+      .where("countryCode", "==", destinationCountry)
+      .where("isActive", "==", true)
+      .get();
+
+    const recommendedVisas = visaTypesSnapshot.docs
+      .map((doc) => {
+        const data = doc.data();
+        // Filter by category matching travel purpose
+        const purposeToCategory: Record<string, string[]> = {
+          tourism: ["tourist", "visitor"],
+          business: ["business", "visitor"],
+          work: ["work"],
+          study: ["student"],
+          family: ["family"],
+          transit: ["transit"],
+        };
+        const matchingCategories = purposeToCategory[travelPurpose] || [];
+        if (!matchingCategories.includes(data.category)) {
+          return null;
+        }
+        return {
+          id: doc.id,
+          name: data.name,
+          description: data.description,
+          processingTime: data.processingTime,
+          baseCostUsd: data.baseCostUsd,
+        };
+      })
+      .filter(Boolean)
+      .slice(0, 3) as VisaPreCheckResult["recommendedVisaTypes"];
+
+    return {
+      visaRequired: true,
+      requirementType: "visa_required" as VisaRequirementType,
+      warnings,
+      recommendedVisaTypes: recommendedVisas,
+      nextSteps: [
+        "Review the recommended visa types below.",
+        "Check your eligibility before applying.",
+        "Gather required documents.",
+        "Submit your application online or through an agent.",
+      ],
+    };
+  }
 
   /**
    * Get eligibility questions for a visa type
-   * Combines: common + category-specific + visa-specific questions
+   * Combines: common + category + country + nationality + visa-specific questions
+   * Filters by nationality if provided
    */
-  async getQuestions(visaTypeId: string): Promise<EligibilityQuestion[]> {
-    // Get the visa type to know its category
+  async getQuestions(
+    visaTypeId: string,
+    nationality?: string,
+    destinationCountry?: string
+  ): Promise<EligibilityQuestion[]> {
+    // Get the visa type to know its category and country
     const visaDoc = await db.collection("visaTypes").doc(visaTypeId).get();
     const visaData = visaDoc.data();
     const category = visaData?.category as VisaCategory | undefined;
+    const countryCode = destinationCountry || visaData?.countryCode as string | undefined;
+
+    // Build list of scopes to query
+    const scopes: string[] = [
+      "common",
+    ];
+
+    if (category) {
+      scopes.push(`category:${category}`);
+    }
+
+    if (countryCode) {
+      scopes.push(`country:${countryCode}`);
+    }
+
+    if (nationality) {
+      scopes.push(`nationality:${nationality}`);
+      if (countryCode) {
+        scopes.push(`nationality:${nationality}:${countryCode}`);
+      }
+    }
+
+    scopes.push(`visa:${visaTypeId}`);
 
     // Fetch all applicable questions in parallel
-    const [commonQuestions, categoryQuestions, visaQuestions] = await Promise.all([
-      this.getQuestionsByScope("common"),
-      category ? this.getQuestionsByScope(`category:${category}`) : Promise.resolve([]),
-      this.getQuestionsByScope(`visa:${visaTypeId}`),
-    ]);
+    const questionPromises = scopes.map((scope) => this.getQuestionsByScope(scope));
+    const questionArrays = await Promise.all(questionPromises);
 
-    // Merge and sort by orderIndex
-    const allQuestions = [...commonQuestions, ...categoryQuestions, ...visaQuestions];
+    // Flatten and deduplicate by ID
+    const questionMap = new Map<string, EligibilityQuestion>();
+    for (const questions of questionArrays) {
+      for (const q of questions) {
+        // Apply nationality filters if question has them
+        if (q.applicableNationalities && q.applicableNationalities.length > 0) {
+          if (!nationality || !q.applicableNationalities.includes(nationality)) {
+            continue; // Skip this question - not for this nationality
+          }
+        }
+        if (q.excludedNationalities && q.excludedNationalities.length > 0) {
+          if (nationality && q.excludedNationalities.includes(nationality)) {
+            continue; // Skip this question - excluded for this nationality
+          }
+        }
+        questionMap.set(q.id, q);
+      }
+    }
+
+    const allQuestions = Array.from(questionMap.values());
 
     // If no questions found at all, return defaults
     if (allQuestions.length === 0) {
       return this.getDefaultQuestions(visaTypeId, category);
     }
 
-    // Sort by orderIndex and return
-    return allQuestions.sort((a, b) => a.orderIndex - b.orderIndex);
+    // Sort by orderIndex and limit to reasonable number (5-8)
+    const sorted = allQuestions.sort((a, b) => a.orderIndex - b.orderIndex);
+
+    // Take top questions, prioritizing required ones
+    const required = sorted.filter((q) => q.isRequired);
+    const optional = sorted.filter((q) => !q.isRequired);
+
+    // Return up to 8 questions, prioritizing required
+    const maxQuestions = 8;
+    if (required.length >= maxQuestions) {
+      return required.slice(0, maxQuestions);
+    }
+
+    return [...required, ...optional.slice(0, maxQuestions - required.length)];
   }
 
   /**
@@ -452,13 +638,32 @@ export class EligibilityService {
     userId: string,
     input: EligibilityCheckInput
   ): Promise<EligibilityCheck> {
-    const { visaTypeId, countryCode, answers } = input;
+    const { visaTypeId, countryCode, nationality, travelPurpose, answers } = input;
 
-    // Get questions for this visa type
-    const questions = await this.getQuestions(visaTypeId);
+    // First, do a pre-check to see if visa is required
+    const preCheckResult = await this.preCheck({
+      nationality,
+      destinationCountry: countryCode,
+      travelPurpose: travelPurpose || "tourism",
+    });
+
+    // Get questions for this visa type, filtered by nationality
+    const questions = await this.getQuestions(visaTypeId, nationality, countryCode);
 
     // Calculate score and build breakdown
     const result = this.calculateScore(questions, answers);
+
+    // Determine suggested path
+    let suggestedPath: "self_service" | "agent_assisted" | "not_eligible" | "visa_free";
+    if (!preCheckResult.visaRequired) {
+      suggestedPath = "visa_free";
+    } else if (result.eligibilityLevel === "high") {
+      suggestedPath = "self_service";
+    } else if (result.eligibilityLevel === "medium") {
+      suggestedPath = "agent_assisted";
+    } else {
+      suggestedPath = "not_eligible";
+    }
 
     // Save the check
     const now = Timestamp.now();
@@ -468,12 +673,20 @@ export class EligibilityService {
       userId,
       visaTypeId,
       countryCode,
+      nationality,
+      visaRequired: preCheckResult.visaRequired,
+      visaRequirementType: preCheckResult.requirementType,
+      exemptionDetails: !preCheckResult.visaRequired ? {
+        maxStayDays: preCheckResult.maxStayDays,
+        conditions: preCheckResult.conditions,
+      } : undefined,
       score: result.score,
-      eligibilityLevel: result.eligibilityLevel,
+      eligibilityLevel: preCheckResult.visaRequired ? result.eligibilityLevel : "not_applicable",
       answers,
       breakdown: result.breakdown,
-      recommendations: result.recommendations,
+      recommendations: preCheckResult.visaRequired ? result.recommendations : preCheckResult.nextSteps,
       missingRequirements: result.missingRequirements,
+      suggestedPath,
       createdAt: now,
     };
 
@@ -620,12 +833,25 @@ export class EligibilityService {
       );
     }
 
+    // Determine suggested path based on eligibility level
+    let suggestedPath: "self_service" | "agent_assisted" | "not_eligible" | "visa_free";
+    if (eligibilityLevel === "high") {
+      suggestedPath = "self_service";
+    } else if (eligibilityLevel === "medium") {
+      suggestedPath = "agent_assisted";
+    } else {
+      suggestedPath = "not_eligible";
+    }
+
     return {
+      visaRequired: true,
+      visaRequirementType: "visa_required" as VisaRequirementType,
       score,
       eligibilityLevel,
       breakdown,
       recommendations,
       missingRequirements,
+      suggestedPath,
     };
   }
 
@@ -732,6 +958,84 @@ export class EligibilityService {
       id: doc.id,
       ...doc.data(),
     } as EligibilityCheck;
+  }
+
+  /**
+   * Seed Nigeria → Ireland eligibility questions
+   * Admin function to populate the database with initial data
+   */
+  async seedNigeriaIreland(): Promise<{ questionsSeeded: number; exemptionsSeeded: number }> {
+    const { seedNigeriaIrelandEligibility } = await import("../data/eligibility-seed-nigeria-ireland");
+    return seedNigeriaIrelandEligibility();
+  }
+
+  /**
+   * Get all questions (for admin listing)
+   */
+  async getAllQuestions(options?: {
+    scope?: string;
+    isActive?: boolean;
+    limit?: number;
+  }): Promise<EligibilityQuestion[]> {
+    let query = this.questionsCollection.orderBy("orderIndex", "asc");
+
+    if (options?.scope) {
+      query = query.where("scope", "==", options.scope) as typeof query;
+    }
+
+    if (options?.isActive !== undefined) {
+      query = query.where("isActive", "==", options.isActive) as typeof query;
+    }
+
+    if (options?.limit) {
+      query = query.limit(options.limit);
+    }
+
+    const snapshot = await query.get();
+
+    return snapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    })) as EligibilityQuestion[];
+  }
+
+  /**
+   * Update a question (admin)
+   */
+  async updateQuestion(
+    questionId: string,
+    updates: Partial<Omit<EligibilityQuestion, "id" | "createdAt">>
+  ): Promise<EligibilityQuestion | null> {
+    const docRef = this.questionsCollection.doc(questionId);
+    const doc = await docRef.get();
+
+    if (!doc.exists) return null;
+
+    const updateData = {
+      ...updates,
+      updatedAt: Timestamp.now(),
+    };
+
+    await docRef.update(updateData);
+
+    return {
+      id: doc.id,
+      ...doc.data(),
+      ...updateData,
+    } as EligibilityQuestion;
+  }
+
+  /**
+   * Delete a question (admin)
+   */
+  async deleteQuestion(questionId: string): Promise<boolean> {
+    const docRef = this.questionsCollection.doc(questionId);
+    const doc = await docRef.get();
+
+    if (!doc.exists) return false;
+
+    await docRef.delete();
+    return true;
   }
 }
 
