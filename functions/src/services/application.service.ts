@@ -53,6 +53,30 @@ class ApplicationService {
       0
     );
 
+    // Look up user and country for denormalized fields
+    const [userDoc, country] = await Promise.all([
+      collections.users.doc(userId).get(),
+      visaService.getCountryByCode(input.countryCode),
+    ]);
+
+    const userData = userDoc.exists ? userDoc.data() : null;
+    const clientName = userData
+      ? `${userData.firstName || ""} ${userData.lastName || ""}`.trim()
+      : "";
+    const clientEmail = userData?.email || "";
+
+    // Resolve agencyId from the agent if mode is "agent"
+    let agencyId: string | undefined;
+    if (input.agentId) {
+      const agentSnapshot = await collections.agents
+        .where("userId", "==", input.agentId)
+        .limit(1)
+        .get();
+      if (!agentSnapshot.empty) {
+        agencyId = (agentSnapshot.docs[0].data()).agencyId;
+      }
+    }
+
     const docRef = collections.applications.doc();
     const now = Timestamp.now();
 
@@ -63,6 +87,7 @@ class ApplicationService {
       countryCode: input.countryCode,
       mode: input.mode,
       agentId: input.agentId,
+      agencyId,
       status: "draft",
       progress: 0,
       currentStep: "Getting started",
@@ -77,6 +102,11 @@ class ApplicationService {
       amountPaid: 0,
       paymentStatus: "pending",
       userNotes: input.userNotes,
+      // Denormalized fields for read performance
+      clientName,
+      clientEmail,
+      visaTypeName: visaType.name,
+      countryName: country?.name || input.countryCode,
       createdAt: now,
       updatedAt: now,
     };
@@ -129,6 +159,41 @@ class ApplicationService {
     const snapshot = await collections.applications
       .where("userId", "==", userId)
       .where("status", "==", status)
+      .orderBy("updatedAt", "desc")
+      .get();
+
+    return snapshot.docs.map((doc) => doc.data() as Application);
+  }
+
+  /**
+   * Get all applications assigned to an agent (by agent's userId)
+   */
+  async getAgentApplications(agentUserId: string): Promise<Application[]> {
+    const snapshot = await collections.applications
+      .where("agentId", "==", agentUserId)
+      .orderBy("updatedAt", "desc")
+      .get();
+
+    return snapshot.docs.map((doc) => doc.data() as Application);
+  }
+
+  /**
+   * Get all applications for an agency (agency owner sees all agency cases)
+   */
+  async getAgencyApplications(agencyId: string): Promise<Application[]> {
+    const snapshot = await collections.applications
+      .where("agencyId", "==", agencyId)
+      .orderBy("updatedAt", "desc")
+      .get();
+
+    return snapshot.docs.map((doc) => doc.data() as Application);
+  }
+
+  /**
+   * Get all applications (admin only)
+   */
+  async getAllApplications(): Promise<Application[]> {
+    const snapshot = await collections.applications
       .orderBy("updatedAt", "desc")
       .get();
 
