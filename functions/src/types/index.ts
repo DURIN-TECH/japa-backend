@@ -45,53 +45,111 @@ export interface Address {
 }
 
 // ============================================
+// AGENCY TYPES
+// ============================================
+
+export type AgencyMemberRole = "owner" | "agent";
+
+export type AgencyInvitationStatus = "pending" | "accepted" | "declined" | "expired";
+
+export interface AgencyService {
+  id: string;
+  name: string;
+  price: number; // In cents
+}
+
+export interface Agency {
+  id: string;
+  name: string;
+  ownerId: string; // userId of the creator/owner
+  ownerName: string; // Denormalized for display
+
+  // Profile
+  address?: string;
+  state?: string;
+  description?: string;
+  logoUrl?: string;
+
+  // Pricing
+  consultationFee?: number; // In cents (agency-level default)
+
+  // Embedded services (small bounded list)
+  services: AgencyService[];
+
+  // Denormalized stats (updated via triggers/service calls)
+  totalAgents: number;
+  totalCases: number;
+  activeCases: number;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+export interface AgencyInvitation {
+  id: string;
+  agencyId: string;
+  agencyName: string; // Denormalized for display
+  invitedBy: string; // userId of inviter
+  invitedByName: string; // Denormalized
+  invitedEmail: string;
+  invitedAgentId?: string; // Set if agent already exists on platform
+  status: AgencyInvitationStatus;
+  createdAt: Timestamp;
+  expiresAt: Timestamp;
+}
+
+// ============================================
 // AGENT TYPES
 // ============================================
 
-export type AgentVerificationStatus = 
-  | "pending" 
-  | "under_review" 
-  | "verified" 
-  | "rejected" 
+export type AgentVerificationStatus =
+  | "pending"
+  | "under_review"
+  | "verified"
+  | "rejected"
   | "suspended";
 
 export interface Agent {
   id: string;
   userId: string; // Reference to user account
-  
+
+  // Agency membership (null = independent agent)
+  agencyId?: string;
+  agencyRole?: AgencyMemberRole;
+
   // Profile
   displayName: string;
   bio: string;
   profilePhotoUrl?: string;
-  
+
   // Professional info
   licenseNumber?: string;
   yearsOfExperience: number;
   specializations: string[]; // e.g., ["Student Visa", "Work Visa"]
   languages: string[];
   featuredVisas: string[]; // Visa type IDs they specialize in
-  
+
   // Verification
   verificationStatus: AgentVerificationStatus;
   verificationDocuments?: string[]; // Storage URLs
   verifiedAt?: Timestamp;
   verifiedBy?: string; // Admin user ID
-  
+
   // Ratings & Stats
   rating: number; // Average rating (1-5)
   totalReviews: number;
   totalApplications: number;
   successRate: number; // Percentage
   responseTime: string; // e.g., "24-48 hours"
-  
+
   // Pricing
   consultationFee: number; // In cents
   serviceFees: Record<string, number>; // visaTypeId -> fee in cents
-  
+
   // Availability
   isAvailable: boolean;
   availableSlots?: AvailabilitySlot[];
-  
+
   // Metadata
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -243,11 +301,12 @@ export interface Application {
   userId: string;
   visaTypeId: string;
   countryCode: string;
-  
+
   // Mode
   mode: ApplicationMode;
   agentId?: string;
-  
+  agencyId?: string; // Cases belong to the agency, not the individual agent
+
   // Status & Progress
   status: ApplicationStatus;
   progress: number; // 0-100
@@ -276,7 +335,13 @@ export interface Application {
   userNotes?: string;
   agentNotes?: string;
   rejectionReason?: string;
-  
+
+  // Denormalized fields (colocated for read performance)
+  clientName?: string;
+  clientEmail?: string;
+  visaTypeName?: string;
+  countryName?: string;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -303,6 +368,23 @@ export interface ApplicationTimeline {
   responsibility: "user" | "agent" | "embassy" | "system";
   
   createdAt: Timestamp;
+}
+
+// ============================================
+// APPLICATION NOTE TYPES
+// ============================================
+
+export type NoteAuthorRole = "agent" | "owner" | "admin" | "system";
+
+export interface ApplicationNote {
+  id: string;
+  applicationId: string;
+  authorId: string;
+  authorName: string; // Denormalized to avoid user lookups
+  authorRole: NoteAuthorRole;
+  content: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
 }
 
 // ============================================
