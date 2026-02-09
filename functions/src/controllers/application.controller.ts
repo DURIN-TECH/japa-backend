@@ -1,6 +1,7 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { applicationService } from "../services/application.service";
+import { collections } from "../utils/firebase";
 import {
   sendSuccess,
   sendError,
@@ -8,7 +9,7 @@ import {
   sendNoContent,
   ErrorMessages,
 } from "../utils/response";
-import { ApplicationStatus } from "../types";
+import { Application, ApplicationStatus, Agent } from "../types";
 
 export class ApplicationController {
   /**
@@ -77,7 +78,11 @@ export class ApplicationController {
 
   /**
    * GET /applications
-   * Get all applications for the current user
+   * Get applications based on role:
+   *   ?role=agent  → cases assigned to this agent
+   *   ?role=owner  → all cases in the agent's agency
+   *   ?role=admin  → all cases (admin only)
+   *   (default)    → cases owned by this user (applicant view)
    */
   async getApplications(
     req: AuthenticatedRequest,
@@ -85,16 +90,38 @@ export class ApplicationController {
   ): Promise<void> {
     try {
       const userId = req.userId!;
-      const { status } = req.query;
+      const { status, role } = req.query;
 
-      let applications;
-      if (status && typeof status === "string") {
-        applications = await applicationService.getApplicationsByStatus(
-          userId,
-          status as ApplicationStatus
-        );
+      let applications: Application[];
+
+      if (role === "admin") {
+        // Admin: see everything
+        if (!req.user?.admin) {
+          sendError(res, "FORBIDDEN", "Admin access required", 403);
+          return;
+        }
+        applications = await applicationService.getAllApplications();
+      } else if (role === "owner") {
+        // Agency owner: see all agency cases
+        const agent = await this.getAgentForUser(userId);
+        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+          sendError(res, "FORBIDDEN", "Agency owner access required", 403);
+          return;
+        }
+        applications = await applicationService.getAgencyApplications(agent.agencyId);
+      } else if (role === "agent") {
+        // Agent: see cases assigned to them
+        applications = await applicationService.getAgentApplications(userId);
       } else {
-        applications = await applicationService.getUserApplications(userId);
+        // Default: applicant's own applications
+        if (status && typeof status === "string") {
+          applications = await applicationService.getApplicationsByStatus(
+            userId,
+            status as ApplicationStatus
+          );
+        } else {
+          applications = await applicationService.getUserApplications(userId);
+        }
       }
 
       sendSuccess(res, applications);
@@ -106,7 +133,8 @@ export class ApplicationController {
 
   /**
    * GET /applications/:id
-   * Get a specific application
+   * Get a specific application.
+   * Access: owner, assigned agent, same-agency member, or admin.
    */
   async getApplication(
     req: AuthenticatedRequest,
@@ -123,8 +151,8 @@ export class ApplicationController {
         return;
       }
 
-      // Check ownership
-      if (application.userId !== userId) {
+      const hasAccess = await this.checkApplicationAccess(userId, application, req.user?.admin);
+      if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
@@ -138,7 +166,8 @@ export class ApplicationController {
 
   /**
    * PUT /applications/:id
-   * Update an application
+   * Update an application.
+   * Owner can update userNotes. Agent/owner can update agentNotes.
    */
   async updateApplication(
     req: AuthenticatedRequest,
@@ -147,7 +176,7 @@ export class ApplicationController {
     try {
       const userId = req.userId!;
       const { id } = req.params;
-      const { userNotes } = req.body;
+      const { userNotes, agentNotes } = req.body;
 
       const application = await applicationService.getApplicationById(id);
 
@@ -156,16 +185,25 @@ export class ApplicationController {
         return;
       }
 
-      // Check ownership
-      if (application.userId !== userId) {
+      const hasAccess = await this.checkApplicationAccess(userId, application, req.user?.admin);
+      if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
 
-      const updated = await applicationService.updateApplication(id, {
-        userNotes,
-      });
+      const isOwner = application.userId === userId;
+      const updates: { userNotes?: string; agentNotes?: string } = {};
 
+      // Only the applicant can update userNotes
+      if (userNotes !== undefined && isOwner) {
+        updates.userNotes = userNotes;
+      }
+      // Agents/agency members can update agentNotes
+      if (agentNotes !== undefined && !isOwner) {
+        updates.agentNotes = agentNotes;
+      }
+
+      const updated = await applicationService.updateApplication(id, updates);
       sendSuccess(res, updated, "Application updated successfully");
     } catch (error) {
       console.error("Error updating application:", error);
@@ -192,8 +230,8 @@ export class ApplicationController {
         return;
       }
 
-      // Check ownership
-      if (application.userId !== userId) {
+      // Only the applicant or admin can delete
+      if (application.userId !== userId && !req.user?.admin) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
@@ -212,7 +250,8 @@ export class ApplicationController {
 
   /**
    * PUT /applications/:id/status
-   * Update application status (admin/agent only for most statuses)
+   * Update application status.
+   * Owner can only withdraw. Agent/admin can set any status.
    */
   async updateStatus(
     req: AuthenticatedRequest,
@@ -235,25 +274,27 @@ export class ApplicationController {
         return;
       }
 
-      // Check ownership or agent/admin permissions
-      const isOwner = application.userId === userId;
-      const isAgent = application.agentId === userId;
+      const isApplicant = application.userId === userId;
+      const isAdmin = !!req.user?.admin;
+      const hasAccess = await this.checkApplicationAccess(userId, application, isAdmin);
 
-      // Users can only withdraw their own applications
-      if (!isOwner && !isAgent) {
+      if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
 
-      // Users can only set status to 'withdrawn'
-      if (isOwner && !isAgent && status !== "withdrawn") {
-        sendError(
-          res,
-          "FORBIDDEN",
-          "You can only withdraw your application",
-          403
-        );
-        return;
+      // Applicants can only withdraw their own applications
+      if (isApplicant && !isAdmin && status !== "withdrawn") {
+        const isAgentToo = application.agentId === userId;
+        if (!isAgentToo) {
+          sendError(
+            res,
+            "FORBIDDEN",
+            "You can only withdraw your application",
+            403
+          );
+          return;
+        }
       }
 
       const updated = await applicationService.updateStatus(id, status, {
@@ -288,8 +329,8 @@ export class ApplicationController {
         return;
       }
 
-      // Check ownership
-      if (application.userId !== userId && application.agentId !== userId) {
+      const hasAccess = await this.checkApplicationAccess(userId, application, req.user?.admin);
+      if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
@@ -300,6 +341,49 @@ export class ApplicationController {
       console.error("Error getting timeline:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
+  }
+
+  // ============================================
+  // HELPER METHODS
+  // ============================================
+
+  /**
+   * Check if a user has access to an application.
+   * Access is granted if:
+   * - User is the applicant (userId)
+   * - User is the assigned agent (agentId)
+   * - User belongs to the same agency (agencyId)
+   * - User is an admin
+   */
+  private async checkApplicationAccess(
+    userId: string,
+    application: Application,
+    isAdmin?: boolean
+  ): Promise<boolean> {
+    if (isAdmin) return true;
+    if (application.userId === userId) return true;
+    if (application.agentId === userId) return true;
+
+    // Check if user belongs to the same agency
+    if (application.agencyId) {
+      const agent = await this.getAgentForUser(userId);
+      if (agent?.agencyId === application.agencyId) return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Get agent document for a userId
+   */
+  private async getAgentForUser(userId: string): Promise<Agent | null> {
+    const snapshot = await collections.agents
+      .where("userId", "==", userId)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) return null;
+    return snapshot.docs[0].data() as Agent;
   }
 }
 
