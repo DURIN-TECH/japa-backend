@@ -6,6 +6,8 @@ import { userController } from "./controllers/user.controller";
 import { visaController } from "./controllers/visa.controller";
 import { agentController } from "./controllers/agent.controller";
 import { applicationController } from "./controllers/application.controller";
+import { agencyController } from "./controllers/agency.controller";
+import { noteController } from "./controllers/note.controller";
 import { documentController } from "./controllers/document.controller";
 import { eligibilityController } from "./controllers/eligibility.controller";
 
@@ -149,6 +151,53 @@ app.put("/agents/:id/verification", verifyAuth, verifyAdmin, (req, res) =>
 );
 
 // ============================================
+// AGENCY ROUTES
+// ============================================
+
+// Agency CRUD
+app.post("/agencies", verifyAuth, (req, res) =>
+  agencyController.createAgency(req, res)
+);
+app.get("/agencies/me", verifyAuth, (req, res) =>
+  agencyController.getMyAgency(req, res)
+);
+app.put("/agencies/me", verifyAuth, (req, res) =>
+  agencyController.updateMyAgency(req, res)
+);
+
+// Agency members
+app.get("/agencies/:id/members", verifyAuth, (req, res) =>
+  agencyController.getMembers(req, res)
+);
+app.post("/agencies/:id/members", verifyAuth, (req, res) =>
+  agencyController.addMember(req, res)
+);
+app.delete("/agencies/:id/members/:agentId", verifyAuth, (req, res) =>
+  agencyController.removeMember(req, res)
+);
+
+// Agency invitations
+app.post("/agencies/:id/invitations", verifyAuth, (req, res) =>
+  agencyController.inviteAgent(req, res)
+);
+app.get("/agencies/:id/invitations", verifyAuth, (req, res) =>
+  agencyController.getInvitations(req, res)
+);
+
+// Invitation actions (top-level routes since invitations have their own IDs)
+app.post("/invitations/:id/accept", verifyAuth, (req, res) =>
+  agencyController.acceptInvitation(req, res)
+);
+app.post("/invitations/:id/decline", verifyAuth, (req, res) =>
+  agencyController.declineInvitation(req, res)
+);
+
+// Admin: list all agencies
+app.get("/agencies", verifyAuth, verifyAdmin, (req, res) =>
+  agencyController.getAllAgencies(req, res)
+);
+
+// ============================================
 // APPLICATION ROUTES
 // ============================================
 
@@ -175,6 +224,20 @@ app.put("/applications/:id/status", verifyAuth, (req, res) =>
 );
 app.get("/applications/:id/timeline", verifyAuth, (req, res) =>
   applicationController.getTimeline(req, res)
+);
+
+// Application notes
+app.get("/applications/:id/notes", verifyAuth, (req, res) =>
+  noteController.getNotes(req, res)
+);
+app.post("/applications/:id/notes", verifyAuth, (req, res) =>
+  noteController.addNote(req, res)
+);
+app.put("/applications/:id/notes/:noteId", verifyAuth, (req, res) =>
+  noteController.updateNote(req, res)
+);
+app.delete("/applications/:id/notes/:noteId", verifyAuth, (req, res) =>
+  noteController.deleteNote(req, res)
 );
 
 // Application documents
