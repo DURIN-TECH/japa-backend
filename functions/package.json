@@ -13,6 +13,8 @@
     "logs": "firebase functions:log",
     "seed": "npm run build && node lib/scripts/seed-questions.js",
     "seed:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-questions.js",
+    "seed:portal": "npm run build && node lib/scripts/seed-portal.js",
+    "seed:portal:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-portal.js",
     "lint": "eslint --ext .ts src/",
     "lint:fix": "eslint --ext .ts src/ --fix",
     "clean": "rm -rf lib"
