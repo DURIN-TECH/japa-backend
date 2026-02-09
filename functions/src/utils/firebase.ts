@@ -19,6 +19,8 @@ export const messaging = admin.messaging();
 export const collections = {
   users: db.collection("users"),
   agents: db.collection("agents"),
+  agencies: db.collection("agencies"),
+  agencyInvitations: db.collection("agencyInvitations"),
   countries: db.collection("countries"),
   applications: db.collection("applications"),
   consultations: db.collection("consultations"),
@@ -53,6 +55,10 @@ export const subcollections = {
   reviews: (agentId: string) =>
     collections.agents.doc(agentId).collection("reviews"),
   
+  // Notes under applications
+  notes: (applicationId: string) =>
+    collections.applications.doc(applicationId).collection("notes"),
+
   // Messages under conversations
   messages: (conversationId: string) =>
     collections.conversations.doc(conversationId).collection("messages"),
