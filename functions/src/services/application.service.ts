@@ -24,6 +24,9 @@ export interface CreateApplicationInput {
 export interface UpdateApplicationInput {
   userNotes?: string;
   agentNotes?: string;
+  agentId?: string;
+  agencyId?: string;
+  mode?: "self" | "agent";
 }
 
 class ApplicationService {

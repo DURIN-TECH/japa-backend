@@ -90,7 +90,7 @@ export class ApplicationController {
   ): Promise<void> {
     try {
       const userId = req.userId!;
-      const { status, role } = req.query;
+      const { status, role, mode } = req.query;
 
       let applications: Application[];
 
@@ -122,6 +122,11 @@ export class ApplicationController {
         } else {
           applications = await applicationService.getUserApplications(userId);
         }
+      }
+
+      // Filter by mode if specified (e.g., ?mode=self for self-service clients)
+      if (mode && typeof mode === "string") {
+        applications = applications.filter((app) => app.mode === mode);
       }
 
       sendSuccess(res, applications);
@@ -176,7 +181,7 @@ export class ApplicationController {
     try {
       const userId = req.userId!;
       const { id } = req.params;
-      const { userNotes, agentNotes } = req.body;
+      const { userNotes, agentNotes, agentId, agencyId, mode } = req.body;
 
       const application = await applicationService.getApplicationById(id);
 
@@ -192,7 +197,7 @@ export class ApplicationController {
       }
 
       const isOwner = application.userId === userId;
-      const updates: { userNotes?: string; agentNotes?: string } = {};
+      const updates: { userNotes?: string; agentNotes?: string; agentId?: string; agencyId?: string; mode?: "self" | "agent" } = {};
 
       // Only the applicant can update userNotes
       if (userNotes !== undefined && isOwner) {
@@ -201,6 +206,12 @@ export class ApplicationController {
       // Agents/agency members can update agentNotes
       if (agentNotes !== undefined && !isOwner) {
         updates.agentNotes = agentNotes;
+      }
+      // Agent/owner/admin can reassign agent or transfer self-service
+      if (!isOwner || req.user?.admin) {
+        if (agentId !== undefined) updates.agentId = agentId;
+        if (agencyId !== undefined) updates.agencyId = agencyId;
+        if (mode !== undefined) updates.mode = mode;
       }
 
       const updated = await applicationService.updateApplication(id, updates);
