@@ -66,6 +66,10 @@ export const subcollections = {
   // Messages under conversations
   messages: (conversationId: string) =>
     collections.conversations.doc(conversationId).collection("messages"),
+
+  // Scrape runs under news sources
+  scrapeRuns: (sourceId: string) =>
+    collections.newsSources.doc(sourceId).collection("scrapeRuns"),
 } as const;
 
 // Firestore timestamp helpers

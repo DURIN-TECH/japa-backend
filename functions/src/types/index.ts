@@ -3,6 +3,9 @@ import { Timestamp } from "firebase-admin/firestore";
 // Re-export eligibility types
 export * from "./eligibility";
 
+// Re-export news types
+export * from "./news";
+
 // ============================================
 // USER TYPES
 // ============================================
@@ -608,7 +611,7 @@ export interface Notification {
   
   // Deep linking
   actionUrl?: string;
-  relatedEntityType?: "application" | "consultation" | "document" | "message";
+  relatedEntityType?: "application" | "consultation" | "document" | "message" | "news_article";
   relatedEntityId?: string;
   
   // Status
