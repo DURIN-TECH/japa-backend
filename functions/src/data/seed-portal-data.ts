@@ -1849,6 +1849,170 @@ async function seedReviews() {
 }
 
 // ============================================
+// SEED TRANSACTIONS
+// ============================================
+
+async function seedTransactions(): Promise<number> {
+  const transactions = [
+    {
+      id: "seed-txn-001",
+      userId: IDS.client1User,
+      agentId: IDS.agent1User,
+      applicationId: IDS.app1,
+      type: "consultation_fee",
+      amount: 500000, // ₦5,000
+      currency: "NGN",
+      status: "completed",
+      isEscrow: false,
+      paymentProvider: "stripe",
+      description: "Initial consultation fee for Short Stay C Visa",
+      clientName: "John Doe",
+      clientEmail: "john.doe@example.com",
+      visaTypeName: "Short Stay 'C' Visa",
+      createdAt: daysAgo(25),
+      updatedAt: daysAgo(25),
+    },
+    {
+      id: "seed-txn-002",
+      userId: IDS.client1User,
+      agentId: IDS.agent1User,
+      applicationId: IDS.app1,
+      type: "service_fee",
+      amount: 4500000, // ₦45,000
+      currency: "NGN",
+      status: "completed",
+      isEscrow: false,
+      paymentProvider: "stripe",
+      description: "Visa application service fee",
+      clientName: "John Doe",
+      clientEmail: "john.doe@example.com",
+      visaTypeName: "Short Stay 'C' Visa",
+      createdAt: daysAgo(20),
+      updatedAt: daysAgo(20),
+    },
+    {
+      id: "seed-txn-003",
+      userId: IDS.client2User,
+      agentId: IDS.agent1User,
+      applicationId: IDS.app2,
+      type: "consultation_fee",
+      amount: 500000, // ₦5,000
+      currency: "NGN",
+      status: "completed",
+      isEscrow: false,
+      paymentProvider: "stripe",
+      description: "Consultation fee for Employment Permit",
+      clientName: "Jane Smith",
+      clientEmail: "jane.smith@example.com",
+      visaTypeName: "General Employment Permit",
+      createdAt: daysAgo(18),
+      updatedAt: daysAgo(18),
+    },
+    {
+      id: "seed-txn-004",
+      userId: IDS.client2User,
+      agentId: IDS.agent1User,
+      applicationId: IDS.app2,
+      type: "service_fee",
+      amount: 7500000, // ₦75,000
+      currency: "NGN",
+      status: "pending",
+      isEscrow: true,
+      escrowReleaseCondition: "Application approval",
+      paymentProvider: "stripe",
+      description: "Employment Permit service fee (held in escrow)",
+      clientName: "Jane Smith",
+      clientEmail: "jane.smith@example.com",
+      visaTypeName: "General Employment Permit",
+      createdAt: daysAgo(15),
+      updatedAt: daysAgo(15),
+    },
+    {
+      id: "seed-txn-005",
+      userId: IDS.client3User,
+      agentId: IDS.agent2User,
+      applicationId: IDS.app3,
+      type: "service_fee",
+      amount: 3500000, // ₦35,000
+      currency: "NGN",
+      status: "completed",
+      isEscrow: false,
+      paymentProvider: "paypal",
+      description: "Short Stay C Visa processing fee",
+      clientName: "Ahmed Ali",
+      clientEmail: "ahmed.ali@example.com",
+      visaTypeName: "Short Stay 'C' Visa",
+      createdAt: daysAgo(30),
+      updatedAt: daysAgo(30),
+    },
+    {
+      id: "seed-txn-006",
+      userId: IDS.client4User,
+      agentId: IDS.agent1User,
+      applicationId: IDS.app4,
+      type: "consultation_fee",
+      amount: 500000, // ₦5,000
+      currency: "NGN",
+      status: "refunded",
+      isEscrow: false,
+      paymentProvider: "stripe",
+      description: "Consultation fee refunded (application rejected)",
+      clientName: "Lisa Wong",
+      clientEmail: "lisa.wong@example.com",
+      visaTypeName: "Student Visa (D)",
+      createdAt: daysAgo(35),
+      updatedAt: daysAgo(10),
+    },
+    {
+      id: "seed-txn-007",
+      userId: IDS.client7User,
+      agentId: IDS.agent2User,
+      applicationId: IDS.app7,
+      type: "government_fee",
+      amount: 9000000, // ₦90,000
+      currency: "NGN",
+      status: "completed",
+      isEscrow: false,
+      paymentProvider: "manual",
+      description: "Embassy application fee for Short Stay C Visa",
+      clientName: "Wanjiku Mwangi",
+      clientEmail: "wanjiku.mwangi@example.com",
+      visaTypeName: "Short Stay 'C' Visa",
+      createdAt: daysAgo(12),
+      updatedAt: daysAgo(12),
+    },
+    {
+      id: "seed-txn-008",
+      userId: IDS.client8User,
+      agentId: IDS.agent1User,
+      applicationId: IDS.app8,
+      type: "service_fee",
+      amount: 6000000, // ₦60,000
+      currency: "NGN",
+      status: "held_in_escrow",
+      isEscrow: true,
+      escrowReleaseCondition: "Interview completion",
+      paymentProvider: "stripe",
+      description: "Employment Permit service fee (pending interview)",
+      clientName: "Sipho Ndlovu",
+      clientEmail: "sipho.ndlovu@example.com",
+      visaTypeName: "General Employment Permit",
+      createdAt: daysAgo(8),
+      updatedAt: daysAgo(8),
+    },
+  ];
+
+  const batch = db.batch();
+  for (const txn of transactions) {
+    const ref = db.collection("transactions").doc(txn.id);
+    batch.set(ref, txn);
+  }
+  await batch.commit();
+  console.log(`✅ Seeded ${transactions.length} transactions`);
+  return transactions.length;
+}
+
+// ============================================
 // MAIN EXPORT
 // ============================================
 
@@ -1861,6 +2025,7 @@ export async function seedPortalData(): Promise<{
   documents: number;
   notes: number;
   reviews: number;
+  transactions: number;
 }> {
   console.log("\n🌱 Seeding portal integration data...\n");
 
@@ -1872,8 +2037,9 @@ export async function seedPortalData(): Promise<{
   const documents = await seedDocuments();
   const notes = await seedNotes();
   const reviews = await seedReviews();
+  const transactions = await seedTransactions();
 
   console.log("\n✅ Portal seed complete!\n");
 
-  return { users, agencies, agents, applications, timelineEntries, documents, notes, reviews };
+  return { users, agencies, agents, applications, timelineEntries, documents, notes, reviews, transactions };
 }

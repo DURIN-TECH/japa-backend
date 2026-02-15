@@ -12,6 +12,7 @@ import {
   eligibilityRoutes,
   adminEligibilityRoutes,
 } from "./routes/eligibility.routes";
+import { transactionRoutes } from "./routes/transaction.routes";
 import { devRoutes } from "./routes/dev.routes";
 
 // Create Express app
@@ -41,6 +42,7 @@ app.use("/agencies", agencyRoutes);
 app.use("/invitations", invitationRoutes);
 app.use("/applications", applicationRoutes);
 app.use("/documents", documentRoutes);
+app.use("/transactions", transactionRoutes);
 app.use("/eligibility", eligibilityRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
 app.use("/dev", devRoutes);
