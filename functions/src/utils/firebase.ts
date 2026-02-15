@@ -25,8 +25,12 @@ export const collections = {
   transactions: db.collection("transactions"),
   consultations: db.collection("consultations"),
   notifications: db.collection("notifications"),
+  paymentRequests: db.collection("paymentRequests"),
   conversations: db.collection("conversations"),
   agencyInvitations: db.collection("agencyInvitations"),
+  newsArticles: db.collection("newsArticles"),
+  newsSources: db.collection("newsSources"),
+  newsSubscriptions: db.collection("newsSubscriptions"),
 } as const;
 
 // Helper to get subcollection references

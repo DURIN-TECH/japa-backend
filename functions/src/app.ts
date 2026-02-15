@@ -14,6 +14,9 @@ import {
 } from "./routes/eligibility.routes";
 import { transactionRoutes } from "./routes/transaction.routes";
 import { consultationRoutes } from "./routes/consultation.routes";
+import { notificationRoutes } from "./routes/notification.routes";
+import { paymentRequestRoutes } from "./routes/payment-request.routes";
+import { messagingRoutes } from "./routes/messaging.routes";
 import { devRoutes } from "./routes/dev.routes";
 
 // Create Express app
@@ -45,6 +48,9 @@ app.use("/applications", applicationRoutes);
 app.use("/documents", documentRoutes);
 app.use("/transactions", transactionRoutes);
 app.use("/consultations", consultationRoutes);
+app.use("/notifications", notificationRoutes);
+app.use("/payment-requests", paymentRequestRoutes);
+app.use("/conversations", messagingRoutes);
 app.use("/eligibility", eligibilityRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
 app.use("/dev", devRoutes);

@@ -550,15 +550,52 @@ export interface Transaction {
 }
 
 // ============================================
+// PAYMENT REQUEST TYPES
+// ============================================
+
+export type PaymentRequestStatus =
+  | "pending"
+  | "paid"
+  | "cancelled"
+  | "expired";
+
+export interface PaymentRequest {
+  id: string;
+  applicationId: string;
+  agentId: string;
+  agencyId?: string;
+  clientId: string;
+
+  // Denormalized
+  clientName: string;
+  clientEmail: string;
+
+  // Payment details
+  amount: number; // In smallest currency unit (kobo/cents)
+  currency: string;
+  description: string;
+
+  // Status
+  status: PaymentRequestStatus;
+  paidAt?: Timestamp;
+  cancelledAt?: Timestamp;
+  expiresAt?: Timestamp;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+// ============================================
 // NOTIFICATION TYPES
 // ============================================
 
-export type NotificationType = 
+export type NotificationType =
   | "application_update"
   | "document_status"
   | "consultation_reminder"
   | "payment_received"
   | "message_received"
+  | "visa_news"
   | "system";
 
 export interface Notification {
