@@ -533,7 +533,12 @@ export interface Transaction {
   // Metadata
   description: string;
   metadata?: Record<string, unknown>;
-  
+
+  // Denormalized fields (for read performance)
+  clientName?: string;
+  clientEmail?: string;
+  visaTypeName?: string;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }

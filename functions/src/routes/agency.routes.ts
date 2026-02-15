@@ -44,6 +44,11 @@ agencyRoutes.get("/:id/invitations", verifyAuth, (req, res) =>
 // Routes mounted at /invitations
 const invitationRoutes = Router();
 
+// Must come before /:id routes
+invitationRoutes.get("/pending", verifyAuth, (req, res) =>
+  agencyController.getMyPendingInvitations(req, res)
+);
+
 invitationRoutes.post("/:id/accept", verifyAuth, (req, res) =>
   agencyController.acceptInvitation(req, res)
 );

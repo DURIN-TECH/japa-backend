@@ -276,6 +276,26 @@ export class AgencyController {
   }
 
   /**
+   * GET /invitations/pending
+   * Get pending invitations for the authenticated user (by email)
+   */
+  async getMyPendingInvitations(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const email = req.user?.email;
+      if (!email) {
+        sendError(res, "VALIDATION_ERROR", "User email not available", 400);
+        return;
+      }
+
+      const invitations = await agencyService.getPendingInvitationsForEmail(email);
+      sendSuccess(res, invitations);
+    } catch (error) {
+      console.error("Error getting pending invitations:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * POST /invitations/:id/accept
    * Accept an agency invitation
    */
