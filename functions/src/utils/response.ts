@@ -95,6 +95,20 @@ export function sendNoContent(res: Response): void {
 }
 
 /**
+ * Send a 404 Not Found response
+ */
+export function sendNotFound(res: Response, message = "Resource not found"): void {
+  sendError(res, "NOT_FOUND", message, 404);
+}
+
+/**
+ * Send a 403 Forbidden response
+ */
+export function sendForbidden(res: Response, message = "You don't have permission to access this resource"): void {
+  sendError(res, "FORBIDDEN", message, 403);
+}
+
+/**
  * Standard error messages
  */
 export const ErrorMessages = {
