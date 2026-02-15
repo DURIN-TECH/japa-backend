@@ -167,11 +167,79 @@ service cloud.firestore {
       match /timeline/{timelineId} {
         allow read: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
                       isAgent() || isAdmin();
-        
+
         allow write: if isAgent() || isAdmin();
       }
+
+      // Notes subcollection
+      match /notes/{noteId} {
+        // Application access holders can read notes
+        allow read: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
+                      isAgent() || isAdmin();
+
+        // Authenticated users with application access can create notes
+        allow create: if isAuthenticated() &&
+                        request.resource.data.authorId == request.auth.uid;
+
+        // Note author can update their own notes
+        allow update: if isOwner(resource.data.authorId);
+
+        // Note author or admin can delete
+        allow delete: if isOwner(resource.data.authorId) || isAdmin();
+      }
     }
-    
+
+    // ============================================
+    // AGENCIES COLLECTION
+    // ============================================
+
+    match /agencies/{agencyId} {
+      // Agency owner can read/write
+      // Agency members (agents) can read
+      allow read: if isAuthenticated() &&
+                    (resource.data.ownerId == request.auth.uid ||
+                     request.auth.uid in resource.data.agentIds ||
+                     isAdmin());
+
+      // Authenticated users can create an agency
+      allow create: if isAuthenticated() &&
+                      request.resource.data.ownerId == request.auth.uid;
+
+      // Only agency owner or admin can update
+      allow update: if isAuthenticated() &&
+                      (resource.data.ownerId == request.auth.uid || isAdmin());
+
+      // Only admin can delete agencies
+      allow delete: if isAdmin();
+    }
+
+    // ============================================
+    // AGENCY INVITATIONS COLLECTION
+    // ============================================
+
+    match /agencyInvitations/{invitationId} {
+      // Agency owner can read their invitations
+      // Invitee can read invitations sent to them
+      allow read: if isAuthenticated() &&
+                    (resource.data.invitedBy == request.auth.uid ||
+                     resource.data.email == request.auth.token.email ||
+                     isAdmin());
+
+      // Agency owner can create invitations
+      allow create: if isAuthenticated() &&
+                      request.resource.data.invitedBy == request.auth.uid;
+
+      // Invitee can accept/decline (update status)
+      // Agency owner can cancel (update status)
+      allow update: if isAuthenticated() &&
+                      (resource.data.invitedBy == request.auth.uid ||
+                       resource.data.email == request.auth.token.email ||
+                       isAdmin());
+
+      // Only admin can delete invitations
+      allow delete: if isAdmin();
+    }
+
     // ============================================
     // CONSULTATIONS COLLECTION
     // ============================================
