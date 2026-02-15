@@ -1,5 +1,5 @@
 /**
- * Seed portal integration data (users, agency, agents, applications, timelines, documents, notes)
+ * Seed portal integration data (auth users, Firestore data)
  *
  * Run against emulator:
  *   npm run seed:portal:emulator
@@ -16,6 +16,10 @@ if (process.env.FIRESTORE_EMULATOR_HOST) {
   console.log(`Using Firestore emulator at ${process.env.FIRESTORE_EMULATOR_HOST}`);
 }
 
+if (process.env.FIREBASE_AUTH_EMULATOR_HOST) {
+  console.log(`Using Auth emulator at ${process.env.FIREBASE_AUTH_EMULATOR_HOST}`);
+}
+
 if (!admin.apps.length) {
   admin.initializeApp({ projectId });
 }
@@ -28,6 +32,7 @@ async function main() {
   try {
     const result = await seedPortalData();
     console.log("Seed completed successfully!");
+    console.log(`- Auth users: ${result.authUsers}`);
     console.log(`- Users: ${result.users}`);
     console.log(`- Agencies: ${result.agencies}`);
     console.log(`- Agents: ${result.agents}`);
@@ -38,6 +43,15 @@ async function main() {
     console.log(`- Reviews: ${result.reviews}`);
     console.log(`- Transactions: ${result.transactions}`);
     console.log(`- Consultations: ${result.consultations}`);
+    console.log(`- Notifications: ${result.notifications}`);
+    console.log(`- Payment Requests: ${result.paymentRequests}`);
+    console.log(`- Conversations: ${result.conversations}`);
+    console.log("\nLogin credentials (all users): password123");
+    console.log("  Admin:  admin@japatest.com");
+    console.log("  Admin2: admin2@japatest.com");
+    console.log("  Owner:  owner@japatest.com");
+    console.log("  Agent1: agent1@japatest.com");
+    console.log("  Agent2: agent2@japatest.com");
     process.exit(0);
   } catch (error) {
     console.error("Seed failed:", error);

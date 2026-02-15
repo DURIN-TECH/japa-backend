@@ -8,6 +8,7 @@
  */
 
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { getAuth } from "firebase-admin/auth";
 
 const db = getFirestore();
 
@@ -16,6 +17,8 @@ const db = getFirestore();
 // ============================================
 const IDS = {
   // Users
+  admin1User: "seed-user-admin-001",
+  admin2User: "seed-user-admin-002",
   ownerUser: "seed-user-owner-001",
   agent1User: "seed-user-agent-001",
   agent2User: "seed-user-agent-002",
@@ -49,6 +52,12 @@ const IDS = {
   app8: "seed-app-008",
   app9: "seed-app-009",
   app10: "seed-app-010",
+
+  // Self-service applications (no agent assigned)
+  ssApp1: "seed-ss-app-001",
+  ssApp2: "seed-ss-app-002",
+  ssApp3: "seed-ss-app-003",
+  ssApp4: "seed-ss-app-004",
 };
 
 // ============================================
@@ -63,6 +72,55 @@ function daysFromNow(days: number): Timestamp {
 }
 
 // ============================================
+// AUTH USERS (Firebase Auth accounts for login)
+// ============================================
+
+const AUTH_USERS = [
+  { uid: IDS.admin1User, email: "admin@japatest.com", displayName: "Olu Adeyemi" },
+  { uid: IDS.admin2User, email: "admin2@japatest.com", displayName: "Ngozi Ibe" },
+  { uid: IDS.ownerUser, email: "owner@japatest.com", displayName: "Adaeze Okonkwo" },
+  { uid: IDS.agent1User, email: "agent1@japatest.com", displayName: "Chinedu Eze" },
+  { uid: IDS.agent2User, email: "agent2@japatest.com", displayName: "Fatima Bello" },
+  { uid: IDS.client1User, email: "john.doe@example.com", displayName: "John Doe" },
+  { uid: IDS.client2User, email: "jane.smith@example.com", displayName: "Jane Smith" },
+  { uid: IDS.client3User, email: "ahmed.ali@example.com", displayName: "Ahmed Ali" },
+  { uid: IDS.client4User, email: "lisa.wong@example.com", displayName: "Lisa Wong" },
+  { uid: IDS.client5User, email: "tunde.bakare@example.com", displayName: "Tunde Bakare" },
+  { uid: IDS.client6User, email: "kwame.asante@example.com", displayName: "Kwame Asante" },
+  { uid: IDS.client7User, email: "wanjiku.mwangi@example.com", displayName: "Wanjiku Mwangi" },
+  { uid: IDS.client8User, email: "sipho.ndlovu@example.com", displayName: "Sipho Ndlovu" },
+  { uid: IDS.client9User, email: "priya.sharma@example.com", displayName: "Priya Sharma" },
+  { uid: IDS.client10User, email: "miguel.santos@example.com", displayName: "Miguel Santos" },
+];
+
+const SEED_PASSWORD = "password123";
+
+async function seedAuthUsers(): Promise<number> {
+  const auth = getAuth();
+  let created = 0;
+
+  for (const user of AUTH_USERS) {
+    try {
+      // Try to get existing user first (idempotent)
+      await auth.getUser(user.uid);
+    } catch {
+      // User doesn't exist, create it
+      await auth.createUser({
+        uid: user.uid,
+        email: user.email,
+        password: SEED_PASSWORD,
+        displayName: user.displayName,
+        emailVerified: true,
+      });
+      created++;
+    }
+  }
+
+  console.log(`✅ Seeded ${AUTH_USERS.length} auth users (${created} new, ${AUTH_USERS.length - created} existing)`);
+  return AUTH_USERS.length;
+}
+
+// ============================================
 // SEED FUNCTIONS
 // ============================================
 
@@ -70,6 +128,36 @@ async function seedUsers() {
   const now = Timestamp.now();
 
   const users = [
+    {
+      id: IDS.admin1User,
+      email: "admin@japatest.com",
+      firstName: "Olu",
+      lastName: "Adeyemi",
+      phone: "+2348001111111",
+      residentialCountry: "NG",
+      onboardingCompleted: true,
+      onboardingCompletedAt: daysAgo(120),
+      hasPassport: true,
+      passportCountry: "NG",
+      admin: true,
+      createdAt: daysAgo(120),
+      updatedAt: now,
+    },
+    {
+      id: IDS.admin2User,
+      email: "admin2@japatest.com",
+      firstName: "Ngozi",
+      lastName: "Ibe",
+      phone: "+2348002222222",
+      residentialCountry: "NG",
+      onboardingCompleted: true,
+      onboardingCompletedAt: daysAgo(100),
+      hasPassport: true,
+      passportCountry: "NG",
+      admin: true,
+      createdAt: daysAgo(100),
+      updatedAt: now,
+    },
     {
       id: IDS.ownerUser,
       email: "owner@japatest.com",
@@ -708,6 +796,113 @@ async function seedApplications() {
       agentNotes: "Client became unresponsive. Missing documents never provided. Application expired after 90 days.",
       createdAt: daysAgo(180),
       updatedAt: daysAgo(90),
+    },
+
+    // ============================================
+    // SELF-SERVICE APPLICATIONS (mode: "self", no agent)
+    // ============================================
+    {
+      id: IDS.ssApp1,
+      userId: IDS.client6User,
+      visaTypeId: "short-stay-c",
+      countryCode: "IE",
+      mode: "self",
+      status: "pending_documents",
+      progress: 40,
+      currentStep: "Uploading documents",
+      nextStep: "Document review",
+      startDate: daysAgo(10),
+      lastUpdated: daysAgo(1),
+      documentsRequired: 6,
+      documentsUploaded: 3,
+      documentsVerified: 0,
+      documentsRejected: 0,
+      totalCost: 25000_00,
+      amountPaid: 0,
+      paymentStatus: "pending",
+      clientName: "Kwame Asante",
+      clientEmail: "kwame.asante@example.com",
+      visaTypeName: "Short Stay 'C' Visa",
+      countryName: "Ireland",
+      createdAt: daysAgo(10),
+      updatedAt: daysAgo(1),
+    },
+    {
+      id: IDS.ssApp2,
+      userId: IDS.client7User,
+      visaTypeId: "work-permit-general",
+      countryCode: "IE",
+      mode: "self",
+      status: "draft",
+      progress: 15,
+      currentStep: "Filling personal info",
+      startDate: daysAgo(5),
+      lastUpdated: daysAgo(2),
+      documentsRequired: 8,
+      documentsUploaded: 0,
+      documentsVerified: 0,
+      documentsRejected: 0,
+      totalCost: 35000_00,
+      amountPaid: 0,
+      paymentStatus: "pending",
+      clientName: "Wanjiku Mwangi",
+      clientEmail: "wanjiku.mwangi@example.com",
+      visaTypeName: "Work Permit (General)",
+      countryName: "Ireland",
+      createdAt: daysAgo(5),
+      updatedAt: daysAgo(2),
+    },
+    {
+      id: IDS.ssApp3,
+      userId: IDS.client8User,
+      visaTypeId: "short-stay-c",
+      countryCode: "IE",
+      mode: "self",
+      status: "draft",
+      progress: 10,
+      currentStep: "Filling personal info",
+      startDate: daysAgo(25),
+      lastUpdated: daysAgo(20),
+      documentsRequired: 6,
+      documentsUploaded: 0,
+      documentsVerified: 0,
+      documentsRejected: 0,
+      totalCost: 25000_00,
+      amountPaid: 0,
+      paymentStatus: "pending",
+      clientName: "Sipho Ndlovu",
+      clientEmail: "sipho.ndlovu@example.com",
+      visaTypeName: "Short Stay 'C' Visa",
+      countryName: "Ireland",
+      userNotes: "Started but got busy with work",
+      createdAt: daysAgo(25),
+      updatedAt: daysAgo(20),
+    },
+    {
+      id: IDS.ssApp4,
+      userId: IDS.client9User,
+      visaTypeId: "short-stay-c",
+      countryCode: "IE",
+      mode: "self",
+      status: "approved",
+      progress: 100,
+      currentStep: "Visa approved",
+      startDate: daysAgo(60),
+      lastUpdated: daysAgo(5),
+      completedAt: daysAgo(5),
+      documentsRequired: 6,
+      documentsUploaded: 6,
+      documentsVerified: 6,
+      documentsRejected: 0,
+      totalCost: 25000_00,
+      amountPaid: 25000_00,
+      paymentStatus: "paid",
+      clientName: "Priya Sharma",
+      clientEmail: "priya.sharma@example.com",
+      visaTypeName: "Short Stay 'C' Visa",
+      countryName: "Ireland",
+      createdAt: daysAgo(60),
+      updatedAt: daysAgo(5),
     },
   ];
 
@@ -2204,10 +2399,407 @@ async function seedConsultations(): Promise<number> {
 }
 
 // ============================================
+// SEED NOTIFICATIONS
+// ============================================
+
+async function seedNotifications(): Promise<number> {
+  const notifications = [
+    // Notifications for agent1 (Chinedu Eze)
+    {
+      id: "seed-notif-001",
+      userId: IDS.agent1User,
+      type: "payment_received",
+      title: "Payment received",
+      body: "₦50,000 received from John Doe for Short Stay C Visa consultation.",
+      actionUrl: `/transactions`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app1,
+      isRead: false,
+      createdAt: daysAgo(0),
+    },
+    {
+      id: "seed-notif-002",
+      userId: IDS.agent1User,
+      type: "consultation_reminder",
+      title: "Upcoming consultation",
+      body: "Interview prep session with Sipho Ndlovu tomorrow at 11:00 AM.",
+      actionUrl: `/appointments`,
+      relatedEntityType: "consultation",
+      relatedEntityId: "seed-consult-003",
+      isRead: false,
+      createdAt: daysAgo(0),
+    },
+    {
+      id: "seed-notif-003",
+      userId: IDS.agent1User,
+      type: "document_status",
+      title: "Document uploaded",
+      body: "Sipho Ndlovu uploaded professional references for Employment Permit application.",
+      actionUrl: `/case-management/${IDS.app8}`,
+      relatedEntityType: "document",
+      relatedEntityId: IDS.app8,
+      isRead: false,
+      createdAt: daysAgo(1),
+    },
+    {
+      id: "seed-notif-004",
+      userId: IDS.agent1User,
+      type: "application_update",
+      title: "Application status change",
+      body: "Sipho Ndlovu's Employment Permit application has an interview scheduled.",
+      actionUrl: `/case-management/${IDS.app8}`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app8,
+      isRead: true,
+      readAt: daysAgo(1),
+      createdAt: daysAgo(2),
+    },
+    {
+      id: "seed-notif-005",
+      userId: IDS.agent1User,
+      type: "payment_received",
+      title: "Payment received",
+      body: "₦75,000 received from Jane Smith for Employment Permit service fee (held in escrow).",
+      actionUrl: `/transactions`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app2,
+      isRead: true,
+      readAt: daysAgo(14),
+      createdAt: daysAgo(15),
+    },
+    {
+      id: "seed-notif-006",
+      userId: IDS.agent1User,
+      type: "application_update",
+      title: "New application assigned",
+      body: "Tunde Bakare started a Short Stay C Visa application. Awaiting payment.",
+      actionUrl: `/case-management/${IDS.app5}`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app5,
+      isRead: true,
+      readAt: daysAgo(2),
+      createdAt: daysAgo(3),
+    },
+    // Notifications for agent2 (Fatima Bello)
+    {
+      id: "seed-notif-007",
+      userId: IDS.agent2User,
+      type: "application_update",
+      title: "Visa approved",
+      body: "Ahmed Ali's Short Stay C Visa has been approved by the embassy.",
+      actionUrl: `/case-management/${IDS.app3}`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app3,
+      isRead: true,
+      readAt: daysAgo(4),
+      createdAt: daysAgo(5),
+    },
+    {
+      id: "seed-notif-008",
+      userId: IDS.agent2User,
+      type: "consultation_reminder",
+      title: "Upcoming consultation",
+      body: "Follow-up consultation with Wanjiku Mwangi scheduled for next week.",
+      actionUrl: `/appointments`,
+      relatedEntityType: "consultation",
+      relatedEntityId: "seed-consult-004",
+      isRead: false,
+      createdAt: daysAgo(0),
+    },
+    // Notifications for owner (Adaeze Okonkwo)
+    {
+      id: "seed-notif-009",
+      userId: IDS.ownerUser,
+      type: "system",
+      title: "Weekly summary",
+      body: "Your agency processed 3 applications this week. 1 approved, 2 in progress.",
+      isRead: false,
+      createdAt: daysAgo(0),
+    },
+    {
+      id: "seed-notif-010",
+      userId: IDS.ownerUser,
+      type: "payment_received",
+      title: "Agency revenue update",
+      body: "₦60,000 received from Sipho Ndlovu's Employment Permit (held in escrow).",
+      actionUrl: `/transactions`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app8,
+      isRead: true,
+      readAt: daysAgo(7),
+      createdAt: daysAgo(8),
+    },
+    {
+      id: "seed-notif-011",
+      userId: IDS.ownerUser,
+      type: "application_update",
+      title: "Application rejected",
+      body: "Lisa Wong's Student Visa (D) application was rejected by the embassy.",
+      actionUrl: `/case-management/${IDS.app4}`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app4,
+      isRead: true,
+      readAt: daysAgo(9),
+      createdAt: daysAgo(10),
+    },
+    {
+      id: "seed-notif-012",
+      userId: IDS.ownerUser,
+      type: "system",
+      title: "New agent review",
+      body: "Ahmed Ali left a 5-star review for Fatima Bello.",
+      isRead: true,
+      readAt: daysAgo(3),
+      createdAt: daysAgo(4),
+    },
+  ];
+
+  const batch = db.batch();
+  for (const n of notifications) {
+    const ref = db.collection("notifications").doc(n.id);
+    batch.set(ref, n);
+  }
+  await batch.commit();
+  console.log(`✅ Seeded ${notifications.length} notifications`);
+  return notifications.length;
+}
+
+// ============================================
 // MAIN EXPORT
 // ============================================
 
+async function seedPaymentRequests(): Promise<number> {
+  const now = Timestamp.now();
+  const paymentRequests = [
+    {
+      id: "seed-pr-001",
+      applicationId: IDS.app1,
+      agentId: IDS.agent1,
+      agencyId: IDS.agency,
+      clientId: IDS.client1User,
+      clientName: "Adaeze Okafor",
+      clientEmail: "adaeze@email.com",
+      amount: 75000_00, // ₦75,000 in kobo
+      currency: "NGN",
+      description: "Visa Processing Fee",
+      status: "paid",
+      paidAt: now,
+      createdAt: Timestamp.fromDate(new Date("2025-09-15")),
+      updatedAt: now,
+    },
+    {
+      id: "seed-pr-002",
+      applicationId: IDS.app1,
+      agentId: IDS.agent1,
+      agencyId: IDS.agency,
+      clientId: IDS.client1User,
+      clientName: "Adaeze Okafor",
+      clientEmail: "adaeze@email.com",
+      amount: 25000_00, // ₦25,000 in kobo
+      currency: "NGN",
+      description: "Document Authentication Fee",
+      status: "pending",
+      createdAt: Timestamp.fromDate(new Date("2025-12-01")),
+      updatedAt: Timestamp.fromDate(new Date("2025-12-01")),
+    },
+    {
+      id: "seed-pr-003",
+      applicationId: IDS.app2,
+      agentId: IDS.agent1,
+      agencyId: IDS.agency,
+      clientId: IDS.client2User,
+      clientName: "Kwame Mensah",
+      clientEmail: "kwame@email.com",
+      amount: 150000_00, // ₦150,000 in kobo
+      currency: "NGN",
+      description: "Embassy Application Fee",
+      status: "pending",
+      createdAt: Timestamp.fromDate(new Date("2025-11-20")),
+      updatedAt: Timestamp.fromDate(new Date("2025-11-20")),
+    },
+    {
+      id: "seed-pr-004",
+      applicationId: IDS.app5,
+      agentId: IDS.agent2,
+      agencyId: IDS.agency,
+      clientId: IDS.client5User,
+      clientName: "Aisha Bello",
+      clientEmail: "aisha@email.com",
+      amount: 50000_00, // ₦50,000 in kobo
+      currency: "NGN",
+      description: "Consultation Fee",
+      status: "cancelled",
+      cancelledAt: now,
+      createdAt: Timestamp.fromDate(new Date("2025-10-05")),
+      updatedAt: now,
+    },
+    {
+      id: "seed-pr-005",
+      applicationId: IDS.app3,
+      agentId: IDS.agent1,
+      agencyId: IDS.agency,
+      clientId: IDS.client3User,
+      clientName: "Amara Njoku",
+      clientEmail: "amara@email.com",
+      amount: 100000_00, // ₦100,000 in kobo
+      currency: "NGN",
+      description: "Visa Service Fee",
+      status: "paid",
+      paidAt: Timestamp.fromDate(new Date("2025-10-20")),
+      createdAt: Timestamp.fromDate(new Date("2025-10-10")),
+      updatedAt: Timestamp.fromDate(new Date("2025-10-20")),
+    },
+  ];
+
+  for (const pr of paymentRequests) {
+    await db.collection("paymentRequests").doc(pr.id).set(pr);
+  }
+
+  return paymentRequests.length;
+}
+
+// ============================================
+// CONVERSATIONS & MESSAGES
+// ============================================
+
+const CONV_IDS = {
+  conv1: "seed-conv-001", // agent1 ↔ client1 (app1)
+  conv2: "seed-conv-002", // agent1 ↔ client2 (app2)
+  conv3: "seed-conv-003", // agent2 ↔ client3 (app3)
+  conv4: "seed-conv-004", // owner ↔ client5 (app5)
+};
+
+async function seedConversations(): Promise<number> {
+  const convs = [
+    {
+      id: CONV_IDS.conv1,
+      userId: IDS.client1User,
+      agentId: IDS.agent1,
+      applicationId: IDS.app1,
+      lastMessageAt: daysAgo(0),
+      lastMessage: "Your documents have been reviewed and approved!",
+      unreadCountUser: 1,
+      unreadCountAgent: 0,
+      createdAt: daysAgo(14),
+      updatedAt: daysAgo(0),
+    },
+    {
+      id: CONV_IDS.conv2,
+      userId: IDS.client2User,
+      agentId: IDS.agent1,
+      applicationId: IDS.app2,
+      lastMessageAt: daysAgo(1),
+      lastMessage: "Please upload your proof of funds",
+      unreadCountUser: 0,
+      unreadCountAgent: 1,
+      createdAt: daysAgo(10),
+      updatedAt: daysAgo(1),
+    },
+    {
+      id: CONV_IDS.conv3,
+      userId: IDS.client3User,
+      agentId: IDS.agent2,
+      applicationId: IDS.app3,
+      lastMessageAt: daysAgo(2),
+      lastMessage: "Thank you for your patience",
+      unreadCountUser: 0,
+      unreadCountAgent: 0,
+      createdAt: daysAgo(7),
+      updatedAt: daysAgo(2),
+    },
+    {
+      id: CONV_IDS.conv4,
+      userId: IDS.client5User,
+      agentId: IDS.ownerAgent,
+      applicationId: IDS.app5,
+      lastMessageAt: daysAgo(3),
+      lastMessage: "I'll follow up with the embassy this week",
+      unreadCountUser: 1,
+      unreadCountAgent: 0,
+      createdAt: daysAgo(20),
+      updatedAt: daysAgo(3),
+    },
+  ];
+
+  const batch = db.batch();
+  for (const conv of convs) {
+    batch.set(db.collection("conversations").doc(conv.id), conv);
+  }
+  await batch.commit();
+
+  // Seed messages for each conversation
+  const allMessages = [
+    // Conv 1: agent1 ↔ client1
+    {
+      convId: CONV_IDS.conv1,
+      messages: [
+        { senderId: IDS.agent1User, senderType: "agent" as const, content: "Welcome John! I'm Chinedu, your assigned agent for the UK Work Visa application. How can I help you today?", createdAt: daysAgo(14) },
+        { senderId: IDS.client1User, senderType: "user" as const, content: "Hi Chinedu! I just submitted my documents. Can you confirm you received everything?", createdAt: daysAgo(13) },
+        { senderId: IDS.agent1User, senderType: "agent" as const, content: "Yes, I can see your uploads. I'm reviewing them now. I'll get back to you within 24 hours.", createdAt: daysAgo(13) },
+        { senderId: IDS.client1User, senderType: "user" as const, content: "Thank you so much! Looking forward to hearing from you.", createdAt: daysAgo(12) },
+        { senderId: IDS.agent1User, senderType: "agent" as const, content: "Your documents have been reviewed and approved!", createdAt: daysAgo(0), isRead: false },
+      ],
+    },
+    // Conv 2: agent1 ↔ client2
+    {
+      convId: CONV_IDS.conv2,
+      messages: [
+        { senderId: IDS.agent1User, senderType: "agent" as const, content: "Hello Jane, I'm handling your Canada Study Visa application. Please let me know if you have any questions.", createdAt: daysAgo(10) },
+        { senderId: IDS.client2User, senderType: "user" as const, content: "Thanks Chinedu! I'm still gathering some documents. What's the deadline?", createdAt: daysAgo(9) },
+        { senderId: IDS.agent1User, senderType: "agent" as const, content: "Please upload your proof of funds", createdAt: daysAgo(1) },
+        { senderId: IDS.client2User, senderType: "user" as const, content: "I'll have it ready by tomorrow!", createdAt: daysAgo(1), isRead: false },
+      ],
+    },
+    // Conv 3: agent2 ↔ client3
+    {
+      convId: CONV_IDS.conv3,
+      messages: [
+        { senderId: IDS.agent2User, senderType: "agent" as const, content: "Hi Ahmed, I'm Fatima and I'll be assisting with your Germany Work Visa. Let's get started!", createdAt: daysAgo(7) },
+        { senderId: IDS.client3User, senderType: "user" as const, content: "Great to meet you Fatima! What documents do I need first?", createdAt: daysAgo(6) },
+        { senderId: IDS.agent2User, senderType: "agent" as const, content: "I'll send you a checklist shortly. For now, please make sure your passport is valid for at least 6 months.", createdAt: daysAgo(5) },
+        { senderId: IDS.client3User, senderType: "user" as const, content: "It is valid until 2028. Thanks for checking!", createdAt: daysAgo(3) },
+        { senderId: IDS.agent2User, senderType: "agent" as const, content: "Thank you for your patience", createdAt: daysAgo(2) },
+      ],
+    },
+    // Conv 4: owner ↔ client5
+    {
+      convId: CONV_IDS.conv4,
+      messages: [
+        { senderId: IDS.ownerUser, senderType: "agent" as const, content: "Hello Tunde, this is Adaeze from Japa Immigration Services. I'm personally overseeing your application.", createdAt: daysAgo(20) },
+        { senderId: IDS.client5User, senderType: "user" as const, content: "That's great to hear! I've been waiting for an update on my embassy submission.", createdAt: daysAgo(15) },
+        { senderId: IDS.ownerUser, senderType: "agent" as const, content: "I'll follow up with the embassy this week", createdAt: daysAgo(3) },
+      ],
+    },
+  ];
+
+  let msgCount = 0;
+  for (const convMessages of allMessages) {
+    const batch = db.batch();
+    let idx = 1;
+    for (const msg of convMessages.messages) {
+      const msgId = `${convMessages.convId}-msg-${String(idx).padStart(3, "0")}`;
+      const msgRef = db.collection("conversations").doc(convMessages.convId).collection("messages").doc(msgId);
+      batch.set(msgRef, {
+        id: msgId,
+        conversationId: convMessages.convId,
+        senderId: msg.senderId,
+        senderType: msg.senderType,
+        content: msg.content,
+        isRead: msg.isRead ?? true,
+        createdAt: msg.createdAt,
+      });
+      idx++;
+      msgCount++;
+    }
+    await batch.commit();
+  }
+
+  console.log(`  ✅ ${convs.length} conversations, ${msgCount} messages`);
+  return convs.length;
+}
+
 export async function seedPortalData(): Promise<{
+  authUsers: number;
   users: number;
   agencies: number;
   agents: number;
@@ -2218,9 +2810,13 @@ export async function seedPortalData(): Promise<{
   reviews: number;
   transactions: number;
   consultations: number;
+  notifications: number;
+  paymentRequests: number;
+  conversations: number;
 }> {
   console.log("\n🌱 Seeding portal integration data...\n");
 
+  const authUsers = await seedAuthUsers();
   const users = await seedUsers();
   const agencies = await seedAgency();
   const agents = await seedAgents();
@@ -2231,8 +2827,11 @@ export async function seedPortalData(): Promise<{
   const reviews = await seedReviews();
   const transactions = await seedTransactions();
   const consultations = await seedConsultations();
+  const notifications = await seedNotifications();
+  const paymentRequests = await seedPaymentRequests();
+  const conversations = await seedConversations();
 
   console.log("\n✅ Portal seed complete!\n");
 
-  return { users, agencies, agents, applications, timelineEntries, documents, notes, reviews, transactions, consultations };
+  return { authUsers, users, agencies, agents, applications, timelineEntries, documents, notes, reviews, transactions, consultations, notifications, paymentRequests, conversations };
 }
