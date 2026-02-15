@@ -452,15 +452,21 @@ export interface Consultation {
   id: string;
   userId: string;
   agentId: string;
+  agencyId?: string;
   applicationId?: string;
-  
+
+  // Denormalized display fields
+  clientName: string;
+  clientEmail: string;
+  agentName: string;
+
   // Booking details
   type: ConsultationType;
   scheduledDate: Timestamp;
   scheduledTime: string; // "10:30"
   durationMinutes: number;
   timezone: string;
-  
+
   // Status
   status: ConsultationStatus;
   

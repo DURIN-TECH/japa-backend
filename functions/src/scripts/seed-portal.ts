@@ -35,6 +35,9 @@ async function main() {
     console.log(`- Timeline entries: ${result.timelineEntries}`);
     console.log(`- Documents: ${result.documents}`);
     console.log(`- Notes: ${result.notes}`);
+    console.log(`- Reviews: ${result.reviews}`);
+    console.log(`- Transactions: ${result.transactions}`);
+    console.log(`- Consultations: ${result.consultations}`);
     process.exit(0);
   } catch (error) {
     console.error("Seed failed:", error);

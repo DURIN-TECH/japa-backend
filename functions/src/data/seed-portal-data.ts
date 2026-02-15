@@ -2013,6 +2013,197 @@ async function seedTransactions(): Promise<number> {
 }
 
 // ============================================
+// SEED CONSULTATIONS
+// ============================================
+
+async function seedConsultations(): Promise<number> {
+  const consultations = [
+    {
+      id: "seed-consult-001",
+      userId: IDS.client1User,
+      agentId: IDS.agent1User,
+      agencyId: IDS.agency,
+      applicationId: IDS.app1,
+      clientName: "John Doe",
+      clientEmail: "john.doe@example.com",
+      agentName: "Chinedu Eze",
+      type: "initial",
+      scheduledDate: daysAgo(20),
+      scheduledTime: "10:00",
+      durationMinutes: 30,
+      timezone: "Africa/Lagos",
+      status: "completed",
+      fee: 500000,
+      paymentStatus: "paid",
+      meetingPlatform: "zoom",
+      summary: "Discussed visa requirements and document checklist. Client has strong financials.",
+      createdAt: daysAgo(22),
+      updatedAt: daysAgo(20),
+    },
+    {
+      id: "seed-consult-002",
+      userId: IDS.client2User,
+      agentId: IDS.agent1User,
+      agencyId: IDS.agency,
+      applicationId: IDS.app2,
+      clientName: "Jane Smith",
+      clientEmail: "jane.smith@example.com",
+      agentName: "Chinedu Eze",
+      type: "document_review",
+      scheduledDate: daysAgo(5),
+      scheduledTime: "14:00",
+      durationMinutes: 45,
+      timezone: "Africa/Lagos",
+      status: "completed",
+      fee: 300000,
+      paymentStatus: "paid",
+      meetingPlatform: "google_meet",
+      summary: "Reviewed employment contract and qualification documents. Degree certificate needs re-scan.",
+      createdAt: daysAgo(7),
+      updatedAt: daysAgo(5),
+    },
+    {
+      id: "seed-consult-003",
+      userId: IDS.client8User,
+      agentId: IDS.agent1User,
+      agencyId: IDS.agency,
+      applicationId: IDS.app8,
+      clientName: "Sipho Ndlovu",
+      clientEmail: "sipho.ndlovu@example.com",
+      agentName: "Chinedu Eze",
+      type: "interview_prep",
+      scheduledDate: daysFromNow(3),
+      scheduledTime: "11:00",
+      durationMinutes: 60,
+      timezone: "Africa/Lagos",
+      status: "confirmed",
+      fee: 800000,
+      paymentStatus: "paid",
+      meetingPlatform: "zoom",
+      meetingLink: "https://zoom.us/j/1234567890",
+      createdAt: daysAgo(3),
+      updatedAt: daysAgo(3),
+    },
+    {
+      id: "seed-consult-004",
+      userId: IDS.client7User,
+      agentId: IDS.agent2User,
+      agencyId: IDS.agency,
+      applicationId: IDS.app7,
+      clientName: "Wanjiku Mwangi",
+      clientEmail: "wanjiku.mwangi@example.com",
+      agentName: "Fatima Bello",
+      type: "follow_up",
+      scheduledDate: daysFromNow(7),
+      scheduledTime: "09:30",
+      durationMinutes: 30,
+      timezone: "Africa/Lagos",
+      status: "scheduled",
+      fee: 0,
+      paymentStatus: "paid",
+      meetingPlatform: "google_meet",
+      createdAt: daysAgo(1),
+      updatedAt: daysAgo(1),
+    },
+    {
+      id: "seed-consult-005",
+      userId: IDS.client3User,
+      agentId: IDS.agent2User,
+      agencyId: IDS.agency,
+      applicationId: IDS.app3,
+      clientName: "Ahmed Ali",
+      clientEmail: "ahmed.ali@example.com",
+      agentName: "Fatima Bello",
+      type: "initial",
+      scheduledDate: daysAgo(55),
+      scheduledTime: "15:00",
+      durationMinutes: 30,
+      timezone: "Africa/Lagos",
+      status: "completed",
+      fee: 250000,
+      paymentStatus: "paid",
+      summary: "Initial consultation for Short Stay C Visa. Discussed travel history and documentation plan.",
+      createdAt: daysAgo(57),
+      updatedAt: daysAgo(55),
+    },
+    {
+      id: "seed-consult-006",
+      userId: IDS.client9User,
+      agentId: IDS.agent2User,
+      agencyId: IDS.agency,
+      applicationId: IDS.app9,
+      clientName: "Priya Sharma",
+      clientEmail: "priya.sharma@example.com",
+      agentName: "Fatima Bello",
+      type: "general",
+      scheduledDate: daysAgo(25),
+      scheduledTime: "10:00",
+      durationMinutes: 30,
+      timezone: "Asia/Kolkata",
+      status: "cancelled",
+      fee: 250000,
+      paymentStatus: "refunded",
+      cancelledAt: daysAgo(26),
+      cancelledBy: IDS.client9User,
+      cancellationReason: "Travel plans changed, no longer need visa.",
+      createdAt: daysAgo(30),
+      updatedAt: daysAgo(25),
+    },
+    {
+      id: "seed-consult-007",
+      userId: IDS.client6User,
+      agentId: IDS.agent1User,
+      agencyId: IDS.agency,
+      applicationId: IDS.app6,
+      clientName: "Kwame Asante",
+      clientEmail: "kwame.asante@example.com",
+      agentName: "Chinedu Eze",
+      type: "initial",
+      scheduledDate: daysFromNow(1),
+      scheduledTime: "16:00",
+      durationMinutes: 30,
+      timezone: "Africa/Accra",
+      status: "confirmed",
+      fee: 500000,
+      paymentStatus: "paid",
+      meetingPlatform: "zoom",
+      meetingLink: "https://zoom.us/j/9876543210",
+      createdAt: daysAgo(2),
+      updatedAt: daysAgo(2),
+    },
+    {
+      id: "seed-consult-008",
+      userId: IDS.client4User,
+      agentId: IDS.agent1User,
+      agencyId: IDS.agency,
+      applicationId: IDS.app4,
+      clientName: "Lisa Wong",
+      clientEmail: "lisa.wong@example.com",
+      agentName: "Chinedu Eze",
+      type: "follow_up",
+      scheduledDate: daysAgo(12),
+      scheduledTime: "13:00",
+      durationMinutes: 30,
+      timezone: "Africa/Lagos",
+      status: "no_show",
+      fee: 0,
+      paymentStatus: "paid",
+      createdAt: daysAgo(15),
+      updatedAt: daysAgo(12),
+    },
+  ];
+
+  const batch = db.batch();
+  for (const c of consultations) {
+    const ref = db.collection("consultations").doc(c.id);
+    batch.set(ref, c);
+  }
+  await batch.commit();
+  console.log(`✅ Seeded ${consultations.length} consultations`);
+  return consultations.length;
+}
+
+// ============================================
 // MAIN EXPORT
 // ============================================
 
@@ -2026,6 +2217,7 @@ export async function seedPortalData(): Promise<{
   notes: number;
   reviews: number;
   transactions: number;
+  consultations: number;
 }> {
   console.log("\n🌱 Seeding portal integration data...\n");
 
@@ -2038,8 +2230,9 @@ export async function seedPortalData(): Promise<{
   const notes = await seedNotes();
   const reviews = await seedReviews();
   const transactions = await seedTransactions();
+  const consultations = await seedConsultations();
 
   console.log("\n✅ Portal seed complete!\n");
 
-  return { users, agencies, agents, applications, timelineEntries, documents, notes, reviews, transactions };
+  return { users, agencies, agents, applications, timelineEntries, documents, notes, reviews, transactions, consultations };
 }
