@@ -20,13 +20,13 @@ export const collections = {
   users: db.collection("users"),
   agents: db.collection("agents"),
   agencies: db.collection("agencies"),
-  agencyInvitations: db.collection("agencyInvitations"),
   countries: db.collection("countries"),
   applications: db.collection("applications"),
-  consultations: db.collection("consultations"),
   transactions: db.collection("transactions"),
+  consultations: db.collection("consultations"),
   notifications: db.collection("notifications"),
   conversations: db.collection("conversations"),
+  agencyInvitations: db.collection("agencyInvitations"),
 } as const;
 
 // Helper to get subcollection references
