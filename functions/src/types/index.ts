@@ -589,6 +589,23 @@ export interface PaymentRequest {
 }
 
 // ============================================
+// BANK ACCOUNT TYPES
+// ============================================
+
+export interface BankAccount {
+  id: string;
+  userId: string; // Owner of the bank account
+
+  accountName: string;
+  bankName: string;
+  accountNumber: string;
+  isMain: boolean;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+// ============================================
 // NOTIFICATION TYPES
 // ============================================
 

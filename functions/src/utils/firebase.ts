@@ -28,6 +28,7 @@ export const collections = {
   paymentRequests: db.collection("paymentRequests"),
   conversations: db.collection("conversations"),
   agencyInvitations: db.collection("agencyInvitations"),
+  bankAccounts: db.collection("bankAccounts"),
   newsArticles: db.collection("newsArticles"),
   newsSources: db.collection("newsSources"),
   newsSubscriptions: db.collection("newsSubscriptions"),
