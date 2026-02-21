@@ -18,6 +18,11 @@ export const api = functions.https.onRequest(app);
 import { collections, messaging } from "./utils/firebase";
 import { agentService } from "./services/agent.service";
 import { visaService } from "./services/visa.service";
+import { newsScraperService } from "./services/news-scraper.service";
+import { newsService } from "./services/news.service";
+import { newsNotificationService } from "./services/news-notification.service";
+import { NewsArticle } from "./types/news";
+import { Timestamp } from "firebase-admin/firestore";
 
 /**
  * When a new user is created via Firebase Auth
@@ -286,5 +291,74 @@ export const sendConsultationReminders = functions.pubsub
       );
     } catch (error) {
       console.error("Error sending consultation reminders:", error);
+    }
+  });
+
+/**
+ * Every 30 minutes: Scrape visa news from due sources
+ */
+export const scrapeNewsOrchestrator = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 540 })
+  .pubsub.schedule("*/30 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    console.log("Running news scrape orchestrator...");
+    try {
+      const result = await newsScraperService.runOrchestrator();
+      console.log(
+        `Orchestrator complete: ${result.sourcesProcessed} sources, ${result.newArticles} new articles, ${result.errors} errors`
+      );
+    } catch (error) {
+      console.error("News scrape orchestrator failed:", error);
+    }
+  });
+
+/**
+ * Weekly: Clean up old news articles and scrape runs
+ * Runs every Sunday at 4 AM UTC
+ */
+export const cleanupOldNews = functions.pubsub
+  .schedule("0 4 * * 0")
+  .timeZone("UTC")
+  .onRun(async () => {
+    console.log("Running news cleanup...");
+    try {
+      const articlesDeleted = await newsService.cleanupOldArticles(90);
+      const runsDeleted = await newsService.cleanupOldScrapeRuns(30);
+      console.log(
+        `News cleanup: ${articlesDeleted} articles, ${runsDeleted} scrape runs deleted`
+      );
+    } catch (error) {
+      console.error("News cleanup failed:", error);
+    }
+  });
+
+/**
+ * When a new news article is created
+ * Send notifications to subscribed users
+ */
+export const onNewsArticleCreated = functions.firestore
+  .document("newsArticles/{articleId}")
+  .onCreate(async (snapshot) => {
+    const article = { ...snapshot.data(), id: snapshot.id } as NewsArticle;
+
+    // Only notify for published, non-low importance articles
+    if (!article.isPublished || article.importance === "low") {
+      return;
+    }
+
+    try {
+      const sentCount = await newsNotificationService.notifySubscribers(article);
+      console.log(
+        `News notification sent to ${sentCount} users for article: ${article.title}`
+      );
+
+      // Mark notification as sent
+      await snapshot.ref.update({
+        isNotificationSent: true,
+        notificationSentAt: Timestamp.now(),
+      });
+    } catch (error) {
+      console.error("Error notifying subscribers:", error);
     }
   });
