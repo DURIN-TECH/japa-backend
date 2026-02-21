@@ -499,12 +499,13 @@ export interface Consultation {
 // TRANSACTION TYPES
 // ============================================
 
-export type TransactionType = 
+export type TransactionType =
   | "consultation_fee"
   | "service_fee"
   | "government_fee"
   | "refund"
-  | "escrow_release";
+  | "escrow_release"
+  | "withdrawal";
 
 export type TransactionStatus = 
   | "pending"

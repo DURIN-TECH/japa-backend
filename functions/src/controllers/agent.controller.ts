@@ -1,10 +1,13 @@
 import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { agentService } from "../services/agent.service";
+import { agencyService } from "../services/agency.service";
 import {
   sendSuccess,
   sendError,
   sendCreated,
+  sendNotFound,
+  sendForbidden,
   ErrorMessages,
 } from "../utils/response";
 
@@ -413,6 +416,68 @@ export class AgentController {
         sendError(res, "NOT_FOUND", "Agent not found", 404);
         return;
       }
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  // ============================================
+  // AGENCY OWNER ENDPOINTS
+  // ============================================
+
+  /**
+   * PUT /agents/:id/status
+   * Agency owner can suspend or deactivate agents in their agency
+   */
+  async updateAgentStatus(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    try {
+      const ownerUserId = req.userId!;
+      const { id: agentId } = req.params;
+      const { status } = req.body;
+
+      const validStatuses = ["suspended", "deactivated"];
+      if (!validStatuses.includes(status)) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          `status must be one of: ${validStatuses.join(", ")}`,
+          400
+        );
+        return;
+      }
+
+      // Verify the caller owns an agency
+      const agency = await agencyService.getAgencyByOwnerId(ownerUserId);
+      if (!agency) {
+        sendForbidden(res, "Only agency owners can manage agent status");
+        return;
+      }
+
+      // Verify the target agent belongs to the caller's agency
+      const agent = await agentService.getAgentById(agentId);
+      if (!agent) {
+        sendNotFound(res, "Agent not found");
+        return;
+      }
+
+      if (agent.agencyId !== agency.id) {
+        sendForbidden(res, "Agent does not belong to your agency");
+        return;
+      }
+
+      // Update the agent's verification status
+      const verificationStatus = status === "deactivated" ? "rejected" : "suspended";
+      const updated = await agentService.updateVerificationStatus(
+        agentId,
+        verificationStatus,
+        ownerUserId
+      );
+
+      sendSuccess(res, updated, `Agent ${status}`);
+    } catch (error) {
+      console.error("Error updating agent status:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

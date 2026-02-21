@@ -1,5 +1,5 @@
 import { collections } from "../utils/firebase";
-import { Transaction, TransactionStatus } from "../types";
+import { Transaction, TransactionStatus, BankAccount } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 
 export interface TransactionFilters {
@@ -129,6 +129,58 @@ class TransactionService {
       availableBalance: totalRevenue,
       pendingClientsCount: pendingUserIds.size,
     };
+  }
+
+  /**
+   * Convenience: get stats for an agent by userId
+   */
+  async getStatsForAgent(agentUserId: string): Promise<TransactionStats> {
+    const transactions = await this.getTransactionsForAgent(agentUserId);
+
+    // Subtract completed withdrawals from available balance
+    const stats = this.computeStats(transactions);
+    const withdrawals = transactions
+      .filter((t) => t.type === "withdrawal" && (t.status === "completed" || t.status === "processing" || t.status === "pending"))
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    stats.availableBalance = Math.max(0, stats.availableBalance - withdrawals);
+    return stats;
+  }
+
+  /**
+   * Create a withdrawal transaction
+   */
+  async createWithdrawal(
+    agentUserId: string,
+    amount: number,
+    bankAccount: BankAccount
+  ): Promise<Transaction> {
+    const ref = collections.transactions.doc();
+    const now = Timestamp.now();
+
+    const transaction: Transaction = {
+      id: ref.id,
+      userId: agentUserId,
+      agentId: agentUserId,
+      type: "withdrawal",
+      amount,
+      currency: "NGN",
+      status: "pending",
+      isEscrow: false,
+      paymentProvider: "manual",
+      description: `Withdrawal to ${bankAccount.bankName} ${bankAccount.accountNumber}`,
+      metadata: {
+        bankAccountId: bankAccount.id,
+        bankAccountName: bankAccount.accountName,
+        bankName: bankAccount.bankName,
+        accountNumber: bankAccount.accountNumber,
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await ref.set(transaction);
+    return transaction;
   }
 
   // ============================================

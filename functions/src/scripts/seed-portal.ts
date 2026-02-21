@@ -46,6 +46,7 @@ async function main() {
     console.log(`- Notifications: ${result.notifications}`);
     console.log(`- Payment Requests: ${result.paymentRequests}`);
     console.log(`- Conversations: ${result.conversations}`);
+    console.log(`- Bank Accounts: ${result.bankAccounts}`);
     console.log("\nLogin credentials (all users): password123");
     console.log("  Admin:  admin@japatest.com");
     console.log("  Admin2: admin2@japatest.com");

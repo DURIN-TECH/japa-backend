@@ -2798,6 +2798,50 @@ async function seedConversations(): Promise<number> {
   return convs.length;
 }
 
+// ============================================
+// BANK ACCOUNTS
+// ============================================
+
+const BANK_ACCOUNT_IDS = {
+  ba1: "seed-bank-account-001",
+  ba2: "seed-bank-account-002",
+};
+
+async function seedBankAccounts(): Promise<number> {
+  const now = Timestamp.now();
+  const accounts = [
+    {
+      id: BANK_ACCOUNT_IDS.ba1,
+      userId: IDS.ownerUser,
+      accountName: "Samuel Okonkwo",
+      bankName: "First Bank",
+      accountNumber: "3047892651",
+      isMain: true,
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: BANK_ACCOUNT_IDS.ba2,
+      userId: IDS.ownerUser,
+      accountName: "Samuel Okonkwo",
+      bankName: "GTBank",
+      accountNumber: "0218734596",
+      isMain: false,
+      createdAt: now,
+      updatedAt: now,
+    },
+  ];
+
+  const batch = db.batch();
+  for (const account of accounts) {
+    batch.set(db.collection("bankAccounts").doc(account.id), account);
+  }
+  await batch.commit();
+
+  console.log(`  ✅ ${accounts.length} bank accounts`);
+  return accounts.length;
+}
+
 export async function seedPortalData(): Promise<{
   authUsers: number;
   users: number;
@@ -2813,6 +2857,7 @@ export async function seedPortalData(): Promise<{
   notifications: number;
   paymentRequests: number;
   conversations: number;
+  bankAccounts: number;
 }> {
   console.log("\n🌱 Seeding portal integration data...\n");
 
@@ -2830,8 +2875,9 @@ export async function seedPortalData(): Promise<{
   const notifications = await seedNotifications();
   const paymentRequests = await seedPaymentRequests();
   const conversations = await seedConversations();
+  const bankAccounts = await seedBankAccounts();
 
   console.log("\n✅ Portal seed complete!\n");
 
-  return { authUsers, users, agencies, agents, applications, timelineEntries, documents, notes, reviews, transactions, consultations, notifications, paymentRequests, conversations };
+  return { authUsers, users, agencies, agents, applications, timelineEntries, documents, notes, reviews, transactions, consultations, notifications, paymentRequests, conversations, bankAccounts };
 }

@@ -39,6 +39,11 @@ router.post("/:id/reviews", verifyAuth, (req, res) =>
   agentController.addReview(req, res)
 );
 
+// Agency owner endpoints
+router.put("/:id/status", verifyAuth, (req, res) =>
+  agentController.updateAgentStatus(req, res)
+);
+
 // Admin endpoints
 router.put("/:id/verification", verifyAuth, verifyAdmin, (req, res) =>
   agentController.updateVerificationStatus(req, res)
