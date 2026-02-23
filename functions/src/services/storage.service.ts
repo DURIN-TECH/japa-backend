@@ -43,6 +43,40 @@ export class StorageService {
   }
 
   /**
+   * Generate a signed upload URL for agent verification documents
+   */
+  async getSignedVerificationUploadUrl(
+    userId: string,
+    fileName: string,
+    contentType: string
+  ): Promise<{
+    uploadUrl: string;
+    storagePath: string;
+    expiresAt: Date;
+  }> {
+    const fileId = uuidv4();
+    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
+    const storagePath = `verification/${userId}/${fileId}_${sanitizedFileName}`;
+
+    const file = this.bucket.file(storagePath);
+
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    const [uploadUrl] = await file.getSignedUrl({
+      version: "v4",
+      action: "write",
+      expires: expiresAt,
+      contentType,
+    });
+
+    return {
+      uploadUrl,
+      storagePath,
+      expiresAt,
+    };
+  }
+
+  /**
    * Generate a signed download URL for a file
    */
   async getSignedDownloadUrl(

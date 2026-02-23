@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { agentController } from "../controllers/agent.controller";
+import { verificationController } from "../controllers/verification.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
 
 const router = Router();
@@ -16,6 +17,20 @@ router.put("/me/availability", verifyAuth, (req, res) =>
 );
 router.put("/me/slots", verifyAuth, (req, res) =>
   agentController.updateAvailableSlots(req, res)
+);
+
+// Verification document endpoints
+router.post("/me/verification/upload-url", verifyAuth, (req, res) =>
+  verificationController.getUploadUrl(req, res)
+);
+router.post("/me/verification/documents", verifyAuth, (req, res) =>
+  verificationController.registerDocument(req, res)
+);
+router.get("/me/verification/documents", verifyAuth, (req, res) =>
+  verificationController.listDocuments(req, res)
+);
+router.delete("/me/verification/documents", verifyAuth, (req, res) =>
+  verificationController.removeDocument(req, res)
 );
 
 // Public agent endpoints

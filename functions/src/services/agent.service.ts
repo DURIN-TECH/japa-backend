@@ -1,4 +1,4 @@
-import { collections, subcollections, serverTimestamp } from "../utils/firebase";
+import { collections, subcollections, serverTimestamp, arrayUnion, arrayRemove } from "../utils/firebase";
 import {
   Agent,
   AgentReview,
@@ -238,6 +238,45 @@ class AgentService {
 
     const updated = await agentRef.get();
     return updated.data() as Agent;
+  }
+
+  // ============================================
+  // VERIFICATION DOCUMENTS
+  // ============================================
+
+  /**
+   * Add a verification document to an agent profile
+   */
+  async addVerificationDocument(agentId: string, storagePath: string): Promise<void> {
+    const agentRef = collections.agents.doc(agentId);
+    const doc = await agentRef.get();
+
+    if (!doc.exists) {
+      throw new Error("Agent not found");
+    }
+
+    await agentRef.update({
+      verificationDocuments: arrayUnion(storagePath),
+      verificationStatus: "under_review",
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  /**
+   * Remove a verification document from an agent profile
+   */
+  async removeVerificationDocument(agentId: string, storagePath: string): Promise<void> {
+    const agentRef = collections.agents.doc(agentId);
+    const doc = await agentRef.get();
+
+    if (!doc.exists) {
+      throw new Error("Agent not found");
+    }
+
+    await agentRef.update({
+      verificationDocuments: arrayRemove(storagePath),
+      updatedAt: serverTimestamp(),
+    });
   }
 
   // ============================================
