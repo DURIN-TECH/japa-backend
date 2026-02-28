@@ -9,6 +9,7 @@
 
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
+import { seedCountriesAndVisas } from "./seed-countries-visas";
 
 const db = getFirestore();
 
@@ -76,8 +77,8 @@ function daysFromNow(days: number): Timestamp {
 // ============================================
 
 const AUTH_USERS = [
-  { uid: IDS.admin1User, email: "admin@japatest.com", displayName: "Olu Adeyemi" },
-  { uid: IDS.admin2User, email: "admin2@japatest.com", displayName: "Ngozi Ibe" },
+  { uid: IDS.admin1User, email: "admin@japatest.com", displayName: "Olu Adeyemi", isAdmin: true },
+  { uid: IDS.admin2User, email: "admin2@japatest.com", displayName: "Ngozi Ibe", isAdmin: true },
   { uid: IDS.ownerUser, email: "owner@japatest.com", displayName: "Adaeze Okonkwo" },
   { uid: IDS.agent1User, email: "agent1@japatest.com", displayName: "Chinedu Eze" },
   { uid: IDS.agent2User, email: "agent2@japatest.com", displayName: "Fatima Bello" },
@@ -113,6 +114,11 @@ async function seedAuthUsers(): Promise<number> {
         emailVerified: true,
       });
       created++;
+    }
+
+    // Set admin custom claims (idempotent — runs every time to ensure claims are correct)
+    if (user.isAdmin) {
+      await auth.setCustomUserClaims(user.uid, { admin: true });
     }
   }
 
@@ -387,6 +393,7 @@ async function seedAgency() {
     totalAgents: 2,
     totalCases: 10,
     activeCases: 5,
+    status: "approved" as const,
     createdAt: daysAgo(90),
     updatedAt: now,
   };
@@ -2847,6 +2854,8 @@ export async function seedPortalData(): Promise<{
   users: number;
   agencies: number;
   agents: number;
+  countries: number;
+  visaTypes: number;
   applications: number;
   timelineEntries: number;
   documents: number;
@@ -2865,6 +2874,7 @@ export async function seedPortalData(): Promise<{
   const users = await seedUsers();
   const agencies = await seedAgency();
   const agents = await seedAgents();
+  const { countries, visaTypes } = await seedCountriesAndVisas();
   const applications = await seedApplications();
   const timelineEntries = await seedTimelines();
   const documents = await seedDocuments();
@@ -2879,5 +2889,5 @@ export async function seedPortalData(): Promise<{
 
   console.log("\n✅ Portal seed complete!\n");
 
-  return { authUsers, users, agencies, agents, applications, timelineEntries, documents, notes, reviews, transactions, consultations, notifications, paymentRequests, conversations, bankAccounts };
+  return { authUsers, users, agencies, agents, countries, visaTypes, applications, timelineEntries, documents, notes, reviews, transactions, consultations, notifications, paymentRequests, conversations, bankAccounts };
 }

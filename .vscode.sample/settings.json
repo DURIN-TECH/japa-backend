@@ -1,0 +1,38 @@
+{
+  // REST Client environment variables for api.http
+  //
+  // Setup:
+  //   1. Copy this folder:  cp -r .vscode.sample .vscode
+  //   2. For production: replace YOUR_FIREBASE_API_KEY with your real key
+  //      (Firebase Console → Project Settings → Web app → apiKey)
+  //   3. Switch environments via VS Code status bar (bottom right)
+  //
+  // Seed users (all password: password123):
+  //   Admin:  admin@japatest.com      (has admin custom claim)
+  //   Admin2: admin2@japatest.com     (has admin custom claim)
+  //   Owner:  owner@japatest.com      (agency owner)
+  //   Agent1: agent1@japatest.com
+  //   Agent2: agent2@japatest.com
+  //   Client: john.doe@example.com
+
+  "rest-client.environmentVariables": {
+    "$shared": {
+      "password": "password123",
+      "adminEmail": "admin@japatest.com",
+      "ownerEmail": "owner@japatest.com",
+      "agent1Email": "agent1@japatest.com",
+      "agent2Email": "agent2@japatest.com",
+      "clientEmail": "john.doe@example.com"
+    },
+    "local": {
+      "baseUrl": "http://localhost:5001/japa-platform/us-central1/api",
+      "authUrl": "http://localhost:9099/identitytoolkit.googleapis.com/v1",
+      "apiKey": "fake-api-key"
+    },
+    "production": {
+      "baseUrl": "https://us-central1-japa-platform.cloudfunctions.net/api",
+      "authUrl": "https://identitytoolkit.googleapis.com/v1",
+      "apiKey": "YOUR_FIREBASE_API_KEY"
+    }
+  }
+}

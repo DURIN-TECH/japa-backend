@@ -17,9 +17,24 @@ agencyRoutes.post("/", verifyAuth, (req, res) =>
   agencyController.createAgency(req, res)
 );
 
+// Admin: list pending agencies
+agencyRoutes.get("/pending", verifyAuth, verifyAdmin, (req, res) =>
+  agencyController.getPendingAgencies(req, res)
+);
+
 // Admin: list all agencies
 agencyRoutes.get("/", verifyAuth, verifyAdmin, (req, res) =>
   agencyController.getAllAgencies(req, res)
+);
+
+// Admin: get agency review data
+agencyRoutes.get("/:id/review", verifyAuth, verifyAdmin, (req, res) =>
+  agencyController.getAgencyReview(req, res)
+);
+
+// Admin: approve/reject agency
+agencyRoutes.put("/:id/approval", verifyAuth, verifyAdmin, (req, res) =>
+  agencyController.updateAgencyApproval(req, res)
 );
 
 // Agency members

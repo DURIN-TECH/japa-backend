@@ -345,6 +345,68 @@ export class AgencyController {
   }
 
   /**
+   * GET /agencies/:id/review (admin only)
+   * Get agency + owner details for admin review
+   */
+  async getAgencyReview(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+      const data = await agencyService.getAgencyReviewData(id);
+      if (!data) {
+        sendError(res, "NOT_FOUND", "Agency not found", 404);
+        return;
+      }
+      sendSuccess(res, data);
+    } catch (error) {
+      console.error("Error getting agency review data:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /agencies/pending (admin only)
+   * List agencies with status "pending_review"
+   */
+  async getPendingAgencies(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const agencies = await agencyService.getAgenciesByStatus("pending_review");
+      sendSuccess(res, agencies);
+    } catch (error) {
+      console.error("Error getting pending agencies:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /agencies/:id/approval (admin only)
+   * Approve or reject an agency
+   * Body: { action: "approve" | "reject", reason?: string }
+   */
+  async updateAgencyApproval(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const adminUserId = req.userId!;
+      const { id } = req.params;
+      const { action, reason } = req.body;
+
+      if (!action || !["approve", "reject"].includes(action)) {
+        sendError(res, "VALIDATION_ERROR", "Action must be 'approve' or 'reject'", 400);
+        return;
+      }
+
+      const agency = await agencyService.updateAgencyApproval(id, action, adminUserId, reason);
+      sendSuccess(res, agency, `Agency ${action === "approve" ? "approved" : "rejected"} successfully`);
+    } catch (error) {
+      console.error("Error updating agency approval:", error);
+      const message = (error as Error).message;
+      if (message === "Agency not found") {
+        sendError(res, "NOT_FOUND", message, 404);
+        return;
+      }
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * GET /agencies (admin only)
    * List all agencies
    */

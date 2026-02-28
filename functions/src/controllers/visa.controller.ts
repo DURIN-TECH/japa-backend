@@ -296,6 +296,67 @@ export class VisaController {
   }
 
   // ============================================
+  // ADMIN ENDPOINTS
+  // ============================================
+
+  /**
+   * GET /admin/visas
+   * Get all visa types for admin review
+   */
+  async getAdminVisas(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const visas = await visaService.getAllVisaTypesForAdmin();
+      sendSuccess(res, visas);
+    } catch (error) {
+      console.error("Error getting admin visas:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PATCH /admin/visas/:id/review
+   * Approve or reject a visa type
+   */
+  async reviewVisa(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+      const { action, reason, countryCode } = req.body;
+
+      if (!action || !["approve", "reject"].includes(action)) {
+        sendError(res, "VALIDATION_ERROR", "action must be 'approve' or 'reject'", 400);
+        return;
+      }
+
+      if (action === "reject" && !reason) {
+        sendError(res, "VALIDATION_ERROR", "reason is required when rejecting", 400);
+        return;
+      }
+
+      if (!countryCode) {
+        sendError(res, "VALIDATION_ERROR", "countryCode is required", 400);
+        return;
+      }
+
+      const updatedVisa = await visaService.updateVisaReviewStatus(
+        countryCode,
+        id,
+        action,
+        req.userId!,
+        reason
+      );
+
+      sendSuccess(res, updatedVisa, `Visa ${action === "approve" ? "approved" : "rejected"} successfully`);
+    } catch (error) {
+      console.error("Error reviewing visa:", error);
+      if ((error as Error).message === "Visa type not found") {
+        sendError(res, "NOT_FOUND", "Visa type not found", 404);
+        return;
+      }
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  // ============================================
   // SEARCH ENDPOINTS
   // ============================================
 

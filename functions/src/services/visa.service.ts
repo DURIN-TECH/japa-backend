@@ -224,6 +224,8 @@ class VisaService {
       eligibilityCriteria: input.eligibilityCriteria,
       isActive: true,
       agentIds: [],
+      reviewStatus: "pending_review",
+      source: "agent",
       createdAt: now,
       updatedAt: now,
     };
@@ -436,6 +438,77 @@ class VisaService {
       visaTypes: results.slice(offset, offset + limit),
       total,
     };
+  }
+
+  // ============================================
+  // ADMIN OPERATIONS
+  // ============================================
+
+  /**
+   * Get all visa types across all countries for admin review (includes inactive)
+   */
+  async getAllVisaTypesForAdmin(): Promise<
+    (VisaType & { countryName: string })[]
+  > {
+    const countries = await this.getCountries(false);
+    const results: (VisaType & { countryName: string })[] = [];
+
+    for (const country of countries) {
+      const snapshot = await subcollections
+        .visaTypes(country.code)
+        .orderBy("createdAt", "desc")
+        .get();
+
+      const visaTypes = snapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+        countryName: country.name,
+      })) as (VisaType & { countryName: string })[];
+
+      results.push(...visaTypes);
+    }
+
+    return results;
+  }
+
+  /**
+   * Update visa review status (admin only)
+   */
+  async updateVisaReviewStatus(
+    countryCode: string,
+    visaTypeId: string,
+    action: "approve" | "reject",
+    reviewedBy: string,
+    rejectionReason?: string
+  ): Promise<VisaType> {
+    const visaTypeRef = subcollections
+      .visaTypes(countryCode.toUpperCase())
+      .doc(visaTypeId);
+
+    const doc = await visaTypeRef.get();
+    if (!doc.exists) {
+      throw new Error("Visa type not found");
+    }
+
+    const updates: Record<string, unknown> = {
+      reviewStatus: action === "approve" ? "approved" : "rejected",
+      reviewedBy,
+      reviewedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+
+    if (action === "reject" && rejectionReason) {
+      updates.rejectionReason = rejectionReason;
+    }
+
+    if (action === "approve") {
+      updates.isActive = true;
+    }
+
+    await visaTypeRef.update(updates);
+
+    const updated = await visaTypeRef.get();
+    return { id: updated.id, ...updated.data() } as VisaType;
   }
 
   /**

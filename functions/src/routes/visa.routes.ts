@@ -49,4 +49,14 @@ visaSearchRoutes.get("/popular", (req, res) =>
   visaController.getPopularVisaTypes(req, res)
 );
 
-export { countryRoutes, visaSearchRoutes };
+// Routes mounted at /admin/visas
+const adminVisaRoutes = Router();
+
+adminVisaRoutes.get("/", verifyAuth, verifyAdmin, (req, res) =>
+  visaController.getAdminVisas(req, res)
+);
+adminVisaRoutes.patch("/:id/review", verifyAuth, verifyAdmin, (req, res) =>
+  visaController.reviewVisa(req, res)
+);
+
+export { countryRoutes, visaSearchRoutes, adminVisaRoutes };

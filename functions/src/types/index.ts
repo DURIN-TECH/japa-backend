@@ -55,6 +55,8 @@ export type AgencyMemberRole = "owner" | "agent";
 
 export type AgencyInvitationStatus = "pending" | "accepted" | "declined" | "expired";
 
+export type AgencyStatus = "pending_review" | "approved" | "rejected" | "suspended";
+
 export interface AgencyService {
   id: string;
   name: string;
@@ -83,6 +85,12 @@ export interface Agency {
   totalAgents: number;
   totalCases: number;
   activeCases: number;
+
+  // Approval status
+  status: AgencyStatus;
+  rejectionReason?: string;
+  reviewedBy?: string; // Admin userId who approved/rejected
+  reviewedAt?: Timestamp;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -233,6 +241,13 @@ export interface VisaType {
 
   // Agents who handle this visa
   agentIds: string[];
+
+  // Admin review
+  reviewStatus?: "pending_review" | "approved" | "rejected";
+  source?: "scraped" | "agent";
+  reviewedBy?: string;
+  reviewedAt?: Timestamp;
+  rejectionReason?: string;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;

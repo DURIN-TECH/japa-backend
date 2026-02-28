@@ -36,6 +36,8 @@ async function main() {
     console.log(`- Users: ${result.users}`);
     console.log(`- Agencies: ${result.agencies}`);
     console.log(`- Agents: ${result.agents}`);
+    console.log(`- Countries: ${result.countries}`);
+    console.log(`- Visa types: ${result.visaTypes}`);
     console.log(`- Applications: ${result.applications}`);
     console.log(`- Timeline entries: ${result.timelineEntries}`);
     console.log(`- Documents: ${result.documents}`);

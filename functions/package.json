@@ -15,6 +15,8 @@
     "seed:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-questions.js",
     "seed:portal": "npm run build && node lib/scripts/seed-portal.js",
     "seed:portal:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-portal.js",
+    "seed:auth": "npm run build && node lib/scripts/seed-auth-users.js",
+    "seed:auth:emulator": "npm run build && FIREBASE_AUTH_EMULATOR_HOST=localhost:9099 node lib/scripts/seed-auth-users.js",
     "seed:news": "npm run build && node lib/scripts/seed-news-sources.js",
     "seed:news:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-news-sources.js",
     "lint": "eslint --ext .ts src/",

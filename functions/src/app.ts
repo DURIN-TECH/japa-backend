@@ -3,7 +3,7 @@ import cors from "cors";
 
 // Route modules
 import { userRoutes } from "./routes/user.routes";
-import { countryRoutes, visaSearchRoutes } from "./routes/visa.routes";
+import { countryRoutes, visaSearchRoutes, adminVisaRoutes } from "./routes/visa.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
@@ -19,6 +19,7 @@ import { paymentRequestRoutes } from "./routes/payment-request.routes";
 import { messagingRoutes } from "./routes/messaging.routes";
 import { newsRoutes } from "./routes/news.routes";
 import { bankAccountRoutes } from "./routes/bank-account.routes";
+import { onboardingRoutes } from "./routes/onboarding.routes";
 import { devRoutes } from "./routes/dev.routes";
 
 // Create Express app
@@ -54,9 +55,11 @@ app.use("/notifications", notificationRoutes);
 app.use("/payment-requests", paymentRequestRoutes);
 app.use("/conversations", messagingRoutes);
 app.use("/bank-accounts", bankAccountRoutes);
+app.use("/onboarding", onboardingRoutes);
 app.use("/news", newsRoutes);
 app.use("/eligibility", eligibilityRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
+app.use("/admin/visas", adminVisaRoutes);
 app.use("/dev", devRoutes);
 
 // Error handling

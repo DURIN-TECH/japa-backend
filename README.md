@@ -38,45 +38,24 @@ japa-backend/
 ├── functions/
 │   ├── src/
 │   │   ├── controllers/        # HTTP request handlers
-│   │   │   ├── user.controller.ts
-│   │   │   ├── visa.controller.ts
-│   │   │   ├── agent.controller.ts
-│   │   │   ├── application.controller.ts
-│   │   │   ├── document.controller.ts
-│   │   │   ├── agency.controller.ts
-│   │   │   └── note.controller.ts
-│   │   ├── services/           # Business logic
-│   │   │   ├── user.service.ts
-│   │   │   ├── visa.service.ts
-│   │   │   ├── agent.service.ts
-│   │   │   ├── application.service.ts
-│   │   │   ├── document.service.ts
-│   │   │   ├── agency.service.ts
-│   │   │   └── note.service.ts
-│   │   ├── middleware/         # Express middleware
-│   │   │   └── auth.ts
-│   │   ├── types/              # TypeScript types
-│   │   │   ├── index.ts
-│   │   │   └── eligibility.ts
-│   │   ├── utils/              # Utilities
-│   │   │   ├── firebase.ts     # Firestore collections & subcollections
-│   │   │   └── response.ts
-│   │   ├── data/               # Seed data
-│   │   │   ├── seed-portal-data.ts
-│   │   │   ├── seed-ireland-visa.ts
-│   │   │   └── eligibility-seed-nigeria-ireland.ts
-│   │   ├── scripts/            # Seed runners
-│   │   │   ├── seed-portal.ts
-│   │   │   ├── seed-eligibility.ts
-│   │   │   └── seed-questions.ts
-│   │   ├── app.ts              # Express app & routes
-│   │   └── index.ts            # Cloud Functions entry
+│   │   ├── services/           # Business logic (Firestore operations)
+│   │   ├── routes/             # Express route definitions
+│   │   ├── middleware/         # Auth verification, role checks
+│   │   ├── types/              # TypeScript type definitions
+│   │   ├── utils/              # Firebase init, response helpers
+│   │   ├── data/               # Seed data definitions
+│   │   ├── scripts/            # Seed script runners
+│   │   ├── app.ts              # Express app & route mounting
+│   │   └── index.ts            # Cloud Functions entry point
+│   ├── lib/                    # Compiled JS output (gitignored)
 │   ├── package.json
 │   └── tsconfig.json
-├── firebase.json
-├── firestore.rules
-├── firestore.indexes.json
-├── storage.rules
+├── firebase.json               # Emulator and deployment config
+├── firestore.rules             # Firestore security rules
+├── firestore.indexes.json      # Composite indexes
+├── storage.rules               # Cloud Storage security rules
+├── api.http                    # REST Client test file
+├── .vscode.sample/             # REST Client environment template
 └── README.md
 ```
 
@@ -84,39 +63,40 @@ japa-backend/
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 20 (required by `engines` in `package.json`)
 - Firebase CLI: `npm install -g firebase-tools`
-- Firebase project created
 
-### Installation
+### Quick Start (recommended)
 
-1. **Clone and install dependencies:**
-   ```bash
-   cd japa-backend/functions
-   npm install
-   ```
-
-2. **Login to Firebase:**
-   ```bash
-   firebase login
-   ```
-
-3. **Select your project:**
-   ```bash
-   firebase use your-project-id
-   ```
-
-4. **Start emulators for local development:**
-   ```bash
-   npm run serve
-   ```
-
-### Environment Setup
-
-For production, set up environment variables:
+The easiest way to run everything is from the monorepo root:
 
 ```bash
-firebase functions:config:set stripe.secret_key="sk_xxx"
+./dev.sh --seed --no-mobile
+```
+
+This builds the functions, starts all emulators, seeds test data, and launches the portal in one command. See `./dev.sh --help` for options.
+
+### Manual Setup
+
+```bash
+# Install dependencies
+cd japa-backend/functions
+npm install
+
+# Build TypeScript
+npm run build
+
+# Start emulators (run from japa-backend/, not functions/)
+cd ..
+firebase emulators:start --project japa-platform
+```
+
+### Portal Integration
+
+Set the portal's `NEXT_PUBLIC_API_URL` in `japa-portal/.env.local`:
+
+```
+NEXT_PUBLIC_API_URL=http://localhost:5001/japa-platform/us-central1/api
 ```
 
 ## User Roles
@@ -264,39 +244,83 @@ The `role` query parameter controls which applications are returned:
 
 ## Seed Data
 
-Seed scripts populate Firestore with test data for development.
+Seed scripts populate the emulator with test users and Firestore data.
 
-### Portal seed (users, agency, agents, applications, timelines, documents, notes)
+### Seed Users
+
+All seeded with password `password123`:
+
+| Role | Email | UID | Custom Claims |
+|------|-------|-----|---------------|
+| Admin | admin@japatest.com | seed-user-admin-001 | `admin: true` |
+| Admin 2 | admin2@japatest.com | seed-user-admin-002 | `admin: true` |
+| Agency Owner | owner@japatest.com | seed-user-owner-001 | — |
+| Agent 1 | agent1@japatest.com | seed-user-agent-001 | — |
+| Agent 2 | agent2@japatest.com | seed-user-agent-002 | — |
+| Client | john.doe@example.com | seed-user-client-001 | — |
+
+Additional clients (jane.smith, ahmed.ali, etc.) are also seeded for case data.
+
+### Running Seeds
 
 ```bash
-# Against emulator (recommended for development)
 cd functions
+
+# Seed everything (auth users + all Firestore data)
 npm run seed:portal:emulator
 
-# Against production (use with caution)
-npm run seed:portal
+# Seed individually
+npm run seed:auth:emulator     # Auth users only
+npm run seed:news:emulator     # News sources only
+npm run seed:emulator          # Eligibility questions only
 ```
 
-Creates:
-- 8 users (1 owner, 2 agents, 5 clients)
+### What Gets Created
+
+The portal seed creates:
+- 10+ auth users (admins, owner, agents, clients)
 - 1 agency with 4 services
 - 3 agents linked to the agency
-- 5 applications across statuses: `under_review`, `pending_documents`, `approved`, `rejected`, `pending_payment`
-- 13 timeline entries
-- 8 documents (verified, under review, rejected)
-- 5 case notes from agent and owner
+- 5 applications across statuses
+- Timeline entries, documents, notes, reviews
+- Transactions, consultations, notifications
+- Conversations, payment requests, bank accounts
 
 All IDs are deterministic (`seed-*`) so the script is idempotent.
 
-### Eligibility seed (Ireland visa questions)
+## API Testing (`api.http`)
+
+Test endpoints directly in VS Code using the [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension.
+
+### Setup
 
 ```bash
-cd functions
-npm run seed:emulator    # Against emulator
-npm run seed             # Against production
+cd japa-backend
+cp -r .vscode.sample .vscode
 ```
 
-Creates eligibility questions for Nigeria-to-Ireland visa routes.
+This creates `.vscode/settings.json` with REST Client environment variables. The `.vscode/` directory is gitignored so your local settings (including any production API keys) won't be committed.
+
+### Environments
+
+Switch between environments from the VS Code status bar (bottom right corner):
+
+| Environment | Auth URL | API URL | API Key |
+|-------------|----------|---------|---------|
+| **local** | Firebase Auth emulator (port 9099) | Cloud Functions emulator (port 5001) | `fake-api-key` (anything works) |
+| **production** | `identitytoolkit.googleapis.com` | Deployed Cloud Functions | Your real Firebase API key |
+
+For production, open `.vscode/settings.json` and replace `YOUR_FIREBASE_API_KEY` with your key from [Firebase Console](https://console.firebase.google.com/) > Project Settings > Web app > `apiKey`.
+
+### How It Works
+
+1. Start emulators with seed data (`./dev.sh --seed --no-mobile` from monorepo root)
+2. Open `api.http` in VS Code
+3. Select the **local** environment from the status bar
+4. Click **Send Request** on a login block (e.g. "Sign in as Admin") — this calls the Firebase Auth REST API to get a real ID token
+5. Run any subsequent request — it uses the captured token automatically via `{{adminToken}}`, `{{ownerToken}}`, etc.
+
+The login blocks sign in against Firebase Auth (emulator or production, depending on environment) and capture the `idToken` from the response. Tokens expire after ~1 hour; just re-run the login request to get a fresh one.
 
 ## Development
 
@@ -313,25 +337,15 @@ npm run lint:fix         # Auto-fix lint issues
 npm run deploy           # Deploy to Firebase
 ```
 
-### Local Emulators
+### Emulator Ports
 
-```bash
-npm run serve
-```
-
-- Functions: http://localhost:5001/japa-platform/us-central1/api
-- Firestore UI: http://localhost:4000
-- Auth UI: http://localhost:4000/auth
-- Auth emulator: port 9099
-- Firestore emulator: port 8080
-
-### Portal Integration
-
-Set the portal's API URL to the local emulator:
-
-```
-NEXT_PUBLIC_API_URL=http://localhost:5001/japa-platform/us-central1/api
-```
+| Service | Port | URL |
+|---------|------|-----|
+| Emulator UI | 4000 | http://localhost:4000 |
+| Cloud Functions | 5001 | http://localhost:5001/japa-platform/us-central1/api |
+| Firestore | 8080 | http://localhost:8080 |
+| Auth | 9099 | http://localhost:9099 |
+| Storage | 9199 | http://localhost:9199 |
 
 ## Deployment
 

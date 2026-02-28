@@ -8,6 +8,7 @@ import {
   AgencyInvitation,
   AgencyService as AgencyServiceType,
   Agent,
+  User,
 } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -82,6 +83,7 @@ class AgencyService {
       totalAgents: 1, // Owner counts as the first member
       totalCases: 0,
       activeCases: 0,
+      status: "pending_review",
       createdAt: now,
       updatedAt: now,
     };
@@ -408,6 +410,80 @@ class AgencyService {
       .get();
 
     return snapshot.docs.map((doc) => doc.data() as AgencyInvitation);
+  }
+
+  /**
+   * Get agencies by status (admin only)
+   */
+  async getAgenciesByStatus(status: string): Promise<Agency[]> {
+    const snapshot = await collections.agencies
+      .where("status", "==", status)
+      .orderBy("createdAt", "desc")
+      .get();
+
+    return snapshot.docs.map((doc) => doc.data() as Agency);
+  }
+
+  /**
+   * Update agency approval status (admin only)
+   */
+  async updateAgencyApproval(
+    agencyId: string,
+    action: "approve" | "reject",
+    adminUserId: string,
+    reason?: string
+  ): Promise<Agency> {
+    const agencyRef = collections.agencies.doc(agencyId);
+    const doc = await agencyRef.get();
+
+    if (!doc.exists) {
+      throw new Error("Agency not found");
+    }
+
+    const now = Timestamp.now();
+    const updates: Record<string, unknown> = {
+      status: action === "approve" ? "approved" : "rejected",
+      reviewedBy: adminUserId,
+      reviewedAt: now,
+      updatedAt: now,
+    };
+
+    if (action === "reject" && reason) {
+      updates.rejectionReason = reason;
+    }
+
+    await agencyRef.update(updates);
+    const updated = await agencyRef.get();
+    return updated.data() as Agency;
+  }
+
+  /**
+   * Get agency review data: agency + owner's User profile + owner's Agent profile (admin only)
+   */
+  async getAgencyReviewData(
+    agencyId: string
+  ): Promise<{ agency: Agency; ownerUser: User; ownerAgent: Agent | null } | null> {
+    const agencyDoc = await collections.agencies.doc(agencyId).get();
+    if (!agencyDoc.exists) return null;
+
+    const agency = agencyDoc.data() as Agency;
+
+    const [userDoc, agentSnapshot] = await Promise.all([
+      collections.users.doc(agency.ownerId).get(),
+      collections.agents
+        .where("userId", "==", agency.ownerId)
+        .limit(1)
+        .get(),
+    ]);
+
+    if (!userDoc.exists) return null;
+
+    const ownerUser = { id: userDoc.id, ...userDoc.data() } as User;
+    const ownerAgent = agentSnapshot.empty
+      ? null
+      : (agentSnapshot.docs[0].data() as Agent);
+
+    return { agency, ownerUser, ownerAgent };
   }
 
   /**
