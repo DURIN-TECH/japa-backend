@@ -20,6 +20,7 @@ import { messagingRoutes } from "./routes/messaging.routes";
 import { newsRoutes } from "./routes/news.routes";
 import { bankAccountRoutes } from "./routes/bank-account.routes";
 import { onboardingRoutes } from "./routes/onboarding.routes";
+import { analyticsRoutes } from "./routes/analytics.routes";
 import { devRoutes } from "./routes/dev.routes";
 
 // Create Express app
@@ -56,6 +57,7 @@ app.use("/payment-requests", paymentRequestRoutes);
 app.use("/conversations", messagingRoutes);
 app.use("/bank-accounts", bankAccountRoutes);
 app.use("/onboarding", onboardingRoutes);
+app.use("/analytics", analyticsRoutes);
 app.use("/news", newsRoutes);
 app.use("/eligibility", eligibilityRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);

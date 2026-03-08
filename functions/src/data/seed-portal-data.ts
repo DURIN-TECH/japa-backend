@@ -2559,6 +2559,143 @@ async function seedNotifications(): Promise<number> {
       readAt: daysAgo(3),
       createdAt: daysAgo(4),
     },
+
+    // ============================================
+    // CLIENT NOTIFICATIONS (for mobile app testing)
+    // ============================================
+
+    // client1 (John Doe) — has app1 (under_review) + consult-001 (completed)
+    {
+      id: "seed-notif-013",
+      userId: IDS.client1User,
+      type: "application_update",
+      title: "Document review in progress",
+      body: "Your agent is reviewing your submitted documents for Short Stay 'C' Visa.",
+      actionUrl: `/me/applications/${IDS.app1}`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app1,
+      isRead: false,
+      createdAt: daysAgo(1),
+    },
+    {
+      id: "seed-notif-014",
+      userId: IDS.client1User,
+      type: "document_status",
+      title: "Document verified",
+      body: "Your employment letter has been verified by Chinedu Eze.",
+      actionUrl: `/me/applications/${IDS.app1}`,
+      relatedEntityType: "document",
+      relatedEntityId: IDS.app1,
+      isRead: true,
+      readAt: daysAgo(14),
+      createdAt: daysAgo(15),
+    },
+    {
+      id: "seed-notif-015",
+      userId: IDS.client1User,
+      type: "system",
+      title: "Welcome to Japa",
+      body: "Your account is set up. Start by browsing visa types or finding an agent.",
+      isRead: true,
+      readAt: daysAgo(44),
+      createdAt: daysAgo(45),
+    },
+
+    // client2 (Jane Smith) — has app2 (pending_documents) + consult-002 (completed)
+    {
+      id: "seed-notif-016",
+      userId: IDS.client2User,
+      type: "document_status",
+      title: "Document rejected",
+      body: "Your degree certificate was rejected: blurry scan. Please re-upload a clearer copy.",
+      actionUrl: `/me/applications/${IDS.app2}`,
+      relatedEntityType: "document",
+      relatedEntityId: IDS.app2,
+      isRead: false,
+      createdAt: daysAgo(2),
+    },
+    {
+      id: "seed-notif-017",
+      userId: IDS.client2User,
+      type: "application_update",
+      title: "Documents needed",
+      body: "5 more documents are required for your Employment Permit application.",
+      actionUrl: `/me/applications/${IDS.app2}`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app2,
+      isRead: true,
+      readAt: daysAgo(9),
+      createdAt: daysAgo(10),
+    },
+
+    // client3 (Ahmed Ali) — has app3 (approved)
+    {
+      id: "seed-notif-018",
+      userId: IDS.client3User,
+      type: "application_update",
+      title: "Visa approved!",
+      body: "Congratulations! Your Short Stay 'C' Visa has been approved. Valid for 90 days.",
+      actionUrl: `/me/applications/${IDS.app3}`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app3,
+      isRead: false,
+      createdAt: daysAgo(5),
+    },
+
+    // client5 (Tunde Bakare) — has app5 (pending_payment)
+    {
+      id: "seed-notif-019",
+      userId: IDS.client5User,
+      type: "payment_received",
+      title: "Payment required",
+      body: "Please complete payment for your Short Stay 'C' Visa application to proceed.",
+      actionUrl: `/me/applications/${IDS.app5}`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app5,
+      isRead: false,
+      createdAt: daysAgo(1),
+    },
+
+    // client6 (Kwame Asante) — has consult-007 (confirmed, tomorrow)
+    {
+      id: "seed-notif-020",
+      userId: IDS.client6User,
+      type: "consultation_reminder",
+      title: "Consultation tomorrow",
+      body: "Reminder: Your consultation with Chinedu Eze is scheduled for tomorrow at 4:00 PM.",
+      actionUrl: `/me/consultations/seed-consult-007`,
+      relatedEntityType: "consultation",
+      relatedEntityId: "seed-consult-007",
+      isRead: false,
+      createdAt: daysAgo(0),
+    },
+
+    // client8 (Sipho Ndlovu) — has consult-003 (confirmed, 3 days) + app8 (interview)
+    {
+      id: "seed-notif-021",
+      userId: IDS.client8User,
+      type: "consultation_reminder",
+      title: "Upcoming interview prep session",
+      body: "Your interview preparation session with Chinedu Eze is in 3 days at 11:00 AM.",
+      actionUrl: `/me/consultations/seed-consult-003`,
+      relatedEntityType: "consultation",
+      relatedEntityId: "seed-consult-003",
+      isRead: false,
+      createdAt: daysAgo(0),
+    },
+    {
+      id: "seed-notif-022",
+      userId: IDS.client8User,
+      type: "application_update",
+      title: "Interview scheduled",
+      body: "An interview has been scheduled for your Employment Permit application. Check your consultation details.",
+      actionUrl: `/me/applications/${IDS.app8}`,
+      relatedEntityType: "application",
+      relatedEntityId: IDS.app8,
+      isRead: true,
+      readAt: daysAgo(4),
+      createdAt: daysAgo(5),
+    },
   ];
 
   const batch = db.batch();
