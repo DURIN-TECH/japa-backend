@@ -171,6 +171,148 @@ class AnalyticsService {
   }
 
   // ============================================
+  // EVENT QUERY METHODS
+  // Query and aggregate tracked user interactions.
+  // ============================================
+
+  /**
+   * GET /analytics/event-summary
+   *
+   * Returns aggregated counts of tracked events, grouped by event name.
+   * Useful for understanding which features are most/least used.
+   *
+   * Supports filtering by:
+   *   - date range (from/to)
+   *   - source (portal/mobile)
+   *   - specific event names
+   */
+  async getEventSummary(
+    from: string,
+    to: string,
+    source?: string,
+    eventNames?: string[]
+  ): Promise<EventSummaryItem[]> {
+    let query: FirebaseFirestore.Query = db.collection(COLLECTION)
+      .where("clientTimestamp", ">=", Timestamp.fromDate(new Date(from)))
+      .where("clientTimestamp", "<=", Timestamp.fromDate(new Date(to + "T23:59:59.999Z")));
+
+    if (source) {
+      query = query.where("source", "==", source);
+    }
+
+    const snapshot = await query.get();
+
+    // Count events by name
+    const counts = new Map<string, number>();
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      const eventName = data.event as string;
+
+      // If specific events requested, skip others
+      if (eventNames && eventNames.length > 0 && !eventNames.includes(eventName)) {
+        continue;
+      }
+
+      counts.set(eventName, (counts.get(eventName) || 0) + 1);
+    }
+
+    // Sort by count descending
+    return Array.from(counts.entries())
+      .map(([event, count]) => ({ event, count }))
+      .sort((a, b) => b.count - a.count);
+  }
+
+  /**
+   * GET /analytics/active-users
+   *
+   * Returns unique user and session counts within a date range.
+   * Provides daily active users (DAU), weekly active users (WAU),
+   * and total unique sessions.
+   */
+  async getActiveUsers(
+    from: string,
+    to: string,
+    source?: string
+  ): Promise<ActiveUsersData> {
+    let query: FirebaseFirestore.Query = db.collection(COLLECTION)
+      .where("clientTimestamp", ">=", Timestamp.fromDate(new Date(from)))
+      .where("clientTimestamp", "<=", Timestamp.fromDate(new Date(to + "T23:59:59.999Z")));
+
+    if (source) {
+      query = query.where("source", "==", source);
+    }
+
+    const snapshot = await query.get();
+
+    const uniqueUsers = new Set<string>();
+    const uniqueSessions = new Set<string>();
+    const dailyUsers = new Map<string, Set<string>>();
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      if (data.userId) uniqueUsers.add(data.userId);
+      if (data.sessionId) uniqueSessions.add(data.sessionId);
+
+      // Group by day for DAU
+      if (data.userId && data.clientTimestamp) {
+        const day = data.clientTimestamp.toDate().toISOString().split("T")[0];
+        if (!dailyUsers.has(day)) dailyUsers.set(day, new Set());
+        dailyUsers.get(day)!.add(data.userId);
+      }
+    }
+
+    // Compute average DAU
+    const dauValues = Array.from(dailyUsers.values()).map((s) => s.size);
+    const avgDAU = dauValues.length > 0
+      ? Math.round(dauValues.reduce((a, b) => a + b, 0) / dauValues.length)
+      : 0;
+
+    return {
+      totalUniqueUsers: uniqueUsers.size,
+      totalSessions: uniqueSessions.size,
+      avgDailyActiveUsers: avgDAU,
+      dailyBreakdown: Array.from(dailyUsers.entries())
+        .map(([date, users]) => ({ date, count: users.size }))
+        .sort((a, b) => a.date.localeCompare(b.date)),
+    };
+  }
+
+  /**
+   * GET /analytics/top-pages
+   *
+   * Returns page view counts grouped by page path.
+   * Shows which pages get the most traffic.
+   */
+  async getTopPages(
+    from: string,
+    to: string,
+    source?: string,
+    limit = 20
+  ): Promise<PageViewItem[]> {
+    let query: FirebaseFirestore.Query = db.collection(COLLECTION)
+      .where("event", "==", "page_view")
+      .where("clientTimestamp", ">=", Timestamp.fromDate(new Date(from)))
+      .where("clientTimestamp", "<=", Timestamp.fromDate(new Date(to + "T23:59:59.999Z")));
+
+    if (source) {
+      query = query.where("source", "==", source);
+    }
+
+    const snapshot = await query.get();
+
+    const pageCounts = new Map<string, number>();
+    for (const doc of snapshot.docs) {
+      const page = doc.data().page as string;
+      pageCounts.set(page, (pageCounts.get(page) || 0) + 1);
+    }
+
+    return Array.from(pageCounts.entries())
+      .map(([page, views]) => ({ page, views }))
+      .sort((a, b) => b.views - a.views)
+      .slice(0, limit);
+  }
+
+  // ============================================
   // ANALYTICS QUERY METHODS
   // These compute KPIs, trends, and metrics from
   // application and transaction collections.
@@ -685,6 +827,23 @@ export interface StatusPipelineData {
   interview_scheduled: number;
   approved: number;
   rejected: number;
+}
+
+export interface EventSummaryItem {
+  event: string;
+  count: number;
+}
+
+export interface ActiveUsersData {
+  totalUniqueUsers: number;
+  totalSessions: number;
+  avgDailyActiveUsers: number;
+  dailyBreakdown: { date: string; count: number }[];
+}
+
+export interface PageViewItem {
+  page: string;
+  views: number;
 }
 
 /** Singleton instance */

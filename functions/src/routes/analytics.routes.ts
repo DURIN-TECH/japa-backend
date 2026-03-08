@@ -66,4 +66,26 @@ router.get("/status-pipeline", verifyAuth, (req, res) =>
   analyticsController.getStatusPipeline(req, res)
 );
 
+// ============================================
+// EVENT-LEVEL ANALYTICS (admin only)
+// ============================================
+
+// GET /analytics/event-summary — Event counts grouped by event name
+// Query params: from, to, source (optional), events (optional comma-separated)
+router.get("/event-summary", verifyAuth, (req, res) =>
+  analyticsController.getEventSummary(req, res)
+);
+
+// GET /analytics/active-users — Unique user and session counts
+// Query params: from, to, source (optional)
+router.get("/active-users", verifyAuth, (req, res) =>
+  analyticsController.getActiveUsers(req, res)
+);
+
+// GET /analytics/top-pages — Page view rankings by traffic
+// Query params: from, to, source (optional), limit (optional)
+router.get("/top-pages", verifyAuth, (req, res) =>
+  analyticsController.getTopPages(req, res)
+);
+
 export { router as analyticsRoutes };

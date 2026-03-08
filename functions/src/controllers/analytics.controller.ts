@@ -343,6 +343,135 @@ export class AnalyticsController {
   }
 
   // ============================================
+  // GET /analytics/event-summary — Event Counts
+  // ============================================
+
+  /**
+   * GET /analytics/event-summary
+   *
+   * Returns event counts grouped by event name.
+   * Shows which user interactions are most common.
+   *
+   * Query params:
+   *   from: ISO date string (required)
+   *   to: ISO date string (required)
+   *   source: "portal" | "mobile" (optional)
+   *   events: comma-separated event names to filter (optional)
+   *
+   * Admin-only endpoint.
+   */
+  async getEventSummary(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    try {
+      if (!req.user?.admin) {
+        sendError(res, "FORBIDDEN", "Admin access required", 403);
+        return;
+      }
+
+      const { from, to, source, events } = req.query;
+      const eventNames = events ? (events as string).split(",") : undefined;
+
+      const summary = await analyticsService.getEventSummary(
+        (from as string) || this.defaultFrom(),
+        (to as string) || this.defaultTo(),
+        source as string | undefined,
+        eventNames
+      );
+
+      sendSuccess(res, summary);
+    } catch (error) {
+      console.error("Error fetching event summary:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  // ============================================
+  // GET /analytics/active-users — User Activity
+  // ============================================
+
+  /**
+   * GET /analytics/active-users
+   *
+   * Returns unique user counts and session data.
+   *
+   * Query params:
+   *   from: ISO date string
+   *   to: ISO date string
+   *   source: "portal" | "mobile" (optional)
+   *
+   * Admin-only endpoint.
+   */
+  async getActiveUsers(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    try {
+      if (!req.user?.admin) {
+        sendError(res, "FORBIDDEN", "Admin access required", 403);
+        return;
+      }
+
+      const { from, to, source } = req.query;
+
+      const data = await analyticsService.getActiveUsers(
+        (from as string) || this.defaultFrom(),
+        (to as string) || this.defaultTo(),
+        source as string | undefined
+      );
+
+      sendSuccess(res, data);
+    } catch (error) {
+      console.error("Error fetching active users:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  // ============================================
+  // GET /analytics/top-pages — Page View Rankings
+  // ============================================
+
+  /**
+   * GET /analytics/top-pages
+   *
+   * Returns page view counts ranked by traffic.
+   *
+   * Query params:
+   *   from: ISO date string
+   *   to: ISO date string
+   *   source: "portal" | "mobile" (optional)
+   *   limit: max results (default 20)
+   *
+   * Admin-only endpoint.
+   */
+  async getTopPages(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    try {
+      if (!req.user?.admin) {
+        sendError(res, "FORBIDDEN", "Admin access required", 403);
+        return;
+      }
+
+      const { from, to, source, limit } = req.query;
+
+      const data = await analyticsService.getTopPages(
+        (from as string) || this.defaultFrom(),
+        (to as string) || this.defaultTo(),
+        source as string | undefined,
+        limit ? parseInt(limit as string, 10) : 20
+      );
+
+      sendSuccess(res, data);
+    } catch (error) {
+      console.error("Error fetching top pages:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  // ============================================
   // PRIVATE HELPERS
   // ============================================
 
