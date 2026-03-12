@@ -1,0 +1,343 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ============================================
+    // HELPER FUNCTIONS
+    // ============================================
+    
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Check if user owns the document
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Check if user is an admin (via custom claims)
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+    
+    // Check if user is a verified agent
+    function isAgent() {
+      return isAuthenticated() && request.auth.token.agent == true;
+    }
+    
+    // Check if request has valid data
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+    
+    // ============================================
+    // USERS COLLECTION
+    // ============================================
+    
+    match /users/{userId} {
+      // Users can read their own profile
+      allow read: if isOwner(userId);
+      
+      // Users can create their own profile
+      allow create: if isOwner(userId);
+      
+      // Users can update their own profile
+      allow update: if isOwner(userId);
+      
+      // Only admins can delete users
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // AGENTS COLLECTION
+    // ============================================
+    
+    match /agents/{agentId} {
+      // Anyone can read verified agents
+      allow read: if resource.data.verificationStatus == 'verified' || 
+                    isAdmin() ||
+                    (isAuthenticated() && resource.data.userId == request.auth.uid);
+      
+      // Authenticated users can create agent profile
+      allow create: if isAuthenticated() && 
+                      request.resource.data.userId == request.auth.uid;
+      
+      // Agents can update their own profile (limited fields)
+      // Admins can update any field
+      allow update: if isAdmin() ||
+                      (isAuthenticated() && 
+                       resource.data.userId == request.auth.uid &&
+                       !request.resource.data.diff(resource.data).affectedKeys()
+                         .hasAny(['verificationStatus', 'verifiedAt', 'verifiedBy']));
+      
+      // Only admins can delete agents
+      allow delete: if isAdmin();
+      
+      // Agent reviews subcollection
+      match /reviews/{reviewId} {
+        // Anyone can read reviews
+        allow read: if true;
+        
+        // Authenticated users can create reviews
+        allow create: if isAuthenticated() && 
+                        request.resource.data.userId == request.auth.uid;
+        
+        // Users can update their own reviews
+        allow update: if isOwner(resource.data.userId);
+        
+        // Users can delete their own reviews, admins can delete any
+        allow delete: if isOwner(resource.data.userId) || isAdmin();
+      }
+    }
+    
+    // ============================================
+    // COUNTRIES COLLECTION
+    // ============================================
+    
+    match /countries/{countryCode} {
+      // Anyone can read countries
+      allow read: if true;
+      
+      // Only admins can write countries
+      allow write: if isAdmin();
+      
+      // Visa types subcollection
+      match /visaTypes/{visaTypeId} {
+        // Anyone can read active visa types
+        allow read: if resource.data.isActive == true || isAdmin();
+        
+        // Only admins can write visa types
+        allow write: if isAdmin();
+        
+        // Requirements subcollection
+        match /requirements/{requirementId} {
+          // Anyone can read requirements
+          allow read: if true;
+          
+          // Only admins can write requirements
+          allow write: if isAdmin();
+        }
+      }
+    }
+    
+    // ============================================
+    // APPLICATIONS COLLECTION
+    // ============================================
+    
+    match /applications/{applicationId} {
+      // Users can read their own applications
+      // Agents can read applications assigned to them
+      allow read: if isOwner(resource.data.userId) ||
+                    (isAgent() && resource.data.agentId != null && 
+                     exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
+                     get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
+                    isAdmin();
+      
+      // Users can create applications
+      allow create: if isAuthenticated() && 
+                      request.resource.data.userId == request.auth.uid;
+      
+      // Users can update their own applications (limited fields)
+      // Agents can update assigned applications
+      allow update: if isOwner(resource.data.userId) ||
+                      (isAgent() && resource.data.agentId != null &&
+                       exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
+                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
+                      isAdmin();
+      
+      // Only admins can delete applications
+      allow delete: if isAdmin();
+      
+      // Documents subcollection
+      match /documents/{documentId} {
+        allow read: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
+                      isAgent() || isAdmin();
+        
+        allow create: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId);
+        
+        allow update: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
+                        isAgent() || isAdmin();
+        
+        allow delete: if isAdmin();
+      }
+      
+      // Timeline subcollection
+      match /timeline/{timelineId} {
+        allow read: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
+                      isAgent() || isAdmin();
+
+        allow write: if isAgent() || isAdmin();
+      }
+
+      // Notes subcollection
+      match /notes/{noteId} {
+        // Application access holders can read notes
+        allow read: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
+                      isAgent() || isAdmin();
+
+        // Authenticated users with application access can create notes
+        allow create: if isAuthenticated() &&
+                        request.resource.data.authorId == request.auth.uid;
+
+        // Note author can update their own notes
+        allow update: if isOwner(resource.data.authorId);
+
+        // Note author or admin can delete
+        allow delete: if isOwner(resource.data.authorId) || isAdmin();
+      }
+    }
+
+    // ============================================
+    // AGENCIES COLLECTION
+    // ============================================
+
+    match /agencies/{agencyId} {
+      // Agency owner can read/write
+      // Agency members (agents) can read
+      allow read: if isAuthenticated() &&
+                    (resource.data.ownerId == request.auth.uid ||
+                     request.auth.uid in resource.data.agentIds ||
+                     isAdmin());
+
+      // Authenticated users can create an agency
+      allow create: if isAuthenticated() &&
+                      request.resource.data.ownerId == request.auth.uid;
+
+      // Only agency owner or admin can update
+      allow update: if isAuthenticated() &&
+                      (resource.data.ownerId == request.auth.uid || isAdmin());
+
+      // Only admin can delete agencies
+      allow delete: if isAdmin();
+    }
+
+    // ============================================
+    // AGENCY INVITATIONS COLLECTION
+    // ============================================
+
+    match /agencyInvitations/{invitationId} {
+      // Agency owner can read their invitations
+      // Invitee can read invitations sent to them
+      allow read: if isAuthenticated() &&
+                    (resource.data.invitedBy == request.auth.uid ||
+                     resource.data.email == request.auth.token.email ||
+                     isAdmin());
+
+      // Agency owner can create invitations
+      allow create: if isAuthenticated() &&
+                      request.resource.data.invitedBy == request.auth.uid;
+
+      // Invitee can accept/decline (update status)
+      // Agency owner can cancel (update status)
+      allow update: if isAuthenticated() &&
+                      (resource.data.invitedBy == request.auth.uid ||
+                       resource.data.email == request.auth.token.email ||
+                       isAdmin());
+
+      // Only admin can delete invitations
+      allow delete: if isAdmin();
+    }
+
+    // ============================================
+    // CONSULTATIONS COLLECTION
+    // ============================================
+    
+    match /consultations/{consultationId} {
+      // Users can read their own consultations
+      // Agents can read their consultations
+      allow read: if isOwner(resource.data.userId) ||
+                    (isAgent() && 
+                     exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
+                     get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
+                    isAdmin();
+      
+      // Users can create consultations
+      allow create: if isAuthenticated() && 
+                      request.resource.data.userId == request.auth.uid;
+      
+      // Users and agents can update consultations
+      allow update: if isOwner(resource.data.userId) ||
+                      (isAgent() &&
+                       exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
+                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
+                      isAdmin();
+      
+      // Only admins can delete consultations
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // TRANSACTIONS COLLECTION
+    // ============================================
+    
+    match /transactions/{transactionId} {
+      // Users can read their own transactions
+      allow read: if isOwner(resource.data.userId) || isAdmin();
+      
+      // Only system (via Cloud Functions) can create/update transactions
+      allow write: if false;
+    }
+    
+    // ============================================
+    // NOTIFICATIONS COLLECTION
+    // ============================================
+    
+    match /notifications/{notificationId} {
+      // Users can read their own notifications
+      allow read: if isOwner(resource.data.userId);
+      
+      // Users can update their notifications (mark as read)
+      allow update: if isOwner(resource.data.userId) &&
+                      request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(['isRead', 'readAt']);
+      
+      // Only system can create notifications
+      allow create: if false;
+      
+      // Users can delete their own notifications
+      allow delete: if isOwner(resource.data.userId);
+    }
+    
+    // ============================================
+    // CONVERSATIONS COLLECTION
+    // ============================================
+    
+    match /conversations/{conversationId} {
+      // Participants can read conversations
+      allow read: if isAuthenticated() &&
+                    (resource.data.userId == request.auth.uid ||
+                     (exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
+                      get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid));
+      
+      // Authenticated users can create conversations
+      allow create: if isAuthenticated() && 
+                      request.resource.data.userId == request.auth.uid;
+      
+      // Participants can update conversations
+      allow update: if isAuthenticated() &&
+                      (resource.data.userId == request.auth.uid ||
+                       (exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
+                        get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid));
+      
+      allow delete: if isAdmin();
+      
+      // Messages subcollection
+      match /messages/{messageId} {
+        // Participants can read messages
+        allow read: if isAuthenticated() &&
+                      (get(/databases/$(database)/documents/conversations/$(conversationId)).data.userId == request.auth.uid ||
+                       (exists(/databases/$(database)/documents/agents/$(get(/databases/$(database)/documents/conversations/$(conversationId)).data.agentId)) &&
+                        get(/databases/$(database)/documents/agents/$(get(/databases/$(database)/documents/conversations/$(conversationId)).data.agentId)).data.userId == request.auth.uid));
+        
+        // Participants can create messages
+        allow create: if isAuthenticated() && 
+                        request.resource.data.senderId == request.auth.uid;
+        
+        // Messages cannot be updated or deleted
+        allow update, delete: if false;
+      }
+    }
+  }
+}

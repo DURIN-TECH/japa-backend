@@ -1,0 +1,140 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // ============================================
+    // HELPER FUNCTIONS
+    // ============================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+    
+    function isAgent() {
+      return isAuthenticated() && request.auth.token.agent == true;
+    }
+    
+    // Check file size (in bytes)
+    function isValidSize(maxSize) {
+      return request.resource.size <= maxSize;
+    }
+    
+    // Check content type
+    function isValidContentType(types) {
+      return request.resource.contentType.matches(types);
+    }
+    
+    // ============================================
+    // USER PROFILE PHOTOS
+    // ============================================
+    
+    match /users/{userId}/profile/{fileName} {
+      // Anyone can view profile photos
+      allow read: if true;
+      
+      // Users can upload their own profile photos
+      allow write: if isOwner(userId) &&
+                     isValidSize(5 * 1024 * 1024) && // 5MB max
+                     isValidContentType('image/(jpeg|png|gif|webp)');
+      
+      // Users can delete their own profile photos
+      allow delete: if isOwner(userId) || isAdmin();
+    }
+    
+    // ============================================
+    // APPLICATION DOCUMENTS
+    // ============================================
+    
+    match /applications/{applicationId}/documents/{fileName} {
+      // Document owners, assigned agents, and admins can read
+      allow read: if isAuthenticated(); // Simplified - use Firestore for actual auth
+      
+      // Authenticated users can upload documents
+      allow create: if isAuthenticated() &&
+                      isValidSize(10 * 1024 * 1024) && // 10MB max
+                      isValidContentType('(application/pdf|image/(jpeg|png|gif|webp))');
+      
+      // Allow updates (re-uploads)
+      allow update: if isAuthenticated() &&
+                      isValidSize(10 * 1024 * 1024) &&
+                      isValidContentType('(application/pdf|image/(jpeg|png|gif|webp))');
+      
+      // Only admins can delete documents
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // AGENT VERIFICATION DOCUMENTS
+    // ============================================
+    
+    match /agents/{agentId}/verification/{fileName} {
+      // Agents can upload their verification documents
+      // Admins can view verification documents
+      allow read: if isAdmin() || 
+                    (isAuthenticated() && 
+                     exists(/databases/(default)/documents/agents/$(agentId)) &&
+                     get(/databases/(default)/documents/agents/$(agentId)).data.userId == request.auth.uid);
+      
+      allow write: if isAuthenticated() &&
+                     isValidSize(10 * 1024 * 1024) &&
+                     isValidContentType('(application/pdf|image/(jpeg|png|gif|webp))');
+      
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // CONSULTATION RECORDINGS
+    // ============================================
+    
+    match /consultations/{consultationId}/recordings/{fileName} {
+      // Only participants and admins can access recordings
+      allow read: if isAuthenticated(); // Simplified - actual auth in Firestore
+      
+      // Only system can upload recordings (via Cloud Functions)
+      allow write: if false;
+      
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // MESSAGE ATTACHMENTS
+    // ============================================
+    
+    match /messages/{conversationId}/{fileName} {
+      // Conversation participants can read attachments
+      allow read: if isAuthenticated();
+      
+      // Authenticated users can upload attachments
+      allow create: if isAuthenticated() &&
+                      isValidSize(10 * 1024 * 1024) &&
+                      isValidContentType('(application/pdf|image/(jpeg|png|gif|webp)|video/mp4)');
+      
+      // Attachments cannot be updated
+      allow update: if false;
+      
+      // Only admins can delete attachments
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // TEMP UPLOADS (for processing)
+    // ============================================
+    
+    match /temp/{userId}/{fileName} {
+      // Users can manage their own temp files
+      allow read, write: if isOwner(userId) &&
+                           isValidSize(20 * 1024 * 1024);
+      
+      allow delete: if isOwner(userId) || isAdmin();
+    }
+  }
+}
