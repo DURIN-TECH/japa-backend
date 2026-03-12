@@ -59,6 +59,14 @@ export class ConsultationController {
           );
           break;
         }
+        case "client": {
+          // Mobile clients query their own consultations by userId
+          consultations = await consultationService.getConsultationsForClient(
+            userId,
+            filters
+          );
+          break;
+        }
         case "agent":
         default: {
           consultations = await consultationService.getConsultationsForAgent(
@@ -160,15 +168,23 @@ export class ConsultationController {
 
   /**
    * POST /consultations
+   *
+   * Supports two flows:
+   *   1. Agent-initiated: auth'd user is the agent, body contains `userId` (client ID)
+   *   2. Client-initiated: auth'd user is the client, body contains `agentId`
+   *
+   * The controller detects which flow by checking if the auth'd user has an agent profile.
+   * If not, the auth'd user is treated as the client and `agentId` from the body is used.
    */
   async createConsultation(
     req: AuthenticatedRequest,
     res: Response
   ): Promise<void> {
     try {
-      const userId = req.userId!;
+      const authUserId = req.userId!;
       const {
-        userId: clientUserId,
+        userId: bodyClientId,
+        agentId: bodyAgentId,
         applicationId,
         type,
         scheduledDate,
@@ -180,24 +196,55 @@ export class ConsultationController {
         meetingLink,
       } = req.body;
 
-      if (!clientUserId || !type || !scheduledDate || !scheduledTime) {
+      if (!type || !scheduledDate || !scheduledTime) {
         sendError(
           res,
           "VALIDATION_ERROR",
-          "userId, type, scheduledDate, and scheduledTime are required"
+          "type, scheduledDate, and scheduledTime are required"
         );
         return;
       }
 
-      // Get the agent profile for the current user
-      const agent = await this.getAgentForUser(userId);
-      if (!agent) {
-        sendError(res, "FORBIDDEN", "Only agents can create consultations", 403);
-        return;
+      // Determine if auth'd user is an agent or a client
+      const agentProfile = await this.getAgentForUser(authUserId);
+
+      let resolvedClientId: string;
+      let resolvedAgentUserId: string;
+      let agentAgencyId: string | undefined;
+      let agentDisplayName: string;
+
+      if (agentProfile) {
+        // Agent-initiated flow: auth'd user is the agent, body has client userId
+        if (!bodyClientId) {
+          sendError(res, "VALIDATION_ERROR", "userId (client) is required when booking as agent");
+          return;
+        }
+        resolvedClientId = bodyClientId;
+        resolvedAgentUserId = authUserId;
+        agentAgencyId = agentProfile.agencyId;
+        agentDisplayName = agentProfile.displayName;
+      } else {
+        // Client-initiated flow: auth'd user is the client, body has agentId
+        if (!bodyAgentId) {
+          sendError(res, "VALIDATION_ERROR", "agentId is required when booking as client");
+          return;
+        }
+        resolvedClientId = authUserId;
+
+        // Look up the agent by agent doc ID (not userId)
+        const agentDoc = await collections.agents.doc(bodyAgentId).get();
+        if (!agentDoc.exists) {
+          sendError(res, "NOT_FOUND", "Agent not found", 404);
+          return;
+        }
+        const agent = agentDoc.data()!;
+        resolvedAgentUserId = agent.userId;
+        agentAgencyId = agent.agencyId;
+        agentDisplayName = agent.displayName;
       }
 
       // Get client user for denormalized fields
-      const clientDoc = await collections.users.doc(clientUserId).get();
+      const clientDoc = await collections.users.doc(resolvedClientId).get();
       if (!clientDoc.exists) {
         sendError(res, "NOT_FOUND", "Client user not found", 404);
         return;
@@ -207,13 +254,13 @@ export class ConsultationController {
       const { Timestamp } = await import("firebase-admin/firestore");
 
       const consultation = await consultationService.createConsultation({
-        userId: clientUserId,
-        agentId: userId,
-        agencyId: agent.agencyId,
+        userId: resolvedClientId,
+        agentId: resolvedAgentUserId,
+        agencyId: agentAgencyId,
         applicationId: applicationId || undefined,
-        clientName: `${client.firstName} ${client.lastName}`,
+        clientName: `${client.firstName || ""} ${client.lastName || ""}`.trim(),
         clientEmail: client.email,
-        agentName: agent.displayName,
+        agentName: agentDisplayName,
         type,
         scheduledDate: Timestamp.fromDate(new Date(scheduledDate)),
         scheduledTime,

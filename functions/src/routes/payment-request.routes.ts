@@ -20,6 +20,16 @@ paymentRequestRoutes.get("/:id", verifyAuth, (req, res) =>
   paymentRequestController.getPaymentRequest(req, res)
 );
 
+// Approve payment request (client approves agent's fund request)
+paymentRequestRoutes.put("/:id/approve", verifyAuth, (req, res) =>
+  paymentRequestController.approvePaymentRequest(req, res)
+);
+
+// Reject payment request (client rejects with reason, auto-creates chat)
+paymentRequestRoutes.put("/:id/reject", verifyAuth, (req, res) =>
+  paymentRequestController.rejectPaymentRequest(req, res)
+);
+
 // Update payment request status
 paymentRequestRoutes.put("/:id/status", verifyAuth, (req, res) =>
   paymentRequestController.updatePaymentRequestStatus(req, res)

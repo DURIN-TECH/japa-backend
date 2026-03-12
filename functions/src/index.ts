@@ -181,6 +181,53 @@ export const onConsultationCreated = functions.firestore
   });
 
 /**
+ * When a new payment request is created
+ * Send push notification to the client so they can approve/reject
+ */
+export const onPaymentRequestCreated = functions.firestore
+  .document("paymentRequests/{requestId}")
+  .onCreate(async (snapshot, context) => {
+    const request = snapshot.data();
+    console.log(`New payment request created: ${context.params.requestId}`);
+
+    try {
+      // Get client's FCM tokens for push notification
+      const userDoc = await collections.users.doc(request.clientId).get();
+      const user = userDoc.data();
+
+      if (user?.fcmTokens?.length) {
+        const amountDisplay = (request.amount / 100).toLocaleString();
+        await messaging.sendEachForMulticast({
+          tokens: user.fcmTokens,
+          notification: {
+            title: "Payment Request",
+            body: `Your agent requests ₦${amountDisplay} for ${request.description}`,
+          },
+          data: {
+            type: "payment_request",
+            paymentRequestId: context.params.requestId,
+            applicationId: request.applicationId,
+          },
+        });
+      }
+
+      // Create notification record for the client
+      await collections.notifications.add({
+        userId: request.clientId,
+        type: "payment_request",
+        title: "New Payment Request",
+        body: `Your agent requests ₦${(request.amount / 100).toLocaleString()} for ${request.description}`,
+        relatedEntityType: "payment_request",
+        relatedEntityId: context.params.requestId,
+        isRead: false,
+        createdAt: new Date(),
+      });
+    } catch (error) {
+      console.error("Error sending payment request notification:", error);
+    }
+  });
+
+/**
  * When a review is added
  * Recalculate agent rating
  */

@@ -1,5 +1,5 @@
 import { collections, serverTimestamp } from "../utils/firebase";
-import { PaymentRequest, PaymentRequestStatus } from "../types";
+import { PaymentRequest, PaymentRequestStatus, PaymentRequestCategory } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 
 export interface CreatePaymentRequestInput {
@@ -12,6 +12,7 @@ export interface CreatePaymentRequestInput {
   amount: number;
   currency: string;
   description: string;
+  category: PaymentRequestCategory;
 }
 
 class PaymentRequestService {
@@ -31,6 +32,81 @@ class PaymentRequestService {
     await ref.set(paymentRequest);
     const doc = await ref.get();
     return doc.data() as PaymentRequest;
+  }
+
+  /**
+   * Approve a payment request (client approves agent's fund request)
+   */
+  async approvePaymentRequest(id: string): Promise<PaymentRequest> {
+    const ref = collections.paymentRequests.doc(id);
+    const doc = await ref.get();
+
+    if (!doc.exists) {
+      throw new Error("Payment request not found");
+    }
+
+    const request = doc.data() as PaymentRequest;
+    if (request.status !== "pending") {
+      throw new Error("Only pending payment requests can be approved");
+    }
+
+    await ref.update({
+      status: "approved",
+      approvedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    const updated = await ref.get();
+    return updated.data() as PaymentRequest;
+  }
+
+  /**
+   * Reject a payment request (client rejects agent's fund request)
+   */
+  async rejectPaymentRequest(id: string, rejectionReason: string): Promise<PaymentRequest> {
+    const ref = collections.paymentRequests.doc(id);
+    const doc = await ref.get();
+
+    if (!doc.exists) {
+      throw new Error("Payment request not found");
+    }
+
+    const request = doc.data() as PaymentRequest;
+    if (request.status !== "pending") {
+      throw new Error("Only pending payment requests can be rejected");
+    }
+
+    await ref.update({
+      status: "rejected",
+      rejectedAt: serverTimestamp(),
+      rejectionReason,
+      updatedAt: serverTimestamp(),
+    });
+
+    const updated = await ref.get();
+    return updated.data() as PaymentRequest;
+  }
+
+  /**
+   * Get payment requests for a client (by clientId)
+   */
+  async getClientPaymentRequests(
+    clientId: string,
+    filters?: { applicationId?: string; status?: PaymentRequestStatus }
+  ): Promise<PaymentRequest[]> {
+    let query = collections.paymentRequests
+      .where("clientId", "==", clientId)
+      .orderBy("createdAt", "desc") as FirebaseFirestore.Query;
+
+    if (filters?.applicationId) {
+      query = query.where("applicationId", "==", filters.applicationId);
+    }
+    if (filters?.status) {
+      query = query.where("status", "==", filters.status);
+    }
+
+    const snapshot = await query.get();
+    return snapshot.docs.map((doc) => doc.data() as PaymentRequest);
   }
 
   /**
@@ -125,6 +201,10 @@ class PaymentRequestService {
       updates.paidAt = serverTimestamp();
     } else if (status === "cancelled") {
       updates.cancelledAt = serverTimestamp();
+    } else if (status === "approved") {
+      updates.approvedAt = serverTimestamp();
+    } else if (status === "rejected") {
+      updates.rejectedAt = serverTimestamp();
     }
 
     await ref.update(updates);

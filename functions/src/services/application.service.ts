@@ -2,6 +2,7 @@ import {
   collections,
   subcollections,
   serverTimestamp,
+  increment,
 } from "../utils/firebase";
 import {
   Application,
@@ -362,6 +363,40 @@ class ApplicationService {
     }
 
     await collections.applications.doc(applicationId).update(updates);
+  }
+
+  /**
+   * Atomically increment the amountPaid on an application
+   * and recalculate paymentStatus based on totalCost.
+   */
+  async incrementAmountPaid(applicationId: string, amount: number): Promise<void> {
+    const appRef = collections.applications.doc(applicationId);
+    const doc = await appRef.get();
+
+    if (!doc.exists) {
+      throw new Error("Application not found");
+    }
+
+    const application = doc.data() as Application;
+    const newAmountPaid = (application.amountPaid || 0) + amount;
+    const totalCost = application.totalCost || 0;
+
+    // Determine new payment status
+    let paymentStatus: PaymentStatus;
+    if (newAmountPaid >= totalCost && totalCost > 0) {
+      paymentStatus = "paid";
+    } else if (newAmountPaid > 0) {
+      paymentStatus = "partial";
+    } else {
+      paymentStatus = "pending";
+    }
+
+    await appRef.update({
+      amountPaid: increment(amount),
+      paymentStatus,
+      updatedAt: serverTimestamp(),
+      lastUpdated: serverTimestamp(),
+    });
   }
 
   // ============================================

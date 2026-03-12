@@ -576,7 +576,19 @@ export type PaymentRequestStatus =
   | "pending"
   | "paid"
   | "cancelled"
-  | "expired";
+  | "expired"
+  | "approved"
+  | "rejected";
+
+// Category of the payment request — enables consistent filtering/analytics
+export type PaymentRequestCategory =
+  | "visa_fee"
+  | "health_check"
+  | "document_creation"
+  | "document_review"
+  | "translation"
+  | "government_fee"
+  | "other";
 
 export interface PaymentRequest {
   id: string;
@@ -593,12 +605,16 @@ export interface PaymentRequest {
   amount: number; // In smallest currency unit (kobo/cents)
   currency: string;
   description: string;
+  category: PaymentRequestCategory;
 
   // Status
   status: PaymentRequestStatus;
   paidAt?: Timestamp;
   cancelledAt?: Timestamp;
   expiresAt?: Timestamp;
+  approvedAt?: Timestamp;
+  rejectedAt?: Timestamp;
+  rejectionReason?: string;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -630,6 +646,8 @@ export type NotificationType =
   | "document_status"
   | "consultation_reminder"
   | "payment_received"
+  | "payment_request"
+  | "payment_request_rejected"
   | "message_received"
   | "visa_news"
   | "system";
@@ -644,7 +662,7 @@ export interface Notification {
   
   // Deep linking
   actionUrl?: string;
-  relatedEntityType?: "application" | "consultation" | "document" | "message" | "news_article";
+  relatedEntityType?: "application" | "consultation" | "document" | "message" | "news_article" | "payment_request";
   relatedEntityId?: string;
   
   // Status

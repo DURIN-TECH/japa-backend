@@ -52,6 +52,23 @@ class ConsultationService {
   }
 
   /**
+   * Get consultations where the user is the client (userId).
+   * Used by mobile app clients to see their booked consultations.
+   */
+  async getConsultationsForClient(
+    clientUserId: string,
+    filters?: ConsultationFilters
+  ): Promise<Consultation[]> {
+    let query = collections.consultations
+      .where("userId", "==", clientUserId)
+      .orderBy("scheduledDate", "desc") as FirebaseFirestore.Query;
+
+    query = this.applyFilters(query, filters);
+    const snapshot = await query.get();
+    return snapshot.docs.map((doc) => doc.data() as Consultation);
+  }
+
+  /**
    * Get all consultations (admin only).
    */
   async getAllConsultations(

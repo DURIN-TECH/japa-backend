@@ -1,5 +1,5 @@
 import { collections } from "../utils/firebase";
-import { Transaction, TransactionStatus, BankAccount } from "../types";
+import { Transaction, TransactionStatus, BankAccount, PaymentRequest } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 
 export interface TransactionFilters {
@@ -174,6 +174,38 @@ class TransactionService {
         bankAccountName: bankAccount.accountName,
         bankName: bankAccount.bankName,
         accountNumber: bankAccount.accountNumber,
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await ref.set(transaction);
+    return transaction;
+  }
+
+  /**
+   * Create an escrow release transaction when a payment request is approved.
+   * Records the release of held funds to the agent.
+   */
+  async createEscrowRelease(paymentRequest: PaymentRequest): Promise<Transaction> {
+    const ref = collections.transactions.doc();
+    const now = Timestamp.now();
+
+    const transaction: Transaction = {
+      id: ref.id,
+      userId: paymentRequest.clientId,
+      agentId: paymentRequest.agentId,
+      applicationId: paymentRequest.applicationId,
+      type: "escrow_release",
+      amount: paymentRequest.amount,
+      currency: paymentRequest.currency,
+      status: "released",
+      isEscrow: false,
+      paymentProvider: "manual",
+      description: `Escrow release for: ${paymentRequest.description}`,
+      metadata: {
+        paymentRequestId: paymentRequest.id,
+        category: paymentRequest.category,
       },
       createdAt: now,
       updatedAt: now,
