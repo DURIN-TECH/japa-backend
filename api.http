@@ -1,0 +1,236 @@
+# ============================================================
+# JAPA API Testing
+#
+# First-time setup:
+#   cp -r .vscode.sample .vscode
+#   Then for production, replace YOUR_FIREBASE_API_KEY in
+#   .vscode/settings.json with your real key from Firebase console.
+#
+# Switch environments in VS Code status bar (bottom right):
+#   - "local"      → Firebase emulator (localhost)
+#   - "production" → Deployed Cloud Functions
+# ============================================================
+
+# ============================================================
+# AUTH — Sign in as different user types
+# Run ONE of these first, then use the token in requests below.
+# ============================================================
+
+### Sign in as Admin
+# @name loginAdmin
+POST {{authUrl}}/accounts:signInWithPassword?key={{apiKey}}
+Content-Type: application/json
+
+{
+    "email": "{{adminEmail}}",
+    "password": "{{password}}",
+    "returnSecureToken": true
+}
+
+###
+@adminToken = {{loginAdmin.response.body.idToken}}
+
+### Sign in as Agency Owner
+# @name loginOwner
+POST {{authUrl}}/accounts:signInWithPassword?key={{apiKey}}
+Content-Type: application/json
+
+{
+    "email": "{{ownerEmail}}",
+    "password": "{{password}}",
+    "returnSecureToken": true
+}
+
+###
+@ownerToken = {{loginOwner.response.body.idToken}}
+
+### Sign in as Agent 1
+# @name loginAgent1
+POST {{authUrl}}/accounts:signInWithPassword?key={{apiKey}}
+Content-Type: application/json
+
+{
+    "email": "{{agent1Email}}",
+    "password": "{{password}}",
+    "returnSecureToken": true
+}
+
+###
+@agent1Token = {{loginAgent1.response.body.idToken}}
+
+### Sign in as Agent 2
+# @name loginAgent2
+POST {{authUrl}}/accounts:signInWithPassword?key={{apiKey}}
+Content-Type: application/json
+
+{
+    "email": "{{agent2Email}}",
+    "password": "{{password}}",
+    "returnSecureToken": true
+}
+
+###
+@agent2Token = {{loginAgent2.response.body.idToken}}
+
+### Sign in as Client (John Doe)
+# @name loginClient
+POST {{authUrl}}/accounts:signInWithPassword?key={{apiKey}}
+Content-Type: application/json
+
+{
+    "email": "{{clientEmail}}",
+    "password": "{{password}}",
+    "returnSecureToken": true
+}
+
+###
+@clientToken = {{loginClient.response.body.idToken}}
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+### Health check (no auth needed)
+GET {{baseUrl}}/health
+
+# ============================================================
+# USERS
+# ============================================================
+
+### Get my profile (as admin)
+GET {{baseUrl}}/users/me
+Authorization: Bearer {{adminToken}}
+
+### Get my profile (as owner)
+GET {{baseUrl}}/users/me
+Authorization: Bearer {{ownerToken}}
+
+### Get my profile (as agent)
+GET {{baseUrl}}/users/me
+Authorization: Bearer {{agent1Token}}
+
+### Record login
+POST {{baseUrl}}/users/login
+Authorization: Bearer {{adminToken}}
+
+# ============================================================
+# AGENTS
+# ============================================================
+
+### Get all agents (public)
+GET {{baseUrl}}/agents
+
+### Get agent profile (as agent1)
+GET {{baseUrl}}/agents/me
+Authorization: Bearer {{agent1Token}}
+
+### Get agent by ID
+GET {{baseUrl}}/agents/seed-user-agent-001
+Authorization: Bearer {{adminToken}}
+
+# ============================================================
+# AGENCIES
+# ============================================================
+
+### Get my agency (as owner)
+GET {{baseUrl}}/agencies/me
+Authorization: Bearer {{ownerToken}}
+
+### Get all agencies (admin)
+GET {{baseUrl}}/agencies
+Authorization: Bearer {{adminToken}}
+
+### Get pending agencies (admin)
+GET {{baseUrl}}/agencies/pending
+Authorization: Bearer {{adminToken}}
+
+# ============================================================
+# APPLICATIONS (Cases)
+# ============================================================
+
+### Get applications (as admin — sees all)
+GET {{baseUrl}}/applications?role=admin
+Authorization: Bearer {{adminToken}}
+
+### Get applications (as owner — agency cases)
+GET {{baseUrl}}/applications?role=owner
+Authorization: Bearer {{ownerToken}}
+
+### Get applications (as agent — assigned cases)
+GET {{baseUrl}}/applications?role=agent
+Authorization: Bearer {{agent1Token}}
+
+# ============================================================
+# COUNTRIES & VISAS
+# ============================================================
+
+### Get all countries
+GET {{baseUrl}}/countries
+Authorization: Bearer {{adminToken}}
+
+### Get country by code
+GET {{baseUrl}}/countries/IE
+Authorization: Bearer {{adminToken}}
+
+### Get visa types for a country
+GET {{baseUrl}}/countries/IE/visas
+Authorization: Bearer {{adminToken}}
+
+### Search visas (public)
+GET {{baseUrl}}/visas/search?q=work
+
+### Popular visas (public)
+GET {{baseUrl}}/visas/popular
+
+# ============================================================
+# NOTIFICATIONS
+# ============================================================
+
+### Get unread count
+GET {{baseUrl}}/notifications/unread-count
+Authorization: Bearer {{agent1Token}}
+
+### Get all notifications
+GET {{baseUrl}}/notifications
+Authorization: Bearer {{agent1Token}}
+
+# ============================================================
+# TRANSACTIONS
+# ============================================================
+
+### Get transaction stats
+GET {{baseUrl}}/transactions/stats
+Authorization: Bearer {{agent1Token}}
+
+### Get all transactions
+GET {{baseUrl}}/transactions
+Authorization: Bearer {{agent1Token}}
+
+# ============================================================
+# CONSULTATIONS
+# ============================================================
+
+### Get consultation stats
+GET {{baseUrl}}/consultations/stats
+Authorization: Bearer {{agent1Token}}
+
+### Get all consultations
+GET {{baseUrl}}/consultations
+Authorization: Bearer {{agent1Token}}
+
+# ============================================================
+# CONVERSATIONS
+# ============================================================
+
+### Get all conversations
+GET {{baseUrl}}/conversations
+Authorization: Bearer {{agent1Token}}
+
+# ============================================================
+# DEV — Seed endpoints (emulator only)
+# ============================================================
+
+### Seed countries & visas
+POST {{baseUrl}}/dev/seed/countries-visas
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}

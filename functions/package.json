@@ -13,6 +13,12 @@
     "logs": "firebase functions:log",
     "seed": "npm run build && node lib/scripts/seed-questions.js",
     "seed:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-questions.js",
+    "seed:portal": "npm run build && node lib/scripts/seed-portal.js",
+    "seed:portal:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-portal.js",
+    "seed:auth": "npm run build && node lib/scripts/seed-auth-users.js",
+    "seed:auth:emulator": "npm run build && FIREBASE_AUTH_EMULATOR_HOST=localhost:9099 node lib/scripts/seed-auth-users.js",
+    "seed:news": "npm run build && node lib/scripts/seed-news-sources.js",
+    "seed:news:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-news-sources.js",
     "lint": "eslint --ext .ts src/",
     "lint:fix": "eslint --ext .ts src/ --fix",
     "clean": "rm -rf lib"
@@ -21,10 +27,13 @@
     "node": "20"
   },
   "dependencies": {
+    "axios": "^1.13.5",
+    "cheerio": "^1.2.0",
     "cors": "^2.8.5",
     "express": "^4.22.1",
     "firebase-admin": "^12.7.0",
     "firebase-functions": "^5.1.1",
+    "rss-parser": "^3.13.0",
     "uuid": "^13.0.0"
   },
   "devDependencies": {

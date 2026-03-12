@@ -18,6 +18,11 @@ export const api = functions.https.onRequest(app);
 import { collections, messaging } from "./utils/firebase";
 import { agentService } from "./services/agent.service";
 import { visaService } from "./services/visa.service";
+import { newsScraperService } from "./services/news-scraper.service";
+import { newsService } from "./services/news.service";
+import { newsNotificationService } from "./services/news-notification.service";
+import { NewsArticle } from "./types/news";
+import { Timestamp } from "firebase-admin/firestore";
 
 /**
  * When a new user is created via Firebase Auth
@@ -176,6 +181,53 @@ export const onConsultationCreated = functions.firestore
   });
 
 /**
+ * When a new payment request is created
+ * Send push notification to the client so they can approve/reject
+ */
+export const onPaymentRequestCreated = functions.firestore
+  .document("paymentRequests/{requestId}")
+  .onCreate(async (snapshot, context) => {
+    const request = snapshot.data();
+    console.log(`New payment request created: ${context.params.requestId}`);
+
+    try {
+      // Get client's FCM tokens for push notification
+      const userDoc = await collections.users.doc(request.clientId).get();
+      const user = userDoc.data();
+
+      if (user?.fcmTokens?.length) {
+        const amountDisplay = (request.amount / 100).toLocaleString();
+        await messaging.sendEachForMulticast({
+          tokens: user.fcmTokens,
+          notification: {
+            title: "Payment Request",
+            body: `Your agent requests ₦${amountDisplay} for ${request.description}`,
+          },
+          data: {
+            type: "payment_request",
+            paymentRequestId: context.params.requestId,
+            applicationId: request.applicationId,
+          },
+        });
+      }
+
+      // Create notification record for the client
+      await collections.notifications.add({
+        userId: request.clientId,
+        type: "payment_request",
+        title: "New Payment Request",
+        body: `Your agent requests ₦${(request.amount / 100).toLocaleString()} for ${request.description}`,
+        relatedEntityType: "payment_request",
+        relatedEntityId: context.params.requestId,
+        isRead: false,
+        createdAt: new Date(),
+      });
+    } catch (error) {
+      console.error("Error sending payment request notification:", error);
+    }
+  });
+
+/**
  * When a review is added
  * Recalculate agent rating
  */
@@ -286,5 +338,74 @@ export const sendConsultationReminders = functions.pubsub
       );
     } catch (error) {
       console.error("Error sending consultation reminders:", error);
+    }
+  });
+
+/**
+ * Every 30 minutes: Scrape visa news from due sources
+ */
+export const scrapeNewsOrchestrator = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 540 })
+  .pubsub.schedule("*/30 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    console.log("Running news scrape orchestrator...");
+    try {
+      const result = await newsScraperService.runOrchestrator();
+      console.log(
+        `Orchestrator complete: ${result.sourcesProcessed} sources, ${result.newArticles} new articles, ${result.errors} errors`
+      );
+    } catch (error) {
+      console.error("News scrape orchestrator failed:", error);
+    }
+  });
+
+/**
+ * Weekly: Clean up old news articles and scrape runs
+ * Runs every Sunday at 4 AM UTC
+ */
+export const cleanupOldNews = functions.pubsub
+  .schedule("0 4 * * 0")
+  .timeZone("UTC")
+  .onRun(async () => {
+    console.log("Running news cleanup...");
+    try {
+      const articlesDeleted = await newsService.cleanupOldArticles(90);
+      const runsDeleted = await newsService.cleanupOldScrapeRuns(30);
+      console.log(
+        `News cleanup: ${articlesDeleted} articles, ${runsDeleted} scrape runs deleted`
+      );
+    } catch (error) {
+      console.error("News cleanup failed:", error);
+    }
+  });
+
+/**
+ * When a new news article is created
+ * Send notifications to subscribed users
+ */
+export const onNewsArticleCreated = functions.firestore
+  .document("newsArticles/{articleId}")
+  .onCreate(async (snapshot) => {
+    const article = { ...snapshot.data(), id: snapshot.id } as NewsArticle;
+
+    // Only notify for published, non-low importance articles
+    if (!article.isPublished || article.importance === "low") {
+      return;
+    }
+
+    try {
+      const sentCount = await newsNotificationService.notifySubscribers(article);
+      console.log(
+        `News notification sent to ${sentCount} users for article: ${article.title}`
+      );
+
+      // Mark notification as sent
+      await snapshot.ref.update({
+        isNotificationSent: true,
+        notificationSentAt: Timestamp.now(),
+      });
+    } catch (error) {
+      console.error("Error notifying subscribers:", error);
     }
   });

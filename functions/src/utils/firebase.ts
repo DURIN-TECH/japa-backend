@@ -19,12 +19,19 @@ export const messaging = admin.messaging();
 export const collections = {
   users: db.collection("users"),
   agents: db.collection("agents"),
+  agencies: db.collection("agencies"),
   countries: db.collection("countries"),
   applications: db.collection("applications"),
-  consultations: db.collection("consultations"),
   transactions: db.collection("transactions"),
+  consultations: db.collection("consultations"),
   notifications: db.collection("notifications"),
+  paymentRequests: db.collection("paymentRequests"),
   conversations: db.collection("conversations"),
+  agencyInvitations: db.collection("agencyInvitations"),
+  bankAccounts: db.collection("bankAccounts"),
+  newsArticles: db.collection("newsArticles"),
+  newsSources: db.collection("newsSources"),
+  newsSubscriptions: db.collection("newsSubscriptions"),
 } as const;
 
 // Helper to get subcollection references
@@ -53,9 +60,17 @@ export const subcollections = {
   reviews: (agentId: string) =>
     collections.agents.doc(agentId).collection("reviews"),
   
+  // Notes under applications
+  notes: (applicationId: string) =>
+    collections.applications.doc(applicationId).collection("notes"),
+
   // Messages under conversations
   messages: (conversationId: string) =>
     collections.conversations.doc(conversationId).collection("messages"),
+
+  // Scrape runs under news sources
+  scrapeRuns: (sourceId: string) =>
+    collections.newsSources.doc(sourceId).collection("scrapeRuns"),
 } as const;
 
 // Firestore timestamp helpers

@@ -3,6 +3,9 @@ import { Timestamp } from "firebase-admin/firestore";
 // Re-export eligibility types
 export * from "./eligibility";
 
+// Re-export news types
+export * from "./news";
+
 // ============================================
 // USER TYPES
 // ============================================
@@ -45,53 +48,119 @@ export interface Address {
 }
 
 // ============================================
+// AGENCY TYPES
+// ============================================
+
+export type AgencyMemberRole = "owner" | "agent";
+
+export type AgencyInvitationStatus = "pending" | "accepted" | "declined" | "expired";
+
+export type AgencyStatus = "pending_review" | "approved" | "rejected" | "suspended";
+
+export interface AgencyService {
+  id: string;
+  name: string;
+  price: number; // In cents
+}
+
+export interface Agency {
+  id: string;
+  name: string;
+  ownerId: string; // userId of the creator/owner
+  ownerName: string; // Denormalized for display
+
+  // Profile
+  address?: string;
+  state?: string;
+  description?: string;
+  logoUrl?: string;
+
+  // Pricing
+  consultationFee?: number; // In cents (agency-level default)
+
+  // Embedded services (small bounded list)
+  services: AgencyService[];
+
+  // Denormalized stats (updated via triggers/service calls)
+  totalAgents: number;
+  totalCases: number;
+  activeCases: number;
+
+  // Approval status
+  status: AgencyStatus;
+  rejectionReason?: string;
+  reviewedBy?: string; // Admin userId who approved/rejected
+  reviewedAt?: Timestamp;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+export interface AgencyInvitation {
+  id: string;
+  agencyId: string;
+  agencyName: string; // Denormalized for display
+  invitedBy: string; // userId of inviter
+  invitedByName: string; // Denormalized
+  invitedEmail: string;
+  invitedAgentId?: string; // Set if agent already exists on platform
+  status: AgencyInvitationStatus;
+  createdAt: Timestamp;
+  expiresAt: Timestamp;
+}
+
+// ============================================
 // AGENT TYPES
 // ============================================
 
-export type AgentVerificationStatus = 
-  | "pending" 
-  | "under_review" 
-  | "verified" 
-  | "rejected" 
+export type AgentVerificationStatus =
+  | "pending"
+  | "under_review"
+  | "verified"
+  | "rejected"
   | "suspended";
 
 export interface Agent {
   id: string;
   userId: string; // Reference to user account
-  
+
+  // Agency membership (null = independent agent)
+  agencyId?: string;
+  agencyRole?: AgencyMemberRole;
+
   // Profile
   displayName: string;
   bio: string;
   profilePhotoUrl?: string;
-  
+
   // Professional info
   licenseNumber?: string;
   yearsOfExperience: number;
   specializations: string[]; // e.g., ["Student Visa", "Work Visa"]
   languages: string[];
   featuredVisas: string[]; // Visa type IDs they specialize in
-  
+
   // Verification
   verificationStatus: AgentVerificationStatus;
   verificationDocuments?: string[]; // Storage URLs
   verifiedAt?: Timestamp;
   verifiedBy?: string; // Admin user ID
-  
+
   // Ratings & Stats
   rating: number; // Average rating (1-5)
   totalReviews: number;
   totalApplications: number;
   successRate: number; // Percentage
   responseTime: string; // e.g., "24-48 hours"
-  
+
   // Pricing
   consultationFee: number; // In cents
   serviceFees: Record<string, number>; // visaTypeId -> fee in cents
-  
+
   // Availability
   isAvailable: boolean;
   availableSlots?: AvailabilitySlot[];
-  
+
   // Metadata
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -173,6 +242,13 @@ export interface VisaType {
   // Agents who handle this visa
   agentIds: string[];
 
+  // Admin review
+  reviewStatus?: "pending_review" | "approved" | "rejected";
+  source?: "scraped" | "agent";
+  reviewedBy?: string;
+  reviewedAt?: Timestamp;
+  rejectionReason?: string;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -243,11 +319,12 @@ export interface Application {
   userId: string;
   visaTypeId: string;
   countryCode: string;
-  
+
   // Mode
   mode: ApplicationMode;
   agentId?: string;
-  
+  agencyId?: string; // Cases belong to the agency, not the individual agent
+
   // Status & Progress
   status: ApplicationStatus;
   progress: number; // 0-100
@@ -276,7 +353,13 @@ export interface Application {
   userNotes?: string;
   agentNotes?: string;
   rejectionReason?: string;
-  
+
+  // Denormalized fields (colocated for read performance)
+  clientName?: string;
+  clientEmail?: string;
+  visaTypeName?: string;
+  countryName?: string;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -303,6 +386,23 @@ export interface ApplicationTimeline {
   responsibility: "user" | "agent" | "embassy" | "system";
   
   createdAt: Timestamp;
+}
+
+// ============================================
+// APPLICATION NOTE TYPES
+// ============================================
+
+export type NoteAuthorRole = "agent" | "owner" | "admin" | "system";
+
+export interface ApplicationNote {
+  id: string;
+  applicationId: string;
+  authorId: string;
+  authorName: string; // Denormalized to avoid user lookups
+  authorRole: NoteAuthorRole;
+  content: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
 }
 
 // ============================================
@@ -370,15 +470,21 @@ export interface Consultation {
   id: string;
   userId: string;
   agentId: string;
+  agencyId?: string;
   applicationId?: string;
-  
+
+  // Denormalized display fields
+  clientName: string;
+  clientEmail: string;
+  agentName: string;
+
   // Booking details
   type: ConsultationType;
   scheduledDate: Timestamp;
   scheduledTime: string; // "10:30"
   durationMinutes: number;
   timezone: string;
-  
+
   // Status
   status: ConsultationStatus;
   
@@ -408,12 +514,13 @@ export interface Consultation {
 // TRANSACTION TYPES
 // ============================================
 
-export type TransactionType = 
+export type TransactionType =
   | "consultation_fee"
   | "service_fee"
   | "government_fee"
   | "refund"
-  | "escrow_release";
+  | "escrow_release"
+  | "withdrawal";
 
 export type TransactionStatus = 
   | "pending"
@@ -451,7 +558,81 @@ export interface Transaction {
   // Metadata
   description: string;
   metadata?: Record<string, unknown>;
-  
+
+  // Denormalized fields (for read performance)
+  clientName?: string;
+  clientEmail?: string;
+  visaTypeName?: string;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+// ============================================
+// PAYMENT REQUEST TYPES
+// ============================================
+
+export type PaymentRequestStatus =
+  | "pending"
+  | "paid"
+  | "cancelled"
+  | "expired"
+  | "approved"
+  | "rejected";
+
+// Category of the payment request — enables consistent filtering/analytics
+export type PaymentRequestCategory =
+  | "visa_fee"
+  | "health_check"
+  | "document_creation"
+  | "document_review"
+  | "translation"
+  | "government_fee"
+  | "other";
+
+export interface PaymentRequest {
+  id: string;
+  applicationId: string;
+  agentId: string;
+  agencyId?: string;
+  clientId: string;
+
+  // Denormalized
+  clientName: string;
+  clientEmail: string;
+
+  // Payment details
+  amount: number; // In smallest currency unit (kobo/cents)
+  currency: string;
+  description: string;
+  category: PaymentRequestCategory;
+
+  // Status
+  status: PaymentRequestStatus;
+  paidAt?: Timestamp;
+  cancelledAt?: Timestamp;
+  expiresAt?: Timestamp;
+  approvedAt?: Timestamp;
+  rejectedAt?: Timestamp;
+  rejectionReason?: string;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+// ============================================
+// BANK ACCOUNT TYPES
+// ============================================
+
+export interface BankAccount {
+  id: string;
+  userId: string; // Owner of the bank account
+
+  accountName: string;
+  bankName: string;
+  accountNumber: string;
+  isMain: boolean;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -460,12 +641,15 @@ export interface Transaction {
 // NOTIFICATION TYPES
 // ============================================
 
-export type NotificationType = 
+export type NotificationType =
   | "application_update"
   | "document_status"
   | "consultation_reminder"
   | "payment_received"
+  | "payment_request"
+  | "payment_request_rejected"
   | "message_received"
+  | "visa_news"
   | "system";
 
 export interface Notification {
@@ -478,7 +662,7 @@ export interface Notification {
   
   // Deep linking
   actionUrl?: string;
-  relatedEntityType?: "application" | "consultation" | "document" | "message";
+  relatedEntityType?: "application" | "consultation" | "document" | "message" | "news_article" | "payment_request";
   relatedEntityId?: string;
   
   // Status
