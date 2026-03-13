@@ -31,39 +31,39 @@ export class TransactionController {
       let transactions;
 
       switch (role) {
-        case "admin": {
-          if (!req.user?.admin) {
-            sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
-            return;
-          }
-          transactions = await transactionService.getAllTransactions(filters);
-          break;
+      case "admin": {
+        if (!req.user?.admin) {
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
         }
-        case "owner": {
-          const agent = await this.getAgentForUser(userId);
-          if (!agent?.agencyId || agent.agencyRole !== "owner") {
-            sendError(
-              res,
-              "FORBIDDEN",
-              "Only agency owners can view agency transactions",
-              403
-            );
-            return;
-          }
-          transactions = await transactionService.getTransactionsForAgency(
-            agent.agencyId,
-            filters
+        transactions = await transactionService.getAllTransactions(filters);
+        break;
+      }
+      case "owner": {
+        const agent = await this.getAgentForUser(userId);
+        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+          sendError(
+            res,
+            "FORBIDDEN",
+            "Only agency owners can view agency transactions",
+            403
           );
-          break;
+          return;
         }
-        case "agent":
-        default: {
-          transactions = await transactionService.getTransactionsForAgent(
-            userId,
-            filters
-          );
-          break;
-        }
+        transactions = await transactionService.getTransactionsForAgency(
+          agent.agencyId,
+          filters
+        );
+        break;
+      }
+      case "agent":
+      default: {
+        transactions = await transactionService.getTransactionsForAgent(
+          userId,
+          filters
+        );
+        break;
+      }
       }
 
       sendSuccess(res, transactions);
@@ -84,37 +84,37 @@ export class TransactionController {
       let transactions;
 
       switch (role) {
-        case "admin": {
-          if (!req.user?.admin) {
-            sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
-            return;
-          }
-          transactions = await transactionService.getAllTransactions();
-          break;
+      case "admin": {
+        if (!req.user?.admin) {
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
         }
-        case "owner": {
-          const agent = await this.getAgentForUser(userId);
-          if (!agent?.agencyId || agent.agencyRole !== "owner") {
-            sendError(
-              res,
-              "FORBIDDEN",
-              "Only agency owners can view agency stats",
-              403
-            );
-            return;
-          }
-          transactions = await transactionService.getTransactionsForAgency(
-            agent.agencyId
+        transactions = await transactionService.getAllTransactions();
+        break;
+      }
+      case "owner": {
+        const agent = await this.getAgentForUser(userId);
+        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+          sendError(
+            res,
+            "FORBIDDEN",
+            "Only agency owners can view agency stats",
+            403
           );
-          break;
+          return;
         }
-        case "agent":
-        default: {
-          transactions = await transactionService.getTransactionsForAgent(
-            userId
-          );
-          break;
-        }
+        transactions = await transactionService.getTransactionsForAgency(
+          agent.agencyId
+        );
+        break;
+      }
+      case "agent":
+      default: {
+        transactions = await transactionService.getTransactionsForAgent(
+          userId
+        );
+        break;
+      }
       }
 
       const stats = transactionService.computeStats(transactions);

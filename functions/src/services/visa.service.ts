@@ -449,7 +449,7 @@ class VisaService {
    */
   async getAllVisaTypesForAdmin(): Promise<
     (VisaType & { countryName: string })[]
-  > {
+    > {
     const countries = await this.getCountries(false);
     const results: (VisaType & { countryName: string })[] = [];
 

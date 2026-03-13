@@ -8,7 +8,7 @@ router.post("/seed/eligibility", async (req: Request, res: Response) => {
     res.status(404).json({ error: "Not found" });
     return;
   }
-  await eligibilityController.seedNigeriaIreland(req as any, res);
+  await eligibilityController.seedNigeriaIreland(req as Request, res);
 });
 
 router.post("/seed/ireland-visa", async (req: Request, res: Response) => {

@@ -111,17 +111,17 @@ class NewsScraperService {
       let rawArticles: RawArticle[];
 
       switch (source.strategy) {
-        case "rss":
-          rawArticles = await this.fetchRss(source);
-          break;
-        case "html_scrape":
-          rawArticles = await this.fetchHtml(source);
-          break;
-        case "news_api":
-          rawArticles = await this.fetchNewsApi(source);
-          break;
-        default:
-          throw new Error(`Unknown strategy: ${source.strategy}`);
+      case "rss":
+        rawArticles = await this.fetchRss(source);
+        break;
+      case "html_scrape":
+        rawArticles = await this.fetchHtml(source);
+        break;
+      case "news_api":
+        rawArticles = await this.fetchNewsApi(source);
+        break;
+      default:
+        throw new Error(`Unknown strategy: ${source.strategy}`);
       }
 
       // 2. Normalize and deduplicate
@@ -275,8 +275,8 @@ class NewsScraperService {
 
         const summary = selectors.articleSummary
           ? this.cleanText(
-              $el.find(selectors.articleSummary).first().text()
-            ).slice(0, 500)
+            $el.find(selectors.articleSummary).first().text()
+          ).slice(0, 500)
           : "";
 
         const imageUrl = selectors.articleImage

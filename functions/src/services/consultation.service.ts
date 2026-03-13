@@ -188,21 +188,21 @@ class ConsultationService {
 
     for (const c of consultations) {
       switch (c.status) {
-        case "completed":
-          completed++;
-          break;
-        case "cancelled":
-          cancelled++;
-          break;
-        case "no_show":
-          noShow++;
-          break;
-        case "scheduled":
-        case "confirmed":
-          if (c.scheduledDate.toMillis() >= now.toMillis()) {
-            upcoming++;
-          }
-          break;
+      case "completed":
+        completed++;
+        break;
+      case "cancelled":
+        cancelled++;
+        break;
+      case "no_show":
+        noShow++;
+        break;
+      case "scheduled":
+      case "confirmed":
+        if (c.scheduledDate.toMillis() >= now.toMillis()) {
+          upcoming++;
+        }
+        break;
       }
     }
 

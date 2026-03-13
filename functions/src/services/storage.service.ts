@@ -1,5 +1,5 @@
 import { getStorage } from "firebase-admin/storage";
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "crypto";
 
 const BUCKET_NAME = process.env.FIREBASE_STORAGE_BUCKET || "japa-app.appspot.com";
 
@@ -19,7 +19,7 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = uuidv4();
+    const fileId = randomUUID();
     const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
     const storagePath = `documents/${userId}/${applicationId}/${fileId}_${sanitizedFileName}`;
 
@@ -54,7 +54,7 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = uuidv4();
+    const fileId = randomUUID();
     const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
     const storagePath = `verification/${userId}/${fileId}_${sanitizedFileName}`;
 

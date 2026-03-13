@@ -321,242 +321,112 @@ export class EligibilityService {
 
     // Category-specific questions
     switch (category) {
-      case "work":
-        questions.push(
-          {
-            id: "job_offer",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Do you have a job offer from an employer in the destination country?",
-            type: "boolean",
-            weight: 20,
-            correctAnswers: ["true"],
-            orderIndex: 10,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            id: "work_experience",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "How many years of relevant work experience do you have?",
-            type: "number",
-            weight: 10,
-            minValue: 0,
-            maxValue: 50,
-            idealMin: 2,
-            idealMax: 50,
-            orderIndex: 11,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            id: "qualifications",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "What is your highest level of education?",
-            type: "single",
-            options: ["High School", "Bachelor's Degree", "Master's Degree", "PhD", "Professional Certification"],
-            weight: 10,
-            correctAnswers: ["Bachelor's Degree", "Master's Degree", "PhD", "Professional Certification"],
-            orderIndex: 12,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          }
-        );
-        break;
-
-      case "student":
-        questions.push(
-          {
-            id: "admission",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Do you have an admission letter from a recognized institution?",
-            type: "boolean",
-            weight: 25,
-            correctAnswers: ["true"],
-            orderIndex: 10,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            id: "tuition_funds",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Can you prove you have funds to cover tuition fees?",
-            type: "boolean",
-            weight: 15,
-            correctAnswers: ["true"],
-            orderIndex: 11,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            id: "english_proficiency",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Do you have English language proficiency certification (IELTS/TOEFL)?",
-            description: "Required for English-speaking countries.",
-            type: "boolean",
-            weight: 10,
-            correctAnswers: ["true"],
-            orderIndex: 12,
-            isRequired: false,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          }
-        );
-        break;
-
-      case "tourist":
-        questions.push(
-          {
-            id: "return_ticket",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Do you have proof of return or onward travel?",
-            type: "boolean",
-            weight: 15,
-            correctAnswers: ["true"],
-            orderIndex: 10,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            id: "accommodation",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Do you have accommodation bookings for your stay?",
-            type: "boolean",
-            weight: 10,
-            correctAnswers: ["true"],
-            orderIndex: 11,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            id: "travel_insurance",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Do you have travel insurance covering your trip?",
-            type: "boolean",
-            weight: 10,
-            correctAnswers: ["true"],
-            orderIndex: 12,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            id: "ties_to_home",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Can you demonstrate strong ties to your home country?",
-            description: "Employment, property, family, or business ties that show you will return.",
-            type: "boolean",
-            weight: 15,
-            correctAnswers: ["true"],
-            orderIndex: 13,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          }
-        );
-        break;
-
-      case "business":
-        questions.push(
-          {
-            id: "business_invitation",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Do you have an invitation letter from a business in the destination country?",
-            type: "boolean",
-            weight: 20,
-            correctAnswers: ["true"],
-            orderIndex: 10,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            id: "business_ownership",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Do you own or represent a registered business?",
-            type: "boolean",
-            weight: 15,
-            correctAnswers: ["true"],
-            orderIndex: 11,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          }
-        );
-        break;
-
-      case "family":
-        questions.push(
-          {
-            id: "sponsor_status",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Does your sponsor have legal residency/citizenship in the destination country?",
-            type: "boolean",
-            weight: 25,
-            correctAnswers: ["true"],
-            orderIndex: 10,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            id: "relationship_proof",
-            visaTypeId,
-            scope: `category:${category}`,
-            question: "Can you provide proof of your relationship to the sponsor?",
-            description: "Marriage certificate, birth certificate, etc.",
-            type: "boolean",
-            weight: 20,
-            correctAnswers: ["true"],
-            orderIndex: 11,
-            isRequired: true,
-            isActive: true,
-            createdAt: now,
-            updatedAt: now,
-          }
-        );
-        break;
-
-      default:
-        // General financial question for other categories
-        questions.push({
-          id: "financial_proof",
+    case "work":
+      questions.push(
+        {
+          id: "job_offer",
           visaTypeId,
-          scope: "common",
-          question: "Can you provide proof of sufficient funds for your stay?",
-          description: "Bank statements, employment letter, or sponsor letter.",
+          scope: `category:${category}`,
+          question: "Do you have a job offer from an employer in the destination country?",
+          type: "boolean",
+          weight: 20,
+          correctAnswers: ["true"],
+          orderIndex: 10,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: "work_experience",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "How many years of relevant work experience do you have?",
+          type: "number",
+          weight: 10,
+          minValue: 0,
+          maxValue: 50,
+          idealMin: 2,
+          idealMax: 50,
+          orderIndex: 11,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: "qualifications",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "What is your highest level of education?",
+          type: "single",
+          options: ["High School", "Bachelor's Degree", "Master's Degree", "PhD", "Professional Certification"],
+          weight: 10,
+          correctAnswers: ["Bachelor's Degree", "Master's Degree", "PhD", "Professional Certification"],
+          orderIndex: 12,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        }
+      );
+      break;
+
+    case "student":
+      questions.push(
+        {
+          id: "admission",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Do you have an admission letter from a recognized institution?",
+          type: "boolean",
+          weight: 25,
+          correctAnswers: ["true"],
+          orderIndex: 10,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: "tuition_funds",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Can you prove you have funds to cover tuition fees?",
+          type: "boolean",
+          weight: 15,
+          correctAnswers: ["true"],
+          orderIndex: 11,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: "english_proficiency",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Do you have English language proficiency certification (IELTS/TOEFL)?",
+          description: "Required for English-speaking countries.",
+          type: "boolean",
+          weight: 10,
+          correctAnswers: ["true"],
+          orderIndex: 12,
+          isRequired: false,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        }
+      );
+      break;
+
+    case "tourist":
+      questions.push(
+        {
+          id: "return_ticket",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Do you have proof of return or onward travel?",
           type: "boolean",
           weight: 15,
           correctAnswers: ["true"],
@@ -565,7 +435,137 @@ export class EligibilityService {
           isActive: true,
           createdAt: now,
           updatedAt: now,
-        });
+        },
+        {
+          id: "accommodation",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Do you have accommodation bookings for your stay?",
+          type: "boolean",
+          weight: 10,
+          correctAnswers: ["true"],
+          orderIndex: 11,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: "travel_insurance",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Do you have travel insurance covering your trip?",
+          type: "boolean",
+          weight: 10,
+          correctAnswers: ["true"],
+          orderIndex: 12,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: "ties_to_home",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Can you demonstrate strong ties to your home country?",
+          description: "Employment, property, family, or business ties that show you will return.",
+          type: "boolean",
+          weight: 15,
+          correctAnswers: ["true"],
+          orderIndex: 13,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        }
+      );
+      break;
+
+    case "business":
+      questions.push(
+        {
+          id: "business_invitation",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Do you have an invitation letter from a business in the destination country?",
+          type: "boolean",
+          weight: 20,
+          correctAnswers: ["true"],
+          orderIndex: 10,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: "business_ownership",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Do you own or represent a registered business?",
+          type: "boolean",
+          weight: 15,
+          correctAnswers: ["true"],
+          orderIndex: 11,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        }
+      );
+      break;
+
+    case "family":
+      questions.push(
+        {
+          id: "sponsor_status",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Does your sponsor have legal residency/citizenship in the destination country?",
+          type: "boolean",
+          weight: 25,
+          correctAnswers: ["true"],
+          orderIndex: 10,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: "relationship_proof",
+          visaTypeId,
+          scope: `category:${category}`,
+          question: "Can you provide proof of your relationship to the sponsor?",
+          description: "Marriage certificate, birth certificate, etc.",
+          type: "boolean",
+          weight: 20,
+          correctAnswers: ["true"],
+          orderIndex: 11,
+          isRequired: true,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        }
+      );
+      break;
+
+    default:
+      // General financial question for other categories
+      questions.push({
+        id: "financial_proof",
+        visaTypeId,
+        scope: "common",
+        question: "Can you provide proof of sufficient funds for your stay?",
+        description: "Bank statements, employment letter, or sponsor letter.",
+        type: "boolean",
+        weight: 15,
+        correctAnswers: ["true"],
+        orderIndex: 10,
+        isRequired: true,
+        isActive: true,
+        createdAt: now,
+        updatedAt: now,
+      });
     }
 
     return questions.sort((a, b) => a.orderIndex - b.orderIndex);
@@ -730,61 +730,62 @@ export class EligibilityService {
       } else {
         // Evaluate the answer
         switch (question.type) {
-          case "boolean":
-            passed = question.correctAnswers?.includes(String(answerValue)) ?? false;
-            if (passed) {
-              points = question.weight;
-            } else {
-              recommendation = this.getRecommendation(question, answerValue);
-            }
-            break;
+        case "boolean":
+          passed = question.correctAnswers?.includes(String(answerValue)) ?? false;
+          if (passed) {
+            points = question.weight;
+          } else {
+            recommendation = this.getRecommendation(question, answerValue);
+          }
+          break;
 
-          case "number":
-            const numValue = Number(answerValue);
-            if (
-              question.idealMin !== undefined &&
+        case "number": {
+          const numValue = Number(answerValue);
+          if (
+            question.idealMin !== undefined &&
               question.idealMax !== undefined
-            ) {
-              if (numValue >= question.idealMin && numValue <= question.idealMax) {
-                passed = true;
-                points = question.weight;
-              } else if (numValue < question.idealMin) {
-                const ratio = numValue / question.idealMin;
-                points = Math.floor(question.weight * Math.min(ratio, 0.5));
-                recommendation = this.getRecommendation(question, answerValue);
-              }
-            } else {
-              // No ideal range, give full points if answered
+          ) {
+            if (numValue >= question.idealMin && numValue <= question.idealMax) {
               passed = true;
               points = question.weight;
+            } else if (numValue < question.idealMin) {
+              const ratio = numValue / question.idealMin;
+              points = Math.floor(question.weight * Math.min(ratio, 0.5));
+              recommendation = this.getRecommendation(question, answerValue);
             }
-            break;
-
-          case "single":
-            passed = question.correctAnswers?.includes(String(answerValue)) ?? false;
-            if (passed) {
-              points = question.weight;
-            } else {
-              // Partial credit for answering
-              points = Math.floor(question.weight * 0.3);
-            }
-            break;
-
-          case "multiple":
-            const selectedOptions = answerValue as string[];
-            const correctCount = selectedOptions.filter(
-              (opt) => question.correctAnswers?.includes(opt)
-            ).length;
-            const totalCorrect = question.correctAnswers?.length ?? 1;
-            points = Math.floor(question.weight * (correctCount / totalCorrect));
-            passed = correctCount === totalCorrect;
-            break;
-
-          case "date":
-            // For date questions, give full points if answered
-            points = question.weight;
+          } else {
+            // No ideal range, give full points if answered
             passed = true;
-            break;
+            points = question.weight;
+          }
+          break;
+        }
+        case "single":
+          passed = question.correctAnswers?.includes(String(answerValue)) ?? false;
+          if (passed) {
+            points = question.weight;
+          } else {
+            // Partial credit for answering
+            points = Math.floor(question.weight * 0.3);
+          }
+          break;
+
+        case "multiple": {
+          const selectedOptions = answerValue as string[];
+          const correctCount = selectedOptions.filter(
+            (opt) => question.correctAnswers?.includes(opt)
+          ).length;
+          const totalCorrect = question.correctAnswers?.length ?? 1;
+          points = Math.floor(question.weight * (correctCount / totalCorrect));
+          passed = correctCount === totalCorrect;
+          break;
+        }
+
+        case "date":
+          // For date questions, give full points if answered
+          points = question.weight;
+          passed = true;
+          break;
         }
       }
 

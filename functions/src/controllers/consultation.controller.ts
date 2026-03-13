@@ -34,47 +34,47 @@ export class ConsultationController {
       let consultations;
 
       switch (role) {
-        case "admin": {
-          if (!req.user?.admin) {
-            sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
-            return;
-          }
-          consultations = await consultationService.getAllConsultations(filters);
-          break;
+      case "admin": {
+        if (!req.user?.admin) {
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
         }
-        case "owner": {
-          const agent = await this.getAgentForUser(userId);
-          if (!agent?.agencyId || agent.agencyRole !== "owner") {
-            sendError(
-              res,
-              "FORBIDDEN",
-              "Only agency owners can view agency consultations",
-              403
-            );
-            return;
-          }
-          consultations = await consultationService.getConsultationsForAgency(
-            agent.agencyId,
-            filters
+        consultations = await consultationService.getAllConsultations(filters);
+        break;
+      }
+      case "owner": {
+        const agent = await this.getAgentForUser(userId);
+        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+          sendError(
+            res,
+            "FORBIDDEN",
+            "Only agency owners can view agency consultations",
+            403
           );
-          break;
+          return;
         }
-        case "client": {
-          // Mobile clients query their own consultations by userId
-          consultations = await consultationService.getConsultationsForClient(
-            userId,
-            filters
-          );
-          break;
-        }
-        case "agent":
-        default: {
-          consultations = await consultationService.getConsultationsForAgent(
-            userId,
-            filters
-          );
-          break;
-        }
+        consultations = await consultationService.getConsultationsForAgency(
+          agent.agencyId,
+          filters
+        );
+        break;
+      }
+      case "client": {
+        // Mobile clients query their own consultations by userId
+        consultations = await consultationService.getConsultationsForClient(
+          userId,
+          filters
+        );
+        break;
+      }
+      case "agent":
+      default: {
+        consultations = await consultationService.getConsultationsForAgent(
+          userId,
+          filters
+        );
+        break;
+      }
       }
 
       sendSuccess(res, consultations);
@@ -95,37 +95,37 @@ export class ConsultationController {
       let consultations;
 
       switch (role) {
-        case "admin": {
-          if (!req.user?.admin) {
-            sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
-            return;
-          }
-          consultations = await consultationService.getAllConsultations();
-          break;
+      case "admin": {
+        if (!req.user?.admin) {
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
         }
-        case "owner": {
-          const agent = await this.getAgentForUser(userId);
-          if (!agent?.agencyId || agent.agencyRole !== "owner") {
-            sendError(
-              res,
-              "FORBIDDEN",
-              "Only agency owners can view agency stats",
-              403
-            );
-            return;
-          }
-          consultations = await consultationService.getConsultationsForAgency(
-            agent.agencyId
+        consultations = await consultationService.getAllConsultations();
+        break;
+      }
+      case "owner": {
+        const agent = await this.getAgentForUser(userId);
+        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+          sendError(
+            res,
+            "FORBIDDEN",
+            "Only agency owners can view agency stats",
+            403
           );
-          break;
+          return;
         }
-        case "agent":
-        default: {
-          consultations = await consultationService.getConsultationsForAgent(
-            userId
-          );
-          break;
-        }
+        consultations = await consultationService.getConsultationsForAgency(
+          agent.agencyId
+        );
+        break;
+      }
+      case "agent":
+      default: {
+        consultations = await consultationService.getConsultationsForAgent(
+          userId
+        );
+        break;
+      }
       }
 
       const stats = consultationService.computeStats(consultations);
