@@ -32,3 +32,5 @@ npm-debug.log*
 
 # TypeScript cache
 *.tsbuildinfo
+
+key.json
