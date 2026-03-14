@@ -49,6 +49,6 @@ jobs:
       - name: Deploy to Firebase (prod)
         uses: w9jds/firebase-action@master
         with:
-          args: deploy --only functions --project default
+          args: deploy --only functions --project default --force
         env:
           GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
