@@ -291,13 +291,6 @@
         { "fieldPath": "countryCodes", "arrayConfig": "CONTAINS" },
         { "fieldPath": "pushEnabled", "order": "ASCENDING" }
       ]
-    },
-    {
-      "collectionGroup": "scrapeRuns",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "startedAt", "order": "DESCENDING" }
-      ]
     }
   ],
   "fieldOverrides": []
