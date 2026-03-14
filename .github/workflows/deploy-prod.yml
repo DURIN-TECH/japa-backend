@@ -1,6 +1,6 @@
 # Deploy to Production Workflow
 # Triggered on push to the main branch. Lints, builds, and deploys
-# Cloud Functions to the japa-platform Firebase project (production).
+# Cloud Functions, Firestore rules/indexes, and Storage rules to japa-platform.
 
 name: Deploy to Production
 
@@ -48,11 +48,11 @@ jobs:
         working-directory: functions
         run: npm run build
 
-      # Deploy Cloud Functions to the japa-platform Firebase project (production)
+      # Deploy functions, Firestore rules/indexes, and Storage rules to japa-platform
       # Uses a service account JSON stored as a GitHub secret for authentication
       - name: Deploy to Firebase (prod)
         uses: w9jds/firebase-action@master
         with:
-          args: deploy --only functions --project default --force
+          args: deploy --project default --force
         env:
           GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
