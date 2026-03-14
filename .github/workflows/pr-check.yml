@@ -1,0 +1,46 @@
+# PR Check Workflow
+# Runs lint and build checks on pull requests targeting main or dev branches.
+# This ensures code quality before merging — no deployment happens here.
+
+name: PR Check
+
+# Trigger on pull requests to main or dev
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  # Lint and build the Cloud Functions to validate the PR
+  check:
+    name: Lint & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up Node.js 22 to match the engine requirement in package.json
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+          cache-dependency-path: functions/package-lock.json
+
+      # Install dependencies from the lockfile for reproducible builds
+      - name: Install dependencies
+        working-directory: functions
+        run: npm ci
+
+      # Run ESLint to catch code style and potential errors
+      - name: Lint
+        working-directory: functions
+        run: npm run lint
+
+      # Compile TypeScript to verify the build succeeds
+      - name: Build
+        working-directory: functions
+        run: npm run build

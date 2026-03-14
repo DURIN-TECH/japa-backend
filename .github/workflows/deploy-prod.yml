@@ -1,0 +1,54 @@
+# Deploy to Production Workflow
+# Triggered on push to the main branch. Lints, builds, and deploys
+# Cloud Functions to the japa-platform Firebase project (production).
+
+name: Deploy to Production
+
+# Trigger on pushes to the main branch only
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # Lint, build, and deploy Cloud Functions to the production Firebase project
+  deploy:
+    name: Lint, Build & Deploy to Production
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up Node.js 22 to match the engine requirement in package.json
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+          cache-dependency-path: functions/package-lock.json
+
+      # Install dependencies from the lockfile for reproducible builds
+      - name: Install dependencies
+        working-directory: functions
+        run: npm ci
+
+      # Run ESLint to catch code style and potential errors
+      - name: Lint
+        working-directory: functions
+        run: npm run lint
+
+      # Compile TypeScript to verify the build succeeds before deploying
+      - name: Build
+        working-directory: functions
+        run: npm run build
+
+      # Deploy Cloud Functions to the japa-platform Firebase project (production)
+      # Uses a service account JSON stored as a GitHub secret for authentication
+      - name: Deploy to Firebase (prod)
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only functions --project default
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
