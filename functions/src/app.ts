@@ -21,7 +21,6 @@ import { newsRoutes } from "./routes/news.routes";
 import { bankAccountRoutes } from "./routes/bank-account.routes";
 import { onboardingRoutes } from "./routes/onboarding.routes";
 import { analyticsRoutes } from "./routes/analytics.routes";
-import { devRoutes } from "./routes/dev.routes";
 
 // Create Express app
 const app = express();
@@ -62,7 +61,6 @@ app.use("/news", newsRoutes);
 app.use("/eligibility", eligibilityRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
 app.use("/admin/visas", adminVisaRoutes);
-app.use("/dev", devRoutes);
 
 // Error handling
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
