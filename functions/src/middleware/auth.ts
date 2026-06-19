@@ -19,7 +19,7 @@ export async function verifyAuth(
 ): Promise<void> {
   const authHeader = req.headers.authorization;
 
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  if (!authHeader?.startsWith("Bearer ")) {
     res.status(401).json({
       success: false,
       error: "Unauthorized",
@@ -55,7 +55,7 @@ export async function optionalAuth(
 ): Promise<void> {
   const authHeader = req.headers.authorization;
 
-  if (authHeader && authHeader.startsWith("Bearer ")) {
+  if (authHeader?.startsWith("Bearer ")) {
     const token = authHeader.split("Bearer ")[1];
     try {
       const decodedToken = await auth.verifyIdToken(token);
