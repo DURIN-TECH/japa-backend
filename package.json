@@ -1,1 +1,5 @@
-{}
+{
+    "scripts": {
+        "start": "npm --prefix functions run build && firebase emulators:exec --ui \"npm --prefix functions run seed:emulator && tail -f /dev/null\""
+    }
+}

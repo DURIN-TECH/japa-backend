@@ -26,7 +26,10 @@ import { analyticsRoutes } from "./routes/analytics.routes";
 const app = express();
 
 // Middleware
-app.use(cors({ origin: true }));
+app.use(cors({ 
+  origin: true
+  // TODO: In production, set this to our portal and mobile URL and remove the wildcard origin
+}));
 app.use(express.json());
 
 // Request logging

@@ -1,4 +1,13 @@
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { IngestionStrategy, ScrapingConfig, SourceStatus, SupportedCountryCode } from "../types/news";
+
+// Firestore handle for this seeder. Declared at module scope to mirror the
+// other data seeders (seed-portal-data, seed-countries-visas, eligibility).
+// NOTE: getFirestore() requires Firebase Admin to already be initialized, so
+// this module must only be imported AFTER admin.initializeApp() has run — the
+// consolidated seed entry point (scripts/seed-all.ts) guarantees this by
+// importing all data seeders only after init.
+const db = getFirestore();
 
 export interface NewsSourceSeed {
   name: string;
@@ -218,3 +227,59 @@ export const NEWS_SOURCES: NewsSourceSeed[] = [
     priority: 5,
   },
 ];
+
+/**
+ * Seed the `newsSources` collection from the static NEWS_SOURCES list above.
+ *
+ * Moved here (out of scripts/seed-all.ts) so news-source seeding lives next to
+ * its own data definition, matching how every other domain seeder is organized
+ * (seed-portal-data, seed-countries-visas, eligibility-seed-nigeria-ireland).
+ * The consolidated entry point now just calls this function.
+ *
+ * Each source is written under a deterministic doc ID (its slug) with
+ * `{ merge: true }`, so re-running the seed is idempotent: existing sources are
+ * updated in place rather than duplicated, and runtime-tracked fields that the
+ * scraper owns (e.g. reliabilityScore/run counters) are reset to their seed
+ * baseline on each run.
+ *
+ * @returns the number of sources seeded.
+ */
+export async function seedNewsSources(): Promise<number> {
+  const collection = db.collection("newsSources");
+  const batch = db.batch();
+  const now = Timestamp.now();
+
+  for (const source of NEWS_SOURCES) {
+    // Use the slug as the deterministic doc ID so re-running is idempotent.
+    const ref = collection.doc(source.slug);
+    batch.set(
+      ref,
+      {
+        id: source.slug,
+        name: source.name,
+        slug: source.slug,
+        url: source.url,
+        countryCodes: source.countryCodes,
+        strategy: source.strategy,
+        config: source.config,
+        scrapeIntervalMinutes: source.scrapeIntervalMinutes,
+        // Due immediately on first run so the scraper picks it up right away.
+        nextScrapeAt: now,
+        status: source.status,
+        reliabilityScore: 100,
+        consecutiveFailures: 0,
+        totalRuns: 0,
+        successfulRuns: 0,
+        isOfficial: source.isOfficial,
+        priority: source.priority,
+        createdAt: now,
+        updatedAt: now,
+      },
+      { merge: true }
+    );
+  }
+
+  await batch.commit();
+  console.log(`✅ Seeded ${NEWS_SOURCES.length} news sources`);
+  return NEWS_SOURCES.length;
+}

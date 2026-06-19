@@ -1,10 +1,23 @@
 import { getStorage } from "firebase-admin/storage";
 import { randomUUID } from "crypto";
 
-const BUCKET_NAME = process.env.FIREBASE_STORAGE_BUCKET || "japa-app.appspot.com";
-
+// Service that brokers all Cloud Storage access for the backend.
+// File uploads are NOT proxied through Cloud Functions; instead, this service
+// mints short-lived v4 signed URLs that clients use to PUT/GET objects directly.
 export class StorageService {
-  private bucket = getStorage().bucket(BUCKET_NAME);
+  // Resolve the default bucket for the active Firebase project.
+  //
+  // Passing no name to `.bucket()` makes firebase-admin use the `storageBucket`
+  // option that was supplied to `initializeApp()` — which, in turn, is auto-populated
+  // from the `FIREBASE_CONFIG` env var that the Cloud Functions runtime and the
+  // Firebase emulator both set for us. That means the bucket id is always derived
+  // from `.firebaserc` / the project the function was deployed to, instead of being
+  // hardcoded in source. This avoids the previous bug where a stale hardcoded
+  // fallback (`japa-app.appspot.com`) silently pointed at a non-existent bucket.
+  //
+  // To override for a non-default bucket (e.g. a staging-only bucket), pass
+  // `storageBucket` explicitly to `admin.initializeApp()` in utils/firebase.ts.
+  private bucket = getStorage().bucket();
 
   /**
    * Generate a signed upload URL for direct client upload

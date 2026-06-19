@@ -29,6 +29,8 @@ Content-Type: application/json
 
 ###
 @adminToken = {{loginAdmin.response.body.idToken}}
+@refreshToken = {{loginAdmin.response.body.refreshToken}}
+
 
 ### Sign in as Agency Owner
 # @name loginOwner
