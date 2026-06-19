@@ -1,7 +1,7 @@
 /**
  * Payment Request Controller
  *
- * Handles all HTTP endpoints related to payment requests in the Japa platform.
+ * Handles all HTTP endpoints related to payment requests in the Seli platform.
  * Payment requests are created by agents to request funds from clients for
  * visa application services. Clients can approve (releasing escrow funds)
  * or reject (triggering a conversation) these requests.
