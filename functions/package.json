@@ -1,7 +1,7 @@
 {
   "name": "japa-functions",
   "version": "1.0.0",
-  "description": "Japa Backend - Firebase Cloud Functions",
+  "description": "Seli Backend - Firebase Cloud Functions",
   "main": "lib/index.js",
   "scripts": {
     "build": "tsc",
@@ -11,14 +11,8 @@
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log",
-    "seed": "npm run build && node lib/scripts/seed-questions.js",
-    "seed:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-questions.js",
-    "seed:portal": "npm run build && node lib/scripts/seed-portal.js",
-    "seed:portal:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-portal.js",
-    "seed:auth": "npm run build && node lib/scripts/seed-auth-users.js",
-    "seed:auth:emulator": "npm run build && FIREBASE_AUTH_EMULATOR_HOST=localhost:9099 node lib/scripts/seed-auth-users.js",
-    "seed:news": "npm run build && node lib/scripts/seed-news-sources.js",
-    "seed:news:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 node lib/scripts/seed-news-sources.js",
+    "seed": "npm run build && node lib/scripts/seed-all.js",
+    "seed:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 FIREBASE_AUTH_EMULATOR_HOST=localhost:9099 node lib/scripts/seed-all.js",
     "lint": "eslint --ext .ts src/",
     "lint:fix": "eslint --ext .ts src/ --fix",
     "clean": "rm -rf lib"

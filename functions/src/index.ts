@@ -32,11 +32,26 @@ export const onUserCreated = functions.auth.user().onCreate(async (user) => {
   console.log("New user created:", user.uid);
 
   try {
-    await collections.users.doc(user.uid).set({
+    // Use create() rather than set() so this trigger only PROVISIONS a brand
+    // new user document and never overwrites one that already exists.
+    //
+    // This matters because the Auth onCreate event is asynchronous and can
+    // race with other writers of the same user doc — most notably the seed
+    // script (which calls auth.createUser() and then writes a fully-populated
+    // user doc with firstName/lastName/phone/etc.), and onboarding. A plain
+    // set() here would replace the whole document with these empty defaults,
+    // wiping out fields written by those other paths. create() is atomic: if
+    // the doc already exists it throws ALREADY_EXISTS, which we treat as a
+    // no-op so the richer, already-written data is preserved.
+    await collections.users.doc(user.uid).create({
       id: user.uid,
       email: user.email || "",
-      firstName: "",
-      lastName: "",
+      // Mirror the Auth displayName (if any) into first/last name so seeded or
+      // dashboard-created users aren't left with blank names when this trigger
+      // wins the race and creates the doc first. Onboarding still overwrites
+      // these with the values the user actually enters.
+      firstName: (user.displayName || "").split(" ")[0] || "",
+      lastName: (user.displayName || "").split(" ").slice(1).join(" ") || "",
       onboardingCompleted: false,
       hasPassport: false,
       createdAt: new Date(),
@@ -44,8 +59,17 @@ export const onUserCreated = functions.auth.user().onCreate(async (user) => {
     });
 
     console.log("User document created for:", user.uid);
-  } catch (error) {
-    console.error("Error creating user document:", error);
+  } catch (error: unknown) {
+    // ALREADY_EXISTS (Firestore gRPC code 6) means another writer (seed /
+    // onboarding) already created the doc — that's expected and benign, so we
+    // intentionally swallow it to keep their data intact. Anything else is a
+    // real error worth logging.
+    const code = (error as { code?: number }).code;
+    if (code === 6) {
+      console.log("User document already exists, skipping create for:", user.uid);
+    } else {
+      console.error("Error creating user document:", error);
+    }
   }
 });
 

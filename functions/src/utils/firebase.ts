@@ -2,9 +2,22 @@ import * as admin from "firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
 
 // Initialize Firebase Admin SDK
-// When deployed to Cloud Functions, credentials are auto-detected
+// When deployed to Cloud Functions, credentials are auto-detected.
+//
+// We pass `storageBucket` explicitly because StorageService now resolves the
+// default bucket via `getStorage().bucket()` (no hardcoded name). Relying on the
+// auto-detected `FIREBASE_CONFIG.storageBucket` is NOT safe for this project: it
+// resolves to the legacy `<project>.appspot.com` form (`japa-platform.appspot.com`),
+// but this project's real bucket uses the post-Oct-2024 naming convention
+// (`japa-platform.firebasestorage.app`). Without this, every signed-URL/upload
+// call targets a non-existent bucket and fails across all clients.
+//
+// The value is overridable via `FIREBASE_STORAGE_BUCKET` (e.g. for staging).
 if (!admin.apps.length) {
-  admin.initializeApp();
+  admin.initializeApp({
+    storageBucket:
+      process.env.FIREBASE_STORAGE_BUCKET || "japa-platform.firebasestorage.app",
+  });
 }
 
 export const db = admin.firestore();
@@ -13,7 +26,7 @@ export const db = admin.firestore();
 db.settings({ ignoreUndefinedProperties: true });
 export const auth = admin.auth();
 export const storage = admin.storage();
-export const messaging = admin.messaging();
+export const messaging: admin.messaging.Messaging = admin.messaging();
 
 // Firestore collection references
 export const collections = {
