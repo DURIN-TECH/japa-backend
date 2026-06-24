@@ -38,6 +38,11 @@ export const collections = {
   transactions: db.collection("transactions"),
   consultations: db.collection("consultations"),
   notifications: db.collection("notifications"),
+  // Audit trail of outbound multi-channel deliveries (email/sms/push) attempted by
+  // the unified notifier. Email/SMS are currently stubbed, so this collection is the
+  // record that a message "would have been" sent; it becomes a real delivery log once
+  // SendGrid/Twilio are wired in.
+  notificationDeliveries: db.collection("notificationDeliveries"),
   paymentRequests: db.collection("paymentRequests"),
   conversations: db.collection("conversations"),
   agencyInvitations: db.collection("agencyInvitations"),

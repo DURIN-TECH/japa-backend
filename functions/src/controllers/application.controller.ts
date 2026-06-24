@@ -1,7 +1,10 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { applicationService } from "../services/application.service";
-import { collections } from "../utils/firebase";
+import { userService } from "../services/user.service";
+import { messagingService } from "../services/messaging.service";
+import { notificationService } from "../services/notification.service";
+import { collections, auth } from "../utils/firebase";
 import {
   sendSuccess,
   sendError,
@@ -9,7 +12,12 @@ import {
   sendNoContent,
   ErrorMessages,
 } from "../utils/response";
-import { Application, ApplicationStatus, Agent } from "../types";
+import {
+  Application,
+  ApplicationStatus,
+  Agent,
+  NotificationChannel,
+} from "../types";
 
 export class ApplicationController {
   /**
@@ -68,6 +76,189 @@ export class ApplicationController {
       sendCreated(res, application, "Application created successfully");
     } catch (error) {
       console.error("Error creating application:", error);
+      if ((error as Error).message === "Visa type not found") {
+        sendError(res, "NOT_FOUND", "Visa type not found", 404);
+        return;
+      }
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /applications/for-client
+   *
+   * Lets an authenticated AGENT start an application on a CLIENT's behalf from the
+   * portal. Differs from the self-serve `createApplication` (where the caller IS the
+   * applicant) in several ways:
+   *   - The applicant (`userId`) is the CLIENT, resolved/provisioned from an email.
+   *   - The application is tagged `mode: "agent"`, `createdVia: "portal"` and linked
+   *     to the calling agent (`agentId`).
+   *   - A conversation is opened between agent and client.
+   *   - The client is notified across channels (in-app + push real; email/sms stub).
+   */
+  async createApplicationForClient(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    try {
+      const callerUid = req.userId!;
+      const {
+        clientName,
+        clientEmail,
+        clientPhone,
+        countryCode,
+        visaTypeId,
+        agentNotes,
+        channels,
+      } = req.body as {
+        clientName?: string;
+        clientEmail?: string;
+        clientPhone?: string;
+        countryCode?: string;
+        visaTypeId?: string;
+        agentNotes?: string;
+        channels?: NotificationChannel[];
+      };
+
+      // --- Validation --------------------------------------------------------
+      if (!clientName || !clientEmail || !countryCode || !visaTypeId) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          "clientName, clientEmail, countryCode and visaTypeId are required",
+          400
+        );
+        return;
+      }
+
+      // --- Authorize: caller must be an agent --------------------------------
+      // We need both the agent's USER uid (used as Application.agentId, consistent
+      // with the rest of the application code) and the agent DOC id (used as the
+      // Conversation.agentId — these two identifiers are intentionally different).
+      const agentSnapshot = await collections.agents
+        .where("userId", "==", callerUid)
+        .limit(1)
+        .get();
+      if (agentSnapshot.empty) {
+        sendError(
+          res,
+          "FORBIDDEN",
+          "Only agents can start applications on behalf of a client",
+          403
+        );
+        return;
+      }
+      const agentDocId = agentSnapshot.docs[0].id;
+
+      // --- Resolve or provision the client -----------------------------------
+      const normalizedEmail = clientEmail.trim().toLowerCase();
+      // Split the typed full name into first/last for the user profile.
+      const [firstName, ...rest] = clientName.trim().split(/\s+/);
+      const lastName = rest.join(" ");
+
+      let clientUid: string;
+      let clientExisted: boolean;
+
+      const existingUser = await userService.getUserByEmail(normalizedEmail);
+      if (existingUser) {
+        // LINK to the existing client. Do not touch their profile — their own
+        // account details win; the typed name/phone only feed the denormalized
+        // application fields below.
+        clientUid = existingUser.id;
+        clientExisted = true;
+      } else {
+        // Provision a shell account so the application has a real applicant the
+        // client can later claim by signing in with this email.
+        clientExisted = false;
+        try {
+          const authUser = await auth.createUser({
+            email: normalizedEmail,
+            displayName: clientName.trim(),
+          });
+          clientUid = authUser.uid;
+        } catch (err) {
+          // Race / pre-existing Auth account without a Firestore profile: an Auth
+          // record already exists for this email. Recover by looking it up and
+          // treating it as an existing client.
+          if ((err as { code?: string }).code === "auth/email-already-exists") {
+            const authUser = await auth.getUserByEmail(normalizedEmail);
+            clientUid = authUser.uid;
+            clientExisted = true;
+          } else {
+            throw err;
+          }
+        }
+
+        // Create the Firestore profile for the freshly provisioned account.
+        // (Skip if we recovered an existing Auth user that already has a profile.)
+        if (!clientExisted) {
+          await userService.createUser(clientUid, {
+            email: normalizedEmail,
+            firstName: firstName || clientName.trim(),
+            lastName,
+            phone: clientPhone,
+          });
+          // Mark as provisional — created by an agent, not yet self-claimed.
+          await collections.users
+            .doc(clientUid)
+            .update({ isProvisional: true });
+        }
+      }
+
+      // --- Create the application (agent-managed, portal-originated) ----------
+      const application = await applicationService.createApplication(clientUid, {
+        visaTypeId,
+        countryCode,
+        mode: "agent",
+        agentId: callerUid, // Application.agentId = agent USER uid (codebase convention)
+        agentNotes,
+        createdVia: "portal",
+        clientNameOverride: clientName.trim(),
+        clientEmailOverride: normalizedEmail,
+        clientPhoneOverride: clientPhone,
+      });
+
+      // --- Open an agent<->client conversation --------------------------------
+      // Conversation.agentId is the agent DOC id (different identifier — see above).
+      const conversation = await messagingService.getOrCreateConversation(
+        clientUid,
+        agentDocId,
+        application.id
+      );
+
+      // --- Notify the client across channels ----------------------------------
+      const inviteLine = clientExisted
+        ? "Your agent has started a new visa application for you. Open the app to view the details."
+        : "Your agent has started a visa application for you on Seli. Download the app or check your email to follow along.";
+      await notificationService.notifyUser({
+        userId: clientUid,
+        type: "application_created",
+        title: `New ${application.visaTypeName || "visa"} application started`,
+        body: inviteLine,
+        // Default to in-app + email + push so a client without the app still hears
+        // about it; the agent can override per request.
+        channels: channels ?? ["in_app", "email", "push"],
+        relatedEntityType: "application",
+        relatedEntityId: application.id,
+        data: { conversationId: conversation.id },
+      });
+
+      // Return the created application plus the side-effect ids and the link/invite
+      // outcome so the portal can show the right confirmation message.
+      sendCreated(
+        res,
+        {
+          ...application,
+          conversationId: conversation.id,
+          clientExisted,
+          clientId: clientUid,
+        },
+        clientExisted
+          ? "Application created and linked to existing client"
+          : "Application created and client invited"
+      );
+    } catch (error) {
+      console.error("Error creating application for client:", error);
       if ((error as Error).message === "Visa type not found") {
         sendError(res, "NOT_FOUND", "Visa type not found", 404);
         return;

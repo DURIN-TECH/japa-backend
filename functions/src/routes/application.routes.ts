@@ -10,6 +10,11 @@ const router = Router();
 router.post("/", verifyAuth, (req, res) =>
   applicationController.createApplication(req, res)
 );
+// Agent starts an application on a client's behalf (portal flow). Must be declared
+// before the parameterized "/:id" routes so it isn't shadowed by them.
+router.post("/for-client", verifyAuth, (req, res) =>
+  applicationController.createApplicationForClient(req, res)
+);
 router.get("/", verifyAuth, (req, res) =>
   applicationController.getApplications(req, res)
 );

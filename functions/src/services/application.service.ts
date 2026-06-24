@@ -8,6 +8,7 @@ import {
   Application,
   ApplicationStatus,
   ApplicationMode,
+  ApplicationCreatedVia,
   ApplicationTimeline,
   PaymentStatus,
 } from "../types";
@@ -20,6 +21,16 @@ export interface CreateApplicationInput {
   mode: ApplicationMode;
   agentId?: string;
   userNotes?: string;
+  // Origin channel. Defaults to "mobile" (client self-serve) when omitted so the
+  // existing mobile create path is tagged without changing its callers.
+  createdVia?: ApplicationCreatedVia;
+  // Optional notes authored by the agent at creation time (portal flow).
+  agentNotes?: string;
+  // Optional denormalized client details supplied by the caller (portal flow,
+  // where the agent types them in). When omitted we fall back to the user record.
+  clientNameOverride?: string;
+  clientEmailOverride?: string;
+  clientPhoneOverride?: string;
 }
 
 export interface UpdateApplicationInput {
@@ -64,10 +75,15 @@ class ApplicationService {
     ]);
 
     const userData = userDoc.exists ? userDoc.data() : null;
-    const clientName = userData
-      ? `${userData.firstName || ""} ${userData.lastName || ""}`.trim()
-      : "";
-    const clientEmail = userData?.email || "";
+    // Prefer caller-supplied denormalized details (portal flow, where the agent
+    // types them) and fall back to the resolved user record (mobile self-serve).
+    const clientName =
+      input.clientNameOverride?.trim() ||
+      (userData
+        ? `${userData.firstName || ""} ${userData.lastName || ""}`.trim()
+        : "");
+    const clientEmail = input.clientEmailOverride || userData?.email || "";
+    const clientPhone = input.clientPhoneOverride || userData?.phone || undefined;
 
     // Resolve agencyId from the agent if mode is "agent"
     let agencyId: string | undefined;
@@ -92,6 +108,8 @@ class ApplicationService {
       mode: input.mode,
       agentId: input.agentId,
       agencyId,
+      // Default to "mobile" so pre-existing self-serve callers are tagged.
+      createdVia: input.createdVia ?? "mobile",
       status: "draft",
       progress: 0,
       currentStep: "Getting started",
@@ -106,9 +124,11 @@ class ApplicationService {
       amountPaid: 0,
       paymentStatus: "pending",
       userNotes: input.userNotes,
+      agentNotes: input.agentNotes,
       // Denormalized fields for read performance
       clientName,
       clientEmail,
+      clientPhone,
       visaTypeName: visaType.name,
       countryName: country?.name || input.countryCode,
       createdAt: now,

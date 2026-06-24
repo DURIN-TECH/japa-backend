@@ -1,6 +1,28 @@
-import { collections } from "../utils/firebase";
-import { Notification } from "../types";
+import { collections, messaging } from "../utils/firebase";
+import {
+  Notification,
+  NotificationType,
+  NotificationChannel,
+} from "../types";
 import { Timestamp } from "firebase-admin/firestore";
+
+// Input for the unified, multi-channel notifier. A single call fans out to every
+// requested channel (in-app record, push, email, sms). Channels are best-effort and
+// independent — one failing never blocks the others or the caller.
+export interface NotifyUserInput {
+  userId: string; // Recipient's Firebase UID (also the users/{uid} doc id)
+  type: NotificationType;
+  title: string;
+  body: string;
+  // Which channels to deliver on. Defaults to ["in_app", "push"] when omitted.
+  channels?: NotificationChannel[];
+  // Deep-link metadata stored on the in-app record and sent in the push payload.
+  relatedEntityType?: Notification["relatedEntityType"];
+  relatedEntityId?: string;
+  actionUrl?: string;
+  // Extra string key/values merged into the FCM data payload (must be strings).
+  data?: Record<string, string>;
+}
 
 class NotificationService {
   /**
@@ -59,6 +81,128 @@ class NotificationService {
 
     await docRef.set(notification);
     return notification;
+  }
+
+  /**
+   * Unified multi-channel notifier.
+   *
+   * Delivers a single logical notification across the requested channels. Each
+   * channel is dispatched independently and best-effort: a failure in one (e.g. a
+   * push token rejected by FCM) is logged and swallowed so the others — and the
+   * caller's request — still succeed.
+   *
+   * Channel behaviour today:
+   *  - in_app: writes a Firestore notification record (the existing pattern).
+   *  - push:   REAL — sends FCM to the recipient's registered device tokens.
+   *  - email:  STUB — logs + records a `notificationDeliveries` row (no real send).
+   *  - sms:    STUB — logs + records a `notificationDeliveries` row (no real send).
+   *
+   * The email/sms stubs exist so the architecture is end-to-end today and a real
+   * provider (SendGrid/Twilio) is a localized drop-in later — callers don't change.
+   */
+  async notifyUser(input: NotifyUserInput): Promise<void> {
+    const channels = input.channels ?? ["in_app", "push"];
+
+    // Load the recipient once — needed for push tokens (fcmTokens) and for the
+    // email/sms stub destinations (email/phone).
+    const userDoc = await collections.users.doc(input.userId).get();
+    const user = userDoc.exists ? userDoc.data() : null;
+
+    // --- in_app ---------------------------------------------------------------
+    if (channels.includes("in_app")) {
+      try {
+        await this.createNotification({
+          userId: input.userId,
+          type: input.type,
+          title: input.title,
+          body: input.body,
+          actionUrl: input.actionUrl,
+          relatedEntityType: input.relatedEntityType,
+          relatedEntityId: input.relatedEntityId,
+        });
+      } catch (err) {
+        console.error("[notifyUser] in_app delivery failed:", err);
+      }
+    }
+
+    // --- push (REAL FCM) ------------------------------------------------------
+    if (channels.includes("push")) {
+      const tokens = user?.fcmTokens ?? [];
+      if (tokens.length > 0) {
+        try {
+          await messaging.sendEachForMulticast({
+            tokens,
+            notification: { title: input.title, body: input.body },
+            // All FCM data values must be strings.
+            data: {
+              type: input.type,
+              ...(input.relatedEntityId
+                ? { relatedEntityId: input.relatedEntityId }
+                : {}),
+              ...(input.relatedEntityType
+                ? { relatedEntityType: input.relatedEntityType }
+                : {}),
+              ...(input.data ?? {}),
+            },
+          });
+        } catch (err) {
+          // Never fail the request because a push couldn't be delivered.
+          console.error("[notifyUser] push delivery failed:", err);
+        }
+      }
+    }
+
+    // --- email (STUB) ---------------------------------------------------------
+    if (channels.includes("email")) {
+      await this.recordStubDelivery(
+        "email",
+        user?.email,
+        input
+      );
+    }
+
+    // --- sms (STUB) -----------------------------------------------------------
+    if (channels.includes("sms")) {
+      await this.recordStubDelivery(
+        "sms",
+        user?.phone,
+        input
+      );
+    }
+  }
+
+  /**
+   * Stub delivery helper for email/sms. Logs the message and records an auditable
+   * row in `notificationDeliveries` with status "stubbed". Replace the body of this
+   * method (or branch by channel) with a real SendGrid/Twilio call when ready —
+   * nothing else in the codebase needs to change.
+   */
+  private async recordStubDelivery(
+    channel: "email" | "sms",
+    to: string | undefined,
+    input: NotifyUserInput
+  ): Promise<void> {
+    try {
+      console.log(
+        `[${channel.toUpperCase()} stub] -> ${to ?? "(no destination on file)"}: ` +
+          `${input.title} — ${input.body}`
+      );
+      await collections.notificationDeliveries.add({
+        channel,
+        to: to ?? null,
+        userId: input.userId,
+        subject: input.title,
+        body: input.body,
+        type: input.type,
+        relatedEntityType: input.relatedEntityType ?? null,
+        relatedEntityId: input.relatedEntityId ?? null,
+        // "stubbed" = not actually sent; flips to "sent"/"failed" once wired up.
+        status: "stubbed",
+        createdAt: Timestamp.now(),
+      });
+    } catch (err) {
+      console.error(`[notifyUser] ${channel} stub delivery failed:`, err);
+    }
   }
 
   /**

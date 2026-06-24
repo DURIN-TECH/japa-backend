@@ -32,6 +32,13 @@ export interface User {
   passportExpiryDate?: Timestamp;
   passportCountry?: string;
   
+  // Provisioning status
+  // True when this account was created by an agent on a client's behalf (from the
+  // portal) and the client has not yet completed sign-up themselves. Such accounts
+  // can be looked up by email and have applications/conversations attached to them,
+  // but the client may not have set a password or downloaded the app yet.
+  isProvisional?: boolean;
+
   // Metadata
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -314,6 +321,13 @@ export type ApplicationStatus =
 
 export type ApplicationMode = "self" | "agent";
 
+// Origin channel for an application. This is distinct from `mode` (which records
+// WHO manages the application — the client themselves vs an agent). `createdVia`
+// records WHERE the application was started: the mobile app (client self-serve)
+// vs the agent portal (an agent starting it on a client's behalf). This lets us
+// tell the two populations apart for reporting, routing and onboarding logic.
+export type ApplicationCreatedVia = "portal" | "mobile";
+
 export interface Application {
   id: string;
   userId: string;
@@ -324,6 +338,11 @@ export interface Application {
   mode: ApplicationMode;
   agentId?: string;
   agencyId?: string; // Cases belong to the agency, not the individual agent
+
+  // Origin channel — "mobile" for client self-serve, "portal" for agent-started.
+  // Optional for backward-compatibility with documents created before this field
+  // existed (those are treated as "mobile" downstream).
+  createdVia?: ApplicationCreatedVia;
 
   // Status & Progress
   status: ApplicationStatus;
@@ -357,6 +376,7 @@ export interface Application {
   // Denormalized fields (colocated for read performance)
   clientName?: string;
   clientEmail?: string;
+  clientPhone?: string; // Captured when an agent starts an application for a client
   visaTypeName?: string;
   countryName?: string;
 
@@ -643,6 +663,7 @@ export interface BankAccount {
 
 export type NotificationType =
   | "application_update"
+  | "application_created" // An agent started an application on a client's behalf
   | "document_status"
   | "consultation_reminder"
   | "payment_received"
@@ -651,6 +672,12 @@ export type NotificationType =
   | "message_received"
   | "visa_news"
   | "system";
+
+// Delivery channels supported by the unified notifier (`notifyUser`). Each channel
+// is best-effort and independent. "in_app" + "push" are delivered for real today;
+// "email" + "sms" are stubbed (logged + recorded in `notificationDeliveries`) so a
+// real provider (SendGrid/Twilio) can be dropped in later without changing callers.
+export type NotificationChannel = "in_app" | "email" | "sms" | "push";
 
 export interface Notification {
   id: string;
