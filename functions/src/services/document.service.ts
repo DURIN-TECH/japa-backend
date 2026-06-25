@@ -1,6 +1,8 @@
 import { getFirestore, Timestamp, FieldValue } from "firebase-admin/firestore";
 import { Document, DocumentStatus } from "../types";
 import { storageService } from "./storage.service";
+import { noteService } from "./note.service";
+import { userService } from "./user.service";
 
 const db = getFirestore();
 
@@ -221,6 +223,29 @@ export class DocumentService {
     }
 
     await applicationRef.update(countUpdates);
+
+    // Record an activity note on the case capturing this review action so the
+    // notes feed reflects document approvals/rejections/resubmission requests.
+    // Best-effort (never blocks the review).
+    const docName = document.fileName || "document";
+    // Attribute the review to the reviewing agent.
+    const reviewerName = await userService.getDisplayName(reviewerId);
+    const by = reviewerName || "An agent";
+    const activityByStatus: Partial<Record<DocumentStatus, string>> = {
+      verified: `${by} approved document "${docName}".`,
+      rejected:
+        `${by} rejected document "${docName}".` +
+        (input.rejectionReason ? ` Reason: ${input.rejectionReason}` : ""),
+      resubmission_required: `${by} requested resubmission of document "${docName}".`,
+      under_review: `${by} marked document "${docName}" as under review.`,
+    };
+    const activityContent = activityByStatus[input.status];
+    if (activityContent) {
+      await noteService.addActivityNote(document.applicationId, activityContent, {
+        id: reviewerId,
+        name: reviewerName,
+      });
+    }
 
     return {
       ...document,

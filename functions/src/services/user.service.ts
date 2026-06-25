@@ -95,6 +95,21 @@ class UserService {
   }
 
   /**
+   * Resolve a user's display name ("First Last") from their UID. Best-effort —
+   * returns "" if the user can't be found or lookup fails. Used to attribute
+   * activity/audit notes to the agent who performed an action.
+   */
+  async getDisplayName(userId: string): Promise<string> {
+    try {
+      const user = await this.getUserById(userId);
+      if (!user) return "";
+      return `${user.firstName || ""} ${user.lastName || ""}`.trim();
+    } catch {
+      return "";
+    }
+  }
+
+  /**
    * Update user profile
    */
   async updateUser(userId: string, input: UpdateUserInput): Promise<User> {

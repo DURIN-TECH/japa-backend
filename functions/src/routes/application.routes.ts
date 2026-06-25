@@ -54,5 +54,9 @@ router.delete("/:id/notes/:noteId", verifyAuth, (req, res) =>
 router.get("/:applicationId/documents", verifyAuth, (req, res) =>
   documentController.getApplicationDocuments(req, res)
 );
+// Agent requests a document from the client (records an activity note + notifies)
+router.post("/:id/documents/request", verifyAuth, (req, res) =>
+  applicationController.requestDocument(req, res)
+);
 
 export { router as applicationRoutes };

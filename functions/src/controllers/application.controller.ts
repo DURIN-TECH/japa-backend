@@ -4,6 +4,7 @@ import { applicationService } from "../services/application.service";
 import { userService } from "../services/user.service";
 import { messagingService } from "../services/messaging.service";
 import { notificationService } from "../services/notification.service";
+import { noteService } from "../services/note.service";
 import { collections, auth } from "../utils/firebase";
 import {
   sendSuccess,
@@ -406,9 +407,107 @@ export class ApplicationController {
       }
 
       const updated = await applicationService.updateApplication(id, updates);
+
+      // Record an activity note when the assigned agent changes (assignment /
+      // reassignment / self-service takeover) so the case notes reflect it,
+      // attributed to the agent who performed it.
+      if (
+        updates.agentId !== undefined &&
+        updates.agentId !== application.agentId
+      ) {
+        // Resolve both the actor (who made the change) and the target agent name.
+        const [actorName, targetName] = await Promise.all([
+          userService.getDisplayName(userId),
+          userService.getDisplayName(updates.agentId),
+        ]);
+        const target = targetName || "an agent";
+        // Distinguish a self-service takeover (mode self -> agent) from a plain
+        // reassignment for a more meaningful audit entry.
+        const tookOverSelfService =
+          updates.mode === "agent" && application.mode === "self";
+        await noteService.addActivityNote(
+          id,
+          tookOverSelfService
+            ? `${target} picked up the case (was self-service).`
+            : `${actorName || "An agent"} assigned the case to ${target}.`,
+          { id: userId, name: actorName }
+        );
+      }
+
       sendSuccess(res, updated, "Application updated successfully");
     } catch (error) {
       console.error("Error updating application:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /applications/:id/documents/request
+   *
+   * An agent requests a (specific type of) document from the client. This is an
+   * agent-side action with two effects:
+   *   1. records an activity note on the case (so the notes feed shows it), and
+   *   2. notifies the client across channels that a document was requested.
+   * It does not (yet) create a document record — it's a request/prompt + audit.
+   */
+  async requestDocument(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { id } = req.params;
+      const { documentType, notes } = req.body as {
+        documentType?: string;
+        notes?: string;
+      };
+
+      if (!documentType) {
+        sendError(res, "VALIDATION_ERROR", "documentType is required", 400);
+        return;
+      }
+
+      const application = await applicationService.getApplicationById(id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+
+      // Only the case's agent/owner/admin can request documents — not the client.
+      const isAdmin = !!req.user?.admin;
+      const isApplicant = application.userId === userId;
+      const hasAccess = await this.checkApplicationAccess(userId, application, isAdmin);
+      if (!hasAccess || isApplicant) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+
+      // 1. Activity note (audit trail on the case notes feed), attributed to the
+      // requesting agent.
+      const actorName = await userService.getDisplayName(userId);
+      await noteService.addActivityNote(
+        id,
+        `${actorName || "An agent"} requested a document from the client: ${documentType}.` +
+          (notes ? ` Note: ${notes}` : ""),
+        { id: userId, name: actorName }
+      );
+
+      // 2. Notify the client across channels so they know to upload it.
+      await notificationService.notifyUser({
+        userId: application.userId,
+        type: "document_status",
+        title: "Document requested",
+        body:
+          `Your agent requested a document: ${documentType}.` +
+          (notes ? ` ${notes}` : ""),
+        channels: ["in_app", "email", "push"],
+        relatedEntityType: "application",
+        relatedEntityId: id,
+      });
+
+      sendSuccess(res, { documentType }, "Document requested from client");
+    } catch (error) {
+      console.error("Error requesting document:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }
@@ -499,10 +598,14 @@ export class ApplicationController {
         }
       }
 
+      // Resolve the acting agent's name so the activity note attributes the change.
+      const actorName = await userService.getDisplayName(userId);
       const updated = await applicationService.updateStatus(id, status, {
         currentStep,
         nextStep,
         rejectionReason,
+        actorId: userId,
+        actorName,
       });
 
       sendSuccess(res, updated, "Status updated successfully");

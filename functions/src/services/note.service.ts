@@ -44,6 +44,43 @@ class NoteService {
   }
 
   /**
+   * Record an automatic "activity" note on a case — a system-authored entry that
+   * captures something done in relation to the case (status change, document
+   * request, document review, agent assignment, etc.) so the notes feed doubles
+   * as an audit trail of everything that has happened.
+   *
+   * `actor` attributes the activity to the agent who performed it: their name is
+   * stored as `authorName` (and id as `authorId`) so the audit trail shows WHO
+   * acted. The `authorRole` stays "system" so the portal still renders it as an
+   * activity entry (badge, not editable). Callers should also embed the actor's
+   * name in `content` since the notes list shows content (not author).
+   *
+   * Best-effort: failures are logged and swallowed so this side-effect can never
+   * break the underlying mutation that triggered it (mirrors the notification
+   * service's fail-soft behaviour).
+   */
+  async addActivityNote(
+    applicationId: string,
+    content: string,
+    actor?: { id?: string; name?: string }
+  ): Promise<void> {
+    try {
+      // Attribute to the acting agent when known; otherwise fall back to the
+      // generic system sentinel. authorRole stays "system" regardless so the
+      // portal renders these as activity entries (badge, no edit/delete).
+      await this.addNote(
+        applicationId,
+        actor?.id || "system",
+        actor?.name?.trim() || "Seli",
+        "system",
+        content
+      );
+    } catch (err) {
+      console.error("[addActivityNote] failed to record activity note:", err);
+    }
+  }
+
+  /**
    * Update a note's content
    */
   async updateNote(

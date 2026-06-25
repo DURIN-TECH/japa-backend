@@ -14,6 +14,7 @@ import {
 } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 import { visaService } from "./visa.service";
+import { noteService } from "./note.service";
 
 export interface CreateApplicationInput {
   visaTypeId: string;
@@ -258,6 +259,9 @@ class ApplicationService {
       currentStep?: string;
       nextStep?: string;
       rejectionReason?: string;
+      // Agent who performed the change — attributed in the activity note.
+      actorId?: string;
+      actorName?: string;
     }
   ): Promise<Application> {
     const appRef = collections.applications.doc(applicationId);
@@ -306,6 +310,20 @@ class ApplicationService {
       status: "completed",
       responsibility: "system",
     });
+
+    // Record an activity note capturing the transition so the case notes feed
+    // reflects the status change (audit trail), attributed to the acting agent.
+    if (application.status !== status) {
+      const by = options?.actorName?.trim();
+      await noteService.addActivityNote(
+        applicationId,
+        (by ? `${by} updated the status` : "Status updated") +
+          ` from "${this.getStatusTitle(application.status)}" to ` +
+          `"${this.getStatusTitle(status)}".` +
+          (options?.rejectionReason ? ` Reason: ${options.rejectionReason}` : ""),
+        { id: options?.actorId, name: options?.actorName }
+      );
+    }
 
     const updated = await appRef.get();
     return updated.data() as Application;
