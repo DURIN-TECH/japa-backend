@@ -90,6 +90,76 @@ export class StorageService {
   }
 
   /**
+   * Generate a signed upload URL for an agency's white-label logo.
+   *
+   * Stored under a per-agency prefix so logos are easy to scope/clean up and
+   * never collide across agencies. Mirrors the verification-document flow:
+   * the client PUTs the file directly to this short-lived URL, then calls the
+   * register endpoint which makes the object public and persists the URL.
+   */
+  async getSignedAgencyLogoUploadUrl(
+    agencyId: string,
+    fileName: string,
+    contentType: string
+  ): Promise<{
+    uploadUrl: string;
+    storagePath: string;
+    expiresAt: Date;
+  }> {
+    const fileId = randomUUID();
+    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
+    const storagePath = `agency-logos/${agencyId}/${fileId}_${sanitizedFileName}`;
+
+    const file = this.bucket.file(storagePath);
+
+    // Short-lived (15 min) write URL — only enough time to complete the upload.
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    const [uploadUrl] = await file.getSignedUrl({
+      version: "v4",
+      action: "write",
+      expires: expiresAt,
+      contentType,
+    });
+
+    return {
+      uploadUrl,
+      storagePath,
+      expiresAt,
+    };
+  }
+
+  /**
+   * Mint a durable, publicly-fetchable download URL for an uploaded object.
+   *
+   * Agency logos are rendered persistently in the portal chrome (sidebar) on
+   * every page load, so a short-lived signed download URL is unsuitable — it
+   * would expire (v4 signed URLs cap at 7 days).
+   *
+   * We deliberately do NOT use `file.makePublic()`: that sets per-object ACLs,
+   * which throw on buckets with uniform bucket-level access (UBLA) enabled —
+   * the default for newer Firebase Storage buckets. Instead we attach a
+   * `firebaseStorageDownloadTokens` value to the object's metadata and return
+   * the canonical Firebase download URL. This token-based URL works regardless
+   * of UBLA, never expires, and is the standard Firebase download mechanism.
+   */
+  async makeFilePublic(storagePath: string): Promise<string> {
+    const file = this.bucket.file(storagePath);
+
+    // A random token gates access; anyone with the URL can read the object,
+    // which is exactly what we want for a public logo.
+    const token = randomUUID();
+    await file.setMetadata({
+      metadata: { firebaseStorageDownloadTokens: token },
+    });
+
+    // Firebase download URL: the object path is percent-encoded as a single
+    // path segment (slashes become %2F).
+    const encodedPath = encodeURIComponent(storagePath);
+    return `https://firebasestorage.googleapis.com/v0/b/${this.bucket.name}/o/${encodedPath}?alt=media&token=${token}`;
+  }
+
+  /**
    * Generate a signed download URL for a file
    */
   async getSignedDownloadUrl(
