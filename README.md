@@ -363,6 +363,27 @@ firebase deploy --only firestore:rules,storage:rules
 firebase deploy --only firestore:indexes
 ```
 
+## Authorization & Entitlements
+
+Authorization uses the shared **`@durin-tech/authz`** package (private GitHub Packages).
+
+- **Roles** (`admin`/`owner`/`agent`/`client`) live in Firebase **custom claims**, set by `claims.service`
+  on signup / onboarding / invite-accept / leave, plus an admin `PUT /users/:uid/role`. Backfill existing
+  users: `node lib/scripts/backfill-claims.js`.
+- **Enforcement**: `verifyAuth` → `attachAuthz` builds `req.authz` + a CASL `req.ability` (RBAC +
+  entitlements). Controllers gate with `can(req, action, asSubject(...))` and `requireFeature` /
+  `checkWithinLimit`. `GET /users/me/authorization` returns role + entitlements + packed CASL rules.
+- **Entitlements**: `plans` / `subscriptions` / `entitlements` collections (`entitlement.service`). Seed
+  plans: `node lib/scripts/seed-plans.js`. Gating is safe-rollout (RBAC-only until a subscriber has an
+  entitlements doc).
+- **Billing**: Paystack (`services/billing/`) behind a provider-agnostic `BillingProvider`; webhook at
+  `/webhooks/paystack` (HMAC-verified, raw body). Agency **per-seat** billing is enforced at agent
+  invite/accept (HTTP 402 when over paid seats).
+
+Install needs a GitHub Packages token: `NODE_AUTH_TOKEN="$(gh auth token)" npm install` (the committed
+`.npmrc` reads it). See [`todo.md`](./todo.md) for deploy secrets, Paystack config, and the Firebase
+Functions build-token caveat.
+
 ## License
 
 Private - Japa Inc.
