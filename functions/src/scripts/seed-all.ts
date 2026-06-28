@@ -41,6 +41,8 @@ admin.firestore().settings({ ignoreUndefinedProperties: true });
 import { seedPortalData } from "../data/seed-portal-data";
 import { seedNigeriaIrelandEligibility } from "../data/eligibility-seed-nigeria-ireland";
 import { seedNewsSources } from "../data/seed-news-sources";
+import { seedPlans } from "./seed-plans";
+import { backfillClaims } from "./backfill-claims";
 
 /**
  * Entry point — runs each seeder sequentially so later seeders can depend
@@ -66,6 +68,17 @@ async function main() {
     // 3. News sources — feed definitions the scraper polls.
     console.log("→ Seeding news sources...");
     const newsCount = await seedNewsSources();
+
+    // 4. Subscription plans — the RBAC/entitlement billing catalog. Without these
+    //    the portal/mobile "Available plans" list is empty and upgrades can't start.
+    console.log("→ Seeding subscription plans...");
+    const plansCount = await seedPlans();
+
+    // 5. RBAC role claims — backfill canonical role (+ agencyId) custom claims for
+    //    every auth user from the portal data just seeded. Runs last so the agency/
+    //    agent docs it reads already exist.
+    console.log("→ Backfilling RBAC role claims...");
+    await backfillClaims();
 
     // Summary output mirrors what the old per-domain scripts printed so
     // existing muscle memory / docs still line up.
@@ -93,6 +106,9 @@ async function main() {
     console.log(`  - Exemptions:      ${eligibility.exemptionsSeeded}`);
     console.log("News:");
     console.log(`  - Sources:         ${newsCount}`);
+    console.log("Billing / RBAC:");
+    console.log(`  - Plans:           ${plansCount}`);
+    console.log("  - Role claims:     backfilled for all auth users");
     console.log("\nLogin credentials (all seed users): password123");
     console.log("  admin@selitest.com / admin2@selitest.com / owner@selitest.com");
     console.log("  agent1@selitest.com / agent2@selitest.com\n");
