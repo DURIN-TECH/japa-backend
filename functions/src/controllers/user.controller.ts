@@ -1,13 +1,79 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { userService } from "../services/user.service";
+import { claimsService } from "../services/claims.service";
+import { Role, packAbility } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
   ErrorMessages,
 } from "../utils/response";
 
+const ASSIGNABLE_ROLES: Role[] = ["admin", "owner", "agent", "client"];
+
 export class UserController {
+  /**
+   * GET /users/me/authorization
+   * Returns the principal's role, agencyId, resolved entitlements, and packed CASL
+   * rules so the portal/mobile can rebuild the exact same ability locally for UI
+   * gating (the backend remains the authoritative enforcer).
+   */
+  async getAuthorization(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      if (!req.authz || !req.ability) {
+        sendError(res, "UNAUTHORIZED", "Not authenticated", 401);
+        return;
+      }
+      sendSuccess(res, {
+        role: req.authz.role,
+        agencyId: req.authz.agencyId ?? null,
+        entitlements: req.entitlements ?? null,
+        rules: packAbility(req.ability),
+      });
+    } catch (error) {
+      console.error("Error building authorization:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /users/:uid/role  (admin only)
+   * Set a user's RBAC role + agencyId in their custom claims. This is the manual
+   * role-management path (e.g. promoting an admin) before any self-serve flows.
+   */
+  async setUserRole(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const { uid } = req.params;
+      const { role, agencyId } = req.body as { role?: Role; agencyId?: string | null };
+
+      if (!role || !ASSIGNABLE_ROLES.includes(role)) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          `role is required and must be one of: ${ASSIGNABLE_ROLES.join(", ")}`,
+          400
+        );
+        return;
+      }
+      // Owners/agents must carry an agencyId; admin/client must not.
+      const needsAgency = role === "owner" || role === "agent";
+      if (needsAgency && !agencyId) {
+        sendError(res, "VALIDATION_ERROR", `agencyId is required for role "${role}"`, 400);
+        return;
+      }
+
+      await claimsService.setRoleClaims(uid, role, needsAgency ? agencyId : null);
+      sendSuccess(
+        res,
+        { uid, role, agencyId: needsAgency ? agencyId : null },
+        "User role updated. The user must refresh their token for it to take effect."
+      );
+    } catch (error) {
+      console.error("Error setting user role:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
   /**
    * GET /users/me
    * Get current authenticated user's profile

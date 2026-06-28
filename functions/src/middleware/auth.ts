@@ -1,11 +1,69 @@
 import { Request, Response, NextFunction } from "express";
 import { auth } from "../utils/firebase";
 import { DecodedIdToken } from "firebase-admin/auth";
+import { AppAbility, AuthzSubject, Entitlements, Role, defineAbilitiesFor } from "@durin-tech/authz";
+import { claimsService } from "../services/claims.service";
+import { entitlementService } from "../services/entitlement.service";
 
-// Extend Express Request to include authenticated user
+// Extend Express Request to include authenticated user + resolved authorization.
 export interface AuthenticatedRequest extends Request {
   user?: DecodedIdToken;
   userId?: string;
+  /** Resolved principal (role + agencyId) built from custom claims. */
+  authz?: AuthzSubject;
+  /** CASL ability for this principal (RBAC + subscription entitlements). */
+  ability?: AppAbility;
+  /** Resolved entitlements for this principal (null for admin / pre-seed). */
+  entitlements?: Entitlements | null;
+}
+
+/**
+ * Build `req.authz` + `req.ability` from the token's custom claims. When the role
+ * claim isn't present yet (pre-migration user), fall back to resolving from the DB
+ * and lazily backfill the claims so subsequent tokens carry them. Fail-safe: on
+ * any error, default to least-privilege `client` rather than blocking the request.
+ */
+async function attachAuthz(req: AuthenticatedRequest): Promise<void> {
+  const decoded = req.user;
+  if (!decoded) return;
+  const uid = decoded.uid;
+  try {
+    let role = decoded.role as Role | undefined;
+    let agencyId = (decoded.agencyId as string | null | undefined) ?? null;
+
+    if (!role) {
+      const resolved = await claimsService.resolveRoleFromDb(uid);
+      role = resolved.role;
+      agencyId = resolved.agencyId;
+      // Best-effort backfill so the next token carries the claims (no await).
+      void claimsService.setRoleClaims(uid, role, agencyId).catch(() => undefined);
+    }
+
+    const authz: AuthzSubject = { uid, role, agencyId };
+    req.authz = authz;
+
+    // Load the subscriber's entitlements cache (read-only hot path; no writes).
+    // Gating only activates once the cache is populated (admin plan assignment /
+    // migration / billing webhook) — until then `undefined` keeps it RBAC-only.
+    let entitlements: Entitlements | undefined;
+    if (role !== "admin") {
+      const subscriber = entitlementService.resolveSubscriber(authz);
+      if (subscriber) {
+        const ent = await entitlementService
+          .getEntitlements(subscriber.id)
+          .catch(() => null);
+        if (ent) entitlements = ent;
+      }
+    }
+    req.entitlements = entitlements ?? null;
+    req.ability = defineAbilitiesFor(authz, entitlements);
+  } catch (error) {
+    console.error("attachAuthz failed; defaulting to least-privilege:", error);
+    const authz: AuthzSubject = { uid, role: "client", agencyId: null };
+    req.authz = authz;
+    req.entitlements = null;
+    req.ability = defineAbilitiesFor(authz);
+  }
 }
 
 /**
@@ -34,6 +92,7 @@ export async function verifyAuth(
     const decodedToken = await auth.verifyIdToken(token);
     req.user = decodedToken;
     req.userId = decodedToken.uid;
+    await attachAuthz(req);
     next();
   } catch (error) {
     console.error("Token verification failed:", error);
@@ -61,6 +120,7 @@ export async function optionalAuth(
       const decodedToken = await auth.verifyIdToken(token);
       req.user = decodedToken;
       req.userId = decodedToken.uid;
+      await attachAuthz(req);
     } catch {
       // Token invalid, but we don't block the request
       console.log("Optional auth: invalid token provided");
@@ -87,8 +147,12 @@ export async function verifyAgent(
     return;
   }
 
-  // Check custom claims for agent role
-  if (!req.user.agent) {
+  // Agent-side roles: agent, owner, or admin (driven by the role claim, with the
+  // legacy `agent` claim kept as a fallback). req.authz is populated by verifyAuth,
+  // but verifyAgent may be used standalone, so resolve defensively.
+  const role = req.authz?.role ?? (req.user.role as string | undefined);
+  const isAgentSide = role === "agent" || role === "owner" || role === "admin";
+  if (!isAgentSide && !req.user.agent && !req.user.admin) {
     res.status(403).json({
       success: false,
       error: "Forbidden",
@@ -117,8 +181,9 @@ export async function verifyAdmin(
     return;
   }
 
-  // Check custom claims for admin role
-  if (!req.user.admin) {
+  // Admin via the new role claim or the legacy `admin` boolean claim.
+  const isAdmin = req.authz?.role === "admin" || req.user.admin === true;
+  if (!isAdmin) {
     res.status(403).json({
       success: false,
       error: "Forbidden",

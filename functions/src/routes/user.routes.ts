@@ -1,10 +1,18 @@
 import { Router } from "express";
 import { userController } from "../controllers/user.controller";
-import { verifyAuth } from "../middleware/auth";
+import { verifyAuth, verifyAdmin } from "../middleware/auth";
 
 const router = Router();
 
+// Admin-only: manage a user's RBAC role/claims.
+router.put("/:uid/role", verifyAuth, verifyAdmin, (req, res) =>
+  userController.setUserRole(req, res)
+);
+
 router.get("/me", verifyAuth, (req, res) => userController.getMe(req, res));
+router.get("/me/authorization", verifyAuth, (req, res) =>
+  userController.getAuthorization(req, res)
+);
 router.put("/me", verifyAuth, (req, res) => userController.updateMe(req, res));
 router.delete("/me", verifyAuth, (req, res) =>
   userController.deleteMe(req, res)

@@ -4,6 +4,7 @@ import { collections, db, serverTimestamp } from "../utils/firebase";
 import { Agent, Agency } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
+import { claimsService } from "../services/claims.service";
 
 class OnboardingController {
   /**
@@ -123,6 +124,12 @@ class OnboardingController {
       batch.set(agencyRef, agency);
 
       await batch.commit();
+
+      // Promote the user to agency owner in their custom claims so the role rides
+      // in the token. Best-effort: a claims failure must not fail onboarding.
+      await claimsService
+        .setRoleClaims(userId, "owner", agencyRef.id)
+        .catch((e) => console.error("Failed to set owner claims:", e));
 
       // Return the created data
       const updatedUser = await userRef.get();

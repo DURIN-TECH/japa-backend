@@ -11,6 +11,18 @@ import {
   User,
 } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
+import { claimsService } from "./claims.service";
+import { entitlementService } from "./entitlement.service";
+
+/** Thrown when an agency has no free paid seats to add another agent. */
+export class SeatLimitError extends Error {
+  constructor(public readonly limit: number) {
+    super(
+      `All ${limit} paid agent seat(s) are in use. Purchase more seats to add agents.`
+    );
+    this.name = "SeatLimitError";
+  }
+}
 
 export interface CreateAgencyInput {
   name: string;
@@ -239,6 +251,11 @@ class AgencyService {
       updatedAt: serverTimestamp(),
     });
 
+    // They remain an (now independent) agent — update their role claims.
+    await claimsService
+      .setRoleClaims(agent.userId, "agent", null)
+      .catch((e) => console.error("Failed to update claims on leave:", e));
+
     // Decrement agency's agent count
     await agencyRef.update({
       totalAgents: increment(-1),
@@ -270,6 +287,23 @@ class AgencyService {
 
     if (!existingSnapshot.empty) {
       throw new Error("An invitation has already been sent to this email");
+    }
+
+    // Seat-based billing: the owner can only invite agents up to the seats they
+    // have paid for. Count active (non-owner) agents + outstanding pending invites
+    // against the agency's `max_agents` entitlement.
+    const [agencyDoc, pendingSnap] = await Promise.all([
+      collections.agencies.doc(agencyId).get(),
+      collections.agencyInvitations
+        .where("agencyId", "==", agencyId)
+        .where("status", "==", "pending")
+        .get(),
+    ]);
+    const totalMembers = (agencyDoc.data()?.totalAgents as number) ?? 1;
+    const used = totalMembers - 1 + pendingSnap.size; // exclude owner; include pending
+    const seat = await entitlementService.canAddAgent(agencyId, used);
+    if (!seat.allowed) {
+      throw new SeatLimitError(seat.limit);
     }
 
     // Check if the agent already exists on the platform
@@ -354,12 +388,26 @@ class AgencyService {
       throw new Error("Agent is already part of an agency. Leave first.");
     }
 
+    // Authoritative seat check at the moment a seat is actually consumed: active
+    // (non-owner) agents must be below the agency's paid `max_agents` seats.
+    const agencyDoc = await collections.agencies.doc(invitation.agencyId).get();
+    const totalMembers = (agencyDoc.data()?.totalAgents as number) ?? 1;
+    const seat = await entitlementService.canAddAgent(invitation.agencyId, totalMembers - 1);
+    if (!seat.allowed) {
+      throw new SeatLimitError(seat.limit);
+    }
+
     // Update agent with agency membership
     await agentDoc.ref.update({
       agencyId: invitation.agencyId,
       agencyRole: "agent",
       updatedAt: serverTimestamp(),
     });
+
+    // Reflect agency membership in the agent's role claims.
+    await claimsService
+      .setRoleClaims(agent.userId, "agent", invitation.agencyId)
+      .catch((e) => console.error("Failed to update claims on invite accept:", e));
 
     // Update invitation status
     await invitationRef.update({ status: "accepted" });
