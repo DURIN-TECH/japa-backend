@@ -5,6 +5,12 @@ node_modules/
 lib/
 dist/
 
+# Vendored @durin-tech/authz — MUST be committed (re-included from the dist/ rule
+# above) so `firebase deploy` ships it and the Functions cloud build needs no
+# private-registry auth. Regenerate with `npm run vendor:authz`.
+!functions/vendor/authz/dist/
+!functions/vendor/authz/dist/**
+
 # Environment files
 .env
 .env.local
