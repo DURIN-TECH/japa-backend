@@ -6,6 +6,8 @@ import { messagingService } from "../services/messaging.service";
 import { notificationService } from "../services/notification.service";
 import { noteService } from "../services/note.service";
 import { collections, auth } from "../utils/firebase";
+import { can, asSubject, checkWithinLimit, paymentRequired } from "../middleware/authz";
+import { LIMITS } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
@@ -62,6 +64,17 @@ export class ApplicationController {
           "VALIDATION_ERROR",
           "agentId is required when mode is 'agent'",
           400
+        );
+        return;
+      }
+
+      // Enforce the per-plan active-application limit (self-serve → the client's own
+      // active applications). No-op until the client has a plan with this limit.
+      const activeCount = await this.countActiveApplications("userId", userId);
+      if (!checkWithinLimit(req, LIMITS.MAX_ACTIVE_APPLICATIONS, activeCount)) {
+        paymentRequired(
+          res,
+          "You've reached your plan's active application limit. Upgrade to start more."
         );
         return;
       }
@@ -150,6 +163,19 @@ export class ApplicationController {
         return;
       }
       const agentDocId = agentSnapshot.docs[0].id;
+
+      // Enforce the active-application limit for the agency (or independent agent)
+      // before provisioning anything. No-op until a plan with the limit is assigned.
+      const scopeField = req.authz?.agencyId ? "agencyId" : "agentId";
+      const scopeValue = req.authz?.agencyId || callerUid;
+      const activeCount = await this.countActiveApplications(scopeField, scopeValue);
+      if (!checkWithinLimit(req, LIMITS.MAX_ACTIVE_APPLICATIONS, activeCount)) {
+        paymentRequired(
+          res,
+          "Your agency has reached its active application limit. Upgrade to start more."
+        );
+        return;
+      }
 
       // --- Resolve or provision the client -----------------------------------
       const normalizedEmail = clientEmail.trim().toLowerCase();
@@ -338,7 +364,6 @@ export class ApplicationController {
     res: Response
   ): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id } = req.params;
 
       const application = await applicationService.getApplicationById(id);
@@ -348,7 +373,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = await this.checkApplicationAccess(userId, application, req.user?.admin);
+      const hasAccess = this.checkApplicationAccess(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -382,7 +407,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = await this.checkApplicationAccess(userId, application, req.user?.admin);
+      const hasAccess = this.checkApplicationAccess(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -474,9 +499,8 @@ export class ApplicationController {
       }
 
       // Only the case's agent/owner/admin can request documents — not the client.
-      const isAdmin = !!req.user?.admin;
       const isApplicant = application.userId === userId;
-      const hasAccess = await this.checkApplicationAccess(userId, application, isAdmin);
+      const hasAccess = this.checkApplicationAccess(req, application);
       if (!hasAccess || isApplicant) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -577,7 +601,7 @@ export class ApplicationController {
 
       const isApplicant = application.userId === userId;
       const isAdmin = !!req.user?.admin;
-      const hasAccess = await this.checkApplicationAccess(userId, application, isAdmin);
+      const hasAccess = this.checkApplicationAccess(req, application);
 
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
@@ -624,7 +648,6 @@ export class ApplicationController {
     res: Response
   ): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id } = req.params;
 
       const application = await applicationService.getApplicationById(id);
@@ -634,7 +657,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = await this.checkApplicationAccess(userId, application, req.user?.admin);
+      const hasAccess = this.checkApplicationAccess(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -653,29 +676,35 @@ export class ApplicationController {
   // ============================================
 
   /**
-   * Check if a user has access to an application.
-   * Access is granted if:
-   * - User is the applicant (userId)
-   * - User is the assigned agent (agentId)
-   * - User belongs to the same agency (agencyId)
-   * - User is an admin
+   * Check if the request's principal can access an application.
+   *
+   * Now delegates to the shared CASL ability (`req.ability`, built from the role
+   * claim in `verifyAuth`) instead of re-deriving access ad-hoc. The "read" grant
+   * encodes the same rule that used to be inlined here: admin (manage all),
+   * applicant (own `userId`), assigned agent (`agentId`), and same-agency members
+   * (owner/agent on matching `agencyId`).
    */
-  private async checkApplicationAccess(
-    userId: string,
+  private checkApplicationAccess(
+    req: AuthenticatedRequest,
     application: Application,
-    isAdmin?: boolean
-  ): Promise<boolean> {
-    if (isAdmin) return true;
-    if (application.userId === userId) return true;
-    if (application.agentId === userId) return true;
+    action: "read" | "update" | "delete" = "read"
+  ): boolean {
+    return can(req, action, asSubject("Application", application as unknown as Record<string, unknown>));
+  }
 
-    // Check if user belongs to the same agency
-    if (application.agencyId) {
-      const agent = await this.getAgentForUser(userId);
-      if (agent?.agencyId === application.agencyId) return true;
-    }
-
-    return false;
+  /**
+   * Count non-terminal ("active") applications for a scope, used for the
+   * `max_active_applications` plan limit. Terminal statuses don't count against it.
+   */
+  private async countActiveApplications(
+    field: "userId" | "agencyId" | "agentId",
+    value: string
+  ): Promise<number> {
+    const snap = await collections.applications.where(field, "==", value).get();
+    const TERMINAL: ApplicationStatus[] = ["approved", "rejected", "withdrawn", "expired"];
+    return snap.docs.filter(
+      (d) => !TERMINAL.includes((d.data() as Application).status)
+    ).length;
   }
 
   /**

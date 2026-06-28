@@ -20,9 +20,8 @@ import {
   analyticsService,
   AnalyticsEventInput,
 } from "../services/analytics.service";
-import { Agent } from "../types";
 import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
-import { collections } from "../utils/firebase";
+import { ROLES } from "@durin-tech/authz";
 
 export class AnalyticsController {
   // ============================================
@@ -119,7 +118,7 @@ export class AnalyticsController {
       }
 
       // Check role-based authorization (admin claim, agency owner, etc.)
-      const authResult = await this.authorizeAndResolve(req, role as string);
+      const authResult = this.authorizeAndResolve(req, role as string);
       if (!authResult.authorized) {
         sendError(res, "FORBIDDEN", authResult.error!, 403);
         return;
@@ -165,7 +164,7 @@ export class AnalyticsController {
         return;
       }
 
-      const authResult = await this.authorizeAndResolve(req, role as string);
+      const authResult = this.authorizeAndResolve(req, role as string);
       if (!authResult.authorized) {
         sendError(res, "FORBIDDEN", authResult.error!, 403);
         return;
@@ -212,7 +211,7 @@ export class AnalyticsController {
         return;
       }
 
-      const authResult = await this.authorizeAndResolve(req, role as string);
+      const authResult = this.authorizeAndResolve(req, role as string);
       if (!authResult.authorized) {
         sendError(res, "FORBIDDEN", authResult.error!, 403);
         return;
@@ -264,7 +263,7 @@ export class AnalyticsController {
 
       // Agent metrics are only meaningful for admin/owner roles —
       // an individual agent can't see other agents' performance
-      if (role === "agent") {
+      if (role === ROLES.AGENT) {
         sendError(
           res,
           "FORBIDDEN",
@@ -274,7 +273,7 @@ export class AnalyticsController {
         return;
       }
 
-      const authResult = await this.authorizeAndResolve(req, role as string);
+      const authResult = this.authorizeAndResolve(req, role as string);
       if (!authResult.authorized) {
         sendError(res, "FORBIDDEN", authResult.error!, 403);
         return;
@@ -322,7 +321,7 @@ export class AnalyticsController {
         return;
       }
 
-      const authResult = await this.authorizeAndResolve(req, role as string);
+      const authResult = this.authorizeAndResolve(req, role as string);
       if (!authResult.authorized) {
         sendError(res, "FORBIDDEN", authResult.error!, 403);
         return;
@@ -365,7 +364,7 @@ export class AnalyticsController {
     res: Response
   ): Promise<void> {
     try {
-      if (!req.user?.admin) {
+      if (req.authz?.role !== ROLES.ADMIN) {
         sendError(res, "FORBIDDEN", "Admin access required", 403);
         return;
       }
@@ -408,7 +407,7 @@ export class AnalyticsController {
     res: Response
   ): Promise<void> {
     try {
-      if (!req.user?.admin) {
+      if (req.authz?.role !== ROLES.ADMIN) {
         sendError(res, "FORBIDDEN", "Admin access required", 403);
         return;
       }
@@ -450,7 +449,7 @@ export class AnalyticsController {
     res: Response
   ): Promise<void> {
     try {
-      if (!req.user?.admin) {
+      if (req.authz?.role !== ROLES.ADMIN) {
         sendError(res, "FORBIDDEN", "Admin access required", 403);
         return;
       }
@@ -509,44 +508,29 @@ export class AnalyticsController {
    *   - owner: user must be an agent with agencyRole === "owner"
    *   - agent: any authenticated user (their own data)
    */
-  private async authorizeAndResolve(
+  private authorizeAndResolve(
     req: AuthenticatedRequest,
     role: string
-  ): Promise<{ authorized: boolean; agencyId?: string; error?: string }> {
-    if (role === "admin") {
-      // Admin role requires the admin custom claim on the Firebase token
-      if (!req.user?.admin) {
+  ): { authorized: boolean; agencyId?: string; error?: string } {
+    if (role === ROLES.ADMIN) {
+      // Admin authorization comes from the resolved role claim (req.authz).
+      if (req.authz?.role !== ROLES.ADMIN) {
         return { authorized: false, error: "Admin access required" };
       }
       return { authorized: true };
     }
 
-    if (role === "owner") {
-      // Owner role requires the user to be an agent with owner agencyRole
-      const agent = await this.getAgentForUser(req.userId!);
-      if (!agent?.agencyId || agent.agencyRole !== "owner") {
+    if (role === ROLES.OWNER) {
+      // Owner role + owning agency both come from the role claim — no DB lookup.
+      if (req.authz?.role !== ROLES.OWNER || !req.authz.agencyId) {
         return { authorized: false, error: "Agency owner access required" };
       }
       // Return the agencyId so the service can scope data to this agency
-      return { authorized: true, agencyId: agent.agencyId };
+      return { authorized: true, agencyId: req.authz.agencyId };
     }
 
     // Agent role: any authenticated user can see their own data
     return { authorized: true };
-  }
-
-  /**
-   * Looks up the Agent document for a given userId.
-   * Used to resolve agencyId and agencyRole for owner authorization.
-   */
-  private async getAgentForUser(userId: string): Promise<Agent | null> {
-    const snapshot = await collections.agents
-      .where("userId", "==", userId)
-      .limit(1)
-      .get();
-
-    if (snapshot.empty) return null;
-    return snapshot.docs[0].data() as Agent;
   }
 
   /**

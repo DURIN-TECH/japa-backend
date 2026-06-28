@@ -1,14 +1,25 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { agencyService } from "../services/agency.service";
+import { agencyService, SeatLimitError } from "../services/agency.service";
+import { storageService } from "../services/storage.service";
 import { collections } from "../utils/firebase";
-import { Agent } from "../types";
+import { ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
   sendCreated,
   ErrorMessages,
 } from "../utils/response";
+
+// Image MIME types accepted for an agency's white-label logo. Kept narrow on
+// purpose — these are the formats that render reliably in <Image>/<img> and
+// avoid the XSS surface of arbitrary uploads.
+const ALLOWED_LOGO_CONTENT_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/svg+xml",
+];
 
 export class AgencyController {
   /**
@@ -113,17 +124,111 @@ export class AgencyController {
   }
 
   /**
+   * POST /agencies/me/logo/upload-url
+   * Owner-only. Mint a short-lived signed URL the client uses to PUT the logo
+   * file directly to Cloud Storage. The file is registered (and made public)
+   * via POST /agencies/me/logo afterwards.
+   */
+  async getLogoUploadUrl(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { fileName, contentType } = req.body;
+
+      if (!fileName || !contentType) {
+        sendError(res, "VALIDATION_ERROR", "fileName and contentType are required", 400);
+        return;
+      }
+
+      // Reject anything that isn't an allowed image type before we mint a URL.
+      if (!ALLOWED_LOGO_CONTENT_TYPES.includes(contentType)) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          `Invalid content type. Allowed: ${ALLOWED_LOGO_CONTENT_TYPES.join(", ")}`,
+          400
+        );
+        return;
+      }
+
+      // Only the agency owner may change branding.
+      const agency = await agencyService.getAgencyByOwnerId(userId);
+      if (!agency) {
+        sendError(res, "FORBIDDEN", "Only agency owners can update the agency logo", 403);
+        return;
+      }
+
+      const result = await storageService.getSignedAgencyLogoUploadUrl(
+        agency.id,
+        fileName,
+        contentType
+      );
+
+      sendSuccess(res, result);
+    } catch (error) {
+      console.error("Error getting agency logo upload URL:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /agencies/me/logo
+   * Owner-only. Finalize a logo upload: verify the file exists, confirm it
+   * belongs to this agency's storage prefix, make it publicly readable, and
+   * persist the durable public URL onto the agency. Returns the updated agency.
+   */
+  async setLogo(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { storagePath } = req.body;
+
+      if (!storagePath) {
+        sendError(res, "VALIDATION_ERROR", "storagePath is required", 400);
+        return;
+      }
+
+      // Only the agency owner may change branding.
+      const agency = await agencyService.getAgencyByOwnerId(userId);
+      if (!agency) {
+        sendError(res, "FORBIDDEN", "Only agency owners can update the agency logo", 403);
+        return;
+      }
+
+      // Guard against a caller registering a path that isn't theirs — the path
+      // must live under this agency's own logo prefix.
+      if (!storagePath.startsWith(`agency-logos/${agency.id}/`)) {
+        sendError(res, "VALIDATION_ERROR", "storagePath does not belong to this agency", 400);
+        return;
+      }
+
+      // Confirm the client actually completed the upload.
+      const exists = await storageService.fileExists(storagePath);
+      if (!exists) {
+        sendError(res, "VALIDATION_ERROR", "File not found at the specified path", 400);
+        return;
+      }
+
+      // Make the object public and capture its stable URL for persistent rendering.
+      const logoUrl = await storageService.makeFilePublic(storagePath);
+
+      const updated = await agencyService.updateAgency(agency.id, { logoUrl });
+
+      sendSuccess(res, updated, "Agency logo updated successfully");
+    } catch (error) {
+      console.error("Error setting agency logo:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * GET /agencies/:id/members
    * List all agents in an agency
    */
   async getMembers(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id } = req.params;
 
-      // Verify the user belongs to this agency
-      const userAgent = await this.getAgentForUser(userId);
-      if (!userAgent || (userAgent.agencyId !== id && !req.user?.admin)) {
+      // Only admins or members of this agency may view its members (role claim).
+      if (req.authz?.role !== ROLES.ADMIN && req.authz?.agencyId !== id) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
@@ -242,6 +347,10 @@ export class AgencyController {
       sendCreated(res, invitation, "Invitation sent successfully");
     } catch (error) {
       console.error("Error inviting agent:", error);
+      if (error instanceof SeatLimitError) {
+        sendError(res, "UPGRADE_REQUIRED", error.message, 402);
+        return;
+      }
       const message = (error as Error).message;
       if (message === "An invitation has already been sent to this email") {
         sendError(res, "DUPLICATE", message, 409);
@@ -308,6 +417,10 @@ export class AgencyController {
       sendSuccess(res, { accepted: true }, "Invitation accepted");
     } catch (error) {
       console.error("Error accepting invitation:", error);
+      if (error instanceof SeatLimitError) {
+        sendError(res, "UPGRADE_REQUIRED", error.message, 402);
+        return;
+      }
       const message = (error as Error).message;
       if (
         message === "Invitation not found" ||
@@ -420,16 +533,6 @@ export class AgencyController {
     }
   }
 
-  // Helper: get agent document for a userId
-  private async getAgentForUser(userId: string): Promise<Agent | null> {
-    const snapshot = await collections.agents
-      .where("userId", "==", userId)
-      .limit(1)
-      .get();
-
-    if (snapshot.empty) return null;
-    return snapshot.docs[0].data() as Agent;
-  }
 }
 
 export const agencyController = new AgencyController();

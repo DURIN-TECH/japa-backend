@@ -3,16 +3,19 @@ import { applicationController } from "../controllers/application.controller";
 import { noteController } from "../controllers/note.controller";
 import { documentController } from "../controllers/document.controller";
 import { verifyAuth } from "../middleware/auth";
+import { requireFeature } from "../middleware/authz";
+import { FEATURES } from "@durin-tech/authz";
 
 const router = Router();
 
-// Application CRUD
-router.post("/", verifyAuth, (req, res) =>
+// Application CRUD — creating is gated by the "applications.create" entitlement;
+// the per-plan active-application limit is enforced inside the handlers.
+router.post("/", verifyAuth, requireFeature(FEATURES.APPLICATIONS_CREATE), (req, res) =>
   applicationController.createApplication(req, res)
 );
 // Agent starts an application on a client's behalf (portal flow). Must be declared
 // before the parameterized "/:id" routes so it isn't shadowed by them.
-router.post("/for-client", verifyAuth, (req, res) =>
+router.post("/for-client", verifyAuth, requireFeature(FEATURES.APPLICATIONS_CREATE), (req, res) =>
   applicationController.createApplicationForClient(req, res)
 );
 router.get("/", verifyAuth, (req, res) =>

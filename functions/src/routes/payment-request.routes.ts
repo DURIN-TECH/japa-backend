@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { paymentRequestController } from "../controllers/payment-request.controller";
 import { verifyAuth } from "../middleware/auth";
+import { requireFeature } from "../middleware/authz";
+import { FEATURES } from "@durin-tech/authz";
 
 // Routes mounted at /payment-requests
 const paymentRequestRoutes = Router();
@@ -10,8 +12,8 @@ paymentRequestRoutes.get("/", verifyAuth, (req, res) =>
   paymentRequestController.getPaymentRequests(req, res)
 );
 
-// Create payment request
-paymentRequestRoutes.post("/", verifyAuth, (req, res) =>
+// Create payment request — gated by the "payments.request" entitlement (agent action)
+paymentRequestRoutes.post("/", verifyAuth, requireFeature(FEATURES.PAYMENTS_REQUEST), (req, res) =>
   paymentRequestController.createPaymentRequest(req, res)
 );
 

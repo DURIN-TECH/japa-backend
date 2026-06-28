@@ -4,6 +4,13 @@ import { consultationService, ConsultationFilters } from "../services/consultati
 import { collections } from "../utils/firebase";
 import { Agent, Consultation, ConsultationStatus } from "../types";
 import {
+  can,
+  asSubject,
+  checkWithinLimit,
+  paymentRequired,
+} from "../middleware/authz";
+import { ROLES, LIMITS } from "@durin-tech/authz";
+import {
   sendSuccess,
   sendCreated,
   sendError,
@@ -34,17 +41,16 @@ export class ConsultationController {
       let consultations;
 
       switch (role) {
-      case "admin": {
-        if (!req.user?.admin) {
+      case ROLES.ADMIN: {
+        if (req.authz?.role !== ROLES.ADMIN) {
           sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
           return;
         }
         consultations = await consultationService.getAllConsultations(filters);
         break;
       }
-      case "owner": {
-        const agent = await this.getAgentForUser(userId);
-        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+      case ROLES.OWNER: {
+        if (req.authz?.role !== ROLES.OWNER || !req.authz.agencyId) {
           sendError(
             res,
             "FORBIDDEN",
@@ -54,12 +60,12 @@ export class ConsultationController {
           return;
         }
         consultations = await consultationService.getConsultationsForAgency(
-          agent.agencyId,
+          req.authz.agencyId,
           filters
         );
         break;
       }
-      case "client": {
+      case ROLES.CLIENT: {
         // Mobile clients query their own consultations by userId
         consultations = await consultationService.getConsultationsForClient(
           userId,
@@ -67,7 +73,7 @@ export class ConsultationController {
         );
         break;
       }
-      case "agent":
+      case ROLES.AGENT:
       default: {
         consultations = await consultationService.getConsultationsForAgent(
           userId,
@@ -95,17 +101,16 @@ export class ConsultationController {
       let consultations;
 
       switch (role) {
-      case "admin": {
-        if (!req.user?.admin) {
+      case ROLES.ADMIN: {
+        if (req.authz?.role !== ROLES.ADMIN) {
           sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
           return;
         }
         consultations = await consultationService.getAllConsultations();
         break;
       }
-      case "owner": {
-        const agent = await this.getAgentForUser(userId);
-        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+      case ROLES.OWNER: {
+        if (req.authz?.role !== ROLES.OWNER || !req.authz.agencyId) {
           sendError(
             res,
             "FORBIDDEN",
@@ -115,11 +120,11 @@ export class ConsultationController {
           return;
         }
         consultations = await consultationService.getConsultationsForAgency(
-          agent.agencyId
+          req.authz.agencyId
         );
         break;
       }
-      case "agent":
+      case ROLES.AGENT:
       default: {
         consultations = await consultationService.getConsultationsForAgent(
           userId
@@ -144,7 +149,6 @@ export class ConsultationController {
     res: Response
   ): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id } = req.params;
 
       const consultation = await consultationService.getConsultationById(id);
@@ -153,7 +157,11 @@ export class ConsultationController {
         return;
       }
 
-      const hasAccess = await this.checkAccess(userId, consultation, !!req.user?.admin);
+      const hasAccess = can(
+        req,
+        "read",
+        asSubject("Consultation", consultation as unknown as Record<string, unknown>)
+      );
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -251,6 +259,36 @@ export class ConsultationController {
       }
       const client = clientDoc.data()!;
 
+      // Enforce the per-plan monthly consultation limit for the booking subscriber
+      // (agency / independent agent / client — matches whose entitlements loaded).
+      // No-op until a plan with this limit is assigned.
+      const monthScope = agentProfile
+        ? req.authz?.agencyId
+          ? { field: "agencyId" as const, value: req.authz.agencyId }
+          : { field: "agentId" as const, value: authUserId }
+        : { field: "userId" as const, value: authUserId };
+      const scopeSnap = await collections.consultations
+        .where(monthScope.field, "==", monthScope.value)
+        .get();
+      const now = new Date();
+      const monthCount = scopeSnap.docs.filter((d) => {
+        const createdAt = (
+          d.data().createdAt as { toDate?: () => Date } | undefined
+        )?.toDate?.();
+        return (
+          !!createdAt &&
+          createdAt.getUTCFullYear() === now.getUTCFullYear() &&
+          createdAt.getUTCMonth() === now.getUTCMonth()
+        );
+      }).length;
+      if (!checkWithinLimit(req, LIMITS.MAX_CONSULTATIONS_PER_MONTH, monthCount)) {
+        paymentRequired(
+          res,
+          "You've reached your plan's monthly consultation limit. Upgrade to book more."
+        );
+        return;
+      }
+
       const { Timestamp } = await import("firebase-admin/firestore");
 
       const consultation = await consultationService.createConsultation({
@@ -288,7 +326,6 @@ export class ConsultationController {
     res: Response
   ): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id } = req.params;
 
       const existing = await consultationService.getConsultationById(id);
@@ -297,7 +334,11 @@ export class ConsultationController {
         return;
       }
 
-      const hasAccess = await this.checkAccess(userId, existing, !!req.user?.admin);
+      const hasAccess = can(
+        req,
+        "read",
+        asSubject("Consultation", existing as unknown as Record<string, unknown>)
+      );
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -361,7 +402,11 @@ export class ConsultationController {
         return;
       }
 
-      const hasAccess = await this.checkAccess(userId, existing, !!req.user?.admin);
+      const hasAccess = can(
+        req,
+        "read",
+        asSubject("Consultation", existing as unknown as Record<string, unknown>)
+      );
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -387,7 +432,6 @@ export class ConsultationController {
     res: Response
   ): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id } = req.params;
 
       const existing = await consultationService.getConsultationById(id);
@@ -396,7 +440,11 @@ export class ConsultationController {
         return;
       }
 
-      const hasAccess = await this.checkAccess(userId, existing, !!req.user?.admin);
+      const hasAccess = can(
+        req,
+        "read",
+        asSubject("Consultation", existing as unknown as Record<string, unknown>)
+      );
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -413,24 +461,6 @@ export class ConsultationController {
   // ============================================
   // HELPERS
   // ============================================
-
-  private async checkAccess(
-    userId: string,
-    consultation: Consultation,
-    isAdmin: boolean
-  ): Promise<boolean> {
-    if (isAdmin) return true;
-    if (consultation.userId === userId) return true;
-    if (consultation.agentId === userId) return true;
-
-    // Check same agency
-    if (consultation.agencyId) {
-      const agent = await this.getAgentForUser(userId);
-      if (agent?.agencyId === consultation.agencyId) return true;
-    }
-
-    return false;
-  }
 
   private async getAgentForUser(userId: string): Promise<Agent | null> {
     const snapshot = await collections.agents

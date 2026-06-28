@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { consultationController } from "../controllers/consultation.controller";
 import { verifyAuth } from "../middleware/auth";
+import { requireFeature } from "../middleware/authz";
+import { FEATURES } from "@durin-tech/authz";
 
 const router = Router();
 
@@ -13,7 +15,7 @@ router.get("/", verifyAuth, (req, res) =>
   consultationController.getConsultations(req, res)
 );
 
-router.post("/", verifyAuth, (req, res) =>
+router.post("/", verifyAuth, requireFeature(FEATURES.CONSULTATIONS_BOOK), (req, res) =>
   consultationController.createConsultation(req, res)
 );
 

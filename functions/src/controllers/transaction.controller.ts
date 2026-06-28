@@ -3,6 +3,7 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { transactionService, TransactionFilters } from "../services/transaction.service";
 import { collections } from "../utils/firebase";
 import { Agent } from "../types";
+import { ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
@@ -31,17 +32,16 @@ export class TransactionController {
       let transactions;
 
       switch (role) {
-      case "admin": {
-        if (!req.user?.admin) {
+      case ROLES.ADMIN: {
+        if (req.authz?.role !== ROLES.ADMIN) {
           sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
           return;
         }
         transactions = await transactionService.getAllTransactions(filters);
         break;
       }
-      case "owner": {
-        const agent = await this.getAgentForUser(userId);
-        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+      case ROLES.OWNER: {
+        if (req.authz?.role !== ROLES.OWNER || !req.authz.agencyId) {
           sendError(
             res,
             "FORBIDDEN",
@@ -51,12 +51,12 @@ export class TransactionController {
           return;
         }
         transactions = await transactionService.getTransactionsForAgency(
-          agent.agencyId,
+          req.authz.agencyId,
           filters
         );
         break;
       }
-      case "agent":
+      case ROLES.AGENT:
       default: {
         transactions = await transactionService.getTransactionsForAgent(
           userId,
@@ -84,17 +84,16 @@ export class TransactionController {
       let transactions;
 
       switch (role) {
-      case "admin": {
-        if (!req.user?.admin) {
+      case ROLES.ADMIN: {
+        if (req.authz?.role !== ROLES.ADMIN) {
           sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
           return;
         }
         transactions = await transactionService.getAllTransactions();
         break;
       }
-      case "owner": {
-        const agent = await this.getAgentForUser(userId);
-        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+      case ROLES.OWNER: {
+        if (req.authz?.role !== ROLES.OWNER || !req.authz.agencyId) {
           sendError(
             res,
             "FORBIDDEN",
@@ -104,11 +103,11 @@ export class TransactionController {
           return;
         }
         transactions = await transactionService.getTransactionsForAgency(
-          agent.agencyId
+          req.authz.agencyId
         );
         break;
       }
-      case "agent":
+      case ROLES.AGENT:
       default: {
         transactions = await transactionService.getTransactionsForAgent(
           userId

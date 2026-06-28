@@ -3,6 +3,8 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { noteService } from "../services/note.service";
 import { applicationService } from "../services/application.service";
 import { collections } from "../utils/firebase";
+import { can, asSubject } from "../middleware/authz";
+import { ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
@@ -10,7 +12,7 @@ import {
   sendNoContent,
   ErrorMessages,
 } from "../utils/response";
-import { Application, Agent, NoteAuthorRole } from "../types";
+import { NoteAuthorRole } from "../types";
 
 export class NoteController {
   /**
@@ -19,7 +21,6 @@ export class NoteController {
    */
   async getNotes(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id } = req.params;
 
       const application = await applicationService.getApplicationById(id);
@@ -28,7 +29,11 @@ export class NoteController {
         return;
       }
 
-      const hasAccess = await this.checkAccess(userId, application, req.user?.admin);
+      const hasAccess = can(
+        req,
+        "read",
+        asSubject("Application", application as unknown as Record<string, unknown>)
+      );
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -63,14 +68,18 @@ export class NoteController {
         return;
       }
 
-      const hasAccess = await this.checkAccess(userId, application, req.user?.admin);
+      const hasAccess = can(
+        req,
+        "read",
+        asSubject("Application", application as unknown as Record<string, unknown>)
+      );
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
 
       // Resolve author name and role
-      const { authorName, authorRole } = await this.resolveAuthor(userId, req.user?.admin);
+      const { authorName, authorRole } = await this.resolveAuthor(req);
 
       const note = await noteService.addNote(
         id,
@@ -111,7 +120,7 @@ export class NoteController {
         return;
       }
 
-      if (note.authorId !== userId && !req.user?.admin) {
+      if (note.authorId !== userId && req.authz?.role !== ROLES.ADMIN) {
         sendError(res, "FORBIDDEN", "You can only edit your own notes", 403);
         return;
       }
@@ -142,7 +151,7 @@ export class NoteController {
         return;
       }
 
-      if (note.authorId !== userId && !req.user?.admin) {
+      if (note.authorId !== userId && req.authz?.role !== ROLES.ADMIN) {
         sendError(res, "FORBIDDEN", "You can only delete your own notes", 403);
         return;
       }
@@ -160,64 +169,26 @@ export class NoteController {
   // ============================================
 
   /**
-   * Check if user has access to the application's notes.
-   * Same logic as application access: owner, assigned agent, same agency, or admin.
-   */
-  private async checkAccess(
-    userId: string,
-    application: Application,
-    isAdmin?: boolean
-  ): Promise<boolean> {
-    if (isAdmin) return true;
-    if (application.userId === userId) return true;
-    if (application.agentId === userId) return true;
-
-    if (application.agencyId) {
-      const agent = await this.getAgentForUser(userId);
-      if (agent?.agencyId === application.agencyId) return true;
-    }
-
-    return false;
-  }
-
-  /**
-   * Resolve the display name and role for a note author
+   * Resolve the display name and role for a note author from the role claim.
+   * Notes are agent-side, so any non-agent-side role (e.g. a client) is recorded
+   * as "agent" (preserving prior behaviour).
    */
   private async resolveAuthor(
-    userId: string,
-    isAdmin?: boolean
+    req: AuthenticatedRequest
   ): Promise<{ authorName: string; authorRole: NoteAuthorRole }> {
-    const userDoc = await collections.users.doc(userId).get();
+    const uid = req.userId!;
+    const userDoc = await collections.users.doc(uid).get();
     const userData = userDoc.exists ? userDoc.data() : null;
     const authorName = userData
       ? `${userData.firstName || ""} ${userData.lastName || ""}`.trim()
       : "Unknown";
 
-    if (isAdmin) {
-      return { authorName, authorRole: "admin" };
-    }
-
-    // Check if user is an agent and their role
-    const agent = await this.getAgentForUser(userId);
-    if (agent?.agencyRole === "owner") {
-      return { authorName, authorRole: "owner" };
-    }
-    if (agent) {
-      return { authorName, authorRole: "agent" };
-    }
-
-    // Fallback — could be the applicant themselves
-    return { authorName, authorRole: "agent" };
-  }
-
-  private async getAgentForUser(userId: string): Promise<Agent | null> {
-    const snapshot = await collections.agents
-      .where("userId", "==", userId)
-      .limit(1)
-      .get();
-
-    if (snapshot.empty) return null;
-    return snapshot.docs[0].data() as Agent;
+    const role = req.authz?.role;
+    const authorRole: NoteAuthorRole =
+      role === ROLES.ADMIN || role === ROLES.OWNER || role === ROLES.AGENT
+        ? role
+        : "agent";
+    return { authorName, authorRole };
   }
 }
 

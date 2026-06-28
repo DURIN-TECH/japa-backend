@@ -24,6 +24,7 @@ import { applicationService } from "../services/application.service";
 import { messagingService } from "../services/messaging.service";
 import { collections, messaging } from "../utils/firebase";
 import { PaymentRequestStatus } from "../types";
+import { ROLES } from "@durin-tech/authz";
 import { sendSuccess, sendError, sendNotFound, sendForbidden } from "../utils/response";
 
 /**
@@ -67,8 +68,7 @@ class PaymentRequestController {
 
       if (role === "admin") {
         // Admin role: verify the user document has an admin flag set in Firestore
-        const userDoc = await collections.users.doc(userId).get();
-        if (!userDoc.exists || !userDoc.data()?.admin) {
+        if (req.authz?.role !== ROLES.ADMIN) {
           return sendForbidden(res, "Admin access required");
         }
         // Admins can see all payment requests across the platform
@@ -197,8 +197,7 @@ class PaymentRequestController {
       const userId = req.user!.uid;
 
       // Check if user is an admin
-      const userDoc = await collections.users.doc(userId).get();
-      if (userDoc.exists && userDoc.data()?.admin) {
+      if (req.authz?.role === ROLES.ADMIN) {
         return sendSuccess(res, request);
       }
 
@@ -252,8 +251,7 @@ class PaymentRequestController {
 
       // Authorization: only the creating agent or an admin can update status
       const userId = req.user!.uid;
-      const userDoc = await collections.users.doc(userId).get();
-      const isAdmin = userDoc.exists && userDoc.data()?.admin;
+      const isAdmin = req.authz?.role === ROLES.ADMIN;
 
       if (!isAdmin) {
         // Non-admin: verify the user is the agent who created this request
@@ -300,8 +298,7 @@ class PaymentRequestController {
       }
 
       // Authorization: only the client or an admin can approve
-      const userDoc = await collections.users.doc(userId).get();
-      const isAdmin = userDoc.exists && userDoc.data()?.admin;
+      const isAdmin = req.authz?.role === ROLES.ADMIN;
       if (!isAdmin && request.clientId !== userId) {
         return sendForbidden(res, "Only the client or admin can approve payment requests");
       }
@@ -403,8 +400,7 @@ class PaymentRequestController {
       }
 
       // Authorization: only the client or an admin can reject
-      const userDoc = await collections.users.doc(userId).get();
-      const isAdmin = userDoc.exists && userDoc.data()?.admin;
+      const isAdmin = req.authz?.role === ROLES.ADMIN;
       if (!isAdmin && request.clientId !== userId) {
         return sendForbidden(res, "Only the client or admin can reject payment requests");
       }
@@ -504,8 +500,7 @@ class PaymentRequestController {
 
       // Authorization: only the creating agent or an admin can delete
       const userId = req.user!.uid;
-      const userDoc = await collections.users.doc(userId).get();
-      const isAdmin = userDoc.exists && userDoc.data()?.admin;
+      const isAdmin = req.authz?.role === ROLES.ADMIN;
 
       if (!isAdmin) {
         // Non-admin: verify the user is the agent who created this request

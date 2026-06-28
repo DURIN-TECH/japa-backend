@@ -19,8 +19,14 @@
 import { Router } from "express";
 import { analyticsController } from "../controllers/analytics.controller";
 import { verifyAuth } from "../middleware/auth";
+import { requireFeature } from "../middleware/authz";
+import { FEATURES } from "@durin-tech/authz";
 
 const router = Router();
+
+// Dashboard endpoints are gated by the "analytics.view" entitlement (in addition
+// to verifyAuth). Event ingestion below is NOT gated — any authed client may emit.
+const viewAnalytics = [verifyAuth, requireFeature(FEATURES.ANALYTICS_VIEW)] as const;
 
 // ============================================
 // EVENT INGESTION
@@ -38,31 +44,31 @@ router.post("/events", verifyAuth, (req, res) =>
 
 // GET /analytics/kpis — Key performance indicators with period-over-period changes
 // Query params: role (admin|owner|agent), from (ISO date), to (ISO date)
-router.get("/kpis", verifyAuth, (req, res) =>
+router.get("/kpis", ...viewAnalytics, (req, res) =>
   analyticsController.getKPIs(req, res)
 );
 
 // GET /analytics/case-trends — Monthly case counts for the bar chart
 // Query params: role, from, to
-router.get("/case-trends", verifyAuth, (req, res) =>
+router.get("/case-trends", ...viewAnalytics, (req, res) =>
   analyticsController.getCaseTrends(req, res)
 );
 
 // GET /analytics/revenue-trends — Monthly revenue totals for the line chart
 // Query params: role, from, to
-router.get("/revenue-trends", verifyAuth, (req, res) =>
+router.get("/revenue-trends", ...viewAnalytics, (req, res) =>
   analyticsController.getRevenueTrends(req, res)
 );
 
 // GET /analytics/agent-metrics — Per-agent performance data for the table
 // Query params: role (admin|owner only), from, to
-router.get("/agent-metrics", verifyAuth, (req, res) =>
+router.get("/agent-metrics", ...viewAnalytics, (req, res) =>
   analyticsController.getAgentMetrics(req, res)
 );
 
 // GET /analytics/status-pipeline — Case counts by status for the funnel
 // Query params: role (no date range — shows current snapshot)
-router.get("/status-pipeline", verifyAuth, (req, res) =>
+router.get("/status-pipeline", ...viewAnalytics, (req, res) =>
   analyticsController.getStatusPipeline(req, res)
 );
 
@@ -72,7 +78,7 @@ router.get("/status-pipeline", verifyAuth, (req, res) =>
 
 // GET /analytics/event-summary — Event counts grouped by event name
 // Query params: from, to, source (optional), events (optional comma-separated)
-router.get("/event-summary", verifyAuth, (req, res) =>
+router.get("/event-summary", ...viewAnalytics, (req, res) =>
   analyticsController.getEventSummary(req, res)
 );
 

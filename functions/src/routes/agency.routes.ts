@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { agencyController } from "../controllers/agency.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
+import { requireFeature } from "../middleware/authz";
+import { FEATURES } from "@durin-tech/authz";
 
 // Routes mounted at /agencies
 const agencyRoutes = Router();
@@ -11,6 +13,16 @@ agencyRoutes.get("/me", verifyAuth, (req, res) =>
 );
 agencyRoutes.put("/me", verifyAuth, (req, res) =>
   agencyController.updateMyAgency(req, res)
+);
+
+// Agency logo (white-label branding) — owner only. Defined before "/:id"
+// routes; both are 3-segment "/me/..." paths so they can't be shadowed by
+// the single-segment "/:id" matcher.
+agencyRoutes.post("/me/logo/upload-url", verifyAuth, (req, res) =>
+  agencyController.getLogoUploadUrl(req, res)
+);
+agencyRoutes.post("/me/logo", verifyAuth, (req, res) =>
+  agencyController.setLogo(req, res)
 );
 
 agencyRoutes.post("/", verifyAuth, (req, res) =>
@@ -48,8 +60,9 @@ agencyRoutes.delete("/:id/members/:agentId", verifyAuth, (req, res) =>
   agencyController.removeMember(req, res)
 );
 
-// Agency invitations
-agencyRoutes.post("/:id/invitations", verifyAuth, (req, res) =>
+// Agency invitations — gated by the "agency.invite_agents" entitlement (seat limit
+// is additionally enforced in the controller/service).
+agencyRoutes.post("/:id/invitations", verifyAuth, requireFeature(FEATURES.AGENCY_INVITE_AGENTS), (req, res) =>
   agencyController.inviteAgent(req, res)
 );
 agencyRoutes.get("/:id/invitations", verifyAuth, (req, res) =>

@@ -1,6 +1,9 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { documentService } from "../services/document.service";
+import { subcollections } from "../utils/firebase";
+import { checkWithinLimit, paymentRequired } from "../middleware/authz";
+import { LIMITS } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
@@ -98,6 +101,18 @@ export class DocumentController {
           "VALIDATION_ERROR",
           "applicationId, requirementId, fileName, fileType, fileSizeMb, and storagePath are required",
           400
+        );
+        return;
+      }
+
+      // Enforce the per-application document limit (no-op until a plan sets it).
+      const docCount = (
+        await subcollections.documents(applicationId).count().get()
+      ).data().count;
+      if (!checkWithinLimit(req, LIMITS.MAX_DOCUMENTS_PER_APPLICATION, docCount)) {
+        paymentRequired(
+          res,
+          "You've reached this application's document limit for your plan. Upgrade to add more."
         );
         return;
       }
