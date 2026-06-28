@@ -50,6 +50,15 @@ export const collections = {
   newsArticles: db.collection("newsArticles"),
   newsSources: db.collection("newsSources"),
   newsSubscriptions: db.collection("newsSubscriptions"),
+  // RBAC + subscription entitlement layer (@durin-tech/authz):
+  // - plans: plan config (features/limits per audience)
+  // - subscriptions: one active doc per subscriber entity (agency/agent/client)
+  // - entitlements: resolved {features,limits} cache, keyed by subscriberId
+  plans: db.collection("plans"),
+  subscriptions: db.collection("subscriptions"),
+  entitlements: db.collection("entitlements"),
+  // Audit log of normalized billing/provider events (Paystack webhooks, verifications)
+  billingEvents: db.collection("billingEvents"),
 } as const;
 
 // Helper to get subcollection references

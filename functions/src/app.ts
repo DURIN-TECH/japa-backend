@@ -21,15 +21,24 @@ import { newsRoutes } from "./routes/news.routes";
 import { bankAccountRoutes } from "./routes/bank-account.routes";
 import { onboardingRoutes } from "./routes/onboarding.routes";
 import { analyticsRoutes } from "./routes/analytics.routes";
+import {
+  plansRouter,
+  subscriptionsRouter,
+  adminPlansRouter,
+  webhooksRouter,
+} from "./routes/entitlement.routes";
 
 // Create Express app
 const app = express();
 
 // Middleware
-app.use(cors({ 
+app.use(cors({
   origin: true
   // TODO: In production, set this to our portal and mobile URL and remove the wildcard origin
 }));
+// Provider webhooks must read the RAW body to verify signatures, so mount them
+// BEFORE the global JSON parser consumes the stream.
+app.use("/webhooks", webhooksRouter);
 app.use(express.json());
 
 // Request logging
@@ -64,6 +73,9 @@ app.use("/news", newsRoutes);
 app.use("/eligibility", eligibilityRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
 app.use("/admin/visas", adminVisaRoutes);
+app.use("/plans", plansRouter);
+app.use("/subscriptions", subscriptionsRouter);
+app.use("/admin/plans", adminPlansRouter);
 
 // Error handling
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {

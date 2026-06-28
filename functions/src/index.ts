@@ -7,9 +7,19 @@ import { app } from "./app";
 
 /**
  * Main API endpoint
- * All REST API routes are handled by Express
+ * All REST API routes are handled by Express.
+ *
+ * `secrets` binds Cloud Secret Manager values so they're injected into
+ * `process.env` at runtime (1st-gen functions don't see secrets otherwise).
+ * These back the Paystack billing provider:
+ *   - PAYSTACK_SECRET_KEY    — Paystack API/secret key (sk_test_… / sk_live_…)
+ *   - PAYSTACK_CALLBACK_URL  — where Paystack redirects after checkout
+ * Set them with `firebase functions:secrets:set <NAME>` before deploying.
+ * Locally, the emulator reads them from `functions/.env.local` instead.
  */
-export const api = functions.https.onRequest(app);
+export const api = functions
+  .runWith({ secrets: ["PAYSTACK_SECRET_KEY", "PAYSTACK_CALLBACK_URL"] })
+  .https.onRequest(app);
 
 // ============================================
 // FIRESTORE TRIGGERS
@@ -21,6 +31,7 @@ import { visaService } from "./services/visa.service";
 import { newsScraperService } from "./services/news-scraper.service";
 import { newsService } from "./services/news.service";
 import { newsNotificationService } from "./services/news-notification.service";
+import { claimsService } from "./services/claims.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -59,6 +70,11 @@ export const onUserCreated = functions.auth.user().onCreate(async (user) => {
     });
 
     console.log("User document created for:", user.uid);
+    // Provision the user's RBAC role claim. resolveRoleFromDb defaults brand-new
+    // users to "client"; seeded admins / agents get reconciled here too.
+    await claimsService
+      .syncClaimsFromDb(user.uid)
+      .catch((e) => console.error("Failed to set initial role claims:", e));
   } catch (error: unknown) {
     // ALREADY_EXISTS (Firestore gRPC code 6) means another writer (seed /
     // onboarding) already created the doc — that's expected and benign, so we
