@@ -21,14 +21,14 @@ import { app } from "./app";
  * Email is safe-rollout: until RESEND_API_KEY/EMAIL_FROM are set, the email channel
  * falls back to the stub/log path — so deploying without them won't break sends.
  */
+// Email secrets are needed by EVERY function that sends transactional email — not
+// just `api`, but the Firestore/auth/scheduled triggers below too. Gen-1 secrets are
+// bound per-function, so each email-sending function must declare them.
+const EMAIL_SECRETS = ["RESEND_API_KEY", "EMAIL_FROM"];
+
 export const api = functions
   .runWith({
-    secrets: [
-      "PAYSTACK_SECRET_KEY",
-      "PAYSTACK_CALLBACK_URL",
-      "RESEND_API_KEY",
-      "EMAIL_FROM",
-    ],
+    secrets: ["PAYSTACK_SECRET_KEY", "PAYSTACK_CALLBACK_URL", ...EMAIL_SECRETS],
   })
   .https.onRequest(app);
 
@@ -51,10 +51,13 @@ import { Timestamp } from "firebase-admin/firestore";
  * When a new user is created via Firebase Auth
  * Create initial user document in Firestore
  */
-export const onUserCreated = functions.auth.user().onCreate(async (user) => {
-  console.log("New user created:", user.uid);
+export const onUserCreated = functions
+  .runWith({ secrets: EMAIL_SECRETS })
+  .auth.user()
+  .onCreate(async (user) => {
+    console.log("New user created:", user.uid);
 
-  try {
+    try {
     // Use create() rather than set() so this trigger only PROVISIONS a brand
     // new user document and never overwrites one that already exists.
     //
@@ -66,50 +69,50 @@ export const onUserCreated = functions.auth.user().onCreate(async (user) => {
     // wiping out fields written by those other paths. create() is atomic: if
     // the doc already exists it throws ALREADY_EXISTS, which we treat as a
     // no-op so the richer, already-written data is preserved.
-    await collections.users.doc(user.uid).create({
-      id: user.uid,
-      email: user.email || "",
-      // Mirror the Auth displayName (if any) into first/last name so seeded or
-      // dashboard-created users aren't left with blank names when this trigger
-      // wins the race and creates the doc first. Onboarding still overwrites
-      // these with the values the user actually enters.
-      firstName: (user.displayName || "").split(" ")[0] || "",
-      lastName: (user.displayName || "").split(" ").slice(1).join(" ") || "",
-      onboardingCompleted: false,
-      hasPassport: false,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
+      await collections.users.doc(user.uid).create({
+        id: user.uid,
+        email: user.email || "",
+        // Mirror the Auth displayName (if any) into first/last name so seeded or
+        // dashboard-created users aren't left with blank names when this trigger
+        // wins the race and creates the doc first. Onboarding still overwrites
+        // these with the values the user actually enters.
+        firstName: (user.displayName || "").split(" ")[0] || "",
+        lastName: (user.displayName || "").split(" ").slice(1).join(" ") || "",
+        onboardingCompleted: false,
+        hasPassport: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
 
-    console.log("User document created for:", user.uid);
-    // Provision the user's RBAC role claim. resolveRoleFromDb defaults brand-new
-    // users to "client"; seeded admins / agents get reconciled here too.
-    await claimsService
-      .syncClaimsFromDb(user.uid)
-      .catch((e) => console.error("Failed to set initial role claims:", e));
+      console.log("User document created for:", user.uid);
+      // Provision the user's RBAC role claim. resolveRoleFromDb defaults brand-new
+      // users to "client"; seeded admins / agents get reconciled here too.
+      await claimsService
+        .syncClaimsFromDb(user.uid)
+        .catch((e) => console.error("Failed to set initial role claims:", e));
 
-    // Welcome the new user (best-effort, in-app + email).
-    await notificationService
-      .notifyUser({
-        userId: user.uid,
-        type: "welcome",
-        title: "Welcome to Seli",
-        body: "Thanks for joining Seli — we're glad to have you on board. Sign in to get started.",
-      })
-      .catch((e) => console.error("Welcome notification failed:", e));
-  } catch (error: unknown) {
+      // Welcome the new user (best-effort, in-app + email).
+      await notificationService
+        .notifyUser({
+          userId: user.uid,
+          type: "welcome",
+          title: "Welcome to Seli",
+          body: "Thanks for joining Seli — we're glad to have you on board. Sign in to get started.",
+        })
+        .catch((e) => console.error("Welcome notification failed:", e));
+    } catch (error: unknown) {
     // ALREADY_EXISTS (Firestore gRPC code 6) means another writer (seed /
     // onboarding) already created the doc — that's expected and benign, so we
     // intentionally swallow it to keep their data intact. Anything else is a
     // real error worth logging.
-    const code = (error as { code?: number }).code;
-    if (code === 6) {
-      console.log("User document already exists, skipping create for:", user.uid);
-    } else {
-      console.error("Error creating user document:", error);
+      const code = (error as { code?: number }).code;
+      if (code === 6) {
+        console.log("User document already exists, skipping create for:", user.uid);
+      } else {
+        console.error("Error creating user document:", error);
+      }
     }
-  }
-});
+  });
 
 /**
  * When a user is deleted from Firebase Auth
@@ -134,8 +137,9 @@ export const onUserDeleted = functions.auth.user().onDelete(async (user) => {
  * When an application status changes
  * Send notification to user
  */
-export const onApplicationUpdated = functions.firestore
-  .document("applications/{applicationId}")
+export const onApplicationUpdated = functions
+  .runWith({ secrets: EMAIL_SECRETS })
+  .firestore.document("applications/{applicationId}")
   .onUpdate(async (change, context) => {
     const before = change.before.data();
     const after = change.after.data();
@@ -199,8 +203,9 @@ export const onApplicationUpdated = functions.firestore
  * When a consultation is created
  * Send notification to agent
  */
-export const onConsultationCreated = functions.firestore
-  .document("consultations/{consultationId}")
+export const onConsultationCreated = functions
+  .runWith({ secrets: EMAIL_SECRETS })
+  .firestore.document("consultations/{consultationId}")
   .onCreate(async (snapshot, context) => {
     const consultation = snapshot.data();
     console.log(
@@ -231,8 +236,9 @@ export const onConsultationCreated = functions.firestore
  * When a new payment request is created
  * Send push notification to the client so they can approve/reject
  */
-export const onPaymentRequestCreated = functions.firestore
-  .document("paymentRequests/{requestId}")
+export const onPaymentRequestCreated = functions
+  .runWith({ secrets: EMAIL_SECRETS })
+  .firestore.document("paymentRequests/{requestId}")
   .onCreate(async (snapshot, context) => {
     const request = snapshot.data();
     console.log(`New payment request created: ${context.params.requestId}`);
@@ -259,8 +265,9 @@ export const onPaymentRequestCreated = functions.firestore
  * When a review is added
  * Recalculate agent rating
  */
-export const onReviewCreated = functions.firestore
-  .document("agents/{agentId}/reviews/{reviewId}")
+export const onReviewCreated = functions
+  .runWith({ secrets: EMAIL_SECRETS })
+  .firestore.document("agents/{agentId}/reviews/{reviewId}")
   .onCreate(async (snapshot, context) => {
     const { agentId, reviewId } = context.params;
     console.log(`New review added for agent: ${agentId}`);
@@ -337,8 +344,9 @@ export const cleanupNotifications = functions.pubsub
  * Daily: Send consultation reminders
  * Runs every day at 8 AM
  */
-export const sendConsultationReminders = functions.pubsub
-  .schedule("0 8 * * *")
+export const sendConsultationReminders = functions
+  .runWith({ secrets: EMAIL_SECRETS })
+  .pubsub.schedule("0 8 * * *")
   .onRun(async () => {
     console.log("Sending consultation reminders...");
 
