@@ -11,14 +11,25 @@ import { app } from "./app";
  *
  * `secrets` binds Cloud Secret Manager values so they're injected into
  * `process.env` at runtime (1st-gen functions don't see secrets otherwise).
- * These back the Paystack billing provider:
  *   - PAYSTACK_SECRET_KEY    — Paystack API/secret key (sk_test_… / sk_live_…)
  *   - PAYSTACK_CALLBACK_URL  — where Paystack redirects after checkout
+ *   - RESEND_API_KEY         — Resend API key for transactional email (re_…)
+ *   - EMAIL_FROM             — verified sender, e.g. "Seli <noreply@seli.app>"
  * Set them with `firebase functions:secrets:set <NAME>` before deploying.
  * Locally, the emulator reads them from `functions/.env.local` instead.
+ *
+ * Email is safe-rollout: until RESEND_API_KEY/EMAIL_FROM are set, the email channel
+ * falls back to the stub/log path — so deploying without them won't break sends.
  */
 export const api = functions
-  .runWith({ secrets: ["PAYSTACK_SECRET_KEY", "PAYSTACK_CALLBACK_URL"] })
+  .runWith({
+    secrets: [
+      "PAYSTACK_SECRET_KEY",
+      "PAYSTACK_CALLBACK_URL",
+      "RESEND_API_KEY",
+      "EMAIL_FROM",
+    ],
+  })
   .https.onRequest(app);
 
 // ============================================

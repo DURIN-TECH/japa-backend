@@ -5,6 +5,7 @@ import {
   NotificationChannel,
 } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
+import { emailService } from "./email/email.service";
 
 // Input for the unified, multi-channel notifier. A single call fans out to every
 // requested channel (in-app record, push, email, sms). Channels are best-effort and
@@ -152,13 +153,9 @@ class NotificationService {
       }
     }
 
-    // --- email (STUB) ---------------------------------------------------------
+    // --- email (REAL via provider, with safe fallback) ------------------------
     if (channels.includes("email")) {
-      await this.recordStubDelivery(
-        "email",
-        user?.email,
-        input
-      );
+      await this.deliverEmail(user?.email, input);
     }
 
     // --- sms (STUB) -----------------------------------------------------------
@@ -168,6 +165,65 @@ class NotificationService {
         user?.phone,
         input
       );
+    }
+  }
+
+  /**
+   * Deliver a notification by email through the configured provider and record an
+   * auditable `notificationDeliveries` row (status "sent"/"failed").
+   *
+   * Safe-rollout: when the provider isn't configured (no API key) or there's no
+   * address on file, it falls back to the stub/log path — so nothing breaks until
+   * email is set up, and email turns on automatically once the secret is present.
+   */
+  private async deliverEmail(
+    to: string | undefined,
+    input: NotifyUserInput
+  ): Promise<void> {
+    if (!to || !emailService.isConfigured) {
+      await this.recordStubDelivery("email", to, input);
+      return;
+    }
+
+    let status: "sent" | "failed" = "failed";
+    let providerId: string | null = null;
+    let error: string | null = null;
+    try {
+      const result = await emailService.sendNotification({
+        to,
+        subject: input.title,
+        title: input.title,
+        body: input.body,
+        actionUrl: input.actionUrl,
+      });
+      status = result.status === "sent" ? "sent" : "failed";
+      providerId = result.providerId ?? null;
+      error = result.error ?? null;
+      if (result.status !== "sent") {
+        console.error(`[notifyUser] email ${result.status}: ${result.error}`);
+      }
+    } catch (err) {
+      error = (err as Error).message;
+      console.error("[notifyUser] email delivery failed:", err);
+    }
+
+    try {
+      await collections.notificationDeliveries.add({
+        channel: "email",
+        to,
+        userId: input.userId,
+        subject: input.title,
+        body: input.body,
+        type: input.type,
+        relatedEntityType: input.relatedEntityType ?? null,
+        relatedEntityId: input.relatedEntityId ?? null,
+        status,
+        providerId,
+        error,
+        createdAt: Timestamp.now(),
+      });
+    } catch (err) {
+      console.error("[notifyUser] email delivery record failed:", err);
     }
   }
 
