@@ -6,6 +6,7 @@ import {
 } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 import { emailService } from "./email/email.service";
+import { channelsForType } from "./notification-policy";
 
 // Input for the unified, multi-channel notifier. A single call fans out to every
 // requested channel (in-app record, push, email, sms). Channels are best-effort and
@@ -102,7 +103,10 @@ class NotificationService {
    * provider (SendGrid/Twilio) is a localized drop-in later — callers don't change.
    */
   async notifyUser(input: NotifyUserInput): Promise<void> {
-    const channels = input.channels ?? ["in_app", "push"];
+    // Channels: caller's explicit choice wins; otherwise the central per-type
+    // policy decides (so transactional events get email without each call site
+    // hardcoding channel arrays).
+    const channels = input.channels ?? channelsForType(input.type);
 
     // Load the recipient once — needed for push tokens (fcmTokens) and for the
     // email/sms stub destinations (email/phone).

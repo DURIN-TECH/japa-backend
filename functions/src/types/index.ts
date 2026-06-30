@@ -665,6 +665,7 @@ export type NotificationType =
   | "application_update"
   | "application_created" // An agent started an application on a client's behalf
   | "document_status"
+  | "consultation_booking" // A consultation was booked/scheduled
   | "consultation_reminder"
   | "payment_received"
   | "payment_request"
