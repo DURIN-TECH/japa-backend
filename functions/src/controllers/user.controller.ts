@@ -2,6 +2,7 @@ import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { userService } from "../services/user.service";
 import { claimsService } from "../services/claims.service";
+import { notificationService } from "../services/notification.service";
 import { Role, packAbility } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -63,6 +64,17 @@ export class UserController {
       }
 
       await claimsService.setRoleClaims(uid, role, needsAgency ? agencyId : null);
+
+      // Notify the user their access level changed (best-effort).
+      await notificationService
+        .notifyUser({
+          userId: uid,
+          type: "role_changed",
+          title: "Your account access changed",
+          body: `Your role on Seli is now "${role}".`,
+        })
+        .catch((e) => console.error("[user] role-change notify failed:", e));
+
       sendSuccess(
         res,
         { uid, role, agencyId: needsAgency ? agencyId : null },

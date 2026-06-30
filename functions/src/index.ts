@@ -87,6 +87,16 @@ export const onUserCreated = functions.auth.user().onCreate(async (user) => {
     await claimsService
       .syncClaimsFromDb(user.uid)
       .catch((e) => console.error("Failed to set initial role claims:", e));
+
+    // Welcome the new user (best-effort, in-app + email).
+    await notificationService
+      .notifyUser({
+        userId: user.uid,
+        type: "welcome",
+        title: "Welcome to Seli",
+        body: "Thanks for joining Seli — we're glad to have you on board. Sign in to get started.",
+      })
+      .catch((e) => console.error("Welcome notification failed:", e));
   } catch (error: unknown) {
     // ALREADY_EXISTS (Firestore gRPC code 6) means another writer (seed /
     // onboarding) already created the doc — that's expected and benign, so we
@@ -252,11 +262,28 @@ export const onPaymentRequestCreated = functions.firestore
 export const onReviewCreated = functions.firestore
   .document("agents/{agentId}/reviews/{reviewId}")
   .onCreate(async (snapshot, context) => {
-    const { agentId } = context.params;
+    const { agentId, reviewId } = context.params;
     console.log(`New review added for agent: ${agentId}`);
 
-    // Rating is already updated in the service, but we can add
-    // additional logic here if needed (e.g., notify agent)
+    try {
+      const agentUserId = (await collections.agents.doc(agentId).get()).data()
+        ?.userId as string | undefined;
+      if (agentUserId) {
+        const review = snapshot.data();
+        await notificationService.notifyUser({
+          userId: agentUserId,
+          type: "review_received",
+          title: "New review received",
+          body: review?.rating
+            ? `You received a ${review.rating}-star review.`
+            : "You received a new review.",
+          relatedEntityType: "review",
+          relatedEntityId: reviewId,
+        });
+      }
+    } catch (error) {
+      console.error("Error notifying agent of review:", error);
+    }
   });
 
 /**
