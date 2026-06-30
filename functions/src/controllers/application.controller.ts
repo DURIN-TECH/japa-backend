@@ -457,6 +457,18 @@ export class ApplicationController {
             : `${actorName || "An agent"} assigned the case to ${target}.`,
           { id: userId, name: actorName }
         );
+
+        // Notify the newly-assigned agent (in-app + push + email).
+        await notificationService
+          .notifyUser({
+            userId: updates.agentId,
+            type: "application_assigned",
+            title: "New case assigned",
+            body: `${actorName || "An agent"} assigned a case to you${application.clientName ? ` for ${application.clientName}` : ""}.`,
+            relatedEntityType: "application",
+            relatedEntityId: id,
+          })
+          .catch((e) => console.error("[application] assign notify failed:", e));
       }
 
       sendSuccess(res, updated, "Application updated successfully");

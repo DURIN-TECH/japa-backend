@@ -1,8 +1,9 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { consultationService, ConsultationFilters } from "../services/consultation.service";
+import { notificationService } from "../services/notification.service";
 import { collections } from "../utils/firebase";
-import { Agent, Consultation, ConsultationStatus } from "../types";
+import { Agent, Consultation, ConsultationStatus, NotificationType } from "../types";
 import {
   can,
   asSubject,
@@ -326,6 +327,7 @@ export class ConsultationController {
     res: Response
   ): Promise<void> {
     try {
+      const userId = req.userId!;
       const { id } = req.params;
 
       const existing = await consultationService.getConsultationById(id);
@@ -363,6 +365,24 @@ export class ConsultationController {
       }
 
       const updated = await consultationService.updateConsultation(id, updates as Partial<Consultation>);
+
+      // If the time changed, notify the other party it was rescheduled.
+      const rescheduled =
+        req.body.scheduledDate !== undefined || req.body.scheduledTime !== undefined;
+      const recipient = userId === existing.userId ? existing.agentId : existing.userId;
+      if (rescheduled && recipient) {
+        await notificationService
+          .notifyUser({
+            userId: recipient,
+            type: "consultation_rescheduled",
+            title: "Consultation rescheduled",
+            body: "Your consultation has been rescheduled — check the new time.",
+            relatedEntityType: "consultation",
+            relatedEntityId: id,
+          })
+          .catch((e) => console.error("[consultation] reschedule notify failed:", e));
+      }
+
       sendSuccess(res, updated);
     } catch (error) {
       console.error("Error updating consultation:", error);
@@ -417,6 +437,36 @@ export class ConsultationController {
         cancellationReason,
         summary,
       });
+
+      // Notify the OTHER party of a meaningful status transition.
+      const typeByStatus: Record<string, NotificationType> = {
+        confirmed: "consultation_confirmed",
+        completed: "consultation_completed",
+        cancelled: "consultation_cancelled",
+      };
+      const notifType = typeByStatus[status];
+      const recipient = userId === existing.userId ? existing.agentId : existing.userId;
+      if (notifType && recipient) {
+        const copy: Record<string, { title: string; body: string }> = {
+          confirmed: { title: "Consultation confirmed", body: "Your consultation has been confirmed." },
+          completed: { title: "Consultation complete", body: "Your consultation has been marked complete." },
+          cancelled: {
+            title: "Consultation cancelled",
+            body: `Your consultation was cancelled${cancellationReason ? `: ${cancellationReason}` : "."}`,
+          },
+        };
+        await notificationService
+          .notifyUser({
+            userId: recipient,
+            type: notifType,
+            title: copy[status].title,
+            body: copy[status].body,
+            relatedEntityType: "consultation",
+            relatedEntityId: id,
+          })
+          .catch((e) => console.error("[consultation] status notify failed:", e));
+      }
+
       sendSuccess(res, updated);
     } catch (error) {
       console.error("Error updating consultation status:", error);
@@ -432,6 +482,7 @@ export class ConsultationController {
     res: Response
   ): Promise<void> {
     try {
+      const userId = req.userId!;
       const { id } = req.params;
 
       const existing = await consultationService.getConsultationById(id);
@@ -451,6 +502,22 @@ export class ConsultationController {
       }
 
       await consultationService.deleteConsultation(id);
+
+      // Notify the other party that the consultation was cancelled.
+      const recipient = userId === existing.userId ? existing.agentId : existing.userId;
+      if (recipient) {
+        await notificationService
+          .notifyUser({
+            userId: recipient,
+            type: "consultation_cancelled",
+            title: "Consultation cancelled",
+            body: "A consultation was cancelled.",
+            relatedEntityType: "consultation",
+            relatedEntityId: id,
+          })
+          .catch((e) => console.error("[consultation] delete notify failed:", e));
+      }
+
       sendNoContent(res);
     } catch (error) {
       console.error("Error deleting consultation:", error);

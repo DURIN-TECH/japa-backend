@@ -1,6 +1,7 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { documentService } from "../services/document.service";
+import { notificationService } from "../services/notification.service";
 import { subcollections } from "../utils/firebase";
 import { checkWithinLimit, paymentRequired } from "../middleware/authz";
 import { LIMITS } from "@durin-tech/authz";
@@ -125,6 +126,23 @@ export class DocumentController {
         fileSizeMb,
         storagePath,
       });
+
+      // Notify the assigned agent that a document was uploaded for review.
+      const uploadApp = await import("../services/application.service").then((m) =>
+        m.applicationService.getApplicationById(applicationId)
+      );
+      if (uploadApp?.agentId && uploadApp.agentId !== userId) {
+        await notificationService
+          .notifyUser({
+            userId: uploadApp.agentId,
+            type: "document_uploaded",
+            title: "New document uploaded",
+            body: `${uploadApp.clientName || "A client"} uploaded "${fileName}" for review.`,
+            relatedEntityType: "application",
+            relatedEntityId: applicationId,
+          })
+          .catch((e) => console.error("[document] upload notify failed:", e));
+      }
 
       sendCreated(res, document, "Document registered successfully");
     } catch (error) {
@@ -330,6 +348,23 @@ export class DocumentController {
         rejectionReason,
         agentComments,
       });
+
+      // Notify the client of a terminal document decision (approved / needs work).
+      if (status === "verified" || status === "rejected" || status === "resubmission_required") {
+        const approved = status === "verified";
+        await notificationService
+          .notifyUser({
+            userId: application.userId,
+            type: approved ? "document_approved" : "document_rejected",
+            title: approved ? "Document approved" : "Document needs attention",
+            body: approved
+              ? `Your document "${document.fileName}" was approved.`
+              : `Your document "${document.fileName}" needs attention${rejectionReason ? `: ${rejectionReason}` : "."}`,
+            relatedEntityType: "application",
+            relatedEntityId: document.applicationId,
+          })
+          .catch((e) => console.error("[document] status notify failed:", e));
+      }
 
       sendSuccess(res, updated, "Document status updated successfully");
     } catch (error) {

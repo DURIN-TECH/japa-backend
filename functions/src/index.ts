@@ -159,6 +159,18 @@ export const onApplicationUpdated = functions.firestore
           relatedEntityId: context.params.applicationId,
           data: { status: after.status },
         });
+
+        // On withdrawal, also notify the assigned agent their case was withdrawn.
+        if (after.status === "withdrawn" && after.agentId) {
+          await notificationService.notifyUser({
+            userId: after.agentId,
+            type: "application_withdrawn",
+            title: "Case withdrawn",
+            body: `${after.clientName || "A client"} withdrew their application.`,
+            relatedEntityType: "application",
+            relatedEntityId: context.params.applicationId,
+          });
+        }
       } catch (error) {
         console.error("Error sending notification:", error);
       }
