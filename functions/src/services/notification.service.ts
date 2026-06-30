@@ -6,6 +6,7 @@ import {
 } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 import { emailService } from "./email/email.service";
+import { resolveEventEmail } from "./email/event-templates";
 import { channelsForType } from "./notification-policy";
 
 // Input for the unified, multi-channel notifier. A single call fans out to every
@@ -189,16 +190,26 @@ class NotificationService {
       return;
     }
 
+    // Resolve the per-event subject + CTA (the registry frames the call site's copy).
+    const event = resolveEventEmail(input.type, {
+      title: input.title,
+      body: input.body,
+      actionUrl: input.actionUrl,
+      relatedEntityType: input.relatedEntityType ?? null,
+      relatedEntityId: input.relatedEntityId ?? null,
+    });
+
     let status: "sent" | "failed" = "failed";
     let providerId: string | null = null;
     let error: string | null = null;
     try {
       const result = await emailService.sendNotification({
         to,
-        subject: input.title,
+        subject: event.subject,
         title: input.title,
         body: input.body,
-        actionUrl: input.actionUrl,
+        actionUrl: event.actionUrl,
+        actionLabel: event.actionLabel,
       });
       status = result.status === "sent" ? "sent" : "failed";
       providerId = result.providerId ?? null;
@@ -216,7 +227,7 @@ class NotificationService {
         channel: "email",
         to,
         userId: input.userId,
-        subject: input.title,
+        subject: event.subject,
         body: input.body,
         type: input.type,
         relatedEntityType: input.relatedEntityType ?? null,
