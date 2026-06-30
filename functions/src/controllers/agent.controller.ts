@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { agentService } from "../services/agent.service";
 import { agencyService } from "../services/agency.service";
+import { notificationService } from "../services/notification.service";
 import {
   sendSuccess,
   sendError,
@@ -408,6 +409,23 @@ export class AgentController {
         status,
         adminUserId
       );
+
+      // Notify the agent of a terminal verification decision.
+      if (agent?.userId && (status === "verified" || status === "rejected")) {
+        const approved = status === "verified";
+        await notificationService
+          .notifyUser({
+            userId: agent.userId,
+            type: approved ? "verification_approved" : "verification_rejected",
+            title: approved ? "Verification approved" : "Verification needs attention",
+            body: approved
+              ? "Your account verification has been approved — you're all set."
+              : "Your account verification wasn't approved. Please review and resubmit your documents.",
+            relatedEntityType: "verification",
+            relatedEntityId: agentId,
+          })
+          .catch((e) => console.error("[agent] verification notify failed:", e));
+      }
 
       sendSuccess(res, agent, `Agent ${status}`);
     } catch (error) {

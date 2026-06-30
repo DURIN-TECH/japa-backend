@@ -15,15 +15,50 @@ const FULL: NotificationChannel[] = ["in_app", "push", "email"];
 const APP_ONLY: NotificationChannel[] = ["in_app", "push"];
 
 export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChannel[]> = {
+  // Applications
   application_update: FULL,
   application_created: FULL,
+  application_assigned: FULL,
+  application_withdrawn: FULL,
+  // Documents
   document_status: FULL,
+  document_uploaded: FULL,
+  document_approved: FULL,
+  document_rejected: FULL,
+  // Consultations
   consultation_booking: FULL,
   consultation_reminder: FULL,
+  consultation_confirmed: FULL,
+  consultation_rescheduled: FULL,
+  consultation_cancelled: FULL,
+  consultation_completed: FULL,
+  // Payments
   payment_received: FULL,
   payment_request: FULL,
   payment_request_rejected: FULL,
-  message_received: APP_ONLY, // chat — in-app/push only
+  // Subscriptions / billing
+  subscription_activated: FULL,
+  subscription_renewed: FULL,
+  subscription_payment_failed: FULL,
+  subscription_canceled: FULL,
+  plan_changed: FULL,
+  seats_added: FULL,
+  // Agency / agent lifecycle
+  agent_invited: FULL,
+  invitation_accepted: FULL,
+  invitation_declined: FULL,
+  agency_member_removed: FULL,
+  agency_approved: FULL,
+  agency_rejected: FULL,
+  // Verification
+  verification_approved: FULL,
+  verification_rejected: FULL,
+  // Account / engagement
+  welcome: FULL,
+  role_changed: FULL,
+  review_received: FULL,
+  // Other — in-app/push only (email would be noisy)
+  message_received: APP_ONLY,
   visa_news: APP_ONLY,
   system: APP_ONLY,
 };

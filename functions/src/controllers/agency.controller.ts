@@ -2,6 +2,9 @@ import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { agencyService, SeatLimitError } from "../services/agency.service";
 import { storageService } from "../services/storage.service";
+import { notificationService } from "../services/notification.service";
+import { emailService } from "../services/email/email.service";
+import { resolveEventEmail } from "../services/email/event-templates";
 import { collections } from "../utils/firebase";
 import { ROLES } from "@durin-tech/authz";
 import {
@@ -292,7 +295,22 @@ export class AgencyController {
         return;
       }
 
+      // Capture the agent's user id before removal so we can notify them.
+      const removedUserId = (await collections.agents.doc(agentId).get()).data()
+        ?.userId as string | undefined;
       await agencyService.removeAgentFromAgency(agentId);
+      if (removedUserId) {
+        await notificationService
+          .notifyUser({
+            userId: removedUserId,
+            type: "agency_member_removed",
+            title: "Removed from agency",
+            body: `You've been removed from ${agency.name}.`,
+            relatedEntityType: "agency",
+            relatedEntityId: id,
+          })
+          .catch((e) => console.error("[agency] remove notify failed:", e));
+      }
       sendSuccess(res, { removed: true }, "Agent removed from agency");
     } catch (error) {
       console.error("Error removing member:", error);
@@ -343,6 +361,25 @@ export class AgencyController {
         inviterName,
         email
       );
+
+      // Email the invited address directly — the invitee may not have an account
+      // yet, so this bypasses notifyUser (which is keyed by an existing userId).
+      const ev = resolveEventEmail("agent_invited", {
+        title: "Agency invitation",
+        body: "",
+        relatedEntityType: "agency",
+        relatedEntityId: id,
+      });
+      await emailService
+        .sendNotification({
+          to: email,
+          subject: ev.subject,
+          title: `${inviterName} invited you to join ${agency.name}`,
+          body: `${inviterName} has invited you to join ${agency.name} on Seli as an agent.\n\nSign in (or create your account with this email) to accept the invitation.`,
+          actionUrl: ev.actionUrl,
+          actionLabel: ev.actionLabel,
+        })
+        .catch((e) => console.error("[invite] email failed:", e));
 
       sendCreated(res, invitation, "Invitation sent successfully");
     } catch (error) {
@@ -414,6 +451,22 @@ export class AgencyController {
       const { id } = req.params;
 
       await agencyService.acceptInvitation(id, userId);
+
+      // Notify the inviting owner that the agent accepted.
+      const invite = (await collections.agencyInvitations.doc(id).get()).data();
+      if (invite?.invitedBy) {
+        await notificationService
+          .notifyUser({
+            userId: invite.invitedBy,
+            type: "invitation_accepted",
+            title: "Invitation accepted",
+            body: `${invite.invitedEmail} accepted your invitation to join ${invite.agencyName}.`,
+            relatedEntityType: "agency",
+            relatedEntityId: invite.agencyId,
+          })
+          .catch((e) => console.error("[invitation] accept notify failed:", e));
+      }
+
       sendSuccess(res, { accepted: true }, "Invitation accepted");
     } catch (error) {
       console.error("Error accepting invitation:", error);
@@ -444,7 +497,22 @@ export class AgencyController {
     try {
       const { id } = req.params;
 
+      // Capture the invitation before declining so we can notify the owner.
+      const invite = (await collections.agencyInvitations.doc(id).get()).data();
       await agencyService.declineInvitation(id);
+      if (invite?.invitedBy) {
+        await notificationService
+          .notifyUser({
+            userId: invite.invitedBy,
+            type: "invitation_declined",
+            title: "Invitation declined",
+            body: `${invite.invitedEmail} declined your invitation to join ${invite.agencyName}.`,
+            relatedEntityType: "agency",
+            relatedEntityId: invite.agencyId,
+          })
+          .catch((e) => console.error("[invitation] decline notify failed:", e));
+      }
+
       sendSuccess(res, { declined: true }, "Invitation declined");
     } catch (error) {
       console.error("Error declining invitation:", error);
@@ -507,6 +575,24 @@ export class AgencyController {
       }
 
       const agency = await agencyService.updateAgencyApproval(id, action, adminUserId, reason);
+
+      // Notify the agency owner of the admin decision.
+      if (agency?.ownerId) {
+        const approved = action === "approve";
+        await notificationService
+          .notifyUser({
+            userId: agency.ownerId,
+            type: approved ? "agency_approved" : "agency_rejected",
+            title: approved ? "Your agency was approved" : "Update on your agency application",
+            body: approved
+              ? `Your agency "${agency.name}" has been approved. You can now operate on Seli.`
+              : `Your agency "${agency.name}" application was not approved${reason ? `: ${reason}` : "."}`,
+            relatedEntityType: "agency",
+            relatedEntityId: id,
+          })
+          .catch((e) => console.error("[agency] approval notify failed:", e));
+      }
+
       sendSuccess(res, agency, `Agency ${action === "approve" ? "approved" : "rejected"} successfully`);
     } catch (error) {
       console.error("Error updating agency approval:", error);

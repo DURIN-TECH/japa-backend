@@ -662,14 +662,49 @@ export interface BankAccount {
 // ============================================
 
 export type NotificationType =
+  // Applications
   | "application_update"
   | "application_created" // An agent started an application on a client's behalf
+  | "application_assigned" // An application was assigned to an agent
+  | "application_withdrawn"
+  // Documents
   | "document_status"
+  | "document_uploaded" // Client uploaded a document for review
+  | "document_approved"
+  | "document_rejected"
+  // Consultations
   | "consultation_booking" // A consultation was booked/scheduled
   | "consultation_reminder"
+  | "consultation_confirmed"
+  | "consultation_rescheduled"
+  | "consultation_cancelled"
+  | "consultation_completed"
+  // Payments
   | "payment_received"
   | "payment_request"
   | "payment_request_rejected"
+  // Subscriptions / billing
+  | "subscription_activated"
+  | "subscription_renewed"
+  | "subscription_payment_failed"
+  | "subscription_canceled"
+  | "plan_changed"
+  | "seats_added"
+  // Agency / agent lifecycle
+  | "agent_invited"
+  | "invitation_accepted"
+  | "invitation_declined"
+  | "agency_member_removed"
+  | "agency_approved"
+  | "agency_rejected"
+  // Verification
+  | "verification_approved"
+  | "verification_rejected"
+  // Account / engagement
+  | "welcome"
+  | "role_changed"
+  | "review_received"
+  // Other
   | "message_received"
   | "visa_news"
   | "system";
@@ -690,7 +725,7 @@ export interface Notification {
   
   // Deep linking
   actionUrl?: string;
-  relatedEntityType?: "application" | "consultation" | "document" | "message" | "news_article" | "payment_request";
+  relatedEntityType?: "application" | "consultation" | "document" | "message" | "news_article" | "payment_request" | "subscription" | "agency" | "agent" | "verification" | "review";
   relatedEntityId?: string;
   
   // Status

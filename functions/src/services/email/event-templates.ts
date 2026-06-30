@@ -85,6 +85,150 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     actionLabel: "View case",
     path: casePath,
   },
+
+  // Applications (assignment / withdrawal)
+  application_assigned: {
+    subject: "A case was assigned to you",
+    actionLabel: "View case",
+    path: casePath,
+  },
+  application_withdrawn: {
+    subject: "An application was withdrawn",
+    actionLabel: "View case",
+    path: casePath,
+  },
+
+  // Documents
+  document_uploaded: {
+    subject: "A document was uploaded for review",
+    actionLabel: "Review document",
+    path: casePath,
+  },
+  document_approved: {
+    subject: "Your document was approved",
+    actionLabel: "View documents",
+    path: casePath,
+  },
+  document_rejected: {
+    subject: "Your document needs attention",
+    actionLabel: "View documents",
+    path: casePath,
+  },
+
+  // Consultations
+  consultation_confirmed: {
+    subject: "Your consultation is confirmed",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
+  consultation_rescheduled: {
+    subject: "Your consultation was rescheduled",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
+  consultation_cancelled: {
+    subject: "Your consultation was cancelled",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
+  consultation_completed: {
+    subject: "Your consultation is complete",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
+
+  // Subscriptions / billing
+  subscription_activated: {
+    subject: "Your subscription is active",
+    actionLabel: "Manage subscription",
+    path: () => "/account-settings?tab=subscription",
+  },
+  subscription_renewed: {
+    subject: "Your subscription renewed",
+    actionLabel: "Manage subscription",
+    path: () => "/account-settings?tab=subscription",
+  },
+  subscription_payment_failed: {
+    subject: "Action needed: payment failed",
+    actionLabel: "Update payment",
+    path: () => "/account-settings?tab=subscription",
+  },
+  subscription_canceled: {
+    subject: "Your subscription was canceled",
+    actionLabel: "Resubscribe",
+    path: () => "/account-settings?tab=subscription",
+  },
+  plan_changed: {
+    subject: "Your plan was updated",
+    actionLabel: "Manage subscription",
+    path: () => "/account-settings?tab=subscription",
+  },
+  seats_added: {
+    subject: "Agent seats added to your plan",
+    actionLabel: "Manage agents",
+    path: () => "/account-settings?tab=agencyProfile",
+  },
+
+  // Agency / agent lifecycle
+  agent_invited: {
+    subject: "You've been invited to join an agency on Seli",
+    actionLabel: "Accept invitation",
+    path: () => "/login",
+  },
+  invitation_accepted: {
+    subject: "An agent accepted your invitation",
+    actionLabel: "View agency",
+    path: () => "/account-settings?tab=agencyProfile",
+  },
+  invitation_declined: {
+    subject: "An agent declined your invitation",
+    actionLabel: "View agency",
+    path: () => "/account-settings?tab=agencyProfile",
+  },
+  agency_member_removed: {
+    subject: "You were removed from an agency",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
+  agency_approved: {
+    subject: "Your agency has been approved",
+    actionLabel: "Go to dashboard",
+    path: () => "/dashboard",
+  },
+  agency_rejected: {
+    subject: "Update on your agency application",
+    actionLabel: "View agency",
+    path: () => "/account-settings?tab=agencyProfile",
+  },
+
+  // Verification
+  verification_approved: {
+    subject: "Your verification was approved",
+    actionLabel: "View verification",
+    path: () => "/account-settings?tab=verification",
+  },
+  verification_rejected: {
+    subject: "Your verification needs attention",
+    actionLabel: "View verification",
+    path: () => "/account-settings?tab=verification",
+  },
+
+  // Account / engagement
+  welcome: {
+    subject: "Welcome to Seli",
+    actionLabel: "Get started",
+    path: () => "/dashboard",
+  },
+  role_changed: {
+    subject: "Your account access changed",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
+  review_received: {
+    subject: "You received a new review",
+    actionLabel: "View reviews",
+    path: () => "/dashboard",
+  },
 };
 
 /** Join a relative path to the configured app URL. */

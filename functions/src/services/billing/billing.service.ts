@@ -9,7 +9,9 @@ import {
 } from "@durin-tech/authz";
 import { entitlementService } from "../entitlement.service";
 import { paystackProvider } from "./paystack.provider";
+import { notificationService } from "../notification.service";
 import { StoredPlan } from "../../types/billing";
+import { NotificationType } from "../../types";
 
 /**
  * Billing service — the bridge between a payment provider and the entitlement
@@ -84,6 +86,81 @@ class BillingService {
     });
 
     await entitlementService.recomputeEntitlements(event.subscriberType, event.subscriberId);
+
+    // Notify the subscriber (best-effort) — activation/renewal receipt, payment
+    // failure (action needed), cancellation, or plan change.
+    await this.notifySubscriber(event).catch((e) =>
+      console.error("[billing] subscriber notification failed:", e)
+    );
+  }
+
+  /**
+   * Resolve a subscriber to the user who should receive billing emails: the agency
+   * OWNER for agency subscriptions; the user themselves for agent/client.
+   */
+  private async resolveRecipientUserId(
+    subscriberType: SubscriberType,
+    subscriberId: string
+  ): Promise<string | null> {
+    if (subscriberType === "agency") {
+      const doc = await collections.agencies.doc(subscriberId).get();
+      return (doc.data()?.ownerId as string | undefined) ?? null;
+    }
+    return subscriberId; // agent / client → the user uid is the subscriber id
+  }
+
+  /** Map a normalized billing event to a subscriber notification + send it. */
+  private async notifySubscriber(event: NormalizedSubscriptionEvent): Promise<void> {
+    const map: Partial<
+      Record<
+        NormalizedSubscriptionEvent["type"],
+        { type: NotificationType; title: string; body: (plan: string) => string }
+      >
+    > = {
+      activated: {
+        type: "subscription_activated",
+        title: "Your subscription is active",
+        body: (p) => `Your subscription to ${p} is now active. Enjoy your upgraded features.`,
+      },
+      renewed: {
+        type: "subscription_renewed",
+        title: "Your subscription renewed",
+        body: (p) => `Your ${p} subscription has renewed for another period.`,
+      },
+      past_due: {
+        type: "subscription_payment_failed",
+        title: "Payment failed",
+        body: (p) =>
+          `We couldn't process your payment for ${p}. Please update your payment method to keep your subscription active.`,
+      },
+      canceled: {
+        type: "subscription_canceled",
+        title: "Subscription canceled",
+        body: (p) => `Your subscription to ${p} has been canceled. You can resubscribe anytime.`,
+      },
+      updated: {
+        type: "plan_changed",
+        title: "Your plan was updated",
+        body: (p) => `Your subscription plan is now ${p}.`,
+      },
+    };
+    const entry = map[event.type];
+    if (!entry) return;
+
+    const userId = await this.resolveRecipientUserId(event.subscriberType, event.subscriberId);
+    if (!userId) return;
+
+    const planDoc = await collections.plans.doc(event.planId).get();
+    const planName = (planDoc.data() as StoredPlan | undefined)?.name ?? "your plan";
+
+    await notificationService.notifyUser({
+      userId,
+      type: entry.type,
+      title: entry.title,
+      body: entry.body(planName),
+      relatedEntityType: "subscription",
+      relatedEntityId: event.subscriberId,
+    });
   }
 
   /** Verify + parse a provider webhook (raw body) and apply it if valid. */
@@ -172,6 +249,23 @@ class BillingService {
     const newTotal = Number(meta.newTotal);
     if (!Number.isFinite(newTotal)) return null;
     await entitlementService.setPaidSeats(agencyId, newTotal);
+
+    // Notify the agency owner that seats were added (best-effort).
+    const ownerId = (await collections.agencies.doc(agencyId).get()).data()?.ownerId as
+      | string
+      | undefined;
+    if (ownerId) {
+      await notificationService
+        .notifyUser({
+          userId: ownerId,
+          type: "seats_added",
+          title: "Agent seats added",
+          body: `Your plan now includes ${newTotal} agent seats.`,
+          relatedEntityType: "agency",
+          relatedEntityId: agencyId,
+        })
+        .catch((e) => console.error("[billing] seats notification failed:", e));
+    }
     return newTotal;
   }
 }
