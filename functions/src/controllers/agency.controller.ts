@@ -55,6 +55,19 @@ export class AgencyController {
         services,
       });
 
+      // Confirm to the owner that creation is complete and the agency is now
+      // awaiting admin approval — links to their pending-review status page.
+      await notificationService
+        .notifyUser({
+          userId,
+          type: "agency_pending_review",
+          title: "Agency creation completed",
+          body: `Your agency "${agency.name}" has been created and is now awaiting approval. We'll let you know as soon as it's reviewed.`,
+          relatedEntityType: "agency",
+          relatedEntityId: agency.id,
+        })
+        .catch((e) => console.error("[agency] pending-review notify failed:", e));
+
       sendCreated(res, agency, "Agency created successfully");
     } catch (error) {
       console.error("Error creating agency:", error);

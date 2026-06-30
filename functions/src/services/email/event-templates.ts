@@ -190,6 +190,11 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     actionLabel: "Open dashboard",
     path: () => "/dashboard",
   },
+  agency_pending_review: {
+    subject: "Your agency is awaiting approval",
+    actionLabel: "View review status",
+    path: () => "/pending-review",
+  },
   agency_approved: {
     subject: "Your agency has been approved",
     actionLabel: "Go to dashboard",

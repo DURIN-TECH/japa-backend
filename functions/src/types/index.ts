@@ -695,6 +695,7 @@ export type NotificationType =
   | "invitation_accepted"
   | "invitation_declined"
   | "agency_member_removed"
+  | "agency_pending_review" // Agency created, awaiting admin approval
   | "agency_approved"
   | "agency_rejected"
   // Verification

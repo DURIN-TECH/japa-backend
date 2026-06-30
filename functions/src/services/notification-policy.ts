@@ -48,6 +48,7 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   invitation_accepted: FULL,
   invitation_declined: FULL,
   agency_member_removed: FULL,
+  agency_pending_review: FULL,
   agency_approved: FULL,
   agency_rejected: FULL,
   // Verification
