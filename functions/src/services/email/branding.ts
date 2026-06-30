@@ -14,12 +14,10 @@ export const EMAIL_BRANDING = {
   /** Hosted logo. PNG on purpose — email clients don't render SVG reliably. */
   logoUrl:
     process.env.EMAIL_LOGO_URL ||
-    "https://japa-portal-backend--japa-platform.us-central1.hosted.app/assets/seli_logo.png",
+    "https://portal.weareseli.com/assets/seli_logo.png",
 
-  /** Brand home / default destination for the footer link. */
-  appUrl:
-    process.env.APP_URL ||
-    "https://japa-portal-backend--japa-platform.us-central1.hosted.app",
+  /** Brand home / default destination for the footer link (custom portal domain). */
+  appUrl: process.env.APP_URL || "https://portal.weareseli.com",
 
   /** Support address shown in the footer. */
   supportEmail: process.env.EMAIL_SUPPORT || "support@seli.app",
