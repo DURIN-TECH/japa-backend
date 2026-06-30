@@ -22,7 +22,8 @@ import { paymentRequestService } from "../services/payment-request.service";
 import { transactionService } from "../services/transaction.service";
 import { applicationService } from "../services/application.service";
 import { messagingService } from "../services/messaging.service";
-import { collections, messaging } from "../utils/firebase";
+import { notificationService } from "../services/notification.service";
+import { collections } from "../utils/firebase";
 import { PaymentRequestStatus } from "../types";
 import { ROLES } from "@durin-tech/authz";
 import { sendSuccess, sendError, sendNotFound, sendForbidden } from "../utils/response";
@@ -317,46 +318,22 @@ class PaymentRequestController {
       // Step 3: Update the application's running total of payments made
       await applicationService.incrementAmountPaid(request.applicationId, request.amount);
 
-      // Step 4: Notify the agent about the approval
-      const agentDoc = await collections.agents.doc(request.agentId).get();
-      const agent = agentDoc.data();
-      if (agent) {
-        // Look up the agent's user record for FCM tokens
-        const agentUserDoc = await collections.users.doc(agent.userId).get();
-        const agentUser = agentUserDoc.data();
-
-        // Create an in-app notification record in Firestore
-        await collections.notifications.add({
-          userId: agent.userId,
+      // Step 4: Notify the agent about the approval (in-app + push + email).
+      const approvedAgentUserId = (
+        await collections.agents.doc(request.agentId).get()
+      ).data()?.userId;
+      if (approvedAgentUserId) {
+        await notificationService.notifyUser({
+          userId: approvedAgentUserId,
           type: "payment_received",
           title: "Payment Approved",
-          body: `Client approved payment of ₦${(request.amount / 100).toLocaleString()} for ${request.description}`,
+          body: `Your client approved payment of ₦${(request.amount / 100).toLocaleString()} for ${request.description}.`,
           relatedEntityType: "payment_request",
           relatedEntityId: id,
-          isRead: false,
-          createdAt: new Date(),
+          data: request.applicationId
+            ? { applicationId: request.applicationId }
+            : undefined,
         });
-
-        // Step 5: Send FCM push notification to agent's registered devices
-        if (agentUser?.fcmTokens?.length) {
-          try {
-            await messaging.sendEachForMulticast({
-              tokens: agentUser.fcmTokens,
-              notification: {
-                title: "Payment Approved",
-                body: `Client approved ₦${(request.amount / 100).toLocaleString()} for ${request.description}`,
-              },
-              data: {
-                type: "payment_received",
-                paymentRequestId: id,
-                applicationId: request.applicationId,
-              },
-            });
-          } catch (pushError) {
-            // Log but don't fail the request if push notification fails
-            console.error("Error sending push notification:", pushError);
-          }
-        }
       }
 
       return sendSuccess(res, approved, "Payment request approved");
@@ -418,42 +395,18 @@ class PaymentRequestController {
       const agent = agentDoc.data();
 
       if (agent) {
-        // Look up the agent's user record for FCM tokens
-        const agentUserDoc = await collections.users.doc(agent.userId).get();
-        const agentUser = agentUserDoc.data();
-
-        // Step 3: Create an in-app notification record in Firestore
-        await collections.notifications.add({
+        // Step 3: Notify the agent (in-app + push + email) of the rejection.
+        await notificationService.notifyUser({
           userId: agent.userId,
           type: "payment_request_rejected",
           title: "Payment Request Rejected",
-          body: `Client rejected payment of ₦${(request.amount / 100).toLocaleString()} for ${request.description}. Reason: ${reason}`,
+          body: `Your client rejected payment of ₦${(request.amount / 100).toLocaleString()} for ${request.description}. Reason: ${reason}`,
           relatedEntityType: "payment_request",
           relatedEntityId: id,
-          isRead: false,
-          createdAt: new Date(),
+          data: request.applicationId
+            ? { applicationId: request.applicationId }
+            : undefined,
         });
-
-        // Step 4: Send FCM push notification to agent's registered devices
-        if (agentUser?.fcmTokens?.length) {
-          try {
-            await messaging.sendEachForMulticast({
-              tokens: agentUser.fcmTokens,
-              notification: {
-                title: "Payment Request Rejected",
-                body: `Client rejected ₦${(request.amount / 100).toLocaleString()} for ${request.description}`,
-              },
-              data: {
-                type: "payment_request_rejected",
-                paymentRequestId: id,
-                applicationId: request.applicationId,
-              },
-            });
-          } catch (pushError) {
-            // Log but don't fail the request if push notification fails
-            console.error("Error sending push notification:", pushError);
-          }
-        }
 
         // Step 5: Auto-create a conversation so client and agent can discuss
         // the rejection. The rejection reason is sent as the first message.

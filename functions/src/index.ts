@@ -36,13 +36,14 @@ export const api = functions
 // FIRESTORE TRIGGERS
 // ============================================
 
-import { collections, messaging } from "./utils/firebase";
+import { collections } from "./utils/firebase";
 import { agentService } from "./services/agent.service";
 import { visaService } from "./services/visa.service";
 import { newsScraperService } from "./services/news-scraper.service";
 import { newsService } from "./services/news.service";
 import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
+import { notificationService } from "./services/notification.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -136,46 +137,27 @@ export const onApplicationUpdated = functions.firestore
       );
 
       try {
-        // Get user's FCM tokens
-        const userDoc = await collections.users.doc(after.userId).get();
-        const user = userDoc.data();
+        // Friendly per-status copy (falls back to a humanized status).
+        const statusMessages: Record<string, string> = {
+          under_review: "Your application is now under review.",
+          submitted_to_embassy: "Your application has been submitted to the embassy.",
+          interview_scheduled: "Your interview has been scheduled.",
+          approved: "Congratulations! Your visa has been approved.",
+          rejected: "Unfortunately, your visa application was not approved.",
+        };
+        const message =
+          statusMessages[after.status] ??
+          `Your application status is now: ${after.status.replace(/_/g, " ")}`;
 
-        if (user?.fcmTokens?.length) {
-          const statusMessages: Record<string, string> = {
-            under_review: "Your application is now under review",
-            submitted_to_embassy: "Your application has been submitted to the embassy",
-            interview_scheduled: "Your interview has been scheduled",
-            approved: "Congratulations! Your visa has been approved",
-            rejected: "Unfortunately, your visa application was not approved",
-          };
-
-          const message = statusMessages[after.status];
-          if (message) {
-            await messaging.sendEachForMulticast({
-              tokens: user.fcmTokens,
-              notification: {
-                title: "Application Update",
-                body: message,
-              },
-              data: {
-                type: "application_update",
-                applicationId: context.params.applicationId,
-                status: after.status,
-              },
-            });
-          }
-        }
-
-        // Create notification record
-        await collections.notifications.add({
+        // One call fans out to in-app + push + email (per the channel policy).
+        await notificationService.notifyUser({
           userId: after.userId,
           type: "application_update",
           title: "Application Status Update",
-          body: `Your application status is now: ${after.status.replace(/_/g, " ")}`,
+          body: message,
           relatedEntityType: "application",
           relatedEntityId: context.params.applicationId,
-          isRead: false,
-          createdAt: new Date(),
+          data: { status: after.status },
         });
       } catch (error) {
         console.error("Error sending notification:", error);
@@ -204,27 +186,19 @@ export const onConsultationCreated = functions.firestore
     );
 
     try {
-      // Get agent's user profile to get FCM tokens
+      // Resolve the agent's user id, then notify across in-app + push + email.
       const agentDoc = await collections.agents.doc(consultation.agentId).get();
-      const agent = agentDoc.data();
+      const agentUserId = agentDoc.data()?.userId;
 
-      if (agent) {
-        const userDoc = await collections.users.doc(agent.userId).get();
-        const user = userDoc.data();
-
-        if (user?.fcmTokens?.length) {
-          await messaging.sendEachForMulticast({
-            tokens: user.fcmTokens,
-            notification: {
-              title: "New Consultation Booking",
-              body: "You have a new consultation booking",
-            },
-            data: {
-              type: "consultation_booking",
-              consultationId: context.params.consultationId,
-            },
-          });
-        }
+      if (agentUserId) {
+        await notificationService.notifyUser({
+          userId: agentUserId,
+          type: "consultation_booking",
+          title: "New Consultation Booking",
+          body: "You have a new consultation booking.",
+          relatedEntityType: "consultation",
+          relatedEntityId: context.params.consultationId,
+        });
       }
     } catch (error) {
       console.error("Error notifying agent:", error);
@@ -242,36 +216,17 @@ export const onPaymentRequestCreated = functions.firestore
     console.log(`New payment request created: ${context.params.requestId}`);
 
     try {
-      // Get client's FCM tokens for push notification
-      const userDoc = await collections.users.doc(request.clientId).get();
-      const user = userDoc.data();
-
-      if (user?.fcmTokens?.length) {
-        const amountDisplay = (request.amount / 100).toLocaleString();
-        await messaging.sendEachForMulticast({
-          tokens: user.fcmTokens,
-          notification: {
-            title: "Payment Request",
-            body: `Your agent requests ₦${amountDisplay} for ${request.description}`,
-          },
-          data: {
-            type: "payment_request",
-            paymentRequestId: context.params.requestId,
-            applicationId: request.applicationId,
-          },
-        });
-      }
-
-      // Create notification record for the client
-      await collections.notifications.add({
+      const amountDisplay = (request.amount / 100).toLocaleString();
+      await notificationService.notifyUser({
         userId: request.clientId,
         type: "payment_request",
         title: "New Payment Request",
-        body: `Your agent requests ₦${(request.amount / 100).toLocaleString()} for ${request.description}`,
+        body: `Your agent requests ₦${amountDisplay} for ${request.description}.`,
         relatedEntityType: "payment_request",
         relatedEntityId: context.params.requestId,
-        isRead: false,
-        createdAt: new Date(),
+        data: request.applicationId
+          ? { applicationId: request.applicationId }
+          : undefined,
       });
     } catch (error) {
       console.error("Error sending payment request notification:", error);
@@ -365,23 +320,15 @@ export const sendConsultationReminders = functions.pubsub
       for (const doc of upcomingConsultations.docs) {
         const consultation = doc.data();
 
-        // Get user's FCM tokens
-        const userDoc = await collections.users.doc(consultation.userId).get();
-        const user = userDoc.data();
-
-        if (user?.fcmTokens?.length) {
-          await messaging.sendEachForMulticast({
-            tokens: user.fcmTokens,
-            notification: {
-              title: "Consultation Reminder",
-              body: `You have a consultation scheduled tomorrow at ${consultation.scheduledTime}`,
-            },
-            data: {
-              type: "consultation_reminder",
-              consultationId: doc.id,
-            },
-          });
-        }
+        // Notify the client across in-app + push + email (per the channel policy).
+        await notificationService.notifyUser({
+          userId: consultation.userId,
+          type: "consultation_reminder",
+          title: "Consultation Reminder",
+          body: `You have a consultation scheduled tomorrow at ${consultation.scheduledTime}.`,
+          relatedEntityType: "consultation",
+          relatedEntityId: doc.id,
+        });
       }
 
       console.log(
