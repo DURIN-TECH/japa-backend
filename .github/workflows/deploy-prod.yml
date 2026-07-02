@@ -48,29 +48,21 @@ jobs:
         working-directory: functions
         run: npm run build
 
-      # Authenticate to Google Cloud using the official auth action.
+      # Deploy functions, Firestore rules/indexes, and Storage rules to
+      # japa-platform. Runs from the repo root (where firebase.json lives). The
+      # firebase-tools version is pinned (not @latest / @master) so CI is
+      # reproducible.
       #
-      # Replaces the third-party w9jds/firebase-action. This action parses and
-      # validates the service-account JSON, writes it to a temp credentials file,
-      # and exports GOOGLE_APPLICATION_CREDENTIALS so downstream Firebase/Google
-      # tooling picks up Application Default Credentials automatically — no
-      # interactive `firebase login` required.
-      #
-      # We reuse the existing FIREBASE_SERVICE_ACCOUNT_PROD secret (the full SA
-      # key JSON). To go keyless later, drop `credentials_json` and instead set
-      # `workload_identity_provider` + `service_account`, and add
-      # `permissions: { id-token: write }` to this job.
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
-
-      # Deploy functions, Firestore rules/indexes, and Storage rules to japa-platform.
-      #
-      # Runs from the repo root (where firebase.json lives). firebase-tools reads
-      # the credentials exported by the auth step above. The version is pinned
-      # (not @latest / @master) so CI is reproducible and can't silently break
-      # when a new firebase-tools release is published — which is exactly how the
-      # previous w9jds@master setup regressed.
+      # Auth: write the FIREBASE_SERVICE_ACCOUNT_PROD key to a temp file and point
+      # ADC at it via GOOGLE_APPLICATION_CREDENTIALS — firebase-tools authenticates
+      # from that directly. (google-github-actions/auth's credential file was NOT
+      # consumed by firebase-tools — "Failed to authenticate" — so we write the raw
+      # key ourselves. It lives only in the ephemeral runner temp dir and secrets
+      # are masked in logs. Matches deploy-dev.yml.)
       - name: Deploy to Firebase (prod)
-        run: npx --yes firebase-tools@15.22.0 deploy --project default --force
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
+        run: |
+          printf '%s' "$FIREBASE_SA_KEY" > "$RUNNER_TEMP/sa-key.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa-key.json"
+          npx --yes firebase-tools@15.22.0 deploy --project default --force
