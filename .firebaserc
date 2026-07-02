@@ -1,5 +1,7 @@
 {
   "projects": {
-    "default": "japa-platform"
+    "default": "japa-platform",
+    "prod": "japa-platform",
+    "dev": "durin-seli-dev"
   }
 }

@@ -1,0 +1,77 @@
+# Deploy to Dev Workflow
+# Triggered on push to the `dev` branch. Lints, builds, and deploys Cloud
+# Functions, Firestore rules/indexes, and Storage rules to the durin-seli-dev
+# ("Seli Dev") project.
+#
+# Auth is KEYLESS via Workload Identity Federation — the pool/provider and the
+# ci-deployer service account were created by Terraform (infra/terraform). No
+# service-account JSON key is stored anywhere. Set these two repo secrets from
+# `terraform output` (Settings → Secrets → Actions):
+#   GCP_WORKLOAD_IDENTITY_PROVIDER = terraform output workload_identity_provider
+#   GCP_DEPLOY_SERVICE_ACCOUNT     = terraform output deployer_service_account
+
+name: Deploy to Dev
+
+# Trigger on pushes to the dev branch only
+on:
+  push:
+    branches:
+      - dev
+
+jobs:
+  deploy:
+    name: Lint, Build & Deploy to Dev
+    runs-on: ubuntu-latest
+
+    # WIF needs GitHub to mint an OIDC token for this job.
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      # Check out the repository code
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # Set up Node.js 22 to match the engine requirement in package.json
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: "npm"
+          cache-dependency-path: functions/package-lock.json
+
+      # Install dependencies from the lockfile for reproducible builds
+      - name: Install dependencies
+        working-directory: functions
+        run: npm ci
+
+      # Run ESLint to catch code style and potential errors
+      - name: Lint
+        working-directory: functions
+        run: npm run lint
+
+      # Compile TypeScript to verify the build succeeds before deploying
+      - name: Build
+        working-directory: functions
+        run: npm run build
+
+      # Keyless auth to Google Cloud via Workload Identity Federation.
+      # Impersonates ci-deployer@durin-seli-dev.iam.gserviceaccount.com, which
+      # Terraform granted deploy roles + allowed this repo (DURIN-TECH/japa-backend)
+      # to impersonate.
+      - name: Authenticate to Google Cloud (keyless / WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      # Deploy functions, Firestore rules/indexes, and Storage rules to the dev
+      # project. `--project dev` resolves to durin-seli-dev via .firebaserc.
+      # NOTE: the Storage default bucket must exist first (provision it once in
+      # the Firebase console) or the storage-rules step of the deploy will fail.
+      - name: Deploy to Firebase (dev)
+        run: npx --yes firebase-tools@15.22.0 deploy --project dev --force
