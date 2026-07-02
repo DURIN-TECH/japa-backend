@@ -3,10 +3,12 @@
 # Functions, Firestore rules/indexes, and Storage rules to the durin-seli-dev
 # ("Seli Dev") project.
 #
-# Auth uses a key for the ci-deployer service account (created by Terraform),
-# stored as the FIREBASE_SERVICE_ACCOUNT_DEV repo secret — same mechanism as the
-# prod workflow. (Keyless WIF was tried but firebase-tools doesn't consume the
-# external-account credential; the WIF pool/SA still exist in Terraform.)
+# Auth: the ci-deployer service-account key (created by Terraform) is stored as
+# the FIREBASE_SERVICE_ACCOUNT_DEV repo secret; the deploy step writes it to a
+# temp file and points GOOGLE_APPLICATION_CREDENTIALS at it. (Keyless WIF and
+# google-github-actions/auth's credential file both failed with "Failed to
+# authenticate" from firebase-tools; a raw key via ADC works. WIF pool/SA still
+# exist in Terraform if we revisit.)
 
 name: Deploy to Dev
 
@@ -52,20 +54,20 @@ jobs:
         working-directory: functions
         run: npm run build
 
-      # Authenticate with the ci-deployer service-account key (same mechanism as
-      # the prod workflow). firebase-tools reads the credentials file this action
-      # writes via GOOGLE_APPLICATION_CREDENTIALS. NOTE: WIF/keyless was tried
-      # first but firebase-tools does not consume the external-account credential
-      # ("Failed to authenticate"), so we use a SA key like prod. The keyless WIF
-      # pool/SA still exist in Terraform if we revisit this later.
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DEV }}
-
       # Deploy functions, Firestore rules/indexes, and Storage rules to the dev
       # project. `--project dev` resolves to durin-seli-dev via .firebaserc.
-      # NOTE: the Storage default bucket must exist first (provision it once in
-      # the Firebase console) or the storage-rules step of the deploy will fail.
+      #
+      # Auth: write the ci-deployer SA key to a temp file and point ADC at it via
+      # GOOGLE_APPLICATION_CREDENTIALS. firebase-tools authenticates from that
+      # directly. (This is reliable where google-github-actions/auth's credential
+      # file was NOT consumed by firebase-tools — "Failed to authenticate". The
+      # key lives only in the ephemeral runner temp dir and is masked in logs.)
+      # NOTE: the Storage default bucket must exist first (provisioned once) or
+      # the storage-rules stage of the deploy will fail.
       - name: Deploy to Firebase (dev)
-        run: npx --yes firebase-tools@15.22.0 deploy --project dev --force
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DEV }}
+        run: |
+          printf '%s' "$FIREBASE_SA_KEY" > "$RUNNER_TEMP/sa-key.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa-key.json"
+          npx --yes firebase-tools@15.22.0 deploy --project dev --force
