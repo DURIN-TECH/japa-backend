@@ -3,12 +3,10 @@
 # Functions, Firestore rules/indexes, and Storage rules to the durin-seli-dev
 # ("Seli Dev") project.
 #
-# Auth is KEYLESS via Workload Identity Federation — the pool/provider and the
-# ci-deployer service account were created by Terraform (infra/terraform). No
-# service-account JSON key is stored anywhere. Set these two repo secrets from
-# `terraform output` (Settings → Secrets → Actions):
-#   GCP_WORKLOAD_IDENTITY_PROVIDER = terraform output workload_identity_provider
-#   GCP_DEPLOY_SERVICE_ACCOUNT     = terraform output deployer_service_account
+# Auth uses a key for the ci-deployer service account (created by Terraform),
+# stored as the FIREBASE_SERVICE_ACCOUNT_DEV repo secret — same mechanism as the
+# prod workflow. (Keyless WIF was tried but firebase-tools doesn't consume the
+# external-account credential; the WIF pool/SA still exist in Terraform.)
 
 name: Deploy to Dev
 
@@ -22,11 +20,6 @@ jobs:
   deploy:
     name: Lint, Build & Deploy to Dev
     runs-on: ubuntu-latest
-
-    # WIF needs GitHub to mint an OIDC token for this job.
-    permissions:
-      contents: read
-      id-token: write
 
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -59,15 +52,16 @@ jobs:
         working-directory: functions
         run: npm run build
 
-      # Keyless auth to Google Cloud via Workload Identity Federation.
-      # Impersonates ci-deployer@durin-seli-dev.iam.gserviceaccount.com, which
-      # Terraform granted deploy roles + allowed this repo (DURIN-TECH/japa-backend)
-      # to impersonate.
-      - name: Authenticate to Google Cloud (keyless / WIF)
+      # Authenticate with the ci-deployer service-account key (same mechanism as
+      # the prod workflow). firebase-tools reads the credentials file this action
+      # writes via GOOGLE_APPLICATION_CREDENTIALS. NOTE: WIF/keyless was tried
+      # first but firebase-tools does not consume the external-account credential
+      # ("Failed to authenticate"), so we use a SA key like prod. The keyless WIF
+      # pool/SA still exist in Terraform if we revisit this later.
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DEV }}
 
       # Deploy functions, Firestore rules/indexes, and Storage rules to the dev
       # project. `--project dev` resolves to durin-seli-dev via .firebaserc.
