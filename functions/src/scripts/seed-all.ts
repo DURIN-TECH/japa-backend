@@ -7,15 +7,72 @@
  * invokes each underlying data seeder in dependency order.
  *
  * Usage:
- *   npm run seed              # against whatever GCLOUD_PROJECT points to
- *   npm run seed:emulator     # against local Firestore + Auth emulators
+ *   npm run seed:emulator                       # local emulators (safe sandbox)
+ *   npm run seed:dev                            # durin-seli-dev
+ *   npm run seed:prod -- --confirm-prod         # japa-platform (guarded)
+ *   node lib/scripts/seed-all.js --project <id> [--confirm-prod]
+ *
+ * Project selection precedence (highest wins):
+ *   1. --project <id>  /  -p <id>   (CLI flag)
+ *   2. SEED_PROJECT                 (env)
+ *   3. GCLOUD_PROJECT / GOOGLE_CLOUD_PROJECT (env)
+ *   4. emulator run (FIRESTORE_EMULATOR_HOST set) → "demo-seli"
+ * There is NO silent production default — an unresolved project aborts.
+ *
+ * Against a REAL project, Admin SDK auth comes from Application Default
+ * Credentials (GOOGLE_APPLICATION_CREDENTIALS / `gcloud auth application-default
+ * login`). The project id below only selects WHICH project, not the creds.
  */
 
 import * as admin from "firebase-admin";
 
-// Firebase project ID — falls back to the default platform project when
-// GCLOUD_PROJECT is not set (common when running locally against emulators).
-const projectId = process.env.GCLOUD_PROJECT || "japa-platform";
+// Projects treated as production. Seeding writes test users/agencies/etc., so
+// touching one requires an explicit --confirm-prod (or ALLOW_PROD_SEED=true).
+const PROD_PROJECT_IDS = ["japa-platform"];
+
+// Minimal CLI flag parsing: --project <id> | --project=<id> | -p <id>,
+// plus --confirm-prod / --yes to authorize a production target.
+function parseArgs(argv: string[]): { project?: string; confirmProd: boolean } {
+  let project: string | undefined;
+  let confirmProd = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--project" || a === "-p") project = argv[++i];
+    else if (a.startsWith("--project=")) project = a.slice("--project=".length);
+    else if (a === "--confirm-prod" || a === "--yes") confirmProd = true;
+  }
+  return { project, confirmProd };
+}
+
+const args = parseArgs(process.argv.slice(2));
+const onEmulator = Boolean(process.env.FIRESTORE_EMULATOR_HOST);
+
+// Resolve the target project — no silent prod fallback.
+const projectId =
+  args.project ||
+  process.env.SEED_PROJECT ||
+  process.env.GCLOUD_PROJECT ||
+  process.env.GOOGLE_CLOUD_PROJECT ||
+  (onEmulator ? "demo-seli" : undefined);
+
+if (!projectId) {
+  console.error(
+    "\n❌ No target project specified.\n" +
+    "   Pass --project <id>, set SEED_PROJECT/GCLOUD_PROJECT, or run against emulators.\n" +
+    "   e.g. npm run seed:dev   |   node lib/scripts/seed-all.js --project durin-seli-dev\n"
+  );
+  process.exit(1);
+}
+
+// Guard: refuse to seed a production project unless explicitly confirmed.
+const confirmProd = args.confirmProd || process.env.ALLOW_PROD_SEED === "true";
+if (!onEmulator && PROD_PROJECT_IDS.includes(projectId) && !confirmProd) {
+  console.error(
+    `\n❌ Refusing to seed PRODUCTION project "${projectId}" — this writes test data.\n` +
+    "   Re-run with --confirm-prod (or ALLOW_PROD_SEED=true) if you really mean it.\n"
+  );
+  process.exit(1);
+}
 
 // Log which emulators (if any) this run is targeting so it's obvious at a
 // glance whether we're writing to local sandboxes or live infrastructure.
