@@ -32,6 +32,13 @@ export interface CreateApplicationInput {
   clientNameOverride?: string;
   clientEmailOverride?: string;
   clientPhoneOverride?: string;
+  // Admin provenance (admin-started portal flow). When an admin creates the
+  // application on an agency's behalf, `agentId` points to the chosen owning
+  // agent while these record who created it and why. See Application type.
+  createdByAdmin?: boolean;
+  createdByAdminId?: string;
+  createdByAdminName?: string;
+  adminCreationReason?: string;
 }
 
 export interface UpdateApplicationInput {
@@ -111,6 +118,12 @@ class ApplicationService {
       agencyId,
       // Default to "mobile" so pre-existing self-serve callers are tagged.
       createdVia: input.createdVia ?? "mobile",
+      // Admin provenance — only meaningful when an admin started this (undefined
+      // is ignored by Firestore, matching the other optional fields above).
+      createdByAdmin: input.createdByAdmin,
+      createdByAdminId: input.createdByAdminId,
+      createdByAdminName: input.createdByAdminName,
+      adminCreationReason: input.adminCreationReason,
       status: "draft",
       progress: 0,
       currentStep: "Getting started",

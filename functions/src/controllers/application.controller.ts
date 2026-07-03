@@ -124,6 +124,11 @@ export class ApplicationController {
         visaTypeId,
         agentNotes,
         channels,
+        // Admin-only: the owning agent + agency the admin is acting for, and an
+        // optional reason. Ignored for the agent flow (owner = the caller).
+        agentId: ownerAgentId,
+        agencyId: ownerAgencyId,
+        adminCreationReason: adminReason,
       } = req.body as {
         clientName?: string;
         clientEmail?: string;
@@ -132,6 +137,9 @@ export class ApplicationController {
         visaTypeId?: string;
         agentNotes?: string;
         channels?: NotificationChannel[];
+        agentId?: string;
+        agencyId?: string;
+        adminCreationReason?: string;
       };
 
       // --- Validation --------------------------------------------------------
@@ -145,29 +153,109 @@ export class ApplicationController {
         return;
       }
 
-      // --- Authorize: caller must be an agent --------------------------------
-      // We need both the agent's USER uid (used as Application.agentId, consistent
-      // with the rest of the application code) and the agent DOC id (used as the
-      // Conversation.agentId — these two identifiers are intentionally different).
-      const agentSnapshot = await collections.agents
-        .where("userId", "==", callerUid)
-        .limit(1)
-        .get();
-      if (agentSnapshot.empty) {
-        sendError(
-          res,
-          "FORBIDDEN",
-          "Only agents can start applications on behalf of a client",
-          403
-        );
-        return;
+      // --- Authorize & resolve the OWNING agent ------------------------------
+      // Two kinds of caller may start an application for a client:
+      //   1) An AGENT — the case is owned by them (original behaviour).
+      //   2) A platform ADMIN — acting on an agency's behalf. The admin must name
+      //      the owning agent (`agentId`) and agency (`agencyId`); the case is
+      //      owned by that agent, but we stamp admin provenance for the audit trail.
+      //
+      // Either way we end up with the owning agent's USER uid (Application.agentId)
+      // and DOC id (Conversation.agentId) — intentionally different identifiers.
+      const isAdmin = req.authz?.role === "admin" || req.user?.admin === true;
+
+      let ownerAgentUid: string;
+      let agentDocId: string;
+      // Admin provenance passed through to the created application (undefined for
+      // the agent flow, so no admin fields are written).
+      let adminProvenance:
+        | {
+            createdByAdmin: true;
+            createdByAdminId: string;
+            createdByAdminName?: string;
+            adminCreationReason?: string;
+          }
+        | undefined;
+
+      if (isAdmin) {
+        // Admin flow: the owning agent + agency must be supplied and consistent.
+        if (!ownerAgentId || !ownerAgencyId) {
+          sendError(
+            res,
+            "VALIDATION_ERROR",
+            "agentId and agencyId are required when an admin starts an application",
+            400
+          );
+          return;
+        }
+        const ownerSnap = await collections.agents
+          .where("userId", "==", ownerAgentId)
+          .limit(1)
+          .get();
+        if (ownerSnap.empty) {
+          sendError(res, "NOT_FOUND", "The selected agent could not be found", 404);
+          return;
+        }
+        const ownerDoc = ownerSnap.docs[0];
+        // Defence-in-depth: the chosen agent must belong to the chosen agency
+        // (the portal filters agents by agency, but never trust the client).
+        if ((ownerDoc.data() as { agencyId?: string }).agencyId !== ownerAgencyId) {
+          sendError(
+            res,
+            "VALIDATION_ERROR",
+            "The selected agent does not belong to the selected agency",
+            400
+          );
+          return;
+        }
+        ownerAgentUid = ownerAgentId;
+        agentDocId = ownerDoc.id;
+
+        // Build the "which admin" audit fields from the admin's own profile.
+        const adminDoc = await collections.users.doc(callerUid).get();
+        const adminData = adminDoc.exists
+          ? (adminDoc.data() as { firstName?: string; lastName?: string; email?: string })
+          : null;
+        const adminName =
+          (adminData
+            ? `${adminData.firstName || ""} ${adminData.lastName || ""}`.trim()
+            : "") ||
+          adminData?.email ||
+          req.user?.email;
+        adminProvenance = {
+          createdByAdmin: true,
+          createdByAdminId: callerUid,
+          createdByAdminName: adminName || undefined,
+          adminCreationReason: adminReason?.trim() || undefined,
+        };
+      } else {
+        // Agent flow: the caller must themselves be an agent.
+        const agentSnapshot = await collections.agents
+          .where("userId", "==", callerUid)
+          .limit(1)
+          .get();
+        if (agentSnapshot.empty) {
+          sendError(
+            res,
+            "FORBIDDEN",
+            "Only agents can start applications on behalf of a client",
+            403
+          );
+          return;
+        }
+        ownerAgentUid = callerUid;
+        agentDocId = agentSnapshot.docs[0].id;
       }
-      const agentDocId = agentSnapshot.docs[0].id;
 
       // Enforce the active-application limit for the agency (or independent agent)
       // before provisioning anything. No-op until a plan with the limit is assigned.
-      const scopeField = req.authz?.agencyId ? "agencyId" : "agentId";
-      const scopeValue = req.authz?.agencyId || callerUid;
+      // Scope the count to the OWNING agency: for the admin flow that's the
+      // agency they picked; for an agent it's their own agency (or themselves if
+      // they're an independent agent).
+      const scopeField = isAdmin || req.authz?.agencyId ? "agencyId" : "agentId";
+      const scopeValue = isAdmin
+        ? ownerAgencyId!
+        : req.authz?.agencyId || callerUid;
       const activeCount = await this.countActiveApplications(scopeField, scopeValue);
       if (!checkWithinLimit(req, LIMITS.MAX_ACTIVE_APPLICATIONS, activeCount)) {
         paymentRequired(
@@ -237,12 +325,16 @@ export class ApplicationController {
         visaTypeId,
         countryCode,
         mode: "agent",
-        agentId: callerUid, // Application.agentId = agent USER uid (codebase convention)
+        // Application.agentId = owning agent's USER uid (the caller for the agent
+        // flow; the admin-selected agent for the admin flow).
+        agentId: ownerAgentUid,
         agentNotes,
         createdVia: "portal",
         clientNameOverride: clientName.trim(),
         clientEmailOverride: normalizedEmail,
         clientPhoneOverride: clientPhone,
+        // Admin provenance (spread only when an admin created this).
+        ...(adminProvenance ?? {}),
       });
 
       // --- Open an agent<->client conversation --------------------------------

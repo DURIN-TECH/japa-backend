@@ -243,8 +243,13 @@ export class AgencyController {
     try {
       const { id } = req.params;
 
-      // Only admins or members of this agency may view its members (role claim).
-      if (req.authz?.role !== ROLES.ADMIN && req.authz?.agencyId !== id) {
+      // Only admins or members of this agency may view its members. Accept BOTH
+      // admin signals — the `role` claim and the legacy `admin: true` boolean —
+      // to match verifyAdmin(); a legacy-claim admin has no `role: "admin"` and
+      // was otherwise wrongly rejected with a 403.
+      const isAdmin =
+        req.authz?.role === ROLES.ADMIN || req.user?.admin === true;
+      if (!isAdmin && req.authz?.agencyId !== id) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }

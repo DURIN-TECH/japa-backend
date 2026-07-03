@@ -344,6 +344,15 @@ export interface Application {
   // existed (those are treated as "mobile" downstream).
   createdVia?: ApplicationCreatedVia;
 
+  // Admin provenance — set when a platform ADMIN (not the assigned agent) starts
+  // the application on an agency's behalf. `agentId`/`agencyId` above still point
+  // to the chosen owning agent/agency; these fields record who actually created
+  // it and why, for audit and support. Absent on agent/self-serve applications.
+  createdByAdmin?: boolean; // Flag: was this created by an admin?
+  createdByAdminId?: string; // The admin's user uid (which admin)
+  createdByAdminName?: string; // Denormalized admin name for display
+  adminCreationReason?: string; // Optional reason the admin gave
+
   // Status & Progress
   status: ApplicationStatus;
   progress: number; // 0-100
