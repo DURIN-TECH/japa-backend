@@ -19,12 +19,14 @@
  *   4. emulator run (FIRESTORE_EMULATOR_HOST set) → "demo-seli"
  * There is NO silent production default — an unresolved project aborts.
  *
- * Against a REAL project, Admin SDK auth comes from Application Default
- * Credentials (GOOGLE_APPLICATION_CREDENTIALS / `gcloud auth application-default
- * login`). The project id below only selects WHICH project, not the creds.
+ * Against a REAL project, authenticate with a SERVICE ACCOUNT key:
+ *   GOOGLE_APPLICATION_CREDENTIALS=<sa-key.json> npm run seed:dev
+ * User ADC (`gcloud auth application-default login`) works for Firestore but
+ * FAILS for Auth/identitytoolkit ("requires a quota project") — firebase-admin's
+ * Auth client doesn't apply the ADC quota project. A service account's own
+ * project is the consumer, so it just works; any SA with firebase.admin (e.g.
+ * ci-deployer@<project>) is sufficient.
  */
-
-import * as admin from "firebase-admin";
 
 // Projects treated as production. Seeding writes test users/agencies/etc., so
 // touching one requires an explicit --confirm-prod (or ALLOW_PROD_SEED=true).
@@ -83,23 +85,16 @@ if (process.env.FIREBASE_AUTH_EMULATOR_HOST) {
   console.log(`Using Auth emulator at ${process.env.FIREBASE_AUTH_EMULATOR_HOST}`);
 }
 
-// Initialize Firebase Admin exactly once — every downstream seeder
-// reuses this default app instance.
-if (!admin.apps.length) {
-  admin.initializeApp({ projectId });
+// Point the shared Admin SDK at THIS project. utils/firebase (lazy-loaded in
+// main(), NOT imported at the top of this file) reads these envs and OWNS
+// initializeApp() + Firestore settings(). We deliberately don't call those here
+// too — doing so caused a wrong-project app and a double-settings() crash
+// ("Firestore has already been initialized").
+process.env.GCLOUD_PROJECT = projectId;
+process.env.GOOGLE_CLOUD_PROJECT = projectId;
+if (!onEmulator && !process.env.FIREBASE_STORAGE_BUCKET) {
+  process.env.FIREBASE_STORAGE_BUCKET = `${projectId}.firebasestorage.app`;
 }
-
-// Firestore tolerates undefined values in seed payloads instead of throwing,
-// which keeps seed data definitions simpler (optional fields can be omitted).
-admin.firestore().settings({ ignoreUndefinedProperties: true });
-
-// Underlying data seeders — imported after admin init so they can use the
-// default app safely.
-import { seedPortalData } from "../data/seed-portal-data";
-import { seedNigeriaIrelandEligibility } from "../data/eligibility-seed-nigeria-ireland";
-import { seedNewsSources } from "../data/seed-news-sources";
-import { seedPlans } from "./seed-plans";
-import { backfillClaims } from "./backfill-claims";
 
 /**
  * Entry point — runs each seeder sequentially so later seeders can depend
@@ -110,6 +105,16 @@ async function main() {
   console.log(`\nStarting full backend seed for project: ${projectId}\n`);
 
   try {
+    // Lazy-load the shared Admin SDK init FIRST — importing utils/firebase runs
+    // initializeApp() (against the project env set above) + Firestore settings()
+    // exactly once — then load the seeders, which reuse that default app.
+    await import("../utils/firebase");
+    const { seedPortalData } = await import("../data/seed-portal-data");
+    const { seedNigeriaIrelandEligibility } = await import("../data/eligibility-seed-nigeria-ireland");
+    const { seedNewsSources } = await import("../data/seed-news-sources");
+    const { seedPlans } = await import("./seed-plans");
+    const { backfillClaims } = await import("./backfill-claims");
+
     // 1. Portal data — creates auth users, agencies, agents, clients,
     //    countries, visa types, applications, and all related Firestore
     //    collections. This is the biggest seeder and everything else
