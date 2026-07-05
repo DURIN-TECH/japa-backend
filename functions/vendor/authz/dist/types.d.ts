@@ -87,5 +87,11 @@ export declare function hasFeature(entitlements: Entitlements | null | undefined
 export declare function getLimit(entitlements: Entitlements | null | undefined, key: LimitKey): number;
 /** True if `currentCount` is below the limit for `key` (UNLIMITED always passes). */
 export declare function isWithinLimit(entitlements: Entitlements | null | undefined, key: LimitKey, currentCount: number): boolean;
+/**
+ * True when a subscription is in a non-access-granting (unpaid/expired) state —
+ * reads stay allowed, writes should be gated. `null`/`undefined` entitlements are
+ * NOT read-only: no resolved plan means grant-all (the default before billing).
+ */
+export declare function isReadOnly(entitlements: Entitlements | null | undefined): boolean;
 /** Flatten a plan into resolved entitlements for a subscriber. */
 export declare function entitlementsFromPlan(plan: Plan, subscriberType: SubscriberType, subscriberId: string, status: SubscriptionStatus): Entitlements;

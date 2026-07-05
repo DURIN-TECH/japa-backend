@@ -5,8 +5,18 @@
  *
  * Run:  npm run build && node lib/scripts/seed-plans.js
  */
+import { FEATURE_KEYS, LIMIT_KEYS, UNLIMITED } from "@durin-tech/authz";
 import { collections } from "../utils/firebase";
 import { StoredPlan } from "../types/billing";
+
+// Until subscription billing launches, the free default plan for every audience
+// grants FULL access — all features open and no numeric caps. Derived from the
+// authz catalog so it can never drift from the feature/limit vocabulary. When
+// paid tiers go live, tighten these back to a curated free allowance.
+const ALL_FEATURES = [...FEATURE_KEYS];
+const UNLIMITED_LIMITS = Object.fromEntries(
+  LIMIT_KEYS.map((key) => [key, UNLIMITED])
+) as StoredPlan["limits"];
 
 const PLANS: StoredPlan[] = [
   // ── Client (mobile) ──────────────────────────────────────────────────────
@@ -17,8 +27,9 @@ const PLANS: StoredPlan[] = [
     priceKobo: 0,
     interval: "none",
     isDefault: true,
-    features: ["applications.create", "documents.upload", "news.alerts"],
-    limits: { max_active_applications: 1, max_documents_per_application: 10 },
+    // Free = full access until billing launches.
+    features: ALL_FEATURES,
+    limits: UNLIMITED_LIMITS,
   },
   {
     id: "client_pro",
@@ -48,8 +59,9 @@ const PLANS: StoredPlan[] = [
     priceKobo: 0,
     interval: "none",
     isDefault: true,
-    features: ["applications.create", "documents.upload", "messaging"],
-    limits: { max_active_applications: 5 },
+    // Free = full access until billing launches.
+    features: ALL_FEATURES,
+    limits: UNLIMITED_LIMITS,
   },
   {
     id: "agent_pro",
@@ -77,14 +89,9 @@ const PLANS: StoredPlan[] = [
     priceKobo: 0,
     interval: "none",
     isDefault: true,
-    features: [
-      "applications.create",
-      "documents.upload",
-      "messaging",
-      "consultations.book",
-      "agency.invite_agents",
-    ],
-    limits: { max_active_applications: 25, max_agents: 1 },
+    // Free = full access until billing launches.
+    features: ALL_FEATURES,
+    limits: UNLIMITED_LIMITS,
     seatPriceKobo: 500000, // ₦5,000 per agent seat
   },
   {

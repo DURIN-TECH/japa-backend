@@ -85,6 +85,13 @@ function defineAbilitiesFor(principal, entitlements) {
                 }
             }
         }
+        // Read-only gating: a resolved-but-lapsed subscription (unpaid/expired — any
+        // status outside ACTIVE_SUBSCRIPTION_STATUSES) keeps read access but loses
+        // all writes. Layered last so these `cannot` rules override the role grants.
+        // Skipped when entitlements are omitted/null (RBAC-only / grant-all default).
+        if (entitlements && !types_1.ACTIVE_SUBSCRIPTION_STATUSES.includes(entitlements.status)) {
+            cannot(["create", "update", "delete", "assign", "approve"], "all");
+        }
     }
     return build();
 }

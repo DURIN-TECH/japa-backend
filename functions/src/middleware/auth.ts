@@ -1,7 +1,14 @@
 import { Request, Response, NextFunction } from "express";
 import { auth } from "../utils/firebase";
 import { DecodedIdToken } from "firebase-admin/auth";
-import { AppAbility, AuthzSubject, Entitlements, Role, defineAbilitiesFor } from "@durin-tech/authz";
+import {
+  AppAbility,
+  AuthzSubject,
+  Entitlements,
+  Role,
+  defineAbilitiesFor,
+  isReadOnly,
+} from "@durin-tech/authz";
 import { claimsService } from "../services/claims.service";
 import { entitlementService } from "../services/entitlement.service";
 
@@ -93,6 +100,21 @@ export async function verifyAuth(
     req.user = decodedToken;
     req.userId = decodedToken.uid;
     await attachAuthz(req);
+
+    // Read-only enforcement: a lapsed/unpaid plan may read but not write. Block
+    // mutating methods for non-admin read-only principals; reads pass through.
+    // Single chokepoint for every authenticated route (admins + unresolved
+    // entitlements are never read-only, so nothing blocks before billing exists).
+    const isWrite = !["GET", "HEAD", "OPTIONS"].includes(req.method.toUpperCase());
+    if (isWrite && req.authz?.role !== "admin" && isReadOnly(req.entitlements)) {
+      res.status(402).json({
+        success: false,
+        error: "UPGRADE_REQUIRED",
+        message: "Your plan is read-only. Renew your subscription to make changes.",
+      });
+      return;
+    }
+
     next();
   } catch (error) {
     console.error("Token verification failed:", error);
