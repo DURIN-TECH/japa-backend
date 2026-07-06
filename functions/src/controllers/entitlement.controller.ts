@@ -78,9 +78,12 @@ export class EntitlementController {
   async listPlans(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
       const { audience } = req.query as { audience?: string };
-      let query = collections.plans.orderBy("priceKobo", "asc");
-      if (audience) query = query.where("audience", "==", audience) as typeof query;
-      const snap = await query.get();
+      // where() must precede orderBy() on a different field — Firestore requires a
+      // composite index for this and the index must exist in firestore.indexes.json.
+      const query = audience
+        ? collections.plans.where("audience", "==", audience).orderBy("priceKobo", "asc")
+        : collections.plans.orderBy("priceKobo", "asc");
+      const snap = await (query as FirebaseFirestore.Query).get();
       sendSuccess(res, snap.docs.map((d) => d.data() as Plan));
     } catch (error) {
       console.error("Error listing plans:", error);

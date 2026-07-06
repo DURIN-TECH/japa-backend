@@ -113,6 +113,7 @@ async function main() {
     const { seedNigeriaIrelandEligibility } = await import("../data/eligibility-seed-nigeria-ireland");
     const { seedNewsSources } = await import("../data/seed-news-sources");
     const { seedPlans } = await import("./seed-plans");
+    const { seedSubscriptions } = await import("./seed-subscriptions");
     const { backfillClaims } = await import("./backfill-claims");
 
     // 1. Portal data — creates auth users, agencies, agents, clients,
@@ -136,7 +137,12 @@ async function main() {
     console.log("→ Seeding subscription plans...");
     const plansCount = await seedPlans();
 
-    // 5. RBAC role claims — backfill canonical role (+ agencyId) custom claims for
+    // 5. Subscriptions + entitlements — assign default plans to every seeded entity
+    //    (the agency, all clients). Must run after both portal data and plans exist.
+    console.log("→ Seeding subscriptions & entitlements...");
+    const subCounts = await seedSubscriptions();
+
+    // 6. RBAC role claims — backfill canonical role (+ agencyId) custom claims for
     //    every auth user from the portal data just seeded. Runs last so the agency/
     //    agent docs it reads already exist.
     console.log("→ Backfilling RBAC role claims...");
@@ -170,6 +176,7 @@ async function main() {
     console.log(`  - Sources:         ${newsCount}`);
     console.log("Billing / RBAC:");
     console.log(`  - Plans:           ${plansCount}`);
+    console.log(`  - Subscriptions:   ${subCounts.agency + subCounts.clients} (agency + ${subCounts.clients} clients)`);
     console.log("  - Role claims:     backfilled for all auth users");
     console.log("\nLogin credentials (all seed users): password123");
     console.log("  admin@selitest.com / admin2@selitest.com / owner@selitest.com");

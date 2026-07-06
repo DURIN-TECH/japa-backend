@@ -12,7 +12,7 @@
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log",
     "seed": "npm run build && node lib/scripts/seed-all.js",
-    "seed:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 FIREBASE_AUTH_EMULATOR_HOST=localhost:9099 node lib/scripts/seed-all.js",
+    "seed:emulator": "npm run build && GCLOUD_PROJECT=japa-platform FIRESTORE_EMULATOR_HOST=localhost:8080 FIREBASE_AUTH_EMULATOR_HOST=localhost:9099 node lib/scripts/seed-all.js",
     "seed:dev": "npm run build && node lib/scripts/seed-all.js --project durin-seli-dev",
     "seed:prod": "npm run build && node lib/scripts/seed-all.js --project japa-platform",
     "admin:grant": "npm run build && node lib/scripts/grant-admin.js",

@@ -291,6 +291,22 @@
         { "fieldPath": "countryCodes", "arrayConfig": "CONTAINS" },
         { "fieldPath": "pushEnabled", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "plans",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "audience", "order": "ASCENDING" },
+        { "fieldPath": "priceKobo", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "plans",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "audience", "order": "ASCENDING" },
+        { "fieldPath": "isDefault", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []
