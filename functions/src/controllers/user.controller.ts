@@ -3,14 +3,16 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { userService } from "../services/user.service";
 import { claimsService } from "../services/claims.service";
 import { notificationService } from "../services/notification.service";
-import { Role, packAbility } from "@durin-tech/authz";
+import { Role, ROLES, packAbility } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
   ErrorMessages,
 } from "../utils/response";
 
-const ASSIGNABLE_ROLES: Role[] = ["admin", "owner", "agent", "client"];
+// Roles an admin may assign through the role-management endpoint. Sourced from the
+// shared authz constants (never hardcoded literals) so the list can't drift.
+const ASSIGNABLE_ROLES: Role[] = [ROLES.ADMIN, ROLES.OWNER, ROLES.AGENT, ROLES.CLIENT];
 
 export class UserController {
   /**
@@ -57,10 +59,28 @@ export class UserController {
         return;
       }
       // Owners/agents must carry an agencyId; admin/client must not.
-      const needsAgency = role === "owner" || role === "agent";
+      const needsAgency = role === ROLES.OWNER || role === ROLES.AGENT;
       if (needsAgency && !agencyId) {
         sendError(res, "VALIDATION_ERROR", `agencyId is required for role "${role}"`, 400);
         return;
+      }
+
+      // Last-admin guard: refuse to demote the final admin. Without this, an admin
+      // could change the only remaining admin (possibly themselves) to a lesser role
+      // and lock the whole platform out of every admin-only operation — including this
+      // very endpoint, making recovery a manual break-glass script run. We only pay for
+      // the admin scan when we're actually about to remove admin from a current admin.
+      if (role !== ROLES.ADMIN && (await claimsService.isAdmin(uid))) {
+        const adminCount = await claimsService.countAdmins();
+        if (adminCount <= 1) {
+          sendError(
+            res,
+            "LAST_ADMIN",
+            "Cannot change the role of the last remaining admin. Promote another admin first.",
+            409
+          );
+          return;
+        }
       }
 
       await claimsService.setRoleClaims(uid, role, needsAgency ? agencyId : null);

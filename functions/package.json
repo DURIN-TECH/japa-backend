@@ -15,6 +15,8 @@
     "seed:emulator": "npm run build && FIRESTORE_EMULATOR_HOST=localhost:8080 FIREBASE_AUTH_EMULATOR_HOST=localhost:9099 node lib/scripts/seed-all.js",
     "seed:dev": "npm run build && node lib/scripts/seed-all.js --project durin-seli-dev",
     "seed:prod": "npm run build && node lib/scripts/seed-all.js --project japa-platform",
+    "admin:grant": "npm run build && node lib/scripts/grant-admin.js",
+    "admin:revoke": "npm run build && node lib/scripts/grant-admin.js --revoke",
     "lint": "eslint --ext .ts src/",
     "lint:fix": "eslint --ext .ts src/ --fix",
     "clean": "rm -rf lib",

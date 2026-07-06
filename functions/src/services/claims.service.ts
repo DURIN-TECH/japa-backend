@@ -1,6 +1,6 @@
 import { auth, collections } from "../utils/firebase";
 import { Agent } from "../types";
-import { Role } from "@durin-tech/authz";
+import { Role, ROLES } from "@durin-tech/authz";
 
 /**
  * Claims service — the single source of truth for a user's RBAC role.
@@ -33,6 +33,20 @@ class ClaimsService {
       agencyId: agencyId ?? null,
       admin: role === "admin", // legacy compatibility
     });
+
+    // Keep the legacy Firestore `users/{uid}.admin` field in lockstep with the claim
+    // we just wrote. It's still consulted by resolveRoleFromDb (and any other legacy
+    // reader), and seed data sets it — so an admin created here must carry it, and a
+    // demotion must clear it, or the two admin signals drift. We use update() (not
+    // set/merge) deliberately: it no-ops when the user has no profile doc, so a full
+    // backfill over auth-only users never materializes empty `{admin:false}` docs.
+    // If there's no doc to sync, the custom claim above is authoritative on its own.
+    await collections.users
+      .doc(uid)
+      .update({ admin: role === "admin" })
+      .catch(() => {
+        /* no profile doc yet — claim is authoritative, nothing to sync */
+      });
   }
 
   /** Promote/demote a user to admin (used by the admin role-management endpoint). */
@@ -40,8 +54,11 @@ class ClaimsService {
     if (isAdmin) {
       await this.setRoleClaims(uid, "admin");
     } else {
-      // Drop back to whatever the DB says they otherwise are.
-      const resolved = await this.resolveRoleFromDb(uid);
+      // Real demotion. resolveRoleFromDb(ignoreAdmin) computes the role the user would
+      // have WITHOUT admin — otherwise the still-present admin claim/field would resolve
+      // them straight back to admin. setRoleClaims then rewrites the claim AND clears the
+      // legacy Firestore `admin` field (see there), so no later backfill can re-promote.
+      const resolved = await this.resolveRoleFromDb(uid, { ignoreAdmin: true });
       await this.setRoleClaims(uid, resolved.role, resolved.agencyId);
     }
   }
@@ -52,22 +69,30 @@ class ClaimsService {
    *
    * Precedence: admin (legacy user-doc field or existing claim) > agency member
    * (owner/agent from the `agents` collection) > independent agent > client.
+   *
+   * Pass `ignoreAdmin: true` to skip the admin short-circuit — used by the demotion
+   * path, which needs the role the user would have *without* admin (otherwise the
+   * still-present admin claim/field would resolve them right back to admin).
    */
   async resolveRoleFromDb(
-    uid: string
+    uid: string,
+    opts: { ignoreAdmin?: boolean } = {}
   ): Promise<{ role: Role; agencyId: string | null }> {
-    // 1. Admin — honor the legacy user-doc field or an existing admin claim.
-    try {
-      const [userDoc, authUser] = await Promise.all([
-        collections.users.doc(uid).get(),
-        auth.getUser(uid).catch(() => null),
-      ]);
-      const userData = userDoc.exists ? userDoc.data() : null;
-      if (userData?.admin === true || authUser?.customClaims?.admin === true) {
-        return { role: "admin", agencyId: null };
+    // 1. Admin — honor the legacy user-doc field or an existing admin claim,
+    //    unless the caller explicitly asked us to ignore admin (demotion).
+    if (!opts.ignoreAdmin) {
+      try {
+        const [userDoc, authUser] = await Promise.all([
+          collections.users.doc(uid).get(),
+          auth.getUser(uid).catch(() => null),
+        ]);
+        const userData = userDoc.exists ? userDoc.data() : null;
+        if (userData?.admin === true || authUser?.customClaims?.admin === true) {
+          return { role: "admin", agencyId: null };
+        }
+      } catch {
+        // fall through to agent/client resolution
       }
-    } catch {
-      // fall through to agent/client resolution
     }
 
     // 2. Agent or owner — look up the agents collection.
@@ -90,6 +115,37 @@ class ClaimsService {
     const resolved = await this.resolveRoleFromDb(uid);
     await this.setRoleClaims(uid, resolved.role, resolved.agencyId);
     return resolved;
+  }
+
+  /**
+   * Whether a user currently holds the admin role. Reads the live custom claims
+   * (the source of truth) and honors the legacy `admin` boolean during migration.
+   * Returns false if the user doesn't exist.
+   */
+  async isAdmin(uid: string): Promise<boolean> {
+    const user = await auth.getUser(uid).catch(() => null);
+    const claims = user?.customClaims || {};
+    return claims.role === ROLES.ADMIN || claims.admin === true;
+  }
+
+  /**
+   * Count how many users currently hold the admin role, by paging through every
+   * Firebase Auth user and inspecting their custom claims. Admin claims can't be
+   * queried directly (custom claims aren't indexed), so this is a full scan — fine
+   * because it's only called on the rare admin-demotion path as a last-admin guard.
+   */
+  async countAdmins(): Promise<number> {
+    let count = 0;
+    let nextPageToken: string | undefined;
+    do {
+      const page = await auth.listUsers(1000, nextPageToken);
+      for (const user of page.users) {
+        const claims = user.customClaims || {};
+        if (claims.role === ROLES.ADMIN || claims.admin === true) count++;
+      }
+      nextPageToken = page.pageToken;
+    } while (nextPageToken);
+    return count;
   }
 }
 
