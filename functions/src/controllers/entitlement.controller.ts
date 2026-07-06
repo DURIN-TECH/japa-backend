@@ -278,7 +278,10 @@ export class EntitlementController {
         planId,
         email
       );
-      sendSuccess(res, session, "Checkout started");
+      // A free-plan switch is applied immediately (no redirect); a paid plan
+      // returns a hosted checkout URL to send the user to.
+      const applied = (session as { applied?: boolean }).applied === true;
+      sendSuccess(res, session, applied ? "Plan changed" : "Checkout started");
     } catch (error) {
       const message = (error as Error).message;
       // Client-fixable problems (missing/invalid plan) → 400.

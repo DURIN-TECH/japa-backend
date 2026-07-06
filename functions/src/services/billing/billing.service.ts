@@ -14,6 +14,17 @@ import { StoredPlan } from "../../types/billing";
 import { NotificationType } from "../../types";
 
 /**
+ * Result of a checkout request that required no payment (a free-plan switch).
+ * Distinguished from a `CheckoutSession` by the `applied` flag so the caller
+ * knows the plan is already live and there is no URL to redirect to.
+ */
+export interface AppliedSwitch {
+  applied: true;
+  planId: string;
+  provider: string;
+}
+
+/**
  * Billing service — the bridge between a payment provider and the entitlement
  * layer. Providers are pluggable (default: Paystack); everything downstream only
  * deals with normalized events, so provider details never leak into the rest of
@@ -35,18 +46,42 @@ class BillingService {
   /**
    * Start a checkout for a subscriber + plan. Looks up the plan to get the amount
    * and (optionally) its provider plan code, then delegates to the provider.
+   *
+   * Free plans (priceKobo ≤ 0) are a special case: there is nothing to charge, and
+   * Paystack rejects a zero-amount transaction with "Invalid Amount Sent". So a
+   * move to a free plan (e.g. downgrading from a paid tier) is applied directly —
+   * no checkout redirect — and the caller gets `{ applied: true }` instead of a
+   * hosted checkout URL.
    */
   async createCheckout(
     subscriberType: SubscriberType,
     subscriberId: string,
     planId: string,
     email: string
-  ): Promise<CheckoutSession> {
+  ): Promise<CheckoutSession | AppliedSwitch> {
     const planDoc = await collections.plans.doc(planId).get();
     if (!planDoc.exists) throw new Error("Plan not found");
     const plan = planDoc.data() as StoredPlan;
     if (plan.audience !== subscriberType) {
       throw new Error(`Plan "${planId}" is for ${plan.audience}, not ${subscriberType}`);
+    }
+
+    // ── Free plan: no payment step ────────────────────────────────────────
+    // Cancel any active paid subscription at the provider (so recurring billing
+    // stops), then apply the free plan + recompute entitlements immediately.
+    if (!plan.priceKobo || plan.priceKobo <= 0) {
+      await this.cancelExistingProviderSubscription(subscriberId);
+      await this.applyEvent({
+        type: "updated",
+        subscriberType,
+        subscriberId,
+        planId,
+        status: "active",
+        currentPeriodEnd: null,
+        provider: "manual",
+        providerRef: null,
+      });
+      return { applied: true, planId, provider: "manual" };
     }
 
     return this.provider.createCheckout({
@@ -57,6 +92,24 @@ class BillingService {
       amountKobo: plan.priceKobo,
       metadata: plan.paystackPlanCode ? { paystackPlanCode: plan.paystackPlanCode } : undefined,
     });
+  }
+
+  /**
+   * Best-effort cancellation of a subscriber's existing paid subscription at the
+   * provider — used when they switch to a free plan so recurring charges stop.
+   * Never throws: the local plan switch must succeed even if the remote cancel
+   * fails (e.g. already canceled, or no provider ref on record).
+   */
+  private async cancelExistingProviderSubscription(subscriberId: string): Promise<void> {
+    try {
+      const snap = await collections.subscriptions.doc(subscriberId).get();
+      const sub = snap.data() as Subscription | undefined;
+      if (sub?.providerRef && sub.provider === this.provider.name) {
+        await this.provider.cancelSubscription(sub.providerRef);
+      }
+    } catch (e) {
+      console.error("[billing] provider cancel on downgrade failed (continuing):", e);
+    }
   }
 
   /**
