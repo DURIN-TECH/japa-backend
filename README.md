@@ -275,6 +275,51 @@ npm run seed:news:emulator     # News sources only
 npm run seed:emulator          # Eligibility questions only
 ```
 
+### Seeding a real project (dev / prod) — use a service account
+
+`seed:dev` / `seed:prod` run the **full** seed against a live Firebase project
+(`durin-seli-dev` / `japa-platform`). Two gotchas:
+
+**1. Authenticate with a service account, not user ADC.** The seed creates Auth
+users (`identitytoolkit`). With user credentials (`gcloud auth
+application-default login`) that call fails with:
+
+```
+FirebaseAuthError: ... identitytoolkit.googleapis.com API requires a quota
+project, which is not set by default.
+```
+
+firebase-admin's Auth client does **not** apply the ADC quota project, so
+`gcloud auth application-default set-quota-project` does **not** fix it. Use a
+service account with the `firebase.admin` role instead — its own project is the
+quota consumer, so it just works:
+
+```bash
+cd functions
+
+# One-off: create a key for an existing SA (e.g. the CI deployer)
+gcloud iam service-accounts keys create /tmp/seli-dev-sa.json \
+  --iam-account=ci-deployer@durin-seli-dev.iam.gserviceaccount.com
+#   (list SAs with: gcloud iam service-accounts list --project durin-seli-dev)
+
+# Run the full seed with the SA
+GOOGLE_APPLICATION_CREDENTIALS=/tmp/seli-dev-sa.json npm run seed:dev
+# prod is guarded:  GOOGLE_APPLICATION_CREDENTIALS=... npm run seed:prod -- --confirm-prod
+```
+
+Delete the key when done (`rm /tmp/seli-dev-sa.json`).
+
+**2. Changing plan features requires the full seed, not just `seed-plans`.**
+Entitlements are **cached** per subscriber (`entitlements/{subscriberId}`), and
+`attachAuthz` reads that cache. Re-seeding only the `plans` collection updates
+the plan definitions but leaves the stale cache in place, so accounts won't see
+the change. `seed:dev`/`seed:prod` recompute the cache (the "subscriptions &
+entitlements" step) — so run the **full** seed after editing `seed-plans.ts`
+(e.g. the free-plan feature list), not `node lib/scripts/seed-plans.js` alone.
+
+> After seeding, deploy code changes separately:
+> `firebase deploy --only functions --project durin-seli-dev`.
+
 ### What Gets Created
 
 The portal seed creates:
