@@ -281,8 +281,22 @@ export class EntitlementController {
       sendSuccess(res, session, "Checkout started");
     } catch (error) {
       const message = (error as Error).message;
-      if (message === "Plan not found" || message.startsWith("Plan ") || message.includes("PAYSTACK")) {
+      // Client-fixable problems (missing/invalid plan) → 400.
+      if (message === "Plan not found" || message.startsWith("Plan ")) {
         sendError(res, "VALIDATION_ERROR", message, 400);
+        return;
+      }
+      // Upstream billing-provider failure (bad/misconfigured key, Paystack down,
+      // charge rejected). The full provider detail goes to logs; the client gets a
+      // safe message + 502 (Bad Gateway) rather than a misleading 400 or naked 500.
+      if (message.startsWith("PAYSTACK_ERROR") || message.includes("PAYSTACK")) {
+        console.error("Paystack checkout failed:", message);
+        sendError(
+          res,
+          "BILLING_PROVIDER_ERROR",
+          "Payment provider is temporarily unavailable. Please try again shortly.",
+          502
+        );
         return;
       }
       console.error("Error creating checkout:", error);

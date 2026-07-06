@@ -37,11 +37,36 @@ export class PaystackProvider implements BillingProvider {
     return process.env.PAYSTACK_CALLBACK_URL;
   }
 
+  /**
+   * Axios client bound to Paystack with the secret key. A response interceptor
+   * normalizes every non-2xx / network failure into a single classified error
+   * (`PAYSTACK_ERROR: …`) that carries Paystack's own status + message. This means
+   * a bad/misconfigured secret ("Invalid key"), a rejected charge, or a Paystack
+   * outage surfaces as a recognizable provider error the controller can map to a
+   * clean 502 — instead of a raw AxiosError bubbling up as a naked 500 whose cause
+   * is invisible from the portal.
+   */
   private client() {
-    return axios.create({
+    const instance = axios.create({
       baseURL: PAYSTACK_BASE,
       headers: { Authorization: `Bearer ${this.secretKey}` },
     });
+    instance.interceptors.response.use(
+      (res) => res,
+      (err) => {
+        // Prefer Paystack's structured error body; fall back to the axios message.
+        const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+        const providerMsg =
+          (axios.isAxiosError(err) &&
+            (err.response?.data as { message?: string } | undefined)?.message) ||
+          (err as Error)?.message ||
+          "unknown error";
+        throw new Error(
+          `PAYSTACK_ERROR: ${providerMsg}${status ? ` (HTTP ${status})` : ""}`
+        );
+      }
+    );
+    return instance;
   }
 
   /**
