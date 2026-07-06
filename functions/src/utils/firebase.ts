@@ -4,19 +4,56 @@ import { FieldValue } from "firebase-admin/firestore";
 // Initialize Firebase Admin SDK
 // When deployed to Cloud Functions, credentials are auto-detected.
 //
-// We pass `storageBucket` explicitly because StorageService now resolves the
-// default bucket via `getStorage().bucket()` (no hardcoded name). Relying on the
-// auto-detected `FIREBASE_CONFIG.storageBucket` is NOT safe for this project: it
-// resolves to the legacy `<project>.appspot.com` form (`japa-platform.appspot.com`),
-// but this project's real bucket uses the post-Oct-2024 naming convention
-// (`japa-platform.firebasestorage.app`). Without this, every signed-URL/upload
-// call targets a non-existent bucket and fails across all clients.
+// We pass `storageBucket` explicitly because StorageService resolves the default
+// bucket via `getStorage().bucket()` (no hardcoded name). Two things we must NOT
+// rely on for the bucket id:
+//   1. The auto-detected `FIREBASE_CONFIG.storageBucket` — it resolves to the
+//      legacy `<project>.appspot.com` form, but this project's real bucket uses
+//      the post-Oct-2024 convention `<project>.firebasestorage.app`.
+//   2. A hardcoded project name — a hardcoded `japa-platform.firebasestorage.app`
+//      fallback meant the DEV backend (durin-seli-dev) minted signed upload URLs
+//      pointing at the PROD bucket, so uploads failed (CORS / cross-project auth)
+//      and any that slipped through would have written dev data into prod storage.
 //
-// The value is overridable via `FIREBASE_STORAGE_BUCKET` (e.g. for staging).
+// Instead we derive the bucket from THIS runtime's project id — exactly what the
+// seed/grant scripts do (`${projectId}.firebasestorage.app`). The Cloud Functions
+// runtime always exposes the active project via GCLOUD_PROJECT / GOOGLE_CLOUD_PROJECT
+// (and, as a last resort, FIREBASE_CONFIG.projectId). This is correct in every
+// environment with zero per-project config.
+//
+// Still overridable via `FIREBASE_STORAGE_BUCKET` (e.g. a staging-only bucket).
+function resolveStorageBucket(): string {
+  // Explicit override always wins.
+  if (process.env.FIREBASE_STORAGE_BUCKET) {
+    return process.env.FIREBASE_STORAGE_BUCKET;
+  }
+
+  // Active project id, from the standard runtime env vars first.
+  let projectId =
+    process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "";
+
+  // Fall back to FIREBASE_CONFIG.projectId (set by the Functions runtime/emulator).
+  if (!projectId && process.env.FIREBASE_CONFIG) {
+    try {
+      projectId = JSON.parse(process.env.FIREBASE_CONFIG).projectId || "";
+    } catch {
+      // Malformed FIREBASE_CONFIG — leave projectId empty and fail loudly below.
+    }
+  }
+
+  if (!projectId) {
+    throw new Error(
+      "Cannot resolve storage bucket: no project id in GCLOUD_PROJECT / " +
+        "GOOGLE_CLOUD_PROJECT / FIREBASE_CONFIG, and FIREBASE_STORAGE_BUCKET is unset."
+    );
+  }
+
+  return `${projectId}.firebasestorage.app`;
+}
+
 if (!admin.apps.length) {
   admin.initializeApp({
-    storageBucket:
-      process.env.FIREBASE_STORAGE_BUCKET || "japa-platform.firebasestorage.app",
+    storageBucket: resolveStorageBucket(),
   });
 }
 
