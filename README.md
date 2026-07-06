@@ -266,14 +266,18 @@ Additional clients (jane.smith, ahmed.ali, etc.) are also seeded for case data.
 ```bash
 cd functions
 
-# Seed everything (auth users + all Firestore data)
-npm run seed:portal:emulator
-
-# Seed individually
-npm run seed:auth:emulator     # Auth users only
-npm run seed:news:emulator     # News sources only
-npm run seed:emulator          # Eligibility questions only
+# Seed everything (auth users + all Firestore data) into the running emulators
+npm run seed:emulator
 ```
+
+**The emulator seed must run under the project the emulators + portal use.** The
+Firestore emulator namespaces data per project: this repo's emulators run as
+`japa-platform` (`.firebaserc` `default`) and the portal points at
+`localhost:5001/japa-platform/…`. `seed:emulator` therefore pins
+`GCLOUD_PROJECT=japa-platform`; without it, `seed-all` falls back to `demo-seli`
+and the data lands in a namespace the Emulator UI + portal never read — the seed
+"succeeds" but nothing shows. Start the emulators first
+(`firebase emulators:start`), then seed.
 
 ### Seeding a real project (dev / prod) — use a service account
 
