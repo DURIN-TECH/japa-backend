@@ -10,6 +10,13 @@ export interface StoredPlan extends Plan {
   description?: string;
   /** Maps this package to a Paystack plan code (enables recurring subscriptions). */
   paystackPlanCode?: string | null;
+  /**
+   * Groups a tier's monthly + yearly variants so the upgrade UI can pair them
+   * (e.g. show a "Save X%" badge and a Monthly/Yearly toggle). Both the `agent_pro`
+   * (monthly) and `agent_pro_yearly` (yearly) plans share `billingGroup: "agent_pro"`.
+   * Purely a display/pairing hint — the entitlement layer ignores it.
+   */
+  billingGroup?: string;
   /** Cost per agent seat (agency plans) — the owner pays this per agent added. */
   seatPriceKobo?: number;
   /** Hidden from upgrade screens / un-purchasable when false (defaults to true). */

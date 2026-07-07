@@ -66,6 +66,12 @@ function validatePlanInput(body: Record<string, unknown>): { plan?: Omit<StoredP
       seatPriceKobo:
         typeof body.seatPriceKobo === "number" ? body.seatPriceKobo : undefined,
       sortOrder: typeof body.sortOrder === "number" ? body.sortOrder : 0,
+      // Pairs monthly/yearly variants of the same tier for the upgrade UI. Optional;
+      // omitted (undefined) when the admin leaves it blank so we don't store empties.
+      billingGroup:
+        typeof body.billingGroup === "string" && body.billingGroup.trim()
+          ? body.billingGroup.trim()
+          : undefined,
     },
   };
 }
