@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 
 // Route modules
-import { userRoutes } from "./routes/user.routes";
+import { userRoutes, adminUsersRouter } from "./routes/user.routes";
 import { countryRoutes, visaSearchRoutes, adminVisaRoutes } from "./routes/visa.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
@@ -76,6 +76,7 @@ app.use("/admin/visas", adminVisaRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);
+app.use("/admin/users", adminUsersRouter);
 
 // Error handling
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
