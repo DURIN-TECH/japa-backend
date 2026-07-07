@@ -63,7 +63,7 @@ japa-backend/
 
 ### Prerequisites
 
-- Node.js 20 (required by `engines` in `package.json`)
+- Node.js 22 (required by `engines` in `package.json` / the Cloud Functions runtime)
 - Firebase CLI: `npm install -g firebase-tools`
 
 ### Quick Start (recommended)
@@ -398,19 +398,51 @@ npm run deploy           # Deploy to Firebase
 
 ## Deployment
 
+Three environments — **local** (emulators), **dev/staging** (`durin-seli-dev`), and
+**prod** (`japa-platform`). Deploys are **push-to-branch** via GitHub Actions:
+
+| Push to | Deploys to | Workflow |
+|---------|-----------|----------|
+| `dev` | `durin-seli-dev` | `.github/workflows/deploy-dev.yml` |
+| `main` | `japa-platform` | `.github/workflows/deploy-prod.yml` |
+
+Each workflow lints, builds, and runs `firebase deploy --project <alias>` (aliases in
+`.firebaserc`: `dev` → durin-seli-dev, `default`/`prod` → japa-platform). See the
+meta-repo **`ENVIRONMENTS.md`** for the full runbook (one-time project setup, App
+Hosting, CI auth gotchas). Manual deploy is still available when needed:
+
 ```bash
-# Deploy everything
-firebase deploy
-
-# Deploy only functions
-firebase deploy --only functions
-
-# Deploy only rules
-firebase deploy --only firestore:rules,storage:rules
-
-# Deploy only indexes
-firebase deploy --only firestore:indexes
+firebase deploy --only functions --project dev    # or: default (prod)
+firebase deploy --only firestore:rules,storage:rules --project dev
+firebase deploy --only firestore:indexes --project dev
 ```
+
+## Secrets & Configuration
+
+Runtime secrets are **Cloud Secret Manager** entries, bound to functions via
+`.runWith({ secrets: [...] })` in `src/index.ts` — never committed to git. They
+**bind at deploy time**: after changing a secret's value you must redeploy (push the
+branch, or `firebase deploy --only functions`) for functions to pick up the new
+version.
+
+| Secret | Used by | Notes |
+|--------|---------|-------|
+| `PAYSTACK_SECRET_KEY` | billing / checkout | `sk_test_…` on dev, `sk_live_…` on prod |
+| `PAYSTACK_CALLBACK_URL` | billing | **portal** URL Paystack redirects to after payment — points at `<portal>/account-settings`, *not* a backend endpoint (see Payments below) |
+| `PAYSTACK_PUBLIC_KEY` | portal (client) | not bound to functions; used for inline checkout |
+| `RESEND_API_KEY` | email | Resend API key (`re_…`) |
+| `EMAIL_FROM` | email | verified sender, e.g. `Seli <info@weareseli.com>` |
+
+Set/rotate a value (per project):
+
+```bash
+printf '%s' 'sk_test_XXXX' \
+  | gcloud secrets versions add PAYSTACK_SECRET_KEY --project durin-seli-dev --data-file=-
+# then redeploy so functions bind the new version
+```
+
+Locally (emulators) these are read from `functions/.env` (see `.env.example`); an
+unset secret is safe — email/billing degrade rather than crash (see below).
 
 ## Authorization & Entitlements
 
@@ -432,6 +464,39 @@ Authorization uses the shared **`@durin-tech/authz`** package (private GitHub Pa
 Install needs a GitHub Packages token: `NODE_AUTH_TOKEN="$(gh auth token)" npm install` (the committed
 `.npmrc` reads it). See [`todo.md`](./todo.md) for deploy secrets, Paystack config, and the Firebase
 Functions build-token caveat.
+
+### Payments flow (Paystack)
+
+The subscription **upgrade/downgrade** flow (`POST /subscriptions/checkout`):
+
+1. **Free plan** (`priceKobo <= 0`, e.g. a downgrade to the free tier) — there is
+   nothing to charge and Paystack rejects a zero amount (`Invalid Amount Sent`), so
+   the backend **skips Paystack**: it cancels any active paid subscription at the
+   provider (stops recurring billing), applies the plan + recomputes entitlements
+   immediately, and returns `{ applied: true }` (no redirect).
+2. **Paid plan** — the backend initializes a Paystack transaction and returns a hosted
+   `{ url }`. The **portal** redirects the browser there.
+3. After payment Paystack redirects the **browser** back to `PAYSTACK_CALLBACK_URL`,
+   which is a **portal** page (`<portal>/account-settings?reference=…`) — *not* a
+   backend endpoint. The portal reads the `reference` and calls `POST /subscriptions/verify`
+   to confirm + apply (verify-on-return).
+4. `POST /webhooks/paystack` is the authoritative server-to-server confirmation
+   (both verify and webhook are idempotent).
+
+Provider failures (bad/misconfigured key, Paystack down, rejected charge) are
+normalized by the provider into a `PAYSTACK_ERROR: <msg> (HTTP <status>)` and
+surfaced by `createCheckout` as a clean **502** (detail logged), not a naked 500.
+
+Test card (Paystack test mode): `4084 0840 8408 4081`, any future expiry, any CVV.
+
+### Transactional email (Resend)
+
+Email goes through a provider interface (`services/email/`, default **Resend**).
+It's **safe-rollout**: until `RESEND_API_KEY` + `EMAIL_FROM` are set the channel is
+skipped (logged, not thrown). A `403` from Resend means the `EMAIL_FROM` domain
+isn't verified in Resend — verify the sending domain (dev uses `weareseli.com`,
+sender `info@weareseli.com`). On deployed environments `NODE_ENV=production`, so the
+`EMAIL_FROM_DEV_OVERRIDE` (local-only `onboarding@resend.dev` fallback) is inert.
 
 ## License
 
