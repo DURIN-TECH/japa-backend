@@ -37,6 +37,7 @@ const PLANS: StoredPlan[] = [
     audience: "client",
     priceKobo: 250000, // ₦2,500 / month
     interval: "month",
+    billingGroup: "client_pro",
     features: [
       "applications.create",
       "documents.upload",
@@ -69,6 +70,7 @@ const PLANS: StoredPlan[] = [
     audience: "agent",
     priceKobo: 1000000, // ₦10,000 / month
     interval: "month",
+    billingGroup: "agent_pro",
     features: [
       "applications.create",
       "applications.bulk",
@@ -100,6 +102,7 @@ const PLANS: StoredPlan[] = [
     audience: "agency",
     priceKobo: 2500000, // ₦25,000 / month
     interval: "month",
+    billingGroup: "agency_standard",
     features: [
       "applications.create",
       "documents.upload",
@@ -117,6 +120,7 @@ const PLANS: StoredPlan[] = [
     audience: "agency",
     priceKobo: 5000000, // ₦50,000 / month
     interval: "month",
+    billingGroup: "agency_pro",
     features: [
       "applications.create",
       "applications.bulk",
@@ -138,6 +142,7 @@ const PLANS: StoredPlan[] = [
     audience: "client",
     priceKobo: 100000, // ₦1,000 / month
     interval: "month",
+    billingGroup: "client_standard",
     features: ["applications.create", "documents.upload", "messaging", "news.alerts"],
     limits: { max_active_applications: 3, max_documents_per_application: 25 },
   },
@@ -147,6 +152,7 @@ const PLANS: StoredPlan[] = [
     audience: "agent",
     priceKobo: 500000, // ₦5,000 / month
     interval: "month",
+    billingGroup: "agent_standard",
     features: [
       "applications.create",
       "documents.upload",
@@ -159,17 +165,48 @@ const PLANS: StoredPlan[] = [
 ];
 
 /**
+ * Discount applied to yearly plans, expressed as the number of months charged for a
+ * full year. 10% off 12 months → pay for 10.8 months. Yearly priceKobo is derived
+ * from the monthly variant so the two can never drift.
+ */
+const YEARLY_MONTHS_CHARGED = 10.8; // 12 × (1 − 0.10)
+
+/**
+ * Derive a discounted yearly plan for every paid monthly plan that declares a
+ * `billingGroup`. The yearly variant keeps the same audience/features/limits/seat
+ * pricing and shares the `billingGroup` so the upgrade UI can pair them and show the
+ * discount. Free/`interval: "none"` plans are skipped (nothing to bill yearly).
+ */
+function buildYearlyVariants(monthlyPlans: StoredPlan[]): StoredPlan[] {
+  return monthlyPlans
+    .filter((p) => p.interval === "month" && p.priceKobo > 0 && p.billingGroup)
+    .map((p) => ({
+      ...p,
+      id: `${p.id}_yearly`,
+      name: `${p.name} (Yearly)`,
+      interval: "year" as const,
+      // 10% cheaper than paying monthly for a year, rounded to whole kobo.
+      priceKobo: Math.round(p.priceKobo * YEARLY_MONTHS_CHARGED),
+      // A yearly variant is never the free default for its audience.
+      isDefault: false,
+    }));
+}
+
+/** Monthly (source) plans + their derived yearly variants — the full catalog to seed. */
+const ALL_PLANS: StoredPlan[] = [...PLANS, ...buildYearlyVariants(PLANS)];
+
+/**
  * Upsert all subscription plans. Exported so the consolidated `seed-all` can run it
  * in-process; also runnable standalone (see the guard below). Returns the count.
  */
 export async function seedPlans(): Promise<number> {
-  console.log(`Seeding ${PLANS.length} plans…`);
-  for (const plan of PLANS) {
+  console.log(`Seeding ${ALL_PLANS.length} plans…`);
+  for (const plan of ALL_PLANS) {
     await collections.plans.doc(plan.id).set(plan, { merge: true });
     console.log(`  ✓ ${plan.id} (${plan.audience}) — ${plan.features.length} features`);
   }
   console.log("Done seeding plans.");
-  return PLANS.length;
+  return ALL_PLANS.length;
 }
 
 // Allow `node lib/scripts/seed-plans.js` to still run it directly.

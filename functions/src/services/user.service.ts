@@ -1,6 +1,36 @@
-import { collections, serverTimestamp } from "../utils/firebase";
-import { User, Address } from "../types";
+import { collections, serverTimestamp, auth } from "../utils/firebase";
+import { User, Address, Agency } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
+import { Role, Subscription } from "@durin-tech/authz";
+import { StoredPlan } from "../types/billing";
+
+/**
+ * Flattened admin view of a user, joining Firebase Auth (identity + role claims +
+ * account timestamps) with Firestore (`users` profile, `subscriptions`/`plans`,
+ * `agencies`). Dates are ISO strings so the portal can render them directly.
+ */
+export interface AdminUserRow {
+  uid: string;
+  email: string | null;
+  emailVerified: boolean;
+  disabled: boolean;
+  firstName: string;
+  lastName: string;
+  phone: string | null;
+  /** RBAC role from custom claims (null if the account has no role claim yet). */
+  role: Role | null;
+  agencyId: string | null;
+  agencyName: string | null;
+  onboardingCompleted: boolean;
+  isProvisional: boolean;
+  planId: string | null;
+  planName: string | null;
+  subscriptionStatus: string | null;
+  /** Account creation time (Firebase Auth metadata), ISO. */
+  createdAt: string | null;
+  /** Last sign-in time (Firebase Auth metadata), ISO. */
+  lastLoginAt: string | null;
+}
 
 export interface CreateUserInput {
   email: string;
@@ -244,6 +274,90 @@ class UserService {
   async hasCompletedOnboarding(userId: string): Promise<boolean> {
     const user = await this.getUserById(userId);
     return user?.onboardingCompleted ?? false;
+  }
+
+  /**
+   * List every user for the admin directory. Firebase Auth is the primary source —
+   * it's the only place that has the RBAC role (custom claims) and the account
+   * creation / last-sign-in timestamps for *all* accounts, including provisional or
+   * auth-only ones with no profile doc. Each auth record is then enriched from
+   * Firestore.
+   *
+   * The enrichment collections (`users`, `agencies`, `subscriptions`, `plans`) are
+   * each fetched once and indexed in memory, so the whole join costs a handful of
+   * reads regardless of user count (no per-user round-trips).
+   */
+  async listAllUsers(): Promise<AdminUserRow[]> {
+    // 1. Page through all Firebase Auth accounts (1000 max per page).
+    const authUsers: import("firebase-admin/auth").UserRecord[] = [];
+    let pageToken: string | undefined;
+    do {
+      const page = await auth.listUsers(1000, pageToken);
+      authUsers.push(...page.users);
+      pageToken = page.pageToken;
+    } while (pageToken);
+
+    // 2. Load the enrichment collections once and index them for O(1) lookups.
+    const [userSnap, agencySnap, subSnap, planSnap] = await Promise.all([
+      collections.users.get(),
+      collections.agencies.get(),
+      collections.subscriptions.get(),
+      collections.plans.get(),
+    ]);
+
+    const userDocs = new Map<string, User>();
+    userSnap.forEach((d) => userDocs.set(d.id, d.data() as User));
+
+    const agencyNames = new Map<string, string>();
+    agencySnap.forEach((d) => agencyNames.set(d.id, (d.data() as Agency).name));
+
+    // Subscriptions are keyed by subscriberId (agency id for owner/agent, uid for
+    // agent-without-agency / client).
+    const subsBySubscriber = new Map<string, Subscription>();
+    subSnap.forEach((d) => subsBySubscriber.set(d.id, d.data() as Subscription));
+
+    const planNames = new Map<string, string>();
+    planSnap.forEach((d) => planNames.set(d.id, (d.data() as StoredPlan).name));
+
+    // 3. Join each auth record with its Firestore enrichment.
+    return authUsers.map((au) => {
+      const claims = (au.customClaims ?? {}) as { role?: Role; agencyId?: string | null };
+      const role = claims.role ?? null;
+      const agencyId = claims.agencyId ?? null;
+      const profile = userDocs.get(au.uid);
+
+      // Resolve the subscriber this user bills under (mirrors
+      // entitlementService.resolveSubscriber): agency for owner/agent-with-agency,
+      // else the user's own uid.
+      const subscriberId =
+        (role === "owner" || role === "agent") && agencyId ? agencyId : au.uid;
+      const sub = subsBySubscriber.get(subscriberId);
+
+      return {
+        uid: au.uid,
+        email: au.email ?? profile?.email ?? null,
+        emailVerified: au.emailVerified,
+        disabled: au.disabled,
+        firstName: profile?.firstName ?? "",
+        lastName: profile?.lastName ?? "",
+        phone: profile?.phone ?? null,
+        role,
+        agencyId,
+        agencyName: agencyId ? agencyNames.get(agencyId) ?? null : null,
+        onboardingCompleted: profile?.onboardingCompleted ?? false,
+        isProvisional: profile?.isProvisional ?? false,
+        planId: sub?.planId ?? null,
+        planName: sub?.planId ? planNames.get(sub.planId) ?? null : null,
+        subscriptionStatus: sub?.status ?? null,
+        // Firebase Auth metadata timestamps are RFC-1123 strings; normalize to ISO.
+        createdAt: au.metadata.creationTime
+          ? new Date(au.metadata.creationTime).toISOString()
+          : null,
+        lastLoginAt: au.metadata.lastSignInTime
+          ? new Date(au.metadata.lastSignInTime).toISOString()
+          : null,
+      };
+    });
   }
 }
 
