@@ -1,6 +1,7 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { userService } from "../services/user.service";
+import { storageService } from "../services/storage.service";
 import { claimsService } from "../services/claims.service";
 import { notificationService } from "../services/notification.service";
 import { Role, ROLES, packAbility } from "@durin-tech/authz";
@@ -13,6 +14,11 @@ import {
 // Roles an admin may assign through the role-management endpoint. Sourced from the
 // shared authz constants (never hardcoded literals) so the list can't drift.
 const ASSIGNABLE_ROLES: Role[] = [ROLES.ADMIN, ROLES.OWNER, ROLES.AGENT, ROLES.CLIENT];
+
+// Image MIME types accepted for a user's profile photo (avatar). Restricted to
+// the raster formats that render reliably in <img> — no SVG (XSS surface) and no
+// HEIC (browsers can't display it inline).
+const ALLOWED_PHOTO_CONTENT_TYPES = ["image/png", "image/jpeg", "image/webp"];
 
 export class UserController {
   /**
@@ -107,6 +113,21 @@ export class UserController {
   }
 
   /**
+   * GET /admin/users  (admin only)
+   * List every user with their joined details (identity, role, agency, plan,
+   * status, timestamps) for the admin directory.
+   */
+  async listAllUsers(_req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const users = await userService.listAllUsers();
+      sendSuccess(res, users);
+    } catch (error) {
+      console.error("Error listing all users:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * GET /users/me
    * Get current authenticated user's profile
    */
@@ -154,6 +175,92 @@ export class UserController {
       sendSuccess(res, updatedUser, "Profile updated successfully");
     } catch (error) {
       console.error("Error updating user profile:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /users/me/photo/upload-url
+   * Mint a short-lived signed URL the client uses to PUT the profile photo
+   * directly to Cloud Storage. Finalized via POST /users/me/photo afterwards.
+   */
+  async getPhotoUploadUrl(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { fileName, contentType } = req.body;
+
+      if (!fileName || !contentType) {
+        sendError(res, "VALIDATION_ERROR", "fileName and contentType are required", 400);
+        return;
+      }
+
+      // Reject anything that isn't an allowed image type before minting a URL.
+      if (!ALLOWED_PHOTO_CONTENT_TYPES.includes(contentType)) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          `Invalid content type. Allowed: ${ALLOWED_PHOTO_CONTENT_TYPES.join(", ")}`,
+          400
+        );
+        return;
+      }
+
+      const result = await storageService.getSignedProfilePhotoUploadUrl(
+        userId,
+        fileName,
+        contentType
+      );
+
+      sendSuccess(res, result);
+    } catch (error) {
+      console.error("Error getting profile photo upload URL:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /users/me/photo
+   * Finalize a profile photo upload: confirm the file exists, verify it lives
+   * under this user's own profile prefix, make it publicly readable, and persist
+   * the durable public URL onto the user. Returns the updated user profile.
+   */
+  async setPhoto(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { storagePath } = req.body;
+
+      if (!storagePath) {
+        sendError(res, "VALIDATION_ERROR", "storagePath is required", 400);
+        return;
+      }
+
+      // Guard against registering a path that isn't theirs — the path must live
+      // under this user's own profile prefix.
+      if (!storagePath.startsWith(`users/${userId}/profile/`)) {
+        sendError(res, "VALIDATION_ERROR", "storagePath does not belong to this user", 400);
+        return;
+      }
+
+      // Confirm the client actually completed the upload.
+      const exists = await storageService.fileExists(storagePath);
+      if (!exists) {
+        sendError(res, "VALIDATION_ERROR", "File not found at the specified path", 400);
+        return;
+      }
+
+      // Make the object public and capture its stable URL for persistent rendering
+      // (avatars appear in the header/sidebar on every page, so a short-lived
+      // signed download URL would expire — mirrors the agency-logo flow).
+      const profilePhotoUrl = await storageService.makeFilePublic(storagePath);
+
+      const updatedUser = await userService.updateUser(userId, { profilePhotoUrl });
+
+      sendSuccess(res, updatedUser, "Profile photo updated successfully");
+    } catch (error) {
+      console.error("Error setting profile photo:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

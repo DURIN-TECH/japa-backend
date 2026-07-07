@@ -130,6 +130,49 @@ export class StorageService {
   }
 
   /**
+   * Generate a signed upload URL for a user's profile photo (avatar).
+   *
+   * Mirrors the agency-logo flow: the client PUTs the image directly to this
+   * short-lived URL, then calls the register endpoint which makes the object
+   * public and persists the durable URL onto the user's profile.
+   *
+   * Stored under `users/{userId}/profile/…` — the location the storage.rules
+   * already scope to the owner (public read), keeping the object path consistent
+   * with the rest of the project.
+   */
+  async getSignedProfilePhotoUploadUrl(
+    userId: string,
+    fileName: string,
+    contentType: string
+  ): Promise<{
+    uploadUrl: string;
+    storagePath: string;
+    expiresAt: Date;
+  }> {
+    const fileId = randomUUID();
+    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
+    const storagePath = `users/${userId}/profile/${fileId}_${sanitizedFileName}`;
+
+    const file = this.bucket.file(storagePath);
+
+    // Short-lived (15 min) write URL — only enough time to complete the upload.
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    const [uploadUrl] = await file.getSignedUrl({
+      version: "v4",
+      action: "write",
+      expires: expiresAt,
+      contentType,
+    });
+
+    return {
+      uploadUrl,
+      storagePath,
+      expiresAt,
+    };
+  }
+
+  /**
    * Mint a durable, publicly-fetchable download URL for an uploaded object.
    *
    * Agency logos are rendered persistently in the portal chrome (sidebar) on
