@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { agencyController } from "../controllers/agency.controller";
+import { complianceController } from "../controllers/compliance.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
 import { requireFeature } from "../middleware/authz";
 import { FEATURES } from "@durin-tech/authz";
@@ -25,6 +26,24 @@ agencyRoutes.post("/me/logo", verifyAuth, (req, res) =>
   agencyController.setLogo(req, res)
 );
 
+// Agency compliance (KYC/KYB/payout) — owner only. All are 3-segment
+// "/me/compliance..." paths, defined before "/:id" so they can't be shadowed.
+agencyRoutes.get("/me/compliance", verifyAuth, (req, res) =>
+  complianceController.getMyCompliance(req, res)
+);
+agencyRoutes.put("/me/compliance", verifyAuth, (req, res) =>
+  complianceController.updateMyCompliance(req, res)
+);
+agencyRoutes.post("/me/compliance/upload-url", verifyAuth, (req, res) =>
+  complianceController.getUploadUrl(req, res)
+);
+agencyRoutes.post("/me/compliance/documents", verifyAuth, (req, res) =>
+  complianceController.registerDocument(req, res)
+);
+agencyRoutes.post("/me/compliance/submit", verifyAuth, (req, res) =>
+  complianceController.submitForReview(req, res)
+);
+
 agencyRoutes.post("/", verifyAuth, (req, res) =>
   agencyController.createAgency(req, res)
 );
@@ -47,6 +66,14 @@ agencyRoutes.get("/:id/review", verifyAuth, verifyAdmin, (req, res) =>
 // Admin: approve/reject agency
 agencyRoutes.put("/:id/approval", verifyAuth, verifyAdmin, (req, res) =>
   agencyController.updateAgencyApproval(req, res)
+);
+
+// Admin: review + decide agency compliance (KYC/KYB/payout)
+agencyRoutes.get("/:id/compliance", verifyAuth, verifyAdmin, (req, res) =>
+  complianceController.getComplianceForReview(req, res)
+);
+agencyRoutes.put("/:id/compliance/decision", verifyAuth, verifyAdmin, (req, res) =>
+  complianceController.decide(req, res)
 );
 
 // Agency members

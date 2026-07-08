@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { paymentRequestController } from "../controllers/payment-request.controller";
 import { verifyAuth } from "../middleware/auth";
-import { requireFeature } from "../middleware/authz";
+import { requireFeature, requireAgencyVerified } from "../middleware/authz";
 import { FEATURES } from "@durin-tech/authz";
 
 // Routes mounted at /payment-requests
@@ -12,9 +12,16 @@ paymentRequestRoutes.get("/", verifyAuth, (req, res) =>
   paymentRequestController.getPaymentRequests(req, res)
 );
 
-// Create payment request — gated by the "payments.request" entitlement (agent action)
-paymentRequestRoutes.post("/", verifyAuth, requireFeature(FEATURES.PAYMENTS_REQUEST), (req, res) =>
-  paymentRequestController.createPaymentRequest(req, res)
+// Create payment request — gated by (1) the "payments.request" entitlement AND
+// (2) agency compliance. An unverified agency can manage its own clients but may
+// not make/receive payments on the platform, so requesting funds is blocked
+// until KYC/KYB verification passes.
+paymentRequestRoutes.post(
+  "/",
+  verifyAuth,
+  requireFeature(FEATURES.PAYMENTS_REQUEST),
+  requireAgencyVerified("request or receive payments"),
+  (req, res) => paymentRequestController.createPaymentRequest(req, res)
 );
 
 // Get payment request by ID
