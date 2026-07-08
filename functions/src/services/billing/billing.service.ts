@@ -119,13 +119,26 @@ class BillingService {
    */
   async applyEvent(event: NormalizedSubscriptionEvent): Promise<void> {
     const now = Timestamp.now();
+
+    // Renewal date shown in the plan summary. Prefer the provider-supplied date; on an
+    // activation/renewal that arrives without one (e.g. the post-redirect verify, which
+    // has no next_payment_date), estimate it from the plan's billing interval so a date
+    // shows immediately. A later webhook carrying the real next_payment_date overwrites
+    // this — we only estimate when the event itself has no date.
+    let currentPeriodEnd = event.currentPeriodEnd ?? null;
+    if (!currentPeriodEnd && (event.type === "activated" || event.type === "renewed")) {
+      const planSnap = await collections.plans.doc(event.planId).get();
+      const interval = (planSnap.data() as StoredPlan | undefined)?.interval;
+      currentPeriodEnd = this.estimatePeriodEnd(interval, now.toDate());
+    }
+
     const subscription: Subscription = {
       id: event.subscriberId,
       subscriberType: event.subscriberType,
       subscriberId: event.subscriberId,
       planId: event.planId,
       status: event.status,
-      currentPeriodEnd: event.currentPeriodEnd ?? null,
+      currentPeriodEnd,
       provider: event.provider,
       providerRef: event.providerRef ?? null,
       updatedAt: now.toDate().toISOString(),
@@ -145,6 +158,23 @@ class BillingService {
     await this.notifySubscriber(event).catch((e) =>
       console.error("[billing] subscriber notification failed:", e)
     );
+  }
+
+  /**
+   * Estimate the next renewal date by advancing `from` by one billing interval.
+   * Returns an ISO string, or null when the plan has no real cadence ("none"/free)
+   * or the interval is unknown. Used only as a fallback until the provider webhook
+   * supplies the exact next_payment_date.
+   */
+  private estimatePeriodEnd(
+    interval: string | undefined,
+    from: Date
+  ): string | null {
+    const next = new Date(from);
+    if (interval === "month") next.setMonth(next.getMonth() + 1);
+    else if (interval === "year") next.setFullYear(next.getFullYear() + 1);
+    else return null; // "none" / unknown — no renewal date
+    return next.toISOString();
   }
 
   /**

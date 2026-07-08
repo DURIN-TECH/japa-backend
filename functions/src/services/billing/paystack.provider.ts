@@ -98,6 +98,32 @@ export class PaystackProvider implements BillingProvider {
     return { url: data.authorization_url, reference: data.reference, provider: this.name };
   }
 
+  /**
+   * Ensure a Paystack Plan exists for a recurring package and return its `plan_code`.
+   * Paystack only auto-recurs against a Plan object, so each paid package needs one.
+   * Our `interval` ("month"/"year") maps to Paystack's cadence vocabulary
+   * ("monthly"/"annually"). The returned code is stored on the plan doc
+   * (`paystackPlanCode`) and later passed to `createCheckout`, which turns the
+   * transaction into a subscription.
+   *
+   * Note: this always creates a NEW plan. Idempotency is handled by the caller
+   * (the sync script skips packages that already carry a `paystackPlanCode`).
+   */
+  async ensurePlan(input: {
+    name: string;
+    amountKobo: number;
+    interval: "month" | "year";
+  }): Promise<string> {
+    const paystackInterval = input.interval === "year" ? "annually" : "monthly";
+    const res = await this.client().post<{ data: { plan_code: string } }>("/plan", {
+      name: input.name,
+      amount: input.amountKobo,
+      interval: paystackInterval,
+      currency: "NGN",
+    });
+    return res.data.data.plan_code;
+  }
+
   /** Verify a transaction by reference (post-redirect confirmation). */
   async verifyTransaction(reference: string): Promise<NormalizedSubscriptionEvent | null> {
     const res = await this.client().get<{ data: PaystackVerifyData }>(
@@ -157,18 +183,37 @@ export class PaystackProvider implements BillingProvider {
       return null;
     }
 
-    const meta = body.data?.metadata;
-    const ref = body.data?.reference ?? body.data?.subscription_code ?? null;
+    const data = body.data;
+    const meta = data?.metadata;
+    const ref = data?.reference ?? data?.subscription_code ?? null;
+    // Paystack's next auto-charge date — our subscription's currentPeriodEnd (the
+    // renewal date shown in the plan summary). Present on subscription/invoice events.
+    const periodEnd = data?.next_payment_date ?? null;
+
     switch (body.event) {
-    case "charge.success":
     case "subscription.create":
-      return this.toEvent("activated", meta, ref, body.data);
+      // First successful subscription charge — activate with the real renewal date.
+      return this.toEvent("activated", meta, ref, data, periodEnd);
+    case "charge.success":
+      // A successful charge (may be the first one). No renewal date on this event;
+      // billing.service estimates one from the plan interval if still missing.
+      return this.toEvent("activated", meta, ref, data, periodEnd);
+    case "invoice.create":
     case "invoice.update":
+      // Recurring invoice outcome: a paid invoice is a renewal (carries the next
+      // renewal date); an unpaid one means the charge failed → past due.
+      return this.toEvent(
+        data?.paid || data?.status === "success" ? "renewed" : "past_due",
+        meta,
+        ref,
+        data,
+        periodEnd
+      );
     case "invoice.payment_failed":
-      return this.toEvent("past_due", meta, ref, body.data);
+      return this.toEvent("past_due", meta, ref, data, periodEnd);
     case "subscription.disable":
     case "subscription.not_renew":
-      return this.toEvent("canceled", meta, ref, body.data);
+      return this.toEvent("canceled", meta, ref, data, periodEnd);
     default:
       return null;
     }
@@ -178,7 +223,8 @@ export class PaystackProvider implements BillingProvider {
     type: NormalizedSubscriptionEvent["type"],
     meta: PaystackMetadata | undefined,
     providerRef: string | null,
-    raw: unknown
+    raw: unknown,
+    currentPeriodEnd: string | null = null
   ): NormalizedSubscriptionEvent | null {
     if (!meta?.subscriberType || !meta?.subscriberId || !meta?.planId) return null;
     const status =
@@ -189,6 +235,7 @@ export class PaystackProvider implements BillingProvider {
       subscriberId: meta.subscriberId,
       planId: meta.planId,
       status,
+      currentPeriodEnd,
       provider: this.name,
       providerRef,
       raw,
@@ -212,6 +259,11 @@ interface PaystackWebhookBody {
     reference?: string;
     subscription_code?: string;
     metadata?: PaystackMetadata;
+    /** ISO date of the next auto-charge — maps to our `currentPeriodEnd`. */
+    next_payment_date?: string;
+    /** Invoice charge outcome flags (recurring renewals). */
+    paid?: boolean;
+    status?: string;
   };
 }
 
