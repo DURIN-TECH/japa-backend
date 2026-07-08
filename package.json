@@ -1,5 +1,5 @@
 {
     "scripts": {
-        "start": "npm --prefix functions run build && firebase emulators:exec --ui \"npm --prefix functions run seed:emulator && tail -f /dev/null\""
+        "start": "npm --prefix functions run build && APP_URL=${APP_URL:-http://localhost:3000} firebase emulators:exec --ui \"npm --prefix functions run seed:emulator && tail -f /dev/null\""
     }
 }
