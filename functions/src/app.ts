@@ -9,6 +9,9 @@ import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
 import { documentRoutes } from "./routes/document.routes";
+// Document templates feature (rich-text templates + editable case-linked instances)
+import { documentTemplateRoutes } from "./routes/document-template.routes";
+import { documentInstanceRoutes } from "./routes/document-instance.routes";
 import {
   eligibilityRoutes,
   adminEligibilityRoutes,
@@ -64,6 +67,9 @@ app.use("/agencies", agencyRoutes);
 app.use("/invitations", invitationRoutes);
 app.use("/applications", applicationRoutes);
 app.use("/documents", documentRoutes);
+// Document templates: catalog (read-only) + editable instances cloned from them
+app.use("/document-templates", documentTemplateRoutes);
+app.use("/document-instances", documentInstanceRoutes);
 app.use("/transactions", transactionRoutes);
 app.use("/consultations", consultationRoutes);
 app.use("/notifications", notificationRoutes);

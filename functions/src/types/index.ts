@@ -769,12 +769,110 @@ export interface Conversation {
   userId: string;
   agentId: string;
   applicationId?: string;
-  
+
   lastMessageAt: Timestamp;
   lastMessage?: string;
   unreadCountUser: number;
   unreadCountAgent: number;
-  
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+// ============================================
+// DOCUMENT TEMPLATE TYPES
+// ============================================
+//
+// The "document templates" feature (distinct from the file-upload `Document`
+// above): agents clone a rich-text template from a catalog into an editable
+// `DocumentInstance`, optionally linked to an application, optionally shared
+// with the mobile client. Content is stored as ProseMirror JSON — an opaque
+// structured document that the portal's rich-text editor round-trips.
+//
+// Mirrors the portal contract in japa-portal/src/types/api.ts (which uses
+// `string` dates); here we use Firestore `Timestamp` and rely on the standard
+// serialization (`{ _seconds, _nanoseconds }`) the portal mappers already
+// handle. Kept in sync with the portal type names deliberately.
+
+/**
+ * ProseMirror JSON document. Opaque to the backend — we store and return it
+ * verbatim; only the editor interprets `content`. Typed loosely so we never
+ * couple the backend to a specific schema/version of the editor.
+ */
+export type ProseMirrorDoc = { type: "doc"; content?: unknown[] } & Record<
+  string,
+  unknown
+>;
+
+/** Catalog grouping for templates (drives the portal's Category column). */
+export type TemplateCategory = "cover_letter" | "sop" | "affidavit" | "other";
+
+/**
+ * Ownership scope of a template:
+ *   - "global": authored by Seli, visible to every agency (no `agencyId`).
+ *   - "agency": authored by an agency, visible only within that agency.
+ */
+export type TemplateScope = "global" | "agency";
+
+/** Lifecycle of an editable instance (agent-driven; not client-visible). */
+export type DocumentInstanceStatus = "draft" | "final";
+
+/** Whether the linked mobile client can see the instance yet. */
+export type DocumentShareStatus = "private" | "shared";
+
+/**
+ * A clonable template in the catalog. `content` is only loaded on demand
+ * (single-fetch with `?includeContent=true`) since it can be large; list
+ * responses omit it.
+ */
+export interface DocumentTemplate {
+  id: string;
+  title: string;
+  description?: string;
+  category: TemplateCategory;
+  scope: TemplateScope;
+  agencyId?: string; // present only when scope === "agency"
+  schemaVersion: number; // editor/content schema version (for future migrations)
+  content?: ProseMirrorDoc; // omitted in list responses
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+/**
+ * An editable document cloned from a template. Carries the fields the shared
+ * CASL "Document" ability matches on for authorization:
+ *   - `agencyId`  → agency owners manage every instance in their agency
+ *   - `createdBy` → the authoring agent (surfaced to CASL as `agentId`)
+ */
+export interface DocumentInstance {
+  id: string;
+  title: string;
+  templateId: string; // source template
+  agencyId?: string; // owning agency (absent for independent agents)
+  createdBy: string; // authoring agent's userId
+  applicationId: string | null; // linked case; null until linked
+  status: DocumentInstanceStatus;
+  shareStatus: DocumentShareStatus;
+  version: number; // optimistic-concurrency token; incremented on every save
+  schemaVersion: number; // copied from the source template at clone time
+  content?: ProseMirrorDoc; // omitted in list responses, present on get-one
+  // Denormalized display names (avoid client-side user lookups)
+  createdByName?: string;
+  updatedByName?: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+/**
+ * An immutable snapshot of an instance's content, written on each successful
+ * save. Enables the editor's version history (`GET /:id/versions`). Stored in a
+ * `versions` subcollection under the instance.
+ */
+export interface DocumentVersion {
+  id: string;
+  instanceId: string;
+  version: number;
+  updatedByName?: string; // who produced this version
+  content?: ProseMirrorDoc; // the content at this version
+  createdAt: Timestamp;
 }

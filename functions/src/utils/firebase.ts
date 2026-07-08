@@ -96,6 +96,12 @@ export const collections = {
   entitlements: db.collection("entitlements"),
   // Audit log of normalized billing/provider events (Paystack webhooks, verifications)
   billingEvents: db.collection("billingEvents"),
+  // Document templates feature:
+  // - documentTemplates: the clonable rich-text catalog (global + per-agency)
+  // - documentInstances: editable docs cloned from templates (per-agent/agency),
+  //   with an immutable `versions` subcollection (see `subcollections` below)
+  documentTemplates: db.collection("documentTemplates"),
+  documentInstances: db.collection("documentInstances"),
 } as const;
 
 // Helper to get subcollection references
@@ -135,6 +141,10 @@ export const subcollections = {
   // Scrape runs under news sources
   scrapeRuns: (sourceId: string) =>
     collections.newsSources.doc(sourceId).collection("scrapeRuns"),
+
+  // Immutable content snapshots under a document instance (version history).
+  documentVersions: (instanceId: string) =>
+    collections.documentInstances.doc(instanceId).collection("versions"),
 } as const;
 
 // Firestore timestamp helpers
