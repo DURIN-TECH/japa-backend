@@ -90,6 +90,49 @@ export class StorageService {
   }
 
   /**
+   * Generate a signed upload URL for an agency compliance document (KYC/KYB).
+   *
+   * Objects are namespaced per-agency AND per-slot (e.g. "idDocument",
+   * "cacDocument") so each required document lives at a predictable, isolated
+   * path and re-uploading a slot doesn't collide with other slots. Mirrors the
+   * verification-document flow: client PUTs directly to this short-lived URL,
+   * then calls the register endpoint which records the path against the slot.
+   */
+  async getSignedComplianceUploadUrl(
+    agencyId: string,
+    slot: string,
+    fileName: string,
+    contentType: string
+  ): Promise<{
+    uploadUrl: string;
+    storagePath: string;
+    expiresAt: Date;
+  }> {
+    const fileId = randomUUID();
+    const sanitizedSlot = slot.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
+    const storagePath = `compliance/${agencyId}/${sanitizedSlot}/${fileId}_${sanitizedFileName}`;
+
+    const file = this.bucket.file(storagePath);
+
+    // Short-lived (15 min) write URL — only enough time to complete the upload.
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    const [uploadUrl] = await file.getSignedUrl({
+      version: "v4",
+      action: "write",
+      expires: expiresAt,
+      contentType,
+    });
+
+    return {
+      uploadUrl,
+      storagePath,
+      expiresAt,
+    };
+  }
+
+  /**
    * Generate a signed upload URL for an agency's white-label logo.
    *
    * Stored under a per-agency prefix so logos are easy to scope/clean up and

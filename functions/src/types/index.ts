@@ -70,6 +70,74 @@ export interface AgencyService {
   price: number; // In cents
 }
 
+// ============================================
+// COMPLIANCE (KYC / KYB / PAYOUT) TYPES
+// ============================================
+
+// Lifecycle of an agency's compliance file. This is DISTINCT from `AgencyStatus`
+// (which gates admission to the platform). An agency can be `approved` on the
+// platform yet still be `not_started` on compliance — and it is compliance
+// verification, not platform admission, that unlocks payments and the ability to
+// be assigned platform-originated ("our") clients.
+//   not_started  – nothing captured yet
+//   in_progress  – some fields/docs saved, not yet submitted
+//   under_review – all required items submitted, awaiting an admin decision
+//   verified     – admin approved; payments + platform clients unlocked
+//   rejected     – admin rejected; agency must fix items and resubmit
+export type ComplianceStatus =
+  | "not_started"
+  | "in_progress"
+  | "under_review"
+  | "verified"
+  | "rejected";
+
+// Government ID types accepted for owner KYC (Nigeria-focused).
+export type KycIdType =
+  | "nin"
+  | "passport"
+  | "drivers_license"
+  | "voters_card";
+
+// Settlement bank account used for Paystack payouts (KYB payout leg).
+export interface SettlementBank {
+  bankName: string;
+  bankCode?: string; // Paystack bank code, when resolved
+  accountNumber: string;
+  accountName: string;
+}
+
+// The full compliance file attached to an Agency. Fields are optional because
+// they are captured incrementally; `getComplianceRequirements()` on the service
+// derives which required items are still outstanding before an agency may submit.
+export interface AgencyCompliance {
+  status: ComplianceStatus;
+
+  // ---- KYC: identity of the agency owner (the natural person) ----
+  legalFirstName?: string;
+  legalLastName?: string;
+  dateOfBirth?: Timestamp;
+  idType?: KycIdType;
+  idNumber?: string; // NIN / passport no. / etc.
+  bvn?: string; // Bank Verification Number (Nigeria)
+  idDocumentPath?: string; // Storage path to the government ID scan
+  proofOfAddressPath?: string; // Storage path to a proof-of-address doc/selfie
+
+  // ---- KYB: the business (the agency legal entity) ----
+  rcNumber?: string; // CAC RC/BN registration number
+  tin?: string; // Tax Identification Number
+  businessAddress?: string;
+  cacDocumentPath?: string; // Storage path to the CAC registration certificate
+
+  // ---- Payout: where settlements are paid ----
+  settlementBank?: SettlementBank;
+
+  // ---- Review metadata ----
+  submittedAt?: Timestamp;
+  reviewedAt?: Timestamp;
+  reviewedBy?: string; // Admin userId who verified/rejected
+  rejectionReason?: string;
+}
+
 export interface Agency {
   id: string;
   name: string;
@@ -93,11 +161,16 @@ export interface Agency {
   totalCases: number;
   activeCases: number;
 
-  // Approval status
+  // Approval status (platform admission — set during onboarding review)
   status: AgencyStatus;
   rejectionReason?: string;
   reviewedBy?: string; // Admin userId who approved/rejected
   reviewedAt?: Timestamp;
+
+  // Compliance file (KYC/KYB/payout). Absent until the owner starts it.
+  // Compliance `verified` — not platform `status: "approved"` — is what unlocks
+  // payments and assignment of platform-originated clients.
+  compliance?: AgencyCompliance;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -710,6 +783,10 @@ export type NotificationType =
   // Verification
   | "verification_approved"
   | "verification_rejected"
+  // Compliance (agency KYC/KYB/payout)
+  | "compliance_submitted" // Owner submitted the compliance file for review
+  | "compliance_approved" // Admin verified the agency's compliance
+  | "compliance_rejected" // Admin rejected; items need fixing
   // Account / engagement
   | "welcome"
   | "role_changed"

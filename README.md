@@ -444,6 +444,16 @@ printf '%s' 'sk_test_XXXX' \
 Locally (emulators) these are read from `functions/.env` (see `.env.example`); an
 unset secret is safe — email/billing degrade rather than crash (see below).
 
+### Non-secret config (plain env vars)
+
+Some runtime config is **not** sensitive and lives in plain env vars (not Secret
+Manager). Set these in `functions/.env.local` for emulators, or as function env
+vars / your deploy config for real environments.
+
+| Env var | Used by | Notes |
+|---------|---------|-------|
+| `APP_URL` | email links | Portal base URL used to build links in emails — footer, and the **password-reset** link (`${APP_URL}/reset-password?oobCode=…`). Defaults to the prod portal (`https://portal.weareseli.com`). **Must point at the portal wired to _this_ backend's Firebase project**, because the reset `oobCode` is project-scoped. **Local dev:** `APP_URL=http://localhost:3000` — otherwise reset emails link at prod. The local startup scripts (`npm start`, `npm --prefix functions run serve`) already default it to `http://localhost:3000`. |
+
 ## Authorization & Entitlements
 
 Authorization uses the shared **`@durin-tech/authz`** package (private GitHub Packages).
@@ -497,6 +507,14 @@ skipped (logged, not thrown). A `403` from Resend means the `EMAIL_FROM` domain
 isn't verified in Resend — verify the sending domain (dev uses `weareseli.com`,
 sender `info@weareseli.com`). On deployed environments `NODE_ENV=production`, so the
 `EMAIL_FROM_DEV_OVERRIDE` (local-only `onboarding@resend.dev` fallback) is inert.
+
+**Whitelabeled password reset** (`POST /auth/forgot-password`, public): the Admin SDK
+mints a Firebase reset link, we extract its `oobCode`, and email a branded link to the
+portal's own `${APP_URL}/reset-password?oobCode=…` page (the portal completes the reset
+client-side). The endpoint is **enumeration-safe** (identical response whether or not the
+account exists). Set [`APP_URL`](#non-secret-config-plain-env-vars) to the portal for
+_this_ backend's Firebase project — the `oobCode` is project-scoped, so a mismatched
+`APP_URL` produces links that won't validate.
 
 ## License
 
