@@ -7,6 +7,7 @@ import { notificationService } from "../services/notification.service";
 import { noteService } from "../services/note.service";
 import { collections, auth } from "../utils/firebase";
 import { can, asSubject, checkWithinLimit, paymentRequired } from "../middleware/authz";
+import { complianceService } from "../services/compliance.service";
 import { LIMITS } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -521,6 +522,38 @@ export class ApplicationController {
         if (agentId !== undefined) updates.agentId = agentId;
         if (agencyId !== undefined) updates.agencyId = agencyId;
         if (mode !== undefined) updates.mode = mode;
+      }
+
+      // ---- Compliance gate: platform-originated ("our") clients ----
+      // An unverified agency may manage its OWN clients (cases it created via the
+      // portal, createdVia="portal") but may NOT take on platform-originated
+      // clients (self-serve / mobile). Block an unverified agency from being
+      // assigned such a case. Admins bypass; the applicant editing their own
+      // notes is unaffected (no assignment change).
+      const isAdmin = req.user?.admin === true || req.authz?.role === "admin";
+      const isAssigning =
+        updates.agencyId !== undefined ||
+        updates.agentId !== undefined ||
+        updates.mode === "agent";
+      // Platform-originated = anything not started by an agency in the portal.
+      const isPlatformClient = application.createdVia !== "portal";
+      if (!isAdmin && isAssigning && isPlatformClient) {
+        // The agency the case would belong to after this change: an explicit
+        // target agencyId if given, otherwise the acting caller's agency.
+        const targetAgencyId =
+          updates.agencyId ?? req.authz?.agencyId ?? application.agencyId;
+        const verified = targetAgencyId
+          ? await complianceService.isVerified(targetAgencyId)
+          : false;
+        if (!verified) {
+          sendError(
+            res,
+            "COMPLIANCE_REQUIRED",
+            "Your agency must complete KYC/KYB verification before taking on Seli clients. You can still manage your own clients.",
+            403
+          );
+          return;
+        }
       }
 
       const updated = await applicationService.updateApplication(id, updates);

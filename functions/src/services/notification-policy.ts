@@ -54,6 +54,10 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   // Verification
   verification_approved: FULL,
   verification_rejected: FULL,
+  // Compliance (agency KYC/KYB/payout) — transactional, worth an email
+  compliance_submitted: FULL,
+  compliance_approved: FULL,
+  compliance_rejected: FULL,
   // Account / engagement
   welcome: FULL,
   role_changed: FULL,

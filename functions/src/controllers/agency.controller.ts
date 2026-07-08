@@ -98,6 +98,16 @@ export class AgencyController {
         return;
       }
 
+      // The compliance file holds the owner's KYC/KYB PII (BVN, ID number,
+      // document paths). Non-owner agents only need to know whether the agency
+      // is verified (to render the "locked until verified" callout), so redact
+      // everything but the status for anyone who isn't the owner or an admin.
+      const isOwner = agency.ownerId === userId;
+      const isAdmin = req.authz?.role === ROLES.ADMIN || req.user?.admin === true;
+      if (agency.compliance && !isOwner && !isAdmin) {
+        agency.compliance = { status: agency.compliance.status };
+      }
+
       sendSuccess(res, agency);
     } catch (error) {
       console.error("Error getting agency:", error);
