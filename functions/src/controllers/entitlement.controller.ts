@@ -374,8 +374,11 @@ export class EntitlementController {
         sendError(res, "VALIDATION_ERROR", "A billing email is required", 400);
         return;
       }
-      const session = await billingService.startSeatCheckout(agencyId, email, quantity);
-      sendSuccess(res, session, "Seat checkout started");
+      const result = await billingService.startSeatCheckout(agencyId, email, quantity);
+      // Two shapes: seats charged inline against the saved card ({ applied: true, ... }),
+      // or a hosted checkout to redirect to ({ url } fallback when we hold no card yet).
+      const applied = (result as { applied?: boolean }).applied === true;
+      sendSuccess(res, result, applied ? "Seats added" : "Seat checkout started");
     } catch (error) {
       const message = (error as Error).message;
       if (

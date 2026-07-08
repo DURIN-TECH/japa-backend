@@ -8,7 +8,7 @@ import {
   SubscriberType,
 } from "@durin-tech/authz";
 import { entitlementService } from "../entitlement.service";
-import { paystackProvider } from "./paystack.provider";
+import { paystackProvider, PaystackChargeRaw } from "./paystack.provider";
 import { notificationService } from "../notification.service";
 import { StoredPlan } from "../../types/billing";
 import { NotificationType } from "../../types";
@@ -143,7 +143,22 @@ class BillingService {
       providerRef: event.providerRef ?? null,
       updatedAt: now.toDate().toISOString(),
     };
-    await collections.subscriptions.doc(event.subscriberId).set(subscription, { merge: true });
+
+    // Capture the customer's saved-card authorization + customer code from the raw
+    // Paystack payload (present on charge/verify success). These are what let us later
+    // charge the seat cost server-side and re-create the subscription at a new total
+    // without another hosted checkout. Only write them when present so we never clobber
+    // previously-stored codes with undefined on events that don't carry them.
+    const raw = event.raw as PaystackChargeRaw | undefined;
+    const authorizationCode = raw?.authorization?.authorization_code;
+    const customerCode = raw?.customer?.customer_code;
+    const extra: Record<string, string> = {};
+    if (authorizationCode) extra.authorizationCode = authorizationCode;
+    if (customerCode) extra.customerCode = customerCode;
+
+    await collections.subscriptions
+      .doc(event.subscriberId)
+      .set({ ...subscription, ...extra }, { merge: true });
 
     // Audit the raw provider payload.
     await collections.billingEvents.add({
@@ -274,25 +289,60 @@ class BillingService {
     return true;
   }
 
-  // ── Agent seats (agency owner pays per seat) ──────────────────────────────
+  // ── Agent seats (recurring add-ons, prorated) ─────────────────────────────
+  //
+  // Seats are an add-on to the recurring subscription: base plan price + (extra
+  // seats × seat price) is what renews each cycle. Because Paystack can't change a
+  // running subscription's amount, "adding a seat" is prorated:
+  //   1. charge ONLY the seat cost now (server-side against the saved card), and
+  //   2. re-point the recurring subscription at a Plan for the new total, starting
+  //      at the next renewal date.
+  // If we hold no saved authorization yet (e.g. seeded data, or the owner never
+  // completed a real checkout), we fall back to a one-off hosted checkout for the
+  // seat and grant it on return; the recurring reschedule is then best-effort.
 
   /**
-   * Start a checkout to buy `quantity` additional agent seats. Amount =
-   * quantity × the agency plan's `seatPriceKobo`. The new seat total is stamped
-   * into the transaction metadata so it can be applied on confirmation.
+   * The subscription doc shape with the billing-only extras we persist alongside the
+   * shared `Subscription` fields.
+   */
+  private async getAgencySubscriptionDoc(agencyId: string): Promise<
+    | (Subscription & {
+        authorizationCode?: string;
+        customerCode?: string;
+        recurringAmountKobo?: number;
+      })
+    | undefined
+  > {
+    const snap = await collections.subscriptions.doc(agencyId).get();
+    return snap.data() as
+      | (Subscription & { authorizationCode?: string; customerCode?: string; recurringAmountKobo?: number })
+      | undefined;
+  }
+
+  /**
+   * Result of a seat change that was charged + applied inline (no redirect). Mirrors
+   * `AppliedSwitch` so the controller/portal can branch on `applied`.
+   */
+  // (declared inline via the union return type below)
+
+  /**
+   * Add `quantity` agent seats. Charges only the seat cost now; steps the recurring
+   * total up from the next renewal. Returns an inline-applied result when we could
+   * charge the saved card, or a `CheckoutSession` (redirect) as a fallback.
    */
   async startSeatCheckout(
     agencyId: string,
     email: string,
     quantity: number
-  ): Promise<CheckoutSession> {
+  ): Promise<CheckoutSession | { applied: true; seats: number; recurringAmountKobo: number }> {
     if (!Number.isInteger(quantity) || quantity < 1) {
       throw new Error("quantity must be a positive integer");
     }
-    const subscription = await entitlementService.getActiveSubscription(agencyId);
+
+    const subDoc = await this.getAgencySubscriptionDoc(agencyId);
     const plan =
-      (subscription
-        ? ((await collections.plans.doc(subscription.planId).get()).data() as StoredPlan | undefined)
+      (subDoc
+        ? ((await collections.plans.doc(subDoc.planId).get()).data() as StoredPlan | undefined)
         : undefined) ?? ((await entitlementService.getDefaultPlan("agency")) as StoredPlan | null);
     if (!plan) throw new Error("Plan not found");
     if (!plan.seatPriceKobo || plan.seatPriceKobo <= 0) {
@@ -300,40 +350,129 @@ class BillingService {
     }
 
     const entitlements = await entitlementService.getEntitlements(agencyId);
-    const currentSeats = entitlements?.limits.max_agents ?? plan.limits.max_agents ?? 0;
+    const baseSeats = plan.limits.max_agents ?? 0;
+    const currentSeats = entitlements?.limits.max_agents ?? baseSeats;
     if (currentSeats === -1) throw new Error("This plan already includes unlimited agents");
-    const newTotal = currentSeats + quantity;
 
+    const newSeats = currentSeats + quantity;
+    const newExtraSeats = Math.max(0, newSeats - baseSeats);
+    const seatChargeNow = quantity * plan.seatPriceKobo; // prorated: just the added seats
+    const recurringTotal = plan.priceKobo + newExtraSeats * plan.seatPriceKobo;
+
+    // Preferred path: charge the saved card server-side (no redirect).
+    if (subDoc?.authorizationCode) {
+      const charge = await paystackProvider.chargeAuthorization({
+        authorizationCode: subDoc.authorizationCode,
+        email,
+        amountKobo: seatChargeNow,
+        metadata: { kind: "seats", subscriberId: agencyId },
+      });
+      if (charge.status === "success") {
+        await this.applySeatChange(agencyId, plan, newSeats, recurringTotal);
+        return { applied: true, seats: newSeats, recurringAmountKobo: recurringTotal };
+      }
+      // Fall through to hosted checkout if the direct charge didn't succeed.
+    }
+
+    // Fallback: one-off hosted checkout for the seat cost. The new totals are stamped
+    // into metadata so `confirmSeatPurchase` can apply them on return.
     return this.provider.createCheckout({
       subscriberType: "agency",
       subscriberId: agencyId,
       planId: plan.id,
       email,
-      amountKobo: quantity * plan.seatPriceKobo,
+      amountKobo: seatChargeNow,
       metadata: {
         kind: "seats",
         subscriberId: agencyId,
-        addSeats: String(quantity),
-        newTotal: String(newTotal),
+        newSeats: String(newSeats),
+        recurringTotal: String(recurringTotal),
       },
     });
   }
 
   /**
-   * Confirm a seat purchase server-side by verifying the transaction reference with
-   * the provider, then set the agency's paid seats. Returns the new seat total or
-   * null if the transaction isn't a successful seat purchase for this agency.
+   * Confirm a fallback (redirect) seat purchase and apply it. Returns the new seat
+   * total, or null if the reference isn't a successful seat purchase for this agency.
    */
   async confirmSeatPurchase(reference: string, agencyId: string): Promise<number | null> {
     const result = await paystackProvider.getTransactionMetadata(reference);
     if (!result || result.status !== "success") return null;
-    const meta = result.metadata;
+    const meta = result.metadata as { kind?: string; subscriberId?: string; newSeats?: string; recurringTotal?: string };
     if (meta.kind !== "seats" || meta.subscriberId !== agencyId) return null;
-    const newTotal = Number(meta.newTotal);
-    if (!Number.isFinite(newTotal)) return null;
-    await entitlementService.setPaidSeats(agencyId, newTotal);
+    const newSeats = Number(meta.newSeats);
+    const recurringTotal = Number(meta.recurringTotal);
+    if (!Number.isFinite(newSeats)) return null;
 
-    // Notify the agency owner that seats were added (best-effort).
+    const plan = (await collections.plans.doc(
+      (await this.getAgencySubscriptionDoc(agencyId))?.planId ?? ""
+    ).get()).data() as StoredPlan | undefined;
+    if (!plan) return null;
+
+    await this.applySeatChange(
+      agencyId,
+      plan,
+      newSeats,
+      Number.isFinite(recurringTotal) ? recurringTotal : plan.priceKobo
+    );
+    return newSeats;
+  }
+
+  /**
+   * Apply a seat change: grant the seats immediately (entitlements) and reschedule
+   * the recurring subscription to `recurringTotal` starting at the next renewal.
+   * The reschedule is best-effort — a missing authorization/customer code (or a
+   * provider hiccup) never blocks the seat grant; we still record the intended
+   * recurring total for display.
+   */
+  private async applySeatChange(
+    agencyId: string,
+    plan: StoredPlan,
+    newSeats: number,
+    recurringTotal: number
+  ): Promise<void> {
+    // 1. Immediate access — the owner can add the agent right away.
+    await entitlementService.setPaidSeats(agencyId, newSeats);
+
+    // 2. Reschedule the recurring amount for the next cycle (best-effort).
+    const sub = await this.getAgencySubscriptionDoc(agencyId);
+    const subUpdate: Record<string, unknown> = { recurringAmountKobo: recurringTotal };
+    try {
+      if (
+        sub?.customerCode &&
+        sub?.authorizationCode &&
+        (plan.interval === "month" || plan.interval === "year")
+      ) {
+        const planCode = await this.ensureAmountPlan(plan, recurringTotal);
+        // Stop the current subscription so it doesn't also renew at the old amount.
+        if (sub.providerRef) {
+          await this.provider
+            .cancelSubscription(sub.providerRef)
+            .catch((e) => console.error("[billing] disable old sub on seat change failed:", e));
+        }
+        // Start a new subscription at the new total, beginning at the next renewal
+        // so the customer isn't re-charged the full amount today.
+        const startDate =
+          sub.currentPeriodEnd ?? this.estimatePeriodEnd(plan.interval, new Date());
+        const newRef = await paystackProvider.createSubscription({
+          customerCode: sub.customerCode,
+          planCode,
+          authorizationCode: sub.authorizationCode,
+          startDate,
+        });
+        subUpdate.providerRef = newRef;
+      } else {
+        console.warn(
+          `[billing] seat reschedule skipped for ${agencyId} (no saved authorization); ` +
+            "recorded intended recurring total only."
+        );
+      }
+    } catch (e) {
+      console.error("[billing] recurring reschedule on seat change failed (continuing):", e);
+    }
+    await collections.subscriptions.doc(agencyId).set(subUpdate, { merge: true });
+
+    // 3. Notify the agency owner (best-effort).
     const ownerId = (await collections.agencies.doc(agencyId).get()).data()?.ownerId as
       | string
       | undefined;
@@ -343,13 +482,37 @@ class BillingService {
           userId: ownerId,
           type: "seats_added",
           title: "Agent seats added",
-          body: `Your plan now includes ${newTotal} agent seats.`,
+          body: `Your plan now includes ${newSeats} agent seats (₦${(recurringTotal / 100).toLocaleString()}/${plan.interval} from your next renewal).`,
           relatedEntityType: "agency",
           relatedEntityId: agencyId,
         })
         .catch((e) => console.error("[billing] seats notification failed:", e));
     }
-    return newTotal;
+  }
+
+  /**
+   * Get (or lazily create + cache) a Paystack Plan code for a specific recurring
+   * total on this package. Cached per-amount in `plan.seatPlanCodes` so distinct
+   * seat totals reuse their Plan instead of minting a new one each time.
+   */
+  private async ensureAmountPlan(plan: StoredPlan, totalKobo: number): Promise<string> {
+    const key = String(totalKobo);
+    // The base total (no extra seats) uses the package's own synced plan code.
+    if (totalKobo === plan.priceKobo && plan.paystackPlanCode) return plan.paystackPlanCode;
+    const cached = plan.seatPlanCodes?.[key];
+    if (cached) return cached;
+
+    const interval = plan.interval === "year" ? "year" : "month";
+    const code = await paystackProvider.ensurePlan({
+      name: `${plan.name} — ₦${(totalKobo / 100).toLocaleString()}/${interval}`,
+      amountKobo: totalKobo,
+      interval,
+    });
+    await collections.plans.doc(plan.id).set(
+      { seatPlanCodes: { ...(plan.seatPlanCodes ?? {}), [key]: code } },
+      { merge: true }
+    );
+    return code;
   }
 }
 

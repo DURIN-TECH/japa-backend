@@ -124,6 +124,59 @@ export class PaystackProvider implements BillingProvider {
     return res.data.data.plan_code;
   }
 
+  /**
+   * Charge a customer's saved card (authorization) server-side, with no redirect.
+   * Used for the prorated one-off seat charge: the owner already paid once (so we
+   * hold an `authorization_code`), and the seat cost is small and known, so there's
+   * no need to bounce them through hosted checkout again. Returns the transaction
+   * status + reference (status "success" means the card was charged).
+   */
+  async chargeAuthorization(input: {
+    authorizationCode: string;
+    email: string;
+    amountKobo: number;
+    metadata?: Record<string, string>;
+  }): Promise<{ status: string; reference: string }> {
+    const res = await this.client().post<{ data: { status: string; reference: string } }>(
+      "/transaction/charge_authorization",
+      {
+        authorization_code: input.authorizationCode,
+        email: input.email,
+        amount: input.amountKobo,
+        currency: "NGN",
+        metadata: input.metadata,
+      }
+    );
+    return { status: res.data.data.status, reference: res.data.data.reference };
+  }
+
+  /**
+   * Create a subscription directly against a customer + plan using their saved
+   * authorization, optionally starting on a future date. This is how we step the
+   * recurring amount up/down at the *next* renewal: after charging just the seat
+   * now, we point a new subscription (at the new total's plan) to begin at the
+   * current period end. Returns a combined "code:token" providerRef (both are
+   * needed to later disable it — see `cancelSubscription`).
+   */
+  async createSubscription(input: {
+    customerCode: string;
+    planCode: string;
+    authorizationCode: string;
+    /** ISO datetime for the first charge (Paystack accepts a future `start_date`). */
+    startDate?: string | null;
+  }): Promise<string> {
+    const res = await this.client().post<{
+      data: { subscription_code: string; email_token: string };
+    }>("/subscription", {
+      customer: input.customerCode,
+      plan: input.planCode,
+      authorization: input.authorizationCode,
+      ...(input.startDate ? { start_date: input.startDate } : {}),
+    });
+    const { subscription_code, email_token } = res.data.data;
+    return `${subscription_code}:${email_token}`;
+  }
+
   /** Verify a transaction by reference (post-redirect confirmation). */
   async verifyTransaction(reference: string): Promise<NormalizedSubscriptionEvent | null> {
     const res = await this.client().get<{ data: PaystackVerifyData }>(
@@ -248,14 +301,25 @@ interface PaystackMetadata {
   subscriberId?: string;
   planId?: string;
 }
-interface PaystackVerifyData {
+
+/**
+ * The subset of a Paystack charge/verify payload we read off `event.raw` in
+ * billing.service — the saved-card authorization + customer identifiers needed to
+ * charge again server-side and to (re)create subscriptions.
+ */
+export interface PaystackChargeRaw {
+  authorization?: { authorization_code?: string };
+  customer?: { customer_code?: string };
+}
+
+interface PaystackVerifyData extends PaystackChargeRaw {
   status: string;
   reference: string;
   metadata?: PaystackMetadata;
 }
 interface PaystackWebhookBody {
   event: string;
-  data?: {
+  data?: PaystackChargeRaw & {
     reference?: string;
     subscription_code?: string;
     metadata?: PaystackMetadata;

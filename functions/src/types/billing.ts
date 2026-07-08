@@ -11,6 +11,13 @@ export interface StoredPlan extends Plan {
   /** Maps this package to a Paystack plan code (enables recurring subscriptions). */
   paystackPlanCode?: string | null;
   /**
+   * Cache of ad-hoc Paystack plan codes keyed by total amount (kobo), used for
+   * seat-inclusive recurring totals (base + extra seats). Lets us reuse a Plan for a
+   * given total instead of minting a new one on every seat change.
+   * e.g. { "2900000": "PLN_..." } for a ₦29,000 recurring total.
+   */
+  seatPlanCodes?: Record<string, string>;
+  /**
    * Groups a tier's monthly + yearly variants so the upgrade UI can pair them
    * (e.g. show a "Save X%" badge and a Monthly/Yearly toggle). Both the `agent_pro`
    * (monthly) and `agent_pro_yearly` (yearly) plans share `billingGroup: "agent_pro"`.
