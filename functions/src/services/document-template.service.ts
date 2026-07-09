@@ -12,7 +12,13 @@
  * which is fine for the modest catalog size the portal assumes.
  */
 import { collections } from "../utils/firebase";
-import { DocumentTemplate, TemplateCategory } from "../types";
+import {
+  DocumentTemplate,
+  ProseMirrorDoc,
+  TemplateCategory,
+  TemplateScope,
+} from "../types";
+import { Timestamp } from "firebase-admin/firestore";
 
 // Filters accepted by the catalog listing. Both are optional and applied in
 // memory after the scope-based fetch.
@@ -20,6 +26,31 @@ export interface TemplateFilters {
   category?: TemplateCategory;
   search?: string;
 }
+
+// Fields accepted when authoring a template. Any agent-side user can create one
+// (added to the shared global catalog); `createdBy` records who so they can later
+// edit/delete their own.
+export interface CreateTemplateInput {
+  title: string;
+  description?: string;
+  category: TemplateCategory;
+  content: ProseMirrorDoc;
+  scope?: TemplateScope; // defaults to "global"
+  agencyId?: string; // only meaningful when scope === "agency"
+  createdBy?: string; // authoring user's uid
+  createdByName?: string; // denormalized display name
+}
+
+// Editable fields on an existing template (all optional — patch semantics).
+export interface UpdateTemplateInput {
+  title?: string;
+  description?: string;
+  category?: TemplateCategory;
+  content?: ProseMirrorDoc;
+}
+
+// Current content/schema version stamped on authored templates.
+const SCHEMA_VERSION = 1;
 
 class DocumentTemplateService {
   /**
@@ -86,6 +117,70 @@ class DocumentTemplateService {
     if (!doc.exists) return null;
     const template = doc.data() as DocumentTemplate;
     return includeContent ? template : stripContent(template);
+  }
+
+  // ============================================
+  // AUTHORING (admin-managed catalog)
+  // ============================================
+
+  /**
+   * Create a new template. Defaults to "global" scope (Seli-authored, visible to
+   * everyone); pass scope/agencyId to author an agency-scoped one.
+   */
+  async create(input: CreateTemplateInput): Promise<DocumentTemplate> {
+    const now = Timestamp.now();
+    const ref = collections.documentTemplates.doc();
+    const template: DocumentTemplate = {
+      id: ref.id,
+      title: input.title,
+      description: input.description,
+      category: input.category,
+      scope: input.scope ?? "global",
+      // Only set agencyId for agency-scoped templates (undefined is stripped by
+      // Firestore's ignoreUndefinedProperties).
+      agencyId: input.scope === "agency" ? input.agencyId : undefined,
+      schemaVersion: SCHEMA_VERSION,
+      content: input.content,
+      createdBy: input.createdBy,
+      createdByName: input.createdByName,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await ref.set(template);
+    return template;
+  }
+
+  /**
+   * Patch an existing template's editable fields. Returns null if it doesn't
+   * exist. id/scope/schemaVersion/createdAt are never mutated here.
+   */
+  async update(
+    id: string,
+    input: UpdateTemplateInput
+  ): Promise<DocumentTemplate | null> {
+    const ref = collections.documentTemplates.doc(id);
+    const doc = await ref.get();
+    if (!doc.exists) return null;
+
+    // Only copy provided fields so absent ones are left untouched.
+    const updates: Record<string, unknown> = { updatedAt: Timestamp.now() };
+    if (input.title !== undefined) updates.title = input.title;
+    if (input.description !== undefined) updates.description = input.description;
+    if (input.category !== undefined) updates.category = input.category;
+    if (input.content !== undefined) updates.content = input.content;
+
+    await ref.update(updates);
+    const updated = await ref.get();
+    return updated.data() as DocumentTemplate;
+  }
+
+  /** Delete a template. Existing cloned instances keep their own content copy. */
+  async delete(id: string): Promise<boolean> {
+    const ref = collections.documentTemplates.doc(id);
+    const doc = await ref.get();
+    if (!doc.exists) return false;
+    await ref.delete();
+    return true;
   }
 }
 
