@@ -14,7 +14,7 @@ import { app } from "./app";
  *   - PAYSTACK_SECRET_KEY    — Paystack API/secret key (sk_test_… / sk_live_…)
  *   - PAYSTACK_CALLBACK_URL  — where Paystack redirects after checkout
  *   - RESEND_API_KEY         — Resend API key for transactional email (re_…)
- *   - EMAIL_FROM             — verified sender, e.g. "Seli <noreply@seli.app>"
+ *   - EMAIL_FROM             — verified sender, e.g. "Seli <noreply@weareseli.com>"
  * Set them with `firebase functions:secrets:set <NAME>` before deploying.
  * Locally, the emulator reads them from `functions/.env.local` instead.
  *

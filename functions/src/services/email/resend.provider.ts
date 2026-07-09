@@ -8,7 +8,7 @@ import { EmailMessage, EmailProvider, EmailResult } from "./email.types";
  *
  * Config (env / Firebase secrets):
  *   - RESEND_API_KEY — API key from the Resend dashboard (re_…).
- *   - EMAIL_FROM     — verified sender, e.g. "Seli <noreply@seli.app>".
+ *   - EMAIL_FROM     — verified sender, e.g. "Seli <noreply@weareseli.com>".
  *
  * Dev / test mode:
  *   When NODE_ENV !== "production" and EMAIL_FROM is not set (or not yet domain-
