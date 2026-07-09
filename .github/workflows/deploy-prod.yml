@@ -4,11 +4,13 @@
 
 name: Deploy to Production
 
-# Trigger on pushes to the main branch only
+# Trigger on pushes to the main branch, or manually (to re-deploy / re-seed prod
+# on demand without pushing a commit).
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   # Lint, build, and deploy Cloud Functions to the production Firebase project
@@ -66,3 +68,28 @@ jobs:
           printf '%s' "$FIREBASE_SA_KEY" > "$RUNNER_TEMP/sa-key.json"
           export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa-key.json"
           npx --yes firebase-tools@15.22.0 deploy --project default --force
+
+      # Bootstrap the prod project with the MINIMAL non-test dataset so a fresh
+      # prod is usable without a manual seed: the 2 real platform admins plus
+      # reference/config data (countries/visas, eligibility, news sources, plans,
+      # document templates). Runs the dedicated seed-prod-bootstrap seeder (NOT
+      # the full test seeder) — no fake agencies/agents/clients/applications.
+      #
+      # Idempotent: deterministic ids / get-then-create; deletes nothing. Re-runs
+      # re-assert the baseline without duplicating or erroring. NOTE: reference
+      # data is upserted, so if admins later CURATE countries/visas/plans in the
+      # prod admin UI, a redeploy would reset those seeded docs — if that becomes
+      # undesirable, drop the `push: main` trigger from this step's dataset and
+      # run it via workflow_dispatch only.
+      #
+      # ALLOW_PROD_SEED=true satisfies the seeder's production guard in CI (the
+      # equivalent of `--confirm-prod`). Reuses the prod ci-deployer SA key.
+      - name: Seed prod bootstrap (idempotent)
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
+          ALLOW_PROD_SEED: "true"
+        working-directory: functions
+        run: |
+          printf '%s' "$FIREBASE_SA_KEY" > "$RUNNER_TEMP/sa-key.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa-key.json"
+          npm run seed:prod
