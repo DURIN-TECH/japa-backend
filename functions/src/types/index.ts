@@ -911,6 +911,11 @@ export interface DocumentTemplate {
   agencyId?: string; // present only when scope === "agency"
   schemaVersion: number; // editor/content schema version (for future migrations)
   content?: ProseMirrorDoc; // omitted in list responses
+  // Authoring: who created this template. Any agent-side user can contribute
+  // templates to the shared global catalog; the creator (or an admin) may edit or
+  // delete it. Absent on Seli-seeded templates (admin-managed only).
+  createdBy?: string; // authoring user's uid
+  createdByName?: string; // denormalized display name
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }

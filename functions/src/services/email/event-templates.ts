@@ -41,6 +41,16 @@ const casePath = (ctx: EventEmailContext): string =>
     : "/dashboard";
 
 /**
+ * Deep-link to the admin agency-review page when the notification references an
+ * agency (used for compliance_submitted, which fans out to admins). Falls back
+ * to the agencies list if the id is missing.
+ */
+const agencyReviewPath = (ctx: EventEmailContext): string =>
+  ctx.relatedEntityType === "agency" && ctx.relatedEntityId
+    ? `/admin/agencies/${ctx.relatedEntityId}`
+    : "/admin/agencies";
+
+/**
  * Subject + CTA per event type. Keep subjects specific (they're what users scan in
  * their inbox) and CTAs action-oriented.
  */
@@ -203,6 +213,25 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
   agency_rejected: {
     subject: "Update on your agency application",
     actionLabel: "View agency",
+    path: () => "/account-settings?tab=agencyProfile",
+  },
+
+  // Compliance (agency KYC/KYB/payout)
+  compliance_submitted: {
+    // Sent to admins when an owner submits their compliance file for review.
+    // CTA links straight to that agency's review page.
+    subject: "An agency is ready for compliance review",
+    actionLabel: "Review agency",
+    path: agencyReviewPath,
+  },
+  compliance_approved: {
+    subject: "Your agency is verified",
+    actionLabel: "View agency",
+    path: () => "/account-settings?tab=agencyProfile",
+  },
+  compliance_rejected: {
+    subject: "Your agency compliance needs attention",
+    actionLabel: "Update compliance",
     path: () => "/account-settings?tab=agencyProfile",
   },
 
