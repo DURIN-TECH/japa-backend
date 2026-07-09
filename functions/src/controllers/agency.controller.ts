@@ -5,7 +5,9 @@ import { storageService } from "../services/storage.service";
 import { notificationService } from "../services/notification.service";
 import { emailService } from "../services/email/email.service";
 import { resolveEventEmail } from "../services/email/event-templates";
+import { EMAIL_BRANDING } from "../services/email/branding";
 import { collections } from "../utils/firebase";
+import { AgencyInvitation } from "../types";
 import { ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -398,14 +400,18 @@ export class AgencyController {
         relatedEntityType: "agency",
         relatedEntityId: id,
       });
+      // Deep-link straight to signup with the invitation context so the invitee
+      // lands on a "join {agency}" flow (and is auto-added on account creation)
+      // rather than the generic create-your-own-agency onboarding.
+      const inviteUrl = `${EMAIL_BRANDING.appUrl}/create-account?invite=${invitation.id}`;
       await emailService
         .sendNotification({
           to: email,
           subject: ev.subject,
           title: `${inviterName} invited you to join ${agency.name}`,
-          body: `${inviterName} has invited you to join ${agency.name} on Seli as an agent.\n\nSign in (or create your account with this email) to accept the invitation.`,
-          actionUrl: ev.actionUrl,
-          actionLabel: ev.actionLabel,
+          body: `${inviterName} has invited you to join ${agency.name} on Seli as an agent.\n\nCreate your account (or sign in) with this email to join the agency.`,
+          actionUrl: inviteUrl,
+          actionLabel: "Join agency",
         })
         .catch((e) => console.error("[invite] email failed:", e));
 
@@ -473,6 +479,37 @@ export class AgencyController {
    * POST /invitations/:id/accept
    * Accept an agency invitation
    */
+  /**
+   * GET /invitations/:id/preview  (PUBLIC — no auth)
+   *
+   * Minimal, unauthenticated lookup so the signup page can show "you're joining
+   * {agency} as an agent" before the invitee has an account. The invitation id
+   * is a random Firestore id, so possessing it is the capability. Returns only
+   * non-sensitive fields.
+   */
+  async getInvitationPreview(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+      const doc = await collections.agencyInvitations.doc(id).get();
+      if (!doc.exists) {
+        sendError(res, "NOT_FOUND", "Invitation not found", 404);
+        return;
+      }
+      const invite = doc.data() as AgencyInvitation;
+      const expired = invite.expiresAt.toMillis() < Date.now();
+      sendSuccess(res, {
+        id: invite.id,
+        agencyName: invite.agencyName,
+        invitedEmail: invite.invitedEmail,
+        status: invite.status,
+        expired,
+      });
+    } catch (error) {
+      console.error("Error previewing invitation:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
   async acceptInvitation(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
       const userId = req.userId!;
@@ -544,6 +581,48 @@ export class AgencyController {
       sendSuccess(res, { declined: true }, "Invitation declined");
     } catch (error) {
       console.error("Error declining invitation:", error);
+      const message = (error as Error).message;
+      if (message === "Invitation not found" || message === "Invitation is no longer pending") {
+        sendError(res, "VALIDATION_ERROR", message, 400);
+        return;
+      }
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * DELETE /invitations/:id
+   * Cancel (un-send) a pending invitation. Owner-initiated: only the owner of
+   * the agency the invite belongs to (or an admin) may cancel it. This is what
+   * lets an owner remove a pending invite from the members list — and frees the
+   * email to be re-invited later.
+   */
+  async cancelInvitation(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { id } = req.params;
+
+      // Load the invitation so we can authorize against its agency.
+      const invite = (await collections.agencyInvitations.doc(id).get()).data() as
+        | AgencyInvitation
+        | undefined;
+      if (!invite) {
+        sendError(res, "NOT_FOUND", "Invitation not found", 404);
+        return;
+      }
+
+      // Only the owning agency's owner (or an admin) can cancel the invite.
+      const isAdmin = req.authz?.role === ROLES.ADMIN || req.user?.admin === true;
+      const agency = await agencyService.getAgencyById(invite.agencyId);
+      if (!isAdmin && (!agency || agency.ownerId !== userId)) {
+        sendError(res, "FORBIDDEN", "Only agency owners can cancel invitations", 403);
+        return;
+      }
+
+      await agencyService.cancelInvitation(id);
+      sendSuccess(res, { id, cancelled: true }, "Invitation cancelled");
+    } catch (error) {
+      console.error("Error cancelling invitation:", error);
       const message = (error as Error).message;
       if (message === "Invitation not found" || message === "Invitation is no longer pending") {
         sendError(res, "VALIDATION_ERROR", message, 400);

@@ -104,11 +104,22 @@ invitationRoutes.get("/pending", verifyAuth, (req, res) =>
   agencyController.getMyPendingInvitations(req, res)
 );
 
+// PUBLIC — no auth: lets the signup page show the invite's agency before the
+// invitee has an account. Returns only non-sensitive fields.
+invitationRoutes.get("/:id/preview", (req, res) =>
+  agencyController.getInvitationPreview(req, res)
+);
+
 invitationRoutes.post("/:id/accept", verifyAuth, (req, res) =>
   agencyController.acceptInvitation(req, res)
 );
 invitationRoutes.post("/:id/decline", verifyAuth, (req, res) =>
   agencyController.declineInvitation(req, res)
+);
+
+// Owner-initiated cancel of a pending invite (ownership enforced in controller).
+invitationRoutes.delete("/:id", verifyAuth, (req, res) =>
+  agencyController.cancelInvitation(req, res)
 );
 
 export { agencyRoutes, invitationRoutes };

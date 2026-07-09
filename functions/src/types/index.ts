@@ -1,4 +1,12 @@
 import { Timestamp } from "firebase-admin/firestore";
+// Automated-verification result shapes live with the provider contract; the
+// compliance file below embeds them as optional signals (see the verification
+// service). One-way import (types -> verification.types), so no cycle.
+import type {
+  VerificationCheckResult,
+  VerificationCheckType,
+  ConsentRecord,
+} from "../services/verification/verification.types";
 
 // Re-export eligibility types
 export * from "./eligibility";
@@ -136,6 +144,26 @@ export interface AgencyCompliance {
   reviewedAt?: Timestamp;
   reviewedBy?: string; // Admin userId who verified/rejected
   rejectionReason?: string;
+
+  // ---- Automated verification (additive; absent on legacy docs) ----
+  // These feed the ASSISTED-REVIEW flow: on submit the platform runs provider
+  // checks and stores their normalized results here as decision signals. They do
+  // NOT change the file-level `status` semantics — an admin still approves/rejects
+  // (or auto-verify, when explicitly enabled). Optional so existing agencies and
+  // `getRequirements()` are unaffected.
+  //
+  // Progress of the automated pass, distinct from the file-level `status`:
+  //   not_started implicitly (field absent) -> checks_running -> passed | needs_review | failed
+  verificationStatus?:
+    | "not_run"
+    | "checks_running"
+    | "passed"
+    | "needs_review"
+    | "failed";
+  // Per-check normalized results, keyed by check type (BVN/NIN/CAC/doc/liveness/AML).
+  verificationChecks?: Partial<Record<VerificationCheckType, VerificationCheckResult>>;
+  // Audit log of the user's consent to government-ID lookups (NIBSS iGree / NDPA).
+  consent?: { bvn?: ConsentRecord; nin?: ConsentRecord };
 }
 
 export interface Agency {

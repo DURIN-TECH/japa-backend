@@ -26,9 +26,27 @@ import { app } from "./app";
 // bound per-function, so each email-sending function must declare them.
 const EMAIL_SECRETS = ["RESEND_API_KEY", "EMAIL_FROM"];
 
+// Automated identity/document verification (Dojah by default). Bound to `api`
+// because the compliance/KYC routes + the verification webhook live in the Express
+// app. Absent secrets => provider `isConfigured=false` => runChecks() no-ops, so
+// the manual review flow is unaffected (safe-rollout). `DOJAH_BASE_URL` selects
+// sandbox (dev) vs live (prod); `VERIFICATION_PROVIDER`/`VERIFICATION_AUTO_APPROVE`
+// are plain env (not secrets).
+const VERIFICATION_SECRETS = [
+  "DOJAH_APP_ID",
+  "DOJAH_SECRET_KEY",
+  "DOJAH_WEBHOOK_SECRET",
+  "DOJAH_BASE_URL",
+];
+
 export const api = functions
   .runWith({
-    secrets: ["PAYSTACK_SECRET_KEY", "PAYSTACK_CALLBACK_URL", ...EMAIL_SECRETS],
+    secrets: [
+      "PAYSTACK_SECRET_KEY",
+      "PAYSTACK_CALLBACK_URL",
+      ...EMAIL_SECRETS,
+      ...VERIFICATION_SECRETS,
+    ],
   })
   .https.onRequest(app);
 

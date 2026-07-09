@@ -437,6 +437,33 @@ class AgencyService {
   }
 
   /**
+   * Cancel (delete) a pending agency invitation.
+   *
+   * This is the owner-initiated counterpart to declineInvitation (which is
+   * invitee-initiated). The owner "un-sends" an invite they no longer want
+   * outstanding. We hard-delete the doc so it disappears from the members
+   * list entirely, and — importantly — so the same email can be re-invited
+   * later without a stale "pending" record blocking a fresh invite.
+   *
+   * Only pending invitations can be cancelled: an already-accepted invite
+   * corresponds to a real agent membership that must be removed via
+   * removeMember, not by deleting the invitation record.
+   */
+  async cancelInvitation(invitationId: string): Promise<void> {
+    const invitationRef = collections.agencyInvitations.doc(invitationId);
+    const invitationDoc = await invitationRef.get();
+
+    if (!invitationDoc.exists) throw new Error("Invitation not found");
+
+    const invitation = invitationDoc.data() as AgencyInvitation;
+    if (invitation.status !== "pending") {
+      throw new Error("Invitation is no longer pending");
+    }
+
+    await invitationRef.delete();
+  }
+
+  /**
    * Get all invitations for an agency
    */
   async getAgencyInvitations(agencyId: string): Promise<AgencyInvitation[]> {
