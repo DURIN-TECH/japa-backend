@@ -1,6 +1,7 @@
 import { collections, serverTimestamp } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import { Agency, AgencyCompliance, KycIdType, SettlementBank } from "../types";
+import { verificationOrchestrator } from "./verification/verification.orchestrator";
 
 // ============================================
 // COMPLIANCE (KYC / KYB / PAYOUT) SERVICE
@@ -285,6 +286,24 @@ class ComplianceService {
       submittedAt: Timestamp.now(),
     };
     delete next.rejectionReason;
+
+    // Kick off AUTOMATED verification (assisted-review signals). Safe-rollout:
+    // when the provider is unconfigured this returns null and `next` is written
+    // exactly as the manual flow always has (status stays `under_review`, no
+    // verification fields). A verification failure must NEVER block submission —
+    // we log and fall back to pure manual review.
+    try {
+      const outcome = await verificationOrchestrator.runAgencyChecks(agencyId, next);
+      if (outcome) {
+        next.verificationChecks = outcome.verificationChecks;
+        next.verificationStatus = outcome.verificationStatus;
+      }
+    } catch (err) {
+      console.error(
+        "Automated verification failed on submit (continuing to manual review):",
+        err
+      );
+    }
 
     return this.saveCompliance(agencyId, next);
   }
