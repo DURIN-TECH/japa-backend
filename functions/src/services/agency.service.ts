@@ -353,7 +353,8 @@ class AgencyService {
    */
   async acceptInvitation(
     invitationId: string,
-    agentUserId: string
+    agentUserId: string,
+    userEmail?: string
   ): Promise<void> {
     const invitationRef = collections.agencyInvitations.doc(invitationId);
     const invitationDoc = await invitationRef.get();
@@ -371,22 +372,15 @@ class AgencyService {
       throw new Error("Invitation has expired");
     }
 
-    // Find the agent by userId
+    // Find the agent by userId. An invited user may NOT have an agent profile
+    // yet — they signed up but never completed onboarding (the original bug
+    // that stranded invited agents). In that case we create one here as a
+    // member, mirroring the /onboarding/join-agency path, so accepting from the
+    // dashboard invite banner (or mobile) works without a pre-existing profile.
     const agentSnapshot = await collections.agents
       .where("userId", "==", agentUserId)
       .limit(1)
       .get();
-
-    if (agentSnapshot.empty) {
-      throw new Error("Agent profile not found");
-    }
-
-    const agentDoc = agentSnapshot.docs[0];
-    const agent = agentDoc.data() as Agent;
-
-    if (agent.agencyId) {
-      throw new Error("Agent is already part of an agency. Leave first.");
-    }
 
     // Authoritative seat check at the moment a seat is actually consumed: active
     // (non-owner) agents must be below the agency's paid `max_agents` seats.
@@ -397,16 +391,73 @@ class AgencyService {
       throw new SeatLimitError(seat.limit);
     }
 
-    // Update agent with agency membership
-    await agentDoc.ref.update({
-      agencyId: invitation.agencyId,
-      agencyRole: "agent",
-      updatedAt: serverTimestamp(),
-    });
+    if (agentSnapshot.empty) {
+      // No profile yet → create one as a verified, available member. Guard with
+      // an email match (when the caller's email is known) so an invite can only
+      // be redeemed by its intended recipient — same rule as join-agency.
+      if (userEmail && invitation.invitedEmail.toLowerCase() !== userEmail.toLowerCase()) {
+        throw new Error("This invitation was sent to a different email address.");
+      }
+
+      const userDoc = await collections.users.doc(agentUserId).get();
+      const u = userDoc.data() as User | undefined;
+      const displayName =
+        `${u?.firstName ?? ""} ${u?.lastName ?? ""}`.trim() || u?.email || "Agent";
+      const now = Timestamp.now();
+      const agentRef = collections.agents.doc();
+      const agent: Agent = {
+        id: agentRef.id,
+        userId: agentUserId,
+        agencyId: invitation.agencyId,
+        agencyRole: "agent",
+        displayName,
+        bio: "",
+        yearsOfExperience: 0,
+        specializations: [],
+        languages: ["English"],
+        featuredVisas: [],
+        verificationStatus: "verified",
+        rating: 0,
+        totalReviews: 0,
+        totalApplications: 0,
+        successRate: 0,
+        responseTime: "N/A",
+        consultationFee: 0,
+        serviceFees: {},
+        isAvailable: true,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await agentRef.set(agent);
+
+      // Reflect completed onboarding so they aren't bounced back to onboarding.
+      await collections.users.doc(agentUserId).set(
+        {
+          onboardingCompleted: true,
+          onboardingCompletedAt: now,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } else {
+      const agentDoc = agentSnapshot.docs[0];
+      const agent = agentDoc.data() as Agent;
+
+      if (agent.agencyId) {
+        throw new Error("Agent is already part of an agency. Leave first.");
+      }
+
+      // Attach the existing (agency-less) profile to the agency.
+      await agentDoc.ref.update({
+        agencyId: invitation.agencyId,
+        agencyRole: "agent",
+        updatedAt: serverTimestamp(),
+      });
+    }
 
     // Reflect agency membership in the agent's role claims.
     await claimsService
-      .setRoleClaims(agent.userId, "agent", invitation.agencyId)
+      .setRoleClaims(agentUserId, "agent", invitation.agencyId)
       .catch((e) => console.error("Failed to update claims on invite accept:", e));
 
     // Update invitation status
