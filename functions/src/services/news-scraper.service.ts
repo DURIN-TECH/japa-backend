@@ -37,7 +37,7 @@ class NewsScraperService {
       timeout: 15000,
       headers: {
         "User-Agent":
-          "Seli-VisaNewsBot/1.0 (+https://seli.app/bot)",
+          "Seli-VisaNewsBot/1.0 (+https://weareseli.com/bot)",
         Accept:
           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",

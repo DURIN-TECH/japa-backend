@@ -19,6 +19,6 @@ export const EMAIL_BRANDING = {
   /** Brand home / default destination for the footer link (custom portal domain). */
   appUrl: process.env.APP_URL || "https://portal.weareseli.com",
 
-  /** Support address shown in the footer. */
-  supportEmail: process.env.EMAIL_SUPPORT || "support@seli.app",
+  /** Support address shown in the footer / "Need help?" line. */
+  supportEmail: process.env.EMAIL_SUPPORT || "support@weareseli.com",
 } as const;
