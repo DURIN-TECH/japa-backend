@@ -18,6 +18,7 @@ import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { documentInstanceService } from "../services/document-instance.service";
 import { documentTemplateService } from "../services/document-template.service";
+import { applicationService } from "../services/application.service";
 import { collections } from "../utils/firebase";
 import {
   Agent,
@@ -204,6 +205,13 @@ export class DocumentInstanceController {
         applicationId: linkedApplicationId,
       });
 
+      // Audit: if the document was created already attached to a case, record it.
+      await this.auditToCase(
+        linkedApplicationId,
+        "Document attached",
+        `"${instance.title}" was created from a template and attached by ${createdByName}.`
+      );
+
       sendCreated(res, instance);
     } catch (error) {
       console.error("Error cloning template:", error);
@@ -267,6 +275,15 @@ export class DocumentInstanceController {
         return;
       }
 
+      // Audit: record the edit on the linked case (if any). The per-version
+      // snapshot in the versions subcollection is the fine-grained history; this
+      // timeline entry surfaces the activity on the case screen.
+      await this.auditToCase(
+        result.instance.applicationId,
+        "Document updated",
+        `"${result.instance.title}" was edited by ${editorName} (version ${result.instance.version}).`
+      );
+
       sendSuccess(res, result.instance);
     } catch (error) {
       console.error("Error saving document instance:", error);
@@ -279,6 +296,7 @@ export class DocumentInstanceController {
    */
   async link(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
+      const userId = req.userId!;
       const { id } = req.params;
       const { applicationId } = req.body ?? {};
 
@@ -307,10 +325,34 @@ export class DocumentInstanceController {
         }
       }
 
+      const previousApplicationId = existing.applicationId;
+      const nextApplicationId = (applicationId as string | null) ?? null;
       const updated = await documentInstanceService.setApplication(
         id,
-        applicationId ?? null
+        nextApplicationId
       );
+
+      // Audit the attach/detach on the affected case timelines.
+      if (previousApplicationId !== nextApplicationId) {
+        const actor = await this.resolveDisplayName(userId);
+        // Detach from the previous case (if it was linked to a different one).
+        if (previousApplicationId) {
+          await this.auditToCase(
+            previousApplicationId,
+            "Document detached",
+            `"${existing.title}" was detached from this case by ${actor}.`
+          );
+        }
+        // Attach to the new case (if now linked).
+        if (nextApplicationId) {
+          await this.auditToCase(
+            nextApplicationId,
+            "Document attached",
+            `"${existing.title}" was attached to this case by ${actor}.`
+          );
+        }
+      }
+
       sendSuccess(res, updated);
     } catch (error) {
       console.error("Error linking document instance:", error);
@@ -343,6 +385,17 @@ export class DocumentInstanceController {
       }
 
       const updated = await documentInstanceService.setShareStatus(id, shareStatus);
+
+      // Audit the share/unshare on the linked case (if any).
+      const actor = await this.resolveDisplayName(req.userId!);
+      await this.auditToCase(
+        existing.applicationId,
+        shareStatus === "shared" ? "Document shared with client" : "Document sharing revoked",
+        shareStatus === "shared"
+          ? `"${existing.title}" was shared with the client by ${actor}.`
+          : `Sharing of "${existing.title}" with the client was revoked by ${actor}.`
+      );
+
       sendSuccess(res, updated);
     } catch (error) {
       console.error("Error updating share status:", error);
@@ -369,6 +422,15 @@ export class DocumentInstanceController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
+
+      // Audit the removal on the linked case (if any) BEFORE deleting, while we
+      // still hold the instance's title + link.
+      const actor = await this.resolveDisplayName(req.userId!);
+      await this.auditToCase(
+        existing.applicationId,
+        "Document removed",
+        `"${existing.title}" was deleted by ${actor}.`
+      );
 
       await documentInstanceService.delete(id);
       sendSuccess(res, { id });
@@ -420,6 +482,33 @@ export class DocumentInstanceController {
       agentId: instance.createdBy,
       userId: instance.createdBy,
     });
+  }
+
+  /**
+   * Audit trail: append an entry to the linked application's case timeline (the
+   * same feed shown on the case-detail screen), so document actions — attach,
+   * detach, edit, share, delete — are visible in the case history.
+   *
+   * Best-effort and non-fatal: a timeline write failure must never fail the
+   * underlying document operation, so errors are swallowed with a log. No-ops
+   * when there is no linked application (nothing to attach the audit to).
+   */
+  private async auditToCase(
+    applicationId: string | null | undefined,
+    title: string,
+    description: string
+  ): Promise<void> {
+    if (!applicationId) return;
+    try {
+      await applicationService.addTimelineEntry(applicationId, {
+        title,
+        description,
+        status: "completed",
+        responsibility: "agent",
+      });
+    } catch (error) {
+      console.error("[document-instance] audit timeline write failed:", error);
+    }
   }
 
   /**
