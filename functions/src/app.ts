@@ -31,6 +31,7 @@ import {
   adminPlansRouter,
   webhooksRouter,
 } from "./routes/entitlement.routes";
+import { verificationWebhookRoutes } from "./routes/verification-webhook.routes";
 
 // Create Express app
 const app = express();
@@ -43,6 +44,8 @@ app.use(cors({
 // Provider webhooks must read the RAW body to verify signatures, so mount them
 // BEFORE the global JSON parser consumes the stream.
 app.use("/webhooks", webhooksRouter);
+// Verification provider async results (document/liveness) — also raw-body + HMAC.
+app.use("/webhooks", verificationWebhookRoutes);
 app.use(express.json());
 
 // Request logging
