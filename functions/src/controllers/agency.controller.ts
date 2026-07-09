@@ -515,7 +515,9 @@ export class AgencyController {
       const userId = req.userId!;
       const { id } = req.params;
 
-      await agencyService.acceptInvitation(id, userId);
+      // Pass the caller's email so the service can enforce the invite-email
+      // match when it has to create a fresh member profile.
+      await agencyService.acceptInvitation(id, userId, req.user?.email);
 
       // Notify the inviting owner that the agent accepted.
       const invite = (await collections.agencyInvitations.doc(id).get()).data();
@@ -544,7 +546,7 @@ export class AgencyController {
         message === "Invitation not found" ||
         message === "Invitation is no longer pending" ||
         message === "Invitation has expired" ||
-        message === "Agent profile not found" ||
+        message === "This invitation was sent to a different email address." ||
         message === "Agent is already part of an agency. Leave first."
       ) {
         sendError(res, "VALIDATION_ERROR", message, 400);
