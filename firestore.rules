@@ -26,7 +26,28 @@ service cloud.firestore {
     function isAgent() {
       return isAuthenticated() && request.auth.token.agent == true;
     }
-    
+
+    // ---- RBAC role-claim helpers (canonical claims: role + agencyId) ----
+    // The current auth system stores a `role` claim (admin/owner/agent/client)
+    // and an `agencyId` claim, keeping the legacy `admin` boolean in sync. These
+    // helpers key off the canonical `role` claim (with legacy fallbacks) so rules
+    // stay correct for tokens minted by the RBAC layer.
+
+    // Any agent-side principal: agent, owner, or admin.
+    function isAgentSide() {
+      return isAuthenticated() &&
+        (request.auth.token.role in ['agent', 'owner', 'admin'] ||
+         request.auth.token.admin == true);
+    }
+
+    // Agency owner scoped to a specific agency (via the agencyId claim).
+    function isAgencyOwner(agencyId) {
+      return isAuthenticated() &&
+        request.auth.token.role == 'owner' &&
+        agencyId != null &&
+        request.auth.token.agencyId == agencyId;
+    }
+
     // Check if request has valid data
     function hasRequiredFields(fields) {
       return request.resource.data.keys().hasAll(fields);
@@ -337,6 +358,79 @@ service cloud.firestore {
         
         // Messages cannot be updated or deleted
         allow update, delete: if false;
+      }
+    }
+
+    // ============================================
+    // DOCUMENT TEMPLATES COLLECTION
+    // ============================================
+    //
+    // Read-only clonable catalog. All writes go through the backend (Admin SDK,
+    // which bypasses these rules) — there is no client authoring path — so direct
+    // writes are denied. Reads are agent-side only and scope-limited: everyone
+    // sees "global" templates; "agency" templates only within the owning agency.
+
+    match /documentTemplates/{templateId} {
+      allow read: if isAdmin() ||
+                    (isAgentSide() &&
+                     (resource.data.scope == 'global' ||
+                      resource.data.get('agencyId', null) == request.auth.token.agencyId));
+
+      // Seeded / authored exclusively via the backend.
+      allow write: if false;
+    }
+
+    // ============================================
+    // DOCUMENT INSTANCES COLLECTION
+    // ============================================
+    //
+    // Editable documents cloned from templates. Every mutation (clone, save,
+    // link, share, delete) goes through the API, which enforces authorization and
+    // optimistic-concurrency versioning — so direct client writes are denied to
+    // prevent bypassing the version check. Reads are granted to:
+    //   - the authoring agent (createdBy)
+    //   - the owning agency's owner (agencyId matches the owner's claim)
+    //   - platform admins
+    //   - the linked application's client, but ONLY once the doc is shared
+    //     (supports the mobile "share with client" phase)
+
+    match /documentInstances/{instanceId} {
+      // Reusable read predicate (also used by the versions subcollection).
+      function canReadInstance() {
+        return isAdmin() ||
+          (isAuthenticated() && resource.data.createdBy == request.auth.uid) ||
+          isAgencyOwner(resource.data.get('agencyId', null)) ||
+          (resource.data.shareStatus == 'shared' &&
+           resource.data.applicationId != null &&
+           isOwner(
+             get(/databases/$(database)/documents/applications/$(resource.data.applicationId)).data.userId
+           ));
+      }
+
+      allow read: if canReadInstance();
+
+      // All writes flow through the backend (Admin SDK), which owns the version
+      // increment + snapshot. No direct client writes.
+      allow write: if false;
+
+      // Immutable content snapshots (version history). Same read scope as the
+      // parent instance; the parent doc is fetched to evaluate access. Written
+      // only by the backend alongside each save.
+      match /versions/{versionId} {
+        function parentInstance() {
+          return get(/databases/$(database)/documents/documentInstances/$(instanceId)).data;
+        }
+
+        allow read: if isAdmin() ||
+          (isAuthenticated() && parentInstance().createdBy == request.auth.uid) ||
+          isAgencyOwner(parentInstance().get('agencyId', null)) ||
+          (parentInstance().shareStatus == 'shared' &&
+           parentInstance().applicationId != null &&
+           isOwner(
+             get(/databases/$(database)/documents/applications/$(parentInstance().get('applicationId', null))).data.userId
+           ));
+
+        allow write: if false;
       }
     }
   }
