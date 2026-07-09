@@ -12,11 +12,13 @@
 
 name: Deploy to Dev
 
-# Trigger on pushes to the dev branch only
+# Trigger on pushes to the dev branch, or manually (to re-deploy + re-seed dev
+# on demand without pushing a commit).
 on:
   push:
     branches:
       - dev
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -71,3 +73,27 @@ jobs:
           printf '%s' "$FIREBASE_SA_KEY" > "$RUNNER_TEMP/sa-key.json"
           export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa-key.json"
           npx --yes firebase-tools@15.22.0 deploy --project dev --force
+
+      # Seed the dev project with the baseline test dataset (auth users,
+      # agencies, agents, clients, countries/visas, applications, plans,
+      # subscriptions, document templates, RBAC claims) so dev is always ready
+      # for testing with no manual step.
+      #
+      # SAFE TO RUN EVERY DEPLOY — the consolidated seeder (scripts/seed-all.ts)
+      # is idempotent: it uses deterministic auth/document IDs, skips auth users
+      # that already exist, and upserts Firestore docs with set()/merge. So a
+      # re-run refreshes the seed baseline (and role claims) without duplicating
+      # data or erroring, and it never deletes anything — data you created while
+      # testing (which has random IDs) is left untouched.
+      #
+      # Auth: reuses the same ci-deployer SA key as the deploy step. seed:dev
+      # targets durin-seli-dev explicitly (`--project durin-seli-dev`), so it can
+      # never touch prod, and prod's seed guard stays intact regardless.
+      - name: Seed dev data (idempotent)
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DEV }}
+        working-directory: functions
+        run: |
+          printf '%s' "$FIREBASE_SA_KEY" > "$RUNNER_TEMP/sa-key.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa-key.json"
+          npm run seed:dev

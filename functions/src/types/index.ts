@@ -70,6 +70,74 @@ export interface AgencyService {
   price: number; // In cents
 }
 
+// ============================================
+// COMPLIANCE (KYC / KYB / PAYOUT) TYPES
+// ============================================
+
+// Lifecycle of an agency's compliance file. This is DISTINCT from `AgencyStatus`
+// (which gates admission to the platform). An agency can be `approved` on the
+// platform yet still be `not_started` on compliance — and it is compliance
+// verification, not platform admission, that unlocks payments and the ability to
+// be assigned platform-originated ("our") clients.
+//   not_started  – nothing captured yet
+//   in_progress  – some fields/docs saved, not yet submitted
+//   under_review – all required items submitted, awaiting an admin decision
+//   verified     – admin approved; payments + platform clients unlocked
+//   rejected     – admin rejected; agency must fix items and resubmit
+export type ComplianceStatus =
+  | "not_started"
+  | "in_progress"
+  | "under_review"
+  | "verified"
+  | "rejected";
+
+// Government ID types accepted for owner KYC (Nigeria-focused).
+export type KycIdType =
+  | "nin"
+  | "passport"
+  | "drivers_license"
+  | "voters_card";
+
+// Settlement bank account used for Paystack payouts (KYB payout leg).
+export interface SettlementBank {
+  bankName: string;
+  bankCode?: string; // Paystack bank code, when resolved
+  accountNumber: string;
+  accountName: string;
+}
+
+// The full compliance file attached to an Agency. Fields are optional because
+// they are captured incrementally; `getComplianceRequirements()` on the service
+// derives which required items are still outstanding before an agency may submit.
+export interface AgencyCompliance {
+  status: ComplianceStatus;
+
+  // ---- KYC: identity of the agency owner (the natural person) ----
+  legalFirstName?: string;
+  legalLastName?: string;
+  dateOfBirth?: Timestamp;
+  idType?: KycIdType;
+  idNumber?: string; // NIN / passport no. / etc.
+  bvn?: string; // Bank Verification Number (Nigeria)
+  idDocumentPath?: string; // Storage path to the government ID scan
+  proofOfAddressPath?: string; // Storage path to a proof-of-address doc/selfie
+
+  // ---- KYB: the business (the agency legal entity) ----
+  rcNumber?: string; // CAC RC/BN registration number
+  tin?: string; // Tax Identification Number
+  businessAddress?: string;
+  cacDocumentPath?: string; // Storage path to the CAC registration certificate
+
+  // ---- Payout: where settlements are paid ----
+  settlementBank?: SettlementBank;
+
+  // ---- Review metadata ----
+  submittedAt?: Timestamp;
+  reviewedAt?: Timestamp;
+  reviewedBy?: string; // Admin userId who verified/rejected
+  rejectionReason?: string;
+}
+
 export interface Agency {
   id: string;
   name: string;
@@ -93,11 +161,16 @@ export interface Agency {
   totalCases: number;
   activeCases: number;
 
-  // Approval status
+  // Approval status (platform admission — set during onboarding review)
   status: AgencyStatus;
   rejectionReason?: string;
   reviewedBy?: string; // Admin userId who approved/rejected
   reviewedAt?: Timestamp;
+
+  // Compliance file (KYC/KYB/payout). Absent until the owner starts it.
+  // Compliance `verified` — not platform `status: "approved"` — is what unlocks
+  // payments and assignment of platform-originated clients.
+  compliance?: AgencyCompliance;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -710,6 +783,10 @@ export type NotificationType =
   // Verification
   | "verification_approved"
   | "verification_rejected"
+  // Compliance (agency KYC/KYB/payout)
+  | "compliance_submitted" // Owner submitted the compliance file for review
+  | "compliance_approved" // Admin verified the agency's compliance
+  | "compliance_rejected" // Admin rejected; items need fixing
   // Account / engagement
   | "welcome"
   | "role_changed"
@@ -769,12 +846,110 @@ export interface Conversation {
   userId: string;
   agentId: string;
   applicationId?: string;
-  
+
   lastMessageAt: Timestamp;
   lastMessage?: string;
   unreadCountUser: number;
   unreadCountAgent: number;
-  
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+// ============================================
+// DOCUMENT TEMPLATE TYPES
+// ============================================
+//
+// The "document templates" feature (distinct from the file-upload `Document`
+// above): agents clone a rich-text template from a catalog into an editable
+// `DocumentInstance`, optionally linked to an application, optionally shared
+// with the mobile client. Content is stored as ProseMirror JSON — an opaque
+// structured document that the portal's rich-text editor round-trips.
+//
+// Mirrors the portal contract in japa-portal/src/types/api.ts (which uses
+// `string` dates); here we use Firestore `Timestamp` and rely on the standard
+// serialization (`{ _seconds, _nanoseconds }`) the portal mappers already
+// handle. Kept in sync with the portal type names deliberately.
+
+/**
+ * ProseMirror JSON document. Opaque to the backend — we store and return it
+ * verbatim; only the editor interprets `content`. Typed loosely so we never
+ * couple the backend to a specific schema/version of the editor.
+ */
+export type ProseMirrorDoc = { type: "doc"; content?: unknown[] } & Record<
+  string,
+  unknown
+>;
+
+/** Catalog grouping for templates (drives the portal's Category column). */
+export type TemplateCategory = "cover_letter" | "sop" | "affidavit" | "other";
+
+/**
+ * Ownership scope of a template:
+ *   - "global": authored by Seli, visible to every agency (no `agencyId`).
+ *   - "agency": authored by an agency, visible only within that agency.
+ */
+export type TemplateScope = "global" | "agency";
+
+/** Lifecycle of an editable instance (agent-driven; not client-visible). */
+export type DocumentInstanceStatus = "draft" | "final";
+
+/** Whether the linked mobile client can see the instance yet. */
+export type DocumentShareStatus = "private" | "shared";
+
+/**
+ * A clonable template in the catalog. `content` is only loaded on demand
+ * (single-fetch with `?includeContent=true`) since it can be large; list
+ * responses omit it.
+ */
+export interface DocumentTemplate {
+  id: string;
+  title: string;
+  description?: string;
+  category: TemplateCategory;
+  scope: TemplateScope;
+  agencyId?: string; // present only when scope === "agency"
+  schemaVersion: number; // editor/content schema version (for future migrations)
+  content?: ProseMirrorDoc; // omitted in list responses
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+/**
+ * An editable document cloned from a template. Carries the fields the shared
+ * CASL "Document" ability matches on for authorization:
+ *   - `agencyId`  → agency owners manage every instance in their agency
+ *   - `createdBy` → the authoring agent (surfaced to CASL as `agentId`)
+ */
+export interface DocumentInstance {
+  id: string;
+  title: string;
+  templateId: string; // source template
+  agencyId?: string; // owning agency (absent for independent agents)
+  createdBy: string; // authoring agent's userId
+  applicationId: string | null; // linked case; null until linked
+  status: DocumentInstanceStatus;
+  shareStatus: DocumentShareStatus;
+  version: number; // optimistic-concurrency token; incremented on every save
+  schemaVersion: number; // copied from the source template at clone time
+  content?: ProseMirrorDoc; // omitted in list responses, present on get-one
+  // Denormalized display names (avoid client-side user lookups)
+  createdByName?: string;
+  updatedByName?: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+/**
+ * An immutable snapshot of an instance's content, written on each successful
+ * save. Enables the editor's version history (`GET /:id/versions`). Stored in a
+ * `versions` subcollection under the instance.
+ */
+export interface DocumentVersion {
+  id: string;
+  instanceId: string;
+  version: number;
+  updatedByName?: string; // who produced this version
+  content?: ProseMirrorDoc; // the content at this version
+  createdAt: Timestamp;
 }

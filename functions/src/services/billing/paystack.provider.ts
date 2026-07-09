@@ -98,6 +98,85 @@ export class PaystackProvider implements BillingProvider {
     return { url: data.authorization_url, reference: data.reference, provider: this.name };
   }
 
+  /**
+   * Ensure a Paystack Plan exists for a recurring package and return its `plan_code`.
+   * Paystack only auto-recurs against a Plan object, so each paid package needs one.
+   * Our `interval` ("month"/"year") maps to Paystack's cadence vocabulary
+   * ("monthly"/"annually"). The returned code is stored on the plan doc
+   * (`paystackPlanCode`) and later passed to `createCheckout`, which turns the
+   * transaction into a subscription.
+   *
+   * Note: this always creates a NEW plan. Idempotency is handled by the caller
+   * (the sync script skips packages that already carry a `paystackPlanCode`).
+   */
+  async ensurePlan(input: {
+    name: string;
+    amountKobo: number;
+    interval: "month" | "year";
+  }): Promise<string> {
+    const paystackInterval = input.interval === "year" ? "annually" : "monthly";
+    const res = await this.client().post<{ data: { plan_code: string } }>("/plan", {
+      name: input.name,
+      amount: input.amountKobo,
+      interval: paystackInterval,
+      currency: "NGN",
+    });
+    return res.data.data.plan_code;
+  }
+
+  /**
+   * Charge a customer's saved card (authorization) server-side, with no redirect.
+   * Used for the prorated one-off seat charge: the owner already paid once (so we
+   * hold an `authorization_code`), and the seat cost is small and known, so there's
+   * no need to bounce them through hosted checkout again. Returns the transaction
+   * status + reference (status "success" means the card was charged).
+   */
+  async chargeAuthorization(input: {
+    authorizationCode: string;
+    email: string;
+    amountKobo: number;
+    metadata?: Record<string, string>;
+  }): Promise<{ status: string; reference: string }> {
+    const res = await this.client().post<{ data: { status: string; reference: string } }>(
+      "/transaction/charge_authorization",
+      {
+        authorization_code: input.authorizationCode,
+        email: input.email,
+        amount: input.amountKobo,
+        currency: "NGN",
+        metadata: input.metadata,
+      }
+    );
+    return { status: res.data.data.status, reference: res.data.data.reference };
+  }
+
+  /**
+   * Create a subscription directly against a customer + plan using their saved
+   * authorization, optionally starting on a future date. This is how we step the
+   * recurring amount up/down at the *next* renewal: after charging just the seat
+   * now, we point a new subscription (at the new total's plan) to begin at the
+   * current period end. Returns a combined "code:token" providerRef (both are
+   * needed to later disable it — see `cancelSubscription`).
+   */
+  async createSubscription(input: {
+    customerCode: string;
+    planCode: string;
+    authorizationCode: string;
+    /** ISO datetime for the first charge (Paystack accepts a future `start_date`). */
+    startDate?: string | null;
+  }): Promise<string> {
+    const res = await this.client().post<{
+      data: { subscription_code: string; email_token: string };
+    }>("/subscription", {
+      customer: input.customerCode,
+      plan: input.planCode,
+      authorization: input.authorizationCode,
+      ...(input.startDate ? { start_date: input.startDate } : {}),
+    });
+    const { subscription_code, email_token } = res.data.data;
+    return `${subscription_code}:${email_token}`;
+  }
+
   /** Verify a transaction by reference (post-redirect confirmation). */
   async verifyTransaction(reference: string): Promise<NormalizedSubscriptionEvent | null> {
     const res = await this.client().get<{ data: PaystackVerifyData }>(
@@ -157,18 +236,37 @@ export class PaystackProvider implements BillingProvider {
       return null;
     }
 
-    const meta = body.data?.metadata;
-    const ref = body.data?.reference ?? body.data?.subscription_code ?? null;
+    const data = body.data;
+    const meta = data?.metadata;
+    const ref = data?.reference ?? data?.subscription_code ?? null;
+    // Paystack's next auto-charge date — our subscription's currentPeriodEnd (the
+    // renewal date shown in the plan summary). Present on subscription/invoice events.
+    const periodEnd = data?.next_payment_date ?? null;
+
     switch (body.event) {
-    case "charge.success":
     case "subscription.create":
-      return this.toEvent("activated", meta, ref, body.data);
+      // First successful subscription charge — activate with the real renewal date.
+      return this.toEvent("activated", meta, ref, data, periodEnd);
+    case "charge.success":
+      // A successful charge (may be the first one). No renewal date on this event;
+      // billing.service estimates one from the plan interval if still missing.
+      return this.toEvent("activated", meta, ref, data, periodEnd);
+    case "invoice.create":
     case "invoice.update":
+      // Recurring invoice outcome: a paid invoice is a renewal (carries the next
+      // renewal date); an unpaid one means the charge failed → past due.
+      return this.toEvent(
+        data?.paid || data?.status === "success" ? "renewed" : "past_due",
+        meta,
+        ref,
+        data,
+        periodEnd
+      );
     case "invoice.payment_failed":
-      return this.toEvent("past_due", meta, ref, body.data);
+      return this.toEvent("past_due", meta, ref, data, periodEnd);
     case "subscription.disable":
     case "subscription.not_renew":
-      return this.toEvent("canceled", meta, ref, body.data);
+      return this.toEvent("canceled", meta, ref, data, periodEnd);
     default:
       return null;
     }
@@ -178,7 +276,8 @@ export class PaystackProvider implements BillingProvider {
     type: NormalizedSubscriptionEvent["type"],
     meta: PaystackMetadata | undefined,
     providerRef: string | null,
-    raw: unknown
+    raw: unknown,
+    currentPeriodEnd: string | null = null
   ): NormalizedSubscriptionEvent | null {
     if (!meta?.subscriberType || !meta?.subscriberId || !meta?.planId) return null;
     const status =
@@ -189,6 +288,7 @@ export class PaystackProvider implements BillingProvider {
       subscriberId: meta.subscriberId,
       planId: meta.planId,
       status,
+      currentPeriodEnd,
       provider: this.name,
       providerRef,
       raw,
@@ -201,17 +301,33 @@ interface PaystackMetadata {
   subscriberId?: string;
   planId?: string;
 }
-interface PaystackVerifyData {
+
+/**
+ * The subset of a Paystack charge/verify payload we read off `event.raw` in
+ * billing.service — the saved-card authorization + customer identifiers needed to
+ * charge again server-side and to (re)create subscriptions.
+ */
+export interface PaystackChargeRaw {
+  authorization?: { authorization_code?: string };
+  customer?: { customer_code?: string };
+}
+
+interface PaystackVerifyData extends PaystackChargeRaw {
   status: string;
   reference: string;
   metadata?: PaystackMetadata;
 }
 interface PaystackWebhookBody {
   event: string;
-  data?: {
+  data?: PaystackChargeRaw & {
     reference?: string;
     subscription_code?: string;
     metadata?: PaystackMetadata;
+    /** ISO date of the next auto-charge — maps to our `currentPeriodEnd`. */
+    next_payment_date?: string;
+    /** Invoice charge outcome flags (recurring renewals). */
+    paid?: boolean;
+    status?: string;
   };
 }
 

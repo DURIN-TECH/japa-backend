@@ -112,6 +112,7 @@ async function main() {
     const { seedPortalData } = await import("../data/seed-portal-data");
     const { seedNigeriaIrelandEligibility } = await import("../data/eligibility-seed-nigeria-ireland");
     const { seedNewsSources } = await import("../data/seed-news-sources");
+    const { seedDocumentTemplates } = await import("../data/seed-document-templates");
     const { seedPlans } = await import("./seed-plans");
     const { seedSubscriptions } = await import("./seed-subscriptions");
     const { backfillClaims } = await import("./backfill-claims");
@@ -131,6 +132,11 @@ async function main() {
     // 3. News sources — feed definitions the scraper polls.
     console.log("→ Seeding news sources...");
     const newsCount = await seedNewsSources();
+
+    // 3b. Document templates — the global rich-text catalog agents clone from.
+    //     Independent of portal data; safe to run any time after admin init.
+    console.log("→ Seeding document templates...");
+    const documentTemplatesCount = await seedDocumentTemplates();
 
     // 4. Subscription plans — the RBAC/entitlement billing catalog. Without these
     //    the portal/mobile "Available plans" list is empty and upgrades can't start.
@@ -174,6 +180,8 @@ async function main() {
     console.log(`  - Exemptions:      ${eligibility.exemptionsSeeded}`);
     console.log("News:");
     console.log(`  - Sources:         ${newsCount}`);
+    console.log("Documents:");
+    console.log(`  - Templates:       ${documentTemplatesCount}`);
     console.log("Billing / RBAC:");
     console.log(`  - Plans:           ${plansCount}`);
     console.log(`  - Subscriptions:   ${subCounts.agency + subCounts.clients} (agency + ${subCounts.clients} clients)`);
