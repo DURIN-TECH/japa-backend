@@ -64,6 +64,26 @@ class ClaimsService {
   }
 
   /**
+   * Suspend or restore a user's account access.
+   *
+   * Sets a `disabled` custom claim (hard-checked by verifyAuth to block every
+   * request) and, when disabling, REVOKES the user's refresh tokens so their
+   * live session dies on the very next request: the existing ID token fails the
+   * checkRevoked verification (→ 401), and any token re-issued after this call
+   * carries `disabled: true` (→ 403). Restoring just clears the claim; the user
+   * signs in again to obtain a clean token. Best-effort/idempotent.
+   */
+  async setAccountDisabled(uid: string, disabled: boolean): Promise<void> {
+    const user = await auth.getUser(uid);
+    const existing = user.customClaims || {};
+    await auth.setCustomUserClaims(uid, { ...existing, disabled });
+    if (disabled) {
+      // Kill the live session immediately — forces re-auth on the next request.
+      await auth.revokeRefreshTokens(uid);
+    }
+  }
+
+  /**
    * Resolve a user's effective role from current Firestore state — the canonical
    * resolver used for migration, lazy backfill, and admin demotion.
    *

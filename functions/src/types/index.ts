@@ -14,6 +14,9 @@ export * from "./eligibility";
 // Re-export news types
 export * from "./news";
 
+// Re-export visa-catalog scraper types
+export * from "./visa-catalog";
+
 // ============================================
 // USER TYPES
 // ============================================
@@ -337,6 +340,11 @@ export interface VisaType {
   // Official application
   applicationUrl?: string; // URL to official online application form (e.g., AVATS for Ireland)
   applicationInstructions?: string; // Brief instructions for completing official application
+
+  // Provenance (set when a value comes from the visa-catalog scraper + approval).
+  // Note: the `source` flag lives in the "Admin review" block below.
+  sourceUrl?: string; // official URL this record was last verified against
+  lastVerifiedAt?: Timestamp; // when an agent last approved a scraped update
 
   // Stats
   successRate?: number;
@@ -805,6 +813,8 @@ export type NotificationType =
   | "invitation_accepted"
   | "invitation_declined"
   | "agency_member_removed"
+  | "agent_suspended" // Owner suspended the agent's access (temporary)
+  | "agent_deactivated" // Owner deactivated the agent (access revoked)
   | "agency_pending_review" // Agency created, awaiting admin approval
   | "agency_approved"
   | "agency_rejected"

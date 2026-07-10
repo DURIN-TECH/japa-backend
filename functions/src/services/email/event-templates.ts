@@ -200,6 +200,16 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     actionLabel: "Open dashboard",
     path: () => "/dashboard",
   },
+  agent_suspended: {
+    subject: "Your access has been suspended",
+    actionLabel: "View details",
+    path: () => "/account-suspended",
+  },
+  agent_deactivated: {
+    subject: "Your account has been deactivated",
+    actionLabel: "View details",
+    path: () => "/account-suspended",
+  },
   agency_pending_review: {
     subject: "Your agency is awaiting approval",
     actionLabel: "View review status",
