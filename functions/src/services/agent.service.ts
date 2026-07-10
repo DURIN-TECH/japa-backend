@@ -6,6 +6,7 @@ import {
   AvailabilitySlot,
 } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
+import { claimsService } from "./claims.service";
 
 export interface CreateAgentInput {
   userId: string;
@@ -235,6 +236,23 @@ class AgentService {
     }
 
     await agentRef.update(updates);
+
+    // Enforce the status at the AUTH layer, not just cosmetically: suspending or
+    // rejecting an agent disables their account (revokes their session + sets a
+    // `disabled` claim so verifyAuth blocks every request); verifying re-enables
+    // it. Best-effort — a claims hiccup must not fail the status write, but log.
+    const agent = doc.data() as Agent;
+    if (agent.userId) {
+      if (status === "rejected" || status === "suspended") {
+        await claimsService
+          .setAccountDisabled(agent.userId, true)
+          .catch((e) => console.error("Failed to disable agent account:", e));
+      } else if (status === "verified") {
+        await claimsService
+          .setAccountDisabled(agent.userId, false)
+          .catch((e) => console.error("Failed to re-enable agent account:", e));
+      }
+    }
 
     const updated = await agentRef.get();
     return updated.data() as Agent;

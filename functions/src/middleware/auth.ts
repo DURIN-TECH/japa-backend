@@ -96,9 +96,26 @@ export async function verifyAuth(
   const token = authHeader.split("Bearer ")[1];
 
   try {
-    const decodedToken = await auth.verifyIdToken(token);
+    // checkRevoked=true so a suspended/rejected agent (whose refresh tokens were
+    // revoked) is rejected on their very next request — an immediate force-logout
+    // rather than waiting up to an hour for their ID token to expire.
+    const decodedToken = await auth.verifyIdToken(token, true);
     req.user = decodedToken;
     req.userId = decodedToken.uid;
+
+    // Hard block for disabled accounts (agent suspended or rejected). The claim
+    // rides in the token, so no DB read is needed; combined with the token
+    // revocation above, a re-issued token still carries `disabled` and is
+    // blocked here. The distinct code lets the portal show a suspended screen.
+    if (decodedToken.disabled === true) {
+      res.status(403).json({
+        success: false,
+        error: "ACCOUNT_SUSPENDED",
+        message: "Your access has been suspended. Please contact your agency owner.",
+      });
+      return;
+    }
+
     await attachAuthz(req);
 
     // Read-only enforcement: a lapsed/unpaid plan may read but not write. Block
