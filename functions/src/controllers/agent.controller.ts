@@ -493,6 +493,25 @@ export class AgentController {
         ownerUserId
       );
 
+      // Notify the affected agent. This is also the audit record for the action:
+      // agency/agent lifecycle events are captured in the notifications feed (+
+      // email), so without this the suspend/deactivate left no trace. Best-effort.
+      if (agent.userId) {
+        const suspended = status === "suspended";
+        await notificationService
+          .notifyUser({
+            userId: agent.userId,
+            type: suspended ? "agent_suspended" : "agent_deactivated",
+            title: suspended ? "Access suspended" : "Account deactivated",
+            body: suspended
+              ? `Your access at ${agency.name} has been suspended. Please contact your agency owner.`
+              : `Your account at ${agency.name} has been deactivated — you no longer have access.`,
+            relatedEntityType: "agency",
+            relatedEntityId: agency.id,
+          })
+          .catch((e) => console.error("[agent] status-change notify failed:", e));
+      }
+
       sendSuccess(res, updated, `Agent ${status}`);
     } catch (error) {
       console.error("Error updating agent status:", error);
