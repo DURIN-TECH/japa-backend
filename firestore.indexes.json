@@ -1,6 +1,14 @@
 {
   "indexes": [
     {
+      "collectionGroup": "visaSources",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "nextCrawlAt", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "agents",
       "queryScope": "COLLECTION",
       "fields": [
