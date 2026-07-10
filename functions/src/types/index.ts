@@ -14,9 +14,6 @@ export * from "./eligibility";
 // Re-export news types
 export * from "./news";
 
-// Re-export visa-catalog scraper types
-export * from "./visa-catalog";
-
 // ============================================
 // USER TYPES
 // ============================================
