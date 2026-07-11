@@ -44,6 +44,20 @@ agencyRoutes.post("/me/compliance/submit", verifyAuth, (req, res) =>
   complianceController.submitForReview(req, res)
 );
 
+// PUBLIC — no auth: agency discovery directory for the mobile app. Mounted the
+// same way as the public GET /agents. These MUST be registered before the
+// "/:id" param routes so the literal "browse" segment can't be captured as an
+// ":id". Each returns the PUBLIC-safe agency projection only.
+agencyRoutes.get("/browse", (req, res) =>
+  agencyController.browseAgencies(req, res)
+);
+agencyRoutes.get("/browse/:id", (req, res) =>
+  agencyController.getPublicAgency(req, res)
+);
+agencyRoutes.get("/browse/:id/agents", (req, res) =>
+  agencyController.getPublicAgencyAgents(req, res)
+);
+
 agencyRoutes.post("/", verifyAuth, (req, res) =>
   agencyController.createAgency(req, res)
 );

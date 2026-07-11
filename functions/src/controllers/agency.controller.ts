@@ -1,6 +1,7 @@
-import { Response } from "express";
+import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { agencyService, SeatLimitError } from "../services/agency.service";
+import { agentService } from "../services/agent.service";
 import { storageService } from "../services/storage.service";
 import { notificationService } from "../services/notification.service";
 import { emailService } from "../services/email/email.service";
@@ -243,6 +244,91 @@ export class AgencyController {
       sendSuccess(res, updated, "Agency logo updated successfully");
     } catch (error) {
       console.error("Error setting agency logo:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  // ============================================
+  // PUBLIC BROWSING (unauthenticated directory)
+  // ============================================
+
+  /**
+   * GET /agencies/browse  (PUBLIC — no auth)
+   *
+   * List publicly-visible agencies for the mobile discovery directory.
+   * "Publicly visible" == platform-approved (status === "approved"); pending,
+   * rejected and suspended agencies are never returned. Each item is the
+   * PUBLIC-safe projection only (see PublicAgency) — no private/compliance data.
+   *
+   * Optional query params:
+   *   - ?limit=<n>     cap the number of results (max 100)
+   *   - ?search=<text> case-insensitive substring match on agency name
+   */
+  async browseAgencies(req: Request, res: Response): Promise<void> {
+    try {
+      const limitRaw = req.query.limit as string | undefined;
+      const search = req.query.search as string | undefined;
+      const parsedLimit = limitRaw ? parseInt(limitRaw, 10) : undefined;
+
+      const agencies = await agencyService.listPublicAgencies({
+        // Ignore a non-numeric ?limit= rather than passing NaN through.
+        limit:
+          parsedLimit !== undefined && Number.isFinite(parsedLimit)
+            ? parsedLimit
+            : undefined,
+        search,
+      });
+
+      sendSuccess(res, agencies);
+    } catch (error) {
+      console.error("Error browsing agencies:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /agencies/browse/:id  (PUBLIC — no auth)
+   *
+   * Fetch a single agency's public profile. 404 if it does not exist or is not
+   * publicly visible (not approved).
+   */
+  async getPublicAgency(req: Request, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+      const agency = await agencyService.getPublicAgencyById(id);
+      if (!agency) {
+        sendError(res, "NOT_FOUND", "Agency not found", 404);
+        return;
+      }
+      sendSuccess(res, agency);
+    } catch (error) {
+      console.error("Error getting public agency:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /agencies/browse/:id/agents  (PUBLIC — no auth)
+   *
+   * List the publicly-visible (verified + available) agents belonging to a
+   * publicly-visible agency. 404 if the agency isn't publicly visible, so we
+   * never expose the roster of a non-approved agency.
+   */
+  async getPublicAgencyAgents(req: Request, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+
+      // Gate on the agency's public visibility first.
+      const agency = await agencyService.getPublicAgencyById(id);
+      if (!agency) {
+        sendError(res, "NOT_FOUND", "Agency not found", 404);
+        return;
+      }
+
+      const agents = await agentService.getPublicAgentsByAgency(id);
+      sendSuccess(res, agents);
+    } catch (error) {
+      console.error("Error getting public agency agents:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

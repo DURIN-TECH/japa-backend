@@ -162,6 +162,23 @@ class AgentService {
   }
 
   /**
+   * Get the publicly-visible agents of a given agency (for the unauthenticated
+   * agency directory). Mirrors the public GET /agents rule: only "verified"
+   * agents, and — per the directory spec — only those currently available.
+   * Uses the existing (agencyId ASC, displayName ASC) composite index.
+   */
+  async getPublicAgentsByAgency(agencyId: string): Promise<Agent[]> {
+    const snapshot = await collections.agents
+      .where("agencyId", "==", agencyId)
+      .orderBy("displayName", "asc")
+      .get();
+
+    return snapshot.docs
+      .map((doc) => doc.data() as Agent)
+      .filter((a) => a.verificationStatus === "verified" && a.isAvailable);
+  }
+
+  /**
    * Get top-rated agents
    */
   async getTopAgents(limit = 10): Promise<Agent[]> {

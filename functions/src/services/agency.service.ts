@@ -7,6 +7,7 @@ import {
   Agency,
   AgencyInvitation,
   AgencyService as AgencyServiceType,
+  AgencyStatus,
   Agent,
   User,
 } from "../types";
@@ -42,6 +43,39 @@ export interface UpdateAgencyInput {
   logoUrl?: string;
   consultationFee?: number;
   services?: AgencyServiceType[];
+}
+
+/**
+ * Public-safe projection of an Agency for the UNAUTHENTICATED directory
+ * (mobile "browse agencies" screens).
+ *
+ * This is a deliberate allow-list: it includes ONLY fields that are safe to
+ * show to any anonymous browser. It intentionally EXCLUDES every private /
+ * compliance / financial-internal field on the Agency model:
+ *   - `ownerId`            (internal user id — leak vector)
+ *   - `compliance`         (owner KYC/KYB PII: BVN, NIN, ID docs, settlement bank)
+ *   - `reviewedBy` / `reviewedAt` / `rejectionReason` (admin review metadata)
+ *   - `activeCases`        (operational load — not for public consumption)
+ *
+ * `consultationFee` and `services` ARE included: they are customer-facing
+ * pricing/catalog data (the same way an Agent's public profile exposes its
+ * `consultationFee`), not financial internals.
+ */
+export interface PublicAgency {
+  id: string;
+  name: string;
+  ownerName: string; // Display name only — never the ownerId
+  state?: string; // Region/location
+  address?: string; // Business address (public contact info)
+  description?: string;
+  logoUrl?: string;
+  consultationFee?: number; // Public default consultation price (in cents)
+  services: AgencyServiceType[]; // Public service catalog (name + price)
+  agentCount: number; // Denormalized member count (= totalAgents)
+  totalCases: number; // Track-record stat
+  status: AgencyStatus; // Always "approved" for anything returned publicly
+  verified: boolean; // Compliance-verified badge (derived from status only, no PII)
+  createdAt: Timestamp; // For an "established"/tenure display
 }
 
 class AgencyService {
@@ -621,6 +655,93 @@ class AgencyService {
       .get();
 
     return snapshot.docs.map((doc) => doc.data() as Agency);
+  }
+
+  // ============================================
+  // PUBLIC BROWSING (unauthenticated directory)
+  // ============================================
+
+  /**
+   * Map a full Agency doc down to its public-safe projection.
+   * Centralized so every public endpoint returns an identical, minimal shape
+   * and no private/compliance field can accidentally leak.
+   */
+  private toPublicAgency(agency: Agency): PublicAgency {
+    return {
+      id: agency.id,
+      name: agency.name,
+      ownerName: agency.ownerName,
+      state: agency.state,
+      address: agency.address,
+      description: agency.description,
+      logoUrl: agency.logoUrl,
+      consultationFee: agency.consultationFee,
+      services: agency.services ?? [],
+      agentCount: agency.totalAgents ?? 0,
+      totalCases: agency.totalCases ?? 0,
+      status: agency.status,
+      // Compliance-verified badge — we expose ONLY the boolean, never the
+      // underlying compliance file (which holds owner KYC/KYB PII).
+      verified: agency.compliance?.status === "verified",
+      createdAt: agency.createdAt,
+    };
+  }
+
+  /**
+   * List agencies that are publicly visible in the directory.
+   *
+   * "Publicly visible" == platform-approved (`status === "approved"`). This is
+   * the same gate as the public agent listing (only "verified" agents show).
+   * Compliance verification is a SEPARATE gate that unlocks payments / platform
+   * client assignment — it is NOT required to appear in the discovery directory,
+   * so we surface it as the `verified` badge instead of hiding unverified-but-
+   * approved agencies. pending_review / rejected / suspended agencies never
+   * appear (the equality on "approved" excludes them all).
+   *
+   * Optional filters:
+   *   - `search`: case-insensitive substring match on the agency name (applied
+   *     in memory — Firestore has no native contains).
+   *   - `limit`: max results. Pushed down to Firestore when there is no search;
+   *     applied after filtering when there is.
+   */
+  async listPublicAgencies(options?: {
+    limit?: number;
+    search?: string;
+  }): Promise<PublicAgency[]> {
+    const search = options?.search?.trim().toLowerCase();
+    const limit =
+      options?.limit && options.limit > 0 ? Math.min(options.limit, 100) : undefined;
+
+    // Uses the existing (status ASC, createdAt DESC) composite index.
+    let query = collections.agencies
+      .where("status", "==", "approved")
+      .orderBy("createdAt", "desc");
+
+    // Only safe to push the limit into the query when we aren't post-filtering
+    // by search (otherwise we'd truncate before the name filter runs).
+    if (limit && !search) {
+      query = query.limit(limit);
+    }
+
+    const snapshot = await query.get();
+    let agencies = snapshot.docs.map((doc) => doc.data() as Agency);
+
+    if (search) {
+      agencies = agencies.filter((a) => a.name?.toLowerCase().includes(search));
+      if (limit) agencies = agencies.slice(0, limit);
+    }
+
+    return agencies.map((a) => this.toPublicAgency(a));
+  }
+
+  /**
+   * Get a single agency's public profile, or null if it does not exist or is
+   * not publicly visible (i.e. not approved). Callers should 404 on null.
+   */
+  async getPublicAgencyById(agencyId: string): Promise<PublicAgency | null> {
+    const agency = await this.getAgencyById(agencyId);
+    if (!agency || agency.status !== "approved") return null;
+    return this.toPublicAgency(agency);
   }
 }
 
