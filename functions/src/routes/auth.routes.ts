@@ -19,4 +19,10 @@ router.post("/forgot-password", (req, res) =>
   authController.forgotPassword(req, res)
 );
 
+// Send (or re-send) the branded "verify your email" message. Public + enumeration
+// safe, mirroring forgot-password: the client just supplies the address to verify.
+router.post("/resend-verification", (req, res) =>
+  authController.resendEmailVerification(req, res)
+);
+
 export { router as authRoutes };

@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { userController } from "../controllers/user.controller";
+import { clientVerificationController } from "../controllers/client-verification.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
 
 const router = Router();
@@ -52,6 +53,15 @@ router.delete("/fcm-token", verifyAuth, (req, res) =>
 
 router.post("/login", verifyAuth, (req, res) =>
   userController.recordLogin(req, res)
+);
+
+// Applicant identity verification (client KYC) — NIN/BVN + explicit consent.
+// GET returns the current status; POST submits an ID for an automated Dojah check.
+router.get("/me/verification", verifyAuth, (req, res) =>
+  clientVerificationController.getStatus(req, res)
+);
+router.post("/me/verification/identity", verifyAuth, (req, res) =>
+  clientVerificationController.submitIdentity(req, res)
 );
 
 export { router as userRoutes, adminUsersRouter };

@@ -53,11 +53,53 @@ export interface User {
   // but the client may not have set a password or downloaded the app yet.
   isProvisional?: boolean;
 
+  // Client-facing identity verification (KYC). Absent on legacy/unverified users.
+  // This is the APPLICANT's own identity check (NIN/BVN + optional selfie), run via
+  // the shared verification service — distinct from `AgencyCompliance` (owner/business
+  // KYC/KYB). See `UserIdentityVerification` below.
+  identityVerification?: UserIdentityVerification;
+
   // Metadata
   createdAt: Timestamp;
   updatedAt: Timestamp;
   lastLoginAt?: Timestamp;
   fcmTokens?: string[]; // For push notifications
+}
+
+// ---- Client identity verification (applicant KYC) ----
+
+// File-level status of an applicant's identity verification. Distinct from the
+// per-check `VerificationCheckStatus` (a subject has many checks but one status):
+//   unverified   – nothing submitted yet (or field absent)
+//   pending      – an async check (selfie/liveness) is in flight, awaiting a webhook
+//   under_review – submitted; provider unconfigured or signals are mixed → awaiting
+//                  a confident automated pass (or a human decision)
+//   verified     – identity confirmed (auto-verified on a high-confidence pass,
+//                  or admin-approved)
+//   failed       – a check hard-failed (mismatch / not found)
+export type IdentityVerificationStatus =
+  | "unverified"
+  | "pending"
+  | "under_review"
+  | "verified"
+  | "failed";
+
+// The applicant identity-verification file embedded on `User`. Mirrors the shape
+// of the automated-verification signals on `AgencyCompliance`, minus the business
+// (KYB) leg — an applicant only proves their own identity.
+export interface UserIdentityVerification {
+  status: IdentityVerificationStatus;
+  // Which government ID the applicant submitted for the lookup.
+  idType?: "nin" | "bvn";
+  // Per-check normalized results, keyed by check type (BVN/NIN/doc/liveness/AML).
+  checks?: Partial<Record<VerificationCheckType, VerificationCheckResult>>;
+  // Audit log of the applicant's consent to the government-ID lookup(s).
+  consent?: { bvn?: ConsentRecord; nin?: ConsentRecord };
+  // Review / lifecycle metadata.
+  submittedAt?: Timestamp;
+  verifiedAt?: Timestamp;
+  reviewedBy?: string; // Admin userId, when a human makes the call
+  reason?: string; // Failure / needs-review explanation surfaced to the user
 }
 
 export interface Address {
@@ -829,6 +871,9 @@ export type NotificationType =
   | "compliance_submitted" // Owner submitted the compliance file for review
   | "compliance_approved" // Admin verified the agency's compliance
   | "compliance_rejected" // Admin rejected; items need fixing
+  // Identity verification (applicant/client KYC — NIN/BVN + optional selfie)
+  | "identity_verified" // The applicant's identity check passed
+  | "identity_verification_failed" // The applicant's identity check failed / needs attention
   // Account / engagement
   | "welcome"
   | "role_changed"

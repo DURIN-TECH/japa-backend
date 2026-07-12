@@ -257,6 +257,18 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     path: () => "/account-settings?tab=verification",
   },
 
+  // Identity verification (applicant KYC)
+  identity_verified: {
+    subject: "Your identity is verified",
+    actionLabel: "Open Seli",
+    path: () => "/",
+  },
+  identity_verification_failed: {
+    subject: "Action needed: identity verification",
+    actionLabel: "Try again",
+    path: () => "/",
+  },
+
   // Account / engagement
   welcome: {
     subject: "Welcome to Seli",

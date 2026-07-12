@@ -60,6 +60,9 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   compliance_submitted: FULL,
   compliance_approved: FULL,
   compliance_rejected: FULL,
+  // Identity verification (applicant KYC) — transactional, worth an email
+  identity_verified: FULL,
+  identity_verification_failed: FULL,
   // Account / engagement
   welcome: FULL,
   role_changed: FULL,
