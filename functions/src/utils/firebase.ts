@@ -102,6 +102,12 @@ export const collections = {
   //   with an immutable `versions` subcollection (see `subcollections` below)
   documentTemplates: db.collection("documentTemplates"),
   documentInstances: db.collection("documentInstances"),
+  // Visa-catalog scraper (see docs/visa-catalog-scraping-spike.md):
+  // - visaSources: per-country registry of official visa URLs the crawler reads.
+  //   Scraped visas are written into countries/{code}/visaTypes as
+  //   reviewStatus="pending_review" / source="scraped" and reviewed via the
+  //   existing admin visa-review flow (no separate queue).
+  visaSources: db.collection("visaSources"),
 } as const;
 
 // Helper to get subcollection references

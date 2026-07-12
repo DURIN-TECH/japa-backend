@@ -14,6 +14,12 @@ export * from "./eligibility";
 // Re-export news types
 export * from "./news";
 
+// Re-export visa-catalog scraper types
+export * from "./visa-catalog";
+// Local import so VisaType (below) can reference the scrape provenance shape.
+// Type-only, so the visa-catalog <-> index cycle is erased at compile time.
+import type { VisaScrapeMeta } from "./visa-catalog";
+
 // ============================================
 // USER TYPES
 // ============================================
@@ -342,6 +348,7 @@ export interface VisaType {
   // Note: the `source` flag lives in the "Admin review" block below.
   sourceUrl?: string; // official URL this record was last verified against
   lastVerifiedAt?: Timestamp; // when an agent last approved a scraped update
+  scrapeMeta?: VisaScrapeMeta; // extractor provenance + per-field citations (audit trail)
 
   // Stats
   successRate?: number;

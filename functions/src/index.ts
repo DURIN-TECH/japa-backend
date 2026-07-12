@@ -39,6 +39,11 @@ const VERIFICATION_SECRETS = [
   "DOJAH_BASE_URL",
 ];
 
+// Visa-catalog scraper LLM key (DeepSeek). Bound to the crawl orchestrator only.
+// Absent => the extractor throws at call time (crawl records the page as failed),
+// so deploying without a key is safe — no visas are ever wrongly published.
+const VISA_CATALOG_SECRETS = ["DEEPSEEK_API_KEY"];
+
 export const api = functions
   .runWith({
     secrets: [
@@ -58,6 +63,7 @@ import { collections } from "./utils/firebase";
 import { agentService } from "./services/agent.service";
 import { visaService } from "./services/visa.service";
 import { newsScraperService } from "./services/news-scraper.service";
+import { visaCatalogCrawlService } from "./services/visa-catalog-crawl.service";
 import { newsService } from "./services/news.service";
 import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
@@ -420,6 +426,31 @@ export const scrapeNewsOrchestrator = functions
       );
     } catch (error) {
       console.error("News scrape orchestrator failed:", error);
+    }
+  });
+
+/**
+ * Visa catalog crawler — ticks every 6 hours and processes the country sources
+ * whose `nextCrawlAt` is due (each source is re-crawled weekly). Fetches official
+ * visa pages, and for pages whose content changed, extracts + stages a proposal
+ * into `pendingVisaChanges` for agent approval. Never publishes to the live
+ * catalog. See docs/visa-catalog-scraping-spike.md.
+ */
+export const crawlVisaCatalogOrchestrator = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: VISA_CATALOG_SECRETS })
+  .pubsub.schedule("0 */6 * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    console.log("Running visa catalog crawl orchestrator...");
+    try {
+      const result = await visaCatalogCrawlService.runOrchestrator();
+      console.log(
+        `Visa catalog crawl: ${result.sourcesProcessed} sources, ${result.pagesFetched} pages, ` +
+          `${result.pagesChanged} changed → ${result.created} new / ${result.updated} updated / ` +
+          `${result.skipped} skipped, ${result.errors} errors`
+      );
+    } catch (error) {
+      console.error("Visa catalog crawl orchestrator failed:", error);
     }
   });
 
