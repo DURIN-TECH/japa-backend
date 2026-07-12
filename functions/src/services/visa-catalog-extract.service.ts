@@ -83,14 +83,14 @@ export function validateExtractedVisa(raw: unknown): ExtractedVisa {
   // eligibilityCriteria: array of non-empty strings.
   const eligibility = Array.isArray(o.eligibilityCriteria)
     ? (o.eligibilityCriteria as unknown[]).filter(
-        (x): x is string => typeof x === "string" && x.trim().length > 0
-      )
+      (x): x is string => typeof x === "string" && x.trim().length > 0
+    )
     : [];
-  if (eligibility.length === 0) errors.push(`"eligibilityCriteria" must be a non-empty string array`);
+  if (eligibility.length === 0) errors.push("\"eligibilityCriteria\" must be a non-empty string array");
 
   // confidence: 0–1.
   const confidence = typeof o.confidence === "number" ? o.confidence : NaN;
-  if (!(confidence >= 0 && confidence <= 1)) errors.push(`"confidence" must be a number in [0,1]`);
+  if (!(confidence >= 0 && confidence <= 1)) errors.push("\"confidence\" must be a number in [0,1]");
 
   // citations: field -> quote map (optional-ish but expected).
   const citations: Record<string, string> = {};
