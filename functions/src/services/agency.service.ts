@@ -81,9 +81,14 @@ class AgencyService {
     const docRef = collections.agencies.doc();
     const now = Timestamp.now();
 
+    // Public, URL-safe handle for the shareable agency page (`/a/<slug>`).
+    // Generated once at creation and never changed thereafter (stable links).
+    const slug = await this.generateUniqueAgencySlug(input.name);
+
     const agency: Agency = {
       id: docRef.id,
       name: input.name,
+      slug,
       ownerId: ownerUserId,
       ownerName,
       address: input.address,
@@ -132,6 +137,72 @@ class AgencyService {
 
     if (snapshot.empty) return null;
     return snapshot.docs[0].data() as Agency;
+  }
+
+  /**
+   * Get an agency by its public slug (used by the unauthenticated shareable
+   * agency page). Returns null when no agency owns the slug.
+   */
+  async getAgencyBySlug(slug: string): Promise<Agency | null> {
+    const snapshot = await collections.agencies
+      .where("slug", "==", slug)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) return null;
+    return snapshot.docs[0].data() as Agency;
+  }
+
+  /**
+   * Turn an agency name into a URL-safe base slug: lowercase, non-alphanumerics
+   * collapsed to single hyphens, trimmed. Falls back to "agency" when the name
+   * has no slug-able characters (e.g. all symbols).
+   */
+  private slugifyName(name: string): string {
+    const base = name
+      .toLowerCase()
+      .normalize("NFKD") // decompose accents so diacritics can be dropped
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    return base || "agency";
+  }
+
+  /**
+   * Produce a slug that is unique across the agencies collection. Starts from
+   * the slugified name and, on collision, appends a short numeric suffix
+   * (`-2`, `-3`, …). Bounded so a pathological run can't loop forever; the final
+   * fallback appends a short random token.
+   */
+  async generateUniqueAgencySlug(name: string): Promise<string> {
+    const base = this.slugifyName(name);
+
+    // Try the bare slug first, then base-2, base-3, … until one is free.
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const candidate = attempt === 0 ? base : `${base}-${attempt + 1}`;
+      const existing = await this.getAgencyBySlug(candidate);
+      if (!existing) return candidate;
+    }
+
+    // Extremely unlikely fallback: base + short random token.
+    const rand = Math.random().toString(36).slice(2, 8);
+    return `${base}-${rand}`;
+  }
+
+  /**
+   * Ensure an agency has a public `slug`, generating and persisting one if missing.
+   * Lets agencies created before slugs existed self-heal on first read (so the
+   * owner's "public page" link appears without an out-of-band backfill). Returns
+   * the agency, mutated in place with the new slug when one had to be created.
+   */
+  async ensureAgencySlug(agency: Agency): Promise<Agency> {
+    if (agency.slug) return agency;
+    const slug = await this.generateUniqueAgencySlug(agency.name);
+    await collections.agencies.doc(agency.id).update({
+      slug,
+      updatedAt: serverTimestamp(),
+    });
+    agency.slug = slug;
+    return agency;
   }
 
   /**

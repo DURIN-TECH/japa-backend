@@ -215,6 +215,55 @@ class TransactionService {
     return transaction;
   }
 
+  /**
+   * Record a completed consultation-fee payment (Paystack). Called after a guest
+   * consultation booking's payment is verified, so it's created already
+   * `completed`. Links back to the consultation and the paying client, and stores
+   * the Paystack reference in `providerTransactionId` for reconciliation.
+   *
+   * Idempotent by design at the caller: the verify handler only calls this once,
+   * gated on the consultation not already being `paid`.
+   */
+  async createConsultationFee(input: {
+    consultationId: string;
+    clientUserId: string;
+    agentUserId?: string;
+    amount: number; // in cents
+    currency?: string;
+    reference: string; // Paystack transaction reference
+    clientName?: string;
+    clientEmail?: string;
+  }): Promise<Transaction> {
+    const ref = collections.transactions.doc();
+    const now = Timestamp.now();
+
+    const transaction: Transaction = {
+      id: ref.id,
+      userId: input.clientUserId,
+      agentId: input.agentUserId,
+      consultationId: input.consultationId,
+      type: "consultation_fee",
+      amount: input.amount,
+      currency: input.currency || "NGN",
+      status: "completed",
+      isEscrow: false,
+      paymentProvider: "paystack",
+      providerTransactionId: input.reference,
+      description: "Consultation fee",
+      metadata: {
+        consultationId: input.consultationId,
+        reference: input.reference,
+      },
+      clientName: input.clientName,
+      clientEmail: input.clientEmail,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await ref.set(transaction);
+    return transaction;
+  }
+
   // ============================================
   // HELPERS
   // ============================================

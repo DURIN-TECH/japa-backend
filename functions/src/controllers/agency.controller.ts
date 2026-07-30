@@ -106,6 +106,19 @@ export class AgencyController {
       // everything but the status for anyone who isn't the owner or an admin.
       const isOwner = agency.ownerId === userId;
       const isAdmin = req.authz?.role === ROLES.ADMIN || req.user?.admin === true;
+
+      // Self-heal a missing public slug on the owner's read so the "Your public
+      // page" link shows up for agencies created before slugs existed — no
+      // separate backfill needed. Only the owner triggers the write (they need
+      // the link); a failure here must never block loading the agency.
+      if (isOwner && !agency.slug) {
+        try {
+          await agencyService.ensureAgencySlug(agency);
+        } catch (e) {
+          console.error("Failed to backfill agency slug:", e);
+        }
+      }
+
       if (agency.compliance && !isOwner && !isAdmin) {
         agency.compliance = { status: agency.compliance.status };
       }
@@ -479,6 +492,55 @@ export class AgencyController {
    * POST /invitations/:id/accept
    * Accept an agency invitation
    */
+  /**
+   * GET /agencies/public/:slug  (PUBLIC — no auth)
+   *
+   * Powers the shareable public agency landing page (`/a/<slug>`). Resolves an
+   * agency by its public slug and returns a deliberately WHITELISTED, non-sensitive
+   * projection — no owner ids/emails, no compliance internals, no admission status.
+   * The only compliance signal exposed is a boolean `verified` badge derived from
+   * `compliance.status === "verified"`. Mirrors the `getInvitationPreview` pattern.
+   */
+  async getPublicAgency(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const { slug } = req.params;
+      const agency = await agencyService.getAgencyBySlug(slug);
+
+      // Only surface agencies that have been admitted to the platform. Anything
+      // else (pending/rejected/suspended) 404s so unapproved/withheld agencies
+      // aren't publicly discoverable via a guessed slug.
+      if (!agency || agency.status !== "approved") {
+        sendError(res, "NOT_FOUND", "Agency not found", 404);
+        return;
+      }
+
+      sendSuccess(res, {
+        name: agency.name,
+        slug: agency.slug,
+        description: agency.description ?? null,
+        logoUrl: agency.logoUrl ?? null,
+        state: agency.state ?? null,
+        ownerName: agency.ownerName,
+        // Agency-level default consultation fee (in cents). null when unset.
+        consultationFee: agency.consultationFee ?? null,
+        // Public service menu (name + price only).
+        services: (agency.services || []).map((s) => ({
+          id: s.id,
+          name: s.name,
+          price: s.price,
+        })),
+        // Social-proof stats (safe aggregates).
+        totalAgents: agency.totalAgents,
+        totalCases: agency.totalCases,
+        // Trust badge only — never the raw compliance file.
+        verified: agency.compliance?.status === "verified",
+      });
+    } catch (error) {
+      console.error("Error fetching public agency:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
   /**
    * GET /invitations/:id/preview  (PUBLIC — no auth)
    *
