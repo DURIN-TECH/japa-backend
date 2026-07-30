@@ -99,6 +99,41 @@ export class PaystackProvider implements BillingProvider {
   }
 
   /**
+   * Initialize a ONE-OFF Paystack transaction that is NOT a subscription.
+   *
+   * Unlike `createCheckout`, the metadata here is caller-defined (e.g. a guest
+   * consultation booking carries `{ purpose:"consultation", consultationId }`),
+   * so it deliberately does NOT flow through the subscription-shaped
+   * `subscriberType/subscriberId/planId` contract — those transactions are
+   * confirmed via `getTransactionMetadata` (reference lookup), not the
+   * subscription webhook. `amountKobo` is the charge in the smallest NGN unit.
+   * `callbackUrl` overrides the provider default so the payer can be returned to
+   * a purpose-specific confirmation page.
+   */
+  async initializeOneOffCharge(input: {
+    email: string;
+    amountKobo: number;
+    metadata?: Record<string, unknown>;
+    callbackUrl?: string;
+  }): Promise<{ authorizationUrl: string; reference: string }> {
+    const callback = input.callbackUrl ?? this.callbackUrl;
+    const payload: Record<string, unknown> = {
+      email: input.email,
+      amount: input.amountKobo,
+      currency: "NGN",
+      metadata: input.metadata ?? {},
+      ...(callback ? { callback_url: callback } : {}),
+    };
+
+    const res = await this.client().post<{ data: PaystackInitData }>(
+      "/transaction/initialize",
+      payload
+    );
+    const data = res.data.data;
+    return { authorizationUrl: data.authorization_url, reference: data.reference };
+  }
+
+  /**
    * Ensure a Paystack Plan exists for a recurring package and return its `plan_code`.
    * Paystack only auto-recurs against a Plan object, so each paid package needs one.
    * Our `interval` ("month"/"year") maps to Paystack's cadence vocabulary
