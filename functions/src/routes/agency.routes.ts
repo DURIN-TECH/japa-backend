@@ -1,12 +1,27 @@
 import { Router } from "express";
 import { agencyController } from "../controllers/agency.controller";
 import { complianceController } from "../controllers/compliance.controller";
+import { consultationController } from "../controllers/consultation.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
 import { requireFeature } from "../middleware/authz";
 import { FEATURES } from "@durin-tech/authz";
 
 // Routes mounted at /agencies
 const agencyRoutes = Router();
+
+// PUBLIC — no auth: powers the shareable public agency landing page.
+// Two-segment "/public/:slug" path, defined before the single-segment "/:id"
+// matcher so it can't be shadowed. Returns only whitelisted, non-sensitive fields.
+agencyRoutes.get("/public/:slug", (req, res) =>
+  agencyController.getPublicAgency(req, res)
+);
+
+// PUBLIC — no auth: guest books a consultation with this agency from the public
+// page. Provisions a client by email and (when the agency charges a fee) returns
+// a Paystack checkout URL. Also a 3-segment "/public/..." path, safe from "/:id".
+agencyRoutes.post("/public/:slug/consultations", (req, res) =>
+  consultationController.createPublicConsultation(req, res)
+);
 
 // Agency CRUD — /me routes before /:id
 agencyRoutes.get("/me", verifyAuth, (req, res) =>

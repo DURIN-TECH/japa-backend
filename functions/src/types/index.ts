@@ -169,6 +169,11 @@ export interface AgencyCompliance {
 export interface Agency {
   id: string;
   name: string;
+  // URL-safe public handle used for the shareable agency landing page
+  // (`/a/<slug>`). Unique across agencies, generated from the name on create
+  // (see `agencyService.generateUniqueAgencySlug`). Optional in the type only so
+  // that agencies created before slugs existed still satisfy it until backfilled.
+  slug?: string;
   ownerId: string; // userId of the creator/owner
   ownerName: string; // Denormalized for display
 
@@ -687,7 +692,9 @@ export interface Transaction {
   escrowReleasedAt?: Timestamp;
   
   // Payment processor
-  paymentProvider: "stripe" | "paypal" | "manual";
+  // Payment processor. "paystack" is the live gateway (subscriptions, seats, and
+  // guest consultation fees); the others predate it.
+  paymentProvider: "stripe" | "paypal" | "manual" | "paystack";
   providerTransactionId?: string;
   
   // Metadata
