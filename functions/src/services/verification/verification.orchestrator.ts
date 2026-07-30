@@ -1,6 +1,7 @@
 import { AgencyCompliance } from "../../types";
 import { verificationService } from "./verification.service";
 import { suggestDecision } from "./decision-policy";
+import { normalizeName } from "./identity-match";
 import {
   VerificationCheckRequest,
   VerificationCheckResult,
@@ -108,7 +109,49 @@ function buildAgencyCheckRequests(
       rcNumber: c.rcNumber,
     });
   }
+  // AML / PEP / sanctions screen on the owner (needs a name to screen against).
+  // No consent gate — this screens public watchlists, not a government database.
+  if (firstName && lastName) {
+    reqs.push({
+      checkType: "aml_pep",
+      subjectRef: agencyId,
+      firstName,
+      lastName,
+      dateOfBirth,
+    });
+  }
   return reqs;
+}
+
+/**
+ * Cross-reference: does the agency owner appear among the CAC directors returned
+ * by the business-registry check? A strong KYB signal (the person onboarding is
+ * actually tied to the company). Purely additive — annotates the CAC result's
+ * `extractedData.ownerIsDirector`; it does not change any check status.
+ */
+function annotateOwnerIsDirector(
+  checks: Partial<Record<VerificationCheckType, VerificationCheckResult>>,
+  c: AgencyCompliance
+): void {
+  const cac = checks.business_registry;
+  const directors = cac?.extractedData?.directors;
+  if (!cac || !Array.isArray(directors)) return;
+
+  const ownerFirst = normalizeName(c.legalFirstName);
+  const ownerLast = normalizeName(c.legalLastName);
+  if (!ownerFirst || !ownerLast) return;
+
+  // A director entry may be a string or an object with name-ish fields — flatten
+  // it to a single normalized string and require both the owner's first and last
+  // name to appear.
+  const ownerIsDirector = directors.some((d) => {
+    const text =
+      typeof d === "string" ? d : Object.values(d as Record<string, unknown>).join(" ");
+    const norm = normalizeName(text);
+    return norm.includes(ownerFirst) && norm.includes(ownerLast);
+  });
+
+  cac.extractedData = { ...cac.extractedData, ownerIsDirector };
 }
 
 /**
@@ -132,6 +175,9 @@ export async function runAgencyChecks(
     Record<VerificationCheckType, VerificationCheckResult>
   > = {};
   for (const r of results) verificationChecks[r.checkType] = r;
+
+  // Add the owner-is-director KYB signal onto the CAC result (additive; no status change).
+  annotateOwnerIsDirector(verificationChecks, compliance);
 
   const decision = suggestDecision(verificationChecks, {
     autoApprove: verificationService.autoApproveEnabled,
