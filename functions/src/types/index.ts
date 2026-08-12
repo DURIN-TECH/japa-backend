@@ -901,6 +901,12 @@ export interface PaymentRequest {
   // Status
   status: PaymentRequestStatus;
   paidAt?: Timestamp;
+  /**
+   * Paystack transaction reference, set when the client starts checkout.
+   * Kept so a return-from-Paystack can be tied back to THIS request, and so a
+   * replayed reference can't be credited to a different one.
+   */
+  paystackReference?: string;
   cancelledAt?: Timestamp;
   expiresAt?: Timestamp;
   approvedAt?: Timestamp;

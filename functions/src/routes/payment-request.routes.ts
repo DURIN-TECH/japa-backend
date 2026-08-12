@@ -34,6 +34,12 @@ paymentRequestRoutes.put("/:id/approve", verifyAuth, (req, res) =>
   paymentRequestController.approvePaymentRequest(req, res)
 );
 
+// Complete a payment after the client returns from Paystack. This is the only
+// path that marks a request "paid" and books the money-side effects.
+paymentRequestRoutes.post("/:id/verify", verifyAuth, (req, res) =>
+  paymentRequestController.verifyPayment(req, res)
+);
+
 // Reject payment request (client rejects with reason, auto-creates chat)
 paymentRequestRoutes.put("/:id/reject", verifyAuth, (req, res) =>
   paymentRequestController.rejectPaymentRequest(req, res)

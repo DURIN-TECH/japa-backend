@@ -23,6 +23,8 @@ import { transactionService } from "../services/transaction.service";
 import { applicationService } from "../services/application.service";
 import { messagingService } from "../services/messaging.service";
 import { notificationService } from "../services/notification.service";
+import { paystackProvider } from "../services/billing/paystack.provider";
+import { EMAIL_BRANDING } from "../services/email/branding";
 import { collections } from "../utils/firebase";
 import { PaymentRequestStatus } from "../types";
 import { ROLES } from "@durin-tech/authz";
@@ -321,15 +323,18 @@ class PaymentRequestController {
   /**
    * PUT /payment-requests/:id/approve
    *
-   * Client approves an agent's payment request. This triggers:
-   *  1. Marking the payment request as approved
-   *  2. Creating an escrow release transaction (funds go to agent)
-   *  3. Incrementing the amountPaid on the related application
-   *  4. Creating a notification record for the agent
-   *  5. Sending an FCM push notification to the agent's devices
+   * Client approves an agent's payment request and STARTS CHECKOUT. Returns a
+   * Paystack `authorizationUrl` for the caller to redirect to.
    *
-   * Only the client on the request or an admin can approve.
-   * The request must be in "pending" status.
+   * WHAT CHANGED AND WHY: approving used to be treated as payment — it booked an
+   * escrow release, incremented the application's `amountPaid`, and told the
+   * agent "payment approved", all without a single naira moving. There was no
+   * payment provider in this flow at all. Money now actually has to change hands
+   * before any of that happens: those side effects moved to `verifyPayment`,
+   * which runs only after Paystack confirms the charge succeeded.
+   *
+   * Only the client on the request or an admin can approve, and only a pending
+   * request can be approved.
    */
   async approvePaymentRequest(req: AuthenticatedRequest, res: Response) {
     try {
@@ -353,34 +358,149 @@ class PaymentRequestController {
         return sendError(res, "VALIDATION_ERROR", "Only pending payment requests can be approved", 400);
       }
 
-      // Step 1: Mark payment request as approved in Firestore
+      // Mark approved — the client has consented to be charged. The request
+      // stays "approved" (not "paid") until Paystack confirms the money landed.
       const approved = await paymentRequestService.approvePaymentRequest(id);
 
-      // Step 2: Create an escrow release transaction to record the fund transfer
-      await transactionService.createEscrowRelease(approved);
-
-      // Step 3: Update the application's running total of payments made
-      await applicationService.incrementAmountPaid(request.applicationId, request.amount);
-
-      // Step 4: Notify the agent about the approval (in-app + push + email).
-      const approvedAgentUserId = (
-        await collections.agents.doc(request.agentId).get()
-      ).data()?.userId;
-      if (approvedAgentUserId) {
-        await notificationService.notifyUser({
-          userId: approvedAgentUserId,
-          type: "payment_received",
-          title: "Payment Approved",
-          body: `Your client approved payment of ₦${(request.amount / 100).toLocaleString()} for ${request.description}.`,
-          relatedEntityType: "payment_request",
-          relatedEntityId: id,
-          data: request.applicationId
-            ? { applicationId: request.applicationId }
-            : undefined,
+      // Initialize a Paystack charge and hand the client a checkout URL.
+      // `purpose` + `paymentRequestId` ride in metadata so the return leg can
+      // tie the reference back to THIS request (see verifyPayment).
+      const { authorizationUrl, reference } =
+        await paystackProvider.initializeOneOffCharge({
+          email: request.clientEmail,
+          amountKobo: request.amount, // already stored in minor units
+          metadata: {
+            purpose: "payment_request",
+            paymentRequestId: id,
+            applicationId: request.applicationId,
+          },
+          callbackUrl: `${EMAIL_BRANDING.appUrl}/client/payments?reference={reference}`,
         });
+
+      // Persist the reference so a replayed or mismatched one can't be credited
+      // to a different request.
+      await collections.paymentRequests.doc(id).update({
+        paystackReference: reference,
+      });
+
+      return sendSuccess(
+        res,
+        { ...approved, paystackReference: reference, authorizationUrl },
+        "Payment request approved — continue to payment"
+      );
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      return sendError(res, "INTERNAL_ERROR", message, 500);
+    }
+  }
+
+
+  /**
+   * POST /payment-requests/:id/verify
+   * Body: { reference: string }
+   *
+   * Completes a payment after the client returns from Paystack. This is where a
+   * payment request actually becomes PAID, and the only place the money-side
+   * effects happen — the escrow-release transaction and the application's
+   * `amountPaid` — because until Paystack says the charge succeeded, nothing has
+   * been paid.
+   *
+   * Verify-on-return (rather than relying solely on a webhook) matches the guest
+   * consultation flow: the client is sitting in front of the result and should
+   * see it immediately. Idempotent, so a refresh of the return URL, a retry, or
+   * a webhook arriving later cannot double-credit.
+   */
+  async verifyPayment(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { id } = req.params;
+      const { reference } = req.body as { reference?: string };
+      const userId = req.user!.uid;
+
+      if (!reference) {
+        return sendError(res, "VALIDATION_ERROR", "reference is required", 400);
       }
 
-      return sendSuccess(res, approved, "Payment request approved");
+      const request = await paymentRequestService.getPaymentRequestById(id);
+      if (!request) return sendNotFound(res, "Payment request not found");
+
+      // Only the client being charged (or an admin) may complete it.
+      const isAdmin = req.authz?.role === ROLES.ADMIN;
+      if (!isAdmin && request.clientId !== userId) {
+        return sendForbidden(res, "Only the client or admin can complete this payment");
+      }
+
+      // Already settled — return success rather than an error so a refreshed
+      // callback URL is harmless.
+      if (request.status === "paid") {
+        return sendSuccess(res, request, "Payment already completed");
+      }
+
+      // The reference must be the one we minted for THIS request. Without this
+      // check a valid reference from any other Paystack transaction could be
+      // replayed here to mark a request paid for free.
+      if (request.paystackReference && request.paystackReference !== reference) {
+        return sendError(
+          res,
+          "VALIDATION_ERROR",
+          "This payment reference does not belong to this request",
+          400
+        );
+      }
+
+      const result = await paystackProvider.getTransactionMetadata(reference);
+      if (!result) return sendNotFound(res, "Transaction not found");
+
+      // Cross-check the metadata too, for references minted before the field
+      // existed or where the update failed.
+      const metaRequestId = result.metadata?.paymentRequestId as string | undefined;
+      if (result.metadata?.purpose !== "payment_request" || metaRequestId !== id) {
+        return sendError(
+          res,
+          "VALIDATION_ERROR",
+          "Reference is not a payment for this request",
+          400
+        );
+      }
+
+      if (result.status !== "success") {
+        // Not paid (abandoned/failed). Leave the request approved so the client
+        // can retry rather than stranding it in a terminal state.
+        return sendSuccess(
+          res,
+          { ...request, paymentStatus: result.status },
+          "Payment not completed"
+        );
+      }
+
+      // ---- Confirmed paid: NOW do the money-side bookkeeping ----------------
+      const paid = await paymentRequestService.updateStatus(id, "paid");
+      await transactionService.createEscrowRelease(paid);
+      await applicationService.incrementAmountPaid(request.applicationId, request.amount);
+
+      // Tell the agent money actually arrived (previously sent on approval,
+      // when nothing had).
+      const agentUserId = (
+        await collections.agents.doc(request.agentId).get()
+      ).data()?.userId;
+      if (agentUserId) {
+        await notificationService
+          .notifyUser({
+            userId: agentUserId,
+            type: "payment_received",
+            title: "Payment received",
+            body:
+              `${request.clientName || "Your client"} paid ` +
+              `${formatAmountForDisplay(request.amount, request.currency)} for ${request.description}.`,
+            relatedEntityType: "payment_request",
+            relatedEntityId: id,
+            data: request.applicationId
+              ? { applicationId: request.applicationId }
+              : undefined,
+          })
+          .catch((e) => console.error("[payment-request] agent notify failed:", e));
+      }
+
+      return sendSuccess(res, paid, "Payment completed");
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Unknown error";
       return sendError(res, "INTERNAL_ERROR", message, 500);
