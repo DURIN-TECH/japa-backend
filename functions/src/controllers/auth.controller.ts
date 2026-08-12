@@ -226,6 +226,221 @@ class AuthController {
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }
+
+  /**
+   * POST /auth/claim-account
+   * Body: { email: string }
+   *
+   * "Claim your account" — the first-run path for a PROVISIONAL client.
+   *
+   * When an agent starts an application (or books a consultation) on behalf of
+   * someone who isn't on Seli yet, we provision a real Firebase Auth user for
+   * them so the case has a genuine applicant. That account has NO PASSWORD: the
+   * client has never chosen one. Until now the only way in was to guess that
+   * "forgot password" would work on an account they never knowingly created.
+   *
+   * This endpoint makes that path explicit. Mechanically it's the same one-time
+   * `oobCode` as a password reset — the difference is entirely in the framing of
+   * the email and the landing page (`/claim` rather than `/reset-password`), which
+   * is what makes it comprehensible to someone who has never signed up.
+   *
+   * Enumeration-safe, exactly like `forgotPassword`: the response is identical
+   * whether or not the address maps to an account.
+   *
+   * `sendClaimEmail` below is the internal helper the provisioning code paths call
+   * directly; this HTTP handler is the public "re-send it to me" entry point.
+   */
+  async claimAccount(req: Request, res: Response): Promise<void> {
+    const GENERIC_OK =
+      "If an account exists for that email, we've sent a link to set your password.";
+
+    try {
+      const rawEmail = (req.body?.email ?? "") as string;
+      const email = rawEmail.trim().toLowerCase();
+
+      // Only a malformed address is rejected — that's a client bug, not an
+      // account signal (same posture as the other public auth flows).
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        sendError(res, "VALIDATION_ERROR", "A valid email address is required");
+        return;
+      }
+
+      // Unknown accounts fall through silently (enumeration protection).
+      await authController.sendClaimEmail(email).catch((err) => {
+        console.error("[auth:claim-account] send failed:", err);
+      });
+
+      sendSuccess(res, { sent: true }, GENERIC_OK);
+    } catch (error) {
+      console.error("claimAccount error:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * Mint and deliver a branded "set your password" email for `email`.
+   *
+   * Extracted from the HTTP handler so the provisioning code paths
+   * (`application.controller.createApplicationForClient`,
+   * `consultation.controller`) can invite a freshly-provisioned client without
+   * going back out through HTTP.
+   *
+   * Resolves `false` when nothing was sent (unknown account, or the email
+   * provider rejected/skipped the send) and `true` when the provider accepted it.
+   * NEVER throws for an unknown account — callers treat this as best-effort and
+   * must not fail their own operation because an invite couldn't go out.
+   *
+   * @param clientName Optional first name, used to personalize the greeting.
+   * @param agencyName Optional agency name — naming who invited them is what
+   *                   stops this reading like a phishing email to someone who has
+   *                   never heard of Seli.
+   */
+  async sendClaimEmail(
+    email: string,
+    clientName?: string,
+    agencyName?: string
+  ): Promise<boolean> {
+    const appUrl = EMAIL_BRANDING.appUrl;
+
+    // Mint the one-time code. As in `forgotPassword` we deliberately pass no
+    // actionCodeSettings — we only want the `oobCode`, and supplying a `url`
+    // would require that domain to sit in Firebase's Authorized domains list.
+    let claimUrl: string;
+    try {
+      const firebaseLink = await auth.generatePasswordResetLink(email);
+      const oobCode = new URL(firebaseLink).searchParams.get("oobCode");
+      // Point at OUR claim page, not the reset page: the copy there is written
+      // for someone setting a first password, not recovering a forgotten one.
+      claimUrl = oobCode
+        ? `${appUrl}/claim?oobCode=${encodeURIComponent(oobCode)}`
+        : firebaseLink;
+    } catch (err: unknown) {
+      const code = (err as { code?: string }).code || "";
+      if (code === "auth/user-not-found" || code === "auth/email-not-found") {
+        // No such account — nothing to claim. Silent no-op by design.
+        return false;
+      }
+      throw err;
+    }
+
+    const greeting = clientName?.trim() ? `Hi ${clientName.trim()}, ` : "";
+    const invitedBy = agencyName?.trim()
+      ? `${agencyName.trim()} has started a visa application for you on ` +
+        `${EMAIL_BRANDING.appName}`
+      : `An immigration agent has started a visa application for you on ` +
+        `${EMAIL_BRANDING.appName}`;
+
+    const result = await emailService.sendNotification({
+      to: email,
+      subject: `Set up your ${EMAIL_BRANDING.appName} account`,
+      title: "Set up your account",
+      body:
+        `${greeting}${invitedBy}. We've created an account for you so you can ` +
+        "track its progress, upload the documents your agent asks for, and message " +
+        "them directly — all from your browser, no app required.\n\n" +
+        "Choose a password using the button below to get started. This link will " +
+        "expire in 1 hour; if it does, you can request a new one from the sign-in " +
+        "page.\n\n" +
+        "If you weren't expecting this, you can safely ignore this email.",
+      actionUrl: claimUrl,
+      actionLabel: "Set your password",
+      preheader: `Set up your ${EMAIL_BRANDING.appName} account`,
+    });
+
+    return logEmailOutcome("claim-account", email, result);
+  }
+
+  /**
+   * POST /auth/magic-link
+   * Body: { email: string }
+   *
+   * Passwordless fallback: emails a one-tap sign-in link. This exists for the
+   * client who never set a password (or has forgotten they did) and just wants
+   * in — the "email me a sign-in link" option on the portal sign-in page.
+   *
+   * IMPORTANT DEPLOYMENT NOTE: unlike the reset/claim flows, this one CANNOT
+   * avoid `actionCodeSettings` — `generateSignInWithEmailLink` requires a
+   * continue URL. That URL's domain must be listed under
+   * Firebase Console → Authentication → Settings → Authorized domains for the
+   * project, and "Email link (passwordless sign-in)" must be enabled on the
+   * Email/Password provider. If either is missing, Firebase throws
+   * `auth/unauthorized-continue-uri` / `auth/operation-not-allowed`; we log that
+   * loudly and still return the generic success so the response never becomes an
+   * enumeration oracle.
+   *
+   * Enumeration-safe, same posture as every other public auth flow here.
+   */
+  async magicLink(req: Request, res: Response): Promise<void> {
+    const GENERIC_OK =
+      "If an account exists for that email, we've sent a sign-in link to it.";
+
+    try {
+      const rawEmail = (req.body?.email ?? "") as string;
+      const email = rawEmail.trim().toLowerCase();
+
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        sendError(res, "VALIDATION_ERROR", "A valid email address is required");
+        return;
+      }
+
+      const appUrl = EMAIL_BRANDING.appUrl;
+
+      let signInUrl: string;
+      try {
+        // The portal's /login page completes the sign-in with
+        // `signInWithEmailLink(auth, email, window.location.href)`, so the
+        // continue URL must land there carrying Firebase's own query params.
+        signInUrl = await auth.generateSignInWithEmailLink(email, {
+          url: `${appUrl}/login?magic=1`,
+          handleCodeInApp: true,
+        });
+      } catch (err: unknown) {
+        const code = (err as { code?: string }).code || "";
+        if (code === "auth/user-not-found" || code === "auth/email-not-found") {
+          // Unknown account — silent success (enumeration protection).
+          sendSuccess(res, { sent: true }, GENERIC_OK);
+          return;
+        }
+        if (
+          code === "auth/unauthorized-continue-uri" ||
+          code === "auth/operation-not-allowed" ||
+          code === "auth/invalid-continue-uri"
+        ) {
+          // Misconfiguration, not a user error. Make it obvious in the logs (see
+          // the deployment note above) but keep the response generic.
+          console.error(
+            `[auth:magic-link] BLOCKED by Firebase config (${code}) for ${appUrl}. ` +
+              "Add the portal domain to Authentication → Settings → Authorized " +
+              "domains, and enable Email link (passwordless sign-in) on the " +
+              "Email/Password provider."
+          );
+          sendSuccess(res, { sent: true }, GENERIC_OK);
+          return;
+        }
+        throw err;
+      }
+
+      const result = await emailService.sendNotification({
+        to: email,
+        subject: `Your ${EMAIL_BRANDING.appName} sign-in link`,
+        title: "Sign in to Seli",
+        body:
+          "Click the button below to sign in — no password needed. This link works " +
+          "once and expires in 1 hour.\n\n" +
+          "If you didn't ask to sign in, you can safely ignore this email; nobody " +
+          "can access your account without this link.",
+        actionUrl: signInUrl,
+        actionLabel: "Sign in",
+        preheader: `Your one-time ${EMAIL_BRANDING.appName} sign-in link`,
+      });
+      logEmailOutcome("magic-link", email, result);
+
+      sendSuccess(res, { sent: true }, GENERIC_OK);
+    } catch (error) {
+      console.error("magicLink error:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
 }
 
 // Singleton — matches the pattern used by every other controller in this app.

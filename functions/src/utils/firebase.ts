@@ -102,6 +102,11 @@ export const collections = {
   //   with an immutable `versions` subcollection (see `subcollections` below)
   documentTemplates: db.collection("documentTemplates"),
   documentInstances: db.collection("documentInstances"),
+  // Durable "agent asked the client for document X" records. Top-level (rather
+  // than a subcollection of applications) so one query by `userId + status`
+  // returns a client's outstanding asks across ALL of their applications — the
+  // to-do list that powers the client web workspace.
+  documentRequests: db.collection("documentRequests"),
   // Visa-catalog scraper (see docs/visa-catalog-scraping-spike.md):
   // - visaSources: per-country registry of official visa URLs the crawler reads.
   //   Scraped visas are written into countries/{code}/visaTypes as

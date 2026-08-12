@@ -1,6 +1,7 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { documentService } from "../services/document.service";
+import { documentRequestService } from "../services/document-request.service";
 import { notificationService } from "../services/notification.service";
 import { subcollections } from "../utils/firebase";
 import { checkWithinLimit, paymentRequired } from "../middleware/authz";
@@ -87,11 +88,23 @@ export class DocumentController {
         fileType,
         fileSizeMb,
         storagePath,
+        // Optional: the durable agent ask this upload satisfies. When present we
+        // close that request out automatically (see below) so the client's to-do
+        // list clears itself instead of needing the agent to tick it off.
+        documentRequestId,
       } = req.body;
+
+      // `requirementId` ties a document to a visa requirement. An upload made
+      // against an ad-hoc agent ask ("send me your bank statement") has no such
+      // requirement, so when `documentRequestId` is supplied we synthesize a
+      // stable requirement key from it instead of rejecting the upload. Exactly
+      // one of the two must be present.
+      const resolvedRequirementId: string | undefined =
+        requirementId || (documentRequestId ? `docreq:${documentRequestId}` : undefined);
 
       if (
         !applicationId ||
-        !requirementId ||
+        !resolvedRequirementId ||
         !fileName ||
         !fileType ||
         fileSizeMb === undefined ||
@@ -100,7 +113,7 @@ export class DocumentController {
         sendError(
           res,
           "VALIDATION_ERROR",
-          "applicationId, requirementId, fileName, fileType, fileSizeMb, and storagePath are required",
+          "applicationId, requirementId (or documentRequestId), fileName, fileType, fileSizeMb, and storagePath are required",
           400
         );
         return;
@@ -120,12 +133,37 @@ export class DocumentController {
 
       const document = await documentService.createDocument(userId, {
         applicationId,
-        requirementId,
+        requirementId: resolvedRequirementId,
         fileName,
         fileType,
         fileSizeMb,
         storagePath,
       });
+
+      // Close out the agent's ask, if this upload was made against one. Guarded
+      // so a client can only fulfil a request that is genuinely addressed to them
+      // and belongs to the same application — otherwise a crafted request id
+      // could tick off someone else's item. Best-effort: a failure here must not
+      // fail an upload that already succeeded.
+      let fulfilledRequestType: string | undefined;
+      if (documentRequestId) {
+        try {
+          const docRequest = await documentRequestService.getById(documentRequestId);
+          if (
+            docRequest &&
+            docRequest.userId === userId &&
+            docRequest.applicationId === applicationId
+          ) {
+            const closed = await documentRequestService.markFulfilled(
+              documentRequestId,
+              document.id
+            );
+            if (closed) fulfilledRequestType = docRequest.documentType;
+          }
+        } catch (e) {
+          console.error("[document] fulfilling document request failed:", e);
+        }
+      }
 
       // Notify the assigned agent that a document was uploaded for review.
       const uploadApp = await import("../services/application.service").then((m) =>
@@ -137,7 +175,12 @@ export class DocumentController {
             userId: uploadApp.agentId,
             type: "document_uploaded",
             title: "New document uploaded",
-            body: `${uploadApp.clientName || "A client"} uploaded "${fileName}" for review.`,
+            // Name the ask it satisfies when there was one — that's the detail
+            // the agent actually cares about ("the bank statement I asked for").
+            body: fulfilledRequestType
+              ? `${uploadApp.clientName || "A client"} uploaded "${fileName}" for your ` +
+                `"${fulfilledRequestType}" request.`
+              : `${uploadApp.clientName || "A client"} uploaded "${fileName}" for review.`,
             relatedEntityType: "application",
             relatedEntityId: applicationId,
           })

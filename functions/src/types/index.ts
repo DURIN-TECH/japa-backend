@@ -625,8 +625,82 @@ export interface Document {
   
   // Tracking
   resubmissionCount: number;
-  
+
   uploadedAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+// ============================================
+// DOCUMENT REQUEST TYPES
+// ============================================
+
+/**
+ * Lifecycle of an agent's "please send me X" ask.
+ *
+ *  - `pending`   — outstanding; this is what the client's to-do list renders.
+ *  - `fulfilled` — the client uploaded a document against it (auto-transitioned
+ *                  by `POST /documents` when it carries `documentRequestId`).
+ *  - `waived`    — the agent decided it's no longer needed.
+ *  - `cancelled` — the agent withdrew the request (asked in error / duplicate).
+ *
+ * Only `pending` is actionable by the client; the other three are terminal.
+ */
+export type DocumentRequestStatus =
+  | "pending"
+  | "fulfilled"
+  | "waived"
+  | "cancelled";
+
+/**
+ * A durable record of an agent asking a client for a specific document.
+ *
+ * WHY THIS EXISTS: this ask used to be fire-and-forget — an activity note plus a
+ * push/email notification. That's fine for the mobile app (which nudges the user
+ * in the moment) but leaves nothing queryable, so a client opening the web
+ * workspace days later had no way to see what they still owe. Persisting the ask
+ * gives the client a checklist and the agent a fulfilment view, and lets us close
+ * the loop automatically when the matching upload lands.
+ *
+ * Stored in the top-level `documentRequests` collection (not a subcollection of
+ * the application) so a client's outstanding items across every one of their
+ * applications can be fetched with a single `userId + status` query.
+ */
+export interface DocumentRequest {
+  id: string;
+  applicationId: string;
+  /** The CLIENT this is addressed to (== Application.userId). Query key. */
+  userId: string;
+  /** Owning agency, when the requesting agent belongs to one. Query key for the
+   *  agency-wide fulfilment view; null for an independent agent. */
+  agencyId?: string | null;
+
+  // --- What's being asked for -------------------------------------------------
+  /** Free-text label the agent typed, e.g. "Bank statement (last 6 months)". */
+  documentType: string;
+  /** Optional extra instruction shown under the label. */
+  notes?: string;
+  /** Optional soft deadline surfaced in the client UI. Not enforced. */
+  dueDate?: Timestamp;
+
+  // --- Provenance -------------------------------------------------------------
+  /** USER uid of the agent/owner/admin who made the request. */
+  requestedBy: string;
+  /** Denormalized display name so the client UI needs no extra lookup. */
+  requestedByName: string;
+
+  // --- Denormalized application context (saves an N+1 fetch on the to-do list) --
+  visaTypeName?: string;
+  countryName?: string;
+
+  // --- Lifecycle --------------------------------------------------------------
+  status: DocumentRequestStatus;
+  /** Id of the `Document` the client uploaded to satisfy this request. */
+  fulfilledDocumentId?: string;
+  fulfilledAt?: Timestamp;
+  /** Uid of whoever moved it to a terminal non-fulfilled state (waive/cancel). */
+  resolvedBy?: string;
+
+  createdAt: Timestamp;
   updatedAt: Timestamp;
 }
 
