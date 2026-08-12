@@ -35,6 +35,23 @@ import { sendSuccess, sendError, sendNotFound, sendForbidden } from "../utils/re
  * Each method corresponds to a REST endpoint and handles authentication checks,
  * authorization (role-based access), validation, and delegation to services.
  */
+/**
+ * Format a minor-unit amount (kobo/cents) for human-facing copy.
+ *
+ * PaymentRequest.amount is stored in the smallest currency unit — the portal
+ * divides by 100 on display — so notification copy must do the same or it reads
+ * 100x too high.
+ */
+function formatAmountForDisplay(minorUnits: number, currency: string): string {
+  const symbol = currency?.toUpperCase() === "NGN" ? "₦" : "";
+  const major = (minorUnits ?? 0) / 100;
+  const formatted = major.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  return symbol ? `${symbol}${formatted}` : `${formatted} ${currency}`;
+}
+
 class PaymentRequestController {
   /**
    * GET /payment-requests
@@ -168,6 +185,33 @@ class PaymentRequestController {
         description,
         category: category || "other",
       });
+
+      // Tell the CLIENT. Creating a payment request previously notified nobody —
+      // the record was written and the flow simply stopped, so a client had no
+      // prompt to pay and would only discover it by happening to open their
+      // payments page. The `payment_request` type is already configured for full
+      // delivery (in-app + email + push) in notification-policy; it was just
+      // never emitted.
+      //
+      // Awaited, not fire-and-forget: work kicked off after the response is sent
+      // gets CPU-throttled by Cloud Functions and lands late or not at all.
+      // Still fail-soft — a notification problem must not fail a request that
+      // was already written.
+      try {
+        await notificationService.notifyUser({
+          userId: app.userId,
+          type: "payment_request",
+          title: "Payment requested",
+          body:
+            `Your agent has requested ${formatAmountForDisplay(Number(amount), currency || "NGN")} ` +
+            `for ${description}. Open Seli to approve or decline it.`,
+          relatedEntityType: "payment_request",
+          relatedEntityId: request.id,
+          data: { paymentRequestId: request.id, applicationId },
+        });
+      } catch (e) {
+        console.error("[payment-request] client notify failed:", e);
+      }
 
       return sendSuccess(res, request, "Payment request created", 201);
     } catch (error: unknown) {
