@@ -21,6 +21,8 @@
     "paystack:sync:prod": "npm run build && node lib/scripts/sync-paystack-plans.js --project japa-platform",
     "admin:grant": "npm run build && node lib/scripts/grant-admin.js",
     "admin:revoke": "npm run build && node lib/scripts/grant-admin.js --revoke",
+    "backfill:slugs": "npm run build && node lib/scripts/backfill-agency-slugs.js",
+    "backfill:slugs:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-agency-slugs.js",
     "lint": "eslint --ext .ts src/",
     "lint:fix": "eslint --ext .ts src/ --fix",
     "clean": "rm -rf lib",

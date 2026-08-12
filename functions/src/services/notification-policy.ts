@@ -67,6 +67,15 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   welcome: FULL,
   role_changed: FULL,
   review_received: FULL,
+  // Account security / self-service. `password_changed` rides `notifyUser` (the
+  // user still exists and keeps the same address). `email_changed` and
+  // `account_deleted` are delivered DIRECTLY via `emailService` to a specific
+  // address (the OLD email / the about-to-be-deleted account), so their entries
+  // here exist only to satisfy the exhaustive channel map — the value is unused
+  // for the direct-send path. Still `FULL` for consistency.
+  password_changed: FULL,
+  email_changed: FULL,
+  account_deleted: FULL,
   // Other — in-app/push only (email would be noisy)
   message_received: APP_ONLY,
   visa_news: APP_ONLY,

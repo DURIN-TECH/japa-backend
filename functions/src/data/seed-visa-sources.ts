@@ -8,13 +8,20 @@ import { VisaSourcePage, VisaSourceValidation } from "../types/visa-catalog";
 // consolidated seed entry point, scripts/seed-all.ts, guarantees that).
 const db = getFirestore();
 
-// Default location of the verified-links markdown (repo root). Resolved relative
-// to this module so it works from compiled `lib/data/…` and ts-node `src/data/…`
-// alike (three levels up = the japa repo root).
-const DEFAULT_MARKDOWN_PATH = path.resolve(
-  __dirname,
-  "../../../official_visa_links_verified_v3.md"
-);
+// Verified-links markdown filename. The file lives at the japa repo root, which
+// is FOUR levels up from this module (compiled `lib/data/…` → lib → functions →
+// japa-backend → repo root; ts-node `src/data/…` has the same depth). We also
+// probe japa-backend/ as a fallback in case the file is ever colocated there, so
+// a wrong path can't silently skip the seed the way `../../../` did before.
+const MARKDOWN_FILENAME = "official_visa_links_verified_v3.md";
+const MARKDOWN_CANDIDATES = [
+  path.resolve(__dirname, "../../../../", MARKDOWN_FILENAME), // repo root
+  path.resolve(__dirname, "../../../", MARKDOWN_FILENAME), // japa-backend/
+];
+// Pick the first candidate that exists; fall back to the repo-root path so the
+// "not found" warning below reports a sensible location.
+const DEFAULT_MARKDOWN_PATH =
+  MARKDOWN_CANDIDATES.find((p) => fs.existsSync(p)) || MARKDOWN_CANDIDATES[0];
 
 // Weekly sweep by default (locked decision) — see the spike doc.
 const CRAWL_INTERVAL_HOURS = 168;

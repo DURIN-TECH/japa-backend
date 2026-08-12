@@ -285,6 +285,15 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     actionLabel: "View reviews",
     path: () => "/dashboard",
   },
+
+  // Account security — "your password was changed" heads-up (via notifyUser). The
+  // CTA is intentionally generic (there's no in-app deep link that fits every
+  // client): it just opens Seli so a user who didn't make the change can react.
+  password_changed: {
+    subject: "Your Seli password was changed",
+    actionLabel: "Open Seli",
+    path: () => "/",
+  },
 };
 
 /** Join a relative path to the configured app URL. */

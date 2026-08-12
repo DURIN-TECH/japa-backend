@@ -24,6 +24,18 @@ import type { VisaScrapeMeta } from "./visa-catalog";
 // USER TYPES
 // ============================================
 
+/**
+ * Per-user notification channel preferences (opt-OUT model). When a field is
+ * `false` the user has switched that channel off; absent/`true` means on. Only the
+ * user-configurable channels live here — `in_app` is always delivered (it's the
+ * record of truth) and is intentionally not represented. Security-critical emails
+ * bypass these preferences (see `NotifyUserInput.critical`).
+ */
+export interface NotificationPreferences {
+  email: boolean; // receive email notifications
+  push: boolean; // receive push notifications
+}
+
 export interface User {
   id: string;
   email: string;
@@ -64,6 +76,10 @@ export interface User {
   updatedAt: Timestamp;
   lastLoginAt?: Timestamp;
   fcmTokens?: string[]; // For push notifications
+
+  // Per-user notification channel preferences (email/push on-off). Absent = all
+  // channels on (opt-out model). See NotificationPreferences.
+  notificationPreferences?: NotificationPreferences;
 }
 
 // ---- Client identity verification (applicant KYC) ----
@@ -217,6 +233,11 @@ export interface AgencyCompliance {
 export interface Agency {
   id: string;
   name: string;
+  // URL-safe public handle used for the shareable agency landing page
+  // (`/a/<slug>`). Unique across agencies, generated from the name on create
+  // (see `agencyService.generateUniqueAgencySlug`). Optional in the type only so
+  // that agencies created before slugs existed still satisfy it until backfilled.
+  slug?: string;
   ownerId: string; // userId of the creator/owner
   ownerName: string; // Denormalized for display
 
@@ -809,8 +830,9 @@ export interface Transaction {
   escrowReleaseCondition?: string;
   escrowReleasedAt?: Timestamp;
   
-  // Payment processor
-  paymentProvider: "stripe" | "paypal" | "manual";
+  // Payment processor. "paystack" is the live gateway (subscriptions, seats, and
+  // guest consultation fees); the others predate it.
+  paymentProvider: "stripe" | "paypal" | "manual" | "paystack";
   providerTransactionId?: string;
   
   // Metadata
@@ -952,6 +974,10 @@ export type NotificationType =
   | "welcome"
   | "role_changed"
   | "review_received"
+  // Account security / self-service (mobile + portal account management)
+  | "password_changed" // Security notice: the account password was just changed
+  | "email_changed" // Security notice sent to the OLD address when an email change is requested
+  | "account_deleted" // Confirmation that the account + data were deleted
   // Other
   | "message_received"
   | "visa_news"

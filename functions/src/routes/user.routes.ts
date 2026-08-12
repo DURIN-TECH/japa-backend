@@ -27,6 +27,25 @@ router.delete("/me", verifyAuth, (req, res) =>
   userController.deleteMe(req, res)
 );
 
+// Account-security self-service (mobile + portal). These are exempted from the
+// read-only-plan write-block in `verifyAuth` — a lapsed plan must never stop a
+// user from securing or deleting their own account.
+//   password-changed → fire the branded "your password was changed" notice
+//                       (the password itself is changed client-side via Firebase).
+//   change-email     → start the branded, verification-gated email-change flow.
+router.post("/me/password-changed", verifyAuth, (req, res) =>
+  userController.notifyPasswordChanged(req, res)
+);
+router.post("/me/change-email", verifyAuth, (req, res) =>
+  userController.changeEmail(req, res)
+);
+
+// Notification channel preferences (email/push on-off). PATCH a partial body to
+// toggle one or both channels.
+router.patch("/me/notification-preferences", verifyAuth, (req, res) =>
+  userController.updateNotificationPreferences(req, res)
+);
+
 // Profile photo (avatar) upload — two-step signed-URL flow:
 //   1. mint a signed PUT URL, 2. register the uploaded object (makes it public
 //   and persists profilePhotoUrl onto the user).
