@@ -163,9 +163,15 @@ class AuthController {
    * template. So, exactly like the reset flow, we mint the verification link with
    * the Admin SDK and deliver it through our own Resend pipeline.
    *
-   * The link points at Firebase's own action handler (it verifies the address and
-   * shows a confirmation page), so this works with zero extra hosted pages. The
-   * email around it is fully Seli-branded.
+   * Like the reset/claim flows, we keep the whole journey on OUR domain: the
+   * Admin SDK mints the link, we pull the one-time `oobCode` out of it, and
+   * rebuild it as `${APP_URL}/verify-email?oobCode=…`. The portal page redeems
+   * the code client-side via `applyActionCode`.
+   *
+   * (This previously handed the user Firebase's own action-handler URL, which
+   * verified the address but dropped them on an unbranded Firebase-hosted page —
+   * the last Firebase surface a user could see, and especially jarring for a
+   * client who had just come through the branded /claim page.)
    *
    * Enumeration-safe (same posture as forgotPassword): always returns the same
    * generic success, whether or not the address maps to an unverified account.
@@ -185,13 +191,21 @@ class AuthController {
         return;
       }
 
-      // Mint the verification link. Unlike the reset flow we keep Firebase's own
-      // link as-is: its action handler verifies the email and shows a confirmation
-      // page, so no custom landing page is required. Throws auth/user-not-found for
-      // unknown accounts, which we swallow (enumeration protection).
+      // Mint the verification link, then re-point it at our own page. As in
+      // `forgotPassword` we deliberately pass no actionCodeSettings — we only
+      // want the `oobCode`, and supplying a `url` would require that domain to
+      // sit in Firebase's Authorized domains list. Throws auth/user-not-found
+      // for unknown accounts, which we swallow (enumeration protection).
+      const appUrl = EMAIL_BRANDING.appUrl;
       let verifyUrl: string;
       try {
-        verifyUrl = await auth.generateEmailVerificationLink(email);
+        const firebaseLink = await auth.generateEmailVerificationLink(email);
+        const oobCode = new URL(firebaseLink).searchParams.get("oobCode");
+        // Fall back to the raw Firebase link if the shape ever changes, so the
+        // user is never stranded — it still resolves via Firebase's handler.
+        verifyUrl = oobCode
+          ? `${appUrl}/verify-email?oobCode=${encodeURIComponent(oobCode)}`
+          : firebaseLink;
       } catch (err: unknown) {
         const code = (err as { code?: string }).code || "";
         if (
