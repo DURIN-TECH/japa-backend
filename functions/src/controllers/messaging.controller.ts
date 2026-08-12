@@ -50,24 +50,28 @@ async function notifyRecipient(
   senderUid: string,
   content: string
 ): Promise<void> {
-  let recipientUid: string | null;
-
-  if (senderType === "agent") {
-    // Agent wrote → the client receives it. Straightforward: userId is a uid.
-    recipientUid = conv.userId;
-  } else {
-    // Client wrote → the agent receives it. conv.agentId is a DOC id, so map it
-    // back to the owning user account.
-    const agentDoc = await collections.agents.doc(conv.agentId).get();
-    recipientUid = agentDoc.exists
-      ? ((agentDoc.data() as { userId?: string }).userId ?? null)
-      : null;
-  }
+  // Resolve the recipient and the sender's name CONCURRENTLY. They're
+  // independent lookups, and running them in series put an extra Firestore
+  // round trip between the message being sent and the notification existing —
+  // latency the recipient sees directly.
+  const [recipientUid, senderName] = await Promise.all([
+    (async (): Promise<string | null> => {
+      if (senderType === "agent") {
+        // Agent wrote → the client receives it. userId is already a uid.
+        return conv.userId;
+      }
+      // Client wrote → the agent receives it. conv.agentId is a DOC id, so map
+      // it back to the owning user account.
+      const agentDoc = await collections.agents.doc(conv.agentId).get();
+      return agentDoc.exists
+        ? ((agentDoc.data() as { userId?: string }).userId ?? null)
+        : null;
+    })(),
+    userService.getDisplayName(senderUid).then((name) => name || "Someone"),
+  ]);
 
   // No resolvable recipient (orphaned agent doc) — nothing to do.
   if (!recipientUid || recipientUid === senderUid) return;
-
-  const senderName = (await userService.getDisplayName(senderUid)) || "Someone";
 
   // Preview the message rather than just saying "you have a new message" — the
   // recipient can often act on it (or decide not to) without opening the thread.
@@ -220,16 +224,22 @@ export async function sendMessage(req: AuthenticatedRequest, res: Response): Pro
       attachmentUrls
     );
 
-    // Tell the OTHER participant. Sending a message previously produced no
-    // notification at all — the message landed in Firestore and the recipient
-    // only discovered it by opening the messaging page, so an agent had no way
-    // to know a client had replied.
+    // Tell the OTHER participant, BEFORE responding.
     //
-    // Best-effort: a notification failure must never fail a message that was
-    // already written.
-    void notifyRecipient(conv, senderType, userId, content.trim()).catch((e) =>
-      console.error("[messaging] recipient notify failed:", e)
-    );
+    // This is deliberately awaited rather than fire-and-forget. Cloud Functions
+    // throttles CPU once the response is sent, so background work kicked off
+    // after `sendCreated` runs at the platform's convenience — which showed up
+    // as a multi-second, variable delay before the recipient's bell updated.
+    // Awaiting costs the SENDER ~one round trip and makes the recipient's
+    // notification deterministic. (It also matches every other controller here.)
+    //
+    // Still fail-soft: a notification error must never fail a message that was
+    // already written, so it's caught and logged rather than propagated.
+    try {
+      await notifyRecipient(conv, senderType, userId, content.trim());
+    } catch (e) {
+      console.error("[messaging] recipient notify failed:", e);
+    }
 
     sendCreated(res, msg);
   } catch (error: unknown) {
