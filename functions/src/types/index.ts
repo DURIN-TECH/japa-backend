@@ -529,6 +529,17 @@ export interface Application {
   createdByAdminName?: string; // Denormalized admin name for display
   adminCreationReason?: string; // Optional reason the admin gave
 
+  // ---- Who is handling this case (resolved on READ, not stored) ----
+  // Populated by the API when an application is returned, so a client can see
+  // who is acting for them without needing read access to the agents/agencies
+  // collections. Deliberately NOT persisted: denormalizing would require a
+  // backfill across every existing application and re-syncing on reassignment,
+  // whereas resolving on read is correct for old and new data alike.
+  agentName?: string;
+  agencyName?: string;
+  /** Agency logo, when the agency has uploaded one (client-facing branding). */
+  agencyLogoUrl?: string;
+
   // Status & Progress
   status: ApplicationStatus;
   progress: number; // 0-100

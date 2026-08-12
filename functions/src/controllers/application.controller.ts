@@ -460,7 +460,8 @@ export class ApplicationController {
         applications = applications.filter((app) => app.mode === mode);
       }
 
-      sendSuccess(res, applications);
+      // Resolve who is handling each case so client-facing UIs can name them.
+      sendSuccess(res, await this.withHandlerNames(applications));
     } catch (error) {
       console.error("Error getting applications:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -492,7 +493,8 @@ export class ApplicationController {
         return;
       }
 
-      sendSuccess(res, application);
+      const [enriched] = await this.withHandlerNames([application]);
+      sendSuccess(res, enriched);
     } catch (error) {
       console.error("Error getting application:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -886,6 +888,79 @@ export class ApplicationController {
     return snap.docs.filter(
       (d) => !TERMINAL.includes((d.data() as Application).status)
     ).length;
+  }
+
+
+  /**
+   * Attach `agentName` / `agencyName` / `agencyLogoUrl` to applications.
+   *
+   * WHY ON READ: a client needs to know who is handling their case, but these
+   * names aren't stored on the application. Denormalizing them at write time
+   * would mean backfilling every existing application and re-syncing whenever a
+   * case is reassigned; resolving here is correct for old and new data alike,
+   * and the client never needs read access to the agents/agencies collections.
+   *
+   * COST: batched, not N+1. Unique agent/agency ids across the whole result set
+   * are resolved ONCE each, so a page of 50 cases from one agency costs two
+   * reads, not a hundred. Fail-soft — on any lookup error the applications are
+   * returned unenriched rather than failing the request.
+   *
+   * NOTE `Application.agentId` is a USER uid (unlike Conversation.agentId, which
+   * is an agent DOC id), so agents are resolved by querying on `userId`.
+   */
+  private async withHandlerNames(
+    applications: Application[]
+  ): Promise<Application[]> {
+    if (applications.length === 0) return applications;
+
+    try {
+      const agentUids = [
+        ...new Set(applications.map((a) => a.agentId).filter(Boolean) as string[]),
+      ];
+      const agencyIds = [
+        ...new Set(applications.map((a) => a.agencyId).filter(Boolean) as string[]),
+      ];
+
+      const [agentEntries, agencyEntries] = await Promise.all([
+        Promise.all(
+          agentUids.map(async (uid) => {
+            const snap = await collections.agents
+              .where("userId", "==", uid)
+              .limit(1)
+              .get();
+            const name = snap.empty
+              ? undefined
+              : (snap.docs[0].data() as { displayName?: string }).displayName;
+            return [uid, name] as const;
+          })
+        ),
+        Promise.all(
+          agencyIds.map(async (id) => {
+            const snap = await collections.agencies.doc(id).get();
+            const data = snap.exists
+              ? (snap.data() as { name?: string; logoUrl?: string })
+              : undefined;
+            return [id, data] as const;
+          })
+        ),
+      ]);
+
+      const agentNames = new Map(agentEntries);
+      const agencies = new Map(agencyEntries);
+
+      return applications.map((app) => ({
+        ...app,
+        agentName: app.agentId ? agentNames.get(app.agentId) : undefined,
+        agencyName: app.agencyId ? agencies.get(app.agencyId)?.name : undefined,
+        agencyLogoUrl: app.agencyId
+          ? agencies.get(app.agencyId)?.logoUrl
+          : undefined,
+      }));
+    } catch (error) {
+      // Never fail a case list because a display name couldn't be resolved.
+      console.error("[application] handler-name enrichment failed:", error);
+      return applications;
+    }
   }
 
   /**
