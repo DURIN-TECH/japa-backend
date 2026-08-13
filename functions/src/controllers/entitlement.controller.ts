@@ -2,6 +2,8 @@ import { Response, Request } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { entitlementService } from "../services/entitlement.service";
 import { billingService } from "../services/billing/billing.service";
+import { paystackProvider } from "../services/billing/paystack.provider";
+import { settlePaymentRequest } from "../services/payment-request-settlement.service";
 import { collections } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import {
@@ -442,10 +444,97 @@ export class EntitlementController {
    * the HMAC signature can be verified. Always 200s quickly (provider retries on
    * non-2xx) while only applying verified events.
    */
+
+  /**
+   * Settle a payment request from a (already signature-verified) webhook body.
+   *
+   * Returns true when this event was a payment-request charge we handled, so the
+   * caller can skip the subscription path. Returns false for anything else —
+   * including a payment-request charge that wasn't successful, which we ignore
+   * rather than acting on.
+   *
+   * Never throws: a webhook must always be answered 200 or Paystack will retry
+   * indefinitely, and a retry storm is worse than a missed settlement we can
+   * repair from logs.
+   */
+  private async settlePaymentRequestFromWebhook(rawBody: string): Promise<boolean> {
+    try {
+      const body = JSON.parse(rawBody) as {
+        event?: string;
+        data?: {
+          reference?: string;
+          status?: string;
+          metadata?: Record<string, unknown>;
+        };
+      };
+
+      if (body.event !== "charge.success") return false;
+
+      const metadata = body.data?.metadata ?? {};
+      if (metadata.purpose !== "payment_request") return false;
+
+      const paymentRequestId = metadata.paymentRequestId as string | undefined;
+      const reference = body.data?.reference;
+      if (!paymentRequestId || !reference) {
+        console.error(
+          "[webhook] payment_request charge missing paymentRequestId/reference:",
+          { paymentRequestId, reference }
+        );
+        // Ours by purpose, but unusable — claim it so we don't hand a malformed
+        // payment-request event to the subscription path.
+        return true;
+      }
+
+      // Paystack sends charge.success only for successful charges, but the
+      // status is checked anyway rather than trusting the event name alone.
+      if (body.data?.status && body.data.status !== "success") return false;
+
+      const outcome = await settlePaymentRequest(paymentRequestId, reference);
+      if (outcome.alreadySettled) {
+        // Expected whenever the client DID return — verify-on-return got there
+        // first. Not an error.
+        console.log(
+          `[webhook] payment request ${paymentRequestId} already settled; ignoring.`
+        );
+      } else if (!outcome.request) {
+        console.error(
+          `[webhook] payment request ${paymentRequestId} not found for reference ${reference}.`
+        );
+      }
+      return true;
+    } catch (error) {
+      console.error("[webhook] payment-request settlement failed:", error);
+      // Claimed: a malformed payment-request event must not fall through to the
+      // subscription handler.
+      return true;
+    }
+  }
+
   async handlePaystackWebhook(req: Request, res: Response): Promise<void> {
     try {
       const raw = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : JSON.stringify(req.body);
       const headers = req.headers as Record<string, string | undefined>;
+
+      // ── Payment requests ────────────────────────────────────────────────
+      // Handled BEFORE the subscription path because both arrive as
+      // `charge.success` and only the metadata tells them apart.
+      //
+      // This is the fallback for a client who paid but never returned to the
+      // site — closed the tab, lost signal, killed the browser. Without it the
+      // charge succeeds at Paystack and the request sits "approved" forever
+      // while the client believes (correctly) that they have paid.
+      //
+      // Signature is verified explicitly: `parseWebhook` returns null both for a
+      // forged payload AND for a valid non-subscription charge, so its null
+      // cannot be treated as "unauthentic" here.
+      if (paystackProvider.verifyWebhookSignature(headers, raw)) {
+        const settled = await this.settlePaymentRequestFromWebhook(raw);
+        if (settled) {
+          res.status(200).json({ received: true, applied: true });
+          return;
+        }
+      }
+
       const applied = await billingService.handleWebhook(headers, raw);
       res.status(200).json({ received: true, applied });
     } catch (error) {

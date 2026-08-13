@@ -19,11 +19,10 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { paymentRequestService } from "../services/payment-request.service";
-import { transactionService } from "../services/transaction.service";
-import { applicationService } from "../services/application.service";
 import { messagingService } from "../services/messaging.service";
 import { notificationService } from "../services/notification.service";
 import { paystackProvider } from "../services/billing/paystack.provider";
+import { settlePaymentRequest } from "../services/payment-request-settlement.service";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { collections } from "../utils/firebase";
 import { PaymentRequestStatus } from "../types";
@@ -472,35 +471,19 @@ class PaymentRequestController {
         );
       }
 
-      // ---- Confirmed paid: NOW do the money-side bookkeeping ----------------
-      const paid = await paymentRequestService.updateStatus(id, "paid");
-      await transactionService.createEscrowRelease(paid);
-      await applicationService.incrementAmountPaid(request.applicationId, request.amount);
+      // ---- Confirmed paid: settle ------------------------------------------
+      // Shared with the Paystack webhook, which settles the same request when
+      // the client never makes it back here. The settlement claims the request
+      // atomically, so whichever path arrives second is a no-op and the agency
+      // can't be credited twice.
+      const outcome = await settlePaymentRequest(id, reference);
+      if (!outcome.request) return sendNotFound(res, "Payment request not found");
 
-      // Tell the agent money actually arrived (previously sent on approval,
-      // when nothing had).
-      const agentUserId = (
-        await collections.agents.doc(request.agentId).get()
-      ).data()?.userId;
-      if (agentUserId) {
-        await notificationService
-          .notifyUser({
-            userId: agentUserId,
-            type: "payment_received",
-            title: "Payment received",
-            body:
-              `${request.clientName || "Your client"} paid ` +
-              `${formatAmountForDisplay(request.amount, request.currency)} for ${request.description}.`,
-            relatedEntityType: "payment_request",
-            relatedEntityId: id,
-            data: request.applicationId
-              ? { applicationId: request.applicationId }
-              : undefined,
-          })
-          .catch((e) => console.error("[payment-request] agent notify failed:", e));
-      }
-
-      return sendSuccess(res, paid, "Payment completed");
+      return sendSuccess(
+        res,
+        outcome.request,
+        outcome.alreadySettled ? "Payment already completed" : "Payment completed"
+      );
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Unknown error";
       return sendError(res, "INTERNAL_ERROR", message, 500);

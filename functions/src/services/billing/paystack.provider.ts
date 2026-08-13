@@ -249,20 +249,37 @@ export class PaystackProvider implements BillingProvider {
    * key, then map the event to our domain shape. Returns null for irrelevant or
    * unverified events (never trust an unsigned payload).
    */
-  parseWebhook(
+  /**
+   * Verify a Paystack webhook's HMAC signature.
+   *
+   * Public because `parseWebhook` below only understands SUBSCRIPTION events —
+   * it returns null both for a forged payload and for a perfectly valid charge
+   * that simply isn't a subscription, which are not the same thing. Handlers for
+   * other charge purposes (payment requests) need to establish authenticity on
+   * their own before trusting the body, and must not re-implement this.
+   */
+  verifyWebhookSignature(
     headers: Record<string, string | undefined>,
     rawBody: string
-  ): NormalizedSubscriptionEvent | null {
+  ): boolean {
     const signature = headers["x-paystack-signature"];
-    if (!signature) return null;
+    if (!signature) return false;
     const expected = crypto
       .createHmac("sha512", this.secretKey)
       .update(rawBody)
       .digest("hex");
     if (signature !== expected) {
       console.warn("Paystack webhook signature mismatch");
-      return null;
+      return false;
     }
+    return true;
+  }
+
+  parseWebhook(
+    headers: Record<string, string | undefined>,
+    rawBody: string
+  ): NormalizedSubscriptionEvent | null {
+    if (!this.verifyWebhookSignature(headers, rawBody)) return null;
 
     let body: PaystackWebhookBody;
     try {
