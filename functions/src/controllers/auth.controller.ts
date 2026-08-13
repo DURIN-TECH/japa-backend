@@ -341,7 +341,7 @@ class AuthController {
     const invitedBy = agencyName?.trim()
       ? `${agencyName.trim()} has started a visa application for you on ` +
         `${EMAIL_BRANDING.appName}`
-      : `An immigration agent has started a visa application for you on ` +
+      : "An immigration agent has started a visa application for you on " +
         `${EMAIL_BRANDING.appName}`;
 
     const result = await emailService.sendNotification({
