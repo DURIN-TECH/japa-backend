@@ -112,6 +112,7 @@ async function main() {
     const { seedPortalData } = await import("../data/seed-portal-data");
     const { seedNigeriaIrelandEligibility } = await import("../data/eligibility-seed-nigeria-ireland");
     const { seedNewsSources } = await import("../data/seed-news-sources");
+    const { seedVisaSources } = await import("../data/seed-visa-sources");
     const { seedDocumentTemplates } = await import("../data/seed-document-templates");
     const { seedPlans } = await import("./seed-plans");
     const { seedSubscriptions } = await import("./seed-subscriptions");
@@ -132,6 +133,11 @@ async function main() {
     // 3. News sources — feed definitions the scraper polls.
     console.log("→ Seeding news sources...");
     const newsCount = await seedNewsSources();
+
+    // 3a2. Visa-catalog sources — the official per-country immigration URLs the
+    //      visa-catalog scraper crawls (seeded from official_visa_links_verified_v3.md).
+    console.log("→ Seeding visa-catalog sources...");
+    const visaSourceCount = await seedVisaSources();
 
     // 3b. Document templates — the global rich-text catalog agents clone from.
     //     Independent of portal data; safe to run any time after admin init.
@@ -180,6 +186,8 @@ async function main() {
     console.log(`  - Exemptions:      ${eligibility.exemptionsSeeded}`);
     console.log("News:");
     console.log(`  - Sources:         ${newsCount}`);
+    console.log("Visa catalog:");
+    console.log(`  - Visa sources:    ${visaSourceCount} countries`);
     console.log("Documents:");
     console.log(`  - Templates:       ${documentTemplatesCount}`);
     console.log("Billing / RBAC:");

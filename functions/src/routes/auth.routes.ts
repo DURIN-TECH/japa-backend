@@ -19,4 +19,21 @@ router.post("/forgot-password", (req, res) =>
   authController.forgotPassword(req, res)
 );
 
+// Send (or re-send) the branded "verify your email" message. Public + enumeration
+// safe, mirroring forgot-password: the client just supplies the address to verify.
+router.post("/resend-verification", (req, res) =>
+  authController.resendEmailVerification(req, res)
+);
+
+// "Claim your account" — first-run set-a-password link for a client whose account
+// was provisioned by an agent. Same one-time code as a reset, but framed (and
+// landed at /claim) for someone who never signed up themselves.
+router.post("/claim-account", (req, res) =>
+  authController.claimAccount(req, res)
+);
+
+// Passwordless fallback — email a one-tap sign-in link. See the controller for the
+// Firebase Authorized-domains / email-link-provider prerequisites.
+router.post("/magic-link", (req, res) => authController.magicLink(req, res));
+
 export { router as authRoutes };

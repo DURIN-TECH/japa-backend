@@ -7,6 +7,8 @@ import { userService } from "../services/user.service";
 import { transactionService } from "../services/transaction.service";
 import { paystackProvider } from "../services/billing/paystack.provider";
 import { EMAIL_BRANDING } from "../services/email/branding";
+// Used to invite a freshly-provisioned client to set a password (claim their account).
+import { authController } from "./auth.controller";
 import { collections, auth } from "../utils/firebase";
 import {
   Agent,
@@ -638,6 +640,14 @@ export class ConsultationController {
           });
           // Provisional = created for the client, not yet self-claimed.
           await collections.users.doc(clientUid).update({ isProvisional: true });
+          // Invite them to set a password. Without this the account exists but is
+          // unreachable — the client can't sign in to see the booking they just
+          // made. Best-effort: an email failure must not fail a paid booking.
+          void authController
+            .sendClaimEmail(normalizedEmail, firstName, agency.name)
+            .catch((e) =>
+              console.error("[consultation] claim-account invite failed:", e)
+            );
         } catch (err) {
           // Auth record already exists (race / pre-existing) → link to it.
           if ((err as { code?: string }).code === "auth/email-already-exists") {

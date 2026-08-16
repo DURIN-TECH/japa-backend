@@ -25,6 +25,11 @@ export interface NotifyUserInput {
   actionUrl?: string;
   // Extra string key/values merged into the FCM data payload (must be strings).
   data?: Record<string, string>;
+  // Security-critical notifications (e.g. "your password was changed") set this so
+  // their EMAIL is delivered even if the user has switched email notifications off
+  // in their preferences. The user should never be able to silence a security
+  // alert about their own account. Does not affect push/in_app.
+  critical?: boolean;
 }
 
 class NotificationService {
@@ -107,12 +112,32 @@ class NotificationService {
     // Channels: caller's explicit choice wins; otherwise the central per-type
     // policy decides (so transactional events get email without each call site
     // hardcoding channel arrays).
-    const channels = input.channels ?? channelsForType(input.type);
+    const resolvedChannels = input.channels ?? channelsForType(input.type);
 
-    // Load the recipient once — needed for push tokens (fcmTokens) and for the
-    // email/sms stub destinations (email/phone).
-    const userDoc = await collections.users.doc(input.userId).get();
-    const user = userDoc.exists ? userDoc.data() : null;
+    // Load the recipient — needed for push tokens (fcmTokens), the email/sms
+    // destinations (email/phone), AND the channel preferences below.
+    //
+    // SKIPPED for in-app-only notifications: `in_app` is never filtered by
+    // preferences and needs nothing off the user doc, so the read would be pure
+    // latency between the triggering action and the notification appearing.
+    // That matters most for `message_received`, which is in-app only and is the
+    // one notification a user is actively waiting on.
+    const needsRecipientDoc = resolvedChannels.some((c) => c !== "in_app");
+    const userDoc = needsRecipientDoc
+      ? await collections.users.doc(input.userId).get()
+      : null;
+    const user = userDoc?.exists ? userDoc.data() : null;
+
+    // Apply the user's opt-out preferences: drop `email`/`push` if they've turned
+    // that channel off. `in_app` is never filtered (it's the record of truth), and
+    // a `critical` notification keeps its email regardless (security alerts must
+    // reach the user). Absent prefs = everything on (opt-out model).
+    const prefs = user?.notificationPreferences;
+    const channels = resolvedChannels.filter((c) => {
+      if (c === "email" && prefs?.email === false && !input.critical) return false;
+      if (c === "push" && prefs?.push === false) return false;
+      return true;
+    });
 
     // --- in_app ---------------------------------------------------------------
     if (channels.includes("in_app")) {

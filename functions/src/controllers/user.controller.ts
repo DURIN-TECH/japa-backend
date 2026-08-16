@@ -4,12 +4,30 @@ import { userService } from "../services/user.service";
 import { storageService } from "../services/storage.service";
 import { claimsService } from "../services/claims.service";
 import { notificationService } from "../services/notification.service";
+import { emailService } from "../services/email/email.service";
+import { EMAIL_BRANDING } from "../services/email/branding";
+import { auth } from "../utils/firebase";
 import { Role, ROLES, packAbility } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
   ErrorMessages,
 } from "../utils/response";
+
+// Basic email shape check, reused by the account-security endpoints below. Mirrors
+// the validation used in auth.controller (a malformed/blank email is a client bug,
+// not an enumeration signal, so rejecting it leaks nothing).
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Mask an email for display in a security notice ("a***@example.com") so the OLD
+// address is told WHERE the account is moving without echoing the full new address
+// back to a channel the requester may not control.
+function maskEmail(email: string): string {
+  const [local, domain] = email.split("@");
+  if (!domain) return email;
+  const head = local.slice(0, 1);
+  return `${head}${"*".repeat(Math.max(1, local.length - 1))}@${domain}`;
+}
 
 // Roles an admin may assign through the role-management endpoint. Sourced from the
 // shared authz constants (never hardcoded literals) so the list can't drift.
@@ -377,6 +395,217 @@ export class UserController {
    * POST /users/login
    * Record user login (for analytics)
    */
+  /**
+   * POST /users/me/password-changed
+   *
+   * Fires the branded "your password was changed" SECURITY notice. The password
+   * itself is changed entirely client-side via Firebase Auth (reauthenticate +
+   * updatePassword) — it never touches the backend. The client calls this endpoint
+   * AFTER a successful change so the account owner gets an out-of-band heads-up:
+   * if they didn't make the change, that email is their signal to react.
+   *
+   * Best-effort: a delivery failure never fails the request (the password is
+   * already changed; we just log the miss). Rides `notifyUser`, so the same event
+   * also lands in-app + push per the channel policy.
+   */
+  async notifyPasswordChanged(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    try {
+      const userId = req.userId!;
+      await notificationService
+        .notifyUser({
+          userId,
+          type: "password_changed",
+          title: "Your password was changed",
+          body:
+            `The password for your ${EMAIL_BRANDING.appName} account was just ` +
+            "changed. If this was you, no action is needed.\n\n" +
+            "If you did NOT change your password, reset it immediately from the " +
+            "sign-in screen and contact support — your account may be at risk.",
+          // Security alert — deliver the email even if the user has opted out of
+          // email notifications. They can't silence an alert about their own account.
+          critical: true,
+        })
+        .catch((e) =>
+          console.error("[user] password-changed notify failed:", e)
+        );
+      sendSuccess(res, { notified: true }, "Password change confirmed");
+    } catch (error) {
+      console.error("Error sending password-changed notice:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /users/me/change-email
+   * Body: { newEmail: string }
+   *
+   * Starts a branded, verification-gated email-change flow:
+   *   1. Mint a Firebase "verify-and-change" link for (currentEmail → newEmail)
+   *      with the Admin SDK. The change only takes effect once the user clicks it,
+   *      so we never trust an unverified address.
+   *   2. Send that link — Seli-branded (Resend) — to the NEW address to confirm.
+   *   3. Send a branded SECURITY notice to the OLD address so an attacker who got
+   *      a session can't silently move the account out from under the owner.
+   *
+   * We deliberately DON'T mutate Firestore here: the email only flips after the
+   * user verifies, and the profile reconciles from the token on next sign-in.
+   * Reauthentication is enforced client-side (recent password) before this call.
+   */
+  async changeEmail(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const rawEmail = (req.body?.newEmail ?? "") as string;
+      const newEmail = rawEmail.trim().toLowerCase();
+
+      // Validate the target address shape up front.
+      if (!newEmail || !EMAIL_RE.test(newEmail)) {
+        sendError(res, "VALIDATION_ERROR", "A valid new email address is required", 400);
+        return;
+      }
+
+      // Resolve the current (authoritative) email from the Auth record — not the
+      // Firestore profile, which can lag. generateVerifyAndChangeEmailLink requires
+      // the FROM address to match the account's current email.
+      const userRecord = await auth.getUser(userId);
+      const currentEmail = (userRecord.email ?? "").toLowerCase();
+      if (!currentEmail) {
+        sendError(res, "VALIDATION_ERROR", "Your account has no email to change", 400);
+        return;
+      }
+      if (currentEmail === newEmail) {
+        sendError(res, "VALIDATION_ERROR", "That is already your email address", 400);
+        return;
+      }
+
+      // Refuse if the target address already belongs to another account. getUserByEmail
+      // throws auth/user-not-found when it's free — the only case we want to proceed.
+      try {
+        await auth.getUserByEmail(newEmail);
+        sendError(res, "CONFLICT", "That email address is already in use", 409);
+        return;
+      } catch (err: unknown) {
+        const code = (err as { code?: string }).code || "";
+        if (code !== "auth/user-not-found" && code !== "auth/email-not-found") {
+          throw err; // a real lookup failure, not "address is free"
+        }
+      }
+
+      // Mint the verify-and-change link (change is applied by Firebase only after
+      // the user clicks it from the new inbox).
+      const changeLink = await auth.generateVerifyAndChangeEmailLink(
+        currentEmail,
+        newEmail
+      );
+
+      // 1) Confirmation to the NEW address (carries the actionable link).
+      const confirmResult = await emailService.sendNotification({
+        to: newEmail,
+        subject: `Confirm your new ${EMAIL_BRANDING.appName} email`,
+        title: "Confirm your new email address",
+        body:
+          `You asked to use this address for your ${EMAIL_BRANDING.appName} ` +
+          "account. Click the button below to confirm the change. Until you do, " +
+          "your account keeps its current email.\n\n" +
+          "If you didn't request this, you can safely ignore this email.",
+        actionUrl: changeLink,
+        actionLabel: "Confirm email change",
+        preheader: `Confirm your new ${EMAIL_BRANDING.appName} email address`,
+      });
+      if (confirmResult.status !== "sent") {
+        console.error(
+          `[user:change-email] confirmation email to ${newEmail} was not sent ` +
+            `(status=${confirmResult.status}${confirmResult.error ? `: ${confirmResult.error}` : ""}).`
+        );
+      }
+
+      // 2) Security heads-up to the OLD address (no link — informational only).
+      await emailService
+        .sendNotification({
+          to: currentEmail,
+          subject: `Security alert: email change requested on ${EMAIL_BRANDING.appName}`,
+          title: "Email change requested",
+          body:
+            `A request was made to change the email on your ${EMAIL_BRANDING.appName} ` +
+            `account to ${maskEmail(newEmail)}. The change only completes once it's ` +
+            "confirmed from the new address.\n\n" +
+            "If this wasn't you, reset your password immediately and contact support " +
+            "— someone may have access to your account.",
+          preheader: "Was this you? A change to your account email was requested.",
+        })
+        .catch((e) =>
+          console.error("[user:change-email] old-address notice failed:", e)
+        );
+
+      sendSuccess(
+        res,
+        { sent: true },
+        "Check your new email inbox to confirm the change."
+      );
+    } catch (error) {
+      console.error("Error starting email change:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PATCH /users/me/notification-preferences
+   * Body: { email?: boolean, push?: boolean }
+   *
+   * Update which channels this user receives non-critical notifications on. A
+   * partial body is allowed (toggle one channel at a time); omitted fields keep
+   * their current value. `in_app` is always delivered and can't be turned off here.
+   * Security-critical emails (e.g. password changed) ignore these preferences.
+   */
+  async updateNotificationPreferences(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { email, push } = req.body as { email?: unknown; push?: unknown };
+
+      // Accept only booleans for the fields that are present; reject anything else
+      // so a malformed toggle can't write garbage into the prefs object.
+      const prefs: Partial<{ email: boolean; push: boolean }> = {};
+      if (email !== undefined) {
+        if (typeof email !== "boolean") {
+          sendError(res, "VALIDATION_ERROR", "`email` must be a boolean", 400);
+          return;
+        }
+        prefs.email = email;
+      }
+      if (push !== undefined) {
+        if (typeof push !== "boolean") {
+          sendError(res, "VALIDATION_ERROR", "`push` must be a boolean", 400);
+          return;
+        }
+        prefs.push = push;
+      }
+      if (prefs.email === undefined && prefs.push === undefined) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          "Provide at least one of `email` or `push`",
+          400
+        );
+        return;
+      }
+
+      const updated = await userService.updateNotificationPreferences(userId, prefs);
+      sendSuccess(
+        res,
+        updated.notificationPreferences ?? { email: true, push: true },
+        "Notification preferences updated"
+      );
+    } catch (error) {
+      console.error("Error updating notification preferences:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
   async recordLogin(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
       const userId = req.userId!;
@@ -397,13 +626,54 @@ export class UserController {
     try {
       const userId = req.userId!;
 
-      // In a real app, you'd want to:
-      // 1. Check for active applications
-      // 2. Handle refunds
-      // 3. Notify agents
-      // 4. Anonymize or archive data
+      // Capture the email BEFORE we delete anything — once the profile + Auth user
+      // are gone there's nothing left to address the confirmation to. Prefer the
+      // authoritative Auth record, fall back to the Firestore profile.
+      let email: string | undefined;
+      try {
+        const rec = await auth.getUser(userId);
+        email = rec.email ?? undefined;
+      } catch {
+        // Auth record may already be gone / unreadable — fall back below.
+      }
+      if (!email) {
+        const profile = await userService.getUserById(userId);
+        email = profile?.email;
+      }
 
+      // Send the branded "your account was deleted" confirmation FIRST (direct
+      // send — `notifyUser` can't be used once the profile/tokens are deleted).
+      // Best-effort: a delivery miss must not block the deletion the user asked for.
+      if (email) {
+        await emailService
+          .sendNotification({
+            to: email,
+            subject: `Your ${EMAIL_BRANDING.appName} account was deleted`,
+            title: "Your account was deleted",
+            body:
+              `Your ${EMAIL_BRANDING.appName} account and personal data have been ` +
+              "deleted as requested. We're sorry to see you go.\n\n" +
+              "If you did NOT request this, contact support immediately — your " +
+              "account may have been compromised.",
+            preheader: `Your ${EMAIL_BRANDING.appName} account has been deleted`,
+          })
+          .catch((e) =>
+            console.error("[user:delete] confirmation email failed:", e)
+          );
+      }
+
+      // Remove the Firestore profile. (Deeper cleanup — applications, documents,
+      // refunds, agent notifications — is intentionally out of scope here and left
+      // as a follow-up; this covers the account + credential.)
       await userService.deleteUser(userId);
+
+      // Delete the Firebase Auth user too, so the credential can't sign back in and
+      // recreate an orphaned session. Best-effort: the profile is already gone, so
+      // don't fail the request if the Auth deletion hiccups (it can be reconciled).
+      await auth
+        .deleteUser(userId)
+        .catch((e) => console.error("[user:delete] auth user delete failed:", e));
+
       sendSuccess(res, { deleted: true }, "Account deleted successfully");
     } catch (error) {
       console.error("Error deleting user:", error);

@@ -1,5 +1,10 @@
 import { getFirestore, Timestamp, FieldValue } from "firebase-admin/firestore";
-import { Document, DocumentStatus } from "../types";
+import {
+  Document,
+  DocumentStatus,
+  DocumentUploaderRole,
+  DocumentUploadSource,
+} from "../types";
 import { storageService } from "./storage.service";
 import { noteService } from "./note.service";
 import { userService } from "./user.service";
@@ -13,6 +18,41 @@ export interface CreateDocumentInput {
   fileType: string;
   fileSizeMb: number;
   storagePath: string;
+
+  // Optional descriptive metadata. Self-serve client uploads send none of this;
+  // the agency-side "upload for client" form collects all of it.
+  documentType?: string;
+  displayName?: string;
+  description?: string;
+  uploadReason?: string;
+  uploadSource?: DocumentUploadSource;
+}
+
+/**
+ * Who is performing an upload, and whether they've been cleared to do it for
+ * someone else.
+ *
+ * WHY THIS EXISTS: these methods used to authorize by comparing the caller's uid
+ * to `application.userId`, which made it structurally impossible for an agent to
+ * upload a document for their own client. Authorization now happens in the
+ * controller against the shared CASL ability (which already understands assigned
+ * agents, agency owners and admins), and the verdict is passed down here as
+ * `onBehalfAuthorized`. The service still refuses cross-client uploads from an
+ * unauthorized caller, so it is not merely trusting its input.
+ */
+export interface UploadActor {
+  /** The caller's uid. */
+  userId: string;
+  /** The caller's role, recorded on the document for audit. */
+  role: DocumentUploaderRole;
+  /** Denormalized display name, recorded on the document for audit. */
+  name?: string;
+  /**
+   * Set by the controller when CASL says this caller may act on the
+   * application (assigned agent / agency owner / admin). Without it, a caller
+   * who is not the application's client is rejected.
+   */
+  onBehalfAuthorized?: boolean;
 }
 
 export interface UpdateDocumentStatusInput {
@@ -25,10 +65,49 @@ export class DocumentService {
   private collection = db.collection("documents");
 
   /**
-   * Get upload URL for a new document
+   * Load an application and confirm `actor` may attach documents to it.
+   *
+   * Returns the application's data (notably `userId` — the client who will own
+   * the document, and whose storage folder it lands in) so callers don't fetch
+   * it twice.
+   */
+  private async resolveUploadTarget(
+    applicationId: string,
+    actor: UploadActor
+  ): Promise<{ ownerUserId: string; agentId?: string; clientName?: string }> {
+    const application = await db.collection("applications").doc(applicationId).get();
+
+    if (!application.exists) {
+      throw new Error("Application not found");
+    }
+
+    const applicationData = application.data() ?? {};
+    const ownerUserId: string = applicationData.userId;
+
+    // The client themselves always passes. Anyone else needs the controller to
+    // have cleared them via CASL.
+    const isOwner = ownerUserId === actor.userId;
+    if (!isOwner && !actor.onBehalfAuthorized) {
+      throw new Error("Unauthorized");
+    }
+
+    return {
+      ownerUserId,
+      agentId: applicationData.agentId,
+      clientName: applicationData.clientName,
+    };
+  }
+
+  /**
+   * Get upload URL for a new document.
+   *
+   * The storage path is keyed to the application's CLIENT, never the caller, so
+   * an agent-uploaded file lives alongside the client's own documents rather
+   * than in a staff folder. For self-uploads the two are the same uid, so this
+   * is a no-op change for existing clients.
    */
   async getUploadUrl(
-    userId: string,
+    actor: UploadActor,
     applicationId: string,
     fileName: string,
     contentType: string
@@ -37,21 +116,10 @@ export class DocumentService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    // Verify the application belongs to the user
-    const applicationRef = db.collection("applications").doc(applicationId);
-    const application = await applicationRef.get();
-
-    if (!application.exists) {
-      throw new Error("Application not found");
-    }
-
-    const applicationData = application.data();
-    if (applicationData?.userId !== userId) {
-      throw new Error("Unauthorized");
-    }
+    const { ownerUserId } = await this.resolveUploadTarget(applicationId, actor);
 
     return storageService.getSignedUploadUrl(
-      userId,
+      ownerUserId,
       applicationId,
       fileName,
       contentType
@@ -59,31 +127,45 @@ export class DocumentService {
   }
 
   /**
-   * Register a document after successful upload
+   * Register a document after successful upload.
+   *
+   * Ownership (`userId`) goes to the client; authorship (`uploadedBy*`) goes to
+   * whoever actually uploaded. When those differ the document is flagged
+   * `uploadedOnBehalf` and an activity note is recorded on the case, so the
+   * audit trail shows both who submitted the file and why.
    */
   async createDocument(
-    userId: string,
+    actor: UploadActor,
     input: CreateDocumentInput
   ): Promise<Document> {
-    const { applicationId, requirementId, fileName, fileType, fileSizeMb, storagePath } = input;
+    const {
+      applicationId,
+      requirementId,
+      fileName,
+      fileType,
+      fileSizeMb,
+      storagePath,
+      documentType,
+      displayName,
+      description,
+      uploadReason,
+      uploadSource,
+    } = input;
 
-    // Verify the application belongs to the user
     const applicationRef = db.collection("applications").doc(applicationId);
-    const application = await applicationRef.get();
-
-    if (!application.exists) {
-      throw new Error("Application not found");
-    }
-
-    const applicationData = application.data();
-    if (applicationData?.userId !== userId) {
-      throw new Error("Unauthorized");
-    }
+    const { ownerUserId } = await this.resolveUploadTarget(applicationId, actor);
 
     // Verify the file exists in storage
     const fileExists = await storageService.fileExists(storagePath);
     if (!fileExists) {
       throw new Error("File not found in storage");
+    }
+
+    // Staff uploading for a client must say why — this is the whole point of the
+    // audit trail, so it is enforced here rather than left to the form.
+    const uploadedOnBehalf = ownerUserId !== actor.userId;
+    if (uploadedOnBehalf && !uploadReason?.trim()) {
+      throw new Error("Upload reason required");
     }
 
     // Create the document record
@@ -93,7 +175,8 @@ export class DocumentService {
     const document: Omit<Document, "id"> = {
       applicationId,
       requirementId,
-      userId,
+      // Ownership stays with the client even when staff uploaded the file.
+      userId: ownerUserId,
       fileName,
       fileType,
       fileSizeMb,
@@ -102,6 +185,21 @@ export class DocumentService {
       resubmissionCount: 0,
       uploadedAt: now,
       updatedAt: now,
+
+      // Provenance — always recorded, including for self-uploads, so newer
+      // documents never need the "missing means self-upload" fallback.
+      uploadedByUserId: actor.userId,
+      uploadedByRole: actor.role,
+      uploadedOnBehalf,
+
+      // Firestore rejects `undefined`, so optional fields are spread in only
+      // when actually supplied.
+      ...(actor.name?.trim() ? { uploadedByName: actor.name.trim() } : {}),
+      ...(documentType?.trim() ? { documentType: documentType.trim() } : {}),
+      ...(displayName?.trim() ? { displayName: displayName.trim() } : {}),
+      ...(description?.trim() ? { description: description.trim() } : {}),
+      ...(uploadReason?.trim() ? { uploadReason: uploadReason.trim() } : {}),
+      ...(uploadSource ? { uploadSource } : {}),
     };
 
     await docRef.set(document);
@@ -112,6 +210,21 @@ export class DocumentService {
       updatedAt: now,
       lastUpdated: now,
     });
+
+    // Record the on-behalf upload in the case's activity feed. Best-effort —
+    // `addActivityNote` swallows its own errors and must never fail an upload
+    // that already succeeded.
+    if (uploadedOnBehalf) {
+      const label = displayName?.trim() || documentType?.trim() || fileName;
+      const by = actor.name?.trim() || "An agent";
+      await noteService.addActivityNote(
+        applicationId,
+        `${by} uploaded document "${label}" on the client's behalf.` +
+          (uploadReason?.trim() ? ` Reason: ${uploadReason.trim()}` : "") +
+          (uploadSource ? ` Received via: ${uploadSource.replace(/_/g, " ")}.` : ""),
+        { id: actor.userId, name: actor.name }
+      );
+    }
 
     return {
       id: docRef.id,
@@ -267,8 +380,14 @@ export class DocumentService {
 
     const document = docSnap.data() as Document;
 
-    // Verify ownership
-    if (document.userId !== userId) {
+    // Deletion is keyed to AUTHORSHIP, not ownership: whoever uploaded the file
+    // may remove it. This matters now that staff can upload for a client — a
+    // client must not be able to delete evidence an agent filed on their case,
+    // and an agent must be able to undo their own mistaken upload. Documents
+    // predating the provenance fields have no `uploadedByUserId`, so they fall
+    // back to `userId` and behave exactly as before.
+    const uploaderId = document.uploadedByUserId || document.userId;
+    if (uploaderId !== userId) {
       throw new Error("Unauthorized");
     }
 
@@ -299,9 +418,19 @@ export class DocumentService {
   }
 
   /**
-   * Get download URL for a document
+   * Get download URL for a document.
+   *
+   * @param authorizedOverride Set by the controller when CASL has already
+   *   cleared the caller for this application. Needed because the local checks
+   *   below only know about the document owner and the *assigned* agent — an
+   *   agency owner or admin (who can now upload here) would otherwise be denied
+   *   access to the very file they just added.
    */
-  async getDownloadUrl(documentId: string, userId: string): Promise<string> {
+  async getDownloadUrl(
+    documentId: string,
+    userId: string,
+    authorizedOverride = false
+  ): Promise<string> {
     const docSnap = await this.collection.doc(documentId).get();
 
     if (!docSnap.exists) {
@@ -318,7 +447,7 @@ export class DocumentService {
     const isOwner = document.userId === userId;
     const isAgent = applicationData?.agentId === userId;
 
-    if (!isOwner && !isAgent) {
+    if (!isOwner && !isAgent && !authorizedOverride) {
       throw new Error("Unauthorized");
     }
 

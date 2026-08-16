@@ -447,12 +447,35 @@ unset secret is safe — email/billing degrade rather than crash (see below).
 ### Non-secret config (plain env vars)
 
 Some runtime config is **not** sensitive and lives in plain env vars (not Secret
-Manager). Set these in `functions/.env.local` for emulators, or as function env
-vars / your deploy config for real environments.
+Manager). Set these in `functions/.env.local` for emulators, and in the committed
+**per-project** env files for deployed environments:
+
+| File | Loaded when | Committed? |
+|------|-------------|------------|
+| `functions/.env.durin-seli-dev` | deploying to durin-seli-dev (`--project dev`) | yes — no secrets in it |
+| `functions/.env.japa-platform` | deploying to japa-platform (`--project default`/`prod`) | yes — no secrets in it |
+| `functions/.env.local` | **emulator only** | no (git-ignored) |
+
+Firebase reads `functions/.env.<PROJECT_ID>` at **deploy time** and injects those
+keys into **every** deployed function — unlike `runWith({ secrets })`, which is
+bound per function. So config here also reaches the Firestore/auth/scheduled email
+triggers, not just `api`. These files are **committed on purpose**: they contain no
+secrets, and keeping them in-repo is what makes dev-vs-prod values reviewable
+instead of an implicit code fallback.
+
+> **Local dev gotcha.** The emulator loads `.env.<PROJECT_ID>` as well, and dotenv
+> files **override the shell environment** — so `APP_URL=… npm start` has no
+> effect. Files are merged in order (`.env` → `.env.<PROJECT_ID>` → `.env.local`),
+> so **`.env.local` is the only thing that reliably wins locally**. Keep
+> `APP_URL=http://localhost:3000` in it (it's in `.env.example`), or local emails
+> will link at a deployed portal whose `oobCode`s can't validate against your
+> emulator. Also note `.env.<PROJECT_ID>` and `.env.<alias>` are mutually
+> exclusive — firebase-tools errors if both exist — hence the project-ID naming.
 
 | Env var | Used by | Notes |
 |---------|---------|-------|
-| `APP_URL` | email links | Portal base URL used to build links in emails — footer, and the **password-reset** link (`${APP_URL}/reset-password?oobCode=…`). Defaults to the prod portal (`https://portal.weareseli.com`). **Must point at the portal wired to _this_ backend's Firebase project**, because the reset `oobCode` is project-scoped. **Local dev:** `APP_URL=http://localhost:3000` — otherwise reset emails link at prod. The local startup scripts (`npm start`, `npm --prefix functions run serve`) already default it to `http://localhost:3000`. |
+| `APP_URL` | email links | Portal base URL used to build every link in transactional email — footer, the auth deep-links (`/reset-password?oobCode=…`, `/verify-email`, `/claim`, `/login?magic=1`), agent invites (`/create-account?invite=…`), the guest-consultation Paystack return (`/a/<slug>/confirm`) and client payment returns. Falls back to the prod portal (`https://portal.weareseli.com`) when unset — which is why it **must** be set per project: the `oobCode` is project-scoped, so a prod URL in dev emails produces links that don't validate. **Local dev:** `APP_URL=http://localhost:3000`; the local startup scripts (`npm start`, `npm --prefix functions run serve`) already default it. |
+| `EMAIL_LOGO_URL` | email header | Hosted logo shown in the email header. Intentionally left at the prod portal (`https://portal.weareseli.com/assets/seli_logo.png`) in **all** environments — it's a public static asset, and pointing dev emails at a dev host only risks a broken image. |
 
 ## Authorization & Entitlements
 

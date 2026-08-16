@@ -14,9 +14,27 @@ export * from "./eligibility";
 // Re-export news types
 export * from "./news";
 
+// Re-export visa-catalog scraper types
+export * from "./visa-catalog";
+// Local import so VisaType (below) can reference the scrape provenance shape.
+// Type-only, so the visa-catalog <-> index cycle is erased at compile time.
+import type { VisaScrapeMeta } from "./visa-catalog";
+
 // ============================================
 // USER TYPES
 // ============================================
+
+/**
+ * Per-user notification channel preferences (opt-OUT model). When a field is
+ * `false` the user has switched that channel off; absent/`true` means on. Only the
+ * user-configurable channels live here — `in_app` is always delivered (it's the
+ * record of truth) and is intentionally not represented. Security-critical emails
+ * bypass these preferences (see `NotifyUserInput.critical`).
+ */
+export interface NotificationPreferences {
+  email: boolean; // receive email notifications
+  push: boolean; // receive push notifications
+}
 
 export interface User {
   id: string;
@@ -47,11 +65,57 @@ export interface User {
   // but the client may not have set a password or downloaded the app yet.
   isProvisional?: boolean;
 
+  // Client-facing identity verification (KYC). Absent on legacy/unverified users.
+  // This is the APPLICANT's own identity check (NIN/BVN + optional selfie), run via
+  // the shared verification service — distinct from `AgencyCompliance` (owner/business
+  // KYC/KYB). See `UserIdentityVerification` below.
+  identityVerification?: UserIdentityVerification;
+
   // Metadata
   createdAt: Timestamp;
   updatedAt: Timestamp;
   lastLoginAt?: Timestamp;
   fcmTokens?: string[]; // For push notifications
+
+  // Per-user notification channel preferences (email/push on-off). Absent = all
+  // channels on (opt-out model). See NotificationPreferences.
+  notificationPreferences?: NotificationPreferences;
+}
+
+// ---- Client identity verification (applicant KYC) ----
+
+// File-level status of an applicant's identity verification. Distinct from the
+// per-check `VerificationCheckStatus` (a subject has many checks but one status):
+//   unverified   – nothing submitted yet (or field absent)
+//   pending      – an async check (selfie/liveness) is in flight, awaiting a webhook
+//   under_review – submitted; provider unconfigured or signals are mixed → awaiting
+//                  a confident automated pass (or a human decision)
+//   verified     – identity confirmed (auto-verified on a high-confidence pass,
+//                  or admin-approved)
+//   failed       – a check hard-failed (mismatch / not found)
+export type IdentityVerificationStatus =
+  | "unverified"
+  | "pending"
+  | "under_review"
+  | "verified"
+  | "failed";
+
+// The applicant identity-verification file embedded on `User`. Mirrors the shape
+// of the automated-verification signals on `AgencyCompliance`, minus the business
+// (KYB) leg — an applicant only proves their own identity.
+export interface UserIdentityVerification {
+  status: IdentityVerificationStatus;
+  // Which government ID the applicant submitted for the lookup.
+  idType?: "nin" | "bvn";
+  // Per-check normalized results, keyed by check type (BVN/NIN/doc/liveness/AML).
+  checks?: Partial<Record<VerificationCheckType, VerificationCheckResult>>;
+  // Audit log of the applicant's consent to the government-ID lookup(s).
+  consent?: { bvn?: ConsentRecord; nin?: ConsentRecord };
+  // Review / lifecycle metadata.
+  submittedAt?: Timestamp;
+  verifiedAt?: Timestamp;
+  reviewedBy?: string; // Admin userId, when a human makes the call
+  reason?: string; // Failure / needs-review explanation surfaced to the user
 }
 
 export interface Address {
@@ -347,6 +411,7 @@ export interface VisaType {
   // Note: the `source` flag lives in the "Admin review" block below.
   sourceUrl?: string; // official URL this record was last verified against
   lastVerifiedAt?: Timestamp; // when an agent last approved a scraped update
+  scrapeMeta?: VisaScrapeMeta; // extractor provenance + per-field citations (audit trail)
 
   // Stats
   successRate?: number;
@@ -464,6 +529,17 @@ export interface Application {
   createdByAdminName?: string; // Denormalized admin name for display
   adminCreationReason?: string; // Optional reason the admin gave
 
+  // ---- Who is handling this case (resolved on READ, not stored) ----
+  // Populated by the API when an application is returned, so a client can see
+  // who is acting for them without needing read access to the agents/agencies
+  // collections. Deliberately NOT persisted: denormalizing would require a
+  // backfill across every existing application and re-syncing on reassignment,
+  // whereas resolving on read is correct for old and new data alike.
+  agentName?: string;
+  agencyName?: string;
+  /** Agency logo, when the agency has uploaded one (client-facing branding). */
+  agencyLogoUrl?: string;
+
   // Status & Progress
   status: ApplicationStatus;
   progress: number; // 0-100
@@ -558,31 +634,159 @@ export type DocumentStatus =
   | "rejected"
   | "resubmission_required";
 
+/**
+ * Who pushed the bytes for a document. Distinct from *ownership*: a document
+ * always belongs to the application's client (`Document.userId`), but agency
+ * staff may upload it for them (see `uploadedOnBehalf` below).
+ */
+export type DocumentUploaderRole = "client" | "agent" | "owner" | "admin";
+
+/**
+ * How a document reached the agency when staff uploaded it on a client's
+ * behalf. Captured for audit — "where did this file come from?" is the first
+ * question asked when a document's provenance is challenged.
+ */
+export type DocumentUploadSource =
+  | "email"
+  | "whatsapp"
+  | "in_person"
+  | "postal"
+  | "third_party"
+  | "other";
+
 export interface Document {
   id: string;
   applicationId: string;
   requirementId: string;
+  /**
+   * The application's CLIENT — the person the document belongs to. This is
+   * ownership, NOT authorship: when an agent uploads for a client this still
+   * points at the client, so the document appears in their workspace. See
+   * `uploadedByUserId` for who actually performed the upload.
+   */
   userId: string;
-  
+
   // File info
   fileName: string;
   fileType: string;
   fileSizeMb: number;
   storageUrl: string;
-  
+
   // Status
   status: DocumentStatus;
-  
+
+  // ---- Descriptive metadata (captured at upload time) ----
+  // Optional across the board: self-serve client uploads from the mobile app
+  // supply none of these, and pre-existing documents have none.
+  /** Category label, e.g. "Bank Statement". Free text so it isn't capped by a list. */
+  documentType?: string;
+  /** Human label for the document, shown instead of the raw file name when set. */
+  displayName?: string;
+  /** Free-text notes about the document's contents, coverage period, etc. */
+  description?: string;
+
+  // ---- Upload provenance (audit trail) ----
+  // Added so an agency can upload documents for a client without the record
+  // silently claiming the client submitted it themselves. Absent on documents
+  // created before this existed — treat a missing `uploadedByUserId` as
+  // "uploaded by the owner" (`userId`) when rendering.
+  /** The uid that actually performed the upload. Equals `userId` for self-uploads. */
+  uploadedByUserId?: string;
+  /** Denormalized uploader name so listings need no extra user lookup. */
+  uploadedByName?: string;
+  /** The uploader's role at the time of upload. */
+  uploadedByRole?: DocumentUploaderRole;
+  /** True when the uploader was NOT the client — i.e. agency staff acted for them. */
+  uploadedOnBehalf?: boolean;
+  /** WHY staff uploaded for the client. Required for on-behalf uploads. */
+  uploadReason?: string;
+  /** How the file reached the agency (email, WhatsApp, in person…). */
+  uploadSource?: DocumentUploadSource;
+
   // Review
   reviewedBy?: string; // Agent ID
   reviewedAt?: Timestamp;
   rejectionReason?: string;
   agentComments?: string;
-  
+
   // Tracking
   resubmissionCount: number;
-  
+
   uploadedAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+// ============================================
+// DOCUMENT REQUEST TYPES
+// ============================================
+
+/**
+ * Lifecycle of an agent's "please send me X" ask.
+ *
+ *  - `pending`   — outstanding; this is what the client's to-do list renders.
+ *  - `fulfilled` — the client uploaded a document against it (auto-transitioned
+ *                  by `POST /documents` when it carries `documentRequestId`).
+ *  - `waived`    — the agent decided it's no longer needed.
+ *  - `cancelled` — the agent withdrew the request (asked in error / duplicate).
+ *
+ * Only `pending` is actionable by the client; the other three are terminal.
+ */
+export type DocumentRequestStatus =
+  | "pending"
+  | "fulfilled"
+  | "waived"
+  | "cancelled";
+
+/**
+ * A durable record of an agent asking a client for a specific document.
+ *
+ * WHY THIS EXISTS: this ask used to be fire-and-forget — an activity note plus a
+ * push/email notification. That's fine for the mobile app (which nudges the user
+ * in the moment) but leaves nothing queryable, so a client opening the web
+ * workspace days later had no way to see what they still owe. Persisting the ask
+ * gives the client a checklist and the agent a fulfilment view, and lets us close
+ * the loop automatically when the matching upload lands.
+ *
+ * Stored in the top-level `documentRequests` collection (not a subcollection of
+ * the application) so a client's outstanding items across every one of their
+ * applications can be fetched with a single `userId + status` query.
+ */
+export interface DocumentRequest {
+  id: string;
+  applicationId: string;
+  /** The CLIENT this is addressed to (== Application.userId). Query key. */
+  userId: string;
+  /** Owning agency, when the requesting agent belongs to one. Query key for the
+   *  agency-wide fulfilment view; null for an independent agent. */
+  agencyId?: string | null;
+
+  // --- What's being asked for -------------------------------------------------
+  /** Free-text label the agent typed, e.g. "Bank statement (last 6 months)". */
+  documentType: string;
+  /** Optional extra instruction shown under the label. */
+  notes?: string;
+  /** Optional soft deadline surfaced in the client UI. Not enforced. */
+  dueDate?: Timestamp;
+
+  // --- Provenance -------------------------------------------------------------
+  /** USER uid of the agent/owner/admin who made the request. */
+  requestedBy: string;
+  /** Denormalized display name so the client UI needs no extra lookup. */
+  requestedByName: string;
+
+  // --- Denormalized application context (saves an N+1 fetch on the to-do list) --
+  visaTypeName?: string;
+  countryName?: string;
+
+  // --- Lifecycle --------------------------------------------------------------
+  status: DocumentRequestStatus;
+  /** Id of the `Document` the client uploaded to satisfy this request. */
+  fulfilledDocumentId?: string;
+  fulfilledAt?: Timestamp;
+  /** Uid of whoever moved it to a terminal non-fulfilled state (waive/cancel). */
+  resolvedBy?: string;
+
+  createdAt: Timestamp;
   updatedAt: Timestamp;
 }
 
@@ -691,7 +895,6 @@ export interface Transaction {
   escrowReleaseCondition?: string;
   escrowReleasedAt?: Timestamp;
   
-  // Payment processor
   // Payment processor. "paystack" is the live gateway (subscriptions, seats, and
   // guest consultation fees); the others predate it.
   paymentProvider: "stripe" | "paypal" | "manual" | "paystack";
@@ -752,6 +955,12 @@ export interface PaymentRequest {
   // Status
   status: PaymentRequestStatus;
   paidAt?: Timestamp;
+  /**
+   * Paystack transaction reference, set when the client starts checkout.
+   * Kept so a return-from-Paystack can be tied back to THIS request, and so a
+   * replayed reference can't be credited to a different one.
+   */
+  paystackReference?: string;
   cancelledAt?: Timestamp;
   expiresAt?: Timestamp;
   approvedAt?: Timestamp;
@@ -829,10 +1038,17 @@ export type NotificationType =
   | "compliance_submitted" // Owner submitted the compliance file for review
   | "compliance_approved" // Admin verified the agency's compliance
   | "compliance_rejected" // Admin rejected; items need fixing
+  // Identity verification (applicant/client KYC — NIN/BVN + optional selfie)
+  | "identity_verified" // The applicant's identity check passed
+  | "identity_verification_failed" // The applicant's identity check failed / needs attention
   // Account / engagement
   | "welcome"
   | "role_changed"
   | "review_received"
+  // Account security / self-service (mobile + portal account management)
+  | "password_changed" // Security notice: the account password was just changed
+  | "email_changed" // Security notice sent to the OLD address when an email change is requested
+  | "account_deleted" // Confirmation that the account + data were deleted
   // Other
   | "message_received"
   | "visa_news"

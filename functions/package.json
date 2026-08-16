@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc",
     "build:watch": "tsc --watch",
-    "serve": "npm run build && APP_URL=${APP_URL:-http://localhost:3000} firebase emulators:start --only functions",
+    "serve": "npm run build && firebase emulators:start --only functions",
     "shell": "npm run build && firebase functions:shell",
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
@@ -23,6 +23,8 @@
     "admin:revoke": "npm run build && node lib/scripts/grant-admin.js --revoke",
     "backfill:slugs": "npm run build && node lib/scripts/backfill-agency-slugs.js",
     "backfill:slugs:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-agency-slugs.js",
+    "backfill:agentids": "npm run build && node lib/scripts/backfill-application-agent-ids.js",
+    "backfill:agentids:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-application-agent-ids.js",
     "lint": "eslint --ext .ts src/",
     "lint:fix": "eslint --ext .ts src/ --fix",
     "clean": "rm -rf lib",

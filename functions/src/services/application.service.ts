@@ -204,6 +204,35 @@ class ApplicationService {
   }
 
   /**
+   * Resolve an agent identifier to the agent's USER uid.
+   *
+   * `Application.agentId` stores a user uid, while `AgentProfile.id` is an
+   * unrelated auto-generated document id. Callers conflate the two, and the
+   * failure is silent: the case is written with an id that no assigned-case
+   * query will ever match, so it vanishes from the agent's list and its
+   * documents 403.
+   *
+   * Accepts either identifier: if the value is an AgentProfile doc id, its
+   * `userId` is returned; otherwise the value is passed through unchanged
+   * (it is already a uid, or a caller-supplied value we shouldn't rewrite).
+   */
+  async normalizeAgentIdentifier(agentIdentifier: string): Promise<string> {
+    if (!agentIdentifier) return agentIdentifier;
+
+    try {
+      const profile = await collections.agents.doc(agentIdentifier).get();
+      const userId = profile.exists
+        ? (profile.data() as { userId?: string }).userId
+        : undefined;
+      return userId || agentIdentifier;
+    } catch {
+      // Never block an assignment on this lookup — worst case we store what
+      // the caller sent, which is the pre-existing behaviour.
+      return agentIdentifier;
+    }
+  }
+
+  /**
    * Get all applications assigned to an agent (by agent's userId)
    */
   async getAgentApplications(agentUserId: string): Promise<Application[]> {

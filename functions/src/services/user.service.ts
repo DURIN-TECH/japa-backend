@@ -1,5 +1,5 @@
 import { collections, serverTimestamp, auth } from "../utils/firebase";
-import { User, Address, Agency } from "../types";
+import { User, Address, Agency, NotificationPreferences } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 import { Role, Subscription } from "@durin-tech/authz";
 import { StoredPlan } from "../types/billing";
@@ -165,6 +165,40 @@ class UserService {
 
     await userRef.update(updates);
     
+    const updatedDoc = await userRef.get();
+    return updatedDoc.data() as User;
+  }
+
+  /**
+   * Update a user's notification channel preferences (email/push). Writes ONLY the
+   * `notificationPreferences` object — a dedicated, tightly-scoped mutation so the
+   * broad `updateUser` (which spreads arbitrary body fields) is never the path for
+   * this. Merges over any existing prefs so a partial update (just email, just push)
+   * leaves the other channel untouched. Returns the refreshed user.
+   */
+  async updateNotificationPreferences(
+    userId: string,
+    prefs: Partial<NotificationPreferences>
+  ): Promise<User> {
+    const userRef = collections.users.doc(userId);
+    const userDoc = await userRef.get();
+    if (!userDoc.exists) {
+      throw new Error("User not found");
+    }
+
+    // Merge over current prefs (default: both channels on) so a partial patch only
+    // changes the field the caller sent.
+    const current = (userDoc.data() as User).notificationPreferences;
+    const next: NotificationPreferences = {
+      email: prefs.email ?? current?.email ?? true,
+      push: prefs.push ?? current?.push ?? true,
+    };
+
+    await userRef.update({
+      notificationPreferences: next,
+      updatedAt: serverTimestamp(),
+    });
+
     const updatedDoc = await userRef.get();
     return updatedDoc.data() as User;
   }

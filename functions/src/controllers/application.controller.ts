@@ -5,6 +5,9 @@ import { userService } from "../services/user.service";
 import { messagingService } from "../services/messaging.service";
 import { notificationService } from "../services/notification.service";
 import { noteService } from "../services/note.service";
+import { documentRequestService } from "../services/document-request.service";
+// Used to invite a freshly-provisioned client to set a password (claim their account).
+import { authController } from "./auth.controller";
 import { collections, auth } from "../utils/firebase";
 import { can, asSubject, checkWithinLimit, paymentRequired } from "../middleware/authz";
 import { complianceService } from "../services/compliance.service";
@@ -321,6 +324,23 @@ export class ApplicationController {
         }
       }
 
+      // --- Invite a brand-new client to claim their account -------------------
+      // A provisioned account has no password, so without this the client has no
+      // way into the web workspace to upload documents or reply to their agent —
+      // the notification below would tell them something happened but not how to
+      // act on it. Best-effort and deliberately not awaited into the failure path:
+      // an email problem must never fail an application that was already created.
+      if (!clientExisted) {
+        const agencyName = await this.resolveAgencyName(
+          isAdmin ? ownerAgencyId : req.authz?.agencyId
+        );
+        void authController
+          .sendClaimEmail(normalizedEmail, firstName, agencyName)
+          .catch((e) =>
+            console.error("[application] claim-account invite failed:", e)
+          );
+      }
+
       // --- Create the application (agent-managed, portal-originated) ----------
       const application = await applicationService.createApplication(clientUid, {
         visaTypeId,
@@ -440,7 +460,8 @@ export class ApplicationController {
         applications = applications.filter((app) => app.mode === mode);
       }
 
-      sendSuccess(res, applications);
+      // Resolve who is handling each case so client-facing UIs can name them.
+      sendSuccess(res, await this.withHandlerNames(applications));
     } catch (error) {
       console.error("Error getting applications:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -472,7 +493,8 @@ export class ApplicationController {
         return;
       }
 
-      sendSuccess(res, application);
+      const [enriched] = await this.withHandlerNames([application]);
+      sendSuccess(res, enriched);
     } catch (error) {
       console.error("Error getting application:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -519,7 +541,16 @@ export class ApplicationController {
       }
       // Agent/owner/admin can reassign agent or transfer self-service
       if (!isOwner || req.user?.admin) {
-        if (agentId !== undefined) updates.agentId = agentId;
+        // `Application.agentId` is the agent's USER uid, deliberately distinct
+        // from the AgentProfile DOC id (see the comment on startApplication).
+        // Clients have repeatedly sent the doc id here, which silently detached
+        // the case: assigned-case queries run on uid, so the agent lost the case
+        // from their list and was denied access to its documents, with no error
+        // anywhere. Normalize instead of trusting the caller — if the value
+        // resolves to an agent profile, store that profile's userId.
+        if (agentId !== undefined) {
+          updates.agentId = await applicationService.normalizeAgentIdentifier(agentId);
+        }
         if (agencyId !== undefined) updates.agencyId = agencyId;
         if (mode !== undefined) updates.mode = mode;
       }
@@ -643,9 +674,27 @@ export class ApplicationController {
         return;
       }
 
-      // 1. Activity note (audit trail on the case notes feed), attributed to the
-      // requesting agent.
       const actorName = await userService.getDisplayName(userId);
+
+      // 1. Persist the ask. This used to be fire-and-forget (note + notification
+      // only), which left nothing for a client to look up later — so a client on
+      // the web workspace had no way to see what they still owed. The durable
+      // record is now the source of truth; the note and notification below remain
+      // as the audit trail and the nudge.
+      const request = await documentRequestService.create({
+        applicationId: id,
+        userId: application.userId,
+        agencyId: application.agencyId ?? req.authz?.agencyId ?? null,
+        documentType: documentType.trim(),
+        notes,
+        requestedBy: userId,
+        requestedByName: actorName || "Your agent",
+        visaTypeName: application.visaTypeName,
+        countryName: application.countryName,
+      });
+
+      // 2. Activity note (audit trail on the case notes feed), attributed to the
+      // requesting agent.
       await noteService.addActivityNote(
         id,
         `${actorName || "An agent"} requested a document from the client: ${documentType}.` +
@@ -653,7 +702,10 @@ export class ApplicationController {
         { id: userId, name: actorName }
       );
 
-      // 2. Notify the client across channels so they know to upload it.
+      // 3. Notify the client across channels so they know to upload it. The
+      // request id rides in `data` so a client that understands it can deep-link
+      // straight to the item; `relatedEntityId` stays the application id so the
+      // existing mobile deep-link handlers keep working unchanged.
       await notificationService.notifyUser({
         userId: application.userId,
         type: "document_status",
@@ -664,9 +716,12 @@ export class ApplicationController {
         channels: ["in_app", "email", "push"],
         relatedEntityType: "application",
         relatedEntityId: id,
+        data: { documentRequestId: request.id },
       });
 
-      sendSuccess(res, { documentType }, "Document requested from client");
+      // Return the full record (not just the echoed type) so the portal can drop
+      // it straight into its outstanding-requests list without a refetch.
+      sendSuccess(res, request, "Document requested from client");
     } catch (error) {
       console.error("Error requesting document:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -842,6 +897,100 @@ export class ApplicationController {
     return snap.docs.filter(
       (d) => !TERMINAL.includes((d.data() as Application).status)
     ).length;
+  }
+
+
+  /**
+   * Attach `agentName` / `agencyName` / `agencyLogoUrl` to applications.
+   *
+   * WHY ON READ: a client needs to know who is handling their case, but these
+   * names aren't stored on the application. Denormalizing them at write time
+   * would mean backfilling every existing application and re-syncing whenever a
+   * case is reassigned; resolving here is correct for old and new data alike,
+   * and the client never needs read access to the agents/agencies collections.
+   *
+   * COST: batched, not N+1. Unique agent/agency ids across the whole result set
+   * are resolved ONCE each, so a page of 50 cases from one agency costs two
+   * reads, not a hundred. Fail-soft — on any lookup error the applications are
+   * returned unenriched rather than failing the request.
+   *
+   * NOTE `Application.agentId` is a USER uid (unlike Conversation.agentId, which
+   * is an agent DOC id), so agents are resolved by querying on `userId`.
+   */
+  private async withHandlerNames(
+    applications: Application[]
+  ): Promise<Application[]> {
+    if (applications.length === 0) return applications;
+
+    try {
+      const agentUids = [
+        ...new Set(applications.map((a) => a.agentId).filter(Boolean) as string[]),
+      ];
+      const agencyIds = [
+        ...new Set(applications.map((a) => a.agencyId).filter(Boolean) as string[]),
+      ];
+
+      const [agentEntries, agencyEntries] = await Promise.all([
+        Promise.all(
+          agentUids.map(async (uid) => {
+            const snap = await collections.agents
+              .where("userId", "==", uid)
+              .limit(1)
+              .get();
+            const name = snap.empty
+              ? undefined
+              : (snap.docs[0].data() as { displayName?: string }).displayName;
+            return [uid, name] as const;
+          })
+        ),
+        Promise.all(
+          agencyIds.map(async (id) => {
+            const snap = await collections.agencies.doc(id).get();
+            const data = snap.exists
+              ? (snap.data() as { name?: string; logoUrl?: string })
+              : undefined;
+            return [id, data] as const;
+          })
+        ),
+      ]);
+
+      const agentNames = new Map(agentEntries);
+      const agencies = new Map(agencyEntries);
+
+      return applications.map((app) => ({
+        ...app,
+        agentName: app.agentId ? agentNames.get(app.agentId) : undefined,
+        agencyName: app.agencyId ? agencies.get(app.agencyId)?.name : undefined,
+        agencyLogoUrl: app.agencyId
+          ? agencies.get(app.agencyId)?.logoUrl
+          : undefined,
+      }));
+    } catch (error) {
+      // Never fail a case list because a display name couldn't be resolved.
+      console.error("[application] handler-name enrichment failed:", error);
+      return applications;
+    }
+  }
+
+  /**
+   * Look up an agency's display name for use in outbound client-facing copy.
+   *
+   * Naming the agency in the "claim your account" email is what stops it reading
+   * like phishing to a client who has never heard of Seli. Fail-soft: returns
+   * undefined on a missing id or any lookup error, and the email falls back to
+   * generic wording rather than not being sent.
+   */
+  private async resolveAgencyName(
+    agencyId?: string | null
+  ): Promise<string | undefined> {
+    if (!agencyId) return undefined;
+    try {
+      const snap = await collections.agencies.doc(agencyId).get();
+      const name = snap.exists ? (snap.data() as { name?: string }).name : undefined;
+      return name?.trim() || undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /**

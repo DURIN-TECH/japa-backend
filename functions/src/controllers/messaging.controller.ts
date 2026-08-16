@@ -1,8 +1,11 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { messagingService } from "../services/messaging.service";
+import { notificationService } from "../services/notification.service";
+import { userService } from "../services/user.service";
 import { sendSuccess, sendCreated, sendError, sendNotFound, sendForbidden } from "../utils/response";
 import { collections } from "../utils/firebase";
+import { Conversation } from "../types";
 
 /**
  * Check if the authenticated user is a participant in the conversation.
@@ -23,6 +26,68 @@ async function getAgentId(userId: string): Promise<string | null> {
     .get();
   if (snap.empty) return null;
   return snap.docs[0].id;
+}
+
+/**
+ * Notify the participant who DIDN'T send the message.
+ *
+ * Resolving the recipient is asymmetric, and the asymmetry is easy to get
+ * wrong: `Conversation.userId` is a USER uid, but `Conversation.agentId` is an
+ * agent DOCUMENT id. Notifications are addressed by user uid, so the agent side
+ * needs a lookup through the `agents` collection first.
+ *
+ * Channel selection is left to the central policy (`channelsForType`), which
+ * maps `message_received` to in-app only — deliberately, so a chat exchange
+ * doesn't generate an email per message. The in-app record is what drives the
+ * portal's unread badge.
+ *
+ * @param senderType Which side sent it, as already derived by the caller.
+ * @param senderUid  The sending user's uid — used for their display name.
+ */
+async function notifyRecipient(
+  conv: Conversation,
+  senderType: "agent" | "user",
+  senderUid: string,
+  content: string
+): Promise<void> {
+  // Resolve the recipient and the sender's name CONCURRENTLY. They're
+  // independent lookups, and running them in series put an extra Firestore
+  // round trip between the message being sent and the notification existing —
+  // latency the recipient sees directly.
+  const [recipientUid, senderName] = await Promise.all([
+    (async (): Promise<string | null> => {
+      if (senderType === "agent") {
+        // Agent wrote → the client receives it. userId is already a uid.
+        return conv.userId;
+      }
+      // Client wrote → the agent receives it. conv.agentId is a DOC id, so map
+      // it back to the owning user account.
+      const agentDoc = await collections.agents.doc(conv.agentId).get();
+      return agentDoc.exists
+        ? ((agentDoc.data() as { userId?: string }).userId ?? null)
+        : null;
+    })(),
+    userService.getDisplayName(senderUid).then((name) => name || "Someone"),
+  ]);
+
+  // No resolvable recipient (orphaned agent doc) — nothing to do.
+  if (!recipientUid || recipientUid === senderUid) return;
+
+  // Preview the message rather than just saying "you have a new message" — the
+  // recipient can often act on it (or decide not to) without opening the thread.
+  const preview =
+    content.length > 120 ? `${content.slice(0, 117)}…` : content;
+
+  await notificationService.notifyUser({
+    userId: recipientUid,
+    type: "message_received",
+    title: `New message from ${senderName}`,
+    body: preview,
+    // Channels intentionally omitted — see the policy note above.
+    relatedEntityType: "message",
+    relatedEntityId: conv.id,
+    data: { conversationId: conv.id },
+  });
 }
 
 /**
@@ -158,6 +223,23 @@ export async function sendMessage(req: AuthenticatedRequest, res: Response): Pro
       content.trim(),
       attachmentUrls
     );
+
+    // Tell the OTHER participant, BEFORE responding.
+    //
+    // This is deliberately awaited rather than fire-and-forget. Cloud Functions
+    // throttles CPU once the response is sent, so background work kicked off
+    // after `sendCreated` runs at the platform's convenience — which showed up
+    // as a multi-second, variable delay before the recipient's bell updated.
+    // Awaiting costs the SENDER ~one round trip and makes the recipient's
+    // notification deterministic. (It also matches every other controller here.)
+    //
+    // Still fail-soft: a notification error must never fail a message that was
+    // already written, so it's caught and logged rather than propagated.
+    try {
+      await notifyRecipient(conv, senderType, userId, content.trim());
+    } catch (e) {
+      console.error("[messaging] recipient notify failed:", e);
+    }
 
     sendCreated(res, msg);
   } catch (error: unknown) {

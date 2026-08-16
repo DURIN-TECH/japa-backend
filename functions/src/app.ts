@@ -12,6 +12,8 @@ import { documentRoutes } from "./routes/document.routes";
 // Document templates feature (rich-text templates + editable case-linked instances)
 import { documentTemplateRoutes } from "./routes/document-template.routes";
 import { documentInstanceRoutes } from "./routes/document-instance.routes";
+// Durable agent→client document asks (backs the client web workspace to-do list)
+import { documentRequestRoutes } from "./routes/document-request.routes";
 import {
   eligibilityRoutes,
   adminEligibilityRoutes,
@@ -73,6 +75,7 @@ app.use("/documents", documentRoutes);
 // Document templates: catalog (read-only) + editable instances cloned from them
 app.use("/document-templates", documentTemplateRoutes);
 app.use("/document-instances", documentInstanceRoutes);
+app.use("/document-requests", documentRequestRoutes);
 app.use("/transactions", transactionRoutes);
 app.use("/consultations", consultationRoutes);
 app.use("/notifications", notificationRoutes);

@@ -123,7 +123,25 @@ export async function verifyAuth(
     // Single chokepoint for every authenticated route (admins + unresolved
     // entitlements are never read-only, so nothing blocks before billing exists).
     const isWrite = !["GET", "HEAD", "OPTIONS"].includes(req.method.toUpperCase());
-    if (isWrite && req.authz?.role !== "admin" && isReadOnly(req.entitlements)) {
+
+    // Exemption: self-service SECURITY / data-rights actions must NEVER be plan-
+    // gated. A user with a lapsed (read-only) plan must still be able to secure
+    // their account (change password / email) or exercise their right to delete
+    // it. `originalUrl` is the app-root path (query stripped); `endsWith` tolerates
+    // any mount prefix. Keep this list tiny and security-scoped.
+    const path = req.originalUrl.split("?")[0];
+    const method = req.method.toUpperCase();
+    const isAccountSecurityWrite =
+      path.endsWith("/users/me/password-changed") ||
+      path.endsWith("/users/me/change-email") ||
+      (method === "DELETE" && path.endsWith("/users/me"));
+
+    if (
+      isWrite &&
+      !isAccountSecurityWrite &&
+      req.authz?.role !== "admin" &&
+      isReadOnly(req.entitlements)
+    ) {
       res.status(402).json({
         success: false,
         error: "UPGRADE_REQUIRED",

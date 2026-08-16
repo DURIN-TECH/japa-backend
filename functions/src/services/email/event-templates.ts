@@ -257,6 +257,18 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     path: () => "/account-settings?tab=verification",
   },
 
+  // Identity verification (applicant KYC)
+  identity_verified: {
+    subject: "Your identity is verified",
+    actionLabel: "Open Seli",
+    path: () => "/",
+  },
+  identity_verification_failed: {
+    subject: "Action needed: identity verification",
+    actionLabel: "Try again",
+    path: () => "/",
+  },
+
   // Account / engagement
   welcome: {
     subject: "Welcome to Seli",
@@ -272,6 +284,15 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     subject: "You received a new review",
     actionLabel: "View reviews",
     path: () => "/dashboard",
+  },
+
+  // Account security — "your password was changed" heads-up (via notifyUser). The
+  // CTA is intentionally generic (there's no in-app deep link that fits every
+  // client): it just opens Seli so a user who didn't make the change can react.
+  password_changed: {
+    subject: "Your Seli password was changed",
+    actionLabel: "Open Seli",
+    path: () => "/",
   },
 };
 
