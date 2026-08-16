@@ -634,27 +634,81 @@ export type DocumentStatus =
   | "rejected"
   | "resubmission_required";
 
+/**
+ * Who pushed the bytes for a document. Distinct from *ownership*: a document
+ * always belongs to the application's client (`Document.userId`), but agency
+ * staff may upload it for them (see `uploadedOnBehalf` below).
+ */
+export type DocumentUploaderRole = "client" | "agent" | "owner" | "admin";
+
+/**
+ * How a document reached the agency when staff uploaded it on a client's
+ * behalf. Captured for audit — "where did this file come from?" is the first
+ * question asked when a document's provenance is challenged.
+ */
+export type DocumentUploadSource =
+  | "email"
+  | "whatsapp"
+  | "in_person"
+  | "postal"
+  | "third_party"
+  | "other";
+
 export interface Document {
   id: string;
   applicationId: string;
   requirementId: string;
+  /**
+   * The application's CLIENT — the person the document belongs to. This is
+   * ownership, NOT authorship: when an agent uploads for a client this still
+   * points at the client, so the document appears in their workspace. See
+   * `uploadedByUserId` for who actually performed the upload.
+   */
   userId: string;
-  
+
   // File info
   fileName: string;
   fileType: string;
   fileSizeMb: number;
   storageUrl: string;
-  
+
   // Status
   status: DocumentStatus;
-  
+
+  // ---- Descriptive metadata (captured at upload time) ----
+  // Optional across the board: self-serve client uploads from the mobile app
+  // supply none of these, and pre-existing documents have none.
+  /** Category label, e.g. "Bank Statement". Free text so it isn't capped by a list. */
+  documentType?: string;
+  /** Human label for the document, shown instead of the raw file name when set. */
+  displayName?: string;
+  /** Free-text notes about the document's contents, coverage period, etc. */
+  description?: string;
+
+  // ---- Upload provenance (audit trail) ----
+  // Added so an agency can upload documents for a client without the record
+  // silently claiming the client submitted it themselves. Absent on documents
+  // created before this existed — treat a missing `uploadedByUserId` as
+  // "uploaded by the owner" (`userId`) when rendering.
+  /** The uid that actually performed the upload. Equals `userId` for self-uploads. */
+  uploadedByUserId?: string;
+  /** Denormalized uploader name so listings need no extra user lookup. */
+  uploadedByName?: string;
+  /** The uploader's role at the time of upload. */
+  uploadedByRole?: DocumentUploaderRole;
+  /** True when the uploader was NOT the client — i.e. agency staff acted for them. */
+  uploadedOnBehalf?: boolean;
+  /** WHY staff uploaded for the client. Required for on-behalf uploads. */
+  uploadReason?: string;
+  /** How the file reached the agency (email, WhatsApp, in person…). */
+  uploadSource?: DocumentUploadSource;
+
   // Review
   reviewedBy?: string; // Agent ID
   reviewedAt?: Timestamp;
   rejectionReason?: string;
   agentComments?: string;
-  
+
   // Tracking
   resubmissionCount: number;
 
