@@ -541,7 +541,16 @@ export class ApplicationController {
       }
       // Agent/owner/admin can reassign agent or transfer self-service
       if (!isOwner || req.user?.admin) {
-        if (agentId !== undefined) updates.agentId = agentId;
+        // `Application.agentId` is the agent's USER uid, deliberately distinct
+        // from the AgentProfile DOC id (see the comment on startApplication).
+        // Clients have repeatedly sent the doc id here, which silently detached
+        // the case: assigned-case queries run on uid, so the agent lost the case
+        // from their list and was denied access to its documents, with no error
+        // anywhere. Normalize instead of trusting the caller — if the value
+        // resolves to an agent profile, store that profile's userId.
+        if (agentId !== undefined) {
+          updates.agentId = await applicationService.normalizeAgentIdentifier(agentId);
+        }
         if (agencyId !== undefined) updates.agencyId = agencyId;
         if (mode !== undefined) updates.mode = mode;
       }

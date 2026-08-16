@@ -71,11 +71,11 @@ export class DocumentController {
     // `req.authz.role` is the authoritative principal role from the token
     // claims; default to client for the (fail-safe) case where it's absent.
     const role = (req.authz?.role ?? ROLES.CLIENT) as DocumentUploaderRole;
-    // Only look the name up when it will actually be recorded as provenance —
-    // a self-upload doesn't need it and this saves a read on the hot path.
-    const name = onBehalfAuthorized
-      ? await userService.getDisplayName(userId).catch(() => "")
-      : undefined;
+    // Resolved for EVERY upload, not just on-behalf ones: the portal's
+    // "Uploaded by" column reads this name, so omitting it for self-uploads
+    // would leave a client's own document showing no uploader at all. One extra
+    // read per upload, which is not a hot path.
+    const name = await userService.getDisplayName(userId).catch(() => "");
 
     return { userId, role, name: name || undefined, onBehalfAuthorized };
   }
