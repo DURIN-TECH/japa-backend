@@ -7,6 +7,10 @@ import { userService } from "../services/user.service";
 import { transactionService } from "../services/transaction.service";
 import { paystackProvider } from "../services/billing/paystack.provider";
 import { EMAIL_BRANDING } from "../services/email/branding";
+// Vanity-subdomain awareness: a booking started on `<slug>.weareseli.com` must
+// come back from Paystack to THAT host, not to the portal.
+import { resolveBookingCallbackUrl } from "../utils/agency-slug";
+import { AGENCY_PAGE_DOMAIN } from "../config/agency-domain";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
 import { authController } from "./auth.controller";
 import { collections, auth } from "../utils/firebase";
@@ -572,6 +576,7 @@ export class ConsultationController {
         scheduledDate,
         scheduledTime,
         timezone,
+        origin,
       } = req.body as {
         clientName?: string;
         clientEmail?: string;
@@ -580,6 +585,12 @@ export class ConsultationController {
         scheduledDate?: string;
         scheduledTime?: string;
         timezone?: string;
+        // The host the visitor is actually booking from — either the agency's
+        // vanity subdomain or the portal. UNTRUSTED: `resolveBookingCallbackUrl`
+        // checks it against an allowlist before it can influence the Paystack
+        // return URL (an unchecked value here would be an open redirect on a
+        // payment flow). Optional — omitted requests get the canonical default.
+        origin?: string;
       };
 
       // --- Validate inputs ---------------------------------------------------
@@ -700,7 +711,16 @@ export class ConsultationController {
 
       // --- Payment: paid agencies must checkout before the booking confirms --
       if (feeNaira > 0) {
-        const callbackUrl = `${EMAIL_BRANDING.appUrl}/a/${slug}/confirm`;
+        // Return the payer to the SAME host they started on. `agency.slug` (not
+        // the requested `slug`, which may be a historic one) is the canonical
+        // label, so a booking made through an old link still confirms on the
+        // agency's current vanity host.
+        const callbackUrl = resolveBookingCallbackUrl(
+          agency.slug ?? slug,
+          origin,
+          AGENCY_PAGE_DOMAIN,
+          EMAIL_BRANDING.appUrl
+        );
         const { authorizationUrl, reference } = await paystackProvider.initializeOneOffCharge({
           email: normalizedEmail,
           amountKobo: feeNaira * 100, // Naira → kobo for Paystack
