@@ -107,6 +107,133 @@ export class DocumentInstanceController {
     }
   }
 
+  // ============================================
+  // CLIENT-FACING READS
+  // ============================================
+  //
+  // Everything above is agent-side (`verifyAgent`). Sharing a document with a
+  // client was previously a dead end because of that: an agent could flip
+  // `shareStatus` to "shared" and the client had no endpoint that would return
+  // it. These two handlers are the missing read path.
+  //
+  // They deliberately do NOT go through the CASL "Document" ability, which
+  // models agency-side ownership (author / agency owner / admin) and has no
+  // notion of "the client this document is about". Access here is the narrower,
+  // explicit rule: the caller must own the linked APPLICATION, and the document
+  // must actually be shared.
+
+  /**
+   * Confirm the caller is the client on `applicationId`.
+   *
+   * Ownership is checked against `application.userId` rather than CASL because
+   * that is exactly the relationship being authorized — and because an agent
+   * calling these endpoints should fall through to the agent-side routes, not
+   * get a second, laxer path to the same documents.
+   */
+  private async ownsApplication(
+    userId: string,
+    applicationId: string
+  ): Promise<boolean> {
+    const appDoc = await collections.applications.doc(applicationId).get();
+    if (!appDoc.exists) return false;
+    return (appDoc.data() as Application).userId === userId;
+  }
+
+  /**
+   * GET /document-instances/shared?applicationId=...
+   *
+   * Documents an agency has shared with the authenticated client. With
+   * `applicationId` it's scoped to that case; without one it spans every
+   * application the client owns, which is what the "shared with you" list on a
+   * client's home view needs.
+   *
+   * Content is stripped (as in every list response) — the client fetches a
+   * single document's body via `GET /document-instances/shared/:id`.
+   */
+  async listShared(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const applicationId = req.query.applicationId as string | undefined;
+
+      // Resolve which applications to look at: the requested one (after an
+      // ownership check) or all of the caller's.
+      let applicationIds: string[];
+      if (applicationId) {
+        if (!(await this.ownsApplication(userId, applicationId))) {
+          // 403 rather than 404: the caller asked about a specific case, and
+          // whether it exists isn't theirs to learn.
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
+        }
+        applicationIds = [applicationId];
+      } else {
+        const applications = await applicationService.getUserApplications(userId);
+        applicationIds = applications.map((a) => a.id);
+      }
+
+      if (applicationIds.length === 0) {
+        sendSuccess(res, []);
+        return;
+      }
+
+      // One query per case, in parallel. A client has a handful of applications,
+      // so this stays well inside a single request's budget — and it keeps each
+      // query to the single equality filter the service standardises on.
+      const perApplication = await Promise.all(
+        applicationIds.map((id) =>
+          documentInstanceService.listSharedForApplication(id)
+        )
+      );
+
+      const instances = perApplication
+        .flat()
+        .sort((a, b) => b.updatedAt.toMillis() - a.updatedAt.toMillis());
+
+      sendSuccess(res, instances);
+    } catch (error) {
+      console.error("Error listing shared document instances:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /document-instances/shared/:id
+   *
+   * A single shared document, WITH its content, for the client it was shared
+   * with. Both conditions are re-checked here rather than trusted from the list
+   * response: an agent can un-share a document at any moment, and this is the
+   * request that actually hands over the body.
+   */
+  async getShared(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { id } = req.params;
+
+      const instance = await documentInstanceService.getById(id);
+      if (!instance) {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+
+      // Unshared, or never linked to a case — indistinguishable from "doesn't
+      // exist" as far as a client is concerned, and answered the same way so the
+      // endpoint can't be used to probe for document ids.
+      if (
+        instance.shareStatus !== "shared" ||
+        !instance.applicationId ||
+        !(await this.ownsApplication(userId, instance.applicationId))
+      ) {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+
+      sendSuccess(res, instance);
+    } catch (error) {
+      console.error("Error getting shared document instance:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
   /**
    * GET /document-instances/:id
    */

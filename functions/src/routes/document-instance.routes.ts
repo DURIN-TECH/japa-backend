@@ -1,9 +1,14 @@
 /**
  * Document instance routes — editable documents cloned from templates.
  *
- * All routes require an authenticated agent-side user (agent/owner/admin).
- * Per-document ownership is enforced in the controller via the shared CASL
- * "Document" ability; the read-only-plan 402 gate is applied in `verifyAuth`.
+ * Agent-side routes require an authenticated agent-side user (agent/owner/admin);
+ * per-document ownership is enforced in the controller via the shared CASL
+ * "Document" ability, and the read-only-plan 402 gate is applied in `verifyAuth`.
+ *
+ * The `/shared` routes are the exception: they are read-only and CLIENT-facing,
+ * returning only documents an agent has explicitly shared on a case the caller
+ * owns. See the controller's "client-facing reads" section for why they don't
+ * reuse the CASL ability.
  *
  * NOTE: the static `/:id/versions` route is registered before the bare `/:id`
  * handlers by virtue of Express matching the more specific path first for GET;
@@ -14,6 +19,22 @@ import { documentInstanceController } from "../controllers/document-instance.con
 import { verifyAuth, verifyAgent } from "../middleware/auth";
 
 const router = Router();
+
+// --- Client-facing reads ----------------------------------------------------
+// Registered FIRST so `/shared` is matched literally instead of being swallowed
+// by the `/:id` handlers below. `verifyAgent` is deliberately absent: these are
+// the routes a CLIENT uses to read documents their agency shared with them, and
+// the controller authorizes by ownership of the linked application.
+
+// GET /document-instances/shared?applicationId= — documents shared with the client
+router.get("/shared", verifyAuth, (req, res) =>
+  documentInstanceController.listShared(req, res)
+);
+
+// GET /document-instances/shared/:id — one shared document, with content
+router.get("/shared/:id", verifyAuth, (req, res) =>
+  documentInstanceController.getShared(req, res)
+);
 
 // GET /document-instances — list (scoped by role / applicationId)
 router.get("/", verifyAuth, verifyAgent, (req, res) =>

@@ -644,7 +644,7 @@ export class ConsultationController {
           // unreachable — the client can't sign in to see the booking they just
           // made. Best-effort: an email failure must not fail a paid booking.
           void authController
-            .sendClaimEmail(normalizedEmail, firstName, agency.name)
+            .sendClaimEmail(normalizedEmail, firstName, agency.name, agency.id)
             .catch((e) =>
               console.error("[consultation] claim-account invite failed:", e)
             );

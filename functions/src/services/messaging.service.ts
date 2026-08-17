@@ -148,6 +148,51 @@ class MessagingService {
   }
 
   /**
+   * Conversations whose most recent message landed inside `[notBefore, olderThan]`
+   * — the window the unread-message reminder scheduler sweeps.
+   *
+   * WHY A WINDOW AND NOT JUST "OLDER THAN AN HOUR": an open-ended `<=` would match
+   * every conversation ever, and the sweep would grow without bound as the product
+   * ages. The lower bound keeps each run proportional to recent traffic instead.
+   * It also caps how late a nudge can arrive: if the scheduler is down for longer
+   * than the window, those conversations age out rather than producing a burst of
+   * stale "you have a new message" emails days after the fact.
+   *
+   * Both bounds are on the SAME field, so this needs no composite index. Unread
+   * counts and per-side reminder stamps are filtered by the caller in memory.
+   */
+  async findConversationsWithRecentMessages(
+    notBefore: Date,
+    olderThan: Date
+  ): Promise<Conversation[]> {
+    const snapshot = await collections.conversations
+      .where("lastMessageAt", ">=", Timestamp.fromDate(notBefore))
+      .where("lastMessageAt", "<=", Timestamp.fromDate(olderThan))
+      .get();
+
+    return snapshot.docs.map((doc) => doc.data() as Conversation);
+  }
+
+  /**
+   * Stamp that the unread-message reminder was emailed to one side.
+   *
+   * Written AFTER a successful send so a crash mid-run retries next tick rather
+   * than silently swallowing the nudge. Deliberately does NOT touch `updatedAt`:
+   * this is scheduler bookkeeping, not conversation activity, and bumping the
+   * timestamp would reorder the user's thread list for no reason.
+   */
+  async recordUnreadReminderSent(
+    conversationId: string,
+    side: "user" | "agent"
+  ): Promise<void> {
+    const field =
+      side === "agent" ? "unreadReminderSentAtAgent" : "unreadReminderSentAtUser";
+    await collections.conversations.doc(conversationId).update({
+      [field]: Timestamp.now(),
+    });
+  }
+
+  /**
    * Mark messages as read in a conversation.
    */
   async markAsRead(conversationId: string, userId: string, isAgent: boolean): Promise<void> {

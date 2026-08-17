@@ -286,6 +286,15 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     path: () => "/dashboard",
   },
 
+  // Messaging — the "you have an unread message" nudge. The CTA has no `path`
+  // because the right destination differs per recipient (clients read threads at
+  // /client/messages, agents at /messaging); the scheduler resolves the correct
+  // one and passes it as an explicit `actionUrl`, which wins over any path here.
+  message_unread_reminder: {
+    subject: "You have a new message",
+    actionLabel: "Read message",
+  },
+
   // Account security — "your password was changed" heads-up (via notifyUser). The
   // CTA is intentionally generic (there's no in-app deep link that fits every
   // client): it just opens Seli so a user who didn't make the change can react.

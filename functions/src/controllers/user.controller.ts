@@ -513,6 +513,9 @@ export class UserController {
         actionUrl: changeLink,
         actionLabel: "Confirm email change",
         preheader: `Confirm your new ${EMAIL_BRANDING.appName} email address`,
+        // Brand by the ACCOUNT (uid), not the recipient address — the new address
+        // isn't attached to any account yet, so an address lookup would miss.
+        brandFor: { userId },
       });
       if (confirmResult.status !== "sent") {
         console.error(
@@ -534,6 +537,7 @@ export class UserController {
             "If this wasn't you, reset your password immediately and contact support " +
             "— someone may have access to your account.",
           preheader: "Was this you? A change to your account email was requested.",
+          brandFor: { userId },
         })
         .catch((e) =>
           console.error("[user:change-email] old-address notice failed:", e)
