@@ -234,10 +234,19 @@ export interface Agency {
   id: string;
   name: string;
   // URL-safe public handle used for the shareable agency landing page
-  // (`/a/<slug>`). Unique across agencies, generated from the name on create
-  // (see `agencyService.generateUniqueAgencySlug`). Optional in the type only so
+  // (`/a/<slug>`) AND as the DNS label of the agency's vanity subdomain
+  // (`https://<slug>.weareseli.com`). Unique across agencies, generated from the
+  // name on create (see `agencyService.generateUniqueAgencySlug`), and always a
+  // valid DNS label: ≤63 chars, `[a-z0-9-]`, no leading/trailing hyphen, never
+  // `xn--`, never a reserved infrastructure label. Optional in the type only so
   // that agencies created before slugs existed still satisfy it until backfilled.
   slug?: string;
+  // Slugs this agency used to have, appended whenever the `backfill:slugs`
+  // migration rewrites an invalid/reserved legacy slug. `getAgencyBySlug` falls
+  // back to this array so links shared under an old slug keep resolving (the
+  // public page 301s them to the current canonical URL). Absent until a rewrite
+  // actually happens.
+  previousSlugs?: string[];
   ownerId: string; // userId of the creator/owner
   ownerName: string; // Denormalized for display
 

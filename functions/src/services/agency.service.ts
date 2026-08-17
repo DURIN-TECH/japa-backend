@@ -10,9 +10,18 @@ import {
   Agent,
   User,
 } from "../types";
-import { Timestamp } from "firebase-admin/firestore";
+import { Timestamp, FieldValue } from "firebase-admin/firestore";
 import { claimsService } from "./claims.service";
 import { entitlementService } from "./entitlement.service";
+// Slug rules live in their own PURE module (no Firestore) so they can be unit
+// tested and mirrored in the portal. Slugs are DNS labels now — every approved
+// agency is served at `https://<slug>.weareseli.com` — hence the extra checks.
+import {
+  slugifyAgencyName,
+  isReservedAgencySlug,
+  isUsableAgencySlug,
+  withSlugSuffix,
+} from "../utils/agency-slug";
 
 /** Thrown when an agency has no free paid seats to add another agent. */
 export class SeatLimitError extends Error {
@@ -141,7 +150,19 @@ class AgencyService {
 
   /**
    * Get an agency by its public slug (used by the unauthenticated shareable
-   * agency page). Returns null when no agency owns the slug.
+   * agency page and by the vanity-subdomain host routing).
+   *
+   * Two-step lookup:
+   *   1. exact match on the CURRENT `slug`
+   *   2. fall back to `previousSlugs` (array-contains) so links shared before a
+   *      slug migration — `https://<old-slug>.weareseli.com` and
+   *      `https://portal.weareseli.com/a/<old-slug>` alike — never dead-end.
+   *      Callers compare the requested slug to `agency.slug` and 301 to the
+   *      canonical URL when they differ.
+   *
+   * Both queries are single-field, so Firestore's automatic indexes cover them
+   * (array-contains on `previousSlugs` included) — no composite index needed.
+   * Returns null when no agency owns the slug, current or historic.
    */
   async getAgencyBySlug(slug: string): Promise<Agency | null> {
     const snapshot = await collections.agencies
@@ -149,43 +170,54 @@ class AgencyService {
       .limit(1)
       .get();
 
-    if (snapshot.empty) return null;
-    return snapshot.docs[0].data() as Agency;
+    if (!snapshot.empty) return snapshot.docs[0].data() as Agency;
+
+    // Historic slug? Only pay for this second read when the first one missed.
+    const legacy = await collections.agencies
+      .where("previousSlugs", "array-contains", slug)
+      .limit(1)
+      .get();
+
+    if (legacy.empty) return null;
+    return legacy.docs[0].data() as Agency;
   }
 
   /**
-   * Turn an agency name into a URL-safe base slug: lowercase, non-alphanumerics
-   * collapsed to single hyphens, trimmed. Falls back to "agency" when the name
-   * has no slug-able characters (e.g. all symbols).
-   */
-  private slugifyName(name: string): string {
-    const base = name
-      .toLowerCase()
-      .normalize("NFKD") // decompose accents so diacritics can be dropped
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "");
-    return base || "agency";
-  }
-
-  /**
-   * Produce a slug that is unique across the agencies collection. Starts from
-   * the slugified name and, on collision, appends a short numeric suffix
-   * (`-2`, `-3`, …). Bounded so a pathological run can't loop forever; the final
-   * fallback appends a short random token.
+   * Produce a slug that is unique across the agencies collection AND safe to
+   * serve as a DNS label (`<slug>.weareseli.com`).
+   *
+   * Shape/length/`xn--` handling lives in `slugifyAgencyName`. This method adds
+   * the two rules that need a database or a suffix:
+   *   • RESERVED words — an agency literally named "Portal" must not be handed
+   *     `portal`, which would collide with the real portal host. Reserved bases
+   *     are namespaced to `<base>-agency` before the uniqueness loop runs.
+   *   • COLLISIONS — on a taken slug, append `-2`, `-3`, … via `withSlugSuffix`
+   *     so the discriminator can never push the label past 63 characters.
+   *
+   * Bounded so a pathological run can't loop forever; the final fallback
+   * appends a short random token.
    */
   async generateUniqueAgencySlug(name: string): Promise<string> {
-    const base = this.slugifyName(name);
+    let base = slugifyAgencyName(name);
+
+    // "Portal" → "portal" (reserved) → "portal-agency". Note that the common
+    // cases ("Portal Immigration" → "portal-immigration") are already safe;
+    // this only fires when the WHOLE slugified name is a reserved label.
+    if (isReservedAgencySlug(base)) {
+      base = withSlugSuffix(base, "-agency");
+    }
 
     // Try the bare slug first, then base-2, base-3, … until one is free.
     for (let attempt = 0; attempt < 25; attempt++) {
-      const candidate = attempt === 0 ? base : `${base}-${attempt + 1}`;
+      const candidate =
+        attempt === 0 ? base : withSlugSuffix(base, `-${attempt + 1}`);
       const existing = await this.getAgencyBySlug(candidate);
       if (!existing) return candidate;
     }
 
     // Extremely unlikely fallback: base + short random token.
     const rand = Math.random().toString(36).slice(2, 8);
-    return `${base}-${rand}`;
+    return withSlugSuffix(base, `-${rand}`);
   }
 
   /**
@@ -193,6 +225,11 @@ class AgencyService {
    * Lets agencies created before slugs existed self-heal on first read (so the
    * owner's "public page" link appears without an out-of-band backfill). Returns
    * the agency, mutated in place with the new slug when one had to be created.
+   *
+   * Deliberately only fills a MISSING slug. Repairing an existing-but-invalid
+   * slug changes a link the owner may already have shared, so that is the job of
+   * the explicit `backfill:slugs` migration (which records the old value in
+   * `previousSlugs` so the shared link keeps working) — not of a read path.
    */
   async ensureAgencySlug(agency: Agency): Promise<Agency> {
     if (agency.slug) return agency;
@@ -203,6 +240,43 @@ class AgencyService {
     });
     agency.slug = slug;
     return agency;
+  }
+
+  /**
+   * Migration helper: replace an agency's slug with a freshly generated, valid
+   * one, preserving the old value in `previousSlugs` so already-shared links
+   * still resolve (callers 301 them to the new canonical URL).
+   *
+   * No-ops and returns null when the current slug is already usable, which keeps
+   * the backfill script idempotent.
+   *
+   * @returns `{ from, to }` when a rewrite happened, otherwise null.
+   */
+  async migrateAgencySlug(
+    agency: Agency
+  ): Promise<{ from: string; to: string } | null> {
+    const current = agency.slug;
+    if (isUsableAgencySlug(current)) return null;
+
+    const next = await this.generateUniqueAgencySlug(agency.name);
+
+    await collections.agencies.doc(agency.id).update({
+      slug: next,
+      // arrayUnion keeps the history append-only and de-duplicated across
+      // repeated migrations. Only record a real previous value (an agency with
+      // no slug at all has nothing to preserve).
+      ...(current
+        ? { previousSlugs: FieldValue.arrayUnion(current) }
+        : {}),
+      updatedAt: serverTimestamp(),
+    });
+
+    agency.slug = next;
+    if (current) {
+      agency.previousSlugs = [...(agency.previousSlugs ?? []), current];
+    }
+
+    return { from: current ?? "(none)", to: next };
   }
 
   /**
