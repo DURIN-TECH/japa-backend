@@ -1051,6 +1051,11 @@ export type NotificationType =
   | "account_deleted" // Confirmation that the account + data were deleted
   // Other
   | "message_received"
+  // Nudge sent by email when a message has sat unread for over an hour. Distinct
+  // from `message_received` (in-app/push only, fired the instant a message
+  // arrives) so the two can carry different copy and different channels: this one
+  // exists precisely because the real-time channels were missed.
+  | "message_unread_reminder"
   | "visa_news"
   | "system";
 
@@ -1109,6 +1114,15 @@ export interface Conversation {
   lastMessage?: string;
   unreadCountUser: number;
   unreadCountAgent: number;
+
+  // --- Unread-message email reminders -----------------------------------------
+  // When the hourly nudge was last emailed to each side. The scheduler sends only
+  // if the stamp is absent or OLDER than `lastMessageAt`, which gives exactly one
+  // reminder per burst of unread messages: a later message moves `lastMessageAt`
+  // forward and re-arms the nudge, while the same unread backlog never nags twice.
+  // Absent on conversations that predate the feature — treated as "never sent".
+  unreadReminderSentAtUser?: Timestamp;
+  unreadReminderSentAtAgent?: Timestamp;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;

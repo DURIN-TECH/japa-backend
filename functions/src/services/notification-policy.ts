@@ -13,6 +13,11 @@ import { NotificationChannel, NotificationType } from "../types";
 const FULL: NotificationChannel[] = ["in_app", "push", "email"];
 /** Ephemeral/high-frequency events — in-app + push only (email would be noisy). */
 const APP_ONLY: NotificationChannel[] = ["in_app", "push"];
+/**
+ * Follow-up nudges that exist BECAUSE the in-app/push channels went unnoticed.
+ * Re-delivering to those channels would be pure noise, so email is the only one.
+ */
+const EMAIL_ONLY: NotificationChannel[] = ["email"];
 
 export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChannel[]> = {
   // Applications
@@ -78,6 +83,11 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   account_deleted: FULL,
   // Other — in-app/push only (email would be noisy)
   message_received: APP_ONLY,
+  // The hourly "still unread" nudge is EMAIL ONLY. The recipient already got the
+  // in-app record and the push when the message landed — repeating them is what
+  // makes a reminder feel like spam. Email is the channel that was missed, so
+  // email is the only one this adds.
+  message_unread_reminder: EMAIL_ONLY,
   visa_news: APP_ONLY,
   system: APP_ONLY,
 };

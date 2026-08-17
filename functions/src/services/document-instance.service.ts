@@ -86,6 +86,23 @@ class DocumentInstanceService {
     return this.sortStripped(snap);
   }
 
+  /**
+   * Instances linked to an application AND actually shared with its client.
+   *
+   * The client-facing counterpart of `listForApplication`. Sharing is a per-
+   * document decision an agent makes (`PATCH /:id/share`), so a draft an agent is
+   * still working on must never appear here — `shareStatus` is filtered in memory
+   * to keep the query to the single equality filter this service standardises on.
+   */
+  async listSharedForApplication(
+    applicationId: string
+  ): Promise<DocumentInstance[]> {
+    const snap = await collections.documentInstances
+      .where("applicationId", "==", applicationId)
+      .get();
+    return this.sortStripped(snap).filter((i) => i.shareStatus === "shared");
+  }
+
   /** All instances (admin only). */
   async listAll(): Promise<DocumentInstance[]> {
     const snap = await collections.documentInstances.get();

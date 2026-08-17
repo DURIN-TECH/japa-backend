@@ -68,6 +68,7 @@ import { newsService } from "./services/news.service";
 import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
 import { notificationService } from "./services/notification.service";
+import { unreadMessageReminderService } from "./services/unread-message-reminder.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -407,6 +408,31 @@ export const sendConsultationReminders = functions
       );
     } catch (error) {
       console.error("Error sending consultation reminders:", error);
+    }
+  });
+
+/**
+ * Every 15 minutes: nudge whoever has left a message unread for over an hour.
+ *
+ * Applies equally to clients and agents, and each is emailed a link into their
+ * own view of the thread. Runs on a tighter cadence than the 1-hour threshold so
+ * the nudge lands promptly after the hour elapses rather than up to an hour late;
+ * the per-side reminder stamp is what prevents duplicates, not the interval.
+ */
+export const sendUnreadMessageReminders = functions
+  .runWith({ secrets: EMAIL_SECRETS })
+  .pubsub.schedule("*/15 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    console.log("Sending unread-message reminders...");
+    try {
+      const result = await unreadMessageReminderService.run();
+      console.log(
+        `Unread-message reminders: ${result.conversationsScanned} conversations ` +
+          `scanned, ${result.remindersSent} sent, ${result.errors} errors`
+      );
+    } catch (error) {
+      console.error("Unread-message reminder sweep failed:", error);
     }
   });
 

@@ -331,11 +331,18 @@ export class ApplicationController {
       // act on it. Best-effort and deliberately not awaited into the failure path:
       // an email problem must never fail an application that was already created.
       if (!clientExisted) {
-        const agencyName = await this.resolveAgencyName(
-          isAdmin ? ownerAgencyId : req.authz?.agencyId
-        );
+        const invitingAgencyId = isAdmin ? ownerAgencyId : req.authz?.agencyId;
+        const agencyName = await this.resolveAgencyName(invitingAgencyId);
         void authController
-          .sendClaimEmail(normalizedEmail, firstName, agencyName)
+          .sendClaimEmail(
+            normalizedEmail,
+            firstName,
+            agencyName,
+            // Co-brands the invite with the agency's logo. Passed explicitly:
+            // the application below doesn't exist yet, so there is nothing for
+            // the fallback lookup to resolve from the client's address.
+            invitingAgencyId ?? undefined
+          )
           .catch((e) =>
             console.error("[application] claim-account invite failed:", e)
           );

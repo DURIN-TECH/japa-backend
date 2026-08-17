@@ -25,6 +25,12 @@ export interface NotifyUserInput {
   actionUrl?: string;
   // Extra string key/values merged into the FCM data payload (must be strings).
   data?: Record<string, string>;
+  // Case context used ONLY to pick the agency whose logo co-brands the email
+  // header. Needed when the notification is about something other than an
+  // application (a chat thread, say) but still belongs to a specific case — a
+  // client working with two agencies would otherwise get whichever logo their
+  // most recent application happens to carry.
+  brandApplicationId?: string;
   // Security-critical notifications (e.g. "your password was changed") set this so
   // their EMAIL is delivered even if the user has switched email notifications off
   // in their preferences. The user should never be able to silence a security
@@ -235,6 +241,18 @@ class NotificationService {
         body: input.body,
         actionUrl: event.actionUrl,
         actionLabel: event.actionLabel,
+        // Co-brand the header with the agency this notification concerns. When
+        // the event is about a case we hand over that case's id, so a client
+        // working with more than one agency sees the RIGHT logo rather than
+        // whichever agency they last dealt with.
+        brandFor: {
+          userId: input.userId,
+          applicationId:
+            input.brandApplicationId ??
+            (input.relatedEntityType === "application"
+              ? input.relatedEntityId
+              : undefined),
+        },
       });
       status = result.status === "sent" ? "sent" : "failed";
       providerId = result.providerId ?? null;
