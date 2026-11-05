@@ -40,3 +40,6 @@ npm-debug.log*
 *.tsbuildinfo
 
 key.json
+
+# Claude Code local settings + session logs (any depth) — machine-local, may contain prod ids
+.claude/
