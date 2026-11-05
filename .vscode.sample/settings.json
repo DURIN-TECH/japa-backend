@@ -8,21 +8,21 @@
   //   3. Switch environments via VS Code status bar (bottom right)
   //
   // Seed users (all password: password123):
-  //   Admin:  admin@selitest.com      (has admin custom claim)
-  //   Admin2: admin2@selitest.com     (has admin custom claim)
-  //   Owner:  owner@selitest.com      (agency owner)
-  //   Agent1: agent1@selitest.com
-  //   Agent2: agent2@selitest.com
-  //   Client: john.doe@example.com
+  //   Admin:  delivered+admin@resend.dev      (has admin custom claim)
+  //   Admin2: delivered+admin2@resend.dev     (has admin custom claim)
+  //   Owner:  delivered+owner@resend.dev      (agency owner)
+  //   Agent1: delivered+agent1@resend.dev
+  //   Agent2: delivered+agent2@resend.dev
+  //   Client: delivered+john.doe@resend.dev
 
   "rest-client.environmentVariables": {
     "$shared": {
       "password": "password123",
-      "adminEmail": "admin@selitest.com",
-      "ownerEmail": "owner@selitest.com",
-      "agent1Email": "agent1@selitest.com",
-      "agent2Email": "agent2@selitest.com",
-      "clientEmail": "john.doe@example.com"
+      "adminEmail": "delivered+admin@resend.dev",
+      "ownerEmail": "delivered+owner@resend.dev",
+      "agent1Email": "delivered+agent1@resend.dev",
+      "agent2Email": "delivered+agent2@resend.dev",
+      "clientEmail": "delivered+john.doe@resend.dev"
     },
     "local": {
       "baseUrl": "http://localhost:5001/japa-platform/us-central1/api",

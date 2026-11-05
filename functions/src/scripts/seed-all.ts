@@ -195,8 +195,8 @@ async function main() {
     console.log(`  - Subscriptions:   ${subCounts.agency + subCounts.clients} (agency + ${subCounts.clients} clients)`);
     console.log("  - Role claims:     backfilled for all auth users");
     console.log("\nLogin credentials (all seed users): password123");
-    console.log("  admin@selitest.com / admin2@selitest.com / owner@selitest.com");
-    console.log("  agent1@selitest.com / agent2@selitest.com\n");
+    console.log("  delivered+admin@resend.dev / delivered+admin2@resend.dev / delivered+owner@resend.dev");
+    console.log("  delivered+agent1@resend.dev / delivered+agent2@resend.dev\n");
 
     process.exit(0);
   } catch (error) {
