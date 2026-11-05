@@ -65,6 +65,44 @@ const IDS = {
 };
 
 // ============================================
+// SEED EMAILS (Resend test addresses)
+// ============================================
+// Every seed user gets a Resend test inbox instead of a fake domain, so any
+// email the app sends to seed data (reset links, notifications, payment
+// requests) is accepted by Resend and simulated as delivered — no bounces
+// against our sending reputation, and nothing reaches a real person.
+//
+// Resend supports "+label" tagging on its test addresses, so the label is the
+// user's old seed local-part (admin, agent1, john.doe, ...):
+// delivered+admin@resend.dev. Short enough to type at login, and still tells
+// you in the Resend dashboard which seed user an email was sent to.
+// See https://resend.com/docs/dashboard/emails/send-test-emails
+//
+// NOTE: these are also the LOGIN emails for the seeded auth accounts.
+export function resendTestEmail(label: string): string {
+  return `delivered+${label}@resend.dev`;
+}
+
+/** Seed user key (same keys as IDS) -> that user's Resend test email. */
+const EMAILS = {
+  admin1User: resendTestEmail("admin"),
+  admin2User: resendTestEmail("admin2"),
+  ownerUser: resendTestEmail("owner"),
+  agent1User: resendTestEmail("agent1"),
+  agent2User: resendTestEmail("agent2"),
+  client1User: resendTestEmail("john.doe"),
+  client2User: resendTestEmail("jane.smith"),
+  client3User: resendTestEmail("ahmed.ali"),
+  client4User: resendTestEmail("lisa.wong"),
+  client5User: resendTestEmail("tunde.bakare"),
+  client6User: resendTestEmail("kwame.asante"),
+  client7User: resendTestEmail("wanjiku.mwangi"),
+  client8User: resendTestEmail("sipho.ndlovu"),
+  client9User: resendTestEmail("priya.sharma"),
+  client10User: resendTestEmail("miguel.santos"),
+};
+
+// ============================================
 // HELPERS
 // ============================================
 function daysAgo(days: number): Timestamp {
@@ -80,21 +118,21 @@ function daysFromNow(days: number): Timestamp {
 // ============================================
 
 const AUTH_USERS = [
-  { uid: IDS.admin1User, email: "admin@selitest.com", displayName: "Olu Adeyemi", isAdmin: true },
-  { uid: IDS.admin2User, email: "admin2@selitest.com", displayName: "Ngozi Ibe", isAdmin: true },
-  { uid: IDS.ownerUser, email: "owner@selitest.com", displayName: "Adaeze Okonkwo" },
-  { uid: IDS.agent1User, email: "agent1@selitest.com", displayName: "Chinedu Eze" },
-  { uid: IDS.agent2User, email: "agent2@selitest.com", displayName: "Fatima Bello" },
-  { uid: IDS.client1User, email: "john.doe@example.com", displayName: "John Doe" },
-  { uid: IDS.client2User, email: "jane.smith@example.com", displayName: "Jane Smith" },
-  { uid: IDS.client3User, email: "ahmed.ali@example.com", displayName: "Ahmed Ali" },
-  { uid: IDS.client4User, email: "lisa.wong@example.com", displayName: "Lisa Wong" },
-  { uid: IDS.client5User, email: "tunde.bakare@example.com", displayName: "Tunde Bakare" },
-  { uid: IDS.client6User, email: "kwame.asante@example.com", displayName: "Kwame Asante" },
-  { uid: IDS.client7User, email: "wanjiku.mwangi@example.com", displayName: "Wanjiku Mwangi" },
-  { uid: IDS.client8User, email: "sipho.ndlovu@example.com", displayName: "Sipho Ndlovu" },
-  { uid: IDS.client9User, email: "priya.sharma@example.com", displayName: "Priya Sharma" },
-  { uid: IDS.client10User, email: "miguel.santos@example.com", displayName: "Miguel Santos" },
+  { uid: IDS.admin1User, email: EMAILS.admin1User, displayName: "Olu Adeyemi", isAdmin: true },
+  { uid: IDS.admin2User, email: EMAILS.admin2User, displayName: "Ngozi Ibe", isAdmin: true },
+  { uid: IDS.ownerUser, email: EMAILS.ownerUser, displayName: "Adaeze Okonkwo" },
+  { uid: IDS.agent1User, email: EMAILS.agent1User, displayName: "Chinedu Eze" },
+  { uid: IDS.agent2User, email: EMAILS.agent2User, displayName: "Fatima Bello" },
+  { uid: IDS.client1User, email: EMAILS.client1User, displayName: "John Doe" },
+  { uid: IDS.client2User, email: EMAILS.client2User, displayName: "Jane Smith" },
+  { uid: IDS.client3User, email: EMAILS.client3User, displayName: "Ahmed Ali" },
+  { uid: IDS.client4User, email: EMAILS.client4User, displayName: "Lisa Wong" },
+  { uid: IDS.client5User, email: EMAILS.client5User, displayName: "Tunde Bakare" },
+  { uid: IDS.client6User, email: EMAILS.client6User, displayName: "Kwame Asante" },
+  { uid: IDS.client7User, email: EMAILS.client7User, displayName: "Wanjiku Mwangi" },
+  { uid: IDS.client8User, email: EMAILS.client8User, displayName: "Sipho Ndlovu" },
+  { uid: IDS.client9User, email: EMAILS.client9User, displayName: "Priya Sharma" },
+  { uid: IDS.client10User, email: EMAILS.client10User, displayName: "Miguel Santos" },
 ];
 
 const SEED_PASSWORD = "password123";
@@ -106,7 +144,12 @@ async function seedAuthUsers(): Promise<number> {
   for (const user of AUTH_USERS) {
     try {
       // Try to get existing user first (idempotent)
-      await auth.getUser(user.uid);
+      const existing = await auth.getUser(user.uid);
+      // Migrate accounts seeded before the switch to Resend test emails, so a
+      // re-seed moves them onto the new address instead of leaving the old one.
+      if (existing.email !== user.email) {
+        await auth.updateUser(user.uid, { email: user.email, emailVerified: true });
+      }
     } catch {
       // User doesn't exist, create it
       await auth.createUser({
@@ -139,7 +182,7 @@ async function seedUsers() {
   const users = [
     {
       id: IDS.admin1User,
-      email: "admin@selitest.com",
+      email: EMAILS.admin1User,
       firstName: "Olu",
       lastName: "Adeyemi",
       phone: "+2348001111111",
@@ -154,7 +197,7 @@ async function seedUsers() {
     },
     {
       id: IDS.admin2User,
-      email: "admin2@selitest.com",
+      email: EMAILS.admin2User,
       firstName: "Ngozi",
       lastName: "Ibe",
       phone: "+2348002222222",
@@ -169,7 +212,7 @@ async function seedUsers() {
     },
     {
       id: IDS.ownerUser,
-      email: "owner@selitest.com",
+      email: EMAILS.ownerUser,
       firstName: "Adaeze",
       lastName: "Okonkwo",
       phone: "+2348012345678",
@@ -183,7 +226,7 @@ async function seedUsers() {
     },
     {
       id: IDS.agent1User,
-      email: "agent1@selitest.com",
+      email: EMAILS.agent1User,
       firstName: "Chinedu",
       lastName: "Eze",
       phone: "+2348023456789",
@@ -197,7 +240,7 @@ async function seedUsers() {
     },
     {
       id: IDS.agent2User,
-      email: "agent2@selitest.com",
+      email: EMAILS.agent2User,
       firstName: "Fatima",
       lastName: "Bello",
       phone: "+2348034567890",
@@ -211,7 +254,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client1User,
-      email: "john.doe@example.com",
+      email: EMAILS.client1User,
       firstName: "John",
       lastName: "Doe",
       phone: "+2348045678901",
@@ -225,7 +268,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client2User,
-      email: "jane.smith@example.com",
+      email: EMAILS.client2User,
       firstName: "Jane",
       lastName: "Smith",
       phone: "+2348056789012",
@@ -239,7 +282,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client3User,
-      email: "ahmed.ali@example.com",
+      email: EMAILS.client3User,
       firstName: "Ahmed",
       lastName: "Ali",
       phone: "+2348067890123",
@@ -253,7 +296,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client4User,
-      email: "lisa.wong@example.com",
+      email: EMAILS.client4User,
       firstName: "Lisa",
       lastName: "Wong",
       phone: "+2348078901234",
@@ -267,7 +310,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client5User,
-      email: "tunde.bakare@example.com",
+      email: EMAILS.client5User,
       firstName: "Tunde",
       lastName: "Bakare",
       phone: "+2348089012345",
@@ -281,7 +324,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client6User,
-      email: "kwame.asante@example.com",
+      email: EMAILS.client6User,
       firstName: "Kwame",
       lastName: "Asante",
       phone: "+233201234567",
@@ -302,7 +345,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client7User,
-      email: "wanjiku.mwangi@example.com",
+      email: EMAILS.client7User,
       firstName: "Wanjiku",
       lastName: "Mwangi",
       phone: "+254712345678",
@@ -316,7 +359,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client8User,
-      email: "sipho.ndlovu@example.com",
+      email: EMAILS.client8User,
       firstName: "Sipho",
       lastName: "Ndlovu",
       phone: "+27821234567",
@@ -337,7 +380,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client9User,
-      email: "priya.sharma@example.com",
+      email: EMAILS.client9User,
       firstName: "Priya",
       lastName: "Sharma",
       phone: "+919876543210",
@@ -351,7 +394,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client10User,
-      email: "miguel.santos@example.com",
+      email: EMAILS.client10User,
       firstName: "Miguel",
       lastName: "Santos",
       phone: "+639171234567",
@@ -537,7 +580,7 @@ async function seedApplications() {
       amountPaid: 15000_00,
       paymentStatus: "partial",
       clientName: "John Doe",
-      clientEmail: "john.doe@example.com",
+      clientEmail: EMAILS.client1User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       agentNotes: "Client documents mostly in order. Awaiting updated bank statement.",
@@ -566,7 +609,7 @@ async function seedApplications() {
       amountPaid: 35000_00,
       paymentStatus: "paid",
       clientName: "Jane Smith",
-      clientEmail: "jane.smith@example.com",
+      clientEmail: EMAILS.client2User,
       visaTypeName: "General Employment Permit",
       countryName: "Ireland",
       userNotes: "My employer will send the contract by next week.",
@@ -596,7 +639,7 @@ async function seedApplications() {
       amountPaid: 25000_00,
       paymentStatus: "paid",
       clientName: "Ahmed Ali",
-      clientEmail: "ahmed.ali@example.com",
+      clientEmail: EMAILS.client3User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       createdAt: daysAgo(60),
@@ -626,7 +669,7 @@ async function seedApplications() {
       paymentStatus: "paid",
       rejectionReason: "Insufficient proof of funds and weak ties to home country.",
       clientName: "Lisa Wong",
-      clientEmail: "lisa.wong@example.com",
+      clientEmail: EMAILS.client4User,
       visaTypeName: "Student Visa (D)",
       countryName: "Ireland",
       createdAt: daysAgo(50),
@@ -654,7 +697,7 @@ async function seedApplications() {
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Tunde Bakare",
-      clientEmail: "tunde.bakare@example.com",
+      clientEmail: EMAILS.client5User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       createdAt: daysAgo(3),
@@ -682,7 +725,7 @@ async function seedApplications() {
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Kwame Asante",
-      clientEmail: "kwame.asante@example.com",
+      clientEmail: EMAILS.client6User,
       visaTypeName: "Student Visa (D)",
       countryName: "Ireland",
       userNotes: "Planning to study MSc Computer Science at Trinity College Dublin.",
@@ -711,7 +754,7 @@ async function seedApplications() {
       amountPaid: 25000_00,
       paymentStatus: "paid",
       clientName: "Wanjiku Mwangi",
-      clientEmail: "wanjiku.mwangi@example.com",
+      clientEmail: EMAILS.client7User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       agentNotes: "Strong application — well-documented travel history to UK and Schengen.",
@@ -742,7 +785,7 @@ async function seedApplications() {
       amountPaid: 35000_00,
       paymentStatus: "paid",
       clientName: "Sipho Ndlovu",
-      clientEmail: "sipho.ndlovu@example.com",
+      clientEmail: EMAILS.client8User,
       visaTypeName: "General Employment Permit",
       countryName: "Ireland",
       agentNotes: "Interview scheduled for next week. Client is well-prepared.",
@@ -771,7 +814,7 @@ async function seedApplications() {
       amountPaid: 15000_00,
       paymentStatus: "partial",
       clientName: "Priya Sharma",
-      clientEmail: "priya.sharma@example.com",
+      clientEmail: EMAILS.client9User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       userNotes: "Travel plans changed, no longer need visa for this period.",
@@ -800,7 +843,7 @@ async function seedApplications() {
       amountPaid: 25000_00,
       paymentStatus: "paid",
       clientName: "Miguel Santos",
-      clientEmail: "miguel.santos@example.com",
+      clientEmail: EMAILS.client10User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       agentNotes: "Client became unresponsive. Missing documents never provided. Application expired after 90 days.",
@@ -831,7 +874,7 @@ async function seedApplications() {
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Kwame Asante",
-      clientEmail: "kwame.asante@example.com",
+      clientEmail: EMAILS.client6User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       createdAt: daysAgo(10),
@@ -856,7 +899,7 @@ async function seedApplications() {
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Wanjiku Mwangi",
-      clientEmail: "wanjiku.mwangi@example.com",
+      clientEmail: EMAILS.client7User,
       visaTypeName: "Work Permit (General)",
       countryName: "Ireland",
       createdAt: daysAgo(5),
@@ -881,7 +924,7 @@ async function seedApplications() {
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Sipho Ndlovu",
-      clientEmail: "sipho.ndlovu@example.com",
+      clientEmail: EMAILS.client8User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       userNotes: "Started but got busy with work",
@@ -908,7 +951,7 @@ async function seedApplications() {
       amountPaid: 25000_00,
       paymentStatus: "paid",
       clientName: "Priya Sharma",
-      clientEmail: "priya.sharma@example.com",
+      clientEmail: EMAILS.client9User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       createdAt: daysAgo(60),
@@ -2072,7 +2115,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "stripe",
       description: "Initial consultation fee for Short Stay C Visa",
       clientName: "John Doe",
-      clientEmail: "john.doe@example.com",
+      clientEmail: EMAILS.client1User,
       visaTypeName: "Short Stay 'C' Visa",
       createdAt: daysAgo(25),
       updatedAt: daysAgo(25),
@@ -2090,7 +2133,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "stripe",
       description: "Visa application service fee",
       clientName: "John Doe",
-      clientEmail: "john.doe@example.com",
+      clientEmail: EMAILS.client1User,
       visaTypeName: "Short Stay 'C' Visa",
       createdAt: daysAgo(20),
       updatedAt: daysAgo(20),
@@ -2108,7 +2151,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "stripe",
       description: "Consultation fee for Employment Permit",
       clientName: "Jane Smith",
-      clientEmail: "jane.smith@example.com",
+      clientEmail: EMAILS.client2User,
       visaTypeName: "General Employment Permit",
       createdAt: daysAgo(18),
       updatedAt: daysAgo(18),
@@ -2127,7 +2170,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "stripe",
       description: "Employment Permit service fee (held in escrow)",
       clientName: "Jane Smith",
-      clientEmail: "jane.smith@example.com",
+      clientEmail: EMAILS.client2User,
       visaTypeName: "General Employment Permit",
       createdAt: daysAgo(15),
       updatedAt: daysAgo(15),
@@ -2145,7 +2188,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "paypal",
       description: "Short Stay C Visa processing fee",
       clientName: "Ahmed Ali",
-      clientEmail: "ahmed.ali@example.com",
+      clientEmail: EMAILS.client3User,
       visaTypeName: "Short Stay 'C' Visa",
       createdAt: daysAgo(30),
       updatedAt: daysAgo(30),
@@ -2163,7 +2206,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "stripe",
       description: "Consultation fee refunded (application rejected)",
       clientName: "Lisa Wong",
-      clientEmail: "lisa.wong@example.com",
+      clientEmail: EMAILS.client4User,
       visaTypeName: "Student Visa (D)",
       createdAt: daysAgo(35),
       updatedAt: daysAgo(10),
@@ -2181,7 +2224,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "manual",
       description: "Embassy application fee for Short Stay C Visa",
       clientName: "Wanjiku Mwangi",
-      clientEmail: "wanjiku.mwangi@example.com",
+      clientEmail: EMAILS.client7User,
       visaTypeName: "Short Stay 'C' Visa",
       createdAt: daysAgo(12),
       updatedAt: daysAgo(12),
@@ -2200,7 +2243,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "stripe",
       description: "Employment Permit service fee (pending interview)",
       clientName: "Sipho Ndlovu",
-      clientEmail: "sipho.ndlovu@example.com",
+      clientEmail: EMAILS.client8User,
       visaTypeName: "General Employment Permit",
       createdAt: daysAgo(8),
       updatedAt: daysAgo(8),
@@ -2230,7 +2273,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app1,
       clientName: "John Doe",
-      clientEmail: "john.doe@example.com",
+      clientEmail: EMAILS.client1User,
       agentName: "Chinedu Eze",
       type: "initial",
       scheduledDate: daysAgo(20),
@@ -2252,7 +2295,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app2,
       clientName: "Jane Smith",
-      clientEmail: "jane.smith@example.com",
+      clientEmail: EMAILS.client2User,
       agentName: "Chinedu Eze",
       type: "document_review",
       scheduledDate: daysAgo(5),
@@ -2274,7 +2317,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app8,
       clientName: "Sipho Ndlovu",
-      clientEmail: "sipho.ndlovu@example.com",
+      clientEmail: EMAILS.client8User,
       agentName: "Chinedu Eze",
       type: "interview_prep",
       scheduledDate: daysFromNow(3),
@@ -2296,7 +2339,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app7,
       clientName: "Wanjiku Mwangi",
-      clientEmail: "wanjiku.mwangi@example.com",
+      clientEmail: EMAILS.client7User,
       agentName: "Fatima Bello",
       type: "follow_up",
       scheduledDate: daysFromNow(7),
@@ -2317,7 +2360,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app3,
       clientName: "Ahmed Ali",
-      clientEmail: "ahmed.ali@example.com",
+      clientEmail: EMAILS.client3User,
       agentName: "Fatima Bello",
       type: "initial",
       scheduledDate: daysAgo(55),
@@ -2338,7 +2381,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app9,
       clientName: "Priya Sharma",
-      clientEmail: "priya.sharma@example.com",
+      clientEmail: EMAILS.client9User,
       agentName: "Fatima Bello",
       type: "general",
       scheduledDate: daysAgo(25),
@@ -2361,7 +2404,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app6,
       clientName: "Kwame Asante",
-      clientEmail: "kwame.asante@example.com",
+      clientEmail: EMAILS.client6User,
       agentName: "Chinedu Eze",
       type: "initial",
       scheduledDate: daysFromNow(1),
@@ -2383,7 +2426,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app4,
       clientName: "Lisa Wong",
-      clientEmail: "lisa.wong@example.com",
+      clientEmail: EMAILS.client4User,
       agentName: "Chinedu Eze",
       type: "follow_up",
       scheduledDate: daysAgo(12),
@@ -2725,7 +2768,7 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client1User,
       clientName: "Adaeze Okafor",
-      clientEmail: "adaeze@email.com",
+      clientEmail: EMAILS.client1User,
       amount: 75000_00, // ₦75,000 in kobo
       currency: "NGN",
       description: "Visa Processing Fee",
@@ -2741,7 +2784,7 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client1User,
       clientName: "Adaeze Okafor",
-      clientEmail: "adaeze@email.com",
+      clientEmail: EMAILS.client1User,
       amount: 25000_00, // ₦25,000 in kobo
       currency: "NGN",
       description: "Document Authentication Fee",
@@ -2756,7 +2799,7 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client2User,
       clientName: "Kwame Mensah",
-      clientEmail: "kwame@email.com",
+      clientEmail: EMAILS.client2User,
       amount: 150000_00, // ₦150,000 in kobo
       currency: "NGN",
       description: "Embassy Application Fee",
@@ -2771,7 +2814,7 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client5User,
       clientName: "Aisha Bello",
-      clientEmail: "aisha@email.com",
+      clientEmail: EMAILS.client5User,
       amount: 50000_00, // ₦50,000 in kobo
       currency: "NGN",
       description: "Consultation Fee",
@@ -2787,7 +2830,7 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client3User,
       clientName: "Amara Njoku",
-      clientEmail: "amara@email.com",
+      clientEmail: EMAILS.client3User,
       amount: 100000_00, // ₦100,000 in kobo
       currency: "NGN",
       description: "Visa Service Fee",

@@ -252,12 +252,12 @@ All seeded with password `password123`:
 
 | Role | Email | UID | Custom Claims |
 |------|-------|-----|---------------|
-| Admin | admin@japatest.com | seed-user-admin-001 | `admin: true` |
-| Admin 2 | admin2@japatest.com | seed-user-admin-002 | `admin: true` |
-| Agency Owner | owner@japatest.com | seed-user-owner-001 | — |
-| Agent 1 | agent1@japatest.com | seed-user-agent-001 | — |
-| Agent 2 | agent2@japatest.com | seed-user-agent-002 | — |
-| Client | john.doe@example.com | seed-user-client-001 | — |
+| Admin | delivered+admin@resend.dev | seed-user-admin-001 | `admin: true` |
+| Admin 2 | delivered+admin2@resend.dev | seed-user-admin-002 | `admin: true` |
+| Agency Owner | delivered+owner@resend.dev | seed-user-owner-001 | — |
+| Agent 1 | delivered+agent1@resend.dev | seed-user-agent-001 | — |
+| Agent 2 | delivered+agent2@resend.dev | seed-user-agent-002 | — |
+| Client | delivered+john.doe@resend.dev | seed-user-client-001 | — |
 
 Additional clients (jane.smith, ahmed.ali, etc.) are also seeded for case data.
 
