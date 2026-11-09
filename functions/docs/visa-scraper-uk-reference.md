@@ -241,34 +241,40 @@ and the ID can also change between runs. **Change:** use `page.visaId` when it's
 
 ---
 
-## 5. When to scrape — recommendation
+## 5. When to scrape — weekly, at night, in the source's own timezone
 
-**UK: check every night, starting 03:15 Europe/London, window 02:00–05:00 local.** The LLM only runs
-for routes whose content changed.
+**Cadence stays weekly** (the spike's locked decision). Visa rules and fees change rarely, and a weekly run
+keeps spend and the review queue in proportion as more countries come on. The LLM still only runs on routes
+whose content changed.
 
-Why:
+**UK: once a week, Monday 03:15 Europe/London (the Sunday-night window, 02:00–05:00 local).**
 
-1. **Politeness.** UK overnight is when the fewest real people use GOV.UK, so our requests compete with no one.
-2. **Freshness.** GOV.UK publishes during the UK working day. A 03:00 run picks up the previous day's edits
-   within about 18 hours. Fee and rule changes have announced effective dates, so a weekly run could leave a
-   wrong fee live for up to 6 days.
-3. **It's nearly free to check.** 12 Content API calls a night (~1.5s apart, about 20 seconds total). The LLM
-   only runs on routes that changed, so most nights it makes zero calls.
-4. **Review queue is ready by morning.** London is UTC+0/+1 and Lagos is UTC+1, so proposals made at 03:00 are
-   waiting when agents start work. Weekend-published changes are reviewed on Monday.
-5. **`:15`, not `:00`.** It keeps us off the top of the hour, when most other people's cron jobs fire.
+Why that slot:
 
-Use `.timeZone("Europe/London")` so the run follows GMT/BST automatically. The function currently uses
-`"UTC"`, so its local time would shift by an hour in summer.
+1. **Politeness.** UK overnight, and Sunday night in particular, is when the fewest real people use GOV.UK.
+2. **Captures the whole working week.** GOV.UK publishes during UK office hours, so a Sunday-night run sees
+   everything published Monday–Friday.
+3. **Review queue ready Monday morning.** London is UTC+0/+1 and Lagos is UTC+1, so proposals are waiting
+   when agents start the week.
+4. **`:15`, not `:00`.** It keeps us off the top of the hour, when most other people's cron jobs fire.
 
-**This changes a locked decision** (the spike set a weekly cadence): UK goes to a daily *check*, with
-extraction still only on change. Other countries stay weekly until they have a cheap change signal like GOV.UK's.
+Use `.timeZone("Europe/London")` / per-source timezones so runs follow daylight saving automatically. The
+orchestrator currently uses `"UTC"` on a `0 */6 * * *` tick, and the weekly slot drifts by however long runs take.
 
-**Generalised for other countries:** each source has a `crawlWindow` in its own timezone (e.g. Ireland
-`Europe/Dublin`, Canada `America/Toronto`, UAE `Asia/Dubai`). The orchestrator ticks hourly at `:15`,
-queries due sources (`status == active && nextCrawlAt <= now`), and keeps only those whose local hour is
-inside their window. That in-memory filter is fine at ~30 countries. After a run it sets `nextCrawlAt` to the
-next window opening plus `crawlIntervalHours`.
+**Generalised for other countries.** Each source has a `crawlWindow` in its own timezone and **its own night
+of the week**, so the 26 countries are spread across the week instead of landing on one night:
+
+```ts
+crawlWindow: { timeZone: "Europe/London", dayOfWeek: 1 /* Mon, ISO 1–7 */, startHour: 2, endHour: 5 }
+// e.g. IE Europe/Dublin Tue · CA America/Toronto Wed · AE Asia/Dubai Thu …
+```
+
+The orchestrator ticks **hourly at `:15`**, queries due sources (`status == active && nextCrawlAt <= now`),
+and keeps only those whose local day and hour fall inside their window. That in-memory filter is fine at
+~30 countries. After a run it sets `nextCrawlAt` to the **next** opening of that window, not to
+`now + 168h`, so the slot never drifts. A source that misses its window (outage, or the per-run cap is hit)
+catches up in the remaining hours of that night. If the whole night is missed, it waits for next week's window.
+An admin can trigger a one-off run (`crawl-visa-catalog.ts --country GB`) when a known change lands mid-week.
 
 > *Optional:* DeepSeek has at times offered an off-peak price window. If it currently does, extraction can be
 > queued and drained in that window separately from the fetch, because the stages are already decoupled.
@@ -318,7 +324,7 @@ Its outbound requests leave from Google Cloud's shared egress IP pool, not from 
 | C | LLM converts currency | `{feeAmount, feeCurrency}` + code FX + `scrapeMeta.fee` (§2.3); re-check the seed's GBP-in-USD values |
 | D | Ingest **skips** any approved/seeded visa → curated UK data never updates | Build the spike's `pendingVisaChanges` (diff + citations) for live visas; approval applies the diff |
 | E | Approval doesn't set `lastVerifiedAt` or recompute `Country` stats (`recomputeCountryStats` exists but isn't called) | Call both in `reviewVisa` on approve |
-| F | Schedule: `0 */6 * * *` UTC, weekly per source | Per-source `crawlWindow` + `Europe/London` daily UK check (§5) |
+| F | Schedule: `0 */6 * * *` UTC; `nextCrawlAt = now + 168h` drifts and ignores local night | Per-source weekly `crawlWindow` (timezone + night of week); UK Mon 03:15 London (§5) |
 | G | Bot hygiene | Real `/bot` page; `Retry-After`/429 backoff (§6) |
 | H | No accuracy bar for the UK | Golden set = the 4 seeded UK visas, hand-corrected against today's GOV.UK; CI check per `extractorPromptVersion` |
 
@@ -330,5 +336,5 @@ data quality. H has to exist before anyone trusts a prompt change. D and E keep 
 Keep **DeepSeek-chat** behind `LlmExtractor`. It's already wired, and `DEEPSEEK_API_KEY` is already a
 secret. The code does almost no parsing: the adapter returns plain-text sections, and the model fills the
 schema. Per changed UK route: ~9k tokens in, ~1.5k out, roughly **$0.004** at the spike's prices (re-verify).
-A full UK backfill of 12 routes costs about 5 cents. A typical night costs $0, because nothing changed.
+A full UK backfill of 12 routes costs about 5 cents. A typical weekly UK run costs cents or nothing, because most routes haven't changed.
 The system prompt + schema + 2 UK few-shot examples are identical on every call, so they're the cached prefix.
