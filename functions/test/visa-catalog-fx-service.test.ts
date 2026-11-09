@@ -10,6 +10,12 @@
 // Covers:
 //  - runOrchestrator refreshes appConfig/fx once per run; a throwing fetcher
 //    keeps the previous doc and the run continues
+//  - runOrchestrator weekly night window (issue #63): only due sources inside
+//    their local window run; out-of-window ones are untouched; no .limit()
+//    before the window filter; nextCrawlAt = next window opening (no drift);
+//    catch-up within a night, never twice a night, missed night waits a week;
+//    no-window sources keep the interval; FX refresh / re-convert only on a
+//    tick that crawls something; broken/paused never run; auto-pause at 5
 //  - after a refresh, a stale-flagged pending scraped visa is re-converted
 //    from its stored components with ZERO extractor calls, content hash
 //    untouched; approved / agent docs are left alone
@@ -18,7 +24,7 @@
 //    rejecting a flagged one both work
 //  - visaController.reviewVisa maps the typed error to 409 with the message
 
-import { test, describe, before, beforeEach } from "node:test";
+import { test, describe, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 
@@ -69,7 +75,7 @@ function applyUpdate(target: Data, update: Data): Data {
 
 /** A doc ref backed by `store`. */
 function fakeDoc(path: string) {
-  const ref = {
+  const ref: any = {
     id: path.split("/").pop()!,
     async get() {
       const d = store.get(path);
@@ -83,26 +89,68 @@ function fakeDoc(path: string) {
       if (!cur) throw new Error(`NOT_FOUND ${path}`);
       store.set(path, applyUpdate(cur, data));
     },
+    // Subcollection (the orchestrator writes visaSources/{cc}/crawlRuns).
+    collection: (name: string) => fakeCollection(`${path}/${name}`),
   };
   return ref;
 }
 
+/** Comparable form of a stored value: Timestamps compare by millis. */
+const cmpValue = (v: unknown): unknown => (v instanceof Timestamp ? v.toMillis() : v);
+
+/** Counter for auto-ids handed out by the fake `add()`. */
+let autoId = 0;
+
+/** Query state carried by the fake collection (immutable per query). */
+interface FakeQuery {
+  filters: [string, string, unknown][]; // field, op ("==" | "<="), value
+  order?: [string, "asc" | "desc"];
+  limit?: number;
+}
+
 /** A collection ref / query backed by `store` (direct children only).
- *  `where` returns a NEW query, like Firestore (filters never leak). Every
- *  filter is treated as equality — enough for the code under test (the
- *  orchestrator's `nextCrawlAt <= now` simply matches nothing here). */
-function fakeCollection(path: string, filters: [string, unknown][] = []): any {
+ *  `where` / `orderBy` / `limit` return a NEW query, like Firestore (state
+ *  never leaks). Supports `==` and `<=` (Timestamps compared by millis; a
+ *  missing field never matches `<=`), one orderBy, and a REAL limit, so a
+ *  `.limit()` before the window filter would be caught by the tests. */
+function fakeCollection(path: string, q: FakeQuery = { filters: [] }): any {
   const col = {
     doc: (id: string) => fakeDoc(`${path}/${id}`),
-    where(field: string, _op: string, value: unknown) {
-      return fakeCollection(path, [...filters, [field, value]]);
+    where(field: string, op: string, value: unknown) {
+      return fakeCollection(path, { ...q, filters: [...q.filters, [field, op, value]] });
     },
-    orderBy: () => col,
-    limit: () => col,
+    orderBy(field: string, dir: "asc" | "desc" = "asc") {
+      return fakeCollection(path, { ...q, order: [field, dir] });
+    },
+    limit(n: number) {
+      return fakeCollection(path, { ...q, limit: n });
+    },
+    // Auto-id add (crawlRuns log).
+    async add(data: Data) {
+      const ref = fakeDoc(`${path}/auto-${++autoId}`);
+      await ref.set(data);
+      return ref;
+    },
     async get() {
-      const docs = [...store.entries()]
+      let entries = [...store.entries()]
         .filter(([p]) => p.startsWith(`${path}/`) && !p.slice(path.length + 1).includes("/"))
-        .filter(([, d]) => filters.every(([f, v]) => d[f] === v))
+        .filter(([, d]) =>
+          q.filters.every(([f, op, v]) => {
+            const a = cmpValue(d[f]);
+            const b = cmpValue(v);
+            if (op === "<=") return a !== undefined && (a as number) <= (b as number);
+            return a === b;
+          })
+        );
+      if (q.order) {
+        const [f, dir] = q.order;
+        entries.sort(([, x], [, y]) => {
+          const d = (cmpValue(x[f]) as number) - (cmpValue(y[f]) as number);
+          return dir === "asc" ? d : -d;
+        });
+      }
+      if (q.limit !== undefined) entries = entries.slice(0, q.limit);
+      const docs = entries
         .map(([p]) => fakeDoc(p))
         .map((ref) => ({ id: ref.id, ref, data: () => clone(store.get(`${path}/${ref.id}`)!) }));
       return { docs, empty: docs.length === 0 };
@@ -152,6 +200,7 @@ let crawl: any;
 let extractMod: any;
 let visaSvc: any;
 let controller: any;
+let catalogSvc: any;
 let extractorCalls = 0;
 
 before(async () => {
@@ -168,6 +217,8 @@ before(async () => {
     throw new Error("extractor must not be called");
   };
   crawl = (await import("../src/services/visa-catalog-crawl.service")).visaCatalogCrawlService;
+  // The same instance the orchestrator calls (spied on for re-convert counts).
+  catalogSvc = (await import("../src/services/visa-catalog.service")).visaCatalogService;
   visaSvc = (await import("../src/services/visa.service")).visaService;
   controller = (await import("../src/controllers/visa.controller")).visaController;
 });
@@ -182,6 +233,25 @@ beforeEach(() => {
 
 // ----- Orchestrator: refresh + re-convert -----
 
+/** ISO weekday (1 = Mon .. 7 = Sun) of the real clock, in UTC. */
+const isoWeekdayUtcToday = () => (new Date().getUTCDay() === 0 ? 7 : new Date().getUTCDay());
+
+/** Make the FX tests' tick crawl something (FX only runs then, issue #63):
+ *  one active, due source whose window spans the whole of TODAY in UTC, so
+ *  the real clock (these tests use it) is always inside it. No pages, so
+ *  nothing is fetched. */
+function putDueAllDaySource(cc = "FR"): void {
+  store.set(`visaSources/${cc}`, {
+    countryCode: cc,
+    status: "active",
+    pages: [],
+    crawlIntervalHours: 168,
+    consecutiveFailures: 0,
+    nextCrawlAt: Timestamp.fromMillis(Date.now() - DAY_MS),
+    crawlWindow: { timeZone: "UTC", dayOfWeek: isoWeekdayUtcToday(), startHour: 0, endHour: 24 },
+  });
+}
+
 describe("runOrchestrator — FX refresh + re-convert", () => {
   test("refreshes appConfig/fx and re-converts a stale-flagged pending visa with zero extractor calls", async () => {
     store.set("appConfig/fx", oldFx() as unknown as Data);
@@ -189,6 +259,7 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
     // Approved + agent docs with a flagged fee must not be touched.
     store.set("countries/GB/visaTypes/gb-approved", scrapedVisa(oldFx(), { reviewStatus: "approved", baseCostUsd: 1 }));
     store.set("countries/GB/visaTypes/gb-agent", scrapedVisa(oldFx(), { source: "agent", baseCostUsd: 2 }));
+    putDueAllDaySource();
     const before = store.get("countries/GB/visaTypes/gb-skilled-worker-visa")!;
     assert.equal((before.scrapeMeta as any).fee.fxStale, true);
     assert.equal("baseCostUsd" in before, false);
@@ -229,6 +300,7 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
     const previous = oldFx();
     store.set("appConfig/fx", previous as unknown as Data);
     store.set("countries/GB/visaTypes/gb-skilled-worker-visa", scrapedVisa(previous));
+    putDueAllDaySource();
 
     const summary = await crawl.runOrchestrator({
       fetchFxRates: async () => {
@@ -243,6 +315,205 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
     const doc = store.get("countries/GB/visaTypes/gb-skilled-worker-visa")!;
     assert.equal((doc.scrapeMeta as any).fee.fxStale, true);
     assert.equal("baseCostUsd" in doc, false);
+  });
+});
+
+// ----- Orchestrator: weekly night window (issue #63) -----
+//
+// Fixed tick times (injected via `now`), Europe/London:
+//  - GMT week: Mon 2026-11-09 02:15 GMT = 02:15Z
+//  - BST week: Mon 2026-06-15 02:15 BST = 01:15Z
+// GB's window is Mon 02:00-05:00 local (ticks 02:15, 03:15, 04:15).
+
+const HOUR_MS = 60 * 60 * 1000;
+const GB_WINDOW = { timeZone: "Europe/London", dayOfWeek: 1, startHour: 2, endHour: 5 };
+const at = (iso: string) => Date.parse(iso);
+
+/** An active registry source (no pages → nothing fetched), due since
+ *  `dueSince`, with GB's window unless overridden. */
+function putSource(cc: string, over: Data = {}, dueSince = "2026-11-02T02:00:00Z"): void {
+  store.set(`visaSources/${cc}`, {
+    countryCode: cc,
+    status: "active",
+    pages: [],
+    crawlIntervalHours: 168,
+    consecutiveFailures: 0,
+    reliabilityScore: 100,
+    nextCrawlAt: Timestamp.fromMillis(at(dueSince)),
+    crawlWindow: GB_WINDOW,
+    ...over,
+  });
+}
+
+/** Stored nextCrawlAt of a source, as an ISO string. */
+const nextOf = (cc: string) => (store.get(`visaSources/${cc}`)!.nextCrawlAt as Timestamp).toDate().toISOString();
+
+describe("runOrchestrator — weekly night window", () => {
+  // Counting stubs for the FX side: fetcher + re-convert spy.
+  let fxFetches = 0;
+  let reconverts = 0;
+  let origReconvert: any;
+  const fetchFxRates = async () => {
+    fxFetches++;
+    return { rates: { GBP: 0.8 }, rateDate: isoDaysAgo(1) };
+  };
+  /** Run one tick at `iso` with the stubs (and optional extra options). */
+  const tick = (iso: string, extra: Data = {}) => crawl.runOrchestrator({ now: at(iso), fetchFxRates, ...extra });
+
+  beforeEach(() => {
+    store.delete("visaSources/GB"); // the shared paused fixture; each test seeds its own
+    fxFetches = 0;
+    reconverts = 0;
+    origReconvert = catalogSvc.reconvertFlaggedFees;
+    catalogSvc.reconvertFlaggedFees = async (...args: unknown[]) => {
+      reconverts++;
+      return origReconvert.apply(catalogSvc, args);
+    };
+  });
+  afterEach(() => {
+    catalogSvc.reconvertFlaggedFees = origReconvert;
+  });
+
+  test("GB is skipped on a Sunday afternoon: untouched, and no FX refresh / re-convert", async () => {
+    putSource("GB");
+    const before = clone(store.get("visaSources/GB"));
+    const summary = await tick("2026-11-08T15:15:00Z"); // Sun 15:15 GMT
+    assert.equal(summary.sourcesProcessed, 0);
+    assert.equal(summary.fxRefreshed, false);
+    assert.equal(fxFetches, 0); // no Frankfurter call
+    assert.equal(reconverts, 0); // no pending-visa scan
+    assert.equal(store.has("appConfig/fx"), false);
+    assert.deepEqual(store.get("visaSources/GB"), before); // no write, nextCrawlAt unchanged
+  });
+
+  test("no due source at all → no FX refresh / re-convert", async () => {
+    putSource("GB", {}, "2026-11-16T02:00:00Z"); // not due yet
+    const summary = await tick("2026-11-09T02:15:00Z");
+    assert.equal(summary.sourcesProcessed, 0);
+    assert.equal(summary.fxRefreshed, false);
+    assert.equal(fxFetches, 0);
+    assert.equal(reconverts, 0);
+  });
+
+  test("GB runs at Mon 02:15 GMT → next Monday 02:00 GMT; FX refreshed exactly once", async () => {
+    putSource("GB");
+    putSource("DE", { crawlWindow: { ...GB_WINDOW, timeZone: "Europe/Berlin" } }); // Mon 03:15 Berlin: also in window
+    const summary = await tick("2026-11-09T02:15:00Z");
+    assert.equal(summary.sourcesProcessed, 2);
+    assert.equal(summary.fxRefreshed, true);
+    assert.equal(fxFetches, 1); // once per tick, not per source
+    assert.equal(reconverts, 1);
+    assert.equal(nextOf("GB"), "2026-11-16T02:00:00.000Z");
+    assert.equal(nextOf("DE"), "2026-11-16T01:00:00.000Z"); // Mon 02:00 CET
+    const gb = store.get("visaSources/GB")!;
+    assert.equal((gb.lastCrawledAt as Timestamp).toMillis(), at("2026-11-09T02:15:00Z"));
+  });
+
+  test("GB runs at Mon 02:15 BST (01:15Z) → next Monday 02:00 BST (01:00Z)", async () => {
+    putSource("GB", {}, "2026-06-08T01:00:00Z");
+    const summary = await tick("2026-06-15T01:15:00Z");
+    assert.equal(summary.sourcesProcessed, 1);
+    assert.equal(nextOf("GB"), "2026-06-22T01:00:00.000Z");
+  });
+
+  test("DST: next opening stays at local 02:00 across both clock changes", async () => {
+    putSource("GB", {}, "2026-03-16T02:00:00Z");
+    await tick("2026-03-23T02:15:00Z"); // Mon 02:15 GMT
+    assert.equal(nextOf("GB"), "2026-03-30T01:00:00.000Z"); // Mon 02:00 BST
+    putSource("GB", {}, "2026-10-12T01:00:00Z");
+    await tick("2026-10-19T01:15:00Z"); // Mon 02:15 BST
+    assert.equal(nextOf("GB"), "2026-10-26T02:00:00.000Z"); // Mon 02:00 GMT
+  });
+
+  test("no drift: a run on the last catch-up tick (04:15) still lands on next Monday 02:00", async () => {
+    putSource("GB");
+    await tick("2026-11-09T04:15:00Z");
+    assert.equal(nextOf("GB"), "2026-11-16T02:00:00.000Z");
+  });
+
+  test("the due query has no limit: 4 due out-of-window sources ordered first don't starve the in-window one", async () => {
+    // Oldest nextCrawlAt first, all due, all on a Tuesday window (out on a Monday).
+    const tue = { ...GB_WINDOW, dayOfWeek: 2 };
+    for (const [i, cc] of ["IE", "FR", "KR", "SA"].entries()) {
+      putSource(cc, { crawlWindow: tue }, `2026-10-0${i + 1}T02:00:00Z`);
+    }
+    putSource("GB", {}, "2026-11-02T02:00:00Z"); // youngest: ordered LAST
+    const outBefore = ["IE", "FR", "KR", "SA"].map((cc) => clone(store.get(`visaSources/${cc}`)));
+    const summary = await tick("2026-11-09T02:15:00Z", { maxSources: 3 });
+    assert.equal(summary.sourcesProcessed, 1);
+    assert.equal(nextOf("GB"), "2026-11-16T02:00:00.000Z");
+    // Out-of-window sources: no write at all (no fetch, nextCrawlAt unchanged).
+    assert.deepEqual(
+      ["IE", "FR", "KR", "SA"].map((cc) => store.get(`visaSources/${cc}`)),
+      outBefore
+    );
+  });
+
+  test("catch-up: a source left over by maxSources runs on a later tick the same night, and nobody runs twice", async () => {
+    for (const [i, cc] of ["GB", "DE", "JP", "QA"].entries()) {
+      // All on GB's London window; distinct due times fix the order.
+      putSource(cc, {}, `2026-11-02T0${i}:00:00Z`);
+    }
+    const first = await tick("2026-11-09T02:15:00Z", { maxSources: 3 });
+    assert.equal(first.sourcesProcessed, 3);
+    assert.equal(nextOf("QA"), "2026-11-02T03:00:00.000Z"); // left over: untouched, still due
+
+    const second = await tick("2026-11-09T03:15:00Z", { maxSources: 3 });
+    assert.equal(second.sourcesProcessed, 1); // only QA: the others moved to next week
+    assert.equal(nextOf("QA"), "2026-11-16T02:00:00.000Z");
+
+    const third = await tick("2026-11-09T04:15:00Z", { maxSources: 3 });
+    assert.equal(third.sourcesProcessed, 0); // never twice in one night
+    assert.equal(third.fxRefreshed, false);
+  });
+
+  test("a whole missed night: not run mid-week, run at the next window", async () => {
+    putSource("GB", {}, "2026-11-02T02:00:00Z"); // its Mon 02-05 window was missed
+    const tue = await tick("2026-11-10T02:15:00Z"); // Tuesday
+    assert.equal(tue.sourcesProcessed, 0);
+    const mon5 = await tick("2026-11-09T05:15:00Z"); // Monday, but after the window
+    assert.equal(mon5.sourcesProcessed, 0);
+    assert.equal(nextOf("GB"), "2026-11-02T02:00:00.000Z"); // still due, unchanged
+    const nextMon = await tick("2026-11-16T02:15:00Z");
+    assert.equal(nextMon.sourcesProcessed, 1);
+    assert.equal(nextOf("GB"), "2026-11-23T02:00:00.000Z");
+  });
+
+  test("a source with no crawlWindow keeps the legacy behaviour (any time, now + crawlIntervalHours)", async () => {
+    putSource("XX", { crawlWindow: undefined });
+    delete store.get("visaSources/XX")!.crawlWindow;
+    const summary = await tick("2026-11-11T13:00:00Z"); // a Wednesday afternoon
+    assert.equal(summary.sourcesProcessed, 1);
+    assert.equal(nextOf("XX"), new Date(at("2026-11-11T13:00:00Z") + 168 * HOUR_MS).toISOString());
+  });
+
+  test("broken / paused sources are never processed, even in window", async () => {
+    putSource("GB", { status: "broken" });
+    putSource("DE", { status: "paused" });
+    const summary = await tick("2026-11-09T02:15:00Z");
+    assert.equal(summary.sourcesProcessed, 0);
+    assert.equal(fxFetches, 0);
+  });
+
+  test("auto-pause after 5 consecutive failures still works", async () => {
+    putSource("GB", { consecutiveFailures: 4 }); // no pages → this run fails too
+    await tick("2026-11-09T02:15:00Z");
+    const gb = store.get("visaSources/GB")!;
+    assert.equal(gb.consecutiveFailures, 5);
+    assert.equal(gb.status, "broken");
+    assert.equal(nextOf("GB"), "2026-11-16T02:00:00.000Z");
+  });
+
+  test("an invalid stored window is skipped (logged), not thrown", async () => {
+    putSource("GB", { crawlWindow: { ...GB_WINDOW, timeZone: "Mars/Olympus" } });
+    const origError = console.error;
+    console.error = () => undefined;
+    try {
+      const summary = await tick("2026-11-09T02:15:00Z");
+      assert.equal(summary.sourcesProcessed, 0);
+    } finally {
+      console.error = origError;
+    }
   });
 });
 
