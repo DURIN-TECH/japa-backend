@@ -45,6 +45,8 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *  - "2026-11-fee-length-v3" (#59): deterministic visa-length selection (the
  *    LONGEST standard outside-country option; surcharges use the same years)
  *    and `fee.years` must quote a duration, not the fee line.
+ * Before merging a bump (or a model change), run `npm run eval:visa-extract`
+ * and attach the result — see functions/eval/README.md.
  */
 export const EXTRACTOR_PROMPT_VERSION = "2026-11-fee-length-v3";
 
