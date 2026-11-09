@@ -3,36 +3,119 @@
   "sourceUrl": "https://www.gov.uk/graduate-visa",
   "fixtureRecordedAt": "2026-11-09",
   "draftedBy": "ai-team software-engineer, from guide.json only (not from seed data), 2026-11-09",
-  "verifiedBy": "pending",
-  "verifiedOn": "pending",
+  "verifiedBy": "wrightkhlebisol",
+  "verifiedOn": "2026-11-09",
   "notes": [
+    "QA checked all fields vs live Content API 2026-11-09; user spot-checked fee lines",
     "Fee rule (#59): one application fee (£937, applied for inside the UK only). IHS £1,035 per year x 2: the standard length is 2 years for anyone applying on or before 31 December 2026. The 3-year length is only for PhD / doctoral holders (a variant, not the standard case). VERIFIER: confirm 2, not 3.",
     "DATE-SENSITIVE: from 1 January 2027 the standard length becomes 18 months (IHS £1,552.50 total). Re-record and re-verify this route then.",
     "category: 'work' (the visa is a post-study permission to work / look for work, not to study).",
-    "processingDaysMin: the page only says 'within 8 weeks', so any minimum from 0 to 56 days is consistent with it."
+    "Processing time (user decision, 2026-11-09): FULL RANGE: the Graduate visa is applied for inside the UK only and the page gives one figure ('within 8 weeks'): max = 56, min = inclusive range 0..56."
   ],
-  "name": { "value": "Graduate", "source": "A Graduate visa gives you permission to stay in the UK for at least 18 months after successfully completing an eligible course in the UK." },
-  "category": { "value": "work", "source": "work in most jobs" },
-  "processingDaysMin": { "range": [0, 56], "source": "you’ll usually get a decision within 8 weeks." },
-  "processingDaysMax": { "value": 56, "source": "you’ll usually get a decision within 8 weeks." },
+  "name": {
+    "value": "Graduate",
+    "source": "A Graduate visa gives you permission to stay in the UK for at least 18 months after successfully completing an eligible course in the UK."
+  },
+  "category": {
+    "value": "work",
+    "source": "work in most jobs"
+  },
+  "processingDaysMin": {
+    "range": [
+      0,
+      56
+    ],
+    "source": "you’ll usually get a decision within 8 weeks."
+  },
+  "processingDaysMax": {
+    "value": 56,
+    "source": "you’ll usually get a decision within 8 weeks."
+  },
   "validityPeriod": {
-    "durations": [{ "amount": 2, "unit": "year" }],
+    "durations": [
+      {
+        "amount": 2,
+        "unit": "year"
+      }
+    ],
     "source": "2 years if you apply on or before 31 December 2026"
   },
-  "isExtendable": { "value": false, "source": "You cannot extend your Graduate visa." },
+  "isExtendable": {
+    "value": false,
+    "source": "You cannot extend your Graduate visa."
+  },
   "eligibility": {
     "themes": [
-      { "theme": "be in the UK when you apply", "anyOf": ["in the uk", "inside the uk"], "source": "You must be in the UK when you apply." },
-      { "theme": "currently on a Student / Tier 4 visa", "anyOf": ["student visa", "tier 4"], "source": "your current visa is a Student visa or Tier 4 (General) student visa" },
-      { "theme": "completed an eligible UK course", "anyOf": ["completed", "completing", "eligible course", "degree", "bachelor", "master"], "source": "you studied a UK bachelor’s degree, postgraduate degree or other eligible course for a minimum period of time with your Student visa or Tier 4 (General) student visa" },
-      { "theme": "education provider has told the Home Office", "anyOf": ["home office", "education provider", "university", "reported", "notified", "confirmed"], "source": "your education provider (such as your university or college) has told the Home Office you’ve successfully completed your course" }
+      {
+        "theme": "be in the UK when you apply",
+        "anyOf": [
+          "be in the uk",
+          "must be in the uk",
+          "you're in the uk",
+          "you are in the uk",
+          "currently in the uk",
+          "inside the uk",
+          "in the uk when you apply"
+        ],
+        "source": "You must be in the UK when you apply."
+      },
+      {
+        "theme": "currently on a Student / Tier 4 visa",
+        "anyOf": [
+          "student visa",
+          "tier 4"
+        ],
+        "source": "your current visa is a Student visa or Tier 4 (General) student visa"
+      },
+      {
+        "theme": "completed an eligible UK course",
+        "anyOf": [
+          "successfully completed",
+          "completed an eligible",
+          "completed a uk",
+          "completed your course",
+          "eligible course",
+          "bachelor s degree",
+          "master s degree",
+          "phd",
+          "postgraduate"
+        ],
+        "source": "you studied a UK bachelor’s degree, postgraduate degree or other eligible course for a minimum period of time with your Student visa or Tier 4 (General) student visa"
+      },
+      {
+        "theme": "education provider has told the Home Office",
+        "anyOf": [
+          "home office",
+          "education provider",
+          "notified",
+          "told the home office"
+        ],
+        "source": "your education provider (such as your university or college) has told the Home Office you’ve successfully completed your course"
+      }
     ]
   },
-  "applicationUrlHost": { "value": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk", "source": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/graduate_in_uk" },
+  "applicationUrlHost": {
+    "value": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk",
+    "source": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/graduate_in_uk"
+  },
   "feeComponents": {
     "components": [
-      { "kind": "application", "amount": 937, "currency": "GBP", "per": "application", "source": "pay the £937 application fee" },
-      { "kind": "surcharge", "amount": 1035, "currency": "GBP", "per": "year", "years": 2, "source": "pay the healthcare surcharge - this is usually £1,035 for each year you’ll be in the UK", "yearsSource": "2 years if you apply on or before 31 December 2026" }
+      {
+        "kind": "application",
+        "amount": 937,
+        "currency": "GBP",
+        "per": "application",
+        "source": "pay the £937 application fee"
+      },
+      {
+        "kind": "surcharge",
+        "amount": 1035,
+        "currency": "GBP",
+        "per": "year",
+        "years": 2,
+        "source": "pay the healthcare surcharge - this is usually £1,035 for each year you’ll be in the UK",
+        "yearsSource": "2 years if you apply on or before 31 December 2026"
+      }
     ]
   }
 }

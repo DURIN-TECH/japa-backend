@@ -3,35 +3,115 @@
   "sourceUrl": "https://www.gov.uk/standard-visitor",
   "fixtureRecordedAt": "2026-11-09",
   "draftedBy": "ai-team software-engineer, from guide.json only (not from seed data), 2026-11-09",
-  "verifiedBy": "pending",
-  "verifiedOn": "pending",
+  "verifiedBy": "wrightkhlebisol",
+  "verifiedOn": "2026-11-09",
   "notes": [
+    "QA checked all fields vs live Content API 2026-11-09; user spot-checked fee lines",
     "Fee rule (#59): the standard (up to 6 months) Standard Visitor visa is £135. Long-term (2/5/10 year), medical and academic variants and the £1,172 in-UK extension are excluded. No IHS for visitors.",
     "isExtendable: true — a stay under 6 months can be extended up to a total of 6 months (and longer for medical treatment / academics).",
-    "processingDaysMin: the page only says 'within 3 weeks', so any minimum from 0 to 21 days is consistent with it."
+    "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK visa decision (3 weeks), max = inside-UK extension decision, standard service (8 weeks)."
   ],
-  "name": { "value": "Standard Visitor", "source": "You can visit the UK as a Standard Visitor for tourism, business, study (courses up to 6 months) and other permitted activities." },
-  "category": { "value": "tourist", "source": "You can visit the UK as a Standard Visitor for tourism, business, study (courses up to 6 months) and other permitted activities." },
-  "processingDaysMin": { "range": [0, 21], "source": "you’ll usually get a decision on your visa within 3 weeks." },
-  "processingDaysMax": { "value": 21, "source": "you’ll usually get a decision on your visa within 3 weeks." },
+  "name": {
+    "value": "Standard Visitor",
+    "source": "You can visit the UK as a Standard Visitor for tourism, business, study (courses up to 6 months) and other permitted activities."
+  },
+  "category": {
+    "value": "tourist",
+    "source": "You can visit the UK as a Standard Visitor for tourism, business, study (courses up to 6 months) and other permitted activities."
+  },
+  "processingDaysMin": {
+    "value": 21,
+    "source": "you’ll usually get a decision on your visa within 3 weeks."
+  },
+  "processingDaysMax": {
+    "value": 56,
+    "source": "If you use the standard service, a decision will usually be made within 8 weeks of providing your supporting documents and proving your identity."
+  },
   "validityPeriod": {
-    "durations": [{ "amount": 6, "unit": "month" }],
+    "durations": [
+      {
+        "amount": 6,
+        "unit": "month"
+      }
+    ],
     "source": "You can usually stay in the UK for up to 6 months."
   },
-  "isExtendable": { "value": true, "source": "You may be able to extend your stay if you have permission to be in the UK for less than 6 months. You can extend your stay up to a total of 6 months." },
+  "isExtendable": {
+    "value": true,
+    "source": "You may be able to extend your stay if you have permission to be in the UK for less than 6 months. You can extend your stay up to a total of 6 months."
+  },
   "eligibility": {
     "themes": [
-      { "theme": "will leave the UK at the end of the visit", "anyOf": ["leave the uk", "leave at the end", "end of your visit", "end of the visit", "return home", "depart"], "source": "you’ll leave the UK at the end of your visit" },
-      { "theme": "can support yourself during the trip", "anyOf": ["support yourself", "support themselves", "funds", "funding", "enough money", "sufficient money", "financially"], "source": "you’re able to support yourself and your dependants during your trip (or have funding from someone else to support you)" },
-      { "theme": "can pay for the return or onward journey", "anyOf": ["return or onward", "return journey", "onward journey", "return travel", "return trip"], "source": "you’re able to pay for your return or onward journey (or have funding from someone else to pay for the journey)" },
-      { "theme": "valid passport or travel document", "anyOf": ["passport", "travel document"], "source": "You must have a passport or travel document to enter the UK. It should be valid for the whole of your stay." },
-      { "theme": "will not live in the UK through frequent or successive visits", "anyOf": ["frequent", "successive", "main home", "extended periods", "live in the uk"], "source": "you’ll not live in the UK for extended periods through frequent or successive visits, or make the UK your main home" }
+      {
+        "theme": "will leave the UK at the end of the visit",
+        "anyOf": [
+          "leave the uk",
+          "leave at the end",
+          "end of your visit",
+          "end of the visit",
+          "return home",
+          "intend to leave"
+        ],
+        "source": "you’ll leave the UK at the end of your visit"
+      },
+      {
+        "theme": "can support yourself during the trip",
+        "anyOf": [
+          "support yourself",
+          "support themselves",
+          "enough money",
+          "sufficient money",
+          "sufficient funds",
+          "funds to support",
+          "financially support"
+        ],
+        "source": "you’re able to support yourself and your dependants during your trip (or have funding from someone else to support you)"
+      },
+      {
+        "theme": "can pay for the return or onward journey",
+        "anyOf": [
+          "return or onward",
+          "return journey",
+          "onward journey",
+          "return travel",
+          "return trip"
+        ],
+        "source": "you’re able to pay for your return or onward journey (or have funding from someone else to pay for the journey)"
+      },
+      {
+        "theme": "valid passport or travel document",
+        "anyOf": [
+          "passport",
+          "travel document"
+        ],
+        "source": "You must have a passport or travel document to enter the UK. It should be valid for the whole of your stay."
+      },
+      {
+        "theme": "will not live in the UK through frequent or successive visits",
+        "anyOf": [
+          "frequent or successive",
+          "successive visits",
+          "frequent visits",
+          "main home",
+          "extended periods"
+        ],
+        "source": "you’ll not live in the UK for extended periods through frequent or successive visits, or make the UK your main home"
+      }
     ]
   },
-  "applicationUrlHost": { "value": "visas-immigration.service.gov.uk", "source": "https://visas-immigration.service.gov.uk/apply-visa-type/visit" },
+  "applicationUrlHost": {
+    "value": "visas-immigration.service.gov.uk",
+    "source": "https://visas-immigration.service.gov.uk/apply-visa-type/visit"
+  },
   "feeComponents": {
     "components": [
-      { "kind": "application", "amount": 135, "currency": "GBP", "per": "application", "source": "A Standard Visitor visa costs £135 for up to 6 months." }
+      {
+        "kind": "application",
+        "amount": 135,
+        "currency": "GBP",
+        "per": "application",
+        "source": "A Standard Visitor visa costs £135 for up to 6 months."
+      }
     ]
   }
 }
