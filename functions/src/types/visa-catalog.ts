@@ -80,6 +80,10 @@ export interface VisaSource {
   // refreshed on every re-seed. A page whose URL the adapter can't handle
   // falls back to generic-html (see pickSourceAdapter).
   adapter?: SourceAdapterId;
+  // Official host patterns ("www.gov.uk", "*.service.gov.uk") — issue #74.
+  // Registry-owned: set from VISA_SOURCE_OFFICIAL_HOSTS on every re-seed.
+  // Gates the extractor's `applicationUrl`; absent → code fallback / none.
+  officialHosts?: string[];
 
   // Scheduling — weekly by default (168h). Staggered via nextCrawlAt.
   crawlIntervalHours: number;

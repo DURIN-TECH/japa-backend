@@ -7,6 +7,8 @@ import type {
 import { VisaCategory } from "../types";
 // Static ISO 4217 allow-list (no network) for fee component currencies.
 import { isIso4217 } from "./visa-catalog-fx";
+// Registry official-host matching for `applicationUrl` (issue #74).
+import { officialHttpsUrl } from "./visa-catalog-official-hosts";
 
 // ============================================
 // VISA CATALOG — EXTRACT SERVICE (Step 3)
@@ -85,6 +87,10 @@ export interface ExtractContext {
   url: string;
   countryName: string;
   routeName: string; // the label from the source registry, e.g. "Skilled Worker visa"
+  // The country's registry `officialHosts` patterns (issue #74). When given
+  // (non-empty), `applicationUrl` is kept only on these hosts; absent/empty →
+  // only the http(s) check (countries without a registered host list).
+  officialHosts?: readonly string[];
 }
 
 // The provider-agnostic contract. Any model backend implements this.
@@ -95,8 +101,41 @@ export interface LlmExtractor {
 
 // ----- Validation (dependency-free) -----
 
+/** Options for `validateExtractedVisa`. */
+export interface ValidateOptions {
+  // Registry official host patterns (see visa-catalog-official-hosts.ts).
+  officialHosts?: readonly string[];
+}
+
+/**
+ * Keep `applicationUrl` only when it is safe to show users (issue #74):
+ *  - with an official host list: an https URL whose host matches it (exact, or
+ *    a strict subdomain of a `*.` pattern on a label boundary — so
+ *    "evilservice.gov.uk.attacker.com" and "www.gov.uk@evil.com" are dropped);
+ *  - without one (country not registered yet): any parseable http(s) URL, as
+ *    before; other schemes (javascript:, data:) are dropped.
+ * A dropped URL is a SOFT failure (field omitted, rest of the extraction kept):
+ * a bad link must not throw away a whole visa.
+ */
+export function sanitizeApplicationUrl(
+  raw: unknown,
+  officialHosts: readonly string[] | undefined
+): string | undefined {
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  const value = raw.trim();
+  if (officialHosts && officialHosts.length > 0) {
+    return officialHttpsUrl(value, officialHosts) ? value : undefined;
+  }
+  try {
+    const { protocol } = new URL(value);
+    return protocol === "https:" || protocol === "http:" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Narrow unknown → ExtractedVisa, or throw with the first problem found. */
-export function validateExtractedVisa(raw: unknown): ExtractedVisa {
+export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {}): ExtractedVisa {
   const errors: string[] = [];
   const o = (raw ?? {}) as Record<string, unknown>;
 
@@ -172,7 +211,8 @@ export function validateExtractedVisa(raw: unknown): ExtractedVisa {
 
   const maxExtensions =
     typeof o.maxExtensions === "number" ? o.maxExtensions : undefined;
-  const applicationUrl = typeof o.applicationUrl === "string" ? o.applicationUrl : undefined;
+  // Official-host check (issue #74): off-registry / unsafe URLs are dropped.
+  const applicationUrl = sanitizeApplicationUrl(o.applicationUrl, options.officialHosts);
   const applicationInstructions =
     typeof o.applicationInstructions === "string" ? o.applicationInstructions : undefined;
 
@@ -464,7 +504,8 @@ export class DeepSeekExtractor implements LlmExtractor {
     }
 
     // Validate before handing off — never let an invalid shape past this line.
-    return validateExtractedVisa(parsed);
+    // `officialHosts` (registry) gates `applicationUrl` (issue #74).
+    return validateExtractedVisa(parsed, { officialHosts: context.officialHosts });
   }
 }
 

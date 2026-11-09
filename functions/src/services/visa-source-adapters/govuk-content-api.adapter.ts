@@ -1,5 +1,6 @@
 import type { VisaSourcePage } from "../../types/visa-catalog";
 import { htmlFragmentToText, type VisaCatalogFetchService } from "../visa-catalog-fetch.service";
+import { officialHostsFor, officialHttpsUrl } from "../visa-catalog-official-hosts";
 import { capText, effectiveSectionPatterns, formatSections, selectSections } from "./sections";
 import type { SourceAdapter, SourceDocument, SourceSection } from "./types";
 
@@ -36,6 +37,33 @@ const GOVUK_HOST = "www.gov.uk";
 
 /** Content API base: `${GOVUK_CONTENT_API}${pathname}`. */
 const GOVUK_CONTENT_API = "https://www.gov.uk/api/content";
+
+/** Base for resolving relative hrefs in part bodies ("/apply" → www.gov.uk). */
+const GOVUK_BASE_URL = `https://${GOVUK_HOST}`;
+
+/**
+ * Official host patterns for GB, from the registry map (issue #74). This
+ * adapter only serves www.gov.uk, so it is always the GB entry.
+ */
+const GB_OFFICIAL_HOSTS = officialHostsFor("GB");
+
+/**
+ * Link filter for guide part bodies (issue #74): returns the URL to print as
+ * `text (url)` when the link points at an official APPLY service, else
+ * undefined (link stays plain text, as before).
+ *
+ * "Apply service" = an https URL on a GB official host OTHER than www.gov.uk
+ * itself — i.e. `*.service.gov.uk` / `*.homeoffice.gov.uk`. www.gov.uk links
+ * are guidance pages (dozens per guide); printing them would bloat the text
+ * and tempt the model to pick a guidance page as `applicationUrl`. Relative
+ * hrefs resolve to www.gov.uk, so they are never printed. Third-party links
+ * (ecctis, coe.int…) are never printed either.
+ */
+export function govukApplyLinkUrl(absoluteUrl: string): string | undefined {
+  const url = officialHttpsUrl(absoluteUrl, GB_OFFICIAL_HOSTS);
+  if (!url || url.hostname.toLowerCase() === GOVUK_HOST) return undefined;
+  return url.toString();
+}
 
 /** Only this schema carries `details.parts[]`. */
 const GUIDE_SCHEMA = "guide";
@@ -92,8 +120,13 @@ function toSections(parts: unknown): SourceSection[] {
       slug: (p.slug as string).trim(),
       // Fall back to the slug if a part has no title (never seen, but safe).
       title: typeof p.title === "string" && p.title.trim() ? p.title.trim() : (p.slug as string),
-      // HTML body → plain text with the SAME block-newline logic as pages.
-      text: typeof p.body === "string" ? htmlFragmentToText(p.body) : "",
+      // HTML body → plain text with the SAME block-newline logic as pages, plus
+      // apply-service links rendered as `text (url)` (#74). NOTE: this changes
+      // GB content hashes once, so GB pages re-extract on the next crawl.
+      text:
+        typeof p.body === "string"
+          ? htmlFragmentToText(p.body, { baseUrl: GOVUK_BASE_URL, renderLinkUrl: govukApplyLinkUrl })
+          : "",
     }));
 }
 

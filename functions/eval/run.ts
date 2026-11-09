@@ -9,6 +9,8 @@ import {
   type LlmExtractor,
 } from "../src/services/visa-catalog-extract.service";
 import { GovukContentApiAdapter } from "../src/services/visa-source-adapters";
+// Same official-host gate on `applicationUrl` as a GB crawl (issue #74).
+import { officialHostsFor } from "../src/services/visa-catalog-official-hosts";
 import type { ExtractedVisa, VisaSourcePage } from "../src/types/visa-catalog";
 import {
   EVAL_COUNTRY_NAME,
@@ -216,6 +218,8 @@ async function runRoute(route: EvalRoute, expected: ExpectedVisa, goldenDir: str
         url: page.url,
         countryName: EVAL_COUNTRY_NAME,
         routeName: page.routeName,
+        // GB registry official hosts, exactly as the crawl passes them (#74).
+        officialHosts: officialHostsFor("GB"),
       });
       return { ...base, ...provenance, extracted, score: scoreRoute(expected, extracted) };
     } catch (err) {
