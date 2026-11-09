@@ -67,6 +67,24 @@ export interface VisaSourcePage {
   lastError?: string;
 }
 
+// ----- Weekly night crawl window (issue #63) -----
+//
+// When a source may be crawled: once a week, on one LOCAL weekday, between two
+// LOCAL hours in the source's own IANA time zone (government sites are hit at
+// their quietest). The orchestrator ticks hourly at :15 UTC; every seeded
+// zone has a whole-hour UTC offset, so a tick is also at :15 local. With
+// startHour 2 / endHour 5 the ticks inside the window are 02:15 (first run),
+// 03:15 and 04:15 (catch-up tries). Pure helpers live in
+// services/visa-crawl-window.ts.
+export interface CrawlWindow {
+  timeZone: string; // IANA, e.g. "Europe/London"
+  dayOfWeek: number; // ISO 1 (Mon) .. 7 (Sun): the LOCAL weekday the window opens
+  startHour: number; // local hour, inclusive, 0-23
+  // Local hour, exclusive, startHour < endHour <= 24. No overnight wrap: a
+  // window always sits within one local day.
+  endHour: number;
+}
+
 // One registry entry per country. Holds the known official pages for that
 // country plus health/scheduling fields (mirrors the news `NewsSource`).
 export interface VisaSource {
@@ -81,8 +99,15 @@ export interface VisaSource {
   // falls back to generic-html (see pickSourceAdapter).
   adapter?: SourceAdapterId;
 
-  // Scheduling — weekly by default (168h). Staggered via nextCrawlAt.
+  // Scheduling. A source WITH a `crawlWindow` is crawled once a week inside
+  // that local night window (issue #63) and `nextCrawlAt` is set to the
+  // window's next opening after each run. `crawlIntervalHours` (168 = weekly)
+  // is used ONLY by a source without a window (legacy behaviour:
+  // `nextCrawlAt = now + crawlIntervalHours`, no window filter).
   crawlIntervalHours: number;
+  // Registry-owned: set from VISA_SOURCE_WINDOWS in seed-visa-sources.ts and
+  // refreshed on every re-seed (NOT crawl state). Absent = legacy interval.
+  crawlWindow?: CrawlWindow;
   lastCrawledAt?: Timestamp;
   nextCrawlAt?: Timestamp;
 
