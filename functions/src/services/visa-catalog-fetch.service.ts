@@ -1,6 +1,9 @@
 import axios, { AxiosInstance } from "axios";
 import * as cheerio from "cheerio";
 import { createHash } from "crypto";
+// Host backoff (issue #64): 429/503 detection + Retry-After parsing live in a
+// small pure helper so #15 (Firestore-backed host state) can reuse them.
+import { HostBackoffError, backoffDelayMs, isBackoffStatus } from "./visa-crawl-host-state";
 
 // ============================================
 // VISA CATALOG — FETCH SERVICE (Step 2)
@@ -11,6 +14,28 @@ import { createHash } from "crypto";
 // page URL, fetch it politely, strip boilerplate down to readable content text,
 // and hash that text so the extractor only ever runs on pages that actually
 // changed. No LLM here — this layer is cheap and fully verifiable.
+//
+// ---- Crawler etiquette & blocking policy (issue #64) ----
+//
+// Seli's crawler is honest and identifiable: every request carries
+// VISA_CATALOG_USER_AGENT, whose URL (https://weareseli.com/bot) explains
+// what we fetch, how often, and how to ask us to stop. On top of that:
+//
+//  - robots.txt is respected (isAllowedByRobots, fail-open if unreadable);
+//  - requests to one host are spaced by PER_HOST_MIN_INTERVAL_MS;
+//  - a 429 or 503 from a host (on a page, an API call OR robots.txt) throws a
+//    HostBackoffError carrying the host's `Retry-After` (seconds or HTTP-date,
+//    clamped; a default when absent). The crawl then stops requesting that
+//    host for the rest of the run, records the retry-after time so the next
+//    scheduled run does not hit it earlier, and counts the run as a failure
+//    toward the source's auto-pause (see visa-catalog-crawl.service.ts).
+//
+// We NEVER rotate IP addresses, use proxies / residential IP pools, spoof
+// or rotate the User-Agent, or otherwise disguise the crawler to get around a
+// block, a rate limit or a robots.txt rule. A host that blocks or throttles us
+// is handled by backing off and, if it persists, by contacting the site owner
+// (and pausing the source) — never by evading it. Do not add any such
+// mechanism here or in an adapter.
 
 // Elements that are chrome/boilerplate, not visa content — removed before we
 // read text so the extractor sees signal, not nav bars and cookie banners.
@@ -81,6 +106,9 @@ export interface VisaCatalogFetchServiceOptions {
   // Per-host politeness gap in ms. Default PER_HOST_MIN_INTERVAL_MS (1.5s);
   // tests lower it so they don't sleep.
   minIntervalMs?: number;
+  // Clock (epoch ms) used to turn `Retry-After` into an instant (issue #64).
+  // Default Date.now; tests inject a fixed clock so HTTP-dates are exact.
+  clock?: () => number;
 }
 
 /** Raw HTTP response handed to adapters by `getRaw()`. */
@@ -156,10 +184,32 @@ export class VisaCatalogFetchService {
   private readonly lastRequestByHost = new Map<string, number>();
   // Cached robots.txt disallow rules per host (null = fetch failed / none).
   private readonly robotsCache = new Map<string, string[] | null>();
+  // Clock for Retry-After maths (see options.clock).
+  private readonly clock: () => number;
 
   constructor(options: VisaCatalogFetchServiceOptions = {}) {
     this.minIntervalMs = options.minIntervalMs ?? PER_HOST_MIN_INTERVAL_MS;
     this.http = options.http ?? VisaCatalogFetchService.createDefaultClient();
+    this.clock = options.clock ?? Date.now;
+  }
+
+  /**
+   * Back off on 429/503 (issue #64): if `status` asks us to slow down, throw a
+   * HostBackoffError for `host` whose `untilMs` comes from the response's
+   * `Retry-After` header (delta-seconds or HTTP-date, clamped to
+   * MAX_BACKOFF_MS; DEFAULT_BACKOFF_MS when missing/garbage). Every request
+   * path (pages, getRaw for adapters, robots.txt) calls this right after the
+   * response arrives, so no caller can accidentally treat a throttle as an
+   * ordinary error and keep hammering the host. Other statuses return.
+   */
+  private assertNotThrottled(host: string, status: number, headers: unknown): void {
+    if (!isBackoffStatus(status)) return;
+    // Header lookup: axios lowercases header names; tolerate plain objects
+    // (test stubs) that use the canonical casing.
+    const hdrs = (headers ?? {}) as Record<string, unknown>;
+    const retryAfter = hdrs["retry-after"] ?? hdrs["Retry-After"];
+    const now = this.clock();
+    throw new HostBackoffError({ host, status, untilMs: now + backoffDelayMs(retryAfter, now) });
   }
 
   /** Production axios client (the shape used before adapters existed). */
@@ -210,7 +260,10 @@ export class VisaCatalogFetchService {
    * Best-effort robots.txt check for our user-agent. Fetches (and caches) the
    * host's robots.txt and returns false if any `Disallow` rule (under `*` or our
    * agent) prefixes the target path. Fail-open: if robots.txt can't be read we
-   * proceed, which is the conventional crawler behaviour.
+   * proceed, which is the conventional crawler behaviour — EXCEPT a 429/503 on
+   * robots.txt, which throws HostBackoffError (issue #64): a host that is
+   * throttling us must not then get the page request too. Nothing is cached
+   * in that case, so a later run re-reads robots.txt.
    */
   async isAllowedByRobots(url: string): Promise<boolean> {
     const host = this.hostOf(url);
@@ -218,6 +271,7 @@ export class VisaCatalogFetchService {
 
     let disallows = this.robotsCache.get(host);
     if (disallows === undefined) {
+      // May throw HostBackoffError (429/503 on robots.txt) — left uncached.
       disallows = await this.loadRobots(url);
       this.robotsCache.set(host, disallows);
     }
@@ -244,6 +298,8 @@ export class VisaCatalogFetchService {
       const host = this.hostOf(url);
       await this.rateLimit(host);
       const resp = await this.http.get(`${origin}/robots.txt`, { responseType: "text" });
+      // 429/503 -> HostBackoffError, rethrown by the catch below (NOT fail-open).
+      this.assertNotThrottled(host, resp.status, resp.headers);
       if (resp.status >= 400 || typeof resp.data !== "string") return null;
 
       const disallows: string[] = [];
@@ -263,7 +319,10 @@ export class VisaCatalogFetchService {
         }
       }
       return disallows;
-    } catch {
+    } catch (err) {
+      // A throttle is not "robots unreadable": propagate it so the crawl
+      // backs off instead of going on to request the page.
+      if (err instanceof HostBackoffError) throw err;
       return null; // fail-open
     }
   }
@@ -273,8 +332,10 @@ export class VisaCatalogFetchService {
    * response (e.g. the GOV.UK Content API adapter). Waits out the per-host gap
    * first, sends our UA (client default) plus any extra `headers` (such as
    * `Accept: application/json`), and returns status/body/final URL WITHOUT
-   * throwing on non-2xx — the adapter decides what is an error. Robots is NOT
-   * checked here; call `isAllowedByRobots()` first (as fetchAndClean does).
+   * throwing on non-2xx — the adapter decides what is an error. The ONE
+   * exception is 429/503, which throws HostBackoffError (issue #64) so every
+   * adapter backs off the same way. Robots is NOT checked here; call
+   * `isAllowedByRobots()` first (as fetchAndClean does).
    *
    * Keeping this the only way adapters reach the network means the rate limit,
    * robots cache and client live in one place (#15 can swap them here).
@@ -283,6 +344,8 @@ export class VisaCatalogFetchService {
     const host = this.hostOf(url);
     await this.rateLimit(host);
     const resp = await this.http.get(url, { responseType: "text", headers });
+    // 429/503 -> HostBackoffError (Retry-After honoured by the crawl).
+    this.assertNotThrottled(host, resp.status, resp.headers);
     const finalUrl = resp.request?.res?.responseUrl || url;
     const body = typeof resp.data === "string" ? resp.data : String(resp.data ?? "");
     // Header lookup is case-insensitive in axios; tolerate plain objects (stubs).
@@ -295,6 +358,7 @@ export class VisaCatalogFetchService {
    * Fetch one page's raw HTML (rate-limited, redirect-following). Returns the
    * HTML string + status + final URL. Non-HTML or error statuses are surfaced so
    * the caller can record source health rather than crashing the run.
+   * 429/503 throws HostBackoffError instead (issue #64).
    */
   private async fetchHtml(
     url: string
@@ -302,6 +366,8 @@ export class VisaCatalogFetchService {
     const host = this.hostOf(url);
     await this.rateLimit(host);
     const resp = await this.http.get(url, { responseType: "text" });
+    // 429/503 -> HostBackoffError (Retry-After honoured by the crawl).
+    this.assertNotThrottled(host, resp.status, resp.headers);
     const finalUrl = resp.request?.res?.responseUrl || url;
     const html = typeof resp.data === "string" ? resp.data : String(resp.data ?? "");
     return { html, status: resp.status, finalUrl };
@@ -342,7 +408,8 @@ export class VisaCatalogFetchService {
   /**
    * The one call the orchestrator uses: fetch a URL, clean it, and hash it.
    * Throws on network failure or a non-2xx status (so the caller records a
-   * source failure); returns the cleaned + hashed page on success.
+   * source failure) — a HostBackoffError for 429/503, from robots.txt or the
+   * page itself; returns the cleaned + hashed page on success.
    */
   async fetchAndClean(url: string, options?: { checkRobots?: boolean }): Promise<FetchedPage> {
     if (options?.checkRobots) {
