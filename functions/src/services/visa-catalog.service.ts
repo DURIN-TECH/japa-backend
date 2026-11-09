@@ -2,6 +2,8 @@ import { collections, subcollections, serverTimestamp } from "../utils/firebase"
 import { Timestamp } from "firebase-admin/firestore";
 import { VisaType } from "../types";
 import { ExtractedVisa, VisaScrapeMeta } from "../types/visa-catalog";
+// Pure id/code rules live in a Firebase-free module so they are unit-testable.
+import { deriveVisaId, resolveVisaCode } from "./visa-catalog-ids";
 
 // ============================================
 // VISA CATALOG SERVICE (ingest into review queue)
@@ -21,17 +23,19 @@ import { ExtractedVisa, VisaScrapeMeta } from "../types/visa-catalog";
 // The result of ingesting one extraction.
 export type IngestOutcome = "created" | "updated" | "unchanged" | "skipped";
 
-// Fields the extractor produces that map onto VisaType.
+// Fields the extractor produces that map onto VisaType. `code` is the already
+// resolved code (registry-pinned `visaCode` if any, else the extracted one).
 function extractedToFields(
   countryCode: string,
   visaId: string,
+  code: string,
   e: ExtractedVisa
 ): Partial<VisaType> {
   return {
     id: visaId,
     countryCode,
     name: e.name,
-    code: e.code,
+    code,
     description: e.description,
     category: e.category,
     processingTime: e.processingTime,
@@ -47,19 +51,19 @@ function extractedToFields(
   };
 }
 
-// Deterministic id part so re-crawling the same visa maps to the same doc.
-function slug(input: string): string {
-  return input
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 40);
-}
-
 class VisaCatalogService {
-  /** Deterministic visa doc id: `${countryCode}_${slug(code||name)}`. */
-  buildVisaId(countryCode: string, extracted: ExtractedVisa): string {
-    return `${countryCode}_${slug(extracted.code || extracted.name)}`;
+  /**
+   * Deterministic visa doc id for a crawled page — owned by the source
+   * registry, never by the LLM output:
+   *  - the page's pinned `visaId` verbatim when set, else
+   *  - `${countryCode.toLowerCase()}-${slug(full url path)}` (hash-suffixed
+   *    when over-long; see deriveVisaId in visa-catalog-ids.ts).
+   * Throws on an unparseable URL / empty path (the crawl loop records it as a
+   * page error). Replaces the old `${CC}_${slug(code||name)}` scheme, which let
+   * extraction drift fork one visa into several `GB_*` docs.
+   */
+  buildVisaId(countryCode: string, sourceUrl: string, pinned?: { visaId?: string }): string {
+    return deriveVisaId({ countryCode, sourceUrl, visaId: pinned?.visaId });
   }
 
   /**
@@ -73,6 +77,10 @@ class VisaCatalogService {
    *    clobber curated/live data. (Proposing edits to already-live visas is a
    *    deliberate future enhancement; see the spike doc.)
    *  - Same content hash as last time: unchanged, no write.
+   *
+   * Identity: the doc id comes from the registry page (`visaId` pin or URL
+   * path — see buildVisaId), and a pinned `visaCode` overrides the extracted
+   * code. Callers pass the page's `visaId` / `visaCode` straight through.
    */
   async ingestExtraction(params: {
     countryCode: string;
@@ -81,9 +89,15 @@ class VisaCatalogService {
     contentHash: string;
     extracted: ExtractedVisa;
     model: string;
+    // Registry-pinned identity from the VisaSourcePage (both optional).
+    visaId?: string;
+    visaCode?: string;
   }): Promise<{ visaId: string; outcome: IngestOutcome }> {
     const { countryCode, sourceUrl, routeName, contentHash, extracted, model } = params;
-    const visaId = this.buildVisaId(countryCode, extracted);
+    // Id from the registry (pin or URL path), never from extracted.code/name.
+    const visaId = this.buildVisaId(countryCode, sourceUrl, { visaId: params.visaId });
+    // Pinned code wins over the extracted one (aligns with seeded equivalents).
+    const code = resolveVisaCode(params.visaCode, extracted.code);
     const ref = subcollections.visaTypes(countryCode).doc(visaId);
     const now = Timestamp.now();
 
@@ -96,7 +110,7 @@ class VisaCatalogService {
       contentHash,
       extractedAt: now,
     };
-    const fields = extractedToFields(countryCode, visaId, extracted);
+    const fields = extractedToFields(countryCode, visaId, code, extracted);
 
     const snap = await ref.get();
     if (!snap.exists) {

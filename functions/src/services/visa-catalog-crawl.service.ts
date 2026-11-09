@@ -116,6 +116,9 @@ class VisaCatalogCrawlService {
             contentHash: fetched.contentHash,
             extracted,
             model: visaCatalogExtractor.model,
+            // Registry-owned identity: pinned doc id + code (if any).
+            visaId: page.visaId,
+            visaCode: page.visaCode,
           });
           if (outcome === "created") summary.created++;
           else if (outcome === "updated") summary.updated++;

@@ -20,6 +20,9 @@
  */
 import * as fs from "fs";
 import * as path from "path";
+// Type-only import: erased at compile time, so it doesn't trigger Firebase init
+// before the env below is set.
+import type { VisaSource } from "../types/visa-catalog";
 
 // ---- CLI args ----
 function parseArgs(argv: string[]) {
@@ -80,8 +83,6 @@ async function main() {
   const { visaCatalogFetchService } = await import("../services/visa-catalog-fetch.service");
   const { visaCatalogExtractor } = await import("../services/visa-catalog-extract.service");
   const { visaCatalogService } = await import("../services/visa-catalog.service");
-  const { VisaSource } = { VisaSource: null }; // (type only; not needed at runtime)
-  void VisaSource;
 
   // Pick sources: one country, or all.
   const sourcesSnap = args.country
@@ -96,11 +97,9 @@ async function main() {
   const totals = { fetched: 0, created: 0, updated: 0, unchanged: 0, skipped: 0, errors: 0 };
 
   for (const doc of sourcesSnap.docs) {
-    const source = doc.data() as {
-      countryCode: string;
-      countryName: string;
-      pages: { url: string; routeName: string }[];
-    };
+    // Registry doc; pages are full VisaSourcePage objects so the pinned
+    // `visaId` / `visaCode` (registry-owned identity) reach ingestExtraction.
+    const source = doc.data() as Pick<VisaSource, "countryCode" | "countryName" | "pages">;
     // Filter pages by --visa name if provided.
     const pages = source.pages.filter(
       (p) => !args.visa || p.routeName.toLowerCase().includes(args.visa)
@@ -124,6 +123,9 @@ async function main() {
           contentHash: fetched.contentHash,
           extracted,
           model: visaCatalogExtractor.model,
+          // Registry-owned identity: pinned doc id + code (if any).
+          visaId: page.visaId,
+          visaCode: page.visaCode,
         });
         totals[outcome]++;
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
