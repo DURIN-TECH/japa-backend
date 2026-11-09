@@ -89,7 +89,7 @@ Today the prompt says `baseCostUsd (number; convert local fees to USD)`. That as
 exchange rate, which is a hallucination risk on the field users care about most. It also explains the seed:
 `uk-skilled-worker.baseCostUsd = 719` matches the old **£719** fee, so the seed most likely stored GBP in a
 USD field. **Change:** the LLM returns `{feeAmount, feeCurrency}` exactly as printed (with a citation). Code
-converts to `baseCostUsd` using a rate stored in `appConfig/fx` (refreshed by the same nightly job), and
+converts to `baseCostUsd` using a rate stored in `appConfig/fx` (refreshed by the weekly crawl run), and
 records the original in `scrapeMeta.fee`. The validator rejects a fee with no citation.
 
 ### 2.4 A complete scraped UK record (illustrative values)
