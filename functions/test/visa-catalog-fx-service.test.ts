@@ -20,7 +20,7 @@
 
 import { test, describe, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 
 import type { VisaType } from "../src/types";
 import type { ExtractedFeeComponent, FxRatesDoc } from "../src/types/visa-catalog";
@@ -60,7 +60,9 @@ function applyUpdate(target: Data, update: Data): Data {
       if (typeof cur[p] !== "object" || cur[p] === null) cur[p] = {};
       cur = cur[p] as Data;
     }
-    cur[parts[parts.length - 1]] = value;
+    // FieldValue.delete() sentinel → remove the key, like Firestore.
+    if (value instanceof FieldValue && value.isEqual(FieldValue.delete())) delete cur[parts[parts.length - 1]];
+    else cur[parts[parts.length - 1]] = value;
   }
   return out;
 }
@@ -116,11 +118,15 @@ const SW: ExtractedFeeComponent[] = [
   { kind: "application", label: "Application fee", amount: 1000, currency: "GBP", per: "application" },
   { kind: "surcharge", label: "Immigration Health Surcharge", amount: 1000, currency: "GBP", per: "year", years: 3 },
 ];
+// These tests run on the REAL clock (the services call Timestamp.now()), so
+// every rate date is relative to today — fixed dates would go stale after
+// FX_MAX_RATE_DATE_AGE_DAYS and break the suite.
+const isoDaysAgo = (d: number) => new Date(Date.now() - d * DAY_MS).toISOString().slice(0, 10);
 const oldFx = (): FxRatesDoc => ({
   base: "USD",
   rates: { GBP: 0.8 },
   fetchedAt: Timestamp.fromMillis(Date.now() - 8 * DAY_MS),
-  rateDate: "2026-10-30",
+  rateDate: isoDaysAgo(10),
   source: FX_SOURCE_ECB,
 });
 
@@ -191,7 +197,7 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
     const summary = await crawl.runOrchestrator({
       fetchFxRates: async () => {
         fetches++;
-        return { rates: { GBP: 0.8 }, rateDate: "2026-11-06" };
+        return { rates: { GBP: 0.8 }, rateDate: isoDaysAgo(3) };
       },
     });
 
@@ -202,7 +208,7 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
 
     const fx = store.get("appConfig/fx")!;
     assert.equal(fx.base, "USD");
-    assert.equal(fx.rateDate, "2026-11-06");
+    assert.equal(fx.rateDate, isoDaysAgo(3));
     assert.equal(fx.source, FX_SOURCE_ECB);
     assert.ok(fx.fetchedAt instanceof Timestamp);
 
@@ -211,7 +217,7 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
     assert.equal(after.baseCostUsd, 5000);
     assert.equal(fee.fxStale, undefined);
     assert.equal(fee.fxMissing, undefined);
-    assert.equal(fee.fxDate, "2026-11-06");
+    assert.equal(fee.fxDate, isoDaysAgo(3));
     assert.equal((after.scrapeMeta as any).contentHash, "page-hash-1"); // untouched
 
     assert.equal(store.get("countries/GB/visaTypes/gb-approved")!.baseCostUsd, 1);
@@ -244,7 +250,7 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
 
 describe("ingestExtraction — stale rate on an existing pending doc", () => {
   test("fee flagged fxStale, old USD provenance gone, baseCostUsd unchanged", async () => {
-    const fresh = { ...oldFx(), fetchedAt: Timestamp.now() };
+    const fresh = { ...oldFx(), fetchedAt: Timestamp.now(), rateDate: isoDaysAgo(1) };
     const path = "countries/GB/visaTypes/gb-skilled-worker-visa";
     store.set(path, scrapedVisa(fresh)); // converted: baseCostUsd 5000, totalUsd, fxSource
     const svc = (await import("../src/services/visa-catalog.service")).visaCatalogService;
@@ -274,6 +280,68 @@ describe("ingestExtraction — stale rate on an existing pending doc", () => {
     assert.equal(doc.baseCostUsd, 5000); // unchanged, not overwritten, not 0
     assert.equal(doc.reviewStatus, "pending_review");
     assert.equal(doc.isActive, false);
+  });
+
+  // Review blocker: a converted pending doc whose page now yields NO fee must
+  // not keep (and be approvable with) its old cost.
+  test("converted doc re-ingested with feeComponents [] → cost deleted, noPublishedFee, not approvable", async () => {
+    const fresh = { ...oldFx(), fetchedAt: Timestamp.now(), rateDate: isoDaysAgo(0) };
+    const path = "countries/GB/visaTypes/gb-skilled-worker-visa";
+    store.set(path, scrapedVisa(fresh)); // baseCostUsd 5000
+    assert.equal(store.get(path)!.baseCostUsd, 5000);
+    const svc = (await import("../src/services/visa-catalog.service")).visaCatalogService;
+    await svc.ingestExtraction({
+      countryCode: "GB",
+      sourceUrl: "https://www.gov.uk/skilled-worker-visa",
+      routeName: "Skilled Worker visa",
+      contentHash: "page-hash-3",
+      extracted: {
+        name: "Skilled Worker visa", code: "SW", description: "d", category: "work",
+        processingTime: "3 weeks", processingDaysMin: 15, processingDaysMax: 21,
+        feeComponents: [], validityPeriod: "5 years", isExtendable: true,
+        eligibilityCriteria: ["x"], confidence: 0.9, citations: {},
+      },
+      model: "stub",
+      visaId: "gb-skilled-worker-visa",
+      fx: fresh,
+    });
+    const doc = store.get(path)!;
+    assert.equal("baseCostUsd" in doc, false); // deleted, not left at 5000
+    assert.equal((doc.scrapeMeta as any).fee.noPublishedFee, true);
+    await assert.rejects(
+      visaSvc.updateVisaReviewStatus("GB", "gb-skilled-worker-visa", "approve", "admin-1"),
+      VisaFeeNotConvertibleError
+    );
+  });
+
+  test("dropped surcharge (unverified) on re-ingest → cost deleted, feeUnverified, not approvable", async () => {
+    const fresh = { ...oldFx(), fetchedAt: Timestamp.now(), rateDate: isoDaysAgo(0) };
+    const path = "countries/GB/visaTypes/gb-student-visa";
+    store.set(path, scrapedVisa(fresh));
+    const svc = (await import("../src/services/visa-catalog.service")).visaCatalogService;
+    await svc.ingestExtraction({
+      countryCode: "GB",
+      sourceUrl: "https://www.gov.uk/student-visa",
+      routeName: "Student visa",
+      contentHash: "page-hash-4",
+      extracted: {
+        name: "Student visa", code: "ST", description: "d", category: "student",
+        processingTime: "3 weeks", processingDaysMin: 15, processingDaysMax: 21,
+        feeComponents: [SW[0]], validityPeriod: "course", isExtendable: true,
+        eligibilityCriteria: ["x"], confidence: 0.9, citations: { "fee.application": "a" },
+        feeUnverifiedReasons: ["dropped surcharge \"IHS\": citations[\"fee.years\"] must quote a visa length/duration"],
+      },
+      model: "stub",
+      visaId: "gb-student-visa",
+      fx: fresh,
+    });
+    const doc = store.get(path)!;
+    assert.equal("baseCostUsd" in doc, false);
+    assert.equal((doc.scrapeMeta as any).fee.feeUnverified, true);
+    await assert.rejects(
+      visaSvc.updateVisaReviewStatus("GB", "gb-student-visa", "approve", "admin-1"),
+      (e: unknown) => e instanceof VisaFeeNotConvertibleError && e.message === FEE_NOT_CONVERTED_MESSAGE
+    );
   });
 
   test("new doc with no rate: baseCostUsd absent", async () => {
@@ -317,7 +385,7 @@ describe("visaService.updateVisaReviewStatus — approval guard", () => {
   });
 
   test("approving a normally converted scraped visa works", async () => {
-    const fresh = { ...oldFx(), fetchedAt: Timestamp.now() };
+    const fresh = { ...oldFx(), fetchedAt: Timestamp.now(), rateDate: isoDaysAgo(1) };
     store.set("countries/GB/visaTypes/gb-ok", scrapedVisa(fresh));
     const v: VisaType = await visaSvc.updateVisaReviewStatus("GB", "gb-ok", "approve", "admin-1");
     assert.equal(v.reviewStatus, "approved");

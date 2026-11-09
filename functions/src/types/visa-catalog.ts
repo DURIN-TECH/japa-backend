@@ -198,6 +198,14 @@ export interface VisaFeeMeta {
   // means `baseCostUsd` was NOT written and approval is blocked.
   fxStale?: boolean;
   fxMissing?: boolean;
+  // The page states no fee (feeComponents was []). No `baseCostUsd`; an
+  // existing doc's old cost is deleted on ingest. Approval is blocked.
+  noPublishedFee?: boolean;
+  // Part of the fee could not be verified: a per-year surcharge whose years /
+  // length citation failed validation was DROPPED (the rest kept), or a
+  // component is implausibly large. No `baseCostUsd`; approval is blocked.
+  feeUnverified?: boolean;
+  feeUnverifiedReason?: string;
 }
 
 // ----- Stored exchange rates (`appConfig/fx`) -----
@@ -231,6 +239,9 @@ export interface ExtractedVisa {
   // `baseCostUsd`: code computes the total and converts it to USD.
   // [] = the page states no fee; a free visa = one application component of 0.
   feeComponents: ExtractedFeeComponent[];
+  // Set by the validator when it dropped a per-year surcharge whose years /
+  // length citation failed the checks (absent when nothing was dropped).
+  feeUnverifiedReasons?: string[];
   validityPeriod: string;
   isExtendable: boolean;
   maxExtensions?: number;

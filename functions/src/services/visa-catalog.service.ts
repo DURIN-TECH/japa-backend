@@ -1,5 +1,5 @@
 import { collections, subcollections, serverTimestamp } from "../utils/firebase";
-import { Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { VisaType } from "../types";
 import { ExtractedVisa, FxRatesDoc } from "../types/visa-catalog";
 // Pure id/code rules live in a Firebase-free module so they are unit-testable.
@@ -19,6 +19,7 @@ import {
   FxStore,
   computeFee,
   fetchFrankfurterRates,
+  isFeeFxFlagged,
   isFxFresh,
   planFeeReconvert,
   refreshFxRates,
@@ -130,7 +131,9 @@ class VisaCatalogService {
     // NOTE: the content-hash gate below runs on the PAGE text, so a rate
     // change alone never re-stages a visa; flagged fees are instead
     // re-converted from their stored components by reconvertFlaggedFees().
-    const { baseCostUsd, feeMeta } = computeFee(extracted.feeComponents, params.fx, now);
+    const { baseCostUsd, feeMeta } = computeFee(extracted.feeComponents, params.fx, now, {
+      unverifiedReasons: extracted.feeUnverifiedReasons,
+    });
 
     // Provenance + audit trail (adapter fields merged in when given).
     const scrapeMeta = buildScrapeMeta({
@@ -176,7 +179,20 @@ class VisaCatalogService {
       // fxSource next to a new fxStale flag, or old citations). Other
       // top-level fields not in `fields` are kept — in particular an omitted
       // `baseCostUsd` (unconverted fee) stays UNCHANGED, as intended.
-      await ref.update({ ...fields, sourceUrl, scrapeMeta, updatedAt: now });
+      // Review fix: when the NEW extraction supports no cost for a reason other
+      // than FX (no published fee, or an unverified fee), DELETE the old
+      // `baseCostUsd` — it would otherwise stay next to a fee block that no
+      // longer supports it. (FX-flagged fees keep the old value unchanged, as
+      // specified; the approval guard blocks them by the flag.)
+      const deleteCost =
+        baseCostUsd === undefined && !isFeeFxFlagged(feeMeta) && (feeMeta.noPublishedFee || feeMeta.feeUnverified);
+      await ref.update({
+        ...fields,
+        ...(deleteCost ? { baseCostUsd: FieldValue.delete() } : {}),
+        sourceUrl,
+        scrapeMeta,
+        updatedAt: now,
+      });
       return { visaId, outcome: "updated" };
     }
     return { visaId, outcome: "skipped" };

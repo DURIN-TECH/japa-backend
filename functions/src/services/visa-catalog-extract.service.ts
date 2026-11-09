@@ -53,6 +53,12 @@ export const EXTRACTOR_PROMPT_VERSION = "2026-11-fee-length-v3";
 const DURATION_RE =
   /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)[\s-]*(years?|months?)\b/i;
 
+// Upper bound for `years` on a per-year component (no standard visa length
+// is longer; a bigger value is a mis-read). The amount plausibility cap is
+// applied in USD by computeFee (MAX_FEE_COMPONENT_USD), because a cap in the
+// source currency would reject legitimate IDR / VND / COP fees.
+export const MAX_FEE_YEARS = 10;
+
 // Allowed fee component enums (mirrored from the types for validation).
 const FEE_KINDS: FeeComponentKind[] = ["application", "surcharge"];
 const FEE_PERS: FeeComponentPer[] = ["application", "year"];
@@ -144,7 +150,11 @@ export function validateExtractedVisa(raw: unknown): ExtractedVisa {
   }
 
   // ---- Fee components (issue #59): as published, validated per component ----
-  const feeComponents = validateFeeComponents(o.feeComponents, citations, errors);
+  const { components: feeComponents, unverifiedReasons } = validateFeeComponents(
+    o.feeComponents,
+    citations,
+    errors
+  );
 
   // ---- Range / sanity checks (defence against nonsense values) ----
   if (Number.isFinite(processingDaysMin) && Number.isFinite(processingDaysMax)) {
@@ -181,6 +191,8 @@ export function validateExtractedVisa(raw: unknown): ExtractedVisa {
     applicationInstructions,
     confidence,
     citations,
+    // Only present when a surcharge was dropped (never an empty array/undefined key).
+    ...(unverifiedReasons.length > 0 ? { feeUnverifiedReasons: unverifiedReasons } : {}),
   };
 }
 
@@ -201,10 +213,12 @@ function validateFeeComponents(
   raw: unknown,
   citations: Record<string, string>,
   errors: string[]
-): ExtractedFeeComponent[] {
+): { components: ExtractedFeeComponent[]; unverifiedReasons: string[] } {
+  // Why a per-year surcharge was dropped (soft failures, see below).
+  const unverifiedReasons: string[] = [];
   if (!Array.isArray(raw)) {
     errors.push("\"feeComponents\" must be an array (empty when the page states no fee)");
-    return [];
+    return { components: [], unverifiedReasons };
   }
   const out: ExtractedFeeComponent[] = [];
   // Per-kind / per-year ordinals drive the citation key suffixes.
@@ -242,31 +256,45 @@ function validateFeeComponents(
       errors.push(`${where}.per must be one of ${FEE_PERS.join(", ")}`);
       return;
     }
+    const label = typeof c.label === "string" && c.label.trim() ? c.label.trim() : kind;
     let years: number | undefined;
     if (per === "year") {
       yearCount++;
+      // Problems with `years` / its length citation. For a SURCHARGE these are
+      // soft: the component is dropped (rest of the extraction kept) and the
+      // fee is marked unverified, so one unprovable length (e.g. "the length
+      // of your course") doesn't throw away the whole visa. For a per-year
+      // APPLICATION fee they stay hard errors.
+      const yearProblems: string[] = [];
       const y = typeof c.years === "string" ? Number(c.years) : c.years;
-      if (typeof y !== "number" || !Number.isInteger(y) || y < 1) {
-        errors.push(`${where}.years must be an integer >= 1 when per is "year"`);
+      if (typeof y !== "number" || !Number.isInteger(y) || y < 1 || y > MAX_FEE_YEARS) {
+        yearProblems.push(`${where}.years must be an integer from 1 to ${MAX_FEE_YEARS} when per is "year"`);
       } else {
         years = y;
       }
       const yKey = feeYearsCitationKey(yearCount);
       if (!hasCitation(yKey)) {
-        errors.push(`${where} is per year but citations["${yKey}"] is missing`);
+        yearProblems.push(`${where} is per year but citations["${yKey}"] is missing`);
       } else {
         // The years citation must state a DURATION ("up to 5 years",
         // "2 years and 9 months", "five years"), not just a fee amount…
         const yQuote = citations[yKey];
         if (!DURATION_RE.test(yQuote)) {
-          errors.push(`citations["${yKey}"] must quote a visa length/duration (e.g. "up to 5 years")`);
+          yearProblems.push(`citations["${yKey}"] must quote a visa length/duration (e.g. "up to 5 years")`);
         }
         // …and must not just repeat the application-fee sentence (the
         // failure seen live: the "up to 3 years - £819" fee line reused).
         const appQuote = citations[feeCitationKey("application", 1)];
         if (appQuote && appQuote.trim() === yQuote.trim()) {
-          errors.push(`citations["${yKey}"] must quote the visa length, not repeat the fee.application quote`);
+          yearProblems.push(`citations["${yKey}"] must quote the visa length, not repeat the fee.application quote`);
         }
+      }
+      if (yearProblems.length > 0) {
+        if (kind === "surcharge") {
+          unverifiedReasons.push(`dropped surcharge "${label}": ${yearProblems.join(", ")}`);
+          return; // drop this component only
+        }
+        errors.push(...yearProblems);
       }
     }
 
@@ -282,12 +310,11 @@ function validateFeeComponents(
       errors.push(`${where}.currency "${currency}" is not a known ISO 4217 code`);
     }
 
-    const label = typeof c.label === "string" && c.label.trim() ? c.label.trim() : kind;
     const component: ExtractedFeeComponent = { kind, label, amount, currency, per };
     if (years !== undefined) component.years = years;
     out.push(component);
   });
-  return out;
+  return { components: out, unverifiedReasons };
 }
 
 /** Thrown when the model output fails validation (collects all problems). */

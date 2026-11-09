@@ -293,13 +293,6 @@ export class VisaController {
         sendError(res, "NOT_FOUND", "Visa type not found", 404);
         return;
       }
-      // Approval refused: no usable USD cost (stale/missing FX rate, or no
-      // baseCostUsd). 409 Conflict — the visa's state blocks the action until
-      // a cost is set or the crawl re-runs with a fresh rate.
-      if (error instanceof VisaFeeNotConvertibleError) {
-        sendError(res, error.code, error.message, 409);
-        return;
-      }
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }
@@ -361,9 +354,9 @@ export class VisaController {
         sendError(res, "NOT_FOUND", "Visa type not found", 404);
         return;
       }
-      // Approval refused: no usable USD cost (stale/missing FX rate, or no
-      // baseCostUsd). 409 Conflict — the visa's state blocks the action until
-      // a cost is set or the crawl re-runs with a fresh rate.
+      // Approval refused: no usable USD cost (stale/missing FX rate,
+      // unverified fee, or no/mismatched baseCostUsd). 409 Conflict — the
+      // visa's state blocks approval until the crawl re-runs (or reject it).
       if (error instanceof VisaFeeNotConvertibleError) {
         sendError(res, error.code, error.message, 409);
         return;

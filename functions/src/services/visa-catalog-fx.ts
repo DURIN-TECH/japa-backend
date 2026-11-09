@@ -33,6 +33,21 @@ import { VISA_CATALOG_USER_AGENT } from "./visa-catalog-fetch.service";
  *  `date`, which lags over weekends/holidays). Matches the weekly crawl. */
 export const FX_MAX_AGE_DAYS = 7;
 
+/** Max age of the rate's own ECB reference DATE (`rateDate`). The
+ *  orchestrator re-fetches every 6h and rewrites `fetchedAt` each time, so if
+ *  Frankfurter kept serving an old `date` (an ECB or API outage) `fetchedAt`
+ *  alone would make it look fresh forever. 14 days leaves plenty of slack for
+ *  weekends and holiday runs (the ECB publishes each TARGET working day). */
+export const FX_MAX_RATE_DATE_AGE_DAYS = 14;
+
+/** Plausibility cap per fee component, in USD (after conversion). A component
+ *  worth more than this is almost certainly a mis-read (salary, savings
+ *  requirement, wrong units) — the fee is marked `feeUnverified` and approval
+ *  is blocked. Checked in USD, not in the source currency, because
+ *  high-denomination currencies (IDR, VND, COP, ... — all in the registry)
+ *  legitimately print fees far above 100000 units. */
+export const MAX_FEE_COMPONENT_USD = 100_000;
+
 /** Frankfurter "latest" endpoint, rebased to USD, no symbol filter (~30 ECB
  *  currencies, small payload). Free, no key. The old api.frankfurter.app host
  *  301-redirects, so use the .dev/v1 host directly. */
@@ -160,17 +175,18 @@ export async function refreshFxRates(params: {
   log?: (msg: string) => void;
 }): Promise<FxRefreshResult> {
   const log = params.log ?? ((m: string) => console.warn(m));
+
+  // ---- 1. Fetch. Failure → keep (and use) the previous stored doc ----
+  let doc: FxRatesDoc;
   try {
     const fetched = await params.fetchRates();
-    const doc: FxRatesDoc = {
+    doc = {
       base: "USD",
       rates: fetched.rates,
       fetchedAt: params.now,
       rateDate: fetched.rateDate,
       source: FX_SOURCE_ECB,
     };
-    await params.store.set(doc);
-    return { fx: doc, refreshed: true };
   } catch (err) {
     const error = (err as Error)?.message ?? String(err);
     log(`[visa-catalog-fx] FX refresh failed, keeping previous appConfig/fx: ${error}`);
@@ -178,12 +194,31 @@ export async function refreshFxRates(params: {
     const previous = await params.store.get().catch(() => undefined);
     return { fx: previous, refreshed: false, error };
   }
+
+  // ---- 2. Store. Failure → still use the FRESH rates for this run ----
+  // (`refreshed:false` because nothing was persisted; the next run retries.)
+  try {
+    await params.store.set(doc);
+    return { fx: doc, refreshed: true };
+  } catch (err) {
+    const error = (err as Error)?.message ?? String(err);
+    log(`[visa-catalog-fx] FX fetched but storing appConfig/fx failed; using fresh rates for this run: ${error}`);
+    return { fx: doc, refreshed: false, error };
+  }
 }
 
-/** True when the stored doc is no older than FX_MAX_AGE_DAYS at `now`. */
+/**
+ * True when the stored doc is usable at `now`: fetched no more than
+ * FX_MAX_AGE_DAYS ago AND its ECB `rateDate` is no more than
+ * FX_MAX_RATE_DATE_AGE_DAYS old. An unparseable `rateDate` counts as stale.
+ */
 export function isFxFresh(fx: FxRatesDoc | undefined, now: Timestamp): boolean {
   if (!fx?.fetchedAt) return false;
-  return now.toMillis() - fx.fetchedAt.toMillis() <= FX_MAX_AGE_DAYS * DAY_MS;
+  if (now.toMillis() - fx.fetchedAt.toMillis() > FX_MAX_AGE_DAYS * DAY_MS) return false;
+  // `rateDate` is a plain YYYY-MM-DD (UTC day).
+  const rateMs = Date.parse(`${fx.rateDate}T00:00:00Z`);
+  if (!Number.isFinite(rateMs)) return false;
+  return now.toMillis() - rateMs <= FX_MAX_RATE_DATE_AGE_DAYS * DAY_MS;
 }
 
 // ----- computeFee -----
@@ -213,13 +248,22 @@ export interface ComputedFee {
  *  - Empty components (the page states no fee) → no `baseCostUsd`: the
  *    reviewer sets the cost by hand (approval is blocked until then).
  *
+ *  - Unverified fee (review fix): when the validator dropped a per-year
+ *    surcharge it could not verify (`opts.unverifiedReasons`), or a component
+ *    converts to more than MAX_FEE_COMPONENT_USD, the fee is marked
+ *    `feeUnverified` (+ reason) and no `baseCostUsd` is produced — the total
+ *    would be incomplete or implausible. Approval is blocked.
+ *
  * @param now injected clock (staleness + the peg conversion date).
+ * @param opts.unverifiedReasons why parts of the fee could not be verified.
  */
 export function computeFee(
   components: ExtractedFeeComponent[],
   fx: FxRatesDoc | undefined,
-  now: Timestamp
+  now: Timestamp,
+  opts?: { unverifiedReasons?: string[] }
 ): ComputedFee {
+  const unverified: string[] = [...(opts?.unverifiedReasons ?? [])];
   // ---- 1. Per-component totals (arithmetic in code, never in the LLM) ----
   const metaComponents: VisaFeeComponentMeta[] = components.map((c) => {
     const totalInCurrency = c.per === "year" ? c.amount * (c.years ?? 0) : c.amount;
@@ -247,8 +291,14 @@ export function computeFee(
 
   const feeMeta: VisaFeeMeta = { components: metaComponents, totals };
 
-  // Nothing published → nothing to convert, and no cost to claim.
-  if (metaComponents.length === 0) return { feeMeta };
+  // Nothing published → nothing to convert, and no cost to claim. Recorded
+  // explicitly so an existing doc's old `baseCostUsd` is removed on ingest
+  // (never left standing next to a fee block that no longer supports it).
+  if (metaComponents.length === 0) {
+    feeMeta.noPublishedFee = true;
+    applyUnverified(feeMeta, unverified);
+    return { feeMeta };
+  }
 
   // ---- 3. Convert each currency total ----
   const fresh = isFxFresh(fx, now);
@@ -299,11 +349,30 @@ export function computeFee(
   if (stale) feeMeta.fxStale = true;
   if (missing) feeMeta.fxMissing = true;
 
-  // Any unconverted currency → no USD figure at all (never a partial or 0).
-  if (stale || missing) return { feeMeta };
+  // ---- 5. Plausibility: each converted component <= MAX_FEE_COMPONENT_USD ----
+  for (const c of metaComponents) {
+    const usdPerUnit = c.currency === "USD" ? 1 : fxRateToUsd[c.currency];
+    if (usdPerUnit !== undefined && c.totalInCurrency * usdPerUnit > MAX_FEE_COMPONENT_USD) {
+      unverified.push(
+        `"${c.label}" (${c.totalInCurrency} ${c.currency}) exceeds the ${MAX_FEE_COMPONENT_USD} USD plausibility cap`
+      );
+    }
+  }
+  applyUnverified(feeMeta, unverified);
+
+  // Any unconverted currency, or an unverified fee → no USD figure at all
+  // (never a partial, implausible or fake-0 number).
+  if (stale || missing || feeMeta.feeUnverified) return { feeMeta };
 
   feeMeta.totalUsd = totalUsd;
   return { baseCostUsd: Math.round(totalUsd), feeMeta };
+}
+
+/** Set `feeUnverified` + a joined reason when there are reasons (else nothing). */
+function applyUnverified(feeMeta: VisaFeeMeta, reasons: string[]): void {
+  if (reasons.length === 0) return;
+  feeMeta.feeUnverified = true;
+  feeMeta.feeUnverifiedReason = reasons.join("; ");
 }
 
 /** True when a stored fee block is flagged as not converted. */
@@ -355,7 +424,13 @@ export function planFeeReconvert(
     if (c.years !== undefined) e.years = c.years;
     return e;
   });
-  const result = computeFee(components, fx, now);
+  // Carry a stored "unverified" reason through: the dropped component isn't in
+  // `components`, so the fee stays unverified (and unapprovable) after a
+  // re-convert. (A plausibility reason is re-derived by computeFee itself.)
+  const storedReasons = (fee.feeUnverifiedReason ?? "")
+    .split("; ")
+    .filter((r) => r && !r.includes("plausibility cap"));
+  const result = computeFee(components, fx, now, { unverifiedReasons: storedReasons });
 
   if (result.baseCostUsd === undefined) {
     // Still no usable rate. Only write if the flags themselves changed
@@ -370,14 +445,18 @@ export function planFeeReconvert(
 
 // ----- Approval guard -----
 
-/** Message returned to the reviewer when approval is refused for FX reasons. */
+/** Message returned to the reviewer when approval is refused because the
+ *  fee could not be turned into a trustworthy USD cost. (There is no API to
+ *  set a cost by hand yet — follow-up issue — so it names what works today.) */
 export const FEE_NOT_CONVERTED_MESSAGE =
-  "Fee could not be converted to USD (stale or missing exchange rate): " +
-  "set the cost manually or re-run the crawl";
+  "Fee could not be converted to USD (stale/missing exchange rate or unverified fee). " +
+  "Re-run the crawl or reject.";
 
-/** Message when the visa simply has no finite USD cost. */
+/** Message when the visa has no valid USD cost (missing, or out of step with
+ *  its stored published fee). */
 export const FEE_MISSING_COST_MESSAGE =
-  "Visa has no USD cost (baseCostUsd is not set): set the cost manually before approving";
+  "Visa has no valid USD cost (baseCostUsd is missing or does not match the published fee). " +
+  "Re-run the crawl or reject.";
 
 /**
  * Typed error thrown by visaService.updateVisaReviewStatus when an approval is
@@ -395,17 +474,29 @@ export class VisaFeeNotConvertibleError extends Error {
 /**
  * Throw VisaFeeNotConvertibleError when `visa` must not be approved:
  *  - a scraped visa whose `scrapeMeta.fee` is fxMissing / fxStale, or
+ *    feeUnverified (a surcharge was dropped, or a component is implausible);
  *  - any visa whose `baseCostUsd` is not a finite number (approving it would
- *    make e.g. application totals NaN).
+ *    make e.g. application totals NaN);
+ *  - a scraped visa whose `baseCostUsd` is not exactly
+ *    `Math.round(scrapeMeta.fee.totalUsd)` — the cost must be the one its
+ *    stored published fee supports (catches an old cost left behind when the
+ *    page changed, and pre-#59 scraped docs that have no fee block at all).
  * Only called for `approve`; rejecting is never blocked.
  */
 export function assertVisaApprovable(
   visa: Pick<VisaType, "source" | "scrapeMeta" | "baseCostUsd">
 ): void {
-  if (visa.source === "scraped" && isFeeFxFlagged(visa.scrapeMeta?.fee)) {
+  const fee = visa.scrapeMeta?.fee;
+  if (visa.source === "scraped" && (isFeeFxFlagged(fee) || fee?.feeUnverified)) {
     throw new VisaFeeNotConvertibleError(FEE_NOT_CONVERTED_MESSAGE);
   }
   if (typeof visa.baseCostUsd !== "number" || !Number.isFinite(visa.baseCostUsd)) {
     throw new VisaFeeNotConvertibleError(FEE_MISSING_COST_MESSAGE);
+  }
+  if (visa.source === "scraped") {
+    const totalUsd = fee?.totalUsd;
+    if (typeof totalUsd !== "number" || !Number.isFinite(totalUsd) || visa.baseCostUsd !== Math.round(totalUsd)) {
+      throw new VisaFeeNotConvertibleError(FEE_MISSING_COST_MESSAGE);
+    }
   }
 }

@@ -28,6 +28,7 @@
  *   node lib/scripts/crawl-visa-catalog.js --visa "skilled worker"
  *   node lib/scripts/crawl-visa-catalog.js --country GB --visa "student" --limit 3
  *   node lib/scripts/crawl-visa-catalog.js --country GB --limit 2 --force
+ *   node lib/scripts/crawl-visa-catalog.js --country GB --max-extractions 3
  *   node lib/scripts/crawl-visa-catalog.js --country GB --project durin-seli-dev
  *
  * Needs DEEPSEEK_API_KEY (loaded from functions/.env.local automatically) and a
@@ -45,8 +46,18 @@ import type { VisaType } from "../types";
 // ---- CLI args ----
 function parseArgs(argv: string[]) {
   // `force`: skip the hash gate and always extract.
-  const out: { country?: string; visa?: string; project?: string; limit: number; force: boolean } = {
+  // `maxExtractions`: cap on LLM calls this run (every call counts, success
+  // or failure — same rule as the orchestrator's maxExtractions).
+  const out: {
+    country?: string;
+    visa?: string;
+    project?: string;
+    limit: number;
+    maxExtractions: number;
+    force: boolean;
+  } = {
     limit: 25,
+    maxExtractions: 25,
     force: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -56,6 +67,7 @@ function parseArgs(argv: string[]) {
     else if (a === "--project" || a === "-p") out.project = argv[++i];
     else if (a === "--limit") out.limit = parseInt(argv[++i] || "25", 10);
     else if (a === "--force") out.force = true;
+    else if (a === "--max-extractions") out.maxExtractions = parseInt(argv[++i] || "25", 10);
   }
   return out;
 }
@@ -127,8 +139,16 @@ async function main() {
       ? `FX: refreshed appConfig/fx (ECB date ${fx?.rateDate})`
       : `FX: refresh FAILED (${fxRefresh.error}); using previous appConfig/fx: ${fx ? fx.rateDate : "none"}`
   );
-  const reconvert = await visaCatalogService.reconvertFlaggedFees(fx);
-  console.log(`FX: re-converted ${reconvert.reconverted} flagged fee(s), re-flagged ${reconvert.reflagged}`);
+  // A failed re-convert must not abort the manual run (same as the orchestrator).
+  try {
+    const reconvert = await visaCatalogService.reconvertFlaggedFees(fx);
+    console.log(`FX: re-converted ${reconvert.reconverted} flagged fee(s), re-flagged ${reconvert.reflagged}`);
+  } catch (err) {
+    console.error(`FX: re-converting flagged fees FAILED (continuing): ${(err as Error).message}`);
+  }
+
+  // LLM calls made this run (successful or not), capped by --max-extractions.
+  let extractionsUsed = 0;
 
   let processed = 0;
   // `unchanged` also counts hash-gate skips (no LLM call); `withdrawn` = pages
@@ -197,6 +217,13 @@ async function main() {
           }
         }
 
+        // Extraction cap: every LLM call counts, counted BEFORE the call so a
+        // failing call (API / validation error) also uses up a slot.
+        if (extractionsUsed >= args.maxExtractions) {
+          console.log(`  -> skipped: --max-extractions ${args.maxExtractions} reached`);
+          continue;
+        }
+        extractionsUsed++;
         const extracted = await visaCatalogExtractor.extract(fetched.text, {
           url: page.url,
           countryName: source.countryName,

@@ -163,12 +163,15 @@ class VisaCatalogCrawlService {
           if (!changed) continue; // hash gate — nothing new, skip the LLM
 
           summary.pagesChanged++;
+          // Count the LLM call BEFORE making it: a failed call (API error,
+          // validation error) costs money too and must use up a
+          // maxExtractions slot, or a systematic failure could exceed the cap.
+          extractionsUsed++;
           const extracted = await visaCatalogExtractor.extract(fetched.text, {
             url: page.url,
             countryName: source.countryName,
             routeName: page.routeName,
           });
-          extractionsUsed++;
           pages[i] = { ...pages[i], lastExtractedAt: now };
 
           const { outcome } = await visaCatalogService.ingestExtraction({

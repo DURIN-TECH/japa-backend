@@ -23,6 +23,7 @@ import { Timestamp } from "firebase-admin/firestore";
 
 import {
   EXTRACTOR_PROMPT_VERSION,
+  MAX_FEE_YEARS,
   ExtractionValidationError,
   buildSystemPrompt,
   validateExtractedVisa,
@@ -32,6 +33,8 @@ import {
   FEE_NOT_CONVERTED_MESSAGE,
   FRANKFURTER_LATEST_URL,
   FX_MAX_AGE_DAYS,
+  FX_MAX_RATE_DATE_AGE_DAYS,
+  MAX_FEE_COMPONENT_USD,
   FX_SOURCE_ECB,
   FX_SOURCE_PEG,
   OFFICIAL_USD_PEGS,
@@ -116,8 +119,8 @@ describe("validateExtractedVisa — feeComponents", () => {
   });
 
   test("(a) rejects a non-zero component with no citation", () => {
-    assertRejects(rawVisa({ citations: { "fee.surcharge": "x", "fee.years": "y" } }), /fee\.application/);
-    assertRejects(rawVisa({ citations: { "fee.application": "x", "fee.years": "y" } }), /fee\.surcharge/);
+    assertRejects(rawVisa({ citations: { "fee.surcharge": "x", "fee.years": "for 3 years" } }), /fee\.application/);
+    assertRejects(rawVisa({ citations: { "fee.application": "x", "fee.years": "for 3 years" } }), /fee\.surcharge/);
   });
 
   test("(b) rejects a non-zero component with no or an unknown currency", () => {
@@ -127,37 +130,69 @@ describe("validateExtractedVisa — feeComponents", () => {
     assertRejects(rawVisa({ feeComponents: bad }), /"XXQ" is not a known ISO 4217/);
   });
 
-  test("(c) rejects per:\"year\" with no years or no fee.years citation", () => {
-    const noYears = [SW_COMPONENTS[0], { ...SW_COMPONENTS[1], years: undefined }];
-    assertRejects(rawVisa({ feeComponents: noYears }), /years must be an integer >= 1/);
-    const zeroYears = [SW_COMPONENTS[0], { ...SW_COMPONENTS[1], years: 0 }];
-    assertRejects(rawVisa({ feeComponents: zeroYears }), /years must be an integer >= 1/);
-    assertRejects(
-      rawVisa({ citations: { "fee.application": "a", "fee.surcharge": "b" } }),
+  // Review fix: a per-year SURCHARGE whose years / length citation fails is
+  // DROPPED (the rest of the extraction kept) and the fee marked unverified,
+  // instead of failing the whole extraction.
+  /** Validate, expect success, and return the result. */
+  const dropCase = (over: Record<string, unknown>) => validateExtractedVisa(rawVisa(over));
+  const assertSurchargeDropped = (v: ExtractedVisa, re: RegExp) => {
+    assert.deepEqual(v.feeComponents, [SW_COMPONENTS[0]]); // application kept
+    assert.ok(v.feeUnverifiedReasons && v.feeUnverifiedReasons.length === 1);
+    assert.match(v.feeUnverifiedReasons[0], /dropped surcharge "Immigration Health Surcharge"/);
+    assert.match(v.feeUnverifiedReasons[0], re);
+  };
+
+  test("(c) per:\"year\" surcharge with no / invalid years → dropped, fee unverified", () => {
+    assertSurchargeDropped(dropCase({ feeComponents: [SW_COMPONENTS[0], { ...SW_COMPONENTS[1], years: undefined }] }), /years must be an integer from 1 to 10/);
+    assertSurchargeDropped(dropCase({ feeComponents: [SW_COMPONENTS[0], { ...SW_COMPONENTS[1], years: 0 }] }), /years must be an integer/);
+  });
+
+  test("(c) per:\"year\" surcharge with no fee.years citation → dropped, fee unverified", () => {
+    assertSurchargeDropped(
+      dropCase({ citations: { "fee.application": "a", "fee.surcharge": "b" } }),
       /citations\["fee\.years"\] is missing/
     );
   });
 
-  test("rejects a fee.years citation with no duration in it", () => {
+  test("years above MAX_FEE_YEARS (10) → surcharge dropped", () => {
+    assert.equal(MAX_FEE_YEARS, 10);
+    assertSurchargeDropped(dropCase({ feeComponents: [SW_COMPONENTS[0], { ...SW_COMPONENTS[1], years: 11 }] }), /from 1 to 10/);
+  });
+
+  test("a per-year APPLICATION fee with bad years still fails the extraction", () => {
     assertRejects(
-      rawVisa({ citations: { "fee.application": "a £1,000 fee", "fee.surcharge": "b", "fee.years": "£1,035 per person" } }),
+      rawVisa({ feeComponents: [{ ...SW_COMPONENTS[0], per: "year" }], citations: { "fee.application": "a" } }),
+      /years must be an integer/
+    );
+  });
+
+  test("fee.years citation with no duration (incl. \"the length of your course\") → dropped", () => {
+    assertSurchargeDropped(
+      dropCase({ citations: { "fee.application": "a £1,000 fee", "fee.surcharge": "b", "fee.years": "£1,035 per person" } }),
+      /must quote a visa length\/duration/
+    );
+    assertSurchargeDropped(
+      dropCase({ citations: { "fee.application": "a", "fee.surcharge": "b", "fee.years": "for the length of your course" } }),
       /must quote a visa length\/duration/
     );
   });
 
-  test("rejects a fee.years citation that just repeats the fee.application quote", () => {
+  test("fee.years citation repeating the fee.application quote → dropped", () => {
     const line = "up to 3 years - £819 per person";
-    assertRejects(
-      rawVisa({ citations: { "fee.application": line, "fee.surcharge": "b", "fee.years": line } }),
+    assertSurchargeDropped(
+      dropCase({ citations: { "fee.application": line, "fee.surcharge": "b", "fee.years": line } }),
       /not repeat the fee\.application quote/
     );
   });
 
+  test("a valid payload carries no feeUnverifiedReasons key", () => {
+    assert.equal("feeUnverifiedReasons" in validateExtractedVisa(rawVisa()), false);
+  });
+
   test("accepts duration phrasings: digits, words, years and months", () => {
     for (const q of ["Your visa can last for up to 5 years", "2 years and 9 months", "for five years", "a 12-month course"]) {
-      assert.doesNotThrow(() =>
-        validateExtractedVisa(rawVisa({ citations: { "fee.application": "a", "fee.surcharge": "b", "fee.years": q } }))
-      );
+      const v = validateExtractedVisa(rawVisa({ citations: { "fee.application": "a", "fee.surcharge": "b", "fee.years": q } }));
+      assert.equal(v.feeComponents.length, 2, q);
     }
   });
 
@@ -327,10 +362,42 @@ describe("computeFee", () => {
     assert.deepEqual(Object.keys(feeMeta.fxRateToUsd ?? {}).sort(), ["EUR", "GBP"]);
   });
 
-  test("empty components: no baseCostUsd (no fake 0)", () => {
+  test("empty components: no baseCostUsd (no fake 0), recorded as noPublishedFee", () => {
     const { baseCostUsd, feeMeta } = computeFee([], fxDoc(), NOW);
     assert.equal(baseCostUsd, undefined);
-    assert.deepEqual(feeMeta, { components: [], totals: [] });
+    assert.deepEqual(feeMeta, { components: [], totals: [], noPublishedFee: true });
+  });
+
+  test("unverified reasons → feeUnverified + reason, no baseCostUsd", () => {
+    const { baseCostUsd, feeMeta } = computeFee([SW_COMPONENTS[0]], fxDoc(), NOW, {
+      unverifiedReasons: ["dropped surcharge \"IHS\": no duration"],
+    });
+    assert.equal(baseCostUsd, undefined);
+    assert.equal(feeMeta.feeUnverified, true);
+    assert.equal(feeMeta.feeUnverifiedReason, "dropped surcharge \"IHS\": no duration");
+    assert.equal(feeMeta.totalUsd, undefined);
+  });
+
+  test(`a component worth more than MAX_FEE_COMPONENT_USD (${MAX_FEE_COMPONENT_USD}) → feeUnverified`, () => {
+    const { baseCostUsd, feeMeta } = computeFee(
+      [{ kind: "application", label: "Salary threshold misread", amount: 90_000, currency: "GBP", per: "application" }],
+      fxDoc(),
+      NOW
+    );
+    assert.equal(baseCostUsd, undefined);
+    assert.equal(feeMeta.feeUnverified, true);
+    assert.match(feeMeta.feeUnverifiedReason ?? "", /plausibility cap/);
+  });
+
+  test("a large fee in a high-denomination currency is fine (cap is in USD)", () => {
+    // IDR 2,000,000 at 16,000 per USD = 125 USD.
+    const { baseCostUsd, feeMeta } = computeFee(
+      [{ kind: "application", label: "Visa", amount: 2_000_000, currency: "IDR", per: "application" }],
+      fxDoc(NOW, { IDR: 16_000 }),
+      NOW
+    );
+    assert.equal(baseCostUsd, 125);
+    assert.equal(feeMeta.feeUnverified, undefined);
   });
 });
 
@@ -385,6 +452,17 @@ describe("no usable rate → flagged, no baseCostUsd", () => {
     assert.equal(feeMeta.fxStale, true);
     assert.equal(feeMeta.fxMissing, undefined);
     assert.deepEqual(feeMeta.totals, [{ currency: "GBP", amount: 4000 }]);
+  });
+
+  test(`rateDate older than FX_MAX_RATE_DATE_AGE_DAYS (${FX_MAX_RATE_DATE_AGE_DAYS}) → stale even if just fetched`, () => {
+    assert.equal(FX_MAX_RATE_DATE_AGE_DAYS, 14);
+    // NOW = 2026-11-09T12:00Z. 2026-10-27 is 13.5 days old (fresh); 10-25 is 15.5.
+    assert.equal(isFxFresh({ ...fxDoc(NOW), rateDate: "2026-10-27" }, NOW), true);
+    assert.equal(isFxFresh({ ...fxDoc(NOW), rateDate: "2026-10-25" }, NOW), false);
+    assert.equal(isFxFresh({ ...fxDoc(NOW), rateDate: "not-a-date" }, NOW), false);
+    const { baseCostUsd, feeMeta } = computeFee(SW_COMPONENTS, { ...fxDoc(NOW), rateDate: "2026-10-01" }, NOW);
+    assert.equal(baseCostUsd, undefined);
+    assert.equal(feeMeta.fxStale, true);
   });
 
   test("exactly FX_MAX_AGE_DAYS old is still fresh", () => {
@@ -459,6 +537,28 @@ describe("refreshFxRates", () => {
     assert.equal(res.fx, previous); // still used (2 days old = fresh)
     assert.equal(store.writes, 0); // never overwritten with nothing
     assert.equal(logs.length, 1);
+  });
+
+  test("fetch OK but the store write fails → fresh rates still used for this run", async () => {
+    const previous = fxDoc(daysAgo(2));
+    const logs: string[] = [];
+    const store: FxStore = {
+      get: async () => previous,
+      set: async () => {
+        throw new Error("permission denied");
+      },
+    };
+    const res = await refreshFxRates({
+      fetchRates: async () => ({ rates: { GBP: 0.75 }, rateDate: "2026-11-06" }),
+      store,
+      now: NOW,
+      log: (m) => logs.push(m),
+    });
+    assert.equal(res.refreshed, false);
+    assert.equal(res.error, "permission denied");
+    assert.deepEqual(res.fx?.rates, { GBP: 0.75 }); // the fresh ones, not `previous`
+    assert.equal(res.fx?.fetchedAt, NOW);
+    assert.match(logs[0], /storing appConfig\/fx failed/);
   });
 
   test("fetchFrankfurterRates calls the USD-based latest endpoint and keeps valid rates", async () => {
@@ -556,6 +656,20 @@ describe("planFeeReconvert", () => {
     assert.equal(plan.fee.totalUsd, 5000);
   });
 
+  test("an unverified fee stays unverified (and costless) after a re-convert", () => {
+    const { feeMeta } = computeFee([SW_COMPONENTS[0]], fxDoc(daysAgo(8)), NOW, {
+      unverifiedReasons: ["dropped surcharge \"IHS\": no duration"],
+    });
+    const v = staleVisa();
+    v.scrapeMeta = { ...v.scrapeMeta!, fee: feeMeta };
+    const plan = planFeeReconvert(v, fxDoc(NOW), NOW);
+    assert.ok(plan); // flags changed (fxStale cleared) → write the new block
+    assert.equal(plan.baseCostUsd, undefined);
+    assert.equal(plan.fee.fxStale, undefined);
+    assert.equal(plan.fee.feeUnverified, true);
+    assert.equal(plan.fee.feeUnverifiedReason, "dropped surcharge \"IHS\": no duration");
+  });
+
   test("still no rate with the same flags → no write", () => {
     assert.equal(planFeeReconvert(staleVisa(), fxDoc(daysAgo(9)), NOW), null);
   });
@@ -595,6 +709,44 @@ describe("assertVisaApprovable", () => {
       );
     });
   }
+
+  test("throws for a scraped visa with feeUnverified", () => {
+    const { feeMeta } = computeFee([SW_COMPONENTS[0]], fxDoc(), NOW, { unverifiedReasons: ["dropped"] });
+    assert.throws(
+      () => assertVisaApprovable({ source: "scraped", baseCostUsd: 1250, scrapeMeta: { fee: feeMeta } } as VisaType),
+      (e: unknown) => e instanceof VisaFeeNotConvertibleError && e.message === FEE_NOT_CONVERTED_MESSAGE
+    );
+  });
+
+  test("scraped: baseCostUsd must equal Math.round(fee.totalUsd)", () => {
+    const { feeMeta } = computeFee(SW_COMPONENTS, fxDoc(), NOW); // totalUsd 5000
+    // An old cost left behind (e.g. 9092) is refused…
+    assert.throws(
+      () => assertVisaApprovable({ source: "scraped", baseCostUsd: 9092, scrapeMeta: { fee: feeMeta } } as VisaType),
+      (e: unknown) => e instanceof VisaFeeNotConvertibleError && e.message === FEE_MISSING_COST_MESSAGE
+    );
+    // …as is a cost next to a "no published fee" block (no totalUsd)…
+    const { feeMeta: none } = computeFee([], fxDoc(), NOW);
+    assert.throws(
+      () => assertVisaApprovable({ source: "scraped", baseCostUsd: 9092, scrapeMeta: { fee: none } } as VisaType),
+      VisaFeeNotConvertibleError
+    );
+    // …and a scraped doc with no fee block at all (pre-#59).
+    assert.throws(() => assertVisaApprovable({ source: "scraped", baseCostUsd: 719 } as VisaType), VisaFeeNotConvertibleError);
+  });
+
+  test("agent / seeded visas only need a finite cost", () => {
+    assert.doesNotThrow(() => assertVisaApprovable({ source: "agent", baseCostUsd: 500 } as VisaType));
+    assert.doesNotThrow(() => assertVisaApprovable({ baseCostUsd: 719 } as VisaType));
+  });
+
+  test("the 409 message names only remedies that exist", () => {
+    assert.doesNotMatch(FEE_NOT_CONVERTED_MESSAGE + FEE_MISSING_COST_MESSAGE, /manually/);
+    assert.equal(
+      FEE_NOT_CONVERTED_MESSAGE,
+      "Fee could not be converted to USD (stale/missing exchange rate or unverified fee). Re-run the crawl or reject."
+    );
+  });
 
   test("throws for a non-finite baseCostUsd", () => {
     assert.throws(
