@@ -456,15 +456,18 @@ export const scrapeNewsOrchestrator = functions
   });
 
 /**
- * Visa catalog crawler — ticks every 6 hours and processes the country sources
- * whose `nextCrawlAt` is due (each source is re-crawled weekly). Fetches official
+ * Visa catalog crawler — ticks HOURLY at :15 UTC and processes the country
+ * sources that are due (`nextCrawlAt <= now`) AND inside their weekly local
+ * night window (issue #63; e.g. GB Monday 02:15 Europe/London). Every seeded
+ * zone has a whole-hour offset, so :15 UTC is :15 local too. Ticks with no
+ * in-window due source return immediately (no FX call, no LLM). Fetches official
  * visa pages, and for pages whose content changed, extracts + stages a proposal
  * into `pendingVisaChanges` for agent approval. Never publishes to the live
  * catalog. See docs/visa-catalog-scraping-spike.md.
  */
 export const crawlVisaCatalogOrchestrator = functions
   .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: VISA_CATALOG_SECRETS })
-  .pubsub.schedule("0 */6 * * *")
+  .pubsub.schedule("15 * * * *") // hourly at :15 (issue #63)
   .timeZone("UTC")
   .onRun(async () => {
     console.log("Running visa catalog crawl orchestrator...");

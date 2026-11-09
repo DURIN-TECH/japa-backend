@@ -7,6 +7,9 @@ import type { FxFetcher } from "./visa-catalog-fx";
 // Fetching goes through the source adapter picked from `source.adapter`
 // (govuk-content-api for GB, generic-html — today's fetch service — otherwise).
 import { pickSourceAdapter, sourceMetaFromDocument } from "./visa-source-adapters";
+// Pure weekly-night-window helpers (issue #63): which due sources may run on
+// this tick, and when each runs next.
+import { isInCrawlWindow, nextWindowOpening } from "./visa-crawl-window";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -17,10 +20,21 @@ import { pickSourceAdapter, sourceMetaFromDocument } from "./visa-source-adapter
 // (bounded batch per invocation, per-source health + rescheduling) so cost and
 // runtime stay predictable.
 //
-// Cadence: each source is re-crawled every `crawlIntervalHours` (168 = weekly).
-// The scheduled function ticks more often than weekly and processes only sources
-// whose `nextCrawlAt` is due, so the 26 seeded countries self-stagger across the
-// week instead of all firing at once.
+// Cadence (issue #63): the scheduled function ticks HOURLY at :15 UTC. Each
+// source with a `crawlWindow` is crawled once a week, on its own local night
+// (e.g. GB: Monday 02:00-05:00 Europe/London -> ticks 02:15, 03:15, 04:15).
+// A source runs on a tick only when it is due (`nextCrawlAt <= now`) AND the
+// tick is inside its local window; after the run `nextCrawlAt` is set to the
+// window's next opening (next week, on the local grid, so no drift).
+//
+// Catch-up rule (no extra state): a source stays due until it runs. Skipped
+// on one tick (maxSources cap, outage) -> picked up on a later tick of the
+// same night. Whole night missed -> stays due but filtered out until next
+// week's window (never run mid-week). It never runs twice in one night: a
+// successful OR failed run moves `nextCrawlAt` to next week.
+//
+// A source WITHOUT a `crawlWindow` keeps the legacy behaviour: no window
+// filter, re-crawled every `crawlIntervalHours` (`now + interval`).
 
 // Recorded as the page's lastError when the source says the page is withdrawn
 // (whether or not a scraped doc was deactivated), so it shows in source health.
@@ -58,11 +72,20 @@ class VisaCatalogCrawlService {
     maxExtractions?: number;
     // Injectable FX fetcher (tests / manual runs); defaults to Frankfurter.
     fetchFxRates?: FxFetcher;
+    // Injectable "tick time" (tests / emulator checks), like fetchFxRates.
+    // Drives the due query, the window filter, nextCrawlAt and the crawl
+    // timestamps. Defaults to the real clock.
+    now?: Date | number;
   }): Promise<CrawlSummary> {
     const maxSources = opts?.maxSources ?? DEFAULT_MAX_SOURCES;
     const maxExtractions = opts?.maxExtractions ?? DEFAULT_MAX_EXTRACTIONS;
 
-    const now = Timestamp.now();
+    // The tick's instant. Every scheduling decision below uses THIS value (not
+    // the run's end time), so a long run never shifts the weekly grid.
+    const now =
+      opts?.now === undefined
+        ? Timestamp.now()
+        : Timestamp.fromMillis(typeof opts.now === "number" ? opts.now : opts.now.getTime());
     const summary: CrawlSummary = {
       sourcesProcessed: 0,
       pagesFetched: 0,
@@ -76,10 +99,51 @@ class VisaCatalogCrawlService {
       feesReconverted: 0,
     };
 
+    // Due = active AND nextCrawlAt <= now, oldest first (needs the composite
+    // index status+nextCrawlAt — already in firestore.indexes.json).
+    // NO .limit() here (issue #63): a limit applied BEFORE the window filter
+    // would let due-but-out-of-window sources (e.g. a missed night, oldest
+    // nextCrawlAt) fill the batch and starve the in-window ones. The registry
+    // is a handful of docs (26), so reading all due ones is cheap.
+    // ("broken" / "paused" sources never match the status filter.)
+    const dueSnap = await collections.visaSources
+      .where("status", "==", "active")
+      .where("nextCrawlAt", "<=", now)
+      .orderBy("nextCrawlAt", "asc")
+      .get();
+
+    // ---- Window filter, THEN the per-run cap ----
+    // Keep a due source if the tick is inside its local window, or if it has
+    // no window (legacy). An out-of-window source is left completely
+    // untouched: no fetch, no write, its nextCrawlAt unchanged — so it is
+    // still due when its window opens. A stored window that fails validation
+    // (should never happen: the seed validates) is logged and skipped rather
+    // than aborting the tick for every other source.
+    const runnable = dueSnap.docs
+      .filter((doc) => {
+        const source = doc.data() as VisaSource;
+        if (!source.crawlWindow) return true;
+        try {
+          return isInCrawlWindow(source.crawlWindow, now.toMillis());
+        } catch (err) {
+          console.error(`Visa catalog: source ${doc.id} has an invalid crawlWindow, skipped:`, err);
+          return false;
+        }
+      })
+      .slice(0, maxSources);
+
+    // Nothing to crawl on this tick (the common case: most hourly ticks fall
+    // outside every window) -> stop here, BEFORE any FX work: no Frankfurter
+    // call and no pending-visa scan. fxRefreshed stays false. FX freshness is
+    // not at risk: every night of the week has sources, so a refresh happens
+    // at least daily, well within FX_MAX_AGE_DAYS (7).
+    if (runnable.length === 0) return summary;
+
     // ---- FX: refresh appConfig/fx ONCE per run, before any extraction ----
-    // Never throws: on failure the previous doc is kept and used if still
-    // within FX_MAX_AGE_DAYS. Then re-convert pending scraped visas whose fee
-    // was flagged stale/missing, from their stored components (no LLM call).
+    // Only on a tick that crawls something. Never throws: on failure the
+    // previous doc is kept and used if still within FX_MAX_AGE_DAYS. Then
+    // re-convert pending scraped visas whose fee was flagged stale/missing,
+    // from their stored components (no LLM call).
     const fxRefresh = await visaCatalogService.refreshFx(opts?.fetchFxRates);
     const fx = fxRefresh.fx;
     summary.fxRefreshed = fxRefresh.refreshed;
@@ -90,18 +154,10 @@ class VisaCatalogCrawlService {
       console.error("Visa catalog: re-converting flagged fees failed:", err);
     }
 
-    // Due = active AND nextCrawlAt <= now, oldest first (needs the composite
-    // index status+nextCrawlAt — added to firestore.indexes.json).
-    const dueSnap = await collections.visaSources
-      .where("status", "==", "active")
-      .where("nextCrawlAt", "<=", now)
-      .orderBy("nextCrawlAt", "asc")
-      .limit(maxSources)
-      .get();
-
+    // Running count of LLM calls this tick, against maxExtractions.
     let extractionsUsed = 0;
 
-    for (const doc of dueSnap.docs) {
+    for (const doc of runnable) {
       const source = doc.data() as VisaSource;
       const runStart = Timestamp.now();
       const pages: VisaSourcePage[] = [...source.pages];
@@ -110,8 +166,9 @@ class VisaCatalogCrawlService {
       let ingested = 0;
 
       for (let i = 0; i < pages.length; i++) {
-        // Respect the per-run extraction cap; remaining pages are picked up next
-        // tick (their hash is unchanged so they re-check cheaply).
+        // Respect the per-run extraction cap. The source is still rescheduled
+        // below, so its remaining pages are picked up at its NEXT window
+        // (their stored hash is unchanged, so they re-extract then).
         if (extractionsUsed >= maxExtractions) break;
 
         const page = pages[i];
@@ -214,9 +271,14 @@ class VisaCatalogCrawlService {
       // Simple reliability signal: this run's fetch success ratio.
       const attempted = fetchedOk + pageErrors;
       const reliabilityScore = attempted > 0 ? Math.round((fetchedOk / attempted) * 100) : source.reliabilityScore;
-      const nextCrawlAt = Timestamp.fromMillis(
-        now.toMillis() + source.crawlIntervalHours * 60 * 60 * 1000
-      );
+      // Reschedule (success OR failure, so a source never runs twice in one
+      // night): with a window -> its next opening strictly after this tick
+      // (next week's local startHour; DST-correct; no drift however long the
+      // run took, since it is computed from the tick's `now`). Without a
+      // window -> legacy `now + crawlIntervalHours`.
+      const nextCrawlAt = source.crawlWindow
+        ? Timestamp.fromDate(nextWindowOpening(source.crawlWindow, now.toMillis()))
+        : Timestamp.fromMillis(now.toMillis() + source.crawlIntervalHours * 60 * 60 * 1000);
 
       await doc.ref.update({
         pages,

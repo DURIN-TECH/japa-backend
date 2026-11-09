@@ -34,9 +34,11 @@ import { VISA_CATALOG_USER_AGENT } from "./visa-catalog-fetch.service";
 export const FX_MAX_AGE_DAYS = 7;
 
 /** Max age of the rate's own ECB reference DATE (`rateDate`). The
- *  orchestrator re-fetches every 6h and rewrites `fetchedAt` each time, so if
- *  Frankfurter kept serving an old `date` (an ECB or API outage) `fetchedAt`
- *  alone would make it look fresh forever. 14 days leaves plenty of slack for
+ *  orchestrator re-fetches on every tick that crawls a source (at least once a
+ *  day, since every night of the week has sources in its window — issue #63)
+ *  and rewrites `fetchedAt` each time, so if Frankfurter kept serving an old
+ *  `date` (an ECB or API outage) `fetchedAt` alone would make it look fresh
+ *  forever. 14 days leaves plenty of slack for
  *  weekends and holiday runs (the ECB publishes each TARGET working day). */
 export const FX_MAX_RATE_DATE_AGE_DAYS = 14;
 
