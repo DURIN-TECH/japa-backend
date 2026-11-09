@@ -109,6 +109,13 @@ async function main() {
       processed++;
       try {
         console.log(`\n[${source.countryCode}] ${page.routeName}\n  ${page.url}`);
+        // Resolve the record id BEFORE fetching/extracting (same rule as the
+        // scheduled orchestrator): pinned `visaId`, else the URL path, never
+        // extraction output. A page with no derivable id (empty path, bad URL)
+        // throws here and is counted as an error without costing an LLM call.
+        const resolvedVisaId = visaCatalogService.buildVisaId(source.countryCode, page.url, {
+          visaId: page.visaId,
+        });
         const fetched = await visaCatalogFetchService.fetchAndClean(page.url, { checkRobots: true });
         totals.fetched++;
         const extracted = await visaCatalogExtractor.extract(fetched.cleanText, {
@@ -123,8 +130,9 @@ async function main() {
           contentHash: fetched.contentHash,
           extracted,
           model: visaCatalogExtractor.model,
-          // Registry-owned identity: pinned doc id + code (if any).
-          visaId: page.visaId,
+          // Registry-owned identity: the id resolved above (used verbatim by
+          // ingest, not recomputed) + the pinned code, if any.
+          visaId: resolvedVisaId,
           visaCode: page.visaCode,
         });
         totals[outcome]++;

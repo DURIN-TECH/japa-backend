@@ -89,8 +89,15 @@ class VisaCatalogService {
     contentHash: string;
     extracted: ExtractedVisa;
     model: string;
-    // Registry-pinned identity from the VisaSourcePage (both optional).
+    // Registry-owned identity (both optional).
+    // `visaId`: the doc id the caller already resolved with buildVisaId()
+    // before extraction (the crawlers do this so an un-derivable id fails
+    // before any LLM call), or simply the page's pinned `visaId`. Either way it
+    // is used VERBATIM — buildVisaId returns a given id unchanged — so ingest
+    // never recomputes a different id. When absent, the id is derived from
+    // `sourceUrl`.
     visaId?: string;
+    // `visaCode`: the page's pinned code; overrides `extracted.code` when set.
     visaCode?: string;
   }): Promise<{ visaId: string; outcome: IngestOutcome }> {
     const { countryCode, sourceUrl, routeName, contentHash, extracted, model } = params;

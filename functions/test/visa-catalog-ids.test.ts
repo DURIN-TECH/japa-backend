@@ -120,6 +120,46 @@ describe("deriveVisaId", () => {
   });
 });
 
+// ----- Id resolution BEFORE extraction (review finding 1) -----
+//
+// The crawlers resolve the id from the registry page alone, before fetching or
+// calling the LLM, then hand that id to ingestExtraction, which uses it
+// verbatim. These tests pin the two properties that makes safe.
+
+describe("id resolution before extraction", () => {
+  // Only registry-page inputs are needed: no ExtractedVisa exists yet.
+  test("resolves from the registry page alone (no extraction output)", () => {
+    const page: Pick<VisaSourcePage, "url" | "visaId"> = {
+      url: "https://www.gov.uk/graduate-visa",
+    };
+    assert.equal(
+      deriveVisaId({ countryCode: "GB", sourceUrl: page.url, visaId: page.visaId }),
+      "gb-graduate-visa"
+    );
+  });
+
+  // Real registry entry with no path: fails up front, so the crawl records a
+  // page error instead of spending an LLM call on a page it can't store.
+  test("KR root URL with only a query string throws before extraction", () => {
+    assert.throws(
+      () => deriveVisaId({ countryCode: "KR", sourceUrl: "https://www.visa.go.kr/?LANG_TYPE=EN" }),
+      /empty path/
+    );
+  });
+
+  // ingest re-runs buildVisaId with the caller's resolved id as the "pin";
+  // that must return it unchanged so the two never disagree.
+  test("a resolved id passed back in is returned unchanged (idempotent)", () => {
+    for (const sourceUrl of [
+      "https://www.gov.uk/student-visa",
+      "https://x.gov/" + "deep-path-".repeat(12) + "visa", // hash-suffixed case
+    ]) {
+      const resolved = deriveVisaId({ countryCode: "GB", sourceUrl });
+      assert.equal(deriveVisaId({ countryCode: "GB", sourceUrl, visaId: resolved }), resolved);
+    }
+  });
+});
+
 // ----- resolveVisaCode -----
 
 describe("resolveVisaCode", () => {

@@ -84,6 +84,19 @@ class VisaCatalogCrawlService {
 
         const page = pages[i];
         try {
+          // ---- Resolve the record id FIRST (registry-owned identity) ----
+          // From the page's pinned `visaId`, else its URL path — never from
+          // extraction output, so it can be known before any LLM call. Doing it
+          // before the fetch means a page whose id can't be derived (e.g. KR's
+          // `https://www.visa.go.kr/?LANG_TYPE=EN`: empty path) throws here and
+          // is recorded as a page error by the catch below WITHOUT spending a
+          // fetch, an LLM call or a maxExtractions slot. (Resolving after the
+          // fetch would also store its content hash, so the next crawl's hash
+          // gate would skip the page and silently clear the error.)
+          const visaId = visaCatalogService.buildVisaId(source.countryCode, page.url, {
+            visaId: page.visaId,
+          });
+
           const fetched = await visaCatalogFetchService.fetchAndClean(page.url, {
             checkRobots: true,
           });
@@ -116,8 +129,9 @@ class VisaCatalogCrawlService {
             contentHash: fetched.contentHash,
             extracted,
             model: visaCatalogExtractor.model,
-            // Registry-owned identity: pinned doc id + code (if any).
-            visaId: page.visaId,
+            // Registry-owned identity: the id resolved above (used verbatim by
+            // ingest, not recomputed) + the pinned code, if any.
+            visaId,
             visaCode: page.visaCode,
           });
           if (outcome === "created") summary.created++;
