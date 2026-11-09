@@ -84,7 +84,7 @@ function rawVisa(over: Record<string, unknown> = {}): Record<string, unknown> {
     citations: {
       "fee.application": "£1,000 if your certificate of sponsorship is for more than 3 years",
       "fee.surcharge": "healthcare surcharge - usually £1,000 per year",
-      "fee.years": "for up to 3 years",
+      "fee.years": "Your visa can last for up to 3 years",
     },
     ...over,
   };
@@ -138,6 +138,29 @@ describe("validateExtractedVisa — feeComponents", () => {
     );
   });
 
+  test("rejects a fee.years citation with no duration in it", () => {
+    assertRejects(
+      rawVisa({ citations: { "fee.application": "a £1,000 fee", "fee.surcharge": "b", "fee.years": "£1,035 per person" } }),
+      /must quote a visa length\/duration/
+    );
+  });
+
+  test("rejects a fee.years citation that just repeats the fee.application quote", () => {
+    const line = "up to 3 years - £819 per person";
+    assertRejects(
+      rawVisa({ citations: { "fee.application": line, "fee.surcharge": "b", "fee.years": line } }),
+      /not repeat the fee\.application quote/
+    );
+  });
+
+  test("accepts duration phrasings: digits, words, years and months", () => {
+    for (const q of ["Your visa can last for up to 5 years", "2 years and 9 months", "for five years", "a 12-month course"]) {
+      assert.doesNotThrow(() =>
+        validateExtractedVisa(rawVisa({ citations: { "fee.application": "a", "fee.surcharge": "b", "fee.years": q } }))
+      );
+    }
+  });
+
   test("(d) rejects a negative amount", () => {
     const neg = [{ ...SW_COMPONENTS[0], amount: -5 }];
     assertRejects(rawVisa({ feeComponents: neg }), /amount must be >= 0/);
@@ -178,7 +201,7 @@ describe("validateExtractedVisa — feeComponents", () => {
           { kind: "surcharge", label: "Health levy", amount: 50, currency: "GBP", per: "year", years: 2 },
           { kind: "surcharge", label: "Biometrics", amount: 20, currency: "USD", per: "application" },
         ],
-        citations: { "fee.application": "a", "fee.surcharge": "b", "fee.years": "c", "fee.surcharge.2": "d" },
+        citations: { "fee.application": "a", "fee.surcharge": "b", "fee.years": "for 2 years", "fee.surcharge.2": "d" },
       })
     );
     // Currency is normalised to upper case.
@@ -207,8 +230,22 @@ describe("extractor prompt — fee rule", () => {
     }
   });
 
-  test("prompt version is bumped from v1", () => {
-    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-fee-components-v2");
+  test("prompt version is bumped (v3: deterministic fee length)", () => {
+    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-fee-length-v3");
+  });
+
+  test("states the deterministic visa-length rule with the Skilled Worker example", () => {
+    assert.match(prompt, /LONGEST length/);
+    assert.match(prompt, /Never pick a shorter-length option/);
+    assert.match(prompt, /MAXIMUM length/);
+    assert.match(prompt, /surcharge uses that SAME length/);
+    assert.match(prompt, /application amount 1618, healthcare surcharge\s+1035 per year with years 5/);
+    assert.match(prompt, /WRONG: 819 with years 3/);
+  });
+
+  test("fee.years must quote a duration, not the fee sentence", () => {
+    assert.match(prompt, /citations\['fee\.years'\].*must quote the text that states the\s+visa LENGTH\/DURATION/s);
+    assert.match(prompt, /must NOT simply repeat the fee sentence/);
   });
 });
 

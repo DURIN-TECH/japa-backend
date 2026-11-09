@@ -42,8 +42,16 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *  - v1 (implicit, pre-#59): the LLM returned `baseCostUsd` it converted itself.
  *  - "2026-11-fee-components-v2" (#59): fee returned as published components;
  *    code does the arithmetic and the FX conversion.
+ *  - "2026-11-fee-length-v3" (#59): deterministic visa-length selection (the
+ *    LONGEST standard outside-country option; surcharges use the same years)
+ *    and `fee.years` must quote a duration, not the fee line.
  */
-export const EXTRACTOR_PROMPT_VERSION = "2026-11-fee-components-v2";
+export const EXTRACTOR_PROMPT_VERSION = "2026-11-fee-length-v3";
+
+// A duration phrase: a number (digits or a word) followed by year(s)/month(s),
+// e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
+const DURATION_RE =
+  /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)[\s-]*(years?|months?)\b/i;
 
 // Allowed fee component enums (mirrored from the types for validation).
 const FEE_KINDS: FeeComponentKind[] = ["application", "surcharge"];
@@ -244,7 +252,22 @@ function validateFeeComponents(
         years = y;
       }
       const yKey = feeYearsCitationKey(yearCount);
-      if (!hasCitation(yKey)) errors.push(`${where} is per year but citations["${yKey}"] is missing`);
+      if (!hasCitation(yKey)) {
+        errors.push(`${where} is per year but citations["${yKey}"] is missing`);
+      } else {
+        // The years citation must state a DURATION ("up to 5 years",
+        // "2 years and 9 months", "five years"), not just a fee amount…
+        const yQuote = citations[yKey];
+        if (!DURATION_RE.test(yQuote)) {
+          errors.push(`citations["${yKey}"] must quote a visa length/duration (e.g. "up to 5 years")`);
+        }
+        // …and must not just repeat the application-fee sentence (the
+        // failure seen live: the "up to 3 years - £819" fee line reused).
+        const appQuote = citations[feeCitationKey("application", 1)];
+        if (appQuote && appQuote.trim() === yQuote.trim()) {
+          errors.push(`citations["${yKey}"] must quote the visa length, not repeat the fee.application quote`);
+        }
+      }
     }
 
     // currency + citation (only required for a non-zero amount)
@@ -303,22 +326,37 @@ export function buildSystemPrompt(): string {
     "- Report fees EXACTLY as the page prints them, in the page's own currency. Do NOT convert currency.",
     "- Do NOT do any arithmetic: never add, multiply or total amounts. Report each published amount as-is.",
     "- Include ONLY: (1) the MAIN applicant's government application fee for the standard case of applying",
-    "  from OUTSIDE the country (e.g. UK Skilled Worker: outside the UK, certificate of sponsorship for more",
-    "  than 3 years), and (2) MANDATORY per-applicant surcharges for the standard visa length",
-    "  (e.g. the UK Immigration Health Surcharge).",
-    "- EXCLUDE: dependants' fees, priority/premium/super-priority services, shortage-occupation or other",
-    "  reduced-rate variants, in-country fees (extending, switching, applying from inside the country),",
-    "  and optional extras.",
+    "  from OUTSIDE the country, and (2) MANDATORY per-applicant surcharges",
+    "  (e.g. the UK Immigration Health Surcharge) for that same visa length.",
+    "- EXCLUDE: dependants' fees, priority/premium/super-priority services, shortage-occupation, immigration",
+    "  salary list or other reduced-rate variants, in-country fees (extending, switching, updating, applying",
+    "  from inside the country), and optional extras.",
+    "",
+    "CHOOSING THE VISA LENGTH (apply these steps in order, deterministically):",
+    "  1. Keep only the outside-the-country, standard-rate (non-shortage, non-reduced) application fee options.",
+    "  2. If those options differ by visa length (e.g. 'up to 3 years' vs 'more than 3 years'), pick the",
+    "     option for the LONGEST length. Never pick a shorter-length option when a longer one is listed.",
+    "  3. The visa length = the MAXIMUM length the page says that option can be granted for. If the option",
+    "     is open-ended (e.g. 'more than 3 years'), use the visa's stated maximum length from elsewhere on the",
+    "     page (e.g. 'Your visa can last for up to 5 years' -> 5).",
+    "  4. Every per-year surcharge uses that SAME length as its `years` (a whole number of years; if the",
+    "     length is not a whole number of years, use the number of years the page says the surcharge is",
+    "     charged for).",
+    "  Example (UK Skilled Worker): options outside the UK are 'up to 3 years - £819' and 'more than 3 years",
+    "  - £1,618'; the visa can last up to 5 years. Correct: application amount 1618, healthcare surcharge",
+    "  1035 per year with years 5. WRONG: 819 with years 3.",
+    "",
     "- Each component is an object: { kind: 'application' | 'surcharge', label (the page's name for the fee),",
     "  amount (plain number, no symbols or thousands separators), currency (ISO 4217 code, e.g. 'GBP'),",
-    "  per: 'application' | 'year', years (integer, ONLY when per is 'year': the number of years of the",
-    "  standard visa length the surcharge is charged for) }.",
+    "  per: 'application' | 'year', years (integer, ONLY when per is 'year': the visa length from the steps above) }.",
     "- At most ONE 'application' component. A visa with no surcharge has only the application component.",
     "- A free visa: one application component with amount 0. If the page states no fee at all: [].",
     "  Never use 0 for a fee you could not find: use [] instead (0 means the page says it is free).",
     "- Citations for fees (verbatim quotes): citations['fee.application'] for the application fee,",
-    "  citations['fee.surcharge'] for the surcharge (a 2nd surcharge uses 'fee.surcharge.2'), and",
-    "  citations['fee.years'] quoting the text that supports `years` (2nd per-year component: 'fee.years.2').",
+    "  citations['fee.surcharge'] for the surcharge (a 2nd surcharge uses 'fee.surcharge.2').",
+    "- citations['fee.years'] (2nd per-year component: 'fee.years.2') must quote the text that states the",
+    "  visa LENGTH/DURATION you used for `years` (e.g. 'Your visa can last for up to 5 years'). It must",
+    "  contain that duration, and must NOT simply repeat the fee sentence used for 'fee.application'.",
   ].join("\n");
 }
 
