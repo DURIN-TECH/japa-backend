@@ -19,11 +19,12 @@ import { guidePath, guidePlainText, type GuideBody, type GuideFixture, type Guid
 //   npm run eval:record -- <route|--all> [--write]
 //
 // Re-records a golden route's guide.json from the live GOV.UK Content API and
-// prints a unified diff of `updated_at` + the guide's part text against the
+// prints a unified diff of `updated_at`, the part slugs and the guide's part text against the
 // stored fixture.
 //   - Without --write: shows the diff only, changes NO file.
-//   - With --write:    overwrites guide.json and reminds you to re-verify
-//                      expected.json (values + quotes + verifiedBy/verifiedOn).
+//   - With --write:    overwrites guide.json of every CHANGED route (an
+//                      unchanged one is left byte-for-byte) and reminds you to
+//                      re-verify expected.json (values + quotes + verifiedBy/verifiedOn).
 // So a GOV.UK change only enters the golden set as a deliberate, reviewed commit.
 //
 // Politeness (reference doc §6): every request goes through the SHARED
@@ -127,10 +128,15 @@ export function buildFixture(
   };
 }
 
-/** The text that the diff compares: `updated_at` line + every part as plain text. */
+/**
+ * The text that the diff compares: `updated_at`, the ordered part SLUGS (a
+ * renamed / added / removed slug changes section selection, so it must show
+ * even when the text is the same), then every part as plain text.
+ */
 export function diffableText(body: GuideBody | undefined): string {
   if (!body) return "";
-  return `updated_at: ${String(body.updated_at ?? "")}\n\n${guidePlainText(body)}`;
+  const slugs = (body.details?.parts ?? []).map((p) => p.slug).join(", ");
+  return `updated_at: ${String(body.updated_at ?? "")}\nparts: ${slugs}\n\n${guidePlainText(body)}`;
 }
 
 /** Options for recordRoutes (injectable for tests). */
@@ -199,16 +205,21 @@ export async function recordRoutes(opts: RecordOptions): Promise<number> {
   }
   for (const { route, fixture, changed } of recorded) {
     const file = guidePath(route.route, goldenDir);
+    // Unchanged on GOV.UK → keep the stored file byte-for-byte (its recordedAt
+    // and expected.fixtureRecordedAt stay valid; SW/Graduate stay identical to
+    // test/fixtures). Only a real change is rewritten.
+    if (!changed) {
+      log(`unchanged, not rewritten: ${path.relative(process.cwd(), file)}`);
+      continue;
+    }
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(fixture, null, 2) + "\n");
     log(`wrote ${path.relative(process.cwd(), file)}`);
-    if (changed) {
-      log(
-        `  -> RE-VERIFY eval/golden/${route.route}/expected.json against the live page: ` +
-          "values, `source` quotes (npm test checks they are still in guide.json), " +
-          "and reset verifiedBy/verifiedOn to the person who checked."
-      );
-    }
+    log(
+      `  -> RE-VERIFY eval/golden/${route.route}/expected.json against the live page: ` +
+        "values, `source` quotes (npm test checks they are still in guide.json), " +
+        "fixtureRecordedAt, and reset verifiedBy/verifiedOn to the person who checked."
+    );
   }
   return 0;
 }

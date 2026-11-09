@@ -93,6 +93,11 @@ export interface EvalResultFile {
   gitDirty: boolean; // uncommitted changes at run time
   mode: "live" | "replay";
   replayOf?: string; // replay: the results file re-scored
+  // True when the run did NOT cover the whole golden set (live `--only`, or a
+  // replay of a subset). Its gate verdict then only speaks for those routes and
+  // must never be attached to a PR as THE eval result (report says PARTIAL).
+  partial: boolean;
+  routesRun: string[]; // the routes this run scored, in order
   config: {
     weights: typeof FIELD_WEIGHTS;
     processingDaysTolerance: number;
@@ -236,7 +241,7 @@ const cell = (s: string, w: number) => (s.length >= w ? s.slice(0, w) : s + " ".
 /** Print the report table (per route x field type, overall, gate, notes). */
 export function printReport(res: EvalResultFile, log: (l: string) => void): void {
   const types: FieldType[] = ["fee", "exact", "numeric", "text", "eligibility", "url"];
-  log(`\nVisa extraction eval — ${res.mode}${res.replayOf ? ` of ${res.replayOf}` : ""}`);
+  log(`\nVisa extraction eval — ${res.mode}${res.replayOf ? ` of ${res.replayOf}` : ""}${res.partial ? ` — PARTIAL (${res.routesRun.join(", ")})` : ""}`);
   log(`prompt ${res.extractorPromptVersion} | model ${res.model} | ran ${res.ranAt} | git ${res.gitSha.slice(0, 12)}${res.gitDirty ? " (dirty)" : ""}\n`);
   log(`${cell("route", 22)}${cell("score", 8)}${types.map((t) => cell(t, 12)).join("")}`);
   for (const r of res.routes) {
@@ -266,7 +271,11 @@ export function printReport(res: EvalResultFile, log: (l: string) => void): void
   const notes = res.routes.flatMap((r) => r.score.notes.map((n) => `  ${r.route}: ${n}`));
   if (notes.length) log(`\nNotes (never fail the run):\n${notes.join("\n")}`);
 
-  log(`\nGATE: ${res.pass ? "PASS" : "FAIL"}`);
+  // A partial run's verdict covers only the routes it ran: say so loudly.
+  const partial = res.partial
+    ? ` (PARTIAL: ${res.routesRun.length} of ${EVAL_ROUTES.length} routes — not a full eval result)`
+    : "";
+  log(`\nGATE: ${res.pass ? "PASS" : "FAIL"}${partial}`);
   for (const fl of res.failures) log(`  - ${fl}`);
 }
 
@@ -292,6 +301,14 @@ function readResults(file: string): EvalResultFile {
   return JSON.parse(fs.readFileSync(path.resolve(file), "utf8")) as EvalResultFile;
 }
 
+/**
+ * True when `routesRun` is not the whole golden set (a missing route, e.g. a
+ * live `--only` run or a replay of a subset). Extra routes don't matter here.
+ */
+export function isPartialRun(routesRun: string[]): boolean {
+  return EVAL_ROUTES.some((r) => !routesRun.includes(r.route));
+}
+
 /** Assemble a results file from scored routes. */
 export function buildResults(
   routes: RouteRecord[],
@@ -299,8 +316,11 @@ export function buildResults(
 ): EvalResultFile {
   const scores = routes.map((r) => r.score);
   const gate = evaluateGate(scores);
+  const routesRun = routes.map((r) => r.route);
   return {
     ...meta,
+    partial: isPartialRun(routesRun),
+    routesRun,
     config: {
       weights: FIELD_WEIGHTS,
       processingDaysTolerance: PROCESSING_DAYS_TOLERANCE,

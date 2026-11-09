@@ -270,7 +270,8 @@ function scoreNumber(field: ScoredField, expected: ExpectedNumber, actual: unkno
   const v = expected.value ?? NaN;
   const tol = processingTolerance(v);
   const ok = Math.abs(actual - v) <= tol;
-  return result(field, ok ? 1 : 0, exp, actual, ok ? undefined : `outside ${v} +/- ${tol}`);
+  // Rounded for display only (0.2 x 56 prints as 11.200000000000001 otherwise).
+  return result(field, ok ? 1 : 0, exp, actual, ok ? undefined : `outside ${v} +/- ${Number(tol.toFixed(2))}`);
 }
 
 /** name: normalised actual contains the normalised expected core name. */
@@ -314,7 +315,9 @@ function scoreEligibility(expected: { themes: ExpectedTheme[] }, actual: unknown
 function scoreHost(expected: ExpectedValue<string>, actualUrl: unknown): FieldResult {
   const host = urlHost(actualUrl);
   const ok = host !== "" && host === expected.value.toLowerCase();
-  return result("applicationUrlHost", ok ? 1 : 0, expected.value, actualUrl ?? null, ok ? undefined : `host "${host}"`);
+  // Detail names BOTH hosts, so the report never reads as if the actual host were expected.
+  const detail = ok ? undefined : `host "${host || "(none)"}", expected "${expected.value}"`;
+  return result("applicationUrlHost", ok ? 1 : 0, expected.value, actualUrl ?? null, detail);
 }
 
 // ----- Fees (set-based, hard gate) -----
