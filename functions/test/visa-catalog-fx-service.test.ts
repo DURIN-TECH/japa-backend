@@ -23,6 +23,12 @@
 //    write) for a flagged scraped visa; approving a converted one and
 //    rejecting a flagged one both work
 //  - visaController.reviewVisa maps the typed error to 409 with the message
+//  - runOrchestrator host backoff (issue #64), with a stubbed HTTP client:
+//    a 429/503 stops requests to that host for the rest of the run (other
+//    hosts continue), the retry-after time is stored on the source, the run
+//    counts as a failure (auto-pause at 5), a later run skips the host until
+//    then without counting a failure (and defers nextCrawlAt past it), an
+//    expired backoff is crawled again and pruned
 
 import { test, describe, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -525,6 +531,197 @@ describe("runOrchestrator — weekly night window", () => {
     } finally {
       console.error = origError;
     }
+  });
+});
+
+// ----- Orchestrator: host backoff on 429/503 (issue #64) -----
+//
+// The orchestrator gets adapters over a fetch service whose HTTP client is a
+// stub (records every requested URL), with no politeness delay and a clock
+// fixed at the tick, so Retry-After instants are exact. Pages carry the hash
+// of the stub's page text as lastContentHash, so a successful fetch hits the
+// hash gate and never reaches the (throwing) extractor stub.
+
+describe("runOrchestrator — host backoff on 429/503", () => {
+  const TICK = "2026-11-09T02:15:00Z"; // Mon 02:15 GMT: inside GB_WINDOW
+  const tickMs = Date.parse(TICK);
+  // Long enough page text to pass the fetch service's 100-char minimum.
+  const PAGE_HTML =
+    "<html><body><main><h1>Work visa</h1><p>" +
+    "You can apply for this visa if you have a job offer from an approved employer. ".repeat(5) +
+    "</p></main></body></html>";
+
+  /** A stubbed response. */
+  type Stub = { status: number; body?: string; headers?: Record<string, unknown> };
+  let calls: string[] = [];
+  let adapters: any;
+  let pageHash = "";
+
+  /** Build adapters over a stub serving `routes` (default: 200 PAGE_HTML; robots.txt 404). */
+  async function wire(routes: Record<string, Stub>): Promise<void> {
+    const { VisaCatalogFetchService } = await import("../src/services/visa-catalog-fetch.service");
+    const { createSourceAdapters } = await import("../src/services/visa-source-adapters");
+    calls = [];
+    const fetchService = new VisaCatalogFetchService({
+      minIntervalMs: 0,
+      clock: () => tickMs,
+      http: {
+        async get(url: string) {
+          calls.push(url);
+          const r: Stub =
+            routes[url] ?? (url.endsWith("/robots.txt") ? { status: 404 } : { status: 200, body: PAGE_HTML });
+          return { status: r.status, data: r.body ?? "", headers: r.headers ?? {} };
+        },
+      },
+    });
+    pageHash = fetchService.hash(fetchService.htmlToCleanText(PAGE_HTML));
+    adapters = createSourceAdapters(fetchService);
+  }
+
+  /** A registry page on `url`, already crawled (hash = the stub's text). */
+  const pg = (url: string) => ({ url, routeName: "Route", validation: "text_verified", lastContentHash: pageHash });
+
+  /** An active generic-html source, due, on GB_WINDOW, with `urls` as pages. */
+  function putPagedSource(cc: string, urls: string[], over: Data = {}): void {
+    putSource(cc, { pages: urls.map(pg), ...over });
+  }
+
+  const run = () => crawl.runOrchestrator({ now: tickMs, adapters, fetchFxRates: async () => ({ rates: { GBP: 0.8 }, rateDate: isoDaysAgo(1) }) });
+  const src = (cc: string) => store.get(`visaSources/${cc}`)!;
+  const pagesOf = (cc: string) => src(cc).pages as any[];
+
+  beforeEach(() => {
+    store.delete("visaSources/GB"); // the shared paused fixture
+  });
+
+  test("429 (Retry-After seconds): rest of the host skipped, other hosts continue, backoff stored, run counts as a failure", async () => {
+    await wire({
+      "https://a.example.gov/visas/one": { status: 429, headers: { "retry-after": "3600" } },
+    });
+    putPagedSource("ZZ", [
+      "https://a.example.gov/visas/one",
+      "https://a.example.gov/visas/two",
+      "https://b.example.gov/visas/three",
+    ]);
+
+    const summary = await run();
+
+    // a.example.gov: only robots + the throttled page were requested; page two never was.
+    assert.deepEqual(calls, [
+      "https://a.example.gov/robots.txt",
+      "https://a.example.gov/visas/one",
+      "https://b.example.gov/robots.txt",
+      "https://b.example.gov/visas/three",
+    ]);
+    const until = "2026-11-09T03:15:00.000Z";
+    const pages = pagesOf("ZZ");
+    assert.equal(pages[0].lastError, `host backed off (429), retry after ${until}`);
+    assert.equal(pages[1].lastError, `host backed off (429), retry after ${until}`);
+    assert.equal(pages[1].lastCrawledAt, undefined); // skipped, not crawled
+    assert.equal(pages[2].lastError, undefined); // the other host was fine
+
+    // Stored for the next run.
+    const backoffs = src("ZZ").hostBackoffs as any[];
+    assert.equal(backoffs.length, 1);
+    assert.equal(backoffs[0].host, "a.example.gov");
+    assert.equal(backoffs[0].status, 429);
+    assert.equal((backoffs[0].until as Timestamp).toDate().toISOString(), until);
+    assert.equal((backoffs[0].recordedAt as Timestamp).toMillis(), tickMs);
+
+    // A throttled run is a failure even though one page fetched.
+    assert.equal(src("ZZ").consecutiveFailures, 1);
+    assert.equal(src("ZZ").status, "active");
+    // Not every host is backed off -> normal weekly schedule.
+    assert.equal(nextOf("ZZ"), "2026-11-16T02:00:00.000Z");
+    assert.equal(summary.hostsBackedOff, 1);
+    assert.equal(summary.pagesDeferred, 1);
+    assert.equal(summary.pagesFetched, 1);
+  });
+
+  test("503 (HTTP-date) with 4 prior failures -> auto-paused (broken)", async () => {
+    await wire({
+      "https://a.example.gov/visas/one": { status: 503, headers: { "retry-after": "Mon, 09 Nov 2026 04:00:00 GMT" } },
+    });
+    putPagedSource("ZZ", ["https://a.example.gov/visas/one"], { consecutiveFailures: 4 });
+
+    await run();
+
+    assert.equal(src("ZZ").consecutiveFailures, 5);
+    assert.equal(src("ZZ").status, "broken");
+    assert.equal(pagesOf("ZZ")[0].lastError, "host backed off (503), retry after 2026-11-09T04:00:00.000Z");
+  });
+
+  test("missing Retry-After -> default backoff stored", async () => {
+    await wire({ "https://a.example.gov/robots.txt": { status: 429 } }); // throttled on robots.txt itself
+    putPagedSource("ZZ", ["https://a.example.gov/visas/one", "https://a.example.gov/visas/two"]);
+
+    await run();
+
+    assert.deepEqual(calls, ["https://a.example.gov/robots.txt"]); // no page request at all
+    const backoffs = src("ZZ").hostBackoffs as any[];
+    assert.equal((backoffs[0].until as Timestamp).toMillis(), tickMs + 60 * 60 * 1000);
+    assert.equal(src("ZZ").consecutiveFailures, 1);
+  });
+
+  test("the next run before retry-after: no request, no failure counted, nextCrawlAt deferred past it", async () => {
+    await wire({});
+    // Stored by an earlier run: a.example.gov asked us to wait until Tue 17 Nov.
+    putPagedSource("ZZ", ["https://a.example.gov/visas/one", "https://a.example.gov/visas/two"], {
+      consecutiveFailures: 2,
+      hostBackoffs: [
+        {
+          host: "a.example.gov",
+          until: Timestamp.fromMillis(Date.parse("2026-11-17T00:00:00Z")),
+          status: 429,
+          recordedAt: Timestamp.fromMillis(Date.parse("2026-11-02T02:15:00Z")),
+        },
+      ],
+    });
+
+    const summary = await run();
+
+    assert.deepEqual(calls, []); // the host was not contacted
+    assert.equal(summary.pagesDeferred, 2);
+    assert.equal(summary.hostsBackedOff, 0);
+    assert.equal(src("ZZ").consecutiveFailures, 2); // a deferral is not a failure
+    assert.match(pagesOf("ZZ")[0].lastError, /^host backed off \(429\), retry after 2026-11-17T00:00:00.000Z$/);
+    // Next Monday (16th) is before the retry-after -> the Monday after.
+    assert.equal(nextOf("ZZ"), "2026-11-23T02:00:00.000Z");
+    assert.equal((src("ZZ").hostBackoffs as any[]).length, 1); // kept
+  });
+
+  test("an expired stored backoff: host crawled again, entry pruned, success resets failures", async () => {
+    await wire({});
+    putPagedSource("ZZ", ["https://a.example.gov/visas/one"], {
+      consecutiveFailures: 1,
+      hostBackoffs: [
+        {
+          host: "a.example.gov",
+          until: Timestamp.fromMillis(tickMs - 1000),
+          status: 503,
+          recordedAt: Timestamp.fromMillis(tickMs - 7 * DAY_MS),
+        },
+      ],
+    });
+
+    await run();
+
+    assert.deepEqual(calls, ["https://a.example.gov/robots.txt", "https://a.example.gov/visas/one"]);
+    assert.deepEqual(src("ZZ").hostBackoffs, []);
+    assert.equal(src("ZZ").consecutiveFailures, 0);
+    assert.equal(pagesOf("ZZ")[0].lastError, undefined);
+  });
+
+  test("a host that throttled one source is not requested by a later source in the same run", async () => {
+    await wire({ "https://a.example.gov/visas/one": { status: 429, headers: { "retry-after": "60" } } });
+    putPagedSource("AA", ["https://a.example.gov/visas/one"], { nextCrawlAt: Timestamp.fromMillis(Date.parse("2026-11-01T00:00:00Z")) });
+    putPagedSource("BB", ["https://a.example.gov/visas/two"]); // due later -> processed second
+
+    await run();
+
+    assert.equal(calls.filter((u) => u.includes("/visas/")).length, 1); // only AA's page
+    assert.match(pagesOf("BB")[0].lastError, /^host backed off \(429\)/);
+    assert.equal(src("BB").consecutiveFailures, 0); // BB was only deferred
   });
 });
 
