@@ -22,6 +22,8 @@ the previous results file to show the before/after.
 
 A run costs about 6 DeepSeek calls (a few cents). The key is read from
 `functions/.env.local` (`DEEPSEEK_API_KEY`), or export it in your shell.
+The script loads that file with `node --env-file-if-exists`, which needs
+**Node 22.9 or later** (an older 22.x fails at startup with "bad option").
 
 ```bash
 cd functions
@@ -30,6 +32,11 @@ npm run eval:visa-extract -- --only student-visa               # one route
 npm run eval:visa-extract -- --compare eval/results/<old>.json # + delta vs an earlier run
 npm run eval:visa-extract -- --replay eval/results/<run>.json  # re-score stored outputs, no LLM, no key
 ```
+
+Only a run over **all** routes is an eval result for a PR. A live `--only`
+run (or a replay of a file with fewer routes) is marked `partial: true` in the
+results file and prints `PARTIAL` in the header and next to the gate verdict:
+its PASS/FAIL covers only the routes it ran.
 
 Exit codes: `0` pass, `1` below the gate, `2` usage/config error (no key,
 missing fixture, unknown route, unreadable results file). Without a key (and
@@ -57,10 +64,10 @@ reviewed commit, and never to make one run pass.
 | Field | Type | Rule | Weight |
 |---|---|---|---|
 | `feeComponents` | fee | Set-based (order-independent) exact match on `kind`, `amount`, `currency`, `per`, `years`. A missing, extra, wrong-amount or wrong-years component, or `feeUnverifiedReasons` on the output, is a **mismatch** | 3 |
-| `eligibility` | eligibility | Fraction of expected themes with at least one keyword alternative present (whole words, case-insensitive) in the joined `eligibilityCriteria`. No LLM judge | 2 |
+| `eligibility` | eligibility | Fraction of expected themes with at least one keyword alternative present (whole words, case-insensitive) in the joined `eligibilityCriteria`. No LLM judge. Keep alternatives specific to the theme: phrases such as "18 or over" or "aged 16", never bare numbers, the route's own name ("talent") or generic words ("money", "income", "offer", "relationship", "in the uk") that vague criteria would hit | 2 |
 | `category` | exact | Equal | 1 |
 | `isExtendable` | exact | Equal | 1 |
-| `processingDaysMin` / `processingDaysMax` | numeric | Within ±20% of `value` (at least ±1 day), `PROCESSING_DAYS_TOLERANCE` / `PROCESSING_DAYS_MIN_TOLERANCE_DAYS`. When the page only bounds a value ("within 3 weeks" says nothing about the minimum), expected uses an inclusive `range` instead (e.g. `[0, 21]`) | 1 each |
+| `processingDaysMin` / `processingDaysMax` | numeric | Within ±20% of `value` (at least ±1 day), `PROCESSING_DAYS_TOLERANCE` / `PROCESSING_DAYS_MIN_TOLERANCE_DAYS`. **Full range** (user decision): min = the outside-country decision time, max = the inside-country time where the page states one (Global Talent: 21–56); if the inside time is the shorter one, the range runs from the shorter to the longer (Family: 56–84). When the page gives only one figure, it is the max and the min is an inclusive `range` `[0, max]` ("within 8 weeks" says nothing about the minimum) | 1 each |
 | `name` | text | Normalised actual contains the expected core name ("Skilled Worker") | 1 |
 | `validityPeriod` | text | Fraction of the expected durations (e.g. 2 years + 9 months) stated in the text | 1 |
 | `applicationUrlHost` | url | Host of `applicationUrl` equals the expected host | 1 |
@@ -100,7 +107,7 @@ field type mean               …
 OVERALL 0.900 (pass >= 0.85, every route >= 0.7, no fee mismatch)
 
 Field failures:
-  skilled-worker-visa.applicationUrlHost (0.000): host "www.gov.uk" | actual "https://www.gov.uk/…"
+  skilled-worker-visa.applicationUrlHost (0.000): host "www.gov.uk", expected "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk" | actual "https://www.gov.uk/…"
 Notes (never fail the run):
   student-visa: known gap #69 (feeComponents): IHS is on a linked page
 GATE: PASS
@@ -156,7 +163,10 @@ npm run eval:record -- <route> --write  # overwrite guide.json
 ```
 
 It uses the shared production fetch service: our bot User-Agent, robots.txt
-check, at least 1.5s between requests, one route at a time. A non-200,
+check, at least 1.5s between requests, one route at a time. The diff covers
+`updated_at`, the ordered part slugs (a renamed slug changes which sections
+the extractor sees) and every part's text. `--write` only rewrites routes
+whose diff is non-empty; an unchanged fixture is left byte-for-byte. A non-200,
 non-JSON, non-guide, withdrawn or part-less response aborts without writing
 anything (with `--all`, nothing is written if any route fails).
 

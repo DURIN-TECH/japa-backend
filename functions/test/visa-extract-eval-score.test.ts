@@ -223,8 +223,9 @@ function perfectSW(): ExtractedVisa {
     description: "Work for an approved employer.",
     category: "work",
     processingTime: "3 weeks",
-    processingDaysMin: 1,
-    processingDaysMax: 21,
+    // Full range (user decision): outside-UK 3 weeks .. inside-UK 8 weeks.
+    processingDaysMin: 21,
+    processingDaysMax: 56,
     feeComponents: [
       { kind: "application", label: "fee", amount: 1618, currency: "GBP", per: "application" },
       { kind: "surcharge", label: "IHS", amount: 1035, currency: "GBP", per: "year", years: 5 },
@@ -351,10 +352,22 @@ describe("scorer (eval/score.ts)", () => {
       a.processingDaysMax = max;
       return field(scoreRoute(SW, a), "processingDaysMax").score;
     };
-    assert.equal(at(25), 1); // 21 + 4 <= 4.2
-    assert.equal(at(17), 1); // 21 - 4
-    assert.equal(at(26), 0); // 21 + 5 > 4.2
-    assert.equal(at(16), 0);
+    // SW max = 56 (inside-UK 8 weeks): tolerance 11.2 days.
+    assert.ok(Math.abs(processingTolerance(56) - 11.2) < 1e-9);
+    assert.equal(at(67), 1); // 56 + 11 <= 11.2
+    assert.equal(at(45), 1); // 56 - 11
+    assert.equal(at(68), 0); // 56 + 12 > 11.2
+    assert.equal(at(44), 0);
+    // SW min = 21 (outside-UK 3 weeks): tolerance 4.2 days.
+    const atMin = (min: number) => {
+      const a = perfectSW();
+      a.processingDaysMin = min;
+      return field(scoreRoute(SW, a), "processingDaysMin").score;
+    };
+    assert.equal(atMin(25), 1);
+    assert.equal(atMin(17), 1);
+    assert.equal(atMin(26), 0);
+    assert.equal(atMin(0), 0); // "within" is no longer the SW rule: min is a point value
     // Small expected value: the 1-day floor applies.
     const small: ExpectedVisa = { ...SW, processingDaysMax: { value: 2, source: "" } };
     const s = (v: number) => {
@@ -367,16 +380,35 @@ describe("scorer (eval/score.ts)", () => {
     assert.equal(s(4), 0);
   });
 
-  test("numeric: range mode (page only bounds the value) is inclusive", () => {
+  test("numeric: range mode (page gives one figure: min in [0, max]) is inclusive", () => {
+    // Graduate: in-UK only, "within 8 weeks" → min range [0, 56].
+    const grad = loadExpected("graduate-visa");
+    assert.deepEqual(grad.processingDaysMin.range, [0, 56]);
     const at = (min: number) => {
       const a = perfectSW();
       a.processingDaysMin = min;
-      return field(scoreRoute(SW, a), "processingDaysMin").score;
+      return field(scoreRoute(grad, a), "processingDaysMin").score;
     };
     assert.equal(at(0), 1);
-    assert.equal(at(21), 1);
-    assert.equal(at(22), 0);
+    assert.equal(at(56), 1);
+    assert.equal(at(57), 0);
     assert.equal(at(-1), 0);
+  });
+
+  test("processing time follows the full-range decision on every route", () => {
+    const want: Record<string, [unknown, number]> = {
+      "skilled-worker-visa": [21, 56],
+      "standard-visitor": [21, 56],
+      "student-visa": [21, 56],
+      "graduate-visa": [[0, 56], 56],
+      "uk-family-visa": [56, 84],
+      "global-talent": [21, 56],
+    };
+    for (const [route, [min, max]] of Object.entries(want)) {
+      const e = loadExpected(route);
+      assert.deepEqual(Array.isArray(min) ? e.processingDaysMin.range : e.processingDaysMin.value, min, route);
+      assert.equal(e.processingDaysMax.value, max, route);
+    }
   });
 
   test("keyword: eligibility = fraction of themes hit, whole-word matching", () => {
@@ -389,6 +421,28 @@ describe("scorer (eval/score.ts)", () => {
     assert.equal(containsKeyword("Visa costs", "cos"), false);
     assert.equal(containsKeyword("A CoS from your employer", "cos"), true);
     assert.equal(containsKeyword("combined income of £29,000", "29,000"), true);
+  });
+
+  test("keyword: vague criteria do not satisfy the tightened eligibility themes (review probes)", () => {
+    const grad = loadExpected("graduate-visa");
+    const gt = loadExpected("global-talent");
+    const fam = loadExpected("uk-family-visa");
+    const score = (e: ExpectedVisa, crit: string[]) =>
+      field(scoreRoute(e, { ...perfectSW(), eligibilityCriteria: crit }), "eligibility").score;
+    // Each probe scored 0.75 or matched with the old, loose keywords.
+    assert.equal(
+      score(grad, ["You must have studied in the UK", "Your university must have confirmed something", "You must hold a degree"]),
+      0
+    );
+    assert.equal(score(gt, ["Global Talent visa applicants must be 18 and do research"]), 1 / 4); // only the field theme
+    assert.equal(
+      field(scoreRoute(fam, { ...perfectSW(), eligibilityCriteria: ["Must be 18 months into a relationship"] }), "eligibility").detail?.includes("18 or over"),
+      true
+    );
+    // The page's own wording ("you’re in the UK", curly apostrophe) still hits the theme.
+    assert.equal(score(grad, ["you\u2019re in the UK"]), 1 / 4);
+    // The real requirement still matches.
+    assert.equal(score(gt, ["Be a leader in digital technology", "Hold an endorsement", "Be 18 or over"]), 1);
   });
 
   test("keyword: validityPeriod must state each expected duration", () => {
@@ -419,7 +473,10 @@ describe("scorer (eval/score.ts)", () => {
   test("url: applicationUrl host must equal the expected host", () => {
     const a = perfectSW();
     a.applicationUrl = "https://www.gov.uk/skilled-worker-visa/apply";
-    assert.equal(field(scoreRoute(SW, a), "applicationUrlHost").score, 0);
+    const r = field(scoreRoute(SW, a), "applicationUrlHost");
+    assert.equal(r.score, 0);
+    // The failure names both hosts.
+    assert.equal(r.detail, 'host "www.gov.uk", expected "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk"');
     a.applicationUrl = "not a url";
     assert.equal(field(scoreRoute(SW, a), "applicationUrlHost").score, 0);
   });
@@ -504,6 +561,9 @@ describe("runner (eval/run.ts)", () => {
     assert.match(out, /OVERALL 0\.900/);
     assert.match(out, /GATE: PASS/);
     assert.match(out, /known gap #69/);
+    // The sample covers 2 of the 6 routes: the verdict is flagged as partial.
+    assert.match(out, /GATE: PASS \(PARTIAL: 2 of 6 routes/);
+    assert.match(out, /replay of eval-sample-results\.json — PARTIAL \(skilled-worker-visa, student-visa\)/);
   });
 
   test("--replay exits 1 when a stored output has a fee mismatch", async () => {
@@ -594,6 +654,10 @@ describe("runner (eval/run.ts)", () => {
     assert.equal(res.routes[0].extracted, null);
     assert.match(res.routes[0].error ?? "", /DeepSeek API error 500/);
     assert.equal(res.routes[0].score.score, 0);
+    // A live --only run is a PARTIAL result, recorded in the file and the report.
+    assert.equal(res.partial, true);
+    assert.deepEqual(res.routesRun, ["skilled-worker-visa"]);
+    assert.match(c.lines.join("\n"), /GATE: FAIL \(PARTIAL: 1 of 6 routes/);
     assert.deepEqual(res.thresholds, { overall: OVERALL_PASS_THRESHOLD, route: ROUTE_PASS_THRESHOLD });
     assert.match(c.lines.join("\n"), /EXTRACTION FAILED/);
   });
@@ -691,6 +755,39 @@ describe("eval:record (eval/record.ts)", () => {
     assert.match(written._fixture.recordedBy, /Seli-VisaCatalogBot\/1\.0.*Accept: application\/json/);
     assert.deepEqual(written.body.details?.parts, loadGuide("graduate-visa").body.details?.parts);
     assert.match(lines2.join("\n"), /RE-VERIFY eval\/golden\/graduate-visa\/expected\.json/);
+  });
+
+  test("--write leaves an unchanged fixture byte-for-byte (no new recordedAt)", async () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, "graduate-visa"));
+    const storedFile = path.join(dir, "graduate-visa", "guide.json");
+    const original = fs.readFileSync(path.join(FIXTURES, "govuk-graduate-visa.json"), "utf8");
+    fs.writeFileSync(storedFile, original);
+    const { service } = recordService({ [api]: servedBody("govuk-graduate-visa.json") });
+    const lines: string[] = [];
+    const code = await recordRoutes({
+      routes: graduate, write: true, fetchService: service, goldenDir: dir, log: (l) => lines.push(l), today: "2030-01-01",
+    });
+    assert.equal(code, 0);
+    assert.equal(fs.readFileSync(storedFile, "utf8"), original);
+    assert.match(lines.join("\n"), /unchanged, not rewritten/);
+    assert.doesNotMatch(lines.join("\n"), /RE-VERIFY/);
+  });
+
+  test("the diff reports part slug changes even when the text is identical", async () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, "graduate-visa"));
+    const stored = loadGuide("graduate-visa");
+    const parts = stored.body.details?.parts ?? [];
+    parts[1] = { ...parts[1], slug: "old-course-slug" }; // same title + body, renamed slug
+    fs.writeFileSync(path.join(dir, "graduate-visa", "guide.json"), JSON.stringify(stored));
+    const { service } = recordService({ [api]: servedBody("govuk-graduate-visa.json") });
+    const lines: string[] = [];
+    await recordRoutes({ routes: graduate, write: false, fetchService: service, goldenDir: dir, log: (l) => lines.push(l) });
+    const out = lines.join("\n");
+    assert.match(out, /graduate-visa: CHANGED/);
+    assert.match(out, /^-parts: overview, old-course-slug,/m);
+    assert.match(out, /^\+parts: overview, course-you-studied,/m);
   });
 
   test("argument parsing", () => {
