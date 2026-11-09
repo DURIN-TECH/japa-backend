@@ -170,10 +170,13 @@ class VisaCatalogService {
     // Only refresh a visa that is still an unapproved scrape; never overwrite an
     // approved or agent-authored record.
     if (existing.source === "scraped" && existing.reviewStatus === "pending_review") {
-      await ref.set(
-        { ...fields, sourceUrl, scrapeMeta, updatedAt: now },
-        { merge: true }
-      );
+      // update() (not set+merge): a top-level `scrapeMeta` key REPLACES the
+      // whole map. set(..., {merge:true}) would deep-merge it, leaving stale
+      // keys from the previous extraction behind (e.g. an old totalUsd /
+      // fxSource next to a new fxStale flag, or old citations). Other
+      // top-level fields not in `fields` are kept — in particular an omitted
+      // `baseCostUsd` (unconverted fee) stays UNCHANGED, as intended.
+      await ref.update({ ...fields, sourceUrl, scrapeMeta, updatedAt: now });
       return { visaId, outcome: "updated" };
     }
     return { visaId, outcome: "skipped" };

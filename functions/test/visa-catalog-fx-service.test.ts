@@ -240,6 +240,68 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
   });
 });
 
+// ----- Ingest: stale rate on an existing pending doc -----
+
+describe("ingestExtraction — stale rate on an existing pending doc", () => {
+  test("fee flagged fxStale, old USD provenance gone, baseCostUsd unchanged", async () => {
+    const fresh = { ...oldFx(), fetchedAt: Timestamp.now() };
+    const path = "countries/GB/visaTypes/gb-skilled-worker-visa";
+    store.set(path, scrapedVisa(fresh)); // converted: baseCostUsd 5000, totalUsd, fxSource
+    const svc = (await import("../src/services/visa-catalog.service")).visaCatalogService;
+    const out = await svc.ingestExtraction({
+      countryCode: "GB",
+      sourceUrl: "https://www.gov.uk/skilled-worker-visa",
+      routeName: "Skilled Worker visa",
+      contentHash: "page-hash-2", // changed content
+      extracted: {
+        name: "Skilled Worker visa", code: "SW", description: "d", category: "work",
+        processingTime: "3 weeks", processingDaysMin: 15, processingDaysMax: 21,
+        feeComponents: SW, validityPeriod: "5 years", isExtendable: true,
+        eligibilityCriteria: ["x"], confidence: 0.9, citations: {},
+      },
+      model: "stub",
+      visaId: "gb-skilled-worker-visa",
+      fx: oldFx(), // 8 days old
+    });
+    assert.equal(out.outcome, "updated");
+    const doc = store.get(path)!;
+    const fee = (doc.scrapeMeta as any).fee;
+    assert.equal(fee.fxStale, true);
+    // scrapeMeta replaced wholesale: no leftover conversion from last time.
+    assert.equal(fee.totalUsd, undefined);
+    assert.equal(fee.fxSource, undefined);
+    assert.equal(fee.fxRateToUsd, undefined);
+    assert.equal(doc.baseCostUsd, 5000); // unchanged, not overwritten, not 0
+    assert.equal(doc.reviewStatus, "pending_review");
+    assert.equal(doc.isActive, false);
+  });
+
+  test("new doc with no rate: baseCostUsd absent", async () => {
+    const svc = (await import("../src/services/visa-catalog.service")).visaCatalogService;
+    await svc.ingestExtraction({
+      countryCode: "TW",
+      sourceUrl: "https://www.boca.gov.tw/visitor-visa",
+      routeName: "Visitor visa",
+      contentHash: "h",
+      extracted: {
+        name: "Visitor visa", code: "V", description: "d", category: "tourist",
+        processingTime: "", processingDaysMin: 1, processingDaysMax: 5,
+        feeComponents: [{ kind: "application", label: "Fee", amount: 1600, currency: "TWD", per: "application" }],
+        validityPeriod: "", isExtendable: false, eligibilityCriteria: ["x"], confidence: 0.9,
+        citations: { "fee.application": "NT$1,600" },
+      },
+      model: "stub",
+      visaId: "tw-visitor-visa",
+      fx: { ...oldFx(), fetchedAt: Timestamp.now() },
+    });
+    const doc = store.get("countries/TW/visaTypes/tw-visitor-visa")!;
+    assert.equal("baseCostUsd" in doc, false);
+    assert.equal((doc.scrapeMeta as any).fee.fxMissing, true);
+    assert.equal(doc.reviewStatus, "pending_review");
+    assert.equal(doc.isActive, false);
+  });
+});
+
 // ----- Approval guard in the service + controller -----
 
 describe("visaService.updateVisaReviewStatus — approval guard", () => {
