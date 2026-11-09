@@ -158,6 +158,10 @@ before(async () => {
   firebase = await import("../src/utils/firebase");
   firebase.collections.appConfig = fakeCollection("appConfig");
   firebase.collections.visaSources = fakeCollection("visaSources");
+  // Issue #61: reconvertFlaggedFees also scans open pendingVisaChanges rows
+  // (empty here), so that collection must be faked too or it would try to
+  // reach a real Firestore.
+  firebase.collections.pendingVisaChanges = fakeCollection("pendingVisaChanges");
   firebase.collections.countries = fakeCollection("countries");
   firebase.subcollections.visaTypes = (cc: string) => fakeCollection(`countries/${cc}/visaTypes`);
 
