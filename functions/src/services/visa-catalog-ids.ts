@@ -194,6 +194,9 @@ export const SOURCE_CRAWL_STATE_FIELDS = [
   "status",
   "reliabilityScore",
   "consecutiveFailures",
+  // Host backoffs (issue #64): a re-seed must not let us hit a host that
+  // asked us to wait.
+  "hostBackoffs",
 ] as const;
 
 /**

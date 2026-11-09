@@ -23,6 +23,13 @@
  * doc at the resolved id is deactivated (isActive:false + staleSince, set
  * once); seeded/agent docs are never touched; nothing is created.
  *
+ * Host backoff (issue #64): a 429/503 from a host stops this run from
+ * requesting that host again (its remaining pages are reported as skipped),
+ * and pages on a host whose stored `hostBackoffs` retry-after time (written by
+ * the scheduled orchestrator) is still ahead are skipped too. This script does
+ * NOT write source health, so it neither persists a new backoff nor counts a
+ * failure — the scheduled orchestrator owns that.
+ *
  * Usage (after `npm run build`, or with `npx tsx src/scripts/crawl-visa-catalog.ts`):
  *   node lib/scripts/crawl-visa-catalog.js --country GB
  *   node lib/scripts/crawl-visa-catalog.js --visa "skilled worker"
@@ -118,6 +125,12 @@ async function main() {
   );
   const { visaCatalogExtractor } = await import("../services/visa-catalog-extract.service");
   const { visaCatalogService } = await import("../services/visa-catalog.service");
+  // Pure host-backoff helper (issue #64): same skip rules as the orchestrator.
+  const { HostBackoffTracker, backoffMessage, hostOf, isHostBackoffError } = await import(
+    "../services/visa-crawl-host-state"
+  );
+  // One tracker for the whole manual run (shared across countries).
+  const hostState = new HostBackoffTracker(Date.now());
 
   // Pick sources: one country, or all.
   const sourcesSnap = args.country
@@ -161,12 +174,28 @@ async function main() {
     skipped: 0,
     withdrawn: 0,
     errors: 0,
+    deferred: 0, // pages skipped: host backed off (issue #64)
   };
 
   for (const doc of sourcesSnap.docs) {
     // Registry doc; pages are full VisaSourcePage objects so the pinned
     // `visaId` / `visaCode` (registry-owned identity) reach ingestExtraction.
-    const source = doc.data() as Pick<VisaSource, "countryCode" | "countryName" | "pages" | "adapter">;
+    const source = doc.data() as Pick<
+      VisaSource,
+      "countryCode" | "countryName" | "pages" | "adapter" | "hostBackoffs"
+    >;
+    // Stored retry-after times from the scheduled crawl (Firestore Timestamps
+    // -> the helper's ms form; malformed entries ignored).
+    hostState.load(
+      (source.hostBackoffs ?? [])
+        .filter((e) => e && typeof e.host === "string" && typeof e.until?.toMillis === "function")
+        .map((e) => ({
+          host: e.host,
+          untilMs: e.until.toMillis(),
+          status: e.status,
+          recordedAtMs: e.until.toMillis(),
+        }))
+    );
     // Filter pages by --visa name if provided.
     const pages = source.pages.filter(
       (p) => !args.visa || p.routeName.toLowerCase().includes(args.visa)
@@ -174,6 +203,14 @@ async function main() {
     for (const page of pages) {
       if (processed >= args.limit) break;
       processed++;
+      // Host backed off (this run, or a stored retry-after still ahead)?
+      // Skip without any request.
+      const blocking = hostState.blocking(hostOf(page.url));
+      if (blocking) {
+        totals.deferred++;
+        console.log(`\n[${source.countryCode}] ${page.routeName}\n  -> skipped: ${backoffMessage(blocking)}`);
+        continue;
+      }
       try {
         console.log(`\n[${source.countryCode}] ${page.routeName}\n  ${page.url}`);
         // Resolve the record id BEFORE fetching/extracting (same rule as the
@@ -249,6 +286,8 @@ async function main() {
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
       } catch (err) {
         totals.errors++;
+        // 429/503: stop requesting this host for the rest of the manual run.
+        if (isHostBackoffError(err)) hostState.record(err.toEntry(Date.now()));
         console.log(`  -> ERROR: ${(err as Error).message}`);
       }
     }
@@ -258,7 +297,7 @@ async function main() {
   console.log(
     `\nDone. fetched ${totals.fetched} | created ${totals.created} | updated ${totals.updated} | ` +
       `unchanged ${totals.unchanged} | skipped ${totals.skipped} | withdrawn ${totals.withdrawn} | ` +
-      `errors ${totals.errors}`
+      `errors ${totals.errors} | host backed off ${totals.deferred}`
   );
   console.log("Review pending scraped visas at: admin → Visa Review (filter source=scraped).");
   process.exit(0);
