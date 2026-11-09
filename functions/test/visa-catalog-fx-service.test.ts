@@ -551,8 +551,8 @@ describe("runOrchestrator — host backoff on 429/503", () => {
     "You can apply for this visa if you have a job offer from an approved employer. ".repeat(5) +
     "</p></main></body></html>";
 
-  /** A stubbed response. */
-  type Stub = { status: number; body?: string; headers?: Record<string, unknown> };
+  /** A stubbed response (`responseUrl` = post-redirect URL, as axios reports it). */
+  type Stub = { status: number; body?: string; headers?: Record<string, unknown>; responseUrl?: string };
   let calls: string[] = [];
   let adapters: any;
   let pageHash = "";
@@ -570,7 +570,12 @@ describe("runOrchestrator — host backoff on 429/503", () => {
           calls.push(url);
           const r: Stub =
             routes[url] ?? (url.endsWith("/robots.txt") ? { status: 404 } : { status: 200, body: PAGE_HTML });
-          return { status: r.status, data: r.body ?? "", headers: r.headers ?? {} };
+          return {
+            status: r.status,
+            data: r.body ?? "",
+            headers: r.headers ?? {},
+            ...(r.responseUrl ? { request: { res: { responseUrl: r.responseUrl } } } : {}),
+          };
         },
       },
     });
@@ -710,6 +715,34 @@ describe("runOrchestrator — host backoff on 429/503", () => {
     assert.deepEqual(src("ZZ").hostBackoffs, []);
     assert.equal(src("ZZ").consecutiveFailures, 0);
     assert.equal(pagesOf("ZZ")[0].lastError, undefined);
+  });
+
+  test("429 after a cross-host redirect: backoff stored for the final AND the requested host", async () => {
+    await wire({
+      "https://a.example.gov/visas/one": {
+        status: 429,
+        headers: { "retry-after": "3600" },
+        responseUrl: "https://cdn.example.net/visas/one",
+      },
+    });
+    putPagedSource("ZZ", ["https://a.example.gov/visas/one", "https://a.example.gov/visas/two"], {
+      nextCrawlAt: Timestamp.fromMillis(Date.parse("2026-11-01T00:00:00Z")), // processed first
+    });
+    // A later source whose page is ON the redirect target host.
+    putPagedSource("YY", ["https://cdn.example.net/visas/three"]);
+
+    await run();
+
+    // The final (throttling) host is blocked for the rest of the run too.
+    assert.equal(calls.some((u) => u.startsWith("https://cdn.example.net/")), false);
+    assert.match(pagesOf("YY")[0].lastError, /^host backed off \(429\)/);
+    // The second page on the same origin is NOT requested (it would be
+    // redirected straight back to the host that throttled us).
+    assert.equal(calls.filter((u) => u.includes("/visas/")).length, 1);
+    // Only a.example.gov is a page host, so only it is persisted on this source.
+    const hosts = (src("ZZ").hostBackoffs as any[]).map((b) => b.host);
+    assert.deepEqual(hosts, ["a.example.gov"]);
+    assert.equal(src("ZZ").consecutiveFailures, 1);
   });
 
   test("a host that throttled one source is not requested by a later source in the same run", async () => {

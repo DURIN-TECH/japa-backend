@@ -77,6 +77,88 @@ export const PER_HOST_MIN_INTERVAL_MS = 1_500;
 // (HTML pages, robots.txt and the GOV.UK Content API alike).
 export const VISA_CATALOG_USER_AGENT = "Seli-VisaCatalogBot/1.0 (+https://weareseli.com/bot)";
 
+// How long a host's parsed robots.txt is trusted before it is re-read: 24h
+// (RFC 9309 §2.4: crawlers SHOULD NOT use a cached copy for more than 24
+// hours). Without a TTL a warm Cloud Functions instance would keep a stale
+// copy for its whole lifetime and miss a newly added Disallow.
+export const ROBOTS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * True when a robots.txt `User-agent` value names US. RFC 9309 matches the
+ * product token case-insensitively; we also accept any token containing
+ * "seli" (the historic, lenient rule) so a site writing `User-agent: Seli`
+ * or `SeliBot` is honoured too. `*` is NOT a match here (it is the fallback
+ * group, handled separately).
+ */
+export function robotsAgentMatchesUs(agent: string): boolean {
+  const a = agent.trim().toLowerCase();
+  return a !== "*" && a.includes("seli");
+}
+
+/**
+ * Parse robots.txt into the Disallow path prefixes that apply to our crawler,
+ * following RFC 9309 group rules:
+ *
+ *  - A GROUP is one or more consecutive `User-agent:` lines followed by its
+ *    rule lines (`Allow:` / `Disallow:`). The first rule line ends the agent
+ *    list; the next `User-agent:` after a rule starts a NEW group. So in
+ *      User-agent: OtherBot
+ *      User-agent: Seli-VisaCatalogBot
+ *      Disallow: /
+ *    the Disallow applies to BOTH agents (the old parser reset on each
+ *    `User-agent:` line and lost it when we were not listed last).
+ *  - If any group names our agent, ONLY those groups apply (merged, if there
+ *    are several), and the `*` group is ignored — the specific group wins.
+ *  - Otherwise the `*` group(s) apply; with neither, nothing is disallowed.
+ *  - Other lines (Sitemap, Crawl-delay, unknown) are ignored and do not end
+ *    a group's agent list. An empty `Disallow:` disallows nothing.
+ *
+ * Simplification (unchanged from before): `Allow:` lines are not evaluated
+ * (no longest-match allow-vs-disallow), so an Allow inside a disallowed tree
+ * is still treated as disallowed — the conservative side for a crawler.
+ */
+export function parseRobotsDisallows(text: string): string[] {
+  /** One robots.txt group: its user-agents and its Disallow values. */
+  interface Group {
+    agents: string[];
+    disallows: string[];
+  }
+  const groups: Group[] = [];
+  let current: Group | undefined;
+  // True once the current group has seen a rule line (its agent list is closed).
+  let inRules = false;
+
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.split("#")[0].trim();
+    if (!line) continue;
+    const colon = line.indexOf(":");
+    if (colon < 0) continue; // not a "field: value" line
+    const key = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+
+    if (key === "user-agent") {
+      // A user-agent after rules (or the very first one) opens a new group;
+      // consecutive user-agent lines extend the current group's agent list.
+      if (!current || inRules) {
+        current = { agents: [], disallows: [] };
+        groups.push(current);
+        inRules = false;
+      }
+      current.agents.push(value);
+    } else if (key === "allow" || key === "disallow") {
+      // Rules before any user-agent line belong to no group: ignored.
+      if (!current) continue;
+      inRules = true;
+      if (key === "disallow" && value) current.disallows.push(value);
+    }
+  }
+
+  // Specific groups (naming us) win; else the `*` fallback; else nothing.
+  const ours = groups.filter((g) => g.agents.some(robotsAgentMatchesUs));
+  const chosen = ours.length > 0 ? ours : groups.filter((g) => g.agents.some((a) => a.trim() === "*"));
+  return chosen.flatMap((g) => g.disallows);
+}
+
 // Block-level elements that get a trailing newline before text is read, so
 // headings/paragraphs/list items don't run together (see blockText()).
 const BLOCK_SELECTORS = "p,h1,h2,h3,h4,h5,h6,li,br,div,section,article,tr,td,dt,dd";
@@ -106,8 +188,9 @@ export interface VisaCatalogFetchServiceOptions {
   // Per-host politeness gap in ms. Default PER_HOST_MIN_INTERVAL_MS (1.5s);
   // tests lower it so they don't sleep.
   minIntervalMs?: number;
-  // Clock (epoch ms) used to turn `Retry-After` into an instant (issue #64).
-  // Default Date.now; tests inject a fixed clock so HTTP-dates are exact.
+  // Clock (epoch ms) used to turn `Retry-After` into an instant (issue #64)
+  // and to age the robots.txt cache. Default Date.now; tests inject a fixed
+  // (or advancing) clock so HTTP-dates and the TTL are exact.
   clock?: () => number;
 }
 
@@ -182,9 +265,11 @@ export class VisaCatalogFetchService {
   private readonly minIntervalMs: number;
   // Last-request time per host, for polite per-host rate limiting.
   private readonly lastRequestByHost = new Map<string, number>();
-  // Cached robots.txt disallow rules per host (null = fetch failed / none).
-  private readonly robotsCache = new Map<string, string[] | null>();
-  // Clock for Retry-After maths (see options.clock).
+  // Cached robots.txt disallow rules per host (null = fetch failed / none),
+  // with the time they were read; entries older than ROBOTS_CACHE_TTL_MS are
+  // re-fetched (see isAllowedByRobots).
+  private readonly robotsCache = new Map<string, { disallows: string[] | null; fetchedAt: number }>();
+  // Clock for Retry-After maths and the robots cache TTL (see options.clock).
   private readonly clock: () => number;
 
   constructor(options: VisaCatalogFetchServiceOptions = {}) {
@@ -201,15 +286,34 @@ export class VisaCatalogFetchService {
    * path (pages, getRaw for adapters, robots.txt) calls this right after the
    * response arrives, so no caller can accidentally treat a throttle as an
    * ordinary error and keep hammering the host. Other statuses return.
+   *
+   * Redirects: axios follows them, so a 429/503 may come from ANOTHER host
+   * than the one requested. The error's `host` is the FINAL host (the one
+   * that throttled us), read from `request.res.responseUrl`; `requestedHost`
+   * is the one we asked. responseUrl is only populated by axios's Node http
+   * adapter (follow-redirects) — stubs and other adapters may omit it — so
+   * when it is missing we fall back to the requested host. Callers record the
+   * backoff against BOTH hosts (see the orchestrator), so a missing
+   * responseUrl can never let us keep hitting the throttling host.
    */
-  private assertNotThrottled(host: string, status: number, headers: unknown): void {
-    if (!isBackoffStatus(status)) return;
+  private assertNotThrottled(
+    requestedUrl: string,
+    resp: Awaited<ReturnType<VisaCatalogHttpClient["get"]>>
+  ): void {
+    if (!isBackoffStatus(resp.status)) return;
+    const requestedHost = this.hostOf(requestedUrl);
+    const finalHost = this.hostOf(resp.request?.res?.responseUrl ?? "") || requestedHost;
     // Header lookup: axios lowercases header names; tolerate plain objects
     // (test stubs) that use the canonical casing.
-    const hdrs = (headers ?? {}) as Record<string, unknown>;
+    const hdrs = (resp.headers ?? {}) as Record<string, unknown>;
     const retryAfter = hdrs["retry-after"] ?? hdrs["Retry-After"];
     const now = this.clock();
-    throw new HostBackoffError({ host, status, untilMs: now + backoffDelayMs(retryAfter, now) });
+    throw new HostBackoffError({
+      host: finalHost,
+      requestedHost,
+      status: resp.status,
+      untilMs: now + backoffDelayMs(retryAfter, now),
+    });
   }
 
   /** Production axios client (the shape used before adapters existed). */
@@ -269,11 +373,17 @@ export class VisaCatalogFetchService {
     const host = this.hostOf(url);
     if (!host) return false;
 
-    let disallows = this.robotsCache.get(host);
-    if (disallows === undefined) {
-      // May throw HostBackoffError (429/503 on robots.txt) — left uncached.
+    // Use the cached copy only while it is younger than ROBOTS_CACHE_TTL_MS;
+    // otherwise (or on a miss) re-read robots.txt.
+    const cached = this.robotsCache.get(host);
+    let disallows: string[] | null;
+    if (cached && this.clock() - cached.fetchedAt < ROBOTS_CACHE_TTL_MS) {
+      disallows = cached.disallows;
+    } else {
+      // May throw HostBackoffError (429/503 on robots.txt) — left uncached
+      // (an expired entry stays expired, so the next check retries).
       disallows = await this.loadRobots(url);
-      this.robotsCache.set(host, disallows);
+      this.robotsCache.set(host, { disallows, fetchedAt: this.clock() });
     }
     if (!disallows || disallows.length === 0) return true;
 
@@ -288,37 +398,21 @@ export class VisaCatalogFetchService {
   }
 
   /**
-   * Fetch + parse robots.txt into a flat list of Disallow prefixes that apply to
-   * us (rules under `User-agent: *` or a Seli-specific agent). Deliberately
-   * simple — enough to respect explicit blocks without a full parser.
+   * Fetch robots.txt and parse it (parseRobotsDisallows: RFC 9309 groups;
+   * our specific group wins over `*`) into the Disallow prefixes that apply
+   * to us. null when it can't be read (fail-open).
    */
   private async loadRobots(url: string): Promise<string[] | null> {
     try {
       const origin = new URL(url).origin;
       const host = this.hostOf(url);
       await this.rateLimit(host);
-      const resp = await this.http.get(`${origin}/robots.txt`, { responseType: "text" });
+      const robotsUrl = `${origin}/robots.txt`;
+      const resp = await this.http.get(robotsUrl, { responseType: "text" });
       // 429/503 -> HostBackoffError, rethrown by the catch below (NOT fail-open).
-      this.assertNotThrottled(host, resp.status, resp.headers);
+      this.assertNotThrottled(robotsUrl, resp);
       if (resp.status >= 400 || typeof resp.data !== "string") return null;
-
-      const disallows: string[] = [];
-      // Track whether the current `User-agent` block applies to us.
-      let applies = false;
-      for (const raw of resp.data.split(/\r?\n/)) {
-        const line = raw.split("#")[0].trim();
-        if (!line) continue;
-        const [field, ...rest] = line.split(":");
-        const key = field.trim().toLowerCase();
-        const value = rest.join(":").trim();
-        if (key === "user-agent") {
-          const ua = value.toLowerCase();
-          applies = ua === "*" || ua.includes("seli");
-        } else if (key === "disallow" && applies && value) {
-          disallows.push(value);
-        }
-      }
-      return disallows;
+      return parseRobotsDisallows(resp.data);
     } catch (err) {
       // A throttle is not "robots unreadable": propagate it so the crawl
       // backs off instead of going on to request the page.
@@ -345,7 +439,7 @@ export class VisaCatalogFetchService {
     await this.rateLimit(host);
     const resp = await this.http.get(url, { responseType: "text", headers });
     // 429/503 -> HostBackoffError (Retry-After honoured by the crawl).
-    this.assertNotThrottled(host, resp.status, resp.headers);
+    this.assertNotThrottled(url, resp);
     const finalUrl = resp.request?.res?.responseUrl || url;
     const body = typeof resp.data === "string" ? resp.data : String(resp.data ?? "");
     // Header lookup is case-insensitive in axios; tolerate plain objects (stubs).
@@ -367,7 +461,7 @@ export class VisaCatalogFetchService {
     await this.rateLimit(host);
     const resp = await this.http.get(url, { responseType: "text" });
     // 429/503 -> HostBackoffError (Retry-After honoured by the crawl).
-    this.assertNotThrottled(host, resp.status, resp.headers);
+    this.assertNotThrottled(url, resp);
     const finalUrl = resp.request?.res?.responseUrl || url;
     const html = typeof resp.data === "string" ? resp.data : String(resp.data ?? "");
     return { html, status: resp.status, finalUrl };

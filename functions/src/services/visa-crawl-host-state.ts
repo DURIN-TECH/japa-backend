@@ -125,14 +125,20 @@ export function backoffMessage(entry: Pick<HostBackoffEntry, "status" | "untilMs
  * never catch errors), so it reaches the crawl's per-page catch unchanged.
  */
 export class HostBackoffError extends Error {
+  // The host that ANSWERED 429/503: the final host after redirects when the
+  // HTTP client reports it, else the requested host.
   readonly host: string;
+  // The host we sent the request to (same as `host` unless a cross-host
+  // redirect happened). Callers record both — see the orchestrator.
+  readonly requestedHost: string;
   readonly status: number;
   readonly untilMs: number;
 
-  constructor(params: { host: string; status: number; untilMs: number }) {
+  constructor(params: { host: string; status: number; untilMs: number; requestedHost?: string }) {
     super(backoffMessage(params));
     this.name = "HostBackoffError";
     this.host = params.host;
+    this.requestedHost = params.requestedHost ?? params.host;
     this.status = params.status;
     this.untilMs = params.untilMs;
   }

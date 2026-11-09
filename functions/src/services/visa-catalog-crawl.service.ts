@@ -1,6 +1,6 @@
 import { collections } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
-import { VisaSource, VisaSourceHostBackoff, VisaSourcePage } from "../types/visa-catalog";
+import { VisaSource, VisaSourcePage } from "../types/visa-catalog";
 import { visaCatalogExtractor } from "./visa-catalog-extract.service";
 import { visaCatalogService } from "./visa-catalog.service";
 import type { FxFetcher } from "./visa-catalog-fx";
@@ -12,12 +12,13 @@ import { pickSourceAdapter, sourceMetaFromDocument, type SourceAdapterSet } from
 import { isInCrawlWindow, nextWindowOpening } from "./visa-crawl-window";
 // Crawler etiquette (issue #64): per-host 429/503 backoff state for the run.
 import {
-  HostBackoffEntry,
   HostBackoffTracker,
   backoffMessage,
   hostOf,
   isHostBackoffError,
 } from "./visa-crawl-host-state";
+// Firestore <-> helper mappers for `hostBackoffs`, shared with the manual script.
+import { hostBackoffEntriesFromSource, hostBackoffEntriesToSource } from "./visa-crawl-host-backoff-store";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -84,29 +85,6 @@ export interface CrawlSummary {
   // by a stored retry-after time).
   hostsBackedOff: number;
   pagesDeferred: number;
-}
-
-/** Stored (Firestore) backoff entries -> the pure helper's ms form. */
-function entriesFromSource(stored: VisaSourceHostBackoff[] | undefined): HostBackoffEntry[] {
-  if (!Array.isArray(stored)) return [];
-  return stored
-    .filter((e) => e && typeof e.host === "string" && e.until instanceof Timestamp)
-    .map((e) => ({
-      host: e.host,
-      untilMs: e.until.toMillis(),
-      status: e.status,
-      recordedAtMs: e.recordedAt instanceof Timestamp ? e.recordedAt.toMillis() : e.until.toMillis(),
-    }));
-}
-
-/** The helper's ms entries -> the Firestore form stored on the source doc. */
-function entriesToSource(entries: HostBackoffEntry[]): VisaSourceHostBackoff[] {
-  return entries.map((e) => ({
-    host: e.host,
-    until: Timestamp.fromMillis(e.untilMs),
-    status: e.status,
-    recordedAt: Timestamp.fromMillis(e.recordedAtMs),
-  }));
 }
 
 class VisaCatalogCrawlService {
@@ -239,7 +217,7 @@ class VisaCatalogCrawlService {
       let throttledThisRun = false;
       let deferredPages = 0;
       // Stored retry-after times from earlier runs (expired ones are ignored).
-      hostState.load(entriesFromSource(source.hostBackoffs));
+      hostState.load(hostBackoffEntriesFromSource(source.hostBackoffs));
 
       for (let i = 0; i < pages.length; i++) {
         // Respect the per-run extraction cap. The source is still rescheduled
@@ -345,18 +323,25 @@ class VisaCatalogCrawlService {
           pageErrors++;
           summary.errors++;
           // ---- 429/503: back off from the host (issue #64) ----
-          // Record it for the rest of the run (and for persisting below). The
-          // error's host is the one actually requested (e.g. www.gov.uk for the
-          // Content API); the page's own host is recorded too in case an
-          // adapter ever requests a different host for a page, so the skip
-          // check above (by page host) still catches the remaining pages.
+          // Record it for the rest of the run (and for persisting below)
+          // against EVERY host involved (deduplicated by the tracker):
+          //  - err.host: the host that actually answered 429/503 (the final
+          //    host after any redirect, when the client reports it);
+          //  - err.requestedHost: the host we asked (differs only after a
+          //    cross-host redirect, or when the adapter requests another host
+          //    than the page's, e.g. an API host);
+          //  - the page's own host, because the skip check above is by PAGE
+          //    host: we cannot know where a page redirects before requesting
+          //    it, so blocking only the redirect target would let the next
+          //    page on the same origin go out and be redirected straight back
+          //    to the host that throttled us.
           if (isHostBackoffError(err)) {
             throttledThisRun = true;
             const entry = err.toEntry(now.toMillis());
             if (!hostState.isFresh(entry.host)) summary.hostsBackedOff++;
-            hostState.record(entry);
-            const pageHost = hostOf(page.url);
-            if (pageHost && pageHost !== entry.host) hostState.record({ ...entry, host: pageHost });
+            for (const h of new Set([entry.host, err.requestedHost, hostOf(page.url)])) {
+              if (h) hostState.record({ ...entry, host: h });
+            }
           }
           pages[i] = {
             ...page,
@@ -406,6 +391,13 @@ class VisaCatalogCrawlService {
       // never come back early and stay on the local-night grid); without ->
       // that instant itself. If only some hosts are backed off, the normal
       // schedule stands and their pages are skipped per page.
+      //
+      // INTENTIONAL: a windowed source then waits for the next WEEKLY
+      // opening after the retry-after, even if the host frees up minutes
+      // later (e.g. Retry-After lands mid-week -> next week's night). We do
+      // not add an off-window catch-up run: crawling only in the source's
+      // local night (issue #63) is part of being a polite crawler, and a
+      // host that just throttled us is the last one to hit at an odd hour.
       const uniqueHosts = new Set(pageHosts);
       if (uniqueHosts.size > 0 && backoffs.length === uniqueHosts.size) {
         const earliestFreeMs = Math.min(...backoffs.map((b) => b.untilMs));
@@ -426,7 +418,7 @@ class VisaCatalogCrawlService {
         status,
         reliabilityScore,
         // Always written: an empty array clears expired backoffs.
-        hostBackoffs: entriesToSource(backoffs),
+        hostBackoffs: hostBackoffEntriesToSource(backoffs),
         updatedAt: now,
       });
 

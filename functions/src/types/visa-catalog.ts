@@ -85,8 +85,6 @@ export interface CrawlWindow {
   endHour: number;
 }
 
-// One registry entry per country. Holds the known official pages for that
-// country plus health/scheduling fields (mirrors the news `NewsSource`).
 /**
  * One stored host backoff on a `visaSources/{cc}` doc (issue #64). The
  * Firestore form of `HostBackoffEntry` (services/visa-crawl-host-state.ts).
@@ -98,6 +96,8 @@ export interface VisaSourceHostBackoff {
   recordedAt: Timestamp; // tick time of the run that recorded it
 }
 
+// One registry entry per country. Holds the known official pages for that
+// country plus health/scheduling fields (mirrors the news `NewsSource`).
 export interface VisaSource {
   id: string; // ISO alpha-2 country code, e.g. "GB"
   countryCode: string;

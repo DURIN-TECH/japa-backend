@@ -129,6 +129,8 @@ async function main() {
   const { HostBackoffTracker, backoffMessage, hostOf, isHostBackoffError } = await import(
     "../services/visa-crawl-host-state"
   );
+  // Same Firestore -> helper mapper as the orchestrator (one implementation).
+  const { hostBackoffEntriesFromSource } = await import("../services/visa-crawl-host-backoff-store");
   // One tracker for the whole manual run (shared across countries).
   const hostState = new HostBackoffTracker(Date.now());
 
@@ -186,16 +188,7 @@ async function main() {
     >;
     // Stored retry-after times from the scheduled crawl (Firestore Timestamps
     // -> the helper's ms form; malformed entries ignored).
-    hostState.load(
-      (source.hostBackoffs ?? [])
-        .filter((e) => e && typeof e.host === "string" && typeof e.until?.toMillis === "function")
-        .map((e) => ({
-          host: e.host,
-          untilMs: e.until.toMillis(),
-          status: e.status,
-          recordedAtMs: e.until.toMillis(),
-        }))
-    );
+    hostState.load(hostBackoffEntriesFromSource(source.hostBackoffs));
     // Filter pages by --visa name if provided.
     const pages = source.pages.filter(
       (p) => !args.visa || p.routeName.toLowerCase().includes(args.visa)
@@ -287,7 +280,14 @@ async function main() {
       } catch (err) {
         totals.errors++;
         // 429/503: stop requesting this host for the rest of the manual run.
-        if (isHostBackoffError(err)) hostState.record(err.toEntry(Date.now()));
+        // Recorded against the answering host, the requested host and the
+        // page host (see the orchestrator's catch for why all three).
+        if (isHostBackoffError(err)) {
+          const entry = err.toEntry(Date.now());
+          for (const h of new Set([entry.host, err.requestedHost, hostOf(page.url)])) {
+            if (h) hostState.record({ ...entry, host: h });
+          }
+        }
         console.log(`  -> ERROR: ${(err as Error).message}`);
       }
     }

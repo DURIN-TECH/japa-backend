@@ -14,6 +14,11 @@
 //    throw HostBackoffError on pages, getRaw and robots.txt; robots 429 sends
 //    no page request and is not cached; other non-2xx are unchanged
 //  - both adapters let HostBackoffError propagate unchanged
+//  - a 429 after a cross-host redirect names the FINAL host (and keeps the
+//    requested one); without responseUrl it falls back to the requested host
+//  - hostBackoffEntriesFromSource / ToSource (shared by orchestrator + script)
+//  - robots.txt (review round 1): RFC 9309 groups — multi-agent group, our
+//    agent second in the list, specific group beats `*`; cache TTL 24h
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -30,9 +35,16 @@ import {
   parseRetryAfter,
 } from "../src/services/visa-crawl-host-state";
 import {
+  ROBOTS_CACHE_TTL_MS,
   VisaCatalogFetchService,
+  parseRobotsDisallows,
   type VisaCatalogHttpClient,
 } from "../src/services/visa-catalog-fetch.service";
+import {
+  hostBackoffEntriesFromSource,
+  hostBackoffEntriesToSource,
+} from "../src/services/visa-crawl-host-backoff-store";
+import { Timestamp } from "firebase-admin/firestore";
 import { GenericHtmlAdapter, GovukContentApiAdapter } from "../src/services/visa-source-adapters";
 import type { VisaSourcePage } from "../src/types/visa-catalog";
 
@@ -138,19 +150,25 @@ interface StubResponse {
   status: number;
   body?: string;
   headers?: Record<string, unknown>;
+  responseUrl?: string; // post-redirect URL, as axios's Node adapter reports it
 }
 
 /** Stub client serving `routes[url]` (404 when absent) and recording requested URLs. */
-function stubService(routes: Record<string, StubResponse>) {
+function stubService(routes: Record<string, StubResponse>, clock: () => number = () => NOW) {
   const calls: string[] = [];
   const http: VisaCatalogHttpClient = {
     async get(url) {
       calls.push(url);
       const r = routes[url] ?? { status: 404, body: "not found" };
-      return { status: r.status, data: r.body ?? "", headers: r.headers ?? {} };
+      return {
+        status: r.status,
+        data: r.body ?? "",
+        headers: r.headers ?? {},
+        ...(r.responseUrl ? { request: { res: { responseUrl: r.responseUrl } } } : {}),
+      };
     },
   };
-  const service = new VisaCatalogFetchService({ http, minIntervalMs: 0, clock: () => NOW });
+  const service = new VisaCatalogFetchService({ http, minIntervalMs: 0, clock });
   return { service, calls };
 }
 
@@ -234,5 +252,128 @@ describe("VisaCatalogFetchService — 429/503 backoff", () => {
       503,
       NOW + 10_000
     );
+  });
+});
+
+// ----- Redirects: which host gets the backoff -----
+
+describe("VisaCatalogFetchService — 429 after a redirect", () => {
+  test("names the FINAL host, keeps the requested one", async () => {
+    const { service } = stubService({
+      [PAGE_URL]: { status: 429, headers: { "retry-after": "60" }, responseUrl: "https://cdn.example.net/visas/work" },
+    });
+    await assert.rejects(service.fetchAndClean(PAGE_URL), (err: unknown) => {
+      assert.ok(isHostBackoffError(err));
+      assert.equal(err.host, "cdn.example.net");
+      assert.equal(err.requestedHost, "immi.example.gov");
+      return true;
+    });
+  });
+
+  test("no responseUrl (stub / non-Node adapter) -> the requested host", async () => {
+    const { service } = stubService({ [PAGE_URL]: { status: 503 } });
+    await assert.rejects(service.fetchAndClean(PAGE_URL), (err: unknown) => {
+      assert.ok(isHostBackoffError(err));
+      assert.equal(err.host, "immi.example.gov");
+      assert.equal(err.requestedHost, "immi.example.gov");
+      return true;
+    });
+  });
+});
+
+// ----- Firestore mappers (shared by orchestrator + manual script) -----
+
+describe("hostBackoffEntriesFromSource / ToSource", () => {
+  test("round-trips, keeps recordedAt, drops malformed entries", () => {
+    const entries = [{ host: "a.gov", untilMs: NOW + MIN, status: 429, recordedAtMs: NOW - MIN }];
+    const stored = hostBackoffEntriesToSource(entries);
+    assert.ok(stored[0].until instanceof Timestamp);
+    assert.deepEqual(hostBackoffEntriesFromSource(stored), entries);
+    const bad = [
+      { host: "", until: Timestamp.fromMillis(NOW), status: 429, recordedAt: Timestamp.fromMillis(NOW) },
+      { host: "b.gov", until: "not a timestamp", status: 429 },
+      null,
+    ] as any;
+    assert.deepEqual(hostBackoffEntriesFromSource(bad), []);
+    assert.deepEqual(hostBackoffEntriesFromSource(undefined), []);
+  });
+
+  test("a missing recordedAt falls back to until", () => {
+    const stored = [{ host: "a.gov", until: Timestamp.fromMillis(NOW + MIN), status: 503 }] as any;
+    assert.equal(hostBackoffEntriesFromSource(stored)[0].recordedAtMs, NOW + MIN);
+  });
+});
+
+// ----- robots.txt: RFC 9309 groups + cache TTL -----
+
+describe("parseRobotsDisallows — RFC 9309 groups", () => {
+  test("a group listing several agents applies to all of them (our agent first)", () => {
+    const txt = "User-agent: Seli-VisaCatalogBot\nUser-agent: OtherBot\nDisallow: /\n";
+    assert.deepEqual(parseRobotsDisallows(txt), ["/"]);
+  });
+
+  test("our agent SECOND in the list still gets the group's rules", () => {
+    const txt = "User-agent: OtherBot\nUser-agent: Seli-VisaCatalogBot\nDisallow: /private\n";
+    assert.deepEqual(parseRobotsDisallows(txt), ["/private"]);
+  });
+
+  test("a specific group wins over `*` (the `*` rules are ignored)", () => {
+    const txt = [
+      "User-agent: *",
+      "Disallow: /",
+      "",
+      "User-agent: Seli-VisaCatalogBot",
+      "Disallow: /drafts",
+    ].join("\n");
+    assert.deepEqual(parseRobotsDisallows(txt), ["/drafts"]);
+    // ...and with an empty Disallow, our group allows everything despite `*`.
+    assert.deepEqual(parseRobotsDisallows("User-agent: *\nDisallow: /\nUser-agent: seli\nDisallow:\n"), []);
+  });
+
+  test("without a specific group, `*` applies; a rule line ends the agent list", () => {
+    const txt = [
+      "User-agent: *",
+      "Disallow: /search",
+      "User-agent: OtherBot", // new group: OtherBot only
+      "Disallow: /",
+    ].join("\n");
+    assert.deepEqual(parseRobotsDisallows(txt), ["/search"]);
+  });
+
+  test("several groups naming us are merged; Sitemap/Crawl-delay don't end the agent list", () => {
+    const txt = [
+      "User-agent: Seli-VisaCatalogBot",
+      "Crawl-delay: 5",
+      "User-agent: OtherBot",
+      "Disallow: /a",
+      "Sitemap: https://x.gov/sitemap.xml",
+      "User-agent: SELI",
+      "Disallow: /b # comment",
+    ].join("\r\n");
+    assert.deepEqual(parseRobotsDisallows(txt), ["/a", "/b"]);
+  });
+
+  test("no applicable group / rules before any user-agent -> nothing disallowed", () => {
+    assert.deepEqual(parseRobotsDisallows("Disallow: /\nUser-agent: OtherBot\nDisallow: /\n"), []);
+    assert.deepEqual(parseRobotsDisallows(""), []);
+  });
+});
+
+describe("VisaCatalogFetchService — robots.txt cache TTL", () => {
+  test("re-reads robots.txt once the cached copy is older than ROBOTS_CACHE_TTL_MS", async () => {
+    let now = NOW;
+    const { service, calls } = stubService(
+      { [ROBOTS_URL]: { status: 200, body: "User-agent: *\nDisallow: /blocked\n" } },
+      () => now
+    );
+    assert.equal(await service.isAllowedByRobots(PAGE_URL), true);
+    assert.equal(await service.isAllowedByRobots("https://immi.example.gov/blocked/x"), false);
+    assert.equal(calls.length, 1); // cached within the TTL
+    now += ROBOTS_CACHE_TTL_MS - 1;
+    await service.isAllowedByRobots(PAGE_URL);
+    assert.equal(calls.length, 1); // still fresh
+    now += 1;
+    await service.isAllowedByRobots(PAGE_URL);
+    assert.equal(calls.length, 2); // expired -> re-read
   });
 });
