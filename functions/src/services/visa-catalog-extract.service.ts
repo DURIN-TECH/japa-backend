@@ -279,7 +279,7 @@ export class ExtractionValidationError extends Error {
 
 // The instruction + schema the model must follow. Stable across all pages (a
 // good candidate for provider-side prompt/context caching).
-function buildSystemPrompt(): string {
+export function buildSystemPrompt(): string {
   return [
     "You extract a SINGLE country's visa/permit into strict JSON for an immigration platform.",
     "Return ONLY a JSON object — no markdown, no prose — with EXACTLY these keys:",
