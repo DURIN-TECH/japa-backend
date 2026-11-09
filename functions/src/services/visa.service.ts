@@ -11,6 +11,10 @@ import {
   RequiredDocument,
 } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
+// Approval guard for visas with no usable USD cost (issue #59).
+import { assertVisaApprovable } from "./visa-catalog-fx";
+// Finite-only min for the denormalized country stats.
+import { finiteMin } from "./visa-catalog-meta";
 
 export interface CreateCountryInput {
   code: string;
@@ -120,10 +124,12 @@ class VisaService {
       return;
     }
 
-    const minProcessingDays = Math.min(
-      ...visaTypes.map((v) => v.processingDaysMin)
-    );
-    const minCostUsd = Math.min(...visaTypes.map((v) => v.baseCostUsd));
+    // Finite-only mins (issue #59). getVisaTypesByCountry only returns
+    // isActive docs, and approval is blocked without a finite baseCostUsd, so
+    // a pending scraped doc with no cost never gets here today — but a plain
+    // Math.min over one missing value would write NaN, so be defensive.
+    const minProcessingDays = finiteMin(visaTypes.map((v) => v.processingDaysMin));
+    const minCostUsd = finiteMin(visaTypes.map((v) => v.baseCostUsd));
 
     await collections.countries.doc(countryCode).update({
       visaTypesCount: visaTypes.length,
@@ -473,6 +479,11 @@ class VisaService {
 
   /**
    * Update visa review status (admin only)
+   *
+   * Approval guard (issue #59): `approve` throws VisaFeeNotConvertibleError
+   * (controller → 409) for a scraped visa whose fee is flagged fxStale /
+   * fxMissing, or any visa without a finite `baseCostUsd`. Nothing is written
+   * in that case. `reject` is never blocked.
    */
   async updateVisaReviewStatus(
     countryCode: string,
@@ -488,6 +499,11 @@ class VisaService {
     const doc = await visaTypeRef.get();
     if (!doc.exists) {
       throw new Error("Visa type not found");
+    }
+
+    // Refuse to publish a visa with no usable USD cost (throws, no write).
+    if (action === "approve") {
+      assertVisaApprovable(doc.data() as VisaType);
     }
 
     const updates: Record<string, unknown> = {

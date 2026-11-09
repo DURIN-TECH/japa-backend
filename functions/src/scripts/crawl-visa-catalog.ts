@@ -15,6 +15,10 @@
  * equal the page is reported "unchanged (hash gate)" and NO extraction runs.
  * Pass --force to extract anyway.
  *
+ * FX (issue #59): `appConfig/fx` is refreshed once at the start of the run
+ * (Frankfurter / ECB), flagged pending fees are re-converted, and each
+ * extracted fee is converted to `baseCostUsd` in code.
+ *
  * Withdrawn pages (GOV.UK `withdrawn_notice`) are never extracted: a scraped
  * doc at the resolved id is deactivated (isActive:false + staleSince, set
  * once); seeded/agent docs are never touched; nothing is created.
@@ -112,6 +116,20 @@ async function main() {
     process.exit(1);
   }
 
+  // ---- FX: refresh appConfig/fx once per run, before extraction (issue #59) ----
+  // Same as the orchestrator: on failure the previous doc is kept; then
+  // pending scraped visas whose fee was flagged stale/missing are
+  // re-converted from their stored components (no LLM call).
+  const fxRefresh = await visaCatalogService.refreshFx();
+  const fx = fxRefresh.fx;
+  console.log(
+    fxRefresh.refreshed
+      ? `FX: refreshed appConfig/fx (ECB date ${fx?.rateDate})`
+      : `FX: refresh FAILED (${fxRefresh.error}); using previous appConfig/fx: ${fx ? fx.rateDate : "none"}`
+  );
+  const reconvert = await visaCatalogService.reconvertFlaggedFees(fx);
+  console.log(`FX: re-converted ${reconvert.reconverted} flagged fee(s), re-flagged ${reconvert.reflagged}`);
+
   let processed = 0;
   // `unchanged` also counts hash-gate skips (no LLM call); `withdrawn` = pages
   // the source marked withdrawn (never extracted).
@@ -197,6 +215,8 @@ async function main() {
           visaCode: page.visaCode,
           // Adapter provenance for scrapeMeta.
           sourceMeta: sourceMetaFromDocument(fetched),
+          // This run's rate doc: the fee is converted in code (issue #59).
+          fx,
         });
         totals[outcome]++;
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);

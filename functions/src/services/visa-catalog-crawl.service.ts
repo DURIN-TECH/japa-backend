@@ -3,6 +3,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { VisaSource, VisaSourcePage } from "../types/visa-catalog";
 import { visaCatalogExtractor } from "./visa-catalog-extract.service";
 import { visaCatalogService } from "./visa-catalog.service";
+import type { FxFetcher } from "./visa-catalog-fx";
 // Fetching goes through the source adapter picked from `source.adapter`
 // (govuk-content-api for GB, generic-html — today's fetch service — otherwise).
 import { pickSourceAdapter, sourceMetaFromDocument } from "./visa-source-adapters";
@@ -39,6 +40,11 @@ export interface CrawlSummary {
   skipped: number; // existing approved/agent visa left untouched
   withdrawn: number; // source said withdrawn → no extraction (scraped doc deactivated if present)
   errors: number;
+  // FX (issue #59): whether appConfig/fx was refreshed this run, and how many
+  // flagged pending visas were re-converted (cost written) from stored fee
+  // components with no LLM call.
+  fxRefreshed: boolean;
+  feesReconverted: number;
 }
 
 class VisaCatalogCrawlService {
@@ -50,6 +56,8 @@ class VisaCatalogCrawlService {
   async runOrchestrator(opts?: {
     maxSources?: number;
     maxExtractions?: number;
+    // Injectable FX fetcher (tests / manual runs); defaults to Frankfurter.
+    fetchFxRates?: FxFetcher;
   }): Promise<CrawlSummary> {
     const maxSources = opts?.maxSources ?? DEFAULT_MAX_SOURCES;
     const maxExtractions = opts?.maxExtractions ?? DEFAULT_MAX_EXTRACTIONS;
@@ -64,7 +72,23 @@ class VisaCatalogCrawlService {
       skipped: 0,
       withdrawn: 0,
       errors: 0,
+      fxRefreshed: false,
+      feesReconverted: 0,
     };
+
+    // ---- FX: refresh appConfig/fx ONCE per run, before any extraction ----
+    // Never throws: on failure the previous doc is kept and used if still
+    // within FX_MAX_AGE_DAYS. Then re-convert pending scraped visas whose fee
+    // was flagged stale/missing, from their stored components (no LLM call).
+    const fxRefresh = await visaCatalogService.refreshFx(opts?.fetchFxRates);
+    const fx = fxRefresh.fx;
+    summary.fxRefreshed = fxRefresh.refreshed;
+    try {
+      summary.feesReconverted = (await visaCatalogService.reconvertFlaggedFees(fx)).reconverted;
+    } catch (err) {
+      // A failed re-convert must not abort the crawl; it retries next run.
+      console.error("Visa catalog: re-converting flagged fees failed:", err);
+    }
 
     // Due = active AND nextCrawlAt <= now, oldest first (needs the composite
     // index status+nextCrawlAt — added to firestore.indexes.json).
@@ -160,6 +184,8 @@ class VisaCatalogCrawlService {
             visaCode: page.visaCode,
             // Adapter provenance (provider, content_id, updated_at, sections, truncated).
             sourceMeta: sourceMetaFromDocument(fetched),
+            // This run's rate doc: fee converted in code (issue #59).
+            fx,
           });
           if (outcome === "created") summary.created++;
           else if (outcome === "updated") summary.updated++;

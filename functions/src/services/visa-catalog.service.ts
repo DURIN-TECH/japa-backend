@@ -1,11 +1,29 @@
 import { collections, subcollections, serverTimestamp } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import { VisaType } from "../types";
-import { ExtractedVisa } from "../types/visa-catalog";
+import { ExtractedVisa, FxRatesDoc } from "../types/visa-catalog";
 // Pure id/code rules live in a Firebase-free module so they are unit-testable.
 import { deriveVisaId, resolveVisaCode } from "./visa-catalog-ids";
 // Pure scrape-meta + withdrawn decisions (also unit-tested without Firestore).
-import { WithdrawnOutcome, buildScrapeMeta, planWithdrawnUpdate } from "./visa-catalog-meta";
+import {
+  WithdrawnOutcome,
+  buildScrapeMeta,
+  extractedToVisaFields,
+  finiteMin,
+  planWithdrawnUpdate,
+} from "./visa-catalog-meta";
+// Pure fee arithmetic + FX conversion (issue #59) and the rate refresh.
+import {
+  FxFetcher,
+  FxRefreshResult,
+  FxStore,
+  computeFee,
+  fetchFrankfurterRates,
+  isFxFresh,
+  planFeeReconvert,
+  refreshFxRates,
+} from "./visa-catalog-fx";
+import { EXTRACTOR_PROMPT_VERSION } from "./visa-catalog-extract.service";
 import type { ScrapeSourceMeta } from "./visa-source-adapters";
 
 // ============================================
@@ -26,34 +44,20 @@ import type { ScrapeSourceMeta } from "./visa-source-adapters";
 // The result of ingesting one extraction.
 export type IngestOutcome = "created" | "updated" | "unchanged" | "skipped";
 
-// Fields the extractor produces that map onto VisaType. `code` is the already
-// resolved code (registry-pinned `visaCode` if any, else the extracted one).
-function extractedToFields(
-  countryCode: string,
-  visaId: string,
-  code: string,
-  e: ExtractedVisa
-): Partial<VisaType> {
-  return {
-    id: visaId,
-    countryCode,
-    name: e.name,
-    code,
-    description: e.description,
-    category: e.category,
-    processingTime: e.processingTime,
-    processingDaysMin: e.processingDaysMin,
-    processingDaysMax: e.processingDaysMax,
-    baseCostUsd: e.baseCostUsd,
-    validityPeriod: e.validityPeriod,
-    isExtendable: e.isExtendable,
-    maxExtensions: e.maxExtensions,
-    eligibilityCriteria: e.eligibilityCriteria,
-    applicationUrl: e.applicationUrl,
-    applicationInstructions: e.applicationInstructions,
-  };
-}
+// Doc id of the rate document under `appConfig`.
+const FX_DOC_ID = "fx";
 
+// Firestore-backed store for the single `appConfig/fx` rate document
+// (backend-only: firestore.rules has no appConfig match, so clients are denied).
+export const firestoreFxStore: FxStore = {
+  async get() {
+    const snap = await collections.appConfig.doc(FX_DOC_ID).get();
+    return snap.exists ? (snap.data() as FxRatesDoc) : undefined;
+  },
+  async set(doc: FxRatesDoc) {
+    await collections.appConfig.doc(FX_DOC_ID).set(doc);
+  },
+};
 class VisaCatalogService {
   /**
    * Deterministic visa doc id for a crawled page — owned by the source
@@ -106,6 +110,10 @@ class VisaCatalogService {
     // sourceUpdatedAt, sectionsUsed, truncated) — build it with
     // sourceMetaFromDocument(). Optional: callers without it write the old shape.
     sourceMeta?: ScrapeSourceMeta;
+    // The `appConfig/fx` doc for this run (from refreshFx()). Required so a
+    // caller can't forget it; `undefined` = no stored rate at all (fees in a
+    // non-USD, non-pegged currency are then flagged fxMissing).
+    fx: FxRatesDoc | undefined;
   }): Promise<{ visaId: string; outcome: IngestOutcome }> {
     const { countryCode, sourceUrl, routeName, contentHash, extracted, model } = params;
     // Id from the registry (pin or URL path), never from extracted.code/name.
@@ -114,6 +122,15 @@ class VisaCatalogService {
     const code = resolveVisaCode(params.visaCode, extracted.code);
     const ref = subcollections.visaTypes(countryCode).doc(visaId);
     const now = Timestamp.now();
+
+    // ---- Fee: code-computed total + USD conversion (issue #59) ----
+    // `baseCostUsd` is undefined when a currency had no usable rate (or no fee
+    // was stated): it is then NOT written (absent on a new doc, unchanged on
+    // an existing pending doc) and approval is blocked by the review guard.
+    // NOTE: the content-hash gate below runs on the PAGE text, so a rate
+    // change alone never re-stages a visa; flagged fees are instead
+    // re-converted from their stored components by reconvertFlaggedFees().
+    const { baseCostUsd, feeMeta } = computeFee(extracted.feeComponents, params.fx, now);
 
     // Provenance + audit trail (adapter fields merged in when given).
     const scrapeMeta = buildScrapeMeta({
@@ -124,8 +141,10 @@ class VisaCatalogService {
       extracted,
       extractedAt: now,
       sourceMeta: params.sourceMeta,
+      fee: feeMeta,
+      extractorPromptVersion: EXTRACTOR_PROMPT_VERSION,
     });
-    const fields = extractedToFields(countryCode, visaId, code, extracted);
+    const fields = extractedToVisaFields({ countryCode, visaId, code, extracted, baseCostUsd });
 
     const snap = await ref.get();
     if (!snap.exists) {
@@ -190,6 +209,61 @@ class VisaCatalogService {
     return plan.outcome;
   }
 
+  // ============================================
+  // FX (issue #59)
+  // ============================================
+
+  /**
+   * Refresh `appConfig/fx` from Frankfurter (ECB reference rates). Call ONCE
+   * per crawl run, before extraction. On failure the previous doc is kept and
+   * returned (see refreshFxRates) — never throws, so the run continues.
+   *
+   * @param fetchRates injectable fetcher (defaults to Frankfurter via fetch).
+   */
+  async refreshFx(fetchRates: FxFetcher = () => fetchFrankfurterRates()): Promise<FxRefreshResult> {
+    return refreshFxRates({ fetchRates, store: firestoreFxStore, now: Timestamp.now() });
+  }
+
+  /**
+   * Re-convert PENDING SCRAPED visas whose `scrapeMeta.fee` is flagged
+   * fxStale / fxMissing, from their stored fee components, with the given
+   * rate doc. No LLM call, and the content hash is untouched. A fresh rate
+   * writes `baseCostUsd`, replaces `scrapeMeta.fee` (new fx fields, flags
+   * cleared). Approved / seeded / agent docs are never touched (planFeeReconvert).
+   *
+   * Only runs when `fx` is fresh — a stale doc can't clear anything. Scans
+   * each registry country's `reviewStatus == "pending_review"` docs (a
+   * single-field equality: no composite / collection-group index needed).
+   *
+   * @returns how many docs were re-converted (cost written) / re-flagged.
+   */
+  async reconvertFlaggedFees(fx: FxRatesDoc | undefined): Promise<{ reconverted: number; reflagged: number }> {
+    const result = { reconverted: 0, reflagged: 0 };
+    const now = Timestamp.now();
+    if (!isFxFresh(fx, now)) return result;
+
+    const sources = await collections.visaSources.get();
+    for (const src of sources.docs) {
+      const countryCode = (src.data().countryCode as string) || src.id;
+      const pending = await subcollections
+        .visaTypes(countryCode)
+        .where("reviewStatus", "==", "pending_review")
+        .get();
+      for (const doc of pending.docs) {
+        const plan = planFeeReconvert(doc.data() as VisaType, fx, now);
+        if (!plan) continue;
+        // Field-path update: replaces scrapeMeta.fee wholesale (clearing the
+        // flags) without touching scrapeMeta.contentHash or anything else.
+        const update: Record<string, unknown> = { "scrapeMeta.fee": plan.fee, updatedAt: now };
+        if (plan.baseCostUsd !== undefined) update.baseCostUsd = plan.baseCostUsd;
+        await doc.ref.update(update);
+        if (plan.baseCostUsd !== undefined) result.reconverted++;
+        else result.reflagged++;
+      }
+    }
+    return result;
+  }
+
   /**
    * Recompute denormalized Country stats from its current APPROVED/active visas.
    * Call after an approval flips a scraped visa live. (Pending scraped visas are
@@ -198,13 +272,12 @@ class VisaCatalogService {
   async recomputeCountryStats(countryCode: string): Promise<void> {
     const snap = await subcollections.visaTypes(countryCode).get();
     const visas = snap.docs.map((d) => d.data() as VisaType).filter((v) => v.isActive !== false);
-    const costs = visas.map((v) => v.baseCostUsd).filter((n) => Number.isFinite(n));
-    const days = visas.map((v) => v.processingDaysMin).filter((n) => Number.isFinite(n));
+    // Finite-only mins: a doc without baseCostUsd can't make the stat NaN.
     await collections.countries.doc(countryCode).set(
       {
         visaTypesCount: visas.length,
-        minCostUsd: costs.length ? Math.min(...costs) : 0,
-        minProcessingDays: days.length ? Math.min(...days) : 0,
+        minCostUsd: finiteMin(visas.map((v) => v.baseCostUsd)),
+        minProcessingDays: finiteMin(visas.map((v) => v.processingDaysMin)),
         updatedAt: serverTimestamp(),
       },
       { merge: true }
