@@ -1,9 +1,12 @@
 import { collections, subcollections, serverTimestamp } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import { VisaType } from "../types";
-import { ExtractedVisa, VisaScrapeMeta } from "../types/visa-catalog";
+import { ExtractedVisa } from "../types/visa-catalog";
 // Pure id/code rules live in a Firebase-free module so they are unit-testable.
 import { deriveVisaId, resolveVisaCode } from "./visa-catalog-ids";
+// Pure scrape-meta + withdrawn decisions (also unit-tested without Firestore).
+import { WithdrawnOutcome, buildScrapeMeta, planWithdrawnUpdate } from "./visa-catalog-meta";
+import type { ScrapeSourceMeta } from "./visa-source-adapters";
 
 // ============================================
 // VISA CATALOG SERVICE (ingest into review queue)
@@ -99,6 +102,10 @@ class VisaCatalogService {
     visaId?: string;
     // `visaCode`: the page's pinned code; overrides `extracted.code` when set.
     visaCode?: string;
+    // Adapter provenance for scrapeMeta (sourceProvider, sourceDocumentId,
+    // sourceUpdatedAt, sectionsUsed, truncated) — build it with
+    // sourceMetaFromDocument(). Optional: callers without it write the old shape.
+    sourceMeta?: ScrapeSourceMeta;
   }): Promise<{ visaId: string; outcome: IngestOutcome }> {
     const { countryCode, sourceUrl, routeName, contentHash, extracted, model } = params;
     // Id from the registry (pin or URL path), never from extracted.code/name.
@@ -108,15 +115,16 @@ class VisaCatalogService {
     const ref = subcollections.visaTypes(countryCode).doc(visaId);
     const now = Timestamp.now();
 
-    const scrapeMeta: VisaScrapeMeta = {
+    // Provenance + audit trail (adapter fields merged in when given).
+    const scrapeMeta = buildScrapeMeta({
       sourceUrl,
       routeName,
       model,
-      confidence: extracted.confidence,
-      citations: extracted.citations,
       contentHash,
+      extracted,
       extractedAt: now,
-    };
+      sourceMeta: params.sourceMeta,
+    });
     const fields = extractedToFields(countryCode, visaId, code, extracted);
 
     const snap = await ref.get();
@@ -150,6 +158,36 @@ class VisaCatalogService {
       return { visaId, outcome: "updated" };
     }
     return { visaId, outcome: "skipped" };
+  }
+
+  /**
+   * Withdrawn-source path: the source (GOV.UK `withdrawn_notice`) says the
+   * page is withdrawn, so the scraped visa at `visaId` comes off the app.
+   *
+   * Only a doc with `source === "scraped"` is modified, regardless of its
+   * reviewStatus: `isActive: false` + `staleSince` (set once, never
+   * overwritten). Seeded/agent docs are never touched; a missing doc is not
+   * created; nothing is deleted. Rules live in planWithdrawnUpdate().
+   *
+   * After an `isActive` flip the country's denormalized stats are recomputed
+   * so visaTypesCount / min cost / min days stay right.
+   *
+   * No auto-reactivation: if the guide later stops being withdrawn, nothing
+   * here (or in ingest) flips the doc back on — a human re-approves it.
+   */
+  async markWithdrawn(countryCode: string, visaId: string): Promise<WithdrawnOutcome> {
+    const ref = subcollections.visaTypes(countryCode).doc(visaId);
+    const snap = await ref.get();
+    const plan = planWithdrawnUpdate(
+      snap.exists ? (snap.data() as VisaType) : undefined,
+      Timestamp.now()
+    );
+    if (plan.update) {
+      // update() (not set) — the doc is known to exist and must stay intact.
+      await ref.update(plan.update);
+      await this.recomputeCountryStats(countryCode);
+    }
+    return plan.outcome;
   }
 
   /**

@@ -1,7 +1,7 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import * as fs from "fs";
 import * as path from "path";
-import { VisaSourcePage, VisaSourceValidation } from "../types/visa-catalog";
+import { SourceAdapterId, VisaSourcePage, VisaSourceValidation } from "../types/visa-catalog";
 import {
   VisaSourcePin,
   applyVisaSourcePins,
@@ -69,7 +69,24 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   "https://www.gov.uk/standard-visitor": { visaId: "gb-standard-visitor", visaCode: "SVV" }, // ~ uk-visitor
   "https://www.gov.uk/skilled-worker-visa": { visaId: "gb-skilled-worker-visa", visaCode: "SWV" }, // ~ uk-skilled-worker
   "https://www.gov.uk/student-visa": { visaId: "gb-student-visa", visaCode: "TIER4" }, // ~ uk-student
-  "https://www.gov.uk/uk-family-visa": { visaId: "gb-uk-family-visa", visaCode: "FAM" }, // ~ uk-family
+  // Family is ONE guide covering partner/child/parent/… routes, with slugs the
+  // default section patterns don't know (partner-spouse, proof-income-partner,
+  // provide-information). v1 keeps it as one record (matching the seed), so it
+  // gets an explicit include list: the partner route (the main one, where the
+  // fees and requirements live) plus the shared English / documents parts.
+  // Parent/child/adult-dependent/private-life parts are left out (§3.1: a
+  // later decision may split them into their own records).
+  "https://www.gov.uk/uk-family-visa": {
+    visaId: "gb-uk-family-visa",
+    visaCode: "FAM", // ~ uk-family
+    includeSections: [
+      "overview",
+      "partner-spouse",
+      "proof-income-partner",
+      "knowledge-of-english",
+      "provide-information",
+    ],
+  },
   // ---- United Kingdom (GB) — routes with no seeded equivalent (no visaCode) ----
   "https://www.gov.uk/health-care-worker-visa": { visaId: "gb-health-care-worker-visa" },
   "https://www.gov.uk/child-study-visa": { visaId: "gb-child-study-visa" },
@@ -83,6 +100,23 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   "https://www.gov.uk/british-national-overseas-bno-visa": {
     visaId: "gb-british-national-overseas-bno-visa",
   },
+};
+
+// ============================================
+// SOURCE ADAPTER PER COUNTRY (registry-owned)
+// ============================================
+//
+// ISO code -> the SourceAdapter that fetches that country's pages (see
+// services/visa-source-adapters/). Countries not listed get no `adapter` field
+// and use the default, "generic-html". Like the pins above, this is applied by
+// seedVisaSources() and REFRESHED on every re-seed (it is registry config, not
+// crawl state), while crawl state is still preserved.
+//
+// GB: GOV.UK's JSON Content API — guide parts fetched separately and selected
+// (docs/visa-scraper-uk-reference.md §3). NOTE: switching a country's adapter
+// changes its content hashes, so every page re-extracts once on the next crawl.
+export const VISA_SOURCE_ADAPTERS: Record<string, SourceAdapterId> = {
+  GB: "govuk-content-api",
 };
 
 // Weekly sweep by default (locked decision) — see the spike doc.
@@ -187,6 +221,58 @@ export function parseVisaSourcesMarkdown(markdown: string): ParsedCountry[] {
 }
 
 /**
+ * Build the `visaSources/{cc}` doc for one parsed country (pure — no I/O).
+ *
+ * Seed-owned (refreshed every seed): identity, pages from the markdown + pins
+ * (incl. section overrides), and `adapter` from `adapters`. Crawler-owned:
+ * page crawl state (mergePageCrawlState) and source health/scheduling
+ * (pickSourceCrawlState) are carried over from `existing`. Returns the doc plus
+ * the override URLs that matched a page (for the stale-override warning).
+ */
+export function buildSeededVisaSource(params: {
+  country: ParsedCountry;
+  existing: Record<string, unknown> | undefined;
+  now: Timestamp;
+  overrides?: Record<string, VisaSourcePin>;
+  adapters?: Record<string, SourceAdapterId>;
+}): { doc: Record<string, unknown>; matchedUrls: Set<string> } {
+  const { country: c, existing, now } = params;
+  const overrides = params.overrides ?? VISA_SOURCE_OVERRIDES;
+  const adapters = params.adapters ?? VISA_SOURCE_ADAPTERS;
+
+  // 1. Seed-owned page fields: markdown rows + pinned identity/sections.
+  const pinned = applyVisaSourcePins(c.pages, overrides);
+
+  // 2. Crawler-owned page fields: carried over by URL from the stored doc.
+  const pages = mergePageCrawlState(pinned.pages, existing?.pages as VisaSourcePage[] | undefined);
+
+  // 3. Registry-owned adapter (absent → field omitted → generic-html default).
+  const adapter = adapters[c.countryCode];
+
+  // 4. Defaults for a new country, overlaid with any stored crawl/health
+  //    state (pickSourceCrawlState returns {} for a new country).
+  const doc: Record<string, unknown> = {
+    id: c.countryCode,
+    countryCode: c.countryCode,
+    countryName: c.countryName,
+    // The v3 list only admits official/government sources by its inclusion rule.
+    isOfficial: true,
+    pages,
+    ...(adapter ? { adapter } : {}),
+    crawlIntervalHours: CRAWL_INTERVAL_HOURS,
+    // Due immediately so the first crawl picks a new country up.
+    nextCrawlAt: now,
+    status: "active",
+    reliabilityScore: 100,
+    consecutiveFailures: 0,
+    createdAt: now,
+    ...pickSourceCrawlState(existing),
+    updatedAt: now,
+  };
+  return { doc, matchedUrls: pinned.matchedUrls };
+}
+
+/**
  * Seed the `visaSources/{countryCode}` registry from the verified-links
  * markdown plus VISA_SOURCE_OVERRIDES. Idempotent (deterministic doc ids);
  * returns the number of country sources written.
@@ -194,8 +280,9 @@ export function parseVisaSourcesMarkdown(markdown: string): ParsedCountry[] {
  * Re-seeding PRESERVES crawl state, so it is safe to run after deploys:
  *  - `pages` is rebuilt from the markdown + pins (pages removed from the
  *    markdown disappear; new pages start with no crawl state; existing pages
- *    gain/refresh `visaId`/`visaCode` — this is how deployed registries pick up
- *    the pins), then each page's crawler fields (lastContentHash, lastCrawledAt,
+ *    gain/refresh `visaId`/`visaCode`/`includeSections`/`excludeSections` —
+ *    this is how deployed registries pick up the pins), the source `adapter`
+ *    is refreshed from VISA_SOURCE_ADAPTERS, then each page's crawler fields (lastContentHash, lastCrawledAt,
  *    lastExtractedAt, lastError) are copied from the stored page with the same
  *    URL, so the hash gate still holds on the next crawl.
  *  - Source-level createdAt, nextCrawlAt, lastCrawledAt, status,
@@ -236,35 +323,12 @@ export async function seedVisaSources(markdownPath?: string): Promise<number> {
       ? (snaps[idx].data() as Record<string, unknown>)
       : undefined;
 
-    // 1. Seed-owned page fields: markdown rows + pinned identity.
-    const pinned = applyVisaSourcePins(c.pages, VISA_SOURCE_OVERRIDES);
-    pinned.matchedUrls.forEach((u) => matchedOverrideUrls.add(u));
-
-    // 2. Crawler-owned page fields: carried over by URL from the stored doc.
-    const pages = mergePageCrawlState(
-      pinned.pages,
-      existing?.pages as VisaSourcePage[] | undefined
-    );
-
-    // 3. Defaults for a new country, overlaid with any stored crawl/health
-    //    state (pickSourceCrawlState returns {} for a new country).
-    batch.set(ref, {
-      id: c.countryCode,
-      countryCode: c.countryCode,
-      countryName: c.countryName,
-      // The v3 list only admits official/government sources by its inclusion rule.
-      isOfficial: true,
-      pages,
-      crawlIntervalHours: CRAWL_INTERVAL_HOURS,
-      // Due immediately so the first crawl picks a new country up.
-      nextCrawlAt: now,
-      status: "active",
-      reliabilityScore: 100,
-      consecutiveFailures: 0,
-      createdAt: now,
-      ...pickSourceCrawlState(existing),
-      updatedAt: now,
-    });
+    // Seed-owned fields (pages + pins + adapter) refreshed, crawl state kept.
+    const { doc, matchedUrls } = buildSeededVisaSource({ country: c, existing, now });
+    matchedUrls.forEach((u) => matchedOverrideUrls.add(u));
+    // Full overwrite (no merge): a registry field removed from code (e.g. a
+    // country dropped from VISA_SOURCE_ADAPTERS) disappears from the doc too.
+    batch.set(ref, doc);
   });
 
   // Guard: an override whose URL no longer appears in the markdown (e.g. the

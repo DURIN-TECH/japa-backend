@@ -24,6 +24,14 @@ export type VisaSourceValidation =
   | "pathway_verified"
   | "unverified";
 
+// Which SourceAdapter fetches a source's pages (see
+// services/visa-source-adapters/). One adapter per KIND of source, not per
+// country:
+//  - "govuk-content-api": GOV.UK's public JSON Content API (`/api/content<path>`),
+//    one guide part per section (GB).
+//  - "generic-html": today's HTML fetch + clean (everyone else; the default).
+export type SourceAdapterId = "govuk-content-api" | "generic-html";
+
 // Crawl lifecycle — identical semantics to the news scraper's SourceStatus.
 export type CrawlStatus = "active" | "paused" | "broken" | "retired";
 
@@ -44,6 +52,14 @@ export interface VisaSourcePage {
   // identity: when set it overrides the extracted code (used so scraped GB
   // routes line up with their seeded `uk-*` equivalents for comparison).
   visaCode?: string;
+  // Section selection overrides for structured adapters (GOV.UK guide part
+  // slugs). Slug patterns, case-insensitive, `*` = any run of characters
+  // (e.g. "update-your-visa-*"). When set, each REPLACES the adapter's code
+  // default list (include and exclude independently); exclude wins over
+  // include. Registry-owned: set from VISA_SOURCE_OVERRIDES and refreshed on
+  // every re-seed. Ignored by `generic-html` (one whole-page section).
+  includeSections?: string[];
+  excludeSections?: string[];
   // Content-hash gate: skip extraction when the cleaned page text is unchanged.
   lastContentHash?: string; // sha256 of the cleaned page text last crawl
   lastCrawledAt?: Timestamp;
@@ -59,6 +75,11 @@ export interface VisaSource {
   countryName: string;
   isOfficial: boolean; // are all pages on official/government domains?
   pages: VisaSourcePage[];
+  // Which adapter fetches this country's pages. Absent = "generic-html".
+  // Registry-owned: set from VISA_SOURCE_ADAPTERS in seed-visa-sources.ts and
+  // refreshed on every re-seed. A page whose URL the adapter can't handle
+  // falls back to generic-html (see pickSourceAdapter).
+  adapter?: SourceAdapterId;
 
   // Scheduling — weekly by default (168h). Staggered via nextCrawlAt.
   crawlIntervalHours: number;
@@ -86,8 +107,24 @@ export interface VisaScrapeMeta {
   model: string; // extractor model, e.g. "deepseek-chat"
   confidence: number; // 0–1 from the extractor
   citations: Record<string, string>; // field name -> verbatim source quote
-  contentHash: string; // sha256 of the cleaned page text this was extracted from
+  contentHash: string; // sha256 of the exact text sent to the extractor (selected + capped)
   extractedAt: Timestamp;
+
+  // ---- Source provenance (issue #58; all optional so older docs stay valid) ----
+  // Which adapter fetched the text. Docs written before adapters have none.
+  sourceProvider?: SourceAdapterId;
+  // The source's own stable document id (GOV.UK `content_id` UUID — survives
+  // URL renames). Absent for generic-html.
+  sourceDocumentId?: string;
+  // When the SOURCE last changed, ISO string as published (GOV.UK `updated_at`).
+  // Absent when the source doesn't say (or for generic-html).
+  sourceUpdatedAt?: string;
+  // Slugs of the sections the extractor saw, in source order (GOV.UK part
+  // slugs). Absent/empty for generic-html (one whole page).
+  sectionsUsed?: string[];
+  // True when the selected sections exceeded the adapter's cap and the text
+  // was cut. Never silent: also logged with the page URL at fetch time.
+  truncated?: boolean;
 }
 
 // ----- Extractor output shape -----

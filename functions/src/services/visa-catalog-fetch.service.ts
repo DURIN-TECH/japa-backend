@@ -40,11 +40,98 @@ const MAIN_CONTENT_SELECTORS = ["main", "article", "[role='main']", "#content", 
 
 // Cap the cleaned text handed downstream. ~24k chars ≈ 6–8k tokens — enough for
 // a single visa page, and it bounds extraction cost + latency.
-const MAX_CLEAN_TEXT_CHARS = 24_000;
+// Applies to the `generic-html` path only; structured adapters (e.g. the GOV.UK
+// Content API adapter) have their own, separate cap.
+export const MAX_CLEAN_TEXT_CHARS = 24_000;
 
 // Minimum gap between two requests to the SAME host, so we never hammer a
 // government site. Different hosts are unaffected.
-const PER_HOST_MIN_INTERVAL_MS = 1_500;
+export const PER_HOST_MIN_INTERVAL_MS = 1_500;
+
+// Honest, identifiable bot User-Agent shared by every visa-catalog request
+// (HTML pages, robots.txt and the GOV.UK Content API alike).
+export const VISA_CATALOG_USER_AGENT = "Seli-VisaCatalogBot/1.0 (+https://weareseli.com/bot)";
+
+// Block-level elements that get a trailing newline before text is read, so
+// headings/paragraphs/list items don't run together (see blockText()).
+const BLOCK_SELECTORS = "p,h1,h2,h3,h4,h5,h6,li,br,div,section,article,tr,td,dt,dd";
+
+/**
+ * Minimal HTTP surface the fetch service needs from its client. An
+ * `AxiosInstance` satisfies it; tests inject a stub with the same `get` shape
+ * so `npm test` never touches the network.
+ */
+export interface VisaCatalogHttpClient {
+  get(
+    url: string,
+    config?: { responseType?: "text"; headers?: Record<string, string> }
+  ): Promise<{
+    status: number;
+    data: unknown;
+    headers?: unknown;
+    // Axios exposes the post-redirect URL at request.res.responseUrl (Node).
+    request?: { res?: { responseUrl?: string } };
+  }>;
+}
+
+/** Constructor options — all optional; defaults are the production values. */
+export interface VisaCatalogFetchServiceOptions {
+  // Inject an HTTP client (tests). Default: an axios instance with our UA.
+  http?: VisaCatalogHttpClient;
+  // Per-host politeness gap in ms. Default PER_HOST_MIN_INTERVAL_MS (1.5s);
+  // tests lower it so they don't sleep.
+  minIntervalMs?: number;
+}
+
+/** Raw HTTP response handed to adapters by `getRaw()`. */
+export interface RawResponse {
+  status: number; // HTTP status (non-2xx is returned, not thrown)
+  body: string; // response body as text (never parsed here)
+  finalUrl: string; // URL after redirects
+  contentType: string; // Content-Type header ("" when absent)
+}
+
+// `AnyNode` is domhandler's node union. domhandler is only a transitive
+// dependency (via cheerio), so rather than import it directly we recover the
+// type from `cheerio.load`'s first parameter (string | AnyNode | AnyNode[] | Buffer).
+type AnyNode = Exclude<Parameters<typeof cheerio.load>[0], string | Buffer | unknown[]>;
+
+/**
+ * Shared HTML-to-text step: give every block element a trailing newline, read
+ * the text, and normalise whitespace. Used by BOTH `htmlToCleanText()` (whole
+ * pages, generic-html adapter) and the GOV.UK adapter (one guide part body at a
+ * time), so the two paths produce text the same way. Takes the cheerio
+ * selection to read; does NOT cap length (callers own their caps).
+ *
+ * NOTE: mutates the selection (appends "\n" to block elements) — callers pass
+ * a freshly loaded document.
+ */
+export function blockText(root: cheerio.Cheerio<AnyNode>): string {
+  // Insert line breaks between block elements — cheerio's `.text()` concatenates
+  // with no separator, which would run headings/paragraphs/list-items together
+  // into one blob ("visaYou can apply…"). Appending a newline to each block keeps
+  // the structure legible for the extractor.
+  root.find(BLOCK_SELECTORS).append("\n");
+
+  // Normalise: collapse runs of spaces, collapse blank-line runs, trim.
+  return root
+    .text()
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Convert an HTML FRAGMENT (e.g. one GOV.UK guide part's `body`) to plain text
+ * with the shared block-newline logic. No boilerplate stripping or main-region
+ * picking — a fragment is already just content.
+ */
+export function htmlFragmentToText(html: string): string {
+  const $ = cheerio.load(html);
+  // cheerio wraps a fragment in <html><body>; read from <body>.
+  return blockText($("body"));
+}
 
 export interface FetchedPage {
   url: string; // the URL requested
@@ -60,18 +147,28 @@ export interface FetchedPage {
  * orchestrator (Step 5) owns persistence and the content-hash comparison.
  */
 export class VisaCatalogFetchService {
-  private readonly http: AxiosInstance;
+  // The ONE HTTP client for every visa-catalog request (pages, robots.txt and
+  // structured adapters such as the GOV.UK Content API go through it).
+  private readonly http: VisaCatalogHttpClient;
+  // Per-host politeness gap (ms); PER_HOST_MIN_INTERVAL_MS unless overridden.
+  private readonly minIntervalMs: number;
   // Last-request time per host, for polite per-host rate limiting.
   private readonly lastRequestByHost = new Map<string, number>();
   // Cached robots.txt disallow rules per host (null = fetch failed / none).
   private readonly robotsCache = new Map<string, string[] | null>();
 
-  constructor() {
+  constructor(options: VisaCatalogFetchServiceOptions = {}) {
+    this.minIntervalMs = options.minIntervalMs ?? PER_HOST_MIN_INTERVAL_MS;
+    this.http = options.http ?? VisaCatalogFetchService.createDefaultClient();
+  }
+
+  /** Production axios client (the shape used before adapters existed). */
+  private static createDefaultClient(): AxiosInstance {
     // Mirrors the news scraper's client: identifies our bot, bounds time + size.
-    this.http = axios.create({
+    return axios.create({
       timeout: 15_000,
       headers: {
-        "User-Agent": "Seli-VisaCatalogBot/1.0 (+https://weareseli.com/bot)",
+        "User-Agent": VISA_CATALOG_USER_AGENT,
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
       },
@@ -103,7 +200,7 @@ export class VisaCatalogFetchService {
   private async rateLimit(host: string): Promise<void> {
     const last = this.lastRequestByHost.get(host);
     if (last !== undefined) {
-      const wait = PER_HOST_MIN_INTERVAL_MS - (Date.now() - last);
+      const wait = this.minIntervalMs - (Date.now() - last);
       if (wait > 0) await this.delay(wait);
     }
     this.lastRequestByHost.set(host, Date.now());
@@ -172,6 +269,29 @@ export class VisaCatalogFetchService {
   }
 
   /**
+   * Rate-limited GET through the shared client, for adapters that need the raw
+   * response (e.g. the GOV.UK Content API adapter). Waits out the per-host gap
+   * first, sends our UA (client default) plus any extra `headers` (such as
+   * `Accept: application/json`), and returns status/body/final URL WITHOUT
+   * throwing on non-2xx — the adapter decides what is an error. Robots is NOT
+   * checked here; call `isAllowedByRobots()` first (as fetchAndClean does).
+   *
+   * Keeping this the only way adapters reach the network means the rate limit,
+   * robots cache and client live in one place (#15 can swap them here).
+   */
+  async getRaw(url: string, headers?: Record<string, string>): Promise<RawResponse> {
+    const host = this.hostOf(url);
+    await this.rateLimit(host);
+    const resp = await this.http.get(url, { responseType: "text", headers });
+    const finalUrl = resp.request?.res?.responseUrl || url;
+    const body = typeof resp.data === "string" ? resp.data : String(resp.data ?? "");
+    // Header lookup is case-insensitive in axios; tolerate plain objects (stubs).
+    const hdrs = (resp.headers ?? {}) as Record<string, unknown>;
+    const contentType = String(hdrs["content-type"] ?? hdrs["Content-Type"] ?? "");
+    return { status: resp.status, body, finalUrl, contentType };
+  }
+
+  /**
    * Fetch one page's raw HTML (rate-limited, redirect-following). Returns the
    * HTML string + status + final URL. Non-HTML or error statuses are surfaced so
    * the caller can record source health rather than crashing the run.
@@ -182,8 +302,7 @@ export class VisaCatalogFetchService {
     const host = this.hostOf(url);
     await this.rateLimit(host);
     const resp = await this.http.get(url, { responseType: "text" });
-    const finalUrl =
-      (resp.request?.res?.responseUrl as string | undefined) || url;
+    const finalUrl = resp.request?.res?.responseUrl || url;
     const html = typeof resp.data === "string" ? resp.data : String(resp.data ?? "");
     return { html, status: resp.status, finalUrl };
   }
@@ -209,21 +328,9 @@ export class VisaCatalogFetchService {
       }
     }
 
-    // Insert line breaks between block elements — cheerio's `.text()` concatenates
-    // with no separator, which would run headings/paragraphs/list-items together
-    // into one blob ("visaYou can apply…"). Appending a newline to each block keeps
-    // the structure legible for the extractor.
-    root
-      .find("p,h1,h2,h3,h4,h5,h6,li,br,div,section,article,tr,td,dt,dd")
-      .append("\n");
-
-    // Normalise: collapse runs of spaces, collapse blank-line runs, trim.
-    const text = root
-      .text()
-      .replace(/[ \t\f\v]+/g, " ")
-      .replace(/\n[ \t]+/g, "\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+    // Block newlines + whitespace normalisation (shared with the GOV.UK
+    // adapter's per-part conversion), then the generic-html cap.
+    const text = blockText(root);
     return text.length > MAX_CLEAN_TEXT_CHARS ? text.slice(0, MAX_CLEAN_TEXT_CHARS) : text;
   }
 

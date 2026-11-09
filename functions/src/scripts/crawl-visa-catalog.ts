@@ -7,10 +7,23 @@
  * countries/{code}/visaTypes as reviewStatus="pending_review" / source="scraped"
  * and show up in the admin visa-review page for approval.
  *
- * Usage (after `npm run build`):
+ * Fetching uses the source's adapter (VisaSource.adapter: govuk-content-api for
+ * GB, generic-html otherwise), exactly like the orchestrator.
+ *
+ * Hash gate: before calling the LLM, the fetched content hash is compared with
+ * the `scrapeMeta.contentHash` on the existing doc at the resolved id; when
+ * equal the page is reported "unchanged (hash gate)" and NO extraction runs.
+ * Pass --force to extract anyway.
+ *
+ * Withdrawn pages (GOV.UK `withdrawn_notice`) are never extracted: a scraped
+ * doc at the resolved id is deactivated (isActive:false + staleSince, set
+ * once); seeded/agent docs are never touched; nothing is created.
+ *
+ * Usage (after `npm run build`, or with `npx tsx src/scripts/crawl-visa-catalog.ts`):
  *   node lib/scripts/crawl-visa-catalog.js --country GB
  *   node lib/scripts/crawl-visa-catalog.js --visa "skilled worker"
  *   node lib/scripts/crawl-visa-catalog.js --country GB --visa "student" --limit 3
+ *   node lib/scripts/crawl-visa-catalog.js --country GB --limit 2 --force
  *   node lib/scripts/crawl-visa-catalog.js --country GB --project durin-seli-dev
  *
  * Needs DEEPSEEK_API_KEY (loaded from functions/.env.local automatically) and a
@@ -23,11 +36,14 @@ import * as path from "path";
 // Type-only import: erased at compile time, so it doesn't trigger Firebase init
 // before the env below is set.
 import type { VisaSource } from "../types/visa-catalog";
+import type { VisaType } from "../types";
 
 // ---- CLI args ----
 function parseArgs(argv: string[]) {
-  const out: { country?: string; visa?: string; project?: string; limit: number } = {
+  // `force`: skip the hash gate and always extract.
+  const out: { country?: string; visa?: string; project?: string; limit: number; force: boolean } = {
     limit: 25,
+    force: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -35,6 +51,7 @@ function parseArgs(argv: string[]) {
     else if (a === "--visa") out.visa = argv[++i]?.toLowerCase();
     else if (a === "--project" || a === "-p") out.project = argv[++i];
     else if (a === "--limit") out.limit = parseInt(argv[++i] || "25", 10);
+    else if (a === "--force") out.force = true;
   }
   return out;
 }
@@ -79,8 +96,10 @@ async function main() {
 
   // Import AFTER env is set so utils/firebase initializes against this project.
   await import("../utils/firebase");
-  const { collections } = await import("../utils/firebase");
-  const { visaCatalogFetchService } = await import("../services/visa-catalog-fetch.service");
+  const { collections, subcollections } = await import("../utils/firebase");
+  const { pickSourceAdapter, sourceMetaFromDocument } = await import(
+    "../services/visa-source-adapters"
+  );
   const { visaCatalogExtractor } = await import("../services/visa-catalog-extract.service");
   const { visaCatalogService } = await import("../services/visa-catalog.service");
 
@@ -94,12 +113,22 @@ async function main() {
   }
 
   let processed = 0;
-  const totals = { fetched: 0, created: 0, updated: 0, unchanged: 0, skipped: 0, errors: 0 };
+  // `unchanged` also counts hash-gate skips (no LLM call); `withdrawn` = pages
+  // the source marked withdrawn (never extracted).
+  const totals = {
+    fetched: 0,
+    created: 0,
+    updated: 0,
+    unchanged: 0,
+    skipped: 0,
+    withdrawn: 0,
+    errors: 0,
+  };
 
   for (const doc of sourcesSnap.docs) {
     // Registry doc; pages are full VisaSourcePage objects so the pinned
     // `visaId` / `visaCode` (registry-owned identity) reach ingestExtraction.
-    const source = doc.data() as Pick<VisaSource, "countryCode" | "countryName" | "pages">;
+    const source = doc.data() as Pick<VisaSource, "countryCode" | "countryName" | "pages" | "adapter">;
     // Filter pages by --visa name if provided.
     const pages = source.pages.filter(
       (p) => !args.visa || p.routeName.toLowerCase().includes(args.visa)
@@ -116,9 +145,41 @@ async function main() {
         const resolvedVisaId = visaCatalogService.buildVisaId(source.countryCode, page.url, {
           visaId: page.visaId,
         });
-        const fetched = await visaCatalogFetchService.fetchAndClean(page.url, { checkRobots: true });
+        // Fetch through the source's adapter (same choice as the orchestrator).
+        const adapter = pickSourceAdapter(source.adapter, page.url);
+        const fetched = await adapter.fetch(page);
         totals.fetched++;
-        const extracted = await visaCatalogExtractor.extract(fetched.cleanText, {
+        console.log(
+          `  adapter ${adapter.id} | ${fetched.text.length} chars | hash ${fetched.contentHash.slice(0, 12)}` +
+            (fetched.sections.length && adapter.id !== "generic-html"
+              ? ` | sections ${fetched.sections.map((s) => s.slug).join(",")}`
+              : "") +
+            (fetched.truncated ? " | TRUNCATED" : "")
+        );
+
+        // Withdrawn at source → never extract (see header).
+        if (fetched.withdrawn) {
+          const result = await visaCatalogService.markWithdrawn(source.countryCode, resolvedVisaId);
+          totals.withdrawn++;
+          console.log(`  -> withdrawn on source: ${resolvedVisaId} (${result})`);
+          continue;
+        }
+
+        // Hash gate: same text as the stored extraction → no LLM call.
+        if (!args.force) {
+          const existingSnap = await subcollections
+            .visaTypes(source.countryCode)
+            .doc(resolvedVisaId)
+            .get();
+          const existing = existingSnap.exists ? (existingSnap.data() as VisaType) : undefined;
+          if (existing?.scrapeMeta?.contentHash === fetched.contentHash) {
+            totals.unchanged++;
+            console.log(`  -> unchanged (hash gate, no extraction): ${resolvedVisaId}`);
+            continue;
+          }
+        }
+
+        const extracted = await visaCatalogExtractor.extract(fetched.text, {
           url: page.url,
           countryName: source.countryName,
           routeName: page.routeName,
@@ -134,6 +195,8 @@ async function main() {
           // ingest, not recomputed) + the pinned code, if any.
           visaId: resolvedVisaId,
           visaCode: page.visaCode,
+          // Adapter provenance for scrapeMeta.
+          sourceMeta: sourceMetaFromDocument(fetched),
         });
         totals[outcome]++;
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
@@ -147,7 +210,8 @@ async function main() {
 
   console.log(
     `\nDone. fetched ${totals.fetched} | created ${totals.created} | updated ${totals.updated} | ` +
-      `unchanged ${totals.unchanged} | skipped ${totals.skipped} | errors ${totals.errors}`
+      `unchanged ${totals.unchanged} | skipped ${totals.skipped} | withdrawn ${totals.withdrawn} | ` +
+      `errors ${totals.errors}`
   );
   console.log("Review pending scraped visas at: admin → Visa Review (filter source=scraped).");
   process.exit(0);

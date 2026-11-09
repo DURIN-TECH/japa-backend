@@ -1,9 +1,11 @@
 import { collections } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import { VisaSource, VisaSourcePage } from "../types/visa-catalog";
-import { visaCatalogFetchService } from "./visa-catalog-fetch.service";
 import { visaCatalogExtractor } from "./visa-catalog-extract.service";
 import { visaCatalogService } from "./visa-catalog.service";
+// Fetching goes through the source adapter picked from `source.adapter`
+// (govuk-content-api for GB, generic-html — today's fetch service — otherwise).
+import { pickSourceAdapter, sourceMetaFromDocument } from "./visa-source-adapters";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -19,6 +21,10 @@ import { visaCatalogService } from "./visa-catalog.service";
 // whose `nextCrawlAt` is due, so the 26 seeded countries self-stagger across the
 // week instead of all firing at once.
 
+// Recorded as the page's lastError when the source says the page is withdrawn
+// (whether or not a scraped doc was deactivated), so it shows in source health.
+export const WITHDRAWN_PAGE_ERROR = "Withdrawn on GOV.UK";
+
 // Safety bounds per invocation — keep any single run cheap + within the function
 // timeout even on the first pass when every source is due.
 const DEFAULT_MAX_SOURCES = 3; // countries per run
@@ -31,6 +37,7 @@ export interface CrawlSummary {
   created: number; // new pending-review scraped visas written
   updated: number; // existing pending scraped visas refreshed
   skipped: number; // existing approved/agent visa left untouched
+  withdrawn: number; // source said withdrawn → no extraction (scraped doc deactivated if present)
   errors: number;
 }
 
@@ -55,6 +62,7 @@ class VisaCatalogCrawlService {
       created: 0,
       updated: 0,
       skipped: 0,
+      withdrawn: 0,
       errors: 0,
     };
 
@@ -97,12 +105,29 @@ class VisaCatalogCrawlService {
             visaId: page.visaId,
           });
 
-          const fetched = await visaCatalogFetchService.fetchAndClean(page.url, {
-            checkRobots: true,
-          });
+          // ---- Fetch via the source's adapter ----
+          // Throws on robots block / HTTP error / bad payload / nothing
+          // selected → recorded as a page error below, no extraction.
+          const adapter = pickSourceAdapter(source.adapter, page.url);
+          const fetched = await adapter.fetch(page);
           fetchedOk++;
           summary.pagesFetched++;
 
+          // ---- Withdrawn at source: never extract ----
+          // No LLM call and no maxExtractions slot. A SCRAPED doc at the
+          // resolved id is deactivated (isActive:false + staleSince set once);
+          // seeded/agent docs are untouched; nothing is created. The stored
+          // content hash is left as it was. No auto-reactivation if the guide
+          // returns later (see VisaCatalogService.markWithdrawn).
+          if (fetched.withdrawn) {
+            await visaCatalogService.markWithdrawn(source.countryCode, visaId);
+            summary.withdrawn++;
+            pages[i] = { ...page, lastCrawledAt: now, lastError: WITHDRAWN_PAGE_ERROR };
+            continue;
+          }
+
+          // Hash is over the exact text the extractor would see (selected +
+          // capped sections for GOV.UK; the cleaned page for generic-html).
           const changed = fetched.contentHash !== page.lastContentHash;
           // Record crawl metadata regardless of change.
           pages[i] = {
@@ -114,7 +139,7 @@ class VisaCatalogCrawlService {
           if (!changed) continue; // hash gate — nothing new, skip the LLM
 
           summary.pagesChanged++;
-          const extracted = await visaCatalogExtractor.extract(fetched.cleanText, {
+          const extracted = await visaCatalogExtractor.extract(fetched.text, {
             url: page.url,
             countryName: source.countryName,
             routeName: page.routeName,
@@ -133,6 +158,8 @@ class VisaCatalogCrawlService {
             // ingest, not recomputed) + the pinned code, if any.
             visaId,
             visaCode: page.visaCode,
+            // Adapter provenance (provider, content_id, updated_at, sections, truncated).
+            sourceMeta: sourceMetaFromDocument(fetched),
           });
           if (outcome === "created") summary.created++;
           else if (outcome === "updated") summary.updated++;
