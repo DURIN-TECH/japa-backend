@@ -86,7 +86,8 @@ export function isOfficialHost(host: string, patterns: readonly string[]): boole
 /**
  * Parse `url` and return it when it is an https URL on an official host,
  * else undefined. Used for both link rendering and `applicationUrl`.
- * Non-https schemes (http, javascript:, data:, mailto:) never pass.
+ * Non-https schemes (http, javascript:, data:, mailto:), credentials and
+ * explicit ports never pass.
  */
 export function officialHttpsUrl(url: string, patterns: readonly string[]): URL | undefined {
   let parsed: URL;
@@ -98,5 +99,25 @@ export function officialHttpsUrl(url: string, patterns: readonly string[]): URL 
   if (parsed.protocol !== "https:") return undefined;
   // Credentials in a URL are never legitimate for an apply link.
   if (parsed.username || parsed.password) return undefined;
+  // Any explicit non-default port is rejected (":8443" etc.). `URL` already
+  // normalises ":443" on https to "", so only unusual ports reach this.
+  if (parsed.port !== "") return undefined;
   return isOfficialHost(parsed.hostname, patterns) ? parsed : undefined;
+}
+
+/**
+ * The official host patterns to use for one registry source: the stored
+ * `officialHosts` when it is a non-empty array of non-empty strings, else the
+ * code map for its country (a doc seeded before #74, or a malformed field,
+ * must not disable the gate or crash the crawl).
+ */
+export function resolveOfficialHosts(stored: unknown, countryCode: string | undefined): readonly string[] {
+  if (
+    Array.isArray(stored) &&
+    stored.length > 0 &&
+    stored.every((h) => typeof h === "string" && h.trim().length > 0)
+  ) {
+    return stored as string[];
+  }
+  return officialHostsFor(countryCode);
 }

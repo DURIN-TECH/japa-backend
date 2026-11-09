@@ -152,10 +152,17 @@ export function htmlFragmentToText(html: string, options: FragmentTextOptions = 
       }
       const url = render(absolute);
       if (!url) return;
-      // Don't duplicate when the anchor text already IS the URL.
+      // Don't duplicate when the anchor text already IS the URL — compared
+      // against the raw href AND the normalised URL, each with and without a
+      // trailing slash ("https://x.gov.uk" vs "https://x.gov.uk/").
       const text = a.text().trim();
-      if (text === url) return;
-      a.append(` (${url})`);
+      const noSlash = (u: string) => u.replace(/\/+$/, "");
+      const same = [href, absolute, url].some((u) => noSlash(u) === noSlash(text));
+      if (same) return;
+      // Append as a TEXT node, never as HTML: appending a string to cheerio
+      // parses it as markup, so entities in a query string would be decoded
+      // ("&param=" → "¶m=", "&copy=" → "©="). `.text()` sets literal text.
+      a.append($("<span>").text(` (${url})`));
     });
   }
   // cheerio wraps a fragment in <html><body>; read from <body>.

@@ -124,11 +124,14 @@ export function sanitizeApplicationUrl(
   if (typeof raw !== "string" || !raw.trim()) return undefined;
   const value = raw.trim();
   if (officialHosts && officialHosts.length > 0) {
-    return officialHttpsUrl(value, officialHosts) ? value : undefined;
+    // Store the NORMALISED URL (`URL.toString()`: lower-cased host, resolved
+    // dot segments, encoded characters), not the model's raw string, so what
+    // is saved is exactly what was checked.
+    return officialHttpsUrl(value, officialHosts)?.toString();
   }
   try {
-    const { protocol } = new URL(value);
-    return protocol === "https:" || protocol === "http:" ? value : undefined;
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.toString() : undefined;
   } catch {
     return undefined;
   }

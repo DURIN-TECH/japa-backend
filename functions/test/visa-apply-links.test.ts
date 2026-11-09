@@ -25,6 +25,7 @@ import {
   isOfficialHost,
   officialHostsFor,
   officialHttpsUrl,
+  resolveOfficialHosts,
 } from "../src/services/visa-catalog-official-hosts";
 import {
   sanitizeApplicationUrl,
@@ -119,6 +120,75 @@ describe("official host matching", () => {
     assert.equal(officialHttpsUrl("https://u:p@www.gov.uk/apply", GB), undefined);
     assert.equal(officialHttpsUrl("https://x.service.gov.uk.attacker.com/apply", GB), undefined);
   });
+});
+
+describe("review fixes (round 1)", () => {
+  test("(a) any explicit non-default port is rejected; :443 normalises away", () => {
+    assert.equal(officialHttpsUrl("https://visas-immigration.service.gov.uk:8443/x", GB), undefined);
+    assert.equal(officialHttpsUrl("https://www.gov.uk:80/x", GB), undefined);
+    assert.ok(officialHttpsUrl("https://www.gov.uk:443/x", GB)); // default port → "" after parse
+    assert.equal(govukApplyLinkUrl("https://visas-immigration.service.gov.uk:8443/x"), undefined);
+    assert.equal(
+      validateExtractedVisa(rawVisa("https://visas-immigration.service.gov.uk:8443/x"), { officialHosts: GB })
+        .applicationUrl,
+      undefined
+    );
+  });
+
+  test("(b) stored officialHosts used only when a non-empty string array, else the code map", () => {
+    assert.deepEqual([...resolveOfficialHosts(["*.example.gov"], "GB")], ["*.example.gov"]);
+    for (const bad of [undefined, null, [], "www.gov.uk", [""], ["www.gov.uk", 3], [" "], {}]) {
+      assert.deepEqual([...resolveOfficialHosts(bad, "GB")], [...GB], JSON.stringify(bad));
+    }
+    assert.deepEqual([...resolveOfficialHosts(undefined, "CA")], []);
+  });
+
+  test("(c) anchor text equal to the URL (raw or normalised, +/- trailing slash) is not doubled", () => {
+    const opts = { baseUrl: "https://www.gov.uk", renderLinkUrl: govukApplyLinkUrl };
+    // href without path → normalised URL gains a "/"; text is the raw href.
+    assert.equal(
+      htmlFragmentToText('<p><a href="https://visas-immigration.service.gov.uk">https://visas-immigration.service.gov.uk</a></p>', opts),
+      "https://visas-immigration.service.gov.uk"
+    );
+    // text has a trailing slash, href doesn't.
+    assert.equal(
+      htmlFragmentToText('<p><a href="https://x.service.gov.uk/apply">https://x.service.gov.uk/apply/</a></p>', opts),
+      "https://x.service.gov.uk/apply/"
+    );
+    // text is the normalised form of an upper-case-host href.
+    assert.equal(
+      htmlFragmentToText('<p><a href="https://X.SERVICE.GOV.UK/apply">https://x.service.gov.uk/apply</a></p>', opts),
+      "https://x.service.gov.uk/apply"
+    );
+  });
+
+  test("(d) the validator stores the normalised URL, not the raw string", () => {
+    assert.equal(
+      validateExtractedVisa(rawVisa("https://VISAS-IMMIGRATION.service.gov.uk/a/../apply-visa-type/visit"), {
+        officialHosts: GB,
+      }).applicationUrl,
+      "https://visas-immigration.service.gov.uk/apply-visa-type/visit"
+    );
+    assert.equal(sanitizeApplicationUrl("https://www.gov.uk", GB), "https://www.gov.uk/");
+    assert.equal(sanitizeApplicationUrl("https://ircc.canada.ca", undefined), "https://ircc.canada.ca/");
+  });
+});
+
+describe("link rendering: query-string entities stay literal (blocking review fix)", () => {
+  const opts = { baseUrl: "https://www.gov.uk", renderLinkUrl: govukApplyLinkUrl };
+  for (const [label, hrefAttr, expectedUrl] of [
+    ["&amp; in the attribute", "https://x.service.gov.uk/apply?a=1&amp;b=2", "https://x.service.gov.uk/apply?a=1&b=2"],
+    ["raw &param=", "https://x.service.gov.uk/apply?a=1&param=2", "https://x.service.gov.uk/apply?a=1&param=2"],
+    ["raw &copy=", "https://x.service.gov.uk/apply?a=1&copy=2", "https://x.service.gov.uk/apply?a=1&copy=2"],
+    ["&amp;copy= in the attribute", "https://x.service.gov.uk/apply?a=1&amp;copy=2", "https://x.service.gov.uk/apply?a=1&copy=2"],
+  ] as const) {
+    test(label, () => {
+      const text = htmlFragmentToText(`<p><a href="${hrefAttr}">Apply</a></p>`, opts);
+      assert.equal(text, `Apply (${expectedUrl})`);
+      assert.equal(text.includes("¶"), false);
+      assert.equal(text.includes("©"), false);
+    });
+  }
 });
 
 // ----- Validator -----
