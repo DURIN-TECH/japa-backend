@@ -34,6 +34,16 @@ export interface VisaSourcePage {
   routeName: string; // human label from the source list, e.g. "Skilled Worker visa"
   validation: VisaSourceValidation;
   notes?: string; // "Useful information confirmed" column from the markdown
+  // Pinned doc id under countries/{code}/visaTypes for visas scraped from this
+  // page. The registry owns record identity: when set, it is used verbatim
+  // (never derived from what the LLM extracted), so the record survives a
+  // future URL rename. Set from VISA_SOURCE_OVERRIDES in seed-visa-sources.ts;
+  // pages without it fall back to `${cc}-${slug(url path)}`.
+  visaId?: string;
+  // Pinned visa `code` written on the scraped doc. The registry owns record
+  // identity: when set it overrides the extracted code (used so scraped GB
+  // routes line up with their seeded `uk-*` equivalents for comparison).
+  visaCode?: string;
   // Content-hash gate: skip extraction when the cleaned page text is unchanged.
   lastContentHash?: string; // sha256 of the cleaned page text last crawl
   lastCrawledAt?: Timestamp;

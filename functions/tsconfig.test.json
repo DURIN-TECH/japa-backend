@@ -1,0 +1,10 @@
+{
+  // Type-check config for the unit tests in test/ (run by `npm test` before
+  // the tests execute via tsx). Extends the build config but emits nothing, so
+  // test files never end up in lib/ or in a functions deploy.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*", "test/**/*"]
+}
