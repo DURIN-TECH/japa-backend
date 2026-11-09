@@ -1,4 +1,4 @@
-import { collections, subcollections, serverTimestamp } from "../utils/firebase";
+import { collections, subcollections } from "../utils/firebase";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { VisaType } from "../types";
 import { ExtractedVisa, FxRatesDoc } from "../types/visa-catalog";
@@ -9,7 +9,6 @@ import {
   WithdrawnOutcome,
   buildScrapeMeta,
   extractedToVisaFields,
-  finiteMin,
   planWithdrawnUpdate,
 } from "./visa-catalog-meta";
 // Pure fee arithmetic + FX conversion (issue #59) and the rate refresh.
@@ -25,6 +24,8 @@ import {
   refreshFxRates,
 } from "./visa-catalog-fx";
 import { EXTRACTOR_PROMPT_VERSION } from "./visa-catalog-extract.service";
+// Canonical country-stats recompute (issue #62: the only stats function).
+import { visaService } from "./visa.service";
 import type { ScrapeSourceMeta } from "./visa-source-adapters";
 
 // ============================================
@@ -39,8 +40,12 @@ import type { ScrapeSourceMeta } from "./visa-source-adapters";
 // That means scraped visas show up in the EXISTING admin visa-review page (which
 // already filters by source=scraped / reviewStatus=pending_review) and are
 // approved/rejected through the existing `PATCH /admin/visas/:id/review` flow —
-// no separate queue, no autopublish. Approval (elsewhere) flips
-// reviewStatus=approved + isActive=true, making the visa user-visible.
+// no separate queue, no autopublish. Approval (elsewhere:
+// visaService.updateVisaReviewStatus) flips reviewStatus=approved +
+// isActive=true (plus lastVerifiedAt, and clears staleSince), making the visa
+// user-visible, and recomputes the country stats with
+// visaService.updateCountryStats before it returns. Ingest itself never
+// changes stats: pending scraped visas are `isActive: false` and not counted.
 
 // The result of ingesting one extraction.
 export type IngestOutcome = "created" | "updated" | "unchanged" | "skipped";
@@ -208,7 +213,11 @@ class VisaCatalogService {
    * created; nothing is deleted. Rules live in planWithdrawnUpdate().
    *
    * After an `isActive` flip the country's denormalized stats are recomputed
-   * so visaTypesCount / min cost / min days stay right.
+   * so visaTypesCount / min cost / min days stay right — with the ONE
+   * canonical stats function, `visaService.updateCountryStats` (issue #62
+   * removed the duplicate catalog-side recompute that used to live here).
+   * Note it uses update(), so a missing country doc throws instead of
+   * silently creating a stub country with no name.
    *
    * No auto-reactivation: if the guide later stops being withdrawn, nothing
    * here (or in ingest) flips the doc back on — a human re-approves it.
@@ -223,7 +232,7 @@ class VisaCatalogService {
     if (plan.update) {
       // update() (not set) — the doc is known to exist and must stay intact.
       await ref.update(plan.update);
-      await this.recomputeCountryStats(countryCode);
+      await visaService.updateCountryStats(countryCode);
     }
     return plan.outcome;
   }
@@ -281,26 +290,6 @@ class VisaCatalogService {
       }
     }
     return result;
-  }
-
-  /**
-   * Recompute denormalized Country stats from its current APPROVED/active visas.
-   * Call after an approval flips a scraped visa live. (Pending scraped visas are
-   * `isActive: false` and excluded, so ingest itself doesn't change stats.)
-   */
-  async recomputeCountryStats(countryCode: string): Promise<void> {
-    const snap = await subcollections.visaTypes(countryCode).get();
-    const visas = snap.docs.map((d) => d.data() as VisaType).filter((v) => v.isActive !== false);
-    // Finite-only mins: a doc without baseCostUsd can't make the stat NaN.
-    await collections.countries.doc(countryCode).set(
-      {
-        visaTypesCount: visas.length,
-        minCostUsd: finiteMin(visas.map((v) => v.baseCostUsd)),
-        minProcessingDays: finiteMin(visas.map((v) => v.processingDaysMin)),
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
   }
 }
 
