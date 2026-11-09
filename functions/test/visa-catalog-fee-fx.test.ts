@@ -305,6 +305,12 @@ describe("extractor prompt — surcharge printed as a total (#73)", () => {
     // longer push a printed total into per-year x years.
     assert.match(prompt, /applies ONLY to a surcharge the page prints as a per-year rate/);
   });
+
+  test("a stated per-year rate wins over totals listed by length (Graduate-like page)", () => {
+    assert.match(prompt, /states a per-year rate for the surcharge, ALWAYS use per: 'year'/);
+    assert.match(prompt, /ALSO lists totals by length/);
+    assert.match(prompt, /Only when the page states NO per-year rate for it/);
+  });
 });
 
 describe("extractor prompt — full-range processing time (#60/#73)", () => {

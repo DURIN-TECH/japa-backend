@@ -48,7 +48,8 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *  - "2026-11-surcharge-total-v4" (#73): a surcharge the page prints as ONE
  *    amount for a stated stay length ("£3,105 if you're staying for 2 years
  *    and 9 months", UK Family IHS) is a total -> per:"application"; per-year x
- *    years only when the page states a per-year rate (the v3 model returned
+ *    years only when the page states a per-year rate, which wins when the page
+ *    also lists totals by length (Graduate) (the v3 model returned
  *    3105 per year x 3, tripling the Family fee). Also: processing time is the
  *    FULL standard range (min/max = shorter/longer of the outside- and
  *    inside-country standard decision times).
@@ -386,13 +387,19 @@ export function buildSystemPrompt(): string {
     // GOV.UK prints some IHS amounts per year ("£1,035 per year") and some as
     // one amount for the whole stay ("£3,105 if you're staying for 2 years
     // and 9 months"). The second is already the total: multiplying it by the
-    // years overstated the UK Family fee 3x (v3 eval baseline, #60).
+    // years overstated the UK Family fee 3x (v3 eval baseline, #60). Some
+    // pages print BOTH (Graduate: "£1,035 for each year" and "2 years - it
+    // will cost £2,070"): the per-year rate wins, so one rule covers both.
     "SURCHARGE PER YEAR vs TOTAL (decide from the page's wording, per surcharge):",
     "- per: 'year' with `years` ONLY when the page states a per-year rate for it ('£1,035 per year',",
     "  '£1,035 for each year you'll be in the UK').",
-    "- If the page prints the surcharge as ONE amount for a stated stay length ('£3,105 if you're staying for",
-    "  2 years and 9 months', '£5,175 if you're staying for 5 years'), that amount is ALREADY the TOTAL for",
-    "  the stay: report it as per: 'application' with NO `years`. Never multiply it or treat it as per year.",
+    "- If the page states a per-year rate for the surcharge, ALWAYS use per: 'year' with that rate, even",
+    "  when the page ALSO lists totals by length (e.g. '2 years - it will cost £2,070'). Do not report the",
+    "  listed total in that case.",
+    "- Only when the page states NO per-year rate for it and prints the surcharge as",
+    "  ONE amount for a stated stay length ('£3,105 if you're staying for 2 years and 9 months',",
+    "  '£5,175 if you're staying for 5 years'), that amount is ALREADY the TOTAL for the stay:",
+    "  report it as per: 'application' with NO `years`. Never multiply it or treat it as per year.",
     "- When several such totals are listed by stay length, pick the one for the visa length chosen above",
     "  (the main adult applicant's standard stay when applying from outside the country). No 'fee.years'",
     "  citation is needed for a per: 'application' surcharge; cite the amount line in 'fee.surcharge'.",
