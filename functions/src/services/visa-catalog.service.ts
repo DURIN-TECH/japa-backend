@@ -216,8 +216,12 @@ class VisaCatalogService {
    * so visaTypesCount / min cost / min days stay right — with the ONE
    * canonical stats function, `visaService.updateCountryStats` (issue #62
    * removed the duplicate catalog-side recompute that used to live here).
-   * Note it uses update(), so a missing country doc throws instead of
-   * silently creating a stub country with no name.
+   * It uses update(), so a missing country doc throws instead of silently
+   * creating a stub country with no name. That failure is logged and
+   * swallowed here (same pattern as visaService.updateVisaReviewStatus): the
+   * deactivation is already committed and the onVisaTypeUpdated trigger
+   * reconciles, so the crawl still records the page as withdrawn rather than
+   * as a page error.
    *
    * No auto-reactivation: if the guide later stops being withdrawn, nothing
    * here (or in ingest) flips the doc back on — a human re-approves it.
@@ -232,7 +236,16 @@ class VisaCatalogService {
     if (plan.update) {
       // update() (not set) — the doc is known to exist and must stay intact.
       await ref.update(plan.update);
-      await visaService.updateCountryStats(countryCode);
+      // Stats recompute must not turn a committed withdrawal into a page
+      // error (which would also count against the source's reliability).
+      try {
+        await visaService.updateCountryStats(countryCode);
+      } catch (error) {
+        console.error(
+          `Withdrawal of ${countryCode}/${visaId} succeeded but the country stats recompute failed:`,
+          error
+        );
+      }
     }
     return plan.outcome;
   }

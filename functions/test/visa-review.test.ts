@@ -596,4 +596,28 @@ describe("single stats function", () => {
     assert.equal(c.minCostUsd, 1000);
     assert.equal(c.minProcessingDays, 10);
   });
+  test("markWithdrawn with a missing country doc: deactivates, returns 'deactivated', logs the stats error", async () => {
+    // No countries/GB doc: the real updateCountryStats update() throws.
+    store.set(visaPath("gb-live-scraped"), {
+      source: "scraped",
+      reviewStatus: "approved",
+      isActive: true,
+      baseCostUsd: 400,
+      processingDaysMin: 3,
+    });
+
+    let outcome: unknown;
+    const logged = await captureErrors(async () => {
+      outcome = await catalogSvc.markWithdrawn("GB", "gb-live-scraped");
+    });
+
+    // The crawl sees a normal withdrawal (not a page error).
+    assert.equal(outcome, "deactivated");
+    const doc = store.get(visaPath("gb-live-scraped"))!;
+    assert.equal(doc.isActive, false);
+    assert.ok(doc.staleSince instanceof Timestamp);
+    assert.deepEqual(statsCalls, ["GB"]);
+    assert.equal(store.has(COUNTRY), false); // no stub country created
+    assert.ok(logged.some((args) => String(args[0]).includes("stats recompute failed")));
+  });
 });
