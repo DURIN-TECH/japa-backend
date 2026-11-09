@@ -6,6 +6,7 @@ import { assertVisaApprovable, isFeeFxFlagged, isFxFresh } from "./visa-catalog-
 import {
   ProposalInput,
   buildApprovalUpdate,
+  eligibilityRemovalReason,
   findStaleReason,
   mergeProposal,
   planIngest,
@@ -45,13 +46,16 @@ export const VISA_CHANGE_LIST_MAX_LIMIT = 100;
 /**
  * Typed error for the approve/reject/get paths. `code` + `httpStatus` are
  * what the controller sends:
- *  - NOT_FOUND (404): no such row, or its visa doc is gone
+ *  - NOT_FOUND (404): no such row (or an id Firestore can't address), or
+ *    its visa doc is gone
  *  - ALREADY_RESOLVED (409): the row is not `open`
+ *  - REVISION_MISMATCH (409): the admin reviewed an older revision of the row
  *  - STALE_PROPOSAL (409): the live doc changed since the proposal
+ *  - ELIGIBILITY_REMOVED (409): approving would empty the eligibility list
  */
 export class VisaChangeError extends Error {
   constructor(
-    readonly code: "NOT_FOUND" | "ALREADY_RESOLVED" | "STALE_PROPOSAL",
+    readonly code: "NOT_FOUND" | "ALREADY_RESOLVED" | "REVISION_MISMATCH" | "STALE_PROPOSAL" | "ELIGIBILITY_REMOVED",
     message: string,
     readonly httpStatus: number
   ) {
@@ -63,6 +67,29 @@ export class VisaChangeError extends Error {
 /** Shorthand for the "row is not open any more" error. */
 function alreadyResolved(change: PendingVisaChange): VisaChangeError {
   return new VisaChangeError("ALREADY_RESOLVED", `This change is already ${change.status}`, 409);
+}
+
+/**
+ * True when `id` is a usable Firestore document id. Firestore throws (→ a
+ * 500) on ids containing "/", on "." / "..", on reserved `__x__` ids and on
+ * ids over 1500 bytes; such an id can never name a row, so callers answer
+ * 404 instead of letting the SDK throw.
+ */
+export function isValidDocId(id: unknown): id is string {
+  return (
+    typeof id === "string" &&
+    id.length > 0 &&
+    !id.includes("/") &&
+    id !== "." &&
+    id !== ".." &&
+    !/^__.*__$/.test(id) &&
+    Buffer.byteLength(id, "utf8") <= 1500
+  );
+}
+
+/** The 404 for a missing / unaddressable row. */
+function changeNotFound(): VisaChangeError {
+  return new VisaChangeError("NOT_FOUND", "Visa change not found", 404);
 }
 
 /** Read a row snapshot as a typed PendingVisaChange (id from the doc id). */
@@ -142,18 +169,23 @@ class VisaChangeService {
 
   /** One row by id, or null. */
   async getChange(id: string): Promise<PendingVisaChange | null> {
+    if (!isValidDocId(id)) return null;
     const snap = await collections.pendingVisaChanges.doc(id).get();
     return snap.exists ? rowFrom(snap) : null;
   }
 
   /**
    * Approve a proposal in ONE transaction (never partially applied):
-   *  1. read the row + the live visa doc → 404 if either is missing, 409
-   *     ALREADY_RESOLVED if the row is not open;
+   *  1. read the row + the live visa doc → 404 if either is missing (or the
+   *     id is unaddressable), 409 ALREADY_RESOLVED if the row is not open,
+   *     409 REVISION_MISMATCH when `expectedRevision` is given and differs
+   *     from the row's revision (the crawl replaced the row after the admin
+   *     looked at it);
    *  2. stale check (findStaleReason) → 409 STALE_PROPOSAL, nothing written,
    *     the row stays open;
    *  3. fee guard: assertVisaApprovable on the merged doc → throws
-   *     VisaFeeNotConvertibleError (controller maps it to 409);
+   *     VisaFeeNotConvertibleError (controller maps it to 409); then 409
+   *     ELIGIBILITY_REMOVED if it would empty the eligibility list;
    *  4. write only the diffed fields + scrapeMeta + sourceUrl +
    *     lastVerifiedAt + reviewedBy/At + updatedAt to the visa, and mark the
    *     row approved (resolvedBy, resolvedAt, appliedFields).
@@ -161,18 +193,28 @@ class VisaChangeService {
    * visaService.updateCountryStats; a failure there is logged and swallowed
    * (the approval is committed; the onVisaTypeUpdated trigger reconciles).
    *
+   * @param expectedRevision optional: the revision the admin reviewed
    * @returns the updated visa doc
    */
-  async approveChange(id: string, reviewerUid: string): Promise<VisaType> {
+  async approveChange(id: string, reviewerUid: string, expectedRevision?: number): Promise<VisaType> {
+    if (!isValidDocId(id)) throw changeNotFound();
     const rowRef = collections.pendingVisaChanges.doc(id);
 
     const { countryCode, visaId } = await this.runTransaction(async (tx) => {
       const rowSnap = await tx.get(rowRef);
-      if (!rowSnap.exists) throw new VisaChangeError("NOT_FOUND", "Visa change not found", 404);
+      if (!rowSnap.exists) throw changeNotFound();
       const change = rowFrom(rowSnap);
       const visaRef = subcollections.visaTypes(change.countryCode).doc(change.visaId);
       const visaSnap = await tx.get(visaRef);
       if (change.status !== "open") throw alreadyResolved(change);
+      // Optimistic check: the admin approves exactly the revision they saw.
+      if (expectedRevision !== undefined && expectedRevision !== change.revision) {
+        throw new VisaChangeError(
+          "REVISION_MISMATCH",
+          `This change is now at revision ${change.revision} (you reviewed ${expectedRevision}). Reload and review it again.`,
+          409
+        );
+      }
       if (!visaSnap.exists) throw new VisaChangeError("NOT_FOUND", "Visa type not found", 404);
       const live = visaSnap.data() as VisaType;
 
@@ -182,6 +224,9 @@ class VisaChangeService {
 
       // ---- Fee guard on the would-be merged doc (throws, nothing written) ----
       assertVisaApprovable(mergeProposal(live, change) as Pick<VisaType, "source" | "scrapeMeta" | "baseCostUsd">);
+      // ---- Never empty a live visa's eligibility list ----
+      const eligibility = eligibilityRemovalReason(live, change);
+      if (eligibility) throw new VisaChangeError("ELIGIBILITY_REMOVED", eligibility, 409);
 
       // ---- Writes ----
       const now = Timestamp.now();
@@ -220,10 +265,11 @@ class VisaChangeService {
    * @returns the updated row
    */
   async rejectChange(id: string, reviewerUid: string, reason: string): Promise<PendingVisaChange> {
+    if (!isValidDocId(id)) throw changeNotFound();
     const rowRef = collections.pendingVisaChanges.doc(id);
     await this.runTransaction(async (tx) => {
       const rowSnap = await tx.get(rowRef);
-      if (!rowSnap.exists) throw new VisaChangeError("NOT_FOUND", "Visa change not found", 404);
+      if (!rowSnap.exists) throw changeNotFound();
       const change = rowFrom(rowSnap);
       if (change.status !== "open") throw alreadyResolved(change);
       const now = Timestamp.now();

@@ -16,7 +16,10 @@ const adminVisaChangeRoutes = Router();
 adminVisaChangeRoutes.get("/", verifyAuth, (req, res) => visaChangeController.list(req, res));
 // One proposal (full shape: diff, current/proposed, citations, ...).
 adminVisaChangeRoutes.get("/:id", verifyAuth, (req, res) => visaChangeController.get(req, res));
-// Apply it to the live visa in one transaction.
+// Apply it to the live visa in one transaction. Optional body
+// { expectedRevision: number } — the row revision the admin reviewed (the
+// portal UI sends it); if the crawl has since replaced the row with a newer
+// revision → 409 REVISION_MISMATCH, nothing written, the row stays open.
 adminVisaChangeRoutes.post("/:id/approve", verifyAuth, (req, res) => visaChangeController.approve(req, res));
 // Reject it with { reason }; the live visa is untouched.
 adminVisaChangeRoutes.post("/:id/reject", verifyAuth, (req, res) => visaChangeController.reject(req, res));

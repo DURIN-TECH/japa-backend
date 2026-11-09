@@ -47,7 +47,8 @@ class VisaChangeController {
   /**
    * Map service errors onto HTTP:
    *  - VisaChangeError → its own code/status (404 NOT_FOUND, 409
-   *    ALREADY_RESOLVED, 409 STALE_PROPOSAL);
+   *    ALREADY_RESOLVED / REVISION_MISMATCH / STALE_PROPOSAL /
+   *    ELIGIBILITY_REMOVED);
    *  - VisaFeeNotConvertibleError → 409 with its message (same mapping as
    *    PATCH /admin/visas/:id/review);
    *  - anything else → 500.
@@ -75,6 +76,16 @@ class VisaChangeController {
     if (!this.allowed(req, res, "read")) return;
     try {
       // ---- Validate the query ----
+      // Each param must be a single string: a repeated param
+      // (?status=open&status=approved) arrives as an array → 400, never a
+      // silent default.
+      for (const key of ["status", "countryCode", "limit"]) {
+        const v = req.query[key];
+        if (v !== undefined && typeof v !== "string") {
+          sendError(res, "VALIDATION_ERROR", `${key} must be given once, as a single value`, 400);
+          return;
+        }
+      }
       const rawStatus = typeof req.query.status === "string" ? req.query.status : "open";
       if (!PENDING_VISA_CHANGE_STATUSES.includes(rawStatus as PendingVisaChangeStatus)) {
         sendError(res, "VALIDATION_ERROR", `status must be one of: ${PENDING_VISA_CHANGE_STATUSES.join(", ")}`, 400);
@@ -127,15 +138,23 @@ class VisaChangeController {
   }
 
   /**
-   * POST /admin/visa-changes/:id/approve → the updated visa doc.
-   * 404 (row or visa missing), 409 ALREADY_RESOLVED / STALE_PROPOSAL /
-   * FEE_NOT_CONVERTED. Applied in one transaction (see visaChangeService).
+   * POST /admin/visa-changes/:id/approve, optional body { expectedRevision }
+   * → the updated visa doc. `expectedRevision` (integer >= 1, else 400) is
+   * the row revision the admin reviewed; a different current revision →
+   * 409 REVISION_MISMATCH. Also 404 (row or visa missing), 409
+   * ALREADY_RESOLVED / STALE_PROPOSAL / FEE_NOT_CONVERTED /
+   * ELIGIBILITY_REMOVED. Applied in one transaction (see visaChangeService).
    */
   async approve(req: AuthenticatedRequest, res: Response): Promise<void> {
     const { id } = req.params;
     if (!this.allowed(req, res, "approve", id)) return;
+    const expectedRevision = req.body?.expectedRevision;
+    if (expectedRevision !== undefined && (!Number.isInteger(expectedRevision) || expectedRevision < 1)) {
+      sendError(res, "VALIDATION_ERROR", "expectedRevision must be a positive integer", 400);
+      return;
+    }
     try {
-      const visa = await visaChangeService.approveChange(id, req.userId!);
+      const visa = await visaChangeService.approveChange(id, req.userId!, expectedRevision);
       sendSuccess(res, visa, "Visa change approved");
     } catch (error) {
       this.sendServiceError(res, error, "approving visa change");

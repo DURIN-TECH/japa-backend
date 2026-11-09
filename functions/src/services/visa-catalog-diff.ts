@@ -167,9 +167,10 @@ export function diffVisa(params: {
     if (before === undefined && after === undefined) continue;
     if (before !== undefined && after !== undefined && normalizeScalar(before) === normalizeScalar(after)) continue;
     // Build the entry with only the sides that exist (never `undefined`).
-    const entry: { field: VisaScalarDiffField; kind: "changed"; before?: unknown; after?: unknown } = {
+    // Present → absent is flagged "removed": approving deletes the field.
+    const entry: { field: VisaScalarDiffField; kind: "changed" | "removed"; before?: unknown; after?: unknown } = {
       field,
-      kind: "changed",
+      kind: after === undefined ? "removed" : "changed",
     };
     if (before !== undefined) {
       entry.before = before;
@@ -282,11 +283,33 @@ export function mergeProposal(
   return merged as Partial<VisaType>;
 }
 
+/** blockReason when a proposal would empty a live visa's eligibility list. */
+export const ELIGIBILITY_REMOVED_MESSAGE =
+  "Proposal would remove all eligibility criteria. Check the source page, then reject or wait for the next crawl.";
+
 /**
- * Whether a proposal could be approved, and why not. Runs the SAME guard as
- * approval (assertVisaApprovable) on the merged doc, so `approvable` reflects
- * fxStale / fxMissing / feeUnverified / noPublishedFee and baseCostUsd vs
- * Math.round(totalUsd).
+ * Non-fee safety rule (review fix): a proposal must never wipe out ALL of a
+ * live visa's eligibility criteria — an extraction that found none is far
+ * more likely a bad read than a real policy change. Returns the reason when
+ * the merged doc would have no criteria while the live doc has some, else
+ * null. (Other omitted optional scalars may still propose a deletion; those
+ * are marked `kind: "removed"` in the diff.)
+ */
+export function eligibilityRemovalReason(
+  live: Partial<VisaType>,
+  change: Pick<PendingVisaChange, "diff" | "proposed" | "proposedScrapeMeta">
+): string | null {
+  const liveHas = Array.isArray(live.eligibilityCriteria) && live.eligibilityCriteria.length > 0;
+  if (!liveHas) return null;
+  const merged = mergeProposal(live, change).eligibilityCriteria;
+  return Array.isArray(merged) && merged.length > 0 ? null : ELIGIBILITY_REMOVED_MESSAGE;
+}
+
+/**
+ * Whether a proposal could be approved, and why not. Runs the SAME guards as
+ * approval on the merged doc: assertVisaApprovable (fxStale / fxMissing /
+ * feeUnverified / noPublishedFee and baseCostUsd vs Math.round(totalUsd)),
+ * then eligibilityRemovalReason.
  */
 export function proposalApprovability(
   live: Partial<VisaType>,
@@ -294,10 +317,11 @@ export function proposalApprovability(
 ): { approvable: boolean; blockReason?: string } {
   try {
     assertVisaApprovable(mergeProposal(live, change) as Pick<VisaType, "source" | "scrapeMeta" | "baseCostUsd">);
-    return { approvable: true };
   } catch (err) {
     return { approvable: false, blockReason: (err as Error).message };
   }
+  const eligibility = eligibilityRemovalReason(live, change);
+  return eligibility ? { approvable: false, blockReason: eligibility } : { approvable: true };
 }
 
 // ----- Ingest: create / replace / nothing -----

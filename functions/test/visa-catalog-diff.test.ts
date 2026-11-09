@@ -28,6 +28,7 @@ import {
 } from "../src/services/visa-catalog-fx";
 import { buildScrapeMeta, extractedToVisaFields } from "../src/services/visa-catalog-meta";
 import {
+  ELIGIBILITY_REMOVED_MESSAGE,
   buildApprovalUpdate,
   diffFeeComponents,
   diffVisa,
@@ -160,14 +161,14 @@ describe("diffVisa", () => {
     assert.deepEqual(r.diff, []);
   });
 
-  test("absent → present: `before` omitted; present → absent: `after` omitted", () => {
+  test("absent → present: `before` omitted; present → absent: kind \"removed\", `after` omitted", () => {
     const added = diffOf(liveDoc(), extraction({ applicationInstructions: "Apply online" }));
     assert.deepEqual(added.diff, [{ field: "applicationInstructions", kind: "changed", after: "Apply online" }]);
     assert.equal("applicationInstructions" in added.current, false);
 
     const removed = diffOf(liveDoc(), extraction({ applicationUrl: undefined }));
     assert.deepEqual(removed.diff, [
-      { field: "applicationUrl", kind: "changed", before: "https://www.gov.uk/skilled-worker-visa/apply" },
+      { field: "applicationUrl", kind: "removed", before: "https://www.gov.uk/skilled-worker-visa/apply" },
     ]);
     assert.equal("applicationUrl" in removed.proposed, false);
   });
@@ -325,6 +326,14 @@ describe("planProposalWrite", () => {
     const row = rowOf(planProposalWrite({ live: liveDoc(), input: ingestInput(extraction({ feeComponents: [] }), "h2"), now: NOW }));
     assert.equal(row.approvable, false);
     assert.equal(row.blockReason, FEE_MISSING_COST_MESSAGE);
+  });
+
+  test("eligibility emptied while live has criteria → approvable false, 'would remove all eligibility criteria'", () => {
+    const row = rowOf(planProposalWrite({ live: liveDoc(), input: ingestInput(extraction({ eligibilityCriteria: [] }), "h2"), now: NOW }));
+    assert.equal(row.approvable, false);
+    assert.equal(row.blockReason, ELIGIBILITY_REMOVED_MESSAGE);
+    assert.match(row.blockReason!, /would remove all eligibility criteria/);
+    assert.deepEqual(row.diff, [{ field: "eligibilityCriteria", kind: "changed", added: [], removed: ["Job offer", "English B1"] }]);
   });
 
   test("unverified fee → approvable false", () => {

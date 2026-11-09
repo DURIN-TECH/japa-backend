@@ -265,11 +265,14 @@ export type FeeComponentDiff =
 
 /**
  * One changed field in a proposal. `before` / `after` are OMITTED (never
- * `undefined`) when the field is absent on that side (absent → present is a
- * change, and so is present → absent).
+ * `undefined`) when the field is absent on that side. A scalar that is
+ * present live but absent from the new extraction has `kind: "removed"`
+ * (only `before`): approving it DELETES the field from the live doc, so the
+ * diff UI must show it as a removal, not an edit. Absent → present and
+ * present → present are `kind: "changed"`.
  */
 export type VisaFieldDiff =
-  | { field: VisaScalarDiffField; kind: "changed"; before?: unknown; after?: unknown }
+  | { field: VisaScalarDiffField; kind: "changed" | "removed"; before?: unknown; after?: unknown }
   // Compared as a whitespace-trimmed SET: a pure reorder is not a diff. When it
   // is a diff, the full proposed array (in proposed order) is what is applied.
   | { field: "eligibilityCriteria"; kind: "changed"; added: string[]; removed: string[] }

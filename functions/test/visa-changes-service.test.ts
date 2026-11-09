@@ -447,6 +447,33 @@ describe("approveChange", () => {
     assert.equal(writes.length, mark);
   });
 
+  test("expectedRevision: matching revision approves; a different one → 409 REVISION_MISMATCH, nothing written, row open", async () => {
+    await seedLive();
+    await ingest(extraction({ processingDaysMax: 30 }), "h2");
+    await ingest(extraction({ processingDaysMax: 40 }), "h3"); // revision 2
+    const [id] = onlyRow();
+    const mark = writes.length;
+    await assert.rejects(changes.approveChange(id, "admin-1", 1), { code: "REVISION_MISMATCH", httpStatus: 409 });
+    assert.equal(writes.length, mark);
+    assert.equal(store.get(`pendingVisaChanges/${id}`)!.status, "open");
+    const visa = await changes.approveChange(id, "admin-1", 2);
+    assert.equal(visa.processingDaysMax, 40);
+  });
+
+  test("a proposal that empties eligibilityCriteria is refused (409 ELIGIBILITY_REMOVED, nothing written); reject works", async () => {
+    await seedLive();
+    await ingest(extraction({ eligibilityCriteria: [] }), "h2");
+    const [id, row] = onlyRow();
+    assert.equal(row.approvable, false);
+    assert.match(row.blockReason as string, /would remove all eligibility criteria/);
+    const mark = writes.length;
+    await assert.rejects(changes.approveChange(id, "admin-1"), { code: "ELIGIBILITY_REMOVED", httpStatus: 409 });
+    assert.equal(writes.length, mark);
+    assert.deepEqual(store.get(VISA_PATH)!.eligibilityCriteria, ["Job offer"]);
+    const rejected = await changes.rejectChange(id, "admin-1", "Bad extraction");
+    assert.equal(rejected.status, "rejected");
+  });
+
   test("404 for a missing row or a missing visa doc", async () => {
     await assert.rejects(changes.approveChange("nope", "a"), { code: "NOT_FOUND", httpStatus: 404 });
     const id = await proposed(extraction({ processingDaysMax: 30 }));
@@ -535,7 +562,15 @@ describe("visaChangeController — status codes, validation, authz", () => {
     out = await call("list", req(ROLES.ADMIN, { query: { limit: "500" } })); // capped, not an error
     assert.equal(out.status, 200);
 
-    for (const query of [{ status: "bogus" }, { limit: "0" }, { limit: "x" }, { countryCode: "GBR" }]) {
+    for (const query of [
+      { status: "bogus" },
+      { status: ["open", "approved"] }, // repeated param → array
+      { limit: "0" },
+      { limit: "x" },
+      { limit: ["5"] },
+      { countryCode: "GBR" },
+      { countryCode: ["GB"] },
+    ]) {
       out = await call("list", req(ROLES.ADMIN, { query }));
       assert.equal(out.status, 400, JSON.stringify(query));
       assert.equal(out.body.error, "VALIDATION_ERROR");
@@ -571,6 +606,44 @@ describe("visaChangeController — status codes, validation, authz", () => {
     out = await call("approve", req(ROLES.ADMIN, { params: { id: open } }));
     assert.equal(out.status, 409);
     assert.equal(out.body.error, "STALE_PROPOSAL");
+  });
+
+  test("approve: expectedRevision mismatch → 409 REVISION_MISMATCH; non-integer → 400", async () => {
+    await seedLive();
+    await ingest(extraction({ processingDaysMax: 30 }), "h2");
+    const [id] = onlyRow();
+    let out = await call("approve", req(ROLES.ADMIN, { params: { id }, body: { expectedRevision: 2 } }));
+    assert.equal(out.status, 409);
+    assert.equal(out.body.error, "REVISION_MISMATCH");
+    for (const expectedRevision of ["1", 1.5, 0]) {
+      out = await call("approve", req(ROLES.ADMIN, { params: { id }, body: { expectedRevision } }));
+      assert.equal(out.status, 400, String(expectedRevision));
+    }
+    assert.equal(store.get(`pendingVisaChanges/${id}`)!.status, "open");
+    out = await call("approve", req(ROLES.ADMIN, { params: { id }, body: { expectedRevision: 1 } }));
+    assert.equal(out.status, 200);
+  });
+
+  test("approve of an eligibility-emptying proposal → 409 ELIGIBILITY_REMOVED", async () => {
+    await seedLive();
+    await ingest(extraction({ eligibilityCriteria: [] }), "h2");
+    const out = await call("approve", req(ROLES.ADMIN, { params: { id: onlyRow()[0] } }));
+    assert.equal(out.status, 409);
+    assert.equal(out.body.error, "ELIGIBILITY_REMOVED");
+  });
+
+  test("ids Firestore rejects → 404 (not 500) on get / approve / reject", async () => {
+    // Use the REAL doc-id rules: a fake collection would accept anything, so
+    // assert the guard rejects before any Firestore call.
+    for (const id of ["..", ".", "a/b", "__x__", "x".repeat(1501)]) {
+      assert.equal(changesMod.isValidDocId(id), false, id);
+      for (const handler of ["get", "approve", "reject"]) {
+        const out = await call(handler, req(ROLES.ADMIN, { params: { id }, body: { reason: "x" } }));
+        assert.equal(out.status, 404, `${handler} ${id.slice(0, 10)}`);
+        assert.equal(out.body.error, "NOT_FOUND");
+      }
+    }
+    assert.equal(changesMod.isValidDocId("sWPFAQbJ01MXCovE0cb9"), true);
   });
 
   test("approve of a fee-flagged proposal → 409 FEE_NOT_CONVERTED", async () => {
