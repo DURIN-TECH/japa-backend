@@ -96,7 +96,7 @@ records the original in `scrapeMeta.fee`. The validator rejects a fee with no ci
 
 ```json
 {
-  "id": "uk-skilled-worker",
+  "id": "gb-skilled-worker-visa",
   "countryCode": "GB",
   "name": "Skilled Worker visa",
   "code": "SWV",
@@ -147,18 +147,23 @@ Why this beats the current HTML fetch for the UK:
 
 | Route | Path | Record `id` |
 |---|---|---|
-| Standard Visitor | `/standard-visitor` | `uk-visitor` *(seeded)* |
-| Skilled Worker | `/skilled-worker-visa` | `uk-skilled-worker` *(seeded)* |
-| Student | `/student-visa` | `uk-student` *(seeded)* |
-| Family | `/uk-family-visa` | `uk-family` *(seeded)* |
-| Health and Care Worker | `/health-care-worker-visa` | `uk-health-care-worker` |
-| Child Student | `/child-study-visa` | `uk-child-student` |
-| Graduate | `/graduate-visa` | `uk-graduate` |
-| Global Talent | `/global-talent` | `uk-global-talent` |
-| High Potential Individual | `/high-potential-individual-visa` | `uk-hpi` |
-| Youth Mobility Scheme | `/youth-mobility` | `uk-youth-mobility` |
-| India Young Professionals | `/india-young-professionals-scheme-visa` | `uk-india-young-professionals` |
-| British National (Overseas) | `/british-national-overseas-bno-visa` | `uk-bno` |
+| Standard Visitor | `/standard-visitor` | `gb-standard-visitor` (seed `uk-visitor`) |
+| Skilled Worker | `/skilled-worker-visa` | `gb-skilled-worker-visa` (seed `uk-skilled-worker`) |
+| Student | `/student-visa` | `gb-student-visa` (seed `uk-student`) |
+| Family | `/uk-family-visa` | `gb-uk-family-visa` (seed `uk-family`) |
+| Health and Care Worker | `/health-care-worker-visa` | `gb-health-care-worker-visa` |
+| Child Student | `/child-study-visa` | `gb-child-study-visa` |
+| Graduate | `/graduate-visa` | `gb-graduate-visa` |
+| Global Talent | `/global-talent` | `gb-global-talent` |
+| High Potential Individual | `/high-potential-individual-visa` | `gb-high-potential-individual-visa` |
+| Youth Mobility Scheme | `/youth-mobility` | `gb-youth-mobility` |
+| India Young Professionals | `/india-young-professionals-scheme-visa` | `gb-india-young-professionals-scheme-visa` |
+| British National (Overseas) | `/british-national-overseas-bno-visa` | `gb-british-national-overseas-bno-visa` |
+
+**Scraped visas get their own `gb-` IDs and never write to the seeded `uk-*` docs.** The seeded catalog is
+temporary: once the scraper is proven, each seed is compared with its scraped equivalent, references are
+moved to the new ID, and the seed is removed (DURIN-TECH/japa#65). IDs are pinned in the registry (#57), so
+a later GOV.UK URL rename doesn't change them.
 
 Family is one guide covering partner/child/parent routes. v1 keeps it as **one** record, matching the seed.
 Splitting it into sub-routes is a later decision.
@@ -233,11 +238,9 @@ a country has a structured source worth its own adapter, such as an API or a pre
 ### 4.3 Record identity comes from the registry, never from the LLM
 
 Today `buildVisaId` is `${CC}_${slug(extracted.code || extracted.name)}`, where `code` is whatever the model
-invents. Seeded UK docs are `uk-skilled-worker` etc., so a scraped Skilled Worker would be written as
-`GB_swv` (or `GB_skilled_worker`, depending on the run), **next to** the curated one. That creates duplicates,
-and the ID can also change between runs. **Change:** use `page.visaId` when it's set, otherwise
-`${cc}-${slug(path)}`, which is deterministic. The seed for the 4 existing UK visas is backfilled with their
-`visaId`.
+invents, so the ID can change between runs and duplicate records pile up. **Change (#57):** use `page.visaId`
+when it's pinned, otherwise derive it from the full URL path (`${cc}-${slug(path)}`, with a short hash if it
+has to be truncated). Scraped IDs never equal a seeded ID; the seeds are retired separately (#65).
 
 ---
 
@@ -320,9 +323,9 @@ Its outbound requests leave from Google Cloud's shared egress IP pool, not from 
 | # | Gap | Fix |
 |---|---|---|
 | A | No GOV.UK adapter; HTML truncated at 24k chars | `SourceAdapter` interface + `govuk-content-api` adapter + part selection (§3, §4.1) |
-| B | LLM-invented IDs → duplicates of seeded UK visas | Registry-pinned `visaId`/`visaCode`; backfill the 4 seeded UK visas (§4.3) |
+| B | LLM-invented IDs → unstable IDs + duplicates | Registry-pinned `visaId`/`visaCode` in a `gb-` namespace separate from seeds (§4.3, #57); seed retirement #65 |
 | C | LLM converts currency | `{feeAmount, feeCurrency}` + code FX + `scrapeMeta.fee` (§2.3); re-check the seed's GBP-in-USD values |
-| D | Ingest **skips** any approved/seeded visa → curated UK data never updates | Build the spike's `pendingVisaChanges` (diff + citations) for live visas; approval applies the diff |
+| D | Ingest **skips** any approved visa → live scraped data never updates | Build the spike's `pendingVisaChanges` (diff + citations) for live visas; approval applies the diff |
 | E | Approval doesn't set `lastVerifiedAt` or recompute `Country` stats (`recomputeCountryStats` exists but isn't called) | Call both in `reviewVisa` on approve |
 | F | Schedule: `0 */6 * * *` UTC; `nextCrawlAt = now + 168h` drifts and ignores local night | Per-source weekly `crawlWindow` (timezone + night of week); UK Mon 03:15 London (§5) |
 | G | Bot hygiene | Real `/bot` page; `Retry-After`/429 backoff (§6) |
