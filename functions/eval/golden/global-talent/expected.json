@@ -1,0 +1,37 @@
+{
+  "route": "global-talent",
+  "sourceUrl": "https://www.gov.uk/global-talent",
+  "fixtureRecordedAt": "2026-11-09",
+  "draftedBy": "ai-team software-engineer, from guide.json only (not from seed data), 2026-11-09",
+  "verifiedBy": "pending",
+  "verifiedOn": "pending",
+  "notes": [
+    "Multi-stage fee: £766 in total, paid as £561 (endorsement) + £205 (visa) on the endorsement route, or £766 at once on the prize route. The validator allows ONE application component, so the expected component is the published total, 766 (no arithmetic needed: the page prints it). 561 or 205 alone is a mismatch.",
+    "IHS £1,035 per year x 5 (the visa lasts up to 5 years at a time).",
+    "processingDaysMin: the page only says 'within 3 weeks' (outside the UK), so any minimum from 0 to 21 days is consistent with it."
+  ],
+  "name": { "value": "Global Talent", "source": "You can apply for a Global Talent visa to work in the UK if you’re a leader or potential leader in one of the following fields:" },
+  "category": { "value": "work", "source": "You can apply for a Global Talent visa to work in the UK if you’re a leader or potential leader in one of the following fields:" },
+  "processingDaysMin": { "range": [0, 21], "source": "3 weeks, if you’re outside the UK" },
+  "processingDaysMax": { "value": 21, "source": "3 weeks, if you’re outside the UK" },
+  "validityPeriod": {
+    "durations": [{ "amount": 5, "unit": "year" }],
+    "source": "You can live and work in the UK for up to 5 years at a time."
+  },
+  "isExtendable": { "value": true, "source": "You can renew your visa as many times as you like, as long as you still meet the eligibility requirements." },
+  "eligibility": {
+    "themes": [
+      { "theme": "leader or potential leader in your field", "anyOf": ["leader", "potential leader", "talent", "exceptional"], "source": "if you’re a leader or potential leader in one of the following fields:" },
+      { "theme": "endorsement or an eligible prestigious prize", "anyOf": ["endorsement", "endorsed", "prize"], "source": "If you’ve not won an eligible prestigious prize, you’ll need to get an endorsement first to prove that you’re a leader or potential leader in your field." },
+      { "theme": "field: academia/research, arts and culture or digital technology", "anyOf": ["academia", "research", "arts", "culture", "digital technology"], "source": "academia or research" },
+      { "theme": "at least 18 years old", "anyOf": ["18", "eighteen"], "source": "You must also be at least 18 years old." }
+    ]
+  },
+  "applicationUrlHost": { "value": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk", "source": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/global_talent_out_uk" },
+  "feeComponents": {
+    "components": [
+      { "kind": "application", "amount": 766, "currency": "GBP", "per": "application", "source": "It costs £766 to apply." },
+      { "kind": "surcharge", "amount": 1035, "currency": "GBP", "per": "year", "years": 5, "source": "this is usually £1,035 per year for each person applying.", "yearsSource": "You can live and work in the UK for up to 5 years at a time." }
+    ]
+  }
+}
