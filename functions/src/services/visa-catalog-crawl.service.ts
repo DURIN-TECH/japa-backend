@@ -80,8 +80,10 @@ class VisaCatalogCrawlService {
     const maxSources = opts?.maxSources ?? DEFAULT_MAX_SOURCES;
     const maxExtractions = opts?.maxExtractions ?? DEFAULT_MAX_EXTRACTIONS;
 
-    // The tick's instant. Every scheduling decision below uses THIS value (not
-    // the run's end time), so a long run never shifts the weekly grid.
+    // The tick's instant. Every scheduling decision AND every timestamp
+    // written below (lastCrawledAt, page crawl times, updatedAt, the
+    // crawlRuns log) is on THIS clock, not the run's end time, so a long run
+    // never shifts the weekly grid and an injected `now` is consistent.
     const now =
       opts?.now === undefined
         ? Timestamp.now()
@@ -101,6 +103,13 @@ class VisaCatalogCrawlService {
 
     // Due = active AND nextCrawlAt <= now, oldest first (needs the composite
     // index status+nextCrawlAt — already in firestore.indexes.json).
+    // DO NOT add a plain .limit() back here to bound reads: it is applied
+    // before the in-code window filter, so due-but-out-of-window sources
+    // (missed nights sort first) would fill it and starve the in-window ones.
+    // If the registry grows past a handful of docs, query on a STORED window
+    // key instead (e.g. a denormalised `crawlWindowDay` / UTC opening field
+    // in the where clause) so the limit applies after the window filter —
+    // see the Cloud Tasks fan-out, #13.
     // NO .limit() here (issue #63): a limit applied BEFORE the window filter
     // would let due-but-out-of-window sources (e.g. a missed night, oldest
     // nextCrawlAt) fill the batch and starve the in-window ones. The registry
@@ -159,7 +168,9 @@ class VisaCatalogCrawlService {
 
     for (const doc of runnable) {
       const source = doc.data() as VisaSource;
-      const runStart = Timestamp.now();
+      // Real clock, only to measure this source's run duration for the log;
+      // the logged times themselves are on the tick clock (`now`).
+      const runStartReal = Date.now();
       const pages: VisaSourcePage[] = [...source.pages];
       let fetchedOk = 0;
       let pageErrors = 0;
@@ -292,8 +303,11 @@ class VisaCatalogCrawlService {
 
       // Per-run log (subcollection) for observability + admin debugging.
       await doc.ref.collection("crawlRuns").add({
-        startedAt: runStart,
-        completedAt: Timestamp.now(),
+        // Tick clock: startedAt = the tick's `now`; completedAt = `now` plus
+        // the real elapsed time, so the log keeps the run's duration while
+        // staying consistent with an injected `now` (tests / emulator runs).
+        startedAt: now,
+        completedAt: Timestamp.fromMillis(now.toMillis() + (Date.now() - runStartReal)),
         pagesFetched: fetchedOk,
         pageErrors,
         visasIngested: ingested,

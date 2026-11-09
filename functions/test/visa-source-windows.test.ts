@@ -79,25 +79,54 @@ describe("buildSeededVisaSource — crawlWindow + nextCrawlAt", () => {
     assert.equal(doc.crawlIntervalHours, 168); // kept for window-less sources
   });
 
-  test("a re-seed refreshes crawlWindow from code and keeps nextCrawlAt / status / health", () => {
-    const storedNext = Timestamp.fromMillis(Date.parse("2026-01-05T09:00:00Z")); // old, in the past
-    const existing = {
-      // Stale window in the stored doc: must be replaced by the code's.
-      crawlWindow: { timeZone: "UTC", dayOfWeek: 3, startHour: 3, endHour: 6 },
-      nextCrawlAt: storedNext,
-      lastCrawledAt: Timestamp.fromMillis(Date.parse("2025-12-29T09:00:00Z")),
-      status: "paused",
-      reliabilityScore: 42,
-      consecutiveFailures: 2,
-      createdAt: Timestamp.fromMillis(Date.parse("2025-06-01T00:00:00Z")),
-      pages: [],
-    };
-    const { doc } = buildSeededVisaSource({ country, existing, now });
-    assert.deepEqual(doc.crawlWindow, VISA_SOURCE_WINDOWS.GB); // refreshed from code
+  /** A stored GB doc with crawl state, carrying `crawlWindow` (or none). */
+  const storedNext = Timestamp.fromMillis(Date.parse("2026-01-05T09:00:00Z")); // old, in the past
+  const existingWith = (crawlWindow?: Record<string, unknown>) => ({
+    ...(crawlWindow ? { crawlWindow } : {}),
+    nextCrawlAt: storedNext,
+    lastCrawledAt: Timestamp.fromMillis(Date.parse("2025-12-29T09:00:00Z")),
+    status: "paused",
+    reliabilityScore: 42,
+    consecutiveFailures: 2,
+    createdAt: Timestamp.fromMillis(Date.parse("2025-06-01T00:00:00Z")),
+    pages: [],
+  });
+
+  test("re-seed with an UNCHANGED window keeps nextCrawlAt / status / health", () => {
+    // Same fields, different key order: still "unchanged".
+    const { timeZone, dayOfWeek, startHour, endHour } = VISA_SOURCE_WINDOWS.GB;
+    const { doc } = buildSeededVisaSource({
+      country,
+      existing: existingWith({ endHour, startHour, dayOfWeek, timeZone }),
+      now,
+    });
+    assert.deepEqual(doc.crawlWindow, VISA_SOURCE_WINDOWS.GB);
     assert.equal((doc.nextCrawlAt as Timestamp).toMillis(), storedNext.toMillis()); // preserved
     assert.equal(doc.status, "paused");
     assert.equal(doc.reliabilityScore, 42);
     assert.equal(doc.consecutiveFailures, 2);
+  });
+
+  test("re-seed with a CHANGED window refreshes it and resets nextCrawlAt to the new window's opening", () => {
+    // Stale Wednesday UTC window in the stored doc.
+    const { doc } = buildSeededVisaSource({
+      country,
+      existing: existingWith({ timeZone: "UTC", dayOfWeek: 3, startHour: 3, endHour: 6 }),
+      now,
+    });
+    assert.deepEqual(doc.crawlWindow, VISA_SOURCE_WINDOWS.GB); // refreshed from code
+    // Next Mon 02:00 London after Sun 2026-11-08 15:00 GMT.
+    assert.equal((doc.nextCrawlAt as Timestamp).toDate().toISOString(), "2026-11-09T02:00:00.000Z");
+    // Other crawl state still preserved.
+    assert.equal(doc.status, "paused");
+    assert.equal(doc.reliabilityScore, 42);
+    assert.equal(doc.consecutiveFailures, 2);
+  });
+
+  test("re-seed of a pre-#63 doc (no stored window) gains the window and keeps its past nextCrawlAt", () => {
+    const { doc } = buildSeededVisaSource({ country, existing: existingWith(undefined), now });
+    assert.deepEqual(doc.crawlWindow, VISA_SOURCE_WINDOWS.GB);
+    assert.equal((doc.nextCrawlAt as Timestamp).toMillis(), storedNext.toMillis());
   });
 
   test("a country with no window: no crawlWindow field, due now (legacy)", () => {

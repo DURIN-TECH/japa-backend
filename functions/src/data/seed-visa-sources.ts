@@ -295,6 +295,17 @@ export function parseVisaSourcesMarkdown(markdown: string): ParsedCountry[] {
   return out;
 }
 
+/** True when two windows are the same zone, weekday and hours (field-wise,
+ *  so key order / extra fields in the stored doc don't matter). */
+function sameCrawlWindow(a: CrawlWindow, b: CrawlWindow): boolean {
+  return (
+    a.timeZone === b.timeZone &&
+    a.dayOfWeek === b.dayOfWeek &&
+    a.startHour === b.startHour &&
+    a.endHour === b.endHour
+  );
+}
+
 /**
  * Build the `visaSources/{cc}` doc for one parsed country (pure — no I/O).
  *
@@ -304,6 +315,8 @@ export function parseVisaSourcesMarkdown(markdown: string): ParsedCountry[] {
  * page crawl state (mergePageCrawlState) and source health/scheduling
  * (pickSourceCrawlState) are carried over from `existing`. Returns the doc plus
  * the override URLs that matched a page (for the stale-override warning).
+ * If the stored `crawlWindow` differs from the code's, `nextCrawlAt` is reset
+ * to the new window's next opening (see step 5).
  */
 export function buildSeededVisaSource(params: {
   country: ParsedCountry;
@@ -363,6 +376,19 @@ export function buildSeededVisaSource(params: {
     ...pickSourceCrawlState(existing),
     updatedAt: now,
   };
+
+  // 5. Window CHANGED in code since the last seed -> the stored nextCrawlAt
+  //    belongs to the old grid (e.g. a source moved from Tue to Fri would
+  //    otherwise still run on its old night, or not until a week later).
+  //    Reset it to the NEW window's next opening. An unchanged window keeps
+  //    the stored nextCrawlAt (crawl state preserved), and so does a doc that
+  //    had no stored window yet (first rollout of #63: its past nextCrawlAt
+  //    makes it run at its first window — the issue's no-migration rule).
+  //    All other crawl state (status, health, lastCrawledAt) is kept either way.
+  const storedWindow = existing?.crawlWindow as CrawlWindow | undefined;
+  if (crawlWindow && storedWindow && !sameCrawlWindow(storedWindow, crawlWindow)) {
+    doc.nextCrawlAt = Timestamp.fromDate(nextWindowOpening(crawlWindow, now.toMillis()));
+  }
   return { doc, matchedUrls: pinned.matchedUrls };
 }
 

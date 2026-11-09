@@ -233,22 +233,23 @@ beforeEach(() => {
 
 // ----- Orchestrator: refresh + re-convert -----
 
-/** ISO weekday (1 = Mon .. 7 = Sun) of the real clock, in UTC. */
-const isoWeekdayUtcToday = () => (new Date().getUTCDay() === 0 ? 7 : new Date().getUTCDay());
+/** ISO weekday (1 = Mon .. 7 = Sun) of `ms`, in UTC. */
+const isoWeekdayUtc = (ms: number) => (new Date(ms).getUTCDay() === 0 ? 7 : new Date(ms).getUTCDay());
 
 /** Make the FX tests' tick crawl something (FX only runs then, issue #63):
- *  one active, due source whose window spans the whole of TODAY in UTC, so
- *  the real clock (these tests use it) is always inside it. No pages, so
- *  nothing is fetched. */
-function putDueAllDaySource(cc = "FR"): void {
+ *  one active, due source whose window spans the whole UTC day of `tickMs`.
+ *  The SAME `tickMs` is passed to runOrchestrator as `now`, so the tick is
+ *  always inside the window (no flake if the real clock crosses UTC
+ *  midnight mid-test). No pages, so nothing is fetched. */
+function putDueAllDaySource(tickMs: number, cc = "FR"): void {
   store.set(`visaSources/${cc}`, {
     countryCode: cc,
     status: "active",
     pages: [],
     crawlIntervalHours: 168,
     consecutiveFailures: 0,
-    nextCrawlAt: Timestamp.fromMillis(Date.now() - DAY_MS),
-    crawlWindow: { timeZone: "UTC", dayOfWeek: isoWeekdayUtcToday(), startHour: 0, endHour: 24 },
+    nextCrawlAt: Timestamp.fromMillis(tickMs - DAY_MS),
+    crawlWindow: { timeZone: "UTC", dayOfWeek: isoWeekdayUtc(tickMs), startHour: 0, endHour: 24 },
   });
 }
 
@@ -259,13 +260,15 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
     // Approved + agent docs with a flagged fee must not be touched.
     store.set("countries/GB/visaTypes/gb-approved", scrapedVisa(oldFx(), { reviewStatus: "approved", baseCostUsd: 1 }));
     store.set("countries/GB/visaTypes/gb-agent", scrapedVisa(oldFx(), { source: "agent", baseCostUsd: 2 }));
-    putDueAllDaySource();
+    const tickMs = Date.now(); // one fixed tick time for window + orchestrator
+    putDueAllDaySource(tickMs);
     const before = store.get("countries/GB/visaTypes/gb-skilled-worker-visa")!;
     assert.equal((before.scrapeMeta as any).fee.fxStale, true);
     assert.equal("baseCostUsd" in before, false);
 
     let fetches = 0;
     const summary = await crawl.runOrchestrator({
+      now: tickMs,
       fetchFxRates: async () => {
         fetches++;
         return { rates: { GBP: 0.8 }, rateDate: isoDaysAgo(3) };
@@ -300,9 +303,11 @@ describe("runOrchestrator — FX refresh + re-convert", () => {
     const previous = oldFx();
     store.set("appConfig/fx", previous as unknown as Data);
     store.set("countries/GB/visaTypes/gb-skilled-worker-visa", scrapedVisa(previous));
-    putDueAllDaySource();
+    const tickMs = Date.now();
+    putDueAllDaySource(tickMs);
 
     const summary = await crawl.runOrchestrator({
+      now: tickMs,
       fetchFxRates: async () => {
         throw new Error("blocked");
       },
@@ -407,6 +412,12 @@ describe("runOrchestrator — weekly night window", () => {
     assert.equal(nextOf("DE"), "2026-11-16T01:00:00.000Z"); // Mon 02:00 CET
     const gb = store.get("visaSources/GB")!;
     assert.equal((gb.lastCrawledAt as Timestamp).toMillis(), at("2026-11-09T02:15:00Z"));
+    // crawlRuns log is on the injected tick clock too.
+    const runs = [...store.entries()].filter(([p]) => p.startsWith("visaSources/GB/crawlRuns/")).map(([, d]) => d);
+    assert.equal(runs.length, 1);
+    assert.equal((runs[0].startedAt as Timestamp).toMillis(), at("2026-11-09T02:15:00Z"));
+    const completed = (runs[0].completedAt as Timestamp).toMillis();
+    assert.ok(completed >= at("2026-11-09T02:15:00Z") && completed < at("2026-11-09T02:16:00Z"));
   });
 
   test("GB runs at Mon 02:15 BST (01:15Z) → next Monday 02:00 BST (01:00Z)", async () => {
