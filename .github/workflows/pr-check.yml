@@ -1,5 +1,5 @@
 # PR Check Workflow
-# Runs lint and build checks on pull requests targeting main or dev branches.
+# Runs lint, build and unit-test checks on pull requests targeting main or dev branches.
 # This ensures code quality before merging — no deployment happens here.
 
 name: PR Check
@@ -14,7 +14,7 @@ on:
 jobs:
   # Lint and build the Cloud Functions to validate the PR
   check:
-    name: Lint & Build
+    name: Lint, Build & Test
     runs-on: ubuntu-latest
 
     # Opt into Node.js 24 runtime for GitHub Actions to avoid deprecation warnings
@@ -39,7 +39,7 @@ jobs:
         working-directory: functions
         run: npm ci
 
-      # Run ESLint to catch code style and potential errors
+      # Run ESLint to catch code style and potential errors (src/, eval/, test/)
       - name: Lint
         working-directory: functions
         run: npm run lint
@@ -48,3 +48,11 @@ jobs:
       - name: Build
         working-directory: functions
         run: npm run build
+
+      # Run the unit tests (node:test via tsx, see functions/test/).
+      # They are pure and hermetic: no secrets, .env files, emulators or
+      # network are needed, so no env/secrets are passed to this step.
+      # Any failing test exits non-zero and fails the PR check.
+      - name: Test
+        working-directory: functions
+        run: npm test
