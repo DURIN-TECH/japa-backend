@@ -59,12 +59,19 @@ const DEEPSEEK_PEAK_WINDOWS = [
  * prices have been reduced accordingly"; the 2026-10-17 entry (V4.1-Flash-1017)
  * says "The API calling method and pricing remain unchanged".
  *
- * Aliases: our extractor requests `deepseek-chat`. The change log (2026-04-24)
- * says "these two model names [deepseek-chat / deepseek-reasoner] point to the
- * non-thinking mode and thinking mode of deepseek-v4-flash", and the pricing
- * page says the legacy deepseek-v4-flash name is "served by
- * DeepSeek-V4.1-Flash-1017 and billed at the Flash price". So deepseek-chat
- * is billed at the deepseek-flash price.
+ * Primary key: `deepseek-flash` is the id the extractor requests
+ * (DEEPSEEK_EXTRACTOR_MODEL, issue #92). The pricing page: "Use
+ * `deepseek-flash` as the model name". It matches by KEY, not through an
+ * alias, so the current model's price never depends on alias bookkeeping.
+ *
+ * Aliases (kept so HISTORICAL runs, which requested `deepseek-chat`, and any
+ * call answered under a legacy name still price): the change log
+ * (2026-04-24) says "these two model names [deepseek-chat /
+ * deepseek-reasoner] point to the non-thinking mode and thinking mode of
+ * deepseek-v4-flash" and that they "will be discontinued in three months
+ * (2026-07-24)"; the pricing page says the legacy names "deepseek-v4-flash
+ * and deepseek-v4-flash-vision-exp are still accepted" (their models retired,
+ * calls served by the current Flash). So all are billed at the Flash price.
  *
  * deepseek-v4-pro is NOT listed: we do not call it, and the page gives no
  * effective date for its current price. Add it (with its source) before
@@ -80,12 +87,13 @@ export const DEFAULT_LLM_PRICING: LlmPricingDoc = {
       outputPer1M: 1.2,
       offPeak: { inputPer1M: 0.15, cachedInputPer1M: 0.003, outputPer1M: 0.6 },
       peakWindowsUtc: DEEPSEEK_PEAK_WINDOWS,
-      aliases: ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"],
+      aliases: ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"],
       effectiveFrom: "2026-09-10",
       sourceUrl: DEEPSEEK_PRICING_URL,
       note:
         "Top-level prices are the peak rate; offPeak applies outside peakWindowsUtc. Chinese public " +
-        "holidays (off-peak at DeepSeek) are costed at the peak rate. deepseek-chat -> deepseek-flash per " +
+        "holidays (off-peak at DeepSeek) are costed at the peak rate. The extractor requests deepseek-flash (#92); " +
+        "aliases price historical deepseek-chat runs and legacy names -> deepseek-flash per " +
         DEEPSEEK_UPDATES_URL,
     },
   },

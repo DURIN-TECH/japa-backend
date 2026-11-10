@@ -27,8 +27,9 @@ import type { LlmUsageReport } from "../shared/cost/types";
 // Turns a cleaned visa page (from the fetch service) into a structured
 // `ExtractedVisa` using an LLM. The model sits behind the `LlmExtractor`
 // interface so the provider is swappable; the default implementation is
-// DeepSeek-chat (OpenAI-compatible API, JSON output mode) — the cost-optimal
-// choice for per-page schema extraction.
+// DeepSeek Flash (`DEEPSEEK_EXTRACTOR_MODEL`, OpenAI-compatible API, JSON
+// output mode, thinking disabled) — the cost-optimal choice for per-page
+// schema extraction.
 //
 // Everything the model returns is run through a dependency-free validator before
 // it leaves this module, so an invalid/hallucinated shape can never reach the
@@ -660,6 +661,35 @@ function buildUserPrompt(cleanText: string, ctx: ExtractContext): string {
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
 
 /**
+ * The DeepSeek model the extractor requests (issue DURIN-TECH/japa#92). The
+ * ONE place the model id lives: the crawl, the CLI and the eval all read it
+ * through `visaCatalogExtractor.model`, and run records / results file names
+ * carry it.
+ *
+ * Source (checked 2026-11-10):
+ *  - https://api-docs.deepseek.com/quick_start/pricing: "Use `deepseek-flash`
+ *    as the model name" (model version DeepSeek-V4.1-Flash-1017); "JSON
+ *    Output" is supported; the legacy names "deepseek-v4-flash and
+ *    deepseek-v4-flash-vision-exp are still accepted" but their models "have
+ *    been retired".
+ *  - https://api-docs.deepseek.com/updates, 2026-10-17: "simply use
+ *    `deepseek-flash` to access the latest model"; 2026-09-10: "Change the
+ *    model name to `deepseek-flash` to call the latest V4.1 Flash model".
+ *  - Same change log, 2026-04-24: `deepseek-chat` "will be discontinued in
+ *    three months (2026-07-24)"; until then it mapped to V4 Flash's
+ *    non-thinking mode. We used to request `deepseek-chat`; an explicit id
+ *    means a removal of that alias cannot break crawls.
+ *
+ * `deepseek-flash` is a moving alias for the latest Flash build (DeepSeek
+ * names no dated id to pin). A Flash upgrade can therefore change output
+ * without a code change: the response's `model` field is recorded as
+ * `responseModel` on every extraction so a drift is visible, and the eval
+ * (`npm run eval:visa-extract`) is the check to re-run when the change log
+ * announces a new Flash build.
+ */
+export const DEEPSEEK_EXTRACTOR_MODEL = "deepseek-flash";
+
+/**
  * DeepSeek extractor. Uses the OpenAI-compatible chat/completions endpoint with
  * JSON output mode. Requires `DEEPSEEK_API_KEY` in the environment (bound as a
  * Firebase secret at deploy time). Construction never throws — the key is only
@@ -669,7 +699,7 @@ const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek
 export class DeepSeekExtractor implements LlmExtractor {
   readonly model: string;
 
-  constructor(model = "deepseek-chat") {
+  constructor(model: string = DEEPSEEK_EXTRACTOR_MODEL) {
     this.model = model;
   }
 
@@ -689,9 +719,22 @@ export class DeepSeekExtractor implements LlmExtractor {
       },
       body: JSON.stringify({
         model: this.model,
+        // Non-thinking mode, explicitly (issue #92). deepseek-flash has both
+        // modes and "Thinking mode is enabled by default"
+        // (https://api-docs.deepseek.com/guides/thinking_mode; the OpenAI
+        // format is {"thinking": {"type": "enabled/disabled"}}). The old
+        // deepseek-chat alias was the non-thinking mode; thinking would add
+        // billed reasoning tokens to every page and, per the same guide,
+        // makes `temperature` have "no effect". Extraction needs neither.
+        thinking: { type: "disabled" },
         // Low temperature: extraction should be deterministic, not creative.
+        // (Honoured in non-thinking mode only; see above.)
         temperature: 0,
         // JSON mode — the model must return a syntactically valid JSON object.
+        // https://api-docs.deepseek.com/guides/json_mode: response_format
+        // {'type': 'json_object'}, and the prompt must contain the word
+        // "json" (buildSystemPrompt does). No max_tokens: the model's output
+        // cap (384K per the pricing page) is far above an extraction's ~1K.
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: buildSystemPrompt() },
@@ -711,7 +754,7 @@ export class DeepSeekExtractor implements LlmExtractor {
       // total_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens).
       usage?: unknown;
       // The model that actually served the call (may differ from the
-      // requested alias, e.g. deepseek-chat -> a Flash version).
+      // requested alias, e.g. deepseek-flash -> a dated Flash build).
       model?: unknown;
     };
 
@@ -730,8 +773,12 @@ export class DeepSeekExtractor implements LlmExtractor {
       }
     }
 
+    // JSON mode can answer with whitespace only: "the returned `content` may
+    // contain only spaces" when the output was not valid JSON
+    // (https://api-docs.deepseek.com/guides/json_mode). Treat that as "no
+    // content" (a clear error) rather than a confusing JSON.parse failure.
     const content = data.choices?.[0]?.message?.content;
-    if (!content) throw new Error("DeepSeek returned no content");
+    if (!content || !content.trim()) throw new Error("DeepSeek returned no content");
 
     let parsed: unknown;
     try {

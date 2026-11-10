@@ -14,7 +14,7 @@ It is **not** part of `npm test`, CI or any deploy (it calls a paid LLM).
 Run `npm run eval:visa-extract` **before merging**:
 
 - every `EXTRACTOR_PROMPT_VERSION` bump (`src/scrapers/visa-catalog/visa-catalog-extract.service.ts`)
-- every model change (the `DeepSeekExtractor` default model, or a new `LlmExtractor`)
+- every model change (`DEEPSEEK_EXTRACTOR_MODEL`, the `DeepSeekExtractor` default model, or a new `LlmExtractor`), and when DeepSeek's change log announces a new Flash build (`deepseek-flash` is a moving alias)
 
 Commit the results file it writes (`src/scrapers/visa-catalog/eval/results/…json`) in the same PR, and
 put the version + overall score in the PR description. Use `--compare` with

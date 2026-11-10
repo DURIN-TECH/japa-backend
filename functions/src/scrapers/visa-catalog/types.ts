@@ -218,7 +218,7 @@ export interface VisaSource {
 export interface VisaScrapeMeta {
   sourceUrl: string;
   routeName: string; // the source-registry label the page was crawled under
-  model: string; // extractor model, e.g. "deepseek-chat"
+  model: string; // extractor model, e.g. "deepseek-flash" (older records: "deepseek-chat")
   confidence: number; // 0–1 from the extractor
   citations: Record<string, string>; // field name -> verbatim source quote
   // sha256 of the exact text sent to the extractor (selected + capped). For a
@@ -279,7 +279,7 @@ export interface VisaScrapeMeta {
   // Its cost in USD from appConfig/llmPricing; absent when the model had no price.
   llmCostUsd?: number;
   // The model the API says served the call, when it differs in name from
-  // `model` (e.g. a dated Flash version behind "deepseek-chat").
+  // `model` (e.g. a dated Flash build behind "deepseek-flash").
   llmResponseModel?: string;
   // The price-table entry the cost used ("deepseek-flash"); absent when unpriced.
   llmPricedAs?: string;
@@ -555,6 +555,20 @@ export interface PendingVisaChange {
   // noPublishedFee (or the cost does not match it): approve is refused.
   approvable: boolean;
   blockReason?: string; // FEE_NOT_CONVERTED_MESSAGE / FEE_MISSING_COST_MESSAGE when !approvable
+  // ---- Manual USD cost on a proposal (issue #77) ----
+  // The cost itself lives where approve already looks: the proposed fee
+  // (`proposedScrapeMeta.fee.manualCost`, `fxSource: "manual"`, `totalUsd`)
+  // plus `proposed.baseCostUsd` = Math.round(amountUsd). See
+  // changes/visa-change-manual-cost.ts.
+  //
+  // Set when a re-proposal with CHANGED page text replaced this open row and
+  // the row it replaced carried a manual cost: that cost (+ replacedAt /
+  // replacedByContentHash), so the admin sees "your manual cost of $X was
+  // replaced" instead of it vanishing. Kept at ROW level (not on the
+  // proposed fee) so it is never copied onto the live visa by approve.
+  // Carried forward by later replacements until a newer manual cost is
+  // replaced. Absent when nothing was replaced.
+  replacedManualCost?: VisaReplacedManualCostMeta;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   // Set on resolution only:
