@@ -416,6 +416,12 @@ export interface VisaType {
   // `withdrawn_notice`) and took this scraped visa off the app (isActive:false).
   // Never cleared automatically: reactivation is a human review step.
   staleSince?: Timestamp;
+  // Issue #68: set when the crawl put a withdrawn + approved scraped visa back
+  // into the review queue because its source page is live again (reviewStatus
+  // approved -> pending_review). Marks the queue entry as a RESTORE (not a new
+  // scrape), so a re-withdrawal before review can put it back to approved.
+  // Cleared by an admin review (approve or reject) and by that re-withdrawal.
+  restoredAt?: Timestamp;
 
   // Stats
   successRate?: number;
