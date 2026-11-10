@@ -15,15 +15,27 @@
  * equal the page is reported "unchanged (hash gate)" and NO extraction runs.
  * Pass --force to extract anyway.
  *
+ * FX (issue #59): `appConfig/fx` is refreshed once at the start of the run
+ * (Frankfurter / ECB), flagged pending fees are re-converted, and each
+ * extracted fee is converted to `baseCostUsd` in code.
+ *
  * Withdrawn pages (GOV.UK `withdrawn_notice`) are never extracted: a scraped
  * doc at the resolved id is deactivated (isActive:false + staleSince, set
  * once); seeded/agent docs are never touched; nothing is created.
+ *
+ * Host backoff (issue #64): a 429/503 from a host stops this run from
+ * requesting that host again (its remaining pages are reported as skipped),
+ * and pages on a host whose stored `hostBackoffs` retry-after time (written by
+ * the scheduled orchestrator) is still ahead are skipped too. This script does
+ * NOT write source health, so it neither persists a new backoff nor counts a
+ * failure — the scheduled orchestrator owns that.
  *
  * Usage (after `npm run build`, or with `npx tsx src/scripts/crawl-visa-catalog.ts`):
  *   node lib/scripts/crawl-visa-catalog.js --country GB
  *   node lib/scripts/crawl-visa-catalog.js --visa "skilled worker"
  *   node lib/scripts/crawl-visa-catalog.js --country GB --visa "student" --limit 3
  *   node lib/scripts/crawl-visa-catalog.js --country GB --limit 2 --force
+ *   node lib/scripts/crawl-visa-catalog.js --country GB --max-extractions 3
  *   node lib/scripts/crawl-visa-catalog.js --country GB --project durin-seli-dev
  *
  * Needs DEEPSEEK_API_KEY (loaded from functions/.env.local automatically) and a
@@ -41,8 +53,18 @@ import type { VisaType } from "../types";
 // ---- CLI args ----
 function parseArgs(argv: string[]) {
   // `force`: skip the hash gate and always extract.
-  const out: { country?: string; visa?: string; project?: string; limit: number; force: boolean } = {
+  // `maxExtractions`: cap on LLM calls this run (every call counts, success
+  // or failure — same rule as the orchestrator's maxExtractions).
+  const out: {
+    country?: string;
+    visa?: string;
+    project?: string;
+    limit: number;
+    maxExtractions: number;
+    force: boolean;
+  } = {
     limit: 25,
+    maxExtractions: 25,
     force: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -52,6 +74,7 @@ function parseArgs(argv: string[]) {
     else if (a === "--project" || a === "-p") out.project = argv[++i];
     else if (a === "--limit") out.limit = parseInt(argv[++i] || "25", 10);
     else if (a === "--force") out.force = true;
+    else if (a === "--max-extractions") out.maxExtractions = parseInt(argv[++i] || "25", 10);
   }
   return out;
 }
@@ -102,6 +125,14 @@ async function main() {
   );
   const { visaCatalogExtractor } = await import("../services/visa-catalog-extract.service");
   const { visaCatalogService } = await import("../services/visa-catalog.service");
+  // Pure host-backoff helper (issue #64): same skip rules as the orchestrator.
+  const { HostBackoffTracker, backoffMessage, hostOf, isHostBackoffError } = await import(
+    "../services/visa-crawl-host-state"
+  );
+  // Same Firestore -> helper mapper as the orchestrator (one implementation).
+  const { hostBackoffEntriesFromSource } = await import("../services/visa-crawl-host-backoff-store");
+  // One tracker for the whole manual run (shared across countries).
+  const hostState = new HostBackoffTracker(Date.now());
 
   // Pick sources: one country, or all.
   const sourcesSnap = args.country
@@ -112,6 +143,28 @@ async function main() {
     process.exit(1);
   }
 
+  // ---- FX: refresh appConfig/fx once per run, before extraction (issue #59) ----
+  // Same as the orchestrator: on failure the previous doc is kept; then
+  // pending scraped visas whose fee was flagged stale/missing are
+  // re-converted from their stored components (no LLM call).
+  const fxRefresh = await visaCatalogService.refreshFx();
+  const fx = fxRefresh.fx;
+  console.log(
+    fxRefresh.refreshed
+      ? `FX: refreshed appConfig/fx (ECB date ${fx?.rateDate})`
+      : `FX: refresh FAILED (${fxRefresh.error}); using previous appConfig/fx: ${fx ? fx.rateDate : "none"}`
+  );
+  // A failed re-convert must not abort the manual run (same as the orchestrator).
+  try {
+    const reconvert = await visaCatalogService.reconvertFlaggedFees(fx);
+    console.log(`FX: re-converted ${reconvert.reconverted} flagged fee(s), re-flagged ${reconvert.reflagged}`);
+  } catch (err) {
+    console.error(`FX: re-converting flagged fees FAILED (continuing): ${(err as Error).message}`);
+  }
+
+  // LLM calls made this run (successful or not), capped by --max-extractions.
+  let extractionsUsed = 0;
+
   let processed = 0;
   // `unchanged` also counts hash-gate skips (no LLM call); `withdrawn` = pages
   // the source marked withdrawn (never extracted).
@@ -121,14 +174,23 @@ async function main() {
     updated: 0,
     unchanged: 0,
     skipped: 0,
+    // Approved scraped visa whose page changed → pendingVisaChanges row (issue #61).
+    proposed: 0,
     withdrawn: 0,
     errors: 0,
+    deferred: 0, // pages skipped: host backed off (issue #64)
   };
 
   for (const doc of sourcesSnap.docs) {
     // Registry doc; pages are full VisaSourcePage objects so the pinned
     // `visaId` / `visaCode` (registry-owned identity) reach ingestExtraction.
-    const source = doc.data() as Pick<VisaSource, "countryCode" | "countryName" | "pages" | "adapter">;
+    const source = doc.data() as Pick<
+      VisaSource,
+      "countryCode" | "countryName" | "pages" | "adapter" | "hostBackoffs"
+    >;
+    // Stored retry-after times from the scheduled crawl (Firestore Timestamps
+    // -> the helper's ms form; malformed entries ignored).
+    hostState.load(hostBackoffEntriesFromSource(source.hostBackoffs));
     // Filter pages by --visa name if provided.
     const pages = source.pages.filter(
       (p) => !args.visa || p.routeName.toLowerCase().includes(args.visa)
@@ -136,6 +198,14 @@ async function main() {
     for (const page of pages) {
       if (processed >= args.limit) break;
       processed++;
+      // Host backed off (this run, or a stored retry-after still ahead)?
+      // Skip without any request.
+      const blocking = hostState.blocking(hostOf(page.url));
+      if (blocking) {
+        totals.deferred++;
+        console.log(`\n[${source.countryCode}] ${page.routeName}\n  -> skipped: ${backoffMessage(blocking)}`);
+        continue;
+      }
       try {
         console.log(`\n[${source.countryCode}] ${page.routeName}\n  ${page.url}`);
         // Resolve the record id BEFORE fetching/extracting (same rule as the
@@ -179,6 +249,13 @@ async function main() {
           }
         }
 
+        // Extraction cap: every LLM call counts, counted BEFORE the call so a
+        // failing call (API / validation error) also uses up a slot.
+        if (extractionsUsed >= args.maxExtractions) {
+          console.log(`  -> skipped: --max-extractions ${args.maxExtractions} reached`);
+          continue;
+        }
+        extractionsUsed++;
         const extracted = await visaCatalogExtractor.extract(fetched.text, {
           url: page.url,
           countryName: source.countryName,
@@ -197,11 +274,22 @@ async function main() {
           visaCode: page.visaCode,
           // Adapter provenance for scrapeMeta.
           sourceMeta: sourceMetaFromDocument(fetched),
+          // This run's rate doc: the fee is converted in code (issue #59).
+          fx,
         });
         totals[outcome]++;
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
       } catch (err) {
         totals.errors++;
+        // 429/503: stop requesting this host for the rest of the manual run.
+        // Recorded against the answering host, the requested host and the
+        // page host (see the orchestrator's catch for why all three).
+        if (isHostBackoffError(err)) {
+          const entry = err.toEntry(Date.now());
+          for (const h of new Set([entry.host, err.requestedHost, hostOf(page.url)])) {
+            if (h) hostState.record({ ...entry, host: h });
+          }
+        }
         console.log(`  -> ERROR: ${(err as Error).message}`);
       }
     }
@@ -210,10 +298,12 @@ async function main() {
 
   console.log(
     `\nDone. fetched ${totals.fetched} | created ${totals.created} | updated ${totals.updated} | ` +
-      `unchanged ${totals.unchanged} | skipped ${totals.skipped} | withdrawn ${totals.withdrawn} | ` +
-      `errors ${totals.errors}`
+      `unchanged ${totals.unchanged} | skipped ${totals.skipped} | proposed ${totals.proposed} | ` +
+      `withdrawn ${totals.withdrawn} | errors ${totals.errors} | host backed off ${totals.deferred}`
   );
   console.log("Review pending scraped visas at: admin → Visa Review (filter source=scraped).");
+  // Proposed edits to approved visas have no portal UI yet (follow-up issue).
+  if (totals.proposed > 0) console.log("Proposed edits to approved visas: GET /admin/visa-changes?status=open");
   process.exit(0);
 }
 

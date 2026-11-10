@@ -443,8 +443,11 @@ describe("govuk-content-api adapter: failures (all throw → page error, no extr
     await expectFailure(served(loadFixture("govuk-404.json")), /HTTP 404/);
   });
 
+  // 500 rather than 503: since issue #64 a 429/503 is a host backoff
+  // (HostBackoffError, covered in visa-crawl-host-state.test.ts), not a plain
+  // non-2xx failure.
   test("any other non-2xx", async () => {
-    await expectFailure({ status: 503, body: "busy" }, /HTTP 503/);
+    await expectFailure({ status: 500, body: "boom" }, /HTTP 500/);
   });
 
   test("non-JSON 200 body", async () => {

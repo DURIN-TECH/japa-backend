@@ -5,6 +5,8 @@ import cors from "cors";
 import { authRoutes } from "./routes/auth.routes";
 import { userRoutes, adminUsersRouter } from "./routes/user.routes";
 import { countryRoutes, visaSearchRoutes, adminVisaRoutes } from "./routes/visa.routes";
+// Proposed edits to approved scraped visas (pendingVisaChanges, issue #61)
+import { adminVisaChangeRoutes } from "./routes/visa-change.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
@@ -88,6 +90,8 @@ app.use("/news", newsRoutes);
 app.use("/eligibility", eligibilityRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
 app.use("/admin/visas", adminVisaRoutes);
+// Admin queue of proposed edits to live scraped visas (CASL `VisaChange`).
+app.use("/admin/visa-changes", adminVisaChangeRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);

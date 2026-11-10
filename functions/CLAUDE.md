@@ -15,3 +15,9 @@
   `requireFeature` / `checkWithinLimit` guards over re-deriving access from the DB.
 - When you add a new gateable capability, add it to the `@durin-tech/authz` catalog first
   (`FEATURE_KEYS`/`FEATURES` or `LIMIT_KEYS`/`LIMITS`), publish, then use the constant.
+
+## Visa extraction eval (prompt or model changes)
+
+- **Prompt or model change? Attach `eval:visa-extract` result (version + overall).** Any change to
+  the extractor prompt (`EXTRACTOR_PROMPT_VERSION` bump) or model runs `npm run eval:visa-extract`
+  before merge and commits the `eval/results/…json` file. See `eval/README.md`.
