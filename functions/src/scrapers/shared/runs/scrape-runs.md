@@ -2,9 +2,9 @@
 
 Every visa-catalog and news scraper run leaves one `scrapeRuns/{runId}` doc,
 so admins can see what ran, how long it took, what it found and what failed
-without reading Cloud Functions logs. Code: `src/services/scrape-run.service.ts`
-(recorder + reads), `src/types/scrape-run.ts` (schema),
-`src/controllers/scrape-run.controller.ts` (API).
+without reading Cloud Functions logs. Code: `src/scrapers/shared/runs/scrape-run.service.ts`
+(recorder + reads), `src/scrapers/shared/runs/types.ts` (schema),
+`src/scrapers/shared/runs/scrape-run.controller.ts` (API).
 
 ## When a run is recorded
 
@@ -12,7 +12,7 @@ without reading Cloud Functions logs. Code: `src/services/scrape-run.service.ts`
 | --- | --- | --- |
 | `crawlVisaCatalogOrchestrator` (hourly :15) | `scheduled` | the tick has at least one due, in-window source. Idle ticks (most of them) write nothing. |
 | `scrapeNewsOrchestrator` (every 30 min) | `scheduled` | at least one news source is due. |
-| `scripts/crawl-visa-catalog.ts` | `script` | always (after the args check); the run id is printed at the end. |
+| `scrapers/visa-catalog/scripts/crawl-visa-catalog.ts` | `script` | always (after the args check); the run id is printed at the end. |
 | future admin "Run now" (#84) | `manual` | reserved; pass `trigger: "manual"` to `runOrchestrator`. |
 
 Lifecycle: the doc is written `running` before any FX / fetch / LLM work, then
@@ -71,7 +71,7 @@ points the other way.
   "fatalError": "...",            // only when the run threw / went stale
   "warnings": ["FX refresh failed: ..."], // run-level, not errors
   "options": { "maxSources": 3, "maxExtractions": 15 }, // script: country, visa, limit, maxExtractions, force
-  "usage": { ... },               // #82: tokens, extractions, news requests (docs/scrape-costs.md)
+  "usage": { ... },               // #82: tokens, extractions, news requests (src/scrapers/shared/cost/scrape-costs.md)
   "costUsd": 0.0042,              // #82: run cost in USD
   "costBreakdown": { "byCountry": {...}, "byModel": {...} }, // #82
   "expireAt": Timestamp,          // startedAt + 180 days (TTL field)
@@ -89,7 +89,7 @@ points the other way.
   articlesFound, articlesDuplicate, articlesFailed, sourcesDeferred,
   hostsBackedOff, requestsAttempted`.
 
-All error text goes through `redactSecrets()` (`src/utils/redact.ts`, from
+All error text goes through `redactSecrets()` (`src/scrapers/shared/fetch/redact.ts`, from
 #76): `apikey=` / `X-Api-Key:` pairs, `Bearer` tokens and the literal values
 of `NEWS_API_KEY_*` and `DEEPSEEK_API_KEY` are replaced with `[REDACTED]`.
 
@@ -98,13 +98,13 @@ of `NEWS_API_KEY_*` and `DEEPSEEK_API_KEY` are replaced with `[REDACTED]`.
 - Add counters to `CrawlSummary` / `OrchestratorResult`: they land in
   `summary` with no schema change.
 - `usage` / `costUsd` / `costBreakdown` are written by #82 (see
-  `docs/scrape-costs.md`); visa page lines also carry `usage`, `costUsd`,
+  `src/scrapers/shared/cost/scrape-costs.md`); visa page lines also carry `usage`, `costUsd`,
   `model`, `promptVersion`.
 - Finalize hook: `scrapeRunService.registerFinalizeHook(async (run) => ...)`
   runs after every run's final write with the final doc (a throwing hook is
   logged and ignored). Use it for the cost rollup and the post-run alert
   rules. Stale sweeps do not call hooks; #83's hourly check reads the latest
-  finished run per scraper itself. Alerting: see [scrape-alerts.md](scrape-alerts.md).
+  finished run per scraper itself. Alerting: see [scrape-alerts.md](../alerts/scrape-alerts.md).
 
 ## Admin API
 

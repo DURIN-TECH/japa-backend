@@ -2,11 +2,11 @@
 
 What scraping costs, per extraction, run, country, model and month, and what a
 re-extract would cost before it runs. Builds on the run records of #81
-(`docs/scrape-runs.md`).
+(`src/scrapers/shared/runs/scrape-runs.md`).
 
-Code: `src/services/scrape-cost-pricing.ts` (pure maths + the default price
-table), `src/services/scrape-cost.service.ts` (Firestore: price table, budget,
-rollup, report, the #83 reader), `src/types/scrape-cost.ts` (shapes).
+Code: `src/scrapers/shared/cost/scrape-cost-pricing.ts` (pure maths + the default price
+table), `src/scrapers/shared/cost/scrape-cost.service.ts` (Firestore: price table, budget,
+rollup, report, the #83 reader), `src/scrapers/shared/cost/types.ts` (shapes).
 
 ## Where usage comes from
 
@@ -192,7 +192,7 @@ const mtd: ScrapeCostMonthToDate = await scrapeCostService.monthToDate(nowMs?);
 ```
 
 Two doc reads; throws on a Firestore read failure (the caller decides).
-Type: `ScrapeCostMonthToDate` in `src/types/scrape-cost.ts`.
+Type: `ScrapeCostMonthToDate` in `src/scrapers/shared/cost/types.ts`.
 
 ## Admin API: `GET /admin/scrape-costs`
 
@@ -237,7 +237,7 @@ Reads at most 24 month docs + 3 config/rollup docs. No index needed.
 
 ```bash
 # against the emulator or --project <id>; no LLM, no fetch, no writes, no key
-node lib/scripts/crawl-visa-catalog.js --estimate [--country GB] [--visa student] [--assume-bump]
+node lib/scrapers/visa-catalog/scripts/crawl-visa-catalog.js --estimate [--country GB] [--visa student] [--assume-bump]
 ```
 
 Counts, per source, the pages a #71 re-extract would queue (pending scraped

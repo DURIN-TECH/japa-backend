@@ -186,11 +186,11 @@ Approximate pricing per 1M tokens (**verify current DeepSeek pricing** — it ch
 
 | File | Purpose |
 |---|---|
-| `src/types/visa-catalog.ts` | `VisaSource`, `PendingVisaChange`, extraction schema |
-| `src/services/visa-catalog-fetch.service.ts` | axios/cheerio fetch + boilerplate strip + hash gate |
-| `src/services/visa-catalog-extract.service.ts` | `LlmExtractor` interface + DeepSeek impl (OpenAI-compatible, JSON mode), tiering |
-| `src/services/visa-catalog.service.ts` | validate → stage → diff → publish; Country stat rollups |
-| `src/data/seed-visa-sources.ts` | initial per-country official source registry |
+| `src/scrapers/visa-catalog/types.ts` | `VisaSource`, `PendingVisaChange`, extraction schema |
+| `src/scrapers/shared/fetch/visa-catalog-fetch.service.ts` | axios/cheerio fetch + boilerplate strip + hash gate |
+| `src/scrapers/visa-catalog/visa-catalog-extract.service.ts` | `LlmExtractor` interface + DeepSeek impl (OpenAI-compatible, JSON mode), tiering |
+| `src/scrapers/visa-catalog/visa-catalog.service.ts` | validate → stage → diff → publish; Country stat rollups |
+| `src/scrapers/visa-catalog/data/seed-visa-sources.ts` | initial per-country official source registry |
 | `src/scripts/backfill-visa-catalog.ts` | one-off Batch-API backfill runner |
 | `src/index.ts` | add `crawlVisaCatalogOrchestrator` + `cleanupVisaCatalog` scheduled fns |
 | portal `admin/visa-review` | extend to review/approve `pendingVisaChanges` diffs |

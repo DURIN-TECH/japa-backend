@@ -15,12 +15,12 @@ The spike's "Build order" says Steps 3–6 are pending. Most of it is in fact bu
 
 | Piece | File | State |
 |---|---|---|
-| Source registry seeded from v3 (26 countries) | `src/data/seed-visa-sources.ts` | ✅ built |
-| Fetch + boilerplate strip + hash gate + robots + 1.5s/host | `src/services/visa-catalog-fetch.service.ts` | ✅ built (HTML only) |
-| LLM extractor (`LlmExtractor`, DeepSeek-chat, JSON mode, validator) | `src/services/visa-catalog-extract.service.ts` | ✅ built |
-| Ingest → `countries/{code}/visaTypes` as `source:"scraped"`, `reviewStatus:"pending_review"`, `isActive:false` | `src/services/visa-catalog.service.ts` | ✅ built (create-only, see §7) |
+| Source registry seeded from v3 (26 countries) | `src/scrapers/visa-catalog/data/seed-visa-sources.ts` | ✅ built |
+| Fetch + boilerplate strip + hash gate + robots + 1.5s/host | `src/scrapers/shared/fetch/visa-catalog-fetch.service.ts` | ✅ built (HTML only) |
+| LLM extractor (`LlmExtractor`, DeepSeek-chat, JSON mode, validator) | `src/scrapers/visa-catalog/visa-catalog-extract.service.ts` | ✅ built |
+| Ingest → `countries/{code}/visaTypes` as `source:"scraped"`, `reviewStatus:"pending_review"`, `isActive:false` | `src/scrapers/visa-catalog/visa-catalog.service.ts` | ✅ built (create-only, see §7) |
 | Scheduled orchestrator | `crawlVisaCatalogOrchestrator` in `src/index.ts` (`0 */6 * * *` UTC) | ✅ built |
-| Local runner | `src/scripts/crawl-visa-catalog.ts` | ✅ built |
+| Local runner | `src/scrapers/visa-catalog/scripts/crawl-visa-catalog.ts` | ✅ built |
 | Admin approve/reject | `PATCH /admin/visas/:id/review` → `visaService.reviewVisa` | ✅ built (gaps in §7) |
 | `pendingVisaChanges` (diff-based edits to live visas) | — | ❌ not built |
 

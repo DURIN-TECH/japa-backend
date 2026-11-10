@@ -7,11 +7,11 @@ when it clears. New and escalated alerts are emailed to admins, and every alert
 action writes one structured log line (the Cloud Monitoring backstop in the
 meta-repo, `infra/terraform/monitoring_scrape_alerts.tf`).
 
-Code: `src/services/scrape-alert-rules.ts` (pure rule logic),
-`src/services/scrape-alert.service.ts` (store, email, checks, reads),
-`src/services/scrape-alert-cost.ts` (adapter over #82's cost rollup),
-`src/types/scrape-alert.ts` (schema), `src/controllers/scrape-alert.controller.ts`
-(API). Run records it reads: [scrape-runs.md](scrape-runs.md).
+Code: `src/scrapers/shared/alerts/scrape-alert-rules.ts` (pure rule logic),
+`src/scrapers/shared/alerts/scrape-alert.service.ts` (store, email, checks, reads),
+`src/scrapers/shared/alerts/scrape-alert-cost.ts` (adapter over #82's cost rollup),
+`src/scrapers/shared/alerts/types.ts` (schema), `src/scrapers/shared/alerts/scrape-alert.controller.ts`
+(API). Run records it reads: [scrape-runs.md](../runs/scrape-runs.md).
 
 ## When rules run
 
@@ -60,7 +60,7 @@ broken, retired or deleted), or when the host's last "retry after"
 (`details.backoffUntil`) has passed.
 
 **Budget (#82):** the rule reads `scrapeAlertService.costSource`, an adapter
-(`src/services/scrape-alert-cost.ts`) over #82's `scrapeCostService.monthToDate()`
+(`src/scrapers/shared/alerts/scrape-alert-cost.ts`) over #82's `scrapeCostService.monthToDate()`
 (`{ costUsd, budgetUsd }` -> `{ monthUsd, budgetUsd }`): spend from the
 `scrapeCosts/{YYYY-MM}` rollup, budget from `appConfig/scrapeBudget.monthlyUsd`.
 The hourly check first calls `scrapeCostService.backfillRecent()` so runs whose

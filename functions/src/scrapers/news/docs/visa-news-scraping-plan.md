@@ -202,11 +202,11 @@ export interface NewsSubscription {
 |------|---------|
 | `src/types/news.ts` | Type definitions above |
 | `src/services/news.service.ts` | Firestore CRUD for articles, sources, subscriptions |
-| `src/services/news-scraper.service.ts` | Orchestrator + RSS/HTML/API strategy implementations |
+| `src/scrapers/news/news-scraper.service.ts` | Orchestrator + RSS/HTML/API strategy implementations |
 | `src/services/news-notification.service.ts` | FCM + in-app notification dispatch to subscribers |
 | `src/controllers/news.controller.ts` | HTTP request handlers |
 | `src/routes/news.routes.ts` | Express route definitions |
-| `src/data/seed-news-sources.ts` | Initial source configurations |
+| `src/scrapers/news/seed-news-sources.ts` | Initial source configurations |
 | `src/scripts/seed-news-sources.ts` | Seed script runner |
 
 ## Existing Files to Modify
@@ -306,8 +306,8 @@ Auto-classify articles by scanning title + summary for keyword patterns:
 
 ### Phase 2: Core Services
 - [ ] Implement `src/services/news.service.ts` (Firestore CRUD)
-- [ ] Implement `src/services/news-scraper.service.ts` (orchestrator + strategies)
-- [ ] Create `src/data/seed-news-sources.ts` (source configs)
+- [ ] Implement `src/scrapers/news/news-scraper.service.ts` (orchestrator + strategies)
+- [ ] Create `src/scrapers/news/seed-news-sources.ts` (source configs)
 - [ ] Create `src/scripts/seed-news-sources.ts` (seed runner)
 
 ### Phase 3: Scheduled Functions
