@@ -106,7 +106,7 @@ Validation (400 `VALIDATION_ERROR`, `field` names the first bad field):
 | Field | Rule |
 | --- | --- |
 | `visa.enabled`, `news.enabled`, `*.blockManualWhenOff`, `budget.hardStop` | boolean |
-| `visa.maxExtractionsPerRun` | integer 0..200 (0 = fetch + hash only, never extract) |
+| `visa.maxExtractionsPerRun` | integer 1..200 (the run stops at the cap; to stop spending use `enabled` or the hard stop) |
 | `visa.maxSourcesPerTick` | integer 1..50 |
 | `news.maxSourcesPerRun` | integer 1..50 |
 | `manualRuns.cooldownMinutes` | integer 0..1440 |

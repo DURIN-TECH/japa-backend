@@ -33,6 +33,9 @@ import type { ScrapeRunTrigger } from "../shared/runs/types";
 // Importing the cost service also installs the monthly-rollup finalize hook.
 import { scrapeCostService } from "../shared/cost/scrape-cost.service";
 import { roundUsd } from "../shared/cost/scrape-cost-pricing";
+// Issue #96: kill switch + maxSourcesPerRun from appConfig/scraperSettings.
+import { loadScraperSettings } from "../shared/settings/scraper-settings.store";
+import type { ScraperSettings } from "../shared/settings/types";
 
 // ============================================
 // CRAWLER ETIQUETTE (issue #76)
@@ -139,6 +142,8 @@ type CustomItem = {
 export type NewsScraperStore = Pick<
   typeof newsService,
   | "getDueSources"
+  // Issue #96: manual "Run now" on one source reads it by id.
+  | "getSourceById"
   | "createScrapeRun"
   | "isDuplicate"
   | "createArticlesBatch"
@@ -159,6 +164,9 @@ export interface NewsScraperServiceOptions {
   // Issue #81: run-record service (tests inject one backed by the fake
   // Firestore; defaults to the Firestore-backed singleton).
   runs?: ScrapeRunService;
+  // Issue #96: settings loader (tests inject one; defaults to ONE read of
+  // appConfig/scraperSettings per tick).
+  loadSettings?: () => Promise<ScraperSettings>;
 }
 
 /**
@@ -190,6 +198,8 @@ export class NewsScraperService {
   private readonly store: NewsScraperStore;
   private readonly clock: () => number;
   private readonly runs: ScrapeRunService;
+  // Issue #96: reads the admin settings (kill switch, maxSourcesPerRun).
+  private readonly loadSettings: () => Promise<ScraperSettings>;
   // Issue #81: requests attempted (listing pages, feeds, article pages, API
   // calls) since construction. Callers read deltas around a scrape.
   private requestsAttempted = 0;
@@ -202,6 +212,7 @@ export class NewsScraperService {
     this.clock = options.clock ?? Date.now;
     this.store = options.store ?? newsService;
     this.runs = options.runs ?? scrapeRunService;
+    this.loadSettings = options.loadSettings ?? loadScraperSettings;
     this.fetcher = new VisaCatalogFetchService({
       http: options.http ?? createNewsHttpClient(),
       minIntervalMs: options.minIntervalMs,
@@ -226,7 +237,13 @@ export class NewsScraperService {
   // ============================================
 
   /**
-   * One scheduled tick: scrape up to 5 due sources.
+   * One scheduled tick: scrape up to `news.maxSourcesPerRun` (default 5,
+   * appConfig/scraperSettings, issue #96) due sources.
+   *
+   * Issue #96: a SCHEDULED tick with the news scraper switched off returns
+   * at once (no sweep, no run doc, no request). A manual run (trigger
+   * "manual") may target one source (`sourceId`): it is scraped whether or
+   * not it is due, if its status is active or broken.
    *
    * Run records (issue #81): every tick first sweeps stale `running` run docs
    * (crashed runs of either scraper -> failed). A tick with due sources then
@@ -236,8 +253,19 @@ export class NewsScraperService {
    * write no run doc.
    *
    * @param opts.trigger stored on the run doc (default "scheduled").
+   * @param opts.settings resolved settings (the manual worker passes its copy).
+   * @param opts.sourceId scrape just this source (manual Run now, #96).
+   * @param opts.onRunStarted told the run id once the run doc is written.
    */
-  async runOrchestrator(opts?: { trigger?: ScrapeRunTrigger }): Promise<OrchestratorResult> {
+  async runOrchestrator(opts?: {
+    trigger?: ScrapeRunTrigger;
+    settings?: ScraperSettings;
+    sourceId?: string;
+    onRunStarted?: (runId: string) => Promise<void> | void;
+  }): Promise<OrchestratorResult> {
+    const trigger: ScrapeRunTrigger = opts?.trigger ?? "scheduled";
+    // ---- Settings: ONE read per tick; never throws (issue #96) ----
+    const settings = opts?.settings ?? (await this.loadSettings());
     const result: OrchestratorResult = {
       sourcesProcessed: 0,
       newArticles: 0,
@@ -250,10 +278,24 @@ export class NewsScraperService {
       requestsAttempted: 0,
     };
 
+    // ---- Kill switch (issue #96): before anything is read or written ----
+    if (trigger === "scheduled" && !settings.news.enabled) {
+      console.log("News scrape: the news scraper is switched off (appConfig/scraperSettings), tick skipped");
+      return result;
+    }
+    const maxSources = settings.news.maxSourcesPerRun;
+
     // Stale sweep on EVERY tick (never throws).
     await this.runs.sweepStaleRuns(this.clock());
 
-    const dueSources = await this.store.getDueSources(5);
+    // Issue #96: one named source (manual run) or the due batch.
+    let dueSources: NewsSource[];
+    if (opts?.sourceId !== undefined) {
+      const one = await this.store.getSourceById(opts.sourceId);
+      dueSources = one && (one.status === "active" || one.status === "broken") ? [{ ...one, id: one.id ?? opts.sourceId }] : [];
+    } else {
+      dueSources = await this.store.getDueSources(maxSources);
+    }
 
     if (dueSources.length === 0) {
       console.log("No sources due for scraping");
@@ -265,11 +307,20 @@ export class NewsScraperService {
     // ---- Start the run record (issue #81); never throws ----
     const recorder = await this.runs.start({
       kind: "news",
-      trigger: opts?.trigger ?? "scheduled",
+      trigger,
       startedAtMs: this.clock(),
-      options: { maxSources: 5 },
+      // sourceId only on a single-source manual run (undefined is dropped).
+      options: { maxSources, sourceId: opts?.sourceId },
     });
     console.log(`News scrape: run ${recorder.id} started`);
+    // Issue #96: tell the manual worker the run id (best effort).
+    if (opts?.onRunStarted) {
+      try {
+        await opts.onRunStarted(recorder.id);
+      } catch (err) {
+        console.error(`News scrape: onRunStarted callback failed: ${(err as Error)?.message ?? err}`);
+      }
+    }
 
     // Issue #82: API request counters before the run (delta recorded below).
     const apiBefore = { ...this.apiRequestsByProvider };

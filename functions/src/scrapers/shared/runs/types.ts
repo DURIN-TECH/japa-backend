@@ -97,8 +97,10 @@ export interface ScrapeRunSourceEntry {
  *  - unchanged: hash gate, no extraction (or extraction produced no change);
  *  - withdrawn: source says withdrawn, never extracted;
  *  - deferred: host backed off, not requested;
- *  - capped: not attempted, the run's extraction cap was reached (script only;
- *    the orchestrator simply stops and the page waits for the next window);
+ *  - capped: not extracted because of a limit. Script: the run's extraction
+ *    cap was reached (the orchestrator simply stops and the page waits for
+ *    the next window). Issue #96: also a page the budget hard stop fetched
+ *    and hashed but did not extract (`reason` says so; it stays pending);
  *  - supplement: a supplement-only registry row (#86, e.g. the KR fee
  *    table): never extracted, its text is appended to the routes that list
  *    it; `reason` says whether a route fetched it this run. Not counted in

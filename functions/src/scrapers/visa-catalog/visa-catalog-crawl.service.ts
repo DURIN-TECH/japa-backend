@@ -38,6 +38,11 @@ import {
   supplementaryGateHash,
   supplementaryPagesMeta,
 } from "./visa-catalog-supplementary";
+// Admin settings (issue #96): kill switch + limits (one read per tick) and
+// the budget hard stop that gates LLM extraction.
+import { loadScraperSettings } from "../shared/settings/scraper-settings.store";
+import { loadBudgetGate, type BudgetGate } from "../shared/settings/budget-hard-stop";
+import type { ScraperSettings } from "../shared/settings/types";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -97,9 +102,17 @@ import {
 export const WITHDRAWN_PAGE_ERROR = "Withdrawn on GOV.UK";
 
 // Safety bounds per invocation — keep any single run cheap + within the function
-// timeout even on the first pass when every source is due.
-const DEFAULT_MAX_SOURCES = 3; // countries per run
-const DEFAULT_MAX_EXTRACTIONS = 15; // LLM calls per run (cost cap)
+// timeout even on the first pass when every source is due. Issue #96: these
+// used to be code constants (3 countries, 15 LLM calls); they now come from
+// `appConfig/scraperSettings` (visa.maxSourcesPerTick /
+// visa.maxExtractionsPerRun), whose defaults keep those values. See
+// scrapers/shared/settings/scraper-settings.store.ts.
+
+// Issue #96: the run-line reason of a changed page whose extraction the
+// budget hard stop skipped (outcome "capped": the page waits, not an error).
+export const BUDGET_HARD_STOP_REASON =
+  "budget hard stop: the monthly LLM budget is spent, so this page was fetched and hashed but not " +
+  "extracted; it stays pending and re-extracts once the budget allows";
 
 export interface CrawlSummary {
   sourcesProcessed: number;
@@ -133,6 +146,11 @@ export interface CrawlSummary {
   // (e.g. the UK IHS page) could not be fetched or parsed this run. Each is
   // also a page error (in `errors`) and logged with console.error.
   linkedSurchargeErrors: number;
+  // Issue #96: true when the budget hard stop blocked extraction at some
+  // point in this run, and how many pages (changed, or due a prompt
+  // re-extract) were fetched + hashed but NOT extracted because of it.
+  budgetHardStop: boolean;
+  extractionsSkippedBudget: number;
 }
 
 class VisaCatalogCrawlService {
@@ -161,9 +179,43 @@ class VisaCatalogCrawlService {
     // Issue #81: the run recorder service (tests may inject one; defaults to
     // the Firestore-backed singleton).
     runs?: ScrapeRunService;
+    // ---- Issue #96: admin settings + manual runs ----
+    // Resolved settings (tests / the manual-run worker pass the copy they
+    // already read); default = ONE read of appConfig/scraperSettings here.
+    settings?: ScraperSettings;
+    // Run just this country (manual "Run now" on one source): it is crawled
+    // whether or not it is due and whatever its window, as long as its
+    // status is active or broken (paused / retired are never crawled).
+    sourceId?: string;
+    // Run every DUE active source, ignoring crawl windows (manual "Run now"
+    // on the whole scraper). Robots, backoff and limits still apply.
+    ignoreWindow?: boolean;
+    // Ignore the content-hash gate: every fetched page goes to extraction
+    // (still within maxExtractions and the budget hard stop).
+    force?: boolean;
+    // Called with the run id as soon as the run doc is written (the manual
+    // worker stores it on the request so the portal can follow the run).
+    onRunStarted?: (runId: string) => Promise<void> | void;
   }): Promise<CrawlSummary> {
-    const maxSources = opts?.maxSources ?? DEFAULT_MAX_SOURCES;
-    const maxExtractions = opts?.maxExtractions ?? DEFAULT_MAX_EXTRACTIONS;
+    const trigger: ScrapeRunTrigger = opts?.trigger ?? "scheduled";
+
+    // ---- Settings: ONE read per tick (issue #96) ----
+    // Never throws (defaults on a read error). Explicit maxSources /
+    // maxExtractions options (tests, scripts) still win over the settings.
+    const settings = opts?.settings ?? (await loadScraperSettings());
+
+    // ---- Kill switch (issue #96) ----
+    // A SCHEDULED tick with the visa scraper switched off returns before
+    // anything else: no stale sweep, no rollup backfill, no due query, no
+    // run doc, no fetch, no LLM call. Manual runs are gated by the API /
+    // worker (blockManualWhenOff), not here.
+    if (trigger === "scheduled" && !settings.visa.enabled) {
+      console.log("Visa catalog crawl: the visa scraper is switched off (appConfig/scraperSettings), tick skipped");
+      return emptySummary();
+    }
+
+    const maxSources = opts?.maxSources ?? settings.visa.maxSourcesPerTick;
+    const maxExtractions = opts?.maxExtractions ?? settings.visa.maxExtractionsPerRun;
 
     // The tick's instant. Every scheduling decision AND every timestamp
     // written below (lastCrawledAt, page crawl times, updatedAt, the
@@ -173,24 +225,7 @@ class VisaCatalogCrawlService {
       opts?.now === undefined
         ? Timestamp.now()
         : Timestamp.fromMillis(typeof opts.now === "number" ? opts.now : opts.now.getTime());
-    const summary: CrawlSummary = {
-      sourcesProcessed: 0,
-      pagesFetched: 0,
-      pagesChanged: 0,
-      promptReextracts: 0,
-      created: 0,
-      updated: 0,
-      skipped: 0,
-      proposed: 0,
-      withdrawn: 0,
-      restored: 0,
-      errors: 0,
-      fxRefreshed: false,
-      feesReconverted: 0,
-      hostsBackedOff: 0,
-      pagesDeferred: 0,
-      linkedSurchargeErrors: 0,
-    };
+    const summary: CrawlSummary = emptySummary();
     const runs = opts?.runs ?? scrapeRunService;
 
     // ---- Stale run sweep (issue #81) ----
@@ -218,31 +253,18 @@ class VisaCatalogCrawlService {
     // nextCrawlAt) fill the batch and starve the in-window ones. The registry
     // is a handful of docs (26), so reading all due ones is cheap.
     // ("broken" / "paused" sources never match the status filter.)
-    const dueSnap = await collections.visaSources
-      .where("status", "==", "active")
-      .where("nextCrawlAt", "<=", now)
-      .orderBy("nextCrawlAt", "asc")
-      .get();
-
-    // ---- Window filter, THEN the per-run cap ----
-    // Keep a due source if the tick is inside its local window, or if it has
-    // no window (legacy). An out-of-window source is left completely
-    // untouched: no fetch, no write, its nextCrawlAt unchanged — so it is
-    // still due when its window opens. A stored window that fails validation
-    // (should never happen: the seed validates) is logged and skipped rather
-    // than aborting the tick for every other source.
-    const runnable = dueSnap.docs
-      .filter((doc) => {
-        const source = doc.data() as VisaSource;
-        if (!source.crawlWindow) return true;
-        try {
-          return isInCrawlWindow(source.crawlWindow, now.toMillis());
-        } catch (err) {
-          console.error(`Visa catalog: source ${doc.id} has an invalid crawlWindow, skipped:`, err);
-          return false;
-        }
-      })
-      .slice(0, maxSources);
+    // Issue #96 ("Run now" on one source): read just that doc, skipping
+    // the due query and the window filter below. Paused / retired sources
+    // are never crawled (the API refuses them too); a broken one may be
+    // retried by hand (a healthy run makes it active again).
+    let runnable: { ref: FirebaseFirestore.DocumentReference; data(): FirebaseFirestore.DocumentData | undefined }[];
+    if (opts?.sourceId !== undefined) {
+      const snap = await collections.visaSources.doc(opts.sourceId).get();
+      const status = (snap.data() as VisaSource | undefined)?.status;
+      runnable = snap.exists && (status === "active" || status === "broken") ? [snap] : [];
+    } else {
+      runnable = await this.dueRunnable(now, maxSources, opts?.ignoreWindow === true);
+    }
 
     // Nothing to crawl on this tick (the common case: most hourly ticks fall
     // outside every window) -> stop here, BEFORE any FX work: no Frankfurter
@@ -253,16 +275,55 @@ class VisaCatalogCrawlService {
 
     // ---- Start the run record (issue #81) ----
     // Written as `running` before any FX / fetch / LLM work. Never throws.
+    // Issue #96: a manual run also records its scope (sourceId / force /
+    // ignoreWindow); undefined knobs are dropped, so a scheduled run's
+    // options stay { maxSources, maxExtractions } as before.
     const recorder = await runs.start({
       kind: "visa",
-      trigger: opts?.trigger ?? "scheduled",
+      trigger,
       startedAtMs: now.toMillis(),
-      options: { maxSources, maxExtractions },
+      options: {
+        maxSources,
+        maxExtractions,
+        sourceId: opts?.sourceId,
+        force: opts?.force ? true : undefined,
+        ignoreWindow: opts?.ignoreWindow ? true : undefined,
+      },
     });
     console.log(`Visa catalog crawl: run ${recorder.id} started (${runnable.length} source(s))`);
+    // Issue #96: tell the manual worker the run id at once (best effort: a
+    // failing callback must not stop the crawl).
+    if (opts?.onRunStarted) {
+      try {
+        await opts.onRunStarted(recorder.id);
+      } catch (err) {
+        console.error(`Visa catalog crawl: onRunStarted callback failed: ${(err as Error)?.message ?? err}`);
+      }
+    }
 
     try {
-      await this.crawlRunnable(runnable, { now, summary, recorder, maxExtractions, opts });
+      // ---- Budget hard stop (issue #96), read once per run ----
+      // null = nothing to enforce (hard stop off, no budget, or the cost
+      // could not be read — then a run warning says so).
+      const budgetGate = await loadBudgetGate(settings, now.toMillis(), (msg) => recorder.recordWarning(msg));
+      await this.crawlRunnable(runnable, {
+        now,
+        summary,
+        recorder,
+        maxExtractions,
+        opts,
+        budgetGate,
+        force: opts?.force === true,
+      });
+      if (summary.budgetHardStop && budgetGate) {
+        // A run-level warning (not an error: status unaffected). The post-run
+        // alert rule budget_hard_stop (#83 engine) raises the alert from the
+        // summary flag.
+        recorder.recordWarning(
+          `LLM budget hard stop: month-to-date cost reached the $${budgetGate.budgetUsd} budget for ` +
+            `${budgetGate.month}; ${summary.extractionsSkippedBudget} page(s) fetched but not extracted`
+        );
+      }
     } catch (err) {
       // An unexpected throw (e.g. a Firestore write failing) aborts the run:
       // record it as failed with what was counted so far, then rethrow so
@@ -278,21 +339,66 @@ class VisaCatalogCrawlService {
   }
 
   /**
+   * The DUE sources a tick may crawl, oldest first, at most `maxSources`.
+   * Split out of runOrchestrator in #96 (the single-source manual run skips
+   * it). `ignoreWindow` (manual whole-scraper run) keeps every due source
+   * whatever its window.
+   */
+  private async dueRunnable(
+    now: Timestamp,
+    maxSources: number,
+    ignoreWindow: boolean
+  ): Promise<FirebaseFirestore.QueryDocumentSnapshot[]> {
+    const dueSnap = await collections.visaSources
+      .where("status", "==", "active")
+      .where("nextCrawlAt", "<=", now)
+      .orderBy("nextCrawlAt", "asc")
+      .get();
+
+    // ---- Window filter, THEN the per-run cap ----
+    // Keep a due source if the tick is inside its local window, or if it has
+    // no window (legacy). An out-of-window source is left completely
+    // untouched: no fetch, no write, its nextCrawlAt unchanged — so it is
+    // still due when its window opens. A stored window that fails validation
+    // (should never happen: the seed validates) is logged and skipped rather
+    // than aborting the tick for every other source.
+    return dueSnap.docs
+      .filter((doc) => {
+        const source = doc.data() as VisaSource;
+        // Issue #96: a manual whole-scraper run ignores windows.
+        if (ignoreWindow || !source.crawlWindow) return true;
+        try {
+          return isInCrawlWindow(source.crawlWindow, now.toMillis());
+        } catch (err) {
+          console.error(`Visa catalog: source ${doc.id} has an invalid crawlWindow, skipped:`, err);
+          return false;
+        }
+      })
+      .slice(0, maxSources);
+  }
+
+  /**
    * The crawl body for one tick's runnable sources (split out of
    * runOrchestrator in #81 so the run record can wrap it in one try/catch).
    * Mutates `summary` and notes pages / sources / errors on `recorder`.
    */
   private async crawlRunnable(
-    runnable: FirebaseFirestore.QueryDocumentSnapshot[],
+    // Query snapshots (due sources) or one doc snapshot (manual single-source
+    // run, #96): only `ref` and `data()` are used.
+    runnable: { ref: FirebaseFirestore.DocumentReference; data(): FirebaseFirestore.DocumentData | undefined }[],
     ctx: {
       now: Timestamp;
       summary: CrawlSummary;
       recorder: ScrapeRunRecorder;
       maxExtractions: number;
       opts?: { fetchFxRates?: FxFetcher; adapters?: SourceAdapterSet };
+      // Issue #96: the budget hard stop (null = not enforced) and `force`
+      // (ignore the content-hash gate).
+      budgetGate: BudgetGate | null;
+      force: boolean;
     }
   ): Promise<void> {
-    const { now, summary, recorder, maxExtractions, opts } = ctx;
+    const { now, summary, recorder, maxExtractions, opts, budgetGate, force } = ctx;
 
     // ---- Price table for this run (issue #82). Never throws: falls back to
     // the default table (quoted from the provider's page) when unreadable.
@@ -491,7 +597,8 @@ class VisaCatalogCrawlService {
           const extractText = combineSupplementaryText(fetched.text, supps);
           // Hash gate over route + supplements (+ linked surcharge pages).
           const gateHash = linkedGateHash(supplementaryGateHash(fetched.contentHash, supps), linked);
-          const changed = gateHash !== page.lastContentHash;
+          // Issue #96: `force` (manual Run now) treats every page as changed.
+          const changed = force || gateHash !== page.lastContentHash;
           // Record crawl metadata regardless of change.
           pages[i] = {
             ...page,
@@ -520,6 +627,21 @@ class VisaCatalogCrawlService {
           } else {
             summary.pagesChanged++;
           }
+
+          // ---- Budget hard stop (issue #96) ----
+          // The month's spend (rollup at run start + this run's own cost so
+          // far) has reached the budget: do NOT call the LLM. The page was
+          // fetched and hashed above; put its OLD hash back so the gate
+          // still sees it as changed next run (it stays pending), and stamp
+          // extractionDeferredAt. No maxExtractions slot is used.
+          if (budgetGate && budgetGate.exceeded(recorder.usageSoFar.costUsd)) {
+            summary.budgetHardStop = true;
+            summary.extractionsSkippedBudget++;
+            pages[i] = { ...pages[i], lastContentHash: page.lastContentHash, extractionDeferredAt: now };
+            notePage(page, "capped", { visaId, reason: BUDGET_HARD_STOP_REASON });
+            continue;
+          }
+
           // Count the LLM call BEFORE making it: a failed call (API error,
           // validation error) costs money too and must use up a
           // maxExtractions slot, or a systematic failure could exceed the cap.
@@ -539,7 +661,8 @@ class VisaCatalogCrawlService {
               recorder.recordUsage({ ...callUsage, sourceId: source.countryCode });
             },
           });
-          pages[i] = { ...pages[i], lastExtractedAt: now };
+          // Issue #96: a page deferred by the budget hard stop is caught up.
+          pages[i] = { ...pages[i], lastExtractedAt: now, extractionDeferredAt: undefined };
 
           const { outcome } = await visaCatalogService.ingestExtraction({
             countryCode: source.countryCode,
@@ -741,6 +864,30 @@ class VisaCatalogCrawlService {
       summary.sourcesProcessed++;
     }
   }
+}
+
+/** A zeroed run summary (also what a switched-off or idle tick returns). */
+function emptySummary(): CrawlSummary {
+  return {
+    sourcesProcessed: 0,
+    pagesFetched: 0,
+    pagesChanged: 0,
+    promptReextracts: 0,
+    created: 0,
+    updated: 0,
+    skipped: 0,
+    proposed: 0,
+    withdrawn: 0,
+    restored: 0,
+    errors: 0,
+    fxRefreshed: false,
+    feesReconverted: 0,
+    hostsBackedOff: 0,
+    pagesDeferred: 0,
+    linkedSurchargeErrors: 0,
+    budgetHardStop: false,
+    extractionsSkippedBudget: 0,
+  };
 }
 
 export const visaCatalogCrawlService = new VisaCatalogCrawlService();
