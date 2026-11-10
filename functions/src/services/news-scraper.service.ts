@@ -165,6 +165,14 @@ export interface NewsScraperServiceOptions {
 export interface ScrapeSourceTrace {
   sourceRunId?: string;
   requestsAttempted: number;
+  /**
+   * Issue #79: true once scrapeSource() has written this run's outcome to the
+   * source's health counters (updateSourceAfterScrape). The orchestrator reads
+   * it so a failure is recorded EXACTLY ONCE per source per run: scrapeSource
+   * owns the write, and the orchestrator only writes as a fallback when
+   * scrapeSource threw before it got that far (e.g. createScrapeRun failed).
+   */
+  sourceHealthRecorded?: boolean;
 }
 
 // ============================================
@@ -363,12 +371,20 @@ export class NewsScraperService {
         // host + status + message, redacted.
         console.error(`Failed to scrape source ${source.name}: ${describeError(error)}`);
 
-        await this.store.updateSourceAfterScrape(
-          source.id,
-          false,
-          describeError(error),
-          isHostBackoffError(error) ? error.untilMs : undefined
-        );
+        // Issue #79: scrapeSource() already recorded this failure on the
+        // source (totalRuns, consecutiveFailures, reliabilityScore). Writing
+        // it again here double-counted every failure, so a broken source was
+        // auto-paused after ~3 runs instead of 5. Only fall back to recording
+        // it here when scrapeSource threw before its own write (the trace
+        // flag is unset), so each source gets exactly one update per run.
+        if (!trace.sourceHealthRecorded) {
+          await this.store.updateSourceAfterScrape(
+            source.id,
+            false,
+            describeError(error),
+            isHostBackoffError(error) ? error.untilMs : undefined
+          );
+        }
       }
     }
   }
@@ -389,6 +405,15 @@ export class NewsScraperService {
     link?: { runId?: string; trace?: ScrapeSourceTrace }
   ): Promise<ScrapeRun> {
     const runId = await this.store.createScrapeRun(source.id, link?.runId);
+    // Issue #79: whether this call has already written the run's outcome to
+    // the source's health counters. Guards the catch below: if the success
+    // write went through and a LATER step threw (completeScrapeRun), the run
+    // must not be counted a second time as a failure.
+    let healthRecorded = false;
+    const markHealthRecorded = () => {
+      healthRecorded = true;
+      if (link?.trace) link.trace.sourceHealthRecorded = true;
+    };
     if (link?.trace) link.trace.sourceRunId = runId;
     // Requests counter before this source, for the trace's delta.
     const requestsBefore = this.requestsAttempted;
@@ -452,6 +477,7 @@ export class NewsScraperService {
 
       // 4. Update source health
       await this.store.updateSourceAfterScrape(source.id, true);
+      markHealthRecorded();
 
       // 5. Complete the scrape run record
       const runResult: Partial<ScrapeRun> = {
@@ -491,13 +517,19 @@ export class NewsScraperService {
         durationMs: Date.now() - startTime,
       });
 
-      await this.store.updateSourceAfterScrape(
-        source.id,
-        false,
-        describeError(error),
-        // Don't come back before the host's Retry-After time.
-        isHostBackoffError(error) ? error.untilMs : undefined
-      );
+      // Issue #79: the ONE failure write for this source in this run (the
+      // orchestrator skips its own when the trace says we did it). Skipped
+      // if the success write above already counted this run.
+      if (!healthRecorded) {
+        await this.store.updateSourceAfterScrape(
+          source.id,
+          false,
+          describeError(error),
+          // Don't come back before the host's Retry-After time.
+          isHostBackoffError(error) ? error.untilMs : undefined
+        );
+        markHealthRecorded();
+      }
 
       throw error;
     }
