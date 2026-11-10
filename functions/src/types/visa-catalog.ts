@@ -256,6 +256,67 @@ export interface VisaFeeMeta {
   // component is implausibly large. No `baseCostUsd`; approval is blocked.
   feeUnverified?: boolean;
   feeUnverifiedReason?: string;
+
+  // ---- Manual USD cost (issue #70; optional so older docs stay valid) ----
+  // Present when an admin set the USD cost by hand on a PENDING scraped visa
+  // the scraper could not convert (PUT /admin/visas/:id/manual-cost). The
+  // block then also has `fxSource: FX_SOURCE_MANUAL` ("manual"),
+  // `totalUsd = manualCost.amountUsd`, `fxDate` = the day it was set, and NO
+  // fxMissing / fxStale / feeUnverified / noPublishedFee flags (their old
+  // values are kept in `manualCost.previous`). `components` / `totals` stay
+  // exactly as the source published them.
+  manualCost?: VisaManualCostMeta;
+  // Audit trail for an overwrite (issue #70): a later scrape with CHANGED
+  // content replaced a manual cost through the normal path (conversion or
+  // flags). Never silent: the replaced entry is kept here (and logged) so the
+  // review UI can show "your manual cost of $X was replaced on <date>".
+  // Carried forward by later refreshes / re-conversions until a newer manual
+  // cost or overwrite replaces it.
+  replacedManualCost?: VisaReplacedManualCostMeta;
+}
+
+// ----- Manual USD cost (issue #70) -----
+//
+// Who set a hand-entered USD cost on a pending scraped visa, when, and why.
+// Stored at `scrapeMeta.fee.manualCost`. Optional fields are ABSENT (never
+// `undefined`) so the object is always safe to write to Firestore.
+export interface VisaManualCostMeta {
+  // The USD amount exactly as entered (may have cents). The visa's
+  // `baseCostUsd` is Math.round(amountUsd), and `fee.totalUsd` = amountUsd,
+  // so the approval guard (baseCostUsd === round(totalUsd)) accepts it.
+  amountUsd: number;
+  // Why the admin set it, e.g. "CBC rate 1 TWD = 0.031 USD on 2026-11-10".
+  // Required (trimmed, non-empty).
+  reason: string;
+  // Optional exchange rate the admin used: USD per ONE unit of `currency`.
+  // Recorded for audit only — it is not re-applied to the components.
+  rate?: { currency: string; usdPerUnit: number };
+  setBy: string; // admin uid
+  setAt: Timestamp;
+  // `scrapeMeta.contentHash` of the extraction the cost was set against.
+  contentHash: string;
+  // What the fee block said BEFORE this manual cost (the scraper's state),
+  // so a reviewer can see what was overridden. Only keys that were set.
+  previous: {
+    fxMissing?: boolean;
+    fxStale?: boolean;
+    feeUnverified?: boolean;
+    feeUnverifiedReason?: string;
+    noPublishedFee?: boolean;
+    totalUsd?: number;
+    fxSource?: string;
+    baseCostUsd?: number;
+  };
+  // When this manual cost replaced an EARLIER manual cost on the same
+  // extraction (an admin correcting themselves): that earlier entry, minus
+  // its own `previous` / `supersedes` (one level only).
+  supersedes?: Omit<VisaManualCostMeta, "previous" | "supersedes">;
+}
+
+// A manual cost that a later scrape replaced (see VisaFeeMeta.replacedManualCost).
+export interface VisaReplacedManualCostMeta extends VisaManualCostMeta {
+  replacedAt: Timestamp; // when the crawl replaced it
+  replacedByContentHash: string; // content hash of the extraction that replaced it
 }
 
 // ----- Stored exchange rates (`appConfig/fx`) -----

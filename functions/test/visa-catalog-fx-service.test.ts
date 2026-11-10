@@ -229,6 +229,15 @@ before(async () => {
   crawl = (await import("../src/services/visa-catalog-crawl.service")).visaCatalogCrawlService;
   // The same instance the orchestrator calls (spied on for re-convert counts).
   catalogSvc = (await import("../src/services/visa-catalog.service")).visaCatalogService;
+  // Issue #70: the pending-refresh write runs in a transaction. This suite's
+  // fake has no transaction support, so use a pass-through runner (reads and
+  // writes go straight to the fake store; nothing here tests rollback).
+  catalogSvc.runTransaction = (fn: (tx: any) => Promise<unknown>) =>
+    fn({
+      get: (ref: any) => ref.get(),
+      update: (ref: any, data: Data) => ref.update(data),
+      set: (ref: any, data: Data, opts?: { merge?: boolean }) => ref.set(data, opts),
+    });
   visaSvc = (await import("../src/services/visa.service")).visaService;
   controller = (await import("../src/controllers/visa.controller")).visaController;
 });

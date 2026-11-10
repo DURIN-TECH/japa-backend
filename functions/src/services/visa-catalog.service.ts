@@ -1,5 +1,5 @@
-import { collections, subcollections } from "../utils/firebase";
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { collections, db, subcollections } from "../utils/firebase";
+import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 import { VisaType } from "../types";
 import { ExtractedVisa, FxRatesDoc } from "../types/visa-catalog";
 // Pure id/code rules live in a Firebase-free module so they are unit-testable.
@@ -31,6 +31,8 @@ import type { ScrapeSourceMeta } from "./visa-source-adapters";
 // decision, and the pendingVisaChanges writer.
 import { planIngest } from "./visa-catalog-diff";
 import { visaChangeService } from "./visa-catalog-changes.service";
+// Manual USD cost (issue #70): a refresh replaces it, recording the overwrite.
+import { planManualCostOverwrite } from "./visa-manual-cost";
 
 // ============================================
 // VISA CATALOG SERVICE (ingest into review queue)
@@ -71,6 +73,13 @@ export const firestoreFxStore: FxStore = {
   },
 };
 class VisaCatalogService {
+  /**
+   * Transaction runner for the pending-refresh write (issue #70). Swappable
+   * in unit tests for an in-memory one (writes buffered until the callback
+   * resolves, so a throw writes nothing — same all-or-nothing contract).
+   */
+  runTransaction: <T>(fn: (tx: Transaction) => Promise<T>) => Promise<T> = (fn) => db.runTransaction(fn);
+
   /**
    * Deterministic visa doc id for a crawled page — owned by the source
    * registry, never by the LLM output:
@@ -199,17 +208,50 @@ class VisaCatalogService {
       // than FX (no published fee, or an unverified fee), DELETE the old
       // `baseCostUsd` — it would otherwise stay next to a fee block that no
       // longer supports it. (FX-flagged fees keep the old value unchanged, as
-      // specified; the approval guard blocks them by the flag.)
-      const deleteCost =
-        baseCostUsd === undefined && !isFeeFxFlagged(feeMeta) && (feeMeta.noPublishedFee || feeMeta.feeUnverified);
-      await ref.update({
-        ...fields,
-        ...(deleteCost ? { baseCostUsd: FieldValue.delete() } : {}),
-        sourceUrl,
-        scrapeMeta,
-        updatedAt: now,
+      // specified; the approval guard blocks them by the flag — EXCEPT a
+      // manual cost (issue #70), which is deleted: it belonged to the old
+      // content, see planManualCostOverwrite.)
+      //
+      // Issue #70: done in a TRANSACTION that re-reads the doc, so an admin's
+      // manual cost written between our first read and this write is seen
+      // (and its replacement recorded) instead of being lost silently.
+      return this.runTransaction(async (tx) => {
+        const fresh = await tx.get(ref);
+        if (!fresh.exists) return { visaId, outcome: "skipped" as IngestOutcome };
+        const current = fresh.data() as VisaType;
+        // The doc may have moved on since the first read (approved, rejected,
+        // already refreshed with this hash): re-plan and only write a refresh.
+        const again = planIngest(current, contentHash);
+        if (again === "unchanged") return { visaId, outcome: "unchanged" as IngestOutcome };
+        if (again !== "refresh") return { visaId, outcome: "skipped" as IngestOutcome };
+
+        // ---- Manual cost (issue #70): the new extraction replaces it ----
+        // The changed content wins through the normal path (its conversion,
+        // or its flags). The replaced entry is kept on the new fee block as
+        // `replacedManualCost` and logged — never a silent overwrite.
+        const overwrite = planManualCostOverwrite(current.scrapeMeta?.fee, feeMeta, baseCostUsd, contentHash, now);
+        if (overwrite.replaced) {
+          console.warn(
+            `Manual USD cost ${overwrite.replaced.amountUsd} on ${countryCode}/${visaId} (set by ` +
+              `${overwrite.replaced.setBy}) replaced by a re-scrape with changed content (${contentHash}); ` +
+              (baseCostUsd === undefined ? "the new fee is not converted, cost removed" : `new cost ${baseCostUsd}`)
+          );
+        }
+
+        const deleteCost =
+          overwrite.deleteCost ||
+          (baseCostUsd === undefined &&
+            !isFeeFxFlagged(feeMeta) &&
+            Boolean(feeMeta.noPublishedFee || feeMeta.feeUnverified));
+        tx.update(ref, {
+          ...fields,
+          ...(deleteCost ? { baseCostUsd: FieldValue.delete() } : {}),
+          sourceUrl,
+          scrapeMeta: { ...scrapeMeta, fee: overwrite.fee },
+          updatedAt: now,
+        });
+        return { visaId, outcome: "updated" as IngestOutcome };
       });
-      return { visaId, outcome: "updated" };
     }
     // Approved scraped visa whose page changed: propose, never write the live
     // doc. The changes service re-reads the doc + the open row in a

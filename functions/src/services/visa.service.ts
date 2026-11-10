@@ -1,5 +1,6 @@
 import {
   collections,
+  db,
   subcollections,
   serverTimestamp,
 } from "../utils/firebase";
@@ -11,11 +12,13 @@ import {
   RequiredDocument,
 } from "../types";
 // FieldValue.delete() clears `staleSince` on approval (issue #62).
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 // Approval guard for visas with no usable USD cost (issue #59).
 import { assertVisaApprovable } from "./visa-catalog-fx";
 // Finite-only min for the denormalized country stats.
 import { finiteMin } from "./visa-catalog-meta";
+// Manual USD cost on a pending scraped visa (issue #70): pure rules.
+import { ManualCostError, ManualCostInput, planManualCost } from "./visa-manual-cost";
 
 export interface CreateCountryInput {
   code: string;
@@ -51,6 +54,13 @@ export interface CreateRequirementInput {
 }
 
 class VisaService {
+  /**
+   * Transaction runner for setManualCost (issue #70). Swappable in unit tests
+   * for an in-memory one (writes buffered until the callback resolves, so a
+   * throw writes nothing — same all-or-nothing contract as Firestore).
+   */
+  runTransaction: <T>(fn: (tx: Transaction) => Promise<T>) => Promise<T> = (fn) => db.runTransaction(fn);
+
   // ============================================
   // COUNTRY OPERATIONS
   // ============================================
@@ -614,6 +624,57 @@ class VisaService {
     }
 
     const updated = await visaTypeRef.get();
+    return { id: updated.id, ...updated.data() } as VisaType;
+  }
+
+  // ============================================
+  // MANUAL USD COST (issue #70)
+  // ============================================
+
+  /**
+   * Set the USD cost of a PENDING scraped visa by hand
+   * (PUT /admin/visas/:id/manual-cost).
+   *
+   * In ONE transaction: read the visa, decide with the pure planManualCost
+   * (pending scraped only; not when the scraper's own cost is approvable;
+   * optional content-hash check), then write `baseCostUsd` and replace
+   * `scrapeMeta.fee` wholesale (field-path update, so `scrapeMeta.contentHash`,
+   * citations etc. are untouched). The crawl's pending-refresh write is also
+   * transactional, so the two can't interleave and lose a write silently.
+   *
+   * Does NOT approve the visa and does not touch stats: a pending visa is
+   * inactive (not counted). The admin then approves through the normal
+   * PATCH /admin/visas/:id/review, whose guard accepts the manual cost.
+   *
+   * @param visaTypeId doc id under countries/{cc}/visaTypes (controller has
+   *   already checked it is addressable)
+   * @param input validated body (parseManualCostInput)
+   * @param setBy the admin's uid
+   * @returns the visa as stored after the write
+   * @throws ManualCostError NOT_FOUND / NOT_PENDING_SCRAPED /
+   *   FEE_ALREADY_CONVERTED / STALE_VISA — nothing written
+   */
+  async setManualCost(visaTypeId: string, input: ManualCostInput, setBy: string): Promise<VisaType> {
+    const ref = subcollections.visaTypes(input.countryCode).doc(visaTypeId);
+
+    await this.runTransaction(async (tx) => {
+      // ---- Read (before any write, as Firestore requires) ----
+      const snap = await tx.get(ref);
+      if (!snap.exists) throw new ManualCostError("NOT_FOUND", "Visa type not found", 404);
+
+      // ---- Decide (throws → nothing written) ----
+      const now = Timestamp.now();
+      const plan = planManualCost(snap.data() as VisaType, input, setBy, now);
+
+      // ---- Write ----
+      tx.update(ref, {
+        baseCostUsd: plan.baseCostUsd,
+        "scrapeMeta.fee": plan.fee,
+        updatedAt: now,
+      });
+    });
+
+    const updated = await ref.get();
     return { id: updated.id, ...updated.data() } as VisaType;
   }
 
