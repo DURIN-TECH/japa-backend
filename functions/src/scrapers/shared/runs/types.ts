@@ -30,8 +30,8 @@ export type ScrapeRunKind = "visa" | "news";
  * What started the run:
  *  - scheduled: the Cloud Scheduler tick (crawlVisaCatalogOrchestrator /
  *    scrapeNewsOrchestrator);
- *  - manual: an admin-triggered run through the API (reserved for a future
- *    "Run now" endpoint, #84; nothing writes it yet);
+ *  - manual: an admin "Run now" through the API (issue #96: the
+ *    processScrapeRunRequest worker);
  *  - script: a CLI run (`src/scrapers/visa-catalog/scripts/crawl-visa-catalog.ts`).
  */
 export type ScrapeRunTrigger = "scheduled" | "manual" | "script";
