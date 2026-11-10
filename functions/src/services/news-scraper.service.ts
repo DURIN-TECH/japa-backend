@@ -3,6 +3,19 @@ import * as cheerio from "cheerio";
 import Parser from "rss-parser";
 import { createHash } from "crypto";
 import { newsService } from "./news.service";
+// Crawler etiquette (issue #76): the news bot reuses the visa catalog
+// crawler's fetch layer (#64) — robots.txt parsing + cache, per-host rate
+// limit and 429/503 detection — instead of keeping its own copy. See
+// "Crawler etiquette" below.
+import { VisaCatalogFetchService, type VisaCatalogHttpClient } from "./visa-catalog-fetch.service";
+import {
+  HostBackoffTracker,
+  backoffMessage,
+  hostOf,
+  isHostBackoffError,
+  type HostBackoffEntry,
+  type HostBackoffError,
+} from "./visa-crawl-host-state";
 import {
   NewsSource,
   NewsArticle,
@@ -12,6 +25,80 @@ import {
   OrchestratorResult,
 } from "../types/news";
 import { Timestamp } from "firebase-admin/firestore";
+
+// ============================================
+// CRAWLER ETIQUETTE (issue #76)
+// ============================================
+//
+// The news bot is honest and identifiable, like the visa catalog crawler
+// (#64). Every request it makes — news listing pages, RSS feeds, article
+// pages, robots.txt AND the news API calls — carries NEWS_BOT_USER_AGENT,
+// whose URL points at the news-bot section of https://weareseli.com/bot
+// (seli-website `bot.html`, `#news-bot`), which describes what it fetches and
+// how often. Before #76 the RSS feeds were fetched by rss-parser's own HTTP
+// client and so went out as `User-Agent: rss-parser`; they now go through
+// the same client as everything else.
+//
+// On top of that, ALL requests go through a VisaCatalogFetchService instance
+// built on the news bot's own HTTP client (so the News UA, not the catalog
+// UA, is sent), which gives us exactly the catalog crawler's behaviour:
+//
+//  - robots.txt is read (cached 24h per host) and respected before every
+//    listing page, feed and article page. Rules come from
+//    `parseRobotsDisallows`: a group naming us (any User-agent token that
+//    contains "seli", e.g. `Seli-VisaNewsBot`) wins over `*`. Fail-open if
+//    robots.txt cannot be read. News API calls (newsdata.io / newsapi.org)
+//    are licensed, keyed API requests, not crawling, so they are NOT checked
+//    against robots.txt — they do get the backoff below.
+//  - requests to one host are spaced by PER_HOST_MIN_INTERVAL_MS (1.5s).
+//    This replaces the old fixed 1s / 0.5s sleeps.
+//  - a 429 or 503 (on a page, a feed, robots.txt or an API call) throws a
+//    HostBackoffError carrying the host's `Retry-After` (seconds or
+//    HTTP-date, clamped; 1h default). For the REST OF THE RUN (one
+//    orchestrator tick) the host is not requested again: later sources on it
+//    are skipped and remaining article pages on it are not fetched. The
+//    source's next visit is pushed to no earlier than the Retry-After time
+//    (`notBeforeMs` on updateSourceAfterScrape), and the run counts as a
+//    failure toward the source's auto-pause ("broken" after repeated
+//    failures, see news.service.ts).
+//
+// We NEVER rotate IPs, use proxies, or spoof / rotate the User-Agent to get
+// around a block, a rate limit or a robots.txt rule (same policy as
+// visa-catalog-fetch.service.ts). That is also why a source's
+// `customHeaders` may not override the User-Agent (see requestHeaders()).
+
+/**
+ * The news bot's User-Agent. The URL fragment lands on the news-bot section
+ * of the public /bot page (seli-website bot.html, `id="news-bot"`), so a site
+ * owner who looks it up reads what THIS bot does. Keep the two in sync.
+ */
+export const NEWS_BOT_USER_AGENT = "Seli-VisaNewsBot/1.0 (+https://weareseli.com/bot#news-bot)";
+
+/** News API endpoints (requested hosts are what the backoff tracker keys on). */
+export const NEWSDATA_API_URL = "https://newsdata.io/api/1/news";
+export const NEWSAPI_API_URL = "https://newsapi.org/v2/everything";
+
+/** Max article pages opened per source per run when `fetchFullContent` is on. */
+export const MAX_FULL_CONTENT_ARTICLES = 5;
+
+/**
+ * The production HTTP client for every news-bot request. `validateStatus`
+ * accepts every status so the fetch layer sees 429/503 (and decides what is
+ * an error) instead of axios throwing first.
+ */
+export function createNewsHttpClient(): AxiosInstance {
+  return axios.create({
+    timeout: 15000,
+    headers: {
+      "User-Agent": NEWS_BOT_USER_AGENT,
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.5",
+    },
+    maxRedirects: 3,
+    maxContentLength: 5 * 1024 * 1024, // 5MB limit
+    validateStatus: () => true,
+  });
+}
 
 // ============================================
 // CUSTOM RSS PARSER TYPE
@@ -25,29 +112,55 @@ type CustomItem = {
 };
 
 // ============================================
+// DEPENDENCIES (injectable for tests)
+// ============================================
+
+/** The slice of newsService the scraper writes through (a stub in tests). */
+export type NewsScraperStore = Pick<
+  typeof newsService,
+  | "getDueSources"
+  | "createScrapeRun"
+  | "isDuplicate"
+  | "createArticlesBatch"
+  | "updateSourceAfterScrape"
+  | "completeScrapeRun"
+>;
+
+/** Constructor options — all optional; defaults are the production values. */
+export interface NewsScraperServiceOptions {
+  // HTTP client for every request (tests inject a stub; no network).
+  http?: VisaCatalogHttpClient;
+  // Firestore-backed store (tests inject a stub; no emulator).
+  store?: NewsScraperStore;
+  // Per-host politeness gap in ms (tests pass 0 so they don't sleep).
+  minIntervalMs?: number;
+  // Clock (epoch ms) for Retry-After maths and the run's backoff tracker.
+  clock?: () => number;
+}
+
+// ============================================
 // NEWS SCRAPER SERVICE
 // ============================================
 
-class NewsScraperService {
-  private httpClient: AxiosInstance;
+export class NewsScraperService {
+  // Politeness layer shared with the visa catalog crawler (#64), on OUR client.
+  private readonly fetcher: VisaCatalogFetchService;
+  private readonly store: NewsScraperStore;
+  private readonly clock: () => number;
   private rssParser: Parser<CustomFeed, CustomItem>;
 
-  constructor() {
-    this.httpClient = axios.create({
-      timeout: 15000,
-      headers: {
-        "User-Agent":
-          "Seli-VisaNewsBot/1.0 (+https://weareseli.com/bot)",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-      },
-      maxRedirects: 3,
-      maxContentLength: 5 * 1024 * 1024, // 5MB limit
+  constructor(options: NewsScraperServiceOptions = {}) {
+    this.clock = options.clock ?? Date.now;
+    this.store = options.store ?? newsService;
+    this.fetcher = new VisaCatalogFetchService({
+      http: options.http ?? createNewsHttpClient(),
+      minIntervalMs: options.minIntervalMs,
+      clock: this.clock,
     });
 
+    // Used for PARSING only (parseString). The feed itself is fetched through
+    // this.fetcher so it carries our UA, robots.txt and backoff (issue #76).
     this.rssParser = new Parser<CustomFeed, CustomItem>({
-      timeout: 10000,
       customFields: {
         item: [
           ["media:content", "mediaContent"],
@@ -69,7 +182,7 @@ class NewsScraperService {
       errors: 0,
     };
 
-    const dueSources = await newsService.getDueSources(5);
+    const dueSources = await this.store.getDueSources(5);
 
     if (dueSources.length === 0) {
       console.log("No sources due for scraping");
@@ -78,19 +191,40 @@ class NewsScraperService {
 
     console.log(`Found ${dueSources.length} sources due for scraping`);
 
+    // One backoff tracker per run (issue #76): a host that answers 429/503
+    // is not requested again by any later source in this run.
+    const tracker = new HostBackoffTracker(this.clock());
+
     for (const source of dueSources) {
+      // Host already backed off in this run → skip WITHOUT sending a request.
+      // Recorded like the catalog crawler does: a failure (toward auto-pause)
+      // with the backoff message, next visit no earlier than Retry-After.
+      const blocked = this.blockingEntryFor(source, tracker);
+      if (blocked) {
+        result.errors++;
+        console.warn(`Skipping source ${source.name}: ${backoffMessage(blocked)}`);
+        await this.store.updateSourceAfterScrape(
+          source.id,
+          false,
+          backoffMessage(blocked),
+          blocked.untilMs
+        );
+        continue;
+      }
+
       try {
-        const scrapeResult = await this.scrapeSource(source);
+        const scrapeResult = await this.scrapeSource(source, tracker);
         result.sourcesProcessed++;
         result.newArticles += scrapeResult.articlesNew;
       } catch (error) {
         result.errors++;
         console.error(`Failed to scrape source ${source.name}:`, error);
 
-        await newsService.updateSourceAfterScrape(
+        await this.store.updateSourceAfterScrape(
           source.id,
           false,
-          (error as Error).message
+          (error as Error).message,
+          isHostBackoffError(error) ? error.untilMs : undefined
         );
       }
     }
@@ -102,8 +236,15 @@ class NewsScraperService {
   // SINGLE SOURCE SCRAPER
   // ============================================
 
-  async scrapeSource(source: NewsSource): Promise<ScrapeRun> {
-    const runId = await newsService.createScrapeRun(source.id);
+  /**
+   * Scrape one source. `tracker` is the run's backoff state (the
+   * orchestrator's); a standalone call gets a fresh one.
+   */
+  async scrapeSource(
+    source: NewsSource,
+    tracker: HostBackoffTracker = new HostBackoffTracker(this.clock())
+  ): Promise<ScrapeRun> {
+    const runId = await this.store.createScrapeRun(source.id);
     const startTime = Date.now();
 
     try {
@@ -115,7 +256,7 @@ class NewsScraperService {
         rawArticles = await this.fetchRss(source);
         break;
       case "html_scrape":
-        rawArticles = await this.fetchHtml(source);
+        rawArticles = await this.fetchHtml(source, tracker);
         break;
       case "news_api":
         rawArticles = await this.fetchNewsApi(source);
@@ -137,7 +278,7 @@ class NewsScraperService {
         try {
           const normalized = this.normalizeArticle(raw, source);
 
-          const isDup = await newsService.isDuplicate(
+          const isDup = await this.store.isDuplicate(
             normalized.urlHash,
             normalized.titleHash
           );
@@ -160,11 +301,11 @@ class NewsScraperService {
 
       // 3. Batch write new articles
       if (newArticles.length > 0) {
-        await newsService.createArticlesBatch(newArticles);
+        await this.store.createArticlesBatch(newArticles);
       }
 
       // 4. Update source health
-      await newsService.updateSourceAfterScrape(source.id, true);
+      await this.store.updateSourceAfterScrape(source.id, true);
 
       // 5. Complete the scrape run record
       const runResult: Partial<ScrapeRun> = {
@@ -177,7 +318,7 @@ class NewsScraperService {
         durationMs: Date.now() - startTime,
       };
 
-      await newsService.completeScrapeRun(source.id, runId, runResult);
+      await this.store.completeScrapeRun(source.id, runId, runResult);
 
       console.log(
         `Source "${source.name}": found=${rawArticles.length}, new=${articlesNew}, dup=${articlesDuplicate}, failed=${articlesFailed}`
@@ -190,21 +331,105 @@ class NewsScraperService {
         startedAt: Timestamp.now(),
       } as ScrapeRun;
     } catch (error) {
-      await newsService.completeScrapeRun(source.id, runId, {
+      // 429/503 from the source's host (page, feed, robots.txt or API):
+      // block it for the rest of the run before recording the failure.
+      if (isHostBackoffError(error)) this.recordBackoff(tracker, error);
+
+      await this.store.completeScrapeRun(source.id, runId, {
         status: "failed",
         errorMessage: (error as Error).message,
         errorStack: (error as Error).stack,
         durationMs: Date.now() - startTime,
       });
 
-      await newsService.updateSourceAfterScrape(
+      await this.store.updateSourceAfterScrape(
         source.id,
         false,
-        (error as Error).message
+        (error as Error).message,
+        // Don't come back before the host's Retry-After time.
+        isHostBackoffError(error) ? error.untilMs : undefined
       );
 
       throw error;
     }
+  }
+
+  // ============================================
+  // ETIQUETTE HELPERS (issue #76)
+  // ============================================
+
+  /**
+   * The URL a source's first request goes to (the host the run's backoff
+   * check keys on): the feed for RSS, the listing page for HTML, the API
+   * endpoint for news APIs. undefined when the source is misconfigured (the
+   * strategy method then throws its own clear error).
+   */
+  private entryUrlFor(source: NewsSource): string | undefined {
+    switch (source.strategy) {
+    case "rss":
+      return source.config.feedUrl;
+    case "html_scrape":
+      return source.url;
+    case "news_api":
+      if (source.config.apiConfig?.provider === "newsdata") return NEWSDATA_API_URL;
+      if (source.config.apiConfig?.provider === "newsapi") return NEWSAPI_API_URL;
+      return undefined;
+    default:
+      return undefined;
+    }
+  }
+
+  /** The backoff entry blocking this source's host in this run, if any. */
+  private blockingEntryFor(
+    source: NewsSource,
+    tracker: HostBackoffTracker
+  ): HostBackoffEntry | undefined {
+    const url = this.entryUrlFor(source);
+    const host = url ? hostOf(url) : "";
+    return host ? tracker.blocking(host) : undefined;
+  }
+
+  /**
+   * Record a 429/503 against BOTH the host that answered it and the host we
+   * requested (they differ after a cross-host redirect) — same rule as the
+   * visa catalog orchestrator, so a missing post-redirect URL can never let
+   * us keep hitting the throttling host.
+   */
+  private recordBackoff(tracker: HostBackoffTracker, err: HostBackoffError): void {
+    const entry = err.toEntry(this.clock());
+    for (const host of new Set([err.host, err.requestedHost])) {
+      if (host) tracker.record({ ...entry, host });
+    }
+  }
+
+  /**
+   * Per-request headers for a source: its `customHeaders` (e.g. Accept),
+   * minus any User-Agent — the bot must always identify itself as
+   * NEWS_BOT_USER_AGENT (never spoof the UA, see the policy above).
+   */
+  private requestHeaders(source: NewsSource, extra: Record<string, string> = {}): Record<string, string> {
+    const headers: Record<string, string> = {};
+    for (const [key, value] of Object.entries(source.config.customHeaders ?? {})) {
+      if (key.toLowerCase() !== "user-agent") headers[key] = value;
+    }
+    return { ...extra, ...headers };
+  }
+
+  /**
+   * Robots-checked, rate-limited, backoff-aware GET of a crawled URL (listing
+   * page, feed or article). Throws "Blocked by robots.txt" when disallowed,
+   * HostBackoffError on 429/503 (robots.txt or the URL itself), and a plain
+   * error on any other non-2xx. Returns the body text.
+   */
+  private async crawlGet(url: string, headers: Record<string, string>): Promise<string> {
+    if (!(await this.fetcher.isAllowedByRobots(url))) {
+      throw new Error(`Blocked by robots.txt: ${url}`);
+    }
+    const resp = await this.fetcher.getRaw(url, headers);
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`Fetch failed for ${url} (HTTP ${resp.status})`);
+    }
+    return resp.body;
   }
 
   // ============================================
@@ -217,7 +442,14 @@ class NewsScraperService {
       throw new Error(`No feedUrl configured for RSS source: ${source.name}`);
     }
 
-    const feed = await this.rssParser.parseURL(feedUrl);
+    // Fetch through the shared fetch layer (UA + robots + backoff), then parse.
+    const xml = await this.crawlGet(
+      feedUrl,
+      this.requestHeaders(source, {
+        Accept: "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8",
+      })
+    );
+    const feed = await this.rssParser.parseString(xml);
 
     return (feed.items || []).map((item) => ({
       title: this.cleanText(item.title || ""),
@@ -239,7 +471,7 @@ class NewsScraperService {
   // STRATEGY: HTML SCRAPE
   // ============================================
 
-  private async fetchHtml(source: NewsSource): Promise<RawArticle[]> {
+  private async fetchHtml(source: NewsSource, tracker: HostBackoffTracker): Promise<RawArticle[]> {
     const selectors = source.config.selectors;
     if (!selectors) {
       throw new Error(
@@ -247,14 +479,11 @@ class NewsScraperService {
       );
     }
 
-    // Politeness delay
-    await this.delay(1000);
+    // Politeness: the fetch layer's per-host gap (1.5s) replaces the old
+    // fixed 1s sleep; robots.txt + backoff are checked inside crawlGet.
+    const html = await this.crawlGet(source.url, this.requestHeaders(source));
 
-    const response = await this.httpClient.get(source.url, {
-      headers: source.config.customHeaders || {},
-    });
-
-    const $ = cheerio.load(response.data);
+    const $ = cheerio.load(html);
     const articles: RawArticle[] = [];
 
     $(selectors.articleList).each((_, element) => {
@@ -302,18 +531,21 @@ class NewsScraperService {
       }
     });
 
-    // Optionally fetch full content for each article
+    // Optionally fetch full content for the first few articles. Each one is
+    // robots-checked; a host that backed off (this run) is not requested.
     if (source.config.fetchFullContent && selectors.articleBody) {
-      for (const article of articles.slice(0, 5)) {
+      for (const article of articles.slice(0, MAX_FULL_CONTENT_ARTICLES)) {
+        if (tracker.blocking(hostOf(article.url))) continue;
         try {
-          await this.delay(500);
-          const detailResp = await this.httpClient.get(article.url);
-          const detail$ = cheerio.load(detailResp.data);
+          const detailHtml = await this.crawlGet(article.url, {});
+          const detail$ = cheerio.load(detailHtml);
           article.body = this.cleanText(
             detail$(selectors.articleBody).text()
           ).slice(0, 5000);
-        } catch {
-          // Summary is enough
+        } catch (err) {
+          // 429/503 on an article host: stop requesting it for the rest of
+          // the run. Robots-disallowed or failed pages: the summary is enough.
+          if (isHostBackoffError(err)) this.recordBackoff(tracker, err);
         }
       }
     }
@@ -324,6 +556,32 @@ class NewsScraperService {
   // ============================================
   // STRATEGY: NEWS API
   // ============================================
+
+  /**
+   * GET a news API endpoint with query params. Not robots-checked (a keyed
+   * API call, not crawling) but rate-limited and backoff-aware via getRaw.
+   * Errors NEVER include the URL: its query string carries the API key, and
+   * error messages are written to Firestore (scrape runs, source health).
+   */
+  private async getNewsApiJson(
+    endpoint: string,
+    params: Record<string, string | number | undefined>
+  ): Promise<Record<string, unknown>> {
+    const url = new URL(endpoint);
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== "") url.searchParams.set(key, String(value));
+    }
+    // HostBackoffError's message is host/status/time only — no key leak.
+    const resp = await this.fetcher.getRaw(url.toString(), { Accept: "application/json" });
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`News API request to ${url.host} failed (HTTP ${resp.status})`);
+    }
+    try {
+      return JSON.parse(resp.body) as Record<string, unknown>;
+    } catch {
+      throw new Error(`News API response from ${url.host} was not JSON`);
+    }
+  }
 
   private async fetchNewsApi(source: NewsSource): Promise<RawArticle[]> {
     const apiConfig = source.config.apiConfig;
@@ -342,21 +600,16 @@ class NewsScraperService {
     let articles: RawArticle[] = [];
 
     if (apiConfig.provider === "newsdata") {
-      const response = await this.httpClient.get(
-        "https://newsdata.io/api/1/news",
-        {
-          params: {
-            apikey: apiKey,
-            q: apiConfig.query,
-            language: apiConfig.language || "en",
-            country: apiConfig.country,
-            category: apiConfig.category,
-          },
-        }
-      );
+      const data = await this.getNewsApiJson(NEWSDATA_API_URL, {
+        apikey: apiKey,
+        q: apiConfig.query,
+        language: apiConfig.language || "en",
+        country: apiConfig.country,
+        category: apiConfig.category,
+      });
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      articles = (response.data.results || []).map((item: any) => ({
+      articles = ((data.results as any[]) || []).map((item: any) => ({
         title: item.title || "",
         url: item.link || "",
         summary: (item.description || "").slice(0, 500),
@@ -364,21 +617,16 @@ class NewsScraperService {
         publishedAt: item.pubDate ? new Date(item.pubDate) : undefined,
       }));
     } else if (apiConfig.provider === "newsapi") {
-      const response = await this.httpClient.get(
-        "https://newsapi.org/v2/everything",
-        {
-          params: {
-            apiKey,
-            q: apiConfig.query,
-            language: apiConfig.language || "en",
-            sortBy: "publishedAt",
-            pageSize: source.config.maxArticlesPerRun,
-          },
-        }
-      );
+      const data = await this.getNewsApiJson(NEWSAPI_API_URL, {
+        apiKey,
+        q: apiConfig.query,
+        language: apiConfig.language || "en",
+        sortBy: "publishedAt",
+        pageSize: source.config.maxArticlesPerRun,
+      });
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      articles = (response.data.articles || []).map((item: any) => ({
+      articles = ((data.articles as any[]) || []).map((item: any) => ({
         title: item.title || "",
         url: item.url || "",
         summary: (item.description || "").slice(0, 500),
@@ -553,10 +801,6 @@ class NewsScraperService {
       .replace(/\n+/g, " ")
       .replace(/<[^>]*>/g, "")
       .trim();
-  }
-
-  private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
 
