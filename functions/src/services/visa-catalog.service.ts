@@ -27,6 +27,8 @@ import { EXTRACTOR_PROMPT_VERSION } from "./visa-catalog-extract.service";
 // Canonical country-stats recompute (issue #62: the only stats function).
 import { visaService } from "./visa.service";
 import type { ScrapeSourceMeta } from "./visa-source-adapters";
+// Surcharges published on a linked page (issue #69): applied in code before computeFee.
+import { applyLinkedSurcharges, type PageLinkedSurcharge } from "./visa-catalog-linked-surcharge";
 // Proposed edits to approved scraped visas (issue #61): the pure branch
 // decision, and the pendingVisaChanges writer.
 import { isPendingPromptStale, planIngest } from "./visa-catalog-diff";
@@ -147,6 +149,12 @@ class VisaCatalogService {
     // caller can't forget it; `undefined` = no stored rate at all (fees in a
     // non-USD, non-pegged currency are then flagged fxMissing).
     fx: FxRatesDoc | undefined;
+    // Surcharges published on a linked page that this route's registry page
+    // is marked with (issue #69), resolved once per run by the crawl
+    // (LinkedSurchargeCache.forPage). Absent / [] = none. NOTE: callers then
+    // pass `contentHash` = linkedGateHash(page hash, linked), so a change to
+    // the linked page re-stages the visa like a change to its own page.
+    linkedSurcharges?: PageLinkedSurcharge[];
   }): Promise<{ visaId: string; outcome: IngestOutcome }> {
     const { countryCode, sourceUrl, routeName, contentHash, extracted, model } = params;
     // Id from the registry (pin or URL path), never from extracted.code/name.
@@ -163,8 +171,14 @@ class VisaCatalogService {
     // NOTE: the content-hash gate below runs on the PAGE text, so a rate
     // change alone never re-stages a visa; flagged fees are instead
     // re-converted from their stored components by reconvertFlaggedFees().
-    const { baseCostUsd, feeMeta } = computeFee(extracted.feeComponents, params.fx, now, {
-      unverifiedReasons: extracted.feeUnverifiedReasons,
+    // Linked surcharges (#69): appended in code as normal per-year components
+    // (rate from the linked page x registry/extracted years) BEFORE the fee
+    // is computed, so computeFee does the arithmetic like any other surcharge.
+    // With no markers this returns the extraction's components unchanged.
+    const linked = applyLinkedSurcharges(extracted, params.linkedSurcharges ?? []);
+    const { baseCostUsd, feeMeta } = computeFee(linked.feeComponents, params.fx, now, {
+      unverifiedReasons: linked.unverifiedReasons,
+      linkedSurcharges: linked.meta,
     });
 
     // Provenance + audit trail (adapter fields merged in when given).

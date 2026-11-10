@@ -33,6 +33,11 @@
 //    whose PENDING scraped doc came from an older extractor prompt is
 //    re-extracted (and refreshed); current-version / approved / agent /
 //    seeded / rejected docs are not; maxExtractions still caps the run
+//  - runOrchestrator linked surcharge (issue #69): the IHS page is fetched
+//    once per run for every marked route; Student fee = application + IHS
+//    student rate x the assumed year, with provenance; unmarked routes are
+//    not double counted; the combined hash gate re-extracts marked routes
+//    only when the IHS page changes; an unparseable IHS page is a page error
 
 import { test, describe, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -941,6 +946,169 @@ describe("runOrchestrator — prompt-version re-extract (issue #71)", () => {
         extractMod.EXTRACTOR_PROMPT_VERSION
       );
     }
+  });
+});
+
+// ----- Orchestrator: surcharges published on a linked page (issue #69) -----
+
+describe("runOrchestrator — linked surcharge page (issue #69)", () => {
+  const TICK = "2026-11-09T02:15:00Z"; // Mon 02:15 GMT: inside GB_WINDOW
+  const tickMs = Date.parse(TICK);
+  const IHS_API = "https://www.gov.uk/api/content/healthcare-immigration-application";
+  const STUDENT = "https://www.gov.uk/student-visa";
+  const CHILD = "https://www.gov.uk/child-study-visa";
+  const SKILLED = "https://www.gov.uk/skilled-worker-visa";
+  // Real recorded GOV.UK Content API responses (eval golden set).
+  /* eslint-disable @typescript-eslint/no-var-requires */
+  const fixture = (p: string) => require(`../eval/golden/${p}/guide.json`);
+  let calls: string[] = [];
+  let ihsBody: any;
+  let adapters: any;
+  let extractCalls: string[] = [];
+  let originalExtract: any;
+
+  /** Adapters over a stub serving the fixtures; `ihsBody` can be swapped per test. */
+  async function wire(): Promise<void> {
+    const { VisaCatalogFetchService } = await import("../src/services/visa-catalog-fetch.service");
+    const { createSourceAdapters } = await import("../src/services/visa-source-adapters");
+    const bodies: Record<string, unknown> = {
+      "https://www.gov.uk/api/content/student-visa": fixture("student-visa").body,
+      // Child Student served the Student guide: only the marker matters here.
+      "https://www.gov.uk/api/content/child-study-visa": { ...fixture("student-visa").body, base_path: "/child-study-visa" },
+      "https://www.gov.uk/api/content/skilled-worker-visa": fixture("skilled-worker-visa").body,
+    };
+    const fetchService = new VisaCatalogFetchService({
+      minIntervalMs: 0,
+      clock: () => tickMs,
+      http: {
+        async get(url: string) {
+          calls.push(url);
+          if (url.endsWith("/robots.txt")) return { status: 200, data: "User-agent: *\nDisallow: /search/all*\n", headers: { "content-type": "text/plain" } };
+          const body = url === IHS_API ? ihsBody : bodies[url];
+          if (!body) return { status: 404, data: "<html>nf</html>", headers: { "content-type": "text/html" } };
+          return { status: 200, data: JSON.stringify(body), headers: { "content-type": "application/json" } };
+        },
+      },
+    });
+    adapters = createSourceAdapters(fetchService);
+  }
+
+  /** The registry's real markers (VISA_SOURCE_OVERRIDES) for a URL. */
+  const markersOf = async (u: string) =>
+    (await import("../src/data/seed-visa-sources")).VISA_SOURCE_OVERRIDES[u].linkedSurcharges;
+
+  /** GB source (govuk adapter) with the three pages, markers as the registry sets them. */
+  async function putGb(): Promise<void> {
+    const pages = [];
+    for (const [u, id] of [[STUDENT, "gb-student-visa"], [CHILD, "gb-child-study-visa"], [SKILLED, "gb-skilled-worker-visa"]]) {
+      const m = await markersOf(u);
+      pages.push({ url: u, routeName: id, validation: "text_verified", visaId: id, ...(m ? { linkedSurcharges: m } : {}) });
+    }
+    putSource("GB", { adapter: "govuk-content-api", pages });
+  }
+
+  const run = () =>
+    crawl.runOrchestrator({ now: tickMs, adapters, fetchFxRates: async () => ({ rates: { GBP: 0.8 }, rateDate: isoDaysAgo(1) }) });
+  const doc = (id: string) => store.get(`countries/GB/visaTypes/${id}`) as any;
+
+  beforeEach(async () => {
+    store.delete("visaSources/GB");
+    calls = [];
+    extractCalls = [];
+    ihsBody = fixture("_linked/healthcare-immigration-application").body;
+    await wire();
+    // Extractor stub: the route page's own fee only (Student £558; SW its own IHS).
+    originalExtract = extractMod.visaCatalogExtractor.extract;
+    extractMod.visaCatalogExtractor.extract = async (_t: string, ctx: { url: string }) => {
+      extractCalls.push(ctx.url);
+      const sw = ctx.url === SKILLED;
+      return {
+        name: "V", code: "V", description: "d", category: sw ? "work" : "student",
+        processingTime: "3 weeks", processingDaysMin: 21, processingDaysMax: 56,
+        feeComponents: sw
+          ? [
+            { kind: "application", label: "Application fee", amount: 1618, currency: "GBP", per: "application" },
+            { kind: "surcharge", label: "Healthcare surcharge", amount: 1035, currency: "GBP", per: "year", years: 5 },
+          ]
+          : [{ kind: "application", label: "Application fee", amount: 558, currency: "GBP", per: "application" }],
+        validityPeriod: "up to 5 years", isExtendable: true,
+        eligibilityCriteria: ["x"], confidence: 0.9, citations: { "fee.application": "a" },
+      };
+    };
+  });
+
+  afterEach(() => {
+    extractMod.visaCatalogExtractor.extract = originalExtract;
+  });
+
+  test("IHS page fetched ONCE per run; Student/Child Student fee = £558 + £776 x 1 (assumed); SW not double counted", async () => {
+    await putGb();
+    const summary = await run();
+
+    assert.equal(calls.filter((u) => u === IHS_API).length, 1); // once, for two marked routes
+    assert.equal(summary.errors, 0);
+    assert.equal(extractCalls.length, 3);
+
+    for (const id of ["gb-student-visa", "gb-child-study-visa"]) {
+      const fee = doc(id).scrapeMeta.fee;
+      assert.deepEqual(
+        fee.components.map((c: any) => [c.kind, c.amount, c.per, c.years ?? null, c.totalInCurrency]),
+        [["application", 558, "application", null, 558], ["surcharge", 776, "year", 1, 776]]
+      );
+      assert.deepEqual(fee.totals, [{ currency: "GBP", amount: 1334 }]);
+      assert.equal(doc(id).baseCostUsd, Math.round(1334 / 0.8));
+      // Provenance: source + verbatim citation + stated assumed length.
+      const [meta] = fee.linkedSurcharges;
+      assert.equal(meta.sourceUrl, "https://www.gov.uk/healthcare-immigration-application");
+      assert.match(meta.citation, /^£776 per year for students, their dependants, and those on a Youth Mobility Scheme visa/);
+      assert.equal(meta.lengthBasis, "assumed");
+      assert.match(meta.lengthNote, /^1 year assumed/);
+      assert.equal(meta.applied, true);
+    }
+    // Skilled Worker: unmarked → its own IHS only, no linked block.
+    const sw = doc("gb-skilled-worker-visa").scrapeMeta.fee;
+    assert.equal(sw.components.filter((c: any) => c.kind === "surcharge").length, 1);
+    assert.equal(sw.linkedSurcharges, undefined);
+  });
+
+  test("hash gate: unchanged pages + unchanged IHS page → no LLM; an IHS change re-extracts ONLY the marked routes", async () => {
+    await putGb();
+    await run();
+    const pages = (store.get("visaSources/GB")!.pages as any[]);
+    // Marked pages store the combined gate hash (also on the doc), SW its page hash.
+    assert.equal(pages[0].lastContentHash, doc("gb-student-visa").scrapeMeta.contentHash);
+    assert.notEqual(pages[0].lastContentHash, pages[2].lastContentHash);
+
+    // Run 2, nothing changed.
+    store.set("visaSources/GB", { ...store.get("visaSources/GB")!, nextCrawlAt: Timestamp.fromMillis(tickMs - HOUR_MS) });
+    extractCalls = [];
+    await run();
+    assert.equal(extractCalls.length, 0);
+
+    // Run 3: the IHS student rate changes on GOV.UK.
+    const changed = JSON.parse(JSON.stringify(ihsBody));
+    for (const p of changed.details.parts) p.body = p.body.replace("£776 per year for students", "£800 per year for students");
+    ihsBody = changed;
+    store.set("visaSources/GB", { ...store.get("visaSources/GB")!, nextCrawlAt: Timestamp.fromMillis(tickMs - HOUR_MS) });
+    await run();
+    assert.deepEqual(extractCalls.sort(), [CHILD, STUDENT]);
+    assert.equal(doc("gb-student-visa").scrapeMeta.fee.components[1].amount, 800);
+  });
+
+  test("IHS page wording changed (rate not found) → marked routes are page errors, NOT extracted; others continue", async () => {
+    const broken = JSON.parse(JSON.stringify(ihsBody));
+    for (const p of broken.details.parts) p.body = p.body.replace(/per year for students/g, "a year for learners");
+    ihsBody = broken;
+    await putGb();
+    const summary = await run();
+
+    assert.deepEqual(extractCalls, [SKILLED]);
+    assert.equal(summary.errors, 2);
+    const pages = (store.get("visaSources/GB")!.pages as any[]);
+    assert.match(pages[0].lastError, /"student" rate .* not found/);
+    assert.equal(pages[0].lastContentHash, undefined); // gate not advanced
+    assert.equal(doc("gb-student-visa"), undefined);
+    assert.equal(calls.filter((u) => u === IHS_API).length, 1); // failure cached for the run
   });
 });
 

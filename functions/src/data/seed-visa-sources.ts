@@ -20,6 +20,10 @@ import {
 // adapters + validator can read it without importing this seed file.
 import { VISA_SOURCE_OFFICIAL_HOSTS } from "../services/visa-catalog-official-hosts";
 export { VISA_SOURCE_OFFICIAL_HOSTS };
+// Country-level linked-surcharge config (issue #69) — also in a pure services
+// module (regexes can't be stored in Firestore; the crawl reads it from code).
+import { GB_IHS_ID, LINKED_SURCHARGE_SOURCES } from "../services/visa-catalog-linked-surcharge";
+export { LINKED_SURCHARGE_SOURCES };
 
 // NOTE: the Firestore handle is resolved LAZILY inside seedVisaSources() (not at
 // module load), so this module can be imported without Firebase Admin init —
@@ -80,7 +84,26 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   // ---- United Kingdom (GB) — routes with a seeded uk-* equivalent ----
   "https://www.gov.uk/standard-visitor": { visaId: "gb-standard-visitor", visaCode: "SVV" }, // ~ uk-visitor
   "https://www.gov.uk/skilled-worker-visa": { visaId: "gb-skilled-worker-visa", visaCode: "SWV" }, // ~ uk-skilled-worker
-  "https://www.gov.uk/student-visa": { visaId: "gb-student-visa", visaCode: "TIER4" }, // ~ uk-student
+  // Student: the guide only LINKS to the healthcare surcharge ("You'll also
+  // have to pay the healthcare surcharge as part of your application"), so
+  // the IHS student rate comes from the linked page (issue #69). The course
+  // length varies (the page: "up to 5 years" at degree level, "up to 2 years"
+  // below it), so the fee charges an ASSUMED 1 year, stated in scrapeMeta.fee.
+  "https://www.gov.uk/student-visa": {
+    visaId: "gb-student-visa",
+    visaCode: "TIER4", // ~ uk-student
+    linkedSurcharges: [
+      {
+        id: GB_IHS_ID,
+        rate: "student",
+        length: {
+          mode: "assumed",
+          years: 1,
+          note: "1 year assumed: the Student visa length depends on the course (registry assumption, issue #69)",
+        },
+      },
+    ],
+  },
   // Family is ONE guide covering partner/child/parent/… routes, with slugs the
   // default section patterns don't know (partner-spouse, proof-income-partner,
   // provide-information). v1 keeps it as one record (matching the seed), so it
@@ -101,7 +124,30 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   },
   // ---- United Kingdom (GB) — routes with no seeded equivalent (no visaCode) ----
   "https://www.gov.uk/health-care-worker-visa": { visaId: "gb-health-care-worker-visa" },
-  "https://www.gov.uk/child-study-visa": { visaId: "gb-child-study-visa" },
+  // Child Student: same as Student — the guide links to the healthcare
+  // surcharge without an amount, and the stay depends on the course length.
+  "https://www.gov.uk/child-study-visa": {
+    visaId: "gb-child-study-visa",
+    linkedSurcharges: [
+      {
+        id: GB_IHS_ID,
+        rate: "student",
+        length: {
+          mode: "assumed",
+          years: 1,
+          note: "1 year assumed: the Child Student visa length depends on the course (registry assumption, issue #69)",
+        },
+      },
+    ],
+  },
+  // NOT marked (issue #69 audit of the live GOV.UK guides, 2026-11-10): the
+  // route page prints its own IHS, so a linked one would double count (#73):
+  // Skilled Worker, Graduate, Family, Global Talent ("usually £1,035 per
+  // year"), High Potential Individual ("£1,035 for each year"), Youth
+  // Mobility ("usually £776 per year"), India Young Professionals ("a
+  // healthcare surcharge of £1,552"), BN(O) (totals by stay). Health and
+  // Care Worker is exempt ("will not have to pay the healthcare surcharge");
+  // Standard Visitor stays 6 months or less (no IHS from outside the UK).
   "https://www.gov.uk/graduate-visa": { visaId: "gb-graduate-visa" },
   "https://www.gov.uk/global-talent": { visaId: "gb-global-talent" },
   "https://www.gov.uk/high-potential-individual-visa": { visaId: "gb-high-potential-individual-visa" },

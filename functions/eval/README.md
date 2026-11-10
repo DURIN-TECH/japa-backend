@@ -90,12 +90,33 @@ only when it is wrong against the source page, with the quote to prove it.
 
 ### Known gaps
 
-`expected.json` may list `knownGaps` (e.g. Student: `feeComponents`, `#69`,
-"IHS is on a linked page"). A known gap is printed in every report and never
-fails the run. For a `feeComponents` gap the expected components are what the
-guide itself prints (Student: the application fee only). An **extra surcharge**
-or `feeUnverifiedReasons` from the extractor is reported as a note, not a
-mismatch. A wrong application fee is still a mismatch.
+`expected.json` may list `knownGaps` (e.g. `feeComponents`, a tracker ref,
+and a note). A known gap is printed in every report and never fails the run.
+For a `feeComponents` gap the expected components are what the guide itself
+prints. An **extra surcharge** or `feeUnverifiedReasons` from the extractor is
+reported as a note, not a mismatch. A wrong application fee is still a
+mismatch. (No route has one today: Student's IHS was gap #69 until the linked
+surcharge below.)
+
+### Linked surcharges (#69)
+
+Some guides only link to a surcharge (Student: "You'll also have to pay the
+healthcare surcharge as part of your application"). The registry marks those
+routes (`linkedSurcharges` in `VISA_SOURCE_OVERRIDES`) and the crawl adds the
+rate read **in code** from the linked page (`LINKED_SURCHARGE_SOURCES`,
+`src/services/visa-catalog-linked-surcharge.ts`). The eval does the same, in
+live runs and in `--replay`: the linked page is recorded in
+`eval/golden/_linked/<path>/guide.json` (record it with `recordRoutes` and
+`goldenDir: eval/golden/_linked`), served to the real adapter, parsed by the
+real parser, and applied to the extractor output before the fee is scored.
+The results file keeps the raw `extracted` output and adds `linkedSurcharges`
+(the provenance a crawl writes to `scrapeMeta.fee.linkedSurcharges`).
+
+In `expected.json`, a linked component has `linkedPage` (the `_linked` fixture
+its `source` is quoted from) and, for a registry-assumed length,
+`yearsAssumed` (the registry note, verbatim) instead of `yearsSource`.
+Student: £776 per year (student rate) x 1 year (assumed; the course length
+varies).
 
 ## How to read the report
 
@@ -108,8 +129,6 @@ OVERALL 0.900 (pass >= 0.85, every route >= 0.7, no fee mismatch)
 
 Field failures:
   skilled-worker-visa.applicationUrlHost (0.000): host "www.gov.uk", expected "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk" | actual "https://www.gov.uk/…"
-Notes (never fail the run):
-  student-visa: known gap #69 (feeComponents): IHS is on a linked page
 GATE: PASS
 ```
 

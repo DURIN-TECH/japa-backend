@@ -35,6 +35,7 @@ import {
   FIELD_WEIGHTS,
   OVERALL_PASS_THRESHOLD,
   ROUTE_PASS_THRESHOLD,
+  LINKED_GOLDEN_DIR,
 } from "../eval/config";
 import { unifiedDiff } from "../eval/diff";
 import {
@@ -60,6 +61,8 @@ import { VISA_SOURCE_OVERRIDES } from "../src/data/seed-visa-sources";
 import { VisaCatalogFetchService, type VisaCatalogHttpClient } from "../src/services/visa-catalog-fetch.service";
 import { GovukContentApiAdapter } from "../src/services/visa-source-adapters";
 import type { ExtractedVisa } from "../src/types/visa-catalog";
+// Linked surcharge config + page builder (issue #69).
+import { LINKED_SURCHARGE_SOURCES, linkedSurchargePage } from "../src/services/visa-catalog-linked-surcharge";
 
 // ----- Paths -----
 
@@ -76,11 +79,16 @@ function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "seli-eval-test-"));
 }
 
-/** Collect every `source` / `yearsSource` quote of an expected.json, with its JSON path. */
+/**
+ * Collect every `source` / `yearsSource` quote of an expected.json, with its
+ * JSON path. Objects with `linkedPage` (#69: quoted from a LINKED page's
+ * fixture, not the route guide) are skipped here and checked by their own test.
+ */
 function quotesOf(expected: unknown): { at: string; quote: string }[] {
   const out: { at: string; quote: string }[] = [];
   const walk = (o: unknown, at: string) => {
     if (!o || typeof o !== "object") return;
+    if (typeof (o as Record<string, unknown>).linkedPage === "string") return;
     for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
       if ((k === "source" || k === "yearsSource") && typeof v === "string") out.push({ at: `${at}.${k}`, quote: v });
       else walk(v, `${at}.${k}`);
@@ -165,7 +173,10 @@ describe("golden set (eval/golden)", () => {
           assert.equal(c.currency, "GBP");
           if (c.per === "year") {
             assert.ok(Number.isInteger(c.years) && (c.years as number) >= 1);
-            assert.ok(c.yearsSource && /\d+\s*years?/.test(c.yearsSource));
+            // A linked surcharge (#69) with a registry-ASSUMED length states
+            // the assumption instead of quoting a page length.
+            if (c.linkedPage && c.yearsAssumed) assert.match(c.yearsAssumed, /\d+ years?/);
+            else assert.ok(c.yearsSource && /\d+\s*years?/.test(c.yearsSource));
           } else {
             assert.equal(c.years, undefined);
           }
@@ -175,13 +186,37 @@ describe("golden set (eval/golden)", () => {
     });
   }
 
-  test("Student marks the IHS as known gap #69 and expects the application fee only", () => {
+  // ---- Issue #69: Student's IHS comes from the linked surcharge page ----
+  test("Student expects the application fee + the linked IHS student rate x 1 assumed year (no known gap)", () => {
     const st = loadExpected("student-visa");
-    assert.deepEqual(st.knownGaps, [{ field: "feeComponents", ref: "#69", note: "IHS is on a linked page" }]);
+    assert.equal(st.knownGaps, undefined);
+    const ihs = st.feeComponents.components.find((c) => c.kind === "surcharge");
+    assert.ok(ihs);
     assert.deepEqual(
-      st.feeComponents.components.map((c) => c.kind),
-      ["application"]
+      { amount: ihs.amount, currency: ihs.currency, per: ihs.per, years: ihs.years, page: ihs.linkedPage },
+      { amount: 776, currency: "GBP", per: "year", years: 1, page: "healthcare-immigration-application" }
     );
+    // The assumed length is the registry's own note, verbatim.
+    const ref = VISA_SOURCE_OVERRIDES["https://www.gov.uk/student-visa"].linkedSurcharges?.[0];
+    assert.ok(ref && ref.length.mode === "assumed");
+    assert.equal(ihs.yearsAssumed, ref.length.note);
+    assert.equal(ihs.years, ref.length.years);
+  });
+
+  test("every linked-page quote is verbatim in its _linked fixture, in the selected sections", async () => {
+    for (const r of EVAL_ROUTES) {
+      for (const c of loadExpected(r.route).feeComponents.components) {
+        if (!c.linkedPage) continue;
+        const guide = loadGuide(c.linkedPage, LINKED_GOLDEN_DIR);
+        assert.equal(guide._fixture.sourceUrl, `https://www.gov.uk/api/content/${c.linkedPage}`);
+        assert.match(guide._fixture.recordedBy, /Seli-VisaCatalogBot/);
+        // Same sections the crawl reads (LINKED_SURCHARGE_SOURCES config).
+        const cfg = Object.values(LINKED_SURCHARGE_SOURCES).find((x) => x.url === `https://www.gov.uk/${c.linkedPage}`);
+        assert.ok(cfg, `no LINKED_SURCHARGE_SOURCES entry for ${c.linkedPage}`);
+        const doc = await new GovukContentApiAdapter(fixtureFetchService(cfg.url, guide)).fetch(linkedSurchargePage(cfg));
+        assert.ok(quoteInText(c.source, doc.text), `${r.route}: ${JSON.stringify(c.source)} not in ${c.linkedPage}`);
+      }
+    }
   });
 
   test("skilled-worker-visa and graduate-visa guides are copies of the existing test fixtures", () => {
@@ -213,7 +248,11 @@ describe("golden set (eval/golden)", () => {
 
 /** The Skilled Worker expected values (real golden file) — the scorer tests' baseline. */
 const SW: ExpectedVisa = loadExpected("skilled-worker-visa");
-const STUDENT: ExpectedVisa = loadExpected("student-visa");
+// Known-gap scorer tests use the TEST copy of Student (test/fixtures/
+// eval-golden), which still declares IHS as known gap #69: since #69 the real
+// golden Student expects the linked IHS instead, but the known-gap mechanism
+// itself must keep working for future gaps.
+const STUDENT: ExpectedVisa = loadExpected("student-visa", TEST_GOLDEN);
 
 /** An `actual` that scores 1 on every Skilled Worker field. */
 function perfectSW(): ExtractedVisa {
