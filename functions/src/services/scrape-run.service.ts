@@ -13,6 +13,15 @@ import {
 import type { VisaSource } from "../types/visa-catalog";
 import type { NewsSource } from "../types/news";
 import { hostBackoffEntriesFromSource } from "./visa-crawl-host-backoff-store";
+// Issue #82: per-run usage / cost accumulation (pure helpers, no Firestore).
+import {
+  addPricedUsage,
+  emptyBreakdown,
+  emptyTotals,
+  roundUsd,
+  type PricedUsage,
+} from "./scrape-cost-pricing";
+import type { CostTotals, RunCostBreakdown } from "../types/scrape-cost";
 
 // ============================================
 // SCRAPE RUNS — recorder + admin reads (issue #81)
@@ -26,8 +35,9 @@ import { hostBackoffEntriesFromSource } from "./visa-crawl-host-backoff-store";
 //   2. the scraper notes sources / pages / errors on the recorder (in memory,
 //                    no writes — a run is at most a few hundred pages).
 //   3. finalize() -> ONE update with status, finishedAt, durationMs, the full
-//                    summary, sources, pages and the first N errors; then the
-//                    registered finalize hooks run (#82 cost, #83 alerts).
+//                    summary, sources, pages and the first N errors, plus the
+//                    run's LLM usage / cost / news request counts (#82); then
+//                    the registered finalize hooks run (#82 rollup, #83 alerts).
 //      fail()     -> same, for a run that threw: status `failed` + fatalError.
 //
 // Crash safety: a run that dies between 1 and 3 (function timeout, OOM, a
@@ -136,6 +146,12 @@ export class ScrapeRunRecorder {
   // True once a page line was dropped for MAX_RECORDED_PAGES (-> pagesTruncated).
   private pagesDropped = false;
   private finished = false;
+  // ---- Issue #82: usage + cost, summed in memory, written at finalize ----
+  // Every LLM call (recordUsage) and news API request (recordRequests).
+  // `runs` stays 0 here and is set to 1 in the written doc (see write()).
+  private readonly usage: CostTotals = emptyTotals();
+  // The same per country (visa sourceId) and per model (requested model).
+  private readonly breakdown: RunCostBreakdown = emptyBreakdown();
   // Real clock at start, to measure durationMs (see the header on clocks).
   private readonly realStartMs: number;
 
@@ -206,6 +222,39 @@ export class ScrapeRunRecorder {
     }
   }
 
+  /**
+   * Note one LLM call's usage + cost (issue #82). Call it for EVERY call that
+   * reached the API, including one whose output then failed validation (it
+   * was billed). `sourceId` (visa: the country code) feeds the per-country
+   * split; the per-model split uses the requested model. An unpriced model
+   * adds tokens and `unpricedExtractions`, never a made-up cost.
+   */
+  recordUsage(p: PricedUsage & { sourceId?: string }): void {
+    addPricedUsage(this.usage, p);
+    if (p.sourceId) {
+      const c = (this.breakdown.byCountry[p.sourceId] ??= emptyTotals());
+      addPricedUsage(c, p);
+    }
+    const m = (this.breakdown.byModel[p.model] ??= emptyTotals());
+    addPricedUsage(m, p);
+  }
+
+  /**
+   * Note `n` API requests to a news provider ("newsdata" / "newsapi",
+   * issue #82). `costUsd` only when the provider's plan has a per-call price
+   * (appConfig/llmPricing.requestPricing); otherwise requests are counted only.
+   */
+  recordRequests(provider: string, n: number, costUsd?: number): void {
+    if (!(n > 0)) return;
+    this.usage.requests[provider] = (this.usage.requests[provider] ?? 0) + n;
+    if (costUsd !== undefined && costUsd > 0) this.usage.costUsd = roundUsd(this.usage.costUsd + costUsd);
+  }
+
+  /** The run's usage so far (a copy; for logging, e.g. the script's summary line). */
+  get usageSoFar(): CostTotals {
+    return { ...this.usage, requests: { ...this.usage.requests } };
+  }
+
   /** Recorded errors so far (callers use it to reconcile counters). */
   get recordedErrorCount(): number {
     return this.errorCount;
@@ -242,6 +291,15 @@ export class ScrapeRunRecorder {
     const durationMs = Math.max(0, this.service.realClock() - this.realStartMs);
     const startedAt = Timestamp.fromMillis(this.startedAtMs);
     const finishedAt = Timestamp.fromMillis(this.startedAtMs + durationMs);
+    // Issue #82: the run's usage (runs: 1, so monthly sums count runs) and
+    // its per-country / per-model split (each entry also runs: 1).
+    const usage: CostTotals = { ...this.usage, runs: 1, requests: { ...this.usage.requests } };
+    const withRun = (map: Record<string, CostTotals>) =>
+      Object.fromEntries(Object.entries(map).map(([k, t]) => [k, { ...t, runs: 1 }]));
+    const costBreakdown: RunCostBreakdown = {
+      byCountry: withRun(this.breakdown.byCountry),
+      byModel: withRun(this.breakdown.byModel),
+    };
     const final = {
       status,
       finishedAt,
@@ -255,6 +313,9 @@ export class ScrapeRunRecorder {
       errorCount,
       errors: this.errors,
       warnings: this.warnings,
+      usage,
+      costUsd: usage.costUsd,
+      costBreakdown,
       updatedAt: finishedAt,
     };
     // fatalError: set by fail(). Otherwise CLEARED, so a run the stale sweep

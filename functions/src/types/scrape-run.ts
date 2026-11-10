@@ -1,4 +1,6 @@
 import { Timestamp } from "firebase-admin/firestore";
+// Issue #82: usage / cost shapes shared with the monthly rollup.
+import type { CostTotals, LlmUsage, RunCostBreakdown } from "./scrape-cost";
 
 // ============================================
 // SCRAPE RUNS — one record per scraper run (issue #81)
@@ -17,8 +19,8 @@ import { Timestamp } from "firebase-admin/firestore";
 //
 // Forward compatibility (#82 cost, #83 alerting): every field below that a
 // later issue may add to is optional or a plain map, and readers must ignore
-// unknown fields. #82 fills `usage` / `costUsd` (declared here, not written
-// yet); #83 hangs its alert rules off the finalize hook
+// unknown fields. #82 fills `usage` / `costUsd` / `costBreakdown` (and the
+// per-page usage below); #83 hangs its alert rules off the finalize hook
 // (scrapeRunService.registerFinalizeHook).
 
 /** Which scraper produced the run. */
@@ -124,20 +126,22 @@ export interface ScrapeRunPageEntry {
   visaId?: string; // resolved catalog id (countries/{sourceId}/visaTypes/{visaId})
   error?: string; // redacted, capped
   reason?: string; // why a non-error outcome happened (e.g. supplement rows)
+  // ---- Issue #82: the LLM call made for this page, when one was made ----
+  // Present on any page whose extraction reached the API (also on an `error`
+  // page whose output then failed validation: that call was billed too).
+  usage?: LlmUsage; // the provider's token counts for the call
+  costUsd?: number; // from appConfig/llmPricing; absent when the model is unpriced
+  model?: string; // the model requested ("deepseek-chat")
+  promptVersion?: string; // EXTRACTOR_PROMPT_VERSION used
 }
 
 /**
- * LLM usage aggregate — PLACEHOLDER for #82 (cost tracking). Not written by
- * #81; declared so the run doc's shape is agreed. Optional everywhere.
+ * Usage + cost aggregate of a run (issue #82): summed token counts of every
+ * LLM call, the run's cost and its news API request counts per provider.
+ * Same shape as the monthly rollup's buckets (CostTotals); `runs` is 1 on a
+ * run doc so rollups can simply add.
  */
-export interface ScrapeRunUsage {
-  promptTokens?: number;
-  completionTokens?: number;
-  cacheHitTokens?: number;
-  extractions?: number;
-  // Free-form per-provider request counts (news APIs, #82).
-  requests?: Record<string, number>;
-}
+export type ScrapeRunUsage = CostTotals;
 
 /** The `scrapeRuns/{runId}` document. */
 export interface ScrapeRunDoc {
@@ -178,9 +182,12 @@ export interface ScrapeRunDoc {
   // maxExtractions; for a script run: country / visa / limit / force).
   options?: Record<string, string | number | boolean>;
 
-  // ---- #82 placeholders (cost) — not written by #81 ----
-  usage?: ScrapeRunUsage;
-  costUsd?: number;
+  // ---- Cost (issue #82) — written by finalize()/fail(); absent on older docs ----
+  usage?: ScrapeRunUsage; // tokens, extractions, request counts (see CostTotals)
+  costUsd?: number; // = usage.costUsd (top-level so list views and #83 read it directly)
+  // The same split by country (visa sourceId) and model. Feeds the monthly
+  // rollup `scrapeCosts/{YYYY-MM}`. Runs with no LLM call have empty maps.
+  costBreakdown?: RunCostBreakdown;
 
   // ---- Retention ----
   // TTL field: Firestore deletes the doc after this instant (startedAt +

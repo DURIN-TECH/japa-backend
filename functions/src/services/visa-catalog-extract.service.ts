@@ -16,6 +16,9 @@ import {
   PROCESSING_CITATION_PREFIXES,
   PROCESSING_UNVERIFIED_CONFIDENCE_CAP,
 } from "./visa-catalog-processing-check";
+// Token usage from the API response (issue #82): parsed, never estimated.
+import { parseDeepSeekUsage } from "./scrape-cost-pricing";
+import type { LlmUsageReport } from "../types/scrape-cost";
 
 // ============================================
 // VISA CATALOG — EXTRACT SERVICE (Step 3)
@@ -164,6 +167,13 @@ export interface ExtractContext {
   // (non-empty), `applicationUrl` is kept only on these hosts; absent/empty →
   // only the http(s) check (countries without a registered host list).
   officialHosts?: readonly string[];
+  // Issue #82: called once per API call that returned a response with a
+  // `usage` object — BEFORE the output is parsed / validated, so a call whose
+  // output is then rejected is still reported (it was billed). Callers price
+  // it (scrape-cost-pricing.priceUsageReport) and put it on the run record,
+  // the page line and scrapeMeta. A throwing callback is ignored (cost
+  // tracking must never fail an extraction). Optional: stubs may ignore it.
+  onUsage?: (report: LlmUsageReport) => void;
 }
 
 // The provider-agnostic contract. Any model backend implements this.
@@ -697,7 +707,29 @@ export class DeepSeekExtractor implements LlmExtractor {
 
     const data = (await resp.json()) as {
       choices?: { message?: { content?: string } }[];
+      // Issue #82: OpenAI-compatible usage (prompt_tokens, completion_tokens,
+      // total_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens).
+      usage?: unknown;
+      // The model that actually served the call (may differ from the
+      // requested alias, e.g. deepseek-chat -> a Flash version).
+      model?: unknown;
     };
+
+    // ---- Usage (issue #82): report it before anything can throw below ----
+    const usage = parseDeepSeekUsage(data.usage);
+    if (usage && context.onUsage) {
+      try {
+        context.onUsage({
+          usage,
+          model: this.model,
+          ...(typeof data.model === "string" && data.model ? { responseModel: data.model } : {}),
+          atMs: Date.now(),
+        });
+      } catch (err) {
+        console.error("DeepSeek extractor: onUsage callback failed (ignored):", err);
+      }
+    }
+
     const content = data.choices?.[0]?.message?.content;
     if (!content) throw new Error("DeepSeek returned no content");
 

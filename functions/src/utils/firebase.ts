@@ -129,6 +129,13 @@ export const collections = {
   // per-source news log `newsSources/{id}/scrapeRuns` — collection-group
   // queries on "scrapeRuns" see both. Backend-only: no firestore.rules match.
   scrapeRuns: db.collection("scrapeRuns"),
+  // Monthly scraping cost rollup (issue #82): `scrapeCosts/{YYYY-MM}` sums
+  // every finalised run's LLM usage / cost / news API requests by kind,
+  // country and model; `scrapeCosts/{month}/runs/{runId}` markers make each
+  // run count once. Written by services/scrape-cost.service.ts (finalize
+  // hook), read via /admin/scrape-costs and by #83's budget alert.
+  // Backend-only: no firestore.rules match.
+  scrapeCosts: db.collection("scrapeCosts"),
 } as const;
 
 // Helper to get subcollection references

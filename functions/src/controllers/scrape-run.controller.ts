@@ -17,6 +17,15 @@ import {
   type ScrapeRunKind,
   type ScrapeRunStatus,
 } from "../types/scrape-run";
+// Issue #82: the cost report (same CASL gate: read ScrapeRun).
+import {
+  SCRAPE_COST_DEFAULT_MONTHS,
+  SCRAPE_COST_GROUP_BYS,
+  SCRAPE_COST_MAX_MONTHS,
+  scrapeCostService,
+  type ScrapeCostGroupBy,
+} from "../services/scrape-cost.service";
+import { addMonths, isMonthKey, monthKeyUtc, monthsBetween } from "../services/scrape-cost-pricing";
 
 // ============================================
 // ADMIN — SCRAPE RUNS + SOURCE HEALTH (issue #81)
@@ -42,6 +51,16 @@ function parseDateParam(raw: string): number | undefined {
   if (/^\d{10,16}$/.test(raw)) return Number(raw);
   const ms = Date.parse(raw);
   return Number.isNaN(ms) ? undefined : ms;
+}
+
+/**
+ * Parse a scrape-costs `from` / `to` bound to a UTC month key: "YYYY-MM", or
+ * any ISO date/time / epoch ms (its UTC month). undefined = invalid.
+ */
+function parseMonthParam(raw: string): string | undefined {
+  if (isMonthKey(raw)) return raw;
+  const ms = parseDateParam(raw);
+  return ms === undefined ? undefined : monthKeyUtc(ms);
 }
 
 class ScrapeRunController {
@@ -182,6 +201,64 @@ class ScrapeRunController {
       sendSuccess(res, await scrapeRunService.runStats({ fromMs, toMs, kind: kind as ScrapeRunKind | undefined }));
     } catch (error) {
       console.error("Error computing scrape run stats:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /admin/scrape-costs?from=&to=&groupBy=month|country|model|kind&kind=
+   * (issue #82). Read from the monthly rollup `scrapeCosts/{YYYY-MM}`.
+   *  - from / to: "YYYY-MM", or an ISO date/time / epoch ms (its UTC month),
+   *    inclusive. Defaults: to = the current month, from = to − 5 months.
+   *    At most SCRAPE_COST_MAX_MONTHS months; from > to → 400;
+   *  - groupBy: month (default; every month zero-filled, oldest first) |
+   *    country | model | kind (highest cost first);
+   *  - kind: visa | news; filters every groupBy (budget stays all-kinds).
+   * → ScrapeCostReport: groups, totals, budget (current month vs
+   *   appConfig/scrapeBudget) and the price table with sourceUrl / effectiveFrom.
+   */
+  async costs(req: AuthenticatedRequest, res: Response): Promise<void> {
+    if (!this.allowed(req, res)) return;
+    if (!this.singleValued(req, res, ["from", "to", "groupBy", "kind"])) return;
+    const { from, to, groupBy, kind } = req.query as Record<string, string | undefined>;
+    if (groupBy !== undefined && !SCRAPE_COST_GROUP_BYS.includes(groupBy as ScrapeCostGroupBy)) {
+      sendError(res, "VALIDATION_ERROR", `groupBy must be one of: ${SCRAPE_COST_GROUP_BYS.join(", ")}`, 400);
+      return;
+    }
+    if (kind !== undefined && !SCRAPE_RUN_KINDS.includes(kind as ScrapeRunKind)) {
+      sendError(res, "VALIDATION_ERROR", `kind must be one of: ${SCRAPE_RUN_KINDS.join(", ")}`, 400);
+      return;
+    }
+    const toMonth = to === undefined ? monthKeyUtc(Date.now()) : parseMonthParam(to);
+    if (toMonth === undefined) {
+      sendError(res, "VALIDATION_ERROR", "to must be YYYY-MM, an ISO date/time or epoch milliseconds", 400);
+      return;
+    }
+    const fromMonth = from === undefined ? addMonths(toMonth, -(SCRAPE_COST_DEFAULT_MONTHS - 1)) : parseMonthParam(from);
+    if (fromMonth === undefined) {
+      sendError(res, "VALIDATION_ERROR", "from must be YYYY-MM, an ISO date/time or epoch milliseconds", 400);
+      return;
+    }
+    if (fromMonth > toMonth) {
+      sendError(res, "VALIDATION_ERROR", "from must not be after to", 400);
+      return;
+    }
+    if (monthsBetween(fromMonth, toMonth).length > SCRAPE_COST_MAX_MONTHS) {
+      sendError(res, "VALIDATION_ERROR", `the range must be at most ${SCRAPE_COST_MAX_MONTHS} months`, 400);
+      return;
+    }
+    try {
+      sendSuccess(
+        res,
+        await scrapeCostService.report({
+          from: fromMonth,
+          to: toMonth,
+          groupBy: (groupBy as ScrapeCostGroupBy | undefined) ?? "month",
+          kind: kind as ScrapeRunKind | undefined,
+        })
+      );
+    } catch (error) {
+      console.error("Error computing scrape costs:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

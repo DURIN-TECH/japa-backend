@@ -141,6 +141,14 @@ async function main() {
     console.log("→ Seeding visa-catalog sources...");
     const visaSourceCount = await seedVisaSources();
 
+    // 3a3. Scrape cost price table (issue #82): `appConfig/llmPricing` from
+    //      DEFAULT_LLM_PRICING (numbers quoted from the provider's pricing
+    //      page), only when the doc is ABSENT — a table an admin updated is
+    //      never overwritten by a re-seed.
+    console.log("→ Seeding the LLM price table (if absent)...");
+    const { scrapeCostService } = await import("../services/scrape-cost.service");
+    const pricingSeeded = await scrapeCostService.seedPricingIfAbsent();
+
     // 3b. Document templates — the global rich-text catalog agents clone from.
     //     Independent of portal data; safe to run any time after admin init.
     console.log("→ Seeding document templates...");
@@ -190,6 +198,7 @@ async function main() {
     console.log(`  - Sources:         ${newsCount}`);
     console.log("Visa catalog:");
     console.log(`  - Visa sources:    ${visaSourceCount} countries`);
+    console.log(`  - LLM price table: ${pricingSeeded ? "seeded" : "kept (already present)"}`);
     console.log("Documents:");
     console.log(`  - Templates:       ${documentTemplatesCount}`);
     console.log("Billing / RBAC:");

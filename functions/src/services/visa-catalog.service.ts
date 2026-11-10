@@ -30,6 +30,8 @@ import { EXTRACTOR_PROMPT_VERSION } from "./visa-catalog-extract.service";
 // Canonical country-stats recompute (issue #62: the only stats function).
 import { visaService } from "./visa.service";
 import type { ScrapeSourceMeta } from "./visa-source-adapters";
+// Issue #82: priced LLM usage stored on scrapeMeta.
+import type { PricedUsage } from "./scrape-cost-pricing";
 // Surcharges published on a linked page (issue #69): applied in code before computeFee.
 import { applyLinkedSurcharges, type PageLinkedSurcharge } from "./visa-catalog-linked-surcharge";
 // Proposed edits to approved scraped visas (issue #61): the pure branch
@@ -183,6 +185,9 @@ class VisaCatalogService {
     // scrapeMeta.supplementaryPages. Absent / [] = none. As with linked
     // surcharges, `contentHash` is then supplementaryGateHash(...).
     supplementaryPages?: VisaSupplementaryPageMeta[];
+    // Issue #82: the priced token usage of the extraction's LLM call, stored
+    // on scrapeMeta (llmUsage / llmCostUsd). Absent = not recorded.
+    llmUsage?: PricedUsage;
   }): Promise<{ visaId: string; outcome: IngestOutcome }> {
     const { countryCode, sourceUrl, routeName, contentHash, extracted, model } = params;
     // Id from the registry (pin or URL path), never from extracted.code/name.
@@ -221,6 +226,7 @@ class VisaCatalogService {
       fee: feeMeta,
       extractorPromptVersion: EXTRACTOR_PROMPT_VERSION,
       supplementaryPages: params.supplementaryPages,
+      llmUsage: params.llmUsage,
     });
     const fields = extractedToVisaFields({ countryCode, visaId, code, extracted, baseCostUsd });
 
