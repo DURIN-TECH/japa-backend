@@ -409,6 +409,16 @@ describe("findStaleReason / mergeProposal / buildApprovalUpdate", () => {
     assert.ok(findStaleReason({ ...live, scrapeMeta: { ...live.scrapeMeta!, contentHash: "other" } }, row));
     // A NON-diffed field changing is not stale.
     assert.equal(findStaleReason({ ...live, name: "Renamed by hand" }, row), null);
+    // Issue #88: every reason is a complete sentence. The portal places it
+    // between its own sentences, so it must end in a full stop.
+    for (const reason of [
+      findStaleReason({ ...live, processingDaysMax: 22 }, row),
+      findStaleReason({ ...live, reviewStatus: "rejected" }, row),
+      findStaleReason({ ...live, staleSince: NOW }, row),
+      findStaleReason({ ...live, scrapeMeta: { ...live.scrapeMeta!, contentHash: "other" } }, row),
+    ]) {
+      assert.match(reason!, /\.$/);
+    }
   });
 
   test("buildApprovalUpdate writes only diffed fields + scrapeMeta + provenance", () => {
