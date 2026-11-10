@@ -171,19 +171,13 @@ service cloud.firestore {
       // Only admins can delete applications
       allow delete: if isAdmin();
       
-      // Documents subcollection
-      match /documents/{documentId} {
-        allow read: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
-                      isAgent() || isAdmin();
-        
-        allow create: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId);
-        
-        allow update: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
-                        isAgent() || isAdmin();
-        
-        allow delete: if isAdmin();
-      }
-      
+      // NOTE (issue #28): there is deliberately NO `documents` subcollection
+      // rule here. Application documents live in the TOP-LEVEL `documents`
+      // collection, which is backend-only (see the list at the bottom of this
+      // file). The old `match /documents/{documentId}` block that stood here
+      // granted access to a path nothing writes to, and let ANY agent read
+      // it; it was deleted as dead rather than ported.
+
       // Timeline subcollection
       match /timeline/{timelineId} {
         allow read: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
@@ -438,6 +432,12 @@ service cloud.firestore {
     // Firestore denies by default, so with no `match` here every client read
     // and write is refused; only the backend (Admin SDK, which bypasses rules)
     // touches them:
+    //  - documents/{documentId}: uploaded application documents (issue #28).
+    //    Clients never read these from Firestore: portal and mobile go through
+    //    the API (GET /applications/:id/documents, GET /documents/:id[/download]),
+    //    which authorizes per application with the shared CASL ability (the
+    //    applicant, the assigned agent, the owner of the same agency, admins).
+    //    Do NOT add a match: a rule here could only widen that access.
     //  - appConfig/{docId}: backend config, e.g. appConfig/fx exchange rates
     //    (issue #59).
     //  - pendingVisaChanges/{changeId}: proposed field-level edits to
