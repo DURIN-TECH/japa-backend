@@ -436,7 +436,13 @@ export interface VisaType {
   agentIds: string[];
 
   // Admin review
-  reviewStatus?: "pending_review" | "approved" | "rejected";
+  // "draft" (issue #100): an agency visa that was saved but never submitted.
+  // Only `source: "agency"` docs use it (POST /agency/visas). A draft is
+  // hidden everywhere except the owning agency's `/agency/visas` reads: it is
+  // inactive, agency-only, not "approved" (so isVisaPubliclyVisible is false
+  // on three counts), left out of `GET /admin/visas`, and refused by the admin
+  // review endpoint. Missing still means "seed / never reviewed".
+  reviewStatus?: VisaReviewStatus;
   // Where the visa came from (issue #99 adds "agency"):
   //  - "scraped": created by the visa-catalog scraper (pending until approved);
   //  - "agent":   LEGACY. Created through the admin-only
@@ -474,6 +480,56 @@ export interface VisaType {
   // Optional on every visa; validated by the agency endpoints (#100).
   sponsor?: VisaSponsor;
 
+  // ---- Agency submission (issue #100) ----
+  // When / by whom an agency visa was last submitted for review
+  // (`POST /agency/visas/:id/submit`). Missing on drafts that were never
+  // submitted and on every non-agency visa.
+  submittedAt?: Timestamp;
+  submittedBy?: string;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+/**
+ * `VisaType.reviewStatus` values. "draft" is agency-only (issue #100); the
+ * other three are the admin review states used by every source.
+ */
+export type VisaReviewStatus = "draft" | "pending_review" | "approved" | "rejected";
+
+/**
+ * A pending edit to an APPROVED agency visa (issue #100), stored in the
+ * top-level `visaRevisions/{countryCode}__{visaId}` collection — never on the
+ * live visa doc, so public and agency reads keep serving the approved values
+ * (and unreviewed text never reaches a public read of the live doc).
+ *
+ * One revision per visa: further edits merge into it. The admin approve /
+ * reject of a revision is #101 (approve applies `changes` to the live doc and
+ * deletes this doc; reject sets `reviewStatus: "rejected"` + reason). See
+ * `src/agency-visas/agency-visas.md` for the full contract.
+ */
+export interface VisaRevision {
+  /** Doc id: `${countryCode}__${visaId}`. */
+  id: string;
+  /** The live visa this revision edits (`countries/{cc}/visaTypes/{visaId}`). */
+  visaId: string;
+  countryCode: string;
+  /** Copied from the live visa, so an agency's revisions are one query. */
+  ownerAgencyId: string;
+  /**
+   * Content fields that differ from the live visa, with their proposed
+   * values. `null` = remove that optional field from the live visa.
+   */
+  changes: Record<string, unknown>;
+  /** Review state of THIS revision (the live visa stays "approved"). */
+  reviewStatus: "pending_review" | "rejected";
+  /** Last agency user who edited the revision, and when. */
+  submittedBy: string;
+  submittedAt: Timestamp;
+  /** Set by the admin reject (#101); cleared on the next agency edit. */
+  rejectionReason?: string;
+  reviewedBy?: string;
+  reviewedAt?: Timestamp;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }

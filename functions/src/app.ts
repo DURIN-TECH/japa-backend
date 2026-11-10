@@ -18,6 +18,8 @@ import {
   adminScraperRunRoutes,
   adminScraperSettingsRoutes,
 } from "./scrapers";
+// Agency-scoped visa drafts / edits / submit (issue #100).
+import { agencyVisaRoutes } from "./agency-visas";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
@@ -82,6 +84,9 @@ app.use("/visas", visaSearchRoutes);
 app.use("/auth", authRoutes);
 app.use("/agents", agentRoutes);
 app.use("/agencies", agencyRoutes);
+// Agency visas (issue #100): the caller's OWN agency's visas. Singular
+// "/agency" = "my agency" (the agency comes from the token, never the URL).
+app.use("/agency/visas", agencyVisaRoutes);
 app.use("/invitations", invitationRoutes);
 app.use("/applications", applicationRoutes);
 app.use("/documents", documentRoutes);

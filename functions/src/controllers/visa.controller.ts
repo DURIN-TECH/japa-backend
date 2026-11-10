@@ -10,6 +10,8 @@ import {
 import { VisaCategory, VisaType } from "../types";
 // Public visibility rule for visas (issue #99).
 import { isVisaPubliclyVisible } from "../services/visa.service";
+// Agency drafts can't be reviewed (issue #100).
+import { VisaIsDraftError } from "../services/visa.service";
 // Typed error from the approval guard (fee not converted to USD, issue #59).
 import { VisaFeeNotConvertibleError } from "../scrapers";
 // Manual USD cost (issue #70): CASL gate, body validation, typed errors.
@@ -398,6 +400,11 @@ export class VisaController {
       // unverified fee, or no/mismatched baseCostUsd). 409 Conflict — the
       // visa's state blocks approval until the crawl re-runs (or reject it).
       if (error instanceof VisaFeeNotConvertibleError) {
+        sendError(res, error.code, error.message, 409);
+        return;
+      }
+      // Issue #100: an unsubmitted agency draft is not reviewable.
+      if (error instanceof VisaIsDraftError) {
         sendError(res, error.code, error.message, 409);
         return;
       }

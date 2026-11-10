@@ -75,6 +75,19 @@ export function filterPubliclyVisible<T extends VisaVisibilityFields>(visas: T[]
   return visas.filter(isVisaPubliclyVisible);
 }
 
+/**
+ * Thrown by updateVisaReviewStatus for an agency draft (issue #100): a draft
+ * has not been submitted, so the admin can't review it. Controller -> 409.
+ */
+export class VisaIsDraftError extends Error {
+  /** Error code sent to the client. */
+  readonly code = "VISA_IS_DRAFT";
+  constructor() {
+    super("This visa is a draft that its agency has not submitted for review");
+    this.name = "VisaIsDraftError";
+  }
+}
+
 export interface CreateCountryInput {
   code: string;
   name: string;
@@ -582,7 +595,11 @@ class VisaService {
   // ============================================
 
   /**
-   * Get all visa types across all countries for admin review (includes inactive)
+   * Get all visa types across all countries for admin review (includes
+   * inactive). Issue #100: agency DRAFTS (`reviewStatus: "draft"`, never
+   * submitted) are left out — they are the agency's work in progress, not
+   * part of the review queue. Submitted agency visas are listed like any
+   * other (#101 adds the agency name + sponsor).
    */
   async getAllVisaTypesForAdmin(): Promise<
     (VisaType & { countryName: string })[]
@@ -602,7 +619,9 @@ class VisaService {
         countryName: country.name,
       })) as (VisaType & { countryName: string })[];
 
-      results.push(...visaTypes);
+      // Drafts are filtered in code (a `!=` query would drop every doc
+      // without the field, i.e. all seed visas).
+      results.push(...visaTypes.filter((v) => v.reviewStatus !== "draft"));
     }
 
     return results;
@@ -670,6 +689,12 @@ class VisaService {
     // The visa as it is BEFORE this review: drives which extra fields we
     // write (source, staleSince) and whether stats can change (isActive).
     const current = doc.data() as VisaType;
+
+    // Issue #100: an agency draft was never submitted, so it is not in the
+    // review queue and can't be approved or rejected (nothing is written).
+    if (current.reviewStatus === "draft") {
+      throw new VisaIsDraftError();
+    }
 
     // Refuse to publish a visa with no usable USD cost (throws, no write).
     if (action === "approve") {
