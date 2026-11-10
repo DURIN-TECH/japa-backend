@@ -27,8 +27,8 @@ import type { NewsSource } from "../src/types/news";
 import type { VisaCatalogHttpClient } from "../src/services/visa-catalog-fetch.service";
 import { installFakes } from "./helpers/fake-firestore";
 
-// Admin init needs a project id (utils/firebase derives the bucket from it).
-process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT || "demo-unit-test";
+// Project id (GCLOUD_PROJECT=demo-unit-test) and the no-network guard are set
+// centrally by the test preload, test/helpers/setup.ts (issue #94).
 
 // Loaded in before(): a static import would run utils/firebase before the env
 // line above (imports are hoisted).
