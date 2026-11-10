@@ -6,11 +6,11 @@ import { authRoutes } from "./routes/auth.routes";
 import { userRoutes, adminUsersRouter } from "./routes/user.routes";
 import { countryRoutes, visaSearchRoutes, adminVisaRoutes } from "./routes/visa.routes";
 // Proposed edits to approved scraped visas (pendingVisaChanges, issue #61)
-import { adminVisaChangeRoutes } from "./routes/visa-change.routes";
+import { adminVisaChangeRoutes } from "./scrapers";
 // Scraper run records + source health (issue #81, CASL `ScrapeRun`).
-import { adminScrapeCostRoutes, adminScrapeRunRoutes, adminScrapeSourceRoutes } from "./routes/scrape-run.routes";
+import { adminScrapeCostRoutes, adminScrapeRunRoutes, adminScrapeSourceRoutes } from "./scrapers";
 // Scraper alerts: list / acknowledge / resolve (issue #83)
-import { adminScrapeAlertRoutes } from "./routes/scrape-alert.routes";
+import { adminScrapeAlertRoutes } from "./scrapers";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";

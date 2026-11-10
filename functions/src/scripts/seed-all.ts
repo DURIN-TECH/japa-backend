@@ -111,8 +111,8 @@ async function main() {
     await import("../utils/firebase");
     const { seedPortalData } = await import("../data/seed-portal-data");
     const { seedNigeriaIrelandEligibility } = await import("../data/eligibility-seed-nigeria-ireland");
-    const { seedNewsSources } = await import("../data/seed-news-sources");
-    const { seedVisaSources } = await import("../data/seed-visa-sources");
+    const { seedNewsSources } = await import("../scrapers");
+    const { seedVisaSources } = await import("../scrapers");
     const { seedDocumentTemplates } = await import("../data/seed-document-templates");
     const { seedPlans } = await import("./seed-plans");
     const { seedSubscriptions } = await import("./seed-subscriptions");
@@ -146,7 +146,7 @@ async function main() {
     //      page), only when the doc is ABSENT — a table an admin updated is
     //      never overwritten by a re-seed.
     console.log("→ Seeding the LLM price table (if absent)...");
-    const { scrapeCostService } = await import("../services/scrape-cost.service");
+    const { scrapeCostService } = await import("../scrapers");
     const pricingSeeded = await scrapeCostService.seedPricingIfAbsent();
 
     // 3b. Document templates — the global rich-text catalog agents clone from.

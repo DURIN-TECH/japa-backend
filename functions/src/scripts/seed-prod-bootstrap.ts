@@ -180,7 +180,7 @@ async function main() {
     //    comment out if a given catalog should NOT be pre-populated on prod.
     const { seedCountriesAndVisas } = await import("../data/seed-countries-visas");
     const { seedNigeriaIrelandEligibility } = await import("../data/eligibility-seed-nigeria-ireland");
-    const { seedNewsSources } = await import("../data/seed-news-sources");
+    const { seedNewsSources } = await import("../scrapers");
     const { seedDocumentTemplates } = await import("../data/seed-document-templates");
     const { seedPlans } = await import("./seed-plans");
 

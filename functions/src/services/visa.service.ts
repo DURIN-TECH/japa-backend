@@ -14,11 +14,11 @@ import {
 // FieldValue.delete() clears `staleSince` on approval (issue #62).
 import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 // Approval guard for visas with no usable USD cost (issue #59).
-import { assertVisaApprovable } from "./visa-catalog-fx";
+import { assertVisaApprovable } from "../scrapers";
 // Finite-only min for the denormalized country stats.
-import { finiteMin } from "./visa-catalog-meta";
+import { finiteMin } from "../scrapers";
 // Manual USD cost on a pending scraped visa (issue #70): pure rules.
-import { ManualCostError, ManualCostInput, planManualCost } from "./visa-manual-cost";
+import { ManualCostError, ManualCostInput, planManualCost } from "../scrapers";
 
 export interface CreateCountryInput {
   code: string;

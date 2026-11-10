@@ -9,11 +9,11 @@ import {
 } from "../utils/response";
 import { VisaCategory } from "../types";
 // Typed error from the approval guard (fee not converted to USD, issue #59).
-import { VisaFeeNotConvertibleError } from "../services/visa-catalog-fx";
+import { VisaFeeNotConvertibleError } from "../scrapers";
 // Manual USD cost (issue #70): CASL gate, body validation, typed errors.
 import { asSubject, can, forbidden } from "../middleware/authz";
-import { ManualCostError, parseManualCostInput } from "../services/visa-manual-cost";
-import { isValidDocId } from "../services/visa-catalog-changes.service";
+import { ManualCostError, parseManualCostInput } from "../scrapers";
+import { isValidDocId } from "../scrapers";
 
 export class VisaController {
   // ============================================
