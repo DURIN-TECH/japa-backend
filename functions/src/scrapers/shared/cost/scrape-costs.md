@@ -48,7 +48,7 @@ comes out non-finite is treated as **unpriced** (no `costUsd`,
         { "startHour": 1, "endHour": 4, "isoWeekdays": [1,2,3,4,5] },
         { "startHour": 6, "endHour": 10, "isoWeekdays": [1,2,3,4,5] }
       ],
-      "aliases": ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"],
+      "aliases": ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"],
       "effectiveFrom": "2026-09-10",
       "sourceUrl": "https://api-docs.deepseek.com/quick_start/pricing",
       "note": "..."
@@ -69,15 +69,23 @@ Monday through Friday, excluding Chinese public holidays".
   (<https://api-docs.deepseek.com/updates>) entry for V4.1 Flash says "API
   prices have been reduced accordingly"; the 2026-10-17 entry says "pricing
   remain unchanged".
-- **Why `deepseek-chat` is billed as Flash**: the extractor requests
+- **The extractor requests `deepseek-flash`** (issue #92,
+  `DEEPSEEK_EXTRACTOR_MODEL` in
+  `src/scrapers/visa-catalog/visa-catalog-extract.service.ts`), the primary
+  key of the table. The pricing page: "Use `deepseek-flash` as the model
+  name"; the change log (2026-10-17): "simply use `deepseek-flash` to access
+  the latest model". It is sent with `thinking: {type: "disabled"}` (thinking
+  is on by default for Flash), so calls stay in the non-thinking mode the old
+  alias used.
+- **Why `deepseek-chat` is still an alias**: runs before #92 requested
   `deepseek-chat`. The change log (2026-04-24) says it points to the
-  non-thinking mode of `deepseek-v4-flash`, and the pricing page says the
-  legacy `deepseek-v4-flash` name is served by V4.1-Flash and "billed at the
-  Flash price". The same entry announced `deepseek-chat` would be
-  discontinued on 2026-07-24; it still answered on 2026-11-10, with the
-  response's `model` = `deepseek-flash` (stored as
-  `scrapeMeta.llmResponseModel`). Switching the model name is a model change: it
-  needs the eval (`functions/CLAUDE.md`).
+  non-thinking mode of `deepseek-v4-flash` and would be discontinued on
+  2026-07-24; it still answered on 2026-11-10, with the response's `model` =
+  `deepseek-flash` (stored as `scrapeMeta.llmResponseModel`). The pricing page
+  says the legacy names "deepseek-v4-flash and deepseek-v4-flash-vision-exp
+  are still accepted". The aliases keep those historical records priced at
+  the Flash price. Changing the model name is a model change: it needs the
+  eval (`functions/CLAUDE.md`).
 - **Peak vs off-peak**: each call is costed at the rate for the hour its
   response arrived (UTC). Chinese public holidays are not modelled, so a call
   on one is costed at the peak rate (an over-estimate). The scheduled visa
