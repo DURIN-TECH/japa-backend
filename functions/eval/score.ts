@@ -8,6 +8,9 @@ import {
   SCORED_FIELDS,
   type ScoredField,
 } from "./config";
+// Issue #87: the same pure processing-vs-citation check the validator runs.
+// Dependency-free module (no Firebase, no LLM client), so the scorer stays free.
+import { checkProcessingRangeCitations } from "../src/services/visa-catalog-processing-check";
 
 // ============================================
 // VISA EXTRACTION EVAL — SCORER (pure, issue #60)
@@ -17,8 +20,9 @@ import {
 // expected.json) with what the real extractor returned (an ExtractedVisa) and
 // returns per-field results. Deterministic and free: NO network, NO Firebase,
 // NO second LLM ("LLM-as-judge" is deliberately out of scope — cost and
-// non-determinism). Only `import type` from src/, so importing this module
-// loads nothing but ./config.
+// non-determinism). Only `import type` from src/, plus the dependency-free
+// src/services/visa-catalog-processing-check.ts (#87), so importing this
+// module loads nothing but ./config and that pure check.
 //
 // Field types (see eval/README.md "How a run is scored"):
 //   exact        category, isExtendable
@@ -35,6 +39,13 @@ import {
 //   eligibility  fraction of expected themes with >= 1 keyword alternative
 //                present in the joined eligibilityCriteria
 //   url          applicationUrlHost — host of applicationUrl equals expected
+//
+// Plus one HARD gate that is not a scored field (issue #87): processing
+// citation mismatch — processingDaysMin/Max more than PROCESSING_DAYS_TOLERANCE
+// (at least PROCESSING_DAYS_MIN_TOLERANCE_DAYS) from EVERY duration stated in
+// the output's own processing citations (Standard Visitor: max 56 with only
+// "within 3 weeks" cited). The value can match expected.json and still fail
+// this: a number a reviewer cannot trace to a quote is not acceptable.
 
 // ----- Expected shape (expected.json) -----
 
@@ -157,6 +168,9 @@ export interface RouteScore {
   weightTotal: number; // sum(weight)
   fields: FieldResult[];
   feeMismatch: boolean; // true → hard gate fails
+  // Issue #87: processing range vs its cited durations; non-empty → hard gate
+  // fails. Optional so results files written before #87 still type-check.
+  processingCitationProblems?: string[];
   notes: string[]; // known-gap notes etc. (never fail the run)
   knownGaps: KnownGap[];
   error?: string; // extraction failed → every field 0
@@ -460,6 +474,13 @@ export function scoreRoute(
   ];
   const weightedSum = fields.reduce((s, f) => s + f.weight * f.score, 0);
   const weightTotal = fields.reduce((s, f) => s + f.weight, 0);
+  // Issue #87: the range must be stated by the output's own citations, with
+  // the eval's numeric tolerance (20%, >= 1 day). Not weighted: a hard gate.
+  const processingCitationProblems = checkProcessingRangeCitations(
+    { processingDaysMin: actual.processingDaysMin, processingDaysMax: actual.processingDaysMax },
+    actual.citations,
+    { tolerance: PROCESSING_DAYS_TOLERANCE, minToleranceDays: PROCESSING_DAYS_MIN_TOLERANCE_DAYS }
+  );
   return {
     route: expected.route,
     score: weightTotal ? weightedSum / weightTotal : 0,
@@ -467,6 +488,7 @@ export function scoreRoute(
     weightTotal,
     fields,
     feeMismatch: fee.mismatch,
+    processingCitationProblems,
     notes: [...notes, ...fee.notes],
     knownGaps,
   };
@@ -475,6 +497,8 @@ export function scoreRoute(
 /**
  * The gate over all routes:
  *  - HARD: any route with a fee mismatch fails (whatever the scores);
+ *  - HARD (#87): any route whose processingDaysMin/Max is outside the
+ *    tolerance of every duration in its processing citations fails;
  *  - SOFT: overall weighted score < OVERALL_PASS_THRESHOLD fails;
  *  - SOFT: any route score < ROUTE_PASS_THRESHOLD fails.
  * Overall = sum(weight x score) / sum(weight) over every field of every route.
@@ -488,6 +512,10 @@ export function evaluateGate(routes: RouteScore[]): GateResult {
     if (r.feeMismatch) {
       const fee = r.fields.find((f) => f.field === "feeComponents");
       failures.push(`fee mismatch on ${r.route} (hard gate): ${fee?.detail ?? r.error ?? ""}`);
+    }
+    // Issue #87: a processing figure no cited duration supports (hard gate).
+    for (const problem of r.processingCitationProblems ?? []) {
+      failures.push(`processing citation mismatch on ${r.route} (hard gate): ${problem}`);
     }
   }
   if (routes.length === 0) failures.push("no routes scored");

@@ -31,9 +31,13 @@ export function buildScrapeMeta(params: {
   routeName: string;
   model: string;
   contentHash: string;
-  // `processingUnknown` / `uncitedFieldsDropped` (issue #86) are optional on
-  // the extraction and copied only when set.
-  extracted: Pick<ExtractedVisa, "confidence" | "citations" | "processingUnknown" | "uncitedFieldsDropped">;
+  // `processingUnknown` / `uncitedFieldsDropped` (issue #86) and
+  // `processingUnverifiedReasons` (issue #87) are optional on the extraction
+  // and copied only when set.
+  extracted: Pick<
+    ExtractedVisa,
+    "confidence" | "citations" | "processingUnknown" | "uncitedFieldsDropped" | "processingUnverifiedReasons"
+  >;
   extractedAt: Timestamp;
   sourceMeta?: ScrapeSourceMeta;
   // Fee as published + its USD conversion provenance (computeFee().feeMeta).
@@ -64,6 +68,11 @@ export function buildScrapeMeta(params: {
   }
   if (params.supplementaryPages && params.supplementaryPages.length > 0) {
     meta.supplementaryPages = params.supplementaryPages.map((p) => ({ ...p }));
+  }
+  // Issue #87: processing-range flag, only when set (never an empty array).
+  const processingReasons = params.extracted.processingUnverifiedReasons;
+  if (processingReasons && processingReasons.length > 0) {
+    meta.processingUnverifiedReasons = [...processingReasons];
   }
   for (const [k, v] of Object.entries(params.sourceMeta ?? {})) {
     // Cast: keys are a subset of VisaScrapeMeta by construction (ScrapeSourceMeta).
