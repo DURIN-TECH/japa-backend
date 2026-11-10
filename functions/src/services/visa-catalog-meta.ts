@@ -26,7 +26,7 @@ export function buildScrapeMeta(params: {
   routeName: string;
   model: string;
   contentHash: string;
-  extracted: Pick<ExtractedVisa, "confidence" | "citations">;
+  extracted: Pick<ExtractedVisa, "confidence" | "citations" | "processingUnverifiedReasons">;
   extractedAt: Timestamp;
   sourceMeta?: ScrapeSourceMeta;
   // Fee as published + its USD conversion provenance (computeFee().feeMeta).
@@ -46,6 +46,11 @@ export function buildScrapeMeta(params: {
   // Only defined values — Firestore never sees `undefined`.
   if (params.fee) meta.fee = params.fee;
   if (params.extractorPromptVersion) meta.extractorPromptVersion = params.extractorPromptVersion;
+  // Issue #87: processing-range flag, only when set (never an empty array).
+  const processingReasons = params.extracted.processingUnverifiedReasons;
+  if (processingReasons && processingReasons.length > 0) {
+    meta.processingUnverifiedReasons = [...processingReasons];
+  }
   for (const [k, v] of Object.entries(params.sourceMeta ?? {})) {
     // Cast: keys are a subset of VisaScrapeMeta by construction (ScrapeSourceMeta).
     if (v !== undefined) (meta as unknown as Record<string, unknown>)[k] = v;

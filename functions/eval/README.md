@@ -81,6 +81,18 @@ The run **fails** (exit 1) when any of these is true:
 
 - **Hard gate:** any fee mismatch on any route, whatever the scores. Known
   gaps (below) are excluded.
+- **Hard gate (#87):** any route whose `processingDaysMin` or `processingDaysMax`
+  is more than 20% (at least 1 day; the numeric tolerance) from **every**
+  duration stated in its own processing citations (`processingTime`,
+  `processingDaysMin`, `processingDaysMax`). The value can match
+  `expected.json` and still fail: the v4 Standard Visitor crawl stored max 56
+  (the "extend your stay ... within 8 weeks" sentence, the agreed full-range
+  max) with only "within 3 weeks" cited. Output with no cited duration at all
+  is not judged here. The extractor validator runs the same check
+  (`src/services/visa-catalog-processing-check.ts`) and flags the extraction
+  (`processingUnverifiedReasons`, confidence capped at 0.5). `npm test` also
+  checks that every expected processing value is stated by its own `source`
+  quote.
 - overall < **0.85** (`OVERALL_PASS_THRESHOLD`)
 - any single route < **0.7** (`ROUTE_PASS_THRESHOLD`)
 
@@ -125,7 +137,7 @@ route                 score   fee         exact       numeric     text        el
 skilled-worker-visa   0.917   1.000       1.000       1.000       1.000       1.000       0.000
 ...
 field type mean               …
-OVERALL 0.900 (pass >= 0.85, every route >= 0.7, no fee mismatch)
+OVERALL 0.900 (pass >= 0.85, every route >= 0.7, no fee or processing citation mismatch)
 
 Field failures:
   skilled-worker-visa.applicationUrlHost (0.000): host "www.gov.uk", expected "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk" | actual "https://www.gov.uk/…"

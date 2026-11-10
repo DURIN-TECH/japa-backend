@@ -58,6 +58,8 @@ import {
   type RouteScore,
 } from "../eval/score";
 import { VISA_SOURCE_OVERRIDES } from "../src/data/seed-visa-sources";
+// Issue #87: the processing-vs-citation check shared by validator and scorer.
+import { processingDurationsInDays } from "../src/services/visa-catalog-processing-check";
 import { VisaCatalogFetchService, type VisaCatalogHttpClient } from "../src/services/visa-catalog-fetch.service";
 import { GovukContentApiAdapter } from "../src/services/visa-source-adapters";
 import type { ExtractedVisa } from "../src/types/visa-catalog";
@@ -448,6 +450,63 @@ describe("scorer (eval/score.ts)", () => {
       assert.deepEqual(Array.isArray(min) ? e.processingDaysMin.range : e.processingDaysMin.value, min, route);
       assert.equal(e.processingDaysMax.value, max, route);
     }
+  });
+
+  // ---- Issue #87: processing range must be stated by its own citations ----
+  test("golden: every expected processing value is stated by its own source quote (+/- tolerance)", () => {
+    // Catches an expected.json whose number drifted from its quote, which
+    // would let the eval bless a 56 that only a "3 weeks" quote backs.
+    for (const r of EVAL_ROUTES) {
+      const e = loadExpected(r.route);
+      for (const key of ["processingDaysMin", "processingDaysMax"] as const) {
+        const v = e[key].value;
+        if (v === undefined) continue; // a range ([0, max]) is a bound, not a stated figure
+        const cited = processingDurationsInDays(e[key].source);
+        assert.ok(
+          cited.some((d) => Math.abs(v - d) <= processingTolerance(d)),
+          `${r.route}.${key} ${v} is not stated in ${JSON.stringify(e[key].source)} (${cited.join(", ")})`
+        );
+      }
+    }
+  });
+
+  test("hard gate: max more than 20% outside every cited duration fails (Standard Visitor #87)", () => {
+    // The #87 crawl: max 56 stored, but the only processing quotes say 3 weeks.
+    const a = perfectSW();
+    a.citations = {
+      processingTime: "you’ll usually get a decision on your visa within 3 weeks.",
+      processingDaysMin: "you’ll usually get a decision on your visa within 3 weeks.",
+    };
+    const r = scoreRoute(SW, a);
+    // The VALUE still matches expected (21-56), so only the new gate catches it.
+    assert.equal(field(r, "processingDaysMax").score, 1);
+    assert.equal(r.processingCitationProblems?.length, 1);
+    assert.match(r.processingCitationProblems?.[0] ?? "", /processingDaysMax 56 .*\(21 days\)/);
+    const g = evaluateGate([r]);
+    assert.equal(g.pass, false);
+    assert.ok(g.failures.some((f) => /processing citation mismatch on skilled-worker-visa \(hard gate\)/.test(f)));
+  });
+
+  test("hard gate: passes when each end is cited, or within 20% of a cited duration", () => {
+    const a = perfectSW();
+    a.citations = {
+      processingDaysMin: "within 3 weeks",
+      processingDaysMax: "a decision will usually be made within 8 weeks",
+    };
+    assert.deepEqual(scoreRoute(SW, a).processingCitationProblems, []);
+    assert.equal(evaluateGate([scoreRoute(SW, a)]).pass, true);
+    // 2 months = 60 days: 56 is within 20% of it.
+    a.citations = { processingTime: "3 weeks to 2 months" };
+    assert.deepEqual(scoreRoute(SW, a).processingCitationProblems, []);
+    // 68 > 56 + 20% (67.2): fails.
+    a.processingDaysMax = 68;
+    a.citations = { processingTime: "3-8 weeks" };
+    assert.equal(scoreRoute(SW, a).processingCitationProblems?.length, 1);
+  });
+
+  test("hard gate: no processing citation at all is not judged (that is #86's rule)", () => {
+    const r = scoreRoute(SW, perfectSW()); // citations: {}
+    assert.deepEqual(r.processingCitationProblems, []);
   });
 
   test("keyword: eligibility = fraction of themes hit, whole-word matching", () => {

@@ -13,7 +13,10 @@ import * as path from "path";
 //   - overall weighted score >= 0.85, AND
 //   - no single route below 0.7, AND
 //   - no fee mismatch on any route (a hard gate, whatever the scores), except
-//     fee items covered by a route's `knownGaps`.
+//     fee items covered by a route's `knownGaps`, AND
+//   - no processing citation mismatch (issue #87, hard gate):
+//     processingDaysMin/Max within PROCESSING_DAYS_TOLERANCE of at least one
+//     duration the output's own processing citations state.
 //
 // This module is pure config (path + constants): no network, no Firebase.
 
