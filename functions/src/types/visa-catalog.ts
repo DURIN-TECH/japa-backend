@@ -61,11 +61,58 @@ export interface VisaSourcePage {
   // every re-seed. Ignored by `generic-html` (one whole-page section).
   includeSections?: string[];
   excludeSections?: string[];
+  // Surcharges this route must pay that are published on ANOTHER page
+  // (issue #69, e.g. the UK IHS for Student). Registry-owned: set from
+  // VISA_SOURCE_OVERRIDES and refreshed on every re-seed. Absent = none (the
+  // route page prints its own surcharges, or has none). See
+  // services/visa-catalog-linked-surcharge.ts.
+  linkedSurcharges?: LinkedSurchargeRef[];
   // Content-hash gate: skip extraction when the cleaned page text is unchanged.
-  lastContentHash?: string; // sha256 of the cleaned page text last crawl
+  // sha256 of the cleaned page text last crawl (with linked surcharges,
+  // #69: linkedGateHash() of that hash + the linked pages' hashes).
+  lastContentHash?: string;
   lastCrawledAt?: Timestamp;
   lastExtractedAt?: Timestamp;
   lastError?: string;
+}
+
+// ----- Linked surcharges (issue #69) -----
+//
+// Marks a route whose surcharge amount is on a linked page, not its own.
+// `id` names a LINKED_SURCHARGE_SOURCES entry (country-level config, code);
+// `rate` one of its rates ("standard" | "student" for GB IHS). `length` says
+// how many years to charge: "assumed" = a stated registry assumption for
+// variable-length routes (Student: 1 year, recorded with its `note` in
+// scrapeMeta.fee), "extracted" = the whole-year length read in code from the
+// extracted validityPeriod.
+export type LinkedSurchargeLength =
+  | { mode: "assumed"; years: number; note: string }
+  | { mode: "extracted" };
+
+export interface LinkedSurchargeRef {
+  id: string; // e.g. "gb-ihs"
+  rate: string; // e.g. "student"
+  length: LinkedSurchargeLength;
+}
+
+// Provenance of one linked surcharge on scrapeMeta.fee.linkedSurcharges
+// (written for every marker, applied or skipped). Optional fields are absent
+// (never `undefined`) so the block is safe to write to Firestore.
+export interface VisaLinkedSurchargeMeta {
+  id: string; // config id, e.g. "gb-ihs"
+  label: string; // e.g. "Immigration Health Surcharge"
+  sourceUrl: string; // the linked page the rate was read from
+  sourceUpdatedAt?: string; // its GOV.UK `updated_at`
+  sourceContentHash: string; // hash of the linked page text used
+  rate: string; // rate key used, e.g. "student"
+  amount?: number; // per year, as printed on the linked page
+  currency?: string;
+  citation?: string; // verbatim line of the linked page stating the rate
+  lengthBasis: "assumed" | "extracted"; // where `years` came from
+  lengthNote?: string; // the stated assumption (assumed mode), e.g. "1 year: ..."
+  years?: number; // years charged (only when applied)
+  applied: boolean; // false = not added (see skippedReason)
+  skippedReason?: string; // why it was not added (e.g. page already prints a surcharge)
 }
 
 // ----- Weekly night crawl window (issue #63) -----
@@ -157,7 +204,10 @@ export interface VisaScrapeMeta {
   model: string; // extractor model, e.g. "deepseek-chat"
   confidence: number; // 0–1 from the extractor
   citations: Record<string, string>; // field name -> verbatim source quote
-  contentHash: string; // sha256 of the exact text sent to the extractor (selected + capped)
+  // sha256 of the exact text sent to the extractor (selected + capped). For a
+  // route with linked surcharges (#69): linkedGateHash() of that hash and the
+  // linked pages' hashes, so a surcharge change re-stages the visa.
+  contentHash: string;
   extractedAt: Timestamp;
 
   // ---- Source provenance (issue #58; all optional so older docs stay valid) ----
@@ -282,6 +332,10 @@ export interface VisaFeeMeta {
   // Carried forward by later refreshes / re-conversions until a newer manual
   // cost or overwrite replaces it.
   replacedManualCost?: VisaReplacedManualCostMeta;
+  // Surcharges taken from a LINKED page (issue #69): source, citation, rate
+  // and the (assumed or extracted) length charged. The applied ones are also
+  // in `components`. Absent when the route uses none.
+  linkedSurcharges?: VisaLinkedSurchargeMeta[];
 }
 
 // ----- Manual USD cost (issue #70) -----

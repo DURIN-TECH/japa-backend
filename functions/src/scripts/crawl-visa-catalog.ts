@@ -15,7 +15,16 @@
  * equal the page is reported "unchanged (hash gate)" and NO extraction runs.
  * Exception (issue #71): a PENDING scraped doc whose
  * `scrapeMeta.extractorPromptVersion` differs from EXTRACTOR_PROMPT_VERSION is
- * re-extracted anyway (within --max-extractions). Pass --force to extract anyway.
+ * re-extracted anyway (within --max-extractions). For an APPROVED scraped doc
+ * (whose live hash ingest never updates — a changed page becomes a #61
+ * proposal) the text also counts as unchanged when it equals the registry
+ * page's `lastContentHash` or a pendingVisaChanges row was already made from
+ * it (issue #68), so it is not re-extracted on every run. Pass --force to
+ * extract anyway.
+ *
+ * Restored guides (issue #68): a scraped visa that was deactivated as
+ * withdrawn and was approved goes back to pending_review when its page is
+ * live again (admin → Visa Review shows it); it is never reactivated.
  *
  * FX (issue #59): `appConfig/fx` is refreshed once at the start of the run
  * (Frankfurter / ECB), flagged pending fees are re-converted, and each
@@ -129,7 +138,11 @@ async function main() {
     "../services/visa-catalog-extract.service"
   );
   // Pure prompt-version rule shared with the orchestrator (issue #71).
-  const { isPendingPromptStale } = await import("../services/visa-catalog-diff");
+  const { isPendingPromptStale, isApprovedTextAlreadyHandled } = await import(
+    "../services/visa-catalog-diff"
+  );
+  // Proposal lookup for the approved-doc hash gate (issue #68).
+  const { visaChangeService } = await import("../services/visa-catalog-changes.service");
   const { visaCatalogService } = await import("../services/visa-catalog.service");
   // Pure host-backoff helper (issue #64): same skip rules as the orchestrator.
   const { HostBackoffTracker, backoffMessage, hostOf, isHostBackoffError } = await import(
@@ -139,6 +152,16 @@ async function main() {
   const { hostBackoffEntriesFromSource } = await import("../services/visa-crawl-host-backoff-store");
   // One tracker for the whole manual run (shared across countries).
   const hostState = new HostBackoffTracker(Date.now());
+  // Linked surcharge pages (issue #69, e.g. UK IHS): fetched at most once per
+  // manual run, same rules as the orchestrator (skipped if the host backed off).
+  const { LinkedSurchargeCache, linkedGateHash, linkedSurchargePage } = await import(
+    "../services/visa-catalog-linked-surcharge"
+  );
+  const linkedSurcharges = new LinkedSurchargeCache(async (cfg) => {
+    const blocked = hostState.blocking(hostOf(cfg.url));
+    if (blocked) throw new Error(`linked surcharge page not fetched: ${backoffMessage(blocked)}`);
+    return pickSourceAdapter(cfg.adapter, cfg.url).fetch(linkedSurchargePage(cfg));
+  });
 
   // Pick sources: one country, or all.
   const sourcesSnap = args.country
@@ -183,6 +206,8 @@ async function main() {
     // Approved scraped visa whose page changed → pendingVisaChanges row (issue #61).
     proposed: 0,
     withdrawn: 0,
+    // Withdrawn scraped visa whose guide is live again → pending_review (issue #68).
+    restored: 0,
     errors: 0,
     deferred: 0, // pages skipped: host backed off (issue #64)
     // Same hash, but the pending doc came from an older prompt → re-extracted (issue #71).
@@ -243,6 +268,20 @@ async function main() {
           continue;
         }
 
+        // Restored at source (issue #68, same rule as the orchestrator): a
+        // withdrawn + approved scraped doc goes back to pending_review so an
+        // admin sees it. Before the hash gate → independent of the hash.
+        if ((await visaCatalogService.markRestored(source.countryCode, resolvedVisaId)).outcome === "flagged") {
+          totals.restored++;
+          console.log(`  -> guide restored on source: ${resolvedVisaId} back to pending_review`);
+        }
+
+        // Linked surcharges (issue #69): [] for an unmarked page. The gate
+        // hash folds the linked pages' hashes in (same as the orchestrator).
+        const linked = await linkedSurcharges.forPage(page);
+        const gateHash = linkedGateHash(fetched.contentHash, linked);
+        if (linked.length) console.log(`  linked surcharges: ${linked.map((l) => l.resolved.id).join(", ")}`);
+
         // Hash gate: same text as the stored extraction → no LLM call.
         if (!args.force) {
           const existingSnap = await subcollections
@@ -250,7 +289,7 @@ async function main() {
             .doc(resolvedVisaId)
             .get();
           const existing = existingSnap.exists ? (existingSnap.data() as VisaType) : undefined;
-          if (existing?.scrapeMeta?.contentHash === fetched.contentHash) {
+          if (existing?.scrapeMeta?.contentHash === gateHash) {
             // Same text — but a PENDING scraped doc from an older extractor
             // prompt is re-extracted anyway (issue #71, same rule as the
             // orchestrator). Approved / seeded / agent docs never qualify.
@@ -265,6 +304,23 @@ async function main() {
               "  -> same hash, but extracted with prompt " +
                 `${existing.scrapeMeta?.extractorPromptVersion ?? "(none)"} ≠ ${EXTRACTOR_PROMPT_VERSION}: re-extracting`
             );
+          } else if (
+            // Approved doc (issue #68): its live hash never moves on ingest,
+            // so the text also counts as handled when the orchestrator
+            // already processed it (registry page hash) or a proposal row
+            // was made from it. The second clause passes
+            // `hasProposalForHash: true` only to ask "is this a proposable
+            // approved doc?" BEFORE spending the Firestore query, so the
+            // query runs only for approved docs the cheap check missed.
+            isApprovedTextAlreadyHandled(existing, fetched.contentHash, {
+              pageLastContentHash: page.lastContentHash,
+            }) ||
+            (isApprovedTextAlreadyHandled(existing, fetched.contentHash, { hasProposalForHash: true }) &&
+              (await visaChangeService.hasProposalForHash(source.countryCode, resolvedVisaId, fetched.contentHash)))
+          ) {
+            totals.unchanged++;
+            console.log(`  -> unchanged (approved doc, text already crawled/proposed, no extraction): ${resolvedVisaId}`);
+            continue;
           }
         }
 
@@ -284,7 +340,7 @@ async function main() {
           countryCode: source.countryCode,
           sourceUrl: page.url,
           routeName: page.routeName,
-          contentHash: fetched.contentHash,
+          contentHash: gateHash, // page hash unless linked surcharges apply (#69)
           extracted,
           model: visaCatalogExtractor.model,
           // Registry-owned identity: the id resolved above (used verbatim by
@@ -295,6 +351,8 @@ async function main() {
           sourceMeta: sourceMetaFromDocument(fetched),
           // This run's rate doc: the fee is converted in code (issue #59).
           fx,
+          // Linked-page surcharges for this route (issue #69).
+          linkedSurcharges: linked,
         });
         totals[outcome]++;
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
@@ -318,7 +376,7 @@ async function main() {
   console.log(
     `\nDone. fetched ${totals.fetched} | created ${totals.created} | updated ${totals.updated} | ` +
       `unchanged ${totals.unchanged} | skipped ${totals.skipped} | proposed ${totals.proposed} | ` +
-      `withdrawn ${totals.withdrawn} | errors ${totals.errors} | host backed off ${totals.deferred} | ` +
+      `withdrawn ${totals.withdrawn} | restored ${totals.restored} | errors ${totals.errors} | host backed off ${totals.deferred} | ` +
       `prompt re-extracts ${totals.promptReextracts}`
   );
   console.log("Review pending scraped visas at: admin → Visa Review (filter source=scraped).");

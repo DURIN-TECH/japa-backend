@@ -6,9 +6,11 @@ import { ExtractedVisa, FxRatesDoc } from "../types/visa-catalog";
 import { deriveVisaId, resolveVisaCode } from "./visa-catalog-ids";
 // Pure scrape-meta + withdrawn decisions (also unit-tested without Firestore).
 import {
+  RestoredOutcome,
   WithdrawnOutcome,
   buildScrapeMeta,
   extractedToVisaFields,
+  planRestoredUpdate,
   planWithdrawnUpdate,
 } from "./visa-catalog-meta";
 // Pure fee arithmetic + FX conversion (issue #59) and the rate refresh.
@@ -27,6 +29,8 @@ import { EXTRACTOR_PROMPT_VERSION } from "./visa-catalog-extract.service";
 // Canonical country-stats recompute (issue #62: the only stats function).
 import { visaService } from "./visa.service";
 import type { ScrapeSourceMeta } from "./visa-source-adapters";
+// Surcharges published on a linked page (issue #69): applied in code before computeFee.
+import { applyLinkedSurcharges, type PageLinkedSurcharge } from "./visa-catalog-linked-surcharge";
 // Proposed edits to approved scraped visas (issue #61): the pure branch
 // decision, and the pendingVisaChanges writer.
 import { isPendingPromptStale, planIngest } from "./visa-catalog-diff";
@@ -106,9 +110,20 @@ class VisaCatalogService {
    *
    * @returns true when the page must go to extraction despite the same hash
    */
-  async needsPromptReextract(countryCode: string, visaId: string): Promise<boolean> {
-    const snap = await subcollections.visaTypes(countryCode).doc(visaId).get();
-    const existing = snap.exists ? (snap.data() as VisaType) : undefined;
+  async needsPromptReextract(
+    countryCode: string,
+    visaId: string,
+    // Issue #68: the doc the caller already read this page (markRestored's
+    // `doc`; `doc: undefined` = no doc). When given, no second read is made.
+    known?: { doc: VisaType | undefined }
+  ): Promise<boolean> {
+    let existing: VisaType | undefined;
+    if (known) {
+      existing = known.doc;
+    } else {
+      const snap = await subcollections.visaTypes(countryCode).doc(visaId).get();
+      existing = snap.exists ? (snap.data() as VisaType) : undefined;
+    }
     return isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION);
   }
 
@@ -156,6 +171,12 @@ class VisaCatalogService {
     // caller can't forget it; `undefined` = no stored rate at all (fees in a
     // non-USD, non-pegged currency are then flagged fxMissing).
     fx: FxRatesDoc | undefined;
+    // Surcharges published on a linked page that this route's registry page
+    // is marked with (issue #69), resolved once per run by the crawl
+    // (LinkedSurchargeCache.forPage). Absent / [] = none. NOTE: callers then
+    // pass `contentHash` = linkedGateHash(page hash, linked), so a change to
+    // the linked page re-stages the visa like a change to its own page.
+    linkedSurcharges?: PageLinkedSurcharge[];
   }): Promise<{ visaId: string; outcome: IngestOutcome }> {
     const { countryCode, sourceUrl, routeName, contentHash, extracted, model } = params;
     // Id from the registry (pin or URL path), never from extracted.code/name.
@@ -172,8 +193,14 @@ class VisaCatalogService {
     // NOTE: the content-hash gate below runs on the PAGE text, so a rate
     // change alone never re-stages a visa; flagged fees are instead
     // re-converted from their stored components by reconvertFlaggedFees().
-    const { baseCostUsd, feeMeta } = computeFee(extracted.feeComponents, params.fx, now, {
-      unverifiedReasons: extracted.feeUnverifiedReasons,
+    // Linked surcharges (#69): appended in code as normal per-year components
+    // (rate from the linked page x registry/extracted years) BEFORE the fee
+    // is computed, so computeFee does the arithmetic like any other surcharge.
+    // With no markers this returns the extraction's components unchanged.
+    const linked = applyLinkedSurcharges(extracted, params.linkedSurcharges ?? []);
+    const { baseCostUsd, feeMeta } = computeFee(linked.feeComponents, params.fx, now, {
+      unverifiedReasons: linked.unverifiedReasons,
+      linkedSurcharges: linked.meta,
     });
 
     // Provenance + audit trail (adapter fields merged in when given).
@@ -338,18 +365,21 @@ class VisaCatalogService {
    * as a page error.
    *
    * No auto-reactivation: if the guide later stops being withdrawn, nothing
-   * here (or in ingest) flips the doc back on — a human re-approves it.
+   * here (or in ingest) flips the doc back on — markRestored() (issue #68)
+   * only puts it back in the review queue, and a human re-approves it.
    */
   async markWithdrawn(countryCode: string, visaId: string): Promise<WithdrawnOutcome> {
     const ref = subcollections.visaTypes(countryCode).doc(visaId);
     const snap = await ref.get();
-    const plan = planWithdrawnUpdate(
-      snap.exists ? (snap.data() as VisaType) : undefined,
-      Timestamp.now()
-    );
+    const existing = snap.exists ? (snap.data() as VisaType) : undefined;
+    const plan = planWithdrawnUpdate(existing, Timestamp.now());
     if (plan.update) {
       // update() (not set) — the doc is known to exist and must stay intact.
       await ref.update(plan.update);
+    }
+    // Stats only move when isActive flips ("unqueued" changes review fields
+    // only, the doc was already inactive).
+    if (plan.outcome === "deactivated") {
       // Stats recompute must not turn a committed withdrawal into a page
       // error (which would also count against the source's reliability).
       try {
@@ -361,7 +391,55 @@ class VisaCatalogService {
         );
       }
     }
+    // ---- Close open #61 proposals for this visa (issue #68 review fix) ----
+    // A proposal made against the pre-withdrawal text must not resurface after
+    // restore + re-approval. Run on EVERY withdrawn crawl of a scraped doc
+    // (not only on the first, "deactivated" one), so a failed close is simply
+    // retried next crawl. Logged + swallowed like the stats recompute: the
+    // withdrawal itself is committed.
+    if (existing?.source === "scraped") {
+      try {
+        await visaChangeService.closeOpenProposals(countryCode, visaId);
+      } catch (error) {
+        console.error(`Withdrawal of ${countryCode}/${visaId}: closing open proposals failed:`, error);
+      }
+    }
     return plan.outcome;
+  }
+
+  /**
+   * Restored-source path (issue #68): the page fetched fine and is NOT
+   * withdrawn. If the doc at `visaId` is a scraped visa that an earlier crawl
+   * deactivated as withdrawn (inactive + `staleSince`) and it was approved,
+   * put it back into the admin review queue (`reviewStatus: "pending_review"`)
+   * so an admin finds out the guide came back. Rules in planRestoredUpdate().
+   *
+   * Called by both crawlers right after the withdrawn branch and BEFORE the
+   * hash gate, so the signal is recorded whether or not the content hash
+   * changed. It never reactivates (`isActive` and `staleSince` are left as
+   * they are) and never touches stats (`isActive` does not change, so the
+   * country's counts are unaffected). One doc read per non-withdrawn page;
+   * a write only on the first crawl after a restore (afterwards the doc is
+   * pending_review and the rule no longer matches).
+   *
+   * @returns `outcome` ("flagged" when the doc was put back in the queue,
+   *   else "none") and `doc`, the doc after the update (undefined = no doc)
+   */
+  async markRestored(
+    countryCode: string,
+    visaId: string
+  ): Promise<{ outcome: RestoredOutcome; doc: VisaType | undefined }> {
+    const ref = subcollections.visaTypes(countryCode).doc(visaId);
+    const snap = await ref.get();
+    const existing = snap.exists ? (snap.data() as VisaType) : undefined;
+    const plan = planRestoredUpdate(existing, Timestamp.now());
+    // update() (not set): only the review fields change; the doc stays intact.
+    if (plan.update) await ref.update(plan.update);
+    // The doc AS IT NOW IS (the update merged in) — lets the orchestrator's
+    // hash gate reuse this read for the #71 prompt check instead of reading
+    // the same doc again (see needsPromptReextract's `known`).
+    const doc = existing && plan.update ? { ...existing, ...plan.update } : existing;
+    return { outcome: plan.outcome, doc };
   }
 
   // ============================================

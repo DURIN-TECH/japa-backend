@@ -5,6 +5,7 @@ import type {
   FxRatesDoc,
   VisaFeeComponentMeta,
   VisaFeeMeta,
+  VisaLinkedSurchargeMeta,
 } from "../types/visa-catalog";
 import { VISA_CATALOG_USER_AGENT } from "./visa-catalog-fetch.service";
 
@@ -260,14 +261,19 @@ export interface ComputedFee {
  *    `feeUnverified` (+ reason) and no `baseCostUsd` is produced — the total
  *    would be incomplete or implausible. Approval is blocked.
  *
+ *  - Linked surcharges (issue #69): an applied one is already a normal
+ *    per-year component in `components` (added by applyLinkedSurcharges());
+ *    `opts.linkedSurcharges` is only its provenance, copied onto the block.
+ *
  * @param now injected clock (staleness + the peg conversion date).
  * @param opts.unverifiedReasons why parts of the fee could not be verified.
+ * @param opts.linkedSurcharges provenance for `feeMeta.linkedSurcharges`.
  */
 export function computeFee(
   components: ExtractedFeeComponent[],
   fx: FxRatesDoc | undefined,
   now: Timestamp,
-  opts?: { unverifiedReasons?: string[] }
+  opts?: { unverifiedReasons?: string[]; linkedSurcharges?: VisaLinkedSurchargeMeta[] }
 ): ComputedFee {
   const unverified: string[] = [...(opts?.unverifiedReasons ?? [])];
   // ---- 1. Per-component totals (arithmetic in code, never in the LLM) ----
@@ -296,6 +302,10 @@ export function computeFee(
   const totals = [...byCurrency.entries()].map(([currency, amount]) => ({ currency, amount }));
 
   const feeMeta: VisaFeeMeta = { components: metaComponents, totals };
+  // Linked-surcharge provenance (#69): only when there is any (no empty key).
+  if (opts?.linkedSurcharges && opts.linkedSurcharges.length > 0) {
+    feeMeta.linkedSurcharges = opts.linkedSurcharges.map((l) => ({ ...l }));
+  }
 
   // Nothing published → nothing to convert, and no cost to claim. Recorded
   // explicitly so an existing doc's old `baseCostUsd` is removed on ingest
@@ -474,7 +484,13 @@ export function planFeeReconvert(
   // legacy "; "-joined string work; the re-computed block is written in the
   // array form, so a re-convert also migrates a legacy doc.
   const storedReasons = storedFeeUnverifiedReasons(fee).filter((r) => !r.includes("plausibility cap"));
-  const result = computeFee(components, fx, now, { unverifiedReasons: storedReasons });
+  // Linked-surcharge provenance (#69) is carried over too: the applied
+  // surcharge is already in `components`, but its source / citation /
+  // assumed length would otherwise be lost on a re-convert.
+  const result = computeFee(components, fx, now, {
+    unverifiedReasons: storedReasons,
+    linkedSurcharges: fee.linkedSurcharges,
+  });
   // Issue #70: keep the "a manual cost was replaced" audit entry. computeFee
   // builds a brand-new block, so without this a re-convert would silently
   // drop the record of an earlier overwrite.

@@ -20,6 +20,10 @@ import {
 // adapters + validator can read it without importing this seed file.
 import { VISA_SOURCE_OFFICIAL_HOSTS } from "../services/visa-catalog-official-hosts";
 export { VISA_SOURCE_OFFICIAL_HOSTS };
+// Country-level linked-surcharge config (issue #69) — also in a pure services
+// module (regexes can't be stored in Firestore; the crawl reads it from code).
+import { GB_IHS_ID, LINKED_SURCHARGE_SOURCES } from "../services/visa-catalog-linked-surcharge";
+export { LINKED_SURCHARGE_SOURCES };
 
 // NOTE: the Firestore handle is resolved LAZILY inside seedVisaSources() (not at
 // module load), so this module can be imported without Firebase Admin init —
@@ -27,24 +31,81 @@ export { VISA_SOURCE_OFFICIAL_HOSTS };
 // directly. seedVisaSources() itself still requires Admin to be initialized
 // first (scripts/seed-all.ts guarantees that).
 
-// Verified-links markdown filename. It lives at the meta-repo root (the folder
-// that contains seli-backend/). Rather than hard-coding a depth — which breaks
-// in a git worktree under `.worktrees/`, one level deeper — we walk up from
-// this module's directory and take the first ancestor that has the file.
-// (Compiled `lib/data/…` and ts-node/tsx `src/data/…` both work this way.)
+// ============================================
+// WHERE THE VERIFIED-LINKS MARKDOWN COMES FROM (issue #78)
+// ============================================
+//
+// The SOURCE OF TRUTH is `official_visa_links_verified_v3.md` at the meta-repo
+// root (the folder that contains seli-backend/). But CI (deploy-dev.yml ->
+// `npm run seed:dev`) checks out seli-backend ALONE, so the meta-repo copy is
+// never there: before #78 the seed logged "not found ... skipping", wrote 0
+// sources, and dev's scraper had nothing to crawl.
+//
+// Fix: a VENDORED copy is committed next to this module at
+// `functions/src/data/official_visa_links_verified_v3.md`, and the seed reads
+// ONLY that copy. Keeping it in step with the meta-repo:
+//   - `npm run sync:visa-sources` copies the meta-repo file over the vendored
+//     one (scripts/sync-visa-sources.ts), when the meta-repo is present;
+//   - a unit test (test/visa-sources-vendored.test.ts) asserts the two are
+//     byte-identical whenever the meta-repo copy can be found, and skips in a
+//     standalone checkout (CI), where only the vendored copy exists.
 export const MARKDOWN_FILENAME = "official_visa_links_verified_v3.md";
 
-/** How many parent directories to probe for the markdown before giving up. */
-const MARKDOWN_SEARCH_DEPTH = 8;
+/**
+ * Env var that points the sync script / drift test at a specific meta-repo
+ * copy instead of walking up. Useful when the nearest meta-repo checkout is on
+ * a different branch than the one being vendored (e.g. a stacked worktree).
+ */
+export const META_MARKDOWN_ENV = "SELI_META_VISA_SOURCES_MD";
 
 /**
- * Locate the verified-links markdown by walking up from `startDir`. Returns
- * the first existing `<ancestor>/official_visa_links_verified_v3.md`, or
- * `undefined` if none is found within MARKDOWN_SEARCH_DEPTH levels.
+ * Locate the VENDORED markdown for a module living in `startDir`.
+ *
+ * tsc does not copy `.md` files into lib/, so two layouts are probed:
+ *   1. `<startDir>/<file>`             — tsx / ts-node running src/data/…
+ *                                        (and tests passing src/data);
+ *   2. `<startDir>/../../src/data/<file>` — compiled lib/data/… (seed:dev in
+ *                                        CI), reading the committed src copy.
+ * No walking up: the seed must never silently pick a different (e.g. stale
+ * meta-repo) file than the one committed with this code.
  */
 export function findVisaSourcesMarkdown(startDir: string = __dirname): string | undefined {
-  let dir = path.resolve(startDir);
-  for (let i = 0; i < MARKDOWN_SEARCH_DEPTH; i++) {
+  const dir = path.resolve(startDir);
+  const candidates = [
+    path.join(dir, MARKDOWN_FILENAME),
+    path.resolve(dir, "../../src/data", MARKDOWN_FILENAME),
+  ];
+  return candidates.find((c) => fs.existsSync(c));
+}
+
+/**
+ * Where the vendored copy is COMMITTED: `functions/src/data/<file>`. Resolves
+ * the same from src/data (`../../src/data` = itself) and lib/data. The sync
+ * script writes here (never into lib/, which is build output).
+ */
+export function vendoredVisaSourcesMarkdownPath(startDir: string = __dirname): string {
+  return path.resolve(startDir, "../../src/data", MARKDOWN_FILENAME);
+}
+
+/** How many parent directories to probe for the meta-repo copy. */
+const META_SEARCH_DEPTH = 6;
+
+/**
+ * Locate the META-REPO copy (the source of truth), or `undefined` when this
+ * seli-backend checkout is standalone (CI). `$SELI_META_VISA_SOURCES_MD` wins
+ * when set. Otherwise walks up starting ABOVE the seli-backend repo root
+ * (`<functions>/../..`), so the vendored copy inside functions/ can never be
+ * mistaken for the meta-repo one. Works from src/data and lib/data alike, and
+ * from a git worktree under `.worktrees/` (one level deeper than the main
+ * checkout).
+ */
+export function findMetaRepoVisaSourcesMarkdown(startDir: string = __dirname): string | undefined {
+  const fromEnv = process.env[META_MARKDOWN_ENV];
+  if (fromEnv) return fs.existsSync(fromEnv) ? path.resolve(fromEnv) : undefined;
+
+  // startDir is functions/{src,lib}/data -> functions -> seli-backend -> parent.
+  let dir = path.resolve(startDir, "../../../..");
+  for (let i = 0; i < META_SEARCH_DEPTH; i++) {
     const candidate = path.join(dir, MARKDOWN_FILENAME);
     if (fs.existsSync(candidate)) return candidate;
     const parent = path.dirname(dir);
@@ -89,7 +150,26 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   // ---- United Kingdom (GB) — routes with a seeded uk-* equivalent ----
   "https://www.gov.uk/standard-visitor": { visaId: "gb-standard-visitor", visaCode: "SVV" }, // ~ uk-visitor
   "https://www.gov.uk/skilled-worker-visa": { visaId: "gb-skilled-worker-visa", visaCode: "SWV" }, // ~ uk-skilled-worker
-  "https://www.gov.uk/student-visa": { visaId: "gb-student-visa", visaCode: "TIER4" }, // ~ uk-student
+  // Student: the guide only LINKS to the healthcare surcharge ("You'll also
+  // have to pay the healthcare surcharge as part of your application"), so
+  // the IHS student rate comes from the linked page (issue #69). The course
+  // length varies (the page: "up to 5 years" at degree level, "up to 2 years"
+  // below it), so the fee charges an ASSUMED 1 year, stated in scrapeMeta.fee.
+  "https://www.gov.uk/student-visa": {
+    visaId: "gb-student-visa",
+    visaCode: "TIER4", // ~ uk-student
+    linkedSurcharges: [
+      {
+        id: GB_IHS_ID,
+        rate: "student",
+        length: {
+          mode: "assumed",
+          years: 1,
+          note: "1 year assumed: the Student visa length depends on the course (registry assumption, issue #69)",
+        },
+      },
+    ],
+  },
   // Family is ONE guide covering partner/child/parent/… routes, with slugs the
   // default section patterns don't know (partner-spouse, proof-income-partner,
   // provide-information). v1 keeps it as one record (matching the seed), so it
@@ -110,7 +190,30 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   },
   // ---- United Kingdom (GB) — routes with no seeded equivalent (no visaCode) ----
   "https://www.gov.uk/health-care-worker-visa": { visaId: "gb-health-care-worker-visa" },
-  "https://www.gov.uk/child-study-visa": { visaId: "gb-child-study-visa" },
+  // Child Student: same as Student — the guide links to the healthcare
+  // surcharge without an amount, and the stay depends on the course length.
+  "https://www.gov.uk/child-study-visa": {
+    visaId: "gb-child-study-visa",
+    linkedSurcharges: [
+      {
+        id: GB_IHS_ID,
+        rate: "student",
+        length: {
+          mode: "assumed",
+          years: 1,
+          note: "1 year assumed: the Child Student visa length depends on the course (registry assumption, issue #69)",
+        },
+      },
+    ],
+  },
+  // NOT marked (issue #69 audit of the live GOV.UK guides, 2026-11-10): the
+  // route page prints its own IHS, so a linked one would double count (#73):
+  // Skilled Worker, Graduate, Family, Global Talent ("usually £1,035 per
+  // year"), High Potential Individual ("£1,035 for each year"), Youth
+  // Mobility ("usually £776 per year"), India Young Professionals ("a
+  // healthcare surcharge of £1,552"), BN(O) (totals by stay). Health and
+  // Care Worker is exempt ("will not have to pay the healthcare surcharge");
+  // Standard Visitor stays 6 months or less (no IHS from outside the UK).
   "https://www.gov.uk/graduate-visa": { visaId: "gb-graduate-visa" },
   "https://www.gov.uk/global-talent": { visaId: "gb-global-talent" },
   "https://www.gov.uk/high-potential-individual-visa": { visaId: "gb-high-potential-individual-visa" },
@@ -448,10 +551,20 @@ export function buildSeededVisaSource(params: {
   return { doc, matchedUrls: pinned.matchedUrls };
 }
 
+/** True on a CI runner (GitHub Actions and most CI systems set CI=true). */
+function isCi(): boolean {
+  const v = (process.env.CI || "").toLowerCase();
+  return v === "true" || v === "1";
+}
+
 /**
  * Seed the `visaSources/{countryCode}` registry from the verified-links
  * markdown plus VISA_SOURCE_OVERRIDES. Idempotent (deterministic doc ids);
  * returns the number of country sources written.
+ *
+ * The markdown is the VENDORED copy (findVisaSourcesMarkdown) unless a path is
+ * passed. If it is missing, this THROWS when CI=true and warns + returns 0
+ * otherwise (issue #78).
  *
  * Re-seeding PRESERVES crawl state, so it is safe to run after deploys:
  *  - `pages` is rebuilt from the markdown + pins (pages removed from the
@@ -470,10 +583,16 @@ export function buildSeededVisaSource(params: {
 export async function seedVisaSources(markdownPath?: string): Promise<number> {
   const file = markdownPath || findVisaSourcesMarkdown();
   if (!file || !fs.existsSync(file)) {
-    console.warn(
+    const msg =
       `[seed-visa-sources] ${MARKDOWN_FILENAME} not found ` +
-        `(${file || `searched up from ${__dirname}`}) — skipping.`
-    );
+      `(${file || `looked for the vendored copy from ${__dirname}`})`;
+    // In CI a missing source list is a BUILD BUG (the vendored file wasn't
+    // committed / shipped), not something to skip: before #78 this branch
+    // logged one line and returned 0, and dev ran with an empty registry.
+    // GitHub Actions always sets CI=true, so the seed step now fails there.
+    // Locally (no CI) it still only warns, so a partial seed keeps working.
+    if (isCi()) throw new Error(`${msg} — refusing to skip in CI.`);
+    console.warn(`${msg} — skipping.`);
     return 0;
   }
 

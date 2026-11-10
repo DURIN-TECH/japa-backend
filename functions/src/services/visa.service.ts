@@ -578,6 +578,13 @@ class VisaService {
       updates.rejectionReason = rejectionReason;
     }
 
+    // Issue #68: an admin review (either action) resolves a restored-guide
+    // queue entry, so the crawl's `restoredAt` marker goes. Only written when
+    // present, so a normal review writes no `restoredAt` at all.
+    if (current.restoredAt !== undefined) {
+      updates.restoredAt = FieldValue.delete();
+    }
+
     // Whether this review can change the country's active-visa set (and so
     // its denormalized stats). Approve always can (it activates; re-approving
     // an active visa just recomputes the same values). Reject only when the

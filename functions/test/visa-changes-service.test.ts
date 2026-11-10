@@ -541,6 +541,62 @@ describe("rejectChange / reconvertFlaggedFees", () => {
 // Controller
 // ============================================
 
+// ============================================
+// Withdrawal closes open proposals (issue #68 review fix)
+// ============================================
+
+describe("markWithdrawn — closes open proposals for the visa (issue #68)", () => {
+  test("an open proposal becomes rejected/superseded by the system; resolved rows and other visas are untouched", async () => {
+    // Approved live doc + an open proposal from a changed page (h2).
+    await seedLive();
+    await ingest(extraction({ processingDaysMax: 30 }), "h2");
+    const [openId] = onlyRow();
+    // An already-rejected row for the same visa, and an open row for ANOTHER visa.
+    const done = { countryCode: CC, visaId: VISA_ID, status: "rejected", rejectionReason: "admin said no", resolvedBy: "admin-1" };
+    store.set("pendingVisaChanges/done", clone(done));
+    const other = { countryCode: CC, visaId: "gb-other", status: "open" };
+    store.set("pendingVisaChanges/other", clone(other));
+
+    const outcome = await catalog.markWithdrawn(CC, VISA_ID);
+
+    assert.equal(outcome, "deactivated");
+    const row = store.get(`pendingVisaChanges/${openId}`)!;
+    assert.equal(row.status, "rejected");
+    assert.equal(row.rejectionReason, changesMod.SUPERSEDED_BY_WITHDRAWAL_REASON);
+    assert.equal(row.resolvedBy, changesMod.SYSTEM_RESOLVER);
+    assert.ok(row.resolvedAt instanceof Timestamp);
+    assert.deepEqual(store.get("pendingVisaChanges/done"), done);
+    assert.deepEqual(store.get("pendingVisaChanges/other"), other);
+    // The live doc is only deactivated; the proposal was never applied.
+    assert.equal(store.get(VISA_PATH)!.isActive, false);
+    assert.notEqual(store.get(VISA_PATH)!.processingDaysMax, 30);
+  });
+
+  test("withdraw → restore (same text) → re-approve: the pre-withdrawal proposal cannot be approved", async () => {
+    await seedLive();
+    await ingest(extraction({ processingDaysMax: 30 }), "h2");
+    const [openId, openRow] = onlyRow();
+    await catalog.markWithdrawn(CC, VISA_ID);
+    await catalog.markRestored(CC, VISA_ID);
+    await visaSvc.updateVisaReviewStatus(CC, VISA_ID, "approve", "admin-1");
+    await assert.rejects(changes.approveChange(openId, "admin-1", openRow.revision), /already rejected/);
+  });
+
+  test("a later withdrawn crawl (already inactive) still closes a row left open", async () => {
+    await seedLive({ reviewStatus: "approved", isActive: false, staleSince: Timestamp.fromMillis(1) });
+    store.set("pendingVisaChanges/late", { countryCode: CC, visaId: VISA_ID, status: "open" });
+    assert.equal(await catalog.markWithdrawn(CC, VISA_ID), "already_inactive");
+    assert.equal(store.get("pendingVisaChanges/late")!.status, "rejected");
+  });
+
+  test("seeded / agent docs: no proposal query side effects", async () => {
+    await seedLive({ source: undefined });
+    store.set("pendingVisaChanges/x", { countryCode: CC, visaId: VISA_ID, status: "open" });
+    assert.equal(await catalog.markWithdrawn(CC, VISA_ID), "not_scraped");
+    assert.equal(store.get("pendingVisaChanges/x")!.status, "open");
+  });
+});
+
 describe("visaChangeController — status codes, validation, authz", () => {
   test("list: default status=open, newest first, [] when empty; invalid status / limit / countryCode → 400", async () => {
     let out = await call("list", req(ROLES.ADMIN));
