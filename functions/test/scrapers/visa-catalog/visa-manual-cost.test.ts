@@ -35,6 +35,9 @@ import assert from "node:assert/strict";
 import { Timestamp } from "firebase-admin/firestore";
 import { ROLES, defineAbilitiesFor } from "@durin-tech/authz";
 import type { Role } from "@durin-tech/authz";
+// Same tagging helper the manual-cost handler uses, so the CASL check below
+// mirrors the real gate exactly.
+import { asSubject } from "../../../src/middleware/authz";
 
 import type { ExtractedFeeComponent, ExtractedVisa, FxRatesDoc, VisaFeeMeta } from "../../../src/scrapers/visa-catalog/types";
 import {
@@ -640,9 +643,18 @@ describe("PUT /admin/visas/:id/manual-cost", () => {
 
   // The endpoint edits the visa document itself, so it is gated on the `Visa`
   // subject (@durin-tech/authz 0.1.4), not `VisaChange` (a pending proposal).
-  test("the gate is the CASL ability: only admin can update a Visa", () => {
+  // Since @durin-tech/authz 0.1.6 (#98) owner/agent hold a *conditional*
+  // `Visa` grant (own agency's `source: "agency"` visas), so the bare string
+  // check `can("update", "Visa")` is true for them ("some Visa could match").
+  // The gate that matters is the one the handler runs: a visa tagged with
+  // just its id (`asSubject("Visa", { id })`, no `ownerAgencyId`/`source`)
+  // matches no agency condition, so only admin passes it.
+  test("the gate is the CASL ability: only admin can update a catalog Visa", () => {
     const can = (role: Role) =>
-      defineAbilitiesFor({ uid: "u", role, agencyId: role === ROLES.ADMIN ? null : "ag1" }).can("update", "Visa");
+      defineAbilitiesFor({ uid: "u", role, agencyId: role === ROLES.ADMIN ? null : "ag1" }).can(
+        "update",
+        asSubject("Visa", { id: VISA_ID })
+      );
     assert.equal(can(ROLES.ADMIN), true);
     for (const role of [ROLES.OWNER, ROLES.AGENT, ROLES.CLIENT]) assert.equal(can(role), false);
   });
