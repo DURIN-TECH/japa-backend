@@ -9,6 +9,8 @@ import { countryRoutes, visaSearchRoutes, adminVisaRoutes } from "./routes/visa.
 import { adminVisaChangeRoutes } from "./routes/visa-change.routes";
 // Scraper run records + source health (issue #81, CASL `ScrapeRun`).
 import { adminScrapeRunRoutes, adminScrapeSourceRoutes } from "./routes/scrape-run.routes";
+// Scraper alerts: list / acknowledge / resolve (issue #83)
+import { adminScrapeAlertRoutes } from "./routes/scrape-alert.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
@@ -97,6 +99,8 @@ app.use("/admin/visa-changes", adminVisaChangeRoutes);
 // Scraper monitoring (issue #81): run records + per-source health (CASL `ScrapeRun`).
 app.use("/admin/scrape-runs", adminScrapeRunRoutes);
 app.use("/admin/scrape-sources", adminScrapeSourceRoutes);
+// Scraper alerts (issue #83): read = CASL `read ScrapeRun`, ack/resolve = `update ScrapeRun`.
+app.use("/admin/scrape-alerts", adminScrapeAlertRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);

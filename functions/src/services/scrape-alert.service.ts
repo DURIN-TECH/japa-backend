@@ -1,0 +1,889 @@
+import { createHash } from "crypto";
+import { logger } from "firebase-functions";
+import type { LogEntry } from "firebase-functions/logger";
+import { Timestamp, type Transaction } from "firebase-admin/firestore";
+import { collections, db, subcollections } from "../utils/firebase";
+import { notificationService, type NotifyUserInput } from "./notification.service";
+import { EMAIL_BRANDING } from "./email/branding";
+import { safeErrorMessage, toJson } from "./scrape-run.service";
+import { stubMonthToDateCostSource, type MonthToDateCostSource } from "./scrape-alert-cost";
+import {
+  DEFAULT_CONFIG,
+  evaluateBrokenSources,
+  evaluateBudget,
+  evaluateErrorRate,
+  evaluateFx,
+  evaluateHostBackoff,
+  evaluateLinkedSurcharge,
+  evaluateMissedWindows,
+  evaluateReviewQueue,
+  evaluateRunFailed,
+  evaluateRunNoLongerStuck,
+  evaluateStuckRuns,
+  msOf,
+  resolveConfig,
+  ruleEnabled,
+  type AlertSignal,
+  type NewsSourceFacts,
+  type ReviewQueueItem,
+  type RuleEvaluation,
+  type VisaSourceFacts,
+} from "./scrape-alert-rules";
+import {
+  SEVERITY_RANK,
+  type ScrapeAlertDoc,
+  type ScrapeAlertKeyDoc,
+  type ScrapeAlertRule,
+  type ScrapeAlertSeverity,
+  type ScrapeAlertStatus,
+  type ScrapeAlertsConfig,
+  type ScrapeAlertsState,
+} from "../types/scrape-alert";
+import type { ScrapeRunDoc, ScrapeRunKind } from "../types/scrape-run";
+
+// ============================================
+// SCRAPE ALERTS — store, email, checks, admin reads (issue #83)
+// ============================================
+//
+// Two entry points evaluate the rules (services/scrape-alert-rules.ts):
+//
+//   onRunFinalized(run)  — the #81 finalize hook (registered in index.ts),
+//                          after EVERY visa / news run: run_failed,
+//                          run_stuck (clears), error_rate, linked_surcharge,
+//                          host_backoff, source_broken (that kind).
+//   runHourlyCheck()     — the `checkScrapeAlerts` scheduled function
+//                          (hourly, :45 UTC): run_stuck, run_failed (latest
+//                          finished run per scraper — catches the runs the
+//                          #81 stale sweep marks failed, which fire no hook),
+//                          missed_window, source_broken, fx_refresh_failing,
+//                          llm_budget, review_queue_stale; then the daily
+//                          digest when due.
+//
+// Both hand their RuleEvaluations to applyEvaluations(), which for each:
+//   - upserts every signal: one ACTIVE alert per dedupe key (pointer doc in
+//     `scrapeAlertKeys`, read in the same transaction). Existing active
+//     alert -> bumped (lastSeen, count+1 unless the same occurrence) or
+//     escalated (severity / level went up; re-opens an acknowledged alert);
+//     none -> a new alert is created;
+//   - auto-resolves the active alerts in the evaluation's scope that were
+//     not signalled (resolvedBy "system", autoResolved true);
+//   - writes ONE structured JSON log line per action (event "scrape_alert",
+//     the Cloud Monitoring backstop filters on it);
+//   - emails new + escalated alerts (>= immediateMinSeverity) to the admin
+//     recipients through notifyUser (Resend, branded template) — ONE email
+//     per check listing them, not one per alert.
+//
+// Nothing here may break a scraper run: onRunFinalized never throws (the
+// hook runner would swallow it anyway), every rule's reads are isolated so
+// one failing read skips only that rule (and never resolves its alerts),
+// and email failures are logged and ignored.
+
+/** Alerts are TTL-deleted this many days after lastSeen / resolvedAt. */
+export const SCRAPE_ALERT_RETENTION_DAYS = 180;
+/** Occurrence ids kept per alert (see ScrapeAlertDoc.eventIds). */
+const MAX_EVENT_IDS = 20;
+/** Earlier runs read for the host-backoff streak. */
+const BACKOFF_LOOKBACK_RUNS = 20;
+/** Runs read per scraper to find its latest finished one (hourly run_failed). */
+const LATEST_RUN_LOOKBACK = 10;
+/** Open review-queue changes read at most (they are counted, not listed). */
+const REVIEW_QUEUE_MAX_CHANGES = 500;
+/** Admin list defaults (GET /admin/scrape-alerts). */
+export const SCRAPE_ALERT_LIST_DEFAULT_LIMIT = 25;
+export const SCRAPE_ALERT_LIST_MAX_LIMIT = 100;
+/** Most alerts listed in one email. */
+const MAX_ALERTS_PER_EMAIL = 25;
+/**
+ * Portal page the emails link to. TODO(#84): the scraper dashboard's real
+ * alerts route once it exists.
+ */
+export const SCRAPE_ALERTS_PORTAL_PATH = "/admin/scrapers?tab=alerts";
+/** `appConfig` doc ids. */
+export const SCRAPE_ALERTS_CONFIG_DOC = "scrapeAlerts";
+export const SCRAPE_ALERTS_STATE_DOC = "scrapeAlertsState";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Statuses that count as "active" (one per dedupe key). */
+const ACTIVE_STATUSES: ScrapeAlertStatus[] = ["open", "acknowledged"];
+
+/** Short rule names for email subjects / log messages. */
+export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
+  run_failed: "run failed",
+  run_stuck: "run stuck",
+  missed_window: "missed crawl window",
+  source_broken: "source auto-paused",
+  error_rate: "high error rate",
+  host_backoff: "host backing off",
+  linked_surcharge: "linked surcharge errors",
+  fx_refresh_failing: "FX refresh failing",
+  llm_budget: "LLM budget",
+  review_queue_stale: "review queue waiting",
+};
+
+/** Cloud Logging severity per alert severity (resolutions log as INFO). */
+const LOG_SEVERITY: Record<ScrapeAlertSeverity, LogEntry["severity"]> = {
+  critical: "CRITICAL",
+  warning: "WARNING",
+  info: "INFO",
+};
+
+/** What happened to one alert in a check. */
+export type AlertActionKind = "created" | "bumped" | "escalated" | "resolved" | "acknowledged";
+
+/** One alert action (the alert as it stands AFTER the action). */
+export interface AlertAction {
+  action: AlertActionKind;
+  alert: ScrapeAlertDoc;
+}
+
+/** Result of a check (logged by the scheduled function; returned in tests). */
+export interface AlertCheckResult {
+  actions: AlertAction[];
+  emailed: number; // alerts included in the immediate email
+  recipients: number; // admins it went to
+  digestSent: boolean;
+  skippedRules: string[]; // rules whose reads failed this time
+}
+
+/** An alert as the API returns it (ISO dates, no internal eventIds). */
+export type ScrapeAlertJson = Record<string, unknown> & { id: string };
+
+/** Filters for listAlerts (validated by the controller). */
+export interface ListAlertsQuery {
+  status?: ScrapeAlertStatus; // "open" includes acknowledged
+  limit: number;
+  cursor?: string; // an alert id from the previous page's nextCursor
+}
+
+/** Thrown for a cursor that names no alert (-> 400). */
+export class InvalidAlertCursorError extends Error {
+  constructor() {
+    super("cursor does not match a scrape alert");
+  }
+}
+
+/** Outcome of acknowledge / resolve. */
+export type AlertMutationResult =
+  | { outcome: "ok"; alert: ScrapeAlertJson }
+  | { outcome: "not_found" }
+  | { outcome: "already_resolved"; alert: ScrapeAlertJson };
+
+/** Pointer doc id for a dedupe key (keys contain ':' and '.', ids must not be paths). */
+export function alertKeyId(dedupeKey: string): string {
+  return createHash("sha256").update(dedupeKey).digest("hex").slice(0, 40);
+}
+
+/** TTL instant `SCRAPE_ALERT_RETENTION_DAYS` after `fromMs`. */
+function expireAtFrom(fromMs: number): Timestamp {
+  return Timestamp.fromMillis(fromMs + SCRAPE_ALERT_RETENTION_DAYS * DAY_MS);
+}
+
+/** An alert doc -> API JSON (ISO dates; eventIds are internal). */
+function alertJson(id: string, data: unknown): ScrapeAlertJson {
+  const { eventIds: _e, ...rest } = (data ?? {}) as Record<string, unknown>;
+  void _e;
+  return { ...(toJson(rest) as Record<string, unknown>), id };
+}
+
+/** "[Critical]" etc. */
+function sevLabel(s: ScrapeAlertSeverity): string {
+  return `[${s.charAt(0).toUpperCase()}${s.slice(1)}]`;
+}
+
+// ============================================
+// SERVICE
+// ============================================
+
+export class ScrapeAlertService {
+  /** Transaction runner. Swapped for the in-memory one in tests. */
+  runTransaction: <T>(fn: (tx: Transaction) => Promise<T>) => Promise<T> = (fn) => db.runTransaction(fn);
+
+  /** Real clock (ms). Swappable in tests. */
+  realClock: () => number = Date.now;
+
+  /**
+   * Month-to-date LLM cost for the llm_budget rule. TODO(#82): assign the
+   * real rollup (see scrape-alert-cost.ts); the stub has no budget, so the
+   * rule is skipped.
+   */
+  costSource: MonthToDateCostSource = stubMonthToDateCostSource;
+
+  /**
+   * Structured log writer (one JSON line per alert action). firebase-functions'
+   * logger writes `jsonPayload` entries with a real `severity` in Cloud
+   * Logging, which the Terraform log-based alert filters on. Swappable in tests.
+   */
+  log: (entry: LogEntry) => void = (entry) => logger.write(entry);
+
+  /** Email delivery: the existing notifyUser path (Resend). Swappable in tests. */
+  notify: (input: NotifyUserInput) => Promise<void> = (input) => notificationService.notifyUser(input);
+
+  // ---------- Config ----------
+
+  /**
+   * Read `appConfig/scrapeAlerts` merged over the defaults. When the doc does
+   * not exist yet it is written with the defaults, so admins find every
+   * threshold in Firestore to edit (thresholds live in config, not code).
+   * Invalid values fall back to defaults and are logged. A failed read uses
+   * the defaults (alerting must not stop because config could not load).
+   */
+  async loadConfig(): Promise<ScrapeAlertsConfig> {
+    try {
+      const ref = collections.appConfig.doc(SCRAPE_ALERTS_CONFIG_DOC);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        try {
+          await ref.set(DEFAULT_CONFIG);
+        } catch (err) {
+          console.warn(`Scrape alerts: could not write default config: ${safeErrorMessage(err)}`);
+        }
+        return resolveConfig(DEFAULT_CONFIG).config;
+      }
+      const { config, problems } = resolveConfig(snap.data());
+      for (const p of problems) console.warn(`Scrape alerts config (appConfig/${SCRAPE_ALERTS_CONFIG_DOC}): ${p}`);
+      return config;
+    } catch (err) {
+      this.engineError("config", err);
+      return resolveConfig(DEFAULT_CONFIG).config;
+    }
+  }
+
+  // ---------- Entry point 1: after every run (finalize hook) ----------
+
+  /**
+   * The #81 finalize hook: evaluate the run-scoped rules for `run`. Never
+   * throws. Script runs (CLI) are ignored: someone is watching those.
+   */
+  async onRunFinalized(run: ScrapeRunDoc): Promise<AlertCheckResult | undefined> {
+    try {
+      if (run.trigger === "script") return undefined;
+      const config = await this.loadConfig();
+      if (!config.enabled) return undefined;
+      const nowMs = this.realClock();
+      const skippedRules: string[] = [];
+      const evals: RuleEvaluation[] = [
+        evaluateRunFailed(run, config),
+        evaluateRunNoLongerStuck(run),
+        evaluateErrorRate(run, config),
+        evaluateLinkedSurcharge(run, config),
+      ];
+      // Host backoff needs the earlier runs of the same scraper.
+      await this.isolated("host_backoff", skippedRules, async () => {
+        evals.push(evaluateHostBackoff(run, await this.previousRuns(run), config));
+      });
+      // The run may just have auto-paused a source: check that kind now
+      // rather than waiting for the hourly check.
+      await this.isolated("source_broken", skippedRules, async () => {
+        evals.push(evaluateBrokenSources(run.kind, await this.sourceFacts(run.kind), config));
+      });
+      return await this.finish(evals, config, nowMs, skippedRules, false);
+    } catch (err) {
+      this.engineError("finalize", err, run.id);
+      return undefined;
+    }
+  }
+
+  // ---------- Entry point 2: the hourly check ----------
+
+  /**
+   * The hourly check (`checkScrapeAlerts`). Queries what no hook reports:
+   * stuck runs, the latest finished run per scraper (the stale sweep marks
+   * runs failed without hooks), source state, FX, budget and the review
+   * queue; then sends the daily digest when due. Never throws.
+   */
+  async runHourlyCheck(nowMs: number = this.realClock()): Promise<AlertCheckResult> {
+    const empty: AlertCheckResult = { actions: [], emailed: 0, recipients: 0, digestSent: false, skippedRules: [] };
+    try {
+      const config = await this.loadConfig();
+      if (!config.enabled) return empty;
+      const skippedRules: string[] = [];
+      const evals: RuleEvaluation[] = [];
+
+      // ---- Runs ----
+      await this.isolated("run_stuck", skippedRules, async () => {
+        const snap = await collections.scrapeRuns.where("status", "==", "running").get();
+        evals.push(evaluateStuckRuns(snap.docs.map((d) => d.data() as ScrapeRunDoc), nowMs, config));
+      });
+      const latest: Partial<Record<ScrapeRunKind, ScrapeRunDoc>> = {};
+      for (const kind of ["visa", "news"] as ScrapeRunKind[]) {
+        await this.isolated(`run_failed:${kind}`, skippedRules, async () => {
+          const run = await this.latestFinishedRun(kind);
+          latest[kind] = run;
+          if (run) evals.push(evaluateRunFailed(run, config));
+        });
+      }
+
+      // ---- Sources ----
+      await this.isolated("missed_window", skippedRules, async () => {
+        evals.push(evaluateMissedWindows((await this.sourceFacts("visa")) as VisaSourceFacts[], nowMs, config));
+      });
+      for (const kind of ["visa", "news"] as ScrapeRunKind[]) {
+        await this.isolated(`source_broken:${kind}`, skippedRules, async () => {
+          evals.push(evaluateBrokenSources(kind, await this.sourceFacts(kind), config));
+        });
+      }
+
+      // ---- FX (#59) ----
+      // Only when the latest visa run could be read (else we can't tell
+      // "failing" from "not tried").
+      if (!skippedRules.includes("run_failed:visa")) {
+        await this.isolated("fx_refresh_failing", skippedRules, async () => {
+          const fx = await collections.appConfig.doc("fx").get();
+          evals.push(evaluateFx(fx.exists ? msOf(fx.data()?.fetchedAt) : undefined, latest.visa, nowMs, config));
+        });
+      }
+
+      // ---- LLM budget (#82; skipped while the cost source has no budget) ----
+      await this.isolated("llm_budget", skippedRules, async () => {
+        const evaluation = evaluateBudget(await this.costSource.getMonthToDateCost(), nowMs, config);
+        if (evaluation) evals.push(evaluation);
+      });
+
+      // ---- Review queue ----
+      await this.isolated("review_queue_stale", skippedRules, async () => {
+        evals.push(evaluateReviewQueue(await this.reviewQueueItems(nowMs, config), nowMs, config));
+      });
+
+      const result = await this.finish(evals, config, nowMs, skippedRules, true);
+      return result;
+    } catch (err) {
+      this.engineError("hourly", err);
+      return empty;
+    }
+  }
+
+  // ---------- Shared: apply + email ----------
+
+  /** Apply the evaluations, email new / escalated ones, and (hourly) the digest. */
+  private async finish(
+    evals: RuleEvaluation[],
+    config: ScrapeAlertsConfig,
+    nowMs: number,
+    skippedRules: string[],
+    hourly: boolean
+  ): Promise<AlertCheckResult> {
+    const actions = await this.applyEvaluations(evals, config, nowMs);
+    const { emailed, recipients } = await this.emailImmediate(actions, config);
+    const digestSent = hourly ? await this.sendDigestIfDue(config, nowMs) : false;
+    return { actions, emailed, recipients, digestSent, skippedRules };
+  }
+
+  /** Run one rule's reads; on failure log, note the rule as skipped, go on. */
+  private async isolated(rule: string, skipped: string[], fn: () => Promise<void>): Promise<void> {
+    try {
+      await fn();
+    } catch (err) {
+      skipped.push(rule);
+      this.engineError(`rule:${rule}`, err);
+    }
+  }
+
+  /**
+   * Apply evaluations: upsert signals, auto-resolve cleared alerts in scope.
+   * A disabled rule (config) has its active alerts resolved and raises none.
+   * Each alert write is its own transaction; one failing write is logged and
+   * the rest go on.
+   */
+  async applyEvaluations(evals: RuleEvaluation[], config: ScrapeAlertsConfig, nowMs: number): Promise<AlertAction[]> {
+    const actions: AlertAction[] = [];
+    for (const raw of evals) {
+      const evaluation: RuleEvaluation = ruleEnabled(config, raw.rule) ? raw : { rule: raw.rule, signals: [], scope: "all" };
+      const signalled = new Set(evaluation.signals.map((s) => s.key));
+
+      // ---- Signals ----
+      for (const signal of evaluation.signals) {
+        try {
+          const action = await this.upsert(signal, nowMs);
+          if (action) actions.push(action);
+        } catch (err) {
+          this.engineError(`upsert:${signal.key}`, err);
+        }
+      }
+
+      // ---- Auto-resolve what this evaluation covers but did not signal ----
+      let keys: string[] = [];
+      try {
+        if (evaluation.scope === "all" || "keyPrefix" in evaluation.scope) {
+          const prefix = evaluation.scope === "all" ? "" : evaluation.scope.keyPrefix;
+          const snap = await collections.scrapeAlerts
+            .where("rule", "==", evaluation.rule)
+            .where("status", "in", ACTIVE_STATUSES)
+            .get();
+          keys = snap.docs.map((d) => (d.data() as ScrapeAlertDoc).dedupeKey).filter((k) => k.startsWith(prefix));
+        } else {
+          keys = evaluation.scope.keys;
+        }
+      } catch (err) {
+        this.engineError(`scope:${evaluation.rule}`, err);
+      }
+      for (const key of new Set(keys)) {
+        if (signalled.has(key)) continue;
+        try {
+          const action = await this.resolveKey(key, nowMs);
+          if (action) actions.push(action);
+        } catch (err) {
+          this.engineError(`resolve:${key}`, err);
+        }
+      }
+    }
+    for (const a of actions) this.logAction(a);
+    return actions;
+  }
+
+  /**
+   * Create or bump the ACTIVE alert for `signal.key`, in one transaction
+   * guarded by the key's pointer doc. Returns null when nothing changed (the
+   * same occurrence seen again, no escalation).
+   */
+  private async upsert(signal: AlertSignal, nowMs: number): Promise<AlertAction | null> {
+    const pointerRef = collections.scrapeAlertKeys.doc(alertKeyId(signal.key));
+    const now = Timestamp.fromMillis(nowMs);
+    return this.runTransaction(async (tx) => {
+      // ---- Reads (all before writes, as Firestore requires) ----
+      const pointer = await tx.get(pointerRef);
+      const pointed = pointer.exists ? (pointer.data() as ScrapeAlertKeyDoc) : undefined;
+      const alertRef = pointed ? collections.scrapeAlerts.doc(pointed.alertId) : undefined;
+      const existingSnap = alertRef ? await tx.get(alertRef) : undefined;
+      const existing = existingSnap?.exists ? (existingSnap.data() as ScrapeAlertDoc) : undefined;
+
+      // ---- Bump / escalate the active alert ----
+      if (existing && alertRef && existing.status !== "resolved") {
+        const eventIds = existing.eventIds ?? [];
+        const sameEvent = signal.eventId !== undefined && eventIds.includes(signal.eventId);
+        const escalated =
+          SEVERITY_RANK[signal.severity] > SEVERITY_RANK[existing.severity] ||
+          (signal.level ?? 0) > (existing.level ?? 0);
+        if (sameEvent && !escalated) return null;
+        const update: Record<string, unknown> = {
+          message: signal.message,
+          details: signal.details ?? {},
+          lastSeen: now,
+          count: sameEvent ? existing.count : (existing.count ?? 1) + 1,
+          updatedAt: now,
+          expireAt: expireAtFrom(nowMs),
+        };
+        if (signal.eventId !== undefined && !sameEvent) update.eventIds = [...eventIds, signal.eventId].slice(-MAX_EVENT_IDS);
+        if (signal.runId) update.lastRunId = signal.runId;
+        if (escalated) {
+          // Keep the highest severity / level seen; an escalation re-opens an
+          // acknowledged alert (the admin acknowledged something milder).
+          if (SEVERITY_RANK[signal.severity] > SEVERITY_RANK[existing.severity]) update.severity = signal.severity;
+          if ((signal.level ?? 0) > (existing.level ?? 0)) update.level = signal.level;
+          update.escalatedAt = now;
+          if (existing.status === "acknowledged") {
+            update.status = "open";
+            update.acknowledgedBy = null;
+            update.acknowledgedAt = null;
+          }
+        }
+        tx.update(alertRef, update);
+        return { action: escalated ? "escalated" : "bumped", alert: { ...existing, ...update } as ScrapeAlertDoc };
+      }
+
+      // ---- No active alert: create one (and point the key at it) ----
+      const ref = collections.scrapeAlerts.doc();
+      const doc: ScrapeAlertDoc = {
+        id: ref.id,
+        rule: signal.rule,
+        dedupeKey: signal.key,
+        severity: signal.severity,
+        ...(signal.level !== undefined ? { level: signal.level } : {}),
+        kind: signal.kind,
+        subject: signal.subject,
+        message: signal.message,
+        details: signal.details ?? {},
+        ...(signal.runId ? { lastRunId: signal.runId } : {}),
+        firstSeen: now,
+        lastSeen: now,
+        count: 1,
+        eventIds: signal.eventId !== undefined ? [signal.eventId] : [],
+        status: "open",
+        acknowledgedBy: null,
+        acknowledgedAt: null,
+        resolvedBy: null,
+        resolvedAt: null,
+        autoResolved: false,
+        expireAt: expireAtFrom(nowMs),
+        createdAt: now,
+        updatedAt: now,
+      };
+      tx.set(ref, doc);
+      tx.set(pointerRef, { dedupeKey: signal.key, alertId: ref.id, createdAt: now } satisfies ScrapeAlertKeyDoc);
+      return { action: "created", alert: doc };
+    });
+  }
+
+  /**
+   * Auto-resolve the active alert for `key` (the condition cleared). Also
+   * removes a stale pointer (its alert gone / already resolved). Returns null
+   * when there was nothing active.
+   */
+  private async resolveKey(key: string, nowMs: number): Promise<AlertAction | null> {
+    const pointerRef = collections.scrapeAlertKeys.doc(alertKeyId(key));
+    const now = Timestamp.fromMillis(nowMs);
+    return this.runTransaction(async (tx) => {
+      const pointer = await tx.get(pointerRef);
+      if (!pointer.exists) return null;
+      const alertRef = collections.scrapeAlerts.doc((pointer.data() as ScrapeAlertKeyDoc).alertId);
+      const snap = await tx.get(alertRef);
+      const alert = snap.exists ? (snap.data() as ScrapeAlertDoc) : undefined;
+      tx.delete(pointerRef);
+      if (!alert || alert.status === "resolved") return null;
+      const update = {
+        status: "resolved" as const,
+        resolvedBy: "system",
+        resolvedAt: now,
+        autoResolved: true,
+        updatedAt: now,
+        expireAt: expireAtFrom(nowMs),
+      };
+      tx.update(alertRef, update);
+      return { action: "resolved", alert: { ...alert, ...update } };
+    });
+  }
+
+  /** One structured JSON log line per alert action (Terraform backstop). */
+  private logAction(a: AlertAction): void {
+    const { alert } = a;
+    try {
+      this.log({
+        severity: a.action === "resolved" || a.action === "acknowledged" ? "INFO" : LOG_SEVERITY[alert.severity],
+        message: `scrape alert ${a.action}: ${sevLabel(alert.severity)} ${alert.message}`.slice(0, 1000),
+        // Stable fields the log-based alert policy filters on:
+        event: "scrape_alert",
+        action: a.action,
+        alert: {
+          id: alert.id,
+          rule: alert.rule,
+          dedupeKey: alert.dedupeKey,
+          severity: alert.severity,
+          status: alert.status,
+          kind: alert.kind,
+          subject: alert.subject,
+          count: alert.count,
+          firstSeen: new Date(msOf(alert.firstSeen) ?? 0).toISOString(),
+          lastSeen: new Date(msOf(alert.lastSeen) ?? 0).toISOString(),
+          lastRunId: alert.lastRunId ?? null,
+        },
+      });
+    } catch (err) {
+      console.error(`Scrape alerts: log write failed: ${safeErrorMessage(err)}`);
+    }
+  }
+
+  /**
+   * Engine failure (a read, a write, the config): an ERROR log line with its
+   * own event name, so the Terraform backstop can also page when alerting
+   * itself is broken.
+   */
+  private engineError(stage: string, err: unknown, runId?: string): void {
+    try {
+      this.log({
+        severity: "ERROR",
+        message: `scrape alert engine error (${stage}): ${safeErrorMessage(err)}`,
+        event: "scrape_alert_engine_error",
+        stage,
+        ...(runId ? { runId } : {}),
+      });
+    } catch {
+      console.error(`Scrape alerts: engine error (${stage}): ${safeErrorMessage(err)}`);
+    }
+  }
+
+  // ---------- Email ----------
+
+  /**
+   * Admin uids to email: `recipientUserIds` (config) filtered to users that
+   * really are admins, or every admin when the list is empty. Admins carry
+   * `admin: true` on users/{uid} (kept in lockstep with the role claim by
+   * claimsService), the same lookup compliance notifications use.
+   */
+  async recipients(config: ScrapeAlertsConfig): Promise<string[]> {
+    if (config.recipientUserIds.length === 0) {
+      const snap = await collections.users.where("admin", "==", true).get();
+      return snap.docs.map((d) => d.id);
+    }
+    const out: string[] = [];
+    for (const uid of new Set(config.recipientUserIds)) {
+      const snap = await collections.users.doc(uid).get();
+      if (snap.exists && snap.data()?.admin === true) out.push(uid);
+      else console.warn(`Scrape alerts: recipient ${uid} is not an admin user, skipped`);
+    }
+    return out;
+  }
+
+  /**
+   * Email new + escalated alerts at or above immediateMinSeverity: one email
+   * per check (listing them, most severe first) to each recipient. Best
+   * effort: never throws.
+   */
+  private async emailImmediate(actions: AlertAction[], config: ScrapeAlertsConfig): Promise<{ emailed: number; recipients: number }> {
+    if (!config.email.immediate) return { emailed: 0, recipients: 0 };
+    const min = SEVERITY_RANK[config.email.immediateMinSeverity];
+    const alerts = actions
+      .filter((a) => (a.action === "created" || a.action === "escalated") && SEVERITY_RANK[a.alert.severity] >= min)
+      .map((a) => ({ ...a.alert, _escalated: a.action === "escalated" }));
+    if (alerts.length === 0) return { emailed: 0, recipients: 0 };
+    alerts.sort((x, y) => SEVERITY_RANK[y.severity] - SEVERITY_RANK[x.severity]);
+
+    // ---- Copy ----
+    const top = alerts[0];
+    const title =
+      alerts.length === 1
+        ? `${sevLabel(top.severity)} ${top.subject.label}: ${RULE_TITLES[top.rule]}${top._escalated ? " (escalated)" : ""}`
+        : `${sevLabel(top.severity)} ${alerts.length} new scraper alerts`;
+    const lines = alerts
+      .slice(0, MAX_ALERTS_PER_EMAIL)
+      .map((a) => `${sevLabel(a.severity)} ${a.subject.label}: ${a.message}${a._escalated ? " (escalated)" : ""}`);
+    if (alerts.length > MAX_ALERTS_PER_EMAIL) lines.push(`...and ${alerts.length - MAX_ALERTS_PER_EMAIL} more.`);
+    const body =
+      `${alerts.length === 1 ? "A scraper alert needs attention." : `${alerts.length} scraper alerts need attention.`}\n\n` +
+      `${lines.join("\n\n")}\n\n` +
+      "Acknowledge or resolve them on the scraper dashboard. You get one email when an alert opens or gets worse, not on every check.";
+
+    const sent = await this.sendToAdmins(config, title, body);
+    return { emailed: sent > 0 ? alerts.length : 0, recipients: sent };
+  }
+
+  /**
+   * Daily digest (config email.digest): at digestHourUtc, once per UTC day
+   * (claimed in a transaction on appConfig/scrapeAlertsState so a retried or
+   * overlapping check never sends twice), email the active alerts at or
+   * above digestMinSeverity. Nothing active -> no email (the day is still
+   * claimed). Returns true when an email went out.
+   */
+  async sendDigestIfDue(config: ScrapeAlertsConfig, nowMs: number): Promise<boolean> {
+    try {
+      if (!config.email.digest || new Date(nowMs).getUTCHours() !== config.email.digestHourUtc) return false;
+      const day = new Date(nowMs).toISOString().slice(0, 10);
+      const stateRef = collections.appConfig.doc(SCRAPE_ALERTS_STATE_DOC);
+      const claimed = await this.runTransaction(async (tx) => {
+        const snap = await tx.get(stateRef);
+        const state = (snap.exists ? snap.data() : {}) as ScrapeAlertsState;
+        if (state.lastDigestDay === day) return false;
+        tx.set(stateRef, { lastDigestDay: day, lastDigestAt: Timestamp.fromMillis(nowMs) }, { merge: true });
+        return true;
+      });
+      if (!claimed) return false;
+
+      const min = SEVERITY_RANK[config.email.digestMinSeverity];
+      const snap = await collections.scrapeAlerts.where("status", "in", ACTIVE_STATUSES).get();
+      const alerts = snap.docs
+        .map((d) => d.data() as ScrapeAlertDoc)
+        .filter((a) => SEVERITY_RANK[a.severity] >= min)
+        .sort((x, y) => SEVERITY_RANK[y.severity] - SEVERITY_RANK[x.severity] || (msOf(y.lastSeen) ?? 0) - (msOf(x.lastSeen) ?? 0));
+      if (alerts.length === 0) return false;
+
+      const open = alerts.filter((a) => a.status === "open").length;
+      const title = `Scraper alerts digest for ${day}: ${alerts.length} active`;
+      const lines = alerts.slice(0, MAX_ALERTS_PER_EMAIL).map((a) => {
+        const since = new Date(msOf(a.firstSeen) ?? nowMs).toISOString().slice(0, 16).replace("T", " ");
+        return `${sevLabel(a.severity)} ${a.subject.label}: ${a.message} (since ${since} UTC, seen ${a.count}x${a.status === "acknowledged" ? ", acknowledged" : ""})`;
+      });
+      if (alerts.length > MAX_ALERTS_PER_EMAIL) lines.push(`...and ${alerts.length - MAX_ALERTS_PER_EMAIL} more.`);
+      const body =
+        `${alerts.length} scraper alert(s) are active (${open} open, ${alerts.length - open} acknowledged).\n\n` +
+        lines.join("\n\n");
+      return (await this.sendToAdmins(config, title, body)) > 0;
+    } catch (err) {
+      this.engineError("digest", err);
+      return false;
+    }
+  }
+
+  /**
+   * One branded email per admin recipient via notifyUser (EMAIL ONLY,
+   * type `scrape_alert`: no event template, so the subject is `title`).
+   * Returns how many recipients it was sent to (attempted).
+   */
+  private async sendToAdmins(config: ScrapeAlertsConfig, title: string, body: string): Promise<number> {
+    let uids: string[];
+    try {
+      uids = await this.recipients(config);
+    } catch (err) {
+      this.engineError("recipients", err);
+      return 0;
+    }
+    if (uids.length === 0) {
+      console.warn("Scrape alerts: no admin recipients, email not sent");
+      return 0;
+    }
+    let sent = 0;
+    for (const userId of uids) {
+      try {
+        await this.notify({
+          userId,
+          type: "scrape_alert",
+          title,
+          body,
+          channels: ["email"],
+          actionUrl: `${EMAIL_BRANDING.appUrl}${SCRAPE_ALERTS_PORTAL_PATH}`,
+        });
+        sent++;
+      } catch (err) {
+        this.engineError("email", err);
+      }
+    }
+    return sent;
+  }
+
+  // ---------- Reads behind the rules ----------
+
+  /** Earlier finished, non-script runs of the same scraper, newest first. */
+  private async previousRuns(run: ScrapeRunDoc): Promise<ScrapeRunDoc[]> {
+    const snap = await collections.scrapeRuns
+      .where("kind", "==", run.kind)
+      .where("startedAt", "<", run.startedAt)
+      .orderBy("startedAt", "desc")
+      .limit(BACKOFF_LOOKBACK_RUNS)
+      .get();
+    return snap.docs
+      .map((d) => d.data() as ScrapeRunDoc)
+      .filter((r) => r.id !== run.id && r.status !== "running" && r.trigger !== "script");
+  }
+
+  /** The latest finished, non-script run of a scraper (kind+startedAt index). */
+  private async latestFinishedRun(kind: ScrapeRunKind): Promise<ScrapeRunDoc | undefined> {
+    const snap = await collections.scrapeRuns
+      .where("kind", "==", kind)
+      .orderBy("startedAt", "desc")
+      .limit(LATEST_RUN_LOOKBACK)
+      .get();
+    return snap.docs.map((d) => d.data() as ScrapeRunDoc).find((r) => r.status !== "running" && r.trigger !== "script");
+  }
+
+  /** Source facts for one scraper's registry (a few dozen docs at most). */
+  private async sourceFacts(kind: ScrapeRunKind): Promise<Array<VisaSourceFacts | NewsSourceFacts>> {
+    const snap = await (kind === "visa" ? collections.visaSources : collections.newsSources).get();
+    return snap.docs.map((d) => ({ ...(d.data() as Record<string, unknown>), id: d.id }) as VisaSourceFacts | NewsSourceFacts);
+  }
+
+  /**
+   * The review queue's ageing items:
+   *  - scraped visas pending review, per registry country (equality query,
+   *    no index); queued at max(createdAt, restoredAt) — a #68 restore puts
+   *    an old doc back in the queue, its wait starts then;
+   *  - open pendingVisaChanges created on/before the age cutoff (served by
+   *    the existing status+createdAt DESC index), capped.
+   */
+  private async reviewQueueItems(nowMs: number, config: ScrapeAlertsConfig): Promise<ReviewQueueItem[]> {
+    const items: ReviewQueueItem[] = [];
+    const sources = await collections.visaSources.get();
+    for (const src of sources.docs) {
+      const cc = ((src.data().countryCode as string) || src.id).toUpperCase();
+      const pending = await subcollections.visaTypes(cc).where("reviewStatus", "==", "pending_review").get();
+      for (const d of pending.docs) {
+        const v = d.data() as { source?: string; createdAt?: unknown; restoredAt?: unknown };
+        if (v.source !== "scraped") continue;
+        const queuedAt = Math.max(msOf(v.createdAt) ?? 0, msOf(v.restoredAt) ?? 0);
+        if (queuedAt > 0) items.push({ kind: "visa", id: `${cc}/${d.id}`, queuedAtMs: queuedAt });
+      }
+    }
+    const cutoff = Timestamp.fromMillis(nowMs - config.thresholds.reviewQueueMaxAgeDays * DAY_MS);
+    const changes = await collections.pendingVisaChanges
+      .where("status", "==", "open")
+      .where("createdAt", "<=", cutoff)
+      .orderBy("createdAt", "desc")
+      .limit(REVIEW_QUEUE_MAX_CHANGES)
+      .get();
+    for (const d of changes.docs) {
+      const created = msOf(d.data().createdAt);
+      if (created !== undefined) items.push({ kind: "change", id: d.id, queuedAtMs: created });
+    }
+    return items;
+  }
+
+  // ---------- Admin API ----------
+
+  /**
+   * Newest-activity-first page of alerts (lastSeen desc). `status=open`
+   * includes acknowledged alerts (both are "active"); no status = all.
+   * Indexes: status+lastSeen DESC (also serves `in`), lastSeen alone is the
+   * single-field index. Cursor = the last alert id of the previous page.
+   */
+  async listAlerts(q: ListAlertsQuery): Promise<{ items: ScrapeAlertJson[]; nextCursor: string | null }> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let query: any = collections.scrapeAlerts;
+    if (q.status === "open") query = query.where("status", "in", ACTIVE_STATUSES);
+    else if (q.status) query = query.where("status", "==", q.status);
+    query = query.orderBy("lastSeen", "desc");
+    if (q.cursor) {
+      const cursorSnap = await collections.scrapeAlerts.doc(q.cursor).get();
+      if (!cursorSnap.exists) throw new InvalidAlertCursorError();
+      query = query.startAfter(cursorSnap);
+    }
+    const snap = await query.limit(q.limit + 1).get();
+    const docs = snap.docs.slice(0, q.limit);
+    return {
+      items: docs.map((d: { id: string; data: () => unknown }) => alertJson(d.id, d.data())),
+      nextCursor: snap.docs.length > q.limit ? docs[docs.length - 1].id : null,
+    };
+  }
+
+  /** One alert (ISO dates), or null. */
+  async getAlert(id: string): Promise<ScrapeAlertJson | null> {
+    const snap = await collections.scrapeAlerts.doc(id).get();
+    return snap.exists ? alertJson(snap.id, snap.data()) : null;
+  }
+
+  /**
+   * Acknowledge an active alert (an admin is on it). Idempotent for an
+   * already acknowledged alert (returned unchanged); refused for a resolved
+   * one. It keeps being bumped while the condition holds, but is not emailed
+   * again unless it escalates.
+   */
+  async acknowledge(id: string, uid: string, nowMs: number = this.realClock()): Promise<AlertMutationResult> {
+    const ref = collections.scrapeAlerts.doc(id);
+    const now = Timestamp.fromMillis(nowMs);
+    const result = await this.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return { outcome: "not_found" as const };
+      const alert = snap.data() as ScrapeAlertDoc;
+      if (alert.status === "resolved") return { outcome: "already_resolved" as const, alert };
+      if (alert.status === "acknowledged") return { outcome: "ok" as const, alert, changed: false };
+      const update = { status: "acknowledged" as const, acknowledgedBy: uid, acknowledgedAt: now, updatedAt: now };
+      tx.update(ref, update);
+      return { outcome: "ok" as const, alert: { ...alert, ...update }, changed: true };
+    });
+    if (result.outcome === "not_found") return result;
+    if (result.outcome === "ok" && result.changed) this.logAction({ action: "acknowledged", alert: result.alert });
+    return { outcome: result.outcome, alert: alertJson(id, result.alert) };
+  }
+
+  /**
+   * Resolve an alert by hand (autoResolved false). Idempotent: an already
+   * resolved alert comes back as `already_resolved` (controller: 200,
+   * unchanged). Frees the dedupe key, so if the condition still holds the
+   * next check opens a NEW alert (and emails it).
+   */
+  async resolve(id: string, uid: string, nowMs: number = this.realClock()): Promise<AlertMutationResult> {
+    const ref = collections.scrapeAlerts.doc(id);
+    const now = Timestamp.fromMillis(nowMs);
+    const result = await this.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return { outcome: "not_found" as const };
+      const alert = snap.data() as ScrapeAlertDoc;
+      if (alert.status === "resolved") return { outcome: "already_resolved" as const, alert };
+      const pointerRef = collections.scrapeAlertKeys.doc(alertKeyId(alert.dedupeKey));
+      const pointer = await tx.get(pointerRef);
+      const update = {
+        status: "resolved" as const,
+        resolvedBy: uid,
+        resolvedAt: now,
+        autoResolved: false,
+        updatedAt: now,
+        expireAt: expireAtFrom(nowMs),
+      };
+      tx.update(ref, update);
+      // Only drop the pointer when it points at THIS alert.
+      if (pointer.exists && (pointer.data() as ScrapeAlertKeyDoc).alertId === id) tx.delete(pointerRef);
+      return { outcome: "ok" as const, alert: { ...alert, ...update } };
+    });
+    if (result.outcome === "not_found") return result;
+    if (result.outcome === "ok") this.logAction({ action: "resolved", alert: result.alert });
+    return { outcome: result.outcome, alert: alertJson(id, result.alert) };
+  }
+}
+
+export const scrapeAlertService = new ScrapeAlertService();
