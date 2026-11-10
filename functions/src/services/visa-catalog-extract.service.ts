@@ -7,6 +7,8 @@ import type {
 import { VisaCategory } from "../types";
 // Static ISO 4217 allow-list (no network) for fee component currencies.
 import { isIso4217 } from "./visa-catalog-fx";
+// Registry official-host matching for `applicationUrl` (issue #74).
+import { officialHttpsUrl } from "./visa-catalog-official-hosts";
 
 // ============================================
 // VISA CATALOG — EXTRACT SERVICE (Step 3)
@@ -45,8 +47,18 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *  - "2026-11-fee-length-v3" (#59): deterministic visa-length selection (the
  *    LONGEST standard outside-country option; surcharges use the same years)
  *    and `fee.years` must quote a duration, not the fee line.
+ *  - "2026-11-surcharge-total-v4" (#73): a surcharge the page prints as ONE
+ *    amount for a stated stay length ("£3,105 if you're staying for 2 years
+ *    and 9 months", UK Family IHS) is a total -> per:"application"; per-year x
+ *    years only when the page states a per-year rate, which wins when the page
+ *    also lists totals by length (Graduate) (the v3 model returned
+ *    3105 per year x 3, tripling the Family fee). Also: processing time is the
+ *    FULL standard range (min/max = shorter/longer of the outside- and
+ *    inside-country standard decision times).
+ * Before merging a bump (or a model change), run `npm run eval:visa-extract`
+ * and attach the result — see functions/eval/README.md.
  */
-export const EXTRACTOR_PROMPT_VERSION = "2026-11-fee-length-v3";
+export const EXTRACTOR_PROMPT_VERSION = "2026-11-surcharge-total-v4";
 
 // A duration phrase: a number (digits or a word) followed by year(s)/month(s),
 // e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
@@ -83,6 +95,10 @@ export interface ExtractContext {
   url: string;
   countryName: string;
   routeName: string; // the label from the source registry, e.g. "Skilled Worker visa"
+  // The country's registry `officialHosts` patterns (issue #74). When given
+  // (non-empty), `applicationUrl` is kept only on these hosts; absent/empty →
+  // only the http(s) check (countries without a registered host list).
+  officialHosts?: readonly string[];
 }
 
 // The provider-agnostic contract. Any model backend implements this.
@@ -93,8 +109,44 @@ export interface LlmExtractor {
 
 // ----- Validation (dependency-free) -----
 
+/** Options for `validateExtractedVisa`. */
+export interface ValidateOptions {
+  // Registry official host patterns (see visa-catalog-official-hosts.ts).
+  officialHosts?: readonly string[];
+}
+
+/**
+ * Keep `applicationUrl` only when it is safe to show users (issue #74):
+ *  - with an official host list: an https URL whose host matches it (exact, or
+ *    a strict subdomain of a `*.` pattern on a label boundary — so
+ *    "evilservice.gov.uk.attacker.com" and "www.gov.uk@evil.com" are dropped);
+ *  - without one (country not registered yet): any parseable http(s) URL, as
+ *    before; other schemes (javascript:, data:) are dropped.
+ * A dropped URL is a SOFT failure (field omitted, rest of the extraction kept):
+ * a bad link must not throw away a whole visa.
+ */
+export function sanitizeApplicationUrl(
+  raw: unknown,
+  officialHosts: readonly string[] | undefined
+): string | undefined {
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  const value = raw.trim();
+  if (officialHosts && officialHosts.length > 0) {
+    // Store the NORMALISED URL (`URL.toString()`: lower-cased host, resolved
+    // dot segments, encoded characters), not the model's raw string, so what
+    // is saved is exactly what was checked.
+    return officialHttpsUrl(value, officialHosts)?.toString();
+  }
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Narrow unknown → ExtractedVisa, or throw with the first problem found. */
-export function validateExtractedVisa(raw: unknown): ExtractedVisa {
+export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {}): ExtractedVisa {
   const errors: string[] = [];
   const o = (raw ?? {}) as Record<string, unknown>;
 
@@ -170,7 +222,8 @@ export function validateExtractedVisa(raw: unknown): ExtractedVisa {
 
   const maxExtensions =
     typeof o.maxExtensions === "number" ? o.maxExtensions : undefined;
-  const applicationUrl = typeof o.applicationUrl === "string" ? o.applicationUrl : undefined;
+  // Official-host check (issue #74): off-registry / unsafe URLs are dropped.
+  const applicationUrl = sanitizeApplicationUrl(o.applicationUrl, options.officialHosts);
   const applicationInstructions =
     typeof o.applicationInstructions === "string" ? o.applicationInstructions : undefined;
 
@@ -368,10 +421,33 @@ export function buildSystemPrompt(): string {
     "     page (e.g. 'Your visa can last for up to 5 years' -> 5).",
     "  4. Every per-year surcharge uses that SAME length as its `years` (a whole number of years; if the",
     "     length is not a whole number of years, use the number of years the page says the surcharge is",
-    "     charged for).",
+    "     charged for). This step applies ONLY to a surcharge the page prints as a per-year rate.",
     "  Example (UK Skilled Worker): options outside the UK are 'up to 3 years - £819' and 'more than 3 years",
     "  - £1,618'; the visa can last up to 5 years. Correct: application amount 1618, healthcare surcharge",
     "  1035 per year with years 5. WRONG: 819 with years 3.",
+    "",
+    // ---- #73: a surcharge printed as a TOTAL for a stay length ----
+    // GOV.UK prints some IHS amounts per year ("£1,035 per year") and some as
+    // one amount for the whole stay ("£3,105 if you're staying for 2 years
+    // and 9 months"). The second is already the total: multiplying it by the
+    // years overstated the UK Family fee 3x (v3 eval baseline, #60). Some
+    // pages print BOTH (Graduate: "£1,035 for each year" and "2 years - it
+    // will cost £2,070"): the per-year rate wins, so one rule covers both.
+    "SURCHARGE PER YEAR vs TOTAL (decide from the page's wording, per surcharge):",
+    "- per: 'year' with `years` ONLY when the page states a per-year rate for it ('£1,035 per year',",
+    "  '£1,035 for each year you'll be in the UK').",
+    "- If the page states a per-year rate for the surcharge, ALWAYS use per: 'year' with that rate, even",
+    "  when the page ALSO lists totals by length (e.g. '2 years - it will cost £2,070'). Do not report the",
+    "  listed total in that case.",
+    "- Only when the page states NO per-year rate for it and prints the surcharge as",
+    "  ONE amount for a stated stay length ('£3,105 if you're staying for 2 years and 9 months',",
+    "  '£5,175 if you're staying for 5 years'), that amount is ALREADY the TOTAL for the stay:",
+    "  report it as per: 'application' with NO `years`. Never multiply it or treat it as per year.",
+    "- When several such totals are listed by stay length, pick the one for the visa length chosen above",
+    "  (the main adult applicant's standard stay when applying from outside the country). No 'fee.years'",
+    "  citation is needed for a per: 'application' surcharge; cite the amount line in 'fee.surcharge'.",
+    "  Example (UK Family, partner): '£3,105 if you're staying for 2 years and 9 months' -> surcharge amount",
+    "  3105, per 'application'. WRONG: 3105 per year with years 3.",
     "",
     "- Each component is an object: { kind: 'application' | 'surcharge', label (the page's name for the fee),",
     "  amount (plain number, no symbols or thousands separators), currency (ISO 4217 code, e.g. 'GBP'),",
@@ -384,6 +460,23 @@ export function buildSystemPrompt(): string {
     "- citations['fee.years'] (2nd per-year component: 'fee.years.2') must quote the text that states the",
     "  visa LENGTH/DURATION you used for `years` (e.g. 'Your visa can last for up to 5 years'). It must",
     "  contain that duration, and must NOT simply repeat the fee sentence used for 'fee.application'.",
+    "",
+    // ---- #60/#73: processing time is the FULL standard range ----
+    // User decision on #60: min/max span both standard decision times the
+    // page states (outside- and inside-country), whichever is shorter first.
+    "PROCESSING TIME (processingDaysMin / processingDaysMax, in days; 1 week = 7 days):",
+    "- Report the FULL range of the STANDARD decision times the page states for applying from outside AND",
+    "  from inside the country: processingDaysMin = the SHORTER of the two, processingDaysMax = the LONGER.",
+    "  Example: '3 weeks, if you're outside the UK' and '8 weeks, if you're inside the UK' -> 21 and 56.",
+    "  Example: 'outside the UK ... within 12 weeks' and 'inside the UK ... within 8 weeks' -> 56 and 84",
+    "  (the inside time can be the shorter one).",
+    "- The inside-country time may be for extending or switching (e.g. a visitor extending their stay):",
+    "  still use its standard-service figure for the range.",
+    "- Use standard service only: ignore priority / faster / paid-for services and exceptional cases",
+    "  (e.g. 'about 12 months if you do not meet the requirements').",
+    "- If the page gives only ONE standard figure (e.g. 'within 8 weeks'), use it for both",
+    "  processingDaysMin and processingDaysMax.",
+    "- processingTime (string) describes the same range, e.g. '3-8 weeks'.",
   ].join("\n");
 }
 
@@ -462,7 +555,8 @@ export class DeepSeekExtractor implements LlmExtractor {
     }
 
     // Validate before handing off — never let an invalid shape past this line.
-    return validateExtractedVisa(parsed);
+    // `officialHosts` (registry) gates `applicationUrl` (issue #74).
+    return validateExtractedVisa(parsed, { officialHosts: context.officialHosts });
   }
 }
 

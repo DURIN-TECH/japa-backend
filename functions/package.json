@@ -26,8 +26,10 @@
     "backfill:agentids": "npm run build && node lib/scripts/backfill-application-agent-ids.js",
     "backfill:agentids:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-application-agent-ids.js",
     "test": "tsc -p tsconfig.test.json && node --import tsx --test test/*.test.ts",
-    "lint": "eslint --ext .ts src/",
-    "lint:fix": "eslint --ext .ts src/ --fix",
+    "eval:visa-extract": "node --env-file-if-exists=.env.local --import tsx eval/run.ts",
+    "eval:record": "node --import tsx eval/record.ts",
+    "lint": "eslint --ext .ts src/ eval/",
+    "lint:fix": "eslint --ext .ts src/ eval/ --fix",
     "clean": "rm -rf lib",
     "vendor:authz": "node vendor-authz.cjs"
   },

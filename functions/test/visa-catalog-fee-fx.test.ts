@@ -265,8 +265,8 @@ describe("extractor prompt — fee rule", () => {
     }
   });
 
-  test("prompt version is bumped (v3: deterministic fee length)", () => {
-    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-fee-length-v3");
+  test("prompt version is bumped (v4 #73: surcharge printed as a total, full-range processing)", () => {
+    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-surcharge-total-v4");
   });
 
   test("states the deterministic visa-length rule with the Skilled Worker example", () => {
@@ -281,6 +281,53 @@ describe("extractor prompt — fee rule", () => {
   test("fee.years must quote a duration, not the fee sentence", () => {
     assert.match(prompt, /citations\['fee\.years'\].*must quote the text that states the\s+visa LENGTH\/DURATION/s);
     assert.match(prompt, /must NOT simply repeat the fee sentence/);
+  });
+});
+
+// ----- Prompt: #73 surcharge total + full-range processing time -----
+
+describe("extractor prompt — surcharge printed as a total (#73)", () => {
+  const prompt = buildSystemPrompt();
+
+  test("a surcharge stated for a stay length is a total, per 'application'", () => {
+    // The rule itself, with the UK Family wording that triggered the bug.
+    assert.match(prompt, /SURCHARGE PER YEAR vs TOTAL/);
+    assert.match(prompt, /ONE amount for a stated stay length/);
+    assert.match(prompt, /ALREADY the TOTAL/);
+    assert.match(prompt, /per: 'application' with NO `years`/);
+    assert.match(prompt, /Never multiply it or treat it as per year/);
+    assert.match(prompt, /3105, per 'application'\. WRONG: 3105 per year with years 3/);
+  });
+
+  test("per-year x years only when the page states a per-year rate", () => {
+    assert.match(prompt, /per: 'year' with `years` ONLY when the page states a per-year rate/);
+    // The visa-length step 4 is scoped to per-year surcharges so it can no
+    // longer push a printed total into per-year x years.
+    assert.match(prompt, /applies ONLY to a surcharge the page prints as a per-year rate/);
+  });
+
+  test("a stated per-year rate wins over totals listed by length (Graduate-like page)", () => {
+    assert.match(prompt, /states a per-year rate for the surcharge, ALWAYS use per: 'year'/);
+    assert.match(prompt, /ALSO lists totals by length/);
+    assert.match(prompt, /Only when the page states NO per-year rate for it/);
+  });
+});
+
+describe("extractor prompt — full-range processing time (#60/#73)", () => {
+  const prompt = buildSystemPrompt();
+
+  test("min/max = shorter/longer of the outside- and inside-country standard times", () => {
+    assert.match(prompt, /PROCESSING TIME/);
+    assert.match(prompt, /processingDaysMin = the SHORTER of the two, processingDaysMax = the LONGER/);
+    // Global Talent-like example (3 weeks outside / 8 weeks inside -> 21-56)…
+    assert.match(prompt, /-> 21 and 56/);
+    // …and the Family-like case where the inside time is the shorter one.
+    assert.match(prompt, /-> 56 and 84/);
+  });
+
+  test("standard service only, one figure fills both ends", () => {
+    assert.match(prompt, /ignore priority \/ faster \/ paid-for services and exceptional cases/);
+    assert.match(prompt, /only ONE standard figure.*use it for both\s+processingDaysMin and processingDaysMax/s);
   });
 });
 
@@ -402,6 +449,61 @@ describe("computeFee", () => {
 });
 
 // ----- Official pegs -----
+
+// ----- #73: a surcharge printed as a total for the stay -----
+//
+// The fixed prompt returns the UK Family IHS ("£3,105 if you're staying for
+// 2 years and 9 months") as ONE per:"application" surcharge. These pin that the
+// validator accepts it with no `years` / fee.years citation and that computeFee
+// counts it ONCE (the v3 output, 3105 per year x 3, tripled the fee).
+// Figures are illustrative (GBP 0.8 per USD keeps the USD exact).
+
+const FAMILY_TOTAL_COMPONENTS: ExtractedFeeComponent[] = [
+  { kind: "application", label: "Cost if joining your partner", amount: 2000, currency: "GBP", per: "application" },
+  { kind: "surcharge", label: "Healthcare surcharge", amount: 3000, currency: "GBP", per: "application" },
+];
+
+describe("surcharge printed as a total (#73)", () => {
+  test("validator accepts a per:'application' surcharge with no years and no fee.years citation", () => {
+    const v = validateExtractedVisa(
+      rawVisa({
+        feeComponents: FAMILY_TOTAL_COMPONENTS,
+        citations: {
+          "fee.application": "Cost if joining your partner, parent or child £2,000",
+          "fee.surcharge": "£3,000 if you're staying for 2 years and 9 months",
+        },
+      })
+    );
+    assert.equal(v.feeComponents.length, 2);
+    assert.equal(v.feeComponents[1].per, "application");
+    assert.equal(v.feeComponents[1].years, undefined);
+    assert.equal(v.feeUnverifiedReasons, undefined);
+  });
+
+  test("a stray `years` on a per:'application' surcharge is ignored, not multiplied", () => {
+    const v = validateExtractedVisa(
+      rawVisa({
+        feeComponents: [
+          FAMILY_TOTAL_COMPONENTS[0],
+          { ...FAMILY_TOTAL_COMPONENTS[1], years: 3 },
+        ],
+        citations: {
+          "fee.application": "Cost if joining your partner, parent or child £2,000",
+          "fee.surcharge": "£3,000 if you're staying for 2 years and 9 months",
+        },
+      })
+    );
+    assert.equal(v.feeComponents[1].years, undefined);
+  });
+
+  test("computeFee counts the total once (application + surcharge, no x years)", () => {
+    const { baseCostUsd, feeMeta } = computeFee(FAMILY_TOTAL_COMPONENTS, fxDoc(), NOW);
+    // GBP 2000 + 3000 = GBP 5000; / 0.8 = USD 6250 (v3's x3 would be GBP 11000).
+    assert.deepEqual(feeMeta.components.map((c) => c.totalInCurrency), [2000, 3000]);
+    assert.deepEqual(feeMeta.totals, [{ currency: "GBP", amount: 5000 }]);
+    assert.equal(baseCostUsd, 6250);
+  });
+});
 
 describe("official USD pegs", () => {
   test("table holds AED 3.6725, SAR 3.75, QAR 3.64", () => {

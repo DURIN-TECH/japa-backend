@@ -1,0 +1,384 @@
+{
+  "extractorPromptVersion": "2026-11-fee-length-v3",
+  "model": "sample-hand-written",
+  "ranAt": "2026-11-09T00:00:00.000Z",
+  "gitSha": "sample",
+  "gitDirty": false,
+  "mode": "live",
+  "config": {
+    "weights": {
+      "name": 1,
+      "category": 1,
+      "processingDaysMin": 1,
+      "processingDaysMax": 1,
+      "validityPeriod": 1,
+      "isExtendable": 1,
+      "eligibility": 2,
+      "applicationUrlHost": 1,
+      "feeComponents": 3
+    },
+    "processingDaysTolerance": 0.2,
+    "processingDaysMinToleranceDays": 1
+  },
+  "thresholds": {
+    "overall": 0.85,
+    "route": 0.7
+  },
+  "routes": [
+    {
+      "route": "skilled-worker-visa",
+      "sourceUrl": "https://www.gov.uk/skilled-worker-visa",
+      "fixtureRecordedAt": "2026-11-09",
+      "extracted": {
+        "name": "Skilled Worker visa",
+        "code": "SKILLED_WORKER",
+        "description": "ILLUSTRATIVE sample output (hand-written for the replay test, not a real model response).",
+        "category": "work",
+        "processingTime": "3 weeks",
+        "processingDaysMin": 15,
+        "processingDaysMax": 21,
+        "feeComponents": [
+          {
+            "kind": "surcharge",
+            "label": "Immigration Health Surcharge",
+            "amount": 1035,
+            "currency": "GBP",
+            "per": "year",
+            "years": 5
+          },
+          {
+            "kind": "application",
+            "label": "Application fee (more than 3 years)",
+            "amount": 1618,
+            "currency": "GBP",
+            "per": "application"
+          }
+        ],
+        "validityPeriod": "up to 5 years",
+        "isExtendable": true,
+        "eligibilityCriteria": [
+          "Job offer from a Home Office approved employer (sponsor)",
+          "Certificate of sponsorship (CoS)",
+          "Job on the list of eligible occupations",
+          "Minimum salary",
+          "English language requirement"
+        ],
+        "applicationUrl": "https://www.gov.uk/skilled-worker-visa/apply-from-outside-the-uk",
+        "confidence": 0.9,
+        "citations": {
+          "fee.application": "more than 3 years - £1,618 per person",
+          "fee.surcharge": "this is usually £1,035 per year",
+          "fee.years": "Your visa can last for up to 5 years before you need to extend it."
+        }
+      },
+      "score": {
+        "route": "skilled-worker-visa",
+        "score": 0.9166666666666666,
+        "weightedSum": 11,
+        "weightTotal": 12,
+        "fields": [
+          {
+            "field": "name",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "Skilled Worker",
+            "actual": "Skilled Worker visa"
+          },
+          {
+            "field": "category",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "work",
+            "actual": "work"
+          },
+          {
+            "field": "processingDaysMin",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "range": [
+                0,
+                21
+              ]
+            },
+            "actual": 15
+          },
+          {
+            "field": "processingDaysMax",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 21
+            },
+            "actual": 21
+          },
+          {
+            "field": "validityPeriod",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "5 year"
+            ],
+            "actual": "up to 5 years"
+          },
+          {
+            "field": "isExtendable",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": true,
+            "actual": true
+          },
+          {
+            "field": "eligibility",
+            "type": "eligibility",
+            "weight": 2,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "work for a Home Office approved UK employer",
+              "certificate of sponsorship",
+              "eligible occupation",
+              "minimum salary",
+              "knowledge of English"
+            ],
+            "actual": [
+              "Job offer from a Home Office approved employer (sponsor)",
+              "Certificate of sponsorship (CoS)",
+              "Job on the list of eligible occupations",
+              "Minimum salary",
+              "English language requirement"
+            ]
+          },
+          {
+            "field": "applicationUrlHost",
+            "type": "url",
+            "weight": 1,
+            "score": 0,
+            "pass": false,
+            "expected": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk",
+            "actual": "https://www.gov.uk/skilled-worker-visa/apply-from-outside-the-uk",
+            "detail": "host \"www.gov.uk\""
+          },
+          {
+            "field": "feeComponents",
+            "type": "fee",
+            "weight": 3,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "application 1618 GBP per application",
+              "surcharge 1035 GBP per year x5"
+            ],
+            "actual": [
+              "surcharge 1035 GBP per year x5",
+              "application 1618 GBP per application"
+            ]
+          }
+        ],
+        "feeMismatch": false,
+        "notes": [],
+        "knownGaps": []
+      }
+    },
+    {
+      "route": "student-visa",
+      "sourceUrl": "https://www.gov.uk/student-visa",
+      "fixtureRecordedAt": "2026-11-09",
+      "extracted": {
+        "name": "Student visa",
+        "code": "STUDENT",
+        "description": "ILLUSTRATIVE sample output (hand-written for the replay test, not a real model response).",
+        "category": "student",
+        "processingTime": "3 weeks",
+        "processingDaysMin": 0,
+        "processingDaysMax": 15,
+        "feeComponents": [
+          {
+            "kind": "application",
+            "label": "Application fee (outside the UK)",
+            "amount": 558,
+            "currency": "GBP",
+            "per": "application"
+          }
+        ],
+        "feeUnverifiedReasons": [
+          "dropped surcharge \"Healthcare surcharge\": feeComponents[1].years must be an integer from 1 to 10 when per is \"year\""
+        ],
+        "validityPeriod": "Up to 5 years at degree level (2 years below degree level)",
+        "isExtendable": true,
+        "eligibilityCriteria": [
+          "Unconditional offer from a licensed student sponsor (CAS)",
+          "Enough money to support yourself",
+          "English language ability",
+          "Aged 16 or over"
+        ],
+        "applicationUrl": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/student_out_uk",
+        "confidence": 0.85,
+        "citations": {
+          "fee.application": "£558 to apply for a Student visa from outside the UK"
+        }
+      },
+      "score": {
+        "route": "student-visa",
+        "score": 0.8833333333333333,
+        "weightedSum": 10.6,
+        "weightTotal": 12,
+        "fields": [
+          {
+            "field": "name",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "Student",
+            "actual": "Student visa"
+          },
+          {
+            "field": "category",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "student",
+            "actual": "student"
+          },
+          {
+            "field": "processingDaysMin",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "range": [
+                0,
+                21
+              ]
+            },
+            "actual": 0
+          },
+          {
+            "field": "processingDaysMax",
+            "type": "numeric",
+            "weight": 1,
+            "score": 0,
+            "pass": false,
+            "expected": {
+              "value": 21
+            },
+            "actual": 15,
+            "detail": "outside 21 +/- 4.2"
+          },
+          {
+            "field": "validityPeriod",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "5 year"
+            ],
+            "actual": "Up to 5 years at degree level (2 years below degree level)"
+          },
+          {
+            "field": "isExtendable",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": true,
+            "actual": true
+          },
+          {
+            "field": "eligibility",
+            "type": "eligibility",
+            "weight": 2,
+            "score": 0.8,
+            "pass": false,
+            "expected": [
+              "offered a place by a licensed student sponsor (CAS)",
+              "enough money for course and living costs",
+              "knowledge of English",
+              "aged 16 or over",
+              "parental consent if 16 or 17"
+            ],
+            "actual": [
+              "Unconditional offer from a licensed student sponsor (CAS)",
+              "Enough money to support yourself",
+              "English language ability",
+              "Aged 16 or over"
+            ],
+            "detail": "missed themes: parental consent if 16 or 17"
+          },
+          {
+            "field": "applicationUrlHost",
+            "type": "url",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk",
+            "actual": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/student_out_uk"
+          },
+          {
+            "field": "feeComponents",
+            "type": "fee",
+            "weight": 3,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "application 558 GBP per application"
+            ],
+            "actual": [
+              "application 558 GBP per application"
+            ]
+          }
+        ],
+        "feeMismatch": false,
+        "notes": [
+          "known gap #69 (feeComponents): IHS is on a linked page",
+          "known gap #69: feeUnverifiedReasons [\"dropped surcharge \\\"Healthcare surcharge\\\": feeComponents[1].years must be an integer from 1 to 10 when per is \\\"year\\\"\"] — note only"
+        ],
+        "knownGaps": [
+          {
+            "field": "feeComponents",
+            "ref": "#69",
+            "note": "IHS is on a linked page"
+          }
+        ]
+      }
+    }
+  ],
+  "fieldTypeScores": {
+    "text": 1,
+    "exact": 1,
+    "numeric": 0.75,
+    "eligibility": 0.9,
+    "url": 0.5,
+    "fee": 1
+  },
+  "fieldScores": {
+    "name": 1,
+    "category": 1,
+    "processingDaysMin": 1,
+    "processingDaysMax": 0.5,
+    "validityPeriod": 1,
+    "isExtendable": 1,
+    "eligibility": 0.9,
+    "applicationUrlHost": 0.5,
+    "feeComponents": 1
+  },
+  "overall": 0.9,
+  "pass": true,
+  "failures": []
+}

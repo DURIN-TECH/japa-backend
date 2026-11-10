@@ -7,6 +7,8 @@ import type { FxFetcher } from "./visa-catalog-fx";
 // Fetching goes through the source adapter picked from `source.adapter`
 // (govuk-content-api for GB, generic-html — today's fetch service — otherwise).
 import { pickSourceAdapter, sourceMetaFromDocument } from "./visa-source-adapters";
+// Code fallback for a registry doc seeded before `officialHosts` existed (#74).
+import { resolveOfficialHosts } from "./visa-catalog-official-hosts";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -171,6 +173,10 @@ class VisaCatalogCrawlService {
             url: page.url,
             countryName: source.countryName,
             routeName: page.routeName,
+            // Registry official hosts gate `applicationUrl` (issue #74). The
+            // stored field wins only when it is a non-empty string array; a doc
+            // seeded before #74 (or a malformed field) falls back to code.
+            officialHosts: resolveOfficialHosts(source.officialHosts, source.countryCode),
           });
           pages[i] = { ...pages[i], lastExtractedAt: now };
 
