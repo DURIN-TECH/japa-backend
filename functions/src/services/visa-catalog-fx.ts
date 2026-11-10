@@ -451,6 +451,9 @@ export function planFeeReconvert(
   if (visa.source !== "scraped" || visa.reviewStatus !== "pending_review") return null;
   const fee = visa.scrapeMeta?.fee;
   if (!fee || !isFeeFxFlagged(fee)) return null;
+  // Issue #70: an admin-set cost is never re-converted (it carries no flags
+  // anyway; this guards a doc that somehow has both).
+  if (fee.manualCost) return null;
 
   // Strip the derived `totalInCurrency` back to the extracted component shape.
   const components: ExtractedFeeComponent[] = fee.components.map((c) => {

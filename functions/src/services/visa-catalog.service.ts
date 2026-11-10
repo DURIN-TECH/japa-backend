@@ -244,15 +244,27 @@ class VisaCatalogService {
         const current = fresh.data() as VisaType;
         // The doc may have moved on since the first read (approved, rejected,
         // already refreshed with this hash): re-plan and only write a refresh.
-        const again = planIngest(current, contentHash);
+        // Same prompt version as the outer plan (issue #71): a prompt-only
+        // re-extract (same page hash) must still plan "refresh" here, or the
+        // new extraction would be dropped as "unchanged".
+        const again = planIngest(current, contentHash, EXTRACTOR_PROMPT_VERSION);
         if (again === "unchanged") return { visaId, outcome: "unchanged" as IngestOutcome };
         if (again !== "refresh") return { visaId, outcome: "skipped" as IngestOutcome };
 
-        // ---- Manual cost (issue #70): the new extraction replaces it ----
-        // The changed content wins through the normal path (its conversion,
-        // or its flags). The replaced entry is kept on the new fee block as
-        // `replacedManualCost` and logged — never a silent overwrite.
-        const overwrite = planManualCostOverwrite(current.scrapeMeta?.fee, feeMeta, baseCostUsd, contentHash, now);
+        // ---- Manual cost (issue #70) ----
+        // CHANGED page (new content hash): the new extraction replaces the
+        // manual cost through the normal path (its conversion, or its flags);
+        // the replaced entry is kept as `replacedManualCost` and logged —
+        // never a silent overwrite. SAME page (a prompt-only re-extract,
+        // #71): the manual cost survives on top of the new extraction.
+        const overwrite = planManualCostOverwrite({
+          existingFee: current.scrapeMeta?.fee,
+          existingContentHash: current.scrapeMeta?.contentHash,
+          newFee: feeMeta,
+          newBaseCostUsd: baseCostUsd,
+          contentHash,
+          now,
+        });
         if (overwrite.replaced) {
           console.warn(
             `Manual USD cost ${overwrite.replaced.amountUsd} on ${countryCode}/${visaId} (set by ` +
@@ -261,14 +273,22 @@ class VisaCatalogService {
           );
         }
 
-        const deleteCost =
+        // The cost to write: a kept manual cost wins over whatever the
+        // extraction converted; otherwise the existing deletion rules.
+        const costUpdate: Record<string, unknown> = {};
+        if (overwrite.keptManualCostUsd !== undefined) {
+          costUpdate.baseCostUsd = overwrite.keptManualCostUsd;
+        } else if (
           overwrite.deleteCost ||
           (baseCostUsd === undefined &&
             !isFeeFxFlagged(feeMeta) &&
-            Boolean(feeMeta.noPublishedFee || feeMeta.feeUnverified));
+            Boolean(feeMeta.noPublishedFee || feeMeta.feeUnverified))
+        ) {
+          costUpdate.baseCostUsd = FieldValue.delete();
+        }
         tx.update(ref, {
           ...fields,
-          ...(deleteCost ? { baseCostUsd: FieldValue.delete() } : {}),
+          ...costUpdate,
           sourceUrl,
           scrapeMeta: { ...scrapeMeta, fee: overwrite.fee },
           updatedAt: now,
@@ -395,15 +415,28 @@ class VisaCatalogService {
         .where("reviewStatus", "==", "pending_review")
         .get();
       for (const doc of pending.docs) {
-        const plan = planFeeReconvert(doc.data() as VisaType, fx, now);
-        if (!plan) continue;
-        // Field-path update: replaces scrapeMeta.fee wholesale (clearing the
-        // flags) without touching scrapeMeta.contentHash or anything else.
-        const update: Record<string, unknown> = { "scrapeMeta.fee": plan.fee, updatedAt: now };
-        if (plan.baseCostUsd !== undefined) update.baseCostUsd = plan.baseCostUsd;
-        await doc.ref.update(update);
-        if (plan.baseCostUsd !== undefined) result.reconverted++;
-        else result.reflagged++;
+        // Cheap pre-filter on the query snapshot (most docs need nothing).
+        if (!planFeeReconvert(doc.data() as VisaType, fx, now)) continue;
+        // Issue #70: re-read + re-plan in a TRANSACTION before writing. The
+        // query snapshot can be minutes old by now (the loop spans every
+        // country); an admin may have set a manual cost on this doc since, and
+        // a plain update from the stale snapshot would replace that
+        // `scrapeMeta.fee` (and `baseCostUsd`) wholesale — a silent overwrite.
+        // planFeeReconvert itself refuses any fee with a `manualCost`.
+        const outcome = await this.runTransaction(async (tx) => {
+          const fresh = await tx.get(doc.ref);
+          if (!fresh.exists) return "none" as const;
+          const plan = planFeeReconvert(fresh.data() as VisaType, fx, now);
+          if (!plan) return "none" as const;
+          // Field-path update: replaces scrapeMeta.fee wholesale (clearing the
+          // flags) without touching scrapeMeta.contentHash or anything else.
+          const update: Record<string, unknown> = { "scrapeMeta.fee": plan.fee, updatedAt: now };
+          if (plan.baseCostUsd !== undefined) update.baseCostUsd = plan.baseCostUsd;
+          tx.update(doc.ref, update);
+          return plan.baseCostUsd !== undefined ? ("reconverted" as const) : ("reflagged" as const);
+        });
+        if (outcome === "reconverted") result.reconverted++;
+        else if (outcome === "reflagged") result.reflagged++;
       }
     }
     // Flagged open proposals (issue #61), so they are not stuck forever.

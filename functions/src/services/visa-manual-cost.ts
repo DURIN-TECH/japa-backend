@@ -11,6 +11,7 @@ import {
   VisaFeeNotConvertibleError,
   assertVisaApprovable,
   isIso4217,
+  storedFeeUnverifiedReasons,
 } from "./visa-catalog-fx";
 
 // ============================================
@@ -32,10 +33,12 @@ import {
 // `scrapeMeta.fee.totalUsd = amountUsd`, `fxSource: "manual"`, flags cleared.
 // The guard itself is unchanged.
 //
-// Overwrite rule: a later scrape with CHANGED content replaces the manual
-// cost through the normal ingest path (a fresh conversion, or the flags).
-// planManualCostOverwrite (here) decides that write and records the replaced
-// entry in `scrapeMeta.fee.replacedManualCost`, so it is never silent.
+// Overwrite rule: a later scrape with CHANGED content (a new content hash)
+// replaces the manual cost through the normal ingest path (a fresh
+// conversion, or the flags). planManualCostOverwrite (here) decides that
+// write and records the replaced entry in `scrapeMeta.fee.replacedManualCost`,
+// so it is never silent. A re-extract of the SAME page text (prompt-only,
+// issue #71) keeps the manual cost: the admin's confirmation still holds.
 //
 // Firebase-free apart from the Timestamp class, so it is unit-testable
 // without an emulator.
@@ -51,9 +54,10 @@ export const MAX_MANUAL_COST_USD = MAX_FEE_COMPONENT_USD;
 /** Longest reason accepted (characters, after trimming). */
 export const MANUAL_COST_REASON_MAX_LENGTH = 500;
 
-/** Shortest reason accepted (characters, after trimming): enough to rule out
- *  "x" / "ok" while allowing a terse "CBC rate". */
-export const MANUAL_COST_REASON_MIN_LENGTH = 3;
+/** Shortest reason accepted (characters, after trimming). Same rule as a
+ *  rejection reason in the portal: enough to force a real explanation
+ *  ("CBC rate 0.031", "Free per embassy page"). */
+export const MANUAL_COST_REASON_MIN_LENGTH = 10;
 
 /** Two-letter country code (the doc ids under `countries/` are upper-case). */
 const COUNTRY_CODE_RE = /^[A-Za-z]{2}$/;
@@ -62,7 +66,7 @@ const COUNTRY_CODE_RE = /^[A-Za-z]{2}$/;
 
 /** Codes the manual-cost endpoint can fail with (besides 401 / 403 / 500). */
 export type ManualCostErrorCode =
-  | "VALIDATION_ERROR" // 400: bad body
+  | "VALIDATION_ERROR" // 400: bad body (incl. rates not matching the fee's currencies)
   | "NOT_FOUND" // 404: no such visa
   | "NOT_PENDING_SCRAPED" // 409: not a pending_review scraped visa
   | "FEE_ALREADY_CONVERTED" // 409: the scraper's own cost is usable
@@ -91,14 +95,26 @@ function invalid(message: string): ManualCostError {
 
 // ----- Input -----
 
+/** One exchange rate the admin used: USD per ONE unit of `currency`. */
+export interface ManualCostRate {
+  currency: string; // ISO 4217, upper-cased, never "USD"
+  usdPerUnit: number; // finite, > 0
+}
+
 /** The validated request body of PUT /admin/visas/:id/manual-cost. */
 export interface ManualCostInput {
   countryCode: string; // upper-cased
-  amountUsd: number; // finite, > 0, <= MAX_MANUAL_COST_USD, rounds to >= 1
-  reason: string; // trimmed
-  rate?: { currency: string; usdPerUnit: number }; // currency upper-cased
-  // Optional optimistic check: the `scrapeMeta.contentHash` the admin saw.
+  amountUsd: number; // finite, 0 <= x <= MAX_MANUAL_COST_USD (0 = free visa)
+  reason: string; // trimmed, MANUAL_COST_REASON_MIN..MAX_LENGTH chars
+  // One per distinct non-USD currency among the fee components (checked
+  // against the stored fee in planManualCost, since only it knows them).
+  // Shape-validated here: unique currencies.
+  rates: ManualCostRate[];
+  // Optional optimistic checks against what the admin reviewed: the
+  // `scrapeMeta.contentHash`, and `scrapeMeta.extractedAt` as epoch millis
+  // (parsed from the ISO string in the body). Either mismatch → STALE_VISA.
   expectedContentHash?: string;
+  expectedExtractedAtMs?: number;
 }
 
 /**
@@ -126,14 +142,10 @@ export function parseManualCostInput(body: unknown): ManualCostInput {
   if (typeof amountUsd !== "number" || !Number.isFinite(amountUsd)) {
     throw invalid("amountUsd must be a number");
   }
-  if (amountUsd <= 0) {
-    throw invalid("amountUsd must be greater than 0");
-  }
-  // baseCostUsd is whole USD; a value that rounds to 0 would publish a free
-  // visa by accident (a genuinely free visa converts on its own: a 0 fee
-  // needs no exchange rate).
-  if (Math.round(amountUsd) < 1) {
-    throw invalid("amountUsd must be at least 1 USD once rounded to whole dollars");
+  // 0 is allowed: an admin may confirm a visa is free (e.g. a page that
+  // publishes no fee). The portal warns before sending 0.
+  if (amountUsd < 0) {
+    throw invalid("amountUsd must be 0 or more");
   }
   if (amountUsd > MAX_MANUAL_COST_USD) {
     throw invalid(`amountUsd must be at most ${MAX_MANUAL_COST_USD} USD`);
@@ -151,23 +163,36 @@ export function parseManualCostInput(body: unknown): ManualCostInput {
     throw invalid(`reason must be at most ${MANUAL_COST_REASON_MAX_LENGTH} characters`);
   }
 
-  const input: ManualCostInput = { countryCode, amountUsd, reason };
-
-  // ---- rate: optional { currency, usdPerUnit } ----
-  if (b.rate !== undefined && b.rate !== null) {
-    if (typeof b.rate !== "object" || Array.isArray(b.rate)) {
-      throw invalid("rate must be an object { currency, usdPerUnit }");
+  // ---- rates: required array of { currency, usdPerUnit } ----
+  // The old single `rate` field is refused rather than silently ignored.
+  if (b.rate !== undefined) {
+    throw invalid("rate is not accepted; send rates: [{ currency, usdPerUnit }]");
+  }
+  if (!Array.isArray(b.rates)) {
+    throw invalid("rates is required: an array of { currency, usdPerUnit } (empty when the fee has no non-USD currency)");
+  }
+  const rates: ManualCostRate[] = [];
+  const seen = new Set<string>();
+  for (const [n, raw] of b.rates.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw invalid(`rates[${n}] must be an object { currency, usdPerUnit }`);
     }
-    const r = b.rate as Record<string, unknown>;
+    const r = raw as Record<string, unknown>;
     const currency = typeof r.currency === "string" ? r.currency.trim().toUpperCase() : "";
     if (!isIso4217(currency) || currency === "USD") {
-      throw invalid("rate.currency must be an ISO 4217 currency code other than USD");
+      throw invalid(`rates[${n}].currency must be an ISO 4217 currency code other than USD`);
     }
     if (typeof r.usdPerUnit !== "number" || !Number.isFinite(r.usdPerUnit) || r.usdPerUnit <= 0) {
-      throw invalid("rate.usdPerUnit must be a number greater than 0 (USD per one unit of rate.currency)");
+      throw invalid(`rates[${n}].usdPerUnit must be a number greater than 0 (USD per one unit of ${currency})`);
     }
-    input.rate = { currency, usdPerUnit: r.usdPerUnit };
+    if (seen.has(currency)) {
+      throw invalid(`rates has more than one entry for ${currency}`);
+    }
+    seen.add(currency);
+    rates.push({ currency, usdPerUnit: r.usdPerUnit });
   }
+
+  const input: ManualCostInput = { countryCode, amountUsd, reason, rates };
 
   // ---- expectedContentHash: optional string ----
   if (b.expectedContentHash !== undefined && b.expectedContentHash !== null) {
@@ -175,6 +200,15 @@ export function parseManualCostInput(body: unknown): ManualCostInput {
       throw invalid("expectedContentHash must be a non-empty string");
     }
     input.expectedContentHash = b.expectedContentHash;
+  }
+
+  // ---- expectedExtractedAt: optional ISO date-time string ----
+  if (b.expectedExtractedAt !== undefined && b.expectedExtractedAt !== null) {
+    const ms = typeof b.expectedExtractedAt === "string" ? Date.parse(b.expectedExtractedAt) : NaN;
+    if (!Number.isFinite(ms)) {
+      throw invalid("expectedExtractedAt must be an ISO 8601 date-time string");
+    }
+    input.expectedExtractedAtMs = ms;
   }
 
   return input;
@@ -225,9 +259,16 @@ export function planManualCost(
     );
   }
 
-  // ---- Optimistic check against the extraction the admin reviewed ----
+  // ---- Optimistic checks against the extraction the admin reviewed ----
+  // The content hash catches a changed page; extractedAt also catches a
+  // prompt-only re-extract (#71: same hash, possibly a different fee).
   const contentHash = visa.scrapeMeta?.contentHash ?? "";
-  if (input.expectedContentHash !== undefined && input.expectedContentHash !== contentHash) {
+  const extractedAt = visa.scrapeMeta?.extractedAt;
+  const extractedAtMs = extractedAt instanceof Timestamp ? extractedAt.toMillis() : undefined;
+  const hashMoved = input.expectedContentHash !== undefined && input.expectedContentHash !== contentHash;
+  const extractionMoved =
+    input.expectedExtractedAtMs !== undefined && input.expectedExtractedAtMs !== extractedAtMs;
+  if (hashMoved || extractionMoved) {
     throw new ManualCostError(
       "STALE_VISA",
       "This visa was re-scraped since you opened it. Reload and review it again.",
@@ -247,6 +288,24 @@ export function planManualCost(
     );
   }
 
+  // ---- Rates: exactly one per distinct non-USD fee currency ----
+  // (Checked after the 409 state checks: a visa that can't take a manual
+  // cost at all says so, rather than complaining about the rates.)
+  // Every currency the admin had to convert must say which rate they used
+  // (no extras, no gaps), so the audit trail can always be re-checked.
+  const needed = feeCurrencies(oldFee);
+  const given = input.rates.map((r) => r.currency);
+  const missing = needed.filter((c) => !given.includes(c));
+  const extra = given.filter((c) => !needed.includes(c));
+  if (missing.length > 0 || extra.length > 0) {
+    const parts: string[] = [];
+    if (missing.length > 0) parts.push(`missing a rate for ${missing.join(", ")}`);
+    if (extra.length > 0) parts.push(`the fee has no ${extra.join(", ")} component`);
+    throw invalid(
+      `rates must have exactly one entry per non-USD fee currency (${needed.join(", ") || "none"}): ${parts.join("; ")}`
+    );
+  }
+
   // ---- What the scraper said, for the audit trail ----
   // Re-editing a manual cost keeps the ORIGINAL scraper state (the old
   // manual entry's `previous`), and records the entry it supersedes.
@@ -257,12 +316,12 @@ export function planManualCost(
   const manualCost: VisaManualCostMeta = {
     amountUsd: input.amountUsd,
     reason: input.reason,
+    rates: input.rates.map((r) => ({ ...r })),
     setBy,
     setAt: now,
     contentHash,
     previous,
   };
-  if (input.rate) manualCost.rate = { ...input.rate };
   if (oldFee?.manualCost) {
     // One level only: the superseded entry without its own history.
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -287,6 +346,19 @@ export function planManualCost(
   return { baseCostUsd: Math.round(input.amountUsd), fee };
 }
 
+/**
+ * The distinct non-USD currencies among a fee's components, in source order
+ * (components with no currency — a zero part — are skipped). [] for no fee
+ * block, no components, or a USD-only fee.
+ */
+export function feeCurrencies(fee: Pick<VisaFeeMeta, "components"> | undefined): string[] {
+  const out: string[] = [];
+  for (const c of fee?.components ?? []) {
+    if (c.currency && c.currency !== "USD" && !out.includes(c.currency)) out.push(c.currency);
+  }
+  return out;
+}
+
 /** True when the approval guard would accept `visa` as it stands. */
 function isApprovable(visa: Pick<VisaType, "source" | "scrapeMeta" | "baseCostUsd">): boolean {
   try {
@@ -304,7 +376,9 @@ function scraperState(fee: VisaFeeMeta | undefined, baseCostUsd: number | undefi
   if (fee?.fxMissing) p.fxMissing = true;
   if (fee?.fxStale) p.fxStale = true;
   if (fee?.feeUnverified) p.feeUnverified = true;
-  if (fee?.feeUnverifiedReason) p.feeUnverifiedReason = fee.feeUnverifiedReason;
+  // Both the #71 array and the legacy joined string, as an array.
+  const reasons = storedFeeUnverifiedReasons(fee);
+  if (reasons.length > 0) p.feeUnverifiedReasons = reasons;
   if (fee?.noPublishedFee) p.noPublishedFee = true;
   if (typeof fee?.totalUsd === "number") p.totalUsd = fee.totalUsd;
   if (fee?.fxSource) p.fxSource = fee.fxSource;
@@ -316,49 +390,82 @@ function scraperState(fee: VisaFeeMeta | undefined, baseCostUsd: number | undefi
 
 /** What ingest's pending-refresh write must do about a manual cost. */
 export interface ManualCostOverwritePlan {
-  // The fee block to write (the new extraction's, plus the audit entry).
+  // The fee block to write (the new extraction's, plus the audit entry — or,
+  // when the manual cost is kept, the new components with the manual total).
   fee: VisaFeeMeta;
   // True: delete `baseCostUsd` — the old value was the manual one and the new
   // extraction supports no cost (flags), so it must not stay behind.
   deleteCost: boolean;
+  // Set when the manual cost is KEPT (same page text): write this as
+  // `baseCostUsd`, overriding whatever the extraction converted.
+  keptManualCostUsd?: number;
   // The manual entry this refresh replaced (for logging); absent when the
-  // existing fee had no manual cost.
+  // existing fee had no manual cost, or it was kept.
   replaced?: VisaReplacedManualCostMeta;
 }
 
 /**
- * Called by ingest's pending-refresh branch (the extraction's content hash
- * changed). The new extraction ALWAYS wins — that is the "normal path":
+ * Called by ingest's pending-refresh branch, inside its transaction.
+ *
+ * SAME content hash as the stored extraction (a prompt-only re-extract,
+ * issue #71) and the stored fee has a manual cost → KEEP it: the page text
+ * the admin confirmed is unchanged. The new block takes the new extraction's
+ * `components` / `totals` (they are what the source publishes) and the
+ * manual `totalUsd` / `fxSource` / `fxDate` / `manualCost`, with no flags;
+ * `keptManualCostUsd` tells ingest to write `round(amountUsd)`.
+ *
+ * CHANGED content hash → the new extraction wins (the "normal path"):
  *  - it converted → its `baseCostUsd` replaces the manual one;
  *  - it is flagged (fxMissing / fxStale / feeUnverified / noPublishedFee) →
  *    the manual `baseCostUsd` is deleted, so the flags block approval until
  *    an admin sets a cost again.
  * Never silently: the replaced manual entry is stored on the new fee block as
- * `replacedManualCost` (+ when and by which content hash). An existing
- * `replacedManualCost` (from an earlier overwrite) is carried forward when
- * nothing new was replaced.
+ * `replacedManualCost` (+ when and by which content hash).
  *
- * @param existingFee the stored `scrapeMeta.fee` (may be absent)
- * @param newFee computeFee().feeMeta for the new extraction (not mutated)
- * @param newBaseCostUsd computeFee().baseCostUsd (undefined = no usable cost)
- * @param contentHash the new extraction's content hash
+ * An existing `replacedManualCost` (from an earlier overwrite) is carried
+ * forward when nothing new was replaced.
+ *
+ * @param p.existingFee the stored `scrapeMeta.fee` (may be absent)
+ * @param p.existingContentHash the stored `scrapeMeta.contentHash`
+ * @param p.newFee computeFee().feeMeta for the new extraction (not mutated)
+ * @param p.newBaseCostUsd computeFee().baseCostUsd (undefined = no usable cost)
+ * @param p.contentHash the new extraction's content hash
  */
-export function planManualCostOverwrite(
-  existingFee: VisaFeeMeta | undefined,
-  newFee: VisaFeeMeta,
-  newBaseCostUsd: number | undefined,
-  contentHash: string,
-  now: Timestamp
-): ManualCostOverwritePlan {
+export function planManualCostOverwrite(p: {
+  existingFee: VisaFeeMeta | undefined;
+  existingContentHash: string | undefined;
+  newFee: VisaFeeMeta;
+  newBaseCostUsd: number | undefined;
+  contentHash: string;
+  now: Timestamp;
+}): ManualCostOverwritePlan {
+  const { existingFee, newFee } = p;
+  const manual = existingFee?.manualCost;
+
+  // ---- Same page text: the manual cost survives ----
+  if (manual && p.existingContentHash === p.contentHash) {
+    const fee: VisaFeeMeta = {
+      components: newFee.components,
+      totals: newFee.totals,
+      totalUsd: manual.amountUsd,
+      fxSource: FX_SOURCE_MANUAL,
+      fxDate: existingFee?.fxDate ?? p.now.toDate().toISOString().slice(0, 10),
+      manualCost: manual,
+    };
+    if (existingFee?.replacedManualCost) fee.replacedManualCost = existingFee.replacedManualCost;
+    return { fee, deleteCost: false, keptManualCostUsd: Math.round(manual.amountUsd) };
+  }
+
+  // ---- Changed page: the new extraction replaces it, recorded ----
   const fee: VisaFeeMeta = { ...newFee };
-  if (existingFee?.manualCost) {
+  if (manual) {
     const replaced: VisaReplacedManualCostMeta = {
-      ...existingFee.manualCost,
-      replacedAt: now,
-      replacedByContentHash: contentHash,
+      ...manual,
+      replacedAt: p.now,
+      replacedByContentHash: p.contentHash,
     };
     fee.replacedManualCost = replaced;
-    return { fee, deleteCost: newBaseCostUsd === undefined, replaced };
+    return { fee, deleteCost: p.newBaseCostUsd === undefined, replaced };
   }
   if (existingFee?.replacedManualCost) fee.replacedManualCost = existingFee.replacedManualCost;
   return { fee, deleteCost: false };

@@ -290,16 +290,19 @@ export interface VisaFeeMeta {
 // Stored at `scrapeMeta.fee.manualCost`. Optional fields are ABSENT (never
 // `undefined`) so the object is always safe to write to Firestore.
 export interface VisaManualCostMeta {
-  // The USD amount exactly as entered (may have cents). The visa's
+  // The USD amount exactly as entered (may have cents; 0 = a confirmed free
+  // visa). The visa's
   // `baseCostUsd` is Math.round(amountUsd), and `fee.totalUsd` = amountUsd,
   // so the approval guard (baseCostUsd === round(totalUsd)) accepts it.
   amountUsd: number;
   // Why the admin set it, e.g. "CBC rate 1 TWD = 0.031 USD on 2026-11-10".
   // Required (trimmed, non-empty).
   reason: string;
-  // Optional exchange rate the admin used: USD per ONE unit of `currency`.
-  // Recorded for audit only — it is not re-applied to the components.
-  rate?: { currency: string; usdPerUnit: number };
+  // The exchange rates the admin used: USD per ONE unit of `currency`, one
+  // entry per distinct non-USD currency among the fee components (empty for
+  // a USD-only fee or no published fee). Recorded for audit only — not
+  // re-applied to the components.
+  rates: { currency: string; usdPerUnit: number }[];
   setBy: string; // admin uid
   setAt: Timestamp;
   // `scrapeMeta.contentHash` of the extraction the cost was set against.
@@ -310,7 +313,8 @@ export interface VisaManualCostMeta {
     fxMissing?: boolean;
     fxStale?: boolean;
     feeUnverified?: boolean;
-    feeUnverifiedReason?: string;
+    // Read with storedFeeUnverifiedReasons() (array #71 form or legacy string).
+    feeUnverifiedReasons?: string[];
     noPublishedFee?: boolean;
     totalUsd?: number;
     fxSource?: string;

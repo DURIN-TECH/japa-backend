@@ -375,9 +375,11 @@ export class VisaController {
    * Set the USD cost of a PENDING scraped visa by hand, when the scraper
    * could not convert its fee (no rate for the currency, unverified fee, no
    * published fee). Body:
-   *   { countryCode: "TW", amountUsd: 52, reason: "...",
-   *     rate?: { currency: "TWD", usdPerUnit: 0.031 },
-   *     expectedContentHash?: "<scrapeMeta.contentHash the admin saw>" }
+   *   { countryCode: "TW", amountUsd: 52, reason: "<10-500 chars>",
+   *     rates: [{ currency: "TWD", usdPerUnit: 0.031 }],   // one per non-USD fee currency
+   *     expectedContentHash?: "<scrapeMeta.contentHash the admin saw>",
+   *     expectedExtractedAt?: "<scrapeMeta.extractedAt as ISO 8601>" }
+   * amountUsd: finite, 0 <= x <= 100000 (0 = confirmed free visa).
    * 200 → the updated visa. 400 VALIDATION_ERROR, 403 FORBIDDEN, 404
    * NOT_FOUND, 409 NOT_PENDING_SCRAPED / FEE_ALREADY_CONVERTED / STALE_VISA.
    *

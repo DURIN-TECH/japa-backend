@@ -9,8 +9,9 @@
 //
 // Covers:
 //  - parseManualCostInput: valid body (normalised), and every 400 rule
-//    (amount type / finite / > 0 / rounds to >= 1 / max, reason required +
-//    length, rate shape, expectedContentHash)
+//    (amount type / finite / >= 0 / max, reason required + 10-500 chars,
+//    rates array shape + duplicates, old `rate` refused, expectedContentHash,
+//    expectedExtractedAt)
 //  - planManualCost: TWD fxMissing / feeUnverified / noPublishedFee / pre-#59
 //    docs → fxSource "manual", flags cleared (kept in `previous`), components
 //    kept, baseCostUsd = round(amount), and the approval guard accepts it;
@@ -24,7 +25,10 @@
 //  - ingest after a manual cost: changed content that converts replaces it
 //    (recorded in replacedManualCost + logged); changed content that is
 //    flagged deletes the cost (approval blocked again); same content hash →
-//    untouched; an FX re-convert keeps the replacedManualCost audit entry
+//    untouched; a prompt-only re-extract (same hash, older prompt version,
+//    #71) KEEPS the manual cost; an FX re-convert keeps the
+//    replacedManualCost audit entry, never touches a manual fee, and re-reads
+//    each doc in a transaction (a manual cost set mid-pass survives)
 
 import { test, describe, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -39,6 +43,7 @@ import {
   VisaFeeNotConvertibleError,
   assertVisaApprovable,
   computeFee,
+  planFeeReconvert,
 } from "../src/services/visa-catalog-fx";
 import {
   MAX_MANUAL_COST_USD,
@@ -48,7 +53,7 @@ import {
   planManualCost,
   planManualCostOverwrite,
 } from "../src/services/visa-manual-cost";
-import { Data, clone, installFakes, resetStore, store, writes } from "./helpers/fake-firestore";
+import { Data, clone, fakeRunTransaction, installFakes, resetStore, store, writes } from "./helpers/fake-firestore";
 
 // Admin init needs a project id (utils/firebase derives the bucket from it).
 process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT || "demo-unit-test";
@@ -117,7 +122,13 @@ function pendingVisa(components: ExtractedFeeComponent[], over: Data = {}, reaso
 
 /** A valid parsed input (override any field). */
 function input(over: Partial<ManualCostInput> = {}): ManualCostInput {
-  return { countryCode: CC, amountUsd: 51.6, reason: "CBC rate 1 TWD = 0.03225 USD", ...over };
+  return {
+    countryCode: CC,
+    amountUsd: 51.6,
+    reason: "CBC rate 1 TWD = 0.03225 USD",
+    rates: [{ currency: "TWD", usdPerUnit: 0.03225 }],
+    ...over,
+  };
 }
 
 /** Assert `fn` throws a ManualCostError with `code` (and optional status). */
@@ -135,55 +146,72 @@ function throwsCode(fn: () => unknown, code: string, status?: number): void {
 // ============================================
 
 describe("parseManualCostInput", () => {
-  const ok = { countryCode: "tw", amountUsd: 51.6, reason: "  CBC rate  " };
+  const ok = { countryCode: "tw", amountUsd: 51.6, reason: "  CBC rate 0.03225  ", rates: [] as unknown[] };
 
   test("valid body → normalised (country upper-cased, reason trimmed)", () => {
-    assert.deepEqual(parseManualCostInput(ok), { countryCode: "TW", amountUsd: 51.6, reason: "CBC rate" });
+    assert.deepEqual(parseManualCostInput(ok), { countryCode: "TW", amountUsd: 51.6, reason: "CBC rate 0.03225", rates: [] });
   });
 
-  test("optional rate (currency upper-cased) and expectedContentHash are kept", () => {
-    const got = parseManualCostInput({ ...ok, rate: { currency: "twd", usdPerUnit: 0.031 }, expectedContentHash: "h1" });
-    assert.deepEqual(got.rate, { currency: "TWD", usdPerUnit: 0.031 });
+  test("rates (currency upper-cased), expectedContentHash and expectedExtractedAt are kept", () => {
+    const got = parseManualCostInput({
+      ...ok,
+      rates: [{ currency: "twd", usdPerUnit: 0.031 }, { currency: "EUR", usdPerUnit: 1.1 }],
+      expectedContentHash: "h1",
+      expectedExtractedAt: "2026-11-10T12:00:00.000Z",
+    });
+    assert.deepEqual(got.rates, [{ currency: "TWD", usdPerUnit: 0.031 }, { currency: "EUR", usdPerUnit: 1.1 }]);
     assert.equal(got.expectedContentHash, "h1");
+    assert.equal(got.expectedExtractedAtMs, Date.UTC(2026, 10, 10, 12));
   });
 
-  test("rate / expectedContentHash null are treated as absent", () => {
-    const got = parseManualCostInput({ ...ok, rate: null, expectedContentHash: null });
-    assert.equal("rate" in got, false);
+  test("expectedContentHash / expectedExtractedAt null are treated as absent", () => {
+    const got = parseManualCostInput({ ...ok, expectedContentHash: null, expectedExtractedAt: null });
     assert.equal("expectedContentHash" in got, false);
+    assert.equal("expectedExtractedAtMs" in got, false);
+  });
+
+  test("amountUsd 0 (a confirmed free visa) and the max itself are accepted", () => {
+    assert.equal(parseManualCostInput({ ...ok, amountUsd: 0 }).amountUsd, 0);
+    assert.equal(parseManualCostInput({ ...ok, amountUsd: 0.4 }).amountUsd, 0.4);
+    assert.equal(parseManualCostInput({ ...ok, amountUsd: MAX_MANUAL_COST_USD }).amountUsd, MAX_MANUAL_COST_USD);
+  });
+
+  test("reason of exactly 10 and 500 characters is accepted", () => {
+    assert.equal(parseManualCostInput({ ...ok, reason: "x".repeat(10) }).reason.length, 10);
+    assert.equal(parseManualCostInput({ ...ok, reason: "x".repeat(500) }).reason.length, 500);
   });
 
   const bad: [string, unknown][] = [
     ["not an object", "x"],
     ["array body", []],
-    ["missing countryCode", { amountUsd: 10, reason: "abc" }],
+    ["missing countryCode", { amountUsd: 10, reason: "a good reason", rates: [] }],
     ["3-letter countryCode", { ...ok, countryCode: "TWN" }],
     ["amountUsd as a string", { ...ok, amountUsd: "51.6" }],
-    ["amountUsd missing", { countryCode: "TW", reason: "abc" }],
+    ["amountUsd missing", { countryCode: "TW", reason: "a good reason", rates: [] }],
     ["amountUsd NaN", { ...ok, amountUsd: NaN }],
     ["amountUsd Infinity", { ...ok, amountUsd: Infinity }],
-    ["amountUsd 0", { ...ok, amountUsd: 0 }],
     ["amountUsd negative", { ...ok, amountUsd: -5 }],
-    ["amountUsd rounds to 0", { ...ok, amountUsd: 0.4 }],
     ["amountUsd over the max", { ...ok, amountUsd: MAX_MANUAL_COST_USD + 1 }],
-    ["reason missing", { countryCode: "TW", amountUsd: 10 }],
+    ["reason missing", { countryCode: "TW", amountUsd: 10, rates: [] }],
     ["reason blank", { ...ok, reason: "   " }],
-    ["reason too short", { ...ok, reason: "ok" }],
+    ["reason 9 characters", { ...ok, reason: "x".repeat(9) }],
     ["reason too long", { ...ok, reason: "x".repeat(501) }],
-    ["rate not an object", { ...ok, rate: 0.03 }],
-    ["rate currency not ISO 4217", { ...ok, rate: { currency: "XYZ", usdPerUnit: 0.03 } }],
-    ["rate currency USD", { ...ok, rate: { currency: "USD", usdPerUnit: 1 } }],
-    ["rate usdPerUnit 0", { ...ok, rate: { currency: "TWD", usdPerUnit: 0 } }],
-    ["rate usdPerUnit string", { ...ok, rate: { currency: "TWD", usdPerUnit: "0.03" } }],
+    ["rates missing", { countryCode: "TW", amountUsd: 10, reason: "a good reason" }],
+    ["rates not an array", { ...ok, rates: { currency: "TWD", usdPerUnit: 0.03 } }],
+    ["rates entry not an object", { ...ok, rates: [0.03] }],
+    ["rates currency not ISO 4217", { ...ok, rates: [{ currency: "XYZ", usdPerUnit: 0.03 }] }],
+    ["rates currency USD", { ...ok, rates: [{ currency: "USD", usdPerUnit: 1 }] }],
+    ["rates usdPerUnit 0", { ...ok, rates: [{ currency: "TWD", usdPerUnit: 0 }] }],
+    ["rates usdPerUnit string", { ...ok, rates: [{ currency: "TWD", usdPerUnit: "0.03" }] }],
+    ["rates duplicate currency", { ...ok, rates: [{ currency: "TWD", usdPerUnit: 0.03 }, { currency: "twd", usdPerUnit: 0.031 }] }],
+    ["old single rate field", { ...ok, rate: { currency: "TWD", usdPerUnit: 0.03 } }],
     ["expectedContentHash empty", { ...ok, expectedContentHash: "" }],
+    ["expectedExtractedAt not a date", { ...ok, expectedExtractedAt: "yesterday" }],
+    ["expectedExtractedAt a number", { ...ok, expectedExtractedAt: 1700000000000 }],
   ];
   for (const [name, body] of bad) {
     test(`400 VALIDATION_ERROR: ${name}`, () => throwsCode(() => parseManualCostInput(body), "VALIDATION_ERROR", 400));
   }
-
-  test("the max itself is accepted", () => {
-    assert.equal(parseManualCostInput({ ...ok, amountUsd: MAX_MANUAL_COST_USD }).amountUsd, MAX_MANUAL_COST_USD);
-  });
 });
 
 // ============================================
@@ -194,7 +222,7 @@ describe("planManualCost", () => {
   test("TWD fee (fxMissing) → manual block, flags cleared, guard accepts", () => {
     const visa = pendingVisa(TWD_FEE);
     assert.equal(visa.scrapeMeta.fee.fxMissing, true);
-    const plan = planManualCost(visa, input({ rate: { currency: "TWD", usdPerUnit: 0.03225 } }), "admin-1", NOW);
+    const plan = planManualCost(visa, input(), "admin-1", NOW);
 
     assert.equal(plan.baseCostUsd, 52); // Math.round(51.6)
     const fee = plan.fee;
@@ -209,11 +237,11 @@ describe("planManualCost", () => {
     // Published components / totals untouched.
     assert.deepEqual(fee.components, visa.scrapeMeta.fee.components);
     assert.deepEqual(fee.totals, [{ currency: "TWD", amount: 1600 }]);
-    // Who / when / why / rate.
+    // Who / when / why / rates.
     assert.deepEqual(fee.manualCost, {
       amountUsd: 51.6,
       reason: "CBC rate 1 TWD = 0.03225 USD",
-      rate: { currency: "TWD", usdPerUnit: 0.03225 },
+      rates: [{ currency: "TWD", usdPerUnit: 0.03225 }],
       setBy: "admin-1",
       setAt: NOW,
       contentHash: "h1",
@@ -225,19 +253,58 @@ describe("planManualCost", () => {
     );
   });
 
-  test("feeUnverified (dropped surcharge) → cleared, reason kept in previous", () => {
-    const visa = pendingVisa(GBP_FEE, {}, ["dropped surcharge"]);
+  const GBP_RATES = [{ currency: "GBP", usdPerUnit: 1.25 }];
+
+  test("feeUnverified (dropped surcharge) → cleared, reasons kept in previous as an array", () => {
+    const visa = pendingVisa(GBP_FEE, {}, ["dropped surcharge", "second reason"]);
     assert.equal(visa.scrapeMeta.fee.feeUnverified, true);
-    const plan = planManualCost(visa, input({ amountUsd: 900 }), "admin-1", NOW);
+    const plan = planManualCost(visa, input({ amountUsd: 900, rates: GBP_RATES }), "admin-1", NOW);
     assert.equal("feeUnverified" in plan.fee, false);
+    assert.equal("feeUnverifiedReasons" in plan.fee, false);
     assert.equal("feeUnverifiedReason" in plan.fee, false);
     // fxSource is kept too: the GBP part was converted, only the total was untrusted.
     assert.deepEqual(plan.fee.manualCost!.previous, {
       feeUnverified: true,
-      feeUnverifiedReason: "dropped surcharge",
+      feeUnverifiedReasons: ["dropped surcharge", "second reason"],
       fxSource: FX_SOURCE_ECB,
     });
     assert.equal(plan.baseCostUsd, 900);
+  });
+
+  test("legacy feeUnverifiedReason string (pre-#71) is read into the array", () => {
+    const visa = pendingVisa(GBP_FEE, {}, ["x"]);
+    delete visa.scrapeMeta.fee.feeUnverifiedReasons;
+    visa.scrapeMeta.fee.feeUnverifiedReason = "a; b";
+    const plan = planManualCost(visa, input({ rates: GBP_RATES }), "admin-1", NOW);
+    assert.deepEqual(plan.fee.manualCost!.previous.feeUnverifiedReasons, ["a", "b"]);
+  });
+
+  test("rates must cover exactly the non-USD fee currencies (400 otherwise)", () => {
+    const mixed: ExtractedFeeComponent[] = [
+      ...TWD_FEE,
+      { kind: "surcharge", label: "Levy", amount: 10, currency: "USD", per: "application" },
+      { kind: "surcharge", label: "Card fee", amount: 5, currency: "EUR", per: "application" },
+    ];
+    const visa = pendingVisa(mixed);
+    const twd = { currency: "TWD", usdPerUnit: 0.03 };
+    const eur = { currency: "EUR", usdPerUnit: 1.1 };
+    // Missing EUR, extra GBP, empty — all refused; USD never needs a rate.
+    throwsCode(() => planManualCost(visa, input({ rates: [twd] }), "a", NOW), "VALIDATION_ERROR", 400);
+    throwsCode(() => planManualCost(visa, input({ rates: [twd, eur, ...GBP_RATES] }), "a", NOW), "VALIDATION_ERROR", 400);
+    throwsCode(() => planManualCost(visa, input({ rates: [] }), "a", NOW), "VALIDATION_ERROR", 400);
+    const plan = planManualCost(visa, input({ rates: [eur, twd] }), "a", NOW);
+    assert.deepEqual(plan.fee.manualCost!.rates, [eur, twd]);
+  });
+
+  test("no published fee → rates [] required; amount 0 (free) is accepted by the guard", () => {
+    const visa = pendingVisa([]);
+    throwsCode(() => planManualCost(visa, input(), "a", NOW), "VALIDATION_ERROR", 400); // TWD rate given
+    const plan = planManualCost(visa, input({ amountUsd: 0, rates: [] }), "a", NOW);
+    assert.equal(plan.baseCostUsd, 0);
+    assert.equal(plan.fee.totalUsd, 0);
+    assert.doesNotThrow(() =>
+      assertVisaApprovable({ ...visa, baseCostUsd: plan.baseCostUsd, scrapeMeta: { ...visa.scrapeMeta, fee: plan.fee } })
+    );
   });
 
   test("fxStale → cleared; the old (stale-era) baseCostUsd is recorded in previous", () => {
@@ -246,13 +313,13 @@ describe("planManualCost", () => {
     const { feeMeta } = computeFee(GBP_FEE, { ...freshFx(), fetchedAt: Timestamp.fromMillis(0) }, NOW);
     visa.scrapeMeta.fee = feeMeta;
     assert.equal(feeMeta.fxStale, true);
-    const plan = planManualCost(visa, input({ amountUsd: 100 }), "admin-1", NOW);
+    const plan = planManualCost(visa, input({ amountUsd: 100, rates: GBP_RATES }), "admin-1", NOW);
     assert.equal("fxStale" in plan.fee, false);
     assert.deepEqual(plan.fee.manualCost!.previous, { fxStale: true, baseCostUsd: 100 });
   });
 
   test("no published fee → cleared (noPublishedFee in previous), empty components kept", () => {
-    const plan = planManualCost(pendingVisa([]), input({ amountUsd: 30 }), "admin-1", NOW);
+    const plan = planManualCost(pendingVisa([]), input({ amountUsd: 30, rates: [] }), "admin-1", NOW);
     assert.equal("noPublishedFee" in plan.fee, false);
     assert.deepEqual(plan.fee.components, []);
     assert.deepEqual(plan.fee.manualCost!.previous, { noPublishedFee: true });
@@ -260,7 +327,7 @@ describe("planManualCost", () => {
 
   test("pre-#59 scraped doc (no fee block) gets one", () => {
     const visa = { source: "scraped", reviewStatus: "pending_review", scrapeMeta: { contentHash: "h0" } } as any;
-    const plan = planManualCost(visa, input(), "admin-1", NOW);
+    const plan = planManualCost(visa, input({ rates: [] }), "admin-1", NOW);
     assert.deepEqual(plan.fee.components, []);
     assert.deepEqual(plan.fee.totals, []);
     assert.equal(plan.fee.manualCost!.contentHash, "h0");
@@ -283,10 +350,24 @@ describe("planManualCost", () => {
     throwsCode(() => planManualCost(visa, input(), "a", NOW), "FEE_ALREADY_CONVERTED", 409);
   });
 
-  test("409 STALE_VISA when expectedContentHash differs; matching hash is fine", () => {
+  test("409 STALE_VISA when expectedContentHash or expectedExtractedAt differs; matching is fine", () => {
+    const extractedAt = Timestamp.fromMillis(Date.UTC(2026, 10, 9, 2, 15));
     const visa = pendingVisa(TWD_FEE);
+    visa.scrapeMeta.extractedAt = extractedAt;
+    const at = extractedAt.toMillis();
     throwsCode(() => planManualCost(visa, input({ expectedContentHash: "old" }), "a", NOW), "STALE_VISA", 409);
-    assert.doesNotThrow(() => planManualCost(visa, input({ expectedContentHash: "h1" }), "a", NOW));
+    // Same hash but re-extracted later (prompt-only re-extract, #71).
+    throwsCode(
+      () => planManualCost(visa, input({ expectedContentHash: "h1", expectedExtractedAtMs: at - 1000 }), "a", NOW),
+      "STALE_VISA",
+      409
+    );
+    assert.doesNotThrow(() =>
+      planManualCost(visa, input({ expectedContentHash: "h1", expectedExtractedAtMs: at }), "a", NOW)
+    );
+    // A doc with no extractedAt can't match an expected one.
+    delete visa.scrapeMeta.extractedAt;
+    throwsCode(() => planManualCost(visa, input({ expectedExtractedAtMs: at }), "a", NOW), "STALE_VISA", 409);
   });
 
   test("correcting an earlier manual cost: allowed, keeps the scraper's previous, records supersedes", () => {
@@ -294,12 +375,13 @@ describe("planManualCost", () => {
     const first = planManualCost(visa, input(), "admin-1", NOW);
     const after = { ...visa, baseCostUsd: first.baseCostUsd, scrapeMeta: { ...visa.scrapeMeta, fee: first.fee } };
     const later = Timestamp.fromMillis(NOW.toMillis() + 1000);
-    const second = planManualCost(after, input({ amountUsd: 60, reason: "typo fix" }), "admin-2", later);
+    const second = planManualCost(after, input({ amountUsd: 60, reason: "typo fix: 60 not 51.6" }), "admin-2", later);
     assert.equal(second.baseCostUsd, 60);
     assert.deepEqual(second.fee.manualCost!.previous, { fxMissing: true });
     assert.deepEqual(second.fee.manualCost!.supersedes, {
       amountUsd: 51.6,
       reason: "CBC rate 1 TWD = 0.03225 USD",
+      rates: [{ currency: "TWD", usdPerUnit: 0.03225 }],
       setBy: "admin-1",
       setAt: NOW,
       contentHash: "h1",
@@ -313,29 +395,49 @@ describe("planManualCost", () => {
 
 describe("planManualCostOverwrite", () => {
   const manualFee = (): VisaFeeMeta => planManualCost(pendingVisa(TWD_FEE), input(), "admin-1", NOW).fee;
+  /** Plan with the stored doc at content hash "h1". */
+  const plan = (existingFee: VisaFeeMeta | undefined, newFee: VisaFeeMeta, newBaseCostUsd: number | undefined, contentHash: string) =>
+    planManualCostOverwrite({ existingFee, existingContentHash: "h1", newFee, newBaseCostUsd, contentHash, now: NOW });
 
-  test("manual + new converted fee → replacedManualCost recorded, cost kept (not deleted)", () => {
+  test("changed hash + new converted fee → replacedManualCost recorded, cost from the extraction", () => {
     const { feeMeta, baseCostUsd } = computeFee(GBP_FEE, freshFx(), NOW);
-    const plan = planManualCostOverwrite(manualFee(), feeMeta, baseCostUsd, "h2", NOW);
-    assert.equal(plan.deleteCost, false);
-    assert.equal(plan.replaced!.amountUsd, 51.6);
-    assert.equal(plan.fee.replacedManualCost!.replacedByContentHash, "h2");
-    assert.equal(plan.fee.manualCost, undefined);
+    const p = plan(manualFee(), feeMeta, baseCostUsd, "h2");
+    assert.equal(p.deleteCost, false);
+    assert.equal(p.keptManualCostUsd, undefined);
+    assert.equal(p.replaced!.amountUsd, 51.6);
+    assert.equal(p.fee.replacedManualCost!.replacedByContentHash, "h2");
+    assert.equal(p.fee.manualCost, undefined);
     assert.equal(feeMeta.replacedManualCost, undefined); // input not mutated
   });
 
-  test("manual + new flagged fee → deleteCost", () => {
+  test("changed hash + new flagged fee → deleteCost", () => {
     const { feeMeta, baseCostUsd } = computeFee(TWD_FEE, freshFx(), NOW);
-    const plan = planManualCostOverwrite(manualFee(), feeMeta, baseCostUsd, "h2", NOW);
-    assert.equal(plan.deleteCost, true);
-    assert.equal(plan.fee.fxMissing, true);
+    const p = plan(manualFee(), feeMeta, baseCostUsd, "h2");
+    assert.equal(p.deleteCost, true);
+    assert.equal(p.fee.fxMissing, true);
+  });
+
+  test("SAME hash (prompt-only re-extract) → manual cost kept on the new components, nothing replaced", () => {
+    const manual = manualFee();
+    // The new extraction reads a different fee from the same page and converts it.
+    const { feeMeta, baseCostUsd } = computeFee(GBP_FEE, freshFx(), NOW, { unverifiedReasons: [] });
+    const p = plan(manual, feeMeta, baseCostUsd, "h1");
+    assert.equal(p.replaced, undefined);
+    assert.equal(p.deleteCost, false);
+    assert.equal(p.keptManualCostUsd, 52);
+    assert.deepEqual(p.fee.manualCost, manual.manualCost);
+    assert.equal(p.fee.totalUsd, 51.6);
+    assert.equal(p.fee.fxSource, FX_SOURCE_MANUAL);
+    assert.deepEqual(p.fee.components, feeMeta.components); // new published parts
+    assert.equal("fxRateToUsd" in p.fee, false);
+    assert.equal("replacedManualCost" in p.fee, false);
   });
 
   test("no manual cost → nothing replaced; an older replacedManualCost is carried forward", () => {
     const { feeMeta } = computeFee(TWD_FEE, freshFx(), NOW);
-    assert.deepEqual(planManualCostOverwrite(feeMeta, feeMeta, undefined, "h2", NOW), { fee: feeMeta, deleteCost: false });
-    const old = planManualCostOverwrite(manualFee(), feeMeta, undefined, "h2", NOW).fee;
-    const next = planManualCostOverwrite(old, feeMeta, undefined, "h3", NOW);
+    assert.deepEqual(plan(feeMeta, feeMeta, undefined, "h2"), { fee: feeMeta, deleteCost: false });
+    const old = plan(manualFee(), feeMeta, undefined, "h2").fee;
+    const next = plan(old, feeMeta, undefined, "h3");
     assert.equal(next.replaced, undefined);
     assert.equal(next.fee.replacedManualCost!.replacedByContentHash, "h2");
   });
@@ -350,6 +452,7 @@ let catalog: any;
 let controller: any;
 let visaSvc: any;
 let authMw: any;
+let extractMod: any;
 
 /** Ingest one extraction for the fixture visa. */
 function ingest(e: ExtractedVisa, hash: string, fx: FxRatesDoc | undefined = freshFx()): Promise<any> {
@@ -395,7 +498,12 @@ async function put(role: Role, body: unknown, id?: string) {
 }
 
 /** A valid request body. */
-const BODY = { countryCode: "TW", amountUsd: 51.6, reason: "CBC rate 1 TWD = 0.03225 USD" };
+const BODY = {
+  countryCode: "TW",
+  amountUsd: 51.6,
+  reason: "CBC rate 1 TWD = 0.03225 USD",
+  rates: [{ currency: "TWD", usdPerUnit: 0.03225 }],
+};
 
 /** Run `fn` capturing console.warn output. */
 async function captureWarn<T>(fn: () => Promise<T>): Promise<{ result: T; warned: string[] }> {
@@ -415,6 +523,7 @@ before(async () => {
   controller = (await import("../src/controllers/visa.controller")).visaController;
   visaSvc = (await import("../src/services/visa.service")).visaService;
   authMw = await import("../src/middleware/auth");
+  extractMod = await import("../src/services/visa-catalog-extract.service");
 });
 
 beforeEach(async () => {
@@ -468,7 +577,12 @@ describe("PUT /admin/visas/:id/manual-cost", () => {
   test("400 VALIDATION_ERROR for a bad body, nothing written", async () => {
     await ingest(extraction(), "h1");
     const mark = writes.length;
-    for (const body of [{ ...BODY, amountUsd: 0 }, { ...BODY, reason: undefined }, { ...BODY, amountUsd: 1e9 }]) {
+    for (const body of [
+      { ...BODY, amountUsd: -1 },
+      { ...BODY, reason: undefined },
+      { ...BODY, amountUsd: 1e9 },
+      { ...BODY, rates: [] }, // the fee is in TWD: a TWD rate is required
+    ]) {
       const out = await put(ROLES.ADMIN, body);
       assert.equal(out.status, 400);
       assert.equal(out.body.error, "VALIDATION_ERROR");
@@ -617,5 +731,68 @@ describe("a later scrape replaces a manual cost — never silently", () => {
     const doc = store.get(VISA_PATH)! as any;
     assert.equal(doc.baseCostUsd, 50); // 1600 / 32
     assert.equal(doc.scrapeMeta.fee.replacedManualCost.amountUsd, 51.6);
+  });
+
+  test("SAME hash re-extract under a newer prompt (#71) → refreshed, manual cost KEPT, nothing replaced", async () => {
+    await seedManual();
+    // Make the stored extraction look like it came from an older prompt, so
+    // planIngest refreshes it even though the page hash is the same.
+    const cur = store.get(VISA_PATH)! as any;
+    store.set(VISA_PATH, { ...cur, scrapeMeta: { ...cur.scrapeMeta, extractorPromptVersion: "old-prompt" } });
+    const newFee: ExtractedFeeComponent[] = [
+      { kind: "application", label: "Single-entry visa fee", amount: 1600, currency: "TWD", per: "application" },
+    ];
+    const { result, warned } = await captureWarn(() =>
+      ingest(extraction({ feeComponents: newFee, processingDaysMax: 7 }), "h1")
+    );
+    assert.equal(result.outcome, "updated");
+    assert.equal(warned.length, 0);
+    const doc = store.get(VISA_PATH)! as any;
+    assert.equal(doc.processingDaysMax, 7); // the new extraction was written...
+    assert.equal(doc.scrapeMeta.extractorPromptVersion, extractMod.EXTRACTOR_PROMPT_VERSION);
+    assert.equal(doc.scrapeMeta.fee.components[0].label, "Single-entry visa fee");
+    // ...and the manual cost survived on top of it.
+    assert.equal(doc.baseCostUsd, 52);
+    assert.equal(doc.scrapeMeta.fee.manualCost.amountUsd, 51.6);
+    assert.equal(doc.scrapeMeta.fee.fxSource, "manual");
+    assert.equal(doc.scrapeMeta.fee.fxMissing, undefined);
+    assert.equal(doc.scrapeMeta.fee.replacedManualCost, undefined);
+    // Still approvable.
+    const approved = await visaSvc.updateVisaReviewStatus(CC, VISA_ID, "approve", "admin-uid");
+    assert.equal(approved.reviewStatus, "approved");
+  });
+
+  test("planFeeReconvert never re-converts a fee that has a manual cost (even if flagged)", () => {
+    const fee = planManualCost(pendingVisa(TWD_FEE), input(), "admin-1", NOW).fee;
+    const visa = { source: "scraped", reviewStatus: "pending_review", scrapeMeta: { fee: { ...fee, fxMissing: true } } } as any;
+    assert.equal(planFeeReconvert(visa, { ...freshFx(), rates: { TWD: 31 } }, Timestamp.now()), null);
+  });
+
+  test("re-convert race: a manual cost set after the pending query is NOT overwritten", async () => {
+    await ingest(extraction(), "h1"); // TWD → fxMissing
+    store.set("visaSources/TW", { countryCode: CC, status: "active", pages: [] });
+    // Simulate the admin's PUT landing between the re-convert's query and
+    // its write: run it just before the re-convert's transaction starts.
+    const orig = catalog.runTransaction;
+    let injected = false;
+    catalog.runTransaction = async (fn: any) => {
+      if (!injected) {
+        injected = true;
+        assert.equal((await put(ROLES.ADMIN, BODY)).status, 200);
+      }
+      return fakeRunTransaction(fn);
+    };
+    try {
+      const manualMark = () => clone(store.get(VISA_PATH));
+      const r = await catalog.reconvertFlaggedFees({ ...freshFx(), rates: { GBP: 0.8, TWD: 32 } });
+      assert.equal(injected, true);
+      assert.equal(r.reconverted, 0);
+      assert.equal(r.reflagged, 0);
+      const doc = manualMark() as any;
+      assert.equal(doc.baseCostUsd, 52); // the manual cost, not 1600 / 32 = 50
+      assert.equal(doc.scrapeMeta.fee.manualCost.amountUsd, 51.6);
+    } finally {
+      catalog.runTransaction = orig;
+    }
   });
 });
