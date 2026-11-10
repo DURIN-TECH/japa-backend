@@ -7,13 +7,35 @@ import {
   sendCreated,
   ErrorMessages,
 } from "../utils/response";
-import { VisaCategory } from "../types";
+import { VisaCategory, VisaType } from "../types";
+// Public visibility rule for visas (issue #99).
+import { isVisaPubliclyVisible } from "../services/visa.service";
 // Typed error from the approval guard (fee not converted to USD, issue #59).
 import { VisaFeeNotConvertibleError } from "../scrapers";
 // Manual USD cost (issue #70): CASL gate, body validation, typed errors.
 import { asSubject, can, forbidden } from "../middleware/authz";
 import { ManualCostError, parseManualCostInput } from "../scrapers";
 import { isValidDocId } from "../scrapers";
+
+/**
+ * Whether this request may read a visa on the single-visa public endpoints
+ * (`GET /countries/:code/visas/:visaId` and `/full`), issue #99.
+ *
+ *  - A publicly visible visa (isVisaPubliclyVisible): anyone, signed in or not.
+ *  - Any other visa (pending, rejected, inactive, agency-only): only a
+ *    principal whose shared CASL ability allows `read` on THIS visa. Today
+ *    `Visa` is admin-only (`manage all`), so that is admins; the routes use
+ *    `optionalAuth`, so `req.ability` is only set when a valid token was sent.
+ *    The check is on the concrete visa (asSubject), so any conditional rule a
+ *    later authz version adds (e.g. #98's own-agency read) is matched
+ *    against the visa's fields, never granted blanket.
+ *
+ * No role literals: the decision comes from the ability.
+ */
+function canReadVisa(req: AuthenticatedRequest, visa: VisaType): boolean {
+  if (isVisaPubliclyVisible(visa)) return true;
+  return can(req, "read", asSubject("Visa", { ...visa }));
+}
 
 export class VisaController {
   // ============================================
@@ -102,7 +124,8 @@ export class VisaController {
 
   /**
    * GET /countries/:code/visas
-   * Get all visa types for a country
+   * Get all visa types for a country. Public: only publicly visible visas
+   * (both service reads apply isVisaPubliclyVisible, issue #99).
    */
   async getVisaTypes(req: Request, res: Response): Promise<void> {
     try {
@@ -135,15 +158,19 @@ export class VisaController {
 
   /**
    * GET /countries/:code/visas/:visaId
-   * Get visa type details
+   * Get visa type details.
+   *
+   * Issue #99: 404 for a visa the caller may not read (canReadVisa) — the
+   * same answer as an unknown id, so a hidden visa's existence never leaks.
+   * Internal callers keep the unfiltered visaService.getVisaType.
    */
-  async getVisaType(req: Request, res: Response): Promise<void> {
+  async getVisaType(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
       const { code, visaId } = req.params;
 
       const visaType = await visaService.getVisaType(code, visaId);
 
-      if (!visaType) {
+      if (!visaType || !canReadVisa(req, visaType)) {
         sendError(res, "NOT_FOUND", "Visa type not found", 404);
         return;
       }
@@ -157,26 +184,30 @@ export class VisaController {
 
   /**
    * GET /countries/:code/visas/:visaId/full
-   * Get visa type with requirements
+   * Get visa type with requirements.
+   *
+   * Issue #99: same rule as getVisaType — 404 unless the visa is publicly
+   * visible or the caller's ability allows reading it (admins). The visa is
+   * checked BEFORE its requirements are read, so a hidden visa costs no
+   * requirements query.
    */
   async getVisaTypeWithRequirements(
-    req: Request,
+    req: AuthenticatedRequest,
     res: Response
   ): Promise<void> {
     try {
       const { code, visaId } = req.params;
 
-      const result = await visaService.getVisaTypeWithRequirements(
-        code,
-        visaId
-      );
+      const visaType = await visaService.getVisaType(code, visaId);
 
-      if (!result) {
+      if (!visaType || !canReadVisa(req, visaType)) {
         sendError(res, "NOT_FOUND", "Visa type not found", 404);
         return;
       }
 
-      sendSuccess(res, result);
+      const requirements = await visaService.getRequirements(code, visaId);
+
+      sendSuccess(res, { visaType, requirements });
     } catch (error) {
       console.error("Error getting visa type with requirements:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -220,10 +251,15 @@ export class VisaController {
         return;
       }
 
-      const visaType = await visaService.createVisaType({
-        ...input,
-        countryCode: code,
-      });
+      // Issue #99: created pending + hidden (isActive false, agency-only);
+      // the admin's uid is recorded as `createdBy`.
+      const visaType = await visaService.createVisaType(
+        {
+          ...input,
+          countryCode: code,
+        },
+        req.userId
+      );
 
       sendCreated(res, visaType, "Visa type created successfully");
     } catch (error) {
