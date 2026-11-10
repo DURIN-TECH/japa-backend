@@ -16,6 +16,7 @@
     "seed:dev": "npm run build && node lib/scripts/seed-all.js --project durin-seli-dev",
     "seed:prod": "npm run build && node lib/scripts/seed-prod-bootstrap.js --project japa-platform",
     "seed:prod:full": "npm run build && node lib/scripts/seed-all.js --project japa-platform",
+    "sync:visa-sources": "npm run build && node lib/scripts/sync-visa-sources.js",
     "paystack:sync": "npm run build && node lib/scripts/sync-paystack-plans.js",
     "paystack:sync:dev": "npm run build && node lib/scripts/sync-paystack-plans.js --project durin-seli-dev",
     "paystack:sync:prod": "npm run build && node lib/scripts/sync-paystack-plans.js --project japa-platform",
