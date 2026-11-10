@@ -32,7 +32,6 @@ export interface UpdateAgentInput {
   languages?: string[];
   featuredVisas?: string[];
   consultationFee?: number;
-  serviceFees?: Record<string, number>;
   isAvailable?: boolean;
   availableSlots?: AvailabilitySlot[];
 }
@@ -89,7 +88,6 @@ class AgentService {
       successRate: 0,
       responseTime: "24-48 hours",
       consultationFee: input.consultationFee,
-      serviceFees: {},
       isAvailable: false, // Not available until verified
       availableSlots: input.availableSlots || [],
       createdAt: now,

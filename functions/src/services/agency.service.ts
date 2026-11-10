@@ -494,7 +494,6 @@ class AgencyService {
         successRate: 0,
         responseTime: "N/A",
         consultationFee: 0,
-        serviceFees: {},
         isAvailable: true,
         createdAt: now,
         updatedAt: now,
