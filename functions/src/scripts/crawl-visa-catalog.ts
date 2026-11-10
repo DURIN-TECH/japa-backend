@@ -13,7 +13,9 @@
  * Hash gate: before calling the LLM, the fetched content hash is compared with
  * the `scrapeMeta.contentHash` on the existing doc at the resolved id; when
  * equal the page is reported "unchanged (hash gate)" and NO extraction runs.
- * Pass --force to extract anyway.
+ * Exception (issue #71): a PENDING scraped doc whose
+ * `scrapeMeta.extractorPromptVersion` differs from EXTRACTOR_PROMPT_VERSION is
+ * re-extracted anyway (within --max-extractions). Pass --force to extract anyway.
  *
  * FX (issue #59): `appConfig/fx` is refreshed once at the start of the run
  * (Frankfurter / ECB), flagged pending fees are re-converted, and each
@@ -123,7 +125,11 @@ async function main() {
   const { pickSourceAdapter, sourceMetaFromDocument } = await import(
     "../services/visa-source-adapters"
   );
-  const { visaCatalogExtractor } = await import("../services/visa-catalog-extract.service");
+  const { visaCatalogExtractor, EXTRACTOR_PROMPT_VERSION } = await import(
+    "../services/visa-catalog-extract.service"
+  );
+  // Pure prompt-version rule shared with the orchestrator (issue #71).
+  const { isPendingPromptStale } = await import("../services/visa-catalog-diff");
   const { visaCatalogService } = await import("../services/visa-catalog.service");
   // Pure host-backoff helper (issue #64): same skip rules as the orchestrator.
   const { HostBackoffTracker, backoffMessage, hostOf, isHostBackoffError } = await import(
@@ -179,6 +185,8 @@ async function main() {
     withdrawn: 0,
     errors: 0,
     deferred: 0, // pages skipped: host backed off (issue #64)
+    // Same hash, but the pending doc came from an older prompt → re-extracted (issue #71).
+    promptReextracts: 0,
   };
 
   for (const doc of sourcesSnap.docs) {
@@ -243,9 +251,20 @@ async function main() {
             .get();
           const existing = existingSnap.exists ? (existingSnap.data() as VisaType) : undefined;
           if (existing?.scrapeMeta?.contentHash === fetched.contentHash) {
-            totals.unchanged++;
-            console.log(`  -> unchanged (hash gate, no extraction): ${resolvedVisaId}`);
-            continue;
+            // Same text — but a PENDING scraped doc from an older extractor
+            // prompt is re-extracted anyway (issue #71, same rule as the
+            // orchestrator). Approved / seeded / agent docs never qualify.
+            // Still counted against --max-extractions below.
+            if (!isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION)) {
+              totals.unchanged++;
+              console.log(`  -> unchanged (hash gate, no extraction): ${resolvedVisaId}`);
+              continue;
+            }
+            totals.promptReextracts++;
+            console.log(
+              "  -> same hash, but extracted with prompt " +
+                `${existing.scrapeMeta?.extractorPromptVersion ?? "(none)"} ≠ ${EXTRACTOR_PROMPT_VERSION}: re-extracting`
+            );
           }
         }
 
@@ -299,7 +318,8 @@ async function main() {
   console.log(
     `\nDone. fetched ${totals.fetched} | created ${totals.created} | updated ${totals.updated} | ` +
       `unchanged ${totals.unchanged} | skipped ${totals.skipped} | proposed ${totals.proposed} | ` +
-      `withdrawn ${totals.withdrawn} | errors ${totals.errors} | host backed off ${totals.deferred}`
+      `withdrawn ${totals.withdrawn} | errors ${totals.errors} | host backed off ${totals.deferred} | ` +
+      `prompt re-extracts ${totals.promptReextracts}`
   );
   console.log("Review pending scraped visas at: admin → Visa Review (filter source=scraped).");
   // Proposed edits to approved visas have no portal UI yet (follow-up issue).

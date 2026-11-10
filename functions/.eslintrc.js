@@ -28,4 +28,18 @@ module.exports = {
     "indent": ["error", 2],
     "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_" }],
   },
+  overrides: [
+    {
+      // Unit tests (test/**): casting fixtures/partial results through `any`
+      // is how the tests poke at diff rows and fake Firestore docs, and
+      // `_`-prefixed destructured vars are used to drop fields (e.g.
+      // `const { updatedAt: _a, ...rest } = doc`). Allow both here only;
+      // src/ keeps the strict rules.
+      files: ["test/**/*.ts"],
+      rules: {
+        "@typescript-eslint/no-explicit-any": "off",
+        "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }],
+      },
+    },
+  ],
 };
