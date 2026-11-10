@@ -1047,6 +1047,7 @@ describe("runOrchestrator — linked surcharge page (issue #69)", () => {
 
     assert.equal(calls.filter((u) => u === IHS_API).length, 1); // once, for two marked routes
     assert.equal(summary.errors, 0);
+    assert.equal(summary.linkedSurchargeErrors, 0);
     assert.equal(extractCalls.length, 3);
 
     for (const id of ["gb-student-visa", "gb-child-study-visa"]) {
@@ -1104,6 +1105,7 @@ describe("runOrchestrator — linked surcharge page (issue #69)", () => {
 
     assert.deepEqual(extractCalls, [SKILLED]);
     assert.equal(summary.errors, 2);
+    assert.equal(summary.linkedSurchargeErrors, 2); // visible in the run summary
     const pages = (store.get("visaSources/GB")!.pages as any[]);
     assert.match(pages[0].lastError, /"student" rate .* not found/);
     assert.equal(pages[0].lastContentHash, undefined); // gate not advanced

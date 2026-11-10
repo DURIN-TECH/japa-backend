@@ -95,6 +95,10 @@ export interface CrawlSummary {
   // by a stored retry-after time).
   hostsBackedOff: number;
   pagesDeferred: number;
+  // Issue #69: marked pages NOT extracted because their linked surcharge page
+  // (e.g. the UK IHS page) could not be fetched or parsed this run. Each is
+  // also a page error (in `errors`) and logged with console.error.
+  linkedSurchargeErrors: number;
 }
 
 class VisaCatalogCrawlService {
@@ -143,6 +147,7 @@ class VisaCatalogCrawlService {
       feesReconverted: 0,
       hostsBackedOff: 0,
       pagesDeferred: 0,
+      linkedSurchargeErrors: 0,
     };
 
     // Due = active AND nextCrawlAt <= now, oldest first (needs the composite
@@ -301,7 +306,20 @@ class VisaCatalogCrawlService {
           // [] for an unmarked page (no request). A failure (fetch error,
           // rate not found on the linked page, 429) throws into the catch
           // below: a page error, no extraction, stored hash untouched.
-          const linked = await linkedSurcharges.forPage(page);
+          let linked;
+          try {
+            linked = await linkedSurcharges.forPage(page);
+          } catch (err) {
+            // Visible in the scheduled log + run summary, then handled as a
+            // normal page error by the catch below (rethrown).
+            summary.linkedSurchargeErrors++;
+            console.error(
+              `Visa catalog: source ${source.countryCode}, page ${page.url}: linked surcharge unavailable, ` +
+                "page not extracted:",
+              err
+            );
+            throw err;
+          }
           // Hash is over the exact text the extractor would see (selected +
           // capped sections for GOV.UK; the cleaned page for generic-html),
           // combined with the linked pages' hashes when the page has any.

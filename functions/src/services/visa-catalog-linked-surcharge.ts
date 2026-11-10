@@ -174,7 +174,8 @@ export function linkedSurchargePage(cfg: LinkedSurchargeSourceConfig): VisaSourc
 /**
  * Read every configured rate from a fetched linked page.
  *
- * Each rule's regex must match; the amount is capture group 1 with thousands
+ * Each rule's regex must match EXACTLY ONE line (0 or 2+ throw: fail
+ * closed); the amount is capture group 1 with thousands
  * separators removed, and the citation is the whole text LINE that contains
  * the match (verbatim, trimmed). Throws LinkedSurchargeError on a withdrawn
  * page or when any rate is missing / not a positive number — the caller
@@ -190,7 +191,18 @@ export function parseLinkedSurchargeRates(
   const lines = doc.text.split(/\r?\n/);
   const rates: Record<string, ResolvedLinkedRate> = {};
   for (const [key, rule] of Object.entries(cfg.rates)) {
-    const line = lines.find((l) => rule.pattern.test(l));
+    // EXACTLY one line must state the rate (fail closed). Two matching lines
+    // (e.g. GOV.UK announcing a future rate: "From <date>, £X per year for
+    // students…" next to today's) are ambiguous: we must not silently pick
+    // one, so the page is rejected until a human updates the regexes.
+    const matching = lines.filter((l) => rule.pattern.test(l));
+    if (matching.length > 1) {
+      throw new LinkedSurchargeError(
+        `linked surcharge ${cfg.id}: "${key}" rate (${rule.description}) is stated on ${matching.length} lines ` +
+          `of ${cfg.url} (ambiguous, e.g. a future rate announced) — re-check LINKED_SURCHARGE_SOURCES`
+      );
+    }
+    const line = matching[0];
     const match = line?.match(rule.pattern);
     const amount = match ? Number(match[1].replace(/,/g, "")) : NaN;
     if (!line || !Number.isFinite(amount) || amount <= 0) {

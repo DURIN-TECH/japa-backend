@@ -94,6 +94,17 @@ describe("parseLinkedSurchargeRates (real GOV.UK IHS page)", () => {
     assert.throws(() => parseLinkedSurchargeRates(IHS, broken), (e: Error) => e instanceof LinkedSurchargeError && /"standard" rate/.test(e.message));
   });
 
+  test("a rate stated on TWO lines (e.g. a future rate announced) throws: fail closed", async () => {
+    const d = await ihsDoc();
+    const line = "£776 per year for students, their dependants, and those on a Youth Mobility Scheme visa, for example £1,552 for a 2-year visa";
+    const dup = withText(d, `${d.text}\n\nFrom 1 April 2027, £850 per year for students, their dependants, and those on a Youth Mobility Scheme visa`);
+    assert.ok(d.text.includes(line));
+    assert.throws(
+      () => parseLinkedSurchargeRates(IHS, dup),
+      (e: Error) => e instanceof LinkedSurchargeError && /"student" rate .* stated on 2 lines/.test(e.message)
+    );
+  });
+
   test("a withdrawn linked page throws", async () => {
     const d = await ihsDoc();
     assert.throws(() => parseLinkedSurchargeRates(IHS, { ...d, withdrawn: true }), /withdrawn/);
