@@ -58,6 +58,11 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   agency_pending_review: FULL,
   agency_approved: FULL,
   agency_rejected: FULL,
+  // Agency-created visas (issue #101): review decisions + make-global go to
+  // the agency owner. Transactional, so worth an email.
+  agency_visa_approved: FULL,
+  agency_visa_rejected: FULL,
+  agency_visa_made_global: FULL,
   // Verification
   verification_approved: FULL,
   verification_rejected: FULL,

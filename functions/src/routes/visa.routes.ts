@@ -62,6 +62,14 @@ adminVisaRoutes.patch("/:id/review", verifyAuth, verifyAdmin, (req, res) =>
   visaController.reviewVisa(req, res)
 );
 
+// Make an approved agency visa global, or take it back to agency-only
+// (issue #101). Body { countryCode, visibility: "global" | "agency" }.
+// Same admin gate as the review route; the controller adds a CASL check on
+// the `visibility` field.
+adminVisaRoutes.patch("/:id/visibility", verifyAuth, verifyAdmin, (req, res) =>
+  visaController.setVisibility(req, res)
+);
+
 // Set the USD cost of a PENDING scraped visa by hand (issue #70). Body
 // { countryCode, amountUsd, reason, rates, expectedContentHash?, expectedExtractedAt? }.
 // `verifyAuth` → 401 without a token; the controller then gates on the
