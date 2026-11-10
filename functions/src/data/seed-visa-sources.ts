@@ -76,6 +76,15 @@ export function findVisaSourcesMarkdown(startDir: string = __dirname): string | 
 //
 // Applied by seedVisaSources(); parseVisaSourcesMarkdown() stays a pure parser.
 // A key that matches no parsed page is logged as a warning at seed time.
+/**
+ * The KR registry page URL pinned in VISA_SOURCE_OVERRIDES below (issue #67), exported so the unit
+ * tests reference the same string as the map key instead of retyping it.
+ * Must equal the KR row in official_visa_links_verified_v3.md character for
+ * character (see the KR comment in the map for why this page was chosen).
+ */
+export const KR_TEMPORARY_VISIT_URL =
+  "https://www.hikorea.go.kr/info/InfoDatail.pt?CAT_SEQ=522&PARENT_ID=1267&locale=en";
+
 export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   // ---- United Kingdom (GB) — routes with a seeded uk-* equivalent ----
   "https://www.gov.uk/standard-visitor": { visaId: "gb-standard-visitor", visaCode: "SVV" }, // ~ uk-visitor
@@ -111,6 +120,44 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   },
   "https://www.gov.uk/british-national-overseas-bno-visa": {
     visaId: "gb-british-national-overseas-bno-visa",
+  },
+
+  // ---- South Korea (KR) — issue #67 ----
+  //
+  // WHY A PIN IS NEEDED HERE. The old KR row was the Korea Visa Portal home
+  // page (`https://www.visa.go.kr/?LANG_TYPE=EN`): its path is "/", so
+  // deriveVisaId() refused to invent an id and every crawl logged a page
+  // error (the source would flip to `broken` after 5 weekly runs).
+  //
+  // WHY THIS URL. visa.go.kr is no use for a route page: its per-visa detail
+  // screens are reached by a JS form POST (`/openPage.do?MENU_ID=1010201`
+  // with IN_SOJ_QUAL_GRP in the body), so no GET URL addresses one visa.
+  // The Ministry of Justice's HiKorea portal serves server-rendered English
+  // "Easy Guide to Immigration" pages, one per purpose of stay, over plain
+  // GET (`locale=en` selects English). This one is the short-term visit
+  // route; checked 2026-11-10 with the crawl's own fetchAndClean (robots.txt
+  // only restricts Googlebot; 200; ~870 chars of cleaned text) — it states:
+  //   "Temporary visit (C-3) Those seeking short term stay for travel/transit,
+  //    medical treatment, visiting relatives, a major sporting event,
+  //    attending conferences, various cultural or artistic events, religious
+  //    ceremony, or other similar reasons. (The visit must be non-profit in
+  //    nature) ... Passport + Visa + Disembarkation card"
+  //
+  // WHY PINNED EVEN THOUGH THE PATH IS NON-EMPTY. Every HiKorea guide page
+  // shares the path `/info/InfoDatail.pt` and differs only in its query
+  // (CAT_SEQ / PARENT_ID), which normalizedSourcePath() drops. The derived id
+  // would be the generic `kr-info-infodatail-pt`, and a second HiKorea row
+  // (Study, Work, ...) would silently land on the same doc. The pin gives
+  // this route its own stable id instead.
+  //
+  // No `visaCode`: there is no seeded KR visa to line up with
+  // (seed-countries-visas.ts has no kr-* docs), so the extracted code stays.
+  //
+  // KEY MUST MATCH THE MARKDOWN ROW EXACTLY (official_visa_links_verified_v3.md,
+  // "## 23. South Korea"); otherwise seedVisaSources() warns and the pin is
+  // not applied.
+  [KR_TEMPORARY_VISIT_URL]: {
+    visaId: "kr-temporary-visit-c-3",
   },
 };
 
