@@ -29,7 +29,7 @@
     "eval:visa-extract": "node --env-file-if-exists=.env.local --import tsx eval/run.ts",
     "eval:record": "node --import tsx eval/record.ts",
     "lint": "eslint --ext .ts src/ eval/ test/",
-    "lint:fix": "eslint --ext .ts src/ eval/ --fix",
+    "lint:fix": "eslint --ext .ts src/ eval/ test/ --fix",
     "clean": "rm -rf lib",
     "vendor:authz": "node vendor-authz.cjs"
   },
