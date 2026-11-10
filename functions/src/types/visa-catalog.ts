@@ -255,6 +255,15 @@ export interface VisaFeeMeta {
   // length citation failed validation was DROPPED (the rest kept), or a
   // component is implausibly large. No `baseCostUsd`; approval is blocked.
   feeUnverified?: boolean;
+  // Why the fee is unverified, one entry per reason (issue #71: an array,
+  // written whenever `feeUnverified` is set). Read it through
+  // storedFeeUnverifiedReasons() (visa-catalog-fx.ts), which also understands
+  // the legacy string form below.
+  feeUnverifiedReasons?: string[];
+  // LEGACY (pre-#71, read-only): the same reasons joined with "; ". Never
+  // written any more; still present on docs ingested before #71 until they
+  // are re-extracted / re-converted (both replace the fee block wholesale).
+  /** @deprecated read via storedFeeUnverifiedReasons(); write feeUnverifiedReasons */
   feeUnverifiedReason?: string;
 }
 
