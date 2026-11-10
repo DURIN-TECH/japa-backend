@@ -864,3 +864,232 @@ describe("validation helpers", () => {
     });
   });
 });
+
+// ============================================
+// Review fixes (round 1): crawl leases, stale requests, fail closed,
+// budget_hard_stop resolution, strict price-table keys
+// ============================================
+
+describe("source crawl leases", () => {
+  let leasesSvc: any;
+  let firebase: any;
+  before(async () => {
+    leasesSvc = (await import("../../../../src/scrapers/shared/runs/source-lease")).sourceLeaseService;
+    firebase = await import("../../../../src/utils/firebase");
+  });
+  beforeEach(() => {
+    leasesSvc.clock = () => NOW;
+    requests.leaseClock = () => NOW;
+  });
+
+  /** Store a lease doc held by another run until `untilMs`. */
+  function holdLease(kind: string, id: string, untilMs: number, runId = "other-run"): void {
+    store.set(`scrapeSourceLeases/${kind}__${id}`, {
+      kind,
+      sourceId: id,
+      token: "someone-else",
+      trigger: "manual",
+      runId,
+      acquiredAt: Timestamp.fromMillis(NOW - 60 * 1000),
+      expiresAt: Timestamp.fromMillis(untilMs),
+    });
+  }
+
+  test("a whole-scraper run in flight -> single-source Run now is 409 RUN_IN_PROGRESS", async () => {
+    seedGb();
+    const all = await call("runScraper", admin({ params: { kind: "visa" }, body: {} }));
+    assert.equal(all.status, 202);
+    const one = await call("runSource", admin({ params: { kind: "visa", id: CC }, body: {} }));
+    assert.equal(one.status, 409);
+    assert.equal(one.body.error, "RUN_IN_PROGRESS");
+    assert.equal(one.body.requestId, all.body.data.requestId);
+  });
+
+  test("a held source lease (any run crawling it) -> Run now is 409 with the holder's runId", async () => {
+    seedGb();
+    holdLease("visa", CC, NOW + 5 * 60 * 1000, "run-scraper-wide");
+    const out = await call("runSource", admin({ params: { kind: "visa", id: CC }, body: {} }));
+    assert.equal(out.status, 409);
+    assert.equal(out.body.error, "RUN_IN_PROGRESS");
+    assert.equal(out.body.runId, "run-scraper-wide");
+    assert.equal(out.body.leaseExpiresAt, new Date(NOW + 5 * 60 * 1000).toISOString());
+  });
+
+  test("manual GB run holding the lease -> the scheduled tick skips GB (deferred, reason), no fetch", async () => {
+    const monday = Date.parse("2026-11-09T02:15:00Z");
+    seedGb({ nextCrawlAt: Timestamp.fromMillis(monday - HOUR) });
+    holdLease("visa", CC, NOW + 5 * 60 * 1000, "manual-gb-run");
+    const before = JSON.stringify(store.get(`visaSources/${CC}`));
+    const summary = await withStubs(() => crawl.runOrchestrator({ now: monday, fetchFxRates }));
+    assert.equal(summary.sourcesLeased, 1);
+    assert.equal(summary.sourcesProcessed, 0);
+    assert.equal(summary.pagesFetched, 0);
+    assert.equal(extractCalls, 0);
+    assert.equal(JSON.stringify(store.get(`visaSources/${CC}`)), before, "source untouched");
+    const [run] = docsOf("scrapeRuns");
+    const line = (run.sources as any[])[0];
+    assert.equal(line.status, "deferred");
+    assert.match(line.error, /being crawled by another manual run \(manual-gb-run\)/);
+    assert.equal(run.errorCount, 0);
+    // The other run's lease is untouched.
+    assert.equal(store.get(`scrapeSourceLeases/visa__${CC}`)!.token, "someone-else");
+  });
+
+  test("an expired lease is reclaimed; the run releases its own lease when done", async () => {
+    seedGb();
+    holdLease("visa", CC, NOW - 1000); // expired
+    const summary = await withStubs(() => crawl.runOrchestrator({ now: NOW, fetchFxRates, trigger: "manual", sourceId: CC }));
+    assert.equal(summary.sourcesProcessed, 1);
+    assert.equal(summary.sourcesLeased, 0);
+    assert.equal(store.has(`scrapeSourceLeases/visa__${CC}`), false, "released");
+  });
+
+  test("news: a held lease defers the source (no scrape), others go on", async () => {
+    holdLease("news", "cic-news", NOW + 60 * 1000);
+    const scraped: string[] = [];
+    const s = new newsMod.NewsScraperService({
+      loadSettings: async () => settingsWith(),
+      clock: () => NOW,
+      store: { getDueSources: async () => [{ id: "cic-news", name: "CIC News", status: "active" }] },
+    });
+    s.scrapeSource = async (src: any) => {
+      scraped.push(src.id);
+      return { status: "success", articlesNew: 0 };
+    };
+    const result = await quiet(() => s.runOrchestrator());
+    assert.deepEqual(scraped, []);
+    assert.equal(result.sourcesLeased, 1);
+    assert.equal((docsOf("scrapeRuns")[0].sources as any[])[0].status, "deferred");
+  });
+
+  test("settings unreadable: scheduled ticks fail closed, Run now 503, hourly alert", async () => {
+    const orig = firebase.collections.appConfig;
+    firebase.collections.appConfig = {
+      ...orig,
+      doc: (id: string) => (id === "scraperSettings" ? { get: async () => Promise.reject(new Error("unavailable")) } : orig.doc(id)),
+    };
+    try {
+      const monday = Date.parse("2026-11-09T02:15:00Z");
+      seedGb({ nextCrawlAt: Timestamp.fromMillis(monday - HOUR) });
+      const summary = await withStubs(() => crawl.runOrchestrator({ now: monday, fetchFxRates }));
+      assert.equal(summary.sourcesProcessed, 0);
+      assert.equal(docsOf("scrapeRuns").length, 0, "tick skipped");
+      // News too (default loader).
+      const calls: string[] = [];
+      const n = new newsMod.NewsScraperService({ store: { getDueSources: async () => (calls.push("due"), []) } });
+      await quiet(() => n.runOrchestrator());
+      assert.deepEqual(calls, []);
+      // Run now refuses (503).
+      const out = await call("runSource", admin({ params: { kind: "visa", id: CC }, body: {} }));
+      assert.equal(out.status, 503);
+      assert.equal(out.body.error, "SETTINGS_UNAVAILABLE");
+      // The hourly check raises settings_unreadable.
+      const svc = alertsMod.scrapeAlertService;
+      const origLog = svc.log;
+      svc.log = () => undefined;
+      svc.realClock = () => NOW;
+      try {
+        const r = await quiet(() => svc.runHourlyCheck(NOW));
+        assert.ok(r.actions.some((a: any) => a.action === "created" && a.alert.rule === "settings_unreadable"));
+      } finally {
+        svc.log = origLog;
+      }
+    } finally {
+      firebase.collections.appConfig = orig;
+    }
+  });
+});
+
+describe("stale Run now requests", () => {
+  test("a request left running past its deadline reads as failed (timed out); worker sweep too", async () => {
+    store.set("scrapeRunRequests/r-old", {
+      id: "r-old",
+      kind: "visa",
+      scope: "source",
+      sourceId: CC,
+      status: "running",
+      requestedAt: Timestamp.fromMillis(NOW - 20 * 60 * 1000),
+      startedAt: Timestamp.fromMillis(NOW - 20 * 60 * 1000),
+      lockId: "visa__GB",
+    });
+    store.set("scrapeRunRequests/r-old2", {
+      id: "r-old2",
+      kind: "news",
+      scope: "scraper",
+      sourceId: null,
+      status: "queued",
+      requestedAt: Timestamp.fromMillis(NOW - 16 * 60 * 1000),
+      startedAt: null,
+      lockId: "news___all",
+    });
+    const out = await call("getRequest", admin({ params: { id: "r-old" } }));
+    assert.equal(out.body.data.status, "failed");
+    assert.match(out.body.data.error, /^timed out/);
+    // The worker's sweep closes the other one before claiming its own.
+    await quiet(() => worker.process("missing-request"));
+    assert.equal(store.get("scrapeRunRequests/r-old2")!.status, "failed");
+  });
+});
+
+describe("budget_hard_stop resolution (review)", () => {
+  const run = (summary: any) => ({ id: "r", kind: "visa", status: "succeeded", summary });
+  const cfg = () => alertRules.resolveConfig({}).config;
+
+  test("post-run: resolves only when the run checked the budget and found it under", () => {
+    const key = alertRules.BUDGET_HARD_STOP_KEY;
+    assert.deepEqual(alertRules.evaluateBudgetHardStop(run({ budgetChecked: true, budgetOver: false }), cfg()).scope, { keys: [key] });
+    assert.deepEqual(alertRules.evaluateBudgetHardStop(run({ budgetChecked: false }), cfg()).scope, { keys: [] }, "cost unreadable: keep");
+    assert.deepEqual(alertRules.evaluateBudgetHardStop(run({ budgetChecked: true, budgetOver: true }), cfg()).scope, { keys: [] }, "still over: keep");
+    assert.deepEqual(alertRules.evaluateBudgetHardStop(run({}), cfg()).scope, { keys: [] }, "older run doc: keep");
+  });
+
+  test("hourly: clears when the stop is off, no budget, or spend is under; keeps when over", () => {
+    const key = alertRules.BUDGET_HARD_STOP_KEY;
+    assert.deepEqual(alertRules.evaluateBudgetHardStopClears(false, { monthUsd: 9, budgetUsd: 1 }).scope, { keys: [key] });
+    assert.deepEqual(alertRules.evaluateBudgetHardStopClears(true, { monthUsd: 9, budgetUsd: null }).scope, { keys: [key] });
+    assert.deepEqual(alertRules.evaluateBudgetHardStopClears(true, { monthUsd: 0.5, budgetUsd: 1 }).scope, { keys: [key] });
+    assert.deepEqual(alertRules.evaluateBudgetHardStopClears(true, { monthUsd: 1, budgetUsd: 1 }).scope, { keys: [] });
+  });
+
+  test("a hard-stopped visa run sets budgetChecked + budgetOver", async () => {
+    seedGb();
+    store.set("appConfig/scraperSettings", { budget: { hardStop: true } });
+    store.set("appConfig/scrapeBudget", { monthlyUsd: 1 });
+    store.set("scrapeCosts/2026-11", { month: "2026-11", totals: { costUsd: 1.5 } });
+    const s = await withStubs(() => crawl.runOrchestrator({ now: NOW, fetchFxRates, trigger: "manual", sourceId: CC }));
+    assert.equal(s.budgetChecked, true);
+    assert.equal(s.budgetOver, true);
+  });
+});
+
+describe("price table keys (review)", () => {
+  const model = {
+    inputPer1M: 0.2,
+    cachedInputPer1M: 0.02,
+    outputPer1M: 0.8,
+    sourceUrl: "https://api-docs.deepseek.com/quick_start/pricing",
+    effectiveFrom: "2026-09-01",
+  };
+  test("unknown keys and reserved names are 400s naming the field; nothing stored", async () => {
+    const cases: [any, string][] = [
+      [{ currency: "USD", verifiedAt: "x", models: { m: model }, extra: 1 }, "pricing.table.extra"],
+      [{ currency: "USD", verifiedAt: "x", models: { m: { ...model, typo: 1 } } }, "pricing.table.models.m.typo"],
+      [{ currency: "USD", verifiedAt: "x", models: { __name__: model } }, "pricing.table.models"],
+      [{ currency: "USD", verifiedAt: "x", models: { "bad key!": model } }, "pricing.table.models"],
+      [
+        { currency: "USD", verifiedAt: "x", models: { m: model }, requestPricing: { __x__: { perRequestUsd: 0, effectiveFrom: "x", sourceUrl: "x" } } },
+        "pricing.table.requestPricing",
+      ],
+      [
+        { currency: "USD", verifiedAt: "x", models: { m: { ...model, offPeak: { inputPer1M: 1, cachedInputPer1M: 1, outputPer1M: 1, x: 2 } } } },
+        "pricing.table.models.m.offPeak.x",
+      ],
+    ];
+    for (const [table, field] of cases) {
+      const out = await call("patch", admin({ body: { pricing: { table } } }));
+      assert.equal(out.status, 400, JSON.stringify(table));
+      assert.equal(out.body.field, field);
+    }
+    assert.equal(store.has("appConfig/llmPricing"), false);
+  });
+});

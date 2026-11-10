@@ -1,3 +1,4 @@
+import { logger } from "firebase-functions";
 import { collections } from "../../../utils/firebase";
 import type { ScraperSettings, ScraperSettingsDoc } from "./types";
 
@@ -9,10 +10,13 @@ import type { ScraperSettings, ScraperSettingsDoc } from "./types";
 // utils/firebase + types) so the visa / news orchestrators do not pull in the
 // admin service (alerts, pricing, history) and no import cycle appears.
 //
-//   loadScraperSettings()   one Firestore read, merged over the defaults.
-//                           NEVER throws: an unreadable doc means defaults,
-//                           so a Firestore hiccup can't stop (or un-stop) a
-//                           tick in a surprising way; it is logged.
+//   loadScraperSettingsResult()  one Firestore read, merged over the
+//                           defaults, plus `readError` when the READ failed.
+//                           Never throws. Scheduled ticks FAIL CLOSED on a
+//                           readError (skip the tick: an admin's "off" must
+//                           not turn into the defaults' "on"); a MISSING doc
+//                           is normal and means defaults.
+//   loadScraperSettings()   the same, settings only (the admin API / tests).
 //   resolveScraperSettings  the pure merge, field by field: a bad stored
 //                           value falls back to its default (and is reported),
 //                           the same lenient rule the alert engine uses.
@@ -106,22 +110,37 @@ export function resolveScraperSettings(raw: unknown): { settings: ScraperSetting
   return { settings: out, problems };
 }
 
+/** What a settings read produced. */
+export interface LoadedScraperSettings {
+  settings: ScraperSettings; // resolved (defaults when the read failed)
+  readError?: string; // set when the Firestore READ failed (not for a missing doc)
+}
+
 /**
- * Read `appConfig/scraperSettings` once and resolve it. Never throws: on a
- * read error the defaults are returned (logged). Called once at the start of
- * every scheduled tick and every manual run.
+ * Read `appConfig/scraperSettings` once and resolve it. Never throws. On a
+ * read failure it returns the defaults WITH `readError` and writes one
+ * structured ERROR line (event "scrape_alert_engine_error", stage
+ * "scraper_settings_read"), which the #83 Cloud Monitoring backstop pages
+ * on. Called once at the start of every scheduled tick and manual run.
  */
-export async function loadScraperSettings(): Promise<ScraperSettings> {
+export async function loadScraperSettingsResult(): Promise<LoadedScraperSettings> {
   try {
     const snap = await collections.appConfig.doc(SCRAPER_SETTINGS_DOC_ID).get();
     const { settings, problems } = resolveScraperSettings(snap.exists ? (snap.data() as ScraperSettingsDoc) : undefined);
     for (const p of problems) console.warn(`Scraper settings (appConfig/${SCRAPER_SETTINGS_DOC_ID}): ${p}`);
-    return settings;
+    return { settings };
   } catch (err) {
-    console.error(
-      `Scraper settings: reading appConfig/${SCRAPER_SETTINGS_DOC_ID} failed, using defaults: ` +
-        `${(err as Error)?.message ?? String(err)}`
-    );
-    return JSON.parse(JSON.stringify(DEFAULT_SCRAPER_SETTINGS)) as ScraperSettings;
+    const readError = `reading appConfig/${SCRAPER_SETTINGS_DOC_ID} failed: ${(err as Error)?.message ?? String(err)}`;
+    try {
+      logger.write({ severity: "ERROR", message: `Scraper settings: ${readError}`, event: "scrape_alert_engine_error", stage: "scraper_settings_read" });
+    } catch {
+      console.error(`Scraper settings: ${readError}`);
+    }
+    return { settings: JSON.parse(JSON.stringify(DEFAULT_SCRAPER_SETTINGS)) as ScraperSettings, readError };
   }
+}
+
+/** Settings only (defaults on a read error): the admin API and tests. */
+export async function loadScraperSettings(): Promise<ScraperSettings> {
+  return (await loadScraperSettingsResult()).settings;
 }

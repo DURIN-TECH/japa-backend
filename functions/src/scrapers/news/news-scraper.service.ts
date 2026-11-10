@@ -34,7 +34,9 @@ import type { ScrapeRunTrigger } from "../shared/runs/types";
 import { scrapeCostService } from "../shared/cost/scrape-cost.service";
 import { roundUsd } from "../shared/cost/scrape-cost-pricing";
 // Issue #96: kill switch + maxSourcesPerRun from appConfig/scraperSettings.
-import { loadScraperSettings } from "../shared/settings/scraper-settings.store";
+import { loadScraperSettingsResult, type LoadedScraperSettings } from "../shared/settings/scraper-settings.store";
+// Per-source crawl leases (issue #96 review): one crawl of a source at a time.
+import { leaseHeldReason, sourceLeaseService, type HeldLease, type SourceLeaseService } from "../shared/runs/source-lease";
 import type { ScraperSettings } from "../shared/settings/types";
 
 // ============================================
@@ -167,6 +169,8 @@ export interface NewsScraperServiceOptions {
   // Issue #96: settings loader (tests inject one; defaults to ONE read of
   // appConfig/scraperSettings per tick).
   loadSettings?: () => Promise<ScraperSettings>;
+  // Issue #96 review: crawl-lease service (defaults to the Firestore one).
+  leases?: SourceLeaseService;
 }
 
 /**
@@ -188,6 +192,21 @@ export interface ScrapeSourceTrace {
   sourceHealthRecorded?: boolean;
 }
 
+/** A zeroed news run result (a switched-off or fail-closed tick returns it). */
+function emptyNewsResult(): OrchestratorResult {
+  return {
+    sourcesProcessed: 0,
+    newArticles: 0,
+    errors: 0,
+    articlesFound: 0,
+    articlesDuplicate: 0,
+    articlesFailed: 0,
+    sourcesDeferred: 0,
+    hostsBackedOff: 0,
+    requestsAttempted: 0,
+  };
+}
+
 // ============================================
 // NEWS SCRAPER SERVICE
 // ============================================
@@ -199,7 +218,9 @@ export class NewsScraperService {
   private readonly clock: () => number;
   private readonly runs: ScrapeRunService;
   // Issue #96: reads the admin settings (kill switch, maxSourcesPerRun).
-  private readonly loadSettings: () => Promise<ScraperSettings>;
+  private readonly loadSettings: () => Promise<LoadedScraperSettings>;
+  // Issue #96 review: per-source crawl leases.
+  private readonly leasesOverride?: SourceLeaseService;
   // Issue #81: requests attempted (listing pages, feeds, article pages, API
   // calls) since construction. Callers read deltas around a scrape.
   private requestsAttempted = 0;
@@ -214,7 +235,11 @@ export class NewsScraperService {
     this.runs = options.runs ?? scrapeRunService;
     // A wrapper (not the bare import): the singleton is built at module load,
     // and the binding must be read at call time (scrapers/index.ts cycle).
-    this.loadSettings = options.loadSettings ?? (() => loadScraperSettings());
+    // An injected loader (tests) returns plain settings: wrap it.
+    const injected = options.loadSettings;
+    this.loadSettings = injected ? async () => ({ settings: await injected() }) : () => loadScraperSettingsResult();
+    // Resolved at call time (see leases()), like the settings loader.
+    this.leasesOverride = options.leases;
     this.fetcher = new VisaCatalogFetchService({
       http: options.http ?? createNewsHttpClient(),
       minIntervalMs: options.minIntervalMs,
@@ -267,7 +292,17 @@ export class NewsScraperService {
   }): Promise<OrchestratorResult> {
     const trigger: ScrapeRunTrigger = opts?.trigger ?? "scheduled";
     // ---- Settings: ONE read per tick; never throws (issue #96) ----
-    const settings = opts?.settings ?? (await this.loadSettings());
+    let settings = opts?.settings;
+    if (!settings) {
+      const loaded = await this.loadSettings();
+      // FAIL CLOSED (review): an unreadable settings doc skips a scheduled
+      // tick (the store logged an engine-error line for the backstop).
+      if (loaded.readError && trigger === "scheduled") {
+        console.error("News scrape: scraper settings unreadable, tick skipped (fail closed)");
+        return emptyNewsResult();
+      }
+      settings = loaded.settings;
+    }
     const result: OrchestratorResult = {
       sourcesProcessed: 0,
       newArticles: 0,
@@ -326,13 +361,41 @@ export class NewsScraperService {
 
     // Issue #82: API request counters before the run (delta recorded below).
     const apiBefore = { ...this.apiRequestsByProvider };
+    // ---- Source leases (issue #96 review) ----
+    // Each source's crawl lease is taken before it is scraped; a source
+    // another run holds is recorded `deferred` (reason on the line, not an
+    // error) and skipped. All leases are released when the run ends.
+    const leases = this.leasesOverride ?? sourceLeaseService;
+    const held: HeldLease[] = [];
     try {
-      await this.scrapeDueSources(dueSources, result, recorder);
+      const leased: NewsSource[] = [];
+      for (const source of dueSources) {
+        const lease = await leases.acquire("news", source.id, { trigger, runId: recorder.id });
+        if (!lease.ok) {
+          result.sourcesLeased = (result.sourcesLeased ?? 0) + 1;
+          recorder.recordSource({
+            sourceId: source.id,
+            name: source.name,
+            status: "deferred",
+            pagesAttempted: 0,
+            pagesFetched: 0,
+            errors: 0,
+            error: leaseHeldReason(lease),
+          });
+          continue;
+        }
+        held.push(lease);
+        leased.push(source);
+      }
+      await this.scrapeDueSources(leased, result, recorder);
     } catch (err) {
-      // Only reachable if a store write outside the per-source try throws.
+      // Only reachable if a store write outside the per-source try throws
+      // (or a lease could not be taken).
       await this.recordApiRequests(recorder, apiBefore);
       await recorder.fail(err, result);
       throw err;
+    } finally {
+      for (const lease of held) await leases.release(lease);
     }
     await this.recordApiRequests(recorder, apiBefore);
 

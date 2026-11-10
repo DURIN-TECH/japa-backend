@@ -40,7 +40,9 @@ import {
 } from "./visa-catalog-supplementary";
 // Admin settings (issue #96): kill switch + limits (one read per tick) and
 // the budget hard stop that gates LLM extraction.
-import { loadScraperSettings } from "../shared/settings/scraper-settings.store";
+import { loadScraperSettingsResult } from "../shared/settings/scraper-settings.store";
+// Per-source crawl leases (issue #96 review): one crawl of a source at a time.
+import { leaseHeldReason, sourceLeaseService, type HeldLease, type SourceLeaseService } from "../shared/runs/source-lease";
 import { loadBudgetGate, type BudgetGate } from "../shared/settings/budget-hard-stop";
 import type { ScraperSettings } from "../shared/settings/types";
 
@@ -151,6 +153,14 @@ export interface CrawlSummary {
   // re-extract) were fetched + hashed but NOT extracted because of it.
   budgetHardStop: boolean;
   extractionsSkippedBudget: number;
+  // Issue #96 review, for the budget_hard_stop alert: budgetChecked = the
+  // run knows the budget state (hard stop off, no budget, or month-to-date
+  // read OK; false only when the cost read failed); budgetOver = at / over
+  // budget with the hard stop on. sourcesLeased = sources skipped because
+  // another run held their crawl lease (recorded as `deferred` sources).
+  budgetChecked: boolean;
+  budgetOver: boolean;
+  sourcesLeased: number;
 }
 
 class VisaCatalogCrawlService {
@@ -196,26 +206,44 @@ class VisaCatalogCrawlService {
     // Called with the run id as soon as the run doc is written (the manual
     // worker stores it on the request so the portal can follow the run).
     onRunStarted?: (runId: string) => Promise<void> | void;
+    // Issue #96 review: the lease service (tests inject one; defaults to the
+    // Firestore-backed singleton).
+    leases?: SourceLeaseService;
   }): Promise<CrawlSummary> {
     const trigger: ScrapeRunTrigger = opts?.trigger ?? "scheduled";
 
     // ---- Settings: ONE read per tick (issue #96) ----
-    // Never throws (defaults on a read error). Explicit maxSources /
-    // maxExtractions options (tests, scripts) still win over the settings.
-    const settings = opts?.settings ?? (await loadScraperSettings());
+    // Never throws. Explicit maxSources / maxExtractions options (tests,
+    // scripts) still win over the settings.
+    let settings = opts?.settings;
+    if (!settings) {
+      const loaded = await loadScraperSettingsResult();
+      // FAIL CLOSED (review): when the settings doc cannot be READ, a
+      // scheduled tick does not run at all — an admin may have switched the
+      // scraper off, and defaults would turn it back on (LLM spend
+      // included). The store already logged an engine-error line (the
+      // Terraform backstop pages on it) and the hourly alert check raises
+      // `settings_unreadable`. A missing doc is not an error (defaults).
+      if (loaded.readError && trigger === "scheduled") {
+        console.error("Visa catalog crawl: scraper settings unreadable, tick skipped (fail closed)");
+        return emptySummary();
+      }
+      settings = loaded.settings;
+    }
+    const cfg = settings;
 
     // ---- Kill switch (issue #96) ----
     // A SCHEDULED tick with the visa scraper switched off returns before
     // anything else: no stale sweep, no rollup backfill, no due query, no
     // run doc, no fetch, no LLM call. Manual runs are gated by the API /
     // worker (blockManualWhenOff), not here.
-    if (trigger === "scheduled" && !settings.visa.enabled) {
+    if (trigger === "scheduled" && !cfg.visa.enabled) {
       console.log("Visa catalog crawl: the visa scraper is switched off (appConfig/scraperSettings), tick skipped");
       return emptySummary();
     }
 
-    const maxSources = opts?.maxSources ?? settings.visa.maxSourcesPerTick;
-    const maxExtractions = opts?.maxExtractions ?? settings.visa.maxExtractionsPerRun;
+    const maxSources = opts?.maxSources ?? cfg.visa.maxSourcesPerTick;
+    const maxExtractions = opts?.maxExtractions ?? cfg.visa.maxExtractionsPerRun;
 
     // The tick's instant. Every scheduling decision AND every timestamp
     // written below (lastCrawledAt, page crawl times, updatedAt, the
@@ -301,12 +329,39 @@ class VisaCatalogCrawlService {
       }
     }
 
+    // ---- Source leases (issue #96 review) ----
+    // Take each source's crawl lease before touching it; a source another
+    // run is crawling is recorded `deferred` (with the reason) and skipped.
+    // The doc is RE-READ under the lease, so this run starts from the other
+    // run's final state (no lost update of `pages`).
+    const leases = opts?.leases ?? sourceLeaseService;
+    const held: HeldLease[] = [];
     try {
+      const leased = await this.leaseRunnable(runnable, {
+        leases,
+        held,
+        recorder,
+        summary,
+        now,
+        bySourceId: opts?.sourceId !== undefined,
+      });
+
       // ---- Budget hard stop (issue #96), read once per run ----
       // null = nothing to enforce (hard stop off, no budget, or the cost
       // could not be read — then a run warning says so).
-      const budgetGate = await loadBudgetGate(settings, now.toMillis(), (msg) => recorder.recordWarning(msg));
-      await this.crawlRunnable(runnable, {
+      let budgetReadFailed = false;
+      const budgetGate = await loadBudgetGate(cfg, now.toMillis(), (msg) => {
+        budgetReadFailed = true;
+        recorder.recordWarning(msg);
+      });
+      // What this run knows about the budget (review: the alert engine only
+      // resolves budget_hard_stop on a run that really checked it):
+      // budgetChecked = hard stop off, no budget, or the cost was read;
+      // budgetOver = at or over budget at the start (the stop below may
+      // also trip mid-run, which sets budgetHardStop and budgetOver).
+      summary.budgetChecked = !budgetReadFailed;
+      summary.budgetOver = budgetGate !== null && budgetGate.exceeded(0);
+      await this.crawlRunnable(leased, {
         now,
         summary,
         recorder,
@@ -315,6 +370,7 @@ class VisaCatalogCrawlService {
         budgetGate,
         force: opts?.force === true,
       });
+      if (summary.budgetHardStop) summary.budgetOver = true;
       if (summary.budgetHardStop && budgetGate) {
         // A run-level warning (not an error: status unaffected). The post-run
         // alert rule budget_hard_stop (#83 engine) raises the alert from the
@@ -330,12 +386,68 @@ class VisaCatalogCrawlService {
       // the scheduled function logs it as before.
       await recorder.fail(err, summary);
       throw err;
+    } finally {
+      // Release every lease this run took (also when it threw).
+      for (const lease of held) await leases.release(lease);
     }
 
     // ---- Finalise the run record (issue #81) ----
     // "Something worked" = at least one page fetched (see deriveRunStatus).
     await recorder.finalize({ summary, anySuccess: summary.pagesFetched > 0 });
     return summary;
+  }
+
+  /**
+   * Issue #96 review: take the crawl lease of each runnable source, then
+   * re-read its doc under the lease. Returns the fresh snapshots of the
+   * sources this run may crawl; `held` collects the leases to release.
+   *  - lease held by another run -> a `deferred` source line with the
+   *    reason, `summary.sourcesLeased`++, not crawled (no error: the other
+   *    run is crawling it);
+   *  - no longer runnable after the re-read (a due-based run: no longer
+   *    active or no longer due, i.e. the other run just crawled it; a
+   *    single-source run: paused / retired / deleted) -> lease released,
+   *    silently dropped.
+   * A lease that cannot be taken (Firestore error) throws: the run fails.
+   */
+  private async leaseRunnable(
+    runnable: { ref: FirebaseFirestore.DocumentReference; data(): FirebaseFirestore.DocumentData | undefined }[],
+    ctx: {
+      leases: SourceLeaseService;
+      held: HeldLease[];
+      recorder: ScrapeRunRecorder;
+      summary: CrawlSummary;
+      now: Timestamp;
+      bySourceId: boolean;
+    }
+  ): Promise<FirebaseFirestore.DocumentSnapshot[]> {
+    const out: FirebaseFirestore.DocumentSnapshot[] = [];
+    for (const doc of runnable) {
+      const source = doc.data() as VisaSource;
+      const sourceId = source?.countryCode ?? doc.ref.id;
+      const lease = await ctx.leases.acquire("visa", sourceId, { trigger: ctx.recorder.trigger, runId: ctx.recorder.id });
+      if (!lease.ok) {
+        ctx.summary.sourcesLeased++;
+        ctx.recorder.recordSource({
+          sourceId,
+          name: source?.countryName ?? sourceId,
+          status: "deferred",
+          pagesAttempted: 0,
+          pagesFetched: 0,
+          errors: 0,
+          error: leaseHeldReason(lease),
+        });
+        continue;
+      }
+      ctx.held.push(lease);
+      const fresh = await doc.ref.get();
+      const f = fresh.data() as VisaSource | undefined;
+      const stillRunnable = ctx.bySourceId
+        ? fresh.exists && (f?.status === "active" || f?.status === "broken")
+        : fresh.exists && f?.status === "active" && Boolean(f?.nextCrawlAt) && f!.nextCrawlAt!.toMillis() <= ctx.now.toMillis();
+      if (stillRunnable) out.push(fresh);
+    }
+    return out;
   }
 
   /**
@@ -383,8 +495,8 @@ class VisaCatalogCrawlService {
    * Mutates `summary` and notes pages / sources / errors on `recorder`.
    */
   private async crawlRunnable(
-    // Query snapshots (due sources) or one doc snapshot (manual single-source
-    // run, #96): only `ref` and `data()` are used.
+    // Fresh doc snapshots taken under each source's lease (#96 review):
+    // only `ref` and `data()` are used.
     runnable: { ref: FirebaseFirestore.DocumentReference; data(): FirebaseFirestore.DocumentData | undefined }[],
     ctx: {
       now: Timestamp;
@@ -887,6 +999,9 @@ function emptySummary(): CrawlSummary {
     linkedSurchargeErrors: 0,
     budgetHardStop: false,
     extractionsSkippedBudget: 0,
+    budgetChecked: false,
+    budgetOver: false,
+    sourcesLeased: 0,
   };
 }
 

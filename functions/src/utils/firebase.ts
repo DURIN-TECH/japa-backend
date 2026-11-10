@@ -158,6 +158,10 @@ export const collections = {
   // One lock doc per source / whole scraper (`{kind}__{sourceId|_all}`):
   // the in-flight request + cooldown start, claimed in a transaction.
   scrapeRunLocks: db.collection("scrapeRunLocks"),
+  // Per-source crawl leases (`{kind}__{sourceId}`): every crawl of a source
+  // (scheduled, manual, whole-scraper) holds it while crawling, so two runs
+  // never crawl the same source at once. Expire after 15 min.
+  scrapeSourceLeases: db.collection("scrapeSourceLeases"),
 } as const;
 
 // Helper to get subcollection references

@@ -9,6 +9,9 @@ import { EMAIL_BRANDING } from "../../../services/email/branding";
 // through the branded email service (notifyUser needs a user id).
 import { emailService } from "../../../services/email/email.service";
 import type { EmailResult } from "../../../services/email/email.types";
+// Issue #96 review: the hourly check reads the scraper settings (readable?
+// hard stop on?) for settings_unreadable and the budget_hard_stop clear.
+import { loadScraperSettingsResult, type LoadedScraperSettings } from "../settings/scraper-settings.store";
 import { safeErrorMessage, toJson } from "../runs/scrape-run.service";
 import { scrapeCostMonthToDateSource, type MonthToDateCostSource } from "./scrape-alert-cost";
 import {
@@ -16,6 +19,8 @@ import {
   evaluateBrokenSources,
   evaluateBudget,
   evaluateBudgetHardStop,
+  evaluateBudgetHardStopClears,
+  evaluateSettingsReadable,
   evaluateErrorRate,
   evaluateFx,
   evaluateHostBackoff,
@@ -138,6 +143,7 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   llm_budget: "LLM budget",
   review_queue_stale: "review queue waiting",
   budget_hard_stop: "LLM budget hard stop",
+  settings_unreadable: "scraper settings unreadable",
 };
 
 /** Cloud Logging severity per alert severity (resolutions log as INFO). */
@@ -237,6 +243,9 @@ export class ScrapeAlertService {
 
   /** Email delivery: the existing notifyUser path (Resend). Swappable in tests. */
   notify: (input: NotifyUserInput) => Promise<void> = (input) => notificationService.notifyUser(input);
+
+  /** Issue #96 review: scraper settings reader (hourly check). Swappable in tests. */
+  loadSettings: () => Promise<LoadedScraperSettings> = () => loadScraperSettingsResult();
 
   /**
    * Issue #96: email to an extra recipient address (config
@@ -395,13 +404,26 @@ export class ScrapeAlertService {
         });
       }
 
+      // ---- Scraper settings readable? (#96 review: ticks fail closed) ----
+      let loadedSettings: LoadedScraperSettings | undefined;
+      await this.isolated("settings_unreadable", skippedRules, async () => {
+        loadedSettings = await this.loadSettings();
+        evals.push(evaluateSettingsReadable(loadedSettings.readError, config));
+      });
+
       // ---- LLM budget (#82; skipped while no budget is set) ----
       await this.isolated("llm_budget", skippedRules, async () => {
         // Catch #82's rollup up first (runs whose post-run rollup was lost),
         // so the spend compared to the budget is complete.
         await this.costSource.catchUp?.(nowMs);
-        const evaluation = evaluateBudget(await this.costSource.getMonthToDateCost(nowMs), nowMs, config);
+        const cost = await this.costSource.getMonthToDateCost(nowMs);
+        const evaluation = evaluateBudget(cost, nowMs, config);
         if (evaluation) evals.push(evaluation);
+        // #96 review: budget_hard_stop resolves only on a real check that
+        // finds the stop off / no budget / spend under it.
+        if (loadedSettings && !loadedSettings.readError) {
+          evals.push(evaluateBudgetHardStopClears(loadedSettings.settings.budget.hardStop, cost));
+        }
       });
 
       // ---- Review queue ----

@@ -161,6 +161,9 @@ export function parseSettingsPatch(body: unknown): ParsedSettingsPatch {
     rejectUnknownKeys(p, ["table"], "pricing");
     if (p.table !== undefined) {
       const t = p.table;
+      // Review: shape first, so an extra key or a reserved Firestore name
+      // is a 400 naming the field (never stored, never a 500).
+      if (isObj(t)) assertPricingShape(t);
       if (!isObj(t) || !isValidPricingDoc(t)) {
         throw new SettingsValidationError(
           "pricing.table",
@@ -181,6 +184,70 @@ export function parseSettingsPatch(body: unknown): ParsedSettingsPatch {
     }
   }
   return out;
+}
+
+// ---- Price table shape (review item 5) ----
+
+/** Keys allowed at each level of a price table (LlmPricingDoc). */
+const PRICING_TABLE_KEYS = ["currency", "models", "requestPricing", "verifiedAt", "updatedAt"];
+const PRICING_MODEL_KEYS = [
+  "inputPer1M",
+  "cachedInputPer1M",
+  "outputPer1M",
+  "aliases",
+  "offPeak",
+  "peakWindowsUtc",
+  "effectiveFrom",
+  "sourceUrl",
+  "note",
+];
+const PRICING_RATE_KEYS = ["inputPer1M", "cachedInputPer1M", "outputPer1M"];
+const PRICING_WINDOW_KEYS = ["startHour", "endHour", "isoWeekdays"];
+const PRICING_REQUEST_KEYS = ["perRequestUsd", "effectiveFrom", "sourceUrl", "note"];
+
+/**
+ * A model / provider name usable as a Firestore map key: 1..100 chars of
+ * letters, digits and `. _ : / -`, and not a reserved `__name__` form
+ * (Firestore rejects field names matching `__.*__`).
+ */
+const MAP_KEY_RE = /^[A-Za-z0-9._:/-]{1,100}$/;
+function assertMapKey(key: string, path: string): void {
+  if (!MAP_KEY_RE.test(key) || /^__.*__$/.test(key)) {
+    throw new SettingsValidationError(
+      path,
+      `${path}: "${key}" is not a valid name (1-100 letters, digits, . _ : / -; not __reserved__)`
+    );
+  }
+}
+
+/**
+ * Strict key check of a price table (pure). Throws SettingsValidationError
+ * naming the first unknown key or bad model / provider name. Value checks
+ * are isValidPricingDoc's job (called right after).
+ */
+export function assertPricingShape(t: Record<string, unknown>): void {
+  const base = "pricing.table";
+  rejectUnknownKeys(t, PRICING_TABLE_KEYS, base);
+  if (isObj(t.models)) {
+    for (const [name, m] of Object.entries(t.models)) {
+      const mp = `${base}.models.${name}`;
+      assertMapKey(name, `${base}.models`);
+      if (!isObj(m)) continue; // isValidPricingDoc reports it
+      rejectUnknownKeys(m, PRICING_MODEL_KEYS, mp);
+      if (isObj(m.offPeak)) rejectUnknownKeys(m.offPeak, PRICING_RATE_KEYS, `${mp}.offPeak`);
+      if (Array.isArray(m.peakWindowsUtc)) {
+        m.peakWindowsUtc.forEach((w, i) => {
+          if (isObj(w)) rejectUnknownKeys(w, PRICING_WINDOW_KEYS, `${mp}.peakWindowsUtc.${i}`);
+        });
+      }
+    }
+  }
+  if (isObj(t.requestPricing)) {
+    for (const [provider, r] of Object.entries(t.requestPricing)) {
+      assertMapKey(provider, `${base}.requestPricing`);
+      if (isObj(r)) rejectUnknownKeys(r, PRICING_REQUEST_KEYS, `${base}.requestPricing.${provider}`);
+    }
+  }
 }
 
 /**

@@ -3,7 +3,9 @@ import { collections, db } from "../../../utils/firebase";
 import { safeErrorMessage } from "../runs/scrape-run.service";
 import { visaCatalogCrawlService } from "../../visa-catalog/visa-catalog-crawl.service";
 import { newsScraperService } from "../../news/news-scraper.service";
-import { loadScraperSettings } from "./scraper-settings.store";
+import { loadScraperSettingsResult } from "./scraper-settings.store";
+// Issue #96 review: close requests left `running` by a killed function.
+import { scrapeRunRequestService } from "./scrape-run-request.service";
 import type { ScrapeRunLockDoc, ScrapeRunRequestDoc, ScrapeRunRequestStatus, ScraperSettings } from "./types";
 
 // ============================================
@@ -59,7 +61,15 @@ export class ScrapeRunWorker {
     return {
       visa: this.overrides?.visa ?? visaCatalogCrawlService,
       news: this.overrides?.news ?? newsScraperService,
-      loadSettings: this.overrides?.loadSettings ?? loadScraperSettings,
+      // Fail closed: an unreadable settings doc fails the request (the
+      // admin may have blocked manual runs) instead of using defaults.
+      loadSettings:
+        this.overrides?.loadSettings ??
+        (async () => {
+          const r = await loadScraperSettingsResult();
+          if (r.readError) throw new Error(`scraper settings unreadable (${r.readError})`);
+          return r.settings;
+        }),
     };
   }
 
@@ -71,6 +81,12 @@ export class ScrapeRunWorker {
    */
   async process(requestId: string): Promise<ScrapeRunRequestStatus | null> {
     const ref = collections.scrapeRunRequests.doc(requestId);
+
+    // ---- 0. Close requests past their deadline (review item 2) ----
+    // A function killed at its timeout never reaches step 4, so its request
+    // would stay `running` forever. Every worker invocation first marks such
+    // requests `failed` ("timed out"); GET and the next Run now do too.
+    await scrapeRunRequestService.sweepStale(this.clock());
 
     // ---- 1. Claim (queued -> running) ----
     let request: ScrapeRunRequestDoc | null;

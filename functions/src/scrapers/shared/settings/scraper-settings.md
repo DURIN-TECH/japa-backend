@@ -81,7 +81,9 @@ before #96, so an empty Firestore behaves exactly as before).
 Alert rule ids: `run_failed`, `run_stuck`, `missed_window`, `source_broken`,
 `error_rate`, `host_backoff`, `linked_surcharge`, `fx_refresh_failing`,
 `llm_budget`, `review_queue_stale`, and NEW `budget_hard_stop` (critical: a
-visa run skipped extraction because of the hard stop).
+visa run skipped extraction because of the hard stop) and
+`settings_unreadable` (critical: `appConfig/scraperSettings` could not be
+read, so scheduled ticks are skipped).
 
 ## 2. `PATCH /admin/scraper-settings`
 
@@ -112,7 +114,7 @@ Validation (400 `VALIDATION_ERROR`, `field` names the first bad field):
 | `manualRuns.cooldownMinutes` | integer 0..1440 |
 | `budget.monthlyUsd` | null, or a finite number 0..100000 |
 | `alerts.*` | the engine's own `resolveConfig` rules (any value it would reject -> 400, field = `alerts.<its path>`); `extraRecipientEmails`: up to 20 valid addresses; `rules.<id>`: known rule ids only |
-| `pricing.table` | `isValidPricingDoc`, plus `currency: "USD"` and a `verifiedAt` string. Invalid -> 400 `field: "pricing.table"`, nothing saved |
+| `pricing.table` | known keys only at every level (table: `currency models requestPricing verifiedAt`; model: `inputPer1M cachedInputPer1M outputPer1M aliases offPeak peakWindowsUtc effectiveFrom sourceUrl note`; `offPeak`: the 3 prices; window: `startHour endHour isoWeekdays`; request price: `perRequestUsd effectiveFrom sourceUrl note`) -> 400 naming the key (e.g. `pricing.table.models.m.typo`); model / provider names 1-100 of `A-Za-z0-9._:/-` and not `__reserved__` -> 400 `field: "pricing.table.models"` / `"pricing.table.requestPricing"`; then `isValidPricingDoc` plus `currency: "USD"` and a `verifiedAt` string -> 400 `field: "pricing.table"`. Nothing saved on any 400 |
 
 -> 200 with the same body as `GET` (new values). A body with no change -> 200,
 nothing written, no history entry.
@@ -196,17 +198,20 @@ Errors:
 | --- | --- | --- |
 | 400 | `VALIDATION_ERROR` | bad `kind`, `force` not boolean, unknown body key |
 | 404 | `NOT_FOUND` | no such source |
-| 409 | `RUN_IN_PROGRESS` | a manual run of this source is queued / running; body has `requestId` |
+| 409 | `RUN_IN_PROGRESS` | another run is on this source: a manual run of it is queued / running (body has `requestId`), a whole-scraper request of the same kind is queued / running (`requestId` of that one), or any run holds the source's crawl lease, e.g. a scheduled tick or a whole-scraper run crawling it (body has `runId` when known and `leaseExpiresAt`) |
 | 409 | `RUN_COOLDOWN` | the last request for this source was < `cooldownMinutes` ago; body has `retryAfter` (ISO) |
 | 409 | `SOURCE_NOT_ACTIVE` | the source is `paused` or `retired` (a `broken` one may run) |
 | 409 | `SCRAPER_DISABLED` | the scraper is off and `blockManualWhenOff` is set |
+| 503 | `SETTINGS_UNAVAILABLE` | `appConfig/scraperSettings` could not be read (fail closed: retry later) |
 
 ## 6. `POST /admin/scrapers/:kind/run` (Run now, whole scraper)
 
-Same body, response and errors (no 404 / `SOURCE_NOT_ACTIVE`). Runs every DUE
-active source now, ignoring crawl windows (visa: up to `maxSourcesPerTick`;
-news: the normal due batch, up to `maxSourcesPerRun`). One in flight per
-scraper, same cooldown. Nothing due -> the request ends `skipped`.
+Same body, response and errors (no 404 / `SOURCE_NOT_ACTIVE`; `RUN_IN_PROGRESS`
+only for another whole-scraper request). Runs every DUE active source now,
+ignoring crawl windows (visa: up to `maxSourcesPerTick`; news: the normal due
+batch, up to `maxSourcesPerRun`). One in flight per scraper, same cooldown.
+Nothing due -> the request ends `skipped`. A source another run is crawling
+(lease held) is skipped and shows as a `deferred` source line in the run.
 
 ## 7. `GET /admin/scrape-run-requests/:id`
 
@@ -228,9 +233,13 @@ scraper, same cooldown. Nothing due -> the request ends `skipped`.
 ```
 
 `succeeded` = the orchestrator finished (the run itself may be `partial` /
-`failed`: read `scrapeRuns/{runId}`); `failed` = the worker threw; `skipped` =
-nothing to run (no due source, source no longer active, scraper disabled with
-`blockManualWhenOff`). Unknown id -> 404. Requests are TTL-deleted 30 days after
+`failed`: read `scrapeRuns/{runId}`); `failed` = the worker threw (or the
+settings could not be read), OR the request passed its deadline: still
+`queued` / `running` 15 minutes after it was requested / started (the
+function was killed at its timeout or crashed) -> `failed` with `error`
+starting `"timed out"` (applied on GET, by the next Run now on that scope and
+by every worker invocation); `skipped` = nothing to run (no due source, source
+no longer active, scraper disabled with `blockManualWhenOff`). Unknown id -> 404. Requests are TTL-deleted 30 days after
 `requestedAt` (`expireAt`).
 
 ---
@@ -239,7 +248,20 @@ nothing to run (no due source, source no longer active, scraper disabled with
 
 - **Kill switch.** Each scheduled tick reads `appConfig/scraperSettings` ONCE
   at its start. `enabled: false` -> the tick returns at once: no stale sweep,
-  no run doc, no fetch, no LLM call.
+  no run doc, no fetch, no LLM call. **Fails closed:** when the doc cannot be
+  READ (not merely missing), the tick is skipped too, an engine-error log line
+  is written (event `scrape_alert_engine_error`, stage
+  `scraper_settings_read`, paged by the Terraform backstop) and the hourly
+  check raises `settings_unreadable`. Run now answers 503 meanwhile.
+- **Crawl leases.** Every crawl of a source (scheduled tick, single-source
+  run, whole-scraper run) takes `scrapeSourceLeases/{kind}__{sourceId}` in a
+  transaction before touching the source and re-reads the source under it;
+  it releases the lease when the run ends. A source whose lease another run
+  holds is skipped: a `deferred` line on the run with the reason in `error`
+  ("source is being crawled by another manual run (runId); its lease expires
+  at ..."), counted in `summary.sourcesLeased`, not an error. A lease expires
+  15 minutes after it was taken (540s timeout + margin), so a crashed run
+  blocks a source for at most that long.
 - **Limits.** The same read supplies `maxExtractionsPerRun` / `maxSourcesPerTick`
   (visa) and `maxSourcesPerRun` (news). Missing / invalid values fall back to
   the defaults above (never throws).
@@ -250,8 +272,11 @@ nothing to run (no due source, source no longer active, scraper disabled with
   allows) and gets `extractionDeferredAt`; its run line is `capped` with
   reason `budget hard stop`. The run records a warning, `summary.budgetHardStop:
   true` and `summary.extractionsSkippedBudget`, and the post-run alert rule
-  `budget_hard_stop` raises a critical alert (auto-resolved by the next visa
-  run without the stop).
+  `budget_hard_stop` raises a critical alert. It is resolved only by a real
+  budget check that finds the stop off, no budget, or spend under it: a visa
+  run with `summary.budgetChecked: true` and `summary.budgetOver: false`, or
+  the hourly check. A run that could not read the cost, or is still over
+  budget without skipping a page, leaves it open.
 - **One in flight + cooldown.** Enforced in a transaction on
   `scrapeRunLocks/{kind}__{sourceId | _all}` while creating the request. A
   queued / running request older than 15 minutes is treated as dead.
@@ -260,6 +285,7 @@ nothing to run (no due source, source no longer active, scraper disabled with
 
 New collections (backend-only; `firestore.rules` has no match, so clients are
 denied): `appConfig/scraperSettings`, `scraperSettingsHistory`,
-`scrapeRunRequests` (TTL `expireAt`), `scrapeRunLocks`. All new queries are
-single-field (`orderBy at desc`), so no composite index is needed; the TTL
+`scrapeRunRequests` (TTL `expireAt`), `scrapeRunLocks`, `scrapeSourceLeases`.
+All new queries are single-field (`orderBy at desc`, `status in [...]`), so no
+composite index is needed; the TTL
 override for `scrapeRunRequests.expireAt` is in `firestore.indexes.json`.

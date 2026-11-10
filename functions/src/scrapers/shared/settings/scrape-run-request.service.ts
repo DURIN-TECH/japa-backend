@@ -2,13 +2,11 @@ import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db } from "../../../utils/firebase";
 import { toJson } from "../runs/scrape-run.service";
 import type { ScrapeRunKind } from "../runs/types";
-import { loadScraperSettings } from "./scraper-settings.store";
-import type {
-  ScrapeRunLockDoc,
-  ScrapeRunRequestDoc,
-  ScrapeRunRequestScope,
-  ScraperSettings,
-} from "./types";
+import { loadScraperSettingsResult, type LoadedScraperSettings } from "./scraper-settings.store";
+// Issue #96 review: a source run is refused while another run holds the
+// source's crawl lease (scheduled tick, whole-scraper run, ...).
+import { sourceLeaseService } from "../runs/source-lease";
+import type { ScrapeRunLockDoc, ScrapeRunRequestDoc, ScrapeRunRequestScope } from "./types";
 
 // ============================================
 // MANUAL "RUN NOW" — request creation (issue #96)
@@ -26,7 +24,14 @@ import type {
 //      RUN_IN_PROGRESS (an older one died with its function: ignored);
 //   2. the last request less than `manualRuns.cooldownMinutes` ago -> 409
 //      RUN_COOLDOWN with retryAfter;
-//   3. else the request is created `queued` and the lock points at it.
+//   3. scope "source" only (review): the source's crawl lease is held by
+//      another run (a scheduled tick, a whole-scraper run crawling it) or a
+//      whole-scraper request of the same kind is in flight -> 409
+//      RUN_IN_PROGRESS (with runId / requestId when known);
+//   4. else the request is created `queued` and the lock points at it.
+// A queued / running request found past its deadline (STALE_REQUEST_MS
+// after it was requested / started) is marked `failed` ("timed out") on the
+// way, here, on GET, and by the worker's sweep (review item 2).
 // The worker clears `activeRequestId` when it finishes. A lock doc (not a
 // query for "active requests of this source") because a transaction can
 // lock one doc, even a missing one, but not "no doc matches this query".
@@ -43,9 +48,37 @@ export const STALE_REQUEST_MS = 15 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** Why a request was refused (the controller maps each to a 4xx). */
-export type RunRequestRefusal = "NOT_FOUND" | "SOURCE_NOT_ACTIVE" | "SCRAPER_DISABLED" | "RUN_IN_PROGRESS" | "RUN_COOLDOWN";
+export type RunRequestRefusal =
+  | "NOT_FOUND"
+  | "SOURCE_NOT_ACTIVE"
+  | "SCRAPER_DISABLED"
+  | "RUN_IN_PROGRESS"
+  | "RUN_COOLDOWN"
+  // The settings doc could not be read: refuse (fail closed) rather than
+  // guess whether the scraper is switched off. -> 503.
+  | "SETTINGS_UNAVAILABLE";
 
-/** A refused request: 404 for NOT_FOUND, 409 otherwise. */
+/** The error stored on a request that passed its deadline. */
+export const TIMED_OUT_ERROR = "timed out: the run did not finish within its deadline (function timeout or crash)";
+
+/**
+ * When a queued / running request is past its deadline: STALE_REQUEST_MS
+ * after it started (running) or was requested (queued, never picked up).
+ * Pure.
+ */
+export function isStaleRequest(doc: Pick<ScrapeRunRequestDoc, "status" | "requestedAt" | "startedAt">, nowMs: number): boolean {
+  if (doc.status !== "queued" && doc.status !== "running") return false;
+  const since = (doc.status === "running" ? doc.startedAt : null) ?? doc.requestedAt;
+  const ms = since?.toMillis?.();
+  return ms !== undefined && nowMs - ms >= STALE_REQUEST_MS;
+}
+
+/** The update that closes a timed-out request. */
+function timedOutUpdate(nowMs: number): Partial<ScrapeRunRequestDoc> {
+  return { status: "failed", error: TIMED_OUT_ERROR, finishedAt: Timestamp.fromMillis(nowMs) };
+}
+
+/** A refused request: 404 for NOT_FOUND, 503 for SETTINGS_UNAVAILABLE, 409 otherwise. */
 export class RunRequestError extends Error {
   constructor(
     readonly code: RunRequestRefusal,
@@ -83,7 +116,10 @@ export class ScrapeRunRequestService {
    * Settings loader (the cooldown + blockManualWhenOff). Swappable in tests.
    * A wrapper, so the imported binding is read at call time, not at load.
    */
-  loadSettings: () => Promise<ScraperSettings> = () => loadScraperSettings();
+  loadSettings: () => Promise<LoadedScraperSettings> = () => loadScraperSettingsResult();
+
+  /** Lease clock (ms) for the lease check; the lease service's real clock. */
+  leaseClock: () => number = () => sourceLeaseService.clock();
 
   /**
    * Create a Run now request, or throw RunRequestError. `sourceId` null =
@@ -97,7 +133,11 @@ export class ScrapeRunRequestService {
     nowMs?: number;
   }): Promise<CreatedRunRequest> {
     const nowMs = input.nowMs ?? this.clock();
-    const settings = await this.loadSettings();
+    const loaded = await this.loadSettings();
+    if (loaded.readError) {
+      throw new RunRequestError("SETTINGS_UNAVAILABLE", "Scraper settings could not be read; try again shortly");
+    }
+    const settings = loaded.settings;
     const sw = settings[input.kind];
 
     // ---- Scraper switched off AND manual runs blocked ----
@@ -126,20 +166,51 @@ export class ScrapeRunRequestService {
     const lockRef = collections.scrapeRunLocks.doc(lockId);
     const cooldownMs = settings.manualRuns.cooldownMinutes * 60 * 1000;
 
+    const leaseNowMs = this.leaseClock();
     return this.runTransaction(async (tx) => {
+      // ---- Reads first (Firestore: all reads before any write) ----
       const lockSnap = await tx.get(lockRef);
       const lock = lockSnap.exists ? (lockSnap.data() as ScrapeRunLockDoc) : undefined;
+      const activeRef = lock?.activeRequestId ? collections.scrapeRunRequests.doc(lock.activeRequestId) : undefined;
+      const activeSnap = activeRef ? await tx.get(activeRef) : undefined;
+      const active = activeSnap?.exists ? (activeSnap.data() as ScrapeRunRequestDoc) : undefined;
+      // Scope "source": the scraper-wide request of this kind + the lease.
+      let allActive: ScrapeRunRequestDoc | undefined;
+      let lease: Awaited<ReturnType<typeof sourceLeaseService.heldIn>> = null;
+      if (input.sourceId !== null) {
+        const allSnap = await tx.get(collections.scrapeRunLocks.doc(lockIdFor(input.kind, null)));
+        const allLock = allSnap.exists ? (allSnap.data() as ScrapeRunLockDoc) : undefined;
+        if (allLock?.activeRequestId) {
+          const s = await tx.get(collections.scrapeRunRequests.doc(allLock.activeRequestId));
+          allActive = s.exists ? (s.data() as ScrapeRunRequestDoc) : undefined;
+        }
+        lease = await sourceLeaseService.heldIn(tx, input.kind, input.sourceId, leaseNowMs);
+      }
 
-      // ---- 1. One in flight ----
-      if (lock?.activeRequestId) {
-        const activeSnap = await tx.get(collections.scrapeRunRequests.doc(lock.activeRequestId));
-        const active = activeSnap.exists ? (activeSnap.data() as ScrapeRunRequestDoc) : undefined;
-        const sinceMs = lock.activeSince?.toMillis?.() ?? 0;
-        if (active && IN_FLIGHT.has(active.status) && nowMs - sinceMs < STALE_REQUEST_MS) {
+      // ---- 1. One in flight (a request past its deadline is closed as failed) ----
+      if (active && IN_FLIGHT.has(active.status)) {
+        if (isStaleRequest(active, nowMs)) {
+          tx.update(activeRef!, timedOutUpdate(nowMs));
+        } else {
           throw new RunRequestError("RUN_IN_PROGRESS", "A manual run of this scope is already queued or running", {
-            requestId: lock.activeRequestId,
+            requestId: active.id,
           });
         }
+      }
+
+      // ---- 3 (checked before the cooldown: the more useful answer) ----
+      if (allActive && IN_FLIGHT.has(allActive.status) && !isStaleRequest(allActive, nowMs)) {
+        throw new RunRequestError(
+          "RUN_IN_PROGRESS",
+          `A whole-scraper ${input.kind} run is queued or running and will crawl this source if it is due`,
+          { requestId: allActive.id }
+        );
+      }
+      if (lease) {
+        throw new RunRequestError("RUN_IN_PROGRESS", `This source is being crawled by a ${lease.holder.trigger} run`, {
+          ...(lease.holder.runId ? { runId: lease.holder.runId } : {}),
+          leaseExpiresAt: lease.holder.expiresAt,
+        });
       }
 
       // ---- 2. Cooldown since the last request ----
@@ -153,7 +224,7 @@ export class ScrapeRunRequestService {
         );
       }
 
-      // ---- 3. Create the request + take the lock ----
+      // ---- 4. Create the request + take the lock ----
       const ref = collections.scrapeRunRequests.doc();
       const at = Timestamp.fromMillis(nowMs);
       const doc: ScrapeRunRequestDoc = {
@@ -181,10 +252,47 @@ export class ScrapeRunRequestService {
     });
   }
 
-  /** One request as JSON (ISO dates), or null. */
+  /**
+   * Mark one request `failed` ("timed out") when it is still queued /
+   * running past its deadline (re-checked in a transaction). Returns true
+   * when it did.
+   */
+  async expireIfStale(id: string, nowMs: number = this.clock()): Promise<boolean> {
+    const ref = collections.scrapeRunRequests.doc(id);
+    return this.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists || !isStaleRequest(snap.data() as ScrapeRunRequestDoc, nowMs)) return false;
+      tx.update(ref, timedOutUpdate(nowMs));
+      return true;
+    });
+  }
+
+  /**
+   * Close every queued / running request past its deadline (the worker
+   * calls this before each run). One `in` query on `status` (single-field
+   * index), a handful of docs at most. Never throws; returns how many.
+   */
+  async sweepStale(nowMs: number = this.clock()): Promise<number> {
+    try {
+      const snap = await collections.scrapeRunRequests.where("status", "in", ["queued", "running"]).get();
+      let n = 0;
+      for (const d of snap.docs) {
+        if (isStaleRequest(d.data() as ScrapeRunRequestDoc, nowMs) && (await this.expireIfStale(d.id, nowMs))) n++;
+      }
+      return n;
+    } catch (err) {
+      console.error(`Scrape run requests: stale sweep failed: ${(err as Error)?.message ?? err}`);
+      return 0;
+    }
+  }
+
+  /** One request as JSON (ISO dates), or null. A request past its deadline is closed first. */
   async get(id: string): Promise<Record<string, unknown> | null> {
-    const snap = await collections.scrapeRunRequests.doc(id).get();
+    let snap = await collections.scrapeRunRequests.doc(id).get();
     if (!snap.exists) return null;
+    if (isStaleRequest(snap.data() as ScrapeRunRequestDoc, this.clock()) && (await this.expireIfStale(id))) {
+      snap = await collections.scrapeRunRequests.doc(id).get();
+    }
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { expireAt: _e, lockId: _l, ...rest } = snap.data() as Record<string, unknown>;
     return { ...(toJson(rest) as Record<string, unknown>), id: snap.id };

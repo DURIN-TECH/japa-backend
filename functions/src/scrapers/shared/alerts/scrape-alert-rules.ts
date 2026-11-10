@@ -106,6 +106,8 @@ export const DEFAULT_SEVERITY: Record<ScrapeAlertRule, ScrapeAlertSeverity> = {
   review_queue_stale: "info",
   // Issue #96: extraction has stopped, so new visa changes are not reaching review.
   budget_hard_stop: "critical",
+  // Review: no scheduled crawl runs while the settings doc is unreadable.
+  settings_unreadable: "critical",
 };
 
 /** Issue #96: most extra alert recipient addresses (extraRecipientEmails). */
@@ -416,17 +418,27 @@ export function evaluateLinkedSurcharge(run: ScrapeRunDoc, config: ScrapeAlertsC
 // BUDGET HARD STOP (finalize hook, issue #96)
 // ============================================
 
+/** The one dedupe key of budget_hard_stop. */
+export const BUDGET_HARD_STOP_KEY = "budget_hard_stop:visa";
+
 /**
- * budget_hard_stop (visa only): the run's summary says the hard stop
- * blocked extraction (`summary.budgetHardStop === true`) -> raise
- * `budget_hard_stop:visa`; a finished visa run without it clears the alert
- * (the budget was raised, the month rolled over or the stop was switched
- * off). News runs say nothing (they make no LLM calls).
+ * budget_hard_stop (visa only), post-run. Raised when the run's summary says
+ * the hard stop blocked extraction (`summary.budgetHardStop === true`).
+ * Review fix: a run RESOLVES it only when it really checked the budget and
+ * found it under (`budgetChecked === true && budgetOver !== true`: hard
+ * stop off, no budget, or month-to-date below it). A run that could not
+ * read the cost, or is still over budget without having skipped a page (no
+ * changed page reached the gate), leaves the alert as it is, so it does not
+ * flap open / resolved within a month. News runs say nothing.
  */
 export function evaluateBudgetHardStop(run: ScrapeRunDoc, config: ScrapeAlertsConfig): RuleEvaluation {
-  const key = "budget_hard_stop:visa";
-  if (run.kind !== "visa" || run.status === "running") return { rule: "budget_hard_stop", signals: [], scope: { keys: [] } };
-  if (run.summary?.budgetHardStop !== true) return { rule: "budget_hard_stop", signals: [], scope: { keys: [key] } };
+  const key = BUDGET_HARD_STOP_KEY;
+  const keep: RuleEvaluation = { rule: "budget_hard_stop", signals: [], scope: { keys: [] } };
+  if (run.kind !== "visa" || run.status === "running") return keep;
+  if (run.summary?.budgetHardStop !== true) {
+    const under = run.summary?.budgetChecked === true && run.summary?.budgetOver !== true;
+    return under ? { rule: "budget_hard_stop", signals: [], scope: { keys: [key] } } : keep;
+  }
   const skipped = typeof run.summary?.extractionsSkippedBudget === "number" ? (run.summary.extractionsSkippedBudget as number) : 0;
   return {
     rule: "budget_hard_stop",
@@ -444,6 +456,46 @@ export function evaluateBudgetHardStop(run: ScrapeRunDoc, config: ScrapeAlertsCo
         details: { runId: run.id, extractionsSkippedBudget: skipped },
         eventId: run.id,
         runId: run.id,
+      },
+    ],
+  };
+}
+
+/**
+ * budget_hard_stop, hourly clear (review fix): resolve the alert when the
+ * hard stop is off, the budget was cleared, or month-to-date spend is back
+ * under the budget (a raised budget, a new month). Still over -> keep it
+ * (no bump: only a run that skipped pages bumps it). Never raises.
+ */
+export function evaluateBudgetHardStopClears(
+  hardStop: boolean,
+  cost: { monthUsd: number; budgetUsd: number | null }
+): RuleEvaluation {
+  const clear = !hardStop || cost.budgetUsd === null || cost.monthUsd < cost.budgetUsd;
+  return { rule: "budget_hard_stop", signals: [], scope: { keys: clear ? [BUDGET_HARD_STOP_KEY] : [] } };
+}
+
+/**
+ * settings_unreadable (issue #96 review), hourly: reading
+ * appConfig/scraperSettings failed (`readError` set) -> a critical alert,
+ * since every scheduled tick is skipped while it lasts (fail closed); a
+ * successful read clears it.
+ */
+export function evaluateSettingsReadable(readError: string | undefined, config: ScrapeAlertsConfig): RuleEvaluation {
+  const key = "settings_unreadable:scrapers";
+  if (!readError) return { rule: "settings_unreadable", signals: [], scope: { keys: [key] } };
+  return {
+    rule: "settings_unreadable",
+    scope: { keys: [key] },
+    signals: [
+      {
+        rule: "settings_unreadable",
+        key,
+        severity: ruleSeverity(config, "settings_unreadable"),
+        kind: null,
+        subject: { type: "scraper", id: "settings", label: "Scraper settings (appConfig/scraperSettings)" },
+        message: `Scraper settings could not be read, so scheduled visa and news ticks are skipped: ${readError}`.slice(0, 500),
+        details: { error: readError.slice(0, 300) },
       },
     ],
   };

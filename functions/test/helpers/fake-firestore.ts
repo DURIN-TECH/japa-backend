@@ -274,6 +274,10 @@ export async function installFakes(): Promise<void> {
   firebase.collections.scraperSettingsHistory = fakeCollection("scraperSettingsHistory");
   firebase.collections.scrapeRunRequests = fakeCollection("scrapeRunRequests");
   firebase.collections.scrapeRunLocks = fakeCollection("scrapeRunLocks");
+  // Review: per-source crawl leases, taken in a transaction by every crawl.
+  firebase.collections.scrapeSourceLeases = fakeCollection("scrapeSourceLeases");
+  const leases: any = await import("../../src/scrapers/shared/runs/source-lease");
+  leases.sourceLeaseService.runTransaction = fakeRunTransaction;
   const settings: any = await import("../../src/scrapers/shared/settings/scraper-settings.service");
   settings.scraperSettingsService.runTransaction = fakeRunTransaction;
   const requests: any = await import("../../src/scrapers/shared/settings/scrape-run-request.service");

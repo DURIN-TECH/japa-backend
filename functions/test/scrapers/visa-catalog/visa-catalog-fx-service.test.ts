@@ -279,6 +279,10 @@ before(async () => {
   runsSvc.runTransaction = fakeRunTransaction;
   const costsSvc = (await import("../../../src/scrapers/shared/cost/scrape-cost.service")).scrapeCostService as any;
   costsSvc.runTransaction = fakeRunTransaction;
+  // Issue #96 review: every crawl takes a per-source lease (in-memory here).
+  firebase.collections.scrapeSourceLeases = sharedFakeCollection("scrapeSourceLeases");
+  const leasesSvc = (await import("../../../src/scrapers/shared/runs/source-lease")).sourceLeaseService as any;
+  leasesSvc.runTransaction = fakeRunTransaction;
 
   controller = (await import("../../../src/controllers/visa.controller")).visaController;
 });

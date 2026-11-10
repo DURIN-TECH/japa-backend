@@ -48,6 +48,8 @@ const REFUSAL_STATUS: Record<RunRequestError["code"], number> = {
   SCRAPER_DISABLED: 409,
   RUN_IN_PROGRESS: 409,
   RUN_COOLDOWN: 409,
+  // Fail closed (review): the settings doc could not be read.
+  SETTINGS_UNAVAILABLE: 503,
 };
 
 /** 400 naming the offending field (sendError has no extra fields). */

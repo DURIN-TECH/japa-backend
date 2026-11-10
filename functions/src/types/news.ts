@@ -223,4 +223,7 @@ export interface OrchestratorResult {
   sourcesDeferred: number; // skipped without a request: host backed off this run
   hostsBackedOff: number; // sources whose host answered 429/503 this run
   requestsAttempted: number; // listing / feed / article / API requests tried
+  // Issue #96 review: sources skipped because another run held their crawl
+  // lease (recorded as `deferred` source lines; not errors). Absent = 0.
+  sourcesLeased?: number;
 }

@@ -67,7 +67,9 @@ export const SCRAPE_ALERT_STATUSES: readonly ScrapeAlertStatus[] = ["open", "ack
  *  - review_queue_stale: scraped visas pending review / open
  *    pendingVisaChanges waiting longer than reviewQueueMaxAgeDays;
  *  - budget_hard_stop (issue #96): a visa run skipped LLM extraction because
- *    the monthly budget was spent and the hard stop is on.
+ *    the monthly budget was spent and the hard stop is on;
+ *  - settings_unreadable (issue #96 review): appConfig/scraperSettings could
+ *    not be read, so scheduled ticks are skipped (they fail closed).
  */
 export type ScrapeAlertRule =
   | "run_failed"
@@ -80,7 +82,8 @@ export type ScrapeAlertRule =
   | "fx_refresh_failing"
   | "llm_budget"
   | "review_queue_stale"
-  | "budget_hard_stop";
+  | "budget_hard_stop"
+  | "settings_unreadable";
 
 /** Every rule id (config validation, docs). */
 export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
@@ -95,6 +98,7 @@ export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
   "llm_budget",
   "review_queue_stale",
   "budget_hard_stop",
+  "settings_unreadable",
 ];
 
 /**
