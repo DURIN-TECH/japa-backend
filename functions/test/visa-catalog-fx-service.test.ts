@@ -29,6 +29,10 @@
 //    counts as a failure (auto-pause at 5), a later run skips the host until
 //    then without counting a failure (and defers nextCrawlAt past it), an
 //    expired backoff is crawled again and pruned
+//  - runOrchestrator prompt-version re-extract (issue #71): an unchanged page
+//    whose PENDING scraped doc came from an older extractor prompt is
+//    re-extracted (and refreshed); current-version / approved / agent /
+//    seeded / rejected docs are not; maxExtractions still caps the run
 
 import { test, describe, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -759,6 +763,184 @@ describe("runOrchestrator — host backoff on 429/503", () => {
     assert.equal(calls.filter((u) => u.includes("/visas/")).length, 1); // only AA's page
     assert.match(pagesOf("BB")[0].lastError, /^host backed off \(429\)/);
     assert.equal(src("BB").consecutiveFailures, 0); // BB was only deferred
+  });
+});
+
+// ----- Orchestrator: re-extract pending docs from an older prompt (issue #71) -----
+//
+// Every page here is UNCHANGED (its stored lastContentHash = the stub's text
+// hash, and the doc's scrapeMeta.contentHash = the same hash), so before #71
+// the hash gate would skip all of them. Only a PENDING scraped doc whose
+// scrapeMeta.extractorPromptVersion ≠ EXTRACTOR_PROMPT_VERSION may now reach
+// the extractor, and only within maxExtractions.
+
+describe("runOrchestrator — prompt-version re-extract (issue #71)", () => {
+  const TICK = "2026-11-09T02:15:00Z"; // Mon 02:15 GMT: inside GB_WINDOW
+  const tickMs = Date.parse(TICK);
+  // Long enough page text to pass the fetch service's 100-char minimum.
+  const PAGE_HTML =
+    "<html><body><main><h1>Work visa</h1><p>" +
+    "You can apply for this visa if you have a job offer from an approved employer. ".repeat(5) +
+    "</p></main></body></html>";
+  const OLD_VERSION = "2026-10-old-prompt";
+  let adapters: any;
+  let pageHash = "";
+  let extractCalls: string[] = []; // URLs the (stubbed) extractor was asked for
+  let originalExtract: any;
+
+  before(async () => {
+    // Adapters over a stub HTTP client: every page answers 200 PAGE_HTML,
+    // robots.txt 404 (allowed). No network.
+    const { VisaCatalogFetchService } = await import("../src/services/visa-catalog-fetch.service");
+    const { createSourceAdapters } = await import("../src/services/visa-source-adapters");
+    const fetchService = new VisaCatalogFetchService({
+      minIntervalMs: 0,
+      clock: () => tickMs,
+      http: {
+        async get(url: string) {
+          return url.endsWith("/robots.txt")
+            ? { status: 404, data: "", headers: {} }
+            : { status: 200, data: PAGE_HTML, headers: {} };
+        },
+      },
+    });
+    pageHash = fetchService.hash(fetchService.htmlToCleanText(PAGE_HTML));
+    adapters = createSourceAdapters(fetchService);
+  });
+
+  beforeEach(() => {
+    store.delete("visaSources/GB"); // the shared paused fixture
+    extractCalls = [];
+    // Valid extraction stub (counts calls) for this block only; the file-wide
+    // stub (which throws) is restored in afterEach.
+    originalExtract = extractMod.visaCatalogExtractor.extract;
+    extractMod.visaCatalogExtractor.extract = async (_text: string, ctx: { url: string }) => {
+      extractCalls.push(ctx.url);
+      return {
+        name: "Work visa", code: "W", description: "d", category: "work",
+        processingTime: "3 weeks", processingDaysMin: 15, processingDaysMax: 21,
+        feeComponents: [SW[0]], validityPeriod: "5 years", isExtendable: true,
+        eligibilityCriteria: ["x"], confidence: 0.9, citations: { "fee.application": "a" },
+      };
+    };
+  });
+
+  afterEach(() => {
+    extractMod.visaCatalogExtractor.extract = originalExtract;
+  });
+
+  /** Page URL + pinned visaId for slot `n` (pinned so the doc path is known). */
+  const url = (n: string) => `https://a.example.gov/visas/${n}`;
+  const docPath = (n: string) => `countries/ZZ/visaTypes/zz-${n}`;
+
+  /** An active, due ZZ source on GB_WINDOW whose pages were already crawled
+   *  (lastContentHash = the stub's hash, so the hash gate sees no change). */
+  function putZz(names: string[]): void {
+    putSource("ZZ", {
+      pages: names.map((n) => ({
+        url: url(n),
+        routeName: `Route ${n}`,
+        validation: "text_verified",
+        visaId: `zz-${n}`,
+        lastContentHash: pageHash,
+      })),
+    });
+  }
+
+  /** A stored doc at slot `n`, same content hash as the page. */
+  function putDoc(n: string, over: Data, promptVersion: string | undefined): void {
+    const scrapeMeta: Data = { contentHash: pageHash };
+    if (promptVersion !== undefined) scrapeMeta.extractorPromptVersion = promptVersion;
+    store.set(docPath(n), { source: "scraped", reviewStatus: "pending_review", isActive: false, scrapeMeta, ...over });
+  }
+
+  const run = (maxExtractions?: number) =>
+    crawl.runOrchestrator({
+      now: tickMs,
+      adapters,
+      maxExtractions,
+      fetchFxRates: async () => ({ rates: { GBP: 0.8 }, rateDate: isoDaysAgo(1) }),
+    });
+
+  test("pending doc from an older prompt (or with no version) is re-extracted and refreshed", async () => {
+    putZz(["old", "none"]);
+    putDoc("old", {}, OLD_VERSION);
+    putDoc("none", {}, undefined); // pre-#59 doc: no extractorPromptVersion at all
+
+    const summary = await run();
+
+    assert.deepEqual(extractCalls.sort(), [url("none"), url("old")]);
+    assert.equal(summary.promptReextracts, 2);
+    assert.equal(summary.pagesChanged, 0); // the page text did NOT change
+    assert.equal(summary.updated, 2); // refreshed in place, not "unchanged"
+    for (const n of ["old", "none"]) {
+      const doc = store.get(docPath(n))!;
+      assert.equal((doc.scrapeMeta as any).extractorPromptVersion, extractMod.EXTRACTOR_PROMPT_VERSION);
+      assert.equal((doc.scrapeMeta as any).contentHash, pageHash);
+      assert.ok((doc.scrapeMeta as any).fee); // the new prompt's fee block reached it
+      assert.equal(doc.reviewStatus, "pending_review");
+      assert.equal(doc.isActive, false);
+    }
+  });
+
+  test("pending doc on the current prompt is NOT re-extracted (hash gate as before)", async () => {
+    putZz(["cur"]);
+    putDoc("cur", {}, extractMod.EXTRACTOR_PROMPT_VERSION);
+    const before = store.get(docPath("cur"));
+
+    const summary = await run();
+
+    assert.equal(extractCalls.length, 0);
+    assert.equal(summary.promptReextracts, 0);
+    assert.deepEqual(store.get(docPath("cur")), before);
+  });
+
+  test("approved / agent / seeded / rejected docs from an older prompt are untouched (no LLM, no proposal)", async () => {
+    putZz(["approved", "agent", "seeded", "rejected", "missing"]);
+    putDoc("approved", { reviewStatus: "approved", isActive: true }, OLD_VERSION);
+    putDoc("agent", { source: "agent", reviewStatus: "approved" }, OLD_VERSION);
+    putDoc("seeded", { source: undefined, reviewStatus: undefined }, OLD_VERSION);
+    putDoc("rejected", { reviewStatus: "rejected" }, OLD_VERSION);
+    // "missing": no doc at all → nothing to re-extract (unchanged page).
+    const before = ["approved", "agent", "seeded", "rejected"].map((n) => store.get(docPath(n)));
+
+    const summary = await run();
+
+    assert.equal(extractCalls.length, 0);
+    assert.equal(summary.promptReextracts, 0);
+    assert.equal(summary.proposed, 0);
+    assert.deepEqual(["approved", "agent", "seeded", "rejected"].map((n) => store.get(docPath(n))), before);
+    assert.equal(store.get(docPath("missing")), undefined);
+    // No pendingVisaChanges row for the approved doc (#61 needs a real change).
+    assert.equal([...store.keys()].filter((k) => k.startsWith("pendingVisaChanges/")).length, 0);
+  });
+
+  test("stays within maxExtractions: a version bump drains over several runs", async () => {
+    putZz(["a", "b", "c"]);
+    for (const n of ["a", "b", "c"]) putDoc(n, {}, OLD_VERSION);
+
+    // Run 1: cap 2 → only two LLM calls.
+    const first = await run(2);
+    assert.equal(extractCalls.length, 2);
+    assert.equal(first.promptReextracts, 2);
+    const stale = ["a", "b", "c"].filter(
+      (n) => (store.get(docPath(n))!.scrapeMeta as any).extractorPromptVersion === OLD_VERSION
+    );
+    assert.equal(stale.length, 1); // one left for a later run
+
+    // Run 2 (source made due again, same tick): only the leftover is extracted;
+    // the two refreshed docs are now on the current version → hash-gated.
+    store.set("visaSources/ZZ", { ...store.get("visaSources/ZZ")!, nextCrawlAt: Timestamp.fromMillis(tickMs - HOUR_MS) });
+    extractCalls = [];
+    const second = await run(2);
+    assert.deepEqual(extractCalls, [url(stale[0])]);
+    assert.equal(second.promptReextracts, 1);
+    for (const n of ["a", "b", "c"]) {
+      assert.equal(
+        (store.get(docPath(n))!.scrapeMeta as any).extractorPromptVersion,
+        extractMod.EXTRACTOR_PROMPT_VERSION
+      );
+    }
   });
 });
 
