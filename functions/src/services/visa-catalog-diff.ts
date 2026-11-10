@@ -239,16 +239,61 @@ export type IngestPlan =
   | "skip"; // seeded / agent / rejected scraped / withdrawn (staleSince): never touched
 
 /**
+ * Issue #71: is this doc a PENDING SCRAPED visa whose stored extraction was
+ * produced by an older extractor prompt than `currentPromptVersion`?
+ *
+ * Such a doc must be re-extracted even when its page text is unchanged:
+ * otherwise a prompt change (e.g. #59's fee components) never reaches it, and
+ * a pre-#59 doc (no fee block, no `extractorPromptVersion` at all) stays
+ * blocked by the approval guard forever. A missing version counts as stale.
+ *
+ * Deliberately ONLY pending_review scraped docs:
+ *  - approved scraped docs keep the #61 rule — a pendingVisaChanges row is
+ *    proposed only on a REAL content change, never because the prompt moved
+ *    (that would flood admins with prompt-only "edits");
+ *  - seeded / agent / rejected docs are never touched by the crawl at all.
+ *
+ * Pure (the current version is passed in, not imported), so this module stays
+ * free of the extractor's DeepSeek client and is unit-testable.
+ *
+ * @param existing the doc at the resolved id (undefined = no doc yet)
+ * @param currentPromptVersion EXTRACTOR_PROMPT_VERSION of the running code
+ */
+export function isPendingPromptStale(
+  existing: Pick<VisaType, "source" | "reviewStatus" | "scrapeMeta"> | undefined,
+  currentPromptVersion: string
+): boolean {
+  if (!existing) return false; // nothing stored → the normal "create" path
+  if (existing.source !== "scraped" || existing.reviewStatus !== "pending_review") return false;
+  return existing.scrapeMeta?.extractorPromptVersion !== currentPromptVersion;
+}
+
+/**
  * Decide the ingest branch. Seeded `uk-*` docs (no `source`) and agent docs
  * are never touched by the crawl; a withdrawn scraped doc (`staleSince`)
  * gets no proposal ("source came back" is #68's job).
+ *
+ * `currentPromptVersion` (issue #71, optional): when given, a pending scraped
+ * doc with the SAME content hash but an older `extractorPromptVersion` is
+ * "refresh"ed instead of "unchanged", so a re-extraction made because of a
+ * prompt bump is actually written. Callers that omit it (e.g. the #61
+ * proposal transaction, which only ever handles approved docs) keep the plain
+ * content-hash rule.
  */
 export function planIngest(
   existing: Pick<VisaType, "source" | "reviewStatus" | "staleSince" | "scrapeMeta"> | undefined,
-  contentHash: string
+  contentHash: string,
+  currentPromptVersion?: string
 ): IngestPlan {
   if (!existing) return "create";
-  if (existing.scrapeMeta?.contentHash === contentHash) return "unchanged";
+  if (existing.scrapeMeta?.contentHash === contentHash) {
+    // Same page text. Only a pending scraped doc from an older prompt is
+    // re-written (it is not live yet, so refreshing in place is safe).
+    if (currentPromptVersion !== undefined && isPendingPromptStale(existing, currentPromptVersion)) {
+      return "refresh";
+    }
+    return "unchanged";
+  }
   if (existing.source !== "scraped") return "skip";
   if (existing.reviewStatus === "pending_review") return "refresh";
   if (existing.reviewStatus === "approved" && !existing.staleSince) return "propose";

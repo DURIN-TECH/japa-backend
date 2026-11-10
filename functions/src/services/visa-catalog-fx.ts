@@ -370,11 +370,45 @@ export function computeFee(
   return { baseCostUsd: Math.round(totalUsd), feeMeta };
 }
 
-/** Set `feeUnverified` + a joined reason when there are reasons (else nothing). */
+/**
+ * Set `feeUnverified` + the reasons when there are any (else nothing).
+ * Issue #71: stored as an ARRAY (`feeUnverifiedReasons`), one entry per
+ * reason, instead of the old "; "-joined `feeUnverifiedReason` string — a
+ * reason that itself contained "; " could not be split back reliably. A copy
+ * is stored so later edits to the caller's array can't leak into the doc.
+ */
 function applyUnverified(feeMeta: VisaFeeMeta, reasons: string[]): void {
   if (reasons.length === 0) return;
   feeMeta.feeUnverified = true;
-  feeMeta.feeUnverifiedReason = reasons.join("; ");
+  feeMeta.feeUnverifiedReasons = [...reasons];
+}
+
+/** Separator of the legacy (pre-#71) `feeUnverifiedReason` string. */
+const LEGACY_REASON_SEPARATOR = "; ";
+
+/**
+ * The unverified-fee reasons of a stored fee block, whichever shape it has
+ * (issue #71 back-compat):
+ *  - `feeUnverifiedReasons` (array, written since #71) wins when present —
+ *    non-string / empty entries are dropped defensively;
+ *  - else the legacy `feeUnverifiedReason` string is split on "; " (the
+ *    separator it was joined with), empty parts dropped;
+ *  - else [] (no reasons stored).
+ *
+ * @param fee a stored `scrapeMeta.fee` block (or undefined)
+ * @returns the reasons, never undefined
+ */
+export function storedFeeUnverifiedReasons(
+  fee: Pick<VisaFeeMeta, "feeUnverifiedReasons" | "feeUnverifiedReason"> | undefined
+): string[] {
+  if (!fee) return [];
+  if (Array.isArray(fee.feeUnverifiedReasons)) {
+    return fee.feeUnverifiedReasons.filter((r): r is string => typeof r === "string" && r.length > 0);
+  }
+  if (typeof fee.feeUnverifiedReason === "string") {
+    return fee.feeUnverifiedReason.split(LEGACY_REASON_SEPARATOR).filter((r) => r.length > 0);
+  }
+  return [];
 }
 
 /** True when a stored fee block is flagged as not converted. */
@@ -429,9 +463,10 @@ export function planFeeReconvert(
   // Carry a stored "unverified" reason through: the dropped component isn't in
   // `components`, so the fee stays unverified (and unapprovable) after a
   // re-convert. (A plausibility reason is re-derived by computeFee itself.)
-  const storedReasons = (fee.feeUnverifiedReason ?? "")
-    .split("; ")
-    .filter((r) => r && !r.includes("plausibility cap"));
+  // Read via storedFeeUnverifiedReasons() so both the array form (#71) and a
+  // legacy "; "-joined string work; the re-computed block is written in the
+  // array form, so a re-convert also migrates a legacy doc.
+  const storedReasons = storedFeeUnverifiedReasons(fee).filter((r) => !r.includes("plausibility cap"));
   const result = computeFee(components, fx, now, { unverifiedReasons: storedReasons });
 
   if (result.baseCostUsd === undefined) {

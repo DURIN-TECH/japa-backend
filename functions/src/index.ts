@@ -475,7 +475,10 @@ export const crawlVisaCatalogOrchestrator = functions
       const result = await visaCatalogCrawlService.runOrchestrator();
       console.log(
         `Visa catalog crawl: ${result.sourcesProcessed} sources, ${result.pagesFetched} pages, ` +
-          `${result.pagesChanged} changed → ${result.created} new / ${result.updated} updated / ` +
+          // promptReextracts (issue #71): unchanged pages re-extracted because
+          // their pending doc came from an older extractor prompt.
+          `${result.pagesChanged} changed + ${result.promptReextracts} prompt re-extracts → ` +
+          `${result.created} new / ${result.updated} updated / ` +
           `${result.skipped} skipped, ${result.errors} errors`
       );
     } catch (error) {
