@@ -8,7 +8,7 @@
 // Covers issue #57's acceptance criteria for id/code resolution, the GB
 // override map, and the re-seed crawl-state merge.
 
-import { test, describe, TestContext } from "node:test";
+import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as path from "path";
@@ -176,23 +176,15 @@ describe("resolveVisaCode", () => {
 // ----- The GB override map vs. the real markdown and the seeds -----
 
 describe("VISA_SOURCE_OVERRIDES", () => {
-  // The verified-links markdown lives at the meta-repo root; the seed finds it
-  // by walking up. In a standalone seli-backend checkout (e.g. PR CI) it is
-  // absent, so the two markdown-backed tests SKIP with a reason instead of
-  // failing. Set SELI_REQUIRE_SOURCES_MD=1 to make a missing file a hard
-  // failure (e.g. when running from the meta-repo and you want the check).
+  // The verified-links markdown is VENDORED into functions/src/data/ (issue
+  // #78), so it is present in every checkout, CI included: the two
+  // markdown-backed tests below run everywhere again (#66 had to skip them in
+  // CI). A missing file is a hard failure — the map can't be checked without it.
   const markdownPath = findVisaSourcesMarkdown(path.resolve(__dirname, "../src/data"));
-  const requireMarkdown = process.env.SELI_REQUIRE_SOURCES_MD === "1";
-  const MISSING_MD = "official_visa_links_verified_v3.md not found above functions/";
-  // Shared guard: returns true (after marking the test skipped) when the test
-  // should not run. Fails instead when SELI_REQUIRE_SOURCES_MD=1.
-  const skipWithoutMarkdown = (t: TestContext): boolean => {
-    if (markdownPath) return false;
-    assert.ok(!requireMarkdown, `${MISSING_MD} (SELI_REQUIRE_SOURCES_MD=1)`);
-    t.skip(`${MISSING_MD}: meta-repo markdown not available (CI)`);
-    return true;
+  const parsed = () => {
+    assert.ok(markdownPath, "vendored official_visa_links_verified_v3.md not found in src/data/");
+    return parseVisaSourcesMarkdown(fs.readFileSync(markdownPath as string, "utf8"));
   };
-  const parsed = () => parseVisaSourcesMarkdown(fs.readFileSync(markdownPath as string, "utf8"));
 
   // The map also holds non-GB pins (KR since issue #67), so the GB-specific
   // checks below look only at the GOV.UK keys.
@@ -237,8 +229,7 @@ describe("VISA_SOURCE_OVERRIDES", () => {
   });
 
   // Fails if a URL is edited in the markdown (or the map) so a pin would drop.
-  test("covers every GB URL in the markdown, and only those", (t) => {
-    if (skipWithoutMarkdown(t)) return;
+  test("covers every GB URL in the markdown, and only those", () => {
     const gb = parsed().find((c) => c.countryCode === "GB");
     assert.ok(gb, "no United Kingdom section in the markdown");
     const gbUrls = gb.pages.map((p) => p.url).sort();
@@ -249,8 +240,7 @@ describe("VISA_SOURCE_OVERRIDES", () => {
   // PINNED_COUNTRIES touched. (KR is allowed but not required to be pinned
   // here, so this test holds both before and after the KR markdown row is
   // switched to KR_TEMPORARY_VISIT_URL — see the "South Korea pin" block.)
-  test("applying the map pins all GB pages and no unpinned country's", (t) => {
-    if (skipWithoutMarkdown(t)) return;
+  test("applying the map pins all GB pages and no unpinned country's", () => {
     for (const c of parsed()) {
       const { pages } = applyVisaSourcePins(c.pages, VISA_SOURCE_OVERRIDES);
       for (const p of pages) {
