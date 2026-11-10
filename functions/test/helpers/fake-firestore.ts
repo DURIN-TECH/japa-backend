@@ -290,4 +290,10 @@ export async function installFakes(): Promise<void> {
   newsHealth.newsSourceHealthService.runTransaction = fakeRunTransaction;
   const crawl: any = await import("../../src/scrapers/visa-catalog/visa-catalog-crawl.service");
   crawl.visaCatalogCrawlService.runTransaction = fakeRunTransaction;
+  // Issue #101: the admin visa list / review reads agency names and pending
+  // revisions, and the agency visa review runs in its own transaction.
+  firebase.collections.agencies = fakeCollection("agencies");
+  firebase.collections.visaRevisions = fakeCollection("visaRevisions");
+  const agencyReview: any = await import("../../src/agency-visas/agency-visa-review.service");
+  agencyReview.agencyVisaReviewService.runTransaction = fakeRunTransaction;
 }

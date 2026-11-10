@@ -487,6 +487,20 @@ export interface VisaType {
   submittedAt?: Timestamp;
   submittedBy?: string;
 
+  // ---- Make global / agency-only (issue #101) ----
+  // Written only by the admin `PATCH /admin/visas/:id/visibility` action.
+  // Both pairs are kept as history (neither is cleared):
+  //  - madeGlobalBy / madeGlobalAt: the admin uid + time of the LAST switch
+  //    to `visibility: "global"`;
+  //  - madeAgencyOnlyBy / madeAgencyOnlyAt: the admin uid + time of the LAST
+  //    switch back to `visibility: "agency"`.
+  // The current state is always `visibility`; compare the two times to see
+  // which switch happened last. Missing on visas never switched.
+  madeGlobalBy?: string;
+  madeGlobalAt?: Timestamp;
+  madeAgencyOnlyBy?: string;
+  madeAgencyOnlyAt?: Timestamp;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -1165,6 +1179,12 @@ export type NotificationType =
   | "agency_pending_review" // Agency created, awaiting admin approval
   | "agency_approved"
   | "agency_rejected"
+  // Agency-created visas (issue #101): sent to the owning agency's owner when
+  // Seli approves or rejects the visa (or a pending edit to it), and when an
+  // admin makes it global. Taking it back to agency-only sends nothing.
+  | "agency_visa_approved"
+  | "agency_visa_rejected"
+  | "agency_visa_made_global"
   // Verification
   | "verification_approved"
   | "verification_rejected"
@@ -1212,7 +1232,7 @@ export interface Notification {
   
   // Deep linking
   actionUrl?: string;
-  relatedEntityType?: "application" | "consultation" | "document" | "message" | "news_article" | "payment_request" | "subscription" | "agency" | "agent" | "verification" | "review";
+  relatedEntityType?: "application" | "consultation" | "document" | "message" | "news_article" | "payment_request" | "subscription" | "agency" | "agent" | "verification" | "review" | "visa";
   relatedEntityId?: string;
   
   // Status
