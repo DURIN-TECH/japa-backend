@@ -213,15 +213,19 @@ describe("validateExtractedVisa — feeComponents", () => {
     assertRejects(raw, /"feeComponents" must be an array/);
   });
 
-  test("accepts a free visa: one application component of 0, no citation, no currency", () => {
+  // Issue #86: a free visa must be STATED — the 0 needs its fee citation
+  // (currency may still be omitted). An uncited 0 is covered in
+  // test/visa-uncited-numbers.test.ts (dropped + unverified).
+  test("accepts a free visa: one application component of 0 with a citation, no currency", () => {
     const v = validateExtractedVisa(
       rawVisa({
         feeComponents: [{ kind: "application", label: "Free", amount: 0, currency: "", per: "application" }],
-        citations: {},
+        citations: { "fee.application": "There is no fee for this visa" },
       })
     );
     assert.equal(v.feeComponents.length, 1);
     assert.equal(v.feeComponents[0].amount, 0);
+    assert.equal("feeUnverifiedReasons" in v, false);
   });
 
   test("accepts an empty feeComponents (page states no fee)", () => {

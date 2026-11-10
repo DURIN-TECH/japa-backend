@@ -90,6 +90,60 @@ export function feeYearsCitationKey(ordinal: number): string {
   return ordinal <= 1 ? "fee.years" : `fee.years.${ordinal}`;
 }
 
+// ----- Uncited numeric fields (issue #86) -----
+//
+// The rule: a NUMBER the extractor returns is only kept when the page backs it
+// with a citation. The prompt (owned by #87) still tells the model to use "a
+// sensible empty/zero default" for a missing value, so a page that says
+// nothing about processing time came back as processingDaysMin/Max = 0 with no
+// quote (the HiKorea C-3 page, #86) and that 0 was stored as if the page said
+// "0 days". The validator now catches this for EVERY country, without relying
+// on the prompt:
+//   - processingDaysMin / processingDaysMax: kept only when a processing
+//     citation exists (see PROCESSING_CITATION_PREFIXES) AND both values are
+//     present AND the longer one is above 0 (a decision cannot take 0 days;
+//     0 is the prompt's "not found" default). Otherwise BOTH are omitted and
+//     the extraction is flagged `processingUnknown: true`.
+//   - maxExtensions: kept only with a "maxExtensions" citation.
+//   - a fee component of amount 0: kept only with its fee citation (a free
+//     visa must be stated); see validateFeeComponents.
+// Omitted fields are listed in `uncitedFieldsDropped` (audit trail on
+// scrapeMeta), so a reviewer sees what the model returned and why it is gone.
+
+/**
+ * Citation keys that support the processing-time numbers. The model has used
+ * all of these in practice (eval results for v3/v4): "processingTime",
+ * "processingTime.inside", "processingDaysMin", "processingDaysMax". Matched
+ * as PREFIXES, so suffixed variants ("processingTime.outside") count too.
+ */
+export const PROCESSING_CITATION_PREFIXES = ["processingTime", "processingDays"] as const;
+
+/** Citation key prefix that supports `maxExtensions`. */
+export const MAX_EXTENSIONS_CITATION_PREFIX = "maxExtensions";
+
+/**
+ * Display text written to `processingTime` when the processing time is unknown
+ * AND the model's own processing string had no citation either (issue #86).
+ * Readers that only show the string (mobile Explorer `processing`, the portal
+ * review slide-over) then say "not stated" instead of showing an invented
+ * "0 days" or a blank. It is a label, never a number: processingDaysMin/Max
+ * stay ABSENT, so no stat or sort treats it as a duration.
+ */
+export const PROCESSING_TIME_UNKNOWN_LABEL = "Not stated on the official page";
+
+/**
+ * True when `citations` has a non-empty quote under any key that equals or
+ * starts with one of `prefixes`.
+ */
+export function hasCitationWithPrefix(
+  citations: Record<string, string>,
+  prefixes: readonly string[]
+): boolean {
+  return Object.entries(citations).some(
+    ([k, v]) => typeof v === "string" && v.trim().length > 0 && prefixes.some((p) => k.startsWith(p))
+  );
+}
+
 // Context passed alongside the page text to ground the extraction.
 export interface ExtractContext {
   url: string;
@@ -156,11 +210,16 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
     if (required) errors.push(`"${k}" must be a non-empty string`);
     return "";
   };
-  const num = (k: string) => {
-    const v = typeof o[k] === "string" ? Number(o[k]) : o[k];
+  // Optional number (issue #86): absent / null / "" -> undefined (the page
+  // did not state it, which is allowed); a finite number or numeric string ->
+  // the number; anything else (e.g. "three weeks") is still a hard error.
+  const optNum = (k: string): number | undefined => {
+    const raw = o[k];
+    if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) return undefined;
+    const v = typeof raw === "string" ? Number(raw) : raw;
     if (typeof v === "number" && Number.isFinite(v)) return v;
     errors.push(`"${k}" must be a number`);
-    return NaN;
+    return undefined;
   };
   const bool = (k: string) => {
     if (typeof o[k] === "boolean") return o[k] as boolean;
@@ -175,9 +234,9 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
   if (category && !VISA_CATEGORIES.includes(category)) {
     errors.push(`"category" must be one of ${VISA_CATEGORIES.join(", ")}`);
   }
-  const processingTime = str("processingTime", false);
-  const processingDaysMin = num("processingDaysMin");
-  const processingDaysMax = num("processingDaysMax");
+  let processingTime = str("processingTime", false);
+  const rawProcessingDaysMin = optNum("processingDaysMin");
+  const rawProcessingDaysMax = optNum("processingDaysMax");
   const validityPeriod = str("validityPeriod", false);
   const isExtendable = bool("isExtendable");
 
@@ -208,8 +267,47 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
     errors
   );
 
+  // ---- Uncited numeric fields (issue #86, see the module note above) ----
+  // Fields the model returned but the page does not back; listed on the
+  // result (and scrapeMeta) so the omission is never silent.
+  const uncitedFieldsDropped: string[] = [];
+
+  // Processing time: both numbers or neither.
+  const processingCited = hasCitationWithPrefix(citations, PROCESSING_CITATION_PREFIXES);
+  const processingKnown =
+    processingCited &&
+    rawProcessingDaysMin !== undefined &&
+    rawProcessingDaysMax !== undefined &&
+    // A 0-day upper bound is the prompt's "zero default", not a real
+    // decision time — even when some processing quote exists.
+    rawProcessingDaysMax > 0;
+  let processingDaysMin: number | undefined;
+  let processingDaysMax: number | undefined;
+  if (processingKnown) {
+    processingDaysMin = rawProcessingDaysMin;
+    processingDaysMax = rawProcessingDaysMax;
+  } else {
+    // Record which of the two the model DID return (absent ones were never
+    // there to drop).
+    if (rawProcessingDaysMin !== undefined) uncitedFieldsDropped.push("processingDaysMin");
+    if (rawProcessingDaysMax !== undefined) uncitedFieldsDropped.push("processingDaysMax");
+    // Display-only default for the string (see PROCESSING_TIME_UNKNOWN_LABEL):
+    // only when nothing on the page backs the model's processing string
+    // either. A cited string ("varies by embassy") is kept as the page says.
+    if (!processingCited) processingTime = PROCESSING_TIME_UNKNOWN_LABEL;
+  }
+
+  // maxExtensions: an optional count, kept only with its own citation.
+  let maxExtensions: number | undefined;
+  const rawMaxExtensions = optNum("maxExtensions");
+  if (rawMaxExtensions !== undefined) {
+    if (hasCitationWithPrefix(citations, [MAX_EXTENSIONS_CITATION_PREFIX])) maxExtensions = rawMaxExtensions;
+    else uncitedFieldsDropped.push("maxExtensions");
+  }
+
   // ---- Range / sanity checks (defence against nonsense values) ----
-  if (Number.isFinite(processingDaysMin) && Number.isFinite(processingDaysMax)) {
+  // Only for values that survived the citation rule above.
+  if (processingDaysMin !== undefined && processingDaysMax !== undefined) {
     if (processingDaysMin < 0 || processingDaysMax < 0)
       errors.push("processing days must be non-negative");
     if (processingDaysMin > processingDaysMax)
@@ -219,9 +317,6 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
   if (errors.length > 0) {
     throw new ExtractionValidationError(errors);
   }
-
-  const maxExtensions =
-    typeof o.maxExtensions === "number" ? o.maxExtensions : undefined;
   // Official-host check (issue #74): off-registry / unsafe URLs are dropped.
   const applicationUrl = sanitizeApplicationUrl(o.applicationUrl, options.officialHosts);
   const applicationInstructions =
@@ -233,12 +328,14 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
     description,
     category,
     processingTime,
-    processingDaysMin,
-    processingDaysMax,
+    // Absent (not 0) when unknown — the `...` spreads below add the flag.
+    ...(processingDaysMin !== undefined ? { processingDaysMin } : {}),
+    ...(processingDaysMax !== undefined ? { processingDaysMax } : {}),
+    ...(processingKnown ? {} : { processingUnknown: true as const }),
     feeComponents,
     validityPeriod,
     isExtendable,
-    maxExtensions,
+    ...(maxExtensions !== undefined ? { maxExtensions } : {}),
     eligibilityCriteria: eligibility,
     applicationUrl,
     applicationInstructions,
@@ -246,6 +343,8 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
     citations,
     // Only present when a surcharge was dropped (never an empty array/undefined key).
     ...(unverifiedReasons.length > 0 ? { feeUnverifiedReasons: unverifiedReasons } : {}),
+    // Only present when something was dropped (issue #86).
+    ...(uncitedFieldsDropped.length > 0 ? { uncitedFieldsDropped } : {}),
   };
 }
 
@@ -259,7 +358,9 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
  *    `fee.years` citation (n-th per-year component: "fee.years.n")
  *  - a NON-ZERO amount needs a known ISO 4217 currency (static allow-list) and
  *    a non-empty citation "fee.application" / "fee.surcharge" (n-th surcharge:
- *    "fee.surcharge.n"). A zero component needs neither (free visa).
+ *    "fee.surcharge.n"). A zero component (free visa) may omit the currency
+ *    but, since #86, still needs its citation: an uncited 0 is DROPPED and
+ *    recorded as an unverified reason (no fake $0 cost).
  *  - components may use different currencies (each converted separately).
  */
 function validateFeeComponents(
@@ -351,13 +452,23 @@ function validateFeeComponents(
       }
     }
 
-    // currency + citation (only required for a non-zero amount)
+    // currency + citation
     const currency = typeof c.currency === "string" ? c.currency.trim().toUpperCase() : "";
+    const citationKey = feeCitationKey(kind, kindCount[kind]);
+    if (amount === 0 && !hasCitation(citationKey)) {
+      // Issue #86: an UNCITED 0 is the prompt's "zero default", not a page
+      // saying the visa is free. Soft failure: drop the component (rest of
+      // the extraction kept) and mark the fee unverified, so computeFee
+      // writes no baseCostUsd and approval is blocked — never a fake $0.
+      unverifiedReasons.push(
+        `dropped uncited zero ${kind} "${label}": a 0 amount needs citations["${citationKey}"] stating the visa is free`
+      );
+      return;
+    }
     if (amount !== 0) {
       if (!currency) errors.push(`${where}.currency is required for a non-zero amount`);
       else if (!isIso4217(currency)) errors.push(`${where}.currency "${currency}" is not a known ISO 4217 code`);
-      const key = feeCitationKey(kind, kindCount[kind]);
-      if (!hasCitation(key)) errors.push(`${where} has a non-zero amount but citations["${key}"] is missing`);
+      if (!hasCitation(citationKey)) errors.push(`${where} has a non-zero amount but citations["${citationKey}"] is missing`);
     } else if (currency && !isIso4217(currency)) {
       // A zero component may omit the currency, but must not invent one.
       errors.push(`${where}.currency "${currency}" is not a known ISO 4217 code`);

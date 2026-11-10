@@ -163,6 +163,14 @@ async function main() {
     return pickSourceAdapter(cfg.adapter, cfg.url).fetch(linkedSurchargePage(cfg));
   });
 
+  // Supplementary pages (issue #86): same helpers as the orchestrator.
+  const {
+    SupplementaryPageCache,
+    combineSupplementaryText,
+    supplementaryGateHash,
+    supplementaryPagesMeta,
+  } = await import("../services/visa-catalog-supplementary");
+
   // Pick sources: one country, or all.
   const sourcesSnap = args.country
     ? await collections.visaSources.where("countryCode", "==", args.country).get()
@@ -224,9 +232,17 @@ async function main() {
     // Stored retry-after times from the scheduled crawl (Firestore Timestamps
     // -> the helper's ms form; malformed entries ignored).
     hostState.load(hostBackoffEntriesFromSource(source.hostBackoffs));
-    // Filter pages by --visa name if provided.
+    // Supplementary pages (issue #86): one cache per source (its adapter),
+    // each fetched at most once, skipped when its host is backed off.
+    const supplements = new SupplementaryPageCache(async (suppPage) => {
+      const blocked = hostState.blocking(hostOf(suppPage.url));
+      if (blocked) throw new Error(`supplementary page not fetched: ${backoffMessage(blocked)}`);
+      return pickSourceAdapter(source.adapter, suppPage.url).fetch(suppPage);
+    });
+    // Filter pages by --visa name if provided. Supplement-only rows (#86, e.g.
+    // a fee table) are not visas: never extracted on their own.
     const pages = source.pages.filter(
-      (p) => !args.visa || p.routeName.toLowerCase().includes(args.visa)
+      (p) => !p.supplementOnly && (!args.visa || p.routeName.toLowerCase().includes(args.visa))
     );
     for (const page of pages) {
       if (processed >= args.limit) break;
@@ -279,7 +295,12 @@ async function main() {
         // Linked surcharges (issue #69): [] for an unmarked page. The gate
         // hash folds the linked pages' hashes in (same as the orchestrator).
         const linked = await linkedSurcharges.forPage(page);
-        const gateHash = linkedGateHash(fetched.contentHash, linked);
+        // Supplementary pages (issue #86): resolved against the FULL page
+        // list (supplements are filtered out of `pages` above).
+        const supps = await supplements.forPage(page, source.pages);
+        if (supps.length) console.log(`  supplementary pages: ${supps.map((s) => s.page.url).join(", ")}`);
+        const extractText = combineSupplementaryText(fetched.text, supps);
+        const gateHash = linkedGateHash(supplementaryGateHash(fetched.contentHash, supps), linked);
         if (linked.length) console.log(`  linked surcharges: ${linked.map((l) => l.resolved.id).join(", ")}`);
 
         // Hash gate: same text as the stored extraction → no LLM call.
@@ -331,7 +352,7 @@ async function main() {
           continue;
         }
         extractionsUsed++;
-        const extracted = await visaCatalogExtractor.extract(fetched.text, {
+        const extracted = await visaCatalogExtractor.extract(extractText, {
           url: page.url,
           countryName: source.countryName,
           routeName: page.routeName,
@@ -353,9 +374,16 @@ async function main() {
           fx,
           // Linked-page surcharges for this route (issue #69).
           linkedSurcharges: linked,
+          // Supplementary pages used (issue #86), for scrapeMeta.
+          supplementaryPages: supplementaryPagesMeta(supps),
         });
         totals[outcome]++;
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
+        // Issue #86: say when uncited numbers were left out (never written as 0).
+        if (extracted.processingUnknown) console.log("     processing time unknown (no cited figure): days omitted");
+        if (extracted.uncitedFieldsDropped?.length) {
+          console.log(`     uncited fields dropped: ${extracted.uncitedFieldsDropped.join(", ")}`);
+        }
       } catch (err) {
         totals.errors++;
         // 429/503: stop requesting this host for the rest of the manual run.
