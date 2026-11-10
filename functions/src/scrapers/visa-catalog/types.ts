@@ -214,7 +214,7 @@ export interface VisaSource {
 export interface VisaScrapeMeta {
   sourceUrl: string;
   routeName: string; // the source-registry label the page was crawled under
-  model: string; // extractor model, e.g. "deepseek-chat"
+  model: string; // extractor model, e.g. "deepseek-flash" (older records: "deepseek-chat")
   confidence: number; // 0–1 from the extractor
   citations: Record<string, string>; // field name -> verbatim source quote
   // sha256 of the exact text sent to the extractor (selected + capped). For a
@@ -275,7 +275,7 @@ export interface VisaScrapeMeta {
   // Its cost in USD from appConfig/llmPricing; absent when the model had no price.
   llmCostUsd?: number;
   // The model the API says served the call, when it differs in name from
-  // `model` (e.g. a dated Flash version behind "deepseek-chat").
+  // `model` (e.g. a dated Flash build behind "deepseek-flash").
   llmResponseModel?: string;
   // The price-table entry the cost used ("deepseek-flash"); absent when unpriced.
   llmPricedAs?: string;

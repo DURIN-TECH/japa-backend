@@ -134,7 +134,26 @@ describe("prices", () => {
     assert.equal(flash.effectiveFrom, "2026-09-10");
   });
 
-  test("deepseek-chat (our extractor's model) resolves to deepseek-flash by alias, case-insensitively", () => {
+  test("the extractor's model (#92) is a PRIMARY key of the default table, not only an alias", () => {
+    const model = extractMod.DEEPSEEK_EXTRACTOR_MODEL;
+    assert.equal(model, "deepseek-flash");
+    // Matched by key: present in `models` itself.
+    assert.ok(Object.prototype.hasOwnProperty.call(table().models, model));
+    assert.equal(pricingMod.findModelPrice(table(), model).priceKey, model);
+    // ...and not ALSO listed as an alias of some entry (that would mean the
+    // table only priced it indirectly).
+    for (const price of Object.values(table().models) as any[]) {
+      assert.ok(!(price.aliases ?? []).includes(model));
+    }
+  });
+
+  test("legacy names (historical deepseek-chat runs, retired v4-flash ids) still price as deepseek-flash", () => {
+    for (const legacy of ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"]) {
+      assert.equal(pricingMod.findModelPrice(table(), legacy).priceKey, "deepseek-flash", legacy);
+    }
+  });
+
+  test("deepseek-chat (pre-#92 runs' model) resolves to deepseek-flash by alias, case-insensitively", () => {
     assert.equal(pricingMod.findModelPrice(table(), "deepseek-chat").priceKey, "deepseek-flash");
     assert.equal(pricingMod.findModelPrice(table(), "DeepSeek-Flash").priceKey, "deepseek-flash");
     assert.equal(pricingMod.findModelPrice(table(), "gpt-9"), undefined);
@@ -224,9 +243,45 @@ describe("DeepSeekExtractor usage", () => {
     );
     assert.equal(reports.length, 1);
     assert.deepEqual(reports[0].usage, { promptTokens: 4000, completionTokens: 600, cacheHitTokens: 1000, cacheMissTokens: 3000, totalTokens: 4600 });
-    assert.equal(reports[0].model, "deepseek-chat");
+    assert.equal(reports[0].model, "deepseek-flash"); // the requested model (#92)
     assert.equal(reports[0].responseModel, "deepseek-v4.1-flash");
     assert.equal(typeof reports[0].atMs, "number");
+  });
+
+  test("request (#92): deepseek-flash, thinking disabled, JSON mode, temperature 0", async () => {
+    const origFetch = globalThis.fetch;
+    const origKey = process.env.DEEPSEEK_API_KEY;
+    process.env.DEEPSEEK_API_KEY = "sk-test";
+    let sent: any;
+    globalThis.fetch = (async (_url: string, init: any) => {
+      sent = JSON.parse(init.body);
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "not json" } }] }), text: async () => "" };
+    }) as any;
+    try {
+      const ex = new extractMod.DeepSeekExtractor();
+      assert.equal(ex.model, extractMod.DEEPSEEK_EXTRACTOR_MODEL);
+      // The pipeline's default extractor uses the same constant.
+      assert.equal(extractMod.visaCatalogExtractor.model, "deepseek-flash");
+      await assert.rejects(quiet(() => ex.extract("t", { url: "https://x", countryName: "UK", routeName: "R" })), /non-JSON/);
+    } finally {
+      globalThis.fetch = origFetch;
+      if (origKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = origKey;
+    }
+    assert.equal(sent.model, "deepseek-flash");
+    // Thinking is ON by default for deepseek-flash; the extractor must opt out.
+    assert.deepEqual(sent.thinking, { type: "disabled" });
+    assert.deepEqual(sent.response_format, { type: "json_object" });
+    assert.equal(sent.temperature, 0);
+    // JSON mode needs the word "json" in the prompt (DeepSeek's JSON guide).
+    assert.match(sent.messages[0].content, /json/i);
+  });
+
+  test("whitespace-only content (JSON mode's 'not JSON' answer) is 'no content'", async () => {
+    await withFetch({ choices: [{ message: { content: "   \n " } }] }, async () => {
+      const ex = new extractMod.DeepSeekExtractor();
+      await assert.rejects(ex.extract("t", { url: "https://x", countryName: "UK", routeName: "R" }), /no content/);
+    });
   });
 
   test("a throwing onUsage never fails the extraction path; no usage -> no report", async () => {
