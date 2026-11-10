@@ -51,6 +51,8 @@ function defineAbilitiesFor(principal, entitlements) {
             // `manage all`; never grant it to another role (ability.test.ts guards this).
             // The same holds for `Visa` (catalog visa types, #70): only admins edit the
             // live catalog, so no owner/agent/client grant exists for it either.
+            // Likewise `ScrapeRun` (scraper run records + source health, #81): an
+            // operational view for admins only, never granted to another role.
             break;
         case "owner":
             // Agency owners manage everything scoped to their agency.
