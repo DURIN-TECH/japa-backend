@@ -1,0 +1,143 @@
+{
+  "route": "uk-family-visa",
+  "sourceUrl": "https://www.gov.uk/uk-family-visa",
+  "fixtureRecordedAt": "2026-11-09",
+  "draftedBy": "ai-team software-engineer, from guide.json only (not from seed data), 2026-11-09",
+  "verifiedBy": "wrightkhlebisol",
+  "verifiedOn": "2026-11-09",
+  "notes": [
+    "QA checked all fields vs live Content API 2026-11-09; user spot-checked fee lines",
+    "One guide, several routes: the registry extracts the PARTNER / SPOUSE route (VISA_SOURCE_OVERRIDES includeSections: overview, partner-spouse, proof-income-partner, knowledge-of-english, provide-information). Expected values are for that route.",
+    "Fee rule (#59): outside-UK application fee for joining a partner is £2,064. The IHS is printed as a TOTAL per length (not per year): for an adult staying 2 years and 9 months (the partner visa's length from outside the UK) it is £3,105. Expected as ONE surcharge component of 3105 GBP per application. VERIFIER: confirm this reading (the alternative, 1035 x 3, is not printed on this page).",
+    "Processing time (user decision, 2026-11-09): FULL RANGE: here the inside-UK time (8 weeks, meeting the financial and English requirements) is SHORTER than the outside-UK time (12 weeks), so the range is min 56 (inside) to max 84 (outside). The 'about 12 months' case for in-UK applicants who do not meet the financial and English requirements is not the standard case and is excluded. VERIFIER: confirm."
+  ],
+  "name": {
+    "value": "Family",
+    "source": "You need a family visa to live with a family member in the UK for more than 6 months."
+  },
+  "category": {
+    "value": "family",
+    "source": "You need a family visa to live with a family member in the UK for more than 6 months."
+  },
+  "processingDaysMin": {
+    "value": 56,
+    "source": "If you apply inside the UK and you meet the financial requirements and English language requirements, you’ll usually get a decision within 8 weeks."
+  },
+  "processingDaysMax": {
+    "value": 84,
+    "source": "If you apply outside the UK you’ll usually get a decision within 12 weeks."
+  },
+  "validityPeriod": {
+    "durations": [
+      {
+        "amount": 2,
+        "unit": "year"
+      },
+      {
+        "amount": 9,
+        "unit": "month"
+      }
+    ],
+    "source": "You can stay in the UK for up to 2 years and 9 months. After this, you’ll need to apply to extend your stay."
+  },
+  "isExtendable": {
+    "value": true,
+    "source": "You can extend your visa more than once."
+  },
+  "eligibility": {
+    "themes": [
+      {
+        "theme": "you and your partner are both 18 or over",
+        "anyOf": [
+          "18 or over",
+          "18 or older",
+          "aged 18",
+          "at least 18",
+          "over 18"
+        ],
+        "source": "To apply as a partner, you and your partner both need to be 18 or over."
+      },
+      {
+        "theme": "partner is British / Irish / settled (or another listed status)",
+        "anyOf": [
+          "british",
+          "irish",
+          "settled",
+          "indefinite leave to remain",
+          "settled status",
+          "refugee",
+          "protection status"
+        ],
+        "source": "be a British or Irish citizen"
+      },
+      {
+        "theme": "genuine relationship (marriage / civil partnership / 2 years together / fiancé)",
+        "anyOf": [
+          "married",
+          "marriage",
+          "civil partnership",
+          "living together",
+          "lived together",
+          "fiance",
+          "fiancé",
+          "fiancée",
+          "genuine relationship",
+          "in a relationship"
+        ],
+        "source": "you’re in a civil partnership or marriage that’s recognised in the UK"
+      },
+      {
+        "theme": "good knowledge of English",
+        "anyOf": [
+          "english"
+        ],
+        "source": "have a good knowledge of English"
+      },
+      {
+        "theme": "financial requirement (minimum income £29,000)",
+        "anyOf": [
+          "29,000",
+          "£29,000",
+          "29000",
+          "financial requirement",
+          "financial requirements",
+          "minimum income",
+          "income requirement"
+        ],
+        "source": "you and your partner usually need to prove that your combined income is at least £29,000 a year."
+      },
+      {
+        "theme": "intend to live together permanently in the UK",
+        "anyOf": [
+          "live together permanently",
+          "intend to live",
+          "live permanently",
+          "permanently"
+        ],
+        "source": "You and your partner must intend to live together permanently in the UK after you apply."
+      }
+    ]
+  },
+  "applicationUrlHost": {
+    "value": "visas-immigration.service.gov.uk",
+    "source": "https://visas-immigration.service.gov.uk/apply-visa-type/appendixfm"
+  },
+  "feeComponents": {
+    "components": [
+      {
+        "kind": "application",
+        "amount": 2064,
+        "currency": "GBP",
+        "per": "application",
+        "source": "Cost if joining your partner, parent or child\n£2,064"
+      },
+      {
+        "kind": "surcharge",
+        "amount": 3105,
+        "currency": "GBP",
+        "per": "application",
+        "source": "£3,105 if you’re staying for 2 years and 9 months"
+      }
+    ]
+  }
+}

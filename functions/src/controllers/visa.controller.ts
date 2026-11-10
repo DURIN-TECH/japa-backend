@@ -8,6 +8,8 @@ import {
   ErrorMessages,
 } from "../utils/response";
 import { VisaCategory } from "../types";
+// Typed error from the approval guard (fee not converted to USD, issue #59).
+import { VisaFeeNotConvertibleError } from "../services/visa-catalog-fx";
 
 export class VisaController {
   // ============================================
@@ -350,6 +352,13 @@ export class VisaController {
       console.error("Error reviewing visa:", error);
       if ((error as Error).message === "Visa type not found") {
         sendError(res, "NOT_FOUND", "Visa type not found", 404);
+        return;
+      }
+      // Approval refused: no usable USD cost (stale/missing FX rate,
+      // unverified fee, or no/mismatched baseCostUsd). 409 Conflict — the
+      // visa's state blocks approval until the crawl re-runs (or reject it).
+      if (error instanceof VisaFeeNotConvertibleError) {
+        sendError(res, error.code, error.message, 409);
         return;
       }
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);

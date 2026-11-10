@@ -412,6 +412,10 @@ export interface VisaType {
   sourceUrl?: string; // official URL this record was last verified against
   lastVerifiedAt?: Timestamp; // when an agent last approved a scraped update
   scrapeMeta?: VisaScrapeMeta; // extractor provenance + per-field citations (audit trail)
+  // Set ONCE when the scraper found the source withdrawn (GOV.UK
+  // `withdrawn_notice`) and took this scraped visa off the app (isActive:false).
+  // Never cleared automatically: reactivation is a human review step.
+  staleSince?: Timestamp;
 
   // Stats
   successRate?: number;

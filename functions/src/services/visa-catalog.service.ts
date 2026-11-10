@@ -1,7 +1,36 @@
-import { collections, subcollections, serverTimestamp } from "../utils/firebase";
-import { Timestamp } from "firebase-admin/firestore";
+import { collections, subcollections } from "../utils/firebase";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { VisaType } from "../types";
-import { ExtractedVisa, VisaScrapeMeta } from "../types/visa-catalog";
+import { ExtractedVisa, FxRatesDoc } from "../types/visa-catalog";
+// Pure id/code rules live in a Firebase-free module so they are unit-testable.
+import { deriveVisaId, resolveVisaCode } from "./visa-catalog-ids";
+// Pure scrape-meta + withdrawn decisions (also unit-tested without Firestore).
+import {
+  WithdrawnOutcome,
+  buildScrapeMeta,
+  extractedToVisaFields,
+  planWithdrawnUpdate,
+} from "./visa-catalog-meta";
+// Pure fee arithmetic + FX conversion (issue #59) and the rate refresh.
+import {
+  FxFetcher,
+  FxRefreshResult,
+  FxStore,
+  computeFee,
+  fetchFrankfurterRates,
+  isFeeFxFlagged,
+  isFxFresh,
+  planFeeReconvert,
+  refreshFxRates,
+} from "./visa-catalog-fx";
+import { EXTRACTOR_PROMPT_VERSION } from "./visa-catalog-extract.service";
+// Canonical country-stats recompute (issue #62: the only stats function).
+import { visaService } from "./visa.service";
+import type { ScrapeSourceMeta } from "./visa-source-adapters";
+// Proposed edits to approved scraped visas (issue #61): the pure branch
+// decision, and the pendingVisaChanges writer.
+import { planIngest } from "./visa-catalog-diff";
+import { visaChangeService } from "./visa-catalog-changes.service";
 
 // ============================================
 // VISA CATALOG SERVICE (ingest into review queue)
@@ -15,51 +44,45 @@ import { ExtractedVisa, VisaScrapeMeta } from "../types/visa-catalog";
 // That means scraped visas show up in the EXISTING admin visa-review page (which
 // already filters by source=scraped / reviewStatus=pending_review) and are
 // approved/rejected through the existing `PATCH /admin/visas/:id/review` flow —
-// no separate queue, no autopublish. Approval (elsewhere) flips
-// reviewStatus=approved + isActive=true, making the visa user-visible.
+// no separate queue, no autopublish. Approval (elsewhere:
+// visaService.updateVisaReviewStatus) flips reviewStatus=approved +
+// isActive=true (plus lastVerifiedAt, and clears staleSince), making the visa
+// user-visible, and recomputes the country stats with
+// visaService.updateCountryStats before it returns. Ingest itself never
+// changes stats: pending scraped visas are `isActive: false` and not counted.
 
-// The result of ingesting one extraction.
-export type IngestOutcome = "created" | "updated" | "unchanged" | "skipped";
+// The result of ingesting one extraction. "proposed" (issue #61): an
+// approved scraped visa's page changed, so a pendingVisaChanges row was
+// written (or the open one replaced) and the live doc was left untouched.
+export type IngestOutcome = "created" | "updated" | "unchanged" | "skipped" | "proposed";
 
-// Fields the extractor produces that map onto VisaType.
-function extractedToFields(
-  countryCode: string,
-  visaId: string,
-  e: ExtractedVisa
-): Partial<VisaType> {
-  return {
-    id: visaId,
-    countryCode,
-    name: e.name,
-    code: e.code,
-    description: e.description,
-    category: e.category,
-    processingTime: e.processingTime,
-    processingDaysMin: e.processingDaysMin,
-    processingDaysMax: e.processingDaysMax,
-    baseCostUsd: e.baseCostUsd,
-    validityPeriod: e.validityPeriod,
-    isExtendable: e.isExtendable,
-    maxExtensions: e.maxExtensions,
-    eligibilityCriteria: e.eligibilityCriteria,
-    applicationUrl: e.applicationUrl,
-    applicationInstructions: e.applicationInstructions,
-  };
-}
+// Doc id of the rate document under `appConfig`.
+const FX_DOC_ID = "fx";
 
-// Deterministic id part so re-crawling the same visa maps to the same doc.
-function slug(input: string): string {
-  return input
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 40);
-}
-
+// Firestore-backed store for the single `appConfig/fx` rate document
+// (backend-only: firestore.rules has no appConfig match, so clients are denied).
+export const firestoreFxStore: FxStore = {
+  async get() {
+    const snap = await collections.appConfig.doc(FX_DOC_ID).get();
+    return snap.exists ? (snap.data() as FxRatesDoc) : undefined;
+  },
+  async set(doc: FxRatesDoc) {
+    await collections.appConfig.doc(FX_DOC_ID).set(doc);
+  },
+};
 class VisaCatalogService {
-  /** Deterministic visa doc id: `${countryCode}_${slug(code||name)}`. */
-  buildVisaId(countryCode: string, extracted: ExtractedVisa): string {
-    return `${countryCode}_${slug(extracted.code || extracted.name)}`;
+  /**
+   * Deterministic visa doc id for a crawled page — owned by the source
+   * registry, never by the LLM output:
+   *  - the page's pinned `visaId` verbatim when set, else
+   *  - `${countryCode.toLowerCase()}-${slug(full url path)}` (hash-suffixed
+   *    when over-long; see deriveVisaId in visa-catalog-ids.ts).
+   * Throws on an unparseable URL / empty path (the crawl loop records it as a
+   * page error). Replaces the old `${CC}_${slug(code||name)}` scheme, which let
+   * extraction drift fork one visa into several `GB_*` docs.
+   */
+  buildVisaId(countryCode: string, sourceUrl: string, pinned?: { visaId?: string }): string {
+    return deriveVisaId({ countryCode, sourceUrl, visaId: pinned?.visaId });
   }
 
   /**
@@ -69,10 +92,17 @@ class VisaCatalogService {
    * Safety rules:
    *  - NEW visa (no doc): create it pending_review + inactive.
    *  - Existing SCRAPED + still pending_review: refresh it (safe — not live yet).
-   *  - Existing doc that is already approved or agent-authored: SKIP — never
-   *    clobber curated/live data. (Proposing edits to already-live visas is a
-   *    deliberate future enhancement; see the spike doc.)
+   *  - Existing SCRAPED + approved (not withdrawn): PROPOSE — stage a
+   *    field-level edit in `pendingVisaChanges` for an admin (issue #61); the
+   *    live doc is byte-for-byte untouched. See visa-catalog-changes.service.ts.
+   *  - Seeded (no `source`), agent-authored, rejected scraped, or withdrawn
+   *    (`staleSince`) docs: SKIP — never clobber curated/live data.
    *  - Same content hash as last time: unchanged, no write.
+   *  The branch is decided by the pure planIngest() (visa-catalog-diff.ts).
+   *
+   * Identity: the doc id comes from the registry page (`visaId` pin or URL
+   * path — see buildVisaId), and a pinned `visaCode` overrides the extracted
+   * code. Callers pass the page's `visaId` / `visaCode` straight through.
    */
   async ingestExtraction(params: {
     countryCode: string;
@@ -81,22 +111,57 @@ class VisaCatalogService {
     contentHash: string;
     extracted: ExtractedVisa;
     model: string;
+    // Registry-owned identity (both optional).
+    // `visaId`: the doc id the caller already resolved with buildVisaId()
+    // before extraction (the crawlers do this so an un-derivable id fails
+    // before any LLM call), or simply the page's pinned `visaId`. Either way it
+    // is used VERBATIM — buildVisaId returns a given id unchanged — so ingest
+    // never recomputes a different id. When absent, the id is derived from
+    // `sourceUrl`.
+    visaId?: string;
+    // `visaCode`: the page's pinned code; overrides `extracted.code` when set.
+    visaCode?: string;
+    // Adapter provenance for scrapeMeta (sourceProvider, sourceDocumentId,
+    // sourceUpdatedAt, sectionsUsed, truncated) — build it with
+    // sourceMetaFromDocument(). Optional: callers without it write the old shape.
+    sourceMeta?: ScrapeSourceMeta;
+    // The `appConfig/fx` doc for this run (from refreshFx()). Required so a
+    // caller can't forget it; `undefined` = no stored rate at all (fees in a
+    // non-USD, non-pegged currency are then flagged fxMissing).
+    fx: FxRatesDoc | undefined;
   }): Promise<{ visaId: string; outcome: IngestOutcome }> {
     const { countryCode, sourceUrl, routeName, contentHash, extracted, model } = params;
-    const visaId = this.buildVisaId(countryCode, extracted);
+    // Id from the registry (pin or URL path), never from extracted.code/name.
+    const visaId = this.buildVisaId(countryCode, sourceUrl, { visaId: params.visaId });
+    // Pinned code wins over the extracted one (aligns with seeded equivalents).
+    const code = resolveVisaCode(params.visaCode, extracted.code);
     const ref = subcollections.visaTypes(countryCode).doc(visaId);
     const now = Timestamp.now();
 
-    const scrapeMeta: VisaScrapeMeta = {
+    // ---- Fee: code-computed total + USD conversion (issue #59) ----
+    // `baseCostUsd` is undefined when a currency had no usable rate (or no fee
+    // was stated): it is then NOT written (absent on a new doc, unchanged on
+    // an existing pending doc) and approval is blocked by the review guard.
+    // NOTE: the content-hash gate below runs on the PAGE text, so a rate
+    // change alone never re-stages a visa; flagged fees are instead
+    // re-converted from their stored components by reconvertFlaggedFees().
+    const { baseCostUsd, feeMeta } = computeFee(extracted.feeComponents, params.fx, now, {
+      unverifiedReasons: extracted.feeUnverifiedReasons,
+    });
+
+    // Provenance + audit trail (adapter fields merged in when given).
+    const scrapeMeta = buildScrapeMeta({
       sourceUrl,
       routeName,
       model,
-      confidence: extracted.confidence,
-      citations: extracted.citations,
       contentHash,
+      extracted,
       extractedAt: now,
-    };
-    const fields = extractedToFields(countryCode, visaId, extracted);
+      sourceMeta: params.sourceMeta,
+      fee: feeMeta,
+      extractorPromptVersion: EXTRACTOR_PROMPT_VERSION,
+    });
+    const fields = extractedToVisaFields({ countryCode, visaId, code, extracted, baseCostUsd });
 
     const snap = await ref.get();
     if (!snap.exists) {
@@ -116,40 +181,171 @@ class VisaCatalogService {
     }
 
     const existing = snap.data() as VisaType;
-    if (existing.scrapeMeta?.contentHash === contentHash) {
+    // Which branch this doc takes (unchanged / refresh / propose / skip).
+    const branch = planIngest(existing, contentHash);
+    if (branch === "unchanged") {
       return { visaId, outcome: "unchanged" };
     }
     // Only refresh a visa that is still an unapproved scrape; never overwrite an
     // approved or agent-authored record.
-    if (existing.source === "scraped" && existing.reviewStatus === "pending_review") {
-      await ref.set(
-        { ...fields, sourceUrl, scrapeMeta, updatedAt: now },
-        { merge: true }
-      );
+    if (branch === "refresh") {
+      // update() (not set+merge): a top-level `scrapeMeta` key REPLACES the
+      // whole map. set(..., {merge:true}) would deep-merge it, leaving stale
+      // keys from the previous extraction behind (e.g. an old totalUsd /
+      // fxSource next to a new fxStale flag, or old citations). Other
+      // top-level fields not in `fields` are kept — in particular an omitted
+      // `baseCostUsd` (unconverted fee) stays UNCHANGED, as intended.
+      // Review fix: when the NEW extraction supports no cost for a reason other
+      // than FX (no published fee, or an unverified fee), DELETE the old
+      // `baseCostUsd` — it would otherwise stay next to a fee block that no
+      // longer supports it. (FX-flagged fees keep the old value unchanged, as
+      // specified; the approval guard blocks them by the flag.)
+      const deleteCost =
+        baseCostUsd === undefined && !isFeeFxFlagged(feeMeta) && (feeMeta.noPublishedFee || feeMeta.feeUnverified);
+      await ref.update({
+        ...fields,
+        ...(deleteCost ? { baseCostUsd: FieldValue.delete() } : {}),
+        sourceUrl,
+        scrapeMeta,
+        updatedAt: now,
+      });
       return { visaId, outcome: "updated" };
+    }
+    // Approved scraped visa whose page changed: propose, never write the live
+    // doc. The changes service re-reads the doc + the open row in a
+    // transaction, diffs, and creates / replaces the single open row (or
+    // returns "unchanged" when there is no diff or the open row already has
+    // this content hash).
+    if (branch === "propose") {
+      const outcome = await visaChangeService.proposeChange({
+        countryCode,
+        visaId,
+        contentHash,
+        sourceUrl,
+        proposedFields: fields,
+        proposedFee: feeMeta,
+        proposedBaseCostUsd: baseCostUsd,
+        scrapeMeta,
+      });
+      return { visaId, outcome };
     }
     return { visaId, outcome: "skipped" };
   }
 
   /**
-   * Recompute denormalized Country stats from its current APPROVED/active visas.
-   * Call after an approval flips a scraped visa live. (Pending scraped visas are
-   * `isActive: false` and excluded, so ingest itself doesn't change stats.)
+   * Withdrawn-source path: the source (GOV.UK `withdrawn_notice`) says the
+   * page is withdrawn, so the scraped visa at `visaId` comes off the app.
+   *
+   * Only a doc with `source === "scraped"` is modified, regardless of its
+   * reviewStatus: `isActive: false` + `staleSince` (set once, never
+   * overwritten). Seeded/agent docs are never touched; a missing doc is not
+   * created; nothing is deleted. Rules live in planWithdrawnUpdate().
+   *
+   * After an `isActive` flip the country's denormalized stats are recomputed
+   * so visaTypesCount / min cost / min days stay right — with the ONE
+   * canonical stats function, `visaService.updateCountryStats` (issue #62
+   * removed the duplicate catalog-side recompute that used to live here).
+   * It uses update(), so a missing country doc throws instead of silently
+   * creating a stub country with no name. That failure is logged and
+   * swallowed here (same pattern as visaService.updateVisaReviewStatus): the
+   * deactivation is already committed and the onVisaTypeUpdated trigger
+   * reconciles, so the crawl still records the page as withdrawn rather than
+   * as a page error.
+   *
+   * No auto-reactivation: if the guide later stops being withdrawn, nothing
+   * here (or in ingest) flips the doc back on — a human re-approves it.
    */
-  async recomputeCountryStats(countryCode: string): Promise<void> {
-    const snap = await subcollections.visaTypes(countryCode).get();
-    const visas = snap.docs.map((d) => d.data() as VisaType).filter((v) => v.isActive !== false);
-    const costs = visas.map((v) => v.baseCostUsd).filter((n) => Number.isFinite(n));
-    const days = visas.map((v) => v.processingDaysMin).filter((n) => Number.isFinite(n));
-    await collections.countries.doc(countryCode).set(
-      {
-        visaTypesCount: visas.length,
-        minCostUsd: costs.length ? Math.min(...costs) : 0,
-        minProcessingDays: days.length ? Math.min(...days) : 0,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true }
+  async markWithdrawn(countryCode: string, visaId: string): Promise<WithdrawnOutcome> {
+    const ref = subcollections.visaTypes(countryCode).doc(visaId);
+    const snap = await ref.get();
+    const plan = planWithdrawnUpdate(
+      snap.exists ? (snap.data() as VisaType) : undefined,
+      Timestamp.now()
     );
+    if (plan.update) {
+      // update() (not set) — the doc is known to exist and must stay intact.
+      await ref.update(plan.update);
+      // Stats recompute must not turn a committed withdrawal into a page
+      // error (which would also count against the source's reliability).
+      try {
+        await visaService.updateCountryStats(countryCode);
+      } catch (error) {
+        console.error(
+          `Withdrawal of ${countryCode}/${visaId} succeeded but the country stats recompute failed:`,
+          error
+        );
+      }
+    }
+    return plan.outcome;
+  }
+
+  // ============================================
+  // FX (issue #59)
+  // ============================================
+
+  /**
+   * Refresh `appConfig/fx` from Frankfurter (ECB reference rates). Call ONCE
+   * per crawl run, before extraction. On failure the previous doc is kept and
+   * returned (see refreshFxRates) — never throws, so the run continues.
+   *
+   * @param fetchRates injectable fetcher (defaults to Frankfurter via fetch).
+   */
+  async refreshFx(fetchRates: FxFetcher = () => fetchFrankfurterRates()): Promise<FxRefreshResult> {
+    return refreshFxRates({ fetchRates, store: firestoreFxStore, now: Timestamp.now() });
+  }
+
+  /**
+   * Re-convert PENDING SCRAPED visas whose `scrapeMeta.fee` is flagged
+   * fxStale / fxMissing, from their stored fee components, with the given
+   * rate doc. No LLM call, and the content hash is untouched. A fresh rate
+   * writes `baseCostUsd`, replaces `scrapeMeta.fee` (new fx fields, flags
+   * cleared). Approved / seeded / agent docs are never touched (planFeeReconvert).
+   *
+   * Only runs when `fx` is fresh — a stale doc can't clear anything. Scans
+   * each registry country's `reviewStatus == "pending_review"` docs (a
+   * single-field equality: no composite / collection-group index needed).
+   *
+   * Issue #61: then also re-converts OPEN pendingVisaChanges rows whose
+   * proposed fee is fxStale / fxMissing (same arithmetic, no LLM call; see
+   * visaChangeService.reconvertOpenProposals), counted separately.
+   *
+   * @returns how many visa docs were re-converted (cost written) / re-flagged,
+   *   and the same for open proposals.
+   */
+  async reconvertFlaggedFees(fx: FxRatesDoc | undefined): Promise<{
+    reconverted: number;
+    reflagged: number;
+    proposalsReconverted: number;
+    proposalsReflagged: number;
+  }> {
+    const result = { reconverted: 0, reflagged: 0, proposalsReconverted: 0, proposalsReflagged: 0 };
+    const now = Timestamp.now();
+    if (!isFxFresh(fx, now)) return result;
+
+    const sources = await collections.visaSources.get();
+    for (const src of sources.docs) {
+      const countryCode = (src.data().countryCode as string) || src.id;
+      const pending = await subcollections
+        .visaTypes(countryCode)
+        .where("reviewStatus", "==", "pending_review")
+        .get();
+      for (const doc of pending.docs) {
+        const plan = planFeeReconvert(doc.data() as VisaType, fx, now);
+        if (!plan) continue;
+        // Field-path update: replaces scrapeMeta.fee wholesale (clearing the
+        // flags) without touching scrapeMeta.contentHash or anything else.
+        const update: Record<string, unknown> = { "scrapeMeta.fee": plan.fee, updatedAt: now };
+        if (plan.baseCostUsd !== undefined) update.baseCostUsd = plan.baseCostUsd;
+        await doc.ref.update(update);
+        if (plan.baseCostUsd !== undefined) result.reconverted++;
+        else result.reflagged++;
+      }
+    }
+    // Flagged open proposals (issue #61), so they are not stuck forever.
+    const proposals = await visaChangeService.reconvertOpenProposals(fx);
+    result.proposalsReconverted = proposals.reconverted;
+    result.proposalsReflagged = proposals.reflagged;
+    return result;
   }
 }
 

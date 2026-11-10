@@ -10,7 +10,8 @@ module.exports = {
   ],
   parser: "@typescript-eslint/parser",
   parserOptions: {
-    project: ["tsconfig.json"],
+    // tsconfig.test.json also covers eval/ (linted, never built into lib/).
+    project: ["tsconfig.json", "tsconfig.test.json"],
     tsconfigRootDir: __dirname,
     sourceType: "module",
   },
