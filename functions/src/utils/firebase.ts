@@ -107,7 +107,7 @@ export const collections = {
   // returns a client's outstanding asks across ALL of their applications — the
   // to-do list that powers the client web workspace.
   documentRequests: db.collection("documentRequests"),
-  // Visa-catalog scraper (see docs/visa-catalog-scraping-spike.md):
+  // Visa-catalog scraper (see src/scrapers/visa-catalog/docs/visa-catalog-scraping-spike.md):
   // - visaSources: per-country registry of official visa URLs the crawler reads.
   //   Scraped visas are written into countries/{code}/visaTypes as
   //   reviewStatus="pending_review" / source="scraped" and reviewed via the
@@ -124,14 +124,14 @@ export const collections = {
   pendingVisaChanges: db.collection("pendingVisaChanges"),
   // One record per visa / news scraper run (issue #81): timing, counters,
   // per-source + per-page outcomes, first N errors. Written by
-  // services/scrape-run.service.ts, read via /admin/scrape-runs. TTL-deleted
+  // scrapers/shared/runs/scrape-run.service.ts, read via /admin/scrape-runs. TTL-deleted
   // 180 days after start (`expireAt`). NOTE: shares its collection ID with the
   // per-source news log `newsSources/{id}/scrapeRuns` — collection-group
   // queries on "scrapeRuns" see both. Backend-only: no firestore.rules match.
   scrapeRuns: db.collection("scrapeRuns"),
   // Scraper alerts (issue #83): one doc per alert incident (rule, severity,
   // subject, firstSeen/lastSeen/count, open|acknowledged|resolved). Written by
-  // services/scrape-alert.service.ts, read via /admin/scrape-alerts.
+  // scrapers/shared/alerts/scrape-alert.service.ts, read via /admin/scrape-alerts.
   // TTL-deleted 180 days after lastSeen / resolvedAt (`expireAt`).
   // Backend-only: no firestore.rules match -> clients denied.
   scrapeAlerts: db.collection("scrapeAlerts"),
@@ -143,7 +143,7 @@ export const collections = {
   // Monthly scraping cost rollup (issue #82): `scrapeCosts/{YYYY-MM}` sums
   // every finalised run's LLM usage / cost / news API requests by kind,
   // country and model; `scrapeCosts/{month}/runs/{runId}` markers make each
-  // run count once. Written by services/scrape-cost.service.ts (finalize
+  // run count once. Written by scrapers/shared/cost/scrape-cost.service.ts (finalize
   // hook), read via /admin/scrape-costs and by #83's budget alert.
   // Backend-only: no firestore.rules match.
   scrapeCosts: db.collection("scrapeCosts"),

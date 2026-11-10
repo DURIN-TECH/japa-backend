@@ -39,7 +39,7 @@ jobs:
         working-directory: functions
         run: npm ci
 
-      # Run ESLint to catch code style and potential errors (src/, eval/, test/)
+      # Run ESLint to catch code style and potential errors (src/, test/; the eval lives in src/scrapers/visa-catalog/eval/)
       - name: Lint
         working-directory: functions
         run: npm run lint

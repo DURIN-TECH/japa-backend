@@ -250,23 +250,23 @@ export async function installFakes(): Promise<void> {
   firebase.collections.users = fakeCollection("users");
   firebase.subcollections.scrapeRuns = (id: string) => fakeCollection(`newsSources/${id}/scrapeRuns`);
   firebase.subcollections.visaTypes = (cc: string) => fakeCollection(`countries/${cc}/visaTypes`);
-  const changes: any = await import("../../src/services/visa-catalog-changes.service");
+  const changes: any = await import("../../src/scrapers/visa-catalog/changes/visa-catalog-changes.service");
   changes.visaChangeService.runTransaction = fakeRunTransaction;
   // Issue #70: the catalog's pending-refresh write and the manual-cost write
   // are transactional too.
-  const catalog: any = await import("../../src/services/visa-catalog.service");
+  const catalog: any = await import("../../src/scrapers/visa-catalog/visa-catalog.service");
   catalog.visaCatalogService.runTransaction = fakeRunTransaction;
   const visa: any = await import("../../src/services/visa.service");
   visa.visaService.runTransaction = fakeRunTransaction;
   // Issue #81: the stale run sweep is transactional.
-  const runs: any = await import("../../src/services/scrape-run.service");
+  const runs: any = await import("../../src/scrapers/shared/runs/scrape-run.service");
   runs.scrapeRunService.runTransaction = fakeRunTransaction;
   // Issue #82: the monthly cost rollup (scrapeCosts + its runs markers) is
   // written by a finalize hook in a transaction.
   firebase.collections.scrapeCosts = fakeCollection("scrapeCosts");
-  const costs: any = await import("../../src/services/scrape-cost.service");
+  const costs: any = await import("../../src/scrapers/shared/cost/scrape-cost.service");
   costs.scrapeCostService.runTransaction = fakeRunTransaction;
   // Issue #83: alert upserts / resolves / digest claim are transactional.
-  const alerts: any = await import("../../src/services/scrape-alert.service");
+  const alerts: any = await import("../../src/scrapers/shared/alerts/scrape-alert.service");
   alerts.scrapeAlertService.runTransaction = fakeRunTransaction;
 }

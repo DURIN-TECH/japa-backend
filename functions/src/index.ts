@@ -62,15 +62,15 @@ export const api = functions
 import { collections } from "./utils/firebase";
 import { agentService } from "./services/agent.service";
 import { visaService } from "./services/visa.service";
-import { newsScraperService } from "./services/news-scraper.service";
-import { visaCatalogCrawlService } from "./services/visa-catalog-crawl.service";
+import { newsScraperService } from "./scrapers";
+import { visaCatalogCrawlService } from "./scrapers";
 import { newsService } from "./services/news.service";
 import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
 import { notificationService } from "./services/notification.service";
 import { unreadMessageReminderService } from "./services/unread-message-reminder.service";
-import { scrapeRunService } from "./services/scrape-run.service";
-import { scrapeAlertService } from "./services/scrape-alert.service";
+import { scrapeRunService } from "./scrapers";
+import { scrapeAlertService } from "./scrapers";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -468,7 +468,7 @@ export const scrapeNewsOrchestrator = functions
  * in-window due source return immediately (no FX call, no LLM). Fetches official
  * visa pages, and for pages whose content changed, extracts + stages a proposal
  * into `pendingVisaChanges` for agent approval. Never publishes to the live
- * catalog. See docs/visa-catalog-scraping-spike.md.
+ * catalog. See src/scrapers/visa-catalog/docs/visa-catalog-scraping-spike.md.
  */
 export const crawlVisaCatalogOrchestrator = functions
   // EMAIL_SECRETS (issue #83): post-run alert emails, see scrapeNewsOrchestrator.
@@ -502,7 +502,7 @@ export const crawlVisaCatalogOrchestrator = functions
 /**
  * Post-run alert rules: every visa / news run, once finalised (#81), is
  * checked for run_failed / error_rate / linked_surcharge / host_backoff /
- * source_broken (services/scrape-alert.service.ts onRunFinalized). The hook
+ * source_broken (scrapers/shared/alerts/scrape-alert.service.ts onRunFinalized). The hook
  * never throws, and the run's record is already written when it runs.
  * Registered at module load, so it is active in every function instance that
  * runs a scraper (CLI scripts do not load index.ts: script runs never alert).

@@ -20,4 +20,4 @@
 
 - **Prompt or model change? Attach `eval:visa-extract` result (version + overall).** Any change to
   the extractor prompt (`EXTRACTOR_PROMPT_VERSION` bump) or model runs `npm run eval:visa-extract`
-  before merge and commits the `eval/results/…json` file. See `eval/README.md`.
+  before merge and commits the `src/scrapers/visa-catalog/eval/results/…json` file. See `src/scrapers/visa-catalog/eval/README.md`.

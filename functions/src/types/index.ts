@@ -15,10 +15,10 @@ export * from "./eligibility";
 export * from "./news";
 
 // Re-export visa-catalog scraper types
-export * from "./visa-catalog";
+export * from "../scrapers/types";
 // Local import so VisaType (below) can reference the scrape provenance shape.
 // Type-only, so the visa-catalog <-> index cycle is erased at compile time.
-import type { VisaScrapeMeta } from "./visa-catalog";
+import type { VisaScrapeMeta } from "../scrapers/types";
 
 // ============================================
 // USER TYPES
