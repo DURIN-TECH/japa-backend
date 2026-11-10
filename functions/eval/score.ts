@@ -79,6 +79,14 @@ export interface ExpectedFeeComponent extends Sourced {
   per: FeeComponentPer;
   years?: number; // only when per === "year"
   yearsSource?: string; // verbatim quote stating the length used for `years`
+  // Issue #69: set when the component comes from a LINKED page, not the
+  // route's guide: the eval/golden/_linked/<linkedPage>/guide.json fixture
+  // that `source` is quoted from (the test checks the quote there).
+  linkedPage?: string;
+  // Issue #69: for a linked surcharge charged for a REGISTRY-ASSUMED length
+  // (variable-length routes), the registry's stated assumption, verbatim
+  // (replaces `yearsSource`: the length is not on any page).
+  yearsAssumed?: string;
 }
 
 /** A known, tracked gap: reported in every run, never fails it. */
@@ -339,8 +347,9 @@ export function describeFee(c: { kind: string; amount: number; currency?: string
  * plus whether it is a MISMATCH for the hard gate, and notes for tolerated
  * known-gap differences.
  *
- * Known gap on feeComponents (Student IHS, #69): the expected set is what the
- * guide itself prints (application fee only). EXTRA surcharge components and
+ * Known gap on feeComponents (e.g. a surcharge only on a linked page that is
+ * not modelled yet; Student IHS was one until #69): the expected set is what
+ * the guide itself prints. EXTRA surcharge components and
  * `feeUnverifiedReasons` (a dropped IHS whose length the validator could not
  * prove) are then reported as NOTES, not mismatches. A missing or wrong
  * application fee is still a mismatch.

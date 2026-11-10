@@ -7,7 +7,7 @@
   "verifiedOn": "2026-11-09",
   "notes": [
     "QA checked all fields vs live Content API 2026-11-09; user spot-checked fee lines",
-    "Fee rule (#59): application fee £558 from outside the UK. The guide prints no IHS amount ('How much you pay depends on how long your visa lasts', amount on a linked page) -> known gap #69, expected fees = application fee only.",
+    "Fee rule (#59) + #69: application fee £558 from outside the UK. The guide prints no IHS amount ('You’ll also have to pay the healthcare surcharge as part of your application', linked). #69 adds the IHS STUDENT rate from the linked page eval/golden/_linked/healthcare-immigration-application ('how-much-pay' part, recorded 2026-11-10): '£776 per year for students, ...'. Years = 1: the registry's stated assumption for this variable-length route (VISA_SOURCE_OVERRIDES, student-visa linkedSurcharges), not a page value. Applied in code after extraction (no LLM).",
     "validityPeriod: variable; the longest standard stay printed is 'up to 5 years' (degree level, 18 or over).",
     "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK decision time (3 weeks), max = inside-UK decision time (8 weeks)."
   ],
@@ -111,14 +111,17 @@
         "currency": "GBP",
         "per": "application",
         "source": "£558 to apply for a Student visa from outside the UK"
+      },
+      {
+        "kind": "surcharge",
+        "amount": 776,
+        "currency": "GBP",
+        "per": "year",
+        "years": 1,
+        "linkedPage": "healthcare-immigration-application",
+        "yearsAssumed": "1 year assumed: the Student visa length depends on the course (registry assumption, issue #69)",
+        "source": "£776 per year for students, their dependants, and those on a Youth Mobility Scheme visa, for example £1,552 for a 2-year visa"
       }
     ]
-  },
-  "knownGaps": [
-    {
-      "field": "feeComponents",
-      "ref": "#69",
-      "note": "IHS is on a linked page"
-    }
-  ]
+  }
 }

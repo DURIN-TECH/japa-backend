@@ -13,7 +13,7 @@ import * as path from "path";
 //   - overall weighted score >= 0.85, AND
 //   - no single route below 0.7, AND
 //   - no fee mismatch on any route (a hard gate, whatever the scores), except
-//     fee items covered by a route's `knownGaps` (Student IHS, #69).
+//     fee items covered by a route's `knownGaps`.
 //
 // This module is pure config (path + constants): no network, no Firebase.
 
@@ -72,6 +72,15 @@ export const EVAL_DIR = __dirname;
 /** functions/eval/golden/<route>/{guide.json,expected.json} */
 export const GOLDEN_DIR = path.join(EVAL_DIR, "golden");
 
+/**
+ * functions/eval/golden/_linked/<page>/guide.json — recorded LINKED pages
+ * (issue #69): pages a route's fee depends on without printing it, e.g. the
+ * UK healthcare-surcharge page `healthcare-immigration-application`. `<page>`
+ * is the GOV.UK path of LINKED_SURCHARGE_SOURCES[id].url. Not a route: not
+ * scored, never sent to the extractor; parsed in code like in a crawl.
+ */
+export const LINKED_GOLDEN_DIR = path.join(GOLDEN_DIR, "_linked");
+
 /** functions/eval/results/<version>__<model>__<timestamp>.json */
 export const RESULTS_DIR = path.join(EVAL_DIR, "results");
 
@@ -109,7 +118,7 @@ export const EVAL_ROUTES: readonly EvalRoute[] = [
     route: "student-visa",
     url: "https://www.gov.uk/student-visa",
     routeName: "Student visa",
-    shape: "variable length; IHS lives on a linked page (known gap #69)",
+    shape: "variable length; IHS from the linked surcharge page (#69, assumed 1 year)",
   },
   {
     route: "graduate-visa",

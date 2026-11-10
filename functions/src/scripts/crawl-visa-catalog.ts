@@ -152,6 +152,16 @@ async function main() {
   const { hostBackoffEntriesFromSource } = await import("../services/visa-crawl-host-backoff-store");
   // One tracker for the whole manual run (shared across countries).
   const hostState = new HostBackoffTracker(Date.now());
+  // Linked surcharge pages (issue #69, e.g. UK IHS): fetched at most once per
+  // manual run, same rules as the orchestrator (skipped if the host backed off).
+  const { LinkedSurchargeCache, linkedGateHash, linkedSurchargePage } = await import(
+    "../services/visa-catalog-linked-surcharge"
+  );
+  const linkedSurcharges = new LinkedSurchargeCache(async (cfg) => {
+    const blocked = hostState.blocking(hostOf(cfg.url));
+    if (blocked) throw new Error(`linked surcharge page not fetched: ${backoffMessage(blocked)}`);
+    return pickSourceAdapter(cfg.adapter, cfg.url).fetch(linkedSurchargePage(cfg));
+  });
 
   // Pick sources: one country, or all.
   const sourcesSnap = args.country
@@ -266,6 +276,12 @@ async function main() {
           console.log(`  -> guide restored on source: ${resolvedVisaId} back to pending_review`);
         }
 
+        // Linked surcharges (issue #69): [] for an unmarked page. The gate
+        // hash folds the linked pages' hashes in (same as the orchestrator).
+        const linked = await linkedSurcharges.forPage(page);
+        const gateHash = linkedGateHash(fetched.contentHash, linked);
+        if (linked.length) console.log(`  linked surcharges: ${linked.map((l) => l.resolved.id).join(", ")}`);
+
         // Hash gate: same text as the stored extraction → no LLM call.
         if (!args.force) {
           const existingSnap = await subcollections
@@ -273,7 +289,7 @@ async function main() {
             .doc(resolvedVisaId)
             .get();
           const existing = existingSnap.exists ? (existingSnap.data() as VisaType) : undefined;
-          if (existing?.scrapeMeta?.contentHash === fetched.contentHash) {
+          if (existing?.scrapeMeta?.contentHash === gateHash) {
             // Same text — but a PENDING scraped doc from an older extractor
             // prompt is re-extracted anyway (issue #71, same rule as the
             // orchestrator). Approved / seeded / agent docs never qualify.
@@ -324,7 +340,7 @@ async function main() {
           countryCode: source.countryCode,
           sourceUrl: page.url,
           routeName: page.routeName,
-          contentHash: fetched.contentHash,
+          contentHash: gateHash, // page hash unless linked surcharges apply (#69)
           extracted,
           model: visaCatalogExtractor.model,
           // Registry-owned identity: the id resolved above (used verbatim by
@@ -335,6 +351,8 @@ async function main() {
           sourceMeta: sourceMetaFromDocument(fetched),
           // This run's rate doc: the fee is converted in code (issue #59).
           fx,
+          // Linked-page surcharges for this route (issue #69).
+          linkedSurcharges: linked,
         });
         totals[outcome]++;
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);

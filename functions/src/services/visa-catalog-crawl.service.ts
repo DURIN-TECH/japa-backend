@@ -21,6 +21,8 @@ import {
 import { hostBackoffEntriesFromSource, hostBackoffEntriesToSource } from "./visa-crawl-host-backoff-store";
 // Code fallback for a registry doc seeded before `officialHosts` existed (#74).
 import { resolveOfficialHosts } from "./visa-catalog-official-hosts";
+// Surcharges published on a linked page (issue #69): fetched once per run.
+import { LinkedSurchargeCache, linkedGateHash, linkedSurchargePage } from "./visa-catalog-linked-surcharge";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -96,6 +98,10 @@ export interface CrawlSummary {
   // by a stored retry-after time).
   hostsBackedOff: number;
   pagesDeferred: number;
+  // Issue #69: marked pages NOT extracted because their linked surcharge page
+  // (e.g. the UK IHS page) could not be fetched or parsed this run. Each is
+  // also a page error (in `errors`) and logged with console.error.
+  linkedSurchargeErrors: number;
 }
 
 class VisaCatalogCrawlService {
@@ -145,6 +151,7 @@ class VisaCatalogCrawlService {
       feesReconverted: 0,
       hostsBackedOff: 0,
       pagesDeferred: 0,
+      linkedSurchargeErrors: 0,
     };
 
     // Due = active AND nextCrawlAt <= now, oldest first (needs the composite
@@ -216,6 +223,16 @@ class VisaCatalogCrawlService {
     // source: a host that throttled us while crawling one source is not
     // requested again by a later source in the same tick either.
     const hostState = new HostBackoffTracker(now.toMillis());
+
+    // Linked surcharge pages (issue #69, e.g. the UK IHS page), fetched at
+    // most ONCE per run whatever the number of routes using them, through
+    // the normal adapter (robots, rate limit, our UA). A host already backed
+    // off in this run is not requested: the marked route records the error.
+    const linkedSurcharges = new LinkedSurchargeCache(async (cfg) => {
+      const blocked = hostState.blocking(hostOf(cfg.url));
+      if (blocked) throw new Error(`linked surcharge page not fetched: ${backoffMessage(blocked)}`);
+      return pickSourceAdapter(cfg.adapter, cfg.url, opts?.adapters).fetch(linkedSurchargePage(cfg));
+    });
 
     for (const doc of runnable) {
       const source = doc.data() as VisaSource;
@@ -298,13 +315,33 @@ class VisaCatalogCrawlService {
           const restored = await visaCatalogService.markRestored(source.countryCode, visaId);
           if (restored.outcome === "flagged") summary.restored++;
 
+          // ---- Linked surcharges (issue #69) ----
+          // [] for an unmarked page (no request). A failure (fetch error,
+          // rate not found on the linked page, 429) throws into the catch
+          // below: a page error, no extraction, stored hash untouched.
+          let linked;
+          try {
+            linked = await linkedSurcharges.forPage(page);
+          } catch (err) {
+            // Visible in the scheduled log + run summary, then handled as a
+            // normal page error by the catch below (rethrown).
+            summary.linkedSurchargeErrors++;
+            console.error(
+              `Visa catalog: source ${source.countryCode}, page ${page.url}: linked surcharge unavailable, ` +
+                "page not extracted:",
+              err
+            );
+            throw err;
+          }
           // Hash is over the exact text the extractor would see (selected +
-          // capped sections for GOV.UK; the cleaned page for generic-html).
-          const changed = fetched.contentHash !== page.lastContentHash;
+          // capped sections for GOV.UK; the cleaned page for generic-html),
+          // combined with the linked pages' hashes when the page has any.
+          const gateHash = linkedGateHash(fetched.contentHash, linked);
+          const changed = gateHash !== page.lastContentHash;
           // Record crawl metadata regardless of change.
           pages[i] = {
             ...page,
-            lastContentHash: fetched.contentHash,
+            lastContentHash: gateHash,
             lastCrawledAt: now,
             lastError: undefined,
           };
@@ -345,7 +382,8 @@ class VisaCatalogCrawlService {
             countryCode: source.countryCode,
             sourceUrl: page.url,
             routeName: page.routeName,
-            contentHash: fetched.contentHash,
+            // The gate hash (= the page hash unless linked surcharges apply).
+            contentHash: gateHash,
             extracted,
             model: visaCatalogExtractor.model,
             // Registry-owned identity: the id resolved above (used verbatim by
@@ -356,6 +394,8 @@ class VisaCatalogCrawlService {
             sourceMeta: sourceMetaFromDocument(fetched),
             // This run's rate doc: fee converted in code (issue #59).
             fx,
+            // Linked-page surcharges for this route (issue #69).
+            linkedSurcharges: linked,
           });
           if (outcome === "created") summary.created++;
           else if (outcome === "updated") summary.updated++;

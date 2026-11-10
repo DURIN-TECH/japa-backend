@@ -1,5 +1,5 @@
 import { createHash } from "crypto";
-import type { VisaSourcePage } from "../types/visa-catalog";
+import type { LinkedSurchargeRef, VisaSourcePage } from "../types/visa-catalog";
 
 // ============================================
 // VISA CATALOG — RECORD IDENTITY + CRAWL-STATE HELPERS (pure)
@@ -134,6 +134,8 @@ export interface VisaSourcePin {
   // this page (see visa-source-adapters/sections.ts). Optional.
   includeSections?: string[];
   excludeSections?: string[];
+  // Surcharges published on a linked page that this route must add (#69).
+  linkedSurcharges?: LinkedSurchargeRef[];
 }
 
 /**
@@ -165,6 +167,11 @@ export function applyVisaSourcePins(
       // every seed, so editing the map changes the stored page on re-seed.
       ...(pin.includeSections ? { includeSections: [...pin.includeSections] } : {}),
       ...(pin.excludeSections ? { excludeSections: [...pin.excludeSections] } : {}),
+      // Linked-surcharge markers (#69): registry-owned, deep-copied so the
+      // stored page never shares objects with the code map.
+      ...(pin.linkedSurcharges
+        ? { linkedSurcharges: pin.linkedSurcharges.map((r) => ({ ...r, length: { ...r.length } })) }
+        : {}),
     };
   });
   return { pages: out, matchedUrls };

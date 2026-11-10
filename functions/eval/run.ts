@@ -11,12 +11,20 @@ import {
 import { GovukContentApiAdapter } from "../src/services/visa-source-adapters";
 // Same official-host gate on `applicationUrl` as a GB crawl (issue #74).
 import { officialHostsFor } from "../src/services/visa-catalog-official-hosts";
-import type { ExtractedVisa, VisaSourcePage } from "../src/types/visa-catalog";
+import type { ExtractedVisa, VisaLinkedSurchargeMeta, VisaSourcePage } from "../src/types/visa-catalog";
+// Linked-page surcharges (issue #69): the same code step a crawl applies.
+import {
+  LinkedSurchargeCache,
+  applyLinkedSurcharges,
+  linkedSurchargePage,
+  type PageLinkedSurcharge,
+} from "../src/services/visa-catalog-linked-surcharge";
 import {
   EVAL_COUNTRY_NAME,
   EVAL_ROUTES,
   FIELD_WEIGHTS,
   GOLDEN_DIR,
+  LINKED_GOLDEN_DIR,
   PROCESSING_DAYS_MIN_TOLERANCE_DAYS,
   PROCESSING_DAYS_TOLERANCE,
   RESULTS_DIR,
@@ -82,6 +90,10 @@ export interface RouteRecord {
   sectionsUsed?: string[]; // guide parts the adapter selected
   truncated?: boolean; // adapter cap hit
   extracted: ExtractedVisa | null; // the extractor's (validated) output; null when it failed
+  // Linked-page surcharges applied in code after extraction (issue #69), as a
+  // crawl stores them in scrapeMeta.fee.linkedSurcharges. Absent when the
+  // route has none. The fee is SCORED on extracted + these (see scoredOutput).
+  linkedSurcharges?: VisaLinkedSurchargeMeta[];
   error?: string; // why the extraction failed
   score: RouteScore;
 }
@@ -192,6 +204,48 @@ function evalPage(route: EvalRoute): VisaSourcePage {
   };
 }
 
+/**
+ * The route's linked surcharges (issue #69), resolved from the RECORDED linked
+ * pages in eval/golden/_linked/ through the real adapter + the real parser
+ * (no network). [] when the registry marks none for the route. Throws when a
+ * marked route's linked fixture is missing or no longer parses.
+ */
+export async function evalLinkedSurcharges(
+  routeUrl: string,
+  linkedDir: string = LINKED_GOLDEN_DIR
+): Promise<PageLinkedSurcharge[]> {
+  const refs = VISA_SOURCE_OVERRIDES[routeUrl]?.linkedSurcharges ?? [];
+  if (refs.length === 0) return [];
+  const cache = new LinkedSurchargeCache(async (cfg) => {
+    // Fixture dir = the linked page's GOV.UK path, e.g. healthcare-immigration-application.
+    const name = new URL(cfg.url).pathname.replace(/^\/+/, "");
+    const guide = loadGuide(name, linkedDir);
+    return new GovukContentApiAdapter(fixtureFetchService(cfg.url, guide)).fetch(linkedSurchargePage(cfg));
+  });
+  return cache.forPage({ linkedSurcharges: refs });
+}
+
+/**
+ * What is scored for a route: the extractor output with the linked
+ * surcharges applied exactly as ingest applies them (#69). The other fields
+ * are the extractor's own. `feeUnverifiedReasons` is omitted when empty.
+ */
+export function scoredOutput(
+  extracted: ExtractedVisa | null,
+  linked: PageLinkedSurcharge[]
+): { output: ExtractedVisa | null; meta?: VisaLinkedSurchargeMeta[] } {
+  if (!extracted || linked.length === 0) return { output: extracted };
+  const applied = applyLinkedSurcharges(extracted, linked);
+  const { feeUnverifiedReasons: _drop, ...rest } = extracted;
+  void _drop; // replaced by the applied reasons below
+  const output: ExtractedVisa = {
+    ...rest,
+    feeComponents: applied.feeComponents,
+    ...(applied.unverifiedReasons.length ? { feeUnverifiedReasons: applied.unverifiedReasons } : {}),
+  };
+  return { output, meta: applied.meta };
+}
+
 /** Error → one-line message (ExtractionValidationError lists every problem). */
 function errorMessage(err: unknown): string {
   return err instanceof Error ? `${err.name}: ${err.message}` : String(err);
@@ -221,7 +275,15 @@ async function runRoute(route: EvalRoute, expected: ExpectedVisa, goldenDir: str
         // GB registry official hosts, exactly as the crawl passes them (#74).
         officialHosts: officialHostsFor("GB"),
       });
-      return { ...base, ...provenance, extracted, score: scoreRoute(expected, extracted) };
+      // Linked-page surcharges (#69), applied in code like ingest does.
+      const { output, meta } = scoredOutput(extracted, await evalLinkedSurcharges(route.url));
+      return {
+        ...base,
+        ...provenance,
+        extracted,
+        ...(meta ? { linkedSurcharges: meta } : {}),
+        score: scoreRoute(expected, output),
+      };
     } catch (err) {
       const error = errorMessage(err);
       return { ...base, ...provenance, extracted: null, error, score: scoreRoute(expected, null, error) };
@@ -393,7 +455,14 @@ export async function main(argv: string[], deps: RunDeps = {}): Promise<number> 
         return 2;
       }
       const expected = loadExpected(rec.route, goldenDir);
-      rescored.push({ ...rec, score: scoreRoute(expected, rec.extracted, rec.error) });
+      // Re-apply the linked surcharges from the recorded linked pages (#69),
+      // so an older results file is scored by the same rule as a live run.
+      const { output, meta } = scoredOutput(rec.extracted, await evalLinkedSurcharges(rec.sourceUrl));
+      rescored.push({
+        ...rec,
+        ...(meta ? { linkedSurcharges: meta } : {}),
+        score: scoreRoute(expected, output, rec.error),
+      });
     }
     const res = buildResults(rescored, {
       extractorPromptVersion: stored.extractorPromptVersion,
