@@ -10,7 +10,7 @@
 //    / collection(name) for subcollections (e.g. crawlRuns);
 //  - collection refs + queries: doc(id?) (auto id when omitted), add,
 //    where (==, <, <=, >, >=; Timestamps compared by millis), orderBy
-//    (asc/desc), limit, get;
+//    (asc/desc), limit, startAfter(docSnapshot) (issue #81 cursor pages), get;
 //  - runTransaction: tx.get(ref | query), tx.set / tx.update buffered and
 //    applied only when the callback resolves — a throw writes NOTHING, like a
 //    real transaction.
@@ -107,12 +107,18 @@ function cmpValue(v: unknown): unknown {
 
 type Filter = [string, string, unknown];
 
-/** A collection ref / query backed by `store` (direct children only). */
+/**
+ * A collection ref / query backed by `store` (direct children only).
+ * `afterPath`: startAfter() cursor — results begin after the doc at this
+ * path in the query's order (ties keep insertion order, like the real
+ * Firestore's implicit name tiebreak only approximately; tests avoid ties).
+ */
 export function fakeCollection(
   path: string,
   filters: Filter[] = [],
   order?: { field: string; dir: "asc" | "desc" },
-  max?: number
+  max?: number,
+  afterPath?: string
 ): any {
   const col = {
     path,
@@ -123,13 +129,17 @@ export function fakeCollection(
       return ref;
     },
     where(field: string, op: string, value: unknown) {
-      return fakeCollection(path, [...filters, [field, op, value]], order, max);
+      return fakeCollection(path, [...filters, [field, op, value]], order, max, afterPath);
     },
     orderBy(field: string, dir: "asc" | "desc" = "asc") {
-      return fakeCollection(path, filters, { field, dir }, max);
+      return fakeCollection(path, filters, { field, dir }, max, afterPath);
     },
     limit(n: number) {
-      return fakeCollection(path, filters, order, n);
+      return fakeCollection(path, filters, order, n, afterPath);
+    },
+    // Cursor: a doc snapshot from a previous get() (its ref.path is the key).
+    startAfter(snap: { ref: { path: string } }) {
+      return fakeCollection(path, filters, order, max, snap.ref.path);
     },
     async get() {
       let entries = [...store.entries()]
@@ -154,6 +164,10 @@ export function fakeCollection(
           const y = cmpValue(b[order.field]) as any;
           return x === y ? 0 : x < y ? -sign : sign;
         });
+      }
+      if (afterPath !== undefined) {
+        const i = entries.findIndex(([p]) => p === afterPath);
+        entries = i >= 0 ? entries.slice(i + 1) : [];
       }
       if (max !== undefined) entries = entries.slice(0, max);
       const docs = entries.map(([p]) => snapshot(p, fakeDoc(p)));
@@ -201,6 +215,10 @@ export async function installFakes(): Promise<void> {
   firebase.collections.visaSources = fakeCollection("visaSources");
   firebase.collections.countries = fakeCollection("countries");
   firebase.collections.pendingVisaChanges = fakeCollection("pendingVisaChanges");
+  // Issue #81: run records + the news registry (source health, news runs).
+  firebase.collections.scrapeRuns = fakeCollection("scrapeRuns");
+  firebase.collections.newsSources = fakeCollection("newsSources");
+  firebase.subcollections.scrapeRuns = (id: string) => fakeCollection(`newsSources/${id}/scrapeRuns`);
   firebase.subcollections.visaTypes = (cc: string) => fakeCollection(`countries/${cc}/visaTypes`);
   const changes: any = await import("../../src/services/visa-catalog-changes.service");
   changes.visaChangeService.runTransaction = fakeRunTransaction;

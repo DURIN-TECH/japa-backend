@@ -23,6 +23,9 @@ import { hostBackoffEntriesFromSource, hostBackoffEntriesToSource } from "./visa
 import { resolveOfficialHosts } from "./visa-catalog-official-hosts";
 // Surcharges published on a linked page (issue #69): fetched once per run.
 import { LinkedSurchargeCache, linkedGateHash, linkedSurchargePage } from "./visa-catalog-linked-surcharge";
+// Run records (issue #81): one `scrapeRuns/{runId}` doc per run that crawls.
+import { scrapeRunService, type ScrapeRunRecorder, type ScrapeRunService } from "./scrape-run.service";
+import type { ScrapeRunPageOutcome, ScrapeRunSourceStatus, ScrapeRunTrigger } from "../types/scrape-run";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -60,6 +63,15 @@ import { LinkedSurchargeCache, linkedGateHash, linkedSurchargePage } from "./vis
 // pages were all merely skipped because of a STORED backoff is a deferral:
 // neither success nor failure (consecutiveFailures unchanged), so one long
 // Retry-After cannot by itself auto-pause a source.
+//
+// Run records (issue #81): every tick first sweeps stale `running` run docs
+// (crashed runs -> failed). A tick that has something to crawl then writes a
+// `scrapeRuns/{runId}` doc as `running` BEFORE any FX / fetch / LLM work,
+// notes each page's outcome, each source's outcome and each error on it, and
+// finalises it with the full CrawlSummary at the end (or `failed` if the run
+// throws). Idle ticks (nothing due in its window — most hourly ticks) write
+// NO run doc: they crawl nothing, and recording them would add ~24 empty
+// docs a day. Each source's `crawlRuns` log doc carries the `runId`.
 
 // Recorded as the page's lastError when the source says the page is withdrawn
 // (whether or not a scraped doc was deactivated), so it shows in source health.
@@ -123,6 +135,13 @@ class VisaCatalogCrawlService {
     // stubbed HTTP client, e.g. one that answers 429). Defaults to the
     // production adapters over the shared fetch-service singleton.
     adapters?: SourceAdapterSet;
+    // Issue #81: what started this run (stored on the run doc). The
+    // scheduled function leaves it at "scheduled"; a future admin "Run now"
+    // endpoint passes "manual".
+    trigger?: ScrapeRunTrigger;
+    // Issue #81: the run recorder service (tests may inject one; defaults to
+    // the Firestore-backed singleton).
+    runs?: ScrapeRunService;
   }): Promise<CrawlSummary> {
     const maxSources = opts?.maxSources ?? DEFAULT_MAX_SOURCES;
     const maxExtractions = opts?.maxExtractions ?? DEFAULT_MAX_EXTRACTIONS;
@@ -153,6 +172,12 @@ class VisaCatalogCrawlService {
       pagesDeferred: 0,
       linkedSurchargeErrors: 0,
     };
+    const runs = opts?.runs ?? scrapeRunService;
+
+    // ---- Stale run sweep (issue #81) ----
+    // On EVERY tick, idle or not: a previous run (visa or news) still
+    // `running` after 1h crashed or timed out -> mark it failed. Never throws.
+    await runs.sweepStaleRuns(now.toMillis());
 
     // Due = active AND nextCrawlAt <= now, oldest first (needs the composite
     // index status+nextCrawlAt — already in firestore.indexes.json).
@@ -201,6 +226,49 @@ class VisaCatalogCrawlService {
     // at least daily, well within FX_MAX_AGE_DAYS (7).
     if (runnable.length === 0) return summary;
 
+    // ---- Start the run record (issue #81) ----
+    // Written as `running` before any FX / fetch / LLM work. Never throws.
+    const recorder = await runs.start({
+      kind: "visa",
+      trigger: opts?.trigger ?? "scheduled",
+      startedAtMs: now.toMillis(),
+      options: { maxSources, maxExtractions },
+    });
+    console.log(`Visa catalog crawl: run ${recorder.id} started (${runnable.length} source(s))`);
+
+    try {
+      await this.crawlRunnable(runnable, { now, summary, recorder, maxExtractions, opts });
+    } catch (err) {
+      // An unexpected throw (e.g. a Firestore write failing) aborts the run:
+      // record it as failed with what was counted so far, then rethrow so
+      // the scheduled function logs it as before.
+      await recorder.fail(err, summary);
+      throw err;
+    }
+
+    // ---- Finalise the run record (issue #81) ----
+    // "Something worked" = at least one page fetched (see deriveRunStatus).
+    await recorder.finalize({ summary, anySuccess: summary.pagesFetched > 0 });
+    return summary;
+  }
+
+  /**
+   * The crawl body for one tick's runnable sources (split out of
+   * runOrchestrator in #81 so the run record can wrap it in one try/catch).
+   * Mutates `summary` and notes pages / sources / errors on `recorder`.
+   */
+  private async crawlRunnable(
+    runnable: FirebaseFirestore.QueryDocumentSnapshot[],
+    ctx: {
+      now: Timestamp;
+      summary: CrawlSummary;
+      recorder: ScrapeRunRecorder;
+      maxExtractions: number;
+      opts?: { fetchFxRates?: FxFetcher; adapters?: SourceAdapterSet };
+    }
+  ): Promise<void> {
+    const { now, summary, recorder, maxExtractions, opts } = ctx;
+
     // ---- FX: refresh appConfig/fx ONCE per run, before any extraction ----
     // Only on a tick that crawls something. Never throws: on failure the
     // previous doc is kept and used if still within FX_MAX_AGE_DAYS. Then
@@ -214,6 +282,9 @@ class VisaCatalogCrawlService {
     } catch (err) {
       // A failed re-convert must not abort the crawl; it retries next run.
       console.error("Visa catalog: re-converting flagged fees failed:", err);
+      // Visible on the run record too (not counted in summary.errors, which
+      // counts page errors only).
+      recorder.recordError({ error: `re-converting flagged fees failed: ${(err as Error)?.message ?? err}` });
     }
 
     // Running count of LLM calls this tick, against maxExtractions.
@@ -247,6 +318,23 @@ class VisaCatalogCrawlService {
       // and how many of its pages were skipped because their host was backed off.
       let throttledThisRun = false;
       let deferredPages = 0;
+      // Issue #81: this source's page outcomes, for its run-record line.
+      const counts = { created: 0, updated: 0, skipped: 0, proposed: 0, withdrawn: 0, unchanged: 0, deferred: 0 };
+      // Note one page outcome on the run record (and in the per-source counts).
+      const notePage = (
+        page: VisaSourcePage,
+        outcome: ScrapeRunPageOutcome,
+        extra: { visaId?: string; error?: string } = {}
+      ) => {
+        if (outcome in counts) counts[outcome as keyof typeof counts]++;
+        recorder.recordPage({
+          sourceId: source.countryCode,
+          url: page.url,
+          routeName: page.routeName,
+          outcome,
+          ...extra,
+        });
+      };
       // Stored retry-after times from earlier runs (expired ones are ignored).
       hostState.load(hostBackoffEntriesFromSource(source.hostBackoffs));
 
@@ -268,6 +356,7 @@ class VisaCatalogCrawlService {
           deferredPages++;
           summary.pagesDeferred++;
           pages[i] = { ...page, lastError: backoffMessage(blocking) };
+          notePage(page, "deferred", { error: backoffMessage(blocking) });
           continue;
         }
 
@@ -303,6 +392,7 @@ class VisaCatalogCrawlService {
             await visaCatalogService.markWithdrawn(source.countryCode, visaId);
             summary.withdrawn++;
             pages[i] = { ...page, lastCrawledAt: now, lastError: WITHDRAWN_PAGE_ERROR };
+            notePage(page, "withdrawn", { visaId });
             continue;
           }
 
@@ -358,7 +448,10 @@ class VisaCatalogCrawlService {
             const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId, {
               doc: restored.doc, // same doc, already read by markRestored (no second read)
             });
-            if (!promptStale) continue; // nothing new, skip the LLM
+            if (!promptStale) {
+              notePage(page, "unchanged", { visaId });
+              continue; // nothing new, skip the LLM
+            }
             summary.promptReextracts++;
           } else {
             summary.pagesChanged++;
@@ -402,9 +495,13 @@ class VisaCatalogCrawlService {
           else if (outcome === "skipped") summary.skipped++;
           else if (outcome === "proposed") summary.proposed++;
           if (outcome !== "unchanged") ingested++;
+          notePage(page, outcome, { visaId });
         } catch (err) {
           pageErrors++;
           summary.errors++;
+          // Issue #81: on the run record (redacted there).
+          recorder.recordError({ sourceId: source.countryCode, url: page.url, error: err });
+          notePage(page, "error", { error: (err as Error)?.message ?? String(err) });
           // ---- 429/503: back off from the host (issue #64) ----
           // Record it for the rest of the run (and for persisting below)
           // against EVERY host involved (deduplicated by the tracker):
@@ -506,7 +603,9 @@ class VisaCatalogCrawlService {
       });
 
       // Per-run log (subcollection) for observability + admin debugging.
-      await doc.ref.collection("crawlRuns").add({
+      // `runId` links it to the run-wide `scrapeRuns/{runId}` doc (#81).
+      const crawlRunRef = await doc.ref.collection("crawlRuns").add({
+        runId: recorder.id,
         // Tick clock: startedAt = the tick's `now`; completedAt = `now` plus
         // the real elapsed time, so the log keeps the run's duration while
         // staying consistent with an injected `now` (tests / emulator runs).
@@ -521,10 +620,29 @@ class VisaCatalogCrawlService {
         status,
       });
 
+      // ---- Run-record line for this source (issue #81) ----
+      // deferred = nothing requested (stored backoffs only); succeeded = some
+      // page fetched with no page error and no 429/503; partial = fetched
+      // some but had errors / was throttled; failed = fetched nothing (incl.
+      // a source with no pages — the same rule that bumps consecutiveFailures).
+      let sourceStatus: ScrapeRunSourceStatus;
+      if (deferredOnly) sourceStatus = "deferred";
+      else if (fetchedOk === 0) sourceStatus = "failed";
+      else if (pageErrors === 0 && !throttledThisRun) sourceStatus = "succeeded";
+      else sourceStatus = "partial";
+      recorder.recordSource({
+        sourceId: source.countryCode,
+        name: source.countryName,
+        status: sourceStatus,
+        pagesAttempted: fetchedOk + pageErrors + deferredPages,
+        pagesFetched: fetchedOk,
+        errors: pageErrors,
+        sourceRunId: crawlRunRef.id,
+        counts: { ...counts, visasIngested: ingested },
+      });
+
       summary.sourcesProcessed++;
     }
-
-    return summary;
   }
 }
 

@@ -222,11 +222,17 @@ class NewsService {
   // SCRAPE RUN OPERATIONS
   // ============================================
 
-  async createScrapeRun(sourceId: string): Promise<string> {
+  /**
+   * Start a per-source run log (`newsSources/{sourceId}/scrapeRuns`).
+   * @param runId the run-wide `scrapeRuns/{runId}` record it belongs to
+   *   (issue #81), when called from an orchestrator run.
+   */
+  async createScrapeRun(sourceId: string, runId?: string): Promise<string> {
     const ref = subcollections.scrapeRuns(sourceId).doc();
     const run: ScrapeRun = {
       id: ref.id,
       sourceId,
+      ...(runId ? { runId } : {}),
       status: "running",
       articlesFound: 0,
       articlesNew: 0,
@@ -259,21 +265,39 @@ class NewsService {
     return snapshot.docs.map((doc) => doc.data() as ScrapeRun);
   }
 
+  /**
+   * Delete per-source news run logs (`newsSources/{id}/scrapeRuns`) older
+   * than `olderThanDays`, at most 400 per call (one batch).
+   *
+   * Issue #81: this used to be a collection-group query on "scrapeRuns",
+   * which would ALSO match the new top-level `scrapeRuns/{runId}` run
+   * records (same collection ID) and delete them after 30 days instead of
+   * their 180-day TTL. It now queries each news source's subcollection
+   * directly (a handful of sources), so top-level run records are never
+   * touched here — they are removed only by the Firestore TTL policy.
+   */
   async cleanupOldScrapeRuns(olderThanDays: number): Promise<number> {
     const cutoff = Timestamp.fromDate(
       new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000)
     );
-    const snapshot = await db
-      .collectionGroup("scrapeRuns")
-      .where("startedAt", "<", cutoff)
-      .limit(400)
-      .get();
+    const MAX_DELETES = 400; // one batch (Firestore allows 500 writes)
+    const sources = await collections.newsSources.get();
+    const refs: FirebaseFirestore.DocumentReference[] = [];
+    for (const source of sources.docs) {
+      if (refs.length >= MAX_DELETES) break;
+      const snapshot = await subcollections
+        .scrapeRuns(source.id)
+        .where("startedAt", "<", cutoff)
+        .limit(MAX_DELETES - refs.length)
+        .get();
+      snapshot.docs.forEach((doc) => refs.push(doc.ref));
+    }
 
-    if (snapshot.empty) return 0;
+    if (refs.length === 0) return 0;
     const batch = db.batch();
-    snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+    refs.forEach((ref) => batch.delete(ref));
     await batch.commit();
-    return snapshot.size;
+    return refs.length;
   }
 
   // ============================================

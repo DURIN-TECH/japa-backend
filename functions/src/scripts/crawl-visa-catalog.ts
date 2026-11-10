@@ -53,6 +53,14 @@
  * Firestore target (an emulator via FIRESTORE_EMULATOR_HOST, or --project <id>).
  * At least one of --country / --visa is required so it never crawls everything
  * by accident.
+ *
+ * Run record (issue #81): the run is recorded like a scheduled one, as a
+ * `scrapeRuns/{runId}` doc with kind "visa" and trigger "script" (written
+ * `running` before the FX refresh, finalised at the end with the counters,
+ * per-source and per-page outcomes and the first errors; `failed` if the
+ * script crashes). The script options (country, visa, limit, ...) are stored
+ * as `options`. Stale `running` runs older than 1h are swept to `failed`
+ * first, as on every scheduled tick. The run id is printed at the end.
  */
 import * as fs from "fs";
 import * as path from "path";
@@ -60,6 +68,12 @@ import * as path from "path";
 // before the env below is set.
 import type { VisaSource } from "../types/visa-catalog";
 import type { VisaType } from "../types";
+import type { ScrapeRunRecorder } from "../services/scrape-run.service";
+import type { ScrapeRunPageOutcome, ScrapeRunSourceStatus } from "../types/scrape-run";
+
+// The run record of this invocation (issue #81), module-level so the crash
+// handler at the bottom can mark it failed. Unset until the run starts.
+let activeRecorder: ScrapeRunRecorder | undefined;
 
 // ---- CLI args ----
 function parseArgs(argv: string[]) {
@@ -163,12 +177,32 @@ async function main() {
     return pickSourceAdapter(cfg.adapter, cfg.url).fetch(linkedSurchargePage(cfg));
   });
 
+  // ---- Run record (issue #81) ----
+  // Same recorder as the orchestrator. Sweep crashed runs first, then start
+  // ours as `running` before any FX / fetch / LLM work.
+  const { scrapeRunService } = await import("../services/scrape-run.service");
+  await scrapeRunService.sweepStaleRuns();
+  const recorder = await scrapeRunService.start({
+    kind: "visa",
+    trigger: "script",
+    options: {
+      country: args.country,
+      visa: args.visa,
+      limit: args.limit,
+      maxExtractions: args.maxExtractions,
+      force: args.force,
+    },
+  });
+  activeRecorder = recorder;
+
   // Pick sources: one country, or all.
   const sourcesSnap = args.country
     ? await collections.visaSources.where("countryCode", "==", args.country).get()
     : await collections.visaSources.get();
   if (sourcesSnap.empty) {
-    console.error(`No visaSources found${args.country ? ` for ${args.country}` : ""}. Seed first.`);
+    const msg = `No visaSources found${args.country ? ` for ${args.country}` : ""}. Seed first.`;
+    console.error(msg);
+    await recorder.fail(new Error(msg));
     process.exit(1);
   }
 
@@ -184,8 +218,11 @@ async function main() {
       : `FX: refresh FAILED (${fxRefresh.error}); using previous appConfig/fx: ${fx ? fx.rateDate : "none"}`
   );
   // A failed re-convert must not abort the manual run (same as the orchestrator).
+  // Re-converted fee count, for the run record's feesReconverted (#81).
+  let reconverted = 0;
   try {
     const reconvert = await visaCatalogService.reconvertFlaggedFees(fx);
+    reconverted = reconvert.reconverted;
     console.log(`FX: re-converted ${reconvert.reconverted} flagged fee(s), re-flagged ${reconvert.reflagged}`);
   } catch (err) {
     console.error(`FX: re-converting flagged fees FAILED (continuing): ${(err as Error).message}`);
@@ -212,6 +249,13 @@ async function main() {
     deferred: 0, // pages skipped: host backed off (issue #64)
     // Same hash, but the pending doc came from an older prompt → re-extracted (issue #71).
     promptReextracts: 0,
+    // Issue #81 (run record): pages whose hash changed (sent to extraction),
+    // hosts that answered 429/503 and linked-surcharge failures — the
+    // orchestrator's CrawlSummary counters the script did not keep before.
+    pagesChanged: 0,
+    hostsBackedOff: 0,
+    linkedSurchargeErrors: 0,
+    sourcesProcessed: 0,
   };
 
   for (const doc of sourcesSnap.docs) {
@@ -228,6 +272,19 @@ async function main() {
     const pages = source.pages.filter(
       (p) => !args.visa || p.routeName.toLowerCase().includes(args.visa)
     );
+    // ---- Per-source run-record tallies (issue #81) ----
+    const src = { attempted: 0, fetched: 0, errors: 0, deferred: 0 };
+    const srcCounts: Record<string, number> = {};
+    // Note one page outcome on the run record + this source's tallies.
+    const notePage = (
+      page: (typeof pages)[number],
+      outcome: ScrapeRunPageOutcome,
+      extra: { visaId?: string; error?: string } = {}
+    ) => {
+      src.attempted++;
+      srcCounts[outcome] = (srcCounts[outcome] ?? 0) + 1;
+      recorder.recordPage({ sourceId: source.countryCode, url: page.url, routeName: page.routeName, outcome, ...extra });
+    };
     for (const page of pages) {
       if (processed >= args.limit) break;
       processed++;
@@ -236,9 +293,15 @@ async function main() {
       const blocking = hostState.blocking(hostOf(page.url));
       if (blocking) {
         totals.deferred++;
+        src.deferred++;
+        notePage(page, "deferred", { error: backoffMessage(blocking) });
         console.log(`\n[${source.countryCode}] ${page.routeName}\n  -> skipped: ${backoffMessage(blocking)}`);
         continue;
       }
+      // The resolved catalog id, once known (for the page's run-record line).
+      let pageVisaId: string | undefined;
+      // Same hash but re-extracted for a newer prompt (#71) — not a content change.
+      let promptReextract = false;
       try {
         console.log(`\n[${source.countryCode}] ${page.routeName}\n  ${page.url}`);
         // Resolve the record id BEFORE fetching/extracting (same rule as the
@@ -248,10 +311,12 @@ async function main() {
         const resolvedVisaId = visaCatalogService.buildVisaId(source.countryCode, page.url, {
           visaId: page.visaId,
         });
+        pageVisaId = resolvedVisaId;
         // Fetch through the source's adapter (same choice as the orchestrator).
         const adapter = pickSourceAdapter(source.adapter, page.url);
         const fetched = await adapter.fetch(page);
         totals.fetched++;
+        src.fetched++;
         console.log(
           `  adapter ${adapter.id} | ${fetched.text.length} chars | hash ${fetched.contentHash.slice(0, 12)}` +
             (fetched.sections.length && adapter.id !== "generic-html"
@@ -264,6 +329,7 @@ async function main() {
         if (fetched.withdrawn) {
           const result = await visaCatalogService.markWithdrawn(source.countryCode, resolvedVisaId);
           totals.withdrawn++;
+          notePage(page, "withdrawn", { visaId: resolvedVisaId });
           console.log(`  -> withdrawn on source: ${resolvedVisaId} (${result})`);
           continue;
         }
@@ -278,7 +344,15 @@ async function main() {
 
         // Linked surcharges (issue #69): [] for an unmarked page. The gate
         // hash folds the linked pages' hashes in (same as the orchestrator).
-        const linked = await linkedSurcharges.forPage(page);
+        let linked;
+        try {
+          linked = await linkedSurcharges.forPage(page);
+        } catch (err) {
+          // Counted like the orchestrator's linkedSurchargeErrors (#69), then
+          // handled as a normal page error below.
+          totals.linkedSurchargeErrors++;
+          throw err;
+        }
         const gateHash = linkedGateHash(fetched.contentHash, linked);
         if (linked.length) console.log(`  linked surcharges: ${linked.map((l) => l.resolved.id).join(", ")}`);
 
@@ -296,10 +370,12 @@ async function main() {
             // Still counted against --max-extractions below.
             if (!isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION)) {
               totals.unchanged++;
+              notePage(page, "unchanged", { visaId: resolvedVisaId });
               console.log(`  -> unchanged (hash gate, no extraction): ${resolvedVisaId}`);
               continue;
             }
             totals.promptReextracts++;
+            promptReextract = true;
             console.log(
               "  -> same hash, but extracted with prompt " +
                 `${existing.scrapeMeta?.extractorPromptVersion ?? "(none)"} ≠ ${EXTRACTOR_PROMPT_VERSION}: re-extracting`
@@ -319,6 +395,7 @@ async function main() {
               (await visaChangeService.hasProposalForHash(source.countryCode, resolvedVisaId, fetched.contentHash)))
           ) {
             totals.unchanged++;
+            notePage(page, "unchanged", { visaId: resolvedVisaId });
             console.log(`  -> unchanged (approved doc, text already crawled/proposed, no extraction): ${resolvedVisaId}`);
             continue;
           }
@@ -327,10 +404,14 @@ async function main() {
         // Extraction cap: every LLM call counts, counted BEFORE the call so a
         // failing call (API / validation error) also uses up a slot.
         if (extractionsUsed >= args.maxExtractions) {
+          notePage(page, "capped", { visaId: resolvedVisaId });
           console.log(`  -> skipped: --max-extractions ${args.maxExtractions} reached`);
           continue;
         }
         extractionsUsed++;
+        // A content change unless this is a #71 prompt re-extract (counted
+        // above). Under --force a same-text page also counts (approximate).
+        if (!promptReextract) totals.pagesChanged++;
         const extracted = await visaCatalogExtractor.extract(fetched.text, {
           url: page.url,
           countryName: source.countryName,
@@ -355,20 +436,47 @@ async function main() {
           linkedSurcharges: linked,
         });
         totals[outcome]++;
+        notePage(page, outcome, { visaId });
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
       } catch (err) {
         totals.errors++;
+        src.errors++;
+        // Issue #81: on the run record (redacted there).
+        recorder.recordError({ sourceId: source.countryCode, url: page.url, error: err });
+        notePage(page, "error", { visaId: pageVisaId, error: (err as Error)?.message ?? String(err) });
         // 429/503: stop requesting this host for the rest of the manual run.
         // Recorded against the answering host, the requested host and the
         // page host (see the orchestrator's catch for why all three).
         if (isHostBackoffError(err)) {
           const entry = err.toEntry(Date.now());
+          if (!hostState.isFresh(entry.host)) totals.hostsBackedOff++;
           for (const h of new Set([entry.host, err.requestedHost, hostOf(page.url)])) {
             if (h) hostState.record({ ...entry, host: h });
           }
         }
         console.log(`  -> ERROR: ${(err as Error).message}`);
       }
+    }
+    // ---- This source's run-record line (issue #81) ----
+    // Same rule as the orchestrator's per-source status. A source the
+    // --visa filter left with no pages, or reached after --limit, is not
+    // recorded (it was not attempted).
+    if (src.attempted > 0) {
+      totals.sourcesProcessed++;
+      let status: ScrapeRunSourceStatus;
+      if (src.deferred === src.attempted) status = "deferred";
+      else if (src.fetched === 0) status = "failed";
+      else if (src.errors === 0) status = "succeeded";
+      else status = "partial";
+      recorder.recordSource({
+        sourceId: source.countryCode,
+        name: source.countryName,
+        status,
+        pagesAttempted: src.attempted,
+        pagesFetched: src.fetched,
+        errors: src.errors,
+        counts: srcCounts,
+      });
     }
     if (processed >= args.limit) break;
   }
@@ -379,13 +487,45 @@ async function main() {
       `withdrawn ${totals.withdrawn} | restored ${totals.restored} | errors ${totals.errors} | host backed off ${totals.deferred} | ` +
       `prompt re-extracts ${totals.promptReextracts}`
   );
+  // ---- Finalise the run record (issue #81) ----
+  // Stored in the orchestrator's CrawlSummary vocabulary (pagesFetched,
+  // pagesDeferred, ...) so script and scheduled runs read the same, plus the
+  // script-only `unchanged` count.
+  const finalRun = await recorder.finalize({
+    summary: {
+      sourcesProcessed: totals.sourcesProcessed,
+      pagesFetched: totals.fetched,
+      pagesChanged: totals.pagesChanged,
+      promptReextracts: totals.promptReextracts,
+      created: totals.created,
+      updated: totals.updated,
+      skipped: totals.skipped,
+      proposed: totals.proposed,
+      withdrawn: totals.withdrawn,
+      restored: totals.restored,
+      errors: totals.errors,
+      fxRefreshed: fxRefresh.refreshed,
+      feesReconverted: reconverted,
+      hostsBackedOff: totals.hostsBackedOff,
+      pagesDeferred: totals.deferred,
+      linkedSurchargeErrors: totals.linkedSurchargeErrors,
+      unchanged: totals.unchanged,
+    },
+    anySuccess: totals.fetched > 0,
+  });
+  activeRecorder = undefined;
+  console.log(`Run record: scrapeRuns/${recorder.id} (${finalRun?.status ?? "not recorded"})`);
   console.log("Review pending scraped visas at: admin → Visa Review (filter source=scraped).");
   // Proposed edits to approved visas have no portal UI yet (follow-up issue).
   if (totals.proposed > 0) console.log("Proposed edits to approved visas: GET /admin/visa-changes?status=open");
   process.exit(0);
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error("Crawl failed:", e);
+  // Issue #81: a crash after the run started marks its record failed
+  // (redacted message). If this write also fails, the next run's stale
+  // sweep marks it failed after 1h.
+  if (activeRecorder) await activeRecorder.fail(e);
   process.exit(1);
 });
