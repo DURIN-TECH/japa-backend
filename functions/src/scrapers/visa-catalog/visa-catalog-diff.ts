@@ -11,6 +11,7 @@ import type {
   VisaScrapeMeta,
 } from "./types";
 import { assertVisaApprovable, planFeeReconvert } from "./visa-catalog-fx";
+import { markManualCostReplaced } from "./visa-manual-cost";
 
 // ============================================
 // VISA CATALOG — PROPOSED-EDIT DIFF + PLANNING (pure, issue #61)
@@ -477,6 +478,18 @@ export function planProposalWrite(params: {
   if (proposedScrapeMeta.extractorPromptVersion) row.extractorPromptVersion = proposedScrapeMeta.extractorPromptVersion;
   if (live.scrapeMeta?.contentHash) row.currentContentHash = live.scrapeMeta.contentHash;
   if (blockReason) row.blockReason = blockReason;
+
+  // ---- Issue #77: a replaced manual cost is recorded, never silent ----
+  // A new extraction (changed content hash: same hash returned "none" above)
+  // replaces the open row wholesale, including any manual cost an admin set
+  // on its proposed fee. Keep that entry on the new row as
+  // `replacedManualCost`; otherwise carry an earlier record forward.
+  const replacedManual = openRow?.proposedScrapeMeta?.fee?.manualCost;
+  if (replacedManual) {
+    row.replacedManualCost = markManualCostReplaced(replacedManual, input.contentHash, now);
+  } else if (openRow?.replacedManualCost) {
+    row.replacedManualCost = openRow.replacedManualCost;
+  }
 
   return openRow ? { action: "replace", id: openRow.id, row } : { action: "create", row };
 }

@@ -40,6 +40,12 @@ import {
 // so it is never silent. A re-extract of the SAME page text (prompt-only,
 // issue #71) keeps the manual cost: the admin's confirmation still holds.
 //
+// Issue #77 reuses the same rules for an OPEN proposed edit to a live visa
+// (PUT /admin/visa-changes/:id/manual-cost, changes/visa-change-manual-cost.ts):
+// parseManualCostFields (amount / reason / rates), buildManualCostFee (rates
+// check + audit block + fee block) and markManualCostReplaced (the overwrite
+// record) are shared, so the two endpoints cannot drift apart.
+//
 // Firebase-free apart from the Timestamp class, so it is unit-testable
 // without an emulator.
 
@@ -137,6 +143,46 @@ export function parseManualCostInput(body: unknown): ManualCostInput {
   }
   const countryCode = b.countryCode.trim().toUpperCase();
 
+  // ---- amountUsd / reason / rates (shared with the proposal endpoint, #77) ----
+  const input: ManualCostInput = { countryCode, ...parseManualCostFields(b) };
+
+  // ---- expectedContentHash: optional string ----
+  if (b.expectedContentHash !== undefined && b.expectedContentHash !== null) {
+    if (typeof b.expectedContentHash !== "string" || b.expectedContentHash.length === 0) {
+      throw invalid("expectedContentHash must be a non-empty string");
+    }
+    input.expectedContentHash = b.expectedContentHash;
+  }
+
+  // ---- expectedExtractedAt: optional ISO date-time string ----
+  if (b.expectedExtractedAt !== undefined && b.expectedExtractedAt !== null) {
+    const ms = typeof b.expectedExtractedAt === "string" ? Date.parse(b.expectedExtractedAt) : NaN;
+    if (!Number.isFinite(ms)) {
+      throw invalid("expectedExtractedAt must be an ISO 8601 date-time string");
+    }
+    input.expectedExtractedAtMs = ms;
+  }
+
+  return input;
+}
+
+/** The cost fields every manual-cost body carries (#70 visa, #77 proposal). */
+export type ManualCostFields = Pick<ManualCostInput, "amountUsd" | "reason" | "rates">;
+
+/**
+ * Validate the cost fields shared by both manual-cost endpoints:
+ * `amountUsd` (JSON number, 0..MAX_MANUAL_COST_USD), `reason` (trimmed,
+ * MIN..MAX length) and `rates` (array of unique { currency, usdPerUnit },
+ * never USD; the legacy single `rate` field is refused). Throws
+ * ManualCostError(VALIDATION_ERROR) naming the first bad field.
+ *
+ * Used by parseManualCostInput (PUT /admin/visas/:id/manual-cost, #70) and
+ * parseProposalManualCostInput (PUT /admin/visa-changes/:id/manual-cost,
+ * #77), so the two endpoints can never drift apart on what a valid cost is.
+ *
+ * @param b the request body, already checked to be a plain object
+ */
+export function parseManualCostFields(b: Record<string, unknown>): ManualCostFields {
   // ---- amountUsd: finite number, > 0, sane max ----
   const amountUsd = b.amountUsd;
   if (typeof amountUsd !== "number" || !Number.isFinite(amountUsd)) {
@@ -192,26 +238,7 @@ export function parseManualCostInput(body: unknown): ManualCostInput {
     rates.push({ currency, usdPerUnit: r.usdPerUnit });
   }
 
-  const input: ManualCostInput = { countryCode, amountUsd, reason, rates };
-
-  // ---- expectedContentHash: optional string ----
-  if (b.expectedContentHash !== undefined && b.expectedContentHash !== null) {
-    if (typeof b.expectedContentHash !== "string" || b.expectedContentHash.length === 0) {
-      throw invalid("expectedContentHash must be a non-empty string");
-    }
-    input.expectedContentHash = b.expectedContentHash;
-  }
-
-  // ---- expectedExtractedAt: optional ISO date-time string ----
-  if (b.expectedExtractedAt !== undefined && b.expectedExtractedAt !== null) {
-    const ms = typeof b.expectedExtractedAt === "string" ? Date.parse(b.expectedExtractedAt) : NaN;
-    if (!Number.isFinite(ms)) {
-      throw invalid("expectedExtractedAt must be an ISO 8601 date-time string");
-    }
-    input.expectedExtractedAtMs = ms;
-  }
-
-  return input;
+  return { amountUsd, reason, rates };
 }
 
 // ----- Planning the manual write -----
@@ -288,9 +315,55 @@ export function planManualCost(
     );
   }
 
+  // ---- Rates check + the new fee block (shared with #77 proposals) ----
+  // (The rates are checked after the 409 state checks above: a visa that
+  // can't take a manual cost at all says so, rather than complaining about
+  // the rates.)
+  return buildManualCostFee({
+    oldFee,
+    baseCostUsd: visa.baseCostUsd,
+    contentHash,
+    input,
+    setBy,
+    now,
+  });
+}
+
+/**
+ * Build the manual-cost fee block, shared by a pending scraped visa (#70,
+ * planManualCost) and an open proposed edit to a live visa (#77,
+ * planProposalManualCost in changes/visa-change-manual-cost.ts). The caller
+ * has already done its own state checks (which doc, stale, blocked);
+ * this function only does what is the same for both:
+ *
+ *  - rates: exactly one entry per distinct non-USD currency among the fee
+ *    components, no gaps, no extras (else 400 VALIDATION_ERROR);
+ *  - the audit block (`manualCost`): amount, reason, rates, setBy/setAt, the
+ *    content hash it was set against, `previous` (the scraper's own state, or
+ *    the ORIGINAL scraper state when correcting an earlier manual cost) and
+ *    `supersedes` (the corrected entry, one level only);
+ *  - the fee block: published `components` / `totals` kept, `totalUsd =
+ *    amountUsd`, `fxSource: "manual"`, `fxDate` = today, no flags, any
+ *    `replacedManualCost` audit entry carried forward.
+ *
+ * @param p.oldFee the fee block the cost replaces (absent on a pre-#59 doc)
+ * @param p.baseCostUsd the cost stored next to it (for `previous`)
+ * @param p.contentHash the extraction's content hash (recorded in the audit)
+ * @param p.input the validated cost fields
+ * @param p.setBy admin uid
+ * @param p.now injected clock (setAt + fxDate)
+ * @returns `baseCostUsd = Math.round(amountUsd)` and the new fee block
+ */
+export function buildManualCostFee(p: {
+  oldFee: VisaFeeMeta | undefined;
+  baseCostUsd: number | undefined;
+  contentHash: string;
+  input: ManualCostFields;
+  setBy: string;
+  now: Timestamp;
+}): ManualCostPlan {
+  const { oldFee, contentHash, input, setBy, now } = p;
   // ---- Rates: exactly one per distinct non-USD fee currency ----
-  // (Checked after the 409 state checks: a visa that can't take a manual
-  // cost at all says so, rather than complaining about the rates.)
   // Every currency the admin had to convert must say which rate they used
   // (no extras, no gaps), so the audit trail can always be re-checked.
   const needed = feeCurrencies(oldFee);
@@ -311,7 +384,7 @@ export function planManualCost(
   // manual entry's `previous`), and records the entry it supersedes.
   const previous: VisaManualCostMeta["previous"] = oldFee?.manualCost
     ? { ...oldFee.manualCost.previous }
-    : scraperState(oldFee, visa.baseCostUsd);
+    : scraperState(oldFee, p.baseCostUsd);
 
   const manualCost: VisaManualCostMeta = {
     amountUsd: input.amountUsd,
@@ -459,14 +532,30 @@ export function planManualCostOverwrite(p: {
   // ---- Changed page: the new extraction replaces it, recorded ----
   const fee: VisaFeeMeta = { ...newFee };
   if (manual) {
-    const replaced: VisaReplacedManualCostMeta = {
-      ...manual,
-      replacedAt: p.now,
-      replacedByContentHash: p.contentHash,
-    };
+    const replaced = markManualCostReplaced(manual, p.contentHash, p.now);
     fee.replacedManualCost = replaced;
     return { fee, deleteCost: p.newBaseCostUsd === undefined, replaced };
   }
   if (existingFee?.replacedManualCost) fee.replacedManualCost = existingFee.replacedManualCost;
   return { fee, deleteCost: false };
+}
+
+/**
+ * The audit record of a manual cost that a newer extraction replaced:
+ * the manual entry itself plus when (`replacedAt`) and by which page text
+ * (`replacedByContentHash`). Shared by a pending visa's refresh
+ * (planManualCostOverwrite, #70) and a re-proposal replacing an open
+ * proposal that carried a manual cost (planProposalWrite, #77), so both
+ * audit trails have the same shape.
+ *
+ * @param manual the manual cost that is being replaced
+ * @param contentHash the content hash of the extraction replacing it
+ * @param now when it was replaced
+ */
+export function markManualCostReplaced(
+  manual: VisaManualCostMeta,
+  contentHash: string,
+  now: Timestamp
+): VisaReplacedManualCostMeta {
+  return { ...manual, replacedAt: now, replacedByContentHash: contentHash };
 }

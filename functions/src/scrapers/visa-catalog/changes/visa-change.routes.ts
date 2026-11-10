@@ -21,6 +21,10 @@ adminVisaChangeRoutes.get("/:id", verifyAuth, (req, res) => visaChangeController
 // portal UI sends it); if the crawl has since replaced the row with a newer
 // revision → 409 REVISION_MISMATCH, nothing written, the row stays open.
 adminVisaChangeRoutes.post("/:id/approve", verifyAuth, (req, res) => visaChangeController.approve(req, res));
+// Issue #77: set the USD cost by hand on an open proposal blocked by
+// FEE_NOT_CONVERTED. Body { amountUsd, reason, rates, expectedRevision };
+// writes the row only, then approve accepts it.
+adminVisaChangeRoutes.put("/:id/manual-cost", verifyAuth, (req, res) => visaChangeController.setManualCost(req, res));
 // Reject it with { reason }; the live visa is untouched.
 adminVisaChangeRoutes.post("/:id/reject", verifyAuth, (req, res) => visaChangeController.reject(req, res));
 

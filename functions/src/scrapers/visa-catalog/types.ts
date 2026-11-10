@@ -551,6 +551,20 @@ export interface PendingVisaChange {
   // noPublishedFee (or the cost does not match it): approve is refused.
   approvable: boolean;
   blockReason?: string; // FEE_NOT_CONVERTED_MESSAGE / FEE_MISSING_COST_MESSAGE when !approvable
+  // ---- Manual USD cost on a proposal (issue #77) ----
+  // The cost itself lives where approve already looks: the proposed fee
+  // (`proposedScrapeMeta.fee.manualCost`, `fxSource: "manual"`, `totalUsd`)
+  // plus `proposed.baseCostUsd` = Math.round(amountUsd). See
+  // changes/visa-change-manual-cost.ts.
+  //
+  // Set when a re-proposal with CHANGED page text replaced this open row and
+  // the row it replaced carried a manual cost: that cost (+ replacedAt /
+  // replacedByContentHash), so the admin sees "your manual cost of $X was
+  // replaced" instead of it vanishing. Kept at ROW level (not on the
+  // proposed fee) so it is never copied onto the live visa by approve.
+  // Carried forward by later replacements until a newer manual cost is
+  // replaced. Absent when nothing was replaced.
+  replacedManualCost?: VisaReplacedManualCostMeta;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   // Set on resolution only:

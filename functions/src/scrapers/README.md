@@ -49,6 +49,7 @@ scrapers/
     types.ts                           VisaSource, PendingVisaChange, extraction schema
     adapters/                          source adapters (GOV.UK Content API, generic HTML)
     changes/                           pendingVisaChanges service + /admin/visa-changes (#61)
+                                       + manual cost on a proposal (#77), visa-change-manual-cost.md
     data/                              source registry seed + vendored official_visa_links_verified_v3.md (#78)
     scripts/                           crawl-visa-catalog, sync-visa-sources (CLI)
     eval/                              extraction eval: golden set, results history, run/score/record (#60)
