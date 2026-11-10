@@ -266,8 +266,9 @@ describe("extractor prompt — fee rule", () => {
     }
   });
 
-  test("prompt version is bumped (v4 #73: surcharge printed as a total, full-range processing)", () => {
-    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-surcharge-total-v4");
+  // v5 (#87): each processing figure must be tied to the quote stating it.
+  test("prompt version is bumped (v5 #87: processing range tied to its citations)", () => {
+    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-processing-cited-v5");
   });
 
   test("states the deterministic visa-length rule with the Skilled Worker example", () => {

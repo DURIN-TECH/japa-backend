@@ -9,6 +9,11 @@ import { VisaCategory } from "../types";
 import { isIso4217 } from "./visa-catalog-fx";
 // Registry official-host matching for `applicationUrl` (issue #74).
 import { officialHttpsUrl } from "./visa-catalog-official-hosts";
+// Processing range vs the durations its citations state (issue #87).
+import {
+  checkProcessingRangeCitations,
+  PROCESSING_UNVERIFIED_CONFIDENCE_CAP,
+} from "./visa-catalog-processing-check";
 
 // ============================================
 // VISA CATALOG — EXTRACT SERVICE (Step 3)
@@ -55,10 +60,18 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *    3105 per year x 3, tripling the Family fee). Also: processing time is the
  *    FULL standard range (min/max = shorter/longer of the outside- and
  *    inside-country standard decision times).
+ *  - "2026-11-processing-cited-v5" (#87): each end of the processing range is
+ *    tied to its quote. citations["processingDaysMin"] / ["processingDaysMax"]
+ *    must each quote the sentence stating THAT figure, and
+ *    citations["processingTime"] must state every duration in the range (a
+ *    v4 Standard Visitor crawl stored max 56, from "extend your stay ...
+ *    within 8 weeks", with only "within 3 weeks" cited). The value rule is
+ *    unchanged (full range, user decision on #60); the validator now flags a
+ *    range that disagrees with its citations (visa-catalog-processing-check).
  * Before merging a bump (or a model change), run `npm run eval:visa-extract`
  * and attach the result — see functions/eval/README.md.
  */
-export const EXTRACTOR_PROMPT_VERSION = "2026-11-surcharge-total-v4";
+export const EXTRACTOR_PROMPT_VERSION = "2026-11-processing-cited-v5";
 
 // A duration phrase: a number (digits or a word) followed by year(s)/month(s),
 // e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
@@ -227,6 +240,22 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
   const applicationInstructions =
     typeof o.applicationInstructions === "string" ? o.applicationInstructions : undefined;
 
+  // ---- Issue #87: the processing range must match its cited durations ----
+  // A SOFT check (never a rejection): when min/max is more than 20% from
+  // every duration the processing citations state (Standard Visitor: max 56
+  // stored with only "within 3 weeks" cited), the extraction is kept but
+  // FLAGGED (`processingUnverifiedReasons`) and its confidence capped, so the
+  // reviewer sees it instead of a silently stored number. Values with no
+  // cited duration at all are not judged here (that is #86's rule).
+  const processingUnverifiedReasons = checkProcessingRangeCitations(
+    { processingDaysMin, processingDaysMax },
+    citations
+  );
+  const finalConfidence =
+    processingUnverifiedReasons.length > 0
+      ? Math.min(confidence, PROCESSING_UNVERIFIED_CONFIDENCE_CAP)
+      : confidence;
+
   return {
     name,
     code,
@@ -242,10 +271,13 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
     eligibilityCriteria: eligibility,
     applicationUrl,
     applicationInstructions,
-    confidence,
+    // Capped when the processing range disagrees with its citations (#87).
+    confidence: finalConfidence,
     citations,
     // Only present when a surcharge was dropped (never an empty array/undefined key).
     ...(unverifiedReasons.length > 0 ? { feeUnverifiedReasons: unverifiedReasons } : {}),
+    // Only present when the processing range disagrees with its citations (#87).
+    ...(processingUnverifiedReasons.length > 0 ? { processingUnverifiedReasons } : {}),
   };
 }
 
@@ -477,6 +509,19 @@ export function buildSystemPrompt(): string {
     "- If the page gives only ONE standard figure (e.g. 'within 8 weeks'), use it for both",
     "  processingDaysMin and processingDaysMax.",
     "- processingTime (string) describes the same range, e.g. '3-8 weeks'.",
+    // ---- #87: every processing figure is tied to the quote that states it ----
+    // A v4 crawl stored max 56 (the visitor extension's "within 8 weeks")
+    // while the only processing quote was "within 3 weeks". The validator
+    // now flags a range whose ends are not stated in its citations.
+    "- Processing citations (verbatim quotes, each must CONTAIN the duration it supports):",
+    "  citations['processingDaysMin'] = the sentence stating the SHORTER time,",
+    "  citations['processingDaysMax'] = the sentence stating the LONGER time (a different sentence when the",
+    "  two times come from different parts of the page, e.g. applying from outside vs extending inside),",
+    "  citations['processingTime'] = the quote(s) stating every duration in the range; when the two ends come",
+    "  from different sentences, join both quotes with ' / '.",
+    "  Example: citations['processingDaysMin'] = 'you'll usually get a decision on your visa within 3 weeks',",
+    "  citations['processingDaysMax'] = 'a decision will usually be made within 8 weeks', processingTime '3-8 weeks'.",
+    "- Never report a processing figure that no quote in these citations states.",
   ].join("\n");
 }
 

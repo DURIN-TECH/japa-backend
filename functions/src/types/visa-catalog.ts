@@ -236,6 +236,10 @@ export interface VisaScrapeMeta {
   // constant EXTRACTOR_PROMPT_VERSION in visa-catalog-extract.service.ts), so
   // a reviewer can tell which rules a stored extraction followed.
   extractorPromptVersion?: string;
+  // Issue #87: why the processing range disagrees with its cited durations
+  // (copied from ExtractedVisa.processingUnverifiedReasons). Absent when it
+  // agrees. Tells the reviewer to check processingDaysMin/Max by hand.
+  processingUnverifiedReasons?: string[];
 }
 
 // ----- Fee components (issue #59) -----
@@ -532,6 +536,10 @@ export interface ExtractedVisa {
   eligibilityCriteria: string[];
   applicationUrl?: string;
   applicationInstructions?: string;
+  // Set by the validator (issue #87) when processingDaysMin/Max is more than
+  // 20% from every duration the processing citations state; confidence is
+  // then capped. Absent when the range agrees (or the check does not apply).
+  processingUnverifiedReasons?: string[];
   // Trust signals returned alongside the data.
   confidence: number; // 0–1
   // field -> verbatim quote from the page. Fee keys: "fee.application",
