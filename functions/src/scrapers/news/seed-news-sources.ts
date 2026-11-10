@@ -1,13 +1,12 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { IngestionStrategy, ScrapingConfig, SourceStatus, SupportedCountryCode } from "../../types/news";
 
-// Firestore handle for this seeder. Declared at module scope to mirror the
-// other data seeders (seed-portal-data, seed-countries-visas, eligibility).
-// NOTE: getFirestore() requires Firebase Admin to already be initialized, so
-// this module must only be imported AFTER admin.initializeApp() has run — the
-// consolidated seed entry point (scripts/seed-all.ts) guarantees this by
-// importing all data seeders only after init.
-const db = getFirestore();
+// NOTE: the Firestore handle is resolved LAZILY inside seedNewsSources() (not
+// at module load). getFirestore() throws when Firebase Admin is not yet
+// initialized, and since #91 this module is loaded by scrapers/index.ts on
+// every function cold start, in whatever order the import graph gives. Same
+// pattern as seed-visa-sources.ts. seedNewsSources() itself still requires
+// Admin to be initialized first (scripts/seed-all.ts guarantees that).
 
 export interface NewsSourceSeed {
   name: string;
@@ -245,6 +244,8 @@ export const NEWS_SOURCES: NewsSourceSeed[] = [
  * @returns the number of sources seeded.
  */
 export async function seedNewsSources(): Promise<number> {
+  // Resolved here (not at module load) — see the note at the top of the file.
+  const db = getFirestore();
   const collection = db.collection("newsSources");
   const batch = db.batch();
   const now = Timestamp.now();

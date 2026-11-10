@@ -136,7 +136,7 @@ async function main() {
 
     // 3a2. Visa-catalog sources — the official per-country immigration URLs the
     //      visa-catalog scraper crawls (seeded from the copy of
-    //      official_visa_links_verified_v3.md vendored in src/data/, issue #78).
+    //      official_visa_links_verified_v3.md vendored in src/scrapers/visa-catalog/data/, #78).
     //      Throws in CI if that file is missing, which fails the seed step.
     console.log("→ Seeding visa-catalog sources...");
     const visaSourceCount = await seedVisaSources();

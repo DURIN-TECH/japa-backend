@@ -9,10 +9,13 @@
 // outside src/scrapers/ (tests under test/scrapers/ are exempt). Types live in
 // the sibling `scrapers/types.ts` barrel, which carries no runtime code.
 //
-// Named re-exports only (no `export *`): TypeScript compiles each one to a
-// lazy getter, so an import cycle back into this module (e.g. visa.service ->
-// scrapers -> visa-catalog.service -> visa.service) resolves the binding at
-// call time, not at load time.
+// Import cycle: visa.service -> scrapers -> visa-catalog.service ->
+// visa.service. It is safe because no module in that cycle uses an imported
+// binding at load time (only inside functions/methods, at call time), so a
+// partially loaded module is never read. Keep it that way: no top-level use
+// of an import (e.g. `const x = imported.y`, `class A extends Imported`) in
+// modules on the cycle, and no module-load side effects such as a top-level
+// getFirestore() in anything this file pulls in.
 //
 // See README.md next to this file for the module map and its boundaries.
 

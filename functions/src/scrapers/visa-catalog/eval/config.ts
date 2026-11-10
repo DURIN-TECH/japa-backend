@@ -69,7 +69,7 @@ export const SCORED_FIELDS = Object.keys(FIELD_WEIGHTS) as ScoredField[];
 
 // ----- Golden set location + routes -----
 
-/** functions/eval/ (this file's directory, for both tsx and any compiled copy). */
+/** functions/src/scrapers/visa-catalog/eval/ (this file's directory, for both tsx and any compiled copy). */
 export const EVAL_DIR = __dirname;
 
 /** functions/src/scrapers/visa-catalog/eval/golden/<route>/{guide.json,expected.json} */
