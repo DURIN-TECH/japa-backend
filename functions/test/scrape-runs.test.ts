@@ -37,8 +37,8 @@ import type { Role } from "@durin-tech/authz";
 
 import { Data, installFakes, resetStore, store, writes } from "./helpers/fake-firestore";
 
-// Admin init needs a project id (utils/firebase derives the bucket from it).
-process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT || "demo-unit-test";
+// Project id (GCLOUD_PROJECT=demo-unit-test) and the no-network guard are set
+// centrally by the test preload, test/helpers/setup.ts (issue #94).
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 let runsMod: any; // services/scrape-run.service

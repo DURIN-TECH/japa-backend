@@ -35,8 +35,8 @@ import type { ExtractedFeeComponent, ExtractedVisa, FxRatesDoc } from "../src/ty
 import { FX_SOURCE_ECB } from "../src/services/visa-catalog-fx";
 import { Data, clone, installFakes, resetStore, store, writes } from "./helpers/fake-firestore";
 
-// Admin init needs a project id (utils/firebase derives the bucket from it).
-process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT || "demo-unit-test";
+// Project id (GCLOUD_PROJECT=demo-unit-test) and the no-network guard are set
+// centrally by the test preload, test/helpers/setup.ts (issue #94).
 
 // ============================================
 // Fixtures

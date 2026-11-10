@@ -56,10 +56,16 @@ import {
   VisaFeeNotConvertibleError,
   computeFee,
 } from "../src/services/visa-catalog-fx";
+// Issue #94: the run-record / cost-rollup collections and their transaction
+// runner come from the shared fake (its own store; reset in beforeEach).
+import {
+  fakeCollection as sharedFakeCollection,
+  fakeRunTransaction,
+  resetStore as resetSharedStore,
+} from "./helpers/fake-firestore";
 
-// Admin init needs a project id (utils/firebase derives the bucket from it).
-// Dummy, never contacted.
-process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT || "demo-unit-test";
+// Project id (GCLOUD_PROJECT=demo-unit-test) and the no-network guard are set
+// centrally by the test preload, test/helpers/setup.ts (issue #94).
 
 // ----- In-memory Firestore fake (only what these services call) -----
 
@@ -252,12 +258,35 @@ before(async () => {
       update: (ref: any, data: Data) => ref.update(data),
       set: (ref: any, data: Data, opts?: { merge?: boolean }) => ref.set(data, opts),
     });
+  // Issue #94: closeOpenProposals (a withdrawn scraped visa, issue #68) and
+  // the visa service's transactional writes resolve against this suite's
+  // store too, through the same pass-through runner — never a real Firestore.
+  const changes = (await import("../src/services/visa-catalog-changes.service")).visaChangeService as any;
+  changes.runTransaction = catalogSvc.runTransaction;
   visaSvc = (await import("../src/services/visa.service")).visaService;
+  visaSvc.runTransaction = catalogSvc.runTransaction;
+
+  // ---- Issue #94: every orchestrator tick also sweeps stale runs (#81),
+  // backfills the monthly cost rollup (#82), and a tick that crawls writes a
+  // run record whose finalize hook rolls its cost into scrapeCosts. None of
+  // that is under test here, but it must not reach a real Firestore (in CI
+  // each such call waited ~20s on the metadata server). Fake the collections
+  // with the shared helper (its own store) and run their transactions
+  // in memory.
+  firebase.collections.scrapeRuns = sharedFakeCollection("scrapeRuns");
+  firebase.collections.scrapeCosts = sharedFakeCollection("scrapeCosts");
+  const runsSvc = (await import("../src/services/scrape-run.service")).scrapeRunService as any;
+  runsSvc.runTransaction = fakeRunTransaction;
+  const costsSvc = (await import("../src/services/scrape-cost.service")).scrapeCostService as any;
+  costsSvc.runTransaction = fakeRunTransaction;
+
   controller = (await import("../src/controllers/visa.controller")).visaController;
 });
 
 beforeEach(() => {
   store.clear();
+  // Issue #94: run records / cost rollups from the previous test.
+  resetSharedStore();
   extractorCalls = 0;
   // One registry country (no page due: nextCrawlAt is absent so the due query
   // filter on status is the only one that matters — keep it "paused").

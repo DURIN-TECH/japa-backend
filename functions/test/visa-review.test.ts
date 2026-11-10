@@ -35,9 +35,8 @@ import type { VisaType } from "../src/types";
 import type { ExtractedFeeComponent, FxRatesDoc } from "../src/types/visa-catalog";
 import { FX_SOURCE_ECB, VisaFeeNotConvertibleError, computeFee } from "../src/services/visa-catalog-fx";
 
-// Admin init needs a project id (utils/firebase derives the bucket from it).
-// Dummy, never contacted.
-process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT || "demo-unit-test";
+// Project id (GCLOUD_PROJECT=demo-unit-test) and the no-network guard are set
+// centrally by the test preload, test/helpers/setup.ts (issue #94).
 
 // ============================================
 // In-memory Firestore fake (only what these services call)
@@ -254,6 +253,18 @@ before(async () => {
   const firebase: any = await import("../src/utils/firebase");
   firebase.collections.countries = fakeCollection("countries");
   firebase.subcollections.visaTypes = (cc: string) => fakeCollection(`countries/${cc}/visaTypes`);
+  // Issue #94: markWithdrawn of a scraped visa also closes its open #61
+  // proposals (issue #68), which queries pendingVisaChanges and resolves each
+  // row in a transaction. Fake the collection (empty in these tests) and use a
+  // pass-through runner, so nothing reaches a real Firestore.
+  firebase.collections.pendingVisaChanges = fakeCollection("pendingVisaChanges");
+  const changes: any = (await import("../src/services/visa-catalog-changes.service")).visaChangeService;
+  changes.runTransaction = (fn: (tx: any) => Promise<unknown>) =>
+    fn({
+      get: (ref: any) => ref.get(),
+      update: (ref: any, data: Data) => ref.update(data),
+      set: (ref: any, data: Data, opts?: { merge?: boolean }) => ref.set(data, opts),
+    });
 
   visaSvc = (await import("../src/services/visa.service")).visaService;
   catalogSvc = (await import("../src/services/visa-catalog.service")).visaCatalogService;

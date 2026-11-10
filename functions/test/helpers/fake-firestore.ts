@@ -17,6 +17,12 @@
 //    real transaction.
 // Every update()/set() is recorded in `writes` so tests can assert exactly
 // what was (or was not) written.
+//
+// Issue #94: anything a test forgets to fake is caught by the preload,
+// test/helpers/setup.ts — a real Firestore / Google call rejects at once and
+// fails the test that made it. When a new code path (a new collection, or a
+// new service with its own `runTransaction`) is reached from a test, add it to
+// installFakes() below (or to the suite's own fake).
 
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 

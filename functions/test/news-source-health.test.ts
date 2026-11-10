@@ -28,7 +28,8 @@ import type { NewsSource } from "../src/types/news";
 import type { VisaCatalogHttpClient } from "../src/services/visa-catalog-fetch.service";
 import { installFakes, resetStore, store as fakeStore } from "./helpers/fake-firestore";
 
-process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT || "demo-unit-test";
+// Project id (GCLOUD_PROJECT=demo-unit-test) and the no-network guard are set
+// centrally by the test preload, test/helpers/setup.ts (issue #94).
 
 type ScraperModule = typeof import("../src/services/news-scraper.service");
 let mod: ScraperModule;
