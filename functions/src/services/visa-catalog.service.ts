@@ -29,7 +29,7 @@ import { visaService } from "./visa.service";
 import type { ScrapeSourceMeta } from "./visa-source-adapters";
 // Proposed edits to approved scraped visas (issue #61): the pure branch
 // decision, and the pendingVisaChanges writer.
-import { planIngest } from "./visa-catalog-diff";
+import { isPendingPromptStale, planIngest } from "./visa-catalog-diff";
 import { visaChangeService } from "./visa-catalog-changes.service";
 // Manual USD cost (issue #70): a refresh replaces it, recording the overwrite.
 import { planManualCostOverwrite } from "./visa-manual-cost";
@@ -92,6 +92,24 @@ class VisaCatalogService {
    */
   buildVisaId(countryCode: string, sourceUrl: string, pinned?: { visaId?: string }): string {
     return deriveVisaId({ countryCode, sourceUrl, visaId: pinned?.visaId });
+  }
+
+  /**
+   * Issue #71: should an UNCHANGED page still be re-extracted because the doc
+   * at `visaId` is a pending scraped visa from an older extractor prompt?
+   *
+   * Used by both crawlers' hash gates (scheduled orchestrator + manual
+   * script) right where they would otherwise skip the LLM. One doc read per
+   * unchanged page; the rule itself is the pure isPendingPromptStale()
+   * (visa-catalog-diff.ts): approved / seeded / agent / rejected docs, and a
+   * missing doc, always return false.
+   *
+   * @returns true when the page must go to extraction despite the same hash
+   */
+  async needsPromptReextract(countryCode: string, visaId: string): Promise<boolean> {
+    const snap = await subcollections.visaTypes(countryCode).doc(visaId).get();
+    const existing = snap.exists ? (snap.data() as VisaType) : undefined;
+    return isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION);
   }
 
   /**
@@ -191,7 +209,12 @@ class VisaCatalogService {
 
     const existing = snap.data() as VisaType;
     // Which branch this doc takes (unchanged / refresh / propose / skip).
-    const branch = planIngest(existing, contentHash);
+    // Passing the running prompt version (issue #71) makes a PENDING scraped
+    // doc extracted by an older prompt "refresh" even when the page hash is
+    // the same — the crawl only re-extracts it for that reason (see
+    // needsPromptReextract), so the new extraction must not be dropped as
+    // "unchanged". Approved docs are unaffected by the version.
+    const branch = planIngest(existing, contentHash, EXTRACTOR_PROMPT_VERSION);
     if (branch === "unchanged") {
       return { visaId, outcome: "unchanged" };
     }

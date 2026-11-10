@@ -72,6 +72,9 @@ export interface CrawlSummary {
   sourcesProcessed: number;
   pagesFetched: number;
   pagesChanged: number; // content hash differed → sent to extraction
+  // Issue #71: pages with an UNCHANGED hash sent to extraction anyway because
+  // their pending scraped doc came from an older extractor prompt version.
+  promptReextracts: number;
   created: number; // new pending-review scraped visas written
   updated: number; // existing pending scraped visas refreshed
   skipped: number; // seeded/agent/rejected/withdrawn visa left untouched
@@ -127,6 +130,7 @@ class VisaCatalogCrawlService {
       sourcesProcessed: 0,
       pagesFetched: 0,
       pagesChanged: 0,
+      promptReextracts: 0,
       created: 0,
       updated: 0,
       skipped: 0,
@@ -291,9 +295,22 @@ class VisaCatalogCrawlService {
             lastCrawledAt: now,
             lastError: undefined,
           };
-          if (!changed) continue; // hash gate — nothing new, skip the LLM
-
-          summary.pagesChanged++;
+          // ---- Hash gate (+ prompt-version re-extract, issue #71) ----
+          // Same text as last crawl → normally skip the LLM. Exception: the
+          // doc at `visaId` is a PENDING scraped visa extracted by an older
+          // EXTRACTOR_PROMPT_VERSION — re-extract it so a prompt change
+          // reaches it without a manual --force. Approved / seeded / agent
+          // docs never qualify (approved ones only get a #61 proposal on a
+          // real content change). This goes through the same
+          // maxExtractions accounting below, so a version bump drains over
+          // several runs instead of re-extracting everything at once.
+          if (!changed) {
+            const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId);
+            if (!promptStale) continue; // nothing new, skip the LLM
+            summary.promptReextracts++;
+          } else {
+            summary.pagesChanged++;
+          }
           // Count the LLM call BEFORE making it: a failed call (API error,
           // validation error) costs money too and must use up a
           // maxExtractions slot, or a systematic failure could exceed the cap.

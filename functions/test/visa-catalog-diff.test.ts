@@ -33,6 +33,7 @@ import {
   diffFeeComponents,
   diffVisa,
   findStaleReason,
+  isPendingPromptStale,
   mergeProposal,
   planIngest,
   planProposalFeeReconvert,
@@ -259,6 +260,39 @@ describe("planIngest (doc state → branch)", () => {
     assert.equal(planIngest({ ...base, source: "scraped", reviewStatus: "approved", staleSince: NOW }, "new"), "skip");
     assert.equal(planIngest({ ...base, source: "agent", reviewStatus: "approved" }, "new"), "skip");
     assert.equal(planIngest({ ...base }, "new"), "skip"); // seeded uk-* (no source)
+  });
+});
+
+// ----- Prompt-version re-extract (issue #71) -----
+
+describe("isPendingPromptStale + planIngest with a prompt version (issue #71)", () => {
+  const CUR = "v-current";
+  const meta = (v?: string) => ({ contentHash: "h", ...(v ? { extractorPromptVersion: v } : {}) }) as any;
+  const pending = (v?: string) => ({ source: "scraped" as const, reviewStatus: "pending_review" as const, scrapeMeta: meta(v) });
+
+  test("only a pending scraped doc with an older / missing version is stale", () => {
+    assert.equal(isPendingPromptStale(pending("v-old"), CUR), true);
+    assert.equal(isPendingPromptStale(pending(undefined), CUR), true); // pre-#59 doc
+    assert.equal(isPendingPromptStale(pending(CUR), CUR), false);
+    assert.equal(isPendingPromptStale(undefined, CUR), false); // no doc
+    assert.equal(isPendingPromptStale({ ...pending("v-old"), reviewStatus: "approved" }, CUR), false);
+    assert.equal(isPendingPromptStale({ ...pending("v-old"), reviewStatus: "rejected" }, CUR), false);
+    assert.equal(isPendingPromptStale({ ...pending("v-old"), source: "agent" }, CUR), false);
+    assert.equal(isPendingPromptStale({ scrapeMeta: meta("v-old") } as any, CUR), false); // seeded
+  });
+
+  test("same hash: stale pending doc → refresh; everything else keeps the hash rule", () => {
+    assert.equal(planIngest(pending("v-old"), "h", CUR), "refresh");
+    assert.equal(planIngest(pending(undefined), "h", CUR), "refresh");
+    assert.equal(planIngest(pending(CUR), "h", CUR), "unchanged");
+    // Approved docs stay "unchanged" on the same hash: no prompt-only proposal (#61).
+    assert.equal(planIngest({ ...pending("v-old"), reviewStatus: "approved" }, "h", CUR), "unchanged");
+    assert.equal(planIngest({ ...pending("v-old"), source: "agent" }, "h", CUR), "unchanged");
+    // No version passed (e.g. the #61 proposal transaction) → plain hash rule.
+    assert.equal(planIngest(pending("v-old"), "h"), "unchanged");
+    // A real content change is unaffected by the version.
+    assert.equal(planIngest(pending("v-old"), "new", CUR), "refresh");
+    assert.equal(planIngest({ ...pending("v-old"), reviewStatus: "approved" }, "new", CUR), "propose");
   });
 });
 

@@ -45,6 +45,7 @@ import {
   isFxFresh,
   planFeeReconvert,
   refreshFxRates,
+  storedFeeUnverifiedReasons,
   type FxStore,
 } from "../src/services/visa-catalog-fx";
 import { buildScrapeMeta, extractedToVisaFields, finiteMin } from "../src/services/visa-catalog-meta";
@@ -421,7 +422,9 @@ describe("computeFee", () => {
     });
     assert.equal(baseCostUsd, undefined);
     assert.equal(feeMeta.feeUnverified, true);
-    assert.equal(feeMeta.feeUnverifiedReason, "dropped surcharge \"IHS\": no duration");
+    // Issue #71: stored as an array, the legacy joined string is never written.
+    assert.deepEqual(feeMeta.feeUnverifiedReasons, ["dropped surcharge \"IHS\": no duration"]);
+    assert.equal("feeUnverifiedReason" in feeMeta, false);
     assert.equal(feeMeta.totalUsd, undefined);
   });
 
@@ -433,7 +436,8 @@ describe("computeFee", () => {
     );
     assert.equal(baseCostUsd, undefined);
     assert.equal(feeMeta.feeUnverified, true);
-    assert.match(feeMeta.feeUnverifiedReason ?? "", /plausibility cap/);
+    assert.equal(feeMeta.feeUnverifiedReasons?.length, 1);
+    assert.match(feeMeta.feeUnverifiedReasons?.[0] ?? "", /plausibility cap/);
   });
 
   test("a large fee in a high-denomination currency is fine (cap is in USD)", () => {
@@ -769,7 +773,36 @@ describe("planFeeReconvert", () => {
     assert.equal(plan.baseCostUsd, undefined);
     assert.equal(plan.fee.fxStale, undefined);
     assert.equal(plan.fee.feeUnverified, true);
-    assert.equal(plan.fee.feeUnverifiedReason, "dropped surcharge \"IHS\": no duration");
+    assert.deepEqual(plan.fee.feeUnverifiedReasons, ["dropped surcharge \"IHS\": no duration"]);
+  });
+
+  // ---- Issue #71: legacy "; "-joined reason string (pre-#71 docs) ----
+  test("a legacy feeUnverifiedReason string is read back and migrated to the array form", () => {
+    const { feeMeta } = computeFee([SW_COMPONENTS[0]], fxDoc(daysAgo(8)), NOW, {
+      unverifiedReasons: ["placeholder"],
+    });
+    // Rebuild the block as a pre-#71 doc stored it: joined string, no array.
+    delete feeMeta.feeUnverifiedReasons;
+    feeMeta.feeUnverifiedReason = "dropped surcharge \"IHS\": no duration; second reason";
+    const v = staleVisa();
+    v.scrapeMeta = { ...v.scrapeMeta!, fee: feeMeta };
+    const plan = planFeeReconvert(v, fxDoc(NOW), NOW);
+    assert.ok(plan);
+    assert.equal(plan.fee.feeUnverified, true);
+    // Both reasons survive, as separate entries, and the legacy key is gone.
+    assert.deepEqual(plan.fee.feeUnverifiedReasons, ["dropped surcharge \"IHS\": no duration", "second reason"]);
+    assert.equal("feeUnverifiedReason" in plan.fee, false);
+  });
+
+  test("a legacy plausibility reason is dropped on re-convert (re-derived by computeFee)", () => {
+    const { feeMeta } = computeFee([SW_COMPONENTS[0]], fxDoc(daysAgo(8)), NOW);
+    feeMeta.feeUnverified = true;
+    feeMeta.feeUnverifiedReason = "\"X\" (1 GBP) exceeds the 1 USD plausibility cap; dropped surcharge \"IHS\": no duration";
+    const v = staleVisa();
+    v.scrapeMeta = { ...v.scrapeMeta!, fee: feeMeta };
+    const plan = planFeeReconvert(v, fxDoc(NOW), NOW);
+    assert.ok(plan);
+    assert.deepEqual(plan.fee.feeUnverifiedReasons, ["dropped surcharge \"IHS\": no duration"]);
   });
 
   test("still no rate with the same flags → no write", () => {
@@ -872,5 +905,33 @@ describe("finiteMin", () => {
     assert.equal(finiteMin([500, undefined, NaN, 130]), 130);
     assert.equal(finiteMin([undefined]), 0);
     assert.equal(finiteMin([]), 0);
+  });
+});
+
+// ----- storedFeeUnverifiedReasons (issue #71 back-compat reader) -----
+
+describe("storedFeeUnverifiedReasons", () => {
+  test("array form wins and is returned as-is (empty / non-string entries dropped)", () => {
+    assert.deepEqual(storedFeeUnverifiedReasons({ feeUnverifiedReasons: ["a; still one reason", "b"] }), [
+      "a; still one reason",
+      "b",
+    ]);
+    assert.deepEqual(
+      storedFeeUnverifiedReasons({ feeUnverifiedReasons: ["a", "", 3 as unknown as string] }),
+      ["a"]
+    );
+    // Array present → the legacy string is ignored.
+    assert.deepEqual(storedFeeUnverifiedReasons({ feeUnverifiedReasons: ["a"], feeUnverifiedReason: "x; y" }), ["a"]);
+  });
+
+  test("legacy string form is split on '; '", () => {
+    assert.deepEqual(storedFeeUnverifiedReasons({ feeUnverifiedReason: "x; y" }), ["x", "y"]);
+    assert.deepEqual(storedFeeUnverifiedReasons({ feeUnverifiedReason: "only" }), ["only"]);
+    assert.deepEqual(storedFeeUnverifiedReasons({ feeUnverifiedReason: "" }), []);
+  });
+
+  test("no reasons / no fee block → []", () => {
+    assert.deepEqual(storedFeeUnverifiedReasons({}), []);
+    assert.deepEqual(storedFeeUnverifiedReasons(undefined), []);
   });
 });
