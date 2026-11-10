@@ -437,13 +437,81 @@ export interface VisaType {
 
   // Admin review
   reviewStatus?: "pending_review" | "approved" | "rejected";
-  source?: "scraped" | "agent";
+  // Where the visa came from (issue #99 adds "agency"):
+  //  - "scraped": created by the visa-catalog scraper (pending until approved);
+  //  - "agent":   LEGACY. Created through the admin-only
+  //               `POST /countries/:code/visas` before ownership existed. Still
+  //               valid for those existing docs; nothing new is written with it
+  //               except by that legacy endpoint (createVisaType);
+  //  - "agency":  created by an agency (owner/agent) for its own clients (#100).
+  //               Always carries `ownerAgencyId` + `createdBy`.
+  // Missing on seed visas (treated as admin-curated and publicly visible).
+  source?: VisaSource;
   reviewedBy?: string;
   reviewedAt?: Timestamp;
   rejectionReason?: string;
 
+  // ---- Ownership + visibility (issue #99) ----
+  // Agency that owns this visa (`agencies/{id}`). Set for `source: "agency"`
+  // visas only; it never changes, and it stays set after the visa is made
+  // global (the agency keeps the creator tag). Missing = Seli-owned
+  // (seed, scraped, or legacy admin-created `source: "agent"`).
+  ownerAgencyId?: string;
+  // Firebase Auth uid of the user who created the visa (an agency owner or
+  // agent for agency visas, the admin for admin-created ones). Missing on
+  // seed, scraped and legacy docs, whose creator was never recorded.
+  createdBy?: string;
+  // Who can see the visa once it is active + approved:
+  //  - "global": everyone (Explorer, `/visas`, country lists, search, stats);
+  //  - "agency": only through the owning agency (its portal users, its public
+  //              `/a/<slug>` page, its cases — #102). Never in public reads.
+  // Missing = "global" (seed and scraped docs predate the field). Approval
+  // does NOT change it: only the admin make-global action (#101) does.
+  // Public reads decide with `isVisaPubliclyVisible` (visa.service.ts).
+  visibility?: VisaVisibility;
+  // Organisation that sponsors this route, for organisation-sponsored visas
+  // (e.g. a UK sponsor-licence holder issuing Certificates of Sponsorship).
+  // Optional on every visa; validated by the agency endpoints (#100).
+  sponsor?: VisaSponsor;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+/**
+ * Origin of a visa doc (`VisaType.source`). See the field comment for each
+ * value; "agent" is legacy and kept only so existing docs stay valid.
+ */
+export type VisaSource = "scraped" | "agent" | "agency";
+
+/**
+ * Named `VisaType.visibility` values (issue #99), so code compares against
+ * one constant instead of repeating string literals.
+ */
+export const VISA_VISIBILITY = {
+  /** Only visible through the owning agency. */
+  AGENCY: "agency",
+  /** Visible to everyone (public reads). The default when missing. */
+  GLOBAL: "global",
+} as const;
+
+/** `VisaType.visibility`: "agency" | "global" (see VISA_VISIBILITY). */
+export type VisaVisibility = (typeof VISA_VISIBILITY)[keyof typeof VISA_VISIBILITY];
+
+/**
+ * Sponsoring organisation of an organisation-sponsored visa route
+ * (`VisaType.sponsor`, issue #99). Free-text details as the agency entered
+ * them; validation lives with the agency visa endpoints (#100).
+ */
+export interface VisaSponsor {
+  /** Legal or trading name of the sponsoring organisation. Required. */
+  organisationName: string;
+  /** Organisation website (absolute URL). */
+  website?: string;
+  /** Sponsor licence number, e.g. a UK Home Office sponsor licence. */
+  sponsorLicenceNumber?: string;
+  /** How to reach the sponsor: a name, email or phone number. */
+  contact?: string;
 }
 
 export type VisaCategory = 

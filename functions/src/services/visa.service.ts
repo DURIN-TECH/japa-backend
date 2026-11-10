@@ -10,6 +10,7 @@ import {
   VisaRequirement,
   VisaCategory,
   RequiredDocument,
+  VISA_VISIBILITY,
 } from "../types";
 // FieldValue.delete() clears `staleSince` on approval (issue #62).
 import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
@@ -19,6 +20,60 @@ import { assertVisaApprovable } from "../scrapers";
 import { finiteMin } from "../scrapers";
 // Manual USD cost on a pending scraped visa (issue #70): pure rules.
 import { ManualCostError, ManualCostInput, planManualCost } from "../scrapers";
+
+// ============================================
+// PUBLIC VISIBILITY RULE (issue #99)
+// ============================================
+
+/**
+ * The fields the public visibility rule reads. A Pick (not the whole
+ * VisaType) so callers can pass raw Firestore data or partial docs.
+ */
+export type VisaVisibilityFields = Pick<VisaType, "isActive" | "visibility" | "reviewStatus">;
+
+/**
+ * Whether a visa may be shown on a PUBLIC read: `/countries/:code/visas`,
+ * `/countries/:code/visas/:visaId(/full)`, `/visas`, `/visas/search`,
+ * `/visas/popular` and the denormalized country stats. The ONE place this
+ * rule lives — every public read (and #100 / #102) goes through it.
+ *
+ * Visible only when ALL of these hold:
+ *  1. `isActive === true` (strict, matching the `isActive == true` query);
+ *  2. `visibility` is "global" or missing (seed / scraped docs predate the
+ *     field, and missing means global). "agency" visas are only reachable
+ *     through their agency (#102), never here;
+ *  3. `reviewStatus` is "approved" or missing (seed docs have no review).
+ *     "pending_review" and "rejected" are hidden even when `isActive` is
+ *     true — the pre-#99 bug was a pending agent visa written with
+ *     `isActive: true`, which this blocks regardless of the data.
+ *
+ * `null` is treated like missing (Firestore can hold explicit nulls).
+ *
+ * Why in code and not in the query: Firestore cannot match a MISSING field
+ * (`where("visibility", "==", "global")` would drop every seed doc), so the
+ * reads keep their existing `isActive == true` query and filter the result
+ * here. No extra index is needed for that.
+ *
+ * @param visa the visa (or just its isActive / visibility / reviewStatus)
+ * @returns true when the visa may appear on a public read
+ */
+export function isVisaPubliclyVisible(visa: VisaVisibilityFields): boolean {
+  // 1. Live in the app at all.
+  if (visa.isActive !== true) return false;
+  // 2. Globally visible (missing / null = global).
+  if (visa.visibility != null && visa.visibility !== VISA_VISIBILITY.GLOBAL) return false;
+  // 3. Approved, or never reviewed (seed).
+  if (visa.reviewStatus != null && visa.reviewStatus !== "approved") return false;
+  return true;
+}
+
+/**
+ * Keep only the publicly visible visas (see isVisaPubliclyVisible), in their
+ * original order.
+ */
+export function filterPubliclyVisible<T extends VisaVisibilityFields>(visas: T[]): T[] {
+  return visas.filter(isVisaPubliclyVisible);
+}
 
 export interface CreateCountryInput {
   code: string;
@@ -123,8 +178,10 @@ class VisaService {
    * Update country stats (called after visa type changes)
    *
    * The ONE canonical recompute of a country's denormalized
-   * `visaTypesCount` / `minCostUsd` / `minProcessingDays` from its ACTIVE
-   * visas (issue #62 deleted the catalog-side duplicate). Callers: the
+   * `visaTypesCount` / `minCostUsd` / `minProcessingDays` from its PUBLICLY
+   * VISIBLE visas (issue #62 deleted the catalog-side duplicate). Issue #99:
+   * it reads through getVisaTypesByCountry, so a pending, rejected or
+   * agency-only visa never changes a country's stats, even when active. Callers: the
    * `onVisaTypeUpdated` trigger, createVisaType / updateVisaType,
    * updateVisaReviewStatus (approve/reject) and
    * visaCatalogService.markWithdrawn. Uses update(), so a missing country
@@ -165,7 +222,13 @@ class VisaService {
   // ============================================
 
   /**
-   * Get all visa types for a country
+   * Get the PUBLICLY VISIBLE visa types for a country, ordered by category.
+   *
+   * Public read (`GET /countries/:code/visas`) and the source for search,
+   * popular, `/visas` and the country stats. Issue #99: the query still
+   * filters `isActive == true` (index: visaTypes isActive + category, COLLECTION
+   * scope), then isVisaPubliclyVisible drops pending / rejected / agency-only
+   * docs in code (Firestore can't match missing fields).
    */
   async getVisaTypesByCountry(countryCode: string): Promise<VisaType[]> {
     const snapshot = await subcollections
@@ -174,14 +237,19 @@ class VisaService {
       .orderBy("category")
       .get();
 
-    return snapshot.docs.map((doc) => ({
+    const visaTypes = snapshot.docs.map((doc) => ({
       id: doc.id,
       ...doc.data(),
     })) as VisaType[];
+    // ---- Public visibility rule (issue #99) ----
+    return filterPubliclyVisible(visaTypes);
   }
 
   /**
-   * Get visa types by category
+   * Get the PUBLICLY VISIBLE visa types of one category for a country
+   * (`GET /countries/:code/visas?category=…`, `/visas?category=…`).
+   * Equality-only query (merged single-field indexes); filtered in code with
+   * isVisaPubliclyVisible, like getVisaTypesByCountry.
    */
   async getVisaTypesByCategory(
     countryCode: string,
@@ -193,14 +261,20 @@ class VisaService {
       .where("category", "==", category)
       .get();
 
-    return snapshot.docs.map((doc) => ({
+    const visaTypes = snapshot.docs.map((doc) => ({
       id: doc.id,
       ...doc.data(),
     })) as VisaType[];
+    // ---- Public visibility rule (issue #99) ----
+    return filterPubliclyVisible(visaTypes);
   }
 
   /**
-   * Get a single visa type
+   * Get a single visa type, UNFILTERED (any status / visibility).
+   *
+   * Internal callers only (case creation in application.service, review,
+   * requirements). Public endpoints must check isVisaPubliclyVisible on the
+   * result (or use getPublicVisaType) — see the visa controller.
    */
   async getVisaType(
     countryCode: string,
@@ -219,9 +293,31 @@ class VisaService {
   }
 
   /**
-   * Create a new visa type (admin only)
+   * Get a single visa type for a PUBLIC read: null when it does not exist OR
+   * is not publicly visible (isVisaPubliclyVisible), so the caller answers
+   * 404 either way and a hidden visa's existence never leaks.
    */
-  async createVisaType(input: CreateVisaTypeInput): Promise<VisaType> {
+  async getPublicVisaType(
+    countryCode: string,
+    visaTypeId: string
+  ): Promise<VisaType | null> {
+    const visaType = await this.getVisaType(countryCode, visaTypeId);
+    return visaType && isVisaPubliclyVisible(visaType) ? visaType : null;
+  }
+
+  /**
+   * Create a new visa type (`POST /countries/:code/visas`, admin only).
+   *
+   * Issue #99 write-path fix: the doc is created PENDING and HIDDEN —
+   * `reviewStatus: "pending_review"`, `isActive: false` and
+   * `visibility: "agency"` — so it is not publicly visible until an admin
+   * approves it (approval sets `isActive: true`). Before #99 it was written
+   * `isActive: true`, which put an unreviewed visa in every public read.
+   * Approval does not touch `visibility`, so the approved visa stays out of
+   * the public reads until the admin make-global action (#101). It has no
+   * `ownerAgencyId` (admin-created); `createdBy` is recorded when given.
+   */
+  async createVisaType(input: CreateVisaTypeInput, createdBy?: string): Promise<VisaType> {
     const countryCode = input.countryCode.toUpperCase();
 
     // Verify country exists
@@ -249,17 +345,25 @@ class VisaService {
       isExtendable: input.isExtendable ?? false,
       maxExtensions: input.maxExtensions,
       eligibilityCriteria: input.eligibilityCriteria,
-      isActive: true,
+      // Hidden until approved (issue #99): inactive + agency-only + pending.
+      isActive: false,
+      visibility: VISA_VISIBILITY.AGENCY,
       agentIds: [],
       reviewStatus: "pending_review",
+      // Legacy source of this admin endpoint (kept so the admin review list
+      // and the backfill treat these docs the same way as before).
       source: "agent",
+      // Who created it (the admin's uid), when the controller passes it.
+      ...(createdBy ? { createdBy } : {}),
       createdAt: now,
       updatedAt: now,
     };
 
     await docRef.set(visaType);
 
-    // Update country stats
+    // Update country stats. A hidden visa never changes them (the recompute
+    // only counts publicly visible visas), but recomputing keeps the stats
+    // self-healing, as before.
     await this.updateCountryStats(countryCode);
 
     return visaType;
@@ -382,7 +486,9 @@ class VisaService {
   // ============================================
 
   /**
-   * Search visa types across all countries
+   * Search visa types across all countries (`GET /visas/search`).
+   * Only publicly visible visas: it reads through getVisaTypesByCountry,
+   * which applies isVisaPubliclyVisible (issue #99).
    */
   async searchVisaTypes(query: string): Promise<VisaType[]> {
     // Note: Firestore doesn't support full-text search natively
@@ -406,7 +512,8 @@ class VisaService {
   }
 
   /**
-   * Get popular visa types across all countries
+   * Get popular visa types across all countries (`GET /visas/popular`).
+   * Only publicly visible visas, via getVisaTypesByCountry (issue #99).
    */
   async getPopularVisaTypes(limit = 10): Promise<VisaType[]> {
     const results: VisaType[] = [];
@@ -425,6 +532,9 @@ class VisaService {
 
   /**
    * Get all visa types across all countries with optional filtering
+   * (`GET /visas`). Only publicly visible visas: both per-country reads apply
+   * isVisaPubliclyVisible (issue #99), so the pagination `total` below counts
+   * visible visas only.
    */
   async getAllVisaTypes(options?: {
     category?: VisaCategory;
@@ -615,6 +725,9 @@ class VisaService {
       statsAffected = true;
     }
 
+    // Issue #99: neither action writes `visibility`. An approved
+    // agency-only visa stays agency-only (out of the public reads) until the
+    // admin make-global action (#101) sets it to "global".
     await visaTypeRef.update(updates);
 
     // ---- Recompute country stats before responding ----
@@ -686,7 +799,11 @@ class VisaService {
   }
 
   /**
-   * Get visa type with full details including requirements
+   * Get visa type with full details including requirements, UNFILTERED.
+   *
+   * The public `GET /countries/:code/visas/:visaId/full` handler checks
+   * visibility itself before calling this (admins see every visa), so this
+   * stays the unfiltered read for internal / admin use.
    */
   async getVisaTypeWithRequirements(
     countryCode: string,

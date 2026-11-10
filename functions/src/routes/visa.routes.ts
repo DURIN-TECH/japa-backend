@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { visaController } from "../controllers/visa.controller";
-import { verifyAuth, verifyAdmin } from "../middleware/auth";
+import { verifyAuth, verifyAdmin, optionalAuth } from "../middleware/auth";
 
 // Routes mounted at /countries
 const countryRoutes = Router();
@@ -15,10 +15,13 @@ countryRoutes.post("/", verifyAuth, verifyAdmin, (req, res) =>
 countryRoutes.get("/:code/visas", (req, res) =>
   visaController.getVisaTypes(req, res)
 );
-countryRoutes.get("/:code/visas/:visaId", (req, res) =>
+// Single-visa reads (issue #99): public, but a non-visible visa is 404 unless
+// the caller's ability allows reading it. `optionalAuth` attaches the ability
+// when a valid token is sent and never blocks an anonymous request.
+countryRoutes.get("/:code/visas/:visaId", optionalAuth, (req, res) =>
   visaController.getVisaType(req, res)
 );
-countryRoutes.get("/:code/visas/:visaId/full", (req, res) =>
+countryRoutes.get("/:code/visas/:visaId/full", optionalAuth, (req, res) =>
   visaController.getVisaTypeWithRequirements(req, res)
 );
 countryRoutes.post("/:code/visas", verifyAuth, verifyAdmin, (req, res) =>
