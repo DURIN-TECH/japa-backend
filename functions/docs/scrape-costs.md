@@ -68,8 +68,9 @@ Monday through Friday, excluding Chinese public holidays".
   non-thinking mode of `deepseek-v4-flash`, and the pricing page says the
   legacy `deepseek-v4-flash` name is served by V4.1-Flash and "billed at the
   Flash price". The same entry announced `deepseek-chat` would be
-  discontinued on 2026-07-24; it still answered on 2026-11-10 (see the
-  emulator check on #82). Switching the model name is a model change: it
+  discontinued on 2026-07-24; it still answered on 2026-11-10, with the
+  response's `model` = `deepseek-flash` (stored as
+  `scrapeMeta.llmResponseModel`). Switching the model name is a model change: it
   needs the eval (`functions/CLAUDE.md`).
 - **Peak vs off-peak**: each call is costed at the rate for the hour its
   response arrived (UTC). Chinese public holidays are not modelled, so a call
