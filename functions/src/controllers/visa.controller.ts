@@ -381,15 +381,19 @@ export class VisaController {
    * 200 → the updated visa. 400 VALIDATION_ERROR, 403 FORBIDDEN, 404
    * NOT_FOUND, 409 NOT_PENDING_SCRAPED / FEE_ALREADY_CONVERTED / STALE_VISA.
    *
-   * Authz: the shared CASL ability, `update` on the `VisaChange` subject
-   * (@durin-tech/authz: "a pending (not yet live) edit to a scraped visa",
-   * admin-only via `manage all`). Checked FIRST, before validation or any
-   * read, so nothing about the visa leaks to non-admins. No role literals.
+   * Authz: the shared CASL ability, `update` on the `Visa` subject
+   * (@durin-tech/authz >= 0.1.4: a catalog visa type, admin-only via
+   * `manage all`). This writes the visa document itself, so it is gated on
+   * `Visa`, NOT on `VisaChange` (that subject is a pending edit *proposal*
+   * in `pendingVisaChanges`, a different resource). Checked FIRST, before
+   * validation or any read, so nothing about the visa leaks to non-admins.
+   * No role literals.
    */
   async setManualCost(req: AuthenticatedRequest, res: Response): Promise<void> {
     const { id } = req.params;
     // ---- CASL gate ----
-    if (!can(req, "update", asSubject("VisaChange", { id }))) {
+    // `update Visa`: an admin edit to the visa document itself (see above).
+    if (!can(req, "update", asSubject("Visa", { id }))) {
       forbidden(res, "Only admins can set a visa's cost by hand");
       return;
     }

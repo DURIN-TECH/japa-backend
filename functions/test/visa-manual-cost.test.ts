@@ -524,11 +524,30 @@ describe("PUT /admin/visas/:id/manual-cost", () => {
     assert.equal(nextCalled, false);
   });
 
-  test("the gate is the CASL ability: only admin can update a VisaChange", () => {
+  // The endpoint edits the visa document itself, so it is gated on the `Visa`
+  // subject (@durin-tech/authz 0.1.4), not `VisaChange` (a pending proposal).
+  test("the gate is the CASL ability: only admin can update a Visa", () => {
     const can = (role: Role) =>
-      defineAbilitiesFor({ uid: "u", role, agencyId: role === ROLES.ADMIN ? null : "ag1" }).can("update", "VisaChange");
+      defineAbilitiesFor({ uid: "u", role, agencyId: role === ROLES.ADMIN ? null : "ag1" }).can("update", "Visa");
     assert.equal(can(ROLES.ADMIN), true);
     for (const role of [ROLES.OWNER, ROLES.AGENT, ROLES.CLIENT]) assert.equal(can(role), false);
+  });
+
+  test("the handler checks `update Visa` (not `VisaChange`) on the visa id", async () => {
+    // Swap the request's ability for a spy that records every check and
+    // denies it, so the handler stops at the gate with a 403. The recorded
+    // subject type is the one CASL's `subject()` tagged on the resource.
+    const seen: Array<[string, unknown, unknown]> = [];
+    const spy = {
+      can(action: string, resource: any) {
+        seen.push([action, resource?.__caslSubjectType__, resource?.id]);
+        return false;
+      },
+    };
+    const { res, out } = fakeRes();
+    await controller.setManualCost({ ...req(ROLES.ADMIN, BODY), ability: spy }, res);
+    assert.equal(out.status, 403);
+    assert.deepEqual(seen, [["update", "Visa", VISA_ID]]);
   });
 });
 
