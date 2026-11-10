@@ -177,9 +177,23 @@ Both kinds when `kind` is omitted (visa first). `200 { data: SourceHealth[] }`:
   "intervalHours": 168 | null,     // visa legacy interval; news scrapeIntervalMinutes/60
   "hostBackoffs": [ { "host": "www.gov.uk", "until": "ISO", "status": 429, "recordedAt": "ISO" } ], // active only; [] for news
   "lastError": { "message": "...", "at": "ISO" | null, "url": "..." } | null, // visa: latest page error
-  "pageCount": 12 | null, "pagesWithErrors": 1 | null  // visa only
+  "pageCount": 12 | null, "pagesWithErrors": 1 | null,  // visa only
+  // Issue #107 (additive):
+  "autoPaused": false,             // true while the CRAWLER holds it: `broken` at the failure limit,
+                                   // or `paused` for a missing news API key; false for an admin / registry pause
+  "autoPausedAt": "ISO" | null,
+  "autoPausedReason": "HTTP 404 ..." | null,      // the last error when it was paused (redacted)
+  "autoPauseCause": "failure_limit" | "missing_api_key" | null,
+  "consecutiveFailureLimit": 5,    // <kind>.consecutiveFailureLimit in force (appConfig/scraperSettings)
+  "statusReason": "..." | null     // why the registry seed ships it paused / retired (news)
 }
 ```
+
+Run source lines (`scrapeRuns/{id}.sources[]`, the run detail) also carry
+`health: { consecutiveFailures, consecutiveFailureLimit, autoPaused,
+autoPausedThisRun }` after each crawled source's health write (#107), and the
+summaries count `sourcesAutoPaused` (both kinds) and, for news,
+`sourcesPaused` (news_api sources skipped for a missing key).
 
 ## Indexes
 

@@ -216,6 +216,13 @@ export const SOURCE_CRAWL_STATE_FIELDS = [
   // Host backoffs (issue #64): a re-seed must not let us hit a host that
   // asked us to wait.
   "hostBackoffs",
+  // Issue #107: the crawler's auto-pause flags (shared/runs/source-health.ts
+  // AUTO_PAUSE_FIELDS): a re-seed must not un-pause an auto-paused source
+  // or drop why it was paused.
+  "autoPaused",
+  "autoPausedAt",
+  "autoPausedReason",
+  "autoPauseCause",
 ] as const;
 
 /**

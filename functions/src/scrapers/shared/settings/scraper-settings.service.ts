@@ -334,8 +334,14 @@ export class ScraperSettingsService {
    *  - crawlWindow (visa): `crawlWindow` + `adminOverrides.crawlWindow`, and
    *    `nextCrawlAt` = the new window's next opening; null removes the
    *    override and restores the registry window (VISA_SOURCE_WINDOWS);
-   *  - resetFailures: consecutiveFailures 0, and a `broken` source (with no
-   *    explicit status in the same edit) becomes `active` again;
+   *  - resetFailures: consecutiveFailures 0, and a source the CRAWLER
+   *    paused (`broken`, or `paused` with `autoPaused` for a missing API
+   *    key, issue #107) becomes `active` again when the same edit sets no
+   *    explicit status;
+   *  - issue #107: any edit that ends the crawler's hold (resetFailures, or
+   *    an explicit status) clears the auto-pause flags (`autoPaused`,
+   *    `autoPausedAt`, `autoPausedReason`, `autoPauseCause`): from then on
+   *    the status is the admin's choice;
    *  - clearHostBackoffs (visa): hostBackoffs [].
    */
   async updateSource(
@@ -363,6 +369,9 @@ export class ScraperSettingsService {
         adminOverrides: { status: overrides.status ?? null, reason: overrides.reason ?? null, crawlWindow: overrides.crawlWindow ?? null },
         crawlWindow: before.crawlWindow ?? null,
         hostBackoffs: Array.isArray(before.hostBackoffs) ? before.hostBackoffs.length : 0,
+        // Issue #107: the crawler's auto-pause flag (diffed so the history
+        // entry shows a reset ending an auto-pause).
+        autoPaused: before.autoPaused === true,
       };
       const beforeView = JSON.parse(JSON.stringify(after));
       const ao = after.adminOverrides as Record<string, unknown>;
@@ -401,10 +410,22 @@ export class ScraperSettingsService {
       if (patch.resetFailures) {
         update.consecutiveFailures = 0;
         after.consecutiveFailures = 0;
-        if (patch.status === undefined && before.status === "broken") {
+        // Crawler-held: broken (failure limit) or paused by the crawler
+        // itself (missing API key). An ADMIN pause (no autoPaused flag) is
+        // never lifted by a reset.
+        const crawlerHeld = before.status === "broken" || (before.status === "paused" && before.autoPaused === true);
+        if (patch.status === undefined && crawlerHeld) {
           update.status = "active";
           after.status = "active";
         }
+      }
+      // Issue #107: a reset or an explicit status ends the crawler's hold.
+      if ((patch.resetFailures || patch.status !== undefined) && before.autoPaused === true) {
+        update.autoPaused = false;
+        update.autoPausedAt = null;
+        update.autoPausedReason = null;
+        update.autoPauseCause = null;
+        after.autoPaused = false;
       }
       if (patch.clearHostBackoffs) {
         update.hostBackoffs = [];

@@ -11,6 +11,8 @@ import {
   type ScrapeAlertThresholds,
 } from "./types";
 import { nextWindowOpening } from "../etiquette/visa-crawl-window";
+// Issue #107: the source_broken alert quotes the error that paused the source.
+import { redactSecrets } from "../fetch/redact";
 
 // ============================================
 // SCRAPE ALERTS — pure rule logic (issue #83)
@@ -711,6 +713,10 @@ export interface VisaSourceFacts {
   crawlWindow?: CrawlWindow;
   lastCrawledAt?: unknown; // Timestamp
   createdAt?: unknown; // Timestamp
+  // Issue #107: the crawler's auto-pause flags (shared/runs/source-health.ts).
+  autoPaused?: boolean;
+  autoPausedReason?: string | null;
+  autoPauseCause?: string | null;
 }
 
 /** The news-source fields the broken rule reads. */
@@ -720,6 +726,10 @@ export interface NewsSourceFacts {
   status?: string;
   consecutiveFailures?: number;
   lastErrorMessage?: string;
+  // Issue #107: the crawler's auto-pause flags (shared/runs/source-health.ts).
+  autoPaused?: boolean;
+  autoPausedReason?: string | null;
+  autoPauseCause?: string | null;
 }
 
 /**
@@ -784,12 +794,20 @@ export function evaluateMissedWindows(sources: VisaSourceFacts[], nowMs: number,
 }
 
 /**
- * source_broken: a source auto-paused by its scraper (`broken`, set at 5
- * consecutive failures by both scrapers) raises
- * `source_broken:<kind>:<id>`. A manually `paused` source is left alone
- * (someone chose that) — unless its failure streak is at the auto-pause
- * level too. `scope` covers the given kind(s) only (keyPrefix), so the
- * finalize hook of a visa run never resolves news alerts.
+ * source_broken: a source auto-paused by its scraper raises
+ * `source_broken:<kind>:<id>` (one alert per source, deduped on that key).
+ *
+ * Issue #107: "auto-paused" = status `broken`, which only the crawler sets,
+ * when the failure streak reaches `<kind>.consecutiveFailureLimit` (the
+ * source then also carries `autoPaused: true` + `autoPausedReason`). A
+ * `paused` source does NOT alert: an admin chose that (and a news_api
+ * source the crawler paused for a missing API key is a config gap, shown on
+ * its health row, not a crawl failure). Before #107 a `paused` source with
+ * >= 5 failures also alerted; that clause is gone because the flags now say
+ * who paused a source. The alert auto-resolves when the source is no
+ * longer `broken` (reset, recovered by a manual run, or paused by an admin).
+ * `scope` covers the given kind only (keyPrefix), so the finalize hook of a
+ * visa run never resolves news alerts.
  */
 export function evaluateBrokenSources(
   kind: ScrapeRunKind,
@@ -798,11 +816,18 @@ export function evaluateBrokenSources(
 ): RuleEvaluation {
   const signals: AlertSignal[] = [];
   for (const s of sources) {
+    if (s.status !== "broken") continue;
     const failures = s.consecutiveFailures ?? 0;
-    const autoPaused = s.status === "broken" || (s.status === "paused" && failures >= 5);
-    if (!autoPaused) continue;
     const name = ("countryName" in s ? s.countryName : undefined) ?? ("name" in s ? s.name : undefined) ?? s.id;
-    const lastError = "lastErrorMessage" in s && s.lastErrorMessage ? `; last error: ${s.lastErrorMessage}` : "";
+    // The error that paused it: the stored auto-pause reason (#107), else
+    // the news source's last error (a doc paused before #107).
+    const rawError =
+      (typeof s.autoPausedReason === "string" && s.autoPausedReason) ||
+      ("lastErrorMessage" in s && s.lastErrorMessage ? s.lastErrorMessage : "") ||
+      "";
+    // Redacted again here: alert text is emailed and stored.
+    const lastErrorText = rawError ? redactSecrets(rawError) : null;
+    const lastError = lastErrorText ? `; last error: ${lastErrorText}` : "";
     signals.push({
       rule: "source_broken",
       key: `source_broken:${kind}:${s.id}`,
@@ -810,7 +835,14 @@ export function evaluateBrokenSources(
       kind,
       subject: { type: "source", id: s.id, label: `${name} (${kind} source)` },
       message: `${name} (${kind} source) was auto-paused after ${failures} consecutive failed runs and is no longer scraped${lastError}`.slice(0, 600),
-      details: { sourceId: s.id, status: s.status ?? null, consecutiveFailures: failures },
+      details: {
+        sourceId: s.id,
+        status: s.status ?? null,
+        consecutiveFailures: failures,
+        // Issue #107: the error that paused it (redacted by the store).
+        lastError: lastErrorText ? lastErrorText.slice(0, 500) : null,
+        autoPaused: true,
+      },
     });
   }
   return { rule: "source_broken", signals, scope: { keyPrefix: `source_broken:${kind}:` } };

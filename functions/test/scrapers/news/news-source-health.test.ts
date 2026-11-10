@@ -4,7 +4,8 @@
 //
 // Run with `npm test`. NO network and NO emulator: HTTP goes to a stub
 // client, Firestore is the in-memory fake (test/helpers/fake-firestore), and
-// the REAL newsService.updateSourceAfterScrape does the counting, so the
+// the REAL newsSourceHealthService.updateSourceAfterScrape (moved out of
+// newsService in #107) does the counting, so the
 // assertions cover the actual totalRuns / consecutiveFailures /
 // reliabilityScore / auto-pause maths.
 //
@@ -34,6 +35,8 @@ import { installFakes, resetStore, store as fakeStore } from "../../helpers/fake
 type ScraperModule = typeof import("../../../src/scrapers/news/news-scraper.service");
 let mod: ScraperModule;
 let newsService: typeof import("../../../src/services/news.service")["newsService"];
+// Issue #107: the per-run health write moved to the scrapers module.
+let health: typeof import("../../../src/scrapers/news/news-source-health")["newsSourceHealthService"];
 
 before(async () => {
   await installFakes();
@@ -61,6 +64,7 @@ before(async () => {
   };
   mod = await import("../../../src/scrapers/news/news-scraper.service");
   newsService = (await import("../../../src/services/news.service")).newsService;
+  health = (await import("../../../src/scrapers/news/news-source-health")).newsSourceHealthService;
 });
 
 // ----- Stub HTTP: url -> status; unknown URLs 404 (robots.txt absent) -----
@@ -112,7 +116,8 @@ function makeScraper(dueIds: string[]) {
     getDueSources: async () => dueIds.map((id) => sourceDoc(id) as unknown as NewsSource),
     createScrapeRun: newsService.createScrapeRun.bind(newsService),
     completeScrapeRun: newsService.completeScrapeRun.bind(newsService),
-    updateSourceAfterScrape: newsService.updateSourceAfterScrape.bind(newsService),
+    updateSourceAfterScrape: health.updateSourceAfterScrape.bind(health),
+    pauseForMissingApiKey: health.pauseForMissingApiKey.bind(health),
     isDuplicate: async () => false,
     createArticlesBatch: async (a: unknown[]) => a.length,
   };

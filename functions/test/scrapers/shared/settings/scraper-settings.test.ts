@@ -214,8 +214,9 @@ describe("settings store (runtime merge)", () => {
   test("defaults equal the pre-#96 code constants", () => {
     const { settings, problems } = storeMod.resolveScraperSettings(undefined);
     assert.deepEqual(settings, {
-      visa: { enabled: true, blockManualWhenOff: false, maxExtractionsPerRun: 15, maxSourcesPerTick: 3 },
-      news: { enabled: true, blockManualWhenOff: false, maxSourcesPerRun: 5 },
+      // consecutiveFailureLimit (issue #107): 5 = the old hard-coded auto-pause threshold.
+      visa: { enabled: true, blockManualWhenOff: false, consecutiveFailureLimit: 5, maxExtractionsPerRun: 15, maxSourcesPerTick: 3 },
+      news: { enabled: true, blockManualWhenOff: false, consecutiveFailureLimit: 5, maxSourcesPerRun: 5 },
       manualRuns: { cooldownMinutes: 10 },
       budget: { hardStop: false },
     });
@@ -633,7 +634,9 @@ describe("per-source controls", () => {
     assert.equal((doc.nextCrawlAt as Timestamp).toMillis(), NOW + HOUR, "same window: nextCrawlAt kept");
     // News: an admin status survives; without overrides the seed's status applies.
     assert.equal(seedNews.newsSeedStatus("active", { status: "retired", adminOverrides: { status: "retired" } }), "retired");
-    assert.equal(seedNews.newsSeedStatus("active", { status: "broken" }), "active");
+    // Issue #107: a crawler hold (broken) is no longer undone by a re-seed.
+    assert.equal(seedNews.newsSeedStatus("active", { status: "broken" }), "broken");
+    assert.equal(seedNews.newsSeedStatus("active", { status: "active" }), "active");
   });
 });
 

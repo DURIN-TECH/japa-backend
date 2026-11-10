@@ -23,6 +23,9 @@ import {
   type PricedUsage,
 } from "../cost/scrape-cost-pricing";
 import type { CostTotals, RunCostBreakdown } from "../cost/types";
+// Issue #107: the consecutiveFailureLimit in force, for the health rows.
+// (The store module only imports utils/firebase + types: no cycle.)
+import { loadScraperSettings } from "../settings/scraper-settings.store";
 
 // ============================================
 // SCRAPE RUNS — recorder + admin reads (issue #81)
@@ -450,6 +453,44 @@ export interface ScrapeSourceHealth {
   // Issue #96: the admin's per-source edits (status + reason, crawl window,
   // who / when; ISO dates), or null when none were made.
   adminOverrides: Record<string, unknown> | null;
+  // ---- Issue #107 (additive) ----
+  // True while the CRAWLER holds the source: `broken` after
+  // `consecutiveFailureLimit` consecutive failures (cause "failure_limit"),
+  // or `paused` because a news_api key is missing (cause "missing_api_key").
+  // An admin pause has autoPaused false (its reason is in adminOverrides).
+  autoPaused: boolean;
+  autoPausedAt: string | null;
+  autoPausedReason: string | null; // the last error at the pause (redacted)
+  autoPauseCause: string | null; // "failure_limit" | "missing_api_key"
+  // `<kind>.consecutiveFailureLimit` in force (appConfig/scraperSettings).
+  consecutiveFailureLimit: number;
+  // Why the registry seed ships the source paused / retired (news), or null.
+  statusReason: string | null;
+}
+
+/** Per-kind failure limits passed to the row builders. */
+type FailureLimits = Record<ScrapeRunKind, number>;
+
+/** Read the limits in force (settings read never throws: defaults on error). */
+async function loadFailureLimits(): Promise<FailureLimits> {
+  const settings = await loadScraperSettings();
+  return { visa: settings.visa.consecutiveFailureLimit, news: settings.news.consecutiveFailureLimit };
+}
+
+/** Issue #107: the auto-pause fields of a stored source doc, as JSON. */
+function autoPauseJson(s: Record<string, unknown>): Pick<
+  ScrapeSourceHealth,
+  "autoPaused" | "autoPausedAt" | "autoPausedReason" | "autoPauseCause" | "statusReason"
+> {
+  return {
+    // A legacy `broken` doc (auto-paused before #107, no flag) is auto-paused too.
+    autoPaused: s.autoPaused === true || s.status === "broken",
+    autoPausedAt: iso(s.autoPausedAt),
+    autoPausedReason: typeof s.autoPausedReason === "string" ? redactSecrets(s.autoPausedReason) : null,
+    autoPauseCause:
+      typeof s.autoPauseCause === "string" ? s.autoPauseCause : s.status === "broken" ? "failure_limit" : null,
+    statusReason: typeof s.statusReason === "string" ? s.statusReason : null,
+  };
 }
 
 /** Timestamp-like (duck-typed, survives a second SDK copy). */
@@ -705,13 +746,15 @@ export class ScrapeRunService {
   /** Per-source health for one kind, or both when `kind` is omitted. */
   async listSourceHealth(kind: ScrapeRunKind | undefined, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth[]> {
     const out: ScrapeSourceHealth[] = [];
+    // Issue #107: one settings read for the limit shown on every row.
+    const limits = await loadFailureLimits();
     if (!kind || kind === "visa") {
       const snap = await collections.visaSources.get();
-      for (const d of snap.docs) out.push(visaHealth(d.id, d.data() as VisaSource, nowMs));
+      for (const d of snap.docs) out.push(visaHealth(d.id, d.data() as VisaSource, nowMs, limits.visa));
     }
     if (!kind || kind === "news") {
       const snap = await collections.newsSources.get();
-      for (const d of snap.docs) out.push(newsHealth(d.id, d.data() as NewsSource));
+      for (const d of snap.docs) out.push(newsHealth(d.id, d.data() as NewsSource, limits.news));
     }
     return out;
   }
@@ -723,7 +766,10 @@ export class ScrapeRunService {
   async getSourceHealth(kind: ScrapeRunKind, id: string, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth | null> {
     const snap = await (kind === "visa" ? collections.visaSources : collections.newsSources).doc(id).get();
     if (!snap.exists) return null;
-    return kind === "visa" ? visaHealth(id, snap.data() as VisaSource, nowMs) : newsHealth(id, snap.data() as NewsSource);
+    const limits = await loadFailureLimits();
+    return kind === "visa"
+      ? visaHealth(id, snap.data() as VisaSource, nowMs, limits.visa)
+      : newsHealth(id, snap.data() as NewsSource, limits.news);
   }
 }
 
@@ -746,7 +792,7 @@ function listItem(id: string, data: unknown): ScrapeRunJson {
 }
 
 /** Visa source -> health row. */
-function visaHealth(id: string, s: VisaSource, nowMs: number): ScrapeSourceHealth {
+function visaHealth(id: string, s: VisaSource, nowMs: number, failureLimit: number): ScrapeSourceHealth {
   const pages = Array.isArray(s.pages) ? s.pages : [];
   // Most recent page error = the source's last error (sources store errors per page).
   const errored = pages
@@ -780,11 +826,13 @@ function visaHealth(id: string, s: VisaSource, nowMs: number): ScrapeSourceHealt
     pageCount: pages.length,
     pagesWithErrors: errored.length,
     adminOverrides: adminOverridesJson((s as { adminOverrides?: unknown }).adminOverrides),
+    ...autoPauseJson(s as unknown as Record<string, unknown>),
+    consecutiveFailureLimit: failureLimit,
   };
 }
 
 /** News source -> health row. */
-function newsHealth(id: string, s: NewsSource): ScrapeSourceHealth {
+function newsHealth(id: string, s: NewsSource, failureLimit: number): ScrapeSourceHealth {
   return {
     kind: "news",
     sourceId: id,
@@ -802,6 +850,8 @@ function newsHealth(id: string, s: NewsSource): ScrapeSourceHealth {
     pageCount: null,
     pagesWithErrors: null,
     adminOverrides: adminOverridesJson((s as { adminOverrides?: unknown }).adminOverrides),
+    ...autoPauseJson(s as unknown as Record<string, unknown>),
+    consecutiveFailureLimit: failureLimit,
   };
 }
 

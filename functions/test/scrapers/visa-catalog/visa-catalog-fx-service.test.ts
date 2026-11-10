@@ -265,6 +265,9 @@ before(async () => {
   changes.runTransaction = catalogSvc.runTransaction;
   visaSvc = (await import("../../../src/services/visa.service")).visaService;
   visaSvc.runTransaction = catalogSvc.runTransaction;
+  // Issue #107: the crawler's per-source health write is transactional
+  // (status re-read so an admin pause is kept): same pass-through runner.
+  (crawl as any).runTransaction = catalogSvc.runTransaction;
 
   // ---- Issue #94: every orchestrator tick also sweeps stale runs (#81),
   // backfills the monthly cost rollup (#82), and a tick that crawls writes a
