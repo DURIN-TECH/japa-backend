@@ -47,6 +47,8 @@ function defineAbilitiesFor(principal, entitlements) {
         case "admin":
             // Admins can perform every operation on everything.
             can("manage", "all");
+            // `VisaChange` (pending scraped-visa edits) is deliberately admin-only via
+            // `manage all`; never grant it to another role (ability.test.ts guards this).
             break;
         case "owner":
             // Agency owners manage everything scoped to their agency.
@@ -90,7 +92,9 @@ function defineAbilitiesFor(principal, entitlements) {
         // all writes. Layered last so these `cannot` rules override the role grants.
         // Skipped when entitlements are omitted/null (RBAC-only / grant-all default).
         if (entitlements && !types_1.ACTIVE_SUBSCRIPTION_STATUSES.includes(entitlements.status)) {
-            cannot(["create", "update", "delete", "assign", "approve"], "all");
+            // `reject` is a write like `approve` (e.g. rejecting a pending change), so
+            // a lapsed plan blocks it too.
+            cannot(["create", "update", "delete", "assign", "approve", "reject"], "all");
         }
     }
     return build();

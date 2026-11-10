@@ -27,6 +27,10 @@ import { EXTRACTOR_PROMPT_VERSION } from "./visa-catalog-extract.service";
 // Canonical country-stats recompute (issue #62: the only stats function).
 import { visaService } from "./visa.service";
 import type { ScrapeSourceMeta } from "./visa-source-adapters";
+// Proposed edits to approved scraped visas (issue #61): the pure branch
+// decision, and the pendingVisaChanges writer.
+import { planIngest } from "./visa-catalog-diff";
+import { visaChangeService } from "./visa-catalog-changes.service";
 
 // ============================================
 // VISA CATALOG SERVICE (ingest into review queue)
@@ -47,8 +51,10 @@ import type { ScrapeSourceMeta } from "./visa-source-adapters";
 // visaService.updateCountryStats before it returns. Ingest itself never
 // changes stats: pending scraped visas are `isActive: false` and not counted.
 
-// The result of ingesting one extraction.
-export type IngestOutcome = "created" | "updated" | "unchanged" | "skipped";
+// The result of ingesting one extraction. "proposed" (issue #61): an
+// approved scraped visa's page changed, so a pendingVisaChanges row was
+// written (or the open one replaced) and the live doc was left untouched.
+export type IngestOutcome = "created" | "updated" | "unchanged" | "skipped" | "proposed";
 
 // Doc id of the rate document under `appConfig`.
 const FX_DOC_ID = "fx";
@@ -86,10 +92,13 @@ class VisaCatalogService {
    * Safety rules:
    *  - NEW visa (no doc): create it pending_review + inactive.
    *  - Existing SCRAPED + still pending_review: refresh it (safe — not live yet).
-   *  - Existing doc that is already approved or agent-authored: SKIP — never
-   *    clobber curated/live data. (Proposing edits to already-live visas is a
-   *    deliberate future enhancement; see the spike doc.)
+   *  - Existing SCRAPED + approved (not withdrawn): PROPOSE — stage a
+   *    field-level edit in `pendingVisaChanges` for an admin (issue #61); the
+   *    live doc is byte-for-byte untouched. See visa-catalog-changes.service.ts.
+   *  - Seeded (no `source`), agent-authored, rejected scraped, or withdrawn
+   *    (`staleSince`) docs: SKIP — never clobber curated/live data.
    *  - Same content hash as last time: unchanged, no write.
+   *  The branch is decided by the pure planIngest() (visa-catalog-diff.ts).
    *
    * Identity: the doc id comes from the registry page (`visaId` pin or URL
    * path — see buildVisaId), and a pinned `visaCode` overrides the extracted
@@ -172,12 +181,14 @@ class VisaCatalogService {
     }
 
     const existing = snap.data() as VisaType;
-    if (existing.scrapeMeta?.contentHash === contentHash) {
+    // Which branch this doc takes (unchanged / refresh / propose / skip).
+    const branch = planIngest(existing, contentHash);
+    if (branch === "unchanged") {
       return { visaId, outcome: "unchanged" };
     }
     // Only refresh a visa that is still an unapproved scrape; never overwrite an
     // approved or agent-authored record.
-    if (existing.source === "scraped" && existing.reviewStatus === "pending_review") {
+    if (branch === "refresh") {
       // update() (not set+merge): a top-level `scrapeMeta` key REPLACES the
       // whole map. set(..., {merge:true}) would deep-merge it, leaving stale
       // keys from the previous extraction behind (e.g. an old totalUsd /
@@ -199,6 +210,24 @@ class VisaCatalogService {
         updatedAt: now,
       });
       return { visaId, outcome: "updated" };
+    }
+    // Approved scraped visa whose page changed: propose, never write the live
+    // doc. The changes service re-reads the doc + the open row in a
+    // transaction, diffs, and creates / replaces the single open row (or
+    // returns "unchanged" when there is no diff or the open row already has
+    // this content hash).
+    if (branch === "propose") {
+      const outcome = await visaChangeService.proposeChange({
+        countryCode,
+        visaId,
+        contentHash,
+        sourceUrl,
+        proposedFields: fields,
+        proposedFee: feeMeta,
+        proposedBaseCostUsd: baseCostUsd,
+        scrapeMeta,
+      });
+      return { visaId, outcome };
     }
     return { visaId, outcome: "skipped" };
   }
@@ -276,10 +305,20 @@ class VisaCatalogService {
    * each registry country's `reviewStatus == "pending_review"` docs (a
    * single-field equality: no composite / collection-group index needed).
    *
-   * @returns how many docs were re-converted (cost written) / re-flagged.
+   * Issue #61: then also re-converts OPEN pendingVisaChanges rows whose
+   * proposed fee is fxStale / fxMissing (same arithmetic, no LLM call; see
+   * visaChangeService.reconvertOpenProposals), counted separately.
+   *
+   * @returns how many visa docs were re-converted (cost written) / re-flagged,
+   *   and the same for open proposals.
    */
-  async reconvertFlaggedFees(fx: FxRatesDoc | undefined): Promise<{ reconverted: number; reflagged: number }> {
-    const result = { reconverted: 0, reflagged: 0 };
+  async reconvertFlaggedFees(fx: FxRatesDoc | undefined): Promise<{
+    reconverted: number;
+    reflagged: number;
+    proposalsReconverted: number;
+    proposalsReflagged: number;
+  }> {
+    const result = { reconverted: 0, reflagged: 0, proposalsReconverted: 0, proposalsReflagged: 0 };
     const now = Timestamp.now();
     if (!isFxFresh(fx, now)) return result;
 
@@ -302,6 +341,10 @@ class VisaCatalogService {
         else result.reflagged++;
       }
     }
+    // Flagged open proposals (issue #61), so they are not stuck forever.
+    const proposals = await visaChangeService.reconvertOpenProposals(fx);
+    result.proposalsReconverted = proposals.reconverted;
+    result.proposalsReflagged = proposals.reflagged;
     return result;
   }
 }
