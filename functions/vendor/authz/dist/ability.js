@@ -36,6 +36,35 @@ const FEATURE_CAPABILITIES = {
     "payments.request": [["create", "PaymentRequest"]],
 };
 /**
+ * Agency visas (#98): grant an agency role (owner or agent) the right to
+ * create, read, update and delete the visas its own agency created, and
+ * nothing more. Shared by the owner and agent branches so the two roles can
+ * never drift apart. See the `Visa` entry of `SubjectType` for the contract.
+ *
+ * @param builder  the `can` / `cannot` pair of the ability being built
+ * @param agencyId the principal's agency, possibly undefined/null/empty
+ */
+function grantAgencyVisas(builder, agencyId) {
+    // No agency, no visa grant. Without this guard the condition would be
+    // `{ ownerAgencyId: undefined }`, which matches any visa document that
+    // lacks `ownerAgencyId` (undefined === undefined), i.e. every scraped visa.
+    if (!agencyId)
+        return;
+    // Both conditions are required: the visa belongs to this agency AND it is
+    // an agency-created visa. A scraped or legacy "agent" visa that happens to
+    // carry a matching `ownerAgencyId` is still off-limits.
+    builder.can([...types_1.AGENCY_VISA_ACTIONS], "Visa", {
+        ownerAgencyId: agencyId,
+        source: types_1.AGENCY_VISA_SOURCE,
+    });
+    // Field-level denial, layered after the grant so it wins: agencies edit a
+    // visa's content but never its review state, visibility (make-global),
+    // activation or ownership. CASL only applies a field-scoped `cannot` when
+    // the caller passes a field, so callers check each field they write:
+    //   ability.can("update", subject("Visa", doc), "visibility") === false
+    builder.cannot("update", "Visa", [...types_1.VISA_PROTECTED_FIELDS]);
+}
+/**
  * Build the ability for a principal. Pass resolved `entitlements` to apply
  * subscription gating; omit them to get role/ownership-only rules (Phase 1).
  */
@@ -49,8 +78,11 @@ function defineAbilitiesFor(principal, entitlements) {
             can("manage", "all");
             // `VisaChange` (pending scraped-visa edits) is deliberately admin-only via
             // `manage all`; never grant it to another role (ability.test.ts guards this).
-            // The same holds for `Visa` (catalog visa types, #70): only admins edit the
-            // live catalog, so no owner/agent/client grant exists for it either.
+            // `Visa` (catalog visa types, #70) is admin-wide via `manage all` too:
+            // admins edit the live catalog, approve/reject any visa and make agency
+            // visas global. Agency roles only get a narrow, condition- and
+            // field-restricted grant on their own agency's visas (#98, see
+            // `grantAgencyVisas`); clients get none.
             // Likewise `ScrapeRun` (scraper run records + source health, #81): an
             // operational view for admins only, never granted to another role.
             break;
@@ -62,6 +94,9 @@ function defineAbilitiesFor(principal, entitlements) {
             can("read", "Transaction", { agencyId });
             can("read", "Analytics", { agencyId });
             can(["read", "update"], "User", { id: uid });
+            // Own agency's agency-created visas (#98): create/read/update/delete,
+            // with review, visibility and ownership fields locked.
+            grantAgencyVisas({ can, cannot }, agencyId);
             break;
         case "agent":
             // Agents manage resources assigned to them; read their agency's cases.
@@ -70,6 +105,9 @@ function defineAbilitiesFor(principal, entitlements) {
             can("read", "Agent", { agencyId });
             can(["read", "update"], "Agent", { userId: uid });
             can(["read", "update"], "User", { id: uid });
+            // Agents get the same agency-visa grant as owners (#98), scoped to the
+            // agent's own `agencyId`; an independent agent (no agency) gets none.
+            grantAgencyVisas({ can, cannot }, agencyId);
             break;
         case "client":
             // Clients manage only their own resources (mobile).

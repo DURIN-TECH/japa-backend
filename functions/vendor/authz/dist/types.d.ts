@@ -36,9 +36,31 @@ export type SubjectType = "Application" | "Document" | "Consultation" | "Payment
  * processing times). Distinct from `VisaChange`, which is a *proposal* to
  * edit one: admin edits made directly to a visa document (e.g. setting a
  * manual USD cost, #70) are gated on `Visa`, not on `VisaChange`.
- * Admin-only for writes: no role grant exists for it (see
- * `defineAbilitiesFor`). Public catalog reads are served by unauthenticated
- * routes and do not go through this subject.
+ * Public catalog reads are served by unauthenticated routes and do not go
+ * through this subject.
+ *
+ * Agency visas (#98) reuse this same subject; there is no separate
+ * "AgencyVisa" subject. The contract for agency roles:
+ *
+ * - Who: `owner` and `agent` principals with a non-empty `agencyId`.
+ *   A principal without an agency gets no `Visa` grant at all.
+ * - Actions: `create`, `read`, `update`, `delete`
+ *   (`AGENCY_VISA_ACTIONS`). `delete` is meant for drafts only; the
+ *   draft-only rule is enforced by the backend (#100), not by CASL.
+ * - Conditions (both must match on the tagged visa document):
+ *     `ownerAgencyId === principal.agencyId` and
+ *     `source === AGENCY_VISA_SOURCE` ("agency").
+ *   So the backend must tag the full doc: `subject("Visa", visaDoc)`, with
+ *   `ownerAgencyId` and `source` present. Scraped, legacy `"agent"` and
+ *   source-less visas never match.
+ * - Restricted fields: owner/agent cannot `update` any field in
+ *   `VISA_PROTECTED_FIELDS` (review state, visibility, activation and
+ *   ownership). Check per field: `can("update", visa, "visibility")`.
+ *   A field-less `can("update", visa)` is still true, so the backend must
+ *   also check each field it is about to write.
+ * - Never granted to them: `approve`, `reject` (and make-global, which is
+ *   an `update` of `visibility`): those stay admin-only via `manage all`.
+ * - A lapsed subscription strips `create`/`update`/`delete` (read-only).
  */
  | "Visa"
 /**
@@ -52,6 +74,29 @@ export type SubjectType = "Application" | "Document" | "Consultation" | "Payment
  | "ScrapeRun" | "all";
 /** CASL actions. Kept as a string union plus open `string` for forward-compat. */
 export type Action = "manage" | "create" | "read" | "update" | "delete" | "assign" | "approve" | "reject" | (string & {});
+/**
+ * The `VisaType.source` value that marks a visa created by an agency (#98,
+ * field added to the backend type in #99). Agency-role `Visa` grants only
+ * match documents carrying this source. Use this constant instead of the
+ * `"agency"` literal.
+ */
+export declare const AGENCY_VISA_SOURCE: "agency";
+/**
+ * The actions agency roles (owner, agent) hold on their own agency's visas.
+ * Approve/reject are deliberately absent: review stays admin-only.
+ */
+export declare const AGENCY_VISA_ACTIONS: readonly ["create", "read", "update", "delete"];
+/**
+ * `Visa` document fields that only admins (or the server itself) may write.
+ * Owner and agent hold field-level `cannot("update", "Visa", ...)` rules on
+ * every one of these, so they can edit a visa's content (name, requirements,
+ * fees, sponsor, ...) but never its review state, visibility (make-global),
+ * activation or ownership. On create the backend sets these fields itself
+ * rather than taking them from the request body.
+ */
+export declare const VISA_PROTECTED_FIELDS: readonly ["reviewStatus", "reviewedBy", "reviewedAt", "rejectionReason", "visibility", "isActive", "ownerAgencyId", "createdBy", "source"];
+/** One of the `VISA_PROTECTED_FIELDS`. */
+export type VisaProtectedField = (typeof VISA_PROTECTED_FIELDS)[number];
 /**
  * The authenticated principal that abilities are built from. Derived entirely
  * from the Firebase custom claims (`role`, `agencyId`) plus the uid — no DB read
