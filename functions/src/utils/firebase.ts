@@ -117,6 +117,11 @@ export const collections = {
   // USD exchange rates (Frankfurter / ECB) the visa scraper converts
   // published fees with (issue #59). No firestore.rules match → clients denied.
   appConfig: db.collection("appConfig"),
+  // Proposed field-level edits to already-approved scraped visas (issue #61):
+  // the crawl stages one `open` row per visa here instead of touching the
+  // live doc, and an admin approves/rejects it via /admin/visa-changes.
+  // Backend-only: no firestore.rules match → clients denied.
+  pendingVisaChanges: db.collection("pendingVisaChanges"),
 } as const;
 
 // Helper to get subcollection references

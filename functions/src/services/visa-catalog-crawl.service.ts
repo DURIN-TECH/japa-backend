@@ -39,7 +39,10 @@ export interface CrawlSummary {
   pagesChanged: number; // content hash differed → sent to extraction
   created: number; // new pending-review scraped visas written
   updated: number; // existing pending scraped visas refreshed
-  skipped: number; // existing approved/agent visa left untouched
+  skipped: number; // seeded/agent/rejected/withdrawn visa left untouched
+  // Approved scraped visa whose page changed: a pendingVisaChanges row was
+  // written / replaced for an admin (issue #61). Not counted in `skipped`.
+  proposed: number;
   withdrawn: number; // source said withdrawn → no extraction (scraped doc deactivated if present)
   errors: number;
   // FX (issue #59): whether appConfig/fx was refreshed this run, and how many
@@ -72,6 +75,7 @@ class VisaCatalogCrawlService {
       created: 0,
       updated: 0,
       skipped: 0,
+      proposed: 0,
       withdrawn: 0,
       errors: 0,
       fxRefreshed: false,
@@ -199,6 +203,7 @@ class VisaCatalogCrawlService {
           if (outcome === "created") summary.created++;
           else if (outcome === "updated") summary.updated++;
           else if (outcome === "skipped") summary.skipped++;
+          else if (outcome === "proposed") summary.proposed++;
           if (outcome !== "unchanged") ingested++;
         } catch (err) {
           pageErrors++;

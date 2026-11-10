@@ -1,5 +1,5 @@
 import { Timestamp } from "firebase-admin/firestore";
-import type { VisaCategory } from "./index";
+import type { VisaCategory, VisaType } from "./index";
 
 // ============================================
 // VISA CATALOG SCRAPING TYPES
@@ -10,8 +10,9 @@ import type { VisaCategory } from "./index";
 // scraped changes flow through, and the shape the LLM extractor returns.
 //
 // Design guarantees encoded here:
-//  - The scraper only ever writes PROPOSALS to `pendingVisaChanges`; an agent
-//    approves before anything reaches the live `countries/{code}/visaTypes`.
+//  - New scraped visas land in `countries/{code}/visaTypes` as inactive
+//    `pending_review` docs; edits to an already-approved scraped visa are only
+//    ever PROPOSALS in `pendingVisaChanges` that an admin approves (issue #61).
 //  - Nothing auto-publishes and nothing is auto-deleted.
 
 // ----- Source registry (`visaSources/{countryCode}`) -----
@@ -224,6 +225,112 @@ export interface FxRatesDoc {
   fetchedAt: Timestamp; // when WE fetched it — staleness is measured from here
   rateDate: string; // the API's `date` (ECB reference date, YYYY-MM-DD)
   source: string; // FX_SOURCE_ECB
+}
+
+// ----- Proposed edits to live visas (`pendingVisaChanges/{changeId}`, issue #61) -----
+//
+// When the official page behind an ALREADY-APPROVED scraped visa changes, the
+// crawl does not touch the live doc: it stages a field-level proposal here and
+// an admin approves it (applied in one transaction, never partially) or
+// rejects it with a reason. Backend-only collection: firestore.rules has no
+// match for it (default deny), all access is via the Admin SDK.
+//
+// Invariants:
+//  - At most one `open` row per `countryCode + visaId`; a newer extraction
+//    overwrites that row IN PLACE (same id + createdAt, `revision` + 1).
+//  - The crawl never deletes a row, and nothing is ever auto-published.
+
+/** Lifecycle of a proposal. There is deliberately no "auto_published". */
+export type PendingVisaChangeStatus = "open" | "approved" | "rejected";
+
+/** The scalar VisaType fields the diff compares (strings compared trimmed). */
+export type VisaScalarDiffField =
+  | "name"
+  | "description"
+  | "category"
+  | "processingTime"
+  | "processingDaysMin"
+  | "processingDaysMax"
+  | "validityPeriod"
+  | "isExtendable"
+  | "maxExtensions"
+  | "applicationUrl"
+  | "applicationInstructions";
+
+/**
+ * One fee-component change. Components are matched by `kind` + `label` +
+ * `currency` and compared in their OWN currency (`amount`, `per`, `years`),
+ * so an exchange-rate movement alone is never a change.
+ */
+export type FeeComponentDiff =
+  | { change: "added"; after: VisaFeeComponentMeta }
+  | { change: "removed"; before: VisaFeeComponentMeta }
+  | { change: "changed"; before: VisaFeeComponentMeta; after: VisaFeeComponentMeta };
+
+/**
+ * One changed field in a proposal. `before` / `after` are OMITTED (never
+ * `undefined`) when the field is absent on that side. A scalar that is
+ * present live but absent from the new extraction has `kind: "removed"`
+ * (only `before`): approving it DELETES the field from the live doc, so the
+ * diff UI must show it as a removal, not an edit. Absent → present and
+ * present → present are `kind: "changed"`.
+ */
+export type VisaFieldDiff =
+  | { field: VisaScalarDiffField; kind: "changed" | "removed"; before?: unknown; after?: unknown }
+  // Compared as a whitespace-trimmed SET: a pure reorder is not a diff. When it
+  // is a diff, the full proposed array (in proposed order) is what is applied.
+  | { field: "eligibilityCriteria"; kind: "changed"; added: string[]; removed: string[] }
+  // The fee. Applying it writes `baseCostUsd` (+ `scrapeMeta.fee` via the
+  // wholesale scrapeMeta replace) in the same transaction.
+  | {
+      field: "fee";
+      kind: "changed";
+      components: FeeComponentDiff[];
+      baseCostUsdBefore?: number;
+      baseCostUsdAfter?: number;
+    };
+
+/** A staged, field-level edit to a live (approved, scraped) visa. */
+export interface PendingVisaChange {
+  id: string; // auto id
+  countryCode: string; // upper-case, e.g. "GB"
+  visaId: string; // target doc under countries/{code}/visaTypes
+  // "create" is not used (new visas still go straight to pending_review);
+  // there is never a "delete".
+  changeType: "update";
+  status: PendingVisaChangeStatus;
+  revision: number; // 1 on create, +1 each time a newer extraction replaces the open row
+  diff: VisaFieldDiff[]; // never empty
+  // Live values of the diffed fields only, at proposal time (stale check +
+  // diff UI). For a fee diff this holds `baseCostUsd`.
+  current: Partial<VisaType>;
+  // Proposed values of the diffed fields only (incl. `baseCostUsd` when the
+  // fee diff converts). A diffed field absent here is REMOVED on approve.
+  proposed: Partial<VisaType>;
+  proposedScrapeMeta: VisaScrapeMeta; // written wholesale on approve (replace, not deep-merge)
+  proposedSourceUrl: string;
+  citations: Record<string, string>; // = proposedScrapeMeta.citations, hoisted for list/diff UI
+  confidence: number; // 0-1
+  sourceUrl: string;
+  contentHash: string; // sha256 of the text the extractor saw
+  model: string;
+  extractorPromptVersion?: string;
+  // The live doc's `scrapeMeta.contentHash` when the proposal was (last)
+  // written. Absent when the live doc had none. Part of the approve-time stale
+  // check: if the live scrapeMeta moved, the copied-forward parts of
+  // `proposedScrapeMeta` (e.g. an unchanged fee block) would be out of date.
+  currentContentHash?: string;
+  // False when the proposed fee is fxStale / fxMissing / feeUnverified /
+  // noPublishedFee (or the cost does not match it): approve is refused.
+  approvable: boolean;
+  blockReason?: string; // FEE_NOT_CONVERTED_MESSAGE / FEE_MISSING_COST_MESSAGE when !approvable
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  // Set on resolution only:
+  resolvedBy?: string; // admin uid
+  resolvedAt?: Timestamp;
+  rejectionReason?: string;
+  appliedFields?: string[]; // on approve: the visa fields actually written from the diff
 }
 
 // ----- Extractor output shape -----
