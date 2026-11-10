@@ -9,7 +9,7 @@ meta-repo, `infra/terraform/monitoring_scrape_alerts.tf`).
 
 Code: `src/services/scrape-alert-rules.ts` (pure rule logic),
 `src/services/scrape-alert.service.ts` (store, email, checks, reads),
-`src/services/scrape-alert-cost.ts` (#82 cost interface, stubbed),
+`src/services/scrape-alert-cost.ts` (adapter over #82's cost rollup),
 `src/types/scrape-alert.ts` (schema), `src/controllers/scrape-alert.controller.ts`
 (API). Run records it reads: [scrape-runs.md](scrape-runs.md).
 
@@ -59,10 +59,12 @@ source it was seen with (`details.sources`) is no longer `active` (paused,
 broken, retired or deleted), or when the host's last "retry after"
 (`details.backoffUntil`) has passed.
 
-**Budget (#82):** the rule reads `scrapeAlertService.costSource`
-(`getMonthToDateCost(): Promise<{ monthUsd, budgetUsd | null }>`). Until #82
-lands it is a stub returning `budgetUsd: null`, so the rule is skipped (TODO in
-`scrape-alert-cost.ts`).
+**Budget (#82):** the rule reads `scrapeAlertService.costSource`, an adapter
+(`src/services/scrape-alert-cost.ts`) over #82's `scrapeCostService.monthToDate()`
+(`{ costUsd, budgetUsd }` -> `{ monthUsd, budgetUsd }`): spend from the
+`scrapeCosts/{YYYY-MM}` rollup, budget from `appConfig/scrapeBudget.monthlyUsd`.
+The hourly check first calls `scrapeCostService.backfillRecent()` so runs whose
+post-run rollup was lost are counted. No budget set (`null`) = rule skipped.
 
 ## Dedupe, escalation, resolution
 

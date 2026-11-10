@@ -6,7 +6,7 @@ import { collections, db, subcollections } from "../utils/firebase";
 import { notificationService, type NotifyUserInput } from "./notification.service";
 import { EMAIL_BRANDING } from "./email/branding";
 import { safeErrorMessage, toJson } from "./scrape-run.service";
-import { stubMonthToDateCostSource, type MonthToDateCostSource } from "./scrape-alert-cost";
+import { scrapeCostMonthToDateSource, type MonthToDateCostSource } from "./scrape-alert-cost";
 import {
   DEFAULT_CONFIG,
   evaluateBrokenSources,
@@ -216,11 +216,11 @@ export class ScrapeAlertService {
   realClock: () => number = Date.now;
 
   /**
-   * Month-to-date LLM cost for the llm_budget rule. TODO(#82): assign the
-   * real rollup (see scrape-alert-cost.ts); the stub has no budget, so the
-   * rule is skipped.
+   * Month-to-date LLM cost + budget for the llm_budget rule: #82's rollup
+   * via scrapeCostService.monthToDate() (scrape-alert-cost.ts). Swappable in
+   * tests.
    */
-  costSource: MonthToDateCostSource = stubMonthToDateCostSource;
+  costSource: MonthToDateCostSource = scrapeCostMonthToDateSource();
 
   /**
    * Structured log writer (one JSON line per alert action). firebase-functions'
@@ -369,9 +369,12 @@ export class ScrapeAlertService {
         });
       }
 
-      // ---- LLM budget (#82; skipped while the cost source has no budget) ----
+      // ---- LLM budget (#82; skipped while no budget is set) ----
       await this.isolated("llm_budget", skippedRules, async () => {
-        const evaluation = evaluateBudget(await this.costSource.getMonthToDateCost(), nowMs, config);
+        // Catch #82's rollup up first (runs whose post-run rollup was lost),
+        // so the spend compared to the budget is complete.
+        await this.costSource.catchUp?.(nowMs);
+        const evaluation = evaluateBudget(await this.costSource.getMonthToDateCost(nowMs), nowMs, config);
         if (evaluation) evals.push(evaluation);
       });
 

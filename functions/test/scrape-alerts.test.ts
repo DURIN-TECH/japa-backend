@@ -744,3 +744,54 @@ describe("review fixes", () => {
     assert.ok(emails.length > 0 && emails.every((e) => e.critical === false));
   });
 });
+
+// ============================================
+// #82 cost source (adapter over scrapeCostService.monthToDate)
+// ============================================
+
+describe("llm_budget over #82's rollup", () => {
+  test("fires at 50 / 80 / 100% of appConfig/scrapeBudget, silent without a budget; backfill runs first", async () => {
+    const costMod: any = await import("../src/services/scrape-alert-cost");
+    const source = costMod.scrapeCostMonthToDateSource();
+    let caughtUp = 0;
+    svc.costSource = {
+      getMonthToDateCost: (nowMs?: number) => source.getMonthToDateCost(nowMs),
+      catchUp: async (nowMs?: number) => {
+        caughtUp++;
+        await source.catchUp(nowMs);
+      },
+    };
+    const spend = (usd: number) => store.set("scrapeCosts/2026-11", { month: "2026-11", totals: { costUsd: usd } });
+    const budget = () => alertDocs().find((d) => d.rule === "llm_budget");
+
+    // No budget set: rule skipped even with spend.
+    spend(500);
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(budget(), undefined);
+    assert.equal(caughtUp, 1);
+
+    store.set("appConfig/scrapeBudget", { monthlyUsd: 100 });
+    spend(49);
+    await quiet(() => svc.runHourlyCheck(NOW + 1));
+    assert.equal(budget(), undefined); // under 50%
+
+    spend(50);
+    await quiet(() => svc.runHourlyCheck(NOW + 2));
+    assert.equal(budget()!.level, 50);
+    assert.equal(budget()!.severity, "info");
+    assert.equal((budget()!.details as any).monthUsd, 50);
+
+    spend(80);
+    await quiet(() => svc.runHourlyCheck(NOW + 3));
+    assert.equal(budget()!.level, 80);
+    assert.equal(budget()!.severity, "warning");
+
+    emails = [];
+    spend(100);
+    await quiet(() => svc.runHourlyCheck(NOW + 4));
+    assert.equal(budget()!.level, 100);
+    assert.equal(budget()!.severity, "critical");
+    assert.ok(emails.length > 0 && emails.every((e) => e.critical === true));
+    assert.equal(alertDocs().filter((d) => d.rule === "llm_budget").length, 1); // one escalating alert
+  });
+});
