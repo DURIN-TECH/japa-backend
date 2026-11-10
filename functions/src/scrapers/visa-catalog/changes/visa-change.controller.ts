@@ -11,6 +11,8 @@ import {
   visaChangeService,
 } from "./visa-catalog-changes.service";
 import { VisaFeeNotConvertibleError } from "../visa-catalog-fx";
+import { ManualCostError } from "../visa-manual-cost";
+import { parseProposalManualCostInput } from "./visa-change-manual-cost";
 
 // ============================================
 // ADMIN — PROPOSED VISA CHANGES (issue #61)
@@ -19,12 +21,13 @@ import { VisaFeeNotConvertibleError } from "../visa-catalog-fx";
 // Mounted at /admin/visa-changes (scrapers/visa-catalog/changes/visa-change.routes.ts). Every route
 // runs `verifyAuth` first (no token → 401), then checks the shared CASL
 // ability on the `VisaChange` subject (@durin-tech/authz 0.1.3, admin-only):
-//   list / get → "read", approve → "approve", reject → "reject".
+//   list / get → "read", approve → "approve", reject → "reject",
+//   manual cost (#77) → "update" (it edits the proposal row).
 // A principal without the permission gets 403 — before any validation or
 // Firestore read, so nothing about the queue leaks to non-admins.
 
 /** The action a route needs on the `VisaChange` subject. */
-type VisaChangeAction = "read" | "approve" | "reject";
+type VisaChangeAction = "read" | "approve" | "reject" | "update";
 
 /** Two-letter country code (the doc ids under `countries/` are upper-case). */
 const COUNTRY_CODE_RE = /^[A-Za-z]{2}$/;
@@ -55,6 +58,11 @@ class VisaChangeController {
    */
   private sendServiceError(res: Response, error: unknown, what: string): void {
     if (error instanceof VisaChangeError) {
+      sendError(res, error.code, error.message, error.httpStatus);
+      return;
+    }
+    // Manual cost (#77): 400 VALIDATION_ERROR, 409 FEE_ALREADY_CONVERTED.
+    if (error instanceof ManualCostError) {
       sendError(res, error.code, error.message, error.httpStatus);
       return;
     }
@@ -158,6 +166,34 @@ class VisaChangeController {
       sendSuccess(res, visa, "Visa change approved");
     } catch (error) {
       this.sendServiceError(res, error, "approving visa change");
+    }
+  }
+
+  /**
+   * PUT /admin/visa-changes/:id/manual-cost (issue #77)
+   * Body: { amountUsd: number, reason: string,
+   *         rates: [{ currency, usdPerUnit }], expectedRevision: number }
+   * Same cost rules as PUT /admin/visas/:id/manual-cost (#70): amountUsd
+   * 0..100000 (0 = free), reason 10..500 chars trimmed, rates exactly one per
+   * non-USD currency of the PROPOSED fee. 200 → the updated row (its
+   * proposed fee carries the manual cost; `approvable` recomputed).
+   * 400 VALIDATION_ERROR, 403 FORBIDDEN, 404 NOT_FOUND, 409 ALREADY_RESOLVED /
+   * REVISION_MISMATCH / STALE_PROPOSAL / FEE_ALREADY_CONVERTED.
+   *
+   * Authz: CASL `update` on `VisaChange` (admin-only), checked FIRST, before
+   * validation or any read, like the other handlers.
+   */
+  async setManualCost(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const { id } = req.params;
+    if (!this.allowed(req, res, "update", id)) return;
+    try {
+      // ---- Validate (throws ManualCostError 400) ----
+      const input = parseProposalManualCostInput(req.body);
+      // ---- Write (one transaction) ----
+      const row = await visaChangeService.setManualCost(id, input, req.userId!);
+      sendSuccess(res, row, "Manual cost set");
+    } catch (error) {
+      this.sendServiceError(res, error, "setting a manual cost on a visa change");
     }
   }
 

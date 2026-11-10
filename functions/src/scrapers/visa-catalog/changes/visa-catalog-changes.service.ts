@@ -13,6 +13,7 @@ import {
   planProposalFeeReconvert,
   planProposalWrite,
 } from "../visa-catalog-diff";
+import { ProposalManualCostInput, planProposalManualCost } from "./visa-change-manual-cost";
 // Canonical country-stats recompute. One-way import: visa.service.ts must
 // never import this module or the catalog service (no circular import).
 import { visaService } from "../../../services/visa.service";
@@ -35,6 +36,9 @@ import { visaService } from "../../../services/visa.service";
 //    untouched and fee flags never block it.
 //  - list/get for the admin queue, and reconvertOpenProposals() for flagged
 //    proposed fees after an FX refresh.
+//  - setManualCost() (issue #77): an admin sets the USD cost by hand on an
+//    open proposal blocked by FEE_NOT_CONVERTED; the row's proposed fee then
+//    passes approveChange's existing guard. See visa-change-manual-cost.ts.
 
 /** Every valid row status (for query validation in the controller). */
 export const PENDING_VISA_CHANGE_STATUSES: readonly PendingVisaChangeStatus[] = ["open", "approved", "rejected"];
@@ -264,6 +268,63 @@ class VisaChangeService {
 
     const updated = await subcollections.visaTypes(countryCode).doc(visaId).get();
     return { ...(updated.data() as VisaType), id: visaId };
+  }
+
+  /**
+   * Set the USD cost of an OPEN, fee-blocked proposal by hand (issue #77,
+   * PUT /admin/visa-changes/:id/manual-cost). ONE transaction:
+   *  1. read the row + the live visa doc → the same checks, in the same order,
+   *     as approveChange: 404 NOT_FOUND (row, or unaddressable id), 409
+   *     ALREADY_RESOLVED, 409 REVISION_MISMATCH (the crawl replaced the row
+   *     after the admin looked), 404 (visa gone), 409 STALE_PROPOSAL (setting
+   *     a cost on a proposal that can never be approved helps no one);
+   *  2. planProposalManualCost (pure): 409 FEE_ALREADY_CONVERTED when the fee
+   *     guard does not block it, 400 when the rates do not match the fee's
+   *     currencies;
+   *  3. write the patch on the ROW only (proposedScrapeMeta with the manual
+   *     fee, proposed/diff baseCostUsd, approvable, blockReason, updatedAt).
+   * The live visa is never written here, and the row's `revision` is not
+   * bumped (it counts extractions, not admin edits). The admin then approves
+   * through the normal approveChange, whose guard accepts the manual cost.
+   *
+   * @param id row id
+   * @param input validated body (parseProposalManualCostInput)
+   * @param setBy admin uid
+   * @returns the row as stored after the write
+   * @throws VisaChangeError / ManualCostError — nothing written
+   */
+  async setManualCost(id: string, input: ProposalManualCostInput, setBy: string): Promise<PendingVisaChange> {
+    if (!isValidDocId(id)) throw changeNotFound();
+    const rowRef = collections.pendingVisaChanges.doc(id);
+
+    await this.runTransaction(async (tx) => {
+      // ---- Reads (all before any write) ----
+      const rowSnap = await tx.get(rowRef);
+      if (!rowSnap.exists) throw changeNotFound();
+      const change = rowFrom(rowSnap);
+      const visaSnap = await tx.get(subcollections.visaTypes(change.countryCode).doc(change.visaId));
+
+      // ---- Row state: same checks + order as approveChange ----
+      if (change.status !== "open") throw alreadyResolved(change);
+      if (input.expectedRevision !== change.revision) {
+        throw new VisaChangeError(
+          "REVISION_MISMATCH",
+          `This change is now at revision ${change.revision} (you reviewed ${input.expectedRevision}). Reload and review it again.`,
+          409
+        );
+      }
+      if (!visaSnap.exists) throw new VisaChangeError("NOT_FOUND", "Visa type not found", 404);
+      const live = visaSnap.data() as VisaType;
+      const stale = findStaleReason(live, change);
+      if (stale) throw new VisaChangeError("STALE_PROPOSAL", stale, 409);
+
+      // ---- Decide (throws → nothing written) + write ----
+      const patch = planProposalManualCost(change, live, input, setBy, Timestamp.now());
+      tx.update(rowRef, { ...patch });
+    });
+
+    const after = await rowRef.get();
+    return rowFrom(after);
   }
 
   /**
