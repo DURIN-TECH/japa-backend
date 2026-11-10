@@ -43,7 +43,7 @@ import {
   selectSections,
   slugMatches,
 } from "../src/services/visa-source-adapters/sections";
-import { buildScrapeMeta, planWithdrawnUpdate } from "../src/services/visa-catalog-meta";
+import { buildScrapeMeta, planRestoredUpdate, planWithdrawnUpdate } from "../src/services/visa-catalog-meta";
 import {
   VISA_SOURCE_ADAPTERS,
   VISA_SOURCE_OVERRIDES,
@@ -489,6 +489,21 @@ describe("govuk-content-api adapter: withdrawn", () => {
     assert.equal(isWithdrawnNotice({ explanation: "", withdrawn_at: null }), false);
     assert.equal(isWithdrawnNotice({ explanation: "Closed", withdrawn_at: "2026-11-01" }), true);
   });
+
+  // Issue #68: only a non-empty `withdrawn_at` STRING means withdrawn.
+  test("isWithdrawnNotice keys on a non-empty withdrawn_at string only", () => {
+    assert.equal(isWithdrawnNotice({ withdrawn_at: "2026-11-01T10:00:00Z" }), true);
+    // explanation alone / another populated key → live (no false withdrawal)
+    assert.equal(isWithdrawnNotice({ explanation: "Closed" }), false);
+    assert.equal(isWithdrawnNotice({ something_new: "x" }), false);
+    // empty / whitespace / non-string withdrawn_at → live
+    assert.equal(isWithdrawnNotice({ explanation: "Closed", withdrawn_at: "" }), false);
+    assert.equal(isWithdrawnNotice({ explanation: "Closed", withdrawn_at: "   " }), false);
+    assert.equal(isWithdrawnNotice({ withdrawn_at: 1730000000 }), false);
+    assert.equal(isWithdrawnNotice({ withdrawn_at: true }), false);
+    // a non-object notice is never withdrawn
+    assert.equal(isWithdrawnNotice("withdrawn"), false);
+  });
 });
 
 // ----- Section patterns -----
@@ -631,6 +646,49 @@ describe("planWithdrawnUpdate", () => {
     const plan = planWithdrawnUpdate(undefined, now);
     assert.equal(plan.outcome, "missing");
     assert.equal(plan.update, undefined);
+  });
+
+  // Issue #68: approval deletes staleSince (#62), so a re-approved doc that is
+  // withdrawn again starts a new episode with a FRESH staleSince.
+  test("second withdrawal after re-approval (staleSince cleared) → fresh staleSince = now", () => {
+    const reApproved = { source: "scraped" as const, isActive: true, reviewStatus: "approved" as const };
+    const plan = planWithdrawnUpdate(reApproved, now);
+    assert.equal(plan.outcome, "deactivated");
+    assert.equal(plan.update?.staleSince, now);
+    assert.notEqual(plan.update?.staleSince, earlier);
+  });
+});
+
+// ----- Restored-guide signal (issue #68) -----
+
+describe("planRestoredUpdate", () => {
+  const now = Timestamp.fromMillis(1_800_000_000_000);
+  const stale = Timestamp.fromMillis(1_700_000_000_000);
+
+  test("withdrawn (inactive + staleSince) approved scraped doc → pending_review, nothing else", () => {
+    const plan = planRestoredUpdate({ source: "scraped", reviewStatus: "approved", isActive: false, staleSince: stale }, now);
+    assert.equal(plan.outcome, "flagged");
+    // Exactly the review status + updatedAt: no isActive (never reactivated),
+    // no staleSince change (approval clears it).
+    assert.deepEqual(plan.update, { reviewStatus: "pending_review", updatedAt: now });
+  });
+
+  test("no write for anything that is not a withdrawn approved scraped doc", () => {
+    const cases: [string, Parameters<typeof planRestoredUpdate>[0]][] = [
+      ["missing", undefined],
+      ["live approved", { source: "scraped", reviewStatus: "approved", isActive: true }],
+      ["active but staleSince (inconsistent)", { source: "scraped", reviewStatus: "approved", isActive: true, staleSince: stale }],
+      ["inactive without staleSince", { source: "scraped", reviewStatus: "approved", isActive: false }],
+      ["already pending", { source: "scraped", reviewStatus: "pending_review", isActive: false, staleSince: stale }],
+      ["rejected stays rejected", { source: "scraped", reviewStatus: "rejected", isActive: false, staleSince: stale }],
+      ["seeded", { source: undefined, reviewStatus: "approved", isActive: false, staleSince: stale }],
+      ["agent", { source: "agent", reviewStatus: "approved", isActive: false, staleSince: stale }],
+    ];
+    for (const [label, existing] of cases) {
+      const plan = planRestoredUpdate(existing, now);
+      assert.equal(plan.outcome, "none", label);
+      assert.equal(plan.update, undefined, label);
+    }
   });
 });
 

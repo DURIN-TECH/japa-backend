@@ -82,6 +82,9 @@ export interface CrawlSummary {
   // written / replaced for an admin (issue #61). Not counted in `skipped`.
   proposed: number;
   withdrawn: number; // source said withdrawn → no extraction (scraped doc deactivated if present)
+  // Issue #68: withdrawn scraped visas whose page is live again, put back in
+  // the admin review queue (reviewStatus pending_review; never reactivated).
+  restored: number;
   errors: number;
   // FX (issue #59): whether appConfig/fx was refreshed this run, and how many
   // flagged pending visas were re-converted (cost written) from stored fee
@@ -136,6 +139,7 @@ class VisaCatalogCrawlService {
       skipped: 0,
       proposed: 0,
       withdrawn: 0,
+      restored: 0,
       errors: 0,
       fxRefreshed: false,
       feesReconverted: 0,
@@ -283,6 +287,15 @@ class VisaCatalogCrawlService {
             summary.withdrawn++;
             pages[i] = { ...page, lastCrawledAt: now, lastError: WITHDRAWN_PAGE_ERROR };
             continue;
+          }
+
+          // ---- Restored at source: admin review signal (issue #68) ----
+          // The page is live. If its scraped doc was deactivated as withdrawn
+          // (and was approved), put it back to pending_review so it shows in
+          // the admin Visa Review queue. Runs BEFORE the hash gate, so it
+          // fires whether or not the text changed; never reactivates.
+          if ((await visaCatalogService.markRestored(source.countryCode, visaId)) === "flagged") {
+            summary.restored++;
           }
 
           // Hash is over the exact text the extractor would see (selected +

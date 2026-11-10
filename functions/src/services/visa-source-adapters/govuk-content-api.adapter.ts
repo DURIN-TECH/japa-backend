@@ -92,14 +92,18 @@ export interface GovukContentItem {
 /**
  * True when a `withdrawn_notice` value means "withdrawn". GOV.UK sends an
  * empty object `{}` for live content (so `Boolean(notice)` would be wrong: an
- * empty object is truthy); a withdrawn item has a non-empty notice (typically
- * `explanation` + `withdrawn_at`).
+ * empty object is truthy); a withdrawn item has `{ explanation, withdrawn_at }`.
+ *
+ * Issue #68: keyed on `withdrawn_at` ONLY — a non-empty (non-whitespace)
+ * string. Any other populated key (e.g. an `explanation` without a date, or a
+ * field GOV.UK adds later) is NOT treated as a withdrawal: a false positive
+ * would deactivate a live, approved visa, while a missed withdrawal is only
+ * caught one crawl later. `withdrawn_at: null` / `""` / a non-string → live.
  */
 export function isWithdrawnNotice(notice: unknown): boolean {
   if (!notice || typeof notice !== "object") return false;
-  return Object.values(notice as Record<string, unknown>).some(
-    (v) => v !== null && v !== undefined && v !== ""
-  );
+  const withdrawnAt = (notice as Record<string, unknown>).withdrawn_at;
+  return typeof withdrawnAt === "string" && withdrawnAt.trim() !== "";
 }
 
 /**

@@ -6,9 +6,11 @@ import { ExtractedVisa, FxRatesDoc } from "../types/visa-catalog";
 import { deriveVisaId, resolveVisaCode } from "./visa-catalog-ids";
 // Pure scrape-meta + withdrawn decisions (also unit-tested without Firestore).
 import {
+  RestoredOutcome,
   WithdrawnOutcome,
   buildScrapeMeta,
   extractedToVisaFields,
+  planRestoredUpdate,
   planWithdrawnUpdate,
 } from "./visa-catalog-meta";
 // Pure fee arithmetic + FX conversion (issue #59) and the rate refresh.
@@ -276,7 +278,8 @@ class VisaCatalogService {
    * as a page error.
    *
    * No auto-reactivation: if the guide later stops being withdrawn, nothing
-   * here (or in ingest) flips the doc back on — a human re-approves it.
+   * here (or in ingest) flips the doc back on — markRestored() (issue #68)
+   * only puts it back in the review queue, and a human re-approves it.
    */
   async markWithdrawn(countryCode: string, visaId: string): Promise<WithdrawnOutcome> {
     const ref = subcollections.visaTypes(countryCode).doc(visaId);
@@ -299,6 +302,32 @@ class VisaCatalogService {
         );
       }
     }
+    return plan.outcome;
+  }
+
+  /**
+   * Restored-source path (issue #68): the page fetched fine and is NOT
+   * withdrawn. If the doc at `visaId` is a scraped visa that an earlier crawl
+   * deactivated as withdrawn (inactive + `staleSince`) and it was approved,
+   * put it back into the admin review queue (`reviewStatus: "pending_review"`)
+   * so an admin finds out the guide came back. Rules in planRestoredUpdate().
+   *
+   * Called by both crawlers right after the withdrawn branch and BEFORE the
+   * hash gate, so the signal is recorded whether or not the content hash
+   * changed. It never reactivates (`isActive` and `staleSince` are left as
+   * they are) and never touches stats (`isActive` does not change, so the
+   * country's counts are unaffected). One doc read per non-withdrawn page;
+   * a write only on the first crawl after a restore (afterwards the doc is
+   * pending_review and the rule no longer matches).
+   *
+   * @returns "flagged" when the doc was put back in the queue, else "none"
+   */
+  async markRestored(countryCode: string, visaId: string): Promise<RestoredOutcome> {
+    const ref = subcollections.visaTypes(countryCode).doc(visaId);
+    const snap = await ref.get();
+    const plan = planRestoredUpdate(snap.exists ? (snap.data() as VisaType) : undefined, Timestamp.now());
+    // update() (not set): only the review fields change; the doc stays intact.
+    if (plan.update) await ref.update(plan.update);
     return plan.outcome;
   }
 

@@ -33,6 +33,11 @@
 //    whose PENDING scraped doc came from an older extractor prompt is
 //    re-extracted (and refreshed); current-version / approved / agent /
 //    seeded / rejected docs are not; maxExtractions still caps the run
+//  - runOrchestrator restored guide (issue #68): a withdrawn + approved
+//    scraped doc whose page is live again goes back to pending_review
+//    (same or changed hash), never reactivated; live / rejected / pending /
+//    seeded docs get no signal; withdraw → restore → approve → withdraw
+//    again sets a fresh staleSince
 
 import { test, describe, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -941,6 +946,182 @@ describe("runOrchestrator — prompt-version re-extract (issue #71)", () => {
         extractMod.EXTRACTOR_PROMPT_VERSION
       );
     }
+  });
+});
+
+// ----- Orchestrator: restored GOV.UK guide → admin review signal (issue #68) -----
+
+describe("runOrchestrator — restored guide (issue #68)", () => {
+  const TICK = "2026-11-09T02:15:00Z"; // Mon 02:15 GMT: inside GB_WINDOW
+  const tickMs = Date.parse(TICK);
+  const URL_A = "https://www.gov.uk/zz-work-visa";
+  const DOC = "countries/ZZ/visaTypes/zz-work";
+  // What the stub adapter answers: withdrawn or live, and with which hash.
+  let withdrawnNow = false;
+  let hashNow = "hash-1";
+  let extractCalls = 0;
+  let originalExtract: any;
+
+  /** Stub adapter set: both ids map to one adapter that handles every URL
+   *  and returns a document shaped by `withdrawnNow` / `hashNow`. No network. */
+  const stubAdapter = {
+    id: "generic-html",
+    canHandle: () => true,
+    async fetch(page: { url: string }) {
+      return withdrawnNow
+        ? { url: page.url, withdrawn: true, sections: [], text: "", contentHash: "empty" }
+        : {
+            url: page.url,
+            withdrawn: false,
+            sections: [{ slug: "page", title: "t", text: "Work visa text" }],
+            text: "Work visa text",
+            contentHash: hashNow,
+          };
+    },
+  };
+  const adapters: any = { "generic-html": stubAdapter, "govuk-content-api": stubAdapter };
+
+  beforeEach(() => {
+    store.delete("visaSources/GB"); // the shared paused fixture
+    withdrawnNow = false;
+    hashNow = "hash-1";
+    extractCalls = 0;
+    // Valid extraction stub (counts calls); the file-wide throwing stub is
+    // restored in afterEach.
+    originalExtract = extractMod.visaCatalogExtractor.extract;
+    extractMod.visaCatalogExtractor.extract = async () => {
+      extractCalls++;
+      return {
+        name: "Work visa (restored)", code: "W", description: "d", category: "work",
+        processingTime: "3 weeks", processingDaysMin: 15, processingDaysMax: 21,
+        feeComponents: [SW[0]], validityPeriod: "5 years", isExtendable: true,
+        eligibilityCriteria: ["x"], confidence: 0.9, citations: { "fee.application": "a" },
+      };
+    };
+  });
+
+  afterEach(() => {
+    extractMod.visaCatalogExtractor.extract = originalExtract;
+  });
+
+  /** One due ZZ source, one page pinned to zz-work, last crawled at `lastHash`. */
+  function putZz(lastHash = "hash-1"): void {
+    putSource("ZZ", {
+      pages: [{ url: URL_A, routeName: "Work", validation: "text_verified", visaId: "zz-work", lastContentHash: lastHash }],
+    });
+  }
+
+  /** The stored zz-work doc: approved scraped visa, current prompt, hash-1. */
+  function putDoc(over: Data = {}): void {
+    store.set(DOC, {
+      source: "scraped",
+      reviewStatus: "approved",
+      isActive: true,
+      name: "Work visa",
+      scrapeMeta: { contentHash: "hash-1", extractorPromptVersion: extractMod.EXTRACTOR_PROMPT_VERSION },
+      ...over,
+    });
+  }
+
+  /** Run one tick; the source is made due again first (same tick clock). */
+  const run = () => {
+    const src = store.get("visaSources/ZZ");
+    if (src) store.set("visaSources/ZZ", { ...src, nextCrawlAt: Timestamp.fromMillis(tickMs - HOUR_MS) });
+    return crawl.runOrchestrator({
+      now: tickMs,
+      adapters,
+      fetchFxRates: async () => ({ rates: { GBP: 0.8 }, rateDate: isoDaysAgo(1) }),
+    });
+  };
+
+  test("withdrawn approved doc whose page is live again (same hash) → pending_review, still inactive, staleSince kept", async () => {
+    const stale = Timestamp.fromMillis(1_700_000_000_000);
+    putZz();
+    putDoc({ isActive: false, staleSince: stale });
+
+    const summary = await run();
+
+    const doc = store.get(DOC)!;
+    assert.equal(summary.restored, 1);
+    assert.equal(doc.reviewStatus, "pending_review"); // shows in admin Visa Review
+    assert.equal(doc.isActive, false); // never auto-reactivated
+    assert.equal((doc.staleSince as Timestamp).toMillis(), stale.toMillis());
+    assert.equal(extractCalls, 0); // unchanged text: no LLM call
+    // The flag goes on the doc itself, no #61 proposal row.
+    assert.equal([...store.keys()].filter((k) => k.startsWith("pendingVisaChanges/")).length, 0);
+  });
+
+  test("restored with CHANGED text → flagged, then refreshed in place with the new extraction", async () => {
+    putZz("hash-1");
+    putDoc({ isActive: false, staleSince: Timestamp.fromMillis(1) });
+    hashNow = "hash-2";
+
+    const summary = await run();
+
+    const doc = store.get(DOC)!;
+    assert.equal(summary.restored, 1);
+    assert.equal(summary.updated, 1); // pending_review branch: refresh in place
+    assert.equal(extractCalls, 1);
+    assert.equal(doc.reviewStatus, "pending_review");
+    assert.equal(doc.isActive, false);
+    assert.equal(doc.name, "Work visa (restored)");
+    assert.equal((doc.scrapeMeta as any).contentHash, "hash-2");
+    assert.ok(doc.staleSince); // still marked until an admin approves
+  });
+
+  test("no signal for live docs, rejected docs, already-pending docs, seeded docs", async () => {
+    const cases: [string, Data][] = [
+      ["live approved", {}],
+      ["rejected + withdrawn", { reviewStatus: "rejected", isActive: false, staleSince: Timestamp.fromMillis(1) }],
+      ["pending + withdrawn", { reviewStatus: "pending_review", isActive: false, staleSince: Timestamp.fromMillis(1) }],
+      ["seeded + inactive + staleSince", { source: undefined, isActive: false, staleSince: Timestamp.fromMillis(1) }],
+    ];
+    for (const [label, over] of cases) {
+      store.clear();
+      putZz();
+      putDoc(over);
+      const before = clone(store.get(DOC));
+      const summary = await run();
+      assert.equal(summary.restored, 0, label);
+      assert.deepEqual(store.get(DOC), before, label);
+    }
+  });
+
+  test("full cycle: withdraw → restore → approve clears staleSince → second withdrawal sets a FRESH staleSince", async () => {
+    putZz();
+    putDoc();
+    // Country doc so the stats recompute after each isActive flip succeeds
+    // (otherwise it logs a swallowed NOT_FOUND).
+    store.set("countries/ZZ", { code: "ZZ", name: "Zedland" });
+
+    // 1) Withdrawn on GOV.UK: deactivated + staleSince.
+    withdrawnNow = true;
+    await run();
+    let doc = store.get(DOC)!;
+    assert.equal(doc.isActive, false);
+    const firstStale = (doc.staleSince as Timestamp).toMillis();
+
+    // 2) Restored: back in the review queue, still off.
+    withdrawnNow = false;
+    assert.equal((await run()).restored, 1);
+    assert.equal(store.get(DOC)!.reviewStatus, "pending_review");
+
+    // 3) Admin approves through the existing review flow: on again, staleSince gone.
+    const fresh = { ...oldFx(), fetchedAt: Timestamp.now(), rateDate: isoDaysAgo(1) };
+    const { feeMeta, baseCostUsd } = computeFee(SW, fresh, Timestamp.now());
+    store.set(DOC, { ...store.get(DOC)!, baseCostUsd, scrapeMeta: { ...(store.get(DOC)!.scrapeMeta as Data), fee: feeMeta } });
+    await visaSvc.updateVisaReviewStatus("ZZ", "zz-work", "approve", "admin-1");
+    doc = store.get(DOC)!;
+    assert.equal(doc.isActive, true);
+    assert.equal("staleSince" in doc, false);
+
+    // 4) Withdrawn again: a NEW staleSince (not the first episode's).
+    await new Promise((r) => setTimeout(r, 5)); // make Timestamp.now() move on
+    withdrawnNow = true;
+    await run();
+    doc = store.get(DOC)!;
+    assert.equal(doc.isActive, false);
+    assert.ok((doc.staleSince as Timestamp).toMillis() > firstStale);
   });
 });
 

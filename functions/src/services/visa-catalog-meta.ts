@@ -73,8 +73,12 @@ export type WithdrawnOutcome =
  *
  * NOTE: there is deliberately no inverse. A guide that later stops being
  * withdrawn does NOT reactivate the doc here — reactivation stays a human
- * review step (re-extraction of a pending doc leaves isActive alone; an
- * approved doc is skipped by ingest).
+ * review step: planRestoredUpdate() (issue #68) only puts the doc back in the
+ * admin review queue (pending_review); an admin approval reactivates it.
+ *
+ * Second withdrawal (issue #68): approval deletes `staleSince` (#62), so a
+ * re-approved doc that is withdrawn AGAIN has no `staleSince` and gets a
+ * FRESH one (`now`) here — "set once" applies per withdrawal episode.
  */
 export function planWithdrawnUpdate(
   existing: Pick<VisaType, "source" | "isActive" | "staleSince"> | undefined,
@@ -92,6 +96,56 @@ export function planWithdrawnUpdate(
       updatedAt: now,
     },
   };
+}
+
+// ----- Restored-guide signal (issue #68) -----
+
+/** What the restored path does to the doc at the resolved visa id. */
+export type RestoredOutcome =
+  | "flagged" // withdrawn + approved scraped doc → reviewStatus back to pending_review
+  | "none"; // anything else: no write (not withdrawn, not scraped, already pending, rejected, missing)
+
+/**
+ * Decide the "source came back" update for the doc at the resolved visa id,
+ * called when a page that is NOT withdrawn is fetched (issue #68).
+ *
+ * The case it catches: a GOV.UK guide was withdrawn (#58) — the crawl
+ * deactivated the scraped visa and set `staleSince` — and now the guide is
+ * live again. Without a signal the visa would stay inactive forever, with no
+ * admin ever finding out. So the doc goes back into the EXISTING admin
+ * review queue: `reviewStatus: "pending_review"`. The portal's visa-review
+ * page (admin → Visa Review) already lists, counts and filters by
+ * `reviewStatus`, and only shows Approve / Reject for `pending_review` docs,
+ * so this surfaces with NO portal change. Approving it (visaService
+ * .updateVisaReviewStatus) sets isActive:true and clears `staleSince` (#62).
+ *
+ * Rules:
+ *  - Only `source === "scraped"` docs, inactive, with `staleSince` (i.e.
+ *    deactivated by the withdrawn path and not yet re-approved).
+ *  - Only when `reviewStatus === "approved"`: that is the doc that was live
+ *    before the withdrawal and now needs a human decision.
+ *    - already `pending_review` → it is already in the queue: no write;
+ *    - `rejected` → an admin already decided against it: a restored guide
+ *      must not undo that rejection, so no write.
+ *  - NEVER auto-reactivates: `isActive` stays false and `staleSince` stays
+ *    set (so the admin can see it was withdrawn, and approval clears it).
+ *  - Independent of the content hash: the caller runs it BEFORE the hash
+ *    gate, so a guide restored with byte-identical text is still flagged.
+ *    (When the text DID change, the now-pending doc is then refreshed in
+ *    place by ingest's normal pending_review branch, so the admin reviews
+ *    the restored content.)
+ *
+ * Pure: no Firestore I/O (VisaCatalogService.markRestored does the write).
+ */
+export function planRestoredUpdate(
+  existing: Pick<VisaType, "source" | "isActive" | "staleSince" | "reviewStatus"> | undefined,
+  now: Timestamp
+): { outcome: RestoredOutcome; update?: { reviewStatus: "pending_review"; updatedAt: Timestamp } } {
+  if (!existing) return { outcome: "none" }; // nothing to flag, nothing created
+  if (existing.source !== "scraped") return { outcome: "none" }; // seeded / agent: never touched
+  if (existing.isActive !== false || !existing.staleSince) return { outcome: "none" }; // not withdrawn
+  if (existing.reviewStatus !== "approved") return { outcome: "none" }; // pending already / rejected
+  return { outcome: "flagged", update: { reviewStatus: "pending_review", updatedAt: now } };
 }
 
 /**

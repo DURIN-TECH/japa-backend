@@ -269,6 +269,37 @@ export function isPendingPromptStale(
 }
 
 /**
+ * Issue #68: the manual crawl script's hash gate for an APPROVED scraped doc.
+ *
+ * Ingest never writes an approved doc's `scrapeMeta.contentHash` (a changed
+ * page becomes a #61 proposal instead; the live hash only moves when an
+ * admin approves that proposal). Comparing the fetched hash with the live
+ * doc's alone therefore re-extracts such a page on EVERY manual run. This
+ * rule says the text was already handled when the doc takes ingest's
+ * "propose" branch (scraped + approved + not withdrawn) and either:
+ *  - `pageLastContentHash` (the registry page's hash, written by the
+ *    scheduled orchestrator after it processed the page) equals it — the
+ *    same gate the orchestrator itself uses; or
+ *  - `hasProposalForHash`: a pendingVisaChanges row (any status) was already
+ *    made from this text (see VisaChangeService.hasProposalForHash).
+ *
+ * Pending / seeded / agent / rejected / withdrawn docs → false (they keep the
+ * script's existing gate: live hash + the #71 prompt-version rule).
+ * Pure; the caller does the lookups (and may skip the query when the cheap
+ * page-hash check already answers).
+ */
+export function isApprovedTextAlreadyHandled(
+  existing: Pick<VisaType, "source" | "reviewStatus" | "staleSince"> | undefined,
+  fetchedHash: string,
+  seen: { pageLastContentHash?: string; hasProposalForHash?: boolean }
+): boolean {
+  // Only docs that ingest would PROPOSE for (mirrors planIngest's "propose").
+  if (!existing || existing.source !== "scraped") return false;
+  if (existing.reviewStatus !== "approved" || existing.staleSince) return false;
+  return seen.pageLastContentHash === fetchedHash || seen.hasProposalForHash === true;
+}
+
+/**
  * Decide the ingest branch. Seeded `uk-*` docs (no `source`) and agent docs
  * are never touched by the crawl; a withdrawn scraped doc (`staleSince`)
  * gets no proposal ("source came back" is #68's job).

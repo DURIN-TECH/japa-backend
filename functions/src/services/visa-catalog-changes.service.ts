@@ -286,6 +286,33 @@ class VisaChangeService {
   }
 
   /**
+   * Issue #68 (manual crawl hash gate): has a proposal row — of ANY status
+   * (open, approved, rejected) — already been made for this visa from this
+   * exact page text (`contentHash`)?
+   *
+   * An approved scraped visa's own `scrapeMeta.contentHash` only moves when a
+   * proposal is APPROVED, so while a proposal is open, or after it was
+   * rejected, the live doc's hash stays the old one. A gate that only looks
+   * at the live doc would then re-extract the page on every manual run (an
+   * LLM call each time), and after a rejection it would even re-propose the
+   * text the admin just turned down. A row with this hash means "this text
+   * was already turned into a proposal": nothing new to extract.
+   *
+   * Equality-only query (countryCode, visaId, contentHash) + limit(1): served
+   * by Firestore's single-field indexes, no composite index needed (same as
+   * the open-row lookup in proposeChange).
+   */
+  async hasProposalForHash(countryCode: string, visaId: string, contentHash: string): Promise<boolean> {
+    const snap = await collections.pendingVisaChanges
+      .where("countryCode", "==", countryCode)
+      .where("visaId", "==", visaId)
+      .where("contentHash", "==", contentHash)
+      .limit(1)
+      .get();
+    return !snap.empty;
+  }
+
+  /**
    * Re-convert OPEN proposals whose proposed fee is fxStale / fxMissing,
    * from their stored components with the run's (fresh) rate doc — no LLM
    * call. Updates proposedScrapeMeta.fee, proposed.baseCostUsd, the fee diff
