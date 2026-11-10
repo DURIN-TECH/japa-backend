@@ -212,11 +212,11 @@ describe("applyLinkedSurcharges", () => {
       {
         feeComponents: [APP],
         validityPeriod: "up to 5 years",
-        feeUnverifiedReasons: ['dropped surcharge "Healthcare surcharge": years', 'dropped surcharge "Other levy": years'],
+        feeUnverifiedReasons: ["dropped surcharge \"Healthcare surcharge\": years", "dropped surcharge \"Other levy\": years"],
       },
       await linkedWith(ASSUMED)
     );
-    assert.deepEqual(r.unverifiedReasons, ['dropped surcharge "Other levy": years']);
+    assert.deepEqual(r.unverifiedReasons, ["dropped surcharge \"Other levy\": years"]);
   });
 
   test("an unknown rate key is unverified, not guessed", async () => {
