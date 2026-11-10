@@ -136,7 +136,7 @@ function parseArgs(argv: string[]) {
 // unlike the Functions runtime). Only sets keys that aren't already present.
 function loadLocalEnv() {
   // functions/{src,lib}/scrapers/visa-catalog/scripts -> functions/.env.local
-  const file = path.resolve(__dirname, "../../../../../.env.local");
+  const file = path.resolve(__dirname, "../../../../.env.local");
   if (!fs.existsSync(file)) return;
   for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
     const m = line.match(/^([A-Z0-9_]+)=(.*)$/);
