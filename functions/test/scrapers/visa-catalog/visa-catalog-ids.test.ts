@@ -192,7 +192,8 @@ describe("VISA_SOURCE_OVERRIDES", () => {
     Object.keys(VISA_SOURCE_OVERRIDES).filter((u) => u.startsWith("https://www.gov.uk/"));
   // Countries that are allowed to have pins at all (GB + KR). Any other
   // country's page picking up a pin means a map key collided with its URL.
-  const PINNED_COUNTRIES = new Set(["GB", "KR"]);
+  // HK: the TP Stream page keeps its old record id (issue #107).
+  const PINNED_COUNTRIES = new Set(["GB", "KR", "HK"]);
 
   // Exactly the 12 ids (and 4 codes) the issue specifies.
   test("has exactly the 12 specified GB pins and 4 codes", () => {

@@ -264,7 +264,7 @@ This version starts with countries that are popular for immigration or comparati
 |---|---|---:|---|
 | Quality Migrant Admission Scheme | https://www.immd.gov.hk/eng/services/visas/quality_migrant_admission_scheme.html | TEXT-VERIFIED | Hong Kong Immigration Department page; showed scheme objective, no-job-offer requirement and extension/stay details. |
 | General Employment Policy | https://www.immd.gov.hk/eng/services/visas/GEP.html | TEXT-VERIFIED | Hong Kong Immigration Department page; showed professional employment route, initial stay pattern, extension and right-of-abode notes. |
-| Technical Professionals Stream under GEP / ASMTP | https://www.immd.gov.hk/eng/services/visas/tech-professionals-stream.html | TEXT-VERIFIED | Hong Kong Immigration Department page; showed purpose, quota and eligibility framing for specified technical professionals. |
+| Technical Professionals Stream under GEP / ASMTP | https://www.immd.gov.hk/eng/services/visas/TPStream.html | TEXT-VERIFIED | Hong Kong Immigration Department page; showed purpose, quota and eligibility framing for specified technical professionals. (URL updated 2026-11-10, issue #107: the old tech-professionals-stream.html page returns 404; this is the page the GEP and ASMTP pages now link to.) |
 
 ---
 
