@@ -38,7 +38,7 @@ any validation or read (403).
 
 | Status | `error` | When |
 | --- | --- | --- |
-| 200 | | The updated row (`data`). `approvable` / `blockReason` recomputed. |
+| 200 | | The updated row (`data`): new `revision`, `approvable` / `blockReason` recomputed. |
 | 400 | `VALIDATION_ERROR` | Bad body, or rates not matching the fee's currencies |
 | 403 | `FORBIDDEN` | Not an admin |
 | 404 | `NOT_FOUND` | No such row (or unaddressable id), or its visa is gone |
@@ -65,7 +65,13 @@ transaction:
 - `approvable`, `blockReason` (removed when approvable; may stay set for a
   non-fee block such as `ELIGIBILITY_REMOVED`), `updatedAt`.
 
-`revision` is not bumped: it counts extractions, not admin edits.
+`revision` + 1. Setting or changing a cost is a new revision of the
+proposal, so an approve sent with the revision seen BEFORE the cost was set
+(or before another admin changed it) answers `409 REVISION_MISMATCH`. The
+response row carries the new revision; the portal approves with it. The
+crawl's replace path keeps counting from it (`openRow.revision + 1`); no crawl
+logic depends on the revision staying fixed. The response row is built inside
+the transaction (read + patch), so it is exactly what was committed.
 
 ## Overwrite rule
 

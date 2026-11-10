@@ -1,4 +1,4 @@
-import { Timestamp, Transaction } from "firebase-admin/firestore";
+import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../../utils/firebase";
 import type { VisaType } from "../../../types";
 import type { FxRatesDoc, PendingVisaChange, PendingVisaChangeStatus } from "../types";
@@ -281,23 +281,29 @@ class VisaChangeService {
    *  2. planProposalManualCost (pure): 409 FEE_ALREADY_CONVERTED when the fee
    *     guard does not block it, 400 when the rates do not match the fee's
    *     currencies;
-   *  3. write the patch on the ROW only (proposedScrapeMeta with the manual
-   *     fee, proposed/diff baseCostUsd, approvable, blockReason, updatedAt).
-   * The live visa is never written here, and the row's `revision` is not
-   * bumped (it counts extractions, not admin edits). The admin then approves
-   * through the normal approveChange, whose guard accepts the manual cost.
+   *  3. write the patch on the ROW only (revision + 1, proposedScrapeMeta
+   *     with the manual fee, proposed/diff baseCostUsd, approvable,
+   *     blockReason, updatedAt).
+   * The live visa is never written here. The revision IS bumped (review
+   * fix): an approve sent with the revision seen before this cost was set /
+   * changed answers 409 REVISION_MISMATCH. The admin then approves the new
+   * revision through the normal approveChange, whose guard accepts the cost.
+   *
+   * The returned row is built INSIDE the transaction from the row it read
+   * plus the patch it wrote, so it is exactly what was committed (no
+   * second read that a concurrent crawl could slip in front of).
    *
    * @param id row id
    * @param input validated body (parseProposalManualCostInput)
    * @param setBy admin uid
-   * @returns the row as stored after the write
+   * @returns the row as committed (with the new `revision`)
    * @throws VisaChangeError / ManualCostError — nothing written
    */
   async setManualCost(id: string, input: ProposalManualCostInput, setBy: string): Promise<PendingVisaChange> {
     if (!isValidDocId(id)) throw changeNotFound();
     const rowRef = collections.pendingVisaChanges.doc(id);
 
-    await this.runTransaction(async (tx) => {
+    return this.runTransaction(async (tx) => {
       // ---- Reads (all before any write) ----
       const rowSnap = await tx.get(rowRef);
       if (!rowSnap.exists) throw changeNotFound();
@@ -320,11 +326,14 @@ class VisaChangeService {
 
       // ---- Decide (throws → nothing written) + write ----
       const patch = planProposalManualCost(change, live, input, setBy, Timestamp.now());
-      tx.update(rowRef, { ...patch });
-    });
+      // No blockReason in the patch = approvable: delete the stored one.
+      tx.update(rowRef, { ...patch, blockReason: patch.blockReason ?? FieldValue.delete() });
 
-    const after = await rowRef.get();
-    return rowFrom(after);
+      // ---- The committed row (read + patch), for the response ----
+      const row: PendingVisaChange = { ...change, ...patch };
+      if (patch.blockReason === undefined) delete row.blockReason;
+      return row;
+    });
   }
 
   /**

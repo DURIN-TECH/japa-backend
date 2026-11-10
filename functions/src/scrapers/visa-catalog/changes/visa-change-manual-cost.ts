@@ -1,4 +1,4 @@
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { Timestamp } from "firebase-admin/firestore";
 import type { VisaType } from "../../../types";
 import type { PendingVisaChange, VisaFieldDiff, VisaScrapeMeta } from "../types";
 import { VisaFeeNotConvertibleError, assertVisaApprovable } from "../visa-catalog-fx";
@@ -78,14 +78,25 @@ export function parseProposalManualCostInput(body: unknown): ProposalManualCostI
 
 // ----- Planning the row write -----
 
-/** The fields setManualCost writes on the row (tx.update payload). */
+/**
+ * The fields setManualCost writes on the row. `blockReason` is undefined when
+ * the proposal became approvable: the service writes FieldValue.delete() for
+ * it and drops it from the row it returns.
+ */
 export interface ProposalManualCostPatch {
+  // change.revision + 1 (review fix): setting / changing a cost is a new
+  // revision of the proposal, so an admin approving with the revision they
+  // saw BEFORE the cost was set (or changed by someone else) gets 409
+  // REVISION_MISMATCH instead of approving a cost they never looked at.
+  // The crawl's replace path already uses openRow.revision + 1, so it keeps
+  // counting up from here; nothing relies on the revision staying fixed.
+  revision: number;
   proposedScrapeMeta: VisaScrapeMeta; // with the manual fee block (wholesale)
   proposed: Partial<VisaType>; // + baseCostUsd = round(amountUsd)
   current: Partial<VisaType>; // + live baseCostUsd if a fee entry had to be added
   diff: VisaFieldDiff[]; // fee entry's baseCostUsdAfter = round(amountUsd)
   approvable: boolean; // recomputed (may stay false: e.g. ELIGIBILITY_REMOVED)
-  blockReason: string | FieldValue; // FieldValue.delete() when approvable
+  blockReason?: string; // absent when approvable (see above)
   updatedAt: Timestamp;
 }
 
@@ -186,13 +197,15 @@ export function planProposalManualCost(
   const next = { diff, proposed: proposed as Partial<VisaType>, proposedScrapeMeta };
   const { approvable, blockReason } = proposalApprovability(live, next);
 
-  return {
+  const patch: ProposalManualCostPatch = {
+    revision: (change.revision ?? 1) + 1,
     proposedScrapeMeta,
     proposed: proposed as Partial<VisaType>,
     current: current as Partial<VisaType>,
     diff,
     approvable,
-    blockReason: blockReason ?? FieldValue.delete(),
     updatedAt: now,
   };
+  if (blockReason) patch.blockReason = blockReason;
+  return patch;
 }

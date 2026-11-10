@@ -219,19 +219,21 @@ describe("visaChangeService.setManualCost", () => {
     assert.deepEqual(fee.manualCost.rates, [{ currency: "TWD", usdPerUnit: 0.0312 }]);
     assert.equal(fee.manualCost.previous.fxMissing, true);
 
-    // ---- Cost on the diff + proposed; block cleared; revision unchanged ----
+    // ---- Cost on the diff + proposed; block cleared; revision bumped ----
     assert.equal(row.proposed.baseCostUsd, 94);
     assert.equal(row.diff.find((d: any) => d.field === "fee").baseCostUsdAfter, 94);
     assert.equal(row.approvable, true);
     assert.equal(row.blockReason, undefined);
-    assert.equal(row.revision, 1);
+    assert.equal(row.revision, 2);
     assert.equal(row.status, "open");
+    // The returned row is exactly what was committed.
+    assert.deepEqual(row, { ...store.get(`pendingVisaChanges/${id}`), id });
   });
 
   test("the existing approve path then applies baseCostUsd = round(amountUsd) + the manual fee to the live visa", async () => {
     const id = await blockedProposal();
     await changes.setManualCost(id, parse(body()), "admin-1");
-    const visa = await changes.approveChange(id, "admin-2", 1);
+    const visa = await changes.approveChange(id, "admin-2", 2);
     assert.equal(visa.baseCostUsd, 94);
     const live = store.get(VISA_PATH)! as any;
     assert.equal(live.baseCostUsd, 94);
@@ -239,6 +241,56 @@ describe("visaChangeService.setManualCost", () => {
     assert.equal(live.scrapeMeta.fee.manualCost.setBy, "admin-1");
     assert.equal(live.reviewedBy, "admin-2");
     assert.equal(store.get(`pendingVisaChanges/${id}`)!.status, "approved");
+  });
+
+  test("revision: two admins set costs → the first admin's approve with the revision they saw is refused", async () => {
+    const id = await blockedProposal();
+    // Admin A sets a cost on revision 1 → revision 2 (A's screen now shows 2).
+    const a = await changes.setManualCost(id, parse(body()), "admin-a");
+    assert.equal(a.revision, 2);
+    // Admin B, also on revision 2, changes the cost → revision 3.
+    const b = await changes.setManualCost(id, parse(body({ amountUsd: 120, reason: "Embassy rate is higher", expectedRevision: 2 })), "admin-b");
+    assert.equal(b.revision, 3);
+    // A approves with the revision they saw: refused, nothing written.
+    const mark = writes.length;
+    await assert.rejects(changes.approveChange(id, "admin-a", 2), { code: "REVISION_MISMATCH", httpStatus: 409 });
+    assert.equal(writes.length, mark);
+    assert.equal(store.get(`pendingVisaChanges/${id}`)!.status, "open");
+    // Also refused: setting a cost on the old revision.
+    await assert.rejects(changes.setManualCost(id, parse(body()), "admin-a"), { code: "REVISION_MISMATCH" });
+    // With the current revision, B's cost is applied.
+    const visa = await changes.approveChange(id, "admin-a", 3);
+    assert.equal(visa.baseCostUsd, 120);
+  });
+
+  test("eligibility-only block → 409 FEE_ALREADY_CONVERTED; nothing written", async () => {
+    await ingest(extraction(), "h1");
+    store.set(VISA_PATH, { ...store.get(VISA_PATH)!, reviewStatus: "approved", isActive: true });
+    await ingest(extraction({ eligibilityCriteria: [], feeComponents: [{ ...GBP_FEE[0], amount: 900 }] }), "h2");
+    const [id, row] = onlyRow();
+    assert.equal(row.approvable, false);
+    assert.match(row.blockReason as string, /eligibility/);
+    const mark = writes.length;
+    await assert.rejects(changes.setManualCost(id, parse(body({ rates: [{ currency: "GBP", usdPerUnit: 1.25 }] })), "a"), {
+      code: "FEE_ALREADY_CONVERTED",
+      httpStatus: 409,
+    });
+    assert.equal(writes.length, mark);
+  });
+
+  test("fee + eligibility block → cost is set, but approve is still refused ELIGIBILITY_REMOVED", async () => {
+    await ingest(extraction(), "h1");
+    store.set(VISA_PATH, { ...store.get(VISA_PATH)!, reviewStatus: "approved", isActive: true });
+    await ingest(extraction({ eligibilityCriteria: [], feeComponents: TWD_FEE }), "h2");
+    const [id] = onlyRow();
+    const row = await changes.setManualCost(id, parse(body()), "admin-1");
+    assert.equal(row.proposedScrapeMeta.fee.fxSource, FX_SOURCE_MANUAL);
+    assert.equal(row.approvable, false);
+    assert.match(row.blockReason, /eligibility/);
+    assert.match(store.get(`pendingVisaChanges/${id}`)!.blockReason as string, /eligibility/);
+    const liveBefore = clone(store.get(VISA_PATH));
+    await assert.rejects(changes.approveChange(id, "admin-1", row.revision), { code: "ELIGIBILITY_REMOVED", httpStatus: 409 });
+    assert.deepEqual(store.get(VISA_PATH), liveBefore);
   });
 
   test("409 FEE_ALREADY_CONVERTED on a proposal whose fee converts; nothing written", async () => {
@@ -288,7 +340,12 @@ describe("visaChangeService.setManualCost", () => {
   test("a second manual cost corrects the first (supersedes, original previous kept)", async () => {
     const id = await blockedProposal();
     await changes.setManualCost(id, parse(body()), "admin-1");
-    const row = await changes.setManualCost(id, parse(body({ amountUsd: 100, reason: "Corrected: CBC 0.0333 rate" })), "admin-2");
+    const row = await changes.setManualCost(
+      id,
+      parse(body({ amountUsd: 100, reason: "Corrected: CBC 0.0333 rate", expectedRevision: 2 })),
+      "admin-2"
+    );
+    assert.equal(row.revision, 3);
     const m = row.proposedScrapeMeta.fee.manualCost;
     assert.equal(m.amountUsd, 100);
     assert.equal(m.supersedes.amountUsd, 93.6);
@@ -309,7 +366,7 @@ describe("re-proposal after a manual cost", () => {
     await ingest(extraction({ feeComponents: [{ ...TWD_FEE[0], amount: 3500 }] }), "h3");
     const [id2, row] = onlyRow();
     assert.equal(id2, id);
-    assert.equal(row.revision, 2);
+    assert.equal(row.revision, 3); // 1 crawl, 2 manual cost, 3 crawl
     assert.equal(row.approvable, false);
     const fee = (row.proposedScrapeMeta as any).fee;
     assert.equal(fee.manualCost, undefined);

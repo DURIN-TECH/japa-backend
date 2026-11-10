@@ -176,7 +176,8 @@ class VisaChangeController {
    * Same cost rules as PUT /admin/visas/:id/manual-cost (#70): amountUsd
    * 0..100000 (0 = free), reason 10..500 chars trimmed, rates exactly one per
    * non-USD currency of the PROPOSED fee. 200 → the updated row (its
-   * proposed fee carries the manual cost; `approvable` recomputed).
+   * proposed fee carries the manual cost; `approvable` recomputed; `revision`
+   * + 1, which the next approve must send as expectedRevision).
    * 400 VALIDATION_ERROR, 403 FORBIDDEN, 404 NOT_FOUND, 409 ALREADY_RESOLVED /
    * REVISION_MISMATCH / STALE_PROPOSAL / FEE_ALREADY_CONVERTED.
    *
