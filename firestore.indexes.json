@@ -687,6 +687,20 @@
       ]
     },
     {
+      "collectionGroup": "scrapeRuns",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "costRolledUp",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "startedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
       "collectionGroup": "scrapeAlerts",
       "queryScope": "COLLECTION",
       "fields": [

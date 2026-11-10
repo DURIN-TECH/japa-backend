@@ -28,6 +28,11 @@ import { Timestamp } from "firebase-admin/firestore";
 // Run records (issue #81): one `scrapeRuns/{runId}` doc per orchestrator run.
 import { scrapeRunService, type ScrapeRunService } from "./scrape-run.service";
 import type { ScrapeRunTrigger } from "../types/scrape-run";
+// Issue #82: news API request counts per provider (and their cost, only for a
+// plan with a per-call price in appConfig/llmPricing.requestPricing).
+// Importing the cost service also installs the monthly-rollup finalize hook.
+import { scrapeCostService } from "./scrape-cost.service";
+import { roundUsd } from "./scrape-cost-pricing";
 
 // ============================================
 // CRAWLER ETIQUETTE (issue #76)
@@ -165,6 +170,14 @@ export interface NewsScraperServiceOptions {
 export interface ScrapeSourceTrace {
   sourceRunId?: string;
   requestsAttempted: number;
+  /**
+   * Issue #79: true once scrapeSource() has written this run's outcome to the
+   * source's health counters (updateSourceAfterScrape). The orchestrator reads
+   * it so a failure is recorded EXACTLY ONCE per source per run: scrapeSource
+   * owns the write, and the orchestrator only writes as a fallback when
+   * scrapeSource threw before it got that far (e.g. createScrapeRun failed).
+   */
+  sourceHealthRecorded?: boolean;
 }
 
 // ============================================
@@ -180,6 +193,9 @@ export class NewsScraperService {
   // Issue #81: requests attempted (listing pages, feeds, article pages, API
   // calls) since construction. Callers read deltas around a scrape.
   private requestsAttempted = 0;
+  // Issue #82: news API calls (NewsData.io / NewsAPI) per provider since
+  // construction; the orchestrator records the per-run delta on the run.
+  private readonly apiRequestsByProvider: Record<string, number> = {};
   private rssParser: Parser<CustomFeed, CustomItem>;
 
   constructor(options: NewsScraperServiceOptions = {}) {
@@ -255,17 +271,42 @@ export class NewsScraperService {
     });
     console.log(`News scrape: run ${recorder.id} started`);
 
+    // Issue #82: API request counters before the run (delta recorded below).
+    const apiBefore = { ...this.apiRequestsByProvider };
     try {
       await this.scrapeDueSources(dueSources, result, recorder);
     } catch (err) {
       // Only reachable if a store write outside the per-source try throws.
+      await this.recordApiRequests(recorder, apiBefore);
       await recorder.fail(err, result);
       throw err;
     }
+    await this.recordApiRequests(recorder, apiBefore);
 
     // "Something worked" = at least one source scraped without throwing.
     await recorder.finalize({ summary: result, anySuccess: result.sourcesProcessed > 0 });
     return result;
+  }
+
+  /**
+   * Issue #82: note this run's news API requests per provider on the run
+   * record (`usage.requests`). Costed only when appConfig/llmPricing has a
+   * per-request price for the provider (our plans have none: counts only).
+   * The price table is read only when the run made API calls. Never throws.
+   */
+  private async recordApiRequests(
+    recorder: Awaited<ReturnType<ScrapeRunService["start"]>>,
+    before: Record<string, number>
+  ): Promise<void> {
+    const delta = Object.entries(this.apiRequestsByProvider)
+      .map(([provider, n]) => [provider, n - (before[provider] ?? 0)] as const)
+      .filter(([, n]) => n > 0);
+    if (delta.length === 0) return;
+    const { pricing } = await scrapeCostService.loadPricing();
+    for (const [provider, n] of delta) {
+      const price = pricing.requestPricing?.[provider]?.perRequestUsd;
+      recorder.recordRequests(provider, n, typeof price === "number" ? roundUsd(price * n) : undefined);
+    }
   }
 
   /**
@@ -363,12 +404,20 @@ export class NewsScraperService {
         // host + status + message, redacted.
         console.error(`Failed to scrape source ${source.name}: ${describeError(error)}`);
 
-        await this.store.updateSourceAfterScrape(
-          source.id,
-          false,
-          describeError(error),
-          isHostBackoffError(error) ? error.untilMs : undefined
-        );
+        // Issue #79: scrapeSource() already recorded this failure on the
+        // source (totalRuns, consecutiveFailures, reliabilityScore). Writing
+        // it again here double-counted every failure, so a broken source was
+        // auto-paused after ~3 runs instead of 5. Only fall back to recording
+        // it here when scrapeSource threw before its own write (the trace
+        // flag is unset), so each source gets exactly one update per run.
+        if (!trace.sourceHealthRecorded) {
+          await this.store.updateSourceAfterScrape(
+            source.id,
+            false,
+            describeError(error),
+            isHostBackoffError(error) ? error.untilMs : undefined
+          );
+        }
       }
     }
   }
@@ -389,6 +438,15 @@ export class NewsScraperService {
     link?: { runId?: string; trace?: ScrapeSourceTrace }
   ): Promise<ScrapeRun> {
     const runId = await this.store.createScrapeRun(source.id, link?.runId);
+    // Issue #79: whether this call has already written the run's outcome to
+    // the source's health counters. Guards the catch below: if the success
+    // write went through and a LATER step threw (completeScrapeRun), the run
+    // must not be counted a second time as a failure.
+    let healthRecorded = false;
+    const markHealthRecorded = () => {
+      healthRecorded = true;
+      if (link?.trace) link.trace.sourceHealthRecorded = true;
+    };
     if (link?.trace) link.trace.sourceRunId = runId;
     // Requests counter before this source, for the trace's delta.
     const requestsBefore = this.requestsAttempted;
@@ -452,6 +510,7 @@ export class NewsScraperService {
 
       // 4. Update source health
       await this.store.updateSourceAfterScrape(source.id, true);
+      markHealthRecorded();
 
       // 5. Complete the scrape run record
       const runResult: Partial<ScrapeRun> = {
@@ -491,13 +550,19 @@ export class NewsScraperService {
         durationMs: Date.now() - startTime,
       });
 
-      await this.store.updateSourceAfterScrape(
-        source.id,
-        false,
-        describeError(error),
-        // Don't come back before the host's Retry-After time.
-        isHostBackoffError(error) ? error.untilMs : undefined
-      );
+      // Issue #79: the ONE failure write for this source in this run (the
+      // orchestrator skips its own when the trace says we did it). Skipped
+      // if the success write above already counted this run.
+      if (!healthRecorded) {
+        await this.store.updateSourceAfterScrape(
+          source.id,
+          false,
+          describeError(error),
+          // Don't come back before the host's Retry-After time.
+          isHostBackoffError(error) ? error.untilMs : undefined
+        );
+        markHealthRecorded();
+      }
 
       throw error;
     }
@@ -715,6 +780,8 @@ export class NewsScraperService {
    * error messages are written to Firestore (scrape runs, source health).
    */
   private async getNewsApiJson(
+    // Issue #82: which provider the call is for (request counts per provider).
+    provider: string,
     endpoint: string,
     params: Record<string, string | number | undefined>,
     headers: Record<string, string> = {}
@@ -725,6 +792,9 @@ export class NewsScraperService {
     }
     // Issue #81: one attempted request on the run record.
     this.requestsAttempted++;
+    // Issue #82: and one call to this provider (counted even if it then fails:
+    // providers count attempted calls against the plan's quota).
+    this.apiRequestsByProvider[provider] = (this.apiRequestsByProvider[provider] ?? 0) + 1;
     // HostBackoffError's message is host/status/time only — no key leak.
     const resp = await this.fetcher.getRaw(url.toString(), { Accept: "application/json", ...headers });
     if (resp.status < 200 || resp.status >= 300) {
@@ -757,7 +827,7 @@ export class NewsScraperService {
       // NewsData.io only documents the `apikey` QUERY parameter (no header
       // form in its own docs), so the key stays in the URL; every log/stored
       // error goes through describeError() / redactSecrets() instead.
-      const data = await this.getNewsApiJson(NEWSDATA_API_URL, {
+      const data = await this.getNewsApiJson("newsdata", NEWSDATA_API_URL, {
         apikey: apiKey,
         q: apiConfig.query,
         language: apiConfig.language || "en",
@@ -777,6 +847,7 @@ export class NewsScraperService {
       // NewsAPI documents the `X-Api-Key` header (and recommends it over the
       // query string, so the key stays out of URLs and logs).
       const data = await this.getNewsApiJson(
+        "newsapi",
         NEWSAPI_API_URL,
         {
           q: apiConfig.query,

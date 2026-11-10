@@ -135,7 +135,17 @@ describe("ScrapeRunRecorder", () => {
     const mark = writes.length;
     await r.finalize({ summary: { pagesFetched: 1, errors: 0, fxRefreshed: true }, anySuccess: true });
     const done = onlyRun();
-    assert.equal(writes.length - mark, 1, "exactly one final write");
+    // Writes to the run doc only: since #82 the finalize hook also writes the
+    // monthly cost rollup (scrapeCosts/...) and flips the run's
+    // `costRolledUp` bookkeeping flag; neither is the run record's final write.
+    assert.equal(
+      writes
+        .slice(mark)
+        .filter((w) => w.path.startsWith("scrapeRuns/") && !(Object.keys(w.data).length === 1 && "costRolledUp" in w.data))
+        .length,
+      1,
+      "exactly one final write"
+    );
     assert.equal(done.status, "succeeded");
     assert.equal(typeof done.durationMs, "number");
     assert.ok((done.finishedAt as Timestamp).toMillis() >= NOW);

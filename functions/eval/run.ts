@@ -33,6 +33,18 @@ import {
   type EvalRoute,
   type ScoredField,
 } from "./config";
+// Issue #82: token usage + cost per route (default price table: the eval
+// has no Firestore, so it prices with DEFAULT_LLM_PRICING, the seed of
+// appConfig/llmPricing, quoted from the provider's pricing page).
+import {
+  DEFAULT_LLM_PRICING,
+  addPricedUsage,
+  emptyTotals,
+  findModelPrice,
+  priceUsageReport,
+  type PricedUsage,
+} from "../src/services/scrape-cost-pricing";
+import type { CostTotals, LlmUsage } from "../src/types/scrape-cost";
 import { expectedPath, fixtureFetchService, guidePath, loadExpected, loadGuide } from "./golden";
 import {
   evaluateGate,
@@ -95,6 +107,11 @@ export interface RouteRecord {
   // route has none. The fee is SCORED on extracted + these (see scoredOutput).
   linkedSurcharges?: VisaLinkedSurchargeMeta[];
   error?: string; // why the extraction failed
+  // Issue #82: the API's token usage for this route's call (also when the
+  // output then failed validation), and its cost. Absent when no call
+  // reached the API (or an older results file).
+  usage?: LlmUsage;
+  costUsd?: number;
   score: RouteScore;
 }
 
@@ -124,6 +141,11 @@ export interface EvalResultFile {
   overall: number;
   pass: boolean;
   failures: string[];
+  // Issue #82: summed usage of the routes' calls + cost, and the prices
+  // used (priceKey null = the model had no price: tokens only).
+  usage: CostTotals;
+  costUsd: number;
+  pricing: { priceKey: string | null; sourceUrl: string | null; effectiveFrom: string | null };
 }
 
 // ----- Dependencies (injectable for tests) -----
@@ -266,6 +288,10 @@ async function runRoute(route: EvalRoute, expected: ExpectedVisa, goldenDir: str
       sectionsUsed: doc.sections.map((s) => s.slug),
       truncated: Boolean(doc.truncated),
     };
+    // Issue #82: the call's priced usage (set by onUsage when the API answers).
+    let priced: PricedUsage | undefined;
+    const usageFields = () =>
+      priced ? { usage: priced.usage, ...(priced.costUsd !== undefined ? { costUsd: priced.costUsd } : {}) } : {};
     try {
       // The ONLY network call: the real extractor, same context as a crawl.
       const extracted = await extractor.extract(doc.text, {
@@ -274,6 +300,9 @@ async function runRoute(route: EvalRoute, expected: ExpectedVisa, goldenDir: str
         routeName: page.routeName,
         // GB registry official hosts, exactly as the crawl passes them (#74).
         officialHosts: officialHostsFor("GB"),
+        onUsage: (report) => {
+          priced = priceUsageReport(report, DEFAULT_LLM_PRICING);
+        },
       });
       // Linked-page surcharges (#69), applied in code like ingest does.
       const { output, meta } = scoredOutput(extracted, await evalLinkedSurcharges(route.url));
@@ -282,11 +311,12 @@ async function runRoute(route: EvalRoute, expected: ExpectedVisa, goldenDir: str
         ...provenance,
         extracted,
         ...(meta ? { linkedSurcharges: meta } : {}),
+        ...usageFields(),
         score: scoreRoute(expected, output),
       };
     } catch (err) {
       const error = errorMessage(err);
-      return { ...base, ...provenance, extracted: null, error, score: scoreRoute(expected, null, error) };
+      return { ...base, ...provenance, extracted: null, error, ...usageFields(), score: scoreRoute(expected, null, error) };
     }
   } catch (err) {
     // Adapter failure on a recorded fixture (shouldn't happen) — still a 0, not a crash.
@@ -320,6 +350,14 @@ export function printReport(res: EvalResultFile, log: (l: string) => void): void
   }
   log(`${cell("field type mean", 30)}${types.map((t) => cell(f3(res.fieldTypeScores[t]), 12)).join("")}`);
   log(`\nOVERALL ${f3(res.overall)} (pass >= ${res.thresholds.overall}, every route >= ${res.thresholds.route}, no fee or processing citation mismatch)`);
+  // Issue #82: what the run's calls used and cost (older results files have no usage).
+  if (res.usage && res.usage.extractions > 0) {
+    log(
+      `tokens ${res.usage.promptTokens} in (${res.usage.cacheHitTokens} cache hit) / ${res.usage.completionTokens} out over ` +
+        `${res.usage.extractions} call(s), cost $${res.usage.costUsd.toFixed(6)}` +
+        (res.pricing?.sourceUrl ? ` (prices from ${res.pricing.sourceUrl}, effective ${res.pricing.effectiveFrom})` : " (model unpriced)")
+    );
+  }
 
   // Every failing field, so a reader sees WHY without opening the JSON.
   log("\nField failures:");
@@ -382,6 +420,13 @@ export function buildResults(
 ): EvalResultFile {
   const scores = routes.map((r) => r.score);
   const gate = evaluateGate(scores);
+  // ---- Issue #82: usage + cost over the routes that reported usage ----
+  const usage = emptyTotals();
+  usage.runs = 1;
+  for (const r of routes) {
+    if (r.usage) addPricedUsage(usage, { usage: r.usage, model: meta.model, costUsd: r.costUsd });
+  }
+  const price = findModelPrice(DEFAULT_LLM_PRICING, meta.model);
   const routesRun = routes.map((r) => r.route);
   return {
     ...meta,
@@ -399,6 +444,13 @@ export function buildResults(
     overall: gate.overall,
     pass: gate.pass,
     failures: gate.failures,
+    usage,
+    costUsd: usage.costUsd,
+    pricing: {
+      priceKey: price?.priceKey ?? null,
+      sourceUrl: price?.price.sourceUrl ?? null,
+      effectiveFrom: price?.price.effectiveFrom ?? null,
+    },
   };
 }
 

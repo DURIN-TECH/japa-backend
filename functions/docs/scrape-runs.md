@@ -71,8 +71,9 @@ points the other way.
   "fatalError": "...",            // only when the run threw / went stale
   "warnings": ["FX refresh failed: ..."], // run-level, not errors
   "options": { "maxSources": 3, "maxExtractions": 15 }, // script: country, visa, limit, maxExtractions, force
-  "usage": { ... },               // #82 placeholder, not written yet
-  "costUsd": 0.0,                 // #82 placeholder, not written yet
+  "usage": { ... },               // #82: tokens, extractions, news requests (docs/scrape-costs.md)
+  "costUsd": 0.0042,              // #82: run cost in USD
+  "costBreakdown": { "byCountry": {...}, "byModel": {...} }, // #82
   "expireAt": Timestamp,          // startedAt + 180 days (TTL field)
   "createdAt": Timestamp, "updatedAt": Timestamp
 }
@@ -96,7 +97,9 @@ of `NEWS_API_KEY_*` and `DEEPSEEK_API_KEY` are replaced with `[REDACTED]`.
 
 - Add counters to `CrawlSummary` / `OrchestratorResult`: they land in
   `summary` with no schema change.
-- `usage` / `costUsd` are declared (optional) on `ScrapeRunDoc` for #82.
+- `usage` / `costUsd` / `costBreakdown` are written by #82 (see
+  `docs/scrape-costs.md`); visa page lines also carry `usage`, `costUsd`,
+  `model`, `promptVersion`.
 - Finalize hook: `scrapeRunService.registerFinalizeHook(async (run) => ...)`
   runs after every run's final write with the final doc (a throwing hook is
   logged and ignored). Use it for the cost rollup and the post-run alert
@@ -124,7 +127,8 @@ Query (all optional, each at most once, else 400 `VALIDATION_ERROR`):
 | `cursor` | the previous page's `nextCursor`; unknown → 400 `INVALID_CURSOR` |
 
 `200 { data: { items: RunListItem[], nextCursor: string | null } }`, newest
-first. `RunListItem` = the run doc without `pages`, `sources` and `errors`.
+first. `RunListItem` = the run doc without `pages`, `sources` and `errors`
+(so it includes `usage`, `costUsd` and `costBreakdown`, #82).
 
 ### `GET /admin/scrape-runs/stats`
 

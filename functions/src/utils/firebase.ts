@@ -140,6 +140,13 @@ export const collections = {
   // read in the upsert transaction so one key never gets two active alerts.
   // Backend-only.
   scrapeAlertKeys: db.collection("scrapeAlertKeys"),
+  // Monthly scraping cost rollup (issue #82): `scrapeCosts/{YYYY-MM}` sums
+  // every finalised run's LLM usage / cost / news API requests by kind,
+  // country and model; `scrapeCosts/{month}/runs/{runId}` markers make each
+  // run count once. Written by services/scrape-cost.service.ts (finalize
+  // hook), read via /admin/scrape-costs and by #83's budget alert.
+  // Backend-only: no firestore.rules match.
+  scrapeCosts: db.collection("scrapeCosts"),
 } as const;
 
 // Helper to get subcollection references

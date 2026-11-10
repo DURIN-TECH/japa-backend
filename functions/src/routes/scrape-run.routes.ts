@@ -6,7 +6,8 @@ import { scrapeRunController } from "../controllers/scrape-run.controller";
 // Routes for scraper monitoring (issue #81)
 // ============================================
 //
-// Mounted at /admin/scrape-runs and /admin/scrape-sources (app.ts). Read-only.
+// Mounted at /admin/scrape-runs, /admin/scrape-sources and /admin/scrape-costs
+// (app.ts). Read-only.
 // `verifyAuth` gives 401 without a valid token; the controller then gates on
 // CASL `read ScrapeRun` (admin-only in @durin-tech/authz) → 403 otherwise.
 
@@ -24,4 +25,11 @@ adminScrapeRunRoutes.get("/:id", verifyAuth, (req, res) => scrapeRunController.g
 const adminScrapeSourceRoutes = Router();
 adminScrapeSourceRoutes.get("/", verifyAuth, (req, res) => scrapeRunController.sources(req, res));
 
-export { adminScrapeRunRoutes, adminScrapeSourceRoutes };
+/**
+ * /admin/scrape-costs — LLM / API cost from the monthly rollup (issue #82).
+ * Same gate (CASL read ScrapeRun).
+ */
+const adminScrapeCostRoutes = Router();
+adminScrapeCostRoutes.get("/", verifyAuth, (req, res) => scrapeRunController.costs(req, res));
+
+export { adminScrapeCostRoutes, adminScrapeRunRoutes, adminScrapeSourceRoutes };

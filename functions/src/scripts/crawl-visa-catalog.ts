@@ -61,6 +61,24 @@
  * script crashes). The script options (country, visa, limit, ...) are stored
  * as `options`. Stale `running` runs older than 1h are swept to `failed`
  * first, as on every scheduled tick. The run id is printed at the end.
+ *
+ * Cost (issue #82): each LLM call's reported token usage is priced with
+ * `appConfig/llmPricing` (default table when absent) and recorded on the run
+ * (usage, costUsd, per country / model), on the page line and in scrapeMeta;
+ * the run is added to the monthly rollup `scrapeCosts/{YYYY-MM}` when it is
+ * finalised. The run's tokens and cost are printed at the end.
+ *
+ * Cost estimate (issue #82), BEFORE a large re-extract (e.g. a prompt version
+ * bump, #71): `--estimate` fetches nothing, calls no LLM, writes nothing (no
+ * run doc). It counts the pages a re-extract would queue and prices them
+ * from the average RECORDED usage per extraction (last 50 visa runs):
+ *   node lib/scripts/crawl-visa-catalog.js --estimate                 (all sources)
+ *   node lib/scripts/crawl-visa-catalog.js --estimate --country GB
+ *   node lib/scripts/crawl-visa-catalog.js --estimate --assume-bump   (as if the prompt version changed)
+ * "Queued" = pages whose doc is a PENDING scraped visa from another prompt
+ * version (what #71 re-extracts; with --assume-bump every pending scraped
+ * doc), plus pages with no doc yet. It also prints the cost of re-extracting
+ * every extractable page (the --force upper bound). No DEEPSEEK_API_KEY needed.
  */
 import * as fs from "fs";
 import * as path from "path";
@@ -70,6 +88,8 @@ import type { VisaSource } from "../types/visa-catalog";
 import type { VisaType } from "../types";
 import type { ScrapeRunRecorder } from "../services/scrape-run.service";
 import type { ScrapeRunPageOutcome, ScrapeRunSourceStatus } from "../types/scrape-run";
+// Type-only (issue #82): a priced LLM call.
+import type { PricedUsage } from "../services/scrape-cost-pricing";
 
 // The run record of this invocation (issue #81), module-level so the crash
 // handler at the bottom can mark it failed. Unset until the run starts.
@@ -87,10 +107,16 @@ function parseArgs(argv: string[]) {
     limit: number;
     maxExtractions: number;
     force: boolean;
+    // Issue #82: print a re-extract cost estimate and exit (no fetch/LLM/writes).
+    estimate: boolean;
+    // With --estimate: treat EVERY pending scraped doc as prompt-stale.
+    assumeBump: boolean;
   } = {
     limit: 25,
     maxExtractions: 25,
     force: false,
+    estimate: false,
+    assumeBump: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -100,6 +126,8 @@ function parseArgs(argv: string[]) {
     else if (a === "--limit") out.limit = parseInt(argv[++i] || "25", 10);
     else if (a === "--force") out.force = true;
     else if (a === "--max-extractions") out.maxExtractions = parseInt(argv[++i] || "25", 10);
+    else if (a === "--estimate") out.estimate = true;
+    else if (a === "--assume-bump") out.assumeBump = true;
   }
   return out;
 }
@@ -117,13 +145,14 @@ function loadLocalEnv() {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (!args.country && !args.visa) {
+  // The estimate is read-only, so it may cover every source.
+  if (!args.estimate && !args.country && !args.visa) {
     console.error("\n❌ Pass --country <CODE> and/or --visa <name>.\n");
     process.exit(1);
   }
 
   loadLocalEnv();
-  if (!process.env.DEEPSEEK_API_KEY) {
+  if (!args.estimate && !process.env.DEEPSEEK_API_KEY) {
     console.error("\n❌ DEEPSEEK_API_KEY not set (add it to functions/.env.local).\n");
     process.exit(1);
   }
@@ -144,6 +173,11 @@ async function main() {
 
   // Import AFTER env is set so utils/firebase initializes against this project.
   await import("../utils/firebase");
+  // ---- --estimate: print the re-extract estimate and stop (issue #82) ----
+  if (args.estimate) {
+    await printEstimate(args);
+    process.exit(0);
+  }
   const { collections, subcollections } = await import("../utils/firebase");
   const { pickSourceAdapter, sourceMetaFromDocument } = await import(
     "../services/visa-source-adapters"
@@ -184,6 +218,13 @@ async function main() {
     supplementaryGateHash,
     supplementaryPagesMeta,
   } = await import("../services/visa-catalog-supplementary");
+
+  // ---- Cost (issue #82) ----
+  // Importing the cost service installs the monthly-rollup finalize hook;
+  // the price table is read once for the run.
+  const { scrapeCostService } = await import("../services/scrape-cost.service");
+  const { pageUsageFields, priceUsageReport } = await import("../services/scrape-cost-pricing");
+  const { pricing, origin: pricingOrigin } = await scrapeCostService.loadPricing();
 
   // ---- Run record (issue #81) ----
   // Same recorder as the orchestrator. Sweep crashed runs first, then start
@@ -301,7 +342,8 @@ async function main() {
     const notePage = (
       page: (typeof pages)[number],
       outcome: ScrapeRunPageOutcome,
-      extra: { visaId?: string; error?: string; reason?: string } = {}
+      // Issue #82: plus the page's LLM usage fields when it made a call.
+      extra: { visaId?: string; error?: string; reason?: string } & Record<string, unknown> = {}
     ) => {
       // Supplement rows are listed, not counted as attempted (same as the recorder).
       if (outcome !== "supplement") src.attempted++;
@@ -325,6 +367,8 @@ async function main() {
       let pageVisaId: string | undefined;
       // Same hash but re-extracted for a newer prompt (#71) — not a content change.
       let promptReextract = false;
+      // Issue #82: priced usage of this page's LLM call (set by onUsage).
+      let callUsage: PricedUsage | undefined;
       try {
         console.log(`\n[${source.countryCode}] ${page.routeName}\n  ${page.url}`);
         // Resolve the record id BEFORE fetching/extracting (same rule as the
@@ -445,6 +489,11 @@ async function main() {
           url: page.url,
           countryName: source.countryName,
           routeName: page.routeName,
+          // Issue #82: price + record the call's reported usage on the run.
+          onUsage: (report) => {
+            callUsage = priceUsageReport(report, pricing);
+            recorder.recordUsage({ ...callUsage, sourceId: source.countryCode });
+          },
         });
         const { visaId, outcome } = await visaCatalogService.ingestExtraction({
           countryCode: source.countryCode,
@@ -465,9 +514,12 @@ async function main() {
           linkedSurcharges: linked,
           // Supplementary pages used (issue #86), for scrapeMeta.
           supplementaryPages: supplementaryPagesMeta(supps),
+          // Issue #82: token usage + cost on scrapeMeta.
+          llmUsage: callUsage,
         });
         totals[outcome]++;
-        notePage(page, outcome, { visaId });
+        notePage(page, outcome, { visaId, ...pageUsageFields(callUsage, EXTRACTOR_PROMPT_VERSION) });
+        if (callUsage) console.log(`     ${describeUsage(callUsage)}`);
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
         // Issue #86: say when uncited numbers were left out (never written as 0).
         if (extracted.processingUnknown) console.log("     processing time unknown (no cited figure): days omitted");
@@ -479,7 +531,12 @@ async function main() {
         src.errors++;
         // Issue #81: on the run record (redacted there).
         recorder.recordError({ sourceId: source.countryCode, url: page.url, error: err });
-        notePage(page, "error", { visaId: pageVisaId, error: (err as Error)?.message ?? String(err) });
+        notePage(page, "error", {
+          visaId: pageVisaId,
+          error: (err as Error)?.message ?? String(err),
+          // A call that failed validation was still billed (#82).
+          ...pageUsageFields(callUsage, EXTRACTOR_PROMPT_VERSION),
+        });
         // 429/503: stop requesting this host for the rest of the manual run.
         // Recorded against the answering host, the requested host and the
         // page host (see the orchestrator's catch for why all three).
@@ -561,10 +618,104 @@ async function main() {
   });
   activeRecorder = undefined;
   console.log(`Run record: scrapeRuns/${recorder.id} (${finalRun?.status ?? "not recorded"})`);
+  // Issue #82: what the run cost (price table origin: config or default).
+  const used = recorder.usageSoFar;
+  console.log(
+    `Cost: ${used.extractions} extraction(s), ${used.promptTokens} prompt tokens ` +
+      `(${used.cacheHitTokens} cache hit), ${used.completionTokens} completion tokens, ` +
+      `$${used.costUsd.toFixed(6)} (prices: ${pricingOrigin === "config" ? "appConfig/llmPricing" : "default table"}` +
+      `${used.unpricedExtractions ? `; ${used.unpricedExtractions} call(s) UNPRICED` : ""})`
+  );
   console.log("Review pending scraped visas at: admin → Visa Review (filter source=scraped).");
   // Proposed edits to approved visas have no portal UI yet (follow-up issue).
   if (totals.proposed > 0) console.log("Proposed edits to approved visas: GET /admin/visa-changes?status=open");
   process.exit(0);
+}
+
+/** One line describing a priced call (issue #82). */
+function describeUsage(p: PricedUsage): string {
+  const cost = p.costUsd === undefined ? "UNPRICED (no price for this model)" : `$${p.costUsd.toFixed(6)}${p.peak ? " (peak)" : " (off-peak)"}`;
+  return `tokens: ${p.usage.promptTokens} in (${p.usage.cacheHitTokens} cache hit) / ${p.usage.completionTokens} out, ${cost}`;
+}
+
+/**
+ * `--estimate` (issue #82): how much would re-extracting cost? Read-only:
+ * reads the registry, the visa docs at each page's id, the last visa runs'
+ * recorded usage and the price table. Prints per-source counts and the
+ * estimate for (a) the pages a #71 re-extract would queue and (b) every
+ * extractable page (--force).
+ */
+async function printEstimate(args: ReturnType<typeof parseArgs>): Promise<void> {
+  const { collections, subcollections } = await import("../utils/firebase");
+  const { visaCatalogExtractor, EXTRACTOR_PROMPT_VERSION } = await import("../services/visa-catalog-extract.service");
+  const { visaCatalogService } = await import("../services/visa-catalog.service");
+  const { isPendingPromptStale } = await import("../services/visa-catalog-diff");
+  const { scrapeCostService } = await import("../services/scrape-cost.service");
+  const { estimateReextractCost } = await import("../services/scrape-cost-pricing");
+
+  const sourcesSnap = args.country
+    ? await collections.visaSources.where("countryCode", "==", args.country).get()
+    : await collections.visaSources.get();
+  let queued = 0;
+  let extractable = 0;
+  console.log(`\nRe-extract estimate (prompt ${EXTRACTOR_PROMPT_VERSION}${args.assumeBump ? ", assuming a version bump" : ""})`);
+  for (const doc of sourcesSnap.docs) {
+    const source = doc.data() as Pick<VisaSource, "countryCode" | "pages">;
+    // Same page filter as a crawl: no supplement-only rows, optional --visa.
+    const pages = (source.pages ?? []).filter(
+      (p) => !p.supplementOnly && (!args.visa || p.routeName.toLowerCase().includes(args.visa))
+    );
+    let srcQueued = 0;
+    for (const page of pages) {
+      let visaId: string;
+      try {
+        visaId = visaCatalogService.buildVisaId(source.countryCode, page.url, { visaId: page.visaId });
+      } catch {
+        continue; // un-derivable id: a crawl errors before any LLM call
+      }
+      extractable++;
+      const snap = await subcollections.visaTypes(source.countryCode).doc(visaId).get();
+      const existing = snap.exists ? (snap.data() as VisaType) : undefined;
+      // No doc yet: the next crawl extracts it. Pending scraped doc: stale
+      // when from another prompt version (or always, with --assume-bump).
+      const stale = !existing
+        ? true
+        : args.assumeBump
+          ? existing.source === "scraped" && existing.reviewStatus === "pending_review"
+          : isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION);
+      if (stale) srcQueued++;
+    }
+    queued += srcQueued;
+    console.log(`  ${source.countryCode}: ${srcQueued} queued / ${pages.length} extractable page(s)`);
+  }
+
+  const [{ pricing, origin }, average] = await Promise.all([
+    scrapeCostService.loadPricing(),
+    scrapeCostService.averageVisaUsage(),
+  ]);
+  const model = visaCatalogExtractor.model;
+  const show = (label: string, pages: number) => {
+    const e = estimateReextractCost({ pages, model, pricing, average });
+    if (!e.priceKey) {
+      console.log(`  ${label}: ${pages} page(s) — no price for model ${model} in the price table; no USD estimate`);
+    } else if (!e.totalUsd || !e.basis) {
+      console.log(`  ${label}: ${pages} page(s) — no recorded usage yet (run one extraction first); no USD estimate`);
+    } else {
+      console.log(
+        `  ${label}: ${pages} page(s) x ~${Math.round(e.basis.promptTokens)} in / ~${Math.round(e.basis.completionTokens)} out tokens ` +
+          `= $${e.totalUsd.offPeak.toFixed(4)} (all off-peak) to $${e.totalUsd.peak.toFixed(4)} (all peak)`
+      );
+    }
+    return e;
+  };
+  console.log(`\nModel ${model}; prices: ${origin === "config" ? "appConfig/llmPricing" : "default table"}`);
+  const e = show("Queued re-extract (#71)", queued);
+  show("Everything (--force)", extractable);
+  if (e.basis) console.log(`  Basis: average of ${e.basis.extractions} recorded extraction(s) (last visa runs)`);
+  if (e.sourceUrl) console.log(`  Price source: ${e.sourceUrl} (effective from ${e.effectiveFrom})`);
+  console.log(
+    "  Note: the scheduled crawl drains a queue at maxExtractions per run (15), so the cost is spread over several runs."
+  );
 }
 
 main().catch(async (e) => {
