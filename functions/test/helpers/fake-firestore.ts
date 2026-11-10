@@ -11,7 +11,8 @@
 //  - collection refs + queries: doc(id?) (auto id when omitted), add,
 //    where (==, <, <=, >, >=; Timestamps compared by millis), orderBy
 //    (asc/desc), limit, startAfter(docSnapshot) (issue #81 cursor pages), get;
-//  - runTransaction: tx.get(ref | query), tx.set / tx.update buffered and
+//  - `in` filters and doc / tx deletes (issue #83 alert store);
+//  - runTransaction: tx.get(ref | query), tx.set / tx.update / tx.delete buffered and
 //    applied only when the callback resolves — a throw writes NOTHING, like a
 //    real transaction.
 // Every update()/set() is recorded in `writes` so tests can assert exactly
@@ -25,7 +26,7 @@ export type Data = Record<string, unknown>;
 /** "path/to/doc" -> stored data. */
 export const store = new Map<string, Data>();
 /** Every committed write, in order (raw payload, sentinels intact). */
-export const writes: { op: "set" | "update"; path: string; data: Data }[] = [];
+export const writes: { op: "set" | "update" | "delete"; path: string; data: Data }[] = [];
 
 /** Reset the fake between tests. */
 export function resetStore(): void {
@@ -75,6 +76,12 @@ function doUpdate(path: string, data: Data): void {
   store.set(path, applyUpdate(cur, data));
 }
 
+/** Delete a doc (a missing doc is fine, like Firestore). Issue #83. */
+function doDelete(path: string): void {
+  writes.push({ op: "delete", path, data: {} });
+  store.delete(path);
+}
+
 /** A doc snapshot shaped like Firestore's. */
 function snapshot(path: string, ref: any) {
   const d = store.get(path);
@@ -94,6 +101,9 @@ export function fakeDoc(path: string): any {
     },
     async update(data: Data) {
       doUpdate(path, data);
+    },
+    async delete() {
+      doDelete(path);
     },
     collection: (name: string) => fakeCollection(`${path}/${name}`),
   };
@@ -153,6 +163,8 @@ export function fakeCollection(
             const a = cmpValue(d[f]) as any;
             const b = cmpValue(v) as any;
             if (op === "==") return a === b;
+            // `in`: the value is an array of candidates (issue #83).
+            if (op === "in") return (v as unknown[]).map(cmpValue).includes(a);
             if (a === undefined) return false;
             if (op === "<") return a < b;
             if (op === "<=") return a <= b;
@@ -201,6 +213,10 @@ export async function fakeRunTransaction<T>(fn: (tx: any) => Promise<T>): Promis
       pending.push(() => doUpdate(ref.path, data));
       return tx;
     },
+    delete(ref: any) {
+      pending.push(() => doDelete(ref.path));
+      return tx;
+    },
   };
   const result = await fn(tx);
   for (const w of pending) w();
@@ -222,6 +238,10 @@ export async function installFakes(): Promise<void> {
   // Issue #81: run records + the news registry (source health, news runs).
   firebase.collections.scrapeRuns = fakeCollection("scrapeRuns");
   firebase.collections.newsSources = fakeCollection("newsSources");
+  // Issue #83: the alert store + its dedupe pointers, and users (recipients).
+  firebase.collections.scrapeAlerts = fakeCollection("scrapeAlerts");
+  firebase.collections.scrapeAlertKeys = fakeCollection("scrapeAlertKeys");
+  firebase.collections.users = fakeCollection("users");
   firebase.subcollections.scrapeRuns = (id: string) => fakeCollection(`newsSources/${id}/scrapeRuns`);
   firebase.subcollections.visaTypes = (cc: string) => fakeCollection(`countries/${cc}/visaTypes`);
   const changes: any = await import("../../src/services/visa-catalog-changes.service");
@@ -235,4 +255,7 @@ export async function installFakes(): Promise<void> {
   // Issue #81: the stale run sweep is transactional.
   const runs: any = await import("../../src/services/scrape-run.service");
   runs.scrapeRunService.runTransaction = fakeRunTransaction;
+  // Issue #83: alert upserts / resolves / digest claim are transactional.
+  const alerts: any = await import("../../src/services/scrape-alert.service");
+  alerts.scrapeAlertService.runTransaction = fakeRunTransaction;
 }
