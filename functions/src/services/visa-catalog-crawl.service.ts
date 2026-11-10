@@ -23,6 +23,13 @@ import { hostBackoffEntriesFromSource, hostBackoffEntriesToSource } from "./visa
 import { resolveOfficialHosts } from "./visa-catalog-official-hosts";
 // Surcharges published on a linked page (issue #69): fetched once per run.
 import { LinkedSurchargeCache, linkedGateHash, linkedSurchargePage } from "./visa-catalog-linked-surcharge";
+// Supplementary pages (issue #86): extra official pages appended to a route's text.
+import {
+  SupplementaryPageCache,
+  combineSupplementaryText,
+  supplementaryGateHash,
+  supplementaryPagesMeta,
+} from "./visa-catalog-supplementary";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -249,6 +256,15 @@ class VisaCatalogCrawlService {
       let deferredPages = 0;
       // Stored retry-after times from earlier runs (expired ones are ignored).
       hostState.load(hostBackoffEntriesFromSource(source.hostBackoffs));
+      // ---- Supplementary pages for this source (issue #86) ----
+      // One cache per SOURCE (supplements are rows of the same country and
+      // use its adapter); each is fetched at most once, skipped like any page
+      // when its host is backed off.
+      const supplements = new SupplementaryPageCache(async (suppPage) => {
+        const blocked = hostState.blocking(hostOf(suppPage.url));
+        if (blocked) throw new Error(`supplementary page not fetched: ${backoffMessage(blocked)}`);
+        return pickSourceAdapter(source.adapter, suppPage.url, opts?.adapters).fetch(suppPage);
+      });
 
       for (let i = 0; i < pages.length; i++) {
         // Respect the per-run extraction cap. The source is still rescheduled
@@ -257,6 +273,11 @@ class VisaCatalogCrawlService {
         if (extractionsUsed >= maxExtractions) break;
 
         const page = pages[i];
+
+        // ---- Supplement-only row (issue #86)? Not a visa: never extracted ----
+        // It is fetched (once per run) only for the routes that list it in
+        // `supplementaryPages`, below. Its own crawl fields are updated there.
+        if (page.supplementOnly) continue;
 
         // ---- Host backed off? Skip WITHOUT any request (issue #64) ----
         // Blocked if the host answered 429/503 earlier in this run (for the
@@ -336,7 +357,20 @@ class VisaCatalogCrawlService {
           // Hash is over the exact text the extractor would see (selected +
           // capped sections for GOV.UK; the cleaned page for generic-html),
           // combined with the linked pages' hashes when the page has any.
-          const gateHash = linkedGateHash(fetched.contentHash, linked);
+          // Supplementary pages (issue #86): [] for a route that lists none.
+          // A failure throws (route NOT extracted without its fee page) and
+          // is recorded on the route like any page error.
+          const supps = await supplements.forPage(page, pages);
+          // Record the supplements' own crawl state on their rows (they are
+          // never visited by this loop): fetched now, with their text hash.
+          for (const s of supps) {
+            const j = pages.findIndex((p) => p.url === s.page.url);
+            if (j >= 0) pages[j] = { ...pages[j], lastCrawledAt: now, lastContentHash: s.doc.contentHash, lastError: undefined };
+          }
+          // Text the extractor sees: the route text + each supplement.
+          const extractText = combineSupplementaryText(fetched.text, supps);
+          // Hash gate over route + supplements (+ linked surcharge pages).
+          const gateHash = linkedGateHash(supplementaryGateHash(fetched.contentHash, supps), linked);
           const changed = gateHash !== page.lastContentHash;
           // Record crawl metadata regardless of change.
           pages[i] = {
@@ -367,7 +401,7 @@ class VisaCatalogCrawlService {
           // validation error) costs money too and must use up a
           // maxExtractions slot, or a systematic failure could exceed the cap.
           extractionsUsed++;
-          const extracted = await visaCatalogExtractor.extract(fetched.text, {
+          const extracted = await visaCatalogExtractor.extract(extractText, {
             url: page.url,
             countryName: source.countryName,
             routeName: page.routeName,
@@ -396,6 +430,8 @@ class VisaCatalogCrawlService {
             fx,
             // Linked-page surcharges for this route (issue #69).
             linkedSurcharges: linked,
+            // Supplementary pages used (issue #86), for scrapeMeta.
+            supplementaryPages: supplementaryPagesMeta(supps),
           });
           if (outcome === "created") summary.created++;
           else if (outcome === "updated") summary.updated++;

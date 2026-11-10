@@ -146,6 +146,14 @@ export function findMetaRepoVisaSourcesMarkdown(startDir: string = __dirname): s
 export const KR_TEMPORARY_VISIT_URL =
   "https://www.hikorea.go.kr/info/InfoDatail.pt?CAT_SEQ=522&PARENT_ID=1267&locale=en";
 
+/**
+ * The Korea Visa Portal fee table (issue #86): a SUPPLEMENT-ONLY registry row
+ * (not a visa) whose text is appended to the KR C-3 route before extraction.
+ * Exported for the unit tests, like KR_TEMPORARY_VISIT_URL. Must equal the KR
+ * fee-table row in official_visa_links_verified_v3.md character for character.
+ */
+export const KR_VISA_FEE_TABLE_URL = "https://www.visa.go.kr/openPage.do?MENU_ID=10103&LANG_TYPE=EN";
+
 export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   // ---- United Kingdom (GB) — routes with a seeded uk-* equivalent ----
   "https://www.gov.uk/standard-visitor": { visaId: "gb-standard-visitor", visaCode: "SVV" }, // ~ uk-visitor
@@ -259,8 +267,38 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   // KEY MUST MATCH THE MARKDOWN ROW EXACTLY (official_visa_links_verified_v3.md,
   // "## 23. South Korea"); otherwise seedVisaSources() warns and the pin is
   // not applied.
+  //
+  // ISSUE #86 — THE FEE COMES FROM A SUPPLEMENTARY PAGE. The C-3 guide above
+  // is ~870 chars with no fee and no processing time, so the extraction had
+  // 40% confidence, no fee and 0 processing days. The fee is on the Korea
+  // Visa Portal's static fee table (KR_VISA_FEE_TABLE_URL, below), which the
+  // crawl appends to this route's text (services/visa-catalog-supplementary.ts).
+  // PROCESSING TIME: no crawlable official page states it. It is published
+  // per mission on the MOFA embassy sites (e.g. the Embassy in Nigeria,
+  // overseas.mofa.go.kr/ng-en/wpge/m_9859/contents.do), but every
+  // *.mofa.go.kr page answers our crawler with an endless 307 cookie
+  // challenge (a cookie-setting redirect loop, checked 2026-11-10), and the
+  // crawler policy forbids working around a block. So the C-3 processing
+  // time is left UNKNOWN (processingUnknown), never a fake 0.
   [KR_TEMPORARY_VISIT_URL]: {
     visaId: "kr-temporary-visit-c-3",
+    supplementaryPages: [KR_VISA_FEE_TABLE_URL],
+  },
+  // Korea Visa Portal "Visa Application Fee for Each Visa Type (in USD)"
+  // (issue #86). Unlike the per-visa screens (JS form POST, see above), this
+  // menu page answers a plain GET with server-rendered English (LANG_TYPE=EN;
+  // robots.txt only restricts Googlebot). Checked 2026-11-10 with the crawl's
+  // own fetchAndClean (200, ~2,450 chars) — it states:
+  //   "90 days or less Single-entry visa  USD 40"
+  //   "91 days or longer Single-entry visa  USD 60"
+  //   "Double-entry visa usable up to 2 times  USD 70"
+  //   "Multiple-entry visa  USD 90"
+  // `supplementOnly`: it is a fee table, not a visa, so it is never extracted
+  // into a doc of its own; the pinned id is reserved (never written) so the
+  // row still has registry-owned identity like every other KR row.
+  [KR_VISA_FEE_TABLE_URL]: {
+    visaId: "kr-visa-fee-table",
+    supplementOnly: true,
   },
 };
 

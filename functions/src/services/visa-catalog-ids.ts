@@ -136,6 +136,12 @@ export interface VisaSourcePin {
   excludeSections?: string[];
   // Surcharges published on a linked page that this route must add (#69).
   linkedSurcharges?: LinkedSurchargeRef[];
+  // Supplementary pages (issue #86): URLs of `supplementOnly` rows of the same
+  // country whose text is appended to this route's text before extraction.
+  supplementaryPages?: string[];
+  // True for a row that is not a visa route (e.g. a fee table): never
+  // extracted on its own, only fetched as a supplement (issue #86).
+  supplementOnly?: boolean;
 }
 
 /**
@@ -172,6 +178,12 @@ export function applyVisaSourcePins(
       ...(pin.linkedSurcharges
         ? { linkedSurcharges: pin.linkedSurcharges.map((r) => ({ ...r, length: { ...r.length } })) }
         : {}),
+      // Supplementary pages (#86): registry-owned, fresh array per seed.
+      ...(pin.supplementaryPages && pin.supplementaryPages.length > 0
+        ? { supplementaryPages: [...pin.supplementaryPages] }
+        : {}),
+      // Only `true` is stored (absent = an ordinary route page).
+      ...(pin.supplementOnly ? { supplementOnly: true } : {}),
     };
   });
   return { pages: out, matchedUrls };

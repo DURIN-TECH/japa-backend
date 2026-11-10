@@ -22,6 +22,7 @@ import * as path from "path";
 import {
   COUNTRY_CODES,
   KR_TEMPORARY_VISIT_URL,
+  KR_VISA_FEE_TABLE_URL,
   MARKDOWN_FILENAME,
   META_MARKDOWN_ENV,
   findMetaRepoVisaSourcesMarkdown,
@@ -68,11 +69,15 @@ describe("vendored verified-links markdown", () => {
     assert.deepEqual(codes, Object.values(COUNTRY_CODES).sort());
   });
 
-  test("carries the #67 KR row (the pinned HiKorea page)", () => {
+  // #67 added the HiKorea C-3 route; #86 added the Korea Visa Portal fee
+  // table as a supplement-only row right after it.
+  test("carries the KR rows (#67 HiKorea C-3 page + #86 visa fee table)", () => {
     const parsed = parseVisaSourcesMarkdown(fs.readFileSync(VENDORED, "utf8"));
     const kr = parsed.find((c) => c.countryCode === "KR");
     assert.ok(kr, "no South Korea section");
-    assert.deepEqual(kr.pages.map((p) => p.url), [KR_TEMPORARY_VISIT_URL]);
+    assert.deepEqual(kr.pages.map((p) => p.url), [KR_TEMPORARY_VISIT_URL, KR_VISA_FEE_TABLE_URL]);
+    // Both rows are TEXT-VERIFIED in the source of truth.
+    assert.ok(kr.pages.every((p) => p.validation === "text_verified"));
   });
 });
 

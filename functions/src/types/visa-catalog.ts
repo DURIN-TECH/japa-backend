@@ -67,6 +67,17 @@ export interface VisaSourcePage {
   // route page prints its own surcharges, or has none). See
   // services/visa-catalog-linked-surcharge.ts.
   linkedSurcharges?: LinkedSurchargeRef[];
+  // ---- Supplementary pages (issue #86) ----
+  // URLs of OTHER rows of the same country whose text is appended to this
+  // route's text before extraction, because they publish what the route page
+  // itself leaves out (KR: the HiKorea C-3 guide has no fee; the Korea Visa
+  // Portal fee table does). Each URL must be a page of the same source that
+  // is marked `supplementOnly`. Registry-owned (VISA_SOURCE_OVERRIDES).
+  supplementaryPages?: string[];
+  // True for a page that is NOT a visa route of its own (e.g. a fee table):
+  // the crawl never extracts it into a visa doc, it is only fetched as a
+  // supplementary page for the routes that list it. Registry-owned.
+  supplementOnly?: boolean;
   // Content-hash gate: skip extraction when the cleaned page text is unchanged.
   // sha256 of the cleaned page text last crawl (with linked surcharges,
   // #69: linkedGateHash() of that hash + the linked pages' hashes).
@@ -236,10 +247,35 @@ export interface VisaScrapeMeta {
   // constant EXTRACTOR_PROMPT_VERSION in visa-catalog-extract.service.ts), so
   // a reviewer can tell which rules a stored extraction followed.
   extractorPromptVersion?: string;
+
+  // ---- Uncited numeric fields (issue #86; optional so older docs stay valid) ----
+  // True when the extraction had no cited processing time, so the visa doc
+  // has NO processingDaysMin/Max (and `processingTime` may be the display
+  // label PROCESSING_TIME_UNKNOWN_LABEL). Absent when the processing time is
+  // known. Shown to the reviewer as "processing time not published".
+  processingUnknown?: boolean;
+  // The numeric fields the validator dropped because the page did not cite
+  // them (ExtractedVisa.uncitedFieldsDropped). Absent when none were.
+  uncitedFieldsDropped?: string[];
+  // Supplementary registry pages whose text was appended to this route's
+  // page before extraction (issue #86, e.g. the Korea Visa Portal fee table
+  // for the HiKorea C-3 route). Absent when the route uses none.
+  supplementaryPages?: VisaSupplementaryPageMeta[];
   // Issue #87: why the processing range disagrees with its cited durations
   // (copied from ExtractedVisa.processingUnverifiedReasons). Absent when it
   // agrees. Tells the reviewer to check processingDaysMin/Max by hand.
   processingUnverifiedReasons?: string[];
+}
+
+// ----- Supplementary pages (issue #86) -----
+//
+// Provenance of one supplementary page used for an extraction (stored on
+// scrapeMeta.supplementaryPages). Optional fields absent, never `undefined`.
+export interface VisaSupplementaryPageMeta {
+  url: string; // the registry page URL (a row of the same country)
+  routeName: string; // its label in the registry markdown
+  contentHash: string; // hash of its text as appended (feeds the route's hash gate)
+  sourceUpdatedAt?: string; // when the source says it changed, if known
 }
 
 // ----- Fee components (issue #59) -----
@@ -521,8 +557,19 @@ export interface ExtractedVisa {
   description: string;
   category: VisaCategory;
   processingTime: string;
-  processingDaysMin: number;
-  processingDaysMax: number;
+  // Issue #86: ABSENT (never a fake 0) when the page does not back them with a
+  // processing citation — then `processingUnknown` is true and both are
+  // omitted together (the validator never keeps just one).
+  processingDaysMin?: number;
+  processingDaysMax?: number;
+  // Set (true) by the validator when the processing time is unknown: no
+  // processing citation, a missing value, or a 0-day upper bound. Absent when
+  // processingDaysMin/Max are present.
+  processingUnknown?: true;
+  // Numeric fields the model returned that the validator DROPPED for lack of
+  // a citation, e.g. ["processingDaysMin", "processingDaysMax",
+  // "maxExtensions"] (issue #86). Absent when nothing was dropped.
+  uncitedFieldsDropped?: string[];
   // The fee as published (issue #59). Replaces the old LLM-converted
   // `baseCostUsd`: code computes the total and converts it to USD.
   // [] = the page states no fee; a free visa = one application component of 0.

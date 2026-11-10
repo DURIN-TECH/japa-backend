@@ -1,7 +1,7 @@
 import { collections, db, subcollections } from "../utils/firebase";
 import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 import { VisaType } from "../types";
-import { ExtractedVisa, FxRatesDoc } from "../types/visa-catalog";
+import { ExtractedVisa, FxRatesDoc, VisaSupplementaryPageMeta } from "../types/visa-catalog";
 // Pure id/code rules live in a Firebase-free module so they are unit-testable.
 import { deriveVisaId, resolveVisaCode } from "./visa-catalog-ids";
 // Pure scrape-meta + withdrawn decisions (also unit-tested without Firestore).
@@ -10,6 +10,7 @@ import {
   WithdrawnOutcome,
   buildScrapeMeta,
   extractedToVisaFields,
+  absentFieldDeletes,
   planRestoredUpdate,
   planWithdrawnUpdate,
 } from "./visa-catalog-meta";
@@ -177,6 +178,11 @@ class VisaCatalogService {
     // pass `contentHash` = linkedGateHash(page hash, linked), so a change to
     // the linked page re-stages the visa like a change to its own page.
     linkedSurcharges?: PageLinkedSurcharge[];
+    // Supplementary pages whose text was appended to the route text before
+    // extraction (issue #86; build with supplementaryPagesMeta()). Recorded on
+    // scrapeMeta.supplementaryPages. Absent / [] = none. As with linked
+    // surcharges, `contentHash` is then supplementaryGateHash(...).
+    supplementaryPages?: VisaSupplementaryPageMeta[];
   }): Promise<{ visaId: string; outcome: IngestOutcome }> {
     const { countryCode, sourceUrl, routeName, contentHash, extracted, model } = params;
     // Id from the registry (pin or URL path), never from extracted.code/name.
@@ -214,6 +220,7 @@ class VisaCatalogService {
       sourceMeta: params.sourceMeta,
       fee: feeMeta,
       extractorPromptVersion: EXTRACTOR_PROMPT_VERSION,
+      supplementaryPages: params.supplementaryPages,
     });
     const fields = extractedToVisaFields({ countryCode, visaId, code, extracted, baseCostUsd });
 
@@ -315,6 +322,9 @@ class VisaCatalogService {
         }
         tx.update(ref, {
           ...fields,
+          // Issue #86: processing days / maxExtensions the new extraction
+          // left out (uncited) are deleted, not left at the old value.
+          ...absentFieldDeletes(fields),
           ...costUpdate,
           sourceUrl,
           scrapeMeta: { ...scrapeMeta, fee: overwrite.fee },
