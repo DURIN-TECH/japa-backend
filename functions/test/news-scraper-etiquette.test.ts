@@ -264,7 +264,7 @@ describe("robots.txt", () => {
   test("disallowed article pages are skipped; allowed ones are fetched", async () => {
     routes.set("https://gov.example.org/news", { status: 200, body: LISTING });
     routes.set("https://other.example.net/robots.txt", { status: 200, body: "User-agent: *\nDisallow: /n/\n" });
-    routes.set("https://gov.example.org/n/1", { status: 200, body: '<div class="body">Full text one</div>' });
+    routes.set("https://gov.example.org/n/1", { status: 200, body: "<div class=\"body\">Full text one</div>" });
     await makeScraper().scrapeSource(htmlSource("ukvi", "https://gov.example.org/news", true));
     assert.ok(urlsRequested().includes("https://gov.example.org/n/1"));
     assert.ok(!urlsRequested().includes("https://other.example.net/n/2"));
