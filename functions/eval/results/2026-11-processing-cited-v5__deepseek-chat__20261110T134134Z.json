@@ -1,0 +1,1166 @@
+{
+  "extractorPromptVersion": "2026-11-processing-cited-v5",
+  "model": "deepseek-chat",
+  "ranAt": "2026-11-10T13:41:34.072Z",
+  "gitSha": "5184710d79bb2560a479745a58b22b0fb35ea40b",
+  "gitDirty": true,
+  "mode": "live",
+  "partial": false,
+  "routesRun": [
+    "skilled-worker-visa",
+    "standard-visitor",
+    "student-visa",
+    "graduate-visa",
+    "uk-family-visa",
+    "global-talent"
+  ],
+  "config": {
+    "weights": {
+      "name": 1,
+      "category": 1,
+      "processingDaysMin": 1,
+      "processingDaysMax": 1,
+      "validityPeriod": 1,
+      "isExtendable": 1,
+      "eligibility": 2,
+      "applicationUrlHost": 1,
+      "feeComponents": 3
+    },
+    "processingDaysTolerance": 0.2,
+    "processingDaysMinToleranceDays": 1
+  },
+  "thresholds": {
+    "overall": 0.85,
+    "route": 0.7
+  },
+  "routes": [
+    {
+      "route": "skilled-worker-visa",
+      "sourceUrl": "https://www.gov.uk/skilled-worker-visa",
+      "fixtureRecordedAt": "2026-11-09",
+      "sourceUpdatedAt": "2026-09-14T16:24:44+01:00",
+      "contentHash": "60c5842b148fee4e9513e8264b8eac5d9a0c6c50c8472e7b04147be1c98432a2",
+      "sectionsUsed": [
+        "overview",
+        "your-job",
+        "when-you-can-be-paid-less",
+        "if-you-work-in-healthcare-or-education",
+        "knowledge-of-english",
+        "how-much-it-costs",
+        "documents-you-must-provide",
+        "apply-from-outside-the-uk",
+        "extend-your-visa"
+      ],
+      "truncated": false,
+      "extracted": {
+        "name": "Skilled Worker visa",
+        "code": "SKILLED_WORKER",
+        "description": "A Skilled Worker visa allows you to come to or stay in the UK to do an eligible job with an approved employer. It has replaced the Tier 2 (General) work visa.",
+        "category": "work",
+        "processingTime": "3-8 weeks",
+        "processingDaysMin": 21,
+        "processingDaysMax": 56,
+        "feeComponents": [
+          {
+            "kind": "application",
+            "label": "Application fee (more than 3 years)",
+            "amount": 1618,
+            "currency": "GBP",
+            "per": "application"
+          },
+          {
+            "kind": "surcharge",
+            "label": "Healthcare surcharge",
+            "amount": 1035,
+            "currency": "GBP",
+            "per": "year",
+            "years": 5
+          }
+        ],
+        "validityPeriod": "up to 5 years",
+        "isExtendable": true,
+        "eligibilityCriteria": [
+          "work for a UK employer that’s been approved by the Home Office",
+          "have a ‘certificate of sponsorship’ (CoS) from your employer",
+          "do a job that’s on the list of eligible occupations",
+          "be paid a minimum salary - how much depends on the type of work you do and the date you got your CoS",
+          "You must be able to speak, read, write and understand English"
+        ],
+        "applicationUrl": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/skilled_worker_out_uk",
+        "applicationInstructions": "You must apply online. You can apply for a visa up to 3 months before the day you are due to start work in the UK. As part of your application, you’ll need to prove your identity and provide your documents.",
+        "confidence": 0.95,
+        "citations": {
+          "name": "Skilled Worker visa",
+          "description": "A Skilled Worker visa allows you to come to or stay in the UK to do an eligible job with an approved employer.",
+          "category": "work",
+          "processingTime": "3 weeks, if you’re outside the UK / 8 weeks, if you’re inside the UK",
+          "processingDaysMin": "3 weeks, if you’re outside the UK",
+          "processingDaysMax": "8 weeks, if you’re inside the UK",
+          "fee.application": "more than 3 years - £1,618 per person",
+          "fee.surcharge": "this is usually £1,035 per year",
+          "fee.years": "Your visa can last for up to 5 years before you need to extend it.",
+          "validityPeriod": "Your visa can last for up to 5 years before you need to extend it.",
+          "isExtendable": "You can apply to extend your visa as many times as you like as long as you still meet the eligibility requirements.",
+          "eligibilityCriteria": "work for a UK employer that’s been approved by the Home Office / have a ‘certificate of sponsorship’ (CoS) from your employer / do a job that’s on the list of eligible occupations / be paid a minimum salary - how much depends on the type of work you do and the date you got your CoS / You must be able to speak, read, write and understand English.",
+          "applicationUrl": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/skilled_worker_out_uk",
+          "applicationInstructions": "You must apply online. / You can apply for a visa up to 3 months before the day you are due to start work in the UK."
+        }
+      },
+      "score": {
+        "route": "skilled-worker-visa",
+        "score": 1,
+        "weightedSum": 12,
+        "weightTotal": 12,
+        "fields": [
+          {
+            "field": "name",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "Skilled Worker",
+            "actual": "Skilled Worker visa"
+          },
+          {
+            "field": "category",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "work",
+            "actual": "work"
+          },
+          {
+            "field": "processingDaysMin",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 21
+            },
+            "actual": 21
+          },
+          {
+            "field": "processingDaysMax",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 56
+            },
+            "actual": 56
+          },
+          {
+            "field": "validityPeriod",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "5 year"
+            ],
+            "actual": "up to 5 years"
+          },
+          {
+            "field": "isExtendable",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": true,
+            "actual": true
+          },
+          {
+            "field": "eligibility",
+            "type": "eligibility",
+            "weight": 2,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "work for a Home Office approved UK employer",
+              "certificate of sponsorship",
+              "eligible occupation",
+              "minimum salary",
+              "knowledge of English"
+            ],
+            "actual": [
+              "work for a UK employer that’s been approved by the Home Office",
+              "have a ‘certificate of sponsorship’ (CoS) from your employer",
+              "do a job that’s on the list of eligible occupations",
+              "be paid a minimum salary - how much depends on the type of work you do and the date you got your CoS",
+              "You must be able to speak, read, write and understand English"
+            ]
+          },
+          {
+            "field": "applicationUrlHost",
+            "type": "url",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk",
+            "actual": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/skilled_worker_out_uk"
+          },
+          {
+            "field": "feeComponents",
+            "type": "fee",
+            "weight": 3,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "application 1618 GBP per application",
+              "surcharge 1035 GBP per year x5"
+            ],
+            "actual": [
+              "application 1618 GBP per application",
+              "surcharge 1035 GBP per year x5"
+            ]
+          }
+        ],
+        "feeMismatch": false,
+        "processingCitationProblems": [],
+        "notes": [],
+        "knownGaps": []
+      }
+    },
+    {
+      "route": "standard-visitor",
+      "sourceUrl": "https://www.gov.uk/standard-visitor",
+      "fixtureRecordedAt": "2026-11-09",
+      "sourceUpdatedAt": "2026-10-13T12:00:04+01:00",
+      "contentHash": "bb40b41d686843969226b0856f5498aa9fe12d0bcd3f1ba3ee2a318e151fa425",
+      "sectionsUsed": [
+        "overview",
+        "apply-standard-visitor-visa",
+        "extend-your-stay"
+      ],
+      "truncated": false,
+      "extracted": {
+        "name": "Standard Visitor visa",
+        "code": "STANDARD_VISITOR",
+        "description": "The Standard Visitor visa allows you to visit the UK for tourism, business, study (up to 6 months), and other permitted activities. You can usually stay for up to 6 months.",
+        "category": "tourist",
+        "processingTime": "3-8 weeks",
+        "processingDaysMin": 21,
+        "processingDaysMax": 56,
+        "feeComponents": [
+          {
+            "kind": "application",
+            "label": "Standard Visitor visa",
+            "amount": 135,
+            "currency": "GBP",
+            "per": "application"
+          }
+        ],
+        "validityPeriod": "6 months",
+        "isExtendable": true,
+        "eligibilityCriteria": [
+          "You must have a passport or travel document valid for the whole of your stay.",
+          "You must be able to show that you will leave the UK at the end of your visit.",
+          "You must be able to support yourself and your dependants during your trip (or have funding from someone else).",
+          "You must be able to pay for your return or onward journey (or have funding from someone else).",
+          "You must not live in the UK for extended periods through frequent or successive visits, or make the UK your main home."
+        ],
+        "applicationUrl": "https://visas-immigration.service.gov.uk/apply-visa-type/visit",
+        "applicationInstructions": "You must apply online before you travel to the UK and attend an appointment at a visa application centre. The earliest you can apply is 3 months before you travel.",
+        "confidence": 0.95,
+        "citations": {
+          "name": "Standard Visitor visa",
+          "description": "You can visit the UK as a Standard Visitor for tourism, business, study (courses up to 6 months) and other permitted activities.",
+          "processingDaysMin": "you’ll usually get a decision on your visa within 3 weeks",
+          "processingDaysMax": "a decision will usually be made within 8 weeks",
+          "processingTime": "you’ll usually get a decision on your visa within 3 weeks / a decision will usually be made within 8 weeks",
+          "fee.application": "A Standard Visitor visa costs £135 for up to 6 months.",
+          "validityPeriod": "You can usually stay in the UK for up to 6 months.",
+          "isExtendable": "You may be able to extend your stay if you have permission to be in the UK for less than 6 months.",
+          "eligibilityCriteria": "You must have a passport or travel document to enter the UK. It should be valid for the whole of your stay. / you’ll leave the UK at the end of your visit / you’re able to support yourself and your dependants during your trip (or have funding from someone else to support you) / you’re able to pay for your return or onward journey (or have funding from someone else to pay for the journey) / you’ll not live in the UK for extended periods through frequent or successive visits, or make the UK your main home",
+          "applicationUrl": "Apply now (https://visas-immigration.service.gov.uk/apply-visa-type/visit)",
+          "applicationInstructions": "You must apply for a Standard Visitor visa online before you travel to the UK. / The earliest you can apply is 3 months before you travel."
+        }
+      },
+      "score": {
+        "route": "standard-visitor",
+        "score": 1,
+        "weightedSum": 12,
+        "weightTotal": 12,
+        "fields": [
+          {
+            "field": "name",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "Standard Visitor",
+            "actual": "Standard Visitor visa"
+          },
+          {
+            "field": "category",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "tourist",
+            "actual": "tourist"
+          },
+          {
+            "field": "processingDaysMin",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 21
+            },
+            "actual": 21
+          },
+          {
+            "field": "processingDaysMax",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 56
+            },
+            "actual": 56
+          },
+          {
+            "field": "validityPeriod",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "6 month"
+            ],
+            "actual": "6 months"
+          },
+          {
+            "field": "isExtendable",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": true,
+            "actual": true
+          },
+          {
+            "field": "eligibility",
+            "type": "eligibility",
+            "weight": 2,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "will leave the UK at the end of the visit",
+              "can support yourself during the trip",
+              "can pay for the return or onward journey",
+              "valid passport or travel document",
+              "will not live in the UK through frequent or successive visits"
+            ],
+            "actual": [
+              "You must have a passport or travel document valid for the whole of your stay.",
+              "You must be able to show that you will leave the UK at the end of your visit.",
+              "You must be able to support yourself and your dependants during your trip (or have funding from someone else).",
+              "You must be able to pay for your return or onward journey (or have funding from someone else).",
+              "You must not live in the UK for extended periods through frequent or successive visits, or make the UK your main home."
+            ]
+          },
+          {
+            "field": "applicationUrlHost",
+            "type": "url",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "visas-immigration.service.gov.uk",
+            "actual": "https://visas-immigration.service.gov.uk/apply-visa-type/visit"
+          },
+          {
+            "field": "feeComponents",
+            "type": "fee",
+            "weight": 3,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "application 135 GBP per application"
+            ],
+            "actual": [
+              "application 135 GBP per application"
+            ]
+          }
+        ],
+        "feeMismatch": false,
+        "processingCitationProblems": [],
+        "notes": [],
+        "knownGaps": []
+      }
+    },
+    {
+      "route": "student-visa",
+      "sourceUrl": "https://www.gov.uk/student-visa",
+      "fixtureRecordedAt": "2026-11-09",
+      "sourceUpdatedAt": "2026-11-09T09:02:50+00:00",
+      "contentHash": "1f6352dc7e01632f3060a6aa73e962966a91f18ef1ab5c297ee334744ab23dfa",
+      "sectionsUsed": [
+        "overview",
+        "course",
+        "money",
+        "knowledge-of-english",
+        "documents-you-must-provide",
+        "apply-online",
+        "extend-your-visa"
+      ],
+      "truncated": false,
+      "extracted": {
+        "name": "Student visa",
+        "code": "STUDENT",
+        "description": "The Student visa allows individuals aged 16 or over to study in the UK at a licensed student sponsor. Applicants must have a Confirmation of Acceptance for Studies (CAS), demonstrate sufficient funds, and meet English language requirements.",
+        "category": "student",
+        "processingTime": "3-8 weeks",
+        "processingDaysMin": 21,
+        "processingDaysMax": 56,
+        "feeComponents": [
+          {
+            "kind": "application",
+            "label": "Student visa application fee",
+            "amount": 558,
+            "currency": "GBP",
+            "per": "application"
+          }
+        ],
+        "validityPeriod": "up to 5 years",
+        "isExtendable": true,
+        "eligibilityCriteria": [
+          "You are 16 or over",
+          "You have been offered a place on a course by a licensed student sponsor",
+          "You have enough money to support yourself and pay for your course",
+          "You can speak, read, write and understand English",
+          "You have consent from your parents if you are 16 or 17"
+        ],
+        "applicationUrl": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/student_out_uk",
+        "applicationInstructions": "You must apply online for a Student visa. As part of your application, you'll need to prove your identity either by using the 'UK Immigration: ID Check' app or by having your fingerprints and photo taken at a visa application centre.",
+        "confidence": 0.9,
+        "citations": {
+          "processingDaysMin": "3 weeks, if you’re outside the UK",
+          "processingDaysMax": "8 weeks, if you’re inside the UK",
+          "processingTime": "3 weeks, if you’re outside the UK / 8 weeks, if you’re inside the UK",
+          "fee.application": "£558 to apply for a Student visa from outside the UK",
+          "validityPeriod": "If you’re 18 or over and your course is at degree level, you can usually stay in the UK for up to 5 years.",
+          "eligibilityCriteria": "You can apply for a Student visa to study in the UK if you’re 16 or over and you: have been offered a place on a course by a licensed student sponsor; have enough money to support yourself and pay for your course; can speak, read, write and understand English; have consent from your parents if you’re 16 or 17",
+          "applicationUrl": "Start now (https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/student_out_uk)",
+          "applicationInstructions": "You must apply online for a Student visa. As part of your application, you’ll need to prove your identity. How you do this depends on where you’re from and what type of passport you have."
+        }
+      },
+      "linkedSurcharges": [
+        {
+          "id": "gb-ihs",
+          "label": "Immigration Health Surcharge",
+          "sourceUrl": "https://www.gov.uk/healthcare-immigration-application",
+          "sourceContentHash": "f6ebb0af9f66b1dbb318229164921ddc7985f09ea342d23998d529676cb27f27",
+          "rate": "student",
+          "lengthBasis": "assumed",
+          "applied": true,
+          "sourceUpdatedAt": "2026-09-18T15:20:43+01:00",
+          "lengthNote": "1 year assumed: the Student visa length depends on the course (registry assumption, issue #69)",
+          "amount": 776,
+          "currency": "GBP",
+          "citation": "£776 per year for students, their dependants, and those on a Youth Mobility Scheme visa, for example £1,552 for a 2-year visa",
+          "years": 1
+        }
+      ],
+      "score": {
+        "route": "student-visa",
+        "score": 1,
+        "weightedSum": 12,
+        "weightTotal": 12,
+        "fields": [
+          {
+            "field": "name",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "Student",
+            "actual": "Student visa"
+          },
+          {
+            "field": "category",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "student",
+            "actual": "student"
+          },
+          {
+            "field": "processingDaysMin",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 21
+            },
+            "actual": 21
+          },
+          {
+            "field": "processingDaysMax",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 56
+            },
+            "actual": 56
+          },
+          {
+            "field": "validityPeriod",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "5 year"
+            ],
+            "actual": "up to 5 years"
+          },
+          {
+            "field": "isExtendable",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": true,
+            "actual": true
+          },
+          {
+            "field": "eligibility",
+            "type": "eligibility",
+            "weight": 2,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "offered a place by a licensed student sponsor (CAS)",
+              "enough money for course and living costs",
+              "knowledge of English",
+              "aged 16 or over",
+              "parental consent if 16 or 17"
+            ],
+            "actual": [
+              "You are 16 or over",
+              "You have been offered a place on a course by a licensed student sponsor",
+              "You have enough money to support yourself and pay for your course",
+              "You can speak, read, write and understand English",
+              "You have consent from your parents if you are 16 or 17"
+            ]
+          },
+          {
+            "field": "applicationUrlHost",
+            "type": "url",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk",
+            "actual": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/student_out_uk"
+          },
+          {
+            "field": "feeComponents",
+            "type": "fee",
+            "weight": 3,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "application 558 GBP per application",
+              "surcharge 776 GBP per year x1"
+            ],
+            "actual": [
+              "application 558 GBP per application",
+              "surcharge 776 GBP per year x1"
+            ]
+          }
+        ],
+        "feeMismatch": false,
+        "processingCitationProblems": [],
+        "notes": [],
+        "knownGaps": []
+      }
+    },
+    {
+      "route": "graduate-visa",
+      "sourceUrl": "https://www.gov.uk/graduate-visa",
+      "fixtureRecordedAt": "2026-11-09",
+      "sourceUpdatedAt": "2026-10-27T09:24:34+00:00",
+      "contentHash": "321ab2a60d19eb65fc6d103b11e8acebe83eddce4d358c3e4deb33ec2c28be82",
+      "sectionsUsed": [
+        "overview",
+        "course-you-studied",
+        "how-much-it-costs",
+        "documents-youll-need-to-apply",
+        "apply"
+      ],
+      "truncated": false,
+      "extracted": {
+        "name": "Graduate visa",
+        "code": "GRADUATE",
+        "description": "A Graduate visa allows you to stay in the UK for at least 18 months after successfully completing an eligible course in the UK. You must be in the UK when you apply and hold a Student visa or Tier 4 (General) student visa.",
+        "category": "work",
+        "processingTime": "8 weeks",
+        "processingDaysMin": 56,
+        "processingDaysMax": 56,
+        "feeComponents": [
+          {
+            "kind": "application",
+            "label": "Application fee",
+            "amount": 937,
+            "currency": "GBP",
+            "per": "application"
+          },
+          {
+            "kind": "surcharge",
+            "label": "Healthcare surcharge",
+            "amount": 1035,
+            "currency": "GBP",
+            "per": "year",
+            "years": 2
+          }
+        ],
+        "validityPeriod": "2 years",
+        "isExtendable": false,
+        "eligibilityCriteria": [
+          "You’re in the UK",
+          "Your current visa is a Student visa or Tier 4 (General) student visa",
+          "You studied a UK bachelor’s degree, postgraduate degree or other eligible course for a minimum period of time with your Student visa or Tier 4 (General) student visa",
+          "Your education provider has told the Home Office you’ve successfully completed your course"
+        ],
+        "applicationUrl": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/graduate_in_uk",
+        "applicationInstructions": "You must apply online for a Graduate visa. You must be in the UK when you apply. You’ll need to prove your identity and provide your documents. You must apply before your Student visa or Tier 4 (General) student visa expires.",
+        "confidence": 0.95,
+        "citations": {
+          "name": "A Graduate visa gives you permission to stay in the UK for at least 18 months after successfully completing an eligible course in the UK.",
+          "description": "A Graduate visa gives you permission to stay in the UK for at least 18 months after successfully completing an eligible course in the UK.",
+          "processingTime": "you’ll usually get a decision on your visa within 8 weeks",
+          "processingDaysMin": "you’ll usually get a decision on your visa within 8 weeks",
+          "processingDaysMax": "you’ll usually get a decision on your visa within 8 weeks",
+          "fee.application": "pay the £937 application fee",
+          "fee.surcharge": "pay the healthcare surcharge - this is usually £1,035 for each year you’ll be in the UK",
+          "fee.years": "2 years if you apply on or before 31 December 2026",
+          "validityPeriod": "2 years if you apply on or before 31 December 2026",
+          "isExtendable": "You cannot extend your Graduate visa.",
+          "eligibilityCriteria": "You can apply for a Graduate visa if all of the following are true: you’re in the UK; your current visa is a Student visa or Tier 4 (General) student visa; you studied a UK bachelor’s degree, postgraduate degree or other eligible course for a minimum period of time with your Student visa or Tier 4 (General) student visa; your education provider (such as your university or college) has told the Home Office you’ve successfully completed your course",
+          "applicationUrl": "Start now (https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/graduate_in_uk)",
+          "applicationInstructions": "You must apply online for a Graduate visa."
+        }
+      },
+      "score": {
+        "route": "graduate-visa",
+        "score": 1,
+        "weightedSum": 12,
+        "weightTotal": 12,
+        "fields": [
+          {
+            "field": "name",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "Graduate",
+            "actual": "Graduate visa"
+          },
+          {
+            "field": "category",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "work",
+            "actual": "work"
+          },
+          {
+            "field": "processingDaysMin",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "range": [
+                0,
+                56
+              ]
+            },
+            "actual": 56
+          },
+          {
+            "field": "processingDaysMax",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 56
+            },
+            "actual": 56
+          },
+          {
+            "field": "validityPeriod",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "2 year"
+            ],
+            "actual": "2 years"
+          },
+          {
+            "field": "isExtendable",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": false,
+            "actual": false
+          },
+          {
+            "field": "eligibility",
+            "type": "eligibility",
+            "weight": 2,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "be in the UK when you apply",
+              "currently on a Student / Tier 4 visa",
+              "completed an eligible UK course",
+              "education provider has told the Home Office"
+            ],
+            "actual": [
+              "You’re in the UK",
+              "Your current visa is a Student visa or Tier 4 (General) student visa",
+              "You studied a UK bachelor’s degree, postgraduate degree or other eligible course for a minimum period of time with your Student visa or Tier 4 (General) student visa",
+              "Your education provider has told the Home Office you’ve successfully completed your course"
+            ]
+          },
+          {
+            "field": "applicationUrlHost",
+            "type": "url",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk",
+            "actual": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/graduate_in_uk"
+          },
+          {
+            "field": "feeComponents",
+            "type": "fee",
+            "weight": 3,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "application 937 GBP per application",
+              "surcharge 1035 GBP per year x2"
+            ],
+            "actual": [
+              "application 937 GBP per application",
+              "surcharge 1035 GBP per year x2"
+            ]
+          }
+        ],
+        "feeMismatch": false,
+        "processingCitationProblems": [],
+        "notes": [],
+        "knownGaps": []
+      }
+    },
+    {
+      "route": "uk-family-visa",
+      "sourceUrl": "https://www.gov.uk/uk-family-visa",
+      "fixtureRecordedAt": "2026-11-09",
+      "sourceUpdatedAt": "2026-10-23T18:21:04+01:00",
+      "contentHash": "6f3da277cfa78093cbbc27dfb5e232ccb7997e8e3985af77408f91a9f3b6dd15",
+      "sectionsUsed": [
+        "overview",
+        "partner-spouse",
+        "proof-income-partner",
+        "provide-information",
+        "knowledge-of-english"
+      ],
+      "truncated": false,
+      "extracted": {
+        "name": "Family visa",
+        "code": "FAMILY",
+        "description": "A visa to live with a family member in the UK for more than 6 months, such as a spouse, partner, child, parent, or relative providing long-term care.",
+        "category": "family",
+        "processingTime": "8-12 weeks",
+        "processingDaysMin": 56,
+        "processingDaysMax": 84,
+        "feeComponents": [
+          {
+            "kind": "application",
+            "label": "Cost if joining your partner, parent or child",
+            "amount": 2064,
+            "currency": "GBP",
+            "per": "application"
+          },
+          {
+            "kind": "surcharge",
+            "label": "Healthcare surcharge for each adult",
+            "amount": 3105,
+            "currency": "GBP",
+            "per": "application"
+          }
+        ],
+        "validityPeriod": "2 years and 9 months",
+        "isExtendable": true,
+        "eligibilityCriteria": [
+          "You and your partner both need to be 18 or over (if applying as a partner).",
+          "Your partner must be a British or Irish citizen, have settled status, pre-settled status, or hold certain other statuses.",
+          "You must intend to live together permanently in the UK.",
+          "You must prove your relationship (e.g., marriage certificate, living together for at least 2 years).",
+          "You must have a good knowledge of English.",
+          "You must meet the financial requirements (minimum income of £29,000 per year unless exempt)."
+        ],
+        "applicationUrl": "https://visas-immigration.service.gov.uk/apply-visa-type/appendixfm",
+        "applicationInstructions": "You must apply online from outside the UK.",
+        "confidence": 0.9,
+        "citations": {
+          "processingDaysMin": "If you apply inside the UK and you meet the financial requirements and English language requirements, you’ll usually get a decision within 8 weeks.",
+          "processingDaysMax": "If you apply outside the UK you’ll usually get a decision within 12 weeks.",
+          "processingTime": "If you apply outside the UK you’ll usually get a decision within 12 weeks. / If you apply inside the UK and you meet the financial requirements and English language requirements, you’ll usually get a decision within 8 weeks.",
+          "fee.application": "Cost if joining your partner, parent or child £2,064",
+          "fee.surcharge": "£3,105 if you’re staying for 2 years and 9 months",
+          "validityPeriod": "You can stay in the UK for up to 2 years and 9 months.",
+          "isExtendable": "You can extend your visa more than once.",
+          "eligibilityCriteria": "To apply as a partner, you and your partner both need to be 18 or over. / Your partner must also either: be a British or Irish citizen / You and your partner must intend to live together permanently in the UK after you apply. / You must be able to prove one of the following: you’re in a civil partnership or marriage that’s recognised in the UK / You also need to prove you: have a good knowledge of English / meet the financial requirements / If you apply for a family visa as a partner, you and your partner usually need to prove that your combined income is at least £29,000 a year.",
+          "applicationUrl": "You must apply online from outside the UK (https://visas-immigration.service.gov.uk/apply-visa-type/appendixfm).",
+          "applicationInstructions": "You must apply online from outside the UK (https://visas-immigration.service.gov.uk/apply-visa-type/appendixfm)."
+        }
+      },
+      "score": {
+        "route": "uk-family-visa",
+        "score": 1,
+        "weightedSum": 12,
+        "weightTotal": 12,
+        "fields": [
+          {
+            "field": "name",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "Family",
+            "actual": "Family visa"
+          },
+          {
+            "field": "category",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "family",
+            "actual": "family"
+          },
+          {
+            "field": "processingDaysMin",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 56
+            },
+            "actual": 56
+          },
+          {
+            "field": "processingDaysMax",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 84
+            },
+            "actual": 84
+          },
+          {
+            "field": "validityPeriod",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "2 year",
+              "9 month"
+            ],
+            "actual": "2 years and 9 months"
+          },
+          {
+            "field": "isExtendable",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": true,
+            "actual": true
+          },
+          {
+            "field": "eligibility",
+            "type": "eligibility",
+            "weight": 2,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "you and your partner are both 18 or over",
+              "partner is British / Irish / settled (or another listed status)",
+              "genuine relationship (marriage / civil partnership / 2 years together / fiancé)",
+              "good knowledge of English",
+              "financial requirement (minimum income £29,000)",
+              "intend to live together permanently in the UK"
+            ],
+            "actual": [
+              "You and your partner both need to be 18 or over (if applying as a partner).",
+              "Your partner must be a British or Irish citizen, have settled status, pre-settled status, or hold certain other statuses.",
+              "You must intend to live together permanently in the UK.",
+              "You must prove your relationship (e.g., marriage certificate, living together for at least 2 years).",
+              "You must have a good knowledge of English.",
+              "You must meet the financial requirements (minimum income of £29,000 per year unless exempt)."
+            ]
+          },
+          {
+            "field": "applicationUrlHost",
+            "type": "url",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "visas-immigration.service.gov.uk",
+            "actual": "https://visas-immigration.service.gov.uk/apply-visa-type/appendixfm"
+          },
+          {
+            "field": "feeComponents",
+            "type": "fee",
+            "weight": 3,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "application 2064 GBP per application",
+              "surcharge 3105 GBP per application"
+            ],
+            "actual": [
+              "application 2064 GBP per application",
+              "surcharge 3105 GBP per application"
+            ]
+          }
+        ],
+        "feeMismatch": false,
+        "processingCitationProblems": [],
+        "notes": [],
+        "knownGaps": []
+      }
+    },
+    {
+      "route": "global-talent",
+      "sourceUrl": "https://www.gov.uk/global-talent",
+      "fixtureRecordedAt": "2026-11-09",
+      "sourceUpdatedAt": "2026-10-27T09:25:13+00:00",
+      "contentHash": "c87ab2d23fe25d58382dc241e49801a35dadc1024a109fa5d97584b13f605f6c",
+      "sectionsUsed": [
+        "overview",
+        "documents-youll-need-to-apply",
+        "apply-from-outside-the-uk",
+        "extend-your-visa"
+      ],
+      "truncated": false,
+      "extracted": {
+        "name": "Global Talent visa",
+        "code": "GLOBAL_TALENT",
+        "description": "A visa for leaders or potential leaders in academia or research, arts and culture, or digital technology to work in the UK. Applicants must be at least 18 years old and either have won an eligible prestigious prize or obtained an endorsement from a Home Office approved organisation.",
+        "category": "work",
+        "processingTime": "3-8 weeks",
+        "processingDaysMin": 21,
+        "processingDaysMax": 56,
+        "feeComponents": [
+          {
+            "kind": "application",
+            "label": "Application fee",
+            "amount": 766,
+            "currency": "GBP",
+            "per": "application"
+          },
+          {
+            "kind": "surcharge",
+            "label": "Healthcare surcharge",
+            "amount": 1035,
+            "currency": "GBP",
+            "per": "year",
+            "years": 5
+          }
+        ],
+        "validityPeriod": "up to 5 years",
+        "isExtendable": true,
+        "eligibilityCriteria": [
+          "You must be at least 18 years old.",
+          "You must be a leader or potential leader in academia or research, arts and culture, or digital technology.",
+          "If you have not won an eligible prestigious prize, you must obtain an endorsement from an organisation approved by the Home Office.",
+          "If applying based on an endorsement, you must apply within 3 months of receiving your endorsement letter.",
+          "The endorsing organisation must not have withdrawn its approval."
+        ],
+        "applicationUrl": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/global_talent_out_uk",
+        "applicationInstructions": "You must apply online. As part of your application, you'll need to prove your identity and provide your documents. You may need to attend an appointment at a visa application centre.",
+        "confidence": 0.95,
+        "citations": {
+          "name": "Global Talent visa",
+          "description": "You can apply for a Global Talent visa to work in the UK if you’re a leader or potential leader in one of the following fields: academia or research, arts and culture, digital technology.",
+          "category": "work in the UK",
+          "processingTime": "3 weeks, if you’re outside the UK / 8 weeks, if you’re inside the UK",
+          "processingDaysMin": "3 weeks, if you’re outside the UK",
+          "processingDaysMax": "8 weeks, if you’re inside the UK",
+          "fee.application": "It costs £766 to apply.",
+          "fee.surcharge": "this is usually £1,035 per year for each person applying",
+          "fee.years": "You can live and work in the UK for up to 5 years at a time.",
+          "validityPeriod": "You can live and work in the UK for up to 5 years at a time.",
+          "isExtendable": "There’s no limit to how long you can stay in the UK in total, but you will need to renew (‘extend’) your visa when it expires.",
+          "eligibilityCriteria": "You must also be at least 18 years old. / you’ll need to get an endorsement first to prove that you’re a leader or potential leader in your field. / you’re applying within 3 months of receiving your endorsement letter / the organisation that endorsed you has not withdrawn its approval",
+          "applicationUrl": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/global_talent_out_uk",
+          "applicationInstructions": "You must apply online. / As part of your application, you’ll need to prove your identity and provide your documents."
+        }
+      },
+      "score": {
+        "route": "global-talent",
+        "score": 1,
+        "weightedSum": 12,
+        "weightTotal": 12,
+        "fields": [
+          {
+            "field": "name",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "Global Talent",
+            "actual": "Global Talent visa"
+          },
+          {
+            "field": "category",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "work",
+            "actual": "work"
+          },
+          {
+            "field": "processingDaysMin",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 21
+            },
+            "actual": 21
+          },
+          {
+            "field": "processingDaysMax",
+            "type": "numeric",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": {
+              "value": 56
+            },
+            "actual": 56
+          },
+          {
+            "field": "validityPeriod",
+            "type": "text",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "5 year"
+            ],
+            "actual": "up to 5 years"
+          },
+          {
+            "field": "isExtendable",
+            "type": "exact",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": true,
+            "actual": true
+          },
+          {
+            "field": "eligibility",
+            "type": "eligibility",
+            "weight": 2,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "leader or potential leader in your field",
+              "endorsement or an eligible prestigious prize",
+              "field: academia/research, arts and culture or digital technology",
+              "at least 18 years old"
+            ],
+            "actual": [
+              "You must be at least 18 years old.",
+              "You must be a leader or potential leader in academia or research, arts and culture, or digital technology.",
+              "If you have not won an eligible prestigious prize, you must obtain an endorsement from an organisation approved by the Home Office.",
+              "If applying based on an endorsement, you must apply within 3 months of receiving your endorsement letter.",
+              "The endorsing organisation must not have withdrawn its approval."
+            ]
+          },
+          {
+            "field": "applicationUrlHost",
+            "type": "url",
+            "weight": 1,
+            "score": 1,
+            "pass": true,
+            "expected": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk",
+            "actual": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/global_talent_out_uk"
+          },
+          {
+            "field": "feeComponents",
+            "type": "fee",
+            "weight": 3,
+            "score": 1,
+            "pass": true,
+            "expected": [
+              "application 766 GBP per application",
+              "surcharge 1035 GBP per year x5"
+            ],
+            "actual": [
+              "application 766 GBP per application",
+              "surcharge 1035 GBP per year x5"
+            ]
+          }
+        ],
+        "feeMismatch": false,
+        "processingCitationProblems": [],
+        "notes": [],
+        "knownGaps": []
+      }
+    }
+  ],
+  "fieldTypeScores": {
+    "text": 1,
+    "exact": 1,
+    "numeric": 1,
+    "eligibility": 1,
+    "url": 1,
+    "fee": 1
+  },
+  "fieldScores": {
+    "name": 1,
+    "category": 1,
+    "processingDaysMin": 1,
+    "processingDaysMax": 1,
+    "validityPeriod": 1,
+    "isExtendable": 1,
+    "eligibility": 1,
+    "applicationUrlHost": 1,
+    "feeComponents": 1
+  },
+  "overall": 1,
+  "pass": true,
+  "failures": []
+}
