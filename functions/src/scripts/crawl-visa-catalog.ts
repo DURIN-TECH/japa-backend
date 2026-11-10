@@ -174,6 +174,8 @@ async function main() {
     updated: 0,
     unchanged: 0,
     skipped: 0,
+    // Approved scraped visa whose page changed → pendingVisaChanges row (issue #61).
+    proposed: 0,
     withdrawn: 0,
     errors: 0,
     deferred: 0, // pages skipped: host backed off (issue #64)
@@ -296,10 +298,12 @@ async function main() {
 
   console.log(
     `\nDone. fetched ${totals.fetched} | created ${totals.created} | updated ${totals.updated} | ` +
-      `unchanged ${totals.unchanged} | skipped ${totals.skipped} | withdrawn ${totals.withdrawn} | ` +
-      `errors ${totals.errors} | host backed off ${totals.deferred}`
+      `unchanged ${totals.unchanged} | skipped ${totals.skipped} | proposed ${totals.proposed} | ` +
+      `withdrawn ${totals.withdrawn} | errors ${totals.errors} | host backed off ${totals.deferred}`
   );
   console.log("Review pending scraped visas at: admin → Visa Review (filter source=scraped).");
+  // Proposed edits to approved visas have no portal UI yet (follow-up issue).
+  if (totals.proposed > 0) console.log("Proposed edits to approved visas: GET /admin/visa-changes?status=open");
   process.exit(0);
 }
 

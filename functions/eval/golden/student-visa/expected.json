@@ -1,0 +1,124 @@
+{
+  "route": "student-visa",
+  "sourceUrl": "https://www.gov.uk/student-visa",
+  "fixtureRecordedAt": "2026-11-09",
+  "draftedBy": "ai-team software-engineer, from guide.json only (not from seed data), 2026-11-09",
+  "verifiedBy": "wrightkhlebisol",
+  "verifiedOn": "2026-11-09",
+  "notes": [
+    "QA checked all fields vs live Content API 2026-11-09; user spot-checked fee lines",
+    "Fee rule (#59): application fee £558 from outside the UK. The guide prints no IHS amount ('How much you pay depends on how long your visa lasts', amount on a linked page) -> known gap #69, expected fees = application fee only.",
+    "validityPeriod: variable; the longest standard stay printed is 'up to 5 years' (degree level, 18 or over).",
+    "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK decision time (3 weeks), max = inside-UK decision time (8 weeks)."
+  ],
+  "name": {
+    "value": "Student",
+    "source": "You can apply for a Student visa to study in the UK if you’re 16 or over"
+  },
+  "category": {
+    "value": "student",
+    "source": "You can apply for a Student visa to study in the UK if you’re 16 or over"
+  },
+  "processingDaysMin": {
+    "value": 21,
+    "source": "3 weeks, if you’re outside the UK"
+  },
+  "processingDaysMax": {
+    "value": 56,
+    "source": "8 weeks, if you’re inside the UK"
+  },
+  "validityPeriod": {
+    "durations": [
+      {
+        "amount": 5,
+        "unit": "year"
+      }
+    ],
+    "source": "If you’re 18 or over and your course is at degree level, you can usually stay in the UK for up to 5 years."
+  },
+  "isExtendable": {
+    "value": true,
+    "source": "You may be able to extend your Student visa to stay longer and continue your course or study a new course."
+  },
+  "eligibility": {
+    "themes": [
+      {
+        "theme": "offered a place by a licensed student sponsor (CAS)",
+        "anyOf": [
+          "licensed student sponsor",
+          "licensed sponsor",
+          "student sponsor",
+          "confirmation of acceptance for studies",
+          "cas",
+          "unconditional offer",
+          "offer of a place",
+          "offered a place"
+        ],
+        "source": "have been offered a place on a course by a licensed student sponsor"
+      },
+      {
+        "theme": "enough money for course and living costs",
+        "anyOf": [
+          "enough money",
+          "sufficient funds",
+          "financial requirement",
+          "support yourself",
+          "maintenance funds",
+          "course fees",
+          "living costs",
+          "pay for your course"
+        ],
+        "source": "have enough money to support yourself and pay for your course - the amount will vary depending on your circumstances"
+      },
+      {
+        "theme": "knowledge of English",
+        "anyOf": [
+          "english"
+        ],
+        "source": "can speak, read, write and understand English"
+      },
+      {
+        "theme": "aged 16 or over",
+        "anyOf": [
+          "16 or over",
+          "16 or older",
+          "aged 16",
+          "at least 16",
+          "over 16"
+        ],
+        "source": "You can apply for a Student visa to study in the UK if you’re 16 or over"
+      },
+      {
+        "theme": "parental consent if 16 or 17",
+        "anyOf": [
+          "consent",
+          "parental consent",
+          "consent from your parents"
+        ],
+        "source": "have consent from your parents if you’re 16 or 17 - you’ll need evidence of this when you apply"
+      }
+    ]
+  },
+  "applicationUrlHost": {
+    "value": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk",
+    "source": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/student_out_uk"
+  },
+  "feeComponents": {
+    "components": [
+      {
+        "kind": "application",
+        "amount": 558,
+        "currency": "GBP",
+        "per": "application",
+        "source": "£558 to apply for a Student visa from outside the UK"
+      }
+    ]
+  },
+  "knownGaps": [
+    {
+      "field": "feeComponents",
+      "ref": "#69",
+      "note": "IHS is on a linked page"
+    }
+  ]
+}

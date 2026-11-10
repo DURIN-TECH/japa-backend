@@ -16,6 +16,10 @@ import {
   mergePageCrawlState,
   pickSourceCrawlState,
 } from "../services/visa-catalog-ids";
+// Registry official hosts (issue #74) — lives in a pure services module so the
+// adapters + validator can read it without importing this seed file.
+import { VISA_SOURCE_OFFICIAL_HOSTS } from "../services/visa-catalog-official-hosts";
+export { VISA_SOURCE_OFFICIAL_HOSTS };
 
 // NOTE: the Firestore handle is resolved LAZILY inside seedVisaSources() (not at
 // module load), so this module can be imported without Firebase Admin init —
@@ -326,11 +330,13 @@ export function buildSeededVisaSource(params: {
   adapters?: Record<string, SourceAdapterId>;
   // Registry-owned night windows; defaults to VISA_SOURCE_WINDOWS.
   windows?: Record<string, CrawlWindow>;
+  officialHosts?: Record<string, readonly string[]>;
 }): { doc: Record<string, unknown>; matchedUrls: Set<string> } {
   const { country: c, existing, now } = params;
   const overrides = params.overrides ?? VISA_SOURCE_OVERRIDES;
   const adapters = params.adapters ?? VISA_SOURCE_ADAPTERS;
   const windows = params.windows ?? VISA_SOURCE_WINDOWS;
+  const officialHostMap = params.officialHosts ?? VISA_SOURCE_OFFICIAL_HOSTS;
 
   // 1. Seed-owned page fields: markdown rows + pinned identity/sections.
   const pinned = applyVisaSourcePins(c.pages, overrides);
@@ -340,6 +346,8 @@ export function buildSeededVisaSource(params: {
 
   // 3. Registry-owned adapter (absent → field omitted → generic-html default).
   const adapter = adapters[c.countryCode];
+  // 3a. Registry-owned official hosts (#74); absent → field omitted.
+  const officialHosts = officialHostMap[c.countryCode];
 
   // 3b. Registry-owned night window (absent → field omitted → legacy
   //     interval scheduling). Validated here so a typo in the map fails the
@@ -358,6 +366,7 @@ export function buildSeededVisaSource(params: {
     pages,
     ...(adapter ? { adapter } : {}),
     ...(crawlWindow ? { crawlWindow } : {}),
+    ...(officialHosts && officialHosts.length ? { officialHosts: [...officialHosts] } : {}),
     crawlIntervalHours: CRAWL_INTERVAL_HOURS,
     // A brand-new country with a window waits for its night: first
     // nextCrawlAt = its next window opening (operators use the manual

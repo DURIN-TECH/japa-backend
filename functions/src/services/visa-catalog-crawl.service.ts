@@ -19,6 +19,8 @@ import {
 } from "./visa-crawl-host-state";
 // Firestore <-> helper mappers for `hostBackoffs`, shared with the manual script.
 import { hostBackoffEntriesFromSource, hostBackoffEntriesToSource } from "./visa-crawl-host-backoff-store";
+// Code fallback for a registry doc seeded before `officialHosts` existed (#74).
+import { resolveOfficialHosts } from "./visa-catalog-official-hosts";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -72,7 +74,10 @@ export interface CrawlSummary {
   pagesChanged: number; // content hash differed → sent to extraction
   created: number; // new pending-review scraped visas written
   updated: number; // existing pending scraped visas refreshed
-  skipped: number; // existing approved/agent visa left untouched
+  skipped: number; // seeded/agent/rejected/withdrawn visa left untouched
+  // Approved scraped visa whose page changed: a pendingVisaChanges row was
+  // written / replaced for an admin (issue #61). Not counted in `skipped`.
+  proposed: number;
   withdrawn: number; // source said withdrawn → no extraction (scraped doc deactivated if present)
   errors: number;
   // FX (issue #59): whether appConfig/fx was refreshed this run, and how many
@@ -125,6 +130,7 @@ class VisaCatalogCrawlService {
       created: 0,
       updated: 0,
       skipped: 0,
+      proposed: 0,
       withdrawn: 0,
       errors: 0,
       fxRefreshed: false,
@@ -296,6 +302,10 @@ class VisaCatalogCrawlService {
             url: page.url,
             countryName: source.countryName,
             routeName: page.routeName,
+            // Registry official hosts gate `applicationUrl` (issue #74). The
+            // stored field wins only when it is a non-empty string array; a doc
+            // seeded before #74 (or a malformed field) falls back to code.
+            officialHosts: resolveOfficialHosts(source.officialHosts, source.countryCode),
           });
           pages[i] = { ...pages[i], lastExtractedAt: now };
 
@@ -318,6 +328,7 @@ class VisaCatalogCrawlService {
           if (outcome === "created") summary.created++;
           else if (outcome === "updated") summary.updated++;
           else if (outcome === "skipped") summary.skipped++;
+          else if (outcome === "proposed") summary.proposed++;
           if (outcome !== "unchanged") ingested++;
         } catch (err) {
           pageErrors++;

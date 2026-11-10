@@ -10,7 +10,8 @@ import {
   VisaCategory,
   RequiredDocument,
 } from "../types";
-import { Timestamp } from "firebase-admin/firestore";
+// FieldValue.delete() clears `staleSince` on approval (issue #62).
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 // Approval guard for visas with no usable USD cost (issue #59).
 import { assertVisaApprovable } from "./visa-catalog-fx";
 // Finite-only min for the denormalized country stats.
@@ -110,6 +111,16 @@ class VisaService {
 
   /**
    * Update country stats (called after visa type changes)
+   *
+   * The ONE canonical recompute of a country's denormalized
+   * `visaTypesCount` / `minCostUsd` / `minProcessingDays` from its ACTIVE
+   * visas (issue #62 deleted the catalog-side duplicate). Callers: the
+   * `onVisaTypeUpdated` trigger, createVisaType / updateVisaType,
+   * updateVisaReviewStatus (approve/reject) and
+   * visaCatalogService.markWithdrawn. Uses update(), so a missing country
+   * doc throws rather than creating a stub country.
+   *
+   * @param countryCode the country doc id (upper-case code)
    */
   async updateCountryStats(countryCode: string): Promise<void> {
     const visaTypes = await this.getVisaTypesByCountry(countryCode);
@@ -480,10 +491,45 @@ class VisaService {
   /**
    * Update visa review status (admin only)
    *
+   * Called by `PATCH /admin/visas/:id/review` (visaController.reviewVisa).
+   *
    * Approval guard (issue #59): `approve` throws VisaFeeNotConvertibleError
    * (controller → 409) for a scraped visa whose fee is flagged fxStale /
    * fxMissing, or any visa without a finite `baseCostUsd`. Nothing is written
-   * in that case. `reject` is never blocked.
+   * in that case (no review fields, no lastVerifiedAt, no staleSince change,
+   * no stats recompute). `reject` is never blocked.
+   *
+   * Catalog consistency (issue #62), all in the SAME `update()` as the review
+   * status so the visa never shows a half-applied review:
+   *  - approve → `isActive: true`; `lastVerifiedAt` (server timestamp) ONLY
+   *    for `source: "scraped"` (per its type comment, "when an agent last
+   *    approved a scraped update" — agent/seeded visas never get it); and a
+   *    `staleSince` marker (set by the crawl when the source was withdrawn) is
+   *    removed with FieldValue.delete(). A visa without `staleSince` gets no
+   *    `staleSince` write at all.
+   *  - reject of a LIVE visa (`isActive: true`, e.g. an agent-created visa or
+   *    a previously approved one) → `isActive: false`, so it leaves the app.
+   *    A visa that is already inactive (a pending scraped visa) only gets the
+   *    review fields.
+   *
+   * Country stats: when the write changes (or may change) the set of active
+   * visas — every approve, and a reject that deactivated a live visa — the
+   * country's `visaTypesCount` / `minCostUsd` / `minProcessingDays` are
+   * recomputed with `updateCountryStats` BEFORE returning, so the response
+   * and any read right after are consistent. (The `onVisaTypeUpdated`
+   * trigger also recomputes asynchronously; it stays as the safety net for
+   * every other write path.) A failing recompute is logged and swallowed:
+   * the review itself is already committed and the trigger reconciles, so a
+   * stats error must not turn a successful review into a 500.
+   *
+   * @param countryCode   country of the visa (any case; upper-cased here)
+   * @param visaTypeId    visa doc id under `countries/{cc}/visaTypes`
+   * @param action        "approve" | "reject"
+   * @param reviewedBy    uid of the reviewing admin
+   * @param rejectionReason reason stored on reject (controller requires it)
+   * @returns the visa as stored after the review
+   * @throws Error("Visa type not found") for an unknown id (controller → 404);
+   *         nothing is written and no recompute is attempted
    */
   async updateVisaReviewStatus(
     countryCode: string,
@@ -492,20 +538,25 @@ class VisaService {
     reviewedBy: string,
     rejectionReason?: string
   ): Promise<VisaType> {
-    const visaTypeRef = subcollections
-      .visaTypes(countryCode.toUpperCase())
-      .doc(visaTypeId);
+    // Country docs are keyed by the upper-case code; use it for the visa ref
+    // AND the stats recompute so both hit the same country.
+    const cc = countryCode.toUpperCase();
+    const visaTypeRef = subcollections.visaTypes(cc).doc(visaTypeId);
 
     const doc = await visaTypeRef.get();
     if (!doc.exists) {
       throw new Error("Visa type not found");
     }
+    // The visa as it is BEFORE this review: drives which extra fields we
+    // write (source, staleSince) and whether stats can change (isActive).
+    const current = doc.data() as VisaType;
 
     // Refuse to publish a visa with no usable USD cost (throws, no write).
     if (action === "approve") {
-      assertVisaApprovable(doc.data() as VisaType);
+      assertVisaApprovable(current);
     }
 
+    // ---- Review fields (both actions) ----
     const updates: Record<string, unknown> = {
       reviewStatus: action === "approve" ? "approved" : "rejected",
       reviewedBy,
@@ -517,11 +568,50 @@ class VisaService {
       updates.rejectionReason = rejectionReason;
     }
 
+    // Whether this review can change the country's active-visa set (and so
+    // its denormalized stats). Approve always can (it activates; re-approving
+    // an active visa just recomputes the same values). Reject only when the
+    // visa was live — rejecting an already inactive visa changes nothing.
+    let statsAffected = false;
+
     if (action === "approve") {
+      // ---- Approve: publish + provenance + clear the stale marker ----
       updates.isActive = true;
+      // Only scraped visas carry verification provenance. Re-approving an
+      // approved scraped visa refreshes it (idempotent otherwise).
+      if (current.source === "scraped") {
+        updates.lastVerifiedAt = serverTimestamp();
+      }
+      // A human approval is the reactivation step for a withdrawn-at-source
+      // visa, so the crawl's `staleSince` marker goes. Only written when the
+      // field exists, so a normal approval writes no `staleSince` at all.
+      if (current.staleSince !== undefined) {
+        updates.staleSince = FieldValue.delete();
+      }
+      statsAffected = true;
+    } else if (current.isActive === true) {
+      // ---- Reject a LIVE visa: take it off the app ----
+      // (Strict `=== true`, matching getVisaTypesByCountry's
+      // `isActive == true` filter: a doc without the flag isn't counted in
+      // the stats, so rejecting it changes nothing.)
+      updates.isActive = false;
+      statsAffected = true;
     }
 
     await visaTypeRef.update(updates);
+
+    // ---- Recompute country stats before responding ----
+    if (statsAffected) {
+      try {
+        await this.updateCountryStats(cc);
+      } catch (error) {
+        // Review already committed; the onVisaTypeUpdated trigger reconciles.
+        console.error(
+          `Visa ${action} of ${cc}/${visaTypeId} succeeded but the country stats recompute failed:`,
+          error
+        );
+      }
+    }
 
     const updated = await visaTypeRef.get();
     return { id: updated.id, ...updated.data() } as VisaType;
