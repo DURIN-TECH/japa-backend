@@ -212,7 +212,9 @@ export class NewsScraperService {
     this.clock = options.clock ?? Date.now;
     this.store = options.store ?? newsService;
     this.runs = options.runs ?? scrapeRunService;
-    this.loadSettings = options.loadSettings ?? loadScraperSettings;
+    // A wrapper (not the bare import): the singleton is built at module load,
+    // and the binding must be read at call time (scrapers/index.ts cycle).
+    this.loadSettings = options.loadSettings ?? (() => loadScraperSettings());
     this.fetcher = new VisaCatalogFetchService({
       http: options.http ?? createNewsHttpClient(),
       minIntervalMs: options.minIntervalMs,

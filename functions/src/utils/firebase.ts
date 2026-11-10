@@ -147,6 +147,17 @@ export const collections = {
   // hook), read via /admin/scrape-costs and by #83's budget alert.
   // Backend-only: no firestore.rules match.
   scrapeCosts: db.collection("scrapeCosts"),
+  // ---- Scraper settings + manual runs (issue #96). All backend-only: no
+  // firestore.rules match -> clients denied; admins go through the API. ----
+  // Audit trail of admin edits to the scraper settings and per-source
+  // controls: one doc per change set (who, when, target, field diff).
+  scraperSettingsHistory: db.collection("scraperSettingsHistory"),
+  // Manual "Run now" requests: written by the admin API, processed by the
+  // onCreate function processScrapeRunRequest. TTL 30 days (`expireAt`).
+  scrapeRunRequests: db.collection("scrapeRunRequests"),
+  // One lock doc per source / whole scraper (`{kind}__{sourceId|_all}`):
+  // the in-flight request + cooldown start, claimed in a transaction.
+  scrapeRunLocks: db.collection("scrapeRunLocks"),
 } as const;
 
 // Helper to get subcollection references

@@ -228,6 +228,21 @@ export const NEWS_SOURCES: NewsSourceSeed[] = [
 ];
 
 /**
+ * The status a re-seed writes for one news source (issue #96, pure): the
+ * seed's own status, unless an admin set one (`adminOverrides.status` on the
+ * stored doc) — then the stored status is kept, so an admin pause / retire
+ * is never undone by a deploy. `adminOverrides` itself is not written by the
+ * seed (merge: true), so it stays as it was.
+ */
+export function newsSeedStatus(seedStatus: SourceStatus, existing: Record<string, unknown> | undefined): SourceStatus {
+  const overrides = existing?.adminOverrides as { status?: unknown } | undefined;
+  if (overrides && typeof overrides.status === "string" && typeof existing?.status === "string") {
+    return existing.status as SourceStatus;
+  }
+  return seedStatus;
+}
+
+/**
  * Seed the `newsSources` collection from the static NEWS_SOURCES list above.
  *
  * Moved here (out of scripts/seed-all.ts) so news-source seeding lives next to
@@ -250,9 +265,16 @@ export async function seedNewsSources(): Promise<number> {
   const batch = db.batch();
   const now = Timestamp.now();
 
-  for (const source of NEWS_SOURCES) {
+  // Issue #96: read the existing docs (one round trip) so an admin's status
+  // edit (`adminOverrides`, set through PATCH /admin/scrape-sources/news/:id)
+  // survives the re-seed. getAll() on zero refs would throw, hence the guard.
+  const refs = NEWS_SOURCES.map((s) => collection.doc(s.slug));
+  const snaps = refs.length ? await db.getAll(...refs) : [];
+
+  NEWS_SOURCES.forEach((source, idx) => {
     // Use the slug as the deterministic doc ID so re-running is idempotent.
-    const ref = collection.doc(source.slug);
+    const ref = refs[idx];
+    const existing = snaps[idx]?.exists ? (snaps[idx].data() as Record<string, unknown>) : undefined;
     batch.set(
       ref,
       {
@@ -266,7 +288,7 @@ export async function seedNewsSources(): Promise<number> {
         scrapeIntervalMinutes: source.scrapeIntervalMinutes,
         // Due immediately on first run so the scraper picks it up right away.
         nextScrapeAt: now,
-        status: source.status,
+        status: newsSeedStatus(source.status, existing),
         reliabilityScore: 100,
         consecutiveFailures: 0,
         totalRuns: 0,
@@ -278,7 +300,7 @@ export async function seedNewsSources(): Promise<number> {
       },
       { merge: true }
     );
-  }
+  });
 
   await batch.commit();
   console.log(`✅ Seeded ${NEWS_SOURCES.length} news sources`);
