@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ACTIVE_SUBSCRIPTION_STATUSES = exports.SUBSCRIBER_ROLES = exports.AGENT_SIDE_ROLES = exports.ROLES = void 0;
+exports.ACTIVE_SUBSCRIPTION_STATUSES = exports.VISA_PROTECTED_FIELDS = exports.AGENCY_VISA_ACTIONS = exports.AGENCY_VISA_SOURCE = exports.SUBSCRIBER_ROLES = exports.AGENT_SIDE_ROLES = exports.ROLES = void 0;
 exports.hasFeature = hasFeature;
 exports.getLimit = getLimit;
 exports.isWithinLimit = isWithinLimit;
@@ -24,6 +24,41 @@ exports.ROLES = {
 exports.AGENT_SIDE_ROLES = [exports.ROLES.ADMIN, exports.ROLES.OWNER, exports.ROLES.AGENT];
 /** Roles that can hold/manage a subscription directly (admins are unlimited). */
 exports.SUBSCRIBER_ROLES = [exports.ROLES.OWNER, exports.ROLES.AGENT, exports.ROLES.CLIENT];
+/**
+ * The `VisaType.source` value that marks a visa created by an agency (#98,
+ * field added to the backend type in #99). Agency-role `Visa` grants only
+ * match documents carrying this source. Use this constant instead of the
+ * `"agency"` literal.
+ */
+exports.AGENCY_VISA_SOURCE = "agency";
+/**
+ * The actions agency roles (owner, agent) hold on their own agency's visas.
+ * Approve/reject are deliberately absent: review stays admin-only.
+ */
+exports.AGENCY_VISA_ACTIONS = ["create", "read", "update", "delete"];
+/**
+ * `Visa` document fields that only admins (or the server itself) may write.
+ * Owner and agent hold field-level `cannot("update", "Visa", ...)` rules on
+ * every one of these, so they can edit a visa's content (name, requirements,
+ * fees, sponsor, ...) but never its review state, visibility (make-global),
+ * activation or ownership. On create the backend sets these fields itself
+ * rather than taking them from the request body.
+ */
+exports.VISA_PROTECTED_FIELDS = [
+    // Review state: set only by the admin approve/reject flow (#101).
+    "reviewStatus",
+    "reviewedBy",
+    "reviewedAt",
+    "rejectionReason",
+    // Visibility: "agency" | "global"; flipping it is the admin make-global action.
+    "visibility",
+    // Activation: a visa goes live only through review.
+    "isActive",
+    // Ownership + provenance: fixed at creation, never reassignable by agencies.
+    "ownerAgencyId",
+    "createdBy",
+    "source",
+];
 /** Statuses that grant access to a plan's features. */
 exports.ACTIVE_SUBSCRIPTION_STATUSES = ["active", "trialing"];
 /** True if the entitlements are in an access-granting state and include `key`. */
