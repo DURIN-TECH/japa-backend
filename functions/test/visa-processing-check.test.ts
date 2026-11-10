@@ -19,12 +19,16 @@ import { Timestamp } from "firebase-admin/firestore";
 
 import {
   checkProcessingRangeCitations,
-  citedProcessingDurations,
+  isProcessingCitationKey,
+  parseNumberToken,
   processingDurationsInDays,
+  relevantProcessingQuotes,
   PROCESSING_UNVERIFIED_CONFIDENCE_CAP,
 } from "../src/services/visa-catalog-processing-check";
 import { buildSystemPrompt, validateExtractedVisa } from "../src/services/visa-catalog-extract.service";
 import { buildScrapeMeta } from "../src/services/visa-catalog-meta";
+import { readFileSync } from "fs";
+import * as path from "path";
 
 // The two Standard Visitor sentences (eval/golden/standard-visitor/guide.json).
 const OUTSIDE_3_WEEKS = "you’ll usually get a decision on your visa within 3 weeks.";
@@ -86,11 +90,94 @@ describe("processingDurationsInDays", () => {
     assert.deepEqual(processingDurationsInDays("several weeks"), []);
   });
 
-  test("the union of processingTime / Min / Max citations is used", () => {
-    assert.deepEqual(
-      citedProcessingDurations({ processingTime: "3-8 weeks", processingDaysMax: "within 12 weeks", other: "5 years" }),
-      [21, 56, 84]
-    );
+  // Review round 1 (#87): phrasing the first parser missed, one row each.
+  // [phrase, expected days]
+  const TABLE: [string, number[]][] = [
+    // qualifier word between number and unit
+    ["within 15 calendar days", [15]],
+    ["within 15 calendar days … extended to 45 days", [15, 45]],
+    ["10 working days", [10, 14]], // plain count + calendar equivalent (x 7/5)
+    ["10 business days", [10, 14]],
+    ["3 full weeks", [21]],
+    // "and" / "or" range separators
+    ["between 2 and 4 months", [60, 120]],
+    ["between one and three months", [30, 90]],
+    ["2 or 3 weeks", [14, 21]],
+    // number words: tens, hyphenated and spaced compounds (never a range)
+    ["forty-five days", [45]],
+    ["twenty-one days", [21]],
+    ["twenty one days", [21]],
+    ["sixty days", [60]],
+    ["ninety days", [90]],
+    ["eighteen weeks", [126]], // a teen is not read as its unit ("eight")
+    ["seventy days", [70]],
+    // "a" / "an" = 1
+    ["within a month", [30]],
+    ["about a week", [7]],
+    // abbreviations
+    ["1-2 wks", [7, 14]],
+    ["2 wk", [14]],
+    ["3 mos", [90]],
+    ["6 mths", [180]],
+    ["24 hrs", [1]],
+    ["1 yr", [365]],
+    // a compound stay length stays two durations, not a 2-9 month range
+    ["2 years and 9 months", [730, 270]],
+    // non-English: nothing parses (the check then fails safe)
+    ["15 jours", []],
+    ["drei Wochen", []],
+    ["10 días hábiles", []],
+  ];
+  for (const [phrase, days] of TABLE) {
+    test(`parses ${JSON.stringify(phrase)} -> [${days.join(", ")}]`, () => {
+      assert.deepEqual(processingDurationsInDays(phrase), days);
+    });
+  }
+
+  test("parseNumberToken: digits, words, compounds, a/an; unknown words are not numbers", () => {
+    assert.equal(parseNumberToken("45"), 45);
+    assert.equal(parseNumberToken("forty-five"), 45);
+    assert.equal(parseNumberToken("ninety"), 90);
+    assert.equal(parseNumberToken("an"), 1);
+    assert.equal(parseNumberToken("several"), undefined);
+    assert.equal(parseNumberToken("forty-several"), undefined);
+  });
+});
+
+// ----- Citation keys -----
+
+describe("processing citation keys (prefix match)", () => {
+  test("suffixed keys count; other keys do not", () => {
+    for (const k of ["processingTime", "processingTime.inside", "processingDaysMin", "processingDaysMax.outside"]) {
+      assert.equal(isProcessingCitationKey(k), true, k);
+    }
+    for (const k of ["fee.application", "validityPeriod", "eligibilityCriteria"]) {
+      assert.equal(isProcessingCitationKey(k), false, k);
+    }
+  });
+
+  test("a field's relevant quotes = processingTime* plus its own processingDays<Field>*", () => {
+    const c = {
+      processingTime: "3-8 weeks",
+      "processingTime.inside": "within 8 weeks",
+      "processingDaysMax.outside": "within 12 weeks",
+      processingDaysMin: "within 3 weeks",
+      validityPeriod: "5 years",
+    };
+    assert.deepEqual(relevantProcessingQuotes(c, "processingDaysMax"), ["3-8 weeks", "within 8 weeks", "within 12 weeks"]);
+    assert.deepEqual(relevantProcessingQuotes(c, "processingDaysMin"), ["3-8 weeks", "within 8 weeks", "within 3 weeks"]);
+  });
+
+  test("real v4 Standard Visitor output (8 weeks cited only as processingTime.inside) is NOT flagged", () => {
+    // eval/results/2026-11-surcharge-total-v4__deepseek-chat__20261109T214642Z.json
+    const file = path.join(__dirname, "..", "eval", "results", "2026-11-surcharge-total-v4__deepseek-chat__20261109T214642Z.json");
+    const res = JSON.parse(readFileSync(file, "utf8")) as {
+      routes: { route: string; extracted: { processingDaysMin: number; processingDaysMax: number; citations: Record<string, string> } }[];
+    };
+    const visitor = res.routes.find((r) => r.route === "standard-visitor");
+    assert.ok(visitor);
+    assert.ok("processingTime.inside" in visitor.extracted.citations);
+    assert.deepEqual(checkProcessingRangeCitations(visitor.extracted, visitor.extracted.citations), []);
   });
 });
 
@@ -120,6 +207,34 @@ describe("checkProcessingRangeCitations", () => {
     assert.equal(at(68).length, 1);
     // Tiny figures get a 1-day floor: 2 days vs "1 day" agrees.
     assert.deepEqual(checkProcessingRangeCitations({ processingDaysMax: 2 }, { processingTime: "1 day" }), []);
+  });
+
+  test("fail-safe: one relevant quote with no parsable duration -> that field is not judged", () => {
+    // Non-English quote next to an English one: the max would otherwise be flagged.
+    assert.deepEqual(
+      checkProcessingRangeCitations(
+        { processingDaysMin: 15, processingDaysMax: 45 },
+        { processingTime: "within 15 calendar days", "processingTime.extended": "jusqu'à 45 jours" }
+      ),
+      []
+    );
+    // Only the field whose relevant quotes are all parsable is judged:
+    // processingDaysMax.note is relevant to the max only.
+    const reasons = checkProcessingRangeCitations(
+      { processingDaysMin: 5, processingDaysMax: 99 },
+      { processingTime: "within 3 weeks", "processingDaysMax.note": "voir le site" }
+    );
+    assert.deepEqual(reasons, ["processingDaysMin 5 is more than 20% from every cited duration (21 days)"]);
+  });
+
+  test("review phrasings agree with correct values (no false flags)", () => {
+    const ok = (min: number, max: number, quote: string) =>
+      assert.deepEqual(checkProcessingRangeCitations({ processingDaysMin: min, processingDaysMax: max }, { processingTime: quote }), [], quote);
+    ok(15, 45, "within 15 calendar days, which may be extended to 45 days");
+    ok(60, 120, "between 2 and 4 months");
+    ok(30, 90, "between one and three months");
+    ok(14, 21, "2 or 3 weeks");
+    ok(45, 45, "forty-five days");
   });
 
   test("checks the min too", () => {

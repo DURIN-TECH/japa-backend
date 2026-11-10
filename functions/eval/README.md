@@ -83,8 +83,10 @@ The run **fails** (exit 1) when any of these is true:
   gaps (below) are excluded.
 - **Hard gate (#87):** any route whose `processingDaysMin` or `processingDaysMax`
   is more than 20% (at least 1 day; the numeric tolerance) from **every**
-  duration stated in its own processing citations (`processingTime`,
-  `processingDaysMin`, `processingDaysMax`). The value can match
+  duration stated in its own processing citations (keys starting
+  `processingTime` or `processingDays`, so `processingTime.inside` counts;
+  a field is judged only when every citation relevant to it parsed to a
+  duration, so an unparsable or non-English quote never fails the run). The value can match
   `expected.json` and still fail: the v4 Standard Visitor crawl stored max 56
   (the "extend your stay ... within 8 weeks" sentence, the agreed full-range
   max) with only "within 3 weeks" cited. Output with no cited duration at all
