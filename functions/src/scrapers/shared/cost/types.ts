@@ -47,7 +47,7 @@ export interface LlmUsage {
  */
 export interface LlmUsageReport {
   usage: LlmUsage;
-  model: string; // the model name we REQUESTED (e.g. "deepseek-chat")
+  model: string; // the model name we REQUESTED (e.g. "deepseek-flash")
   responseModel?: string; // the model the API says served it, when given
   atMs: number; // when the response arrived (prices can depend on the hour)
 }
@@ -78,8 +78,8 @@ export interface UtcHourWindow {
  * peak window is billed at `offPeak`. Without `offPeak`, one flat rate.
  */
 export interface LlmModelPrice extends LlmTokenPrices {
-  // Other model names billed at this price (e.g. "deepseek-chat" is served
-  // by, and billed as, deepseek-flash). Looked up case-insensitively.
+  // Other model names billed at this price (e.g. the legacy "deepseek-chat"
+  // that pre-#92 runs requested is served by, and billed as, deepseek-flash). Looked up case-insensitively.
   aliases?: string[];
   offPeak?: LlmTokenPrices;
   peakWindowsUtc?: UtcHourWindow[];
