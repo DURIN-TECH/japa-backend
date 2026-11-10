@@ -68,6 +68,35 @@ export interface VisaSourcePage {
   lastError?: string;
 }
 
+// ----- Weekly night crawl window (issue #63) -----
+//
+// When a source may be crawled: once a week, on one LOCAL weekday, between two
+// LOCAL hours in the source's own IANA time zone (government sites are hit at
+// their quietest). The orchestrator ticks hourly at :15 UTC; every seeded
+// zone has a whole-hour UTC offset, so a tick is also at :15 local. With
+// startHour 2 / endHour 5 the ticks inside the window are 02:15 (first run),
+// 03:15 and 04:15 (catch-up tries). Pure helpers live in
+// services/visa-crawl-window.ts.
+export interface CrawlWindow {
+  timeZone: string; // IANA, e.g. "Europe/London"
+  dayOfWeek: number; // ISO 1 (Mon) .. 7 (Sun): the LOCAL weekday the window opens
+  startHour: number; // local hour, inclusive, 0-23
+  // Local hour, exclusive, startHour < endHour <= 24. No overnight wrap: a
+  // window always sits within one local day.
+  endHour: number;
+}
+
+/**
+ * One stored host backoff on a `visaSources/{cc}` doc (issue #64). The
+ * Firestore form of `HostBackoffEntry` (services/visa-crawl-host-state.ts).
+ */
+export interface VisaSourceHostBackoff {
+  host: string; // lowercased host, e.g. "www.gov.uk"
+  until: Timestamp; // do not request the host before this instant
+  status: number; // the status that triggered it (429 | 503)
+  recordedAt: Timestamp; // tick time of the run that recorded it
+}
+
 // One registry entry per country. Holds the known official pages for that
 // country plus health/scheduling fields (mirrors the news `NewsSource`).
 export interface VisaSource {
@@ -86,10 +115,26 @@ export interface VisaSource {
   // Gates the extractor's `applicationUrl`; absent → code fallback / none.
   officialHosts?: string[];
 
-  // Scheduling — weekly by default (168h). Staggered via nextCrawlAt.
+  // Scheduling. A source WITH a `crawlWindow` is crawled once a week inside
+  // that local night window (issue #63) and `nextCrawlAt` is set to the
+  // window's next opening after each run. `crawlIntervalHours` (168 = weekly)
+  // is used ONLY by a source without a window (legacy behaviour:
+  // `nextCrawlAt = now + crawlIntervalHours`, no window filter).
   crawlIntervalHours: number;
+  // Registry-owned: set from VISA_SOURCE_WINDOWS in seed-visa-sources.ts and
+  // refreshed on every re-seed (NOT crawl state). Absent = legacy interval.
+  crawlWindow?: CrawlWindow;
   lastCrawledAt?: Timestamp;
   nextCrawlAt?: Timestamp;
+
+  // Crawler etiquette (issue #64): hosts of this source that answered 429/503
+  // and asked us (via Retry-After, or our default) not to come back before
+  // `until`. Crawler-owned (kept across re-seeds). The orchestrator skips any
+  // page on a listed host until then, and defers `nextCrawlAt` when EVERY page
+  // host is backed off past it. Expired entries are pruned on each run. Kept
+  // as an array of plain entries (not a host-keyed map: hosts contain dots,
+  // which are field-path separators) so #15 can move it to per-host docs.
+  hostBackoffs?: VisaSourceHostBackoff[];
 
   // Health / self-healing (auto-pause at 5 consecutive failures, like news).
   status: CrawlStatus;
