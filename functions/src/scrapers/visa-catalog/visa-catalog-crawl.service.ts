@@ -1,4 +1,4 @@
-import { collections } from "../../utils/firebase";
+import { collections, db } from "../../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import { VisaSource, VisaSourcePage } from "./types";
 import { EXTRACTOR_PROMPT_VERSION, visaCatalogExtractor } from "./visa-catalog-extract.service";
@@ -45,6 +45,9 @@ import { loadScraperSettingsResult } from "../shared/settings/scraper-settings.s
 import { leaseHeldReason, sourceLeaseService, type HeldLease, type SourceLeaseService } from "../shared/runs/source-lease";
 import { loadBudgetGate, type BudgetGate } from "../shared/settings/budget-hard-stop";
 import type { ScraperSettings } from "../shared/settings/types";
+// Issue #107: the shared auto-pause rules (limit = visa.consecutiveFailureLimit).
+import { nextSourceHealth, type SourceRunOutcome } from "../shared/runs/source-health";
+import type { Transaction } from "firebase-admin/firestore";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -161,9 +164,20 @@ export interface CrawlSummary {
   budgetChecked: boolean;
   budgetOver: boolean;
   sourcesLeased: number;
+  // Issue #107: sources THIS run auto-paused (their failure streak reached
+  // visa.consecutiveFailureLimit; status -> broken, no longer crawled
+  // unattended).
+  sourcesAutoPaused: number;
 }
 
 class VisaCatalogCrawlService {
+  /**
+   * Transaction runner (issue #107: the per-source health write re-reads
+   * the status in a transaction so an admin pause made mid-run is kept).
+   * Tests swap in the in-memory runner (test/helpers/fake-firestore.ts).
+   */
+  runTransaction: <T>(fn: (tx: Transaction) => Promise<T>) => Promise<T> = (fn) => db.runTransaction(fn);
+
   /**
    * Process a bounded batch of due sources. Returns a run summary. Never throws
    * on per-page failures — those are recorded against the page/source so a bad
@@ -369,6 +383,7 @@ class VisaCatalogCrawlService {
         opts,
         budgetGate,
         force: opts?.force === true,
+        failureLimit: cfg.visa.consecutiveFailureLimit,
       });
       if (summary.budgetHardStop) summary.budgetOver = true;
       if (summary.budgetHardStop && budgetGate) {
@@ -508,9 +523,11 @@ class VisaCatalogCrawlService {
       // (ignore the content-hash gate).
       budgetGate: BudgetGate | null;
       force: boolean;
+      // Issue #107: visa.consecutiveFailureLimit in force for this run.
+      failureLimit: number;
     }
   ): Promise<void> {
-    const { now, summary, recorder, maxExtractions, opts, budgetGate, force } = ctx;
+    const { now, summary, recorder, maxExtractions, opts, budgetGate, force, failureLimit } = ctx;
 
     // ---- Price table for this run (issue #82). Never throws: falls back to
     // the default table (quoted from the provider's page) when unreadable.
@@ -863,7 +880,8 @@ class VisaCatalogCrawlService {
       // ---- Source health + reschedule ----
       // A source "succeeds" this run if at least one page fetched AND no host
       // throttled it (a 429/503 counts as a failure, issue #64). Consecutive
-      // failures auto-pause it at 5 (self-healing, like news).
+      // failures auto-pause it at visa.consecutiveFailureLimit (default 5,
+      // issue #107; rules in shared/runs/source-health.ts, same as news).
       // Deferral (issue #64): when no request was made at all because every
       // page's host was under a STORED backoff, we were only respecting the
       // host's own Retry-After — neither success nor failure, so the counter
@@ -872,11 +890,16 @@ class VisaCatalogCrawlService {
       const anySuccess = fetchedOk > 0 && !throttledThisRun;
       const deferredOnly =
         deferredPages > 0 && fetchedOk === 0 && pageErrors === 0 && !throttledThisRun;
-      let consecutiveFailures: number;
-      if (deferredOnly) consecutiveFailures = source.consecutiveFailures || 0; // unchanged
-      else if (anySuccess) consecutiveFailures = 0; // healthy run resets the streak
-      else consecutiveFailures = (source.consecutiveFailures || 0) + 1; // failure (incl. 429/503)
-      const status = consecutiveFailures >= 5 ? "broken" : "active";
+      // deferred = unchanged; success = streak reset (and a `broken` source
+      // retried by hand is active again); failure (incl. 429/503) = +1,
+      // auto-paused at the limit. The status itself is decided in the
+      // transaction below, against the doc as it is THEN (admin pause kept).
+      const outcome: SourceRunOutcome = deferredOnly ? "deferred" : anySuccess ? "success" : "failure";
+      // The error an auto-pause records: the first page error of this run,
+      // else why nothing was fetched.
+      const runError =
+        pages.find((p) => p.lastError && p.lastCrawledAt && p.lastCrawledAt.toMillis() === now.toMillis())?.lastError ??
+        (throttledThisRun ? "a host answered 429/503 (backed off)" : pages.length === 0 ? "source has no pages" : "no page fetched");
       // Simple reliability signal: this run's fetch success ratio.
       const attempted = fetchedOk + pageErrors;
       const reliabilityScore = attempted > 0 ? Math.round((fetchedOk / attempted) * 100) : source.reliabilityScore;
@@ -919,17 +942,34 @@ class VisaCatalogCrawlService {
         }
       }
 
-      await doc.ref.update({
-        pages,
-        lastCrawledAt: now,
-        nextCrawlAt,
-        consecutiveFailures,
-        status,
-        reliabilityScore,
-        // Always written: an empty array clears expired backoffs.
-        hostBackoffs: hostBackoffEntriesToSource(backoffs),
-        updatedAt: now,
+      // Issue #107: read + write in one transaction so the status is decided
+      // against the doc as it is now: an admin PATCH (pause / retire) made
+      // while this source was crawling is never overwritten.
+      const health = await this.runTransaction(async (tx) => {
+        const fresh = await tx.get(doc.ref);
+        const stored = (fresh.data() ?? source) as VisaSource & { autoPaused?: boolean; autoPausedAt?: Timestamp | null };
+        const h = nextSourceHealth(stored, outcome, { limit: failureLimit, errorMessage: runError, now });
+        tx.update(doc.ref, {
+          pages,
+          lastCrawledAt: now,
+          nextCrawlAt,
+          consecutiveFailures: h.consecutiveFailures,
+          status: h.status,
+          reliabilityScore,
+          // Always written: an empty array clears expired backoffs.
+          hostBackoffs: hostBackoffEntriesToSource(backoffs),
+          updatedAt: now,
+          ...(h.autoPause ?? {}),
+        });
+        return h;
       });
+      const status = health.status;
+      if (health.newlyAutoPaused) {
+        summary.sourcesAutoPaused++;
+        console.warn(
+          `Visa catalog: source ${source.countryCode} auto-paused after ${health.consecutiveFailures} consecutive failures (limit ${failureLimit})`
+        );
+      }
 
       // Per-run log (subcollection) for observability + admin debugging.
       // `runId` links it to the run-wide `scrapeRuns/{runId}` doc (#81).
@@ -971,6 +1011,13 @@ class VisaCatalogCrawlService {
         errors: pageErrors,
         sourceRunId: crawlRunRef.id,
         counts: { ...counts, visasIngested: ingested },
+        // Issue #107: streak, limit and auto-pause state after this run.
+        health: {
+          consecutiveFailures: health.consecutiveFailures,
+          consecutiveFailureLimit: failureLimit,
+          autoPaused: health.autoPaused,
+          autoPausedThisRun: health.newlyAutoPaused,
+        },
       });
 
       summary.sourcesProcessed++;
@@ -1002,6 +1049,7 @@ function emptySummary(): CrawlSummary {
     budgetChecked: false,
     budgetOver: false,
     sourcesLeased: 0,
+    sourcesAutoPaused: 0,
   };
 }
 

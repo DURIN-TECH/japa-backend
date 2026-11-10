@@ -200,10 +200,18 @@ export interface VisaSource {
   // which are field-path separators) so #15 can move it to per-host docs.
   hostBackoffs?: VisaSourceHostBackoff[];
 
-  // Health / self-healing (auto-pause at 5 consecutive failures, like news).
+  // Health / self-healing: auto-pause (status `broken`) at
+  // visa.consecutiveFailureLimit consecutive failures (default 5, issue #107;
+  // rules in scrapers/shared/runs/source-health.ts, same as news).
   status: CrawlStatus;
   reliabilityScore: number; // 0–100 (successfulRuns / totalRuns)
   consecutiveFailures: number;
+  // Issue #107: set by the crawler when it auto-pauses the source, cleared on
+  // recovery / admin reset. Crawl state: kept across re-seeds.
+  autoPaused?: boolean;
+  autoPausedAt?: Timestamp | null;
+  autoPausedReason?: string | null; // the last error at the pause
+  autoPauseCause?: "failure_limit" | null;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;

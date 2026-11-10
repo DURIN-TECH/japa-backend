@@ -8,7 +8,7 @@ import {
   ArticleImportance,
   SourceStatus,
 } from "../types/news";
-import { Timestamp, FieldValue } from "firebase-admin/firestore";
+import { Timestamp } from "firebase-admin/firestore";
 
 // ============================================
 // QUERY OPTIONS
@@ -144,6 +144,12 @@ class NewsService {
     return snapshot.docs.map((doc) => doc.data() as NewsSource);
   }
 
+  /**
+   * Due = `active` and nextScrapeAt <= now, oldest first. `paused`,
+   * `retired` and `broken` (auto-paused by the scraper, issue #107) sources
+   * never match, so a source that keeps failing is not attempted again
+   * until an admin resets it or runs it by hand.
+   */
   async getDueSources(limit = 5): Promise<NewsSource[]> {
     const now = Timestamp.now();
     const snapshot = await collections.newsSources
@@ -160,63 +166,10 @@ class NewsService {
     return doc.exists ? (doc.data() as NewsSource) : null;
   }
 
-  /**
-   * Record a scrape outcome on the source and schedule its next visit.
-   *
-   * @param notBeforeMs optional epoch ms the next visit must not precede —
-   *   the host's Retry-After time after a 429/503 (issue #76). The next visit
-   *   is the LATER of `now + scrapeIntervalMinutes` and this, so a long
-   *   Retry-After pushes the source back but a short one never brings it
-   *   forward.
-   */
-  async updateSourceAfterScrape(
-    sourceId: string,
-    success: boolean,
-    errorMessage?: string,
-    notBeforeMs?: number
-  ): Promise<void> {
-    const ref = collections.newsSources.doc(sourceId);
-    const doc = await ref.get();
-    if (!doc.exists) return;
-
-    const source = doc.data() as NewsSource;
-    const nextInterval = source.scrapeIntervalMinutes * 60 * 1000;
-    const nextScrapeAt = Timestamp.fromMillis(
-      Math.max(Date.now() + nextInterval, notBeforeMs ?? 0)
-    );
-
-    const updates: Record<string, unknown> = {
-      lastScrapedAt: Timestamp.now(),
-      nextScrapeAt,
-      totalRuns: increment(1),
-      updatedAt: FieldValue.serverTimestamp(),
-    };
-
-    if (success) {
-      updates.consecutiveFailures = 0;
-      updates.successfulRuns = increment(1);
-      updates.reliabilityScore = Math.min(
-        100,
-        ((source.successfulRuns + 1) / (source.totalRuns + 1)) * 100
-      );
-    } else {
-      updates.consecutiveFailures = source.consecutiveFailures + 1;
-      updates.lastErrorMessage = errorMessage;
-      updates.lastErrorAt = Timestamp.now();
-      updates.reliabilityScore =
-        (source.successfulRuns / (source.totalRuns + 1)) * 100;
-
-      // Auto-pause after 5 consecutive failures
-      if (source.consecutiveFailures + 1 >= 5) {
-        updates.status = "broken";
-        console.warn(
-          `Source ${source.name} auto-paused after 5 consecutive failures`
-        );
-      }
-    }
-
-    await ref.update(updates);
-  }
+  // Issue #107: the per-run health write (`updateSourceAfterScrape`) moved
+  // to the scrapers module (scrapers/news/news-source-health.ts), next to the
+  // visa crawler's, so both apply the same auto-pause rules
+  // (scrapers/shared/runs/source-health.ts).
 
   // ============================================
   // SCRAPE RUN OPERATIONS

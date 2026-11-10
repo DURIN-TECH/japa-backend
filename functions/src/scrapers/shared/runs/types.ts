@@ -87,6 +87,20 @@ export interface ScrapeRunSourceEntry {
   // articlesFound/New/Duplicate/Failed). Open map so later issues can add.
   counts?: Record<string, number>;
   error?: string; // redacted message when the source failed outright
+  // Issue #107: the source's health AFTER this run (both kinds), for the
+  // dashboard's run detail: the failure streak, the
+  // `<kind>.consecutiveFailureLimit` in force, whether the source is now
+  // auto-paused (status `broken`) and whether THIS run paused it. Absent on
+  // lines with no health write (lease-deferred, missing-key, empty).
+  health?: ScrapeRunSourceHealth;
+}
+
+/** Issue #107: a run source line's health snapshot (see ScrapeRunSourceEntry.health). */
+export interface ScrapeRunSourceHealth {
+  consecutiveFailures: number;
+  consecutiveFailureLimit: number;
+  autoPaused: boolean;
+  autoPausedThisRun: boolean;
 }
 
 /**

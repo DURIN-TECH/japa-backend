@@ -34,8 +34,10 @@ export const SCRAPER_SETTINGS_DOC_ID = "scraperSettings";
  * news sources), so an empty Firestore behaves exactly as before.
  */
 export const DEFAULT_SCRAPER_SETTINGS: ScraperSettings = {
-  visa: { enabled: true, blockManualWhenOff: false, maxExtractionsPerRun: 15, maxSourcesPerTick: 3 },
-  news: { enabled: true, blockManualWhenOff: false, maxSourcesPerRun: 5 },
+  // consecutiveFailureLimit (issue #107): 5 = the auto-pause threshold both
+  // scrapers hard-coded before (DEFAULT_CONSECUTIVE_FAILURE_LIMIT).
+  visa: { enabled: true, blockManualWhenOff: false, consecutiveFailureLimit: 5, maxExtractionsPerRun: 15, maxSourcesPerTick: 3 },
+  news: { enabled: true, blockManualWhenOff: false, consecutiveFailureLimit: 5, maxSourcesPerRun: 5 },
   manualRuns: { cooldownMinutes: 10 },
   budget: { hardStop: false },
 };
@@ -57,11 +59,15 @@ export const SETTINGS_FIELD_RULES: {
     // To stop spending, switch the scraper off or use the budget hard stop.
     maxExtractionsPerRun: { type: "integer", min: 1, max: 200 },
     maxSourcesPerTick: { type: "integer", min: 1, max: 50 },
+    // Issue #107: auto-pause after this many consecutive failed crawls.
+    consecutiveFailureLimit: { type: "integer", min: 1, max: 50 },
   },
   news: {
     enabled: { type: "boolean" },
     blockManualWhenOff: { type: "boolean" },
     maxSourcesPerRun: { type: "integer", min: 1, max: 50 },
+    // Issue #107: auto-pause after this many consecutive failed crawls.
+    consecutiveFailureLimit: { type: "integer", min: 1, max: 50 },
   },
   manualRuns: {
     cooldownMinutes: { type: "integer", min: 0, max: 1440 },

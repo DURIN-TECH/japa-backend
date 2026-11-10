@@ -34,12 +34,14 @@ before #96, so an empty Firestore behaves exactly as before).
     "enabled": true,                 // scheduled visa ticks run (kill switch)
     "blockManualWhenOff": false,     // when enabled=false, also refuse Run now
     "maxExtractionsPerRun": 15,      // LLM calls per run (was DEFAULT_MAX_EXTRACTIONS)
-    "maxSourcesPerTick": 3           // countries per run (was DEFAULT_MAX_SOURCES)
+    "maxSourcesPerTick": 3,          // countries per run (was DEFAULT_MAX_SOURCES)
+    "consecutiveFailureLimit": 5     // NEW (#107): auto-pause a source after N consecutive failed crawls
   },
   "news": {
     "enabled": true,
     "blockManualWhenOff": false,
-    "maxSourcesPerRun": 5            // was the hard-coded 5
+    "maxSourcesPerRun": 5,           // was the hard-coded 5
+    "consecutiveFailureLimit": 5     // NEW (#107): same, for news sources
   },
   "manualRuns": {
     "cooldownMinutes": 10            // per source / per scraper, between Run now requests
@@ -94,7 +96,7 @@ Partial update: send only what changes. Objects merge key by key (incl.
 ```jsonc
 {
   "visa":   { "enabled": false, "maxExtractionsPerRun": 1 },
-  "news":   { "maxSourcesPerRun": 3 },
+  "news":   { "maxSourcesPerRun": 3, "consecutiveFailureLimit": 3 },
   "manualRuns": { "cooldownMinutes": 5 },
   "budget": { "monthlyUsd": 25, "hardStop": true },          // monthlyUsd: null clears the budget
   "alerts": { "extraRecipientEmails": ["ops@example.org"], "thresholds": { "errorRatePct": 30 },
@@ -111,6 +113,7 @@ Validation (400 `VALIDATION_ERROR`, `field` names the first bad field):
 | `visa.maxExtractionsPerRun` | integer 1..200 (the run stops at the cap; to stop spending use `enabled` or the hard stop) |
 | `visa.maxSourcesPerTick` | integer 1..50 |
 | `news.maxSourcesPerRun` | integer 1..50 |
+| `visa.consecutiveFailureLimit`, `news.consecutiveFailureLimit` | integer 1..50 (default 5) |
 | `manualRuns.cooldownMinutes` | integer 0..1440 |
 | `budget.monthlyUsd` | null, or a finite number 0..100000 |
 | `alerts.*` | the engine's own `resolveConfig` rules (any value it would reject -> 400, field = `alerts.<its path>`); `extraRecipientEmails`: up to 20 valid addresses; `rules.<id>`: known rule ids only |
@@ -157,7 +160,8 @@ Newest first. `limit` default 25, max 100; `cursor` = previous `nextCursor`
   "reason": "Site redesign, selectors broken",   // required for paused / retired; max 500 chars
   "crawlWindow": { "timeZone": "Europe/London", "dayOfWeek": 1, "startHour": 2, "endHour": 5 },
                                      // visa only; null = back to the registry default window
-  "resetFailures": true,             // consecutiveFailures -> 0 (a `broken` source becomes `active`)
+  "resetFailures": true,             // consecutiveFailures -> 0; a crawler-held source (`broken`, or `paused`
+                                     // with autoPaused for a missing API key) becomes `active`; auto-pause flags cleared
   "clearHostBackoffs": true          // visa only: drop every stored 429/503 backoff
 }
 ```
@@ -200,7 +204,7 @@ Errors:
 | 404 | `NOT_FOUND` | no such source |
 | 409 | `RUN_IN_PROGRESS` | another run is on this source: a manual run of it is queued / running (body has `requestId`), a whole-scraper request of the same kind is queued / running (`requestId` of that one), or any run holds the source's crawl lease, e.g. a scheduled tick or a whole-scraper run crawling it (body has `runId` when known and `leaseExpiresAt`) |
 | 409 | `RUN_COOLDOWN` | the last request for this source was < `cooldownMinutes` ago; body has `retryAfter` (ISO) |
-| 409 | `SOURCE_NOT_ACTIVE` | the source is `paused` or `retired` (a `broken` one may run) |
+| 409 | `SOURCE_NOT_ACTIVE` | the source is `paused` or `retired` (a `broken` one may run: an admin retry of an auto-paused source; on success it returns to `active` with `consecutiveFailures` 0 and the auto-pause flags cleared) |
 | 409 | `SCRAPER_DISABLED` | the scraper is off and `blockManualWhenOff` is set |
 | 503 | `SETTINGS_UNAVAILABLE` | `appConfig/scraperSettings` could not be read (fail closed: retry later) |
 
@@ -280,6 +284,34 @@ no longer active, scraper disabled with `blockManualWhenOff`). Unknown id -> 404
 - **One in flight + cooldown.** Enforced in a transaction on
   `scrapeRunLocks/{kind}__{sourceId | _all}` while creating the request. A
   queued / running request older than 15 minutes is treated as dead.
+
+- **Auto-pause (issue #107).** `visa.consecutiveFailureLimit` /
+  `news.consecutiveFailureLimit` (per scraper, because the two crawl at very
+  different rates: weekly vs every few hours). When a failed crawl brings a
+  source's `consecutiveFailures` to the limit, the crawler sets it `broken`
+  with `autoPaused: true`, `autoPausedAt`, `autoPausedReason` (the last
+  error) and `autoPauseCause: "failure_limit"`. A `broken` source is not
+  selected by scheduled ticks or a whole-scraper Run now (both select
+  `active` only), so it produces no error lines and cannot mark runs
+  `partial`; the `source_broken` alert says so. Rules (one module,
+  `shared/runs/source-health.ts`, both scrapers): the limit is checked on
+  each FAILED crawl only, so lowering it below a source's streak pauses that
+  source on its next failure, and raising it never un-pauses anything. A
+  success (single-source Run now) or `resetFailures` returns it to `active`.
+  The crawler never changes an admin `paused` / `retired` status (its health
+  write re-reads the status in a transaction). Failures below the limit still
+  count and still make the run `partial`; a deferred-only visa run does not
+  count.
+- **Missing news API key (issue #107).** A `news_api` source whose
+  `NEWS_API_KEY_<PROVIDER>` secret is not set is not requested: the crawler
+  sets it `paused` with `autoPaused: true`, `autoPauseCause:
+  "missing_api_key"`, reason `missing API key (...)`, and the run gets a
+  `deferred` source line (no error, run stays `succeeded`). After setting the
+  secret, un-pause it with `PATCH /admin/scrape-sources/news/<id>
+  { "resetFailures": true }`.
+- **Per-source news timeout (issue #107).** `newsSources/{id}.config.requestTimeoutMs`
+  (ms, clamped to 60000) overrides the news HTTP client's 15000 ms default for
+  that source's requests; set in `news/seed-news-sources.ts` (cic-news: 30000).
 
 ## Firestore
 

@@ -17,6 +17,7 @@
     "seed:prod": "npm run build && node lib/scripts/seed-prod-bootstrap.js --project japa-platform",
     "seed:prod:full": "npm run build && node lib/scripts/seed-all.js --project japa-platform",
     "sync:visa-sources": "npm run build && node lib/scrapers/visa-catalog/scripts/sync-visa-sources.js",
+    "remediate:sources-107": "npm run build && node lib/scrapers/shared/scripts/remediate-failing-sources.js",
     "paystack:sync": "npm run build && node lib/scripts/sync-paystack-plans.js",
     "paystack:sync:dev": "npm run build && node lib/scripts/sync-paystack-plans.js --project durin-seli-dev",
     "paystack:sync:prod": "npm run build && node lib/scripts/sync-paystack-plans.js --project japa-platform",

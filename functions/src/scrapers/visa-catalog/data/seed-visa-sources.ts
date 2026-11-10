@@ -167,7 +167,36 @@ export const KR_TEMPORARY_VISIT_URL =
  */
 export const KR_VISA_FEE_TABLE_URL = "https://www.visa.go.kr/openPage.do?MENU_ID=10103&LANG_TYPE=EN";
 
+/**
+ * The HK Technical Professionals Stream page (issue #107). The registry row
+ * used to point at `.../visas/tech-professionals-stream.html`, which now
+ * answers 404 (every HK crawl logged a page error, so every visa run with HK
+ * in it ended `partial`). Checked 2026-11-10 with a plain public GET: the
+ * Immigration Department's GEP and ASMTP pages now link to this URL (200,
+ * ~55 KB), titled "General Employment Policy and Admission Scheme for
+ * Mainland Talents and Professionals (Technical Professionals Stream)" and
+ * stating: "the HKSAR Government has introduced the Technical Professionals
+ * Stream (hereafter "TP Stream") under the General Employment Policy ... and
+ * the Admission Scheme for Mainland Talents and Professionals ... Applications
+ * under the TP Stream are subject to quota and restricted to the specific
+ * skilled trades as listed on the TP List." robots.txt on www.immd.gov.hk is
+ * 404 (no rules). Exported for the unit tests; must equal the HK row in
+ * official_visa_links_verified_v3.md character for character.
+ */
+export const HK_TP_STREAM_URL = "https://www.immd.gov.hk/eng/services/visas/TPStream.html";
+
+/**
+ * The visa doc id the HK TP Stream page had under its OLD URL (the id the
+ * crawl derived from `tech-professionals-stream.html`). Pinned below so the
+ * new URL keeps writing to the same `countries/HK/visaTypes/{id}` doc and a
+ * previously scraped record is not duplicated under a new path-derived id.
+ */
+export const HK_TP_STREAM_VISA_ID = "hk-eng-services-visas-tech-professionals-stream-html";
+
 export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
+  // ---- Hong Kong (HK) — issue #107: old URL 404s, same record id kept ----
+  [HK_TP_STREAM_URL]: { visaId: HK_TP_STREAM_VISA_ID },
+
   // ---- United Kingdom (GB) — routes with a seeded uk-* equivalent ----
   "https://www.gov.uk/standard-visitor": { visaId: "gb-standard-visitor", visaCode: "SVV" }, // ~ uk-visitor
   "https://www.gov.uk/skilled-worker-visa": { visaId: "gb-skilled-worker-visa", visaCode: "SWV" }, // ~ uk-skilled-worker

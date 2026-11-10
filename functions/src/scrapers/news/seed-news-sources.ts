@@ -1,4 +1,4 @@
-import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { FieldValue, getFirestore, Timestamp } from "firebase-admin/firestore";
 import { IngestionStrategy, ScrapingConfig, SourceStatus, SupportedCountryCode } from "../../types/news";
 
 // NOTE: the Firestore handle is resolved LAZILY inside seedNewsSources() (not
@@ -17,6 +17,10 @@ export interface NewsSourceSeed {
   config: ScrapingConfig;
   scrapeIntervalMinutes: number;
   status: SourceStatus;
+  // Issue #107: why the registry ships this source paused / retired
+  // (required for those statuses; stored as `statusReason` on the doc and
+  // shown on the source's health row).
+  statusReason?: string;
   isOfficial: boolean;
   priority: number;
 }
@@ -35,6 +39,13 @@ export const NEWS_SOURCES: NewsSourceSeed[] = [
       feedUrl: "https://www.cicnews.com/feed",
       maxArticlesPerRun: 20,
       fetchFullContent: false,
+      // Issue #107: runs failed with "timeout of 15000ms exceeded" (the news
+      // client's default, NEWS_HTTP_TIMEOUT_MS). Checked 2026-11-10 with a
+      // plain public GET: the feed answers 200 with items, but the host is
+      // slow at times (the `/feed/` -> `/feed` redirect alone took ~7.6s).
+      // 30s for this source only; a run that still times out is recorded
+      // as a normal failure ("timeout of 30000ms exceeded").
+      requestTimeoutMs: 30_000,
     },
     scrapeIntervalMinutes: 120,
     status: "active",
@@ -85,7 +96,17 @@ export const NEWS_SOURCES: NewsSourceSeed[] = [
       fetchFullContent: false,
     },
     scrapeIntervalMinutes: 360,
-    status: "active",
+    // Issue #107: PAUSED. Every run got HTTP 403. Checked 2026-11-10 with a
+    // plain public GET: the Akamai edge in front of every homeaffairs.gov.au
+    // host (immi., www., minister., incl. robots.txt) answers 403 "Access
+    // Denied" to our bot User-Agent (Seli-VisaNewsBot) and 200 to generic
+    // clients, and the department publishes no RSS / Atom feed (the archive
+    // page links none). Our crawler policy forbids spoofing the UA to get
+    // round a block, so there is nothing to repoint to: paused with a reason.
+    status: "paused",
+    statusReason:
+      "Home Affairs blocks our bot User-Agent (HTTP 403 from the Akamai edge on every homeaffairs.gov.au host, " +
+      "robots.txt included) and publishes no RSS/Atom feed; we never spoof the User-Agent (checked 2026-11-10, issue #107)",
     isOfficial: true,
     priority: 1,
   },
@@ -196,7 +217,11 @@ export const NEWS_SOURCES: NewsSourceSeed[] = [
       fetchFullContent: false,
     },
     scrapeIntervalMinutes: 240,
-    status: "active",
+    // Issue #107: RETIRED. Every run failed with "getaddrinfo EAI_AGAIN
+    // visareporter.com"; checked 2026-11-10: the domain does not resolve
+    // (no DNS answer), so the site is gone.
+    status: "retired",
+    statusReason: "domain does not resolve (visareporter.com: no DNS answer, checked 2026-11-10, issue #107)",
     isOfficial: false,
     priority: 4,
   },
@@ -221,6 +246,11 @@ export const NEWS_SOURCES: NewsSourceSeed[] = [
       fetchFullContent: false,
     },
     scrapeIntervalMinutes: 720,
+    // Issue #107: stays active in the registry. Without the
+    // NEWS_API_KEY_NEWSDATA secret the scraper pauses it at run time
+    // (status paused, autoPaused, reason "missing API key") instead of
+    // erroring; once the secret is set an admin un-pauses it with
+    // PATCH /admin/scrape-sources/news/newsdata-immigration { "resetFailures": true }.
     status: "active",
     isOfficial: false,
     priority: 5,
@@ -228,18 +258,91 @@ export const NEWS_SOURCES: NewsSourceSeed[] = [
 ];
 
 /**
- * The status a re-seed writes for one news source (issue #96, pure): the
- * seed's own status, unless an admin set one (`adminOverrides.status` on the
- * stored doc) — then the stored status is kept, so an admin pause / retire
- * is never undone by a deploy. `adminOverrides` itself is not written by the
- * seed (merge: true), so it stays as it was.
+ * The status a re-seed writes for one news source (pure). In order:
+ *  1. an admin set one (`adminOverrides.status`, issue #96): the stored
+ *     status is kept, so an admin pause / retire is never undone by a deploy;
+ *  2. the registry ships the source `paused` / `retired` (issue #107, e.g. a
+ *     dead domain): that wins over any stored crawler state;
+ *  3. the crawler holds it (`broken`, or `autoPaused`, issue #107): kept, so
+ *     a re-seed never un-pauses a source that keeps failing (before #107 the
+ *     seed reset it to active with 0 failures, and it failed again);
+ *  4. otherwise the seed's status.
+ * `adminOverrides` itself is not written by the seed (merge: true).
  */
 export function newsSeedStatus(seedStatus: SourceStatus, existing: Record<string, unknown> | undefined): SourceStatus {
   const overrides = existing?.adminOverrides as { status?: unknown } | undefined;
   if (overrides && typeof overrides.status === "string" && typeof existing?.status === "string") {
     return existing.status as SourceStatus;
   }
+  if (seedStatus === "paused" || seedStatus === "retired") return seedStatus;
+  if (existing && (existing.status === "broken" || existing.autoPaused === true) && typeof existing.status === "string") {
+    return existing.status as SourceStatus;
+  }
   return seedStatus;
+}
+
+/**
+ * Runtime health fields the crawler owns (issue #107). A re-seed of an
+ * EXISTING doc keeps them (only a new doc gets the baseline), so the streak
+ * and the auto-pause flags survive deploys and match the kept status.
+ */
+export const NEWS_SOURCE_HEALTH_FIELDS = [
+  "reliabilityScore",
+  "consecutiveFailures",
+  "totalRuns",
+  "successfulRuns",
+  "createdAt",
+] as const;
+
+/**
+ * The doc a re-seed writes for one news source (pure, merge: true).
+ * Registry fields always; the health baseline only for a NEW doc.
+ */
+export function buildSeededNewsSource(
+  source: NewsSourceSeed,
+  existing: Record<string, unknown> | undefined,
+  now: Timestamp
+): Record<string, unknown> {
+  const status = newsSeedStatus(source.status, existing);
+  const doc: Record<string, unknown> = {
+    id: source.slug,
+    name: source.name,
+    slug: source.slug,
+    url: source.url,
+    countryCodes: source.countryCodes,
+    strategy: source.strategy,
+    config: source.config,
+    scrapeIntervalMinutes: source.scrapeIntervalMinutes,
+    // Due immediately so the scraper picks it up right away (only an
+    // `active` source is ever due).
+    nextScrapeAt: now,
+    status,
+    // The registry's reason for a paused / retired source; removed when the
+    // registry no longer gives one (merge: true needs an explicit delete).
+    statusReason: source.statusReason ?? (existing ? FieldValue.delete() : undefined),
+    isOfficial: source.isOfficial,
+    priority: source.priority,
+    updatedAt: now,
+  };
+  if (doc.statusReason === undefined) delete doc.statusReason;
+  // The registry's paused / retired status replaces a crawler hold: drop the
+  // auto-pause flags so the row does not claim the crawler paused it.
+  if (existing?.autoPaused === true && status !== existing.status) {
+    Object.assign(doc, { autoPaused: false, autoPausedAt: null, autoPausedReason: null, autoPauseCause: null });
+  }
+  if (!existing) {
+    // Brand-new source: the health baseline.
+    Object.assign(doc, { reliabilityScore: 100, consecutiveFailures: 0, totalRuns: 0, successfulRuns: 0, createdAt: now });
+  } else {
+    // Existing source: keep the crawler's health (merge leaves it alone);
+    // fill in only what an old doc lacks.
+    for (const field of NEWS_SOURCE_HEALTH_FIELDS) {
+      if (existing[field] === undefined) {
+        doc[field] = field === "reliabilityScore" ? 100 : field === "createdAt" ? now : 0;
+      }
+    }
+  }
+  return doc;
 }
 
 /**
@@ -252,9 +355,10 @@ export function newsSeedStatus(seedStatus: SourceStatus, existing: Record<string
  *
  * Each source is written under a deterministic doc ID (its slug) with
  * `{ merge: true }`, so re-running the seed is idempotent: existing sources are
- * updated in place rather than duplicated, and runtime-tracked fields that the
- * scraper owns (e.g. reliabilityScore/run counters) are reset to their seed
- * baseline on each run.
+ * updated in place rather than duplicated. Issue #107: the runtime health the
+ * scraper owns (reliabilityScore, run counters, the failure streak and the
+ * auto-pause flags) is KEPT on existing docs (it used to be reset on every
+ * seed, which un-paused failing sources); see buildSeededNewsSource().
  *
  * @returns the number of sources seeded.
  */
@@ -277,27 +381,7 @@ export async function seedNewsSources(): Promise<number> {
     const existing = snaps[idx]?.exists ? (snaps[idx].data() as Record<string, unknown>) : undefined;
     batch.set(
       ref,
-      {
-        id: source.slug,
-        name: source.name,
-        slug: source.slug,
-        url: source.url,
-        countryCodes: source.countryCodes,
-        strategy: source.strategy,
-        config: source.config,
-        scrapeIntervalMinutes: source.scrapeIntervalMinutes,
-        // Due immediately on first run so the scraper picks it up right away.
-        nextScrapeAt: now,
-        status: newsSeedStatus(source.status, existing),
-        reliabilityScore: 100,
-        consecutiveFailures: 0,
-        totalRuns: 0,
-        successfulRuns: 0,
-        isOfficial: source.isOfficial,
-        priority: source.priority,
-        createdAt: now,
-        updatedAt: now,
-      },
+      buildSeededNewsSource(source, existing, now),
       { merge: true }
     );
   });

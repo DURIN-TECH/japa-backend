@@ -21,6 +21,10 @@ export interface ScraperSwitches {
   enabled: boolean;
   // When `enabled` is false, also refuse manual "Run now" requests.
   blockManualWhenOff: boolean;
+  // Issue #107: consecutive failed crawls after which the crawler auto-pauses
+  // a source (status `broken` + `autoPaused`, no longer crawled unattended).
+  // Per scraper (visa / news can differ). Integer 1..50, default 5.
+  consecutiveFailureLimit: number;
 }
 
 /** Visa scraper settings. */

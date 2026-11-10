@@ -37,7 +37,9 @@ scrapers/
   shared/                  used by both scrapers
     fetch/                 HTTP client, robots.txt (RFC 9309), User-Agent; secret redaction
     etiquette/             per-host crawl state + backoff store, weekly crawl windows
-    runs/                  scrapeRuns records, /admin/scrape-runs + /admin/scrape-sources (#81), scrape-runs.md
+    runs/                  scrapeRuns records, /admin/scrape-runs + /admin/scrape-sources (#81), scrape-runs.md;
+                           source-health.ts: the auto-pause rules both crawlers apply (#107)
+    scripts/               one-off data fixes, e.g. remediate-failing-sources (#107, dry run by default)
     cost/                  LLM price table, monthly cost rollup, /admin/scrape-costs (#82), scrape-costs.md
     alerts/                post-run + hourly alert rules, emails, /admin/scrape-alerts (#83), scrape-alerts.md
     settings/              appConfig/scraperSettings (kill switch, limits, hard stop), /admin/scraper-settings,
@@ -58,6 +60,7 @@ scrapers/
     docs/                              scraping spike, UK reference design
   news/
     news-scraper.service.ts            orchestrator (scrapeNewsOrchestrator) + strategies
+    news-source-health.ts              per-run source health write + missing-key pause (#107)
     seed-news-sources.ts               news source registry seed
     docs/                              news scraping plan
 ```

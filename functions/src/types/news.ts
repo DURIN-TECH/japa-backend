@@ -54,6 +54,14 @@ export interface ScrapingConfig {
 
   /** Custom HTTP headers (e.g., for Accept or User-Agent) */
   customHeaders?: Record<string, string>;
+
+  /**
+   * Issue #107: per-request timeout in ms for this source's requests (feed,
+   * listing page, article pages). Absent = the news HTTP client's default
+   * (NEWS_HTTP_TIMEOUT_MS, 15000). Clamped to NEWS_MAX_REQUEST_TIMEOUT_MS
+   * (60000) by the scraper. Set in seed-news-sources.ts (e.g. cic-news).
+   */
+  requestTimeoutMs?: number;
 }
 
 // ============================================
@@ -86,6 +94,20 @@ export interface NewsSource {
   successfulRuns: number;
   lastErrorMessage?: string;
   lastErrorAt?: Timestamp;
+
+  // Issue #107: set by the CRAWLER when it pauses the source itself
+  // (scrapers/shared/runs/source-health.ts): `broken` after
+  // `news.consecutiveFailureLimit` consecutive failures (cause
+  // "failure_limit"), or `paused` when a news_api provider key is missing
+  // (cause "missing_api_key"). Cleared on recovery / admin reset.
+  autoPaused?: boolean;
+  autoPausedAt?: Timestamp | null;
+  autoPausedReason?: string | null;
+  autoPauseCause?: "failure_limit" | "missing_api_key" | null;
+  // Issue #107: why the REGISTRY (seed-news-sources.ts) ships the source
+  // paused / retired, e.g. "domain does not resolve". Admin reasons live in
+  // `adminOverrides.reason`.
+  statusReason?: string;
 
   // Metadata
   isOfficial: boolean;
@@ -226,4 +248,10 @@ export interface OrchestratorResult {
   // Issue #96 review: sources skipped because another run held their crawl
   // lease (recorded as `deferred` source lines; not errors). Absent = 0.
   sourcesLeased?: number;
+  // Issue #107: news_api sources skipped and paused because their provider
+  // key secret is missing (`deferred` lines, not errors). Absent = 0.
+  sourcesPaused?: number;
+  // Issue #107: sources THIS run auto-paused (streak reached
+  // news.consecutiveFailureLimit). Absent = 0.
+  sourcesAutoPaused?: number;
 }

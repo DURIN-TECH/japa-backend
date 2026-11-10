@@ -284,4 +284,10 @@ export async function installFakes(): Promise<void> {
   requests.scrapeRunRequestService.runTransaction = fakeRunTransaction;
   const worker: any = await import("../../src/scrapers/shared/settings/scrape-run-worker");
   worker.scrapeRunWorker.runTransaction = fakeRunTransaction;
+  // Issue #107: the per-run source health writes (news + visa) re-read the
+  // source status in a transaction (an admin pause made mid-run is kept).
+  const newsHealth: any = await import("../../src/scrapers/news/news-source-health");
+  newsHealth.newsSourceHealthService.runTransaction = fakeRunTransaction;
+  const crawl: any = await import("../../src/scrapers/visa-catalog/visa-catalog-crawl.service");
+  crawl.visaCatalogCrawlService.runTransaction = fakeRunTransaction;
 }

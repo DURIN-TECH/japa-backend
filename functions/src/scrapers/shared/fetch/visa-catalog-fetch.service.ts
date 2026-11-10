@@ -171,7 +171,9 @@ const BLOCK_SELECTORS = "p,h1,h2,h3,h4,h5,h6,li,br,div,section,article,tr,td,dt,
 export interface VisaCatalogHttpClient {
   get(
     url: string,
-    config?: { responseType?: "text"; headers?: Record<string, string> }
+    // `timeout` (ms, issue #107): a per-request override of the client's
+    // default timeout (axios honours it; test stubs may ignore it).
+    config?: { responseType?: "text"; headers?: Record<string, string>; timeout?: number }
   ): Promise<{
     status: number;
     data: unknown;
@@ -479,10 +481,16 @@ export class VisaCatalogFetchService {
    * Keeping this the only way adapters reach the network means the rate limit,
    * robots cache and client live in one place (#15 can swap them here).
    */
-  async getRaw(url: string, headers?: Record<string, string>): Promise<RawResponse> {
+  async getRaw(url: string, headers?: Record<string, string>, opts?: { timeoutMs?: number }): Promise<RawResponse> {
     const host = this.hostOf(url);
     await this.rateLimit(host);
-    const resp = await this.http.get(url, { responseType: "text", headers });
+    // Issue #107: `opts.timeoutMs` overrides the client timeout for this
+    // request only (a slow news feed, e.g. cic-news). Omitted = client default.
+    const resp = await this.http.get(url, {
+      responseType: "text",
+      headers,
+      ...(opts?.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+    });
     // 429/503 -> HostBackoffError (Retry-After honoured by the crawl).
     this.assertNotThrottled(url, resp);
     const finalUrl = resp.request?.res?.responseUrl || url;

@@ -292,6 +292,28 @@ describe("hourly state rules", () => {
     assert.deepEqual(r.scope, { keyPrefix: "source_broken:news:" });
   });
 
+  // Issue #107: auto-pause flags; who paused it decides whether it alerts.
+  test("source_broken (#107): details carry id, failures, last error; admin / missing-key pauses do not alert", () => {
+    const r = rules.evaluateBrokenSources(
+      "visa",
+      [
+        { id: "HK", countryName: "Hong Kong", status: "broken", consecutiveFailures: 3, autoPaused: true, autoPausedReason: "HTTP 404 apikey=abc123secret" },
+        // An admin pause with a long streak: someone chose it (the pre-#107 rule alerted here).
+        { id: "FR", countryName: "France", status: "paused", consecutiveFailures: 12 },
+        // The crawler's missing-key pause is a config gap, not a crawl failure.
+        { id: "ND", countryName: "x", status: "paused", autoPaused: true, autoPauseCause: "missing_api_key" },
+      ],
+      cfg()
+    );
+    assert.deepEqual(r.signals.map((s: any) => s.key), ["source_broken:visa:HK"]);
+    const d = r.signals[0].details;
+    assert.equal(d.sourceId, "HK");
+    assert.equal(d.consecutiveFailures, 3);
+    assert.match(d.lastError, /^HTTP 404/);
+    assert.ok(!d.lastError.includes("abc123secret"), "redacted");
+    assert.match(r.signals[0].message, /last error: HTTP 404/);
+  });
+
   test("fx: stale AND the latest run failed to refresh; ageing alone is fine", () => {
     const failed = run("v1", { summary: { fxRefreshed: false }, warnings: ["FX refresh failed: 500"] });
     assert.equal(rules.evaluateFx(NOW - 49 * HOUR, failed, NOW, cfg()).signals.length, 1);
@@ -464,6 +486,28 @@ describe("hourly check", () => {
     // The stuck run finishes: its alert clears via the hook.
     await quiet(() => svc.onRunFinalized(run("stuck", { status: "succeeded" })));
     assert.equal(alertDocs().find((d) => d.dedupeKey === "run_stuck:stuck")!.status, "resolved");
+  });
+
+  // Issue #107: raised once per source while auto-paused, resolved by a reset.
+  test("source_broken (#107): raised for an auto-paused news source, deduped, resolved once it is active again", async () => {
+    store.set("newsSources/cic-news", {
+      name: "CIC News",
+      status: "broken",
+      consecutiveFailures: 5,
+      autoPaused: true,
+      autoPausedReason: "timeout of 30000ms exceeded",
+      lastErrorMessage: "timeout of 30000ms exceeded",
+    });
+    await quiet(() => svc.runHourlyCheck(NOW));
+    await quiet(() => svc.runHourlyCheck(NOW + 1000));
+    const mine = alertDocs().filter((d) => d.rule === "source_broken");
+    assert.equal(mine.length, 1, "deduped per source");
+    assert.equal(mine[0].dedupeKey, "source_broken:news:cic-news");
+    assert.equal((mine[0].details as any).lastError, "timeout of 30000ms exceeded");
+    // PATCH resetFailures (or a successful manual run) -> active, flags cleared.
+    store.set("newsSources/cic-news", { name: "CIC News", status: "active", consecutiveFailures: 0, autoPaused: false });
+    await quiet(() => svc.runHourlyCheck(NOW + 2000));
+    assert.equal(alertDocs().find((d) => d.rule === "source_broken")!.status, "resolved");
   });
 
   test("missed window, broken source, stale review queue, FX failing", async () => {

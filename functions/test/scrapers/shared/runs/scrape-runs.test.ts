@@ -512,10 +512,16 @@ describe("visa orchestrator run records", () => {
         };
       },
     };
+    // Issue #107: the health write is now a transaction; make it fail too.
+    const origTx = crawl.runTransaction;
+    crawl.runTransaction = async () => {
+      throw new Error("write failed");
+    };
     try {
       await assert.rejects(withStubs(() => crawl.runOrchestrator({ now: NOW, fetchFxRates })), /write failed/);
     } finally {
       firebase.collections.visaSources = origUpdate;
+      crawl.runTransaction = origTx;
     }
     const run = onlyRun();
     assert.equal(run.status, "failed");

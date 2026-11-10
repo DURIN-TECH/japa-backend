@@ -38,6 +38,11 @@ import { loadScraperSettingsResult, type LoadedScraperSettings } from "../shared
 // Per-source crawl leases (issue #96 review): one crawl of a source at a time.
 import { leaseHeldReason, sourceLeaseService, type HeldLease, type SourceLeaseService } from "../shared/runs/source-lease";
 import type { ScraperSettings } from "../shared/settings/types";
+// Issue #107: the per-run source health write (auto-pause at
+// news.consecutiveFailureLimit, missing-API-key pause), moved here from
+// services/news.service.ts.
+import { newsSourceHealthService, type NewsSourceHealthResult } from "./news-source-health";
+import type { ScrapeRunSourceEntry } from "../shared/runs/types";
 
 // ============================================
 // CRAWLER ETIQUETTE (issue #76)
@@ -72,8 +77,8 @@ import type { ScraperSettings } from "../shared/settings/types";
 //    are skipped and remaining article pages on it are not fetched. The
 //    source's next visit is pushed to no earlier than the Retry-After time
 //    (`notBeforeMs` on updateSourceAfterScrape), and the run counts as a
-//    failure toward the source's auto-pause ("broken" after repeated
-//    failures, see news.service.ts).
+//    failure toward the source's auto-pause ("broken" after
+//    news.consecutiveFailureLimit failures, see news-source-health.ts, #107).
 //
 // We NEVER rotate IPs, use proxies, or spoof / rotate the User-Agent to get
 // around a block, a rate limit or a robots.txt rule (same policy as
@@ -111,9 +116,18 @@ export { redactSecrets, describeError };
  * accepts every status so the fetch layer sees 429/503 (and decides what is
  * an error) instead of axios throwing first.
  */
+/**
+ * Default per-request timeout of the news HTTP client (ms). A source may
+ * raise it with `config.requestTimeoutMs` (issue #107, e.g. cic-news, whose
+ * feed host is slow at times), capped at NEWS_MAX_REQUEST_TIMEOUT_MS.
+ */
+export const NEWS_HTTP_TIMEOUT_MS = 15_000;
+/** Largest per-source timeout honoured (keeps a run inside the function timeout). */
+export const NEWS_MAX_REQUEST_TIMEOUT_MS = 60_000;
+
 export function createNewsHttpClient(): AxiosInstance {
   return axios.create({
-    timeout: 15000,
+    timeout: NEWS_HTTP_TIMEOUT_MS,
     headers: {
       "User-Agent": NEWS_BOT_USER_AGENT,
       Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -140,7 +154,11 @@ type CustomItem = {
 // DEPENDENCIES (injectable for tests)
 // ============================================
 
-/** The slice of newsService the scraper writes through (a stub in tests). */
+/**
+ * The slice of newsService the scraper reads / writes through (a stub in
+ * tests), plus the source health writes (issue #107: they moved to
+ * news-source-health.ts; a stub store may omit pauseForMissingApiKey).
+ */
 export type NewsScraperStore = Pick<
   typeof newsService,
   | "getDueSources"
@@ -149,9 +167,36 @@ export type NewsScraperStore = Pick<
   | "createScrapeRun"
   | "isDuplicate"
   | "createArticlesBatch"
-  | "updateSourceAfterScrape"
   | "completeScrapeRun"
->;
+> & {
+  // Returns what was written (or void from a test stub).
+  updateSourceAfterScrape: (
+    sourceId: string,
+    success: boolean,
+    errorMessage?: string,
+    notBeforeMs?: number,
+    opts?: { failureLimit?: number }
+  ) => Promise<NewsSourceHealthResult | null | void>;
+  pauseForMissingApiKey?: (sourceId: string, provider: string) => Promise<boolean>;
+};
+
+/**
+ * The production store: newsService's reads / article writes + the health
+ * writes. Methods resolve their target at CALL time (scrapers/index.ts import
+ * cycle: the singletons may not exist yet when this module loads).
+ */
+function defaultNewsStore(): NewsScraperStore {
+  return {
+    getDueSources: (limit) => newsService.getDueSources(limit),
+    getSourceById: (id) => newsService.getSourceById(id),
+    createScrapeRun: (id, runId) => newsService.createScrapeRun(id, runId),
+    isDuplicate: (u, t) => newsService.isDuplicate(u, t),
+    createArticlesBatch: (a) => newsService.createArticlesBatch(a),
+    completeScrapeRun: (id, runId, r) => newsService.completeScrapeRun(id, runId, r),
+    updateSourceAfterScrape: (id, ok, msg, nb, o) => newsSourceHealthService.updateSourceAfterScrape(id, ok, msg, nb, o),
+    pauseForMissingApiKey: (id, provider) => newsSourceHealthService.pauseForMissingApiKey(id, provider),
+  };
+}
 
 /** Constructor options — all optional; defaults are the production values. */
 export interface NewsScraperServiceOptions {
@@ -190,6 +235,13 @@ export interface ScrapeSourceTrace {
    * scrapeSource threw before it got that far (e.g. createScrapeRun failed).
    */
   sourceHealthRecorded?: boolean;
+  /**
+   * Issue #107: what the health write decided (streak, limit, auto-pause),
+   * for the run's source line. Unset when the store returned nothing (stubs).
+   */
+  health?: NewsSourceHealthResult;
+  /** Issue #107: `news.consecutiveFailureLimit` for this run (input). */
+  failureLimit?: number;
 }
 
 /** A zeroed news run result (a switched-off or fail-closed tick returns it). */
@@ -231,7 +283,7 @@ export class NewsScraperService {
 
   constructor(options: NewsScraperServiceOptions = {}) {
     this.clock = options.clock ?? Date.now;
-    this.store = options.store ?? newsService;
+    this.store = options.store ?? defaultNewsStore();
     this.runs = options.runs ?? scrapeRunService;
     // A wrapper (not the bare import): the singleton is built at module load,
     // and the binding must be read at call time (scrapers/index.ts cycle).
@@ -387,7 +439,7 @@ export class NewsScraperService {
         held.push(lease);
         leased.push(source);
       }
-      await this.scrapeDueSources(leased, result, recorder);
+      await this.scrapeDueSources(leased, result, recorder, settings.news.consecutiveFailureLimit);
     } catch (err) {
       // Only reachable if a store write outside the per-source try throws
       // (or a lease could not be taken).
@@ -432,7 +484,9 @@ export class NewsScraperService {
   private async scrapeDueSources(
     dueSources: NewsSource[],
     result: OrchestratorResult,
-    recorder: Awaited<ReturnType<ScrapeRunService["start"]>>
+    recorder: Awaited<ReturnType<ScrapeRunService["start"]>>,
+    // Issue #107: news.consecutiveFailureLimit in force for this run.
+    failureLimit?: number
   ): Promise<void> {
 
     // One backoff tracker per run (issue #76): a host that answers 429/503
@@ -440,6 +494,34 @@ export class NewsScraperService {
     const tracker = new HostBackoffTracker(this.clock());
 
     for (const source of dueSources) {
+      // ---- Issue #107: news_api source without its provider key ----
+      // Paused (cause "missing_api_key") instead of erroring: no request, no
+      // failure counted, no error line, so it cannot mark the run partial.
+      // A `deferred` line says why. Once the secret is set an admin
+      // un-pauses it (PATCH ... { "resetFailures": true }).
+      const missingKeyProvider = this.missingApiKeyProvider(source);
+      if (missingKeyProvider) {
+        const paused = this.store.pauseForMissingApiKey
+          ? await this.store.pauseForMissingApiKey(source.id, missingKeyProvider)
+          : false;
+        result.sourcesPaused = (result.sourcesPaused ?? 0) + 1;
+        const why =
+          `paused: missing API key for provider ${missingKeyProvider} ` +
+          `(secret NEWS_API_KEY_${missingKeyProvider.toUpperCase()} is not set)` +
+          (paused ? "" : "; source status left unchanged");
+        console.warn(`Skipping source ${source.name}: ${why}`);
+        recorder.recordSource({
+          sourceId: source.id,
+          name: source.name,
+          status: "deferred",
+          pagesAttempted: 0,
+          pagesFetched: 0,
+          errors: 0,
+          error: why,
+        });
+        continue;
+      }
+
       // Host already backed off in this run → skip WITHOUT sending a request.
       // Recorded like the catalog crawler does: a failure (toward auto-pause)
       // with the backoff message, next visit no earlier than Retry-After.
@@ -451,26 +533,33 @@ export class NewsScraperService {
         // Issue #81: a deferred source on the run record (counted as an
         // error, like the result above, because it counts toward auto-pause).
         recorder.recordError({ sourceId: source.id, url: this.entryUrlFor(source), error: backoffMessage(blocked) });
-        recorder.recordSource({
-          sourceId: source.id,
-          name: source.name,
-          status: "deferred",
-          pagesAttempted: 0,
-          pagesFetched: 0,
-          errors: 1,
-          error: backoffMessage(blocked),
-        });
-        await this.store.updateSourceAfterScrape(
+        const health = await this.store.updateSourceAfterScrape(
           source.id,
           false,
           backoffMessage(blocked),
-          blocked.untilMs
+          blocked.untilMs,
+          { failureLimit }
+        );
+        this.noteAutoPause(result, health);
+        recorder.recordSource(
+          withHealth(
+            {
+              sourceId: source.id,
+              name: source.name,
+              status: "deferred",
+              pagesAttempted: 0,
+              pagesFetched: 0,
+              errors: 1,
+              error: backoffMessage(blocked),
+            },
+            health
+          )
         );
         continue;
       }
 
       // Filled by scrapeSource even when it throws (issue #81).
-      const trace: ScrapeSourceTrace = { requestsAttempted: 0 };
+      const trace: ScrapeSourceTrace = { requestsAttempted: 0, failureLimit };
       try {
         const scrapeResult = await this.scrapeSource(source, tracker, { runId: recorder.id, trace });
         result.sourcesProcessed++;
@@ -480,23 +569,28 @@ export class NewsScraperService {
         result.articlesFailed += scrapeResult.articlesFailed ?? 0;
         result.requestsAttempted += trace.requestsAttempted;
         recorder.addPagesAttempted(trace.requestsAttempted);
-        recorder.recordSource({
-          sourceId: source.id,
-          name: source.name,
-          // The per-source log's "partial" (every article failed to
-          // normalise) maps to the run vocabulary's partial.
-          status: scrapeResult.status === "partial" ? "partial" : "succeeded",
-          pagesAttempted: trace.requestsAttempted,
-          pagesFetched: trace.requestsAttempted,
-          errors: 0,
-          sourceRunId: trace.sourceRunId,
-          counts: {
-            articlesFound: scrapeResult.articlesFound ?? 0,
-            articlesNew: scrapeResult.articlesNew ?? 0,
-            articlesDuplicate: scrapeResult.articlesDuplicate ?? 0,
-            articlesFailed: scrapeResult.articlesFailed ?? 0,
-          },
-        });
+        recorder.recordSource(
+          withHealth(
+            {
+              sourceId: source.id,
+              name: source.name,
+              // The per-source log's "partial" (every article failed to
+              // normalise) maps to the run vocabulary's partial.
+              status: scrapeResult.status === "partial" ? "partial" : "succeeded",
+              pagesAttempted: trace.requestsAttempted,
+              pagesFetched: trace.requestsAttempted,
+              errors: 0,
+              sourceRunId: trace.sourceRunId,
+              counts: {
+                articlesFound: scrapeResult.articlesFound ?? 0,
+                articlesNew: scrapeResult.articlesNew ?? 0,
+                articlesDuplicate: scrapeResult.articlesDuplicate ?? 0,
+                articlesFailed: scrapeResult.articlesFailed ?? 0,
+              },
+            },
+            trace.health
+          )
+        );
       } catch (error) {
         result.errors++;
         result.requestsAttempted += trace.requestsAttempted;
@@ -505,16 +599,6 @@ export class NewsScraperService {
         // status, and the recorder redacts again before storing.
         recorder.addPagesAttempted(trace.requestsAttempted);
         recorder.recordError({ sourceId: source.id, url: this.entryUrlFor(source), error: describeError(error) });
-        recorder.recordSource({
-          sourceId: source.id,
-          name: source.name,
-          status: "failed",
-          pagesAttempted: trace.requestsAttempted,
-          pagesFetched: 0,
-          errors: 1,
-          sourceRunId: trace.sourceRunId,
-          error: describeError(error),
-        });
         // Never log the raw error: an axios error carries the request URL
         // (NewsData.io's key is in its query string). describeError() keeps
         // host + status + message, redacted.
@@ -527,13 +611,33 @@ export class NewsScraperService {
         // it here when scrapeSource threw before its own write (the trace
         // flag is unset), so each source gets exactly one update per run.
         if (!trace.sourceHealthRecorded) {
-          await this.store.updateSourceAfterScrape(
+          const health = await this.store.updateSourceAfterScrape(
             source.id,
             false,
             describeError(error),
-            isHostBackoffError(error) ? error.untilMs : undefined
+            isHostBackoffError(error) ? error.untilMs : undefined,
+            { failureLimit }
           );
+          if (health) trace.health = health;
         }
+        this.noteAutoPause(result, trace.health);
+        // Issue #107: the source line is written AFTER the health write so
+        // it carries the streak, the limit and whether this run auto-paused it.
+        recorder.recordSource(
+          withHealth(
+            {
+              sourceId: source.id,
+              name: source.name,
+              status: "failed",
+              pagesAttempted: trace.requestsAttempted,
+              pagesFetched: 0,
+              errors: 1,
+              sourceRunId: trace.sourceRunId,
+              error: describeError(error),
+            },
+            trace.health
+          )
+        );
       }
     }
   }
@@ -624,8 +728,12 @@ export class NewsScraperService {
         await this.store.createArticlesBatch(newArticles);
       }
 
-      // 4. Update source health
-      await this.store.updateSourceAfterScrape(source.id, true);
+      // 4. Update source health (issue #107: a success on an auto-paused
+      //    source, i.e. a manual retry, makes it active again)
+      const okHealth = await this.store.updateSourceAfterScrape(source.id, true, undefined, undefined, {
+        failureLimit: link?.trace?.failureLimit,
+      });
+      if (okHealth && link?.trace) link.trace.health = okHealth;
       markHealthRecorded();
 
       // 5. Complete the scrape run record
@@ -670,18 +778,43 @@ export class NewsScraperService {
       // orchestrator skips its own when the trace says we did it). Skipped
       // if the success write above already counted this run.
       if (!healthRecorded) {
-        await this.store.updateSourceAfterScrape(
+        const failHealth = await this.store.updateSourceAfterScrape(
           source.id,
           false,
           describeError(error),
           // Don't come back before the host's Retry-After time.
-          isHostBackoffError(error) ? error.untilMs : undefined
+          isHostBackoffError(error) ? error.untilMs : undefined,
+          // Issue #107: auto-pause at news.consecutiveFailureLimit.
+          { failureLimit: link?.trace?.failureLimit }
         );
+        if (failHealth && link?.trace) link.trace.health = failHealth;
         markHealthRecorded();
       }
 
       throw error;
     }
+  }
+
+  // ============================================
+  // SOURCE HEALTH HELPERS (issue #107)
+  // ============================================
+
+  /**
+   * The provider of a `news_api` source whose key secret
+   * (`NEWS_API_KEY_<PROVIDER>`) is not set, or undefined (the source can run,
+   * or it is not a news_api source). A misconfigured source without
+   * apiConfig is NOT reported here: fetchNewsApi throws its own clear error.
+   */
+  private missingApiKeyProvider(source: NewsSource): string | undefined {
+    if (source.strategy !== "news_api") return undefined;
+    const provider = source.config?.apiConfig?.provider;
+    if (!provider) return undefined;
+    return process.env[`NEWS_API_KEY_${provider.toUpperCase()}`] ? undefined : provider;
+  }
+
+  /** Count a source THIS run auto-paused (summary.sourcesAutoPaused). */
+  private noteAutoPause(result: OrchestratorResult, health: NewsSourceHealthResult | null | void | undefined): void {
+    if (health && health.newlyAutoPaused) result.sourcesAutoPaused = (result.sourcesAutoPaused ?? 0) + 1;
   }
 
   // ============================================
@@ -751,13 +884,15 @@ export class NewsScraperService {
    * HostBackoffError on 429/503 (robots.txt or the URL itself), and a plain
    * error on any other non-2xx. Returns the body text.
    */
-  private async crawlGet(url: string, headers: Record<string, string>): Promise<string> {
+  private async crawlGet(url: string, headers: Record<string, string>, timeoutMs?: number): Promise<string> {
     // Issue #81: counted as attempted even when robots.txt then blocks it.
     this.requestsAttempted++;
     if (!(await this.fetcher.isAllowedByRobots(url))) {
       throw new Error(`Blocked by robots.txt: ${url}`);
     }
-    const resp = await this.fetcher.getRaw(url, headers);
+    // Issue #107: a per-source timeout (config.requestTimeoutMs) overrides
+    // the client's NEWS_HTTP_TIMEOUT_MS for this request only.
+    const resp = await this.fetcher.getRaw(url, headers, timeoutMs ? { timeoutMs } : undefined);
     if (resp.status < 200 || resp.status >= 300) {
       throw new Error(`Fetch failed for ${url} (HTTP ${resp.status})`);
     }
@@ -779,7 +914,8 @@ export class NewsScraperService {
       feedUrl,
       this.requestHeaders(source, {
         Accept: "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8",
-      })
+      }),
+      sourceTimeoutMs(source)
     );
     const feed = await this.rssParser.parseString(xml);
 
@@ -813,7 +949,7 @@ export class NewsScraperService {
 
     // Politeness: the fetch layer's per-host gap (1.5s) replaces the old
     // fixed 1s sleep; robots.txt + backoff are checked inside crawlGet.
-    const html = await this.crawlGet(source.url, this.requestHeaders(source));
+    const html = await this.crawlGet(source.url, this.requestHeaders(source), sourceTimeoutMs(source));
 
     const $ = cheerio.load(html);
     const articles: RawArticle[] = [];
@@ -869,7 +1005,7 @@ export class NewsScraperService {
       for (const article of articles.slice(0, MAX_FULL_CONTENT_ARTICLES)) {
         if (tracker.blocking(hostOf(article.url))) continue;
         try {
-          const detailHtml = await this.crawlGet(article.url, {});
+          const detailHtml = await this.crawlGet(article.url, {}, sourceTimeoutMs(source));
           const detail$ = cheerio.load(detailHtml);
           article.body = this.cleanText(
             detail$(selectors.articleBody).text()
@@ -1151,6 +1287,38 @@ export class NewsScraperService {
       .replace(/<[^>]*>/g, "")
       .trim();
   }
+}
+
+// ============================================
+// MODULE HELPERS (issue #107)
+// ============================================
+
+/**
+ * A source's per-request timeout (config.requestTimeoutMs), clamped to
+ * 1..NEWS_MAX_REQUEST_TIMEOUT_MS; undefined = the client default.
+ */
+export function sourceTimeoutMs(source: NewsSource): number | undefined {
+  const t = source.config?.requestTimeoutMs;
+  if (typeof t !== "number" || !Number.isFinite(t) || t <= 0) return undefined;
+  return Math.min(Math.round(t), NEWS_MAX_REQUEST_TIMEOUT_MS);
+}
+
+/**
+ * A run source line plus the source's health after this run (issue #107):
+ * streak, the limit in force and whether it is auto-paused. Unchanged when
+ * the store returned nothing (test stubs).
+ */
+function withHealth(entry: ScrapeRunSourceEntry, health: NewsSourceHealthResult | null | void | undefined): ScrapeRunSourceEntry {
+  if (!health) return entry;
+  return {
+    ...entry,
+    health: {
+      consecutiveFailures: health.consecutiveFailures,
+      consecutiveFailureLimit: health.consecutiveFailureLimit,
+      autoPaused: health.autoPaused,
+      autoPausedThisRun: health.newlyAutoPaused,
+    },
+  };
 }
 
 export const newsScraperService = new NewsScraperService();
