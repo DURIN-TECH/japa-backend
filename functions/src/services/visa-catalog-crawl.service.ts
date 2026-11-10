@@ -84,6 +84,9 @@ export interface CrawlSummary {
   // written / replaced for an admin (issue #61). Not counted in `skipped`.
   proposed: number;
   withdrawn: number; // source said withdrawn → no extraction (scraped doc deactivated if present)
+  // Issue #68: withdrawn scraped visas whose page is live again, put back in
+  // the admin review queue (reviewStatus pending_review; never reactivated).
+  restored: number;
   errors: number;
   // FX (issue #59): whether appConfig/fx was refreshed this run, and how many
   // flagged pending visas were re-converted (cost written) from stored fee
@@ -142,6 +145,7 @@ class VisaCatalogCrawlService {
       skipped: 0,
       proposed: 0,
       withdrawn: 0,
+      restored: 0,
       errors: 0,
       fxRefreshed: false,
       feesReconverted: 0,
@@ -302,6 +306,15 @@ class VisaCatalogCrawlService {
             continue;
           }
 
+          // ---- Restored at source: admin review signal (issue #68) ----
+          // The page is live. If its scraped doc was deactivated as withdrawn
+          // (and was approved), put it back to pending_review so it shows in
+          // the admin Visa Review queue. Runs BEFORE the hash gate, so it
+          // fires whether or not the text changed; never reactivates.
+          // Its read of the doc is reused by the #71 prompt check below.
+          const restored = await visaCatalogService.markRestored(source.countryCode, visaId);
+          if (restored.outcome === "flagged") summary.restored++;
+
           // ---- Linked surcharges (issue #69) ----
           // [] for an unmarked page (no request). A failure (fetch error,
           // rate not found on the linked page, 429) throws into the catch
@@ -342,7 +355,9 @@ class VisaCatalogCrawlService {
           // maxExtractions accounting below, so a version bump drains over
           // several runs instead of re-extracting everything at once.
           if (!changed) {
-            const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId);
+            const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId, {
+              doc: restored.doc, // same doc, already read by markRestored (no second read)
+            });
             if (!promptStale) continue; // nothing new, skip the LLM
             summary.promptReextracts++;
           } else {

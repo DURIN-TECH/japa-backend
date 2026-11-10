@@ -33,6 +33,7 @@ import {
   diffFeeComponents,
   diffVisa,
   findStaleReason,
+  isApprovedTextAlreadyHandled,
   isPendingPromptStale,
   mergeProposal,
   planIngest,
@@ -469,5 +470,42 @@ describe("planProposalFeeReconvert", () => {
     const row = rowOf(planProposalWrite({ live, input: ingestInput(extraction({ processingDaysMax: 30 }), "h2"), now: NOW }));
     assert.equal(planProposalFeeReconvert(row, live, fx(), NOW), null);
     assert.equal(planProposalFeeReconvert({ ...row, status: "rejected" }, live, fx(), NOW), null);
+  });
+});
+
+// ----- Manual script hash gate for approved docs (issue #68) -----
+
+describe("isApprovedTextAlreadyHandled (issue #68)", () => {
+  const approved = { source: "scraped" as const, reviewStatus: "approved" as const };
+
+  test("approved scraped doc: handled when the registry page hash matches", () => {
+    assert.equal(isApprovedTextAlreadyHandled(approved, "h2", { pageLastContentHash: "h2" }), true);
+  });
+
+  test("approved scraped doc: handled when a proposal row exists for this text", () => {
+    assert.equal(isApprovedTextAlreadyHandled(approved, "h2", { hasProposalForHash: true }), true);
+  });
+
+  test("approved scraped doc: NOT handled for new text (page hash differs, no proposal)", () => {
+    assert.equal(
+      isApprovedTextAlreadyHandled(approved, "h3", { pageLastContentHash: "h2", hasProposalForHash: false }),
+      false
+    );
+    assert.equal(isApprovedTextAlreadyHandled(approved, "h3", {}), false);
+  });
+
+  test("never for pending / rejected / withdrawn / seeded / agent / missing docs", () => {
+    const seen = { pageLastContentHash: "h", hasProposalForHash: true };
+    const cases: [string, Parameters<typeof isApprovedTextAlreadyHandled>[0]][] = [
+      ["missing", undefined],
+      ["pending", { source: "scraped", reviewStatus: "pending_review" }],
+      ["rejected", { source: "scraped", reviewStatus: "rejected" }],
+      ["withdrawn", { ...approved, staleSince: Timestamp.fromMillis(1) }],
+      ["seeded", { source: undefined, reviewStatus: "approved" }],
+      ["agent", { source: "agent", reviewStatus: "approved" }],
+    ];
+    for (const [label, existing] of cases) {
+      assert.equal(isApprovedTextAlreadyHandled(existing, "h", seen), false, label);
+    }
   });
 });
