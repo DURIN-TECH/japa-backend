@@ -398,6 +398,18 @@ export interface RunHostFacts {
   touched: Set<string>;
   // host -> source ids seen with it (to tell whether a later run touched it).
   sourcesByHost: Map<string, Set<string>>;
+  // host -> latest "retry after" instant (ms) in its backoff messages, when given.
+  untilByHost: Map<string, number>;
+}
+
+/**
+ * The "retry after <ISO>" instant of a backoff message (backoffMessage in
+ * visa-crawl-host-state.ts), or undefined (e.g. a bare "status=429").
+ */
+export function backoffUntilMs(message: string | undefined): number | undefined {
+  const m = typeof message === "string" ? /retry after (\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/.exec(message) : null;
+  const ms = m ? Date.parse(m[1]) : NaN;
+  return Number.isNaN(ms) ? undefined : ms;
 }
 
 /**
@@ -412,10 +424,15 @@ export function runHostFacts(run: ScrapeRunDoc): RunHostFacts {
   const backedOff = new Set<string>();
   const touched = new Set<string>();
   const sourcesByHost = new Map<string, Set<string>>();
-  const note = (host: string, sourceId: string | undefined, backoff: boolean) => {
+  const untilByHost = new Map<string, number>();
+  const note = (host: string, sourceId: string | undefined, backoff: boolean, message?: string) => {
     if (!host) return;
     touched.add(host);
-    if (backoff) backedOff.add(host);
+    if (backoff) {
+      backedOff.add(host);
+      const until = backoffUntilMs(message);
+      if (until !== undefined && until > (untilByHost.get(host) ?? 0)) untilByHost.set(host, until);
+    }
     if (sourceId) {
       if (!sourcesByHost.has(host)) sourcesByHost.set(host, new Set());
       sourcesByHost.get(host)!.add(sourceId);
@@ -423,12 +440,12 @@ export function runHostFacts(run: ScrapeRunDoc): RunHostFacts {
   };
   for (const p of run.pages ?? []) {
     if (p.outcome === "supplement") continue; // not necessarily requested this run
-    note(hostOfUrl(p.url), p.sourceId, (p.outcome === "error" || p.outcome === "deferred") && isBackoffMessage(p.error));
+    note(hostOfUrl(p.url), p.sourceId, (p.outcome === "error" || p.outcome === "deferred") && isBackoffMessage(p.error), p.error);
   }
   for (const e of run.errors ?? []) {
-    note(hostOfUrl(e.url), e.sourceId, isBackoffMessage(e.message));
+    note(hostOfUrl(e.url), e.sourceId, isBackoffMessage(e.message), e.message);
   }
-  return { backedOff, touched, sourcesByHost };
+  return { backedOff, touched, sourcesByHost, untilByHost };
 }
 
 /**
@@ -479,7 +496,15 @@ export function evaluateHostBackoff(run: ScrapeRunDoc, previous: ScrapeRunDoc[],
       kind: run.kind,
       subject: { type: "host", id: host, label: host },
       message: `${host} answered 429/503 on ${streak} consecutive ${run.kind} runs (latest ${run.id}); the scraper is backing off`,
-      details: { runId: run.id, host, consecutiveRuns: streak, sources: [...hostSources].sort().join(",") || null },
+      details: {
+        runId: run.id,
+        host,
+        consecutiveRuns: streak,
+        // Read back by evaluateHostBackoffClears (hourly): which sources use
+        // the host, and when the host said we may come back.
+        sources: [...hostSources].sort().join(",") || null,
+        backoffUntil: facts.untilByHost.has(host) ? isoOf(facts.untilByHost.get(host)!) : null,
+      },
       eventId: run.id,
       runId: run.id,
     });
@@ -490,6 +515,50 @@ export function evaluateHostBackoff(run: ScrapeRunDoc, previous: ScrapeRunDoc[],
     if (!facts.backedOff.has(host)) clearKeys.push(`host_backoff:${run.kind}:${host}`);
   }
   return { rule: "host_backoff", signals, scope: { keys: clearKeys } };
+}
+
+/** An active host_backoff alert, as the hourly clear check reads it. */
+export interface ActiveHostBackoffAlert {
+  dedupeKey: string; // "host_backoff:<kind>:<host>"
+  kind: ScrapeRunKind | null;
+  details?: ScrapeAlertDetails; // sources (comma list), backoffUntil (ISO)
+}
+
+/**
+ * host_backoff clears that no run reports (review fix; hourly): a backoff
+ * alert normally clears when a later run touches the host cleanly, but that
+ * run may never come. Clear it when
+ *  - every source it was seen with is no longer crawled (status other than
+ *    `active`: paused / broken / retired, or the source doc is gone); or
+ *  - the host's last "retry after" has passed: the backoff is over, and no
+ *    run since has backed off again (that run would have bumped it with a
+ *    later backoffUntil, or cleared it).
+ * Signals nothing; scope = the keys it decided are clear.
+ *
+ * @param sourceStatus kind -> (source id -> status); a missing id = removed.
+ */
+export function evaluateHostBackoffClears(
+  alerts: ActiveHostBackoffAlert[],
+  sourceStatus: Partial<Record<ScrapeRunKind, Map<string, string>>>,
+  nowMs: number
+): RuleEvaluation {
+  const keys: string[] = [];
+  for (const a of alerts) {
+    // ---- Backoff expired ----
+    const untilIso = typeof a.details?.backoffUntil === "string" ? a.details.backoffUntil : undefined;
+    const until = untilIso ? Date.parse(untilIso) : NaN;
+    if (!Number.isNaN(until) && until <= nowMs) {
+      keys.push(a.dedupeKey);
+      continue;
+    }
+    // ---- Every source it belongs to stopped (or vanished) ----
+    const statuses = a.kind ? sourceStatus[a.kind] : undefined;
+    const ids = typeof a.details?.sources === "string" ? a.details.sources.split(",").filter(Boolean) : [];
+    if (statuses && ids.length > 0 && ids.every((id) => (statuses.get(id) ?? "removed") !== "active")) {
+      keys.push(a.dedupeKey);
+    }
+  }
+  return { rule: "host_backoff", signals: [], scope: { keys } };
 }
 
 // ============================================

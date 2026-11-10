@@ -132,6 +132,10 @@ export interface ScrapeAlertDoc {
   message: string; // latest description (refreshed on every bump)
   details?: ScrapeAlertDetails;
   lastRunId?: string; // the run that last raised / bumped it, when there is one
+  // Review fix: true when the post-run hook stored this alert as new /
+  // escalated but skipped the email because the scraper function was near its
+  // timeout. The hourly check emails it and clears the flag.
+  emailPending?: boolean;
 
   firstSeen: Timestamp;
   lastSeen: Timestamp;
@@ -159,15 +163,25 @@ export interface ScrapeAlertDoc {
 
 /**
  * `scrapeAlertKeys/{sha256(dedupeKey)}` — pointer from a dedupe key to its
- * ACTIVE alert. Exists only while that alert is open / acknowledged (deleted
- * on resolve). Reading it inside the upsert transaction is what makes "one
+ * ACTIVE alert. Exists while that alert is open / acknowledged; deleted on
+ * auto-resolve. Reading it inside the upsert transaction is what makes "one
  * active alert per key" hold under concurrent checks (a transaction can lock
  * a single doc, even a missing one, but not "no doc matches this query").
+ *
+ * TOMBSTONE (review fix): a MANUAL resolve of an alert that has occurrence
+ * ids (run ids, window openings) keeps the pointer, pointing at the resolved
+ * alert, with `suppressEventIds` = those ids. A later check that signals one
+ * of the SAME occurrences (the hourly check re-reading the run the admin just
+ * resolved) is then skipped instead of opening + emailing a new alert; a NEW
+ * occurrence (a new failing run) replaces the tombstone with a new alert, and
+ * an auto-resolve (condition cleared) deletes it.
  */
 export interface ScrapeAlertKeyDoc {
   dedupeKey: string;
   alertId: string;
   createdAt: Timestamp;
+  suppressEventIds?: string[]; // tombstone only: occurrences already resolved by hand
+  resolvedAt?: Timestamp; // tombstone only
 }
 
 // ============================================

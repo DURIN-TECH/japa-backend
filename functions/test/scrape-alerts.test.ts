@@ -23,6 +23,10 @@
 //  - finalize hook: script runs ignored; hourly check: stuck runs, a
 //    stale-swept failed run (no hook) raises run_failed; a disabled rule
 //    resolves its alerts; default config written when missing
+//  - review fixes: a manual resolve does not re-open the same run (tombstone),
+//    auto-resolve race guard, host_backoff clears for stopped sources /
+//    expired backoffs, post-run time budget (emailPending -> hourly),
+//    critical emails bypass the email opt-out
 //  - controller: 403 for owner / agent / client on every route, list
 //    filters (open includes acknowledged), acknowledge / resolve, 404 / 409
 
@@ -603,7 +607,7 @@ describe("scrape-alert controller", () => {
     assert.equal((await call("list", req(ROLES.ADMIN, { query: { cursor: "missing" } }))).status, 400);
   });
 
-  test("acknowledge / resolve: audit fields, idempotence, 404, 409, pointer freed", async () => {
+  test("acknowledge / resolve: audit fields, idempotence, 404, 409, pointer tombstoned", async () => {
     seedAlert("a1");
     store.set(`scrapeAlertKeys/${alertsMod.alertKeyId("run_failed:a1")}`, { dedupeKey: "run_failed:a1", alertId: "a1" });
     const ack = await call("acknowledge", req(ROLES.ADMIN, { params: { id: "a1" } }));
@@ -618,11 +622,125 @@ describe("scrape-alert controller", () => {
     assert.equal(res.body.data.status, "resolved");
     assert.equal(res.body.data.resolvedBy, "admin-uid");
     assert.equal(res.body.data.autoResolved, false);
-    assert.equal(pointerDocs().length, 0);
+    // The alert had occurrence ids: the pointer stays as a tombstone so the
+    // same run is not re-opened by the next check (review fix).
+    assert.equal(pointerDocs().length, 1);
+    assert.deepEqual(pointerDocs()[0].suppressEventIds, ["r1"]);
     assert.equal((await call("resolve", req(ROLES.ADMIN, { params: { id: "a1" } }))).status, 200); // idempotent
     assert.equal((await call("acknowledge", req(ROLES.ADMIN, { params: { id: "a1" } }))).status, 409);
     assert.equal((await call("acknowledge", req(ROLES.ADMIN, { params: { id: "nope" } }))).status, 404);
     assert.equal((await call("get", req(ROLES.ADMIN, { params: { id: "nope" } }))).status, 404);
     assert.equal((await call("get", req(ROLES.ADMIN, { params: { id: "a1" } }))).body.data.id, "a1");
+  });
+});
+
+// ============================================
+// Review fixes
+// ============================================
+
+describe("review fixes", () => {
+  test("manual resolve: the same failed run is not re-opened; a new failing run is", async () => {
+    seedRun(run("r1", { status: "failed" }));
+    await quiet(() => svc.runHourlyCheck(NOW));
+    const first = alertDocs()[0];
+    assert.equal(first.status, "open");
+    await quiet(() => svc.resolve(first.id, "admin1", NOW + 1000));
+    // Tombstone pointer remembers r1.
+    assert.deepEqual(pointerDocs()[0].suppressEventIds, ["r1"]);
+
+    emails = [];
+    await quiet(() => svc.runHourlyCheck(NOW + HOUR)); // re-reads r1: skipped
+    assert.equal(alertDocs().length, 1);
+    assert.equal(emails.length, 0);
+
+    seedRun(run("r2", { status: "failed", startedAt: Timestamp.fromMillis(NOW + HOUR) }));
+    await quiet(() => svc.runHourlyCheck(NOW + 2 * HOUR)); // new failing run: new alert
+    assert.equal(alertDocs().filter((d) => d.status === "open").length, 1);
+    assert.equal(emails.length, 2);
+
+    // A success (finalized later than that hourly check) clears it and removes the pointer.
+    svc.realClock = () => NOW + 3 * HOUR;
+    try {
+      await quiet(() => svc.onRunFinalized(run("r3", { startedAt: Timestamp.fromMillis(NOW + 2 * HOUR) })));
+    } finally {
+      svc.realClock = () => NOW;
+    }
+    assert.equal(pointerDocs().length, 0);
+    assert.equal(alertDocs().filter((d) => d.status === "open").length, 0);
+  });
+
+  test("auto-resolve skips an alert seen after the evaluation started", async () => {
+    seedAlert("a1", { dedupeKey: "run_failed:visa", lastSeen: Timestamp.fromMillis(NOW + 5 * 60 * 1000) });
+    store.set(`scrapeAlertKeys/${alertsMod.alertKeyId("run_failed:visa")}`, { dedupeKey: "run_failed:visa", alertId: "a1" });
+    const actions = await quiet(() =>
+      svc.applyEvaluations([{ rule: "run_failed", signals: [], scope: { keys: ["run_failed:visa"] } }], cfg(), NOW)
+    );
+    assert.equal(actions.length, 0);
+    assert.equal((store.get("scrapeAlerts/a1") as any).status, "open");
+    assert.equal(pointerDocs().length, 1);
+    // An evaluation that started after that sighting does resolve it.
+    await quiet(() => svc.applyEvaluations([{ rule: "run_failed", signals: [], scope: { keys: ["run_failed:visa"] } }], cfg(), NOW + HOUR));
+    assert.equal((store.get("scrapeAlerts/a1") as any).status, "resolved");
+  });
+
+  test("host_backoff: backoffUntil recorded; cleared when sources stop or the backoff expires", async () => {
+    // Rule records the retry-after instant.
+    const msg = "host backed off (429), retry after 2026-11-10T13:00:00.000Z";
+    const page = { sourceId: "GB", url: "https://www.gov.uk/v", outcome: "error", error: msg };
+    const sig = rules.evaluateHostBackoff(run("r2", { pages: [page] }), [run("r1", { pages: [page] })], cfg()).signals[0];
+    assert.equal(sig.details.backoffUntil, "2026-11-10T13:00:00.000Z");
+    assert.equal(sig.details.sources, "GB");
+
+    // Pure clears.
+    const statuses = { visa: new Map([["GB", "paused"], ["IE", "active"]]) };
+    const r = rules.evaluateHostBackoffClears(
+      [
+        { dedupeKey: "host_backoff:visa:a", kind: "visa", details: { sources: "GB", backoffUntil: null } }, // paused
+        { dedupeKey: "host_backoff:visa:b", kind: "visa", details: { sources: "XX", backoffUntil: null } }, // removed
+        { dedupeKey: "host_backoff:visa:c", kind: "visa", details: { sources: "IE", backoffUntil: "2026-11-10T11:00:00.000Z" } }, // expired
+        { dedupeKey: "host_backoff:visa:d", kind: "visa", details: { sources: "IE", backoffUntil: "2026-11-10T13:00:00.000Z" } }, // still on
+      ],
+      statuses,
+      NOW
+    );
+    assert.deepEqual(r.scope.keys, ["host_backoff:visa:a", "host_backoff:visa:b", "host_backoff:visa:c"]);
+
+    // Through the hourly check.
+    store.set("visaSources/GB", { countryCode: "GB", status: "paused", consecutiveFailures: 0 });
+    seedAlert("h1", { rule: "host_backoff", dedupeKey: "host_backoff:visa:www.gov.uk", details: { sources: "GB", backoffUntil: null } });
+    store.set(`scrapeAlertKeys/${alertsMod.alertKeyId("host_backoff:visa:www.gov.uk")}`, { dedupeKey: "host_backoff:visa:www.gov.uk", alertId: "h1" });
+    await quiet(() => svc.runHourlyCheck(NOW));
+    const h1 = store.get("scrapeAlerts/h1") as any;
+    assert.equal(h1.status, "resolved");
+    assert.equal(h1.autoResolved, true);
+  });
+
+  test("post-run time budget: near the timeout -> stored, emailed by the hourly check; past it -> skipped", async () => {
+    const late = await quiet(() =>
+      svc.onRunFinalized(run("r1", { status: "failed", durationMs: alertsMod.HOOK_NO_EMAIL_AFTER_MS + 1000 }))
+    );
+    assert.equal(late.actions.length, 1);
+    assert.equal(emails.length, 0);
+    assert.equal(alertDocs()[0].emailPending, true);
+    seedRun(run("r1", { status: "failed" })); // the hourly check sees the same run (no new occurrence)
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(emails.length, 2); // sent now
+    assert.equal(alertDocs()[0].emailPending, false);
+    emails = [];
+    await quiet(() => svc.runHourlyCheck(NOW + HOUR));
+    assert.equal(emails.length, 0); // only once
+
+    resetStore();
+    const skipped = await quiet(() => svc.onRunFinalized(run("r9", { status: "failed", durationMs: alertsMod.HOOK_SKIP_AFTER_MS })));
+    assert.equal(skipped, undefined);
+    assert.equal(alertDocs().length, 0);
+  });
+
+  test("critical alert emails bypass the email opt-out; warnings respect it", async () => {
+    await quiet(() => svc.onRunFinalized(run("r1", { status: "failed" })));
+    assert.ok(emails.length > 0 && emails.every((e) => e.critical === true));
+    emails = [];
+    await quiet(() => svc.onRunFinalized(run("r2", { pagesAttempted: 10, errorCount: 5 }))); // error_rate warning (run_failed clears)
+    assert.ok(emails.length > 0 && emails.every((e) => e.critical === false));
   });
 });

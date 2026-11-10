@@ -18,13 +18,20 @@ Code: `src/services/scrape-alert-rules.ts` (pure rule logic),
 | Trigger | Where | Rules |
 | --- | --- | --- |
 | After every run (scheduled / manual) | #81 finalize hook, registered in `index.ts` (`scrapeAlertService.onRunFinalized`) | `run_failed`, `run_stuck` (clears the run's own), `error_rate`, `linked_surcharge`, `host_backoff`, `source_broken` (that scraper) |
-| Hourly, :45 UTC | `checkScrapeAlerts` scheduled function (`runHourlyCheck`) | `run_stuck`, `run_failed` (latest finished run per scraper), `missed_window`, `source_broken`, `fx_refresh_failing`, `llm_budget`, `review_queue_stale`; then the daily digest |
+| Hourly, :45 UTC | `checkScrapeAlerts` scheduled function (`runHourlyCheck`; 300s timeout, 256MB) | `run_stuck`, `run_failed` (latest finished run per scraper), `missed_window`, `source_broken`, `host_backoff` clears (below), `fx_refresh_failing`, `llm_budget`, `review_queue_stale`; then emails held back by a late hook (`emailPending`) and the daily digest |
 
 Script runs (`trigger: "script"`, the CLI) never alert. Stale sweeps (#81) fire
 no hook, so the hourly check reads the latest finished run of each scraper
 itself: a run the sweep marked `failed` raises `run_failed` within the hour.
 A read failure skips only that rule for that check (logged, see below) and
 never resolves its alerts.
+
+**Post-run time budget.** The hook runs inside the scraper function's 540s
+timeout, after the crawl. `run.durationMs` (real elapsed time) decides:
+>= 450s (`HOOK_NO_EMAIL_AFTER_MS`) the alerts are stored but not emailed; they
+get `emailPending: true` and the next hourly check emails them and clears the
+flag. >= 500s (`HOOK_SKIP_AFTER_MS`) the hook does nothing: the hourly check
+still catches `run_failed`, the other per-run rules are lost for that run.
 
 ## Rules
 
@@ -47,6 +54,11 @@ How `host_backoff` sees hosts: visa page lines (`pages[]`, every line's host is
 lines, so a later news run counts as touching the host when it processed a
 source that was seen with that host.
 
+A backoff alert also clears on the hourly check, without a run, when every
+source it was seen with (`details.sources`) is no longer `active` (paused,
+broken, retired or deleted), or when the host's last "retry after"
+(`details.backoffUntil`) has passed.
+
 **Budget (#82):** the rule reads `scrapeAlertService.costSource`
 (`getMonthToDateCost(): Promise<{ monthUsd, budgetUsd | null }>`). Until #82
 lands it is a stub returning `budgetUsd: null`, so the rule is skipped (TODO in
@@ -68,6 +80,16 @@ lands it is a stub returning `budgetUsd: null`, so the rule is skipped (TODO in
 - **Auto-resolved** when the condition clears: `status: resolved`,
   `resolvedBy: "system"`, `autoResolved: true`, pointer deleted. A resolved alert
   is never re-opened; a recurrence creates a new alert (and a new email).
+  Race guard: inside the resolve transaction, an alert whose `lastSeen` is later
+  than the evaluation's start (another check re-raised it meanwhile) is left
+  alone.
+- **Resolved by hand**: when the alert has occurrence ids, the pointer stays as
+  a tombstone (`suppressEventIds`, `resolvedAt`, pointing at the resolved alert).
+  A check that sees one of those SAME occurrences again (the hourly check
+  re-reading the run the admin resolved) skips it: no new alert, no email. A
+  new occurrence (a new failing run) opens a new alert; an auto-resolve deletes
+  the tombstone. Alerts without occurrence ids (source_broken, fx, review
+  queue) free the key, so a condition that still holds opens a new alert.
 - A rule disabled in config has its active alerts resolved.
 
 ## Document shape (`scrapeAlerts/{alertId}`)
@@ -87,6 +109,7 @@ lands it is a stub returning `budgetUsd: null`, so the rule is skipped (TODO in
   "lastRunId": "Ab12",
   "firstSeen": Timestamp, "lastSeen": Timestamp, "count": 2,
   "eventIds": ["Ab12", "Cd34"],     // internal, not returned by the API
+  "emailPending": false,            // true while a late post-run hook's email waits for the hourly check
   "escalatedAt": Timestamp,         // when it last escalated
   "status": "open",                 // open | acknowledged | resolved
   "acknowledgedBy": "uid" | null, "acknowledgedAt": Timestamp | null,
@@ -134,8 +157,12 @@ template; without `RESEND_API_KEY` it takes the stub path and records a
 `[Critical] Visa scraper: run failed`, or `[Critical] 3 new scraper alerts` when
 one check raised several (one email per check, not per alert). The CTA links to
 `APP_URL + /admin/scrapers?tab=alerts` (TODO #84: the dashboard's real route).
-Acknowledged alerts are not emailed again unless they escalate. Users'
-email opt-out preference is respected. Tests use `delivered+<name>@resend.dev`.
+Acknowledged alerts are not emailed again unless they escalate. An email that
+lists a **critical** alert is sent with notifyUser's existing `critical: true`
+flag (the one security emails use), so it reaches admins who switched email
+off; warning / info emails respect the opt-out. If every admin opted out and
+nothing is critical, only the log line is written. Tests use
+`delivered+<name>@resend.dev`.
 
 The scraper functions (`crawlVisaCatalogOrchestrator`, `scrapeNewsOrchestrator`)
 and `checkScrapeAlerts` bind `RESEND_API_KEY` / `EMAIL_FROM`.
@@ -203,5 +230,6 @@ also `status in [...]`), `rule ASC + status ASC` (auto-resolve scope query);
 plus the TTL field override `scrapeAlerts.expireAt` (180 days), deployed by CI
 like the #81 one. The rules also use existing indexes: `scrapeRuns`
 `kind + startedAt DESC`, `pendingVisaChanges` `status + createdAt DESC`.
-`scrapeAlertKeys` needs no index or TTL (one doc per active alert, deleted on
-resolve). Both collections are backend-only (no `firestore.rules` match).
+`scrapeAlertKeys` needs no index or TTL (one doc per active alert or manual
+resolve tombstone; deleted on auto-resolve, replaced by the next occurrence).
+`emailPending == true` uses the automatic single-field index. Both collections are backend-only (no `firestore.rules` match).

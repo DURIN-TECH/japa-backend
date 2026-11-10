@@ -517,8 +517,11 @@ scrapeRunService.registerFinalizeHook((run) => scrapeAlertService.onRunFinalized
  * when configured. :45 sits between the visa tick (:15) and news ticks
  * (:00 / :30). Thresholds + recipients: Firestore `appConfig/scrapeAlerts`.
  */
+// Explicit budget (review fix): the work is sequential (a query per visa
+// source, a transaction per alert, an email per admin), so the 60s default
+// is too tight. 256MB is plenty: it holds a few hundred small docs at most.
 export const checkScrapeAlerts = functions
-  .runWith({ secrets: EMAIL_SECRETS })
+  .runWith({ timeoutSeconds: 300, memory: "256MB", secrets: EMAIL_SECRETS })
   .pubsub.schedule("45 * * * *")
   .timeZone("UTC")
   .onRun(async () => {

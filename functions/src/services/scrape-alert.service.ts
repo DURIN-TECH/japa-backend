@@ -14,6 +14,7 @@ import {
   evaluateErrorRate,
   evaluateFx,
   evaluateHostBackoff,
+  evaluateHostBackoffClears,
   evaluateLinkedSurcharge,
   evaluateMissedWindows,
   evaluateReviewQueue,
@@ -91,6 +92,18 @@ const REVIEW_QUEUE_MAX_CHANGES = 500;
 /** Admin list defaults (GET /admin/scrape-alerts). */
 export const SCRAPE_ALERT_LIST_DEFAULT_LIMIT = 25;
 export const SCRAPE_ALERT_LIST_MAX_LIMIT = 100;
+/**
+ * Post-run hook time budget (review fix). The scraper functions have a 540s
+ * timeout and the hook runs after the crawl, inside it. `run.durationMs` is
+ * the run's real elapsed time (≈ time since the function started), so:
+ *  - past HOOK_SKIP_AFTER_MS the hook does nothing (the hourly check still
+ *    catches run_failed; that run's per-run rules are lost);
+ *  - past HOOK_NO_EMAIL_AFTER_MS alerts are stored but not emailed; they are
+ *    flagged `emailPending` and the hourly check emails them.
+ */
+export const SCRAPER_FUNCTION_TIMEOUT_MS = 540_000;
+export const HOOK_SKIP_AFTER_MS = 500_000;
+export const HOOK_NO_EMAIL_AFTER_MS = 450_000;
 /** Most alerts listed in one email. */
 const MAX_ALERTS_PER_EMAIL = 25;
 /**
@@ -258,6 +271,13 @@ export class ScrapeAlertService {
   async onRunFinalized(run: ScrapeRunDoc): Promise<AlertCheckResult | undefined> {
     try {
       if (run.trigger === "script") return undefined;
+      // ---- Time budget (see HOOK_SKIP_AFTER_MS) ----
+      const elapsed = run.durationMs ?? 0;
+      if (elapsed >= HOOK_SKIP_AFTER_MS) {
+        console.warn(`Scrape alerts: run ${run.id} took ${elapsed}ms, too close to the function timeout; post-run rules skipped (hourly check covers run_failed)`);
+        return undefined;
+      }
+      const deferEmail = elapsed >= HOOK_NO_EMAIL_AFTER_MS;
       const config = await this.loadConfig();
       if (!config.enabled) return undefined;
       const nowMs = this.realClock();
@@ -277,7 +297,7 @@ export class ScrapeAlertService {
       await this.isolated("source_broken", skippedRules, async () => {
         evals.push(evaluateBrokenSources(run.kind, await this.sourceFacts(run.kind), config));
       });
-      return await this.finish(evals, config, nowMs, skippedRules, false);
+      return await this.finish(evals, config, nowMs, skippedRules, false, deferEmail);
     } catch (err) {
       this.engineError("finalize", err, run.id);
       return undefined;
@@ -324,6 +344,21 @@ export class ScrapeAlertService {
         });
       }
 
+      // ---- host_backoff clears no run reports (review fix) ----
+      // Paused / retired / removed sources, or the host's retry-after passed.
+      await this.isolated("host_backoff_clear", skippedRules, async () => {
+        const active = await collections.scrapeAlerts
+          .where("rule", "==", "host_backoff")
+          .where("status", "in", ACTIVE_STATUSES)
+          .get();
+        if (active.empty) return;
+        const sourceStatus: Partial<Record<ScrapeRunKind, Map<string, string>>> = {};
+        for (const kind of ["visa", "news"] as ScrapeRunKind[]) {
+          sourceStatus[kind] = new Map((await this.sourceFacts(kind)).map((f) => [f.id, String(f.status ?? "")]));
+        }
+        evals.push(evaluateHostBackoffClears(active.docs.map((d) => d.data() as ScrapeAlertDoc), sourceStatus, nowMs));
+      });
+
       // ---- FX (#59) ----
       // Only when the latest visa run could be read (else we can't tell
       // "failing" from "not tried").
@@ -361,10 +396,18 @@ export class ScrapeAlertService {
     config: ScrapeAlertsConfig,
     nowMs: number,
     skippedRules: string[],
-    hourly: boolean
+    hourly: boolean,
+    deferEmail = false
   ): Promise<AlertCheckResult> {
-    const actions = await this.applyEvaluations(evals, config, nowMs);
-    const { emailed, recipients } = await this.emailImmediate(actions, config);
+    const actions = await this.applyEvaluations(evals, config, nowMs, { deferEmail });
+    if (deferEmail) {
+      // Stored with emailPending: the hourly check sends them.
+      return { actions, emailed: 0, recipients: 0, digestSent: false, skippedRules };
+    }
+    // Hourly: also email what a post-run hook stored but could not send.
+    const toEmail = hourly ? [...actions, ...(await this.pendingEmailActions(actions))] : actions;
+    const { emailed, recipients } = await this.emailImmediate(toEmail, config);
+    if (hourly) await this.clearEmailPending(toEmail);
     const digestSent = hourly ? await this.sendDigestIfDue(config, nowMs) : false;
     return { actions, emailed, recipients, digestSent, skippedRules };
   }
@@ -385,7 +428,12 @@ export class ScrapeAlertService {
    * Each alert write is its own transaction; one failing write is logged and
    * the rest go on.
    */
-  async applyEvaluations(evals: RuleEvaluation[], config: ScrapeAlertsConfig, nowMs: number): Promise<AlertAction[]> {
+  async applyEvaluations(
+    evals: RuleEvaluation[],
+    config: ScrapeAlertsConfig,
+    nowMs: number,
+    opts: { deferEmail?: boolean } = {}
+  ): Promise<AlertAction[]> {
     const actions: AlertAction[] = [];
     for (const raw of evals) {
       const evaluation: RuleEvaluation = ruleEnabled(config, raw.rule) ? raw : { rule: raw.rule, signals: [], scope: "all" };
@@ -394,7 +442,7 @@ export class ScrapeAlertService {
       // ---- Signals ----
       for (const signal of evaluation.signals) {
         try {
-          const action = await this.upsert(signal, nowMs);
+          const action = await this.upsert(signal, nowMs, opts.deferEmail === true);
           if (action) actions.push(action);
         } catch (err) {
           this.engineError(`upsert:${signal.key}`, err);
@@ -436,7 +484,7 @@ export class ScrapeAlertService {
    * guarded by the key's pointer doc. Returns null when nothing changed (the
    * same occurrence seen again, no escalation).
    */
-  private async upsert(signal: AlertSignal, nowMs: number): Promise<AlertAction | null> {
+  private async upsert(signal: AlertSignal, nowMs: number, deferEmail: boolean): Promise<AlertAction | null> {
     const pointerRef = collections.scrapeAlertKeys.doc(alertKeyId(signal.key));
     const now = Timestamp.fromMillis(nowMs);
     return this.runTransaction(async (tx) => {
@@ -446,6 +494,17 @@ export class ScrapeAlertService {
       const alertRef = pointed ? collections.scrapeAlerts.doc(pointed.alertId) : undefined;
       const existingSnap = alertRef ? await tx.get(alertRef) : undefined;
       const existing = existingSnap?.exists ? (existingSnap.data() as ScrapeAlertDoc) : undefined;
+
+      // ---- Tombstone of a manual resolve: same occurrence -> skip ----
+      // (see ScrapeAlertKeyDoc). Without this, the hourly check would re-read
+      // the run an admin just resolved and open + email a new alert for it.
+      if (
+        existing?.status === "resolved" &&
+        signal.eventId !== undefined &&
+        (pointed?.suppressEventIds ?? []).includes(signal.eventId)
+      ) {
+        return null;
+      }
 
       // ---- Bump / escalate the active alert ----
       if (existing && alertRef && existing.status !== "resolved") {
@@ -471,6 +530,7 @@ export class ScrapeAlertService {
           if (SEVERITY_RANK[signal.severity] > SEVERITY_RANK[existing.severity]) update.severity = signal.severity;
           if ((signal.level ?? 0) > (existing.level ?? 0)) update.level = signal.level;
           update.escalatedAt = now;
+          if (deferEmail) update.emailPending = true;
           if (existing.status === "acknowledged") {
             update.status = "open";
             update.acknowledgedBy = null;
@@ -497,6 +557,7 @@ export class ScrapeAlertService {
         firstSeen: now,
         lastSeen: now,
         count: 1,
+        ...(deferEmail ? { emailPending: true } : {}),
         eventIds: signal.eventId !== undefined ? [signal.eventId] : [],
         status: "open",
         acknowledgedBy: null,
@@ -516,8 +577,10 @@ export class ScrapeAlertService {
 
   /**
    * Auto-resolve the active alert for `key` (the condition cleared). Also
-   * removes a stale pointer (its alert gone / already resolved). Returns null
-   * when there was nothing active.
+   * removes a stale pointer (its alert gone / already resolved, incl. a
+   * manual-resolve tombstone). Returns null when there was nothing active, or
+   * when the alert was seen after `nowMs` (the evaluation's start: see the
+   * race guard below).
    */
   private async resolveKey(key: string, nowMs: number): Promise<AlertAction | null> {
     const pointerRef = collections.scrapeAlertKeys.doc(alertKeyId(key));
@@ -528,6 +591,11 @@ export class ScrapeAlertService {
       const alertRef = collections.scrapeAlerts.doc((pointer.data() as ScrapeAlertKeyDoc).alertId);
       const snap = await tx.get(alertRef);
       const alert = snap.exists ? (snap.data() as ScrapeAlertDoc) : undefined;
+      // Race guard (review fix): another check (a finalize hook running
+      // alongside the hourly check) re-raised this alert AFTER this
+      // evaluation read its data. Its sighting is newer than our "clear"
+      // verdict, so leave the alert (and its pointer) alone.
+      if (alert && alert.status !== "resolved" && (msOf(alert.lastSeen) ?? 0) > nowMs) return null;
       tx.delete(pointerRef);
       if (!alert || alert.status === "resolved") return null;
       const update = {
@@ -642,7 +710,8 @@ export class ScrapeAlertService {
       `${lines.join("\n\n")}\n\n` +
       "Acknowledge or resolve them on the scraper dashboard. You get one email when an alert opens or gets worse, not on every check.";
 
-    const sent = await this.sendToAdmins(config, title, body);
+    // A critical alert reaches admins even if they turned email off.
+    const sent = await this.sendToAdmins(config, title, body, alerts.some((a) => a.severity === "critical"));
     return { emailed: sent > 0 ? alerts.length : 0, recipients: sent };
   }
 
@@ -685,7 +754,7 @@ export class ScrapeAlertService {
       const body =
         `${alerts.length} scraper alert(s) are active (${open} open, ${alerts.length - open} acknowledged).\n\n` +
         lines.join("\n\n");
-      return (await this.sendToAdmins(config, title, body)) > 0;
+      return (await this.sendToAdmins(config, title, body, alerts.some((a) => a.severity === "critical"))) > 0;
     } catch (err) {
       this.engineError("digest", err);
       return false;
@@ -695,9 +764,10 @@ export class ScrapeAlertService {
   /**
    * One branded email per admin recipient via notifyUser (EMAIL ONLY,
    * type `scrape_alert`: no event template, so the subject is `title`).
+   * `critical` bypasses the recipient's email opt-out (notifyUser).
    * Returns how many recipients it was sent to (attempted).
    */
-  private async sendToAdmins(config: ScrapeAlertsConfig, title: string, body: string): Promise<number> {
+  private async sendToAdmins(config: ScrapeAlertsConfig, title: string, body: string, critical: boolean): Promise<number> {
     let uids: string[];
     try {
       uids = await this.recipients(config);
@@ -718,6 +788,11 @@ export class ScrapeAlertService {
           title,
           body,
           channels: ["email"],
+          // notifyUser's existing override: a `critical` notification keeps
+          // its email even when the user switched email off. Set when the
+          // email lists a CRITICAL alert, so an opted-out admin is not left
+          // unaware that scraping is down. Warnings / info respect the opt-out.
+          critical,
           actionUrl: `${EMAIL_BRANDING.appUrl}${SCRAPE_ALERTS_PORTAL_PATH}`,
         });
         sent++;
@@ -726,6 +801,37 @@ export class ScrapeAlertService {
       }
     }
     return sent;
+  }
+
+  /**
+   * Alerts a post-run hook stored without emailing (near the function
+   * timeout), as created / escalated actions for emailImmediate. Skips ones
+   * already in `actions` and ones resolved since.
+   */
+  private async pendingEmailActions(actions: AlertAction[]): Promise<AlertAction[]> {
+    try {
+      const seen = new Set(actions.map((a) => a.alert.id));
+      const snap = await collections.scrapeAlerts.where("emailPending", "==", true).get();
+      return snap.docs
+        .map((d) => d.data() as ScrapeAlertDoc)
+        .filter((a) => !seen.has(a.id) && a.status !== "resolved")
+        .map((alert) => ({ action: alert.escalatedAt ? ("escalated" as const) : ("created" as const), alert }));
+    } catch (err) {
+      this.engineError("pending_email", err);
+      return [];
+    }
+  }
+
+  /** Clear `emailPending` on the alerts just emailed (or no longer emailable). */
+  private async clearEmailPending(actions: AlertAction[]): Promise<void> {
+    for (const a of actions) {
+      if (!a.alert.emailPending) continue;
+      try {
+        await collections.scrapeAlerts.doc(a.alert.id).update({ emailPending: false });
+      } catch (err) {
+        this.engineError("pending_email_clear", err);
+      }
+    }
   }
 
   // ---------- Reads behind the rules ----------
@@ -876,8 +982,23 @@ export class ScrapeAlertService {
         expireAt: expireAtFrom(nowMs),
       };
       tx.update(ref, update);
-      // Only drop the pointer when it points at THIS alert.
-      if (pointer.exists && (pointer.data() as ScrapeAlertKeyDoc).alertId === id) tx.delete(pointerRef);
+      // Only touch the pointer when it points at THIS alert. With occurrence
+      // ids, keep it as a tombstone so the SAME occurrence is not re-opened by
+      // the next check (ScrapeAlertKeyDoc); without, free the key.
+      if (pointer.exists && (pointer.data() as ScrapeAlertKeyDoc).alertId === id) {
+        const eventIds = alert.eventIds ?? [];
+        if (eventIds.length > 0) {
+          tx.set(pointerRef, {
+            dedupeKey: alert.dedupeKey,
+            alertId: id,
+            createdAt: (pointer.data() as ScrapeAlertKeyDoc).createdAt ?? now,
+            suppressEventIds: eventIds.slice(-MAX_EVENT_IDS),
+            resolvedAt: now,
+          } satisfies ScrapeAlertKeyDoc);
+        } else {
+          tx.delete(pointerRef);
+        }
+      }
       return { outcome: "ok" as const, alert: { ...alert, ...update } };
     });
     if (result.outcome === "not_found") return result;
