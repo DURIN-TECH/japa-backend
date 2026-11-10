@@ -515,7 +515,7 @@ describe("scorer (eval/score.ts)", () => {
     const r = field(scoreRoute(SW, a), "applicationUrlHost");
     assert.equal(r.score, 0);
     // The failure names both hosts.
-    assert.equal(r.detail, 'host "www.gov.uk", expected "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk"');
+    assert.equal(r.detail, "host \"www.gov.uk\", expected \"apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk\"");
     a.applicationUrl = "not a url";
     assert.equal(field(scoreRoute(SW, a), "applicationUrlHost").score, 0);
   });
