@@ -4,19 +4,37 @@
 //
 // Run with `npm test`. Hermetic: NO network and NO emulator.
 //
-// BASELINE VERSION (first commit of #29): the check is still the private
-// `ApplicationController.checkApplicationAccess(req, application, action)`.
-// This file pins its allow/deny matrix (test/access/fixtures.ts) BEFORE the
-// function moves to src/utils/access.ts, so the move can be shown to change
-// nothing. The next commit points `check()` below at the shared function and
-// leaves the table alone.
+// Pins the allow/deny matrix (test/access/fixtures.ts) of the shared
+// `checkApplicationAccess` in src/utils/access.ts. The table was first run
+// green against the private `ApplicationController.checkApplicationAccess`
+// (commit "pin the application access allow/deny matrix before extraction"),
+// then this file's `check()` was pointed at the shared function with the
+// table left alone: same answers before and after the move.
+//
+// Every cell is asked THREE ways, which must all agree:
+//  1. with an already-built ability (what REST handlers pass: `req.ability`),
+//  2. with a narrow principal (what a Firestore trigger passes: no request),
+//  3. through the request adapter `checkApplicationAccessForRequest`.
+//
+// Also covers what is new in #29, all of it fail-closed:
+//  - a missing principal / missing application (admin included) is denied;
+//  - `buildAbilityForPrincipal`: malformed principal -> deny-all, and
+//    null entitlements behave like "none" (as on the request path);
+//  - `resolveAbilityForUid` (trigger side): deny-all when the principal or
+//    its entitlements cannot be resolved.
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { defineAbilitiesFor } from "@durin-tech/authz";
-import type { AuthzSubject, Entitlements } from "@durin-tech/authz";
+import { ROLES, defineAbilitiesFor } from "@durin-tech/authz";
+import type { AppAbility, AuthzSubject, Entitlements } from "@durin-tech/authz";
 
-import { applicationController } from "../../src/controllers/application.controller";
+import {
+  buildAbilityForPrincipal,
+  checkApplicationAccess,
+  checkApplicationAccessForRequest,
+  denyAllAbility,
+  resolveAbilityForUid,
+} from "../../src/utils/access";
 import type { Application } from "../../src/types";
 import {
   ACTIONS,
@@ -33,9 +51,12 @@ import type { AccessAction } from "./fixtures";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 /**
- * The check under test, reduced to (principal, entitlements, application,
- * action) -> boolean. `entitlements` undefined = RBAC only, which is what
- * `attachAuthz` passes when no entitlements cache exists.
+ * The check under test, reduced to (principal, application, action,
+ * entitlements) -> boolean. `entitlements` undefined = RBAC only, which is
+ * what `attachAuthz` passes when no entitlements cache exists.
+ *
+ * Asks the three entry points and fails if they disagree, so no caller style
+ * can be more permissive than another.
  */
 function check(
   principal: AuthzSubject,
@@ -43,9 +64,28 @@ function check(
   action?: AccessAction,
   entitlements?: Entitlements
 ): boolean {
-  const req = { ability: defineAbilitiesFor(principal, entitlements) };
-  const fn = (applicationController as any).checkApplicationAccess;
-  return action === undefined ? fn(req, application) : fn(req, application, action);
+  // 1. Built ability, exactly as `attachAuthz` builds `req.ability`.
+  const ability = defineAbilitiesFor(principal, entitlements);
+  const viaAbility =
+    action === undefined
+      ? checkApplicationAccess(ability, application)
+      : checkApplicationAccess(ability, application, action);
+  // 2. Narrow principal, no request and no pre-built ability.
+  const who = { authz: principal, entitlements };
+  const viaPrincipal =
+    action === undefined
+      ? checkApplicationAccess(who, application)
+      : checkApplicationAccess(who, application, action);
+  // 3. Request adapter (reads `req.ability` only).
+  const req = { ability };
+  const viaRequest =
+    action === undefined
+      ? checkApplicationAccessForRequest(req, application)
+      : checkApplicationAccessForRequest(req, application, action);
+
+  assert.equal(viaPrincipal, viaAbility, "principal and ability entry points disagree");
+  assert.equal(viaRequest, viaAbility, "request adapter and ability entry points disagree");
+  return viaAbility;
 }
 
 // ============================================
@@ -178,5 +218,255 @@ describe("checkApplicationAccess: subscription state", () => {
     for (const action of ACTIONS) {
       assert.equal(check(PRINCIPALS.ownerA, APPLICATIONS.bAssigned, action, ENT_LAPSED), false);
     }
+  });
+});
+
+// ============================================
+// Fail closed: missing principal / application
+// ============================================
+
+describe("checkApplicationAccess: missing inputs are denied", () => {
+  test("no principal: denied", () => {
+    for (const action of ACTIONS) {
+      assert.equal(checkApplicationAccess(null, APPLICATIONS.selfServe, action), false);
+      assert.equal(checkApplicationAccess(undefined, APPLICATIONS.selfServe, action), false);
+    }
+  });
+
+  test("an application that does not exist: denied, even for an admin", () => {
+    const adminAbility = defineAbilitiesFor(PRINCIPALS.admin);
+    for (const action of ACTIONS) {
+      assert.equal(checkApplicationAccess(adminAbility, null, action), false);
+      assert.equal(checkApplicationAccess(adminAbility, undefined, action), false);
+      assert.equal(checkApplicationAccess({ authz: PRINCIPALS.admin }, null, action), false);
+      assert.equal(checkApplicationAccessForRequest({ ability: adminAbility }, null, action), false);
+    }
+  });
+
+  test("a request with no ability: denied, and not rebuilt from other request fields", () => {
+    // `authz` says admin, but only `ability` counts.
+    const req = { authz: PRINCIPALS.admin, ability: undefined } as any;
+    assert.equal(checkApplicationAccessForRequest(req, APPLICATIONS.selfServe), false);
+  });
+
+  test("the deny-all ability denies everything", () => {
+    const none = denyAllAbility();
+    for (const app of Object.values(APPLICATIONS)) {
+      for (const action of ACTIONS) {
+        assert.equal(checkApplicationAccess(none, app, action), false);
+      }
+    }
+    assert.equal(none.can("manage", "all"), false);
+  });
+});
+
+// ============================================
+// buildAbilityForPrincipal (sync, no request)
+// ============================================
+
+/** True when `ability` grants nothing on any fixture application. */
+function deniesEverything(ability: AppAbility): boolean {
+  return Object.values(APPLICATIONS).every((app) =>
+    ACTIONS.every((action) => !checkApplicationAccess(ability, app, action))
+  );
+}
+
+describe("buildAbilityForPrincipal", () => {
+  test("builds the same ability the request path would", () => {
+    for (const cell of matrixCells()) {
+      const ability = buildAbilityForPrincipal({ authz: PRINCIPALS[cell.principal] });
+      assert.equal(
+        checkApplicationAccess(ability, APPLICATIONS[cell.application], cell.action),
+        cell.allowed,
+        `${cell.principal} ${cell.action} ${cell.application}`
+      );
+    }
+  });
+
+  test("null entitlements mean 'no plan resolved': role rules only, as on the request path", () => {
+    for (const action of ACTIONS) {
+      assert.equal(
+        checkApplicationAccess({ authz: PRINCIPALS.ownerA, entitlements: null }, APPLICATIONS.aAssigned, action),
+        true
+      );
+    }
+    // And it is the request path's ability rule for rule (undefined, not null).
+    assert.deepEqual(
+      buildAbilityForPrincipal({ authz: PRINCIPALS.ownerA, entitlements: null }).rules,
+      defineAbilitiesFor(PRINCIPALS.ownerA).rules
+    );
+  });
+
+  test("resolved entitlements are applied (lapsed plan = read-only)", () => {
+    const ability = buildAbilityForPrincipal({ authz: PRINCIPALS.ownerA, entitlements: ENT_LAPSED });
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.aAssigned, "read"), true);
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.aAssigned, "update"), false);
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.aAssigned, "delete"), false);
+  });
+
+  test("a missing or malformed principal gets the deny-all ability", () => {
+    const bad: any[] = [
+      null,
+      undefined,
+      {},
+      { authz: null },
+      { authz: undefined },
+      { authz: "uid-admin" },
+      { authz: { role: ROLES.ADMIN } }, // no uid
+      { authz: { uid: "", role: ROLES.ADMIN } }, // empty uid
+      { authz: { uid: 42, role: ROLES.ADMIN } }, // non-string uid
+      { authz: { uid: "uid-x" } }, // no role
+      { authz: { uid: "uid-x", role: "superuser" } }, // unknown role
+      { authz: { uid: "uid-x", role: "ADMIN" } }, // wrong case is not admin
+    ];
+    for (const principal of bad) {
+      const ability = buildAbilityForPrincipal(principal);
+      assert.equal(ability.rules.length, 0, `expected no rules for ${JSON.stringify(principal)}`);
+      assert.equal(deniesEverything(ability), true);
+    }
+  });
+
+  test("a malformed principal passed straight to the check is denied too", () => {
+    const who: any = { authz: { uid: "", role: ROLES.ADMIN } };
+    assert.equal(checkApplicationAccess(who, APPLICATIONS.selfServe), false);
+  });
+});
+
+// ============================================
+// resolveAbilityForUid (trigger side: uid in, ability out, never throws)
+// ============================================
+
+describe("resolveAbilityForUid: resolves like the request path", () => {
+  test("principal + no entitlements: role rules only", async () => {
+    const ability = await resolveAbilityForUid(PRINCIPALS.agentA1.uid, {
+      resolvePrincipal: async () => PRINCIPALS.agentA1,
+      resolveEntitlements: async () => null,
+    });
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.aAssigned, "update"), true);
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.aUnassigned, "read"), true);
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.aUnassigned, "update"), false);
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.bAssigned, "read"), false);
+  });
+
+  test("the whole matrix holds for a resolved principal", async () => {
+    for (const cell of matrixCells()) {
+      const principal = PRINCIPALS[cell.principal];
+      const ability = await resolveAbilityForUid(principal.uid, {
+        resolvePrincipal: async () => principal,
+        resolveEntitlements: async () => undefined,
+      });
+      assert.equal(
+        checkApplicationAccess(ability, APPLICATIONS[cell.application], cell.action),
+        cell.allowed,
+        `${cell.principal} ${cell.action} ${cell.application}`
+      );
+    }
+  });
+
+  test("resolved entitlements are applied (lapsed plan = read-only)", async () => {
+    const ability = await resolveAbilityForUid(PRINCIPALS.ownerA.uid, {
+      resolvePrincipal: async () => PRINCIPALS.ownerA,
+      resolveEntitlements: async () => ENT_LAPSED,
+    });
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.aAssigned, "read"), true);
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.aAssigned, "update"), false);
+  });
+
+  test("admins skip the entitlements lookup", async () => {
+    let asked = false;
+    const ability = await resolveAbilityForUid(PRINCIPALS.admin.uid, {
+      resolvePrincipal: async () => PRINCIPALS.admin,
+      resolveEntitlements: async () => {
+        asked = true;
+        throw new Error("must not be called for an admin");
+      },
+    });
+    assert.equal(asked, false);
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.bAssigned, "delete"), true);
+  });
+});
+
+describe("resolveAbilityForUid: defaults to deny when something cannot be resolved", () => {
+  /** Entitlements resolver for cases that must never reach it. */
+  const neverEntitlements = async (): Promise<null> => {
+    throw new Error("resolveEntitlements must not be reached");
+  };
+
+  test("empty / missing uid: deny-all, resolvers not called", async () => {
+    for (const uid of ["", null, undefined, 42 as any]) {
+      let called = false;
+      const ability = await resolveAbilityForUid(uid, {
+        resolvePrincipal: async () => {
+          called = true;
+          return PRINCIPALS.admin;
+        },
+        resolveEntitlements: neverEntitlements,
+      });
+      assert.equal(called, false);
+      assert.equal(ability.rules.length, 0);
+    }
+  });
+
+  test("principal lookup throws: deny-all", async () => {
+    const ability = await resolveAbilityForUid(PRINCIPALS.admin.uid, {
+      resolvePrincipal: async () => {
+        throw new Error("firestore unavailable");
+      },
+      resolveEntitlements: neverEntitlements,
+    });
+    assert.equal(ability.rules.length, 0);
+    assert.equal(deniesEverything(ability), true);
+  });
+
+  test("principal not found (null / undefined): deny-all", async () => {
+    for (const found of [null, undefined]) {
+      const ability = await resolveAbilityForUid("uid-ghost", {
+        resolvePrincipal: async () => found,
+        resolveEntitlements: neverEntitlements,
+      });
+      assert.equal(ability.rules.length, 0);
+    }
+  });
+
+  test("malformed principal (unknown role, empty uid): deny-all", async () => {
+    for (const found of [{ uid: "uid-x", role: "superuser" }, { uid: "", role: ROLES.ADMIN }, { uid: "uid-x" }]) {
+      const ability = await resolveAbilityForUid("uid-x", {
+        resolvePrincipal: async () => found as any,
+        resolveEntitlements: neverEntitlements,
+      });
+      assert.equal(ability.rules.length, 0);
+    }
+  });
+
+  test("resolver answers for a different uid: deny-all", async () => {
+    // Asked about client2, got the admin back: must not become admin.
+    const ability = await resolveAbilityForUid(PRINCIPALS.client2.uid, {
+      resolvePrincipal: async () => PRINCIPALS.admin,
+      resolveEntitlements: neverEntitlements,
+    });
+    assert.equal(ability.rules.length, 0);
+  });
+
+  test("entitlements lookup throws: deny-all (not role-only)", async () => {
+    // The applicant would be allowed on role rules alone; an unresolvable
+    // subscription state must not be read as "no restrictions".
+    const ability = await resolveAbilityForUid(PRINCIPALS.client1.uid, {
+      resolvePrincipal: async () => PRINCIPALS.client1,
+      resolveEntitlements: async () => {
+        throw new Error("entitlements cache unavailable");
+      },
+    });
+    assert.equal(ability.rules.length, 0);
+    assert.equal(checkApplicationAccess(ability, APPLICATIONS.selfServe, "read"), false);
+  });
+
+  test("never throws, even when a resolver throws synchronously", async () => {
+    const ability = await resolveAbilityForUid("uid-x", {
+      resolvePrincipal: () => {
+        throw new Error("sync failure");
+      },
+      resolveEntitlements: neverEntitlements,
+    });
+    assert.equal(ability.rules.length, 0);
   });
 });
