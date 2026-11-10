@@ -59,4 +59,12 @@ adminVisaRoutes.patch("/:id/review", verifyAuth, verifyAdmin, (req, res) =>
   visaController.reviewVisa(req, res)
 );
 
+// Set the USD cost of a PENDING scraped visa by hand (issue #70). Body
+// { countryCode, amountUsd, reason, rates, expectedContentHash?, expectedExtractedAt? }.
+// `verifyAuth` → 401 without a token; the controller then gates on the
+// shared CASL ability (no `verifyAdmin` role check) → 403 for non-admins.
+adminVisaRoutes.put("/:id/manual-cost", verifyAuth, (req, res) =>
+  visaController.setManualCost(req, res)
+);
+
 export { countryRoutes, visaSearchRoutes, adminVisaRoutes };

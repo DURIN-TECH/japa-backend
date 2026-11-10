@@ -49,6 +49,8 @@ function defineAbilitiesFor(principal, entitlements) {
             can("manage", "all");
             // `VisaChange` (pending scraped-visa edits) is deliberately admin-only via
             // `manage all`; never grant it to another role (ability.test.ts guards this).
+            // The same holds for `Visa` (catalog visa types, #70): only admins edit the
+            // live catalog, so no owner/agent/client grant exists for it either.
             break;
         case "owner":
             // Agency owners manage everything scoped to their agency.

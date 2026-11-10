@@ -30,7 +30,17 @@ export type SubjectType = "Application" | "Document" | "Consultation" | "Payment
  * `pendingVisaChanges` collection until an admin approves or rejects it.
  * Admin-only: no role grant exists for it (see `defineAbilitiesFor`).
  */
- | "VisaChange" | "all";
+ | "VisaChange"
+/**
+ * A catalog visa type (the live `visas` collection: requirements, fees,
+ * processing times). Distinct from `VisaChange`, which is a *proposal* to
+ * edit one: admin edits made directly to a visa document (e.g. setting a
+ * manual USD cost, #70) are gated on `Visa`, not on `VisaChange`.
+ * Admin-only for writes: no role grant exists for it (see
+ * `defineAbilitiesFor`). Public catalog reads are served by unauthenticated
+ * routes and do not go through this subject.
+ */
+ | "Visa" | "all";
 /** CASL actions. Kept as a string union plus open `string` for forward-compat. */
 export type Action = "manage" | "create" | "read" | "update" | "delete" | "assign" | "approve" | "reject" | (string & {});
 /**

@@ -191,8 +191,9 @@ export async function fakeRunTransaction<T>(fn: (tx: any) => Promise<T>): Promis
 }
 
 /**
- * Swap the real Firestore refs in utils/firebase for fakes, and the changes
- * service's transaction runner for the in-memory one. Call in `before()`.
+ * Swap the real Firestore refs in utils/firebase for fakes, and the
+ * transaction runners (changes service, catalog service, visa service) for
+ * the in-memory one. Call in `before()`.
  */
 export async function installFakes(): Promise<void> {
   const firebase: any = await import("../../src/utils/firebase");
@@ -203,4 +204,10 @@ export async function installFakes(): Promise<void> {
   firebase.subcollections.visaTypes = (cc: string) => fakeCollection(`countries/${cc}/visaTypes`);
   const changes: any = await import("../../src/services/visa-catalog-changes.service");
   changes.visaChangeService.runTransaction = fakeRunTransaction;
+  // Issue #70: the catalog's pending-refresh write and the manual-cost write
+  // are transactional too.
+  const catalog: any = await import("../../src/services/visa-catalog.service");
+  catalog.visaCatalogService.runTransaction = fakeRunTransaction;
+  const visa: any = await import("../../src/services/visa.service");
+  visa.visaService.runTransaction = fakeRunTransaction;
 }

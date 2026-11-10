@@ -62,6 +62,10 @@ export const FX_SOURCE_ECB = "frankfurter.dev (ECB reference rates)";
 /** `fxSource` label for a conversion done with OFFICIAL_USD_PEGS. */
 export const FX_SOURCE_PEG = "official peg";
 
+/** `fxSource` label for a USD cost an admin set by hand (issue #70,
+ *  services/visa-manual-cost.ts). Never produced by computeFee. */
+export const FX_SOURCE_MANUAL = "manual";
+
 /**
  * Official fixed USD pegs, in LOCAL currency units per 1 USD (same direction
  * as the Frankfurter `rates`). These currencies are not in the ECB reference
@@ -457,6 +461,9 @@ export function planFeeReconvert(
   if (visa.source !== "scraped" || visa.reviewStatus !== "pending_review") return null;
   const fee = visa.scrapeMeta?.fee;
   if (!fee || !isFeeFxFlagged(fee)) return null;
+  // Issue #70: an admin-set cost is never re-converted (it carries no flags
+  // anyway; this guards a doc that somehow has both).
+  if (fee.manualCost) return null;
 
   // Strip the derived `totalInCurrency` back to the extracted component shape.
   const components: ExtractedFeeComponent[] = fee.components.map((c) => {
@@ -484,6 +491,10 @@ export function planFeeReconvert(
     unverifiedReasons: storedReasons,
     linkedSurcharges: fee.linkedSurcharges,
   });
+  // Issue #70: keep the "a manual cost was replaced" audit entry. computeFee
+  // builds a brand-new block, so without this a re-convert would silently
+  // drop the record of an earlier overwrite.
+  if (fee.replacedManualCost) result.feeMeta.replacedManualCost = fee.replacedManualCost;
 
   if (result.baseCostUsd === undefined) {
     // Still no usable rate. Only write if the flags themselves changed
@@ -499,8 +510,10 @@ export function planFeeReconvert(
 // ----- Approval guard -----
 
 /** Message returned to the reviewer when approval is refused because the
- *  fee could not be turned into a trustworthy USD cost. (There is no API to
- *  set a cost by hand yet — follow-up issue — so it names what works today.) */
+ *  fee could not be turned into a trustworthy USD cost. Also used as the
+ *  `blockReason` of pendingVisaChanges rows, where no manual cost exists, so
+ *  it deliberately does not mention one; the review UI offers the manual
+ *  cost (PUT /admin/visas/:id/manual-cost, issue #70) for pending visas. */
 export const FEE_NOT_CONVERTED_MESSAGE =
   "Fee could not be converted to USD (stale/missing exchange rate or unverified fee). " +
   "Re-run the crawl or reject.";

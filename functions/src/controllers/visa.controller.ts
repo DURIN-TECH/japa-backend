@@ -10,6 +10,10 @@ import {
 import { VisaCategory } from "../types";
 // Typed error from the approval guard (fee not converted to USD, issue #59).
 import { VisaFeeNotConvertibleError } from "../services/visa-catalog-fx";
+// Manual USD cost (issue #70): CASL gate, body validation, typed errors.
+import { asSubject, can, forbidden } from "../middleware/authz";
+import { ManualCostError, parseManualCostInput } from "../services/visa-manual-cost";
+import { isValidDocId } from "../services/visa-catalog-changes.service";
 
 export class VisaController {
   // ============================================
@@ -361,6 +365,58 @@ export class VisaController {
         sendError(res, error.code, error.message, 409);
         return;
       }
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /admin/visas/:id/manual-cost (issue #70)
+   *
+   * Set the USD cost of a PENDING scraped visa by hand, when the scraper
+   * could not convert its fee (no rate for the currency, unverified fee, no
+   * published fee). Body:
+   *   { countryCode: "TW", amountUsd: 52, reason: "<10-500 chars>",
+   *     rates: [{ currency: "TWD", usdPerUnit: 0.031 }],   // one per non-USD fee currency
+   *     expectedContentHash?: "<scrapeMeta.contentHash the admin saw>",
+   *     expectedExtractedAt?: "<scrapeMeta.extractedAt as ISO 8601>" }
+   * amountUsd: finite, 0 <= x <= 100000 (0 = confirmed free visa).
+   * 200 → the updated visa. 400 VALIDATION_ERROR, 403 FORBIDDEN, 404
+   * NOT_FOUND, 409 NOT_PENDING_SCRAPED / FEE_ALREADY_CONVERTED / STALE_VISA.
+   *
+   * Authz: the shared CASL ability, `update` on the `Visa` subject
+   * (@durin-tech/authz >= 0.1.4: a catalog visa type, admin-only via
+   * `manage all`). This writes the visa document itself, so it is gated on
+   * `Visa`, NOT on `VisaChange` (that subject is a pending edit *proposal*
+   * in `pendingVisaChanges`, a different resource). Checked FIRST, before
+   * validation or any read, so nothing about the visa leaks to non-admins.
+   * No role literals.
+   */
+  async setManualCost(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const { id } = req.params;
+    // ---- CASL gate ----
+    // `update Visa`: an admin edit to the visa document itself (see above).
+    if (!can(req, "update", asSubject("Visa", { id }))) {
+      forbidden(res, "Only admins can set a visa's cost by hand");
+      return;
+    }
+    try {
+      // ---- Validate ----
+      // An unaddressable id (e.g. "__x__") would make Firestore throw → 404.
+      if (!isValidDocId(id)) {
+        sendError(res, "NOT_FOUND", "Visa type not found", 404);
+        return;
+      }
+      const input = parseManualCostInput(req.body);
+
+      // ---- Write (one transaction) ----
+      const updated = await visaService.setManualCost(id, input, req.userId!);
+      sendSuccess(res, updated, "Manual cost set");
+    } catch (error) {
+      if (error instanceof ManualCostError) {
+        sendError(res, error.code, error.message, error.httpStatus);
+        return;
+      }
+      console.error("Error setting manual visa cost:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }
