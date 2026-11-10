@@ -1,6 +1,7 @@
 # Spike: Visa Catalog Scraping (countries + all visa types)
 
-> **Status:** Spike / recommendation. Not yet implemented.
+> **Status:** Spike / recommendation. Steps 1–5 are now built on `dev`; see
+> [`visa-scraper-uk-reference.md`](./visa-scraper-uk-reference.md) for the current state, the UK (GOV.UK) reference design, scheduling and gaps.
 > **Goal:** Keep `countries/{code}/visaTypes/*` populated and up to date across **all** countries by scraping official immigration sources on a daily/weekly schedule — cost-effectively and without corrupting curated data.
 
 ## TL;DR recommendation
