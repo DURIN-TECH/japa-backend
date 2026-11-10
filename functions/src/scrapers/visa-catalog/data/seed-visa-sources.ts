@@ -19,6 +19,8 @@ import {
 // Registry official hosts (issue #74) — lives in a pure services module so the
 // adapters + validator can read it without importing this seed file.
 import { VISA_SOURCE_OFFICIAL_HOSTS } from "../visa-catalog-official-hosts";
+// Issue #96: the per-source admin overrides block the seed carries over.
+import type { SourceAdminOverrides } from "../../shared/settings/types";
 export { VISA_SOURCE_OFFICIAL_HOSTS };
 // Country-level linked-surcharge config (issue #69) — also in a pure services
 // module (regexes can't be stored in Firestore; the crawl reads it from code).
@@ -551,8 +553,26 @@ export function buildSeededVisaSource(params: {
   // 3b. Registry-owned night window (absent → field omitted → legacy
   //     interval scheduling). Validated here so a typo in the map fails the
   //     seed loudly instead of storing a window the orchestrator can't use.
-  const crawlWindow = windows[c.countryCode];
-  if (crawlWindow) assertValidCrawlWindow(crawlWindow);
+  const registryWindow = windows[c.countryCode];
+  if (registryWindow) assertValidCrawlWindow(registryWindow);
+
+  // 3c. Admin overrides (issue #96): an admin's edits through
+  //     PATCH /admin/scrape-sources/visa/:cc live in `adminOverrides` and
+  //     survive every re-seed. The status the admin set is already kept as
+  //     crawl state (pickSourceCrawlState); a window override REPLACES the
+  //     registry window here. An override window that no longer validates
+  //     (should never happen: the API validates) is ignored with a warning
+  //     rather than failing the whole seed.
+  const adminOverrides = existing?.adminOverrides as SourceAdminOverrides | undefined;
+  let crawlWindow = registryWindow;
+  if (adminOverrides?.crawlWindow) {
+    try {
+      assertValidCrawlWindow(adminOverrides.crawlWindow);
+      crawlWindow = adminOverrides.crawlWindow;
+    } catch (err) {
+      console.warn(`[seed-visa-sources] ${c.countryCode}: admin crawlWindow override is invalid, registry window used: ${(err as Error).message}`);
+    }
+  }
 
   // 4. Defaults for a new country, overlaid with any stored crawl/health
   //    state (pickSourceCrawlState returns {} for a new country).
@@ -566,6 +586,8 @@ export function buildSeededVisaSource(params: {
     ...(adapter ? { adapter } : {}),
     ...(crawlWindow ? { crawlWindow } : {}),
     ...(officialHosts && officialHosts.length ? { officialHosts: [...officialHosts] } : {}),
+    // Issue #96: carried over verbatim (the full overwrite below would drop it).
+    ...(adminOverrides && typeof adminOverrides === "object" ? { adminOverrides } : {}),
     crawlIntervalHours: CRAWL_INTERVAL_HOURS,
     // A brand-new country with a window waits for its night: first
     // nextCrawlAt = its next window opening (operators use the manual
@@ -628,6 +650,9 @@ function isCi(): boolean {
  *    reliabilityScore and consecutiveFailures are kept from the existing doc;
  *    only `updatedAt` is refreshed. A brand-new country gets the defaults
  *    (its nextCrawlAt = its next window opening, not now).
+ *  - Admin edits (issue #96, `adminOverrides`: status + reason, crawl
+ *    window) are kept: the block is copied over and its window replaces the
+ *    registry window.
  */
 export async function seedVisaSources(markdownPath?: string): Promise<number> {
   const file = markdownPath || findVisaSourcesMarkdown();

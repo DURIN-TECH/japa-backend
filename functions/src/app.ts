@@ -11,6 +11,13 @@ import { adminVisaChangeRoutes } from "./scrapers";
 import { adminScrapeCostRoutes, adminScrapeRunRoutes, adminScrapeSourceRoutes } from "./scrapers";
 // Scraper alerts: list / acknowledge / resolve (issue #83)
 import { adminScrapeAlertRoutes } from "./scrapers";
+// Scraper settings, per-source controls and manual "Run now" (issue #96).
+import {
+  adminScrapeRunRequestRoutes,
+  adminScrapeSourceControlRoutes,
+  adminScraperRunRoutes,
+  adminScraperSettingsRoutes,
+} from "./scrapers";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
@@ -99,6 +106,13 @@ app.use("/admin/visa-changes", adminVisaChangeRoutes);
 // Scraper monitoring (issue #81): run records + per-source health (CASL `ScrapeRun`).
 app.use("/admin/scrape-runs", adminScrapeRunRoutes);
 app.use("/admin/scrape-sources", adminScrapeSourceRoutes);
+// Issue #96: per-source edits + Run now on the same path (PATCH /:kind/:id,
+// POST /:kind/:id/run; the #81 router above only serves GET /).
+app.use("/admin/scrape-sources", adminScrapeSourceControlRoutes);
+// Issue #96: settings (read = `read ScrapeRun`, edits / runs = `update ScrapeRun`).
+app.use("/admin/scraper-settings", adminScraperSettingsRoutes);
+app.use("/admin/scrapers", adminScraperRunRoutes);
+app.use("/admin/scrape-run-requests", adminScrapeRunRequestRoutes);
 // Scraper alerts (issue #83): read = CASL `read ScrapeRun`, ack/resolve = `update ScrapeRun`.
 app.use("/admin/scrape-alerts", adminScrapeAlertRoutes);
 // Scraping cost report from the monthly rollup (issue #82; CASL `ScrapeRun`).

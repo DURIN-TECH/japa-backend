@@ -86,6 +86,10 @@ export interface VisaSourcePage {
   lastContentHash?: string;
   lastCrawledAt?: Timestamp;
   lastExtractedAt?: Timestamp;
+  // Issue #96: set when the budget hard stop skipped this page's extraction
+  // although its content changed (its old lastContentHash is kept, so the
+  // next run within budget still sees the change). Cleared on extraction.
+  extractionDeferredAt?: Timestamp;
   lastError?: string;
 }
 

@@ -269,4 +269,19 @@ export async function installFakes(): Promise<void> {
   // Issue #83: alert upserts / resolves / digest claim are transactional.
   const alerts: any = await import("../../src/scrapers/shared/alerts/scrape-alert.service");
   alerts.scrapeAlertService.runTransaction = fakeRunTransaction;
+  // Issue #96: settings audit history, Run now requests + their locks, and
+  // the three services that write them in transactions.
+  firebase.collections.scraperSettingsHistory = fakeCollection("scraperSettingsHistory");
+  firebase.collections.scrapeRunRequests = fakeCollection("scrapeRunRequests");
+  firebase.collections.scrapeRunLocks = fakeCollection("scrapeRunLocks");
+  // Review: per-source crawl leases, taken in a transaction by every crawl.
+  firebase.collections.scrapeSourceLeases = fakeCollection("scrapeSourceLeases");
+  const leases: any = await import("../../src/scrapers/shared/runs/source-lease");
+  leases.sourceLeaseService.runTransaction = fakeRunTransaction;
+  const settings: any = await import("../../src/scrapers/shared/settings/scraper-settings.service");
+  settings.scraperSettingsService.runTransaction = fakeRunTransaction;
+  const requests: any = await import("../../src/scrapers/shared/settings/scrape-run-request.service");
+  requests.scrapeRunRequestService.runTransaction = fakeRunTransaction;
+  const worker: any = await import("../../src/scrapers/shared/settings/scrape-run-worker");
+  worker.scrapeRunWorker.runTransaction = fakeRunTransaction;
 }

@@ -65,7 +65,11 @@ export const SCRAPE_ALERT_STATUSES: readonly ScrapeAlertStatus[] = ["open", "ack
  *    and the latest visa run's refresh failed;
  *  - llm_budget: month-to-date LLM cost past 50/80/100% of the budget (#82);
  *  - review_queue_stale: scraped visas pending review / open
- *    pendingVisaChanges waiting longer than reviewQueueMaxAgeDays.
+ *    pendingVisaChanges waiting longer than reviewQueueMaxAgeDays;
+ *  - budget_hard_stop (issue #96): a visa run skipped LLM extraction because
+ *    the monthly budget was spent and the hard stop is on;
+ *  - settings_unreadable (issue #96 review): appConfig/scraperSettings could
+ *    not be read, so scheduled ticks are skipped (they fail closed).
  */
 export type ScrapeAlertRule =
   | "run_failed"
@@ -77,7 +81,9 @@ export type ScrapeAlertRule =
   | "linked_surcharge"
   | "fx_refresh_failing"
   | "llm_budget"
-  | "review_queue_stale";
+  | "review_queue_stale"
+  | "budget_hard_stop"
+  | "settings_unreadable";
 
 /** Every rule id (config validation, docs). */
 export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
@@ -91,6 +97,8 @@ export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
   "fx_refresh_failing",
   "llm_budget",
   "review_queue_stale",
+  "budget_hard_stop",
+  "settings_unreadable",
 ];
 
 /**
@@ -225,6 +233,10 @@ export interface ScrapeAlertsConfig {
   // Who gets the emails: these admin uids, or (empty) every admin user.
   // Non-admin uids are ignored, so a stale list can never leak alerts.
   recipientUserIds: string[];
+  // Issue #96: extra email addresses that also receive every alert email
+  // (immediate + digest), e.g. an ops mailbox. Set by admins only (the
+  // scraper settings API); at most MAX_EXTRA_RECIPIENT_EMAILS.
+  extraRecipientEmails: string[];
   email: ScrapeAlertEmailConfig;
   thresholds: ScrapeAlertThresholds;
   rules: Partial<Record<ScrapeAlertRule, ScrapeAlertRuleConfig>>;

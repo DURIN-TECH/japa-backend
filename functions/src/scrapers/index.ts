@@ -28,6 +28,8 @@ export { newsScraperService } from "./news/news-scraper.service";
 export { scrapeRunService } from "./shared/runs/scrape-run.service";
 /** Scraper alerts (#83): post-run hook + hourly check (checkScrapeAlerts). */
 export { scrapeAlertService } from "./shared/alerts/scrape-alert.service";
+/** Manual "Run now" worker (#96): src/index.ts's processScrapeRunRequest trigger. */
+export { scrapeRunWorker } from "./shared/settings/scrape-run-worker";
 
 // ---- Admin routers (app.ts) ----
 /** Proposed edits to approved scraped visas (pendingVisaChanges, #61). */
@@ -36,6 +38,13 @@ export { adminVisaChangeRoutes } from "./visa-catalog/changes/visa-change.routes
 export { adminScrapeCostRoutes, adminScrapeRunRoutes, adminScrapeSourceRoutes } from "./shared/runs/scrape-run.routes";
 /** Scraper alerts: list / acknowledge / resolve (#83). */
 export { adminScrapeAlertRoutes } from "./shared/alerts/scrape-alert.routes";
+/** Scraper settings, per-source controls, Run now + request polling (#96). */
+export {
+  adminScrapeRunRequestRoutes,
+  adminScrapeSourceControlRoutes,
+  adminScraperRunRoutes,
+  adminScraperSettingsRoutes,
+} from "./shared/settings/scraper-settings.routes";
 
 // ---- Seeders (scripts/seed-all.ts, scripts/seed-prod-bootstrap.ts) ----
 /** News source registry seed. */

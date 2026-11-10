@@ -13,7 +13,7 @@ without reading Cloud Functions logs. Code: `src/scrapers/shared/runs/scrape-run
 | `crawlVisaCatalogOrchestrator` (hourly :15) | `scheduled` | the tick has at least one due, in-window source. Idle ticks (most of them) write nothing. |
 | `scrapeNewsOrchestrator` (every 30 min) | `scheduled` | at least one news source is due. |
 | `scrapers/visa-catalog/scripts/crawl-visa-catalog.ts` | `script` | always (after the args check); the run id is printed at the end. |
-| future admin "Run now" (#84) | `manual` | reserved; pass `trigger: "manual"` to `runOrchestrator`. |
+| admin "Run now" (#96): `processScrapeRunRequest` | `manual` | always (one source, or every due source with windows ignored); see `shared/settings/scraper-settings.md`. |
 
 Lifecycle: the doc is written `running` before any FX / fetch / LLM work, then
 finalised once with `succeeded` (no errors), `partial` (errors, but something

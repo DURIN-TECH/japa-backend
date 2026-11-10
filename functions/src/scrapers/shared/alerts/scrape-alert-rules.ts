@@ -80,6 +80,7 @@ export const DEFAULT_THRESHOLDS: ScrapeAlertThresholds = {
 export const DEFAULT_CONFIG: ScrapeAlertsConfig = {
   enabled: true,
   recipientUserIds: [],
+  extraRecipientEmails: [],
   email: {
     immediate: true,
     immediateMinSeverity: "warning",
@@ -103,7 +104,23 @@ export const DEFAULT_SEVERITY: Record<ScrapeAlertRule, ScrapeAlertSeverity> = {
   fx_refresh_failing: "warning",
   llm_budget: "warning",
   review_queue_stale: "info",
+  // Issue #96: extraction has stopped, so new visa changes are not reaching review.
+  budget_hard_stop: "critical",
+  // Review: no scheduled crawl runs while the settings doc is unreadable.
+  settings_unreadable: "critical",
 };
+
+/** Issue #96: most extra alert recipient addresses (extraRecipientEmails). */
+export const MAX_EXTRA_RECIPIENT_EMAILS = 20;
+
+/**
+ * A plausible email address: one "@", no spaces, a dot in the domain, at
+ * most 254 chars. Deliberately simple (the provider does the real check);
+ * it only keeps typos and junk out of the config.
+ */
+export function isPlausibleEmail(v: unknown): v is string {
+  return typeof v === "string" && v.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+}
 
 /** A finite number >= min (and <= max), else undefined. */
 function num(v: unknown, min: number, max = Number.POSITIVE_INFINITY): number | undefined {
@@ -181,6 +198,15 @@ export function resolveConfig(raw: unknown): { config: ScrapeAlertsConfig; probl
     : undefined;
   const recipientUserIds = pick("recipientUserIds", r.recipientUserIds, ids, [] as string[]);
 
+  // ---- Extra recipient addresses (issue #96): plausible emails, max 20 ----
+  const emails =
+    Array.isArray(r.extraRecipientEmails) &&
+    r.extraRecipientEmails.length <= MAX_EXTRA_RECIPIENT_EMAILS &&
+    r.extraRecipientEmails.every(isPlausibleEmail)
+      ? [...new Set((r.extraRecipientEmails as string[]).map((e) => e.trim().toLowerCase()))]
+      : undefined;
+  const extraRecipientEmails = pick("extraRecipientEmails", r.extraRecipientEmails, emails, [] as string[]);
+
   // ---- Per-rule overrides: known rules only ----
   const rules: ScrapeAlertsConfig["rules"] = {};
   if (r.rules && typeof r.rules === "object") {
@@ -201,6 +227,7 @@ export function resolveConfig(raw: unknown): { config: ScrapeAlertsConfig; probl
     config: {
       enabled: pick("enabled", r.enabled, bool(r.enabled), true),
       recipientUserIds,
+      extraRecipientEmails,
       email: emailCfg,
       thresholds,
       rules,
@@ -382,6 +409,93 @@ export function evaluateLinkedSurcharge(run: ScrapeRunDoc, config: ScrapeAlertsC
         details: { runId: run.id, linkedSurchargeErrors: n },
         eventId: run.id,
         runId: run.id,
+      },
+    ],
+  };
+}
+
+// ============================================
+// BUDGET HARD STOP (finalize hook, issue #96)
+// ============================================
+
+/** The one dedupe key of budget_hard_stop. */
+export const BUDGET_HARD_STOP_KEY = "budget_hard_stop:visa";
+
+/**
+ * budget_hard_stop (visa only), post-run. Raised when the run's summary says
+ * the hard stop blocked extraction (`summary.budgetHardStop === true`).
+ * Review fix: a run RESOLVES it only when it really checked the budget and
+ * found it under (`budgetChecked === true && budgetOver !== true`: hard
+ * stop off, no budget, or month-to-date below it). A run that could not
+ * read the cost, or is still over budget without having skipped a page (no
+ * changed page reached the gate), leaves the alert as it is, so it does not
+ * flap open / resolved within a month. News runs say nothing.
+ */
+export function evaluateBudgetHardStop(run: ScrapeRunDoc, config: ScrapeAlertsConfig): RuleEvaluation {
+  const key = BUDGET_HARD_STOP_KEY;
+  const keep: RuleEvaluation = { rule: "budget_hard_stop", signals: [], scope: { keys: [] } };
+  if (run.kind !== "visa" || run.status === "running") return keep;
+  if (run.summary?.budgetHardStop !== true) {
+    const under = run.summary?.budgetChecked === true && run.summary?.budgetOver !== true;
+    return under ? { rule: "budget_hard_stop", signals: [], scope: { keys: [key] } } : keep;
+  }
+  const skipped = typeof run.summary?.extractionsSkippedBudget === "number" ? (run.summary.extractionsSkippedBudget as number) : 0;
+  return {
+    rule: "budget_hard_stop",
+    scope: { keys: [key] },
+    signals: [
+      {
+        rule: "budget_hard_stop",
+        key,
+        severity: ruleSeverity(config, "budget_hard_stop"),
+        kind: "visa",
+        subject: scraperSubject("visa"),
+        message:
+          `Visa scraper run ${run.id}: the monthly LLM budget is spent and the hard stop is on, so ` +
+          `${skipped} changed page(s) were fetched but not extracted. Raise the budget or switch the hard stop off to resume.`,
+        details: { runId: run.id, extractionsSkippedBudget: skipped },
+        eventId: run.id,
+        runId: run.id,
+      },
+    ],
+  };
+}
+
+/**
+ * budget_hard_stop, hourly clear (review fix): resolve the alert when the
+ * hard stop is off, the budget was cleared, or month-to-date spend is back
+ * under the budget (a raised budget, a new month). Still over -> keep it
+ * (no bump: only a run that skipped pages bumps it). Never raises.
+ */
+export function evaluateBudgetHardStopClears(
+  hardStop: boolean,
+  cost: { monthUsd: number; budgetUsd: number | null }
+): RuleEvaluation {
+  const clear = !hardStop || cost.budgetUsd === null || cost.monthUsd < cost.budgetUsd;
+  return { rule: "budget_hard_stop", signals: [], scope: { keys: clear ? [BUDGET_HARD_STOP_KEY] : [] } };
+}
+
+/**
+ * settings_unreadable (issue #96 review), hourly: reading
+ * appConfig/scraperSettings failed (`readError` set) -> a critical alert,
+ * since every scheduled tick is skipped while it lasts (fail closed); a
+ * successful read clears it.
+ */
+export function evaluateSettingsReadable(readError: string | undefined, config: ScrapeAlertsConfig): RuleEvaluation {
+  const key = "settings_unreadable:scrapers";
+  if (!readError) return { rule: "settings_unreadable", signals: [], scope: { keys: [key] } };
+  return {
+    rule: "settings_unreadable",
+    scope: { keys: [key] },
+    signals: [
+      {
+        rule: "settings_unreadable",
+        key,
+        severity: ruleSeverity(config, "settings_unreadable"),
+        kind: null,
+        subject: { type: "scraper", id: "settings", label: "Scraper settings (appConfig/scraperSettings)" },
+        message: `Scraper settings could not be read, so scheduled visa and news ticks are skipped: ${readError}`.slice(0, 500),
+        details: { error: readError.slice(0, 300) },
       },
     ],
   };

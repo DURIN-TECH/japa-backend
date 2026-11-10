@@ -447,6 +447,9 @@ export interface ScrapeSourceHealth {
   lastError: { message: string; at: string | null; url?: string } | null;
   pageCount: number | null; // visa: registry pages; news: null
   pagesWithErrors: number | null; // visa: pages whose lastError is set
+  // Issue #96: the admin's per-source edits (status + reason, crawl window,
+  // who / when; ISO dates), or null when none were made.
+  adminOverrides: Record<string, unknown> | null;
 }
 
 /** Timestamp-like (duck-typed, survives a second SDK copy). */
@@ -712,6 +715,21 @@ export class ScrapeRunService {
     }
     return out;
   }
+
+  /**
+   * Issue #96: the health row of ONE source (after an admin edit), or null
+   * when the doc does not exist. One read.
+   */
+  async getSourceHealth(kind: ScrapeRunKind, id: string, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth | null> {
+    const snap = await (kind === "visa" ? collections.visaSources : collections.newsSources).doc(id).get();
+    if (!snap.exists) return null;
+    return kind === "visa" ? visaHealth(id, snap.data() as VisaSource, nowMs) : newsHealth(id, snap.data() as NewsSource);
+  }
+}
+
+/** Issue #96: a source doc's `adminOverrides` block as JSON (ISO dates), or null. */
+function adminOverridesJson(v: unknown): Record<string, unknown> | null {
+  return v && typeof v === "object" ? (toJson(v) as Record<string, unknown>) : null;
 }
 
 /**
@@ -761,6 +779,7 @@ function visaHealth(id: string, s: VisaSource, nowMs: number): ScrapeSourceHealt
       : null,
     pageCount: pages.length,
     pagesWithErrors: errored.length,
+    adminOverrides: adminOverridesJson((s as { adminOverrides?: unknown }).adminOverrides),
   };
 }
 
@@ -782,6 +801,7 @@ function newsHealth(id: string, s: NewsSource): ScrapeSourceHealth {
     lastError: s.lastErrorMessage ? { message: redactSecrets(s.lastErrorMessage), at: iso(s.lastErrorAt) } : null,
     pageCount: null,
     pagesWithErrors: null,
+    adminOverrides: adminOverridesJson((s as { adminOverrides?: unknown }).adminOverrides),
   };
 }
 

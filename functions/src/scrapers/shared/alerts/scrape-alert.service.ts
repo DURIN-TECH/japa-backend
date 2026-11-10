@@ -5,12 +5,22 @@ import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../../utils/firebase";
 import { notificationService, type NotifyUserInput } from "../../../services/notification.service";
 import { EMAIL_BRANDING } from "../../../services/email/branding";
+// Issue #96: alert emails to the extra (non-user) addresses go straight
+// through the branded email service (notifyUser needs a user id).
+import { emailService } from "../../../services/email/email.service";
+import type { EmailResult } from "../../../services/email/email.types";
+// Issue #96 review: the hourly check reads the scraper settings (readable?
+// hard stop on?) for settings_unreadable and the budget_hard_stop clear.
+import { loadScraperSettingsResult, type LoadedScraperSettings } from "../settings/scraper-settings.store";
 import { safeErrorMessage, toJson } from "../runs/scrape-run.service";
 import { scrapeCostMonthToDateSource, type MonthToDateCostSource } from "./scrape-alert-cost";
 import {
   DEFAULT_CONFIG,
   evaluateBrokenSources,
   evaluateBudget,
+  evaluateBudgetHardStop,
+  evaluateBudgetHardStopClears,
+  evaluateSettingsReadable,
   evaluateErrorRate,
   evaluateFx,
   evaluateHostBackoff,
@@ -132,6 +142,8 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   fx_refresh_failing: "FX refresh failing",
   llm_budget: "LLM budget",
   review_queue_stale: "review queue waiting",
+  budget_hard_stop: "LLM budget hard stop",
+  settings_unreadable: "scraper settings unreadable",
 };
 
 /** Cloud Logging severity per alert severity (resolutions log as INFO). */
@@ -232,6 +244,27 @@ export class ScrapeAlertService {
   /** Email delivery: the existing notifyUser path (Resend). Swappable in tests. */
   notify: (input: NotifyUserInput) => Promise<void> = (input) => notificationService.notifyUser(input);
 
+  /** Issue #96 review: scraper settings reader (hourly check). Swappable in tests. */
+  loadSettings: () => Promise<LoadedScraperSettings> = () => loadScraperSettingsResult();
+
+  /**
+   * Issue #96: email to an extra recipient address (config
+   * extraRecipientEmails), via the branded template. Swappable in tests.
+   */
+  sendEmail: (input: { to: string; subject: string; title: string; body: string; actionUrl: string }) => Promise<EmailResult> = (
+    input
+  ) =>
+    emailService.sendNotification({
+      to: input.to,
+      subject: input.subject,
+      title: input.title,
+      body: input.body,
+      actionUrl: input.actionUrl,
+      actionLabel: "Open the scraper dashboard",
+      // No agency co-brand: these are platform (Seli) emails.
+      agency: null,
+    });
+
   // ---------- Config ----------
 
   /**
@@ -287,6 +320,8 @@ export class ScrapeAlertService {
         evaluateRunNoLongerStuck(run),
         evaluateErrorRate(run, config),
         evaluateLinkedSurcharge(run, config),
+        // Issue #96: the hard stop blocked extraction in this run.
+        evaluateBudgetHardStop(run, config),
       ];
       // Host backoff needs the earlier runs of the same scraper.
       await this.isolated("host_backoff", skippedRules, async () => {
@@ -369,13 +404,26 @@ export class ScrapeAlertService {
         });
       }
 
+      // ---- Scraper settings readable? (#96 review: ticks fail closed) ----
+      let loadedSettings: LoadedScraperSettings | undefined;
+      await this.isolated("settings_unreadable", skippedRules, async () => {
+        loadedSettings = await this.loadSettings();
+        evals.push(evaluateSettingsReadable(loadedSettings.readError, config));
+      });
+
       // ---- LLM budget (#82; skipped while no budget is set) ----
       await this.isolated("llm_budget", skippedRules, async () => {
         // Catch #82's rollup up first (runs whose post-run rollup was lost),
         // so the spend compared to the budget is complete.
         await this.costSource.catchUp?.(nowMs);
-        const evaluation = evaluateBudget(await this.costSource.getMonthToDateCost(nowMs), nowMs, config);
+        const cost = await this.costSource.getMonthToDateCost(nowMs);
+        const evaluation = evaluateBudget(cost, nowMs, config);
         if (evaluation) evals.push(evaluation);
+        // #96 review: budget_hard_stop resolves only on a real check that
+        // finds the stop off / no budget / spend under it.
+        if (loadedSettings && !loadedSettings.readError) {
+          evals.push(evaluateBudgetHardStopClears(loadedSettings.settings.budget.hardStop, cost));
+        }
       });
 
       // ---- Review queue ----
@@ -776,13 +824,15 @@ export class ScrapeAlertService {
       uids = await this.recipients(config);
     } catch (err) {
       this.engineError("recipients", err);
-      return 0;
+      uids = [];
     }
+    // Issue #96: the extra addresses get the same email (no user, so no
+    // per-user opt-out applies). Sent even when no admin recipient exists.
+    let sent = await this.sendToExtraEmails(config, title, body);
     if (uids.length === 0) {
-      console.warn("Scrape alerts: no admin recipients, email not sent");
-      return 0;
+      if (sent === 0) console.warn("Scrape alerts: no admin recipients, email not sent");
+      return sent;
     }
-    let sent = 0;
     for (const userId of uids) {
       try {
         await this.notify({
@@ -799,6 +849,32 @@ export class ScrapeAlertService {
           actionUrl: `${EMAIL_BRANDING.appUrl}${SCRAPE_ALERTS_PORTAL_PATH}`,
         });
         sent++;
+      } catch (err) {
+        this.engineError("email", err);
+      }
+    }
+    return sent;
+  }
+
+  /**
+   * Issue #96: email every `extraRecipientEmails` address (branded template,
+   * same subject / body as the admins' email). Best effort: a failure is
+   * logged as an engine error and that address is not counted. Returns how
+   * many addresses the provider accepted (or skipped while unconfigured).
+   */
+  private async sendToExtraEmails(config: ScrapeAlertsConfig, title: string, body: string): Promise<number> {
+    let sent = 0;
+    for (const to of config.extraRecipientEmails ?? []) {
+      try {
+        const result = await this.sendEmail({
+          to,
+          subject: title,
+          title,
+          body,
+          actionUrl: `${EMAIL_BRANDING.appUrl}${SCRAPE_ALERTS_PORTAL_PATH}`,
+        });
+        if (result.status === "failed") this.engineError("email", new Error(result.error ?? "extra recipient email failed"));
+        else sent++;
       } catch (err) {
         this.engineError("email", err);
       }

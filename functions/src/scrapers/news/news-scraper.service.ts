@@ -33,6 +33,11 @@ import type { ScrapeRunTrigger } from "../shared/runs/types";
 // Importing the cost service also installs the monthly-rollup finalize hook.
 import { scrapeCostService } from "../shared/cost/scrape-cost.service";
 import { roundUsd } from "../shared/cost/scrape-cost-pricing";
+// Issue #96: kill switch + maxSourcesPerRun from appConfig/scraperSettings.
+import { loadScraperSettingsResult, type LoadedScraperSettings } from "../shared/settings/scraper-settings.store";
+// Per-source crawl leases (issue #96 review): one crawl of a source at a time.
+import { leaseHeldReason, sourceLeaseService, type HeldLease, type SourceLeaseService } from "../shared/runs/source-lease";
+import type { ScraperSettings } from "../shared/settings/types";
 
 // ============================================
 // CRAWLER ETIQUETTE (issue #76)
@@ -139,6 +144,8 @@ type CustomItem = {
 export type NewsScraperStore = Pick<
   typeof newsService,
   | "getDueSources"
+  // Issue #96: manual "Run now" on one source reads it by id.
+  | "getSourceById"
   | "createScrapeRun"
   | "isDuplicate"
   | "createArticlesBatch"
@@ -159,6 +166,11 @@ export interface NewsScraperServiceOptions {
   // Issue #81: run-record service (tests inject one backed by the fake
   // Firestore; defaults to the Firestore-backed singleton).
   runs?: ScrapeRunService;
+  // Issue #96: settings loader (tests inject one; defaults to ONE read of
+  // appConfig/scraperSettings per tick).
+  loadSettings?: () => Promise<ScraperSettings>;
+  // Issue #96 review: crawl-lease service (defaults to the Firestore one).
+  leases?: SourceLeaseService;
 }
 
 /**
@@ -180,6 +192,21 @@ export interface ScrapeSourceTrace {
   sourceHealthRecorded?: boolean;
 }
 
+/** A zeroed news run result (a switched-off or fail-closed tick returns it). */
+function emptyNewsResult(): OrchestratorResult {
+  return {
+    sourcesProcessed: 0,
+    newArticles: 0,
+    errors: 0,
+    articlesFound: 0,
+    articlesDuplicate: 0,
+    articlesFailed: 0,
+    sourcesDeferred: 0,
+    hostsBackedOff: 0,
+    requestsAttempted: 0,
+  };
+}
+
 // ============================================
 // NEWS SCRAPER SERVICE
 // ============================================
@@ -190,6 +217,10 @@ export class NewsScraperService {
   private readonly store: NewsScraperStore;
   private readonly clock: () => number;
   private readonly runs: ScrapeRunService;
+  // Issue #96: reads the admin settings (kill switch, maxSourcesPerRun).
+  private readonly loadSettings: () => Promise<LoadedScraperSettings>;
+  // Issue #96 review: per-source crawl leases.
+  private readonly leasesOverride?: SourceLeaseService;
   // Issue #81: requests attempted (listing pages, feeds, article pages, API
   // calls) since construction. Callers read deltas around a scrape.
   private requestsAttempted = 0;
@@ -202,6 +233,13 @@ export class NewsScraperService {
     this.clock = options.clock ?? Date.now;
     this.store = options.store ?? newsService;
     this.runs = options.runs ?? scrapeRunService;
+    // A wrapper (not the bare import): the singleton is built at module load,
+    // and the binding must be read at call time (scrapers/index.ts cycle).
+    // An injected loader (tests) returns plain settings: wrap it.
+    const injected = options.loadSettings;
+    this.loadSettings = injected ? async () => ({ settings: await injected() }) : () => loadScraperSettingsResult();
+    // Resolved at call time (see leases()), like the settings loader.
+    this.leasesOverride = options.leases;
     this.fetcher = new VisaCatalogFetchService({
       http: options.http ?? createNewsHttpClient(),
       minIntervalMs: options.minIntervalMs,
@@ -226,7 +264,13 @@ export class NewsScraperService {
   // ============================================
 
   /**
-   * One scheduled tick: scrape up to 5 due sources.
+   * One scheduled tick: scrape up to `news.maxSourcesPerRun` (default 5,
+   * appConfig/scraperSettings, issue #96) due sources.
+   *
+   * Issue #96: a SCHEDULED tick with the news scraper switched off returns
+   * at once (no sweep, no run doc, no request). A manual run (trigger
+   * "manual") may target one source (`sourceId`): it is scraped whether or
+   * not it is due, if its status is active or broken.
    *
    * Run records (issue #81): every tick first sweeps stale `running` run docs
    * (crashed runs of either scraper -> failed). A tick with due sources then
@@ -236,8 +280,29 @@ export class NewsScraperService {
    * write no run doc.
    *
    * @param opts.trigger stored on the run doc (default "scheduled").
+   * @param opts.settings resolved settings (the manual worker passes its copy).
+   * @param opts.sourceId scrape just this source (manual Run now, #96).
+   * @param opts.onRunStarted told the run id once the run doc is written.
    */
-  async runOrchestrator(opts?: { trigger?: ScrapeRunTrigger }): Promise<OrchestratorResult> {
+  async runOrchestrator(opts?: {
+    trigger?: ScrapeRunTrigger;
+    settings?: ScraperSettings;
+    sourceId?: string;
+    onRunStarted?: (runId: string) => Promise<void> | void;
+  }): Promise<OrchestratorResult> {
+    const trigger: ScrapeRunTrigger = opts?.trigger ?? "scheduled";
+    // ---- Settings: ONE read per tick; never throws (issue #96) ----
+    let settings = opts?.settings;
+    if (!settings) {
+      const loaded = await this.loadSettings();
+      // FAIL CLOSED (review): an unreadable settings doc skips a scheduled
+      // tick (the store logged an engine-error line for the backstop).
+      if (loaded.readError && trigger === "scheduled") {
+        console.error("News scrape: scraper settings unreadable, tick skipped (fail closed)");
+        return emptyNewsResult();
+      }
+      settings = loaded.settings;
+    }
     const result: OrchestratorResult = {
       sourcesProcessed: 0,
       newArticles: 0,
@@ -250,10 +315,24 @@ export class NewsScraperService {
       requestsAttempted: 0,
     };
 
+    // ---- Kill switch (issue #96): before anything is read or written ----
+    if (trigger === "scheduled" && !settings.news.enabled) {
+      console.log("News scrape: the news scraper is switched off (appConfig/scraperSettings), tick skipped");
+      return result;
+    }
+    const maxSources = settings.news.maxSourcesPerRun;
+
     // Stale sweep on EVERY tick (never throws).
     await this.runs.sweepStaleRuns(this.clock());
 
-    const dueSources = await this.store.getDueSources(5);
+    // Issue #96: one named source (manual run) or the due batch.
+    let dueSources: NewsSource[];
+    if (opts?.sourceId !== undefined) {
+      const one = await this.store.getSourceById(opts.sourceId);
+      dueSources = one && (one.status === "active" || one.status === "broken") ? [{ ...one, id: one.id ?? opts.sourceId }] : [];
+    } else {
+      dueSources = await this.store.getDueSources(maxSources);
+    }
 
     if (dueSources.length === 0) {
       console.log("No sources due for scraping");
@@ -265,21 +344,58 @@ export class NewsScraperService {
     // ---- Start the run record (issue #81); never throws ----
     const recorder = await this.runs.start({
       kind: "news",
-      trigger: opts?.trigger ?? "scheduled",
+      trigger,
       startedAtMs: this.clock(),
-      options: { maxSources: 5 },
+      // sourceId only on a single-source manual run (undefined is dropped).
+      options: { maxSources, sourceId: opts?.sourceId },
     });
     console.log(`News scrape: run ${recorder.id} started`);
+    // Issue #96: tell the manual worker the run id (best effort).
+    if (opts?.onRunStarted) {
+      try {
+        await opts.onRunStarted(recorder.id);
+      } catch (err) {
+        console.error(`News scrape: onRunStarted callback failed: ${(err as Error)?.message ?? err}`);
+      }
+    }
 
     // Issue #82: API request counters before the run (delta recorded below).
     const apiBefore = { ...this.apiRequestsByProvider };
+    // ---- Source leases (issue #96 review) ----
+    // Each source's crawl lease is taken before it is scraped; a source
+    // another run holds is recorded `deferred` (reason on the line, not an
+    // error) and skipped. All leases are released when the run ends.
+    const leases = this.leasesOverride ?? sourceLeaseService;
+    const held: HeldLease[] = [];
     try {
-      await this.scrapeDueSources(dueSources, result, recorder);
+      const leased: NewsSource[] = [];
+      for (const source of dueSources) {
+        const lease = await leases.acquire("news", source.id, { trigger, runId: recorder.id });
+        if (!lease.ok) {
+          result.sourcesLeased = (result.sourcesLeased ?? 0) + 1;
+          recorder.recordSource({
+            sourceId: source.id,
+            name: source.name,
+            status: "deferred",
+            pagesAttempted: 0,
+            pagesFetched: 0,
+            errors: 0,
+            error: leaseHeldReason(lease),
+          });
+          continue;
+        }
+        held.push(lease);
+        leased.push(source);
+      }
+      await this.scrapeDueSources(leased, result, recorder);
     } catch (err) {
-      // Only reachable if a store write outside the per-source try throws.
+      // Only reachable if a store write outside the per-source try throws
+      // (or a lease could not be taken).
       await this.recordApiRequests(recorder, apiBefore);
       await recorder.fail(err, result);
       throw err;
+    } finally {
+      for (const lease of held) await leases.release(lease);
     }
     await this.recordApiRequests(recorder, apiBefore);
 

@@ -40,6 +40,8 @@ scrapers/
     runs/                  scrapeRuns records, /admin/scrape-runs + /admin/scrape-sources (#81), scrape-runs.md
     cost/                  LLM price table, monthly cost rollup, /admin/scrape-costs (#82), scrape-costs.md
     alerts/                post-run + hourly alert rules, emails, /admin/scrape-alerts (#83), scrape-alerts.md
+    settings/              appConfig/scraperSettings (kill switch, limits, hard stop), /admin/scraper-settings,
+                           per-source controls, Run now requests + worker (#96), scraper-settings.md
   visa-catalog/
     visa-catalog-crawl.service.ts      orchestrator (crawlVisaCatalogOrchestrator)
     visa-catalog-extract.service.ts    LLM extractor + validator

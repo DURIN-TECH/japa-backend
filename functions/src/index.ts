@@ -71,6 +71,7 @@ import { notificationService } from "./services/notification.service";
 import { unreadMessageReminderService } from "./services/unread-message-reminder.service";
 import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
+import { scrapeRunWorker } from "./scrapers";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -533,6 +534,28 @@ export const checkScrapeAlerts = functions
         `digest ${result.digestSent ? "sent" : "not sent"}` +
         (result.skippedRules.length ? `, skipped rules: ${result.skippedRules.join(", ")}` : "")
     );
+  });
+
+/**
+ * Manual "Run now" (issue #96): the admin API writes a
+ * `scrapeRunRequests/{requestId}` doc (POST /admin/scrape-sources/:kind/:id/run
+ * or POST /admin/scrapers/:kind/run) and returns at once; this trigger runs
+ * the crawl. It calls the normal visa / news orchestrator scoped to one
+ * source (or every due source, windows ignored) with trigger "manual", so a
+ * manual run gets its own scrapeRuns record and still obeys robots.txt, host
+ * backoff, maxExtractionsPerRun and the budget hard stop. Same memory,
+ * timeout and secrets as the visa orchestrator (DeepSeek for extraction,
+ * email for the post-run alerts). The worker never throws; every outcome is
+ * written on the request doc, which the portal polls via
+ * GET /admin/scrape-run-requests/:id. Region pinned to us-central1 (the
+ * gen1 default, where the API and the scheduled scrapers run).
+ */
+export const processScrapeRunRequest = functions
+  .region("us-central1")
+  .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: [...VISA_CATALOG_SECRETS, ...EMAIL_SECRETS] })
+  .firestore.document("scrapeRunRequests/{requestId}")
+  .onCreate(async (_snapshot, context) => {
+    await scrapeRunWorker.process(context.params.requestId);
   });
 
 /**
