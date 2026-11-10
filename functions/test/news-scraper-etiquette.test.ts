@@ -25,6 +25,7 @@ import assert from "node:assert/strict";
 
 import type { NewsSource } from "../src/types/news";
 import type { VisaCatalogHttpClient } from "../src/services/visa-catalog-fetch.service";
+import { installFakes } from "./helpers/fake-firestore";
 
 // Admin init needs a project id (utils/firebase derives the bucket from it).
 process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT || "demo-unit-test";
@@ -35,6 +36,9 @@ type ScraperModule = typeof import("../src/services/news-scraper.service");
 let mod: ScraperModule;
 
 before(async () => {
+  // Issue #81: the orchestrator now writes a `scrapeRuns` run record through
+  // utils/firebase; swap in the in-memory fake so no real Firestore is hit.
+  await installFakes();
   mod = await import("../src/services/news-scraper.service");
 });
 

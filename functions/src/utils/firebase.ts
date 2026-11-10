@@ -122,6 +122,13 @@ export const collections = {
   // live doc, and an admin approves/rejects it via /admin/visa-changes.
   // Backend-only: no firestore.rules match → clients denied.
   pendingVisaChanges: db.collection("pendingVisaChanges"),
+  // One record per visa / news scraper run (issue #81): timing, counters,
+  // per-source + per-page outcomes, first N errors. Written by
+  // services/scrape-run.service.ts, read via /admin/scrape-runs. TTL-deleted
+  // 180 days after start (`expireAt`). NOTE: shares its collection ID with the
+  // per-source news log `newsSources/{id}/scrapeRuns` — collection-group
+  // queries on "scrapeRuns" see both. Backend-only: no firestore.rules match.
+  scrapeRuns: db.collection("scrapeRuns"),
 } as const;
 
 // Helper to get subcollection references

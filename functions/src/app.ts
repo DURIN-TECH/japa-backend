@@ -7,6 +7,8 @@ import { userRoutes, adminUsersRouter } from "./routes/user.routes";
 import { countryRoutes, visaSearchRoutes, adminVisaRoutes } from "./routes/visa.routes";
 // Proposed edits to approved scraped visas (pendingVisaChanges, issue #61)
 import { adminVisaChangeRoutes } from "./routes/visa-change.routes";
+// Scraper run records + source health (issue #81, CASL `ScrapeRun`).
+import { adminScrapeRunRoutes, adminScrapeSourceRoutes } from "./routes/scrape-run.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
@@ -92,6 +94,9 @@ app.use("/admin/eligibility", adminEligibilityRoutes);
 app.use("/admin/visas", adminVisaRoutes);
 // Admin queue of proposed edits to live scraped visas (CASL `VisaChange`).
 app.use("/admin/visa-changes", adminVisaChangeRoutes);
+// Scraper monitoring (issue #81): run records + per-source health (CASL `ScrapeRun`).
+app.use("/admin/scrape-runs", adminScrapeRunRoutes);
+app.use("/admin/scrape-sources", adminScrapeSourceRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);

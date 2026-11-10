@@ -40,7 +40,16 @@ export type SubjectType = "Application" | "Document" | "Consultation" | "Payment
  * `defineAbilitiesFor`). Public catalog reads are served by unauthenticated
  * routes and do not go through this subject.
  */
- | "Visa" | "all";
+ | "Visa"
+/**
+ * A scrape run record (the top-level `scrapeRuns` collection, #81): one doc
+ * per visa or news crawl run with its timing, counters and errors, plus the
+ * per-source health view served next to it. Admin-only: no role grant
+ * exists for it (see `defineAbilitiesFor`). Backend action map:
+ * GET /admin/scrape-runs, GET /admin/scrape-runs/:id and
+ * GET /admin/scrape-sources = read.
+ */
+ | "ScrapeRun" | "all";
 /** CASL actions. Kept as a string union plus open `string` for forward-compat. */
 export type Action = "manage" | "create" | "read" | "update" | "delete" | "assign" | "approve" | "reject" | (string & {});
 /**

@@ -25,6 +25,9 @@ import {
   OrchestratorResult,
 } from "../types/news";
 import { Timestamp } from "firebase-admin/firestore";
+// Run records (issue #81): one `scrapeRuns/{runId}` doc per orchestrator run.
+import { scrapeRunService, type ScrapeRunService } from "./scrape-run.service";
+import type { ScrapeRunTrigger } from "../types/scrape-run";
 
 // ============================================
 // CRAWLER ETIQUETTE (issue #76)
@@ -85,52 +88,13 @@ export const MAX_FULL_CONTENT_ARTICLES = 5;
 // SECRET-SAFE ERROR LOGGING (issue #76 review)
 // ============================================
 //
-// News API keys must never reach Cloud Logging or Firestore. NewsAPI gets
-// its key in the `X-Api-Key` header (documented at
-// https://newsapi.org/docs/authentication), but NewsData.io only documents
-// the `apikey` QUERY parameter (https://newsdata.io/documentation), so its
-// key is in the request URL. A raw axios error carries that URL (and the
-// request headers) in `error.config`, so the scraper NEVER logs or stores a
-// raw error object: everything goes through describeError(), which keeps
-// only the message (plus host + status when known) with keys redacted.
-
-/** Query parameters / headers that carry an API key (matched case-insensitively). */
-const SECRET_PARAM_PATTERN = /((?:api[_-]?key|x-api-key|access[_-]?key|x-access-key)\s*[=:]\s*)[^&\s"',;]+/gi;
-
-/**
- * Replace the value of every `apikey=` / `apiKey=` / `X-Api-Key:`-style pair
- * in `text` with `[REDACTED]`. Also redacts the literal values of the
- * configured NEWS_API_KEY_* env vars wherever they appear (belt and braces:
- * catches a key echoed back in an upstream error body).
- */
-export function redactSecrets(text: string): string {
-  let out = text.replace(SECRET_PARAM_PATTERN, "$1[REDACTED]");
-  for (const [name, value] of Object.entries(process.env)) {
-    if (name.startsWith("NEWS_API_KEY_") && value && value.length >= 6) {
-      out = out.split(value).join("[REDACTED]");
-    }
-  }
-  return out;
-}
-
-/**
- * A loggable, secret-free one-line description of an error: its message,
- * plus `host` and HTTP `status` when it is an axios error (read from
- * `config.url` / `response.status`, never echoed whole). Redacted.
- */
-export function describeError(error: unknown): string {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const e = error as any;
-  const message = error instanceof Error ? error.message : String(error);
-  const parts: string[] = [];
-  if (e && typeof e === "object" && e.isAxiosError) {
-    const host = typeof e.config?.url === "string" ? hostOf(e.config.url) : "";
-    if (host) parts.push(`host=${host}`);
-    if (typeof e.response?.status === "number") parts.push(`status=${e.response.status}`);
-  }
-  parts.push(message);
-  return redactSecrets(parts.join(" "));
-}
+// News API keys must never reach Cloud Logging or Firestore, so the scraper
+// never logs or stores a raw error object: everything goes through
+// describeError() / redactSecrets(). They moved to utils/redact.ts (#81) so
+// the scrape-run recorder can redact run errors without importing this
+// module; re-exported here so existing callers and tests keep working.
+import { redactSecrets, describeError } from "../utils/redact";
+export { redactSecrets, describeError };
 
 /**
  * The production HTTP client for every news-bot request. `validateStatus`
@@ -187,6 +151,20 @@ export interface NewsScraperServiceOptions {
   minIntervalMs?: number;
   // Clock (epoch ms) for Retry-After maths and the run's backoff tracker.
   clock?: () => number;
+  // Issue #81: run-record service (tests inject one backed by the fake
+  // Firestore; defaults to the Firestore-backed singleton).
+  runs?: ScrapeRunService;
+}
+
+/**
+ * Filled in by scrapeSource() for its caller (issue #81): the id of the
+ * per-source log doc it created, and how many requests it attempted. Set even
+ * when scrapeSource throws, so the orchestrator can still link the failed
+ * source's log and count its requests.
+ */
+export interface ScrapeSourceTrace {
+  sourceRunId?: string;
+  requestsAttempted: number;
 }
 
 // ============================================
@@ -198,11 +176,16 @@ export class NewsScraperService {
   private readonly fetcher: VisaCatalogFetchService;
   private readonly store: NewsScraperStore;
   private readonly clock: () => number;
+  private readonly runs: ScrapeRunService;
+  // Issue #81: requests attempted (listing pages, feeds, article pages, API
+  // calls) since construction. Callers read deltas around a scrape.
+  private requestsAttempted = 0;
   private rssParser: Parser<CustomFeed, CustomItem>;
 
   constructor(options: NewsScraperServiceOptions = {}) {
     this.clock = options.clock ?? Date.now;
     this.store = options.store ?? newsService;
+    this.runs = options.runs ?? scrapeRunService;
     this.fetcher = new VisaCatalogFetchService({
       http: options.http ?? createNewsHttpClient(),
       minIntervalMs: options.minIntervalMs,
@@ -226,12 +209,33 @@ export class NewsScraperService {
   // ORCHESTRATOR
   // ============================================
 
-  async runOrchestrator(): Promise<OrchestratorResult> {
+  /**
+   * One scheduled tick: scrape up to 5 due sources.
+   *
+   * Run records (issue #81): every tick first sweeps stale `running` run docs
+   * (crashed runs of either scraper -> failed). A tick with due sources then
+   * writes `scrapeRuns/{runId}` as `running`, notes each source's outcome
+   * (with a link to its `newsSources/{id}/scrapeRuns` log, which carries the
+   * runId) and each error, and finalises it with this result. Idle ticks
+   * write no run doc.
+   *
+   * @param opts.trigger stored on the run doc (default "scheduled").
+   */
+  async runOrchestrator(opts?: { trigger?: ScrapeRunTrigger }): Promise<OrchestratorResult> {
     const result: OrchestratorResult = {
       sourcesProcessed: 0,
       newArticles: 0,
       errors: 0,
+      articlesFound: 0,
+      articlesDuplicate: 0,
+      articlesFailed: 0,
+      sourcesDeferred: 0,
+      hostsBackedOff: 0,
+      requestsAttempted: 0,
     };
+
+    // Stale sweep on EVERY tick (never throws).
+    await this.runs.sweepStaleRuns(this.clock());
 
     const dueSources = await this.store.getDueSources(5);
 
@@ -241,6 +245,38 @@ export class NewsScraperService {
     }
 
     console.log(`Found ${dueSources.length} sources due for scraping`);
+
+    // ---- Start the run record (issue #81); never throws ----
+    const recorder = await this.runs.start({
+      kind: "news",
+      trigger: opts?.trigger ?? "scheduled",
+      startedAtMs: this.clock(),
+      options: { maxSources: 5 },
+    });
+    console.log(`News scrape: run ${recorder.id} started`);
+
+    try {
+      await this.scrapeDueSources(dueSources, result, recorder);
+    } catch (err) {
+      // Only reachable if a store write outside the per-source try throws.
+      await recorder.fail(err, result);
+      throw err;
+    }
+
+    // "Something worked" = at least one source scraped without throwing.
+    await recorder.finalize({ summary: result, anySuccess: result.sourcesProcessed > 0 });
+    return result;
+  }
+
+  /**
+   * The per-source loop of runOrchestrator (split out in #81 so the run
+   * record can wrap it). Mutates `result`, notes sources / errors on `recorder`.
+   */
+  private async scrapeDueSources(
+    dueSources: NewsSource[],
+    result: OrchestratorResult,
+    recorder: Awaited<ReturnType<ScrapeRunService["start"]>>
+  ): Promise<void> {
 
     // One backoff tracker per run (issue #76): a host that answers 429/503
     // is not requested again by any later source in this run.
@@ -253,7 +289,20 @@ export class NewsScraperService {
       const blocked = this.blockingEntryFor(source, tracker);
       if (blocked) {
         result.errors++;
+        result.sourcesDeferred++;
         console.warn(`Skipping source ${source.name}: ${backoffMessage(blocked)}`);
+        // Issue #81: a deferred source on the run record (counted as an
+        // error, like the result above, because it counts toward auto-pause).
+        recorder.recordError({ sourceId: source.id, url: this.entryUrlFor(source), error: backoffMessage(blocked) });
+        recorder.recordSource({
+          sourceId: source.id,
+          name: source.name,
+          status: "deferred",
+          pagesAttempted: 0,
+          pagesFetched: 0,
+          errors: 1,
+          error: backoffMessage(blocked),
+        });
         await this.store.updateSourceAfterScrape(
           source.id,
           false,
@@ -263,12 +312,52 @@ export class NewsScraperService {
         continue;
       }
 
+      // Filled by scrapeSource even when it throws (issue #81).
+      const trace: ScrapeSourceTrace = { requestsAttempted: 0 };
       try {
-        const scrapeResult = await this.scrapeSource(source, tracker);
+        const scrapeResult = await this.scrapeSource(source, tracker, { runId: recorder.id, trace });
         result.sourcesProcessed++;
         result.newArticles += scrapeResult.articlesNew;
+        result.articlesFound += scrapeResult.articlesFound ?? 0;
+        result.articlesDuplicate += scrapeResult.articlesDuplicate ?? 0;
+        result.articlesFailed += scrapeResult.articlesFailed ?? 0;
+        result.requestsAttempted += trace.requestsAttempted;
+        recorder.addPagesAttempted(trace.requestsAttempted);
+        recorder.recordSource({
+          sourceId: source.id,
+          name: source.name,
+          // The per-source log's "partial" (every article failed to
+          // normalise) maps to the run vocabulary's partial.
+          status: scrapeResult.status === "partial" ? "partial" : "succeeded",
+          pagesAttempted: trace.requestsAttempted,
+          pagesFetched: trace.requestsAttempted,
+          errors: 0,
+          sourceRunId: trace.sourceRunId,
+          counts: {
+            articlesFound: scrapeResult.articlesFound ?? 0,
+            articlesNew: scrapeResult.articlesNew ?? 0,
+            articlesDuplicate: scrapeResult.articlesDuplicate ?? 0,
+            articlesFailed: scrapeResult.articlesFailed ?? 0,
+          },
+        });
       } catch (error) {
         result.errors++;
+        result.requestsAttempted += trace.requestsAttempted;
+        if (isHostBackoffError(error)) result.hostsBackedOff++;
+        // Issue #81: on the run record — describeError() keeps host +
+        // status, and the recorder redacts again before storing.
+        recorder.addPagesAttempted(trace.requestsAttempted);
+        recorder.recordError({ sourceId: source.id, url: this.entryUrlFor(source), error: describeError(error) });
+        recorder.recordSource({
+          sourceId: source.id,
+          name: source.name,
+          status: "failed",
+          pagesAttempted: trace.requestsAttempted,
+          pagesFetched: 0,
+          errors: 1,
+          sourceRunId: trace.sourceRunId,
+          error: describeError(error),
+        });
         // Never log the raw error: an axios error carries the request URL
         // (NewsData.io's key is in its query string). describeError() keeps
         // host + status + message, redacted.
@@ -282,8 +371,6 @@ export class NewsScraperService {
         );
       }
     }
-
-    return result;
   }
 
   // ============================================
@@ -296,9 +383,15 @@ export class NewsScraperService {
    */
   async scrapeSource(
     source: NewsSource,
-    tracker: HostBackoffTracker = new HostBackoffTracker(this.clock())
+    tracker: HostBackoffTracker = new HostBackoffTracker(this.clock()),
+    // Issue #81: the run-wide record id to stamp on the per-source log, and
+    // a trace object filled for the caller (see ScrapeSourceTrace).
+    link?: { runId?: string; trace?: ScrapeSourceTrace }
   ): Promise<ScrapeRun> {
-    const runId = await this.store.createScrapeRun(source.id);
+    const runId = await this.store.createScrapeRun(source.id, link?.runId);
+    if (link?.trace) link.trace.sourceRunId = runId;
+    // Requests counter before this source, for the trace's delta.
+    const requestsBefore = this.requestsAttempted;
     const startTime = Date.now();
 
     try {
@@ -372,6 +465,7 @@ export class NewsScraperService {
       };
 
       await this.store.completeScrapeRun(source.id, runId, runResult);
+      if (link?.trace) link.trace.requestsAttempted = this.requestsAttempted - requestsBefore;
 
       console.log(
         `Source "${source.name}": found=${rawArticles.length}, new=${articlesNew}, dup=${articlesDuplicate}, failed=${articlesFailed}`
@@ -387,6 +481,7 @@ export class NewsScraperService {
       // 429/503 from the source's host (page, feed, robots.txt or API):
       // block it for the rest of the run before recording the failure.
       if (isHostBackoffError(error)) this.recordBackoff(tracker, error);
+      if (link?.trace) link.trace.requestsAttempted = this.requestsAttempted - requestsBefore;
 
       await this.store.completeScrapeRun(source.id, runId, {
         status: "failed",
@@ -476,6 +571,8 @@ export class NewsScraperService {
    * error on any other non-2xx. Returns the body text.
    */
   private async crawlGet(url: string, headers: Record<string, string>): Promise<string> {
+    // Issue #81: counted as attempted even when robots.txt then blocks it.
+    this.requestsAttempted++;
     if (!(await this.fetcher.isAllowedByRobots(url))) {
       throw new Error(`Blocked by robots.txt: ${url}`);
     }
@@ -626,6 +723,8 @@ export class NewsScraperService {
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== "") url.searchParams.set(key, String(value));
     }
+    // Issue #81: one attempted request on the run record.
+    this.requestsAttempted++;
     // HostBackoffError's message is host/status/time only — no key leak.
     const resp = await this.fetcher.getRaw(url.toString(), { Accept: "application/json", ...headers });
     if (resp.status < 200 || resp.status >= 300) {

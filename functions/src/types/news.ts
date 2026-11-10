@@ -148,6 +148,10 @@ export interface NewsArticle {
 export interface ScrapeRun {
   id: string;
   sourceId: string;
+  // Issue #81: the run-wide `scrapeRuns/{runId}` record this source run
+  // belongs to (absent on logs written before #81, or for a standalone
+  // scrapeSource() call outside an orchestrator run).
+  runId?: string;
 
   status: ScrapeRunStatus;
 
@@ -204,8 +208,19 @@ export interface RawArticle {
   tags?: string[];
 }
 
+/**
+ * One news orchestrator run's summary. Logged by the scheduled function and
+ * stored verbatim as `summary` on the run's `scrapeRuns/{runId}` doc (#81).
+ */
 export interface OrchestratorResult {
-  sourcesProcessed: number;
+  sourcesProcessed: number; // sources scraped without throwing
   newArticles: number;
-  errors: number;
+  errors: number; // sources that failed or were skipped for a backoff
+  // ---- Issue #81: the rest of the run's counters ----
+  articlesFound: number; // raw articles returned by feeds / pages / APIs
+  articlesDuplicate: number;
+  articlesFailed: number; // articles that failed to normalise
+  sourcesDeferred: number; // skipped without a request: host backed off this run
+  hostsBackedOff: number; // sources whose host answered 429/503 this run
+  requestsAttempted: number; // listing / feed / article / API requests tried
 }
