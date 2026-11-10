@@ -89,6 +89,10 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   // email is the only one this adds.
   message_unread_reminder: EMAIL_ONLY,
   visa_news: APP_ONLY,
+  // Scraper alerts (issue #83) go to admins by EMAIL only: the point is that
+  // admins find out without watching the portal. No in-app/push record (the
+  // alerts themselves live in scrapeAlerts and the #84 dashboard).
+  scrape_alert: EMAIL_ONLY,
   system: APP_ONLY,
 };
 

@@ -129,6 +129,17 @@ export const collections = {
   // per-source news log `newsSources/{id}/scrapeRuns` — collection-group
   // queries on "scrapeRuns" see both. Backend-only: no firestore.rules match.
   scrapeRuns: db.collection("scrapeRuns"),
+  // Scraper alerts (issue #83): one doc per alert incident (rule, severity,
+  // subject, firstSeen/lastSeen/count, open|acknowledged|resolved). Written by
+  // services/scrape-alert.service.ts, read via /admin/scrape-alerts.
+  // TTL-deleted 180 days after lastSeen / resolvedAt (`expireAt`).
+  // Backend-only: no firestore.rules match -> clients denied.
+  scrapeAlerts: db.collection("scrapeAlerts"),
+  // Dedupe pointers for scrapeAlerts (issue #83): `{sha256(dedupeKey)}` ->
+  // the ACTIVE alert's id. Exists only while that alert is open/acknowledged;
+  // read in the upsert transaction so one key never gets two active alerts.
+  // Backend-only.
+  scrapeAlertKeys: db.collection("scrapeAlertKeys"),
   // Monthly scraping cost rollup (issue #82): `scrapeCosts/{YYYY-MM}` sums
   // every finalised run's LLM usage / cost / news API requests by kind,
   // country and model; `scrapeCosts/{month}/runs/{runId}` markers make each

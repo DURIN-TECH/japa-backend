@@ -103,8 +103,8 @@ of `NEWS_API_KEY_*` and `DEEPSEEK_API_KEY` are replaced with `[REDACTED]`.
 - Finalize hook: `scrapeRunService.registerFinalizeHook(async (run) => ...)`
   runs after every run's final write with the final doc (a throwing hook is
   logged and ignored). Use it for the cost rollup and the post-run alert
-  rules. Stale sweeps do not call hooks; #83's hourly check should query
-  `status == "failed"` runs itself (or extend `sweepStaleRuns`).
+  rules. Stale sweeps do not call hooks; #83's hourly check reads the latest
+  finished run per scraper itself. Alerting: see [scrape-alerts.md](scrape-alerts.md).
 
 ## Admin API
 

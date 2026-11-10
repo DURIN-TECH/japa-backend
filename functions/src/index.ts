@@ -69,6 +69,8 @@ import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
 import { notificationService } from "./services/notification.service";
 import { unreadMessageReminderService } from "./services/unread-message-reminder.service";
+import { scrapeRunService } from "./services/scrape-run.service";
+import { scrapeAlertService } from "./services/scrape-alert.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -439,8 +441,11 @@ export const sendUnreadMessageReminders = functions
 /**
  * Every 30 minutes: Scrape visa news from due sources
  */
+// EMAIL_SECRETS (issue #83): the run's finalize hook evaluates the scraper
+// alert rules and emails admins about new / escalated alerts from inside
+// this function, so it needs the Resend secrets like any other sender.
 export const scrapeNewsOrchestrator = functions
-  .runWith({ memory: "512MB", timeoutSeconds: 540 })
+  .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: EMAIL_SECRETS })
   .pubsub.schedule("*/30 * * * *")
   .timeZone("UTC")
   .onRun(async () => {
@@ -466,7 +471,8 @@ export const scrapeNewsOrchestrator = functions
  * catalog. See docs/visa-catalog-scraping-spike.md.
  */
 export const crawlVisaCatalogOrchestrator = functions
-  .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: VISA_CATALOG_SECRETS })
+  // EMAIL_SECRETS (issue #83): post-run alert emails, see scrapeNewsOrchestrator.
+  .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: [...VISA_CATALOG_SECRETS, ...EMAIL_SECRETS] })
   .pubsub.schedule("15 * * * *") // hourly at :15 (issue #63)
   .timeZone("UTC")
   .onRun(async () => {
@@ -487,6 +493,46 @@ export const crawlVisaCatalogOrchestrator = functions
     } catch (error) {
       console.error("Visa catalog crawl orchestrator failed:", error);
     }
+  });
+
+// ============================================
+// SCRAPER ALERTS (issue #83)
+// ============================================
+
+/**
+ * Post-run alert rules: every visa / news run, once finalised (#81), is
+ * checked for run_failed / error_rate / linked_surcharge / host_backoff /
+ * source_broken (services/scrape-alert.service.ts onRunFinalized). The hook
+ * never throws, and the run's record is already written when it runs.
+ * Registered at module load, so it is active in every function instance that
+ * runs a scraper (CLI scripts do not load index.ts: script runs never alert).
+ */
+scrapeRunService.registerFinalizeHook((run) => scrapeAlertService.onRunFinalized(run).then(() => undefined));
+
+/**
+ * Hourly at :45 UTC: the alert checks no run hook can do — stuck runs, the
+ * latest finished run per scraper (runs the stale sweep marked failed fire
+ * no hook), missed weekly windows, auto-paused sources, FX refresh failing,
+ * the LLM budget (#82) and the ageing review queue — then the daily digest
+ * when configured. :45 sits between the visa tick (:15) and news ticks
+ * (:00 / :30). Thresholds + recipients: Firestore `appConfig/scrapeAlerts`.
+ */
+// Explicit budget (review fix): the work is sequential (a query per visa
+// source, a transaction per alert, an email per admin), so the 60s default
+// is too tight. 256MB is plenty: it holds a few hundred small docs at most.
+export const checkScrapeAlerts = functions
+  .runWith({ timeoutSeconds: 300, memory: "256MB", secrets: EMAIL_SECRETS })
+  .pubsub.schedule("45 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const result = await scrapeAlertService.runHourlyCheck();
+    const counts: Record<string, number> = {};
+    for (const a of result.actions) counts[a.action] = (counts[a.action] ?? 0) + 1;
+    console.log(
+      `Scrape alert check: ${JSON.stringify(counts)}, emailed ${result.emailed} alert(s) to ${result.recipients} admin(s), ` +
+        `digest ${result.digestSent ? "sent" : "not sent"}` +
+        (result.skippedRules.length ? `, skipped rules: ${result.skippedRules.join(", ")}` : "")
+    );
   });
 
 /**

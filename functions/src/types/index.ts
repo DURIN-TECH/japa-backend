@@ -1054,6 +1054,9 @@ export type NotificationType =
   // Account / engagement
   | "welcome"
   | "role_changed"
+  // Scraper monitoring (issue #83): a new / escalated scraper alert or the
+  // daily alert digest, emailed to admins only (server-side).
+  | "scrape_alert"
   | "review_received"
   // Account security / self-service (mobile + portal account management)
   | "password_changed" // Security notice: the account password was just changed
