@@ -160,10 +160,20 @@ class NewsService {
     return doc.exists ? (doc.data() as NewsSource) : null;
   }
 
+  /**
+   * Record a scrape outcome on the source and schedule its next visit.
+   *
+   * @param notBeforeMs optional epoch ms the next visit must not precede —
+   *   the host's Retry-After time after a 429/503 (issue #76). The next visit
+   *   is the LATER of `now + scrapeIntervalMinutes` and this, so a long
+   *   Retry-After pushes the source back but a short one never brings it
+   *   forward.
+   */
   async updateSourceAfterScrape(
     sourceId: string,
     success: boolean,
-    errorMessage?: string
+    errorMessage?: string,
+    notBeforeMs?: number
   ): Promise<void> {
     const ref = collections.newsSources.doc(sourceId);
     const doc = await ref.get();
@@ -171,7 +181,9 @@ class NewsService {
 
     const source = doc.data() as NewsSource;
     const nextInterval = source.scrapeIntervalMinutes * 60 * 1000;
-    const nextScrapeAt = Timestamp.fromMillis(Date.now() + nextInterval);
+    const nextScrapeAt = Timestamp.fromMillis(
+      Math.max(Date.now() + nextInterval, notBeforeMs ?? 0)
+    );
 
     const updates: Record<string, unknown> = {
       lastScrapedAt: Timestamp.now(),
