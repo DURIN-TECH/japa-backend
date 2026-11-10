@@ -8,6 +8,9 @@ import { resolveEventEmail } from "../services/email/event-templates";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { collections } from "../utils/firebase";
 import { AgencyInvitation } from "../types";
+// Issue #103: per-visa service prices on the public agency page.
+import { agencyVisaPriceService } from "../agency-visa-prices/agency-visa-price.service";
+import type { PublicAgencyVisaPrice } from "../agency-visa-prices/agency-visa-price.service";
 import { ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -514,6 +517,16 @@ export class AgencyController {
         return;
       }
 
+      // ---- Per-visa service prices (issue #103) ----
+      // A pricing read failure must not take the whole public page down: log
+      // it and serve the page without prices (it then shows no visa list).
+      let visaPrices: PublicAgencyVisaPrice[] = [];
+      try {
+        visaPrices = await agencyVisaPriceService.listPublic(agency.id);
+      } catch (error) {
+        console.error("Error loading public agency visa prices:", error);
+      }
+
       sendSuccess(res, {
         name: agency.name,
         slug: agency.slug,
@@ -521,7 +534,8 @@ export class AgencyController {
         logoUrl: agency.logoUrl ?? null,
         state: agency.state ?? null,
         ownerName: agency.ownerName,
-        // Agency-level default consultation fee (in cents). null when unset.
+        // Agency-level default consultation fee in whole NAIRA (the old "in
+        // cents" comment was wrong; see consultation.controller). null when unset.
         consultationFee: agency.consultationFee ?? null,
         // Public service menu (name + price only).
         services: (agency.services || []).map((s) => ({
@@ -534,6 +548,11 @@ export class AgencyController {
         totalCases: agency.totalCases,
         // Trust badge only — never the raw compliance file.
         verified: agency.compliance?.status === "verified",
+        // Issue #103: the visas this agency offers with ITS OWN service price
+        // in whole naira (null = "Contact for pricing"). Only this agency's
+        // prices, only visas it may still price (own approved + priced
+        // global). Separate from each visa's government fee (baseCostUsd).
+        visaPrices,
       });
     } catch (error) {
       console.error("Error fetching public agency:", error);

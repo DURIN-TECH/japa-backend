@@ -20,6 +20,8 @@ import {
 } from "./scrapers";
 // Agency-scoped visa drafts / edits / submit (issue #100).
 import { agencyVisaRoutes } from "./agency-visas";
+// Agency per-visa service prices, in whole naira (issue #103).
+import { agencyVisaPriceRoutes } from "./agency-visa-prices";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
@@ -87,6 +89,9 @@ app.use("/agencies", agencyRoutes);
 // Agency visas (issue #100): the caller's OWN agency's visas. Singular
 // "/agency" = "my agency" (the agency comes from the token, never the URL).
 app.use("/agency/visas", agencyVisaRoutes);
+// Agency per-visa service prices (issue #103): the caller's OWN agency's
+// prices (agency from the token). Contract: src/agency-visa-prices/agency-visa-prices.md.
+app.use("/agency/visa-prices", agencyVisaPriceRoutes);
 app.use("/invitations", invitationRoutes);
 app.use("/applications", applicationRoutes);
 app.use("/documents", documentRoutes);
