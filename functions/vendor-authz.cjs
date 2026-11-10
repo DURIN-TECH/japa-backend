@@ -9,11 +9,19 @@
  *
  * Run after the package changes (requires ../../seli-authz present + built):
  *   npm run vendor:authz   # or: node vendor-authz.cjs
+ *
+ * Optional override: set SELI_AUTHZ_DIR to vendor from a different seli-authz
+ * checkout (e.g. a git worktree under .worktrees/, where ../../seli-authz does not
+ * exist). Unset, the default sibling path below is used exactly as before.
+ *   SELI_AUTHZ_DIR=/path/to/seli-authz-worktree npm run vendor:authz
  */
 const fs = require("fs");
 const path = require("path");
 
-const SRC = path.resolve(__dirname, "../../seli-authz");
+// Source checkout: SELI_AUTHZ_DIR when given, else the sibling seli-authz repo.
+const SRC = process.env.SELI_AUTHZ_DIR
+  ? path.resolve(process.env.SELI_AUTHZ_DIR)
+  : path.resolve(__dirname, "../../seli-authz");
 const DEST = path.resolve(__dirname, "vendor/authz");
 
 const srcDist = path.join(SRC, "dist");

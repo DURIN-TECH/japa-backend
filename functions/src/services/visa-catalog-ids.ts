@@ -123,10 +123,17 @@ export function resolveVisaCode(visaCode: string | undefined, extractedCode: str
 
 // ----- Registry pins -----
 
-/** One pinned identity for a registry page (see VISA_SOURCE_OVERRIDES). */
+/**
+ * One registry-owned override for a page (see VISA_SOURCE_OVERRIDES): pinned
+ * identity plus optional section-selection overrides for structured adapters.
+ */
 export interface VisaSourcePin {
   visaId: string; // the doc id under countries/{cc}/visaTypes
   visaCode?: string; // optional code override (only where a seeded equivalent exists)
+  // Slug patterns that REPLACE the adapter's default include/exclude lists for
+  // this page (see visa-source-adapters/sections.ts). Optional.
+  includeSections?: string[];
+  excludeSections?: string[];
 }
 
 /**
@@ -151,9 +158,13 @@ export function applyVisaSourcePins(
     return {
       ...page,
       visaId: pin.visaId,
-      // Only set visaCode when the pin has one, so unpinned codes stay absent
+      // Only set optional fields when the pin has them, so they stay absent
       // (not `undefined`-valued) on the stored page.
       ...(pin.visaCode ? { visaCode: pin.visaCode } : {}),
+      // Section overrides are registry-owned too: copied (fresh arrays) on
+      // every seed, so editing the map changes the stored page on re-seed.
+      ...(pin.includeSections ? { includeSections: [...pin.includeSections] } : {}),
+      ...(pin.excludeSections ? { excludeSections: [...pin.excludeSections] } : {}),
     };
   });
   return { pages: out, matchedUrls };
@@ -183,13 +194,17 @@ export const SOURCE_CRAWL_STATE_FIELDS = [
   "status",
   "reliabilityScore",
   "consecutiveFailures",
+  // Host backoffs (issue #64): a re-seed must not let us hit a host that
+  // asked us to wait.
+  "hostBackoffs",
 ] as const;
 
 /**
  * Rebuild a country's page list on re-seed.
  *
  * `freshPages` (markdown + pins) is the source of truth for WHICH pages exist
- * and their seed-owned fields (routeName, validation, notes, visaId, visaCode):
+ * and their seed-owned fields (routeName, validation, notes, visaId, visaCode,
+ * includeSections, excludeSections):
  * pages removed from the markdown disappear, new pages start with no crawl
  * state. For every fresh page whose URL matches a stored page, the crawler's
  * fields (PAGE_CRAWL_STATE_FIELDS) are copied over, so the hash gate holds and

@@ -24,9 +24,15 @@ export type SubscriberType = "agency" | "agent" | "client";
  * CASL subject (resource) types that abilities are defined over. `"all"` is the
  * CASL wildcard used for admin.
  */
-export type SubjectType = "Application" | "Document" | "Consultation" | "PaymentRequest" | "Transaction" | "Note" | "Conversation" | "Agency" | "Agent" | "User" | "Analytics" | "Plan" | "Subscription" | "all";
+export type SubjectType = "Application" | "Document" | "Consultation" | "PaymentRequest" | "Transaction" | "Note" | "Conversation" | "Agency" | "Agent" | "User" | "Analytics" | "Plan" | "Subscription"
+/**
+ * A pending (not yet live) edit to a scraped visa, held in the
+ * `pendingVisaChanges` collection until an admin approves or rejects it.
+ * Admin-only: no role grant exists for it (see `defineAbilitiesFor`).
+ */
+ | "VisaChange" | "all";
 /** CASL actions. Kept as a string union plus open `string` for forward-compat. */
-export type Action = "manage" | "create" | "read" | "update" | "delete" | "assign" | "approve" | (string & {});
+export type Action = "manage" | "create" | "read" | "update" | "delete" | "assign" | "approve" | "reject" | (string & {});
 /**
  * The authenticated principal that abilities are built from. Derived entirely
  * from the Firebase custom claims (`role`, `agencyId`) plus the uid — no DB read

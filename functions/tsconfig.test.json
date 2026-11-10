@@ -1,10 +1,12 @@
 {
   // Type-check config for the unit tests in test/ (run by `npm test` before
   // the tests execute via tsx). Extends the build config but emits nothing, so
-  // test files never end up in lib/ or in a functions deploy.
+  // test files never end up in lib/ or in a functions deploy. Also type-checks
+  // the visa extraction eval (eval/, issue #60), which is likewise never
+  // compiled into lib/ (the build tsconfig only includes src/).
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true
   },
-  "include": ["src/**/*", "test/**/*"]
+  "include": ["src/**/*", "test/**/*", "eval/**/*"]
 }

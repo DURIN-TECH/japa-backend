@@ -1,13 +1,25 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import * as fs from "fs";
 import * as path from "path";
-import { VisaSourcePage, VisaSourceValidation } from "../types/visa-catalog";
+import {
+  CrawlWindow,
+  SourceAdapterId,
+  VisaSourcePage,
+  VisaSourceValidation,
+} from "../types/visa-catalog";
+// Pure window helpers (no Firebase): validate each seeded window and compute
+// a brand-new country's first `nextCrawlAt` (its next window opening).
+import { assertValidCrawlWindow, nextWindowOpening } from "../services/visa-crawl-window";
 import {
   VisaSourcePin,
   applyVisaSourcePins,
   mergePageCrawlState,
   pickSourceCrawlState,
 } from "../services/visa-catalog-ids";
+// Registry official hosts (issue #74) — lives in a pure services module so the
+// adapters + validator can read it without importing this seed file.
+import { VISA_SOURCE_OFFICIAL_HOSTS } from "../services/visa-catalog-official-hosts";
+export { VISA_SOURCE_OFFICIAL_HOSTS };
 
 // NOTE: the Firestore handle is resolved LAZILY inside seedVisaSources() (not at
 // module load), so this module can be imported without Firebase Admin init —
@@ -69,7 +81,24 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   "https://www.gov.uk/standard-visitor": { visaId: "gb-standard-visitor", visaCode: "SVV" }, // ~ uk-visitor
   "https://www.gov.uk/skilled-worker-visa": { visaId: "gb-skilled-worker-visa", visaCode: "SWV" }, // ~ uk-skilled-worker
   "https://www.gov.uk/student-visa": { visaId: "gb-student-visa", visaCode: "TIER4" }, // ~ uk-student
-  "https://www.gov.uk/uk-family-visa": { visaId: "gb-uk-family-visa", visaCode: "FAM" }, // ~ uk-family
+  // Family is ONE guide covering partner/child/parent/… routes, with slugs the
+  // default section patterns don't know (partner-spouse, proof-income-partner,
+  // provide-information). v1 keeps it as one record (matching the seed), so it
+  // gets an explicit include list: the partner route (the main one, where the
+  // fees and requirements live) plus the shared English / documents parts.
+  // Parent/child/adult-dependent/private-life parts are left out (§3.1: a
+  // later decision may split them into their own records).
+  "https://www.gov.uk/uk-family-visa": {
+    visaId: "gb-uk-family-visa",
+    visaCode: "FAM", // ~ uk-family
+    includeSections: [
+      "overview",
+      "partner-spouse",
+      "proof-income-partner",
+      "knowledge-of-english",
+      "provide-information",
+    ],
+  },
   // ---- United Kingdom (GB) — routes with no seeded equivalent (no visaCode) ----
   "https://www.gov.uk/health-care-worker-visa": { visaId: "gb-health-care-worker-visa" },
   "https://www.gov.uk/child-study-visa": { visaId: "gb-child-study-visa" },
@@ -85,12 +114,96 @@ export const VISA_SOURCE_OVERRIDES: Record<string, VisaSourcePin> = {
   },
 };
 
-// Weekly sweep by default (locked decision) — see the spike doc.
+// ============================================
+// SOURCE ADAPTER PER COUNTRY (registry-owned)
+// ============================================
+//
+// ISO code -> the SourceAdapter that fetches that country's pages (see
+// services/visa-source-adapters/). Countries not listed get no `adapter` field
+// and use the default, "generic-html". Like the pins above, this is applied by
+// seedVisaSources() and REFRESHED on every re-seed (it is registry config, not
+// crawl state), while crawl state is still preserved.
+//
+// GB: GOV.UK's JSON Content API — guide parts fetched separately and selected
+// (docs/visa-scraper-uk-reference.md §3). NOTE: switching a country's adapter
+// changes its content hashes, so every page re-extracts once on the next crawl.
+export const VISA_SOURCE_ADAPTERS: Record<string, SourceAdapterId> = {
+  GB: "govuk-content-api",
+};
+
+// ============================================
+// WEEKLY NIGHT CRAWL WINDOW PER COUNTRY (registry-owned, issue #63)
+// ============================================
+//
+// ISO code -> when that country's source may be crawled: one local night a
+// week, 02:00-05:00 in its own IANA zone (user decision on issue #63: first
+// run at the 02:15 tick, catch-up tries at 03:15 and 04:15). The 26 countries
+// are spread over the 7 nights 4/4/4/4/4/3/3 so government sites are hit at
+// their quietest and no night is crowded (at most 4 due, well inside 3 ticks
+// x maxSources 3). Mixing zones within one night is intended.
+//
+// Every zone here has a whole-hour UTC offset year-round, which is why the
+// hourly :15 UTC tick is also :15 local. CA and US use one representative
+// zone (their national sites aren't tied to a single local night).
+//
+// Like VISA_SOURCE_ADAPTERS, this is applied by seedVisaSources() and
+// REFRESHED on every re-seed (it is registry config, NOT crawl state, so it is
+// not in SOURCE_CRAWL_STATE_FIELDS). A unit test asserts it covers exactly the
+// keys of COUNTRY_CODES with valid windows.
+
+/** Local window hours shared by every seeded source (02:00 inclusive -> 05:00 exclusive). */
+const WINDOW_START_HOUR = 2;
+const WINDOW_END_HOUR = 5;
+
+/** Build a seeded window for one zone + ISO weekday (1 = Mon .. 7 = Sun). */
+function night(timeZone: string, dayOfWeek: number): CrawlWindow {
+  return { timeZone, dayOfWeek, startHour: WINDOW_START_HOUR, endHour: WINDOW_END_HOUR };
+}
+
+export const VISA_SOURCE_WINDOWS: Record<string, CrawlWindow> = {
+  // ---- Monday (1) ----
+  GB: night("Europe/London", 1), // UK: Monday 02:15 Europe/London
+  DE: night("Europe/Berlin", 1),
+  JP: night("Asia/Tokyo", 1),
+  QA: night("Asia/Qatar", 1),
+  // ---- Tuesday (2) ----
+  IE: night("Europe/Dublin", 2),
+  FR: night("Europe/Paris", 2),
+  KR: night("Asia/Seoul", 2),
+  SA: night("Asia/Riyadh", 2),
+  // ---- Wednesday (3) ----
+  CA: night("America/Toronto", 3),
+  NL: night("Europe/Amsterdam", 3),
+  HK: night("Asia/Hong_Kong", 3),
+  EE: night("Europe/Tallinn", 3),
+  // ---- Thursday (4) ----
+  AE: night("Asia/Dubai", 4),
+  SE: night("Europe/Stockholm", 4),
+  TW: night("Asia/Taipei", 4),
+  MT: night("Europe/Malta", 4),
+  // ---- Friday (5) ----
+  US: night("America/New_York", 5),
+  NO: night("Europe/Oslo", 5),
+  MY: night("Asia/Kuala_Lumpur", 5),
+  CZ: night("Europe/Prague", 5),
+  // ---- Saturday (6) ----
+  NZ: night("Pacific/Auckland", 6),
+  FI: night("Europe/Helsinki", 6),
+  BE: night("Europe/Brussels", 6),
+  // ---- Sunday (7) ----
+  SG: night("Asia/Singapore", 7),
+  DK: night("Europe/Copenhagen", 7),
+  AT: night("Europe/Vienna", 7),
+};
+
+// Interval fallback, used ONLY by a source without a crawlWindow (none of the
+// seeded ones): weekly sweep (locked decision) — see the spike doc.
 const CRAWL_INTERVAL_HOURS = 168;
 
 // Country-name → ISO 3166-1 alpha-2, for the 26 countries in the v3 file. The
-// section headers are matched case-insensitively after trimming.
-const COUNTRY_CODES: Record<string, string> = {
+// section headers are matched case-insensitively after trimming. Exported so
+// the unit test can check VISA_SOURCE_WINDOWS covers exactly these countries.
+export const COUNTRY_CODES: Record<string, string> = {
   canada: "CA",
   "new zealand": "NZ",
   "united kingdom": "GB",
@@ -186,6 +299,108 @@ export function parseVisaSourcesMarkdown(markdown: string): ParsedCountry[] {
   return out;
 }
 
+/** True when two windows are the same zone, weekday and hours (field-wise,
+ *  so key order / extra fields in the stored doc don't matter). */
+function sameCrawlWindow(a: CrawlWindow, b: CrawlWindow): boolean {
+  return (
+    a.timeZone === b.timeZone &&
+    a.dayOfWeek === b.dayOfWeek &&
+    a.startHour === b.startHour &&
+    a.endHour === b.endHour
+  );
+}
+
+/**
+ * Build the `visaSources/{cc}` doc for one parsed country (pure — no I/O).
+ *
+ * Seed-owned (refreshed every seed): identity, pages from the markdown + pins
+ * (incl. section overrides), `adapter` from `adapters` and `crawlWindow` from
+ * `windows` (issue #63). Crawler-owned:
+ * page crawl state (mergePageCrawlState) and source health/scheduling
+ * (pickSourceCrawlState) are carried over from `existing`. Returns the doc plus
+ * the override URLs that matched a page (for the stale-override warning).
+ * If the stored `crawlWindow` differs from the code's, `nextCrawlAt` is reset
+ * to the new window's next opening (see step 5).
+ */
+export function buildSeededVisaSource(params: {
+  country: ParsedCountry;
+  existing: Record<string, unknown> | undefined;
+  now: Timestamp;
+  overrides?: Record<string, VisaSourcePin>;
+  adapters?: Record<string, SourceAdapterId>;
+  // Registry-owned night windows; defaults to VISA_SOURCE_WINDOWS.
+  windows?: Record<string, CrawlWindow>;
+  officialHosts?: Record<string, readonly string[]>;
+}): { doc: Record<string, unknown>; matchedUrls: Set<string> } {
+  const { country: c, existing, now } = params;
+  const overrides = params.overrides ?? VISA_SOURCE_OVERRIDES;
+  const adapters = params.adapters ?? VISA_SOURCE_ADAPTERS;
+  const windows = params.windows ?? VISA_SOURCE_WINDOWS;
+  const officialHostMap = params.officialHosts ?? VISA_SOURCE_OFFICIAL_HOSTS;
+
+  // 1. Seed-owned page fields: markdown rows + pinned identity/sections.
+  const pinned = applyVisaSourcePins(c.pages, overrides);
+
+  // 2. Crawler-owned page fields: carried over by URL from the stored doc.
+  const pages = mergePageCrawlState(pinned.pages, existing?.pages as VisaSourcePage[] | undefined);
+
+  // 3. Registry-owned adapter (absent → field omitted → generic-html default).
+  const adapter = adapters[c.countryCode];
+  // 3a. Registry-owned official hosts (#74); absent → field omitted.
+  const officialHosts = officialHostMap[c.countryCode];
+
+  // 3b. Registry-owned night window (absent → field omitted → legacy
+  //     interval scheduling). Validated here so a typo in the map fails the
+  //     seed loudly instead of storing a window the orchestrator can't use.
+  const crawlWindow = windows[c.countryCode];
+  if (crawlWindow) assertValidCrawlWindow(crawlWindow);
+
+  // 4. Defaults for a new country, overlaid with any stored crawl/health
+  //    state (pickSourceCrawlState returns {} for a new country).
+  const doc: Record<string, unknown> = {
+    id: c.countryCode,
+    countryCode: c.countryCode,
+    countryName: c.countryName,
+    // The v3 list only admits official/government sources by its inclusion rule.
+    isOfficial: true,
+    pages,
+    ...(adapter ? { adapter } : {}),
+    ...(crawlWindow ? { crawlWindow } : {}),
+    ...(officialHosts && officialHosts.length ? { officialHosts: [...officialHosts] } : {}),
+    crawlIntervalHours: CRAWL_INTERVAL_HOURS,
+    // A brand-new country with a window waits for its night: first
+    // nextCrawlAt = its next window opening (operators use the manual
+    // `crawl-visa-catalog --country` script for an immediate first crawl).
+    // Without a window it is due immediately (legacy). An EXISTING doc keeps
+    // its stored nextCrawlAt via pickSourceCrawlState below; an old value in
+    // the past just means it runs at its first window, then stays on the
+    // weekly grid — no migration needed.
+    nextCrawlAt: crawlWindow
+      ? Timestamp.fromDate(nextWindowOpening(crawlWindow, now.toMillis()))
+      : now,
+    status: "active",
+    reliabilityScore: 100,
+    consecutiveFailures: 0,
+    createdAt: now,
+    ...pickSourceCrawlState(existing),
+    updatedAt: now,
+  };
+
+  // 5. Window CHANGED in code since the last seed -> the stored nextCrawlAt
+  //    belongs to the old grid (e.g. a source moved from Tue to Fri would
+  //    otherwise still run on its old night, or not until a week later).
+  //    Reset it to the NEW window's next opening. An unchanged window keeps
+  //    the stored nextCrawlAt (crawl state preserved), and so does a doc that
+  //    had no stored window yet (first rollout of #63: its past nextCrawlAt
+  //    makes it run at its first window — the issue's no-migration rule).
+  //    All other crawl state (status, health, lastCrawledAt) is kept either way.
+  const storedWindow = existing?.crawlWindow as CrawlWindow | undefined;
+  if (crawlWindow && storedWindow && !sameCrawlWindow(storedWindow, crawlWindow)) {
+    doc.nextCrawlAt = Timestamp.fromDate(nextWindowOpening(crawlWindow, now.toMillis()));
+  }
+  return { doc, matchedUrls: pinned.matchedUrls };
+}
+
 /**
  * Seed the `visaSources/{countryCode}` registry from the verified-links
  * markdown plus VISA_SOURCE_OVERRIDES. Idempotent (deterministic doc ids);
@@ -194,13 +409,16 @@ export function parseVisaSourcesMarkdown(markdown: string): ParsedCountry[] {
  * Re-seeding PRESERVES crawl state, so it is safe to run after deploys:
  *  - `pages` is rebuilt from the markdown + pins (pages removed from the
  *    markdown disappear; new pages start with no crawl state; existing pages
- *    gain/refresh `visaId`/`visaCode` — this is how deployed registries pick up
- *    the pins), then each page's crawler fields (lastContentHash, lastCrawledAt,
+ *    gain/refresh `visaId`/`visaCode`/`includeSections`/`excludeSections` —
+ *    this is how deployed registries pick up the pins), the source `adapter`
+ *    and `crawlWindow` are refreshed from VISA_SOURCE_ADAPTERS /
+ *    VISA_SOURCE_WINDOWS, then each page's crawler fields (lastContentHash, lastCrawledAt,
  *    lastExtractedAt, lastError) are copied from the stored page with the same
  *    URL, so the hash gate still holds on the next crawl.
  *  - Source-level createdAt, nextCrawlAt, lastCrawledAt, status,
  *    reliabilityScore and consecutiveFailures are kept from the existing doc;
- *    only `updatedAt` is refreshed. A brand-new country gets the defaults.
+ *    only `updatedAt` is refreshed. A brand-new country gets the defaults
+ *    (its nextCrawlAt = its next window opening, not now).
  */
 export async function seedVisaSources(markdownPath?: string): Promise<number> {
   const file = markdownPath || findVisaSourcesMarkdown();
@@ -236,35 +454,12 @@ export async function seedVisaSources(markdownPath?: string): Promise<number> {
       ? (snaps[idx].data() as Record<string, unknown>)
       : undefined;
 
-    // 1. Seed-owned page fields: markdown rows + pinned identity.
-    const pinned = applyVisaSourcePins(c.pages, VISA_SOURCE_OVERRIDES);
-    pinned.matchedUrls.forEach((u) => matchedOverrideUrls.add(u));
-
-    // 2. Crawler-owned page fields: carried over by URL from the stored doc.
-    const pages = mergePageCrawlState(
-      pinned.pages,
-      existing?.pages as VisaSourcePage[] | undefined
-    );
-
-    // 3. Defaults for a new country, overlaid with any stored crawl/health
-    //    state (pickSourceCrawlState returns {} for a new country).
-    batch.set(ref, {
-      id: c.countryCode,
-      countryCode: c.countryCode,
-      countryName: c.countryName,
-      // The v3 list only admits official/government sources by its inclusion rule.
-      isOfficial: true,
-      pages,
-      crawlIntervalHours: CRAWL_INTERVAL_HOURS,
-      // Due immediately so the first crawl picks a new country up.
-      nextCrawlAt: now,
-      status: "active",
-      reliabilityScore: 100,
-      consecutiveFailures: 0,
-      createdAt: now,
-      ...pickSourceCrawlState(existing),
-      updatedAt: now,
-    });
+    // Seed-owned fields (pages + pins + adapter) refreshed, crawl state kept.
+    const { doc, matchedUrls } = buildSeededVisaSource({ country: c, existing, now });
+    matchedUrls.forEach((u) => matchedOverrideUrls.add(u));
+    // Full overwrite (no merge): a registry field removed from code (e.g. a
+    // country dropped from VISA_SOURCE_ADAPTERS) disappears from the doc too.
+    batch.set(ref, doc);
   });
 
   // Guard: an override whose URL no longer appears in the markdown (e.g. the
