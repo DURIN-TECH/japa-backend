@@ -81,6 +81,57 @@ export const NEWSAPI_API_URL = "https://newsapi.org/v2/everything";
 /** Max article pages opened per source per run when `fetchFullContent` is on. */
 export const MAX_FULL_CONTENT_ARTICLES = 5;
 
+// ============================================
+// SECRET-SAFE ERROR LOGGING (issue #76 review)
+// ============================================
+//
+// News API keys must never reach Cloud Logging or Firestore. NewsAPI gets
+// its key in the `X-Api-Key` header (documented at
+// https://newsapi.org/docs/authentication), but NewsData.io only documents
+// the `apikey` QUERY parameter (https://newsdata.io/documentation), so its
+// key is in the request URL. A raw axios error carries that URL (and the
+// request headers) in `error.config`, so the scraper NEVER logs or stores a
+// raw error object: everything goes through describeError(), which keeps
+// only the message (plus host + status when known) with keys redacted.
+
+/** Query parameters / headers that carry an API key (matched case-insensitively). */
+const SECRET_PARAM_PATTERN = /((?:api[_-]?key|x-api-key|access[_-]?key|x-access-key)\s*[=:]\s*)[^&\s"',;]+/gi;
+
+/**
+ * Replace the value of every `apikey=` / `apiKey=` / `X-Api-Key:`-style pair
+ * in `text` with `[REDACTED]`. Also redacts the literal values of the
+ * configured NEWS_API_KEY_* env vars wherever they appear (belt and braces:
+ * catches a key echoed back in an upstream error body).
+ */
+export function redactSecrets(text: string): string {
+  let out = text.replace(SECRET_PARAM_PATTERN, "$1[REDACTED]");
+  for (const [name, value] of Object.entries(process.env)) {
+    if (name.startsWith("NEWS_API_KEY_") && value && value.length >= 6) {
+      out = out.split(value).join("[REDACTED]");
+    }
+  }
+  return out;
+}
+
+/**
+ * A loggable, secret-free one-line description of an error: its message,
+ * plus `host` and HTTP `status` when it is an axios error (read from
+ * `config.url` / `response.status`, never echoed whole). Redacted.
+ */
+export function describeError(error: unknown): string {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const e = error as any;
+  const message = error instanceof Error ? error.message : String(error);
+  const parts: string[] = [];
+  if (e && typeof e === "object" && e.isAxiosError) {
+    const host = typeof e.config?.url === "string" ? hostOf(e.config.url) : "";
+    if (host) parts.push(`host=${host}`);
+    if (typeof e.response?.status === "number") parts.push(`status=${e.response.status}`);
+  }
+  parts.push(message);
+  return redactSecrets(parts.join(" "));
+}
+
 /**
  * The production HTTP client for every news-bot request. `validateStatus`
  * accepts every status so the fetch layer sees 429/503 (and decides what is
@@ -218,12 +269,15 @@ export class NewsScraperService {
         result.newArticles += scrapeResult.articlesNew;
       } catch (error) {
         result.errors++;
-        console.error(`Failed to scrape source ${source.name}:`, error);
+        // Never log the raw error: an axios error carries the request URL
+        // (NewsData.io's key is in its query string). describeError() keeps
+        // host + status + message, redacted.
+        console.error(`Failed to scrape source ${source.name}: ${describeError(error)}`);
 
         await this.store.updateSourceAfterScrape(
           source.id,
           false,
-          (error as Error).message,
+          describeError(error),
           isHostBackoffError(error) ? error.untilMs : undefined
         );
       }
@@ -293,8 +347,7 @@ export class NewsScraperService {
         } catch (parseError) {
           articlesFailed++;
           console.warn(
-            `Failed to normalize article from ${source.name}:`,
-            parseError
+            `Failed to normalize article from ${source.name}: ${describeError(parseError)}`
           );
         }
       }
@@ -337,15 +390,16 @@ export class NewsScraperService {
 
       await this.store.completeScrapeRun(source.id, runId, {
         status: "failed",
-        errorMessage: (error as Error).message,
-        errorStack: (error as Error).stack,
+        // Written to Firestore: redacted like the logs.
+        errorMessage: describeError(error),
+        errorStack: (error as Error).stack ? redactSecrets(String((error as Error).stack)) : undefined,
         durationMs: Date.now() - startTime,
       });
 
       await this.store.updateSourceAfterScrape(
         source.id,
         false,
-        (error as Error).message,
+        describeError(error),
         // Don't come back before the host's Retry-After time.
         isHostBackoffError(error) ? error.untilMs : undefined
       );
@@ -565,14 +619,15 @@ export class NewsScraperService {
    */
   private async getNewsApiJson(
     endpoint: string,
-    params: Record<string, string | number | undefined>
+    params: Record<string, string | number | undefined>,
+    headers: Record<string, string> = {}
   ): Promise<Record<string, unknown>> {
     const url = new URL(endpoint);
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== "") url.searchParams.set(key, String(value));
     }
     // HostBackoffError's message is host/status/time only — no key leak.
-    const resp = await this.fetcher.getRaw(url.toString(), { Accept: "application/json" });
+    const resp = await this.fetcher.getRaw(url.toString(), { Accept: "application/json", ...headers });
     if (resp.status < 200 || resp.status >= 300) {
       throw new Error(`News API request to ${url.host} failed (HTTP ${resp.status})`);
     }
@@ -600,6 +655,9 @@ export class NewsScraperService {
     let articles: RawArticle[] = [];
 
     if (apiConfig.provider === "newsdata") {
+      // NewsData.io only documents the `apikey` QUERY parameter (no header
+      // form in its own docs), so the key stays in the URL; every log/stored
+      // error goes through describeError() / redactSecrets() instead.
       const data = await this.getNewsApiJson(NEWSDATA_API_URL, {
         apikey: apiKey,
         q: apiConfig.query,
@@ -617,13 +675,18 @@ export class NewsScraperService {
         publishedAt: item.pubDate ? new Date(item.pubDate) : undefined,
       }));
     } else if (apiConfig.provider === "newsapi") {
-      const data = await this.getNewsApiJson(NEWSAPI_API_URL, {
-        apiKey,
-        q: apiConfig.query,
-        language: apiConfig.language || "en",
-        sortBy: "publishedAt",
-        pageSize: source.config.maxArticlesPerRun,
-      });
+      // NewsAPI documents the `X-Api-Key` header (and recommends it over the
+      // query string, so the key stays out of URLs and logs).
+      const data = await this.getNewsApiJson(
+        NEWSAPI_API_URL,
+        {
+          q: apiConfig.query,
+          language: apiConfig.language || "en",
+          sortBy: "publishedAt",
+          pageSize: source.config.maxArticlesPerRun,
+        },
+        { "X-Api-Key": apiKey }
+      );
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       articles = ((data.articles as any[]) || []).map((item: any) => ({

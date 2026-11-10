@@ -372,3 +372,85 @@ describe("429/503 backoff", () => {
     });
   });
 });
+
+// ============================================
+// API keys never reach logs (issue #76 review)
+// ============================================
+
+describe("API key secrecy", () => {
+  /** Run `fn` with console.log/warn/error captured; returns everything logged. */
+  async function captureLogs(fn: () => Promise<unknown>): Promise<string> {
+    const lines: string[] = [];
+    const orig = { log: console.log, warn: console.warn, error: console.error };
+    const sink = (...args: unknown[]) => {
+      // Serialise objects deeply (like Cloud Logging would) so a raw error's
+      // config.url / headers would show up if they were logged.
+      lines.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a, Object.getOwnPropertyNames(a ?? {})))).join(" "));
+    };
+    console.log = sink;
+    console.warn = sink;
+    console.error = sink;
+    try {
+      await fn();
+    } finally {
+      Object.assign(console, orig);
+    }
+    return lines.join("\n");
+  }
+
+  test("a network-level axios error on the keyed NewsData URL logs no key", async () => {
+    // An axios-shaped error whose message AND config carry the keyed URL.
+    const keyedUrl = "https://newsdata.io/api/1/news?apikey=secret-key-123&q=visa";
+    const failingHttp: VisaCatalogHttpClient = {
+      async get(url) {
+        const err = Object.assign(new Error(`connect ECONNREFUSED while requesting ${url}`), {
+          isAxiosError: true,
+          config: { url, headers: { "X-Api-Key": "secret-key-123" } },
+        });
+        throw err;
+      },
+    };
+    dueSources = [apiSource("newsdata")];
+    const scraper = new mod.NewsScraperService({
+      http: failingHttp,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      store: store as any,
+      minIntervalMs: 0,
+      clock: () => NOW,
+    });
+    const logs = await captureLogs(() => scraper.runOrchestrator());
+    assert.ok(logs.includes("Failed to scrape source newsdata"), logs);
+    assert.ok(logs.includes("host=newsdata.io"), logs);
+    assert.ok(!logs.includes("secret-key-123"), logs);
+    assert.ok(!logs.includes(keyedUrl), logs);
+    // Nothing written to Firestore carries it either.
+    for (const u of updates) assert.ok(!(u.errorMessage ?? "").includes("secret-key-123"));
+    for (const r of runs) {
+      assert.ok(!String(r.result.errorMessage ?? "").includes("secret-key-123"));
+      assert.ok(!String(r.result.errorStack ?? "").includes("secret-key-123"));
+    }
+  });
+
+  test("NewsAPI gets its key in the X-Api-Key header, not the URL", async () => {
+    process.env.NEWS_API_KEY_NEWSAPI = "newsapi-key-456";
+    const src = apiSource("newsapi");
+    src.config.apiConfig = { provider: "newsapi", query: "visa" };
+    routes.set("https://newsapi.org/v2/everything?q=visa&language=en&sortBy=publishedAt&pageSize=10", {
+      status: 200,
+      body: JSON.stringify({ articles: [{ title: "T", url: "https://x.example/2" }] }),
+    });
+    const run = await makeScraper().scrapeSource(src);
+    assert.equal(run.articlesNew, 1);
+    const req = requests.find((r) => r.url.startsWith("https://newsapi.org/"));
+    assert.ok(req && !req.url.includes("newsapi-key-456"));
+    assert.equal(req.headers?.["X-Api-Key"], "newsapi-key-456");
+  });
+
+  test("redactSecrets / describeError strip key pairs and configured key values", () => {
+    assert.equal(
+      mod.redactSecrets("GET /news?apikey=abc123&q=x apiKey=zzz X-Api-Key: qqq"),
+      "GET /news?apikey=[REDACTED]&q=x apiKey=[REDACTED] X-Api-Key: [REDACTED]"
+    );
+    assert.equal(mod.describeError(new Error("echo secret-key-123 back")), "echo [REDACTED] back");
+  });
+});
