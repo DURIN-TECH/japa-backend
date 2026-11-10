@@ -319,7 +319,7 @@ export function printReport(res: EvalResultFile, log: (l: string) => void): void
     log(`${cell(r.route, 22)}${cell(f3(r.score.score), 8)}${byType.join("")}${r.error ? "  EXTRACTION FAILED" : ""}`);
   }
   log(`${cell("field type mean", 30)}${types.map((t) => cell(f3(res.fieldTypeScores[t]), 12)).join("")}`);
-  log(`\nOVERALL ${f3(res.overall)} (pass >= ${res.thresholds.overall}, every route >= ${res.thresholds.route}, no fee mismatch)`);
+  log(`\nOVERALL ${f3(res.overall)} (pass >= ${res.thresholds.overall}, every route >= ${res.thresholds.route}, no fee or processing citation mismatch)`);
 
   // Every failing field, so a reader sees WHY without opening the JSON.
   log("\nField failures:");

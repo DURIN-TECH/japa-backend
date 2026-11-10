@@ -177,6 +177,14 @@ async function main() {
     return pickSourceAdapter(cfg.adapter, cfg.url).fetch(linkedSurchargePage(cfg));
   });
 
+  // Supplementary pages (issue #86): same helpers as the orchestrator.
+  const {
+    SupplementaryPageCache,
+    combineSupplementaryText,
+    supplementaryGateHash,
+    supplementaryPagesMeta,
+  } = await import("../services/visa-catalog-supplementary");
+
   // ---- Run record (issue #81) ----
   // Same recorder as the orchestrator. Sweep crashed runs first, then start
   // ours as `running` before any FX / fetch / LLM work.
@@ -226,7 +234,11 @@ async function main() {
     console.log(`FX: re-converted ${reconvert.reconverted} flagged fee(s), re-flagged ${reconvert.reflagged}`);
   } catch (err) {
     console.error(`FX: re-converting flagged fees FAILED (continuing): ${(err as Error).message}`);
+    // Run-level warning, not an error (same as the orchestrator, #81).
+    recorder.recordWarning(`re-converting flagged fees failed: ${(err as Error)?.message ?? err}`);
   }
+  // A failed FX refresh is a run-level warning too (the previous rates are used).
+  if (!fxRefresh.refreshed) recorder.recordWarning(`FX refresh failed: ${fxRefresh.error ?? "unknown error"}`);
 
   // LLM calls made this run (successful or not), capped by --max-extractions.
   let extractionsUsed = 0;
@@ -268,20 +280,31 @@ async function main() {
     // Stored retry-after times from the scheduled crawl (Firestore Timestamps
     // -> the helper's ms form; malformed entries ignored).
     hostState.load(hostBackoffEntriesFromSource(source.hostBackoffs));
-    // Filter pages by --visa name if provided.
+    // Supplementary pages (issue #86): one cache per source (its adapter),
+    // each fetched at most once, skipped when its host is backed off.
+    const supplements = new SupplementaryPageCache(async (suppPage) => {
+      const blocked = hostState.blocking(hostOf(suppPage.url));
+      if (blocked) throw new Error(`supplementary page not fetched: ${backoffMessage(blocked)}`);
+      return pickSourceAdapter(source.adapter, suppPage.url).fetch(suppPage);
+    });
+    // Filter pages by --visa name if provided. Supplement-only rows (#86, e.g.
+    // a fee table) are not visas: never extracted on their own.
     const pages = source.pages.filter(
-      (p) => !args.visa || p.routeName.toLowerCase().includes(args.visa)
+      (p) => !p.supplementOnly && (!args.visa || p.routeName.toLowerCase().includes(args.visa))
     );
     // ---- Per-source run-record tallies (issue #81) ----
     const src = { attempted: 0, fetched: 0, errors: 0, deferred: 0 };
+    // Supplement-only rows (#86) fetched for a route this run, by URL.
+    const suppsFetched = new Set<string>();
     const srcCounts: Record<string, number> = {};
     // Note one page outcome on the run record + this source's tallies.
     const notePage = (
       page: (typeof pages)[number],
       outcome: ScrapeRunPageOutcome,
-      extra: { visaId?: string; error?: string } = {}
+      extra: { visaId?: string; error?: string; reason?: string } = {}
     ) => {
-      src.attempted++;
+      // Supplement rows are listed, not counted as attempted (same as the recorder).
+      if (outcome !== "supplement") src.attempted++;
       srcCounts[outcome] = (srcCounts[outcome] ?? 0) + 1;
       recorder.recordPage({ sourceId: source.countryCode, url: page.url, routeName: page.routeName, outcome, ...extra });
     };
@@ -353,7 +376,13 @@ async function main() {
           totals.linkedSurchargeErrors++;
           throw err;
         }
-        const gateHash = linkedGateHash(fetched.contentHash, linked);
+        // Supplementary pages (issue #86): resolved against the FULL page
+        // list (supplements are filtered out of `pages` above).
+        const supps = await supplements.forPage(page, source.pages);
+        if (supps.length) console.log(`  supplementary pages: ${supps.map((s) => s.page.url).join(", ")}`);
+        for (const s of supps) suppsFetched.add(s.page.url);
+        const extractText = combineSupplementaryText(fetched.text, supps);
+        const gateHash = linkedGateHash(supplementaryGateHash(fetched.contentHash, supps), linked);
         if (linked.length) console.log(`  linked surcharges: ${linked.map((l) => l.resolved.id).join(", ")}`);
 
         // Hash gate: same text as the stored extraction → no LLM call.
@@ -412,7 +441,7 @@ async function main() {
         // A content change unless this is a #71 prompt re-extract (counted
         // above). Under --force a same-text page also counts (approximate).
         if (!promptReextract) totals.pagesChanged++;
-        const extracted = await visaCatalogExtractor.extract(fetched.text, {
+        const extracted = await visaCatalogExtractor.extract(extractText, {
           url: page.url,
           countryName: source.countryName,
           routeName: page.routeName,
@@ -434,10 +463,17 @@ async function main() {
           fx,
           // Linked-page surcharges for this route (issue #69).
           linkedSurcharges: linked,
+          // Supplementary pages used (issue #86), for scrapeMeta.
+          supplementaryPages: supplementaryPagesMeta(supps),
         });
         totals[outcome]++;
         notePage(page, outcome, { visaId });
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
+        // Issue #86: say when uncited numbers were left out (never written as 0).
+        if (extracted.processingUnknown) console.log("     processing time unknown (no cited figure): days omitted");
+        if (extracted.uncitedFieldsDropped?.length) {
+          console.log(`     uncited fields dropped: ${extracted.uncitedFieldsDropped.join(", ")}`);
+        }
       } catch (err) {
         totals.errors++;
         src.errors++;
@@ -462,6 +498,16 @@ async function main() {
     // --visa filter left with no pages, or reached after --limit, is not
     // recorded (it was not attempted).
     if (src.attempted > 0) {
+      // Supplement-only rows (#86) of this source: listed so they are
+      // visible on the run, with whether a route fetched them.
+      for (const p of source.pages) {
+        if (!p.supplementOnly) continue;
+        notePage(p, "supplement", {
+          reason: suppsFetched.has(p.url)
+            ? "supplement-only page (fee table): fetched for the routes that use it, never extracted"
+            : "supplement-only page (fee table): not fetched this run (no route using it was crawled)",
+        });
+      }
       totals.sourcesProcessed++;
       let status: ScrapeRunSourceStatus;
       if (src.deferred === src.attempted) status = "deferred";

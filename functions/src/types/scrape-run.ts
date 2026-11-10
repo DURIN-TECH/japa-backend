@@ -62,10 +62,12 @@ export interface ScrapeRunError {
 /**
  * Outcome of one source within a run.
  *  - succeeded / partial / failed: as for the run, scoped to the source;
+ *  - empty: no page attempted (the source has no pages, or the run's
+ *    extraction cap was used up before it); not an error;
  *  - deferred: nothing requested, every page's host was under a stored
  *    429/503 backoff (visa, #64) or the host backed off earlier this run (news).
  */
-export type ScrapeRunSourceStatus = "succeeded" | "partial" | "failed" | "deferred";
+export type ScrapeRunSourceStatus = "succeeded" | "partial" | "failed" | "deferred" | "empty";
 
 /** Per-source line of a run (the run detail's "sources" table). */
 export interface ScrapeRunSourceEntry {
@@ -95,6 +97,10 @@ export interface ScrapeRunSourceEntry {
  *  - deferred: host backed off, not requested;
  *  - capped: not attempted, the run's extraction cap was reached (script only;
  *    the orchestrator simply stops and the page waits for the next window);
+ *  - supplement: a supplement-only registry row (#86, e.g. the KR fee
+ *    table): never extracted, its text is appended to the routes that list
+ *    it; `reason` says whether a route fetched it this run. Not counted in
+ *    pagesAttempted;
  *  - error: fetch / extract / ingest failed (see `error`).
  */
 export type ScrapeRunPageOutcome =
@@ -106,6 +112,7 @@ export type ScrapeRunPageOutcome =
   | "withdrawn"
   | "deferred"
   | "capped"
+  | "supplement"
   | "error";
 
 /** Per-page line of a run. News runs record none (their unit is the source). */
@@ -116,6 +123,7 @@ export interface ScrapeRunPageEntry {
   outcome: ScrapeRunPageOutcome;
   visaId?: string; // resolved catalog id (countries/{sourceId}/visaTypes/{visaId})
   error?: string; // redacted, capped
+  reason?: string; // why a non-error outcome happened (e.g. supplement rows)
 }
 
 /**
@@ -159,7 +167,11 @@ export interface ScrapeRunDoc {
   errorCount: number; // every error in the run (not just the stored ones)
   errors: ScrapeRunError[]; // the first MAX_RECORDED_ERRORS, redacted
   // Set when the run itself threw (or was swept as stale): redacted message.
+  // Cleared by a normal finalize (a late finalize after a stale sweep).
   fatalError?: string;
+  // Run-level warnings (max 10, redacted): problems that are not errors and
+  // do not affect `status` / `errorCount`, e.g. the FX fee re-convert failing.
+  warnings?: string[];
 
   // ---- Context ----
   // The run's knobs, for reading a run later (e.g. maxSources,

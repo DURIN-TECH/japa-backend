@@ -137,6 +137,10 @@ export function fakeCollection(
     limit(n: number) {
       return fakeCollection(path, filters, order, n, afterPath);
     },
+    // Field projection (issue #81 stats scan): the fake returns whole docs.
+    select() {
+      return fakeCollection(path, filters, order, max, afterPath);
+    },
     // Cursor: a doc snapshot from a previous get() (its ref.path is the key).
     startAfter(snap: { ref: { path: string } }) {
       return fakeCollection(path, filters, order, max, snap.ref.path);
@@ -228,4 +232,7 @@ export async function installFakes(): Promise<void> {
   catalog.visaCatalogService.runTransaction = fakeRunTransaction;
   const visa: any = await import("../../src/services/visa.service");
   visa.visaService.runTransaction = fakeRunTransaction;
+  // Issue #81: the stale run sweep is transactional.
+  const runs: any = await import("../../src/services/scrape-run.service");
+  runs.scrapeRunService.runTransaction = fakeRunTransaction;
 }

@@ -1,6 +1,11 @@
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import type { VisaType } from "../types";
-import type { ExtractedVisa, VisaFeeMeta, VisaScrapeMeta } from "../types/visa-catalog";
+import type {
+  ExtractedVisa,
+  VisaFeeMeta,
+  VisaScrapeMeta,
+  VisaSupplementaryPageMeta,
+} from "../types/visa-catalog";
 import type { ScrapeSourceMeta } from "./visa-source-adapters";
 
 // ============================================
@@ -26,13 +31,21 @@ export function buildScrapeMeta(params: {
   routeName: string;
   model: string;
   contentHash: string;
-  extracted: Pick<ExtractedVisa, "confidence" | "citations">;
+  // `processingUnknown` / `uncitedFieldsDropped` (issue #86) and
+  // `processingUnverifiedReasons` (issue #87) are optional on the extraction
+  // and copied only when set.
+  extracted: Pick<
+    ExtractedVisa,
+    "confidence" | "citations" | "processingUnknown" | "uncitedFieldsDropped" | "processingUnverifiedReasons"
+  >;
   extractedAt: Timestamp;
   sourceMeta?: ScrapeSourceMeta;
   // Fee as published + its USD conversion provenance (computeFee().feeMeta).
   fee?: VisaFeeMeta;
   // EXTRACTOR_PROMPT_VERSION of the prompt that produced `extracted`.
   extractorPromptVersion?: string;
+  // Supplementary pages appended to the route text (issue #86); [] / absent = none.
+  supplementaryPages?: VisaSupplementaryPageMeta[];
 }): VisaScrapeMeta {
   const meta: VisaScrapeMeta = {
     sourceUrl: params.sourceUrl,
@@ -46,6 +59,21 @@ export function buildScrapeMeta(params: {
   // Only defined values — Firestore never sees `undefined`.
   if (params.fee) meta.fee = params.fee;
   if (params.extractorPromptVersion) meta.extractorPromptVersion = params.extractorPromptVersion;
+  // ---- Issue #86: uncited numeric fields + supplementary pages ----
+  // Only written when they say something (no `false` / empty keys), so a
+  // route with a cited processing time and no supplements keeps the old shape.
+  if (params.extracted.processingUnknown) meta.processingUnknown = true;
+  if (params.extracted.uncitedFieldsDropped && params.extracted.uncitedFieldsDropped.length > 0) {
+    meta.uncitedFieldsDropped = [...params.extracted.uncitedFieldsDropped];
+  }
+  if (params.supplementaryPages && params.supplementaryPages.length > 0) {
+    meta.supplementaryPages = params.supplementaryPages.map((p) => ({ ...p }));
+  }
+  // Issue #87: processing-range flag, only when set (never an empty array).
+  const processingReasons = params.extracted.processingUnverifiedReasons;
+  if (processingReasons && processingReasons.length > 0) {
+    meta.processingUnverifiedReasons = [...processingReasons];
+  }
   for (const [k, v] of Object.entries(params.sourceMeta ?? {})) {
     // Cast: keys are a subset of VisaScrapeMeta by construction (ScrapeSourceMeta).
     if (v !== undefined) (meta as unknown as Record<string, unknown>)[k] = v;
@@ -201,6 +229,29 @@ export function finiteMin(values: unknown[], fallback = 0): number {
 }
 
 /**
+ * Optional extracted VisaType fields that a refresh must DELETE from an
+ * existing pending doc when the new extraction leaves them out (issue #86).
+ * Without this, a merge update keeps the previous extraction's value next to
+ * a scrapeMeta that no longer supports it — e.g. the old fake `0` processing
+ * days staying on the KR doc after the validator started omitting them.
+ * (`baseCostUsd` has its own rules in ingestExtraction: FX-flagged fees keep
+ * the old cost, see the refresh branch there.)
+ */
+export const REFRESH_DELETABLE_FIELDS = ["processingDaysMin", "processingDaysMax", "maxExtensions"] as const;
+
+/**
+ * The FieldValue.delete() map for every REFRESH_DELETABLE_FIELDS key that is
+ * absent from `fields` (the extractedToVisaFields() output). Spread into the
+ * refresh update; {} when all of them are present.
+ */
+export function absentFieldDeletes(fields: Partial<VisaType>): Record<string, FieldValue> {
+  const out: Record<string, FieldValue> = {};
+  const rec = fields as Record<string, unknown>;
+  for (const k of REFRESH_DELETABLE_FIELDS) if (rec[k] === undefined) out[k] = FieldValue.delete();
+  return out;
+}
+
+/**
  * Map a validated extraction onto VisaType fields for the ingest write.
  * `code` is the already resolved code (registry-pinned `visaCode` if any, else
  * the extracted one).
@@ -210,6 +261,10 @@ export function finiteMin(values: unknown[], fallback = 0): number {
  * undefined (fee flagged fxStale/fxMissing, or no fee stated) the key is
  * OMITTED: absent on a new doc, and left unchanged by a merge update on an
  * existing pending doc. Never a fake 0.
+ *
+ * Issue #86: `processingDaysMin` / `processingDaysMax` / `maxExtensions` are
+ * undefined when the page did not cite them, so they are OMITTED here too
+ * (never a fake 0); a refresh deletes stale values via absentFieldDeletes().
  *
  * Every undefined value is dropped, so no `undefined` reaches Firestore
  * (regardless of the db's ignoreUndefinedProperties setting).

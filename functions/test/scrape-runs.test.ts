@@ -24,6 +24,9 @@
 //  - listRuns filters / newest first / cursor pages; getRun ISO dates;
 //    source health for visa (active backoffs only, latest page error) + news
 //  - controller: 403 for owner / agent / client, 400 validation, 404, shapes
+//  - review follow-ups: transactional stale sweep, late finalize clears the
+//    stale fatalError, run-level warnings (fee re-convert), `empty` sources,
+//    #86 supplement-only rows, GET /admin/scrape-runs/stats
 //  - news cleanupOldScrapeRuns no longer touches top-level run records
 
 import { test, describe, before, beforeEach } from "node:test";
@@ -264,6 +267,46 @@ describe("sweepStaleRuns", () => {
   });
 });
 
+describe("sweepStaleRuns — transactional re-check", () => {
+  test("a run that finalised between the query and the write is left alone", async () => {
+    seedRun("racy", { status: "running", startedAt: Timestamp.fromMillis(NOW - 2 * HOUR), finishedAt: null });
+    const orig = runs.runTransaction;
+    // Before the transaction body runs, the run finishes on its own.
+    runs.runTransaction = async (fn: any) => {
+      store.set("scrapeRuns/racy", { ...store.get("scrapeRuns/racy")!, status: "succeeded" });
+      return orig(fn);
+    };
+    try {
+      assert.equal(await quiet(() => runs.sweepStaleRuns(NOW)), 0);
+    } finally {
+      runs.runTransaction = orig;
+    }
+    const d = store.get("scrapeRuns/racy")!;
+    assert.equal(d.status, "succeeded");
+    assert.equal(d.fatalError, undefined);
+  });
+
+  test("a late finalize after a stale sweep clears the stale fatalError", async () => {
+    const r = await runs.start({ kind: "visa", trigger: "scheduled", startedAtMs: NOW - 2 * HOUR });
+    await quiet(() => runs.sweepStaleRuns(NOW));
+    assert.equal(onlyRun().status, "failed");
+    assert.equal(onlyRun().fatalError, runsMod.STALE_RUN_MESSAGE);
+    await r.finalize({ summary: { errors: 0 }, anySuccess: true });
+    assert.equal(onlyRun().status, "succeeded");
+    assert.equal("fatalError" in onlyRun(), false);
+  });
+
+  test("warnings are stored but never change errorCount or status", async () => {
+    const r = await runs.start({ kind: "visa", trigger: "scheduled", startedAtMs: NOW });
+    r.recordWarning("FX refresh failed: apikey=abc123");
+    await r.finalize({ summary: { errors: 0 }, anySuccess: true });
+    const d = onlyRun();
+    assert.equal(d.status, "succeeded");
+    assert.equal(d.errorCount, 0);
+    assert.deepEqual(d.warnings, ["FX refresh failed: apikey=[REDACTED]"]);
+  });
+});
+
 // ============================================
 // Visa orchestrator
 // ============================================
@@ -364,6 +407,57 @@ describe("visa orchestrator run records", () => {
     assert.equal(src.counts.created, 1);
     const crawlRun = store.get(`visaSources/${CC}/crawlRuns/${src.sourceRunId}`)!;
     assert.equal(crawlRun.runId, runId);
+  });
+
+  test("a failed fee re-convert is a warning: a clean crawl stays succeeded", async () => {
+    seedSource();
+    const src = store.get(`visaSources/${CC}`)!;
+    store.set(`visaSources/${CC}`, { ...src, pages: [(src.pages as any[])[0]] }); // only the good page
+    const catalogSvc = (await import("../src/services/visa-catalog.service")).visaCatalogService as any;
+    const orig = catalogSvc.reconvertFlaggedFees;
+    catalogSvc.reconvertFlaggedFees = async () => {
+      throw new Error("reconvert broke");
+    };
+    try {
+      const summary = await withStubs(() => crawl.runOrchestrator({ now: NOW, fetchFxRates }));
+      assert.equal(summary.errors, 0);
+    } finally {
+      catalogSvc.reconvertFlaggedFees = orig;
+    }
+    const run = onlyRun();
+    assert.equal(run.status, "succeeded");
+    assert.equal(run.errorCount, 0);
+    assert.deepEqual(run.warnings, ["re-converting flagged fees failed: reconvert broke"]);
+  });
+
+  test("a source with no pages is recorded `empty`, not failed", async () => {
+    seedSource();
+    store.set(`visaSources/${CC}`, { ...store.get(`visaSources/${CC}`)!, pages: [] });
+    await withStubs(() => crawl.runOrchestrator({ now: NOW, fetchFxRates }));
+    const src = (onlyRun().sources as any[])[0];
+    assert.equal(src.status, "empty");
+    assert.equal(src.errors, 0);
+    assert.equal(src.pagesAttempted, 0);
+  });
+
+  test("a supplement-only row (#86) is listed as `supplement` with a reason, not as an attempted page", async () => {
+    const FEES = "https://www.gov.uk/visa-fees";
+    seedSource();
+    store.set(`visaSources/${CC}`, {
+      ...store.get(`visaSources/${CC}`)!,
+      pages: [
+        { url: PAGE_OK, routeName: "Skilled Worker visa", visaId: "gb-skilled-worker", supplementaryPages: [FEES] },
+        { url: FEES, routeName: "Visa fees", supplementOnly: true },
+      ],
+    });
+    await withStubs(() => crawl.runOrchestrator({ now: NOW, fetchFxRates }));
+    const run = onlyRun();
+    assert.equal(run.status, "succeeded");
+    assert.equal(run.pagesAttempted, 1);
+    const supp = (run.pages as any[]).find((p) => p.url === FEES);
+    assert.equal(supp.outcome, "supplement");
+    assert.match(supp.reason, /fetched for the routes that use it/);
+    assert.equal((run.pages as any[]).find((p) => p.url === PAGE_OK).outcome, "created");
   });
 
   test("trigger is passed through", async () => {
@@ -556,6 +650,42 @@ describe("listRuns / getRun", () => {
   });
 });
 
+describe("runStats", () => {
+  const D0 = Date.parse("2026-11-08T00:00:00Z");
+  /** Runs over three days, both kinds, every status. */
+  function seedStats(): void {
+    seedRun("a", { kind: "visa", status: "succeeded", startedAt: Timestamp.fromMillis(D0 + 2 * HOUR) });
+    seedRun("b", { kind: "visa", status: "failed", startedAt: Timestamp.fromMillis(D0 + 5 * HOUR) });
+    seedRun("c", { kind: "news", status: "partial", startedAt: Timestamp.fromMillis(D0 + 6 * HOUR) });
+    seedRun("d", { kind: "news", status: "running", startedAt: Timestamp.fromMillis(D0 + 2 * DAY + HOUR) });
+    seedRun("e", { kind: "visa", status: "succeeded", startedAt: Timestamp.fromMillis(D0 + 2 * DAY + 2 * HOUR) });
+    seedRun("out", { kind: "visa", status: "succeeded", startedAt: Timestamp.fromMillis(D0 - DAY) }); // before range
+  }
+
+  test("per-day, per-kind status counts, zero-filled, with totals", async () => {
+    seedStats();
+    const st = await runs.runStats({ fromMs: D0, toMs: D0 + 3 * DAY - 1 });
+    assert.equal(st.bucket, "day");
+    assert.deepEqual(st.kinds, ["visa", "news"]);
+    assert.deepEqual(st.buckets.map((b: any) => b.date), ["2026-11-08", "2026-11-09", "2026-11-10"]);
+    assert.deepEqual(st.buckets[0].visa, { succeeded: 1, partial: 0, failed: 1, running: 0, total: 2 });
+    assert.deepEqual(st.buckets[0].news, { succeeded: 0, partial: 1, failed: 0, running: 0, total: 1 });
+    assert.deepEqual(st.buckets[1].visa, { succeeded: 0, partial: 0, failed: 0, running: 0, total: 0 });
+    assert.deepEqual(st.buckets[2].news, { succeeded: 0, partial: 0, failed: 0, running: 1, total: 1 });
+    assert.deepEqual(st.totals.visa, { succeeded: 2, partial: 0, failed: 1, running: 0, total: 3 });
+    assert.equal(st.scanned, 5);
+    assert.equal(st.truncated, false);
+  });
+
+  test("kind filter counts one kind only", async () => {
+    seedStats();
+    const st = await runs.runStats({ fromMs: D0, toMs: D0 + 3 * DAY - 1, kind: "news" });
+    assert.deepEqual(st.kinds, ["news"]);
+    assert.equal(st.buckets[0].visa, undefined);
+    assert.equal(st.totals.news.total, 2);
+  });
+});
+
 describe("listSourceHealth", () => {
   test("visa: active backoffs only, latest page error, window; news: mapped fields", async () => {
     store.set("visaSources/GB", {
@@ -681,6 +811,26 @@ describe("scrape-run controller", () => {
     const src = await call("sources", req(ROLES.ADMIN, { query: { kind: "news" } }));
     assert.equal(src.status, 200);
     assert.deepEqual(src.body.data, []);
+  });
+
+  test("stats: 403 for non-admins; admin 200 shape; range / bucket / kind validation", async () => {
+    assert.equal((await call("stats", req(ROLES.OWNER))).status, 403);
+    seedRun("s1", { startedAt: Timestamp.fromMillis(NOW - HOUR) });
+    const ok = await call("stats", req(ROLES.ADMIN, { query: { from: "2026-11-01", to: "2026-11-10T23:59:59Z", kind: "visa" } }));
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.data.buckets.length, 10);
+    assert.equal(ok.body.data.totals.visa.succeeded, 1);
+    // Defaults (last 30 days to now) are accepted.
+    assert.equal((await call("stats", req(ROLES.ADMIN))).status, 200);
+    for (const query of [
+      { from: "2026-01-01", to: "2026-11-01" }, // > 90 days
+      { from: "2026-11-10", to: "2026-11-01" },
+      { bucket: "week" },
+      { kind: "jobs" },
+      { to: "never" },
+    ]) {
+      assert.equal((await call("stats", req(ROLES.ADMIN, { query }))).status, 400, JSON.stringify(query));
+    }
   });
 
   test("validation: bad kind / status / dates / limit / cursor / repeated param -> 400", async () => {

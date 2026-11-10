@@ -26,6 +26,13 @@ import { LinkedSurchargeCache, linkedGateHash, linkedSurchargePage } from "./vis
 // Run records (issue #81): one `scrapeRuns/{runId}` doc per run that crawls.
 import { scrapeRunService, type ScrapeRunRecorder, type ScrapeRunService } from "./scrape-run.service";
 import type { ScrapeRunPageOutcome, ScrapeRunSourceStatus, ScrapeRunTrigger } from "../types/scrape-run";
+// Supplementary pages (issue #86): extra official pages appended to a route's text.
+import {
+  SupplementaryPageCache,
+  combineSupplementaryText,
+  supplementaryGateHash,
+  supplementaryPagesMeta,
+} from "./visa-catalog-supplementary";
 
 // ============================================
 // VISA CATALOG — CRAWL ORCHESTRATOR (Step 5)
@@ -277,14 +284,18 @@ class VisaCatalogCrawlService {
     const fxRefresh = await visaCatalogService.refreshFx(opts?.fetchFxRates);
     const fx = fxRefresh.fx;
     summary.fxRefreshed = fxRefresh.refreshed;
+    // Issue #81: a failed refresh is a run-level warning (previous rates are
+    // used while within FX_MAX_AGE_DAYS) — not an error, status unaffected.
+    if (!fxRefresh.refreshed) recorder.recordWarning(`FX refresh failed: ${fxRefresh.error ?? "unknown error"}`);
     try {
       summary.feesReconverted = (await visaCatalogService.reconvertFlaggedFees(fx)).reconverted;
     } catch (err) {
       // A failed re-convert must not abort the crawl; it retries next run.
       console.error("Visa catalog: re-converting flagged fees failed:", err);
-      // Visible on the run record too (not counted in summary.errors, which
-      // counts page errors only).
-      recorder.recordError({ error: `re-converting flagged fees failed: ${(err as Error)?.message ?? err}` });
+      // A run-level WARNING on the run record: not a page error, so it is
+      // neither in summary.errors nor in errorCount, and a clean crawl
+      // stays `succeeded`.
+      recorder.recordWarning(`re-converting flagged fees failed: ${(err as Error)?.message ?? err}`);
     }
 
     // Running count of LLM calls this tick, against maxExtractions.
@@ -324,7 +335,7 @@ class VisaCatalogCrawlService {
       const notePage = (
         page: VisaSourcePage,
         outcome: ScrapeRunPageOutcome,
-        extra: { visaId?: string; error?: string } = {}
+        extra: { visaId?: string; error?: string; reason?: string } = {}
       ) => {
         if (outcome in counts) counts[outcome as keyof typeof counts]++;
         recorder.recordPage({
@@ -337,6 +348,15 @@ class VisaCatalogCrawlService {
       };
       // Stored retry-after times from earlier runs (expired ones are ignored).
       hostState.load(hostBackoffEntriesFromSource(source.hostBackoffs));
+      // ---- Supplementary pages for this source (issue #86) ----
+      // One cache per SOURCE (supplements are rows of the same country and
+      // use its adapter); each is fetched at most once, skipped like any page
+      // when its host is backed off.
+      const supplements = new SupplementaryPageCache(async (suppPage) => {
+        const blocked = hostState.blocking(hostOf(suppPage.url));
+        if (blocked) throw new Error(`supplementary page not fetched: ${backoffMessage(blocked)}`);
+        return pickSourceAdapter(source.adapter, suppPage.url, opts?.adapters).fetch(suppPage);
+      });
 
       for (let i = 0; i < pages.length; i++) {
         // Respect the per-run extraction cap. The source is still rescheduled
@@ -345,6 +365,11 @@ class VisaCatalogCrawlService {
         if (extractionsUsed >= maxExtractions) break;
 
         const page = pages[i];
+
+        // ---- Supplement-only row (issue #86)? Not a visa: never extracted ----
+        // It is fetched (once per run) only for the routes that list it in
+        // `supplementaryPages`, below. Its own crawl fields are updated there.
+        if (page.supplementOnly) continue;
 
         // ---- Host backed off? Skip WITHOUT any request (issue #64) ----
         // Blocked if the host answered 429/503 earlier in this run (for the
@@ -426,7 +451,20 @@ class VisaCatalogCrawlService {
           // Hash is over the exact text the extractor would see (selected +
           // capped sections for GOV.UK; the cleaned page for generic-html),
           // combined with the linked pages' hashes when the page has any.
-          const gateHash = linkedGateHash(fetched.contentHash, linked);
+          // Supplementary pages (issue #86): [] for a route that lists none.
+          // A failure throws (route NOT extracted without its fee page) and
+          // is recorded on the route like any page error.
+          const supps = await supplements.forPage(page, pages);
+          // Record the supplements' own crawl state on their rows (they are
+          // never visited by this loop): fetched now, with their text hash.
+          for (const s of supps) {
+            const j = pages.findIndex((p) => p.url === s.page.url);
+            if (j >= 0) pages[j] = { ...pages[j], lastCrawledAt: now, lastContentHash: s.doc.contentHash, lastError: undefined };
+          }
+          // Text the extractor sees: the route text + each supplement.
+          const extractText = combineSupplementaryText(fetched.text, supps);
+          // Hash gate over route + supplements (+ linked surcharge pages).
+          const gateHash = linkedGateHash(supplementaryGateHash(fetched.contentHash, supps), linked);
           const changed = gateHash !== page.lastContentHash;
           // Record crawl metadata regardless of change.
           pages[i] = {
@@ -460,7 +498,7 @@ class VisaCatalogCrawlService {
           // validation error) costs money too and must use up a
           // maxExtractions slot, or a systematic failure could exceed the cap.
           extractionsUsed++;
-          const extracted = await visaCatalogExtractor.extract(fetched.text, {
+          const extracted = await visaCatalogExtractor.extract(extractText, {
             url: page.url,
             countryName: source.countryName,
             routeName: page.routeName,
@@ -489,6 +527,8 @@ class VisaCatalogCrawlService {
             fx,
             // Linked-page surcharges for this route (issue #69).
             linkedSurcharges: linked,
+            // Supplementary pages used (issue #86), for scrapeMeta.
+            supplementaryPages: supplementaryPagesMeta(supps),
           });
           if (outcome === "created") summary.created++;
           else if (outcome === "updated") summary.updated++;
@@ -529,6 +569,22 @@ class VisaCatalogCrawlService {
             lastError: (err as Error).message?.slice(0, 300),
           };
         }
+      }
+
+      // ---- Supplement-only rows on the run record (issues #86, #81) ----
+      // The page loop skips them (not visas, never extracted); they are
+      // fetched through the supplements cache by the routes that list them.
+      // Recorded AFTER the loop so the line says whether a route fetched the
+      // row this run (its lastCrawledAt was set to this tick above). Outcome
+      // "supplement" does not count toward pagesAttempted.
+      for (const p of pages) {
+        if (!p.supplementOnly) continue;
+        const fetchedNow = Boolean(p.lastCrawledAt) && p.lastCrawledAt!.toMillis() === now.toMillis();
+        notePage(p, "supplement", {
+          reason: fetchedNow
+            ? "supplement-only page (fee table): fetched for the routes that use it, never extracted"
+            : "supplement-only page (fee table): not fetched this run (no route using it was crawled)",
+        });
       }
 
       // ---- Source health + reschedule ----
@@ -621,12 +677,15 @@ class VisaCatalogCrawlService {
       });
 
       // ---- Run-record line for this source (issue #81) ----
-      // deferred = nothing requested (stored backoffs only); succeeded = some
-      // page fetched with no page error and no 429/503; partial = fetched
-      // some but had errors / was throttled; failed = fetched nothing (incl.
-      // a source with no pages — the same rule that bumps consecutiveFailures).
+      // empty = no page attempted at all (a source with no pages, or the
+      // run's extraction cap was used up before it) — not an error, even
+      // though source health still counts it as a failure; deferred =
+      // nothing requested (stored backoffs only); succeeded = some page
+      // fetched with no page error and no 429/503; partial = fetched some
+      // but had errors / was throttled; failed = attempted, fetched nothing.
       let sourceStatus: ScrapeRunSourceStatus;
-      if (deferredOnly) sourceStatus = "deferred";
+      if (fetchedOk + pageErrors + deferredPages === 0) sourceStatus = "empty";
+      else if (deferredOnly) sourceStatus = "deferred";
       else if (fetchedOk === 0) sourceStatus = "failed";
       else if (pageErrors === 0 && !throttledThisRun) sourceStatus = "succeeded";
       else sourceStatus = "partial";

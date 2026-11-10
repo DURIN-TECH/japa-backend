@@ -21,7 +21,13 @@ worked: a page fetched / a news source scraped) or `failed` (errors and
 nothing worked, or the run threw: `fatalError`). A run that crashes stays
 `running`; every scheduled tick (idle or not, either scraper) and every script
 run first sweeps `running` docs older than 1h to `failed` with
-`fatalError: "stale: ..."`.
+`fatalError: "stale: ..."`. The sweep re-reads each doc in a transaction and
+only flips it while it is still `running`; a run that finalises after being
+swept gets its real status and the stale `fatalError` is cleared.
+
+Run-level **warnings** (`warnings[]`, max 10) record problems that are not
+errors: a failed FX refresh (previous rates used) or a failed fee re-convert.
+They never change `status` or `errorCount`, so a clean crawl stays `succeeded`.
 
 Recording never breaks a crawl: write failures are logged and swallowed.
 
@@ -45,7 +51,7 @@ points the other way.
   "pagesAttempted": 14,
   "sources": [ {                  // max 100
     "sourceId": "GB", "name": "United Kingdom",
-    "status": "partial",          // succeeded | partial | failed | deferred
+    "status": "partial",          // succeeded | partial | failed | deferred | empty (no page attempted: no pages, or the extraction cap was used up)
     "pagesAttempted": 8, "pagesFetched": 7, "errors": 1,
     "sourceRunId": "crawlRunDocId",
     "counts": { "created": 1, "updated": 0, "proposed": 2, "skipped": 0,
@@ -54,14 +60,16 @@ points the other way.
   } ],
   "pages": [ {                    // visa only, max 300 (pagesTruncated: true past that)
     "sourceId": "GB", "url": "https://www.gov.uk/...", "routeName": "Skilled Worker visa",
-    "outcome": "proposed",        // created|updated|proposed|skipped|unchanged|withdrawn|deferred|capped|error
+    "outcome": "proposed",        // created|updated|proposed|skipped|unchanged|withdrawn|deferred|capped|supplement|error
     "visaId": "gb-skilled-worker",// -> countries/GB/visaTypes/{visaId}
-    "error": "..."
+    "error": "...",
+    "reason": "..."               // e.g. supplement rows: whether a route fetched it this run
   } ],
   "pagesTruncated": false,
   "errorCount": 1,                // all errors (>= errors.length)
   "errors": [ { "sourceId": "GB", "url": "...", "message": "...", "at": Timestamp } ], // first 20, redacted
   "fatalError": "...",            // only when the run threw / went stale
+  "warnings": ["FX refresh failed: ..."], // run-level, not errors
   "options": { "maxSources": 3, "maxExtractions": 15 }, // script: country, visa, limit, maxExtractions, force
   "usage": { ... },               // #82 placeholder, not written yet
   "costUsd": 0.0,                 // #82 placeholder, not written yet
@@ -117,6 +125,35 @@ Query (all optional, each at most once, else 400 `VALIDATION_ERROR`):
 
 `200 { data: { items: RunListItem[], nextCursor: string | null } }`, newest
 first. `RunListItem` = the run doc without `pages`, `sources` and `errors`.
+
+### `GET /admin/scrape-runs/stats`
+
+Per-UTC-day run counts by status, per kind (dashboard overview, #84).
+
+| Param | Values |
+| --- | --- |
+| `from`, `to` | ISO date/time or epoch ms, inclusive on `startedAt`. Defaults: `to` = now, `from` = `to` − 30 days. At most 90 days; `from > to` → 400 |
+| `bucket` | `day` only (default) |
+| `kind` | `visa` \| `news` (default both) |
+
+```jsonc
+{ "data": {
+  "from": "2026-11-01T00:00:00.000Z", "to": "2026-11-10T23:59:59.000Z",
+  "bucket": "day", "kinds": ["visa", "news"],
+  "buckets": [   // every UTC day in range, oldest first, zero-filled
+    { "date": "2026-11-01",
+      "visa": { "succeeded": 3, "partial": 1, "failed": 0, "running": 0, "total": 4 },
+      "news": { "succeeded": 46, "partial": 1, "failed": 1, "running": 0, "total": 48 } }
+  ],
+  "totals": { "visa": { ... }, "news": { ... } },
+  "scanned": 520,      // run docs read
+  "truncated": false   // true if the 10,000-doc scan cap was hit (oldest days undercounted)
+} }
+```
+
+Computed by one bounded, projected scan (`kind`, `status`, `startedAt`) over
+the range rather than 720 count queries; uses the existing
+`kind+startedAt` index (or the single-field `startedAt` index without `kind`).
 
 ### `GET /admin/scrape-runs/:id`
 

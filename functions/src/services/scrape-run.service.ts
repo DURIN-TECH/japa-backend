@@ -1,5 +1,5 @@
-import { Timestamp } from "firebase-admin/firestore";
-import { collections } from "../utils/firebase";
+import { FieldValue, Timestamp, type Transaction } from "firebase-admin/firestore";
+import { collections, db } from "../utils/firebase";
 import { redactSecrets } from "../utils/redact";
 import {
   ScrapeRunDoc,
@@ -54,6 +54,11 @@ export const MAX_RECORDED_ERRORS = 20;
 export const MAX_RECORDED_PAGES = 300;
 /** Source lines stored on the run doc. */
 export const MAX_RECORDED_SOURCES = 100;
+/** Run-level warnings stored on the run doc (e.g. a failed fee re-convert). */
+export const MAX_RECORDED_WARNINGS = 10;
+/** fatalError written by the stale sweep. */
+export const STALE_RUN_MESSAGE =
+  "stale: run did not finish within 1h (crashed or timed out); marked failed by a later run";
 /** Longest stored error message (after redaction). */
 const MAX_ERROR_CHARS = 500;
 
@@ -122,9 +127,14 @@ export class ScrapeRunRecorder {
   private readonly sources: ScrapeRunSourceEntry[] = [];
   private readonly pages: ScrapeRunPageEntry[] = [];
   private readonly errors: ScrapeRunError[] = [];
+  // Run-level problems that are NOT errors: they never count in errorCount
+  // and never change the status (e.g. the FX fee re-convert failing, #59).
+  private readonly warnings: string[] = [];
   private sourcesAttempted = 0;
   private pagesAttempted = 0;
   private errorCount = 0;
+  // True once a page line was dropped for MAX_RECORDED_PAGES (-> pagesTruncated).
+  private pagesDropped = false;
   private finished = false;
   // Real clock at start, to measure durationMs (see the header on clocks).
   private readonly realStartMs: number;
@@ -151,10 +161,16 @@ export class ScrapeRunRecorder {
     }
   }
 
-  /** Note one page's outcome (counted even past MAX_RECORDED_PAGES). */
+  /**
+   * Note one page's outcome (counted even past MAX_RECORDED_PAGES).
+   * "supplement" rows (#86) are listed but not counted as attempted pages:
+   * they are fetched as part of the routes that use them.
+   */
   recordPage(entry: ScrapeRunPageEntry): void {
-    this.pagesAttempted++;
-    if (this.pages.length < MAX_RECORDED_PAGES) {
+    if (entry.outcome !== "supplement") this.pagesAttempted++;
+    if (this.pages.length >= MAX_RECORDED_PAGES) {
+      this.pagesDropped = true; // counted above, not stored
+    } else {
       this.pages.push({ ...entry, error: entry.error ? redactSecrets(entry.error).slice(0, MAX_ERROR_CHARS) : undefined });
     }
   }
@@ -177,6 +193,16 @@ export class ScrapeRunRecorder {
         message: safeErrorMessage(e.error),
         at: Timestamp.fromMillis(this.startedAtMs + (this.service.realClock() - this.realStartMs)),
       });
+    }
+  }
+
+  /**
+   * Note a run-level warning (first MAX_RECORDED_WARNINGS stored, redacted).
+   * Not an error: errorCount and the derived status are unaffected.
+   */
+  recordWarning(message: string): void {
+    if (this.warnings.length < MAX_RECORDED_WARNINGS) {
+      this.warnings.push(redactSecrets(message).slice(0, MAX_ERROR_CHARS));
     }
   }
 
@@ -225,12 +251,16 @@ export class ScrapeRunRecorder {
       pagesAttempted: this.pagesAttempted,
       sources: this.sources,
       pages: this.pages,
-      pagesTruncated: this.pagesAttempted > this.pages.length && this.pages.length >= MAX_RECORDED_PAGES,
+      pagesTruncated: this.pagesDropped,
       errorCount,
       errors: this.errors,
-      ...(fatalError ? { fatalError } : {}),
+      warnings: this.warnings,
       updatedAt: finishedAt,
     };
+    // fatalError: set by fail(). Otherwise CLEARED, so a run the stale sweep
+    // wrongly marked failed (it finalised late) does not keep the "stale"
+    // message next to its real status.
+    const finalWrite = { ...final, fatalError: fatalError ?? FieldValue.delete() };
     // The full doc as it now stands (what hooks receive).
     const doc: ScrapeRunDoc = {
       id: this.id,
@@ -241,10 +271,11 @@ export class ScrapeRunRecorder {
       expireAt: expireAtFor(this.startedAtMs),
       createdAt: startedAt,
       ...final,
+      ...(fatalError ? { fatalError } : {}),
     };
     if (!this.persisted) return doc;
     try {
-      await collections.scrapeRuns.doc(this.id).update(final);
+      await collections.scrapeRuns.doc(this.id).update(finalWrite);
     } catch (err) {
       console.error(`Scrape run ${this.id}: final write failed: ${safeErrorMessage(err)}`);
       return doc;
@@ -278,6 +309,57 @@ export class InvalidCursorError extends Error {
   constructor() {
     super("cursor does not match a scrape run");
   }
+}
+
+/** Stats query (GET /admin/scrape-runs/stats), validated by the controller. */
+export interface RunStatsQuery {
+  fromMs: number; // inclusive, startedAt >= from
+  toMs: number; // inclusive, startedAt <= to
+  kind?: ScrapeRunKind;
+}
+
+/** Longest stats range (days). */
+export const RUN_STATS_MAX_DAYS = 90;
+/** Default stats range when `from` is omitted (days back from `to`). */
+export const RUN_STATS_DEFAULT_DAYS = 30;
+/**
+ * Most run docs one stats call reads. ~55 runs/day (48 news + a few visa
+ * ticks) x 90 days ≈ 5,000, so this leaves 2x headroom; past it the answer
+ * is marked `truncated` instead of reading without bound.
+ */
+export const RUN_STATS_MAX_SCAN = 10_000;
+
+/** Per-status run counts for one kind in one bucket. */
+export interface RunStatusCounts {
+  succeeded: number;
+  partial: number;
+  failed: number;
+  running: number;
+  total: number;
+}
+
+/** GET /admin/scrape-runs/stats response. */
+export interface RunStats {
+  from: string; // ISO, as applied
+  to: string; // ISO, as applied
+  bucket: "day"; // UTC calendar days
+  kinds: ScrapeRunKind[]; // the kinds counted (one when `kind` was given)
+  // One entry per UTC day from `from` to `to` (inclusive), oldest first,
+  // zero-filled; each has a counts object per kind in `kinds`.
+  buckets: Array<{ date: string } & Partial<Record<ScrapeRunKind, RunStatusCounts>>>;
+  totals: Partial<Record<ScrapeRunKind, RunStatusCounts>>;
+  scanned: number; // run docs read
+  truncated: boolean; // true when RUN_STATS_MAX_SCAN was hit (oldest days undercounted)
+}
+
+/** A zeroed counts object. */
+function zeroCounts(): RunStatusCounts {
+  return { succeeded: 0, partial: 0, failed: 0, running: 0, total: 0 };
+}
+
+/** UTC day key ("2026-11-10") of an epoch-ms instant. */
+function utcDay(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
 }
 
 /** One source's health, normalised across kinds (GET /admin/scrape-sources). */
@@ -331,6 +413,9 @@ export type ScrapeRunJson = Record<string, unknown> & { id: string };
 
 export class ScrapeRunService {
   private readonly hooks: ScrapeRunFinalizeHook[] = [];
+
+  /** Transaction runner (the stale sweep). Swapped for the in-memory one in tests. */
+  runTransaction: <T>(fn: (tx: Transaction) => Promise<T>) => Promise<T> = (fn) => db.runTransaction(fn);
 
   /** Real clock (ms). Swappable in tests to make durationMs deterministic. */
   realClock: () => number = Date.now;
@@ -415,20 +500,30 @@ export class ScrapeRunService {
       const snap = await collections.scrapeRuns.where("status", "==", "running").get();
       let swept = 0;
       for (const d of snap.docs) {
-        const run = d.data() as ScrapeRunDoc;
-        if (!isTs(run.startedAt) || nowMs - run.startedAt.toMillis() <= STALE_RUN_MS) continue;
-        const now = Timestamp.fromMillis(nowMs);
-        await d.ref.update({
-          status: "failed",
-          finishedAt: now,
-          // Unknown real duration: report the time until it was found stale.
-          durationMs: nowMs - run.startedAt.toMillis(),
-          fatalError: "stale: run did not finish within 1h (crashed or timed out); marked failed by a later run",
-          errorCount: (run.errorCount ?? 0) + 1,
-          updatedAt: now,
+        const listed = d.data() as ScrapeRunDoc;
+        if (!isTs(listed.startedAt) || nowMs - listed.startedAt.toMillis() <= STALE_RUN_MS) continue;
+        // Re-read inside a transaction and only flip a run that is STILL
+        // `running`: a slow run that finalised between the query and this
+        // write (or another tick sweeping concurrently) is left alone.
+        const flipped = await this.runTransaction(async (tx) => {
+          const fresh = await tx.get(d.ref);
+          const run = fresh.data() as ScrapeRunDoc | undefined;
+          if (!fresh.exists || !run || run.status !== "running" || !isTs(run.startedAt)) return false;
+          const now = Timestamp.fromMillis(nowMs);
+          tx.update(d.ref, {
+            status: "failed",
+            finishedAt: now,
+            // Unknown real duration: report the time until it was found stale.
+            durationMs: nowMs - run.startedAt.toMillis(),
+            fatalError: STALE_RUN_MESSAGE,
+            errorCount: (run.errorCount ?? 0) + 1,
+            updatedAt: now,
+          });
+          return true;
         });
+        if (!flipped) continue;
         swept++;
-        console.warn(`Scrape run ${d.id} (${run.kind}) was stale, marked failed`);
+        console.warn(`Scrape run ${d.id} (${listed.kind}) was stale, marked failed`);
       }
       return swept;
     } catch (err) {
@@ -465,6 +560,70 @@ export class ScrapeRunService {
     return {
       items: docs.map((d: { id: string; data: () => unknown }) => listItem(d.id, d.data())),
       nextCursor: snap.docs.length > q.limit ? docs[docs.length - 1].id : null,
+    };
+  }
+
+  /**
+   * Per-UTC-day run counts by status, per kind (the dashboard overview, #84).
+   *
+   * One bounded scan instead of count() aggregations: a count query per
+   * day x kind x status would be up to 90 x 2 x 4 = 720 queries per call.
+   * The scan reads only `kind`, `status`, `startedAt` (select projection),
+   * newest first (served by the kind+startedAt DESC index, or the
+   * single-field startedAt index without `kind`), capped at
+   * RUN_STATS_MAX_SCAN docs (then `truncated: true`). The controller caps
+   * the range at RUN_STATS_MAX_DAYS.
+   */
+  async runStats(q: RunStatsQuery): Promise<RunStats> {
+    const kinds: ScrapeRunKind[] = q.kind ? [q.kind] : ["visa", "news"];
+    // ---- Zero-filled day buckets, oldest first ----
+    const buckets: RunStats["buckets"] = [];
+    const byDay = new Map<string, RunStats["buckets"][number]>();
+    for (let t = Date.parse(`${utcDay(q.fromMs)}T00:00:00Z`); t <= q.toMs; t += DAY_MS) {
+      const b: RunStats["buckets"][number] = { date: utcDay(t) };
+      for (const k of kinds) b[k] = zeroCounts();
+      buckets.push(b);
+      byDay.set(b.date, b);
+    }
+    const totals: RunStats["totals"] = {};
+    for (const k of kinds) totals[k] = zeroCounts();
+
+    // ---- Bounded scan ----
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let query: any = collections.scrapeRuns;
+    if (q.kind) query = query.where("kind", "==", q.kind);
+    query = query
+      .where("startedAt", ">=", Timestamp.fromMillis(q.fromMs))
+      .where("startedAt", "<=", Timestamp.fromMillis(q.toMs))
+      .orderBy("startedAt", "desc")
+      .select("kind", "status", "startedAt")
+      .limit(RUN_STATS_MAX_SCAN + 1);
+    const snap = await query.get();
+    const docs = snap.docs.slice(0, RUN_STATS_MAX_SCAN);
+    for (const d of docs) {
+      const run = d.data() as Pick<ScrapeRunDoc, "kind" | "status" | "startedAt">;
+      if (!isTs(run.startedAt) || !kinds.includes(run.kind)) continue;
+      const bucket = byDay.get(utcDay(run.startedAt.toMillis()));
+      const counts = bucket?.[run.kind];
+      const total = totals[run.kind];
+      if (!counts || !total) continue;
+      // Unknown status values (none today) only count toward `total`.
+      if (run.status in counts && run.status !== ("total" as string)) {
+        counts[run.status as keyof Omit<RunStatusCounts, "total">]++;
+        total[run.status as keyof Omit<RunStatusCounts, "total">]++;
+      }
+      counts.total++;
+      total.total++;
+    }
+    return {
+      from: new Date(q.fromMs).toISOString(),
+      to: new Date(q.toMs).toISOString(),
+      bucket: "day",
+      kinds,
+      buckets,
+      totals,
+      scanned: docs.length,
+      truncated: snap.docs.length > RUN_STATS_MAX_SCAN,
     };
   }
 

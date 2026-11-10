@@ -4,6 +4,8 @@ import { asSubject, can, forbidden } from "../middleware/authz";
 import { sendError, sendSuccess, ErrorMessages } from "../utils/response";
 import {
   InvalidCursorError,
+  RUN_STATS_DEFAULT_DAYS,
+  RUN_STATS_MAX_DAYS,
   SCRAPE_RUN_LIST_DEFAULT_LIMIT,
   SCRAPE_RUN_LIST_MAX_LIMIT,
   scrapeRunService,
@@ -135,6 +137,51 @@ class ScrapeRunController {
         return;
       }
       console.error("Error listing scrape runs:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /admin/scrape-runs/stats?from=&to=&bucket=day&kind=
+   * Per-UTC-day run counts by status, per kind (see scrapeRunService.runStats).
+   *  - to: default now; from: default to − 30 days (ISO or epoch ms);
+   *  - range at most 90 days, from <= to (else 400);
+   *  - bucket: only "day" (default); kind: visa | news (default both).
+   */
+  async stats(req: AuthenticatedRequest, res: Response): Promise<void> {
+    if (!this.allowed(req, res)) return;
+    if (!this.singleValued(req, res, ["from", "to", "bucket", "kind"])) return;
+    const { from, to, bucket, kind } = req.query as Record<string, string | undefined>;
+    if (bucket !== undefined && bucket !== "day") {
+      sendError(res, "VALIDATION_ERROR", "bucket must be day", 400);
+      return;
+    }
+    if (kind !== undefined && !SCRAPE_RUN_KINDS.includes(kind as ScrapeRunKind)) {
+      sendError(res, "VALIDATION_ERROR", `kind must be one of: ${SCRAPE_RUN_KINDS.join(", ")}`, 400);
+      return;
+    }
+    const toMs = to === undefined ? Date.now() : parseDateParam(to);
+    if (toMs === undefined) {
+      sendError(res, "VALIDATION_ERROR", "to must be an ISO date/time or epoch milliseconds", 400);
+      return;
+    }
+    const fromMs = from === undefined ? toMs - RUN_STATS_DEFAULT_DAYS * 24 * 60 * 60 * 1000 : parseDateParam(from);
+    if (fromMs === undefined) {
+      sendError(res, "VALIDATION_ERROR", "from must be an ISO date/time or epoch milliseconds", 400);
+      return;
+    }
+    if (fromMs > toMs) {
+      sendError(res, "VALIDATION_ERROR", "from must not be after to", 400);
+      return;
+    }
+    if (toMs - fromMs > RUN_STATS_MAX_DAYS * 24 * 60 * 60 * 1000) {
+      sendError(res, "VALIDATION_ERROR", `the range must be at most ${RUN_STATS_MAX_DAYS} days`, 400);
+      return;
+    }
+    try {
+      sendSuccess(res, await scrapeRunService.runStats({ fromMs, toMs, kind: kind as ScrapeRunKind | undefined }));
+    } catch (error) {
+      console.error("Error computing scrape run stats:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

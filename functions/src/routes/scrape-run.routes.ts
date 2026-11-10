@@ -14,6 +14,9 @@ import { scrapeRunController } from "../controllers/scrape-run.controller";
 const adminScrapeRunRoutes = Router();
 // Newest-first, filterable, cursor-paginated list.
 adminScrapeRunRoutes.get("/", verifyAuth, (req, res) => scrapeRunController.list(req, res));
+// Per-day counts by status per kind (dashboard overview, #84). Registered
+// BEFORE /:id so "stats" is never read as a run id.
+adminScrapeRunRoutes.get("/stats", verifyAuth, (req, res) => scrapeRunController.stats(req, res));
 // One run in full (sources, pages, errors).
 adminScrapeRunRoutes.get("/:id", verifyAuth, (req, res) => scrapeRunController.get(req, res));
 
