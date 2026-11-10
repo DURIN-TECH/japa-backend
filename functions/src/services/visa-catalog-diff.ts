@@ -491,22 +491,27 @@ export function planProposalWrite(params: {
  *  - any diffed field's live value no longer equals `current[field]`;
  *  - the live scrapeMeta moved since the proposal (`currentContentHash`), so
  *    the carried-forward parts of `proposedScrapeMeta` are out of date.
+ *
+ * Each reason is a full sentence ending in a full stop (issue #88): the portal
+ * slots it between two of its own sentences in the STALE_PROPOSAL error box
+ * ("…older version. <reason> Reject it, or wait…"), so a missing stop ran the
+ * sentences together ("…was made Reject it…").
  */
 export function findStaleReason(live: Partial<VisaType>, change: PendingVisaChange): string | null {
   if (live.source !== "scraped" || live.reviewStatus !== "approved") {
-    return "The live visa is no longer an approved scraped visa";
+    return "The live visa is no longer an approved scraped visa.";
   }
-  if (live.staleSince) return "The live visa was withdrawn at source (staleSince is set)";
+  if (live.staleSince) return "The live visa was withdrawn at source (staleSince is set).";
   const liveRec = live as Record<string, unknown>;
   const current = (change.current ?? {}) as Record<string, unknown>;
   for (const d of change.diff) {
     const field = diffTargetField(d);
     if (!valuesEqual(liveRec[field], current[field])) {
-      return `The live value of "${field}" changed since this proposal was made`;
+      return `The live value of "${field}" changed since this proposal was made.`;
     }
   }
   if ((live.scrapeMeta?.contentHash ?? undefined) !== (change.currentContentHash ?? undefined)) {
-    return "The live visa's scrape provenance changed since this proposal was made";
+    return "The live visa's scrape provenance changed since this proposal was made.";
   }
   return null;
 }
