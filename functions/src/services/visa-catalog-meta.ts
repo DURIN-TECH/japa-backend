@@ -7,6 +7,7 @@ import type {
   VisaSupplementaryPageMeta,
 } from "../types/visa-catalog";
 import type { ScrapeSourceMeta } from "./visa-source-adapters";
+import type { PricedUsage } from "./scrape-cost-pricing";
 
 // ============================================
 // VISA CATALOG — SCRAPE META + WITHDRAWN RULES (pure)
@@ -46,6 +47,9 @@ export function buildScrapeMeta(params: {
   extractorPromptVersion?: string;
   // Supplementary pages appended to the route text (issue #86); [] / absent = none.
   supplementaryPages?: VisaSupplementaryPageMeta[];
+  // Issue #82: the priced usage of the LLM call behind `extracted` (absent
+  // when the extractor reported none, e.g. a stub).
+  llmUsage?: PricedUsage;
 }): VisaScrapeMeta {
   const meta: VisaScrapeMeta = {
     sourceUrl: params.sourceUrl,
@@ -73,6 +77,15 @@ export function buildScrapeMeta(params: {
   const processingReasons = params.extracted.processingUnverifiedReasons;
   if (processingReasons && processingReasons.length > 0) {
     meta.processingUnverifiedReasons = [...processingReasons];
+  }
+  // Issue #82: token usage + cost of the call (only defined values).
+  if (params.llmUsage) {
+    meta.llmUsage = { ...params.llmUsage.usage };
+    if (params.llmUsage.costUsd !== undefined) meta.llmCostUsd = params.llmUsage.costUsd;
+    if (params.llmUsage.pricedAs) meta.llmPricedAs = params.llmUsage.pricedAs;
+    if (params.llmUsage.responseModel && params.llmUsage.responseModel !== params.model) {
+      meta.llmResponseModel = params.llmUsage.responseModel;
+    }
   }
   for (const [k, v] of Object.entries(params.sourceMeta ?? {})) {
     // Cast: keys are a subset of VisaScrapeMeta by construction (ScrapeSourceMeta).

@@ -1,3 +1,5 @@
+// Issue #82: per-call token usage on scrapeMeta.
+import type { LlmUsage } from "./scrape-cost";
 import { Timestamp } from "firebase-admin/firestore";
 import type { VisaCategory, VisaType } from "./index";
 
@@ -265,6 +267,18 @@ export interface VisaScrapeMeta {
   // (copied from ExtractedVisa.processingUnverifiedReasons). Absent when it
   // agrees. Tells the reviewer to check processingDaysMin/Max by hand.
   processingUnverifiedReasons?: string[];
+
+  // ---- LLM usage + cost (issue #82; optional so older docs stay valid) ----
+  // The provider's token counts for the call that produced this extraction
+  // (the prompt version is `extractorPromptVersion`, the model `model`).
+  llmUsage?: LlmUsage;
+  // Its cost in USD from appConfig/llmPricing; absent when the model had no price.
+  llmCostUsd?: number;
+  // The model the API says served the call, when it differs in name from
+  // `model` (e.g. a dated Flash version behind "deepseek-chat").
+  llmResponseModel?: string;
+  // The price-table entry the cost used ("deepseek-flash"); absent when unpriced.
+  llmPricedAs?: string;
 }
 
 // ----- Supplementary pages (issue #86) -----

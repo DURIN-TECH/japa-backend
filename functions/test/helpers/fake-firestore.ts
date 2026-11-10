@@ -235,4 +235,9 @@ export async function installFakes(): Promise<void> {
   // Issue #81: the stale run sweep is transactional.
   const runs: any = await import("../../src/services/scrape-run.service");
   runs.scrapeRunService.runTransaction = fakeRunTransaction;
+  // Issue #82: the monthly cost rollup (scrapeCosts + its runs markers) is
+  // written by a finalize hook in a transaction.
+  firebase.collections.scrapeCosts = fakeCollection("scrapeCosts");
+  const costs: any = await import("../../src/services/scrape-cost.service");
+  costs.scrapeCostService.runTransaction = fakeRunTransaction;
 }

@@ -1,7 +1,7 @@
 import { collections } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import { VisaSource, VisaSourcePage } from "../types/visa-catalog";
-import { visaCatalogExtractor } from "./visa-catalog-extract.service";
+import { EXTRACTOR_PROMPT_VERSION, visaCatalogExtractor } from "./visa-catalog-extract.service";
 import { visaCatalogService } from "./visa-catalog.service";
 import type { FxFetcher } from "./visa-catalog-fx";
 // Fetching goes through the source adapter picked from `source.adapter`
@@ -26,6 +26,11 @@ import { LinkedSurchargeCache, linkedGateHash, linkedSurchargePage } from "./vis
 // Run records (issue #81): one `scrapeRuns/{runId}` doc per run that crawls.
 import { scrapeRunService, type ScrapeRunRecorder, type ScrapeRunService } from "./scrape-run.service";
 import type { ScrapeRunPageOutcome, ScrapeRunSourceStatus, ScrapeRunTrigger } from "../types/scrape-run";
+// Cost tracking (issue #82): the price table (loaded once per run) and the
+// pure helpers that price each call's reported usage. Importing the service
+// also installs the monthly-rollup finalize hook.
+import { scrapeCostService } from "./scrape-cost.service";
+import { pageUsageFields, priceUsageReport, type PricedUsage } from "./scrape-cost-pricing";
 // Supplementary pages (issue #86): extra official pages appended to a route's text.
 import {
   SupplementaryPageCache,
@@ -79,6 +84,13 @@ import {
 // throws). Idle ticks (nothing due in its window — most hourly ticks) write
 // NO run doc: they crawl nothing, and recording them would add ~24 empty
 // docs a day. Each source's `crawlRuns` log doc carries the `runId`.
+//
+// Cost (issue #82): the run loads `appConfig/llmPricing` once (after the run
+// doc is written), and every LLM call's reported token usage is priced and
+// noted on the run record (per country / model), on the page line and in the
+// visa's scrapeMeta. A call whose output then fails validation is still
+// counted (it was billed). finalize() writes the totals; the finalize hook
+// adds them to `scrapeCosts/{YYYY-MM}`.
 
 // Recorded as the page's lastError when the source says the page is withdrawn
 // (whether or not a scraped doc was deactivated), so it shows in source health.
@@ -186,6 +198,12 @@ class VisaCatalogCrawlService {
     // `running` after 1h crashed or timed out -> mark it failed. Never throws.
     await runs.sweepStaleRuns(now.toMillis());
 
+    // ---- Cost rollup backfill (issue #82 review) ----
+    // Also on EVERY (hourly) tick: re-add finished runs of the current /
+    // previous month whose rollup hook failed. An empty indexed query when
+    // nothing failed; bounded; never throws. #83's hourly check may call it too.
+    await scrapeCostService.backfillRecent(now.toMillis());
+
     // Due = active AND nextCrawlAt <= now, oldest first (needs the composite
     // index status+nextCrawlAt — already in firestore.indexes.json).
     // DO NOT add a plain .limit() back here to bound reads: it is applied
@@ -276,6 +294,10 @@ class VisaCatalogCrawlService {
   ): Promise<void> {
     const { now, summary, recorder, maxExtractions, opts } = ctx;
 
+    // ---- Price table for this run (issue #82). Never throws: falls back to
+    // the default table (quoted from the provider's page) when unreadable.
+    const { pricing } = await scrapeCostService.loadPricing();
+
     // ---- FX: refresh appConfig/fx ONCE per run, before any extraction ----
     // Only on a tick that crawls something. Never throws: on failure the
     // previous doc is kept and used if still within FX_MAX_AGE_DAYS. Then
@@ -335,7 +357,8 @@ class VisaCatalogCrawlService {
       const notePage = (
         page: VisaSourcePage,
         outcome: ScrapeRunPageOutcome,
-        extra: { visaId?: string; error?: string; reason?: string } = {}
+        // Issue #82: the page's LLM usage fields (pageUsageFields) when it made a call.
+        extra: { visaId?: string; error?: string; reason?: string } & ReturnType<typeof pageUsageFields> = {}
       ) => {
         if (outcome in counts) counts[outcome as keyof typeof counts]++;
         recorder.recordPage({
@@ -385,6 +408,9 @@ class VisaCatalogCrawlService {
           continue;
         }
 
+        // Issue #82: the priced usage of this page's LLM call, set by the
+        // extractor's onUsage callback (stays undefined when no call is made).
+        let callUsage: PricedUsage | undefined;
         try {
           // ---- Resolve the record id FIRST (registry-owned identity) ----
           // From the page's pinned `visaId`, else its URL path — never from
@@ -506,6 +532,12 @@ class VisaCatalogCrawlService {
             // stored field wins only when it is a non-empty string array; a doc
             // seeded before #74 (or a malformed field) falls back to code.
             officialHosts: resolveOfficialHosts(source.officialHosts, source.countryCode),
+            // Issue #82: price the call's reported usage and count it on the
+            // run (per country / model) as soon as the API answers.
+            onUsage: (report) => {
+              callUsage = priceUsageReport(report, pricing);
+              recorder.recordUsage({ ...callUsage, sourceId: source.countryCode });
+            },
           });
           pages[i] = { ...pages[i], lastExtractedAt: now };
 
@@ -529,19 +561,25 @@ class VisaCatalogCrawlService {
             linkedSurcharges: linked,
             // Supplementary pages used (issue #86), for scrapeMeta.
             supplementaryPages: supplementaryPagesMeta(supps),
+            // Issue #82: token usage + cost on scrapeMeta.
+            llmUsage: callUsage,
           });
           if (outcome === "created") summary.created++;
           else if (outcome === "updated") summary.updated++;
           else if (outcome === "skipped") summary.skipped++;
           else if (outcome === "proposed") summary.proposed++;
           if (outcome !== "unchanged") ingested++;
-          notePage(page, outcome, { visaId });
+          notePage(page, outcome, { visaId, ...pageUsageFields(callUsage, EXTRACTOR_PROMPT_VERSION) });
         } catch (err) {
           pageErrors++;
           summary.errors++;
           // Issue #81: on the run record (redacted there).
           recorder.recordError({ sourceId: source.countryCode, url: page.url, error: err });
-          notePage(page, "error", { error: (err as Error)?.message ?? String(err) });
+          // Usage fields too when the failure came after a billed LLM call (#82).
+          notePage(page, "error", {
+            error: (err as Error)?.message ?? String(err),
+            ...pageUsageFields(callUsage, EXTRACTOR_PROMPT_VERSION),
+          });
           // ---- 429/503: back off from the host (issue #64) ----
           // Record it for the rest of the run (and for persisting below)
           // against EVERY host involved (deduplicated by the tracker):
