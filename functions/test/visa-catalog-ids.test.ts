@@ -8,7 +8,7 @@
 // Covers issue #57's acceptance criteria for id/code resolution, the GB
 // override map, and the re-seed crawl-state merge.
 
-import { test, describe } from "node:test";
+import { test, describe, TestContext } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as path from "path";
@@ -22,6 +22,7 @@ import {
   resolveVisaCode,
 } from "../src/services/visa-catalog-ids";
 import {
+  KR_TEMPORARY_VISIT_URL,
   VISA_SOURCE_OVERRIDES,
   findVisaSourcesMarkdown,
   parseVisaSourcesMarkdown,
@@ -176,12 +177,30 @@ describe("resolveVisaCode", () => {
 
 describe("VISA_SOURCE_OVERRIDES", () => {
   // The verified-links markdown lives at the meta-repo root; the seed finds it
-  // by walking up. A missing file is a hard failure (the map can't be checked).
+  // by walking up. In a standalone seli-backend checkout (e.g. PR CI) it is
+  // absent, so the two markdown-backed tests SKIP with a reason instead of
+  // failing. Set SELI_REQUIRE_SOURCES_MD=1 to make a missing file a hard
+  // failure (e.g. when running from the meta-repo and you want the check).
   const markdownPath = findVisaSourcesMarkdown(path.resolve(__dirname, "../src/data"));
-  const parsed = () => {
-    assert.ok(markdownPath, "official_visa_links_verified_v3.md not found above functions/");
-    return parseVisaSourcesMarkdown(fs.readFileSync(markdownPath as string, "utf8"));
+  const requireMarkdown = process.env.SELI_REQUIRE_SOURCES_MD === "1";
+  const MISSING_MD = "official_visa_links_verified_v3.md not found above functions/";
+  // Shared guard: returns true (after marking the test skipped) when the test
+  // should not run. Fails instead when SELI_REQUIRE_SOURCES_MD=1.
+  const skipWithoutMarkdown = (t: TestContext): boolean => {
+    if (markdownPath) return false;
+    assert.ok(!requireMarkdown, `${MISSING_MD} (SELI_REQUIRE_SOURCES_MD=1)`);
+    t.skip(`${MISSING_MD}: meta-repo markdown not available (CI)`);
+    return true;
   };
+  const parsed = () => parseVisaSourcesMarkdown(fs.readFileSync(markdownPath as string, "utf8"));
+
+  // The map also holds non-GB pins (KR since issue #67), so the GB-specific
+  // checks below look only at the GOV.UK keys.
+  const gbKeys = () =>
+    Object.keys(VISA_SOURCE_OVERRIDES).filter((u) => u.startsWith("https://www.gov.uk/"));
+  // Countries that are allowed to have pins at all (GB + KR). Any other
+  // country's page picking up a pin means a map key collided with its URL.
+  const PINNED_COUNTRIES = new Set(["GB", "KR"]);
 
   // Exactly the 12 ids (and 4 codes) the issue specifies.
   test("has exactly the 12 specified GB pins and 4 codes", () => {
@@ -199,7 +218,7 @@ describe("VISA_SOURCE_OVERRIDES", () => {
       "/india-young-professionals-scheme-visa": ["gb-india-young-professionals-scheme-visa"],
       "/british-national-overseas-bno-visa": ["gb-british-national-overseas-bno-visa"],
     };
-    const keys = Object.keys(VISA_SOURCE_OVERRIDES);
+    const keys = gbKeys();
     assert.equal(keys.length, 12);
     for (const [p, [visaId, visaCode]] of Object.entries(expected)) {
       const pin = VISA_SOURCE_OVERRIDES[`https://www.gov.uk${p}`];
@@ -211,26 +230,34 @@ describe("VISA_SOURCE_OVERRIDES", () => {
 
   // Each pin equals today's path-derived id, as the issue requires.
   test("each pinned id equals the path-derived id", () => {
-    for (const [url, pin] of Object.entries(VISA_SOURCE_OVERRIDES)) {
+    for (const url of gbKeys()) {
+      const pin = VISA_SOURCE_OVERRIDES[url];
       assert.equal(deriveVisaId({ countryCode: "GB", sourceUrl: url }), pin.visaId, url);
     }
   });
 
   // Fails if a URL is edited in the markdown (or the map) so a pin would drop.
-  test("covers every GB URL in the markdown, and only those", () => {
+  test("covers every GB URL in the markdown, and only those", (t) => {
+    if (skipWithoutMarkdown(t)) return;
     const gb = parsed().find((c) => c.countryCode === "GB");
     assert.ok(gb, "no United Kingdom section in the markdown");
     const gbUrls = gb.pages.map((p) => p.url).sort();
-    assert.deepEqual(gbUrls, Object.keys(VISA_SOURCE_OVERRIDES).sort());
+    assert.deepEqual(gbUrls, gbKeys().sort());
   });
 
-  // After applying the map: every GB page pinned, no other country touched.
-  test("applying the map pins all GB pages and no other country's", () => {
+  // After applying the map: every GB page pinned, and no country outside
+  // PINNED_COUNTRIES touched. (KR is allowed but not required to be pinned
+  // here, so this test holds both before and after the KR markdown row is
+  // switched to KR_TEMPORARY_VISIT_URL — see the "South Korea pin" block.)
+  test("applying the map pins all GB pages and no unpinned country's", (t) => {
+    if (skipWithoutMarkdown(t)) return;
     for (const c of parsed()) {
       const { pages } = applyVisaSourcePins(c.pages, VISA_SOURCE_OVERRIDES);
       for (const p of pages) {
         if (c.countryCode === "GB") assert.ok(p.visaId, `GB page unpinned: ${p.url}`);
-        else assert.equal(p.visaId, undefined, `${c.countryCode} page pinned: ${p.url}`);
+        else if (!PINNED_COUNTRIES.has(c.countryCode)) {
+          assert.equal(p.visaId, undefined, `${c.countryCode} page pinned: ${p.url}`);
+        }
       }
     }
   });
@@ -251,6 +278,76 @@ describe("VISA_SOURCE_OVERRIDES", () => {
       assert.ok(!seededIds.has(pin.visaId), `pinned id collides with a seed: ${pin.visaId}`);
       assert.ok(!pin.visaId.startsWith("uk-"), `pinned id in the seeded uk-* namespace: ${pin.visaId}`);
     }
+  });
+});
+
+// ----- South Korea pin (issue #67) -----
+//
+// The KR row used to be the visa.go.kr home page, whose empty path made
+// deriveVisaId() throw before any fetch. These tests pin down the fix: the
+// replacement HiKorea route page resolves to its own `kr-*` id.
+//
+// The markdown itself lives in the meta-repo, so the end-to-end check below
+// parses an inline copy of the KR section exactly as it should read there
+// (same table shape, same URL string as the map key).
+
+describe("South Korea pin (issue #67)", () => {
+  // The KR section as it reads in official_visa_links_verified_v3.md after
+  // the fix (one row, the HiKorea short-term visit route).
+  const KR_SECTION = [
+    "## 23. South Korea",
+    "",
+    "| Visa / route | Official link | Validation | Useful information confirmed |",
+    "|---|---|---:|---|",
+    `| Temporary Visit (C-3) — tourism, transit, events and conferences | ${KR_TEMPORARY_VISIT_URL} | TEXT-VERIFIED | HiKorea page. |`,
+  ].join("\n");
+
+  test("the old visa.go.kr home page cannot derive an id (the bug)", () => {
+    // Documents why the row had to change: "/" is an empty path.
+    assert.throws(
+      () => deriveVisaId({ countryCode: "KR", sourceUrl: "https://www.visa.go.kr/?LANG_TYPE=EN" }),
+      /empty path/
+    );
+  });
+
+  test("the KR page is pinned to kr-temporary-visit-c-3", () => {
+    const pin = VISA_SOURCE_OVERRIDES[KR_TEMPORARY_VISIT_URL];
+    assert.ok(pin, "no pin for the KR page");
+    assert.equal(pin.visaId, "kr-temporary-visit-c-3");
+    // No seeded KR equivalent, so no code override.
+    assert.equal(pin.visaCode, undefined);
+  });
+
+  test("parsing the KR row + applying pins resolves the page to its kr-* id", () => {
+    const [kr] = parseVisaSourcesMarkdown(KR_SECTION);
+    assert.equal(kr.countryCode, "KR");
+    assert.equal(kr.pages.length, 1);
+    // The parser keeps the full URL, query string included, so it matches the key.
+    assert.equal(kr.pages[0].url, KR_TEMPORARY_VISIT_URL);
+    assert.equal(kr.pages[0].validation, "text_verified");
+
+    const { pages, matchedUrls } = applyVisaSourcePins(kr.pages, VISA_SOURCE_OVERRIDES);
+    assert.ok(matchedUrls.has(KR_TEMPORARY_VISIT_URL), "pin not matched (seed would warn)");
+    // Same call the crawl makes before fetching: no throw, pinned id wins.
+    const id = deriveVisaId({
+      countryCode: kr.countryCode,
+      sourceUrl: pages[0].url,
+      visaId: pages[0].visaId,
+    });
+    assert.equal(id, "kr-temporary-visit-c-3");
+    assert.match(id, /^kr-/);
+  });
+
+  test("without the pin, every HiKorea guide page would collapse onto one id", () => {
+    // Why the pin matters even though the path is non-empty: the query
+    // (CAT_SEQ/PARENT_ID) is dropped, so Study and Tourism derive the same id.
+    const tourism = deriveVisaId({ countryCode: "KR", sourceUrl: KR_TEMPORARY_VISIT_URL });
+    const study = deriveVisaId({
+      countryCode: "KR",
+      sourceUrl: "https://www.hikorea.go.kr/info/InfoDatail.pt?CAT_SEQ=526&PARENT_ID=1275&locale=en",
+    });
+    assert.equal(tourism, "kr-info-infodatail-pt");
+    assert.equal(study, tourism);
   });
 });
 
