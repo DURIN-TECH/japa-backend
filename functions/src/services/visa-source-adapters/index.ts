@@ -18,6 +18,7 @@ export { GenericHtmlAdapter, GENERIC_HTML_SECTION_SLUG } from "./generic-html.ad
 export {
   GovukContentApiAdapter,
   GOVUK_MAX_TEXT_CHARS,
+  govukApplyLinkUrl,
   govukContentApiUrl,
   isWithdrawnNotice,
 } from "./govuk-content-api.adapter";

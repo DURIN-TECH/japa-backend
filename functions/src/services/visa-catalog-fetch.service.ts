@@ -127,10 +127,55 @@ export function blockText(root: cheerio.Cheerio<AnyNode>): string {
  * with the shared block-newline logic. No boilerplate stripping or main-region
  * picking — a fragment is already just content.
  */
-export function htmlFragmentToText(html: string): string {
+export function htmlFragmentToText(html: string, options: FragmentTextOptions = {}): string {
   const $ = cheerio.load(html);
+  // ---- Optional link rendering (issue #74) ----
+  // By default links are read as their text only (href dropped) — exactly the
+  // pre-#74 output. When a caller passes `renderLinkUrl`, each <a href> is
+  // resolved against `baseUrl` and, if the predicate returns a URL string, the
+  // anchor's text becomes `text (url)`. Only the GOV.UK adapter opts in; the
+  // generic-html path never calls this function, so its text + hash are
+  // unchanged (#58 guarantee).
+  if (options.renderLinkUrl) {
+    const render = options.renderLinkUrl;
+    $("a[href]").each((_, el) => {
+      const a = $(el);
+      const href = (a.attr("href") ?? "").trim();
+      if (!href) return;
+      // Resolve relative hrefs ("/apply", "apply") against the base; an
+      // unparseable href is simply left as plain text.
+      let absolute: string;
+      try {
+        absolute = new URL(href, options.baseUrl).toString();
+      } catch {
+        return;
+      }
+      const url = render(absolute);
+      if (!url) return;
+      // Don't duplicate when the anchor text already IS the URL — compared
+      // against the raw href AND the normalised URL, each with and without a
+      // trailing slash ("https://x.gov.uk" vs "https://x.gov.uk/").
+      const text = a.text().trim();
+      const noSlash = (u: string) => u.replace(/\/+$/, "");
+      const same = [href, absolute, url].some((u) => noSlash(u) === noSlash(text));
+      if (same) return;
+      // Append as a TEXT node, never as HTML: appending a string to cheerio
+      // parses it as markup, so entities in a query string would be decoded
+      // ("&param=" → "¶m=", "&copy=" → "©="). `.text()` sets literal text.
+      a.append($("<span>").text(` (${url})`));
+    });
+  }
   // cheerio wraps a fragment in <html><body>; read from <body>.
   return blockText($("body"));
+}
+
+/** Options for `htmlFragmentToText` (all optional; none → pre-#74 output). */
+export interface FragmentTextOptions {
+  // Base URL relative hrefs are resolved against (e.g. "https://www.gov.uk").
+  baseUrl?: string;
+  // Given a link's ABSOLUTE url, return the URL to print after the link text
+  // (`text (url)`), or undefined to keep the link as plain text.
+  renderLinkUrl?: (absoluteUrl: string) => string | undefined;
 }
 
 export interface FetchedPage {
