@@ -17,7 +17,7 @@ Code: `src/scrapers/shared/alerts/scrape-alert-rules.ts` (pure rule logic),
 
 | Trigger | Where | Rules |
 | --- | --- | --- |
-| After every run (scheduled / manual) | #81 finalize hook, registered in `index.ts` (`scrapeAlertService.onRunFinalized`) | `run_failed`, `run_stuck` (clears the run's own), `error_rate`, `linked_surcharge`, `host_backoff`, `source_broken` (that scraper) |
+| After every run (scheduled / manual) | #81 finalize hook, registered in `index.ts` (`scrapeAlertService.onRunFinalized`) | `run_failed`, `run_stuck` (clears the run's own), `error_rate`, `linked_surcharge`, `budget_hard_stop` (#96), `host_backoff`, `source_broken` (that scraper) |
 | Hourly, :45 UTC | `checkScrapeAlerts` scheduled function (`runHourlyCheck`; 300s timeout, 256MB) | `run_stuck`, `run_failed` (latest finished run per scraper), `missed_window`, `source_broken`, `host_backoff` clears (below), `fx_refresh_failing`, `llm_budget`, `review_queue_stale`; then emails held back by a late hook (`emailPending`) and the daily digest |
 
 Script runs (`trigger: "script"`, the CLI) never alert. Stale sweeps (#81) fire
@@ -46,6 +46,7 @@ still catches `run_failed`, the other per-run rules are lost for that run.
 | `linked_surcharge` | `linked_surcharge:visa` | `summary.linkedSurchargeErrors >= linkedSurchargeErrors` (#69) | a visa run below it | warning |
 | `fx_refresh_failing` | `fx_refresh_failing:fx` | `appConfig/fx.fetchedAt` older than `fxFailingHours` **and** the latest visa run's refresh failed (`summary.fxRefreshed === false`) (#59) | a refresh succeeds | warning |
 | `llm_budget` | `llm_budget:<YYYY-MM>` | month-to-date LLM cost >= a `budgetPcts` level; `level` = highest reached | new month / under every level | 50% info, 80% warning, 100% critical |
+| `budget_hard_stop` (#96) | `budget_hard_stop:visa` | a visa run's `summary.budgetHardStop` is true: the hard stop (`appConfig/scraperSettings.budget.hardStop`) skipped extraction because month-to-date cost reached the budget | a visa run without it | critical |
 | `review_queue_stale` | `review_queue_stale:visa` | a scraped visa pending review (queued at max(createdAt, restoredAt)) or an open `pendingVisaChanges` row waiting longer than `reviewQueueMaxAgeDays` | nothing is that old | info |
 
 How `host_backoff` sees hosts: visa page lines (`pages[]`, every line's host is
@@ -131,6 +132,7 @@ validated on its own; an invalid one falls back to its default and is logged.
 {
   "enabled": true,                  // master switch (false: no checks, no emails)
   "recipientUserIds": [],           // admin uids; [] = every admin (users.admin == true). Non-admins are skipped.
+  "extraRecipientEmails": [],       // #96: extra addresses that also get every alert email / digest (max 20; branded email service, no user opt-out)
   "email": {
     "immediate": true,              // email new + escalated alerts right away (one email per check)
     "immediateMinSeverity": "warning",
