@@ -28,7 +28,7 @@
     "test": "tsc -p tsconfig.test.json && node --import tsx --test test/*.test.ts",
     "eval:visa-extract": "node --env-file-if-exists=.env.local --import tsx eval/run.ts",
     "eval:record": "node --import tsx eval/record.ts",
-    "lint": "eslint --ext .ts src/ eval/",
+    "lint": "eslint --ext .ts src/ eval/ test/",
     "lint:fix": "eslint --ext .ts src/ eval/ --fix",
     "clean": "rm -rf lib",
     "vendor:authz": "node vendor-authz.cjs"
