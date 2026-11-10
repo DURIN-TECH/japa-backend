@@ -147,17 +147,17 @@ describe("review fixes (round 1)", () => {
     const opts = { baseUrl: "https://www.gov.uk", renderLinkUrl: govukApplyLinkUrl };
     // href without path → normalised URL gains a "/"; text is the raw href.
     assert.equal(
-      htmlFragmentToText('<p><a href="https://visas-immigration.service.gov.uk">https://visas-immigration.service.gov.uk</a></p>', opts),
+      htmlFragmentToText("<p><a href=\"https://visas-immigration.service.gov.uk\">https://visas-immigration.service.gov.uk</a></p>", opts),
       "https://visas-immigration.service.gov.uk"
     );
     // text has a trailing slash, href doesn't.
     assert.equal(
-      htmlFragmentToText('<p><a href="https://x.service.gov.uk/apply">https://x.service.gov.uk/apply/</a></p>', opts),
+      htmlFragmentToText("<p><a href=\"https://x.service.gov.uk/apply\">https://x.service.gov.uk/apply/</a></p>", opts),
       "https://x.service.gov.uk/apply/"
     );
     // text is the normalised form of an upper-case-host href.
     assert.equal(
-      htmlFragmentToText('<p><a href="https://X.SERVICE.GOV.UK/apply">https://x.service.gov.uk/apply</a></p>', opts),
+      htmlFragmentToText("<p><a href=\"https://X.SERVICE.GOV.UK/apply\">https://x.service.gov.uk/apply</a></p>", opts),
       "https://x.service.gov.uk/apply"
     );
   });
