@@ -479,7 +479,10 @@ export const crawlVisaCatalogOrchestrator = functions
           // their pending doc came from an older extractor prompt.
           `${result.pagesChanged} changed + ${result.promptReextracts} prompt re-extracts → ` +
           `${result.created} new / ${result.updated} updated / ` +
-          `${result.skipped} skipped, ${result.errors} errors`
+          `${result.skipped} skipped, ${result.errors} errors` +
+          // Issue #69: pages not extracted because their linked surcharge
+          // page (UK IHS) could not be fetched/parsed — part of `errors`.
+          (result.linkedSurchargeErrors ? ` (${result.linkedSurchargeErrors} linked-surcharge errors)` : "")
       );
     } catch (error) {
       console.error("Visa catalog crawl orchestrator failed:", error);
