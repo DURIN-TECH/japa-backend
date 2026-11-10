@@ -294,9 +294,9 @@ class VisaCatalogCrawlService {
           // (and was approved), put it back to pending_review so it shows in
           // the admin Visa Review queue. Runs BEFORE the hash gate, so it
           // fires whether or not the text changed; never reactivates.
-          if ((await visaCatalogService.markRestored(source.countryCode, visaId)) === "flagged") {
-            summary.restored++;
-          }
+          // Its read of the doc is reused by the #71 prompt check below.
+          const restored = await visaCatalogService.markRestored(source.countryCode, visaId);
+          if (restored.outcome === "flagged") summary.restored++;
 
           // Hash is over the exact text the extractor would see (selected +
           // capped sections for GOV.UK; the cleaned page for generic-html).
@@ -318,7 +318,9 @@ class VisaCatalogCrawlService {
           // maxExtractions accounting below, so a version bump drains over
           // several runs instead of re-extracting everything at once.
           if (!changed) {
-            const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId);
+            const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId, {
+              doc: restored.doc, // same doc, already read by markRestored (no second read)
+            });
             if (!promptStale) continue; // nothing new, skip the LLM
             summary.promptReextracts++;
           } else {

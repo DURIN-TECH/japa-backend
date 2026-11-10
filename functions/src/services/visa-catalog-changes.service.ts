@@ -39,6 +39,16 @@ import { visaService } from "./visa.service";
 /** Every valid row status (for query validation in the controller). */
 export const PENDING_VISA_CHANGE_STATUSES: readonly PendingVisaChangeStatus[] = ["open", "approved", "rejected"];
 
+/**
+ * Issue #68: `resolvedBy` on a row the SYSTEM closed (not an admin uid), and
+ * the reason written when the visa's source page was withdrawn. Uses the
+ * existing #61 status semantics — the row becomes "rejected" (resolved, never
+ * applied) with this reason — so no new status value is needed anywhere.
+ */
+export const SYSTEM_RESOLVER = "system";
+export const SUPERSEDED_BY_WITHDRAWAL_REASON =
+  "Superseded: the source page was withdrawn, so this proposed edit no longer reflects the source";
+
 /** Default / max page size of the admin list. */
 export const VISA_CHANGE_LIST_DEFAULT_LIMIT = 50;
 export const VISA_CHANGE_LIST_MAX_LIMIT = 100;
@@ -283,6 +293,51 @@ class VisaChangeService {
     });
     const after = await rowRef.get();
     return rowFrom(after);
+  }
+
+  /**
+   * Issue #68 (review fix): close every OPEN proposal for a visa whose source
+   * page was just seen withdrawn.
+   *
+   * Why: a row opened before the withdrawal would otherwise stay open through
+   * withdraw → restore → re-approve; if the restored text is byte-identical
+   * the pending doc is not refreshed, so after re-approval findStaleReason
+   * passes again and an admin could apply an edit the source no longer says.
+   *
+   * Each row is resolved as "rejected" with SUPERSEDED_BY_WITHDRAWAL_REASON
+   * and resolvedBy SYSTEM_RESOLVER (the #61 "resolved, not applied" state),
+   * re-read in its own transaction so a row an admin resolved meanwhile is
+   * left alone. The live visa doc is never touched. Equality-only query
+   * (countryCode, visaId, status) — same as proposeChange, no composite index.
+   *
+   * @returns how many rows were closed
+   */
+  async closeOpenProposals(countryCode: string, visaId: string): Promise<number> {
+    const open = await collections.pendingVisaChanges
+      .where("countryCode", "==", countryCode)
+      .where("visaId", "==", visaId)
+      .where("status", "==", "open")
+      .get();
+    let closed = 0;
+    for (const row of open.docs) {
+      const rowRef = collections.pendingVisaChanges.doc(row.id);
+      const didClose = await this.runTransaction(async (tx) => {
+        const snap = await tx.get(rowRef);
+        // Gone, or already resolved by an admin since the query: nothing to do.
+        if (!snap.exists || rowFrom(snap).status !== "open") return false;
+        const now = Timestamp.now();
+        tx.update(rowRef, {
+          status: "rejected",
+          rejectionReason: SUPERSEDED_BY_WITHDRAWAL_REASON,
+          resolvedBy: SYSTEM_RESOLVER,
+          resolvedAt: now,
+          updatedAt: now,
+        });
+        return true;
+      });
+      if (didClose) closed++;
+    }
+    return closed;
   }
 
   /**

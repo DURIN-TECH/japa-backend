@@ -971,12 +971,12 @@ describe("runOrchestrator — restored guide (issue #68)", () => {
       return withdrawnNow
         ? { url: page.url, withdrawn: true, sections: [], text: "", contentHash: "empty" }
         : {
-            url: page.url,
-            withdrawn: false,
-            sections: [{ slug: "page", title: "t", text: "Work visa text" }],
-            text: "Work visa text",
-            contentHash: hashNow,
-          };
+          url: page.url,
+          withdrawn: false,
+          sections: [{ slug: "page", title: "t", text: "Work visa text" }],
+          text: "Work visa text",
+          contentHash: hashNow,
+        };
     },
   };
   const adapters: any = { "generic-html": stubAdapter, "govuk-content-api": stubAdapter };
@@ -1122,6 +1122,48 @@ describe("runOrchestrator — restored guide (issue #68)", () => {
     doc = store.get(DOC)!;
     assert.equal(doc.isActive, false);
     assert.ok((doc.staleSince as Timestamp).toMillis() > firstStale);
+  });
+
+  // Issue #68 review fix: a restore awaiting review must leave the queue when
+  // the guide is withdrawn again, so it can't be approved live while withdrawn.
+  test("restored, then withdrawn again before review → back to approved, inactive, staleSince kept", async () => {
+    const stale = Timestamp.fromMillis(1_700_000_000_000);
+    putZz();
+    putDoc({ isActive: false, staleSince: stale });
+
+    // Restore: in the queue, with the restore marker.
+    assert.equal((await run()).restored, 1);
+    assert.equal(store.get(DOC)!.reviewStatus, "pending_review");
+    assert.ok(store.get(DOC)!.restoredAt instanceof Timestamp);
+
+    // Withdrawn again before any admin review.
+    withdrawnNow = true;
+    await run();
+    const doc = store.get(DOC)!;
+    assert.equal(doc.reviewStatus, "approved"); // out of the review queue
+    assert.equal(doc.isActive, false);
+    assert.equal((doc.staleSince as Timestamp).toMillis(), stale.toMillis());
+    assert.equal("restoredAt" in doc, false);
+
+    // And restored once more → back in the queue (the cycle repeats cleanly).
+    withdrawnNow = false;
+    assert.equal((await run()).restored, 1);
+    assert.equal(store.get(DOC)!.reviewStatus, "pending_review");
+  });
+
+  test("admin approve clears restoredAt (with staleSince)", async () => {
+    putZz();
+    putDoc({ isActive: false, staleSince: Timestamp.fromMillis(1) });
+    store.set("countries/ZZ", { code: "ZZ", name: "Zedland" });
+    await run();
+    const fresh = { ...oldFx(), fetchedAt: Timestamp.now(), rateDate: isoDaysAgo(1) };
+    const { feeMeta, baseCostUsd } = computeFee(SW, fresh, Timestamp.now());
+    store.set(DOC, { ...store.get(DOC)!, baseCostUsd, scrapeMeta: { ...(store.get(DOC)!.scrapeMeta as Data), fee: feeMeta } });
+    await visaSvc.updateVisaReviewStatus("ZZ", "zz-work", "approve", "admin-1");
+    const doc = store.get(DOC)!;
+    assert.equal("restoredAt" in doc, false);
+    assert.equal("staleSince" in doc, false);
+    assert.equal(doc.isActive, true);
   });
 });
 

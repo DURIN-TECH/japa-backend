@@ -19,7 +19,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { createHash } from "crypto";
 import * as cheerio from "cheerio";
-import { Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 
 import {
   MAX_CLEAN_TEXT_CHARS,
@@ -659,6 +659,37 @@ describe("planWithdrawnUpdate", () => {
   });
 });
 
+// ----- Withdrawn again while a restore awaits review (issue #68 review fix) -----
+
+describe("planWithdrawnUpdate — restored doc withdrawn again before review", () => {
+  const now = Timestamp.fromMillis(1_800_000_000_000);
+  const stale = Timestamp.fromMillis(1_700_000_000_000);
+
+  test("pending_review + restoredAt → back to approved (out of the queue), still inactive, staleSince kept", () => {
+    const plan = planWithdrawnUpdate(
+      { source: "scraped", reviewStatus: "pending_review", isActive: false, staleSince: stale, restoredAt: stale },
+      now
+    );
+    assert.equal(plan.outcome, "unqueued");
+    const u = plan.update as Record<string, unknown>;
+    assert.equal(u.reviewStatus, "approved");
+    assert.ok((u.restoredAt as FieldValue).isEqual(FieldValue.delete()));
+    assert.equal(u.updatedAt, now);
+    // never touches isActive / staleSince
+    assert.equal("isActive" in u, false);
+    assert.equal("staleSince" in u, false);
+  });
+
+  test("a NEVER-approved pending doc (no restoredAt) is not promoted to approved", () => {
+    const plan = planWithdrawnUpdate(
+      { source: "scraped", reviewStatus: "pending_review", isActive: false, staleSince: stale },
+      now
+    );
+    assert.equal(plan.outcome, "already_inactive");
+    assert.equal(plan.update, undefined);
+  });
+});
+
 // ----- Restored-guide signal (issue #68) -----
 
 describe("planRestoredUpdate", () => {
@@ -670,7 +701,7 @@ describe("planRestoredUpdate", () => {
     assert.equal(plan.outcome, "flagged");
     // Exactly the review status + updatedAt: no isActive (never reactivated),
     // no staleSince change (approval clears it).
-    assert.deepEqual(plan.update, { reviewStatus: "pending_review", updatedAt: now });
+    assert.deepEqual(plan.update, { reviewStatus: "pending_review", restoredAt: now, updatedAt: now });
   });
 
   test("no write for anything that is not a withdrawn approved scraped doc", () => {

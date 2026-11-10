@@ -261,7 +261,7 @@ async function main() {
         // Restored at source (issue #68, same rule as the orchestrator): a
         // withdrawn + approved scraped doc goes back to pending_review so an
         // admin sees it. Before the hash gate → independent of the hash.
-        if ((await visaCatalogService.markRestored(source.countryCode, resolvedVisaId)) === "flagged") {
+        if ((await visaCatalogService.markRestored(source.countryCode, resolvedVisaId)).outcome === "flagged") {
           totals.restored++;
           console.log(`  -> guide restored on source: ${resolvedVisaId} back to pending_review`);
         }

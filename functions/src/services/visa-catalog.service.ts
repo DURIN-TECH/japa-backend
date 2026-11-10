@@ -99,9 +99,20 @@ class VisaCatalogService {
    *
    * @returns true when the page must go to extraction despite the same hash
    */
-  async needsPromptReextract(countryCode: string, visaId: string): Promise<boolean> {
-    const snap = await subcollections.visaTypes(countryCode).doc(visaId).get();
-    const existing = snap.exists ? (snap.data() as VisaType) : undefined;
+  async needsPromptReextract(
+    countryCode: string,
+    visaId: string,
+    // Issue #68: the doc the caller already read this page (markRestored's
+    // `doc`; `doc: undefined` = no doc). When given, no second read is made.
+    known?: { doc: VisaType | undefined }
+  ): Promise<boolean> {
+    let existing: VisaType | undefined;
+    if (known) {
+      existing = known.doc;
+    } else {
+      const snap = await subcollections.visaTypes(countryCode).doc(visaId).get();
+      existing = snap.exists ? (snap.data() as VisaType) : undefined;
+    }
     return isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION);
   }
 
@@ -284,13 +295,15 @@ class VisaCatalogService {
   async markWithdrawn(countryCode: string, visaId: string): Promise<WithdrawnOutcome> {
     const ref = subcollections.visaTypes(countryCode).doc(visaId);
     const snap = await ref.get();
-    const plan = planWithdrawnUpdate(
-      snap.exists ? (snap.data() as VisaType) : undefined,
-      Timestamp.now()
-    );
+    const existing = snap.exists ? (snap.data() as VisaType) : undefined;
+    const plan = planWithdrawnUpdate(existing, Timestamp.now());
     if (plan.update) {
       // update() (not set) — the doc is known to exist and must stay intact.
       await ref.update(plan.update);
+    }
+    // Stats only move when isActive flips ("unqueued" changes review fields
+    // only, the doc was already inactive).
+    if (plan.outcome === "deactivated") {
       // Stats recompute must not turn a committed withdrawal into a page
       // error (which would also count against the source's reliability).
       try {
@@ -300,6 +313,19 @@ class VisaCatalogService {
           `Withdrawal of ${countryCode}/${visaId} succeeded but the country stats recompute failed:`,
           error
         );
+      }
+    }
+    // ---- Close open #61 proposals for this visa (issue #68 review fix) ----
+    // A proposal made against the pre-withdrawal text must not resurface after
+    // restore + re-approval. Run on EVERY withdrawn crawl of a scraped doc
+    // (not only on the first, "deactivated" one), so a failed close is simply
+    // retried next crawl. Logged + swallowed like the stats recompute: the
+    // withdrawal itself is committed.
+    if (existing?.source === "scraped") {
+      try {
+        await visaChangeService.closeOpenProposals(countryCode, visaId);
+      } catch (error) {
+        console.error(`Withdrawal of ${countryCode}/${visaId}: closing open proposals failed:`, error);
       }
     }
     return plan.outcome;
@@ -320,15 +346,24 @@ class VisaCatalogService {
    * a write only on the first crawl after a restore (afterwards the doc is
    * pending_review and the rule no longer matches).
    *
-   * @returns "flagged" when the doc was put back in the queue, else "none"
+   * @returns `outcome` ("flagged" when the doc was put back in the queue,
+   *   else "none") and `doc`, the doc after the update (undefined = no doc)
    */
-  async markRestored(countryCode: string, visaId: string): Promise<RestoredOutcome> {
+  async markRestored(
+    countryCode: string,
+    visaId: string
+  ): Promise<{ outcome: RestoredOutcome; doc: VisaType | undefined }> {
     const ref = subcollections.visaTypes(countryCode).doc(visaId);
     const snap = await ref.get();
-    const plan = planRestoredUpdate(snap.exists ? (snap.data() as VisaType) : undefined, Timestamp.now());
+    const existing = snap.exists ? (snap.data() as VisaType) : undefined;
+    const plan = planRestoredUpdate(existing, Timestamp.now());
     // update() (not set): only the review fields change; the doc stays intact.
     if (plan.update) await ref.update(plan.update);
-    return plan.outcome;
+    // The doc AS IT NOW IS (the update merged in) — lets the orchestrator's
+    // hash gate reuse this read for the #71 prompt check instead of reading
+    // the same doc again (see needsPromptReextract's `known`).
+    const doc = existing && plan.update ? { ...existing, ...plan.update } : existing;
+    return { outcome: plan.outcome, doc };
   }
 
   // ============================================
