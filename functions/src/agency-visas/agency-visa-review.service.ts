@@ -624,47 +624,47 @@ export function ownerEmailCopy(
   const entity = { relatedEntityType: "visa" as const, relatedEntityId: visa.id };
   const why = reason ? ` Reason: ${reason}` : "";
   switch (kind) {
-    case "approved":
-      return {
-        type: "agency_visa_approved",
-        title: `Seli approved ${name}`,
-        body:
+  case "approved":
+    return {
+      type: "agency_visa_approved",
+      title: `Seli approved ${name}`,
+      body:
           `${name} is approved. Your agents can now start cases on it, ` +
           "and it’s on your agency page. Only your agency’s clients can see it for now.",
-        ...entity,
-      };
-    case "revision_approved":
-      return {
-        type: "agency_visa_approved",
-        title: `Seli approved your changes to ${name}`,
-        body: `Your changes to ${name} are approved and live now.`,
-        ...entity,
-      };
-    case "rejected":
-      return {
-        type: "agency_visa_rejected",
-        title: `${name} needs changes`,
-        body: `Seli didn’t approve ${name}.${why} Edit the visa and submit it again when you’re ready.`,
-        ...entity,
-      };
-    case "revision_rejected":
-      return {
-        type: "agency_visa_rejected",
-        title: `Your changes to ${name} need work`,
-        body:
+      ...entity,
+    };
+  case "revision_approved":
+    return {
+      type: "agency_visa_approved",
+      title: `Seli approved your changes to ${name}`,
+      body: `Your changes to ${name} are approved and live now.`,
+      ...entity,
+    };
+  case "rejected":
+    return {
+      type: "agency_visa_rejected",
+      title: `${name} needs changes`,
+      body: `Seli didn’t approve ${name}.${why} Edit the visa and submit it again when you’re ready.`,
+      ...entity,
+    };
+  case "revision_rejected":
+    return {
+      type: "agency_visa_rejected",
+      title: `Your changes to ${name} need work`,
+      body:
           `Seli didn’t approve your changes to ${name}.${why} ` +
           "The approved version stays live. Edit your changes to send them again.",
-        ...entity,
-      };
-    case "made_global":
-      return {
-        type: "agency_visa_made_global",
-        title: `${name} is now on Seli for everyone`,
-        body:
+      ...entity,
+    };
+  case "made_global":
+    return {
+      type: "agency_visa_made_global",
+      title: `${name} is now on Seli for everyone`,
+      body:
           `Seli added ${name} to the Explorer, so every applicant can find it. ` +
           "It still shows your agency as its creator.",
-        ...entity,
-      };
+      ...entity,
+    };
   }
 }
 
