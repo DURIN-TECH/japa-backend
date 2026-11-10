@@ -162,7 +162,23 @@ export const collections = {
   // (scheduled, manual, whole-scraper) holds it while crawling, so two runs
   // never crawl the same source at once. Expire after 15 min.
   scrapeSourceLeases: db.collection("scrapeSourceLeases"),
+  // Pending edits to APPROVED agency visas (issue #100):
+  // `visaRevisions/{countryCode}__{visaId}`, one per visa. Kept off the live
+  // visa doc so public reads never serve unreviewed agency text. Written by
+  // src/agency-visas, reviewed by the admin (#101). Backend-only: no
+  // firestore.rules match -> clients denied.
+  visaRevisions: db.collection("visaRevisions"),
 } as const;
+
+// Collection-group queries (every subcollection with that id, across all
+// parents). A function, not a stored query, so a test can swap it for a fake.
+export const collectionGroups = {
+  // Every `countries/{cc}/visaTypes` subcollection at once. Used by the
+  // agency visa endpoints (issue #100) to find an agency's visas without
+  // knowing their country (indexes: visaTypes ownerAgencyId + createdAt and
+  // ownerAgencyId + id, COLLECTION_GROUP scope).
+  visaTypes: () => db.collectionGroup("visaTypes"),
+};
 
 // Helper to get subcollection references
 export const subcollections = {
