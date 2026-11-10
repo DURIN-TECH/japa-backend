@@ -131,6 +131,9 @@ export interface ScrapeRunPageEntry {
   // page whose output then failed validation: that call was billed too).
   usage?: LlmUsage; // the provider's token counts for the call
   costUsd?: number; // from appConfig/llmPricing; absent when the model is unpriced
+  // The price-table entry used (the served model's, else the requested
+  // model's / alias's), e.g. "deepseek-flash". Absent when unpriced.
+  pricedAs?: string;
   model?: string; // the model requested ("deepseek-chat")
   promptVersion?: string; // EXTRACTOR_PROMPT_VERSION used
 }
@@ -188,6 +191,11 @@ export interface ScrapeRunDoc {
   // The same split by country (visa sourceId) and model. Feeds the monthly
   // rollup `scrapeCosts/{YYYY-MM}`. Runs with no LLM call have empty maps.
   costBreakdown?: RunCostBreakdown;
+  // Monthly rollup bookkeeping (#82 review): written `false` by finalize,
+  // set `true` in the same transaction that adds the run to
+  // scrapeCosts/{month}. A finished run left `false` (the hook failed) is
+  // picked up by scrapeCostService.backfillRecent(). Absent on older docs.
+  costRolledUp?: boolean;
 
   // ---- Retention ----
   // TTL field: Firestore deletes the doc after this instant (startedAt +

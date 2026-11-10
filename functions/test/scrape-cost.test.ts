@@ -156,7 +156,7 @@ describe("prices", () => {
     // (2000 x 0.30 + 3000 x 0.006 + 700 x 1.20) / 1e6
     assert.equal(peak.costUsd, pricingMod.roundUsd((2000 * 0.3 + 3000 * 0.006 + 700 * 1.2) / 1e6));
     assert.equal(peak.peak, true);
-    assert.equal(peak.priceKey, "deepseek-flash");
+    assert.equal(peak.pricedAs, "deepseek-flash");
     const off = pricingMod.priceUsageReport({ usage: u, model: "deepseek-chat", atMs: NOW }, table());
     assert.equal(off.costUsd, pricingMod.roundUsd((2000 * 0.15 + 3000 * 0.003 + 700 * 0.6) / 1e6));
     assert.equal(off.peak, false);
@@ -168,12 +168,12 @@ describe("prices", () => {
     assert.equal("costUsd" in p, false);
   });
 
-  test("the response model is the fallback lookup", () => {
+  test("an unknown requested name is priced by the served (response) model", () => {
     const p = pricingMod.priceUsageReport(
       { usage: usage(10, 1), model: "alias-we-do-not-know", responseModel: "deepseek-flash", atMs: NOW },
       table()
     );
-    assert.equal(p.priceKey, "deepseek-flash");
+    assert.equal(p.pricedAs, "deepseek-flash");
     assert.equal(p.responseModel, "deepseek-flash");
   });
 
@@ -547,6 +547,8 @@ describe("visa orchestrator records cost", () => {
     assert.deepEqual(page.usage, usage(5000, 700, 3000));
     assert.equal(page.costUsd, expectedCost);
     assert.equal(page.model, "deepseek-chat");
+    // Served model "deepseek-v4.1-flash" is not in the table -> priced by the requested alias.
+    assert.equal(page.pricedAs, "deepseek-flash");
     assert.equal(page.promptVersion, extractMod.EXTRACTOR_PROMPT_VERSION);
     // Run totals
     assert.equal(run.costUsd, expectedCost);
@@ -662,5 +664,165 @@ describe("eval results record usage", () => {
       sourceUrl: "https://api-docs.deepseek.com/quick_start/pricing",
       effectiveFrom: "2026-09-10",
     });
+  });
+});
+
+// ============================================
+// Review fixes (#82): strict price validation, non-finite costs,
+// served-model-first pricing, rollup backfill
+// ============================================
+
+describe("review: price table validation + non-finite costs", () => {
+  /** A valid table to break one field of. */
+  const good = () => JSON.parse(JSON.stringify(pricingMod.DEFAULT_LLM_PRICING));
+
+  test("isValidPricingDoc rejects bad peak / offPeak prices, peak windows, aliases, request prices", () => {
+    assert.equal(costMod.isValidPricingDoc(good()), true);
+    const broken: Array<(d: any) => void> = [
+      (d) => (d.models["deepseek-flash"].outputPer1M = Number.NaN),
+      (d) => (d.models["deepseek-flash"].inputPer1M = -1),
+      (d) => (d.models["deepseek-flash"].offPeak.cachedInputPer1M = "0.003"),
+      (d) => delete d.models["deepseek-flash"].offPeak.outputPer1M,
+      (d) => delete d.models["deepseek-flash"].peakWindowsUtc, // offPeak without windows
+      (d) => (d.models["deepseek-flash"].peakWindowsUtc[0].endHour = 25),
+      (d) => (d.models["deepseek-flash"].peakWindowsUtc[0].startHour = 5), // start >= end (4)
+      (d) => (d.models["deepseek-flash"].peakWindowsUtc[1].isoWeekdays = [0, 8]),
+      (d) => (d.models["deepseek-flash"].peakWindowsUtc[1].isoWeekdays = []),
+      (d) => (d.models["deepseek-flash"].aliases = [42]),
+      (d) => delete d.models["deepseek-flash"].sourceUrl,
+      (d) => (d.requestPricing = { newsapi: { perRequestUsd: Number.POSITIVE_INFINITY } }),
+    ];
+    for (const breakIt of broken) {
+      const d = good();
+      breakIt(d);
+      assert.equal(costMod.isValidPricingDoc(d), false, breakIt.toString());
+    }
+  });
+
+  test("an invalid stored doc falls back to the default table with a console.error", async () => {
+    const d = good();
+    d.models["deepseek-flash"].offPeak.outputPer1M = null;
+    store.set("appConfig/llmPricing", d);
+    const errors: string[] = [];
+    const orig = console.error;
+    console.error = (m: string) => errors.push(String(m));
+    try {
+      const loaded = await costs.loadPricing();
+      assert.equal(loaded.origin, "default");
+      assert.equal(loaded.pricing.models["deepseek-flash"].offPeak.outputPer1M, 0.6);
+    } finally {
+      console.error = orig;
+    }
+    assert.ok(errors.some((e) => /malformed/.test(e)));
+  });
+
+  test("a non-finite cost is UNPRICED in priceUsageReport, accumulators and page fields (never $0 / NaN)", () => {
+    const nanTable = { currency: "USD", verifiedAt: "x", models: { m: { inputPer1M: Number.NaN, cachedInputPer1M: 0, outputPer1M: 0, effectiveFrom: "x", sourceUrl: "x" } } };
+    const p = pricingMod.priceUsageReport({ usage: usage(100, 10), model: "m", atMs: NOW }, nanTable);
+    assert.equal(p.costUsd, undefined);
+    assert.equal(p.pricedAs, undefined);
+
+    const t = pricingMod.emptyTotals();
+    pricingMod.addPricedUsage(t, { usage: usage(100, 10), model: "m", costUsd: Number.NaN });
+    pricingMod.addPricedUsage(t, { usage: usage(100, 10), model: "m", costUsd: Number.POSITIVE_INFINITY });
+    pricingMod.addPricedUsage(t, { usage: usage(100, 10), model: "m", costUsd: 0.25 });
+    assert.equal(t.extractions, 3);
+    assert.equal(t.unpricedExtractions, 2);
+    assert.equal(t.costUsd, 0.25);
+    assert.equal(Number.isNaN(pricingMod.roundUsd(Number.NaN)), true);
+    assert.equal("costUsd" in pricingMod.pageUsageFields({ usage: usage(1, 1), model: "m", costUsd: Number.NaN }, "v"), false);
+  });
+
+  test("recorder: a NaN call cost or request cost never reaches the run doc", async () => {
+    const r = await runs.start({ kind: "news", trigger: "scheduled", startedAtMs: NOW });
+    r.recordUsage({ model: "m", usage: usage(10, 1), costUsd: Number.NaN });
+    r.recordRequests("newsapi", 2, Number.NaN);
+    await quiet(() => r.finalize({ summary: { errors: 0 }, anySuccess: true }));
+    const run = runDocs()[0] as any;
+    assert.equal(run.costUsd, 0);
+    assert.equal(run.usage.unpricedExtractions, 1);
+    assert.deepEqual(run.usage.requests, { newsapi: 2 });
+  });
+});
+
+describe("review: served model priced first", () => {
+  /** Requested alias -> cheap entry; served model -> its own (dearer) entry. */
+  const table = {
+    currency: "USD",
+    verifiedAt: "x",
+    models: {
+      cheap: { inputPer1M: 1, cachedInputPer1M: 0, outputPer1M: 0, aliases: ["deepseek-chat"], effectiveFrom: "x", sourceUrl: "x" },
+      dear: { inputPer1M: 10, cachedInputPer1M: 0, outputPer1M: 0, effectiveFrom: "x", sourceUrl: "x" },
+    },
+  };
+
+  test("the response model wins over the requested alias; pricedAs records it", () => {
+    const p = pricingMod.priceUsageReport({ usage: usage(1_000_000, 0), model: "deepseek-chat", responseModel: "dear", atMs: NOW }, table);
+    assert.equal(p.pricedAs, "dear");
+    assert.equal(p.costUsd, 10);
+    assert.equal(pricingMod.pageUsageFields(p, "v").pricedAs, "dear");
+  });
+
+  test("an unknown response model falls back to the requested model / alias", () => {
+    const p = pricingMod.priceUsageReport({ usage: usage(1_000_000, 0), model: "deepseek-chat", responseModel: "unknown-x", atMs: NOW }, table);
+    assert.equal(p.pricedAs, "cheap");
+    assert.equal(p.costUsd, 1);
+  });
+});
+
+describe("review: rollup backfill", () => {
+  /** Finish a visa run whose rollup hook transaction FAILS once. */
+  async function runWithFailedHook(startedAtMs: number, cost: number): Promise<any> {
+    const origTx = costs.runTransaction;
+    costs.runTransaction = async () => {
+      throw new Error("firestore unavailable");
+    };
+    try {
+      const r = await runs.start({ kind: "visa", trigger: "scheduled", startedAtMs });
+      r.recordUsage({ sourceId: "GB", model: "deepseek-chat", usage: usage(100, 10), costUsd: cost });
+      return await quiet(() => r.finalize({ summary: { errors: 0 }, anySuccess: true }));
+    } finally {
+      costs.runTransaction = origTx;
+    }
+  }
+
+  test("a run whose hook failed stays costRolledUp:false; backfillRecent adds it once and flags it", async () => {
+    const doc = await runWithFailedHook(NOW, 0.5);
+    assert.equal(store.get(`scrapeRuns/${doc.id}`)!.costRolledUp, false);
+    assert.equal(store.get("scrapeCosts/2026-11"), undefined);
+    assert.equal(await quiet(() => costs.backfillRecent(NOW)), 1);
+    assert.equal((store.get("scrapeCosts/2026-11") as any).totals.costUsd, 0.5);
+    assert.equal(store.get(`scrapeRuns/${doc.id}`)!.costRolledUp, true);
+    assert.equal(await costs.backfillRecent(NOW), 0); // idempotent
+    assert.equal((store.get("scrapeCosts/2026-11") as any).totals.costUsd, 0.5);
+  });
+
+  test("a normal run is flagged by the hook (nothing to backfill)", async () => {
+    const r = await runs.start({ kind: "visa", trigger: "scheduled", startedAtMs: NOW });
+    r.recordUsage({ sourceId: "GB", model: "deepseek-chat", usage: usage(1, 1), costUsd: 0.1 });
+    const doc = await quiet(() => r.finalize({ summary: { errors: 0 }, anySuccess: true }));
+    assert.equal(store.get(`scrapeRuns/${doc.id}`)!.costRolledUp, true);
+    assert.equal(await costs.backfillRecent(NOW), 0);
+  });
+
+  test("covers the current + previous month only, skips running docs, is bounded", async () => {
+    await runWithFailedHook(Date.parse("2026-10-31T23:00:00Z"), 0.2); // previous month
+    await runWithFailedHook(Date.parse("2026-09-15T00:00:00Z"), 0.3); // too old
+    store.set("scrapeRuns/live", { id: "live", kind: "visa", status: "running", costRolledUp: false, startedAt: Timestamp.fromMillis(NOW + 5000), usage: { extractions: 1, costUsd: 9 } });
+    await runWithFailedHook(NOW, 0.1);
+    await runWithFailedHook(NOW + 1000, 0.1);
+    assert.equal(await quiet(() => costs.backfillMonth("2026-11", 1)), 1); // bounded: 1 of 2
+    assert.equal(await quiet(() => costs.backfillRecent(NOW)), 2); // Oct run + the other Nov run
+    assert.equal((store.get("scrapeCosts/2026-10") as any).totals.costUsd, 0.2);
+    assert.equal((store.get("scrapeCosts/2026-11") as any).totals.costUsd, 0.2);
+    assert.equal(store.get("scrapeCosts/2026-09"), undefined);
+    assert.equal(store.get("scrapeRuns/live")!.costRolledUp, false);
+  });
+
+  test("the visa orchestrator backfills at the start of every tick (idle ticks too)", async () => {
+    await runWithFailedHook(NOW - 2 * 60 * 60 * 1000, 0.4);
+    // No due sources: an idle tick.
+    await quiet(() => crawl.runOrchestrator({ now: NOW, fetchFxRates: async () => ({ rates: {}, rateDate: "x" }) }));
+    assert.equal((store.get("scrapeCosts/2026-11") as any).totals.costUsd, 0.4);
   });
 });

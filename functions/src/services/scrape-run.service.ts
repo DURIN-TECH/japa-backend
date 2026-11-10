@@ -18,6 +18,7 @@ import {
   addPricedUsage,
   emptyBreakdown,
   emptyTotals,
+  isFiniteCost,
   roundUsd,
   type PricedUsage,
 } from "./scrape-cost-pricing";
@@ -247,7 +248,8 @@ export class ScrapeRunRecorder {
   recordRequests(provider: string, n: number, costUsd?: number): void {
     if (!(n > 0)) return;
     this.usage.requests[provider] = (this.usage.requests[provider] ?? 0) + n;
-    if (costUsd !== undefined && costUsd > 0) this.usage.costUsd = roundUsd(this.usage.costUsd + costUsd);
+    // A non-finite cost (bad price) is ignored: the requests stay counted.
+    if (isFiniteCost(costUsd) && costUsd > 0) this.usage.costUsd = roundUsd(this.usage.costUsd + costUsd);
   }
 
   /** The run's usage so far (a copy; for logging, e.g. the script's summary line). */
@@ -316,6 +318,8 @@ export class ScrapeRunRecorder {
       usage,
       costUsd: usage.costUsd,
       costBreakdown,
+      // #82 review: the rollup hook flips this to true (see backfillRecent).
+      costRolledUp: false,
       updatedAt: finishedAt,
     };
     // fatalError: set by fail(). Otherwise CLEARED, so a run the stale sweep

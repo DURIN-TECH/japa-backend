@@ -198,6 +198,12 @@ class VisaCatalogCrawlService {
     // `running` after 1h crashed or timed out -> mark it failed. Never throws.
     await runs.sweepStaleRuns(now.toMillis());
 
+    // ---- Cost rollup backfill (issue #82 review) ----
+    // Also on EVERY (hourly) tick: re-add finished runs of the current /
+    // previous month whose rollup hook failed. An empty indexed query when
+    // nothing failed; bounded; never throws. #83's hourly check may call it too.
+    await scrapeCostService.backfillRecent(now.toMillis());
+
     // Due = active AND nextCrawlAt <= now, oldest first (needs the composite
     // index status+nextCrawlAt — already in firestore.indexes.json).
     // DO NOT add a plain .limit() back here to bound reads: it is applied

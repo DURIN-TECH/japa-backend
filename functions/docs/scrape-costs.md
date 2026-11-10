@@ -21,8 +21,14 @@ Each call is recorded in four places:
 
 | Where | Fields |
 | --- | --- |
-| run page line `scrapeRuns/{id}.pages[]` | `usage`, `costUsd`, `model`, `promptVersion` (also on an `error` page after a billed call) |
-| visa doc `scrapeMeta` | `llmUsage`, `llmCostUsd`, `llmResponseModel` (when the API names a different model), plus the existing `model` and `extractorPromptVersion` |
+| run page line `scrapeRuns/{id}.pages[]` | `usage`, `costUsd`, `pricedAs`, `model`, `promptVersion` (also on an `error` page after a billed call) |
+| visa doc `scrapeMeta` | `llmUsage`, `llmCostUsd`, `llmPricedAs`, `llmResponseModel` (when the API names a different model), plus the existing `model` and `extractorPromptVersion` |
+
+**Which price applies**: the model the API says served the call (response
+`model`) is looked up first (by key or alias), then the requested model. The
+entry used is recorded as `pricedAs` (e.g. `deepseek-flash`). A cost that
+comes out non-finite is treated as **unpriced** (no `costUsd`,
+`unpricedExtractions` + 1), never as $0.
 | run doc | `usage`, `costUsd`, `costBreakdown.byCountry` / `.byModel` |
 | eval results file | per route `usage` / `costUsd`; file-level `usage`, `costUsd`, `pricing` |
 
@@ -86,8 +92,13 @@ Monday through Friday, excluding Chinese public holidays".
 
 Seeding: `seed-all` writes `DEFAULT_LLM_PRICING` (in
 `scrape-cost-pricing.ts`) when the doc is **absent** and never overwrites it.
-When the doc is missing or malformed, runs use the default table and the
-report says `pricing.origin: "default"`. To change prices: edit the doc (and
+When the doc is missing or malformed, runs use the default table (logged
+with `console.error`) and the report says `pricing.origin: "default"`.
+"Malformed" is strict: every model needs finite, non-negative peak prices,
+`sourceUrl` and `effectiveFrom`; an `offPeak` rate needs the same three
+prices **and** a valid `peakWindowsUtc` (0 <= startHour < endHour <= 24,
+non-empty ISO weekdays 1..7); `aliases` must be strings; `requestPricing`
+entries need a finite `perRequestUsd`. To change prices: edit the doc (and
 the default + its quote in code, so a fresh project seeds the same numbers),
 with `sourceUrl`, `effectiveFrom` and `verifiedAt`.
 
@@ -149,6 +160,16 @@ marker exists the run is skipped, so the rollup is **idempotent per runId**
   "updatedAt": Timestamp
 }
 ```
+
+**Backfill**: finalize writes `costRolledUp: false` on the run doc and the
+rollup transaction sets it `true` (with the marker). If the hook fails, the
+run stays `false`; `scrapeCostService.backfillRecent(nowMs)` re-applies such
+finished runs of the current and previous UTC month (`backfillMonth(month)`,
+at most 50 per month per call, oldest first; idempotent through the marker).
+It runs at the start of every hourly visa orchestrator tick (idle ticks
+included); #83's hourly check can call it too. Query: `costRolledUp == false`
++ `startedAt` range, index `scrapeRuns (costRolledUp ASC, startedAt ASC)` in
+`firestore.indexes.json`. Normally it matches nothing.
 
 `runs` in a country / model bucket = runs that touched it. News runs have no
 country (no LLM; their requests are in `byKind.news.requests`). Rollup docs

@@ -136,9 +136,13 @@ describe("ScrapeRunRecorder", () => {
     await r.finalize({ summary: { pagesFetched: 1, errors: 0, fxRefreshed: true }, anySuccess: true });
     const done = onlyRun();
     // Writes to the run doc only: since #82 the finalize hook also writes the
-    // monthly cost rollup (scrapeCosts/...), which is not the run record.
+    // monthly cost rollup (scrapeCosts/...) and flips the run's
+    // `costRolledUp` bookkeeping flag; neither is the run record's final write.
     assert.equal(
-      writes.slice(mark).filter((w) => w.path.startsWith("scrapeRuns/")).length,
+      writes
+        .slice(mark)
+        .filter((w) => w.path.startsWith("scrapeRuns/") && !(Object.keys(w.data).length === 1 && "costRolledUp" in w.data))
+        .length,
       1,
       "exactly one final write"
     );

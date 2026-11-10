@@ -15,6 +15,7 @@ import type {
 } from "../types/scrape-cost";
 import {
   DEFAULT_LLM_PRICING,
+  addMonths,
   addTotals,
   addTotalsMap,
   averageUsageOf,
@@ -53,6 +54,11 @@ import { safeErrorMessage, scrapeRunService, type ScrapeRunService } from "./scr
 // usage lived in the crashed process's memory and is lost (they rarely
 // reached the API, but a crash mid-crawl under-reports; see the doc).
 //
+// Backfill (#82 review): if the hook's transaction fails, the run doc keeps
+// `costRolledUp: false`; backfillRecent() (start of every visa orchestrator
+// tick, later #83's hourly check) re-applies such runs of the current and
+// previous month, bounded, idempotent through the marker.
+//
 // Errors never reach a scraper: the hook is isolated by the run service and
 // loadPricing() falls back to the default table on a read failure.
 
@@ -64,6 +70,12 @@ export const SCRAPE_BUDGET_DOC_ID = "scrapeBudget";
 export const SCRAPE_COST_MAX_MONTHS = 24;
 /** Default span (months, incl. the `to` month) when `from` is omitted. */
 export const SCRAPE_COST_DEFAULT_MONTHS = 6;
+/**
+ * Most un-rolled-up runs one backfill pass re-applies (#82 review). Normally
+ * zero: the finalize hook handles every run; this only catches runs whose
+ * hook failed (e.g. a transient Firestore error).
+ */
+export const ROLLUP_BACKFILL_MAX_RUNS = 50;
 /** Visa runs read to average usage per extraction (the re-extract estimate). */
 export const ESTIMATE_HISTORY_RUNS = 50;
 
@@ -123,26 +135,72 @@ function isTs(v: unknown): v is { toMillis(): number } {
   return Boolean(v) && typeof (v as { toMillis?: unknown }).toMillis === "function";
 }
 
+/** A finite, non-negative price. */
+function isPrice(v: unknown): boolean {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0;
+}
+
+/** The three token prices of a rate, all usable. */
+function isTokenPrices(v: unknown): boolean {
+  const p = v as Record<string, unknown> | null;
+  return Boolean(p) && typeof p === "object" && isPrice(p!.inputPer1M) && isPrice(p!.cachedInputPer1M) && isPrice(p!.outputPer1M);
+}
+
+/** An integer in [min, max]. */
+function isIntIn(v: unknown, min: number, max: number): boolean {
+  return typeof v === "number" && Number.isInteger(v) && v >= min && v <= max;
+}
+
+/** One peak window: 0 <= startHour < endHour <= 24, ISO weekdays 1..7 (non-empty). */
+function isHourWindow(v: unknown): boolean {
+  const w = v as Record<string, unknown> | null;
+  if (!w || typeof w !== "object") return false;
+  return (
+    isIntIn(w.startHour, 0, 23) &&
+    isIntIn(w.endHour, 1, 24) &&
+    (w.startHour as number) < (w.endHour as number) &&
+    Array.isArray(w.isoWeekdays) &&
+    w.isoWeekdays.length > 0 &&
+    w.isoWeekdays.every((d) => isIntIn(d, 1, 7))
+  );
+}
+
 /**
- * Minimal shape check of a stored price table: a `models` map whose entries
- * have the three numeric prices. A malformed doc is not used (default table
- * instead, logged) rather than costing runs at NaN.
+ * Shape check of a stored price table (#82 review: strict). Every model needs
+ * finite, non-negative peak prices, a sourceUrl and an effectiveFrom; an
+ * `offPeak` rate (when present) needs the same three prices, and then
+ * `peakWindowsUtc` must be a valid window list (else nothing would ever be
+ * peak); `aliases` must be strings. requestPricing entries need a finite
+ * perRequestUsd. A doc that fails is NOT used: loadPricing falls back to
+ * DEFAULT_LLM_PRICING with a console.error, so a bad edit can never turn
+ * into NaN -> a silent $0.
  */
 export function isValidPricingDoc(raw: unknown): raw is LlmPricingDoc {
   if (!raw || typeof raw !== "object") return false;
-  const models = (raw as { models?: unknown }).models;
-  if (!models || typeof models !== "object") return false;
-  return Object.values(models as Record<string, unknown>).every((m) => {
-    const p = m as Record<string, unknown>;
-    return (
-      p &&
-      typeof p.inputPer1M === "number" &&
-      typeof p.cachedInputPer1M === "number" &&
-      typeof p.outputPer1M === "number" &&
-      typeof p.sourceUrl === "string" &&
-      typeof p.effectiveFrom === "string"
-    );
+  const doc = raw as { models?: unknown; requestPricing?: unknown };
+  if (!doc.models || typeof doc.models !== "object") return false;
+  const modelsOk = Object.values(doc.models as Record<string, unknown>).every((m) => {
+    const p = m as Record<string, unknown> | null;
+    if (!p || typeof p !== "object" || !isTokenPrices(p)) return false;
+    if (typeof p.sourceUrl !== "string" || typeof p.effectiveFrom !== "string") return false;
+    if (p.aliases !== undefined && !(Array.isArray(p.aliases) && p.aliases.every((a) => typeof a === "string"))) return false;
+    if (p.offPeak !== undefined) {
+      if (!isTokenPrices(p.offPeak)) return false;
+      if (!Array.isArray(p.peakWindowsUtc) || !p.peakWindowsUtc.every(isHourWindow)) return false;
+    } else if (p.peakWindowsUtc !== undefined && !(Array.isArray(p.peakWindowsUtc) && p.peakWindowsUtc.every(isHourWindow))) {
+      return false;
+    }
+    return true;
   });
+  if (!modelsOk) return false;
+  if (doc.requestPricing !== undefined) {
+    if (!doc.requestPricing || typeof doc.requestPricing !== "object") return false;
+    const ok = Object.values(doc.requestPricing as Record<string, unknown>).every(
+      (r) => Boolean(r) && typeof r === "object" && isPrice((r as Record<string, unknown>).perRequestUsd)
+    );
+    if (!ok) return false;
+  }
+  return true;
 }
 
 /**
@@ -261,17 +319,83 @@ export class ScrapeCostService {
     const month = monthKeyUtc(run.startedAt.toMillis());
     const monthRef = collections.scrapeCosts.doc(month);
     const markerRef = monthRef.collection("runs").doc(run.id);
+    const runRef = collections.scrapeRuns.doc(run.id);
     return this.runTransaction(async (tx) => {
       // Reads first (Firestore transactions: all reads before writes).
       const marker = await tx.get(markerRef);
-      if (marker.exists) return false; // already counted: idempotent per runId
+      const runSnap = await tx.get(runRef);
+      // Flag the run doc as rolled up (#82 review: the backfill's query key),
+      // in the SAME transaction as the marker, so the two never disagree.
+      const flagRun = () => {
+        if (runSnap.exists && (runSnap.data() as Partial<ScrapeRunDoc>).costRolledUp !== true) {
+          tx.update(runRef, { costRolledUp: true });
+        }
+      };
+      if (marker.exists) {
+        // Already counted (idempotent per runId). Still flag the run, e.g. a
+        // late finalize after a stale sweep rewrote costRolledUp: false.
+        flagRun();
+        return false;
+      }
       const current = await tx.get(monthRef);
       const now = Timestamp.fromMillis(this.clock());
       const merged = mergeRunIntoMonth(current.exists ? current.data() : undefined, run, month, now);
       tx.set(monthRef, merged);
       tx.set(markerRef, { runId: run.id, kind: run.kind, costUsd: run.costUsd ?? 0, appliedAt: now });
+      flagRun();
       return true;
     });
+  }
+
+  /**
+   * Backfill one UTC month (#82 review): re-apply FINISHED runs whose rollup
+   * failed. Finalize writes `costRolledUp: false` and applyRun sets it true,
+   * so the query `costRolledUp == false AND startedAt in month` finds only
+   * runs whose hook failed (normally none: an empty, indexed query). Each is
+   * re-applied through applyRun, whose marker keeps it idempotent. Bounded
+   * at `max` runs per call (oldest first); the rest wait for the next call.
+   * Index: scrapeRuns (costRolledUp ASC, startedAt ASC). Never throws;
+   * returns how many runs were added.
+   */
+  async backfillMonth(month: string, max: number = ROLLUP_BACKFILL_MAX_RUNS): Promise<number> {
+    try {
+      const startMs = Date.parse(`${month}-01T00:00:00Z`);
+      const endMs = Date.parse(`${addMonths(month, 1)}-01T00:00:00Z`);
+      const snap = await collections.scrapeRuns
+        .where("costRolledUp", "==", false)
+        .where("startedAt", ">=", Timestamp.fromMillis(startMs))
+        .where("startedAt", "<", Timestamp.fromMillis(endMs))
+        .orderBy("startedAt", "asc")
+        .limit(max)
+        .get();
+      let added = 0;
+      for (const d of snap.docs) {
+        const run = { ...(d.data() as ScrapeRunDoc), id: d.id };
+        // Only finalised runs (finalize is what sets costRolledUp at all).
+        if (run.status === "running") continue;
+        try {
+          if (await this.applyRun(run)) added++;
+        } catch (err) {
+          console.error(`Scrape cost: backfill of run ${d.id} failed (retried next pass): ${safeErrorMessage(err)}`);
+        }
+      }
+      if (added > 0) console.warn(`Scrape cost: backfilled ${added} run(s) into scrapeCosts/${month}`);
+      return added;
+    } catch (err) {
+      console.error(`Scrape cost: backfill of ${month} failed: ${safeErrorMessage(err)}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Backfill the current and the previous UTC month (a run finalised just
+   * after midnight on the 1st belongs to the previous month). Called at the
+   * start of every hourly visa orchestrator tick (and, later, by #83's hourly
+   * check). Never throws; returns the number of runs added.
+   */
+  async backfillRecent(nowMs: number = this.clock()): Promise<number> {
+    const current = monthKeyUtc(nowMs);
+    return (await this.backfillMonth(addMonths(current, -1))) + (await this.backfillMonth(current));
   }
 
   // ---------- #83 reader (STABLE SHAPE) ----------

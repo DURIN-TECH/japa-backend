@@ -168,7 +168,15 @@ export function pricesAt(price: LlmModelPrice, atMs: number): LlmTokenPrices {
 
 /** Round a USD amount for storage (1e-8 USD; avoids float noise in sums). */
 export function roundUsd(v: number): number {
+  // A non-finite input (NaN / Infinity from a bad price) is returned as is:
+  // callers check isFiniteCost() and treat it as UNPRICED, never as $0.
+  if (!Number.isFinite(v)) return v;
   return Math.round(v * 1e8) / 1e8;
+}
+
+/** True for a usable cost: a finite number >= 0 (review fix, #82). */
+export function isFiniteCost(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0;
 }
 
 /** USD cost of `usage` at the given token prices. */
@@ -184,26 +192,33 @@ export interface PricedUsage {
   usage: LlmUsage;
   model: string; // requested model
   responseModel?: string;
-  costUsd?: number; // undefined = no price for this model
-  priceKey?: string; // the price-table entry used
+  costUsd?: number; // undefined = no price for this model (or the price was unusable)
+  // The price-table entry the call was costed with ("deepseek-flash"):
+  // recorded on the page line so a reader sees WHICH price applied.
+  pricedAs?: string;
   peak?: boolean; // which rate applied (only when priced)
 }
 
 /**
- * Price one usage report. The REQUESTED model is looked up first (that is
- * what we chose and what the table is keyed by), then the model the API says
- * served the call.
+ * Price one usage report. The model the API says SERVED the call
+ * (`responseModel`) is looked up first: it is what the provider bills (an
+ * alias such as deepseek-chat can be re-pointed to another model with another
+ * price). Then the requested model (by key or alias). The entry used is
+ * recorded as `pricedAs`. A cost that comes out non-finite (a bad price that
+ * slipped past validation) leaves the call UNPRICED, never $0.
  */
 export function priceUsageReport(report: LlmUsageReport, pricing: LlmPricingDoc | undefined): PricedUsage {
   const found =
-    findModelPrice(pricing, report.model) ?? (report.responseModel ? findModelPrice(pricing, report.responseModel) : undefined);
+    (report.responseModel ? findModelPrice(pricing, report.responseModel) : undefined) ??
+    findModelPrice(pricing, report.model);
   const out: PricedUsage = { usage: report.usage, model: report.model };
   if (report.responseModel) out.responseModel = report.responseModel;
   if (!found) return out;
-  const peak = isPeakAt(found.price, report.atMs);
-  out.costUsd = costAtPrices(report.usage, pricesAt(found.price, report.atMs));
-  out.priceKey = found.priceKey;
-  out.peak = peak;
+  const cost = costAtPrices(report.usage, pricesAt(found.price, report.atMs));
+  if (!isFiniteCost(cost)) return out; // unusable price -> unpriced
+  out.costUsd = cost;
+  out.pricedAs = found.priceKey;
+  out.peak = isPeakAt(found.price, report.atMs);
   return out;
 }
 
@@ -263,12 +278,14 @@ export function addTotals(a: CostTotals, b: CostTotals): CostTotals {
 /** Add one priced call into `t` (mutates). */
 export function addPricedUsage(t: CostTotals, p: PricedUsage): CostTotals {
   t.extractions++;
-  if (p.costUsd === undefined) t.unpricedExtractions++;
+  // A missing OR non-finite cost is unpriced: counted, never added as $0 / NaN.
+  const priced = isFiniteCost(p.costUsd);
+  if (!priced) t.unpricedExtractions++;
   t.promptTokens += p.usage.promptTokens;
   t.completionTokens += p.usage.completionTokens;
   t.cacheHitTokens += p.usage.cacheHitTokens;
   t.cacheMissTokens += p.usage.cacheMissTokens;
-  t.costUsd = roundUsd(t.costUsd + (p.costUsd ?? 0));
+  if (priced) t.costUsd = roundUsd(t.costUsd + (p.costUsd as number));
   return t;
 }
 
@@ -414,11 +431,13 @@ export function averageUsageOf(usages: Array<Partial<CostTotals> | undefined>): 
 export function pageUsageFields(
   p: PricedUsage | undefined,
   promptVersion: string
-): { usage?: LlmUsage; costUsd?: number; model?: string; promptVersion?: string } {
+): { usage?: LlmUsage; costUsd?: number; pricedAs?: string; model?: string; promptVersion?: string } {
   if (!p) return {};
   return {
     usage: { ...p.usage },
-    ...(p.costUsd !== undefined ? { costUsd: p.costUsd } : {}),
+    ...(isFiniteCost(p.costUsd) ? { costUsd: p.costUsd } : {}),
+    // Which price-table entry the cost used (review fix): absent when unpriced.
+    ...(p.pricedAs ? { pricedAs: p.pricedAs } : {}),
     model: p.model,
     promptVersion,
   };

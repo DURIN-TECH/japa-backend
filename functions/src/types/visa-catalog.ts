@@ -277,6 +277,8 @@ export interface VisaScrapeMeta {
   // The model the API says served the call, when it differs in name from
   // `model` (e.g. a dated Flash version behind "deepseek-chat").
   llmResponseModel?: string;
+  // The price-table entry the cost used ("deepseek-flash"); absent when unpriced.
+  llmPricedAs?: string;
 }
 
 // ----- Supplementary pages (issue #86) -----

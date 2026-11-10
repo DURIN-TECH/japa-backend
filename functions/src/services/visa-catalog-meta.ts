@@ -82,6 +82,7 @@ export function buildScrapeMeta(params: {
   if (params.llmUsage) {
     meta.llmUsage = { ...params.llmUsage.usage };
     if (params.llmUsage.costUsd !== undefined) meta.llmCostUsd = params.llmUsage.costUsd;
+    if (params.llmUsage.pricedAs) meta.llmPricedAs = params.llmUsage.pricedAs;
     if (params.llmUsage.responseModel && params.llmUsage.responseModel !== params.model) {
       meta.llmResponseModel = params.llmUsage.responseModel;
     }
