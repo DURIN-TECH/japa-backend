@@ -351,4 +351,11 @@ describe("pickSourceCrawlState", () => {
   test("brand-new country -> {} so defaults apply", () => {
     assert.deepEqual(pickSourceCrawlState(undefined), {});
   });
+
+  // Issue #64: a re-seed must not drop a host's retry-after time, or the next
+  // crawl would hit a host that asked us to wait.
+  test("keeps stored hostBackoffs", () => {
+    const hostBackoffs = [{ host: "www.gov.uk", until: "u", status: 429, recordedAt: "r" }];
+    assert.deepEqual(pickSourceCrawlState({ status: "active", hostBackoffs }), { status: "active", hostBackoffs });
+  });
 });

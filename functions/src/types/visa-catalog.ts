@@ -85,6 +85,17 @@ export interface CrawlWindow {
   endHour: number;
 }
 
+/**
+ * One stored host backoff on a `visaSources/{cc}` doc (issue #64). The
+ * Firestore form of `HostBackoffEntry` (services/visa-crawl-host-state.ts).
+ */
+export interface VisaSourceHostBackoff {
+  host: string; // lowercased host, e.g. "www.gov.uk"
+  until: Timestamp; // do not request the host before this instant
+  status: number; // the status that triggered it (429 | 503)
+  recordedAt: Timestamp; // tick time of the run that recorded it
+}
+
 // One registry entry per country. Holds the known official pages for that
 // country plus health/scheduling fields (mirrors the news `NewsSource`).
 export interface VisaSource {
@@ -110,6 +121,15 @@ export interface VisaSource {
   crawlWindow?: CrawlWindow;
   lastCrawledAt?: Timestamp;
   nextCrawlAt?: Timestamp;
+
+  // Crawler etiquette (issue #64): hosts of this source that answered 429/503
+  // and asked us (via Retry-After, or our default) not to come back before
+  // `until`. Crawler-owned (kept across re-seeds). The orchestrator skips any
+  // page on a listed host until then, and defers `nextCrawlAt` when EVERY page
+  // host is backed off past it. Expired entries are pruned on each run. Kept
+  // as an array of plain entries (not a host-keyed map: hosts contain dots,
+  // which are field-path separators) so #15 can move it to per-host docs.
+  hostBackoffs?: VisaSourceHostBackoff[];
 
   // Health / self-healing (auto-pause at 5 consecutive failures, like news).
   status: CrawlStatus;
