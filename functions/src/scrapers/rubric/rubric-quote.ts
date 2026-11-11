@@ -70,6 +70,23 @@ function isWordChar(ch: string | undefined): boolean {
   return ch !== undefined && /[\p{L}\p{N}]/u.test(ch);
 }
 
+/**
+ * Characters that continue one written token across a boundary: a hyphen, an
+ * apostrophe (both the ASCII and the typographic form), a percent sign, a
+ * plus sign and a slash. They join the parts of one token
+ * ("non-Bordurian", "applicant's", "20%", "+44", "and/or"), so a match may
+ * not start or end inside one. Without this, "Bordurian" is quoted out of
+ * "non-Bordurian" (the inverse of the rule), "eight days" out of
+ * "twenty-eight days" (a false threshold), and "applicant" out of
+ * "applicant's" (code review round 2, B1/B4/B6).
+ */
+const TOKEN_JOINERS = new Set(["-", "'", "’", "%", "+", "/"]);
+
+/** True for a character that is part of a token: a word character or a joiner. */
+function isTokenChar(ch: string | undefined): boolean {
+  return isWordChar(ch) || (ch !== undefined && TOKEN_JOINERS.has(ch));
+}
+
 /** True for an ASCII digit. */
 function isDigit(ch: string | undefined): boolean {
   return ch !== undefined && ch >= "0" && ch <= "9";
@@ -78,8 +95,11 @@ function isDigit(ch: string | undefined): boolean {
 /**
  * True when the occurrence of `needle` at `at` in `hay` starts and ends on a
  * token boundary:
- *  - if the needle starts (ends) with a letter or digit, the character before
- *    (after) it must not be a letter or digit;
+ *  - if the needle starts (ends) with a token character, the character before
+ *    (after) it must not be one either. A token runs through letters, digits
+ *    and the joiners hyphen, apostrophe, `%`, `+` and `/`, so a match cannot
+ *    begin or end inside "non-Bordurian", "applicant's", "20%", "+44" or
+ *    "and/or";
  *  - if it starts (ends) with a digit, it must not continue a number through
  *    a separator either ("028" out of "1,028", "1" out of "1.5"), and it may
  *    not start (end) with that separator between two digits.
@@ -88,8 +108,8 @@ function onTokenBoundary(hay: string, at: number, needle: string): boolean {
   const end = at + needle.length;
   const first = needle[0];
   const last = needle[needle.length - 1];
-  if (isWordChar(first) && isWordChar(hay[at - 1])) return false;
-  if (isWordChar(last) && isWordChar(hay[end])) return false;
+  if (isTokenChar(first) && isTokenChar(hay[at - 1])) return false;
+  if (isTokenChar(last) && isTokenChar(hay[end])) return false;
   if (isDigit(first) && (hay[at - 1] === "," || hay[at - 1] === ".") && isDigit(hay[at - 2])) return false;
   if (isDigit(last) && (hay[end] === "," || hay[end] === ".") && isDigit(hay[end + 1])) return false;
   // The same cut made one character over: a needle that starts (ends) with
