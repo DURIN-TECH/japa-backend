@@ -106,10 +106,22 @@ function isoOf(ts: { toDate?: () => Date } | null | undefined): string | null {
   return ts && typeof ts.toDate === "function" ? ts.toDate().toISOString() : null;
 }
 
-/** The full `data`: the stored document, without operational fields, and without `internalCall` for client-role callers. */
-export function serializeFull(assessment: ApplicationAssessment, role: string | undefined): unknown {
+/** Roles that may see who asked for a review (agent-side only; never an applicant). */
+const REQUESTER_VISIBLE_ROLES: readonly string[] = [ROLES.AGENT, ROLES.OWNER, ROLES.ADMIN];
+
+/**
+ * The full `data`: the stored document, without operational fields, and without
+ * `internalCall` for client-role callers.
+ *
+ * `requestedByName` (#43): a display string for who asked, for staff roles only.
+ * It is resolved by the controller (never the uid, which stays stripped with the
+ * rest of `requestedBy`) and added here only when the caller is staff, so an
+ * applicant's body never carries the key at all.
+ */
+export function serializeFull(assessment: ApplicationAssessment, role: string | undefined, requestedByName?: string | null): unknown {
   const visible: Record<string, unknown> = { ...(assessment as unknown as Record<string, unknown>) };
   for (const f of OPERATIONAL_FIELDS) delete visible[f];
+  if (role && REQUESTER_VISIBLE_ROLES.includes(role) && requestedByName) visible.requestedByName = requestedByName;
   if (role === ROLES.CLIENT) return stripKeyDeep(visible, "internalCall");
   return visible;
 }
@@ -119,7 +131,8 @@ export function envelope(
   assessment: ApplicationAssessment,
   tier: AssessmentTier,
   role: string | undefined,
-  staleReason: StaleReason | null
+  staleReason: StaleReason | null,
+  requestedByName?: string | null
 ): { meta: AssessmentMeta; data: FreeAssessmentData | unknown | null } {
   const meta: AssessmentMeta = {
     assessmentId: assessment.id,
@@ -134,5 +147,5 @@ export function envelope(
   };
   if (assessment.status !== "succeeded") return { meta, data: null };
   if (tier === "free") return { meta, data: serializeFree(assessment) };
-  return { meta, data: serializeFull(assessment, role) };
+  return { meta, data: serializeFull(assessment, role, requestedByName) };
 }

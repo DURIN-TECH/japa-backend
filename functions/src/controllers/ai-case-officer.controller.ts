@@ -116,7 +116,39 @@ export class AiCaseOfficerController {
   /** The envelope for one assessment, with the stale reason computed here, server-side. */
   private async envelopeFor(assessment: ApplicationAssessment, tier: "free" | "full", req: AuthenticatedRequest, app: Application) {
     const staleReason = await aiCaseOfficerService.staleReasonOf(app, assessment);
-    return envelope(assessment, tier, req.authz?.role, staleReason);
+    // Staff only (#43): a display name for who asked, never the uid. Applicants
+    // get nothing, so the lookup is skipped for them.
+    const requestedByName = await this.requesterNameFor(assessment, tier, req.authz?.role);
+    return envelope(assessment, tier, req.authz?.role, staleReason, requestedByName);
+  }
+
+  /**
+   * Display string for `requestedBy`, for staff roles on the full tier only.
+   * "System" for any non-manual trigger (or a "system" requester); otherwise the
+   * requester's agent display name, else their user name, else a generic label.
+   * Returns null for everyone else, so no key is serialised.
+   */
+  private async requesterNameFor(assessment: ApplicationAssessment, tier: "free" | "full", role: string | undefined): Promise<string | null> {
+    if (tier !== "full" || assessment.status !== "succeeded") return null;
+    if (role !== "agent" && role !== "owner" && role !== "admin") return null;
+    if (assessment.trigger !== "manual" || !assessment.requestedBy || assessment.requestedBy === "system") return "System";
+    try {
+      const agentSnap = await collections.agents.where("userId", "==", assessment.requestedBy).limit(1).get();
+      if (!agentSnap.empty) {
+        const name = (agentSnap.docs[0].data() as { displayName?: string }).displayName;
+        if (name) return name;
+      }
+      const userDoc = await collections.users.doc(assessment.requestedBy).get();
+      if (userDoc.exists) {
+        const u = userDoc.data() as { firstName?: string; lastName?: string };
+        const name = `${u.firstName || ""} ${u.lastName || ""}`.trim();
+        if (name) return name;
+      }
+    } catch (error) {
+      // A display-name lookup must never fail the read.
+      console.error("[ai-case-officer] requester name lookup failed:", error);
+    }
+    return "Unknown user";
   }
 }
 

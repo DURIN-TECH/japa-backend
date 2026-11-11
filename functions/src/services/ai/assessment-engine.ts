@@ -673,6 +673,8 @@ function groundFrom(c: AssessmentCriterion, detail: string, whatWouldHelp: strin
     title: c.title,
     kind: c.kind,
     isMandatoryBar: c.kind === "mandatory_bar",
+    // Stage comes from the rubric criterion, never from model text (#43).
+    stage: c.stage,
     ruleRef: c.ruleRef ?? null,
     sourceUrl: c.source.url,
     sourceQuote: c.source.quote,
@@ -757,6 +759,8 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
         title: c.title,
         kind: c.kind,
         isMandatoryBar: false,
+        // Stage comes from the rubric criterion, never from model text (#43).
+        stage: c.stage,
         ruleRef: c.ruleRef ?? null,
         sourceUrl: c.source.url,
         sourceQuote: c.source.quote,
