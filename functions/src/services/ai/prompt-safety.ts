@@ -104,4 +104,4 @@ export function findBannedWording(text: string): boolean {
 }
 
 /** Version of the prompts in this module and the engine. Recorded on every assessment. */
-export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-11.1";
+export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-11.2";

@@ -20,8 +20,10 @@ import {
   documentFieldsFor,
   evaluateObjective,
   extractionIsSuspicious,
+  hashStatementContent,
   judgementCriteriaOf,
   mandatoryBarHits,
+  numberStatementBlocks,
   parseExtraction,
   parseJudgement,
   topIssuesOf,
@@ -109,7 +111,10 @@ interface LoadedInputs {
   eligibilityAnswers: Record<string, unknown> | null;
   intake: Record<string, unknown>;
   documents: Array<{ id: string; path: string; updatedAtMs: number; sizeMb: number; label: string }>;
-  statements: Array<{ instanceId: string; version: number; text: string }>;
+  // `blocks` is one plain-text string per TOP-LEVEL ProseMirror block, in
+  // document order (index = the block's index in `content`); `contentHash`
+  // hashes the content itself so the input hash ignores bare version bumps.
+  statements: Array<{ instanceId: string; version: number; text: string; blocks: string[]; contentHash: string }>;
 }
 
 /** Statement categories that count as a statement. Template-level, never free text. */
@@ -236,6 +241,7 @@ function newAssessmentDoc(args: {
     credibilityFlags: [],
     strengths: [],
     statementFindings: [],
+    statement: null,
     insufficientInformation: [],
     suspiciousContent: [],
     confidence: null,
@@ -299,7 +305,17 @@ export class AiCaseOfficerService {
       const tpl = inst.templateId ? await collections.documentTemplates.doc(inst.templateId).get() : null;
       const category = tpl && tpl.exists ? (tpl.data() as { category?: string }).category : undefined;
       if (!category || !STATEMENT_CATEGORIES.has(category)) continue;
-      statements.push({ instanceId: d.id, version: inst.version ?? 0, text: plainTextOf(inst.content as ProseMirrorDoc | undefined) });
+      const doc = inst.content as ProseMirrorDoc | undefined;
+      // Top-level children only: the portal resolves `nodePath: [i]` as
+      // doc.content[i], so the numbering must use exactly this array.
+      const top = doc && Array.isArray((doc as { content?: unknown }).content) ? ((doc as { content: unknown[] }).content) : [];
+      statements.push({
+        instanceId: d.id,
+        version: inst.version ?? 0,
+        text: plainTextOf(doc),
+        blocks: top.map((b) => plainTextOf(b)),
+        contentHash: hashStatementContent(doc ?? null),
+      });
     }
     statements.sort((a, b) => (a.instanceId < b.instanceId ? -1 : 1));
 
@@ -321,7 +337,7 @@ export class AiCaseOfficerService {
     return {
       rubricVersion,
       documents: loaded.documents.map((d) => ({ path: `${d.id}:${d.path}`, updatedAtMs: d.updatedAtMs })),
-      statements: loaded.statements.map((s) => ({ instanceId: s.instanceId, version: s.version })),
+      statements: loaded.statements.map((s) => ({ instanceId: s.instanceId, contentHash: s.contentHash })),
       eligibilityAnswers: loaded.eligibilityAnswers,
       intake: loaded.intake,
     };
@@ -651,6 +667,13 @@ export class AiCaseOfficerService {
     let judgeUsage = zeroUsage();
     let judgeUsed = false;
     const statementText = loaded.statements.map((s) => s.text).filter(Boolean).join("\n\n");
+    // The ONE statement whose blocks are numbered and anchorable: the first (by
+    // instance id) that has any block. Others are sent unnumbered, so a note on
+    // them is stored without a position. `statement` records what was read.
+    const primary = loaded.statements.find((s) => s.blocks.length > 0) ?? null;
+    const numbered = primary ? numberStatementBlocks(primary.blocks) : null;
+    const otherText = loaded.statements.filter((s) => s !== primary).map((s) => s.text).filter(Boolean).join("\n\n");
+    const statementRef = primary ? { instanceId: primary.instanceId, version: primary.version } : null;
     if (statementText && findInjectionSignals(statementText)) {
       suspiciousContent.push({ source: "statement", documentId: null, page: null });
     }
@@ -660,7 +683,8 @@ export class AiCaseOfficerService {
       if (requests > settings.maxRequestsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its request cap");
       const request = buildJudgementRequest({
         rubric,
-        statementText: statementText || null,
+        statementText: numbered ? numbered.text : statementText || null,
+        otherStatementsText: otherText || null,
         profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. Nationality code: ${loaded.nationality ?? "not given"}.`,
         intakeSummary: JSON.stringify(loaded.intake),
         extractionSummary: extractions
@@ -677,7 +701,7 @@ export class AiCaseOfficerService {
         if (res.stopReason === "refusal") {
           judgementFailed = true;
         } else {
-          const parsed = parseJudgement(res.text, judgementCriteria.map((c) => c.criterionId));
+          const parsed = parseJudgement(res.text, judgementCriteria.map((c) => c.criterionId), numbered ? numbered.sentCount : 0);
           if (parsed.ok) judgement = parsed.output;
           else judgementFailed = true;
         }
@@ -694,6 +718,7 @@ export class AiCaseOfficerService {
       judgement,
       documents: extractions,
       statementReadable: statementText.trim().length > 0,
+      statement: statementRef,
       score,
       suspiciousDocumentIds: suspiciousContent.map((s) => s.documentId ?? "statement"),
       judgementFailed,
@@ -720,6 +745,10 @@ export class AiCaseOfficerService {
     // Items dropped by code (a criterion id the rubric does not contain, or model
     // text that broke the banned-wording list) are logged as a COUNT. The text is
     // never logged: it may carry an applicant's words.
+    if (content.unanchoredCount > 0) {
+      // A count only: never the text or the model's index values.
+      console.warn(`[ai-case-officer] assessment ${id}: ${content.unanchoredCount} statement finding(s) stored without a position`);
+    }
     if (content.droppedCount > 0) {
       console.warn(`[ai-case-officer] assessment ${id}: ${content.droppedCount} model item(s) dropped by code checks`);
     }
@@ -736,6 +765,7 @@ export class AiCaseOfficerService {
       credibilityFlags: content.credibilityFlags,
       strengths: content.strengths,
       statementFindings: content.statementFindings,
+      statement: content.statement,
       insufficientInformation: content.insufficientInformation,
       suspiciousContent,
       confidence: content.confidence,

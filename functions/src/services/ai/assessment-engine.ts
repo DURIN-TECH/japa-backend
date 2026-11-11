@@ -6,10 +6,12 @@ import type {
   ReadinessBand,
   RefusalGround,
   StageOutcomes,
+  StatementFinding,
+  StatementRef,
 } from "../../types/assessment";
 import type { LlmRequest } from "./llm-provider";
 import { AI_MODELS } from "./ai-models";
-import { DATA_ONLY_RULE, findBannedWording, findInjectionSignals, wrapUntrusted } from "./prompt-safety";
+import { DATA_ONLY_RULE, findBannedWording, findInjectionSignals, sanitizeUntrusted, wrapUntrusted, MAX_UNTRUSTED_CHARS } from "./prompt-safety";
 
 // ============================================
 // ASSESSMENT ENGINE — PURE CORE (issue #42)
@@ -84,9 +86,13 @@ export interface ObjectiveResult {
 export interface JudgementOutput {
   findings: Array<{ criterionId: string; detail: string; whatWouldHelp: string; concern: boolean }>;
   strengths: Array<{ criterionId: string; detail: string }>;
-  statementNotes: Array<{ criterionId: string; detail: string }>;
+  // `blockIndex` is the model's number for a statement block, ALREADY validated
+  // against the blocks that were sent: an integer in range, else null.
+  statementNotes: Array<{ criterionId: string; detail: string; blockIndex: number | null }>;
   suspiciousPassages: string[];
   dropped: number;
+  // Statement notes kept but stored without a position (missing or out-of-range index).
+  unanchored: number;
 }
 
 /** One stored assessment's content, before the job adds its record fields. */
@@ -95,7 +101,9 @@ export interface AssessmentContent {
   refusalGrounds: RefusalGround[];
   credibilityFlags: CredibilityFlag[];
   strengths: Array<{ criterionId: string; title: string; detail: string }>;
-  statementFindings: Array<{ criterionId: string; title: string; detail: string }>;
+  statementFindings: StatementFinding[];
+  // The statement that was read (null when none).
+  statement: StatementRef | null;
   insufficientInformation: InsufficientItem[];
   suspiciousDocumentIds: string[];
   score: number | null;
@@ -105,6 +113,8 @@ export interface AssessmentContent {
   // A mandatory bar applies (code-decided). Served to the free tier as a boolean.
   hasBlockingRule: boolean;
   droppedCount: number;
+  // Statement findings stored without `nodePath` (see JudgementOutput.unanchored).
+  unanchoredCount: number;
 }
 
 // ============================================
@@ -116,8 +126,9 @@ export interface AssessmentInputs {
   rubricVersion: number;
   // Document paths and their `updatedAt` (ms). A changed file changes the hash.
   documents: Array<{ path: string; updatedAtMs: number }>;
-  // Statement versions (DocumentInstance `version`).
-  statements: Array<{ instanceId: string; version: number }>;
+  // Statements, by CONTENT hash (see hashStatementContent), not by `version`:
+  // a version bump with identical text must not trigger a re-run (#36).
+  statements: Array<{ instanceId: string; contentHash: string }>;
   // Eligibility answers, as stored on the latest check (null when none).
   eligibilityAnswers: Record<string, unknown> | null;
   // Intake answers (#113). Empty until that feature stores them.
@@ -133,6 +144,11 @@ function canonical(value: unknown): string {
     .filter((k) => obj[k] !== undefined)
     .sort();
   return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical(obj[k])}`).join(",")}}`;
+}
+
+/** sha256 of a statement's ProseMirror content, key-order independent. */
+export function hashStatementContent(content: unknown): string {
+  return createHash("sha256").update(canonical(content)).digest("hex");
 }
 
 /**
@@ -487,6 +503,14 @@ export function polaritySentence(polarity: IntentPolarity | null): string {
  */
 export function judgementSchema(criterionIds: readonly string[]): Record<string, unknown> {
   const idEnum = [...criterionIds];
+  // A statement note also names the numbered block it is about. Only a number:
+  // the model never returns a path or a text span (code builds the path).
+  const statementNote = {
+    type: "object",
+    additionalProperties: false,
+    required: ["criterionId", "detail", "blockIndex"],
+    properties: { criterionId: { type: "string", enum: idEnum }, detail: { type: "string" }, blockIndex: { type: "integer" } },
+  };
   const pair = {
     type: "object",
     additionalProperties: false,
@@ -513,7 +537,7 @@ export function judgementSchema(criterionIds: readonly string[]): Record<string,
         },
       },
       strengths: { type: "array", items: pair },
-      statementNotes: { type: "array", items: pair },
+      statementNotes: { type: "array", items: statementNote },
       suspiciousPassages: { type: "array", items: { type: "string" } },
     },
   };
@@ -525,16 +549,51 @@ const JUDGEMENT_SYSTEM =
   "reasons. You do not decide the outcome, do not predict a decision, and do not " +
   "say that an applicant will or will not be approved, refused, granted or likely to " +
   "succeed. Name each criterion only by its id. Quote nothing you have not been given.\n" +
+  "The statement is shown as numbered blocks, each line starting [n]. For every " +
+  "statement note, set blockIndex to the number n of the one block the note is about. " +
+  "Use -1 when the note concerns the statement as a whole or text that is not numbered. " +
+  "Never write a path or copy text spans.\n" +
   DATA_ONLY_RULE;
 
 /** Inputs for the stage 3 request. Everything applicant-derived is wrapped. */
 export interface JudgementRequestInput {
   rubric: Pick<VisaRubric, "criteria" | "intentPolarity">;
+  // Numbered statement blocks (see numberStatementBlocks), or null.
   statementText: string | null;
+  // Text of any further statements: unnumbered, so notes on it cannot be anchored.
+  otherStatementsText?: string | null;
   profileSummary: string;
   intakeSummary: string;
   extractionSummary: string;
   objectiveSummary: string;
+}
+
+/** The statement as sent to the model: numbered text and how many blocks it holds. */
+export interface NumberedStatement {
+  text: string;
+  // Blocks that are actually in `text`. A block cut by the size cap is not
+  // counted, so a number the model could never have seen is never accepted.
+  sentCount: number;
+}
+
+/**
+ * Number the TOP-LEVEL blocks of a statement, one `[n] text` line each, n being
+ * the block's index in the document's `content` array. Why numbers and not
+ * paths or quotes: the model can only point at a block it was shown, and code
+ * turns that number into `nodePath` after range-checking it. Empty blocks keep
+ * their number (as an empty line) so indexes always match the real document.
+ */
+export function numberStatementBlocks(blockTexts: readonly string[]): NumberedStatement {
+  const lines: string[] = [];
+  let used = 0;
+  for (let i = 0; i < blockTexts.length; i++) {
+    // Sanitise per line so the size check below counts the escaped length.
+    const line = `[${i}] ${sanitizeUntrusted(blockTexts[i])}`;
+    if (used + line.length + 1 > MAX_UNTRUSTED_CHARS) break;
+    lines.push(line);
+    used += line.length + 1;
+  }
+  return { text: lines.join("\n"), sentCount: lines.length };
 }
 
 /** Build the stage 3 request. Rubric text is trusted data; applicant text is wrapped. */
@@ -558,7 +617,8 @@ export function buildJudgementRequest(input: JudgementRequestInput): LlmRequest 
     "\n" +
     wrapUntrusted(input.extractionSummary, "extraction") +
     "\n" +
-    wrapUntrusted(input.statementText ?? "(no statement)", "statement");
+    wrapUntrusted(input.statementText ?? "(no statement)", "statement") +
+    (input.otherStatementsText ? "\n" + wrapUntrusted(input.otherStatementsText, "other_statement") : "");
   return {
     role: "judgement",
     system: JUDGEMENT_SYSTEM,
@@ -577,7 +637,9 @@ export function buildJudgementRequest(input: JudgementRequestInput): LlmRequest 
  */
 export function parseJudgement(
   text: string,
-  criterionIds: readonly string[]
+  criterionIds: readonly string[],
+  // Number of numbered statement blocks that were sent (0 when none).
+  statementBlockCount = 0
 ): { ok: true; output: JudgementOutput } | { ok: false; reason: string } {
   let parsed: unknown;
   try {
@@ -628,16 +690,29 @@ export function parseJudgement(
     return out;
   };
   let strengths: Array<{ criterionId: string; detail: string }>;
-  let statementNotes: Array<{ criterionId: string; detail: string }>;
+  let statementNotes: JudgementOutput["statementNotes"];
+  let unanchored = 0;
   try {
     strengths = pairs(parsed.strengths as unknown[], "strengths");
-    statementNotes = pairs(parsed.statementNotes as unknown[], "statementNotes");
+    // Notes keep the pair checks (shape, known id, banned wording); the block
+    // index is then validated in code. An index that is not an integer inside
+    // the document that was sent is dropped to null, never clamped or guessed.
+    const rawNotes = parsed.statementNotes as unknown[];
+    statementNotes = [];
+    for (const raw of rawNotes) {
+      const [kept] = pairs([raw], "statementNotes");
+      if (!kept) continue;
+      const idx = (raw as Record<string, unknown>).blockIndex;
+      const valid = typeof idx === "number" && Number.isInteger(idx) && idx >= 0 && idx < statementBlockCount;
+      if (!valid) unanchored++;
+      statementNotes.push({ ...kept, blockIndex: valid ? (idx as number) : null });
+    }
   } catch (err) {
     return { ok: false, reason: `${(err as Error).message} breaks the shape` };
   }
 
   const suspiciousPassages = (parsed.suspiciousPassages as unknown[]).filter((p): p is string => typeof p === "string");
-  return { ok: true, output: { findings, strengths, statementNotes, suspiciousPassages, dropped } };
+  return { ok: true, output: { findings, strengths, statementNotes, suspiciousPassages, dropped, unanchored } };
 }
 
 // ============================================
@@ -657,6 +732,8 @@ export interface AssembleInput {
   judgement: JudgementOutput | null;
   documents: DocumentExtraction[];
   statementReadable: boolean;
+  // The statement the numbered blocks came from (null when none was read).
+  statement?: StatementRef | null;
   score: number | null;
   // Documents the statement and extraction saw as addressing the model.
   suspiciousDocumentIds: string[];
@@ -698,6 +775,8 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   const strengths: AssessmentContent["strengths"] = [];
   const statementFindings: AssessmentContent["statementFindings"] = [];
   let droppedCount = input.judgement?.dropped ?? 0;
+  let unanchoredCount = input.judgement?.unanchored ?? 0;
+  const statementRef = input.statement ?? null;
 
   const seenRefusal = new Set<string>();
   for (const c of input.mandatoryHits) {
@@ -770,7 +849,35 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     }
     for (const n of input.judgement.statementNotes) {
       const c = criterionById(rubric, n.criterionId);
-      if (c) statementFindings.push({ criterionId: c.criterionId, title: c.title, detail: n.detail });
+      // An unknown id was already dropped and counted in parseJudgement; this
+      // second check keeps assembly safe on its own.
+      if (!c) {
+        droppedCount++;
+        continue;
+      }
+      // `comment` is what the portal shows; re-checked here so banned wording
+      // can never reach an applicant through the new field.
+      if (findBannedWording(n.detail)) {
+        droppedCount++;
+        continue;
+      }
+      statementFindings.push({
+        criterionId: c.criterionId,
+        title: c.title,
+        comment: n.detail,
+        // Same text, so consumers that read `detail` keep working.
+        detail: n.detail,
+        // Everything below comes from the rubric criterion, never the model.
+        kind: c.kind,
+        stage: c.stage,
+        ruleRef: c.ruleRef ?? null,
+        sourceQuote: c.source.quote,
+        sourceUrl: c.source.url,
+        severity: c.severity,
+        statementVersion: statementRef ? statementRef.version : null,
+        // Already range-checked against the blocks sent. Absent when not valid.
+        ...(n.blockIndex !== null && statementRef ? { nodePath: [n.blockIndex] } : {}),
+      });
     }
   }
 
@@ -801,6 +908,7 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     credibilityFlags,
     strengths,
     statementFindings,
+    statement: statementRef,
     insufficientInformation: insufficient,
     suspiciousDocumentIds: input.suspiciousDocumentIds,
     score: input.score,
@@ -809,6 +917,7 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     internalCall: refusalGrounds.length > 0 ? "would_refuse" : "would_approve",
     hasBlockingRule: input.mandatoryHits.length > 0,
     droppedCount,
+    unanchoredCount,
   };
 }
 

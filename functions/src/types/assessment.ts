@@ -1,5 +1,5 @@
 import type { Timestamp } from "firebase-admin/firestore";
-import type { CriterionKind } from "./rubric";
+import type { CriterionKind, DecisionStage } from "./rubric";
 
 // ============================================
 // APPLICATION ASSESSMENT — TYPES (issue #42)
@@ -108,6 +108,42 @@ export interface CredibilityFlag {
   whatWouldHelp: string;
 }
 
+/**
+ * One finding about the applicant's statement, anchored to a block of it (#36).
+ *
+ * Everything except `comment`/`detail` and `nodePath` is copied by code from the
+ * rubric criterion or the statement record; the model supplies only the
+ * explanation and a block number, which code validates before storing a path.
+ */
+export interface StatementFinding {
+  criterionId: string;
+  title: string;
+  // The model's explanation. `detail` carries the same text so consumers
+  // written before `comment` existed keep working.
+  comment: string;
+  detail: string;
+  // ---- copied from the rubric criterion, never model text ----
+  kind: CriterionKind;
+  stage: DecisionStage;
+  ruleRef: string | null;
+  sourceQuote: string;
+  sourceUrl: string;
+  severity: string;
+  // The DocumentInstance `version` that was read. Null only when no statement
+  // was read (it cannot happen for a finding the model made about a statement).
+  statementVersion: number | null;
+  // Child indexes from the statement document root: `[blockIndex]` for a
+  // top-level block. ABSENT (not null, not []) when the model's block number
+  // was missing or out of range: a position is never guessed.
+  nodePath?: number[];
+}
+
+/** Which statement the findings were read from. */
+export interface StatementRef {
+  instanceId: string;
+  version: number;
+}
+
 /** A passage that addressed the model (injection). Stored, never shown. */
 export interface SuspiciousContentFlag {
   source: "document" | "statement";
@@ -159,7 +195,10 @@ export interface ApplicationAssessment {
   refusalGrounds: RefusalGround[];
   credibilityFlags: CredibilityFlag[];
   strengths: Array<{ criterionId: string; title: string; detail: string }>;
-  statementFindings: Array<{ criterionId: string; title: string; detail: string }>;
+  statementFindings: StatementFinding[];
+  // The statement read at assessment time (null when none). Findings'
+  // `nodePath` is only valid against this instance at this version.
+  statement: StatementRef | null;
   insufficientInformation: InsufficientItem[];
   suspiciousContent: SuspiciousContentFlag[];
   confidence: "high" | "medium" | "low" | null;
