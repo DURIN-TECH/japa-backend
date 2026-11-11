@@ -5,24 +5,27 @@
 // Run with `npm run test:emulator`. Uses @firebase/rules-unit-testing against
 // the Firestore emulator, which has loaded the repo's real ../firestore.rules.
 //
-// Both collections are written ONLY by the backend (Admin SDK, through the
-// API): no portal or mobile code writes either of them from a client SDK.
-// So the statement tested here is simple and is made one field at a time:
-//  - DENY: no signed-in user (the agency's owner, a member, the applicant,
-//    the assigned agent, a stranger) can create a document or change ANY
-//    field of one, whether the field is review-gated (`status`,
-//    `compliance`), an authority anchor (`ownerId`, `agentId`, `agencyId`),
-//    a counter (`totalAgents`) or an ordinary profile field (`name`);
-//  - ALLOW: the reads that existed before still work, so nothing that only
-//    reads these documents is affected.
-// The "allow" side of every owner-editable field is the API's job and is
-// tested in agency-authority.emu.ts (PUT /agencies/me).
+// Both collections are written by the backend (Admin SDK, through the API):
+// no portal or mobile code writes either of them from a client SDK.
+//  - agencies: the owner may write ONLY the owner-editable profile fields
+//    (the same allow-list as AGENCY_OWNER_EDITABLE_FIELDS / PUT
+//    /agencies/me). Every other field is server-written, one field at a time:
+//    review-gated (`status`, `compliance`, `reviewedBy/At`), authority
+//    anchors (`ownerId`, `ownerName`, `slug`), counters (`totalAgents`),
+//    server-managed (`logoUrl`, timestamps) and any field added later.
+//    Creation is backend-only.
+//  - applications: creation and every update are backend-only; no signed-in
+//    user (the applicant, the assigned agent, a stranger) can write any field.
+// The "allow" side of the application's editable fields (userNotes /
+// agentNotes) is the API's job. The agency equivalent is tested both here
+// (the rule) and in agency-authority.emu.ts (PUT /agencies/me).
 //
 // The field lists are spelled out here on purpose (not imported from the
 // rules or the services): the test is the independent statement of what a
-// client must not be able to write.
+// client must and must not be able to write.
 
 import { test, describe, before, after, beforeEach } from "node:test";
+import assert from "node:assert/strict";
 import { assertFails, assertSucceeds } from "@firebase/rules-unit-testing";
 
 import { clientDb, rulesEnv, withoutRules } from "./helpers";
@@ -64,10 +67,25 @@ const AGENCY_DOC = {
 };
 
 /**
- * Every agency field, with a value a client might try to write. Grouped only
- * for the reader: the rule is the same for all of them (backend-only).
+ * The fields the owner MAY write from a client SDK (issue #138): the same
+ * list the API copies on PUT /agencies/me. Spelled out here on purpose, so a
+ * change to the rule has to be a change to this test too.
  */
-const AGENCY_FIELDS: Record<string, unknown> = {
+const AGENCY_OWNER_EDITABLE_FIELDS: Record<string, unknown> = {
+  name: "Renamed",
+  address: "2 Other Street",
+  state: "Abuja",
+  description: "Changed",
+  consultationFee: 1,
+  services: [],
+};
+
+/**
+ * Every agency field a client must NOT be able to write, with a value a client
+ * might try. Grouped only for the reader: the rule is hasOnly(the editable
+ * list), so all of these are refused, known today or added later.
+ */
+const AGENCY_PROTECTED_FIELDS: Record<string, unknown> = {
   // ---- review-gated ----
   status: "approved",
   compliance: { status: "verified" },
@@ -89,15 +107,8 @@ const AGENCY_FIELDS: Record<string, unknown> = {
   activeCases: 0,
   // ---- server-managed ----
   createdAt: new Date(),
-  logoUrl: "https://example.invalid/x.png",
-  // ---- owner-editable, but only through PUT /agencies/me ----
-  name: "Renamed",
-  address: "2 Other Street",
-  state: "Abuja",
-  description: "Changed",
-  consultationFee: 1,
-  services: [],
   updatedAt: new Date(),
+  logoUrl: "https://example.invalid/x.png",
   // ---- a field nobody has thought of yet ----
   somethingNew: true,
 };
@@ -191,16 +202,59 @@ beforeEach(async () => {
 // agencies/{agencyId}
 // ============================================
 
-describe("agencies/{agencyId}: update is backend-only", () => {
-  for (const [field, value] of Object.entries(AGENCY_FIELDS)) {
+describe("agencies/{agencyId}: the owner may edit exactly the owner-editable profile", () => {
+  /** Read the stored agency with rules off (what the write actually saved). */
+  async function storedAgency(): Promise<Record<string, unknown>> {
+    let data: Record<string, unknown> = {};
+    await withoutRules(async (db) => {
+      const snap = await db.collection("agencies").doc(AGENCY).get();
+      data = snap.data() ?? {};
+    });
+    return data;
+  }
+
+  for (const [field, value] of Object.entries(AGENCY_OWNER_EDITABLE_FIELDS)) {
+    test(`ALLOW the owner updating ${field}`, async () => {
+      await assertSucceeds((await asOwner()).collection("agencies").doc(AGENCY).update({ [field]: value }));
+      assert.deepEqual((await storedAgency())[field], value);
+    });
+  }
+
+  test("ALLOW several owner-editable fields in one update, leaving everything else alone", async () => {
+    await assertSucceeds(
+      (await asOwner()).collection("agencies").doc(AGENCY).update({
+        name: "Renamed",
+        address: "2 Other Street",
+        consultationFee: 30000,
+      })
+    );
+    const after = await storedAgency();
+    assert.equal(after.name, "Renamed");
+    assert.equal(after.address, "2 Other Street");
+    assert.equal(after.consultationFee, 30000);
+    // The protected fields are untouched.
+    assert.equal(after.status, AGENCY_DOC.status);
+    assert.equal(after.ownerId, OWNER);
+    assert.equal(after.totalAgents, AGENCY_DOC.totalAgents);
+  });
+});
+
+describe("agencies/{agencyId}: every other field is server-written", () => {
+  for (const [field, value] of Object.entries(AGENCY_PROTECTED_FIELDS)) {
     test(`DENY the owner updating ${field}`, async () => {
       await assertFails((await asOwner()).collection("agencies").doc(AGENCY).update({ [field]: value }));
     });
   }
 
-  test("DENY a protected field hidden in an otherwise harmless update", async () => {
+  test("DENY a protected field hidden in an otherwise allowed update", async () => {
     await assertFails(
       (await asOwner()).collection("agencies").doc(AGENCY).update({ description: "hi", status: "approved" })
+    );
+    await assertFails(
+      (await asOwner())
+        .collection("agencies")
+        .doc(AGENCY)
+        .update({ name: "Renamed", totalAgents: -50 })
     );
   });
 
@@ -213,6 +267,15 @@ describe("agencies/{agencyId}: update is backend-only", () => {
   test("DENY a member or a stranger updating the agency", async () => {
     await assertFails((await asMember()).collection("agencies").doc(AGENCY).update({ name: "Mine now" }));
     await assertFails((await asStranger()).collection("agencies").doc(AGENCY).update({ ownerId: STRANGER }));
+    // Even an otherwise owner-editable field.
+    await assertFails((await asMember()).collection("agencies").doc(AGENCY).update({ description: "hi" }));
+  });
+
+  test("DENY a signed-in non-owner who happens to hold the owner claim of this agency", async () => {
+    // The rule reads the RECORD (resource.data.ownerId), not the claim: a
+    // stale or forged claim must not turn into write access.
+    const forged = await clientDb(STRANGER, { role: "owner", agencyId: AGENCY });
+    await assertFails(forged.collection("agencies").doc(AGENCY).update({ name: "Mine now" }));
   });
 });
 
@@ -234,22 +297,30 @@ describe("agencies/{agencyId}: create is backend-only", () => {
   for (const [field, value] of Object.entries({
     status: "approved",
     compliance: { status: "verified" },
+    ownerId: STRANGER,
+    ownerName: "Someone",
     totalAgents: 0,
+    totalCases: 0,
     reviewedBy: "admin-uid",
+    slug: "taken",
+    logoUrl: "https://example.invalid/x.png",
   })) {
     test(`DENY a client create carrying ${field}`, async () => {
       await assertFails(
         (await asStranger())
           .collection("agencies")
           .doc("agency-new")
-          .set({ id: "agency-new", name: "New", ownerId: STRANGER, [field]: value })
+          .set({ id: "agency-new", name: "New", [field]: value })
       );
     });
   }
 
-  test("DENY even the minimal create (name + own ownerId)", async () => {
+  test("DENY even the minimal create: only the owner-editable profile", async () => {
     await assertFails(
-      (await asStranger()).collection("agencies").doc("agency-new").set({ name: "New", ownerId: STRANGER })
+      (await asStranger())
+        .collection("agencies")
+        .doc("agency-new")
+        .set({ name: "New", address: "1 Road", services: [] })
     );
   });
 });

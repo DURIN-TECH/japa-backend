@@ -319,33 +319,61 @@ service cloud.firestore {
                      request.auth.uid in resource.data.agentIds ||
                      isAdmin());
 
-      // ---- Agencies are written ONLY by the backend (issue #138) ----
-      // Every create and update goes through the API (Admin SDK, which
-      // bypasses these rules). No portal or mobile code writes this
-      // collection from a client SDK, so nothing legitimate is lost.
-      //
-      // Why backend-only rather than an allow-list: the agency record is what
-      // the backend trusts for
+      // ---- Owner-editable agency profile (ALLOW-LIST, issue #138) ----
+      // The ONLY fields the owner may change from a client SDK. This list is
+      // the same one the API copies (AGENCY_OWNER_EDITABLE_FIELDS in
+      // functions/src/services/agency.service.ts).
+      function ownerEditableAgencyFields() {
+        return [
+          'name',
+          'address',
+          'state',
+          'description',
+          'consultationFee',
+          'services'
+        ];
+      }
+
+      // The agency's owner, as recorded on the document (not by claim): the
+      // claim is derived from this field, so only the record may name it.
+      function isRecordedOwner() {
+        return isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      }
+
+      // ---- Creation is backend-only (issue #138) ----
+      // Creating an agency starts the owner's role, the admin's review queue
+      // and the seat count. It goes through owner onboarding or POST
+      // /agencies (Admin SDK), which always writes `pending_review`, no
+      // compliance file, one member and a server-generated slug. A client
+      // create would have to name its own ownerId and seat count, so it is
+      // refused outright.
+      allow create: if false;
+
+      // ---- Update: the owner-editable profile and nothing else ----
+      // `diff().affectedKeys().hasOnly(...)` makes every other field
+      // server-written, whether or not anybody has thought of it yet:
+      //  - status (+ reviewedBy, reviewedAt, rejectionReason): the admin's
+      //    admission decision (public page, admin review queue);
+      //  - compliance (the whole KYC/KYB/payout file, either key or any
+      //    nested field, and its review metadata): the gate on payment
+      //    requests and on taking platform clients. Its fields are edited
+      //    through /agencies/me/compliance, which locks the file once
+      //    submitted;
       //  - ownerId: the ownership anchor. The role lookup grants the owner
       //    role only when the agency names the user (claims.service.ts), and
       //    the owner endpoints check it;
-      //  - status (+ reviewedBy, reviewedAt, rejectionReason): the admin's
-      //    admission decision (public page, admin review queue);
-      //  - compliance (the whole KYC/KYB/payout file, its status and review
-      //    metadata): the gate on payment requests and on taking platform
-      //    clients. Its fields are edited through /agencies/me/compliance,
-      //    which locks the file once submitted;
+      //  - ownerName, slug, id: server-managed identity;
       //  - totalAgents: the seat check on invitations counts from it;
       //    totalCases / activeCases: stats;
-      //  - slug, id, ownerName, logoUrl, createdAt: server-managed (the logo
-      //    is set only through the logo upload endpoints).
-      // What an owner may edit (name, address, state, description,
-      // consultationFee, services) is edited through PUT /agencies/me, which
-      // copies exactly those fields (AGENCY_OWNER_EDITABLE_FIELDS in
-      // functions/src/services/agency.service.ts). Creating an agency goes
-      // through owner onboarding or POST /agencies, which always start it as
-      // `pending_review` with no compliance file.
-      allow create, update: if false;
+      //  - logoUrl: set only by the logo endpoints, after validating the
+      //    upload (issue #141);
+      //  - createdAt / updatedAt: timestamps the server writes.
+      // A document overwrite that drops a protected field is refused too:
+      // the removed key appears in affectedKeys(). The API applies the same
+      // allow-list and type checks (PUT /agencies/me).
+      allow update: if isRecordedOwner() &&
+                      request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(ownerEditableAgencyFields());
 
       // Only admin can delete agencies
       allow delete: if isAdmin();
