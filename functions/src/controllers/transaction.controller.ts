@@ -141,36 +141,26 @@ export class TransactionController {
         return;
       }
 
-      // Access check: admin, the agent on the transaction, or same agency
-      const isAdmin = !!req.user?.admin;
+      // Access check: admin, the agent on the transaction, or same agency.
+      // The caller's role and agency come from the resolved principal
+      // (req.authz, built from custom claims), never from the caller's own
+      // agent document (issue #135).
+      const isAdmin = req.authz?.role === ROLES.ADMIN || req.user?.admin === true;
       const isAgent = transaction.agentId === userId;
 
       if (!isAdmin && !isAgent) {
-        // Check same agency
-        const agent = await this.getAgentForUser(userId);
-        if (!agent?.agencyId) {
+        // Same agency: the caller must belong to an agency...
+        const callerAgencyId = req.authz?.agencyId;
+        if (!callerAgencyId || !transaction.agentId) {
           sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
           return;
         }
 
-        // Check if the transaction's agent is in the same agency
-        if (transaction.agentId) {
-          const txnAgentSnapshot = await collections.agents
-            .where("userId", "==", transaction.agentId)
-            .limit(1)
-            .get();
-
-          if (txnAgentSnapshot.empty) {
-            sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
-            return;
-          }
-
-          const txnAgent = txnAgentSnapshot.docs[0].data() as Agent;
-          if (txnAgent.agencyId !== agent.agencyId) {
-            sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
-            return;
-          }
-        } else {
+        // ...and the transaction's agent must be in that same agency. (This
+        // reads the OTHER party's agent document, to learn which agency the
+        // transaction belongs to; it grants the caller nothing by itself.)
+        const txnAgent = await this.getAgentForUser(transaction.agentId);
+        if (!txnAgent?.agencyId || txnAgent.agencyId !== callerAgencyId) {
           sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
           return;
         }

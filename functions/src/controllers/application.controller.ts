@@ -11,7 +11,7 @@ import { authController } from "./auth.controller";
 import { collections, auth } from "../utils/firebase";
 import { can, asSubject, checkWithinLimit, paymentRequired } from "../middleware/authz";
 import { complianceService } from "../services/compliance.service";
-import { LIMITS } from "@durin-tech/authz";
+import { LIMITS, ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
@@ -22,7 +22,6 @@ import {
 import {
   Application,
   ApplicationStatus,
-  Agent,
   NotificationChannel,
 } from "../types";
 
@@ -440,13 +439,14 @@ export class ApplicationController {
         }
         applications = await applicationService.getAllApplications();
       } else if (role === "owner") {
-        // Agency owner: see all agency cases
-        const agent = await this.getAgentForUser(userId);
-        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+        // Agency owner: see all agency cases. The owner role AND the agency
+        // come from the resolved principal (req.authz, built from custom
+        // claims), never from the caller's agent document (issue #135).
+        if (req.authz?.role !== ROLES.OWNER || !req.authz.agencyId) {
           sendError(res, "FORBIDDEN", "Agency owner access required", 403);
           return;
         }
-        applications = await applicationService.getAgencyApplications(agent.agencyId);
+        applications = await applicationService.getAgencyApplications(req.authz.agencyId);
       } else if (role === "agent") {
         // Agent: see cases assigned to them
         applications = await applicationService.getAgentApplications(userId);
@@ -998,19 +998,6 @@ export class ApplicationController {
     } catch {
       return undefined;
     }
-  }
-
-  /**
-   * Get agent document for a userId
-   */
-  private async getAgentForUser(userId: string): Promise<Agent | null> {
-    const snapshot = await collections.agents
-      .where("userId", "==", userId)
-      .limit(1)
-      .get();
-
-    if (snapshot.empty) return null;
-    return snapshot.docs[0].data() as Agent;
   }
 }
 
