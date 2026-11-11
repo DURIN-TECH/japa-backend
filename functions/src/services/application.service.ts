@@ -15,6 +15,9 @@ import {
 import { Timestamp } from "firebase-admin/firestore";
 import { visaService } from "./visa.service";
 import { noteService } from "./note.service";
+// Case-start rule for agency visas (issue #102). Imported from its file, not
+// the agency-visas index, so this service does not pull in routes.
+import { canStartCaseOnVisa } from "../agency-visas/agency-visa-access";
 
 export interface CreateApplicationInput {
   visaTypeId: string;
@@ -57,14 +60,21 @@ class ApplicationService {
     userId: string,
     input: CreateApplicationInput
   ): Promise<Application> {
-    // Verify visa type exists
-    const visaType = await visaService.getVisaType(
+    // Resolve agencyId from the agent if mode is "agent". Done FIRST (issue
+    // #102): which agency the case belongs to decides whether it may be
+    // started on an agency-only visa.
+    const agencyId = await this.resolveAgentAgencyId(input.agentId);
+
+    // Verify the visa exists AND may be used for this case (issue #102):
+    // refused when the visa is draft / pending / rejected / inactive, or
+    // agency-only and the case does not belong to the owning agency. The
+    // refusal is the same error as an unknown id (controllers answer 404),
+    // so a hidden visa's existence never leaks. Nothing is written.
+    const visaType = await this.getStartableVisa(
       input.countryCode,
-      input.visaTypeId
+      input.visaTypeId,
+      agencyId
     );
-    if (!visaType) {
-      throw new Error("Visa type not found");
-    }
 
     // Get requirements to count required documents
     const requirements = await visaService.getRequirements(
@@ -92,18 +102,6 @@ class ApplicationService {
         : "");
     const clientEmail = input.clientEmailOverride || userData?.email || "";
     const clientPhone = input.clientPhoneOverride || userData?.phone || undefined;
-
-    // Resolve agencyId from the agent if mode is "agent"
-    let agencyId: string | undefined;
-    if (input.agentId) {
-      const agentSnapshot = await collections.agents
-        .where("userId", "==", input.agentId)
-        .limit(1)
-        .get();
-      if (!agentSnapshot.empty) {
-        agencyId = (agentSnapshot.docs[0].data()).agencyId;
-      }
-    }
 
     const docRef = collections.applications.doc();
     const now = Timestamp.now();
@@ -160,6 +158,45 @@ class ApplicationService {
     });
 
     return application;
+  }
+
+  /**
+   * The agency a case belongs to, from its agent: the `agencyId` of the
+   * agent doc whose `userId` is `agentUid`. Undefined for a case with no
+   * agent, an unknown agent, or an independent agent (no agency).
+   */
+  async resolveAgentAgencyId(agentUid: string | undefined): Promise<string | undefined> {
+    if (!agentUid) return undefined;
+    const agentSnapshot = await collections.agents
+      .where("userId", "==", agentUid)
+      .limit(1)
+      .get();
+    if (agentSnapshot.empty) return undefined;
+    return (agentSnapshot.docs[0].data()).agencyId || undefined;
+  }
+
+  /**
+   * Read the visa a new case is for and check it may be used (issue #102,
+   * `canStartCaseOnVisa`): public visas for any case; an approved, active,
+   * agency-only visa only for a case of the owning agency; nothing else.
+   *
+   * Throws `Error("Visa type not found")` both for an unknown id and for a
+   * refused visa, so callers answer the same 404 and existence never leaks.
+   * Also used by `POST /applications/for-client` BEFORE it provisions a
+   * client account, so a refused visa creates nothing at all.
+   *
+   * @param caseAgencyId the agency the new case will belong to (or none)
+   */
+  async getStartableVisa(
+    countryCode: string,
+    visaTypeId: string,
+    caseAgencyId: string | null | undefined
+  ) {
+    const visaType = await visaService.getVisaType(countryCode, visaTypeId);
+    if (!visaType || !canStartCaseOnVisa(visaType, caseAgencyId)) {
+      throw new Error("Visa type not found");
+    }
+    return visaType;
   }
 
   /**
