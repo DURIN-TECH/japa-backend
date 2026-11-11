@@ -3,7 +3,7 @@
 // ============================================
 //
 // Loaded with `--import ./test/emulator/setup.ts` by `npm run test:emulator`
-// (which starts the Auth + Firestore emulators through `firebase
+// (which starts the Auth + Firestore + Storage emulators through `firebase
 // emulators:exec` with ../firebase.emulator-test.json, i.e. on ports that do
 // not collide with a developer's normal emulators).
 //
@@ -14,8 +14,9 @@
 // is imported, unless:
 //  1. every project id in the environment starts with `demo-` (Firebase's
 //     prefix for a project that can never be a real one), and
-//  2. FIRESTORE_EMULATOR_HOST and FIREBASE_AUTH_EMULATOR_HOST are both set
-//     and both point at this machine.
+//  2. FIRESTORE_EMULATOR_HOST, FIREBASE_AUTH_EMULATOR_HOST and
+//     FIREBASE_STORAGE_EMULATOR_HOST (added for #141) are all set and all
+//     point at this machine.
 // It also drops ambient credentials, so even a bug could not authenticate
 // against a real project.
 //
@@ -59,12 +60,20 @@ if (projectIds.length === 0) refuse("no project id is set (GCLOUD_PROJECT).");
 const bad = projectIds.filter((id) => !id.startsWith("demo-"));
 if (bad.length > 0) refuse(`project id must start with demo- (got ${bad.join(", ")}).`);
 
-// ---- 2. Both emulators must be configured, and local.
+// ---- 2. Every emulator the tests use must be configured, and local.
 if (!isLocal(process.env.FIRESTORE_EMULATOR_HOST)) {
   refuse(`FIRESTORE_EMULATOR_HOST must be a local address (got ${process.env.FIRESTORE_EMULATOR_HOST}).`);
 }
 if (!isLocal(process.env.FIREBASE_AUTH_EMULATOR_HOST)) {
   refuse(`FIREBASE_AUTH_EMULATOR_HOST must be a local address (got ${process.env.FIREBASE_AUTH_EMULATOR_HOST}).`);
+}
+
+// The Storage emulator (issue #141): the Admin SDK's bucket calls (exists,
+// save, delete) go wherever this variable points, so it gets the same check.
+if (!isLocal(process.env.FIREBASE_STORAGE_EMULATOR_HOST)) {
+  refuse(
+    `FIREBASE_STORAGE_EMULATOR_HOST must be a local address (got ${process.env.FIREBASE_STORAGE_EMULATOR_HOST}).`
+  );
 }
 
 // ---- 3. No ambient credentials, no metadata-server probing.

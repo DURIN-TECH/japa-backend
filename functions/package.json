@@ -31,7 +31,7 @@
     "backfill:visas": "npm run build && node lib/scripts/backfill-visa-ownership.js",
     "backfill:visas:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-visa-ownership.js",
     "test": "tsc -p tsconfig.test.json && node --import tsx --import ./test/helpers/setup.ts --test 'test/**/*.test.ts'",
-    "test:emulator": "firebase emulators:exec --config ../firebase.emulator-test.json --project demo-seli-emulator-test --only auth,firestore \"node --import tsx --import ./test/emulator/setup.ts --test --test-concurrency=1 'test/emulator/*.emu.ts'\"",
+    "test:emulator": "firebase emulators:exec --config ../firebase.emulator-test.json --project demo-seli-emulator-test --only auth,firestore,storage \"node --import tsx --import ./test/emulator/setup.ts --test --test-concurrency=1 'test/emulator/*.emu.ts'\"",
     "eval:visa-extract": "node --env-file-if-exists=.env.local --import tsx src/scrapers/visa-catalog/eval/run.ts",
     "eval:record": "node --import tsx src/scrapers/visa-catalog/eval/record.ts",
     "lint": "eslint --ext .ts src/ test/",
