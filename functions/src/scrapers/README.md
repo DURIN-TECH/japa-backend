@@ -74,6 +74,22 @@ scrapers/
     guidance-source.{controller,routes}.ts   GET /admin/guidance-sources (admin-only list)
     data/                              seed-guidance-sources.ts: entries (data) + validator + loader
     scripts/                           seed-guidance-sources (CLI, dry run by default)
+  rubric/                              visa rubrics (#40): guidance snapshots -> cited, versioned,
+                                       machine-checkable criteria, staged `pending_review`.
+                                       Types live in src/types/rubric.ts. Not scheduled, no routes.
+    rubric-extraction.service.ts       orchestrator: settings (fail closed) -> hash gate -> chunk ->
+                                       one model call per chunk -> validate in code -> merge ->
+                                       version N+1 (pending) + run record
+    rubric-quote.ts                    verbatim quote lookup in a snapshot (per page for PDFs);
+                                       numbers / dates / units must be in the quote
+    rubric-chunk.ts                    bounded, deterministic chunks (whole pages / paragraphs)
+    rubric-prompt.ts                   constant system prompt, delimited data frame, output JSON
+                                       schema + the in-code schema check of the answer
+    rubric-validate.ts                 structural validator (kind rules, id joins, intent flag)
+    rubric.store.ts                    visaRubrics head + rubricVersions; writes pending only;
+                                       getApprovedRubric is the only consumer read
+    rubric-settings.ts                 appConfig/rubricExtractionSettings: kill switch + caps
+    scripts/                           extract-rubric (CLI, dry run by default)
 ```
 
 Tests mirror this layout under `functions/test/scrapers/`; shared test helpers
