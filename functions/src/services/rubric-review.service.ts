@@ -4,11 +4,13 @@ import { collectionGroups, collections, db, subcollections } from "../utils/fire
 // ESLint boundary rule of issue #91 refuses deep imports from here).
 import { SnapshotQuoteIndex, guidanceSnapshotStore, rubricStore, validateVisaRubric } from "../scrapers";
 import type { GuidanceSnapshotContent } from "../scrapers/types";
+import type { RubricIssue } from "../scrapers/rubric/rubric-validate";
 import {
   INTENT_POLARITIES,
   RUBRIC_REVIEW_FIELDS,
   RUBRIC_REVIEW_STATUSES,
   type AssessmentCriterion,
+  type EvidenceItem,
   type IntentPolarity,
   type RubricCitation,
   type RubricFlag,
@@ -190,6 +192,7 @@ export type RubricReviewErrorCode =
   | "CITATION_UNVERIFIABLE" // 409: a quote could not be checked (fails closed)
   | "SOURCE_CHANGED" // 409: a source moved between the check and the write
   | "RUBRIC_INVALID" // 409: the structural validator refuses the rubric
+  | "RUBRIC_MALFORMED" // 422: the stored document is not a rubric (no criteria list)
   | "FLAGS_NOT_ACKNOWLEDGED"; // 409: a blocking flag was not acknowledged
 
 /** A refusal with its HTTP status. The controller sends it as it is. */
@@ -210,6 +213,19 @@ const invalid = (message: string) => new RubricReviewError("VALIDATION_ERROR", m
 const conflict = (code: RubricReviewErrorCode, message: string) => new RubricReviewError(code, message, 409);
 /** 404 for a version that does not exist (or an id that cannot name one). */
 const notFound = () => new RubricReviewError("NOT_FOUND", "Rubric version not found", 404);
+/** 422 for a stored version whose document is not shaped like a rubric. */
+const malformed = () => new RubricReviewError("RUBRIC_MALFORMED", "This rubric version is stored in a shape the review cannot read. Reject it and re-extract.", 422);
+
+/**
+ * A safe description of an error for the log: its numeric/string `code` when
+ * it has one, else its class name. Never the message, which for a storage
+ * error includes the object path.
+ */
+function errorClass(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (typeof code === "string" || typeof code === "number") return `code ${code}`;
+  return (err as { constructor?: { name?: string } } | null)?.constructor?.name ?? "unknown error";
+}
 
 // ============================================
 // Ids
@@ -406,6 +422,15 @@ export interface ReviewCriterion extends AssessmentCriterion {
   quoteContext: QuoteContext | null;
 }
 
+/** An evidence item as the review API returns it, with its citation check. */
+export interface ReviewEvidenceItem extends EvidenceItem {
+  // True unless the item's quote was found in the current source text (also
+  // true when the check could not be made: see `citationStatus`).
+  staleCitation: boolean;
+  citationStatus: CitationStatus;
+  quoteContext: QuoteContext | null;
+}
+
 /** Something that stops an approval whatever the reviewer acknowledges. */
 export interface ApprovalBlocker {
   code: string;
@@ -451,7 +476,8 @@ export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intent
   criteria: ReviewCriterion[];
   intake: VisaRubric["intake"] | null;
   intakeQuestions: VisaRubric["intakeQuestions"];
-  evidenceItems: VisaRubric["evidenceItems"];
+  // Each item carries the same citation check as a criterion.
+  evidenceItems: ReviewEvidenceItem[];
   outcomeStatistics: VisaRubric["outcomeStatistics"] | null;
   sourceSnapshots: VisaRubric["sourceSnapshots"];
   extractorModel: string;
@@ -668,6 +694,11 @@ export interface RubricReviewDeps {
   snapshots: { read(sourceId: string, contentHash: string): Promise<GuidanceSnapshotContent> };
   // The clock every write of one decision is stamped with.
   now: () => Timestamp;
+  // Ids of the EligibilityQuestion docs that exist (the `eligibilityQuestions`
+  // collection, the one `eligibility.service` reads). The validator needs them
+  // to verify a criterion's `eligibilityQuestionId`; read only when a version
+  // has such a criterion. Backend use only.
+  eligibilityQuestionIds: () => Promise<ReadonlySet<string>>;
 }
 
 /** What was found for one citation. */
@@ -680,12 +711,52 @@ interface CitationFinding {
 interface CitationCheck {
   // criterionId -> status and context.
   byCriterion: Map<string, CitationFinding>;
+  // One finding per evidence item, in the stored order (an item's `key` is
+  // not guaranteed unique in a malformed version, so it is not the map key).
+  evidence: CitationFinding[];
   // The polarity proposal's own quote, when it has one.
   proposal: CitationFinding | null;
   // sourceId -> the `latestSnapshotId` the check was made against (null when
   // the source has none or does not exist). Re-read inside the decision's
   // transaction: a source that moved in between aborts the approval.
   sourceHeads: Map<string, string | null>;
+}
+
+/**
+ * What a citation check refuses an approval for: quotes that are no longer in
+ * the current source text (stale) and quotes that could not be checked
+ * (unverifiable), over EVERY quote the version cites: criteria, evidence
+ * items and the polarity proposal. Empty when all are current. Used by the
+ * detail (`approval.blockers`) and by `decide`, so the two agree.
+ */
+function citationBlockers(citations: CitationCheck): ApprovalBlocker[] {
+  const groups: { label: string; findings: CitationFinding[] }[] = [
+    { label: "criterion quote(s)", findings: [...citations.byCriterion.values()] },
+    { label: "evidence item quote(s)", findings: citations.evidence },
+    { label: "intent polarity proposal quote(s)", findings: citations.proposal ? [citations.proposal] : [] },
+  ];
+  const count = (status: CitationStatus) =>
+    groups.map((g) => ({ label: g.label, n: g.findings.filter((f) => f.status === status).length })).filter((g) => g.n > 0);
+  const out: ApprovalBlocker[] = [];
+  const stale = count("stale");
+  if (stale.length > 0) {
+    out.push({ code: "STALE_CITATION", message: `${stale.map((g) => `${g.n} ${g.label}`).join(", ")} no longer in the current source text. Re-extract the rubric instead of approving this version.` });
+  }
+  const unverifiable = count("unverifiable");
+  if (unverifiable.length > 0) {
+    out.push({ code: "CITATION_UNVERIFIABLE", message: `${unverifiable.map((g) => `${g.n} ${g.label}`).join(", ")} could not be checked against the current source text (source or snapshot unreadable).` });
+  }
+  return out;
+}
+
+/**
+ * The structural validator's errors for the rubric as it would be approved
+ * with `polarity`. Shared by the detail (so `canApprove` is false exactly
+ * when `decide` would answer RUBRIC_INVALID) and by `decide`.
+ */
+function structuralErrors(rubric: VisaRubric, polarity: IntentPolarity, knownEligibilityQuestionIds: ReadonlySet<string> | undefined): RubricIssue[] {
+  const candidate: VisaRubric = { ...rubric, reviewStatus: "approved", intentPolarity: polarity };
+  return validateVisaRubric(candidate, { knownEligibilityQuestionIds }).errors;
 }
 
 export class RubricReviewService {
@@ -698,7 +769,13 @@ export class RubricReviewService {
   private readonly deps: RubricReviewDeps;
 
   constructor(deps: Partial<RubricReviewDeps> = {}) {
-    this.deps = { snapshots: guidanceSnapshotStore, now: () => Timestamp.now(), ...deps };
+    this.deps = {
+      snapshots: guidanceSnapshotStore,
+      now: () => Timestamp.now(),
+      // Ids only (`select()` with no fields): no question text is read.
+      eligibilityQuestionIds: async () => new Set((await db.collection("eligibilityQuestions").select().get()).docs.map((d) => d.id)),
+      ...deps,
+    };
   }
 
   // ---------- Seam for #37 ----------
@@ -765,9 +842,16 @@ export class RubricReviewService {
    */
   private async checkCitations(rubric: VisaRubric): Promise<CitationCheck> {
     const criteria = Array.isArray(rubric.criteria) ? rubric.criteria : [];
+    const evidenceItems = Array.isArray(rubric.evidenceItems) ? rubric.evidenceItems : [];
     const proposalSource = rubric.intentPolarityProposal?.source ?? null;
+    // Every quote the version cites: criteria, evidence items (cited
+    // requirements shown to applicants) and the polarity proposal.
     const sourceIds = [
-      ...new Set([...criteria.map((c) => c.source?.sourceId), proposalSource?.sourceId].filter((id): id is string => typeof id === "string" && id.length > 0)),
+      ...new Set(
+        [...criteria.map((c) => c.source?.sourceId), ...evidenceItems.map((e) => e?.source?.sourceId), proposalSource?.sourceId].filter(
+          (id): id is string => typeof id === "string" && id.length > 0
+        )
+      ),
     ];
 
     // ---- where each source stands now ----
@@ -780,7 +864,7 @@ export class RubricReviewService {
           const id = snap.exists ? (snap.data() as { latestSnapshotId?: unknown }).latestSnapshotId : null;
           latest = typeof id === "string" && id ? id : null;
         } catch (err) {
-          console.error(`Rubric review: guidance source ${sourceId} unreadable: ${(err as Error)?.message ?? err}`);
+          console.error(`Rubric review: guidance source ${sourceId} unreadable (${errorClass(err)})`);
         }
         sourceHeads.set(sourceId, latest);
       })
@@ -796,8 +880,9 @@ export class RubricReviewService {
           .read(sourceId, contentHash)
           .then((content) => new SnapshotQuoteIndex(content))
           .catch((err) => {
-            // The source id only: never the path or any text.
-            console.error(`Rubric review: a snapshot of ${sourceId} is unreadable: ${(err as Error)?.message ?? err}`);
+            // The source id and an error class/code only: the message of a
+            // storage error carries the object path, so it is never logged.
+            console.error(`Rubric review: a snapshot of ${sourceId} is unreadable (${errorClass(err)})`);
             return null;
           });
         indexes.set(key, index);
@@ -825,7 +910,8 @@ export class RubricReviewService {
 
     const byCriterion = new Map<string, CitationFinding>();
     await Promise.all(criteria.map(async (c) => void byCriterion.set(c.criterionId, await inspect(c.source))));
-    return { byCriterion, proposal: proposalSource ? await inspect(proposalSource) : null, sourceHeads };
+    const evidence = await Promise.all(evidenceItems.map((e) => inspect(e?.source)));
+    return { byCriterion, evidence, proposal: proposalSource ? await inspect(proposalSource) : null, sourceHeads };
   }
 
   // ---------- Detail ----------
@@ -864,10 +950,14 @@ export class RubricReviewService {
     if (!parsed) return null;
     const rubric = await rubricStore.getVersionForReview(parsed.routeKey, parsed.version);
     if (!rubric) return null;
+    // A stored document that is not a rubric (no criteria list) is a clean,
+    // typed refusal, not a crash further down.
+    if (!Array.isArray(rubric.criteria)) throw malformed();
 
     const [head, citations] = await Promise.all([rubricStore.getHead(parsed.routeKey), this.checkCitations(rubric)]);
     const baseline = await this.loadBaseline(rubric, head);
 
+    const evidenceItems = Array.isArray(rubric.evidenceItems) ? rubric.evidenceItems : [];
     // ---- criteria with their citation status ----
     const criteria: ReviewCriterion[] = rubric.criteria.map((c) => {
       const finding = citations.byCriterion.get(c.criterionId) ?? { status: "unverifiable" as const, context: null };
@@ -893,7 +983,11 @@ export class RubricReviewService {
     // the decision is what the flags are computed from.
     const flags = reviewFlagsFor(rubric, rubric.intentPolarity);
     const intentCriteriaCount = rubric.criteria.filter((c) => c.concernsIntent === true).length;
-    const blockers = this.approvalBlockers(rubric, head, citations);
+    // The structural validator's verdict, so `canApprove` agrees with `decide`.
+    // (The polarity only has to be a valid placeholder here: no validator
+    // error depends on which one.)
+    const structure = structuralErrors(rubric, rubric.intentPolarity ?? rubric.intentPolarityProposal?.value ?? "not_assessed", await this.knownEligibilityIds(rubric));
+    const blockers = this.approvalBlockers(rubric, head, citations, structure);
     const discardedByReason: Record<string, number> = {};
     for (const d of rubric.discarded ?? []) discardedByReason[d.reason] = (discardedByReason[d.reason] ?? 0) + 1;
 
@@ -931,7 +1025,10 @@ export class RubricReviewService {
       criteria,
       intake: rubric.intake ?? null,
       intakeQuestions: rubric.intakeQuestions ?? [],
-      evidenceItems: (rubric.evidenceItems ?? []).map((e) => ({ ...e, source: toCitation(e.source) })),
+      evidenceItems: evidenceItems.map((e, i) => {
+        const finding = citations.evidence[i] ?? { status: "unverifiable" as const, context: null };
+        return { ...e, source: toCitation(e.source), staleCitation: finding.status !== "current", citationStatus: finding.status, quoteContext: finding.context };
+      }),
       outcomeStatistics: rubric.outcomeStatistics ?? null,
       sourceSnapshots: (rubric.sourceSnapshots ?? []).map((s) => ({
         sourceId: s.sourceId,
@@ -972,11 +1069,30 @@ export class RubricReviewService {
   }
 
   /**
+   * The ids of the eligibility questions, for the validator's check of a
+   * criterion's `eligibilityQuestionId`. Read only when a criterion links one
+   * (undefined otherwise). If they cannot be read, undefined too: the
+   * validator then reports the link as unverified and the approval is
+   * refused (fail closed). Storage-independent, so `decide` calls it BEFORE
+   * its transaction and passes the result in.
+   */
+  private async knownEligibilityIds(rubric: VisaRubric): Promise<ReadonlySet<string> | undefined> {
+    const criteria = Array.isArray(rubric.criteria) ? rubric.criteria : [];
+    if (!criteria.some((c) => c?.eligibilityQuestionId !== undefined)) return undefined;
+    try {
+      return await this.deps.eligibilityQuestionIds();
+    } catch (err) {
+      console.error(`Rubric review: eligibility question ids unreadable (${errorClass(err)})`);
+      return undefined;
+    }
+  }
+
+  /**
    * What refuses an approval outright, as far as it can be told without the
    * request (state, position in the route, citations). The same checks run
    * again, authoritatively, inside `decide`.
    */
-  private approvalBlockers(rubric: VisaRubric, head: RubricHead | null, citations: CitationCheck): ApprovalBlocker[] {
+  private approvalBlockers(rubric: VisaRubric, head: RubricHead | null, citations: CitationCheck, structure: RubricIssue[]): ApprovalBlocker[] {
     const blockers: ApprovalBlocker[] = [];
     if (rubric.reviewStatus !== "pending_review") {
       blockers.push({ code: "ALREADY_DECIDED", message: `This version is already ${rubric.reviewStatus}.` });
@@ -984,14 +1100,10 @@ export class RubricReviewService {
     if (!head || head.latestVersion !== rubric.version) {
       blockers.push({ code: "NOT_LATEST_VERSION", message: "A newer version of this route's rubric exists. Review that one; this one can only be rejected." });
     }
-    const statuses = [...citations.byCriterion.values()].map((f) => f.status);
-    const stale = statuses.filter((s) => s === "stale").length;
-    const unverifiable = statuses.filter((s) => s === "unverifiable").length;
-    if (stale > 0) {
-      blockers.push({ code: "STALE_CITATION", message: `${stale} criterion/criteria quote text that is no longer in the current source. Re-extract the rubric instead of approving this version.` });
-    }
-    if (unverifiable > 0) {
-      blockers.push({ code: "CITATION_UNVERIFIABLE", message: `${unverifiable} criterion/criteria could not be checked against the current source text (source or snapshot unreadable).` });
+    blockers.push(...citationBlockers(citations));
+    if (structure.length > 0) {
+      const codes = [...new Set(structure.map((e) => e.code))].join(", ");
+      blockers.push({ code: "RUBRIC_INVALID", message: `This rubric version is not internally consistent (${codes}). Reject it and re-extract.` });
     }
     return blockers;
   }
@@ -1018,19 +1130,26 @@ export class RubricReviewService {
     // content it reads is immutable, and the sources it was made against are
     // re-read inside the transaction below.
     let citations: CitationCheck | null = null;
+    let knownEligibilityIds: ReadonlySet<string> | undefined;
     if (input.action === "approve") {
       const preview = await rubricStore.getVersionForReview(routeKey, version);
       if (!preview) throw notFound();
       // Cheap early answers; both are checked again inside the transaction.
       if (preview.reviewStatus !== "pending_review") throw conflict("ALREADY_DECIDED", `This rubric version is already ${preview.reviewStatus}`);
       citations = await this.checkCitations(preview);
-      const statuses = [...citations.byCriterion.values()].map((f) => f.status);
-      if (statuses.includes("stale")) {
-        throw conflict("STALE_CITATION", "A criterion quotes text that is no longer in the current source. The source has moved on: re-extract the rubric instead of approving this version.");
-      }
-      if (statuses.includes("unverifiable")) {
-        throw conflict("CITATION_UNVERIFIABLE", "A criterion could not be checked against the current source text (source or snapshot unreadable). Nothing was approved; try again or re-extract.");
-      }
+      // Stale or unverifiable quotes anywhere (criteria, evidence items, the
+      // polarity proposal) refuse the approval. The quotes are immutable
+      // content; the sources they were checked against are re-read inside
+      // the transaction (SOURCE_CHANGED), which covers all three kinds.
+      const refused = citationBlockers(citations);
+      const stale = refused.find((b) => b.code === "STALE_CITATION");
+      if (stale) throw conflict("STALE_CITATION", `${stale.message} The source has moved on.`);
+      const unverifiable = refused.find((b) => b.code === "CITATION_UNVERIFIABLE");
+      if (unverifiable) throw conflict("CITATION_UNVERIFIABLE", `${unverifiable.message} Nothing was approved; try again or re-extract.`);
+      // The question ids the structural check needs: read here, outside
+      // the transaction (the version content is immutable, so the answer
+      // holds for the copy read inside).
+      knownEligibilityIds = await this.knownEligibilityIds(preview);
     }
 
     const now = this.deps.now();
@@ -1120,17 +1239,22 @@ export class RubricReviewService {
       }
 
       // ---- the rubric exactly as it would be approved ----
-      const candidate: VisaRubric = { ...rubric, reviewStatus: "approved", intentPolarity: input.intentPolarity, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter };
-      const validation = validateVisaRubric(candidate);
-      if (validation.errors.length > 0) {
-        const codes = [...new Set(validation.errors.map((e) => e.code))].join(", ");
+      const errors = structuralErrors({ ...rubric, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter }, input.intentPolarity, knownEligibilityIds);
+      if (errors.length > 0) {
+        const codes = [...new Set(errors.map((e) => e.code))].join(", ");
         throw conflict("RUBRIC_INVALID", `This rubric version is not internally consistent and cannot be approved (${codes}). Reject it and re-extract.`);
       }
 
       // ---- blocking flags: each one acknowledged by name ----
+      // The flags the version has under the DECISION are the ones that must
+      // be acknowledged. But the admin read the flags `getVersion` returned,
+      // computed under the PROPOSAL: a key from either set is accepted (a key
+      // the decision resolves is simply not recorded as acknowledged), and
+      // only a key that belongs to neither is refused.
       const flags = reviewFlagsFor(rubric, input.intentPolarity);
+      const proposedFlags = reviewFlagsFor(rubric, null);
       const blocking = flags.filter((f) => f.blocking);
-      const unknownKeys = input.acknowledgedFlags.filter((k) => !flags.some((f) => f.key === k));
+      const unknownKeys = input.acknowledgedFlags.filter((k) => !flags.some((f) => f.key === k) && !proposedFlags.some((f) => f.key === k));
       if (unknownKeys.length > 0) throw invalid(`acknowledgedFlags names flag(s) this version does not have: ${unknownKeys.join(", ")}`);
       const missing = blocking.filter((f) => !input.acknowledgedFlags.includes(f.key));
       if (missing.length > 0) {
