@@ -2,15 +2,19 @@ import { Response } from "express";
 import type { Timestamp } from "firebase-admin/firestore";
 import { AuthenticatedRequest } from "../../middleware/auth";
 import { asSubject, can, forbidden } from "../../middleware/authz";
-import { collections } from "../../utils/firebase";
+import { collections, db } from "../../utils/firebase";
 import { ErrorMessages, sendError, sendSuccess } from "../../utils/response";
+import { sourceLeaseService } from "../shared/runs/source-lease";
+import { guidanceCrawlService } from "./guidance-crawl.service";
+import { GUIDANCE_SOURCE_ID_RE } from "./guidance-snapshot.store";
 import type { GuidanceSource } from "./types";
 
 // ============================================
 // ADMIN — GUIDANCE SOURCE REGISTRY (issue #39)
 // ============================================
 //
-// Mounted at /admin/guidance-sources (guidance-source.routes.ts). Read-only.
+// Mounted at /admin/guidance-sources (guidance-source.routes.ts). The list is
+// read-only; the one write is the admin retry, POST /:id/crawl (issue #143).
 // `verifyAuth` runs first (no token -> 401); the handler then checks the
 // shared CASL ability BEFORE any Firestore read, so a non-admin gets 403
 // `FORBIDDEN` and learns nothing about the registry.
@@ -57,6 +61,12 @@ export interface GuidanceSourceListItem {
   lastErrorKind: string | null;
   lastErrorAt: string | null;
   backoffUntil: string | null;
+  // Issue #143: the last time OUR Storage / Firestore failed while handling
+  // this source (redacted, capped), and when. null when there is none (or the
+  // source has been crawled successfully since). Not part of the failure
+  // streak: `consecutiveFailures` / `status` never move for these.
+  lastInfrastructureError: string | null;
+  lastInfrastructureErrorAt: string | null;
 }
 
 /** Firestore Timestamp -> ISO string (null when absent or not a Timestamp). */
@@ -101,6 +111,8 @@ export function toGuidanceSourceListItem(id: string, data: Partial<GuidanceSourc
     lastErrorKind: str(data.lastErrorKind),
     lastErrorAt: iso(data.lastErrorAt),
     backoffUntil: iso(data.backoffUntil),
+    lastInfrastructureError: str(data.lastInfrastructureError),
+    lastInfrastructureErrorAt: iso(data.lastInfrastructureErrorAt),
   };
 }
 
@@ -128,6 +140,79 @@ class GuidanceSourceController {
       sendSuccess(res, { sources, total: sources.length });
     } catch (error) {
       console.error("Error listing guidance sources:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /admin/guidance-sources/:id/crawl (issue #143)
+   * Crawl exactly this source now, due or not, `failing` included: the admin
+   * retry. It is `runOrchestrator({ sourceIds: [id] })`, so it writes a
+   * `scrapeRuns` doc (kind "guidance", trigger "manual"), takes the source's
+   * lease, ignores the infrastructure backoff, and on success puts the source
+   * back to `active` (failure streak, auto-pause flags and the infra counter
+   * cleared).
+   *
+   * Answers: 401 (no token, verifyAuth) / 403 (not an admin) / 404 (id not in
+   * the registry) / 409 RUN_IN_PROGRESS with the lease holder / 200 with the
+   * outcome of the source and the updated registry item. Nothing is read
+   * before the admin gate.
+   */
+  async crawl(req: AuthenticatedRequest, res: Response): Promise<void> {
+    // Admin gate first, same ability as the list.
+    if (!can(req, "read", asSubject("ScrapeRun", {}))) {
+      forbidden(res, "Only admins can crawl guidance sources");
+      return;
+    }
+    const id = (req.params as { id?: string }).id ?? "";
+    try {
+      // An id that cannot exist is a 404, like one that is simply unknown.
+      const ref = GUIDANCE_SOURCE_ID_RE.test(id) ? collections.guidanceSources.doc(id) : undefined;
+      const snap = ref ? await ref.get() : undefined;
+      if (!ref || !snap?.exists) {
+        sendError(res, "NOT_FOUND", `Guidance source ${id.slice(0, 80)} is not in the registry`, 404);
+        return;
+      }
+
+      // Pre-flight: someone else already crawling this source -> 409 with the
+      // holder, BEFORE a run record is written for a retry that cannot run.
+      // (The orchestrator takes the lease for real; if a run slips in between
+      // this check and that, the source line says `lease_held` and we answer
+      // 409 below as well.)
+      const held = await db.runTransaction((tx) => sourceLeaseService.heldIn(tx, "guidance", id));
+      if (held) {
+        res.status(409).json({
+          success: false,
+          error: "RUN_IN_PROGRESS",
+          message: "This source is being crawled by another run; try again when it finishes",
+          holder: held.holder,
+        });
+        return;
+      }
+
+      const summary = await guidanceCrawlService.runOrchestrator({ sourceIds: [id], trigger: "manual" });
+      const result = summary.results.find((r) => r.sourceId === id);
+      if (result?.outcome === "lease_held") {
+        res.status(409).json({
+          success: false,
+          error: "RUN_IN_PROGRESS",
+          message: result.error ?? "This source is being crawled by another run",
+        });
+        return;
+      }
+
+      // The registry item AFTER the crawl, so the caller sees the un-failed
+      // status / cleared counters without a second request.
+      const after = await ref.get();
+      sendSuccess(res, {
+        outcome: result?.outcome ?? "not_crawled",
+        error: result?.error ?? null,
+        errorKind: result?.errorKind ?? null,
+        warnings: summary.warnings,
+        source: after.exists ? toGuidanceSourceListItem(id, after.data() as Partial<GuidanceSource>) : null,
+      });
+    } catch (error) {
+      console.error("Error crawling guidance source:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

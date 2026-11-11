@@ -85,6 +85,7 @@ import { agentService } from "./services/agent.service";
 import { visaService } from "./services/visa.service";
 import { newsScraperService } from "./scrapers";
 import { visaCatalogCrawlService } from "./scrapers";
+import { guidanceCrawlService } from "./scrapers";
 import { newsService } from "./services/news.service";
 import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
@@ -517,12 +518,47 @@ export const crawlVisaCatalogOrchestrator = functions
     }
   });
 
+/**
+ * Caseworker-guidance crawler (issue #143) — ONCE A NIGHT at 03:20 UTC.
+ * Weekly-or-nightly cadence per source is not decided here: every source
+ * carries its own `checkIntervalHours`, and a tick only requests the sources
+ * that are due (a source checked recently answers `not_due` without a
+ * request), so a tick with nothing due returns at once: no run record, no
+ * alert. :20 is off the other ticks (:00 / :15 / :30 / :45), so it never
+ * lands on the same minute as the news, visa or alert-check functions.
+ *
+ * Fetches go through the shared fetch service (robots.txt, per-host gap,
+ * 429/503 backoff) that `guidanceCrawlService` uses by default; each run is a
+ * `scrapeRuns` doc of kind "guidance", each source is crawled under its own
+ * lease, and the finalize hook below alerts admins when a source turns
+ * `failing` or the crawl could not store its results. The crawl never sends
+ * a document to a model, so it needs no LLM secret, only the email secrets.
+ */
+export const crawlGuidanceOrchestrator = functions
+  // EMAIL_SECRETS: post-run alert emails, see scrapeNewsOrchestrator.
+  .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: [...EMAIL_SECRETS] })
+  .pubsub.schedule("20 3 * * *") // nightly at 03:20 UTC (issue #143)
+  .timeZone("UTC")
+  .onRun(async () => {
+    console.log("Running guidance crawl orchestrator...");
+    try {
+      const result = await guidanceCrawlService.runOrchestrator();
+      console.log(
+        `Guidance crawl: ${result.sourcesConsidered} sources, ${result.sourcesFetched} fetched, ` +
+          `${result.changed} changed / ${result.unchanged} unchanged / ${result.failed} failed, ` +
+          `${result.infraErrors} infrastructure errors, ${result.notDue} not due`
+      );
+    } catch (error) {
+      console.error("Guidance crawl orchestrator failed:", error);
+    }
+  });
+
 // ============================================
 // SCRAPER ALERTS (issue #83)
 // ============================================
 
 /**
- * Post-run alert rules: every visa / news run, once finalised (#81), is
+ * Post-run alert rules: every visa / news / guidance run, once finalised (#81), is
  * checked for run_failed / error_rate / linked_surcharge / host_backoff /
  * source_broken (scrapers/shared/alerts/scrape-alert.service.ts onRunFinalized). The hook
  * never throws, and the run's record is already written when it runs.
