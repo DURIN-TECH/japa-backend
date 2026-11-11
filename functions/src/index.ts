@@ -94,6 +94,7 @@ import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
 import { scrapeRunWorker } from "./scrapers";
 import { outcomeImportService, outcomeRunWorker, registeredDestinations } from "./scrapers";
+import { aiCaseOfficerService } from "./services/ai-case-officer.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -246,6 +247,13 @@ export const onApplicationUpdated = functions
       (after.status === "approved" || after.status === "rejected")
     ) {
       await agentService.updateAgentStats(after.agentId);
+    }
+
+    // AI case-officer (issue #42): moving to under review queues an assessment.
+    // Only writes the job document; it makes no model call and never throws.
+    // The worker (processAssessmentJob) does the work, idempotently, by id.
+    if (before.status !== after.status && after.status === "under_review") {
+      await aiCaseOfficerService.enqueueForStatusChange(context.params.applicationId);
     }
   });
 
@@ -677,4 +685,28 @@ export const onNewsArticleCreated = functions.firestore
     } catch (error) {
       console.error("Error notifying subscribers:", error);
     }
+  });
+
+// ============================================
+// AI CASE-OFFICER WORKER (issue #42)
+// ============================================
+//
+// Runs an assessment job. It returns at once unless the write moved the document
+// INTO `queued` (created queued, or failed -> queued). runJob then claims the
+// document `queued -> running` in a transaction, so a duplicate delivery of the
+// same event never runs twice. Function-level retry stays off: a failed job is
+// retried by a new request, which moves the same document back to queued.
+//
+// Binds AI_SECRETS: this is the function that calls the model. Timeout and
+// memory follow the crawler's pattern (540 s, the Gen-1 maximum). The memory is
+// for holding one attached document at a time.
+export const processAssessmentJob = functions
+  .runWith({ secrets: [...AI_SECRETS], timeoutSeconds: 540, memory: "1GB" })
+  .firestore.document("applicationAssessments/{assessmentId}")
+  .onWrite(async (change, context) => {
+    if (!change.after.exists) return;
+    const after = change.after.data() ?? {};
+    const before = change.before.exists ? change.before.data() ?? {} : {};
+    if (after.status !== "queued" || before.status === "queued") return;
+    await aiCaseOfficerService.runJob(context.params.assessmentId);
   });

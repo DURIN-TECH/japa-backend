@@ -188,9 +188,10 @@ describe("secret binding in src/index.ts (Gen 1 runWith)", () => {
     assert.match(runWithOf("onApplicationUpdated"), /EMAIL_SECRETS/);
   });
 
-  test("`api` is the only function bound so far", () => {
+  test("`api` and the assessment worker are the only functions bound (issue #42)", () => {
     // Spreads of the list inside a runWith (comments mention it without `...`).
-    assert.equal(indexSource.match(/\.\.\.AI_SECRETS/g)?.length, 1);
+    assert.equal(indexSource.match(/\.\.\.AI_SECRETS/g)?.length, 2);
+    assert.match(runWithOf("processAssessmentJob"), /\.\.\.AI_SECRETS/);
   });
 
   test("nothing in functions/src uses the Gen-2 defineSecret", () => {
