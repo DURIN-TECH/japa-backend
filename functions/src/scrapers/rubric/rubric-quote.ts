@@ -81,7 +81,8 @@ function isDigit(ch: string | undefined): boolean {
  *  - if the needle starts (ends) with a letter or digit, the character before
  *    (after) it must not be a letter or digit;
  *  - if it starts (ends) with a digit, it must not continue a number through
- *    a separator either ("028" out of "1,028", "1" out of "1.5").
+ *    a separator either ("028" out of "1,028", "1" out of "1.5"), and it may
+ *    not start (end) with that separator between two digits.
  */
 function onTokenBoundary(hay: string, at: number, needle: string): boolean {
   const end = at + needle.length;
@@ -91,6 +92,11 @@ function onTokenBoundary(hay: string, at: number, needle: string): boolean {
   if (isWordChar(last) && isWordChar(hay[end])) return false;
   if (isDigit(first) && (hay[at - 1] === "," || hay[at - 1] === ".") && isDigit(hay[at - 2])) return false;
   if (isDigit(last) && (hay[end] === "," || hay[end] === ".") && isDigit(hay[end + 1])) return false;
+  // The same cut made one character over: a needle that starts (ends) with
+  // the separator itself, between two digits (".2" out of "3.2").
+  const sep = (ch: string | undefined) => ch === "," || ch === ".";
+  if (sep(first) && isDigit(needle[1]) && isDigit(hay[at - 1])) return false;
+  if (sep(last) && isDigit(needle[needle.length - 2]) && isDigit(hay[end])) return false;
   return true;
 }
 
