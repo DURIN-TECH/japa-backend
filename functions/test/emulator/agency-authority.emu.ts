@@ -260,6 +260,103 @@ describe("A. agency membership endpoints act only on the caller's own agency", (
   });
 });
 
+describe("A. the other owner-only endpoints use the same owner check", () => {
+  test("a legacy agency record naming the caller does not open the /agencies/me owner endpoints", async () => {
+    const attacker = await seedIndependentAgent("a7-attacker");
+    const forgedId = `forged-a7-${Date.now()}`;
+    await put("agencies", forgedId, {
+      id: forgedId,
+      name: "Forged",
+      ownerId: attacker.account.uid,
+      ownerName: "Nobody",
+      services: [],
+      totalAgents: 1,
+      status: "approved",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const t = attacker.account.idToken;
+
+    assert.deepEqual(
+      {
+        update: (await api.call("PUT", "/agencies/me", t, { name: "Still Forged" })).status,
+        logoUrl: (
+          await api.call("POST", "/agencies/me/logo/upload-url", t, { fileName: "l.png", contentType: "image/png" })
+        ).status,
+        logo: (await api.call("POST", "/agencies/me/logo", t, { storagePath: `agency-logos/${forgedId}/l.png` }))
+          .status,
+        complianceRead: (await api.call("GET", "/agencies/me/compliance", t)).status,
+        complianceWrite: (await api.call("PUT", "/agencies/me/compliance", t, { legalFirstName: "X" })).status,
+        complianceSubmit: (await api.call("POST", "/agencies/me/compliance/submit", t, {})).status,
+        nameAfter: (await stored("agencies", forgedId)).name,
+        complianceAfter: (await stored("agencies", forgedId)).compliance ?? null,
+      },
+      {
+        update: 403,
+        logoUrl: 403,
+        logo: 403,
+        complianceRead: 403,
+        complianceWrite: 403,
+        complianceSubmit: 403,
+        nameAfter: "Forged",
+        complianceAfter: null,
+      }
+    );
+  });
+
+  test("a real owner still reaches them, and manages agent status only inside their own agency", async () => {
+    const mine = await seedAgency("a8-mine");
+    const theirs = await seedAgency("a8-theirs");
+    const myMember = await seedMember(mine, "a8-mine-member");
+    const theirMember = await seedMember(theirs, "a8-their-member");
+    const t = mine.owner.idToken;
+
+    const complianceRead = await api.call("GET", "/agencies/me/compliance", t);
+    const complianceWrite = await api.call("PUT", "/agencies/me/compliance", t, {
+      legalFirstName: "Olu",
+      // must be ignored: the review decision is an admin's
+      status: "verified",
+      reviewedBy: "admin-uid",
+    });
+    const suspendTheirs = await api.call("PUT", `/agents/${theirMember.agentDocId}/status`, t, {
+      status: "suspended",
+    });
+    // A member (not the owner) tries first, while their account is active.
+    const byMember = await api.call("PUT", `/agents/${mine.ownerAgentDocId}/status`, myMember.account.idToken, {
+      status: "suspended",
+    });
+    const suspendMine = await api.call("PUT", `/agents/${myMember.agentDocId}/status`, t, { status: "suspended" });
+    const compliance = (await stored("agencies", mine.agencyId)).compliance;
+
+    assert.deepEqual(
+      {
+        complianceRead: complianceRead.status,
+        complianceWrite: complianceWrite.status,
+        complianceStatus: compliance.status,
+        complianceReviewedBy: compliance.reviewedBy ?? null,
+        legalFirstName: compliance.legalFirstName,
+        suspendTheirs: suspendTheirs.status,
+        theirMemberStatus: (await stored("agents", theirMember.agentDocId)).verificationStatus,
+        suspendMine: suspendMine.status,
+        myMemberStatus: (await stored("agents", myMember.agentDocId)).verificationStatus,
+        byMember: byMember.status,
+      },
+      {
+        complianceRead: 200,
+        complianceWrite: 200,
+        complianceStatus: "in_progress",
+        complianceReviewedBy: null,
+        legalFirstName: "Olu",
+        suspendTheirs: 403,
+        theirMemberStatus: "verified",
+        suspendMine: 200,
+        myMemberStatus: "suspended",
+        byMember: 403,
+      }
+    );
+  });
+});
+
 // ============================================
 // B. Agency records: no authority from a client
 // ============================================
