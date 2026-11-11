@@ -944,12 +944,52 @@ export interface DocumentRequest {
   /** Id of the `Document` the client uploaded to satisfy this request. */
   fulfilledDocumentId?: string;
   fulfilledAt?: Timestamp;
-  /** Uid of whoever moved it to a terminal non-fulfilled state (waive/cancel). */
+  /** Uid of whoever moved it to a terminal non-fulfilled state (waive/cancel).
+   *  `"system"` (CHECKLIST_SYSTEM_ACTOR_ID) when the checklist sync cancelled it. */
   resolvedBy?: string;
+
+  // --- Checklist-origin fields (issue #114) ------------------------------------
+  // All OPTIONAL: agent-raised requests and every pre-existing document carry
+  // none of them and behave exactly as before.
+  /** `"checklist"` when the request was generated from the verified visa
+   *  record by the checklist builder; absent for agent-raised requests. */
+  origin?: "checklist";
+  /** Stable id of the checklist item (from the rubric evidence key, or the
+   *  visa record's document list). With `applicationId` it is the idempotency
+   *  key: the doc id is `{applicationId}__{checklistItemId}`. */
+  checklistItemId?: string;
+  /** Whose document it is. `sponsor` documents are still uploaded by the
+   *  applicant (the sponsor has no account) and belong to the applicant. */
+  holder?: "applicant" | "sponsor";
+  /** Why the document is asked for: a deterministic template filled from the
+   *  rubric criterion, so it is always present on a checklist item. */
+  reason?: string;
+  /** Whether the source calls the document required (false = optional). */
+  required?: boolean;
+  /** The rubric criterion this item mainly evidences (its `ruleRef` or
+   *  `criterionId`), for display and audit. */
+  criterionRef?: string;
+  /** The published source behind the item: verbatim quote + official URL. */
+  citation?: DocumentRequestCitation;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
+
+/** Verbatim quote + URL behind a checklist item (never model-written). */
+export interface DocumentRequestCitation {
+  /** The exact words of the published source. */
+  quote: string;
+  /** The official page the quote is on. */
+  url: string;
+  /** The publisher's own paragraph / section number, when the rubric has one. */
+  ruleRef?: string;
+}
+
+/** Actor recorded as `requestedBy` / `resolvedBy` on system-built requests. */
+export const CHECKLIST_SYSTEM_ACTOR_ID = "system";
+/** Display name shown to the applicant for system-built requests. */
+export const CHECKLIST_SYSTEM_ACTOR_NAME = "Seli";
 
 // ============================================
 // CONSULTATION TYPES
