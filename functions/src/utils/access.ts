@@ -34,8 +34,9 @@
 //   - KNOWN DEFECT: a no-agency `agent` / `owner` principal is granted on
 //     `{ agencyId: undefined }`, which CASL matches against any application
 //     that has NO `agencyId` field (self-serve applications). See
-//     KNOWN_DEFECT_CELLS in test/access/fixtures.ts. To be fixed in
-//     `@durin-tech/authz`; deliberately not patched here.
+//     KNOWN_DEFECT_CELLS in test/access/fixtures.ts. Tracked as
+//     DURIN-TECH/japa#131, to be fixed in `@durin-tech/authz`; deliberately
+//     not patched here.
 //
 // WHO CAN CALL IT: anything. Nothing in this file imports Express or reads a
 // request. Callers pass either
@@ -113,8 +114,19 @@ export interface AbilityResolvers {
   /**
    * Resolve the principal for a uid, or null/undefined when there is none.
    * May throw: a throw is treated as "unresolvable" and denies.
-   * Request-path equivalent: the token's role claims, else
-   * `claimsService.resolveRoleFromDb(uid)`.
+   *
+   * Rules for whoever implements this:
+   *  - Take the role and agency from a source the user cannot write: the
+   *    Firebase Auth custom claims (`role`, `agencyId`), which is what the
+   *    request path trusts. Do NOT wire `claimsService.resolveRoleFromDb`
+   *    into a trigger until DURIN-TECH/japa#135 is fixed: it reads documents
+   *    a client can write, so a user could resolve themselves a higher role.
+   *  - Return null for a disabled / suspended user (the `disabled` claim).
+   *    The request path blocks them in `verifyAuth` before any ability is
+   *    built; nothing here can see that claim, so the resolver must.
+   *  - Do NOT swallow errors (`.catch(() => null)` and the like) to return a
+   *    lower-privilege principal: let them throw, so the outcome is deny
+   *    rather than a guess.
    */
   resolvePrincipal: (uid: string) => Promise<AuthzSubject | null | undefined>;
   /**
@@ -123,6 +135,10 @@ export interface AbilityResolvers {
    * treated as "unresolvable" and denies. Not called for admins.
    * Request-path equivalent: `entitlementService.resolveSubscriber(authz)`
    * then `entitlementService.getEntitlements(subscriber.id)`.
+   *
+   * Do NOT swallow errors here: `.catch(() => null)` turns an outage into
+   * "no plan resolved", i.e. role-only rules, and a lapsed (read-only)
+   * subscriber would get their writes back. Let the lookup throw.
    */
   resolveEntitlements: (authz: AuthzSubject) => Promise<Entitlements | null | undefined>;
 }
@@ -145,20 +161,52 @@ export function denyAllAbility(): AppAbility {
 const KNOWN_ROLES: readonly Role[] = Object.values(ROLES);
 
 /**
- * True when `authz` is a usable principal: a non-empty string uid and a role
- * the ability factory knows. Anything else must not reach the factory (an
- * unknown role happens to produce no grants today, but that is the factory's
- * accident, not a guarantee).
+ * True when `authz` is a usable principal:
+ *  - `uid`: a non-empty string;
+ *  - `role`: one the ability factory knows (an unknown role happens to
+ *    produce no grants today, but that is the factory's accident, not a
+ *    guarantee);
+ *  - `agencyId`: null, undefined, or a non-empty string.
+ * Anything else must not reach the factory.
+ *
+ * WHY `agencyId` IS CHECKED: the factory copies it straight into CASL
+ * conditions (`{ agencyId }`), and CASL reads an OBJECT there as a Mongo
+ * query operator. A principal carrying `agencyId: { $ne: null }` (or
+ * `{ $exists: true }`, `{ $in: [...] }`) would match every agency's
+ * applications. Arrays, numbers and the empty string are refused as well:
+ * none of them is an agency id.
  */
 function isUsablePrincipal(authz: unknown): authz is AuthzSubject {
   if (!authz || typeof authz !== "object") return false;
-  const a = authz as Partial<AuthzSubject>;
-  return typeof a.uid === "string" && a.uid.length > 0 && KNOWN_ROLES.includes(a.role as Role);
+  const a = authz as Record<string, unknown>;
+  // uid: the factory uses it in conditions too (`userId`, `agentId`), so it
+  // must be a plain non-empty string for the same reason as agencyId.
+  if (typeof a.uid !== "string" || a.uid.length === 0) return false;
+  if (!KNOWN_ROLES.includes(a.role as Role)) return false;
+  // agencyId: absent (null / undefined) or a real id. Never an operator.
+  const agencyId = a.agencyId;
+  if (agencyId === null || agencyId === undefined) return true;
+  return typeof agencyId === "string" && agencyId.length > 0;
 }
 
-/** True when `who` is an already-built ability rather than a principal. */
+/**
+ * The class of every ability `@durin-tech/authz` builds (CASL's
+ * `PureAbility`), taken from an ability the package itself made. Not imported
+ * from `@casl/ability` on purpose: this package does not declare CASL as a
+ * direct dependency, and reading the class off authz's own output guarantees
+ * it is the SAME CASL copy authz uses, so `instanceof` cannot be fooled by a
+ * second copy in node_modules.
+ */
+const ABILITY_CLASS = denyAllAbility().constructor as new (...args: never[]) => AppAbility;
+
+/**
+ * True when `who` is an already-built ability rather than a principal.
+ * A real `instanceof` check, not duck-typing: a principal-shaped object that
+ * merely has a `can` function is NOT an ability and goes through
+ * `buildAbilityForPrincipal` (and its validation) like any other principal.
+ */
 function isAbility(who: AppAbility | ApplicationAccessPrincipal): who is AppAbility {
-  return typeof (who as AppAbility).can === "function";
+  return who instanceof ABILITY_CLASS;
 }
 
 // ============================================
@@ -173,8 +221,9 @@ function isAbility(who: AppAbility | ApplicationAccessPrincipal): who is AppAbil
  * inputs: `defineAbilitiesFor(authz, entitlements)`, with "no entitlements"
  * passed as `undefined` (role/ownership rules only).
  *
- * Fails closed: a missing principal, an empty uid, an unknown role, or a
- * factory error returns the deny-all ability.
+ * Fails closed: a missing principal, an empty uid, an unknown role, an
+ * `agencyId` that is not null / undefined / a non-empty string (see
+ * `isUsablePrincipal`), or a factory error returns the deny-all ability.
  *
  * @param principal the resolved principal (+ optional entitlements)
  * @returns the principal's ability, or deny-all
@@ -259,7 +308,11 @@ export async function resolveAbilityForUid(
  *                    `agencyId` as stored. Missing -> false, for everyone
  *                    (an admin has no access to an application that does not
  *                    exist; handlers answer 404 before they get here).
- * @param action      `read` (default), `update` or `delete`
+ * @param action      `read` (default), `update` or `delete`. A caller that
+ *                    is about to WRITE must pass `"update"` or `"delete"`,
+ *                    never rely on the default: `read` is wider (a
+ *                    same-agency colleague and a lapsed subscriber can read
+ *                    but not write).
  */
 export function checkApplicationAccess(
   who: AppAbility | ApplicationAccessPrincipal | null | undefined,

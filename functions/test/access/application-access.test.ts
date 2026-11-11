@@ -318,12 +318,52 @@ describe("buildAbilityForPrincipal", () => {
       { authz: { uid: "uid-x" } }, // no role
       { authz: { uid: "uid-x", role: "superuser" } }, // unknown role
       { authz: { uid: "uid-x", role: "ADMIN" } }, // wrong case is not admin
+      // agencyId that is not null / undefined / a non-empty string. An object
+      // here would be read by CASL as a Mongo operator (review of #29).
+      { authz: { uid: "uid-x", role: ROLES.OWNER, agencyId: { $ne: null } } },
+      { authz: { uid: "uid-x", role: ROLES.OWNER, agencyId: { $exists: true } } },
+      { authz: { uid: "uid-x", role: ROLES.AGENT, agencyId: { $in: ["agency-a", "agency-b"] } } },
+      { authz: { uid: "uid-x", role: ROLES.OWNER, agencyId: ["agency-b"] } },
+      { authz: { uid: "uid-x", role: ROLES.OWNER, agencyId: 0 } },
+      { authz: { uid: "uid-x", role: ROLES.OWNER, agencyId: "" } },
+      // Same trick on the uid (used in `userId` / `agentId` conditions).
+      { authz: { uid: { $ne: null }, role: ROLES.CLIENT } },
     ];
     for (const principal of bad) {
       const ability = buildAbilityForPrincipal(principal);
       assert.equal(ability.rules.length, 0, `expected no rules for ${JSON.stringify(principal)}`);
       assert.equal(deniesEverything(ability), true);
     }
+  });
+
+  test("an operator-valued agencyId never reaches another agency's application", () => {
+    // The attack from the review of #29: an owner/agent principal whose
+    // agencyId is a Mongo operator instead of an id.
+    const operators: any[] = [{ $ne: null }, { $exists: true }, { $in: ["agency-a", "agency-b"] }];
+    for (const role of [ROLES.OWNER, ROLES.AGENT]) {
+      for (const agencyId of operators) {
+        const who: any = { authz: { uid: "uid-attacker", role, agencyId } };
+        for (const app of Object.values(APPLICATIONS)) {
+          for (const action of ACTIONS) {
+            assert.equal(
+              checkApplicationAccess(who, app, action),
+              false,
+              `${role} ${JSON.stringify(agencyId)} ${action} ${app.id}`
+            );
+          }
+        }
+      }
+    }
+  });
+
+  test("an object that only looks like an ability is treated as a principal, and denied", () => {
+    // Has a `can` function but is not a CASL ability: must not be trusted.
+    const fake: any = { can: () => true };
+    assert.equal(checkApplicationAccess(fake, APPLICATIONS.selfServe), false);
+    // A real principal with a stray `can` is still judged by its role.
+    const who: any = { authz: PRINCIPALS.client2, can: () => true };
+    assert.equal(checkApplicationAccess(who, APPLICATIONS.aAssigned), false);
+    assert.equal(checkApplicationAccess(who, APPLICATIONS.bAssigned), true);
   });
 
   test("a malformed principal passed straight to the check is denied too", () => {
@@ -428,8 +468,18 @@ describe("resolveAbilityForUid: defaults to deny when something cannot be resolv
     }
   });
 
-  test("malformed principal (unknown role, empty uid): deny-all", async () => {
-    for (const found of [{ uid: "uid-x", role: "superuser" }, { uid: "", role: ROLES.ADMIN }, { uid: "uid-x" }]) {
+  test("malformed principal (unknown role, empty uid, bad agencyId): deny-all", async () => {
+    const malformed = [
+      { uid: "uid-x", role: "superuser" },
+      { uid: "", role: ROLES.ADMIN },
+      { uid: "uid-x" },
+      // agencyId as a Mongo operator / non-id value (review of #29).
+      { uid: "uid-x", role: ROLES.OWNER, agencyId: { $ne: null } },
+      { uid: "uid-x", role: ROLES.AGENT, agencyId: { $exists: true } },
+      { uid: "uid-x", role: ROLES.OWNER, agencyId: ["agency-b"] },
+      { uid: "uid-x", role: ROLES.OWNER, agencyId: "" },
+    ];
+    for (const found of malformed) {
       const ability = await resolveAbilityForUid("uid-x", {
         resolvePrincipal: async () => found as any,
         resolveEntitlements: neverEntitlements,

@@ -249,7 +249,7 @@ export const MATRIX: Record<PrincipalName, Record<ApplicationName, string>> = {
  * guards against this for visas; the Application grants do not.
  *
  * #29 is a pure refactor and must not change the rule, so these cells are
- * pinned as they are and reported on the issue for a fix in
+ * pinned as they are. Tracked as DURIN-TECH/japa#131 for a fix in
  * `@durin-tech/authz`. When that fix lands, flip them to "---" here.
  */
 export const KNOWN_DEFECT_CELLS: [PrincipalName, ApplicationName][] = [
