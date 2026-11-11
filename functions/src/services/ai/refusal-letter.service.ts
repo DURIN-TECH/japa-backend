@@ -16,6 +16,7 @@ import {
   identityWarnings,
   parseRefusalAnswer,
 } from "./refusal-letter-logic";
+import { resolveDisclosureNotice } from "./refusal-disclosure-notice";
 import { sniffMediaType } from "../ai-case-officer.service";
 
 // ============================================
@@ -218,6 +219,7 @@ export class RefusalLetterService {
       checklist: { state: "not_built", items: [] },
       matchedCriterionIds: [],
       unmatchedReasonIds: [],
+      disclosureNotice: null,
       model: null,
       promptVersion: REFUSAL_PROMPT_VERSION,
       usage: null,
@@ -299,6 +301,8 @@ export class RefusalLetterService {
 
     // ---- the approved rubric for the application's route (null is allowed) ----
     const rubric = await this.deps.getApprovedRubric(app.countryCode, app.visaTypeId);
+    // Per-destination, tied to the rubric's own criterion when it has one.
+    const disclosureNotice = resolveDisclosureNotice(app.countryCode, rubric);
 
     // ---- today's global cap, claimed only by jobs that reach the model ----
     await this.claimDailyCap(settings);
@@ -327,6 +331,7 @@ export class RefusalLetterService {
     if (!parsed || !parsed.ok) {
       await this.store(cur.id, {
         outcome: "unreadable",
+        disclosureNotice,
         rubricVersion: rubric?.version ?? null,
         model: res.model,
         usage,
@@ -335,11 +340,11 @@ export class RefusalLetterService {
     }
     const letter = parsed.letter;
     if (!letter.readable) {
-      await this.store(cur.id, { outcome: "unreadable", rubricVersion: rubric?.version ?? null, suspiciousContent: letter.suspicious, model: res.model, usage });
+      await this.store(cur.id, { outcome: "unreadable", disclosureNotice, rubricVersion: rubric?.version ?? null, suspiciousContent: letter.suspicious, model: res.model, usage });
       return;
     }
     if (!letter.isRefusalLetter) {
-      await this.store(cur.id, { outcome: "not_a_refusal_letter", rubricVersion: rubric?.version ?? null, suspiciousContent: letter.suspicious, model: res.model, usage });
+      await this.store(cur.id, { outcome: "not_a_refusal_letter", disclosureNotice, rubricVersion: rubric?.version ?? null, suspiciousContent: letter.suspicious, model: res.model, usage });
       return;
     }
 
@@ -356,6 +361,7 @@ export class RefusalLetterService {
 
     await this.store(cur.id, {
       outcome: "analysed",
+      disclosureNotice,
       rubricVersion: rubric?.version ?? null,
       decisionDate: letter.decisionDate,
       visaTypeNamed: letter.visaTypeNamed,

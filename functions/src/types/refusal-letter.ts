@@ -81,6 +81,14 @@ export interface RefusalChecklist {
   items: RefusalChecklistItem[];
 }
 
+/** The disclosure notice, resolved per destination when the job ran (null = none for this destination). */
+export interface DisclosureNotice {
+  title: string;
+  body: string;
+  rule: { ruleRef: string; quote: string; url: string; context: string };
+  help: string;
+}
+
 export interface RefusalAnalysis {
   id: string;
   userId: string; // the applicant (the application's owner)
@@ -113,6 +121,9 @@ export interface RefusalAnalysis {
   // Derived lists kept for operators and later queries (design 3.8).
   matchedCriterionIds: string[];
   unmatchedReasonIds: string[];
+
+  // Null for a destination with no entry: nothing is shown.
+  disclosureNotice: DisclosureNotice | null;
 
   model: string | null;
   promptVersion: string;

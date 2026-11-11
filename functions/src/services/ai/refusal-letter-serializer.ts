@@ -14,34 +14,6 @@ import type { RefusalAnalysis, RefusalOutcome } from "../../types/refusal-letter
 // quote is fixed text written here. None of it predicts an outcome, and none of
 // it advises leaving anything out.
 
-/**
- * The disclosure notice (acceptance criterion: shown after extraction, even when
- * nothing could be mapped and when there is no rubric).
- *
- * SOURCE (fetched 2026-11-10, per the issue): Immigration Rules Part Suitability,
- * SUI 9.1(b), https://www.gov.uk/guidance/immigration-rules/immigration-rules-part-suitability
- * The quote below is the rule's own wording. The copy does NOT claim that any
- * particular application-form question exists, and does NOT say disclosure
- * guarantees an outcome: the issue has no quote for either. HUMAN SIGN-OFF
- * REQUIRED on this copy before release (attached to the PR).
- *
- * NOTE FOR REVIEWERS: this is the one route-specific item in the feature. It is
- * data (a fixed notice), not branching: the mapping code never reads it. A route
- * with its own published disclosure rule needs its own entry, and a human to
- * supply the quote.
- */
-export const DISCLOSURE_NOTICE = {
-  title: "Be open about an earlier refusal",
-  body: "If you have been refused a visa before, deal with that openly on your next application.",
-  rule: {
-    ruleRef: "SUI 9.1(b)",
-    quote: "not disclosing relevant facts in relation to the application",
-    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-part-suitability",
-    context: "This is one of the two ways the published rule on deception (SUI 9.1) describes it.",
-  },
-  help: "If you are not sure what to say about it, ask a qualified adviser or an agent.",
-} as const;
-
 /** Fixed copy for each warning code. A warning is never a block. */
 const WARNING_COPY: Record<string, string> = {
   name_mismatch: "The name on this letter does not match the name on your profile. Check that it is your letter.",
@@ -114,8 +86,9 @@ export function serializeRefusalData(a: RefusalAnalysis) {
       }
       : { state: "not_built" as const, emptyReason: null, items: [] },
     warnings: a.warnings.map((w) => ({ code: w.code, message: WARNING_COPY[w.code] ?? "" })),
-    // Shown in every finished state: unreadable, unmatched and no-rubric included.
-    disclosureNotice: DISCLOSURE_NOTICE,
+    // Resolved per destination by the job (null = none for this destination).
+    // Shown in every finished state when present.
+    disclosureNotice: a.disclosureNotice ?? null,
   };
 }
 
