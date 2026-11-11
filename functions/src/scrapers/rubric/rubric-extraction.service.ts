@@ -10,6 +10,7 @@ import type { GuidanceChangeEvent } from "../guidance/guidance-crawl.service";
 import type { GuidanceSnapshotContent, GuidanceSnapshotMeta, GuidanceSource } from "../guidance/types";
 import {
   DEFAULT_SEVERITY_LEVELS,
+  RUBRIC_CITATION_FIELDS,
   RUBRIC_SCHEMA_VERSION,
   type AssessmentCriterion,
   type EvidenceItem,
@@ -36,7 +37,7 @@ import {
   type RawIntakeQuestion,
   type RawRubricOutput,
 } from "./rubric-prompt";
-import { SnapshotQuoteIndex, dateSupported, passagesOverlap, unitSupported, unsupportedNumbers } from "./rubric-quote";
+import { SnapshotQuoteIndex, containsTokenBounded, dateSupported, groupNameSupported, passagesOverlap, unitSupported, unsupportedNumbers } from "./rubric-quote";
 import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSettings } from "./rubric-settings";
 import { rubricRouteKey, rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
 import { validateCriterionShape, validateVisaRubric } from "./rubric-validate";
@@ -84,6 +85,9 @@ const TAG = "[rubric-extraction]";
 
 /** Cap on the model's own label kept on a discard record. */
 const MAX_LABEL_CHARS = 120;
+
+/** Cap on a stored discard detail (details are fixed strings; this is a backstop). */
+const MAX_DETAIL_CHARS = 200;
 
 /** Cap on discard records stored on one version (the count is always exact). */
 const MAX_STORED_DISCARDS = 200;
@@ -190,6 +194,9 @@ const SLUG_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
 interface AcceptedCriterion {
   ref: string;
   criterion: AssessmentCriterion;
+  // The quote begins part-way through a sentence of the source (see
+  // SnapshotQuoteIndex.startsMidSentence): becomes a reviewer flag.
+  startsMidSentence: boolean;
 }
 
 /** What one chunk's answer yields once validated. */
@@ -210,6 +217,57 @@ export interface CitationBase {
   contentHash: string;
   retrievedAt: string;
   publishedDate?: string;
+}
+
+/** Fixed, code-written details for discard records. No model text, no source text. */
+const DETAIL = {
+  quote: "the quote is not in the stored text of its source as one whole-word passage",
+  flagged: "the quote overlaps a passage flagged as addressed to a reader model",
+  citationField: "a supporting citation names a field outside the allowed list",
+  citation: "a supporting citation is not in the stored text of the source",
+  ruleRef: "the rule reference is not printed in, or directly before, the quote",
+  valueType: "check.value must be a JSON number for this operator",
+  valuePresent: "a `present` check must not carry a value",
+  value: "check.value is not written in the criterion's own quote",
+  unit: "check.unit is not written in the criterion's own quote",
+  titleNumber: "the title states a number the criterion's own quote does not",
+  factorNumber: "a probe factor states a number the criterion's own quote does not",
+  date: "validFrom / validUntil is not a date written in the criterion's own quote",
+  groupShape: "appliesTo.nationalities and appliesTo.asWritten must be parallel lists of the same length",
+  group: "a member of appliesTo.asWritten is not named in the criterion's own quote as a whole name",
+  polarity: "the passage given for the intent polarity is not in the stored text",
+  polarityFlagged: "the passage given for the intent polarity was flagged",
+  evidenceQuote: "the passage naming the document is not in the stored text",
+  evidenceFlagged: "the passage naming the document was flagged",
+  evidenceKey: "the evidence key is not a slug",
+  evidenceNumber: "the evidence title states a number its quote does not",
+} as const;
+
+/**
+ * Make a model-supplied label safe to store: control and invisible
+ * formatting characters removed, whitespace collapsed, capped. Labels are
+ * stored for the reviewer and never logged.
+ */
+function safeLabel(label: string): string {
+  // eslint-disable-next-line no-control-regex
+  return label.replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g, " ").replace(/\s+/g, " ").trim().slice(0, MAX_LABEL_CHARS);
+}
+
+/** English display names of region codes (platform data, loaded on first use). */
+let regionNames: Intl.DisplayNames | undefined;
+
+/**
+ * The platform's display name for a two-letter region code, or the code
+ * itself when the platform has none (a code it does not know comes back
+ * unchanged, which then never matches the source's wording and is flagged).
+ */
+export function regionDisplayName(code: string): string {
+  try {
+    regionNames ??= new Intl.DisplayNames(["en"], { type: "region" });
+    return regionNames.of(code) ?? code;
+  } catch {
+    return code;
+  }
 }
 
 /**
@@ -234,11 +292,14 @@ export function assessChunkOutput(
   const discards: RubricDiscard[] = [];
   /** Record one discarded item. */
   const discard = (itemType: RubricDiscard["itemType"], reason: RubricDiscardReason, detail: string, label: string) => {
-    discards.push({ itemType, reason, detail, label: label.slice(0, MAX_LABEL_CHARS), sourceId: chunk.sourceId, chunkIndex: chunk.chunkIndex });
+    discards.push({ itemType, reason, detail: detail.slice(0, MAX_DETAIL_CHARS), label: safeLabel(label), sourceId: chunk.sourceId, chunkIndex: chunk.chunkIndex });
   };
-  /** Build the stored citation for a quote found on `page`. */
-  const cite = (quote: string, page: number | undefined): RubricCitation => ({
-    quote: quote.trim(),
+  /**
+   * Build the stored citation for a located passage. `matched` is the
+   * SOURCE's text (from the lookup), never the model's copy.
+   */
+  const cite = (matched: string, page: number | undefined): RubricCitation => ({
+    quote: matched,
     sourceId: base.sourceId,
     url: base.url,
     contentHash: base.contentHash,
@@ -253,7 +314,7 @@ export function assessChunkOutput(
   const suspiciousPassages: RubricCitation[] = [];
   for (const s of raw.suspiciousPassages) {
     const found = index.locate(s.quote);
-    if (found.ok) suspiciousPassages.push(cite(s.quote, found.page));
+    if (found.ok) suspiciousPassages.push(cite(found.matched, found.page));
   }
   /** True when a quote overlaps a flagged passage. */
   const flagged = (quote: string) => suspiciousPassages.some((s) => passagesOverlap(s.quote, quote));
@@ -262,8 +323,13 @@ export function assessChunkOutput(
   const criteria: AcceptedCriterion[] = [];
   for (const c of raw.criteria) {
     const accepted = assessCriterion(c, index, cite, flagged, severityLevels);
-    if ("reason" in accepted) discard("criterion", accepted.reason, accepted.detail, c.title);
-    else criteria.push({ ref: c.ref, criterion: accepted });
+    if ("reason" in accepted) {
+      discard("criterion", accepted.reason, accepted.detail, c.title);
+    } else {
+      // Located again only to ask where the quote sits in its sentence.
+      const found = index.locate(accepted.source.quote);
+      criteria.push({ ref: c.ref, criterion: accepted, startsMidSentence: found.ok && index.startsMidSentence(found) });
+    }
   }
 
   // ---- intent polarity proposal ----
@@ -271,26 +337,20 @@ export function assessChunkOutput(
   // `not_assessed` is the absence of a statement: nothing to cite or keep.
   if (raw.intentPolarity && raw.intentPolarity.value !== "not_assessed") {
     const found = index.locate(raw.intentPolarity.quote);
-    if (!found.ok) discard("intent_polarity", found.reason, "the passage given for the intent polarity is not in the source", raw.intentPolarity.value);
-    else if (flagged(raw.intentPolarity.quote as string)) discard("intent_polarity", "quote_in_flagged_passage", "the passage given for the intent polarity was flagged", raw.intentPolarity.value);
-    else polarity = { value: raw.intentPolarity.value, source: cite(raw.intentPolarity.quote as string, found.page) };
+    if (!found.ok) discard("intent_polarity", found.reason, DETAIL.polarity, raw.intentPolarity.value);
+    else if (flagged(found.matched)) discard("intent_polarity", "quote_in_flagged_passage", DETAIL.polarityFlagged, raw.intentPolarity.value);
+    else polarity = { value: raw.intentPolarity.value, source: cite(found.matched, found.page) };
   }
 
   // ---- evidence items: each must quote the passage that names the document ----
   const evidenceItems: { raw: RawEvidenceItem; source: RubricCitation }[] = [];
   for (const e of raw.evidenceItems) {
     const found = index.locate(e.quote);
-    if (!found.ok) {
-      discard("evidence_item", found.reason, "the passage naming the document is not in the source", e.title);
-    } else if (flagged(e.quote)) {
-      discard("evidence_item", "quote_in_flagged_passage", "the passage naming the document was flagged", e.title);
-    } else if (!SLUG_RE.test(e.key)) {
-      discard("evidence_item", "invalid_shape", "key is not a slug", e.title);
-    } else {
-      const missing = unsupportedNumbers(e.title, e.quote);
-      if (missing.length > 0) discard("evidence_item", "number_not_in_quote", `title states ${missing.join(", ")}, which the quote does not`, e.title);
-      else evidenceItems.push({ raw: e, source: cite(e.quote, found.page) });
-    }
+    if (!found.ok) discard("evidence_item", found.reason, DETAIL.evidenceQuote, e.title);
+    else if (flagged(found.matched)) discard("evidence_item", "quote_in_flagged_passage", DETAIL.evidenceFlagged, e.title);
+    else if (!SLUG_RE.test(e.key)) discard("evidence_item", "invalid_shape", DETAIL.evidenceKey, e.title);
+    else if (unsupportedNumbers(e.title, found.matched).length > 0) discard("evidence_item", "number_not_in_quote", DETAIL.evidenceNumber, e.title);
+    else evidenceItems.push({ raw: e, source: cite(found.matched, found.page) });
   }
 
   return { criteria, discards, suspiciousPassages, polarity, intake: cleanIntakeMeta(raw.intake), intakeQuestions: raw.intakeQuestions, evidenceItems };
@@ -306,78 +366,94 @@ function cleanIntakeMeta(raw: RawRubricOutput["intake"]): IntakeMeta | null {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+/** Operators whose value is a threshold, and so must be a number. */
+const NUMERIC_OPS: readonly string[] = ["gte", "lte", "heldForDays"];
+
 /**
  * Validate one proposed criterion. Returns the stored criterion, or the
- * reason it is discarded. The checks run strictest-evidence first: is the
- * quote there, then is everything else the model said backed by it.
+ * reason it is discarded.
+ *
+ * The one rule behind every check below: what the criterion CLAIMS (a
+ * threshold, a unit, a date, a group, a number in its title) must be written
+ * in the criterion's OWN QUOTE. Supporting citations are kept for the
+ * reviewer but never widen what a claim is checked against: a figure from
+ * another paragraph of the same document proves nothing about this rule.
  */
 function assessCriterion(
   c: RawCriterion,
   index: SnapshotQuoteIndex,
-  cite: (quote: string, page: number | undefined) => RubricCitation,
+  cite: (matched: string, page: number | undefined) => RubricCitation,
   flagged: (quote: string) => boolean,
   severityLevels: readonly string[]
 ): AssessmentCriterion | { reason: RubricDiscardReason; detail: string } {
-  // 1. The quote must be verbatim in THIS source's snapshot (and, in a PDF,
-  //    within one page). A paraphrase, an invented sentence and a sentence
-  //    from another document all fail here.
+  // 1. The quote must be verbatim in THIS source's snapshot: whole words,
+  //    one page / one paragraph. A paraphrase, an invented sentence, a
+  //    fragment cut out of a longer word or number, and a sentence from
+  //    another document all fail here.
   const found = index.locate(c.quote);
-  if (!found.ok) return { reason: found.reason, detail: "the quote is not in the stored text of its source" };
-  if (flagged(c.quote)) return { reason: "quote_in_flagged_passage", detail: "the quote overlaps a passage flagged as addressed to a reader model" };
+  if (!found.ok) return { reason: found.reason, detail: DETAIL.quote };
+  // From here on only the SOURCE's text is used, never the model's copy.
+  const quote = found.matched;
+  if (flagged(quote)) return { reason: "quote_in_flagged_passage", detail: DETAIL.flagged };
 
-  // 2. Per-field supporting passages: each must be verbatim too.
+  // 2. Supporting citations: a closed list of fields, each passage verbatim.
+  //    Reviewer aids only (see the function comment).
   const citations: Record<string, string> = {};
   for (const extra of c.citations) {
+    if (!(RUBRIC_CITATION_FIELDS as readonly string[]).includes(extra.field)) return { reason: "invalid_shape", detail: DETAIL.citationField };
     const at = index.locate(extra.quote);
-    if (!at.ok || flagged(extra.quote)) return { reason: "citation_not_found", detail: `the supporting passage for ${extra.field} is not in the stored text` };
-    citations[extra.field] = extra.quote.trim();
+    if (!at.ok || flagged(at.matched)) return { reason: "citation_not_found", detail: DETAIL.citation };
+    citations[extra.field] = at.matched;
   }
-  // Everything the model may lean on: its quote plus its supporting passages.
-  const support = [c.quote, ...Object.values(citations)].join(" ");
 
-  // 3. The rule reference must be printed in the document.
+  // 3. The rule reference must be printed with the quote (in it, or just
+  //    before it), not merely somewhere in the document.
   const ruleRef = c.ruleRef?.trim() || undefined;
-  if (ruleRef && !index.containsLiteral(ruleRef)) return { reason: "rule_ref_not_in_source", detail: "the rule reference does not appear in the source" };
+  if (ruleRef && !index.ruleRefNear(found, ruleRef)) return { reason: "rule_ref_not_in_source", detail: DETAIL.ruleRef };
 
-  // 4. No invented numbers: every number stated in the check, the title or
-  //    the probe factors must be written in the supporting text. (The title
-  //    may also repeat the rule reference's own digits.)
-  if (c.check && (typeof c.check.value === "number" || typeof c.check.value === "string")) {
-    const missing = unsupportedNumbers(c.check.value, support);
-    if (missing.length > 0) return { reason: "number_not_in_quote", detail: `check.value states ${missing.join(", ")}, which the quote does not` };
+  // 4. The check: a threshold is a NUMBER written in the quote (and not the
+  //    day or year of a date in it); a string is only allowed for `eq`, and
+  //    must be in the quote word for word; a unit must be in the quote too.
+  if (c.check) {
+    const v = c.check.value;
+    if (NUMERIC_OPS.includes(c.check.op) && !(typeof v === "number" && Number.isFinite(v))) return { reason: "invalid_shape", detail: DETAIL.valueType };
+    if (c.check.op === "present" && v !== null) return { reason: "invalid_shape", detail: DETAIL.valuePresent };
+    if (typeof v === "number" && unsupportedNumbers(v, quote, { outsideDates: true }).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.value };
+    if (typeof v === "string" && (!v.trim() || !containsTokenBounded(quote, v))) return { reason: "number_not_in_quote", detail: DETAIL.value };
+    if (c.check.unit !== null && !unitSupported(c.check.unit, quote)) return { reason: "unit_not_in_quote", detail: DETAIL.unit };
   }
-  const titleMissing = unsupportedNumbers(c.title, `${support} ${ruleRef ?? ""}`);
-  if (titleMissing.length > 0) return { reason: "number_not_in_quote", detail: `title states ${titleMissing.join(", ")}, which the quote does not` };
+
+  // 5. Numbers in the applicant-facing wording must be in the quote as well.
+  //    (The rule reference's own digits do not count.)
+  if (unsupportedNumbers(c.title, quote).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.titleNumber };
   for (const factor of c.probeFactors) {
-    const missing = unsupportedNumbers(factor, support);
-    if (missing.length > 0) return { reason: "number_not_in_quote", detail: `a probe factor states ${missing.join(", ")}, which the quote does not` };
+    if (unsupportedNumbers(factor, quote).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.factorNumber };
   }
-  if (c.check?.unit && !unitSupported(c.check.unit, support)) return { reason: "unit_not_in_quote", detail: `the unit ${c.check.unit} is not written in the quote` };
 
-  // 5. Dates must be in the supporting text.
+  // 6. Dates: the same date, as one date expression, in the quote.
   for (const key of ["validFrom", "validUntil"] as const) {
     const v = c[key];
-    if (v && !dateSupported(v, support)) return { reason: "date_not_in_quote", detail: `${key} is not written in the quote` };
+    if (v && !dateSupported(v, quote)) return { reason: "date_not_in_quote", detail: DETAIL.date };
   }
 
-  // 6. A bar's group must be named in the supporting text, word for word.
+  // 7. A bar's group: one source name per code, each a whole name in the quote.
   if (c.appliesTo) {
-    const normSupport = normalizeForQuoteMatch(support);
-    const absent = c.appliesTo.asWritten.filter((w) => !normalizeForQuoteMatch(w) || !normSupport.includes(normalizeForQuoteMatch(w)));
-    if (absent.length > 0) return { reason: "applies_to_not_in_quote", detail: `${absent.length} group member(s) are not named in the quote` };
+    if (c.appliesTo.asWritten.length !== c.appliesTo.nationalities.length) return { reason: "invalid_shape", detail: DETAIL.groupShape };
+    if (c.appliesTo.asWritten.some((w) => !groupNameSupported(w, quote))) return { reason: "applies_to_not_in_quote", detail: DETAIL.group };
   }
 
-  // 7. Build the stored criterion. Nothing is silently "repaired": a
+  // 8. Build the stored criterion. Nothing is silently "repaired": a
   //    judgement criterion that came with a check keeps it here, and is then
   //    discarded by the shape rules below.
+  const nationalities = c.appliesTo?.nationalities.map((n) => n.trim().toUpperCase()) ?? [];
   const criterion: AssessmentCriterion = {
-    criterionId: criterionIdOf(index.snapshot.sourceId, c.quote, c.kind, c.check?.field),
+    criterionId: criterionIdOf(index.snapshot.sourceId, quote, c.kind, c.check?.field),
     title: c.title.trim(),
     kind: c.kind,
     stage: c.stage,
     severity: c.severity,
     ...(ruleRef ? { ruleRef } : {}),
-    source: cite(c.quote, found.page),
+    source: cite(quote, found.page),
     ...(c.check
       ? {
         check: {
@@ -388,7 +464,16 @@ function assessCriterion(
         },
       }
       : {}),
-    ...(c.appliesTo ? { appliesTo: { nationalities: c.appliesTo.nationalities.map((n) => n.trim().toUpperCase()), asWritten: c.appliesTo.asWritten.map((w) => w.trim()) } } : {}),
+    ...(c.appliesTo
+      ? {
+        appliesTo: {
+          nationalities,
+          asWritten: c.appliesTo.asWritten.map((w) => w.trim()),
+          // Platform data beside the model's proposal, for the reviewer.
+          codeNames: nationalities.map(regionDisplayName),
+        },
+      }
+      : {}),
     ...(c.validFrom ? { validFrom: c.validFrom } : {}),
     ...(c.validUntil ? { validUntil: c.validUntil } : {}),
     ...(c.kind === "judgement"
@@ -399,8 +484,8 @@ function assessCriterion(
     confidence: c.confidence,
   };
 
-  // 8. Kind rules (judgement with a check, objective without one, a bar with
-  //    no group, ...).
+  // 9. Kind rules (judgement with a check, objective without one, a bar with
+  //    no group, ...). The detail is the validator's own codes.
   const issues = validateCriterionShape(criterion, severityLevels);
   if (issues.length > 0) return { reason: "invalid_shape", detail: issues.map((i) => i.code).join(", ") };
   return criterion;
@@ -450,12 +535,12 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
     suspiciousPassages.push(...assessment.suspiciousPassages);
     /** Record a discard made at merge time. */
     const discard = (itemType: RubricDiscard["itemType"], reason: RubricDiscardReason, detail: string, label: string) =>
-      discards.push({ itemType, reason, detail, label: label.slice(0, MAX_LABEL_CHARS), sourceId: chunk.sourceId, chunkIndex: chunk.chunkIndex });
+      discards.push({ itemType, reason, detail, label: safeLabel(label), sourceId: chunk.sourceId, chunkIndex: chunk.chunkIndex });
 
     // ---- criteria ----
     // The model's handles are only meaningful inside its own answer.
     const refToId = new Map<string, string>();
-    for (const { ref, criterion } of assessment.criteria) {
+    for (const { ref, criterion, startsMidSentence } of assessment.criteria) {
       refToId.set(ref, criterion.criterionId);
       if (byId.has(criterion.criterionId)) {
         discard("criterion", "duplicate", "the same passage was already extracted", criterion.title);
@@ -463,6 +548,15 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
       }
       byId.set(criterion.criterionId, criterion);
       criteria.push(criterion);
+      if (startsMidSentence) {
+        // The check code cannot make: do the words BEFORE the quote change
+        // what it means? Said out loud, per criterion, for the reviewer.
+        flags.push({
+          code: "quote_starts_mid_sentence",
+          message: "the quote begins part-way through a sentence of the source. Words before it (a negation, a condition) may change its meaning: read the whole sentence in the source before approving.",
+          target: criterion.criterionId,
+        });
+      }
     }
     /** Stable ids of the surviving criteria a list of handles points at. */
     const resolve = (refs: string[]) => [...new Set(refs.map((r) => refToId.get(r)).filter((id): id is string => id !== undefined))];
@@ -549,7 +643,7 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
       if (!questions.has(id)) continue;
       if (conds.some((c) => !questions.has(c.questionId) || c.questionId === id)) {
         const q = questions.get(id) as IntakeQuestion;
-        discards.push({ itemType: "intake_question", reason: "unresolved_reference", detail: "its show-when condition names a question that is not in the rubric", label: q.label.slice(0, MAX_LABEL_CHARS), sourceId: "", chunkIndex: -1 });
+        discards.push({ itemType: "intake_question", reason: "unresolved_reference", detail: "its show-when condition names a question that is not in the rubric", label: safeLabel(q.label), sourceId: "", chunkIndex: -1 });
         questions.delete(id);
         removed = true;
       }
@@ -570,6 +664,89 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
   }
 
   return { criteria, intake, intakeQuestions, evidenceItems: [...evidence.values()], intentPolarityProposal, suspiciousPassages, discards, flags };
+}
+
+/** What `reviewFlagsFor` needs to know about the run besides its content. */
+export interface ReviewFlagContext {
+  // Model calls the version was built from.
+  chunkCount: number;
+  // PDF pages whose text does not end at the end of a sentence, per source.
+  pagesEndingMidSentence: { sourceId: string; pages: number[] }[];
+}
+
+/** Characters a page can end on and still be "at the end of a sentence". */
+const SENTENCE_END_RE = /[.!?:;)\]"'\u2019\u201D\u00BB]$/;
+
+/** 1-based numbers of a PDF snapshot's pages that end mid-sentence. */
+export function pagesEndingMidSentence(snapshot: Pick<GuidanceSnapshotContent, "pages">): number[] {
+  return (snapshot.pages ?? []).filter((p) => p.text.trim().length > 0 && !SENTENCE_END_RE.test(p.text.trim())).map((p) => p.page);
+}
+
+/**
+ * The STANDING reviewer flags of an extracted rubric: things code cannot
+ * verify, said out loud on every version they apply to, so a reviewer never
+ * has to remember them. They are remarks, not errors.
+ *
+ *  - nationality_codes_model_proposed   any mandatory bar: the country codes
+ *        are the model's mapping of the source's wording; confirm each one.
+ *  - nationality_code_name_mismatch     per criterion and code: the
+ *        platform's name for the code is not how the source names it.
+ *  - intake_wording_uncited             intake labels, help text and options
+ *        are the model's wording, not quotes.
+ *  - multiple_chunks / page_ends_mid_sentence   a rule that runs across a
+ *        chunk or page boundary may be missing or cut short.
+ */
+export function reviewFlagsFor(content: Pick<MergedRubricContent, "criteria" | "intakeQuestions">, ctx: ReviewFlagContext): RubricFlag[] {
+  const flags: RubricFlag[] = [];
+  const bars = content.criteria.filter((c) => c.kind === "mandatory_bar" && c.appliesTo);
+  if (bars.length > 0) {
+    flags.push({
+      code: "nationality_codes_model_proposed",
+      message: `${bars.length} mandatory bar(s) carry country codes proposed by the extraction model from the source's wording. Code has checked the wording is in the quote, not that each code is the right one: confirm every code against appliesTo.asWritten before approving.`,
+      target: "rubric",
+    });
+  }
+  for (const c of bars) {
+    const a = c.appliesTo as NonNullable<AssessmentCriterion["appliesTo"]>;
+    a.nationalities.forEach((code, i) => {
+      const name = a.codeNames?.[i] ?? regionDisplayName(code);
+      // Compared without case; anything else (a different spelling, an
+      // adjective, a code the platform does not know) is for the reviewer.
+      if (name.toLowerCase() !== (a.asWritten[i] ?? "").trim().toLowerCase()) {
+        flags.push({
+          code: "nationality_code_name_mismatch",
+          // The code is two validated letters and the name is platform data:
+          // neither is free text from the model.
+          message: `entry ${i + 1} of the group: code ${code} is "${name}" on this platform, which is not how the source names that entry. Confirm or reject the code.`,
+          target: c.criterionId,
+        });
+      }
+    });
+  }
+  if (content.intakeQuestions.length > 0) {
+    flags.push({
+      code: "intake_wording_uncited",
+      message: `${content.intakeQuestions.length} intake question(s): their labels, help text and options are wording written by the extraction model, not quotes from the source. Read each one before approving.`,
+      target: "rubric",
+    });
+  }
+  if (ctx.chunkCount > 1) {
+    flags.push({
+      code: "multiple_chunks",
+      message: `built from ${ctx.chunkCount} separate excerpts of the source(s). A rule whose text runs across the boundary between two excerpts may be missing or incomplete.`,
+      target: "rubric",
+    });
+  }
+  for (const s of ctx.pagesEndingMidSentence) {
+    if (s.pages.length === 0) continue;
+    const shown = s.pages.slice(0, 30).join(", ");
+    flags.push({
+      code: "page_ends_mid_sentence",
+      message: `${s.pages.length} page(s) of ${s.sourceId} do not end at the end of a sentence (page ${shown}${s.pages.length > 30 ? ", ..." : ""}). A quote cannot cross a page break, so a rule that does may be missing or cut short.`,
+      target: "rubric",
+    });
+  }
+  return flags;
 }
 
 /** Count discards by reason. */
@@ -666,6 +843,35 @@ export class RubricExtractionService {
     let chunkCount = 0;
     let reachedModel = false;
 
+    /** The run record for a status (the same doc id from start to finish). */
+    const runRecord = (
+      status: RubricRunStatus,
+      r: Pick<ExtractRouteResult, "reasonCode" | "error" | "version" | "criteriaAccepted" | "discardedCount" | "discardedByReason" | "costUsd">
+    ): RubricExtractionRun => ({
+      runId,
+      routeKey,
+      countryCode: input.countryCode,
+      visaTypeId: input.visaTypeId,
+      status,
+      reachedModel,
+      reasonCode: r.reasonCode,
+      error: r.error,
+      trigger,
+      sourceSnapshots: sources.map((s) => s.snapshot),
+      sourceSetHash,
+      model,
+      promptVersion: RUBRIC_PROMPT_VERSION,
+      version: r.version,
+      chunks: chunkCount,
+      usage,
+      costUsd: r.costUsd,
+      criteriaAccepted: r.criteriaAccepted,
+      discardedCount: r.discardedCount,
+      discardedByReason: r.discardedByReason,
+      startedAt,
+      finishedAt: this.now(),
+    });
+
     /** Assemble a result (and, when asked, store the run record). */
     const finish = async (
       status: ExtractRouteResult["status"],
@@ -689,29 +895,7 @@ export class RubricExtractionService {
         costUsd,
       };
       if (record && status !== "dry_run") {
-        const run: RubricExtractionRun = {
-          runId,
-          routeKey,
-          countryCode: input.countryCode,
-          visaTypeId: input.visaTypeId,
-          status,
-          reasonCode: result.reasonCode,
-          error: result.error,
-          trigger,
-          sourceSnapshots: sources.map((s) => s.snapshot),
-          sourceSetHash,
-          model,
-          promptVersion: RUBRIC_PROMPT_VERSION,
-          version: result.version,
-          chunks: chunkCount,
-          usage,
-          costUsd,
-          criteriaAccepted: result.criteriaAccepted,
-          discardedCount: result.discardedCount,
-          discardedByReason: result.discardedByReason,
-          startedAt,
-          finishedAt: this.now(),
-        };
+        const run = runRecord(status, result);
         try {
           await this.store.writeRun(run);
         } catch (err) {
@@ -754,12 +938,14 @@ export class RubricExtractionService {
 
       // ---- 4. plan: read the snapshot text, cut it, check the caps ----
       const indexes = new Map<string, SnapshotQuoteIndex>();
+      const midSentence: ReviewFlagContext["pagesEndingMidSentence"] = [];
       const chunks: SourceChunk[] = [];
       plan = [];
       for (const s of sources) {
         // `read` re-hashes the text and refuses a mismatch.
         const content: GuidanceSnapshotContent = await this.snapshots.read(s.snapshot.sourceId, s.snapshot.contentHash);
         indexes.set(s.snapshot.sourceId, new SnapshotQuoteIndex(content));
+        midSentence.push({ sourceId: s.snapshot.sourceId, pages: pagesEndingMidSentence(content) });
         const cut = chunkSnapshot(content, settings.maxChunkChars);
         chunks.push(...cut);
         plan.push({ sourceId: s.snapshot.sourceId, contentHashPrefix: s.snapshot.contentHash.slice(0, 12), docType: s.snapshot.docType, chars: content.text.length, chunks: cut.length });
@@ -769,11 +955,27 @@ export class RubricExtractionService {
       this.assertWithinCaps(chunks, settings);
       if (input.dryRun) return await finish("dry_run", {}, false);
 
-      // The daily cap counts runs that reached the model, so it is checked
-      // only now that this run is about to.
+      // The daily cap counts the runs that REACHED THE MODEL today (UTC),
+      // whatever became of them, so it is checked only now that this run is
+      // about to.
       const dayStart = Timestamp.fromMillis(Math.floor(startedAt.toMillis() / 86_400_000) * 86_400_000);
       if ((await this.store.countRunsSince(dayStart)) >= settings.maxRunsPerDay) {
         throw new RunStop("skipped", "daily_cap_reached", `the daily cap of ${settings.maxRunsPerDay} extraction run(s) is used up`);
+      }
+      // Claim this run's place BEFORE its first call: a `started` record that
+      // the final record later replaces. A run that crashes, or whose final
+      // record cannot be saved, is then still counted, and a second run
+      // starting meanwhile sees this one. (Check-then-write is not atomic:
+      // two runs starting in the same instant can both pass, so the cap can
+      // be exceeded by the number of simultaneous starts, not more.) If the
+      // record cannot be written the run does not start: an uncounted run
+      // is how a cap stops being one.
+      reachedModel = true;
+      try {
+        await this.store.writeRun(runRecord("started", { reasonCode: null, error: null, version: null, criteriaAccepted: 0, discardedCount: 0, discardedByReason: {}, costUsd: null }));
+      } catch (err) {
+        reachedModel = false;
+        throw new RunStop("skipped", "run_record_unavailable", "the run could not be recorded, so it was not started");
       }
 
       // ---- 5 + 6. one call per chunk, validated in code ----
@@ -782,7 +984,6 @@ export class RubricExtractionService {
       for (const chunk of chunks) {
         const source = sources.find((s) => s.snapshot.sourceId === chunk.sourceId) as LoadedSource;
         const request = buildRubricRequest(chunk, severityLevels, { maxOutputTokens: settings.maxOutputTokensPerRequest, timeoutMs: settings.requestTimeoutMs });
-        reachedModel = true;
         const raw = await this.callModel(request, usage);
         parts.push({
           chunk,
@@ -799,8 +1000,9 @@ export class RubricExtractionService {
       // ---- 7. merge ----
       const merged = mergeAssessments(parts);
       const discardedByReason = countByReason(merged.discards);
-      // Every rejection is logged with its reason (never with source text).
-      for (const d of merged.discards) console.warn(`${TAG} ${routeKey}: discarded ${d.itemType} (${d.reason}) from ${d.sourceId || "merge"}#${d.chunkIndex}: ${d.detail}`);
+      // Every rejection is logged with its reason CODE and where it came
+      // from. Never the detail, the label, the model's text or source text.
+      for (const d of merged.discards) console.warn(`${TAG} ${routeKey}: discarded ${d.itemType} (${d.reason}) from ${d.sourceId || "merge"}#${d.chunkIndex}`);
       if (merged.criteria.length === 0) {
         return await finish("failed", { reasonCode: "no_criteria_accepted", error: "no criterion survived validation", discardedCount: merged.discards.length, discardedByReason }, true);
       }
@@ -841,7 +1043,11 @@ export class RubricExtractionService {
         const codes = [...new Set(validation.errors.map((e) => e.code))].join(", ");
         return await finish("failed", { reasonCode: "rubric_invalid", error: `the merged rubric is not consistent: ${codes}`, discardedCount: merged.discards.length, discardedByReason }, true);
       }
-      draft.flags = [...merged.flags, ...validation.flags];
+      draft.flags = [
+        ...merged.flags,
+        ...validation.flags,
+        ...reviewFlagsFor(merged, { chunkCount, pagesEndingMidSentence: midSentence }),
+      ];
       if (merged.suspiciousPassages.length > 0) {
         draft.flags.push({ code: "suspicious_passages", message: `${merged.suspiciousPassages.length} passage(s) of the source read as instructions to a reader model; no criterion quotes them. Read them before approving.`, target: "rubric" });
       }

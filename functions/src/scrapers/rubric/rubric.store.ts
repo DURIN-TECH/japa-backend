@@ -30,9 +30,14 @@ import type { RubricExtractionRun, RubricHead, VisaRubric } from "../../types/ru
 // Immutable versions: a version doc is only ever created. A version number
 // that already exists is refused, never overwritten.
 
-/** Head doc id of a route. Both parts are checked so neither can carry a `/`. */
+/**
+ * Head doc id of a route. Both parts are checked so neither can carry a `/`.
+ * The country code must be two UPPER-CASE letters, as the catalogue stores
+ * it: a lower-case code is refused rather than folded, so one route can
+ * never end up under two keys.
+ */
 export function rubricRouteKey(countryCode: string, visaTypeId: string): string {
-  if (!/^[A-Za-z]{2}$/.test(countryCode)) throw new Error(`Invalid country code: ${JSON.stringify(countryCode)}`);
+  if (!/^[A-Z]{2}$/.test(countryCode)) throw new Error(`Invalid country code (two upper-case letters expected): ${JSON.stringify(countryCode)}`);
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(visaTypeId)) throw new Error(`Invalid visa type id: ${JSON.stringify(visaTypeId)}`);
   return `${countryCode}_${visaTypeId}`;
 }
@@ -175,16 +180,15 @@ export class RubricStore {
   }
 
   /**
-   * How many runs since `since` reached the model (succeeded or failed).
+   * How many runs since `since` REACHED THE MODEL (`reachedModel: true`):
+   * still running (`started`), finished either way, or died mid-way. A run
+   * refused or failed before its first call is not counted.
    * One range filter on one field: served by the automatic single-field
    * index, no composite index needed. Runs are few, so they are counted here.
    */
   async countRunsSince(since: Timestamp): Promise<number> {
     const snap = await collections.rubricExtractionRuns.where("startedAt", ">=", since).get();
-    return snap.docs.filter((d) => {
-      const status = (d.data() as RubricExtractionRun).status;
-      return status === "succeeded" || status === "failed";
-    }).length;
+    return snap.docs.filter((d) => (d.data() as RubricExtractionRun).reachedModel === true).length;
   }
 }
 

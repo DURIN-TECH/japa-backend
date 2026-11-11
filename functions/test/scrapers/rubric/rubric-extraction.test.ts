@@ -193,9 +193,19 @@ describe("rubric extraction: a web-page source", () => {
     assert.equal(funds.check, undefined);
     // A nationality-scoped bar round-trips with its dates and its wording.
     const bar = byTitle(rubric, "Nationals refused from a stated date");
-    assert.deepEqual(bar.appliesTo, { nationalities: ["QM", "QN"], asWritten: ["Borduria", "Syldavia"] });
+    // `codeNames` is the platform's name for each code, added by code beside
+    // the model's proposal (these invented codes have no name: the code
+    // comes back, which never matches the wording and is flagged below).
+    assert.deepEqual(bar.appliesTo, { nationalities: ["QM", "QN"], asWritten: ["Borduria", "Syldavia"], codeNames: ["QM", "QN"] });
     assert.equal(bar.validFrom, "2026-03-26");
     assert.equal(bar.stage, "suitability");
+    // Standing reviewer flags: what code cannot verify is said on the version.
+    assert.deepEqual(rubric.flags.map((f) => [f.code, f.target]), [
+      ["nationality_codes_model_proposed", "rubric"],
+      ["nationality_code_name_mismatch", bar.criterionId],
+      ["nationality_code_name_mismatch", bar.criterionId],
+      ["intake_wording_uncited", "rubric"],
+    ]);
 
     // Intake questions and evidence point at the STABLE criterion ids.
     assert.deepEqual(rubric.intake, { title: "About your visit", cardTitle: "Your visit" });
@@ -219,7 +229,7 @@ describe("rubric extraction: a web-page source", () => {
     assert.deepEqual(rubric.sourceSnapshots, [{ sourceId: SOURCE_A_ID, contentHash: hash, url: SOURCE_A_URL, docType: "html", publishedDate: SOURCE_A_PUBLISHED }]);
     assert.equal(rubric.sourceSetHash, sourceSetHashOf([{ sourceId: SOURCE_A_ID, contentHash: hash }]));
     assert.equal(rubric.extractorModel, "recorded-model");
-    assert.equal(rubric.extractorPromptVersion, "2026-11-rubric-v1");
+    assert.equal(rubric.extractorPromptVersion, "2026-11-rubric-v2");
   });
 
   test("the polarity is stored as a cited PROPOSAL; the decision stays empty for the admin", async () => {
@@ -241,7 +251,7 @@ describe("rubric extraction: a web-page source", () => {
     await runA(h);
     const rubric = versionDoc(KEY_A, 1) as VisaRubric;
     assert.equal(rubric.intentPolarityProposal, null);
-    assert.deepEqual(rubric.flags.map((f) => f.code), ["intent_criteria_without_polarity"]);
+    assert.ok(rubric.flags.some((f) => f.code === "intent_criteria_without_polarity"));
   });
 
   test("the head records the newest version and leaves approvedVersion empty", async () => {
@@ -292,6 +302,62 @@ describe("rubric extraction: a web-page source", () => {
 // ============================================
 // A PDF: page numbers, opposite polarity
 // ============================================
+
+describe("rubric extraction: nothing the model writes reaches a log or a stored detail", () => {
+  test("a misbehaving answer: its strings are in no log line, no discard detail and no run record", async () => {
+    // Markers a hostile or careless answer puts wherever it can put a string.
+    const M = { title: "LEAK-TITLE-7731", unit: "LEAK-UNIT-7732", field: "LEAK-FIELD-7733", ref: "LEAK-REF-7734", value: "LEAK-VALUE-7735", name: "LEAK-NAME-7736", factor: "LEAK-FACTOR-7737", label: "LEAK-LABEL-7738", key: "leak-key-7739" };
+    const real = "There is no set level of funds.";
+    const out = routeAAnswer();
+    out.criteria.push(
+      crit({ ref: "m1", title: M.title, kind: "objective", quote: real, check: { field: M.field, op: "eq", value: true, unit: M.unit } }),
+      crit({ ref: "m2", title: `${M.title} b\u202Ed\ni`, kind: "objective", quote: real, check: { field: "f", op: "eq", value: M.value, unit: null } }),
+      crit({ ref: "m3", title: `${M.title} c`, kind: "judgement", quote: real, ruleRef: M.ref, probeFactors: [M.factor], requiresInterviewBeforeRefusal: false }),
+      crit({ ref: "m4", title: `${M.title} d`, kind: "mandatory_bar", quote: real, appliesTo: { nationalities: ["QM"], asWritten: [M.name] } }),
+      crit({ ref: "m5", title: `${M.title} e`, kind: "judgement", quote: `${M.value} is nowhere in the document`, probeFactors: ["x"], requiresInterviewBeforeRefusal: false }),
+      crit({ ref: "m6", title: `${M.title} f ${"x".repeat(500)}`, kind: "objective", quote: real, check: { field: "f", op: "gte", value: M.value as unknown as number, unit: null } })
+    );
+    out.intakeQuestions.push({ id: "Not A Slug", label: M.label, helpText: null, answerType: "text", required: true, criterionRefs: ["m1"], group: null, party: null, options: [], textMaxLength: null, dateRelativeToToday: null, showWhenAnyOf: [] });
+    out.evidenceItems.push({ key: M.key, title: M.label, party: "applicant", criterionRefs: ["age"], quote: `${M.value} names no document`, documentType: null, fields: [] });
+    await setUpRouteA(h, out);
+    const { result, lines } = await runA(h);
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.discardedCount, 8);
+
+    const markers = Object.values(M);
+    const leaksIn = (text: string) => markers.filter((m) => text.includes(m));
+    // Logs: reason codes and positions only.
+    for (const line of lines) assert.deepEqual(leaksIn(line), [], `log line: ${line.slice(0, 80)}`);
+    assert.ok(lines.some((l) => /discarded criterion \(unit_not_in_quote\) from avalen-short-visit-rules#0$/.test(l)));
+    // Stored details are fixed sentences; the run record holds no label at all.
+    const rubric = versionDoc(KEY_A, 1) as VisaRubric;
+    for (const d of rubric.discarded) {
+      assert.deepEqual(leaksIn(d.detail), [], d.reason);
+      assert.ok(d.detail.length <= 200);
+      // The label is the one model string kept (for the reviewer): capped,
+      // with control and direction-override characters removed.
+      assert.ok(d.label.length <= 120);
+      // eslint-disable-next-line no-control-regex
+      assert.doesNotMatch(d.label, /[\u0000-\u001F\u202A-\u202E]/);
+    }
+    assert.deepEqual(leaksIn(JSON.stringify(runDocs())), []);
+    assert.deepEqual(leaksIn(JSON.stringify(result)), []);
+    // And none of it became a criterion.
+    assert.equal(rubric.criteria.length, 6);
+  });
+
+  test("a schema-breaking answer: the stored error names paths, never the model's own key or value", async () => {
+    const out: any = routeAAnswer();
+    out.criteria[0]["LEAK-KEY-8841"] = "LEAK-VALUE-8842";
+    out.criteria[1].citations = [{ field: "LEAK-FIELD-8843", quote: "x" }];
+    await setUpRouteA(h, out);
+    const { result, lines } = await runA(h);
+    assert.equal(result.reasonCode, "invalid_model_output");
+    const everything = `${lines.join("\n")}\n${JSON.stringify(result)}\n${JSON.stringify(runDocs())}`;
+    assert.doesNotMatch(everything, /LEAK-/);
+    assert.match(result.error as string, /\$\.criteria\[0\]: has a property that is not allowed/);
+  });
+});
 
 describe("rubric extraction: a PDF source", () => {
   /** Seed route B and record an answer for its single chunk. */
@@ -397,7 +463,8 @@ describe("rubric extraction: what the code-side validation rejects", () => {
     // The quote is real ("no set level of funds"); the threshold is made up.
     const { reasons, rubric } = await rejectReason(crit({ ref: "x", title: "Minimum funds", kind: "objective", quote: "There is no set level of funds.", check: { field: "funds.balance", op: "gte", value: 5000, unit: null } }));
     assert.deepEqual(reasons, { number_not_in_quote: 1 });
-    assert.match(rubric.discarded[0].detail, /5000/);
+    // The stored detail is a fixed sentence: it names the field, not the figure.
+    assert.equal(rubric.discarded[0].detail, "check.value is not written in the criterion's own quote");
   });
 
   test("a real quote with an altered number is rejected", async () => {
@@ -851,7 +918,52 @@ describe("rubric extraction: cost guards", () => {
     assert.deepEqual(versionPaths(), []);
   });
 
-  test("the daily cap counts runs that reached the model", async () => {
+  test("a run that never reached the model does not use up the daily cap; one that died after starting does", async () => {
+    await setUpRouteA(h);
+    h.settings.maxRunsPerDay = 1;
+    // Fails before any call (not a real visa type): recorded, not counted.
+    h.state.knownVisaTypes.clear();
+    const early = await runA(h);
+    assert.equal(early.result.reasonCode, "visa_type_not_found");
+    assert.equal(runDocs()[0].reachedModel, false);
+    h.state.knownVisaTypes.add(`${ROUTE_A.countryCode}/${ROUTE_A.visaTypeId}`);
+    assert.equal(await h.rubrics.countRunsSince(Timestamp.fromMillis(0)), 0);
+
+    // A run that crashed after its first call left only its `started`
+    // record behind. It reached the model, so it counts.
+    store.set("rubricExtractionRuns/crashed-run", { runId: "crashed-run", status: "started", reachedModel: true, startedAt: Timestamp.fromMillis(T0 - 1000) });
+    const blocked = await runA(h);
+    assert.equal(blocked.result.reasonCode, "daily_cap_reached");
+    assert.equal(h.provider.requests.length, 0);
+  });
+
+  test("the `started` record is written before the first model call and replaced by the final one", async () => {
+    await setUpRouteA(h);
+    // Look at the run records from inside the model call.
+    const seen: any[] = [];
+    const original = h.provider.complete.bind(h.provider);
+    h.provider.complete = async (request) => {
+      seen.push(...runDocs().map((r) => ({ ...r })));
+      return original(request);
+    };
+    const { result } = await runA(h);
+    assert.deepEqual(seen.map((r) => [r.status, r.reachedModel, r.runId]), [["started", true, result.runId]]);
+    assert.deepEqual(runDocs().map((r) => [r.status, r.reachedModel, r.runId]), [["succeeded", true, result.runId]]);
+  });
+
+  test("when the `started` record cannot be written the run does not start", async () => {
+    await setUpRouteA(h);
+    h.rubrics.writeRun = async () => {
+      throw new Error("unavailable");
+    };
+    const { result } = await runA(h);
+    assert.equal(result.status, "skipped");
+    assert.equal(result.reasonCode, "run_record_unavailable");
+    assert.equal(h.provider.requests.length, 0);
+    assert.deepEqual(versionPaths(), []);
+  });
+
+  test("the daily cap counts runs that reached the model (succeeded or failed), per UTC day", async () => {
     await setUpRouteA(h);
     h.settings.maxRunsPerDay = 1;
     assert.equal((await runA(h)).result.status, "succeeded");

@@ -126,8 +126,13 @@ export function validateCriterionShape(c: AssessmentCriterion, severityLevels: r
       add("bar_without_applies_to", "a mandatory bar needs appliesTo.nationalities");
     } else {
       if (a.nationalities.some((n) => !/^[A-Z]{2}$/.test(n))) add("nationality_code_invalid", "appliesTo.nationalities must be two-letter uppercase codes");
-      if (!Array.isArray(a.asWritten) || a.asWritten.length !== a.nationalities.length || a.asWritten.some((w) => !filled(w))) {
-        add("applies_to_as_written_mismatch", "appliesTo.asWritten must give the source's own wording for each nationality code");
+      // One source name per code, in the same order. A name of one or two
+      // characters is not a name (it would "match" inside almost any text).
+      if (!Array.isArray(a.asWritten) || a.asWritten.length !== a.nationalities.length || a.asWritten.some((w) => !filled(w) || w.trim().length < 3)) {
+        add("applies_to_as_written_mismatch", "appliesTo.asWritten must give the source's own wording (3 characters or more) for each nationality code, in the same order");
+      }
+      if (a.codeNames !== undefined && (!Array.isArray(a.codeNames) || a.codeNames.length !== a.nationalities.length)) {
+        add("applies_to_code_names_mismatch", "appliesTo.codeNames must be parallel to appliesTo.nationalities");
       }
     }
   }
@@ -136,8 +141,15 @@ export function validateCriterionShape(c: AssessmentCriterion, severityLevels: r
     if (!CHECK_OPS.includes(c.check.op)) add("check_op_invalid", `check.op must be one of ${CHECK_OPS.join(", ")}`);
     else if (c.check.op !== "present" && (c.check.value === undefined || c.check.value === null || c.check.value === "")) {
       add("check_value_missing", `check.value is required for op ${c.check.op}`);
-    } else if (c.check.op === "heldForDays" && (typeof c.check.value !== "number" || !filled(c.check.unit))) {
+    } else if (c.check.op === "heldForDays" && (typeof c.check.value !== "number" || !Number.isFinite(c.check.value) || !filled(c.check.unit))) {
       add("check_duration_invalid", "a heldForDays check needs a numeric value and the unit the source writes it in");
+    } else if ((c.check.op === "gte" || c.check.op === "lte") && (typeof c.check.value !== "number" || !Number.isFinite(c.check.value))) {
+      // A threshold is a number. A string here ("a hundred thousand", digits
+      // of another script) could not be checked against the quote, so it is
+      // refused outright rather than accepted unverified.
+      add("check_value_not_numeric", `check.value must be a finite number for op ${c.check.op}`);
+    } else if (c.check.op === "present" && c.check.value !== undefined) {
+      add("check_value_unexpected", "a `present` check must not carry a value");
     }
   }
   for (const key of ["validFrom", "validUntil"] as const) {

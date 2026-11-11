@@ -62,8 +62,10 @@ describe("quote lookup", () => {
   const pdf = new SnapshotQuoteIndex(snapshot(SOURCE_B_ID, B_PAGES));
 
   test("an exact substring is found; whitespace differences do not matter", () => {
-    assert.deepEqual(html.locate("An applicant must be aged 18 or over"), { ok: true });
-    assert.deepEqual(html.locate("An applicant must\n   be aged 18\tor over"), { ok: true });
+    assert.equal(html.locate("An applicant must be aged 18 or over").ok, true);
+    const rewrapped = html.locate("An applicant must\n   be aged 18\tor over");
+    // What comes back is the SOURCE's text, not the caller's copy of it.
+    assert.deepEqual(rewrapped.ok && rewrapped.matched, "An applicant must be aged 18 or over");
   });
 
   test("anything else is not found: a paraphrase, another case, changed punctuation", () => {
@@ -79,9 +81,14 @@ describe("quote lookup", () => {
   });
 
   test("a PDF quote gets the page it is on", () => {
-    assert.deepEqual(pdf.locate(B_QUOTES.dual), { ok: true, page: 2 });
-    assert.deepEqual(pdf.locate(B_QUOTES.tuition), { ok: true, page: 3 });
-    assert.deepEqual(pdf.locate(B_QUOTES.tiesRewrapped), { ok: true, page: 2 });
+    /** The page a quote is found on (undefined when it is not found). */
+    const pageOf = (q: string) => {
+      const found = pdf.locate(q);
+      return found.ok ? found.page : undefined;
+    };
+    assert.equal(pageOf(B_QUOTES.dual), 2);
+    assert.equal(pageOf(B_QUOTES.tuition), 3);
+    assert.equal(pageOf(B_QUOTES.tiesRewrapped), 2);
   });
 
   test("a PDF quote spanning two pages is told apart from one that is not there", () => {
@@ -90,8 +97,9 @@ describe("quote lookup", () => {
   });
 
   test("a hyphen at a line end is kept: the joined word does not match", () => {
-    const hyphen = new SnapshotQuoteIndex(snapshot("doc", "Applications in the non-\ncomplex stream are decided first by the duty officer."));
-    assert.deepEqual(hyphen.locate("Applications in the non- complex stream are decided first"), { ok: true });
+    // A PDF page: its line breaks are layout, so a quote may run over them.
+    const hyphen = new SnapshotQuoteIndex(snapshot("doc", ["Applications in the non-\ncomplex stream are decided first by the duty officer."]));
+    assert.equal(hyphen.locate("Applications in the non- complex stream are decided first").ok, true);
     assert.deepEqual(hyphen.locate("Applications in the non-complex stream are decided first"), { ok: false, reason: "quote_not_found" });
   });
 
@@ -115,7 +123,8 @@ describe("quote lookup", () => {
 describe("number, date and unit checks", () => {
   test("numbersIn reads digits (commas, decimals, ordinals) and number words", () => {
     assert.deepEqual([...numbersIn("held for 28 days, at least 1,270.50 and the 3rd payslip")].sort(), ["1270.5", "28", "3"]);
-    assert.deepEqual([...numbersIn("for twenty-eight consecutive days or six months")].sort(), ["20", "28", "6", "8"]);
+    // A compound number word is ONE number: it does not also license its parts.
+    assert.deepEqual([...numbersIn("for twenty-eight consecutive days or six months")].sort(), ["28", "6"]);
     assert.deepEqual([...numbersIn("no figures here")], []);
   });
 
@@ -136,11 +145,16 @@ describe("number, date and unit checks", () => {
     assert.equal(dateSupported("26 March 2026", "applies on or after 26 March 2026"), false);
   });
 
-  test("unitSupported checks duration units only", () => {
+  test("unitSupported: every unit must be written in the quote, exactly as given", () => {
     assert.equal(unitSupported("days", "for 28 consecutive days"), true);
-    assert.equal(unitSupported("days", "within 1 day of arrival"), true);
+    assert.equal(unitSupported("day", "within 1 day of arrival"), true);
+    assert.equal(unitSupported("days", "within 1 day of arrival"), false);
     assert.equal(unitSupported("months", "for 28 consecutive days"), false);
-    assert.equal(unitSupported("XAC", "an amount of 100"), true);
+    // Not only durations: a currency code needs that code in the quote.
+    assert.equal(unitSupported("XAC", "an amount of 100"), false);
+    assert.equal(unitSupported("XAC", "an amount of 100 XAC"), true);
+    assert.equal(unitSupported("day", "paid on a weekday"), false);
+    assert.equal(unitSupported("  ", "anything"), false);
   });
 });
 
