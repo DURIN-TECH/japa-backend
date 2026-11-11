@@ -32,6 +32,10 @@ export interface GuidanceSourceListItem {
   title: string;
   url: string;
   finalUrl: string | null;
+  // Issue #111, for a source whose address is looked up on a parent page:
+  // that page, and the address it gave at the last successful fetch.
+  resolveFromPageUrl: string | null;
+  resolvedUrl: string | null;
   jurisdiction: string;
   route: string;
   docType: string;
@@ -74,6 +78,8 @@ export function toGuidanceSourceListItem(id: string, data: Partial<GuidanceSourc
     title: str(data.title) ?? id,
     url: str(data.url) ?? "",
     finalUrl: str(data.finalUrl),
+    resolveFromPageUrl: str(data.resolveFrom?.pageUrl),
+    resolvedUrl: str(data.resolvedUrl),
     jurisdiction: str(data.jurisdiction) ?? "",
     route: str(data.route) ?? "",
     docType: str(data.docType) ?? "",
