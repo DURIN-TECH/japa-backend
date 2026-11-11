@@ -15,6 +15,12 @@
 // first, then kept unchanged across the move to `src/utils/access.ts`. If a
 // row here has to change, the access rule changed: that is NOT a refactor.
 //
+// ONE deliberate rule change since then, DURIN-TECH/japa#131 (fixed in
+// `@durin-tech/authz` 0.1.7, vendored under functions/vendor/authz): a
+// principal with no agency no longer matches an application through the
+// agency grant. Three cells flipped from allowed to "---" and nothing else
+// moved; see the note above `agentIndep` in MATRIX.
+//
 // Two agencies, A and B, so every row can be read as a tenant-isolation check.
 
 import { ROLES } from "@durin-tech/authz";
@@ -207,18 +213,28 @@ export const MATRIX: Record<PrincipalName, Record<ApplicationName, string>> = {
     aAssigned: "---", aUnassigned: "---", bAssigned: "rud", selfServe: "---",
     nullAgency: "---", indepAssigned: "---", ownedByAgentA1: "rud",
   },
-  // Independent agent: denied every agency's cases and manages the case
-  // assigned to them.
-  // KNOWN DEFECT, pinned as-is (see KNOWN_DEFECT_CELLS): `selfServe` is "r--".
+  // FIXED BY DURIN-TECH/japa#131 (the only cells that ever changed here):
+  //   agentIndep    -> selfServe      was "r--", now "---"
+  //   ownerNoAgency -> selfServe      was "rud", now "---"
+  //   ownerNoAgency -> indepAssigned  was "rud", now "---"
+  // Before `@durin-tech/authz` 0.1.7 a no-agency `agent` / `owner` was
+  // granted on `{ agencyId: undefined }`, which CASL matches against any
+  // application with NO `agencyId` field (undefined === undefined), i.e.
+  // self-serve applications and the cases of independent agents. The agency
+  // grant is now only added when the principal has a non-empty `agencyId`.
+  //
+  // Independent agent: denied every agency's cases AND every application
+  // that merely lacks an agency; still fully manages the case assigned to
+  // them (`indepAssigned`, through the assigned-agent grant on `agentId`).
   agentIndep: {
-    aAssigned: "---", aUnassigned: "---", bAssigned: "---", selfServe: "r--",
+    aAssigned: "---", aUnassigned: "---", bAssigned: "---", selfServe: "---",
     nullAgency: "---", indepAssigned: "rud", ownedByAgentA1: "---",
   },
-  // Owner role without an agency.
-  // KNOWN DEFECT, pinned as-is: `selfServe` and `indepAssigned` are "rud".
+  // Owner role without an agency: nothing. The owner role has only the
+  // agency grant on applications, and with no agency that grant is not added.
   ownerNoAgency: {
-    aAssigned: "---", aUnassigned: "---", bAssigned: "---", selfServe: "rud",
-    nullAgency: "---", indepAssigned: "rud", ownedByAgentA1: "---",
+    aAssigned: "---", aUnassigned: "---", bAssigned: "---", selfServe: "---",
+    nullAgency: "---", indepAssigned: "---", ownedByAgentA1: "---",
   },
   // Applicant: manages their own applications, whoever handles them.
   client1: {
@@ -236,27 +252,6 @@ export const MATRIX: Record<PrincipalName, Record<ApplicationName, string>> = {
     nullAgency: "---", indepAssigned: "---", ownedByAgentA1: "rud",
   },
 };
-
-/**
- * Cells of MATRIX that are ALLOWED today although the stated rule (admin >
- * applicant > assigned agent > same agency) says they should be denied.
- *
- * Cause (seli-authz/src/ability.ts): for a principal with no agency the
- * `agent` / `owner` grants are built with the condition
- * `{ agencyId: undefined }`, and CASL matches that against any document that
- * has NO `agencyId` field (undefined === undefined). Self-serve applications
- * are stored without the field. `grantAgencyVisas` in the same file already
- * guards against this for visas; the Application grants do not.
- *
- * #29 is a pure refactor and must not change the rule, so these cells are
- * pinned as they are. Tracked as DURIN-TECH/japa#131 for a fix in
- * `@durin-tech/authz`. When that fix lands, flip them to "---" here.
- */
-export const KNOWN_DEFECT_CELLS: [PrincipalName, ApplicationName][] = [
-  ["agentIndep", "selfServe"],
-  ["ownerNoAgency", "selfServe"],
-  ["ownerNoAgency", "indepAssigned"],
-];
 
 /** True when `code` (e.g. "r--") allows `action`. */
 export function expected(code: string, action: AccessAction): boolean {

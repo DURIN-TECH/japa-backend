@@ -16,6 +16,11 @@
 //  2. with a narrow principal (what a Firestore trigger passes: no request),
 //  3. through the request adapter `checkApplicationAccessForRequest`.
 //
+// The table changed ONCE since the extraction, on purpose: DURIN-TECH/japa#131
+// (fixed in `@durin-tech/authz` 0.1.7) stopped a no-agency agent / owner from
+// matching applications through the agency grant. The three cells that #29
+// had pinned as a known defect are now denied; see the "#131" block below.
+//
 // Also covers what is new in #29, all of it fail-closed:
 //  - a missing principal / missing application (admin included) is denied;
 //  - `buildAbilityForPrincipal`: malformed principal -> deny-all, and
@@ -41,7 +46,6 @@ import {
   APPLICATIONS,
   ENT_ACTIVE,
   ENT_LAPSED,
-  KNOWN_DEFECT_CELLS,
   MATRIX,
   PRINCIPALS,
   matrixCells,
@@ -174,25 +178,83 @@ describe("checkApplicationAccess: named edge cases", () => {
 });
 
 // ============================================
-// Known defect, pinned so the refactor cannot hide or widen it
+// #131: a principal with no agency never matches through the agency grant
 // ============================================
 
-describe("checkApplicationAccess: KNOWN DEFECT in the rule (pinned, not endorsed)", () => {
-  // See KNOWN_DEFECT_CELLS in fixtures.ts: a no-agency agent/owner matches
-  // applications that have no `agencyId` field. Reported on #29; the fix
-  // belongs in @durin-tech/authz. These assertions exist so that (a) the
-  // refactor provably did not change it and (b) the fix has a test to flip.
-  test("the listed cells are exactly the allowed ones the stated rule would deny", () => {
-    for (const [p, a] of KNOWN_DEFECT_CELLS) {
-      assert.notEqual(MATRIX[p][a], "---", `${p} -> ${a} is pinned as allowed`);
-      assert.equal(check(PRINCIPALS[p], APPLICATIONS[a], "read"), true);
+describe("checkApplicationAccess: no agency, no agency grant (#131, was a pinned known defect)", () => {
+  // Until `@durin-tech/authz` 0.1.7 a no-agency agent / owner was granted on
+  // `{ agencyId: undefined }`, which matched any application with no
+  // `agencyId` field. #29 pinned the three affected cells as allowed
+  // (KNOWN_DEFECT_CELLS, now removed); the fix flipped them to deny. They are
+  // spelled out here, independently of MATRIX, so the fix cannot be undone by
+  // editing the table alone.
+
+  /** The cells #29 pinned as allowed and #131 flipped to deny. */
+  const FIXED_CELLS = [
+    [PRINCIPALS.agentIndep, APPLICATIONS.selfServe],
+    [PRINCIPALS.ownerNoAgency, APPLICATIONS.selfServe],
+    [PRINCIPALS.ownerNoAgency, APPLICATIONS.indepAssigned],
+  ] as const;
+
+  test("the three formerly-allowed cells are denied for every action, and MATRIX says so", () => {
+    assert.equal(MATRIX.agentIndep.selfServe, "---");
+    assert.equal(MATRIX.ownerNoAgency.selfServe, "---");
+    assert.equal(MATRIX.ownerNoAgency.indepAssigned, "---");
+    for (const [principal, application] of FIXED_CELLS) {
+      for (const action of ACTIONS) {
+        assert.equal(check(principal, application, action), false, `${principal.uid} ${action} ${application.id}`);
+      }
     }
   });
 
-  test("an independent agent can READ (not write) a stranger's self-serve application", () => {
-    assert.equal(check(PRINCIPALS.agentIndep, APPLICATIONS.selfServe, "read"), true);
-    assert.equal(check(PRINCIPALS.agentIndep, APPLICATIONS.selfServe, "update"), false);
-    assert.equal(check(PRINCIPALS.agentIndep, APPLICATIONS.selfServe, "delete"), false);
+  test("an independent agent cannot read a stranger's self-serve application", () => {
+    for (const action of ACTIONS) {
+      assert.equal(check(PRINCIPALS.agentIndep, APPLICATIONS.selfServe, action), false);
+    }
+  });
+
+  test("an independent agent still has full access to the application assigned to them", () => {
+    // The assigned-agent grant is keyed on `agentId`, not on the agency.
+    for (const action of ACTIONS) {
+      assert.equal(check(PRINCIPALS.agentIndep, APPLICATIONS.indepAssigned, action), true);
+    }
+  });
+
+  test("an owner with no agency has no access to any application", () => {
+    for (const application of Object.values(APPLICATIONS)) {
+      for (const action of ACTIONS) {
+        assert.equal(check(PRINCIPALS.ownerNoAgency, application, action), false, `${action} ${application.id}`);
+      }
+    }
+  });
+
+  test("no agency in any spelling (absent, null) x application agencyId absent, null or set: denied", () => {
+    // Principals: the claims carry `null`; a hand-built principal may omit it.
+    const noAgency: AuthzSubject[] = [
+      PRINCIPALS.agentIndep,
+      { uid: PRINCIPALS.agentIndep.uid, role: ROLES.AGENT },
+      PRINCIPALS.ownerNoAgency,
+      { uid: PRINCIPALS.ownerNoAgency.uid, role: ROLES.OWNER },
+    ];
+    // Applications none of them is assigned to: field absent, null, set.
+    const strangers = [APPLICATIONS.selfServe, APPLICATIONS.nullAgency, APPLICATIONS.aUnassigned, APPLICATIONS.bAssigned];
+    for (const principal of noAgency) {
+      for (const application of strangers) {
+        for (const action of ACTIONS) {
+          assert.equal(check(principal, application, action), false, `${principal.role} ${action} ${application.id}`);
+        }
+      }
+    }
+  });
+
+  test("a lapsed or active plan does not bring the access back", () => {
+    for (const entitlements of [ENT_ACTIVE, ENT_LAPSED]) {
+      for (const [principal, application] of FIXED_CELLS) {
+        for (const action of ACTIONS) {
+          assert.equal(check(principal, application, action, entitlements), false);
+        }
+      }
+    }
   });
 });
 
