@@ -2,6 +2,8 @@ import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { documentService, UploadActor } from "../services/document.service";
 import { documentRequestService } from "../services/document-request.service";
+import { documentCheckService } from "../services/ai/document-check.service";
+import { tierFor } from "../services/ai/tier-serializer";
 import { notificationService } from "../services/notification.service";
 import { userService } from "../services/user.service";
 import { collections } from "../utils/firebase";
@@ -328,6 +330,25 @@ export class DocumentController {
           }
         } catch (e) {
           console.error("[document] fulfilling document request failed:", e);
+        }
+      }
+
+      // Per-upload document check (issue #115). Only for the applicant's OWN
+      // upload against a checklist item, and only on the paid tier: a caller
+      // without `ai.case_officer` (or whose entitlements did not resolve, which
+      // reads as free) uploads exactly as before and nothing here runs. This
+      // only WRITES a queued job (cheap); the worker does the model call, so the
+      // response below never waits on it. Best-effort: a failure here must not
+      // fail an upload that already succeeded, and it never touches the
+      // document's status.
+      if (documentRequestId && isClientsOwn && tierFor(req.authz?.role, req.entitlements) === "full") {
+        try {
+          const checkRequest = await documentRequestService.getById(documentRequestId);
+          if (checkRequest && checkRequest.userId === document.userId && checkRequest.applicationId === applicationId) {
+            await documentCheckService.enqueue(document, targetApp, checkRequest);
+          }
+        } catch (e) {
+          console.error("[document] queuing the document check failed:", e);
         }
       }
 

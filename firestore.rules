@@ -556,6 +556,11 @@ service cloud.firestore {
     //    the record of each extraction run (issue #40). Consumers only ever
     //    get an APPROVED version, through the backend. Do NOT add a match.
 
+    //  - documentChecks/{documentId} and documentCheckCaps/{id}: per-upload
+    //    document checks and their daily cost counters (issue #115). Clients read
+    //    the check only through GET /documents/:id/check (tier-trimmed). Do NOT
+    //    add a match.
+
     // ---- Agency visa revisions (issue #100), explicit deny (issue #102) ----
     // visaRevisions/{cc}__{visaId}: unreviewed agency edits to an approved
     // visa. Backend only (agency read via /agency/visas, admin review via

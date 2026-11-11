@@ -441,6 +441,10 @@ export class DocumentService {
     // Delete the document record
     await docRef.delete();
 
+    // Its per-upload check (issue #115) holds values read from the file: it goes
+    // with the document. Best effort: a missing check is not an error.
+    await db.collection("documentChecks").doc(documentId).delete().catch((e) => console.error("[document] deleting its check failed:", e));
+
     // Update application document counts
     const applicationRef = db.collection("applications").doc(document.applicationId);
     const countUpdates: Record<string, FieldValue | Timestamp> = {

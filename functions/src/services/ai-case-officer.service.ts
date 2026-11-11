@@ -13,16 +13,13 @@ import type {
 import {
   assembleContent,
   assessmentIdFor,
-  buildExtractionRequest,
   buildJudgementRequest,
   computeInputHash,
   deriveHolderFact,
   documentFieldsFor,
   evaluateObjective,
-  extractionIsSuspicious,
   judgementCriteriaOf,
   mandatoryBarHits,
-  parseExtraction,
   parseJudgement,
   topIssuesOf,
   type AssessmentContent,
@@ -31,6 +28,7 @@ import {
   type Facts,
   type JudgementOutput,
 } from "./ai/assessment-engine";
+import { extractOneDocument, sniffMediaType } from "./ai/document-extraction";
 import { costOfUsage } from "./ai/ai-pricing";
 import { readAiSettings, type AiSettings, type AiSettingsRead } from "./ai/ai-settings";
 import { AnthropicLlmProvider, type LlmProvider, type LlmUsage } from "./ai/llm-provider";
@@ -124,13 +122,8 @@ function plainTextOf(node: unknown): string {
   return `${own}${kids ? ` ${kids}` : ""}`.replace(/\s+/g, " ").trim();
 }
 
-/** Media type from the bytes, never from the stored name. Null when unsupported. */
-export function sniffMediaType(bytes: Buffer): "application/pdf" | "image/jpeg" | "image/png" | null {
-  if (bytes.length >= 4 && bytes.subarray(0, 4).toString("latin1") === "%PDF") return "application/pdf";
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
-  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
-  return null;
-}
+// Re-exported from the shared extraction module so existing imports keep working.
+export { sniffMediaType };
 
 function zeroUsage(): AssessmentUsage {
   return { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -592,47 +585,26 @@ export class AiCaseOfficerService {
         extractions.push(unreadable(base, "file could not be read"));
         continue;
       }
-      const mediaType = sniffMediaType(bytes);
-      if (!mediaType) {
-        extractions.push(unreadable(base, "file type is not supported"));
-        continue;
-      }
-
-      const request = buildExtractionRequest({ label: d.label, mediaType, data: bytes.toString("base64") }, fields);
-      requests++;
-      chars += request.user.length + (request.documents?.[0]?.data.length ?? 0);
-      if (requests > settings.maxRequestsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its request cap");
-      if (chars > settings.maxInputCharsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its input size cap");
-
-      extractUsed = true;
-      try {
-        const res = await this.deps.provider.complete(request);
-        extractUsage = addUsage(extractUsage, res.usage);
-        if (res.stopReason === "refusal") {
-          extractions.push(failed(base, "the model declined to read the file"));
-          continue;
-        }
-        const parsed = parseExtraction(res.text, fields);
-        if (!parsed.ok) {
-          extractions.push(failed(base, `the answer broke the contract: ${parsed.reason}`));
-          continue;
-        }
-        const suspicious = extractionIsSuspicious(parsed.values);
-        if (suspicious) suspiciousContent.push({ source: "document", documentId: d.id, page: null });
-        extractions.push({
-          documentId: d.id,
-          label: d.label,
-          mediaType,
-          readable: parsed.readable,
-          values: parsed.values,
-          failed: false,
-          failure: null,
-          suspicious,
-        });
-      } catch {
-        // One document failing never fails the job: its criteria go to insufficient.
-        extractions.push(failed(base, "the model call failed"));
-      }
+      // The shared single-document extraction (document-extraction.ts, also used
+      // by the per-upload check #115): sniff, guards, request, call, parse.
+      // The cost caps run just before the call, through `beforeCall`.
+      const result = await extractOneDocument({
+        provider: this.deps.provider,
+        documentId: d.id,
+        label: d.label,
+        bytes,
+        fields,
+        beforeCall: (request) => {
+          requests++;
+          chars += request.user.length + (request.documents?.[0]?.data.length ?? 0);
+          if (requests > settings.maxRequestsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its request cap");
+          if (chars > settings.maxInputCharsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its input size cap");
+        },
+      });
+      if (result.called) extractUsed = true;
+      if (result.usage) extractUsage = addUsage(extractUsage, result.usage);
+      if (result.extraction.suspicious) suspiciousContent.push({ source: "document", documentId: d.id, page: null });
+      extractions.push(result.extraction);
     }
 
     // ---- facts the checks may read ----
@@ -773,11 +745,6 @@ export class AiCaseOfficerService {
 /** A document that could not be read: its criteria become insufficient. */
 function unreadable(base: { documentId: string; label: string }, reason: string): DocumentExtraction {
   return { ...base, mediaType: "", readable: false, values: [], failed: false, failure: reason, suspicious: false };
-}
-
-/** A document whose extraction failed: counted as unread, never as a pass. */
-function failed(base: { documentId: string; label: string }, reason: string): DocumentExtraction {
-  return { ...base, mediaType: "", readable: false, values: [], failed: true, failure: reason, suspicious: false };
 }
 
 /** Singleton over the real provider, Storage, Firestore and settings. */
