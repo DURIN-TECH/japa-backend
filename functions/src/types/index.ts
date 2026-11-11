@@ -139,7 +139,9 @@ export type AgencyStatus = "pending_review" | "approved" | "rejected" | "suspend
 export interface AgencyService {
   id: string;
   name: string;
-  price: number; // In cents
+  // Service price in WHOLE NAIRA (the portal stores the raw ₦ input, like the
+  // agency `consultationFee`). The old "in cents" comment was wrong (#144).
+  price: number;
 }
 
 // ============================================

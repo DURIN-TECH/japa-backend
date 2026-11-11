@@ -1,6 +1,15 @@
-import { Response } from "express";
+import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { agencyService, SeatLimitError } from "../services/agency.service";
+import {
+  agencyService,
+  SeatLimitError,
+  isAgencyPubliclyVisible,
+  isAgencyComplianceVerified,
+  toPublicAgencyServices,
+  PUBLIC_AGENCY_LIST_MAX,
+} from "../services/agency.service";
+// Issue #144: the public agency directory lists an agency's agents.
+import { agentService } from "../services/agent.service";
 import { storageService } from "../services/storage.service";
 import { notificationService } from "../services/notification.service";
 import { emailService } from "../services/email/email.service";
@@ -28,6 +37,32 @@ const ALLOWED_LOGO_CONTENT_TYPES = [
   "image/webp",
   "image/svg+xml",
 ];
+
+/**
+ * Parse `?limit=` of `GET /agencies/browse` (issue #144).
+ *
+ * Only a plain positive integer counts ("10"). Anything else ("abc", "0",
+ * "-1", "1.5", "10abc", an empty or repeated param) is IGNORED (undefined:
+ * the service then uses its default), never a 400 or a 500. Values above the
+ * cap are clamped to PUBLIC_AGENCY_LIST_MAX.
+ */
+export function parseBrowseLimit(raw: unknown): number | undefined {
+  if (typeof raw !== "string" || !/^\d+$/.test(raw.trim())) return undefined;
+  const n = parseInt(raw.trim(), 10);
+  if (!Number.isSafeInteger(n) || n <= 0) return undefined;
+  return Math.min(n, PUBLIC_AGENCY_LIST_MAX);
+}
+
+/**
+ * Parse `?search=` of `GET /agencies/browse`: a trimmed string, or undefined
+ * when absent, blank or not a single string (e.g. `?search=a&search=b`,
+ * which Express parses to an array).
+ */
+export function parseBrowseSearch(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : undefined;
+}
 
 export class AgencyController {
   /**
@@ -512,7 +547,8 @@ export class AgencyController {
       // Only surface agencies that have been admitted to the platform. Anything
       // else (pending/rejected/suspended) 404s so unapproved/withheld agencies
       // aren't publicly discoverable via a guessed slug.
-      if (!agency || agency.status !== "approved") {
+      // Issue #144: the same visibility rule as the /browse endpoints.
+      if (!agency || !isAgencyPubliclyVisible(agency)) {
         sendError(res, "NOT_FOUND", "Agency not found", 404);
         return;
       }
@@ -538,16 +574,13 @@ export class AgencyController {
         // cents" comment was wrong; see consultation.controller). null when unset.
         consultationFee: agency.consultationFee ?? null,
         // Public service menu (name + price only).
-        services: (agency.services || []).map((s) => ({
-          id: s.id,
-          name: s.name,
-          price: s.price,
-        })),
+        // (Shared with the /browse projection, issue #144.)
+        services: toPublicAgencyServices(agency.services),
         // Social-proof stats (safe aggregates).
         totalAgents: agency.totalAgents,
         totalCases: agency.totalCases,
         // Trust badge only — never the raw compliance file.
-        verified: agency.compliance?.status === "verified",
+        verified: isAgencyComplianceVerified(agency),
         // Issue #103: the visas this agency offers with ITS OWN service price
         // in whole naira (null = "Contact for pricing"). Only this agency's
         // prices, only visas it may still price (own approved + priced
@@ -556,6 +589,109 @@ export class AgencyController {
       });
     } catch (error) {
       console.error("Error fetching public agency:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  // ============================================
+  // PUBLIC AGENCY DIRECTORY (unauthenticated, issue #144)
+  // ============================================
+  //
+  // Three read-only routes for the mobile Explorer's agency screens. No
+  // auth, no `checkApplicationAccess` (no case data is involved). Every
+  // response is built from the `PublicAgency` allow-list
+  // (`toPublicAgency()` in agency.service), and only `approved` agencies are
+  // ever served: anything else 404s with the same body as an unknown id.
+
+  /**
+   * GET /agencies/browse  (PUBLIC — no auth)
+   *
+   * List the publicly visible (approved) agencies, newest first. Each item
+   * is the `PublicAgency` projection WITHOUT `visaPrices` (keeps the list a
+   * single query; the detail route below carries them).
+   *
+   * Query params (both optional; bad values are ignored, never a 500):
+   *   - `?limit=<n>`     max results, capped at 100 (also the default)
+   *   - `?search=<text>` case-insensitive substring match on the agency
+   *                      name; the limit applies AFTER this filter
+   *
+   * No match is `200 []`, not a 404.
+   */
+  async browseAgencies(req: Request, res: Response): Promise<void> {
+    try {
+      const agencies = await agencyService.listPublicAgencies({
+        limit: parseBrowseLimit(req.query.limit),
+        search: parseBrowseSearch(req.query.search),
+      });
+      sendSuccess(res, agencies);
+    } catch (error) {
+      console.error("Error browsing agencies:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /agencies/browse/:id  (PUBLIC — no auth)
+   *
+   * One agency's public profile by document id: the `PublicAgency`
+   * projection plus `visaPrices[]`. 404 NOT_FOUND for an unknown id AND for
+   * a non-approved agency (same body, so existence never leaks).
+   *
+   * Named `getPublicAgencyById` so it doesn't collide with the slug handler
+   * `getPublicAgency` (`GET /agencies/public/:slug`).
+   *
+   * `visaPrices[]` comes from `agencyVisaPriceService.listPublic(agency.id)`,
+   * the SAME call the slug page makes, so entries are identical (same keys,
+   * same values) on both routes: this agency's own approved active visas
+   * plus the visas it priced, `price` in whole NAIRA (null = "Contact for
+   * pricing"), `baseCostUsd` the separate government fee in USD. A pricing
+   * read failure is logged and served as `[]`, like the slug page.
+   */
+  async getPublicAgencyById(req: Request, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+      const agency = await agencyService.getPublicAgencyById(id);
+      if (!agency) {
+        sendError(res, "NOT_FOUND", "Agency not found", 404);
+        return;
+      }
+
+      // ---- Per-visa service prices (#102/#103), never fatal ----
+      let visaPrices: PublicAgencyVisaPrice[] = [];
+      try {
+        visaPrices = await agencyVisaPriceService.listPublic(agency.id);
+      } catch (error) {
+        console.error("Error loading public agency visa prices:", error);
+      }
+
+      sendSuccess(res, { ...agency, visaPrices });
+    } catch (error) {
+      console.error("Error getting public agency by id:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /agencies/browse/:id/agents  (PUBLIC — no auth)
+   *
+   * The agency's verified AND available agents, in the same shape as the
+   * public `GET /agents`. Gated on the agency first: an unknown or
+   * non-approved agency is 404 NOT_FOUND (never `200 []`, which would
+   * reveal that the id exists and expose a hidden agency's roster).
+   */
+  async getPublicAgencyAgents(req: Request, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+      const agency = await agencyService.getPublicAgencyById(id);
+      if (!agency) {
+        sendError(res, "NOT_FOUND", "Agency not found", 404);
+        return;
+      }
+
+      const agents = await agentService.getPublicAgentsByAgency(agency.id);
+      sendSuccess(res, agents);
+    } catch (error) {
+      console.error("Error getting public agency agents:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

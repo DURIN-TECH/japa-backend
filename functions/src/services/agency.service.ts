@@ -7,6 +7,7 @@ import {
   Agency,
   AgencyInvitation,
   AgencyService as AgencyServiceType,
+  AgencyStatus,
   Agent,
   User,
 } from "../types";
@@ -42,6 +43,122 @@ export interface UpdateAgencyInput {
   logoUrl?: string;
   consultationFee?: number;
   services?: AgencyServiceType[];
+}
+
+// ============================================
+// PUBLIC AGENCY DIRECTORY (issue #144)
+// ============================================
+
+/** Hard cap on `GET /agencies/browse?limit=` (and the default page size). */
+export const PUBLIC_AGENCY_LIST_MAX = 100;
+
+/**
+ * Public-safe projection of an Agency for the UNAUTHENTICATED directory
+ * (`GET /agencies/browse` and `GET /agencies/browse/:id`, the mobile
+ * Explorer's agency screens; matches mobile `ApiAgency` in
+ * `src/hooks/useAgencies.ts`).
+ *
+ * This is a deliberate ALLOW-LIST: it carries ONLY fields that are safe to
+ * show to any anonymous browser, copied one by one in `toPublicAgency()`.
+ * It intentionally EXCLUDES every private / compliance / internal field:
+ *   - `ownerId`            (internal user id, a leak vector)
+ *   - `compliance`         (owner KYC/KYB PII: BVN, NIN, ID docs, settlement bank)
+ *   - `reviewedBy` / `reviewedAt` / `rejectionReason` (admin review metadata)
+ *   - `activeCases`        (operational load, not for public consumption)
+ *
+ * `consultationFee` and `services` ARE included: they are customer-facing
+ * pricing, not financial internals. Both are in WHOLE NAIRA, exactly as
+ * stored (never divided or multiplied by 100).
+ */
+export interface PublicAgency {
+  id: string;
+  name: string;
+  /** Public slug of the `/a/<slug>` landing page; null until backfilled. */
+  slug: string | null;
+  /** Display name only, never the owner's user id. */
+  ownerName: string;
+  /** Region / location. Omitted from the JSON when unset. */
+  state?: string;
+  /** Business address (public contact info). Omitted when unset. */
+  address?: string;
+  description?: string;
+  logoUrl?: string;
+  /** Default consultation fee in WHOLE NAIRA. Omitted when unset. */
+  consultationFee?: number;
+  /** Public service menu: id, name and price (WHOLE NAIRA) only. */
+  services: { id: string; name: string; price: number }[];
+  /** Denormalized member count (the agency's `totalAgents`). */
+  agentCount: number;
+  /** Track-record stat (the agency's `totalCases`). */
+  totalCases: number;
+  /** Always "approved": nothing else is ever returned publicly. */
+  status: AgencyStatus;
+  /** Compliance-verified badge (boolean only, never the compliance file). */
+  verified: boolean;
+  /** Serializes as `{ _seconds, _nanoseconds }` over JSON. */
+  createdAt: Timestamp;
+}
+
+/**
+ * Is this agency publicly visible (directory, public pages)?
+ *
+ * "Public" == admitted to the platform (`status === "approved"`).
+ * `pending_review`, `rejected` and `suspended` agencies are never public.
+ * Compliance verification is a SEPARATE gate (it unlocks payments and
+ * platform-client assignment) and is shown as the `verified` badge instead,
+ * so an approved but unverified agency is still listed. Shared by the slug
+ * page and the browse endpoints so both gate the same way.
+ */
+export function isAgencyPubliclyVisible(agency: Pick<Agency, "status"> | null | undefined): boolean {
+  return agency?.status === "approved";
+}
+
+/**
+ * The public trust badge: true only when the agency's compliance file
+ * (KYC/KYB/payout) was verified by an admin. Only this boolean is ever
+ * exposed, never the file itself. Shared with the slug page.
+ */
+export function isAgencyComplianceVerified(agency: Pick<Agency, "compliance">): boolean {
+  return agency.compliance?.status === "verified";
+}
+
+/**
+ * The public service menu: id, name and price (whole naira) only, so any
+ * extra field ever added to a stored service can't leak. Shared with the
+ * slug page.
+ */
+export function toPublicAgencyServices(
+  services: AgencyServiceType[] | undefined
+): { id: string; name: string; price: number }[] {
+  return (services || []).map((s) => ({ id: s.id, name: s.name, price: s.price }));
+}
+
+/**
+ * Map a full Agency doc down to its public-safe projection (allow-list).
+ * Centralized so every browse endpoint returns an identical, minimal shape
+ * and no private / compliance field can accidentally leak. Optional profile
+ * fields stay `undefined` when unset (dropped from the JSON), as mobile's
+ * `ApiAgency` expects.
+ */
+export function toPublicAgency(agency: Agency): PublicAgency {
+  return {
+    id: agency.id,
+    name: agency.name,
+    slug: agency.slug ?? null,
+    ownerName: agency.ownerName,
+    state: agency.state,
+    address: agency.address,
+    description: agency.description,
+    logoUrl: agency.logoUrl,
+    // Whole naira, unchanged from storage.
+    consultationFee: agency.consultationFee,
+    services: toPublicAgencyServices(agency.services),
+    agentCount: agency.totalAgents ?? 0,
+    totalCases: agency.totalCases ?? 0,
+    status: agency.status,
+    verified: isAgencyComplianceVerified(agency),
+    createdAt: agency.createdAt,
+  };
 }
 
 class AgencyService {
@@ -691,6 +808,57 @@ class AgencyService {
       .get();
 
     return snapshot.docs.map((doc) => doc.data() as Agency);
+  }
+
+  // ============================================
+  // PUBLIC BROWSING (unauthenticated directory, issue #144)
+  // ============================================
+
+  /**
+   * List the publicly visible (approved) agencies, newest first, as the
+   * public projection. No `visaPrices` here: the list stays one query.
+   *
+   * Query: `status == "approved"` ordered by `createdAt desc`, served by the
+   * existing `agencies (status ASC, createdAt DESC)` composite index.
+   *
+   * @param options.search case-insensitive substring match on the agency
+   *   name. Applied in memory (Firestore has no "contains"), so with a
+   *   search we read every approved agency, filter, THEN apply the limit.
+   * @param options.limit max results, clamped to 1..PUBLIC_AGENCY_LIST_MAX
+   *   (default: the max). Pushed into the query only when there is no
+   *   search, else it would truncate before the name filter runs.
+   */
+  async listPublicAgencies(options?: { limit?: number; search?: string }): Promise<PublicAgency[]> {
+    const search = options?.search?.trim().toLowerCase() || undefined;
+    const requested = options?.limit;
+    const limit =
+      requested !== undefined && Number.isInteger(requested) && requested > 0
+        ? Math.min(requested, PUBLIC_AGENCY_LIST_MAX)
+        : PUBLIC_AGENCY_LIST_MAX;
+
+    let query = collections.agencies.where("status", "==", "approved").orderBy("createdAt", "desc");
+    if (!search) query = query.limit(limit);
+
+    const snapshot = await query.get();
+    let agencies = snapshot.docs.map((doc) => doc.data() as Agency);
+
+    if (search) {
+      agencies = agencies.filter((a) => (a.name ?? "").toLowerCase().includes(search)).slice(0, limit);
+    }
+
+    return agencies.map(toPublicAgency);
+  }
+
+  /**
+   * One agency's public projection, or null when it does not exist or is
+   * not publicly visible (not approved). Callers 404 on null with the SAME
+   * body either way, so a non-approved agency's existence never leaks.
+   */
+  async getPublicAgencyById(agencyId: string): Promise<PublicAgency | null> {
+    const agency = await this.getAgencyById(agencyId);
+    if (!agency || !isAgencyPubliclyVisible(agency)) return null;
+    // A doc missing its own `id` field would be corrupt; trust the path.
+    return toPublicAgency({ ...agency, id: agency.id ?? agencyId });
   }
 }
 

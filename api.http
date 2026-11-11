@@ -134,6 +134,21 @@ Authorization: Bearer {{adminToken}}
 # AGENCIES
 # ============================================================
 
+### Public agency directory (no auth, #144): approved agencies, newest first
+GET {{baseUrl}}/agencies/browse
+
+### Public agency directory: search by name, capped list (limit max 100)
+GET {{baseUrl}}/agencies/browse?search=acme&limit=10
+
+### Public agency profile by id, with visaPrices[] (no auth; 404 unless approved)
+GET {{baseUrl}}/agencies/browse/seed-agency-001
+
+### Public agency's verified + available agents (no auth; 404 unless approved)
+GET {{baseUrl}}/agencies/browse/seed-agency-001/agents
+
+### Public agency landing page by slug, with visaPrices[] (no auth)
+GET {{baseUrl}}/agencies/public/acme
+
 ### Get my agency (as owner)
 GET {{baseUrl}}/agencies/me
 Authorization: Bearer {{ownerToken}}
