@@ -27,16 +27,20 @@
 // `functions/vendor/authz`). Change the rule THERE, never here.
 //
 // Two things about that encoding that the precedence list above glosses over
-// (both pinned by test/access/, both pre-date #29):
+// (both pinned by test/access/):
 //   - Grants hang off the principal's ROLE, one branch per role. So step 2
 //     applies to `client`-role principals only: an agent-role user who is the
 //     applicant of an application gets nothing from being its applicant.
-//   - KNOWN DEFECT: a no-agency `agent` / `owner` principal is granted on
-//     `{ agencyId: undefined }`, which CASL matches against any application
-//     that has NO `agencyId` field (self-serve applications). See
-//     KNOWN_DEFECT_CELLS in test/access/fixtures.ts. Tracked as
-//     DURIN-TECH/japa#131, to be fixed in `@durin-tech/authz`; deliberately
-//     not patched here.
+//   - Step 4 needs an agency on BOTH sides. A principal with no agency
+//     (`agencyId` null / absent / empty: an independent agent, or an
+//     owner-role user without an agency) gets no agency grant at all, so it
+//     can never match an application through `agencyId`, including one that
+//     has no `agencyId` field (self-serve applications).
+//     FIXED in DURIN-TECH/japa#131 (`@durin-tech/authz` 0.1.7). Before that
+//     fix such a principal was granted on `{ agencyId: undefined }`, which
+//     CASL matched against every application lacking the field; #29 had
+//     pinned that as a known defect (KNOWN_DEFECT_CELLS, since removed). The
+//     fix lives in the package, as it must: nothing was patched here.
 //
 // WHO CAN CALL IT: anything. Nothing in this file imports Express or reads a
 // request. Callers pass either
