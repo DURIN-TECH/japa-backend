@@ -15,7 +15,7 @@ import { HostBackoffTracker, backoffMessage, hostOf, isHostBackoffError } from "
 // Failure streak -> auto-pause rules shared with the visa and news crawlers.
 import { DEFAULT_CONSECUTIVE_FAILURE_LIMIT, nextSourceHealth, type NextSourceHealth } from "../shared/runs/source-health";
 import { extractPublishedDate } from "./guidance-published-date";
-import { GuidanceResolveError, resolveDocumentUrl } from "./guidance-resolve";
+import { GuidanceResolveError, linkPatternHost, resolveDocumentUrl } from "./guidance-resolve";
 import { GUIDANCE_SOURCE_ID_RE, guidanceSnapshotStore, type GuidanceSnapshotStore } from "./guidance-snapshot.store";
 import type { GuidanceSnapshotMeta, GuidanceSource, GuidanceSourceStatus } from "./types";
 
@@ -433,12 +433,19 @@ export class GuidanceCrawlService {
     }
     // Host backing off: a stored `backoffUntil` from an earlier run, or a
     // 429/503 another source on the same host got a moment ago.
-    // A source with `resolveFrom` asks TWO hosts (the parent page's and the
-    // document's), so a fresh backoff on either defers it.
-    const host = hostOf(source.url);
+    // A source with `resolveFrom` asks TWO hosts: the parent page's, and the
+    // one its link pattern is pinned to (where the document will be
+    // requested). A fresh backoff on any host it would ask defers it. The
+    // seed validator makes `url` and the pattern name the same host, but a
+    // stored doc may have been edited by hand, so all three are checked.
     const storedBackoffMs = millisOf(source.backoffUntil);
-    const parentHost = typeof source.resolveFrom?.pageUrl === "string" ? hostOf(source.resolveFrom.pageUrl) : "";
-    const fresh = hostState.blocking(host) ?? (parentHost ? hostState.blocking(parentHost) : undefined);
+    const hosts = [hostOf(source.url)];
+    if (typeof source.resolveFrom?.pageUrl === "string") hosts.push(hostOf(source.resolveFrom.pageUrl));
+    if (typeof source.resolveFrom?.linkPattern === "string") hosts.push(linkPatternHost(source.resolveFrom.linkPattern) ?? "");
+    let fresh: ReturnType<HostBackoffTracker["blocking"]>;
+    for (const h of hosts) {
+      if (h && !fresh) fresh = hostState.blocking(h);
+    }
     if (storedBackoffMs > nowMs || fresh) {
       const untilMs = Math.max(storedBackoffMs, fresh?.untilMs ?? 0);
       const error = fresh ? backoffMessage(fresh) : `host backed off, retry after ${new Date(untilMs).toISOString()}`;

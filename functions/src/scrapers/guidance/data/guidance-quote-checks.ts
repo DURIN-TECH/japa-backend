@@ -64,6 +64,17 @@ export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
     sourceIds: ["gb-appendix-v-visitor"],
   },
 
+  // ---- The suitability rules the visitor rules refer to (V 3.1) ----
+  // An identity check: a sentence from the document's opening, so the stored
+  // snapshot is known to be this document.
+  {
+    id: "part-suitability-opening",
+    label: "Opening, second paragraph",
+    passage:
+      "If an applicant is refused under this Part, they will not meet the suitability requirements of the route on which they are applying.",
+    sourceIds: ["gb-part-suitability"],
+  },
+
   // ---- The finance appendix the visitor rules refer to ----
   {
     id: "appendix-finance-2-1",

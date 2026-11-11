@@ -26,9 +26,12 @@ import { VisaCatalogFetchService, VisaCatalogHttpClient } from "../../../src/scr
 import { GuidanceCrawlService, failureKindOf } from "../../../src/scrapers/guidance/guidance-crawl.service";
 import {
   GuidanceResolveError,
+  MAX_RESOLVED_LINK_CHARS,
   findMatchingLinks,
+  linkPatternHost,
   resolveFromProblems,
 } from "../../../src/scrapers/guidance/guidance-resolve";
+import { hasQuantifiedAlternation, publishedDateSelectorProblem } from "../../../src/scrapers/guidance/guidance-published-date";
 import { GuidanceSnapshotStore, SnapshotBucket } from "../../../src/scrapers/guidance/guidance-snapshot.store";
 import {
   buildSeededGuidanceSource,
@@ -222,6 +225,46 @@ describe("guidance resolveFrom: seed validation", () => {
     assert.equal(problems("https://files\\.gamma-registry\\.example/media/(?:a|b)\\.pdf"), "");
   });
 
+  test("a quantifier right after the literal origin is refused: the slash that ends the host must be literal", () => {
+    // Each of these STARTS with a literal https://host/ yet lets the host be
+    // extended, because the final slash is optional or repeatable.
+    for (const linkPattern of [
+      "https://files\\.gamma-registry\\.example/?.*\\.pdf",
+      "https://files\\.gamma-registry\\.example/*.+\\.pdf",
+      "https://files\\.gamma-registry\\.example/{0}.+\\.pdf",
+      "https://files\\.gamma-registry\\.example/+x\\.pdf",
+    ]) {
+      assert.match(
+        resolveFromProblems({ pageUrl: PAGE_URL, linkPattern }).join(" | "),
+        /must not put a quantifier .* right after the literal https:\/\/<host>\//,
+        linkPattern
+      );
+      assert.equal(linkPatternHost(linkPattern), null, linkPattern);
+    }
+    assert.equal(linkPatternHost(LINK_PATTERN), FILE_HOST);
+    assert.equal(linkPatternHost(".+\\.pdf"), null);
+  });
+
+  test("a quantified group that contains an alternative is refused, in link patterns and date selectors alike", () => {
+    for (const tail of ["(a|aa)+\\.pdf", "(?:a|a)*b", "(?:x|y){2,}", "(?:x|y)?z", "(?:(?:a|b)c)+"]) {
+      const linkPattern = `https://files\\.gamma-registry\\.example/media/${tail}`;
+      assert.match(resolveFromProblems({ pageUrl: PAGE_URL, linkPattern }).join(" | "), /must not quantify a group that contains an alternative/, tail);
+      assert.equal(hasQuantifiedAlternation(tail), true, tail);
+    }
+    // Not that shape: an unquantified alternative, a `|` inside a character
+    // class, an escaped parenthesis.
+    for (const fine of ["(?:a|b)\\.pdf", "[(a|b)]+", "\\(a|b\\)+", "(ab)+"]) {
+      assert.equal(hasQuantifiedAlternation(fine), false, fine);
+    }
+    assert.match(publishedDateSelectorProblem("issued (?:on|at)+ (\\d{4})") ?? "", /must not quantify a group that contains an alternative/);
+    assert.equal(publishedDateSelectorProblem("issued (?:on|at) (\\d{4})"), undefined);
+  });
+
+  test("the seed's url must be on the host the pattern names", () => {
+    const problems = validateGuidanceSourceSeed({ ...HANDBOOK, url: `https://${PAGE_HOST}/media/aa11/handbook.pdf` });
+    assert.ok(problems.some((p) => p === `url must be on the host resolveFrom.linkPattern names (${FILE_HOST})`), problems.join(" | "));
+  });
+
   test("resolveFrom and expectedFinalUrl cannot be combined", () => {
     const problems = validateGuidanceSourceSeed({ ...HANDBOOK, expectedFinalUrl: FILE_V1 });
     assert.ok(problems.some((p) => /expectedFinalUrl cannot be combined with resolveFrom/.test(p)));
@@ -251,6 +294,50 @@ describe("guidance resolveFrom: finding the link", () => {
       "<a href=\"https://files.gamma-registry.example.evil.example/media/aa11/handbook.pdf\">another host</a>" +
       "<a href=\"mailto:keeper@gamma-registry.example\">mail</a><a>no href</a>";
     assert.deepEqual(findMatchingLinks(page, PAGE_URL, LINK_PATTERN), [FILE_V1]);
+  });
+
+  test("a link on another host is never a match, whatever the pattern says", () => {
+    // The three patterns the validator now refuses, used here as if one had
+    // reached the registry anyway, and one WELL-FORMED pattern whose tail is
+    // loose. The links are look-alikes of the pinned host: a suffix-extended
+    // host, a userinfo `@` form, and a protocol-relative link.
+    const lookAlikes =
+      `<a href="https://${FILE_HOST}.evil.example/x.pdf">suffix-extended host</a>` +
+      `<a href="https://${FILE_HOST}@evil.example/y.pdf">userinfo form</a>` +
+      `<a href="//${FILE_HOST}.evil.example/z.pdf">protocol-relative</a>` +
+      `<a href="https://${FILE_HOST}:8443/media/aa11/p.pdf">explicit port</a>` +
+      `<a href="https://keeper:secret@${FILE_HOST}/media/aa11/c.pdf">credentials on the right host</a>`;
+    for (const pattern of [
+      "https://files\\.gamma-registry\\.example/?.*\\.pdf",
+      "https://files\\.gamma-registry\\.example/*.+\\.pdf",
+      "https://files\\.gamma-registry\\.example/{0}.+\\.pdf",
+    ]) {
+      // Refused patterns match nothing at all, even a genuine link.
+      assert.deepEqual(findMatchingLinks(lookAlikes + `<a href="${FILE_V1}">real</a>`, PAGE_URL, pattern), [], pattern);
+    }
+    // A valid pattern with a permissive tail: only the genuine link comes back.
+    const loose = "https://files\\.gamma-registry\\.example/.+\\.pdf";
+    assert.deepEqual(resolveFromProblems({ pageUrl: PAGE_URL, linkPattern: loose }), []);
+    assert.deepEqual(findMatchingLinks(lookAlikes, PAGE_URL, loose), []);
+    assert.deepEqual(findMatchingLinks(lookAlikes + `<a href="${FILE_V1}">real</a>`, PAGE_URL, loose), [FILE_V1]);
+    // A <base> on the page cannot move a relative link onto the pinned host's
+    // look-alike either: links resolve against the page's own address.
+    assert.deepEqual(findMatchingLinks("<base href=\"https://evil.example/\"><a href=\"media/aa11/q.pdf\">q</a>", PAGE_URL, loose), []);
+  });
+
+  test(`a link longer than ${MAX_RESOLVED_LINK_CHARS} characters is not tested against the pattern`, () => {
+    assert.equal(MAX_RESOLVED_LINK_CHARS, 512);
+    const long = `https://${FILE_HOST}/media/aa11/${"a".repeat(MAX_RESOLVED_LINK_CHARS)}.pdf`;
+    assert.deepEqual(findMatchingLinks(`<a href="${long}">long</a><a href="${FILE_V1}">ok</a>`, PAGE_URL, LINK_PATTERN), [FILE_V1]);
+  });
+
+  test("a pattern the validator refuses is never run, so a backtracking shape cannot stall the lookup", () => {
+    // Alternation under a repeat: measured doubling per character when run.
+    const slow = "https://files\\.gamma-registry\\.example/media/(?:a|a)*b";
+    const page = `<a href="https://${FILE_HOST}/media/${"a".repeat(40)}c">x</a>`;
+    const started = Date.now();
+    assert.deepEqual(findMatchingLinks(page, PAGE_URL, slow), []);
+    assert.ok(Date.now() - started < 1_000, "returned at once");
   });
 
   test("a relative link is resolved against the page it is on", () => {
@@ -438,6 +525,37 @@ describe("guidance resolveFrom: failures", () => {
     routes[FILE_V1] = pdfRoute(PAGES_V1, { responseUrl: `https://${FILE_HOST}/media/zz99/other.pdf` });
     const { result } = await crawlOnce();
     assert.equal(result.errorKind, "redirect_changed");
+    assertNothingIngested();
+  });
+
+  test("a 429 from the file host defers another source whose pattern is pinned to that host, without requesting anything", async () => {
+    // Source 1 is an ordinary document on the file host; it gets a 429.
+    const plainUrl = `https://${FILE_HOST}/notices/tide-tables`;
+    const plain: GuidanceSourceSeed = {
+      id: "gamma-a-tide-tables",
+      title: "Tide tables",
+      url: plainUrl,
+      jurisdiction: "GG",
+      route: "lighthouse-keeper",
+      docType: "html",
+      checkIntervalHours: 24,
+      verificationStatus: "verified",
+      verificationNote: "Whole fictional page retrieved by hand on 2026-11-10.",
+      retrievedAt: "2026-11-10",
+    };
+    routes[plainUrl] = { status: 429, body: "slow down", contentType: "text/plain" };
+    seed(plain);
+    // Source 2 resolves from the PAGE host; a hand-edited `url` on a third
+    // host means only its link pattern still names the throttled file host.
+    seed(HANDBOOK);
+    source(HANDBOOK.id).url = "https://archive.gamma-registry.example/old/handbook.pdf";
+
+    const summary = await quiet(() => makeService().runOrchestrator({ now: at(T0) }));
+    const byId = new Map(summary.results.map((r) => [r.sourceId, r]));
+    assert.equal(byId.get(plain.id)!.errorKind, "host_backoff");
+    assert.equal(byId.get(HANDBOOK.id)!.outcome, "deferred");
+    // Neither the parent page nor the file was requested for the handbook.
+    assert.deepEqual(pageCalls(), [plainUrl]);
     assertNothingIngested();
   });
 

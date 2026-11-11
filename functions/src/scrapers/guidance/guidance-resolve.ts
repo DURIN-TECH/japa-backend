@@ -1,6 +1,6 @@
 import * as cheerio from "cheerio";
 import type { RawResponse } from "../shared/fetch/visa-catalog-fetch.service";
-import { NESTED_QUANTIFIER_RE } from "./guidance-published-date";
+import { NESTED_QUANTIFIER_RE, hasQuantifiedAlternation } from "./guidance-published-date";
 import type { GuidanceResolveFrom } from "./types";
 
 // ============================================
@@ -25,6 +25,12 @@ import type { GuidanceResolveFrom } from "./types";
 //  - the pattern must begin with a literal `https://<host>/`, checked at
 //    seeding time, so whatever the page contains, the crawl can only be sent
 //    to the host a human wrote into the seed;
+//  - that is NOT left to the pattern alone: independently of what the
+//    expression matches, every candidate link is parsed as a URL and must be
+//    https, on EXACTLY the host written in the pattern's literal prefix, with
+//    no user name, password or explicit port. A link on a look-alike host
+//    (`host.evil.example`, `host@evil.example`, `//host.evil.example/...`)
+//    is never a match, whatever the pattern says;
 //  - the pattern must match exactly ONE distinct link. No match and several
 //    matches are both failures: the crawl never guesses which file is meant;
 //  - the pattern is matched against one link at a time (bounded length), and
@@ -34,8 +40,13 @@ import type { GuidanceResolveFrom } from "./types";
 /** Longest link pattern accepted (same bound as the date selector). */
 export const MAX_LINK_PATTERN_CHARS = 300;
 
-/** Longest link on a page that is considered at all. */
-export const MAX_RESOLVED_LINK_CHARS = 2_048;
+/**
+ * Longest link that is tested against a pattern: 512 characters, measured on
+ * the href as written AND on the absolute URL it resolves to. A longer link
+ * is not a candidate. The cap bounds what a pattern (which is data) is ever
+ * run over; a published file's address is far shorter than this.
+ */
+export const MAX_RESOLVED_LINK_CHARS = 512;
 
 /** Largest parent page read, in characters (a listing page is small). */
 export const MAX_RESOLVE_PAGE_CHARS = 5 * 1024 * 1024;
@@ -46,7 +57,23 @@ export const MAX_RESOLVE_PAGE_CHARS = 5 * 1024 * 1024;
  * then `/`. Tested against the pattern's SOURCE TEXT. Because the pattern is
  * matched against the whole URL, this pins the scheme and the host.
  */
-const LITERAL_ORIGIN_RE = /^https:\/\/(?:[A-Za-z0-9-]+\\\.)+[A-Za-z]{2,}\//;
+const LITERAL_ORIGIN_RE = /^https:\/\/((?:[A-Za-z0-9-]+\\\.)+[A-Za-z]{2,})\//;
+
+/**
+ * The host a link pattern is pinned to: the one written in its literal
+ * `https://<host>/` prefix, lowercased, with the escaped dots unescaped. Null
+ * when the pattern has no such prefix, or when the character right after it
+ * is a quantifier (`?`, `*`, `+`, `{`): that would make the prefix's final
+ * `/` optional or repeatable, so the "host" could be extended by whatever
+ * follows (`https://host\.tld/?.*` also matches `https://host.tld.evil/...`).
+ */
+export function linkPatternHost(linkPattern: string): string | null {
+  const m = LITERAL_ORIGIN_RE.exec(linkPattern);
+  if (!m) return null;
+  const next = linkPattern[m[0].length];
+  if (next === "?" || next === "*" || next === "+" || next === "{") return null;
+  return m[1].replace(/\\\./g, ".").toLowerCase();
+}
 
 /** The fetch surface the lookup needs (the shared fetch service has both). */
 export interface GuidanceResolveFetcher {
@@ -85,9 +112,19 @@ export function resolveFromProblems(value: unknown): string[] {
   const problems: string[] = [];
   if (!isHttpsUrl(pageUrl)) problems.push("resolveFrom.pageUrl must be an absolute https URL");
 
+  problems.push(...linkPatternProblems(linkPattern));
+  return problems;
+}
+
+/**
+ * Everything wrong with a link pattern on its own (empty = usable). Also
+ * consulted by `findMatchingLinks`, so a pattern that would be refused at
+ * seeding time is never RUN either, wherever it came from.
+ */
+export function linkPatternProblems(linkPattern: unknown): string[] {
+  const problems: string[] = [];
   if (typeof linkPattern !== "string" || !linkPattern.trim()) {
-    problems.push("resolveFrom.linkPattern is required");
-    return problems;
+    return ["resolveFrom.linkPattern is required"];
   }
   if (linkPattern.length > MAX_LINK_PATTERN_CHARS) {
     problems.push(`resolveFrom.linkPattern is longer than ${MAX_LINK_PATTERN_CHARS} characters`);
@@ -99,8 +136,16 @@ export function resolveFromProblems(value: unknown): string[] {
     return problems;
   }
   // Scheme and host are written out, not matched: see LITERAL_ORIGIN_RE.
-  if (!LITERAL_ORIGIN_RE.test(linkPattern)) {
+  const origin = LITERAL_ORIGIN_RE.exec(linkPattern);
+  if (!origin) {
     problems.push("resolveFrom.linkPattern must begin with a literal https://<host>/ (dots escaped), so it pins the host");
+  } else if (linkPatternHost(linkPattern) === null) {
+    // `https://host\.tld/?...`, `/*...`, `/+...`, `/{0}...`: the slash that
+    // ends the host would no longer have to be there.
+    problems.push(
+      "resolveFrom.linkPattern must not put a quantifier (? * + {) right after the literal https://<host>/: " +
+        "the slash that ends the host must be matched literally"
+    );
   }
   // A top-level alternative (`a|b`) would escape that literal start.
   if (hasTopLevelAlternation(linkPattern)) {
@@ -108,6 +153,9 @@ export function resolveFromProblems(value: unknown): string[] {
   }
   if (NESTED_QUANTIFIER_RE.test(linkPattern)) {
     problems.push("resolveFrom.linkPattern must not repeat a group that itself contains a quantifier (nested quantifiers)");
+  }
+  if (hasQuantifiedAlternation(linkPattern)) {
+    problems.push("resolveFrom.linkPattern must not quantify a group that contains an alternative (|)");
   }
   return problems;
 }
@@ -143,10 +191,21 @@ function hasTopLevelAlternation(pattern: string): boolean {
 /**
  * The distinct absolute URLs of the links on a page that match the pattern
  * in full. Pure. Relative links are resolved against `baseUrl`; fragments
- * are dropped (they never reach a server); links that are not https, are
- * over-long or cannot be parsed are ignored.
+ * are dropped (they never reach a server); links that cannot be parsed or
+ * are over-long (MAX_RESOLVED_LINK_CHARS) are ignored.
+ *
+ * Two independent conditions, BOTH required:
+ *  1. the URL check (isOnPinnedHost): https, exactly the pattern's host, no
+ *     credentials, no explicit port. This does not depend on the expression;
+ *  2. the expression matches the whole absolute URL.
+ * A pattern the validator refuses (linkPatternProblems) matches nothing and
+ * is never run.
  */
 export function findMatchingLinks(html: string, baseUrl: string, linkPattern: string): string[] {
+  // A pattern the validator would refuse (no pinned host, or a shape that
+  // backtracks badly) is not run at all.
+  const host = linkPatternHost(linkPattern);
+  if (!host || linkPatternProblems(linkPattern).length > 0) return [];
   // Anchored at both ends: the pattern describes the whole address.
   const re = new RegExp(`^(?:${linkPattern})$`);
   const $ = cheerio.load(html);
@@ -160,12 +219,22 @@ export function findMatchingLinks(html: string, baseUrl: string, linkPattern: st
     } catch {
       return; // not a URL: not a candidate
     }
-    if (absolute.protocol !== "https:") return;
+    if (!isOnPinnedHost(absolute, host)) return;
     absolute.hash = "";
     const url = absolute.toString();
     if (url.length <= MAX_RESOLVED_LINK_CHARS && re.test(url)) found.add(url);
   });
   return [...found];
+}
+
+/**
+ * Is this parsed URL an https address on exactly `host`, with nothing that
+ * could make it read as that host while going elsewhere? The URL parser has
+ * already normalised it (lowercased host, resolved `//host/...`, split off
+ * any `user@`), so the comparison is on what would actually be requested.
+ */
+export function isOnPinnedHost(url: URL, host: string): boolean {
+  return url.protocol === "https:" && url.hostname === host && url.username === "" && url.password === "" && url.port === "";
 }
 
 /** Result of a lookup. */
@@ -219,6 +288,12 @@ export async function resolveDocumentUrl(
       `${matches.length} different links on ${pageUrl} match the entry's linkPattern (it must match exactly one): ` +
         matches.slice(0, 3).join(", ")
     );
+  }
+  // Belt and braces: whatever found the link, the address handed to the
+  // crawl is re-parsed and must be on the pinned host.
+  const host = linkPatternHost(linkPattern);
+  if (!host || !isOnPinnedHost(new URL(matches[0]), host)) {
+    throw new GuidanceResolveError(`The link found on ${pageUrl} is not on the host the entry's linkPattern names`);
   }
   return { resolvedUrl: matches[0], pageFinalUrl: page.finalUrl || pageUrl };
 }

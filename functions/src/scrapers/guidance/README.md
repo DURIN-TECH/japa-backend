@@ -19,6 +19,7 @@ unit test enforces that.
 | `guidance-crawl.service.ts` | Fetch, hash gate, snapshot |
 | `guidance-resolve.ts` | Looks up a document's current address on a parent page (`resolveFrom`) |
 | `guidance-quote-check.ts` | The quote integrity check |
+| `guidance-seed-run.ts` | The script's guards: which project a run may touch, and whether a crawl did its job |
 | `guidance-snapshot.store.ts` | Snapshot text in Cloud Storage, read back by hash |
 | `scripts/seed-guidance-sources.ts` | The CLI below |
 
@@ -39,7 +40,8 @@ yourself and record honestly what you got:
   group around the date. Keep it LITERAL: write the publisher's lead-in words
   out and capture only the date, for example
   `issued to staff on (\d{1,2} [A-Za-z]+ \d{4})`. No leading `.*` / `.+`, no
-  groups inside repeated groups; the validator refuses both. It is matched in
+  quantifier inside a repeated group, and no quantified group that contains
+  `|` (not even `(a|b)?`); the validator refuses all three. It is matched in
   the first and last 20,000 characters of the cleaned text only. If the
   cleaned text carries no date, leave the selector out: `publishedDate` stays
   null, which is the truth.
@@ -65,12 +67,19 @@ snapshot (with `resolvedFromUrl` naming the page). `url` in the seed is then
 only a record; it is never requested and does not need updating at the next
 release.
 
-Rules the validator enforces: the pattern must begin with a literal
-`https://<host>/` with the dots escaped (so the page cannot send the crawl to
-another host), no top-level `|`, no nested quantifiers, and no
-`expectedFinalUrl` on the same entry. No match, or more than one distinct
-match, fails the crawl with `resolve_failed` and stores nothing: tighten the
-pattern.
+Rules the validator enforces:
+
+- the pattern begins with a literal `https://<host>/` with the dots escaped,
+  and the character after that slash is not a quantifier (`?`, `*`, `+`, `{`);
+- no top-level `|`, no nested quantifiers, no quantified group containing `|`;
+- the seed's `url` is on the same host as the pattern;
+- no `expectedFinalUrl` on the same entry.
+
+The host is also enforced independently of the pattern: each candidate link
+is parsed as a URL and must be https, on exactly the pattern's host, with no
+user name, password or explicit port. A link longer than 512 characters is
+not considered. No match, or more than one distinct match, fails the crawl
+with `resolve_failed` and stores nothing: tighten the pattern.
 
 ### Pinning passages
 
@@ -80,33 +89,64 @@ the ids of the entries whose snapshot must contain it. List two ids to assert
 that two renditions of one document (web page and PDF) agree. Only whitespace
 is normalised when matching; quote marks, dashes, case and wording must be
 exact. Never adjust a passage to make the check pass: if it fails, re-read
-the source.
+the source. Give every source at least one passage (a sentence from its
+opening is enough): a unit test requires it, and a check that finds no
+passage to check fails.
 
 ## Seeding and crawling
 
 Run from `functions/`. The target project is always named explicitly.
+
+### Which project a run may touch
+
+The script decides this before it reads or writes anything, and prints which
+project and which stores (both emulators, or the real project) it will use.
+
+- **Emulators**: set a `demo-*` project id and BOTH emulator hosts. One host
+  without the other, an emulator host with a non-demo project id, or a
+  `demo-*` id with no emulator host are refused.
+- **A real project**: any run that writes (`--apply`) must repeat the project
+  id in `--confirm-project=<project>`. Without it, or with a different id,
+  nothing is written. Read-only runs (dry run, `--check-quotes`) need no
+  confirmation.
+
+```bash
+# Local: emulators on non-default ports, a demo project id.
+export GCLOUD_PROJECT=demo-guidance
+export FIRESTORE_EMULATOR_HOST=127.0.0.1:<port> FIREBASE_STORAGE_EMULATOR_HOST=127.0.0.1:<port>
+npm run seed:guidance-sources -- --apply --crawl
+```
+
+### Commands (a real project)
 
 ```bash
 # Dry run: validate the entries and print them. Writes nothing.
 GCLOUD_PROJECT=<project> npm run seed:guidance-sources
 
 # Write the registry entries (no network request).
-GCLOUD_PROJECT=<project> npm run seed:guidance-sources -- --apply
+GCLOUD_PROJECT=<project> npm run seed:guidance-sources -- --apply --confirm-project=<project>
 
 # Write, then crawl whatever is due, then run the quote check.
-GCLOUD_PROJECT=<project> npm run seed:guidance-sources -- --apply --crawl
+GCLOUD_PROJECT=<project> npm run seed:guidance-sources -- --apply --crawl --confirm-project=<project>
 
 # Crawl named sources now, due or not (also retries a `failing` source).
-GCLOUD_PROJECT=<project> npm run seed:guidance-sources -- --apply --crawl --only=<id>,<id>
+GCLOUD_PROJECT=<project> npm run seed:guidance-sources -- --apply --crawl --only=<id>,<id> --confirm-project=<project>
 
 # Quote check only, against what is already stored. No network, no write.
 GCLOUD_PROJECT=<project> npm run seed:guidance-sources -- --check-quotes
 ```
 
+An `--only` id that is not a seed entry is an error: the script stops before
+doing anything.
+
 A crawl prints the run summary (counters and one line per source), then the
 registry state (final URL, hash, publisher's date, snapshot size and page
-count), then the quote check. The script exits non-zero if any source failed
-or any passage was not found.
+count), then the quote check. The script exits non-zero when:
+
+- any source the run was for did not end `changed`, `unchanged` or `not_due`
+  with a stored snapshot (so skipped, deferred, failed, dropped after an
+  unexpected error, or never fetched);
+- any passage was not found, or the quote check had nothing to check.
 
 A second crawl of unchanged sources writes nothing: `unchanged` goes up,
 `snapshotsWritten`, `storageObjectsWritten` and `downstreamCalls` stay 0.
@@ -130,7 +170,7 @@ and `lastErrorKind` per source.
   unchanged `url` never un-fails one. Crawl it by id after re-seeding:
 
   ```bash
-  GCLOUD_PROJECT=<project> npm run seed:guidance-sources -- --apply --crawl --only=<id>
+  GCLOUD_PROJECT=<project> npm run seed:guidance-sources -- --apply --crawl --only=<id> --confirm-project=<project>
   ```
 
   A successful by-id crawl sets it back to `active`.

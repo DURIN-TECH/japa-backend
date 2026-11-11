@@ -218,6 +218,20 @@ export async function runQuoteChecks(
   return results;
 }
 
+/**
+ * The verdict on a run of the check: why it did NOT pass, or undefined when
+ * it did. A run that checked NOTHING has not passed: zero results means no
+ * passage is listed for the sources asked about (or the wrong sources were
+ * asked about), which proves nothing about the stored text.
+ */
+export function quoteCheckFailure(results: readonly GuidanceQuoteResult[]): string | undefined {
+  if (results.length === 0) {
+    return "no passage was checked: none is listed for the source(s) asked about, so nothing was confirmed";
+  }
+  const failed = failedQuoteResults(results).length;
+  return failed > 0 ? `${failed} of ${results.length} not confirmed` : undefined;
+}
+
 /** The results that failed. */
 export function failedQuoteResults(results: readonly GuidanceQuoteResult[]): GuidanceQuoteResult[] {
   return results.filter((r) => !r.found);

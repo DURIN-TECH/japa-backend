@@ -31,6 +31,7 @@ import {
   failedQuoteResults,
   findPassage,
   foldTypography,
+  quoteCheckFailure,
   runQuoteChecks,
   validateQuoteChecks,
 } from "../../../src/scrapers/guidance/guidance-quote-check";
@@ -178,6 +179,20 @@ describe("guidance quote check: running a list", () => {
     assert.deepEqual(subset.map((r) => r.sourceId), [PDF.sourceId, PDF.sourceId]);
   });
 
+  test("a run that checked nothing has NOT passed", async () => {
+    // No checks at all, a subset that no passage is listed for, and a typo.
+    assert.match(quoteCheckFailure([])!, /no passage was checked/);
+    const none = await runQuoteChecks([check("one", "trims the wick each morning", [WEB.sourceId])], deps, [PDF.sourceId]);
+    assert.deepEqual(none, []);
+    assert.match(quoteCheckFailure(none)!, /no passage was checked/);
+    assert.match(quoteCheckFailure(await runQuoteChecks([check("one", "x")], deps, ["delta-keeper-rules-wbe"]))!, /no passage was checked/);
+    // Found = pass; a miss = fail with the count.
+    const found = await runQuoteChecks([check("one", "trims the wick each morning")], deps);
+    assert.equal(quoteCheckFailure(found), undefined);
+    const mixed = await runQuoteChecks([check("one", "trims the wick each morning"), check("two", "not in either text")], deps);
+    assert.equal(quoteCheckFailure(mixed), "2 of 4 not confirmed");
+  });
+
   test("the list validator refuses malformed rows and rows that name an unknown source", () => {
     assert.deepEqual(validateQuoteChecks([check("ok", "x")], BOTH), []);
     const problems = validateQuoteChecks(
@@ -229,6 +244,13 @@ describe("committed guidance seed data", () => {
 
   test("every committed quote check is well formed and names entries that exist", () => {
     assert.deepEqual(validateQuoteChecks(GUIDANCE_QUOTE_CHECKS, GUIDANCE_SOURCE_SEEDS.map((s) => s.id)), []);
+  });
+
+  test("every committed seed entry has at least one pinned passage (an identity check)", () => {
+    // So `--check-quotes --only=<id>` can never pass by checking nothing,
+    // and every stored snapshot is known to be the document it claims to be.
+    const pinned = new Set(GUIDANCE_QUOTE_CHECKS.flatMap((c) => c.sourceIds));
+    for (const seed of GUIDANCE_SOURCE_SEEDS) assert.ok(pinned.has(seed.id), `${seed.id} has no quote check`);
   });
 
   test("a committed date selector reads the publisher's own wording (synthetic sample of that wording)", () => {
@@ -308,18 +330,40 @@ describe("committed guidance seed data", () => {
     assert.ok(codeFiles.length >= 6, "the guidance code files were found");
 
     const needles = new Set<string>();
+    // Jurisdiction keys are short (two letters), so they are looked for as
+    // whole, case-sensitive words rather than as substrings.
+    const jurisdictions = new Set<string>();
+    /**
+     * A host and every parent domain of it down to two labels
+     * (`a.b.c.example` -> itself, `b.c.example`, `c.example`). That always
+     * includes the registrable domain, without needing a public-suffix list.
+     */
+    const addHostAndParents = (host: string) => {
+      const labels = host.split(".");
+      for (let i = 0; i + 2 <= labels.length; i++) needles.add(labels.slice(i).join("."));
+    };
     for (const seed of GUIDANCE_SOURCE_SEEDS) {
       needles.add(seed.id);
       needles.add(seed.route);
       needles.add(seed.title);
-      needles.add(new URL(seed.url).host);
-      if (seed.resolveFrom) needles.add(new URL(seed.resolveFrom.pageUrl).host);
+      jurisdictions.add(seed.jurisdiction);
+      addHostAndParents(new URL(seed.url).host);
+      if (seed.resolveFrom) addHostAndParents(new URL(seed.resolveFrom.pageUrl).host);
     }
     for (const c of GUIDANCE_QUOTE_CHECKS) needles.add(c.passage);
+    /** Escape a string for use inside a regular expression. */
+    const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     for (const file of codeFiles) {
-      const text = fs.readFileSync(file, "utf8").toLowerCase();
+      const raw = fs.readFileSync(file, "utf8");
+      const text = raw.toLowerCase();
       for (const needle of needles) {
         assert.ok(!text.includes(needle.toLowerCase()), `${path.relative(root, file)} mentions seed data: ${JSON.stringify(needle)}`);
+      }
+      for (const jurisdiction of jurisdictions) {
+        assert.ok(
+          !new RegExp(`\\b${escapeRe(jurisdiction)}\\b`).test(raw),
+          `${path.relative(root, file)} mentions a seeded jurisdiction: ${JSON.stringify(jurisdiction)}`
+        );
       }
     }
   });

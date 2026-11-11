@@ -1,6 +1,6 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { publishedDateSelectorProblem } from "../guidance-published-date";
-import { resolveFromProblems } from "../guidance-resolve";
+import { linkPatternHost, resolveFromProblems } from "../guidance-resolve";
 import { GUIDANCE_SOURCE_ID_RE } from "../guidance-snapshot.store";
 import {
   GUIDANCE_DOC_TYPES,
@@ -243,6 +243,13 @@ export function validateGuidanceSourceSeed(seed: GuidanceSourceSeed): string[] {
     problems.push(...resolveFromProblems(s.resolveFrom));
     if (s.expectedFinalUrl !== undefined) {
       problems.push("expectedFinalUrl cannot be combined with resolveFrom (the resolved address is the redirect baseline)");
+    }
+    // `url` records where the document WAS; the pattern says where it may
+    // be. They must name the same host, or one of the two is a mistake.
+    const patternHost =
+      typeof s.resolveFrom?.linkPattern === "string" ? linkPatternHost(s.resolveFrom.linkPattern) : null;
+    if (patternHost && isHttpsUrl(s.url) && new URL(s.url as string).hostname !== patternHost) {
+      problems.push(`url must be on the host resolveFrom.linkPattern names (${patternHost})`);
     }
   }
   if (typeof s.jurisdiction !== "string" || !KEY_RE.test(s.jurisdiction)) {

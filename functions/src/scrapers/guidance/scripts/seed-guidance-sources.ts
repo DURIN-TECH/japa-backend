@@ -8,8 +8,15 @@
  * SAFETY
  *  - DRY RUN BY DEFAULT: validates the entries, prints what would be written
  *    and writes nothing. Pass `--apply` to write.
- *  - The target project must be named explicitly with GCLOUD_PROJECT (or an
- *    emulator via FIRESTORE_EMULATOR_HOST); there is no default project.
+ *  - The target project must be named explicitly with GCLOUD_PROJECT; there
+ *    is no default project.
+ *  - PROJECT GUARD (guidance-seed-run.ts): writing to a project whose id
+ *    does not start with `demo-` is refused unless `--confirm-project=<id>`
+ *    repeats that id. The emulators come as a pair (FIRESTORE_EMULATOR_HOST
+ *    and FIREBASE_STORAGE_EMULATOR_HOST): one without the other, an emulator
+ *    host with a non-demo project id, or a demo project id without the
+ *    emulators are all refused before anything is touched.
+ *  - An `--only=` id that is not a seed entry is an error.
  *  - `--crawl` (only with `--apply`) then runs the guidance crawl once. That
  *    DOES make network requests (robots.txt + one GET per due source) and
  *    writes snapshot text to the project's default Storage bucket. Add
@@ -18,20 +25,27 @@
  *    INTEGRITY CHECK runs (issue #111): every passage in
  *    data/guidance-quote-checks.ts must appear verbatim (whitespace
  *    normalised) in the latest stored snapshot of the entries it names. Any
- *    miss makes the script exit non-zero. `--check-quotes` alone reads the
- *    registry and the stored snapshots only: no network request, no write.
+ *    miss makes the script exit non-zero, and so does a check that checked
+ *    nothing. `--check-quotes` alone reads the registry and the stored
+ *    snapshots only: no network request, no write.
+ *  - After a crawl, every source the run was for must have ended `changed`,
+ *    `unchanged` or `not_due` WITH a stored snapshot; a skipped, deferred or
+ *    failed source makes the script exit non-zero.
  *
  * Run (from functions/):
  *   npm run build
  *   GCLOUD_PROJECT=<project> node lib/scrapers/guidance/scripts/seed-guidance-sources.js           # dry run
- *   GCLOUD_PROJECT=<project> node lib/scrapers/guidance/scripts/seed-guidance-sources.js --apply   # write
- *   GCLOUD_PROJECT=<project> node lib/scrapers/guidance/scripts/seed-guidance-sources.js --apply --crawl --only=<id>
+ *   GCLOUD_PROJECT=<project> node lib/scrapers/guidance/scripts/seed-guidance-sources.js --apply --confirm-project=<project>
+ *   GCLOUD_PROJECT=<project> node lib/scrapers/guidance/scripts/seed-guidance-sources.js --apply --crawl --only=<id> --confirm-project=<project>
  *   GCLOUD_PROJECT=<project> node lib/scrapers/guidance/scripts/seed-guidance-sources.js --check-quotes
- * or `npm run seed:guidance-sources -- [--apply] [--crawl] [--only=...] [--check-quotes]`.
+ * (`--confirm-project` is not needed, and not accepted with another id, on a
+ * `demo-*` project against the emulators.)
+ * or `npm run seed:guidance-sources -- [--apply] [--crawl] [--only=...] [--check-quotes] [--confirm-project=<id>]`.
  */
 import { GUIDANCE_QUOTE_CHECKS } from "../data/guidance-quote-checks";
 import { GUIDANCE_SOURCE_SEEDS, seedGuidanceSources, validateGuidanceSourceSeeds } from "../data/seed-guidance-sources";
-import { failedQuoteResults, runQuoteChecks, validateQuoteChecks } from "../guidance-quote-check";
+import { failedQuoteResults, quoteCheckFailure, runQuoteChecks, validateQuoteChecks } from "../guidance-quote-check";
+import { crawlTargetProblems, projectGuardProblems, unknownSourceIds } from "../guidance-seed-run";
 
 /** Tag every line this script prints. */
 const TAG = "[seed-guidance-sources]";
@@ -40,8 +54,12 @@ const TAG = "[seed-guidance-sources]";
  * Print where every seeded source stands after a run: one JSON line each,
  * with the stored crawl state and the size of its newest snapshot. Fields
  * and numbers only: never document text.
+ *
+ * @returns each source's `latestSnapshotId` (null when it has none, or when
+ *   the registry has no such entry), for the "did the crawl do its job" check
  */
-async function printRegistryState(sourceIds: readonly string[]): Promise<void> {
+async function printRegistryState(sourceIds: readonly string[]): Promise<Map<string, string | null>> {
+  const latest = new Map<string, string | null>();
   const { collections, subcollections } = await import("../../../utils/firebase");
   /** Firestore Timestamp -> ISO string, or null. */
   const iso = (v: unknown): string | null => {
@@ -53,10 +71,12 @@ async function printRegistryState(sourceIds: readonly string[]): Promise<void> {
     const doc = await collections.guidanceSources.doc(id).get();
     if (!doc.exists) {
       console.log(`  ${JSON.stringify({ id, missing: true })}`);
+      latest.set(id, null);
       continue;
     }
     const d = doc.data() as Record<string, unknown>;
-    const hash = typeof d.latestSnapshotId === "string" ? d.latestSnapshotId : null;
+    const hash = typeof d.latestSnapshotId === "string" && d.latestSnapshotId ? d.latestSnapshotId : null;
+    latest.set(id, hash);
     const all = await subcollections.guidanceSnapshots(id).get();
     const meta = hash ? (all.docs.find((s) => s.id === hash)?.data() as Record<string, unknown> | undefined) : undefined;
     console.log(
@@ -87,6 +107,7 @@ async function printRegistryState(sourceIds: readonly string[]): Promise<void> {
       })}`
     );
   }
+  return latest;
 }
 
 /**
@@ -122,10 +143,12 @@ async function checkQuotes(only?: readonly string[]): Promise<boolean> {
     }
   }
   const failed = failedQuoteResults(results);
-  if (failed.length > 0) {
+  const failure = quoteCheckFailure(results);
+  if (failure) {
+    // Includes the "checked nothing" case: zero pairs is a failure, not a pass.
     // The passage is OUR data (already in the repo), so printing it is fine;
     // the document's text is never printed.
-    console.error(`${TAG} quote integrity check FAILED: ${failed.length} of ${results.length} not confirmed. Passages looked for:`);
+    console.error(`${TAG} quote integrity check FAILED: ${failure}.${failed.length > 0 ? " Passages looked for:" : ""}`);
     for (const id of new Set(failed.map((f) => f.checkId))) {
       const check = GUIDANCE_QUOTE_CHECKS.find((c) => c.id === id);
       if (check) console.error(`  ${id}: ${JSON.stringify(check.passage)}`);
@@ -147,10 +170,38 @@ async function main(): Promise<void> {
   const onlyArg = args.find((a) => a.startsWith("--only="));
   const only = onlyArg ? onlyArg.slice("--only=".length).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
 
-  const project = process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "";
-  const emulator = process.env.FIRESTORE_EMULATOR_HOST || "";
-  if (!project) {
-    console.error(`${TAG} set GCLOUD_PROJECT to the target project (there is no default).`);
+  // `--confirm-project=<id>`: the second naming of a real project (see the guard).
+  const confirmArg = args.find((a) => a.startsWith("--confirm-project="));
+  const confirmProject = confirmArg ? confirmArg.slice("--confirm-project=".length) : undefined;
+
+  // ---- Project guard: decided before anything is loaded or touched ----
+  const firestoreEmulator = process.env.FIRESTORE_EMULATOR_HOST || "";
+  const storageEmulator = process.env.FIREBASE_STORAGE_EMULATOR_HOST || "";
+  const guard = projectGuardProblems({
+    gcloudProject: process.env.GCLOUD_PROJECT,
+    googleCloudProject: process.env.GOOGLE_CLOUD_PROJECT,
+    firestoreEmulatorHost: firestoreEmulator,
+    storageEmulatorHost: storageEmulator,
+    confirmProject,
+    writes: apply,
+  });
+  if (!guard.target) {
+    console.error(`${TAG} refusing to run, nothing was read or written:`);
+    for (const p of guard.problems) console.error(`  - ${p}`);
+    process.exitCode = 1;
+    return;
+  }
+  const project = guard.target.projectId;
+
+  // An `--only=` id that is not a seed entry is a typo: stop, rather than
+  // crawl nothing and report a clean run.
+  const seedIds = GUIDANCE_SOURCE_SEEDS.map((s) => s.id);
+  const unknown = unknownSourceIds(only, seedIds);
+  if (unknown.length > 0 || (only && only.length === 0)) {
+    console.error(
+      `${TAG} --only names ${unknown.length > 0 ? `source(s) that are not in the seed: ${unknown.join(", ")}` : "no source"}. ` +
+        `Seed ids: ${seedIds.join(", ")}`
+    );
     process.exitCode = 1;
     return;
   }
@@ -167,8 +218,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  // The banner names BOTH stores, so it is plain where a run will land.
+  const where = guard.target.emulated
+    ? `EMULATORS: Firestore ${firestoreEmulator}, Storage ${storageEmulator}`
+    : "REAL PROJECT: Firestore and Storage of this project (no emulator)";
   console.log(
-    `${TAG} project ${project}${emulator ? ` (emulator ${emulator})` : ""} — ` +
+    `${TAG} project ${project} (${where}) — ` +
       (apply ? "APPLY: entries will be written" : "DRY RUN: nothing is written (pass --apply to write)")
   );
   for (const s of GUIDANCE_SOURCE_SEEDS) {
@@ -199,14 +254,21 @@ async function main(): Promise<void> {
   // Ids, hashes and error messages only: never document text.
   console.log(`${TAG} crawl summary:`);
   console.log(JSON.stringify(summary, null, 2));
-  await printRegistryState(only ?? GUIDANCE_SOURCE_SEEDS.map((s) => s.id));
+  const targetIds = only ?? seedIds;
+  const latest = await printRegistryState(targetIds);
 
   // A seed whose sources could not all be fetched has not done its job: say
-  // so in the exit code (the summary above says which and why).
-  if (summary.failed > 0 || summary.infraErrors > 0 || summary.deferred > 0) {
-    console.error(`${TAG} crawl incomplete: ${summary.failed} failed, ${summary.infraErrors} infrastructure error(s), ${summary.deferred} deferred.`);
+  // so in the exit code. Every source the run was FOR must have ended
+  // changed / unchanged / not_due AND have a stored snapshot; skipped
+  // (unverified, paused, failing), deferred, failed, dropped after an
+  // unexpected error and never-fetched all count against the run.
+  const incomplete = crawlTargetProblems(summary, targetIds, latest);
+  if (incomplete.length > 0) {
+    console.error(`${TAG} crawl incomplete for ${incomplete.length} of ${targetIds.length} targeted source(s):`);
+    for (const p of incomplete) console.error(`  - ${p}`);
     process.exitCode = 1;
   }
+  if (summary.infraErrors > 0) process.exitCode = 1;
   // Quote integrity (issue #111): the stored text must contain the passages
   // a human read in the published documents. A miss fails the seed.
   if (!(await checkQuotes(only))) process.exitCode = 1;
