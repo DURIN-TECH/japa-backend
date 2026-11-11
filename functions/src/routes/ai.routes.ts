@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { aiCaseOfficerController } from "../controllers/ai-case-officer.controller";
+import { aiChatController } from "../controllers/ai-chat.controller";
 import { verifyAuth } from "../middleware/auth";
 
 // ============================================
@@ -12,6 +13,9 @@ import { verifyAuth } from "../middleware/auth";
 //   POST /ai/applications/:id/assess      start (or return) the assessment
 //   GET  /ai/applications/:id/assessment  the latest assessment for the application
 //   GET  /ai/assessments/:id              one assessment, by id
+//   POST   /ai/applications/:id/chat      ask one question (issue #45)
+//   GET    /ai/applications/:id/chat      the caller's own chat history
+//   DELETE /ai/applications/:id/chat      clear the caller's own chat history
 
 const aiRoutes = Router();
 
@@ -24,5 +28,9 @@ aiRoutes.get("/applications/:id/assessment", verifyAuth, (req, res) =>
 aiRoutes.get("/assessments/:id", verifyAuth, (req, res) =>
   aiCaseOfficerController.byId(req, res)
 );
+
+aiRoutes.post("/applications/:id/chat", verifyAuth, (req, res) => aiChatController.ask(req, res));
+aiRoutes.get("/applications/:id/chat", verifyAuth, (req, res) => aiChatController.history(req, res));
+aiRoutes.delete("/applications/:id/chat", verifyAuth, (req, res) => aiChatController.clear(req, res));
 
 export { aiRoutes };
