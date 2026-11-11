@@ -4,6 +4,7 @@ import type { LogEntry } from "firebase-functions/logger";
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../../utils/firebase";
 import { notificationService, type NotifyUserInput } from "../../../services/notification.service";
+import { claimsService } from "../../../services/claims.service";
 import { EMAIL_BRANDING } from "../../../services/email/branding";
 // Issue #96: alert emails to the extra (non-user) addresses go straight
 // through the branded email service (notifyUser needs a user id).
@@ -714,19 +715,17 @@ export class ScrapeAlertService {
 
   /**
    * Admin uids to email: `recipientUserIds` (config) filtered to users that
-   * really are admins, or every admin when the list is empty. Admins carry
-   * `admin: true` on users/{uid} (kept in lockstep with the role claim by
-   * claimsService), the same lookup compliance notifications use.
+   * really are admins, or every admin when the list is empty. "Admin" means
+   * the account holds the admin custom claim (issue #135): the
+   * `users/{uid}.admin` document field is not an authority and is not read.
    */
   async recipients(config: ScrapeAlertsConfig): Promise<string[]> {
     if (config.recipientUserIds.length === 0) {
-      const snap = await collections.users.where("admin", "==", true).get();
-      return snap.docs.map((d) => d.id);
+      return claimsService.listAdminUids();
     }
     const out: string[] = [];
     for (const uid of new Set(config.recipientUserIds)) {
-      const snap = await collections.users.doc(uid).get();
-      if (snap.exists && snap.data()?.admin === true) out.push(uid);
+      if (await claimsService.isAdmin(uid)) out.push(uid);
       else console.warn(`Scrape alerts: recipient ${uid} is not an admin user, skipped`);
     }
     return out;

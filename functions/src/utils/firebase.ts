@@ -72,6 +72,19 @@ export const collections = {
   agencies: db.collection("agencies"),
   countries: db.collection("countries"),
   applications: db.collection("applications"),
+  // CANONICAL home of uploaded application documents (issue #28): the
+  // TOP-LEVEL `documents` collection, one doc per uploaded file, linked to its
+  // application by the `applicationId` field (and to the client by `userId`).
+  // This is the path services/document.service.ts reads and writes, the seeder
+  // (data/seed-portal-data.ts) writes, and the per-application document limit
+  // counts. There is deliberately NO `applications/{id}/documents`
+  // subcollection and no `subcollections.documents()` helper: that second path
+  // was the "split-brain" (seeded there, read here, so nothing seeded was ever
+  // visible). Do not reintroduce it. Composite indexes for this collection
+  // (applicationId + uploadedAt, applicationId + requirementId + uploadedAt)
+  // live in firestore.indexes.json. Backend-only: no firestore.rules match ->
+  // clients are denied and go through the API, which authorizes via CASL.
+  documents: db.collection("documents"),
   transactions: db.collection("transactions"),
   consultations: db.collection("consultations"),
   notifications: db.collection("notifications"),
@@ -113,6 +126,20 @@ export const collections = {
   //   reviewStatus="pending_review" / source="scraped" and reviewed via the
   //   existing admin visa-review flow (no separate queue).
   visaSources: db.collection("visaSources"),
+  // Caseworker-guidance source registry (issue #39), kept SEPARATE from
+  // visaSources on purpose:
+  // - visaSources describes WHAT A VISA IS (the public pages the catalog
+  //   crawler turns into visa types, fees and requirements);
+  // - guidanceSources describes HOW OFFICERS DECIDE (the published rules and
+  //   caseworker guidance a rubric is extracted from).
+  // One doc per document (web page or PDF), keyed by a generic
+  // jurisdiction + route. Written by the seed
+  // (scrapers/guidance/data/seed-guidance-sources.ts) and the guidance crawl
+  // (scrapers/guidance/guidance-crawl.service.ts); read by admins through
+  // GET /admin/guidance-sources. Immutable text snapshots hang off each
+  // source (see `subcollections.guidanceSnapshots`).
+  // Backend-only: no firestore.rules match -> clients denied.
+  guidanceSources: db.collection("guidanceSources"),
   // Backend-only app configuration documents. Today: `appConfig/fx`, the
   // USD exchange rates (Frankfurter / ECB) the visa scraper converts
   // published fees with (issue #59). No firestore.rules match → clients denied.
@@ -201,10 +228,10 @@ export const subcollections = {
       .doc(visaTypeId)
       .collection("requirements"),
   
-  // Documents under applications
-  documents: (applicationId: string) =>
-    collections.applications.doc(applicationId).collection("documents"),
-  
+  // NOTE: there is intentionally no `documents` helper here. Application
+  // documents live in the TOP-LEVEL `collections.documents` (filter by
+  // `applicationId`), never under `applications/{id}/documents` (issue #28).
+
   // Timeline under applications
   timeline: (applicationId: string) =>
     collections.applications.doc(applicationId).collection("timeline"),
@@ -228,6 +255,14 @@ export const subcollections = {
   // Immutable content snapshots under a document instance (version history).
   documentVersions: (instanceId: string) =>
     collections.documentInstances.doc(instanceId).collection("versions"),
+
+  // Immutable snapshots of one guidance source (issue #39):
+  // `guidanceSources/{sourceId}/snapshots/{contentHash}`. METADATA only; the
+  // snapshot's text lives in Cloud Storage (see
+  // scrapers/guidance/guidance-snapshot.store.ts). Backend-only, like its
+  // parent: no firestore.rules match.
+  guidanceSnapshots: (sourceId: string) =>
+    collections.guidanceSources.doc(sourceId).collection("snapshots"),
 
   // An agency's per-visa service prices (issue #103), in whole NAIRA:
   // `agencies/{agencyId}/visaPrices/{countryCode}__{visaTypeId}`. Written and

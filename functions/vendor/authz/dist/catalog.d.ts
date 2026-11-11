@@ -7,7 +7,7 @@
  * Boolean capabilities that a plan can grant. A feature is either present in a
  * subscriber's entitlements (unlocked) or absent (locked / paywalled).
  */
-export declare const FEATURE_KEYS: readonly ["applications.create", "applications.bulk", "messaging", "consultations.book", "documents.upload", "analytics.view", "agency.invite_agents", "self_service", "priority_support", "news.alerts", "payments.request"];
+export declare const FEATURE_KEYS: readonly ["applications.create", "applications.bulk", "messaging", "consultations.book", "documents.upload", "analytics.view", "agency.invite_agents", "self_service", "priority_support", "news.alerts", "payments.request", "ai.case_officer"];
 export type FeatureKey = (typeof FEATURE_KEYS)[number];
 /**
  * Named constants for every feature key. **Always reference features through this
@@ -26,6 +26,7 @@ export declare const FEATURES: {
     readonly PRIORITY_SUPPORT: "priority_support";
     readonly NEWS_ALERTS: "news.alerts";
     readonly PAYMENTS_REQUEST: "payments.request";
+    readonly AI_CASE_OFFICER: "ai.case_officer";
 };
 /**
  * Numeric ceilings a plan can impose. Enforced by counting current usage and

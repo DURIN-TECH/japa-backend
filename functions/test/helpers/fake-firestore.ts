@@ -12,6 +12,7 @@
 //    where (==, <, <=, >, >=; Timestamps compared by millis), orderBy
 //    (asc/desc), limit, startAfter(docSnapshot) (issue #81 cursor pages), get;
 //  - `in` filters and doc / tx deletes (issue #83 alert store);
+//  - count() aggregations on a collection / query (issue #28);
 //  - runTransaction: tx.get(ref | query), tx.set / tx.update / tx.delete buffered and
 //    applied only when the callback resolves — a throw writes NOTHING, like a
 //    real transaction.
@@ -165,6 +166,16 @@ export function fakeCollection(
     // Cursor: a doc snapshot from a previous get() (its ref.path is the key).
     startAfter(snap: { ref: { path: string } }) {
       return fakeCollection(path, filters, order, max, snap.ref.path);
+    },
+    // count() aggregation (issue #28 document limit): same filters as get(),
+    // returned in the AggregateQuerySnapshot shape (`.data().count`).
+    count() {
+      return {
+        async get() {
+          const snap = await col.get();
+          return { data: () => ({ count: snap.size as number }) };
+        },
+      };
     },
     async get() {
       let entries = [...store.entries()]

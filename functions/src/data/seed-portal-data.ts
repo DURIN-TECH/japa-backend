@@ -553,8 +553,30 @@ async function seedAgents() {
   return agents.length;
 }
 
-async function seedApplications() {
-  const applications = [
+/**
+ * The seeded applications, as plain data (no Firestore access).
+ *
+ * Split out from seedApplications() and exported so a unit test can check the
+ * denormalized document counters (`documentsUploaded` / `documentsVerified` /
+ * `documentsRejected`) against the documents buildSeedDocuments() actually
+ * seeds (issue #28).
+ *
+ * COUNTERS — which are real and which are aspirational:
+ *  - app1, app2, app3, app4, app7, app8 have seeded documents, and their
+ *    uploaded / verified / rejected counters match those documents exactly
+ *    (pinned by test/data/seed-documents.test.ts).
+ *  - app5, app6, ssApp2, ssApp3 have zero counters and no documents: agree.
+ *  - app9, app10, ssApp1, ssApp4 carry NON-ZERO counters but have NO seeded
+ *    documents (SEED_APPS_WITH_ASPIRATIONAL_DOCUMENT_COUNTERS). The counters
+ *    are kept so portal/mobile list and progress screens show varied states
+ *    (expired, withdrawn, self-service mid-upload, completed); the documents
+ *    API returns an empty list for them. Do not treat those four as
+ *    assessable fixtures.
+ *  - `documentsRequired` is aspirational everywhere: it is a hand-written
+ *    number, not derived from the visa type's seeded requirements.
+ */
+export function buildSeedApplications() {
+  return [
     {
       id: IDS.app1,
       userId: IDS.client1User,
@@ -955,6 +977,24 @@ async function seedApplications() {
       updatedAt: daysAgo(5),
     },
   ];
+}
+
+/**
+ * Seeded applications whose non-zero document counters are intentionally
+ * aspirational: they have NO seeded documents behind them (see the note on
+ * buildSeedApplications). Listed explicitly so the unit test fails if a new
+ * mismatch is introduced by accident instead of on purpose.
+ */
+export const SEED_APPS_WITH_ASPIRATIONAL_DOCUMENT_COUNTERS: readonly string[] = [
+  IDS.app9,
+  IDS.app10,
+  IDS.ssApp1,
+  IDS.ssApp4,
+];
+
+/** Write the seeded applications (deterministic ids, so a re-run overwrites). */
+async function seedApplications() {
+  const applications = buildSeedApplications();
 
   const batch = db.batch();
   for (const app of applications) {
@@ -1343,7 +1383,32 @@ async function seedTimelines() {
   return allTimelines.length;
 }
 
-async function seedDocuments() {
+/**
+ * Deterministic id for a seeded document: `<applicationId>-doc-<requirement>`,
+ * e.g. `seed-app-001-doc-passport`. Each seeded application has at most one
+ * document per requirement, so the pair is unique (pinned by a unit test).
+ * A fixed id is what makes the seed idempotent: a second run overwrites the
+ * same docs instead of adding 34 more (issue #28).
+ */
+export function seedDocumentId(applicationId: string, requirementId: string): string {
+  return `${applicationId}-doc-${requirementId.replace(/^req-/, "")}`;
+}
+
+/**
+ * The seeded documents, as plain data (no Firestore access), each with its
+ * deterministic `id` and its `applicationId`.
+ *
+ * STORAGE PATHS ARE PLACEHOLDERS: every `storageUrl` below is a made-up
+ * `gs://japa-platform.firebasestorage.app/documents/<app>/<file>` string. No
+ * object is uploaded for it in any environment (emulator, dev or prod), and it
+ * is a gs:// URL rather than the bucket-relative path real uploads store
+ * (`documents/{userId}/{applicationId}/...`). So `GET /documents/:id/download`
+ * cannot return a working file for a seeded document, and anything that
+ * fetches the bytes (e.g. vision extraction) must tolerate a missing file for
+ * seeded documents. Real fixtures with real files belong with the visitor
+ * fixtures (#35/#42), not here.
+ */
+export function buildSeedDocuments() {
   // Documents for app1 (under_review — 5 uploaded, 4 verified)
   const app1Docs = [
     {
@@ -1880,17 +1945,71 @@ async function seedDocuments() {
 
   const allDocs = [...app1Docs, ...app2Docs, ...app3Docs, ...app4Docs, ...app7Docs, ...app8Docs];
 
-  const batch = db.batch();
+  // Stamp each document with its deterministic id (see seedDocumentId).
+  return allDocs.map((doc) => ({
+    id: seedDocumentId(doc.applicationId, doc.requirementId),
+    ...doc,
+  }));
+}
+
+/** Max writes per Firestore batch is 500; stay well under it. */
+const SEED_BATCH_SIZE = 400;
+
+/**
+ * Seed the application documents into the TOP-LEVEL `documents` collection —
+ * the canonical path that services/document.service.ts reads (see the comment
+ * on `collections.documents` in utils/firebase.ts).
+ *
+ * Before issue #28 this wrote to `applications/{id}/documents` with random
+ * ids, which no API read ("split-brain"), and every run added another copy.
+ * Now:
+ *  1. each document is written at `documents/{deterministic id}`, so running
+ *     the seed twice overwrites instead of duplicating;
+ *  2. the copies earlier seed runs left in the dead
+ *     `applications/{seedAppId}/documents` subcollections are deleted. This
+ *     only touches the SEEDED application ids (`seed-app-*` / `seed-ss-app-*`),
+ *     never any other application.
+ *
+ * @param firestore Injected for unit tests; defaults to the Admin SDK db.
+ * @returns the number of documents seeded.
+ */
+export async function seedDocuments(
+  firestore: FirebaseFirestore.Firestore = db
+): Promise<number> {
+  const allDocs = buildSeedDocuments();
+
+  // ---- 1. Write to the canonical top-level collection (idempotent ids).
+  const batch = firestore.batch();
   for (const doc of allDocs) {
-    const ref = db
-      .collection("applications")
-      .doc(doc.applicationId)
-      .collection("documents")
-      .doc();
-    batch.set(ref, { id: ref.id, ...doc });
+    batch.set(firestore.collection("documents").doc(doc.id), doc);
   }
   await batch.commit();
-  console.log(`✅ Seeded ${allDocs.length} documents`);
+
+  // ---- 2. Remove the legacy subcollection copies under the seeded apps.
+  const seededAppIds = buildSeedApplications().map((app) => app.id);
+  const legacyRefs: FirebaseFirestore.DocumentReference[] = [];
+  for (const appId of seededAppIds) {
+    const legacy = await firestore
+      .collection("applications")
+      .doc(appId)
+      .collection("documents")
+      .get();
+    for (const snap of legacy.docs) legacyRefs.push(snap.ref);
+  }
+  // Earlier runs each added a full copy, so there can be more than one
+  // batch's worth: delete in chunks.
+  for (let i = 0; i < legacyRefs.length; i += SEED_BATCH_SIZE) {
+    const cleanup = firestore.batch();
+    for (const ref of legacyRefs.slice(i, i + SEED_BATCH_SIZE)) cleanup.delete(ref);
+    await cleanup.commit();
+  }
+
+  console.log(
+    `✅ Seeded ${allDocs.length} documents` +
+      (legacyRefs.length > 0
+        ? ` (removed ${legacyRefs.length} legacy subcollection copies)`
+        : "")
+  );
   return allDocs.length;
 }
 

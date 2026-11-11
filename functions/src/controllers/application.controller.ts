@@ -9,9 +9,12 @@ import { documentRequestService } from "../services/document-request.service";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
 import { authController } from "./auth.controller";
 import { collections, auth } from "../utils/firebase";
-import { can, asSubject, checkWithinLimit, paymentRequired } from "../middleware/authz";
+import { checkWithinLimit, paymentRequired } from "../middleware/authz";
+// Shared application access check (#29): admin > applicant > assigned agent >
+// same agency, decided by the CASL ability on `req.ability`. See utils/access.ts.
+import { checkApplicationAccessForRequest } from "../utils/access";
 import { complianceService } from "../services/compliance.service";
-import { LIMITS } from "@durin-tech/authz";
+import { LIMITS, ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
@@ -22,7 +25,6 @@ import {
 import {
   Application,
   ApplicationStatus,
-  Agent,
   NotificationChannel,
 } from "../types";
 
@@ -461,13 +463,14 @@ export class ApplicationController {
         }
         applications = await applicationService.getAllApplications();
       } else if (role === "owner") {
-        // Agency owner: see all agency cases
-        const agent = await this.getAgentForUser(userId);
-        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+        // Agency owner: see all agency cases. The owner role AND the agency
+        // come from the resolved principal (req.authz, built from custom
+        // claims), never from the caller's agent document (issue #135).
+        if (req.authz?.role !== ROLES.OWNER || !req.authz.agencyId) {
           sendError(res, "FORBIDDEN", "Agency owner access required", 403);
           return;
         }
-        applications = await applicationService.getAgencyApplications(agent.agencyId);
+        applications = await applicationService.getAgencyApplications(req.authz.agencyId);
       } else if (role === "agent") {
         // Agent: see cases assigned to them
         applications = await applicationService.getAgentApplications(userId);
@@ -515,7 +518,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -550,7 +553,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -696,7 +699,7 @@ export class ApplicationController {
 
       // Only the case's agent/owner/admin can request documents — not the client.
       const isApplicant = application.userId === userId;
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess || isApplicant) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -821,7 +824,7 @@ export class ApplicationController {
 
       const isApplicant = application.userId === userId;
       const isAdmin = !!req.user?.admin;
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
 
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
@@ -877,7 +880,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -895,22 +898,11 @@ export class ApplicationController {
   // HELPER METHODS
   // ============================================
 
-  /**
-   * Check if the request's principal can access an application.
-   *
-   * Now delegates to the shared CASL ability (`req.ability`, built from the role
-   * claim in `verifyAuth`) instead of re-deriving access ad-hoc. The "read" grant
-   * encodes the same rule that used to be inlined here: admin (manage all),
-   * applicant (own `userId`), assigned agent (`agentId`), and same-agency members
-   * (owner/agent on matching `agencyId`).
-   */
-  private checkApplicationAccess(
-    req: AuthenticatedRequest,
-    application: Application,
-    action: "read" | "update" | "delete" = "read"
-  ): boolean {
-    return can(req, action, asSubject("Application", application as unknown as Record<string, unknown>));
-  }
+  // NOTE (#29): the application access check that used to live here as a
+  // private method is now the shared `checkApplicationAccess` in
+  // `utils/access.ts` (same rule, same CASL ability). Handlers call it through
+  // `checkApplicationAccessForRequest(req, application)`, which reads
+  // `req.ability`; triggers and the AI routes call it without a request.
 
   /**
    * Count non-terminal ("active") applications for a scope, used for the
@@ -1019,19 +1011,6 @@ export class ApplicationController {
     } catch {
       return undefined;
     }
-  }
-
-  /**
-   * Get agent document for a userId
-   */
-  private async getAgentForUser(userId: string): Promise<Agent | null> {
-    const snapshot = await collections.agents
-      .where("userId", "==", userId)
-      .limit(1)
-      .get();
-
-    if (snapshot.empty) return null;
-    return snapshot.docs[0].data() as Agent;
   }
 }
 
