@@ -159,6 +159,36 @@ export function toApplicantSafeVisa(visa: VisaType): ApplicantSafeVisa {
   return out as ApplicantSafeVisa;
 }
 
+/**
+ * Issue #153: the shape a visa takes in every PUBLIC list (country list,
+ * all-visas, search, popular). An agency-created visa (`source: "agency"`) is
+ * cut down to its applicant-safe fields, so `sponsor.sponsorLicenceNumber`,
+ * `sponsor.contact`, `createdBy`, `reviewedBy`, `submittedBy`,
+ * `madeGlobalBy` and `agentIds` never leave the API. Seeded / scraped visas
+ * carry none of that data and are returned exactly as stored (same object).
+ *
+ * Callers pass visas that already cleared `isVisaPubliclyVisible`; this only
+ * decides WHICH FIELDS are shown, not whether the visa is shown.
+ */
+export function toPublicListVisa<T extends VisaType>(visa: T): T | ApplicantSafeVisa {
+  if (visa.source !== AGENCY_VISA_SOURCE) return visa;
+  const safe: ApplicantSafeVisa & { sharedRoute?: unknown } = toApplicantSafeVisa(visa);
+  // Issue #153 (rebased onto #237): the public lists attach `sharedRoute`
+  // BEFORE projecting, because the lookup reads `inheritsFrom`, which the
+  // applicant-safe whitelist drops. `sharedRoute` is public by design (route
+  // id + name + covered countries only, see shared-routes/public-visa-route),
+  // so it is carried over onto the projection when the caller attached it.
+  // A visa without the key (e.g. the single-visa path in visaForCaller) gets
+  // no `sharedRoute` key here.
+  if ("sharedRoute" in visa) safe.sharedRoute = (visa as { sharedRoute?: unknown }).sharedRoute;
+  return safe;
+}
+
+/** Map a list of visas through toPublicListVisa (see above). */
+export function toPublicListVisas<T extends VisaType>(visas: T[]): Array<T | ApplicantSafeVisa> {
+  return visas.map(toPublicListVisa);
+}
+
 // ============================================
 // Service (reads applications)
 // ============================================
@@ -260,7 +290,7 @@ class AgencyVisaAccessService {
 
     // 2. Public visas. Only agency visas carry private sponsor / owner data.
     if (isVisaPubliclyVisible(visa)) {
-      return visa.source === AGENCY_VISA_SOURCE ? toApplicantSafeVisa(visa) : visa;
+      return toPublicListVisa(visa);
     }
 
     // 3. Agency-only, approved and active: through an application only.

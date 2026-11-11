@@ -23,7 +23,10 @@ import { AGENCY_VISA_SOURCE } from "@durin-tech/authz";
 import { VISA_VISIBILITY, VisaVisibility } from "../types";
 // Who may read an agency-only visa, and its applicant-safe view (issue #102).
 // Imported from its file (not the module index) to keep the import graph flat.
-import { agencyVisaAccessService } from "../agency-visas/agency-visa-access";
+import {
+  agencyVisaAccessService,
+  toPublicListVisas,
+} from "../agency-visas/agency-visa-access";
 import {
   ADMIN_VISA_SOURCE_FILTERS,
   AdminVisaFilters,
@@ -197,7 +200,11 @@ export class VisaController {
       }
 
       // Issue #237: each visa on a shared route also carries `sharedRoute`.
-      sendSuccess(res, await attachSharedRoutes(visaTypes));
+      // Issue #153: then agency visas are projected to the applicant-safe
+      // fields (no sponsor licence / contact, no createdBy / reviewedBy / ...).
+      // Order matters: attachSharedRoutes reads `inheritsFrom`, which the
+      // projection drops; toPublicListVisas keeps the attached `sharedRoute`.
+      sendSuccess(res, toPublicListVisas(await attachSharedRoutes(visaTypes)));
     } catch (error) {
       console.error("Error getting visa types:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -801,7 +808,12 @@ export class VisaController {
       });
 
       // Issue #237: only the page being returned is enriched.
-      sendSuccess(res, { ...result, visaTypes: await attachSharedRoutes(result.visaTypes) });
+      // Issue #153: then the same applicant-safe projection as the country
+      // list (attach first, see getVisaTypes); `total` is unchanged.
+      sendSuccess(res, {
+        ...result,
+        visaTypes: toPublicListVisas(await attachSharedRoutes(result.visaTypes)),
+      });
     } catch (error) {
       console.error("Error getting all visa types:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -822,7 +834,9 @@ export class VisaController {
       }
 
       const results = await visaService.searchVisaTypes(q);
-      sendSuccess(res, await attachSharedRoutes(results));
+      // Issue #237 + #153: shared route attached, then agency search hits get
+      // the applicant-safe projection (attach first, see getVisaTypes).
+      sendSuccess(res, toPublicListVisas(await attachSharedRoutes(results)));
     } catch (error) {
       console.error("Error searching visa types:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -838,7 +852,9 @@ export class VisaController {
       const limit = parseInt(req.query.limit as string) || 10;
       const visaTypes = await visaService.getPopularVisaTypes(limit);
 
-      sendSuccess(res, await attachSharedRoutes(visaTypes));
+      // Issue #237 + #153: shared route attached, then agency popular visas
+      // get the applicant-safe projection (attach first, see getVisaTypes).
+      sendSuccess(res, toPublicListVisas(await attachSharedRoutes(visaTypes)));
     } catch (error) {
       console.error("Error getting popular visa types:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
