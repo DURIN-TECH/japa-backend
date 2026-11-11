@@ -477,6 +477,11 @@ service cloud.firestore {
     //  - pendingVisaChanges/{changeId}: proposed field-level edits to
     //    approved scraped visas, staged by the crawl and approved/rejected by
     //    admins via /admin/visa-changes (issue #61). Do NOT add a match.
+    //  - riskSignals/{signalId} (+ its append-only /events audit trail):
+    //    trafficking / scam signals for a human to review (issue #119). Admins
+    //    read and decide them through /admin/risk-signals only, so the subject
+    //    and every other client principal can never see a signal or a count of
+    //    signals. Do NOT add a match, not even an admin one.
 
     // ---- Agency visa revisions (issue #100), explicit deny (issue #102) ----
     // visaRevisions/{cc}__{visaId}: unreviewed agency edits to an approved

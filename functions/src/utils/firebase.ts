@@ -168,6 +168,13 @@ export const collections = {
   // src/agency-visas, reviewed by the admin (#101). Backend-only: no
   // firestore.rules match -> clients denied.
   visaRevisions: db.collection("visaRevisions"),
+  // Trafficking / scam signals for a human to review (issue #119). One
+  // `riskSignals/{signalId}` per finding, plus an append-only
+  // `riskSignals/{signalId}/events` audit trail. Raised only by backend code
+  // (riskSignalService.raiseRiskSignal, used by #120 / #121), read and decided
+  // by admins through /admin/risk-signals. Visible to admins only and never
+  // to the subject: backend-only, no firestore.rules match -> clients denied.
+  riskSignals: db.collection("riskSignals"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all
