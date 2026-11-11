@@ -188,6 +188,16 @@ export async function optionalAuth(
 }
 
 /**
+ * True when the caller is agent-side (agent, owner or admin). Same rule as
+ * `verifyAgent`, exposed as a predicate so a handler that is open to applicants
+ * as well can branch to the (much narrower) applicant path (#43).
+ */
+export function isAgentSideRequest(req: AuthenticatedRequest): boolean {
+  const role = req.authz?.role ?? (req.user?.role as string | undefined);
+  return role === "agent" || role === "owner" || role === "admin" || !!req.user?.agent || !!req.user?.admin;
+}
+
+/**
  * Middleware to check if user is an agent
  */
 export async function verifyAgent(
