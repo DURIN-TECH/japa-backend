@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { aiCaseOfficerController } from "../controllers/ai-case-officer.controller";
 import { verifyAuth } from "../middleware/auth";
+import { aiActionController, requireCaseOfficerPlanFailClosed } from "../controllers/ai-action.controller";
 
 // ============================================
 // AI CASE-OFFICER ROUTES (issue #42)
@@ -12,6 +13,13 @@ import { verifyAuth } from "../middleware/auth";
 //   POST /ai/applications/:id/assess      start (or return) the assessment
 //   GET  /ai/applications/:id/assessment  the latest assessment for the application
 //   GET  /ai/assessments/:id              one assessment, by id
+//
+// Proposed actions (issue #44). Behind verifyAuth AND a fail-closed
+// `ai.case_officer` plan gate (unresolved entitlements are refused, unlike
+// `requireFeature`), then the shared application access check in the handler:
+//   GET  /ai/assessments/:id/actions                     the proposals
+//   POST /ai/assessments/:id/actions/:actionId/accept    accept (may create a DocumentRequest)
+//   POST /ai/assessments/:id/actions/:actionId/reject    reject, optional { reason }
 
 const aiRoutes = Router();
 
@@ -23,6 +31,16 @@ aiRoutes.get("/applications/:id/assessment", verifyAuth, (req, res) =>
 );
 aiRoutes.get("/assessments/:id", verifyAuth, (req, res) =>
   aiCaseOfficerController.byId(req, res)
+);
+
+aiRoutes.get("/assessments/:id/actions", verifyAuth, requireCaseOfficerPlanFailClosed, (req, res) =>
+  aiActionController.list(req, res)
+);
+aiRoutes.post("/assessments/:id/actions/:actionId/accept", verifyAuth, requireCaseOfficerPlanFailClosed, (req, res) =>
+  aiActionController.accept(req, res)
+);
+aiRoutes.post("/assessments/:id/actions/:actionId/reject", verifyAuth, requireCaseOfficerPlanFailClosed, (req, res) =>
+  aiActionController.reject(req, res)
 );
 
 export { aiRoutes };

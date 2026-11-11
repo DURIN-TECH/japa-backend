@@ -14,7 +14,7 @@
  */
 import { collections } from "../utils/firebase";
 import { DocumentRequest, DocumentRequestStatus } from "../types";
-import { Timestamp } from "firebase-admin/firestore";
+import { Timestamp, type Transaction } from "firebase-admin/firestore";
 
 /** Fields a caller supplies when raising a new request. */
 export interface CreateDocumentRequestInput {
@@ -30,6 +30,16 @@ export interface CreateDocumentRequestInput {
   requestedByName: string;
   visaTypeName?: string;
   countryName?: string;
+  /**
+   * Optional fixed document id (issue #44). Omitted by every existing caller,
+   * which keeps the auto-generated id. A caller that must be idempotent (accepting
+   * an AI proposed action) passes a deterministic id so a repeat can never make
+   * a second request.
+   */
+  id?: string;
+  /** Back-reference to the AI proposed action this request was created from (issue #44). */
+  sourceAssessmentId?: string;
+  sourceActionId?: string;
 }
 
 /** Filters accepted by `list`. At least one scope key must be provided. */
@@ -54,8 +64,8 @@ class DocumentRequestService {
    * `undefined` optional fields are stripped before the write — Firestore rejects
    * explicit `undefined` values, and a missing key reads back as absent anyway.
    */
-  async create(input: CreateDocumentRequestInput): Promise<DocumentRequest> {
-    const ref = collections.documentRequests.doc();
+  async create(input: CreateDocumentRequestInput, tx?: Transaction): Promise<DocumentRequest> {
+    const ref = input.id ? collections.documentRequests.doc(input.id) : collections.documentRequests.doc();
     const now = Timestamp.now();
 
     const request: DocumentRequest = {
@@ -76,9 +86,16 @@ class DocumentRequestService {
         : {}),
       ...(input.visaTypeName ? { visaTypeName: input.visaTypeName } : {}),
       ...(input.countryName ? { countryName: input.countryName } : {}),
+      // Back-reference to an accepted AI proposed action (issue #44); absent otherwise.
+      ...(input.sourceAssessmentId ? { sourceAssessmentId: input.sourceAssessmentId } : {}),
+      ...(input.sourceActionId ? { sourceActionId: input.sourceActionId } : {}),
     };
 
-    await ref.set(request);
+    // Inside a caller's transaction the write is part of it (issue #44: the
+    // accept flips the action and creates the request atomically). Without one,
+    // behaviour is exactly as before.
+    if (tx) tx.set(ref, request);
+    else await ref.set(request);
     return request;
   }
 

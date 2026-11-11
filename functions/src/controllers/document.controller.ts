@@ -1,3 +1,4 @@
+import { aiActionService } from "../services/ai-action.service";
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { documentService, UploadActor } from "../services/document.service";
@@ -324,7 +325,12 @@ export class DocumentController {
               documentRequestId,
               document.id
             );
-            if (closed) fulfilledRequestType = docRequest.documentType;
+            if (closed) {
+              fulfilledRequestType = docRequest.documentType;
+              // A request made from an AI proposed action marks that action
+              // satisfied (issue #44). No-op without a back-reference; never throws.
+              await aiActionService.syncFromRequest(docRequest, "satisfied");
+            }
           }
         } catch (e) {
           console.error("[document] fulfilling document request failed:", e);

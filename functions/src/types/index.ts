@@ -947,6 +947,14 @@ export interface DocumentRequest {
   /** Uid of whoever moved it to a terminal non-fulfilled state (waive/cancel). */
   resolvedBy?: string;
 
+  // --- Back-reference to an accepted AI proposed action (issue #44) ------------
+  // Additive and optional: set only on a request created by accepting a proposed
+  // action (`applicationAssessments/{sourceAssessmentId}/proposedActions/{sourceActionId}`).
+  // Existing consumers ignore them. They make accept idempotent and let a
+  // fulfilled / waived / cancelled request update the action it came from.
+  sourceAssessmentId?: string;
+  sourceActionId?: string;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }

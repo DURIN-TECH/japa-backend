@@ -179,3 +179,78 @@ export interface ApplicationAssessment {
   // Null while the model has no price entry (see services/ai/ai-pricing.ts).
   costUsd: number | null;
 }
+
+// ============================================
+// PROPOSED ACTIONS — TYPES (issue #44)
+// ============================================
+//
+// `applicationAssessments/{assessmentId}/proposedActions/{actionId}`.
+//
+// A proposed action is a PROPOSAL. It is derived in code from one assessment
+// finding (its `whatWouldHelp`) and the rubric criterion that finding cites.
+// Nothing is created for the applicant until a human with access accepts it;
+// accepting a blocking, client-owned action creates a real DocumentRequest
+// through the existing document-request service. There is no step engine, no
+// new applicant-facing surface and no new collection for the result.
+//
+// Who writes what: the assessment worker writes the proposals (status
+// "proposed"); the accept / reject handlers change `status` and the decision
+// fields; the document-request hooks move an accepted action on to "satisfied"
+// or "withdrawn". Nothing a client sends is stored except an optional reject reason.
+
+/** Who has to do it. */
+export const PROPOSED_ACTION_OWNERS = ["client", "agent"] as const;
+export type ProposedActionOwner = (typeof PROPOSED_ACTION_OWNERS)[number];
+
+/** A rough size of the job, set in code from the kind of finding. */
+export const PROPOSED_ACTION_EFFORTS = ["quick", "moderate", "significant"] as const;
+export type ProposedActionEffort = (typeof PROPOSED_ACTION_EFFORTS)[number];
+
+/**
+ * Lifecycle:
+ *  - proposed:  written by the worker, nothing created for anyone;
+ *  - accepted:  a human accepted it (a DocumentRequest exists when it was
+ *               blocking and client-owned);
+ *  - rejected:  a human declined it;
+ *  - satisfied: its DocumentRequest was fulfilled;
+ *  - withdrawn: its DocumentRequest was waived or cancelled (no longer asked for).
+ */
+export const PROPOSED_ACTION_STATUSES = ["proposed", "accepted", "rejected", "satisfied", "withdrawn"] as const;
+export type ProposedActionStatus = (typeof PROPOSED_ACTION_STATUSES)[number];
+
+/** Which kind of finding the action came from. Stored for the operator; never served. */
+export type ProposedActionOrigin = "refusal_ground" | "credibility_flag" | "insufficient_information";
+
+/** The stored document. */
+export interface ProposedAction {
+  id: string;
+  assessmentId: string;
+  // Copied from the assessment, for isolation checks and queries.
+  applicationId: string;
+  userId: string;
+  agencyId: string | null;
+
+  title: string;
+  ownerRole: ProposedActionOwner;
+  // True when the plan cannot move on without it. Only a blocking, client-owned
+  // action becomes a DocumentRequest when accepted.
+  blocking: boolean;
+  // Resolves to a criterion in the rubric version the assessment used (checked at write time).
+  criterionId: string;
+  evidenceNeeded: string;
+  estEffort: ProposedActionEffort;
+  status: ProposedActionStatus;
+  origin: ProposedActionOrigin;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+
+  // ---- decision ----
+  acceptedBy: string | null;
+  acceptedAt: Timestamp | null;
+  rejectedBy: string | null;
+  rejectedAt: Timestamp | null;
+  rejectReason: string | null;
+  // The DocumentRequest this action created. Null for any other accept.
+  documentRequestId: string | null;
+}

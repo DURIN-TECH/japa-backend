@@ -233,6 +233,11 @@ export const collectionGroups = {
 
 // Helper to get subcollection references
 export const subcollections = {
+  // `applicationAssessments/{assessmentId}/proposedActions/{actionId}` (issue #44).
+  // Backend-only: no firestore.rules match, so clients read it via /ai routes.
+  proposedActions: (assessmentId: string) =>
+    collections.applicationAssessments.doc(assessmentId).collection("proposedActions"),
+
   // Visa types under countries
   visaTypes: (countryCode: string) => 
     collections.countries.doc(countryCode).collection("visaTypes"),
