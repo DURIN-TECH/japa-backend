@@ -7,7 +7,11 @@ import { emailService } from "../services/email/email.service";
 import { resolveEventEmail } from "../services/email/event-templates";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { collections } from "../utils/firebase";
+import { validateStoragePath } from "../utils/storage-paths";
 import { AgencyInvitation } from "../types";
+// Issue #103: per-visa service prices on the public agency page.
+import { agencyVisaPriceService } from "../agency-visa-prices/agency-visa-price.service";
+import type { PublicAgencyVisaPrice } from "../agency-visa-prices/agency-visa-price.service";
 import { ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -236,20 +240,23 @@ export class AgencyController {
 
       // Guard against a caller registering a path that isn't theirs — the path
       // must live under this agency's own logo prefix.
-      if (!storagePath.startsWith(`agency-logos/${agency.id}/`)) {
+      // Shared validator (issue #141): an issued object directly under
+      // `agency-logos/{agency.id}/`, a plain bucket-relative key and nothing else.
+      const checked = validateStoragePath(storagePath, { purpose: "agency-logo", agencyId: agency.id });
+      if (!checked.ok) {
         sendError(res, "VALIDATION_ERROR", "storagePath does not belong to this agency", 400);
         return;
       }
 
       // Confirm the client actually completed the upload.
-      const exists = await storageService.fileExists(storagePath);
+      const exists = await storageService.fileExists(checked.key);
       if (!exists) {
         sendError(res, "VALIDATION_ERROR", "File not found at the specified path", 400);
         return;
       }
 
       // Make the object public and capture its stable URL for persistent rendering.
-      const logoUrl = await storageService.makeFilePublic(storagePath);
+      const logoUrl = await storageService.makeFilePublic(checked.key);
 
       const updated = await agencyService.updateAgency(agency.id, { logoUrl });
 
@@ -514,6 +521,16 @@ export class AgencyController {
         return;
       }
 
+      // ---- Per-visa service prices (issue #103) ----
+      // A pricing read failure must not take the whole public page down: log
+      // it and serve the page without prices (it then shows no visa list).
+      let visaPrices: PublicAgencyVisaPrice[] = [];
+      try {
+        visaPrices = await agencyVisaPriceService.listPublic(agency.id);
+      } catch (error) {
+        console.error("Error loading public agency visa prices:", error);
+      }
+
       sendSuccess(res, {
         name: agency.name,
         slug: agency.slug,
@@ -521,7 +538,8 @@ export class AgencyController {
         logoUrl: agency.logoUrl ?? null,
         state: agency.state ?? null,
         ownerName: agency.ownerName,
-        // Agency-level default consultation fee (in cents). null when unset.
+        // Agency-level default consultation fee in whole NAIRA (the old "in
+        // cents" comment was wrong; see consultation.controller). null when unset.
         consultationFee: agency.consultationFee ?? null,
         // Public service menu (name + price only).
         services: (agency.services || []).map((s) => ({
@@ -534,6 +552,11 @@ export class AgencyController {
         totalCases: agency.totalCases,
         // Trust badge only — never the raw compliance file.
         verified: agency.compliance?.status === "verified",
+        // Issue #103: the visas this agency offers with ITS OWN service price
+        // in whole naira (null = "Contact for pricing"). Only this agency's
+        // prices, only visas it may still price (own approved + priced
+        // global). Separate from each visa's government fee (baseCostUsd).
+        visaPrices,
       });
     } catch (error) {
       console.error("Error fetching public agency:", error);

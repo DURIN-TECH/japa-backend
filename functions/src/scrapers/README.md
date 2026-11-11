@@ -71,8 +71,12 @@ scrapers/
     guidance-snapshot.store.ts         snapshot text in Cloud Storage, keyed by content hash,
                                        create-only, backend-only (never served to a client)
     guidance-published-date.ts         publisher's own date, found by a per-source selector
+    guidance-resolve.ts                current address of a document that moves with each
+                                       publication, read from a stable parent page (#111)
+    guidance-quote-check.ts            passages that must appear verbatim in stored snapshots (#111)
     guidance-source.{controller,routes}.ts   GET /admin/guidance-sources (admin-only list)
-    data/                              seed-guidance-sources.ts: entries (data) + validator + loader
+    data/                              seed-guidance-sources.ts: entries (data) + validator + loader;
+                                       guidance-quote-checks.ts: the passages (data) (#111)
     scripts/                           seed-guidance-sources (CLI, dry run by default)
   rubric/                              visa rubrics (#40): guidance snapshots -> cited, versioned,
                                        machine-checkable criteria, staged `pending_review`.
@@ -90,6 +94,7 @@ scrapers/
                                        getApprovedRubric is the only consumer read
     rubric-settings.ts                 appConfig/rubricExtractionSettings: kill switch + caps
     scripts/                           extract-rubric (CLI, dry run by default)
+    README.md                          runbook: adding a source, seeding, crawling, recovering
 ```
 
 Tests mirror this layout under `functions/test/scrapers/`; shared test helpers

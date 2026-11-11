@@ -103,6 +103,32 @@ export interface GuidanceSourceSeed {
   // the first fetch) fails with `redirect_changed` and ingests nothing.
   // Optional only because most sources do not redirect.
   expectedFinalUrl?: string;
+  // OPTIONAL (issue #111). For a document whose own address CHANGES with
+  // every publication (a file whose URL carries a per-release id): where to
+  // look the current address up. When set, the crawl first reads
+  // `resolveFrom.pageUrl`, finds the one link on it that matches
+  // `resolveFrom.linkPattern`, and requests THAT; `url` is then only the
+  // record of the address the document had when it was retrieved by hand,
+  // and is not requested. See guidance-resolve.ts. Not allowed together
+  // with `expectedFinalUrl` (the resolved address is the redirect baseline).
+  resolveFrom?: GuidanceResolveFrom;
+}
+
+/**
+ * How to find a document's CURRENT address on a stable parent page (issue
+ * #111). Pure data: any publisher's "landing page that links to the current
+ * file" is described by these two strings, and no code knows which one.
+ */
+export interface GuidanceResolveFrom {
+  // The stable page that links to the document (absolute https URL). It is
+  // fetched through the shared fetch service: robots.txt, bot user agent and
+  // the per-host delay all apply.
+  pageUrl: string;
+  // A regular expression (source text, no flags) that must match the WHOLE
+  // absolute URL of exactly one link on that page. It must begin with a
+  // literal `https://<host>/`, so a page can never steer the crawl to
+  // another host (the seed validator enforces this).
+  linkPattern: string;
 }
 
 /**
@@ -112,13 +138,17 @@ export interface GuidanceSourceSeed {
 export interface GuidanceSource
   extends Omit<
     GuidanceSourceSeed,
-    "id" | "status" | "retrievedAt" | "retrievalError" | "publishedDateSelector" | "expectedFinalUrl"
+    "id" | "status" | "retrievedAt" | "retrievalError" | "publishedDateSelector" | "expectedFinalUrl" | "resolveFrom"
   > {
   status: GuidanceSourceStatus;
   // The seed's optional fields are stored as null when absent (so a re-seed
   // that drops one clears it).
   publishedDateSelector: string | null;
   expectedFinalUrl: string | null;
+  // Where the document's current address is looked up (issue #111), or null
+  // for a source whose `url` is requested directly. Absent on docs seeded
+  // before #111, which the crawl treats as null.
+  resolveFrom?: GuidanceResolveFrom | null;
   retrievalError: string | null;
   // The manual retrieval instant (from the seed's `retrievedAt`), or null.
   retrievedAt: Timestamp | null;
@@ -132,6 +162,10 @@ export interface GuidanceSource
   // The URL the last successful fetch ended at, after redirects (equal to
   // `url` when there was no redirect). Both are always kept.
   finalUrl: string | null;
+  // For a source with `resolveFrom` (issue #111): the document address the
+  // parent page linked to at the last successful fetch, i.e. the URL that
+  // was actually requested. Null / absent for every other source.
+  resolvedUrl?: string | null;
   // The publisher's own date, as an ISO date (YYYY-MM-DD) when it could be
   // parsed, else null; and the text it was read from, exactly as written.
   publishedDate: string | null;
@@ -176,6 +210,11 @@ export interface GuidanceSnapshotMeta {
   // The URL that was requested, and where the request ended after redirects.
   url: string;
   finalUrl: string;
+  // For a source with `resolveFrom` (issue #111): the parent page the
+  // document's address was read from, in which case `url` above is that
+  // RESOLVED address (what was requested), not the seed's `url`. Null /
+  // absent for a source requested directly.
+  resolvedFromUrl?: string | null;
   httpStatus: number;
   fetchedAt: Timestamp;
   // The publisher's own date, when the document gives one (see GuidanceSource).

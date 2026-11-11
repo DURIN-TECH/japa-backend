@@ -7,6 +7,7 @@ import { notificationService } from "../services/notification.service";
 import { emailService } from "../services/email/email.service";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { auth } from "../utils/firebase";
+import { validateStoragePath } from "../utils/storage-paths";
 import { Role, ROLES, packAbility } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -257,13 +258,16 @@ export class UserController {
 
       // Guard against registering a path that isn't theirs — the path must live
       // under this user's own profile prefix.
-      if (!storagePath.startsWith(`users/${userId}/profile/`)) {
+      // Shared validator (issue #141): an issued object directly under
+      // `users/{userId}/profile/`, a plain bucket-relative key and nothing else.
+      const checked = validateStoragePath(storagePath, { purpose: "profile-photo", userId });
+      if (!checked.ok) {
         sendError(res, "VALIDATION_ERROR", "storagePath does not belong to this user", 400);
         return;
       }
 
       // Confirm the client actually completed the upload.
-      const exists = await storageService.fileExists(storagePath);
+      const exists = await storageService.fileExists(checked.key);
       if (!exists) {
         sendError(res, "VALIDATION_ERROR", "File not found at the specified path", 400);
         return;
@@ -272,7 +276,7 @@ export class UserController {
       // Make the object public and capture its stable URL for persistent rendering
       // (avatars appear in the header/sidebar on every page, so a short-lived
       // signed download URL would expire — mirrors the agency-logo flow).
-      const profilePhotoUrl = await storageService.makeFilePublic(storagePath);
+      const profilePhotoUrl = await storageService.makeFilePublic(checked.key);
 
       const updatedUser = await userService.updateUser(userId, { profilePhotoUrl });
 
