@@ -130,6 +130,27 @@ describe("probe: token boundaries", () => {
     rejects(judgement("is not refundable. 3.5 Funds must have been held"), "quote_spans_paragraphs");
   });
 
+  // Code review round 2: the boundary check treated hyphen, apostrophe, %,
+  // + and / as boundaries, so a quote could start or end inside a token.
+  test("a token runs through hyphens, apostrophes, %, + and / (round 2)", () => {
+    // B1/B6: the inverse of the source's group must not be quotable.
+    assert.equal(containsTokenBounded("a non-Bordurian national", "Bordurian"), false);
+    assert.equal(containsTokenBounded("a non-Bordurian national", "non-Bordurian"), true);
+    // B4 end to end: "eight days" is not a whole token of "twenty-eight days".
+    assert.equal(containsTokenBounded("held for twenty-eight days", "eight days"), false);
+    assert.equal(containsTokenBounded("held for twenty-eight days", "twenty-eight days"), true);
+    assert.equal(containsTokenBounded("the applicant's funds", "applicant"), false);
+    assert.equal(containsTokenBounded("a fee of 20% applies", "20"), false);
+    assert.equal(containsTokenBounded("dial +44 for help", "44"), false);
+    assert.equal(containsTokenBounded("the and/or clause", "or"), false);
+    // The typographic apostrophe is the same joiner as the ASCII one.
+    assert.equal(containsTokenBounded("the applicant\u2019s funds", "applicant"), false);
+  });
+
+  test("the hyphen cut is rejected end to end (\"eight days\" from \"twenty-eight days\")", () => {
+    rejects(objective("eight days before the application", { field: "f", op: "heldForDays", value: 8, unit: "days" }), "quote_not_found");
+  });
+
   test("still rejected: a case-altered quote, two passages joined, a look-alike letter", () => {
     rejects(judgement(FUNDS.toLowerCase()), "quote_not_found");
     rejects(judgement("The applicant must have sufficient funds The priority service fee is 1,270 units"), "quote_not_found");
