@@ -58,11 +58,16 @@ import { Worker } from "worker_threads";
 // fails with reason "text-too-long", and the error records how many
 // characters and pages had been read when it stopped.
 //
-// ---- No OCR ----
+// ---- Image-only PDFs ----
 //
-// A scanned / image-only PDF has no text layer. That is reported as the
-// explicit failure "no-extractable-text" — never as an empty string, which
-// would hash as a valid fetch and mark the source up to date. OCR is #38.
+// A scanned / image-only PDF has no text layer. `extractPdfText()` reports
+// that as the explicit failure "no-extractable-text" — never as an empty
+// string, which would hash as a valid fetch and mark the source up to date.
+// A caller that WANTS such documents read (the guidance crawl, issue #38)
+// uses `extractPdfTextWithOcr()` in pdf-ocr.ts instead, which tries this
+// module's text-layer path first and only then falls back to OCR, marking
+// the result as OCR-derived (see `PdfExtraction` below). OCR never runs for a
+// document that has a usable text layer.
 
 // ----- Limits -----
 
@@ -141,10 +146,15 @@ export type PdfFailureReason =
   | "malformed" // the parser could not read the file (or crashed on it)
   | "too-many-pages" // more pages than maxPages
   | "text-too-long" // more extracted text than maxTextChars (never truncated)
-  | "no-extractable-text" // no text layer (scanned / image-only); OCR is #38
+  | "no-extractable-text" // no text layer (scanned / image-only), and OCR was not used or found no text
   | "parse-timeout" // parsing exceeded parseTimeoutMs and was terminated
   | "memory-exceeded" // parsing grew process memory past parseRssGrowthMb and was terminated
-  | "not-accepted"; // the caller asked for no PDFs (acceptPdf: false); nothing was downloaded
+  | "not-accepted" // the caller asked for no PDFs (acceptPdf: false); nothing was downloaded
+  // ---- OCR (issue #38); see pdf-ocr.ts ----
+  | "ocr-too-many-pages" // an image-only PDF with more pages than the per-document OCR cap
+  | "ocr-budget-exceeded" // the run's OCR page budget (the spend cap) has too little left
+  | "ocr-low-confidence" // OCR output below the confidence floor / obvious garbage: rejected
+  | "ocr-failed"; // the OCR engine or its image step failed (not a time / memory stop)
 
 /** Numbers recorded with a failure, so a refusal is never unexplained. */
 export interface PdfFailureDetails {
@@ -159,6 +169,14 @@ export interface PdfFailureDetails {
   timeoutMs?: number; // the parse budget that applied
   rssGrowthMb?: number; // process RSS growth (MB) seen when the parse was stopped
   maxRssGrowthMb?: number; // the RSS growth budget (MB) that applied
+  // ---- OCR (issue #38) ----
+  ocrPages?: number; // pages that would have needed OCR
+  ocrMaxPages?: number; // the per-document OCR page cap that applied
+  ocrBudgetPagesLeft?: number; // pages left in the run's OCR budget
+  ocrMeanConfidence?: number; // characters-weighted mean confidence, 0-100
+  ocrMinConfidence?: number; // the lowest page confidence seen, 0-100
+  ocrConfidenceFloor?: number; // the mean-confidence floor that applied
+  ocrPageConfidenceFloor?: number; // the per-page confidence floor that applied
 }
 
 /**
@@ -331,6 +349,70 @@ export interface PdfText {
   // 1-based numbers of pages that yielded no text (e.g. scanned inserts in an
   // otherwise textual document). Empty for a fully textual PDF.
   pagesWithoutText: number[];
+  // How the text was obtained (issue #38). Absent = the text layer for every
+  // page (everything produced before OCR existed, and every normal PDF).
+  // Present and `method !== "text-layer"` = some or all of the text is OCR
+  // output, which is LESS RELIABLE than embedded text: anything that matches a
+  // quote against this text must carry that fact along. See `PdfExtraction`.
+  extraction?: PdfExtraction;
+  // sha256 (hex) of the PDF FILE's bytes. Set only on the OCR route (pdf-ocr.ts),
+  // where it is the key of the "same file, skip OCR" shortcut.
+  sourceSha256?: string;
+  // Set ONLY when OCR was skipped because the file is byte-identical to one
+  // already recognised: the content hash that earlier OCR produced. Then
+  // `cleanText` is "" and `pages` is empty (nothing was recognised this time);
+  // the caller must treat the document as unchanged and read nothing from it.
+  ocrReusedContentHash?: string;
+}
+
+// ----- How a page's text was obtained (issue #38) -----
+
+/** How one page's text was obtained. */
+export type PdfPageMethod =
+  | "text-layer" // embedded text, read straight from the PDF
+  | "ocr" // recognised from the page's image(s) by the OCR engine
+  | "none"; // no text from either route (a blank page, or an image OCR found nothing in)
+
+/** The OCR engine's own account of one page. */
+export interface PdfOcrPage {
+  page: number; // 1-based
+  // Mean word confidence the engine reported, 0-100 (higher = more reliable).
+  confidence: number;
+  // Visible (non-whitespace) characters recognised on the page.
+  chars: number;
+}
+
+/** Everything a reviewer needs to judge OCR-derived text. */
+export interface PdfOcrInfo {
+  engine: string; // e.g. "tesseract.js"
+  engineVersion: string; // the engine and its core, pinned by package.json
+  model: string; // the language model data, e.g. "eng 4.0.0_best_int"
+  language: string; // e.g. "eng"
+  // Per OCR'd page, in page order.
+  pages: PdfOcrPage[];
+  // Characters-weighted mean of the page confidences, 0-100, and the lowest.
+  meanConfidence: number;
+  minPageConfidence: number;
+  // The floors this text passed (so a later change of the floor is visible).
+  confidenceFloor: number;
+  pageConfidenceFloor: number;
+}
+
+/**
+ * The provenance of a PDF's text. Stored on the snapshot (metadata and the
+ * stored object) and carried to every quote check, so a reviewer always knows
+ * whether a quote was matched against OCR text.
+ */
+export interface PdfExtraction {
+  // "text-layer": every page's text is embedded text.
+  // "ocr": every page that has text got it from OCR.
+  // "mixed": some pages embedded, some OCR (a page is never BOTH: see
+  //          `pageMethods`, and pdf-ocr.ts for when a page is OCR'd).
+  method: "text-layer" | "ocr" | "mixed";
+  // One entry per page, `pageMethods[0]` = page 1.
+  pageMethods: PdfPageMethod[];
+  // Present exactly when some page was OCR'd.
+  ocr?: PdfOcrInfo;
 }
 
 /**
@@ -577,22 +659,12 @@ function runPdfWorker(input: PdfWorkerInput, limits: PdfLimits, label: string): 
 }
 
 /**
- * Extract clean, per-page text from PDF bytes.
- *
- * Checks, in order: byte cap, `%PDF-` header, then (in the worker, under the
- * timeout and the memory watchdog) the parse itself and the page cap, then the text cap and the "has a text layer"
- * floor. Every refusal is a `PdfFetchError` with a reason; the text is never
- * truncated and an image-only PDF never comes back as empty text.
- *
- * @param bytes  the PDF file
- * @param label  what to call the document in error messages (its URL)
- * @param limits caps to apply (default DEFAULT_PDF_LIMITS)
+ * Steps 1-5 of reading a PDF: byte cap, `%PDF-` header, isolated parse (page
+ * cap, timeout, memory watchdog), clean each page, text cap. Does NOT apply
+ * the "has a text layer" floor: `extractPdfText()` does, and the OCR route
+ * (pdf-ocr.ts) uses the per-page result to decide what to recognise.
  */
-export async function extractPdfText(
-  bytes: Uint8Array,
-  label: string,
-  limits: PdfLimits = DEFAULT_PDF_LIMITS
-): Promise<PdfText> {
+export async function readPdfPages(bytes: Uint8Array, label: string, limits: PdfLimits = DEFAULT_PDF_LIMITS): Promise<PdfText> {
   const byteLength = bytes.byteLength;
 
   // 1. Byte cap (the fetch service already enforced it while downloading).
@@ -648,18 +720,48 @@ export async function extractPdfText(
       }
     );
   }
+  return pdf;
+}
+
+/** The "no text layer" refusal for a text of `visibleChars` visible characters. */
+export function noTextLayerError(label: string, pdf: Pick<PdfText, "pageCount" | "byteLength">, visibleChars: number, limits: PdfLimits): PdfFetchError {
+  return new PdfFetchError(
+    "no-extractable-text",
+    `No extractable text in PDF for ${label}: ${visibleChars} characters over ${pdf.pageCount} pages ` +
+      `(below the ${limits.minTextChars}-character floor; likely scanned / image-only, which needs OCR)`,
+    { charsRead: visibleChars, pageCount: pdf.pageCount, minTextChars: limits.minTextChars, byteLength: pdf.byteLength }
+  );
+}
+
+/** Visible (non-whitespace) characters in a text. */
+export function visibleCharCount(text: string): number {
+  return text.replace(/\s+/g, "").length;
+}
+
+/**
+ * Extract clean, per-page text from PDF bytes (TEXT LAYER ONLY: no OCR here;
+ * see pdf-ocr.ts for the route that falls back to it).
+ *
+ * Checks, in order: byte cap, `%PDF-` header, then (in the worker, under the
+ * timeout and the memory watchdog) the parse itself and the page cap, then the text cap and the "has a text layer"
+ * floor. Every refusal is a `PdfFetchError` with a reason; the text is never
+ * truncated and an image-only PDF never comes back as empty text.
+ *
+ * @param bytes  the PDF file
+ * @param label  what to call the document in error messages (its URL)
+ * @param limits caps to apply (default DEFAULT_PDF_LIMITS)
+ */
+export async function extractPdfText(
+  bytes: Uint8Array,
+  label: string,
+  limits: PdfLimits = DEFAULT_PDF_LIMITS
+): Promise<PdfText> {
+  const pdf = await readPdfPages(bytes, label, limits);
 
   // 6. A text layer must exist. Count non-whitespace characters so a file of
   // blank pages (or page separators only) cannot pass.
-  const visibleChars = pdf.cleanText.replace(/\s+/g, "").length;
-  if (visibleChars < limits.minTextChars) {
-    throw new PdfFetchError(
-      "no-extractable-text",
-      `No extractable text in PDF for ${label}: ${visibleChars} characters over ${pdf.pageCount} pages ` +
-        `(below the ${limits.minTextChars}-character floor; likely scanned / image-only, which needs OCR)`,
-      { charsRead: visibleChars, pageCount: pdf.pageCount, minTextChars: limits.minTextChars, byteLength }
-    );
-  }
+  const visibleChars = visibleCharCount(pdf.cleanText);
+  if (visibleChars < limits.minTextChars) throw noTextLayerError(label, pdf, visibleChars, limits);
 
   return pdf;
 }

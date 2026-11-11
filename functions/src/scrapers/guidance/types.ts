@@ -1,4 +1,6 @@
 import type { Timestamp } from "firebase-admin/firestore";
+// How a PDF's text was obtained (text layer or OCR; issue #38).
+import type { PdfExtraction, PdfPageMethod } from "../shared/fetch/pdf-text";
 
 // ============================================
 // GUIDANCE SOURCE REGISTRY — TYPES (issue #39)
@@ -172,6 +174,14 @@ export interface GuidanceSource
   publishedDateText: string | null;
   // Id (= content hash) of the newest snapshot, and when the hash last moved.
   latestSnapshotId: string | null;
+  // How the newest snapshot's text was obtained (issue #38): "html",
+  // "text-layer", "ocr" or "mixed". Absent / null on docs from before OCR,
+  // which are text-layer or html. "ocr" / "mixed" = a quote matched against it
+  // is lower confidence and needs human review.
+  lastExtractionMethod?: string | null;
+  // sha256 of the PDF FILE last recognised by OCR, or null when the newest
+  // snapshot is not OCR-derived. A byte-identical file skips OCR on re-crawl.
+  lastOcrSourceSha256?: string | null;
   lastChangedAt: Timestamp | null;
   // Every attempt, successful or not.
   lastAttemptAt: Timestamp | null;
@@ -229,6 +239,11 @@ export interface GuidanceSnapshotMeta {
   byteLength: number;
   // Size of the fetched PDF file in bytes; null for a web page.
   sourceByteLength: number | null;
+  // How the text was obtained (issue #38): the method per page, and for OCR
+  // the engine, version, model and per-page confidence. Null / absent for a
+  // web page and for snapshots stored before OCR existed (all text-layer).
+  // Anything that cites this snapshot must carry the OCR marker along.
+  extraction?: PdfExtraction | null;
   // Object name in the project's default bucket (never a URL).
   storagePath: string;
   // The hash this one replaced WHEN IT WAS FIRST SEEN (null for a source's
@@ -240,12 +255,18 @@ export interface GuidanceSnapshotMeta {
 }
 
 /** Version of the JSON object stored in Cloud Storage. */
-export const GUIDANCE_SNAPSHOT_SCHEMA_VERSION = 1;
+// 2 (issue #38): adds `extraction` and a per-page `method`. Objects written
+// at version 1 have neither, and mean "text layer / web page" (see
+// guidance-snapshot.store.ts).
+export const GUIDANCE_SNAPSHOT_SCHEMA_VERSION = 2;
 
 /** One page of a PDF snapshot. `page` is 1-based, as printed in a citation. */
 export interface GuidanceSnapshotPage {
   page: number;
   text: string;
+  // How THIS page's text was obtained (issue #38). Absent (version 1
+  // objects) = "text-layer".
+  method?: PdfPageMethod;
 }
 
 /**
@@ -266,4 +287,10 @@ export interface GuidanceSnapshotContent {
   text: string;
   // Per-page text with page numbers, for a PDF; null for a web page.
   pages: GuidanceSnapshotPage[] | null;
+  // How the text was obtained (issue #38). Absent (version 1) or null = a
+  // text layer / a web page. `method` "ocr" or "mixed" = OCR-derived text:
+  // a quote matched against it is LOWER CONFIDENCE and needs human review
+  // (see guidance-quote-check.ts). Not covered by the content hash, so the
+  // store checks it against the pages when reading.
+  extraction?: PdfExtraction | null;
 }

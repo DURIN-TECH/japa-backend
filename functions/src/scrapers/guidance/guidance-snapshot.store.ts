@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import { storage } from "../../utils/firebase";
 // The separator the fetch service joins a PDF's pages with (a form feed).
-import { PDF_PAGE_SEPARATOR } from "../shared/fetch/pdf-text";
+import { PDF_PAGE_SEPARATOR, type PdfExtraction } from "../shared/fetch/pdf-text";
 import {
   GUIDANCE_SNAPSHOT_SCHEMA_VERSION,
   type GuidanceDocType,
@@ -118,6 +118,10 @@ export interface SnapshotWriteInput {
   text: string;
   // Per-page text for a PDF (`pages[0]` is page 1); omitted for a web page.
   pages?: readonly string[];
+  // How a PDF's text was obtained (issue #38). Omitted for a web page. For a
+  // PDF, omitted = a text layer on every page. When OCR was used it MUST be
+  // passed: it is what marks the stored text as OCR-derived.
+  extraction?: PdfExtraction;
 }
 
 /** Result of `write()`. */
@@ -163,8 +167,19 @@ export class GuidanceSnapshotStore {
 
     // Page numbers are stored explicitly (1-based) so a consumer never has to
     // infer them from an array index.
+    // Each page carries how its text was obtained, so a quote's page tells a
+    // reviewer whether it was matched against OCR (issue #38).
+    const extraction: PdfExtraction | null = input.pages
+      ? input.extraction ?? {
+          method: "text-layer",
+          pageMethods: input.pages.map((t) => (t.length > 0 ? "text-layer" : "none")),
+        }
+      : null;
+    if (extraction && extraction.pageMethods.length !== input.pages?.length) {
+      throw new Error("Snapshot extraction does not describe every page");
+    }
     const pages: GuidanceSnapshotPage[] | null = input.pages
-      ? input.pages.map((text, i) => ({ page: i + 1, text }))
+      ? input.pages.map((text, i) => ({ page: i + 1, text, method: extraction?.pageMethods[i] }))
       : null;
     const content: GuidanceSnapshotContent = {
       schemaVersion: GUIDANCE_SNAPSHOT_SCHEMA_VERSION,
@@ -176,6 +191,7 @@ export class GuidanceSnapshotStore {
       fetchedAt: new Date(input.fetchedAtMs).toISOString(),
       text: input.text,
       pages,
+      extraction,
     };
 
     const file = this.resolveBucket().file(storagePath);
@@ -196,7 +212,14 @@ export class GuidanceSnapshotStore {
             cacheControl: "private, no-store",
             // Custom metadata for anyone browsing the bucket. Deliberately NO
             // `firebaseStorageDownloadTokens`: no download URL can be built.
-            metadata: { sourceId: input.sourceId, contentHash, docType: input.docType },
+            // `extractionMethod` makes OCR-derived objects recognisable
+            // without opening them.
+            metadata: {
+              sourceId: input.sourceId,
+              contentHash,
+              docType: input.docType,
+              extractionMethod: extraction ? extraction.method : "html",
+            },
           },
         });
       return { contentHash, storagePath, byteLength, created: true };
@@ -235,6 +258,24 @@ export class GuidanceSnapshotStore {
       }
     } else if (content.docType === "pdf") {
       throw new Error(`Guidance snapshot ${storagePath}: a PDF snapshot without pages`);
+    }
+    // OCR marker (issue #38). `extraction` is not covered by the hash either,
+    // so it must agree with the pages: one method per page, the per-page
+    // `method` equal to it, and OCR details present exactly when a page is
+    // OCR. A snapshot that hides or invents OCR is refused, never repaired.
+    // Version 1 objects have no marker and mean "text layer".
+    const ex = content.extraction;
+    if (ex) {
+      const pages = content.pages ?? [];
+      const hasOcrPage = ex.pageMethods.includes("ocr");
+      const consistent =
+        ex.pageMethods.length === pages.length &&
+        pages.every((p, i) => p.method === ex.pageMethods[i]) &&
+        hasOcrPage === Boolean(ex.ocr) &&
+        (ex.method === "text-layer") === !hasOcrPage;
+      if (!consistent) throw new Error(`Guidance snapshot ${storagePath}: its extraction marker does not match its pages`);
+    } else if (content.pages?.some((p) => p.method === "ocr")) {
+      throw new Error(`Guidance snapshot ${storagePath}: OCR pages without an extraction marker`);
     }
     return content;
   }

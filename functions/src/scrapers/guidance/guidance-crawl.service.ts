@@ -10,6 +10,8 @@ import {
   type RawResponse,
 } from "../shared/fetch/visa-catalog-fetch.service";
 import { DEFAULT_PDF_LIMITS, isPdfFetchError } from "../shared/fetch/pdf-text";
+// OCR fallback for image-only PDFs (issue #38) and its per-run page budget.
+import { DEFAULT_OCR_RUN_BUDGET_PAGES, OcrBudget, type PdfOcrOptions } from "../shared/fetch/pdf-ocr";
 import { describeError } from "../shared/fetch/redact";
 import { HostBackoffTracker, backoffMessage, hostOf, isHostBackoffError } from "../shared/etiquette/visa-crawl-host-state";
 // Failure streak -> auto-pause rules shared with the visa and news crawlers.
@@ -173,7 +175,7 @@ export interface GuidanceCrawlSummary {
 export interface GuidanceFetcher {
   fetchAndClean(
     url: string,
-    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number }
+    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number; ocr?: PdfOcrOptions }
   ): Promise<FetchedPage>;
   // Needed only for a source with `resolveFrom` (issue #111): the robots
   // check and the raw GET of the parent page. Optional so a fetcher that
@@ -197,6 +199,11 @@ export interface GuidanceCrawlOptions {
   // the hook the rubric extraction (#40) attaches to. It is never called for
   // an unchanged source. A listener that throws is recorded as a warning.
   onChanged?: (event: GuidanceChangeEvent) => Promise<void> | void;
+  // OCR pages this run may spend on image-only PDFs, across ALL its sources
+  // (the OCR spend cap, issue #38). Default DEFAULT_OCR_RUN_BUDGET_PAGES. A
+  // document that does not fit in what is left fails with a logged
+  // "ocr-budget-exceeded" and is retried on a later run. 0 = no OCR this run.
+  ocrBudgetPages?: number;
 }
 
 /**
@@ -339,6 +346,8 @@ export class GuidanceCrawlService {
 
     // Hosts that answered 429/503 in THIS run: not requested again in it.
     const hostState = new HostBackoffTracker(nowMs);
+    // One OCR page budget for the whole run (issue #38).
+    const ocrBudget = new OcrBudget(opts.ocrBudgetPages ?? DEFAULT_OCR_RUN_BUDGET_PAGES);
 
     for (const doc of docs) {
       summary.sourcesConsidered++;
@@ -346,7 +355,7 @@ export class GuidanceCrawlService {
       // hand-edited doc with a field of the wrong type, a write that fails)
       // becomes a line in the summary; the run goes on to the next source.
       try {
-        await this.processSource(doc, { now, failureLimit, summary, explicit: !!explicit, hostState, onChanged: opts.onChanged });
+        await this.processSource(doc, { now, failureLimit, summary, explicit: !!explicit, hostState, ocrBudget, onChanged: opts.onChanged });
       } catch (err) {
         summary.warnings.push(`source ${doc.id}: skipped after an unexpected error: ${describeError(err).slice(0, MAX_STORED_ERROR_CHARS)}`);
       }
@@ -380,6 +389,7 @@ export class GuidanceCrawlService {
       // True when the run named its sources (`sourceIds`).
       explicit: boolean;
       hostState: HostBackoffTracker;
+      ocrBudget: OcrBudget;
       onChanged?: GuidanceCrawlOptions["onChanged"];
     }
   ): Promise<void> {
@@ -467,7 +477,7 @@ export class GuidanceCrawlService {
 
     // ---- Crawl ----
     try {
-      await this.crawlSource(sourceId, source, { now, failureLimit, summary, onChanged: ctx.onChanged });
+      await this.crawlSource(sourceId, source, { now, failureLimit, summary, ocrBudget: ctx.ocrBudget, onChanged: ctx.onChanged });
     } catch (err) {
       // Our own infrastructure failed: a run-level error, not the source's
       // fault. The source doc is left exactly as it was (no streak, no
@@ -524,6 +534,7 @@ export class GuidanceCrawlService {
       now: Timestamp;
       failureLimit: number;
       summary: GuidanceCrawlSummary;
+      ocrBudget: OcrBudget;
       onChanged?: GuidanceCrawlOptions["onChanged"];
     }
   ): Promise<void> {
@@ -561,6 +572,23 @@ export class GuidanceCrawlService {
       checkRobots: true,
       acceptPdf: source.docType === "pdf",
       maxHtmlTextChars: GUIDANCE_MAX_HTML_TEXT_CHARS,
+      // An image-only PDF is read by OCR instead of failing (issue #38).
+      // The text is marked OCR-derived on the snapshot (step 5). Bounded by
+      // the per-document page cap, this run's shared page budget and the
+      // confidence floor. GUIDANCE_OCR_DISABLED=1 turns the fallback off
+      // (such a PDF then fails with "no-extractable-text" as before).
+      ocr:
+        source.docType === "pdf"
+          ? {
+              limits: { enabled: process.env.GUIDANCE_OCR_DISABLED !== "1" },
+              budget: ctx.ocrBudget,
+              // The last OCR'd file: a byte-identical one skips OCR (free re-crawl).
+              lastRecognised:
+                source.lastOcrSourceSha256 && source.lastContentHash
+                  ? { pdfSha256: source.lastOcrSourceSha256, contentHash: source.lastContentHash }
+                  : undefined,
+            }
+          : undefined,
     });
 
     // 2. The document must still be the kind the registry says it is.
@@ -652,6 +680,8 @@ export class GuidanceCrawlService {
         fetchedAtMs: page.fetchedAt,
         text: page.cleanText,
         pages: page.pdf?.pages,
+        // Marks OCR-derived text on the stored object (issue #38).
+        extraction: page.pdf?.extraction,
       });
     } catch (err) {
       throw new GuidanceInfraError("storage_error", `Could not store the snapshot text: ${describeError(err)}`);
@@ -682,6 +712,8 @@ export class GuidanceCrawlService {
       charCount: page.cleanText.length,
       byteLength: written.byteLength,
       sourceByteLength: page.pdf ? page.pdf.byteLength : null,
+      // OCR marker (issue #38): null for a web page.
+      extraction: page.pdf?.extraction ?? null,
       storagePath: written.storagePath,
       previousContentHash,
       createdAt: now,
@@ -709,6 +741,11 @@ export class GuidanceCrawlService {
         ...success,
         lastContentHash: page.contentHash,
         latestSnapshotId: page.contentHash,
+        // OCR visibility on the source itself (issue #38), plus the file
+        // hash that lets an unchanged scan skip OCR next time. Null unless
+        // the newest snapshot is OCR-derived.
+        lastExtractionMethod: page.pdf?.extraction?.method ?? (page.pdf ? "text-layer" : "html"),
+        lastOcrSourceSha256: page.pdf?.extraction?.ocr ? page.pdf.sourceSha256 ?? null : null,
         lastChangedAt: now,
         publishedDate: meta.publishedDate,
         publishedDateText: meta.publishedDateText,

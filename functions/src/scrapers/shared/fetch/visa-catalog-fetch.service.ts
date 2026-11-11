@@ -7,6 +7,8 @@ import { HostBackoffError, backoffDelayMs, isBackoffStatus } from "../etiquette/
 // PDF support (issue #33): detection, limits and text extraction live in
 // pdf-text.ts; this service only routes a PDF response to it.
 import { DEFAULT_PDF_LIMITS, PdfFetchError, PdfLimits, PdfText, extractPdfText, isPdfResponse } from "./pdf-text";
+// OCR fallback for image-only PDFs (issue #38): opt-in per call, see pdf-ocr.ts.
+import { PdfOcrOptions, extractPdfTextWithOcr } from "./pdf-ocr";
 
 // ============================================
 // VISA CATALOG — FETCH SERVICE (Step 2)
@@ -864,7 +866,12 @@ export class VisaCatalogFetchService {
     // MAX_CLEAN_TEXT_CHARS; a page whose clean text is longer than this value
     // fails with HtmlTextTooLongError instead, the same "never truncate
     // silently" rule the PDF path follows. Has no effect on a PDF response.
-    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number }
+    // ocr (issue #38, default unset = unchanged behaviour): when set, an
+    // image-only PDF is read by OCR instead of failing with
+    // "no-extractable-text"; the result's `pdf.extraction` says how the text
+    // was obtained. See pdf-ocr.ts. Has no effect on a PDF with a text layer
+    // or on a web page.
+    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number; ocr?: PdfOcrOptions }
   ): Promise<FetchedPage> {
     if (options?.checkRobots) {
       const allowed = await this.isAllowedByRobots(url);
@@ -889,7 +896,9 @@ export class VisaCatalogFetchService {
       const bytes = typeof body === "string" ? Buffer.from(body, "latin1") : body;
       let pdf: PdfText;
       try {
-        pdf = await extractPdfText(bytes, url, this.pdfLimits);
+        pdf = options?.ocr
+          ? await extractPdfTextWithOcr(bytes, url, this.pdfLimits, options.ocr)
+          : await extractPdfText(bytes, url, this.pdfLimits);
       } catch (err) {
         if (err instanceof PdfFetchError) {
           console.warn(`Visa catalog fetch: PDF rejected (${err.reason}): ${err.message}`);
@@ -902,8 +911,11 @@ export class VisaCatalogFetchService {
         httpStatus: status,
         // Pages joined with a form feed; NOT subject to MAX_CLEAN_TEXT_CHARS.
         cleanText: pdf.cleanText,
-        // Same change-detection key as HTML: sha256 of the clean text.
-        contentHash: this.hash(pdf.cleanText),
+        // Same change-detection key as HTML: sha256 of the clean text. The
+        // one exception (issue #38): a byte-identical scan whose OCR was
+        // skipped carries the hash that earlier OCR produced (its text was
+        // not read this time).
+        contentHash: pdf.ocrReusedContentHash ?? this.hash(pdf.cleanText),
         fetchedAt: Date.now(),
         pdf,
       };

@@ -187,3 +187,40 @@ and `lastErrorKind` per source.
 A quote check that starts failing after a crawl means the publisher changed
 the wording (a new snapshot was written; the old one is still readable by its
 hash). That is a signal for the rubric owner, not something to patch here.
+
+## OCR fallback for image-only PDFs (issue #38)
+
+A scanned PDF has no text layer. The crawl reads it with OCR instead of
+failing with `no-extractable-text` (`../shared/fetch/pdf-ocr.ts`).
+
+- **Engine**: `tesseract.js` 7.0.0 (WebAssembly) with the English model from
+  `@tesseract.js-data/eng`, both pinned in `functions/package.json`. No native
+  build step, no network at run time, no third-party service: the document
+  never leaves the function. Page images are pulled out of the PDF by a worker
+  thread (`pdf-ocr.worker.ts`); the engine runs in its own thread.
+- **When**: only for a PDF below the text-layer floor, and only for pages with
+  fewer than 25 embedded characters. A page that has a text layer keeps its
+  embedded text; OCR text is never mixed into it.
+- **Marking** (citation integrity): every snapshot records how its text was
+  obtained. `extraction` on the stored object and on the snapshot metadata
+  holds the method per page (`text-layer` / `ocr` / `none`) and, for OCR, the
+  engine, version, model and per-page confidence. Each stored page carries its
+  `method`. The source records `lastExtractionMethod`. The store refuses to
+  read a snapshot whose marker disagrees with its pages.
+- **Quote check**: a passage matched on an OCR page is reported with
+  `ocrDerived` and `needsHumanReview`, and counts as NOT confirmed
+  (`failedQuoteResults`): an OCR quote alone never satisfies the verbatim
+  requirement without a person reading the page.
+- **Hash gate**: OCR text is cleaned and page-joined like text-layer text and
+  hashed the same way. The sha256 of the OCR'd file is kept on the source
+  (`lastOcrSourceSha256`); a byte-identical file skips OCR on re-crawl.
+- **Bounds**: 30 pages per document, a 60-page budget per crawl run
+  (`ocrBudgetPages`), 240 s total, 300 MB RSS growth, 16 MP per image, a
+  confidence floor (mean 70, any page 40, 60% letters or digits). Exceeding a
+  cap or the floor fails the source with a logged reason
+  (`ocr-too-many-pages`, `ocr-budget-exceeded`, `ocr-low-confidence`,
+  `parse-timeout`, `memory-exceeded`). `GUIDANCE_OCR_DISABLED=1` turns OCR off.
+- **Deploy**: the function that runs the guidance crawl needs about 1 GB of
+  memory and a long timeout for OCR; 512 MB is too small. Limits: a scan whose
+  page is not one embedded image (outlined text, many tiles) or is stored
+  rotated is not read.

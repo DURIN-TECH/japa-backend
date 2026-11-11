@@ -42,6 +42,7 @@
  * `demo-*` project against the emulators.)
  * or `npm run seed:guidance-sources -- [--apply] [--crawl] [--only=...] [--check-quotes] [--confirm-project=<id>]`.
  */
+import type { PdfExtraction } from "../../shared/fetch/pdf-text";
 import { GUIDANCE_QUOTE_CHECKS } from "../data/guidance-quote-checks";
 import { GUIDANCE_SOURCE_SEEDS, seedGuidanceSources, validateGuidanceSourceSeeds } from "../data/seed-guidance-sources";
 import { failedQuoteResults, quoteCheckFailure, runQuoteChecks, validateQuoteChecks } from "../guidance-quote-check";
@@ -100,6 +101,9 @@ async function printRegistryState(sourceIds: readonly string[]): Promise<Map<str
             pageCount: meta.pageCount,
             pagesWithoutText: meta.pagesWithoutText,
             sourceByteLength: meta.sourceByteLength,
+            // How the text was obtained; "ocr" / "mixed" = lower confidence.
+            extractionMethod: (meta.extraction as PdfExtraction | null | undefined)?.method ?? null,
+            ocrMeanConfidence: (meta.extraction as PdfExtraction | null | undefined)?.ocr?.meanConfidence ?? null,
             httpStatus: meta.httpStatus,
             fetchedAt: iso(meta.fetchedAt),
           }
@@ -136,7 +140,12 @@ async function checkQuotes(only?: readonly string[]): Promise<boolean> {
   for (const r of results) {
     const where = r.page ? ` page ${r.page}${r.endPage && r.endPage !== r.page ? `-${r.endPage}` : ""}` : "";
     const hash = r.contentHash ? ` snapshot ${r.contentHash.slice(0, 12)}` : "";
-    if (r.found) {
+    if (r.found && r.needsHumanReview) {
+      // OCR-derived text: present, but not a confirmation (issue #38).
+      console.error(
+        `  OCR-ONLY ${r.sourceId}${hash}${where}  [${r.label}] ${r.checkId}: matched in OCR text (${r.ocrEngine}, confidence ${r.ocrConfidence}); human review required`
+      );
+    } else if (r.found) {
       console.log(`  FOUND    ${r.sourceId}${hash}${where}  [${r.label}] ${r.checkId}`);
     } else {
       console.error(`  MISSING  ${r.sourceId}${hash}  [${r.label}] ${r.checkId}: ${r.problem}${r.detail ? ` (${r.detail})` : ""}`);

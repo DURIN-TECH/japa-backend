@@ -61,6 +61,16 @@ export interface GuidanceQuoteResult {
   // For a PDF snapshot: the 1-based page the passage starts and ends on.
   page?: number;
   endPage?: number;
+  // OCR (issue #38). True when the passage was matched in text that came
+  // from OCR (a page that had no text layer): that is LOWER CONFIDENCE, so
+  // `found` alone is not a confirmation: `needsHumanReview` is set and a
+  // reviewer must read the page image before the quote is relied on.
+  ocrDerived?: boolean;
+  needsHumanReview?: boolean;
+  // The engine's 0-100 confidence on the OCR page(s) the passage sits on
+  // (the lowest, when it spans pages), and the engine that produced it.
+  ocrConfidence?: number;
+  ocrEngine?: string;
   problem?: GuidanceQuoteProblem;
   // Extra detail for a failure (a read error, or a punctuation hint).
   detail?: string;
@@ -71,6 +81,29 @@ export interface PassageLocation {
   found: boolean;
   page?: number;
   endPage?: number;
+  // OCR provenance of the matched text (issue #38); see GuidanceQuoteResult.
+  ocrDerived?: boolean;
+  ocrConfidence?: number;
+  ocrEngine?: string;
+}
+
+/**
+ * Whether the matched text is OCR-derived. With page methods, only the pages
+ * the passage touches count (a passage on an embedded-text page of a mixed
+ * document is NOT lower confidence); without a page, any OCR in the snapshot
+ * counts, because the match cannot be attributed to a page.
+ */
+function ocrProvenance(
+  content: Pick<GuidanceSnapshotContent, "extraction">,
+  pages?: { page: number; endPage: number }
+): Pick<PassageLocation, "ocrDerived" | "ocrConfidence" | "ocrEngine"> {
+  const ex = content.extraction;
+  if (!ex || !ex.ocr) return {};
+  const touched = pages
+    ? ex.ocr.pages.filter((p) => p.page >= pages.page && p.page <= pages.endPage)
+    : ex.ocr.pages;
+  if (touched.length === 0) return {};
+  return { ocrDerived: true, ocrConfidence: Math.min(...touched.map((p) => p.confidence)), ocrEngine: ex.ocr.engine };
 }
 
 /**
@@ -89,7 +122,7 @@ export function foldTypography(text: string): string {
  * Is the passage in this snapshot, verbatim after whitespace normalisation?
  * For a PDF snapshot the page numbers are reported too. Pure.
  */
-export function findPassage(content: Pick<GuidanceSnapshotContent, "text" | "pages">, passage: string): PassageLocation {
+export function findPassage(content: Pick<GuidanceSnapshotContent, "text" | "pages" | "extraction">, passage: string): PassageLocation {
   const needle = normalizeForQuoteMatch(passage);
   if (!needle) return { found: false };
   if (!normalizeForQuoteMatch(content.text).includes(needle)) return { found: false };
@@ -98,9 +131,9 @@ export function findPassage(content: Pick<GuidanceSnapshotContent, "text" | "pag
   // lookup still answers (start and end page differ).
   if (content.pages && content.pages.length > 0) {
     const at = findPdfQuote({ pages: content.pages.map((p) => p.text) }, passage);
-    if (at) return { found: true, page: at.page, endPage: at.endPage };
+    if (at) return { found: true, page: at.page, endPage: at.endPage, ...ocrProvenance(content, at) };
   }
-  return { found: true };
+  return { found: true, ...ocrProvenance(content) };
 }
 
 /**
@@ -196,7 +229,16 @@ export async function runQuoteChecks(
       }
       const at = findPassage(snap.content, check.passage);
       if (at.found) {
-        results.push({ ...base, contentHash: snap.hash, found: true, ...(at.page ? { page: at.page, endPage: at.endPage } : {}) });
+        results.push({
+          ...base,
+          contentHash: snap.hash,
+          found: true,
+          ...(at.page ? { page: at.page, endPage: at.endPage } : {}),
+          // An OCR match is never a plain confirmation (issue #38).
+          ...(at.ocrDerived
+            ? { ocrDerived: true, needsHumanReview: true, ocrConfidence: at.ocrConfidence, ocrEngine: at.ocrEngine }
+            : {}),
+        });
         continue;
       }
       // A miss. Say whether the words are there under different punctuation:
@@ -229,10 +271,18 @@ export function quoteCheckFailure(results: readonly GuidanceQuoteResult[]): stri
     return "no passage was checked: none is listed for the source(s) asked about, so nothing was confirmed";
   }
   const failed = failedQuoteResults(results).length;
-  return failed > 0 ? `${failed} of ${results.length} not confirmed` : undefined;
+  if (failed === 0) return undefined;
+  // OCR-only matches are named separately: they are present, but a person
+  // must review them (issue #38).
+  const review = results.filter((r) => r.found && r.needsHumanReview).length;
+  return `${failed} of ${results.length} not confirmed` + (review > 0 ? ` (${review} found only in OCR text: human review required)` : "");
 }
 
-/** The results that failed. */
+/**
+ * The results that are not a confirmation: the passage is missing, OR it was
+ * found only in OCR-derived text (lower confidence; issue #38), which never
+ * satisfies the verbatim-citation requirement without human review.
+ */
 export function failedQuoteResults(results: readonly GuidanceQuoteResult[]): GuidanceQuoteResult[] {
-  return results.filter((r) => !r.found);
+  return results.filter((r) => !r.found || r.needsHumanReview);
 }
