@@ -94,6 +94,9 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   // email is the only one this adds.
   message_unread_reminder: EMAIL_ONLY,
   visa_news: APP_ONLY,
+  // Pre-review insights (issue #117): in-app + push to the assigned agent. No
+  // email: an auto-run can fire after every upload burst, which would be noisy.
+  assessment_insights: APP_ONLY,
   // Scraper alerts (issue #83) go to admins by EMAIL only: the point is that
   // admins find out without watching the portal. No in-app/push record (the
   // alerts themselves live in scrapeAlerts and the #84 dashboard).

@@ -94,6 +94,7 @@ import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
 import { scrapeRunWorker } from "./scrapers";
 import { aiCaseOfficerService } from "./services/ai-case-officer.service";
+import { assessmentAutoRunService } from "./services/assessment-auto-run.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -658,5 +659,44 @@ export const processAssessmentJob = functions
     const after = change.after.data() ?? {};
     const before = change.before.exists ? change.before.data() ?? {} : {};
     if (after.status !== "queued" || before.status === "queued") return;
-    await aiCaseOfficerService.runJob(context.params.assessmentId);
+    const result = await aiCaseOfficerService.runJob(context.params.assessmentId);
+    // Issue #117: after a successful AUTO-run, tell the assigned agent once if the
+    // findings changed. No-op for manual runs, failures, and an identical finding set.
+    if (result === "succeeded") await assessmentAutoRunService.notifyIfNew(context.params.assessmentId);
+  });
+
+// ============================================
+// AGENT PRE-REVIEW AUTO-RUN (issue #117)
+// ============================================
+//
+// Neither function below calls the model, so neither binds AI_SECRETS. They only
+// write the `queued` assessment document; the worker above (which holds the
+// secret) does the work, and it only ever sees entitled, gated applications.
+
+/**
+ * A document was added to, or replaced on, an application: record (or push out)
+ * the debounce marker. Fires for creates and for a changed `storageUrl` only.
+ */
+export const recordAssessmentDebounce = functions
+  .firestore.document("documents/{documentId}")
+  .onWrite(async (change) => {
+    if (!change.after.exists) return; // a delete never starts a run
+    const after = change.after.data() ?? {};
+    const before = change.before.exists ? change.before.data() ?? {} : null;
+    if (before && before.storageUrl === after.storageUrl) return; // not a new or replaced file
+    await assessmentAutoRunService.recordDocumentChange(after.applicationId);
+  });
+
+/**
+ * Every 5 minutes: start ONE assessment per application whose quiet period has
+ * passed (entitled, agent-assigned, open cases only), and re-queue a transient
+ * auto-run failure once.
+ */
+export const sweepAssessmentDebounce = functions
+  .runWith({ timeoutSeconds: 300, memory: "256MB" })
+  .pubsub.schedule("*/5 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const r = await assessmentAutoRunService.sweep();
+    console.log(`Assessment auto-run sweep: ${r.due} due, ${r.requested} requested, ${r.skipped} skipped, ${r.retried} retried`);
   });

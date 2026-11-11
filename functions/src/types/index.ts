@@ -1235,6 +1235,9 @@ export type NotificationType =
   // exists precisely because the real-time channels were missed.
   | "message_unread_reminder"
   | "visa_news"
+  // Issue #117: an automatic pre-review run produced findings that differ from
+  // the previous run. Goes to the assigned agent only, never to the applicant.
+  | "assessment_insights"
   | "system";
 
 // Delivery channels supported by the unified notifier (`notifyUser`). Each channel
