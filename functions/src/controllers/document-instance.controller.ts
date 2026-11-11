@@ -273,7 +273,17 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
-      if (!can(req, "read", this.documentSubject(instance))) {
+      // Applicant statement: read-only for staff with read access to the case.
+      // Cross-agency staff get 404, indistinguishable from a missing id.
+      const statementRead = await this.staffStatementRead(req, instance);
+      if (statementRead === "denied") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (
+        statementRead !== "allowed" &&
+        !can(req, "read", this.documentSubject(instance))
+      ) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
@@ -399,6 +409,7 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
+      if (await this.denyStaffStatementWrite(existing, res)) return;
       if (!can(req, "update", this.documentSubject(existing))) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -462,6 +473,7 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
+      if (await this.denyStaffStatementWrite(existing, res)) return;
       if (!can(req, "update", this.documentSubject(existing))) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -536,6 +548,7 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
+      if (await this.denyStaffStatementWrite(existing, res)) return;
       if (!can(req, "update", this.documentSubject(existing))) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -575,6 +588,7 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
+      if (await this.denyStaffStatementWrite(existing, res)) return;
       if (!can(req, "delete", this.documentSubject(existing))) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -609,7 +623,16 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
-      if (!can(req, "read", this.documentSubject(existing))) {
+      // Same read-only staff rule as getOne for an applicant statement.
+      const statementRead = await this.staffStatementRead(req, existing);
+      if (statementRead === "denied") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (
+        statementRead !== "allowed" &&
+        !can(req, "read", this.documentSubject(existing))
+      ) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
@@ -896,6 +919,59 @@ export class DocumentInstanceController {
       console.error("Error saving applicant statement:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
+  }
+
+  // ---- staff READ-ONLY path to an applicant statement (#43) ----
+
+  /**
+   * The linked application when `instance` is an APPLICANT STATEMENT, else null.
+   * Shape: statement template, the derived `statement_<applicationId>` id, and
+   * `createdBy` equal to the application's applicant. An agent-authored instance
+   * from the same template never matches (different id, different creator).
+   */
+  private async applicantStatementApplication(
+    instance: DocumentInstance
+  ): Promise<Application | null> {
+    if (
+      instance.templateId !== STATEMENT_TEMPLATE_ID ||
+      !instance.applicationId ||
+      instance.id !== this.statementIdFor(instance.applicationId)
+    ) {
+      return null;
+    }
+    const snap = await collections.applications.doc(instance.applicationId).get();
+    if (!snap.exists) return null;
+    const application = { id: snap.id, ...snap.data() } as Application;
+    return application.userId === instance.createdBy ? application : null;
+  }
+
+  /**
+   * Staff READ gate for an applicant statement: the caller must pass the shared
+   * read check on the linked application (assigned agent, same-agency staff,
+   * admin). Returns "not_statement" when the instance is not an applicant
+   * statement (caller falls through to the normal Document ability),
+   * "allowed", or "denied" (answer 404, as for a missing id).
+   */
+  private async staffStatementRead(
+    req: AuthenticatedRequest,
+    instance: DocumentInstance
+  ): Promise<"not_statement" | "allowed" | "denied"> {
+    const application = await this.applicantStatementApplication(instance);
+    if (!application) return "not_statement";
+    return checkApplicationAccessForRequest(req, application, "read") ? "allowed" : "denied";
+  }
+
+  /**
+   * Staff may never write an applicant statement (save, link, share, delete),
+   * admin included. Responds 403 and returns true when the instance is one.
+   */
+  private async denyStaffStatementWrite(
+    instance: DocumentInstance,
+    res: Response
+  ): Promise<boolean> {
+    if (!(await this.applicantStatementApplication(instance))) return false;
+    sendError(res, "FORBIDDEN", "A client's statement can only be edited by the client.", 403);
+    return true;
   }
 
   // ============================================
