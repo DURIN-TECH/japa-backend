@@ -182,6 +182,18 @@ export const collections = {
   // src/agency-visas, reviewed by the admin (#101). Backend-only: no
   // firestore.rules match -> clients denied.
   visaRevisions: db.collection("visaRevisions"),
+  // Visa rubrics (issue #40): `visaRubrics/{countryCode}_{visaTypeId}` is the
+  // HEAD of one route's rubric (which version is approved, which is newest,
+  // which guidance sources it is extracted from). The rubric itself is in the
+  // `rubricVersions` subcollection (see subcollections.rubricVersions), so an
+  // approved version and a newer pending one can exist together. Written by
+  // scrapers/rubric (extraction, always `pending_review`) and by the rubric
+  // review API (#125). Backend-only: no firestore.rules match -> clients denied.
+  visaRubrics: db.collection("visaRubrics"),
+  // One record per rubric extraction run (issue #40): status, token usage,
+  // cost (null while the model is unpriced), what was discarded and why.
+  // Backend-only: no firestore.rules match.
+  rubricExtractionRuns: db.collection("rubricExtractionRuns"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all
@@ -243,6 +255,14 @@ export const subcollections = {
   // parent: no firestore.rules match.
   guidanceSnapshots: (sourceId: string) =>
     collections.guidanceSources.doc(sourceId).collection("snapshots"),
+
+  // Versions of one route's rubric (issue #40):
+  // `visaRubrics/{routeKey}/rubricVersions/{version}`. The id is
+  // `rubricVersions`, not `versions`, because `documentInstances/{id}/versions`
+  // already exists and a collection-group query on `versions` would see both.
+  // A version's content is immutable once written. Backend-only, like its parent.
+  rubricVersions: (routeKey: string) =>
+    collections.visaRubrics.doc(routeKey).collection("rubricVersions"),
 } as const;
 
 // Firestore timestamp helpers

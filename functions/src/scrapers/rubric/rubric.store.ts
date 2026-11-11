@@ -1,0 +1,192 @@
+import { Timestamp, type Transaction } from "firebase-admin/firestore";
+import { collections, db, subcollections } from "../../utils/firebase";
+import type { RubricExtractionRun, RubricHead, VisaRubric } from "../../types/rubric";
+
+// ============================================
+// RUBRIC — FIRESTORE STORE (issue #40)
+// ============================================
+//
+// Layout (all backend-only: no firestore.rules match, clients are denied):
+//
+//   visaRubrics/{countryCode}_{visaTypeId}                 RubricHead
+//   visaRubrics/{routeKey}/rubricVersions/{version}        VisaRubric
+//   rubricExtractionRuns/{runId}                           RubricExtractionRun
+//
+// Two guarantees live here, in the only module that touches these paths:
+//
+//  1. GOVERNANCE. `writePendingVersion` is the only way extraction writes a
+//     rubric, and it refuses anything that is not `pending_review` with every
+//     review field at its initial value. It never sets `approvedVersion`.
+//     There is no method here that approves, publishes or edits a version:
+//     review is #125.
+//  2. CONSUMERS ONLY SEE APPROVED RUBRICS. `getApprovedRubric` is the one
+//     read a consumer (the assessment engine, intake, the checklist) may use.
+//     It follows the head's `approvedVersion` and then RE-CHECKS the version
+//     doc's own `reviewStatus`, so a head pointing at a pending or rejected
+//     version (a bug, a half-finished write) still yields nothing. The
+//     `...ForReview` reads return any status and are for the admin review API
+//     only; they must never be wired to a client-facing route.
+//
+// Immutable versions: a version doc is only ever created. A version number
+// that already exists is refused, never overwritten.
+
+/** Head doc id of a route. Both parts are checked so neither can carry a `/`. */
+export function rubricRouteKey(countryCode: string, visaTypeId: string): string {
+  if (!/^[A-Za-z]{2}$/.test(countryCode)) throw new Error(`Invalid country code: ${JSON.stringify(countryCode)}`);
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(visaTypeId)) throw new Error(`Invalid visa type id: ${JSON.stringify(visaTypeId)}`);
+  return `${countryCode}_${visaTypeId}`;
+}
+
+/** Thrown when a write would break the governance or immutability rules. */
+export class RubricStoreError extends Error {
+  constructor(
+    readonly code: "not_pending" | "version_exists" | "route_mismatch",
+    message: string
+  ) {
+    super(message);
+    this.name = "RubricStoreError";
+  }
+}
+
+/** What `writePendingVersion` did. */
+export type PendingWriteResult =
+  | { written: true; version: number }
+  // The head already records a version for this exact set of snapshots
+  // (another run got there first): nothing was written.
+  | { written: false; version: number };
+
+/** A rubric as built by extraction: everything but the version number. */
+export type RubricDraft = Omit<VisaRubric, "version">;
+
+export class RubricStore {
+  // Transaction runner; a property so tests can swap in an in-memory one.
+  runTransaction: <T>(fn: (tx: Transaction) => Promise<T>) => Promise<T> = (fn) => db.runTransaction(fn);
+
+  /** The head of a route, or null when the route has no rubric yet. */
+  async getHead(routeKey: string): Promise<RubricHead | null> {
+    const snap = await collections.visaRubrics.doc(routeKey).get();
+    return snap.exists ? (snap.data() as RubricHead) : null;
+  }
+
+  /** Every head (the registry of routes that have a rubric). Small. */
+  async listHeads(): Promise<RubricHead[]> {
+    const snap = await collections.visaRubrics.get();
+    return snap.docs.map((d) => d.data() as RubricHead);
+  }
+
+  /**
+   * The rubric consumers may use for a route: its APPROVED version, or null.
+   * Null when the route has no rubric, when nothing has been approved, and
+   * when the version the head points at is not itself marked approved.
+   * A pending or rejected version is never returned.
+   */
+  async getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null> {
+    const routeKey = rubricRouteKey(countryCode, visaTypeId);
+    const head = await this.getHead(routeKey);
+    if (!head || head.approvedVersion === null || head.approvedVersion === undefined) return null;
+    const snap = await subcollections.rubricVersions(routeKey).doc(String(head.approvedVersion)).get();
+    if (!snap.exists) return null;
+    const rubric = snap.data() as VisaRubric;
+    // Belt and braces: trust the version's own status, not just the pointer.
+    return rubric.reviewStatus === "approved" ? rubric : null;
+  }
+
+  /**
+   * One version, whatever its review status. ADMIN REVIEW ONLY (#125): never
+   * return this from a route a client can call.
+   */
+  async getVersionForReview(routeKey: string, version: number): Promise<VisaRubric | null> {
+    const snap = await subcollections.rubricVersions(routeKey).doc(String(version)).get();
+    return snap.exists ? (snap.data() as VisaRubric) : null;
+  }
+
+  /**
+   * Write a freshly extracted rubric as the route's next version, in one
+   * transaction with the head:
+   *  - the version number is the head's `latestVersion + 1` (1 for a new
+   *    route), read inside the transaction, so two runs cannot share one;
+   *  - unless `force`, nothing is written when the head already records a
+   *    version for the same `sourceSetHash` (the hash gate, re-checked here
+   *    against a concurrent run);
+   *  - the head's `approvedVersion` is left exactly as it is (null for a new
+   *    route): the previously approved version keeps serving.
+   *
+   * @throws RubricStoreError("not_pending") when the draft is not a pristine
+   *   `pending_review` rubric. Extraction can never write an approved one.
+   */
+  async writePendingVersion(draft: RubricDraft, sourceIds: string[], opts: { force?: boolean; now?: Timestamp } = {}): Promise<PendingWriteResult> {
+    // Governance guard. Checked on the draft itself, so no caller can slip
+    // a decided rubric through this path.
+    if (
+      draft.reviewStatus !== "pending_review" ||
+      draft.intentPolarity !== null ||
+      draft.reviewedBy !== null ||
+      draft.reviewedAt !== null ||
+      draft.rejectReason !== null ||
+      draft.supersededAt !== null ||
+      draft.revision !== 0
+    ) {
+      throw new RubricStoreError("not_pending", "extraction may only write a pending_review rubric with untouched review fields");
+    }
+    const routeKey = rubricRouteKey(draft.countryCode, draft.visaTypeId);
+    if (draft.routeKey !== routeKey) throw new RubricStoreError("route_mismatch", "routeKey does not match countryCode and visaTypeId");
+
+    const now = opts.now ?? Timestamp.now();
+    const headRef = collections.visaRubrics.doc(routeKey);
+    return this.runTransaction(async (tx) => {
+      const headSnap = await tx.get(headRef);
+      const head = headSnap.exists ? (headSnap.data() as RubricHead) : null;
+      if (head && !opts.force && head.latestSourceSetHash === draft.sourceSetHash) {
+        return { written: false as const, version: head.latestVersion };
+      }
+      const version = (head?.latestVersion ?? 0) + 1;
+      const versionRef = subcollections.rubricVersions(routeKey).doc(String(version));
+      // Immutability guard: a version doc is created once, never replaced.
+      const existing = await tx.get(versionRef);
+      if (existing.exists) throw new RubricStoreError("version_exists", `rubric version ${routeKey}/${version} already exists`);
+
+      const rubric: VisaRubric = { ...draft, version };
+      tx.set(versionRef, rubric as unknown as Record<string, unknown>);
+      if (head) {
+        // Only the "newest" pointers move. approvedVersion is not in this
+        // update at all, so it cannot change here.
+        tx.update(headRef, { latestVersion: version, latestSourceSetHash: draft.sourceSetHash, sourceIds, updatedAt: now });
+      } else {
+        const newHead: RubricHead = {
+          routeKey,
+          countryCode: draft.countryCode,
+          visaTypeId: draft.visaTypeId,
+          sourceIds,
+          approvedVersion: null,
+          latestVersion: version,
+          latestSourceSetHash: draft.sourceSetHash,
+          createdAt: now,
+          updatedAt: now,
+        };
+        tx.set(headRef, newHead as unknown as Record<string, unknown>);
+      }
+      return { written: true as const, version };
+    });
+  }
+
+  /** Store a run record under its id. */
+  async writeRun(run: RubricExtractionRun): Promise<void> {
+    await collections.rubricExtractionRuns.doc(run.runId).set(run as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * How many runs since `since` reached the model (succeeded or failed).
+   * One range filter on one field: served by the automatic single-field
+   * index, no composite index needed. Runs are few, so they are counted here.
+   */
+  async countRunsSince(since: Timestamp): Promise<number> {
+    const snap = await collections.rubricExtractionRuns.where("startedAt", ">=", since).get();
+    return snap.docs.filter((d) => {
+      const status = (d.data() as RubricExtractionRun).status;
+      return status === "succeeded" || status === "failed";
+    }).length;
+  }
+}
+
+/** Singleton over the project's Firestore. */
+export const rubricStore = new RubricStore();
