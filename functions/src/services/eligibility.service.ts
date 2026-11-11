@@ -10,9 +10,76 @@ import {
   VisaExemption,
   VisaRequirementType,
 } from "../types/eligibility";
-import { VisaCategory } from "../types";
+import { VisaCategory, VisaType } from "../types";
+// The ONE place visa types live: `countries/{code}/visaTypes` (see the
+// CANONICAL VISA TYPE PATH note below). Both helpers come from utils/firebase
+// so unit tests can swap them for in-memory fakes.
+import { collectionGroups, subcollections } from "../utils/firebase";
+// The public visibility rule (issue #99). Called, never re-implemented here.
+import { isVisaPubliclyVisible } from "./visa.service";
 
 const db = getFirestore();
+
+// ============================================
+// CANONICAL VISA TYPE PATH (issue #27)
+// ============================================
+//
+// Visa types live in exactly ONE place: `countries/{countryCode}/visaTypes/{id}`.
+// That is where every writer puts them (the seed scripts, the admin
+// `POST /countries/:code/visas`, the visa-catalog scraper and the agency visa
+// endpoints), and where every other reader looks (visa.service).
+//
+// There is NO top-level `visaTypes` collection. Eligibility used to read one
+// straight off the database root, which nothing ever wrote, so it never found a
+// visa: recommendations were always empty and questions never saw the visa's
+// category. Do NOT bring that path back, here or anywhere else:
+//  - one country       -> `subcollections.visaTypes(countryCode)`
+//  - country not known -> `collectionGroups.visaTypes()` (collection group)
+//
+// Everything this service shows a PUBLIC user also goes through
+// `isVisaPubliclyVisible()`, so a pending / rejected scraped visa, an
+// agency-only visa or an inactive one is never recommended or scored.
+
+/**
+ * Travel purpose (from the pre-check form) -> the visa categories that fit it.
+ * A purpose that is not listed ("other") matches no category, so it gets no
+ * recommendation. Unchanged from before issue #27 (only moved out of the loop).
+ */
+const PURPOSE_TO_CATEGORIES: Record<string, string[]> = {
+  tourism: ["tourist", "visitor"],
+  business: ["business", "visitor"],
+  work: ["work"],
+  study: ["student"],
+  family: ["family"],
+  transit: ["transit"],
+};
+
+/** Most visa types one pre-check recommends (unchanged). */
+const MAX_RECOMMENDED_VISAS = 3;
+
+/**
+ * Whether a caller-supplied value is safe to use as ONE Firestore path
+ * segment (a country code or a visa type id). Both come straight from a
+ * public request (body, query string or URL param), and `doc("")` or an id
+ * holding a "/" makes the Firestore client throw, which would turn a bad
+ * input into a 500. An unsafe value is treated as "no such visa" instead.
+ */
+function isSafeDocId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
+/**
+ * What eligibility knows about a visa type id:
+ *  - `visible`: the visa exists and may be shown to a public user. Carries
+ *    the two fields question selection needs (category + its country).
+ *  - `hidden`: the visa exists but is NOT publicly visible (pending,
+ *    rejected, agency-only or inactive). Nothing about it may be used.
+ *  - `missing`: no such visa (or the id / country was not usable).
+ */
+type ResolvedVisaType =
+  | { kind: "visible"; countryCode: string; category?: VisaCategory }
+  | { kind: "hidden" }
+  | { kind: "missing" };
 
 export class EligibilityService {
   private questionsCollection = db.collection("eligibilityQuestions");
@@ -93,43 +160,57 @@ export class EligibilityService {
     return this.getVisaRequiredResult(destinationCountry, travelPurpose, warnings);
   }
 
+  /**
+   * Build the "visa required" pre-check answer, with up to
+   * MAX_RECOMMENDED_VISAS recommended visa types for the travel purpose.
+   *
+   * Reads ONE country's visas: `countries/{destinationCountry}/visaTypes`
+   * where `isActive == true` (single-field equality, so no composite index
+   * and no cross-country scan), then:
+   *  1. keeps only publicly visible visas (isVisaPubliclyVisible), so a
+   *     pending / rejected scraped visa or an agency-only visa is never
+   *     recommended, even one wrongly stored with `isActive: true`;
+   *  2. keeps only the categories that fit the travel purpose.
+   *
+   * An unknown or unusable destination gives an empty recommendation list,
+   * never an error.
+   *
+   * @param destinationCountry destination country code (any case)
+   * @param travelPurpose purpose from the pre-check form
+   * @param warnings warnings collected by preCheck, passed through
+   */
   private async getVisaRequiredResult(
     destinationCountry: string,
     travelPurpose: string,
     warnings?: string[]
   ): Promise<VisaPreCheckResult> {
-    // Get recommended visa types for this purpose and country
-    const visaTypesSnapshot = await db.collection("visaTypes")
-      .where("countryCode", "==", destinationCountry)
-      .where("isActive", "==", true)
-      .get();
+    // Categories that fit this purpose (none for an unlisted purpose).
+    const matchingCategories = PURPOSE_TO_CATEGORIES[travelPurpose] || [];
 
-    const recommendedVisas = visaTypesSnapshot.docs
-      .map((doc) => {
-        const data = doc.data();
-        // Filter by category matching travel purpose
-        const purposeToCategory: Record<string, string[]> = {
-          tourism: ["tourist", "visitor"],
-          business: ["business", "visitor"],
-          work: ["work"],
-          study: ["student"],
-          family: ["family"],
-          transit: ["transit"],
-        };
-        const matchingCategories = purposeToCategory[travelPurpose] || [];
-        if (!matchingCategories.includes(data.category)) {
-          return null;
-        }
-        return {
-          id: doc.id,
-          name: data.name,
-          description: data.description,
-          processingTime: data.processingTime,
-          baseCostUsd: data.baseCostUsd,
-        };
-      })
-      .filter(Boolean)
-      .slice(0, 3) as VisaPreCheckResult["recommendedVisaTypes"];
+    // Per-country read on the canonical path. Country doc ids are upper-case
+    // codes, as in visa.service. Skipped for an unusable code (see isSafeDocId).
+    const visaDocs = isSafeDocId(destinationCountry) ?
+      (await subcollections
+        .visaTypes(destinationCountry.toUpperCase())
+        .where("isActive", "==", true)
+        .get()).docs :
+      [];
+
+    const recommendedVisas = visaDocs
+      // Firestore data is untyped: these docs are VisaType documents.
+      .map((doc) => ({ id: doc.id, data: doc.data() as VisaType }))
+      // ---- Public visibility rule (issue #99), then purpose match ----
+      .filter(({ data }) => isVisaPubliclyVisible(data))
+      .filter(({ data }) => matchingCategories.includes(data.category))
+      .slice(0, MAX_RECOMMENDED_VISAS)
+      // Same five fields as before: the response shape is unchanged.
+      .map(({ id, data }) => ({
+        id,
+        name: data.name,
+        description: data.description,
+        processingTime: data.processingTime,
+        baseCostUsd: data.baseCostUsd,
+      })) as VisaPreCheckResult["recommendedVisaTypes"];
 
     return {
       visaRequired: true,
@@ -146,9 +227,117 @@ export class EligibilityService {
   }
 
   /**
+   * Find a visa type by id on the canonical path (see CANONICAL VISA TYPE
+   * PATH at the top of this file) and apply the public visibility rule.
+   *
+   * Two lookups, depending on what the caller knows:
+   *
+   *  A. Country known (`POST /eligibility/check` always sends it;
+   *     `GET /eligibility/questions/:visaTypeId?destinationCountry=…` may):
+   *     one document read, `countries/{CC}/visaTypes/{visaTypeId}`. The
+   *     country decides, so the same id under another country is never used.
+   *
+   *  B. Country NOT known (`GET /eligibility/questions/:visaTypeId` with no
+   *     `destinationCountry`, which is what the mobile app sends today):
+   *     a COLLECTION-GROUP query over every `countries/{code}/visaTypes`
+   *     subcollection, `where("id", "==", visaTypeId)`. Visa docs store their
+   *     own id in the `id` field (a collection-group query cannot filter on a
+   *     bare document id). Needs the single-field COLLECTION_GROUP index on
+   *     `visaTypes.id` (firestore.indexes.json, `fieldOverrides`). The country
+   *     of each match is its parent document: `doc.ref.parent.parent.id`.
+   *
+   *     The same id can exist under two countries. The pick is deterministic:
+   *     publicly visible matches only, then the lowest country code (plain
+   *     string order). Callers that know the country should send it (lookup A).
+   *
+   *     If the query itself fails (for example the index is still building
+   *     right after a deploy), the error is logged and the visa is treated as
+   *     `missing`: the caller then gets the generic questions, exactly what
+   *     this endpoint returned for every visa before issue #27, not a 500.
+   *
+   * Never throws for an unknown / unusable id or country.
+   *
+   * @param visaTypeId visa type document id
+   * @param countryCode destination country code when the caller knows it
+   */
+  private async resolveVisaType(
+    visaTypeId: string,
+    countryCode?: string
+  ): Promise<ResolvedVisaType> {
+    // An id that cannot be a document id cannot match anything.
+    if (!isSafeDocId(visaTypeId)) return { kind: "missing" };
+
+    // ---- A. Country known: one document read under that country ----
+    if (countryCode !== undefined && countryCode !== "") {
+      if (!isSafeDocId(countryCode)) return { kind: "missing" };
+      const cc = countryCode.toUpperCase();
+      const doc = await subcollections.visaTypes(cc).doc(visaTypeId).get();
+      // Untyped Firestore data: a VisaType document (undefined when missing).
+      const data = doc.data() as VisaType | undefined;
+      if (!doc.exists || !data) return { kind: "missing" };
+      if (!isVisaPubliclyVisible(data)) return { kind: "hidden" };
+      return { kind: "visible", countryCode: cc, category: data.category };
+    }
+
+    // ---- B. Country not known: collection-group query on the `id` field ----
+    let matches: { countryCode: string; data: VisaType }[];
+    try {
+      const snapshot = await collectionGroups.visaTypes().where("id", "==", visaTypeId).get();
+      matches = snapshot.docs
+        .map((doc) => ({
+          // `countries/{CC}/visaTypes/{id}`: the country is the grandparent.
+          countryCode: doc.ref.parent.parent?.id,
+          data: doc.data() as VisaType,
+        }))
+        // A top-level `visaTypes` doc (no parent document) is not a real
+        // visa type: there must be none, and one must never be scored.
+        .filter((m): m is { countryCode: string; data: VisaType } => !!m.countryCode);
+    } catch (error) {
+      // Degrade to the generic questions instead of failing the request.
+      console.error("Eligibility: visaTypes collection-group lookup failed; using generic questions:", error);
+      return { kind: "missing" };
+    }
+
+    if (matches.length === 0) return { kind: "missing" };
+
+    // Publicly visible matches only, lowest country code first.
+    const visible = matches
+      .filter((m) => isVisaPubliclyVisible(m.data))
+      .sort((a, b) => (a.countryCode < b.countryCode ? -1 : a.countryCode > b.countryCode ? 1 : 0));
+    if (visible.length === 0) return { kind: "hidden" };
+    if (visible.length > 1) {
+      // Not an error, but worth seeing: the caller should send the country.
+      console.warn(
+        `Eligibility: visa type id "${visaTypeId}" exists under ${visible.length} countries ` +
+          `(${visible.map((m) => m.countryCode).join(", ")}); using ${visible[0].countryCode}. ` +
+          "Pass destinationCountry to pick one."
+      );
+    }
+    return {
+      kind: "visible",
+      countryCode: visible[0].countryCode,
+      category: visible[0].data.category,
+    };
+  }
+
+  /**
    * Get eligibility questions for a visa type
    * Combines: common + category + country + nationality + visa-specific questions
    * Filters by nationality if provided
+   *
+   * The visa type is read from `countries/{code}/visaTypes` (resolveVisaType):
+   *  - visible visa: its category and country pick the question scopes;
+   *  - missing visa: no category, generic questions (never throws). The
+   *    `visa:{id}` scope is still read, as before, so questions seeded for an
+   *    id keep working;
+   *  - hidden visa (pending / rejected / agency-only / inactive): treated as
+   *    missing AND its `visa:{id}` questions are not served, so nothing
+   *    specific to a non-public visa reaches a public user.
+   *
+   * @param visaTypeId visa type document id
+   * @param nationality applicant nationality, filters nationality-scoped questions
+   * @param destinationCountry destination country code; when given, the visa is
+   *   looked up under that country only
    */
   async getQuestions(
     visaTypeId: string,
@@ -156,10 +345,11 @@ export class EligibilityService {
     destinationCountry?: string
   ): Promise<EligibilityQuestion[]> {
     // Get the visa type to know its category and country
-    const visaDoc = await db.collection("visaTypes").doc(visaTypeId).get();
-    const visaData = visaDoc.data();
-    const category = visaData?.category as VisaCategory | undefined;
-    const countryCode = destinationCountry || visaData?.countryCode as string | undefined;
+    const resolved = await this.resolveVisaType(visaTypeId, destinationCountry);
+    const category = resolved.kind === "visible" ? resolved.category : undefined;
+    // The caller's country wins (unchanged); else the visa's own country.
+    const countryCode = destinationCountry ||
+      (resolved.kind === "visible" ? resolved.countryCode : undefined);
 
     // Build list of scopes to query
     const scopes: string[] = [
@@ -181,7 +371,10 @@ export class EligibilityService {
       }
     }
 
-    scopes.push(`visa:${visaTypeId}`);
+    // Visa-specific questions: never for a visa that exists but is hidden.
+    if (resolved.kind !== "hidden") {
+      scopes.push(`visa:${visaTypeId}`);
+    }
 
     // Fetch all applicable questions in parallel
     const questionPromises = scopes.map((scope) => this.getQuestionsByScope(scope));
