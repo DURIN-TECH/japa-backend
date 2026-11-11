@@ -34,6 +34,9 @@ import { AgencyVisaPrice, VISA_VISIBILITY, VisaCategory, VisaSource, VisaType, V
 import { isVisaPubliclyVisible, visaService } from "../services/visa.service";
 import { AgencyVisaError } from "../agency-visas/agency-visa.validation";
 import type { VisaPriceTarget } from "./agency-visa-price.validation";
+// Applicant-safe sponsor projection (issue #102). Imported from its file, not
+// the agency-visas index, to keep the import graph flat.
+import { PublicVisaSponsor, toPublicSponsor } from "../agency-visas/agency-visa-access";
 
 // ============================================
 // Types
@@ -66,7 +69,14 @@ export interface AgencyVisaPriceView {
 
 /**
  * The public projection of one offered visa on `GET /agencies/public/:slug`
- * (`visaPrices[]`). Deliberately minimal: no owner ids, no review fields.
+ * (`visaPrices[]`). No owner ids, no review fields, no `createdBy`, no
+ * `agentIds`, and no private sponsor fields.
+ *
+ * Issue #103 added the first five keys. Issue #102 added the applicant-safe
+ * visa detail to the SAME entries (not a second list), so the `/a/<slug>`
+ * page can show the agency's own visas, and a visitor arriving through the
+ * link can read them, without the single-visa endpoints (which never serve
+ * an agency-only visa to someone without a case at that agency).
  */
 export interface PublicAgencyVisaPrice {
   visaTypeId: string;
@@ -75,6 +85,33 @@ export interface PublicAgencyVisaPrice {
   category: VisaCategory;
   /** Whole NAIRA, or null ("Contact for pricing"). */
   price: number | null;
+
+  // ---- Applicant-safe visa detail (issue #102) ----
+  /** True for this agency's OWN agency visa (agency-only or made global). */
+  isAgencyVisa: boolean;
+  /** "agency" while only reachable through this agency, else "global". */
+  visibility: VisaVisibility;
+  visaCode: string | null;
+  description: string | null;
+  processingTime: string | null;
+  processingDaysMin: number | null;
+  processingDaysMax: number | null;
+  validityPeriod: string | null;
+  isExtendable: boolean | null;
+  maxExtensions: number | null;
+  eligibilityCriteria: string[];
+  /** GOVERNMENT fee in USD (not this agency's price); null when unset. */
+  baseCostUsd: number | null;
+  applicationUrl: string | null;
+  applicationInstructions: string | null;
+  /** Organisation name + website only; null when the visa has no sponsor. */
+  sponsor: PublicVisaSponsor | null;
+}
+
+/** One offered visa: its view (with this agency's price) and the doc it came from. */
+interface OfferedEntry {
+  view: AgencyVisaPriceView;
+  visa: VisaType;
 }
 
 // ============================================
@@ -130,6 +167,46 @@ export function toPriceView(visa: VisaType, agencyId: string, price: AgencyVisaP
   };
 }
 
+/**
+ * The public page entry of one offered visa (issue #103 keys + the #102
+ * applicant-safe detail). A whitelist: every key is named here, so a new
+ * private field on the visa doc can never reach the public page by accident.
+ * Missing optional values are `null` (never `undefined`, which JSON drops),
+ * so the shape is the same for every entry.
+ */
+export function toPublicAgencyVisa(v: AgencyVisaPriceView, visa: VisaType): PublicAgencyVisaPrice {
+  /** A string value, or null. */
+  const str = (x: unknown): string | null => (typeof x === "string" && x ? x : null);
+  /** A finite number, or null. */
+  const num = (x: unknown): number | null => (typeof x === "number" && Number.isFinite(x) ? x : null);
+  return {
+    // ---- #103 ----
+    visaTypeId: v.visaTypeId,
+    countryCode: v.countryCode,
+    visaName: v.visaName,
+    category: v.category,
+    price: v.price,
+    // ---- #102: applicant-safe detail ----
+    isAgencyVisa: v.isOwnVisa,
+    visibility: v.visibility,
+    visaCode: v.visaCode,
+    description: str(visa.description),
+    processingTime: str(visa.processingTime),
+    processingDaysMin: num(visa.processingDaysMin),
+    processingDaysMax: num(visa.processingDaysMax),
+    validityPeriod: str(visa.validityPeriod),
+    isExtendable: typeof visa.isExtendable === "boolean" ? visa.isExtendable : null,
+    maxExtensions: num(visa.maxExtensions),
+    eligibilityCriteria: Array.isArray(visa.eligibilityCriteria)
+      ? visa.eligibilityCriteria.filter((c): c is string => typeof c === "string")
+      : [],
+    baseCostUsd: v.baseCostUsd,
+    applicationUrl: str(visa.applicationUrl),
+    applicationInstructions: str(visa.applicationInstructions),
+    sponsor: toPublicSponsor(visa.sponsor) ?? null,
+  };
+}
+
 /** The 404 for an unknown visa AND a visa this agency can't see (same body, no leak). */
 function visaNotFound(): AgencyVisaError {
   return new AgencyVisaError("NOT_FOUND", "Visa not found", 404);
@@ -169,6 +246,18 @@ class AgencyVisaPriceService {
    * @param includeGlobal also list every public visa the agency has not priced
    */
   async listOffered(agencyId: string, options: { includeGlobal?: boolean } = {}): Promise<AgencyVisaPriceView[]> {
+    return (await this.listOfferedEntries(agencyId, options)).map((e) => e.view);
+  }
+
+  /**
+   * listOffered, keeping each entry's visa doc next to its view (issue #102:
+   * the public page projects applicant-safe detail from the doc). Same
+   * queries, rules and order as listOffered; see its comment.
+   */
+  private async listOfferedEntries(
+    agencyId: string,
+    options: { includeGlobal?: boolean } = {}
+  ): Promise<OfferedEntry[]> {
     const [priceSnap, ownSnap] = await Promise.all([
       subcollections.agencyVisaPrices(agencyId).get(),
       collectionGroups.visaTypes().where("ownerAgencyId", "==", agencyId).orderBy("createdAt", "desc").get(),
@@ -179,15 +268,15 @@ class AgencyVisaPriceService {
     for (const d of priceSnap.docs) prices.set(d.id, d.data() as AgencyVisaPrice);
 
     const seen = new Set<string>();
-    const own: AgencyVisaPriceView[] = [];
-    const others: AgencyVisaPriceView[] = [];
+    const own: OfferedEntry[] = [];
+    const others: OfferedEntry[] = [];
 
     /** Add one visa if it is priceable and not listed yet. */
-    const add = (visa: VisaType, bucket: AgencyVisaPriceView[]) => {
+    const add = (visa: VisaType, bucket: OfferedEntry[]) => {
       const key = agencyVisaPriceId(visa.countryCode, visa.id);
       if (seen.has(key) || !canAgencyPriceVisa(visa, agencyId)) return;
       seen.add(key);
-      bucket.push(toPriceView(visa, agencyId, prices.get(key) ?? null));
+      bucket.push({ view: toPriceView(visa, agencyId, prices.get(key) ?? null), visa });
     };
 
     // ---- 1. Own approved agency visas (priced or not) ----
@@ -214,7 +303,8 @@ class AgencyVisaPriceService {
     }
 
     others.sort(
-      (a, b) => a.countryCode.localeCompare(b.countryCode) || a.visaName.localeCompare(b.visaName)
+      (a, b) =>
+        a.view.countryCode.localeCompare(b.view.countryCode) || a.view.visaName.localeCompare(b.view.visaName)
     );
     return [...own, ...others];
   }
@@ -225,14 +315,8 @@ class AgencyVisaPriceService {
    * price or null. Public data only.
    */
   async listPublic(agencyId: string): Promise<PublicAgencyVisaPrice[]> {
-    const offered = await this.listOffered(agencyId);
-    return offered.map((v) => ({
-      visaTypeId: v.visaTypeId,
-      countryCode: v.countryCode,
-      visaName: v.visaName,
-      category: v.category,
-      price: v.price,
-    }));
+    const offered = await this.listOfferedEntries(agencyId);
+    return offered.map(({ view: v, visa }) => toPublicAgencyVisa(v, visa));
   }
 
   // ------------------------------------------
