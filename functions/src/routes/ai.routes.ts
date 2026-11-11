@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { aiCaseOfficerController } from "../controllers/ai-case-officer.controller";
+import { refusalLetterController } from "../controllers/refusal-letter.controller";
 import { verifyAuth } from "../middleware/auth";
 
 // ============================================
@@ -12,6 +13,8 @@ import { verifyAuth } from "../middleware/auth";
 //   POST /ai/applications/:id/assess      start (or return) the assessment
 //   GET  /ai/applications/:id/assessment  the latest assessment for the application
 //   GET  /ai/assessments/:id              one assessment, by id
+//   POST /ai/refusal-letters              start reading an uploaded refusal letter (#122)
+//   GET  /ai/refusal-letters/:id          one refusal-letter analysis, by id (#122)
 
 const aiRoutes = Router();
 
@@ -24,5 +27,9 @@ aiRoutes.get("/applications/:id/assessment", verifyAuth, (req, res) =>
 aiRoutes.get("/assessments/:id", verifyAuth, (req, res) =>
   aiCaseOfficerController.byId(req, res)
 );
+
+// ---- refusal-letter analysis (issue #122) ----
+aiRoutes.post("/refusal-letters", verifyAuth, (req, res) => refusalLetterController.create(req, res));
+aiRoutes.get("/refusal-letters/:id", verifyAuth, (req, res) => refusalLetterController.byId(req, res));
 
 export { aiRoutes };

@@ -219,6 +219,12 @@ export const collections = {
   // Per-day AI spend counters, one document per UTC day (`aiCosts/{YYYY-MM-DD}`).
   // Written in a transaction per assessment; read by the daily cap. Backend-only.
   aiCosts: db.collection("aiCosts"),
+  // Refusal-letter analyses (issue #122): one document per letter version, which
+  // is also its job record. The id is a hash of the user, document, storage path
+  // and updatedAt, so asking twice for the same letter is a no-op. Holds the
+  // letter's quoted reasons (personal data). Backend-only: no firestore.rules
+  // match, so clients read it only through /ai/refusal-letters.
+  refusalAnalyses: db.collection("refusalAnalyses"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all

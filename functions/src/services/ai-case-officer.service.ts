@@ -280,7 +280,10 @@ export class AiCaseOfficerService {
       : null;
 
     const docSnap = await collections.documents.where("applicationId", "==", app.id).get();
-    const documents = docSnap.docs.map((d) => {
+    // A refusal letter (issue #122) is read by its own analysis, never by the
+    // assessment: leave it out, so it is not sent to extraction here and
+    // uploading one does not change the assessment's input hash.
+    const documents = docSnap.docs.filter((d) => (d.data() as Document).requirementId !== "refusal-letter").map((d) => {
       const data = d.data() as Document;
       return {
         id: d.id,

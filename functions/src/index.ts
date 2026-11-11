@@ -2,6 +2,7 @@ import * as functions from "firebase-functions";
 import { app } from "./app";
 // The Anthropic secret list (issue #31). Importing this module is cheap: it
 // does not load the Anthropic SDK (that happens lazily on the first model call).
+import { refusalLetterService } from "./services/ai/refusal-letter.service";
 import { AI_SECRETS } from "./services/ai/anthropic-client";
 
 // ============================================
@@ -659,4 +660,22 @@ export const processAssessmentJob = functions
     const before = change.before.exists ? change.before.data() ?? {} : {};
     if (after.status !== "queued" || before.status === "queued") return;
     await aiCaseOfficerService.runJob(context.params.assessmentId);
+  });
+
+// ============================================
+// REFUSAL-LETTER WORKER (issue #122)
+// ============================================
+//
+// Same shape as processAssessmentJob: returns at once unless the write moved the
+// document INTO `queued`; runJob claims `queued -> running` in a transaction so a
+// duplicate delivery never runs twice. Binds AI_SECRETS (it calls the model).
+export const processRefusalAnalysisJob = functions
+  .runWith({ secrets: [...AI_SECRETS], timeoutSeconds: 300, memory: "1GB" })
+  .firestore.document("refusalAnalyses/{analysisId}")
+  .onWrite(async (change, context) => {
+    if (!change.after.exists) return;
+    const after = change.after.data() ?? {};
+    const before = change.before.exists ? change.before.data() ?? {} : {};
+    if (after.status !== "queued" || before.status === "queued") return;
+    await refusalLetterService.runJob(context.params.analysisId);
   });
