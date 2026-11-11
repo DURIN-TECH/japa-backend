@@ -64,3 +64,13 @@ export { ManualCostError, parseManualCostInput, planManualCost } from "./visa-ca
 export type { ManualCostInput } from "./visa-catalog/visa-manual-cost";
 /** Firestore doc-id check shared with the visa change routes. */
 export { isValidDocId } from "./visa-catalog/changes/visa-catalog-changes.service";
+
+// ---- Caseworker-guidance registry (issue #39) ----
+/** Admin list of guidance sources (GET /admin/guidance-sources). */
+export { adminGuidanceSourceRoutes } from "./guidance/guidance-source.routes";
+/** Guidance crawl orchestrator (fetch, hash gate, snapshots). */
+export { guidanceCrawlService } from "./guidance/guidance-crawl.service";
+/** Snapshot text store, for backend quote validation only (never an API response). */
+export { guidanceSnapshotStore } from "./guidance/guidance-snapshot.store";
+/** Guidance source registry seed. */
+export { seedGuidanceSources } from "./guidance/data/seed-guidance-sources";

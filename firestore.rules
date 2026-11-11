@@ -443,5 +443,9 @@ service cloud.firestore {
     //  - pendingVisaChanges/{changeId}: proposed field-level edits to
     //    approved scraped visas, staged by the crawl and approved/rejected by
     //    admins via /admin/visa-changes (issue #61). Do NOT add a match.
+    //  - guidanceSources/{sourceId} and its snapshots/{contentHash}
+    //    subcollection: the caseworker-guidance source registry and the
+    //    metadata of its immutable text snapshots (issue #39). Admins read
+    //    the registry via GET /admin/guidance-sources. Do NOT add a match.
   }
 }

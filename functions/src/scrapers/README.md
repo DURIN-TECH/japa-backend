@@ -63,6 +63,17 @@ scrapers/
     news-source-health.ts              per-run source health write + missing-key pause (#107)
     seed-news-sources.ts               news source registry seed
     docs/                              news scraping plan
+  guidance/                            caseworker-guidance registry (#39): HOW OFFICERS DECIDE,
+                                       separate from visa-catalog's visaSources (what a visa is)
+    types.ts                           GuidanceSource, seed entry, snapshot metadata + stored object
+    guidance-crawl.service.ts          orchestrator: shared fetch -> hash gate -> snapshot; skips
+                                       unverified sources; N failures -> status "failing"
+    guidance-snapshot.store.ts         snapshot text in Cloud Storage, keyed by content hash,
+                                       create-only, backend-only (never served to a client)
+    guidance-published-date.ts         publisher's own date, found by a per-source selector
+    guidance-source.{controller,routes}.ts   GET /admin/guidance-sources (admin-only list)
+    data/                              seed-guidance-sources.ts: entries (data) + validator + loader
+    scripts/                           seed-guidance-sources (CLI, dry run by default)
 ```
 
 Tests mirror this layout under `functions/test/scrapers/`; shared test helpers

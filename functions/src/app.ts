@@ -18,6 +18,8 @@ import {
   adminScraperRunRoutes,
   adminScraperSettingsRoutes,
 } from "./scrapers";
+// Caseworker-guidance source registry: admin list (issue #39).
+import { adminGuidanceSourceRoutes } from "./scrapers";
 // Agency-scoped visa drafts / edits / submit (issue #100).
 import { agencyVisaRoutes } from "./agency-visas";
 import { agentRoutes } from "./routes/agent.routes";
@@ -122,6 +124,9 @@ app.use("/admin/scrape-run-requests", adminScrapeRunRequestRoutes);
 app.use("/admin/scrape-alerts", adminScrapeAlertRoutes);
 // Scraping cost report from the monthly rollup (issue #82; CASL `ScrapeRun`).
 app.use("/admin/scrape-costs", adminScrapeCostRoutes);
+// Caseworker-guidance source registry (issue #39): read-only admin list
+// (CASL `read ScrapeRun`, admin-only). No route serves snapshot text.
+app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);

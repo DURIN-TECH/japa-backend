@@ -136,5 +136,16 @@ service firebase.storage {
       
       allow delete: if isOwner(userId) || isAdmin();
     }
+
+    // ============================================
+    // BACKEND-ONLY PATHS: deliberately NO match block
+    // ============================================
+    // Storage rules deny by default, so a path with no `match` here is closed
+    // to every client SDK; only the backend (Admin SDK, which bypasses rules)
+    // can touch it. Do NOT add a match for these, and do NOT add a catch-all
+    // (`match /{allPaths=**}`) that would open them:
+    //  - guidance-snapshots/{sourceId}/{contentHash}.json: cleaned text of
+    //    fetched caseworker guidance, kept for internal quote validation only
+    //    (issue #39). Never served to a client.
   }
 }
