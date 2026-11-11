@@ -82,7 +82,10 @@ export function criterion(
   src: FixtureSource,
   f: Omit<Partial<AssessmentCriterion>, "source" | "criterionId"> & Pick<AssessmentCriterion, "title" | "kind"> & { quote: string; page?: number }
 ): AssessmentCriterion {
-  const { quote, page, ...rest } = f;
+  const { page, ...rest } = f;
+  // Stored quotes are the source's text with whitespace collapsed (#40).
+  const quote = f.quote.replace(/\s+/g, " ").trim();
+  delete (rest as { quote?: string }).quote;
   return {
     stage: "eligibility",
     severity: "high",

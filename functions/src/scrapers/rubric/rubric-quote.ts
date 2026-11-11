@@ -211,6 +211,23 @@ export class SnapshotQuoteIndex {
     return /\p{Ll}{2,}/u.test(lead);
   }
 
+  /**
+   * The source text just before and just after a located quote, for a
+   * reviewer to read the quote in context (issue #125): a quote that begins
+   * after a negation cannot be caught in code, so a person must see the words
+   * around it. BOUNDED twice over: it never leaves the quote's own unit (the
+   * line of a web page, the page of a PDF) and never returns more than
+   * `maxChars` on either side. It can therefore never return a whole
+   * snapshot. `truncated*` say whether the unit holds more text that way.
+   */
+  contextAround(found: Extract<QuoteLookup, { ok: true }>, maxChars: number): { before: string; after: string; truncatedBefore: boolean; truncatedAfter: boolean } {
+    const text = this.units[found.unit].text;
+    const quoteEnd = found.at + found.matched.length;
+    const from = Math.max(0, found.at - Math.max(0, maxChars));
+    const to = Math.min(text.length, quoteEnd + Math.max(0, maxChars));
+    return { before: text.slice(from, found.at), after: text.slice(quoteEnd, to), truncatedBefore: from > 0, truncatedAfter: to < text.length };
+  }
+
   /** True when a literal appears in the document, verbatim and token-bounded. */
   containsLiteral(literal: string): boolean {
     return tokenBoundedPositions(this.joined, normalizeForQuoteMatch(literal)).length > 0;

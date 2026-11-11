@@ -498,12 +498,18 @@ describe("GET /admin/rubrics/:id", () => {
     assert.equal(d.approval.staleCriterionIds.length, 2);
   });
 
-  test("staleCitation ignores whitespace only: a re-wrapped page is current, a reworded one is not", async () => {
+  test("staleCitation ignores whitespace only: a re-spaced page is current, a reworded one is not", async () => {
     await seedA();
-    // Same words, every space doubled and lines re-broken.
-    await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: A_TEXT.replace(/ /g, "  \n") });
+    // Same words, same lines, every space widened (spaces, tabs).
+    await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: A_TEXT.replace(/ /g, " \t ") });
     let d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
     for (const c of d.criteria) assert.equal(c.staleCitation, false, c.title);
+    // The age rule is now split over two paragraphs: no longer one passage
+    // of the source, so the same lookup extraction uses reports it gone.
+    await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: A_TEXT.replace("aged 18 or over", "aged 18\nor over") });
+    d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    assert.equal(d.criteria.find((c: any) => c.title === "Aged 18 or over").staleCitation, true);
+    assert.equal(d.criteria.find((c: any) => c.title === "Funds held for 28 days").staleCitation, false);
     // One letter of case differs: no fuzzy matching, so it is stale.
     await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: A_TEXT.replace("aged 18 or over", "Aged 18 or over") });
     d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
@@ -546,8 +552,79 @@ describe("GET /admin/rubrics/:id", () => {
     assert.deepEqual(d.discardedByReason, { quote_not_found: 2, number_not_in_quote: 1 });
     assert.equal(d.suspiciousPassageCount, 1);
     assert.equal(d.suspiciousPassages[0].quote, A_LINES.sponsor);
-    assert.deepEqual(d.flags.map((f: any) => [f.key, f.blocking]), [["intent_polarity_conflict:rubric", true], ["suspicious_passages:rubric", true]]);
+    assert.deepEqual(d.flags.map((f: any) => [f.key, f.category, f.blocking]), [
+      ["intent_polarity_conflict:rubric", "must_acknowledge", true],
+      ["suspicious_passages:rubric", "must_acknowledge", true],
+    ]);
     assert.deepEqual(d.approval.requiredAcknowledgements, ["intent_polarity_conflict:rubric", "suspicious_passages:rubric"]);
+  });
+
+  test("each quote comes with a bounded window of its source: the words before a quote are visible", async () => {
+    await seedA();
+    const d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    // Web page: the window is the quote's own line, nothing from other lines.
+    const leave = d.criteria.find((c: any) => c.title === "Will leave at the end of the visit");
+    assert.deepEqual(leave.quoteContext, {
+      before: "SV 3.1 ",
+      after: " An intention to remain beyond the visit counts against the applicant.",
+      truncatedBefore: false,
+      truncatedAfter: false,
+      snapshot: "current",
+    });
+    assert.equal(`${leave.quoteContext.before}${leave.source.quote}${leave.quoteContext.after}`, A_LINES.leave);
+    // The polarity proposal's sentence has its context too.
+    assert.equal(d.intentPolarityProposal.quoteContext.before, "SV 3.1 The decision maker must be satisfied that the applicant will leave Avalen at the end of the visit. ");
+    assert.equal(d.intentPolarityProposal.quoteContext.after, "");
+
+    // PDF: the window stays on the quote's page.
+    await seedB();
+    const b = (await api("GET", `/${ID_B1}`, "t-admin")).body.data;
+    const tuition = b.criteria.find((c: any) => c.title === "Tuition for the first 12 months");
+    assert.equal(tuition.quoteContext.before, "from a listed institution for the whole course. ");
+    assert.equal(tuition.quoteContext.after, "");
+    const ties = b.criteria.find((c: any) => c.title === "Ties, study plan and previous travel");
+    assert.match(ties.quoteContext.before, /Holding both intentions is not a reason to refuse\. G 3 $/);
+    assert.ok(!JSON.stringify(ties.quoteContext).includes("G 5 Tuition"), "nothing from page 3");
+  });
+
+  test("a quote taken from after a negation: the negation is in the context the reviewer is shown", async () => {
+    const line = "SV 7.1 The applicant is not required to hold a return ticket when applying.";
+    const hash = await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: `${A_TEXT}\n${line}` });
+    const s = sourceA(hash);
+    // Verbatim, on word boundaries, and the opposite of what the source says.
+    await write(draft(ROUTE_A, [s], [criterion(s, { title: "Return ticket", kind: "objective", ruleRef: "SV 7.1", quote: "required to hold a return ticket", check: { field: "travel.returnTicket", op: "present" } })], { proposal: { value: "not_assessed" } }));
+    const d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    assert.equal(d.criteria[0].staleCitation, false, "code cannot catch it");
+    assert.equal(d.criteria[0].quoteContext.before, "SV 7.1 The applicant is not ");
+    assert.equal(d.criteria[0].quoteContext.after, " when applying.");
+  });
+
+  test("the context window is bounded: at most 300 characters either side, never the whole text", async () => {
+    const filler = (word: string) => Array.from({ length: 200 }, (_, i) => `${word}${i}`).join(" ");
+    const quote = "The applicant must hold a valid permit at all times.";
+    const line = `${filler("alpha")} ${quote} ${filler("omega")}`;
+    const hash = await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: `${A_LINES.heading}\n${line}` });
+    const s = sourceA(hash);
+    await write(draft(ROUTE_A, [s], [criterion(s, { title: "Valid permit", kind: "judgement", quote })]));
+    const out = await api("GET", `/${ID_A1}`, "t-admin");
+    const ctx = out.body.data.criteria[0].quoteContext;
+    assert.equal(ctx.before.length, 300);
+    assert.equal(ctx.after.length, 300);
+    assert.equal(ctx.truncatedBefore, true);
+    assert.equal(ctx.truncatedAfter, true);
+    assert.ok(line.includes(`${ctx.before}${quote}${ctx.after}`));
+    assert.ok(!JSON.stringify(out.body).includes("alpha0 "), "the start of the line is not returned");
+    assert.ok(!JSON.stringify(out.body).includes(A_LINES.heading), "another line is not returned");
+  });
+
+  test("a stale quote is shown in the snapshot it was cited to", async () => {
+    await seedA();
+    await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: A2_TEXT });
+    const d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    const age = d.criteria.find((c: any) => c.title === "Aged 18 or over");
+    assert.equal(age.staleCitation, true);
+    assert.deepEqual(age.quoteContext, { before: "SV 2.1 ", after: "", truncatedBefore: false, truncatedAfter: false, snapshot: "cited" });
+    assert.equal(d.criteria.find((c: any) => c.title === "Funds held for 28 days").quoteContext.snapshot, "current");
   });
 
   test("response hygiene: quotes yes; snapshot text, storage paths and URLs to stored text never", async () => {
@@ -582,7 +659,7 @@ describe("GET /admin/rubrics/:id", () => {
 
   test("the version id round-trips, including a visa type id with underscores", () => {
     assert.deepEqual(parseRubricVersionId(rubricVersionId("XA_some__v2_route", 12)), { routeKey: "XA_some__v2_route", version: 12 });
-    for (const bad of ["XA_route", "XA_route__v", "XA/route__v1", "../XA_route__v1", "XAB_route__v1", 7, null]) assert.equal(parseRubricVersionId(bad), null, String(bad));
+    for (const bad of ["XA_route", "XA_route__v", "XA/route__v1", "../XA_route__v1", "XAB_route__v1", "xa_route__v1", 7, null]) assert.equal(parseRubricVersionId(bad), null, String(bad));
   });
 });
 
@@ -854,6 +931,62 @@ describe("rubric review: approve", () => {
     assert.equal(entry.by, "admin-uid");
     assert.deepEqual(entry.acknowledgedFlags.map((f: any) => [f.key, f.code, f.target]), [["suspicious_passages:rubric", "suspicious_passages", "rubric"]]);
     assert.equal(typeof entry.acknowledgedFlags[0].message, "string");
+  });
+
+  test("per-criterion flags are acknowledged per criterion; standing notices once per version", async () => {
+    const hash = await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: A_TEXT });
+    const base = routeAV1(hash);
+    const [ageId, heldId, , barId] = base.criteria.map((c) => c.criterionId);
+    await write(
+      routeAV1(hash, {
+        extra: {
+          flags: [
+            // Specific things to check, one per criterion.
+            { code: "quote_starts_mid_sentence", message: "begins part-way through a sentence", target: ageId },
+            { code: "quote_starts_mid_sentence", message: "begins part-way through a sentence", target: heldId },
+            { code: "nationality_code_name_mismatch", message: "code and source name differ", target: barId },
+            // Limits of this extraction, one each for the whole version.
+            { code: "nationality_codes_model_proposed", message: "codes are a model proposal", target: "rubric" },
+            { code: "intake_wording_uncited", message: "intake wording is the model's", target: "rubric" },
+            { code: "multiple_chunks", message: "read in several excerpts", target: "rubric" },
+            { code: "page_ends_mid_sentence", message: "a page ends mid-sentence", target: "rubric" },
+            { code: "page_ends_mid_sentence", message: "another source, same notice", target: "rubric" },
+            // Harmless: shown, not acknowledged.
+            { code: "intake_answer_type_unknown", message: "a client may not render this", target: "some_question" },
+            // A code this API has never heard of: must be acknowledged.
+            { code: "a_future_flag", message: "added by a later extractor", target: "rubric" },
+          ],
+        },
+      })
+    );
+    const detail = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    const byCategory = (cat: string) => detail.flags.filter((f: any) => f.category === cat).map((f: any) => f.key);
+    assert.deepEqual(byCategory("must_acknowledge"), [`quote_starts_mid_sentence:${ageId}`, `quote_starts_mid_sentence:${heldId}`, `nationality_code_name_mismatch:${barId}`, "a_future_flag:rubric"]);
+    // One key per notice, however many times extraction raised it.
+    assert.deepEqual(byCategory("standing_notice"), ["nationality_codes_model_proposed:rubric", "intake_wording_uncited:rubric", "multiple_chunks:rubric", "page_ends_mid_sentence:rubric"]);
+    assert.deepEqual(byCategory("info"), ["intake_answer_type_unknown:some_question"]);
+    const required: string[] = detail.approval.requiredAcknowledgements;
+    assert.equal(required.length, 8);
+    assert.ok(!required.includes("intake_answer_type_unknown:some_question"));
+
+    // Leaving out any single one refuses the approval and names it.
+    writes.length = 0;
+    for (const left of required) {
+      const out = await decide(ID_A1, approveBody(0, { acknowledgedFlags: required.filter((k) => k !== left) }));
+      assert.equal(out.status, 409, left);
+      assert.equal(out.body.error, "FLAGS_NOT_ACKNOWLEDGED");
+      assert.ok(out.body.message.includes(left), left);
+    }
+    // Acknowledging one criterion's flag does not cover another criterion's.
+    assert.match((await decide(ID_A1, approveBody(0, { acknowledgedFlags: required.filter((k) => !k.endsWith(heldId)) }))).body.message, new RegExp(heldId));
+    assert.equal(writes.length, 0);
+
+    // All eight named: approved, and each is on the record with who.
+    const out = await decide(ID_A1, approveBody(0, { acknowledgedFlags: required }));
+    assert.equal(out.status, 200);
+    const [entry] = auditEntries();
+    assert.equal(entry.by, "admin-uid");
+    assert.deepEqual(entry.acknowledgedFlags.map((f: any) => f.key).sort(), [...required].sort());
   });
 
   test("criteria about intent: a decided polarity resolves the flag; deciding not_assessed needs an acknowledgement", async () => {

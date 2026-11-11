@@ -56,11 +56,20 @@ import { diffRubricVersions, type ChangedCriterion, type IntentPolarityDiff } fr
 //    approved (`RUBRIC_INVALID`).
 //
 // APPROVE, needs the reviewer's explicit acknowledgement:
-//  - every BLOCKING FLAG on the version (passages that read as instructions
-//    to a reader model, conflicting polarity passages, criteria about intent
-//    left with no polarity, an empty rubric, any flag code this file does not
-//    know to be harmless) must be named in `acknowledgedFlags`, by its key
-//    `code:target`. Missing one -> `FLAGS_NOT_ACKNOWLEDGED`, nothing written.
+//  - every flag on the version must be named in `acknowledgedFlags`, by its
+//    key `code:target`, unless this file knows its code to be harmless.
+//    Missing one -> `FLAGS_NOT_ACKNOWLEDGED`, nothing written. Two kinds:
+//      * "must_acknowledge": something specific to look at (passages that
+//        read as instructions to a reader model, a quote that starts
+//        mid-sentence, a country code whose name is not how the source names
+//        the group, conflicting polarity passages, criteria about intent left
+//        with no polarity, an empty rubric, and ANY code this file has never
+//        heard of). The per-criterion ones carry the criterion id as their
+//        target, so each criterion is acknowledged by name.
+//      * "standing_notice": a limit of extraction that holds for the whole
+//        version (codes were proposed by the model, intake wording is the
+//        model's, the source was read in several excerpts, a page ends
+//        mid-sentence). One per version, acknowledged once.
 //    Who acknowledged what is recorded in the audit entry.
 //
 // APPROVE, the polarity: `intentPolarity` is the ADMIN'S DECISION and must be
@@ -87,9 +96,12 @@ import { diffRubricVersions, type ChangedCriterion, type IntentPolarityDiff } fr
 //
 // ---- What a response may contain ----
 //
-// Criterion quotes: yes (a reviewer needs them). The stored snapshot TEXT,
-// its Storage path, or any URL to it: never. Snapshots are read here only to
-// look a quote up; nothing read from one is returned or logged.
+// Criterion quotes: yes (a reviewer needs them), each with a BOUNDED window
+// of the source around it (`quoteContext`: at most QUOTE_CONTEXT_CHARS on
+// either side, never beyond the quote's own line or page), because a quote
+// that begins after a negation cannot be caught in code and must be read in
+// context. The stored snapshot text as a whole, its Storage path, or any URL
+// to it: never. Nothing read from a snapshot is logged.
 //
 // ---- Seam for re-assessment (#37) ----
 //
@@ -119,8 +131,14 @@ export const RUBRIC_REVIEW_REASON_MAX_LENGTH = 2000;
 export const RUBRIC_LIST_DEFAULT_LIMIT = 50;
 export const RUBRIC_LIST_MAX_LIMIT = 100;
 
-/** Most flags a request may acknowledge (a rubric has a handful). */
-const MAX_ACKNOWLEDGED_FLAGS = 100;
+/** Most flags a request may acknowledge (one per flagged criterion at most). */
+const MAX_ACKNOWLEDGED_FLAGS = 500;
+
+/**
+ * Most source text returned on EITHER side of a quote as its context. The
+ * window also stops at the end of the quote's line (web page) or page (PDF).
+ */
+export const QUOTE_CONTEXT_CHARS = 300;
 
 /** Validator flag raised when criteria concern intent but no polarity scores them. */
 const INTENT_FLAG_CODE = "intent_criteria_without_polarity";
@@ -136,8 +154,26 @@ const SUSPICIOUS_FLAG_CODE = "suspicious_passages";
  */
 const NON_BLOCKING_FLAG_CODES: ReadonlySet<string> = new Set(["intake_answer_type_unknown"]);
 
+/**
+ * Flag codes that are STANDING NOTICES: limits of extraction that hold for
+ * the version as a whole rather than one thing to fix. They are returned to
+ * the reviewer and must be acknowledged, once per version (their target is
+ * the rubric, so there is one key per code):
+ *  - nationality_codes_model_proposed: country codes are the model's proposal;
+ *  - intake_wording_uncited: intake labels and options are the model's wording;
+ *  - multiple_chunks: the source was read in several excerpts;
+ *  - page_ends_mid_sentence: a rule crossing a page break may be cut short.
+ */
+const STANDING_NOTICE_FLAG_CODES: ReadonlySet<string> = new Set([
+  "nationality_codes_model_proposed",
+  "intake_wording_uncited",
+  "multiple_chunks",
+  "page_ends_mid_sentence",
+]);
+
 /** `{countryCode}_{visaTypeId}__v{version}`: the id of one rubric version in the API. */
-const VERSION_ID_RE = /^([A-Za-z]{2}_[A-Za-z0-9][A-Za-z0-9_-]*)__v([1-9]\d{0,8})$/;
+// The country code is two UPPER-CASE letters, as `rubricRouteKey` requires.
+const VERSION_ID_RE = /^([A-Z]{2}_[A-Za-z0-9][A-Za-z0-9_-]*)__v([1-9]\d{0,8})$/;
 
 // ============================================
 // Errors
@@ -206,8 +242,19 @@ export interface ReviewFlag {
   code: string;
   target: string;
   message: string;
-  // True when approval needs this flag acknowledged.
+  // What it asks of the reviewer (see the file header):
+  //  - must_acknowledge: a specific thing to check before approving;
+  //  - standing_notice:  a limit of this extraction, acknowledged once;
+  //  - info:             shown only.
+  category: "must_acknowledge" | "standing_notice" | "info";
+  // True when approval needs this flag acknowledged (every category but info).
   blocking: boolean;
+}
+
+/** The category of a flag code. An unknown code must be acknowledged (fail closed). */
+function flagCategory(code: string): ReviewFlag["category"] {
+  if (NON_BLOCKING_FLAG_CODES.has(code)) return "info";
+  return STANDING_NOTICE_FLAG_CODES.has(code) ? "standing_notice" : "must_acknowledge";
 }
 
 /** Key of a flag in `acknowledgedFlags`. */
@@ -244,7 +291,8 @@ export function reviewFlagsFor(rubric: VisaRubric, decision: IntentPolarity | nu
     const key = flagKey(f);
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ key, code: f.code, target: f.target, message: f.message, blocking: !NON_BLOCKING_FLAG_CODES.has(f.code) });
+    const category = flagCategory(f.code);
+    out.push({ key, code: f.code, target: f.target, message: f.message, category, blocking: category !== "info" });
   }
   return out;
 }
@@ -332,12 +380,30 @@ export function parseRubricDecision(body: unknown): RubricDecisionInput {
  */
 export type CitationStatus = "current" | "stale" | "unverifiable";
 
+/**
+ * The source text around a quote, so a reviewer can read it in context. A
+ * bounded window (see QUOTE_CONTEXT_CHARS), never the document.
+ */
+export interface QuoteContext {
+  // Text of the same line / page just before and just after the quote.
+  before: string;
+  after: string;
+  // True when the line / page holds more text in that direction.
+  truncatedBefore: boolean;
+  truncatedAfter: boolean;
+  // Which snapshot the window was cut from: the source's CURRENT one, or
+  // (for a stale citation) the one the quote was CITED to at extraction.
+  snapshot: "current" | "cited";
+}
+
 /** A criterion as the review API returns it. */
 export interface ReviewCriterion extends AssessmentCriterion {
   // True unless the quote was found in the current source text. So it is
   // also true when the check could not be made (see `citationStatus`).
   staleCitation: boolean;
   citationStatus: CitationStatus;
+  // Null when no stored snapshot holding the quote could be read.
+  quoteContext: QuoteContext | null;
 }
 
 /** Something that stops an approval whatever the reviewer acknowledges. */
@@ -378,7 +444,9 @@ export interface RubricVersionListItem {
 export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intentPolarityProposal" | "sources"> {
   schemaVersion: number;
   rejectReason: string | null;
-  intentPolarityProposal: VisaRubric["intentPolarityProposal"];
+  // The extractor's proposal with its quote, and that quote's context: the
+  // sentence that states a polarity is exactly where a negation matters.
+  intentPolarityProposal: (NonNullable<VisaRubric["intentPolarityProposal"]> & { quoteContext: QuoteContext | null }) | null;
   severityLevels: string[];
   criteria: ReviewCriterion[];
   intake: VisaRubric["intake"] | null;
@@ -549,6 +617,7 @@ function toCriterion(c: AssessmentCriterion): AssessmentCriterion {
     ...(c.ruleRef !== undefined ? { ruleRef: c.ruleRef } : {}),
     source: toCitation(c.source),
     ...(c.check !== undefined ? { check: c.check } : {}),
+    // Includes `codeNames` (the platform's name for each proposed code).
     ...(c.appliesTo !== undefined ? { appliesTo: c.appliesTo } : {}),
     ...(c.validFrom !== undefined ? { validFrom: c.validFrom } : {}),
     ...(c.validUntil !== undefined ? { validUntil: c.validUntil } : {}),
@@ -601,10 +670,18 @@ export interface RubricReviewDeps {
   now: () => Timestamp;
 }
 
+/** What was found for one citation. */
+interface CitationFinding {
+  status: CitationStatus;
+  context: QuoteContext | null;
+}
+
 /** Outcome of the stale-citation check of one version. */
 interface CitationCheck {
-  // criterionId -> status.
-  byCriterion: Map<string, CitationStatus>;
+  // criterionId -> status and context.
+  byCriterion: Map<string, CitationFinding>;
+  // The polarity proposal's own quote, when it has one.
+  proposal: CitationFinding | null;
   // sourceId -> the `latestSnapshotId` the check was made against (null when
   // the source has none or does not exist). Re-read inside the decision's
   // transaction: a source that moved in between aborts the approval.
@@ -675,22 +752,26 @@ export class RubricReviewService {
 
   /**
    * For each criterion: is its quote still in the CURRENT stored text of its
-   * source (the snapshot the source's `latestSnapshotId` points at)?
-   * Whitespace-normalised, verbatim, no fuzzy matching: the same lookup
-   * extraction used (`SnapshotQuoteIndex`).
+   * source (the snapshot the source's `latestSnapshotId` points at)? The
+   * lookup is the one extraction used (`SnapshotQuoteIndex.locate`): verbatim
+   * after whitespace normalisation, on word boundaries, within one line or
+   * page, no fuzzy matching.
    *
-   * A criterion whose citation was validated against that very snapshot is
-   * current without reading anything. Otherwise the newest snapshot is read
-   * once per source. A source or snapshot that cannot be read makes its
-   * criteria `unverifiable`, never `current`.
+   * Each finding also carries the bounded window of text around the quote:
+   * from the current snapshot when the quote is there, else from the snapshot
+   * it was cited to (so a reviewer can still read a stale quote in context).
+   * A source or snapshot that cannot be read makes its criteria
+   * `unverifiable`, never `current`. Each snapshot is read at most once.
    */
   private async checkCitations(rubric: VisaRubric): Promise<CitationCheck> {
     const criteria = Array.isArray(rubric.criteria) ? rubric.criteria : [];
-    const sourceIds = [...new Set(criteria.map((c) => c.source?.sourceId).filter((id): id is string => typeof id === "string" && id.length > 0))];
+    const proposalSource = rubric.intentPolarityProposal?.source ?? null;
+    const sourceIds = [
+      ...new Set([...criteria.map((c) => c.source?.sourceId), proposalSource?.sourceId].filter((id): id is string => typeof id === "string" && id.length > 0)),
+    ];
 
+    // ---- where each source stands now ----
     const sourceHeads = new Map<string, string | null>();
-    // sourceId -> the newest snapshot's quote index, or null when unreadable.
-    const indexes = new Map<string, SnapshotQuoteIndex | null>();
     await Promise.all(
       sourceIds.map(async (sourceId) => {
         let latest: string | null = null;
@@ -702,33 +783,49 @@ export class RubricReviewService {
           console.error(`Rubric review: guidance source ${sourceId} unreadable: ${(err as Error)?.message ?? err}`);
         }
         sourceHeads.set(sourceId, latest);
-        // Only read the text when some criterion was cited to an OLDER snapshot.
-        const needsText = latest !== null && criteria.some((c) => c.source?.sourceId === sourceId && c.source.contentHash !== latest);
-        if (!needsText) return;
-        try {
-          indexes.set(sourceId, new SnapshotQuoteIndex(await this.deps.snapshots.read(sourceId, latest as string)));
-        } catch (err) {
-          // The source id only: never the path or any text.
-          console.error(`Rubric review: newest snapshot of ${sourceId} unreadable: ${(err as Error)?.message ?? err}`);
-          indexes.set(sourceId, null);
-        }
       })
     );
 
-    const byCriterion = new Map<string, CitationStatus>();
-    for (const c of criteria) {
-      const sourceId = c.source?.sourceId;
-      const latest = sourceId ? sourceHeads.get(sourceId) ?? null : null;
-      let status: CitationStatus;
-      if (!sourceId || latest === null) status = "unverifiable";
-      else if (c.source.contentHash === latest) status = "current";
-      else {
-        const index = indexes.get(sourceId);
-        status = !index ? "unverifiable" : index.locate(c.source.quote).ok ? "current" : "stale";
+    // ---- snapshots, read lazily and once each; null when unreadable ----
+    const indexes = new Map<string, Promise<SnapshotQuoteIndex | null>>();
+    const indexOf = (sourceId: string, contentHash: string): Promise<SnapshotQuoteIndex | null> => {
+      const key = `${sourceId}:${contentHash}`;
+      let index = indexes.get(key);
+      if (!index) {
+        index = this.deps.snapshots
+          .read(sourceId, contentHash)
+          .then((content) => new SnapshotQuoteIndex(content))
+          .catch((err) => {
+            // The source id only: never the path or any text.
+            console.error(`Rubric review: a snapshot of ${sourceId} is unreadable: ${(err as Error)?.message ?? err}`);
+            return null;
+          });
+        indexes.set(key, index);
       }
-      byCriterion.set(c.criterionId, status);
-    }
-    return { byCriterion, sourceHeads };
+      return index;
+    };
+    /** The window around a quote in one snapshot, or null when it is not there. */
+    const contextIn = (index: SnapshotQuoteIndex | null, quote: string, snapshot: QuoteContext["snapshot"]): QuoteContext | null => {
+      const found = index?.locate(quote);
+      return index && found?.ok ? { ...index.contextAround(found, QUOTE_CONTEXT_CHARS), snapshot } : null;
+    };
+    /** Status and context of one citation. */
+    const inspect = async (citation: RubricCitation | undefined): Promise<CitationFinding> => {
+      const sourceId = citation?.sourceId;
+      const latest = sourceId ? sourceHeads.get(sourceId) ?? null : null;
+      if (!citation || !sourceId || latest === null) return { status: "unverifiable", context: null };
+      const current = await indexOf(sourceId, latest);
+      const inCurrent = contextIn(current, citation.quote, "current");
+      if (inCurrent) return { status: "current", context: inCurrent };
+      // Not in the current text (or it could not be read). Show the quote
+      // where it WAS found: the snapshot it was cited to.
+      const cited = citation.contentHash !== latest ? contextIn(await indexOf(sourceId, citation.contentHash), citation.quote, "cited") : null;
+      return { status: current ? "stale" : "unverifiable", context: cited };
+    };
+
+    const byCriterion = new Map<string, CitationFinding>();
+    await Promise.all(criteria.map(async (c) => void byCriterion.set(c.criterionId, await inspect(c.source))));
+    return { byCriterion, proposal: proposalSource ? await inspect(proposalSource) : null, sourceHeads };
   }
 
   // ---------- Detail ----------
@@ -773,8 +870,8 @@ export class RubricReviewService {
 
     // ---- criteria with their citation status ----
     const criteria: ReviewCriterion[] = rubric.criteria.map((c) => {
-      const citationStatus = citations.byCriterion.get(c.criterionId) ?? "unverifiable";
-      return { ...toCriterion(c), staleCitation: citationStatus !== "current", citationStatus };
+      const finding = citations.byCriterion.get(c.criterionId) ?? { status: "unverifiable" as const, context: null };
+      return { ...toCriterion(c), staleCitation: finding.status !== "current", citationStatus: finding.status, quoteContext: finding.context };
     });
 
     // ---- diff (serialised criteria: the same whitelist as above) ----
@@ -817,7 +914,11 @@ export class RubricReviewService {
       suspiciousPassageCount: item.suspiciousPassageCount,
       intentPolarity: item.intentPolarity,
       intentPolarityProposal: rubric.intentPolarityProposal
-        ? { value: rubric.intentPolarityProposal.value, ...(rubric.intentPolarityProposal.source ? { source: toCitation(rubric.intentPolarityProposal.source) } : {}) }
+        ? {
+          value: rubric.intentPolarityProposal.value,
+          ...(rubric.intentPolarityProposal.source ? { source: toCitation(rubric.intentPolarityProposal.source) } : {}),
+          quoteContext: citations.proposal?.context ?? null,
+        }
         : null,
       createdAt: item.createdAt,
       reviewedBy: item.reviewedBy,
@@ -883,7 +984,7 @@ export class RubricReviewService {
     if (!head || head.latestVersion !== rubric.version) {
       blockers.push({ code: "NOT_LATEST_VERSION", message: "A newer version of this route's rubric exists. Review that one; this one can only be rejected." });
     }
-    const statuses = [...citations.byCriterion.values()];
+    const statuses = [...citations.byCriterion.values()].map((f) => f.status);
     const stale = statuses.filter((s) => s === "stale").length;
     const unverifiable = statuses.filter((s) => s === "unverifiable").length;
     if (stale > 0) {
@@ -923,7 +1024,7 @@ export class RubricReviewService {
       // Cheap early answers; both are checked again inside the transaction.
       if (preview.reviewStatus !== "pending_review") throw conflict("ALREADY_DECIDED", `This rubric version is already ${preview.reviewStatus}`);
       citations = await this.checkCitations(preview);
-      const statuses = [...citations.byCriterion.values()];
+      const statuses = [...citations.byCriterion.values()].map((f) => f.status);
       if (statuses.includes("stale")) {
         throw conflict("STALE_CITATION", "A criterion quotes text that is no longer in the current source. The source has moved on: re-extract the rubric instead of approving this version.");
       }
