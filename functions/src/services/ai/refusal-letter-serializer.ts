@@ -39,7 +39,8 @@ const STATE_COPY: Record<RefusalOutcome, string> = {
 };
 
 /** The serialized body of one analysis. */
-export function serializeRefusalData(a: RefusalAnalysis) {
+export function serializeRefusalData(a: RefusalAnalysis, listed: ReadonlyMap<string, string> = new Map()) {
+  const confirmed = new Set((a.confirmedItems ?? []).map((c) => c.checklistItemId));
   const outcome = a.outcome ?? "unreadable";
   const analysed = outcome === "analysed";
   return {
@@ -82,6 +83,10 @@ export function serializeRefusalData(a: RefusalAnalysis) {
           reason: i.reason,
           citation: { quote: i.citation.quote, url: i.citation.url, ruleRef: i.citation.ruleRef ?? null },
           addressesCriterionIds: [...i.addressesCriterionIds],
+          // The status of the applicant's own document request for this item, or null
+          // when it is not on their list. `confirmed`: they confirmed it from here.
+          listStatus: listed.get(i.checklistItemId) ?? null,
+          confirmed: confirmed.has(i.checklistItemId),
         })),
       }
       : { state: "not_built" as const, emptyReason: null, items: [] },
@@ -106,9 +111,9 @@ export function refusalMeta(a: RefusalAnalysis) {
 }
 
 /** The envelope: `data` is null until the job has finished. */
-export function refusalEnvelope(a: RefusalAnalysis) {
+export function refusalEnvelope(a: RefusalAnalysis, listed: ReadonlyMap<string, string> = new Map()) {
   return {
     meta: refusalMeta(a),
-    data: a.status === "succeeded" ? serializeRefusalData(a) : null,
+    data: a.status === "succeeded" ? serializeRefusalData(a, listed) : null,
   };
 }

@@ -31,5 +31,8 @@ aiRoutes.get("/assessments/:id", verifyAuth, (req, res) =>
 // ---- refusal-letter analysis (issue #122) ----
 aiRoutes.post("/refusal-letters", verifyAuth, (req, res) => refusalLetterController.create(req, res));
 aiRoutes.get("/refusal-letters/:id", verifyAuth, (req, res) => refusalLetterController.byId(req, res));
+aiRoutes.post("/refusal-letters/:id/checklist/confirm", verifyAuth, (req, res) =>
+  refusalLetterController.confirmChecklist(req, res)
+);
 
 export { aiRoutes };

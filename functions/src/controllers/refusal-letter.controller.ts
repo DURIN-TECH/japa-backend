@@ -7,6 +7,7 @@ import { sendError, sendNotFound, sendForbidden, sendSuccess } from "../utils/re
 import type { Application, Document } from "../types";
 import { refusalLetterService } from "../services/ai/refusal-letter.service";
 import { refusalEnvelope } from "../services/ai/refusal-letter-serializer";
+import { documentRequestService } from "../services/document-request.service";
 import { tierFor } from "../services/ai/tier-serializer";
 
 // ============================================
@@ -28,7 +29,16 @@ import { tierFor } from "../services/ai/tier-serializer";
 //
 // Nothing here logs the letter, a quote or an extracted reason.
 
+/** Application statuses in which the applicant may still add to their document list. */
+const EDITABLE_STATUSES = new Set<string>(["draft", "pending_payment", "pending_documents"]);
+
 export class RefusalLetterController {
+  /** checklistItemId -> status of the applicant's own checklist requests for the application. */
+  private async listedMap(applicationId: string): Promise<Map<string, string>> {
+    const rows = await documentRequestService.listChecklistForApplication(applicationId);
+    return new Map(rows.filter((r) => r.checklistItemId).map((r) => [r.checklistItemId as string, r.status]));
+  }
+
   /** The application a document belongs to, or null. */
   private async loadApplication(id: string): Promise<Application | null> {
     const snap = await collections.applications.doc(id).get();
@@ -69,7 +79,7 @@ export class RefusalLetterController {
       // The same letter, already read: return the stored result.
       if (outcome.status === "succeeded") {
         const stored = await refusalLetterService.getById(outcome.analysisId);
-        if (stored) return sendSuccess(res, refusalEnvelope(stored));
+        if (stored) return sendSuccess(res, refusalEnvelope(stored, await this.listedMap(stored.applicationId)));
       }
       return sendSuccess(res, { analysisId: outcome.analysisId, status: outcome.status }, undefined, 202);
     }
@@ -89,7 +99,43 @@ export class RefusalLetterController {
     if (tierFor(req.authz?.role, req.entitlements) !== "full") {
       return paymentRequired(res, "Reading a refusal letter needs the case-officer plan.");
     }
-    return sendSuccess(res, refusalEnvelope(analysis));
+    return sendSuccess(res, refusalEnvelope(analysis, await this.listedMap(analysis.applicationId)));
+  }
+
+  /**
+   * POST /ai/refusal-letters/:id/checklist/confirm  { checklistItemIds: string[] }
+   * The applicant (and only the applicant) puts chosen items on their document
+   * list. Access: `update` on the application, applicant uid, full tier, and an
+   * editable application status. Ids only: items are read from the stored analysis.
+   */
+  async confirmChecklist(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const ids = (req.body as { checklistItemIds?: unknown } | undefined)?.checklistItemIds;
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 50 || !ids.every((x) => typeof x === "string" && x.length > 0 && x.length < 200)) {
+      return sendError(res, "VALIDATION_ERROR", "checklistItemIds must be a non-empty list of ids", 400);
+    }
+    const analysis = await refusalLetterService.getById(req.params.id);
+    if (!analysis) return sendNotFound(res, "Analysis not found");
+    const app = await this.loadApplication(analysis.applicationId);
+    if (!app || !checkApplicationAccessForRequest(req, app, "update")) return sendForbidden(res);
+    // Only the applicant adds to their own list: staff access is not enough.
+    if (!req.authz?.uid || req.authz.uid !== app.userId) return sendForbidden(res, "Only the applicant can add these to their document list.");
+    if (tierFor(req.authz?.role, req.entitlements) !== "full") {
+      return paymentRequired(res, "Reading a refusal letter needs the case-officer plan.");
+    }
+    // Editable = not yet with a decision maker or closed.
+    if (!EDITABLE_STATUSES.has(app.status)) {
+      return sendError(res, "APPLICATION_LOCKED", "This application can no longer be changed.", 409);
+    }
+
+    const outcome = await refusalLetterService.confirmChecklist({
+      analysis,
+      app,
+      checklistItemIds: ids as string[],
+      confirmedBy: req.authz.uid,
+    });
+    if (outcome.kind === "not_ready") return sendError(res, "NOT_READY", "This letter has not been analysed yet.", 409);
+    if (outcome.kind === "unknown_ids") return sendError(res, "VALIDATION_ERROR", "One or more items are not on this letter's checklist.", 400);
+    return sendSuccess(res, { added: outcome.added, alreadyListed: outcome.alreadyListed });
   }
 }
 

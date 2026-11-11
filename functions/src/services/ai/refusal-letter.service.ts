@@ -16,6 +16,7 @@ import {
   identityWarnings,
   parseRefusalAnswer,
 } from "./refusal-letter-logic";
+import { documentRequestService } from "../document-request.service";
 import { resolveDisclosureNotice } from "./refusal-disclosure-notice";
 import { sniffMediaType } from "../ai-case-officer.service";
 
@@ -219,11 +220,61 @@ export class RefusalLetterService {
       checklist: { state: "not_built", items: [] },
       matchedCriterionIds: [],
       unmatchedReasonIds: [],
+      confirmedItems: [],
       disclosureNotice: null,
       model: null,
       promptVersion: REFUSAL_PROMPT_VERSION,
       usage: null,
     };
+  }
+
+  // ----------------------------------------------------------------
+  // Confirm (the applicant adds checklist items to their document list)
+  // ----------------------------------------------------------------
+
+  /**
+   * Put the chosen items on the applicant's document list. Everything comes from
+   * the STORED analysis: the client sends ids only, an unknown id rejects the
+   * whole request, and no title or quote is ever read from the request. Items
+   * under a deception reason are never in the stored checklist (the builder
+   * excluded them), so they cannot be confirmed.
+   */
+  async confirmChecklist(args: {
+    analysis: RefusalAnalysis;
+    app: Application;
+    checklistItemIds: string[];
+    confirmedBy: string;
+  }): Promise<{ kind: "unknown_ids" } | { kind: "not_ready" } | { kind: "ok"; added: string[]; alreadyListed: string[] }> {
+    const { analysis, app, checklistItemIds, confirmedBy } = args;
+    if (analysis.status !== "succeeded" || analysis.outcome !== "analysed") return { kind: "not_ready" };
+    const stored = new Map(analysis.checklist.items.map((i) => [i.checklistItemId, i]));
+    const ids = [...new Set(checklistItemIds)];
+    if (ids.some((id) => !stored.has(id))) return { kind: "unknown_ids" };
+
+    // Rebuild the #114 item shape from the stored item; `criterionRef` is the
+    // first matched criterion it addresses.
+    const items = ids.map((id) => {
+      const i = stored.get(id)!;
+      return {
+        checklistItemId: i.checklistItemId,
+        title: i.title,
+        holder: i.holder,
+        required: i.required,
+        reason: i.reason,
+        criterionRef: i.addressesCriterionIds[0],
+        citation: i.citation,
+      };
+    });
+    const res = await documentRequestService.addChecklistItems(app, items);
+
+    // Record what was confirmed and when (once per item).
+    const now = Timestamp.fromDate(this.deps.now());
+    const have = new Set((analysis.confirmedItems ?? []).map((c) => c.checklistItemId));
+    const fresh = ids.filter((id) => !have.has(id)).map((id) => ({ checklistItemId: id, confirmedAt: now, confirmedBy }));
+    if (fresh.length > 0) {
+      await collections.refusalAnalyses.doc(analysis.id).update({ confirmedItems: [...(analysis.confirmedItems ?? []), ...fresh] });
+    }
+    return { kind: "ok", ...res };
   }
 
   // ----------------------------------------------------------------

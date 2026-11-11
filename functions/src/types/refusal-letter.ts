@@ -122,6 +122,8 @@ export interface RefusalAnalysis {
   matchedCriterionIds: string[];
   unmatchedReasonIds: string[];
 
+  // Items the applicant confirmed onto their document list (empty until they do).
+  confirmedItems: { checklistItemId: string; confirmedAt: Timestamp; confirmedBy: string }[];
   // Null for a destination with no entry: nothing is shown.
   disclosureNotice: DisclosureNotice | null;
 
