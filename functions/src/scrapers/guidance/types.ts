@@ -75,7 +75,9 @@ export interface GuidanceSourceSeed {
   // OPTIONAL. How to find the publisher's own "published / last updated"
   // date in the document: a regular expression (source text, no flags)
   // applied to the CLEANED TEXT, whose first capture group is the date as
-  // written. Text rather than a CSS selector because the same field must work
+  // written. Searched for in the first and last 20,000 characters only, and
+  // it may not start with `.*` / `.+` or nest quantifiers (the seed
+  // validator refuses those). Text rather than a CSS selector because the same field must work
   // for PDFs, and because the fetch service hands back cleaned text only.
   // See guidance-published-date.ts.
   publishedDateSelector?: string;
@@ -95,9 +97,11 @@ export interface GuidanceSourceSeed {
   // `unverified`; FORBIDDEN on `verified` (a source with a recorded failure
   // is not verified, whatever else the entry says).
   retrievalError?: string;
-  // OPTIONAL. The URL the document is expected to end up at after redirects.
-  // When set it is the baseline for the "redirects to a different document"
-  // check; when absent the baseline is the final URL of the first good fetch.
+  // The URL the request is expected to END at after redirects. REQUIRED in
+  // practice for a source whose `url` redirects: without it the crawl
+  // expects the request to end at `url` itself, and any redirect (even on
+  // the first fetch) fails with `redirect_changed` and ingests nothing.
+  // Optional only because most sources do not redirect.
   expectedFinalUrl?: string;
 }
 
@@ -120,7 +124,8 @@ export interface GuidanceSource
   retrievedAt: Timestamp | null;
 
   // ---- Crawl state (written by the crawler, kept by a re-seed) ----
-  // When the source was last fetched SUCCESSFULLY (changed or not).
+  // When the source was last fetched SUCCESSFULLY (changed or not): the
+  // tick time of that crawl run (the same clock as `lastAttemptAt`).
   lastFetchedAt: Timestamp | null;
   // sha256 of the cleaned text of the last successful fetch: the hash gate.
   lastContentHash: string | null;
@@ -187,8 +192,10 @@ export interface GuidanceSnapshotMeta {
   sourceByteLength: number | null;
   // Object name in the project's default bucket (never a URL).
   storagePath: string;
-  // The hash this one replaced (null for a source's first snapshot): the
-  // record of the change.
+  // The hash this one replaced WHEN IT WAS FIRST SEEN (null for a source's
+  // first snapshot): the record of the change. If the content later goes
+  // away and comes back, this snapshot is reused as it is; the move is
+  // recorded on the source (`latestSnapshotId`, `lastChangedAt`).
   previousContentHash: string | null;
   createdAt: Timestamp;
 }

@@ -193,7 +193,11 @@ const stored = (id: string, hash: string): GuidanceSnapshotContent => JSON.parse
 
 /** A crawl service over the stubbed network and the in-memory stores. */
 function makeService(minIntervalMs = 0): GuidanceCrawlService {
-  const fetcher = new VisaCatalogFetchService({ http, minIntervalMs });
+  // The fetch service turns `Retry-After` into an instant with ITS clock
+  // (production: the wall clock, the same one the run's `now` comes from).
+  // Here the run's `now` is injected, so the fetch service is given the same
+  // fixed clock: no assertion in this file depends on the real date.
+  const fetcher = new VisaCatalogFetchService({ http, minIntervalMs, clock: () => T0 });
   const svc = new GuidanceCrawlService(fetcher, new GuidanceSnapshotStore(bucket));
   svc.runTransaction = fakeRunTransaction as any;
   return svc;
@@ -637,7 +641,8 @@ describe("guidance crawl: failing sources", () => {
   test("a redirect is recorded with both the requested and the final URL", async () => {
     const moved = `https://${A_HOST}/rules/short-stay-2026`;
     routes[A_URL] = html(A_V1, { responseUrl: moved });
-    seed(SOURCE_A);
+    // A source known to redirect declares where it ends up.
+    seed({ ...SOURCE_A, expectedFinalUrl: moved });
     await quiet(() => makeService().runOrchestrator({ now: at(T0) }));
     const a = source(SOURCE_A.id);
     assert.equal(a.url, A_URL);
@@ -648,6 +653,56 @@ describe("guidance crawl: failing sources", () => {
     const obj = stored(SOURCE_A.id, a.lastContentHash);
     assert.equal(obj.url, A_URL);
     assert.equal(obj.finalUrl, moved);
+  });
+
+  test("an undeclared redirect on the FIRST fetch fails and nothing is ingested (no trust on first use)", async () => {
+    // No expectedFinalUrl, never fetched: the request must end at `url`.
+    routes[A_URL] = html(A_V1, { responseUrl: `https://${A_HOST}/somewhere-else` });
+    seed(SOURCE_A);
+    const svc = makeService();
+    const s = await quiet(() => svc.runOrchestrator({ now: at(T0) }));
+    assert.equal(s.results[0].outcome, "failed");
+    assert.equal(s.results[0].errorKind, "redirect_changed");
+    assert.match(s.results[0].error!, /declare expectedFinalUrl/);
+    const a = source(SOURCE_A.id);
+    // Nothing was taken as this source's content, and no baseline was learnt.
+    assert.equal(a.lastContentHash, null);
+    assert.equal(a.finalUrl, null);
+    assert.equal(a.lastFetchedAt, null);
+    assert.equal(a.consecutiveFailures, 1);
+    assert.equal(snapshotPaths(SOURCE_A.id).length, 0);
+    assert.equal(objects.size, 0);
+    assert.equal(saveAttempts, 0);
+
+    // It keeps failing on later runs: the redirect target never becomes trusted.
+    const again = await quiet(() => svc.runOrchestrator({ now: at(T0 + 25 * HOUR) }));
+    assert.equal(again.results[0].errorKind, "redirect_changed");
+    assert.equal(objects.size, 0);
+
+    // A response that ends at the requested URL (same document, trailing
+    // slash and host case aside) is accepted.
+    routes[A_URL] = html(A_V1, { responseUrl: `https://${A_HOST.toUpperCase()}/rules/short-stay/` });
+    const ok = await quiet(() => svc.runOrchestrator({ now: at(T0 + 50 * HOUR) }));
+    assert.equal(ok.changed, 1);
+  });
+
+  test("after a re-seed changes the url, the first fetch of the new url is not trusted blindly either", async () => {
+    seed(SOURCE_A);
+    const svc = makeService();
+    await quiet(() => svc.runOrchestrator({ now: at(T0) }));
+    const before = source(SOURCE_A.id).lastContentHash;
+
+    // Re-seed with a new address (the seed resets finalUrl to null)...
+    const newUrl = `https://${A_HOST}/rules/short-stay-v2`;
+    const reseeded = buildSeededGuidanceSource({ ...SOURCE_A, url: newUrl }, source(SOURCE_A.id), at(T0 + HOUR));
+    store.set(`guidanceSources/${SOURCE_A.id}`, { ...source(SOURCE_A.id), ...reseeded });
+    assert.equal(source(SOURCE_A.id).finalUrl, null);
+    // ...which redirects somewhere undeclared.
+    routes[newUrl] = html(A_V2, { responseUrl: `https://${A_HOST}/landing` });
+    const s = await quiet(() => svc.runOrchestrator({ now: at(T0 + 25 * HOUR) }));
+    assert.equal(s.results[0].errorKind, "redirect_changed");
+    assert.equal(source(SOURCE_A.id).lastContentHash, before);
+    assert.equal(snapshotPaths(SOURCE_A.id).length, 1);
   });
 
   test("a source that starts redirecting to a different document fails and its content is not ingested", async () => {
@@ -703,7 +758,7 @@ describe("guidance crawl: failing sources", () => {
     assert.equal(source(SOURCE_B.id).lastErrorKind, "content_type_changed");
   });
 
-  test("a Storage failure is a counted failure and the hash is not advanced", async () => {
+  test("a Storage failure is a run-level error, not a failure of the source", async () => {
     seed(SOURCE_A);
     const failing: SnapshotBucket = {
       file: () => ({
@@ -716,12 +771,54 @@ describe("guidance crawl: failing sources", () => {
     };
     const svc = new GuidanceCrawlService(new VisaCatalogFetchService({ http, minIntervalMs: 0 }), new GuidanceSnapshotStore(failing));
     svc.runTransaction = fakeRunTransaction as any;
-    const s = await quiet(() => svc.runOrchestrator({ now: at(T0) }));
+    // Even with a limit of 1, an outage on our side must not mark the source failing.
+    const s = await quiet(() => svc.runOrchestrator({ now: at(T0), failureLimit: 1 }));
+    assert.equal(s.results[0].outcome, "infra_error");
     assert.equal(s.results[0].errorKind, "storage_error");
+    assert.equal(s.failed, 0);
+    assert.equal(s.infraErrors, 1);
+    assert.equal(s.infrastructureErrors.length, 1);
+    assert.match(s.infrastructureErrors[0], /alpha-short-stay-rules: storage_error: Could not store the snapshot text: backend unavailable/);
+    assert.deepEqual(s.failing, []);
     const a = source(SOURCE_A.id);
     assert.equal(a.lastContentHash, null);
-    assert.equal(a.consecutiveFailures, 1);
+    assert.equal(a.consecutiveFailures, 0);
+    assert.equal(a.status, "active");
+    assert.equal(a.lastError, null);
+    // Not stamped as attempted: the next run tries again.
+    assert.equal(a.lastAttemptAt, null);
     assert.equal(snapshotPaths(SOURCE_A.id).length, 0);
+  });
+
+  test("a Firestore transaction failure is a run-level error, not a failure of the source", async () => {
+    seed(SOURCE_A, SOURCE_B);
+    const svc = makeService();
+    svc.runTransaction = (async () => {
+      throw new Error("deadline exceeded");
+    }) as any;
+    const s = await quiet(() => svc.runOrchestrator({ now: at(T0), failureLimit: 1 }));
+    assert.deepEqual(s.results.map((r) => `${r.outcome}:${r.errorKind}`), ["infra_error:firestore_error", "infra_error:firestore_error"]);
+    assert.equal(s.failed, 0);
+    assert.equal(s.infraErrors, 2);
+    assert.equal(s.infrastructureErrors.length, 2);
+    for (const id of [SOURCE_A.id, SOURCE_B.id]) {
+      assert.equal(source(id).consecutiveFailures, 0);
+      assert.equal(source(id).status, "active");
+      assert.equal(source(id).lastContentHash, null);
+    }
+  });
+
+  test("a source failure whose write-back fails is reported as a run-level error too", async () => {
+    delete routes[A_URL]; // 404: a real source failure
+    seed(SOURCE_A);
+    const svc = makeService();
+    svc.runTransaction = (async () => {
+      throw new Error("unavailable");
+    }) as any;
+    const s = await quiet(() => svc.runOrchestrator({ now: at(T0) }));
+    assert.equal(s.results[0].outcome, "failed");
+    assert.equal(s.results[0].errorKind, "http_error");
+    assert.match(s.infrastructureErrors[0], /firestore_error: could not record the failure: unavailable/);
   });
 
   test("paused and retired sources are never requested", async () => {
@@ -729,6 +826,147 @@ describe("guidance crawl: failing sources", () => {
     const s = await quiet(() => makeService().runOrchestrator({ now: at(T0), sourceIds: [SOURCE_A.id, SOURCE_B.id] }));
     assert.equal(s.skippedInactive, 2);
     assert.equal(calls.length, 0);
+  });
+});
+
+// ============================================
+// One clock; nothing throws out of the run
+// ============================================
+
+describe("guidance crawl: clock and robustness", () => {
+  /** A fetcher whose own clock reads `skewMs` away from the run's. */
+  function skewedService(skewMs: number): GuidanceCrawlService {
+    const real = new VisaCatalogFetchService({ http, minIntervalMs: 0 });
+    const svc = new GuidanceCrawlService(
+      { fetchAndClean: async (url, options) => ({ ...(await real.fetchAndClean(url, options)), fetchedAt: T0 + skewMs }) },
+      new GuidanceSnapshotStore(bucket)
+    );
+    svc.runTransaction = fakeRunTransaction as any;
+    return svc;
+  }
+
+  for (const [label, skew] of [["ten years ahead of", 10 * 366 * 24 * HOUR], ["ten years behind", -10 * 366 * 24 * HOUR]] as const) {
+    test(`the due check uses the run's clock only: a fetch clock ${label} the run changes nothing`, async () => {
+      seed(SOURCE_A);
+      const svc = skewedService(skew);
+      await quiet(() => svc.runOrchestrator({ now: at(T0) }));
+      const a = source(SOURCE_A.id);
+      // Registry stamps come from the run's `now`...
+      assert.equal(a.lastFetchedAt.toMillis(), T0);
+      assert.equal(a.lastAttemptAt.toMillis(), T0);
+      // ...and the fetch service's own reading is kept on the snapshot only.
+      const meta = store.get(`guidanceSources/${SOURCE_A.id}/snapshots/${a.lastContentHash}`) as Record<string, any>;
+      assert.equal(meta.fetchedAt.toMillis(), T0 + skew);
+      assert.equal(meta.createdAt.toMillis(), T0);
+
+      // 23h later: not due. 25h later: due. Whatever the fetch clock said.
+      assert.equal((await quiet(() => svc.runOrchestrator({ now: at(T0 + 23 * HOUR) }))).notDue, 1);
+      const due = await quiet(() => svc.runOrchestrator({ now: at(T0 + 25 * HOUR) }));
+      assert.equal(due.notDue, 0);
+      assert.equal(due.unchanged, 1);
+    });
+  }
+
+  test("only `verified` and `partial` are crawled: a missing or misspelt status is skipped and reported", async () => {
+    seed(SOURCE_A, SOURCE_B);
+    // Hand-edited docs: one misspelt, one with the field removed.
+    store.set(`guidanceSources/${SOURCE_A.id}`, { ...source(SOURCE_A.id), verificationStatus: "Verified " });
+    const { verificationStatus: _dropped, ...withoutStatus } = source(SOURCE_B.id);
+    store.set(`guidanceSources/${SOURCE_B.id}`, withoutStatus);
+
+    const s = await quiet(() => makeService().runOrchestrator({ now: at(T0), sourceIds: [SOURCE_A.id, SOURCE_B.id] }));
+    assert.deepEqual(s.skippedUnverified, [SOURCE_A.id, SOURCE_B.id]);
+    assert.equal(calls.length, 0, "nothing is requested");
+    assert.equal(objects.size, 0);
+    assert.equal(s.warnings.length, 2);
+    assert.match(s.warnings[0], /verificationStatus "Verified " is not a known value, treated as unverified/);
+    assert.match(s.warnings[1], /verificationStatus null is not a known value/);
+  });
+
+  test("an id that is not in the registry is reported", async () => {
+    seed(SOURCE_A);
+    const s = await quiet(() => makeService().runOrchestrator({ now: at(T0), sourceIds: [SOURCE_A.id, "no-such-source"] }));
+    assert.equal(s.changed, 1);
+    assert.deepEqual(s.warnings, ["source no-such-source: asked for by id but not in the registry"]);
+  });
+
+  test("a hand-edited doc with non-Timestamp dates does not throw out of the run", async () => {
+    seed(SOURCE_A, SOURCE_B);
+    store.set(`guidanceSources/${SOURCE_A.id}`, {
+      ...source(SOURCE_A.id),
+      lastFetchedAt: "2026-11-01",
+      lastAttemptAt: 12345,
+      backoffUntil: { seconds: 1 },
+    });
+    const s = await quiet(() => makeService().runOrchestrator({ now: at(T0) }));
+    // Unreadable dates count as "never": the source is simply crawled.
+    assert.deepEqual(s.results.map((r) => `${r.sourceId}:${r.outcome}`), [`${SOURCE_A.id}:changed`, `${SOURCE_B.id}:changed`]);
+    assert.ok(source(SOURCE_A.id).lastFetchedAt instanceof Timestamp);
+  });
+
+  test("a failed backoff write on a deferred source is reported, and the run carries on", async () => {
+    const second: GuidanceSourceSeed = { ...SOURCE_A, id: "alpha-second", url: `https://${A_HOST}/rules/transit` };
+    routes[A_URL] = { status: 429, body: "slow down", contentType: "text/plain", headers: { "retry-after": "7200" } };
+    seed(SOURCE_A, second, SOURCE_B);
+    // The registry as usual, except that a direct update on the deferred
+    // source's doc fails (the 429 source's own write goes through the
+    // transaction runner, which still works).
+    const firebase: any = await import("../../../src/utils/firebase");
+    const real = fakeCollection("guidanceSources");
+    firebase.collections.guidanceSources = {
+      doc: (id: string) => real.doc(id),
+      get: async () => {
+        const snap = await real.get();
+        for (const d of snap.docs) {
+          if (d.id === second.id) {
+            d.ref = {
+              ...d.ref,
+              update: async () => {
+                throw new Error("permission lost");
+              },
+            };
+          }
+        }
+        return snap;
+      },
+    };
+    try {
+      const s = await quiet(() => makeService().runOrchestrator({ now: at(T0) }));
+      assert.deepEqual(s.results.map((r) => `${r.sourceId}:${r.outcome}`), [
+        `${SOURCE_A.id}:failed`,
+        `${second.id}:deferred`,
+        `${SOURCE_B.id}:changed`,
+      ]);
+      assert.equal(s.infrastructureErrors.length, 1);
+      assert.match(s.infrastructureErrors[0], /alpha-second: firestore_error: could not store the host backoff: permission lost/);
+    } finally {
+      firebase.collections.guidanceSources = real;
+    }
+  });
+
+  test("an unexpected error on one source becomes a warning and the next source is still crawled", async () => {
+    seed(SOURCE_A, SOURCE_B);
+    const firebase: any = await import("../../../src/utils/firebase");
+    const real = fakeCollection("guidanceSources");
+    firebase.collections.guidanceSources = {
+      doc: (id: string) => real.doc(id),
+      get: async () => {
+        const snap = await real.get();
+        // The first doc cannot even be read.
+        snap.docs[0].data = () => {
+          throw new Error("corrupt document");
+        };
+        return snap;
+      },
+    };
+    try {
+      const s = await quiet(() => makeService().runOrchestrator({ now: at(T0) }));
+      assert.match(s.warnings[0], /alpha-short-stay-rules: skipped after an unexpected error: corrupt document/);
+      assert.equal(s.changed, 1);
+      assert.equal(s.results[0].sourceId, SOURCE_B.id);
+    } finally {
+      firebase.collections.guidanceSources = real;
+    }
   });
 });
 
@@ -741,6 +979,11 @@ describe("guidance crawl: helpers", () => {
     assert.ok(sameDocumentUrl("https://Docs.Example.org/a/b/", "https://docs.example.org/a/b#part-2"));
     assert.ok(!sameDocumentUrl("https://docs.example.org/a/b", "https://docs.example.org/a/c"));
     assert.ok(!sameDocumentUrl("https://docs.example.org/a?v=1", "https://docs.example.org/a?v=2"));
+    // Different documents: another host (www or not), another scheme, path case.
+    assert.ok(!sameDocumentUrl("https://docs.example.org/a", "https://www.docs.example.org/a"));
+    assert.ok(!sameDocumentUrl("https://docs.example.org/a", "http://docs.example.org/a"));
+    assert.ok(!sameDocumentUrl("https://docs.example.org/a", "https://docs.example.org/A"));
+    assert.ok(sameDocumentUrl("https://docs.example.org", "https://docs.example.org/"));
   });
 
   test("failureKindOf classifies fetch errors", () => {

@@ -1,5 +1,7 @@
 import { createHash } from "crypto";
 import { storage } from "../../utils/firebase";
+// The separator the fetch service joins a PDF's pages with (a form feed).
+import { PDF_PAGE_SEPARATOR } from "../shared/fetch/pdf-text";
 import {
   GUIDANCE_SNAPSHOT_SCHEMA_VERSION,
   type GuidanceDocType,
@@ -209,7 +211,8 @@ export class GuidanceSnapshotStore {
   /**
    * Read a snapshot's stored object. BACKEND USE ONLY (quote validation): do
    * not return the result from an API route. The text is re-hashed and must
-   * match the key, so a corrupted or swapped object is refused, not trusted.
+   * match the key, and a PDF's pages must join back into that text, so a
+   * corrupted or swapped object is refused, not trusted.
    */
   async read(sourceId: string, contentHash: string): Promise<GuidanceSnapshotContent> {
     const storagePath = guidanceSnapshotPath(sourceId, contentHash);
@@ -217,6 +220,21 @@ export class GuidanceSnapshotStore {
     const content = JSON.parse(bytes.toString("utf8")) as GuidanceSnapshotContent;
     if (typeof content?.text !== "string" || sha256Hex(content.text) !== contentHash) {
       throw new Error(`Guidance snapshot ${storagePath} does not match its content hash`);
+    }
+    // A PDF's pages are what a citation's page number is read from, but only
+    // `text` is covered by the hash. So the pages must reproduce the text
+    // exactly (joined with the page separator) and be numbered 1..n in
+    // order; otherwise a quote could be found in `text` and attributed to
+    // the wrong page. Refused loudly, never repaired.
+    if (content.pages !== null && content.pages !== undefined) {
+      const pages = content.pages;
+      const wellFormed =
+        Array.isArray(pages) && pages.every((p, i) => p && p.page === i + 1 && typeof p.text === "string");
+      if (!wellFormed || pages.map((p) => p.text).join(PDF_PAGE_SEPARATOR) !== content.text) {
+        throw new Error(`Guidance snapshot ${storagePath}: its pages do not match its text`);
+      }
+    } else if (content.docType === "pdf") {
+      throw new Error(`Guidance snapshot ${storagePath}: a PDF snapshot without pages`);
     }
     return content;
   }

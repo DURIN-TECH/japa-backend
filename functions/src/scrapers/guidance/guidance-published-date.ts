@@ -12,9 +12,23 @@
 // `publishedDateSelector`, a regular expression applied to the document's
 // cleaned text whose first capture group is the date as written. Nothing here
 // knows any publisher's wording. Pure functions, no I/O.
+//
+// A selector is data too, so its cost is bounded twice: it only ever runs
+// over a window of the text (the head and the tail), and the seed validator
+// refuses the pattern shapes that backtrack badly.
 
 /** Longest selector accepted (a guard against a runaway pattern in the data). */
 export const MAX_PUBLISHED_DATE_SELECTOR_CHARS = 300;
+
+/**
+ * How much of a document the selector is run over: the first and the last
+ * this-many characters (a publisher's date sits in the header or the footer,
+ * not on page 40). Bounding the input bounds the pattern's run time: a
+ * selector is data, a guidance document can be a million characters, and a
+ * careless pattern over all of it could hold a crawl for minutes. A date
+ * outside the window is simply "no published date".
+ */
+export const DEFAULT_PUBLISHED_DATE_WINDOW_CHARS = 20_000;
 
 /** Longest date text kept from a match (a date is short; anything longer is a bad selector). */
 export const MAX_PUBLISHED_DATE_TEXT_CHARS = 80;
@@ -63,6 +77,26 @@ export function publishedDateSelectorProblem(selector: string): string | undefin
   // many groups it declares.
   const groups = (new RegExp(`${re.source}|`).exec("")?.length ?? 1) - 1;
   if (groups < 1) return "publishedDateSelector needs a capture group around the date";
+
+  // ---- Run-time guards (with the search window, see extractPublishedDate) ----
+  // Two shapes make a pattern slow on text it does not match, and neither is
+  // needed to find a date. They are refused here, at seeding time. The checks
+  // are textual and err on the side of refusing: write the lead-in words
+  // literally and keep quantifiers out of repeated groups.
+  //
+  // 1. An unanchored greedy wildcard at the very start (`.*Updated`,
+  //    `(.+)Updated`, `[\s\S]*Updated`): the engine retries it from every
+  //    position, which is quadratic in the text. The pattern is already
+  //    searched for anywhere in the text, so a leading wildcard adds nothing.
+  if (/^(?:\((?:\?[:=!]|\?<[^>]*>)?)*(?:\.|\[\\s\\S\]|\[\\S\\s\]|\[\^\])[*+]/.test(selector)) {
+    return "publishedDateSelector must not start with an unanchored wildcard such as .* or .+";
+  }
+  // 2. A nested quantifier: a group that contains a quantifier and is itself
+  //    repeated, e.g. `(\d+)+`, `(a*)*`, `(?:\s+\w+)*`. That is the classic
+  //    exponential-backtracking shape.
+  if (/\([^()]*(?:[*+]|\{\d+,\d*\})[^()]*\)(?:[*+]|\{\d+,\d*\})/.test(selector)) {
+    return "publishedDateSelector must not repeat a group that itself contains a quantifier (nested quantifiers)";
+  }
   return undefined;
 }
 
@@ -118,16 +152,34 @@ export function parsePublishedDate(text: string): string | null {
 /**
  * Find the publisher's date in a document's cleaned text.
  *
- * @param cleanText the document's cleaned text (for a PDF: all pages)
- * @param selector  the registry entry's `publishedDateSelector`, if any
+ * The selector is run over a bounded window only: the first `windowChars`
+ * characters, then (if there was no match and the text is longer) the last
+ * `windowChars`. The two never overlap. A date that sits outside both is not
+ * found, which is reported the same as a document that gives no date.
+ *
+ * @param cleanText   the document's cleaned text (for a PDF: all pages)
+ * @param selector    the registry entry's `publishedDateSelector`, if any
+ * @param windowChars size of each search window, in characters
+ *   (default DEFAULT_PUBLISHED_DATE_WINDOW_CHARS)
  * @returns the date found, or null when the entry has no selector, the
- *   selector is unusable, or it does not match. Never throws: a missing date
- *   must not fail a crawl.
+ *   selector is unusable (including the run-time guards the seed validator
+ *   applies), or it does not match in the window. Never throws: a missing
+ *   date must not fail a crawl.
  */
-export function extractPublishedDate(cleanText: string, selector: string | undefined | null): PublishedDate | null {
+export function extractPublishedDate(
+  cleanText: string,
+  selector: string | undefined | null,
+  windowChars: number = DEFAULT_PUBLISHED_DATE_WINDOW_CHARS
+): PublishedDate | null {
   if (!selector || publishedDateSelectorProblem(selector)) return null;
+  const size = Number.isFinite(windowChars) && windowChars > 0 ? Math.floor(windowChars) : DEFAULT_PUBLISHED_DATE_WINDOW_CHARS;
   // Case-insensitive: publishers vary the capitalisation of the lead-in.
-  const match = new RegExp(selector, "i").exec(cleanText);
+  const re = new RegExp(selector, "i");
+  // Head first; the tail starts where the head ended at the earliest, so a
+  // short document is searched once and no character twice.
+  const head = cleanText.slice(0, size);
+  const tail = cleanText.length > size ? cleanText.slice(Math.max(size, cleanText.length - size)) : "";
+  const match = re.exec(head) ?? (tail ? re.exec(tail) : null);
   const raw = match?.[1];
   if (!raw) return null;
   const publishedDateText = raw.trim().replace(/\s+/g, " ").slice(0, MAX_PUBLISHED_DATE_TEXT_CHARS);

@@ -36,6 +36,8 @@ import type { GuidanceSnapshotMeta, GuidanceSource, GuidanceSourceStatus } from 
 //  - throw out of `runOrchestrator` because one source failed: a failure is
 //    counted on that source, and after N in a row the source becomes
 //    `failing` and is reported;
+//  - blame a source for OUR outage: a Cloud Storage or Firestore error is a
+//    run-level `infrastructureErrors` line and never moves a failure streak;
 //  - branch on a jurisdiction, route or publisher: a source is data;
 //  - send anything to a model, or log document text. A fetched document is
 //    untrusted data; this module only stores and hashes it.
@@ -66,8 +68,12 @@ export type GuidanceFailureKind =
   | "host_backoff" // the host answered 429/503
   | "pdf_unreadable" // a PDF the reader refused (encrypted, scanned, too big, ...)
   | "text_too_long" // a web page over GUIDANCE_MAX_HTML_TEXT_CHARS
-  | "storage_error" // the snapshot text could not be stored
+  | "storage_error" // the snapshot text could not be stored (OUR side)
+  | "firestore_error" // a registry / snapshot write failed (OUR side)
   | "fetch_error"; // anything else (network, timeout, too little content)
+
+/** The kinds that are our infrastructure's fault, not the source's. */
+export type GuidanceInfraErrorKind = Extract<GuidanceFailureKind, "storage_error" | "firestore_error">;
 
 /** A crawl failure this module raises itself (the rest come from the fetcher). */
 export class GuidanceCrawlError extends Error {
@@ -77,11 +83,26 @@ export class GuidanceCrawlError extends Error {
   }
 }
 
+/**
+ * An INFRASTRUCTURE error while handling a source: Cloud Storage or Firestore
+ * failed on our side. It says nothing about the source, so it is NOT counted
+ * toward the source's failure streak (a Storage outage must not turn every
+ * source `failing`); it is recorded on the run (`infrastructureErrors`) and
+ * the source is simply tried again on the next run.
+ */
+export class GuidanceInfraError extends Error {
+  constructor(readonly kind: GuidanceInfraErrorKind, message: string) {
+    super(message);
+    this.name = "GuidanceInfraError";
+  }
+}
+
 /** What happened to one source in a run. */
 export type GuidanceSourceOutcome =
   | "changed" // new content: a snapshot was recorded
   | "unchanged" // same hash: nothing written but the fetch time
-  | "failed" // the fetch (or store) failed; counted on the source
+  | "failed" // the fetch failed; counted on the source
+  | "infra_error" // Storage / Firestore failed on our side; NOT counted on the source
   | "deferred" // its host is backing off; not requested
   | "skipped_unverified" // verificationStatus "unverified": never fetched
   | "skipped_inactive" // paused / retired, or failing and not asked for by id
@@ -93,7 +114,7 @@ export interface GuidanceSourceResult {
   outcome: GuidanceSourceOutcome;
   // Present for changed / unchanged.
   contentHash?: string;
-  // Present for failed / deferred.
+  // Present for failed / deferred / infra_error.
   error?: string;
   errorKind?: GuidanceFailureKind;
   // Status after this run (changed / unchanged / failed).
@@ -115,6 +136,8 @@ export interface GuidanceCrawlSummary {
   unchanged: number;
   changed: number;
   failed: number;
+  // Sources not completed because Storage / Firestore failed on our side.
+  infraErrors: number;
   deferred: number;
   notDue: number;
   skippedInactive: number;
@@ -127,7 +150,11 @@ export interface GuidanceCrawlSummary {
   // Ids that became `failing` in this run, and ids that are failing after it.
   newlyFailing: string[];
   failing: string[];
-  // Non-fatal problems (a listener that threw, an unreadable registry entry).
+  // Run-level errors: Storage / Firestore failures, one line each. These
+  // never touch a source's failure streak.
+  infrastructureErrors: string[];
+  // Non-fatal problems (a listener that threw, an unreadable registry entry,
+  // an id asked for that is not in the registry).
   warnings: string[];
   results: GuidanceSourceResult[];
 }
@@ -157,8 +184,14 @@ export interface GuidanceCrawlOptions {
 }
 
 /**
- * Compare two URLs as documents: fragment ignored, a trailing slash on the
- * path ignored, host case-insensitive. Unparseable input compares as text.
+ * Compare two URLs as documents. "Same" means, after parsing both:
+ *  - same scheme, same host (case-insensitive) and same port;
+ *  - same path, ignoring trailing slashes (`/a/b/` = `/a/b`); the path itself
+ *    is case-SENSITIVE, as paths are;
+ *  - same query string, character for character (`?v=1` is not `?v=2`);
+ *  - the fragment (`#part-2`) is ignored: it never reaches the server.
+ * Anything else is a different document: another host (including `www.` vs
+ * none), http vs https, another path. Unparseable input compares as text.
  */
 export function sameDocumentUrl(a: string, b: string): boolean {
   const norm = (raw: string): string => {
@@ -176,7 +209,7 @@ export function sameDocumentUrl(a: string, b: string): boolean {
 
 /** Classify a thrown error into a failure kind. */
 export function failureKindOf(err: unknown): GuidanceFailureKind {
-  if (err instanceof GuidanceCrawlError) return err.kind;
+  if (err instanceof GuidanceCrawlError || err instanceof GuidanceInfraError) return err.kind;
   if (isHostBackoffError(err)) return "host_backoff";
   if (isPdfFetchError(err)) {
     // "not-accepted" = the registry says web page but the URL served a PDF.
@@ -193,6 +226,23 @@ export function failureKindOf(err: unknown): GuidanceFailureKind {
 const toSharedStatus = (s: string | undefined): string | undefined => (s === "failing" ? "broken" : s);
 const fromSharedStatus = (s: string): GuidanceSourceStatus => (s === "broken" ? "failing" : (s as GuidanceSourceStatus));
 
+/** Verification statuses the crawl will fetch. Anything else is skipped. */
+const CRAWLABLE_VERIFICATION_STATUSES: readonly string[] = ["verified", "partial"];
+
+/**
+ * Epoch ms of a stored Timestamp field, or 0 when it is absent or is not a
+ * Timestamp (a hand-edited doc may hold a string or a number there; that
+ * must not throw out of the run).
+ */
+function millisOf(value: unknown): number {
+  const ts = value as { toMillis?: unknown } | null | undefined;
+  if (ts && typeof ts.toMillis === "function") {
+    const ms = Number((ts as { toMillis: () => number }).toMillis());
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  return 0;
+}
+
 /** A blank summary. */
 function emptySummary(): GuidanceCrawlSummary {
   return {
@@ -201,6 +251,7 @@ function emptySummary(): GuidanceCrawlSummary {
     unchanged: 0,
     changed: 0,
     failed: 0,
+    infraErrors: 0,
     deferred: 0,
     notDue: 0,
     skippedInactive: 0,
@@ -210,6 +261,7 @@ function emptySummary(): GuidanceCrawlSummary {
     skippedUnverified: [],
     newlyFailing: [],
     failing: [],
+    infrastructureErrors: [],
     warnings: [],
     results: [],
   };
@@ -259,85 +311,34 @@ export class GuidanceCrawlService {
     const snap = await collections.guidanceSources.get();
     const docs = snap.docs.filter((d) => !explicit || explicit.has(d.id));
 
+    // An id asked for that is not in the registry is a typo or a stale
+    // script: say so rather than report a clean run that did nothing.
+    if (explicit) {
+      const known = new Set(snap.docs.map((d) => d.id));
+      for (const id of explicit) {
+        if (!known.has(id)) summary.warnings.push(`source ${id}: asked for by id but not in the registry`);
+      }
+    }
+
     // Hosts that answered 429/503 in THIS run: not requested again in it.
     const hostState = new HostBackoffTracker(nowMs);
 
     for (const doc of docs) {
       summary.sourcesConsidered++;
-      const source = doc.data() as GuidanceSource;
-      const sourceId = doc.id;
-
-      // ---- Selection: every "no" is counted, and the first one reported ----
-
-      // A malformed entry (hand-edited doc) is reported, never requested.
-      if (!GUIDANCE_SOURCE_ID_RE.test(sourceId) || typeof source.url !== "string" || !source.url) {
-        summary.warnings.push(`source ${sourceId}: not a valid registry entry, skipped`);
-        summary.skippedInactive++;
-        summary.results.push({ sourceId, outcome: "skipped_inactive" });
-        continue;
-      }
-      // Unverified: skipped and reported, whatever else is true of it, and
-      // even when asked for by id.
-      if (source.verificationStatus === "unverified") {
-        summary.skippedUnverified.push(sourceId);
-        summary.results.push({ sourceId, outcome: "skipped_unverified" });
-        continue;
-      }
-      // Paused / retired: never crawled. Failing: only when asked for by id.
-      const status = source.status ?? "active";
-      if (status === "paused" || status === "retired" || (status === "failing" && !explicit)) {
-        summary.skippedInactive++;
-        if (status === "failing") summary.failing.push(sourceId);
-        summary.results.push({ sourceId, outcome: "skipped_inactive", status });
-        continue;
-      }
-      // Due: one attempt per `checkIntervalHours`, counted from the last
-      // attempt (successful or not) so a broken source is not retried on
-      // every tick. Skipped for an explicit run.
-      if (!explicit) {
-        const lastMs = Math.max(source.lastFetchedAt?.toMillis() ?? 0, source.lastAttemptAt?.toMillis() ?? 0);
-        const intervalMs = Math.max(1, Number(source.checkIntervalHours) || 24) * 60 * 60 * 1000;
-        if (lastMs > 0 && nowMs < lastMs + intervalMs) {
-          summary.notDue++;
-          summary.results.push({ sourceId, outcome: "not_due" });
-          continue;
-        }
-      }
-      // Host backing off: a stored `backoffUntil` from an earlier run, or a
-      // 429/503 another source on the same host got a moment ago.
-      const host = hostOf(source.url);
-      const storedBackoffMs = source.backoffUntil?.toMillis() ?? 0;
-      const fresh = hostState.blocking(host);
-      if (storedBackoffMs > nowMs || fresh) {
-        const untilMs = Math.max(storedBackoffMs, fresh?.untilMs ?? 0);
-        const error = fresh ? backoffMessage(fresh) : `host backed off, retry after ${new Date(untilMs).toISOString()}`;
-        // Remember the fresh backoff on this source too, so the next run
-        // waits as well. Not a failure: nothing was requested.
-        if (fresh && untilMs > storedBackoffMs) {
-          await doc.ref.update({ backoffUntil: Timestamp.fromMillis(untilMs), updatedAt: now });
-        }
-        summary.deferred++;
-        summary.results.push({ sourceId, outcome: "deferred", error, errorKind: "host_backoff" });
-        continue;
-      }
-
-      // ---- Crawl ----
+      // Safety net: whatever goes wrong while handling ONE source (a
+      // hand-edited doc with a field of the wrong type, a write that fails)
+      // becomes a line in the summary; the run goes on to the next source.
       try {
-        await this.crawlSource(sourceId, source, { now, failureLimit, summary, onChanged: opts.onChanged });
+        await this.processSource(doc, { now, failureLimit, summary, explicit: !!explicit, hostState, onChanged: opts.onChanged });
       } catch (err) {
-        // A 429/503: stop requesting this host for the rest of the run.
-        if (isHostBackoffError(err)) {
-          hostState.record(err.toEntry(nowMs));
-          // A cross-host redirect: block the host we asked as well.
-          if (err.requestedHost !== err.host) hostState.record({ ...err.toEntry(nowMs), host: err.requestedHost });
-        }
-        await this.recordFailure(sourceId, err, { now, failureLimit, summary });
+        summary.warnings.push(`source ${doc.id}: skipped after an unexpected error: ${describeError(err).slice(0, MAX_STORED_ERROR_CHARS)}`);
       }
     }
 
     console.log(
       `Guidance crawl: ${summary.sourcesConsidered} source(s), ${summary.changed} changed, ` +
-        `${summary.unchanged} unchanged, ${summary.failed} failed, ${summary.deferred} deferred, ` +
+        `${summary.unchanged} unchanged, ${summary.failed} failed, ${summary.infraErrors} infrastructure error(s), ` +
+        `${summary.deferred} deferred, ` +
         `${summary.skippedUnverified.length} unverified skipped`
     );
     if (summary.skippedUnverified.length > 0) {
@@ -350,8 +351,144 @@ export class GuidanceCrawlService {
   }
 
   /**
-   * Fetch one source and record the result. Throws on any failure (the
-   * caller counts it); returns normally for changed and unchanged.
+   * Decide whether one registry entry is crawled in this run and, if so,
+   * crawl it and record the outcome. Every "no" is counted and reported.
+   */
+  private async processSource(
+    doc: { id: string; data(): unknown; ref: { update(data: Record<string, unknown>): Promise<unknown> } },
+    ctx: {
+      now: Timestamp;
+      failureLimit: number;
+      summary: GuidanceCrawlSummary;
+      // True when the run named its sources (`sourceIds`).
+      explicit: boolean;
+      hostState: HostBackoffTracker;
+      onChanged?: GuidanceCrawlOptions["onChanged"];
+    }
+  ): Promise<void> {
+    const { now, failureLimit, summary, explicit, hostState } = ctx;
+    const nowMs = now.toMillis();
+    const source = (doc.data() ?? {}) as GuidanceSource;
+    const sourceId = doc.id;
+
+    // A malformed entry (hand-edited doc) is reported, never requested.
+    if (!GUIDANCE_SOURCE_ID_RE.test(sourceId) || typeof source.url !== "string" || !source.url) {
+      summary.warnings.push(`source ${sourceId}: not a valid registry entry, skipped`);
+      summary.skippedInactive++;
+      summary.results.push({ sourceId, outcome: "skipped_inactive" });
+      return;
+    }
+    // Verification: ONLY a source marked exactly `verified` or `partial` is
+    // fetched. `unverified` is skipped and reported, and so is anything else
+    // (a missing or misspelt value): the admin list shows such an entry as
+    // "unverified", and the crawl must not treat it as better than that.
+    // This holds even when the source is asked for by id.
+    if (!CRAWLABLE_VERIFICATION_STATUSES.includes(source.verificationStatus as string)) {
+      if (source.verificationStatus !== "unverified") {
+        summary.warnings.push(
+          `source ${sourceId}: verificationStatus ${JSON.stringify(source.verificationStatus ?? null)} is not a known value, treated as unverified`
+        );
+      }
+      summary.skippedUnverified.push(sourceId);
+      summary.results.push({ sourceId, outcome: "skipped_unverified" });
+      return;
+    }
+    // Paused / retired: never crawled. Failing: only when asked for by id.
+    const status = source.status ?? "active";
+    if (status === "paused" || status === "retired" || (status === "failing" && !explicit)) {
+      summary.skippedInactive++;
+      if (status === "failing") summary.failing.push(sourceId);
+      summary.results.push({ sourceId, outcome: "skipped_inactive", status });
+      return;
+    }
+    // Due: one attempt per `checkIntervalHours`, counted from the last
+    // attempt (successful or not) so a broken source is not retried on
+    // every tick. Skipped for an explicit run. Both stamps are written from
+    // the RUN's clock (`now`), the same clock compared against here.
+    if (!explicit) {
+      const lastMs = Math.max(millisOf(source.lastFetchedAt), millisOf(source.lastAttemptAt));
+      const intervalMs = Math.max(1, Number(source.checkIntervalHours) || 24) * 60 * 60 * 1000;
+      if (lastMs > 0 && nowMs < lastMs + intervalMs) {
+        summary.notDue++;
+        summary.results.push({ sourceId, outcome: "not_due" });
+        return;
+      }
+    }
+    // Host backing off: a stored `backoffUntil` from an earlier run, or a
+    // 429/503 another source on the same host got a moment ago.
+    const host = hostOf(source.url);
+    const storedBackoffMs = millisOf(source.backoffUntil);
+    const fresh = hostState.blocking(host);
+    if (storedBackoffMs > nowMs || fresh) {
+      const untilMs = Math.max(storedBackoffMs, fresh?.untilMs ?? 0);
+      const error = fresh ? backoffMessage(fresh) : `host backed off, retry after ${new Date(untilMs).toISOString()}`;
+      // Remember the fresh backoff on this source too, so the next run
+      // waits as well. Not a failure: nothing was requested. If the write
+      // fails the source is still deferred for this run; only the reminder
+      // for the next run is lost, which is reported.
+      if (fresh && untilMs > storedBackoffMs) {
+        try {
+          await doc.ref.update({ backoffUntil: Timestamp.fromMillis(untilMs), updatedAt: now });
+        } catch (err) {
+          this.noteInfraError(summary, sourceId, "firestore_error", `could not store the host backoff: ${describeError(err)}`);
+        }
+      }
+      summary.deferred++;
+      summary.results.push({ sourceId, outcome: "deferred", error, errorKind: "host_backoff" });
+      return;
+    }
+
+    // ---- Crawl ----
+    try {
+      await this.crawlSource(sourceId, source, { now, failureLimit, summary, onChanged: ctx.onChanged });
+    } catch (err) {
+      // Our own infrastructure failed: a run-level error, not the source's
+      // fault. The source doc is left exactly as it was (no streak, no
+      // attempt stamp), so the next run tries it again.
+      if (err instanceof GuidanceInfraError) {
+        const error = this.noteInfraError(summary, sourceId, err.kind, err.message);
+        summary.infraErrors++;
+        summary.results.push({ sourceId, outcome: "infra_error", error, errorKind: err.kind });
+        return;
+      }
+      // A 429/503: stop requesting this host for the rest of the run.
+      if (isHostBackoffError(err)) {
+        hostState.record(err.toEntry(nowMs));
+        // A cross-host redirect: block the host we asked as well.
+        if (err.requestedHost !== err.host) hostState.record({ ...err.toEntry(nowMs), host: err.requestedHost });
+      }
+      await this.recordFailure(sourceId, err, { now, failureLimit, summary });
+    }
+  }
+
+  /**
+   * Record a run-level infrastructure error (and log it). Returns the
+   * bounded, redacted message that was recorded.
+   */
+  private noteInfraError(summary: GuidanceCrawlSummary, sourceId: string, kind: GuidanceInfraErrorKind, message: string): string {
+    const error = message.slice(0, MAX_STORED_ERROR_CHARS);
+    summary.infrastructureErrors.push(`source ${sourceId}: ${kind}: ${error}`);
+    console.error(`Guidance crawl: infrastructure error on source ${sourceId} (${kind}): ${error}`);
+    return error;
+  }
+
+  /**
+   * Run a Firestore transaction; a failure becomes a GuidanceInfraError so it
+   * is reported on the run and never counted against the source.
+   */
+  private async inTransaction<T>(what: string, fn: (tx: Transaction) => Promise<T>): Promise<T> {
+    try {
+      return await this.runTransaction(fn);
+    } catch (err) {
+      throw new GuidanceInfraError("firestore_error", `Could not ${what}: ${describeError(err)}`);
+    }
+  }
+
+  /**
+   * Fetch one source and record the result. Throws on any failure: a
+   * GuidanceInfraError when Storage / Firestore failed on our side, anything
+   * else when the SOURCE failed (the caller counts only the latter on the
+   * source). Returns normally for changed and unchanged.
    */
   private async crawlSource(
     sourceId: string,
@@ -381,24 +518,36 @@ export class GuidanceCrawlService {
       );
     }
 
-    // 3. It must still be the same document. A redirect in itself is fine
-    //    (both URLs are recorded); a redirect to somewhere NEW is not: the
-    //    text behind it may be another document entirely, so it is not
-    //    ingested until a human re-checks the entry.
-    const baseline = source.expectedFinalUrl || source.finalUrl;
-    if (baseline && !sameDocumentUrl(baseline, page.finalUrl)) {
+    // 3. It must be the document the registry names. The request has to
+    //    end at a KNOWN address, from the very first fetch (no trust on
+    //    first use: otherwise whatever a URL happened to redirect to on day
+    //    one would be snapshotted and become the trusted baseline):
+    //      - the seed's `expectedFinalUrl`, for a source known to redirect;
+    //      - else the final URL of the last good fetch;
+    //      - else (first fetch, or after a re-seed changed `url`) the
+    //        requested `url` itself.
+    //    A redirect anywhere else fails with `redirect_changed` and nothing
+    //    is ingested until a human re-checks the entry and declares the
+    //    target. Both URLs are always recorded. See sameDocumentUrl() for
+    //    what counts as the same address.
+    const baseline = source.expectedFinalUrl || source.finalUrl || source.url;
+    if (!sameDocumentUrl(baseline, page.finalUrl)) {
       throw new GuidanceCrawlError(
         "redirect_changed",
-        `Redirect target changed for ${source.url}: expected ${baseline}, got ${page.finalUrl}`
+        `Unexpected redirect for ${source.url}: expected to end at ${baseline}, got ${page.finalUrl}` +
+          (source.expectedFinalUrl ? "" : " (declare expectedFinalUrl in the seed if this redirect is intended)")
       );
     }
     summary.sourcesFetched++;
 
     const sourceRef = collections.guidanceSources.doc(sourceId);
-    const fetchedAt = Timestamp.fromMillis(page.fetchedAt);
     // Fields every successful fetch writes: the streak resets, errors clear.
+    // ONE clock: `lastFetchedAt` and `lastAttemptAt` are both the run's
+    // `now`, the value the due check compares against. The fetch service's
+    // own wall-clock reading (`page.fetchedAt`) is kept only on the snapshot
+    // (metadata and stored object), as the record of when the bytes arrived.
     const success = {
-      lastFetchedAt: fetchedAt,
+      lastFetchedAt: now,
       lastAttemptAt: now,
       finalUrl: page.finalUrl,
       lastError: null,
@@ -410,7 +559,7 @@ export class GuidanceCrawlService {
 
     // 4. Hash gate. Same hash as last time = nothing downstream to do.
     if (page.contentHash === source.lastContentHash) {
-      const health = await this.runTransaction(async (tx) => {
+      const health = await this.inTransaction("stamp the fetch on the source", async (tx) => {
         const fresh = await tx.get(sourceRef);
         if (!fresh.exists) return undefined; // deleted mid-run: nothing to stamp
         const h = this.health(fresh.data() as GuidanceSource, "success", { now, limit: ctx.failureLimit });
@@ -443,11 +592,11 @@ export class GuidanceCrawlService {
         pages: page.pdf?.pages,
       });
     } catch (err) {
-      throw new GuidanceCrawlError("storage_error", `Could not store the snapshot text: ${describeError(err)}`);
+      throw new GuidanceInfraError("storage_error", `Could not store the snapshot text: ${describeError(err)}`);
     }
     // The store hashes the text itself; it must agree with the fetch service.
     if (written.contentHash !== page.contentHash) {
-      throw new GuidanceCrawlError("storage_error", "Snapshot hash does not match the fetched content hash");
+      throw new GuidanceInfraError("storage_error", "Snapshot hash does not match the fetched content hash");
     }
     if (written.created) summary.storageObjectsWritten++;
 
@@ -459,7 +608,8 @@ export class GuidanceCrawlService {
       url: source.url,
       finalUrl: page.finalUrl,
       httpStatus: page.httpStatus,
-      fetchedAt,
+      // When the bytes arrived, by the fetch service's clock (see above).
+      fetchedAt: Timestamp.fromMillis(page.fetchedAt),
       publishedDate: published?.publishedDate ?? null,
       publishedDateText: published?.publishedDateText ?? null,
       pageCount: page.pdf ? page.pdf.pageCount : null,
@@ -473,11 +623,18 @@ export class GuidanceCrawlService {
     };
 
     // 6. Snapshot doc + source update in ONE transaction: the source never
-    //    points at a snapshot that does not exist. The snapshot is created
-    //    only if absent (content that returns to an earlier version reuses
-    //    that version's snapshot untouched).
+    //    points at a snapshot that does not exist.
+    //
+    //    REVERTED CONTENT: a snapshot is created only if absent. When a
+    //    document goes A -> B -> A, the third fetch hashes to A again, whose
+    //    snapshot (doc and Storage object) already exists: it is REUSED
+    //    untouched, with its original `fetchedAt` and `previousContentHash`.
+    //    The move back is still recorded on the source (`lastContentHash`,
+    //    `latestSnapshotId` -> A, `lastChangedAt` -> now) and the listener
+    //    is still told (previousContentHash = B). So there is one snapshot
+    //    per distinct text, not one per change.
     const metaRef = subcollections.guidanceSnapshots(sourceId).doc(page.contentHash);
-    const committed = await this.runTransaction(async (tx) => {
+    const committed = await this.inTransaction("record the snapshot", async (tx) => {
       const fresh = await tx.get(sourceRef);
       if (!fresh.exists) return undefined; // deleted mid-run
       const existing = await tx.get(metaRef);
@@ -520,8 +677,8 @@ export class GuidanceCrawlService {
 
   /**
    * Count a failed crawl on the source: streak + 1, the error recorded, and
-   * `failing` once the streak reaches the limit. Never throws (a source whose
-   * failure cannot even be recorded becomes a warning).
+   * `failing` once the streak reaches the limit. Never throws (a failure
+   * that cannot even be recorded becomes a run-level infrastructure error).
    */
   private async recordFailure(
     sourceId: string,
@@ -556,7 +713,7 @@ export class GuidanceCrawlService {
         return h;
       });
     } catch (writeErr) {
-      summary.warnings.push(`source ${sourceId}: could not record the failure: ${describeError(writeErr).slice(0, MAX_STORED_ERROR_CHARS)}`);
+      this.noteInfraError(summary, sourceId, "firestore_error", `could not record the failure: ${describeError(writeErr)}`);
     }
 
     const status = health ? fromSharedStatus(health.status) : undefined;

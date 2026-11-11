@@ -28,6 +28,7 @@ import {
   validateGuidanceSourceSeeds,
 } from "../../../src/scrapers/guidance/data/seed-guidance-sources";
 import {
+  DEFAULT_PUBLISHED_DATE_WINDOW_CHARS,
   extractPublishedDate,
   parsePublishedDate,
   publishedDateSelectorProblem,
@@ -134,6 +135,10 @@ describe("guidance seed: validation", () => {
     assert.equal(bad({ status: "failing" as never }).length, 1);
     assert.equal(bad({ publishedDateSelector: "no capture group" }).length, 1);
     assert.equal(bad({ publishedDateSelector: "(unclosed" }).length, 1);
+    // Patterns that backtrack badly are refused at seeding time.
+    for (const slow of [".*Updated (\\d+)", "(.+)Updated (\\d+)", "[\\s\\S]*Updated (\\d+)", "Updated (\\d+)+", "Updated (?:\\s+\\w+)* (\\d+)"]) {
+      assert.equal(bad({ publishedDateSelector: slow }).length, 1, slow);
+    }
     assert.equal(bad({ expectedFinalUrl: "ftp://x.example/a" }).length, 1);
   });
 
@@ -256,6 +261,28 @@ describe("guidance published date", () => {
     });
   });
 
+  test("the selector only runs over the head and the tail of the text", () => {
+    const sel = "Last updated:? (\\d{1,2} [A-Za-z]+ \\d{4})";
+    const pad = (n: number) => "x".repeat(n);
+    const W = 1000;
+    // In the head window, and in the tail window: found.
+    assert.equal(extractPublishedDate(`Last updated: 3 March 2026 ${pad(5000)}`, sel, W)?.publishedDate, "2026-03-03");
+    assert.equal(extractPublishedDate(`${pad(5000)} Last updated: 3 March 2026`, sel, W)?.publishedDate, "2026-03-03");
+    // In the middle, outside both windows: simply no published date.
+    assert.equal(extractPublishedDate(`${pad(3000)} Last updated: 3 March 2026 ${pad(3000)}`, sel, W), null);
+    // A text shorter than two windows is searched once, with no overlap.
+    assert.equal(extractPublishedDate(`${pad(1200)} Last updated: 3 March 2026`, sel, W)?.publishedDate, "2026-03-03");
+    // The default window is 20,000 characters at each end.
+    assert.equal(DEFAULT_PUBLISHED_DATE_WINDOW_CHARS, 20_000);
+    assert.equal(extractPublishedDate(`${pad(30_000)} Last updated: 3 March 2026 ${pad(30_000)}`, sel), null);
+    assert.equal(extractPublishedDate(`${pad(30_000)} Last updated: 3 March 2026 ${pad(10_000)}`, sel)?.publishedDate, "2026-03-03");
+  });
+
+  test("a slow pattern that reached the registry anyway is not run", () => {
+    assert.equal(extractPublishedDate("Updated 2026-03-03", ".*Updated (\\S+)"), null);
+    assert.equal(extractPublishedDate("Updated 2026-03-03", "Updated (\\S+)")?.publishedDate, "2026-03-03");
+  });
+
   test("no selector, no match or a bad selector yields null and never throws", () => {
     assert.equal(extractPublishedDate("text", undefined), null);
     assert.equal(extractPublishedDate("text", null), null);
@@ -350,6 +377,40 @@ describe("guidance snapshot store", () => {
     const { storagePath, contentHash } = await s.write(input);
     objects.set(storagePath, JSON.stringify({ ...JSON.parse(objects.get(storagePath)!), text: "tampered" }));
     await assert.rejects(s.read(input.sourceId, contentHash), /does not match its content hash/);
+  });
+
+  test("read refuses a PDF snapshot whose pages do not join back into its text", async () => {
+    const { bucket, objects } = memoryBucket();
+    const s = new GuidanceSnapshotStore(bucket);
+    const { storagePath, contentHash } = await s.write(input);
+    const good = JSON.parse(objects.get(storagePath)!);
+    /** Store a variant of the object (same text, so the hash still matches). */
+    const withPages = (pages: unknown) => objects.set(storagePath, JSON.stringify({ ...good, pages }));
+
+    // A page's text altered (a quote would be cited to the wrong page).
+    withPages([{ page: 1, text: "page one" }, { page: 2, text: "page 2" }]);
+    await assert.rejects(s.read(input.sourceId, contentHash), /its pages do not match its text/);
+    // Text moved between pages.
+    withPages([{ page: 1, text: "page" }, { page: 2, text: "one\fpage two" }]);
+    await assert.rejects(s.read(input.sourceId, contentHash), /its pages do not match its text/);
+    // Page numbers wrong or out of order.
+    withPages([{ page: 2, text: "page one" }, { page: 1, text: "page two" }]);
+    await assert.rejects(s.read(input.sourceId, contentHash), /its pages do not match its text/);
+    // Pages dropped from a PDF snapshot.
+    withPages(null);
+    await assert.rejects(s.read(input.sourceId, contentHash), /a PDF snapshot without pages/);
+    // The untouched object still reads.
+    withPages(good.pages);
+    assert.equal((await s.read(input.sourceId, contentHash)).pages!.length, 2);
+  });
+
+  test("an HTML snapshot (no pages) reads back", async () => {
+    const { bucket } = memoryBucket();
+    const s = new GuidanceSnapshotStore(bucket);
+    const w = await s.write({ ...input, docType: "html", sourceId: "alpha-short-stay-rules", text: "whole page", pages: undefined });
+    const r = await s.read("alpha-short-stay-rules", w.contentHash);
+    assert.equal(r.pages, null);
+    assert.equal(r.text, "whole page");
   });
 
   test("ids that could escape the snapshot folder are refused", () => {
