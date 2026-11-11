@@ -160,6 +160,9 @@ const bucket: SnapshotBucket = {
         }
         objects.set(name, { data, options });
       },
+      async exists() {
+        return [objects.has(name)];
+      },
       async download() {
         const o = objects.get(name);
         if (!o) throw Object.assign(new Error("No such object"), { code: 404 });
@@ -708,6 +711,7 @@ describe("guidance crawl: failing sources", () => {
           throw Object.assign(new Error("backend unavailable"), { code: 503 });
         },
         download: async () => [Buffer.from("")],
+        exists: async () => [false],
       }),
     };
     const svc = new GuidanceCrawlService(new VisaCatalogFetchService({ http, minIntervalMs: 0 }), new GuidanceSnapshotStore(failing));

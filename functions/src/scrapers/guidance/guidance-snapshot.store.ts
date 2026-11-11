@@ -25,10 +25,19 @@ import {
 //
 // ---- Immutable ----
 //
-// An object is written with the precondition "only if it does not exist yet"
-// (`ifGenerationMatch: 0`). A second write of the same key is refused by
-// Storage itself (HTTP 412), which this store reports as "already there":
-// nothing is overwritten, ever. There is no update or delete method here.
+// Two guards, so nothing is overwritten, ever (and there is no update or
+// delete method here):
+//  1. `write()` first asks whether the object exists and, if so, stops:
+//     "already there", nothing sent.
+//  2. The write itself carries the precondition "only if it does not exist
+//     yet" (`ifGenerationMatch: 0`), so if two runs race past guard 1, Cloud
+//     Storage refuses the second write (HTTP 412), which is also reported as
+//     "already there".
+// Guard 1 exists because the Firebase Storage EMULATOR ignores write
+// preconditions (checked with firebase-tools on 2026-11-11: a second
+// create-only save was accepted). Guard 2 is what makes it atomic in
+// production. Even without either, a same-key write could only replace the
+// text with identical text: the key is the text's hash.
 //
 // ---- Internal only: never served to a client ----
 //
@@ -88,6 +97,7 @@ export interface SnapshotFile {
     }
   ): Promise<void>;
   download(): Promise<[Buffer]>;
+  exists(): Promise<[boolean]>;
 }
 
 /** The part of a Cloud Storage bucket this store uses. */
@@ -166,14 +176,18 @@ export class GuidanceSnapshotStore {
       pages,
     };
 
+    const file = this.resolveBucket().file(storagePath);
+    // Guard 1: already stored -> nothing to do (see "Immutable" above).
+    const [exists] = await file.exists();
+    if (exists) return { contentHash, storagePath, byteLength, created: false };
+
     try {
-      await this.resolveBucket()
-        .file(storagePath)
+      await file
         .save(JSON.stringify(content), {
           // One request: the precondition below is checked atomically with it.
           resumable: false,
           contentType: "application/json; charset=utf-8",
-          // Create only: generation 0 means "no live object with this name".
+          // Guard 2, create only: generation 0 = "no live object with this name".
           preconditionOpts: { ifGenerationMatch: 0 },
           metadata: {
             // Never cached by an intermediary, should a URL ever exist.

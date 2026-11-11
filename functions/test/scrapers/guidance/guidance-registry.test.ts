@@ -270,12 +270,22 @@ describe("guidance published date", () => {
 // Snapshot text store
 // ============================================
 
-/** An in-memory bucket that enforces create-only writes, like Cloud Storage. */
-function memoryBucket() {
+/**
+ * An in-memory bucket that enforces create-only writes, like Cloud Storage.
+ * `blindExists: true` makes exists() always answer "no", as it would for the
+ * loser of a race between two runs, so the write precondition is what stops
+ * the overwrite.
+ */
+function memoryBucket(opts: { blindExists?: boolean } = {}) {
   const objects = new Map<string, string>();
+  const counts = { saves: 0 };
   const bucket: SnapshotBucket = {
     file: (name) => ({
+      async exists() {
+        return [opts.blindExists ? false : objects.has(name)];
+      },
       async save(data, options) {
+        counts.saves++;
         if (options.preconditionOpts.ifGenerationMatch === 0 && objects.has(name)) {
           throw Object.assign(new Error("Precondition Failed"), { code: 412 });
         }
@@ -286,7 +296,7 @@ function memoryBucket() {
       },
     }),
   };
-  return { bucket, objects };
+  return { bucket, objects, counts };
 }
 
 describe("guidance snapshot store", () => {
@@ -301,7 +311,7 @@ describe("guidance snapshot store", () => {
   };
 
   test("writes under the content hash, once; a repeat write stores nothing and overwrites nothing", async () => {
-    const { bucket, objects } = memoryBucket();
+    const { bucket, objects, counts } = memoryBucket();
     const s = new GuidanceSnapshotStore(bucket);
     const first = await s.write(input);
     assert.equal(first.contentHash, sha256Hex(input.text));
@@ -315,11 +325,23 @@ describe("guidance snapshot store", () => {
     assert.equal(again.created, false);
     assert.equal(objects.size, 1);
     assert.equal(objects.get(first.storagePath), before);
+    assert.equal(counts.saves, 1, "the existing object is detected before any write is sent");
 
     const read = await s.read(input.sourceId, first.contentHash);
     assert.equal(read.text, input.text);
     assert.deepEqual(read.pages, [{ page: 1, text: "page one" }, { page: 2, text: "page two" }]);
     assert.equal(read.fetchedAt, "2026-11-11T02:00:00.000Z");
+  });
+
+  test("a write that races past the exists check is stopped by the create-only precondition", async () => {
+    const { bucket, objects, counts } = memoryBucket({ blindExists: true });
+    const s = new GuidanceSnapshotStore(bucket);
+    const first = await s.write(input);
+    const before = objects.get(first.storagePath);
+    const again = await s.write({ ...input, fetchedAtMs: input.fetchedAtMs + 1000 });
+    assert.equal(counts.saves, 2, "the second write was sent");
+    assert.equal(again.created, false, "and refused (412), reported as already stored");
+    assert.equal(objects.get(first.storagePath), before);
   });
 
   test("read refuses an object whose text does not match its key", async () => {
