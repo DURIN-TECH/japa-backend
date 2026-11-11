@@ -27,6 +27,8 @@ import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/typ
 import { PDF_PAGE_SEPARATOR } from "../../../src/scrapers/shared/fetch/pdf-text";
 import {
   SnapshotQuoteIndex,
+  unitAdjacentToNumber,
+  withoutLeadingParagraphNumber,
   containsTokenBounded,
   dateSupported,
   datesIn,
@@ -387,13 +389,14 @@ describe("probe: appliesTo", () => {
     assert.deepEqual(flags.map((f) => [f.code, f.target]), [
       ["nationality_codes_model_proposed", "rubric"],
       ["nationality_code_name_mismatch", r.accepted?.criterionId],
+      ["title_wording_uncited", "rubric"],
     ]);
     assert.match(flags[1].message, /^entry 2 of the group: code QM /);
 
     // Swap the codes: both entries are now flagged.
     const swapped = { ...(r.accepted as AssessmentCriterion), appliesTo: { nationalities: ["QM", "ZZ"], asWritten: [zzName, "Borduria"], codeNames: ["QM", zzName] } };
     const again = reviewFlagsFor({ criteria: [swapped], intakeQuestions: [] }, { chunkCount: 1, pagesEndingMidSentence: [] });
-    assert.deepEqual(again.map((f) => f.code), ["nationality_codes_model_proposed", "nationality_code_name_mismatch", "nationality_code_name_mismatch"]);
+    assert.deepEqual(again.map((f) => f.code), ["nationality_codes_model_proposed", "nationality_code_name_mismatch", "nationality_code_name_mismatch", "title_wording_uncited"]);
   });
 
   test("the stored-rubric validator: names of fewer than three characters, and codeNames that are not parallel", () => {
@@ -462,15 +465,16 @@ describe("probe: citation fields", () => {
 describe("standing reviewer flags", () => {
   const none = { chunkCount: 1, pagesEndingMidSentence: [] };
 
-  test("no bars, no intake questions, one chunk: no standing flag", () => {
+  test("no bars, no intake questions, one chunk: only the title flag (titles are always model wording)", () => {
     const c = assess(judgement(FUNDS)).accepted as AssessmentCriterion;
-    assert.deepEqual(reviewFlagsFor({ criteria: [c], intakeQuestions: [] }, none), []);
+    assert.deepEqual(reviewFlagsFor({ criteria: [c], intakeQuestions: [] }, none).map((f) => [f.code, f.target]), [["title_wording_uncited", "rubric"]]);
+    assert.deepEqual(reviewFlagsFor({ criteria: [], intakeQuestions: [] }, none), []);
   });
 
   test("intake wording is flagged as the model's own, uncited", () => {
     const c = assess(judgement(FUNDS)).accepted as AssessmentCriterion;
     const q = { id: "q1", label: "A question", answerType: "text", required: true, criterionIds: [c.criterionId] };
-    assert.deepEqual(reviewFlagsFor({ criteria: [c], intakeQuestions: [q] }, none).map((f) => f.code), ["intake_wording_uncited"]);
+    assert.deepEqual(reviewFlagsFor({ criteria: [c], intakeQuestions: [q] }, none).map((f) => f.code), ["title_wording_uncited", "intake_wording_uncited"]);
   });
 
   test("a version built from more than one chunk, and PDF pages that end mid-sentence, are flagged", () => {
@@ -479,8 +483,8 @@ describe("standing reviewer flags", () => {
     assert.deepEqual(pagesEndingMidSentence(pdf), [2]);
     assert.deepEqual(pagesEndingMidSentence(DOC), [], "a web page has no pages");
     const flags = reviewFlagsFor({ criteria: [c], intakeQuestions: [] }, { chunkCount: 3, pagesEndingMidSentence: [{ sourceId: "probe-doc", pages: [2] }, { sourceId: "other-doc", pages: [] }] });
-    assert.deepEqual(flags.map((f) => f.code), ["multiple_chunks", "page_ends_mid_sentence"]);
-    assert.match(flags[1].message, /1 page\(s\) of probe-doc .*\(page 2\)/);
+    assert.deepEqual(flags.map((f) => f.code), ["title_wording_uncited", "multiple_chunks", "page_ends_mid_sentence"]);
+    assert.match(flags[2].message, /1 page\(s\) of probe-doc .*\(page 2\)/);
   });
 });
 
@@ -507,5 +511,177 @@ describe("route key", () => {
     assert.throws(() => rubricRouteKey("Xa", "xa-short-visit"), /upper-case/);
     assert.throws(() => rubricRouteKey("XAA", "v"), /Invalid country code/);
     assert.throws(() => rubricRouteKey("XA", "a/b"), /Invalid visa type id/);
+  });
+});
+
+// ============================================
+// Review round 3 (R2-1 .. R2-3 and the small items)
+// ============================================
+
+describe("probe round 3: typographic hyphens and dashes are token joiners (R2-1)", () => {
+  // U+2011 non-breaking hyphen, U+2013 en dash, U+2212 minus.
+  const NBH = "\u2011";
+  const EN = "\u2013";
+  const text = [
+    `6.1 The fee is non${NBH}refundable in all cases and must be paid in full.`,
+    `6.2 From 26 March 2026 a national of Borduria or Guinea${NBH}Bissau must be refused entry clearance.`,
+    `6.3 The applicant must have at least 18${EN}28 days of leave remaining before travel.`,
+    "6.4 A temperature of \u221228 degrees is the stated limit for the storage of samples.",
+  ].join("\n");
+  const idx = new SnapshotQuoteIndex(snapshot(text));
+
+  test("a word taken from after a non-breaking hyphen is rejected (\"refundable\" out of \"non\u2011refundable\")", () => {
+    rejects(judgement("refundable in all cases and must be paid in full."), "quote_not_found", idx);
+    assert.ok(assess(judgement(`The fee is non${NBH}refundable in all cases and must be paid in full.`), idx).accepted);
+  });
+
+  test("a number taken from the end of an en-dash range is rejected (\"28 days\" out of \"18\u201328 days\")", () => {
+    rejects(objective("28 days of leave remaining before travel.", { field: "leave", op: "gte", value: 28, unit: "days" }), "quote_not_found", idx);
+    assert.ok(assess(objective(`The applicant must have at least 18${EN}28 days of leave remaining before travel.`, { field: "leave", op: "gte", value: 28, unit: "days" }), idx).accepted);
+  });
+
+  test("a group name taken from the first part of a name joined with a non-breaking hyphen is rejected, whatever the code", () => {
+    const quote = `From 26 March 2026 a national of Borduria or Guinea${NBH}Bissau must be refused entry clearance.`;
+    // "Guinea" with its own platform code, so no mismatch flag could catch it.
+    const guinea = regionDisplayName("GN");
+    assert.equal(guinea, "Guinea");
+    rejects(crit({ ref: "r", title: "T", kind: "mandatory_bar", quote, appliesTo: { nationalities: ["GN"], asWritten: ["Guinea"] } }), "applies_to_not_in_quote", idx);
+    assert.ok(assess(crit({ ref: "r", title: "T", kind: "mandatory_bar", quote, appliesTo: { nationalities: ["QM"], asWritten: ["Borduria"] } }), idx).accepted);
+    for (const joiner of ["-", "\u2010", NBH, "\u2012", EN, "\u2212"]) {
+      assert.equal(groupNameSupported("Guinea", `a national of Guinea${joiner}Bissau`), false, `U+${joiner.charCodeAt(0).toString(16)}`);
+      assert.equal(groupNameSupported("Bissau", `a national of Guinea${joiner}Bissau`), false);
+    }
+    assert.equal(containsTokenBounded("a limit of \u221228 degrees", "28 degrees"), false);
+  });
+});
+
+describe("probe round 3: thousands grouped with spaces (R2-2)", () => {
+  const text = "7.1 The applicant must show funds of 1 270 units for each month of stay.\n7.2 The fee is 1\u00A0270 units and is paid once at the desk.";
+  const idx = new SnapshotQuoteIndex(snapshot(text));
+  const FULL = "The applicant must show funds of 1 270 units for each month of stay.";
+
+  test("a space-grouped number yields no number: neither 1 nor 270 supports a threshold", () => {
+    assert.deepEqual([...numbersIn("funds of 1 270 units")], []);
+    assert.deepEqual([...numbersIn("funds of 12 345 678 units and 5 dogs")], ["5"]);
+    rejects(objective(FULL, { field: "funds", op: "gte", value: 270, unit: "units" }), "number_not_in_quote", idx);
+    rejects(objective(FULL, { field: "funds", op: "gte", value: 1, unit: "month" }), "number_not_in_quote", idx);
+    rejects(objective(FULL, { field: "funds", op: "gte", value: 1270, unit: "units" }), "number_not_in_quote", idx);
+    // A non-breaking space is normalised to a plain one: same result.
+    rejects(objective("The fee is 1 270 units and is paid once at the desk.", { field: "fee", op: "eq", value: 270, unit: "units" }), "number_not_in_quote", idx);
+  });
+
+  test("a quote cut out of a space-grouped number is rejected", () => {
+    rejects(objective("270 units for each month of stay.", { field: "funds", op: "gte", value: 270, unit: "units" }), "quote_not_found", idx);
+    assert.deepEqual(tokenBoundedPositions("funds of 1 270 units", "270 units"), []);
+    assert.deepEqual(tokenBoundedPositions("held for 28 5 days", "28"), []);
+    // Ordinary spaces around a number are fine.
+    assert.deepEqual(tokenBoundedPositions("held for 28 days", "28 days"), [9]);
+    assert.deepEqual(tokenBoundedPositions("on 26 March 2026", "26 March 2026"), [3]);
+  });
+
+  test("a space-grouped run does not hide a date", () => {
+    assert.deepEqual(datesIn("on 26 March 2026"), ["2026-03-26"]);
+    assert.deepEqual([...numbersIn("on 26 March 2026 for 5 days")].sort(), ["2026", "26", "5"]);
+  });
+});
+
+describe("probe round 3: a quote that stops before the end of its sentence (R2-3)", () => {
+  const text = "8.1 The applicant must be refused only where the decision maker is satisfied that the document is false.\n8.2 The applicant must be refused.\n8.3 Funds must be shown. Another sentence follows here.";
+  const idx = new SnapshotQuoteIndex(snapshot(text));
+
+  test("a quote that stops before 'only where ...' carries quote_ends_mid_sentence", () => {
+    const r = assess(judgement("The applicant must be refused"), idx);
+    assert.ok(r.accepted, "verbatim, so not rejected");
+    assert.equal(r.out.criteria[0].endsMidSentence, true);
+    const merged = mergeAssessments([{ chunk: CHUNK, assessment: r.out }]);
+    assert.deepEqual(merged.flags.map((f) => [f.code, f.target]), [["quote_ends_mid_sentence", r.accepted?.criterionId]]);
+  });
+
+  test("a complete sentence, or one that ends at the end of the line, is not flagged", () => {
+    const whole = assess(judgement("The applicant must be refused only where the decision maker is satisfied that the document is false."), idx);
+    assert.equal(whole.out.criteria[0].endsMidSentence, false);
+    const noStop = new SnapshotQuoteIndex(snapshot("9.1 A list item without a full stop at the end\n9.2 Funds must be shown"));
+    assert.equal(assess(judgement("A list item without a full stop at the end"), noStop).out.criteria[0].endsMidSentence, false);
+    // The quote ends a sentence; the next sentence's words do not count.
+    assert.equal(assess(judgement("Funds must be shown."), idx).out.criteria[0].endsMidSentence, false);
+    // Without its full stop the quote is complete too: only the mark follows.
+    assert.equal(assess(judgement("Funds must be shown"), idx).out.criteria[0].endsMidSentence, false);
+  });
+
+  test("both flags can apply to one criterion", () => {
+    const r = assess(judgement("must be refused only where the decision maker"), idx);
+    const merged = mergeAssessments([{ chunk: CHUNK, assessment: r.out }]);
+    assert.deepEqual(merged.flags.map((f) => f.code).sort(), ["quote_ends_mid_sentence", "quote_starts_mid_sentence"]);
+  });
+});
+
+describe("probe round 3: smaller items", () => {
+  const text = [
+    "4.1 The fee is final and must be paid in full by the applicant.",
+    "4.2 The order made on 1 January 2020 is revoked. From 26 March 2026 a national of Nigeria or Syldavia must be refused entry clearance.",
+    "4.4 Funds must have been held for 28 days or 4 weeks before the date of application.",
+    "4.5 Applicants who are nationals of Nigeria must attend an interview.",
+  ].join("\n");
+  const idx = new SnapshotQuoteIndex(snapshot(text));
+  const DAYS_WEEKS = "Funds must have been held for 28 days or 4 weeks before the date of application.";
+
+  test("more than one date in the quote of a dated criterion: flagged multiple_dates_in_quote", () => {
+    const quote = "The order made on 1 January 2020 is revoked. From 26 March 2026 a national of Nigeria or Syldavia must be refused entry clearance.";
+    const r = assess(crit({ ref: "r", title: "T", kind: "mandatory_bar", quote, appliesTo: { nationalities: ["NG"], asWritten: ["Nigeria"] }, validFrom: "2020-01-01" }), idx);
+    assert.ok(r.accepted, "the date IS in the quote, so it is not rejected");
+    assert.equal(r.out.criteria[0].multipleDates, true);
+    assert.ok(mergeAssessments([{ chunk: CHUNK, assessment: r.out }]).flags.some((f) => f.code === "multiple_dates_in_quote" && f.target === r.accepted?.criterionId));
+    // One date, or no dates asked for: no flag.
+    const one = assess(crit({ ref: "r", title: "T", kind: "mandatory_bar", quote: "From 26 March 2026 a national of Nigeria or Syldavia must be refused entry clearance.", appliesTo: { nationalities: ["NG"], asWritten: ["Nigeria"] }, validFrom: "2026-03-26" }), idx);
+    assert.equal(one.out.criteria[0].multipleDates, false);
+    assert.equal(assess(judgement(quote), idx).out.criteria[0].multipleDates, false);
+  });
+
+  test("a unit must stand next to its number: (28, weeks) from \"28 days or 4 weeks\" is rejected", () => {
+    rejects(objective(DAYS_WEEKS, { field: "held", op: "heldForDays", value: 28, unit: "weeks" }), "unit_not_in_quote", idx);
+    rejects(objective(DAYS_WEEKS, { field: "held", op: "heldForDays", value: 4, unit: "days" }), "unit_not_in_quote", idx);
+    assert.ok(assess(objective(DAYS_WEEKS, { field: "held", op: "heldForDays", value: 28, unit: "days" }), idx).accepted);
+    assert.ok(assess(objective(DAYS_WEEKS, { field: "held", op: "heldForDays", value: 4, unit: "weeks" }), idx).accepted);
+    // One ordinary word between is fine; a unit before its number too.
+    assert.equal(unitAdjacentToNumber(28, "days", "held for 28 consecutive days"), true);
+    assert.equal(unitAdjacentToNumber(100, "USD", "an amount of USD 100"), true);
+    assert.equal(unitAdjacentToNumber(28, "weeks", "held for 28 days or 4 weeks"), false);
+    assert.equal(unitAdjacentToNumber(28, "days", "held for 28"), false);
+  });
+
+  test("a leading paragraph number supports no threshold and no number in a title", () => {
+    rejects(objective("4.4 " + DAYS_WEEKS, { field: "funds", op: "gte", value: 4.4, unit: null }), "number_not_in_quote", idx);
+    rejects(judgement("4.4 " + DAYS_WEEKS, { title: "Rule 4.4 funds" }), "number_not_in_quote", idx);
+    assert.equal(withoutLeadingParagraphNumber("4.4 Funds must be held"), "Funds must be held");
+    assert.equal(withoutLeadingParagraphNumber("SV 2.1 An applicant"), "An applicant");
+    assert.equal(withoutLeadingParagraphNumber("5. Funds must"), "Funds must");
+    assert.equal(withoutLeadingParagraphNumber("(b) Funds must"), "Funds must");
+    // A plain number that is part of the rule is kept.
+    assert.equal(withoutLeadingParagraphNumber("28 days of leave"), "28 days of leave");
+  });
+
+  test("a rule reference needs a digit, and only the NEAREST preceding reference counts", () => {
+    rejects(judgement(DAYS_WEEKS, { ruleRef: "of" }), "rule_ref_not_in_source", idx);
+    rejects(judgement(DAYS_WEEKS, { ruleRef: "Funds" }), "rule_ref_not_in_source", idx);
+    // 4.2 precedes 4.4 on the same line of a PDF page, but 4.4 is nearer.
+    const page = new SnapshotQuoteIndex(snapshot([text.split("\n").join(" ")]));
+    rejects(judgement(DAYS_WEEKS, { ruleRef: "4.2" }), "rule_ref_not_in_source", page);
+    rejects(judgement(DAYS_WEEKS, { ruleRef: "4.1" }), "rule_ref_not_in_source", page);
+    assert.equal(assess(judgement(DAYS_WEEKS, { ruleRef: "4.4" }), page).accepted?.ruleRef, "4.4");
+    // On a web page the line holds one rule: a reference elsewhere is refused as before.
+    rejects(judgement(DAYS_WEEKS, { ruleRef: "4.5" }), "rule_ref_not_in_source", idx);
+  });
+
+  test("a group name must start with a capital letter", () => {
+    const quote = "Applicants who are nationals of Nigeria must attend an interview.";
+    rejects(crit({ ref: "r", title: "T", kind: "mandatory_bar", quote, appliesTo: { nationalities: ["GH", "KE"], asWritten: ["nationals", "applicants"] } }), "applies_to_not_in_quote", idx);
+    assert.equal(groupNameSupported("nationals", "Applicants who are nationals of Nigeria"), false);
+    assert.equal(groupNameSupported("Nigeria", "Applicants who are nationals of Nigeria"), true);
+  });
+
+  test("criterion titles are standing model wording: title_wording_uncited on any version with criteria", () => {
+    const c = assess(judgement(DAYS_WEEKS), idx).accepted as AssessmentCriterion;
+    const flags = reviewFlagsFor({ criteria: [c], intakeQuestions: [] }, { chunkCount: 1, pagesEndingMidSentence: [] });
+    assert.deepEqual(flags.map((f) => [f.code, f.target]), [["title_wording_uncited", "rubric"]]);
   });
 });

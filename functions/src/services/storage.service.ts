@@ -1,9 +1,19 @@
 import { getStorage } from "firebase-admin/storage";
 import { randomUUID } from "crypto";
+import { assertClientReachableKey, buildIssuedPath } from "../utils/storage-paths";
 
 // Service that brokers all Cloud Storage access for the backend.
 // File uploads are NOT proxied through Cloud Functions; instead, this service
 // mints short-lived v4 signed URLs that clients use to PUT/GET objects directly.
+//
+// WHERE PATHS COME FROM (issue #141): every upload path is assembled by
+// `buildIssuedPath()` in utils/storage-paths.ts, the same module the register /
+// download / delete code uses to VALIDATE a path. This service does not decide
+// whose object a path is — its callers must have validated the path against
+// the right owner first (`validateStoragePath`) — but the methods that sign a
+// download, publish or delete an object refuse, as a last line of defence, any
+// value that is not a plain bucket-relative key or that sits under a
+// backend-only prefix (`assertClientReachableKey`).
 export class StorageService {
   // Resolve the default bucket for the active Firebase project.
   //
@@ -32,9 +42,13 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `documents/${userId}/${applicationId}/${fileId}_${sanitizedFileName}`;
+    // documents/{clientUid}/{applicationId}/{uuid}_{file} — `userId` here is
+    // the application's CLIENT (see DocumentService.getUploadUrl), whoever is
+    // uploading.
+    const storagePath = buildIssuedPath(
+      { purpose: "application-document", ownerUserId: userId, applicationId },
+      fileName
+    );
 
     const file = this.bucket.file(storagePath);
 
@@ -67,9 +81,8 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `verification/${userId}/${fileId}_${sanitizedFileName}`;
+    // verification/{agentUserUid}/{uuid}_{file}
+    const storagePath = buildIssuedPath({ purpose: "agent-verification", userId }, fileName);
 
     const file = this.bucket.file(storagePath);
 
@@ -108,10 +121,13 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedSlot = slot.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `compliance/${agencyId}/${sanitizedSlot}/${fileId}_${sanitizedFileName}`;
+    // compliance/{agencyId}/{slot}/{uuid}_{file}. The controller has already
+    // checked `slot` against the known slots; `buildIssuedPath` throws rather
+    // than issue a path if it is not usable as a single path segment.
+    const storagePath = buildIssuedPath(
+      { purpose: "compliance-document", agencyId, slots: [slot] },
+      fileName
+    );
 
     const file = this.bucket.file(storagePath);
 
@@ -149,9 +165,8 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `agency-logos/${agencyId}/${fileId}_${sanitizedFileName}`;
+    // agency-logos/{agencyId}/{uuid}_{file}
+    const storagePath = buildIssuedPath({ purpose: "agency-logo", agencyId }, fileName);
 
     const file = this.bucket.file(storagePath);
 
@@ -192,9 +207,8 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `users/${userId}/profile/${fileId}_${sanitizedFileName}`;
+    // users/{uid}/profile/{uuid}_{file}
+    const storagePath = buildIssuedPath({ purpose: "profile-photo", userId }, fileName);
 
     const file = this.bucket.file(storagePath);
 
@@ -230,7 +244,9 @@ export class StorageService {
    * of UBLA, never expires, and is the standard Firebase download mechanism.
    */
   async makeFilePublic(storagePath: string): Promise<string> {
-    const file = this.bucket.file(storagePath);
+    // Never publish a backend-only object or a non-key value (issue #141).
+    // Callers validate ownership first; this only backstops them.
+    const file = this.bucket.file(assertClientReachableKey(storagePath));
 
     // A random token gates access; anyone with the URL can read the object,
     // which is exactly what we want for a public logo.
@@ -246,13 +262,18 @@ export class StorageService {
   }
 
   /**
-   * Generate a signed download URL for a file
+   * Generate a signed download URL for a file.
+   *
+   * CALLERS MUST VALIDATE FIRST: pass only a path that `validateStoragePath`
+   * accepted for the record's owner (issue #141). As a backstop this method
+   * throws `StoredPathInvalidError` for anything that is not a plain
+   * bucket-relative key, and for every backend-only prefix, whoever asks.
    */
   async getSignedDownloadUrl(
     storagePath: string,
     expirationMinutes = 60
   ): Promise<string> {
-    const file = this.bucket.file(storagePath);
+    const file = this.bucket.file(assertClientReachableKey(storagePath));
 
     const [downloadUrl] = await file.getSignedUrl({
       version: "v4",
@@ -264,10 +285,14 @@ export class StorageService {
   }
 
   /**
-   * Delete a file from storage
+   * Delete a file from storage.
+   *
+   * Same contract as `getSignedDownloadUrl`: callers validate ownership of the
+   * path first; this method additionally refuses backend-only prefixes and
+   * non-key values, so a bad record can never delete a backend object.
    */
   async deleteFile(storagePath: string): Promise<void> {
-    const file = this.bucket.file(storagePath);
+    const file = this.bucket.file(assertClientReachableKey(storagePath));
     await file.delete({ ignoreNotFound: true });
   }
 

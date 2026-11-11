@@ -3,13 +3,19 @@ import { collections, db, subcollections } from "../../utils/firebase";
 // The ONE fetch path every crawler uses (robots.txt, per-host gap, 429/503
 // backoff, PDF reading). The guidance crawl calls it directly: it is not
 // forked, wrapped in another HTTP client, or given its own etiquette.
-import { HtmlTextTooLongError, visaCatalogFetchService, type FetchedPage } from "../shared/fetch/visa-catalog-fetch.service";
+import {
+  HtmlTextTooLongError,
+  visaCatalogFetchService,
+  type FetchedPage,
+  type RawResponse,
+} from "../shared/fetch/visa-catalog-fetch.service";
 import { DEFAULT_PDF_LIMITS, isPdfFetchError } from "../shared/fetch/pdf-text";
 import { describeError } from "../shared/fetch/redact";
 import { HostBackoffTracker, backoffMessage, hostOf, isHostBackoffError } from "../shared/etiquette/visa-crawl-host-state";
 // Failure streak -> auto-pause rules shared with the visa and news crawlers.
 import { DEFAULT_CONSECUTIVE_FAILURE_LIMIT, nextSourceHealth, type NextSourceHealth } from "../shared/runs/source-health";
 import { extractPublishedDate } from "./guidance-published-date";
+import { GuidanceResolveError, linkPatternHost, resolveDocumentUrl } from "./guidance-resolve";
 import { GUIDANCE_SOURCE_ID_RE, guidanceSnapshotStore, type GuidanceSnapshotStore } from "./guidance-snapshot.store";
 import type { GuidanceSnapshotMeta, GuidanceSource, GuidanceSourceStatus } from "./types";
 
@@ -19,6 +25,9 @@ import type { GuidanceSnapshotMeta, GuidanceSource, GuidanceSourceStatus } from 
 //
 // Reads the `guidanceSources` registry and, for each source that is due:
 //
+//   0. (only for a source with `resolveFrom`, issue #111) looks up the
+//      document's current address on its stable parent page, through the
+//      same fetch service, and requests that address in step 1;
 //   1. fetches it through the shared fetch service (robots.txt checked,
 //      per-host gap and 429/503 backoff applied, PDFs read per page);
 //   2. compares the sha256 of its cleaned text with the stored
@@ -64,6 +73,7 @@ export type GuidanceFailureKind =
   | "http_error" // non-2xx response (404, 410, 500, ...)
   | "content_type_changed" // registry says html, got a PDF (or the reverse)
   | "redirect_changed" // the URL now ends at a different document
+  | "resolve_failed" // `resolveFrom`: the parent page gave no single address (#111)
   | "robots_blocked" // robots.txt disallows the URL
   | "host_backoff" // the host answered 429/503
   | "pdf_unreadable" // a PDF the reader refused (encrypted, scanned, too big, ...)
@@ -165,6 +175,12 @@ export interface GuidanceFetcher {
     url: string,
     options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number }
   ): Promise<FetchedPage>;
+  // Needed only for a source with `resolveFrom` (issue #111): the robots
+  // check and the raw GET of the parent page. Optional so a fetcher that
+  // serves documents only still satisfies the interface; such a source then
+  // fails with `resolve_failed` instead of being requested blind.
+  isAllowedByRobots?(url: string): Promise<boolean>;
+  getRaw?(url: string): Promise<RawResponse>;
 }
 
 /** Options for one run. All optional. */
@@ -210,6 +226,7 @@ export function sameDocumentUrl(a: string, b: string): boolean {
 /** Classify a thrown error into a failure kind. */
 export function failureKindOf(err: unknown): GuidanceFailureKind {
   if (err instanceof GuidanceCrawlError || err instanceof GuidanceInfraError) return err.kind;
+  if (err instanceof GuidanceResolveError) return "resolve_failed";
   if (isHostBackoffError(err)) return "host_backoff";
   if (isPdfFetchError(err)) {
     // "not-accepted" = the registry says web page but the URL served a PDF.
@@ -416,9 +433,19 @@ export class GuidanceCrawlService {
     }
     // Host backing off: a stored `backoffUntil` from an earlier run, or a
     // 429/503 another source on the same host got a moment ago.
-    const host = hostOf(source.url);
+    // A source with `resolveFrom` asks TWO hosts: the parent page's, and the
+    // one its link pattern is pinned to (where the document will be
+    // requested). A fresh backoff on any host it would ask defers it. The
+    // seed validator makes `url` and the pattern name the same host, but a
+    // stored doc may have been edited by hand, so all three are checked.
     const storedBackoffMs = millisOf(source.backoffUntil);
-    const fresh = hostState.blocking(host);
+    const hosts = [hostOf(source.url)];
+    if (typeof source.resolveFrom?.pageUrl === "string") hosts.push(hostOf(source.resolveFrom.pageUrl));
+    if (typeof source.resolveFrom?.linkPattern === "string") hosts.push(linkPatternHost(source.resolveFrom.linkPattern) ?? "");
+    let fresh: ReturnType<HostBackoffTracker["blocking"]>;
+    for (const h of hosts) {
+      if (h && !fresh) fresh = hostState.blocking(h);
+    }
     if (storedBackoffMs > nowMs || fresh) {
       const untilMs = Math.max(storedBackoffMs, fresh?.untilMs ?? 0);
       const error = fresh ? backoffMessage(fresh) : `host backed off, retry after ${new Date(untilMs).toISOString()}`;
@@ -502,9 +529,35 @@ export class GuidanceCrawlService {
   ): Promise<void> {
     const { now, summary } = ctx;
 
+    // 0. Which address to request. Normally the entry's `url`. For a source
+    //    with `resolveFrom` (issue #111) the document moves to a new address
+    //    with every publication, so the current one is read from its stable
+    //    parent page first (robots.txt and the per-host delay apply to that
+    //    request too). The parent page must still BE the parent page: if it
+    //    redirects elsewhere, the lookup is not trusted.
+    let requestUrl = source.url;
+    const resolveFrom = source.resolveFrom ?? null;
+    if (resolveFrom) {
+      const fetcher = this.fetcher;
+      if (typeof fetcher.isAllowedByRobots !== "function" || typeof fetcher.getRaw !== "function") {
+        throw new GuidanceResolveError("This fetcher cannot read a parent page, so the document's address cannot be resolved");
+      }
+      const resolved = await resolveDocumentUrl(
+        { isAllowedByRobots: (u) => fetcher.isAllowedByRobots!(u), getRaw: (u) => fetcher.getRaw!(u) },
+        resolveFrom
+      );
+      if (!sameDocumentUrl(resolveFrom.pageUrl, resolved.pageFinalUrl)) {
+        throw new GuidanceCrawlError(
+          "redirect_changed",
+          `Unexpected redirect for the parent page ${resolveFrom.pageUrl}: got ${resolved.pageFinalUrl}; the document's address was not read from it`
+        );
+      }
+      requestUrl = resolved.resolvedUrl;
+    }
+
     // 1. Fetch through the shared path. `acceptPdf: false` for a web-page
     //    source refuses a PDF on its headers, before downloading it.
-    const page = await this.fetcher.fetchAndClean(source.url, {
+    const page = await this.fetcher.fetchAndClean(requestUrl, {
       checkRobots: true,
       acceptPdf: source.docType === "pdf",
       maxHtmlTextChars: GUIDANCE_MAX_HTML_TEXT_CHARS,
@@ -514,7 +567,7 @@ export class GuidanceCrawlService {
     if (source.docType === "pdf" && !page.pdf) {
       throw new GuidanceCrawlError(
         "content_type_changed",
-        `Content type changed for ${source.url}: the registry says PDF but the response was not a PDF`
+        `Content type changed for ${requestUrl}: the registry says PDF but the response was not a PDF`
       );
     }
 
@@ -526,16 +579,20 @@ export class GuidanceCrawlService {
     //      - else the final URL of the last good fetch;
     //      - else (first fetch, or after a re-seed changed `url`) the
     //        requested `url` itself.
+    //    For a source with `resolveFrom` the known address is the one just
+    //    read from the parent page (the previous fetch's final URL belongs to
+    //    the previous publication, and the seed validator forbids
+    //    `expectedFinalUrl` there): the request must end where it was sent.
     //    A redirect anywhere else fails with `redirect_changed` and nothing
     //    is ingested until a human re-checks the entry and declares the
     //    target. Both URLs are always recorded. See sameDocumentUrl() for
     //    what counts as the same address.
-    const baseline = source.expectedFinalUrl || source.finalUrl || source.url;
+    const baseline = resolveFrom ? requestUrl : source.expectedFinalUrl || source.finalUrl || source.url;
     if (!sameDocumentUrl(baseline, page.finalUrl)) {
       throw new GuidanceCrawlError(
         "redirect_changed",
-        `Unexpected redirect for ${source.url}: expected to end at ${baseline}, got ${page.finalUrl}` +
-          (source.expectedFinalUrl ? "" : " (declare expectedFinalUrl in the seed if this redirect is intended)")
+        `Unexpected redirect for ${requestUrl}: expected to end at ${baseline}, got ${page.finalUrl}` +
+          (source.expectedFinalUrl || resolveFrom ? "" : " (declare expectedFinalUrl in the seed if this redirect is intended)")
       );
     }
     summary.sourcesFetched++;
@@ -550,6 +607,10 @@ export class GuidanceCrawlService {
       lastFetchedAt: now,
       lastAttemptAt: now,
       finalUrl: page.finalUrl,
+      // The address read from the parent page (issue #111); null for a
+      // source requested directly. Written on unchanged fetches too: the
+      // same text can come back under a new address.
+      resolvedUrl: resolveFrom ? requestUrl : null,
       lastError: null,
       lastErrorKind: null,
       lastErrorAt: null,
@@ -585,7 +646,8 @@ export class GuidanceCrawlService {
       written = await this.store.write({
         sourceId,
         docType: source.docType,
-        url: source.url,
+        // What was REQUESTED: the resolved address for a `resolveFrom` source.
+        url: requestUrl,
         finalUrl: page.finalUrl,
         fetchedAtMs: page.fetchedAt,
         text: page.cleanText,
@@ -605,8 +667,11 @@ export class GuidanceCrawlService {
       sourceId,
       contentHash: page.contentHash,
       docType: source.docType,
-      url: source.url,
+      // The address requested (see step 0), and the parent page it was read
+      // from when there was one.
+      url: requestUrl,
       finalUrl: page.finalUrl,
+      resolvedFromUrl: resolveFrom ? resolveFrom.pageUrl : null,
       httpStatus: page.httpStatus,
       // When the bytes arrived, by the fetch service's clock (see above).
       fetchedAt: Timestamp.fromMillis(page.fetchedAt),

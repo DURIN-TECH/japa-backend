@@ -4,10 +4,11 @@ import { documentService, UploadActor } from "../services/document.service";
 import { documentRequestService } from "../services/document-request.service";
 import { notificationService } from "../services/notification.service";
 import { userService } from "../services/user.service";
-import { subcollections } from "../utils/firebase";
+import { collections } from "../utils/firebase";
 import { checkWithinLimit, paymentRequired, can, asSubject } from "../middleware/authz";
 import { LIMITS, Action, ROLES } from "@durin-tech/authz";
 import { Application, DocumentUploaderRole, DocumentUploadSource } from "../types";
+import { StoragePathRejectedError, StoredPathInvalidError } from "../utils/storage-paths";
 import {
   sendSuccess,
   sendError,
@@ -25,6 +26,31 @@ const VALID_UPLOAD_SOURCES: DocumentUploadSource[] = [
   "third_party",
   "other",
 ];
+
+/**
+ * Count the documents already registered against an application.
+ *
+ * Feeds the per-application document limit (`LIMITS.MAX_DOCUMENTS_PER_APPLICATION`)
+ * in `createDocument`. Counts the canonical TOP-LEVEL `documents` collection
+ * filtered by `applicationId` — the same collection `DocumentService` writes
+ * to. It used to count the `applications/{id}/documents` subcollection, which
+ * nothing at runtime ever wrote, so the count was permanently 0 and the limit
+ * could never bite (issue #28).
+ *
+ * Index: a single-field equality filter with a count() aggregation is served
+ * by Firestore's automatic single-field index on `applicationId`, so no
+ * composite entry in firestore.indexes.json is needed for this query.
+ *
+ * Exported (rather than inlined) so a unit test can pin which collection it
+ * reads.
+ */
+export async function countApplicationDocuments(applicationId: string): Promise<number> {
+  const snapshot = await collections.documents
+    .where("applicationId", "==", applicationId)
+    .count()
+    .get();
+  return snapshot.data().count;
+}
 
 export class DocumentController {
   /**
@@ -252,9 +278,9 @@ export class DocumentController {
       }
 
       // Enforce the per-application document limit (no-op until a plan sets it).
-      const docCount = (
-        await subcollections.documents(applicationId).count().get()
-      ).data().count;
+      // Counted on the top-level `documents` collection — see
+      // countApplicationDocuments above for why (issue #28).
+      const docCount = await countApplicationDocuments(applicationId);
       if (!checkWithinLimit(req, LIMITS.MAX_DOCUMENTS_PER_APPLICATION, docCount)) {
         paymentRequired(
           res,
@@ -346,6 +372,13 @@ export class DocumentController {
 
       sendCreated(res, document, "Document registered successfully");
     } catch (error) {
+      // The storage path in the request was not one the upload-url endpoint
+      // issues for this application (issue #141). Nothing was stored.
+      if (error instanceof StoragePathRejectedError) {
+        console.warn(`[document] registration refused: storagePath ${error.issue}`);
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
       console.error("Error creating document:", error);
       if ((error as Error).message === "Application not found") {
         sendError(res, "NOT_FOUND", "Application not found", 404);
@@ -439,6 +472,13 @@ export class DocumentController {
       // clients that read the shorter name.
       sendSuccess(res, { downloadUrl, url: downloadUrl });
     } catch (error) {
+      // The record's stored path failed validation at read time (issue #141):
+      // no link is signed. 409 because the request itself was fine.
+      if (error instanceof StoredPathInvalidError) {
+        console.warn(`[document] download refused for ${req.params.id}: stored path ${error.issue}`);
+        sendError(res, "INVALID_STORAGE_PATH", error.message, 409);
+        return;
+      }
       console.error("Error getting download URL:", error);
       if ((error as Error).message === "Document not found") {
         sendError(res, "NOT_FOUND", "Document not found", 404);

@@ -73,14 +73,20 @@ function isWordChar(ch: string | undefined): boolean {
 /**
  * Characters that continue one written token across a boundary: a hyphen, an
  * apostrophe (both the ASCII and the typographic form), a percent sign, a
- * plus sign and a slash. They join the parts of one token
+ * plus sign and a slash, and the typographic hyphens and dashes (U+2010 to
+ * U+2013 and the minus sign U+2212), so "Guinea" cannot be quoted out of
+ * "Guinea\u2011Bissau", nor "28 days" out of "18\u201328 days" (review round 3,
+ * R2-1). They join the parts of one token
  * ("non-Bordurian", "applicant's", "20%", "+44", "and/or"), so a match may
  * not start or end inside one. Without this, "Bordurian" is quoted out of
  * "non-Bordurian" (the inverse of the rule), "eight days" out of
  * "twenty-eight days" (a false threshold), and "applicant" out of
  * "applicant's" (code review round 2, B1/B4/B6).
  */
-const TOKEN_JOINERS = new Set(["-", "'", "’", "%", "+", "/"]);
+const HYPHEN_CHARS = ["-", "\u2010", "\u2011", "\u2012", "\u2013", "\u2212"];
+const TOKEN_JOINERS = new Set([...HYPHEN_CHARS, "'", "\u2019", "%", "+", "/"]);
+/** Regex class body of the hyphens and dashes (for the neighbour tests below). */
+const HYPHEN_CLASS = HYPHEN_CHARS.map((c) => (c === "-" ? "\\-" : `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`)).join("");
 
 /** True for a character that is part of a token: a word character or a joiner. */
 function isTokenChar(ch: string | undefined): boolean {
@@ -112,6 +118,11 @@ function onTokenBoundary(hay: string, at: number, needle: string): boolean {
   if (isTokenChar(last) && isTokenChar(hay[end])) return false;
   if (isDigit(first) && (hay[at - 1] === "," || hay[at - 1] === ".") && isDigit(hay[at - 2])) return false;
   if (isDigit(last) && (hay[end] === "," || hay[end] === ".") && isDigit(hay[end + 1])) return false;
+  // Thousands grouped with a space ("1 270"): a needle that starts with a
+  // digit right after "<digit> " (or ends with a digit right before
+  // " <digit>") may be cut out of one number. Over-rejecting is the safe side.
+  if (isDigit(first) && hay[at - 1] === " " && isDigit(hay[at - 2])) return false;
+  if (isDigit(last) && hay[end] === " " && isDigit(hay[end + 1])) return false;
   // The same cut made one character over: a needle that starts (ends) with
   // the separator itself, between two digits (".2" out of "3.2").
   const sep = (ch: string | undefined) => ch === "," || ch === ".";
@@ -206,12 +217,36 @@ export class SnapshotQuoteIndex {
    */
   ruleRefNear(found: Extract<QuoteLookup, { ok: true }>, ruleRef: string): boolean {
     const needle = normalizeForQuoteMatch(ruleRef);
-    // A reference must have something to it: one stray character matches anywhere.
-    if (needle.length < 2 || !/[\p{L}\p{N}]/u.test(needle)) return false;
+    // A reference must have something to it: one stray character matches
+    // anywhere, and a word ("of") is not a reference. It contains a digit.
+    if (needle.length < 2 || !/\d/.test(needle)) return false;
     const text = this.units[found.unit].text;
     const quoteEnd = found.at + found.matched.length;
     const earliest = this.paginated ? found.at - RULE_REF_WINDOW_CHARS : 0;
-    return tokenBoundedPositions(text, needle).some((p) => p >= earliest && p + needle.length <= quoteEnd);
+    return tokenBoundedPositions(text, needle).some((p) => {
+      if (p < earliest || p + needle.length > quoteEnd) return false;
+      // Inside the quote: it is printed with the rule.
+      if (p >= found.at) return true;
+      // Before the quote: only the NEAREST reference counts. Another
+      // reference-shaped token between it and the quote means the quote
+      // belongs to that one.
+      return !/(?<![\p{L}\p{N}.])\d+(?:\.\d+)+(?![\p{L}\p{N}])/u.test(text.slice(p + needle.length, found.at));
+    });
+  }
+
+  /**
+   * True when the located quote STOPS BEFORE THE END OF ITS SENTENCE: after
+   * it, up to the next sentence-ending mark (or the end of the line / page),
+   * there are ordinary words. A condition or exception that follows ("...
+   * only where ...", "... unless ...") can reverse what the quote says, so
+   * the caller raises a reviewer flag. A quote that itself ends with a
+   * sentence-ending mark is complete.
+   */
+  endsMidSentence(found: Extract<QuoteLookup, { ok: true }>): boolean {
+    if (/[.!?;:]$/.test(found.matched)) return false;
+    const after = this.units[found.unit].text.slice(found.at + found.matched.length);
+    const tail = after.split(/[.!?;:]/u)[0] ?? "";
+    return /\p{Ll}{2,}/u.test(tail);
   }
 
   /**
@@ -342,7 +377,10 @@ function numberTokens(text: string): NumberToken[] {
   const folded = readable(text);
   // Words and digit runs, with their positions. A digit run ends on a digit,
   // so sentence punctuation after it is not part of it.
-  const raw = [...folded.matchAll(/\p{L}+|\d[\d.,]*\d|\d/gu)].map((m) => ({ text: m[0], start: m.index as number, end: (m.index as number) + m[0].length }));
+  // A digit run grouped with spaces ("1 270") is ONE run that parseDigitRun
+  // refuses, so it yields no number: it is not "1" and "270". It is listed
+  // before the plain digit run so it wins at its first digit.
+  const raw = [...folded.matchAll(/\p{L}+|\d{1,3}(?: \d{3})+(?![\d.,])|\d[\d.,]*\d|\d/gu)].map((m) => ({ text: m[0], start: m.index as number, end: (m.index as number) + m[0].length }));
   /** True when only spaces / hyphens separate token i from token i+1. */
   const adjacent = (i: number) => i + 1 < raw.length && /^[\s-]*$/.test(folded.slice(raw[i].end, raw[i + 1].start));
   const out: NumberToken[] = [];
@@ -542,12 +580,48 @@ export function unitSupported(unit: string, support: string): boolean {
 }
 
 /**
+ * True when `unit` stands next to the number `value` in the text: right
+ * after it ("28 days", "1,270 units"; one ordinary word may sit between, as in
+ * "28 consecutive days") or right before it ("USD 100").
+ * "28 days or 4 weeks" does not support the pair (28, "weeks"): the unit is
+ * written, and so is the number, but not together.
+ */
+export function unitAdjacentToNumber(value: number, unit: string, support: string): boolean {
+  const folded = readable(support);
+  const u = readable(normalizeForQuoteMatch(unit));
+  if (!u) return false;
+  return numberTokens(support).some((t) => {
+    if (canonical(t.value) !== canonical(value)) return false;
+    // Right after the number, or after ONE ordinary word ("28 consecutive
+    // days"); two words or more ("28 days or 4 weeks") are a different phrase.
+    const direct = folded.slice(t.end).replace(/^\s*/, "");
+    const oneWord = direct.replace(/^\p{Ll}+\s+/u, "");
+    const startsWithUnit = (rest: string) => rest.startsWith(u) && !isTokenChar(rest[u.length]);
+    const afterOk = startsWithUnit(direct) || (oneWord !== direct && startsWithUnit(oneWord));
+    const beforeText = folded.slice(0, t.start).replace(/\s+$/, "");
+    const beforeOk = beforeText.endsWith(u) && !isTokenChar(beforeText[beforeText.length - u.length - 1]);
+    return afterOk || beforeOk;
+  });
+}
+
+/**
+ * The quote without a LEADING PARAGRAPH NUMBER ("4.4 ", "SV 2.1 ", "5. ",
+ * "(b) "): that number labels the rule, it is not something the rule states,
+ * so it must not support a threshold or a number in a title. A plain integer
+ * with no dot ("28 days") is not a label and is kept.
+ */
+export function withoutLeadingParagraphNumber(quote: string): string {
+  return quote.replace(/^\s*(?:(?:[A-Za-z]{1,3}\s)?(?:\d+(?:\.\d+)+|\d+[.)])|\([A-Za-z0-9]{1,3}\))\s+/, "");
+}
+
+/**
  * True when a group name (an entry of `appliesTo.asWritten`) is written in
  * the supporting text as a WHOLE name:
  *  - verbatim and token-bounded (so not the first letters of a longer word);
  *  - at least MIN_GROUP_NAME_CHARS long (a single letter matches anything);
+ *  - starts with a capital letter;
  *  - not a part of a longer capitalised name at that position: a capitalised
- *    word directly before or after it (joined by a space or a hyphen) makes
+ *    word directly before or after it (joined by a space or any hyphen or dash) makes
  *    it a different name. This also refuses a real name that happens to
  *    follow a capitalised word (the first word of a sentence, say); that is
  *    the safe direction, and the reviewer sees the discard.
@@ -555,10 +629,14 @@ export function unitSupported(unit: string, support: string): boolean {
 export function groupNameSupported(name: string, support: string): boolean {
   const needle = normalizeForQuoteMatch(name);
   if (needle.length < MIN_GROUP_NAME_CHARS) return false;
+  // A name starts with a capital: "national" or "refused" are not names.
+  if (!/^\p{Lu}/u.test(needle)) return false;
   const hay = normalizeForQuoteMatch(support);
+  const beforeRe = new RegExp(`(\\p{L}+)[ ${HYPHEN_CLASS}]$`, "u");
+  const afterRe = new RegExp(`^[ ${HYPHEN_CLASS}](\\p{L}+)`, "u");
   return tokenBoundedPositions(hay, needle).some((at) => {
-    const before = /(\p{L}+)[ -]$/u.exec(hay.slice(0, at))?.[1];
-    const after = /^[ -](\p{L}+)/u.exec(hay.slice(at + needle.length))?.[1];
+    const before = beforeRe.exec(hay.slice(0, at))?.[1];
+    const after = afterRe.exec(hay.slice(at + needle.length))?.[1];
     const capitalised = (word: string | undefined) => word !== undefined && /^\p{Lu}/u.test(word);
     return !capitalised(before) && !capitalised(after);
   });

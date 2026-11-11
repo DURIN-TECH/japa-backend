@@ -164,13 +164,16 @@ const NON_BLOCKING_FLAG_CODES: ReadonlySet<string> = new Set(["intake_answer_typ
  *  - nationality_codes_model_proposed: country codes are the model's proposal;
  *  - intake_wording_uncited: intake labels and options are the model's wording;
  *  - multiple_chunks: the source was read in several excerpts;
- *  - page_ends_mid_sentence: a rule crossing a page break may be cut short.
+ *  - page_ends_mid_sentence: a rule crossing a page break may be cut short;
+ *  - title_wording_uncited: criterion titles are the model's own wording (raised on
+ *    essentially every version).
  */
 const STANDING_NOTICE_FLAG_CODES: ReadonlySet<string> = new Set([
   "nationality_codes_model_proposed",
   "intake_wording_uncited",
   "multiple_chunks",
   "page_ends_mid_sentence",
+  "title_wording_uncited",
 ]);
 
 /** `{countryCode}_{visaTypeId}__v{version}`: the id of one rubric version in the API. */

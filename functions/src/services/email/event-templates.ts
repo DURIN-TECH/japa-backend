@@ -28,7 +28,12 @@ export interface ResolvedEventEmail {
 }
 
 interface EventTemplate {
-  subject: string;
+  /**
+   * Fixed inbox subject. Optional (issue #101): when omitted, the call site's
+   * `title` is the subject, for events whose subject must name something
+   * dynamic (e.g. the agency visa a review decision is about).
+   */
+  subject?: string;
   actionLabel: string;
   /** Relative path (joined to APP_URL) for the CTA, derived from the context. */
   path?: (ctx: EventEmailContext) => string | undefined;
@@ -49,6 +54,13 @@ const agencyReviewPath = (ctx: EventEmailContext): string =>
   ctx.relatedEntityType === "agency" && ctx.relatedEntityId
     ? `/admin/agencies/${ctx.relatedEntityId}`
     : "/admin/agencies";
+
+/**
+ * Portal path of the agency's "Our visas" screen (issue #104), the CTA target
+ * of the agency visa review emails (issue #101). Keep in step with the
+ * portal route.
+ */
+export const AGENCY_VISAS_PATH = "/our-visas";
 
 /**
  * Subject + CTA per event type. Keep subjects specific (they're what users scan in
@@ -224,6 +236,22 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     subject: "Update on your agency application",
     actionLabel: "View agency",
     path: () => "/account-settings?tab=agencyProfile",
+  },
+
+  // Agency-created visas (issue #101). No fixed subject: the title names the
+  // visa ("Seli approved <visa name>"), so it is the subject. The CTA opens
+  // the agency's "Our visas" screen in the portal (#104).
+  agency_visa_approved: {
+    actionLabel: "View your visas",
+    path: () => AGENCY_VISAS_PATH,
+  },
+  agency_visa_rejected: {
+    actionLabel: "Edit your visa",
+    path: () => AGENCY_VISAS_PATH,
+  },
+  agency_visa_made_global: {
+    actionLabel: "View your visas",
+    path: () => AGENCY_VISAS_PATH,
   },
 
   // Compliance (agency KYC/KYB/payout)

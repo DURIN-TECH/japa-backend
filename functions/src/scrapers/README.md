@@ -71,9 +71,14 @@ scrapers/
     guidance-snapshot.store.ts         snapshot text in Cloud Storage, keyed by content hash,
                                        create-only, backend-only (never served to a client)
     guidance-published-date.ts         publisher's own date, found by a per-source selector
+    guidance-resolve.ts                current address of a document that moves with each
+                                       publication, read from a stable parent page (#111)
+    guidance-quote-check.ts            passages that must appear verbatim in stored snapshots (#111)
     guidance-source.{controller,routes}.ts   GET /admin/guidance-sources (admin-only list)
-    data/                              seed-guidance-sources.ts: entries (data) + validator + loader
+    data/                              seed-guidance-sources.ts: entries (data) + validator + loader;
+                                       guidance-quote-checks.ts: the passages (data) (#111)
     scripts/                           seed-guidance-sources (CLI, dry run by default)
+    README.md                          runbook: adding a source, seeding, crawling, recovering
   rubric/                              visa rubrics (#40): guidance snapshots -> cited, versioned,
                                        machine-checkable criteria, staged `pending_review`.
                                        Types live in src/types/rubric.ts. Not scheduled, no routes.
@@ -126,10 +131,12 @@ snapshot before it is written (`rubric-quote.ts`,
 something else than its source. A quote that begins after a negation or a
 condition passes every check: "required to interview the applicant", quoted
 from "is **not** required to interview the applicant", is verbatim. The
-extractor raises the flag `quote_starts_mid_sentence` on a criterion whose
-quote begins part-way through a sentence, but that is a prompt to look, not a
-verdict, and it does not cover a qualifier that comes *after* the quote or in
-another sentence. **A human reviewer must read each quote in its source
+extractor raises `quote_starts_mid_sentence` on a criterion whose quote begins
+part-way through a sentence and `quote_ends_mid_sentence` when it stops before
+the end of its sentence (an exception such as "only where ..." may follow),
+but those are prompts to look, not verdicts, and they do not cover a qualifier
+in another sentence. Also per criterion: `multiple_dates_in_quote`. Standing on
+every version that has the content: `title_wording_uncited`. **A human reviewer must read each quote in its source
 context before approving a rubric.**
 
 Also for the reviewer, raised as flags on the version rather than decided by

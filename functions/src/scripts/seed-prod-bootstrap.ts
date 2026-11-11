@@ -131,8 +131,10 @@ async function seedProdAdmins(): Promise<number> {
       created++;
     }
 
-    // Ensure the profile doc exists with the admin field set (consulted by
-    // resolveRoleFromDb). merge:true preserves anything already there.
+    // Ensure the profile doc exists with the admin field set. The field does
+    // NOT grant the role (issue #135: the claim written below does); it is
+    // what the admin-notification fan-out reads. merge:true preserves
+    // anything already there.
     const now = Timestamp.now();
     await collections.users.doc(uid).set(
       {
