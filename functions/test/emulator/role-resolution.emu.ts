@@ -511,3 +511,300 @@ describe("correctly provisioned admins, owners and agents are unaffected", () =>
     });
   });
 });
+
+// ============================================
+// Invitations: only one issued by the agency's owner can be redeemed
+// ============================================
+
+describe("an invitation is honoured only when the agency's owner issued it", () => {
+  /** Put an invitation document in place with the Admin SDK (bypasses rules). */
+  async function seedInvitation(id: string, fields: Record<string, unknown>): Promise<void> {
+    await withoutRules(async (admin) => {
+      await admin.collection("agencyInvitations").doc(id).set({
+        id,
+        agencyName: "Some Agency",
+        invitedByName: "Someone",
+        status: "pending",
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 86_400_000),
+        ...fields,
+      });
+    });
+  }
+
+  test("a pre-existing invitation whose inviter is not the agency's owner is refused on both redemption paths", async () => {
+    const victim = await seedAgency("inv-forged");
+    const user = await signUp("inv-forged");
+    await provisionUserDoc(user);
+    const invitationId = `invite-${user.uid}`;
+    // Simulates a document written before clients were stopped from writing
+    // this collection: it names the user as BOTH inviter and invitee.
+    await seedInvitation(invitationId, {
+      agencyId: victim.agencyId,
+      invitedBy: user.uid,
+      invitedEmail: user.email,
+    });
+
+    const join = await api.call("POST", "/onboarding/join-agency", user.idToken, {
+      invitationId,
+      firstName: "Self",
+      lastName: "Invited",
+    });
+    const accept = await api.call("POST", `/invitations/${invitationId}/accept`, user.idToken);
+    const got = await resolved(await refreshIdToken(user));
+    let invitationStatus: unknown;
+    let agentDocs = -1;
+    await withoutRules(async (admin) => {
+      invitationStatus = (await admin.collection("agencyInvitations").doc(invitationId).get()).data().status;
+      agentDocs = (await admin.collection("agents").where("userId", "==", user.uid).get()).size;
+    });
+
+    assert.deepEqual(
+      {
+        joinStatus: join.status,
+        acceptStatus: accept.status,
+        acceptMessage: accept.body.message,
+        resolvedRole: got.role,
+        resolvedAgencyId: got.agencyId,
+        invitationStatus,
+        agentDocs,
+      },
+      {
+        joinStatus: 404,
+        acceptStatus: 400,
+        acceptMessage: "Invitation not found",
+        resolvedRole: "client",
+        resolvedAgencyId: null,
+        invitationStatus: "pending", // untouched
+        agentDocs: 0, // no membership was created
+      }
+    );
+  });
+
+  test("an invitation naming an agency that does not exist is refused", async () => {
+    const user = await signUp("inv-noagency");
+    await provisionUserDoc(user);
+    const invitationId = `invite-${user.uid}`;
+    await seedInvitation(invitationId, {
+      agencyId: "agency-that-is-not-there",
+      invitedBy: user.uid,
+      invitedEmail: user.email,
+    });
+    const join = await api.call("POST", "/onboarding/join-agency", user.idToken, {
+      invitationId,
+      firstName: "A",
+      lastName: "B",
+    });
+    assert.equal(join.status, 404);
+    assert.equal((await api.call("POST", `/invitations/${invitationId}/accept`, user.idToken)).status, 400);
+  });
+
+  test("an owner-issued invitation is still accepted through POST /invitations/:id/accept", async () => {
+    const agency = await seedAgency("inv-real");
+    const invitee = await signUp("inv-real-invitee");
+    await provisionUserDoc(invitee);
+    const invitationId = `invite-${invitee.uid}`;
+    await seedInvitation(invitationId, {
+      agencyId: agency.agencyId,
+      invitedBy: agency.owner.uid,
+      invitedEmail: invitee.email,
+    });
+
+    const accept = await api.call("POST", `/invitations/${invitationId}/accept`, invitee.idToken);
+    assert.equal(accept.status, 200, JSON.stringify(accept.body));
+    assert.deepEqual(await resolved(await refreshIdToken(invitee)), {
+      role: "agent",
+      agencyId: agency.agencyId,
+    });
+  });
+
+  test("an owner-issued invitation cannot be redeemed by another address, even by a user who already has an agent profile", async () => {
+    const agency = await seedAgency("inv-email");
+    const other = await signUp("inv-email-other");
+    await provisionUserDoc(other);
+    // `other` already has an (independent) agent profile.
+    await withoutRules(async (admin) => {
+      await admin.collection("agents").doc(`agent-${other.uid}`).set({
+        id: `agent-${other.uid}`,
+        userId: other.uid,
+        displayName: "Other",
+        verificationStatus: "pending",
+      });
+    });
+    const invitationId = `invite-for-someone-else-${other.uid}`;
+    await seedInvitation(invitationId, {
+      agencyId: agency.agencyId,
+      invitedBy: agency.owner.uid,
+      invitedEmail: "delivered+the-real-invitee@resend.dev",
+    });
+
+    const accept = await api.call("POST", `/invitations/${invitationId}/accept`, other.idToken);
+    const join = await api.call("POST", "/onboarding/join-agency", other.idToken, {
+      invitationId,
+      firstName: "A",
+      lastName: "B",
+    });
+    assert.deepEqual(
+      { accept: accept.status, acceptMessage: accept.body.message, join: join.status },
+      { accept: 400, acceptMessage: "This invitation was sent to a different email address.", join: 403 }
+    );
+    assert.deepEqual(await resolved(other.idToken), { role: "agent", agencyId: null });
+  });
+});
+
+// ============================================
+// Agency views take the role and agency from the resolved principal
+// ============================================
+
+describe("agency views (applications, payment requests, transactions) ignore the caller's agent document", () => {
+  let agency: Agency;
+  /** Owner / member tokens that carry their proper claims. */
+  let ownerToken: string;
+  let member: TestAccount;
+  let memberToken: string;
+  const APP_ID = "b2-app-1";
+  const PR_OWNER = "b2-pr-owner";
+  const PR_MEMBER = "b2-pr-member";
+  const TXN_ID = "b2-txn-1";
+
+  /** Set claims the way the server flows do, and return a token carrying them. */
+  async function withClaims(account: TestAccount, role: string, agencyId: string | null): Promise<string> {
+    const { auth } = await import("../../src/utils/firebase");
+    await auth.setCustomUserClaims(account.uid, { role, agencyId, admin: false });
+    return refreshIdToken(account);
+  }
+
+  /**
+   * A user whose agent document claims `agencyRole` in the test agency
+   * (written with the Admin SDK: data from before the protections), while
+   * their custom claims say `claimRole` with no agency.
+   */
+  async function outsider(name: string, agencyRole: string, claimRole: string): Promise<string> {
+    const user = await signUp(name);
+    await provisionUserDoc(user);
+    await withoutRules(async (admin) => {
+      await admin.collection("agents").doc(`agent-${user.uid}`).set({
+        id: `agent-${user.uid}`,
+        userId: user.uid,
+        agencyId: agency.agencyId,
+        agencyRole,
+        displayName: "Outsider",
+        verificationStatus: "verified",
+      });
+    });
+    return withClaims(user, claimRole, null);
+  }
+
+  /** Status of the three agency views for one token. */
+  async function views(token: string) {
+    const [apps, prs, txn] = await Promise.all([
+      api.call("GET", "/applications?role=owner", token),
+      api.call("GET", "/payment-requests?role=owner", token),
+      api.call("GET", `/transactions/${TXN_ID}`, token),
+    ]);
+    return {
+      applications: apps.status,
+      applicationIds: apps.status === 200 ? apps.body.data.map((a: any) => a.id) : null,
+      paymentRequests: prs.status,
+      paymentRequestIds: prs.status === 200 ? prs.body.data.map((p: any) => p.id).sort() : null,
+      transaction: txn.status,
+    };
+  }
+
+  before(async () => {
+    agency = await seedAgency("b2");
+    ownerToken = await withClaims(agency.owner, "owner", agency.agencyId);
+    member = await signUp("b2-member");
+    await provisionUserDoc(member);
+    await withoutRules(async (admin) => {
+      await admin.collection("agents").doc(`agent-${member.uid}`).set({
+        id: `agent-${member.uid}`,
+        userId: member.uid,
+        agencyId: agency.agencyId,
+        agencyRole: "agent",
+        displayName: "Member",
+        verificationStatus: "verified",
+      });
+      // One case, two payment requests and one transaction belonging to the agency.
+      await admin.collection("applications").doc(APP_ID).set({
+        id: APP_ID,
+        userId: "some-client",
+        agencyId: agency.agencyId,
+        agentId: agency.owner.uid,
+        status: "in_progress",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      await admin.collection("paymentRequests").doc(PR_OWNER).set({
+        id: PR_OWNER,
+        agencyId: agency.agencyId,
+        agentId: agency.ownerAgentDocId,
+        applicationId: APP_ID,
+        status: "pending",
+        createdAt: new Date(),
+      });
+      await admin.collection("paymentRequests").doc(PR_MEMBER).set({
+        id: PR_MEMBER,
+        agencyId: agency.agencyId,
+        agentId: `agent-${member.uid}`,
+        applicationId: APP_ID,
+        status: "pending",
+        createdAt: new Date(),
+      });
+      await admin.collection("transactions").doc(TXN_ID).set({
+        id: TXN_ID,
+        agentId: agency.owner.uid,
+        userId: "some-client",
+        applicationId: APP_ID,
+        amount: 50000,
+        status: "completed",
+        createdAt: new Date(),
+      });
+    });
+    memberToken = await withClaims(member, "agent", agency.agencyId);
+  });
+
+  test("agent document says OWNER of the agency, claims say client -> nothing from any of the three", async () => {
+    assert.deepEqual(await views(await outsider("b2-fake-owner", "owner", "client")), {
+      applications: 403,
+      applicationIds: null,
+      paymentRequests: 403,
+      paymentRequestIds: null,
+      transaction: 403,
+    });
+  });
+
+  test("agent document says MEMBER of the agency, claims say independent agent -> nothing from any of the three", async () => {
+    assert.deepEqual(await views(await outsider("b2-fake-member", "agent", "agent")), {
+      applications: 403,
+      applicationIds: null,
+      paymentRequests: 403,
+      paymentRequestIds: null,
+      transaction: 403,
+    });
+  });
+
+  test("the real owner sees the agency's cases, payment requests and transaction, as before", async () => {
+    assert.deepEqual(await views(ownerToken), {
+      applications: 200,
+      applicationIds: [APP_ID],
+      paymentRequests: 200,
+      paymentRequestIds: [PR_MEMBER, PR_OWNER].sort(),
+      transaction: 200,
+    });
+  });
+
+  test("a real member: no owner views; own payment requests and same-agency transaction still work", async () => {
+    assert.deepEqual(await views(memberToken), {
+      applications: 403, // unchanged: this view was already owner-only
+      applicationIds: null,
+      paymentRequests: 403, // owner view is now owner-only
+      paymentRequestIds: null,
+      transaction: 200, // unchanged: same agency
+    });
+    // The member's own (default "agent") view is untouched.
+    const own = await api.call("GET", "/payment-requests", memberToken);
+    assert.equal(own.status, 200, JSON.stringify(own.body));
+    assert.deepEqual(own.body.data.map((p: any) => p.id), [PR_MEMBER]);
+  });
+});

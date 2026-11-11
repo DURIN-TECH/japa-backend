@@ -29,15 +29,25 @@
  *     documents.
  *  4. Accounts whose custom claims place them in an agency that the records
  *     do not confirm, and agencies whose owner has no owner agent document.
+ *  5. Invitations (pending, accepted, any status) that were not issued by the
+ *     owner of the agency they name. The API refuses to redeem these, but a
+ *     pending one should be deleted and an accepted one means the membership
+ *     it produced must be reviewed. Such an invitation never counts as the
+ *     "accepted invitation" that backs a member in section 3.
  *
- * Usage (run by a human, once per project):
- *   npm run build
+ * Usage (run by a human, once per project; `npm run audit:roles` builds first):
  *   GOOGLE_APPLICATION_CREDENTIALS=<sa-key.json> \
- *     node lib/scripts/audit-role-trust.js --project durin-seli-dev
+ *     npm run audit:roles -- --project durin-seli-dev
  *   GOOGLE_APPLICATION_CREDENTIALS=<sa-key.json> \
- *     node lib/scripts/audit-role-trust.js --project japa-platform \
+ *     npm run audit:roles -- --project japa-platform \
  *       --expected-admins first@weareseli.com,second@weareseli.com
  *   # add --json to print the raw report object instead of text
+ *
+ * Emulator safety: when FIRESTORE_EMULATOR_HOST or FIREBASE_AUTH_EMULATOR_HOST
+ * is set, the Admin SDK reads the EMULATOR whatever --project says. The
+ * script therefore refuses a non-demo project id in that case (an empty
+ * emulator would otherwise look like an all-clear for the real project) and
+ * prints a banner whenever it is reading an emulator.
  *
  * A service-account key is needed for the same reason as seed-all.ts: user
  * ADC cannot list Auth users. A read-only role is enough
@@ -101,6 +111,11 @@ export type ClaimIssueCode =
   | "AGENT_CLAIM_NO_AGENT_DOC" // claims say agent of X; no agent document places them in X
   | "AGENCY_OWNER_NO_AGENT_DOC"; // agencies/X.ownerId has no owner agent document for X
 
+/** Why an invitation was reported. */
+export type InvitationIssueCode =
+  | "INVITER_NOT_AGENCY_OWNER" // invitedBy is not agencies/{agencyId}.ownerId
+  | "INVITATION_AGENCY_MISSING"; // agencyId names an agency that does not exist
+
 /** One reported issue on a record. */
 export interface Issue<Code extends string> {
   code: Code;
@@ -148,13 +163,32 @@ export interface ClaimFinding {
   issues: Issue<ClaimIssueCode>[];
 }
 
+/** An invitation not issued by the owner of the agency it names (section 5). */
+export interface InvitationFinding {
+  invitationId: string;
+  status: string | null;
+  agencyId: string | null;
+  invitedBy: string | null;
+  invitedEmail: string | null;
+  issues: Issue<InvitationIssueCode>[];
+}
+
 /** The whole report. Plain data: safe to JSON.stringify. */
 export interface AuditReport {
-  totals: { authUsers: number; agentDocs: number; agencies: number; acceptedInvitations: number };
+  totals: {
+    authUsers: number;
+    agentDocs: number;
+    agencies: number;
+    /** Invitations of every status. */
+    invitations: number;
+    /** Accepted invitations that were issued by the agency's owner. */
+    acceptedInvitations: number;
+  };
   adminFieldWithoutClaim: AdminFieldFinding[];
   adminClaimHolders: AdminClaimHolder[];
   agentFindings: AgentFinding[];
   claimFindings: ClaimFinding[];
+  invitationFindings: InvitationFinding[];
 }
 
 // ============================================
@@ -201,12 +235,14 @@ export async function auditRoleTrust(sources: AuditSources, options: AuditOption
   const { auth, collections } = sources;
 
   // ---- Load everything once (these collections are small).
-  const [authUsers, adminFlagSnap, agentSnap, agencySnap, acceptedInviteSnap] = await Promise.all([
+  const [authUsers, adminFlagSnap, agentSnap, agencySnap, inviteSnap] = await Promise.all([
     listAllUsers(auth),
     collections.users.where("admin", "==", true).get(),
     collections.agents.get(),
     collections.agencies.get(),
-    collections.agencyInvitations.where("status", "==", "accepted").get(),
+    // EVERY invitation, whatever its status: a pending one that was not
+    // issued by the agency's owner matters as much as an accepted one.
+    collections.agencyInvitations.get(),
   ]);
 
   /** Auth account by uid. */
@@ -215,12 +251,53 @@ export async function auditRoleTrust(sources: AuditSources, options: AuditOption
   const ownerByAgency = new Map<string, string | null>(
     agencySnap.docs.map((d) => [d.id, str(d.data().ownerId)])
   );
-  /** "agencyId|email" and "agencyId|agentDocId" keys of accepted invitations. */
+  // ---- Section 5 (computed first: section 3 depends on it): invitations
+  //      that were not issued by the owner of the agency they name.
+  const invitationFindings: InvitationFinding[] = [];
+  /**
+   * "agencyId|email" and "agencyId|agentDocId" keys of ACCEPTED invitations
+   * that the agency's owner issued. Only these can back a membership.
+   */
   const acceptedInvites = new Set<string>();
-  for (const d of acceptedInviteSnap.docs) {
+  let acceptedOwnerIssued = 0;
+  for (const d of inviteSnap.docs) {
     const inv = d.data();
     const agencyId = str(inv.agencyId);
-    if (!agencyId) continue;
+    const invitedBy = str(inv.invitedBy);
+    const status = str(inv.status);
+    const issues: Issue<InvitationIssueCode>[] = [];
+
+    if (!agencyId || !ownerByAgency.has(agencyId)) {
+      issues.push({
+        code: "INVITATION_AGENCY_MISSING",
+        severity: "high",
+        detail: agencyId ? `agencies/${agencyId} does not exist` : "no agencyId",
+      });
+    } else if (!invitedBy || ownerByAgency.get(agencyId) !== invitedBy) {
+      issues.push({
+        code: "INVITER_NOT_AGENCY_OWNER",
+        severity: "high",
+        detail:
+          `invitedBy is ${invitedBy ?? "(unset)"}; agencies/${agencyId}.ownerId is ` +
+          `${ownerByAgency.get(agencyId) ?? "(unset)"}` +
+          (status === "accepted" ? " — ACCEPTED: review the membership it produced" : ""),
+      });
+    }
+
+    if (issues.length > 0) {
+      invitationFindings.push({
+        invitationId: d.id,
+        status,
+        agencyId,
+        invitedBy,
+        invitedEmail: str(inv.invitedEmail),
+        issues,
+      });
+      continue; // never counts towards backing a membership
+    }
+
+    if (status !== "accepted" || !agencyId) continue;
+    acceptedOwnerIssued++;
     const email = lower(inv.invitedEmail);
     if (email) acceptedInvites.add(`${agencyId}|${email}`);
     const agentId = str(inv.invitedAgentId);
@@ -338,7 +415,7 @@ export async function auditRoleTrust(sources: AuditSources, options: AuditOption
             code: "MEMBER_NO_INVITATION",
             severity: "review",
             detail:
-              "no accepted invitation for this agency and account email (expected for members who " +
+              "no accepted, owner-issued invitation for this agency and account email (expected for members who " +
               "were seeded, added directly by an owner/admin, or changed email since)",
           });
         }
@@ -438,12 +515,14 @@ export async function auditRoleTrust(sources: AuditSources, options: AuditOption
       authUsers: authUsers.length,
       agentDocs: agentSnap.size,
       agencies: agencySnap.size,
-      acceptedInvitations: acceptedInviteSnap.size,
+      invitations: inviteSnap.size,
+      acceptedInvitations: acceptedOwnerIssued,
     },
     adminFieldWithoutClaim,
     adminClaimHolders,
     agentFindings,
     claimFindings,
+    invitationFindings,
   };
 }
 
@@ -459,7 +538,8 @@ export function formatAuditReport(report: AuditReport, projectId: string): strin
   add(`Role / membership audit for project: ${projectId}   (READ-ONLY: nothing was changed)`);
   add(
     `Scanned ${report.totals.authUsers} accounts, ${report.totals.agentDocs} agent documents, ` +
-      `${report.totals.agencies} agencies, ${report.totals.acceptedInvitations} accepted invitations.`
+      `${report.totals.agencies} agencies, ${report.totals.invitations} invitations ` +
+      `(${report.totals.acceptedInvitations} accepted and owner-issued).`
   );
 
   add();
@@ -503,12 +583,24 @@ export function formatAuditReport(report: AuditReport, projectId: string): strin
   }
 
   add();
+  add(`5. Invitations NOT issued by the agency's owner (any status): ${report.invitationFindings.length}`);
+  for (const f of report.invitationFindings) {
+    add(
+      `   - agencyInvitations/${f.invitationId}  status=${f.status ?? "-"}  agencyId=${f.agencyId ?? "-"}  ` +
+        `invitedBy=${f.invitedBy ?? "-"}  invitedEmail=${f.invitedEmail ?? "-"}`
+    );
+    for (const i of f.issues) add(`       [${i.severity}] ${i.code}: ${i.detail}`);
+  }
+
+  add();
   add("What to do with a finding (by hand, after confirming with the people involved):");
   add("  - A real admin in section 1: `npm run admin:grant -- --project <id> <email>`. Anyone else: clear users/{uid}.admin.");
   add("  - An unexpected admin in section 2: `npm run admin:revoke -- --project <id> <email>`, then review what the account did.");
   add("  - [high] items in 3 and 4: correct the agent document / claims to match the agency's real membership");
   add("    (PUT /users/:uid/role as an admin rewrites the claims), then have the user sign in again.");
   add("  - [review] items: confirm with the agency owner that the person is a member.");
+  add("  - Section 5: delete the invitation if it is pending; if it was accepted, treat the invited account's");
+  add("    agent document and claims as a [high] item (remove the membership unless the owner confirms it).");
   return lines.join("\n");
 }
 
@@ -535,7 +627,12 @@ function parseArgs(argv: string[]): { project?: string; expectedAdmins: string[]
 /** Entry point when run as `node lib/scripts/audit-role-trust.js`. */
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const onEmulator = Boolean(process.env.FIRESTORE_EMULATOR_HOST);
+  // EITHER variable redirects part of the Admin SDK to an emulator.
+  const emulatorHosts = [
+    ["FIRESTORE_EMULATOR_HOST", process.env.FIRESTORE_EMULATOR_HOST],
+    ["FIREBASE_AUTH_EMULATOR_HOST", process.env.FIREBASE_AUTH_EMULATOR_HOST],
+  ].filter(([, value]) => Boolean(value));
+  const onEmulator = emulatorHosts.length > 0;
 
   // Same project resolution as seed-all.ts / grant-admin.ts: no silent default
   // to a real project.
@@ -548,6 +645,37 @@ async function main(): Promise<void> {
   if (!projectId) {
     console.error("\nNo target project. Pass --project <id> (or run against the emulators).\n");
     process.exit(1);
+  }
+
+  // Emulator safety. With an emulator variable set, the SDK reads the emulator
+  // no matter which project is named, so "nothing found" would say nothing
+  // about the real project. Refuse a real project id outright, and require
+  // BOTH emulators (one alone would mix emulator data with a real service).
+  if (onEmulator) {
+    const names = emulatorHosts.map(([name, value]) => `${name}=${value}`).join(", ");
+    if (!projectId.startsWith("demo-")) {
+      console.error(
+        `\nRefusing to audit project "${projectId}": ${names} is set, so this run would read the ` +
+          "EMULATOR, not that project, and its result would look like an all-clear.\n" +
+          "Unset the emulator variable(s) to audit the real project, or pass a demo- project id " +
+          "to audit the emulator.\n"
+      );
+      process.exit(1);
+    }
+    if (emulatorHosts.length < 2) {
+      console.error(
+        `\nRefusing to run: only ${names} is set. Set both FIRESTORE_EMULATOR_HOST and ` +
+          "FIREBASE_AUTH_EMULATOR_HOST (emulator audit) or neither (real project).\n"
+      );
+      process.exit(1);
+    }
+    console.log(
+      "\n************************************************************\n" +
+        `* EMULATOR RUN (${names})\n` +
+        `* Project "${projectId}" is a local emulator project.\n` +
+        "* This says NOTHING about durin-seli-dev or japa-platform.\n" +
+        "************************************************************"
+    );
   }
 
   // Point the shared Admin SDK at this project BEFORE importing utils/firebase
