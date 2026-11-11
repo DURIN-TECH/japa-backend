@@ -49,6 +49,61 @@ const MONTHS: Record<string, number> = {
   december: 12, dec: 12,
 };
 
+/**
+ * Matches a NESTED QUANTIFIER in a pattern's source text: a group that
+ * contains a quantifier and is itself repeated, e.g. `(\d+)+`, `(a*)*`,
+ * `(?:\s+\w+)*`. That is the classic exponential-backtracking shape.
+ * Exported so every pattern that arrives as registry DATA (this module's
+ * date selector, and the link pattern in guidance-resolve.ts) is refused by
+ * the same rule.
+ */
+export const NESTED_QUANTIFIER_RE = /\([^()]*(?:[*+]|\{\d+,\d*\})[^()]*\)(?:[*+]|\{\d+,\d*\})/;
+
+/**
+ * True when a pattern's source has a QUANTIFIED GROUP THAT CONTAINS AN
+ * ALTERNATIVE: `(a|aa)+`, `(?:x|y)*`, `(a|b){2,}`, `(a|b)?`, or such a group
+ * nested inside a repeated one. Alternation under a repeat is the other
+ * exponential-backtracking shape (measured: the run time of `(?:a|a)*b`
+ * doubles with every extra character of input), and NESTED_QUANTIFIER_RE does
+ * not see it because the group holds no quantifier of its own.
+ *
+ * Refused for every quantifier, including the harmless `?` and `{n}`: the
+ * rule is then one sentence ("do not quantify a group that contains |"), and
+ * a pattern that needs an optional alternative can be written as two
+ * patterns' worth of literal text or with a character class.
+ *
+ * A scanner, not a regular expression: it has to tell `(a|b)+` from `[(|)]+`
+ * and from an escaped `\(`.
+ */
+export function hasQuantifiedAlternation(pattern: string): boolean {
+  // One entry per open group: does it (or a group inside it) contain a `|`?
+  const open: boolean[] = [];
+  let inClass = false; // inside [...]
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "\\") {
+      i++; // the next character is escaped: skip it
+    } else if (inClass) {
+      if (c === "]") inClass = false;
+    } else if (c === "[") {
+      inClass = true;
+    } else if (c === "(") {
+      open.push(false);
+    } else if (c === "|") {
+      if (open.length > 0) open[open.length - 1] = true;
+    } else if (c === ")") {
+      const hadAlternative = open.pop() ?? false;
+      if (hadAlternative) {
+        const next = pattern[i + 1];
+        if (next === "*" || next === "+" || next === "?" || next === "{") return true;
+        // A group holding this one contains the alternative too.
+        if (open.length > 0) open[open.length - 1] = true;
+      }
+    }
+  }
+  return false;
+}
+
 /** The publisher's date as found in a document. */
 export interface PublishedDate {
   // ISO calendar date (YYYY-MM-DD) when the text could be parsed, else null.
@@ -94,8 +149,12 @@ export function publishedDateSelectorProblem(selector: string): string | undefin
   // 2. A nested quantifier: a group that contains a quantifier and is itself
   //    repeated, e.g. `(\d+)+`, `(a*)*`, `(?:\s+\w+)*`. That is the classic
   //    exponential-backtracking shape.
-  if (/\([^()]*(?:[*+]|\{\d+,\d*\})[^()]*\)(?:[*+]|\{\d+,\d*\})/.test(selector)) {
+  if (NESTED_QUANTIFIER_RE.test(selector)) {
     return "publishedDateSelector must not repeat a group that itself contains a quantifier (nested quantifiers)";
+  }
+  // 3. Alternation under a repeat, e.g. `(a|aa)+`: see hasQuantifiedAlternation.
+  if (hasQuantifiedAlternation(selector)) {
+    return "publishedDateSelector must not quantify a group that contains an alternative (|)";
   }
   return undefined;
 }

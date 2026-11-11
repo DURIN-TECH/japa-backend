@@ -72,6 +72,19 @@ export const collections = {
   agencies: db.collection("agencies"),
   countries: db.collection("countries"),
   applications: db.collection("applications"),
+  // CANONICAL home of uploaded application documents (issue #28): the
+  // TOP-LEVEL `documents` collection, one doc per uploaded file, linked to its
+  // application by the `applicationId` field (and to the client by `userId`).
+  // This is the path services/document.service.ts reads and writes, the seeder
+  // (data/seed-portal-data.ts) writes, and the per-application document limit
+  // counts. There is deliberately NO `applications/{id}/documents`
+  // subcollection and no `subcollections.documents()` helper: that second path
+  // was the "split-brain" (seeded there, read here, so nothing seeded was ever
+  // visible). Do not reintroduce it. Composite indexes for this collection
+  // (applicationId + uploadedAt, applicationId + requirementId + uploadedAt)
+  // live in firestore.indexes.json. Backend-only: no firestore.rules match ->
+  // clients are denied and go through the API, which authorizes via CASL.
+  documents: db.collection("documents"),
   transactions: db.collection("transactions"),
   consultations: db.collection("consultations"),
   notifications: db.collection("notifications"),
@@ -220,10 +233,10 @@ export const subcollections = {
       .doc(visaTypeId)
       .collection("requirements"),
   
-  // Documents under applications
-  documents: (applicationId: string) =>
-    collections.applications.doc(applicationId).collection("documents"),
-  
+  // NOTE: there is intentionally no `documents` helper here. Application
+  // documents live in the TOP-LEVEL `collections.documents` (filter by
+  // `applicationId`), never under `applications/{id}/documents` (issue #28).
+
   // Timeline under applications
   timeline: (applicationId: string) =>
     collections.applications.doc(applicationId).collection("timeline"),
@@ -263,6 +276,13 @@ export const subcollections = {
   // A version's content is immutable once written. Backend-only, like its parent.
   rubricVersions: (routeKey: string) =>
     collections.visaRubrics.doc(routeKey).collection("rubricVersions"),
+
+  // An agency's per-visa service prices (issue #103), in whole NAIRA:
+  // `agencies/{agencyId}/visaPrices/{countryCode}__{visaTypeId}`. Written and
+  // read only by src/agency-visa-prices (no firestore.rules match for the
+  // subcollection -> clients denied). A function so tests can swap a fake.
+  agencyVisaPrices: (agencyId: string) =>
+    collections.agencies.doc(agencyId).collection("visaPrices"),
 } as const;
 
 // Firestore timestamp helpers

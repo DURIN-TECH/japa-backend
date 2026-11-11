@@ -30,6 +30,7 @@ import { ROLES, defineAbilitiesFor } from "@durin-tech/authz";
 import type { Role } from "@durin-tech/authz";
 
 import { Data, installFakes, resetStore, store, writes } from "../../../helpers/fake-firestore";
+import { installAdminClaimsFromUserDocs } from "../../../helpers/fake-admin-claims";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 let storeMod: any; // shared/settings/scraper-settings.store
@@ -59,6 +60,9 @@ let extractCalls = 0;
 
 before(async () => {
   await installFakes();
+  // Alert recipients are chosen by admin custom claim (issue #135): fake
+  // Auth so a seeded users/{uid} document with `admin: true` is an admin.
+  await installAdminClaimsFromUserDocs();
   storeMod = await import("../../../../src/scrapers/shared/settings/scraper-settings.store");
   validate = await import("../../../../src/scrapers/shared/settings/scraper-settings.validate");
   controller = (await import("../../../../src/scrapers/shared/settings/scraper-settings.controller")).scraperSettingsController;

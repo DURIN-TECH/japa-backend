@@ -2,9 +2,16 @@
  * One-time migration: backfill RBAC role claims for every existing Firebase Auth
  * user from current Firestore state.
  *
- * Reconciles the previous dual-admin model (custom claim vs `users/{id}.admin`
- * field) and the collection-lookup agent/owner model into a single canonical
- * `role` (+ `agencyId`) custom claim. Idempotent — safe to re-run.
+ * Folds the older claim shapes and the collection-lookup agent/owner model into
+ * a single canonical `role` (+ `agencyId`) custom claim. Idempotent — safe to
+ * re-run.
+ *
+ * Since issue #135 the `users/{id}.admin` document field is NOT a source of the
+ * admin role: only an existing admin custom claim is. An account that was
+ * flagged admin on its profile document alone is NOT promoted here (it gets
+ * the role its agent document implies, and a warning is logged). Run
+ * scripts/audit-role-trust.ts first to list such accounts, and grant the real
+ * ones with `npm run admin:grant`.
  *
  * Run:  npm run build && node lib/scripts/backfill-claims.js
  * (Against the emulator: set FIREBASE_AUTH_EMULATOR_HOST / FIRESTORE_EMULATOR_HOST.)
