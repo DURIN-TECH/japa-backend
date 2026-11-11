@@ -35,6 +35,9 @@ import { pickAllowedFields } from "../../src/utils/pick-allowed-fields";
 /** uid -> custom claims: the in-memory stand-in for Firebase Auth. */
 const claims = new Map<string, Record<string, unknown>>();
 
+/** When true, every Auth lookup fails with a non-"not found" error. */
+let authOutage = false;
+
 /** Put a Firestore document in the fake store. */
 const put = (path: string, data: Record<string, unknown>) => store.set(path, data);
 
@@ -48,9 +51,14 @@ before(async () => {
   firebase.collections.agencies = fakeCollection("agencies");
   // Auth: only the calls the claims service makes.
   firebase.auth.getUser = async (uid: string) => {
-    if (!claims.has(uid)) throw new Error("auth/user-not-found");
+    if (authOutage) throw Object.assign(new Error("backend unavailable"), { code: "auth/internal-error" });
+    if (!claims.has(uid)) throw Object.assign(new Error("no such user"), { code: "auth/user-not-found" });
     return { uid, customClaims: claims.get(uid) };
   };
+  firebase.auth.listUsers = async () => ({
+    users: [...claims.entries()].map(([uid, customClaims]) => ({ uid, customClaims })),
+    pageToken: undefined,
+  });
   firebase.auth.setCustomUserClaims = async (uid: string, next: Record<string, unknown>) => {
     claims.set(uid, next);
   };
@@ -59,6 +67,7 @@ before(async () => {
 beforeEach(() => {
   resetStore();
   claims.clear();
+  authOutage = false;
   mock.restoreAll();
 });
 
@@ -103,6 +112,27 @@ describe("resolveRoleFromDb: admin comes from custom claims only", () => {
     const warnings = captureWarnings();
     await claimsService.resolveRoleFromDb("u1");
     assert.deepEqual(warnings, []);
+  });
+
+  test("an account that does not exist in Auth has no claims -> client", async () => {
+    assert.deepEqual(await claimsService.resolveRoleFromDb("ghost"), { role: ROLES.CLIENT, agencyId: null });
+  });
+
+  test("any other Auth failure is rethrown: a transient error can never resolve an admin to a lower role", async () => {
+    claims.set("u1", { role: "admin", admin: true });
+    authOutage = true;
+    await assert.rejects(claimsService.resolveRoleFromDb("u1"), /backend unavailable/);
+    // ...so syncClaimsFromDb writes nothing and the admin claim survives.
+    await assert.rejects(claimsService.syncClaimsFromDb("u1"), /backend unavailable/);
+    assert.deepEqual(claims.get("u1"), { role: "admin", admin: true });
+  });
+
+  test("listAdminUids returns claim holders only, never profile-flagged accounts", async () => {
+    claims.set("a1", { role: "admin" });
+    claims.set("a2", { admin: true });
+    claims.set("u1", { role: "client" });
+    put("users/u1", { id: "u1", admin: true });
+    assert.deepEqual((await claimsService.listAdminUids()).sort(), ["a1", "a2"]);
   });
 
   test("ignoreAdmin: an admin who also owns an agency resolves to owner (demotion path)", async () => {
@@ -158,6 +188,15 @@ describe("resolveRoleFromDb: agency membership is checked against the agency", (
     const warnings = captureWarnings();
     assert.deepEqual(await claimsService.resolveRoleFromDb("u1"), { role: ROLES.AGENT, agencyId: null });
     assert.match(warnings.join("\n"), /does not exist/);
+  });
+
+  test("malformed agencyId (not a string, or a path) -> independent agent, logged, nothing thrown", async () => {
+    const warnings = captureWarnings();
+    for (const bad of [42, { id: "ag1" }, ["ag1"], "ag1/agents/x", true]) {
+      put("agents/a1", { id: "a1", userId: "u1", agencyId: bad, agencyRole: "owner" });
+      assert.deepEqual(await claimsService.resolveRoleFromDb("u1"), { role: ROLES.AGENT, agencyId: null });
+    }
+    assert.equal(warnings.filter((w) => /malformed agencyId/.test(w)).length, 5);
   });
 
   test("independent agent profile (no agency) -> agent, no agency", async () => {

@@ -143,7 +143,16 @@ class ClaimsService {
     // 1. Admin — custom claims only, unless the caller asked us to ignore
     //    admin (demotion).
     if (!opts.ignoreAdmin) {
-      const authUser = await auth.getUser(uid).catch(() => null);
+      // Only "this account does not exist" means "no claims". Any other Auth
+      // failure (network, quota, permission) is rethrown: treating it as "not
+      // an admin" would let a transient error resolve a real admin to a lower
+      // role, and the lazy backfill would then write that role into their
+      // claims. The request-time caller (middleware/auth.ts) already falls
+      // back to least privilege for THAT request without writing anything.
+      const authUser = await auth.getUser(uid).catch((error: unknown) => {
+        if ((error as { code?: string })?.code === "auth/user-not-found") return null;
+        throw error;
+      });
       if (claimsSayAdmin(authUser?.customClaims)) {
         return { role: ROLES.ADMIN, agencyId: null };
       }
@@ -162,6 +171,16 @@ class ClaimsService {
       for (const doc of agentSnap.docs) {
         const agent = doc.data() as Agent;
         if (!agent.agencyId) continue; // independent profile: nothing to check
+        // `agencyId` must be a usable document id. Anything else (a number, an
+        // object, a path with a slash) is malformed data, never a membership:
+        // skip it explicitly rather than let doc() throw.
+        if (typeof agent.agencyId !== "string" || agent.agencyId.includes("/")) {
+          console.warn(
+            `[authz] agent document ${doc.id} has a malformed agencyId; ` +
+              `not granting agency access to user ${uid}`
+          );
+          continue;
+        }
 
         const agencyDoc = await collections.agencies.doc(agent.agencyId).get();
         if (!agencyDoc.exists) {
@@ -232,6 +251,26 @@ class ClaimsService {
   async isAdmin(uid: string): Promise<boolean> {
     const user = await auth.getUser(uid).catch(() => null);
     return claimsSayAdmin(user?.customClaims);
+  }
+
+  /**
+   * The uids of every account that currently holds the admin role, read from
+   * custom claims (the only source of the role, issue #135). Used to decide
+   * who receives admin notifications, so that a `users/{uid}.admin` document
+   * field can never put someone on that list. A full scan of Auth users, like
+   * countAdmins below: fine for the rare events that notify admins.
+   */
+  async listAdminUids(): Promise<string[]> {
+    const uids: string[] = [];
+    let nextPageToken: string | undefined;
+    do {
+      const page = await auth.listUsers(1000, nextPageToken);
+      for (const user of page.users) {
+        if (claimsSayAdmin(user.customClaims)) uids.push(user.uid);
+      }
+      nextPageToken = page.pageToken;
+    } while (nextPageToken);
+    return uids;
   }
 
   /**
