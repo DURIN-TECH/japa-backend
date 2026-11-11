@@ -7,6 +7,7 @@ import {
 } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 import { claimsService } from "./claims.service";
+import { pickAllowedFields } from "../utils/pick-allowed-fields";
 
 export interface CreateAgentInput {
   userId: string;
@@ -36,6 +37,40 @@ export interface UpdateAgentInput {
   isAvailable?: boolean;
   availableSlots?: AvailabilitySlot[];
 }
+
+/**
+ * The ONLY fields an agent may change on their own agent document through
+ * `PUT /agents/me` (issue #135): exactly the keys of `UpdateAgentInput`.
+ * `updateAgent` copies these from the request and ignores every other key.
+ *
+ * Why an allow-list: the request body comes straight from the client and the
+ * Admin SDK bypasses firestore.rules. Fields that decide what the agent may
+ * do, or how they are presented, must never be copied from it: `agencyId` /
+ * `agencyRole` (agency membership and ownership; read by the role lookup),
+ * `verificationStatus` / `verifiedAt` / `verifiedBy` / `verificationDocuments`
+ * (the verification decision), `userId` (who the profile belongs to), and the
+ * computed stats (`rating`, `totalReviews`, `totalApplications`,
+ * `successRate`, `responseTime`). Those are written only by the dedicated
+ * server flows (onboarding, invitations, agency member endpoints, admin
+ * verification, review aggregation).
+ *
+ * See also `selfEditableAgentFields()` in firestore.rules (direct client
+ * writes; slightly stricter, it leaves out `isAvailable`).
+ */
+export const AGENT_SELF_EDITABLE_FIELDS = [
+  "displayName",
+  "bio",
+  "profilePhotoUrl",
+  "licenseNumber",
+  "yearsOfExperience",
+  "specializations",
+  "languages",
+  "featuredVisas",
+  "consultationFee",
+  "serviceFees",
+  "isAvailable",
+  "availableSlots",
+] as const;
 
 export interface AgentFilters {
   specialization?: string;
@@ -198,8 +233,11 @@ class AgentService {
       throw new Error("Agent not found");
     }
 
+    // Copy ONLY the self-editable profile fields (issue #135): `input` is the
+    // raw request body for PUT /agents/me (see AGENT_SELF_EDITABLE_FIELDS for
+    // what must stay server-written). Unknown keys are dropped silently.
     await agentRef.update({
-      ...input,
+      ...pickAllowedFields(input, AGENT_SELF_EDITABLE_FIELDS),
       updatedAt: serverTimestamp(),
     });
 
