@@ -75,14 +75,14 @@ async function printRegistryState(sourceIds: readonly string[]): Promise<void> {
         snapshotCount: all.size,
         latestSnapshot: meta
           ? {
-              charCount: meta.charCount,
-              byteLength: meta.byteLength,
-              pageCount: meta.pageCount,
-              pagesWithoutText: meta.pagesWithoutText,
-              sourceByteLength: meta.sourceByteLength,
-              httpStatus: meta.httpStatus,
-              fetchedAt: iso(meta.fetchedAt),
-            }
+            charCount: meta.charCount,
+            byteLength: meta.byteLength,
+            pageCount: meta.pageCount,
+            pagesWithoutText: meta.pagesWithoutText,
+            sourceByteLength: meta.sourceByteLength,
+            httpStatus: meta.httpStatus,
+            fetchedAt: iso(meta.fetchedAt),
+          }
           : null,
       })}`
     );

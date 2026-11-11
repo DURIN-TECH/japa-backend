@@ -81,7 +81,7 @@ export interface PassageLocation {
 export function foldTypography(text: string): string {
   return text
     .replace(/[‘’‚‛′]/g, "'")
-    .replace(/[“”„‟″]/g, '"')
+    .replace(/[“”„‟″]/g, "\"")
     .replace(/[‐-―−]/g, "-");
 }
 

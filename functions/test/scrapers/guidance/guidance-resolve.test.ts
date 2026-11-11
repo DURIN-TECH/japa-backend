@@ -74,11 +74,11 @@ const PAGES_V2 = [`Handbook\nThis handbook was issued to keepers on 9 September 
 
 /** The parent page, linking to the given files (plus unrelated links). */
 const listing = (...files: string[]) =>
-  `<html><body><main><h1>Lighthouse keeper handbook</h1>` +
-  `<a href="/publications">All publications</a>` +
+  "<html><body><main><h1>Lighthouse keeper handbook</h1>" +
+  "<a href=\"/publications\">All publications</a>" +
   `<a href="https://${FILE_HOST}/media/cc33/cover.png">Cover image</a>` +
   files.map((f) => `<a class="attachment" href="${f}">Download</a>`).join("") +
-  `</main></body></html>`;
+  "</main></body></html>";
 
 // ----- Stub HTTP client -----
 
@@ -245,17 +245,17 @@ describe("guidance resolveFrom: finding the link", () => {
   test("only links that match the whole pattern count; relative links are resolved; duplicates collapse", () => {
     const page =
       `<a href="${FILE_V1}">a</a><a href="${FILE_V1}#page=2">same file, with a fragment</a>` +
-      `<a href="/media/aa11/handbook.pdf">relative, so on the PAGE host</a>` +
+      "<a href=\"/media/aa11/handbook.pdf\">relative, so on the PAGE host</a>" +
       `<a href="${FILE_V1}.sig">longer than the pattern</a>` +
       `<a href="http://${FILE_HOST}/media/aa11/handbook.pdf">not https</a>` +
-      `<a href="https://files.gamma-registry.example.evil.example/media/aa11/handbook.pdf">another host</a>` +
-      `<a href="mailto:keeper@gamma-registry.example">mail</a><a>no href</a>`;
+      "<a href=\"https://files.gamma-registry.example.evil.example/media/aa11/handbook.pdf\">another host</a>" +
+      "<a href=\"mailto:keeper@gamma-registry.example\">mail</a><a>no href</a>";
     assert.deepEqual(findMatchingLinks(page, PAGE_URL, LINK_PATTERN), [FILE_V1]);
   });
 
   test("a relative link is resolved against the page it is on", () => {
     const pattern = "https://www\\.gamma-registry\\.example/files/[a-z]+\\.pdf";
-    assert.deepEqual(findMatchingLinks(`<a href="../files/handbook.pdf">x</a>`, PAGE_URL, pattern), [
+    assert.deepEqual(findMatchingLinks("<a href=\"../files/handbook.pdf\">x</a>", PAGE_URL, pattern), [
       `https://${PAGE_HOST}/files/handbook.pdf`,
     ]);
   });

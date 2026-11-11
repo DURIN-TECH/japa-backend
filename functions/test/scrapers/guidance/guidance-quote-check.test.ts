@@ -16,7 +16,7 @@
 // the real documents, by the seed script (`--check-quotes`), never here:
 // `npm test` makes no network request.
 
-import { describe, test } from "node:test";
+import { before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -36,6 +36,12 @@ import {
 } from "../../../src/scrapers/guidance/guidance-quote-check";
 import { extractPublishedDate } from "../../../src/scrapers/guidance/guidance-published-date";
 import { sha256Hex } from "../../../src/scrapers/guidance/guidance-snapshot.store";
+import { buildSeededGuidanceSource } from "../../../src/scrapers/guidance/data/seed-guidance-sources";
+import { guidanceSourceController } from "../../../src/scrapers/guidance/guidance-source.controller";
+import { Timestamp } from "firebase-admin/firestore";
+import { ROLES, defineAbilitiesFor } from "@durin-tech/authz";
+import type { Role } from "@durin-tech/authz";
+import { fakeCollection, resetStore, store } from "../../helpers/fake-firestore";
 import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
 
 // ----- Synthetic snapshots (fictional text) -----
@@ -235,6 +241,51 @@ describe("committed guidance seed data", () => {
       const found = extractPublishedDate(`Sample heading\n${leadIn}1 January 2030\nSample body`, seed.publishedDateSelector);
       assert.deepEqual(found, { publishedDate: "2030-01-01", publishedDateText: "1 January 2030" }, seed.id);
     }
+  });
+
+  // ---- The admin list over the committed entries ----
+
+  /** Call GET /admin/guidance-sources as `role`; returns status and body. */
+  async function list(role: Role): Promise<{ status: number; body: any }> {
+    const out = { status: 0, body: undefined as any };
+    const res: any = {
+      status: (code: number) => ((out.status = code), res),
+      json: (b: unknown) => ((out.body = b), res),
+    };
+    const authz = { uid: `${role}-uid`, role, agencyId: role === ROLES.OWNER || role === ROLES.AGENT ? "ag1" : null };
+    await guidanceSourceController.list({ params: {}, query: {}, body: {}, userId: authz.uid, authz, ability: defineAbilitiesFor(authz) } as any, res);
+    return out;
+  }
+
+  before(async () => {
+    const firebase: any = await import("../../../src/utils/firebase");
+    firebase.collections.guidanceSources = fakeCollection("guidanceSources");
+  });
+
+  test("the admin list returns every committed entry with lastFetchedAt, status and verificationStatus; a non-admin gets FORBIDDEN", async () => {
+    resetStore();
+    const now = Timestamp.fromMillis(Date.parse("2026-11-11T02:00:00Z"));
+    for (const seed of GUIDANCE_SOURCE_SEEDS) {
+      // As seeded, then as a first successful crawl would stamp it.
+      store.set(`guidanceSources/${seed.id}`, { ...buildSeededGuidanceSource(seed, undefined, now), lastFetchedAt: now });
+    }
+    const out = await list(ROLES.ADMIN);
+    assert.equal(out.status, 200);
+    assert.equal(out.body.data.total, GUIDANCE_SOURCE_SEEDS.length);
+    const byId = new Map<string, any>(out.body.data.sources.map((s: any) => [s.id, s]));
+    for (const seed of GUIDANCE_SOURCE_SEEDS) {
+      const item = byId.get(seed.id);
+      assert.ok(item, seed.id);
+      assert.equal(item.lastFetchedAt, "2026-11-11T02:00:00.000Z");
+      assert.equal(item.status, "active");
+      assert.equal(item.verificationStatus, seed.verificationStatus);
+      assert.equal(item.url, seed.url);
+      assert.equal(item.resolveFromPageUrl, seed.resolveFrom?.pageUrl ?? null);
+    }
+    const denied = await list(ROLES.AGENT);
+    assert.equal(denied.status, 403);
+    assert.equal(denied.body.error, "FORBIDDEN");
+    assert.equal(denied.body.data, undefined);
   });
 
   test("generic by design: no guidance CODE file names anything that belongs to a seed entry", () => {
