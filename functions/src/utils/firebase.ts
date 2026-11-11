@@ -232,6 +232,10 @@ export const collections = {
   bulkReassessments: db.collection("bulkReassessments"),
   assessmentBatches: db.collection("assessmentBatches"),
   documentExtractions: db.collection("documentExtractions"),
+  // Rule-change alerts (issue #123): one event per admin-approved change, one
+  // notice (the dedupe claim) per event and application. Backend-only.
+  ruleChangeEvents: db.collection("ruleChangeEvents"),
+  ruleChangeNotices: db.collection("ruleChangeNotices"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all

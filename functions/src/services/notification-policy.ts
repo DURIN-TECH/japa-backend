@@ -28,6 +28,8 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   // Bulk re-assessment found a worse result after a rule change (#37): the
   // reviewing agent should hear about it on every channel.
   assessment_rules_updated: FULL,
+  // Approved rule / published-detail change on a route with in-flight cases (#123).
+  rule_change_alert: FULL,
   // Documents
   document_status: FULL,
   document_uploaded: FULL,
