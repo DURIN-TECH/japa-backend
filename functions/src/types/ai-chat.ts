@@ -18,8 +18,9 @@ import type { Timestamp } from "firebase-admin/firestore";
 //
 // Pure module: types and constants only.
 
-/** The entitlement feature key that gates chat. SEPARATE from `ai.case_officer`. */
-export const CHAT_FEATURE_KEY = "ai.chat";
+// NOTE: there is deliberately NO chat-specific entitlement key. Chat is part of
+// the AI case officer: every plan with `FEATURES.AI_CASE_OFFICER` (`ai.case_officer`)
+// gets chat. The gate lives in controllers/ai-chat.controller.ts (chatGate).
 
 /** Longest user message accepted (characters, after trimming). */
 export const CHAT_MAX_MESSAGE_CHARS = 1000;

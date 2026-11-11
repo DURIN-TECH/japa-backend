@@ -1,12 +1,12 @@
 import { Response } from "express";
-import { ROLES, hasFeature, type FeatureKey } from "@durin-tech/authz";
+import { ROLES } from "@durin-tech/authz";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { paymentRequired } from "../middleware/authz";
 import { collections } from "../utils/firebase";
 import { checkApplicationAccessForRequest } from "../utils/access";
 import { sendError, sendSuccess, sendNotFound, sendForbidden } from "../utils/response";
 import type { Application } from "../types";
-import { CHAT_FEATURE_KEY, CHAT_MAX_MESSAGE_CHARS } from "../types/ai-chat";
+import { CHAT_MAX_MESSAGE_CHARS } from "../types/ai-chat";
 import { aiChatService, type ChatPrincipal } from "../services/ai-chat.service";
 import { tierFor, type AssessmentTier } from "../services/ai/tier-serializer";
 
@@ -25,7 +25,7 @@ import { tierFor, type AssessmentTier } from "../services/ai/tier-serializer";
 //   2. checkApplicationAccess `read` on it (403 FORBIDDEN): a cross-agency
 //      caller stops here, and history is addressed by (application, uid) so one
 //      user's or agency's history is never reachable by another;
-//   3. the chat entitlement gate, which FAILS CLOSED (see chatGate);
+//   3. the chat entitlement gate (`ai.case_officer`, no separate chat key), which FAILS CLOSED (see chatGate);
 //   4. the tier (same function as the assessment routes) so the answer is
 //      grounded only in what that caller may already see.
 
@@ -40,20 +40,24 @@ function principalOf(req: AuthenticatedRequest): ChatPrincipal | null {
  * The entitlement gate for chat. Differs from `requireFeature` on purpose:
  * that middleware lets a caller with UNRESOLVED entitlements through; chat
  * spends money, so unresolved means no.
- *   admin                                  -> allowed
- *   entitlements not resolved              -> "unresolved" (403)
- *   resolved and plan includes the key     -> allowed
- *   resolved, key absent / plan lapsed     -> "locked" (402)
+ *   admin                                          -> allowed
+ *   entitlements not resolved                      -> "unresolved" (403)
+ *   resolved and plan includes `ai.case_officer`   -> allowed
+ *   resolved, feature absent / plan lapsed         -> "locked" (402)
  *
- * NOTE: `ai.chat` is not in the vendored @durin-tech/authz catalog yet (the
- * catalog change is a separate repo and an owed follow-up). Until it is added
- * and re-vendored, no plan carries the key and only admins pass. Replace
- * CHAT_FEATURE_KEY with `FEATURES.AI_CHAT` when it lands.
+ * Product decision: chat is NOT a separately sold feature. It rides on the AI
+ * case officer, so every paid plan that has `FEATURES.AI_CASE_OFFICER` gets it
+ * with no extra catalog key or seeding. The "has the feature" question is
+ * answered by `tierFor` (the same function the assessment routes use), so the
+ * entitlement rule lives in exactly one place: tier "full" == has the feature
+ * (or admin). We only add the extra "unresolved" branch on top, because
+ * `tierFor` folds unresolved into "free" and chat must tell the two apart
+ * (403 vs 402).
  */
 function chatGate(req: AuthenticatedRequest): "ok" | "unresolved" | "locked" {
   if (req.authz?.role === ROLES.ADMIN) return "ok";
   if (!req.entitlements) return "unresolved";
-  return hasFeature(req.entitlements, CHAT_FEATURE_KEY as FeatureKey) ? "ok" : "locked";
+  return tierFor(req.authz?.role, req.entitlements) === "full" ? "ok" : "locked";
 }
 
 /** The application for a path id, or null. */
@@ -83,7 +87,7 @@ async function authorize(
     return null;
   }
   if (gate === "locked") {
-    paymentRequired(res, "Chat is not included in your plan.");
+    paymentRequired(res, "Chat is not included in your plan. Upgrade to use the AI case officer and chat.");
     return null;
   }
   return { app, principal, tier: tierFor(req.authz?.role, req.entitlements) };
