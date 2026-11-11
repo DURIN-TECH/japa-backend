@@ -219,6 +219,13 @@ export const collections = {
   // Per-day AI spend counters, one document per UTC day (`aiCosts/{YYYY-MM-DD}`).
   // Written in a transaction per assessment; read by the daily cap. Backend-only.
   aiCosts: db.collection("aiCosts"),
+  // Audit trail of rubric review decisions (issue #125): one doc per approve
+  // or reject (who, when, route, version, action, reason, the flags the
+  // reviewer acknowledged, the version that was serving before). Written in
+  // the SAME transaction as the decision by services/rubric-review.service.ts,
+  // so a decision never exists without its record. Append-only.
+  // Backend-only: no firestore.rules match -> clients denied.
+  rubricReviewHistory: db.collection("rubricReviewHistory"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all
@@ -229,6 +236,12 @@ export const collectionGroups = {
   // knowing their country (indexes: visaTypes ownerAgencyId + createdAt and
   // ownerAgencyId + id, COLLECTION_GROUP scope).
   visaTypes: () => db.collectionGroup("visaTypes"),
+  // Every `visaRubrics/{routeKey}/rubricVersions` subcollection at once
+  // (issue #125): the admin review queue lists rubric versions of all routes
+  // by review status, newest first (index: rubricVersions reviewStatus +
+  // createdAt DESC, COLLECTION_GROUP scope). ADMIN REVIEW ONLY: it returns
+  // versions of any status, so it must never back a client-facing route.
+  rubricVersions: () => db.collectionGroup("rubricVersions"),
 };
 
 // Helper to get subcollection references
