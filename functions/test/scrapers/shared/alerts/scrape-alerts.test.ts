@@ -37,6 +37,7 @@ import { ROLES, defineAbilitiesFor } from "@durin-tech/authz";
 import type { Role } from "@durin-tech/authz";
 
 import { Data, installFakes, resetStore, store } from "../../../helpers/fake-firestore";
+import { installAdminClaimsFromUserDocs } from "../../../helpers/fake-admin-claims";
 
 // Project id (GCLOUD_PROJECT=demo-unit-test) and the no-network guard are set
 // centrally by the test preload, test/helpers/setup.ts (issue #94).
@@ -58,6 +59,9 @@ let logs: any[] = [];
 
 before(async () => {
   await installFakes();
+  // Alert recipients are chosen by admin custom claim (issue #135): fake
+  // Auth so a seeded users/{uid} document with `admin: true` is an admin.
+  await installAdminClaimsFromUserDocs();
   rules = await import("../../../../src/scrapers/shared/alerts/scrape-alert-rules");
   alertsMod = await import("../../../../src/scrapers/shared/alerts/scrape-alert.service");
   svc = alertsMod.scrapeAlertService;

@@ -229,18 +229,148 @@ How an agency edit changes the revision:
 - **Withdrawing a revision:** the agency has no endpoint for this yet. See
   the follow-ups.
 
-## Admin review of the visa itself (existing endpoint)
+## Admin side (issue #101)
 
-Once an agency visa is submitted, it appears in `GET /admin/visas` with
-`reviewStatus: "pending_review"` and `source: "agency"`.
-`PATCH /admin/visas/:id/review` works on it as it does on any other visa:
+Code: `agency-visa-review.service.ts` (list enrichment, review state machine,
+make-global, owner emails), wired into `src/controllers/visa.controller.ts`
+and `src/routes/visa.routes.ts`. Tests:
+`test/agency-visas/agency-visa-review.test.ts`.
 
-- **approve** sets `isActive: true` and `reviewStatus: "approved"`. It does
-  not change `visibility`, which stays `"agency"` until make-global (#101).
-  It needs a finite `baseCostUsd`.
-- **reject** sets `reviewStatus: "rejected"` and `rejectionReason`.
+**Authz.** Every admin route runs `verifyAuth` (401) and `verifyAdmin` (403).
+The controller then checks the shared CASL ability for `update` on the
+`reviewStatus` field (list, review) or the `visibility` field (make-global).
+It checks first on a tagged empty probe, before any read, and then again on
+the real doc tagged `asSubject("Visa", doc)` inside the transaction. An agency
+owner of the visa matches the #98 conditional grant, but the field-level
+`cannot` on `VISA_PROTECTED_FIELDS` still refuses them, so they get **403**.
+No check uses a string subject.
 
-Drafts get 409 `VISA_IS_DRAFT`.
+### `GET /admin/visas`
+
+Lists every reviewable visa: drafts are left out, and `pending_review`,
+`approved` and `rejected` are included. Scraped and seed rows are unchanged
+from before #101. Agency rows (`source: "agency"`) also carry these fields:
+
+| Field | Value |
+| --- | --- |
+| `ownerAgencyId`, `createdBy`, `visibility`, `sponsor` | As stored. |
+| `agencyName` | `agencies/{ownerAgencyId}.name`, read on the server. It is `null` when the agency doc is missing. The client never supplies it. |
+| `pendingRevision` | The `visaRevisions/{cc}__{id}` doc when its `reviewStatus` is `"pending_review"`, otherwise `null`. A rejected revision is not shown here. |
+
+An approved visa whose `pendingRevision` is not null needs review: its live
+values are approved, and the edit is waiting.
+
+Optional query filters (400 `VALIDATION_ERROR` on a bad value):
+
+- `?source=scraped` returns only `source: "scraped"`. Seed and legacy
+  `"agent"` visas are left out.
+- `?source=agency` returns only agency visas.
+- `?agencyId=<id>` returns only that agency's visas. It combines with
+  `source`.
+
+Filters run in code over the existing per-country scan, so no new query and
+no new index are needed. Pending revisions are read with one equality query
+on `visaRevisions.reviewStatus`, which the automatic index covers.
+
+### `PATCH /admin/visas/:id/review` for an agency visa
+
+The body is unchanged: `{ action: "approve" | "reject", countryCode, reason?,
+revisionUpdatedAt? }`. `reason` is required on reject. For agency visas the
+controller sends the request to the agency review, which runs one
+transaction. Every other visa keeps the existing path.
+
+| Visa state | approve | reject |
+| --- | --- | --- |
+| `draft` | 409 `VISA_IS_DRAFT` | 409 `VISA_IS_DRAFT` |
+| `pending_review` | `reviewStatus: "approved"`, `isActive: true`, `reviewedBy`, `reviewedAt`. `visibility` stays `"agency"`. | `reviewStatus: "rejected"`, `rejectionReason`, `isActive: false`, `reviewedBy`, `reviewedAt` |
+| `approved` with a pending revision | Applies the revision (see below) | Rejects the revision (see below) |
+| `approved` with no pending revision | **200** `reviewOutcome: "unchanged"`. Nothing is written and no email is sent (idempotent). | 409 `VISA_NOT_IN_REVIEW` |
+| `rejected` | 409 `VISA_NOT_IN_REVIEW` | 409 `VISA_NOT_IN_REVIEW` |
+
+A rejected visa can be edited (#100), but it must be **resubmitted** before an
+admin can approve it.
+
+**Cost guard.** Approve needs a finite `baseCostUsd` on the visa, or on the
+visa with the revision applied. Without one the answer is
+**409 `VISA_COST_MISSING`**, with the message "Add the government fee in USD
+(baseCostUsd) to this visa before approving it". The shared guard
+(`assertVisaApprovable`) runs after it.
+
+**Revisions.**
+
+- `revisionUpdatedAt` is required, and must equal `pendingRevision.updatedAt`
+  as the admin loaded it. Send the serialised Timestamp as received
+  (`{ _seconds, _nanoseconds }`), an ISO 8601 string, or millis.
+  - missing: 400 `VALIDATION_ERROR`, `field: "revisionUpdatedAt"`;
+  - unparseable: 400;
+  - different from the stored value, checked inside the transaction:
+    **409 `REVISION_CHANGED`**. The agency edited the revision after the
+    admin opened it, so the admin should reload. Nothing is written.
+- **Approve** writes only the agency content keys found in `changes` (the
+  `AGENCY_VISA_CONTENT_FIELDS`, except `countryCode`), with `null` becoming
+  `FieldValue.delete()`. It also writes `reviewedBy`, `reviewedAt` and
+  `updatedAt`, and deletes the revision doc. Any other key in `changes` is
+  ignored, so review state, visibility and ownership can never come from a
+  revision. The live visa stays `approved` and active, and keeps its
+  visibility.
+- **Reject** sets `reviewStatus: "rejected"`, `rejectionReason`, `reviewedBy`
+  and `reviewedAt` on the revision. The live doc is not written, so the
+  previous approved values stay live with `isActive: true`. The agency's next
+  edit reopens the revision (#100).
+
+The response is `200` with the visa as stored, plus `reviewOutcome`:
+`approved | rejected | revision_approved | revision_rejected | unchanged`.
+
+### `PATCH /admin/visas/:id/visibility` (new)
+
+The body is `{ countryCode, visibility: "global" | "agency" }`.
+
+| Case | Result |
+| --- | --- |
+| Approved agency visa, new value `"global"` | Writes `visibility: "global"`, `madeGlobalBy` (uid), `madeGlobalAt`, `updatedAt`. The visa now appears in `/visas`, `/countries/:code/visas`, search, popular and the country stats. |
+| Approved agency visa, new value `"agency"` | Writes `visibility: "agency"`, `madeAgencyOnlyBy`, `madeAgencyOnlyAt`, `updatedAt`. The visa drops out of the public reads again. |
+| Same value as stored | **200** `visibilityOutcome: "unchanged"`. Nothing is written and no email is sent. |
+| Agency visa that is not `approved` | 409 `VISA_NOT_APPROVED` |
+| Not an agency visa | 409 `NOT_AN_AGENCY_VISA` |
+| Unknown id | 404 `NOT_FOUND` |
+| Bad `visibility` or missing `countryCode` | 400 `VALIDATION_ERROR` |
+
+Both who-and-when pairs are kept as history and never cleared. The current
+state is always `visibility`, and the later of `madeGlobalAt` and
+`madeAgencyOnlyAt` tells which switch came last. `ownerAgencyId`, `source`
+and the review fields are never written, so the agency tag stays. The owning
+agency sees the visa in `/agency/visas` either way. The response is `200`
+with the visa, plus `visibilityOutcome`:
+`made_global | made_agency_only | unchanged`. Country stats are recomputed
+after every change (best effort).
+
+### Emails to the agency owner
+
+Emails are sent through `notificationService.notifyUser` (in-app, push and
+email via Resend) to `agencies/{ownerAgencyId}.ownerId`, after the write
+commits.
+
+| Event | Type | Title (also the email subject) |
+| --- | --- | --- |
+| Visa approved | `agency_visa_approved` | "Seli approved <visa name>" |
+| Revision approved | `agency_visa_approved` | "Seli approved your changes to <visa name>" |
+| Visa rejected | `agency_visa_rejected` | "<visa name> needs changes". The body includes the reason. |
+| Revision rejected | `agency_visa_rejected` | "Your changes to <visa name> need work". The body includes the reason. |
+| Made global | `agency_visa_made_global` | "<visa name> is now on Seli for everyone" |
+
+Taking a visa back to agency-only sends **no** email. The agency's own access
+and pages don't change, so there is nothing for it to act on. Idempotent
+calls (`unchanged`) send nothing.
+
+The email button opens `/our-visas` (`AGENCY_VISAS_PATH` in
+`src/services/email/event-templates.ts`). **#104 should use this portal
+route, or update the constant.**
+
+An email failure never fails or rolls back the action. A missing agency or
+owner, or a `notifyUser` rejection, is logged
+(`[agency-visa-review] … email failed`) and the response is still 200.
+`notifyUser` itself checks the provider's `EmailResult` and logs any status
+other than "sent".
 
 ## Firestore indexes (`firestore.indexes.json`)
 
@@ -249,14 +379,96 @@ Drafts get 409 `VISA_IS_DRAFT`.
 | list: group `visaTypes` where `ownerAgencyId ==`, order by `createdAt desc` | `visaTypes` (COLLECTION_GROUP): `ownerAgencyId` ASC, `createdAt` DESC |
 | get by id: group `visaTypes` where `ownerAgencyId ==` and `id ==` | `visaTypes` (COLLECTION_GROUP): `ownerAgencyId` ASC, `id` ASC |
 | revisions of an agency: `visaRevisions` where `ownerAgencyId ==` | automatic single-field index |
+| admin list (#101): `visaRevisions` where `reviewStatus == "pending_review"` | automatic single-field index |
+
+## Reachable through the agency (issue #102)
+
+Code: `agency-visa-access.ts` (the rules and the applicant-safe projection),
+wired into `src/controllers/visa.controller.ts`,
+`src/services/application.service.ts`,
+`src/controllers/application.controller.ts` and the public page
+(`agency-visa-prices/agency-visa-price.service.ts`). Tests:
+`test/agency-visas/agency-visa-access.test.ts`.
+
+### Who reaches an agency-only visa
+
+An agency-only visa is `source: "agency"`, `visibility: "agency"`. It is
+**usable** only when `reviewStatus: "approved"` and `isActive: true`
+(`isApprovedAgencyVisa`). Drafts, pending, rejected and inactive visas are
+never usable, by anyone, the owner included.
+
+| Caller | Public page `/agencies/public/:slug` | Detail, `/full`, `/requirements` | Start a case |
+| --- | --- | --- | --- |
+| Anonymous | Sees the owning agency's approved visas (applicant-safe) | 404 | n/a (401) |
+| Applicant with no case at the agency | Same as anonymous | 404 | Only with an agent of the owning agency (`mode: "agent"`, `agentId`), so the case belongs to it |
+| Applicant with a case whose `agencyId` is the owning agency | Same | **200**, applicant-safe | Same as above |
+| Anyone with a readable case **on this visa** (any agency) | Same | **200**, applicant-safe (existing cases keep loading their visa after it is taken back to agency-only) | Same rule as their role |
+| Owner or agent of the owning agency | Same | **200**, full doc (any state, CASL #98 grant) | **201** via `POST /applications/for-client` |
+| Owner or agent of another agency | Same | 404 | 404 |
+| Admin | Same | **200**, full doc | Only when acting for the owning agency (`agencyId` in the body) |
+
+- Every denial is the **same 404 body as an unknown id**
+  (`{ success: false, error: "NOT_FOUND", message: "Visa type not found" }`).
+- The applicant rule is the firm one: an applicant sees an agency-only visa
+  on the single-visa endpoints **only through an application** (checked with
+  the shared CASL `read` on the tagged Application, so `checkApplicationAccess`
+  semantics). "Arriving through the agency link" means the public page
+  itself: its `visaPrices[]` entries carry the applicant-safe detail (below).
+  No slug or link parameter unlocks the single-visa endpoints or case start.
+- **Case start.** `POST /applications` and `POST /applications/for-client`
+  compute the agency the new case belongs to (from its agent, or the agency an
+  admin acts for), then `canStartCaseOnVisa(visa, caseAgencyId)`: a public
+  visa for any case, an approved agency-only visa only for a case of
+  `ownerAgencyId`. A refusal is 404 `NOT_FOUND` "Visa type not found", the
+  same as an unknown id, and nothing is written. `for-client` checks **before**
+  it provisions a client account, sends an invite, or opens a conversation.
+- The detail queries reached for a non-public visa: `applications where
+  userId ==` (automatic index), `applications where agencyId == <claim> and
+  visaTypeId ==` and `applications where agentId == uid and visaTypeId ==`
+  (composite indexes added to `firestore.indexes.json`).
+
+### Applicant-safe fields
+
+Applicants, anonymous callers and other agencies never get the sponsor
+licence number, the sponsor contact, `createdBy`, `submittedBy`, the review
+fields (`reviewedBy`, `reviewedAt`, `rejectionReason`, `submittedAt`), the
+make-global audit fields, `agentIds` or `scrapeMeta`.
+
+- **Detail / `/full`:** `toApplicantSafeVisa`, a whitelist
+  (`APPLICANT_SAFE_VISA_FIELDS`): `id`, `countryCode`, `name`, `code`,
+  `description`, `category`, `processingTime`, `processingDaysMin`,
+  `processingDaysMax`, `baseCostUsd`, `validityPeriod`, `isExtendable`,
+  `maxExtensions`, `eligibilityCriteria`, `applicationUrl`,
+  `applicationInstructions`, `sourceUrl`, `isActive`, `source`, `visibility`,
+  `ownerAgencyId`, `createdAt`, `updatedAt`, and
+  `sponsor: { organisationName, website? }`. It applies to every
+  agency-created visa served to a non-privileged caller, **including one made
+  global**. Scraped and seed visas are served as stored, as before.
+- **Public page:** see `../agency-visa-prices/agency-visa-prices.md`.
+
+### `firestore.rules` (direct client reads)
+
+- `countries/{cc}/visaTypes/{id}`: readable only when the doc matches
+  `isVisaPubliclyVisible` (active, visibility global or missing, reviewStatus
+  approved or missing), or by an admin. Before #102 any `isActive == true` doc
+  was readable, including approved agency-only visas.
+- `.../requirements/{id}`: readable only when the parent visa is publicly
+  visible, or by an admin (was `if true`).
+- `visaRevisions/{id}` and `agencies/{id}/visaPrices/{id}`: explicit
+  `allow read, write: if false` (backend only).
+
+There is no rules test harness in the repo. The rules were checked by hand
+on the Firestore emulator (alternate port, `demo-` project): seed, global,
+agency-only, pending and inactive visas, their requirements, a revision and a
+price, as anonymous, a client token and an admin token.
 
 ## Follow-ups (out of scope for #100)
 
-- `firestore.rules`: `countries/{cc}/visaTypes` lets any client read a doc
-  with `isActive == true` directly. That includes an approved
-  `visibility: "agency"` visa, which bypasses the #99 API rule. The rule
-  should also require global visibility and an approved or missing review
-  state.
+- ~~`firestore.rules` direct read of agency-only visas~~: done in #102.
 - An agency endpoint to withdraw (delete) a pending revision.
+- #101: an admin can't take down an APPROVED agency visa with the review
+  endpoint (reject only works from `pending_review`, as the #100 review asked).
+  Making it agency-only hides it from the public. A separate "deactivate"
+  admin action would be a follow-up if Seli needs to pull one completely.
 - A visa's `requirements` subcollection (steps and documents) for agency
   visas. Today only `eligibilityCriteria` is captured.

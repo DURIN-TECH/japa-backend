@@ -9,8 +9,9 @@ import {
 } from "../services/compliance.service";
 import { storageService } from "../services/storage.service";
 import { notificationService } from "../services/notification.service";
-import { collections } from "../utils/firebase";
+import { claimsService } from "../services/claims.service";
 import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
+import { validateStoragePath } from "../utils/storage-paths";
 
 // Content types accepted for compliance documents. Kept aligned with the agent
 // verification flow (PDF + common image formats).
@@ -165,19 +166,25 @@ export class ComplianceController {
         sendError(res, "VALIDATION_ERROR", `Invalid slot. Allowed: ${VALID_SLOTS.join(", ")}`, 400);
         return;
       }
-      // The path must belong to this agency's own compliance prefix.
-      if (!storagePath.startsWith(`compliance/${agency.id}/`)) {
+      // The path must be an issued object in this agency's own folder for THIS
+      // slot (`compliance/{agency.id}/{slot}/`) — shared validator, issue #141.
+      const checked = validateStoragePath(storagePath, {
+        purpose: "compliance-document",
+        agencyId: agency.id,
+        slots: [slot],
+      });
+      if (!checked.ok) {
         sendError(res, "VALIDATION_ERROR", "storagePath does not belong to this agency", 400);
         return;
       }
       // Confirm the client actually completed the upload.
-      const exists = await storageService.fileExists(storagePath);
+      const exists = await storageService.fileExists(checked.key);
       if (!exists) {
         sendError(res, "VALIDATION_ERROR", "File not found at the specified path", 400);
         return;
       }
 
-      const compliance = await complianceService.registerDocument(agency.id, slot, storagePath);
+      const compliance = await complianceService.registerDocument(agency.id, slot, checked.key);
       const requirements = complianceService.getRequirements(compliance);
       sendSuccess(res, { compliance, requirements }, "Document uploaded");
     } catch (error) {
@@ -227,7 +234,7 @@ export class ComplianceController {
 
       // Mint short-lived download URLs for each uploaded document so an admin
       // can inspect them without the raw storage paths.
-      const documents = await this.resolveDocumentUrls(compliance);
+      const documents = await this.resolveDocumentUrls(id, compliance);
 
       sendSuccess(res, { compliance, requirements, documents });
     } catch (error) {
@@ -290,8 +297,20 @@ export class ComplianceController {
 
   // ---- helpers ----
 
-  /** Resolve signed download URLs for whichever document slots are populated. */
+  /**
+   * Resolve signed download URLs for whichever document slots are populated.
+   *
+   * Each stored path is validated again before it is signed (issue #141): it
+   * must be an issued object in THIS agency's compliance folder, in one of the
+   * known slots. (Any known slot, not only the field's own: registration did
+   * not always tie a path to its slot, and such a record is still the
+   * agency's own file.) A path that fails gets `null`, like an empty slot,
+   * and is never signed.
+   *
+   * @param agencyId The agency whose compliance file this is (from the route).
+   */
   private async resolveDocumentUrls(
+    agencyId: string,
     compliance: { idDocumentPath?: string; proofOfAddressPath?: string; cacDocumentPath?: string }
   ): Promise<Record<string, string | null>> {
     const slots: Array<[string, string | undefined]> = [
@@ -302,8 +321,19 @@ export class ComplianceController {
     const entries = await Promise.all(
       slots.map(async ([key, path]) => {
         if (!path) return [key, null] as const;
+        const checked = validateStoragePath(path, {
+          purpose: "compliance-document",
+          agencyId,
+          slots: VALID_SLOTS,
+        });
+        if (!checked.ok) {
+          console.warn(
+            `[compliance] agency ${agencyId}: stored ${key} path failed validation (${checked.issue}); not signed`
+          );
+          return [key, null] as const;
+        }
         try {
-          return [key, await storageService.getSignedDownloadUrl(path)] as const;
+          return [key, await storageService.getSignedDownloadUrl(checked.key)] as const;
         } catch {
           return [key, null] as const;
         }
@@ -319,12 +349,14 @@ export class ComplianceController {
     body: string,
     agencyId: string
   ): Promise<void> {
-    // Admins are flagged via the `admin: true` boolean on their user doc.
-    const adminSnap = await collections.users.where("admin", "==", true).get();
+    // Admins are the accounts holding the admin custom claim (issue #135).
+    // The `users/{uid}.admin` document field is deliberately NOT used: it is
+    // not an authority, and a stray flag must not receive admin notifications.
+    const adminUids = await claimsService.listAdminUids();
     await Promise.all(
-      adminSnap.docs.map((doc) =>
+      adminUids.map((adminUid) =>
         notificationService.notifyUser({
-          userId: doc.id,
+          userId: adminUid,
           type,
           title,
           body,

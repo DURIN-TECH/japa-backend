@@ -65,6 +65,48 @@ function grantAgencyVisas(builder, agencyId) {
     builder.cannot("update", "Visa", [...types_1.VISA_PROTECTED_FIELDS]);
 }
 /**
+ * True when the principal really belongs to an agency: `agencyId` is a
+ * non-empty string. Absent, `null`, the empty string and any non-string value
+ * (a number, an array, an object that CASL would read as a Mongo operator)
+ * all count as "no agency".
+ *
+ * @param agencyId the principal's `agencyId`, as resolved from its claims
+ */
+function hasAgency(agencyId) {
+    return typeof agencyId === "string" && agencyId.length > 0;
+}
+/**
+ * Agency grant on applications (fix for DURIN-TECH/japa#131): what a
+ * principal may do with the cases of its OWN agency, i.e. applications whose
+ * `agencyId` equals the principal's `agencyId`.
+ *   - owner: `manage` (every action) on the agency's cases;
+ *   - agent: `read` only (writes come from the assigned-agent grant, which
+ *     is keyed on `agentId` and is NOT touched here).
+ *
+ * The grant is added ONLY when the principal has an agency. Without this
+ * guard the condition would be `{ agencyId: undefined }`, and CASL matches
+ * that against any application that has NO `agencyId` field
+ * (undefined === undefined). Self-serve applications are stored without the
+ * field, so before the fix an independent agent could read every client's
+ * self-serve application, and an owner-role user with no agency could read,
+ * update and delete them (plus the cases of independent agents, which carry
+ * an `agentId` but no `agencyId`).
+ *
+ * Same idea as the guard in `grantAgencyVisas` above.
+ *
+ * @param can      the `can` of the ability being built
+ * @param actions  the action(s) the role holds on its agency's applications
+ * @param agencyId the principal's agency, possibly undefined/null/empty
+ */
+function grantAgencyApplications(can, actions, agencyId) {
+    // No agency, no agency grant: the principal must never match an
+    // application through `agencyId`, whatever the document does or does not
+    // carry in that field.
+    if (!hasAgency(agencyId))
+        return;
+    can(actions, "Application", { agencyId });
+}
+/**
  * Build the ability for a principal. Pass resolved `entitlements` to apply
  * subscription gating; omit them to get role/ownership-only rules (Phase 1).
  */
@@ -90,7 +132,16 @@ function defineAbilitiesFor(principal, entitlements) {
             // Agency owners manage everything scoped to their agency.
             can(["read", "update"], "Agency", { id: agencyId });
             can("manage", "Agent", { agencyId });
-            can("manage", ["Application", "Document", "Consultation", "PaymentRequest", "Note", "Conversation"], { agencyId });
+            // Applications of the owner's own agency: every action. Guarded (#131):
+            // an owner with no agency gets NO application grant at all.
+            grantAgencyApplications(can, "manage", agencyId);
+            // The other case resources keep their agency grant exactly as it was.
+            // Split from the Application grant above only because that one is now
+            // guarded. NOTE: these (and the Agency / Agent / Transaction / Analytics
+            // grants in this branch) still become `{ agencyId: undefined }` for an
+            // owner with no agency; #131 fixes Application only ("any other rule
+            // change" is out of its scope) and the rest is reported as a follow-up.
+            can("manage", ["Document", "Consultation", "PaymentRequest", "Note", "Conversation"], { agencyId });
             can("read", "Transaction", { agencyId });
             can("read", "Analytics", { agencyId });
             can(["read", "update"], "User", { id: uid });
@@ -100,7 +151,12 @@ function defineAbilitiesFor(principal, entitlements) {
             break;
         case "agent":
             // Agents manage resources assigned to them; read their agency's cases.
-            can("read", "Application", { agencyId });
+            // The agency read grant is guarded (#131): an independent agent (no
+            // agency) gets none, so it cannot read applications that merely lack an
+            // `agencyId` (self-serve applications).
+            grantAgencyApplications(can, "read", agencyId);
+            // Assigned-agent grant, keyed on `agentId`: unchanged by #131. An
+            // independent agent keeps full access to the cases assigned to them.
             can("manage", ["Application", "Document", "Consultation", "PaymentRequest", "Note", "Conversation"], { agentId: uid });
             can("read", "Agent", { agencyId });
             can(["read", "update"], "Agent", { userId: uid });

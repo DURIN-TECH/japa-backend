@@ -17,3 +17,18 @@ export {
   parseAgencyVisaBody,
   assertCompleteContent,
 } from "./agency-visa.validation";
+
+// Admin side (issue #101): review of agency visas + revisions, make-global.
+export {
+  agencyVisaReviewService,
+  ADMIN_VISA_SOURCE_FILTERS,
+  VISA_COST_MISSING,
+  parseExpectedTimestamp,
+} from "./agency-visa-review.service";
+export type {
+  AdminVisaFilters,
+  AdminVisaRow,
+  AdminVisaSourceFilter,
+  AgencyVisaReviewOutcome,
+  AgencyVisaVisibilityOutcome,
+} from "./agency-visa-review.service";

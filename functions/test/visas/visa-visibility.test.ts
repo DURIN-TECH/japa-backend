@@ -325,7 +325,9 @@ describe("public visa reads return only visible visas", () => {
 
 describe("admin and internal reads still see every visa", () => {
   test("GET /admin/visas lists all seven docs", async () => {
-    const r = await call(visaController.getAdminVisas.bind(visaController), {});
+    // Issue #101: the list is CASL-gated (review rights), so the call
+    // carries an admin ability, as verifyAuth would attach.
+    const r = await call(visaController.getAdminVisas.bind(visaController), { ability: adminAbility() });
     assert.equal(r.status, 200);
     assert.deepEqual(ids(r.body.data), Object.keys(MATRIX).sort());
   });

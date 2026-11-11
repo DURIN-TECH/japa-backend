@@ -96,21 +96,16 @@ class PaymentRequestController {
         // Client role: return only payment requests addressed to this user
         requests = await paymentRequestService.getClientPaymentRequests(userId, filters);
       } else if (role === "owner") {
-        // Agency owner role: look up the agent profile to find their agency
-        const agentSnap = await collections.agents
-          .where("userId", "==", userId)
-          .limit(1)
-          .get();
-        if (agentSnap.empty) {
-          return sendSuccess(res, []);
+        // Agency owner role: the owner role AND the agency come from the
+        // resolved principal (req.authz, built from custom claims), never from
+        // the caller's agent document (issue #135). Anyone who is not an
+        // agency owner is refused, as on GET /transactions?role=owner; a
+        // member uses the default "agent" view below.
+        if (req.authz?.role !== ROLES.OWNER || !req.authz.agencyId) {
+          return sendForbidden(res, "Agency owner access required");
         }
-        const agent = agentSnap.docs[0].data();
-        // If the agent is not part of an agency, return empty
-        if (!agent.agencyId) {
-          return sendSuccess(res, []);
-        }
-        // Return all payment requests for the agent's agency
-        requests = await paymentRequestService.getAgencyPaymentRequests(agent.agencyId, filters);
+        // Return all payment requests for the owner's agency
+        requests = await paymentRequestService.getAgencyPaymentRequests(req.authz.agencyId, filters);
       } else {
         // Default "agent" role: return only this agent's own payment requests
         const agentSnap = await collections.agents

@@ -3,6 +3,7 @@ import { User, Address, Agency, NotificationPreferences } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 import { Role, Subscription } from "@durin-tech/authz";
 import { StoredPlan } from "../types/billing";
+import { pickAllowedFields } from "../utils/pick-allowed-fields";
 
 /**
  * Flattened admin view of a user, joining Firebase Auth (identity + role claims +
@@ -54,6 +55,41 @@ export interface UpdateUserInput {
   passportExpiryDate?: Date;
   passportCountry?: string;
 }
+
+/**
+ * The ONLY profile fields a user may change on their own `users/{uid}`
+ * document through `PUT /users/me` (issue #135). `updateUser` copies these
+ * keys from the request and ignores every other key.
+ *
+ * Why an allow-list: the request body comes straight from the client, and the
+ * Admin SDK bypasses firestore.rules, so anything copied here lands on the
+ * document. Fields the backend treats as authority or manages itself must
+ * therefore never be copied: `admin` (legacy admin flag), `role` / `agencyId`
+ * / `agencyRole` (role and membership live in custom claims and the agent
+ * document), `identityVerification` (KYC result), `isProvisional`, `email`
+ * (changed only through the verified change-email flow), `fcmTokens`,
+ * `onboardingCompleted`, `id`, `createdAt`, `lastLoginAt`.
+ *
+ * Contents: the keys of `UpdateUserInput`, plus `notificationPreferences`,
+ * which the portal's notification settings screen saves through this
+ * endpoint. Keep in step with `selfEditableUserFields()` in firestore.rules
+ * (the same list, for direct client writes).
+ */
+export const USER_SELF_EDITABLE_FIELDS = [
+  "firstName",
+  "lastName",
+  "middleName",
+  "phone",
+  "dateOfBirth",
+  "address",
+  "residentialCountry",
+  "profilePhotoUrl",
+  "hasPassport",
+  "passportNumber",
+  "passportExpiryDate",
+  "passportCountry",
+  "notificationPreferences",
+] as const;
 
 export interface CompleteOnboardingInput {
   firstName: string;
@@ -150,8 +186,13 @@ class UserService {
       throw new Error("User not found");
     }
 
+    // Copy ONLY the self-editable profile fields (issue #135). `input` is the
+    // raw request body for PUT /users/me, so spreading it would let a caller
+    // write any field (see USER_SELF_EDITABLE_FIELDS for what must stay
+    // server-written). Unknown keys are dropped silently, so existing clients
+    // that send a few extra display fields keep working.
     const updates: Record<string, unknown> = {
-      ...input,
+      ...pickAllowedFields(input, USER_SELF_EDITABLE_FIELDS),
       updatedAt: serverTimestamp(),
     };
 
