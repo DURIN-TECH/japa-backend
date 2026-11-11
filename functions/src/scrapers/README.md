@@ -107,3 +107,36 @@ stay in `functions/test/helpers/`.
   `findVisaSourcesMarkdown` (data/seed-visa-sources.ts) probes its own dir, then
   `../../../../src/scrapers/visa-catalog/data/`. That resolves to the committed copy
   from both `src/` (tsx) and `lib/` (compiled seed in CI).
+
+## Rubric extraction (`rubric/`): what the code checks, and what it cannot
+
+Every criterion the model proposes is checked in code against the stored
+snapshot before it is written (`rubric-quote.ts`,
+`rubric-extraction.service.ts`):
+
+- the quote is in its own source verbatim, starts and ends on a whole word or
+  number, and sits within one PDF page or one line of a web page;
+- a threshold is a JSON number written in the criterion's **own quote** (not
+  the day or year of a date in it); a unit, a date (day, month and year in one
+  expression) and each group name are in that quote too. Supporting
+  `citations` are reviewer aids and never count as support;
+- a rule reference is printed in the quote or directly before it.
+
+**The limit code cannot close.** A verbatim, whole-word quote can still mean
+something else than its source. A quote that begins after a negation or a
+condition passes every check: "required to interview the applicant", quoted
+from "is **not** required to interview the applicant", is verbatim. The
+extractor raises the flag `quote_starts_mid_sentence` on a criterion whose
+quote begins part-way through a sentence, but that is a prompt to look, not a
+verdict, and it does not cover a qualifier that comes *after* the quote or in
+another sentence. **A human reviewer must read each quote in its source
+context before approving a rubric.**
+
+Also for the reviewer, raised as flags on the version rather than decided by
+code: country codes on a mandatory bar are the model's mapping of the source's
+wording (`nationality_codes_model_proposed`, `nationality_code_name_mismatch`);
+intake question wording is the model's (`intake_wording_uncited`); a rule that
+runs across a chunk or page boundary may be missing (`multiple_chunks`,
+`page_ends_mid_sentence`); the model can silently omit a rule, which nothing
+detects. Number words and month names are recognised in English only; anything
+else is not recognised and the criterion that relies on it is rejected.

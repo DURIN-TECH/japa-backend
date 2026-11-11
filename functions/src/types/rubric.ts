@@ -149,9 +149,12 @@ export type IntakeAnswerType = (typeof INTAKE_ANSWER_TYPES)[number];
  * was validated against; none is taken from the model.
  */
 export interface RubricCitation {
-  // The exact words of the source, verbatim. Validated in code against the
-  // stored snapshot text (whitespace-normalised only, no fuzzy matching). A
-  // criterion whose quote is not found never reaches Firestore.
+  // The exact words of the source, verbatim: the passage as the STORED
+  // SNAPSHOT has it (whitespace collapsed to single spaces), not the model's
+  // copy of it. The model's quote is only used to find it: it must match
+  // verbatim (whitespace-normalised, no fuzzy matching), start and end on a
+  // word boundary, and sit within one page / one paragraph. A criterion whose
+  // quote is not found never reaches Firestore.
   quote: string;
   // Guidance source the quote is in (`guidanceSources/{sourceId}`).
   sourceId: string;
@@ -179,12 +182,14 @@ export interface CriterionCheck {
   // field catalogue.
   field: string;
   op: CheckOp;
-  // The threshold / expected value. Absent for `present`. A number or
-  // duration here must appear in the criterion's own quote (or in its
-  // "check.value" citation): an invented number is rejected in code.
+  // The threshold / expected value. Absent for `present`. For `gte`, `lte`
+  // and `heldForDays` it is always a NUMBER, and that number is written in
+  // the criterion's OWN quote (outside any date in it). For `eq` it may be a
+  // number (same rule), a boolean, or a string found verbatim in the quote.
+  // Supporting `citations` never widen this: only `source.quote` counts.
   value?: number | string | boolean;
-  // Unit of `value` as the source writes it (a duration unit, or a currency
-  // code for an amount).
+  // Unit of `value` exactly as the criterion's own quote writes it (a
+  // duration unit, a currency code, ...).
   unit?: string;
 }
 
@@ -194,10 +199,16 @@ export interface CriterionAppliesTo {
   // confirmed by the reviewer; the engine matches the applicant's
   // nationality against this list.
   nationalities: string[];
-  // The same group exactly as the source names it, one entry per code, each
-  // found verbatim in the criterion's quote. This is what makes the mapping
-  // to codes checkable by a human.
+  // The same group exactly as the source names it, one entry per code (the
+  // two arrays are parallel), each found in the criterion's own quote as a
+  // whole name. This is what makes the mapping to codes checkable by a human.
   asWritten: string[];
+  // The platform's display name (English) for each code, parallel to
+  // `nationalities`, filled in by code. A reviewer aid: when it differs from
+  // the matching `asWritten` entry the version carries a flag for this
+  // criterion. The codes are a model PROPOSAL either way and every one must
+  // be confirmed by the reviewer.
+  codeNames?: string[];
 }
 
 /** One criterion of a rubric. */
@@ -246,8 +257,10 @@ export interface AssessmentCriterion {
   intakeQuestionIds?: string[];
 
   // ---- extraction quality ----
-  // Supporting quotes for single fields ("check.value", "appliesTo",
-  // "validFrom", ...), each validated verbatim like `source.quote`.
+  // Extra passages the extractor pointed at for single fields (keys are
+  // RUBRIC_CITATION_FIELDS), each found verbatim in the same source. REVIEWER
+  // AIDS ONLY: a number, unit, date or group is checked against
+  // `source.quote` alone, never against these.
   citations?: Record<string, string>;
   // The extractor's confidence in its own reading, 0..1. A review aid only:
   // nothing is accepted or rejected on it.
@@ -365,12 +378,34 @@ export interface RubricSourceSnapshot {
   publishedDate?: string;
 }
 
+/**
+ * The criterion fields a supporting citation may be attached to. A closed
+ * list, so a citation's key is never a string the model made up.
+ */
+export const RUBRIC_CITATION_FIELDS = [
+  "title",
+  "kind",
+  "stage",
+  "ruleRef",
+  "check.field",
+  "check.value",
+  "check.unit",
+  "appliesTo",
+  "validFrom",
+  "validUntil",
+  "probeFactors",
+  "requiresInterviewBeforeRefusal",
+  "concernsIntent",
+] as const;
+export type RubricCitationField = (typeof RUBRIC_CITATION_FIELDS)[number];
+
 /** Why a model-proposed item was thrown away. Stable, machine-readable. */
 export const RUBRIC_DISCARD_REASONS = [
   "quote_empty",
   "quote_too_short",
   "quote_not_found", // not verbatim in ITS OWN source (includes paraphrase and another document's text)
   "quote_spans_pages", // PDF: runs across a page break
+  "quote_spans_paragraphs", // web page: runs across a line (block) of the cleaned text
   "quote_in_flagged_passage", // overlaps text flagged as addressed to the model
   "number_not_in_quote", // states a number / duration its quote does not
   "date_not_in_quote",
@@ -388,9 +423,12 @@ export type RubricDiscardReason = (typeof RUBRIC_DISCARD_REASONS)[number];
 export interface RubricDiscard {
   itemType: "criterion" | "intake_question" | "evidence_item" | "intent_polarity";
   reason: RubricDiscardReason;
-  // Human-readable detail (which number, which field).
+  // Fixed, code-written detail (which field failed which rule). Never holds
+  // a string the model supplied, and never source text.
   detail: string;
-  // The model's own label for the item (its title / id), capped.
+  // The model's own label for the item (its title), so a reviewer can tell
+  // which proposal was dropped. Capped, control characters removed, stored
+  // only: it is never written to a log.
   label: string;
   sourceId: string;
   // Which chunk of the source it came from (0-based).
@@ -528,8 +566,12 @@ export interface RubricRunUsage {
  *  - skipped:   refused before any model call (kill switch, cap, settings
  *               unreadable);
  *  - failed:    a model call or a validation step failed; NO version written.
+ *  - started:   written just BEFORE the first model call and replaced by the
+ *               final status when the run ends. A record still `started`
+ *               long after its `startedAt` is a run that died mid-way (it
+ *               still counts toward the daily cap: it reached the model).
  */
-export type RubricRunStatus = "succeeded" | "unchanged" | "skipped" | "failed";
+export type RubricRunStatus = "started" | "succeeded" | "unchanged" | "skipped" | "failed";
 
 /** `rubricExtractionRuns/{runId}`: the record of one run (cost + audit). */
 export interface RubricExtractionRun {
@@ -538,6 +580,9 @@ export interface RubricExtractionRun {
   countryCode: string;
   visaTypeId: string;
   status: RubricRunStatus;
+  // True once the run was about to make its first model call. The daily cap
+  // counts exactly these runs.
+  reachedModel: boolean;
   // Machine-readable reason for skipped / failed (e.g. "settings_unavailable").
   reasonCode: string | null;
   // One line, secret-free, never source text.
