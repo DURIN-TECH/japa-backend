@@ -102,6 +102,8 @@ export interface AssessmentContent {
   readiness: ReadinessBand;
   confidence: "high" | "medium" | "low";
   internalCall: "would_approve" | "would_refuse";
+  // A mandatory bar applies (code-decided). Served to the free tier as a boolean.
+  hasBlockingRule: boolean;
   droppedCount: number;
 }
 
@@ -669,6 +671,8 @@ function groundFrom(c: AssessmentCriterion, detail: string, whatWouldHelp: strin
   return {
     criterionId: c.criterionId,
     title: c.title,
+    kind: c.kind,
+    isMandatoryBar: c.kind === "mandatory_bar",
     ruleRef: c.ruleRef ?? null,
     sourceUrl: c.source.url,
     sourceQuote: c.source.quote,
@@ -734,12 +738,25 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     for (const f of input.judgement.findings) {
       const c = criterionById(rubric, f.criterionId);
       if (!c || !f.concern) continue;
-      // The containment point: a judgement criterion produces a flag, never a ground.
+      // Only a judgement criterion can be flagged here: a finding the model
+      // attached to an objective or bar criterion id is ignored, so model text
+      // can never add to, or override, a code-decided rule.
+      if (c.kind !== "judgement") continue;
+      // THE CONTAINMENT POINT. A judgement criterion produces a credibility
+      // flag, never a refusal ground, and this is enforced here in code, not by
+      // the prompt. Why: the engine cannot verify genuineness (leaves at the end
+      // of the visit, genuine purpose, sufficiency of funds) from documents, so a
+      // genuineness concern is a flag for the applicant to address and is never
+      // presented as a predicted refusal (plan rule 4). Caseworker guidance does
+      // let an officer refuse on genuineness; this product still never tells an
+      // applicant they would be refused.
       if (c.concernsIntent && rubric.intentPolarity !== "immigrant_intent_penalised") continue;
       judgementOutcome = "concern";
       credibilityFlags.push({
         criterionId: c.criterionId,
         title: c.title,
+        kind: c.kind,
+        isMandatoryBar: false,
         ruleRef: c.ruleRef ?? null,
         sourceUrl: c.source.url,
         sourceQuote: c.source.quote,
@@ -790,6 +807,7 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     readiness,
     confidence,
     internalCall: refusalGrounds.length > 0 ? "would_refuse" : "would_approve",
+    hasBlockingRule: input.mandatoryHits.length > 0,
     droppedCount,
   };
 }

@@ -86,6 +86,16 @@ const BANNED_WORDING: RegExp[] = [
   /\blikelihood\b/i,
   /\bchances?\s+of\s+(success|approval|refusal)\b/i,
   /\b(you\s+)?(are|were)\s+(approved|refused|rejected)\b/i,
+  // Conditional and hedged forms of the same prediction.
+  /\b(would|may|might|could|can)\s+(well\s+)?be\s+(refused|rejected|denied|declined|granted|approved)\b/i,
+  /\b(would|will|may|might)\s+(probably\s+)?(refuse|reject|deny|decline|grant|approve)\b/i,
+  /\b(good|high|low|strong|slim|poor|better|best|fair|real)\s+(chances?|odds|prospects?|probability)\b/i,
+  /\b(probability|probably|odds)\b/i,
+  /\b(is|are|seems?|appears?)\s+(likely|unlikely)\b/i,
+  /\b(likely|unlikely)\s+to\s+(be\s+)?(succeed|pass|fail|qualify|get|receive|obtain)\b/i,
+  /\bguarantee[sd]?\b/i,
+  /\b(visa|application)\s+(will|would)\s+(succeed|fail|pass)\b/i,
+  /\b(eligible|ineligible)\s+for\s+(a\s+)?(visa|refusal)\b/i,
 ];
 
 /** True when model-written text contains banned wording. */

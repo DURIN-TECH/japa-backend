@@ -422,7 +422,7 @@ describe("the free response is a whitelist, not a deletion", () => {
     assert.equal(tierFor("client", undefined), "free");
   });
 
-  test("the free body has exactly two keys, and no finding key appears at any depth", () => {
+  test("the free body has exactly three keys (band, top three, hasBlockingRule), and no finding key appears at any depth", () => {
     const stored: any = {
       id: "x",
       readiness: "competitive",
@@ -435,9 +435,12 @@ describe("the free response is a whitelist, not a deletion", () => {
       stageOutcomes: {},
       score: 80,
       internalCall: "would_refuse",
+      hasBlockingRule: true,
     };
     const free = serializeFree(stored);
-    assert.deepEqual(Object.keys(free).sort(), ["readiness", "topIssues"]);
+    assert.deepEqual(Object.keys(free).sort(), ["hasBlockingRule", "readiness", "topIssues"]);
+    assert.equal(free.hasBlockingRule, true);
+    assert.equal(serializeFree({ ...stored, hasBlockingRule: undefined }).hasBlockingRule, false, "an older document reads as false");
     const keys = allKeys(free);
     for (const forbidden of ["refusalGrounds", "credibilityFlags", "strengths", "statementFindings", "insufficientInformation", "stageOutcomes", "score", "sourceQuote", "sourceUrl", "ruleRef", "internalCall"]) {
       assert.ok(!keys.includes(forbidden), `the free body must not carry ${forbidden}`);
@@ -475,6 +478,55 @@ describe("injection and wording defences", () => {
     assert.equal(findBannedWording("The applicant will be refused."), true);
     assert.equal(findBannedWording("There is a likelihood of approval."), true);
     assert.equal(findBannedWording("The statement gives no return travel dates."), false);
+  });
+
+  test("hedged and conditional prediction wording is also banned", () => {
+    for (const t of [
+      "This application may be refused.",
+      "You have a good chance of success.",
+      "It is unlikely to succeed.",
+      "The probability is low.",
+      "We cannot guarantee approval.",
+      "A caseworker would probably refuse this.",
+    ]) assert.equal(findBannedWording(t), true, t);
+    assert.equal(findBannedWording("The statement does not say where the applicant will stay."), false);
+  });
+
+  test("a finding attached to an objective or mandatory-bar criterion id never becomes a flag or a ground", () => {
+    const rubric = routeARubric();
+    const content = assembleContent({
+      rubric,
+      mandatoryHits: [],
+      objective: [],
+      // Bypasses parseJudgement on purpose: assembly must hold on its own.
+      judgement: {
+        findings: [
+          { criterionId: "a-funds", detail: "A reviewable point.", whatWouldHelp: "x", concern: true },
+          { criterionId: "a-bar", detail: "A reviewable point.", whatWouldHelp: "x", concern: true },
+        ],
+        strengths: [], statementNotes: [], suspiciousPassages: [], dropped: 0,
+      },
+      documents: [], statementReadable: true, score: 90, suspiciousDocumentIds: [], judgementFailed: false,
+    });
+    assert.equal(content.refusalGrounds.length, 0);
+    assert.equal(content.credibilityFlags.length, 0);
+  });
+
+  test("a bar hit sets hasBlockingRule and marks the ground as a mandatory bar", () => {
+    const rubric = routeARubric();
+    const bar = rubric.criteria.filter((c) => c.criterionId === "a-bar");
+    const content = assembleContent({
+      rubric, mandatoryHits: bar, objective: [], judgement: null, documents: [], statementReadable: false,
+      score: 90, suspiciousDocumentIds: [], judgementFailed: false,
+    });
+    assert.equal(content.hasBlockingRule, true);
+    assert.equal(content.refusalGrounds[0].isMandatoryBar, true);
+    assert.equal(content.refusalGrounds[0].kind, "mandatory_bar");
+    const clear = assembleContent({
+      rubric, mandatoryHits: [], objective: [], judgement: null, documents: [], statementReadable: false,
+      score: 90, suspiciousDocumentIds: [], judgementFailed: false,
+    });
+    assert.equal(clear.hasBlockingRule, false);
   });
 
   test("a wrapped source label must be a short code label", () => {

@@ -1,4 +1,5 @@
 import type { Timestamp } from "firebase-admin/firestore";
+import type { CriterionKind } from "./rubric";
 
 // ============================================
 // APPLICATION ASSESSMENT — TYPES (issue #42)
@@ -83,6 +84,10 @@ export interface InsufficientItem {
 export interface RefusalGround {
   criterionId: string;
   title: string;
+  // The rubric criterion's kind, copied from the rubric (never model text).
+  kind: CriterionKind;
+  // True when the criterion is a mandatory bar (a rule that applies regardless of documents).
+  isMandatoryBar: boolean;
   ruleRef: string | null;
   sourceUrl: string;
   sourceQuote: string;
@@ -94,6 +99,8 @@ export interface RefusalGround {
 export interface CredibilityFlag {
   criterionId: string;
   title: string;
+  kind: CriterionKind;
+  isMandatoryBar: boolean;
   ruleRef: string | null;
   sourceUrl: string;
   sourceQuote: string;
@@ -159,6 +166,10 @@ export interface ApplicationAssessment {
   // The three issues the free tier shows, chosen in code at run time and stored
   // so a read never needs the rubric again. Titles are the rubric's own.
   topIssues: Array<{ criterionId: string; title: string }>;
+  // True when a mandatory bar applies to this applicant. Computed in code. The
+  // free tier is told this one boolean so a free applicant learns that a rule
+  // blocks them (decision on #43); it carries no rule text.
+  hasBlockingRule: boolean;
   // Stored, stripped from every client-role response (see tier-serializer).
   internalCall: "would_approve" | "would_refuse" | null;
 

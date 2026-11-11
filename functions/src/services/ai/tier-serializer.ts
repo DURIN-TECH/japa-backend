@@ -16,8 +16,11 @@ import type { ApplicationAssessment, ReadinessBand } from "../../types/assessmen
 // stored document, so a field added to the document later cannot leak through
 // by accident. A test asserts that no other finding key appears at any depth.
 //
-// The FULL body is the stored document. For a client-role caller `internalCall`
-// is removed at every depth, including a client who owns the application.
+// The FULL body is the stored document minus operational fields (token usage,
+// cost, the injection log, the requester, the input hash), which are for the
+// operator and never for an applicant or agent. For a client-role caller
+// `internalCall` is removed at every depth, including a client who owns the
+// application.
 //
 // Job metadata (`meta`) sits beside `data`, not inside it, so the free `data`
 // keeps exactly the keys above.
@@ -35,21 +38,35 @@ export function tierFor(role: string | undefined, entitlements: Entitlements | n
   return hasFeature(entitlements, FEATURES.AI_CASE_OFFICER) ? "full" : "free";
 }
 
+/** Why a stored assessment no longer matches the current state. Computed server-side. */
+export type StaleReason = "inputs_changed" | "rules_updated";
+
 /** Job metadata: beside `data`, never inside it. */
 export interface AssessmentMeta {
   assessmentId: string;
   status: ApplicationAssessment["status"];
   tier: AssessmentTier;
   rubricVersion: number;
-  // True when the rubric has moved on since this assessment was run.
+  // Null when current. `inputs_changed`: the application's inputs differ from the
+  // ones assessed. `rules_updated`: the approved rubric has moved on. The client
+  // cannot compute either (it cannot compute the input hash).
+  staleReason: StaleReason | null;
+  // Kept for existing readers: true exactly when `staleReason` is set.
   stale: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
   error: { code: string; message: string } | null;
 }
 
-/** The whole free `data` object. */
+/**
+ * The whole free `data` object: the band, the top three, and ONE boolean. The
+ * boolean tells a free applicant that a mandatory bar applies; it carries no
+ * rule text, citation or title.
+ */
 export interface FreeAssessmentData {
   readiness: ReadinessBand | null;
   topIssues: Array<{ criterionId: string; title: string }>;
+  hasBlockingRule: boolean;
 }
 
 /** Build the free `data` from the whitelist. */
@@ -57,6 +74,8 @@ export function serializeFree(assessment: ApplicationAssessment): FreeAssessment
   return {
     readiness: assessment.readiness,
     topIssues: assessment.topIssues.map((i) => ({ criterionId: i.criterionId, title: i.title })),
+    // `=== true`: a document written before this field existed reads as false.
+    hasBlockingRule: assessment.hasBlockingRule === true,
   };
 }
 
@@ -74,10 +93,25 @@ export function stripKeyDeep(value: unknown, key: string): unknown {
   return value;
 }
 
-/** The full `data`: the stored document, with `internalCall` removed for client-role callers. */
+/**
+ * Fields of the stored document that are operational: spend, the injection log,
+ * who asked, and the input hash. Removed from every full response so an
+ * applicant or agent never reads them (the suspicious-content log in particular
+ * is "stored, never shown").
+ */
+const OPERATIONAL_FIELDS = ["usage", "costUsd", "suspiciousContent", "requestedBy", "inputHash", "models", "promptVersion"] as const;
+
+/** A stored time as an ISO string, or null. */
+function isoOf(ts: { toDate?: () => Date } | null | undefined): string | null {
+  return ts && typeof ts.toDate === "function" ? ts.toDate().toISOString() : null;
+}
+
+/** The full `data`: the stored document, without operational fields, and without `internalCall` for client-role callers. */
 export function serializeFull(assessment: ApplicationAssessment, role: string | undefined): unknown {
-  if (role === ROLES.CLIENT) return stripKeyDeep(assessment, "internalCall");
-  return assessment;
+  const visible: Record<string, unknown> = { ...(assessment as unknown as Record<string, unknown>) };
+  for (const f of OPERATIONAL_FIELDS) delete visible[f];
+  if (role === ROLES.CLIENT) return stripKeyDeep(visible, "internalCall");
+  return visible;
 }
 
 /** The envelope: `meta` and `data`. */
@@ -85,14 +119,17 @@ export function envelope(
   assessment: ApplicationAssessment,
   tier: AssessmentTier,
   role: string | undefined,
-  approvedVersion: number | null
+  staleReason: StaleReason | null
 ): { meta: AssessmentMeta; data: FreeAssessmentData | unknown | null } {
   const meta: AssessmentMeta = {
     assessmentId: assessment.id,
     status: assessment.status,
     tier,
     rubricVersion: assessment.rubricVersion,
-    stale: approvedVersion !== null && assessment.rubricVersion < approvedVersion,
+    staleReason,
+    stale: staleReason !== null,
+    startedAt: isoOf(assessment.startedAt),
+    finishedAt: isoOf(assessment.finishedAt),
     error: assessment.error,
   };
   if (assessment.status !== "succeeded") return { meta, data: null };

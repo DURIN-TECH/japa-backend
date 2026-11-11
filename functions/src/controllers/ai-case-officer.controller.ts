@@ -6,6 +6,7 @@ import { checkApplicationAccessForRequest } from "../utils/access";
 import { sendError, sendSuccess, sendNotFound, sendForbidden } from "../utils/response";
 import type { Application } from "../types";
 import type { ApplicationAssessment } from "../types/assessment";
+import { rubricRouteKey } from "../scrapers";
 import { aiCaseOfficerService } from "../services/ai-case-officer.service";
 import { envelope, tierFor } from "../services/ai/tier-serializer";
 
@@ -67,7 +68,7 @@ export class AiCaseOfficerController {
     case "stored": {
       const stored = await aiCaseOfficerService.getById(outcome.assessmentId);
       if (!stored) return sendNotFound(res, "Assessment not found");
-      return sendSuccess(res, await this.envelopeFor(stored, tier, req));
+      return sendSuccess(res, await this.envelopeFor(stored, tier, req, app));
     }
     case "running":
     case "queued":
@@ -83,9 +84,22 @@ export class AiCaseOfficerController {
     if (!checkApplicationAccessForRequest(req, app, "read")) return sendForbidden(res);
 
     const latest = await aiCaseOfficerService.latestFor(app.id);
-    if (!latest) return sendError(res, "NO_ASSESSMENT", "This application has no assessment yet.", 404);
+    if (!latest) {
+      // Two different empty states, told apart: the route has no approved rubric
+      // (nothing can be assessed yet), or it has one and no review has been run.
+      const approved = await aiCaseOfficerService.approvedVersionOf(app.countryCode, app.visaTypeId);
+      if (approved === null) {
+        return sendError(
+          res,
+          "NO_APPROVED_RUBRIC",
+          `There is no approved rubric for the route ${rubricRouteKey(app.countryCode, app.visaTypeId)}, so no assessment can be made.`,
+          404
+        );
+      }
+      return sendError(res, "NO_ASSESSMENT", "This application has no assessment yet.", 404);
+    }
     const tier = tierFor(req.authz?.role, req.entitlements);
-    return sendSuccess(res, await this.envelopeFor(latest, tier, req));
+    return sendSuccess(res, await this.envelopeFor(latest, tier, req, app));
   }
 
   /** GET /ai/assessments/:id: one assessment, access checked on its application. */
@@ -96,13 +110,13 @@ export class AiCaseOfficerController {
     // The check is on the parent application, never on the assessment id alone.
     if (!app || !checkApplicationAccessForRequest(req, app, "read")) return sendForbidden(res);
     const tier = tierFor(req.authz?.role, req.entitlements);
-    return sendSuccess(res, await this.envelopeFor(assessment, tier, req));
+    return sendSuccess(res, await this.envelopeFor(assessment, tier, req, app));
   }
 
-  /** The envelope for one assessment, with the stale flag from the approved version. */
-  private async envelopeFor(assessment: ApplicationAssessment, tier: "free" | "full", req: AuthenticatedRequest) {
-    const approved = await aiCaseOfficerService.approvedVersionOf(assessment.countryCode, assessment.visaTypeId);
-    return envelope(assessment, tier, req.authz?.role, approved);
+  /** The envelope for one assessment, with the stale reason computed here, server-side. */
+  private async envelopeFor(assessment: ApplicationAssessment, tier: "free" | "full", req: AuthenticatedRequest, app: Application) {
+    const staleReason = await aiCaseOfficerService.staleReasonOf(app, assessment);
+    return envelope(assessment, tier, req.authz?.role, staleReason);
   }
 }
 

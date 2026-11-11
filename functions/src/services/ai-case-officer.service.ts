@@ -31,10 +31,11 @@ import {
   type Facts,
   type JudgementOutput,
 } from "./ai/assessment-engine";
+import { costOfUsage } from "./ai/ai-pricing";
 import { readAiSettings, type AiSettings, type AiSettingsRead } from "./ai/ai-settings";
 import { AnthropicLlmProvider, type LlmProvider, type LlmUsage } from "./ai/llm-provider";
 import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-safety";
-import type { AssessmentTier } from "./ai/tier-serializer";
+import type { AssessmentTier, StaleReason } from "./ai/tier-serializer";
 
 // ============================================
 // AI CASE-OFFICER ASSESSMENT — JOB AND I/O (issue #42)
@@ -155,6 +156,30 @@ function isoDate(now: Date): string {
   return now.toISOString().slice(0, 10);
 }
 
+/**
+ * The date a mandatory bar is checked against.
+ *
+ * - `submittedAt`, when the application has one: a rule in force when the
+ *   applicant applied governs their application, so a rule change after
+ *   submission must not change a re-run's outcome.
+ * - Otherwise the ASSESSMENT date (`now`). Never `startDate`: that is when the
+ *   draft was created, not when the application is made, and a bar that came
+ *   into force after a long-lived draft was started would be silently skipped.
+ *
+ * It never returns "no date". Skipping a mandatory bar because a date is
+ * missing would tell an applicant nothing blocks them when something may; the
+ * safe direction is to check the bar against today. (A missing or malformed
+ * `submittedAt` therefore also falls back to `now`.)
+ */
+export function barDateOf(app: Pick<Application, "submittedAt">, now: Date): string {
+  const ts = app.submittedAt as { toDate?: () => Date } | undefined;
+  if (ts && typeof ts.toDate === "function") {
+    const d = ts.toDate();
+    if (d instanceof Date && !Number.isNaN(d.getTime())) return isoDate(d);
+  }
+  return isoDate(now);
+}
+
 /** The default deps: Firestore, Cloud Storage, the Anthropic provider and the settings doc. */
 function defaultDeps(): AssessmentDeps {
   return {
@@ -215,6 +240,7 @@ function newAssessmentDoc(args: {
     suspiciousContent: [],
     confidence: null,
     topIssues: [],
+    hasBlockingRule: false,
     internalCall: null,
     models: { extract: null, judge: null },
     promptVersion: ASSESSMENT_PROMPT_VERSION,
@@ -405,7 +431,23 @@ export class AiCaseOfficerService {
     return done[0] ?? null;
   }
 
-  /** The approved version of a route, for the `stale` flag. */
+  /**
+   * Why a stored assessment is out of date, or null when it is current. Done on
+   * the server because the client cannot compute the input hash.
+   *
+   * `inputs_changed` wins: the applicant's own changes are what they can act on.
+   * Otherwise `rules_updated` when the approved rubric version differs from the
+   * one the assessment used.
+   */
+  async staleReasonOf(app: Application, assessment: ApplicationAssessment): Promise<StaleReason | null> {
+    const loaded = await this.loadInputs(app);
+    if (computeInputHash(this.inputsFor(loaded, assessment.rubricVersion)) !== assessment.inputHash) return "inputs_changed";
+    const approved = await this.approvedVersionOf(assessment.countryCode, assessment.visaTypeId);
+    if (approved !== null && approved !== assessment.rubricVersion) return "rules_updated";
+    return null;
+  }
+
+  /** The approved version of a route. */
   async approvedVersionOf(countryCode: string, visaTypeId: string): Promise<number | null> {
     return this.deps.rubrics.approvedVersionOf(countryCode, visaTypeId);
   }
@@ -481,7 +523,10 @@ export class AiCaseOfficerService {
     const score = loaded.eligibilityScore;
 
     // ---- stage 1: mandatory bars (no model call) ----
-    const hits = mandatoryBarHits(rubric, loaded.nationality, isoDate(now));
+    // The bar is checked against the date the application was SUBMITTED when
+    // there is one, else today (see barDateOf for why never startDate and why
+    // a missing date never means "skip the bar").
+    const hits = mandatoryBarHits(rubric, loaded.nationality, barDateOf(app, now));
     if (hits.length > 0) {
       const content = assembleContent({
         rubric,
@@ -672,6 +717,15 @@ export class AiCaseOfficerService {
     models: { extract: string | null; judge: string | null },
     suspiciousContent: ApplicationAssessment["suspiciousContent"] = []
   ): Promise<void> {
+    // Items dropped by code (a criterion id the rubric does not contain, or model
+    // text that broke the banned-wording list) are logged as a COUNT. The text is
+    // never logged: it may carry an applicant's words.
+    if (content.droppedCount > 0) {
+      console.warn(`[ai-case-officer] assessment ${id}: ${content.droppedCount} model item(s) dropped by code checks`);
+    }
+    // Cost from the price table; null while a role has no confirmed price.
+    const extractCost = costOfUsage("extraction", this.usageAsLlm(usage.extract));
+    const judgeCost = costOfUsage("judgement", this.usageAsLlm(usage.judge));
     await this.finish(id, {
       status: "succeeded",
       error: null,
@@ -686,12 +740,19 @@ export class AiCaseOfficerService {
       suspiciousContent,
       confidence: content.confidence,
       topIssues: topIssuesOf(rubric, content),
+      hasBlockingRule: content.hasBlockingRule,
       internalCall: content.internalCall,
       models,
       model: models.judge ?? models.extract ?? null,
       usage,
-      costUsd: null,
+      // A total only when both stages are priced: a part-priced total would understate the spend.
+      costUsd: extractCost === null || judgeCost === null ? null : extractCost + judgeCost,
     });
+  }
+
+  /** Stored usage in the shape the price function takes. */
+  private usageAsLlm(u: AssessmentUsage): LlmUsage {
+    return { inputTokens: u.inputTokens, outputTokens: u.outputTokens, cacheReadTokens: u.cacheReadTokens, cacheWriteTokens: u.cacheWriteTokens };
   }
 
   /**

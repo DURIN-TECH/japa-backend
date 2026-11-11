@@ -118,7 +118,7 @@ describe("the /ai handlers", () => {
     await aiCaseOfficerController.latest(req({ id: "app-1" }, OWNER, null), got);
     assert.equal(got.statusCode, 200);
     assert.equal(got.body.data.meta.tier, "free");
-    assert.deepEqual(Object.keys(got.body.data.data).sort(), ["readiness", "topIssues"]);
+    assert.deepEqual(Object.keys(got.body.data.data).sort(), ["hasBlockingRule", "readiness", "topIssues"]);
     const keys = allKeys(got.body.data.data);
     for (const forbidden of ["refusalGrounds", "credibilityFlags", "strengths", "statementFindings", "insufficientInformation", "stageOutcomes", "score", "sourceQuote", "sourceUrl", "ruleRef", "internalCall"]) {
       assert.ok(!keys.includes(forbidden), `the free body must not carry ${forbidden}`);
@@ -244,7 +244,51 @@ describe("the /ai handlers", () => {
     const got = mockRes();
     await aiCaseOfficerController.latest(req({ id: "app-1" }, OWNER, null), got);
     assert.equal(got.body.data.meta.stale, true);
+    assert.equal(got.body.data.meta.staleReason, "rules_updated");
     assert.equal(got.body.data.meta.rubricVersion, 1);
+  });
+
+  test("meta carries tier, status, times and staleReason inputs_changed when a document changed", async () => {
+    seedCase();
+    useProvider(new ScriptedProvider((r) => (r.role === "extraction" ? BANK : JSON.stringify({ findings: [], strengths: [], statementNotes: [], suspiciousPassages: [] }))));
+    const posted = mockRes();
+    await aiCaseOfficerController.assess(req({ id: "app-1" }, OWNER, PAID), posted);
+    await work(posted.body.data.assessmentId);
+    let got = mockRes();
+    await aiCaseOfficerController.latest(req({ id: "app-1" }, OWNER, PAID), got);
+    const m = got.body.data.meta;
+    assert.equal(m.tier, "full");
+    assert.equal(m.status, "succeeded");
+    assert.equal(m.staleReason, null);
+    assert.equal(typeof m.startedAt, "string");
+    assert.equal(typeof m.finishedAt, "string");
+    seedDocument({ id: "doc-new", applicationId: "app-1", key: "bank-new", label: "New statement" });
+    got = mockRes();
+    await aiCaseOfficerController.latest(req({ id: "app-1" }, OWNER, PAID), got);
+    assert.equal(got.body.data.meta.staleReason, "inputs_changed");
+  });
+
+  test("the full body never carries operational fields (usage, cost, injection log, requester, hash)", async () => {
+    seedCase();
+    useProvider(new ScriptedProvider((r) => (r.role === "extraction" ? BANK : JSON.stringify({ findings: [], strengths: [], statementNotes: [], suspiciousPassages: [] }))));
+    const posted = mockRes();
+    await aiCaseOfficerController.assess(req({ id: "app-1" }, ADMIN, null), posted);
+    await work(posted.body.data.assessmentId);
+    const got = mockRes();
+    await aiCaseOfficerController.latest(req({ id: "app-1" }, ADMIN, null), got);
+    const keys = allKeys(got.body.data.data);
+    for (const k of ["usage", "costUsd", "suspiciousContent", "requestedBy", "inputHash", "models"]) assert.ok(!keys.includes(k), `full body must not carry ${k}`);
+    assert.ok(keys.includes("refusalGrounds"));
+  });
+
+  test("no approved rubric on GET is told apart from no review yet", async () => {
+    seedApplication({ id: "app-2", visaTypeId: "route-x", agentId: "agent-1", agencyId: "agency-1" });
+    useProvider(new ScriptedProvider(() => "{}"));
+    const res = mockRes();
+    await aiCaseOfficerController.latest(req({ id: "app-2" }, OWNER, null), res);
+    assert.equal(res.statusCode, 404);
+    assert.equal(res.body.error, "NO_APPROVED_RUBRIC");
+    assert.ok(res.body.message.includes("AA_route-x"));
   });
 
   test("no assessment yet answers 404 NO_ASSESSMENT", async () => {
