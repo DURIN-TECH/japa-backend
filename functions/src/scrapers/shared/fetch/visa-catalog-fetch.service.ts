@@ -99,6 +99,12 @@ export const MAX_HTML_BYTES = 5 * 1024 * 1024;
 // without this a server drip-feeding a large PDF could hold a crawl open.
 export const DEFAULT_BODY_TIMEOUT_MS = 60_000;
 
+// Longest silence allowed BETWEEN two chunks of a response body, in ms: the
+// same 15s the client's timeout gave a stalled download before bodies were
+// streamed. A body that stops arriving is dropped after this, well before the
+// overall deadline above.
+export const DEFAULT_BODY_IDLE_TIMEOUT_MS = 15_000;
+
 // Minimum gap between two requests to the SAME host, so we never hammer a
 // government site. Different hosts are unaffected.
 export const PER_HOST_MIN_INTERVAL_MS = 1_500;
@@ -237,11 +243,14 @@ export interface VisaCatalogFetchServiceOptions {
   clock?: () => number;
   // PDF limits (issue #33): byte cap, page cap, text cap, parse timeout and
   // parser memory. Any subset; the rest come from DEFAULT_PDF_LIMITS
-  // (20 MB / 500 pages / 1,000,000 chars / 30 s / 256 MB).
+  // (20 MB / 500 pages / 1,000,000 chars / 30 s / 160 MB of memory growth).
   pdf?: Partial<PdfLimits>;
   // Overall time allowed to read one response body, in ms. Default
   // DEFAULT_BODY_TIMEOUT_MS (60s); tests lower it.
   bodyTimeoutMs?: number;
+  // Longest gap allowed between two chunks of a body, in ms. Default
+  // DEFAULT_BODY_IDLE_TIMEOUT_MS (15s); tests lower it.
+  bodyIdleTimeoutMs?: number;
 }
 
 /** Raw HTTP response handed to adapters by `getRaw()`. */
@@ -417,6 +426,8 @@ export class VisaCatalogFetchService {
   private readonly pdfLimits: PdfLimits;
   // Overall budget for reading one response body (ms).
   private readonly bodyTimeoutMs: number;
+  // Longest gap between two chunks of a response body (ms).
+  private readonly bodyIdleTimeoutMs: number;
 
   constructor(options: VisaCatalogFetchServiceOptions = {}) {
     this.minIntervalMs = options.minIntervalMs ?? PER_HOST_MIN_INTERVAL_MS;
@@ -424,6 +435,7 @@ export class VisaCatalogFetchService {
     this.clock = options.clock ?? Date.now;
     this.pdfLimits = { ...DEFAULT_PDF_LIMITS, ...(options.pdf ?? {}) };
     this.bodyTimeoutMs = options.bodyTimeoutMs ?? DEFAULT_BODY_TIMEOUT_MS;
+    this.bodyIdleTimeoutMs = options.bodyIdleTimeoutMs ?? DEFAULT_BODY_IDLE_TIMEOUT_MS;
   }
 
   /**
@@ -614,11 +626,15 @@ export class VisaCatalogFetchService {
    *     cap: `pdfLimits.maxBytes` for a PDF, MAX_HTML_BYTES otherwise;
    *  4. the body is read as bytes under that cap (see readBody).
    *
+   * `acceptPdf: false` refuses a PDF at step 3, before any of its body is
+   * downloaded (PdfFetchError "not-accepted").
+   *
    * Returns the bytes (or the string a test stub supplied) with the kind,
    * status and final URL.
    */
   private async fetchBody(
-    url: string
+    url: string,
+    acceptPdf: boolean
   ): Promise<{ kind: "html" | "pdf"; body: Buffer | string; status: number; finalUrl: string }> {
     const host = this.hostOf(url);
     await this.rateLimit(host);
@@ -655,6 +671,19 @@ export class VisaCatalogFetchService {
     const kind: "html" | "pdf" = isPdfResponse(contentType, url, finalUrl) ? "pdf" : "html";
     const maxBytes = kind === "pdf" ? this.pdfLimits.maxBytes : MAX_HTML_BYTES;
 
+    // The caller does not take PDFs: refuse now, on the headers alone, so the
+    // document is neither downloaded nor parsed.
+    if (kind === "pdf" && !acceptPdf) {
+      discardBody(data);
+      const err = new PdfFetchError(
+        "not-accepted",
+        `PDF not accepted for ${url}: the response is a PDF (${contentType || "no content type"}) ` +
+          "and this caller reads web pages only; nothing was downloaded"
+      );
+      console.warn(`Visa catalog fetch: PDF rejected (${err.reason}): ${err.message}`);
+      throw err;
+    }
+
     /** The "over the cap" error for this response's kind. */
     const tooLarge = (bytes: number, how: string): Error => {
       if (kind !== "pdf") {
@@ -687,7 +716,8 @@ export class VisaCatalogFetchService {
    *  - A stream (the real client) is read chunk by chunk; the moment the
    *    running total passes `maxBytes` the stream is destroyed and the fetch
    *    fails, so an oversized (or mis-declared) body is never held in memory.
-   *    The whole read is also bounded by `bodyTimeoutMs`.
+   *    Two timers bound the read: `bodyIdleTimeoutMs` between chunks (a
+   *    stalled download) and `bodyTimeoutMs` overall (a drip-fed one).
    *  - Bytes or a string already in hand (test stubs) are only measured.
    */
   private async readBody(
@@ -722,8 +752,21 @@ export class VisaCatalogFetchService {
     const timer = setTimeout(() => {
       stream.destroy?.(new Error(`Timed out reading the response body for ${url} after ${this.bodyTimeoutMs} ms`));
     }, this.bodyTimeoutMs);
+    // Inactivity timer: restarted on every chunk, so it only fires when the
+    // body has gone quiet for `bodyIdleTimeoutMs`.
+    let idleTimer: NodeJS.Timeout | undefined;
+    const restartIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        stream.destroy?.(
+          new Error(`Response body stalled for ${url}: no data for ${this.bodyIdleTimeoutMs} ms after ${total} bytes`)
+        );
+      }, this.bodyIdleTimeoutMs);
+    };
+    restartIdleTimer();
     try {
       for await (const chunk of stream) {
+        restartIdleTimer();
         const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk);
         total += buf.byteLength;
         if (total > maxBytes) {
@@ -735,6 +778,7 @@ export class VisaCatalogFetchService {
       }
     } finally {
       clearTimeout(timer);
+      clearTimeout(idleTimer);
     }
     return Buffer.concat(chunks, total);
   }
@@ -782,7 +826,14 @@ export class VisaCatalogFetchService {
    * `pdf` carries the per-page text, and a PDF that cannot be read throws a
    * `PdfFetchError` whose `reason` says why (see pdf-text.ts).
    */
-  async fetchAndClean(url: string, options?: { checkRobots?: boolean }): Promise<FetchedPage> {
+  async fetchAndClean(
+    url: string,
+    // checkRobots: check robots.txt first (throws when disallowed).
+    // acceptPdf (default true): pass false to refuse a PDF response outright,
+    // with PdfFetchError "not-accepted" and without downloading it; for
+    // callers that can only use a web page's text.
+    options?: { checkRobots?: boolean; acceptPdf?: boolean }
+  ): Promise<FetchedPage> {
     if (options?.checkRobots) {
       const allowed = await this.isAllowedByRobots(url);
       if (!allowed) {
@@ -792,12 +843,12 @@ export class VisaCatalogFetchService {
 
     // One request for both kinds; a non-2xx status has already thrown
     // "Fetch failed for … (HTTP n)" inside fetchBody.
-    const { kind, body, status, finalUrl } = await this.fetchBody(url);
+    const { kind, body, status, finalUrl } = await this.fetchBody(url, options?.acceptPdf ?? true);
 
     // ---- PDF (issue #33) ----
     // Extract the text layer per page. Every refusal (not a PDF, encrypted,
     // malformed, too many pages, too much text, no text layer, parse
-    // timeout) is a PdfFetchError with a reason; it is logged here and
+    // timeout, too much memory) is a PdfFetchError with a reason; it is logged here and
     // rethrown so the caller records a source failure, exactly as for a
     // failed HTML fetch. Nothing is truncated and empty text is never
     // returned as a success.

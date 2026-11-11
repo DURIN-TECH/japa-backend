@@ -22,13 +22,23 @@ import { Worker } from "worker_threads";
 //  2. Magic bytes        — the file must carry the `%PDF-` header; an HTML
 //                          error page or login wall served as
 //                          `application/pdf` is rejected before any parsing.
-//  3. Isolated parse     — the parser runs in a worker thread with its own
-//                          heap limit. The parent enforces a wall-clock
-//                          timeout by TERMINATING the worker, which works even
-//                          when a hostile file keeps the parser in a tight
-//                          CPU loop (a timer on the same thread could never
-//                          fire in that case). A parser crash or out-of-memory
-//                          kills the worker, not the crawl function.
+//  3. Isolated parse     — the parser runs in a worker thread. The parent
+//                          enforces a wall-clock timeout by TERMINATING the
+//                          worker, which works even when a hostile file keeps
+//                          the parser in a tight CPU loop (a timer on the same
+//                          thread could never fire in that case). A parser
+//                          crash kills the worker, not the crawl function.
+//  3b. Memory watchdog   — a worker shares the process's memory, and the
+//                          worker's V8 heap limit only bounds JavaScript
+//                          objects. A PDF's compressed streams are inflated
+//                          into typed arrays that live OUTSIDE that heap, so
+//                          a few hundred kilobytes of highly compressible
+//                          data can expand to gigabytes without ever touching
+//                          the heap limit. The parent therefore watches the
+//                          process's resident memory (RSS) while the worker
+//                          runs and terminates it, with reason
+//                          "memory-exceeded", once RSS has grown by more than
+//                          `parseRssGrowthMb` (see runPdfWorker).
 //  4. Page cap           — checked from the document catalogue before any
 //                          page content is read.
 //  5. Text cap           — exceeding it FAILS the fetch (see below).
@@ -69,9 +79,18 @@ export interface PdfLimits {
   // Wall-clock budget for parsing one PDF, in ms. The worker is terminated
   // when it runs out.
   parseTimeoutMs: number;
-  // Heap limit (old generation, MB) for the parser's worker thread, so one
-  // PDF cannot exhaust the crawl function's memory.
+  // V8 heap limit (old generation, MB) for the parser's worker thread. This
+  // bounds JavaScript objects ONLY (strings, parsed structures). It does NOT
+  // bound the typed arrays that compressed streams are inflated into, which
+  // live outside the heap; `parseRssGrowthMb` is the limit that covers those.
   parseMemoryMb: number;
+  // How much the PROCESS's resident memory (RSS, MB) may grow while one PDF
+  // is being parsed before the parse is terminated with "memory-exceeded".
+  // This is the limit that actually protects the function's memory: it counts
+  // everything the parse allocates, on or off the JavaScript heap. It is
+  // measured for the whole process, so memory allocated by other work running
+  // at the same moment counts toward it too.
+  parseRssGrowthMb: number;
   // Fewest non-whitespace characters a PDF must yield to count as having a
   // text layer. Below this the fetch fails with "no-extractable-text".
   minTextChars: number;
@@ -87,7 +106,14 @@ export interface PdfLimits {
  *    size and still bounds what later stages are handed.
  *  - parseTimeoutMs 30 s: an 80-page document parses in well under a second;
  *    30 s only ever stops a pathological file.
- *  - parseMemoryMb 256: half of the crawl function's 512 MB.
+ *  - parseMemoryMb 256: generous for the parser's JavaScript objects; not
+ *    the limit that protects the function (see parseRssGrowthMb).
+ *  - parseRssGrowthMb 160: the crawl function has 512 MB. An idle instance
+ *    sits at roughly 150-200 MB, and a 20 MB PDF is held twice during a parse
+ *    (the downloaded buffer and the worker's copy: 40 MB). 160 MB of growth
+ *    on top of that stays under 512 MB with room for the watchdog's reaction
+ *    time. For scale: parsing an 80-page guidance PDF grows RSS by about
+ *    85 MB, most of it the worker thread and the parser themselves.
  *  - minTextChars 100: the same floor the HTML path uses for "too little
  *    content".
  */
@@ -97,6 +123,7 @@ export const DEFAULT_PDF_LIMITS: Readonly<PdfLimits> = Object.freeze({
   maxTextChars: 1_000_000,
   parseTimeoutMs: 30_000,
   parseMemoryMb: 256,
+  parseRssGrowthMb: 160,
   minTextChars: 100,
 });
 
@@ -115,7 +142,9 @@ export type PdfFailureReason =
   | "too-many-pages" // more pages than maxPages
   | "text-too-long" // more extracted text than maxTextChars (never truncated)
   | "no-extractable-text" // no text layer (scanned / image-only); OCR is #38
-  | "parse-timeout"; // parsing exceeded parseTimeoutMs and was terminated
+  | "parse-timeout" // parsing exceeded parseTimeoutMs and was terminated
+  | "memory-exceeded" // parsing grew process memory past parseRssGrowthMb and was terminated
+  | "not-accepted"; // the caller asked for no PDFs (acceptPdf: false); nothing was downloaded
 
 /** Numbers recorded with a failure, so a refusal is never unexplained. */
 export interface PdfFailureDetails {
@@ -128,6 +157,8 @@ export interface PdfFailureDetails {
   maxTextChars?: number; // the text cap that applied
   minTextChars?: number; // the text floor that applied
   timeoutMs?: number; // the parse budget that applied
+  rssGrowthMb?: number; // process RSS growth (MB) seen when the parse was stopped
+  maxRssGrowthMb?: number; // the RSS growth budget (MB) that applied
 }
 
 /**
@@ -428,34 +459,59 @@ function workerEntry(): { entry: string; evalEntry: boolean } {
   return { entry: `require("tsx/cjs"); require(${JSON.stringify(file)});`, evalEntry: true };
 }
 
+// How often the parent samples process memory while a PDF is being parsed.
+// Inflating a compressed stream allocates hundreds of MB per second, so the
+// sample has to be frequent for the watchdog to stop it near the budget.
+const RSS_POLL_INTERVAL_MS = 25;
+
+const BYTES_PER_MB = 1024 * 1024;
+
 /**
  * Run the parser in a worker thread and wait for its answer, enforcing the
- * wall-clock timeout and the heap limit. Never rejects with anything but a
- * PdfFetchError: a worker crash (parser bug, out of memory) is "malformed",
- * running out of time is "parse-timeout".
+ * wall-clock timeout, the memory watchdog and the worker's heap limit. Never
+ * rejects with anything but a PdfFetchError: a worker crash (parser bug, heap
+ * limit) is "malformed", running out of time is "parse-timeout", growing
+ * process memory past the budget is "memory-exceeded".
+ *
+ * Memory watchdog: the process's RSS is recorded before the worker starts
+ * (the baseline) and sampled every RSS_POLL_INTERVAL_MS while it runs. Once
+ * RSS has grown by more than `limits.parseRssGrowthMb`, the worker is
+ * terminated, which frees everything it allocated. This is done from the
+ * PARENT because the worker cannot be trusted to notice: the allocation
+ * happens inside one synchronous parser call. Between two samples memory can
+ * still rise somewhat past the budget (the parser grows its buffers by
+ * doubling), which the default budget leaves room for.
  */
 function runPdfWorker(input: PdfWorkerInput, limits: PdfLimits, label: string): Promise<string[]> {
   return new Promise<string[]>((resolve, reject) => {
+    // Read before the buffer is transferred to the worker (after which the
+    // parent's view of it is empty).
+    const byteLength = input.bytes.byteLength;
+    // Baseline for the memory watchdog: what the process holds before parsing.
+    const baselineRss = process.memoryUsage.rss();
+    const budgetBytes = limits.parseRssGrowthMb * BYTES_PER_MB;
+
     const { entry, evalEntry } = workerEntry();
     const worker = new Worker(entry, {
       eval: evalEntry,
       workerData: input,
+      // Move the PDF bytes to the worker instead of copying them again.
+      transferList: [input.bytes.buffer as ArrayBuffer],
       execArgv: [],
-      // Give the parser its own, bounded heap.
+      // Bounds the worker's JavaScript heap only; see the watchdog below for
+      // memory outside it.
       resourceLimits: { maxOldGenerationSizeMb: limits.parseMemoryMb },
-      // The parser's own diagnostics stay out of the function logs; failures
-      // come back as messages.
-      stdout: true,
-      stderr: true,
     });
 
-    // Settle exactly once, always stopping the timer and the worker.
+    // Settle exactly once, always stopping both timers and the worker.
     let settled = false;
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      // terminate() is what actually stops a parser stuck in a CPU loop.
+      clearInterval(watchdog);
+      // terminate() is what actually stops a parser stuck in a CPU loop, and
+      // what releases the memory of one that is inflating a huge stream.
       void worker.terminate();
       fn();
     };
@@ -466,11 +522,29 @@ function runPdfWorker(input: PdfWorkerInput, limits: PdfLimits, label: string): 
           new PdfFetchError(
             "parse-timeout",
             `PDF parse timed out for ${label}: stopped after ${limits.parseTimeoutMs} ms`,
-            { timeoutMs: limits.parseTimeoutMs, byteLength: input.bytes.byteLength }
+            { timeoutMs: limits.parseTimeoutMs, byteLength }
           )
         )
       );
     }, limits.parseTimeoutMs);
+
+    // Memory watchdog (see the function comment).
+    const watchdog = setInterval(() => {
+      const growth = process.memoryUsage.rss() - baselineRss;
+      if (growth <= budgetBytes) return;
+      const grownMb = Math.round(growth / BYTES_PER_MB);
+      finish(() =>
+        reject(
+          new PdfFetchError(
+            "memory-exceeded",
+            `PDF parse used too much memory for ${label}: process memory grew by ${grownMb} MB, over the ` +
+              `${limits.parseRssGrowthMb} MB budget, from a ${byteLength}-byte file (parse stopped; ` +
+              "likely a stream that inflates to far more than its size)",
+            { rssGrowthMb: grownMb, maxRssGrowthMb: limits.parseRssGrowthMb, byteLength }
+          )
+        )
+      );
+    }, RSS_POLL_INTERVAL_MS);
 
     worker.once("message", (out: PdfWorkerOutput) => {
       finish(() => {
@@ -479,7 +553,7 @@ function runPdfWorker(input: PdfWorkerInput, limits: PdfLimits, label: string): 
           // Add what the parent knows to the worker's numbers, so the error
           // always says which limit applied.
           const details: PdfFailureDetails = {
-            byteLength: input.bytes.byteLength,
+            byteLength,
             ...(out.reason === "text-too-long" ? { maxTextChars: limits.maxTextChars } : {}),
             ...(out.details ?? {}),
           };
@@ -487,7 +561,7 @@ function runPdfWorker(input: PdfWorkerInput, limits: PdfLimits, label: string): 
         }
       });
     });
-    // Uncaught error inside the worker, including hitting the heap limit.
+    // Uncaught error inside the worker, including hitting its heap limit.
     worker.once("error", (err) => {
       finish(() =>
         reject(new PdfFetchError("malformed", `PDF parser failed for ${label}: ${err?.message ?? String(err)}`))
@@ -505,8 +579,8 @@ function runPdfWorker(input: PdfWorkerInput, limits: PdfLimits, label: string): 
 /**
  * Extract clean, per-page text from PDF bytes.
  *
- * Checks, in order: byte cap, `%PDF-` header, then (in the worker) the parse
- * itself and the page cap, then the text cap and the "has a text layer"
+ * Checks, in order: byte cap, `%PDF-` header, then (in the worker, under the
+ * timeout and the memory watchdog) the parse itself and the page cap, then the text cap and the "has a text layer"
  * floor. Every refusal is a `PdfFetchError` with a reason; the text is never
  * truncated and an image-only PDF never comes back as empty text.
  *
@@ -540,8 +614,10 @@ export async function extractPdfText(
     );
   }
 
-  // 3 + 4. Parse in the worker (timeout, heap limit, page cap). The worker
-  // gets its own copy of the bytes, so the caller's buffer is left intact.
+  // 3 + 4. Parse in the worker (timeout, memory watchdog, page cap). One
+  // copy of the bytes is made here and then MOVED to the worker, so the
+  // caller's buffer is left intact and the file is held twice, not three
+  // times.
   const rawPages = await runPdfWorker(
     {
       bytes: new Uint8Array(bytes),

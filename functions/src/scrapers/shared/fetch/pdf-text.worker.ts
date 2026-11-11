@@ -8,8 +8,10 @@ import type { PdfWorkerInput, PdfWorkerOutput } from "./pdf-text";
 //
 // Runs the PDF parser OFF the main thread, on behalf of `extractPdfText()` in
 // pdf-text.ts (read the header there first). The parent starts one worker per
-// PDF, hands it the bytes, and terminates it on timeout; this file only parses
-// and reports.
+// PDF, hands it the bytes, and terminates it on timeout or when process
+// memory grows past its budget; this file only parses and reports. It cannot
+// police its own memory: a compressed stream is inflated inside one parser
+// call, outside the JavaScript heap, so the parent watches from outside.
 //
 // Parser: `unpdf` (MIT), which bundles Mozilla's PDF.js (Apache-2.0) as plain
 // JavaScript with no native modules, so nothing is compiled at install or

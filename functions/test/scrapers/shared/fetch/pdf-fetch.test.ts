@@ -37,7 +37,7 @@ import {
 } from "../../../../src/scrapers/shared/fetch/pdf-text";
 import { isHostBackoffError } from "../../../../src/scrapers/shared/etiquette/visa-crawl-host-state";
 import { GenericHtmlAdapter } from "../../../../src/scrapers/visa-catalog/adapters/generic-html.adapter";
-import { buildPdf } from "../../../helpers/pdf-fixture";
+import { buildPdf, deflatedPaddedContent } from "../../../helpers/pdf-fixture";
 
 // ----- Fixtures -----
 
@@ -90,7 +90,12 @@ interface StubCall {
  */
 function serviceWith(
   routes: Record<string, StubResponse | (() => StubResponse)>,
-  options: { pdf?: Partial<PdfLimits>; minIntervalMs?: number; bodyTimeoutMs?: number } = {}
+  options: {
+    pdf?: Partial<PdfLimits>;
+    minIntervalMs?: number;
+    bodyTimeoutMs?: number;
+    bodyIdleTimeoutMs?: number;
+  } = {}
 ) {
   const calls: StubCall[] = [];
   const http: VisaCatalogHttpClient = {
@@ -121,6 +126,7 @@ function serviceWith(
     minIntervalMs: options.minIntervalMs ?? 0,
     pdf: options.pdf,
     bodyTimeoutMs: options.bodyTimeoutMs,
+    bodyIdleTimeoutMs: options.bodyIdleTimeoutMs,
   });
   return { service, calls };
 }
@@ -288,25 +294,23 @@ describe("fetchAndClean — PDF hash gate", () => {
     // identity of the buffer.
     let pages = THREE_PAGES;
     const { service } = serviceWith({ [PDF_URL]: () => pdfRoute(pages) });
-    const adapter = new GenericHtmlAdapter(service);
-    const sourcePage = { url: PDF_URL, routeName: "Guidance", validation: "text_verified" as const };
 
-    // First crawl: the adapter document carries the PDF text and its hash.
-    const first = await adapter.fetch(sourcePage);
-    assert.equal(first.text, THREE_PAGES.join(PDF_PAGE_SEPARATOR));
+    // First crawl.
+    const first = await service.fetchAndClean(PDF_URL, { checkRobots: true });
+    assert.equal(first.cleanText, THREE_PAGES.join(PDF_PAGE_SEPARATOR));
 
-    // Second crawl of the same document: identical hash. The crawl compares
-    // this with the page's stored `lastContentHash` and, when equal, skips
-    // extraction (visa-catalog-crawl.service.ts, "Hash gate"): zero
-    // downstream work for an unchanged PDF.
-    const second = await adapter.fetch(sourcePage);
+    // Second crawl of the same document: identical hash. A crawl compares
+    // this with the hash it stored last time and, when equal, skips
+    // extraction (the "Hash gate" in visa-catalog-crawl.service.ts does this
+    // for web pages): zero downstream work for an unchanged PDF.
+    const second = await service.fetchAndClean(PDF_URL, { checkRobots: true });
     assert.equal(second.contentHash, first.contentHash);
     const changedOnRecrawl = second.contentHash !== first.contentHash;
     assert.equal(changedOnRecrawl, false);
 
     // A new release with one edited sentence: the hash moves.
     pages = [PAGE_1, PAGE_2.replace("will leave", "will depart"), PAGE_3];
-    const third = await adapter.fetch(sourcePage);
+    const third = await service.fetchAndClean(PDF_URL, { checkRobots: true });
     assert.notEqual(third.contentHash, first.contentHash);
   });
 
@@ -554,14 +558,130 @@ describe("fetchAndClean — PDFs that cannot be read", () => {
     assert.equal(err.details.timeoutMs, 1);
   });
 
-  test("failures reach an adapter caller as ordinary rejections (nothing escapes as a crash)", async () => {
-    const { service } = serviceWith({ [PDF_URL]: pdfRoute(["", ""]) });
-    const adapter = new GenericHtmlAdapter(service);
-    const out = await quietly(() =>
-      adapter.fetch({ url: PDF_URL, routeName: "Guidance", validation: "text_verified" })
+  test("a compressed (FlateDecode) PDF reads the same as an uncompressed one", async () => {
+    const plain = serviceWith({ [PDF_URL]: { body: buildPdf(THREE_PAGES), contentType: "application/pdf" } });
+    const packed = serviceWith({
+      [PDF_URL]: { body: buildPdf(THREE_PAGES, { compress: true }), contentType: "application/pdf" },
+    });
+    const [a, b] = [await plain.service.fetchAndClean(PDF_URL), await packed.service.fetchAndClean(PDF_URL)];
+    assert.deepEqual(b.pdf?.pages, THREE_PAGES);
+    assert.equal(b.contentHash, a.contentHash);
+  });
+});
+
+// ============================================
+// Memory: a small PDF that inflates to hundreds of MB
+// ============================================
+
+describe("fetchAndClean — PDF memory watchdog", () => {
+  test("a stream that inflates far past its size is stopped with 'memory-exceeded', memory stays bounded", async () => {
+    // A ~0.3 MB PDF whose one content stream inflates to 300 MB. The parser
+    // inflates it into typed arrays outside the JavaScript heap, so the
+    // worker's heap limit never sees it; only the watchdog on process memory
+    // can stop it. Without the watchdog this parse takes process memory up by
+    // more than the 300 MB it inflates (the parser's buffers double as they
+    // grow) and then "succeeds".
+    const INFLATES_TO_MB = 300;
+    const BUDGET_MB = 64;
+    const pdfBytes = buildPdf([FILLER], { deflatedFirstPage: await deflatedPaddedContent(INFLATES_TO_MB) });
+    assert.ok(pdfBytes.length < 1024 * 1024, `fixture is small on the wire: ${pdfBytes.length} bytes`);
+
+    const { service } = serviceWith(
+      { [PDF_URL]: { body: pdfBytes, contentType: "application/pdf" } },
+      { pdf: { parseRssGrowthMb: BUDGET_MB } }
     );
-    assert.ok(out.error instanceof Error);
-    assert.match((out.error as Error).message, /No extractable text/);
+
+    // Sample process memory ourselves, independently of the watchdog, to see
+    // the peak the process actually reached.
+    const baseline = process.memoryUsage.rss();
+    let peak = baseline;
+    const sampler = setInterval(() => {
+      peak = Math.max(peak, process.memoryUsage.rss());
+    }, 5);
+    let outcome: Awaited<ReturnType<typeof refused>>;
+    try {
+      outcome = await refused(() => service.fetchAndClean(PDF_URL), "memory-exceeded");
+    } finally {
+      clearInterval(sampler);
+    }
+    const { err, warnings } = outcome;
+
+    // Reasoned failure, with the numbers.
+    assert.equal(err.details.maxRssGrowthMb, BUDGET_MB);
+    assert.ok((err.details.rssGrowthMb ?? 0) > BUDGET_MB, `grew ${err.details.rssGrowthMb} MB`);
+    assert.equal(err.details.byteLength, pdfBytes.length);
+    assert.match(err.message, /used too much memory/);
+    assert.ok(warnings.some((w) => w.includes("memory-exceeded")), "the refusal is logged with its reason");
+
+    // Bounded: the process never got near the 300 MB the stream inflates to.
+    // The watchdog samples every 25 ms and the parser's buffers grow by
+    // doubling, so some overshoot past the budget is expected; 200 MB is the
+    // generous ceiling, well under the unguarded figure.
+    const peakGrowthMb = Math.round((peak - baseline) / (1024 * 1024));
+    assert.ok(peakGrowthMb < 200, `process memory grew by ${peakGrowthMb} MB (budget ${BUDGET_MB} MB)`);
+  });
+
+  test("the default budget lets an ordinary PDF through and is part of the configurable limits", async () => {
+    assert.equal(DEFAULT_PDF_LIMITS.parseRssGrowthMb, 160);
+    const { service } = serviceWith({ [PDF_URL]: pdfRoute(THREE_PAGES) });
+    assert.equal((await service.fetchAndClean(PDF_URL)).pdf?.pageCount, 3);
+  });
+});
+
+// ============================================
+// The generic web-page adapter does not take PDFs
+// ============================================
+
+describe("GenericHtmlAdapter — PDF responses are refused, not truncated", () => {
+  const sourcePage = { url: PDF_URL, routeName: "Guidance", validation: "text_verified" as const };
+
+  test("a page that serves a PDF is refused with a logged reason, before the body is read", async () => {
+    let bytesServed = 0;
+    const pdfBytes = buildPdf(THREE_PAGES);
+    const body = new Readable({
+      read() {
+        bytesServed += pdfBytes.length;
+        this.push(pdfBytes);
+        this.push(null);
+      },
+    });
+    const { service, calls } = serviceWith({ [PDF_URL]: { body, contentType: "application/pdf" } });
+    const adapter = new GenericHtmlAdapter(service);
+
+    const { err, warnings } = await refused(() => adapter.fetch(sourcePage), "not-accepted");
+    assert.match(err.message, /PDF not accepted/);
+    assert.match(err.message, /nothing was downloaded/);
+    assert.ok(warnings.some((w) => w.includes("not-accepted")), "the refusal is logged with its reason");
+    // Etiquette still ran (robots.txt, then one request), and the PDF body
+    // was dropped unread: no download, no parse, nothing sent downstream.
+    assert.deepEqual(calls.map((c) => c.url), [ROBOTS_URL, PDF_URL]);
+    assert.equal(bytesServed, 0);
+    assert.equal(body.destroyed, true);
+  });
+
+  test("a web page URL that redirects to a PDF is refused the same way", async () => {
+    const start = `https://${HOST}/guidance/latest`;
+    const { service } = serviceWith({
+      [start]: { body: buildPdf(THREE_PAGES), contentType: "application/octet-stream", responseUrl: PDF_URL },
+    });
+    const adapter = new GenericHtmlAdapter(service);
+    await refused(() => adapter.fetch({ ...sourcePage, url: start }), "not-accepted");
+  });
+
+  test("the same URL is still readable by a caller that asks the fetch service directly", async () => {
+    const { service } = serviceWith({ [PDF_URL]: () => pdfRoute(THREE_PAGES) });
+    await refused(() => new GenericHtmlAdapter(service).fetch(sourcePage), "not-accepted");
+    assert.equal((await service.fetchAndClean(PDF_URL, { checkRobots: true })).pdf?.pageCount, 3);
+  });
+
+  test("web pages through the adapter are unaffected", async () => {
+    const url = `https://${HOST}/visas/visitor`;
+    const html = `<html><body><main><h1>Visitor visa</h1><p>${FILLER} ${FILLER}</p></main></body></html>`;
+    const { service } = serviceWith({ [url]: { body: html, contentType: "text/html" } });
+    const doc = await new GenericHtmlAdapter(service).fetch({ ...sourcePage, url });
+    const direct = await service.fetchAndClean(url);
+    assert.equal(doc.text, direct.cleanText);
+    assert.equal(doc.contentHash, direct.contentHash);
   });
 });
 
@@ -626,15 +746,37 @@ describe("fetchAndClean — PDF byte cap", () => {
     await refused(() => tooSmall.service.fetchAndClean(PDF_URL), "too-large");
   });
 
-  test("a body that stalls is abandoned after the body timeout", async () => {
-    // Sends a little, then never ends.
+  test("a body that stalls is dropped by the inactivity timer, long before the overall deadline", async () => {
+    // Sends a little, then goes silent without ending.
     const body = new Readable({ read() { /* never pushes again */ } });
     body.push(Buffer.from("%PDF-1.4\n"));
     const { service } = serviceWith(
       { [PDF_URL]: { body, contentType: "application/pdf" } },
-      { bodyTimeoutMs: 30 }
+      { bodyIdleTimeoutMs: 30, bodyTimeoutMs: 60_000 }
     );
-    await assert.rejects(service.fetchAndClean(PDF_URL), /Timed out reading the response body/);
+    const started = Date.now();
+    await assert.rejects(service.fetchAndClean(PDF_URL), /Response body stalled .* no data for 30 ms after 9 bytes/);
+    assert.ok(Date.now() - started < 5_000, "did not wait for the overall deadline");
+    assert.equal(body.destroyed, true);
+  });
+
+  test("a body that keeps dripping is dropped by the overall deadline", async () => {
+    // One byte every 10 ms: never idle for long, never finished.
+    let timer: NodeJS.Timeout | undefined;
+    const body = new Readable({
+      read() {
+        if (!timer) timer = setInterval(() => this.push(Buffer.from("%")), 10);
+      },
+      destroy(err, callback) {
+        clearInterval(timer);
+        callback(err);
+      },
+    });
+    const { service } = serviceWith(
+      { [PDF_URL]: { body, contentType: "application/pdf" } },
+      { bodyIdleTimeoutMs: 1_000, bodyTimeoutMs: 80 }
+    );
+    await assert.rejects(service.fetchAndClean(PDF_URL), /Timed out reading the response body .* after 80 ms/);
     assert.equal(body.destroyed, true);
   });
 });

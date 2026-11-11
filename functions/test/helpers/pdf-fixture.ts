@@ -1,3 +1,5 @@
+import { createDeflate, deflateSync } from "node:zlib";
+
 // ============================================
 // Synthetic PDF fixtures (issue #33)
 // ============================================
@@ -21,6 +23,50 @@ export interface BuildPdfOptions {
   encrypted?: boolean;
   // Bytes placed before the `%PDF-` header (readers tolerate a short prefix).
   prefix?: string;
+  // Store each page's content stream deflate-compressed (`/FlateDecode`), as
+  // almost every real PDF does. The extracted text is the same either way.
+  compress?: boolean;
+  // ALREADY-DEFLATED content stream to use for page 1 instead of one built
+  // from its text (see `deflatedPaddedContent`). Requires nothing else; the
+  // page's entry in `pages` is then ignored.
+  deflatedFirstPage?: Buffer;
+}
+
+/**
+ * Build, deflate-compressed, a page content stream that is `paddingMb` MB of
+ * spaces followed by one short line of text. Spaces are legal filler between
+ * drawing operators, and megabytes of one repeated byte compress about
+ * 1000:1, so the result is small on disk and enormous once a parser inflates
+ * it: the shape of a "decompression bomb". Used to test that the parse is
+ * stopped by its memory budget.
+ *
+ * The padding is fed to the compressor 1 MB at a time, so building the
+ * fixture never holds the inflated size in memory itself.
+ */
+export function deflatedPaddedContent(paddingMb: number): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const deflate = createDeflate({ level: 9 });
+    const out: Buffer[] = [];
+    deflate.on("data", (chunk: Buffer) => out.push(chunk));
+    deflate.on("error", reject);
+    deflate.on("end", () => resolve(Buffer.concat(out)));
+
+    const megabyte = Buffer.alloc(1024 * 1024, 0x20); // 1 MB of spaces
+    let written = 0;
+    /** Write padding until done or the compressor asks us to wait. */
+    const pump = () => {
+      while (written < paddingMb) {
+        written++;
+        if (!deflate.write(megabyte)) {
+          deflate.once("drain", pump);
+          return;
+        }
+      }
+      // A real (if tiny) text line after the padding, in the standard font.
+      deflate.end(Buffer.from("BT /F1 11 Tf 50 780 Td (padded page) Tj ET", "latin1"));
+    };
+    pump();
+  });
 }
 
 /** Latin-1 bytes of an ASCII string. */
@@ -66,9 +112,14 @@ export function buildPdf(pages: string[], options: BuildPdfOptions = {}): Buffer
   // ---- Objects: 1 catalogue, 2 page tree, 3 font, 4 ToUnicode, then a
   // (page, content stream) pair per page ----
   const objects: Buffer[] = [];
-  /** A stream object body: dictionary with /Length, then the data. */
-  const stream = (data: string): Buffer =>
-    ascii(`<< /Length ${Buffer.byteLength(data, "latin1")} >>\nstream\n${data}\nendstream`);
+  /** A stream object body: dictionary with /Length (and filter), then the data. */
+  const streamBytes = (data: Buffer, filter = ""): Buffer =>
+    Buffer.concat([ascii(`<< /Length ${data.length}${filter} >>\nstream\n`), data, ascii("\nendstream")]);
+  /** An uncompressed stream object from text. */
+  const stream = (data: string): Buffer => streamBytes(ascii(data));
+  /** A page content stream: deflated when `compress` is set. */
+  const contentStream = (data: string): Buffer =>
+    options.compress ? streamBytes(deflateSync(ascii(data)), " /Filter /FlateDecode") : stream(data);
 
   const pageObjNum = (i: number) => 5 + i * 2; // page i's object number
   const kids = pages.map((_, i) => `${pageObjNum(i)} 0 R`).join(" ");
@@ -94,7 +145,12 @@ export function buildPdf(pages: string[], options: BuildPdfOptions = {}): Buffer
           `/Resources << /Font << /F1 3 0 R >> >> /Contents ${pageObjNum(i) + 1} 0 R >>`
       )
     );
-    objects.push(stream(content));
+    // Page 1 may be given as a ready-made deflated stream (see options).
+    if (i === 0 && options.deflatedFirstPage) {
+      objects.push(streamBytes(options.deflatedFirstPage, " /Filter /FlateDecode"));
+    } else {
+      objects.push(contentStream(content));
+    }
   });
 
   // ---- Serialise: header, objects (recording byte offsets), xref, trailer ----
