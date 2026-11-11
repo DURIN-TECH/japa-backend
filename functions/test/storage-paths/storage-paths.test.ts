@@ -129,7 +129,7 @@ describe("a path must be a normalised, bucket-relative key", () => {
     [`verification/uidA/${NAME}?generation=1`, "BAD_CHARACTERS"],
     [`verification/uidA/${NAME}#x`, "BAD_CHARACTERS"],
     [`verification/uidA/%2e%2e/uidB/${NAME}`, "BAD_CHARACTERS"],
-    [`verification/uidA/*`, "BAD_CHARACTERS"],
+    ["verification/uidA/*", "BAD_CHARACTERS"],
     [`verification/uidA//${NAME}`, "EMPTY_SEGMENT"],
     [`verification/uidA/${NAME}/`, "EMPTY_SEGMENT"],
     [`verification/uidA/../uidB/${NAME}`, "RESERVED_SEGMENT"],

@@ -125,7 +125,7 @@ before(async () => {
     compliance: {
       status: "in_progress",
       idDocumentPath: `compliance/agency-clean/idDocument/${NAME}`, // another agency's
-      proofOfAddressPath: `compliance/agency-bad/proofOfAddress/not-issued.pdf`,
+      proofOfAddressPath: "compliance/agency-bad/proofOfAddress/not-issued.pdf",
     },
   });
   await collections.agencies.doc("agency-no-compliance").set({ id: "agency-no-compliance" });

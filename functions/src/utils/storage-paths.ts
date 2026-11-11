@@ -219,23 +219,23 @@ function isSafeSegment(id: unknown): id is string {
  */
 function scopeFolders(scope: StorageScope): string[] | null {
   switch (scope.purpose) {
-    case "application-document":
-      if (!isSafeSegment(scope.ownerUserId) || !isSafeSegment(scope.applicationId)) return null;
-      return [`documents/${scope.ownerUserId}/${scope.applicationId}/`];
-    case "agent-verification":
-      if (!isSafeSegment(scope.userId)) return null;
-      return [`verification/${scope.userId}/`];
-    case "compliance-document":
-      if (!isSafeSegment(scope.agencyId) || scope.slots.length === 0 || !scope.slots.every(isSafeSegment)) return null;
-      return scope.slots.map((slot) => `compliance/${scope.agencyId}/${slot}/`);
-    case "agency-logo":
-      if (!isSafeSegment(scope.agencyId)) return null;
-      return [`agency-logos/${scope.agencyId}/`];
-    case "profile-photo":
-      if (!isSafeSegment(scope.userId)) return null;
-      return [`users/${scope.userId}/profile/`];
-    default:
-      return null;
+  case "application-document":
+    if (!isSafeSegment(scope.ownerUserId) || !isSafeSegment(scope.applicationId)) return null;
+    return [`documents/${scope.ownerUserId}/${scope.applicationId}/`];
+  case "agent-verification":
+    if (!isSafeSegment(scope.userId)) return null;
+    return [`verification/${scope.userId}/`];
+  case "compliance-document":
+    if (!isSafeSegment(scope.agencyId) || scope.slots.length === 0 || !scope.slots.every(isSafeSegment)) return null;
+    return scope.slots.map((slot) => `compliance/${scope.agencyId}/${slot}/`);
+  case "agency-logo":
+    if (!isSafeSegment(scope.agencyId)) return null;
+    return [`agency-logos/${scope.agencyId}/`];
+  case "profile-photo":
+    if (!isSafeSegment(scope.userId)) return null;
+    return [`users/${scope.userId}/profile/`];
+  default:
+    return null;
   }
 }
 
