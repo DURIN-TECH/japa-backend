@@ -8,3 +8,16 @@
 // deep-importing scrapers/visa-catalog/types.ts (see the boundary rule in
 // .eslintrc.js). The file it re-exports declares no runtime values.
 export * from "./visa-catalog/types";
+// Caseworker-guidance registry types (issue #39). Named, type-only exports:
+// guidance/types.ts also declares runtime constants, which must not leak
+// into this type-only barrel.
+export type {
+  GuidanceDocType,
+  GuidanceSnapshotContent,
+  GuidanceSnapshotMeta,
+  GuidanceSnapshotPage,
+  GuidanceSource,
+  GuidanceSourceSeed,
+  GuidanceSourceStatus,
+  GuidanceVerificationStatus,
+} from "./guidance/types";

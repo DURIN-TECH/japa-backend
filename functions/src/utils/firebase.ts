@@ -126,6 +126,20 @@ export const collections = {
   //   reviewStatus="pending_review" / source="scraped" and reviewed via the
   //   existing admin visa-review flow (no separate queue).
   visaSources: db.collection("visaSources"),
+  // Caseworker-guidance source registry (issue #39), kept SEPARATE from
+  // visaSources on purpose:
+  // - visaSources describes WHAT A VISA IS (the public pages the catalog
+  //   crawler turns into visa types, fees and requirements);
+  // - guidanceSources describes HOW OFFICERS DECIDE (the published rules and
+  //   caseworker guidance a rubric is extracted from).
+  // One doc per document (web page or PDF), keyed by a generic
+  // jurisdiction + route. Written by the seed
+  // (scrapers/guidance/data/seed-guidance-sources.ts) and the guidance crawl
+  // (scrapers/guidance/guidance-crawl.service.ts); read by admins through
+  // GET /admin/guidance-sources. Immutable text snapshots hang off each
+  // source (see `subcollections.guidanceSnapshots`).
+  // Backend-only: no firestore.rules match -> clients denied.
+  guidanceSources: db.collection("guidanceSources"),
   // Backend-only app configuration documents. Today: `appConfig/fx`, the
   // USD exchange rates (Frankfurter / ECB) the visa scraper converts
   // published fees with (issue #59). No firestore.rules match → clients denied.
@@ -234,6 +248,14 @@ export const subcollections = {
   // Immutable content snapshots under a document instance (version history).
   documentVersions: (instanceId: string) =>
     collections.documentInstances.doc(instanceId).collection("versions"),
+
+  // Immutable snapshots of one guidance source (issue #39):
+  // `guidanceSources/{sourceId}/snapshots/{contentHash}`. METADATA only; the
+  // snapshot's text lives in Cloud Storage (see
+  // scrapers/guidance/guidance-snapshot.store.ts). Backend-only, like its
+  // parent: no firestore.rules match.
+  guidanceSnapshots: (sourceId: string) =>
+    collections.guidanceSources.doc(sourceId).collection("snapshots"),
 
   // An agency's per-visa service prices (issue #103), in whole NAIRA:
   // `agencies/{agencyId}/visaPrices/{countryCode}__{visaTypeId}`. Written and

@@ -365,6 +365,25 @@ export interface FetchedPage {
 }
 
 /**
+ * Thrown by `fetchAndClean()` when the caller asked for a page's whole text
+ * (`maxHtmlTextChars`, issue #39) and the page has more than that. The page
+ * is refused rather than truncated, so a caller never stores (or quotes from)
+ * a document with its end missing without knowing.
+ */
+export class HtmlTextTooLongError extends Error {
+  constructor(
+    readonly url: string,
+    // Characters of clean text the page actually has.
+    readonly textChars: number,
+    // The caller's limit it exceeded.
+    readonly maxTextChars: number
+  ) {
+    super(`Page text too long for ${url}: ${textChars} characters exceeds the ${maxTextChars}-character limit`);
+    this.name = "HtmlTextTooLongError";
+  }
+}
+
+/**
  * Body of a response as the HTTP client may hand it over: a Node stream (the
  * real client, `responseType: "stream"`), or already-read bytes / text (test
  * stubs, which ignore `responseType`).
@@ -788,7 +807,14 @@ export class VisaCatalogFetchService {
    * pick the main content region, collapse whitespace, and cap length. This is
    * what gets hashed and (later) handed to the extractor.
    */
-  htmlToCleanText(html: string): string {
+  htmlToCleanText(
+    html: string,
+    // Longest text returned, in characters; anything beyond it is sliced off.
+    // Default MAX_CLEAN_TEXT_CHARS (the visa-page cap). `fetchAndClean()`
+    // passes Infinity when its caller set `maxHtmlTextChars` (issue #39), so
+    // it can FAIL on an over-long page instead of slicing it.
+    maxChars: number = MAX_CLEAN_TEXT_CHARS
+  ): string {
     const $ = cheerio.load(html);
     // Remove chrome/boilerplate outright.
     $(BOILERPLATE_SELECTORS.join(",")).remove();
@@ -807,7 +833,7 @@ export class VisaCatalogFetchService {
     // Block newlines + whitespace normalisation (shared with the GOV.UK
     // adapter's per-part conversion), then the generic-html cap.
     const text = blockText(root);
-    return text.length > MAX_CLEAN_TEXT_CHARS ? text.slice(0, MAX_CLEAN_TEXT_CHARS) : text;
+    return text.length > maxChars ? text.slice(0, maxChars) : text;
   }
 
   /** SHA-256 of arbitrary text — the content-change key. */
@@ -832,7 +858,13 @@ export class VisaCatalogFetchService {
     // acceptPdf (default true): pass false to refuse a PDF response outright,
     // with PdfFetchError "not-accepted" and without downloading it; for
     // callers that can only use a web page's text.
-    options?: { checkRobots?: boolean; acceptPdf?: boolean }
+    // maxHtmlTextChars (issue #39, default unset = unchanged behaviour): for
+    // callers that must have the WHOLE page (guidance snapshots, which are
+    // quoted from later). When set, the HTML text is NOT sliced at
+    // MAX_CLEAN_TEXT_CHARS; a page whose clean text is longer than this value
+    // fails with HtmlTextTooLongError instead, the same "never truncate
+    // silently" rule the PDF path follows. Has no effect on a PDF response.
+    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number }
   ): Promise<FetchedPage> {
     if (options?.checkRobots) {
       const allowed = await this.isAllowedByRobots(url);
@@ -879,7 +911,14 @@ export class VisaCatalogFetchService {
 
     // ---- HTML (unchanged) ----
     const html = decodeHtmlBody(body);
-    const cleanText = this.htmlToCleanText(html);
+    // Default: the capped visa-page text, exactly as before. With
+    // `maxHtmlTextChars` (issue #39): the full text, refused when over the
+    // caller's limit rather than cut short.
+    const htmlLimit = options?.maxHtmlTextChars;
+    const cleanText = htmlLimit === undefined ? this.htmlToCleanText(html) : this.htmlToCleanText(html, Infinity);
+    if (htmlLimit !== undefined && cleanText.length > htmlLimit) {
+      throw new HtmlTextTooLongError(url, cleanText.length, htmlLimit);
+    }
     if (cleanText.length < 100) {
       // Almost no readable content — likely JS-rendered or a block page. Flag it
       // rather than feeding an empty page to the extractor.
