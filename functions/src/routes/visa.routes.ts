@@ -28,8 +28,9 @@ countryRoutes.post("/:code/visas", verifyAuth, verifyAdmin, (req, res) =>
   visaController.createVisaType(req, res)
 );
 
-// Requirements under visa types
-countryRoutes.get("/:code/visas/:visaId/requirements", (req, res) =>
+// Requirements under visa types. Issue #102: gated like the detail and /full
+// routes (optionalAuth attaches the caller's ability when a token is sent).
+countryRoutes.get("/:code/visas/:visaId/requirements", optionalAuth, (req, res) =>
   visaController.getRequirements(req, res)
 );
 countryRoutes.post(

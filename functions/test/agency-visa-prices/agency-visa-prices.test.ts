@@ -580,10 +580,23 @@ describe("public agency page (/agencies/public/:slug)", () => {
     await setPrice(ownerA(), "uk-student", { price: 12500 });
     const r = await publicAgency("acme");
     assert.equal(r.status, 200);
-    assert.deepEqual(r.body.data.visaPrices, [
+    // The #103 keys of each entry (#102 adds applicant-safe visa detail to
+    // the same entries; that part is covered in agency-visa-access.test.ts).
+    const pick = ({ visaTypeId, countryCode, visaName, category, price }: any) => ({
+      visaTypeId,
+      countryCode,
+      visaName,
+      category,
+      price,
+    });
+    assert.deepEqual(r.body.data.visaPrices.map(pick), [
       { visaTypeId: "own-1", countryCode: CC, visaName: "Agency own-1", category: "work", price: null },
       { visaTypeId: "uk-student", countryCode: CC, visaName: "Global uk-student", category: "work", price: 12500 },
     ]);
+    // No owner or review fields on the public page.
+    for (const key of ["ownerAgencyId", "createdBy", "reviewStatus", "agentIds"]) {
+      assert.ok(!JSON.stringify(r.body.data.visaPrices).includes(`"${key}"`), key);
+    }
   });
 
   test("an agency with no priced visas gets `visaPrices: []` and the rest of the page", async () => {

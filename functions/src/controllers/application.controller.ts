@@ -29,7 +29,12 @@ import {
 export class ApplicationController {
   /**
    * POST /applications
-   * Create a new application
+   * Create a new application (applicant self-serve).
+   *
+   * Issue #102: the service refuses a visa that may not be used for this case
+   * (draft / pending / rejected / inactive, or agency-only when the case does
+   * not belong to the owning agency, i.e. no `agentId` of that agency) with
+   * the same 404 as an unknown visa, and writes nothing.
    */
   async createApplication(
     req: AuthenticatedRequest,
@@ -170,6 +175,11 @@ export class ApplicationController {
 
       let ownerAgentUid: string;
       let agentDocId: string;
+      // The agency the new case will belong to (issue #102): the admin's
+      // chosen agency, or the calling agent's own agency (from the agent doc,
+      // the same source createApplication uses). Decides whether the case
+      // may be started on an agency-only visa.
+      let caseAgencyId: string | undefined;
       // Admin provenance passed through to the created application (undefined for
       // the agent flow, so no admin fields are written).
       let adminProvenance:
@@ -214,6 +224,7 @@ export class ApplicationController {
         }
         ownerAgentUid = ownerAgentId;
         agentDocId = ownerDoc.id;
+        caseAgencyId = ownerAgencyId;
 
         // Build the "which admin" audit fields from the admin's own profile.
         const adminDoc = await collections.users.doc(callerUid).get();
@@ -249,7 +260,17 @@ export class ApplicationController {
         }
         ownerAgentUid = callerUid;
         agentDocId = agentSnapshot.docs[0].id;
+        caseAgencyId =
+          (agentSnapshot.docs[0].data() as { agencyId?: string }).agencyId || undefined;
       }
+
+      // --- Visa check BEFORE anything is provisioned (issue #102) ------------
+      // An unknown visa, a draft / pending / rejected / inactive visa, or an
+      // agency-only visa of ANOTHER agency is refused here with the same 404
+      // as an unknown id (thrown as "Visa type not found", handled below), so
+      // no client account, invite email, application or conversation is
+      // created. createApplication re-checks the same rule itself.
+      await applicationService.getStartableVisa(countryCode, visaTypeId, caseAgencyId);
 
       // Enforce the active-application limit for the agency (or independent agent)
       // before provisioning anything. No-op until a plan with the limit is assigned.

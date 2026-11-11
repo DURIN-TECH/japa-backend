@@ -158,10 +158,33 @@ priced. It does not include the whole global catalog.
 
 ```jsonc
 "visaPrices": [
-  { "visaTypeId": "own-1", "countryCode": "GB", "visaName": "…", "category": "work", "price": null },
-  { "visaTypeId": "uk-student", "countryCode": "GB", "visaName": "…", "category": "student", "price": 12500 }
+  {
+    // ---- #103 ----
+    "visaTypeId": "own-1", "countryCode": "GB", "visaName": "…", "category": "work",
+    "price": null,                       // whole NAIRA; null = "Contact for pricing"
+    // ---- #102: applicant-safe visa detail (same entries, not a second list) ----
+    "isAgencyVisa": true,                // this agency's OWN visa (agency-only or made global)
+    "visibility": "agency",              // "agency" = only reachable through this agency; else "global"
+    "visaCode": "ACME-SW", "description": "…",
+    "processingTime": "3 to 8 weeks", "processingDaysMin": 21, "processingDaysMax": 56,
+    "validityPeriod": "Up to 5 years", "isExtendable": true, "maxExtensions": 1,
+    "eligibilityCriteria": ["…"],
+    "baseCostUsd": 900,                  // GOVERNMENT fee in USD, not the agency price; null when unset
+    "applicationUrl": "https://…", "applicationInstructions": "…",
+    "sponsor": { "organisationName": "Acme Ltd", "website": "https://…" }  // or null
+  },
+  { "visaTypeId": "uk-student", "countryCode": "GB", "visaName": "…", "category": "student",
+    "price": 12500, "isAgencyVisa": false, "visibility": "global", "…": "…" }
 ]
 ```
+
+Every entry has every key; a missing optional value is `null`
+(`eligibilityCriteria` is `[]`). The agency's own visas are listed only when
+`source: "agency"`, `ownerAgencyId` is this agency, `reviewStatus: "approved"`
+and `isActive: true`. Drafts, pending, rejected, inactive and other agencies'
+visas never appear. The sponsor licence number and contact, `createdBy`, the
+review fields, `ownerAgencyId` and `agentIds` are never exposed. The page
+still 404s for an unknown slug or an agency that is not `approved`.
 
 - **Units and empty values.** `price` is in whole naira. `null` means the page
   shows "Contact for pricing".
@@ -179,7 +202,7 @@ picker, the agency side calls `GET /agency/visa-prices` and joins on
 
 **Public and mobile.** Read `visaPrices` from `GET /agencies/public/:slug`.
 
-**#102** (reachable through the agency) may extend the public projection with
-more visa detail. `visaPrices` already covers the agency's own approved
-visas, so #102 can reuse `agencyVisaPriceService.listOffered`, or add fields
-to the same entries, rather than adding a second list.
+**#102** (reachable through the agency) added the applicant-safe visa detail
+to the same `visaPrices[]` entries (above), built on `listOffered`. See
+`../agency-visas/agency-visas.md`, "Reachable through the agency", for who
+may read an agency-only visa on the detail endpoints and start a case on it.

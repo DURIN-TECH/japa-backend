@@ -126,16 +126,40 @@ service cloud.firestore {
       
       // Visa types subcollection
       match /visaTypes/{visaTypeId} {
-        // Anyone can read active visa types
-        allow read: if resource.data.isActive == true || isAdmin();
+        // Issue #102: the direct-read twin of the backend's public visibility
+        // rule (`isVisaPubliclyVisible`, functions/src/services/visa.service.ts).
+        // A visa doc is client-readable only when ALL of these hold:
+        //  1. isActive == true;
+        //  2. visibility is "global" or missing/null (seed and scraped docs
+        //     predate the field). An approved AGENCY-ONLY visa is reachable
+        //     only through the backend (#102), never by a direct read;
+        //  3. reviewStatus is "approved" or missing/null (seed docs). Draft,
+        //     pending_review and rejected visas are never client-readable.
+        // `get(field, null)` makes a missing field read as null instead of
+        // failing the rule. Before #102 the rule was `isActive == true`
+        // alone, which let any client read an approved agency-only visa
+        // (bypassing the API rule). Admins can read any visa.
+        function isPubliclyVisibleVisa(data) {
+          return data.isActive == true &&
+            data.get('visibility', null) in [null, 'global'] &&
+            data.get('reviewStatus', null) in [null, 'approved'];
+        }
+
+        allow read: if isPubliclyVisibleVisa(resource.data) || isAdmin();
         
         // Only admins can write visa types
         allow write: if isAdmin();
         
         // Requirements subcollection
         match /requirements/{requirementId} {
-          // Anyone can read requirements
-          allow read: if true;
+          // Issue #102: requirements follow their visa. Readable only when the
+          // parent visa is publicly visible (same rule as above), or by an
+          // admin. Before #102 this was `if true`, so a hidden visa's
+          // requirements were readable by anyone who knew its id.
+          allow read: if isAdmin() ||
+            isPubliclyVisibleVisa(
+              get(/databases/$(database)/documents/countries/$(countryCode)/visaTypes/$(visaTypeId)).data
+            );
           
           // Only admins can write requirements
           allow write: if isAdmin();
@@ -232,6 +256,16 @@ service cloud.firestore {
 
       // Only admin can delete agencies
       allow delete: if isAdmin();
+
+      // Per-visa service prices (issue #103), written and read only by the
+      // backend (Admin SDK, which bypasses rules). Issue #102: an explicit
+      // deny, so a later broad rule on agencies/{agencyId} can never open it
+      // by accident (a parent match does not cover subcollections today, but
+      // this makes the intent impossible to miss). The public page serves the
+      // prices through GET /agencies/public/:slug.
+      match /visaPrices/{priceId} {
+        allow read, write: if false;
+      }
     }
 
     // ============================================
@@ -443,5 +477,14 @@ service cloud.firestore {
     //  - pendingVisaChanges/{changeId}: proposed field-level edits to
     //    approved scraped visas, staged by the crawl and approved/rejected by
     //    admins via /admin/visa-changes (issue #61). Do NOT add a match.
+
+    // ---- Agency visa revisions (issue #100), explicit deny (issue #102) ----
+    // visaRevisions/{cc}__{visaId}: unreviewed agency edits to an approved
+    // visa. Backend only (agency read via /agency/visas, admin review via
+    // /admin/visas). Denied for every client, admins included, so the
+    // unreviewed text can never be read or forged directly.
+    match /visaRevisions/{revisionId} {
+      allow read, write: if false;
+    }
   }
 }
