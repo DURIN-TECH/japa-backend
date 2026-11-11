@@ -140,6 +140,24 @@ export const collections = {
   // source (see `subcollections.guidanceSnapshots`).
   // Backend-only: no firestore.rules match -> clients denied.
   guidanceSources: db.collection("guidanceSources"),
+  // Published outcome statistics (issue #116): decision counts per destination,
+  // published category and nationality, imported from a government's own
+  // statistics release (src/scrapers/outcome-statistics). One doc per
+  // (release, category, nationality) plus an "ALL" nationality doc per category.
+  // Read only by the assessment's country-context lookup
+  // (services/outcome-statistics); never exposed as a list endpoint.
+  // Backend-only: no firestore.rules match -> clients denied.
+  outcomeStatistics: db.collection("outcomeStatistics"),
+  // Which release is current per destination: `outcomeStatisticsReleases/{destination}`.
+  // Flipped last by the import, so a failed import changes nothing. Backend-only.
+  outcomeStatisticsReleases: db.collection("outcomeStatisticsReleases"),
+  // One record per import attempt (release date, file, hash, period, counts,
+  // unmapped names, result), listed by GET /admin/outcome-statistics/runs.
+  // Backend-only.
+  outcomeStatisticsRuns: db.collection("outcomeStatisticsRuns"),
+  // Admin "Run now" requests; a Firestore trigger runs the import in a
+  // higher-memory function than the API. Backend-only.
+  outcomeStatisticsRunRequests: db.collection("outcomeStatisticsRunRequests"),
   // Backend-only app configuration documents. Today: `appConfig/fx`, the
   // USD exchange rates (Frankfurter / ECB) the visa scraper converts
   // published fees with (issue #59). No firestore.rules match → clients denied.

@@ -54,13 +54,16 @@
     "firebase-admin": "^12.7.0",
     "firebase-functions": "^5.1.1",
     "rss-parser": "^3.13.0",
-    "unpdf": "1.9.1"
+    "saxes": "6.0.0",
+    "unpdf": "1.9.1",
+    "unzipper": "0.12.5"
   },
   "devDependencies": {
     "@firebase/rules-unit-testing": "4.0.1",
     "@types/cors": "^2.8.19",
     "@types/express": "^4.17.25",
     "@types/node": "^20.19.27",
+    "@types/unzipper": "0.10.11",
     "@typescript-eslint/eslint-plugin": "^7.18.0",
     "@typescript-eslint/parser": "^7.18.0",
     "eslint": "^8.57.1",
