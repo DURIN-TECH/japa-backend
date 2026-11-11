@@ -7,6 +7,7 @@ import { emailService } from "../services/email/email.service";
 import { resolveEventEmail } from "../services/email/event-templates";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { collections } from "../utils/firebase";
+import { validateStoragePath } from "../utils/storage-paths";
 import { AgencyInvitation } from "../types";
 import { ROLES } from "@durin-tech/authz";
 import {
@@ -236,20 +237,23 @@ export class AgencyController {
 
       // Guard against a caller registering a path that isn't theirs — the path
       // must live under this agency's own logo prefix.
-      if (!storagePath.startsWith(`agency-logos/${agency.id}/`)) {
+      // Shared validator (issue #141): an issued object directly under
+      // `agency-logos/{agency.id}/`, a plain bucket-relative key and nothing else.
+      const checked = validateStoragePath(storagePath, { purpose: "agency-logo", agencyId: agency.id });
+      if (!checked.ok) {
         sendError(res, "VALIDATION_ERROR", "storagePath does not belong to this agency", 400);
         return;
       }
 
       // Confirm the client actually completed the upload.
-      const exists = await storageService.fileExists(storagePath);
+      const exists = await storageService.fileExists(checked.key);
       if (!exists) {
         sendError(res, "VALIDATION_ERROR", "File not found at the specified path", 400);
         return;
       }
 
       // Make the object public and capture its stable URL for persistent rendering.
-      const logoUrl = await storageService.makeFilePublic(storagePath);
+      const logoUrl = await storageService.makeFilePublic(checked.key);
 
       const updated = await agencyService.updateAgency(agency.id, { logoUrl });
 
