@@ -45,6 +45,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "1.8.0",
+    "@durin-tech/authz": "file:vendor/authz",
     "axios": "^1.13.5",
     "cheerio": "^1.2.0",
     "cors": "^2.8.5",
@@ -52,7 +53,7 @@
     "firebase-admin": "^12.7.0",
     "firebase-functions": "^5.1.1",
     "rss-parser": "^3.13.0",
-    "@durin-tech/authz": "file:vendor/authz"
+    "unpdf": "1.9.1"
   },
   "devDependencies": {
     "@firebase/rules-unit-testing": "4.0.1",

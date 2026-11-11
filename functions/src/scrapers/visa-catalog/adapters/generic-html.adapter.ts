@@ -11,6 +11,15 @@ import type { SourceAdapter, SourceDocument } from "./types";
 // 1.5s/host rate limit, UA, boilerplate cleaning, 24_000-char cap and
 // "Too little content" error.
 //
+// PDFs (issue #33): the fetch service can read PDFs, but this adapter does
+// NOT accept them. It hands its whole text to the paid extractor, which is
+// sized for one web page (24,000 characters); a guidance PDF can be forty
+// times that, and how such documents are split up is not decided yet (#39,
+// #111). So a page that serves, or redirects to, a PDF is refused with a
+// clear reason (`PdfFetchError` "not-accepted", logged by the fetch service)
+// before the PDF is even downloaded. It is never truncated to fit. Callers
+// that want PDF text call `fetchAndClean()` themselves.
+//
 // Hash compatibility (important for deploy): `text` is the cleaned page text
 // exactly as before and `contentHash` is fetchAndClean's own hash of it, so a
 // page's stored `lastContentHash` still matches after deploy and non-GB pages
@@ -38,7 +47,9 @@ export class GenericHtmlAdapter implements SourceAdapter {
   /** Fetch + clean the page; one section holding the whole cleaned text. */
   async fetch(page: VisaSourcePage): Promise<SourceDocument> {
     // Throws on robots block / non-2xx / too little content — unchanged.
-    const fetched = await this.fetchService.fetchAndClean(page.url, { checkRobots: true });
+    // `acceptPdf: false`: a PDF response is refused, not extracted (see the
+    // header comment).
+    const fetched = await this.fetchService.fetchAndClean(page.url, { checkRobots: true, acceptPdf: false });
     return {
       url: page.url,
       canonicalUrl: fetched.finalUrl,
