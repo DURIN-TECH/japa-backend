@@ -20,6 +20,8 @@ import {
 } from "./scrapers";
 // Caseworker-guidance source registry: admin list (issue #39).
 import { adminGuidanceSourceRoutes } from "./scrapers";
+// Published outcome statistics imports: admin run list + Run now (issue #116).
+import { adminOutcomeStatisticsRoutes } from "./scrapers";
 // Agency-scoped visa drafts / edits / submit (issue #100).
 import { agencyVisaRoutes } from "./agency-visas";
 // Agency per-visa service prices, in whole naira (issue #103).
@@ -132,6 +134,8 @@ app.use("/admin/scrape-costs", adminScrapeCostRoutes);
 // Caseworker-guidance source registry (issue #39): read-only admin list
 // (CASL `read ScrapeRun`, admin-only). No route serves snapshot text.
 app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
+// Outcome statistics imports (issue #116): admin-only run records + manual run.
+app.use("/admin/outcome-statistics", adminOutcomeStatisticsRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);
