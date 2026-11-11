@@ -1,5 +1,8 @@
 import * as functions from "firebase-functions";
 import { app } from "./app";
+// The Anthropic secret list (issue #31). Importing this module is cheap: it
+// does not load the Anthropic SDK (that happens lazily on the first model call).
+import { AI_SECRETS } from "./services/ai/anthropic-client";
 
 // ============================================
 // HTTP FUNCTIONS
@@ -15,6 +18,7 @@ import { app } from "./app";
  *   - PAYSTACK_CALLBACK_URL  — where Paystack redirects after checkout
  *   - RESEND_API_KEY         — Resend API key for transactional email (re_…)
  *   - EMAIL_FROM             — verified sender, e.g. "Seli <noreply@weareseli.com>"
+ *   - ANTHROPIC_API_KEY      — Anthropic API key for the AI tasks (AI_SECRETS, see below)
  * Set them with `firebase functions:secrets:set <NAME>` before deploying.
  * Locally, the emulator reads them from `functions/.env.local` instead.
  *
@@ -44,6 +48,21 @@ const VERIFICATION_SECRETS = [
 // so deploying without a key is safe — no visas are ever wrongly published.
 const VISA_CATALOG_SECRETS = ["DEEPSEEK_API_KEY"];
 
+// Anthropic API key for the AI tasks (issue #31). `AI_SECRETS` is declared and
+// exported in ONE place, services/ai/anthropic-client.ts (next to the factory
+// that is the only reader of the key), and imported at the top of this file.
+// Bound to:
+//   - `api` only, for now — it will host the `/ai` routes.
+// NOT bound to `onApplicationUpdated`: it only enqueues work and never calls
+// the model. Assessments run in a dedicated Firestore-triggered worker built
+// in #42; that worker adds `AI_SECRETS` to its own runWith when it lands,
+// as do the later AI tasks (#115, #117, #118) for their functions.
+// Absent at runtime => getAnthropicClient() throws "ANTHROPIC_API_KEY is not
+// set for this project". Absent in Secret Manager at DEPLOY time => deploying
+// `api` fails, so create the secret first
+// (`firebase functions:secrets:set ANTHROPIC_API_KEY`). Only `durin-seli-dev`
+// has it for now; production (`japa-platform`) is deliberately left unset.
+
 export const api = functions
   .runWith({
     secrets: [
@@ -51,6 +70,8 @@ export const api = functions
       "PAYSTACK_CALLBACK_URL",
       ...EMAIL_SECRETS,
       ...VERIFICATION_SECRETS,
+      // Anthropic key for the upcoming `/ai` routes (issue #31).
+      ...AI_SECRETS,
     ],
   })
   .https.onRequest(app);
