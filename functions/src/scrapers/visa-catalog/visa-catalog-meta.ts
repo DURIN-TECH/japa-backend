@@ -37,7 +37,12 @@ export function buildScrapeMeta(params: {
   // and copied only when set.
   extracted: Pick<
     ExtractedVisa,
-    "confidence" | "citations" | "processingUnknown" | "uncitedFieldsDropped" | "processingUnverifiedReasons"
+    | "confidence"
+    | "citations"
+    | "processingUnknown"
+    | "uncitedFieldsDropped"
+    | "processingUnverifiedReasons"
+    | "requiredDocumentsDropped"
   >;
   extractedAt: Timestamp;
   sourceMeta?: ScrapeSourceMeta;
@@ -69,6 +74,10 @@ export function buildScrapeMeta(params: {
   if (params.extracted.processingUnknown) meta.processingUnknown = true;
   if (params.extracted.uncitedFieldsDropped && params.extracted.uncitedFieldsDropped.length > 0) {
     meta.uncitedFieldsDropped = [...params.extracted.uncitedFieldsDropped];
+  }
+  // Issue #129: audit trail of uncited documents the validator dropped.
+  if (params.extracted.requiredDocumentsDropped && params.extracted.requiredDocumentsDropped.length > 0) {
+    meta.requiredDocumentsDropped = [...params.extracted.requiredDocumentsDropped];
   }
   if (params.supplementaryPages && params.supplementaryPages.length > 0) {
     meta.supplementaryPages = params.supplementaryPages.map((p) => ({ ...p }));
@@ -250,7 +259,14 @@ export function finiteMin(values: unknown[], fallback = 0): number {
  * (`baseCostUsd` has its own rules in ingestExtraction: FX-flagged fees keep
  * the old cost, see the refresh branch there.)
  */
-export const REFRESH_DELETABLE_FIELDS = ["processingDaysMin", "processingDaysMax", "maxExtensions"] as const;
+// Issue #129: `requiredDocuments` is deletable too — a re-extract that finds no
+// documents must not leave the previous (now unverifiable) list on a pending doc.
+export const REFRESH_DELETABLE_FIELDS = [
+  "processingDaysMin",
+  "processingDaysMax",
+  "maxExtensions",
+  "requiredDocuments",
+] as const;
 
 /**
  * The FieldValue.delete() map for every REFRESH_DELETABLE_FIELDS key that is
@@ -305,6 +321,9 @@ export function extractedToVisaFields(params: {
     isExtendable: e.isExtendable,
     maxExtensions: e.maxExtensions,
     eligibilityCriteria: e.eligibilityCriteria,
+    // Issue #129: OMITTED when empty so a record whose page lists no documents
+    // never gains the field (an empty array is not "the page lists nothing").
+    requiredDocuments: e.requiredDocuments.length > 0 ? e.requiredDocuments : undefined,
     applicationUrl: e.applicationUrl,
     applicationInstructions: e.applicationInstructions,
   };
