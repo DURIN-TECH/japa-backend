@@ -49,6 +49,16 @@ const MONTHS: Record<string, number> = {
   december: 12, dec: 12,
 };
 
+/**
+ * Matches a NESTED QUANTIFIER in a pattern's source text: a group that
+ * contains a quantifier and is itself repeated, e.g. `(\d+)+`, `(a*)*`,
+ * `(?:\s+\w+)*`. That is the classic exponential-backtracking shape.
+ * Exported so every pattern that arrives as registry DATA (this module's
+ * date selector, and the link pattern in guidance-resolve.ts) is refused by
+ * the same rule.
+ */
+export const NESTED_QUANTIFIER_RE = /\([^()]*(?:[*+]|\{\d+,\d*\})[^()]*\)(?:[*+]|\{\d+,\d*\})/;
+
 /** The publisher's date as found in a document. */
 export interface PublishedDate {
   // ISO calendar date (YYYY-MM-DD) when the text could be parsed, else null.
@@ -94,7 +104,7 @@ export function publishedDateSelectorProblem(selector: string): string | undefin
   // 2. A nested quantifier: a group that contains a quantifier and is itself
   //    repeated, e.g. `(\d+)+`, `(a*)*`, `(?:\s+\w+)*`. That is the classic
   //    exponential-backtracking shape.
-  if (/\([^()]*(?:[*+]|\{\d+,\d*\})[^()]*\)(?:[*+]|\{\d+,\d*\})/.test(selector)) {
+  if (NESTED_QUANTIFIER_RE.test(selector)) {
     return "publishedDateSelector must not repeat a group that itself contains a quantifier (nested quantifiers)";
   }
   return undefined;
