@@ -406,18 +406,35 @@ class AgencyVisaPriceService {
 
   /**
    * Clear this agency's price on one visa (the public page then says
-   * "Contact for pricing"). Deletes the price doc. Idempotent: clearing a
-   * price that is not set succeeds and writes nothing. It works whatever the
-   * visa's state, so a stale price can always be removed. It only ever
+   * "Contact for pricing"). Deletes the price doc.
+   *
+   * Same visibility rule as `setPrice` (#154): an unknown visa, or one the
+   * agency may not see (another agency's agency-only visa, a hidden
+   * non-agency visa), is a 404 NOT_FOUND with the same body, and nothing is
+   * written. For a visa the agency CAN see (including its own non-approved
+   * visa) it is idempotent: clearing a price that is not set succeeds and
+   * writes nothing, so a stale price can still be removed. It only ever
    * touches the CALLER's own subcollection, so it can't affect another agency.
    */
   async clearPrice(agencyId: string, target: VisaPriceTarget): Promise<void> {
+    const visaRef = subcollections.visaTypes(target.countryCode).doc(target.visaTypeId);
     const priceRef = subcollections
       .agencyVisaPrices(agencyId)
       .doc(agencyVisaPriceId(target.countryCode, target.visaTypeId));
     await this.runTransaction(async (tx) => {
-      const snap = await tx.get(priceRef);
-      if (snap.exists) tx.delete(priceRef);
+      const [visaSnap, priceSnap] = await Promise.all([tx.get(visaRef), tx.get(priceRef)]);
+      if (!visaSnap.exists) throw visaNotFound();
+      const visa = { id: visaSnap.id, ...visaSnap.data() } as VisaType;
+      visa.countryCode = target.countryCode;
+      // Hidden = ANOTHER agency's agency visa that is not publicly visible.
+      // Its existence must not leak, so it gets the same 404 as an unknown
+      // id. Everything else (public visas, the agency's own visa in any
+      // state, a catalog visa that was deactivated since it was priced) stays
+      // clearable so a stale price can always be removed.
+      if (visa.source === AGENCY_VISA_SOURCE && !isOwnAgencyVisa(visa, agencyId) && !isVisaPubliclyVisible(visa)) {
+        throw visaNotFound();
+      }
+      if (priceSnap.exists) tx.delete(priceRef);
     });
   }
 }

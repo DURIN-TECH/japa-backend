@@ -209,7 +209,9 @@ How an agency edit changes the revision:
   deletes the revision.
 - **After a rejection.** Editing a rejected revision reopens it as
   `pending_review` and drops `rejectionReason`, `reviewedBy` and
-  `reviewedAt`. Its earlier `changes` are kept as the base.
+  `reviewedAt`. A rejected revision's `changes` are discarded on reject
+  (#154), so the next edit starts from the live visa plus the new body only.
+  The service also ignores `changes` on a rejected revision, as a safety net.
 - **The live visa** keeps `reviewStatus: "approved"` and `isActive: true`.
   Public and agency reads keep serving the live values, and the agency reads
   return the revision as `pendingRevision`.
@@ -314,9 +316,10 @@ visa with the revision applied. Without one the answer is
   revision. The live visa stays `approved` and active, and keeps its
   visibility.
 - **Reject** sets `reviewStatus: "rejected"`, `rejectionReason`, `reviewedBy`
-  and `reviewedAt` on the revision. The live doc is not written, so the
+  and `reviewedAt` on the revision and **empties its `changes`** (#154: rejected
+  changes can never go live later). The live doc is not written, so the
   previous approved values stay live with `isActive: true`. The agency's next
-  edit reopens the revision (#100).
+  edit reopens the revision (#100) from the live visa.
 
 The response is `200` with the visa as stored, plus `reviewOutcome`:
 `approved | rejected | revision_approved | revision_rejected | unchanged`.

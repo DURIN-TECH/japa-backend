@@ -506,10 +506,14 @@ class AgencyVisaReviewService {
             tx.delete(revRef);
             return { outcome: "revision_approved" as const, liveChanged: true };
           }
-          // Reject: the revision keeps its changes (the agency can rework
-          // them); the live doc is not written at all, so it stays approved
-          // and active with its previous values.
+          // Reject (#154): the rejected changes are DISCARDED (`changes` is
+          // emptied), so they can never be carried into the next edit and
+          // go live when that one is approved. The revision doc stays only
+          // to carry the rejection reason / reviewer to the agency. The live
+          // doc is not written at all, so it stays approved and active with
+          // its previous values.
           tx.update(revRef, {
+            changes: {},
             reviewStatus: "rejected",
             rejectionReason: input.rejectionReason,
             reviewedBy: input.reviewedBy,

@@ -88,7 +88,7 @@ Every other visa is refused, and nothing is written:
 **Stale prices.** A price can become stale when its visa is deactivated,
 deleted, or taken back to agency-only. The price is kept in storage, but it
 is left out of every read, so it is never shown. The agency can still clear
-it.
+it (unless the visa is another agency's agency-only visa: 404, #154).
 
 ## Endpoints
 
@@ -143,8 +143,8 @@ non-admin who sends `?agencyId=` for any agency other than their own gets
 | `GET /agency/visa-prices` | 200 `AgencyVisaPriceView[]` | 400 / 404 (admin `agencyId`), 403 |
 | `GET /agency/visa-prices?include=global` | 200, the same list plus every public visa not yet priced (`priceUsd: null`), for the portal picker | 403 |
 | `PUT /agency/visa-prices/:countryCode/:visaTypeId` with body `{ "priceUsd": { "amount": "125.00", "currency": "USD" } }` | 200 `AgencyVisaPriceView` | 400, 403 (incl. member agents), 404 |
-| `PUT …` with body `{ "priceUsd": null }` | 200 `{ countryCode, visaTypeId, priceUsd: null }` (clears the price) | 400, 403 (incl. member agents) |
-| `DELETE /agency/visa-prices/:countryCode/:visaTypeId` | 200 `{ countryCode, visaTypeId, priceUsd: null }`. Idempotent: if no price is set, nothing is written | 400, 403 (incl. member agents) |
+| `PUT …` with body `{ "priceUsd": null }` | 200 `{ countryCode, visaTypeId, priceUsd: null }` (clears the price) | 400, 403 (incl. member agents), 404 |
+| `DELETE /agency/visa-prices/:countryCode/:visaTypeId` | 200 `{ countryCode, visaTypeId, priceUsd: null }`. Idempotent: if no price is set, nothing is written. 404 `NOT_FOUND` (same body as `PUT`, nothing written) for an unknown visa or another agency's agency-only visa (#154) | 400, 403 (incl. member agents), 404 |
 
 **List order:**
 
