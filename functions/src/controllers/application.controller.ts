@@ -9,7 +9,10 @@ import { documentRequestService } from "../services/document-request.service";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
 import { authController } from "./auth.controller";
 import { collections, auth } from "../utils/firebase";
-import { can, asSubject, checkWithinLimit, paymentRequired } from "../middleware/authz";
+import { checkWithinLimit, paymentRequired } from "../middleware/authz";
+// Shared application access check (#29): admin > applicant > assigned agent >
+// same agency, decided by the CASL ability on `req.ability`. See utils/access.ts.
+import { checkApplicationAccessForRequest } from "../utils/access";
 import { complianceService } from "../services/compliance.service";
 import { LIMITS, ROLES } from "@durin-tech/authz";
 import {
@@ -515,7 +518,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -550,7 +553,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -696,7 +699,7 @@ export class ApplicationController {
 
       // Only the case's agent/owner/admin can request documents — not the client.
       const isApplicant = application.userId === userId;
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess || isApplicant) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -821,7 +824,7 @@ export class ApplicationController {
 
       const isApplicant = application.userId === userId;
       const isAdmin = !!req.user?.admin;
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
 
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
@@ -877,7 +880,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -895,22 +898,11 @@ export class ApplicationController {
   // HELPER METHODS
   // ============================================
 
-  /**
-   * Check if the request's principal can access an application.
-   *
-   * Now delegates to the shared CASL ability (`req.ability`, built from the role
-   * claim in `verifyAuth`) instead of re-deriving access ad-hoc. The "read" grant
-   * encodes the same rule that used to be inlined here: admin (manage all),
-   * applicant (own `userId`), assigned agent (`agentId`), and same-agency members
-   * (owner/agent on matching `agencyId`).
-   */
-  private checkApplicationAccess(
-    req: AuthenticatedRequest,
-    application: Application,
-    action: "read" | "update" | "delete" = "read"
-  ): boolean {
-    return can(req, action, asSubject("Application", application as unknown as Record<string, unknown>));
-  }
+  // NOTE (#29): the application access check that used to live here as a
+  // private method is now the shared `checkApplicationAccess` in
+  // `utils/access.ts` (same rule, same CASL ability). Handlers call it through
+  // `checkApplicationAccessForRequest(req, application)`, which reads
+  // `req.ability`; triggers and the AI routes call it without a request.
 
   /**
    * Count non-terminal ("active") applications for a scope, used for the
