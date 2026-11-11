@@ -204,6 +204,7 @@ describe("rubric extraction: a web-page source", () => {
       ["nationality_codes_model_proposed", "rubric"],
       ["nationality_code_name_mismatch", bar.criterionId],
       ["nationality_code_name_mismatch", bar.criterionId],
+      ["title_wording_uncited", "rubric"],
       ["intake_wording_uncited", "rubric"],
     ]);
 

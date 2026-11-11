@@ -37,7 +37,18 @@ import {
   type RawIntakeQuestion,
   type RawRubricOutput,
 } from "./rubric-prompt";
-import { SnapshotQuoteIndex, containsTokenBounded, dateSupported, groupNameSupported, passagesOverlap, unitSupported, unsupportedNumbers } from "./rubric-quote";
+import {
+  SnapshotQuoteIndex,
+  containsTokenBounded,
+  dateSupported,
+  datesIn,
+  groupNameSupported,
+  passagesOverlap,
+  unitAdjacentToNumber,
+  unitSupported,
+  unsupportedNumbers,
+  withoutLeadingParagraphNumber,
+} from "./rubric-quote";
 import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSettings } from "./rubric-settings";
 import { rubricRouteKey, rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
 import { validateCriterionShape, validateVisaRubric } from "./rubric-validate";
@@ -197,6 +208,12 @@ interface AcceptedCriterion {
   // The quote begins part-way through a sentence of the source (see
   // SnapshotQuoteIndex.startsMidSentence): becomes a reviewer flag.
   startsMidSentence: boolean;
+  // The quote stops before the end of its sentence (see
+  // SnapshotQuoteIndex.endsMidSentence): becomes a reviewer flag.
+  endsMidSentence: boolean;
+  // A dated criterion whose quote holds more than one date: the reviewer
+  // checks validFrom / validUntil are the right ones.
+  multipleDates: boolean;
 }
 
 /** What one chunk's answer yields once validated. */
@@ -230,6 +247,7 @@ const DETAIL = {
   valuePresent: "a `present` check must not carry a value",
   value: "check.value is not written in the criterion's own quote",
   unit: "check.unit is not written in the criterion's own quote",
+  unitNotAdjacent: "check.unit does not stand directly next to check.value in the criterion's own quote",
   titleNumber: "the title states a number the criterion's own quote does not",
   factorNumber: "a probe factor states a number the criterion's own quote does not",
   date: "validFrom / validUntil is not a date written in the criterion's own quote",
@@ -328,7 +346,13 @@ export function assessChunkOutput(
     } else {
       // Located again only to ask where the quote sits in its sentence.
       const found = index.locate(accepted.source.quote);
-      criteria.push({ ref: c.ref, criterion: accepted, startsMidSentence: found.ok && index.startsMidSentence(found) });
+      criteria.push({
+        ref: c.ref,
+        criterion: accepted,
+        startsMidSentence: found.ok && index.startsMidSentence(found),
+        endsMidSentence: found.ok && index.endsMidSentence(found),
+        multipleDates: Boolean(accepted.validFrom || accepted.validUntil) && datesIn(accepted.source.quote).length > 1,
+      });
     }
   }
 
@@ -418,16 +442,23 @@ function assessCriterion(
     const v = c.check.value;
     if (NUMERIC_OPS.includes(c.check.op) && !(typeof v === "number" && Number.isFinite(v))) return { reason: "invalid_shape", detail: DETAIL.valueType };
     if (c.check.op === "present" && v !== null) return { reason: "invalid_shape", detail: DETAIL.valuePresent };
-    if (typeof v === "number" && unsupportedNumbers(v, quote, { outsideDates: true }).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.value };
+    // A paragraph number at the start of the quote labels the rule; it is
+    // not something the rule states, so it supports no number.
+    const content = withoutLeadingParagraphNumber(quote);
+    if (typeof v === "number" && unsupportedNumbers(v, content, { outsideDates: true }).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.value };
     if (typeof v === "string" && (!v.trim() || !containsTokenBounded(quote, v))) return { reason: "number_not_in_quote", detail: DETAIL.value };
     if (c.check.unit !== null && !unitSupported(c.check.unit, quote)) return { reason: "unit_not_in_quote", detail: DETAIL.unit };
+    // The unit belongs to THIS number: "28 days or 4 weeks" does not make
+    // (28, "weeks") a reading of the rule.
+    if (c.check.unit !== null && typeof v === "number" && !unitAdjacentToNumber(v, c.check.unit, content)) return { reason: "unit_not_in_quote", detail: DETAIL.unitNotAdjacent };
   }
 
   // 5. Numbers in the applicant-facing wording must be in the quote as well.
   //    (The rule reference's own digits do not count.)
-  if (unsupportedNumbers(c.title, quote).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.titleNumber };
+  const body = withoutLeadingParagraphNumber(quote);
+  if (unsupportedNumbers(c.title, body).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.titleNumber };
   for (const factor of c.probeFactors) {
-    if (unsupportedNumbers(factor, quote).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.factorNumber };
+    if (unsupportedNumbers(factor, body).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.factorNumber };
   }
 
   // 6. Dates: the same date, as one date expression, in the quote.
@@ -540,7 +571,7 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
     // ---- criteria ----
     // The model's handles are only meaningful inside its own answer.
     const refToId = new Map<string, string>();
-    for (const { ref, criterion, startsMidSentence } of assessment.criteria) {
+    for (const { ref, criterion, startsMidSentence, endsMidSentence, multipleDates } of assessment.criteria) {
       refToId.set(ref, criterion.criterionId);
       if (byId.has(criterion.criterionId)) {
         discard("criterion", "duplicate", "the same passage was already extracted", criterion.title);
@@ -548,6 +579,20 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
       }
       byId.set(criterion.criterionId, criterion);
       criteria.push(criterion);
+      if (endsMidSentence) {
+        flags.push({
+          code: "quote_ends_mid_sentence",
+          message: "the quote stops before the end of its sentence. A condition or exception that follows it (\"only where\", \"unless\") may change its meaning: read the whole sentence in the source before approving.",
+          target: criterion.criterionId,
+        });
+      }
+      if (multipleDates) {
+        flags.push({
+          code: "multiple_dates_in_quote",
+          message: "the quote contains more than one date. Check that validFrom / validUntil are the dates this rule is meant to carry.",
+          target: criterion.criterionId,
+        });
+      }
       if (startsMidSentence) {
         // The check code cannot make: do the words BEFORE the quote change
         // what it means? Said out loud, per criterion, for the reviewer.
@@ -691,6 +736,9 @@ export function pagesEndingMidSentence(snapshot: Pick<GuidanceSnapshotContent, "
  *        are the model's mapping of the source's wording; confirm each one.
  *  - nationality_code_name_mismatch     per criterion and code: the
  *        platform's name for the code is not how the source names it.
+ *  - title_wording_uncited              criterion titles are model wording.
+ *  - quote_ends_mid_sentence / multiple_dates_in_quote   per criterion (see
+ *        mergeAssessments), beside quote_starts_mid_sentence.
  *  - intake_wording_uncited             intake labels, help text and options
  *        are the model's wording, not quotes.
  *  - multiple_chunks / page_ends_mid_sentence   a rule that runs across a
@@ -721,6 +769,13 @@ export function reviewFlagsFor(content: Pick<MergedRubricContent, "criteria" | "
           target: c.criterionId,
         });
       }
+    });
+  }
+  if (content.criteria.length > 0) {
+    flags.push({
+      code: "title_wording_uncited",
+      message: `${content.criteria.length} criterion title(s) are wording written by the extraction model (applicant-facing: the free tier shows a title on its own), not quotes from the source. Read each title against its quote before approving.`,
+      target: "rubric",
     });
   }
   if (content.intakeQuestions.length > 0) {
