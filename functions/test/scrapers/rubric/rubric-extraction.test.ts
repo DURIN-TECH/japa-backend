@@ -234,6 +234,16 @@ describe("rubric extraction: a web-page source", () => {
     assert.equal(rubric.revision, 0);
   });
 
+  test("criteria about intent with no cited polarity: the stored version is flagged for the reviewer", async () => {
+    const out = routeAAnswer();
+    out.intentPolarity = null;
+    await setUpRouteA(h, out);
+    await runA(h);
+    const rubric = versionDoc(KEY_A, 1) as VisaRubric;
+    assert.equal(rubric.intentPolarityProposal, null);
+    assert.deepEqual(rubric.flags.map((f) => f.code), ["intent_criteria_without_polarity"]);
+  });
+
   test("the head records the newest version and leaves approvedVersion empty", async () => {
     const hash = await setUpRouteA(h);
     await runA(h);
