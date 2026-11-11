@@ -9,7 +9,7 @@ import {
 } from "../services/compliance.service";
 import { storageService } from "../services/storage.service";
 import { notificationService } from "../services/notification.service";
-import { collections } from "../utils/firebase";
+import { claimsService } from "../services/claims.service";
 import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
 
 // Content types accepted for compliance documents. Kept aligned with the agent
@@ -319,12 +319,14 @@ export class ComplianceController {
     body: string,
     agencyId: string
   ): Promise<void> {
-    // Admins are flagged via the `admin: true` boolean on their user doc.
-    const adminSnap = await collections.users.where("admin", "==", true).get();
+    // Admins are the accounts holding the admin custom claim (issue #135).
+    // The `users/{uid}.admin` document field is deliberately NOT used: it is
+    // not an authority, and a stray flag must not receive admin notifications.
+    const adminUids = await claimsService.listAdminUids();
     await Promise.all(
-      adminSnap.docs.map((doc) =>
+      adminUids.map((adminUid) =>
         notificationService.notifyUser({
-          userId: doc.id,
+          userId: adminUid,
           type,
           title,
           body,

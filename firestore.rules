@@ -58,15 +58,54 @@ service cloud.firestore {
     // ============================================
     
     match /users/{userId} {
+      // ---- Self-editable profile fields (ALLOW-LIST, issue #135) ----
+      // The ONLY fields a signed-in user may write on their own profile from
+      // a client SDK. Everything else on the document is written by the
+      // backend (Admin SDK, which bypasses these rules), because the backend
+      // treats it as authority or keeps it in step with another system:
+      //  - admin: legacy admin flag. Still read to pick who receives admin
+      //    notifications (compliance submissions, scraper alerts). The role
+      //    itself comes from the custom claim, never from this field.
+      //  - role, agencyId, agencyRole: role and agency membership live in
+      //    custom claims and on the agent document; they must never be
+      //    assertable from a profile.
+      //  - identityVerification: the applicant's KYC result.
+      //  - isProvisional: marks an account an agent created for a client.
+      //  - email: where notifications are sent; changed only through the
+      //    verified change-email flow.
+      //  - id, createdAt, onboardingCompleted(+At), lastLoginAt, fcmTokens:
+      //    server-managed.
+      // An allow-list (not a deny-list) so a field added later is protected
+      // until someone decides it is safe. No portal or mobile code writes
+      // this collection directly today (both go through the API), so nothing
+      // legitimate is lost. Keep in step with USER_SELF_EDITABLE_FIELDS in
+      // functions/src/services/user.service.ts (the API-side allow-list).
+      function selfEditableUserFields() {
+        return ['firstName', 'lastName', 'middleName', 'phone', 'dateOfBirth',
+                'address', 'residentialCountry', 'profilePhotoUrl',
+                'hasPassport', 'passportNumber', 'passportExpiryDate',
+                'passportCountry', 'notificationPreferences', 'updatedAt'];
+      }
+
       // Users can read their own profile
       allow read: if isOwner(userId);
-      
-      // Users can create their own profile
-      allow create: if isOwner(userId);
-      
-      // Users can update their own profile
-      allow update: if isOwner(userId);
-      
+
+      // Users can create their own profile, with profile fields only. The
+      // identity fields may be present but must tell the truth: `id` is the
+      // document id and `email` is the address on the token.
+      allow create: if isOwner(userId) &&
+                      request.resource.data.keys().hasOnly(
+                        selfEditableUserFields().concat(['id', 'email', 'createdAt'])) &&
+                      request.resource.data.get('id', userId) == userId &&
+                      request.resource.data.get('email', request.auth.token.get('email', null))
+                        == request.auth.token.get('email', null);
+
+      // Users can update their own profile: only allow-listed fields may be
+      // added, changed or removed.
+      allow update: if isOwner(userId) &&
+                      request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(selfEditableUserFields());
+
       // Only admins can delete users
       allow delete: if isAdmin();
     }
@@ -81,18 +120,46 @@ service cloud.firestore {
                     isAdmin() ||
                     (isAuthenticated() && resource.data.userId == request.auth.uid);
       
-      // Authenticated users can create agent profile
-      allow create: if isAuthenticated() && 
-                      request.resource.data.userId == request.auth.uid;
-      
-      // Agents can update their own profile (limited fields)
-      // Admins can update any field
+      // ---- Self-editable agent profile fields (ALLOW-LIST, issue #135) ----
+      // The ONLY fields an agent may write on their own agent document from a
+      // client SDK. Everything else is written by the backend (Admin SDK),
+      // because it decides what the agent may do or how they are presented:
+      //  - agencyId, agencyRole: agency membership and ownership. Written
+      //    only by owner onboarding, invitation acceptance and the agency
+      //    member endpoints; the role lookup reads them.
+      //  - verificationStatus, verifiedAt, verifiedBy, verificationDocuments:
+      //    the admin / agency-owner verification decision and its evidence.
+      //  - userId: who the profile belongs to (fixed at creation).
+      //  - isAvailable: only a verified agent may switch it on (API check).
+      //  - rating, totalReviews, totalApplications, successRate,
+      //    responseTime: computed marketplace stats.
+      //  - id, createdAt: server-managed.
+      // No portal or mobile code writes this collection directly today (both
+      // use the API). Keep in step with AGENT_SELF_EDITABLE_FIELDS in
+      // functions/src/services/agent.service.ts (the API-side allow-list).
+      function selfEditableAgentFields() {
+        return ['displayName', 'bio', 'profilePhotoUrl', 'licenseNumber',
+                'yearsOfExperience', 'specializations', 'languages',
+                'featuredVisas', 'consultationFee', 'serviceFees',
+                'availableSlots', 'updatedAt'];
+      }
+
+      // Authenticated users can create their own agent profile, with profile
+      // fields only: no agency, no verification state, no stats.
+      allow create: if isAuthenticated() &&
+                      request.resource.data.userId == request.auth.uid &&
+                      request.resource.data.keys().hasOnly(
+                        selfEditableAgentFields().concat(['id', 'userId', 'createdAt'])) &&
+                      request.resource.data.get('id', agentId) == agentId;
+
+      // Agents can update the allow-listed fields of their own profile.
+      // Admins (by custom claim) can update any field.
       allow update: if isAdmin() ||
-                      (isAuthenticated() && 
+                      (isAuthenticated() &&
                        resource.data.userId == request.auth.uid &&
-                       !request.resource.data.diff(resource.data).affectedKeys()
-                         .hasAny(['verificationStatus', 'verifiedAt', 'verifiedBy']));
-      
+                       request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(selfEditableAgentFields()));
+
       // Only admins can delete agents
       allow delete: if isAdmin();
       
@@ -274,16 +341,18 @@ service cloud.firestore {
                      resource.data.email == request.auth.token.email ||
                      isAdmin());
 
-      // Agency owner can create invitations
-      allow create: if isAuthenticated() &&
-                      request.resource.data.invitedBy == request.auth.uid;
-
-      // Invitee can accept/decline (update status)
-      // Agency owner can cancel (update status)
-      allow update: if isAuthenticated() &&
-                      (resource.data.invitedBy == request.auth.uid ||
-                       resource.data.email == request.auth.token.email ||
-                       isAdmin());
+      // Invitations are written ONLY by the backend (Admin SDK), through the
+      // API (issue #135). Redeeming an invitation turns it into agency
+      // membership, so a client must never be able to write one. What the API
+      // checks:
+      //  - creating: the caller is the `ownerId` of the agency;
+      //  - redeeming (accept / join-agency): the agency exists and its
+      //    `ownerId` is the invitation's `invitedBy`; the invitation is
+      //    pending and not expired; and the caller's token email equals
+      //    `invitedEmail` (a token with no email is refused). The API does
+      //    NOT require that email to be verified.
+      // No portal or mobile code writes this collection directly.
+      allow create, update: if false;
 
       // Only admin can delete invitations
       allow delete: if isAdmin();
