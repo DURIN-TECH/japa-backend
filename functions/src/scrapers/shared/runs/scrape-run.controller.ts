@@ -13,6 +13,8 @@ import {
 } from "./scrape-run.service";
 import {
   SCRAPE_RUN_KINDS,
+  SCRAPER_SETTINGS_KINDS,
+  type ScraperSettingsKind,
   SCRAPE_RUN_STATUSES,
   type ScrapeRunKind,
   type ScrapeRunStatus,
@@ -292,12 +294,12 @@ class ScrapeRunController {
     if (!this.allowed(req, res)) return;
     if (!this.singleValued(req, res, ["kind"])) return;
     const kind = req.query.kind as string | undefined;
-    if (kind !== undefined && !SCRAPE_RUN_KINDS.includes(kind as ScrapeRunKind)) {
-      sendError(res, "VALIDATION_ERROR", `kind must be one of: ${SCRAPE_RUN_KINDS.join(", ")}`, 400);
+    if (kind !== undefined && !SCRAPER_SETTINGS_KINDS.includes(kind as ScraperSettingsKind)) {
+      sendError(res, "VALIDATION_ERROR", `kind must be one of: ${SCRAPER_SETTINGS_KINDS.join(", ")}`, 400);
       return;
     }
     try {
-      sendSuccess(res, await scrapeRunService.listSourceHealth(kind as ScrapeRunKind | undefined));
+      sendSuccess(res, await scrapeRunService.listSourceHealth(kind as ScraperSettingsKind | undefined));
     } catch (error) {
       console.error("Error listing scrape sources:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
