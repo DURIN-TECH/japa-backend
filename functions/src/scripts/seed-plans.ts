@@ -5,20 +5,54 @@
  *
  * Run:  npm run build && node lib/scripts/seed-plans.js
  */
-import { FEATURE_KEYS, LIMIT_KEYS, UNLIMITED } from "@durin-tech/authz";
+import { FEATURE_KEYS, FEATURES, FeatureKey, LIMIT_KEYS, UNLIMITED } from "@durin-tech/authz";
 import { collections } from "../utils/firebase";
 import { StoredPlan } from "../types/billing";
 
-// Until subscription billing launches, the free default plan for every audience
-// grants FULL access — all features open and no numeric caps. Derived from the
-// authz catalog so it can never drift from the feature/limit vocabulary. When
-// paid tiers go live, tighten these back to a curated free allowance.
-const ALL_FEATURES = [...FEATURE_KEYS];
+// ── Paid-only features ──────────────────────────────────────────────────────
+/**
+ * Features that NO free plan may hold, whatever else the free plans are given.
+ *
+ * Why this list exists: the free plans below are built from the whole authz
+ * catalog (`FEATURE_KEYS`), so a key added to the catalog would otherwise be
+ * granted to every free plan the next time the seed runs. A key listed here is
+ * subtracted from the free plans and must be added by hand to each paid plan
+ * that includes it.
+ *
+ * - `ai.case_officer` (#30): the full cited AI review, per-upload document
+ *   checks and re-runs. The free readiness band and top three issues are served
+ *   by the assessment handlers (#42) without this key.
+ *
+ *   Carried by every paid plan below: both paid client plans
+ *   (`client_standard`, `client_pro`), and all four paid agent/agency plans
+ *   (`agent_standard`, `agent_pro`, `agency_standard`, `agency_pro`), plus their
+ *   derived yearly variants. No paid tier is excluded today; to drop a tier,
+ *   remove the key from that plan and update the expected list in the test.
+ *
+ * `test/billing/plan-entitlements.test.ts` fails if a free plan holds any of
+ * these, so adding a paid-only key means adding it here first.
+ */
+export const PAID_ONLY_FEATURES: readonly FeatureKey[] = [FEATURES.AI_CASE_OFFICER];
+
+/**
+ * What every free default plan grants. Until subscription billing launches the
+ * free plan for every audience is FULL access to the pre-billing features — all
+ * catalog features except the paid-only ones above, and no numeric caps. Derived
+ * from the authz catalog so it can never drift from the feature vocabulary. When
+ * paid tiers go live, tighten this back to a curated free allowance.
+ */
+export const FREE_PLAN_FEATURES: FeatureKey[] = FEATURE_KEYS.filter(
+  (key) => !PAID_ONLY_FEATURES.includes(key)
+);
 const UNLIMITED_LIMITS = Object.fromEntries(
   LIMIT_KEYS.map((key) => [key, UNLIMITED])
 ) as StoredPlan["limits"];
 
-const PLANS: StoredPlan[] = [
+/**
+ * The monthly/free source plans. Exported (read-only use) so the unit tests and
+ * the plan-to-entitlement table are built from the very data that gets seeded.
+ */
+export const PLANS: StoredPlan[] = [
   // ── Client (mobile) ──────────────────────────────────────────────────────
   {
     id: "client_free",
@@ -27,8 +61,8 @@ const PLANS: StoredPlan[] = [
     priceKobo: 0,
     interval: "none",
     isDefault: true,
-    // Free = full access until billing launches.
-    features: ALL_FEATURES,
+    // Free = every feature except the paid-only ones, until billing launches.
+    features: FREE_PLAN_FEATURES,
     limits: UNLIMITED_LIMITS,
   },
   {
@@ -45,6 +79,8 @@ const PLANS: StoredPlan[] = [
       "consultations.book",
       "news.alerts",
       "priority_support",
+      // Paid AI review: full cited review, per-upload checks, re-runs (#30).
+      FEATURES.AI_CASE_OFFICER,
     ],
     limits: {
       max_active_applications: -1,
@@ -60,8 +96,8 @@ const PLANS: StoredPlan[] = [
     priceKobo: 0,
     interval: "none",
     isDefault: true,
-    // Free = full access until billing launches.
-    features: ALL_FEATURES,
+    // Free = every feature except the paid-only ones, until billing launches.
+    features: FREE_PLAN_FEATURES,
     limits: UNLIMITED_LIMITS,
   },
   {
@@ -80,6 +116,8 @@ const PLANS: StoredPlan[] = [
       "payments.request",
       "analytics.view",
       "priority_support",
+      // Paid AI review: full cited review, per-upload checks, re-runs (#30).
+      FEATURES.AI_CASE_OFFICER,
     ],
     limits: { max_active_applications: -1, max_consultations_per_month: -1 },
   },
@@ -91,8 +129,8 @@ const PLANS: StoredPlan[] = [
     priceKobo: 0,
     interval: "none",
     isDefault: true,
-    // Free = full access until billing launches.
-    features: ALL_FEATURES,
+    // Free = every feature except the paid-only ones, until billing launches.
+    features: FREE_PLAN_FEATURES,
     limits: UNLIMITED_LIMITS,
     seatPriceKobo: 500000, // ₦5,000 per agent seat
   },
@@ -110,6 +148,8 @@ const PLANS: StoredPlan[] = [
       "consultations.book",
       "payments.request",
       "agency.invite_agents",
+      // Paid AI review: full cited review, per-upload checks, re-runs (#30).
+      FEATURES.AI_CASE_OFFICER,
     ],
     limits: { max_active_applications: 100, max_agents: 5 },
     seatPriceKobo: 400000, // ₦4,000 per extra agent seat
@@ -131,6 +171,8 @@ const PLANS: StoredPlan[] = [
       "analytics.view",
       "agency.invite_agents",
       "priority_support",
+      // Paid AI review: full cited review, per-upload checks, re-runs (#30).
+      FEATURES.AI_CASE_OFFICER,
     ],
     limits: { max_active_applications: -1, max_agents: -1, max_consultations_per_month: -1 },
     seatPriceKobo: 300000, // ₦3,000 per extra agent seat
@@ -143,7 +185,14 @@ const PLANS: StoredPlan[] = [
     priceKobo: 100000, // ₦1,000 / month
     interval: "month",
     billingGroup: "client_standard",
-    features: ["applications.create", "documents.upload", "messaging", "news.alerts"],
+    features: [
+      "applications.create",
+      "documents.upload",
+      "messaging",
+      "news.alerts",
+      // Paid AI review: full cited review, per-upload checks, re-runs (#30).
+      FEATURES.AI_CASE_OFFICER,
+    ],
     limits: { max_active_applications: 3, max_documents_per_application: 25 },
   },
   {
@@ -159,6 +208,8 @@ const PLANS: StoredPlan[] = [
       "messaging",
       "consultations.book",
       "payments.request",
+      // Paid AI review: full cited review, per-upload checks, re-runs (#30).
+      FEATURES.AI_CASE_OFFICER,
     ],
     limits: { max_active_applications: 25 },
   },
@@ -193,7 +244,7 @@ function buildYearlyVariants(monthlyPlans: StoredPlan[]): StoredPlan[] {
 }
 
 /** Monthly (source) plans + their derived yearly variants — the full catalog to seed. */
-const ALL_PLANS: StoredPlan[] = [...PLANS, ...buildYearlyVariants(PLANS)];
+export const ALL_PLANS: StoredPlan[] = [...PLANS, ...buildYearlyVariants(PLANS)];
 
 /**
  * Upsert all subscription plans. Exported so the consolidated `seed-all` can run it
