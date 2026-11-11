@@ -13,8 +13,14 @@
  * lives in the controller; this layer only shapes queries and writes.
  */
 import { collections } from "../utils/firebase";
-import { DocumentRequest, DocumentRequestStatus } from "../types";
-import { Timestamp } from "firebase-admin/firestore";
+import {
+  DocumentRequest,
+  DocumentRequestStatus,
+  CHECKLIST_SYSTEM_ACTOR_ID,
+  CHECKLIST_SYSTEM_ACTOR_NAME,
+} from "../types";
+import type { ChecklistItem } from "./ai/checklist-builder";
+import { Timestamp, FieldValue } from "firebase-admin/firestore";
 
 /** Fields a caller supplies when raising a new request. */
 export interface CreateDocumentRequestInput {
@@ -171,6 +177,113 @@ class DocumentRequestService {
 
     const updated = await ref.get();
     return updated.data() as DocumentRequest;
+  }
+
+  /**
+   * All checklist-origin requests of one application (any status).
+   * Two equality filters only, so no composite index is needed.
+   */
+  async listChecklistForApplication(applicationId: string): Promise<DocumentRequest[]> {
+    const snap = await collections.documentRequests
+      .where("applicationId", "==", applicationId)
+      .where("origin", "==", "checklist")
+      .get();
+    return snap.docs.map((d) => d.data() as DocumentRequest);
+  }
+
+  /**
+   * Make the stored checklist requests match `items` (issue #114). SERVER-SIDE
+   * ONLY: the caller has already authorised the applicant; this is not the
+   * `POST /document-requests` path, which still bars applicants.
+   *
+   *  - missing item        -> created `pending`, deterministic id
+   *                           `{applicationId}__{checklistItemId}` (so running
+   *                           twice cannot duplicate, even concurrently:
+   *                           `create()` fails if the doc exists);
+   *  - existing + pending  -> wording/citation refreshed in place;
+   *  - pending no longer on the list -> `cancelled`, resolvedBy "system";
+   *  - fulfilled / waived / cancelled -> NEVER touched or reopened.
+   * Returns counts for logging/tests.
+   */
+  async syncChecklist(
+    application: {
+      id: string;
+      userId: string;
+      agencyId?: string | null;
+      visaTypeName?: string;
+      countryName?: string;
+    },
+    items: ChecklistItem[]
+  ): Promise<{ created: number; updated: number; cancelled: number }> {
+    const existing = await this.listChecklistForApplication(application.id);
+    const byItemId = new Map(existing.map((r) => [r.checklistItemId, r]));
+    const wanted = new Set(items.map((i) => i.checklistItemId));
+    const counts = { created: 0, updated: 0, cancelled: 0 };
+    const now = Timestamp.now();
+
+    for (const item of items) {
+      const found = byItemId.get(item.checklistItemId);
+      const fields = {
+        documentType: item.title,
+        holder: item.holder,
+        reason: item.reason,
+        required: item.required,
+        citation: item.citation,
+        ...(item.criterionRef ? { criterionRef: item.criterionRef } : {}),
+      };
+      if (!found) {
+        const ref = collections.documentRequests.doc(`${application.id}__${item.checklistItemId}`);
+        const request: DocumentRequest = {
+          id: ref.id,
+          applicationId: application.id,
+          userId: application.userId,
+          agencyId: application.agencyId ?? null,
+          status: "pending",
+          requestedBy: CHECKLIST_SYSTEM_ACTOR_ID,
+          requestedByName: CHECKLIST_SYSTEM_ACTOR_NAME,
+          origin: "checklist",
+          checklistItemId: item.checklistItemId,
+          ...fields,
+          ...(application.visaTypeName ? { visaTypeName: application.visaTypeName } : {}),
+          ...(application.countryName ? { countryName: application.countryName } : {}),
+          createdAt: now,
+          updatedAt: now,
+        };
+        try {
+          await ref.create(request);
+          counts.created++;
+        } catch (e) {
+          // ALREADY_EXISTS: a concurrent run won the race. Fine (idempotent).
+          if ((e as { code?: number }).code !== 6) throw e;
+        }
+      } else if (found.status === "pending") {
+        await collections.documentRequests.doc(found.id).update({ ...fields, updatedAt: now });
+        counts.updated++;
+      } else if (found.status === "cancelled" && found.resolvedBy === CHECKLIST_SYSTEM_ACTOR_ID) {
+        // The system itself cancelled it (the answer changed) and the answer
+        // changed back: bring it back. A request an agent cancelled stays cancelled.
+        await collections.documentRequests.doc(found.id).update({
+          ...fields,
+          status: "pending",
+          resolvedBy: FieldValue.delete(),
+          updatedAt: now,
+        });
+        counts.updated++;
+      }
+    }
+
+    // Items no longer needed: cancel only the still-pending ones.
+    for (const r of existing) {
+      if (r.status === "pending" && r.checklistItemId && !wanted.has(r.checklistItemId)) {
+        await collections.documentRequests.doc(r.id).update({
+          status: "cancelled",
+          resolvedBy: CHECKLIST_SYSTEM_ACTOR_ID,
+          updatedAt: now,
+        });
+        counts.cancelled++;
+      }
+    }
+    return counts;
   }
 
   /**

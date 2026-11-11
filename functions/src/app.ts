@@ -32,6 +32,7 @@ import { documentRoutes } from "./routes/document.routes";
 import { documentTemplateRoutes } from "./routes/document-template.routes";
 import { documentInstanceRoutes } from "./routes/document-instance.routes";
 // Durable agent→client document asks (backs the client web workspace to-do list)
+import { checklistRoutes } from "./routes/checklist.routes";
 import { documentRequestRoutes } from "./routes/document-request.routes";
 import {
   eligibilityRoutes,
@@ -96,6 +97,8 @@ app.use("/agency/visas", agencyVisaRoutes);
 // prices (agency from the token). Contract: src/agency-visa-prices/agency-visa-prices.md.
 app.use("/agency/visa-prices", agencyVisaPriceRoutes);
 app.use("/invitations", invitationRoutes);
+// Personal document checklist (issue #114): extra-segment paths on /applications.
+app.use("/applications", checklistRoutes);
 app.use("/applications", applicationRoutes);
 app.use("/documents", documentRoutes);
 // Document templates: catalog (read-only) + editable instances cloned from them
