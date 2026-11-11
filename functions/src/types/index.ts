@@ -248,7 +248,9 @@ export interface Agency {
   logoUrl?: string;
 
   // Pricing
-  consultationFee?: number; // In cents (agency-level default)
+  // Agency-level default consultation fee in WHOLE NAIRA (the portal stores the
+  // raw ₦ input; the old "cents" comment was wrong, see consultation.controller).
+  consultationFee?: number;
 
   // Embedded services (small bounded list)
   services: AgencyService[];
@@ -332,7 +334,18 @@ export interface Agent {
 
   // Pricing
   consultationFee: number; // In cents
-  serviceFees: Record<string, number>; // visaTypeId -> fee in cents
+  /**
+   * @deprecated Issue #103: SUPERSEDED by the agency-level per-visa service
+   * price (`agencies/{agencyId}/visaPrices/{cc}__{visaTypeId}`, whole NAIRA,
+   * see `AgencyVisaPrice` below and `src/agency-visa-prices/`).
+   *
+   * Legacy, never written by any UI and never read by any code: old agent
+   * docs carry an empty `{}` here. It was documented as "fee in cents", so
+   * it must NOT be read as naira (or at all). New agent docs no longer get
+   * it, and `PUT /agents/me` drops it from the body. Kept optional in the
+   * type only so existing docs still type-check.
+   */
+  serviceFees?: Record<string, number>;
 
   // Availability
   isAvailable: boolean;
@@ -1386,4 +1399,45 @@ export interface DocumentVersion {
   updatedByName?: string; // who produced this version
   content?: ProseMirrorDoc; // the content at this version
   createdAt: Timestamp;
+}
+
+// ============================================
+// AGENCY PER-VISA SERVICE PRICE (issue #103)
+// ============================================
+
+/**
+ * An agency's own service price for one visa: what the AGENCY charges for
+ * handling the application. Separate from the visa's government fee
+ * (`VisaType.baseCostUsd`, USD), which it never reads or changes.
+ *
+ * Stored at `agencies/{agencyId}/visaPrices/{countryCode}__{visaTypeId}`
+ * (doc id built by `agencyVisaPriceId`), one doc per visa the agency prices.
+ * Keyed by the visa: `visaTypeId` plus its `countryCode`, because a visa's
+ * identity is `countries/{cc}/visaTypes/{visaTypeId}` and seed ids are only
+ * unique within a country. Prices are PER AGENCY: every agency (the creator
+ * of a global visa included) has its own doc, so one agency's price never
+ * shows on another agency's page. Backend-only: no firestore.rules match for
+ * the subcollection, so clients are denied; reads go through the API.
+ *
+ * Supersedes the legacy `Agent.serviceFees` (cents, never used). Contract:
+ * `src/agency-visa-prices/agency-visa-prices.md`.
+ */
+export interface AgencyVisaPrice {
+  /** Doc id: `${countryCode}__${visaTypeId}`. */
+  id: string;
+  /** The agency that set this price (also the parent doc). */
+  agencyId: string;
+  /** The priced visa: `countries/{countryCode}/visaTypes/{visaTypeId}`. */
+  visaTypeId: string;
+  countryCode: string;
+  /**
+   * The agency's service price in WHOLE NAIRA (not kobo, not cents): a
+   * non-negative integer, at most MAX_VISA_SERVICE_PRICE_NAIRA. ₦12,500 is
+   * stored as 12500. Never multiply or divide by 100.
+   */
+  price: number;
+  /** Uid of the agency member who last set it. */
+  updatedBy: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
 }

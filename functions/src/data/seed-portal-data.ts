@@ -472,7 +472,6 @@ async function seedAgents() {
       successRate: 92,
       responseTime: "2-4 hours",
       consultationFee: 5000_00,
-      serviceFees: {},
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "09:00", endTime: "17:00" },
@@ -503,7 +502,6 @@ async function seedAgents() {
       successRate: 87,
       responseTime: "4-8 hours",
       consultationFee: 3000_00,
-      serviceFees: {},
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "10:00", endTime: "18:00" },
@@ -534,7 +532,6 @@ async function seedAgents() {
       successRate: 85,
       responseTime: "6-12 hours",
       consultationFee: 2500_00,
-      serviceFees: {},
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "09:00", endTime: "15:00" },

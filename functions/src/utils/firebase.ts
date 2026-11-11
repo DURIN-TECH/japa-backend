@@ -221,6 +221,13 @@ export const subcollections = {
   // Immutable content snapshots under a document instance (version history).
   documentVersions: (instanceId: string) =>
     collections.documentInstances.doc(instanceId).collection("versions"),
+
+  // An agency's per-visa service prices (issue #103), in whole NAIRA:
+  // `agencies/{agencyId}/visaPrices/{countryCode}__{visaTypeId}`. Written and
+  // read only by src/agency-visa-prices (no firestore.rules match for the
+  // subcollection -> clients denied). A function so tests can swap a fake.
+  agencyVisaPrices: (agencyId: string) =>
+    collections.agencies.doc(agencyId).collection("visaPrices"),
 } as const;
 
 // Firestore timestamp helpers

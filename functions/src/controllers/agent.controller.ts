@@ -214,7 +214,12 @@ export class AgentController {
   ): Promise<void> {
     try {
       const userId = req.userId!;
-      const updates = req.body;
+      // Issue #103: the legacy per-agent `serviceFees` (documented as cents,
+      // never used) is superseded by the agency-level per-visa price in naira
+      // (`/agency/visa-prices`). Drop it from the body so nothing can write a
+      // second, conflicting price source onto the agent doc.
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { serviceFees: _legacyServiceFees, ...updates } = (req.body ?? {}) as Record<string, unknown>;
 
       // Get agent by user ID
       const agent = await agentService.getAgentByUserId(userId);
