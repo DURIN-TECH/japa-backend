@@ -226,6 +226,12 @@ export const collections = {
   // so a decision never exists without its record. Append-only.
   // Backend-only: no firestore.rules match -> clients denied.
   rubricReviewHistory: db.collection("rubricReviewHistory"),
+  // Bulk re-assessment after a rubric approval (issue #37). One run per approval
+  // (id = the approval's audit id), one doc per provider batch, and a cache of
+  // stage 2 document extractions. All backend-only (no firestore.rules match).
+  bulkReassessments: db.collection("bulkReassessments"),
+  assessmentBatches: db.collection("assessmentBatches"),
+  documentExtractions: db.collection("documentExtractions"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all

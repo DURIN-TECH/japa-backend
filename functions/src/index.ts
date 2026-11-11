@@ -94,6 +94,8 @@ import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
 import { scrapeRunWorker } from "./scrapers";
 import { aiCaseOfficerService } from "./services/ai-case-officer.service";
+import { bulkReassessmentService } from "./services/ai-bulk-reassessment.service";
+import type { RubricReviewAuditEntry } from "./services/rubric-review.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -658,5 +660,56 @@ export const processAssessmentJob = functions
     const after = change.after.data() ?? {};
     const before = change.before.exists ? change.before.data() ?? {} : {};
     if (after.status !== "queued" || before.status === "queued") return;
+    // Bulk re-assessment jobs (#37) belong to the Batch API sweep, never to this worker.
+    if (after.viaBatch === true) return;
     await aiCaseOfficerService.runJob(context.params.assessmentId);
+  });
+
+// ============================================
+// BULK RE-ASSESSMENT AFTER A RUBRIC APPROVAL (issue #37)
+// ============================================
+
+/**
+ * Fires on the durable audit document #125 writes in the SAME transaction as a
+ * rubric approval (`rubricReviewHistory`, action "approve"), and enqueues the
+ * bulk re-assessment of the route's open applications. Triggering from the
+ * document, not from an in-memory listener, means a crash or a cold start after
+ * the approval commits cannot lose the event; a re-delivered event is harmless
+ * (the run id is the audit id). No model call happens here: it only writes jobs.
+ * Memory and timeout follow the crawler pattern (512 MB, 540 s); the enqueue
+ * scan is resumable, so a very large route is finished by the sweep below.
+ */
+export const onRubricApproved = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 540 })
+  .firestore.document("rubricReviewHistory/{auditId}")
+  .onCreate(async (snap, context) => {
+    try {
+      const outcome = await bulkReassessmentService.startRun(context.params.auditId, snap.data() as RubricReviewAuditEntry);
+      console.log(`[bulk-reassess] approval ${context.params.auditId}: ${outcome}`);
+    } catch (error) {
+      // Logged, not rethrown: function retry is off, and the sweep resumes any
+      // run whose document was created before the failure.
+      console.error("Bulk re-assessment enqueue failed:", error);
+    }
+  });
+
+/**
+ * Every 15 minutes: advance bulk re-assessments. Polls the provider's batches
+ * and writes their results, plans waiting jobs into new batches (within the
+ * daily cap; the remainder waits for the next day), and closes finished runs.
+ * Binds AI_SECRETS (it submits and reads batches) and EMAIL_SECRETS (a worse
+ * result notifies the reviewing agent). Memory and timeout follow
+ * `crawlVisaCatalogOrchestrator`; the sweep keeps its own time budget under 540 s.
+ */
+export const processBulkReassessments = functions
+  .runWith({ memory: "1GB", timeoutSeconds: 540, secrets: [...AI_SECRETS, ...EMAIL_SECRETS] })
+  .pubsub.schedule("*/15 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    try {
+      const result = await bulkReassessmentService.runSweep();
+      if (result.skipped) console.log(`Bulk re-assessment sweep skipped: ${result.skipped}`);
+    } catch (error) {
+      console.error("Bulk re-assessment sweep failed:", error);
+    }
   });
