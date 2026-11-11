@@ -1,4 +1,5 @@
 import { Timestamp } from "firebase-admin/firestore";
+import type { ApplicationIntake } from "./intake";
 // Automated-verification result shapes live with the provider contract; the
 // compliance file below embeds them as optional signals (see the verification
 // service). One-way import (types -> verification.types), so no cycle.
@@ -736,6 +737,11 @@ export interface Application {
   clientPhone?: string; // Captured when an agent starts an application for a client
   visaTypeName?: string;
   countryName?: string;
+
+  // Answers to the route's intake questions (issue #113). Written only by
+  // PUT /applications/:id/intake, which validates them against the approved
+  // rubric; never through the generic application update.
+  intake?: ApplicationIntake;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
