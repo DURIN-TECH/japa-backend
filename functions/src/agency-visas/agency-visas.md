@@ -381,13 +381,90 @@ other than "sent".
 | revisions of an agency: `visaRevisions` where `ownerAgencyId ==` | automatic single-field index |
 | admin list (#101): `visaRevisions` where `reviewStatus == "pending_review"` | automatic single-field index |
 
+## Reachable through the agency (issue #102)
+
+Code: `agency-visa-access.ts` (the rules and the applicant-safe projection),
+wired into `src/controllers/visa.controller.ts`,
+`src/services/application.service.ts`,
+`src/controllers/application.controller.ts` and the public page
+(`agency-visa-prices/agency-visa-price.service.ts`). Tests:
+`test/agency-visas/agency-visa-access.test.ts`.
+
+### Who reaches an agency-only visa
+
+An agency-only visa is `source: "agency"`, `visibility: "agency"`. It is
+**usable** only when `reviewStatus: "approved"` and `isActive: true`
+(`isApprovedAgencyVisa`). Drafts, pending, rejected and inactive visas are
+never usable, by anyone, the owner included.
+
+| Caller | Public page `/agencies/public/:slug` | Detail, `/full`, `/requirements` | Start a case |
+| --- | --- | --- | --- |
+| Anonymous | Sees the owning agency's approved visas (applicant-safe) | 404 | n/a (401) |
+| Applicant with no case at the agency | Same as anonymous | 404 | Only with an agent of the owning agency (`mode: "agent"`, `agentId`), so the case belongs to it |
+| Applicant with a case whose `agencyId` is the owning agency | Same | **200**, applicant-safe | Same as above |
+| Anyone with a readable case **on this visa** (any agency) | Same | **200**, applicant-safe (existing cases keep loading their visa after it is taken back to agency-only) | Same rule as their role |
+| Owner or agent of the owning agency | Same | **200**, full doc (any state, CASL #98 grant) | **201** via `POST /applications/for-client` |
+| Owner or agent of another agency | Same | 404 | 404 |
+| Admin | Same | **200**, full doc | Only when acting for the owning agency (`agencyId` in the body) |
+
+- Every denial is the **same 404 body as an unknown id**
+  (`{ success: false, error: "NOT_FOUND", message: "Visa type not found" }`).
+- The applicant rule is the firm one: an applicant sees an agency-only visa
+  on the single-visa endpoints **only through an application** (checked with
+  the shared CASL `read` on the tagged Application, so `checkApplicationAccess`
+  semantics). "Arriving through the agency link" means the public page
+  itself: its `visaPrices[]` entries carry the applicant-safe detail (below).
+  No slug or link parameter unlocks the single-visa endpoints or case start.
+- **Case start.** `POST /applications` and `POST /applications/for-client`
+  compute the agency the new case belongs to (from its agent, or the agency an
+  admin acts for), then `canStartCaseOnVisa(visa, caseAgencyId)`: a public
+  visa for any case, an approved agency-only visa only for a case of
+  `ownerAgencyId`. A refusal is 404 `NOT_FOUND` "Visa type not found", the
+  same as an unknown id, and nothing is written. `for-client` checks **before**
+  it provisions a client account, sends an invite, or opens a conversation.
+- The detail queries reached for a non-public visa: `applications where
+  userId ==` (automatic index), `applications where agencyId == <claim> and
+  visaTypeId ==` and `applications where agentId == uid and visaTypeId ==`
+  (composite indexes added to `firestore.indexes.json`).
+
+### Applicant-safe fields
+
+Applicants, anonymous callers and other agencies never get the sponsor
+licence number, the sponsor contact, `createdBy`, `submittedBy`, the review
+fields (`reviewedBy`, `reviewedAt`, `rejectionReason`, `submittedAt`), the
+make-global audit fields, `agentIds` or `scrapeMeta`.
+
+- **Detail / `/full`:** `toApplicantSafeVisa`, a whitelist
+  (`APPLICANT_SAFE_VISA_FIELDS`): `id`, `countryCode`, `name`, `code`,
+  `description`, `category`, `processingTime`, `processingDaysMin`,
+  `processingDaysMax`, `baseCostUsd`, `validityPeriod`, `isExtendable`,
+  `maxExtensions`, `eligibilityCriteria`, `applicationUrl`,
+  `applicationInstructions`, `sourceUrl`, `isActive`, `source`, `visibility`,
+  `ownerAgencyId`, `createdAt`, `updatedAt`, and
+  `sponsor: { organisationName, website? }`. It applies to every
+  agency-created visa served to a non-privileged caller, **including one made
+  global**. Scraped and seed visas are served as stored, as before.
+- **Public page:** see `../agency-visa-prices/agency-visa-prices.md`.
+
+### `firestore.rules` (direct client reads)
+
+- `countries/{cc}/visaTypes/{id}`: readable only when the doc matches
+  `isVisaPubliclyVisible` (active, visibility global or missing, reviewStatus
+  approved or missing), or by an admin. Before #102 any `isActive == true` doc
+  was readable, including approved agency-only visas.
+- `.../requirements/{id}`: readable only when the parent visa is publicly
+  visible, or by an admin (was `if true`).
+- `visaRevisions/{id}` and `agencies/{id}/visaPrices/{id}`: explicit
+  `allow read, write: if false` (backend only).
+
+There is no rules test harness in the repo. The rules were checked by hand
+on the Firestore emulator (alternate port, `demo-` project): seed, global,
+agency-only, pending and inactive visas, their requirements, a revision and a
+price, as anonymous, a client token and an admin token.
+
 ## Follow-ups (out of scope for #100)
 
-- `firestore.rules`: `countries/{cc}/visaTypes` lets any client read a doc
-  with `isActive == true` directly. That includes an approved
-  `visibility: "agency"` visa, which bypasses the #99 API rule. The rule
-  should also require global visibility and an approved or missing review
-  state.
+- ~~`firestore.rules` direct read of agency-only visas~~: done in #102.
 - An agency endpoint to withdraw (delete) a pending revision.
 - #101: an admin can't take down an APPROVED agency visa with the review
   endpoint (reject only works from `pending_review`, as the #100 review asked).
