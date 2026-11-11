@@ -16,7 +16,10 @@
 //    (the existing isVisaPubliclyVisible rule), nor is any other hidden one;
 //  - lookup by visaTypeId works with and without a country, and the same id
 //    under two countries resolves deterministically;
-//  - a hidden visa is never used to pick questions;
+//  - a hidden visa is never used to pick questions: not under its own
+//    country, not under another country, not with an unusable country, and
+//    not while the cross-country lookup has no index (fail closed);
+//  - reserved (`__x__`) ids and a lower-case destination are handled;
 //  - a visa with no EligibilityQuestions still scores (no throw);
 //  - `POST /eligibility/pre-check` and `GET /eligibility/questions/:id` keep
 //    their JSON shape;
@@ -162,6 +165,33 @@ function visaTypesGroup(query: any = fakeCollectionGroup("visaTypes")): any {
       return { ...snap, docs };
     },
   };
+}
+
+/** A collection-group query whose get() rejects with the given error. */
+const failingGroup = (error: Error) => () => ({
+  where: () => ({
+    get: async () => {
+      throw error;
+    },
+  }),
+});
+
+/** What Firestore throws when a query's index is missing / still building. */
+const missingIndexError = () =>
+  Object.assign(new Error("9 FAILED_PRECONDITION: The query requires an index"), { code: 9 });
+
+/** Run `fn` with console.error / console.warn silenced; return what was logged. */
+async function quietly<T>(fn: () => Promise<T>): Promise<{ result: T; errors: unknown[][] }> {
+  const original = { error: console.error, warn: console.warn };
+  const errors: unknown[][] = [];
+  console.error = (...args: unknown[]) => void errors.push(args);
+  console.warn = () => undefined;
+  try {
+    return { result: await fn(), errors };
+  } finally {
+    console.error = original.error;
+    console.warn = original.warn;
+  }
 }
 
 /** Number of collection-group queries started (to prove lookup A skips it). */
@@ -341,6 +371,25 @@ describe("pre-check recommendations read countries/{code}/visaTypes", () => {
     assert.equal(result.recommendedVisaTypes?.length, 3);
   });
 
+  test("the exemption lookup matches the destination in any case", async () => {
+    // Visa-free row stored under the upper-case code, as the seeds write it.
+    store.set("visaExemptions/free", {
+      nationality: NATIONALITY,
+      destinationCountry: CC_C,
+      requirementType: "visa_free",
+      maxStayDays: 90,
+    });
+    for (const destinationCountry of [CC_C, CC_C.toLowerCase()]) {
+      const result = await eligibilityService.preCheck({
+        nationality: NATIONALITY,
+        destinationCountry,
+        travelPurpose: "tourism",
+      });
+      assert.equal(result.visaRequired, false, destinationCountry);
+      assert.equal(result.maxStayDays, 90, destinationCountry);
+    }
+  });
+
   test("a visa-required exemption still recommends from the canonical path", async () => {
     // Second way into the recommendation code: an exemption row that says a
     // visa is required (the first is "no exemption row").
@@ -445,18 +494,53 @@ describe("getQuestions resolves the visa type under its country", () => {
     }
   });
 
-  test("a failing collection-group query degrades to the generic questions", async () => {
+  test("a missing index degrades to the generic questions and is logged as an error", async () => {
     // E.g. the visaTypes.id index is still building right after a deploy.
-    firebase.collectionGroups.visaTypes = () => ({
-      where: () => ({
-        get: async () => {
-          throw new Error("9 FAILED_PRECONDITION: The query requires an index");
-        },
-      }),
-    });
-    const got = await eligibilityService.getQuestions("a-work-seed");
+    firebase.collectionGroups.visaTypes = failingGroup(missingIndexError());
+    const { result: got, errors } = await quietly(() => eligibilityService.getQuestions("a-work-seed"));
     assert.ok(questionIds(got).includes("passport"));
     assert.equal(questionIds(got).includes("job_offer"), false);
+    // Not silent: one error-level log that names the index.
+    assert.equal(errors.length, 1);
+    assert.match(String(errors[0][0]), /visaTypes\.id COLLECTION_GROUP index/);
+  });
+
+  test("a missing index does not affect a visa found under the country sent", async () => {
+    // One document read decides: the group query is never needed.
+    firebase.collectionGroups.visaTypes = failingGroup(missingIndexError());
+    seedQuestion("q-visa-visible", "visa:a-work-seed");
+    const got = await eligibilityService.getQuestions("a-work-seed", undefined, CC_A);
+    assert.deepEqual(questionIds(got), ["q-visa-visible"]);
+  });
+
+  test("any other lookup failure is logged and propagates (not swallowed)", async () => {
+    firebase.collectionGroups.visaTypes = failingGroup(
+      Object.assign(new Error("14 UNAVAILABLE: connection lost"), { code: 14 })
+    );
+    const { errors } = await quietly(async () => {
+      await assert.rejects(() => eligibilityService.getQuestions("a-work-seed"), /UNAVAILABLE/);
+    });
+    assert.equal(errors.length, 1);
+  });
+
+  test("reserved Firestore ids (__x__) give the generic questions, not an error", async () => {
+    for (const reserved of ["__name__", "__x__", "____"]) {
+      // As the visa id, and as the country.
+      const asId = await eligibilityService.getQuestions(reserved, NATIONALITY, CC_A);
+      assert.ok(questionIds(asId).includes("financial_proof"), reserved);
+      const asCountry = await eligibilityService.getQuestions("a-work-seed", NATIONALITY, reserved);
+      assert.ok(questionIds(asCountry).includes("passport"), reserved);
+      // And as the pre-check destination.
+      const pre = await eligibilityService.preCheck({
+        nationality: NATIONALITY,
+        destinationCountry: reserved,
+        travelPurpose: "work",
+      });
+      assert.deepEqual(pre.recommendedVisaTypes, [], reserved);
+    }
+    // The reserved id was never sent to the collection group as a doc id
+    // (only the two usable-id / reserved-country calls reach it).
+    assert.equal(groupQueries, 3);
   });
 });
 
@@ -493,6 +577,100 @@ describe("hidden visas are not used to pick questions", () => {
       assert.equal(questionIds(got).includes(`q-visa-${id}`), false, id);
       assert.equal(questionIds(got).includes("job_offer"), false, id);
     }
+  });
+
+  test("hidden id + another country: its questions are still withheld", async () => {
+    // The bypass from review: every hidden visa lives under A; ask under B
+    // (a real country that does not hold it) and under a country with no docs.
+    for (const id of HIDDEN) {
+      seedQuestion(`q-visa-${id}`, `visa:${id}`);
+      for (const country of [CC_B, CC_C, CC_B.toLowerCase()]) {
+        const got = await eligibilityService.getQuestions(id, NATIONALITY, country);
+        assert.equal(questionIds(got).includes(`q-visa-${id}`), false, `${id} under ${country}`);
+        assert.equal(questionIds(got).includes("job_offer"), false, `${id} under ${country}`);
+        assert.ok(questionIds(got).includes("financial_proof"), `${id} under ${country}`);
+      }
+    }
+  });
+
+  test("hidden id + an unusable country: its questions are still withheld", async () => {
+    for (const id of HIDDEN) {
+      seedQuestion(`q-visa-${id}`, `visa:${id}`);
+      for (const country of ["a/b", "has space", "__x__"]) {
+        const got = await eligibilityService.getQuestions(id, NATIONALITY, country);
+        assert.equal(questionIds(got).includes(`q-visa-${id}`), false, `${id} under ${country}`);
+      }
+    }
+  });
+
+  test("hidden id + another country: submitCheck does not score its questions", async () => {
+    seedQuestion("q-visa-hidden", "visa:a-work-agency-only", { weight: 50 });
+    const check = await eligibilityService.submitCheck("uid-client", {
+      visaTypeId: "a-work-agency-only",
+      countryCode: CC_B,
+      nationality: NATIONALITY,
+      travelPurpose: "work",
+      answers: [{ questionId: "q-visa-hidden", answer: true }],
+    } as any);
+    // Scored on the generic set (4 common + financial_proof) only.
+    assert.deepEqual(
+      check.breakdown.map((b) => b.questionId),
+      ["passport", "passport_validity", "visa_denial", "criminal_record", "financial_proof"]
+    );
+    assert.equal(check.score, 0);
+  });
+
+  test("hidden id + failing group query (no country): withheld, fail closed", async () => {
+    firebase.collectionGroups.visaTypes = failingGroup(missingIndexError());
+    for (const id of HIDDEN) {
+      seedQuestion(`q-visa-${id}`, `visa:${id}`);
+      const { result: got } = await quietly(() => eligibilityService.getQuestions(id));
+      assert.equal(questionIds(got).includes(`q-visa-${id}`), false, id);
+      assert.equal(questionIds(got).includes("job_offer"), false, id);
+      assert.ok(questionIds(got).includes("financial_proof"), id);
+    }
+  });
+
+  test("hidden id + failing group query + another country: withheld, fail closed", async () => {
+    firebase.collectionGroups.visaTypes = failingGroup(missingIndexError());
+    for (const id of HIDDEN) {
+      seedQuestion(`q-visa-${id}`, `visa:${id}`);
+      const { result: got } = await quietly(() => eligibilityService.getQuestions(id, NATIONALITY, CC_B));
+      assert.equal(questionIds(got).includes(`q-visa-${id}`), false, id);
+    }
+    // submitCheck takes the same path.
+    const { result: check } = await quietly(() =>
+      eligibilityService.submitCheck("uid-client", {
+        visaTypeId: "a-work-agency-only",
+        countryCode: CC_B,
+        nationality: NATIONALITY,
+        travelPurpose: "work",
+        answers: [{ questionId: "q-visa-a-work-agency-only", answer: true }],
+      } as any)
+    );
+    assert.equal(check.breakdown.some((b) => b.questionId === "q-visa-a-work-agency-only"), false);
+  });
+
+  test("while the index is missing, an id with no visa document is withheld too (the cost of failing closed)", async () => {
+    firebase.collectionGroups.visaTypes = failingGroup(missingIndexError());
+    seedQuestion("q-visa-unknown", "visa:not-in-catalogue");
+    const { result: got } = await quietly(() => eligibilityService.getQuestions("not-in-catalogue", undefined, CC_A));
+    assert.equal(questionIds(got).includes("q-visa-unknown"), false);
+    assert.ok(questionIds(got).includes("financial_proof"));
+  });
+
+  test("an id that is hidden under one country and public under another", async () => {
+    seedVisa(CC_A, "split-id", { category: "student", visibility: "agency", reviewStatus: "approved" });
+    seedVisa(CC_B, "split-id", { category: "work" });
+    seedQuestion("q-visa-split", "visa:split-id");
+    // Under the hidden copy's country: withheld.
+    assert.equal(
+      questionIds(await eligibilityService.getQuestions("split-id", undefined, CC_A)).includes("q-visa-split"),
+      false
+    );
+    // Under the public copy's country, and with no country: the public visa's.
+    assert.ok(questionIds(await eligibilityService.getQuestions("split-id", undefined, CC_B)).includes("q-visa-split"));
+    assert.ok(questionIds(await eligibilityService.getQuestions("split-id")).includes("q-visa-split"));
   });
 
   test("a visible visa and an unknown id still get their visa-specific questions", async () => {
