@@ -5,6 +5,7 @@ import { Agent, Agency, AgencyInvitation } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
 import { claimsService } from "../services/claims.service";
+import { agencyService } from "../services/agency.service";
 import { entitlementService } from "../services/entitlement.service";
 import { notificationService } from "../services/notification.service";
 
@@ -188,6 +189,13 @@ class OnboardingController {
         return;
       }
       const invite = inviteDoc.data() as AgencyInvitation;
+      // Only an invitation issued by the agency's owner is an invitation at
+      // all (issue #135; see agencyService.isInvitationIssuedByAgencyOwner).
+      // Answered exactly like a missing document.
+      if (!(await agencyService.isInvitationIssuedByAgencyOwner(invite))) {
+        sendError(res, "NOT_FOUND", "Invitation not found", 404);
+        return;
+      }
       if (invite.status !== "pending") {
         sendError(res, "VALIDATION_ERROR", "This invitation is no longer pending", 400);
         return;
@@ -197,8 +205,13 @@ class OnboardingController {
         sendError(res, "VALIDATION_ERROR", "This invitation has expired", 400);
         return;
       }
-      // The invite may only be redeemed by the address it was sent to.
-      if (userEmail && invite.invitedEmail.toLowerCase() !== userEmail) {
+      // The invite may only be redeemed by the address it was sent to. ALWAYS
+      // enforced (issue #135): a token that carries no email is refused too.
+      if (
+        !userEmail ||
+        typeof invite.invitedEmail !== "string" ||
+        invite.invitedEmail.toLowerCase() !== userEmail
+      ) {
         sendError(
           res,
           "FORBIDDEN",

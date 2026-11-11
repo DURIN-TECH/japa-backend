@@ -420,6 +420,31 @@ class AgencyService {
   }
 
   /**
+   * Whether an invitation was really issued by the owner of the agency it
+   * names (issue #135). Redeeming an invitation turns it into agency
+   * membership, so an invitation document is only an authority when it agrees
+   * with the agency's own record: the agency must exist and its `ownerId`
+   * must be the invitation's `invitedBy`. That is exactly what the one server
+   * flow that creates invitations guarantees (POST /agencies/:id/invitations
+   * refuses anyone but the agency's owner; admins do not invite).
+   *
+   * Both redemption paths (acceptInvitation below and POST
+   * /onboarding/join-agency) call this BEFORE doing anything else with the
+   * invitation, and treat `false` as "invitation not found".
+   */
+  async isInvitationIssuedByAgencyOwner(
+    invitation: Pick<AgencyInvitation, "agencyId" | "invitedBy">
+  ): Promise<boolean> {
+    const { agencyId, invitedBy } = invitation;
+    // Malformed references can never match an agency owner.
+    if (typeof agencyId !== "string" || !agencyId || agencyId.includes("/")) return false;
+    if (typeof invitedBy !== "string" || !invitedBy) return false;
+    const agencyDoc = await collections.agencies.doc(agencyId).get();
+    if (!agencyDoc.exists) return false;
+    return (agencyDoc.data() as Agency).ownerId === invitedBy;
+  }
+
+  /**
    * Accept an invitation
    */
   async acceptInvitation(
@@ -433,8 +458,27 @@ class AgencyService {
     if (!invitationDoc.exists) throw new Error("Invitation not found");
 
     const invitation = invitationDoc.data() as AgencyInvitation;
+
+    // Only an invitation issued by the agency's owner is an invitation at all
+    // (issue #135; see isInvitationIssuedByAgencyOwner). Same answer as for a
+    // missing document, so nothing is revealed about why.
+    if (!(await this.isInvitationIssuedByAgencyOwner(invitation))) {
+      throw new Error("Invitation not found");
+    }
+
     if (invitation.status !== "pending") {
       throw new Error("Invitation is no longer pending");
+    }
+
+    // The invitation may only be redeemed by the address it was sent to.
+    // ALWAYS enforced (issue #135): whether or not the caller already has an
+    // agent profile, and a caller whose token carries no email is refused.
+    if (
+      !userEmail ||
+      typeof invitation.invitedEmail !== "string" ||
+      invitation.invitedEmail.toLowerCase() !== userEmail.toLowerCase()
+    ) {
+      throw new Error("This invitation was sent to a different email address.");
     }
 
     // Check expiry
@@ -463,12 +507,8 @@ class AgencyService {
     }
 
     if (agentSnapshot.empty) {
-      // No profile yet → create one as a verified, available member. Guard with
-      // an email match (when the caller's email is known) so an invite can only
-      // be redeemed by its intended recipient — same rule as join-agency.
-      if (userEmail && invitation.invitedEmail.toLowerCase() !== userEmail.toLowerCase()) {
-        throw new Error("This invitation was sent to a different email address.");
-      }
+      // No profile yet → create one as a verified, available member. (The
+      // invited-email match was already enforced above, for every caller.)
 
       const userDoc = await collections.users.doc(agentUserId).get();
       const u = userDoc.data() as User | undefined;

@@ -307,13 +307,17 @@ service cloud.firestore {
                      resource.data.email == request.auth.token.email ||
                      isAdmin());
 
-      // Invitations are created, accepted, declined and cancelled ONLY by
-      // the backend (Admin SDK), through the API, which checks that the
-      // inviter owns the agency and that the redeemer is the invited address
-      // (issue #135). An invitation turns into agency membership when it is
-      // redeemed, so a client must never be able to write one: a self-made
-      // "invitation" would be a way into any agency. No portal or mobile code
-      // writes this collection directly.
+      // Invitations are written ONLY by the backend (Admin SDK), through the
+      // API (issue #135). Redeeming an invitation turns it into agency
+      // membership, so a client must never be able to write one. What the API
+      // checks:
+      //  - creating: the caller is the `ownerId` of the agency;
+      //  - redeeming (accept / join-agency): the agency exists and its
+      //    `ownerId` is the invitation's `invitedBy`; the invitation is
+      //    pending and not expired; and the caller's token email equals
+      //    `invitedEmail` (a token with no email is refused). The API does
+      //    NOT require that email to be verified.
+      // No portal or mobile code writes this collection directly.
       allow create, update: if false;
 
       // Only admin can delete invitations
