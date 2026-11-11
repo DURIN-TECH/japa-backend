@@ -20,6 +20,8 @@ import {
 } from "./scrapers";
 // Caseworker-guidance source registry: admin list (issue #39).
 import { adminGuidanceSourceRoutes } from "./scrapers";
+// Rubric review (issue #125): admin queue, detail with diff, approve / reject.
+import { adminRubricRoutes } from "./routes/rubric-review.routes";
 // Agency-scoped visa drafts / edits / submit (issue #100).
 import { agencyVisaRoutes } from "./agency-visas";
 import { agentRoutes } from "./routes/agent.routes";
@@ -127,6 +129,9 @@ app.use("/admin/scrape-costs", adminScrapeCostRoutes);
 // Caseworker-guidance source registry (issue #39): read-only admin list
 // (CASL `read ScrapeRun`, admin-only). No route serves snapshot text.
 app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
+// Rubric review (issue #125): admin-only (verifyAuth + admin gate on every
+// route). The only routes that read an unapproved rubric version.
+app.use("/admin/rubrics", adminRubricRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);
