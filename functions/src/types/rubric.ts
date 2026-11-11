@@ -348,8 +348,14 @@ export interface EvidenceItem {
  * never fills it in.
  */
 export interface OutcomeStatisticsMapping {
-  // The publisher's own category label / key the route is counted under.
+  // Key of the published category the route is counted under: an opaque key
+  // the destination's importer adapter defines (the `categoryKey` of stored
+  // outcomeStatistics docs, e.g. "group:<slug>"). Looked up by exact match.
   categoryKey: string;
+  // Wording for that category in the applicant's note, e.g. "all visitor
+  // visas". Written by the admin so the note's label matches how wide the
+  // published category really is. Required (#116).
+  categoryLabel: string;
   // Importer adapter that reads that publisher's tables.
   adapterId?: string;
   // Where the tables are published.
@@ -485,6 +491,11 @@ export interface VisaRubric {
   evidenceItems: EvidenceItem[];
   // Set by an admin (never by extraction); absent until then.
   outcomeStatistics?: OutcomeStatisticsMapping;
+  // Admin-set tag (#116): ids of the criteria for which extra supporting
+  // evidence helps. The country-context note lists their titles, and only
+  // when the nationality's published rate is below the all-nationality rate.
+  // Never model-extracted, never chosen per nationality. Absent = no areas.
+  evidenceHelpsCriterionIds?: string[];
 
   // ---- provenance (immutable) ----
   sourceSnapshots: RubricSourceSnapshot[];
@@ -521,6 +532,7 @@ export const RUBRIC_REVIEW_FIELDS = [
   "revision",
   "supersededAt",
   "outcomeStatistics",
+  "evidenceHelpsCriterionIds",
 ] as const;
 
 /**

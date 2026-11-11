@@ -101,6 +101,21 @@ export interface RubricDiff {
   // Criteria identical in both versions (count only).
   unchangedCount: number;
   intentPolarity: IntentPolarityDiff;
+  // The two ADMIN-SET fields (#116): never extracted, so a change here is
+  // always a human's. `before` is the baseline's value, `after` this version's
+  // stored value (absent until an approval sets it), null for absent.
+  adminSet: {
+    outcomeStatistics: AdminSetChange<NonNullable<VisaRubric["outcomeStatistics"]>>;
+    evidenceHelpsCriterionIds: AdminSetChange<string[]>;
+  };
+}
+
+/** One admin-set field compared across two versions. */
+export interface AdminSetChange<T> {
+  before: T | null;
+  after: T | null;
+  // True when the two differ (key order and absence vs null do not count).
+  changed: boolean;
 }
 
 /** Read a diff field from a criterion; absent values become null. */
@@ -176,7 +191,21 @@ function pairByRuleRef(removed: AssessmentCriterion[], added: AssessmentCriterio
 }
 
 /** The parts of a rubric version the diff reads. */
-export type DiffableRubric = Pick<VisaRubric, "version" | "criteria" | "intentPolarity" | "intentPolarityProposal">;
+export type DiffableRubric = Pick<VisaRubric, "version" | "criteria" | "intentPolarity" | "intentPolarityProposal"> &
+  Partial<Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds">>;
+
+/** Compare one admin-set field of two versions (stable JSON, so key order is ignored). */
+function adminSetChange<T>(before: T | undefined, after: T | undefined): AdminSetChange<T> {
+  return { before: before ?? null, after: after ?? null, changed: stableJson(before ?? null) !== stableJson(after ?? null) };
+}
+
+/** Both admin-set fields. A missing baseline compares against nothing. */
+function adminSetDiff(current: DiffableRubric, baseline: DiffableRubric | null): RubricDiff["adminSet"] {
+  return {
+    outcomeStatistics: adminSetChange(baseline?.outcomeStatistics, current.outcomeStatistics),
+    evidenceHelpsCriterionIds: adminSetChange(baseline?.evidenceHelpsCriterionIds, current.evidenceHelpsCriterionIds),
+  };
+}
 
 /**
  * Diff `current` against `baseline`.
@@ -202,6 +231,7 @@ export function diffRubricVersions(current: DiffableRubric, baseline: DiffableRu
         previousDecision: null,
         proposalDiffersFromPreviousDecision: false,
       },
+      adminSet: adminSetDiff(current, null),
     };
   }
 
@@ -254,5 +284,6 @@ export function diffRubricVersions(current: DiffableRubric, baseline: DiffableRu
       previousDecision,
       proposalDiffersFromPreviousDecision: previousDecision !== null && currentProposal !== previousDecision,
     },
+    adminSet: adminSetDiff(current, baseline),
   };
 }

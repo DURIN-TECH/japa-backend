@@ -12,13 +12,14 @@ import {
   type AssessmentCriterion,
   type EvidenceItem,
   type IntentPolarity,
+  type OutcomeStatisticsMapping,
   type RubricCitation,
   type RubricFlag,
   type RubricHead,
   type RubricReviewStatus,
   type VisaRubric,
 } from "../types/rubric";
-import { diffRubricVersions, type ChangedCriterion, type IntentPolarityDiff } from "./rubric-diff";
+import { diffRubricVersions, type ChangedCriterion, type IntentPolarityDiff, type RubricDiff } from "./rubric-diff";
 
 // ============================================
 // RUBRIC REVIEW — ADMIN SERVICE (issue #125)
@@ -132,6 +133,19 @@ export const RUBRIC_REVIEW_REASON_MAX_LENGTH = 2000;
 /** List page sizes (GET /admin/rubrics). */
 export const RUBRIC_LIST_DEFAULT_LIMIT = 50;
 export const RUBRIC_LIST_MAX_LIMIT = 100;
+
+/** The shape of an outcome-statistics `categoryKey` an admin may set (#116). */
+const OUTCOME_CATEGORY_KEY_RE = /^(group|type):[a-z0-9:-]+$/;
+/** Longest `categoryKey`, `categoryLabel`, `adapterId`, `sourceUrl`, `note` accepted. */
+const OUTCOME_KEY_MAX = 200;
+const OUTCOME_LABEL_MAX = 120;
+const OUTCOME_ADAPTER_MAX = 100;
+const OUTCOME_URL_MAX = 2000;
+const OUTCOME_NOTE_MAX = 1000;
+/** Most criteria one `evidenceHelpsCriterionIds` may name. */
+const MAX_EVIDENCE_HELPS_CRITERIA = 100;
+/** Keys an `outcomeStatistics` body object may carry (strict). */
+const OUTCOME_BODY_KEYS = ["categoryKey", "categoryLabel", "adapterId", "sourceUrl", "note"];
 
 /** Most flags a request may acknowledge (one per flagged criterion at most). */
 const MAX_ACKNOWLEDGED_FLAGS = 500;
@@ -332,11 +346,15 @@ export type RubricDecisionInput =
       acknowledgedFlags: string[];
       // Optional note, kept in the audit entry only.
       reason: string | null;
+      // ADMIN-SET (#116), optional: written with the approval when sent,
+      // left as stored (absent) when not. Never read from extraction output.
+      outcomeStatistics?: OutcomeStatisticsMapping;
+      evidenceHelpsCriterionIds?: string[];
     }
   | { action: "reject"; revision: number; reason: string };
 
 /** Body keys each action accepts. Anything else is refused, not ignored. */
-const APPROVE_KEYS = ["action", "revision", "intentPolarity", "acknowledgedFlags", "reason"];
+const APPROVE_KEYS = ["action", "revision", "intentPolarity", "acknowledgedFlags", "reason", "outcomeStatistics", "evidenceHelpsCriterionIds"];
 const REJECT_KEYS = ["action", "revision", "reason"];
 
 /**
@@ -383,7 +401,60 @@ export function parseRubricDecision(body: unknown): RubricDecisionInput {
     }
     acknowledgedFlags = [...new Set(list as string[])];
   }
-  return { action: "approve", revision: b.revision, intentPolarity: b.intentPolarity as IntentPolarity, acknowledgedFlags, reason: reason || null };
+  const out: RubricDecisionInput = { action: "approve", revision: b.revision, intentPolarity: b.intentPolarity as IntentPolarity, acknowledgedFlags, reason: reason || null };
+  if (b.outcomeStatistics !== undefined) out.outcomeStatistics = parseOutcomeStatistics(b.outcomeStatistics);
+  if (b.evidenceHelpsCriterionIds !== undefined) out.evidenceHelpsCriterionIds = parseEvidenceHelps(b.evidenceHelpsCriterionIds);
+  return out;
+}
+
+/**
+ * Validate the admin-set outcome-statistics mapping of an approval. Strict:
+ * unknown keys are refused; strings are trimmed; `sourceUrl` is http(s) only.
+ * @throws RubricReviewError (400 VALIDATION_ERROR)
+ */
+function parseOutcomeStatistics(raw: unknown): OutcomeStatisticsMapping {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw invalid("outcomeStatistics must be an object");
+  const o = raw as Record<string, unknown>;
+  const extra = Object.keys(o).filter((k) => !OUTCOME_BODY_KEYS.includes(k));
+  if (extra.length > 0) throw invalid(`unknown field(s) in outcomeStatistics: ${extra.join(", ")}`);
+  /** A trimmed string no longer than `max`; null when absent. */
+  const text = (key: string, max: number): string | null => {
+    const v = o[key];
+    if (v === undefined || v === null) return null;
+    if (typeof v !== "string") throw invalid(`outcomeStatistics.${key} must be a string`);
+    const t = v.trim();
+    if (t.length > max) throw invalid(`outcomeStatistics.${key} must be at most ${max} characters`);
+    return t;
+  };
+  const categoryKey = text("categoryKey", OUTCOME_KEY_MAX);
+  if (!categoryKey || !OUTCOME_CATEGORY_KEY_RE.test(categoryKey)) throw invalid("outcomeStatistics.categoryKey is required and must look like group:<slug> or type:<slug>");
+  const categoryLabel = text("categoryLabel", OUTCOME_LABEL_MAX);
+  if (!categoryLabel) throw invalid("outcomeStatistics.categoryLabel is required (the wording for the category in the applicant's note)");
+  const result: OutcomeStatisticsMapping = { categoryKey, categoryLabel };
+  const adapterId = text("adapterId", OUTCOME_ADAPTER_MAX);
+  if (adapterId) result.adapterId = adapterId;
+  const sourceUrl = text("sourceUrl", OUTCOME_URL_MAX);
+  if (sourceUrl) {
+    let ok = false;
+    try {
+      ok = ["http:", "https:"].includes(new URL(sourceUrl).protocol);
+    } catch {
+      ok = false;
+    }
+    if (!ok) throw invalid("outcomeStatistics.sourceUrl must be an http(s) URL");
+    result.sourceUrl = sourceUrl;
+  }
+  const note = text("note", OUTCOME_NOTE_MAX);
+  if (note) result.note = note;
+  return result;
+}
+
+/** Validate the admin's list of criterion ids: strings, de-duplicated, capped. */
+function parseEvidenceHelps(raw: unknown): string[] {
+  if (!Array.isArray(raw) || raw.length > MAX_EVIDENCE_HELPS_CRITERIA || raw.some((v) => typeof v !== "string" || !v.trim() || v.length > 200)) {
+    throw invalid(`evidenceHelpsCriterionIds must be a list of at most ${MAX_EVIDENCE_HELPS_CRITERIA} criterion ids`);
+  }
+  return [...new Set((raw as string[]).map((v) => v.trim()))];
 }
 
 // ============================================
@@ -482,6 +553,8 @@ export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intent
   // Each item carries the same citation check as a criterion.
   evidenceItems: ReviewEvidenceItem[];
   outcomeStatistics: VisaRubric["outcomeStatistics"] | null;
+  // Admin-set (#116): criteria for which extra evidence helps; null when unset.
+  evidenceHelpsCriterionIds: string[] | null;
   sourceSnapshots: VisaRubric["sourceSnapshots"];
   extractorModel: string;
   extractorPromptVersion: string;
@@ -505,6 +578,8 @@ export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intent
     // Prominent: see IntentPolarityDiff.
     intentPolarityChanged: boolean;
     intentPolarity: IntentPolarityDiff;
+    // The admin-set fields against the serving version (see RubricDiff).
+    adminSet: RubricDiff["adminSet"];
     summary: { added: number; removed: number; changed: number; unchanged: number };
   };
   // ---- can it be approved, and what would that take ----
@@ -569,6 +644,10 @@ export interface RubricReviewAuditEntry {
   // Approve only: the blocking flags `by` acknowledged (never free text from
   // the request: copied from the version's own flags).
   acknowledgedFlags: { key: string; code: string; target: string; message: string }[];
+  // Approve only: the admin-set fields written with the approval (null when
+  // the request did not send them).
+  outcomeStatistics?: OutcomeStatisticsMapping | null;
+  evidenceHelpsCriterionIds?: string[] | null;
   // The version serving before this decision.
   previousApprovedVersion: number | null;
   // The version serving after it.
@@ -725,6 +804,15 @@ interface CitationCheck {
   sourceHeads: Map<string, string | null>;
 }
 
+/** The admin-set fields an approve body carries (only those that were sent). */
+function adminSetOf(input: RubricDecisionInput): Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds"> {
+  if (input.action !== "approve") return {};
+  return {
+    ...(input.outcomeStatistics ? { outcomeStatistics: input.outcomeStatistics } : {}),
+    ...(input.evidenceHelpsCriterionIds ? { evidenceHelpsCriterionIds: input.evidenceHelpsCriterionIds } : {}),
+  };
+}
+
 /**
  * What a citation check refuses an approval for: quotes that are no longer in
  * the current source text (stale) and quotes that could not be checked
@@ -757,8 +845,14 @@ function citationBlockers(citations: CitationCheck): ApprovalBlocker[] {
  * with `polarity`. Shared by the detail (so `canApprove` is false exactly
  * when `decide` would answer RUBRIC_INVALID) and by `decide`.
  */
-function structuralErrors(rubric: VisaRubric, polarity: IntentPolarity, knownEligibilityQuestionIds: ReadonlySet<string> | undefined): RubricIssue[] {
-  const candidate: VisaRubric = { ...rubric, reviewStatus: "approved", intentPolarity: polarity };
+function structuralErrors(
+  rubric: VisaRubric,
+  polarity: IntentPolarity,
+  knownEligibilityQuestionIds: ReadonlySet<string> | undefined,
+  adminSet: Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds"> = {}
+): RubricIssue[] {
+  // The admin-set fields of the request, as they would be stored.
+  const candidate: VisaRubric = { ...rubric, ...adminSet, reviewStatus: "approved", intentPolarity: polarity };
   return validateVisaRubric(candidate, { knownEligibilityQuestionIds }).errors;
 }
 
@@ -978,6 +1072,7 @@ export class RubricReviewService {
       unchangedCount: raw.unchangedCount,
       intentPolarityChanged: raw.intentPolarity.proposalChanged,
       intentPolarity: raw.intentPolarity,
+      adminSet: raw.adminSet,
       summary: { added: raw.added.length, removed: raw.removed.length, changed: raw.changed.length, unchanged: raw.unchangedCount },
     };
 
@@ -1033,6 +1128,7 @@ export class RubricReviewService {
         return { ...e, source: toCitation(e.source), staleCitation: finding.status !== "current", citationStatus: finding.status, quoteContext: finding.context };
       }),
       outcomeStatistics: rubric.outcomeStatistics ?? null,
+      evidenceHelpsCriterionIds: rubric.evidenceHelpsCriterionIds ?? null,
       sourceSnapshots: (rubric.sourceSnapshots ?? []).map((s) => ({
         sourceId: s.sourceId,
         contentHash: s.contentHash,
@@ -1241,8 +1337,16 @@ export class RubricReviewService {
         }
       }
 
+      // ---- admin-set tags must name this version's own criteria (clean 400
+      //      before the structural check, which would also refuse them) ----
+      if (input.evidenceHelpsCriterionIds) {
+        const own = new Set((rubric.criteria ?? []).map((c) => c.criterionId));
+        const unknownIds = input.evidenceHelpsCriterionIds.filter((cid) => !own.has(cid));
+        if (unknownIds.length > 0) throw invalid(`evidenceHelpsCriterionIds names criteria this version does not have: ${unknownIds.join(", ")}`);
+      }
+
       // ---- the rubric exactly as it would be approved ----
-      const errors = structuralErrors({ ...rubric, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter }, input.intentPolarity, knownEligibilityIds);
+      const errors = structuralErrors({ ...rubric, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter }, input.intentPolarity, knownEligibilityIds, adminSetOf(input));
       if (errors.length > 0) {
         const codes = [...new Set(errors.map((e) => e.code))].join(", ");
         throw conflict("RUBRIC_INVALID", `This rubric version is not internally consistent and cannot be approved (${codes}). Reject it and re-extract.`);
@@ -1267,7 +1371,8 @@ export class RubricReviewService {
 
       // ======== WRITES ========
       // 1. The version: review fields only.
-      tx.update(versionRef, reviewFieldsUpdate({ reviewStatus: "approved", intentPolarity: input.intentPolarity, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter }));
+      //    The admin-set fields go in the same write, only when sent.
+      tx.update(versionRef, reviewFieldsUpdate({ reviewStatus: "approved", intentPolarity: input.intentPolarity, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter, ...adminSetOf(input) }));
       // 2. The version it replaces: marked superseded (it stays `approved`
       //    as a record, but the head no longer points at it).
       if (supersededRef && supersededSnap?.exists) {
@@ -1287,6 +1392,8 @@ export class RubricReviewService {
         intentPolarityProposal: proposal,
         intentPolarityOverridden: proposal !== input.intentPolarity,
         acknowledgedFlags: acknowledged,
+        outcomeStatistics: input.outcomeStatistics ?? null,
+        evidenceHelpsCriterionIds: input.evidenceHelpsCriterionIds ?? null,
         approvedVersion: version,
       };
       tx.set(auditRef, audit as unknown as Record<string, unknown>);

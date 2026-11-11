@@ -253,7 +253,13 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
   // ---- outcome statistics mapping (admin-set; only checked when present) ----
   if (rubric.outcomeStatistics !== undefined) {
     if (!filled(rubric.outcomeStatistics.categoryKey)) err("outcome_statistics_category_missing", "outcomeStatistics.categoryKey is required");
+    if (!filled(rubric.outcomeStatistics.categoryLabel)) err("outcome_statistics_label_missing", "outcomeStatistics.categoryLabel is required");
     if (rubric.outcomeStatistics.sourceUrl !== undefined && !isHttpUrl(rubric.outcomeStatistics.sourceUrl)) err("outcome_statistics_url_invalid", "outcomeStatistics.sourceUrl must be an http(s) URL");
+  }
+
+  // ---- extra-evidence tags (admin-set, #116; only checked when present) ----
+  for (const id of rubric.evidenceHelpsCriterionIds ?? []) {
+    if (!criterionIds.has(id)) err("evidence_tag_criterion_unknown", `evidenceHelpsCriterionIds names criterion ${id}, which is not in the rubric`);
   }
 
   // ---- intent: criteria about intent need a polarity to be scored by ----
