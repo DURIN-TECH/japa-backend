@@ -1,5 +1,6 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { publishedDateSelectorProblem } from "../guidance-published-date";
+import { resolveFromProblems } from "../guidance-resolve";
 import { GUIDANCE_SOURCE_ID_RE } from "../guidance-snapshot.store";
 import {
   GUIDANCE_DOC_TYPES,
@@ -35,15 +36,147 @@ import {
 // The crawl skips `unverified` sources (guidance-crawl.service.ts).
 
 /**
+ * How often the entries below are re-checked: weekly. The documents change a
+ * few times a year, and the crawl is a hash gate, so a weekly look is enough
+ * to notice a re-issue without asking the publisher's servers more than that.
+ */
+const WEEKLY_HOURS = 24 * 7;
+
+/**
  * The registry entries to seed.
  *
- * EMPTY ON PURPOSE in this issue: #39 delivers the registry, its schema, the
- * seed shape and the crawl. The first real entries are added by #111, which
- * also records, per entry, what was retrieved. Add an entry here as data
- * only; no code in this module may depend on what an entry's jurisdiction,
- * route or publisher is.
+ * Add an entry here as DATA only; no code in this module (or anywhere in
+ * guidance/) may depend on what an entry's jurisdiction, route or publisher
+ * is. Adding another route's sources means adding rows to this list (and,
+ * for passages worth pinning, rows to guidance-quote-checks.ts).
+ *
+ * ---- The first entries (issue #111) ----
+ *
+ * Five documents, all sharing one `jurisdiction` + `route` key pair, which is
+ * the pair the rubric built from them will be keyed by. Two of them (the
+ * suitability rules and the finance appendix) are general documents that the
+ * route's own rules refer to; they are registered under the same route key
+ * because that is the route they are read for here.
+ *
+ * Every `verificationNote` below records what was ACTUALLY retrieved, by
+ * whom and when: each document was requested once on 2026-11-11 through the
+ * shared fetch service (bot user agent, robots.txt checked, per-host delay),
+ * the same code path the crawl uses, and the numbers in the note are that
+ * request's. The addresses were taken from the publisher's live pages on
+ * that day, not from the issue text. Nothing here is copied from a summary.
+ *
+ * Publisher's date: only the two renditions of the caseworker guidance carry
+ * their own "published for staff on" line in the text that is stored, so
+ * only they have a `publishedDateSelector`. The three rules pages show their
+ * "updated" date in page furniture OUTSIDE the main content the fetch
+ * service keeps, so their snapshots report no date and `publishedDate`
+ * stays null for them (recorded per entry; not guessed, not copied).
  */
-export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [];
+export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
+  {
+    id: "gb-appendix-v-visitor",
+    title: "Immigration Rules Appendix V: Visitor",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    jurisdiction: "GB",
+    route: "standard-visitor",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-11 (10:48 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "31,960 characters of cleaned text, sha256 fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa. " +
+      "The text runs from the page title to the last rule of the last section (it is not cut short). " +
+      "Read closely: V 3.1, V 4.2 and V 4.3; the rest was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-11T10:48:37Z",
+  },
+  {
+    id: "gb-visit-guidance-html",
+    title: "Visit caseworker guidance (accessible web version)",
+    url: "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    jurisdiction: "GB",
+    route: "standard-visitor",
+    docType: "html",
+    // The document's own line, e.g. "published for Home Office staff on <date>".
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-11 (10:48 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "147,856 characters of cleaned text, sha256 4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c. " +
+      "The address is the one the publication page linked to on that day. The text states version 18.0, " +
+      "published for staff on 8 October 2026, and runs through the last numbered section (19.9). " +
+      "Read closely: sections 7.2, 7.3, 7.4 and 8.2; the rest was retrieved and skimmed, not read line by line.",
+    retrievedAt: "2026-11-11T10:48:38Z",
+  },
+  {
+    id: "gb-visit-guidance-pdf",
+    title: "Visit caseworker guidance (PDF)",
+    // The file's address ON THE DAY IT WAS RETRIEVED. It carries a per-release
+    // id and changes with every publication, so the crawl does not request
+    // this value: it reads the current address from `resolveFrom` each time.
+    url: "https://assets.publishing.service.gov.uk/media/6ab66e8ba9c3d267bcccef22/Visit__updated_.pdf",
+    resolveFrom: {
+      // The stable publication page that always links to the current file.
+      pageUrl: "https://www.gov.uk/government/publications/visit-guidance",
+      // The one PDF attachment on that page: any release id, any file name.
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]+\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "standard-visitor",
+    docType: "pdf",
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-11 (10:48 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "814,372-byte PDF, 80 pages, every page with a text layer, 169,325 characters of cleaned text, " +
+      "sha256 9d4d1a72479fc64f8a5da0a92a12a8c6f129a2f6fdef62101177aeb02bb5ec6f. The file's address was read " +
+      "from the publication page on that day (it was the only PDF linked there). Each page is headed " +
+      "'Published for Home Office staff on 8 October 2026'; page 1 states version 18.0. " +
+      "Read closely: the passages on pages 21 to 23 and 26 that correspond to sections 7.2, 7.3, 7.4 and 8.2 of the " +
+      "web version (the PDF's headings are not numbered); the rest was retrieved and skimmed, not read line by line.",
+    retrievedAt: "2026-11-11T10:48:43Z",
+  },
+  {
+    id: "gb-part-suitability",
+    title: "Immigration Rules: Part Suitability",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-part-suitability",
+    jurisdiction: "GB",
+    route: "standard-visitor",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-11 (10:48 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "36,186 characters of cleaned text, sha256 75e7884bf7a91b9d7064c6bbe9ef884c617a30c9c48b19f9f6cf6311c25c7e35. " +
+      "The address is the one the publisher's index of the rules linked to on that day; this is the document " +
+      "the visitor rules name for refusal grounds (V 3.1 of the entry above). The text runs from the title to the " +
+      "last numbered paragraph (it is not cut short). Read closely: the opening and the closing paragraphs only; " +
+      "the rest was retrieved, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-11T10:48:40Z",
+  },
+  {
+    id: "gb-appendix-finance",
+    title: "Immigration Rules Appendix Finance",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-finance",
+    jurisdiction: "GB",
+    route: "standard-visitor",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-11 (10:48 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "9,076 characters of cleaned text, sha256 12d7089b98578dc7379bc40672a99364e4b0fa10a199004b1aaf0d3c20596847. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because the " +
+      "visitor rules (V 4.2(e) of the first entry) refer to FIN 2.1 of this document. The text runs from the title to " +
+      "the last numbered paragraph (it is not cut short). Read closely: FIN 2.1; the rest was retrieved and skimmed, " +
+      "not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-11T10:48:41Z",
+  },
+];
 
 /** Statuses a seed may set (`failing` belongs to the crawler). */
 const SEEDABLE_STATUSES = ["active", "paused", "retired"] as const;
@@ -60,6 +193,7 @@ export const GUIDANCE_CRAWL_STATE_DEFAULTS = {
   lastFetchedAt: null,
   lastContentHash: null,
   finalUrl: null,
+  resolvedUrl: null,
   publishedDate: null,
   publishedDateText: null,
   latestSnapshotId: null,
@@ -101,6 +235,15 @@ export function validateGuidanceSourceSeed(seed: GuidanceSourceSeed): string[] {
   if (!isHttpsUrl(s.url)) problems.push("url must be an absolute https URL");
   if (s.expectedFinalUrl !== undefined && !isHttpsUrl(s.expectedFinalUrl)) {
     problems.push("expectedFinalUrl must be an absolute https URL");
+  }
+  // A document whose address changes per publication (issue #111): where to
+  // look the current one up. The resolved address is then the redirect
+  // baseline, so a fixed `expectedFinalUrl` would contradict it.
+  if (s.resolveFrom !== undefined) {
+    problems.push(...resolveFromProblems(s.resolveFrom));
+    if (s.expectedFinalUrl !== undefined) {
+      problems.push("expectedFinalUrl cannot be combined with resolveFrom (the resolved address is the redirect baseline)");
+    }
   }
   if (typeof s.jurisdiction !== "string" || !KEY_RE.test(s.jurisdiction)) {
     problems.push("jurisdiction must be a key of letters, digits and hyphens");
@@ -211,6 +354,10 @@ export function buildSeededGuidanceSource(
     // from the doc by the merge.
     publishedDateSelector: seed.publishedDateSelector ?? null,
     expectedFinalUrl: seed.expectedFinalUrl ?? null,
+    // A copy of the two strings (never the seed object itself), or null.
+    resolveFrom: seed.resolveFrom
+      ? { pageUrl: seed.resolveFrom.pageUrl, linkPattern: seed.resolveFrom.linkPattern }
+      : null,
     checkIntervalHours: seed.checkIntervalHours,
     verificationStatus: seed.verificationStatus,
     verificationNote: seed.verificationNote.trim(),
@@ -237,6 +384,7 @@ export function buildSeededGuidanceSource(
     // A different address: forget the old redirect baseline and streak.
     Object.assign(doc, {
       finalUrl: null,
+      resolvedUrl: null,
       consecutiveFailures: 0,
       lastError: null,
       lastErrorKind: null,

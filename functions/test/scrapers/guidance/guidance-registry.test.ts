@@ -163,6 +163,8 @@ describe("guidance seed: the doc that is written", () => {
       docType: "html",
       publishedDateSelector: HTML_SEED.publishedDateSelector,
       expectedFinalUrl: null,
+      // Issue #111: no parent page to resolve the address from.
+      resolveFrom: null,
       checkIntervalHours: 24,
       verificationStatus: "verified",
       verificationNote: HTML_SEED.verificationNote,
@@ -172,6 +174,7 @@ describe("guidance seed: the doc that is written", () => {
       lastFetchedAt: null,
       lastContentHash: null,
       finalUrl: null,
+      resolvedUrl: null,
       publishedDate: null,
       publishedDateText: null,
       latestSnapshotId: null,
