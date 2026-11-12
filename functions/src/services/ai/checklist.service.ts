@@ -64,14 +64,13 @@ class ChecklistService {
     // Approved rubrics only, and only through the store (never a pending one).
     const rubric = await rubricStore.getApprovedRubric(application.countryCode.toUpperCase(), application.visaTypeId);
     const visaType = await visaService.getVisaType(application.countryCode, application.visaTypeId);
-    // `intake` is written by #113 (`Application.intake`, not on `dev` yet when
-    // this was written): read it through a local shape so this file compiles
-    // either way. See #113 `types/intake.ts` ApplicationIntake.
-    const intake = (application as Application & { intake?: { answers?: Record<string, unknown> } }).intake;
+    // Integration: #113 (`Application.intake`) and #129 (`VisaType.requiredDocuments`,
+    // `scrapeMeta.citations`) are both on this branch, so the real types are used
+    // here instead of the local casts #114 shipped with.
+    const intake = application.intake;
     return buildChecklist({
       rubric,
-      // `requiredDocuments` arrives with #129; read defensively.
-      visaRecord: visaType as unknown as { requiredDocuments?: string[]; scrapeMeta?: { sourceUrl?: string; citations?: Record<string, string> } } | null,
+      visaRecord: visaType,
       intakeAnswers: intake?.answers ?? null,
     });
   }
