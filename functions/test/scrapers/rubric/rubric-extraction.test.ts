@@ -512,8 +512,9 @@ describe("rubric extraction: what the code-side validation rejects", () => {
     const kept = await runA(h);
     assert.equal(kept.result.status, "succeeded");
     const rubric = versionDoc(KEY_A, 1) as VisaRubric;
-    assert.equal(rubric.criteria[0].ruleRef, undefined);
-    assert.ok(rubric.flags.some((f) => f.code === "rule_ref_removed"));
+    // The model's "SV 9.9" is not kept; the document's own label of the line is derived instead.
+    assert.notEqual(rubric.criteria[0].ruleRef, "SV 9.9");
+    assert.equal(rubric.criteria[0].ruleRef, "SV 3.2");
 
     resetStore();
     resetBucket();

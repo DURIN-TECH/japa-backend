@@ -122,7 +122,7 @@ export const RUBRIC_INTAKE_SYSTEM_PROMPT = [
   COMMON_INSTRUCTIONS,
   "The criteria are given as JSON with a `ref`, a `title` and the `quote` each rests on. Refer to a criterion only by its `ref`.",
   "",
-  "`intakeQuestions`: questions an applicant would need to answer for the listed criteria to be assessed. Each lists, in `criterionRefs`, the `ref` of every criterion that reads the answer. Ask only what a listed criterion needs, and ask each thing once. If a question matters only when an earlier answer has a certain value (for example a question about someone else only when someone else is involved), give `showWhenAnyOf` with the id of that earlier question and the value. A question about another person's details sets `party` accordingly.",
+  "`intakeQuestions`: questions an applicant would need to answer for the listed criteria to be assessed. Each lists, in `criterionRefs`, the `ref` of every criterion that reads the answer. Ask only what a listed criterion needs, and ask each thing once. If a question matters only when an earlier answer has a certain value (for example a question about someone else only when someone else is involved), give `showWhenAnyOf` with the id of that earlier question and the value. A question about another person's details sets `party` accordingly. When another person takes part (pays, hosts, sponsors, vouches) and criteria read facts about them, also ask for that person's full name as written on their documents, with the same condition.",
   "",
   "`evidenceItems`: documents the excerpt itself names as evidence, each with the verbatim passage naming it (`quote`, copied character for character from one paragraph of the excerpt), the `documentType`, whose document it is (`party`), the `ref` of the criteria it evidences and, when it is asked for only after a certain answer, `showWhenAnyOf` naming the intake question and the value that triggers it. Do not add documents the excerpt does not name.",
   "",
@@ -326,6 +326,7 @@ export function renderRubricUserMessage(
   if (chunk.text.includes(tag)) throw new RubricPromptError("source text contains the delimiter tag");
   const pages = chunk.pageStart === undefined ? "not paginated" : `${chunk.pageStart} to ${chunk.pageEnd}`;
   // The route name is catalogue data: one line, bounded, no control characters.
+  // eslint-disable-next-line no-control-regex
   const routeName = route.routeName.replace(/[\u0000-\u001f]+/g, " ").trim().slice(0, 120);
   return [
     `Route: ${routeName}`,

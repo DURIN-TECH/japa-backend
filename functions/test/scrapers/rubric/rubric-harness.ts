@@ -187,7 +187,7 @@ function wire(value: unknown): string {
 }
 
 /** The criteria half of an answer (call 1). */
-function criteriaHalf(a: RawRubricOutput): string {
+export function criteriaWire(a: RawRubricOutput): string {
   const criteria = a.criteria.map((c) => {
     // `citations` are not part of the model's output any more.
     const { citations: _citations, ...rest } = c;
@@ -197,7 +197,7 @@ function criteriaHalf(a: RawRubricOutput): string {
 }
 
 /** The intake half of an answer (call 2). */
-function intakeHalf(a: RawRubricOutput): string {
+export function intakeWire(a: RawRubricOutput): string {
   return wire({
     ...(a.intake ? { intake: a.intake } : {}),
     intakeQuestions: a.intakeQuestions,
@@ -229,8 +229,8 @@ export async function recordAnswers(
     if (typeof a === "string") provider.script("criteria", tag, chunk.chunkIndex + 1, { text: a, usage: RECORDED_USAGE });
     else if ("raw" in a) provider.script("criteria", tag, chunk.chunkIndex + 1, { usage: RECORDED_USAGE, ...a });
     else {
-      provider.script("criteria", tag, chunk.chunkIndex + 1, { text: criteriaHalf(a), usage: RECORDED_USAGE });
-      provider.script("intake", tag, chunk.chunkIndex + 1, { text: intakeHalf(a), usage: RECORDED_USAGE });
+      provider.script("criteria", tag, chunk.chunkIndex + 1, { text: criteriaWire(a), usage: RECORDED_USAGE });
+      provider.script("intake", tag, chunk.chunkIndex + 1, { text: intakeWire(a), usage: RECORDED_USAGE });
     }
   });
 }

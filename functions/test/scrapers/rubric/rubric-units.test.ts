@@ -30,7 +30,7 @@ import { AI_PRICES, costOfUsage } from "../../../src/services/ai/ai-pricing";
 import { LlmProviderError, RecordedLlmProvider, llmRequestHash } from "../../../src/services/ai/llm-provider";
 import { DEFAULT_SEVERITY_LEVELS } from "../../../src/types/rubric";
 import { A_TEXT, B_PAGES, B_QUOTES, ROUTE_A, ROUTE_B, SOURCE_A_ID, SOURCE_B_ID } from "./fixtures/synthetic-guidance";
-import { answer, crit } from "./rubric-harness";
+import { answer, criteriaWire, crit } from "./rubric-harness";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -354,11 +354,15 @@ describe("prompt", () => {
 
 describe("model output: validated against the schema in code", () => {
   const schema = buildRubricOutputSchema(DEFAULT_SEVERITY_LEVELS);
-  const good = () => answer({ criteria: [crit({ ref: "a", title: "T", kind: "objective", quote: "q", check: { field: "f", op: "gte", value: 1, unit: null } })] });
+  const goodAnswer = () => answer({ criteria: [crit({ ref: "a", title: "T", kind: "objective", quote: "q", check: { field: "f", op: "gte", value: 1, unit: null } })] });
+  // The answer as the provider returns it (optional properties absent, not null).
+  const good = (): any => JSON.parse(criteriaWire(goodAnswer()));
 
   test("a complete answer is accepted", () => {
     assert.deepEqual(validateAgainstSchema(good(), schema), []);
-    assert.deepEqual(parseRubricOutput(JSON.stringify(good()), schema), good());
+    // Absent optional properties are read as null; the half of the answer a
+    // call does not carry is empty.
+    assert.deepEqual(parseRubricOutput(JSON.stringify(good()), schema), goodAnswer());
   });
 
   test("a mismatch is a failed extraction: missing field, extra field, wrong type, unknown enum", () => {

@@ -315,7 +315,9 @@ export class SnapshotQuoteIndex {
     if (this.paginated) return undefined;
     const line = this.units[found.unit].text;
     const own = LINE_LABEL_RE.exec(line);
-    if (own && found.at <= own[0].length) return normalizeRefLabel(own[1]);
+    // The quote starts at the label, or after it with only spaces between.
+    const startsAfter = (labelEnd: number) => found.at >= labelEnd && line.slice(labelEnd, found.at).trim() === "";
+    if (own && (found.at <= own[0].length || startsAfter(own[0].length))) return normalizeRefLabel(own[1]);
 
     /** Nearest earlier non-empty line, going back from `from` (exclusive), within a bound. */
     const earlier = (from: number): number[] => {
@@ -325,7 +327,7 @@ export class SnapshotQuoteIndex {
     };
 
     const limb = LIMB_RE.exec(line);
-    if (limb && found.at <= limb[0].length) {
+    if (limb && (found.at <= limb[0].length || startsAfter(limb[0].length))) {
       // Walk back to the parent paragraph's label, collecting the marker of
       // every list line on the way (nearest first). The chain itself is
       // decided by `composeMarkerChain`, which keeps only the nearest marker
