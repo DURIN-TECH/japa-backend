@@ -230,7 +230,10 @@ describe("rubric validator: joins and integrity", () => {
 
   test("an outcome-statistics mapping is optional, and checked when present", () => {
     assert.deepEqual(codes(rubric({ outcomeStatistics: { categoryKey: "all-visit-categories", categoryLabel: "All visit categories", adapterId: "avalen-tables", sourceUrl: "https://stats.avalen.example/tables", note: "Wider than this route." } })), []);
-    assert.deepEqual(codes(rubric({ outcomeStatistics: { categoryKey: "", categoryLabel: "" } })), ["outcome_statistics_category_missing"]);
+    assert.deepEqual(codes(rubric({ outcomeStatistics: { categoryKey: "", categoryLabel: "" } })), ["outcome_statistics_category_missing", "outcome_statistics_label_missing"]);
+    // TODO(test-pass): categoryLabel is now required too (it is what the app shows); each is reported on its own.
+    assert.deepEqual(codes(rubric({ outcomeStatistics: { categoryKey: "all-visit-categories", categoryLabel: "" } })), ["outcome_statistics_label_missing"]);
+    assert.deepEqual(codes(rubric({ outcomeStatistics: { categoryKey: "", categoryLabel: "All visit categories" } })), ["outcome_statistics_category_missing"]);
   });
 
   test("the route key must match the country code and visa type id", () => {
