@@ -99,3 +99,12 @@ export type {
   RubricCitation,
   VisaRubric,
 } from "../types/rubric";
+// ---- Published outcome statistics importer (issue #116) ----
+/** Import orchestrator (quarterly schedule + manual runs). */
+export { outcomeImportService, ImportAlreadyRunningError } from "./outcome-statistics/outcome-import.service";
+/** "Run now" worker: src/index.ts's processOutcomeStatisticsRunRequest trigger. */
+export { outcomeRunWorker } from "./outcome-statistics/outcome-run-worker";
+/** Admin routes: list import runs, request a manual run (admin-only). */
+export { adminOutcomeStatisticsRoutes } from "./outcome-statistics/outcome-statistics.routes";
+/** Destinations with an outcome data source adapter. */
+export { registeredDestinations } from "./outcome-statistics/registry";

@@ -99,6 +99,7 @@ import { bulkReassessmentService } from "./services/ai-bulk-reassessment.service
 import { ruleChangeAlertsService } from "./services/rule-change-alerts.service";
 import { rubricExtractionService } from "./scrapers";
 import type { RubricReviewAuditEntry } from "./services/rubric-review.service";
+import { outcomeImportService, outcomeRunWorker, registeredDestinations } from "./scrapers";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -590,6 +591,55 @@ export const processScrapeRunRequest = functions
   .firestore.document("scrapeRunRequests/{requestId}")
   .onCreate(async (_snapshot, context) => {
     await scrapeRunWorker.process(context.params.requestId);
+  });
+
+// ============================================
+// PUBLISHED OUTCOME STATISTICS (issue #116)
+// ============================================
+
+/**
+ * Quarterly import of published decision statistics (one run per registered
+ * destination). Governments publish quarterly (the UK Home Office in the
+ * second half of Feb / May / Aug / Nov), so this ticks every MONDAY at 05:00
+ * UTC but only in those four months: an unchanged release is detected by one
+ * cheap page fetch and skipped (same file address / same file hash), so the
+ * weekly tick inside a release month is how a late publication is still
+ * caught. Heavy: the release file is streamed from disk, never held, but the
+ * function gets 2 GB and the full 9 minutes. No secrets needed (public data).
+ * Kill switch: appConfig/outcomeStatistics.scheduledImportEnabled.
+ */
+export const importOutcomeStatistics = functions
+  .runWith({ memory: "2GB", timeoutSeconds: 540 })
+  .pubsub.schedule("0 5 * 2,5,8,11 1")
+  .timeZone("UTC")
+  .onRun(async () => {
+    for (const destination of registeredDestinations()) {
+      try {
+        const outcome = await outcomeImportService.run(destination, "scheduled");
+        console.log(
+          `Outcome statistics import (${destination}): ` +
+            (outcome ? `${outcome.result}${outcome.error ? ` (${outcome.error})` : ""}` : "disabled by settings")
+        );
+      } catch (error) {
+        console.error(`Outcome statistics import (${destination}) failed:`, error);
+      }
+    }
+  });
+
+/**
+ * Manual "Run now" for outcome statistics: the admin API
+ * (POST /admin/outcome-statistics/runs) writes an `outcomeStatisticsRunRequests`
+ * doc and returns 202; this trigger runs the import with the same 2 GB budget
+ * as the scheduled one. The worker never throws; the outcome is written on
+ * the request doc and as an `outcomeStatisticsRuns` record. Region pinned like
+ * processScrapeRunRequest.
+ */
+export const processOutcomeStatisticsRunRequest = functions
+  .region("us-central1")
+  .runWith({ memory: "2GB", timeoutSeconds: 540 })
+  .firestore.document("outcomeStatisticsRunRequests/{requestId}")
+  .onCreate(async (_snapshot, context) => {
+    await outcomeRunWorker.process(context.params.requestId);
   });
 
 /**

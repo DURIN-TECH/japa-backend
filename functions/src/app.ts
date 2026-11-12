@@ -22,6 +22,8 @@ import {
 import { adminGuidanceSourceRoutes } from "./scrapers";
 // Rubric review (issue #125): admin queue, detail with diff, approve / reject.
 import { adminRubricRoutes } from "./routes/rubric-review.routes";
+// Published outcome statistics imports: admin run list + Run now (issue #116).
+import { adminOutcomeStatisticsRoutes } from "./scrapers";
 // Agency-scoped visa drafts / edits / submit (issue #100).
 import { agencyVisaRoutes } from "./agency-visas";
 // Agency per-visa service prices, in whole naira (issue #103).
@@ -140,6 +142,8 @@ app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
 // Rubric review (issue #125): admin-only (verifyAuth + admin gate on every
 // route). The only routes that read an unapproved rubric version.
 app.use("/admin/rubrics", adminRubricRoutes);
+// Outcome statistics imports (issue #116): admin-only run records + manual run.
+app.use("/admin/outcome-statistics", adminOutcomeStatisticsRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);
