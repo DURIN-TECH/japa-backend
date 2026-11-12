@@ -184,6 +184,20 @@ export interface GuidanceSource
   lastErrorAt: Timestamp | null;
   // Set when the host asked us to slow down (429/503): not crawled before it.
   backoffUntil: Timestamp | null;
+  // ---- Infrastructure-error state (issue #143) ----
+  // Our own Storage / Firestore failed while handling this source. This is
+  // NOT the source's failure streak: it never touches `consecutiveFailures`
+  // or `status`. Absent on docs written before #143 (read as 0 / null).
+  // Runs in a row that ended in an infrastructure error on this source.
+  consecutiveInfraErrors?: number;
+  // Not requested before this instant (set once the streak reaches the cap);
+  // an admin retry by id ignores it. Distinct from `backoffUntil` (a HOST
+  // that answered 429/503).
+  infraBackoffUntil?: Timestamp | null;
+  // The last infrastructure error (redacted, capped) and when it happened;
+  // cleared by the next successful crawl of the source.
+  lastInfrastructureError?: string | null;
+  lastInfrastructureErrorAt?: Timestamp | null;
   // Auto-pause flags, the same fields the visa and news crawlers write (see
   // scrapers/shared/runs/source-health.ts). Set when status became `failing`.
   autoPaused?: boolean;

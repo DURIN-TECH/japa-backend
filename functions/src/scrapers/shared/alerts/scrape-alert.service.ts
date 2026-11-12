@@ -26,6 +26,7 @@ import {
   evaluateFx,
   evaluateHostBackoff,
   evaluateHostBackoffClears,
+  evaluateInfrastructureErrors,
   evaluateLinkedSurcharge,
   evaluateMissedWindows,
   evaluateReviewQueue,
@@ -51,7 +52,7 @@ import {
   type ScrapeAlertsConfig,
   type ScrapeAlertsState,
 } from "./types";
-import type { ScrapeRunDoc, ScrapeRunKind } from "../runs/types";
+import { SCRAPE_RUN_KINDS, type ScrapeRunDoc, type ScrapeRunKind } from "../runs/types";
 
 // ============================================
 // SCRAPE ALERTS — store, email, checks, admin reads (issue #83)
@@ -145,6 +146,7 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   review_queue_stale: "review queue waiting",
   budget_hard_stop: "LLM budget hard stop",
   settings_unreadable: "scraper settings unreadable",
+  infrastructure_error: "guidance crawl infrastructure error",
 };
 
 /** Cloud Logging severity per alert severity (resolutions log as INFO). */
@@ -323,6 +325,8 @@ export class ScrapeAlertService {
         evaluateLinkedSurcharge(run, config),
         // Issue #96: the hard stop blocked extraction in this run.
         evaluateBudgetHardStop(run, config),
+        // Issue #143: a guidance run that could not store its results.
+        evaluateInfrastructureErrors(run, config),
       ];
       // Host backoff needs the earlier runs of the same scraper.
       await this.isolated("host_backoff", skippedRules, async () => {
@@ -362,7 +366,8 @@ export class ScrapeAlertService {
         evals.push(evaluateStuckRuns(snap.docs.map((d) => d.data() as ScrapeRunDoc), nowMs, config));
       });
       const latest: Partial<Record<ScrapeRunKind, ScrapeRunDoc>> = {};
-      for (const kind of ["visa", "news"] as ScrapeRunKind[]) {
+      // Every kind (visa, news, guidance): SCRAPE_RUN_KINDS, not a literal list.
+      for (const kind of SCRAPE_RUN_KINDS) {
         await this.isolated(`run_failed:${kind}`, skippedRules, async () => {
           const run = await this.latestFinishedRun(kind);
           latest[kind] = run;
@@ -374,7 +379,7 @@ export class ScrapeAlertService {
       await this.isolated("missed_window", skippedRules, async () => {
         evals.push(evaluateMissedWindows((await this.sourceFacts("visa")) as VisaSourceFacts[], nowMs, config));
       });
-      for (const kind of ["visa", "news"] as ScrapeRunKind[]) {
+      for (const kind of SCRAPE_RUN_KINDS) {
         await this.isolated(`source_broken:${kind}`, skippedRules, async () => {
           evals.push(evaluateBrokenSources(kind, await this.sourceFacts(kind), config));
         });
@@ -389,7 +394,7 @@ export class ScrapeAlertService {
           .get();
         if (active.empty) return;
         const sourceStatus: Partial<Record<ScrapeRunKind, Map<string, string>>> = {};
-        for (const kind of ["visa", "news"] as ScrapeRunKind[]) {
+        for (const kind of SCRAPE_RUN_KINDS) {
           sourceStatus[kind] = new Map((await this.sourceFacts(kind)).map((f) => [f.id, String(f.status ?? "")]));
         }
         evals.push(evaluateHostBackoffClears(active.docs.map((d) => d.data() as ScrapeAlertDoc), sourceStatus, nowMs));
@@ -939,6 +944,26 @@ export class ScrapeAlertService {
 
   /** Source facts for one scraper's registry (a few dozen docs at most). */
   private async sourceFacts(kind: ScrapeRunKind): Promise<Array<VisaSourceFacts | NewsSourceFacts>> {
+    // Issue #143: the guidance registry. Its "failing" status (the crawler
+    // stopped after N consecutive failures) is the same thing the other
+    // registries call "broken", so it is mapped to that word here and
+    // source_broken needs no second code path; the source title is its name
+    // and the stored last error is the auto-pause reason.
+    if (kind === "guidance") {
+      const g = await collections.guidanceSources.get();
+      return g.docs.map((d) => {
+        const data = d.data() as Record<string, unknown>;
+        return {
+          id: d.id,
+          name: typeof data.title === "string" && data.title ? data.title : d.id,
+          status: data.status === "failing" ? "broken" : (data.status as string | undefined),
+          consecutiveFailures: typeof data.consecutiveFailures === "number" ? data.consecutiveFailures : 0,
+          autoPausedReason:
+            (typeof data.autoPausedReason === "string" && data.autoPausedReason) ||
+            (typeof data.lastError === "string" ? data.lastError : null),
+        } as NewsSourceFacts;
+      });
+    }
     const snap = await (kind === "visa" ? collections.visaSources : collections.newsSources).get();
     return snap.docs.map((d) => ({ ...(d.data() as Record<string, unknown>), id: d.id }) as VisaSourceFacts | NewsSourceFacts);
   }

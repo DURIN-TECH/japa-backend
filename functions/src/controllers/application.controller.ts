@@ -14,6 +14,7 @@ import { checkWithinLimit, paymentRequired } from "../middleware/authz";
 // same agency, decided by the CASL ability on `req.ability`. See utils/access.ts.
 import { checkApplicationAccessForRequest } from "../utils/access";
 import { complianceService } from "../services/compliance.service";
+import { intakeService, IntakeValidationError } from "../services/intake.service";
 import { LIMITS, ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -533,6 +534,68 @@ export class ApplicationController {
   }
 
   /**
+   * GET /applications/:id/intake  (issue #113)
+   * The route's intake questions (from the approved rubric), the saved
+   * answers and which required questions are still open. `available: false`
+   * when the route has no approved intake. Needs `read` access.
+   */
+  async getIntake(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "read")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      sendSuccess(res, await intakeService.getIntake(application));
+    } catch (error) {
+      console.error("Error getting application intake:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /applications/:id/intake  (issue #113)
+   * Save the applicant's answers (body: `{ answers: { [questionId]: value } }`).
+   * Needs `update` access (a same-agency agent colleague or a lapsed plan can
+   * read but not write). 409 NOT_EDITABLE once the application is past
+   * `pending_documents`; 400 with the question named when an answer is bad.
+   */
+  async saveIntake(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "update")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      sendSuccess(res, await intakeService.saveIntake(application, req.body?.answers));
+    } catch (error) {
+      if (error instanceof IntakeValidationError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      if (error instanceof Error && error.message === "NOT_EDITABLE") {
+        sendError(res, "NOT_EDITABLE", "This application has been submitted, so these answers can't be changed.", 409);
+        return;
+      }
+      if (error instanceof Error && error.message === "NO_INTAKE") {
+        sendError(res, "NOT_FOUND", "This application has no intake questions", 404);
+        return;
+      }
+      // Never log the answers: they are personal data.
+      console.error("Error saving application intake:", error instanceof Error ? error.message : "unknown");
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * PUT /applications/:id
    * Update an application.
    * Owner can update userNotes. Agent/owner can update agentNotes.
@@ -593,6 +656,12 @@ export class ApplicationController {
       // assigned such a case. Admins bypass; the applicant editing their own
       // notes is unaffected (no assignment change).
       const isAdmin = req.user?.admin === true || req.authz?.role === "admin";
+      // A non-admin may place a case only in their OWN agency (the resolved
+      // principal's), never in one named freely in the request (issue #138).
+      if (!isAdmin && updates.agencyId !== undefined && updates.agencyId !== req.authz?.agencyId) {
+        sendError(res, "FORBIDDEN", "You can only assign a case to your own agency", 403);
+        return;
+      }
       const isAssigning =
         updates.agencyId !== undefined ||
         updates.agentId !== undefined ||

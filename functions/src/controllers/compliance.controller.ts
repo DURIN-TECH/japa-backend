@@ -11,7 +11,7 @@ import { storageService } from "../services/storage.service";
 import { notificationService } from "../services/notification.service";
 import { claimsService } from "../services/claims.service";
 import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
-import { validateStoragePath } from "../utils/storage-paths";
+import { COMPLIANCE_DOCUMENT_SLOTS, validateStoragePath } from "../utils/storage-paths";
 
 // Content types accepted for compliance documents. Kept aligned with the agent
 // verification flow (PDF + common image formats).
@@ -24,11 +24,10 @@ const ALLOWED_CONTENT_TYPES = [
 
 // The document slots an owner may upload to. Validated on the way in so a
 // client can't invent an arbitrary storage prefix.
-const VALID_SLOTS: ComplianceDocumentSlot[] = [
-  "idDocument",
-  "proofOfAddress",
-  "cacDocument",
-];
+// One list, shared with the storage-path validator (utils/storage-paths.ts),
+// so the slots an upload URL is issued for and the slots a stored path is
+// accepted for can never drift apart.
+const VALID_SLOTS = COMPLIANCE_DOCUMENT_SLOTS as readonly ComplianceDocumentSlot[];
 
 /**
  * Controller for the agency compliance (KYC/KYB/payout) flow.
@@ -42,8 +41,10 @@ export class ComplianceController {
    * compliance is strictly an owner action.
    */
   private async requireOwnedAgency(req: AuthenticatedRequest, res: Response) {
-    const userId = req.userId!;
-    const agency = await agencyService.getAgencyByOwnerId(userId);
+    // Resolved principal + the agency's own record (issue #138): an agency
+    // document that merely names the caller is not enough to edit a
+    // compliance file.
+    const agency = await agencyService.getOwnedAgencyForPrincipal(req.authz);
     if (!agency) {
       sendError(res, "FORBIDDEN", "Only agency owners can manage compliance", 403);
       return null;

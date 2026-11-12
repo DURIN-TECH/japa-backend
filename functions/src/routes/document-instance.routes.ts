@@ -36,13 +36,19 @@ router.get("/shared/:id", verifyAuth, (req, res) =>
   documentInstanceController.getShared(req, res)
 );
 
+// The next four routes (list, create, get-one, save) are open to authenticated
+// APPLICANTS as well as agent-side users: `verifyAgent` is intentionally absent
+// and the controller branches on the caller. An applicant is held to their own
+// statement only (#43); agent-side behaviour is unchanged. Link, share, delete
+// and versions below stay agent-only.
+
 // GET /document-instances — list (scoped by role / applicationId)
-router.get("/", verifyAuth, verifyAgent, (req, res) =>
+router.get("/", verifyAuth, (req, res) =>
   documentInstanceController.list(req, res)
 );
 
 // POST /document-instances — clone a template into an editable instance
-router.post("/", verifyAuth, verifyAgent, (req, res) =>
+router.post("/", verifyAuth, (req, res) =>
   documentInstanceController.clone(req, res)
 );
 
@@ -52,12 +58,12 @@ router.get("/:id/versions", verifyAuth, verifyAgent, (req, res) =>
 );
 
 // GET /document-instances/:id — one instance (with content)
-router.get("/:id", verifyAuth, verifyAgent, (req, res) =>
+router.get("/:id", verifyAuth, (req, res) =>
   documentInstanceController.getOne(req, res)
 );
 
 // PUT /document-instances/:id — save (optimistic concurrency)
-router.put("/:id", verifyAuth, verifyAgent, (req, res) =>
+router.put("/:id", verifyAuth, (req, res) =>
   documentInstanceController.save(req, res)
 );
 

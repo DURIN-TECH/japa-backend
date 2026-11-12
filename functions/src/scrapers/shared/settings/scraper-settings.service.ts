@@ -1,7 +1,7 @@
 import { FieldValue, Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db } from "../../../utils/firebase";
 import { toJson } from "../runs/scrape-run.service";
-import type { ScrapeRunKind } from "../runs/types";
+import type { ScraperSettingsKind } from "../runs/types";
 import {
   LLM_PRICING_DOC_ID,
   SCRAPE_BUDGET_DOC_ID,
@@ -60,7 +60,7 @@ export class InvalidHistoryCursorError extends Error {
 
 /** Thrown when the source of a per-source edit does not exist (-> 404). */
 export class SourceNotFoundError extends Error {
-  constructor(kind: ScrapeRunKind, id: string) {
+  constructor(kind: ScraperSettingsKind, id: string) {
     super(`${kind} source ${id} not found`);
   }
 }
@@ -345,7 +345,7 @@ export class ScraperSettingsService {
    *  - clearHostBackoffs (visa): hostBackoffs [].
    */
   async updateSource(
-    kind: ScrapeRunKind,
+    kind: ScraperSettingsKind,
     id: string,
     patch: ParsedSourcePatch,
     uid: string,

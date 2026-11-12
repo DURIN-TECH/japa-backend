@@ -69,7 +69,11 @@ export const SCRAPE_ALERT_STATUSES: readonly ScrapeAlertStatus[] = ["open", "ack
  *  - budget_hard_stop (issue #96): a visa run skipped LLM extraction because
  *    the monthly budget was spent and the hard stop is on;
  *  - settings_unreadable (issue #96 review): appConfig/scraperSettings could
- *    not be read, so scheduled ticks are skipped (they fail closed).
+ *    not be read, so scheduled ticks are skipped (they fail closed);
+ *  - infrastructure_error (issue #143): a guidance run could not store its
+ *    results (`summary.infrastructureErrors` non-empty: Cloud Storage or
+ *    Firestore failed on OUR side). One alert per scraper, bumped by each
+ *    run with the problem, resolved by the next run without it.
  */
 export type ScrapeAlertRule =
   | "run_failed"
@@ -83,7 +87,8 @@ export type ScrapeAlertRule =
   | "llm_budget"
   | "review_queue_stale"
   | "budget_hard_stop"
-  | "settings_unreadable";
+  | "settings_unreadable"
+  | "infrastructure_error";
 
 /** Every rule id (config validation, docs). */
 export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
@@ -99,11 +104,12 @@ export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
   "review_queue_stale",
   "budget_hard_stop",
   "settings_unreadable",
+  "infrastructure_error",
 ];
 
 /**
  * What an alert is about (#84 links it):
- *  - scraper: a whole scraper, id = "visa" | "news";
+ *  - scraper: a whole scraper, id = "visa" | "news" | "guidance";
  *  - run: one scrapeRuns doc, id = run id;
  *  - source: a visa source (id = country code) or news source (id = doc id);
  *    the alert's `kind` says which;

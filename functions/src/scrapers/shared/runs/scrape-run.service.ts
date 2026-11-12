@@ -5,6 +5,7 @@ import {
   ScrapeRunDoc,
   ScrapeRunError,
   ScrapeRunKind,
+  ScraperSettingsKind,
   ScrapeRunPageEntry,
   ScrapeRunSourceEntry,
   ScrapeRunStatus,
@@ -432,7 +433,7 @@ function utcDay(ms: number): string {
 
 /** One source's health, normalised across kinds (GET /admin/scrape-sources). */
 export interface ScrapeSourceHealth {
-  kind: ScrapeRunKind;
+  kind: ScraperSettingsKind; // visa | news (guidance health lives in /admin/guidance-sources)
   sourceId: string;
   name: string;
   countryCodes: string[];
@@ -469,7 +470,7 @@ export interface ScrapeSourceHealth {
 }
 
 /** Per-kind failure limits passed to the row builders. */
-type FailureLimits = Record<ScrapeRunKind, number>;
+type FailureLimits = Record<ScraperSettingsKind, number>;
 
 /** Read the limits in force (settings read never throws: defaults on error). */
 async function loadFailureLimits(): Promise<FailureLimits> {
@@ -744,7 +745,7 @@ export class ScrapeRunService {
   }
 
   /** Per-source health for one kind, or both when `kind` is omitted. */
-  async listSourceHealth(kind: ScrapeRunKind | undefined, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth[]> {
+  async listSourceHealth(kind: ScraperSettingsKind | undefined, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth[]> {
     const out: ScrapeSourceHealth[] = [];
     // Issue #107: one settings read for the limit shown on every row.
     const limits = await loadFailureLimits();
@@ -763,7 +764,7 @@ export class ScrapeRunService {
    * Issue #96: the health row of ONE source (after an admin edit), or null
    * when the doc does not exist. One read.
    */
-  async getSourceHealth(kind: ScrapeRunKind, id: string, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth | null> {
+  async getSourceHealth(kind: ScraperSettingsKind, id: string, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth | null> {
     const snap = await (kind === "visa" ? collections.visaSources : collections.newsSources).doc(id).get();
     if (!snap.exists) return null;
     const limits = await loadFailureLimits();

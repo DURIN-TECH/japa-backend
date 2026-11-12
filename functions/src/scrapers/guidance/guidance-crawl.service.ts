@@ -13,8 +13,22 @@ import { DEFAULT_PDF_LIMITS, isPdfFetchError } from "../shared/fetch/pdf-text";
 import { describeError } from "../shared/fetch/redact";
 import { HostBackoffTracker, backoffMessage, hostOf, isHostBackoffError } from "../shared/etiquette/visa-crawl-host-state";
 // Failure streak -> auto-pause rules shared with the visa and news crawlers.
-import { DEFAULT_CONSECUTIVE_FAILURE_LIMIT, nextSourceHealth, type NextSourceHealth } from "../shared/runs/source-health";
-import { extractPublishedDate } from "./guidance-published-date";
+import {
+  DEFAULT_CONSECUTIVE_FAILURE_LIMIT,
+  DEFAULT_CONSECUTIVE_INFRA_ERROR_LIMIT,
+  DEFAULT_INFRA_BACKOFF_MS,
+  nextSourceHealth,
+  type NextSourceHealth,
+} from "../shared/runs/source-health";
+// Issue #143: run records, per-source crawl leases (the same shared modules
+// the visa crawler uses; the guidance crawl has no run / lease code of its
+// own). They are only USED at call time, never at module load (see the
+// import-cycle note on `fetcher` below).
+import { scrapeRunService, type ScrapeRunService } from "../shared/runs/scrape-run.service";
+import type { ScrapeRunRecorder } from "../shared/runs/scrape-run.service";
+import { leaseHeldReason, sourceLeaseService, type SourceLeaseService } from "../shared/runs/source-lease";
+import type { ScrapeRunSourceStatus, ScrapeRunTrigger } from "../shared/runs/types";
+import { extractPublishedDate, publishedDateSelectorProblem } from "./guidance-published-date";
 import { GuidanceResolveError, linkPatternHost, resolveDocumentUrl } from "./guidance-resolve";
 import { GUIDANCE_SOURCE_ID_RE, guidanceSnapshotStore, type GuidanceSnapshotStore } from "./guidance-snapshot.store";
 import type { GuidanceSnapshotMeta, GuidanceSource, GuidanceSourceStatus } from "./types";
@@ -51,11 +65,20 @@ import type { GuidanceSnapshotMeta, GuidanceSource, GuidanceSourceStatus } from 
 //  - send anything to a model, or log document text. A fetched document is
 //    untrusted data; this module only stores and hashes it.
 //
-// Not here (follow-ups): a scheduled function, run records in `scrapeRuns`
-// and per-source crawl leases. Those are typed to the "visa" | "news" scraper
-// kinds today; two overlapping guidance runs are still safe (snapshots are
-// keyed by hash and created only if absent, and every source write is a
-// transaction), they would merely fetch a source twice.
+// Scheduling and records (issue #143): `crawlGuidanceOrchestrator`
+// (functions/src/index.ts) calls `runOrchestrator()` once a night. A tick with
+// no eligible source returns before anything is recorded (no run doc, no
+// alert, one log line). Otherwise the run is a `scrapeRuns` doc of kind
+// "guidance", and each source is crawled under its own lease
+// (`scrapeSourceLeases/guidance__<sourceId>`), so a tick and an admin retry
+// never crawl one source at once. Overlap is also safe by construction:
+// snapshots are keyed by hash and created only if absent, and every source
+// write is a transaction.
+//
+// Infrastructure errors are capped (issue #143): a source that ends
+// `infra_error` on N runs in a row is not requested again until a backoff
+// passes or an admin retries it by id. The cap counts on the source doc and
+// never touches the failure streak or the status.
 
 /**
  * Longest cleaned text accepted from a web page, in characters: the same
@@ -116,6 +139,8 @@ export type GuidanceSourceOutcome =
   | "deferred" // its host is backing off; not requested
   | "skipped_unverified" // verificationStatus "unverified": never fetched
   | "skipped_inactive" // paused / retired, or failing and not asked for by id
+  | "skipped_infra_backoff" // N infrastructure errors in a row: left alone until the backoff passes (#143)
+  | "lease_held" // another run holds this source's crawl lease; not crawled (#143)
   | "not_due"; // checked recently enough
 
 /** One source's line in the run summary. */
@@ -151,6 +176,10 @@ export interface GuidanceCrawlSummary {
   deferred: number;
   notDue: number;
   skippedInactive: number;
+  // Sources left alone because of the infrastructure-error cap (#143).
+  skippedInfraBackoff: number;
+  // Sources not crawled because another run held their lease (#143).
+  leaseHeld: number;
   // Downstream work actually done: all three stay 0 when nothing changed.
   snapshotsWritten: number; // snapshot docs created in Firestore
   storageObjectsWritten: number; // text objects created in Cloud Storage
@@ -197,6 +226,45 @@ export interface GuidanceCrawlOptions {
   // the hook the rubric extraction (#40) attaches to. It is never called for
   // an unchanged source. A listener that throws is recorded as a warning.
   onChanged?: (event: GuidanceChangeEvent) => Promise<void> | void;
+  // ---- Issue #143: run records, leases and the infrastructure-error cap ----
+  // What started the run (stored on the run doc): "scheduled" for the
+  // nightly function, "manual" for the admin retry endpoint, "script" for the
+  // CLI (script runs never raise alerts). Default "scheduled".
+  trigger?: ScrapeRunTrigger;
+  // The run recorder / lease services (tests inject fakes; default: the
+  // shared Firestore-backed singletons).
+  runs?: ScrapeRunService;
+  leases?: SourceLeaseService;
+  // Consecutive infrastructure-error runs after which a source is backed off,
+  // and for how long (ms). Defaults: the constants in shared/runs/source-health.ts.
+  infraErrorLimit?: number;
+  infraBackoffMs?: number;
+}
+
+/**
+ * What a source's registry entry says about this run, BEFORE anything is
+ * requested. One function decides it for both the up-front "is anything
+ * eligible?" scan and the per-source handling, so the two can never disagree.
+ */
+type Gate =
+  | { verdict: "crawl" }
+  | { verdict: "invalid" } // hand-edited / malformed entry
+  | { verdict: "unverified" }
+  | { verdict: "inactive"; status: string }
+  | { verdict: "not_due" }
+  | { verdict: "infra_backoff"; untilMs: number };
+
+/** The per-run values `processSource` needs. */
+interface SourceRunContext {
+  now: Timestamp;
+  failureLimit: number;
+  summary: GuidanceCrawlSummary;
+  // True when the run named its sources (`sourceIds`).
+  explicit: boolean;
+  hostState: HostBackoffTracker;
+  onChanged?: GuidanceCrawlOptions["onChanged"];
+  infraErrorLimit: number;
+  infraBackoffMs: number;
 }
 
 /**
@@ -272,6 +340,8 @@ function emptySummary(): GuidanceCrawlSummary {
     deferred: 0,
     notDue: 0,
     skippedInactive: 0,
+    skippedInfraBackoff: 0,
+    leaseHeld: 0,
     snapshotsWritten: 0,
     storageObjectsWritten: 0,
     downstreamCalls: 0,
@@ -282,6 +352,21 @@ function emptySummary(): GuidanceCrawlSummary {
     warnings: [],
     results: [],
   };
+}
+
+/**
+ * The summary as stored on the run doc: every counter and id list verbatim
+ * (changed, unchanged, failed, infraErrors, deferred, notDue, skippedInactive,
+ * snapshotsWritten, storageObjectsWritten, skippedUnverified, newlyFailing,
+ * failing, infrastructureErrors, ...), WITHOUT the two bulky free-text
+ * members: the per-source `results` become the run's source lines and the
+ * `warnings` become the run's warnings (see runOrchestrator).
+ */
+function storedSummary(summary: GuidanceCrawlSummary): Record<string, unknown> {
+  const { results: _results, warnings: _warnings, ...counters } = summary;
+  void _results;
+  void _warnings;
+  return counters;
 }
 
 export class GuidanceCrawlService {
@@ -313,12 +398,25 @@ export class GuidanceCrawlService {
 
   /**
    * Crawl every due source once. Never throws for a per-source problem; it
-   * only rejects when the registry itself cannot be read.
+   * only rejects when the registry itself cannot be read (or the run record
+   * machinery throws unexpectedly, which fails the run record and rethrows).
+   *
+   * Issue #143 flow:
+   *  1. read the registry and decide, per source, whether it would be
+   *     requested (`gate`);
+   *  2. NOTHING eligible -> handle the skips (counters only, no network),
+   *     log one line and return: no run doc, no alert;
+   *  3. otherwise start a `scrapeRuns` doc (kind "guidance"), and crawl each
+   *     eligible source under its lease, one at a time. A source whose lease
+   *     another run holds is reported `lease_held`, not crawled;
+   *  4. finalise the run record; the shared finalize hook then evaluates the
+   *     alert rules (it never throws).
    */
   async runOrchestrator(opts: GuidanceCrawlOptions = {}): Promise<GuidanceCrawlSummary> {
     const now = opts.now ?? Timestamp.now();
     const nowMs = now.toMillis();
     const failureLimit = opts.failureLimit ?? DEFAULT_CONSECUTIVE_FAILURE_LIMIT;
+    const trigger: ScrapeRunTrigger = opts.trigger ?? "scheduled";
     const summary = emptySummary();
     const explicit = opts.sourceIds ? new Set(opts.sourceIds) : undefined;
 
@@ -339,23 +437,87 @@ export class GuidanceCrawlService {
 
     // Hosts that answered 429/503 in THIS run: not requested again in it.
     const hostState = new HostBackoffTracker(nowMs);
+    const ctx: SourceRunContext = {
+      now,
+      failureLimit,
+      summary,
+      explicit: !!explicit,
+      hostState,
+      onChanged: opts.onChanged,
+      infraErrorLimit: opts.infraErrorLimit ?? DEFAULT_CONSECUTIVE_INFRA_ERROR_LIMIT,
+      infraBackoffMs: opts.infraBackoffMs ?? DEFAULT_INFRA_BACKOFF_MS,
+    };
 
-    for (const doc of docs) {
-      summary.sourcesConsidered++;
-      // Safety net: whatever goes wrong while handling ONE source (a
-      // hand-edited doc with a field of the wrong type, a write that fails)
-      // becomes a line in the summary; the run goes on to the next source.
-      try {
-        await this.processSource(doc, { now, failureLimit, summary, explicit: !!explicit, hostState, onChanged: opts.onChanged });
-      } catch (err) {
-        summary.warnings.push(`source ${doc.id}: skipped after an unexpected error: ${describeError(err).slice(0, MAX_STORED_ERROR_CHARS)}`);
+    // ---- 1. Which sources will actually be requested? ----
+    // `d.data()` can throw for a hand-edited / corrupt doc; such a doc is
+    // never eligible here and is reported by processSafely() below instead.
+    const eligible = new Set(
+      docs
+        .filter((d) => {
+          try {
+            return this.gate(d.id, (d.data() ?? {}) as GuidanceSource, ctx.explicit, nowMs).verdict === "crawl";
+          } catch {
+            return false;
+          }
+        })
+        .map((d) => d.id)
+    );
+
+    // ---- 2. Nothing eligible: no run doc, no alert (the visa precedent) ----
+    // An empty or all-inactive registry, or a tick where every source was
+    // crawled recently, ends here. The skips are still counted (no request
+    // is made for any of them), so the summary the caller sees is complete.
+    if (eligible.size === 0) {
+      for (const doc of docs) {
+        summary.sourcesConsidered++;
+        await this.processSafely(doc, ctx);
       }
+      console.log(
+        `Guidance crawl: no source is due (${summary.sourcesConsidered} in the registry, ${summary.notDue} not due, ` +
+          `${summary.skippedInactive} inactive or failing, ${summary.skippedInfraBackoff} in infrastructure backoff, ` +
+          `${summary.skippedUnverified.length} unverified); no run recorded`
+      );
+      return summary;
+    }
+
+    // ---- 3. Start the run record (never throws: a failed write detaches it) ----
+    const runs = opts.runs ?? scrapeRunService;
+    const leases = opts.leases ?? sourceLeaseService;
+    const recorder = await runs.start({
+      kind: "guidance",
+      trigger,
+      startedAtMs: nowMs,
+      options: {
+        sourcesDue: eligible.size,
+        // An admin retry names its source; a nightly tick has no such knob.
+        sourceId: explicit && explicit.size === 1 ? [...explicit][0] : undefined,
+        byId: explicit ? true : undefined,
+      },
+    });
+    console.log(`Guidance crawl: run ${recorder.id} started (${eligible.size} source(s) eligible, trigger ${trigger})`);
+
+    try {
+      for (const doc of docs) {
+        summary.sourcesConsidered++;
+        // Not eligible: counted, never requested, no lease needed.
+        if (!eligible.has(doc.id)) {
+          await this.processSafely(doc, ctx);
+          continue;
+        }
+        const title = typeof (doc.data() as Partial<GuidanceSource>)?.title === "string" ? (doc.data() as GuidanceSource).title : doc.id;
+        await this.crawlUnderLease(doc, title, ctx, { leases, recorder, trigger });
+      }
+    } catch (err) {
+      // An unexpected throw aborts the run: record it as failed with what was
+      // counted so far, then rethrow so the scheduled function logs it.
+      await recorder.fail(err, storedSummary(summary));
+      throw err;
     }
 
     console.log(
       `Guidance crawl: ${summary.sourcesConsidered} source(s), ${summary.changed} changed, ` +
         `${summary.unchanged} unchanged, ${summary.failed} failed, ${summary.infraErrors} infrastructure error(s), ` +
-        `${summary.deferred} deferred, ` +
+        `${summary.deferred} deferred, ${summary.leaseHeld} lease held, ${summary.skippedInfraBackoff} in infrastructure backoff, ` +
         `${summary.skippedUnverified.length} unverified skipped`
     );
     if (summary.skippedUnverified.length > 0) {
@@ -364,7 +526,145 @@ export class GuidanceCrawlService {
     if (summary.failing.length > 0) {
       console.error(`Guidance crawl: failing source(s): ${summary.failing.join(", ")}`);
     }
+
+    // ---- 4. Finalise the run record ----
+    // Warnings (a refused date selector, a listener that threw, ...) are
+    // run-level warnings: they never change `errorCount` or the status.
+    for (const w of summary.warnings) recorder.recordWarning(w);
+    // "Something worked" = at least one document was fetched (the shared
+    // derivation: no errors -> succeeded; errors but a fetch -> partial;
+    // errors and no fetch -> failed).
+    await recorder.finalize({ summary: storedSummary(summary), anySuccess: summary.sourcesFetched > 0 });
     return summary;
+  }
+
+  /**
+   * Take one source's crawl lease, re-read the doc under it, crawl, record the
+   * source on the run, and release the lease (also when the crawl threw).
+   */
+  private async crawlUnderLease(
+    doc: { id: string; data(): unknown; ref: { update(data: Record<string, unknown>): Promise<unknown>; get(): Promise<{ id: string; exists: boolean; data(): unknown; ref: { update(data: Record<string, unknown>): Promise<unknown> } }> } },
+    title: string,
+    ctx: SourceRunContext,
+    deps: { leases: SourceLeaseService; recorder: ScrapeRunRecorder; trigger: ScrapeRunTrigger }
+  ): Promise<void> {
+    const { summary } = ctx;
+    const sourceId = doc.id;
+    const before = summary.results.length;
+
+    // A lease that cannot be taken (Firestore error) is OUR failure: reported
+    // as an infrastructure error for the source, never against its streak.
+    let lease;
+    try {
+      lease = await deps.leases.acquire("guidance", sourceId, { trigger: deps.trigger, runId: deps.recorder.id });
+    } catch (err) {
+      const error = this.noteInfraError(summary, sourceId, "firestore_error", `could not take the crawl lease: ${describeError(err)}`);
+      summary.infraErrors++;
+      summary.results.push({ sourceId, outcome: "infra_error", error, errorKind: "firestore_error" });
+      this.recordOnRun(deps.recorder, sourceId, title, summary.results.slice(before));
+      return;
+    }
+    // Another run is crawling it: not an error, just not this run's job.
+    if (!lease.ok) {
+      summary.leaseHeld++;
+      summary.results.push({ sourceId, outcome: "lease_held", error: leaseHeldReason(lease) });
+      this.recordOnRun(deps.recorder, sourceId, title, summary.results.slice(before));
+      return;
+    }
+
+    try {
+      // The lease is held: crawl this source. We deliberately use the doc as
+      // it was read at the start of the run (carrying its ref, so a test that
+      // swaps the ref's update still sees the failure) rather than re-reading
+      // it here; the gate was already applied to decide eligibility, and a
+      // source another run crawled in the meantime is simply `not_due` on the
+      // next tick.
+      await this.processSafely(doc, ctx);
+    } finally {
+      await deps.leases.release(lease);
+    }
+    this.recordOnRun(deps.recorder, sourceId, title, summary.results.slice(before));
+  }
+
+  /**
+   * Put one source's result line(s) on the run record: the source line, and
+   * one error per failed / infrastructure-error outcome (redacted by the
+   * recorder). `deferred` covers every "not requested" outcome.
+   */
+  private recordOnRun(
+    recorder: ScrapeRunRecorder,
+    sourceId: string,
+    title: string,
+    results: GuidanceSourceResult[]
+  ): void {
+    for (const r of results) {
+      const status: ScrapeRunSourceStatus =
+        r.outcome === "changed" || r.outcome === "unchanged"
+          ? "succeeded"
+          : r.outcome === "failed" || r.outcome === "infra_error"
+            ? "failed"
+            : "deferred";
+      const isError = r.outcome === "failed" || r.outcome === "infra_error";
+      recorder.recordSource({
+        sourceId,
+        name: title,
+        status,
+        pagesAttempted: status === "deferred" ? 0 : 1,
+        pagesFetched: status === "succeeded" ? 1 : 0,
+        errors: isError ? 1 : 0,
+        counts: r.outcome === "changed" ? { changed: 1 } : r.outcome === "unchanged" ? { unchanged: 1 } : undefined,
+        error: r.error,
+      });
+      if (isError) recorder.recordError({ sourceId, error: r.error ?? r.outcome });
+    }
+  }
+
+  /**
+   * `processSource` with the per-source safety net: whatever goes wrong while
+   * handling ONE source (a hand-edited doc with a field of the wrong type, a
+   * write that fails) becomes a warning line in the summary; the run goes on
+   * to the next source.
+   */
+  private async processSafely(
+    doc: { id: string; data(): unknown; ref: { update(data: Record<string, unknown>): Promise<unknown> } },
+    ctx: SourceRunContext
+  ): Promise<void> {
+    try {
+      await this.processSource(doc, ctx);
+    } catch (err) {
+      ctx.summary.warnings.push(`source ${doc.id}: skipped after an unexpected error: ${describeError(err).slice(0, MAX_STORED_ERROR_CHARS)}`);
+    }
+  }
+
+  /**
+   * The registry entry's verdict for this run (see Gate). Pure: no writes, no
+   * requests. Order matters and is the order the crawl has always applied:
+   * well-formed, verified, status, due, then the infrastructure-error cap.
+   */
+  private gate(sourceId: string, source: GuidanceSource, explicit: boolean, nowMs: number): Gate {
+    // A malformed entry (hand-edited doc) is reported, never requested.
+    if (!GUIDANCE_SOURCE_ID_RE.test(sourceId) || typeof source.url !== "string" || !source.url) return { verdict: "invalid" };
+    // Verification: ONLY a source marked exactly `verified` or `partial` is
+    // fetched. `unverified` is skipped and reported, and so is anything else
+    // (a missing or misspelt value). This holds even when asked for by id.
+    if (!CRAWLABLE_VERIFICATION_STATUSES.includes(source.verificationStatus as string)) return { verdict: "unverified" };
+    // Paused / retired: never crawled. Failing: only when asked for by id.
+    const status = source.status ?? "active";
+    if (status === "paused" || status === "retired" || (status === "failing" && !explicit)) return { verdict: "inactive", status };
+    if (!explicit) {
+      // Due: one attempt per `checkIntervalHours`, counted from the last
+      // attempt (successful or not) so a broken source is not retried on
+      // every tick. Skipped for an explicit run. Both stamps are written
+      // from the RUN's clock (`now`), the same clock compared against here.
+      const lastMs = Math.max(millisOf(source.lastFetchedAt), millisOf(source.lastAttemptAt));
+      const intervalMs = Math.max(1, Number(source.checkIntervalHours) || 24) * 60 * 60 * 1000;
+      if (lastMs > 0 && nowMs < lastMs + intervalMs) return { verdict: "not_due" };
+      // Infrastructure-error cap (#143): left alone until the backoff passes.
+      // An explicit run (an admin retrying by id) ignores it.
+      const infraUntilMs = millisOf(source.infraBackoffUntil);
+      if (infraUntilMs > nowMs) return { verdict: "infra_backoff", untilMs: infraUntilMs };
+    }
+    return { verdict: "crawl" };
   }
 
   /**
@@ -373,34 +673,25 @@ export class GuidanceCrawlService {
    */
   private async processSource(
     doc: { id: string; data(): unknown; ref: { update(data: Record<string, unknown>): Promise<unknown> } },
-    ctx: {
-      now: Timestamp;
-      failureLimit: number;
-      summary: GuidanceCrawlSummary;
-      // True when the run named its sources (`sourceIds`).
-      explicit: boolean;
-      hostState: HostBackoffTracker;
-      onChanged?: GuidanceCrawlOptions["onChanged"];
-    }
+    ctx: SourceRunContext
   ): Promise<void> {
     const { now, failureLimit, summary, explicit, hostState } = ctx;
     const nowMs = now.toMillis();
     const source = (doc.data() ?? {}) as GuidanceSource;
     const sourceId = doc.id;
 
-    // A malformed entry (hand-edited doc) is reported, never requested.
-    if (!GUIDANCE_SOURCE_ID_RE.test(sourceId) || typeof source.url !== "string" || !source.url) {
+    // The gate (see `gate`) decides whether the source is requested at all;
+    // every "no" is counted and reported here.
+    const verdict = this.gate(sourceId, source, explicit, nowMs);
+    switch (verdict.verdict) {
+    case "invalid":
       summary.warnings.push(`source ${sourceId}: not a valid registry entry, skipped`);
       summary.skippedInactive++;
       summary.results.push({ sourceId, outcome: "skipped_inactive" });
       return;
-    }
-    // Verification: ONLY a source marked exactly `verified` or `partial` is
-    // fetched. `unverified` is skipped and reported, and so is anything else
-    // (a missing or misspelt value): the admin list shows such an entry as
-    // "unverified", and the crawl must not treat it as better than that.
-    // This holds even when the source is asked for by id.
-    if (!CRAWLABLE_VERIFICATION_STATUSES.includes(source.verificationStatus as string)) {
+    case "unverified":
+      // An unknown value is reported: the admin list shows such an entry
+      // as "unverified", and the crawl must not treat it as better.
       if (source.verificationStatus !== "unverified") {
         summary.warnings.push(
           `source ${sourceId}: verificationStatus ${JSON.stringify(source.verificationStatus ?? null)} is not a known value, treated as unverified`
@@ -409,27 +700,27 @@ export class GuidanceCrawlService {
       summary.skippedUnverified.push(sourceId);
       summary.results.push({ sourceId, outcome: "skipped_unverified" });
       return;
-    }
-    // Paused / retired: never crawled. Failing: only when asked for by id.
-    const status = source.status ?? "active";
-    if (status === "paused" || status === "retired" || (status === "failing" && !explicit)) {
+    case "inactive":
       summary.skippedInactive++;
-      if (status === "failing") summary.failing.push(sourceId);
-      summary.results.push({ sourceId, outcome: "skipped_inactive", status });
+      if (verdict.status === "failing") summary.failing.push(sourceId);
+      summary.results.push({ sourceId, outcome: "skipped_inactive", status: verdict.status as GuidanceSourceStatus });
+      return;
+    case "not_due":
+      summary.notDue++;
+      summary.results.push({ sourceId, outcome: "not_due" });
+      return;
+    case "infra_backoff": {
+      // N runs in a row ended in an infrastructure error: not requested
+      // until the backoff passes (or an admin retries it by id). The source
+      // stays `active` with its failure streak untouched.
+      const streak = typeof source.consecutiveInfraErrors === "number" ? source.consecutiveInfraErrors : 0;
+      const error = `infrastructure backoff: ${streak} consecutive run(s) ended in an infrastructure error; not requested until ${new Date(verdict.untilMs).toISOString()} (an admin retry by id ignores this)`;
+      summary.skippedInfraBackoff++;
+      summary.results.push({ sourceId, outcome: "skipped_infra_backoff", error, status: (source.status ?? "active") as GuidanceSourceStatus });
       return;
     }
-    // Due: one attempt per `checkIntervalHours`, counted from the last
-    // attempt (successful or not) so a broken source is not retried on
-    // every tick. Skipped for an explicit run. Both stamps are written from
-    // the RUN's clock (`now`), the same clock compared against here.
-    if (!explicit) {
-      const lastMs = Math.max(millisOf(source.lastFetchedAt), millisOf(source.lastAttemptAt));
-      const intervalMs = Math.max(1, Number(source.checkIntervalHours) || 24) * 60 * 60 * 1000;
-      if (lastMs > 0 && nowMs < lastMs + intervalMs) {
-        summary.notDue++;
-        summary.results.push({ sourceId, outcome: "not_due" });
-        return;
-      }
+    case "crawl":
+      break;
     }
     // Host backing off: a stored `backoffUntil` from an earlier run, or a
     // 429/503 another source on the same host got a moment ago.
@@ -470,12 +761,16 @@ export class GuidanceCrawlService {
       await this.crawlSource(sourceId, source, { now, failureLimit, summary, onChanged: ctx.onChanged });
     } catch (err) {
       // Our own infrastructure failed: a run-level error, not the source's
-      // fault. The source doc is left exactly as it was (no streak, no
-      // attempt stamp), so the next run tries it again.
+      // fault. The failure streak and status are left exactly as they were
+      // (and no attempt stamp is written), so the next run tries it again,
+      // UNLESS the infrastructure-error cap engages (issue #143): the source
+      // doc keeps its own infra counter, and after N runs in a row it is
+      // backed off (see recordInfraError).
       if (err instanceof GuidanceInfraError) {
         const error = this.noteInfraError(summary, sourceId, err.kind, err.message);
         summary.infraErrors++;
         summary.results.push({ sourceId, outcome: "infra_error", error, errorKind: err.kind });
+        await this.recordInfraError(sourceId, error, ctx);
         return;
       }
       // A 429/503: stop requesting this host for the rest of the run.
@@ -485,6 +780,53 @@ export class GuidanceCrawlService {
         if (err.requestedHost !== err.host) hostState.record({ ...err.toEntry(nowMs), host: err.requestedHost });
       }
       await this.recordFailure(sourceId, err, { now, failureLimit, summary });
+    }
+  }
+
+  /**
+   * Count an infrastructure error on the SOURCE doc (issue #143):
+   * `consecutiveInfraErrors` + 1, the (redacted, capped) error and its time
+   * for the admin list, and once the streak reaches the cap
+   * `infraBackoffUntil` = now + the backoff. It never touches
+   * `consecutiveFailures`, `status` or the auto-pause flags: an outage on our
+   * side must not turn a source `failing`.
+   *
+   * Best effort: if this write fails too (Firestore is the outage) the run
+   * says so as one more infrastructure-error line, and the source is simply
+   * tried again next run. Never throws.
+   */
+  private async recordInfraError(sourceId: string, error: string, ctx: SourceRunContext): Promise<void> {
+    const { now, summary } = ctx;
+    try {
+      const sourceRef = collections.guidanceSources.doc(sourceId);
+      const result = await this.runTransaction(async (tx) => {
+        const fresh = await tx.get(sourceRef);
+        if (!fresh.exists) return undefined; // deleted mid-run
+        const stored = fresh.data() as GuidanceSource;
+        const streak = (typeof stored.consecutiveInfraErrors === "number" ? stored.consecutiveInfraErrors : 0) + 1;
+        const capped = streak >= ctx.infraErrorLimit;
+        const untilMs = now.toMillis() + ctx.infraBackoffMs;
+        tx.update(sourceRef, {
+          consecutiveInfraErrors: streak,
+          lastInfrastructureError: error.slice(0, MAX_STORED_ERROR_CHARS),
+          lastInfrastructureErrorAt: now,
+          // Set only when the cap engages; below it the field is left alone.
+          ...(capped ? { infraBackoffUntil: Timestamp.fromMillis(untilMs) } : {}),
+          updatedAt: now,
+        });
+        return { streak, capped, untilMs };
+      });
+      if (result?.capped) {
+        summary.warnings.push(
+          `source ${sourceId}: ${result.streak} consecutive infrastructure errors; not requested again until ${new Date(result.untilMs).toISOString()} ` +
+            "(an admin retry by id ignores this)"
+        );
+      }
+    } catch (writeErr) {
+      // Best effort only: the primary infrastructure error is already
+      // reported on the run, so a failure to *record* it on the source doc
+      // (most likely the same outage) must not inflate the run's counters.
+      console.error(`Guidance crawl: could not record the infrastructure error on source ${sourceId}: ${describeError(writeErr)}`);
     }
   }
 
@@ -615,6 +957,13 @@ export class GuidanceCrawlService {
       lastErrorKind: null,
       lastErrorAt: null,
       backoffUntil: null,
+      // Issue #143: a successful crawl (including an admin retry) clears the
+      // infrastructure-error counter, backoff and last error: the source is
+      // healthy and requested normally again.
+      consecutiveInfraErrors: 0,
+      infraBackoffUntil: null,
+      lastInfrastructureError: null,
+      lastInfrastructureErrorAt: null,
       updatedAt: now,
     };
 
@@ -640,6 +989,16 @@ export class GuidanceCrawlService {
     // 5. Changed (or first fetch). Text to Storage first: if the Firestore
     //    write below then fails, the next run finds the object already there
     //    (same hash) and simply completes the record.
+    // A selector the validator refuses (a pattern that could backtrack badly)
+    // is never run; extractPublishedDate then returns null. Say so in the run
+    // record's warnings instead of leaving `publishedDate` null silently
+    // (issue #143).
+    if (source.publishedDateSelector) {
+      const selectorProblem = publishedDateSelectorProblem(source.publishedDateSelector);
+      if (selectorProblem) {
+        summary.warnings.push(`source ${sourceId}: publishedDateSelector refused at crawl time, publishedDate left empty: ${selectorProblem}`.slice(0, MAX_STORED_ERROR_CHARS));
+      }
+    }
     const published = extractPublishedDate(page.cleanText, source.publishedDateSelector);
     let written;
     try {

@@ -13,6 +13,7 @@ import {
 import { Timestamp } from "firebase-admin/firestore";
 import { claimsService } from "./claims.service";
 import { entitlementService } from "./entitlement.service";
+import { AuthzSubject, ROLES } from "@durin-tech/authz";
 
 /** Thrown when an agency has no free paid seats to add another agent. */
 export class SeatLimitError extends Error {
@@ -24,30 +25,166 @@ export class SeatLimitError extends Error {
   }
 }
 
-export interface CreateAgencyInput {
-  name: string;
-  address?: string;
-  state?: string;
-  description?: string;
-  logoUrl?: string;
-  consultationFee?: number;
+/**
+ * Thrown by `removeAgentFromAgency` when the agent is not a member of the
+ * agency the caller is acting on (issue #138). Controllers answer it like a
+ * missing member, so nothing is revealed about other agencies.
+ */
+export class NotAgencyMemberError extends Error {
+  constructor() {
+    super("Agent is not a member of this agency");
+    this.name = "NotAgencyMemberError";
+  }
+}
+
+/**
+ * The ONLY fields an agency owner may set on their agency record, through
+ * `POST /agencies` (create) and `PUT /agencies/me` (update) (issue #138).
+ *
+ * Why an allow-list: the request body comes straight from the client and the
+ * Admin SDK bypasses firestore.rules. Everything else on the record is a
+ * decision somebody else makes, or is relied on as an authority, and must
+ * never be copied from a request:
+ *  - `ownerId` / `ownerName`: the ownership anchor read by the role lookup
+ *    (claims.service.ts) and by the owner endpoints;
+ *  - `status`, `reviewedBy`, `reviewedAt`, `rejectionReason`: the admin's
+ *    admission decision (PUT /agencies/:id/approval);
+ *  - `compliance`: the KYC/KYB/payout file and its review state, which gates
+ *    payment requests and platform-client assignment. Edited only through
+ *    /agencies/me/compliance (field allow-list + lock once submitted) and
+ *    decided only by an admin;
+ *  - `totalAgents` (the seat check counts from it), `totalCases`,
+ *    `activeCases`: maintained by the member / case flows;
+ *  - `slug`, `id`, `createdAt`: fixed at creation;
+ *  - `logoUrl`: set only by POST /agencies/me/logo, which checks that the
+ *    file is an upload issued for this agency (issue #141).
+ *
+ * firestore.rules makes the whole collection backend-only, so this list is
+ * the single statement of what an owner can edit.
+ */
+export const AGENCY_OWNER_EDITABLE_FIELDS = [
+  "name",
+  "address",
+  "state",
+  "description",
+  "consultationFee",
+  "services",
+] as const;
+
+/** The owner-editable profile of an agency (see AGENCY_OWNER_EDITABLE_FIELDS). */
+export interface AgencyProfileInput {
+  name?: string;
+  address?: string | null;
+  state?: string | null;
+  description?: string | null;
+  consultationFee?: number | null;
   services?: AgencyServiceType[];
 }
 
-export interface UpdateAgencyInput {
-  name?: string;
-  address?: string;
-  state?: string;
-  description?: string;
+/** Creating an agency needs a name; the rest of the profile is optional. */
+export interface CreateAgencyInput extends AgencyProfileInput {
+  name: string;
+}
+
+/**
+ * What the server itself may write on an agency besides the owner-editable
+ * profile. Deliberately NOT reachable from a request body: only server code
+ * passes these (today: the logo endpoint, after validating the upload).
+ */
+export interface AgencyServerWrittenFields {
   logoUrl?: string;
-  consultationFee?: number;
-  services?: AgencyServiceType[];
+}
+
+/** Result of checking a request body against the owner-editable profile. */
+export type AgencyProfileCheck =
+  | { ok: true; profile: AgencyProfileInput }
+  | { ok: false; message: string };
+
+/** True for a number that can be an amount of money (finite, not negative). */
+function isAmount(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * Read the owner-editable agency profile out of an untrusted request body
+ * (issue #138). Only the keys in AGENCY_OWNER_EDITABLE_FIELDS are looked at;
+ * every other key is ignored. A key that IS on the list but carries a value
+ * of the wrong type is an error (the request is refused with a 400) rather
+ * than being stored as it came:
+ *  - `name`: a non-empty string;
+ *  - `address`, `state`, `description`: a string, or null to clear;
+ *  - `consultationFee`: a non-negative number (naira), or null to clear;
+ *  - `services`: an array of `{ id, name, price }`. Only those three keys of
+ *    each entry are kept (the public agency page shows this list).
+ * Keys that are absent stay absent, so a partial update changes only what it
+ * names.
+ */
+export function readAgencyProfileInput(body: unknown): AgencyProfileCheck {
+  const raw = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+  const profile: AgencyProfileInput = {};
+
+  if (raw.name !== undefined) {
+    if (typeof raw.name !== "string" || raw.name.trim() === "") {
+      return { ok: false, message: "Agency name must be a non-empty string" };
+    }
+    profile.name = raw.name.trim();
+  }
+
+  // Optional free-text fields: a string, or null to clear.
+  for (const field of ["address", "state", "description"] as const) {
+    const value = raw[field];
+    if (value === undefined) continue;
+    if (value !== null && typeof value !== "string") {
+      return { ok: false, message: `${field} must be a string` };
+    }
+    profile[field] = value;
+  }
+
+  if (raw.consultationFee !== undefined) {
+    if (raw.consultationFee !== null && !isAmount(raw.consultationFee)) {
+      return { ok: false, message: "consultationFee must be a non-negative number" };
+    }
+    profile.consultationFee = raw.consultationFee;
+  }
+
+  if (raw.services !== undefined) {
+    if (!Array.isArray(raw.services)) {
+      return { ok: false, message: "services must be an array" };
+    }
+    const services: AgencyServiceType[] = [];
+    for (const entry of raw.services as unknown[]) {
+      const service = entry as Record<string, unknown> | null;
+      if (
+        !service ||
+        typeof service !== "object" ||
+        (typeof service.id !== "string" && typeof service.id !== "number") ||
+        typeof service.name !== "string" ||
+        !isAmount(service.price)
+      ) {
+        return {
+          ok: false,
+          message: "Each service needs an id, a name and a non-negative price",
+        };
+      }
+      // Copy the three known keys only; anything else on the entry is dropped.
+      services.push({ id: String(service.id), name: service.name, price: service.price });
+    }
+    profile.services = services;
+  }
+
+  return { ok: true, profile };
 }
 
 class AgencyService {
   /**
    * Create a new agency. The creator becomes the owner.
-   * Also updates the agent's document with agencyId and agencyRole.
+   * Also updates the agent's document with agencyId and agencyRole, and
+   * promotes the creator to the owner role in their custom claims.
+   *
+   * `input` must be the result of `readAgencyProfileInput` (owner-editable
+   * fields only). Everything else on the record is set here: the agency
+   * always starts `pending_review`, with no compliance file, one member (the
+   * owner) and no logo.
    */
   async createAgency(
     ownerUserId: string,
@@ -91,11 +228,11 @@ class AgencyService {
       slug,
       ownerId: ownerUserId,
       ownerName,
-      address: input.address,
-      state: input.state,
-      description: input.description,
-      logoUrl: input.logoUrl,
-      consultationFee: input.consultationFee,
+      // Optional profile fields: null ("cleared") is stored as absent.
+      address: input.address ?? undefined,
+      state: input.state ?? undefined,
+      description: input.description ?? undefined,
+      consultationFee: input.consultationFee ?? undefined,
       services: input.services || [],
       totalAgents: 1, // Owner counts as the first member
       totalCases: 0,
@@ -113,6 +250,17 @@ class AgencyService {
       agencyRole: "owner",
       updatedAt: serverTimestamp(),
     });
+
+    // Promote the creator to agency owner in their custom claims, exactly as
+    // owner onboarding does (issue #138). Owner views and owner endpoints
+    // read the role from the claims, so without this the new owner would be
+    // treated as an independent agent until something else rewrote their
+    // claims. Best-effort, like onboarding: a claims failure must not undo
+    // the agency that was just created (the audit script lists agencies whose
+    // owner has no owner claim).
+    await claimsService
+      .setRoleClaims(ownerUserId, ROLES.OWNER, agency.id)
+      .catch((e) => console.error("Failed to set owner claims on agency creation:", e));
 
     return agency;
   }
@@ -137,6 +285,33 @@ class AgencyService {
 
     if (snapshot.empty) return null;
     return snapshot.docs[0].data() as Agency;
+  }
+
+  /**
+   * The agency this principal OWNS, or null (issue #138).
+   *
+   * This is the check every owner-only endpoint uses. Two server-written
+   * records have to agree:
+   *  - the resolved principal (`req.authz`, from the custom claims, or from
+   *    the role lookup when the token has no role claim yet) says the caller
+   *    is an owner of agency X; and
+   *  - agency X's own record names the caller as `ownerId`.
+   * Looking the agency up by `ownerId` alone is not enough: an agency record
+   * that names a user is only an authority when the role lookup agrees, and
+   * that lookup also requires the user's agent document to say so. (Records
+   * written before `agencies` became backend-only in firestore.rules could
+   * name anybody.)
+   */
+  async getOwnedAgencyForPrincipal(
+    authz: Pick<AuthzSubject, "uid" | "role" | "agencyId"> | undefined
+  ): Promise<Agency | null> {
+    if (!authz || authz.role !== ROLES.OWNER) return null;
+    const { agencyId } = authz;
+    // A usable document id, nothing else (never let doc() throw on bad data).
+    if (typeof agencyId !== "string" || !agencyId || agencyId.includes("/")) return null;
+    const agency = await this.getAgencyById(agencyId);
+    if (!agency || agency.ownerId !== authz.uid) return null;
+    return agency;
   }
 
   /**
@@ -222,11 +397,19 @@ class AgencyService {
   }
 
   /**
-   * Update agency profile
+   * Update agency profile.
+   *
+   * `profile` is the owner-editable part and must be the result of
+   * `readAgencyProfileInput`; it is filtered through
+   * AGENCY_OWNER_EDITABLE_FIELDS once more here, so nothing else can ride
+   * along even if a future caller passes a wider object. `serverFields` is
+   * for values the server itself decided (see AgencyServerWrittenFields) and
+   * is never built from a request body.
    */
   async updateAgency(
     agencyId: string,
-    updates: UpdateAgencyInput
+    profile: AgencyProfileInput,
+    serverFields: AgencyServerWrittenFields = {}
   ): Promise<Agency> {
     const agencyRef = collections.agencies.doc(agencyId);
     const doc = await agencyRef.get();
@@ -234,6 +417,13 @@ class AgencyService {
     if (!doc.exists) {
       throw new Error("Agency not found");
     }
+
+    // Copy the allow-listed keys that are present (undefined = "not sent").
+    const updates: Record<string, unknown> = {};
+    for (const field of AGENCY_OWNER_EDITABLE_FIELDS) {
+      if (profile[field] !== undefined) updates[field] = profile[field];
+    }
+    if (serverFields.logoUrl !== undefined) updates.logoUrl = serverFields.logoUrl;
 
     await agencyRef.update({
       ...updates,
@@ -256,57 +446,39 @@ class AgencyService {
     return snapshot.docs.map((doc) => doc.data() as Agent);
   }
 
-  /**
-   * Add an existing agent to an agency
-   */
-  async addAgentToAgency(
-    agencyId: string,
-    agentId: string
-  ): Promise<void> {
-    const agencyRef = collections.agencies.doc(agencyId);
-    const agentRef = collections.agents.doc(agentId);
-
-    const [agencyDoc, agentDoc] = await Promise.all([
-      agencyRef.get(),
-      agentRef.get(),
-    ]);
-
-    if (!agencyDoc.exists) throw new Error("Agency not found");
-    if (!agentDoc.exists) throw new Error("Agent not found");
-
-    const agent = agentDoc.data() as Agent;
-    if (agent.agencyId) {
-      throw new Error("Agent is already part of an agency");
-    }
-
-    // Update agent with agency membership
-    await agentRef.update({
-      agencyId,
-      agencyRole: "agent",
-      updatedAt: serverTimestamp(),
-    });
-
-    // Increment agency's agent count
-    await agencyRef.update({
-      totalAgents: increment(1),
-      updatedAt: serverTimestamp(),
-    });
-  }
+  // NOTE (issue #138): there is deliberately no "add an existing agent to
+  // an agency" method any more. Attaching an agent to an agency without the
+  // agent saying yes is not something an owner may do; the one way in is an
+  // invitation the agent accepts (inviteAgent + acceptInvitation below, or
+  // POST /onboarding/join-agency for a new account). POST /agencies/:id/members
+  // now sends such an invitation.
 
   /**
    * Remove an agent from an agency.
    * Cases stay with the agency (agencyId on applications is NOT cleared).
    * The agent's agentId on those applications can be cleared or reassigned separately.
+   *
+   * `agencyId` is the agency the caller is acting on (the controller has
+   * already checked that the caller is its owner, or an admin). The agent
+   * MUST currently be a member of exactly that agency (issue #138): the
+   * agent id comes from the URL, so without this check the owner of one
+   * agency could detach a member of any other. A missing agent, an agent
+   * with no agency and an agent of a different agency are all answered the
+   * same way (NotAgencyMemberError).
    */
-  async removeAgentFromAgency(agentId: string): Promise<void> {
+  async removeAgentFromAgency(agencyId: string, agentId: string): Promise<void> {
+    // Malformed ids can never name a member (and must not make doc() throw).
+    if (typeof agentId !== "string" || !agentId || agentId.includes("/")) {
+      throw new NotAgencyMemberError();
+    }
     const agentRef = collections.agents.doc(agentId);
     const agentDoc = await agentRef.get();
 
-    if (!agentDoc.exists) throw new Error("Agent not found");
+    if (!agentDoc.exists) throw new NotAgencyMemberError();
 
     const agent = agentDoc.data() as Agent;
-    if (!agent.agencyId) {
-      throw new Error("Agent is not part of any agency");
+    if (!agencyId || agent.agencyId !== agencyId) {
+      throw new NotAgencyMemberError();
     }
 
     if (agent.agencyRole === "owner") {
@@ -581,15 +753,28 @@ class AgencyService {
   }
 
   /**
-   * Decline an invitation
+   * Decline an invitation.
+   *
+   * Only the address the invitation was sent to may decline it (issue #138),
+   * the same match that accepting requires: `userEmail` is the email on the
+   * caller's token. Anyone else, and a caller whose token carries no email,
+   * gets the same answer as for a missing invitation. (The inviting owner
+   * withdraws an invitation with cancelInvitation instead.)
    */
-  async declineInvitation(invitationId: string): Promise<void> {
+  async declineInvitation(invitationId: string, userEmail?: string): Promise<void> {
     const invitationRef = collections.agencyInvitations.doc(invitationId);
     const invitationDoc = await invitationRef.get();
 
     if (!invitationDoc.exists) throw new Error("Invitation not found");
 
     const invitation = invitationDoc.data() as AgencyInvitation;
+    if (
+      !userEmail ||
+      typeof invitation.invitedEmail !== "string" ||
+      invitation.invitedEmail.toLowerCase() !== userEmail.toLowerCase()
+    ) {
+      throw new Error("Invitation not found");
+    }
     if (invitation.status !== "pending") {
       throw new Error("Invitation is no longer pending");
     }

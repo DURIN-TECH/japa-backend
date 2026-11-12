@@ -1,6 +1,10 @@
 import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { agentService } from "../services/agent.service";
+import {
+  agentService,
+  AgentNotVerifiedError,
+  InvalidAvailabilityError,
+} from "../services/agent.service";
 import { agencyService } from "../services/agency.service";
 import { notificationService } from "../services/notification.service";
 import {
@@ -231,6 +235,22 @@ export class AgentController {
       const updatedAgent = await agentService.updateAgent(agent.id, updates);
       sendSuccess(res, updatedAgent, "Profile updated successfully");
     } catch (error) {
+      // `isAvailable` in a profile update passes the same rule as
+      // PUT /agents/me/availability (issue #138), with the same answers.
+      // Nothing was written when either of these is thrown.
+      if (error instanceof InvalidAvailabilityError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      if (error instanceof AgentNotVerifiedError) {
+        sendError(
+          res,
+          "FORBIDDEN",
+          "Agent must be verified before becoming available",
+          403
+        );
+        return;
+      }
       console.error("Error updating agent profile:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
@@ -471,8 +491,10 @@ export class AgentController {
         return;
       }
 
-      // Verify the caller owns an agency
-      const agency = await agencyService.getAgencyByOwnerId(ownerUserId);
+      // Verify the caller owns an agency: the resolved principal says owner
+      // and the agency's own record names them (issue #138, see
+      // agencyService.getOwnedAgencyForPrincipal).
+      const agency = await agencyService.getOwnedAgencyForPrincipal(req.authz);
       if (!agency) {
         sendForbidden(res, "Only agency owners can manage agent status");
         return;

@@ -74,3 +74,39 @@ export { guidanceCrawlService } from "./guidance/guidance-crawl.service";
 export { guidanceSnapshotStore } from "./guidance/guidance-snapshot.store";
 /** Guidance source registry seed. */
 export { seedGuidanceSources } from "./guidance/data/seed-guidance-sources";
+
+// ---- Visa rubrics (issue #40) ----
+/** Rubric extraction from guidance snapshots (always writes `pending_review`). */
+export { rubricExtractionService } from "./rubric/rubric-extraction.service";
+/**
+ * Rubric store. Consumers use `getApprovedRubric` ONLY (an unapproved version
+ * is never returned by it); the `...ForReview` reads are for the admin review
+ * API (#125).
+ */
+export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
+/** Structural rubric validator (the review API re-runs it before approving). */
+export { validateVisaRubric } from "./rubric/rubric-validate";
+/** Validator issue shape (type-only; the review API reports it). */
+export type { RubricIssue } from "./rubric/rubric-validate";
+/** Verbatim-quote lookup in a stored snapshot (the review API's stale-citation check). */
+export { SnapshotQuoteIndex } from "./rubric/rubric-quote";
+/** Rubric types for consumers (the assessment engine, #42). Type-only. */
+export type {
+  AssessmentCriterion,
+  CriterionAppliesTo,
+  CriterionCheck,
+  CriterionKind,
+  DecisionStage,
+  IntentPolarity,
+  RubricCitation,
+  VisaRubric,
+} from "../types/rubric";
+// ---- Published outcome statistics importer (issue #116) ----
+/** Import orchestrator (quarterly schedule + manual runs). */
+export { outcomeImportService, ImportAlreadyRunningError } from "./outcome-statistics/outcome-import.service";
+/** "Run now" worker: src/index.ts's processOutcomeStatisticsRunRequest trigger. */
+export { outcomeRunWorker } from "./outcome-statistics/outcome-run-worker";
+/** Admin routes: list import runs, request a manual run (admin-only). */
+export { adminOutcomeStatisticsRoutes } from "./outcome-statistics/outcome-statistics.routes";
+/** Destinations with an outcome data source adapter. */
+export { registeredDestinations } from "./outcome-statistics/registry";
