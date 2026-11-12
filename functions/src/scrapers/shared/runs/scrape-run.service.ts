@@ -6,7 +6,6 @@ import {
   ScrapeRunError,
   ScrapeRunKind,
   ScraperSettingsKind,
-  SCRAPE_RUN_KINDS,
   ScrapeRunPageEntry,
   ScrapeRunSourceEntry,
   ScrapeRunStatus,
@@ -686,7 +685,7 @@ export class ScrapeRunService {
    * the range at RUN_STATS_MAX_DAYS.
    */
   async runStats(q: RunStatsQuery): Promise<RunStats> {
-    const kinds: ScrapeRunKind[] = q.kind ? [q.kind] : [...SCRAPE_RUN_KINDS];
+    const kinds: ScrapeRunKind[] = q.kind ? [q.kind] : ["visa", "news"];
     // ---- Zero-filled day buckets, oldest first ----
     const buckets: RunStats["buckets"] = [];
     const byDay = new Map<string, RunStats["buckets"][number]>();

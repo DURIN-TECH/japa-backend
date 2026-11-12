@@ -250,6 +250,7 @@ export async function installFakes(): Promise<void> {
   const firebase: any = await import("../../src/utils/firebase");
   firebase.collections.appConfig = fakeCollection("appConfig");
   firebase.collections.visaSources = fakeCollection("visaSources");
+  firebase.collections.guidanceSources = fakeCollection("guidanceSources");
   firebase.collections.countries = fakeCollection("countries");
   firebase.collections.pendingVisaChanges = fakeCollection("pendingVisaChanges");
   // Issue #81: run records + the news registry (source health, news runs).

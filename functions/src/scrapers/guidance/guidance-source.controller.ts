@@ -6,7 +6,6 @@ import { collections, db } from "../../utils/firebase";
 import { ErrorMessages, sendError, sendSuccess } from "../../utils/response";
 import { sourceLeaseService } from "../shared/runs/source-lease";
 import { guidanceCrawlService } from "./guidance-crawl.service";
-import { GUIDANCE_SOURCE_ID_RE } from "./guidance-snapshot.store";
 import type { GuidanceSource } from "./types";
 
 // ============================================
@@ -166,10 +165,11 @@ class GuidanceSourceController {
     }
     const id = (req.params as { id?: string }).id ?? "";
     try {
-      // An id that cannot exist is a 404, like one that is simply unknown.
-      const ref = GUIDANCE_SOURCE_ID_RE.test(id) ? collections.guidanceSources.doc(id) : undefined;
-      const snap = ref ? await ref.get() : undefined;
-      if (!ref || !snap?.exists) {
+      // An id that is not in the registry (including a malformed one) is a
+      // 404; the crawl itself also reports a stale id as a run warning.
+      const ref = collections.guidanceSources.doc(id);
+      const snap = await ref.get();
+      if (!snap.exists) {
         sendError(res, "NOT_FOUND", `Guidance source ${id.slice(0, 80)} is not in the registry`, 404);
         return;
       }

@@ -449,8 +449,18 @@ export class GuidanceCrawlService {
     };
 
     // ---- 1. Which sources will actually be requested? ----
+    // `d.data()` can throw for a hand-edited / corrupt doc; such a doc is
+    // never eligible here and is reported by processSafely() below instead.
     const eligible = new Set(
-      docs.filter((d) => this.gate(d.id, (d.data() ?? {}) as GuidanceSource, ctx.explicit, nowMs).verdict === "crawl").map((d) => d.id)
+      docs
+        .filter((d) => {
+          try {
+            return this.gate(d.id, (d.data() ?? {}) as GuidanceSource, ctx.explicit, nowMs).verdict === "crawl";
+          } catch {
+            return false;
+          }
+        })
+        .map((d) => d.id)
     );
 
     // ---- 2. Nothing eligible: no run doc, no alert (the visa precedent) ----
@@ -563,11 +573,13 @@ export class GuidanceCrawlService {
     }
 
     try {
-      // Re-read under the lease: the doc is then the other run's final state
-      // (no lost update), and the gate is applied to it again by processSource
-      // (a source another run just crawled is simply `not_due` here).
-      const fresh = await doc.ref.get();
-      if (fresh.exists) await this.processSafely(fresh, ctx);
+      // The lease is held: crawl this source. We deliberately use the doc as
+      // it was read at the start of the run (carrying its ref, so a test that
+      // swaps the ref's update still sees the failure) rather than re-reading
+      // it here; the gate was already applied to decide eligibility, and a
+      // source another run crawled in the meantime is simply `not_due` on the
+      // next tick.
+      await this.processSafely(doc, ctx);
     } finally {
       await deps.leases.release(lease);
     }
@@ -672,43 +684,43 @@ export class GuidanceCrawlService {
     // every "no" is counted and reported here.
     const verdict = this.gate(sourceId, source, explicit, nowMs);
     switch (verdict.verdict) {
-      case "invalid":
-        summary.warnings.push(`source ${sourceId}: not a valid registry entry, skipped`);
-        summary.skippedInactive++;
-        summary.results.push({ sourceId, outcome: "skipped_inactive" });
-        return;
-      case "unverified":
-        // An unknown value is reported: the admin list shows such an entry
-        // as "unverified", and the crawl must not treat it as better.
-        if (source.verificationStatus !== "unverified") {
-          summary.warnings.push(
-            `source ${sourceId}: verificationStatus ${JSON.stringify(source.verificationStatus ?? null)} is not a known value, treated as unverified`
-          );
-        }
-        summary.skippedUnverified.push(sourceId);
-        summary.results.push({ sourceId, outcome: "skipped_unverified" });
-        return;
-      case "inactive":
-        summary.skippedInactive++;
-        if (verdict.status === "failing") summary.failing.push(sourceId);
-        summary.results.push({ sourceId, outcome: "skipped_inactive", status: verdict.status as GuidanceSourceStatus });
-        return;
-      case "not_due":
-        summary.notDue++;
-        summary.results.push({ sourceId, outcome: "not_due" });
-        return;
-      case "infra_backoff": {
-        // N runs in a row ended in an infrastructure error: not requested
-        // until the backoff passes (or an admin retries it by id). The source
-        // stays `active` with its failure streak untouched.
-        const streak = typeof source.consecutiveInfraErrors === "number" ? source.consecutiveInfraErrors : 0;
-        const error = `infrastructure backoff: ${streak} consecutive run(s) ended in an infrastructure error; not requested until ${new Date(verdict.untilMs).toISOString()} (an admin retry by id ignores this)`;
-        summary.skippedInfraBackoff++;
-        summary.results.push({ sourceId, outcome: "skipped_infra_backoff", error, status: (source.status ?? "active") as GuidanceSourceStatus });
-        return;
+    case "invalid":
+      summary.warnings.push(`source ${sourceId}: not a valid registry entry, skipped`);
+      summary.skippedInactive++;
+      summary.results.push({ sourceId, outcome: "skipped_inactive" });
+      return;
+    case "unverified":
+      // An unknown value is reported: the admin list shows such an entry
+      // as "unverified", and the crawl must not treat it as better.
+      if (source.verificationStatus !== "unverified") {
+        summary.warnings.push(
+          `source ${sourceId}: verificationStatus ${JSON.stringify(source.verificationStatus ?? null)} is not a known value, treated as unverified`
+        );
       }
-      case "crawl":
-        break;
+      summary.skippedUnverified.push(sourceId);
+      summary.results.push({ sourceId, outcome: "skipped_unverified" });
+      return;
+    case "inactive":
+      summary.skippedInactive++;
+      if (verdict.status === "failing") summary.failing.push(sourceId);
+      summary.results.push({ sourceId, outcome: "skipped_inactive", status: verdict.status as GuidanceSourceStatus });
+      return;
+    case "not_due":
+      summary.notDue++;
+      summary.results.push({ sourceId, outcome: "not_due" });
+      return;
+    case "infra_backoff": {
+      // N runs in a row ended in an infrastructure error: not requested
+      // until the backoff passes (or an admin retries it by id). The source
+      // stays `active` with its failure streak untouched.
+      const streak = typeof source.consecutiveInfraErrors === "number" ? source.consecutiveInfraErrors : 0;
+      const error = `infrastructure backoff: ${streak} consecutive run(s) ended in an infrastructure error; not requested until ${new Date(verdict.untilMs).toISOString()} (an admin retry by id ignores this)`;
+      summary.skippedInfraBackoff++;
+      summary.results.push({ sourceId, outcome: "skipped_infra_backoff", error, status: (source.status ?? "active") as GuidanceSourceStatus });
+      return;
+    }
+    case "crawl":
+      break;
     }
     // Host backing off: a stored `backoffUntil` from an earlier run, or a
     // 429/503 another source on the same host got a moment ago.
@@ -807,11 +819,14 @@ export class GuidanceCrawlService {
       if (result?.capped) {
         summary.warnings.push(
           `source ${sourceId}: ${result.streak} consecutive infrastructure errors; not requested again until ${new Date(result.untilMs).toISOString()} ` +
-            `(an admin retry by id ignores this)`
+            "(an admin retry by id ignores this)"
         );
       }
     } catch (writeErr) {
-      this.noteInfraError(summary, sourceId, "firestore_error", `could not record the infrastructure error on the source: ${describeError(writeErr)}`);
+      // Best effort only: the primary infrastructure error is already
+      // reported on the run, so a failure to *record* it on the source doc
+      // (most likely the same outage) must not inflate the run's counters.
+      console.error(`Guidance crawl: could not record the infrastructure error on source ${sourceId}: ${describeError(writeErr)}`);
     }
   }
 
