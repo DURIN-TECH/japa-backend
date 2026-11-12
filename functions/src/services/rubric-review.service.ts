@@ -852,7 +852,20 @@ function structuralErrors(
   adminSet: Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds"> = {}
 ): RubricIssue[] {
   // The admin-set fields of the request, as they would be stored.
-  const candidate: VisaRubric = { ...rubric, ...adminSet, reviewStatus: "approved", intentPolarity: polarity };
+  // The validator refuses an "approved" rubric with no reviewer (it is how the
+  // engine attributes a decision). `decide` passes the real reviewer in `rubric`;
+  // the read-only preview (`canApprove` / blockers on the review detail) validates
+  // a still-pending version, whose reviewedBy / reviewedAt are null, so without a
+  // stand-in EVERY pending version reported RUBRIC_INVALID and could never be
+  // approved from the UI. The stand-in only satisfies that one check: it is never stored.
+  const candidate: VisaRubric = {
+    ...rubric,
+    ...adminSet,
+    reviewStatus: "approved",
+    intentPolarity: polarity,
+    reviewedBy: rubric.reviewedBy ?? "preview",
+    reviewedAt: rubric.reviewedAt ?? Timestamp.now(),
+  };
   return validateVisaRubric(candidate, { knownEligibilityQuestionIds }).errors;
 }
 
