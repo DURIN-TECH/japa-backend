@@ -498,6 +498,9 @@ describe("prompt version pin", () => {
     // v3 (#112): optional scalar properties, and no appliesTo / validFrom /
     // validUntil / citations in the schema sent to the model.
     "2026-11-rubric-v3": "ecbfa6aaee534bb65b8235b48d5a0f8cbf83ca4452e66ac64e81edecfe4dbcca",
+    // v4 (#112): two calls (criteria; intake and evidence), scope, derived
+    // references. The hash covers the criteria prompt and schema only.
+    "2026-11-rubric-v4": "1853f8ce0f1017413a7a464fa28b682b5f4c71a3db8a018d7dc688eb7952bca6",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {

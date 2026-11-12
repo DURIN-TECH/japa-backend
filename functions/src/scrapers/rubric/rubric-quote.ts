@@ -152,6 +152,71 @@ export function containsTokenBounded(text: string, literal: string): boolean {
   return tokenBoundedPositions(normalizeForQuoteMatch(text), normalizeForQuoteMatch(literal)).length > 0;
 }
 
+
+// ============================================
+// Rule references derived from a snapshot's own layout (issue #112)
+// ============================================
+
+/**
+ * The reference-shaped label a line may BEGIN with: a short capital prefix
+ * and a number ("V 4.2", "SUI 10.1", "PA.5", "FIN 2.1"), or a bare dotted
+ * number ("7.2"). Shape only: it names no publisher and no document.
+ */
+const REF_SHAPE = String.raw`(?:[A-Z]{1,6}\.?\s?\d+[A-Z]?(?:\.\d+)*|\d+[A-Z]?(?:\.\d+)+)`;
+const LINE_LABEL_RE = new RegExp(String.raw`^(${REF_SHAPE})(?:\.(?=\s|$)|(?=\s|$))`, "u");
+
+/** A bracketed list marker that begins a line: "(a)", "(ii)", "(3)". */
+const LIMB_RE = /^\(([a-z]{1,3}|\d{1,2})\)/u;
+
+/** How many lines back a parent label is looked for before giving up. */
+const MAX_PARENT_LOOKBACK_LINES = 60;
+
+/** Longest title a label line may have and still read as a heading. */
+const MAX_HEADING_TITLE_CHARS = 120;
+
+/** Roman-numeral-looking marker contents (used only to tell list levels apart). */
+const ROMAN_RE = /^(?:i{1,3}|iv|vi{0,3}|ix|x{1,3})$/u;
+
+/** The level class of a marker's content: digits, roman, or letters. */
+function limbClass(inner: string): "digit" | "roman" | "letter" {
+  if (/^\d+$/u.test(inner)) return "digit";
+  return ROMAN_RE.test(inner) && inner.length > 1 ? "roman" : "letter";
+}
+
+/** A label with its trailing full stop removed and spaces collapsed. */
+function normalizeRefLabel(label: string): string {
+  return label.replace(/\s+/gu, " ").replace(/\.$/u, "").trim();
+}
+
+/** True when a label line is a heading: label, then a short title with no sentence punctuation at the end. */
+function isHeadingLine(line: string, labelLength: number): boolean {
+  const title = line.slice(labelLength).trim();
+  return title.length > 0 && title.length <= MAX_HEADING_TITLE_CHARS && !/[.:;,]$/u.test(title);
+}
+
+/**
+ * Every reference-shaped token printed in a text, normalised (trailing full
+ * stop removed). Used to build the allow-list of references a route's own
+ * rules document makes (issue #112): shape only, so over-inclusion keeps
+ * more, never less.
+ */
+export function refTokensIn(text: string): Set<string> {
+  const out = new Set<string>();
+  const re = new RegExp(String.raw`(?<![\p{L}\p{N}.])${REF_SHAPE}(?![\p{L}\p{N}])`, "gu");
+  for (const m of text.matchAll(re)) out.add(normalizeRefLabel(m[0]));
+  return out;
+}
+
+/** Names of appendices and parts a text mentions ("Appendix X", "Part Y"), as printed. */
+export function appendixNamesIn(text: string): Set<string> {
+  const out = new Set<string>();
+  const re = /\b(?:Appendix|Part)\s+[\p{Lu}][\p{L}]*(?:\s+[\p{Lu}][\p{L}]*)*/gu;
+  for (const m of text.matchAll(re)) out.add(m[0].replace(/\s+/gu, " ").trim());
+  return out;
+}
+
+export { normalizeRefLabel };
+
 // ============================================
 // Snapshot index
 // ============================================
@@ -232,6 +297,72 @@ export class SnapshotQuoteIndex {
       // belongs to that one.
       return !/(?<![\p{L}\p{N}.])\d+(?:\.\d+)+(?![\p{L}\p{N}])/u.test(text.slice(p + needle.length, found.at));
     });
+  }
+
+  /**
+   * The rule reference the SNAPSHOT TEXT itself gives the located quote, or
+   * undefined when it gives none (issue #112). Derived in code from the
+   * source's own layout, never taken from the model:
+   *
+   *  1. the quote's own line begins with a reference label ("V 4.2.",
+   *     "FIN 2.1", "7.2") and the quote starts at or just after it: that
+   *     label;
+   *  2. the quote's line begins with a bracketed marker, "(a)" or "(ii)": the
+   *     list's parent label plus the marker. The parent is the NEAREST
+   *     PRECEDING LINE THAT BEGINS WITH A LABEL (a label that merely appears
+   *     mid-sentence in another item is a cross-reference, not a parent), so
+   *     no other label stands between it and the quote. A roman marker under
+   *     a letter marker gives all three ("X 4.2(a)(ii)");
+   *  3. otherwise, when the nearest preceding label-line is a HEADING (a
+   *     short, unpunctuated line that is a label followed by a title), that
+   *     heading's number, for the text under it until the next label-line.
+   *
+   * Web snapshots only: a PDF page is one unit, so its line layout is lost.
+   */
+  derivedRuleRef(found: Extract<QuoteLookup, { ok: true }>): string | undefined {
+    if (this.paginated) return undefined;
+    const line = this.units[found.unit].text;
+    const own = LINE_LABEL_RE.exec(line);
+    if (own && found.at <= own[0].length) return normalizeRefLabel(own[1]);
+
+    /** Nearest earlier non-empty line, going back from `from` (exclusive), within a bound. */
+    const earlier = (from: number): number[] => {
+      const out: number[] = [];
+      for (let i = from - 1; i >= 0 && from - i <= MAX_PARENT_LOOKBACK_LINES; i--) if (this.units[i].text) out.push(i);
+      return out;
+    };
+
+    const limb = LIMB_RE.exec(line);
+    if (limb && found.at <= limb[0].length) {
+      const chain: string[] = [limb[0]];
+      let cls = limbClass(limb[1]);
+      for (const i of earlier(found.unit)) {
+        const text = this.units[i].text;
+        const label = LINE_LABEL_RE.exec(text);
+        if (label) return normalizeRefLabel(label[1]) + chain.join("");
+        const m = LIMB_RE.exec(text);
+        // A marker of another class one level up ("(a)" above "(ii)"): the
+        // first one found going back is the enclosing item.
+        if (m && limbClass(m[1]) !== cls) {
+          chain.unshift(m[0]);
+          cls = limbClass(m[1]);
+        }
+      }
+      return undefined;
+    }
+
+    for (const i of earlier(found.unit)) {
+      const label = LINE_LABEL_RE.exec(this.units[i].text);
+      if (!label) continue;
+      // The nearest label-line decides: it must be a heading.
+      return isHeadingLine(this.units[i].text, label[0].length) ? normalizeRefLabel(label[1]) : undefined;
+    }
+    return undefined;
+  }
+
+  /** The whole document as normalised text (lines joined by a space). */
+  allText(): string {
+    return this.joined;
   }
 
   /**

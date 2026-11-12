@@ -4,6 +4,7 @@ import { linkPatternHost, resolveFromProblems } from "../guidance-resolve";
 import { GUIDANCE_SOURCE_ID_RE } from "../guidance-snapshot.store";
 import {
   GUIDANCE_DOC_TYPES,
+  GUIDANCE_SOURCE_ROLES,
   GUIDANCE_VERIFICATION_STATUSES,
   type GuidanceSourceSeed,
 } from "../types";
@@ -75,6 +76,8 @@ const WEEKLY_HOURS = 24 * 7;
 export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   {
     id: "gb-appendix-v-visitor",
+    // The route's own rules document.
+    role: "primary",
     title: "Immigration Rules Appendix V: Visitor",
     url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
     jurisdiction: "GB",
@@ -92,6 +95,8 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   },
   {
     id: "gb-visit-guidance-html",
+    // General-purpose document: only what the route's own rules point to or what applies to everyone.
+    role: "secondary",
     title: "Visit caseworker guidance (accessible web version)",
     url: "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
     jurisdiction: "GB",
@@ -111,6 +116,8 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   },
   {
     id: "gb-visit-guidance-pdf",
+    // General-purpose document: only what the route's own rules point to or what applies to everyone.
+    role: "secondary",
     title: "Visit caseworker guidance (PDF)",
     // The file's address ON THE DAY IT WAS RETRIEVED. It carries a per-release
     // id and changes with every publication, so the crawl does not request
@@ -140,6 +147,8 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   },
   {
     id: "gb-part-suitability",
+    // General-purpose document: only what the route's own rules point to or what applies to everyone.
+    role: "secondary",
     title: "Immigration Rules: Part Suitability",
     url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-part-suitability",
     jurisdiction: "GB",
@@ -159,6 +168,8 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   },
   {
     id: "gb-appendix-finance",
+    // General-purpose document: only what the route's own rules point to or what applies to everyone.
+    role: "secondary",
     title: "Immigration Rules Appendix Finance",
     url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-finance",
     jurisdiction: "GB",
@@ -281,6 +292,11 @@ export function validateGuidanceSourceSeed(seed: GuidanceSourceSeed): string[] {
     if (problem) problems.push(problem);
   }
 
+  // ---- Role (issue #112) ----
+  if (s.role !== undefined && !GUIDANCE_SOURCE_ROLES.includes(s.role as never)) {
+    problems.push(`role must be one of ${GUIDANCE_SOURCE_ROLES.join(", ")} when present`);
+  }
+
   // ---- Verification honesty ----
   if (!GUIDANCE_VERIFICATION_STATUSES.includes(s.verificationStatus as never)) {
     problems.push(`verificationStatus must be one of ${GUIDANCE_VERIFICATION_STATUSES.join(", ")}`);
@@ -366,6 +382,8 @@ export function buildSeededGuidanceSource(
       ? { pageUrl: seed.resolveFrom.pageUrl, linkPattern: seed.resolveFrom.linkPattern }
       : null,
     checkIntervalHours: seed.checkIntervalHours,
+    // null (not undefined) so a role removed from the seed is cleared.
+    role: seed.role ?? null,
     verificationStatus: seed.verificationStatus,
     verificationNote: seed.verificationNote.trim(),
     retrievedAt: seed.retrievedAt ? Timestamp.fromMillis(Date.parse(seed.retrievedAt)) : null,

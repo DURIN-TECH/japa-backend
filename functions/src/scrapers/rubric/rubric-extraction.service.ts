@@ -30,8 +30,10 @@ import { chunkSnapshot, type SourceChunk } from "./rubric-chunk";
 import {
   RUBRIC_PROMPT_VERSION,
   RubricOutputError,
+  buildIntakeRequest,
   buildRubricRequest,
   parseRubricOutput,
+  type RubricRouteContext,
   type RawCriterion,
   type RawEvidenceItem,
   type RawIntakeQuestion,
@@ -39,11 +41,13 @@ import {
 } from "./rubric-prompt";
 import {
   SnapshotQuoteIndex,
+  appendixNamesIn,
   containsTokenBounded,
   dateSupported,
   datesIn,
   groupNameSupported,
   passagesOverlap,
+  refTokensIn,
   unitAdjacentToNumber,
   unitSupported,
   unsupportedNumbers,
@@ -99,6 +103,9 @@ const MAX_LABEL_CHARS = 120;
 
 /** Cap on a stored discard detail (details are fixed strings; this is a backstop). */
 const MAX_DETAIL_CHARS = 200;
+
+/** How many characters of a discarded quote are kept for the audit trail. */
+const MAX_AUDIT_QUOTE_CHARS = 120;
 
 /** Cap on discard records stored on one version (the count is always exact). */
 const MAX_STORED_DISCARDS = 200;
@@ -157,6 +164,8 @@ export interface RubricExtractionDeps {
   loadSettings?: () => Promise<LoadedRubricSettings>;
   // True when `{countryCode, visaTypeId}` is a real visa type.
   visaTypeExists?: (countryCode: string, visaTypeId: string) => Promise<boolean>;
+  // The route's display name (default: the visa type document's `name`).
+  visaTypeName?: (countryCode: string, visaTypeId: string) => Promise<string>;
   now?: () => Timestamp;
 }
 
@@ -201,10 +210,46 @@ export function criterionIdOf(sourceId: string, quote: string, kind: string, che
 /** A slug: what intake question ids and evidence keys must look like. */
 const SLUG_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
 
+/**
+ * What decides whether a criterion from a general-purpose (secondary) source
+ * belongs to the route (issue #112). Built in code from the route's own
+ * (primary) source text: the reference-shaped tokens it prints and the
+ * appendix / part names it mentions. Null for a primary source, or when the
+ * run has no primary source (then nothing is scoped out).
+ */
+export interface RouteScope {
+  // References the primary source prints ("V 15.1", "FIN 2.1", ...).
+  refs: ReadonlySet<string>;
+  // Appendix / part names the primary source mentions.
+  names: ReadonlySet<string>;
+}
+
+/** Build the scope allow-list from the primary sources' normalised text. */
+export function routeScopeFrom(primaryTexts: readonly string[]): RouteScope {
+  const refs = new Set<string>();
+  const names = new Set<string>();
+  for (const t of primaryTexts) {
+    for (const r of refTokensIn(t)) refs.add(r);
+    for (const n of appendixNamesIn(t)) names.add(n);
+  }
+  return { refs, names };
+}
+
+/** Things done to a criterion that a reviewer should be able to count. */
+interface CriterionNotes {
+  // A `check` the model attached to a judgement criterion was dropped.
+  checkStripped: boolean;
+  // The model's rule reference was not printed with the quote and was removed.
+  refRemoved: boolean;
+  // The rule reference was taken from the snapshot's own layout, not the model.
+  refDerived: boolean;
+}
+
 /** A criterion that passed validation, with the handle the model gave it. */
 interface AcceptedCriterion {
   ref: string;
   criterion: AssessmentCriterion;
+  notes: CriterionNotes;
   // The quote begins part-way through a sentence of the source (see
   // SnapshotQuoteIndex.startsMidSentence): becomes a reviewer flag.
   startsMidSentence: boolean;
@@ -225,6 +270,26 @@ export interface ChunkAssessment {
   intake: IntakeMeta | null;
   intakeQuestions: RawIntakeQuestion[];
   evidenceItems: { raw: RawEvidenceItem; source: RubricCitation }[];
+  // Counts of things done to criteria (see CriterionNotes), for flags.
+  counters: { judgementChecksStripped: number; ruleRefsRemoved: number; ruleRefsDerived: number };
+}
+
+/** Join the criteria half and the intake half of one chunk's two calls. */
+export function combineAssessments(criteriaPart: ChunkAssessment, intakePart: ChunkAssessment): ChunkAssessment {
+  return {
+    criteria: criteriaPart.criteria,
+    discards: [...criteriaPart.discards, ...intakePart.discards],
+    suspiciousPassages: [...criteriaPart.suspiciousPassages, ...intakePart.suspiciousPassages],
+    polarity: criteriaPart.polarity,
+    intake: intakePart.intake,
+    intakeQuestions: intakePart.intakeQuestions,
+    evidenceItems: intakePart.evidenceItems,
+    counters: {
+      judgementChecksStripped: criteriaPart.counters.judgementChecksStripped + intakePart.counters.judgementChecksStripped,
+      ruleRefsRemoved: criteriaPart.counters.ruleRefsRemoved + intakePart.counters.ruleRefsRemoved,
+      ruleRefsDerived: criteriaPart.counters.ruleRefsDerived + intakePart.counters.ruleRefsDerived,
+    },
+  };
 }
 
 /** The citation fields code fills in for a quote found in a snapshot. */
@@ -242,6 +307,8 @@ const DETAIL = {
   flagged: "the quote overlaps a passage flagged as addressed to a reader model",
   citationField: "a supporting citation names a field outside the allowed list",
   citation: "a supporting citation is not in the stored text of the source",
+  scope: "from a general-purpose source, not pointed to by the route's own source, and not marked as applying to every applicant",
+  condition: "the applicability condition is not verbatim in the source",
   ruleRef: "the rule reference is not printed in, or directly before, the quote",
   valueType: "check.value must be a JSON number for this operator",
   valuePresent: "a `present` check must not carry a value",
@@ -305,12 +372,14 @@ export function assessChunkOutput(
   chunk: Pick<SourceChunk, "sourceId" | "chunkIndex">,
   index: SnapshotQuoteIndex,
   base: CitationBase,
-  severityLevels: readonly string[]
+  severityLevels: readonly string[],
+  scope: RouteScope | null = null
 ): ChunkAssessment {
   const discards: RubricDiscard[] = [];
-  /** Record one discarded item. */
-  const discard = (itemType: RubricDiscard["itemType"], reason: RubricDiscardReason, detail: string, label: string) => {
-    discards.push({ itemType, reason, detail: detail.slice(0, MAX_DETAIL_CHARS), label: safeLabel(label), sourceId: chunk.sourceId, chunkIndex: chunk.chunkIndex });
+  const counters = { judgementChecksStripped: 0, ruleRefsRemoved: 0, ruleRefsDerived: 0 };
+  /** Record one discarded item (with an audit trail for a criterion). */
+  const discard = (itemType: RubricDiscard["itemType"], reason: RubricDiscardReason, detail: string, label: string, audit?: Pick<RubricDiscard, "ruleRef" | "quoteHash" | "quoteStart">) => {
+    discards.push({ itemType, reason, detail: detail.slice(0, MAX_DETAIL_CHARS), label: safeLabel(label), sourceId: chunk.sourceId, chunkIndex: chunk.chunkIndex, ...(audit ?? {}) });
   };
   /**
    * Build the stored citation for a located passage. `matched` is the
@@ -340,18 +409,30 @@ export function assessChunkOutput(
   // ---- criteria ----
   const criteria: AcceptedCriterion[] = [];
   for (const c of raw.criteria) {
-    const accepted = assessCriterion(c, index, cite, flagged, severityLevels);
+    const accepted = assessCriterion(c, index, cite, flagged, severityLevels, scope);
     if ("reason" in accepted) {
-      discard("criterion", accepted.reason, accepted.detail, c.title);
+      // What the model proposed, so a reviewer can audit WHY it was dropped:
+      // its reference, a hash of its quote and the quote's first characters.
+      // (Published guidance: no personal data.)
+      discard("criterion", accepted.reason, accepted.detail, c.title, {
+        ...(c.ruleRef?.trim() ? { ruleRef: c.ruleRef.trim().slice(0, 60) } : {}),
+        quoteHash: sha256(normalizeForQuoteMatch(c.quote)),
+        quoteStart: normalizeForQuoteMatch(c.quote).slice(0, MAX_AUDIT_QUOTE_CHARS),
+      });
     } else {
+      const { criterion, notes } = accepted;
+      if (notes.checkStripped) counters.judgementChecksStripped++;
+      if (notes.refRemoved) counters.ruleRefsRemoved++;
+      if (notes.refDerived) counters.ruleRefsDerived++;
       // Located again only to ask where the quote sits in its sentence.
-      const found = index.locate(accepted.source.quote);
+      const found = index.locate(criterion.source.quote);
       criteria.push({
         ref: c.ref,
-        criterion: accepted,
+        criterion,
+        notes,
         startsMidSentence: found.ok && index.startsMidSentence(found),
         endsMidSentence: found.ok && index.endsMidSentence(found),
-        multipleDates: Boolean(accepted.validFrom || accepted.validUntil) && datesIn(accepted.source.quote).length > 1,
+        multipleDates: Boolean(criterion.validFrom || criterion.validUntil) && datesIn(criterion.source.quote).length > 1,
       });
     }
   }
@@ -377,7 +458,7 @@ export function assessChunkOutput(
     else evidenceItems.push({ raw: e, source: cite(found.matched, found.page) });
   }
 
-  return { criteria, discards, suspiciousPassages, polarity, intake: cleanIntakeMeta(raw.intake), intakeQuestions: raw.intakeQuestions, evidenceItems };
+  return { criteria, discards, suspiciousPassages, polarity, intake: cleanIntakeMeta(raw.intake), intakeQuestions: raw.intakeQuestions, evidenceItems, counters };
 }
 
 /** Drop null / blank fields of the model's intake headings; null when none is left. */
@@ -408,8 +489,9 @@ function assessCriterion(
   index: SnapshotQuoteIndex,
   cite: (matched: string, page: number | undefined) => RubricCitation,
   flagged: (quote: string) => boolean,
-  severityLevels: readonly string[]
-): AssessmentCriterion | { reason: RubricDiscardReason; detail: string } {
+  severityLevels: readonly string[],
+  scope: RouteScope | null
+): { criterion: AssessmentCriterion; notes: CriterionNotes } | { reason: RubricDiscardReason; detail: string } {
   // 1. The quote must be verbatim in THIS source's snapshot: whole words,
   //    one page / one paragraph. A paraphrase, an invented sentence, a
   //    fragment cut out of a longer word or number, and a sentence from
@@ -430,10 +512,50 @@ function assessCriterion(
     citations[extra.field] = at.matched;
   }
 
-  // 3. The rule reference must be printed with the quote (in it, or just
-  //    before it), not merely somewhere in the document.
-  const ruleRef = c.ruleRef?.trim() || undefined;
-  if (ruleRef && !index.ruleRefNear(found, ruleRef)) return { reason: "rule_ref_not_in_source", detail: DETAIL.ruleRef };
+  // 3. The rule reference. Never trusted from the model (issue #112):
+  //    (i) a reference the model gives is kept only when it is printed with
+  //    the quote (in it, or earlier on its line); otherwise
+  //    (ii) the reference the SNAPSHOT'S OWN LAYOUT gives the quote is used
+  //    (its own label, a list marker under its parent paragraph's label, or
+  //    the heading it sits under: see SnapshotQuoteIndex.derivedRuleRef);
+  //    (iii) failing both, the reference is left out (it is optional): the
+  //    quote itself was found verbatim, so the criterion stands on its words.
+  const notes: CriterionNotes = { checkStripped: false, refRemoved: false, refDerived: false };
+  const claimedRef = c.ruleRef?.trim() || undefined;
+  let ruleRef: string | undefined;
+  if (claimedRef && index.ruleRefNear(found, claimedRef)) {
+    ruleRef = claimedRef;
+  } else {
+    ruleRef = index.derivedRuleRef(found);
+    notes.refDerived = ruleRef !== undefined;
+    notes.refRemoved = claimedRef !== undefined && ruleRef === undefined;
+  }
+
+  // 3b. A judgement criterion is never machine-checked: a check the model
+  //     attached anyway is dropped here (counted), and the criterion kept.
+  const raw = c;
+  if (raw.kind === "judgement" && raw.check) {
+    c = { ...c, check: null };
+    notes.checkStripped = true;
+  }
+
+  // 3c. Scope (issue #112). A criterion from a general-purpose source is
+  //     kept when the route's own source points at it (its reference is one
+  //     the primary source prints, or its quote names an appendix / part the
+  //     primary source mentions) or when it applies to every applicant;
+  //     otherwise it belongs to another route or activity.
+  if (scope) {
+    const pointedAt = (ruleRef !== undefined && scope.refs.has(ruleRef)) || [...scope.names].some((n) => quote.includes(n));
+    if (!pointedAt && c.applicability !== "all_applicants") return { reason: "out_of_route_scope", detail: DETAIL.scope };
+  }
+
+  // 3d. A conditional criterion's condition is the source's own words.
+  let applicabilityCondition: string | undefined;
+  if (c.applicability === "conditional" && c.applicabilityCondition?.trim()) {
+    const cond = index.locate(c.applicabilityCondition);
+    if (!cond.ok) return { reason: cond.reason, detail: DETAIL.condition };
+    applicabilityCondition = cond.matched;
+  }
 
   // 4. The check: a threshold is a NUMBER written in the quote (and not the
   //    day or year of a date in it); a string is only allowed for `eq`, and
@@ -484,6 +606,8 @@ function assessCriterion(
     stage: c.stage,
     severity: c.severity,
     ...(ruleRef ? { ruleRef } : {}),
+    ...(c.applicability ? { applicability: c.applicability } : {}),
+    ...(applicabilityCondition ? { applicabilityCondition } : {}),
     source: cite(quote, found.page),
     ...(c.check
       ? {
@@ -519,7 +643,7 @@ function assessCriterion(
   //    no group, ...). The detail is the validator's own codes.
   const issues = validateCriterionShape(criterion, severityLevels);
   if (issues.length > 0) return { reason: "invalid_shape", detail: issues.map((i) => i.code).join(", ") };
-  return criterion;
+  return { criterion, notes };
 }
 
 /** What `mergeAssessments` produces: the content of a rubric version. */
@@ -560,9 +684,21 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
   // on one asked in a later chunk.
   const conditions = new Map<string, RawIntakeQuestion["showWhenAnyOf"]>();
   const evidence = new Map<string, EvidenceItem>();
+  // Exact duplicates: the same normalised quote with the same reference
+  // (issue #112). Only these are merged in code; near-duplicates are left to
+  // the reviewer and flagged below.
+  const byQuoteAndRef = new Map<string, string>();
+  const totals = { judgementChecksStripped: 0, ruleRefsRemoved: 0, ruleRefsDerived: 0 };
+  // Evidence items whose trigger had to be simplified (see below).
+  let simplifiedTriggers = 0;
+  // Trigger conditions of evidence items, resolved once every question is in.
+  const evidenceConditions = new Map<string, NonNullable<RawEvidenceItem["showWhenAnyOf"]>>();
 
   for (const { chunk, assessment } of parts) {
     discards.push(...assessment.discards);
+    totals.judgementChecksStripped += assessment.counters.judgementChecksStripped;
+    totals.ruleRefsRemoved += assessment.counters.ruleRefsRemoved;
+    totals.ruleRefsDerived += assessment.counters.ruleRefsDerived;
     suspiciousPassages.push(...assessment.suspiciousPassages);
     /** Record a discard made at merge time. */
     const discard = (itemType: RubricDiscard["itemType"], reason: RubricDiscardReason, detail: string, label: string) =>
@@ -577,6 +713,16 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
         discard("criterion", "duplicate", "the same passage was already extracted", criterion.title);
         continue;
       }
+      // The same words with the same reference under another id (another
+      // source, or another reading of the check): an exact duplicate.
+      const dupKey = `${normalizeForQuoteMatch(criterion.source.quote)}|${criterion.ruleRef ?? ""}`;
+      const dupOf = byQuoteAndRef.get(dupKey);
+      if (dupOf !== undefined) {
+        refToId.set(ref, dupOf);
+        discard("criterion", "duplicate", "the same quote and reference were already extracted", criterion.title);
+        continue;
+      }
+      byQuoteAndRef.set(dupKey, criterion.criterionId);
       byId.set(criterion.criterionId, criterion);
       criteria.push(criterion);
       if (endsMidSentence) {
@@ -672,6 +818,7 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
           ...(Object.keys(expects).length > 0 ? { expects } : {}),
           source,
         });
+        evidenceConditions.set(raw.key, raw.showWhenAnyOf ?? []);
       }
     }
   }
@@ -699,6 +846,28 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
     if (q && conds.length > 0) q.showWhen = { anyOf: conds.map((c) => ({ questionId: c.questionId, op: c.op, value: c.value })) };
   }
 
+  // ---- evidence triggers ----
+  // An evidence item is asked for only when an intake answer matches. The
+  // stored shape is ONE condition: several `eq` on the same question become
+  // one `in`; anything else keeps the first condition and is flagged. An item
+  // whose trigger names a question that is not in the rubric is discarded.
+  for (const [key, conds] of evidenceConditions) {
+    const item = evidence.get(key);
+    if (!item || conds.length === 0) continue;
+    if (conds.some((c) => !questions.has(c.questionId))) {
+      discards.push({ itemType: "evidence_item", reason: "unresolved_reference", detail: "its trigger names a question that is not in the rubric", label: safeLabel(item.title), sourceId: "", chunkIndex: -1 });
+      evidence.delete(key);
+      continue;
+    }
+    const sameQuestion = conds.every((c) => c.questionId === conds[0].questionId && c.op === "eq");
+    if (conds.length === 1) item.when = { questionId: conds[0].questionId, op: conds[0].op, value: conds[0].value };
+    else if (sameQuestion) item.when = { questionId: conds[0].questionId, op: "in", value: conds.map((c) => String(c.value)) };
+    else {
+      item.when = { questionId: conds[0].questionId, op: conds[0].op, value: conds[0].value };
+      simplifiedTriggers++;
+    }
+  }
+
   // ---- back-links: which questions each criterion reads ----
   const intakeQuestions = [...questions.values()];
   for (const q of intakeQuestions) {
@@ -708,7 +877,65 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
     }
   }
 
+  // ---- reviewer flags for what code did on the way ----
+  if (totals.judgementChecksStripped > 0) {
+    flags.push({
+      code: "judgement_check_stripped",
+      message: `${totals.judgementChecksStripped} judgement criteria came with a machine check from the model. A judgement criterion is never machine-checked, so the check was dropped and the criterion kept.`,
+      target: "rubric",
+    });
+  }
+  if (totals.ruleRefsRemoved > 0) {
+    flags.push({
+      code: "rule_ref_removed",
+      message: `${totals.ruleRefsRemoved} rule reference(s) given by the model were not printed with their quote and could not be derived from the source's layout, so they were left out. The criteria were kept: their quotes are verbatim.`,
+      target: "rubric",
+    });
+  }
+  if (totals.ruleRefsDerived > 0) {
+    flags.push({
+      code: "rule_ref_derived",
+      message: `${totals.ruleRefsDerived} rule reference(s) were taken from the source's own layout (a paragraph label, a list marker under its parent paragraph, or the heading above), not from the model.`,
+      target: "rubric",
+    });
+  }
+  if (simplifiedTriggers > 0) {
+    flags.push({
+      code: "evidence_trigger_simplified",
+      message: `${simplifiedTriggers} evidence item(s) had several different triggers; only the first is stored. Read the quote to see when the document is asked for.`,
+      target: "rubric",
+    });
+  }
+  flags.push(...possibleDuplicateFlags(criteria));
+
   return { criteria, intake, intakeQuestions, evidenceItems: [...evidence.values()], intentPolarityProposal, suspiciousPassages, discards, flags };
+}
+
+/** Share of words two criteria must have in common to be flagged as possible duplicates. */
+const DUPLICATE_SIMILARITY = 0.8;
+
+/**
+ * Flag pairs of criteria whose quotes are near-identical (issue #112). They
+ * are NOT merged: whether two rules are the same rule is for the reviewer.
+ * Similarity is the share of distinct lower-case words the quotes have in
+ * common (Jaccard). Quadratic, which is fine for a few hundred criteria.
+ */
+export function possibleDuplicateFlags(criteria: readonly AssessmentCriterion[]): RubricFlag[] {
+  const words = criteria.map((c) => new Set(c.source.quote.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 2)));
+  const flags: RubricFlag[] = [];
+  for (let i = 0; i < criteria.length; i++) {
+    for (let j = i + 1; j < criteria.length; j++) {
+      const a = words[i];
+      const b = words[j];
+      if (a.size < 4 || b.size < 4) continue;
+      let shared = 0;
+      for (const w of a) if (b.has(w)) shared++;
+      if (shared / (a.size + b.size - shared) >= DUPLICATE_SIMILARITY) {
+        flags.push({ code: "possible_duplicate", message: `this criterion's quote is nearly the same as that of ${criteria[j].criterionId}. Decide whether they are one rule.`, target: criteria[i].criterionId });
+      }
+    }
+  }
+  return flags;
 }
 
 /** What `reviewFlagsFor` needs to know about the run besides its content. */
@@ -824,6 +1051,8 @@ function emptyRunUsage(): RubricRunUsage {
 interface LoadedSource {
   snapshot: RubricSourceSnapshot;
   retrievedAt: string;
+  // The source's role for its route (registry data); absent = secondary.
+  role: "primary" | "secondary";
 }
 
 export class RubricExtractionService {
@@ -876,7 +1105,23 @@ export class RubricExtractionService {
         ...(meta.publishedDate ? { publishedDate: meta.publishedDate } : {}),
       },
       retrievedAt: meta.fetchedAt.toDate().toISOString(),
+      role: source.role === "primary" ? "primary" : "secondary",
     };
+  }
+
+  /**
+   * The route's name from the catalogue (`countries/{cc}/visaTypes/{id}`),
+   * sent to the model so it knows which category it is extracting for. Falls
+   * back to the visa type id (data either way, never code).
+   */
+  private async routeName(countryCode: string, visaTypeId: string): Promise<string> {
+    if (this.deps.visaTypeName) return this.deps.visaTypeName(countryCode, visaTypeId);
+    try {
+      const data = (await subcollections.visaTypes(countryCode).doc(visaTypeId).get()).data() as { name?: unknown } | undefined;
+      return typeof data?.name === "string" && data.name.trim() ? data.name.trim() : visaTypeId;
+    } catch {
+      return visaTypeId;
+    }
   }
 
   /**
@@ -1033,23 +1278,41 @@ export class RubricExtractionService {
         throw new RunStop("skipped", "run_record_unavailable", "the run could not be recorded, so it was not started");
       }
 
-      // ---- 5 + 6. one call per chunk, validated in code ----
+      // ---- 5 + 6. two calls per chunk, validated in code ----
+      // Call 1 reads the criteria; code validates them. Call 2 reads the
+      // intake questions and evidence items for the criteria code accepted
+      // (a chunk with none gets no second call). The split keeps each schema
+      // inside the provider's limits.
       const severityLevels = [...DEFAULT_SEVERITY_LEVELS];
+      const limits = { maxOutputTokens: settings.maxOutputTokensPerRequest, timeoutMs: settings.requestTimeoutMs };
+      const routeName = await this.routeName(input.countryCode, input.visaTypeId);
+      // The scope allow-list is built, in code, from the route's own source(s).
+      const primaries = sources.filter((s) => s.role === "primary");
+      const scope = primaries.length > 0 ? routeScopeFrom(primaries.map((s) => (indexes.get(s.snapshot.sourceId) as SnapshotQuoteIndex).allText())) : null;
       const parts: { chunk: SourceChunk; assessment: ChunkAssessment }[] = [];
       for (const chunk of chunks) {
         const source = sources.find((s) => s.snapshot.sourceId === chunk.sourceId) as LoadedSource;
-        const request = buildRubricRequest(chunk, severityLevels, { maxOutputTokens: settings.maxOutputTokensPerRequest, timeoutMs: settings.requestTimeoutMs });
-        const raw = await this.callModel(request, usage);
-        parts.push({
-          chunk,
-          assessment: assessChunkOutput(raw, chunk, indexes.get(chunk.sourceId) as SnapshotQuoteIndex, {
-            sourceId: chunk.sourceId,
-            url: source.snapshot.url,
-            contentHash: chunk.contentHash,
-            retrievedAt: source.retrievedAt,
-            ...(source.snapshot.publishedDate ? { publishedDate: source.snapshot.publishedDate } : {}),
-          }, severityLevels),
-        });
+        const index = indexes.get(chunk.sourceId) as SnapshotQuoteIndex;
+        const base: CitationBase = {
+          sourceId: chunk.sourceId,
+          url: source.snapshot.url,
+          contentHash: chunk.contentHash,
+          retrievedAt: source.retrievedAt,
+          ...(source.snapshot.publishedDate ? { publishedDate: source.snapshot.publishedDate } : {}),
+        };
+        // Scoping applies to secondary sources only, and only when the run has a primary one.
+        const route: RubricRouteContext = { routeName, sourceRole: primaries.length === 0 ? "unspecified" : source.role };
+        const scopeForChunk = scope && source.role === "secondary" ? scope : null;
+
+        const raw1 = await this.callModel(buildRubricRequest(chunk, severityLevels, limits, route), usage);
+        const criteriaPart = assessChunkOutput(raw1, chunk, index, base, severityLevels, scopeForChunk);
+        let assessment = criteriaPart;
+        if (criteriaPart.criteria.length > 0) {
+          const accepted = criteriaPart.criteria.map((a) => ({ ref: a.ref, title: a.criterion.title, quote: a.criterion.source.quote }));
+          const raw2 = await this.callModel(buildIntakeRequest(chunk, accepted, limits, route), usage);
+          assessment = combineAssessments(criteriaPart, assessChunkOutput(raw2, chunk, index, base, severityLevels));
+        }
+        parts.push({ chunk, assessment });
       }
 
       // ---- 7. merge ----
@@ -1127,8 +1390,9 @@ export class RubricExtractionService {
 
   /** Refuse the run when its plan would pass a per-run cap. */
   private assertWithinCaps(chunks: readonly SourceChunk[], settings: RubricExtractionSettings): void {
-    if (chunks.length > settings.maxRequestsPerRun) {
-      throw new RunStop("skipped", "run_cap_exceeded", `the run needs ${chunks.length} requests; the cap is ${settings.maxRequestsPerRun}`);
+    // Two calls per chunk at most (criteria, then intake and evidence).
+    if (chunks.length * 2 > settings.maxRequestsPerRun) {
+      throw new RunStop("skipped", "run_cap_exceeded", `the run needs up to ${chunks.length * 2} requests; the cap is ${settings.maxRequestsPerRun}`);
     }
     const chars = chunks.reduce((n, c) => n + c.text.length, 0);
     if (chars > settings.maxInputCharsPerRun) {
