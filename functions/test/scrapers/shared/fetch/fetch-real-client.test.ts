@@ -156,7 +156,14 @@ describe("fetchAndClean over the real HTTP client (local server)", () => {
 
   /** Production client and limits; only the politeness gap and timers shortened. */
   const service = (overrides: ConstructorParameters<typeof VisaCatalogFetchService>[0] = {}) =>
-    new VisaCatalogFetchService({ minIntervalMs: 0, ...overrides });
+    new VisaCatalogFetchService({
+      minIntervalMs: 0,
+      // Issue #159: the default client refuses loopback and non-standard
+      // ports; this test's stub is both, so it opts in EXPLICITLY (a
+      // constructor option only; production code cannot do this).
+      addressGuard: { allowAddress: (ip) => ip === "127.0.0.1", allowPort: () => true },
+      ...overrides,
+    });
 
   // ----- HTML: unchanged by streaming -----
 
