@@ -247,18 +247,29 @@ service cloud.firestore {
                      get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
                     isAdmin();
       
-      // Users can create applications
-      allow create: if isAuthenticated() && 
-                      request.resource.data.userId == request.auth.uid;
-      
-      // Users can update their own applications (limited fields)
-      // Agents can update assigned applications
-      allow update: if isOwner(resource.data.userId) ||
-                      (isAgent() && resource.data.agentId != null &&
-                       exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
-                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
-                      isAdmin();
-      
+      // ---- Applications are written ONLY by the backend (issue #138) ----
+      // Every create and update goes through the API (Admin SDK, which
+      // bypasses these rules): POST /applications, POST /applications/for-client,
+      // PUT /applications/:id (notes; assignment by the agent side),
+      // PUT /applications/:id/status, and the payment / document flows.
+      // No portal or mobile code writes this collection from a client SDK.
+      //
+      // Why not an allow-list of "harmless" fields: nearly every field on an
+      // application is a decision somebody else makes or relies on:
+      //  - status, currentStep, nextStep, rejectionReason: the progress of
+      //    the case, set by the agent side (the applicant may only withdraw,
+      //    and that goes through the API too);
+      //  - agentId, agencyId, mode, createdVia: who handles the case and who
+      //    may read it and its documents (the API's access check and the
+      //    compliance gate on taking platform clients read these);
+      //  - userId, clientName, clientEmail: whose case it is;
+      //  - paymentStatus, totalFee, amountPaid and the other money fields:
+      //    written by the payment flows.
+      // The two free-text fields a participant may edit (userNotes for the
+      // applicant, agentNotes for the agent side) are edited through
+      // PUT /applications/:id, which decides who may write which.
+      allow create, update: if false;
+
       // Only admins can delete applications
       allow delete: if isAdmin();
       
@@ -274,7 +285,9 @@ service cloud.firestore {
         allow read: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
                       isAgent() || isAdmin();
 
-        allow write: if isAgent() || isAdmin();
+        // The timeline is the record of status changes. It is written only
+        // by the backend, alongside the status change itself (issue #138).
+        allow write: if false;
       }
 
       // Notes subcollection
@@ -283,15 +296,13 @@ service cloud.firestore {
         allow read: if isOwner(get(/databases/$(database)/documents/applications/$(applicationId)).data.userId) ||
                       isAgent() || isAdmin();
 
-        // Authenticated users with application access can create notes
-        allow create: if isAuthenticated() &&
-                        request.resource.data.authorId == request.auth.uid;
-
-        // Note author can update their own notes
-        allow update: if isOwner(resource.data.authorId);
-
-        // Note author or admin can delete
-        allow delete: if isOwner(resource.data.authorId) || isAdmin();
+        // Notes are written ONLY by the backend (issue #138), through
+        // POST / PUT / DELETE /applications/:id/notes[/:noteId], which checks
+        // that the caller has access to THIS application and stamps the
+        // author. A client rule cannot make that check cheaply, and the old
+        // one did not: it let any signed-in user add a note to any
+        // application. No portal or mobile code writes notes from a client SDK.
+        allow write: if false;
       }
     }
 
@@ -300,20 +311,69 @@ service cloud.firestore {
     // ============================================
 
     match /agencies/{agencyId} {
-      // Agency owner can read/write
-      // Agency members (agents) can read
+      // The agency owner and admins can read. (`agentIds` is not written by
+      // any current flow, so in practice members read their agency through
+      // GET /agencies/me, which redacts the compliance file for them.)
       allow read: if isAuthenticated() &&
                     (resource.data.ownerId == request.auth.uid ||
                      request.auth.uid in resource.data.agentIds ||
                      isAdmin());
 
-      // Authenticated users can create an agency
-      allow create: if isAuthenticated() &&
-                      request.resource.data.ownerId == request.auth.uid;
+      // ---- Owner-editable agency profile (ALLOW-LIST, issue #138) ----
+      // The ONLY fields the owner may change from a client SDK. This list is
+      // the same one the API copies (AGENCY_OWNER_EDITABLE_FIELDS in
+      // functions/src/services/agency.service.ts).
+      function ownerEditableAgencyFields() {
+        return [
+          'name',
+          'address',
+          'state',
+          'description',
+          'consultationFee',
+          'services'
+        ];
+      }
 
-      // Only agency owner or admin can update
-      allow update: if isAuthenticated() &&
-                      (resource.data.ownerId == request.auth.uid || isAdmin());
+      // The agency's owner, as recorded on the document (not by claim): the
+      // claim is derived from this field, so only the record may name it.
+      function isRecordedOwner() {
+        return isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      }
+
+      // ---- Creation is backend-only (issue #138) ----
+      // Creating an agency starts the owner's role, the admin's review queue
+      // and the seat count. It goes through owner onboarding or POST
+      // /agencies (Admin SDK), which always writes `pending_review`, no
+      // compliance file, one member and a server-generated slug. A client
+      // create would have to name its own ownerId and seat count, so it is
+      // refused outright.
+      allow create: if false;
+
+      // ---- Update: the owner-editable profile and nothing else ----
+      // `diff().affectedKeys().hasOnly(...)` makes every other field
+      // server-written, whether or not anybody has thought of it yet:
+      //  - status (+ reviewedBy, reviewedAt, rejectionReason): the admin's
+      //    admission decision (public page, admin review queue);
+      //  - compliance (the whole KYC/KYB/payout file, either key or any
+      //    nested field, and its review metadata): the gate on payment
+      //    requests and on taking platform clients. Its fields are edited
+      //    through /agencies/me/compliance, which locks the file once
+      //    submitted;
+      //  - ownerId: the ownership anchor. The role lookup grants the owner
+      //    role only when the agency names the user (claims.service.ts), and
+      //    the owner endpoints check it;
+      //  - ownerName, slug, id: server-managed identity;
+      //  - totalAgents: the seat check on invitations counts from it;
+      //    totalCases / activeCases: stats;
+      //  - logoUrl: set only by the logo endpoints, after validating the
+      //    upload (issue #141);
+      //  - createdAt / updatedAt: timestamps the server writes.
+      // A document overwrite that drops a protected field is refused too:
+      // the removed key appears in affectedKeys(). The API applies the same
+      // allow-list and type checks (PUT /agencies/me).
+      allow update: if isRecordedOwner() &&
+                      request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(ownerEditableAgencyFields());
 
       // Only admin can delete agencies
       allow delete: if isAdmin();

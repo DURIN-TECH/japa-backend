@@ -375,7 +375,16 @@ export class DocumentController {
       // The storage path in the request was not one the upload-url endpoint
       // issues for this application (issue #141). Nothing was stored.
       if (error instanceof StoragePathRejectedError) {
-        console.warn(`[document] registration refused: storagePath ${error.issue}`);
+        // Who tried, and on which application: a refusal here is worth being
+        // able to trace. The application id comes from the request body, so
+        // it is reduced to id characters and a sane length before it is
+        // logged; the refused path itself is never logged.
+        const loggedApplicationId =
+          String(req.body?.applicationId ?? "unknown").replace(/[^A-Za-z0-9_-]/g, "?").slice(0, 64);
+        console.warn(
+          `[document] registration refused: storagePath ${error.issue} ` +
+            `(caller ${req.userId ?? "unknown"}, application ${loggedApplicationId})`
+        );
         sendError(res, "VALIDATION_ERROR", error.message, 400);
         return;
       }

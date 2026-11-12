@@ -593,6 +593,12 @@ export class ApplicationController {
       // assigned such a case. Admins bypass; the applicant editing their own
       // notes is unaffected (no assignment change).
       const isAdmin = req.user?.admin === true || req.authz?.role === "admin";
+      // A non-admin may place a case only in their OWN agency (the resolved
+      // principal's), never in one named freely in the request (issue #138).
+      if (!isAdmin && updates.agencyId !== undefined && updates.agencyId !== req.authz?.agencyId) {
+        sendError(res, "FORBIDDEN", "You can only assign a case to your own agency", 403);
+        return;
+      }
       const isAssigning =
         updates.agencyId !== undefined ||
         updates.agentId !== undefined ||

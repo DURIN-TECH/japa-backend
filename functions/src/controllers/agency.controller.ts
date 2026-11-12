@@ -1,14 +1,19 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { agencyService, SeatLimitError } from "../services/agency.service";
+import {
+  agencyService,
+  NotAgencyMemberError,
+  readAgencyProfileInput,
+  SeatLimitError,
+} from "../services/agency.service";
 import { storageService } from "../services/storage.service";
 import { notificationService } from "../services/notification.service";
 import { emailService } from "../services/email/email.service";
 import { resolveEventEmail } from "../services/email/event-templates";
 import { EMAIL_BRANDING } from "../services/email/branding";
-import { collections } from "../utils/firebase";
+import { auth, collections } from "../utils/firebase";
 import { validateStoragePath } from "../utils/storage-paths";
-import { AgencyInvitation } from "../types";
+import { Agency, Agent, AgencyInvitation } from "../types";
 // Issue #103: per-visa service prices on the public agency page.
 import { agencyVisaPriceService } from "../agency-visa-prices/agency-visa-price.service";
 import type { PublicAgencyVisaPrice } from "../agency-visa-prices/agency-visa-price.service";
@@ -31,15 +36,126 @@ const ALLOWED_LOGO_CONTENT_TYPES = [
 ];
 
 export class AgencyController {
+  // ============================================
+  // WHO IS ACTING (issue #138)
+  // ============================================
+
+  /**
+   * True when the caller is a platform admin BY CLAIM: the canonical `role`
+   * claim or the legacy `admin: true` boolean (same two signals verifyAdmin
+   * accepts). Never a document field.
+   */
+  private isAdmin(req: AuthenticatedRequest): boolean {
+    return req.authz?.role === ROLES.ADMIN || req.user?.admin === true;
+  }
+
+  /**
+   * Authorize an action on the agency named in the URL (`/agencies/:id/...`).
+   *
+   * Returns the agency when the caller may act on it, otherwise sends the
+   * response and returns null. The caller may act when:
+   *  - they are that agency's OWNER: the resolved principal (`req.authz`)
+   *    says owner of exactly this agency AND the agency's own record names
+   *    them (agencyService.getOwnedAgencyForPrincipal); or
+   *  - `allowAdmin` is set and they are an admin by claim.
+   * The agency id in the URL is therefore never trusted on its own: for an
+   * owner it must be the agency of their own principal.
+   */
+  private async authorizeAgencyAction(
+    req: AuthenticatedRequest,
+    res: Response,
+    agencyId: string,
+    forbiddenMessage: string,
+    opts: { allowAdmin?: boolean } = {}
+  ): Promise<Agency | null> {
+    if (opts.allowAdmin && this.isAdmin(req)) {
+      const agency = await agencyService.getAgencyById(agencyId);
+      if (!agency) {
+        sendError(res, "NOT_FOUND", "Agency not found", 404);
+        return null;
+      }
+      return agency;
+    }
+
+    const owned = await agencyService.getOwnedAgencyForPrincipal(req.authz);
+    if (!owned || owned.id !== agencyId) {
+      sendError(res, "FORBIDDEN", forbiddenMessage, 403);
+      return null;
+    }
+    return owned;
+  }
+
+  /**
+   * Create an invitation for `email` to join `agency` and email the invite
+   * link. Shared by POST /agencies/:id/invitations (the owner typed an
+   * address) and POST /agencies/:id/members (the owner picked an existing
+   * agent, who must still accept). The caller has already been authorized as
+   * the agency's owner. Throws what agencyService.inviteAgent throws
+   * (SeatLimitError, duplicate invitation).
+   */
+  private async issueInvitation(
+    agency: Agency,
+    inviterUserId: string,
+    email: string
+  ): Promise<AgencyInvitation> {
+    // Get inviter's name for denormalization
+    const userDoc = await collections.users.doc(inviterUserId).get();
+    const inviterName = userDoc.exists
+      ? `${userDoc.data()?.firstName || ""} ${userDoc.data()?.lastName || ""}`.trim()
+      : "Unknown";
+
+    const invitation = await agencyService.inviteAgent(
+      agency.id,
+      agency.name,
+      inviterUserId,
+      inviterName,
+      email
+    );
+
+    // Email the invited address directly — the invitee may not have an account
+    // yet, so this bypasses notifyUser (which is keyed by an existing userId).
+    const ev = resolveEventEmail("agent_invited", {
+      title: "Agency invitation",
+      body: "",
+      relatedEntityType: "agency",
+      relatedEntityId: agency.id,
+    });
+    // Deep-link straight to signup with the invitation context so the invitee
+    // lands on a "join {agency}" flow (and is auto-added on account creation)
+    // rather than the generic create-your-own-agency onboarding.
+    const inviteUrl = `${EMAIL_BRANDING.appUrl}/create-account?invite=${invitation.id}`;
+    await emailService
+      .sendNotification({
+        to: email,
+        subject: ev.subject,
+        title: `${inviterName} invited you to join ${agency.name}`,
+        body: `${inviterName} has invited you to join ${agency.name} on Seli as an agent.\n\nCreate your account (or sign in) with this email to join the agency.`,
+        actionUrl: inviteUrl,
+        actionLabel: "Join agency",
+      })
+      .catch((e) => console.error("[invite] email failed:", e));
+
+    return invitation;
+  }
+
   /**
    * POST /agencies
    * Create a new agency. Caller must have an agent profile.
+   *
+   * Only the owner-editable profile fields are read from the body (issue
+   * #138, see readAgencyProfileInput): the new agency always starts
+   * `pending_review` with no compliance file, whatever the body says.
    */
   async createAgency(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
       const userId = req.userId!;
-      const { name, address, state, description, logoUrl, consultationFee, services } = req.body;
 
+      const checked = readAgencyProfileInput(req.body);
+      if (!checked.ok) {
+        sendError(res, "VALIDATION_ERROR", checked.message, 400);
+        return;
+      }
+      const { name } = checked.profile;
       if (!name) {
         sendError(res, "VALIDATION_ERROR", "Agency name is required", 400);
         return;
@@ -52,13 +168,8 @@ export class AgencyController {
         : "Unknown";
 
       const agency = await agencyService.createAgency(userId, ownerName, {
+        ...checked.profile,
         name,
-        address,
-        state,
-        description,
-        logoUrl,
-        consultationFee,
-        services,
       });
 
       // Confirm to the owner that creation is complete and the agency is now
@@ -109,7 +220,7 @@ export class AgencyController {
       // is verified (to render the "locked until verified" callout), so redact
       // everything but the status for anyone who isn't the owner or an admin.
       const isOwner = agency.ownerId === userId;
-      const isAdmin = req.authz?.role === ROLES.ADMIN || req.user?.admin === true;
+      const isAdmin = this.isAdmin(req);
 
       // Self-heal a missing public slug on the owner's read so the "Your public
       // page" link shows up for agencies created before slugs existed — no
@@ -136,30 +247,30 @@ export class AgencyController {
 
   /**
    * PUT /agencies/me
-   * Update the agency the current user owns
+   * Update the agency the current user owns.
+   *
+   * Copies ONLY the owner-editable profile fields (issue #138): name,
+   * address, state, description, consultationFee, services. Every other key
+   * in the body is ignored (status, compliance, ownerId, counters, slug,
+   * logoUrl, ...); a listed key with a value of the wrong type is a 400.
    */
   async updateMyAgency(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const userId = req.userId!;
-
-      // Verify the user is an agency owner
-      const agency = await agencyService.getAgencyByOwnerId(userId);
+      // The agency comes from the resolved principal, checked against the
+      // agency's own record (see getOwnedAgencyForPrincipal).
+      const agency = await agencyService.getOwnedAgencyForPrincipal(req.authz);
       if (!agency) {
         sendError(res, "FORBIDDEN", "Only agency owners can update agency settings", 403);
         return;
       }
 
-      const { name, address, state, description, logoUrl, consultationFee, services } = req.body;
+      const checked = readAgencyProfileInput(req.body);
+      if (!checked.ok) {
+        sendError(res, "VALIDATION_ERROR", checked.message, 400);
+        return;
+      }
 
-      const updated = await agencyService.updateAgency(agency.id, {
-        name,
-        address,
-        state,
-        description,
-        logoUrl,
-        consultationFee,
-        services,
-      });
+      const updated = await agencyService.updateAgency(agency.id, checked.profile);
 
       sendSuccess(res, updated, "Agency updated successfully");
     } catch (error) {
@@ -176,7 +287,6 @@ export class AgencyController {
    */
   async getLogoUploadUrl(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const userId = req.userId!;
       const { fileName, contentType } = req.body;
 
       if (!fileName || !contentType) {
@@ -195,8 +305,9 @@ export class AgencyController {
         return;
       }
 
-      // Only the agency owner may change branding.
-      const agency = await agencyService.getAgencyByOwnerId(userId);
+      // Only the agency owner may change branding (resolved principal,
+      // confirmed by the agency's own record).
+      const agency = await agencyService.getOwnedAgencyForPrincipal(req.authz);
       if (!agency) {
         sendError(res, "FORBIDDEN", "Only agency owners can update the agency logo", 403);
         return;
@@ -223,7 +334,6 @@ export class AgencyController {
    */
   async setLogo(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const userId = req.userId!;
       const { storagePath } = req.body;
 
       if (!storagePath) {
@@ -231,8 +341,9 @@ export class AgencyController {
         return;
       }
 
-      // Only the agency owner may change branding.
-      const agency = await agencyService.getAgencyByOwnerId(userId);
+      // Only the agency owner may change branding (resolved principal,
+      // confirmed by the agency's own record).
+      const agency = await agencyService.getOwnedAgencyForPrincipal(req.authz);
       if (!agency) {
         sendError(res, "FORBIDDEN", "Only agency owners can update the agency logo", 403);
         return;
@@ -258,7 +369,9 @@ export class AgencyController {
       // Make the object public and capture its stable URL for persistent rendering.
       const logoUrl = await storageService.makeFilePublic(checked.key);
 
-      const updated = await agencyService.updateAgency(agency.id, { logoUrl });
+      // A server-decided value (the validated upload's public URL), passed
+      // as a server-written field: `logoUrl` is not owner-editable.
+      const updated = await agencyService.updateAgency(agency.id, {}, { logoUrl });
 
       sendSuccess(res, updated, "Agency logo updated successfully");
     } catch (error) {
@@ -279,9 +392,7 @@ export class AgencyController {
       // admin signals — the `role` claim and the legacy `admin: true` boolean —
       // to match verifyAdmin(); a legacy-claim admin has no `role: "admin"` and
       // was otherwise wrongly rejected with a 403.
-      const isAdmin =
-        req.authz?.role === ROLES.ADMIN || req.user?.admin === true;
-      if (!isAdmin && req.authz?.agencyId !== id) {
+      if (!this.isAdmin(req) && req.authz?.agencyId !== id) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
@@ -295,8 +406,15 @@ export class AgencyController {
   }
 
   /**
-   * POST /agencies/:id/members
-   * Add an existing agent to the agency (owner only)
+   * POST /agencies/:id/members   { agentId }
+   * Ask an existing, independent agent to join the agency (owner only).
+   *
+   * The agent is NOT attached here (issue #138): joining an agency changes
+   * who can see the agent's work and what the agent may do, so it needs the
+   * agent's consent. This endpoint sends the agent an ordinary invitation
+   * (same record, same email, same seat check as POST /agencies/:id/invitations)
+   * and answers 202; the agent becomes a member, and gets the member claims,
+   * only when they accept it.
    */
   async addMember(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
@@ -304,25 +422,53 @@ export class AgencyController {
       const { id } = req.params;
       const { agentId } = req.body;
 
-      if (!agentId) {
+      // A plain document id, nothing else.
+      if (typeof agentId !== "string" || !agentId || agentId.includes("/")) {
         sendError(res, "VALIDATION_ERROR", "agentId is required", 400);
         return;
       }
 
-      // Verify the user is the owner of this agency
-      const agency = await agencyService.getAgencyById(id);
-      if (!agency || agency.ownerId !== userId) {
-        sendError(res, "FORBIDDEN", "Only agency owners can add members", 403);
+      // Only the owner of THIS agency (admins do not invite: an invitation
+      // is only valid when issued by the agency's owner).
+      const agency = await this.authorizeAgencyAction(req, res, id, "Only agency owners can add members");
+      if (!agency) return;
+
+      // The agent must exist and be independent.
+      const agentDoc = await collections.agents.doc(agentId).get();
+      if (!agentDoc.exists) {
+        sendError(res, "VALIDATION_ERROR", "Agent not found", 400);
+        return;
+      }
+      const agent = agentDoc.data() as Agent;
+      if (agent.agencyId) {
+        sendError(res, "VALIDATION_ERROR", "Agent is already part of an agency", 400);
         return;
       }
 
-      await agencyService.addAgentToAgency(id, agentId);
-      sendSuccess(res, { added: true }, "Agent added to agency");
+      // Invite the address on the agent's ACCOUNT (Firebase Auth), which is
+      // the address their token carries and the one acceptance is matched on.
+      const account = await auth.getUser(agent.userId).catch(() => null);
+      if (!account?.email) {
+        sendError(res, "VALIDATION_ERROR", "Agent not found", 400);
+        return;
+      }
+
+      const invitation = await this.issueInvitation(agency, userId, account.email);
+      sendSuccess(
+        res,
+        { added: false, invited: true, invitationId: invitation.id },
+        "Invitation sent. The agent joins the agency when they accept it.",
+        202
+      );
     } catch (error) {
       console.error("Error adding member:", error);
+      if (error instanceof SeatLimitError) {
+        sendError(res, "UPGRADE_REQUIRED", error.message, 402);
+        return;
+      }
       const message = (error as Error).message;
-      if (message === "Agent is already part of an agency" || message === "Agent not found") {
-        sendError(res, "VALIDATION_ERROR", message, 400);
+      if (message === "An invitation has already been sent to this email") {
+        sendError(res, "DUPLICATE", message, 409);
         return;
       }
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -331,24 +477,31 @@ export class AgencyController {
 
   /**
    * DELETE /agencies/:id/members/:agentId
-   * Remove an agent from the agency (owner only)
+   * Remove an agent from the agency (that agency's owner, or an admin).
+   *
+   * Two checks (issue #138): the caller owns the agency in the URL (or is an
+   * admin by claim), AND the agent is currently a member of that same agency.
+   * The second check lives in the service, so the agent id from the URL can
+   * never reach a member of another agency.
    */
   async removeMember(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id, agentId } = req.params;
 
-      // Verify the user is the owner of this agency
-      const agency = await agencyService.getAgencyById(id);
-      if (!agency || agency.ownerId !== userId) {
-        sendError(res, "FORBIDDEN", "Only agency owners can remove members", 403);
-        return;
-      }
+      const agency = await this.authorizeAgencyAction(
+        req,
+        res,
+        id,
+        "Only agency owners can remove members",
+        { allowAdmin: true }
+      );
+      if (!agency) return;
 
       // Capture the agent's user id before removal so we can notify them.
+      // Only used after the service has confirmed they were a member here.
       const removedUserId = (await collections.agents.doc(agentId).get()).data()
         ?.userId as string | undefined;
-      await agencyService.removeAgentFromAgency(agentId);
+      await agencyService.removeAgentFromAgency(agency.id, agentId);
       if (removedUserId) {
         await notificationService
           .notifyUser({
@@ -363,10 +516,15 @@ export class AgencyController {
       }
       sendSuccess(res, { removed: true }, "Agent removed from agency");
     } catch (error) {
+      // Not a member of THIS agency (wrong agency, no agency, no such agent):
+      // one answer for all three, nothing changed.
+      if (error instanceof NotAgencyMemberError) {
+        sendError(res, "NOT_FOUND", error.message, 404);
+        return;
+      }
       console.error("Error removing member:", error);
       const message = (error as Error).message;
       if (
-        message === "Agent is not part of any agency" ||
         message === "Agency owner cannot be removed. Transfer ownership or delete the agency."
       ) {
         sendError(res, "VALIDATION_ERROR", message, 400);
@@ -391,49 +549,16 @@ export class AgencyController {
         return;
       }
 
-      // Verify the user is the owner of this agency
-      const agency = await agencyService.getAgencyById(id);
-      if (!agency || agency.ownerId !== userId) {
-        sendError(res, "FORBIDDEN", "Only agency owners can invite agents", 403);
+      if (typeof email !== "string") {
+        sendError(res, "VALIDATION_ERROR", "Email is required", 400);
         return;
       }
 
-      // Get inviter's name for denormalization
-      const userDoc = await collections.users.doc(userId).get();
-      const inviterName = userDoc.exists
-        ? `${userDoc.data()?.firstName || ""} ${userDoc.data()?.lastName || ""}`.trim()
-        : "Unknown";
+      // Only the owner of THIS agency (resolved principal + agency record).
+      const agency = await this.authorizeAgencyAction(req, res, id, "Only agency owners can invite agents");
+      if (!agency) return;
 
-      const invitation = await agencyService.inviteAgent(
-        id,
-        agency.name,
-        userId,
-        inviterName,
-        email
-      );
-
-      // Email the invited address directly — the invitee may not have an account
-      // yet, so this bypasses notifyUser (which is keyed by an existing userId).
-      const ev = resolveEventEmail("agent_invited", {
-        title: "Agency invitation",
-        body: "",
-        relatedEntityType: "agency",
-        relatedEntityId: id,
-      });
-      // Deep-link straight to signup with the invitation context so the invitee
-      // lands on a "join {agency}" flow (and is auto-added on account creation)
-      // rather than the generic create-your-own-agency onboarding.
-      const inviteUrl = `${EMAIL_BRANDING.appUrl}/create-account?invite=${invitation.id}`;
-      await emailService
-        .sendNotification({
-          to: email,
-          subject: ev.subject,
-          title: `${inviterName} invited you to join ${agency.name}`,
-          body: `${inviterName} has invited you to join ${agency.name} on Seli as an agent.\n\nCreate your account (or sign in) with this email to join the agency.`,
-          actionUrl: inviteUrl,
-          actionLabel: "Join agency",
-        })
-        .catch((e) => console.error("[invite] email failed:", e));
+      const invitation = await this.issueInvitation(agency, userId, email);
 
       sendCreated(res, invitation, "Invitation sent successfully");
     } catch (error) {
@@ -457,15 +582,11 @@ export class AgencyController {
    */
   async getInvitations(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id } = req.params;
 
-      // Verify the user is the owner of this agency
-      const agency = await agencyService.getAgencyById(id);
-      if (!agency || agency.ownerId !== userId) {
-        sendError(res, "FORBIDDEN", "Only agency owners can view invitations", 403);
-        return;
-      }
+      // Only the owner of THIS agency (resolved principal + agency record).
+      const agency = await this.authorizeAgencyAction(req, res, id, "Only agency owners can view invitations");
+      if (!agency) return;
 
       const invitations = await agencyService.getAgencyInvitations(id);
       sendSuccess(res, invitations);
@@ -643,7 +764,9 @@ export class AgencyController {
 
   /**
    * POST /invitations/:id/decline
-   * Decline an agency invitation
+   * Decline an agency invitation. Only the invited address may (issue #138):
+   * the service matches the email on the caller's token against the
+   * invitation, and nothing is sent to the owner unless that passed.
    */
   async declineInvitation(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
@@ -651,7 +774,7 @@ export class AgencyController {
 
       // Capture the invitation before declining so we can notify the owner.
       const invite = (await collections.agencyInvitations.doc(id).get()).data();
-      await agencyService.declineInvitation(id);
+      await agencyService.declineInvitation(id, req.user?.email);
       if (invite?.invitedBy) {
         await notificationService
           .notifyUser({
@@ -686,7 +809,6 @@ export class AgencyController {
    */
   async cancelInvitation(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const userId = req.userId!;
       const { id } = req.params;
 
       // Load the invitation so we can authorize against its agency.
@@ -699,11 +821,15 @@ export class AgencyController {
       }
 
       // Only the owning agency's owner (or an admin) can cancel the invite.
-      const isAdmin = req.authz?.role === ROLES.ADMIN || req.user?.admin === true;
-      const agency = await agencyService.getAgencyById(invite.agencyId);
-      if (!isAdmin && (!agency || agency.ownerId !== userId)) {
-        sendError(res, "FORBIDDEN", "Only agency owners can cancel invitations", 403);
-        return;
+      // The owner check is the shared one (resolved principal + agency
+      // record, issue #138). An admin may cancel even when the agency record
+      // is gone, so that a stray invitation can always be cleaned up.
+      if (!this.isAdmin(req)) {
+        const owned = await agencyService.getOwnedAgencyForPrincipal(req.authz);
+        if (!owned || owned.id !== invite.agencyId) {
+          sendError(res, "FORBIDDEN", "Only agency owners can cancel invitations", 403);
+          return;
+        }
       }
 
       await agencyService.cancelInvitation(id);
