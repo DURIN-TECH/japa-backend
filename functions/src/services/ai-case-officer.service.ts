@@ -102,6 +102,9 @@ export interface AssessmentDeps {
 export type RequestOutcome =
   | { kind: "no_rubric"; routeKey: string }
   | { kind: "upgrade_required" }
+  // Only when the caller set `maxAttempts` (the #117 auto-run): the failed job
+  // for these inputs has used its attempts, so it is NOT queued again.
+  | { kind: "attempts_exhausted"; assessmentId: string }
   | { kind: "stored" | "running" | "queued" | "created"; assessmentId: string; status: AssessmentStatus; rubricVersion: number };
 
 /** Inputs the job and the request both read, loaded once. */
@@ -362,7 +365,7 @@ export class AiCaseOfficerService {
    */
   async requestAssessment(
     app: Application,
-    opts: { tier: AssessmentTier; trigger: AssessmentTrigger; requestedBy: string }
+    opts: { tier: AssessmentTier; trigger: AssessmentTrigger; requestedBy: string; maxAttempts?: number }
   ): Promise<RequestOutcome> {
     const rubric = await this.deps.rubrics.getApprovedRubric(app.countryCode, app.visaTypeId);
     if (!rubric) return { kind: "no_rubric", routeKey: rubricRouteKey(app.countryCode, app.visaTypeId) };
@@ -385,7 +388,11 @@ export class AiCaseOfficerService {
         if (cur.status === "queued" || cur.status === "running") {
           return { kind: cur.status, assessmentId, status: cur.status, rubricVersion: cur.rubricVersion };
         }
-        // Failed: a retry on the same inputs is free on both tiers.
+        // Failed: a retry on the same inputs is free on both tiers, unless the
+        // caller caps attempts (#117 auto-run: one automatic retry, then stop).
+        if (opts.maxAttempts !== undefined && (cur.attempt ?? 1) >= opts.maxAttempts) {
+          return { kind: "attempts_exhausted", assessmentId };
+        }
         tx.update(ref, {
           status: "queued",
           error: null,

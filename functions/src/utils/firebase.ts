@@ -219,6 +219,12 @@ export const collections = {
   // the input hash, so the same inputs address the same document. Backend-only:
   // no firestore.rules match, so clients read it only through /ai routes.
   applicationAssessments: db.collection("applicationAssessments"),
+  // Auto-run debounce markers (issue #117): `assessmentDebounce/{applicationId}`,
+  // one per application with a recent document change. Backend-only.
+  assessmentDebounce: db.collection("assessmentDebounce"),
+  // One-per-assessment notification claims (issue #117), id = assessmentId.
+  // Created with `create()`, so a duplicate trigger delivery cannot notify twice. Backend-only.
+  assessmentNotifications: db.collection("assessmentNotifications"),
   // Eligibility checks (read by the assessment for the score and nationality).
   // The same collection EligibilityService writes; listed here so the AI path
   // reads it through the registry, not a second `db.collection` call.
