@@ -24,7 +24,18 @@ import type { CostTotals, LlmUsage, RunCostBreakdown } from "../cost/types";
 // (scrapeRunService.registerFinalizeHook).
 
 /** Which scraper produced the run. */
-export type ScrapeRunKind = "visa" | "news";
+// Issue #143: "guidance" = the caseworker-guidance crawl (guidanceSources
+// registry, scrapers/guidance/). It shares the run records, source leases and
+// alert rules with the other two, but has NO scraper-settings block, no
+// per-source admin PATCH and no cost: those APIs stay on ScraperSettingsKind.
+export type ScrapeRunKind = "visa" | "news" | "guidance";
+
+/**
+ * The kinds that have a block in appConfig/scraperSettings, a per-source
+ * admin PATCH, a Run now request and a health row (visa and news). Guidance
+ * is deliberately not here: its admin surface is /admin/guidance-sources.
+ */
+export type ScraperSettingsKind = Exclude<ScrapeRunKind, "guidance">;
 
 /**
  * What started the run:
@@ -46,7 +57,9 @@ export type ScrapeRunTrigger = "scheduled" | "manual" | "script";
 export type ScrapeRunStatus = "running" | "succeeded" | "partial" | "failed";
 
 /** Every kind / trigger / status value, for validating API query params. */
-export const SCRAPE_RUN_KINDS: readonly ScrapeRunKind[] = ["visa", "news"];
+export const SCRAPE_RUN_KINDS: readonly ScrapeRunKind[] = ["visa", "news", "guidance"];
+/** Kinds accepted by the settings / Run now / source-health APIs (see ScraperSettingsKind). */
+export const SCRAPER_SETTINGS_KINDS: readonly ScraperSettingsKind[] = ["visa", "news"];
 export const SCRAPE_RUN_TRIGGERS: readonly ScrapeRunTrigger[] = ["scheduled", "manual", "script"];
 export const SCRAPE_RUN_STATUSES: readonly ScrapeRunStatus[] = ["running", "succeeded", "partial", "failed"];
 

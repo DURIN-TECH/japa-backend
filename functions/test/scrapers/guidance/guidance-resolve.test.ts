@@ -184,6 +184,12 @@ before(async () => {
   const firebase: any = await import("../../../src/utils/firebase");
   firebase.collections.guidanceSources = fakeCollection("guidanceSources");
   firebase.subcollections.guidanceSnapshots = (id: string) => fakeCollection(`guidanceSources/${id}/snapshots`);
+  firebase.collections.scrapeRuns = fakeCollection("scrapeRuns");
+  firebase.collections.scrapeSourceLeases = fakeCollection("scrapeSourceLeases");
+  const runs: any = await import("../../../src/scrapers/shared/runs/scrape-run.service");
+  runs.scrapeRunService.runTransaction = fakeRunTransaction;
+  const leases: any = await import("../../../src/scrapers/shared/runs/source-lease");
+  leases.sourceLeaseService.runTransaction = fakeRunTransaction;
 });
 
 beforeEach(() => {

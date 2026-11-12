@@ -1,4 +1,5 @@
 import { Timestamp } from "firebase-admin/firestore";
+import type { ApplicationIntake } from "./intake";
 // Automated-verification result shapes live with the provider contract; the
 // compliance file below embeds them as optional signals (see the verification
 // service). One-way import (types -> verification.types), so no cycle.
@@ -416,6 +417,12 @@ export interface VisaType {
   // Eligibility
   eligibilityCriteria: string[];
 
+  // Issue #129: official "documents you must provide", extracted verbatim from
+  // the scraped page and written only on admin approval (scrapeMeta.citations
+  // holds the per-item quote under "requiredDocuments.<index>"). ABSENT when
+  // the page lists none; plain strings, never invented.
+  requiredDocuments?: string[];
+
   // Official application
   applicationUrl?: string; // URL to official online application form (e.g., AVATS for Ireland)
   applicationInstructions?: string; // Brief instructions for completing official application
@@ -737,6 +744,11 @@ export interface Application {
   visaTypeName?: string;
   countryName?: string;
 
+  // Answers to the route's intake questions (issue #113). Written only by
+  // PUT /applications/:id/intake, which validates them against the approved
+  // rubric; never through the generic application update.
+  intake?: ApplicationIntake;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -944,12 +956,59 @@ export interface DocumentRequest {
   /** Id of the `Document` the client uploaded to satisfy this request. */
   fulfilledDocumentId?: string;
   fulfilledAt?: Timestamp;
-  /** Uid of whoever moved it to a terminal non-fulfilled state (waive/cancel). */
+  /** Uid of whoever moved it to a terminal non-fulfilled state (waive/cancel).
+   *  `"system"` (CHECKLIST_SYSTEM_ACTOR_ID) when the checklist sync cancelled it. */
   resolvedBy?: string;
+
+  // --- Back-reference to an accepted AI proposed action (issue #44) ------------
+  // Additive and optional: set only on a request created by accepting a proposed
+  // action (`applicationAssessments/{sourceAssessmentId}/proposedActions/{sourceActionId}`).
+  // Existing consumers ignore them. They make accept idempotent and let a
+  // fulfilled / waived / cancelled request update the action it came from.
+  sourceAssessmentId?: string;
+  sourceActionId?: string;
+  // --- Checklist-origin fields (issue #114) ------------------------------------
+  // All OPTIONAL: agent-raised requests and every pre-existing document carry
+  // none of them and behave exactly as before.
+  /** `"checklist"` when the request was generated from the verified visa
+   *  record by the checklist builder; absent for agent-raised requests. */
+  origin?: "checklist";
+  /** Stable id of the checklist item (from the rubric evidence key, or the
+   *  visa record's document list). With `applicationId` it is the idempotency
+   *  key: the doc id is `{applicationId}__{checklistItemId}`. */
+  checklistItemId?: string;
+  /** Whose document it is. `sponsor` documents are still uploaded by the
+   *  applicant (the sponsor has no account) and belong to the applicant. */
+  holder?: "applicant" | "sponsor";
+  /** Why the document is asked for: a deterministic template filled from the
+   *  rubric criterion, so it is always present on a checklist item. */
+  reason?: string;
+  /** Whether the source calls the document required (false = optional). */
+  required?: boolean;
+  /** The rubric criterion this item mainly evidences (its `ruleRef` or
+   *  `criterionId`), for display and audit. */
+  criterionRef?: string;
+  /** The published source behind the item: verbatim quote + official URL. */
+  citation?: DocumentRequestCitation;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
+
+/** Verbatim quote + URL behind a checklist item (never model-written). */
+export interface DocumentRequestCitation {
+  /** The exact words of the published source. */
+  quote: string;
+  /** The official page the quote is on. */
+  url: string;
+  /** The publisher's own paragraph / section number, when the rubric has one. */
+  ruleRef?: string;
+}
+
+/** Actor recorded as `requestedBy` / `resolvedBy` on system-built requests. */
+export const CHECKLIST_SYSTEM_ACTOR_ID = "system";
+/** Display name shown to the applicant for system-built requests. */
+export const CHECKLIST_SYSTEM_ACTOR_NAME = "Seli";
 
 // ============================================
 // CONSULTATION TYPES
@@ -1159,6 +1218,14 @@ export type NotificationType =
   | "application_created" // An agent started an application on a client's behalf
   | "application_assigned" // An application was assigned to an agent
   | "application_withdrawn"
+  // The approved rules changed and a bulk re-assessment (#37) produced a worse
+  // or blocking result: sent to the assigned agent / agency owner / admins,
+  // NEVER to the applicant.
+  | "assessment_rules_updated"
+  // The published rules or details of an in-flight application's route changed
+  // (issue #123), raised only from an ADMIN-APPROVED change. Staff get the
+  // detail; an applicant only ever gets a neutral, factual notice.
+  | "rule_change_alert"
   // Documents
   | "document_status"
   | "document_uploaded" // Client uploaded a document for review
@@ -1227,6 +1294,9 @@ export type NotificationType =
   // exists precisely because the real-time channels were missed.
   | "message_unread_reminder"
   | "visa_news"
+  // Issue #117: an automatic pre-review run produced findings that differ from
+  // the previous run. Goes to the assigned agent only, never to the applicant.
+  | "assessment_insights"
   | "system";
 
 // Delivery channels supported by the unified notifier (`notifyUser`). Each channel

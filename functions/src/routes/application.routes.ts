@@ -24,6 +24,14 @@ router.get("/", verifyAuth, (req, res) =>
 router.get("/:id", verifyAuth, (req, res) =>
   applicationController.getApplication(req, res)
 );
+// Intake answers (#113): questions come from the approved rubric. Declared
+// with the other "/:id/..." routes; authz is checked in the handlers.
+router.get("/:id/intake", verifyAuth, (req, res) =>
+  applicationController.getIntake(req, res)
+);
+router.put("/:id/intake", verifyAuth, (req, res) =>
+  applicationController.saveIntake(req, res)
+);
 router.put("/:id", verifyAuth, (req, res) =>
   applicationController.updateApplication(req, res)
 );

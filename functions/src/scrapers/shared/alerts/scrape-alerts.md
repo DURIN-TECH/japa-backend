@@ -49,6 +49,7 @@ still catches `run_failed`, the other per-run rules are lost for that run.
 | `llm_budget` | `llm_budget:<YYYY-MM>` | month-to-date LLM cost >= a `budgetPcts` level; `level` = highest reached | new month / under every level | 50% info, 80% warning, 100% critical |
 | `budget_hard_stop` (#96) | `budget_hard_stop:visa` | a visa run's `summary.budgetHardStop` is true: the hard stop (`appConfig/scraperSettings.budget.hardStop`) skipped extraction because month-to-date cost reached the budget | a visa run that checked the budget and found it under (`budgetChecked && !budgetOver`), or the hourly check: stop off / no budget / spend under budget | critical |
 | `settings_unreadable` (#96) | `settings_unreadable:scrapers` | hourly: `appConfig/scraperSettings` could not be read (scheduled ticks fail closed meanwhile) | a later read succeeds | critical |
+| `infrastructure_error` (#143) | `infrastructure_error:guidance` | post-run, guidance runs: `summary.infrastructureErrors` non-empty (Cloud Storage / Firestore failed on our side; never blames a source). A persistent outage bumps this one alert | the next guidance run with an empty `infrastructureErrors` | critical |
 | `review_queue_stale` | `review_queue_stale:visa` | a scraped visa pending review (queued at max(createdAt, restoredAt)) or an open `pendingVisaChanges` row waiting longer than `reviewQueueMaxAgeDays` | nothing is that old | info |
 
 How `host_backoff` sees hosts: visa page lines (`pages[]`, every line's host is
@@ -239,3 +240,11 @@ like the #81 one. The rules also use existing indexes: `scrapeRuns`
 `scrapeAlertKeys` needs no index or TTL (one doc per active alert or manual
 resolve tombstone; deleted on auto-resolve, replaced by the next occurrence).
 `emailPending == true` uses the automatic single-field index. Both collections are backend-only (no `firestore.rules` match).
+
+## Guidance crawl (issue #143)
+
+`kind: "guidance"` runs (`crawlGuidanceOrchestrator`, nightly 03:20 UTC) use the
+same rules as visa and news: `run_failed`, `run_stuck`, `host_backoff`, and
+`source_broken`, where a guidance source's `failing` status counts as `broken`
+(`source_broken:guidance:<sourceId>`, auto-resolved when the source is `active`
+again). `infrastructure_error` is guidance-only.

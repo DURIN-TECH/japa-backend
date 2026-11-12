@@ -17,6 +17,10 @@ import { ProposalManualCostInput, planProposalManualCost } from "./visa-change-m
 // Canonical country-stats recompute. One-way import: visa.service.ts must
 // never import this module or the catalog service (no circular import).
 import { visaService } from "../../../services/visa.service";
+import type { DocumentData, UpdateData } from "firebase-admin/firestore";
+// Transaction.update() wants UpdateData<DocumentData>; the field maps built here are
+// Record<string, unknown> (dotted paths + FieldValue sentinels), which tsc rejects.
+type FsUpdate = UpdateData<DocumentData>;
 
 // ============================================
 // VISA CATALOG — PROPOSED EDITS TO LIVE VISAS (issue #61)
@@ -214,7 +218,7 @@ class VisaChangeService {
     if (!isValidDocId(id)) throw changeNotFound();
     const rowRef = collections.pendingVisaChanges.doc(id);
 
-    const { countryCode, visaId } = await this.runTransaction(async (tx) => {
+    const { countryCode, visaId, diff, sourceUrl } = await this.runTransaction(async (tx) => {
       const rowSnap = await tx.get(rowRef);
       if (!rowSnap.exists) throw changeNotFound();
       const change = rowFrom(rowSnap);
@@ -245,7 +249,7 @@ class VisaChangeService {
       // ---- Writes ----
       const now = Timestamp.now();
       const { update, appliedFields } = buildApprovalUpdate(change, reviewerUid, now);
-      tx.update(visaRef, update);
+      tx.update(visaRef, update as FsUpdate);
       tx.update(rowRef, {
         status: "approved",
         resolvedBy: reviewerUid,
@@ -253,8 +257,21 @@ class VisaChangeService {
         appliedFields,
         updatedAt: now,
       });
-      return { countryCode: change.countryCode, visaId: change.visaId };
+      return { countryCode: change.countryCode, visaId: change.visaId, diff: change.diff, sourceUrl: change.proposedSourceUrl ?? change.sourceUrl ?? null };
     });
+
+    // ---- After commit: record the approved change for rule-change alerts (#123) ----
+    // OUTSIDE the transaction, and its failure is logged and swallowed: it can
+    // never fail or roll back the approval. Only this APPROVE path records an
+    // event; a rejected or still-open proposal triggers nothing. Imported
+    // lazily so the services layer is not loaded while this module is (it
+    // reaches back into the scrapers barrel).
+    try {
+      const { ruleChangeAlertsService } = await import("../../../services/rule-change-alerts.service");
+      await ruleChangeAlertsService.recordVisaChangeApproved({ changeId: id, countryCode, visaId, diff, sourceUrl, approvedBy: reviewerUid });
+    } catch (error) {
+      console.error(`Approval of visa change ${id} (${countryCode}/${visaId}) committed but recording its rule-change alert failed:`, error);
+    }
 
     // ---- After commit: stats follow an edited cost / processing days ----
     try {
@@ -463,7 +480,7 @@ class VisaChangeService {
         if (!visaSnap.exists) return null;
         const patch = planProposalFeeReconvert(change, visaSnap.data() as VisaType, fx, Timestamp.now());
         if (!patch) return null;
-        tx.update(doc.ref, patch);
+        tx.update(doc.ref, patch as FsUpdate);
         return (patch.proposed as Record<string, unknown>).baseCostUsd !== undefined ? "reconverted" : "reflagged";
       });
       if (outcome) result[outcome]++;

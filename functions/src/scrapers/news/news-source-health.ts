@@ -8,6 +8,10 @@ import {
   type AutoPauseFields,
   type SourceRunOutcome,
 } from "../shared/runs/source-health";
+import type { DocumentData, UpdateData } from "firebase-admin/firestore";
+// Transaction.update() wants UpdateData<DocumentData>; the field maps built here are
+// Record<string, unknown> (dotted paths + FieldValue sentinels), which tsc rejects.
+type FsUpdate = UpdateData<DocumentData>;
 
 // ============================================
 // NEWS SOURCE HEALTH — the per-run write on newsSources/{id} (issue #107)
@@ -135,7 +139,7 @@ export class NewsSourceHealthService {
       if (health.newlyAutoPaused) {
         console.warn(`Source ${source.name ?? sourceId} auto-paused after ${health.consecutiveFailures} consecutive failures (limit ${limit})`);
       }
-      tx.update(ref, updates);
+      tx.update(ref, updates as FsUpdate);
       return {
         status: health.status,
         consecutiveFailures: health.consecutiveFailures,

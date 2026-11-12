@@ -4,7 +4,7 @@ import { userService } from "../services/user.service";
 import { storageService } from "../services/storage.service";
 import { claimsService } from "../services/claims.service";
 import { notificationService } from "../services/notification.service";
-import { emailService } from "../services/email/email.service";
+import { emailService, LOCAL_SUPPRESSED_REASON } from "../services/email/email.service";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { auth } from "../utils/firebase";
 import { validateStoragePath } from "../utils/storage-paths";
@@ -521,7 +521,18 @@ export class UserController {
         // isn't attached to any account yet, so an address lookup would miss.
         brandFor: { userId },
       });
-      if (confirmResult.status !== "sent") {
+      if (
+        confirmResult.status === "skipped" &&
+        confirmResult.error === LOCAL_SUPPRESSED_REASON
+      ) {
+        // Deliberate local suppression (EMAIL_SENDING_ENABLED off under the emulator):
+        // expected, not a failure — log at info level only.
+        console.info(
+          `[user:change-email] confirmation email to ${newEmail} not sent — local ` +
+            "email sending is off (set EMAIL_SENDING_ENABLED=true in functions/.env.local to enable)."
+        );
+      } else if (confirmResult.status !== "sent") {
+        // Real failure or genuinely unconfigured provider: keep error-level logging.
         console.error(
           `[user:change-email] confirmation email to ${newEmail} was not sent ` +
             `(status=${confirmResult.status}${confirmResult.error ? `: ${confirmResult.error}` : ""}).`

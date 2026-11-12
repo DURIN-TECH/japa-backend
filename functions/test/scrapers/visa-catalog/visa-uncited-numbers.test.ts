@@ -290,7 +290,7 @@ describe("ingest mapping with unknown processing (issue #86)", () => {
   });
 
   test("absentFieldDeletes is empty when every field is present", () => {
-    assert.deepEqual(absentFieldDeletes({ processingDaysMin: 1, processingDaysMax: 2, maxExtensions: 1 }), {});
+    assert.deepEqual(absentFieldDeletes({ processingDaysMin: 1, processingDaysMax: 2, maxExtensions: 1, requiredDocuments: ["x"] }), {});
   });
 
   test("buildScrapeMeta records processingUnknown + uncitedFieldsDropped + supplements", () => {

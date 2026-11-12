@@ -1,6 +1,6 @@
 import type { Timestamp } from "firebase-admin/firestore";
 import type { CrawlWindow } from "../../visa-catalog/types";
-import type { ScrapeRunKind } from "../runs/types";
+import type { ScraperSettingsKind } from "../runs/types";
 
 // ============================================
 // SCRAPER SETTINGS — shapes (issue #96)
@@ -148,7 +148,7 @@ export type ScrapeRunRequestStatus = "queued" | "running" | "succeeded" | "faile
 /** The `scrapeRunRequests/{id}` doc. */
 export interface ScrapeRunRequestDoc {
   id: string;
-  kind: ScrapeRunKind;
+  kind: ScraperSettingsKind;
   scope: ScrapeRunRequestScope;
   sourceId: string | null; // set for scope "source"
   force: boolean; // ignore the content-hash gate (visa only)

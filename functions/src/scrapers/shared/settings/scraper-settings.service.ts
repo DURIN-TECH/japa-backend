@@ -1,7 +1,7 @@
 import { FieldValue, Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db } from "../../../utils/firebase";
 import { toJson } from "../runs/scrape-run.service";
-import type { ScrapeRunKind } from "../runs/types";
+import type { ScraperSettingsKind } from "../runs/types";
 import {
   LLM_PRICING_DOC_ID,
   SCRAPE_BUDGET_DOC_ID,
@@ -28,6 +28,10 @@ import {
   type ParsedSourcePatch,
 } from "./scraper-settings.validate";
 import type { ScraperSettings, SettingsChange, SettingsHistoryDoc } from "./types";
+import type { DocumentData, UpdateData } from "firebase-admin/firestore";
+// Transaction.update() wants UpdateData<DocumentData>; the field maps built here are
+// Record<string, unknown> (dotted paths + FieldValue sentinels), which tsc rejects.
+type FsUpdate = UpdateData<DocumentData>;
 
 // ============================================
 // SCRAPER SETTINGS — admin view + edits (issue #96)
@@ -62,7 +66,7 @@ export class InvalidHistoryCursorError extends Error {
 
 /** Thrown when the source of a per-source edit does not exist (-> 404). */
 export class SourceNotFoundError extends Error {
-  constructor(kind: ScrapeRunKind, id: string) {
+  constructor(kind: ScraperSettingsKind, id: string) {
     super(`${kind} source ${id} not found`);
   }
 }
@@ -347,7 +351,7 @@ export class ScraperSettingsService {
    *  - clearHostBackoffs (visa): hostBackoffs [].
    */
   async updateSource(
-    kind: ScrapeRunKind,
+    kind: ScraperSettingsKind,
     id: string,
     patch: ParsedSourcePatch,
     uid: string,
@@ -455,7 +459,7 @@ export class ScraperSettingsService {
       update["adminOverrides.updatedAt"] = at;
       update["adminOverrides.updatedBy"] = uid;
       update.updatedAt = at;
-      tx.update(ref, update);
+      tx.update(ref, update as FsUpdate);
       this.writeHistory(tx, { at, by: uid, target: `source:${kind}:${id}`, changes });
       return changes;
     });

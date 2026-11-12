@@ -1,5 +1,5 @@
 import type { CrawlWindow } from "../../visa-catalog/types";
-import type { ScrapeRunKind } from "../runs/types";
+import type { ScraperSettingsKind } from "../runs/types";
 import { assertValidCrawlWindow } from "../etiquette/visa-crawl-window";
 import { isValidPricingDoc } from "../cost/scrape-cost.service";
 import type { LlmPricingDoc } from "../cost/types";
@@ -330,7 +330,7 @@ export interface ParsedSourcePatch {
 }
 
 /** Parse a per-source PATCH. Throws SettingsValidationError on the first bad field. */
-export function parseSourcePatch(kind: ScrapeRunKind, body: unknown): ParsedSourcePatch {
+export function parseSourcePatch(kind: ScraperSettingsKind, body: unknown): ParsedSourcePatch {
   if (!isObj(body)) throw new SettingsValidationError("body", "the body must be a JSON object");
   // Issue #17: news sources additionally take the config keys (and a sent
   // `strategy` gets its own "cannot be changed" 400 from the news module).

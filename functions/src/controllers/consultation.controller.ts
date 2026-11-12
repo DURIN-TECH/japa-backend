@@ -243,7 +243,13 @@ export class ConsultationController {
         }
         resolvedClientId = bodyClientId;
         resolvedAgentUserId = authUserId;
-        agentAgencyId = agentProfile.agencyId;
+        // The agency comes from the RESOLVED PRINCIPAL (issue #138), not from
+        // the caller's own agent document: the principal is the membership
+        // that was checked against the agency's records, and it is the same
+        // value the monthly-limit scope below uses. An agent document that
+        // names an agency the principal does not belong to must not file a
+        // consultation under that agency.
+        agentAgencyId = req.authz?.agencyId ?? undefined;
         agentDisplayName = agentProfile.displayName;
       } else {
         // Client-initiated flow: auth'd user is the client, body has agentId

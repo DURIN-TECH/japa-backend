@@ -53,6 +53,11 @@ export interface UpdateAgentInput {
  * server flows (onboarding, invitations, agency member endpoints, admin
  * verification, review aggregation).
  *
+ * `isAvailable` is on the list but is NOT a free field: only a verified
+ * agent may switch it on. `updateAgent` applies the same check as the
+ * availability endpoint before writing it (issue #138, see
+ * `assertMayBeAvailable`).
+ *
  * See also `selfEditableAgentFields()` in firestore.rules (direct client
  * writes; slightly stricter, it leaves out `isAvailable`).
  */
@@ -70,6 +75,28 @@ export const AGENT_SELF_EDITABLE_FIELDS = [
   "isAvailable",
   "availableSlots",
 ] as const;
+
+/**
+ * Thrown when an agent who is not verified tries to switch themselves
+ * available. One rule, enforced in one place (`assertMayBeAvailable`), for
+ * both endpoints that can set `isAvailable`: PUT /agents/me/availability and
+ * PUT /agents/me (issue #138). The message is kept as it always was, since
+ * existing handlers match on it.
+ */
+export class AgentNotVerifiedError extends Error {
+  constructor() {
+    super("Agent must be verified to be available");
+    this.name = "AgentNotVerifiedError";
+  }
+}
+
+/** Thrown when `isAvailable` is sent with a value that is not a boolean. */
+export class InvalidAvailabilityError extends Error {
+  constructor() {
+    super("isAvailable must be a boolean");
+    this.name = "InvalidAvailabilityError";
+  }
+}
 
 export interface AgentFilters {
   specialization?: string;
@@ -234,8 +261,18 @@ class AgentService {
     // Copy ONLY the self-editable profile fields (issue #135): `input` is the
     // raw request body for PUT /agents/me (see AGENT_SELF_EDITABLE_FIELDS for
     // what must stay server-written). Unknown keys are dropped silently.
+    const updates = pickAllowedFields(input, AGENT_SELF_EDITABLE_FIELDS);
+
+    // `isAvailable` is the one allow-listed field with a condition attached:
+    // the same verified-only rule as PUT /agents/me/availability (issue #138).
+    // Checked BEFORE anything is written, so a refused request changes
+    // nothing at all.
+    if (updates.isAvailable !== undefined) {
+      this.assertMayBeAvailable(doc.data() as Agent, updates.isAvailable);
+    }
+
     await agentRef.update({
-      ...pickAllowedFields(input, AGENT_SELF_EDITABLE_FIELDS),
+      ...updates,
       updatedAt: serverTimestamp(),
     });
 
@@ -471,6 +508,21 @@ class AgentService {
   // ============================================
 
   /**
+   * The one rule for `isAvailable`, used by every path that can set it
+   * (setAvailability below and updateAgent, issue #138): the value must be a
+   * boolean, and only a VERIFIED agent may switch it on. Switching it off is
+   * always allowed. Throws InvalidAvailabilityError / AgentNotVerifiedError.
+   */
+  private assertMayBeAvailable(agent: Agent, isAvailable: unknown): void {
+    if (typeof isAvailable !== "boolean") {
+      throw new InvalidAvailabilityError();
+    }
+    if (isAvailable && agent.verificationStatus !== "verified") {
+      throw new AgentNotVerifiedError();
+    }
+  }
+
+  /**
    * Update agent availability
    */
   async setAvailability(
@@ -483,9 +535,7 @@ class AgentService {
     }
 
     // Only verified agents can be available
-    if (isAvailable && agent.verificationStatus !== "verified") {
-      throw new Error("Agent must be verified to be available");
-    }
+    this.assertMayBeAvailable(agent, isAvailable);
 
     await collections.agents.doc(agentId).update({
       isAvailable,

@@ -106,6 +106,12 @@ export function fakeDoc(path: string): any {
     async set(data: Data, opts?: { merge?: boolean }) {
       doSet(path, data, opts?.merge);
     },
+    // create(): like the real SDK, fails with gRPC ALREADY_EXISTS (6) when the doc is
+    // there. The rule-change event store (#123) relies on it for idempotency.
+    async create(data: Data) {
+      if (store.has(path)) throw Object.assign(new Error(`ALREADY_EXISTS: ${path}`), { code: 6 });
+      doSet(path, data);
+    },
     async update(data: Data) {
       doUpdate(path, data);
     },
@@ -123,6 +129,11 @@ function cmpValue(v: unknown): unknown {
 }
 
 type Filter = [string, string, unknown];
+
+/** Read a (possibly dotted, e.g. "subject.type") field path from a doc. */
+function getPath(d: Data, path: string): unknown {
+  return path.split(".").reduce<any>((cur, k) => (cur === undefined || cur === null ? undefined : cur[k]), d);
+}
 
 /**
  * A collection ref / query backed by `store` (direct children only).
@@ -177,7 +188,7 @@ export function fakeCollection(
         .filter(([p]) => p.startsWith(`${path}/`) && !p.slice(path.length + 1).includes("/"))
         .filter(([, d]) =>
           filters.every(([f, op, v]) => {
-            const a = cmpValue(d[f]) as any;
+            const a = cmpValue(getPath(d, f)) as any;
             const b = cmpValue(v) as any;
             if (op === "==") return a === b;
             // `in`: the value is an array of candidates (issue #83).
@@ -193,8 +204,8 @@ export function fakeCollection(
       if (order) {
         const sign = order.dir === "desc" ? -1 : 1;
         entries = entries.sort(([, a], [, b]) => {
-          const x = cmpValue(a[order.field]) as any;
-          const y = cmpValue(b[order.field]) as any;
+          const x = cmpValue(getPath(a, order.field)) as any;
+          const y = cmpValue(getPath(b, order.field)) as any;
           return x === y ? 0 : x < y ? -sign : sign;
         });
       }
@@ -250,6 +261,7 @@ export async function installFakes(): Promise<void> {
   const firebase: any = await import("../../src/utils/firebase");
   firebase.collections.appConfig = fakeCollection("appConfig");
   firebase.collections.visaSources = fakeCollection("visaSources");
+  firebase.collections.guidanceSources = fakeCollection("guidanceSources");
   firebase.collections.countries = fakeCollection("countries");
   firebase.collections.pendingVisaChanges = fakeCollection("pendingVisaChanges");
   // Issue #81: run records + the news registry (source health, news runs).
@@ -258,6 +270,8 @@ export async function installFakes(): Promise<void> {
   // Issue #17: the health rows count a source's articles (articlesLast7d).
   firebase.collections.newsArticles = fakeCollection("newsArticles");
   // Issue #83: the alert store + its dedupe pointers, and users (recipients).
+  // Issue #123: approving a visa change records a rule-change event after commit.
+  firebase.collections.ruleChangeEvents = fakeCollection("ruleChangeEvents");
   firebase.collections.scrapeAlerts = fakeCollection("scrapeAlerts");
   firebase.collections.scrapeAlertKeys = fakeCollection("scrapeAlertKeys");
   firebase.collections.users = fakeCollection("users");
@@ -309,4 +323,21 @@ export async function installFakes(): Promise<void> {
   firebase.collections.visaRevisions = fakeCollection("visaRevisions");
   const agencyReview: any = await import("../../src/agency-visas/agency-visa-review.service");
   agencyReview.agencyVisaReviewService.runTransaction = fakeRunTransaction;
+
+  // Issue #119: the risk-signal store, its audit subcollection (reached
+  // through the doc ref's collection()), and the transactional raise /
+  // status change. Also the collections the "no signal leaks into a
+  // non-admin response" test reads: applications, agents, conversations,
+  // notifications and document requests (users + agencies are above).
+  firebase.collections.riskSignals = fakeCollection("riskSignals");
+  firebase.collections.applications = fakeCollection("applications");
+  firebase.collections.agents = fakeCollection("agents");
+  firebase.collections.conversations = fakeCollection("conversations");
+  firebase.collections.notifications = fakeCollection("notifications");
+  firebase.collections.documentRequests = fakeCollection("documentRequests");
+  // attachAuthz reads the caller's resolved-entitlements cache for every
+  // non-admin token (null means RBAC-only, which is what these tests want).
+  firebase.collections.entitlements = fakeCollection("entitlements");
+  const riskSignals: any = await import("../../src/services/risk-signal.service");
+  riskSignals.riskSignalService.runTransaction = fakeRunTransaction;
 }

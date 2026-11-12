@@ -572,7 +572,10 @@ describe("guidance snapshots are backend-only", () => {
       path: l.route.path,
       methods: Object.keys(l.route.methods),
     }));
-    assert.deepEqual(routes, [{ path: "/", methods: ["get"] }]);
+    assert.deepEqual(routes, [
+      { path: "/", methods: ["get"] },
+      { path: "/:id/crawl", methods: ["post"] },
+    ]);
   });
 
   test("no controller or route file reads the snapshot store", () => {
