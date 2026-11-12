@@ -88,6 +88,11 @@ export interface RefusalGround {
   kind: CriterionKind;
   // True when the criterion is a mandatory bar (a rule that applies regardless of documents).
   isMandatoryBar: boolean;
+  // The decision stage (validity | suitability | eligibility | credibility),
+  // copied from the rubric criterion in code, never from model text (#43). It
+  // lets staff tell "not a valid application" from a refusal ground. Absent on
+  // documents stored before #43, so readers must tolerate undefined.
+  stage: DecisionStage;
   ruleRef: string | null;
   sourceUrl: string;
   sourceQuote: string;
@@ -101,6 +106,11 @@ export interface CredibilityFlag {
   title: string;
   kind: CriterionKind;
   isMandatoryBar: boolean;
+  // The decision stage (validity | suitability | eligibility | credibility),
+  // copied from the rubric criterion in code, never from model text (#43). It
+  // lets staff tell "not a valid application" from a refusal ground. Absent on
+  // documents stored before #43, so readers must tolerate undefined.
+  stage: DecisionStage;
   ruleRef: string | null;
   sourceUrl: string;
   sourceQuote: string;

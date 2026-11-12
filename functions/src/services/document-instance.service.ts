@@ -32,6 +32,10 @@ export interface CloneInput {
   createdByName?: string; // denormalized display name
   agencyId?: string | null; // owning agency (null for independent agents)
   applicationId?: string | null; // optional link at creation time
+  // Optional deterministic doc id. When set the instance is written with
+  // `create()` (fails if the id exists) so a duplicate request cannot make a
+  // second instance: used for the applicant's one-per-application statement (#43).
+  fixedId?: string;
 }
 
 // Inputs for a save (PUT). `expectedVersion` is the version the editor last
@@ -131,7 +135,9 @@ class DocumentInstanceService {
    */
   async clone(input: CloneInput): Promise<DocumentInstance> {
     const now = Timestamp.now();
-    const ref = collections.documentInstances.doc();
+    const ref = input.fixedId
+      ? collections.documentInstances.doc(input.fixedId)
+      : collections.documentInstances.doc();
 
     const instance: DocumentInstance = {
       id: ref.id,
@@ -157,7 +163,10 @@ class DocumentInstanceService {
 
     // Write the instance and its first version snapshot together.
     const batch = db.batch();
-    batch.set(ref, instance);
+    // `create` (not `set`) for a fixed id: it rejects with ALREADY_EXISTS instead
+    // of overwriting, so a racing duplicate cannot replace an edited statement.
+    if (input.fixedId) batch.create(ref, instance);
+    else batch.set(ref, instance);
     const versionRef = subcollections.documentVersions(ref.id).doc();
     batch.set(
       versionRef,
