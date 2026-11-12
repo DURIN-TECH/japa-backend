@@ -110,6 +110,10 @@ export const DEFAULT_SEVERITY: Record<ScrapeAlertRule, ScrapeAlertSeverity> = {
   budget_hard_stop: "critical",
   // Review: no scheduled crawl runs while the settings doc is unreadable.
   settings_unreadable: "critical",
+  // Issue #143: the guidance crawl fetched documents it could not store, so
+  // new rule text is not being kept. Admins can turn it off or change its
+  // severity in appConfig/scrapeAlerts like every other rule.
+  infrastructure_error: "critical",
 };
 
 /** Issue #96: most extra alert recipient addresses (extraRecipientEmails). */
@@ -257,7 +261,10 @@ const DAY_MS = 24 * HOUR_MS;
 
 /** "Visa scraper" / "News scraper". */
 export function scraperLabel(kind: ScrapeRunKind): string {
-  return kind === "visa" ? "Visa scraper" : "News scraper";
+  if (kind === "visa") return "Visa scraper";
+  // Issue #143: the caseworker-guidance crawl.
+  if (kind === "guidance") return "Guidance crawl";
+  return "News scraper";
 }
 
 /** Subject for a whole scraper. */
@@ -409,6 +416,58 @@ export function evaluateLinkedSurcharge(run: ScrapeRunDoc, config: ScrapeAlertsC
         subject: scraperSubject("visa"),
         message: `Visa scraper run ${run.id}: ${n} page(s) not extracted because their linked surcharge page (e.g. the UK IHS page) could not be fetched or parsed`,
         details: { runId: run.id, linkedSurchargeErrors: n },
+        eventId: run.id,
+        runId: run.id,
+      },
+    ],
+  };
+}
+
+// ============================================
+// INFRASTRUCTURE ERRORS (finalize hook, issue #143)
+// ============================================
+
+/** Most infrastructure-error lines quoted in the alert message. */
+const MAX_QUOTED_INFRA_ERRORS = 3;
+
+/**
+ * infrastructure_error (guidance runs only), post-run. A finished run whose
+ * `summary.infrastructureErrors` is non-empty (Cloud Storage or Firestore
+ * failed on our side while handling a source) raises ONE alert per scraper,
+ * `infrastructure_error:<kind>`, with the run id as its occurrence: a
+ * persistent outage BUMPS that alert on every run instead of opening a new
+ * one. A finished run whose list is empty resolves it.
+ *
+ * Deliberately separate from run_failed / source_broken: an outage on our
+ * side says nothing about the sources, and never moves a failure streak.
+ * Visa and news runs, and a run still `running`, say nothing (empty scope).
+ */
+export function evaluateInfrastructureErrors(run: ScrapeRunDoc, config: ScrapeAlertsConfig): RuleEvaluation {
+  const key = `infrastructure_error:${run.kind}`;
+  if (run.kind !== "guidance" || run.status === "running") {
+    return { rule: "infrastructure_error", signals: [], scope: { keys: [] } };
+  }
+  // Stored verbatim from the crawl summary: an array of redacted lines.
+  const raw = (run.summary as Record<string, unknown> | undefined)?.infrastructureErrors;
+  const lines = Array.isArray(raw) ? raw.filter((l): l is string => typeof l === "string" && l !== "") : [];
+  if (lines.length === 0) return { rule: "infrastructure_error", signals: [], scope: { keys: [key] } };
+  const quoted = lines.slice(0, MAX_QUOTED_INFRA_ERRORS).map((l) => redactSecrets(l)).join(" | ");
+  return {
+    rule: "infrastructure_error",
+    scope: { keys: [key] },
+    signals: [
+      {
+        rule: "infrastructure_error",
+        key,
+        severity: ruleSeverity(config, "infrastructure_error"),
+        kind: run.kind,
+        subject: scraperSubject(run.kind),
+        message: (
+          `${scraperLabel(run.kind)} run ${run.id}: ${lines.length} infrastructure error(s); documents were fetched but could not be stored or recorded ` +
+          `(sources are not blamed): ${quoted}`
+        ).slice(0, 600),
+        details: { runId: run.id, infrastructureErrors: lines.length, firstError: redactSecrets(lines[0]).slice(0, 300) },
+        // One occurrence per run: the hourly re-read of the same run does not bump twice.
         eventId: run.id,
         runId: run.id,
       },

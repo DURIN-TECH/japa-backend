@@ -250,7 +250,11 @@ async function main(): Promise<void> {
     return;
   }
   const { guidanceCrawlService } = await import("../guidance-crawl.service");
-  const summary = await guidanceCrawlService.runOrchestrator(only ? { sourceIds: only } : {});
+  const summary = await guidanceCrawlService.runOrchestrator(
+    // trigger "script": the run is recorded like any other, but a CLI run
+    // never raises alerts (someone is watching it). Issue #143.
+    only ? { sourceIds: only, trigger: "script" } : { trigger: "script" }
+  );
   // Ids, hashes and error messages only: never document text.
   console.log(`${TAG} crawl summary:`);
   console.log(JSON.stringify(summary, null, 2));

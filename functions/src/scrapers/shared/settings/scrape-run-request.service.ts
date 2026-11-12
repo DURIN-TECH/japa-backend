@@ -1,7 +1,7 @@
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db } from "../../../utils/firebase";
 import { toJson } from "../runs/scrape-run.service";
-import type { ScrapeRunKind } from "../runs/types";
+import type { ScraperSettingsKind } from "../runs/types";
 import { loadScraperSettingsResult, type LoadedScraperSettings } from "./scraper-settings.store";
 // Issue #96 review: a source run is refused while another run holds the
 // source's crawl lease (scheduled tick, whole-scraper run, ...).
@@ -98,7 +98,7 @@ export interface CreatedRunRequest {
 }
 
 /** The lock doc id of a scope: `visa__GB`, `news__cic-news`, `visa___all`. */
-export function lockIdFor(kind: ScrapeRunKind, sourceId: string | null): string {
+export function lockIdFor(kind: ScraperSettingsKind, sourceId: string | null): string {
   return `${kind}__${sourceId ?? "_all"}`;
 }
 
@@ -126,7 +126,7 @@ export class ScrapeRunRequestService {
    * the whole scraper (scope "scraper").
    */
   async create(input: {
-    kind: ScrapeRunKind;
+    kind: ScraperSettingsKind;
     sourceId: string | null;
     force: boolean;
     uid: string;
