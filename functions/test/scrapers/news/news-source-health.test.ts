@@ -167,7 +167,7 @@ describe("source health is updated once per source per run (issue #79)", () => {
   // streak and a feed with items resets it (even when all are duplicates).
   test("zero-yield streak follows articlesFound through a real scrape (#17)", async () => {
     seedSource("quiet", "https://quiet.example.org/feed.xml");
-    const EMPTY = `<?xml version="1.0"?><rss version="2.0"><channel><title>t</title></channel></rss>`;
+    const EMPTY = "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>t</title></channel></rss>";
     routes.set("https://quiet.example.org/feed.xml", { status: 200, body: EMPTY });
     await makeScraper(["quiet"]).runOrchestrator();
     await makeScraper(["quiet"]).runOrchestrator();

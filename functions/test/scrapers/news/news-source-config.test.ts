@@ -101,11 +101,11 @@ function seedSource(id: string, strategy: "rss" | "html_scrape" | "news_api", ov
       ? { feedUrl: "https://news.example.org/feed", maxArticlesPerRun: 15, fetchFullContent: true, customHeaders: { Accept: "x" }, requestTimeoutMs: 20000 }
       : strategy === "html_scrape"
         ? {
-            selectors: { articleList: ".list", articleLink: "a", articleTitle: "h2", articleDate: "time" },
-            maxArticlesPerRun: 10,
-            fetchFullContent: false,
-            customHeaders: { Accept: "y" },
-          }
+          selectors: { articleList: ".list", articleLink: "a", articleTitle: "h2", articleDate: "time" },
+          maxArticlesPerRun: 10,
+          fetchFullContent: false,
+          customHeaders: { Accept: "y" },
+        }
         : { apiConfig: { provider: "newsdata", query: "visa" }, maxArticlesPerRun: 20, fetchFullContent: false };
   store.set(`newsSources/${id}`, {
     id,
@@ -414,7 +414,7 @@ describe("articlesLast7d", () => {
       where: () => ({ where: () => ({ count: () => ({ get: async () => { throw new Error("FAILED_PRECONDITION: index building"); } }) }) }),
     };
     try {
-      const rows = await quiet(() => runsSvc.listSourceHealth("news", NOW));
+      const rows: any[] = await quiet<any[]>(() => runsSvc.listSourceHealth("news", NOW));
       assert.equal(rows.length, 1);
       assert.equal(rows[0].articlesLast7d, null);
       assert.equal(rows[0].sourceId, "s1");
