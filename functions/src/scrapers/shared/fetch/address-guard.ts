@@ -197,8 +197,12 @@ function stripBrackets(host: string): string {
  * never passes them, and nothing here is read from the environment or config.
  */
 export interface AddressGuardOptions {
-  /** Return true to let an otherwise non-public address through (e.g. 127.0.0.1 for a stub). */
-  allowAddress?: (ip: string) => boolean;
+  /**
+   * Return true to let an otherwise non-public address through (e.g. 127.0.0.1
+   * for a stub). `host` is the name being resolved, or the literal host of the
+   * URL being checked, so a test can allow one stub host and not another.
+   */
+  allowAddress?: (ip: string, host: string) => boolean;
   /** Return true to let an otherwise disallowed port through (a stub listens on a random port). */
   allowPort?: (port: number) => boolean;
   /** Replace DNS resolution (default: the system resolver). Always returns every address. */
@@ -206,8 +210,8 @@ export interface AddressGuardOptions {
 }
 
 /** True when the guard lets `ip` through: public, or let in by the test hook. */
-function addressAllowed(ip: string, opts: AddressGuardOptions): boolean {
-  return isPublicAddress(ip) || opts.allowAddress?.(ip) === true;
+function addressAllowed(ip: string, opts: AddressGuardOptions, host: string): boolean {
+  return isPublicAddress(ip) || opts.allowAddress?.(ip, host) === true;
 }
 
 /** Port check with the test hook. */
@@ -233,7 +237,7 @@ export function assertUrlAllowed(target: string | URL, opts: AddressGuardOptions
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new BlockedAddressError(host);
   if (!portAllowed(url.port, opts)) throw new BlockedAddressError(host);
   const bare = stripBrackets(host);
-  if (isIP(bare) !== 0 && !addressAllowed(bare, opts)) throw new BlockedAddressError(host);
+  if (isIP(bare) !== 0 && !addressAllowed(bare, opts, bare)) throw new BlockedAddressError(host);
 }
 
 /** Non-throwing form of assertUrlAllowed, for "skip this link" decisions. */
@@ -273,7 +277,7 @@ export function createGuardedLookup(opts: AddressGuardOptions = {}) {
     resolve.then(
       (addrs) => {
         // An empty answer, or one bad address among good ones, is refused.
-        if (addrs.length === 0 || !addrs.every((a) => addressAllowed(a.address, opts))) {
+        if (addrs.length === 0 || !addrs.every((a) => addressAllowed(a.address, opts, hostname))) {
           callback(new BlockedAddressError(hostname));
           return;
         }
