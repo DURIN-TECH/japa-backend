@@ -165,6 +165,8 @@ describe("guidance seed: the doc that is written", () => {
       expectedFinalUrl: null,
       // Issue #111: no parent page to resolve the address from.
       resolveFrom: null,
+      // Issue #112: HTML_SEED names no role, so none is stored (null, so a role removed from a seed is cleared).
+      role: null,
       checkIntervalHours: 24,
       verificationStatus: "verified",
       verificationNote: HTML_SEED.verificationNote,
@@ -188,6 +190,24 @@ describe("guidance seed: the doc that is written", () => {
       createdAt: NOW,
       updatedAt: NOW,
     });
+  });
+
+  test("a seed's source role is stored as written, and the real seed gives each source its role", () => {
+    for (const role of ["primary", "route_guidance", "secondary"] as const) {
+      assert.equal(buildSeededGuidanceSource({ ...HTML_SEED, role }, undefined, NOW).role, role);
+    }
+    // The registry data (not code) decides the roles: the route's rules are
+    // primary, its caseworker guidance (both renditions) route guidance, the
+    // cross-route documents secondary.
+    assert.deepEqual(
+      Object.fromEntries(GUIDANCE_SOURCE_SEEDS.map((x) => [x.id, x.role])),
+      { "gb-appendix-v-visitor": "primary", "gb-visit-guidance-html": "route_guidance", "gb-visit-guidance-pdf": "route_guidance", "gb-part-suitability": "secondary", "gb-appendix-finance": "secondary" }
+    );
+  });
+
+  test("an unknown source role is rejected by the seed validator", () => {
+    const problems = validateGuidanceSourceSeed({ ...HTML_SEED, role: "tertiary" as never });
+    assert.deepEqual(problems, ["role must be one of primary, route_guidance, secondary when present"]);
   });
 
   test("a re-seed keeps the crawl state and does not un-fail a failing source", () => {
