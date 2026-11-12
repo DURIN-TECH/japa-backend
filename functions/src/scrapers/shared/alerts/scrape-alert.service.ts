@@ -18,6 +18,7 @@ import { scrapeCostMonthToDateSource, type MonthToDateCostSource } from "./scrap
 import {
   DEFAULT_CONFIG,
   evaluateBrokenSources,
+  evaluateNoYieldSources,
   evaluateBudget,
   evaluateBudgetHardStop,
   evaluateBudgetHardStopClears,
@@ -144,6 +145,7 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   llm_budget: "LLM budget",
   review_queue_stale: "review queue waiting",
   budget_hard_stop: "LLM budget hard stop",
+  source_no_yield: "source returns no articles",
   settings_unreadable: "scraper settings unreadable",
 };
 
@@ -333,6 +335,12 @@ export class ScrapeAlertService {
       await this.isolated("source_broken", skippedRules, async () => {
         evals.push(evaluateBrokenSources(run.kind, await this.sourceFacts(run.kind), config));
       });
+      // Issue #17: a news run may just have extended a zero-yield streak.
+      if (run.kind === "news") {
+        await this.isolated("source_no_yield", skippedRules, async () => {
+          evals.push(evaluateNoYieldSources((await this.sourceFacts("news")) as NewsSourceFacts[], config));
+        });
+      }
       return await this.finish(evals, config, nowMs, skippedRules, false, deferEmail);
     } catch (err) {
       this.engineError("finalize", err, run.id);
@@ -379,6 +387,10 @@ export class ScrapeAlertService {
           evals.push(evaluateBrokenSources(kind, await this.sourceFacts(kind), config));
         });
       }
+      // Issue #17: zero-yield news sources (next to source_broken).
+      await this.isolated("source_no_yield", skippedRules, async () => {
+        evals.push(evaluateNoYieldSources((await this.sourceFacts("news")) as NewsSourceFacts[], config));
+      });
 
       // ---- host_backoff clears no run reports (review fix) ----
       // Paused / retired / removed sources, or the host's retry-after passed.

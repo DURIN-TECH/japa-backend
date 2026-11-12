@@ -176,7 +176,7 @@ export type NewsScraperStore = Pick<
     success: boolean,
     errorMessage?: string,
     notBeforeMs?: number,
-    opts?: { failureLimit?: number }
+    opts?: { failureLimit?: number; articlesFound?: number }
   ) => Promise<NewsSourceHealthResult | null | void>;
   pauseForMissingApiKey?: (sourceId: string, provider: string) => Promise<boolean>;
 };
@@ -763,6 +763,8 @@ export class NewsScraperService {
       //    source, i.e. a manual retry, makes it active again)
       const okHealth = await this.store.updateSourceAfterScrape(source.id, true, undefined, undefined, {
         failureLimit: link?.trace?.failureLimit,
+        // Issue #17: the pre-slice count feeds the zero-yield streak.
+        articlesFound: rawArticles.length,
       });
       if (okHealth && link?.trace) link.trace.health = okHealth;
       markHealthRecorded();

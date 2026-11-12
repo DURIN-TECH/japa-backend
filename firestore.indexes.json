@@ -507,6 +507,20 @@
       ]
     },
     {
+      "collectionGroup": "newsArticles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "sourceId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "scrapedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
       "collectionGroup": "newsSources",
       "queryScope": "COLLECTION",
       "fields": [
