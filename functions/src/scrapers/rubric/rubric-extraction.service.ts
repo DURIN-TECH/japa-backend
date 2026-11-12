@@ -207,6 +207,32 @@ export function criterionIdOf(sourceId: string, quote: string, kind: string, che
   return `crit_${sha256([sourceId, normalizeForQuoteMatch(quote), kind, checkField ?? ""].join("\n")).slice(0, 16)}`;
 }
 
+/** Attempts per model call (first try plus one retry). */
+const MAX_CALL_ATTEMPTS = 2;
+/** Pause before a retry, multiplied by the attempt number. */
+const RETRY_BACKOFF_MS = 3000;
+
+/** Failed attempts of a run, and the request cap they count against. */
+interface CallAttempts {
+  failed: number;
+  cap: number;
+}
+
+/**
+ * True for a transient provider failure: a transport error (the connection
+ * was cut: "terminated", reset, "fetch failed"), or an HTTP 5xx / 429 /
+ * 529. Never a 4xx. The message is the secret-free one `describeAnthropicError`
+ * builds (`status=NNN ...` when the API answered).
+ */
+export function isTransientProviderError(message: string): boolean {
+  const status = /status=(\d{3})/.exec(message);
+  if (status) {
+    const code = Number(status[1]);
+    return code >= 500 || code === 429;
+  }
+  return /terminated|ECONNRESET|ETIMEDOUT|fetch failed|socket hang up|other side closed|overloaded|timed out/i.test(message);
+}
+
 /** A slug: what intake question ids and evidence keys must look like. */
 const SLUG_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
 
@@ -1290,6 +1316,8 @@ export class RubricExtractionService {
       const primaries = sources.filter((s) => s.role === "primary");
       const scope = primaries.length > 0 ? routeScopeFrom(primaries.map((s) => (indexes.get(s.snapshot.sourceId) as SnapshotQuoteIndex).allText())) : null;
       const parts: { chunk: SourceChunk; assessment: ChunkAssessment }[] = [];
+      // Failed attempts so far, counted against the request cap with the successes.
+      const attempts: CallAttempts = { failed: 0, cap: settings.maxRequestsPerRun };
       for (const chunk of chunks) {
         const source = sources.find((s) => s.snapshot.sourceId === chunk.sourceId) as LoadedSource;
         const index = indexes.get(chunk.sourceId) as SnapshotQuoteIndex;
@@ -1304,12 +1332,12 @@ export class RubricExtractionService {
         const route: RubricRouteContext = { routeName, sourceRole: primaries.length === 0 ? "unspecified" : source.role };
         const scopeForChunk = scope && source.role === "secondary" ? scope : null;
 
-        const raw1 = await this.callModel(buildRubricRequest(chunk, severityLevels, limits, route), usage);
+        const raw1 = await this.callModel(buildRubricRequest(chunk, severityLevels, limits, route), usage, attempts);
         const criteriaPart = assessChunkOutput(raw1, chunk, index, base, severityLevels, scopeForChunk);
         let assessment = criteriaPart;
         if (criteriaPart.criteria.length > 0) {
           const accepted = criteriaPart.criteria.map((a) => ({ ref: a.ref, title: a.criterion.title, quote: a.criterion.source.quote }));
-          const raw2 = await this.callModel(buildIntakeRequest(chunk, accepted, limits, route), usage);
+          const raw2 = await this.callModel(buildIntakeRequest(chunk, accepted, limits, route), usage, attempts);
           assessment = combineAssessments(criteriaPart, assessChunkOutput(raw2, chunk, index, base, severityLevels));
         }
         parts.push({ chunk, assessment });
@@ -1401,12 +1429,35 @@ export class RubricExtractionService {
   }
 
   /**
+   * One model call with a retry (issue #112): at most 2 attempts, a short
+   * pause between them, and only for a TRANSIENT failure: a connection cut,
+   * a 5xx, 429 or "overloaded" (529). A 4xx (bad request, auth, schema), a
+   * missing key, a refusal, a cut-off answer and an answer that breaks the
+   * schema are never retried. Every attempt counts against the run's request
+   * cap, and calls already completed for earlier chunks are untouched (their
+   * results sit in `parts`), so one dropped connection costs one call.
+   */
+  private async callModel(request: LlmRequest, usage: RubricRunUsage, attempts: CallAttempts): Promise<RawRubricOutput> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.callModelOnce(request, usage);
+      } catch (err) {
+        const retryable = err instanceof RunStop && err.reasonCode === "provider_error" && isTransientProviderError(err.message);
+        if (!retryable || attempt >= MAX_CALL_ATTEMPTS || usage.requests + attempts.failed + 1 >= attempts.cap) throw err;
+        attempts.failed += 1;
+        console.warn(`${TAG} model call failed transiently, retrying (attempt ${attempt + 1} of ${MAX_CALL_ATTEMPTS})`);
+        await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS * attempt));
+      }
+    }
+  }
+
+  /**
    * One model call: send, account for the tokens (whatever happens next,
    * they were billed), require a complete answer, check its shape.
    *
    * @throws RunStop("failed", ...) for anything but a complete, schema-valid answer
    */
-  private async callModel(request: LlmRequest, usage: RubricRunUsage): Promise<RawRubricOutput> {
+  private async callModelOnce(request: LlmRequest, usage: RubricRunUsage): Promise<RawRubricOutput> {
     let response;
     try {
       response = await this.provider.complete(request);
