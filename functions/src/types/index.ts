@@ -357,6 +357,37 @@ export interface Agent {
   updatedAt: Timestamp;
 }
 
+/**
+ * Issue #147: the ONLY shape an unauthenticated agent route may return.
+ *
+ * It is an allow-list (built field by field in `toPublicAgent`, never by
+ * spreading or omitting from `Agent`), so a field added to `Agent` later stays
+ * private until someone adds it here on purpose. Deliberately NOT included:
+ * `userId` (the account uid), `licenseNumber`, `verificationDocuments`,
+ * `verifiedBy`, `verifiedAt`, `agencyRole`, `availableSlots`, `serviceFees`.
+ */
+export interface PublicAgent {
+  id: string;
+  agencyId?: string; // Agency the agent belongs to (absent = independent)
+  displayName: string;
+  bio: string;
+  profilePhotoUrl?: string;
+  yearsOfExperience: number;
+  specializations: string[];
+  languages: string[];
+  featuredVisas: string[];
+  verificationStatus: AgentVerificationStatus;
+  rating: number;
+  totalReviews: number;
+  totalApplications: number;
+  successRate: number;
+  responseTime: string;
+  consultationFee: number; // passed through unchanged (unit is issue #148's concern)
+  isAvailable: boolean;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
 export interface AvailabilitySlot {
   dayOfWeek: number; // 0-6 (Sunday-Saturday)
   startTime: string; // "09:00"
