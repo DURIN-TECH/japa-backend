@@ -820,6 +820,9 @@ function toCriterion(c: AssessmentCriterion): AssessmentCriterion {
     ...(c.probeFactors !== undefined ? { probeFactors: c.probeFactors } : {}),
     ...(c.requiresInterviewBeforeRefusal !== undefined ? { requiresInterviewBeforeRefusal: c.requiresInterviewBeforeRefusal } : {}),
     ...(c.concernsIntent !== undefined ? { concernsIntent: c.concernsIntent } : {}),
+    // Scope (#112), returned so the review screen can filter by it (#161).
+    ...(c.applicability !== undefined ? { applicability: c.applicability } : {}),
+    ...(c.applicabilityCondition !== undefined ? { applicabilityCondition: c.applicabilityCondition } : {}),
     ...(c.eligibilityQuestionId !== undefined ? { eligibilityQuestionId: c.eligibilityQuestionId } : {}),
     ...(c.intakeQuestionIds !== undefined ? { intakeQuestionIds: c.intakeQuestionIds } : {}),
     ...(c.citations !== undefined ? { citations: c.citations } : {}),

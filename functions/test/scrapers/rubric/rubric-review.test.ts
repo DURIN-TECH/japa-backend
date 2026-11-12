@@ -1526,6 +1526,18 @@ describe("rubric review: excluding criteria at approval (#161)", () => {
     assert.equal(d.exclusionPreview.criteriaExcluded, 1);
   });
 
+  test("detail criteria carry applicability and its condition, so the screen can filter by scope", async () => {
+    await seedA();
+    const doc = versionDoc(KEY_A, 1);
+    store.set(`visaRubrics/${KEY_A}/rubricVersions/1`, {
+      ...doc,
+      criteria: doc.criteria.map((c: any, i: number) => (i === 0 ? { ...c, applicability: "conditional", applicabilityCondition: "when sponsored" } : c)),
+    });
+    const d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    assert.equal(d.criteria[0].applicability, "conditional");
+    assert.equal(d.criteria[0].applicabilityCondition, "when sponsored");
+  });
+
   test("preview: GET ?previewExcluded= and POST /exclusion-preview agree, validate the ids, and write nothing", async () => {
     await seedA();
     setRole("primary");
