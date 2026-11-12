@@ -364,11 +364,12 @@ export interface Agent {
  * spreading or omitting from `Agent`), so a field added to `Agent` later stays
  * private until someone adds it here on purpose. Deliberately NOT included:
  * `userId` (the account uid), `licenseNumber`, `verificationDocuments`,
- * `verifiedBy`, `verifiedAt`, `agencyRole`, `availableSlots`, `serviceFees`.
+ * `verifiedBy`, `verifiedAt`, `availableSlots`, `serviceFees`.
  */
 export interface PublicAgent {
   id: string;
   agencyId?: string; // Agency the agent belongs to (absent = independent)
+  agencyRole?: AgencyMemberRole; // Role in that agency (mobile labels agents with it)
   displayName: string;
   bio: string;
   profilePhotoUrl?: string;

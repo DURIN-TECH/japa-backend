@@ -36,7 +36,6 @@ const FORBIDDEN_KEYS = [
   "verificationDocuments",
   "verifiedBy",
   "verifiedAt",
-  "agencyRole",
   "availableSlots",
   "serviceFees",
 ];
@@ -132,14 +131,17 @@ describe("toPublicAgent", () => {
     const pub = toPublicAgent(agentDoc("a1") as unknown as Agent);
     assertPublicShape(pub);
     assert.equal(pub.consultationFee, 5000);
+    assert.equal(pub.agencyRole, "agent");
   });
 
   test("omits optional keys the doc does not have", () => {
     const doc = agentDoc("a1");
     delete doc.agencyId;
+    delete doc.agencyRole;
     delete doc.profilePhotoUrl;
     const pub = toPublicAgent(doc as unknown as Agent) as any;
     assert.equal("agencyId" in pub, false);
+    assert.equal("agencyRole" in pub, false);
     assert.equal("profilePhotoUrl" in pub, false);
   });
 });
@@ -191,6 +193,10 @@ describe("GET /agents/:id", () => {
     seed("a1", { verificationStatus: "pending" });
     const r = await call(agentController.getAgent.bind(agentController), { params: { id: "a1" } });
     assert.equal(r.status, 404);
+    // The error body carries no agent data either.
+    const text = JSON.stringify(r.body);
+    for (const k of FORBIDDEN_KEYS) assert.equal(text.includes(k), false);
+    assert.equal(text.includes("LIC-SECRET-1"), false);
   });
 
   test("unknown id -> 404", async () => {

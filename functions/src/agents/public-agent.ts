@@ -19,11 +19,12 @@ import type { Agent, PublicAgent } from "../types";
 /**
  * The exact key set of a public agent response. Exported so tests (and any
  * other public route) can assert against the same list.
- * Optional keys (agencyId, profilePhotoUrl) appear only when the doc has them.
+ * Optional keys (agencyId, agencyRole, profilePhotoUrl) appear only when the doc has them.
  */
 export const PUBLIC_AGENT_FIELDS = [
   "id",
   "agencyId",
+  "agencyRole",
   "displayName",
   "bio",
   "profilePhotoUrl",
@@ -71,6 +72,7 @@ export function toPublicAgent(agent: Agent): PublicAgent {
     updatedAt: agent.updatedAt,
   };
   if (agent.agencyId !== undefined) pub.agencyId = agent.agencyId;
+  if (agent.agencyRole !== undefined) pub.agencyRole = agent.agencyRole;
   if (agent.profilePhotoUrl !== undefined) pub.profilePhotoUrl = agent.profilePhotoUrl;
   return pub;
 }
