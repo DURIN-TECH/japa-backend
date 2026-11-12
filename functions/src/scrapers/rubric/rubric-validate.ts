@@ -11,6 +11,8 @@ import {
   type VisaRubric,
 } from "../../types/rubric";
 
+import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA } from "./rubric-exclusions";
+
 // ============================================
 // RUBRIC — STRUCTURAL VALIDATOR (issue #40)
 // ============================================
@@ -260,6 +262,28 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
   // ---- extra-evidence tags (admin-set, #116; only checked when present) ----
   for (const id of rubric.evidenceHelpsCriterionIds ?? []) {
     if (!criterionIds.has(id)) err("evidence_tag_criterion_unknown", `evidenceHelpsCriterionIds names criterion ${id}, which is not in the rubric`);
+  }
+
+  // ---- exclusions (admin-set, #161; only checked when present) ----
+  // Every problem here is an ERROR: an exclusion list that names a criterion
+  // the version does not have, names one twice, or names a mandatory bar must
+  // never be stored (a bar is a hard refusal rule: it stays in force).
+  if (rubric.excludedCriterionIds !== undefined) {
+    const excluded = rubric.excludedCriterionIds;
+    if (!Array.isArray(excluded) || excluded.some((id) => typeof id !== "string")) {
+      err("exclusion_invalid", "excludedCriterionIds must be a list of criterion ids");
+    } else {
+      if (excluded.length > MAX_EXCLUDED_CRITERIA) err("exclusion_list_too_long", `excludedCriterionIds may name at most ${MAX_EXCLUDED_CRITERIA} criteria`);
+      for (const id of duplicates(excluded)) err("exclusion_duplicate", "criterion is excluded more than once", id);
+      const kindById = new Map(criteria.map((c) => [c.criterionId, c.kind]));
+      for (const id of new Set(excluded)) {
+        if (!criterionIds.has(id)) err("exclusion_criterion_unknown", `excludedCriterionIds names criterion ${id}, which is not in the rubric`, id);
+        else if (kindById.get(id) === "mandatory_bar") err("mandatory_bar_excluded", "a mandatory bar can never be excluded", id);
+      }
+    }
+  }
+  if (rubric.exclusionNote !== undefined && (typeof rubric.exclusionNote !== "string" || rubric.exclusionNote.length > EXCLUSION_NOTE_MAX)) {
+    err("exclusion_note_invalid", `exclusionNote must be a string of at most ${EXCLUSION_NOTE_MAX} characters`);
   }
 
   // ---- intent: criteria about intent need a polarity to be scored by ----

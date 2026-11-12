@@ -86,6 +86,9 @@ export { rubricExtractionService } from "./rubric/rubric-extraction.service";
 export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
 /** Structural rubric validator (the review API re-runs it before approving). */
 export { validateVisaRubric } from "./rubric/rubric-validate";
+/** Criterion exclusions (#161): the pure read-side filter, the preview and the limits. */
+export { applyExclusions, previewExclusions, MAX_EXCLUDED_CRITERIA, EXCLUSION_NOTE_MAX } from "./rubric/rubric-exclusions";
+export type { ExclusionPreview } from "./rubric/rubric-exclusions";
 /** Validator issue shape (type-only; the review API reports it). */
 export type { RubricIssue } from "./rubric/rubric-validate";
 /** Verbatim-quote lookup in a stored snapshot (the review API's stale-citation check). */

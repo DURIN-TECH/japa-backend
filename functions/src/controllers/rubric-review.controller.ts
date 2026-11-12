@@ -9,6 +9,7 @@ import {
   RUBRIC_LIST_MAX_LIMIT,
   RUBRIC_REVIEW_STATUSES,
   RubricReviewError,
+  parseExcludedIds,
   parseRubricDecision,
   rubricReviewService,
 } from "../services/rubric-review.service";
@@ -22,6 +23,7 @@ import {
 //   GET   /admin/rubrics?reviewStatus=pending_review|approved|rejected&limit=
 //   GET   /admin/rubrics/:id
 //   PATCH /admin/rubrics/:id/review
+//   POST  /admin/rubrics/:id/exclusion-preview   (read-only; #161)
 //
 // `:id` is `{countryCode}_{visaTypeId}__v{version}`.
 //
@@ -118,10 +120,24 @@ class RubricReviewController {
    * One version in full: criteria (each with `staleCitation`), the diff
    * against the serving version, flags, discards, suspicious passages and
    * what an approval would take. 404 when the id names no version.
+   * Optional `?previewExcluded=id1,id2` (#161): the criteria a reviewer is
+   * thinking of excluding; the detail's `exclusionPreview` then counts what
+   * that would remove. Validated like the approve body (400 on an unknown id,
+   * a mandatory bar or too many ids); for a long list use the POST route.
    */
   async get(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const detail = await rubricReviewService.getVersion(req.params.id);
+      let previewExcluded: string[] | undefined;
+      const raw = req.query.previewExcluded;
+      if (raw !== undefined) {
+        if (typeof raw !== "string") {
+          sendError(res, "VALIDATION_ERROR", "previewExcluded must be given once, as a comma-separated list", 400);
+          return;
+        }
+        // An empty value means "nothing proposed": the stored set (if any) is counted.
+        previewExcluded = raw.trim() === "" ? undefined : parseExcludedIds(raw.split(","), "previewExcluded");
+      }
+      const detail = await rubricReviewService.getVersion(req.params.id, { previewExcluded });
       if (!detail) {
         sendError(res, "NOT_FOUND", "Rubric version not found", 404);
         return;
@@ -133,15 +149,42 @@ class RubricReviewController {
   }
 
   /**
+   * POST /admin/rubrics/:id/exclusion-preview   body `{ excludedCriterionIds: string[] }`
+   * Read-only twin of `?previewExcluded=` for long lists. 200 ->
+   * `{ exclusionPreview, primaryExclusionIds }`; 400 for an unknown id, a
+   * mandatory bar or a malformed list; 404 for an unknown version. Writes nothing.
+   */
+  async exclusionPreview(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const body = req.body as Record<string, unknown> | undefined;
+      if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((k) => k !== "excludedCriterionIds")) {
+        sendError(res, "VALIDATION_ERROR", "the body must be { excludedCriterionIds: string[] }", 400);
+        return;
+      }
+      const ids = parseExcludedIds(body.excludedCriterionIds, "excludedCriterionIds");
+      const result = await rubricReviewService.previewExclusion(req.params.id, ids);
+      if (!result) {
+        sendError(res, "NOT_FOUND", "Rubric version not found", 404);
+        return;
+      }
+      sendSuccess(res, result);
+    } catch (error) {
+      this.sendServiceError(res, error, "previewing rubric exclusions");
+    }
+  }
+
+  /**
    * PATCH /admin/rubrics/:id/review
    * Body, approve: `{ action: "approve", revision, intentPolarity,
-   *                   acknowledgedFlags?: string[], reason?: string }`
+   *                   acknowledgedFlags?: string[], reason?: string,
+   *                   excludedCriterionIds?: string[], exclusionNote?: string,
+   *                   confirmPrimaryExclusions?: boolean }` (#161)
    * Body, reject:  `{ action: "reject", revision, reason }` (reason >= 10 chars)
    * 200 -> the decision (new revision, serving version, audit id).
    * 400 VALIDATION_ERROR; 404 NOT_FOUND; 409 ALREADY_DECIDED /
    * REVISION_MISMATCH / NOT_LATEST_VERSION / STALE_CITATION /
    * CITATION_UNVERIFIABLE / SOURCE_CHANGED / RUBRIC_INVALID /
-   * FLAGS_NOT_ACKNOWLEDGED. Nothing is written on any error.
+   * FLAGS_NOT_ACKNOWLEDGED / PRIMARY_EXCLUSION_UNCONFIRMED. Nothing is written on any error.
    */
   async review(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {

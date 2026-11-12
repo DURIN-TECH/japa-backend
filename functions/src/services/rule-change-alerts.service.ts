@@ -1,6 +1,6 @@
 import { FieldPath, Timestamp } from "firebase-admin/firestore";
 import { collections } from "../utils/firebase";
-import { rubricStore } from "../scrapers";
+import { applyExclusions, rubricStore } from "../scrapers";
 import type { VisaRubric } from "../scrapers";
 import type { VisaFieldDiff, FeeComponentDiff } from "../scrapers/types";
 import type { Application } from "../types";
@@ -495,8 +495,17 @@ export class RuleChangeAlertsService {
       this.deps.getRubricVersion(entry.routeKey, event.previousRubricVersion),
     ]);
     if (!current || !baseline) return skip("rubric_version_missing");
+    // `getVersionForReview` returns any status. Both versions here are named by
+    // an approval (the one approved and the one it replaced), so each must
+    // BE approved; anything else is skipped and logged, never diffed.
+    if (current.reviewStatus !== "approved" || baseline.reviewStatus !== "approved") {
+      console.warn(`Rule-change alerts: ${entry.routeKey} v${version} or v${event.previousRubricVersion} is not approved; skipped`);
+      return skip("rubric_version_not_approved");
+    }
 
-    const summary = summariseRubricDiff(current, baseline);
+    // Diff what applicants actually get (#161): each version without the
+    // criteria its reviewer excluded.
+    const summary = summariseRubricDiff(applyExclusions(current), applyExclusions(baseline));
     // An approval that moves no criterion (a noisy page edit that extracted the
     // same rules) alerts nobody.
     if (!summary) return skip("no_criteria_change");

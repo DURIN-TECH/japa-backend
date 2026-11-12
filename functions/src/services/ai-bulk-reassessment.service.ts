@@ -2,7 +2,7 @@ import { createHash } from "crypto";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { collections, db } from "../utils/firebase";
-import { rubricRouteKey, rubricStore, type VisaRubric } from "../scrapers";
+import { applyExclusions, rubricRouteKey, rubricStore, type VisaRubric } from "../scrapers";
 import type { Application } from "../types";
 import {
   READINESS_BANDS,
@@ -875,7 +875,17 @@ export class BulkReassessmentService {
     if (this.rubricVersionCache.has(key)) return this.rubricVersionCache.get(key) ?? null;
     let found: VisaRubric | null = null;
     try {
-      found = await this.deps.getRubricVersion(routeKey, version);
+      const loaded = await this.deps.getRubricVersion(routeKey, version);
+      if (loaded && loaded.reviewStatus !== "approved") {
+        // `getVersionForReview` returns ANY status. Only an approved version
+        // is a rule set someone was assessed against, so a pending or
+        // rejected one is skipped (the change summary just has no rubric diff).
+        console.warn(`Bulk re-assessment: rubric ${routeKey} v${version} is ${loaded.reviewStatus}, not approved; skipped for the diff`);
+      } else if (loaded) {
+        // Compare EFFECTIVE content (#161): the approved reader has the
+        // reviewer's exclusions applied, so this side must too.
+        found = applyExclusions(loaded);
+      }
     } catch {
       found = null;
     }
