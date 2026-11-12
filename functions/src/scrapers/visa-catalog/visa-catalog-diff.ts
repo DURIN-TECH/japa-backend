@@ -139,6 +139,7 @@ export interface VisaDiffResult {
  *  - scalars: strict equality after trimming strings; absent vs present is a
  *    change (`before` / `after` omitted on the absent side);
  *  - eligibilityCriteria: trimmed set; a pure reorder is not a diff;
+ *  - requiredDocuments (#129): trimmed, case-insensitive set; same reorder rule;
  *  - fee: components compared in their own currency; unchanged components
  *    keep the live `baseCostUsd` + `scrapeMeta.fee`. A live doc without
  *    `scrapeMeta.fee` (pre-#59) counts the fee as changed.
@@ -196,6 +197,31 @@ export function diffVisa(params: {
     // Live value verbatim (stale check) and the FULL proposed array, in order.
     if (live.eligibilityCriteria !== undefined) current.eligibilityCriteria = live.eligibilityCriteria;
     proposed.eligibilityCriteria = propCriteria;
+  }
+
+  // ---- requiredDocuments (trimmed, case-insensitive set; issue #129) ----
+  // Keyed by the normalised form (trim + collapse whitespace + lower-case) but
+  // reported with the original text. Absent live + empty proposed = no diff, so
+  // a record whose page never lists documents never gets a proposal.
+  const docKey = (s: unknown) => String(s).trim().replace(/\s+/g, " ").toLowerCase();
+  const liveDocs = Array.isArray(live.requiredDocuments) ? live.requiredDocuments : [];
+  const propDocs = Array.isArray(proposedFields.requiredDocuments) ? proposedFields.requiredDocuments : [];
+  const liveDocKeys = new Set(liveDocs.map(docKey));
+  const propDocKeys = new Set(propDocs.map(docKey));
+  const docsAdded = propDocs.filter((s, i) => !liveDocKeys.has(docKey(s)) && propDocs.findIndex((x) => docKey(x) === docKey(s)) === i);
+  const docsRemoved = liveDocs.filter((s, i) => !propDocKeys.has(docKey(s)) && liveDocs.findIndex((x) => docKey(x) === docKey(s)) === i);
+  if (docsAdded.length || docsRemoved.length) {
+    diff.push({
+      field: "requiredDocuments",
+      kind: "changed",
+      added: docsAdded.map((s) => String(s).trim()),
+      removed: docsRemoved.map((s) => String(s).trim()),
+    });
+    // Live value verbatim (stale check). The FULL proposed list is applied;
+    // when it is empty the key is left OUT of `proposed`, which approve turns
+    // into a field delete (the page no longer lists any document).
+    if (live.requiredDocuments !== undefined) current.requiredDocuments = live.requiredDocuments;
+    if (propDocs.length > 0) proposed.requiredDocuments = propDocs;
   }
 
   // ---- Fee ----

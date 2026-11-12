@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import type Anthropic from "@anthropic-ai/sdk";
 import { AI_MODELS, type AiModelRole } from "./ai-models";
 import { describeAnthropicError, getAnthropicClient } from "./anthropic-client";
 
@@ -29,6 +30,16 @@ import { describeAnthropicError, getAnthropicClient } from "./anthropic-client";
 // response, the client or a request options object. Errors are turned into a
 // secret-free one-liner by describeAnthropicError().
 
+/**
+ * One file attached to a request (issue #42, stage 2). The media type is the
+ * one the caller SNIFFED from the bytes, never the stored file name.
+ */
+export interface LlmDocument {
+  mediaType: "application/pdf" | "image/jpeg" | "image/png";
+  // Base64 bytes of the file.
+  data: string;
+}
+
 /** One structured request: a system prompt, one user message, one schema. */
 export interface LlmRequest {
   // The role decides the model (ai-models.ts); never a model id literal.
@@ -37,6 +48,9 @@ export interface LlmRequest {
   system: string;
   // The data for this call (already wrapped in its delimiters by the caller).
   user: string;
+  // Attached files, sent before the text in the user turn. Absent for
+  // text-only calls, which keep their exact request shape and recording hash.
+  documents?: LlmDocument[];
   // JSON Schema the answer must follow.
   schema: Record<string, unknown>;
   // Upper bound on generated tokens (thinking included).
@@ -93,8 +107,51 @@ export function emptyLlmUsage(): LlmUsage {
 // Anthropic provider
 // ============================================
 
+/**
+ * The user turn: plain text when nothing is attached (the shape every existing
+ * caller sends), otherwise the attached files as base64 blocks followed by the
+ * text. A PDF goes as a `document` block, an image as an `image` block.
+ */
+function userContent(request: LlmRequest): MessageContent {
+  if (!request.documents || request.documents.length === 0) return request.user;
+  const blocks: ContentBlock[] = request.documents.map((d): ContentBlock =>
+    d.mediaType === "application/pdf"
+      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: d.data } }
+      : { type: "image", source: { type: "base64", media_type: d.mediaType, data: d.data } }
+  );
+  blocks.push({ type: "text", text: request.user });
+  return blocks;
+}
+
+type MessageContent = Anthropic.MessageParam["content"];
+type ContentBlock = Anthropic.ContentBlockParam;
+
 /** Retries left to the SDK per request (connection errors, 429, 5xx). */
 const MAX_RETRIES = 1;
+
+/**
+ * The Messages API params for one request. Shared by the interactive path
+ * (`complete`, streamed) and the Batch API path (services/ai/batch-provider.ts),
+ * so the two can never send different prompts, schemas or flags for the same
+ * request.
+ *
+ *  - Schema-constrained JSON through `output_config.format`. There is no
+ *    `strict` field: the caller re-validates the answer in code.
+ *  - Deliberately absent: temperature / top_p / top_k (rejected), tools and
+ *    tool_choice (the model must not be able to act).
+ */
+export function messageParamsFor(request: LlmRequest, model: string): Anthropic.MessageCreateParamsNonStreaming {
+  return {
+    model,
+    max_tokens: request.maxOutputTokens,
+    system: request.system,
+    messages: [{ role: "user", content: userContent(request) }],
+    output_config: {
+      format: { type: "json_schema", schema: request.schema },
+      ...(request.effort ? { effort: request.effort } : {}),
+    },
+  };
+}
 
 /** The real provider, over the shared client. */
 export class AnthropicLlmProvider implements LlmProvider {
@@ -120,23 +177,7 @@ export class AnthropicLlmProvider implements LlmProvider {
     const model = this.modelFor(request.role);
     try {
       const message = await client.messages
-        .stream(
-          {
-            model,
-            max_tokens: request.maxOutputTokens,
-            system: request.system,
-            messages: [{ role: "user", content: request.user }],
-            // Schema-constrained JSON. No `strict` field exists here: the
-            // caller re-validates the answer in code.
-            output_config: {
-              format: { type: "json_schema", schema: request.schema },
-              ...(request.effort ? { effort: request.effort } : {}),
-            },
-            // Deliberately absent: temperature / top_p / top_k (rejected),
-            // tools and tool_choice (the model must not be able to act).
-          },
-          { timeout: request.timeoutMs, maxRetries: MAX_RETRIES }
-        )
+        .stream(messageParamsFor(request, model), { timeout: request.timeoutMs, maxRetries: MAX_RETRIES })
         .finalMessage();
 
       // Join the text blocks; thinking blocks are ignored.
@@ -172,10 +213,14 @@ export class AnthropicLlmProvider implements LlmProvider {
  * that changes the answer (role, both prompts, the schema); the timeout and
  * token ceiling are left out so tuning them does not orphan recordings.
  */
-export function llmRequestHash(request: Pick<LlmRequest, "role" | "system" | "user" | "schema">): string {
-  return createHash("sha256")
-    .update(JSON.stringify([request.role, request.system, request.user, request.schema]))
-    .digest("hex");
+export function llmRequestHash(request: Pick<LlmRequest, "role" | "system" | "user" | "schema" | "documents">): string {
+  const base: unknown[] = [request.role, request.system, request.user, request.schema];
+  // Attached bytes change the answer, so their digests join the key. Text-only
+  // requests add nothing, so existing recordings keep their hash.
+  if (request.documents && request.documents.length > 0) {
+    base.push(request.documents.map((d) => [d.mediaType, createHash("sha256").update(d.data).digest("hex")]));
+  }
+  return createHash("sha256").update(JSON.stringify(base)).digest("hex");
 }
 
 /** What a recording holds: the answer text, and optionally the rest. */
@@ -205,7 +250,7 @@ export class RecordedLlmProvider implements LlmProvider {
   }
 
   /** Store the answer for a request. */
-  record(request: Pick<LlmRequest, "role" | "system" | "user" | "schema">, recording: LlmRecording): void {
+  record(request: Pick<LlmRequest, "role" | "system" | "user" | "schema" | "documents">, recording: LlmRecording): void {
     this.recordings.set(llmRequestHash(request), recording);
   }
 

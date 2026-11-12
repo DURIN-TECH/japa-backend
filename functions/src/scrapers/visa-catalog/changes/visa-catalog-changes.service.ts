@@ -214,7 +214,7 @@ class VisaChangeService {
     if (!isValidDocId(id)) throw changeNotFound();
     const rowRef = collections.pendingVisaChanges.doc(id);
 
-    const { countryCode, visaId } = await this.runTransaction(async (tx) => {
+    const { countryCode, visaId, diff, sourceUrl } = await this.runTransaction(async (tx) => {
       const rowSnap = await tx.get(rowRef);
       if (!rowSnap.exists) throw changeNotFound();
       const change = rowFrom(rowSnap);
@@ -253,8 +253,21 @@ class VisaChangeService {
         appliedFields,
         updatedAt: now,
       });
-      return { countryCode: change.countryCode, visaId: change.visaId };
+      return { countryCode: change.countryCode, visaId: change.visaId, diff: change.diff, sourceUrl: change.proposedSourceUrl ?? change.sourceUrl ?? null };
     });
+
+    // ---- After commit: record the approved change for rule-change alerts (#123) ----
+    // OUTSIDE the transaction, and its failure is logged and swallowed: it can
+    // never fail or roll back the approval. Only this APPROVE path records an
+    // event; a rejected or still-open proposal triggers nothing. Imported
+    // lazily so the services layer is not loaded while this module is (it
+    // reaches back into the scrapers barrel).
+    try {
+      const { ruleChangeAlertsService } = await import("../../../services/rule-change-alerts.service");
+      await ruleChangeAlertsService.recordVisaChangeApproved({ changeId: id, countryCode, visaId, diff, sourceUrl, approvedBy: reviewerUid });
+    } catch (error) {
+      console.error(`Approval of visa change ${id} (${countryCode}/${visaId}) committed but recording its rule-change alert failed:`, error);
+    }
 
     // ---- After commit: stats follow an edited cost / processing days ----
     try {

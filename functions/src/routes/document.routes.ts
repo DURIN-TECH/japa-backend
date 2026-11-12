@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { documentCheckController } from "../controllers/document-check.controller";
 import { documentController } from "../controllers/document.controller";
 import { verifyAuth } from "../middleware/auth";
 import { requireFeature } from "../middleware/authz";
@@ -29,5 +30,11 @@ router.delete("/:id", verifyAuth, (req, res) =>
 router.put("/:id/status", verifyAuth, (req, res) =>
   documentController.updateDocumentStatus(req, res)
 );
+
+// Per-upload document check (issue #115). No requireFeature: the tier is decided
+// in the handler (fail closed), and a free caller gets an upgrade state, not a 402,
+// on the read.
+router.get("/:id/check", verifyAuth, (req, res) => documentCheckController.get(req, res));
+router.post("/:id/check/retry", verifyAuth, (req, res) => documentCheckController.retry(req, res));
 
 export { router as documentRoutes };

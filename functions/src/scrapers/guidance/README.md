@@ -157,6 +157,28 @@ Local runs use the Firestore and Storage emulators with a `demo-` project id
 and non-default ports. Do not seed or crawl a shared project from a feature
 branch.
 
+## Schedule, run records and alerts (issue #143)
+
+`crawlGuidanceOrchestrator` (functions/src/index.ts) runs once a night at
+03:20 UTC and crawls the sources that are due by their own
+`checkIntervalHours`. A tick with nothing due writes no run record and raises
+no alert. Otherwise the run is a `scrapeRuns` doc of kind `guidance`
+(`GET /admin/scrape-runs?kind=guidance`), and each source is crawled under the
+lease `scrapeSourceLeases/guidance__<sourceId>`.
+
+- A source that turns `failing` raises a critical `source_broken` alert, and
+  an infrastructure error (our Storage / Firestore) raises
+  `infrastructure_error`. Neither moves a source's failure streak.
+- A source with an infrastructure error on 3 runs in a row
+  (`DEFAULT_CONSECUTIVE_INFRA_ERROR_LIMIT`) is left alone for 6 hours
+  (`DEFAULT_INFRA_BACKOFF_MS`), both in `shared/runs/source-health.ts`.
+- Admin retry: `POST /admin/guidance-sources/<id>/crawl` crawls that one
+  source now (due or not, `failing` included, backoff ignored). A success sets
+  it back to `active` and clears the infrastructure counter. 409
+  `RUN_IN_PROGRESS` when another run holds its lease.
+- `GET /admin/guidance-sources` shows `lastInfrastructureError` and
+  `lastInfrastructureErrorAt`.
+
 ## Recovering a source
 
 The admin list (`GET /admin/guidance-sources`) shows `status`, `lastError`

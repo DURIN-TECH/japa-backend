@@ -36,6 +36,23 @@ import type { Timestamp } from "firebase-admin/firestore";
 /** Default `consecutiveFailureLimit` (the hard-coded value before #107). */
 export const DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 5;
 
+// ---- Infrastructure-error cap (issue #143, guidance crawl) ----
+//
+// An INFRASTRUCTURE error (our Cloud Storage / Firestore failed while handling
+// a source) says nothing about the source, so it never moves the failure
+// streak above and never turns a source `failing`. It does need a brake: a
+// source that hits one on every run would otherwise be re-fetched from the
+// publisher on every tick for as long as the outage lasts. After
+// `DEFAULT_CONSECUTIVE_INFRA_ERROR_LIMIT` runs in a row that ended in an
+// infrastructure error on the same source, the crawler stops requesting it
+// until `DEFAULT_INFRA_BACKOFF_MS` has passed (or an admin retries it by id).
+
+/** Consecutive runs with an infrastructure error on one source before it is backed off. */
+export const DEFAULT_CONSECUTIVE_INFRA_ERROR_LIMIT = 3;
+
+/** How long a capped source is left alone: 6 hours, in milliseconds. */
+export const DEFAULT_INFRA_BACKOFF_MS = 6 * 60 * 60 * 1000;
+
 /**
  * Why the crawler paused a source:
  *  - failure_limit: `consecutiveFailures` reached the limit (status `broken`);

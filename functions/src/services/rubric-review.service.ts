@@ -4,7 +4,7 @@ import { collectionGroups, collections, db, subcollections } from "../utils/fire
 // ESLint boundary rule of issue #91 refuses deep imports from here).
 import { SnapshotQuoteIndex, guidanceSnapshotStore, rubricStore, validateVisaRubric } from "../scrapers";
 import type { GuidanceSnapshotContent } from "../scrapers/types";
-import type { RubricIssue } from "../scrapers/rubric/rubric-validate";
+import type { RubricIssue } from "../scrapers";
 import {
   INTENT_POLARITIES,
   RUBRIC_REVIEW_FIELDS,

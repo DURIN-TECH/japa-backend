@@ -271,6 +271,10 @@ export interface VisaScrapeMeta {
   // The numeric fields the validator dropped because the page did not cite
   // them (ExtractedVisa.uncitedFieldsDropped). Absent when none were.
   uncitedFieldsDropped?: string[];
+  // Issue #129: documents the model returned that had no verbatim quote on the
+  // page and were therefore DROPPED (ExtractedVisa.requiredDocumentsDropped).
+  // Audit trail so a reviewer sees what the model claimed. Absent when none.
+  requiredDocumentsDropped?: string[];
   // Supplementary registry pages whose text was appended to this route's
   // page before extraction (issue #86, e.g. the Korea Visa Portal fee table
   // for the HiKorea C-3 route). Absent when the route uses none.
@@ -519,6 +523,12 @@ export type VisaFieldDiff =
   // Compared as a whitespace-trimmed SET: a pure reorder is not a diff. When it
   // is a diff, the full proposed array (in proposed order) is what is applied.
   | { field: "eligibilityCriteria"; kind: "changed"; added: string[]; removed: string[] }
+  // Issue #129: the official "documents you must provide" list. Same set
+  // semantics as eligibilityCriteria, but compared case-INSENSITIVELY too (a
+  // document repeated in different case is the same document). `removed`
+  // documents disappear from the live doc on approve, as the proposed array
+  // replaces the live one wholesale (an empty proposed list deletes the field).
+  | { field: "requiredDocuments"; kind: "changed"; added: string[]; removed: string[] }
   // The fee. Applying it writes `baseCostUsd` (+ `scrapeMeta.fee` via the
   // wholesale scrapeMeta replace) in the same transaction.
   | {
@@ -621,6 +631,14 @@ export interface ExtractedVisa {
   isExtendable: boolean;
   maxExtensions?: number;
   eligibilityCriteria: string[];
+  // Issue #129: documents the page says the applicant must provide, one string
+  // per document in page order, trimmed and de-duplicated. Every item has a
+  // verbatim quote under citations["requiredDocuments.<index>"] (0-based index
+  // into THIS array). [] is valid: the page lists no documents.
+  requiredDocuments: string[];
+  // Issue #129: model-returned documents dropped for lacking a verbatim quote
+  // on the page. Only present when something was dropped.
+  requiredDocumentsDropped?: string[];
   applicationUrl?: string;
   applicationInstructions?: string;
   // Set by the validator (issue #87) when processingDaysMin/Max is more than
@@ -632,5 +650,6 @@ export interface ExtractedVisa {
   // field -> verbatim quote from the page. Fee keys: "fee.application",
   // "fee.surcharge" (2nd surcharge "fee.surcharge.2", ...), and "fee.years"
   // (2nd per-year component "fee.years.2", ...) — see feeCitationKey().
+  // Documents: "requiredDocuments.0", "requiredDocuments.1", ... (issue #129).
   citations: Record<string, string>;
 }

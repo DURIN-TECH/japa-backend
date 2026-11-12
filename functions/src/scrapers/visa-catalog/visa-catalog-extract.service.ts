@@ -74,10 +74,14 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *    within 8 weeks", with only "within 3 weeks" cited). The value rule is
  *    unchanged (full range, user decision on #60); the validator now flags a
  *    range that disagrees with its citations (visa-catalog-processing-check).
+ *  - "2026-11-required-documents-v6" (#129): new `requiredDocuments` array
+ *    (the page's own "documents you must provide" list, in page order), each
+ *    item backed by a verbatim quote in citations["requiredDocuments.<index>"].
+ *    The validator drops any item without a matching quote on the page.
  * Before merging a bump (or a model change), run `npm run eval:visa-extract`
  * and attach the result — see functions/src/scrapers/visa-catalog/eval/README.md.
  */
-export const EXTRACTOR_PROMPT_VERSION = "2026-11-processing-cited-v5";
+export const EXTRACTOR_PROMPT_VERSION = "2026-11-required-documents-v6";
 
 // A duration phrase: a number (digits or a word) followed by year(s)/month(s),
 // e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
@@ -132,6 +136,83 @@ export function feeYearsCitationKey(ordinal: number): string {
 // The citation keys that support the processing-time numbers are #87's shared
 // PROCESSING_CITATION_PREFIXES (visa-catalog-processing-check.ts), imported
 // above, so the uncited rule and the range check read the same keys.
+
+// ----- Required documents (issue #129) -----
+//
+// The domain rule: a document is only shown as a requirement when the page
+// itself lists it. So the model returns the page's own wording per item plus a
+// verbatim quote, and the VALIDATOR (not the prompt) enforces it: an item with
+// no quote, a quote that is not on the page, or a quote that does not contain
+// the item is dropped and recorded. Code never adds a document of its own.
+
+/** Citation key for the item at `index` (0-based) of `requiredDocuments`. */
+export function requiredDocumentCitationKey(index: number): string {
+  return `requiredDocuments.${index}`;
+}
+
+/**
+ * Normalise text for the "is this quote on the page" test: unify curly
+ * quotes/dashes, collapse whitespace, lower-case. Matching is otherwise exact,
+ * so a paraphrase never passes.
+ */
+function normForQuote(s: string): string {
+  return s
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, "\"")
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Validate `requiredDocuments` (pushes shape problems onto `errors`).
+ * Returns the kept items (page order, de-duplicated, re-indexed), the quotes
+ * under their NEW indices, and the raw items that were dropped.
+ *  - absent / null = the page lists none: [] and valid (not an error);
+ *  - present but not an array of non-empty strings: a hard error, like a
+ *    malformed eligibilityCriteria;
+ *  - kept only with a non-empty quote under the item's ORIGINAL index that
+ *    (a) appears on the page when `pageText` is given and (b) contains the
+ *    item's text (so the item is the page's wording, not a paraphrase);
+ *  - duplicates (trim + whitespace + case-insensitive) collapse to the first
+ *    cited occurrence and are not "dropped" (nothing was lost).
+ */
+function validateRequiredDocuments(
+  raw: unknown,
+  citations: Record<string, string>,
+  pageText: string | undefined,
+  errors: string[]
+): { items: string[]; quotes: Record<string, string>; dropped: string[] } {
+  const none = { items: [] as string[], quotes: {} as Record<string, string>, dropped: [] as string[] };
+  if (raw === undefined || raw === null) return none;
+  if (!Array.isArray(raw) || raw.some((x) => typeof x !== "string" || x.trim().length === 0)) {
+    errors.push("\"requiredDocuments\" must be an array of non-empty strings (empty when the page lists none)");
+    return none;
+  }
+  const page = pageText === undefined ? undefined : normForQuote(pageText);
+  const items: string[] = [];
+  const quotes: Record<string, string> = {};
+  const dropped: string[] = [];
+  const seen = new Set<string>();
+  (raw as string[]).forEach((rawItem, i) => {
+    const item = rawItem.trim();
+    const quote = citations[requiredDocumentCitationKey(i)];
+    const q = typeof quote === "string" ? normForQuote(quote) : "";
+    const cited =
+      q.length > 0 && (page === undefined || page.includes(q)) && q.includes(normForQuote(item));
+    if (!cited) {
+      dropped.push(item);
+      return;
+    }
+    const key = normForQuote(item);
+    if (seen.has(key)) return; // repeat of a kept document: collapse silently
+    seen.add(key);
+    quotes[requiredDocumentCitationKey(items.length)] = (quote as string).trim();
+    items.push(item);
+  });
+  return { items, quotes, dropped };
+}
 
 /** Citation key prefix that supports `maxExtensions`. */
 export const MAX_EXTENSIONS_CITATION_PREFIX = "maxExtensions";
@@ -189,6 +270,10 @@ export interface LlmExtractor {
 export interface ValidateOptions {
   // Registry official host patterns (see visa-catalog-official-hosts.ts).
   officialHosts?: readonly string[];
+  // The page text the model saw (issue #129). When given, a required-document
+  // quote must appear in it word for word; without it (stubs, eval replays)
+  // only the quote's presence and its containing the item are checked.
+  pageText?: string;
 }
 
 /**
@@ -270,6 +355,8 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
     : [];
   if (eligibility.length === 0) errors.push("\"eligibilityCriteria\" must be a non-empty string array");
 
+  // requiredDocuments (issue #129): optional; validated further once the
+  // citations are parsed below (it needs them).
   // confidence: 0–1.
   const confidence = typeof o.confidence === "number" ? o.confidence : NaN;
   if (!(confidence >= 0 && confidence <= 1)) errors.push("\"confidence\" must be a number in [0,1]");
@@ -288,6 +375,14 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
     citations,
     errors
   );
+
+  // ---- Required documents (issue #129): cited verbatim or dropped ----
+  const docs = validateRequiredDocuments(o.requiredDocuments, citations, options.pageText, errors);
+  // Re-key the document citations to the KEPT items' indices: strip the
+  // model's (raw-index) keys, then add the remapped ones, so a dropped or
+  // collapsed item never leaves a quote pointing at the wrong document.
+  for (const k of Object.keys(citations)) if (k.startsWith("requiredDocuments.")) delete citations[k];
+  Object.assign(citations, docs.quotes);
 
   // ---- Uncited numeric fields (issue #86, see the module note above) ----
   // Fields the model returned but the page does not back; listed on the
@@ -375,6 +470,9 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
     isExtendable,
     ...(maxExtensions !== undefined ? { maxExtensions } : {}),
     eligibilityCriteria: eligibility,
+    requiredDocuments: docs.items,
+    // Audit trail, only when something was dropped (issue #129).
+    ...(docs.dropped.length > 0 ? { requiredDocumentsDropped: docs.dropped } : {}),
     applicationUrl,
     applicationInstructions,
     // Capped when the processing range disagrees with its citations (#87).
@@ -543,7 +641,8 @@ export function buildSystemPrompt(): string {
     "  processingTime (string, e.g. '3-8 weeks'), processingDaysMin (number), processingDaysMax (number),",
     "  feeComponents (array, see FEES below), validityPeriod (string, e.g. '3 years'),",
     "  isExtendable (boolean), maxExtensions (number, optional),",
-    "  eligibilityCriteria (array of short strings), applicationUrl (string, optional),",
+    "  eligibilityCriteria (array of short strings),",
+    "  requiredDocuments (array of strings, see DOCUMENTS below), applicationUrl (string, optional),",
     "  applicationInstructions (string, optional),",
     "  confidence (number 0-1: how confident you are this is accurate FROM THE PAGE),",
     "  citations (object mapping field name -> a short verbatim quote from the page that supports it).",
@@ -642,6 +741,18 @@ export function buildSystemPrompt(): string {
     "  Example: citations['processingDaysMin'] = 'you'll usually get a decision on your visa within 3 weeks',",
     "  citations['processingDaysMax'] = 'a decision will usually be made within 8 weeks', processingTime '3-8 weeks'.",
     "- Never report a processing figure that no quote in these citations states.",
+    "",
+    // ---- #129: the page's own document list, nothing else ----
+    "DOCUMENTS (requiredDocuments):",
+    "- List ONLY the documents the page itself says the applicant must provide / send / upload / submit",
+    "  (e.g. under a heading such as 'documents you must provide' or 'what you need to apply'), one string per",
+    "  document, in the order the page lists them, using the page's own wording.",
+    "- Never add a document the page does not name, even a typical one (passport, photo, ...). Do not infer",
+    "  documents from eligibility rules. Do not split or merge the page's items.",
+    "- If the page has no such list, return [] (this is valid; do not lower confidence for it).",
+    "- EVERY item needs a verbatim quote: citations['requiredDocuments.<index>'] where <index> is the item's",
+    "  0-based position in YOUR array (citations['requiredDocuments.0'] for the first). The quote must be copied",
+    "  word for word from the page and contain the item's text. An item without such a quote will be discarded.",
   ].join("\n");
 }
 
@@ -789,7 +900,8 @@ export class DeepSeekExtractor implements LlmExtractor {
 
     // Validate before handing off — never let an invalid shape past this line.
     // `officialHosts` (registry) gates `applicationUrl` (issue #74).
-    return validateExtractedVisa(parsed, { officialHosts: context.officialHosts });
+    // `pageText` lets the validator confirm document quotes are on the page (#129).
+    return validateExtractedVisa(parsed, { officialHosts: context.officialHosts, pageText: cleanText });
   }
 }
 

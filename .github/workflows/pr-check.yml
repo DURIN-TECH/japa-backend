@@ -56,3 +56,46 @@ jobs:
       - name: Test
         working-directory: functions
         run: npm test
+
+  # Run the Firebase-emulator suites: the Firestore and Storage rules tests
+  # against the repo's real rules files, and the end-to-end API tests against
+  # the real Express app with real ID tokens (functions/test/emulator/).
+  # The demo project id and the non-default test ports live in
+  # firebase.emulator-test.json; no secrets or .env files are needed.
+  emulator:
+    name: Emulator tests
+    runs-on: ubuntu-latest
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: "npm"
+          cache-dependency-path: functions/package-lock.json
+
+      # The Firestore / Auth / Storage emulators are Java processes.
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependencies
+        working-directory: functions
+        run: npm ci
+
+      # `npm run test:emulator` shells out to the Firebase CLI
+      # (`firebase emulators:exec`), which is not a dependency of the repo.
+      - name: Install Firebase CLI
+        run: npm install --global firebase-tools@15
+
+      - name: Emulator tests
+        working-directory: functions
+        run: npm run test:emulator

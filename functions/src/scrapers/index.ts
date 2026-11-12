@@ -86,5 +86,27 @@ export { rubricExtractionService } from "./rubric/rubric-extraction.service";
 export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
 /** Structural rubric validator (the review API re-runs it before approving). */
 export { validateVisaRubric } from "./rubric/rubric-validate";
+/** Validator issue shape (type-only; the review API reports it). */
+export type { RubricIssue } from "./rubric/rubric-validate";
 /** Verbatim-quote lookup in a stored snapshot (the review API's stale-citation check). */
 export { SnapshotQuoteIndex } from "./rubric/rubric-quote";
+/** Rubric types for consumers (the assessment engine, #42). Type-only. */
+export type {
+  AssessmentCriterion,
+  CriterionAppliesTo,
+  CriterionCheck,
+  CriterionKind,
+  DecisionStage,
+  IntentPolarity,
+  RubricCitation,
+  VisaRubric,
+} from "../types/rubric";
+// ---- Published outcome statistics importer (issue #116) ----
+/** Import orchestrator (quarterly schedule + manual runs). */
+export { outcomeImportService, ImportAlreadyRunningError } from "./outcome-statistics/outcome-import.service";
+/** "Run now" worker: src/index.ts's processOutcomeStatisticsRunRequest trigger. */
+export { outcomeRunWorker } from "./outcome-statistics/outcome-run-worker";
+/** Admin routes: list import runs, request a manual run (admin-only). */
+export { adminOutcomeStatisticsRoutes } from "./outcome-statistics/outcome-statistics.routes";
+/** Destinations with an outcome data source adapter. */
+export { registeredDestinations } from "./outcome-statistics/registry";

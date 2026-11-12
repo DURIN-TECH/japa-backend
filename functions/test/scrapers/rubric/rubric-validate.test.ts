@@ -229,8 +229,8 @@ describe("rubric validator: joins and integrity", () => {
   });
 
   test("an outcome-statistics mapping is optional, and checked when present", () => {
-    assert.deepEqual(codes(rubric({ outcomeStatistics: { categoryKey: "all-visit-categories", adapterId: "avalen-tables", sourceUrl: "https://stats.avalen.example/tables", note: "Wider than this route." } })), []);
-    assert.deepEqual(codes(rubric({ outcomeStatistics: { categoryKey: "" } })), ["outcome_statistics_category_missing"]);
+    assert.deepEqual(codes(rubric({ outcomeStatistics: { categoryKey: "all-visit-categories", categoryLabel: "All visit categories", adapterId: "avalen-tables", sourceUrl: "https://stats.avalen.example/tables", note: "Wider than this route." } })), []);
+    assert.deepEqual(codes(rubric({ outcomeStatistics: { categoryKey: "", categoryLabel: "" } })), ["outcome_statistics_category_missing"]);
   });
 
   test("the route key must match the country code and visa type id", () => {

@@ -215,7 +215,8 @@ async function quiet<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 before(async () => {
-  // Swap the real Firestore refs for the in-memory fake.
+  const { installFakes } = await import("../../helpers/fake-firestore");
+  await installFakes();
   const firebase: any = await import("../../../src/utils/firebase");
   firebase.collections.guidanceSources = fakeCollection("guidanceSources");
   firebase.subcollections.guidanceSnapshots = (id: string) => fakeCollection(`guidanceSources/${id}/snapshots`);
@@ -375,8 +376,10 @@ describe("guidance crawl: hash gate", () => {
     assert.equal(saveAttempts, 0, "Cloud Storage is not written to (not even attempted)");
     assert.deepEqual([...store.keys()].filter((p) => p.includes("/snapshots/")).sort(), snapshotDocsBefore);
     assert.deepEqual(objects, objectsBefore);
-    // The only Firestore writes are the two fetch-time stamps on the sources.
-    assert.deepEqual(writes.map((w) => `${w.op} ${w.path}`).sort(), [
+    // The only guidance-source writes are the two fetch-time stamps on the sources
+    // (the run record and per-source leases now write their own docs too).
+    const guidanceWrites = writes.filter((w) => w.path.startsWith("guidanceSources/"));
+    assert.deepEqual(guidanceWrites.map((w) => `${w.op} ${w.path}`).sort(), [
       `update guidanceSources/${SOURCE_A.id}`,
       `update guidanceSources/${SOURCE_B.id}`,
     ]);

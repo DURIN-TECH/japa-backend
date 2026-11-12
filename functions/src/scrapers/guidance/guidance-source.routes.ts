@@ -6,9 +6,10 @@ import { guidanceSourceController } from "./guidance-source.controller";
 // Routes for the guidance source registry (issue #39)
 // ============================================
 //
-// Mounted at /admin/guidance-sources (app.ts). Read-only: ONE route, the
-// list. `verifyAuth` gives 401 without a valid token; the controller then
-// gates on the admin-only CASL ability -> 403 FORBIDDEN otherwise.
+// Mounted at /admin/guidance-sources (app.ts). Two routes: the read-only list,
+// and (issue #143) the admin retry `POST /:id/crawl`. `verifyAuth` gives 401
+// without a valid token; the controller then gates on the admin-only CASL
+// ability -> 403 FORBIDDEN otherwise.
 //
 // There is deliberately no route that returns a snapshot or its text: stored
 // guidance text is for the backend's own quote validation.
@@ -16,5 +17,8 @@ import { guidanceSourceController } from "./guidance-source.controller";
 /** /admin/guidance-sources — the caseworker-guidance registry. */
 const adminGuidanceSourceRoutes = Router();
 adminGuidanceSourceRoutes.get("/", verifyAuth, (req, res) => guidanceSourceController.list(req, res));
+
+// Crawl exactly this source now (due or not, `failing` included).
+adminGuidanceSourceRoutes.post("/:id/crawl", verifyAuth, (req, res) => guidanceSourceController.crawl(req, res));
 
 export { adminGuidanceSourceRoutes };

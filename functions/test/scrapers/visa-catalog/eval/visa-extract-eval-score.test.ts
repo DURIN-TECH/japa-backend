@@ -280,6 +280,7 @@ function perfectSW(): ExtractedVisa {
       "Minimum salary",
       "English",
     ],
+    requiredDocuments: [],
     applicationUrl: "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/skilled_worker_out_uk",
     confidence: 0.9,
     citations: {},

@@ -1,7 +1,10 @@
+import { aiActionService } from "../services/ai-action.service";
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { documentService, UploadActor } from "../services/document.service";
 import { documentRequestService } from "../services/document-request.service";
+import { documentCheckService } from "../services/ai/document-check.service";
+import { tierFor } from "../services/ai/tier-serializer";
 import { notificationService } from "../services/notification.service";
 import { userService } from "../services/user.service";
 import { collections } from "../utils/firebase";
@@ -324,10 +327,34 @@ export class DocumentController {
               documentRequestId,
               document.id
             );
-            if (closed) fulfilledRequestType = docRequest.documentType;
+            if (closed) {
+              fulfilledRequestType = docRequest.documentType;
+              // A request made from an AI proposed action marks that action
+              // satisfied (issue #44). No-op without a back-reference; never throws.
+              await aiActionService.syncFromRequest(docRequest, "satisfied");
+            }
           }
         } catch (e) {
           console.error("[document] fulfilling document request failed:", e);
+        }
+      }
+
+      // Per-upload document check (issue #115). Only for the applicant's OWN
+      // upload against a checklist item, and only on the paid tier: a caller
+      // without `ai.case_officer` (or whose entitlements did not resolve, which
+      // reads as free) uploads exactly as before and nothing here runs. This
+      // only WRITES a queued job (cheap); the worker does the model call, so the
+      // response below never waits on it. Best-effort: a failure here must not
+      // fail an upload that already succeeded, and it never touches the
+      // document's status.
+      if (documentRequestId && isClientsOwn && tierFor(req.authz?.role, req.entitlements) === "full") {
+        try {
+          const checkRequest = await documentRequestService.getById(documentRequestId);
+          if (checkRequest && checkRequest.userId === document.userId && checkRequest.applicationId === applicationId) {
+            await documentCheckService.enqueue(document, targetApp, checkRequest);
+          }
+        } catch (e) {
+          console.error("[document] queuing the document check failed:", e);
         }
       }
 
@@ -375,7 +402,16 @@ export class DocumentController {
       // The storage path in the request was not one the upload-url endpoint
       // issues for this application (issue #141). Nothing was stored.
       if (error instanceof StoragePathRejectedError) {
-        console.warn(`[document] registration refused: storagePath ${error.issue}`);
+        // Who tried, and on which application: a refusal here is worth being
+        // able to trace. The application id comes from the request body, so
+        // it is reduced to id characters and a sane length before it is
+        // logged; the refused path itself is never logged.
+        const loggedApplicationId =
+          String(req.body?.applicationId ?? "unknown").replace(/[^A-Za-z0-9_-]/g, "?").slice(0, 64);
+        console.warn(
+          `[document] registration refused: storagePath ${error.issue} ` +
+            `(caller ${req.userId ?? "unknown"}, application ${loggedApplicationId})`
+        );
         sendError(res, "VALIDATION_ERROR", error.message, 400);
         return;
       }
