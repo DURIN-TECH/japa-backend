@@ -1,5 +1,7 @@
-import axios, { AxiosInstance } from "axios";
+import type { AxiosInstance } from "axios";
 import * as cheerio from "cheerio";
+// Connect-time address guard (issue #159): every default client refuses non-public targets.
+import { createGuardedHttpClient, type AddressGuardOptions } from "./address-guard";
 import { createHash } from "crypto";
 // Host backoff (issue #64): 429/503 detection + Retry-After parsing live in a
 // small pure helper so #15 (Firestore-backed host state) can reuse them.
@@ -251,6 +253,10 @@ export interface VisaCatalogFetchServiceOptions {
   // Longest gap allowed between two chunks of a body, in ms. Default
   // DEFAULT_BODY_IDLE_TIMEOUT_MS (15s); tests lower it.
   bodyIdleTimeoutMs?: number;
+  // TEST-ONLY (issue #159): relaxes the address guard of the DEFAULT client so
+  // tests can reach loopback stub servers. Ignored when `http` is injected.
+  // Never derived from env/config; production constructs the service without it.
+  addressGuard?: AddressGuardOptions;
 }
 
 /** Raw HTTP response handed to adapters by `getRaw()`. */
@@ -450,7 +456,7 @@ export class VisaCatalogFetchService {
 
   constructor(options: VisaCatalogFetchServiceOptions = {}) {
     this.minIntervalMs = options.minIntervalMs ?? PER_HOST_MIN_INTERVAL_MS;
-    this.http = options.http ?? VisaCatalogFetchService.createDefaultClient();
+    this.http = options.http ?? VisaCatalogFetchService.createDefaultClient(options.addressGuard);
     this.clock = options.clock ?? Date.now;
     this.pdfLimits = { ...DEFAULT_PDF_LIMITS, ...(options.pdf ?? {}) };
     this.bodyTimeoutMs = options.bodyTimeoutMs ?? DEFAULT_BODY_TIMEOUT_MS;
@@ -495,10 +501,15 @@ export class VisaCatalogFetchService {
     });
   }
 
-  /** Production axios client (the shape used before adapters existed). */
-  private static createDefaultClient(): AxiosInstance {
+  /**
+   * Production axios client (the shape used before adapters existed), built by
+   * the shared address guard (issue #159): non-public addresses, IP-literal
+   * hosts, ports other than 80/443 and env proxies are all refused, on the
+   * first request and on every redirect hop. `guard` is the test hook.
+   */
+  static createDefaultClient(guard?: AddressGuardOptions): AxiosInstance {
     // Mirrors the news scraper's client: identifies our bot, bounds time + size.
-    return axios.create({
+    return createGuardedHttpClient({
       timeout: 15_000,
       headers: {
         "User-Agent": VISA_CATALOG_USER_AGENT,
@@ -509,7 +520,7 @@ export class VisaCatalogFetchService {
       maxContentLength: MAX_HTML_BYTES, // 5MB
       // We handle non-2xx ourselves (some sites 403 bots) rather than throwing.
       validateStatus: () => true,
-    });
+    }, guard);
   }
 
   /** Small sleep helper for per-host politeness delays. */

@@ -1,4 +1,4 @@
-import axios, { AxiosInstance } from "axios";
+import type { AxiosInstance } from "axios";
 import * as cheerio from "cheerio";
 import Parser from "rss-parser";
 import { createHash } from "crypto";
@@ -7,6 +7,7 @@ import { newsService } from "../../services/news.service";
 // crawler's fetch layer (#64) — robots.txt parsing + cache, per-host rate
 // limit and 429/503 detection — instead of keeping its own copy. See
 // "Crawler etiquette" below.
+import { createGuardedHttpClient, isUrlAllowed, type AddressGuardOptions } from "../shared/fetch/address-guard";
 import { VisaCatalogFetchService, type VisaCatalogHttpClient } from "../shared/fetch/visa-catalog-fetch.service";
 import {
   HostBackoffTracker,
@@ -125,8 +126,10 @@ export const NEWS_HTTP_TIMEOUT_MS = 15_000;
 /** Largest per-source timeout honoured (keeps a run inside the function timeout). */
 export const NEWS_MAX_REQUEST_TIMEOUT_MS = 60_000;
 
-export function createNewsHttpClient(): AxiosInstance {
-  return axios.create({
+export function createNewsHttpClient(guard?: AddressGuardOptions): AxiosInstance {
+  // Issue #159: built by the shared address guard (connect-time DNS check,
+  // literal + port check on every hop, no env proxy). `guard` is TEST-ONLY.
+  return createGuardedHttpClient({
     timeout: NEWS_HTTP_TIMEOUT_MS,
     headers: {
       "User-Agent": NEWS_BOT_USER_AGENT,
@@ -136,7 +139,7 @@ export function createNewsHttpClient(): AxiosInstance {
     maxRedirects: 3,
     maxContentLength: 5 * 1024 * 1024, // 5MB limit
     validateStatus: () => true,
-  });
+  }, guard);
 }
 
 // ============================================
@@ -1037,6 +1040,11 @@ export class NewsScraperService {
     if (source.config.fetchFullContent && selectors.articleBody) {
       for (const article of articles.slice(0, MAX_FULL_CONTENT_ARTICLES)) {
         if (tracker.blocking(hostOf(article.url))) continue;
+        // Issue #159: article links are scraped off a third-party page. One
+        // that points at a non-public address or port is skipped silently
+        // (summary kept), with no request and no failed run. Names are
+        // judged again at connect time by the guarded client.
+        if (!isUrlAllowed(article.url)) continue;
         try {
           const detailHtml = await this.crawlGet(article.url, {}, sourceTimeoutMs(source));
           const detail$ = cheerio.load(detailHtml);

@@ -262,3 +262,55 @@ describe("parseSourcePatch delegation", () => {
     rejects(() => parseSourcePatch("news", { strategy: "rss" }), "strategy");
   });
 });
+
+// ============================================
+// Issue #159: shared classifier, normalised href, ports, trailing dots
+// ============================================
+
+describe("parseFeedUrl: address rules shared with the fetch guard (issue #159)", () => {
+  test("returns the normalised href, and it re-parses to the host that was checked", () => {
+    const stored = parseFeedUrl("  HTTPS://News.Example.ORG\\feed\t.xml ");
+    assert.equal(stored, "https://news.example.org/feed.xml");
+    assert.equal(new URL(stored).hostname, "news.example.org");
+    assert.equal(parseFeedUrl("https://news.example.org"), "https://news.example.org/");
+  });
+
+  test("every trailing dot is stripped before the checks", () => {
+    for (const h of ["http://localhost../", "http://localhost.../", "http://metadata.google.internal../", "http://127.0.0.1../", "http://foo.local../"]) {
+      rejects(() => parseFeedUrl(h), "config.feedUrl");
+    }
+    assert.ok(parseFeedUrl("https://news.example.org../feed"));
+  });
+
+  test("single-label hosts are refused", () => {
+    for (const h of ["http://intranet/", "http://corp/feed", "http://wiki./", "https://db01/"]) rejects(() => parseFeedUrl(h), "config.feedUrl");
+  });
+
+  test("IPv4 / IPv6 classes from the shared classifier are refused", () => {
+    const refused = [
+      "http://0.0.0.0/", "http://100.64.0.1/", "http://192.0.0.1/", "http://198.18.0.1/", "http://198.19.255.255/",
+      "http://192.0.2.1/", "http://224.0.0.1/", "http://255.255.255.255/", "http://169.254.169.254/",
+      "http://[::]/", "http://[::1]/", "http://[fc00::1]/", "http://[fe80::1]/", "http://[ff02::1]/",
+      "http://[::ffff:8.8.8.8]/", "http://[::ffff:808:808]/", "http://[::8.8.8.8]/", "http://[64:ff9b::808:808]/",
+      "http://[2002:808:808::]/", "http://[2001::1]/", "http://[2001:db8::1]/",
+    ];
+    for (const u of refused) rejects(() => parseFeedUrl(u), "config.feedUrl");
+    for (const u of ["http://100.63.255.255/f", "http://198.20.0.1/f", "http://[2606:4700:4700::1111]/f"]) assert.ok(parseFeedUrl(u), u);
+  });
+
+  test("ports other than 80/443 are refused with their own message", () => {
+    for (const u of ["https://news.example.org:8443/f", "http://news.example.org:8080/f", "http://news.example.org:22/f"]) {
+      assert.throws(
+        () => parseFeedUrl(u),
+        (e: unknown) => e instanceof SettingsValidationError && e.field === "config.feedUrl" && /default port/.test(e.message)
+      );
+    }
+    assert.ok(parseFeedUrl("https://news.example.org:443/f"));
+    assert.ok(parseFeedUrl("http://news.example.org:80/f"));
+  });
+
+  test("stays literal-only: a name is never resolved at write time", () => {
+    // Would be refused at fetch time if it resolved to an internal address; accepted here.
+    assert.ok(parseFeedUrl("https://does-not-resolve.example.org/feed"));
+  });
+});
