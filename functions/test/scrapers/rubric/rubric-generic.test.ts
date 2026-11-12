@@ -152,7 +152,17 @@ describe("rubric module: stays inside the issue's boundaries", () => {
   test("nothing is scheduled and no route serves a rubric", () => {
     const index = fs.readFileSync(path.join(SRC, "index.ts"), "utf8");
     const app = fs.readFileSync(path.join(SRC, "app.ts"), "utf8");
-    assert.doesNotMatch(index, /rubric/i, "src/index.ts must not reference the rubric module");
+    // TODO(test-pass): #123 deliberately wired ONE trigger (onGuidanceSourceChanged,
+    // a Firestore onUpdate on a guidance source, never a schedule) to the rubric
+    // extraction, plus the #37 / #123 triggers on the approval audit doc. What must
+    // still hold: extraction is reachable from that one function only, nothing
+    // scheduled runs it, and index.ts imports no other rubric-module file.
+    const calls = [...index.matchAll(/rubricExtractionService\.(\w+)/g)].map((m) => m[1]);
+    assert.deepEqual(calls, ["onGuidanceChanged"], "src/index.ts calls rubric extraction only through onGuidanceChanged");
+    const trigger = index.slice(index.indexOf("export const onGuidanceSourceChanged"));
+    assert.ok(trigger.slice(0, trigger.indexOf("rubricExtractionService.")).includes(".firestore.document(\"guidanceSources/"), "the call sits inside the guidance-source trigger");
+    assert.doesNotMatch(index, /from "\.\/scrapers\/rubric|types\/rubric"/, "src/index.ts imports no rubric module file directly");
+    assert.doesNotMatch(index, /schedule\([^)]*\)[^;]*rubricExtractionService/s, "no scheduled function runs rubric extraction");
     // Issue #125 added the ADMIN review API (routes/, controllers/, services/
     // rubric-review.* and services/rubric-diff.ts), mounted once under
     // /admin/rubrics. That is the only rubric route, and those four files
@@ -161,7 +171,11 @@ describe("rubric module: stays inside the issue's boundaries", () => {
     const REVIEW_API_FILES = [path.join("services", "rubric-review.service.ts"), path.join("services", "rubric-diff.ts"), path.join("controllers", "rubric-review.controller.ts"), path.join("routes", "rubric-review.routes.ts")];
     // No other file outside the module and the scrapers barrel imports it.
     const outside = tsFiles(SRC).filter((f) => !MODULE_FILES.includes(f) && ![path.join("scrapers", "index.ts"), ...REVIEW_API_FILES].includes(path.relative(SRC, f)));
-    const importers = outside.filter((f) => /from "[^"]*(scrapers\/rubric|\/rubric\/|types\/rubric)/.test(fs.readFileSync(f, "utf8")));
+    // TODO(test-pass): the AI services (checklist builder, document check, refusal
+    // letter, ...) import the rubric TYPE (`import type`, erased at compile time) to
+    // read an approved rubric they are handed. That is not a dependency on the
+    // module, so only VALUE imports count here.
+    const importers = outside.filter((f) => /^import (?!type\b)[^;]*from "[^"]*(scrapers\/rubric|\/rubric\/|types\/rubric)/m.test(fs.readFileSync(f, "utf8")));
     assert.deepEqual(importers.map((f) => path.relative(SRC, f)), []);
     for (const [file, text] of sources) {
       assert.doesNotMatch(text, /functions\.(pubsub|https|firestore)|\.schedule\(|express\.Router|Router\(\)/, `${file} defines a trigger or a route`);

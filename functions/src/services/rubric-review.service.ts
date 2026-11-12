@@ -1,4 +1,4 @@
-import { Timestamp, type Transaction } from "firebase-admin/firestore";
+import { Timestamp, type DocumentData, type Transaction, type UpdateData } from "firebase-admin/firestore";
 import { collectionGroups, collections, db, subcollections } from "../utils/firebase";
 // The scrapers module is reached through its public entry point only (the
 // ESLint boundary rule of issue #91 refuses deep imports from here).
@@ -691,9 +691,9 @@ function iso(value: unknown): string | null {
  * `RUBRIC_REVIEW_FIELDS` throws instead of reaching Firestore, so content and
  * provenance (criteria, sources, quotes) cannot be changed by a review.
  */
-export function reviewFieldsUpdate(fields: Partial<Pick<VisaRubric, (typeof RUBRIC_REVIEW_FIELDS)[number]>>): Record<string, unknown> {
+export function reviewFieldsUpdate(fields: Partial<Pick<VisaRubric, (typeof RUBRIC_REVIEW_FIELDS)[number]>>): UpdateData<DocumentData> {
   const allowed: readonly string[] = RUBRIC_REVIEW_FIELDS;
-  const update: Record<string, unknown> = {};
+  const update: UpdateData<DocumentData> = {};
   for (const [key, value] of Object.entries(fields)) {
     if (!allowed.includes(key)) throw new Error(`rubric review may not write "${key}" on a version`);
     update[key] = value;
@@ -852,7 +852,20 @@ function structuralErrors(
   adminSet: Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds"> = {}
 ): RubricIssue[] {
   // The admin-set fields of the request, as they would be stored.
-  const candidate: VisaRubric = { ...rubric, ...adminSet, reviewStatus: "approved", intentPolarity: polarity };
+  // The validator refuses an "approved" rubric with no reviewer (it is how the
+  // engine attributes a decision). `decide` passes the real reviewer in `rubric`;
+  // the read-only preview (`canApprove` / blockers on the review detail) validates
+  // a still-pending version, whose reviewedBy / reviewedAt are null, so without a
+  // stand-in EVERY pending version reported RUBRIC_INVALID and could never be
+  // approved from the UI. The stand-in only satisfies that one check: it is never stored.
+  const candidate: VisaRubric = {
+    ...rubric,
+    ...adminSet,
+    reviewStatus: "approved",
+    intentPolarity: polarity,
+    reviewedBy: rubric.reviewedBy ?? "preview",
+    reviewedAt: rubric.reviewedAt ?? Timestamp.now(),
+  };
   return validateVisaRubric(candidate, { knownEligibilityQuestionIds }).errors;
 }
 

@@ -53,6 +53,10 @@ import {
   type ScrapeAlertsState,
 } from "./types";
 import { SCRAPE_RUN_KINDS, type ScrapeRunDoc, type ScrapeRunKind } from "../runs/types";
+import type { DocumentData, UpdateData } from "firebase-admin/firestore";
+// Transaction.update() wants UpdateData<DocumentData>; the field maps built here are
+// Record<string, unknown> (dotted paths + FieldValue sentinels), which tsc rejects.
+type FsUpdate = UpdateData<DocumentData>;
 
 // ============================================
 // SCRAPE ALERTS — store, email, checks, admin reads (issue #83)
@@ -594,7 +598,7 @@ export class ScrapeAlertService {
             update.acknowledgedAt = null;
           }
         }
-        tx.update(alertRef, update);
+        tx.update(alertRef, update as FsUpdate);
         return { action: escalated ? "escalated" : "bumped", alert: { ...existing, ...update } as ScrapeAlertDoc };
       }
 
@@ -663,7 +667,7 @@ export class ScrapeAlertService {
         updatedAt: now,
         expireAt: expireAtFrom(nowMs),
       };
-      tx.update(alertRef, update);
+      tx.update(alertRef, update as FsUpdate);
       return { action: "resolved", alert: { ...alert, ...update } };
     });
   }

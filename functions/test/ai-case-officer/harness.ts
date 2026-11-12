@@ -254,6 +254,9 @@ export async function installAssessmentFakes(): Promise<void> {
     "applicationAssessments",
     "aiCosts",
     "appConfig",
+    // The controller's staff-only "requested by" name lookup (#43) reads agents
+    // then users; without a fake the real client is reached (and the unit-test guard trips).
+    "agents",
   ]) {
     firebase.collections[name] = fakeCollection(name);
   }

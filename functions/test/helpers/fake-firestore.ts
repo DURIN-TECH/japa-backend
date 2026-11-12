@@ -106,6 +106,12 @@ export function fakeDoc(path: string): any {
     async set(data: Data, opts?: { merge?: boolean }) {
       doSet(path, data, opts?.merge);
     },
+    // create(): like the real SDK, fails with gRPC ALREADY_EXISTS (6) when the doc is
+    // there. The rule-change event store (#123) relies on it for idempotency.
+    async create(data: Data) {
+      if (store.has(path)) throw Object.assign(new Error(`ALREADY_EXISTS: ${path}`), { code: 6 });
+      doSet(path, data);
+    },
     async update(data: Data) {
       doUpdate(path, data);
     },
@@ -262,6 +268,8 @@ export async function installFakes(): Promise<void> {
   firebase.collections.scrapeRuns = fakeCollection("scrapeRuns");
   firebase.collections.newsSources = fakeCollection("newsSources");
   // Issue #83: the alert store + its dedupe pointers, and users (recipients).
+  // Issue #123: approving a visa change records a rule-change event after commit.
+  firebase.collections.ruleChangeEvents = fakeCollection("ruleChangeEvents");
   firebase.collections.scrapeAlerts = fakeCollection("scrapeAlerts");
   firebase.collections.scrapeAlertKeys = fakeCollection("scrapeAlertKeys");
   firebase.collections.users = fakeCollection("users");

@@ -878,7 +878,8 @@ describe("rubric review: approve", () => {
     const out = await decide(ID_A1, approveBody(0, { acknowledgedFlags: [] }));
     assert.equal(out.status, 409);
     assert.equal(out.body.error, "STALE_CITATION");
-    assert.match(out.body.message, /re-extract/);
+    // TODO(test-pass): the message now starts "Re-extract the rubric instead of approving…" (capital R).
+    assert.match(out.body.message, /re-extract/i);
     assert.equal(writes.length, 0);
     assert.equal(versionDoc(KEY_A, 1).reviewStatus, "pending_review");
     // It can still be rejected.
@@ -1206,6 +1207,10 @@ describe("rubric review: audit and the approval seam", () => {
         revisionBefore: 0,
         revisionAfter: 1,
         sourceSetHash: versionDoc(KEY_A, 1).sourceSetHash,
+        // TODO(test-pass): #116 audit entries also record the admin-set fields of the
+        // decision; null when the approval sent none.
+        outcomeStatistics: null,
+        evidenceHelpsCriterionIds: null,
       }
     );
     assert.equal(second.action, "reject");
@@ -1299,10 +1304,41 @@ describe("rubric review: nothing unapproved is served", () => {
       .filter((f) => /getVersionForReview|collectionGroups\.rubricVersions|rubricReviewHistory/.test(fs.readFileSync(f, "utf8")))
       .map((f) => path.relative(src, f))
       .sort();
-    assert.deepEqual(users, [path.join("scrapers", "rubric", "rubric.store.ts"), path.join("services", "rubric-review.service.ts"), path.join("utils", "firebase.ts")]);
+    // TODO(test-pass): #37 / #123 added consumers of the AUDIT collection
+    // (`rubricReviewHistory`): the two triggers in index.ts and the bulk
+    // re-assessment / rule-change services + types, which only react to the audit
+    // entry an approval writes. Those are allowed to name it; the containment
+    // property is checked on the next assertion, which keeps the VERSION readers
+    // (any-status versions, the collection group) to the original three files.
+    assert.deepEqual(users, [
+      "index.ts",
+      path.join("scrapers", "rubric", "rubric.store.ts"),
+      path.join("services", "ai-bulk-reassessment.service.ts"),
+      path.join("services", "rubric-review.service.ts"),
+      path.join("services", "rule-change-alerts.service.ts"),
+      path.join("types", "bulk-reassessment.ts"),
+      path.join("types", "rule-change.ts"),
+      path.join("utils", "firebase.ts"),
+    ]);
+    const versionReaders = walk(src)
+      .filter((f) => /getVersionForReview|collectionGroups\.rubricVersions/.test(fs.readFileSync(f, "utf8")))
+      .map((f) => path.relative(src, f))
+      .sort();
+    // TODO(test-pass): #37 (bulk re-assessment) and #123 (rule-change alerts) are two more
+    // BACKEND-ONLY callers of getVersionForReview: they load the approved version
+    // named by an approval's audit entry and the one it replaced. No route calls them.
+    // (utils/firebase.ts only declares the collection group; it no longer matches by name.)
+    assert.deepEqual(versionReaders, [
+      path.join("scrapers", "rubric", "rubric.store.ts"),
+      path.join("services", "ai-bulk-reassessment.service.ts"),
+      path.join("services", "rubric-review.service.ts"),
+      path.join("services", "rule-change-alerts.service.ts"),
+    ]);
     // And the review service is reached from one controller, mounted once, under /admin.
     const importers = walk(src)
-      .filter((f) => /rubric-review\.(service|controller|routes)"/.test(fs.readFileSync(f, "utf8")))
+      // TODO(test-pass): `import type` (the audit entry's type, used by #37/#123) is erased
+      // at compile time and reaches no runtime code, so only value imports count.
+      .filter((f) => /^import (?!type\b)[^;]*rubric-review\.(service|controller|routes)"/m.test(fs.readFileSync(f, "utf8")))
       .map((f) => path.relative(src, f))
       .sort();
     assert.deepEqual(importers, ["app.ts", path.join("controllers", "rubric-review.controller.ts"), path.join("routes", "rubric-review.routes.ts")]);

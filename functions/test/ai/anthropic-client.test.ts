@@ -188,10 +188,22 @@ describe("secret binding in src/index.ts (Gen 1 runWith)", () => {
     assert.match(runWithOf("onApplicationUpdated"), /EMAIL_SECRETS/);
   });
 
-  test("`api` and the assessment worker are the only functions bound (issue #42)", () => {
+  test("only the named AI functions are bound (issues #42, #37, #115, #117, #118)", () => {
+    // TODO(test-pass): was "api + the assessment worker" (count 2). The later AI
+    // tasks each bind the key on their OWN worker, as the AI_SECRETS comment in
+    // index.ts says they would. The list is explicit so a new binding must be a
+    // conscious edit here: the count pins "no other function gets the key".
+    const BOUND = [
+      "api",
+      "processAssessmentJob",
+      "onGuidanceSourceChanged",
+      "processBulkReassessments",
+      "processDocumentCheck",
+      "processRefusalAnalysisJob",
+    ];
     // Spreads of the list inside a runWith (comments mention it without `...`).
-    assert.equal(indexSource.match(/\.\.\.AI_SECRETS/g)?.length, 2);
-    assert.match(runWithOf("processAssessmentJob"), /\.\.\.AI_SECRETS/);
+    assert.equal(indexSource.match(/\.\.\.AI_SECRETS/g)?.length, BOUND.length);
+    for (const name of BOUND) assert.match(runWithOf(name), /\.\.\.AI_SECRETS/, `${name} binds the key`);
   });
 
   test("nothing in functions/src uses the Gen-2 defineSecret", () => {
