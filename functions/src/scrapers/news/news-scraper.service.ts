@@ -720,13 +720,13 @@ export class NewsScraperService {
 
       // 2b. ONE batched lookup for the whole source (2 * ceil(N / 30)
       //     concurrent queries) instead of two awaited queries per article.
-      const existing =
-        candidates.length > 0
-          ? await this.store.findExistingHashes(
-              candidates.map((c) => c.urlHash),
-              candidates.map((c) => c.titleHash)
-            )
-          : new Set<string>();
+      let existing = new Set<string>();
+      if (candidates.length > 0) {
+        existing = await this.store.findExistingHashes(
+          candidates.map((c) => c.urlHash),
+          candidates.map((c) => c.titleHash)
+        );
+      }
 
       // 2c. A duplicate = urlHash OR titleHash already stored (as before) OR
       //     already seen earlier in THIS batch (nothing is written until
