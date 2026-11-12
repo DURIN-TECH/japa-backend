@@ -104,6 +104,7 @@ import { outcomeImportService, outcomeRunWorker, registeredDestinations } from "
 import { documentCheckService } from "./services/ai/document-check.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
+import { onUserContactWritten } from "./services/risk-rules/shared-contact.runner";
 
 /**
  * When a new user is created via Firebase Auth
@@ -324,6 +325,23 @@ export const onPaymentRequestCreated = functions
     } catch (error) {
       console.error("Error sending payment request notification:", error);
     }
+  });
+
+/**
+ * Risk rule (issue #121): shared contact detail across applicant accounts.
+ *
+ * Fires when a user document is created or its phone / email changes. The
+ * handler only ever raises an admin-only risk signal (#119); it never touches
+ * the user, notifies anyone or blocks anything, and it swallows its own
+ * failures so the user write that triggered it is never affected.
+ */
+export const onUserContactChanged = functions.firestore
+  .document("users/{userId}")
+  .onWrite(async (change) => {
+    await onUserContactWritten(
+      change.before.exists ? (change.before.data() as Record<string, unknown>) : undefined,
+      change.after.exists ? (change.after.data() as Record<string, unknown>) : undefined
+    );
   });
 
 /**
