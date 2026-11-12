@@ -3,10 +3,8 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     
-    // ============================================
-    // HELPER FUNCTIONS
-    // ============================================
-    
+    // =====================================    // HELPER FUNCTIONS
+    // =====================================    
     // Check if user is authenticated
     function isAuthenticated() {
       return request.auth != null;
@@ -53,10 +51,8 @@ service cloud.firestore {
       return request.resource.data.keys().hasAll(fields);
     }
     
-    // ============================================
-    // USERS COLLECTION
-    // ============================================
-    
+    // =====================================    // USERS COLLECTION
+    // =====================================    
     match /users/{userId} {
       // ---- Self-editable profile fields (ALLOW-LIST, issue #135) ----
       // The ONLY fields a signed-in user may write on their own profile from
@@ -110,10 +106,8 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
     
-    // ============================================
-    // AGENTS COLLECTION
-    // ============================================
-    
+    // =====================================    // AGENTS COLLECTION
+    // =====================================    
     match /agents/{agentId} {
       // Anyone can read verified agents
       allow read: if resource.data.verificationStatus == 'verified' || 
@@ -180,10 +174,8 @@ service cloud.firestore {
       }
     }
     
-    // ============================================
-    // COUNTRIES COLLECTION
-    // ============================================
-    
+    // =====================================    // COUNTRIES COLLECTION
+    // =====================================    
     match /countries/{countryCode} {
       // Anyone can read countries
       allow read: if true;
@@ -234,10 +226,8 @@ service cloud.firestore {
       }
     }
     
-    // ============================================
-    // APPLICATIONS COLLECTION
-    // ============================================
-    
+    // =====================================    // APPLICATIONS COLLECTION
+    // =====================================    
     match /applications/{applicationId} {
       // Users can read their own applications
       // Agents can read applications assigned to them
@@ -306,10 +296,8 @@ service cloud.firestore {
       }
     }
 
-    // ============================================
-    // AGENCIES COLLECTION
-    // ============================================
-
+    // =====================================    // AGENCIES COLLECTION
+    // =====================================
     match /agencies/{agencyId} {
       // The agency owner and admins can read. (`agentIds` is not written by
       // any current flow, so in practice members read their agency through
@@ -389,10 +377,8 @@ service cloud.firestore {
       }
     }
 
-    // ============================================
-    // AGENCY INVITATIONS COLLECTION
-    // ============================================
-
+    // =====================================    // AGENCY INVITATIONS COLLECTION
+    // =====================================
     match /agencyInvitations/{invitationId} {
       // Agency owner can read their invitations
       // Invitee can read invitations sent to them
@@ -418,10 +404,8 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // ============================================
-    // CONSULTATIONS COLLECTION
-    // ============================================
-    
+    // =====================================    // CONSULTATIONS COLLECTION
+    // =====================================    
     match /consultations/{consultationId} {
       // Users can read their own consultations
       // Agents can read their consultations
@@ -446,10 +430,8 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
     
-    // ============================================
-    // TRANSACTIONS COLLECTION
-    // ============================================
-    
+    // =====================================    // TRANSACTIONS COLLECTION
+    // =====================================    
     match /transactions/{transactionId} {
       // Users can read their own transactions
       allow read: if isOwner(resource.data.userId) || isAdmin();
@@ -458,10 +440,8 @@ service cloud.firestore {
       allow write: if false;
     }
     
-    // ============================================
-    // NOTIFICATIONS COLLECTION
-    // ============================================
-    
+    // =====================================    // NOTIFICATIONS COLLECTION
+    // =====================================    
     match /notifications/{notificationId} {
       // Users can read their own notifications
       allow read: if isOwner(resource.data.userId);
@@ -478,10 +458,8 @@ service cloud.firestore {
       allow delete: if isOwner(resource.data.userId);
     }
     
-    // ============================================
-    // CONVERSATIONS COLLECTION
-    // ============================================
-    
+    // =====================================    // CONVERSATIONS COLLECTION
+    // =====================================    
     match /conversations/{conversationId} {
       // Participants can read conversations
       allow read: if isAuthenticated() &&
@@ -518,10 +496,8 @@ service cloud.firestore {
       }
     }
 
-    // ============================================
-    // DOCUMENT TEMPLATES COLLECTION
-    // ============================================
-    //
+    // =====================================    // DOCUMENT TEMPLATES COLLECTION
+    // =====================================    //
     // Read-only clonable catalog. All writes go through the backend (Admin SDK,
     // which bypasses these rules) — there is no client authoring path — so direct
     // writes are denied. Reads are agent-side only and scope-limited: everyone
@@ -537,10 +513,8 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    // ============================================
-    // DOCUMENT INSTANCES COLLECTION
-    // ============================================
-    //
+    // =====================================    // DOCUMENT INSTANCES COLLECTION
+    // =====================================    //
     // Editable documents cloned from templates. Every mutation (clone, save,
     // link, share, delete) goes through the API, which enforces authorization and
     // optimistic-concurrency versioning — so direct client writes are denied to
@@ -615,6 +589,10 @@ service cloud.firestore {
     //    from caseworker guidance, staged `pending_review` for an admin, and
     //    the record of each extraction run (issue #40). Consumers only ever
     //    get an APPROVED version, through the backend. Do NOT add a match.
+    //  - rubricReviewHistory/{entryId}: audit trail of rubric review
+    //    decisions (who approved or rejected which version, why, and which
+    //    flags they acknowledged), written with each decision by the admin
+    //    review API, /admin/rubrics (issue #125). Do NOT add a match.
 
     // ---- Agency visa revisions (issue #100), explicit deny (issue #102) ----
     // visaRevisions/{cc}__{visaId}: unreviewed agency edits to an approved
