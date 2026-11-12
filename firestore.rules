@@ -594,6 +594,11 @@ service cloud.firestore {
     //    flags they acknowledged), written with each decision by the admin
     //    review API, /admin/rubrics (issue #125). Do NOT add a match.
 
+    //  - ruleChangeEvents/{eventId} and ruleChangeNotices/{eventId}__{appId}:
+    //    one event per ADMIN-APPROVED rule or visa-record change, and one
+    //    dedupe claim per application it was handled for (who was told what,
+    //    issue #123). Written by the backend only. Do NOT add a match.
+
     // ---- Agency visa revisions (issue #100), explicit deny (issue #102) ----
     // visaRevisions/{cc}__{visaId}: unreviewed agency edits to an approved
     // visa. Backend only (agency read via /agency/visas, admin review via

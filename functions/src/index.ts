@@ -96,6 +96,8 @@ import { scrapeRunWorker } from "./scrapers";
 import { aiCaseOfficerService } from "./services/ai-case-officer.service";
 import { assessmentAutoRunService } from "./services/assessment-auto-run.service";
 import { bulkReassessmentService } from "./services/ai-bulk-reassessment.service";
+import { ruleChangeAlertsService } from "./services/rule-change-alerts.service";
+import { rubricExtractionService } from "./scrapers";
 import type { RubricReviewAuditEntry } from "./services/rubric-review.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
@@ -730,6 +732,74 @@ export const onRubricApproved = functions
       // Logged, not rethrown: function retry is off, and the sweep resumes any
       // run whose document was created before the failure.
       console.error("Bulk re-assessment enqueue failed:", error);
+    }
+  });
+
+/**
+ * Issue #123: record a rule-change event when an admin approves a rubric
+ * version. Fires on the SAME durable audit document as `onRubricApproved`
+ * (separate function, so neither can hold up or break the other). It only ever
+ * sees an approval: a raw crawl diff or an unapproved extraction writes no
+ * audit document. Makes no model call. The event id is derived from the route
+ * and version, so a re-delivered trigger records nothing twice. The alerts
+ * themselves go out from `processRuleChangeAlerts` below.
+ */
+export const onRubricApprovedRecordAlert = functions
+  .runWith({ memory: "256MB", timeoutSeconds: 120 })
+  .firestore.document("rubricReviewHistory/{auditId}")
+  .onCreate(async (snap, context) => {
+    try {
+      const outcome = await ruleChangeAlertsService.recordRubricApproval(context.params.auditId, snap.data() as RubricReviewAuditEntry);
+      console.log(`[rule-change] approval ${context.params.auditId}: ${outcome}`);
+    } catch (error) {
+      // Logged, not rethrown: function retry is off.
+      console.error("Recording the rule-change event failed:", error);
+    }
+  });
+
+/**
+ * Issue #123: when a guidance source's snapshot hash changes (the crawl moved
+ * `latestSnapshotId`, which IS the content hash), re-extract every route that
+ * uses the source. #40's own hash gate means an unchanged source set costs
+ * nothing; the result is only ever STAGED `pending_review` (never approved),
+ * and its spend caps apply: a capped run is skipped and leaves the previous
+ * approved rubric serving. Nobody is alerted here: an alert needs an admin's
+ * approval of the staged version. Binds AI_SECRETS (the extraction reads it).
+ */
+export const onGuidanceSourceChanged = functions
+  .runWith({ memory: "1GB", timeoutSeconds: 540, secrets: [...AI_SECRETS] })
+  .firestore.document("guidanceSources/{sourceId}")
+  .onUpdate(async (change, context) => {
+    const before = (change.before.data() as { latestSnapshotId?: string | null }).latestSnapshotId ?? null;
+    const after = (change.after.data() as { latestSnapshotId?: string | null }).latestSnapshotId ?? null;
+    // Only a moved hash is a change; every other source write (fetch stamps,
+    // health, pauses) leaves it alone.
+    if (!after || after === before) return;
+    try {
+      const results = await rubricExtractionService.onGuidanceChanged({ sourceId: context.params.sourceId });
+      console.log(`[rule-change] source ${context.params.sourceId} changed: ${results.map((r) => r.status).join(",") || "no route uses it"}`);
+    } catch (error) {
+      console.error("Re-extraction after a guidance change failed:", error);
+    }
+  });
+
+/**
+ * Issue #123: every 15 minutes, send the alerts of recorded rule-change events
+ * (admin-approved rubric versions and visa-record edits): a notification per
+ * affected in-flight application to the case's agent / owner, and the neutral,
+ * factual notices an applicant may be sent. Idempotent per event and
+ * application. Binds EMAIL_SECRETS (the notifications email). No model call.
+ */
+export const processRuleChangeAlerts = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: [...EMAIL_SECRETS] })
+  .pubsub.schedule("*/15 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    try {
+      const result = await ruleChangeAlertsService.runSweep();
+      if (result.eventsSeen > 0) console.log(`Rule-change alert sweep: ${JSON.stringify(result)}`);
+    } catch (error) {
+      console.error("Rule-change alert sweep failed:", error);
     }
   });
 

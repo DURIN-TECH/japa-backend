@@ -1171,6 +1171,10 @@ export type NotificationType =
   // or blocking result: sent to the assigned agent / agency owner / admins,
   // NEVER to the applicant.
   | "assessment_rules_updated"
+  // The published rules or details of an in-flight application's route changed
+  // (issue #123), raised only from an ADMIN-APPROVED change. Staff get the
+  // detail; an applicant only ever gets a neutral, factual notice.
+  | "rule_change_alert"
   // Documents
   | "document_status"
   | "document_uploaded" // Client uploaded a document for review
