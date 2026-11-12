@@ -68,7 +68,7 @@ class EmailService {
   async send(message: EmailMessage): Promise<EmailResult> {
     if (this.suppressedLocally) {
       console.info(
-        `[EmailService] Local email sending is off (set EMAIL_SENDING_ENABLED=true in ` +
+        "[EmailService] Local email sending is off (set EMAIL_SENDING_ENABLED=true in " +
           `functions/.env.local to enable) — would send to ${message.to}: "${message.subject}"`
       );
       return { status: "skipped", error: LOCAL_SUPPRESSED_REASON };
