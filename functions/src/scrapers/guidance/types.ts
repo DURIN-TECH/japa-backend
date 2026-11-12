@@ -51,13 +51,16 @@ export type GuidanceVerificationStatus = (typeof GUIDANCE_VERIFICATION_STATUSES)
 /**
  * What a source is to its route (issue #112), set by data in the seed:
  *  - `primary`: the route's own rules document;
- *  - `secondary`: a general-purpose document (caseworker guidance covering
- *    many activities, a cross-route suitability or finance appendix) from
- *    which only what the primary source points to, or what applies to every
- *    applicant, belongs in the route's rubric.
+ *  - `route_guidance`: guidance written for this same route (caseworker
+ *    guidance for it): everything in it is about this route, so it is read
+ *    like a primary source, though some of it may be conditional or for a
+ *    specialist sub-category;
+ *  - `secondary`: a cross-route document (a general suitability part, a
+ *    finance appendix) from which only what the primary source points to, and
+ *    what applies to applicants of the route, belongs in the rubric.
  * A source without a role is read as `secondary` where a role matters.
  */
-export const GUIDANCE_SOURCE_ROLES = ["primary", "secondary"] as const;
+export const GUIDANCE_SOURCE_ROLES = ["primary", "route_guidance", "secondary"] as const;
 export type GuidanceSourceRole = (typeof GUIDANCE_SOURCE_ROLES)[number];
 
 // ----- Registry entry -----

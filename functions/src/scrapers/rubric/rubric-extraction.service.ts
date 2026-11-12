@@ -53,6 +53,7 @@ import {
   unsupportedNumbers,
   withoutLeadingParagraphNumber,
 } from "./rubric-quote";
+import { spansSiblingMarkers } from "./rubric-marker-chain";
 import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSettings } from "./rubric-settings";
 import { rubricRouteKey, rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
 import { validateCriterionShape, validateVisaRubric } from "./rubric-validate";
@@ -237,11 +238,10 @@ export function isTransientProviderError(message: string): boolean {
 const SLUG_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
 
 /**
- * What decides whether a criterion from a general-purpose (secondary) source
+ * What decides whether a criterion from a cross-route (secondary) source
  * belongs to the route (issue #112). Built in code from the route's own
  * (primary) source text: the reference-shaped tokens it prints and the
- * appendix / part names it mentions. Null for a primary source, or when the
- * run has no primary source (then nothing is scoped out).
+ * appendix / part names it mentions.
  */
 export interface RouteScope {
   // References the primary source prints ("V 15.1", "FIN 2.1", ...).
@@ -259,6 +259,37 @@ export function routeScopeFrom(primaryTexts: readonly string[]): RouteScope {
     for (const n of appendixNamesIn(t)) names.add(n);
   }
   return { refs, names };
+}
+
+/** What a source is to its route (registry data, see GuidanceSourceRole). */
+export type SourceRole = "primary" | "route_guidance" | "secondary";
+
+/** How much of a document's start is searched for its own name. */
+const DOCUMENT_NAME_HEAD_CHARS = 400;
+
+/**
+ * True when the route's own (primary) source refers to a cross-route
+ * document BY NAME: an appendix / part name the primary source mentions
+ * appears in the document's registry title or at the start of its text.
+ * Names come from the primary text and titles from the registry, so no name
+ * is written in code.
+ */
+export function primaryNamesDocument(scope: RouteScope, title: string, text: string): boolean {
+  const head = `${title} ${text.slice(0, DOCUMENT_NAME_HEAD_CHARS)}`.replace(/\s+/gu, " ");
+  return [...scope.names].some((n) => head.includes(n));
+}
+
+/**
+ * Everything `assessChunkOutput` needs to apply the scope rules of one
+ * source: its role, the allow-list from the primary source, and whether the
+ * primary source names THIS document. Null (no primary source in the run):
+ * nothing is scoped out.
+ */
+export interface SourceScope {
+  role: SourceRole;
+  allow: RouteScope;
+  // Secondary only: the primary source refers to this document by name.
+  namedByPrimary: boolean;
 }
 
 /** Things done to a criterion that a reviewer should be able to count. */
@@ -285,6 +316,9 @@ interface AcceptedCriterion {
   // A dated criterion whose quote holds more than one date: the reviewer
   // checks validFrom / validUntil are the right ones.
   multipleDates: boolean;
+  // The quote spans two or more list markers of one level, or only introduces
+  // a list ("...the third party:"): sub-conditions may have been merged.
+  combinedSubConditions: boolean;
 }
 
 /** What one chunk's answer yields once validated. */
@@ -333,7 +367,9 @@ const DETAIL = {
   flagged: "the quote overlaps a passage flagged as addressed to a reader model",
   citationField: "a supporting citation names a field outside the allowed list",
   citation: "a supporting citation is not in the stored text of the source",
-  scope: "from a general-purpose source, not pointed to by the route's own source, and not marked as applying to every applicant",
+  scope: "from a cross-route source the route's own source does not point to, or not a rule for applicants of the route",
+  specialist: "the rule applies only to a specialist activity or sub-category the source singles out",
+  otherRoute: "the text says the rule applies to a different route or category of applicant",
   condition: "the applicability condition is not verbatim in the source",
   ruleRef: "the rule reference is not printed in, or directly before, the quote",
   valueType: "check.value must be a JSON number for this operator",
@@ -399,7 +435,7 @@ export function assessChunkOutput(
   index: SnapshotQuoteIndex,
   base: CitationBase,
   severityLevels: readonly string[],
-  scope: RouteScope | null = null
+  scope: SourceScope | null = null
 ): ChunkAssessment {
   const discards: RubricDiscard[] = [];
   const counters = { judgementChecksStripped: 0, ruleRefsRemoved: 0, ruleRefsDerived: 0 };
@@ -459,6 +495,7 @@ export function assessChunkOutput(
         startsMidSentence: found.ok && index.startsMidSentence(found),
         endsMidSentence: found.ok && index.endsMidSentence(found),
         multipleDates: Boolean(criterion.validFrom || criterion.validUntil) && datesIn(criterion.source.quote).length > 1,
+        combinedSubConditions: found.ok && (spansSiblingMarkers(criterion.source.quote) || index.introducesList(found)),
       });
     }
   }
@@ -516,7 +553,7 @@ function assessCriterion(
   cite: (matched: string, page: number | undefined) => RubricCitation,
   flagged: (quote: string) => boolean,
   severityLevels: readonly string[],
-  scope: RouteScope | null
+  scope: SourceScope | null
 ): { criterion: AssessmentCriterion; notes: CriterionNotes } | { reason: RubricDiscardReason; detail: string } {
   // 1. The quote must be verbatim in THIS source's snapshot: whole words,
   //    one page / one paragraph. A paraphrase, an invented sentence, a
@@ -565,19 +602,35 @@ function assessCriterion(
     notes.checkStripped = true;
   }
 
-  // 3c. Scope (issue #112). A criterion from a general-purpose source is
-  //     kept when the route's own source points at it (its reference is one
-  //     the primary source prints, or its quote names an appendix / part the
-  //     primary source mentions) or when it applies to every applicant;
-  //     otherwise it belongs to another route or activity.
+  // 3c. Scope (issue #112). The model proposes an applicability; code decides
+  //     what to keep from the source's role (registry data) alone:
+  //      - primary, route_guidance: keep `all_applicants` and `conditional`;
+  //        a `specialist` or `other_route` criterion is dropped under its own
+  //        reason, so the reviewer can count them;
+  //      - secondary: keep a criterion only when the route's own source
+  //        points at it (names the document, or prints this criterion's
+  //        reference) AND it is `all_applicants` or `conditional`; anything
+  //        else is `out_of_route_scope`.
+  //     A criterion with no applicability (a caller that predates the field)
+  //     is read as `all_applicants`.
+  const applicability = c.applicability ?? "all_applicants";
   if (scope) {
-    const pointedAt = (ruleRef !== undefined && scope.refs.has(ruleRef)) || [...scope.names].some((n) => quote.includes(n));
-    if (!pointedAt && c.applicability !== "all_applicants") return { reason: "out_of_route_scope", detail: DETAIL.scope };
+    const wanted = applicability === "all_applicants" || applicability === "conditional";
+    if (scope.role === "secondary") {
+      const pointedAt = scope.namedByPrimary || (ruleRef !== undefined && scope.allow.refs.has(ruleRef));
+      if (!pointedAt || !wanted) return { reason: "out_of_route_scope", detail: DETAIL.scope };
+    } else if (applicability === "specialist") {
+      return { reason: "specialist_activity", detail: DETAIL.specialist };
+    } else if (applicability === "other_route") {
+      return { reason: "other_route", detail: DETAIL.otherRoute };
+    }
   }
 
-  // 3d. A conditional criterion's condition is the source's own words.
+  // 3d. A conditional criterion's condition is the source's own words, found
+  //     verbatim like any quote. (A criterion that is not conditional keeps
+  //     no condition.)
   let applicabilityCondition: string | undefined;
-  if (c.applicability === "conditional" && c.applicabilityCondition?.trim()) {
+  if (applicability === "conditional" && c.applicabilityCondition?.trim()) {
     const cond = index.locate(c.applicabilityCondition);
     if (!cond.ok) return { reason: cond.reason, detail: DETAIL.condition };
     applicabilityCondition = cond.matched;
@@ -632,7 +685,7 @@ function assessCriterion(
     stage: c.stage,
     severity: c.severity,
     ...(ruleRef ? { ruleRef } : {}),
-    ...(c.applicability ? { applicability: c.applicability } : {}),
+    ...(c.applicability ? { applicability: c.applicability as "all_applicants" | "conditional" } : {}),
     ...(applicabilityCondition ? { applicabilityCondition } : {}),
     source: cite(quote, found.page),
     ...(c.check
@@ -733,7 +786,7 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
     // ---- criteria ----
     // The model's handles are only meaningful inside its own answer.
     const refToId = new Map<string, string>();
-    for (const { ref, criterion, startsMidSentence, endsMidSentence, multipleDates } of assessment.criteria) {
+    for (const { ref, criterion, startsMidSentence, endsMidSentence, multipleDates, combinedSubConditions } of assessment.criteria) {
       refToId.set(ref, criterion.criterionId);
       if (byId.has(criterion.criterionId)) {
         discard("criterion", "duplicate", "the same passage was already extracted", criterion.title);
@@ -755,6 +808,13 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
         flags.push({
           code: "quote_ends_mid_sentence",
           message: "the quote stops before the end of its sentence. A condition or exception that follows it (\"only where\", \"unless\") may change its meaning: read the whole sentence in the source before approving.",
+          target: criterion.criterionId,
+        });
+      }
+      if (combinedSubConditions) {
+        flags.push({
+          code: "combined_sub_conditions",
+          message: "the quote spans two or more list items of the same level, or is only the lead-in of a list. Each lettered or numbered sub-condition should be its own criterion with its own quote: check the source and split or add criteria before approving.",
           target: criterion.criterionId,
         });
       }
@@ -925,6 +985,17 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
       target: "rubric",
     });
   }
+  // Specialist-activity criteria are dropped on purpose (they apply to a
+  // sub-category of applicants only). Said once, with the count, so the
+  // reviewer knows this rubric covers the general case.
+  const specialistDropped = discards.filter((d) => d.itemType === "criterion" && d.reason === "specialist_activity").length;
+  if (specialistDropped > 0) {
+    flags.push({
+      code: "specialist_criteria_dropped",
+      message: `${specialistDropped} criteria that apply only to a specialist activity or sub-category the sources single out were left out. This rubric covers the general case only.`,
+      target: "rubric",
+    });
+  }
   if (simplifiedTriggers > 0) {
     flags.push({
       code: "evidence_trigger_simplified",
@@ -1078,7 +1149,10 @@ interface LoadedSource {
   snapshot: RubricSourceSnapshot;
   retrievedAt: string;
   // The source's role for its route (registry data); absent = secondary.
-  role: "primary" | "secondary";
+  role: SourceRole;
+  // The registry's title for the document (data), used to tell whether the
+  // route's own source refers to it by name.
+  title: string;
 }
 
 export class RubricExtractionService {
@@ -1131,7 +1205,8 @@ export class RubricExtractionService {
         ...(meta.publishedDate ? { publishedDate: meta.publishedDate } : {}),
       },
       retrievedAt: meta.fetchedAt.toDate().toISOString(),
-      role: source.role === "primary" ? "primary" : "secondary",
+      role: source.role === "primary" || source.role === "route_guidance" ? source.role : "secondary",
+      title: typeof source.title === "string" ? source.title : "",
     };
   }
 
@@ -1328,9 +1403,12 @@ export class RubricExtractionService {
           retrievedAt: source.retrievedAt,
           ...(source.snapshot.publishedDate ? { publishedDate: source.snapshot.publishedDate } : {}),
         };
-        // Scoping applies to secondary sources only, and only when the run has a primary one.
+        // Scoping applies only when the run has a primary source. What is
+        // kept from each source depends on its role (see assessCriterion 3c).
         const route: RubricRouteContext = { routeName, sourceRole: primaries.length === 0 ? "unspecified" : source.role };
-        const scopeForChunk = scope && source.role === "secondary" ? scope : null;
+        const scopeForChunk: SourceScope | null = scope
+          ? { role: source.role, allow: scope, namedByPrimary: source.role === "secondary" && primaryNamesDocument(scope, source.title, index.allText()) }
+          : null;
 
         const raw1 = await this.callModel(buildRubricRequest(chunk, severityLevels, limits, route), usage, attempts);
         const criteriaPart = assessChunkOutput(raw1, chunk, index, base, severityLevels, scopeForChunk);

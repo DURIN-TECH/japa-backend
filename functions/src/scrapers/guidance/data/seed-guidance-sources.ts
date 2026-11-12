@@ -95,8 +95,8 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   },
   {
     id: "gb-visit-guidance-html",
-    // General-purpose document: only what the route's own rules point to or what applies to everyone.
-    role: "secondary",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
     title: "Visit caseworker guidance (accessible web version)",
     url: "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
     jurisdiction: "GB",
@@ -116,8 +116,8 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   },
   {
     id: "gb-visit-guidance-pdf",
-    // General-purpose document: only what the route's own rules point to or what applies to everyone.
-    role: "secondary",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
     title: "Visit caseworker guidance (PDF)",
     // The file's address ON THE DAY IT WAS RETRIEVED. It carries a per-release
     // id and changes with every publication, so the crawl does not request
@@ -147,7 +147,7 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   },
   {
     id: "gb-part-suitability",
-    // General-purpose document: only what the route's own rules point to or what applies to everyone.
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
     role: "secondary",
     title: "Immigration Rules: Part Suitability",
     url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-part-suitability",
@@ -168,7 +168,7 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   },
   {
     id: "gb-appendix-finance",
-    // General-purpose document: only what the route's own rules point to or what applies to everyone.
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
     role: "secondary",
     title: "Immigration Rules Appendix Finance",
     url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-finance",

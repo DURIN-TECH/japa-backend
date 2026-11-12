@@ -254,7 +254,10 @@ export interface AssessmentCriterion {
   // Scope (#112): does the rule apply to every applicant on the route, or
   // only in some circumstances? `applicabilityCondition` is those
   // circumstances in the source's words, found verbatim in the source.
-  applicability?: "all_applicants" | "conditional";
+  // Four values (see CRITERION_APPLICABILITIES): only `all_applicants` and
+  // `conditional` are ever stored; `specialist` and `other_route` are
+  // proposed by the model and dropped in code (with a discard record).
+  applicability?: "all_applicants" | "conditional" | "specialist" | "other_route";
   applicabilityCondition?: string;
   // Links to an existing EligibilityQuestion (types/eligibility.ts).
   eligibilityQuestionId?: string;
@@ -432,7 +435,9 @@ export const RUBRIC_DISCARD_REASONS = [
   "invalid_shape", // breaks a kind rule (judgement with a check, ...)
   "duplicate", // same criterion already produced by an earlier chunk
   "unresolved_reference", // points at criteria that did not survive
-  "out_of_route_scope", // from a general-purpose source, not pointed to by the route's own source, and not for every applicant
+  "out_of_route_scope", // from a cross-route source the route's own source does not point to, or not for every applicant of the route
+  "specialist_activity", // applies only to a specialist activity or sub-category the source singles out
+  "other_route", // the text says it applies to a different route or category of applicant
 ] as const;
 export type RubricDiscardReason = (typeof RUBRIC_DISCARD_REASONS)[number];
 

@@ -1,6 +1,7 @@
 import { normalizeForQuoteMatch } from "../shared/fetch/pdf-text";
 import type { GuidanceSnapshotContent } from "../guidance/types";
 import type { RubricDiscardReason } from "../../types/rubric";
+import { composeMarkerChain } from "./rubric-marker-chain";
 
 // ============================================
 // RUBRIC — QUOTE AND NUMBER VALIDATION (issue #40)
@@ -169,19 +170,10 @@ const LINE_LABEL_RE = new RegExp(String.raw`^(${REF_SHAPE})(?:\.(?=\s|$)|(?=\s|$
 const LIMB_RE = /^\(([a-z]{1,3}|\d{1,2})\)/u;
 
 /** How many lines back a parent label is looked for before giving up. */
-const MAX_PARENT_LOOKBACK_LINES = 60;
+const MAX_PARENT_LOOKBACK_LINES = 250;
 
 /** Longest title a label line may have and still read as a heading. */
 const MAX_HEADING_TITLE_CHARS = 120;
-
-/** Roman-numeral-looking marker contents (used only to tell list levels apart). */
-const ROMAN_RE = /^(?:i{1,3}|iv|vi{0,3}|ix|x{1,3})$/u;
-
-/** The level class of a marker's content: digits, roman, or letters. */
-function limbClass(inner: string): "digit" | "roman" | "letter" {
-  if (/^\d+$/u.test(inner)) return "digit";
-  return ROMAN_RE.test(inner) && inner.length > 1 ? "roman" : "letter";
-}
 
 /** A label with its trailing full stop removed and spaces collapsed. */
 function normalizeRefLabel(label: string): string {
@@ -334,19 +326,17 @@ export class SnapshotQuoteIndex {
 
     const limb = LIMB_RE.exec(line);
     if (limb && found.at <= limb[0].length) {
-      const chain: string[] = [limb[0]];
-      let cls = limbClass(limb[1]);
+      // Walk back to the parent paragraph's label, collecting the marker of
+      // every list line on the way (nearest first). The chain itself is
+      // decided by `composeMarkerChain`, which keeps only the nearest marker
+      // of each nesting level (see rubric-marker-chain.ts).
+      const markers: string[] = [limb[1]];
       for (const i of earlier(found.unit)) {
         const text = this.units[i].text;
         const label = LINE_LABEL_RE.exec(text);
-        if (label) return normalizeRefLabel(label[1]) + chain.join("");
+        if (label) return normalizeRefLabel(label[1]) + composeMarkerChain(markers.reverse()).join("");
         const m = LIMB_RE.exec(text);
-        // A marker of another class one level up ("(a)" above "(ii)"): the
-        // first one found going back is the enclosing item.
-        if (m && limbClass(m[1]) !== cls) {
-          chain.unshift(m[0]);
-          cls = limbClass(m[1]);
-        }
+        if (m) markers.push(m[1]);
       }
       return undefined;
     }
@@ -358,6 +348,20 @@ export class SnapshotQuoteIndex {
       return isHeadingLine(this.units[i].text, label[0].length) ? normalizeRefLabel(label[1]) : undefined;
     }
     return undefined;
+  }
+
+  /**
+   * True when the located quote ends with a colon and the NEXT non-empty
+   * line of the page begins with a list marker: the quote is only the
+   * lead-in of a list, so the list's items (each its own sub-condition) are
+   * not covered by it. Web snapshots only (a PDF page is one unit).
+   */
+  introducesList(found: Extract<QuoteLookup, { ok: true }>): boolean {
+    if (this.paginated || !found.matched.endsWith(":")) return false;
+    for (let i = found.unit + 1; i < this.units.length && i <= found.unit + 3; i++) {
+      if (this.units[i].text) return LIMB_RE.test(this.units[i].text);
+    }
+    return false;
   }
 
   /** The whole document as normalised text (lines joined by a space). */
