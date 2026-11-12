@@ -140,25 +140,6 @@ function htmlSource(id: string, url: string, fetchFullContent = false): NewsSour
   } as unknown as NewsSource;
 }
 
-function apiSource(id: string): NewsSource {
-  return {
-    id,
-    name: id,
-    slug: id,
-    url: "https://newsdata.io",
-    countryCodes: ["GB"],
-    strategy: "news_api",
-    config: {
-      apiConfig: { provider: "newsdata", query: "visa immigration" },
-      maxArticlesPerRun: 10,
-      fetchFullContent: false,
-    },
-    scrapeIntervalMinutes: 720,
-    isOfficial: false,
-  } as unknown as NewsSource;
-}
-
-
 const LISTING = `<html><body>
 <div class="item"><a href="https://gov.example.org/n/1">Fee update one</a></div>
 <div class="item"><a href="http://127.0.0.1/admin">Internal one</a></div>
@@ -184,7 +165,7 @@ beforeEach(() => {
 describe("scraped article links", () => {
   test("links to non-public addresses or ports are never requested and do not fail the run", async () => {
     routes.set("https://gov.example.org/news", { status: 200, body: LISTING });
-    routes.set("https://gov.example.org/n/1", { status: 200, body: '<div class="body">Full text one</div>' });
+    routes.set("https://gov.example.org/n/1", { status: 200, body: "<div class=\"body\">Full text one</div>" });
     const run = await makeScraper().scrapeSource(htmlSource("ukvi", "https://gov.example.org/news", true));
     // The run succeeded and found every link.
     assert.equal(updates[0].success, true);
