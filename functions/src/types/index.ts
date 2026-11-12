@@ -416,6 +416,12 @@ export interface VisaType {
   // Eligibility
   eligibilityCriteria: string[];
 
+  // Issue #129: official "documents you must provide", extracted verbatim from
+  // the scraped page and written only on admin approval (scrapeMeta.citations
+  // holds the per-item quote under "requiredDocuments.<index>"). ABSENT when
+  // the page lists none; plain strings, never invented.
+  requiredDocuments?: string[];
+
   // Official application
   applicationUrl?: string; // URL to official online application form (e.g., AVATS for Ireland)
   applicationInstructions?: string; // Brief instructions for completing official application
