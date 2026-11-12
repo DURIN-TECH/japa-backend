@@ -16,6 +16,13 @@ router.get("/", verifyAuth, verifyAgent, (req, res) =>
   documentTemplateController.list(req, res)
 );
 
+// POST /document-templates/draft — AI-written DRAFT (issue #118). Read-only: it
+// saves nothing. Registered before any "/:id" route so "draft" is never read as an
+// id. The feature gate is fail-closed and lives in the handler (see controller).
+router.post("/draft", verifyAuth, verifyAgent, (req, res) =>
+  documentTemplateController.draft(req, res)
+);
+
 // GET /document-templates/:id?includeContent=true — one template
 router.get("/:id", verifyAuth, verifyAgent, (req, res) =>
   documentTemplateController.getOne(req, res)
