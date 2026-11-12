@@ -242,6 +242,16 @@ export const collections = {
   // notice (the dedupe claim) per event and application. Backend-only.
   ruleChangeEvents: db.collection("ruleChangeEvents"),
   ruleChangeNotices: db.collection("ruleChangeNotices"),
+  // Ask-anywhere chat (issue #45). `aiConversations/{id}`: one conversation per
+  // (application, user), id = sha256(applicationId:uid), so a caller can only
+  // ever address their OWN conversation. Messages hang off it (see
+  // `subcollections.aiChatMessages`). Backend-only: no firestore.rules match, so
+  // clients read history only through GET /ai/applications/:id/chat.
+  aiConversations: db.collection("aiConversations"),
+  // Per-user chat usage counters, one doc per user per UTC day
+  // (`aiChatUsage/{uid}_{YYYY-MM-DD}`): messages per hour and per day, tokens
+  // spent. Read and written by the chat rate / spend caps. Backend-only.
+  aiChatUsage: db.collection("aiChatUsage"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all
@@ -294,6 +304,10 @@ export const subcollections = {
   // Notes under applications
   notes: (applicationId: string) =>
     collections.applications.doc(applicationId).collection("notes"),
+
+  // Chat turns under an AI conversation (issue #45).
+  aiChatMessages: (conversationId: string) =>
+    collections.aiConversations.doc(conversationId).collection("messages"),
 
   // Messages under conversations
   messages: (conversationId: string) =>

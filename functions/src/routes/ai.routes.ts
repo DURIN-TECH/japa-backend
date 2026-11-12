@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { aiCaseOfficerController } from "../controllers/ai-case-officer.controller";
+import { aiChatController } from "../controllers/ai-chat.controller";
 import { verifyAuth } from "../middleware/auth";
 import { aiActionController, requireCaseOfficerPlanFailClosed } from "../controllers/ai-action.controller";
 
@@ -20,6 +21,9 @@ import { aiActionController, requireCaseOfficerPlanFailClosed } from "../control
 //   GET  /ai/assessments/:id/actions                     the proposals
 //   POST /ai/assessments/:id/actions/:actionId/accept    accept (may create a DocumentRequest)
 //   POST /ai/assessments/:id/actions/:actionId/reject    reject, optional { reason }
+//   POST   /ai/applications/:id/chat      ask one question (issue #45)
+//   GET    /ai/applications/:id/chat      the caller's own chat history
+//   DELETE /ai/applications/:id/chat      clear the caller's own chat history
 
 const aiRoutes = Router();
 
@@ -42,5 +46,8 @@ aiRoutes.post("/assessments/:id/actions/:actionId/accept", verifyAuth, requireCa
 aiRoutes.post("/assessments/:id/actions/:actionId/reject", verifyAuth, requireCaseOfficerPlanFailClosed, (req, res) =>
   aiActionController.reject(req, res)
 );
+aiRoutes.post("/applications/:id/chat", verifyAuth, (req, res) => aiChatController.ask(req, res));
+aiRoutes.get("/applications/:id/chat", verifyAuth, (req, res) => aiChatController.history(req, res));
+aiRoutes.delete("/applications/:id/chat", verifyAuth, (req, res) => aiChatController.clear(req, res));
 
 export { aiRoutes };

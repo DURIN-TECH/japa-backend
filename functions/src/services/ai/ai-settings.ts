@@ -36,6 +36,18 @@ export interface AiSettings {
   // "no dollar cap". Only enforced when both roles have a confirmed price
   // (ai-pricing.ts); otherwise the request cap above is the only brake.
   maxBatchCostUsdPerDay: number;
+  // ---- ask-anywhere chat (issue #45) ----
+  // Kill switch for chat alone (the assessment `enabled` switch also stops it).
+  chatEnabled: boolean;
+  // Per-user rate limit: messages in one UTC clock hour, and in one UTC day.
+  chatMessagesPerUserPerHour: number;
+  chatMessagesPerUserPerDay: number;
+  // Per-user spend cap. The price table is empty, so the cap is in TOKENS
+  // (input + output the API reported) per UTC day, not dollars. Switch to
+  // dollars once ai-pricing.ts has confirmed prices.
+  chatTokensPerUserPerDay: number;
+  // Global cap: chat turns that reached the model, per UTC day, all users.
+  chatTurnsPerDay: number;
 }
 
 /** Defaults. Sized for one application with a handful of documents. */
@@ -47,16 +59,25 @@ export const DEFAULT_AI_SETTINGS: Readonly<AiSettings> = Object.freeze({
   maxFileBytes: 10 * 1024 * 1024,
   maxBatchRequestsPerDay: 1_000,
   maxBatchCostUsdPerDay: 0,
+  chatEnabled: true,
+  chatMessagesPerUserPerHour: 20,
+  chatMessagesPerUserPerDay: 100,
+  chatTokensPerUserPerDay: 400_000,
+  chatTurnsPerDay: 5_000,
 });
 
 /** Allowed range of each numeric setting. A stored value outside it falls back to its default. */
-const RANGES: Record<Exclude<keyof AiSettings, "enabled">, [number, number]> = {
+const RANGES: Record<Exclude<keyof AiSettings, "enabled" | "chatEnabled">, [number, number]> = {
   maxRequestsPerAssessment: [1, 50],
   maxInputCharsPerAssessment: [10_000, 20_000_000],
   maxAssessmentsPerDay: [1, 10_000],
   maxFileBytes: [100_000, 50 * 1024 * 1024],
   maxBatchRequestsPerDay: [1, 100_000],
   maxBatchCostUsdPerDay: [0, 100_000],
+  chatMessagesPerUserPerHour: [1, 1_000],
+  chatMessagesPerUserPerDay: [1, 10_000],
+  chatTokensPerUserPerDay: [10_000, 50_000_000],
+  chatTurnsPerDay: [1, 1_000_000],
 };
 
 /** Result of a settings read. */
@@ -67,6 +88,7 @@ export function mergeAiSettings(stored: Record<string, unknown> | undefined): Ai
   const out: AiSettings = { ...DEFAULT_AI_SETTINGS };
   if (!stored) return out;
   if (typeof stored.enabled === "boolean") out.enabled = stored.enabled;
+  if (typeof stored.chatEnabled === "boolean") out.chatEnabled = stored.chatEnabled;
   for (const key of Object.keys(RANGES) as Array<keyof typeof RANGES>) {
     const v = stored[key];
     const [min, max] = RANGES[key];
