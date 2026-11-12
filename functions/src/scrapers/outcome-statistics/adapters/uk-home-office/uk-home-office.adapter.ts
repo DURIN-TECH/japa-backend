@@ -41,6 +41,7 @@ import { UK_NATIONALITY_CODES } from "./nationality-codes";
 //   - Data_Vis_D01 columns: Year, Quarter, Nationality, Region, Visa type group,
 //     Visa type, Visa type subgroup, Applicant type, Applications;
 //   - Data_Vis_D02 columns: the same eight, then Case outcome, Decisions;
+//   - the Notes sheet states which quarters are provisional (read as a caveat);
 //   - `Case outcome` values seen: Issued, Refused, Withdrawn, Lapsed;
 //   - `Quarter` reads like "2026 Q2"; `Year` is stored as text.
 //
@@ -80,6 +81,9 @@ const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 /** The flat data sheets. */
 export const SHEET_APPLICATIONS = "Data_Vis_D01";
 export const SHEET_OUTCOMES = "Data_Vis_D02";
+
+/** The workbook's notes sheet (read only for the publisher's "provisional" statement). */
+const SHEET_NOTES = "Notes";
 
 /** 1-based number of the header row in both data sheets. */
 const HEADER_ROW = 4;
@@ -223,6 +227,32 @@ async function readAndCheckHeader(wb: XlsxWorkbook, sheet: string): Promise<Reco
   });
   if (!header) throw new OutcomeSchemaError(`Sheet ${sheet}: no header row at row ${HEADER_ROW}. Nothing was imported.`);
   return mapHeader(sheet, header);
+}
+
+/**
+ * Read the publisher's own "provisional" statement(s) from the Notes sheet, so
+ * the caveat travels with the release it belongs to (and names the period it
+ * applies to) instead of being a constant that could go stale. The real
+ * release (read 2026-11-11) carries: "Data from Q1 2026 onwards are
+ * provisional." Any Notes cell whose text mentions "provisional" is kept
+ * verbatim. Best effort: a missing Notes sheet or no such cell gives no extra
+ * caveat; it never fails the import (the Notes sheet is small, a few KB).
+ */
+async function readProvisionalCaveats(wb: XlsxWorkbook): Promise<string[]> {
+  if (!wb.hasSheet(SHEET_NOTES)) return [];
+  const found: string[] = [];
+  try {
+    await wb.streamRows(SHEET_NOTES, (_rowNumber, cells) => {
+      for (const cell of cells) {
+        const text = cell === undefined ? "" : clean(cell);
+        // Whole-sentence cells only (short enough to be a statement, not a table dump).
+        if (text && text.length <= 300 && /provisional/i.test(text) && !found.includes(text)) found.push(text);
+      }
+    });
+  } catch {
+    return []; // caveat is additive; a Notes read problem must not block a valid import
+  }
+  return found;
 }
 
 /** The UK adapter. */
@@ -385,7 +415,7 @@ export class UkHomeOfficeOutcomeAdapter implements OutcomeDataSourceAdapter {
       rowsRead,
       unmappedNames: [...unmapped].sort(),
       tableNames: [`Vis_D02 (data sheet ${SHEET_OUTCOMES})`],
-      caveats: CAVEATS,
+      caveats: [...CAVEATS, ...(await readProvisionalCaveats(wb))],
     };
   }
 }

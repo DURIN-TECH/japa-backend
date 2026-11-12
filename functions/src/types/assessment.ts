@@ -1,4 +1,5 @@
 import type { Timestamp } from "firebase-admin/firestore";
+import type { CountryContextResult } from "../services/outcome-statistics/country-context";
 import type { CriterionKind, DecisionStage } from "./rubric";
 
 // ============================================
@@ -247,6 +248,13 @@ export interface ApplicationAssessment {
   // free tier is told this one boolean so a free applicant learns that a rule
   // blocks them (decision on #43); it carries no rule text.
   hasBlockingRule: boolean;
+  // Published outcome statistics for the applicant's passport country and the
+  // route's published category (#116). Present ONLY when a figure was found
+  // (status "available"); absent otherwise, and absent when building it
+  // failed. Computed AFTER and OUTSIDE scoring: nothing above this line reads
+  // it, it is not part of the input hash, and it is never sent to a model.
+  // Full tier and staff only: the free whitelist does not include it.
+  countryContext?: AvailableCountryContext;
   // Stored, stripped from every client-role response (see tier-serializer).
   internalCall: "would_approve" | "would_refuse" | null;
 
@@ -363,3 +371,5 @@ export interface ProposedAction {
   // The DocumentRequest this action created. Null for any other accept.
   documentRequestId: string | null;
 }
+/** The "available" arm of the country-context result: what is stored and served. */
+export type AvailableCountryContext = Extract<CountryContextResult, { status: "available" }>;

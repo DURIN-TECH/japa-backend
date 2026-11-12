@@ -3,12 +3,14 @@ import { getStorage } from "firebase-admin/storage";
 import { collections, db } from "../utils/firebase";
 import { rubricRouteKey, rubricStore, type VisaRubric } from "../scrapers";
 import type { Application, Document, DocumentInstance, EligibilityCheck, ProseMirrorDoc, User } from "../types";
+import { buildCountryContext, type CountryContextResult } from "./outcome-statistics/country-context";
 import type {
   ApplicationAssessment,
   AssessmentErrorCode,
   AssessmentStatus,
   AssessmentTrigger,
   AssessmentUsage,
+  AvailableCountryContext,
 } from "../types/assessment";
 import {
   assembleContent,
@@ -96,6 +98,9 @@ export interface AssessmentDeps {
   runTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>;
   readSettings(): Promise<AiSettingsRead>;
   now(): Date;
+  // Country-context lookup (#116). Optional so existing fakes keep working;
+  // defaults to the real builder. Reads published statistics only, no model.
+  buildCountryContext?: (input: Parameters<typeof buildCountryContext>[0]) => Promise<CountryContextResult>;
 }
 
 /** What a POST resolved to. */
@@ -762,6 +767,51 @@ export class AiCaseOfficerService {
     );
   }
 
+  /**
+   * The country-context note for a finished assessment (#116), or undefined.
+   *
+   * Called ONLY from storeContent, after `content` (band, score, findings) is
+   * fully assembled, and its result goes into the stored doc beside them. It
+   * does not feed back: nothing here is passed to assembleContent, topIssuesOf,
+   * the input hash or any model request. Undefined (so the field is absent)
+   * when the rubric has no outcome-statistics mapping, the applicant has no
+   * passport country, no figure was found, or ANYTHING fails: the assessment
+   * never fails because of this note.
+   */
+  private async countryContextFor(rubric: VisaRubric, assessmentId: string): Promise<AvailableCountryContext | undefined> {
+    const mapping = rubric.outcomeStatistics;
+    if (!mapping) return undefined; // a rubric without the mapping produces no note
+    try {
+      // Nationality = the PASSPORT country on the profile, not residence.
+      const assessmentSnap = await collections.applicationAssessments.doc(assessmentId).get();
+      const applicationId = (assessmentSnap.data() as ApplicationAssessment | undefined)?.applicationId;
+      const appSnap = applicationId ? await collections.applications.doc(applicationId).get() : null;
+      const userId = appSnap && appSnap.exists ? (appSnap.data() as Application).userId : null;
+      const userSnap = userId ? await collections.users.doc(userId).get() : null;
+      const passportCountry = userSnap && userSnap.exists ? (userSnap.data() as User).passportCountry : undefined;
+
+      // Rubric-tagged "extra evidence helps" criteria, by their own titles.
+      const byId = new Map(rubric.criteria.map((c) => [c.criterionId, c.title]));
+      const evidenceAreas = (rubric.evidenceHelpsCriterionIds ?? [])
+        .filter((id) => byId.has(id))
+        .map((id) => ({ id, label: byId.get(id) as string }));
+
+      const build = this.deps.buildCountryContext ?? buildCountryContext;
+      const result = await build({
+        destination: rubric.countryCode,
+        categoryKey: mapping.categoryKey,
+        categoryLabel: mapping.categoryLabel,
+        passportCountry,
+        evidenceAreas,
+      });
+      return result.status === "available" ? result : undefined;
+    } catch (err) {
+      // Counted, never fatal; no applicant data in the log.
+      console.warn(`[ai-case-officer] country context not built for assessment ${assessmentId}: ${err instanceof Error ? err.name : "error"}`);
+      return undefined;
+    }
+  }
+
   /** Store the result of a finished job. */
   // Public since #37. `extra` is merged into the same write (the bulk path adds its
   // supersede links, change summary and review flag), so a result and its bulk
@@ -788,6 +838,8 @@ export class AiCaseOfficerService {
     // Cost from the price table; null while a role has no confirmed price.
     const extractCost = costOfUsage("extraction", this.usageAsLlm(usage.extract));
     const judgeCost = costOfUsage("judgement", this.usageAsLlm(usage.judge));
+    // Computed AFTER the content above is final, from nothing in it (#116).
+    const countryContext = await this.countryContextFor(rubric, id);
     await this.finish(id, {
       status: "succeeded",
       error: null,
@@ -805,6 +857,8 @@ export class AiCaseOfficerService {
       topIssues: topIssuesOf(rubric, content),
       hasBlockingRule: content.hasBlockingRule,
       internalCall: content.internalCall,
+      // Spread only when present: an absent note is an absent field, not null.
+      ...(countryContext ? { countryContext } : {}),
       models,
       model: models.judge ?? models.extract ?? null,
       usage,
