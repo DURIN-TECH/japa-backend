@@ -38,6 +38,7 @@ import { readAiSettings, type AiSettings, type AiSettingsRead } from "./ai/ai-se
 import { AnthropicLlmProvider, type LlmProvider, type LlmUsage } from "./ai/llm-provider";
 import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-safety";
 import type { AssessmentTier, StaleReason } from "./ai/tier-serializer";
+import { aiActionService } from "./ai-action.service";
 
 // ============================================
 // AI CASE-OFFICER ASSESSMENT — JOB AND I/O (issue #42)
@@ -778,6 +779,12 @@ export class AiCaseOfficerService {
       // A total only when both stages are priced: a part-priced total would understate the spend.
       costUsd: extractCost === null || judgeCost === null ? null : extractCost + judgeCost,
     });
+    // Proposed actions (issue #44): derived from the findings just stored and
+    // checked against THIS rubric version. They are inert proposals (nothing is
+    // created for the applicant until a human accepts one). Best-effort inside
+    // the service: it never throws, so it cannot fail a stored verdict.
+    const stored = await this.getById(id);
+    if (stored) await aiActionService.writeForAssessment(stored, rubric, content);
   }
 
   /** Stored usage in the shape the price function takes. */
