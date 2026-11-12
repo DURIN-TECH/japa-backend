@@ -40,6 +40,10 @@ import { isPendingPromptStale, planIngest } from "./visa-catalog-diff";
 import { visaChangeService } from "./changes/visa-catalog-changes.service";
 // Manual USD cost (issue #70): a refresh replaces it, recording the overwrite.
 import { planManualCostOverwrite } from "./visa-manual-cost";
+import type { DocumentData, UpdateData } from "firebase-admin/firestore";
+// Transaction.update() wants UpdateData<DocumentData>; the field maps built here are
+// Record<string, unknown> (dotted paths + FieldValue sentinels), which tsc rejects.
+type FsUpdate = UpdateData<DocumentData>;
 
 // ============================================
 // VISA CATALOG SERVICE (ingest into review queue)
@@ -526,7 +530,7 @@ class VisaCatalogService {
           // flags) without touching scrapeMeta.contentHash or anything else.
           const update: Record<string, unknown> = { "scrapeMeta.fee": plan.fee, updatedAt: now };
           if (plan.baseCostUsd !== undefined) update.baseCostUsd = plan.baseCostUsd;
-          tx.update(doc.ref, update);
+          tx.update(doc.ref, update as FsUpdate);
           return plan.baseCostUsd !== undefined ? ("reconverted" as const) : ("reflagged" as const);
         });
         if (outcome === "reconverted") result.reconverted++;

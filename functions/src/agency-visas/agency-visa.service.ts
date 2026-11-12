@@ -36,6 +36,10 @@ import {
   mergeContent,
   pickContent,
 } from "./agency-visa.validation";
+import type { DocumentData, UpdateData } from "firebase-admin/firestore";
+// Transaction.update() wants UpdateData<DocumentData>; the field maps built here are
+// Record<string, unknown> (dotted paths + FieldValue sentinels), which tsc rejects.
+type FsUpdate = UpdateData<DocumentData>;
 
 // ============================================
 // Types
@@ -319,7 +323,7 @@ class AgencyVisaService {
       assertCompleteContent(merged);
       const update: Record<string, unknown> = { ...parsed.fields, updatedAt: now };
       for (const field of parsed.cleared) update[field] = FieldValue.delete();
-      tx.update(ref, update);
+      tx.update(ref, update as FsUpdate);
     });
 
     return this.get(actor.agencyId, visaId, () => true);
