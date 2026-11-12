@@ -40,12 +40,12 @@ import {
   unsupportedNumbers,
 } from "../../../src/scrapers/rubric/rubric-quote";
 import { assessChunkOutput, mergeAssessments, pagesEndingMidSentence, regionDisplayName, reviewFlagsFor } from "../../../src/scrapers/rubric/rubric-extraction.service";
-import { RUBRIC_PROMPT_VERSION, RUBRIC_SYSTEM_PROMPT, buildRubricOutputSchema, validateAgainstSchema } from "../../../src/scrapers/rubric/rubric-prompt";
+import { RUBRIC_INTAKE_SYSTEM_PROMPT, RUBRIC_PROMPT_VERSION, RUBRIC_SYSTEM_PROMPT, buildIntakeOutputSchema, buildRubricOutputSchema, validateAgainstSchema } from "../../../src/scrapers/rubric/rubric-prompt";
 import { rubricRouteKey } from "../../../src/scrapers/rubric/rubric.store";
 import { validateCriterionShape } from "../../../src/scrapers/rubric/rubric-validate";
 import { DEFAULT_SEVERITY_LEVELS, RUBRIC_CITATION_FIELDS, type AssessmentCriterion } from "../../../src/types/rubric";
 import type { RawCriterion } from "../../../src/scrapers/rubric/rubric-prompt";
-import { answer, crit } from "./rubric-harness";
+import { answer, criteriaWire, crit } from "./rubric-harness";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -95,6 +95,19 @@ function rejects(c: RawCriterion, reason: string, index = INDEX): void {
   const r = assess(c, index);
   assert.equal(r.accepted, undefined, "the criterion must not be accepted");
   assert.equal(r.reason, reason);
+}
+
+/**
+ * Assert the model's rule reference is NOT kept (issue #112: a reference is
+ * never trusted from the model; one that is not printed with the quote is
+ * dropped and the criterion stands on its verbatim quote, with the source's
+ * own reference derived from its layout when it has one).
+ */
+function refDropped(c: RawCriterion, ruleRef: string, index = INDEX): AssessmentCriterion | undefined {
+  const r = assess(c, index);
+  assert.ok(r.accepted, "a verbatim quote keeps the criterion even when the reference is wrong");
+  assert.notEqual(r.accepted.ruleRef, ruleRef, `the reference "${ruleRef}" must not be kept`);
+  return r.accepted;
 }
 
 // ============================================
@@ -215,7 +228,9 @@ describe("probe: support comes from the criterion's own quote", () => {
   });
 
   test("a number in the title must be in the quote; the rule reference's digits do not license it", () => {
-    rejects(judgement(FUNDS, { title: "Funds of at least 1,270", ruleRef: "1,270" }), "rule_ref_not_in_source");
+    // The reference "1,270" is not printed with the quote, so it is dropped; the
+    // title's number is then refused because the quote does not state it.
+    rejects(judgement(FUNDS, { title: "Funds of at least 1,270", ruleRef: "1,270" }), "number_not_in_quote");
     rejects(judgement(FUNDS, { title: "Rule 3.2: sufficient funds", ruleRef: "3.2" }), "number_not_in_quote");
     assert.ok(assess(judgement(FUNDS, { title: "Sufficient funds", ruleRef: "3.2" })).accepted);
   });
@@ -413,15 +428,25 @@ describe("probe: appliesTo", () => {
 
 describe("probe: rule references", () => {
   test("a reference printed elsewhere in the document is not this rule's reference", () => {
-    rejects(judgement(FUNDS, { ruleRef: "3.7" }), "rule_ref_not_in_source");
-    rejects(judgement(FUNDS, { ruleRef: "3.1" }), "rule_ref_not_in_source");
+    // The model's "3.7" and "3.1" are dropped; the document's own label of the line ("3.2") is derived instead.
+    assert.equal(refDropped(judgement(FUNDS, { ruleRef: "3.7" }), "3.7")?.ruleRef, "3.2");
+    assert.equal(refDropped(judgement(FUNDS, { ruleRef: "3.1" }), "3.1")?.ruleRef, "3.2");
     assert.equal(assess(judgement(FUNDS, { ruleRef: "3.2" })).accepted?.ruleRef, "3.2");
+    // The check itself, on the index.
+    const found = INDEX.locate(FUNDS);
+    assert.ok(found.ok);
+    assert.equal(INDEX.ruleRefNear(found, "3.7"), false);
+    assert.equal(INDEX.ruleRefNear(found, "3.1"), false);
+    assert.equal(INDEX.ruleRefNear(found, "3.2"), true);
   });
 
-  test("a one-character or punctuation-only reference, and a fragment of one, are rejected", () => {
-    rejects(judgement(FUNDS, { ruleRef: "3" }), "rule_ref_not_in_source");
-    rejects(judgement(FUNDS, { ruleRef: ".." }), "rule_ref_not_in_source");
-    rejects(judgement(FUNDS, { ruleRef: ".2" }), "rule_ref_not_in_source");
+  test("a one-character or punctuation-only reference, and a fragment of one, are not kept", () => {
+    for (const ref of ["3", "..", ".2"]) {
+      assert.equal(refDropped(judgement(FUNDS, { ruleRef: ref }), ref)?.ruleRef, "3.2");
+      const found = INDEX.locate(FUNDS);
+      assert.ok(found.ok);
+      assert.equal(INDEX.ruleRefNear(found, ref), false);
+    }
   });
 
   test("a reference inside the quote counts; on a PDF page it must be shortly before the quote", () => {
@@ -429,8 +454,8 @@ describe("probe: rule references", () => {
     const filler = "The officer records the evidence considered and the weight given to it. ".repeat(6);
     const page = new SnapshotQuoteIndex(snapshot([`7.1 ${filler}\n7.2 Short rule here.\n${FUNDS}`]));
     assert.equal(assess(judgement(FUNDS, { ruleRef: "7.2" }), page).accepted?.ruleRef, "7.2");
-    // 7.1 is on the same page but more than the window before the quote.
-    rejects(judgement(FUNDS, { ruleRef: "7.1" }), "rule_ref_not_in_source", page);
+    // 7.1 is on the same page but more than the window before the quote: dropped (a PDF page has no line layout to derive from).
+    assert.equal(refDropped(judgement(FUNDS, { ruleRef: "7.1" }), "7.1", page)?.ruleRef, undefined);
   });
 });
 
@@ -446,15 +471,18 @@ describe("probe: citation fields", () => {
 
   test("the output schema only allows the listed fields, and a problem line never repeats a model-chosen key", () => {
     const schema = buildRubricOutputSchema(DEFAULT_SEVERITY_LEVELS);
-    const good = answer({ criteria: [judgement(FUNDS, { citations: [{ field: "probeFactors", quote: FEE }] })] });
-    assert.deepEqual(validateAgainstSchema(good, schema), []);
-    for (const field of RUBRIC_CITATION_FIELDS) {
-      assert.deepEqual(validateAgainstSchema(answer({ criteria: [judgement(FUNDS, { citations: [{ field, quote: FEE }] })] }), schema), []);
-    }
-    const bad: any = answer({ criteria: [judgement(FUNDS, { citations: [{ field: "MODEL-KEY", quote: FEE }] })] });
+    const wired = (c: RawCriterion) => JSON.parse(criteriaWire(answer({ criteria: [c] })));
+    assert.deepEqual(validateAgainstSchema(wired(judgement(FUNDS)), schema), []);
+    // Supporting citations are not part of the model's output any more: a
+    // `citations` property is refused like any other unknown property.
+    const withCitations = wired(judgement(FUNDS));
+    withCitations.criteria[0].citations = [{ field: "probeFactors", quote: FEE }];
+    assert.deepEqual(validateAgainstSchema(withCitations, schema), ["$.criteria[0]: has a property that is not allowed"]);
+    // The validator still accepts every field of the closed list (stored rubrics and tests may carry them).
+    assert.equal(RUBRIC_CITATION_FIELDS.includes("probeFactors"), true);
+    const bad = wired(judgement(FUNDS));
     bad.criteria[0]["MODEL-PROPERTY"] = 1;
-    const problems = validateAgainstSchema(bad, schema);
-    assert.deepEqual(problems.sort(), ["$.criteria[0].citations[0].field: not one of the allowed values", "$.criteria[0]: has a property that is not allowed"]);
+    assert.deepEqual(validateAgainstSchema(bad, schema), ["$.criteria[0]: has a property that is not allowed"]);
   });
 });
 
@@ -495,12 +523,32 @@ describe("prompt version pin", () => {
   // in rubric-prompt.ts, and add the new hash below (keep the old lines).
   const PINNED: Record<string, string> = {
     "2026-11-rubric-v2": "b2043fc231eb40af3853c1c802cb00d1594e8ea2c613c3e1c2c6d157dacf1c13",
+    // v3 (#112): optional scalar properties, and no appliesTo / validFrom /
+    // validUntil / citations in the schema sent to the model.
+    "2026-11-rubric-v3": "ecbfa6aaee534bb65b8235b48d5a0f8cbf83ca4452e66ac64e81edecfe4dbcca",
+    // v4 (#112): two calls (criteria; intake and evidence), scope, derived
+    // references. The hash covers the criteria prompt and schema only.
+    "2026-11-rubric-v4": "1853f8ce0f1017413a7a464fa28b682b5f4c71a3db8a018d7dc688eb7952bca6",
+    // v5 (#112): three source roles, four applicabilities, one criterion per
+    // sub-condition, absence statements. Criteria prompt and schema.
+    "2026-11-rubric-v5": "ee0ca17869187a2c1d7ba3f8bdb9cf4c1842aad30fb83a02da90ccea95af132e",
+  };
+  // v5 onwards: the intake prompt and its schema are pinned too (call 2),
+  // so a change to either also needs a version bump.
+  const PINNED_INTAKE: Record<string, string> = {
+    "2026-11-rubric-v5": "688856deafdcd93a6ec428cf7899db3a439040a59ee62b5d7fdf4269a52bf8ce",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {
     const hash = sha256(`${RUBRIC_SYSTEM_PROMPT}\n${JSON.stringify(buildRubricOutputSchema(DEFAULT_SEVERITY_LEVELS))}`);
     assert.ok(RUBRIC_PROMPT_VERSION in PINNED, `no hash pinned for ${RUBRIC_PROMPT_VERSION}: add one`);
     assert.equal(hash, PINNED[RUBRIC_PROMPT_VERSION], "the prompt or schema changed: bump RUBRIC_PROMPT_VERSION and pin the new hash");
+  });
+
+  test("the intake prompt and schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {
+    const hash = sha256(`${RUBRIC_INTAKE_SYSTEM_PROMPT}\n${JSON.stringify(buildIntakeOutputSchema())}`);
+    assert.ok(RUBRIC_PROMPT_VERSION in PINNED_INTAKE, `no intake hash pinned for ${RUBRIC_PROMPT_VERSION}: add one`);
+    assert.equal(hash, PINNED_INTAKE[RUBRIC_PROMPT_VERSION], "the intake prompt or schema changed: bump RUBRIC_PROMPT_VERSION and pin the new hash");
   });
 });
 
@@ -594,7 +642,8 @@ describe("probe round 3: a quote that stops before the end of its sentence (R2-3
     assert.ok(r.accepted, "verbatim, so not rejected");
     assert.equal(r.out.criteria[0].endsMidSentence, true);
     const merged = mergeAssessments([{ chunk: CHUNK, assessment: r.out }]);
-    assert.deepEqual(merged.flags.map((f) => [f.code, f.target]), [["quote_ends_mid_sentence", r.accepted?.criterionId]]);
+    // (The reference "8.1" is derived from the line's own label: that is a separate, standing flag.)
+    assert.deepEqual(merged.flags.filter((f) => f.code !== "rule_ref_derived").map((f) => [f.code, f.target]), [["quote_ends_mid_sentence", r.accepted?.criterionId]]);
   });
 
   test("a complete sentence, or one that ends at the end of the line, is not flagged", () => {
@@ -661,15 +710,15 @@ describe("probe round 3: smaller items", () => {
   });
 
   test("a rule reference needs a digit, and only the NEAREST preceding reference counts", () => {
-    rejects(judgement(DAYS_WEEKS, { ruleRef: "of" }), "rule_ref_not_in_source", idx);
-    rejects(judgement(DAYS_WEEKS, { ruleRef: "Funds" }), "rule_ref_not_in_source", idx);
+    refDropped(judgement(DAYS_WEEKS, { ruleRef: "of" }), "of", idx);
+    refDropped(judgement(DAYS_WEEKS, { ruleRef: "Funds" }), "Funds", idx);
     // 4.2 precedes 4.4 on the same line of a PDF page, but 4.4 is nearer.
     const page = new SnapshotQuoteIndex(snapshot([text.split("\n").join(" ")]));
-    rejects(judgement(DAYS_WEEKS, { ruleRef: "4.2" }), "rule_ref_not_in_source", page);
-    rejects(judgement(DAYS_WEEKS, { ruleRef: "4.1" }), "rule_ref_not_in_source", page);
+    refDropped(judgement(DAYS_WEEKS, { ruleRef: "4.2" }), "4.2", page);
+    refDropped(judgement(DAYS_WEEKS, { ruleRef: "4.1" }), "4.1", page);
     assert.equal(assess(judgement(DAYS_WEEKS, { ruleRef: "4.4" }), page).accepted?.ruleRef, "4.4");
-    // On a web page the line holds one rule: a reference elsewhere is refused as before.
-    rejects(judgement(DAYS_WEEKS, { ruleRef: "4.5" }), "rule_ref_not_in_source", idx);
+    // On a web page the line holds one rule: a reference elsewhere is not kept.
+    refDropped(judgement(DAYS_WEEKS, { ruleRef: "4.5" }), "4.5", idx);
   });
 
   test("a group name must start with a capital letter", () => {

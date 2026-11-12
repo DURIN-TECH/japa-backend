@@ -251,6 +251,14 @@ export interface AssessmentCriterion {
   // by extraction, editable in review. A rubric with such a criterion but no
   // polarity is flagged by the validator.
   concernsIntent?: boolean;
+  // Scope (#112): does the rule apply to every applicant on the route, or
+  // only in some circumstances? `applicabilityCondition` is those
+  // circumstances in the source's words, found verbatim in the source.
+  // Four values (see CRITERION_APPLICABILITIES): only `all_applicants` and
+  // `conditional` are ever stored; `specialist` and `other_route` are
+  // proposed by the model and dropped in code (with a discard record).
+  applicability?: "all_applicants" | "conditional" | "specialist" | "other_route";
+  applicabilityCondition?: string;
   // Links to an existing EligibilityQuestion (types/eligibility.ts).
   eligibilityQuestionId?: string;
   // Ids of the rubric's intake questions whose answers this criterion reads.
@@ -427,6 +435,9 @@ export const RUBRIC_DISCARD_REASONS = [
   "invalid_shape", // breaks a kind rule (judgement with a check, ...)
   "duplicate", // same criterion already produced by an earlier chunk
   "unresolved_reference", // points at criteria that did not survive
+  "out_of_route_scope", // from a cross-route source the route's own source does not point to, or not for every applicant of the route
+  "specialist_activity", // applies only to a specialist activity or sub-category the source singles out
+  "other_route", // the text says it applies to a different route or category of applicant
 ] as const;
 export type RubricDiscardReason = (typeof RUBRIC_DISCARD_REASONS)[number];
 
@@ -444,6 +455,13 @@ export interface RubricDiscard {
   sourceId: string;
   // Which chunk of the source it came from (0-based).
   chunkIndex: number;
+  // Audit trail (#112): what the model proposed, so a reviewer can tell WHY
+  // a proposal was dropped. Published guidance, not personal data. The
+  // reference as the model wrote it, a sha256 of its quote (hex) and the
+  // first 120 characters of that quote. Present on criteria only.
+  ruleRef?: string;
+  quoteHash?: string;
+  quoteStart?: string;
 }
 
 /** A non-fatal remark on a stored rubric (see the validator). */

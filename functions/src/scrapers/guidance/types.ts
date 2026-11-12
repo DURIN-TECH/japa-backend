@@ -48,6 +48,21 @@ export type GuidanceSourceStatus = (typeof GUIDANCE_SOURCE_STATUSES)[number];
 export const GUIDANCE_VERIFICATION_STATUSES = ["verified", "partial", "unverified"] as const;
 export type GuidanceVerificationStatus = (typeof GUIDANCE_VERIFICATION_STATUSES)[number];
 
+/**
+ * What a source is to its route (issue #112), set by data in the seed:
+ *  - `primary`: the route's own rules document;
+ *  - `route_guidance`: guidance written for this same route (caseworker
+ *    guidance for it): everything in it is about this route, so it is read
+ *    like a primary source, though some of it may be conditional or for a
+ *    specialist sub-category;
+ *  - `secondary`: a cross-route document (a general suitability part, a
+ *    finance appendix) from which only what the primary source points to, and
+ *    what applies to applicants of the route, belongs in the rubric.
+ * A source without a role is read as `secondary` where a role matters.
+ */
+export const GUIDANCE_SOURCE_ROLES = ["primary", "route_guidance", "secondary"] as const;
+export type GuidanceSourceRole = (typeof GUIDANCE_SOURCE_ROLES)[number];
+
 // ----- Registry entry -----
 
 /**
@@ -81,6 +96,8 @@ export interface GuidanceSourceSeed {
   // for PDFs, and because the fetch service hands back cleaned text only.
   // See guidance-published-date.ts.
   publishedDateSelector?: string;
+  // OPTIONAL (issue #112). See GuidanceSourceRole. Data, not a name match.
+  role?: GuidanceSourceRole;
   // How often to re-check the source, in hours.
   checkIntervalHours: number;
   // Seeded status. Optional: defaults to "active" for a new source, and an
