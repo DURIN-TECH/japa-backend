@@ -242,6 +242,7 @@ describe("containment: a judgement criterion is never a refusal", () => {
       statementNotes: [],
       suspiciousPassages: [],
       dropped: 0,
+      unanchored: 0, // integration: required since #42 6f3336d
     };
     const penalised = assembleContent({
       rubric: routeARubric({ intentPolarity: "immigrant_intent_penalised" }),
@@ -346,6 +347,7 @@ describe("intent polarity is declared by the rubric", () => {
       statementNotes: [],
       suspiciousPassages: [],
       dropped: 0,
+      unanchored: 0, // integration: required since #42 6f3336d
     };
     const flagUnder = (polarity: "immigrant_intent_penalised" | "dual_intent_permitted") =>
       assembleContent({
@@ -504,7 +506,7 @@ describe("injection and wording defences", () => {
           { criterionId: "a-funds", detail: "A reviewable point.", whatWouldHelp: "x", concern: true },
           { criterionId: "a-bar", detail: "A reviewable point.", whatWouldHelp: "x", concern: true },
         ],
-        strengths: [], statementNotes: [], suspiciousPassages: [], dropped: 0,
+        strengths: [], statementNotes: [], suspiciousPassages: [], dropped: 0, unanchored: 0,
       },
       documents: [], statementReadable: true, score: 90, suspiciousDocumentIds: [], judgementFailed: false,
     });
@@ -544,11 +546,11 @@ describe("identity and settings", () => {
   });
 
   test("the input hash changes for each input and ignores the order of documents", () => {
-    const base = { rubricVersion: 1, documents: [{ path: "d1:a", updatedAtMs: 1 }, { path: "d2:b", updatedAtMs: 2 }], statements: [{ instanceId: "s1", version: 1 }], eligibilityAnswers: { q1: "yes" }, intake: { sponsor: "x" } };
+    const base = { rubricVersion: 1, documents: [{ path: "d1:a", updatedAtMs: 1 }, { path: "d2:b", updatedAtMs: 2 }], statements: [{ instanceId: "s1", contentHash: "h1" }], eligibilityAnswers: { q1: "yes" }, intake: { sponsor: "x" } };
     const reordered = { ...base, documents: [...base.documents].reverse() };
     assert.equal(computeInputHash(base), computeInputHash(reordered));
     assert.notEqual(computeInputHash(base), computeInputHash({ ...base, documents: [{ path: "d1:a", updatedAtMs: 9 }, base.documents[1]] }), "updatedAt");
-    assert.notEqual(computeInputHash(base), computeInputHash({ ...base, statements: [{ instanceId: "s1", version: 2 }] }), "statement version");
+    assert.notEqual(computeInputHash(base), computeInputHash({ ...base, statements: [{ instanceId: "s1", contentHash: "h2" }] }), "statement content hash"); // TODO(test-pass): #42 6f3336d hashes statements by CONTENT, not version; the old "version bump changes the hash" case no longer applies
     assert.notEqual(computeInputHash(base), computeInputHash({ ...base, eligibilityAnswers: { q1: "no" } }), "eligibility answers");
     assert.notEqual(computeInputHash(base), computeInputHash({ ...base, intake: { sponsor: "y" } }), "intake answers");
   });

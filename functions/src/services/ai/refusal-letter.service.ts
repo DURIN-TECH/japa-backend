@@ -18,7 +18,7 @@ import {
 } from "./refusal-letter-logic";
 import { documentRequestService } from "../document-request.service";
 import { resolveDisclosureNotice } from "./refusal-disclosure-notice";
-import { sniffMediaType } from "../ai-case-officer.service";
+import { sniffMediaType } from "./document-extraction";
 
 // ============================================
 // REFUSAL-LETTER ANALYSIS — job service (issue #122)
