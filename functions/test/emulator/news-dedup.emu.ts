@@ -24,7 +24,7 @@ import { resetEmulators } from "./helpers";
 let db: any;
 let collections: any;
 let newsService: any;
-let backfill: () => Promise<any>;
+let backfill: (opts?: { pageSize?: number }) => Promise<any>;
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -80,10 +80,19 @@ describe("backfill-news-expire-at", () => {
     await collections.newsArticles.doc("has").set({ id: "has", publishedAt: old, createdAt: created, expireAt: Timestamp.fromMillis(1) });
     await collections.newsSources.doc("s1").set({ id: "s1" });
     await collections.newsSources.doc("s1").collection("scrapeRuns").doc("r1").set({ id: "r1", startedAt: created });
+    // A doc with neither date is counted distinctly and given no expiry.
+    await collections.newsArticles.doc("nodates").set({ id: "nodates" });
+    // Top-level scrapeRuns (180-day deadline owned by scrape-run.service) must be left untouched.
+    const topLevelExpire = Timestamp.fromMillis(Date.now() + 180 * DAY);
+    await db.collection("scrapeRuns").doc("top1").set({ id: "top1", startedAt: created, expireAt: topLevelExpire });
+    await db.collection("scrapeRuns").doc("top2").set({ id: "top2", startedAt: created });
 
     const first = await backfill();
-    assert.deepEqual(first.articles, { total: 2, updated: 1, skipped: 1 });
-    assert.deepEqual(first.scrapeRuns, { total: 1, updated: 1, skipped: 0 });
+    assert.deepEqual(first.articles, { total: 3, updated: 1, skipped: 1, skippedNoDates: 1 });
+    assert.deepEqual(first.scrapeRuns, { total: 1, updated: 1, skipped: 0, skippedNoDates: 0 });
+    assert.equal((await collections.newsArticles.doc("nodates").get()).data().expireAt, undefined);
+    assert.equal((await db.collection("scrapeRuns").doc("top1").get()).data().expireAt.toMillis(), topLevelExpire.toMillis());
+    assert.equal((await db.collection("scrapeRuns").doc("top2").get()).data().expireAt, undefined);
 
     const article = (await collections.newsArticles.doc("old").get()).data();
     assert.equal(article.expireAt.toMillis(), created.toMillis() + 90 * DAY);
@@ -95,5 +104,22 @@ describe("backfill-news-expire-at", () => {
     const second = await backfill();
     assert.equal(second.articles.updated, 0);
     assert.equal(second.scrapeRuns.updated, 0);
+  });
+});
+
+describe("backfill-news-expire-at paging", () => {
+  test("covers more docs than one page", async () => {
+    const created = Timestamp.fromMillis(Date.now() - 5 * DAY);
+    // 7 articles with a page size of 3: three pages (3 + 3 + 1).
+    for (let i = 0; i < 7; i++) {
+      await collections.newsArticles.doc(`p${i}`).set({ id: `p${i}`, createdAt: created, body: "x".repeat(100) });
+    }
+    const res = await backfill({ pageSize: 3 });
+    assert.deepEqual(res.articles, { total: 7, updated: 7, skipped: 0, skippedNoDates: 0 });
+    for (let i = 0; i < 7; i++) {
+      assert.ok((await collections.newsArticles.doc(`p${i}`).get()).data().expireAt, `p${i} missing expireAt`);
+    }
+    // Body is untouched by the select()-based read.
+    assert.equal((await collections.newsArticles.doc("p0").get()).data().body.length, 100);
   });
 });
