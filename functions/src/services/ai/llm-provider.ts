@@ -129,6 +129,30 @@ type ContentBlock = Anthropic.ContentBlockParam;
 /** Retries left to the SDK per request (connection errors, 429, 5xx). */
 const MAX_RETRIES = 1;
 
+/**
+ * The Messages API params for one request. Shared by the interactive path
+ * (`complete`, streamed) and the Batch API path (services/ai/batch-provider.ts),
+ * so the two can never send different prompts, schemas or flags for the same
+ * request.
+ *
+ *  - Schema-constrained JSON through `output_config.format`. There is no
+ *    `strict` field: the caller re-validates the answer in code.
+ *  - Deliberately absent: temperature / top_p / top_k (rejected), tools and
+ *    tool_choice (the model must not be able to act).
+ */
+export function messageParamsFor(request: LlmRequest, model: string): Anthropic.MessageCreateParamsNonStreaming {
+  return {
+    model,
+    max_tokens: request.maxOutputTokens,
+    system: request.system,
+    messages: [{ role: "user", content: userContent(request) }],
+    output_config: {
+      format: { type: "json_schema", schema: request.schema },
+      ...(request.effort ? { effort: request.effort } : {}),
+    },
+  };
+}
+
 /** The real provider, over the shared client. */
 export class AnthropicLlmProvider implements LlmProvider {
   /** Model id for a role, from the one config module. */
@@ -153,23 +177,7 @@ export class AnthropicLlmProvider implements LlmProvider {
     const model = this.modelFor(request.role);
     try {
       const message = await client.messages
-        .stream(
-          {
-            model,
-            max_tokens: request.maxOutputTokens,
-            system: request.system,
-            messages: [{ role: "user", content: userContent(request) }],
-            // Schema-constrained JSON. No `strict` field exists here: the
-            // caller re-validates the answer in code.
-            output_config: {
-              format: { type: "json_schema", schema: request.schema },
-              ...(request.effort ? { effort: request.effort } : {}),
-            },
-            // Deliberately absent: temperature / top_p / top_k (rejected),
-            // tools and tool_choice (the model must not be able to act).
-          },
-          { timeout: request.timeoutMs, maxRetries: MAX_RETRIES }
-        )
+        .stream(messageParamsFor(request, model), { timeout: request.timeoutMs, maxRetries: MAX_RETRIES })
         .finalMessage();
 
       // Join the text blocks; thinking blocks are ignored.

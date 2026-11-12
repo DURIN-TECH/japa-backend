@@ -108,7 +108,7 @@ export type RequestOutcome =
   | { kind: "stored" | "running" | "queued" | "created"; assessmentId: string; status: AssessmentStatus; rubricVersion: number };
 
 /** Inputs the job and the request both read, loaded once. */
-interface LoadedInputs {
+export interface LoadedInputs {
   applicantName: string | null;
   nationality: string | null;
   eligibilityScore: number | null;
@@ -141,11 +141,13 @@ export function sniffMediaType(bytes: Buffer): "application/pdf" | "image/jpeg" 
   return null;
 }
 
-function zeroUsage(): AssessmentUsage {
+/** A blank usage record. Exported for the bulk path (#37). */
+export function zeroUsage(): AssessmentUsage {
   return { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 }
 
-function addUsage(total: AssessmentUsage, u: LlmUsage): AssessmentUsage {
+/** Add one call's usage to a total. Exported for the bulk path (#37). */
+export function addUsage(total: AssessmentUsage, u: LlmUsage): AssessmentUsage {
   return {
     requests: total.requests + 1,
     inputTokens: total.inputTokens + u.inputTokens,
@@ -156,7 +158,7 @@ function addUsage(total: AssessmentUsage, u: LlmUsage): AssessmentUsage {
 }
 
 /** The UTC day key used for the daily cap. */
-function dayKey(now: Date): string {
+export function dayKey(now: Date): string {
   return now.toISOString().slice(0, 10);
 }
 
@@ -211,7 +213,7 @@ function defaultDeps(): AssessmentDeps {
 }
 
 /** A blank stored record, before the job has run. */
-function newAssessmentDoc(args: {
+export function newAssessmentDoc(args: {
   id: string;
   app: Application;
   rubricVersion: number;
@@ -270,7 +272,8 @@ export class AiCaseOfficerService {
    * Load every input the assessment reads. Applicant-derived strings are only
    * ever passed on wrapped in delimiters (services/ai/prompt-safety.ts).
    */
-  private async loadInputs(app: Application): Promise<LoadedInputs> {
+  // Public since #37: the bulk re-assessment service reads the same inputs.
+  async loadInputs(app: Application): Promise<LoadedInputs> {
     const userSnap = await collections.users.doc(app.userId).get();
     const user = userSnap.exists ? (userSnap.data() as User) : null;
     const applicantName = user ? `${user.firstName ?? ""} ${user.lastName ?? ""}`.trim() || null : null;
@@ -337,7 +340,8 @@ export class AiCaseOfficerService {
   }
 
   /** The hash inputs for a loaded set and rubric version. */
-  private inputsFor(loaded: LoadedInputs, rubricVersion: number): AssessmentInputs {
+  // Public since #37 (bulk re-assessment recomputes the same hash).
+  inputsFor(loaded: LoadedInputs, rubricVersion: number): AssessmentInputs {
     return {
       rubricVersion,
       documents: loaded.documents.map((d) => ({ path: `${d.id}:${d.path}`, updatedAtMs: d.updatedAtMs })),
@@ -399,6 +403,11 @@ export class AiCaseOfficerService {
           attempt: (cur.attempt ?? 1) + 1,
           trigger: opts.trigger,
           requestedBy: opts.requestedBy,
+          // A failed BULK job retried by a person runs on the interactive path
+          // (the interactive worker skips viaBatch jobs), and leaves its batch.
+          viaBatch: false,
+          batchId: null,
+          batchPhase: null,
           startedAt: null,
           finishedAt: null,
         });
@@ -437,14 +446,25 @@ export class AiCaseOfficerService {
     return snap.exists ? (snap.data() as ApplicationAssessment) : null;
   }
 
-  /** The newest assessment for an application, or null. */
+  /**
+   * The newest assessment for an application, or null.
+   *
+   * A bulk re-assessment job (#37) that has not succeeded is background work: it
+   * may wait hours in a provider batch. It must not hide the applicant's current
+   * result, so a `viaBatch` job in any state but `succeeded` is skipped here.
+   */
   async latestFor(applicationId: string): Promise<ApplicationAssessment | null> {
     const snap = await collections.applicationAssessments
       .where("applicationId", "==", applicationId)
       .orderBy("createdAt", "desc")
-      .limit(1)
+      .limit(10)
       .get();
-    return snap.empty ? null : (snap.docs[0].data() as ApplicationAssessment);
+    for (const d of snap.docs) {
+      const a = d.data() as ApplicationAssessment;
+      if (a.viaBatch === true && a.status !== "succeeded") continue;
+      return a;
+    }
+    return null;
   }
 
   /** The newest succeeded assessment for an application, or null (filtered in code). */
@@ -514,7 +534,8 @@ export class AiCaseOfficerService {
   }
 
   /** Write a stored result or failure. Only the worker writes these fields. */
-  private async finish(assessmentId: string, patch: Partial<ApplicationAssessment> & { status: AssessmentStatus }): Promise<void> {
+  // Public since #37 (the bulk path writes failures through it).
+  async finish(assessmentId: string, patch: Partial<ApplicationAssessment> & { status: AssessmentStatus }): Promise<void> {
     await collections.applicationAssessments.doc(assessmentId).update({
       ...patch,
       finishedAt: Timestamp.fromDate(this.deps.now()),
@@ -742,13 +763,17 @@ export class AiCaseOfficerService {
   }
 
   /** Store the result of a finished job. */
-  private async storeContent(
+  // Public since #37. `extra` is merged into the same write (the bulk path adds its
+  // supersede links, change summary and review flag), so a result and its bulk
+  // fields land in ONE update and a reader never sees one without the other.
+  async storeContent(
     id: string,
     rubric: VisaRubric,
     content: AssessmentContent,
     usage: { extract: AssessmentUsage; judge: AssessmentUsage },
     models: { extract: string | null; judge: string | null },
-    suspiciousContent: ApplicationAssessment["suspiciousContent"] = []
+    suspiciousContent: ApplicationAssessment["suspiciousContent"] = [],
+    extra: Partial<ApplicationAssessment> = {}
   ): Promise<void> {
     // Items dropped by code (a criterion id the rubric does not contain, or model
     // text that broke the banned-wording list) are logged as a COUNT. The text is
@@ -785,6 +810,7 @@ export class AiCaseOfficerService {
       usage,
       // A total only when both stages are priced: a part-priced total would understate the spend.
       costUsd: extractCost === null || judgeCost === null ? null : extractCost + judgeCost,
+      ...extra,
     });
     // Proposed actions (issue #44): derived from the findings just stored and
     // checked against THIS rubric version. They are inert proposals (nothing is
@@ -815,12 +841,12 @@ export class AiCaseOfficerService {
 }
 
 /** A document that could not be read: its criteria become insufficient. */
-function unreadable(base: { documentId: string; label: string }, reason: string): DocumentExtraction {
+export function unreadable(base: { documentId: string; label: string }, reason: string): DocumentExtraction {
   return { ...base, mediaType: "", readable: false, values: [], failed: false, failure: reason, suspicious: false };
 }
 
 /** A document whose extraction failed: counted as unread, never as a pass. */
-function failed(base: { documentId: string; label: string }, reason: string): DocumentExtraction {
+export function failed(base: { documentId: string; label: string }, reason: string): DocumentExtraction {
   return { ...base, mediaType: "", readable: false, values: [], failed: true, failure: reason, suspicious: false };
 }
 

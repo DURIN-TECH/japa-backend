@@ -99,7 +99,7 @@ export function stripKeyDeep(value: unknown, key: string): unknown {
  * applicant or agent never reads them (the suspicious-content log in particular
  * is "stored, never shown").
  */
-const OPERATIONAL_FIELDS = ["usage", "costUsd", "suspiciousContent", "requestedBy", "inputHash", "models", "promptVersion"] as const;
+const OPERATIONAL_FIELDS = ["usage", "costUsd", "suspiciousContent", "requestedBy", "inputHash", "models", "promptVersion", "viaBatch", "batchId", "batchPhase", "batchAttempts", "bulkRunId"] as const;
 
 /** A stored time as an ISO string, or null. */
 function isoOf(ts: { toDate?: () => Date } | null | undefined): string | null {
@@ -122,7 +122,15 @@ export function serializeFull(assessment: ApplicationAssessment, role: string | 
   const visible: Record<string, unknown> = { ...(assessment as unknown as Record<string, unknown>) };
   for (const f of OPERATIONAL_FIELDS) delete visible[f];
   if (role && REQUESTER_VISIBLE_ROLES.includes(role) && requestedByName) visible.requestedByName = requestedByName;
-  if (role === ROLES.CLIENT) return stripKeyDeep(visible, "internalCall");
+  // A client-role caller never sees the verdict call, nor (issue #37) what the
+  // rule change was or that an agent was asked to review: the applicant sees
+  // the update only as the normal stale / updated state.
+  if (role === ROLES.CLIENT) {
+    delete visible.changeSummary;
+    delete visible.reviewRequired;
+    delete visible.reviewNotifiedAt;
+    return stripKeyDeep(visible, "internalCall");
+  }
   return visible;
 }
 

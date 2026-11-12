@@ -50,12 +50,40 @@ export const ASSESSMENT_ERROR_CODES = [
   "provider_stopped",
   "invalid_model_output",
   "internal_error",
+  // Bulk re-assessment (#37): the application was closed, submitted to the
+  // embassy or withdrawn between the rubric approval and the job running.
+  "application_closed",
 ] as const;
 export type AssessmentErrorCode = (typeof ASSESSMENT_ERROR_CODES)[number];
 
 /** What caused the job. */
 export const ASSESSMENT_TRIGGERS = ["manual", "status_change", "documents_changed", "rubric_bump"] as const;
 export type AssessmentTrigger = (typeof ASSESSMENT_TRIGGERS)[number];
+
+/**
+ * What changed between an assessment and the one it superseded (issue #37).
+ * Built in code from the two rubric versions and the two stored results, never
+ * by a model. Shown to the agent only: it is stripped from client-role
+ * responses (services/ai/tier-serializer.ts), because it names rule changes.
+ */
+export interface AssessmentChangeSummary {
+  previousAssessmentId: string;
+  previousRubricVersion: number;
+  rubricVersion: number;
+  // The readiness band before and after, and which way it moved. `unknown`
+  // when the previous result carried no band.
+  readiness: { from: ReadinessBand | null; to: ReadinessBand | null; direction: "down" | "up" | "same" | "unknown" };
+  // Criterion ids that differ between the two RUBRIC versions. Null when the
+  // previous rubric version could not be read (the summary then says so
+  // instead of guessing). `changed` lists the id in the new version.
+  criteria: { added: string[]; removed: string[]; changed: string[] } | null;
+  // Criterion ids of the stored FINDINGS (refusal grounds, credibility flags,
+  // insufficient information): newly raised on this applicant, and no longer
+  // raised.
+  findings: { raised: string[]; resolved: string[] };
+  // A mandatory bar now applies that did not before (code-decided).
+  newBlockingRule: boolean;
+}
 
 /** Outcome of one stage, as the engine recorded it. */
 export interface StageOutcomes {
@@ -224,6 +252,38 @@ export interface ApplicationAssessment {
 
   models: { extract: string | null; judge: string | null };
   promptVersion: string;
+
+  // ---- bulk re-assessment (issue #37). All optional: documents written
+  // before #37, and every interactive assessment, simply do not carry them ----
+  // True when the job belongs to the Batch API path. The interactive worker
+  // (processAssessmentJob) ignores such a job; the bulk sweep owns it.
+  viaBatch?: boolean;
+  // The bulk run (the rubric approval's audit id) that created the job.
+  bulkRunId?: string | null;
+  // The provider batch the job currently waits on (an `assessmentBatches` id),
+  // or null when it is waiting to be planned into the next one.
+  batchId?: string | null;
+  // Which stage that batch holds for this job.
+  batchPhase?: "extraction" | "judgement" | null;
+  // How many batch rounds have failed for this job. At the cap it is failed.
+  batchAttempts?: number;
+  // Why this assessment exists when it was not asked for: the approved rules
+  // moved. `rules_updated` is the same word the stale state uses.
+  updateReason?: "rules_updated" | null;
+  // The assessment this one replaced, and (on the replaced one) the reverse.
+  // The replaced assessment is RETAINED, never overwritten.
+  supersedesAssessmentId?: string | null;
+  supersededByAssessmentId?: string | null;
+  supersededAt?: Timestamp | null;
+  // What changed against the replaced assessment. Set when the job succeeds.
+  changeSummary?: AssessmentChangeSummary | null;
+  // Policy: an agent (or the agency owner, or an admin) must look at this one
+  // because the result got worse for the applicant. The APPLICANT is never
+  // notified of it automatically.
+  reviewRequired?: boolean;
+  // When the reviewer was notified. Null until then (and for ever when no
+  // review is required).
+  reviewNotifiedAt?: Timestamp | null;
   usage: { extract: AssessmentUsage; judge: AssessmentUsage };
   // Null while the model has no price entry (see services/ai/ai-pricing.ts).
   costUsd: number | null;

@@ -232,6 +232,12 @@ export const collections = {
   // Per-day AI spend counters, one document per UTC day (`aiCosts/{YYYY-MM-DD}`).
   // Written in a transaction per assessment; read by the daily cap. Backend-only.
   aiCosts: db.collection("aiCosts"),
+  // Bulk re-assessment after a rubric approval (issue #37). One run per approval
+  // (id = the approval's audit id), one doc per provider batch, and a cache of
+  // stage 2 document extractions. All backend-only (no firestore.rules match).
+  bulkReassessments: db.collection("bulkReassessments"),
+  assessmentBatches: db.collection("assessmentBatches"),
+  documentExtractions: db.collection("documentExtractions"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all

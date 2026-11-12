@@ -821,6 +821,42 @@
       ]
     },
     {
+      "collectionGroup": "applicationAssessments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "countryCode", "order": "ASCENDING" },
+        { "fieldPath": "visaTypeId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "applicationId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "applicationAssessments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "viaBatch", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "batchId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "applicationAssessments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "bulkRunId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "bulkReassessments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "routeKey", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "eligibilityChecks",
       "queryScope": "COLLECTION",
       "fields": [

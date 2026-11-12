@@ -50,3 +50,19 @@ export function costOfUsage(
   // Six decimals: enough for sub-cent calls, no float noise in stored docs.
   return Math.round(usd * 1e6) / 1e6;
 }
+
+/**
+ * Batch API price multiplier (issue #37 states a 50% discount on both input and
+ * output). It is the issue's figure, NOT yet confirmed against the provider's
+ * pricing page; it only ever scales a cost the price table already produced, so
+ * while the table is empty no batch cost is computed at all.
+ */
+export const BATCH_PRICE_MULTIPLIER = 0.5;
+
+/** True when every given role has a confirmed price entry (so a dollar cap can be enforced). */
+export function rolesArePriced(
+  roles: readonly AiModelRole[],
+  prices: Partial<Record<AiModelRole, AiTokenPrices>> = AI_PRICES
+): boolean {
+  return roles.every((r) => prices[r] !== undefined);
+}

@@ -29,6 +29,13 @@ export interface AiSettings {
   maxInputCharsPerAssessment: number;
   maxAssessmentsPerDay: number;
   maxFileBytes: number;
+  // Bulk re-assessment (#37): provider requests the Batch API path may submit per
+  // UTC day. The hard cap while the price table is empty.
+  maxBatchRequestsPerDay: number;
+  // Bulk re-assessment (#37): dollars of recorded batch spend per UTC day. 0 means
+  // "no dollar cap". Only enforced when both roles have a confirmed price
+  // (ai-pricing.ts); otherwise the request cap above is the only brake.
+  maxBatchCostUsdPerDay: number;
 }
 
 /** Defaults. Sized for one application with a handful of documents. */
@@ -38,6 +45,8 @@ export const DEFAULT_AI_SETTINGS: Readonly<AiSettings> = Object.freeze({
   maxInputCharsPerAssessment: 2_000_000,
   maxAssessmentsPerDay: 200,
   maxFileBytes: 10 * 1024 * 1024,
+  maxBatchRequestsPerDay: 1_000,
+  maxBatchCostUsdPerDay: 0,
 });
 
 /** Allowed range of each numeric setting. A stored value outside it falls back to its default. */
@@ -46,6 +55,8 @@ const RANGES: Record<Exclude<keyof AiSettings, "enabled">, [number, number]> = {
   maxInputCharsPerAssessment: [10_000, 20_000_000],
   maxAssessmentsPerDay: [1, 10_000],
   maxFileBytes: [100_000, 50 * 1024 * 1024],
+  maxBatchRequestsPerDay: [1, 100_000],
+  maxBatchCostUsdPerDay: [0, 100_000],
 };
 
 /** Result of a settings read. */

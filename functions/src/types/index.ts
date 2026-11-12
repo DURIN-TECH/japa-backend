@@ -1167,6 +1167,10 @@ export type NotificationType =
   | "application_created" // An agent started an application on a client's behalf
   | "application_assigned" // An application was assigned to an agent
   | "application_withdrawn"
+  // The approved rules changed and a bulk re-assessment (#37) produced a worse
+  // or blocking result: sent to the assigned agent / agency owner / admins,
+  // NEVER to the applicant.
+  | "assessment_rules_updated"
   // Documents
   | "document_status"
   | "document_uploaded" // Client uploaded a document for review
