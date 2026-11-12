@@ -16,13 +16,11 @@
 //    are reported as `openRequiredIds`.
 //  - Free-text answers are personal data: never logged here.
 //
-// DEPENDENCY: reads `visaRubrics` directly because the rubric store from #40
-// is not on `dev` yet. Same paths as #40's `rubric.store.ts`
-// (head `visaRubrics/{routeKey}`, version `rubricVersions/{version}`); swap
-// `loadApprovedIntake` for the store call when #40 merges.
+// The approved rubric is read through #40's `rubricStore.getApprovedRubric`.
 
 import { Timestamp } from "firebase-admin/firestore";
-import { collections, db } from "../utils/firebase";
+import { collections } from "../utils/firebase";
+import { rubricStore, rubricRouteKey } from "../scrapers";
 import { Application, ApplicationStatus } from "../types";
 import {
   ApplicationIntake,
@@ -82,34 +80,34 @@ interface ApprovedIntake {
 /**
  * The approved rubric's intake for a route, or null when there is no
  * approved version or it carries no questions.
+ *
+ * Integration: reads through #40's `rubricStore.getApprovedRubric`, the one read
+ * consumers may use (it re-checks the version's own `reviewStatus`), instead of
+ * the direct `visaRubrics` reads #113 shipped with. Note the store validates the
+ * route key (upper-case two-letter country code), so a malformed code throws
+ * rather than silently addressing a second key; the caller treats that as no
+ * intake.
  */
 async function loadApprovedIntake(
   countryCode: string,
   visaTypeId: string
 ): Promise<ApprovedIntake | null> {
-  const routeKey = `${countryCode}_${visaTypeId}`;
-  const head = await db.collection("visaRubrics").doc(routeKey).get();
-  const approved = head.exists ? head.data()?.approvedVersion : null;
-  if (typeof approved !== "number") return null;
-
-  const versionDoc = await db
-    .collection("visaRubrics")
-    .doc(routeKey)
-    .collection("rubricVersions")
-    .doc(String(approved))
-    .get();
-  if (!versionDoc.exists) return null;
-  const data = versionDoc.data() ?? {};
-
-  // Belt and braces: only ever serve a version a human approved.
-  if (data.reviewStatus !== "approved") return null;
-
-  const questions = Array.isArray(data.intakeQuestions)
-    ? (data.intakeQuestions as IntakeQuestion[])
-    : [];
+  let rubric;
+  try {
+    rubric = await rubricStore.getApprovedRubric(countryCode, visaTypeId);
+  } catch {
+    // Invalid route key parts: no such route, so no intake step.
+    return null;
+  }
+  if (!rubric) return null;
+  const questions = Array.isArray(rubric.intakeQuestions) ? rubric.intakeQuestions : [];
   if (questions.length === 0) return null;
-
-  return { routeKey, version: approved, meta: (data.intake as IntakeMeta) ?? {}, questions };
+  return {
+    routeKey: rubricRouteKey(countryCode, visaTypeId),
+    version: rubric.version,
+    meta: rubric.intake ?? {},
+    questions,
+  };
 }
 
 // ============================================

@@ -7,77 +7,18 @@
 // (`visaRubrics/{countryCode}_{visaTypeId}`, issue #40); the answers are stored
 // on the application as `Application.intake`.
 //
-// DEPENDENCY ON UNMERGED WORK: the full rubric types live in `types/rubric.ts`
-// on the #40 branch (not on `dev` yet). This file declares ONLY the minimal
-// read-side shape #113 needs, mirroring #40's `IntakeQuestion` / `IntakeMeta`
-// field for field. When #40 merges, replace the `Rubric*` interfaces below
-// with `import type { IntakeQuestion, IntakeMeta } from "./rubric"`.
+// INTEGRATION: #113 was built before #40 was on its base, so it carried a copy
+// of the rubric intake types. The copy is gone: the question types are #40's
+// (`types/rubric.ts`) and are re-exported here so existing imports keep working.
 //
 // Generic by design: nothing here (or in the service built on it) names a
 // country, a route, a nationality or a visa type.
 
 import type { Timestamp } from "firebase-admin/firestore";
 
-/** Answer types the renderer and the validator understand. */
-export const INTAKE_ANSWER_TYPES = [
-  "single_choice",
-  "multi_choice",
-  "yes_no",
-  "date",
-  "date_range",
-  "text",
-  "amount",
-] as const;
-export type IntakeAnswerType = (typeof INTAKE_ANSWER_TYPES)[number];
-
-/** One selectable option of a choice question (mirrors #40). */
-export interface IntakeOption {
-  value: string;
-  label: string;
-  description?: string;
-}
-
-/** One "show this question when..." condition (mirrors #40). */
-export interface IntakeCondition {
-  questionId: string;
-  op: "eq" | "neq" | "in";
-  value: string | number | boolean | string[];
-}
-
-/**
- * One intake question as stored on the rubric (mirrors #40's `IntakeQuestion`).
- *
- * Two OPTIONAL fields go beyond #40's shape (`maxLengthDays`, `currencies`):
- * the design spec for #113 asks for them and the renderer degrades safely
- * without them. They are read if the rubric carries them; #40/#112 decide
- * whether to add them to the schema.
- */
-export interface IntakeQuestion {
-  id: string;
-  label: string;
-  helpText?: string;
-  /** Plain string: a rubric may carry a type this version doesn't know. */
-  answerType: string;
-  required: boolean;
-  criterionIds: string[];
-  group?: string;
-  party?: "applicant" | "sponsor";
-  options?: IntakeOption[];
-  dateLimits?: { min?: string; max?: string; relativeToToday?: "past_only" | "future_only" };
-  textLimits?: { minLength?: number; maxLength?: number };
-  showWhen?: { anyOf: IntakeCondition[] };
-  /** date_range: longest allowed range, in days (beyond #40). */
-  maxLengthDays?: number;
-  /** amount: allowed ISO 4217 codes (beyond #40). Any code when absent. */
-  currencies?: string[];
-}
-
-/** Headings of the intake section as a whole (mirrors #40's `IntakeMeta`). */
-export interface IntakeMeta {
-  title?: string;
-  cardTitle?: string;
-  intro?: string;
-}
+export { INTAKE_ANSWER_TYPES } from "./rubric";
+export type { IntakeAnswerType, IntakeOption, IntakeCondition, IntakeQuestion, IntakeMeta } from "./rubric";
+import type { IntakeMeta, IntakeQuestion } from "./rubric";
 
 /** The saved answers, as stored on the application document. */
 export interface ApplicationIntake {

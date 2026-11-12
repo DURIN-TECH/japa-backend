@@ -309,6 +309,11 @@ export interface IntakeQuestion {
   textLimits?: { minLength?: number; maxLength?: number };
   // Shown when ANY of these conditions holds (always shown when absent).
   showWhen?: { anyOf: IntakeCondition[] };
+  // date_range questions: the longest allowed range, in days (#113). Optional:
+  // the renderer and validator degrade safely when it is absent.
+  maxLengthDays?: number;
+  // amount questions: the allowed ISO 4217 codes (#113). Any code when absent.
+  currencies?: string[];
 }
 
 /** Headings of the intake section as a whole. */
