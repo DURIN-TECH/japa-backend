@@ -88,3 +88,14 @@ export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
 export { validateVisaRubric } from "./rubric/rubric-validate";
 /** Verbatim-quote lookup in a stored snapshot (the review API's stale-citation check). */
 export { SnapshotQuoteIndex } from "./rubric/rubric-quote";
+/** Rubric types for consumers (the assessment engine, #42). Type-only. */
+export type {
+  AssessmentCriterion,
+  CriterionAppliesTo,
+  CriterionCheck,
+  CriterionKind,
+  DecisionStage,
+  IntentPolarity,
+  RubricCitation,
+  VisaRubric,
+} from "../types/rubric";

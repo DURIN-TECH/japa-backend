@@ -376,7 +376,12 @@ class ApplicationService {
     if (status === "approved" || status === "rejected") {
       updateData.completedAt = serverTimestamp() as unknown as Timestamp;
     }
-    if (status === "submitted_to_embassy" && !application.submittedAt) {
+    // `submittedAt` pins the date the application was made. It is set once, on
+    // the FIRST move to under_review (the applicant's submission) or to
+    // submitted_to_embassy, never overwritten, and only here on the server: no
+    // client-supplied field reaches it (UpdateApplicationInput does not carry it).
+    // The AI assessment checks mandatory bars against this date (#42).
+    if ((status === "under_review" || status === "submitted_to_embassy") && !application.submittedAt) {
       updateData.submittedAt = serverTimestamp() as unknown as Timestamp;
     }
 

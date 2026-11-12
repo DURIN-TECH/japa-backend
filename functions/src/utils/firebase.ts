@@ -214,6 +214,18 @@ export const collections = {
   // so a decision never exists without its record. Append-only.
   // Backend-only: no firestore.rules match -> clients denied.
   rubricReviewHistory: db.collection("rubricReviewHistory"),
+  // The AI case-officer assessment (issue #42): one document per assessment,
+  // which is also its job record. The id is derived from the application id and
+  // the input hash, so the same inputs address the same document. Backend-only:
+  // no firestore.rules match, so clients read it only through /ai routes.
+  applicationAssessments: db.collection("applicationAssessments"),
+  // Eligibility checks (read by the assessment for the score and nationality).
+  // The same collection EligibilityService writes; listed here so the AI path
+  // reads it through the registry, not a second `db.collection` call.
+  eligibilityChecks: db.collection("eligibilityChecks"),
+  // Per-day AI spend counters, one document per UTC day (`aiCosts/{YYYY-MM-DD}`).
+  // Written in a transaction per assessment; read by the daily cap. Backend-only.
+  aiCosts: db.collection("aiCosts"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all
