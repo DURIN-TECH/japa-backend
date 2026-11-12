@@ -270,6 +270,16 @@ export const collections = {
   // (`aiChatUsage/{uid}_{YYYY-MM-DD}`): messages per hour and per day, tokens
   // spent. Read and written by the chat rate / spend caps. Backend-only.
   aiChatUsage: db.collection("aiChatUsage"),
+  // Per-upload document checks (issue #115): `documentChecks/{documentId}`, one
+  // per uploaded document, which is also its job record (queued -> running ->
+  // done | could_not_check). Read only through the /documents/:id/check and
+  // /applications/:id/document-checks routes, tier-trimmed. Backend-only: no
+  // firestore.rules match, so clients are denied.
+  documentChecks: db.collection("documentChecks"),
+  // Per-day counters that bound the cost of document checks (issue #115):
+  // `documentCheckCaps/{applicationId|userId}__{YYYY-MM-DD}` -> { count }.
+  // Backend-only, same as above.
+  documentCheckCaps: db.collection("documentCheckCaps"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all

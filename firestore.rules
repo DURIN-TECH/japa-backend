@@ -599,6 +599,11 @@ service cloud.firestore {
     //    dedupe claim per application it was handled for (who was told what,
     //    issue #123). Written by the backend only. Do NOT add a match.
 
+    //  - documentChecks/{documentId} and documentCheckCaps/{id}: per-upload
+    //    document checks and their daily cost counters (issue #115). Clients read
+    //    the check only through GET /documents/:id/check (tier-trimmed). Do NOT
+    //    add a match.
+
     // ---- Agency visa revisions (issue #100), explicit deny (issue #102) ----
     // visaRevisions/{cc}__{visaId}: unreviewed agency edits to an approved
     // visa. Backend only (agency read via /agency/visas, admin review via

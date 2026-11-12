@@ -100,6 +100,7 @@ import { ruleChangeAlertsService } from "./services/rule-change-alerts.service";
 import { rubricExtractionService } from "./scrapers";
 import type { RubricReviewAuditEntry } from "./services/rubric-review.service";
 import { outcomeImportService, outcomeRunWorker, registeredDestinations } from "./scrapers";
+import { documentCheckService } from "./services/ai/document-check.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -872,4 +873,27 @@ export const processBulkReassessments = functions
     } catch (error) {
       console.error("Bulk re-assessment sweep failed:", error);
     }
+  });
+
+// ============================================
+// PER-UPLOAD DOCUMENT CHECK WORKER (issue #115)
+// ============================================
+//
+// Runs a document check job. POST /documents only WRITES the queued record (and
+// only for a paid applicant), so the upload response never waits on this. The
+// worker returns at once unless the write moved the record INTO `queued`
+// (created queued, or a retry), then claims `queued -> running` in a
+// transaction so a duplicate delivery never runs twice. Function-level retry
+// stays off: a retry is a new request. Binds AI_SECRETS because it calls the
+// model. 120 s covers the job's own 90 s limit, after which the job stores
+// `could_not_check` instead of being killed mid-write.
+export const processDocumentCheck = functions
+  .runWith({ secrets: [...AI_SECRETS], timeoutSeconds: 120, memory: "512MB" })
+  .firestore.document("documentChecks/{documentId}")
+  .onWrite(async (change, context) => {
+    if (!change.after.exists) return;
+    const after = change.after.data() ?? {};
+    const before = change.before.exists ? change.before.data() ?? {} : {};
+    if (after.status !== "queued" || before.status === "queued") return;
+    await documentCheckService.runJob(context.params.documentId);
   });
