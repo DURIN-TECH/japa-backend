@@ -158,7 +158,7 @@ export function requiredDocumentCitationKey(index: number): string {
 function normForQuote(s: string): string {
   return s
     .replace(/[\u2018\u2019]/g, "'")
-    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u201C\u201D]/g, "\"")
     .replace(/[\u2013\u2014]/g, "-")
     .replace(/\s+/g, " ")
     .trim()

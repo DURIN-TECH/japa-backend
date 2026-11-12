@@ -323,7 +323,10 @@ export function extractedToVisaFields(params: {
     eligibilityCriteria: e.eligibilityCriteria,
     // Issue #129: OMITTED when empty so a record whose page lists no documents
     // never gains the field (an empty array is not "the page lists nothing").
-    requiredDocuments: e.requiredDocuments.length > 0 ? e.requiredDocuments : undefined,
+    // Issue #129: OMITTED when empty/absent so a record whose page lists no
+    // documents never gains the field (an empty array is not "the page lists
+    // nothing"). Guard against older extractions that pre-date the field.
+    requiredDocuments: Array.isArray(e.requiredDocuments) && e.requiredDocuments.length > 0 ? e.requiredDocuments : undefined,
     applicationUrl: e.applicationUrl,
     applicationInstructions: e.applicationInstructions,
   };
