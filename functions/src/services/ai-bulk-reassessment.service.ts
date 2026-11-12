@@ -30,6 +30,7 @@ import {
   judgementCriteriaOf,
   mandatoryBarHits,
   parseExtraction,
+  numberStatementBlocks,
   parseJudgement,
   type AssessmentContent,
   type DocumentExtraction,
@@ -235,6 +236,12 @@ interface JobContext {
   extractUsage: AssessmentUsage;
   usedExtraction: boolean;
   hasStatementReadable: boolean;
+  // Integration (#37 x #42 6f3336d): the statement the model was shown numbered
+  // blocks of, and how many it was shown. Needed to range-check the anchors the
+  // model returns and to record which statement was read, exactly as the single
+  // path does. Null / 0 when no statement had any block.
+  statementRef: { instanceId: string; version: number } | null;
+  statementSentCount: number;
 }
 
 /** What planning one waiting job found. */
@@ -699,11 +706,19 @@ export class BulkReassessmentService {
     const judgementCriteria = judgementCriteriaOf(rubric);
     const statementText = loaded.statements.map((s) => s.text).filter(Boolean).join("\n\n");
     if (statementText && findInjectionSignals(statementText)) suspiciousContent.push({ source: "statement", documentId: null, page: null });
+    // Integration (#37 x #42 6f3336d): number the ONE primary statement's blocks so
+    // findings can be anchored, as `execute` does. Without this the batch result
+    // would store every statement finding unanchored (no `nodePath`).
+    const primary = loaded.statements.find((s) => s.blocks.length > 0) ?? null;
+    const numbered = primary ? numberStatementBlocks(primary.blocks) : null;
+    const otherText = loaded.statements.filter((s) => s !== primary).map((s) => s.text).filter(Boolean).join("\n\n");
+    const statementRef = primary ? { instanceId: primary.instanceId, version: primary.version } : null;
     let judgementRequest: LlmRequest | null = null;
     if (judgementCriteria.length > 0 && (extractions.length > 0 || statementText.trim().length > 0)) {
       judgementRequest = buildJudgementRequest({
         rubric,
-        statementText: statementText || null,
+        statementText: numbered ? numbered.text : statementText || null,
+        otherStatementsText: otherText || null,
         profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. Nationality code: ${loaded.nationality ?? "not given"}.`,
         intakeSummary: JSON.stringify(loaded.intake),
         extractionSummary: extractions
@@ -721,6 +736,8 @@ export class BulkReassessmentService {
         judgementCriteriaIds: judgementCriteria.map((c) => c.criterionId),
         judgementRequest, extractUsage, usedExtraction,
         hasStatementReadable: statementText.trim().length > 0,
+        statementRef,
+        statementSentCount: numbered ? numbered.sentCount : 0,
       },
     };
   }
@@ -920,6 +937,7 @@ export class BulkReassessmentService {
       judgement: judgement.kind === "ok" ? judgement.output : null,
       documents: ctx.extractions,
       statementReadable: ctx.hasStatementReadable,
+      statement: ctx.statementRef,
       score: ctx.score,
       suspiciousDocumentIds: ctx.suspiciousContent.map((s) => s.documentId ?? "statement"),
       judgementFailed: judgement.kind === "failed",
@@ -1071,7 +1089,7 @@ export class BulkReassessmentService {
     let outcomeJ: JudgementOutcome;
     if (outcome.response.stopReason === "refusal") outcomeJ = { kind: "failed", usage: outcome.response.usage };
     else {
-      const parsed = parseJudgement(outcome.response.text, planned.ctx.judgementCriteriaIds);
+      const parsed = parseJudgement(outcome.response.text, planned.ctx.judgementCriteriaIds, planned.ctx.statementSentCount);
       outcomeJ = parsed.ok ? { kind: "ok", output: parsed.output, usage: outcome.response.usage } : { kind: "failed", usage: outcome.response.usage };
     }
     const stored = await this.finalize(doc, planned.ctx, outcomeJ);
