@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import { isIP } from "node:net";
+import { isAllowedPort, isPublicAddress } from "../shared/fetch/address-guard";
 import {
   SUPPORTED_COUNTRY_CODES,
   type HtmlSelectors,
@@ -135,40 +136,19 @@ export function parseCountryCodes(value: unknown, field = "countryCodes"): Suppo
 const BLOCKED_HOST_NAMES = new Set(["localhost", "metadata", "metadata.google.internal", "instance-data"]);
 const BLOCKED_HOST_SUFFIXES = [".localhost", ".local", ".internal", ".localdomain", ".home.arpa"];
 
-/** True for an IPv4 literal in a private / loopback / link-local / special range. */
-function isPrivateIPv4(host: string): boolean {
-  const [a, b] = host.split(".").map(Number);
-  return (
-    a === 0 || // "this" network
-    a === 10 || // private
-    a === 127 || // loopback
-    (a === 169 && b === 254) || // link-local + the 169.254.169.254 metadata address
-    (a === 172 && b >= 16 && b <= 31) || // private
-    (a === 192 && b === 168) || // private
-    (a === 100 && b >= 64 && b <= 127) || // carrier-grade NAT
-    a >= 224 // multicast / reserved / broadcast
-  );
-}
-
-/** True for an IPv6 literal (no brackets) that is loopback / unspecified / private / link-local / v4-mapped-private. */
-function isPrivateIPv6(host: string): boolean {
-  const h = host.toLowerCase();
-  if (h === "::" || h === "::1") return true;
-  if (/^f[cd]/.test(h)) return true; // fc00::/7 unique local
-  if (/^fe[89ab]/.test(h)) return true; // fe80::/10 link-local
-  // ::ffff:a.b.c.d (or its hex form): judge by the embedded IPv4 address.
-  const mapped = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) return isPrivateIPv4(mapped[1]);
-  if (/^::ffff:[0-9a-f]{1,4}:[0-9a-f]{1,4}$/.test(h)) return true; // hex-form mapped: refuse outright
-  return false;
-}
-
 /**
- * feedUrl: a valid http(s) URL, no embedded credentials, and a host that is
- * not localhost / a private, loopback or link-local IP literal / a metadata
- * host (the scraper fetches this URL from our servers, so it must not be
- * pointable at internal addresses). Returns the URL as given (trimmed).
- * Note: this checks the LITERAL host; DNS-rebinding is the fetch layer's job.
+ * feedUrl: a valid http(s) URL, no embedded credentials, port 80/443 only, and
+ * a host that is a dotted public name or a public IP literal (the scraper
+ * fetches this URL from our servers, so it must not be pointable at internal
+ * addresses). Returns the NORMALISED url.href (issue #159), so what is stored
+ * is what was checked: backslashes, tabs/newlines and mixed-case hosts are
+ * already resolved by the WHATWG parser, and re-parsing the stored value gives
+ * the same host.
+ *
+ * Literal-only: IP literals are judged by the shared classifier
+ * (shared/fetch/address-guard.ts, the same rules the fetch layer applies);
+ * names are NOT resolved here (no DNS at write time). A name that resolves to
+ * an internal address is refused at fetch time by the guarded client.
  */
 export function parseFeedUrl(value: unknown, field = "config.feedUrl"): string {
   if (typeof value !== "string" || value.trim() === "" || value.length > MAX_FEED_URL_CHARS) {
@@ -187,20 +167,25 @@ export function parseFeedUrl(value: unknown, field = "config.feedUrl"): string {
   if (url.username !== "" || url.password !== "") {
     throw new SettingsValidationError(field, `${field} must not contain credentials`);
   }
+  // Only the standard web ports (80/443, explicit or the scheme's default).
+  if (!isAllowedPort(url.port)) {
+    throw new SettingsValidationError(field, `${field} must use the default port (80 or 443)`);
+  }
   // WHATWG URL already normalises decimal / hex / short IPv4 forms (e.g.
   // http://2130706433/ -> 127.0.0.1), so the literal checks below see them.
-  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  // ALL trailing dots are stripped ("localhost.." too) before any check.
+  const host = url.hostname.toLowerCase().replace(/\.+$/, "");
   const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
-  const kind = isIP(bare);
-  const blocked =
-    BLOCKED_HOST_NAMES.has(host) ||
-    BLOCKED_HOST_SUFFIXES.some((s) => host.endsWith(s)) ||
-    (kind === 4 && isPrivateIPv4(bare)) ||
-    (kind === 6 && isPrivateIPv6(bare));
+  const isLiteral = isIP(bare) !== 0;
+  const blocked = isLiteral
+    ? !isPublicAddress(bare) // every IPv4 / IPv6 class: the shared classifier
+    : BLOCKED_HOST_NAMES.has(host) ||
+      BLOCKED_HOST_SUFFIXES.some((s) => host.endsWith(s)) ||
+      !host.includes("."); // single-label (bare intranet) names are never a public feed
   if (blocked) {
     throw new SettingsValidationError(field, `${field} must point at a public host (not localhost, a private IP or a metadata host)`);
   }
-  return raw;
+  return url.href;
 }
 
 /** A CSS selector: non-empty, bounded, and parseable by cheerio (css-select). */

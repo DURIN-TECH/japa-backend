@@ -1,5 +1,7 @@
 import * as cheerio from "cheerio";
-import axios from "axios";
+import type { AxiosInstance } from "axios";
+// Issue #159: the release download goes through the same address guard as every scraper fetch.
+import { createGuardedHttpClient, type AddressGuardOptions } from "../../../shared/fetch/address-guard";
 import { createHash } from "crypto";
 import { createWriteStream } from "fs";
 import { Transform } from "stream";
@@ -259,6 +261,17 @@ async function readProvisionalCaveats(wb: XlsxWorkbook): Promise<string[]> {
 export class UkHomeOfficeOutcomeAdapter implements OutcomeDataSourceAdapter {
   readonly destination = "GB";
 
+  // Guarded client for the release download (issue #159). The file URL is
+  // scraped off a gov.uk page, so it is address-checked at connect time, per
+  // redirect hop, like every other scraper fetch. Default redirect depth of
+  // the old bare axios.get (5) is kept.
+  private readonly downloadClient: AxiosInstance;
+
+  /** `guard` is the TEST-ONLY address-guard hook; production passes nothing. */
+  constructor(guard?: AddressGuardOptions) {
+    this.downloadClient = createGuardedHttpClient({ maxRedirects: 5 }, guard);
+  }
+
   /** Find the current release link on the data tables page. */
   async discoverRelease(): Promise<ReleaseDescriptor> {
     if (!(await visaCatalogFetchService.isAllowedByRobots(UK_STATISTICS_PAGE_URL))) {
@@ -276,7 +289,7 @@ export class UkHomeOfficeOutcomeAdapter implements OutcomeDataSourceAdapter {
     if (!(await visaCatalogFetchService.isAllowedByRobots(release.fileUrl))) {
       throw new Error(`robots.txt disallows fetching ${release.fileUrl}`);
     }
-    const resp = await axios.get(release.fileUrl, {
+    const resp = await this.downloadClient.get(release.fileUrl, {
       responseType: "stream",
       headers: { "User-Agent": VISA_CATALOG_USER_AGENT },
       signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
