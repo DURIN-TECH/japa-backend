@@ -12,15 +12,14 @@
 // fails the test.
 
 import { Timestamp } from "firebase-admin/firestore";
-import { RecordedLlmProvider, type LlmRecording } from "../../../src/services/ai/llm-provider";
+import { RecordedLlmProvider, LlmProviderError, type LlmRecording, type LlmRequest, type LlmResponse } from "../../../src/services/ai/llm-provider";
 import { GuidanceSnapshotStore, type SnapshotBucket } from "../../../src/scrapers/guidance/guidance-snapshot.store";
 import { PDF_PAGE_SEPARATOR } from "../../../src/scrapers/shared/fetch/pdf-text";
 import { chunkSnapshot } from "../../../src/scrapers/rubric/rubric-chunk";
-import { buildRubricRequest, type RawCriterion, type RawRubricOutput } from "../../../src/scrapers/rubric/rubric-prompt";
+import { RUBRIC_INTAKE_SYSTEM_PROMPT, delimiterTag, type RawCriterion, type RawRubricOutput } from "../../../src/scrapers/rubric/rubric-prompt";
 import { RubricExtractionService, type RubricExtractionDeps } from "../../../src/scrapers/rubric/rubric-extraction.service";
 import { DEFAULT_RUBRIC_SETTINGS, type RubricExtractionSettings } from "../../../src/scrapers/rubric/rubric-settings";
 import { RubricStore } from "../../../src/scrapers/rubric/rubric.store";
-import { DEFAULT_SEVERITY_LEVELS } from "../../../src/types/rubric";
 import { fakeCollection, fakeRunTransaction, store } from "../../helpers/fake-firestore";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -116,6 +115,8 @@ export function crit(fields: Partial<RawCriterion> & Pick<RawCriterion, "ref" | 
     severity: "high",
     ruleRef: null,
     concernsIntent: false,
+    applicability: "all_applicants",
+    applicabilityCondition: null,
     check: null,
     appliesTo: null,
     validFrom: null,
@@ -137,9 +138,79 @@ export function answer(fields: Partial<RawRubricOutput>): RawRubricOutput {
 export const RECORDED_USAGE = { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
 /**
- * Record the answers for one source's chunks, keyed by the exact requests
- * the service will build for the source's CURRENT snapshot. `answers[i]`
- * answers chunk i; a string is recorded as raw text (for malformed answers).
+ * A recorded provider for the TWO-CALL extraction (issue #112). Call 1 reads
+ * a chunk's criteria; call 2 reads its intake questions and evidence items.
+ * Which accepted criteria call 2 is sent depends on what code accepted, so
+ * its request cannot be hashed in advance; recordings are therefore keyed by
+ * the chunk (the delimiter tag of its snapshot and its excerpt number) and
+ * the kind of call. Everything else is as the base class: a request with no
+ * recording fails with `missing_recording`, and `requests` lists every
+ * request received.
+ */
+export class ScriptedProvider extends RecordedLlmProvider {
+  private readonly scripts = new Map<string, LlmRecording>();
+
+  /** Key of a request: kind of call, snapshot tag, excerpt number. */
+  private static keyOf(kind: "criteria" | "intake", user: string): string {
+    const tag = /<(source_text_[0-9a-f]+)> and/.exec(user)?.[1] ?? "?";
+    const excerpt = /Excerpt (\d+) of/.exec(user)?.[1] ?? "?";
+    return `${kind}|${tag}|${excerpt}`;
+  }
+
+  /** Script one call of one chunk. */
+  script(kind: "criteria" | "intake", tag: string, excerpt: number, recording: LlmRecording): void {
+    this.scripts.set(`${kind}|${tag}|${excerpt}`, recording);
+  }
+
+  override async complete(request: LlmRequest): Promise<LlmResponse> {
+    this.requests.push(request);
+    const kind = request.system === RUBRIC_INTAKE_SYSTEM_PROMPT ? "intake" : "criteria";
+    const hit = this.scripts.get(ScriptedProvider.keyOf(kind, request.user));
+    if (!hit) throw new LlmProviderError("missing_recording", `no recording for the ${kind} call`);
+    return {
+      text: hit.text,
+      stopReason: hit.stopReason === undefined ? "end_turn" : hit.stopReason,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, ...(hit.usage ?? {}) },
+      model: this.modelFor("judgement"),
+    };
+  }
+}
+
+/**
+ * JSON of a hand-written answer as the provider would return it: a property
+ * the schema marks optional is ABSENT rather than null (only `check.value`
+ * may be an explicit null), and an evidence item without triggers gets an
+ * empty `showWhenAnyOf`, which the schema requires.
+ */
+function wire(value: unknown): string {
+  return JSON.stringify(value, (key, v) => (v === null && key !== "value" ? undefined : v));
+}
+
+/** The criteria half of an answer (call 1). */
+function criteriaHalf(a: RawRubricOutput): string {
+  const criteria = a.criteria.map((c) => {
+    // `citations` are not part of the model's output any more.
+    const { citations: _citations, ...rest } = c;
+    return rest;
+  });
+  return wire({ criteria, ...(a.intentPolarity ? { intentPolarity: a.intentPolarity } : {}), suspiciousPassages: a.suspiciousPassages });
+}
+
+/** The intake half of an answer (call 2). */
+function intakeHalf(a: RawRubricOutput): string {
+  return wire({
+    ...(a.intake ? { intake: a.intake } : {}),
+    intakeQuestions: a.intakeQuestions,
+    evidenceItems: a.evidenceItems.map((e) => ({ ...e, showWhenAnyOf: e.showWhenAnyOf ?? [] })),
+    suspiciousPassages: [],
+  });
+}
+
+/**
+ * Record the answers for one source's chunks. `answers[i]` answers chunk i.
+ * An answer written as one object is split into the two calls' halves; a
+ * string (or a raw recording) is the answer of call 1 only, for malformed or
+ * refused answers.
  */
 export async function recordAnswers(
   provider: RecordedLlmProvider,
@@ -147,16 +218,20 @@ export async function recordAnswers(
   answers: (RawRubricOutput | string | (LlmRecording & { raw: true }))[],
   settings: RubricExtractionSettings = DEFAULT_RUBRIC_SETTINGS
 ): Promise<void> {
+  if (!(provider instanceof ScriptedProvider)) throw new Error("recordAnswers needs a ScriptedProvider");
   const hash = (store.get(`guidanceSources/${sourceId}`) as any).latestSnapshotId as string;
   const content = await snapshotStore.read(sourceId, hash);
   const chunks = chunkSnapshot(content, settings.maxChunkChars);
   if (chunks.length !== answers.length) throw new Error(`${sourceId} has ${chunks.length} chunk(s) but ${answers.length} answer(s) were given`);
   chunks.forEach((chunk, i) => {
-    const request = buildRubricRequest(chunk, DEFAULT_SEVERITY_LEVELS, { maxOutputTokens: settings.maxOutputTokensPerRequest, timeoutMs: settings.requestTimeoutMs });
+    const tag = delimiterTag(chunk.contentHash);
     const a = answers[i];
-    if (typeof a === "string") provider.record(request, { text: a, usage: RECORDED_USAGE });
-    else if ("raw" in a) provider.record(request, { usage: RECORDED_USAGE, ...a });
-    else provider.record(request, { text: JSON.stringify(a), usage: RECORDED_USAGE });
+    if (typeof a === "string") provider.script("criteria", tag, chunk.chunkIndex + 1, { text: a, usage: RECORDED_USAGE });
+    else if ("raw" in a) provider.script("criteria", tag, chunk.chunkIndex + 1, { usage: RECORDED_USAGE, ...a });
+    else {
+      provider.script("criteria", tag, chunk.chunkIndex + 1, { text: criteriaHalf(a), usage: RECORDED_USAGE });
+      provider.script("intake", tag, chunk.chunkIndex + 1, { text: intakeHalf(a), usage: RECORDED_USAGE });
+    }
   });
 }
 
@@ -165,7 +240,7 @@ export async function recordAnswers(
 /** A service plus the fakes it runs on. */
 export interface Harness {
   service: RubricExtractionService;
-  provider: RecordedLlmProvider;
+  provider: ScriptedProvider;
   rubrics: RubricStore;
   // Mutable: a test may change settings or the read error between runs.
   settings: RubricExtractionSettings;
@@ -178,7 +253,7 @@ export interface Harness {
  * ("<countryCode>/<visaTypeId>") exists.
  */
 export function makeHarness(deps: Partial<RubricExtractionDeps> = {}): Harness {
-  const provider = new RecordedLlmProvider();
+  const provider = new ScriptedProvider();
   const rubrics = new RubricStore();
   rubrics.runTransaction = fakeRunTransaction as any;
   const h: Harness = {

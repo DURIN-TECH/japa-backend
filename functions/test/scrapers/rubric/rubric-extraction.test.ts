@@ -14,11 +14,15 @@
 
 import { before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { Timestamp } from "firebase-admin/firestore";
 import { resetStore, store } from "../../helpers/fake-firestore";
 import { RubricStoreError, type RubricDraft } from "../../../src/scrapers/rubric/rubric.store";
-import { RUBRIC_SYSTEM_PROMPT, delimiterTag } from "../../../src/scrapers/rubric/rubric-prompt";
-import { criterionIdOf, sourceSetHashOf } from "../../../src/scrapers/rubric/rubric-extraction.service";
+import { RUBRIC_PROMPT_VERSION, RUBRIC_SYSTEM_PROMPT, delimiterTag } from "../../../src/scrapers/rubric/rubric-prompt";
+import { assessChunkOutput, criterionIdOf, sourceSetHashOf } from "../../../src/scrapers/rubric/rubric-extraction.service";
+import { SnapshotQuoteIndex } from "../../../src/scrapers/rubric/rubric-quote";
+import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
+import { DEFAULT_SEVERITY_LEVELS } from "../../../src/types/rubric";
 import type { RawRubricOutput } from "../../../src/scrapers/rubric/rubric-prompt";
 import type { AssessmentCriterion, VisaRubric } from "../../../src/types/rubric";
 import {
@@ -130,6 +134,11 @@ const runA = (h: Harness, extra: Record<string, unknown> = {}) =>
 /** The stored criterion with this title. */
 const byTitle = (rubric: VisaRubric, title: string) => rubric.criteria.find((c) => c.title === title) as AssessmentCriterion;
 
+/** A web-page snapshot object, as the store returns it (for validator-level tests). */
+function snapshotOf(sourceId: string, text: string): GuidanceSnapshotContent {
+  return { schemaVersion: 1, sourceId, contentHash: createHash("sha256").update(text).digest("hex"), docType: "html", url: "https://docs.example/doc", finalUrl: "https://docs.example/doc", fetchedAt: "2026-11-11T01:00:00.000Z", text, pages: null };
+}
+
 let h: Harness;
 
 before(installRubricFakes);
@@ -230,7 +239,7 @@ describe("rubric extraction: a web-page source", () => {
     assert.deepEqual(rubric.sourceSnapshots, [{ sourceId: SOURCE_A_ID, contentHash: hash, url: SOURCE_A_URL, docType: "html", publishedDate: SOURCE_A_PUBLISHED }]);
     assert.equal(rubric.sourceSetHash, sourceSetHashOf([{ sourceId: SOURCE_A_ID, contentHash: hash }]));
     assert.equal(rubric.extractorModel, "recorded-model");
-    assert.equal(rubric.extractorPromptVersion, "2026-11-rubric-v4");
+    assert.equal(rubric.extractorPromptVersion, RUBRIC_PROMPT_VERSION);
   });
 
   test("the polarity is stored as a cited PROPOSAL; the decision stays empty for the admin", async () => {
@@ -283,7 +292,8 @@ describe("rubric extraction: a web-page source", () => {
     assert.equal(run.runId, result.runId);
     assert.equal(run.status, "succeeded");
     assert.equal(run.version, 1);
-    assert.deepEqual(run.usage, { requests: 1, ...RECORDED_USAGE });
+    // Two calls for the one chunk: criteria, then intake questions and evidence.
+    assert.deepEqual(run.usage, { requests: 2, inputTokens: 2 * RECORDED_USAGE.inputTokens, outputTokens: 2 * RECORDED_USAGE.outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
     assert.equal(run.costUsd, null);
     assert.equal(run.model, "recorded-model");
     assert.equal(run.criteriaAccepted, 6);
@@ -374,7 +384,7 @@ describe("rubric extraction: a PDF source", () => {
     await setUpRouteB(
       answer({
         criteria: [
-          crit({ ref: "ties", title: "Ties, study plan and previous travel", kind: "judgement", stage: "credibility", ruleRef: "G 3", quote: B_QUOTES.tiesRewrapped, concernsIntent: true, probeFactors: ["ties to the home country", "study plan", "previous travel"], requiresInterviewBeforeRefusal: true, citations: [{ field: "requiresInterviewBeforeRefusal", quote: B_QUOTES.interview }] }),
+          crit({ ref: "ties", title: "Ties, study plan and previous travel", kind: "judgement", stage: "credibility", ruleRef: "G 3", quote: B_QUOTES.tiesRewrapped, concernsIntent: true, probeFactors: ["ties to the home country", "study plan", "previous travel"], requiresInterviewBeforeRefusal: true }),
           crit({ ref: "tuition", title: "Tuition for the first 12 months", kind: "objective", ruleRef: "G 5", quote: B_QUOTES.tuition, check: { field: "tuition.monthsCovered", op: "gte", value: 12, unit: "months" } }),
         ],
         intentPolarity: { value: "dual_intent_permitted", quote: B_QUOTES.dual },
@@ -387,7 +397,8 @@ describe("rubric extraction: a PDF source", () => {
     // The quote was re-wrapped by the "model": whitespace-only differences match.
     assert.equal(ties.source.page, 2);
     assert.equal(ties.requiresInterviewBeforeRefusal, true);
-    assert.deepEqual(ties.citations, { requiresInterviewBeforeRefusal: B_QUOTES.interview });
+    // Supporting citations are not asked of the model any more (issue #112).
+    assert.equal(ties.citations, undefined);
     assert.equal(byTitle(rubric, "Tuition for the first 12 months").source.page, 3);
     assert.equal(rubric.intentPolarityProposal?.value, "dual_intent_permitted");
     assert.equal(rubric.intentPolarityProposal?.source?.page, 2);
@@ -489,9 +500,21 @@ describe("rubric extraction: what the code-side validation rejects", () => {
     }
   });
 
-  test("a rule reference the document does not print, and a group it does not name, are rejected", async () => {
-    const ref = await rejectReason(crit({ ref: "x", title: "Costs of the visit", kind: "judgement", ruleRef: "SV 9.9", quote: "There is no set level of funds.", probeFactors: ["income"], requiresInterviewBeforeRefusal: false }));
-    assert.deepEqual(ref.reasons, { rule_ref_not_in_source: 1 });
+  test("a rule reference the document does not print is dropped and the criterion kept; a group it does not name is rejected", async () => {
+    // The reference is never trusted from the model (issue #112): a reference
+    // that is not printed with the quote is removed, the criterion stays
+    // because its quote is verbatim, and the reviewer is told how many.
+    h.state.knownVisaTypes.add(`${ROUTE_A.countryCode}/${ROUTE_A.visaTypeId}`);
+    await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: A_TEXT });
+    await recordAnswers(h.provider, SOURCE_A_ID, [
+      answer({ criteria: [crit({ ref: "x", title: "Costs of the visit", kind: "judgement", ruleRef: "SV 9.9", quote: "There is no set level of funds.", probeFactors: ["income"], requiresInterviewBeforeRefusal: false })] }),
+    ]);
+    const kept = await runA(h);
+    assert.equal(kept.result.status, "succeeded");
+    const rubric = versionDoc(KEY_A, 1) as VisaRubric;
+    assert.equal(rubric.criteria[0].ruleRef, undefined);
+    assert.ok(rubric.flags.some((f) => f.code === "rule_ref_removed"));
+
     resetStore();
     resetBucket();
     h = makeHarness();
@@ -500,13 +523,19 @@ describe("rubric extraction: what the code-side validation rejects", () => {
   });
 
   test("a supporting citation that is not in the source rejects the criterion", async () => {
-    const { reasons } = await rejectReason(crit({ ref: "x", title: "Minimum funds", kind: "objective", quote: "There is no set level of funds.", check: { field: "funds.balance", op: "gte", value: 5000, unit: null }, citations: [{ field: "check.value", quote: "Applicants should hold at least 5000 in savings." }] }));
-    assert.deepEqual(reasons, { citation_not_found: 1 });
+    // The model is no longer asked for citations, so this is checked on the
+    // validator itself, which still refuses one that is not verbatim.
+    const doc = snapshotOf(SOURCE_A_ID, A_TEXT);
+    const index = new SnapshotQuoteIndex(doc);
+    const base = { sourceId: doc.sourceId, url: doc.url, contentHash: doc.contentHash, retrievedAt: doc.fetchedAt };
+    const bad = crit({ ref: "x", title: "Minimum funds", kind: "objective", quote: "There is no set level of funds.", check: { field: "funds.balance", op: "gte", value: 5000, unit: null }, citations: [{ field: "check.value", quote: "Applicants should hold at least 5000 in savings." }] });
+    const out = assessChunkOutput(answer({ criteria: [bad] }), { sourceId: doc.sourceId, chunkIndex: 0 }, index, base, DEFAULT_SEVERITY_LEVELS);
+    assert.equal(out.criteria.length, 0);
+    assert.deepEqual(out.discards.map((d) => d.reason), ["citation_not_found"]);
   });
 
-  test("kind boundaries: a judgement with a check, an objective without one, a bar without a group", async () => {
+  test("kind boundaries: an objective without a check and a bar without a group are rejected; a judgement's check is stripped", async () => {
     const cases = [
-      crit({ ref: "x", title: "Costs with a check", kind: "judgement", quote: "There is no set level of funds.", probeFactors: ["income"], requiresInterviewBeforeRefusal: false, check: { field: "funds.balance", op: "present", value: null, unit: null } }),
       crit({ ref: "x", title: "Objective, no check", kind: "objective", quote: "There is no set level of funds." }),
       crit({ ref: "x", title: "Bar, no group", kind: "mandatory_bar", quote: body(A_LINES.bar) }),
       crit({ ref: "x", title: "Judgement, no factors", kind: "judgement", quote: "There is no set level of funds.", requiresInterviewBeforeRefusal: false }),
@@ -518,6 +547,16 @@ describe("rubric extraction: what the code-side validation rejects", () => {
       const { reasons } = await rejectReason(bad);
       assert.deepEqual(reasons, { invalid_shape: 1 }, bad.title);
     }
+    // A judgement criterion never carries a check: the model's is dropped,
+    // the criterion is kept, and the reviewer is told.
+    resetStore();
+    resetBucket();
+    h = makeHarness();
+    await setUpRouteA(h, answer({ criteria: [crit({ ref: "x", title: "Costs with a check", kind: "judgement", quote: "There is no set level of funds.", probeFactors: ["income"], requiresInterviewBeforeRefusal: false, check: { field: "funds.balance", op: "present", value: null, unit: null } })] }));
+    await runA(h);
+    const rubric = versionDoc(KEY_A, 1) as VisaRubric;
+    assert.equal(rubric.criteria[0].check, undefined);
+    assert.ok(rubric.flags.some((f) => f.code === "judgement_check_stripped"));
   });
 
   test("a quote drawn from a different source document in the same batch is rejected", async () => {
@@ -869,7 +908,8 @@ describe("rubric extraction: stale routes", () => {
     // A change event for route A's source while its hash is the same: free.
     const same = await quiet(() => h.service.onGuidanceChanged({ sourceId: SOURCE_A_ID }));
     assert.deepEqual(same.result.map((r) => r.status), ["unchanged"]);
-    assert.equal(h.provider.requests.length, 1);
+    // The first run's two calls; the unchanged re-check made none.
+    assert.equal(h.provider.requests.length, 2);
   });
 
   test("a dry run plans the chunks, calls no model and writes nothing", async () => {
@@ -948,7 +988,8 @@ describe("rubric extraction: cost guards", () => {
       return original(request);
     };
     const { result } = await runA(h);
-    assert.deepEqual(seen.map((r) => [r.status, r.reachedModel, r.runId]), [["started", true, result.runId]]);
+    // Both calls (criteria, then intake) see only the `started` record.
+    assert.deepEqual(seen.map((r) => [r.status, r.reachedModel, r.runId]), [["started", true, result.runId], ["started", true, result.runId]]);
     assert.deepEqual(runDocs().map((r) => [r.status, r.reachedModel, r.runId]), [["succeeded", true, result.runId]]);
   });
 
@@ -971,7 +1012,7 @@ describe("rubric extraction: cost guards", () => {
     const second = await runA(h, { force: true });
     assert.equal(second.result.status, "skipped");
     assert.equal(second.result.reasonCode, "daily_cap_reached");
-    assert.equal(h.provider.requests.length, 1);
+    assert.equal(h.provider.requests.length, 2);
     // The next UTC day it runs again.
     h.state.nowMs = T0 + 24 * 3_600_000;
     assert.equal((await runA(h, { force: true })).result.status, "succeeded");
@@ -1015,7 +1056,7 @@ describe("rubric extraction: provider failures never produce a version", () => {
     const { result } = await runA(h);
     assert.equal(result.status, "failed");
     assert.equal(result.reasonCode, "provider_error");
-    assert.match(result.error as string, /no recording for request/);
+    assert.match(result.error as string, /no recording for the criteria call/);
     assert.deepEqual(versionPaths(), []);
   });
 });
