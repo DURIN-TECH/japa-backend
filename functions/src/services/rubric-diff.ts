@@ -107,6 +107,10 @@ export interface RubricDiff {
   adminSet: {
     outcomeStatistics: AdminSetChange<NonNullable<VisaRubric["outcomeStatistics"]>>;
     evidenceHelpsCriterionIds: AdminSetChange<string[]>;
+    // (#161) the criteria the reviewer excluded; the baseline's own list is
+    // `before`. Order of ids is not significant to a reader but is to the
+    // comparison, and the lists are written in the order the admin sent.
+    excludedCriterionIds: AdminSetChange<string[]>;
   };
 }
 
@@ -192,18 +196,22 @@ function pairByRuleRef(removed: AssessmentCriterion[], added: AssessmentCriterio
 
 /** The parts of a rubric version the diff reads. */
 export type DiffableRubric = Pick<VisaRubric, "version" | "criteria" | "intentPolarity" | "intentPolarityProposal"> &
-  Partial<Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds">>;
+  Partial<Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds" | "excludedCriterionIds">>;
 
 /** Compare one admin-set field of two versions (stable JSON, so key order is ignored). */
 function adminSetChange<T>(before: T | undefined, after: T | undefined): AdminSetChange<T> {
   return { before: before ?? null, after: after ?? null, changed: stableJson(before ?? null) !== stableJson(after ?? null) };
 }
 
+/** A copy of an id list in a stable order (undefined stays undefined), so only a real change in the SET reads as changed. */
+const sortedIds = (ids: string[] | undefined): string[] | undefined => (ids ? [...ids].sort() : undefined);
+
 /** Both admin-set fields. A missing baseline compares against nothing. */
 function adminSetDiff(current: DiffableRubric, baseline: DiffableRubric | null): RubricDiff["adminSet"] {
   return {
     outcomeStatistics: adminSetChange(baseline?.outcomeStatistics, current.outcomeStatistics),
     evidenceHelpsCriterionIds: adminSetChange(baseline?.evidenceHelpsCriterionIds, current.evidenceHelpsCriterionIds),
+    excludedCriterionIds: adminSetChange(sortedIds(baseline?.excludedCriterionIds), sortedIds(current.excludedCriterionIds)),
   };
 }
 

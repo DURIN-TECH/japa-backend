@@ -1,6 +1,7 @@
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../utils/firebase";
 import type { RubricExtractionRun, RubricHead, VisaRubric } from "../../types/rubric";
+import { applyExclusions } from "./rubric-exclusions";
 
 // ============================================
 // RUBRIC — FIRESTORE STORE (issue #40)
@@ -84,6 +85,13 @@ export class RubricStore {
    * Null when the route has no rubric, when nothing has been approved, and
    * when the version the head points at is not itself marked approved.
    * A pending or rejected version is never returned.
+   *
+   * The rubric comes back WITHOUT the criteria the reviewer excluded, and
+   * without the intake questions and evidence items only those criteria
+   * justified (`applyExclusions`, #161). Its `version` is unchanged: the
+   * exclusions were decided in the approval that made this version current,
+   * so a new set of exclusions is always a new version number, which is what
+   * the assessments' staleness check keys on.
    */
   async getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null> {
     const routeKey = rubricRouteKey(countryCode, visaTypeId);
@@ -93,12 +101,20 @@ export class RubricStore {
     if (!snap.exists) return null;
     const rubric = snap.data() as VisaRubric;
     // Belt and braces: trust the version's own status, not just the pointer.
-    return rubric.reviewStatus === "approved" ? rubric : null;
+    if (rubric.reviewStatus !== "approved") return null;
+    // THE one read-side filter (#161): what the reviewer excluded at approval
+    // never reaches a consumer (intake, checklist, assessment, chat, upload
+    // check, refusal letter, templates), whichever of them is asking.
+    return applyExclusions(rubric);
   }
 
   /**
-   * One version, whatever its review status. ADMIN REVIEW ONLY (#125): never
-   * return this from a route a client can call.
+   * One version, whatever its review status, UNFILTERED: every criterion the
+   * extractor found, plus the stored exclusion fields, so a reviewer always
+   * sees everything. ADMIN REVIEW ONLY (#125): never return this from a route
+   * a client can call. A background reader that needs a version's EFFECTIVE
+   * content must check `reviewStatus === "approved"` and pass it through
+   * `applyExclusions` (the bulk re-assessment and rule-change services do).
    */
   async getVersionForReview(routeKey: string, version: number): Promise<VisaRubric | null> {
     const snap = await subcollections.rubricVersions(routeKey).doc(String(version)).get();
@@ -129,7 +145,11 @@ export class RubricStore {
       draft.reviewedAt !== null ||
       draft.rejectReason !== null ||
       draft.supersededAt !== null ||
-      draft.revision !== 0
+      draft.revision !== 0 ||
+      // Exclusions are an admin decision made at approval (#161): extraction
+      // can never hand over a rubric that arrives with some already made.
+      draft.excludedCriterionIds !== undefined ||
+      draft.exclusionNote !== undefined
     ) {
       throw new RubricStoreError("not_pending", "extraction may only write a pending_review rubric with untouched review fields");
     }

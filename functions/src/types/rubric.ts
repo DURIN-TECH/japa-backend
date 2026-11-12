@@ -519,6 +519,15 @@ export interface VisaRubric {
   // when the nationality's published rate is below the all-nationality rate.
   // Never model-extracted, never chosen per nationality. Absent = no areas.
   evidenceHelpsCriterionIds?: string[];
+  // Admin-set at approval (#161): criteria the reviewer EXCLUDED from the
+  // served rubric. The extracted `criteria` list is never edited; the read
+  // side (`applyExclusions`, called by `rubricStore.getApprovedRubric`) leaves
+  // these out, together with the intake questions and evidence items that
+  // only they justified. Never extracted. A mandatory bar can never be listed.
+  // Absent = nothing excluded.
+  excludedCriterionIds?: string[];
+  // Admin-set (#161): the reviewer's one note for the exclusions above.
+  exclusionNote?: string;
 
   // ---- provenance (immutable) ----
   sourceSnapshots: RubricSourceSnapshot[];
@@ -556,6 +565,8 @@ export const RUBRIC_REVIEW_FIELDS = [
   "supersededAt",
   "outcomeStatistics",
   "evidenceHelpsCriterionIds",
+  "excludedCriterionIds",
+  "exclusionNote",
 ] as const;
 
 /**

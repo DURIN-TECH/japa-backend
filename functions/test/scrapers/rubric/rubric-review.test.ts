@@ -198,6 +198,7 @@ describe("rubric review: admin only", () => {
     ["GET", "", undefined],
     ["GET", `/${ID_A1}`, undefined],
     ["PATCH", `/${ID_A1}/review`, approveBody(0)],
+    ["POST", `/${ID_A1}/exclusion-preview`, { excludedCriterionIds: [] }],
   ];
 
   test("no token: 401 on all three", async () => {
@@ -276,13 +277,14 @@ describe("rubric review: admin only", () => {
     assert.equal(out.body.data.total, 1);
   });
 
-  test("exactly three routes exist, each behind verifyAuth, the admin guard and verifyAdmin: no partial approval endpoint", () => {
+  test("exactly four routes exist (one read-only preview), each behind verifyAuth, the admin guard and verifyAdmin: no partial approval endpoint", () => {
     const routes = (adminRubricRoutes as any).stack.filter((l: any) => l.route).map((l: any) => ({
       path: l.route.path,
       methods: Object.keys(l.route.methods),
       chain: l.route.stack.slice(0, 3).map((s: any) => s.handle),
     }));
-    assert.deepEqual(routes.map((r: any) => `${r.methods.join(",")} ${r.path}`), ["get /", "get /:id", "patch /:id/review"]);
+    // #161 added one READ-ONLY route (the exclusion preview). Still no route that approves part of a version.
+    assert.deepEqual(routes.map((r: any) => `${r.methods.join(",")} ${r.path}`), ["get /", "get /:id", "post /:id/exclusion-preview", "patch /:id/review"]);
     for (const r of routes) assert.deepEqual(r.chain, [verifyAuth, requireRubricAdmin, verifyAdmin], r.path);
   });
 });
@@ -1211,6 +1213,10 @@ describe("rubric review: audit and the approval seam", () => {
         // decision; null when the approval sent none.
         outcomeStatistics: null,
         evidenceHelpsCriterionIds: null,
+        excludedCriterionIds: null,
+        exclusionNote: null,
+        exclusionCount: 0,
+        confirmedPrimaryExclusions: [],
       }
     );
     assert.equal(second.action, "reject");
@@ -1348,6 +1354,229 @@ describe("rubric review: nothing unapproved is served", () => {
     const rules = fs.readFileSync(path.join(src, "..", "..", "firestore.rules"), "utf8");
     assert.ok(rules.includes("rubricReviewHistory"), "documented in the backend-only block");
     assert.doesNotMatch(rules, /^\s*match\s+[^\n]*(rubricReviewHistory|rubricVersions|visaRubrics)/m);
+  });
+});
+
+// ============================================
+// Criterion exclusions (issue #161)
+// ============================================
+
+describe("rubric review: excluding criteria at approval (#161)", () => {
+  /** Stored criteria of route A v1 by title prefix. */
+  const critId = (title: string) => (versionDoc(KEY_A, 1).criteria as any[]).find((c) => c.title.startsWith(title)).criterionId as string;
+  /** Give route A's source a role in the guidance registry. */
+  const setRole = (role: string | undefined) => {
+    const cur = store.get(`guidanceSources/${SOURCE_A_ID}`) as any;
+    store.set(`guidanceSources/${SOURCE_A_ID}`, { ...cur, ...(role ? { role } : {}) });
+  };
+
+  test("approve with exclusions writes ONLY review fields, and the audit entry records ids, note, count and reviewer", async () => {
+    await seedA();
+    setRole("secondary");
+    const before = contentOf(versionDoc(KEY_A, 1));
+    const age = critId("Aged");
+    const held = critId("Funds");
+    const res = await decide(ID_A1, approveBody(0, { excludedCriterionIds: [age, held], exclusionNote: "  Specialist guidance only  " }));
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    const stored = versionDoc(KEY_A, 1);
+    assert.deepEqual(stored.excludedCriterionIds, [age, held]);
+    assert.equal(stored.exclusionNote, "Specialist guidance only", "trimmed");
+    assert.equal(contentOf(stored), before, "extracted content is untouched");
+    assert.equal(stored.criteria.length, 4, "the stored criteria list still has everything");
+    // Every write to the version doc went through the review-field whitelist.
+    for (const w of writes.filter((x) => x.op === "update" && x.path === `visaRubrics/${KEY_A}/rubricVersions/1`)) {
+      for (const k of Object.keys(w.data)) assert.ok((RUBRIC_REVIEW_FIELDS as readonly string[]).includes(k), `key ${k}`);
+    }
+    const [audit] = auditEntries();
+    assert.deepEqual(audit.excludedCriterionIds, [age, held]);
+    assert.equal(audit.exclusionNote, "Specialist guidance only");
+    assert.equal(audit.exclusionCount, 2);
+    assert.equal(audit.by, "admin-uid");
+    assert.ok(audit.at, "time recorded");
+  });
+
+  test("an approval without exclusions stores none and audits a zero count", async () => {
+    await seedA();
+    assert.equal((await decide(ID_A1, approveBody(0))).status, 200);
+    assert.equal("excludedCriterionIds" in versionDoc(KEY_A, 1), false);
+    const [audit] = auditEntries();
+    assert.equal(audit.excludedCriterionIds, null);
+    assert.equal(audit.exclusionCount, 0);
+  });
+
+  test("a primary-source exclusion needs confirmPrimaryExclusions: 409 listing the ids, nothing written; confirmed, it goes through", async () => {
+    await seedA();
+    setRole("primary");
+    const age = critId("Aged");
+    const res = await decide(ID_A1, approveBody(0, { excludedCriterionIds: [age] }));
+    assert.equal(res.status, 409);
+    assert.equal(res.body.error, "PRIMARY_EXCLUSION_UNCONFIRMED");
+    assert.ok(JSON.stringify(res.body).includes(age), "the ids are listed");
+    assert.equal(versionDoc(KEY_A, 1).reviewStatus, "pending_review");
+    assert.equal(auditEntries().length, 0);
+    const ok = await decide(ID_A1, approveBody(0, { excludedCriterionIds: [age], confirmPrimaryExclusions: true }));
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    assert.deepEqual(auditEntries()[0].confirmedPrimaryExclusions, [age]);
+  });
+
+  test("the confirmation rule fails closed: a source with no role, an unknown role or no registry entry counts as primary; route_guidance and secondary do not", async () => {
+    const age = critId;
+    for (const [role, needs] of [[undefined, true], ["bogus", true], ["primary", true], ["route_guidance", false], ["secondary", false]] as const) {
+      resetStore();
+      resetBucket();
+      await seedA();
+      setRole(role);
+      const res = await decide(ID_A1, approveBody(0, { excludedCriterionIds: [age("Aged")] }));
+      assert.equal(res.status, needs ? 409 : 200, `role ${role}: ${JSON.stringify(res.body)}`);
+    }
+  });
+
+  test("bad exclusions are 400 and write nothing: unknown id, a mandatory bar, a duplicate, a non-list, a note with no ids", async () => {
+    await seedA();
+    setRole("secondary");
+    const age = critId("Aged");
+    const cases: [string, Record<string, unknown>][] = [
+      ["unknown id", { excludedCriterionIds: ["not-a-criterion"] }],
+      ["mandatory bar", { excludedCriterionIds: [critId("Nationals")] }],
+      ["duplicate", { excludedCriterionIds: [age, age] }],
+      ["not a list", { excludedCriterionIds: "all" }],
+      ["note without ids", { exclusionNote: "why" }],
+      ["note too long", { excludedCriterionIds: [age], exclusionNote: "x".repeat(1001) }],
+      ["confirm not boolean", { excludedCriterionIds: [age], confirmPrimaryExclusions: "yes" }],
+    ];
+    for (const [name, extra] of cases) {
+      const res = await decide(ID_A1, approveBody(0, extra));
+      assert.equal(res.status, 400, `${name}: ${JSON.stringify(res.body)}`);
+      assert.equal(res.body.error, "VALIDATION_ERROR", name);
+    }
+    assert.equal(versionDoc(KEY_A, 1).reviewStatus, "pending_review");
+    assert.equal(auditEntries().length, 0);
+  });
+
+  test("a reject that carries exclusions is a 400, like the other admin-set fields", async () => {
+    await seedA();
+    for (const extra of [{ excludedCriterionIds: [critId("Aged")] }, { exclusionNote: "x" }, { confirmPrimaryExclusions: true }]) {
+      const res = await decide(ID_A1, { action: "reject", revision: 0, reason: "not good enough, re-extract", ...extra });
+      assert.equal(res.status, 400);
+    }
+    assert.equal(versionDoc(KEY_A, 1).reviewStatus, "pending_review");
+  });
+
+  test("getApprovedRubric returns the FILTERED rubric (questions and evidence trimmed); getVersionForReview still returns everything", async () => {
+    await seedA();
+    setRole("secondary");
+    const age = critId("Aged");
+    const leave = critId("Will leave");
+    // Add an intake question and an evidence item that only the age rule justifies, and one the leave rule keeps.
+    const doc = versionDoc(KEY_A, 1);
+    const cite = doc.criteria[0].source;
+    store.set(`visaRubrics/${KEY_A}/rubricVersions/1`, {
+      ...doc,
+      intakeQuestions: [
+        { id: "dob", label: "Date of birth", answerType: "date", required: true, criterionIds: [age] },
+        { id: "plans", label: "Plans", answerType: "text", required: true, criterionIds: [age, leave] },
+      ],
+      evidenceItems: [{ key: "passport", title: "Passport", party: "applicant", criterionIds: [age], source: cite }],
+    });
+    assert.equal((await decide(ID_A1, approveBody(0, { excludedCriterionIds: [age] }))).status, 200);
+
+    const served = await rubricStore.getApprovedRubric(ROUTE_A.countryCode, ROUTE_A.visaTypeId);
+    assert.ok(served);
+    assert.ok(!served.criteria.some((c) => c.criterionId === age));
+    assert.deepEqual(served.intakeQuestions.map((q) => q.id), ["plans"]);
+    assert.deepEqual(served.intakeQuestions[0].criterionIds, [leave]);
+    assert.equal(served.evidenceItems.length, 0);
+    assert.equal(served.version, 1, "same version number: staleness keys on it");
+
+    const review = await rubricStore.getVersionForReview(KEY_A, 1);
+    assert.ok(review!.criteria.some((c) => c.criterionId === age), "the reviewer still sees everything");
+    assert.deepEqual(review!.excludedCriterionIds, [age]);
+    assert.equal(review!.intakeQuestions.length, 2);
+  });
+
+  test("a new approval with exclusions is a NEW version: the head moves to it, which is what rules_updated and the bulk re-assessment key on", async () => {
+    await seedA();
+    assert.equal((await decide(ID_A1, approveBody(0))).status, 200);
+    await seedA2();
+    const v2 = versionDoc(KEY_A, 2);
+    setRole("secondary");
+    const res = await decide(ID_A2, approveBody(v2.revision, { excludedCriterionIds: [v2.criteria[0].criterionId], intentPolarity: "dual_intent_permitted" }));
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(headDoc(KEY_A).approvedVersion, 2);
+    assert.equal((await rubricStore.getApprovedRubric(ROUTE_A.countryCode, ROUTE_A.visaTypeId))!.version, 2);
+  });
+
+  test("detail: criteria carry primarySource and excluded; unfiltered lists; decided version shows stored exclusions and note", async () => {
+    await seedA();
+    setRole("primary");
+    const age = critId("Aged");
+    let d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    assert.ok(d.criteria.every((c: any) => c.primarySource === true && c.excluded === false));
+    assert.equal(d.excludedCriterionIds, null);
+    assert.equal(d.exclusionPreview, null);
+    setRole("secondary");
+    d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    assert.ok(d.criteria.every((c: any) => c.primarySource === false));
+    assert.equal((await decide(ID_A1, approveBody(0, { excludedCriterionIds: [age], exclusionNote: "n" }))).status, 200);
+    d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    assert.equal(d.criteria.length, 4, "unfiltered");
+    assert.equal(d.criteria.find((c: any) => c.criterionId === age).excluded, true);
+    assert.deepEqual(d.excludedCriterionIds, [age]);
+    assert.equal(d.exclusionNote, "n");
+    assert.equal(d.exclusionPreview.criteriaExcluded, 1);
+  });
+
+  test("detail criteria carry applicability and its condition, so the screen can filter by scope", async () => {
+    await seedA();
+    const doc = versionDoc(KEY_A, 1);
+    store.set(`visaRubrics/${KEY_A}/rubricVersions/1`, {
+      ...doc,
+      criteria: doc.criteria.map((c: any, i: number) => (i === 0 ? { ...c, applicability: "conditional", applicabilityCondition: "when sponsored" } : c)),
+    });
+    const d = (await api("GET", `/${ID_A1}`, "t-admin")).body.data;
+    assert.equal(d.criteria[0].applicability, "conditional");
+    assert.equal(d.criteria[0].applicabilityCondition, "when sponsored");
+  });
+
+  test("preview: GET ?previewExcluded= and POST /exclusion-preview agree, validate the ids, and write nothing", async () => {
+    await seedA();
+    setRole("primary");
+    const age = critId("Aged");
+    const held = critId("Funds");
+    const doc = versionDoc(KEY_A, 1);
+    store.set(`visaRubrics/${KEY_A}/rubricVersions/1`, { ...doc, intakeQuestions: [{ id: "dob", label: "DOB", answerType: "date", required: true, criterionIds: [age] }], evidenceItems: [] });
+    const writesBefore = writes.length;
+    const get = await api("GET", `/${ID_A1}?previewExcluded=${encodeURIComponent(`${age},${held}`)}`, "t-admin");
+    assert.equal(get.status, 200);
+    assert.deepEqual(get.body.data.exclusionPreview, {
+      criteriaKept: 2, criteriaExcluded: 2, intakeQuestionsKept: 0, intakeQuestionsDropped: 1, evidenceItemsKept: 0, evidenceItemsDropped: 0, droppedIntakeQuestionIds: ["dob"], droppedEvidenceItemKeys: [],
+    });
+    // The proposed set shows up in the diff as `after`.
+    assert.deepEqual(get.body.data.diff.adminSet.excludedCriterionIds, { before: null, after: [age, held].sort(), changed: true });
+    const post = await api("POST", `/${ID_A1}/exclusion-preview`, "t-admin", { excludedCriterionIds: [age, held] });
+    assert.equal(post.status, 200);
+    assert.deepEqual(post.body.data.exclusionPreview, get.body.data.exclusionPreview);
+    assert.deepEqual(post.body.data.primaryExclusionIds.sort(), [age, held].sort(), "primary source: both need confirmation");
+    assert.equal(writes.length, writesBefore, "read-only");
+    // Validation, as for the approve body.
+    for (const ids of ["nope", critId("Nationals"), `${age},${age}`]) assert.equal((await api("GET", `/${ID_A1}?previewExcluded=${encodeURIComponent(ids)}`, "t-admin")).status, 400, ids);
+    assert.equal((await api("POST", `/${ID_A1}/exclusion-preview`, "t-admin", { excludedCriterionIds: ["nope"] })).status, 400);
+    assert.equal((await api("POST", `/${ID_A1}/exclusion-preview`, "t-admin", { excludedCriterionIds: [], extra: 1 })).status, 400);
+    assert.equal((await api("POST", `/${rubricVersionId(KEY_A, 9)}/exclusion-preview`, "t-admin", { excludedCriterionIds: [] })).status, 404);
+  });
+
+  test("the diff against the serving version shows the exclusions as an admin-set change", async () => {
+    await seedA();
+    setRole("secondary");
+    assert.equal((await decide(ID_A1, approveBody(0))).status, 200);
+    await seedA2();
+    // Re-seeding the source rewrote its registry entry (no role): set it again.
+    setRole("secondary");
+    const v2 = versionDoc(KEY_A, 2);
+    const id = v2.criteria[0].criterionId;
+    assert.equal((await decide(ID_A2, approveBody(v2.revision, { excludedCriterionIds: [id], intentPolarity: "dual_intent_permitted" }))).status, 200);
+    const d = (await api("GET", `/${ID_A2}`, "t-admin")).body.data;
+    assert.deepEqual(d.diff.adminSet.excludedCriterionIds, { before: null, after: [id], changed: true });
   });
 });
 

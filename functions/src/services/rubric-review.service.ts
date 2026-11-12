@@ -2,7 +2,8 @@ import { Timestamp, type DocumentData, type Transaction, type UpdateData } from 
 import { collectionGroups, collections, db, subcollections } from "../utils/firebase";
 // The scrapers module is reached through its public entry point only (the
 // ESLint boundary rule of issue #91 refuses deep imports from here).
-import { SnapshotQuoteIndex, guidanceSnapshotStore, rubricStore, validateVisaRubric } from "../scrapers";
+import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA, SnapshotQuoteIndex, guidanceSnapshotStore, previewExclusions, rubricStore, validateVisaRubric } from "../scrapers";
+import type { ExclusionPreview } from "../scrapers";
 import type { GuidanceSnapshotContent } from "../scrapers/types";
 import type { RubricIssue } from "../scrapers";
 import {
@@ -210,7 +211,8 @@ export type RubricReviewErrorCode =
   | "SOURCE_CHANGED" // 409: a source moved between the check and the write
   | "RUBRIC_INVALID" // 409: the structural validator refuses the rubric
   | "RUBRIC_MALFORMED" // 422: the stored document is not a rubric (no criteria list)
-  | "FLAGS_NOT_ACKNOWLEDGED"; // 409: a blocking flag was not acknowledged
+  | "FLAGS_NOT_ACKNOWLEDGED" // 409: a blocking flag was not acknowledged
+  | "PRIMARY_EXCLUSION_UNCONFIRMED"; // 409: primary-source criteria excluded without confirmPrimaryExclusions (#161)
 
 /** A refusal with its HTTP status. The controller sends it as it is. */
 export class RubricReviewError extends Error {
@@ -350,11 +352,19 @@ export type RubricDecisionInput =
       // left as stored (absent) when not. Never read from extraction output.
       outcomeStatistics?: OutcomeStatisticsMapping;
       evidenceHelpsCriterionIds?: string[];
+      // ADMIN-SET (#161), optional: criteria to leave out of the served
+      // rubric, the reviewer's one note for them, and the explicit
+      // confirmation needed when any of them comes from a primary source.
+      excludedCriterionIds?: string[];
+      exclusionNote?: string;
+      confirmPrimaryExclusions?: boolean;
     }
   | { action: "reject"; revision: number; reason: string };
 
 /** Body keys each action accepts. Anything else is refused, not ignored. */
-const APPROVE_KEYS = ["action", "revision", "intentPolarity", "acknowledgedFlags", "reason", "outcomeStatistics", "evidenceHelpsCriterionIds"];
+const APPROVE_KEYS = ["action", "revision", "intentPolarity", "acknowledgedFlags", "reason", "outcomeStatistics", "evidenceHelpsCriterionIds", "excludedCriterionIds", "exclusionNote", "confirmPrimaryExclusions"];
+// A reject accepts none of the admin-set fields (REJECT_KEYS is strict), so
+// sending exclusions with a reject is a 400 like the other admin-set fields.
 const REJECT_KEYS = ["action", "revision", "reason"];
 
 /**
@@ -404,6 +414,20 @@ export function parseRubricDecision(body: unknown): RubricDecisionInput {
   const out: RubricDecisionInput = { action: "approve", revision: b.revision, intentPolarity: b.intentPolarity as IntentPolarity, acknowledgedFlags, reason: reason || null };
   if (b.outcomeStatistics !== undefined) out.outcomeStatistics = parseOutcomeStatistics(b.outcomeStatistics);
   if (b.evidenceHelpsCriterionIds !== undefined) out.evidenceHelpsCriterionIds = parseEvidenceHelps(b.evidenceHelpsCriterionIds);
+  // ---- exclusions (#161) ----
+  if (b.excludedCriterionIds !== undefined) out.excludedCriterionIds = parseExcludedIds(b.excludedCriterionIds, "excludedCriterionIds");
+  if (b.exclusionNote !== undefined && b.exclusionNote !== null) {
+    if (typeof b.exclusionNote !== "string") throw invalid("exclusionNote must be a string");
+    const note = b.exclusionNote.trim();
+    if (note.length > EXCLUSION_NOTE_MAX) throw invalid(`exclusionNote must be at most ${EXCLUSION_NOTE_MAX} characters`);
+    // A note with nothing excluded would describe nothing: refuse it.
+    if (note && !(out.excludedCriterionIds && out.excludedCriterionIds.length > 0)) throw invalid("exclusionNote needs excludedCriterionIds: there is nothing to explain");
+    if (note) out.exclusionNote = note;
+  }
+  if (b.confirmPrimaryExclusions !== undefined) {
+    if (typeof b.confirmPrimaryExclusions !== "boolean") throw invalid("confirmPrimaryExclusions must be true or false");
+    out.confirmPrimaryExclusions = b.confirmPrimaryExclusions;
+  }
   return out;
 }
 
@@ -457,6 +481,49 @@ function parseEvidenceHelps(raw: unknown): string[] {
   return [...new Set((raw as string[]).map((v) => v.trim()))];
 }
 
+/**
+ * Validate a list of criterion ids to exclude (#161): strings, no blanks, no
+ * duplicates (a repeated id is a client bug, so it is refused rather than
+ * merged), at most MAX_EXCLUDED_CRITERIA. Whether each id is a criterion of
+ * the version, and whether it is a mandatory bar, is checked against the
+ * version itself (`checkExclusionIds`). Used for the approve body, the
+ * preview query and the preview body.
+ * @throws RubricReviewError (400 VALIDATION_ERROR)
+ */
+export function parseExcludedIds(raw: unknown, field: string): string[] {
+  if (!Array.isArray(raw) || raw.length > MAX_EXCLUDED_CRITERIA || raw.some((v) => typeof v !== "string" || !v.trim() || v.length > 300)) {
+    throw invalid(`${field} must be a list of at most ${MAX_EXCLUDED_CRITERIA} criterion ids`);
+  }
+  const ids = (raw as string[]).map((v) => v.trim());
+  if (new Set(ids).size !== ids.length) throw invalid(`${field} names a criterion more than once`);
+  return ids;
+}
+
+/**
+ * Refuse, with a 400, ids that are not criteria of `rubric` or that are
+ * mandatory bars. The validator checks the same things on the stored result
+ * (RUBRIC_INVALID); this gives the reviewer a precise message first.
+ */
+function checkExclusionIds(rubric: VisaRubric, ids: readonly string[]): void {
+  const kinds = new Map((rubric.criteria ?? []).map((c) => [c.criterionId, c.kind]));
+  const unknownIds = ids.filter((id) => !kinds.has(id));
+  if (unknownIds.length > 0) throw invalid(`excludedCriterionIds names criteria this version does not have: ${unknownIds.slice(0, 20).join(", ")}`);
+  const bars = ids.filter((id) => kinds.get(id) === "mandatory_bar");
+  if (bars.length > 0) throw invalid(`mandatory_bar_excluded: a mandatory bar can never be excluded (${bars.join(", ")})`);
+}
+
+/**
+ * Does excluding a criterion of a source with this stored registry entry need
+ * the reviewer's explicit confirmation? Only `route_guidance` and `secondary`
+ * sources do not. Everything else is treated as PRIMARY: a primary role, but
+ * also a source that is missing, unreadable, or has no / an unknown role.
+ * Fail closed: the cost of a wrong guess is one extra confirmation click.
+ */
+export function sourceNeedsExclusionConfirmation(source: { exists: boolean; role?: unknown }): boolean {
+  if (!source.exists) return true;
+  return source.role !== "route_guidance" && source.role !== "secondary";
+}
+
 // ============================================
 // Response shapes
 // ============================================
@@ -494,6 +561,11 @@ export interface ReviewCriterion extends AssessmentCriterion {
   citationStatus: CitationStatus;
   // Null when no stored snapshot holding the quote could be read.
   quoteContext: QuoteContext | null;
+  // (#161) True when excluding this criterion needs `confirmPrimaryExclusions`
+  // (its source is a primary one, or its role cannot be established).
+  primarySource: boolean;
+  // (#161) True when the stored version already excludes this criterion.
+  excluded: boolean;
 }
 
 /** An evidence item as the review API returns it, with its citation check. */
@@ -555,6 +627,14 @@ export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intent
   outcomeStatistics: VisaRubric["outcomeStatistics"] | null;
   // Admin-set (#116): criteria for which extra evidence helps; null when unset.
   evidenceHelpsCriterionIds: string[] | null;
+  // Admin-set at approval (#161): what the stored version excludes (null when
+  // nothing was) and the reviewer's note. The lists above are always the FULL
+  // extraction: the reviewer sees everything, exclusions are only marked.
+  excludedCriterionIds: string[] | null;
+  exclusionNote: string | null;
+  // What the PROPOSED exclusion set (query `previewExcluded`) would remove,
+  // or what the stored one did remove; null when there is nothing to count.
+  exclusionPreview: ExclusionPreview | null;
   sourceSnapshots: VisaRubric["sourceSnapshots"];
   extractorModel: string;
   extractorPromptVersion: string;
@@ -648,6 +728,14 @@ export interface RubricReviewAuditEntry {
   // the request did not send them).
   outcomeStatistics?: OutcomeStatisticsMapping | null;
   evidenceHelpsCriterionIds?: string[] | null;
+  // Approve only (#161): the exclusions written with the approval. Null when
+  // none were sent. `exclusionCount` is the length of the list.
+  excludedCriterionIds?: string[] | null;
+  exclusionNote?: string | null;
+  exclusionCount?: number;
+  // Approve only (#161): the primary-source criteria excluded under an explicit
+  // confirmation (empty when none, or none from a primary source).
+  confirmedPrimaryExclusions?: string[];
   // The version serving before this decision.
   previousApprovedVersion: number | null;
   // The version serving after it.
@@ -732,6 +820,9 @@ function toCriterion(c: AssessmentCriterion): AssessmentCriterion {
     ...(c.probeFactors !== undefined ? { probeFactors: c.probeFactors } : {}),
     ...(c.requiresInterviewBeforeRefusal !== undefined ? { requiresInterviewBeforeRefusal: c.requiresInterviewBeforeRefusal } : {}),
     ...(c.concernsIntent !== undefined ? { concernsIntent: c.concernsIntent } : {}),
+    // Scope (#112), returned so the review screen can filter by it (#161).
+    ...(c.applicability !== undefined ? { applicability: c.applicability } : {}),
+    ...(c.applicabilityCondition !== undefined ? { applicabilityCondition: c.applicabilityCondition } : {}),
     ...(c.eligibilityQuestionId !== undefined ? { eligibilityQuestionId: c.eligibilityQuestionId } : {}),
     ...(c.intakeQuestionIds !== undefined ? { intakeQuestionIds: c.intakeQuestionIds } : {}),
     ...(c.citations !== undefined ? { citations: c.citations } : {}),
@@ -802,12 +893,18 @@ interface CitationCheck {
   // the source has none or does not exist). Re-read inside the decision's
   // transaction: a source that moved in between aborts the approval.
   sourceHeads: Map<string, string | null>;
+  // sourceId -> whether excluding its criteria needs confirmation (#161); see
+  // `sourceNeedsExclusionConfirmation`. A source that could not be read is true.
+  sourceNeedsConfirmation: Map<string, boolean>;
 }
 
 /** The admin-set fields an approve body carries (only those that were sent). */
-function adminSetOf(input: RubricDecisionInput): Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds"> {
+function adminSetOf(input: RubricDecisionInput): Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds" | "excludedCriterionIds" | "exclusionNote"> {
   if (input.action !== "approve") return {};
   return {
+    // An empty list is a decision of "exclude nothing": not stored at all.
+    ...(input.excludedCriterionIds && input.excludedCriterionIds.length > 0 ? { excludedCriterionIds: input.excludedCriterionIds } : {}),
+    ...(input.excludedCriterionIds && input.excludedCriterionIds.length > 0 && input.exclusionNote ? { exclusionNote: input.exclusionNote } : {}),
     ...(input.outcomeStatistics ? { outcomeStatistics: input.outcomeStatistics } : {}),
     ...(input.evidenceHelpsCriterionIds ? { evidenceHelpsCriterionIds: input.evidenceHelpsCriterionIds } : {}),
   };
@@ -849,7 +946,7 @@ function structuralErrors(
   rubric: VisaRubric,
   polarity: IntentPolarity,
   knownEligibilityQuestionIds: ReadonlySet<string> | undefined,
-  adminSet: Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds"> = {}
+  adminSet: Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds" | "excludedCriterionIds" | "exclusionNote"> = {}
 ): RubricIssue[] {
   // The admin-set fields of the request, as they would be stored.
   // The validator refuses an "approved" rubric with no reviewer (it is how the
@@ -966,17 +1063,23 @@ export class RubricReviewService {
 
     // ---- where each source stands now ----
     const sourceHeads = new Map<string, string | null>();
+    const sourceNeedsConfirmation = new Map<string, boolean>();
     await Promise.all(
       sourceIds.map(async (sourceId) => {
         let latest: string | null = null;
+        // Unreadable = unknown role = treated as primary (fail closed).
+        let needsConfirmation = true;
         try {
           const snap = await collections.guidanceSources.doc(sourceId).get();
-          const id = snap.exists ? (snap.data() as { latestSnapshotId?: unknown }).latestSnapshotId : null;
+          const data = snap.exists ? (snap.data() as { latestSnapshotId?: unknown; role?: unknown }) : null;
+          const id = data ? data.latestSnapshotId : null;
           latest = typeof id === "string" && id ? id : null;
+          needsConfirmation = sourceNeedsExclusionConfirmation({ exists: snap.exists, role: data?.role });
         } catch (err) {
           console.error(`Rubric review: guidance source ${sourceId} unreadable (${errorClass(err)})`);
         }
         sourceHeads.set(sourceId, latest);
+        sourceNeedsConfirmation.set(sourceId, needsConfirmation);
       })
     );
 
@@ -1021,7 +1124,7 @@ export class RubricReviewService {
     const byCriterion = new Map<string, CitationFinding>();
     await Promise.all(criteria.map(async (c) => void byCriterion.set(c.criterionId, await inspect(c.source))));
     const evidence = await Promise.all(evidenceItems.map((e) => inspect(e?.source)));
-    return { byCriterion, evidence, proposal: proposalSource ? await inspect(proposalSource) : null, sourceHeads };
+    return { byCriterion, evidence, proposal: proposalSource ? await inspect(proposalSource) : null, sourceHeads, sourceNeedsConfirmation };
   }
 
   // ---------- Detail ----------
@@ -1055,7 +1158,7 @@ export class RubricReviewService {
    * One version in full, with its diff, its stale-citation check and what an
    * approval would take. Null when the id names no version.
    */
-  async getVersion(id: string): Promise<RubricVersionDetail | null> {
+  async getVersion(id: string, opts: { previewExcluded?: string[] } = {}): Promise<RubricVersionDetail | null> {
     const parsed = parseRubricVersionId(id);
     if (!parsed) return null;
     const rubric = await rubricStore.getVersionForReview(parsed.routeKey, parsed.version);
@@ -1069,13 +1172,31 @@ export class RubricReviewService {
 
     const evidenceItems = Array.isArray(rubric.evidenceItems) ? rubric.evidenceItems : [];
     // ---- criteria with their citation status ----
+    const storedExcluded = new Set(rubric.excludedCriterionIds ?? []);
     const criteria: ReviewCriterion[] = rubric.criteria.map((c) => {
       const finding = citations.byCriterion.get(c.criterionId) ?? { status: "unverifiable" as const, context: null };
-      return { ...toCriterion(c), staleCitation: finding.status !== "current", citationStatus: finding.status, quoteContext: finding.context };
+      return {
+        ...toCriterion(c),
+        staleCitation: finding.status !== "current",
+        citationStatus: finding.status,
+        quoteContext: finding.context,
+        // (#161) Unknown source = primary: the fail-closed default of the check.
+        primarySource: citations.sourceNeedsConfirmation.get(c.source?.sourceId) ?? true,
+        excluded: storedExcluded.has(c.criterionId),
+      };
     });
 
+    // ---- exclusion preview (#161) ----
+    // A proposed set (validated like the approve body) is counted with the
+    // very function that will apply it; with none proposed, a decided
+    // version's stored set is what is counted.
+    if (opts.previewExcluded) checkExclusionIds(rubric, opts.previewExcluded);
+    const previewIds = opts.previewExcluded ?? rubric.excludedCriterionIds ?? null;
+    const exclusionPreview = previewIds && previewIds.length > 0 ? previewExclusions(rubric, previewIds) : null;
+
     // ---- diff (serialised criteria: the same whitelist as above) ----
-    const raw = diffRubricVersions(rubric, baseline);
+    // With a proposed exclusion set the diff shows it as `after`.
+    const raw = diffRubricVersions(opts.previewExcluded ? { ...rubric, excludedCriterionIds: opts.previewExcluded } : rubric, baseline);
     const diff: RubricVersionDetail["diff"] = {
       baselineVersion: raw.baselineVersion,
       allNew: raw.allNew,
@@ -1142,6 +1263,9 @@ export class RubricReviewService {
       }),
       outcomeStatistics: rubric.outcomeStatistics ?? null,
       evidenceHelpsCriterionIds: rubric.evidenceHelpsCriterionIds ?? null,
+      excludedCriterionIds: rubric.excludedCriterionIds ?? null,
+      exclusionNote: rubric.exclusionNote ?? null,
+      exclusionPreview,
       sourceSnapshots: (rubric.sourceSnapshots ?? []).map((s) => ({
         sourceId: s.sourceId,
         contentHash: s.contentHash,
@@ -1218,6 +1342,50 @@ export class RubricReviewService {
       blockers.push({ code: "RUBRIC_INVALID", message: `This rubric version is not internally consistent (${codes}). Reject it and re-extract.` });
     }
     return blockers;
+  }
+
+  // ---------- Exclusion preview (#161) ----------
+
+  /**
+   * What excluding `ids` would remove from a version, without writing
+   * anything (the POST route, for lists too long for a query string). Same
+   * validation as the approve body, same counting function as the detail.
+   * `primaryExclusionIds` are the proposed criteria whose source is primary
+   * (or unknown): excluding them needs `confirmPrimaryExclusions` on approve.
+   * Null when the id names no version.
+   */
+  async previewExclusion(id: string, ids: string[]): Promise<{ exclusionPreview: ExclusionPreview; primaryExclusionIds: string[] } | null> {
+    const parsed = parseRubricVersionId(id);
+    if (!parsed) return null;
+    const rubric = await rubricStore.getVersionForReview(parsed.routeKey, parsed.version);
+    if (!rubric) return null;
+    if (!Array.isArray(rubric.criteria)) throw malformed();
+    checkExclusionIds(rubric, ids);
+    const needs = await this.sourcesNeedingConfirmation(rubric);
+    const chosen = new Set(ids);
+    return {
+      exclusionPreview: previewExclusions(rubric, ids),
+      primaryExclusionIds: rubric.criteria.filter((c) => chosen.has(c.criterionId) && (needs.get(c.source?.sourceId) ?? true)).map((c) => c.criterionId),
+    };
+  }
+
+  /** sourceId -> needs confirmation, for the sources a version's criteria cite (a lighter read than the citation check). */
+  private async sourcesNeedingConfirmation(rubric: VisaRubric): Promise<Map<string, boolean>> {
+    const out = new Map<string, boolean>();
+    const sourceIds = [...new Set(rubric.criteria.map((c) => c.source?.sourceId).filter((x): x is string => typeof x === "string" && x.length > 0))];
+    await Promise.all(
+      sourceIds.map(async (sourceId) => {
+        let needs = true;
+        try {
+          const snap = await collections.guidanceSources.doc(sourceId).get();
+          needs = sourceNeedsExclusionConfirmation({ exists: snap.exists, role: snap.exists ? (snap.data() as { role?: unknown }).role : undefined });
+        } catch (err) {
+          console.error(`Rubric review: guidance source ${sourceId} unreadable (${errorClass(err)})`);
+        }
+        out.set(sourceId, needs);
+      })
+    );
+    return out;
   }
 
   // ---------- Decide ----------
@@ -1342,9 +1510,13 @@ export class RubricReviewService {
       const supersededSnap = supersededRef ? await tx.get(supersededRef) : null;
 
       // ---- the sources must still be where the citation check found them ----
+      // The same reads give the role of each source (#161), read INSIDE the
+      // transaction so the confirmation rule uses what is stored now.
+      const needsConfirmation = new Map<string, boolean>();
       for (const [sourceId, checkedAgainst] of (citations as CitationCheck).sourceHeads) {
         const snap = await tx.get(collections.guidanceSources.doc(sourceId));
         const latest = snap.exists ? (snap.data() as { latestSnapshotId?: unknown }).latestSnapshotId : null;
+        needsConfirmation.set(sourceId, sourceNeedsExclusionConfirmation({ exists: snap.exists, role: snap.exists ? (snap.data() as { role?: unknown }).role : undefined }));
         if ((typeof latest === "string" && latest ? latest : null) !== checkedAgainst) {
           throw conflict("SOURCE_CHANGED", "A guidance source changed while this approval was being checked. Nothing was approved; reload the version and review again.");
         }
@@ -1356,6 +1528,25 @@ export class RubricReviewService {
         const own = new Set((rubric.criteria ?? []).map((c) => c.criterionId));
         const unknownIds = input.evidenceHelpsCriterionIds.filter((cid) => !own.has(cid));
         if (unknownIds.length > 0) throw invalid(`evidenceHelpsCriterionIds names criteria this version does not have: ${unknownIds.join(", ")}`);
+      }
+
+      // ---- exclusions (#161): ids valid, then primary ones confirmed ----
+      // Both before any write. A bad id is a 400; an unconfirmed primary
+      // exclusion is a 409 that lists the ids so the client can ask.
+      let confirmedPrimary: string[] = [];
+      if (input.excludedCriterionIds && input.excludedCriterionIds.length > 0) {
+        checkExclusionIds(rubric, input.excludedCriterionIds);
+        const chosen = new Set(input.excludedCriterionIds);
+        // A criterion whose source is not in the transaction's reads cannot
+        // have its role established: treated as primary.
+        const primaryIds = rubric.criteria.filter((c) => chosen.has(c.criterionId) && (needsConfirmation.get(c.source?.sourceId) ?? true)).map((c) => c.criterionId);
+        if (primaryIds.length > 0 && input.confirmPrimaryExclusions !== true) {
+          throw conflict(
+            "PRIMARY_EXCLUSION_UNCONFIRMED",
+            `${primaryIds.length} of the criteria you excluded come from the route's primary source (or a source whose role is not known). Confirm with confirmPrimaryExclusions: true to exclude them. Criteria: ${primaryIds.join(", ")}`
+          );
+        }
+        confirmedPrimary = primaryIds;
       }
 
       // ---- the rubric exactly as it would be approved ----
@@ -1407,6 +1598,11 @@ export class RubricReviewService {
         acknowledgedFlags: acknowledged,
         outcomeStatistics: input.outcomeStatistics ?? null,
         evidenceHelpsCriterionIds: input.evidenceHelpsCriterionIds ?? null,
+        // (#161) What was excluded, why, and how many; null when nothing was.
+        excludedCriterionIds: input.excludedCriterionIds && input.excludedCriterionIds.length > 0 ? input.excludedCriterionIds : null,
+        exclusionNote: input.exclusionNote ?? null,
+        exclusionCount: input.excludedCriterionIds?.length ?? 0,
+        confirmedPrimaryExclusions: confirmedPrimary,
         approvedVersion: version,
       };
       tx.set(auditRef, audit as unknown as Record<string, unknown>);

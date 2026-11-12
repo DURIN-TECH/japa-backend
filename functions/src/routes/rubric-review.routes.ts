@@ -6,9 +6,10 @@ import { requireRubricAdmin, rubricReviewController } from "../controllers/rubri
 // Routes mounted at /admin/rubrics (issue #125)
 // ============================================
 //
-// The admin review of extracted rubric versions. THREE routes, and only
-// these: there is deliberately no route that approves part of a version or
-// edits a criterion (a version is approved or rejected whole), and no route
+// The admin review of extracted rubric versions. FOUR routes, and only
+// these (the fourth, `POST /:id/exclusion-preview`, is read-only: #161): there
+// is deliberately no route that approves part of a version or edits a
+// criterion (a version is approved or rejected whole), and no route
 // that serves a snapshot's text.
 //
 // Every route runs the same chain:
@@ -35,6 +36,9 @@ adminRubricRoutes.get("/", ...adminOnly, (req, res) => rubricReviewController.li
 // One version: criteria with `staleCitation`, diff against the serving
 // version, flags, discards, suspicious passages, approval readiness.
 adminRubricRoutes.get("/:id", ...adminOnly, (req, res) => rubricReviewController.get(req, res));
+// What a proposed exclusion set would remove (read-only; for long id lists
+// that do not fit a query string). Writes nothing.
+adminRubricRoutes.post("/:id/exclusion-preview", ...adminOnly, (req, res) => rubricReviewController.exclusionPreview(req, res));
 // Approve or reject the whole version, with the `revision` the reviewer saw
 // (409 when it is stale or the version is already decided).
 adminRubricRoutes.patch("/:id/review", ...adminOnly, (req, res) => rubricReviewController.review(req, res));
