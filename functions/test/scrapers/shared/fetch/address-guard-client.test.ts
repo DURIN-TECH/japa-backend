@@ -61,22 +61,26 @@ before(async () => {
     if (req.url === "/to-other") {
       res.statusCode = 302;
       res.setHeader("location", `http://other.test:${ok2.port}/landed`);
-      return res.end();
+      res.end();
+      return;
     }
     if (req.url === "/to-internal-name") {
       res.statusCode = 302;
       res.setHeader("location", `http://internal.test:${internal.port}/secret`);
-      return res.end();
+      res.end();
+      return;
     }
     if (req.url === "/to-internal-literal") {
       res.statusCode = 302;
       res.setHeader("location", `http://127.0.0.1:${internal.port}/secret`);
-      return res.end();
+      res.end();
+      return;
     }
     if (req.url === "/to-bad-port") {
       res.statusCode = 302;
       res.setHeader("location", `http://other.test:${internal.port}/secret`);
-      return res.end();
+      res.end();
+      return;
     }
     res.end("ok");
   });
