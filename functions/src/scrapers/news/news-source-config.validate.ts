@@ -6,6 +6,7 @@ import {
   type IngestionStrategy,
   type SupportedCountryCode,
 } from "../../types/news";
+import type { NewsEditableConfig } from "./news-source-config.shape";
 import { SettingsValidationError } from "../shared/settings/scraper-settings.validate";
 
 // ============================================
@@ -66,6 +67,11 @@ export const REQUIRED_HTML_SELECTOR_KEYS: readonly (keyof HtmlSelectors)[] = ["a
 const STRATEGIES: readonly IngestionStrategy[] = ["rss", "html_scrape", "news_api"];
 
 // ---------- Types ----------
+// NewsEditableConfig + newsEditableConfigOf live in news-source-config.shape.ts
+// (dependency-free, so the run service can read them without loading this
+// module's validation imports); re-exported here for the importers (#24 / #25).
+export type { NewsEditableConfig } from "./news-source-config.shape";
+export { newsEditableConfigOf } from "./news-source-config.shape";
 
 /** A parsed partial edit. Absent = not changed. */
 export interface NewsConfigEdit {
@@ -77,17 +83,6 @@ export interface NewsConfigEdit {
     selectors?: Partial<HtmlSelectors>; // merged over the stored selectors
     maxArticlesPerRun?: number;
   };
-}
-
-/** The editable slice of a stored news source (what the edit form shows). */
-export interface NewsEditableConfig {
-  strategy: IngestionStrategy;
-  scrapeIntervalMinutes: number;
-  priority: number;
-  countryCodes: SupportedCountryCode[];
-  feedUrl?: string;
-  selectors?: Partial<HtmlSelectors>;
-  maxArticlesPerRun: number;
 }
 
 /** Top-level keys a news edit may carry (on top of status/reason/resetFailures). */
@@ -396,27 +391,4 @@ export function validateNewsSourceObject(obj: unknown): NewsEditableConfig {
     },
   };
   return parseNewsConfigEdit(body, empty).next as NewsEditableConfig;
-}
-
-// ============================================
-// Stored doc -> editable slice
-// ============================================
-
-/**
- * The editable slice of a stored `newsSources` doc (pure; tolerant of old
- * docs). Used by the health row (`newsConfig`) and by the edit transaction.
- * Never includes `customHeaders` or `apiConfig`.
- */
-export function newsEditableConfigOf(doc: Record<string, unknown>): NewsEditableConfig {
-  const config = isObj(doc.config) ? doc.config : {};
-  const out: NewsEditableConfig = {
-    strategy: doc.strategy as IngestionStrategy,
-    scrapeIntervalMinutes: typeof doc.scrapeIntervalMinutes === "number" ? doc.scrapeIntervalMinutes : 0,
-    priority: typeof doc.priority === "number" ? doc.priority : 0,
-    countryCodes: Array.isArray(doc.countryCodes) ? ([...doc.countryCodes] as SupportedCountryCode[]) : [],
-    maxArticlesPerRun: typeof config.maxArticlesPerRun === "number" ? config.maxArticlesPerRun : 0,
-  };
-  if (typeof config.feedUrl === "string") out.feedUrl = config.feedUrl;
-  if (isObj(config.selectors)) out.selectors = { ...(config.selectors as Partial<HtmlSelectors>) };
-  return out;
 }

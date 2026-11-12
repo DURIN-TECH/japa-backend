@@ -12,7 +12,7 @@ import {
 } from "./types";
 import type { VisaSource } from "../../visa-catalog/types";
 import type { NewsSource } from "../../../types/news";
-import { newsEditableConfigOf, type NewsEditableConfig } from "../../news/news-source-config.validate";
+import { newsEditableConfigOf, type NewsEditableConfig } from "../../news/news-source-config.shape";
 import { hostBackoffEntriesFromSource } from "../etiquette/visa-crawl-host-backoff-store";
 // Issue #82: per-run usage / cost accumulation (pure helpers, no Firestore).
 import {

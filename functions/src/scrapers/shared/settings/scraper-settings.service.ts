@@ -16,7 +16,8 @@ import { SCRAPE_ALERT_RULES, type ScrapeAlertsConfig, type ScrapeAlertSeverity }
 import { nextWindowOpening } from "../etiquette/visa-crawl-window";
 import { VISA_SOURCE_WINDOWS } from "../../visa-catalog/data/seed-visa-sources";
 import type { CrawlWindow } from "../../visa-catalog/types";
-import { applyNewsConfigEdit, newsEditableConfigOf, type NewsEditableConfig } from "../../news/news-source-config.validate";
+import { newsEditableConfigOf, type NewsEditableConfig } from "../../news/news-source-config.shape";
+import { applyNewsConfigEdit } from "../../news/news-source-config.validate";
 import { SCRAPER_SETTINGS_DOC_ID, resolveScraperSettings } from "./scraper-settings.store";
 import {
   assertValidAlerts,
