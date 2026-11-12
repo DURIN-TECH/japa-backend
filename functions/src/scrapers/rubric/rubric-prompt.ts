@@ -6,7 +6,6 @@ import {
   EVIDENCE_PARTIES,
   INTAKE_ANSWER_TYPES,
   INTENT_POLARITIES,
-  RUBRIC_CITATION_FIELDS,
 } from "../../types/rubric";
 import type { SourceChunk } from "./rubric-chunk";
 
@@ -43,8 +42,13 @@ import type { SourceChunk } from "./rubric-chunk";
  *    be in the criterion's own quote (citations no longer count); thresholds
  *    are JSON numbers; quotes stay within one paragraph; `citations[].field`
  *    is a closed list.
+ *  - "2026-11-rubric-v3" (run of #112): the output schema sends scalar
+ *    "nullable" properties as optional properties (left out instead of null)
+ *    to stay under the provider's limit of 16 union-typed parameters; nullable
+ *    objects are optional too; `appliesTo` and the `mandatory_bar` kind, `validFrom`, `validUntil` and `citations` are
+ *    withdrawn from the model's schema (the compiled grammar was too large).
  */
-export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v2";
+export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v3";
 
 /** The constant instructions. No per-document data may ever be added here. */
 export const RUBRIC_SYSTEM_PROMPT = [
@@ -55,14 +59,14 @@ export const RUBRIC_SYSTEM_PROMPT = [
   "Rules for every criterion:",
   "- `quote` is copied character for character from the excerpt: one continuous passage from a single paragraph, made of whole words, no ellipsis, nothing added, nothing corrected, nothing joined from two places. Include the whole sentence, with any \"not\", \"unless\" or \"only if\" it contains. It will be checked by a program against the stored document and discarded if it is not found.",
   "- Lines of the form [[page N]] are page markers added by the program. Never include one in a quote, and never let a quote run from one page into the next.",
-  "- State nothing the quote does not say. Any number, amount, duration, unit, date or named group you give (in `check`, `title`, `probeFactors`, `validFrom`, `validUntil`, `appliesTo`) must be written in that criterion's own `quote`; choose the quote so that it contains them. `citations` may point at further verbatim passages for a reviewer to read, but they never count as support. Never convert, round or calculate: give `check.value` as a JSON number, and `check.unit` exactly as the quote writes the unit.",
+  "- State nothing the quote does not say. Any number, amount, duration, unit, date or named group you give (in `check`, `title`, `probeFactors`) must be written in that criterion's own `quote`; choose the quote so that it contains them. Never convert, round or calculate: give `check.value` as a JSON number, and `check.unit` exactly as the quote writes the unit.",
   "- If the excerpt sets no fixed figure for something, it is not an objective check. Use kind `judgement` and list the factors the excerpt tells the decision maker to weigh in `probeFactors`.",
-  "- `ruleRef` is the publisher's own paragraph or section reference exactly as printed in the excerpt directly before or inside the quote, or null when there is none.",
+  "- `ruleRef` is the publisher's own paragraph or section reference exactly as printed in the excerpt directly before or inside the quote; leave the property out when there is none.",
   "- Never decide an outcome. You describe the rule and the fact to read; you do not say whether anyone passes.",
   "",
   "Kinds:",
   "- `objective`: a rule a program can check. Give `check` with the `field` to read, an `op` and, unless the op is `present`, a `value`.",
-  "- `mandatory_bar`: a bar that applies to a stated group whatever else is true. Give `appliesTo`: `asWritten` lists the group members exactly as the excerpt names them, `nationalities` gives the matching two-letter codes in the same order. Give `validFrom` / `validUntil` (YYYY-MM-DD) only when the excerpt states the dates.",
+  "- `mandatory_bar`: not available in this extraction (a bar tied to a named group is handled elsewhere). Do not use this kind; a bar the excerpt states for everyone is an `objective` or `judgement` criterion.",
   "- `judgement`: a matter the decision maker weighs. Give `probeFactors`, set `check` to null, and set `requiresInterviewBeforeRefusal` to true only when the excerpt says the person should be interviewed or asked before a refusal on this point.",
   "",
   "Stages, in the order they are applied: `validity` (whether the application can be considered at all), `suitability` (grounds for refusal whatever the merits), `eligibility` (the requirements of the category), `credibility` (whether the account given is believed).",
@@ -82,14 +86,34 @@ export const RUBRIC_SYSTEM_PROMPT = [
 // Output schema
 // ============================================
 
-/** `{ anyOf: [schema, null] }`: a value that may be null. */
-function nullable(schema: Record<string, unknown>): Record<string, unknown> {
-  return { anyOf: [schema, { type: "null" }] };
+/**
+ * Schemas marked optional by `optional()`. A WeakSet (not a property) so the
+ * marker never reaches the JSON sent to the provider.
+ */
+const OPTIONAL_SCHEMAS = new WeakSet<object>();
+
+/**
+ * A property the model may leave out when it has nothing to say, instead of
+ * writing `null`. The provider's structured-output compiler refuses a schema
+ * with more than 16 union-typed (`anyOf` / type array) parameters, and a
+ * nullable scalar is a union; an optional plain scalar is not. Absent is read
+ * as null by `parseRubricOutput`, so everything downstream still sees the
+ * same `T | null` shape. (Run #112: 22 unions were rejected with HTTP 400.)
+ * Only used on scalar leaves, where "left out" and "null" mean the same.
+ */
+function optional(schema: Record<string, unknown>): Record<string, unknown> {
+  const copy = { ...schema };
+  OPTIONAL_SCHEMAS.add(copy);
+  return copy;
 }
 
-/** An object schema with every listed property required and no others allowed. */
+/**
+ * An object schema with every listed property required (except those marked
+ * `optional()`) and no others allowed.
+ */
 function object(properties: Record<string, unknown>): Record<string, unknown> {
-  return { type: "object", properties, required: Object.keys(properties), additionalProperties: false };
+  const required = Object.keys(properties).filter((k) => !OPTIONAL_SCHEMAS.has(properties[k] as object));
+  return { type: "object", properties, required, additionalProperties: false };
 }
 
 const STRING = { type: "string" };
@@ -115,40 +139,42 @@ export function buildRubricOutputSchema(severityLevels: readonly string[]): Reco
     kind: { type: "string", enum: [...CRITERION_KINDS] },
     stage: { type: "string", enum: [...DECISION_STAGES] },
     severity: { type: "string", enum: [...severityLevels] },
-    ruleRef: nullable(STRING),
+    ruleRef: optional(STRING),
     quote: STRING,
     concernsIntent: BOOLEAN,
-    check: nullable(
+    check: optional(
       object({
         field: STRING,
         op: { type: "string", enum: [...CHECK_OPS] },
         value: { anyOf: [{ type: "number" }, STRING, BOOLEAN, { type: "null" }] },
-        unit: nullable(STRING),
+        unit: optional(STRING),
       })
     ),
-    appliesTo: nullable(object({ nationalities: STRINGS, asWritten: STRINGS })),
-    validFrom: nullable(STRING),
-    validUntil: nullable(STRING),
+    // `appliesTo` (a group a bar applies to) is NOT part of the provider schema:
+    // with it the compiled grammar exceeds the provider's size limit (#112
+    // probe). Group-specific bars are out of scope for this extraction (#116);
+    // `parseRubricOutput` sets it to null so the typed answer stays complete.
+    // `validFrom`, `validUntil` and `citations` are NOT in the provider schema:
+    // the compiled grammar exceeded the provider's size limit (#112 probe).
+    // `parseRubricOutput` fills them with null / [] (reviewer aids and rule
+    // dates, none needed by the visitor route).
     probeFactors: STRINGS,
-    requiresInterviewBeforeRefusal: nullable(BOOLEAN),
-    // Further passages for a reviewer, per field. `field` is a closed list,
-    // so no model-chosen key name is ever stored.
-    citations: { type: "array", items: object({ field: { type: "string", enum: [...RUBRIC_CITATION_FIELDS] }, quote: STRING }) },
+    requiresInterviewBeforeRefusal: optional(BOOLEAN),
     confidence: { type: "number" },
   });
 
   const intakeQuestion = object({
     id: STRING,
     label: STRING,
-    helpText: nullable(STRING),
+    helpText: optional(STRING),
     answerType: { type: "string", enum: [...INTAKE_ANSWER_TYPES] },
     required: BOOLEAN,
     criterionRefs: STRINGS,
-    group: nullable(STRING),
-    party: nullable({ type: "string", enum: [...EVIDENCE_PARTIES] }),
-    options: { type: "array", items: object({ value: STRING, label: STRING, description: nullable(STRING) }) },
-    textMaxLength: nullable({ type: "number" }),
-    dateRelativeToToday: nullable({ type: "string", enum: ["past_only", "future_only"] }),
+    group: optional(STRING),
+    party: optional({ type: "string", enum: [...EVIDENCE_PARTIES] }),
+    options: { type: "array", items: object({ value: STRING, label: STRING, description: optional(STRING) }) },
+    textMaxLength: optional({ type: "number" }),
+    dateRelativeToToday: optional({ type: "string", enum: ["past_only", "future_only"] }),
     // Shown when ANY of these holds; empty = always shown.
     showWhenAnyOf: {
       type: "array",
@@ -166,14 +192,14 @@ export function buildRubricOutputSchema(severityLevels: readonly string[]): Reco
     party: { type: "string", enum: [...EVIDENCE_PARTIES] },
     criterionRefs: STRINGS,
     quote: STRING,
-    documentType: nullable(STRING),
+    documentType: optional(STRING),
     fields: STRINGS,
   });
 
   return object({
     criteria: { type: "array", items: criterion },
-    intentPolarity: nullable(object({ value: { type: "string", enum: [...INTENT_POLARITIES] }, quote: nullable(STRING) })),
-    intake: nullable(object({ title: nullable(STRING), cardTitle: nullable(STRING), intro: nullable(STRING) })),
+    intentPolarity: optional(object({ value: { type: "string", enum: [...INTENT_POLARITIES] }, quote: optional(STRING) })),
+    intake: optional(object({ title: optional(STRING), cardTitle: optional(STRING), intro: optional(STRING) })),
     intakeQuestions: { type: "array", items: intakeQuestion },
     evidenceItems: { type: "array", items: evidenceItem },
     suspiciousPassages: { type: "array", items: object({ quote: STRING }) },
@@ -391,5 +417,44 @@ export function parseRubricOutput(text: string, schema: Record<string, unknown>)
     // Paths only: a problem line never carries the answer's content.
     throw new RubricOutputError(`the model's answer does not follow the output schema (${problems.length} problem(s))`, problems.slice(0, 20));
   }
+  // Properties the schema marks optional (see `optional()`) may be absent:
+  // read an absent one as null so the typed answer is complete.
+  fillAbsentOptionalsWithNull(parsed, schema);
+  // `appliesTo` is not in the provider schema (see buildRubricOutputSchema).
+  for (const c of ((parsed as { criteria?: Record<string, unknown>[] }).criteria ?? [])) {
+    c.appliesTo = null;
+    c.validFrom = null;
+    c.validUntil = null;
+    c.citations = [];
+  }
   return parsed as RawRubricOutput;
+}
+
+/**
+ * Walk a schema-valid value and set every property that the schema declares
+ * but does not require, and the value lacks, to null. Mutates `value`.
+ */
+function fillAbsentOptionalsWithNull(value: unknown, schema: Record<string, unknown>): void {
+  const anyOf = schema.anyOf as Record<string, unknown>[] | undefined;
+  if (anyOf) {
+    // A nullable object: descend into whichever object branch the value fits.
+    for (const branch of anyOf) {
+      if (validateAgainstSchema(value, branch).length === 0) fillAbsentOptionalsWithNull(value, branch);
+    }
+    return;
+  }
+  if (schema.type === "array" && Array.isArray(value)) {
+    const items = schema.items as Record<string, unknown> | undefined;
+    if (items) value.forEach((v) => fillAbsentOptionalsWithNull(v, items));
+    return;
+  }
+  if (schema.type === "object" && value && typeof value === "object") {
+    const props = (schema.properties ?? {}) as Record<string, Record<string, unknown>>;
+    const required = new Set((schema.required as string[] | undefined) ?? []);
+    const obj = value as Record<string, unknown>;
+    for (const [key, sub] of Object.entries(props)) {
+      if (!(key in obj) && !required.has(key)) obj[key] = null;
+      else fillAbsentOptionalsWithNull(obj[key], sub);
+    }
+  }
 }

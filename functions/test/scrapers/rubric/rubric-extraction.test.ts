@@ -230,7 +230,7 @@ describe("rubric extraction: a web-page source", () => {
     assert.deepEqual(rubric.sourceSnapshots, [{ sourceId: SOURCE_A_ID, contentHash: hash, url: SOURCE_A_URL, docType: "html", publishedDate: SOURCE_A_PUBLISHED }]);
     assert.equal(rubric.sourceSetHash, sourceSetHashOf([{ sourceId: SOURCE_A_ID, contentHash: hash }]));
     assert.equal(rubric.extractorModel, "recorded-model");
-    assert.equal(rubric.extractorPromptVersion, "2026-11-rubric-v2");
+    assert.equal(rubric.extractorPromptVersion, "2026-11-rubric-v3");
   });
 
   test("the polarity is stored as a cited PROPOSAL; the decision stays empty for the admin", async () => {

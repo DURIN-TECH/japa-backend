@@ -51,8 +51,11 @@ export interface RubricExtractionSettings {
  *    about 8 requests for that document;
  *  - maxRequestsPerRun 40 / maxInputCharsPerRun 600,000: room for a route
  *    with a few such sources, and a hard stop well short of a runaway;
- *  - maxOutputTokensPerRequest 16,000: ample for one chunk's criteria plus
- *    the model's reasoning;
+ *  - maxOutputTokensPerRequest 48,000: a first real run (#112) was cut off
+ *    at 16,000 on a dense chunk (about 11,500 tokens per call on average,
+ *    thinking included, effort "high"), which failed the whole run with
+ *    `output_truncated`. This is a ceiling, not a spend target: the other
+ *    caps (requests and input characters per run, runs per day) are unchanged;
  *  - requestTimeoutMs 240,000: four minutes, against an SDK default of ten;
  *  - maxRunsPerDay 20: guidance changes a few times a year.
  */
@@ -61,7 +64,7 @@ export const DEFAULT_RUBRIC_SETTINGS: Readonly<RubricExtractionSettings> = Objec
   maxChunkChars: 24_000,
   maxRequestsPerRun: 40,
   maxInputCharsPerRun: 600_000,
-  maxOutputTokensPerRequest: 16_000,
+  maxOutputTokensPerRequest: 48_000,
   requestTimeoutMs: 240_000,
   maxRunsPerDay: 20,
 });

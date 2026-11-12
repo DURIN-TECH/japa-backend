@@ -495,6 +495,9 @@ describe("prompt version pin", () => {
   // in rubric-prompt.ts, and add the new hash below (keep the old lines).
   const PINNED: Record<string, string> = {
     "2026-11-rubric-v2": "b2043fc231eb40af3853c1c802cb00d1594e8ea2c613c3e1c2c6d157dacf1c13",
+    // v3 (#112): optional scalar properties, and no appliesTo / validFrom /
+    // validUntil / citations in the schema sent to the model.
+    "2026-11-rubric-v3": "ecbfa6aaee534bb65b8235b48d5a0f8cbf83ca4452e66ac64e81edecfe4dbcca",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {
