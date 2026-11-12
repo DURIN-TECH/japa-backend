@@ -59,6 +59,8 @@ import {
   webhooksRouter,
 } from "./routes/entitlement.routes";
 import { verificationWebhookRoutes } from "./routes/verification-webhook.routes";
+// Admin review queue for trafficking / scam risk signals (issue #119).
+import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
 
 // Create Express app
 const app = express();
@@ -125,6 +127,10 @@ app.use("/admin/eligibility", adminEligibilityRoutes);
 app.use("/admin/visas", adminVisaRoutes);
 // Admin queue of proposed edits to live scraped visas (CASL `VisaChange`).
 app.use("/admin/visa-changes", adminVisaChangeRoutes);
+// Admin-only review queue for trafficking / scam risk signals (issue #119).
+// Signals are raised by backend code, never through HTTP; this mount only
+// lists, reads and records an admin decision.
+app.use("/admin/risk-signals", adminRiskSignalRoutes);
 // Scraper monitoring (issue #81): run records + per-source health (CASL `ScrapeRun`).
 app.use("/admin/scrape-runs", adminScrapeRunRoutes);
 app.use("/admin/scrape-sources", adminScrapeSourceRoutes);
