@@ -21,7 +21,7 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 
-import { clientDb, isDenied, refreshIdToken, resetEmulators, RunningApi, signUp, startApi, TestAccount, withoutRules } from "./helpers";
+import { clientDb, isDenied, refreshIdToken, resetEmulators, RunningApi, rulesEnv, signUp, startApi, TestAccount, withoutRules } from "./helpers";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -79,6 +79,9 @@ before(async () => {
 
 after(async () => {
   await api.close();
+  // Release the rules-unit-testing client too: without this the open Firestore
+  // handle keeps the test process alive forever and the whole run hangs.
+  await (await rulesEnv()).cleanup();
 });
 
 describe("firestore.rules: riskSignals is backend-only", () => {

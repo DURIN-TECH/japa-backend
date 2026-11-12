@@ -26,6 +26,10 @@ import {
   type ParsedSourcePatch,
 } from "./scraper-settings.validate";
 import type { ScraperSettings, SettingsChange, SettingsHistoryDoc } from "./types";
+import type { DocumentData, UpdateData } from "firebase-admin/firestore";
+// Transaction.update() wants UpdateData<DocumentData>; the field maps built here are
+// Record<string, unknown> (dotted paths + FieldValue sentinels), which tsc rejects.
+type FsUpdate = UpdateData<DocumentData>;
 
 // ============================================
 // SCRAPER SETTINGS — admin view + edits (issue #96)
@@ -437,7 +441,7 @@ export class ScraperSettingsService {
       update["adminOverrides.updatedAt"] = at;
       update["adminOverrides.updatedBy"] = uid;
       update.updatedAt = at;
-      tx.update(ref, update);
+      tx.update(ref, update as FsUpdate);
       this.writeHistory(tx, { at, by: uid, target: `source:${kind}:${id}`, changes });
       return changes;
     });
