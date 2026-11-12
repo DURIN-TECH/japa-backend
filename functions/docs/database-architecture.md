@@ -198,7 +198,7 @@ A professional profile linked to a User. May belong to an Agency or operate inde
 | totalReviews       | number                 | Denormalized count                                   |
 | totalApplications  | number                 | Denormalized count                                   |
 | successRate        | number                 | Percentage                                           |
-| consultationFee    | number                 | In cents                                             |
+| consultationFee    | number                 | Whole naira (#148)                                   |
 | serviceFees        | Record<string, number> | visaTypeId → fee                                     |
 | isAvailable        | boolean                |                                                      |
 | availableSlots     | AvailabilitySlot[]?    | Embedded: dayOfWeek, startTime, endTime              |
@@ -235,7 +235,7 @@ A company that employs multiple agents. Owns applications through its agents.
 | address, state          | string?         |                                 |
 | description             | string?         |                                 |
 | logoUrl                 | string?         |                                 |
-| consultationFee         | number?         | Agency-level default (cents)    |
+| consultationFee         | number?         | Agency-level default (naira)    |
 | services                | AgencyService[] | Embedded: id, name, price       |
 | totalAgents             | number          | Denormalized                    |
 | totalCases, activeCases | number          | Denormalized                    |

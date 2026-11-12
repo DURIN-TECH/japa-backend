@@ -36,6 +36,7 @@
     "backfill:agentids:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-application-agent-ids.js",
     "backfill:risk-shared-contact": "npm run build && node lib/scripts/backfill-shared-contact-signals.js",
     "backfill:risk-shared-contact:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-shared-contact-signals.js",
+    "migrate:agent-fee": "npm run build && node lib/scripts/migrate-agent-consultation-fee-to-naira.js",
     "backfill:visas": "npm run build && node lib/scripts/backfill-visa-ownership.js",
     "backfill:visas:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-visa-ownership.js",
     "test": "tsc -p tsconfig.test.json && node --import tsx --import ./test/helpers/setup.ts --test 'test/**/*.test.ts'",

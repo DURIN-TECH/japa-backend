@@ -334,7 +334,12 @@ export interface Agent {
   responseTime: string; // e.g., "24-48 hours"
 
   // Pricing
-  consultationFee: number; // In cents
+  // WHOLE NAIRA (issue #148), same unit as `Agency.consultationFee`. Display with no
+  // /100; Paystack kobo conversion (`* 100`) happens only at the payment boundary.
+  consultationFee: number;
+  // Migration marker (#148): set to "naira" by migrate-agent-consultation-fee-to-naira
+  // so a re-run never divides an already-converted fee by 100 again.
+  consultationFeeUnit?: "naira";
   /**
    * @deprecated Issue #103: SUPERSEDED by the agency-level per-visa service
    * price (`agencies/{agencyId}/visaPrices/{cc}__{visaTypeId}`, whole NAIRA,
@@ -1057,7 +1062,9 @@ export interface Consultation {
   meetingPlatform?: "zoom" | "google_meet" | "teams";
   
   // Payment
-  fee: number; // In cents
+  // WHOLE NAIRA (issue #148) for agent-originated and agency (guest) bookings alike.
+  // Paystack kobo (`fee * 100`) is computed only when a charge is initialised.
+  fee: number;
   paymentStatus: PaymentStatus;
   transactionId?: string;
   
