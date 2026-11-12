@@ -68,6 +68,10 @@ export const SCRAPE_ALERT_STATUSES: readonly ScrapeAlertStatus[] = ["open", "ack
  *    pendingVisaChanges waiting longer than reviewQueueMaxAgeDays;
  *  - budget_hard_stop (issue #96): a visa run skipped LLM extraction because
  *    the monthly budget was spent and the hard stop is on;
+ *  - source_no_yield (issue #17): an active news source keeps SUCCEEDING while
+ *    returning zero articles (articlesFound 0 for `zeroYieldRuns` runs in a
+ *    row): usually a broken selector / feed that moved. A signal only; it
+ *    never pauses the source;
  *  - settings_unreadable (issue #96 review): appConfig/scraperSettings could
  *    not be read, so scheduled ticks are skipped (they fail closed);
  *  - infrastructure_error (issue #143): a guidance run could not store its
@@ -87,6 +91,7 @@ export type ScrapeAlertRule =
   | "llm_budget"
   | "review_queue_stale"
   | "budget_hard_stop"
+  | "source_no_yield"
   | "settings_unreadable"
   | "infrastructure_error";
 
@@ -103,6 +108,7 @@ export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
   "llm_budget",
   "review_queue_stale",
   "budget_hard_stop",
+  "source_no_yield",
   "settings_unreadable",
   "infrastructure_error",
 ];
@@ -231,6 +237,7 @@ export interface ScrapeAlertThresholds {
   budgetPcts: number[]; // llm_budget: alert levels, % of budget (ascending)
   reviewQueueMaxAgeDays: number; // review_queue_stale: items older than this
   missedWindowGraceHours: number; // missed_window: wait this long after the window closes
+  zeroYieldRuns: number; // source_no_yield (#17): alert at >= this many consecutive zero-article successful runs
 }
 
 /** The whole `appConfig/scrapeAlerts` doc (every field optional in storage). */

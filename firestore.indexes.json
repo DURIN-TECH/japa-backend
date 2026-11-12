@@ -507,6 +507,20 @@
       ]
     },
     {
+      "collectionGroup": "newsArticles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "sourceId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "scrapedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
       "collectionGroup": "newsSources",
       "queryScope": "COLLECTION",
       "fields": [
@@ -1192,6 +1206,12 @@
     },
     {
       "collectionGroup": "scrapeRuns",
+      "fieldPath": "expireAt",
+      "ttl": true,
+      "indexes": []
+    },
+    {
+      "collectionGroup": "newsArticles",
       "fieldPath": "expireAt",
       "ttl": true,
       "indexes": []

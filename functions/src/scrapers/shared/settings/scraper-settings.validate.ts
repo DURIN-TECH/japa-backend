@@ -6,6 +6,7 @@ import type { LlmPricingDoc } from "../cost/types";
 import { DEFAULT_CONFIG, DEFAULT_THRESHOLDS, resolveConfig } from "../alerts/scrape-alert-rules";
 import { SCRAPE_ALERT_RULES, type ScrapeAlertRule } from "../alerts/types";
 import { SETTINGS_FIELD_RULES, describeRule, fieldValid, type FieldRule } from "./scraper-settings.store";
+import { NEWS_EDIT_KEYS, parseNewsConfigEdit, type NewsConfigEdit } from "../../news/news-source-config.validate";
 import { ADMIN_SOURCE_STATUSES, type AdminSourceStatus, type ScraperSettings, type SettingsChange } from "./types";
 
 // ============================================
@@ -322,12 +323,20 @@ export interface ParsedSourcePatch {
   crawlWindow?: CrawlWindow | null; // visa only; null = back to the registry window
   resetFailures?: boolean;
   clearHostBackoffs?: boolean; // visa only
+  // Issue #17 (news only): the parsed config edit (interval, priority,
+  // countries, config.*). Strategy-dependent rules run later, inside the
+  // update transaction, against the stored source.
+  newsEdit?: NewsConfigEdit;
 }
 
 /** Parse a per-source PATCH. Throws SettingsValidationError on the first bad field. */
 export function parseSourcePatch(kind: ScraperSettingsKind, body: unknown): ParsedSourcePatch {
   if (!isObj(body)) throw new SettingsValidationError("body", "the body must be a JSON object");
-  rejectUnknownKeys(body, ["status", "reason", "crawlWindow", "resetFailures", "clearHostBackoffs"], "");
+  // Issue #17: news sources additionally take the config keys (and a sent
+  // `strategy` gets its own "cannot be changed" 400 from the news module).
+  const sourceKeys = ["status", "reason", "crawlWindow", "resetFailures", "clearHostBackoffs"];
+  if (kind === "news" && "strategy" in body) throw new SettingsValidationError("strategy", "strategy cannot be changed");
+  rejectUnknownKeys(body, kind === "news" ? [...sourceKeys, ...NEWS_EDIT_KEYS] : sourceKeys, "");
   if (Object.keys(body).length === 0) throw new SettingsValidationError("body", "nothing to change");
   const out: ParsedSourcePatch = {};
 
@@ -366,6 +375,11 @@ export function parseSourcePatch(kind: ScraperSettingsKind, body: unknown): Pars
       }
       out.crawlWindow = window;
     }
+  }
+
+  // ---- news config edit (issue #17): delegated to the pure news module ----
+  if (kind === "news" && NEWS_EDIT_KEYS.some((k) => body[k] !== undefined)) {
+    out.newsEdit = parseNewsConfigEdit(body).edit;
   }
 
   // ---- one-shot actions: true does it, false is a no-op ----

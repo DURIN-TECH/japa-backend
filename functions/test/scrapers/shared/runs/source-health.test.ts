@@ -178,7 +178,7 @@ function makeNews(settings: any = settingsWith()) {
     getSourceById: (id: string) => newsService.getSourceById(id),
     createScrapeRun: (id: string, runId?: string) => newsService.createScrapeRun(id, runId),
     completeScrapeRun: (id: string, runId: string, r: any) => newsService.completeScrapeRun(id, runId, r),
-    isDuplicate: async () => false,
+    findExistingHashes: async () => new Set<string>(),
     createArticlesBatch: async (a: unknown[]) => a.length,
     updateSourceAfterScrape: newsHealth.updateSourceAfterScrape.bind(newsHealth),
     pauseForMissingApiKey: newsHealth.pauseForMissingApiKey.bind(newsHealth),

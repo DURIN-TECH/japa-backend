@@ -88,8 +88,8 @@ const store = {
   async createScrapeRun(sourceId: string) {
     return `run-${sourceId}`;
   },
-  async isDuplicate() {
-    return false;
+  async findExistingHashes() {
+    return new Set<string>();
   },
   async createArticlesBatch(articles: { originalUrl: string; body?: string }[]) {
     created.push(...articles);

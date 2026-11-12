@@ -1,4 +1,5 @@
 import { FieldValue, getFirestore, Timestamp } from "firebase-admin/firestore";
+import type { NewsConfigOverrides } from "../shared/settings/types";
 import { IngestionStrategy, ScrapingConfig, SourceStatus, SupportedCountryCode } from "../../types/news";
 
 // NOTE: the Firestore handle is resolved LAZILY inside seedNewsSources() (not
@@ -294,6 +295,25 @@ export const NEWS_SOURCE_HEALTH_FIELDS = [
   "createdAt",
 ] as const;
 
+/** The admin's stored config edits of an existing doc (issue #17), or {}. */
+export function newsConfigOverrides(existing: Record<string, unknown> | undefined): NewsConfigOverrides {
+  const ao = existing?.adminOverrides as { config?: unknown } | undefined;
+  return ao && ao.config && typeof ao.config === "object" ? (ao.config as NewsConfigOverrides) : {};
+}
+
+/**
+ * The `config` a re-seed writes (pure, issue #17): the registry config with
+ * the admin's edited feedUrl / maxArticlesPerRun applied and their edited
+ * selectors merged key by key over the registry's selectors.
+ */
+function effectiveSeedConfig(config: ScrapingConfig, edited: NewsConfigOverrides): ScrapingConfig {
+  const out: ScrapingConfig = { ...config };
+  if (edited.feedUrl !== undefined) out.feedUrl = edited.feedUrl;
+  if (edited.maxArticlesPerRun !== undefined) out.maxArticlesPerRun = edited.maxArticlesPerRun;
+  if (edited.selectors && config.selectors) out.selectors = { ...config.selectors, ...edited.selectors };
+  return out;
+}
+
 /**
  * The doc a re-seed writes for one news source (pure, merge: true).
  * Registry fields always; the health baseline only for a NEW doc.
@@ -304,15 +324,18 @@ export function buildSeededNewsSource(
   now: Timestamp
 ): Record<string, unknown> {
   const status = newsSeedStatus(source.status, existing);
+  // Issue #17: fields an admin edited (adminOverrides.config) win over the
+  // registry; a never-edited source follows the registry as before.
+  const edited = newsConfigOverrides(existing);
   const doc: Record<string, unknown> = {
     id: source.slug,
     name: source.name,
     slug: source.slug,
     url: source.url,
-    countryCodes: source.countryCodes,
+    countryCodes: edited.countryCodes ?? source.countryCodes,
     strategy: source.strategy,
-    config: source.config,
-    scrapeIntervalMinutes: source.scrapeIntervalMinutes,
+    config: effectiveSeedConfig(source.config, edited),
+    scrapeIntervalMinutes: edited.scrapeIntervalMinutes ?? source.scrapeIntervalMinutes,
     // Due immediately so the scraper picks it up right away (only an
     // `active` source is ever due).
     nextScrapeAt: now,
@@ -321,7 +344,7 @@ export function buildSeededNewsSource(
     // registry no longer gives one (merge: true needs an explicit delete).
     statusReason: source.statusReason ?? (existing ? FieldValue.delete() : undefined),
     isOfficial: source.isOfficial,
-    priority: source.priority,
+    priority: edited.priority ?? source.priority,
     updatedAt: now,
   };
   if (doc.statusReason === undefined) delete doc.statusReason;

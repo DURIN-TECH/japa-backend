@@ -53,6 +53,10 @@ export interface NewsSourceHealthWriteOptions {
   failureLimit?: number;
   // Clock for the timestamps (tests); default Date.now.
   nowMs?: number;
+  // Issue #17: the run's raw article count (`rawArticles.length`, before the
+  // maxArticlesPerRun slice). Drives the zero-yield streak. Omitted = the
+  // streak is left untouched (older callers / tests).
+  articlesFound?: number;
 }
 
 /** The reason stored on a news_api source paused for a missing key. */
@@ -113,6 +117,21 @@ export class NewsSourceHealthService {
         updatedAt: now,
         ...(health.autoPause ?? {}),
       };
+      // ---- Issue #17: zero-yield streak ----
+      // Signal is articlesFound, never articlesNew (an all-duplicates run is
+      // healthy). Success + 0 found: streak +1 (zeroYieldSince set when it
+      // starts). Success + found > 0: reset. A failed run, or a call without
+      // articlesFound, leaves both fields alone (failures are source_broken's).
+      if (success && opts.articlesFound !== undefined) {
+        if (opts.articlesFound === 0) {
+          const streak = (source.zeroYieldRuns ?? 0) + 1;
+          updates.zeroYieldRuns = streak;
+          if (streak === 1 || !source.zeroYieldSince) updates.zeroYieldSince = now;
+        } else if ((source.zeroYieldRuns ?? 0) !== 0 || source.zeroYieldSince) {
+          updates.zeroYieldRuns = 0;
+          updates.zeroYieldSince = null;
+        }
+      }
       if (!success) {
         updates.lastErrorMessage = errorMessage ?? null;
         updates.lastErrorAt = now;
