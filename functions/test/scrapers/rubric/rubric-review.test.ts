@@ -1550,6 +1550,9 @@ describe("rubric review: excluding criteria at approval (#161)", () => {
     assert.equal(get.status, 200);
     assert.deepEqual(get.body.data.exclusionPreview, {
       criteriaKept: 2, criteriaExcluded: 2, intakeQuestionsKept: 0, intakeQuestionsDropped: 1, evidenceItemsKept: 0, evidenceItemsDropped: 0, droppedIntakeQuestionIds: ["dob"], droppedEvidenceItemKeys: [],
+      // (#169) the reasons, additive to the counts above
+      droppedIntakeQuestions: [{ id: "dob", label: "DOB", reason: "no_kept_criterion", keptCriterionIds: [] }],
+      droppedEvidenceItems: [],
     });
     // The proposed set shows up in the diff as `after`.
     assert.deepEqual(get.body.data.diff.adminSet.excludedCriterionIds, { before: null, after: [age, held].sort(), changed: true });

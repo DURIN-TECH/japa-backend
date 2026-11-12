@@ -913,6 +913,20 @@ describe("rubric extraction: stale routes", () => {
     assert.equal(h.provider.requests.length, 2);
   });
 
+  test("(#169) onGuidanceChanged logs differently when no rubric exists yet and when heads exist but none uses the source", async () => {
+    await setUpRouteA(h);
+    // No head yet: the log says the first extraction is manual and names the script.
+    const none = await quiet(() => h.service.onGuidanceChanged({ sourceId: SOURCE_A_ID }));
+    assert.deepEqual(none.result, []);
+    assert.ok(none.lines.some((l) => l.includes("no rubric exists yet") && l.includes("by hand") && l.includes("extract:rubric")), none.lines.join("\n"));
+    // A head exists, but none lists this source: a different line, no "by hand" advice.
+    await runA(h);
+    const other = await quiet(() => h.service.onGuidanceChanged({ sourceId: "some-other-source" }));
+    assert.deepEqual(other.result, []);
+    assert.ok(other.lines.some((l) => l.includes("no rubric head lists this source")), other.lines.join("\n"));
+    assert.ok(!other.lines.some((l) => l.includes("no rubric exists yet")));
+  });
+
   test("a dry run plans the chunks, calls no model and writes nothing", async () => {
     await setUpRouteA(h);
     const { result } = await runA(h, { dryRun: true });

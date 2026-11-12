@@ -1603,7 +1603,18 @@ export class RubricExtractionService {
    */
   async onGuidanceChanged(event: Pick<GuidanceChangeEvent, "sourceId">): Promise<ExtractRouteResult[]> {
     const results: ExtractRouteResult[] = [];
-    for (const head of await this.store.listHeads()) {
+    const heads = await this.store.listHeads();
+    // (#169) Tell the two "nothing to do" cases apart in the log. With no head
+    // at all, no route has ever been extracted: a route's FIRST extraction is
+    // started by hand (owner decision, #112), so a changed source cannot start
+    // one. With heads but none listing this source, the source simply belongs
+    // to no extracted route. Behaviour is unchanged in both: nothing runs.
+    if (heads.length === 0) {
+      console.log(`${TAG} source ${event.sourceId} changed: no rubric exists yet for any route using this source; a route's first extraction must be started by hand (npm run extract:rubric)`);
+    } else if (!heads.some((h) => (h.sourceIds ?? []).includes(event.sourceId))) {
+      console.log(`${TAG} source ${event.sourceId} changed: rubrics exist, but no rubric head lists this source in its sourceIds, so nothing is re-drafted`);
+    }
+    for (const head of heads) {
       if (!(head.sourceIds ?? []).includes(event.sourceId)) continue;
       results.push(await this.extractRoute({ countryCode: head.countryCode, visaTypeId: head.visaTypeId, trigger: "guidance_changed" }));
     }

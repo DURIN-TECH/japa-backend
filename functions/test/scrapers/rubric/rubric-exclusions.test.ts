@@ -163,9 +163,65 @@ describe("previewExclusions: counts from the same function", () => {
       evidenceItemsDropped: 1,
       droppedIntakeQuestionIds: ["q-age"],
       droppedEvidenceItemKeys: ["ev-age"],
+      droppedIntakeQuestions: [{ id: "q-age", label: "Question q-age", reason: "no_kept_criterion", keptCriterionIds: [] }],
+      droppedEvidenceItems: [{ key: "ev-age", title: "Document ev-age", reason: "no_kept_criterion" }],
     });
     // The preview did not touch the rubric.
     assert.equal(r.intakeQuestions.length, 2);
+  });
+
+  test("(#169) says why each item drops: no kept criterion, or a dropped question it depends on; keptCriterionIds only for the dependency case", () => {
+    const { age, leave, held } = ids(rubric());
+    const cond = (questionId: string) => ({ questionId, op: "eq" as const, value: "yes" });
+    const r = rubric({
+      intakeQuestions: [
+        question("gate", [age]), // no kept criterion
+        question("dep", [leave, age], { showWhen: { anyOf: [cond("gate")] } }), // kept criterion `leave` still links to it
+        question("chain", [held], { showWhen: { anyOf: [cond("dep")] } }), // depends on a question that itself dropped
+        question("open", [leave]),
+      ],
+      evidenceItems: [
+        evidence("ev-gate", [age]),
+        evidence("ev-dep", [leave], { when: cond("gate") }),
+        evidence("ev-keep", [leave], { when: cond("open") }),
+      ],
+    });
+    const p = previewExclusions(r, [age]);
+    assert.deepEqual(p.droppedIntakeQuestions, [
+      { id: "gate", label: "Question gate", reason: "no_kept_criterion", keptCriterionIds: [] },
+      { id: "dep", label: "Question dep", reason: "depends_on_dropped_question", dependsOn: "gate", keptCriterionIds: [leave] },
+      { id: "chain", label: "Question chain", reason: "depends_on_dropped_question", dependsOn: "dep", keptCriterionIds: [held] },
+    ]);
+    assert.deepEqual(p.droppedEvidenceItems, [
+      { key: "ev-gate", title: "Document ev-gate", reason: "no_kept_criterion" },
+      { key: "ev-dep", title: "Document ev-dep", reason: "depends_on_dropped_question", dependsOn: "gate" },
+    ]);
+    // keptCriterionIds is non-empty exactly for the dependency drops.
+    for (const q of p.droppedIntakeQuestions) assert.equal(q.keptCriterionIds.length > 0, q.reason === "depends_on_dropped_question");
+  });
+
+  test("(#169) the reported drops are exactly what applyExclusions removes", () => {
+    const { age, leave, held } = ids(rubric());
+    const cond = (questionId: string) => ({ questionId, op: "eq" as const, value: "yes" });
+    const r = rubric({
+      intakeQuestions: [
+        question("gate", [age]),
+        question("dep", [leave], { showWhen: { anyOf: [cond("gate")] } }),
+        question("partly", [age, held], { showWhen: { anyOf: [cond("gate"), cond("open")] } }),
+        question("open", [leave]),
+      ],
+      evidenceItems: [evidence("a", [age]), evidence("b", [leave], { when: cond("dep") }), evidence("c", [held])],
+    });
+    for (const excl of [[age], [age, leave], [leave, held], []]) {
+      const p = previewExclusions(r, excl);
+      const out = applyExclusions({ ...r, excludedCriterionIds: excl });
+      const keptQ = new Set(out.intakeQuestions.map((q) => q.id));
+      const keptE = new Set(out.evidenceItems.map((e) => e.key));
+      assert.deepEqual(p.droppedIntakeQuestions.map((q) => q.id), r.intakeQuestions.map((q) => q.id).filter((id) => !keptQ.has(id)));
+      assert.deepEqual(p.droppedEvidenceItems.map((e) => e.key), r.evidenceItems.map((e) => e.key).filter((k) => !keptE.has(k)));
+      assert.deepEqual(p.droppedIntakeQuestions.map((q) => q.id), p.droppedIntakeQuestionIds);
+      assert.deepEqual(p.droppedEvidenceItems.map((e) => e.key), p.droppedEvidenceItemKeys);
+    }
   });
 
   test("an empty set removes nothing", () => {

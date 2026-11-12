@@ -157,6 +157,37 @@ Local runs use the Firestore and Storage emulators with a `demo-` project id
 and non-default ports. Do not seed or crawl a shared project from a feature
 branch.
 
+## First extraction of a new route is run by hand (issue #169)
+
+Seeding and crawling a route's sources does NOT create its rubric. After the
+sources are seeded and crawled (so each has a stored snapshot), start the
+route's first extraction yourself, from `functions/`:
+
+```bash
+# plan only (the default): reads the snapshots, prints the chunk plan, calls no model, writes nothing
+GCLOUD_PROJECT=<project> npm run extract:rubric -- --country=<cc> --visa=<visaTypeId> --sources=<sourceId>,<sourceId>
+# extract and write a pending_review version (model calls; needs ANTHROPIC_API_KEY in functions/.env.local)
+GCLOUD_PROJECT=<project> npm run extract:rubric -- --country=<cc> --visa=<visaTypeId> --sources=<sourceId>,<sourceId> --apply
+```
+
+Requirements:
+
+- The visa type document must already exist (`countries/<cc>/visaTypes/<visaTypeId>`).
+  Without it the run stops with `visa_type_not_found` and writes nothing.
+- Name every source the route's rubric is built from in `--sources`. They are
+  remembered on the rubric head (`sourceIds`) after this first run.
+- The result is a `pending_review` version; an admin reviews and approves it in
+  the portal. Nothing serves until then.
+
+Later guidance changes re-draft automatically, but ONLY for sources listed in
+a rubric head's `sourceIds`: when a source's snapshot hash moves,
+`onGuidanceSourceChanged` re-extracts every route whose head lists that source,
+as a new pending version. A changed source that no head lists starts nothing.
+The function logs which case it was: "no rubric exists yet for any route using
+this source" (no head at all: run the first extraction as above) or "no rubric
+head lists this source" (rubrics exist, this source belongs to none of them;
+add it to a route by re-running the script with `--sources` naming it).
+
 ## Schedule, run records and alerts (issue #143)
 
 `crawlGuidanceOrchestrator` (functions/src/index.ts) runs once a night at
