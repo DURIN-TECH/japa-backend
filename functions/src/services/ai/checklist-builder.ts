@@ -102,15 +102,15 @@ export function conditionHolds(cond: IntakeCondition, answers: Record<string, un
   const values = Array.isArray(answer) ? answer : [answer];
   const wanted = Array.isArray(cond.value) ? cond.value : [cond.value];
   switch (cond.op) {
-    case "eq":
-      return values.some((v) => v === cond.value);
-    case "neq":
-      return values.every((v) => v !== cond.value);
-    case "in":
-      return values.some((v) => wanted.includes(v as never));
-    default:
-      // Unknown operator from a newer rubric: do not guess, do not show.
-      return false;
+  case "eq":
+    return values.some((v) => v === cond.value);
+  case "neq":
+    return values.every((v) => v !== cond.value);
+  case "in":
+    return values.some((v) => wanted.includes(v as never));
+  default:
+    // Unknown operator from a newer rubric: do not guess, do not show.
+    return false;
   }
 }
 

@@ -777,7 +777,7 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   const strengths: AssessmentContent["strengths"] = [];
   const statementFindings: AssessmentContent["statementFindings"] = [];
   let droppedCount = input.judgement?.dropped ?? 0;
-  let unanchoredCount = input.judgement?.unanchored ?? 0;
+  const unanchoredCount = input.judgement?.unanchored ?? 0;
   const statementRef = input.statement ?? null;
 
   const seenRefusal = new Set<string>();

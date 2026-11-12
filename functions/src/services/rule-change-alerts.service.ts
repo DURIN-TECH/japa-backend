@@ -143,6 +143,7 @@ const FIELD_LABELS: Record<string, string> = {
   applicationUrl: "Application link",
   applicationInstructions: "Application instructions",
   eligibilityCriteria: "Requirements",
+  requiredDocuments: "Required documents",
 };
 
 /**
@@ -280,7 +281,10 @@ export function fieldLinesOf(diff: VisaFieldDiff[]): RuleChangeFieldLine[] {
   for (const d of diff) {
     if (d.field === "fee") {
       lines.push(feeLine(d.components));
-    } else if (d.field === "eligibilityCriteria") {
+    } else if (d.field === "eligibilityCriteria" || d.field === "requiredDocuments") {
+      // Integration (#123 x #129): #129 added a `requiredDocuments` list diff
+      // (added/removed names, no before/after). Like the prose fields it is named
+      // only, never quoted, so it is printed as "<label> updated".
       lines.push({ field: d.field, valueKind: "text", before: null, after: null });
     } else if (CLIENT_SAFE_SCALAR_FIELDS.has(d.field)) {
       lines.push({ field: d.field, valueKind: "scalar", before: printValue(d.before), after: d.kind === "removed" ? null : printValue(d.after) });

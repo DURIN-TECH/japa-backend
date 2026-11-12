@@ -21,7 +21,7 @@
  * NO authorisation here: callers (controller) have already run
  * `checkApplicationAccess`. NO model call anywhere in this file.
  */
-import { rubricStore } from "../../scrapers/rubric/rubric.store";
+import { rubricStore } from "../../scrapers";
 import { visaService } from "../visa.service";
 import { documentRequestService } from "../document-request.service";
 import { buildChecklist, ChecklistItem, ChecklistState } from "./checklist-builder";

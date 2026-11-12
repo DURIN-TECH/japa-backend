@@ -154,13 +154,13 @@ export function buildNoteText(args: {
   const lines: string[] = [
     `Decisions on applications recorded under "${args.nationalityName}", ${args.periodLabel}: ` +
       `${formatCount(n.granted)} of ${formatCount(n.decisions)} decisions were grants (${formatPercent(n.grantRate)}).`,
-    `Across all nationalities, same visas and period: ` +
+    "Across all nationalities, same visas and period: " +
       `${formatCount(a.granted)} of ${formatCount(a.decisions)} decisions were grants (${formatPercent(a.grantRate)}).`,
   ];
   if (n.other > 0) {
     lines.push(
       `${formatCount(n.other)} further applications for this nationality ended in another way (for example withdrawn); ` +
-        `they are not counted in the percentages.`
+        "they are not counted in the percentages."
     );
   }
   if (args.evidenceAreas.length > 0) {

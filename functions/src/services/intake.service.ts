@@ -119,15 +119,15 @@ async function loadApprovedIntake(
 function conditionHolds(cond: IntakeCondition, answers: Record<string, unknown>): boolean {
   const actual = answers[cond.questionId];
   switch (cond.op) {
-    case "eq":
-      return actual === cond.value;
-    case "neq":
-      // An unanswered question is not "different from" the value: stay hidden.
-      return actual !== undefined && actual !== null && actual !== cond.value;
-    case "in":
-      return Array.isArray(cond.value) && typeof actual === "string" && cond.value.includes(actual);
-    default:
-      return false;
+  case "eq":
+    return actual === cond.value;
+  case "neq":
+    // An unanswered question is not "different from" the value: stay hidden.
+    return actual !== undefined && actual !== null && actual !== cond.value;
+  case "in":
+    return Array.isArray(cond.value) && typeof actual === "string" && cond.value.includes(actual);
+  default:
+    return false;
   }
 }
 
@@ -218,69 +218,69 @@ function validateAnswer(q: IntakeQuestion, raw: unknown): unknown {
   };
 
   switch (q.answerType) {
-    case "single_choice": {
-      const allowed = (q.options ?? []).map((o) => o.value);
-      if (typeof raw !== "string" || !allowed.includes(raw)) return fail("choose one of the options");
-      return raw;
+  case "single_choice": {
+    const allowed = (q.options ?? []).map((o) => o.value);
+    if (typeof raw !== "string" || !allowed.includes(raw)) return fail("choose one of the options");
+    return raw;
+  }
+  case "multi_choice": {
+    const allowed = (q.options ?? []).map((o) => o.value);
+    if (!Array.isArray(raw) || raw.length > MAX_MULTI_CHOICE) return fail("choose from the options");
+    if (!raw.every((v) => typeof v === "string" && allowed.includes(v))) {
+      return fail("choose from the options");
     }
-    case "multi_choice": {
-      const allowed = (q.options ?? []).map((o) => o.value);
-      if (!Array.isArray(raw) || raw.length > MAX_MULTI_CHOICE) return fail("choose from the options");
-      if (!raw.every((v) => typeof v === "string" && allowed.includes(v))) {
-        return fail("choose from the options");
-      }
-      return Array.from(new Set(raw as string[]));
+    return Array.from(new Set(raw as string[]));
+  }
+  case "yes_no": {
+    if (typeof raw !== "boolean") return fail("answer yes or no");
+    return raw;
+  }
+  case "date": {
+    if (!isRealDate(raw)) return fail("enter a valid date");
+    const problem = checkDateLimits(q, raw);
+    if (problem) return fail(problem);
+    return raw;
+  }
+  case "date_range": {
+    const r = raw as { from?: unknown; to?: unknown } | null;
+    if (!r || typeof r !== "object" || !isRealDate(r.from) || !isRealDate(r.to)) {
+      return fail("enter a valid start and end date");
     }
-    case "yes_no": {
-      if (typeof raw !== "boolean") return fail("answer yes or no");
-      return raw;
+    if (r.to < r.from) return fail("the end date is before the start date");
+    const p1 = checkDateLimits(q, r.from);
+    if (p1) return fail(p1);
+    const p2 = checkDateLimits(q, r.to);
+    if (p2) return fail(p2);
+    if (q.maxLengthDays && daysBetween(r.from, r.to) > q.maxLengthDays) {
+      return fail(`the dates are more than ${q.maxLengthDays} days apart`);
     }
-    case "date": {
-      if (!isRealDate(raw)) return fail("enter a valid date");
-      const problem = checkDateLimits(q, raw);
-      if (problem) return fail(problem);
-      return raw;
-    }
-    case "date_range": {
-      const r = raw as { from?: unknown; to?: unknown } | null;
-      if (!r || typeof r !== "object" || !isRealDate(r.from) || !isRealDate(r.to)) {
-        return fail("enter a valid start and end date");
-      }
-      if (r.to < r.from) return fail("the end date is before the start date");
-      const p1 = checkDateLimits(q, r.from);
-      if (p1) return fail(p1);
-      const p2 = checkDateLimits(q, r.to);
-      if (p2) return fail(p2);
-      if (q.maxLengthDays && daysBetween(r.from, r.to) > q.maxLengthDays) {
-        return fail(`the dates are more than ${q.maxLengthDays} days apart`);
-      }
-      return { from: r.from, to: r.to };
-    }
-    case "text": {
-      if (typeof raw !== "string") return fail("enter text");
-      const text = raw.trim();
-      const max = q.textLimits?.maxLength ?? MAX_TEXT_LENGTH;
-      const min = q.textLimits?.minLength ?? 0;
-      if (text.length > max) return fail(`keep it to ${max} characters or fewer`);
-      if (text.length < min) return fail(`use at least ${min} characters`);
-      return text;
-    }
-    case "amount": {
-      const r = raw as { amount?: unknown; currency?: unknown } | null;
-      const okAmount =
+    return { from: r.from, to: r.to };
+  }
+  case "text": {
+    if (typeof raw !== "string") return fail("enter text");
+    const text = raw.trim();
+    const max = q.textLimits?.maxLength ?? MAX_TEXT_LENGTH;
+    const min = q.textLimits?.minLength ?? 0;
+    if (text.length > max) return fail(`keep it to ${max} characters or fewer`);
+    if (text.length < min) return fail(`use at least ${min} characters`);
+    return text;
+  }
+  case "amount": {
+    const r = raw as { amount?: unknown; currency?: unknown } | null;
+    const okAmount =
         !!r && typeof r.amount === "number" && Number.isFinite(r.amount) && r.amount >= 0;
-      const okCurrency =
+    const okCurrency =
         !!r &&
         typeof r.currency === "string" &&
         CURRENCY_CODE.test(r.currency) &&
         (!q.currencies || q.currencies.length === 0 || q.currencies.includes(r.currency));
-      if (!r || !okAmount || !okCurrency) return fail("enter the amount in numbers and choose a currency");
-      return { amount: r.amount, currency: r.currency };
-    }
-    default:
-      // A type this backend version doesn't know: refuse rather than store
-      // an unvalidated value.
-      return fail("this question can't be answered in this version");
+    if (!r || !okAmount || !okCurrency) return fail("enter the amount in numbers and choose a currency");
+    return { amount: r.amount, currency: r.currency };
+  }
+  default:
+    // A type this backend version doesn't know: refuse rather than store
+    // an unvalidated value.
+    return fail("this question can't be answered in this version");
   }
 }
 

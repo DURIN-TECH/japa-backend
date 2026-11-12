@@ -471,10 +471,10 @@ export class TemplateDraftService {
     const app = req.application;
     const facts: DraftCaseFacts | null = app
       ? {
-          applicantName: (app.clientName ?? "").trim() || "[Applicant full name]",
-          visaTypeName: (app.visaTypeName ?? "").trim() || "[Visa type]",
-          destinationCountryName: (app.countryName ?? "").trim() || "[Destination country]",
-        }
+        applicantName: (app.clientName ?? "").trim() || "[Applicant full name]",
+        visaTypeName: (app.visaTypeName ?? "").trim() || "[Visa type]",
+        destinationCountryName: (app.countryName ?? "").trim() || "[Destination country]",
+      }
       : null;
     // What to cover: the approved rubric's evidence items for THIS application's route.
     const evidence = app ? await this.deps.evidenceFor(app.countryCode, app.visaTypeId) : [];

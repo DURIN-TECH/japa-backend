@@ -86,6 +86,8 @@ export { rubricExtractionService } from "./rubric/rubric-extraction.service";
 export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
 /** Structural rubric validator (the review API re-runs it before approving). */
 export { validateVisaRubric } from "./rubric/rubric-validate";
+/** Validator issue shape (type-only; the review API reports it). */
+export type { RubricIssue } from "./rubric/rubric-validate";
 /** Verbatim-quote lookup in a stored snapshot (the review API's stale-citation check). */
 export { SnapshotQuoteIndex } from "./rubric/rubric-quote";
 /** Rubric types for consumers (the assessment engine, #42). Type-only. */

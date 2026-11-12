@@ -2,7 +2,7 @@ import { createHash } from "crypto";
 import { getStorage } from "firebase-admin/storage";
 import { Timestamp } from "firebase-admin/firestore";
 import { collections, db } from "../../utils/firebase";
-import { rubricStore } from "../../scrapers/rubric/rubric.store";
+import { rubricStore } from "../../scrapers";
 import type { Application, Document, User } from "../../types";
 import type { VisaRubric } from "../../types/rubric";
 import type { RefusalAnalysis } from "../../types/refusal-letter";
