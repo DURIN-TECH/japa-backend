@@ -472,6 +472,7 @@ async function seedAgents() {
       successRate: 92,
       responseTime: "2-4 hours",
       consultationFee: 5000,
+      consultationFeeUnit: "naira", // marker (#148): re-seeding then migrating must not /100 this
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "09:00", endTime: "17:00" },
@@ -502,6 +503,7 @@ async function seedAgents() {
       successRate: 87,
       responseTime: "4-8 hours",
       consultationFee: 3000,
+      consultationFeeUnit: "naira", // marker (#148): re-seeding then migrating must not /100 this
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "10:00", endTime: "18:00" },
@@ -532,6 +534,7 @@ async function seedAgents() {
       successRate: 85,
       responseTime: "6-12 hours",
       consultationFee: 2500,
+      consultationFeeUnit: "naira", // marker (#148): re-seeding then migrating must not /100 this
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "09:00", endTime: "15:00" },
@@ -2397,7 +2400,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 30,
       timezone: "Africa/Lagos",
       status: "completed",
-      fee: 500000,
+      fee: 5000, // whole naira (#148)
       paymentStatus: "paid",
       meetingPlatform: "zoom",
       summary: "Discussed visa requirements and document checklist. Client has strong financials.",
@@ -2419,7 +2422,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 45,
       timezone: "Africa/Lagos",
       status: "completed",
-      fee: 300000,
+      fee: 3000, // whole naira (#148)
       paymentStatus: "paid",
       meetingPlatform: "google_meet",
       summary: "Reviewed employment contract and qualification documents. Degree certificate needs re-scan.",
@@ -2441,7 +2444,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 60,
       timezone: "Africa/Lagos",
       status: "confirmed",
-      fee: 800000,
+      fee: 8000, // whole naira (#148)
       paymentStatus: "paid",
       meetingPlatform: "zoom",
       meetingLink: "https://zoom.us/j/1234567890",
@@ -2484,7 +2487,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 30,
       timezone: "Africa/Lagos",
       status: "completed",
-      fee: 250000,
+      fee: 2500, // whole naira (#148)
       paymentStatus: "paid",
       summary: "Initial consultation for Short Stay C Visa. Discussed travel history and documentation plan.",
       createdAt: daysAgo(57),
@@ -2505,7 +2508,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 30,
       timezone: "Asia/Kolkata",
       status: "cancelled",
-      fee: 250000,
+      fee: 2500, // whole naira (#148)
       paymentStatus: "refunded",
       cancelledAt: daysAgo(26),
       cancelledBy: IDS.client9User,
@@ -2528,7 +2531,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 30,
       timezone: "Africa/Accra",
       status: "confirmed",
-      fee: 500000,
+      fee: 5000, // whole naira (#148)
       paymentStatus: "paid",
       meetingPlatform: "zoom",
       meetingLink: "https://zoom.us/j/9876543210",

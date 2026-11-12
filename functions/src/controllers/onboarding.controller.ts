@@ -88,6 +88,7 @@ class OnboardingController {
         successRate: 0,
         responseTime: "N/A",
         consultationFee: 0,
+        consultationFeeUnit: "naira", // server-owned marker (#148): fee is whole naira
         isAvailable: false,
         createdAt: now,
         updatedAt: now,
@@ -293,6 +294,7 @@ class OnboardingController {
           successRate: 0,
           responseTime: "N/A",
           consultationFee: 0,
+          consultationFeeUnit: "naira", // server-owned marker (#148): fee is whole naira
           isAvailable: true,
           createdAt: now,
           updatedAt: now,

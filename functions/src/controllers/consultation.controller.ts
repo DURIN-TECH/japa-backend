@@ -833,7 +833,9 @@ export class ConsultationController {
           consultationId,
           clientUserId: consultation.userId,
           agentUserId: consultation.agentId,
-          amount: consultation.fee,
+          // `consultation.fee` is whole NAIRA; `Transaction.amount` is KOBO like every
+          // other transaction, so convert here (50,000 naira -> 5,000,000 kobo).
+          amount: consultation.fee * 100,
           reference,
           clientName: consultation.clientName,
           clientEmail: consultation.clientEmail,

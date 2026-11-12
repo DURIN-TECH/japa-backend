@@ -150,6 +150,7 @@ class AgentService {
       successRate: 0,
       responseTime: "24-48 hours",
       consultationFee: input.consultationFee,
+      consultationFeeUnit: "naira", // server-owned marker (#148): fee is whole naira
       isAvailable: false, // Not available until verified
       availableSlots: input.availableSlots || [],
       createdAt: now,
@@ -271,8 +272,17 @@ class AgentService {
       this.assertMayBeAvailable(doc.data() as Agent, updates.isAvailable);
     }
 
+    // Server-owned unit marker (#148): whenever the fee is written it is whole
+    // naira, so stamp it. It is NOT in AGENT_SELF_EDITABLE_FIELDS, so a client
+    // can neither set nor clear it; it is only added here, and only together
+    // with a fee, because stamping an unrelated edit would mark a still-kobo
+    // fee as naira and make the migration skip it.
+    const feeMarker =
+      updates.consultationFee !== undefined ? { consultationFeeUnit: "naira" as const } : {};
+
     await agentRef.update({
       ...updates,
+      ...feeMarker,
       updatedAt: serverTimestamp(),
     });
 

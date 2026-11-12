@@ -407,7 +407,7 @@ A scheduled meeting between a User and an Agent.
 | scheduledTime           | string    | e.g., "10:30"                                                                           |
 | durationMinutes         | number    |                                                                                         |
 | status                  | enum      | pending_payment → scheduled → confirmed → in_progress → completed / cancelled / no_show |
-| fee                     | number    | Cents                                                                                   |
+| fee                     | number    | Whole naira (#148); Paystack kobo is computed at charge time                            |
 | paymentStatus           | enum      |                                                                                         |
 | transactionId           | string?   | **FK → transactions**                                                                   |
 | meetingLink             | string?   |                                                                                         |

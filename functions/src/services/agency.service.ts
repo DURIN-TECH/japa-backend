@@ -706,6 +706,7 @@ class AgencyService {
         successRate: 0,
         responseTime: "N/A",
         consultationFee: 0,
+        consultationFeeUnit: "naira", // server-owned marker (#148): fee is whole naira
         isAvailable: true,
         createdAt: now,
         updatedAt: now,

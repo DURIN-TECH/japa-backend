@@ -228,7 +228,7 @@ class TransactionService {
     consultationId: string;
     clientUserId: string;
     agentUserId?: string;
-    amount: number; // in cents
+    amount: number; // in kobo (minor units), like every Transaction.amount
     currency?: string;
     reference: string; // Paystack transaction reference
     clientName?: string;
