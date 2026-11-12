@@ -74,3 +74,17 @@ export { guidanceCrawlService } from "./guidance/guidance-crawl.service";
 export { guidanceSnapshotStore } from "./guidance/guidance-snapshot.store";
 /** Guidance source registry seed. */
 export { seedGuidanceSources } from "./guidance/data/seed-guidance-sources";
+
+// ---- Visa rubrics (issue #40) ----
+/** Rubric extraction from guidance snapshots (always writes `pending_review`). */
+export { rubricExtractionService } from "./rubric/rubric-extraction.service";
+/**
+ * Rubric store. Consumers use `getApprovedRubric` ONLY (an unapproved version
+ * is never returned by it); the `...ForReview` reads are for the admin review
+ * API (#125).
+ */
+export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
+/** Structural rubric validator (the review API re-runs it before approving). */
+export { validateVisaRubric } from "./rubric/rubric-validate";
+/** Verbatim-quote lookup in a stored snapshot (the review API's stale-citation check). */
+export { SnapshotQuoteIndex } from "./rubric/rubric-quote";

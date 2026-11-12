@@ -610,6 +610,11 @@ service cloud.firestore {
     //    subcollection: the caseworker-guidance source registry and the
     //    metadata of its immutable text snapshots (issue #39). Admins read
     //    the registry via GET /admin/guidance-sources. Do NOT add a match.
+    //  - visaRubrics/{routeKey} and its rubricVersions/{version}
+    //    subcollection, and rubricExtractionRuns/{runId}: rubrics extracted
+    //    from caseworker guidance, staged `pending_review` for an admin, and
+    //    the record of each extraction run (issue #40). Consumers only ever
+    //    get an APPROVED version, through the backend. Do NOT add a match.
 
     // ---- Agency visa revisions (issue #100), explicit deny (issue #102) ----
     // visaRevisions/{cc}__{visaId}: unreviewed agency edits to an approved
