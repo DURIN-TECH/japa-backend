@@ -305,6 +305,76 @@ class DocumentRequestService {
   }
 
   /**
+   * Add SOME checklist items the applicant confirmed (issue #122). SERVER-SIDE
+   * ONLY, after the caller was authorised as the applicant.
+   *
+   * Unlike `syncChecklist`, this NEVER cancels, updates or reopens anything but
+   * a request the system itself cancelled: `syncChecklist` treats its input as
+   * the whole list and would cancel every pending item not in it, which a
+   * subset must not do. Same deterministic id (`{applicationId}__{checklistItemId}`)
+   * and same `create()`, so a repeat confirm, a concurrent one, or an item already
+   * on the applicant's checklist creates no duplicate.
+   * Returns the ids newly put on the list and the ids that already were.
+   */
+  async addChecklistItems(
+    application: { id: string; userId: string; agencyId?: string | null; visaTypeName?: string; countryName?: string },
+    items: ChecklistItem[]
+  ): Promise<{ added: string[]; alreadyListed: string[] }> {
+    const existing = await this.listChecklistForApplication(application.id);
+    const byItemId = new Map(existing.map((r) => [r.checklistItemId, r]));
+    const out = { added: [] as string[], alreadyListed: [] as string[] };
+    const now = Timestamp.now();
+    for (const item of items) {
+      const found = byItemId.get(item.checklistItemId);
+      const fields = {
+        documentType: item.title,
+        holder: item.holder,
+        reason: item.reason,
+        required: item.required,
+        citation: item.citation,
+        ...(item.criterionRef ? { criterionRef: item.criterionRef } : {}),
+      };
+      if (found && !(found.status === "cancelled" && found.resolvedBy === CHECKLIST_SYSTEM_ACTOR_ID)) {
+        // Pending, fulfilled, waived, or cancelled by an agent: leave it exactly as it is.
+        out.alreadyListed.push(item.checklistItemId);
+        continue;
+      }
+      if (found) {
+        // The system cancelled it earlier: bring it back (as syncChecklist does).
+        await collections.documentRequests.doc(found.id).update({ ...fields, status: "pending", resolvedBy: FieldValue.delete(), updatedAt: now });
+        out.added.push(item.checklistItemId);
+        continue;
+      }
+      const ref = collections.documentRequests.doc(`${application.id}__${item.checklistItemId}`);
+      const request: DocumentRequest = {
+        id: ref.id,
+        applicationId: application.id,
+        userId: application.userId,
+        agencyId: application.agencyId ?? null,
+        status: "pending",
+        requestedBy: CHECKLIST_SYSTEM_ACTOR_ID,
+        requestedByName: CHECKLIST_SYSTEM_ACTOR_NAME,
+        origin: "checklist",
+        checklistItemId: item.checklistItemId,
+        ...fields,
+        ...(application.visaTypeName ? { visaTypeName: application.visaTypeName } : {}),
+        ...(application.countryName ? { countryName: application.countryName } : {}),
+        createdAt: now,
+        updatedAt: now,
+      };
+      try {
+        await ref.create(request);
+        out.added.push(item.checklistItemId);
+      } catch (e) {
+        // ALREADY_EXISTS: a concurrent confirm won the race. Fine (idempotent).
+        if ((e as { code?: number }).code !== 6) throw e;
+        out.alreadyListed.push(item.checklistItemId);
+      }
+    }
+    return out;
+  }
+
+  /**
    * Count a client's outstanding (pending) requests — powers the "N items need
    * your attention" badge without shipping the full list to the caller.
    */

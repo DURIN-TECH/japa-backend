@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { aiCaseOfficerController } from "../controllers/ai-case-officer.controller";
 import { aiChatController } from "../controllers/ai-chat.controller";
+import { refusalLetterController } from "../controllers/refusal-letter.controller";
 import { verifyAuth } from "../middleware/auth";
 import { aiActionController, requireCaseOfficerPlanFailClosed } from "../controllers/ai-action.controller";
 
@@ -24,6 +25,8 @@ import { aiActionController, requireCaseOfficerPlanFailClosed } from "../control
 //   POST   /ai/applications/:id/chat      ask one question (issue #45)
 //   GET    /ai/applications/:id/chat      the caller's own chat history
 //   DELETE /ai/applications/:id/chat      clear the caller's own chat history
+//   POST /ai/refusal-letters              start reading an uploaded refusal letter (#122)
+//   GET  /ai/refusal-letters/:id          one refusal-letter analysis, by id (#122)
 
 const aiRoutes = Router();
 
@@ -49,5 +52,11 @@ aiRoutes.post("/assessments/:id/actions/:actionId/reject", verifyAuth, requireCa
 aiRoutes.post("/applications/:id/chat", verifyAuth, (req, res) => aiChatController.ask(req, res));
 aiRoutes.get("/applications/:id/chat", verifyAuth, (req, res) => aiChatController.history(req, res));
 aiRoutes.delete("/applications/:id/chat", verifyAuth, (req, res) => aiChatController.clear(req, res));
+// ---- refusal-letter analysis (issue #122) ----
+aiRoutes.post("/refusal-letters", verifyAuth, (req, res) => refusalLetterController.create(req, res));
+aiRoutes.get("/refusal-letters/:id", verifyAuth, (req, res) => refusalLetterController.byId(req, res));
+aiRoutes.post("/refusal-letters/:id/checklist/confirm", verifyAuth, (req, res) =>
+  refusalLetterController.confirmChecklist(req, res)
+);
 
 export { aiRoutes };
