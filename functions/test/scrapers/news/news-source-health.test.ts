@@ -118,7 +118,7 @@ function makeScraper(dueIds: string[]) {
     completeScrapeRun: newsService.completeScrapeRun.bind(newsService),
     updateSourceAfterScrape: health.updateSourceAfterScrape.bind(health),
     pauseForMissingApiKey: health.pauseForMissingApiKey.bind(health),
-    isDuplicate: async () => false,
+    findExistingHashes: async () => new Set<string>(),
     createArticlesBatch: async (a: unknown[]) => a.length,
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

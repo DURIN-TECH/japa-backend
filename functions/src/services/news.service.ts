@@ -11,6 +11,65 @@ import {
 import { Timestamp } from "firebase-admin/firestore";
 
 // ============================================
+// RETENTION + QUERY CONSTANTS (issue #19)
+// ============================================
+
+/**
+ * How long an article is kept, in days, counted from the LATER of its
+ * `publishedAt` and its ingest time (`createdAt`). Firestore TTL deletes the
+ * doc about 24h after `expireAt` (declared in firestore.indexes.json
+ * `fieldOverrides`, collection group `newsArticles`). Replaces the weekly
+ * `cleanupOldNews` sweep, which only removed 400 docs per run.
+ */
+export const NEWS_ARTICLE_RETENTION_DAYS = 90;
+
+/**
+ * How long a per-source run log (`newsSources/{id}/scrapeRuns`) is kept, in
+ * days from `startedAt`. Covered by the `scrapeRuns` TTL declaration, which is
+ * collection-group scoped and so also matches these docs.
+ */
+export const NEWS_SCRAPE_RUN_RETENTION_DAYS = 30;
+
+/** Milliseconds in a day (retention maths). */
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Firestore's cap on the number of values in one `in` filter. */
+export const FIRESTORE_IN_LIMIT = 30;
+
+/**
+ * Split `values` into chunks of at most `size` (default: Firestore's `in`
+ * limit of 30), keeping order. Pure: an empty input gives no chunks, so a
+ * caller issues no query at all.
+ */
+export function chunkForInQuery<T>(values: readonly T[], size = FIRESTORE_IN_LIMIT): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < values.length; i += size) {
+    chunks.push(values.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * The TTL deadline of an article: the later of `publishedAt` and `createdAt`
+ * plus 90 days. Using the later one keeps an article with a missing, future
+ * or very old `publishedAt` for 90 days from ingest, instead of deleting it
+ * within a day and re-scraping it from the feed. `publishedAt` may be absent
+ * on legacy docs (the backfill passes whatever the doc has).
+ */
+export function articleExpireAt(
+  publishedAt: Timestamp | undefined | null,
+  createdAt: Timestamp
+): Timestamp {
+  const base = Math.max(publishedAt ? publishedAt.toMillis() : 0, createdAt.toMillis());
+  return Timestamp.fromMillis(base + NEWS_ARTICLE_RETENTION_DAYS * DAY_MS);
+}
+
+/** The TTL deadline of a per-source run log: `startedAt` + 30 days. */
+export function scrapeRunExpireAt(startedAt: Timestamp): Timestamp {
+  return Timestamp.fromMillis(startedAt.toMillis() + NEWS_SCRAPE_RUN_RETENTION_DAYS * DAY_MS);
+}
+
+// ============================================
 // QUERY OPTIONS
 // ============================================
 
@@ -63,7 +122,7 @@ class NewsService {
   async createArticlesBatch(
     articles: Omit<
       NewsArticle,
-      "id" | "viewCount" | "bookmarkCount" | "createdAt" | "updatedAt"
+      "id" | "viewCount" | "bookmarkCount" | "createdAt" | "updatedAt" | "expireAt"
     >[]
   ): Promise<number> {
     if (articles.length === 0) return 0;
@@ -80,6 +139,8 @@ class NewsService {
         bookmarkCount: 0,
         createdAt: now,
         updatedAt: now,
+        // TTL deadline (see articleExpireAt): Firestore deletes the doc itself.
+        expireAt: articleExpireAt(data.publishedAt, now),
       };
       batch.set(ref, article);
     }
@@ -95,41 +156,51 @@ class NewsService {
   }
 
   /**
-   * Check if a URL hash or title hash already exists.
-   * Returns true if the article is a duplicate.
+   * Which of the given hashes are already stored on a `newsArticles` doc.
+   *
+   * Replaces the per-article `isDuplicate` (two awaited queries per article):
+   * the hashes are de-duplicated, split into chunks of at most 30 (Firestore's
+   * `in` limit) and every chunk is queried at once, so a source with N
+   * articles issues `2 * ceil(N / 30)` queries, run concurrently. Single-field
+   * equality filters, so no composite index is needed. Only the hash field is
+   * read (`select`), not whole articles.
+   *
+   * The result is ONE set holding matching url hashes and title hashes; the
+   * two hash kinds are digests of different strings, so they cannot clash.
+   * An article is a duplicate when its urlHash OR its titleHash is in it.
+   *
+   * Query-then-write, so it is race-safe only while one orchestrator runs
+   * (the per-source lease guarantees that today; see #14).
    */
-  async isDuplicate(urlHash: string, titleHash: string): Promise<boolean> {
-    // Check URL hash first (exact duplicate)
-    const urlCheck = await collections.newsArticles
-      .where("urlHash", "==", urlHash)
-      .limit(1)
-      .get();
-    if (!urlCheck.empty) return true;
+  async findExistingHashes(
+    urlHashes: readonly string[],
+    titleHashes: readonly string[]
+  ): Promise<Set<string>> {
+    const found = new Set<string>();
 
-    // Check title hash (same title from different URL)
-    const titleCheck = await collections.newsArticles
-      .where("titleHash", "==", titleHash)
-      .limit(1)
-      .get();
-    return !titleCheck.empty;
-  }
+    // One query per chunk and per hash field, all started together.
+    const lookups: Promise<void>[] = [];
+    const lookup = (field: "urlHash" | "titleHash", hashes: readonly string[]) => {
+      for (const chunk of chunkForInQuery([...new Set(hashes)])) {
+        lookups.push(
+          collections.newsArticles
+            .where(field, "in", chunk)
+            .select(field)
+            .get()
+            .then((snapshot) => {
+              snapshot.docs.forEach((doc) => {
+                const value = (doc.data() as Record<string, unknown>)[field];
+                if (typeof value === "string") found.add(value);
+              });
+            })
+        );
+      }
+    };
+    lookup("urlHash", urlHashes);
+    lookup("titleHash", titleHashes);
 
-  async cleanupOldArticles(olderThanDays: number): Promise<number> {
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - olderThanDays);
-    const cutoffTimestamp = Timestamp.fromDate(cutoff);
-
-    const snapshot = await collections.newsArticles
-      .where("publishedAt", "<", cutoffTimestamp)
-      .limit(400)
-      .get();
-
-    if (snapshot.empty) return 0;
-
-    const batch = db.batch();
-    snapshot.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
-    return snapshot.size;
+    await Promise.all(lookups);
+    return found;
   }
 
   // ============================================
@@ -182,6 +253,7 @@ class NewsService {
    */
   async createScrapeRun(sourceId: string, runId?: string): Promise<string> {
     const ref = subcollections.scrapeRuns(sourceId).doc();
+    const startedAt = Timestamp.now();
     const run: ScrapeRun = {
       id: ref.id,
       sourceId,
@@ -191,7 +263,9 @@ class NewsService {
       articlesNew: 0,
       articlesDuplicate: 0,
       articlesFailed: 0,
-      startedAt: Timestamp.now(),
+      startedAt,
+      // TTL deadline for this log (replaces the weekly cleanup sweep).
+      expireAt: scrapeRunExpireAt(startedAt),
     };
     await ref.set(run);
     return ref.id;
@@ -216,41 +290,6 @@ class NewsService {
       .limit(Math.min(limit, 50))
       .get();
     return snapshot.docs.map((doc) => doc.data() as ScrapeRun);
-  }
-
-  /**
-   * Delete per-source news run logs (`newsSources/{id}/scrapeRuns`) older
-   * than `olderThanDays`, at most 400 per call (one batch).
-   *
-   * Issue #81: this used to be a collection-group query on "scrapeRuns",
-   * which would ALSO match the new top-level `scrapeRuns/{runId}` run
-   * records (same collection ID) and delete them after 30 days instead of
-   * their 180-day TTL. It now queries each news source's subcollection
-   * directly (a handful of sources), so top-level run records are never
-   * touched here — they are removed only by the Firestore TTL policy.
-   */
-  async cleanupOldScrapeRuns(olderThanDays: number): Promise<number> {
-    const cutoff = Timestamp.fromDate(
-      new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000)
-    );
-    const MAX_DELETES = 400; // one batch (Firestore allows 500 writes)
-    const sources = await collections.newsSources.get();
-    const refs: FirebaseFirestore.DocumentReference[] = [];
-    for (const source of sources.docs) {
-      if (refs.length >= MAX_DELETES) break;
-      const snapshot = await subcollections
-        .scrapeRuns(source.id)
-        .where("startedAt", "<", cutoff)
-        .limit(MAX_DELETES - refs.length)
-        .get();
-      snapshot.docs.forEach((doc) => refs.push(doc.ref));
-    }
-
-    if (refs.length === 0) return 0;
-    const batch = db.batch();
-    refs.forEach((ref) => batch.delete(ref));
-    await batch.commit();
-    return refs.length;
   }
 
   // ============================================

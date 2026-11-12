@@ -829,6 +829,12 @@
       "indexes": []
     },
     {
+      "collectionGroup": "newsArticles",
+      "fieldPath": "expireAt",
+      "ttl": true,
+      "indexes": []
+    },
+    {
       "collectionGroup": "scrapeAlerts",
       "fieldPath": "expireAt",
       "ttl": true,

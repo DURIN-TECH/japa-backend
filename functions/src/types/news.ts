@@ -161,6 +161,12 @@ export interface NewsArticle {
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
+
+  // Retention (issue #19): max(publishedAt, createdAt) + 90 days. Firestore
+  // TTL deletes the doc after this; policy = the `newsArticles` / `expireAt`
+  // entry in `fieldOverrides` of firestore.indexes.json. Docs written before
+  // #19 get it from `npm run backfill:expireat`.
+  expireAt: Timestamp;
 }
 
 // ============================================
@@ -195,6 +201,11 @@ export interface ScrapeRun {
   // Debug
   httpStatusCode?: number;
   responseTimeMs?: number;
+
+  // Retention (issue #19): startedAt + 30 days. Covered by the `scrapeRuns`
+  // `expireAt` TTL entry in `fieldOverrides` of firestore.indexes.json (its
+  // collection-group scope also matches newsSources/{id}/scrapeRuns).
+  expireAt: Timestamp;
 }
 
 // ============================================
