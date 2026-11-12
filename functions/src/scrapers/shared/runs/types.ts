@@ -15,7 +15,7 @@ import type { CostTotals, LlmUsage, RunCostBreakdown } from "../cost/types";
 // The same collection ID is ALSO used by the legacy per-source news log
 // `newsSources/{id}/scrapeRuns/{id}` (ScrapeRun in types/news.ts). Firestore
 // collection-group queries / TTL policies on "scrapeRuns" therefore span both;
-// see the notes in news.service.ts (cleanupOldScrapeRuns) and src/scrapers/shared/runs/scrape-runs.md.
+// see the notes in news.service.ts (scrapeRunExpireAt) and src/scrapers/shared/runs/scrape-runs.md.
 //
 // Forward compatibility (#82 cost, #83 alerting): every field below that a
 // later issue may add to is optional or a plain map, and readers must ignore

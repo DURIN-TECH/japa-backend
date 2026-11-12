@@ -87,7 +87,6 @@ import { visaService } from "./services/visa.service";
 import { newsScraperService } from "./scrapers";
 import { visaCatalogCrawlService } from "./scrapers";
 import { guidanceCrawlService } from "./scrapers";
-import { newsService } from "./services/news.service";
 import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
 import { notificationService } from "./services/notification.service";
@@ -696,26 +695,6 @@ export const processOutcomeStatisticsRunRequest = functions
   .firestore.document("outcomeStatisticsRunRequests/{requestId}")
   .onCreate(async (_snapshot, context) => {
     await outcomeRunWorker.process(context.params.requestId);
-  });
-
-/**
- * Weekly: Clean up old news articles and scrape runs
- * Runs every Sunday at 4 AM UTC
- */
-export const cleanupOldNews = functions.pubsub
-  .schedule("0 4 * * 0")
-  .timeZone("UTC")
-  .onRun(async () => {
-    console.log("Running news cleanup...");
-    try {
-      const articlesDeleted = await newsService.cleanupOldArticles(90);
-      const runsDeleted = await newsService.cleanupOldScrapeRuns(30);
-      console.log(
-        `News cleanup: ${articlesDeleted} articles, ${runsDeleted} scrape runs deleted`
-      );
-    } catch (error) {
-      console.error("News cleanup failed:", error);
-    }
   });
 
 /**

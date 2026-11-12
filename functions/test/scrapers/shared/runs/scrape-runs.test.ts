@@ -27,7 +27,6 @@
 //  - review follow-ups: transactional stale sweep, late finalize clears the
 //    stale fatalError, run-level warnings (fee re-convert), `empty` sources,
 //    #86 supplement-only rows, GET /admin/scrape-runs/stats
-//  - news cleanupOldScrapeRuns no longer touches top-level run records
 
 import { test, describe, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -47,7 +46,6 @@ let crawl: any;
 let adapters: any;
 let extractMod: any;
 let newsMod: any;
-let newsSvc: any;
 let controller: any;
 let firebase: any;
 
@@ -64,7 +62,6 @@ before(async () => {
   adapters = await import("../../../../src/scrapers/visa-catalog/adapters");
   extractMod = await import("../../../../src/scrapers/visa-catalog/visa-catalog-extract.service");
   newsMod = await import("../../../../src/scrapers/news/news-scraper.service");
-  newsSvc = (await import("../../../../src/services/news.service")).newsService;
   controller = (await import("../../../../src/scrapers/shared/runs/scrape-run.controller")).scrapeRunController;
 });
 
@@ -563,7 +560,7 @@ describe("news orchestrator run records", () => {
           createdRuns.push({ sourceId, runId });
           return `log-${sourceId}`;
         },
-        isDuplicate: async () => false,
+        findExistingHashes: async () => new Set<string>(),
         createArticlesBatch: async (a: unknown[]) => a.length,
         updateSourceAfterScrape: async () => undefined,
         completeScrapeRun: async () => undefined,
@@ -868,34 +865,5 @@ describe("scrape-run controller", () => {
     assert.equal((await call("sources", req(ROLES.ADMIN, { query: { kind: "x" } }))).status, 400);
     // Valid date forms: ISO and epoch ms.
     assert.equal((await call("list", req(ROLES.ADMIN, { query: { from: "2026-11-01", to: String(NOW) } }))).status, 200);
-  });
-});
-
-// ============================================
-// News cleanup must not delete top-level run records
-// ============================================
-
-describe("newsService.cleanupOldScrapeRuns", () => {
-  test("deletes old per-source logs only; top-level scrapeRuns are untouched", async () => {
-    store.set("newsSources/n1", { id: "n1" });
-    store.set("newsSources/n1/scrapeRuns/old", { startedAt: Timestamp.fromMillis(Date.now() - 40 * DAY) });
-    store.set("newsSources/n1/scrapeRuns/new", { startedAt: Timestamp.fromMillis(Date.now() - DAY) });
-    seedRun("top-old", { startedAt: Timestamp.fromMillis(Date.now() - 40 * DAY) });
-    const origBatch = firebase.db.batch;
-    const deleted: string[] = [];
-    firebase.db.batch = () => ({
-      delete: (ref: { path: string }) => void deleted.push(ref.path),
-      commit: async () => {
-        for (const p of deleted) store.delete(p);
-      },
-    });
-    try {
-      assert.equal(await newsSvc.cleanupOldScrapeRuns(30), 1);
-    } finally {
-      firebase.db.batch = origBatch;
-    }
-    assert.deepEqual(deleted, ["newsSources/n1/scrapeRuns/old"]);
-    assert.ok(store.has("scrapeRuns/top-old"));
-    assert.ok(store.has("newsSources/n1/scrapeRuns/new"));
   });
 });

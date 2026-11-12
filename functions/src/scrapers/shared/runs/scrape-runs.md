@@ -242,8 +242,9 @@ Notes:
 
 - The collection ID `scrapeRuns` is shared with the legacy per-source news log
   `newsSources/{id}/scrapeRuns`. The TTL policy only deletes docs that have an
-  `expireAt`, so those logs are unaffected; they are still pruned after 30
-  days by `cleanupOldNews`, which now queries each source's subcollection
-  instead of a collection-group query (that would also have deleted the
-  top-level run records after 30 days).
+  `expireAt`. Since issue #19 the per-source news logs carry one too
+  (`startedAt` + 30 days, written by `newsService.createScrapeRun`), so this
+  same collection-group policy prunes them; the weekly `cleanupOldNews`
+  sweep that used to do it was removed. Logs written before #19 get the
+  field from `npm run backfill:expireat`.
 - The emulator ignores TTL policies.

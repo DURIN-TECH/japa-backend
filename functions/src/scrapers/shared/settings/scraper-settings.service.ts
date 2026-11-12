@@ -16,6 +16,8 @@ import { SCRAPE_ALERT_RULES, type ScrapeAlertsConfig, type ScrapeAlertSeverity }
 import { nextWindowOpening } from "../etiquette/visa-crawl-window";
 import { VISA_SOURCE_WINDOWS } from "../../visa-catalog/data/seed-visa-sources";
 import type { CrawlWindow } from "../../visa-catalog/types";
+import { newsEditableConfigOf, type NewsEditableConfig } from "../../news/news-source-config.shape";
+import { applyNewsConfigEdit } from "../../news/news-source-config.validate";
 import { SCRAPER_SETTINGS_DOC_ID, resolveScraperSettings } from "./scraper-settings.store";
 import {
   assertValidAlerts,
@@ -377,7 +379,20 @@ export class ScraperSettingsService {
         // entry shows a reset ending an auto-pause).
         autoPaused: before.autoPaused === true,
       };
+      // ---- Issue #17: news config edit. The strategy rules run HERE, against
+      // the stored source read in this transaction (the pure parser could not
+      // know the strategy), and may throw SettingsValidationError -> nothing
+      // is written. `after` / `beforeView` get the editable slice so the diff
+      // (and the history entry) lists each changed field. ----
+      let newsNext: NewsEditableConfig | undefined;
+      let newsBefore: NewsEditableConfig | undefined;
+      if (patch.newsEdit) {
+        newsBefore = newsEditableConfigOf(before);
+        newsNext = applyNewsConfigEdit(newsBefore, patch.newsEdit);
+        Object.assign(after, newsMirror(newsBefore));
+      }
       const beforeView = JSON.parse(JSON.stringify(after));
+      if (newsNext) Object.assign(after, newsMirror(newsNext));
       const ao = after.adminOverrides as Record<string, unknown>;
       const update: Record<string, unknown> = {};
 
@@ -438,6 +453,9 @@ export class ScraperSettingsService {
 
       const changes = diffValues(beforeView, JSON.parse(JSON.stringify(after)), "");
       if (changes.length === 0) return changes; // nothing to write
+      // Issue #17: write only the config leaves that actually changed, to the
+      // live fields AND to adminOverrides.config (so a re-seed keeps them).
+      if (newsBefore && newsNext) writeNewsConfig(update, newsBefore, newsNext);
       update["adminOverrides.updatedAt"] = at;
       update["adminOverrides.updatedBy"] = uid;
       update.updatedAt = at;
@@ -445,6 +463,47 @@ export class ScraperSettingsService {
       this.writeHistory(tx, { at, by: uid, target: `source:${kind}:${id}`, changes });
       return changes;
     });
+  }
+}
+
+/**
+ * Issue #17: the editable news fields as the diff sees them. Paths in the
+ * history entry read `scrapeIntervalMinutes`, `config.selectors.articleTitle`...
+ */
+function newsMirror(c: NewsEditableConfig): Record<string, unknown> {
+  return {
+    scrapeIntervalMinutes: c.scrapeIntervalMinutes,
+    priority: c.priority,
+    countryCodes: c.countryCodes,
+    config: { feedUrl: c.feedUrl ?? null, selectors: c.selectors ?? {}, maxArticlesPerRun: c.maxArticlesPerRun },
+  };
+}
+
+/**
+ * Issue #17: add to the Firestore `update` the changed news config leaves.
+ * Dotted paths so untouched config keys (customHeaders, apiConfig,
+ * fetchFullContent, requestTimeoutMs) and unedited selectors are never
+ * rewritten. Each changed leaf is also recorded under `adminOverrides.config`.
+ */
+function writeNewsConfig(update: Record<string, unknown>, before: NewsEditableConfig, next: NewsEditableConfig): void {
+  const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+  for (const key of ["scrapeIntervalMinutes", "priority", "countryCodes"] as const) {
+    if (same(before[key], next[key])) continue;
+    update[key] = next[key];
+    update[`adminOverrides.config.${key}`] = next[key];
+  }
+  if (before.maxArticlesPerRun !== next.maxArticlesPerRun) {
+    update["config.maxArticlesPerRun"] = next.maxArticlesPerRun;
+    update["adminOverrides.config.maxArticlesPerRun"] = next.maxArticlesPerRun;
+  }
+  if (before.feedUrl !== next.feedUrl && next.feedUrl !== undefined) {
+    update["config.feedUrl"] = next.feedUrl;
+    update["adminOverrides.config.feedUrl"] = next.feedUrl;
+  }
+  for (const [key, value] of Object.entries(next.selectors ?? {})) {
+    if ((before.selectors as Record<string, string> | undefined)?.[key] === value) continue;
+    update[`config.selectors.${key}`] = value;
+    update[`adminOverrides.config.selectors.${key}`] = value;
   }
 }
 

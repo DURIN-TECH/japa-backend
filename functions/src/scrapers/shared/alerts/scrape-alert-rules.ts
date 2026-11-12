@@ -76,6 +76,8 @@ export const DEFAULT_THRESHOLDS: ScrapeAlertThresholds = {
   budgetPcts: [50, 80, 100],
   reviewQueueMaxAgeDays: 7,
   missedWindowGraceHours: 2,
+  // Issue #17: consecutive successful runs with articlesFound 0.
+  zeroYieldRuns: 3,
 };
 
 /** The config written to `appConfig/scrapeAlerts` when none exists yet. */
@@ -108,6 +110,8 @@ export const DEFAULT_SEVERITY: Record<ScrapeAlertRule, ScrapeAlertSeverity> = {
   review_queue_stale: "info",
   // Issue #96: extraction has stopped, so new visa changes are not reaching review.
   budget_hard_stop: "critical",
+  // Issue #17: a source that succeeds but yields nothing is a warning, not an outage.
+  source_no_yield: "warning",
   // Review: no scheduled crawl runs while the settings doc is unreadable.
   settings_unreadable: "critical",
   // Issue #143: the guidance crawl fetched documents it could not store, so
@@ -181,6 +185,13 @@ export function resolveConfig(raw: unknown): { config: ScrapeAlertsConfig; probl
     budgetPcts: pick("thresholds.budgetPcts", th.budgetPcts, pcts, d.budgetPcts),
     reviewQueueMaxAgeDays: pick("thresholds.reviewQueueMaxAgeDays", th.reviewQueueMaxAgeDays, num(th.reviewQueueMaxAgeDays, 0.5), d.reviewQueueMaxAgeDays),
     missedWindowGraceHours: pick("thresholds.missedWindowGraceHours", th.missedWindowGraceHours, num(th.missedWindowGraceHours, 0, 72), d.missedWindowGraceHours),
+    // Issue #17: a whole number of runs, 1..100.
+    zeroYieldRuns: pick(
+      "thresholds.zeroYieldRuns",
+      th.zeroYieldRuns,
+      Number.isInteger(th.zeroYieldRuns) ? num(th.zeroYieldRuns, 1, 100) : undefined,
+      d.zeroYieldRuns
+    ),
   };
 
   // ---- Email ----
@@ -785,6 +796,9 @@ export interface NewsSourceFacts {
   status?: string;
   consecutiveFailures?: number;
   lastErrorMessage?: string;
+  // Issue #17: the zero-yield streak (news-source-health.ts).
+  zeroYieldRuns?: number;
+  zeroYieldSince?: unknown; // Timestamp | null
   // Issue #107: the crawler's auto-pause flags (shared/runs/source-health.ts).
   autoPaused?: boolean;
   autoPausedReason?: string | null;
@@ -905,6 +919,41 @@ export function evaluateBrokenSources(
     });
   }
   return { rule: "source_broken", signals, scope: { keyPrefix: `source_broken:${kind}:` } };
+}
+
+/**
+ * source_no_yield (issue #17): an `active` news source whose last
+ * `zeroYieldRuns` (threshold) successful runs all found zero articles raises
+ * `source_no_yield:news:<id>` (warning, one alert per source). The streak is
+ * counted on `articlesFound`, never `articlesNew`, so a quiet news week (all
+ * duplicates) and a low-volume source never raise it. The alert auto-resolves
+ * (keyPrefix scope, like source_broken) when the streak resets or the source
+ * is paused, broken or retired (only `active` sources signal). Never changes
+ * the source's status: a signal, not a kill switch.
+ */
+export function evaluateNoYieldSources(sources: NewsSourceFacts[], config: ScrapeAlertsConfig): RuleEvaluation {
+  const signals: AlertSignal[] = [];
+  const threshold = config.thresholds.zeroYieldRuns;
+  for (const s of sources) {
+    if (s.status !== "active") continue;
+    const runs = s.zeroYieldRuns ?? 0;
+    if (runs < threshold) continue;
+    const name = s.name ?? s.id;
+    const since =
+      s.zeroYieldSince && typeof (s.zeroYieldSince as { toMillis?: unknown }).toMillis === "function"
+        ? new Date((s.zeroYieldSince as { toMillis(): number }).toMillis()).toISOString()
+        : null;
+    signals.push({
+      rule: "source_no_yield",
+      key: `source_no_yield:news:${s.id}`,
+      severity: ruleSeverity(config, "source_no_yield"),
+      kind: "news",
+      subject: { type: "source", id: s.id, label: `${name} (news source)` },
+      message: `${name} (news source) returned no articles in its last ${runs} runs although they succeeded${since ? ` (since ${since})` : ""}; check its feed or selectors`.slice(0, 600),
+      details: { sourceId: s.id, zeroYieldRuns: runs, zeroYieldSince: since, threshold },
+    });
+  }
+  return { rule: "source_no_yield", signals, scope: { keyPrefix: "source_no_yield:news:" } };
 }
 
 /**

@@ -65,7 +65,7 @@ before #96, so an empty Firestore behaves exactly as before).
     "thresholds": {
       "stuckRunMinutes": 60, "errorRatePct": 20, "errorRateMinPages": 5,
       "backoffConsecutiveRuns": 2, "linkedSurchargeErrors": 1, "fxFailingHours": 48,
-      "budgetPcts": [50, 80, 100], "reviewQueueMaxAgeDays": 7, "missedWindowGraceHours": 2
+      "budgetPcts": [50, 80, 100], "reviewQueueMaxAgeDays": 7, "missedWindowGraceHours": 2, "zeroYieldRuns": 3
     },
     "rules": { "error_rate": { "enabled": false }, "run_failed": { "severity": "warning" } },
     // read-only: every rule id with its default severity (for the UI's rule table)
@@ -177,6 +177,34 @@ Newest first. `limit` default 25, max 100; `cursor` = previous `nextCursor`
   plus `adminOverrides`). A history entry is written (`target: "source:<kind>:<id>"`).
 
 `GET /admin/scrape-sources` rows now also carry `adminOverrides` (or null).
+
+### News config edit (issue #17, news sources only)
+
+Extra keys, mixable with the ones above (validation: `scrapers/news/news-source-config.validate.ts`,
+reused by #24 / #25):
+
+```jsonc
+{
+  "scrapeIntervalMinutes": 240,   // integer 15..10080
+  "priority": 2,                  // integer 1..10
+  "countryCodes": ["GB", "IE"],   // non-empty, no duplicates, each in SUPPORTED_COUNTRY_CODES (types/news.ts)
+  "config": {
+    "feedUrl": "https://example.org/feed",   // rss only; public http(s) host, no credentials
+    "selectors": { "articleTitle": "h2 a" }, // html_scrape only; MERGED over stored; each must parse as CSS
+    "maxArticlesPerRun": 20                  // integer 1..100
+  }
+}
+```
+
+- 400 `VALIDATION_ERROR` names the field (`config.selectors.articleList`, `scrapeIntervalMinutes`, ...).
+  `strategy` -> 400 "cannot be changed"; `feedUrl` on a non-rss / selectors on a non-html_scrape source -> 400;
+  a news_api source takes only interval, priority, countryCodes, maxArticlesPerRun.
+- Health counters, `customHeaders`, `apiConfig`, `fetchFullContent`, `requestTimeoutMs`, `url`, `slug`, `name` are never touched.
+- Edited leaves are written to the live fields and to `adminOverrides.config` (only what was edited); a re-seed keeps them.
+  One history entry lists each changed field; a PATCH that changes nothing writes nothing.
+- News rows also carry `newsConfig` (the editable slice), `articlesLast7d` (Firestore `count()` of
+  `newsArticles` with `scrapedAt >= now - 7d`; `null` if the count fails, e.g. while the
+  `newsArticles(sourceId, scrapedAt)` index builds), `zeroYieldRuns` and `zeroYieldSince`. Visa rows: all `null`.
 
 ## 5. `POST /admin/scrape-sources/:kind/:id/run` (Run now, one source)
 

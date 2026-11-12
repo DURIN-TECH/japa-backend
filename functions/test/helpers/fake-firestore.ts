@@ -267,6 +267,8 @@ export async function installFakes(): Promise<void> {
   // Issue #81: run records + the news registry (source health, news runs).
   firebase.collections.scrapeRuns = fakeCollection("scrapeRuns");
   firebase.collections.newsSources = fakeCollection("newsSources");
+  // Issue #17: the health rows count a source's articles (articlesLast7d).
+  firebase.collections.newsArticles = fakeCollection("newsArticles");
   // Issue #83: the alert store + its dedupe pointers, and users (recipients).
   // Issue #123: approving a visa change records a rule-change event after commit.
   firebase.collections.ruleChangeEvents = fakeCollection("ruleChangeEvents");

@@ -118,7 +118,7 @@ function makeScraper(dueIds: string[]) {
     completeScrapeRun: newsService.completeScrapeRun.bind(newsService),
     updateSourceAfterScrape: health.updateSourceAfterScrape.bind(health),
     pauseForMissingApiKey: health.pauseForMissingApiKey.bind(health),
-    isDuplicate: async () => false,
+    findExistingHashes: async () => new Set<string>(),
     createArticlesBatch: async (a: unknown[]) => a.length,
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -160,6 +160,23 @@ describe("source health is updated once per source per run (issue #79)", () => {
     assert.equal(doc.successfulRuns, 3);
     assert.equal(doc.consecutiveFailures, 1);
     assert.equal(doc.reliabilityScore, 75);
+  });
+
+  // Issue #17: scrapeSource passes the pre-slice rawArticles.length as
+  // articlesFound, so an empty-but-successful feed extends the zero-yield
+  // streak and a feed with items resets it (even when all are duplicates).
+  test("zero-yield streak follows articlesFound through a real scrape (#17)", async () => {
+    seedSource("quiet", "https://quiet.example.org/feed.xml");
+    const EMPTY = "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>t</title></channel></rss>";
+    routes.set("https://quiet.example.org/feed.xml", { status: 200, body: EMPTY });
+    await makeScraper(["quiet"]).runOrchestrator();
+    await makeScraper(["quiet"]).runOrchestrator();
+    assert.equal(sourceDoc("quiet").zeroYieldRuns, 2);
+    assert.equal(sourceDoc("quiet").status, "active");
+    routes.set("https://quiet.example.org/feed.xml", { status: 200, body: RSS });
+    await makeScraper(["quiet"]).runOrchestrator();
+    assert.equal(sourceDoc("quiet").zeroYieldRuns, 0);
+    assert.equal(sourceDoc("quiet").zeroYieldSince, null);
   });
 
   test("a source skipped behind a backed-off host is counted once", async () => {
