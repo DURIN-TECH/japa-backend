@@ -14,14 +14,14 @@ import {
 } from "../../src/services/message-access/wording";
 
 describe("wording (approval draft-2, notice draft-1)", () => {
-  test("version ids are unchanged and marked draft", () => {
+  test("current ids are approval draft-2 and notice draft-1, both marked draft", () => {
     assert.equal(CURRENT_APPROVAL_WORDING.versionId, "ai-message-access-approval.draft-2");
     assert.equal(CURRENT_NOTICE_WORDING.versionId, "ai-message-access-notice.draft-1");
     assert.equal(CURRENT_APPROVAL_WORDING.draft && CURRENT_NOTICE_WORDING.draft, true);
   });
   test("approval draft-2 is one short paragraph, exactly as dictated", () => {
     assert.deepEqual(CURRENT_APPROVAL_WORDING.paragraphs, [
-      "Seli’s AI may read the messages I send in my chats. I can switch this off for any chat or for all my chats, and withdraw this approval, at any time.",
+      "Seli’s AI may read the messages I send in my chats. I can switch this off for all my chats, and withdraw this approval, at any time.",
     ]);
   });
   test("draft-1 stays in the history with its original text", () => {
