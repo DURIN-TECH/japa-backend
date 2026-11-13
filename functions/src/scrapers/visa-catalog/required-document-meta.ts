@@ -103,7 +103,7 @@ export function extractConditionalClause(text: string): string | null {
 export function extractLeadIn(quote: string): string | null {
   const m = LEAD_IN.exec(quote);
   if (!m) return null;
-  const lead = m[0].replace(/[\s,;]+$/, "");
+  const lead = m[0].replace(/[\s,;:.]+$/, "");
   return lead.length > 0 ? lead : null;
 }
 
