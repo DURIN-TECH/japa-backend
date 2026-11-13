@@ -396,6 +396,8 @@ export function reasonInWords(code: string): string {
     duplicate_partner_unknown: "a possible duplicate could not be matched to its partner rule",
     checker_not_configured: "the independent AI check is not set up yet",
     question_plan_missing: "the applicant question plan is not set up yet",
+    question_plan_unusable: "the automatic check of the applicant questions could not be completed or gave an unusable answer",
+    question_check_capped: "the automatic check of the applicant questions would pass its spending limit",
     polarity_unverified: "the reading on an intention to stay was not verified",
     settings_unreadable: "the publishing settings could not be read, so nothing was published",
     paused_after_rollback: "automatic publishing for this route is paused after a roll-back",

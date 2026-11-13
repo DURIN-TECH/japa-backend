@@ -20,6 +20,7 @@
     "seed:guidance-sources": "npm run build && node lib/scrapers/guidance/scripts/seed-guidance-sources.js",
     "extract:rubric": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/extract-rubric.js",
     "publish:rubric": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/publish-rubric.js",
+    "plan:questions": "npm run build && node lib/scrapers/rubric/scripts/plan-questions.js",
     "remediate:sources-107": "npm run build && node lib/scrapers/shared/scripts/remediate-failing-sources.js",
     "paystack:sync": "npm run build && node lib/scripts/sync-paystack-plans.js",
     "paystack:sync:dev": "npm run build && node lib/scripts/sync-paystack-plans.js --project durin-seli-dev",

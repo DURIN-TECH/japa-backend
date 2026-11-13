@@ -89,6 +89,10 @@ export { validateVisaRubric } from "./rubric/rubric-validate";
 /** Criterion exclusions (#161): the pure read-side filter, the preview and the limits. */
 export { applyExclusions, previewExclusions, MAX_EXCLUDED_CRITERIA, EXCLUSION_NOTE_MAX } from "./rubric/rubric-exclusions";
 export type { ExclusionPreview } from "./rubric/rubric-exclusions";
+/** (#203) The question plan: check, planner and pure plan functions. */
+export { RubricQuestionPlanner, buildQuestionPlan, QUESTION_PLAN_REASONS } from "./rubric/rubric-question-planner";
+export { QUESTION_PLAN_ALGORITHM_VERSION, sizeQuestions } from "./rubric/rubric-question-plan";
+export { DEFAULT_QUESTION_CHECK_LIMITS, QUESTION_CHECK_PROMPT_VERSION } from "./rubric/rubric-question-check";
 /** Validator issue shape (type-only; the review API reports it). */
 export type { RubricIssue } from "./rubric/rubric-validate";
 /** Verbatim-quote lookup in a stored snapshot (the review API's stale-citation check). */

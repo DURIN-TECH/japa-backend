@@ -12,6 +12,7 @@ import {
   evaluateRubricHeldCleared,
   loadPublishSettings,
   reasonInWords,
+  RubricQuestionPlanner,
   rubricStore,
   routeAllowed,
   sampleAudit,
@@ -921,3 +922,5 @@ function isPaused(head: RubricHead): boolean {
 
 /** Singleton over the project's Firestore. Parts B and C register their implementations on it. */
 export const rubricAutoPublishService = new RubricAutoPublishService();
+// Part C (#203): the question planner (wording check, plan) is registered here.
+rubricAutoPublishService.registerPlanner(new RubricQuestionPlanner());

@@ -649,6 +649,9 @@ export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intent
   // extraction: the reviewer sees everything, exclusions are only marked.
   excludedCriterionIds: string[] | null;
   exclusionNote: string | null;
+  // (#203) The automatic approval's question plan, null when there is none.
+  // The lists above stay the FULL, unfiltered draft; the plan is shown beside them.
+  questionPlan: VisaRubric["questionPlan"] | null;
   // What the PROPOSED exclusion set (query `previewExcluded`) would remove,
   // or what the stored one did remove; null when there is nothing to count.
   exclusionPreview: ExclusionPreview | null;
@@ -1001,12 +1004,12 @@ export interface SystemDecisionExtras {
 
 /**
  * The review fields the question planner may set on a version through the
- * automatic path. EMPTY in part A: part C adds `"questionPlan"` here (and to
- * RUBRIC_REVIEW_FIELDS, `reviewFieldsUpdate` and the validator). Everything
+ * automatic path: only `"questionPlan"` (#203; it is also in
+ * RUBRIC_REVIEW_FIELDS, and the validator checks its shape). Everything
  * else a decision writes (status, polarity, reviewer, exclusions, ...) is set
  * by this file only and can never come from a caller.
  */
-export const PLANNER_WRITABLE_FIELDS: readonly string[] = [];
+export const PLANNER_WRITABLE_FIELDS: readonly string[] = ["questionPlan"];
 
 /** Validate the planner's fields against the allow-list; a key outside it throws (never silently dropped). */
 function plannerReviewFields(raw: Record<string, unknown> | undefined): Partial<Pick<VisaRubric, (typeof RUBRIC_REVIEW_FIELDS)[number]>> {
@@ -1316,6 +1319,7 @@ export class RubricReviewService {
       evidenceHelpsCriterionIds: rubric.evidenceHelpsCriterionIds ?? null,
       excludedCriterionIds: rubric.excludedCriterionIds ?? null,
       exclusionNote: rubric.exclusionNote ?? null,
+      questionPlan: rubric.questionPlan ?? null,
       exclusionPreview,
       sourceSnapshots: (rubric.sourceSnapshots ?? []).map((s) => ({
         sourceId: s.sourceId,
