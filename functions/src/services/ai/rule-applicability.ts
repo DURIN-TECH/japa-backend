@@ -27,67 +27,17 @@
  * nationality. Triggers are data in the rubric.
  */
 import type { AssessmentCriterion, IntakeCondition, IntakeQuestion, RuleTrigger, VisaRubric } from "../../types/rubric";
+import { answerIncludesAny, conditionsForTriggers, isUnanswered, isValidTrigger } from "../../utils/rubric-trigger";
 
 // ============================================
-// Answers
+// Answers and trigger validity: ONE implementation (INTEGRATION, #200)
 // ============================================
-
-/** True when an intake answer counts as "not answered". */
-export function isUnanswered(answer: unknown): boolean {
-  if (answer === undefined || answer === null) return true;
-  if (typeof answer === "string") return answer.trim() === "";
-  if (Array.isArray(answer)) return answer.length === 0;
-  return false;
-}
-
-/**
- * The string forms of an answer that a trigger's `anyOf` is compared with. A
- * multi-choice answer is an array (any selected option counts); a yes/no answer
- * is the boolean, compared as "true" / "false"; a number as its digits.
- */
-function answerTokens(answer: unknown): string[] {
-  const list = Array.isArray(answer) ? answer : [answer];
-  return list.filter((v) => typeof v === "string" || typeof v === "boolean" || typeof v === "number").map((v) => String(v));
-}
-
-/** Does the answer include any of the wanted option values? */
-export function answerIncludesAny(answer: unknown, wanted: readonly string[]): boolean {
-  const tokens = answerTokens(answer);
-  return tokens.some((t) => wanted.includes(t));
-}
-
-// ============================================
-// Trigger validity (shared by extraction and every consumer)
-// ============================================
-
-/**
- * The answer values a question can be answered with, as strings; null when a
- * trigger cannot be checked against the question (free text, dates, amounts:
- * a rule cannot be "triggered" by a value nobody can enumerate).
- */
-export function triggerValuesOf(question: Pick<IntakeQuestion, "answerType" | "options">): string[] | null {
-  if (question.answerType === "single_choice" || question.answerType === "multi_choice") {
-    const opts = (question.options ?? []).map((o) => o.value);
-    return opts.length > 0 ? opts : null;
-  }
-  if (question.answerType === "yes_no") return ["true", "false"];
-  return null;
-}
-
-/**
- * Is the trigger usable against these questions? The question must exist, be
- * of a type whose answers can be enumerated, and every wanted value must be
- * one of them. A trigger that fails this is treated as ABSENT by consumers
- * (so a damaged link can never make a rule apply to everyone: a specialist
- * rule without a valid trigger is "could not tell").
- */
-export function isValidTrigger(trigger: RuleTrigger | undefined, questions: readonly Pick<IntakeQuestion, "id" | "answerType" | "options">[]): trigger is RuleTrigger {
-  if (!trigger || typeof trigger.questionId !== "string" || !Array.isArray(trigger.anyOf) || trigger.anyOf.length === 0) return false;
-  const q = questions.find((x) => x.id === trigger.questionId);
-  if (!q) return false;
-  const allowed = triggerValuesOf(q);
-  return allowed !== null && trigger.anyOf.every((v) => typeof v === "string" && allowed.includes(v));
-}
+//
+// "Does this answer satisfy this trigger" and "is this trigger usable" live in
+// utils/rubric-trigger.ts, a pure module the scrapers' question plan also uses
+// (it may not import from services). They are re-exported here so every
+// consumer keeps importing them from this file.
+export { answerIncludesAny, conditionsForTriggers, isUnanswered, isValidTrigger, triggerValuesOf } from "../../utils/rubric-trigger";
 
 // ============================================
 // Resolution
@@ -252,15 +202,8 @@ export function effectiveIntakeQuestions(rubric: ApplicabilityRubric): IntakeQue
       continue;
     }
     if (gated.length === 0) continue; // only unassessable specialist rules read it
-    // Join the trigger values per question into one condition each.
-    const byQuestion = new Map<string, Set<string>>();
-    for (const c of gated) {
-      const t = c.trigger as RuleTrigger;
-      const set = byQuestion.get(t.questionId) ?? new Set<string>();
-      for (const v of t.anyOf) set.add(v);
-      byQuestion.set(t.questionId, set);
-    }
-    const anyOf: IntakeCondition[] = [...byQuestion.entries()].map(([questionId, values]) => ({ questionId, op: "in" as const, value: [...values] }));
+    // One `in` condition per trigger question, values joined (shared with the question plan).
+    const anyOf: IntakeCondition[] = conditionsForTriggers(gated.map((c) => c.trigger as RuleTrigger));
     out.push({ ...q, showWhen: { anyOf } });
   }
   return out;

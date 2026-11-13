@@ -1,4 +1,7 @@
-import { DECISION_STAGES, type AssessmentCriterion, type EvidenceItem, type IntakeCondition, type IntakeQuestion, type QuestionPlan, type VisaRubric } from "../../types/rubric";
+import { DECISION_STAGES, type AssessmentCriterion, type EvidenceItem, type IntakeCondition, type IntakeQuestion, type QuestionPlan, type RuleTrigger, type VisaRubric } from "../../types/rubric";
+// INTEGRATION (#200/#207): ONE implementation of "is this trigger usable" and "which condition does it
+// give a question", shared with the intake service and the consumers (utils/rubric-trigger.ts).
+import { answerIncludesAny, conditionsForTriggers, isValidTrigger } from "../../utils/rubric-trigger";
 
 // ============================================
 // RUBRIC — QUESTION PLAN, PURE PART (issue #203, part of #200)
@@ -76,26 +79,24 @@ export function decidingQuestionIds(view: PlanView): Set<string> {
 // A rule's own trigger data (read defensively)
 // ============================================
 
-/** "This rule applies when the answer to question `questionId` is one of `anyOf`." */
-export interface ReadTrigger {
-  questionId: string;
-  anyOf: string[];
-}
+/** "This rule applies when the answer to question `questionId` is one of `anyOf`." (the stored `RuleTrigger`) */
+export type ReadTrigger = RuleTrigger;
 
 /**
- * The structured trigger of a rule, when it has one. Read defensively and
- * loosely typed on purpose: the field is added by the change that keeps
- * specialist-activity rules (#207), and a rubric stored before it has none.
- * Anything not exactly `{ questionId: string, anyOf: non-empty string[] }` is
- * "no trigger": a condition is never guessed from a free-text description.
+ * The structured trigger of a rule, when it has one (the real `trigger` field
+ * added by #207; INTEGRATION: no longer read through `unknown`). The shape is
+ * still checked, because a stored rubric may predate the field or hold a
+ * damaged one: anything not exactly `{ questionId: string, anyOf: non-empty
+ * string[] }` is "no trigger". Whether the trigger is USABLE against the
+ * questions is `isValidTrigger`'s question, not this one's. A condition is
+ * never guessed from a free-text description.
  */
 export function ruleTriggerOf(c: AssessmentCriterion): ReadTrigger | null {
-  const t = (c as unknown as { trigger?: unknown }).trigger;
+  const t = c.trigger;
   if (!t || typeof t !== "object") return null;
-  const { questionId, anyOf } = t as { questionId?: unknown; anyOf?: unknown };
-  if (typeof questionId !== "string" || !questionId) return null;
-  if (!Array.isArray(anyOf) || anyOf.length === 0 || !anyOf.every((v) => typeof v === "string")) return null;
-  return { questionId, anyOf: anyOf as string[] };
+  if (typeof t.questionId !== "string" || !t.questionId) return null;
+  if (!Array.isArray(t.anyOf) || t.anyOf.length === 0 || !t.anyOf.every((v) => typeof v === "string")) return null;
+  return { questionId: t.questionId, anyOf: [...t.anyOf] };
 }
 
 // ============================================
@@ -266,47 +267,42 @@ export interface DerivedCondition {
 
 /**
  * Conditions for questions that have none although every rule they serve is
- * conditional with a validated trigger. A condition is derived ONLY when:
+ * conditional or specialist with a valid trigger. A condition is derived ONLY when:
  *  - the question has no `showWhen`;
- *  - EVERY criterion that names the question (via its `criterionIds`) has a
- *    structured trigger (`ruleTriggerOf`) and is not an `all_applicants` rule;
- *  - each trigger names a different, existing, single-choice question and
- *    every value is one of that question's options (the intake service can
- *    only evaluate a membership test against a single value);
+ *  - EVERY criterion that names the question (via its `criterionIds`) is a
+ *    `specialist` or `conditional` rule whose trigger is valid against the
+ *    rubric's questions (`isValidTrigger`: the parent exists and its answers can
+ *    be listed, which includes yes/no and MULTI-choice parents, and every
+ *    value is one of them), and none is triggered by this very question;
  *  - the condition would not make a question wait on itself (cycle).
- * Otherwise nothing is proposed: the question stays as it is. The condition
- * text is built from the trigger values, never from free text.
+ * Otherwise nothing is proposed: the question stays as it is. The condition is
+ * built by `conditionsForTriggers`, the SAME builder the intake service's
+ * `effectiveIntakeQuestions` uses (one `in` condition per parent question, values
+ * as strings, so a boolean or an array answer satisfies it), never from free text.
  */
 export function deriveConditions(view: PlanView): DerivedCondition[] {
   const questions = view.intakeQuestions ?? [];
-  const byId = new Map(questions.map((q) => [q.id, q]));
   const criteria = new Map((view.criteria ?? []).map((c) => [c.criterionId, c]));
   const out: DerivedCondition[] = [];
   let working = questions;
   for (const q of questions) {
     if (q.showWhen && (q.showWhen.anyOf ?? []).length > 0) continue;
     const linked = (q.criterionIds ?? []).map((id) => criteria.get(id));
-    if (linked.length === 0 || linked.some((c) => !c || c.applicability === "all_applicants" || c.applicability === undefined)) continue;
-    const triggers = linked.map((c) => (c ? ruleTriggerOf(c) : null));
-    if (triggers.some((t) => t === null)) continue;
-    const conds: IntakeCondition[] = [];
+    if (linked.length === 0 || linked.some((c) => !c || (c.applicability !== "specialist" && c.applicability !== "conditional"))) continue;
+    const triggers: RuleTrigger[] = [];
     let ok = true;
-    for (const t of triggers as ReadTrigger[]) {
-      const parent = byId.get(t.questionId);
-      if (!parent || parent.id === q.id || parent.answerType !== "single_choice") {
+    for (const c of linked as AssessmentCriterion[]) {
+      const t = ruleTriggerOf(c);
+      // A trigger on a question that does not exist, or whose answers cannot be listed, is not usable.
+      if (!t || t.questionId === q.id || !isValidTrigger(t, questions)) {
         ok = false;
         break;
       }
-      const options = new Set((parent.options ?? []).map((o) => o.value));
-      if (!t.anyOf.every((v) => options.has(v))) {
-        ok = false;
-        break;
-      }
-      conds.push(t.anyOf.length === 1 ? { questionId: t.questionId, op: "eq", value: t.anyOf[0] } : { questionId: t.questionId, op: "in", value: [...t.anyOf] });
+      triggers.push(t);
     }
     if (!ok) continue;
     const seen = new Set<string>();
-    const anyOf = conds.filter((c) => {
+    const anyOf = conditionsForTriggers(triggers).filter((c) => {
       const k = conditionKey(c);
       if (seen.has(k)) return false;
       seen.add(k);
@@ -415,18 +411,26 @@ export function applyOrder<T extends PlanView>(view: T, order: readonly string[]
 /** Marker answers in the simulation. */
 const UNANSWERED = Symbol("unanswered");
 const OTHER = Symbol("other");
-type Sim = string | number | boolean | typeof UNANSWERED | typeof OTHER;
+// A simulated answer: a value, or a list of values (a multi-choice applicant who selected several).
+type Sim = string | number | boolean | string[] | typeof UNANSWERED | typeof OTHER;
 
-/** The intake service's condition test (services/intake.service.ts), on simulated answers. */
+/**
+ * The intake service's condition test (services/intake.service.ts), on simulated answers.
+ * INTEGRATION: `in` uses the shared `answerIncludesAny`, as the intake service does, so a
+ * simulated yes/no answer (a boolean) or multi-choice answer (a list of values) satisfies
+ * the string values a trigger-derived condition holds. Before, `in` required a string, so
+ * the sizing never counted the questions behind a yes/no or multi-choice parent.
+ */
 function conditionHolds(c: IntakeCondition, actual: Sim | undefined): boolean {
   if (actual === undefined || actual === UNANSWERED) return false;
+  const answer = actual === OTHER ? undefined : actual;
   switch (c.op) {
   case "eq":
     return actual === c.value;
   case "neq":
     return actual !== c.value;
   case "in":
-    return Array.isArray(c.value) && typeof actual === "string" && c.value.includes(actual);
+    return Array.isArray(c.value) && answer !== undefined && answerIncludesAny(answer, c.value.map((v) => String(v)));
   default:
     return false;
   }
@@ -481,8 +485,15 @@ export function sizeQuestions(view: PlanView): QuestionPlan["sizing"] {
       values.add(true);
       values.add(false);
     }
-    if (q.answerType === "single_choice") for (const o of q.options ?? []) values.add(o.value);
-    domain.set(q.id, [...values, OTHER]);
+    if (q.answerType === "single_choice" || q.answerType === "multi_choice") for (const o of q.options ?? []) values.add(o.value);
+    const choices: Sim[] = [...values, OTHER];
+    // A multi-choice applicant may select SEVERAL options: add the case that selects every
+    // option a condition reads, so the worst case counts the questions all of them open.
+    if (q.answerType === "multi_choice") {
+      const all = [...new Set([...mentioned].map(String))];
+      if (all.length > 1) choices.push(all);
+    }
+    domain.set(q.id, choices);
   }
 
   /** Visible count for answers drawn per deciding question (UNANSWERED allowed). */

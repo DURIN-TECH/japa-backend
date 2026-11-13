@@ -194,7 +194,8 @@ describe("conditions derived from rule triggers", () => {
     const r = rubricOf([rule("c0", { applicability: "all_applicants" }), conditional("c1", { questionId: "purpose", anyOf: ["study"] }), conditional("c2", { questionId: "purpose", anyOf: ["work", "study"] })], [purpose, question("q1", ["c1", "c2"])]);
     const derived = deriveConditions(r);
     assert.deepEqual(derived.map((d) => d.questionId), ["q1"]);
-    assert.deepEqual(derived[0].showWhen.anyOf, [{ questionId: "purpose", op: "eq", value: "study" }, { questionId: "purpose", op: "in", value: ["work", "study"] }]);
+    // INTEGRATION: the same builder as the intake service: ONE `in` condition per parent question, values joined.
+    assert.deepEqual(derived[0].showWhen.anyOf, [{ questionId: "purpose", op: "in", value: ["study", "work"] }]);
     assert.deepEqual(derived[0].derivedFromCriterionIds, ["c1", "c2"]);
     // Applying adds the condition and nothing else.
     const out = applyConditions(r, derived);
@@ -218,14 +219,44 @@ describe("conditions derived from rule triggers", () => {
     assert.deepEqual(base([conditional("c1", { questionId: "purpose", anyOf: ["fly"] })], [purpose, question("q1", ["c1"])]), []);
     assert.deepEqual(base([conditional("c1", { questionId: "nope", anyOf: ["study"] })], [purpose, question("q1", ["c1"])]), []);
     assert.deepEqual(base([conditional("c1", { questionId: "q1", anyOf: ["study"] })], [purpose, question("q1", ["c1"])]), []);
-    // A multi-choice parent cannot be tested by the intake service.
-    const multi = { ...purpose, id: "multi", answerType: "multi_choice" } as IntakeQuestion;
-    assert.deepEqual(base([conditional("c1", { questionId: "multi", anyOf: ["study"] })], [multi, question("q1", ["c1"])]), []);
+    // A parent whose answers cannot be listed (free text) cannot be tested.
+    const free = { ...purpose, id: "free", answerType: "short_text", options: undefined } as IntakeQuestion;
+    assert.deepEqual(base([conditional("c1", { questionId: "free", anyOf: ["study"] })], [free, question("q1", ["c1"])]), []);
     // Would make the parent wait on its own child.
     const childOfQ1 = { ...purpose, id: "p2", showWhen: { anyOf: [{ questionId: "q1", op: "eq" as const, value: true }] } } as IntakeQuestion;
     assert.deepEqual(base([conditional("c1", { questionId: "p2", anyOf: ["study"] })], [childOfQ1, question("q1", ["c1"])]), []);
     // A question that already has a condition keeps it.
     assert.deepEqual(base([conditional("c1", { questionId: "purpose", anyOf: ["study"] })], [purpose, question("q1", ["c1"], { showWhen: { anyOf: [{ questionId: "purpose", op: "eq", value: "work" }] } })]), []);
+  });
+});
+
+// INTEGRATION (#200 + #207): multi-choice and yes/no parents work end to end, with the
+// same "does this answer satisfy the trigger" the intake service and the consumers use.
+describe("derived conditions for multi-choice and yes/no triggers", () => {
+  const multi = question("multi", ["c0"], { label: "Which apply?", answerType: "multi_choice", options: [{ value: "a", label: "A" }, { value: "b", label: "B" }] });
+  const yn = question("yn", ["c0"], { label: "Is it so?", answerType: "yes_no" });
+  const conditional = (id: string, trigger: unknown) => rule(id, { applicability: "conditional", applicabilityCondition: "free text", trigger });
+
+  test("a multi-choice parent and a yes/no parent each give an `in` condition over string values", () => {
+    const r = rubricOf([rule("c0", { applicability: "all_applicants" }), conditional("c1", { questionId: "multi", anyOf: ["b"] }), conditional("c2", { questionId: "yn", anyOf: ["true"] })], [multi, yn, question("q1", ["c1"]), question("q2", ["c2"])]);
+    const derived = deriveConditions(r);
+    assert.deepEqual(derived.map((d) => [d.questionId, d.showWhen.anyOf]), [
+      ["q1", [{ questionId: "multi", op: "in", value: ["b"] }]],
+      ["q2", [{ questionId: "yn", op: "in", value: ["true"] }]],
+    ]);
+  });
+
+  test("a yes/no trigger value that is not true/false, or a multi-choice value that is not an option, is not derived", () => {
+    const r = rubricOf([rule("c0", { applicability: "all_applicants" }), conditional("c1", { questionId: "yn", anyOf: ["maybe"] }), conditional("c2", { questionId: "multi", anyOf: ["z"] })], [multi, yn, question("q1", ["c1"]), question("q2", ["c2"])]);
+    assert.deepEqual(deriveConditions(r), []);
+  });
+
+  test("the sizing counts the questions behind a yes/no or multi-choice parent (the simulation uses the shared test)", () => {
+    const r = rubricOf([rule("c0", { applicability: "all_applicants" }), conditional("c1", { questionId: "multi", anyOf: ["a"] }), conditional("c2", { questionId: "yn", anyOf: ["true"] })], [multi, yn, question("q1", ["c1"]), question("q2", ["c2"])]);
+    const conditioned = applyConditions(r, deriveConditions(r));
+    const size = sizeQuestions(conditioned);
+    assert.equal(size.best, 2, "multi and yn are always asked");
+    assert.equal(size.worst, 4, "both follow-ups are reachable");
   });
 });
 
