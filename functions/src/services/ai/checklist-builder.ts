@@ -29,6 +29,7 @@
  */
 import type { EvidenceItem, IntakeCondition, VisaRubric } from "../../types/rubric";
 import type { DocumentRequestCitation } from "../../types";
+import { applicableCriterionIds } from "./rule-applicability";
 
 // ============================================
 // Types
@@ -186,10 +187,19 @@ export function buildChecklist(input: BuildChecklistInput): ChecklistResult {
     // be decided yet, so say so rather than show a partial list.
     const needsIntake = (rubric.intakeQuestions?.length ?? 0) > 0 && (!intakeAnswers || Object.keys(intakeAnswers).length === 0);
 
+    // (#207) The criteria that apply to this applicant. A document is asked
+    // for only when at least one criterion it evidences applies: a document
+    // for a specialist-activity rule the applicant's answers do not trigger
+    // (or whose trigger is not yet answered) is not listed. An item that
+    // evidences no known criterion keeps its own `when` as the only gate.
+    const applicable = applicableCriterionIds(rubric, intakeAnswers);
+
     if (!needsIntake) {
       for (const ev of rubric.evidenceItems ?? []) {
         // Trigger: no `when` = always; otherwise the answer must match.
         if (ev.when && !conditionHolds(ev.when, intakeAnswers ?? {})) continue;
+        const known = ev.criterionIds.filter((cid) => criteriaById.has(cid));
+        if (known.length > 0 && !known.some((cid) => applicable.has(cid))) continue;
         // An item without a quote is never shown (domain rule).
         if (!ev.source?.quote?.trim() || !ev.source.url) continue;
 

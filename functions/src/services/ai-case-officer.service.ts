@@ -23,8 +23,10 @@ import {
   hashStatementContent,
   judgementCriteriaOf,
   mandatoryBarHits,
+  mergeJudgementOutputs,
   numberStatementBlocks,
   parseJudgement,
+  planJudgementBatches,
   topIssuesOf,
   type AssessmentContent,
   type AssessmentInputs,
@@ -39,6 +41,7 @@ import { AnthropicLlmProvider, type LlmProvider, type LlmUsage } from "./ai/llm-
 import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-safety";
 import type { AssessmentTier, StaleReason } from "./ai/tier-serializer";
 import { aiActionService } from "./ai-action.service";
+import { notAssessedItems, splitByApplicability } from "./ai/rule-applicability";
 
 // ============================================
 // AI CASE-OFFICER ASSESSMENT — JOB AND I/O (issue #42)
@@ -327,7 +330,13 @@ export class AiCaseOfficerService {
     }
     statements.sort((a, b) => (a.instanceId < b.instanceId ? -1 : 1));
 
-    const intake = ((app as Application & { intake?: Record<string, unknown> }).intake ?? {}) as Record<string, unknown>;
+    // The applicant's intake ANSWERS, keyed by question id (#113 stores them at
+    // `application.intake.answers`, beside the route key, rubric version and
+    // time of the save). (#207) This used to read the whole `intake` object, so
+    // the facts were named `intake.answers` and a save's timestamp changed the
+    // input hash; rule triggers need the answers by question id.
+    const savedIntake = (app as Application & { intake?: { answers?: Record<string, unknown> } }).intake;
+    const intake = (savedIntake?.answers ?? {}) as Record<string, unknown>;
 
     return {
       applicantName,
@@ -556,14 +565,30 @@ export class AiCaseOfficerService {
     if (!appSnap.exists) throw new JobStop("inputs_changed", "the application no longer exists");
     const app = { id: appSnap.id, ...appSnap.data() } as Application;
 
-    const rubric = await this.deps.rubrics.getApprovedRubric(app.countryCode, app.visaTypeId);
-    if (!rubric || rubric.version !== cur.rubricVersion) {
+    const fullRubric = await this.deps.rubrics.getApprovedRubric(app.countryCode, app.visaTypeId);
+    if (!fullRubric || fullRubric.version !== cur.rubricVersion) {
       throw new JobStop("rubric_changed", "the approved rubric changed after this assessment was requested");
     }
     const loaded = await this.loadInputs(app);
-    if (computeInputHash(this.inputsFor(loaded, rubric.version)) !== cur.inputHash) {
+    if (computeInputHash(this.inputsFor(loaded, fullRubric.version)) !== cur.inputHash) {
       throw new JobStop("inputs_changed", "the application's inputs changed after this assessment was requested");
     }
+
+    // ---- which rules apply to THIS applicant (#207) ----
+    // A rulebook keeps specialist-activity and conditional rules; each is
+    // assessed only for applicants whose intake answers trigger it. Three
+    // lists, every criterion in exactly one:
+    //   applicable      -> everything below (bars, objective checks, judgement)
+    //                      runs on `rubric`, the rulebook narrowed to these;
+    //   not applicable  -> nothing at all: no finding, question or action;
+    //   unknown         -> "could not be assessed: we need to know X", added to
+    //                      the insufficient-information list (never a failure).
+    // The intake answers are part of the input hash, so this is a pure function
+    // of inputs the hash already covers. `fullRubric` is kept for what needs the
+    // WHOLE rulebook (titles of could-not-assess rules, top issues, actions).
+    const split = splitByApplicability(fullRubric, loaded.intake);
+    const rubric: VisaRubric = { ...fullRubric, criteria: split.applicable };
+    const notAssessed = notAssessedItems(split);
 
     const now = this.deps.now();
     const score = loaded.eligibilityScore;
@@ -584,8 +609,9 @@ export class AiCaseOfficerService {
         score,
         suspiciousDocumentIds: [],
         judgementFailed: false,
+        notAssessed,
       });
-      await this.storeContent(cur.id, rubric, content, { extract: zeroUsage(), judge: zeroUsage() }, { extract: null, judge: null });
+      await this.storeContent(cur.id, fullRubric, content, { extract: zeroUsage(), judge: zeroUsage() }, { extract: null, judge: null });
       return;
     }
 
@@ -602,8 +628,9 @@ export class AiCaseOfficerService {
         score,
         suspiciousDocumentIds: [],
         judgementFailed: false,
+        notAssessed,
       });
-      await this.storeContent(cur.id, rubric, content, { extract: zeroUsage(), judge: zeroUsage() }, { extract: null, judge: null });
+      await this.storeContent(cur.id, fullRubric, content, { extract: zeroUsage(), judge: zeroUsage() }, { extract: null, judge: null });
       return;
     }
 
@@ -669,10 +696,19 @@ export class AiCaseOfficerService {
     // ---- stage 2 evaluation: code decides ----
     const objective = evaluateObjective(rubric, facts, extractions);
 
-    // ---- stage 3: judgement, one call ----
+    // ---- stage 3: judgement, in as many calls as the rules need (#207) ----
+    // The judgement rules that apply to this applicant are split by decision
+    // stage into batches (planJudgementBatches). A short list is ONE call, as
+    // before; a long one becomes several. Every rule is in exactly one batch,
+    // each call's answer is checked against that batch's own ids and the
+    // answers are combined in code. The request and input caps are checked
+    // before EACH call: a rulebook that would pass them fails the job with
+    // `cost_cap_exceeded` instead of being assessed in part.
     const judgementCriteria = judgementCriteriaOf(rubric);
+    const batches = planJudgementBatches(judgementCriteria);
     let judgement: JudgementOutput | null = null;
     let judgementFailed = false;
+    const unjudgedCriterionIds: string[] = [];
     let judgeUsage = zeroUsage();
     let judgeUsed = false;
     const statementText = loaded.statements.map((s) => s.text).filter(Boolean).join("\n\n");
@@ -686,37 +722,47 @@ export class AiCaseOfficerService {
     if (statementText && findInjectionSignals(statementText)) {
       suspiciousContent.push({ source: "statement", documentId: null, page: null });
     }
-    if (judgementCriteria.length > 0 && (extractions.length > 0 || statementText.trim().length > 0)) {
-      if (this.deps.now().getTime() - started > JUDGEMENT_START_LIMIT_MS) throw new JobStop("timed_out", "the assessment ran out of time before judgement");
-      requests++;
-      if (requests > settings.maxRequestsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its request cap");
-      const request = buildJudgementRequest({
-        rubric,
-        statementText: numbered ? numbered.text : statementText || null,
-        otherStatementsText: otherText || null,
-        profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. Nationality code: ${loaded.nationality ?? "not given"}.`,
-        intakeSummary: JSON.stringify(loaded.intake),
-        extractionSummary: extractions
-          .filter((e) => e.readable && !e.failed && !e.suspicious)
-          .flatMap((e) => e.values.map((v) => `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`))
-          .join("\n"),
-        objectiveSummary: objective.map((r) => `${r.criterionId}: ${r.outcome}`).join("\n"),
-      });
-      if (chars + request.user.length > settings.maxInputCharsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its input size cap");
-      judgeUsed = true;
-      try {
-        const res = await this.deps.provider.complete(request);
-        judgeUsage = addUsage(judgeUsage, res.usage);
-        if (res.stopReason === "refusal") {
-          judgementFailed = true;
-        } else {
-          const parsed = parseJudgement(res.text, judgementCriteria.map((c) => c.criterionId), numbered ? numbered.sentCount : 0);
-          if (parsed.ok) judgement = parsed.output;
-          else judgementFailed = true;
+    if (batches.length > 0 && (extractions.length > 0 || statementText.trim().length > 0)) {
+      const outputs: JudgementOutput[] = [];
+      for (const batch of batches) {
+        if (this.deps.now().getTime() - started > JUDGEMENT_START_LIMIT_MS) throw new JobStop("timed_out", "the assessment ran out of time before judgement");
+        requests++;
+        if (requests > settings.maxRequestsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its request cap");
+        const request = buildJudgementRequest({
+          rubric: { criteria: batch, intentPolarity: rubric.intentPolarity },
+          statementText: numbered ? numbered.text : statementText || null,
+          otherStatementsText: otherText || null,
+          profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. Nationality code: ${loaded.nationality ?? "not given"}.`,
+          intakeSummary: JSON.stringify(loaded.intake),
+          extractionSummary: extractions
+            .filter((e) => e.readable && !e.failed && !e.suspicious)
+            .flatMap((e) => e.values.map((v) => `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`))
+            .join("\n"),
+          objectiveSummary: objective.map((r) => `${r.criterionId}: ${r.outcome}`).join("\n"),
+        });
+        // The characters of every call count toward the same cap.
+        chars += request.user.length;
+        if (chars > settings.maxInputCharsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its input size cap");
+        judgeUsed = true;
+        const batchIds = batch.map((c) => c.criterionId);
+        try {
+          const res = await this.deps.provider.complete(request);
+          judgeUsage = addUsage(judgeUsage, res.usage);
+          if (res.stopReason === "refusal") {
+            unjudgedCriterionIds.push(...batchIds);
+          } else {
+            const parsed = parseJudgement(res.text, batchIds, numbered ? numbered.sentCount : 0);
+            if (parsed.ok) outputs.push(parsed.output);
+            else unjudgedCriterionIds.push(...batchIds);
+          }
+        } catch {
+          unjudgedCriterionIds.push(...batchIds);
         }
-      } catch {
-        judgementFailed = true;
       }
+      // Every call failed: the whole stage failed (as before). Some failed:
+      // their rules are recorded as insufficient and the rest keep their findings.
+      if (outputs.length === 0) judgementFailed = true;
+      else judgement = mergeJudgementOutputs(outputs);
     }
 
     // ---- assembly: containment and citations in code ----
@@ -731,10 +777,12 @@ export class AiCaseOfficerService {
       score,
       suspiciousDocumentIds: suspiciousContent.map((s) => s.documentId ?? "statement"),
       judgementFailed,
+      unjudgedCriterionIds: judgement ? unjudgedCriterionIds : [],
+      notAssessed,
     });
     await this.storeContent(
       cur.id,
-      rubric,
+      fullRubric,
       content,
       { extract: extractUsage, judge: judgeUsage },
       { extract: extractUsed ? this.deps.provider.modelFor("extraction") : null, judge: judgeUsed ? this.deps.provider.modelFor("judgement") : null },

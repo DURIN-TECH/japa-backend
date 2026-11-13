@@ -24,6 +24,7 @@ import {
 } from "./ai/llm-provider";
 import { DATA_ONLY_RULE, findBannedWording, findInjectionSignals, wrapUntrusted } from "./ai/prompt-safety";
 import { serializeFree, stripKeyDeep, type AssessmentTier } from "./ai/tier-serializer";
+import { applicableCriterionIds } from "./ai/rule-applicability";
 
 // ============================================
 // ASK-ANYWHERE CHAT SERVICE (issue #45)
@@ -76,8 +77,15 @@ const CHAT_MAX_OUTPUT_TOKENS = 800;
 const CHAT_TIMEOUT_MS = 60_000;
 /** Longest rubric quote placed in the prompt. */
 const MAX_QUOTE_CHARS = 700;
-/** Most rubric criteria placed in the prompt. */
-const MAX_CRITERIA_IN_PROMPT = 80;
+/**
+ * Most characters of rule text (the criteria JSON) placed in the prompt (#207).
+ * Replaces a count cap of 80 rules, which cut a long rulebook silently. Now the
+ * rules are first narrowed to the ones that apply to THIS applicant, and if
+ * they still do not fit, the number left out is said in the prompt and in
+ * `omittedCriteria`, so the model never states a rule it was not shown and the
+ * omission is never silent.
+ */
+const MAX_CRITERIA_CHARS_IN_PROMPT = 120_000;
 /** Most citations attached to one answer. */
 const MAX_CITATIONS = 6;
 /** Longest stored / returned answer. */
@@ -180,6 +188,9 @@ export interface ChatContext {
   assessment: Record<string, unknown>;
   // Criteria the model may cite. Empty on the free tier.
   criteria: ChatCriterionContext[];
+  // (#207) Rules that apply to the applicant but did not fit the prompt budget.
+  // Zero for any ordinary rulebook; stated to the model when not.
+  omittedCriteria: number;
   outdated: boolean;
 }
 
@@ -297,6 +308,7 @@ export function buildChatContext(
 
   // ---- the criteria the model may cite (full tier only) ----
   const criteria: ChatCriterionContext[] = [];
+  let omittedCriteria = 0;
   if (tier === "full" && rubric) {
     // Criteria the assessment referenced come first, then the rest of the route.
     const referenced = new Set<string>();
@@ -309,24 +321,39 @@ export function buildChatContext(
     if (!isClient) refs.push(assessment.credibilityFlags, assessment.statementFindings);
     for (const list of refs) for (const f of list) referenced.add(f.criterionId);
 
+    // (#207) Rules for a specialist activity or circumstance the applicant's
+    // answers do not trigger are not placed in the prompt (they apply to them
+    // no more than to anyone else): only rules that apply, plus any rule the
+    // assessment itself referenced.
+    const applies = applicableCriterionIds(rubric, app.intake?.answers);
     const ordered = [
       ...rubric.criteria.filter((c) => referenced.has(c.criterionId)),
       // An applicant is not shown judgement-criterion rules that no finding of theirs touches.
-      ...rubric.criteria.filter((c) => !referenced.has(c.criterionId) && !(isClient && c.kind === "judgement")),
+      ...rubric.criteria.filter((c) => !referenced.has(c.criterionId) && applies.has(c.criterionId) && !(isClient && c.kind === "judgement")),
     ];
-    for (const c of ordered.slice(0, MAX_CRITERIA_IN_PROMPT)) {
-      criteria.push({
+    // Fill the prompt in order until the character budget is used. Whatever
+    // does not fit is COUNTED, never silently cut.
+    let used = 0;
+    for (const c of ordered) {
+      const entry: ChatCriterionContext = {
         criterionId: c.criterionId,
         title: c.title,
         kind: c.kind,
         ruleRef: c.ruleRef ?? null,
         sourceUrl: c.source.url,
         sourceQuote: c.source.quote.slice(0, MAX_QUOTE_CHARS),
-      });
+      };
+      const size = JSON.stringify(entry).length;
+      if (used + size > MAX_CRITERIA_CHARS_IN_PROMPT) {
+        omittedCriteria = ordered.length - criteria.length;
+        break;
+      }
+      used += size;
+      criteria.push(entry);
     }
   }
 
-  return { application: applicationFacts(app), assessment: view, criteria, outdated };
+  return { application: applicationFacts(app), assessment: view, criteria, omittedCriteria, outdated };
 }
 
 // ----------------------------------------------------------------
@@ -383,6 +410,10 @@ export function buildChatUserPrompt(ctx: ChatContext, history: HistoryTurn[], me
   parts.push(wrapUntrusted(JSON.stringify(ctx.assessment), "review"));
   parts.push("PUBLISHED GUIDANCE EXCERPTS (none means you may not state any rule):");
   parts.push(wrapUntrusted(JSON.stringify(ctx.criteria), "guidance"));
+  if (ctx.omittedCriteria > 0) {
+    // Said, not silent: the model must not state a rule it was not given.
+    parts.push(`${ctx.omittedCriteria} further published rule(s) that apply to this application are not shown above. Do not state or guess a rule that is not shown; say that your agent can tell them more.`);
+  }
   if (history.length > 0) {
     parts.push("EARLIER IN THIS CONVERSATION:");
     const lines = history.map((t) => `${t.role === "user" ? "person asked" : "you answered"}: ${t.content}`);
