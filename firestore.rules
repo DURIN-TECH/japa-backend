@@ -467,12 +467,33 @@ service cloud.firestore {
                      (exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid));
       
-      // Authenticated users can create conversations
+      // AI message access (issue #172): the per-side chat switch and WHO the two
+      // sides are. The switch fields are written ONLY by the backend
+      // (PUT /conversations/:id/ai-access, Admin SDK, which bypasses these rules):
+      // the API enforces "you can change only your own side" and writes the audit
+      // record in the same transaction.
+      //
+      // Updates are an ALLOW-LIST, not a deny-list. A deny-list of the two switch
+      // fields was not enough: a participant could rewrite `userId` / `agentId`
+      // (the rule only checks the document as it was BEFORE the write), make the
+      // API see them as both sides, clear the other person's switch, then restore
+      // the ids. So a client may update only the fields below. No client code
+      // writes this document today (mobile and portal only read it, through the
+      // API or a listener); the API writes everything else with the Admin SDK.
+      function onlyClientEditableConversationFields() {
+        return request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['unreadCountUser', 'unreadCountAgent', 'updatedAt']);
+      }
+
+      // Authenticated users can create conversations (but cannot create one that
+      // already carries a chat switch value).
       allow create: if isAuthenticated() && 
-                      request.resource.data.userId == request.auth.uid;
+                      request.resource.data.userId == request.auth.uid &&
+                      !request.resource.data.keys().hasAny(['aiAccessOffUser', 'aiAccessOffAgent']);
       
-      // Participants can update conversations
+      // Participants can update only the allow-listed fields.
       allow update: if isAuthenticated() &&
+                      onlyClientEditableConversationFields() &&
                       (resource.data.userId == request.auth.uid ||
                        (exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
                         get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid));

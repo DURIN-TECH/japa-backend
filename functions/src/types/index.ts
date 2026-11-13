@@ -1403,6 +1403,16 @@ export interface Conversation {
   unreadReminderSentAtUser?: Timestamp;
   unreadReminderSentAtAgent?: Timestamp;
 
+  // --- AI message access: per-participant chat switch (issue #172) -------------
+  // True when that side has switched AI access to this chat OFF. A missing field
+  // means ON (not switched off), so existing conversations need no migration.
+  // `User` = the applicant (`userId`), `Agent` = the agent side (`agentId`). Each
+  // side can change only its own field, and only through
+  // PUT /conversations/:id/ai-access (firestore.rules refuses client writes).
+  // While EITHER side is off, nothing from the chat is released for AI use.
+  aiAccessOffUser?: boolean;
+  aiAccessOffAgent?: boolean;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -1549,4 +1559,71 @@ export interface AgencyVisaPrice {
   updatedBy: string;
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+
+// ============================================
+// AI MESSAGE ACCESS TYPES (issue #172)
+// ============================================
+
+/**
+ * A person's express approval for intelligent analysis of the messages they
+ * send. Same idea as the KYC `ConsentRecord`: who, when, which wording version
+ * and the exact text shown. Stored on `aiMessageAccess/{userId}`.
+ */
+export interface AiMessageApproval {
+  userId: string;
+  grantedAt: Timestamp;
+  /** Id of the wording version the person saw (see message-access/wording.ts). */
+  wordingVersion: string;
+  /** The exact wording stored at approval time (never the client's copy). */
+  wording: string;
+  ipAddress?: string;
+  /** Set when the person withdraws. A revoked approval no longer counts. */
+  revokedAt?: Timestamp;
+}
+
+/** The per-user AI message access document, `aiMessageAccess/{userId}`. */
+export interface AiMessageAccessRecord {
+  userId: string;
+  /** The current approval (revoked or not); null/absent = never approved. */
+  approval?: AiMessageApproval | null;
+  /** Account-wide off: while true no chat of this user releases anything. */
+  accountWideOff?: boolean;
+  accountWideOffChangedAt?: Timestamp;
+  /** One-time notice dismissal, stored on the server so it follows the person across devices. */
+  noticeDismissedAt?: Timestamp;
+  noticeDismissedVersion?: string;
+  updatedAt: Timestamp;
+}
+
+/** What an audit record describes. */
+export type AiMessageAccessAuditAction =
+  | "approval_granted"
+  | "approval_revoked"
+  | "chat_switched_off"
+  | "chat_switched_on"
+  | "account_wide_off_enabled"
+  | "account_wide_off_disabled";
+
+/**
+ * One append-only audit record, `aiMessageAccessAudit/{id}`. Written with
+ * `create()` in the same transaction as the change; the API has no update or
+ * delete path. Readable only by admins.
+ */
+export interface AiMessageAccessAuditRecord {
+  id: string;
+  /** Who made the change (always the person whose setting it is). */
+  actorUid: string;
+  /** Whose setting changed. Equal to `actorUid` today; kept explicit for the audit reader. */
+  subjectUid: string;
+  action: AiMessageAccessAuditAction;
+  /** The new value: approved / switched-off / account-wide-off. */
+  newValue: boolean;
+  /** Chat switches only: which chat, and which side of it. */
+  conversationId?: string;
+  side?: "user" | "agent";
+  /** Approvals only: the wording version recorded. */
+  wordingVersion?: string;
+  createdAt: Timestamp;
 }
