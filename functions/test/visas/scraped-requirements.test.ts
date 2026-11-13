@@ -171,7 +171,7 @@ describe("inactive seeded visa stays readable by its applicants (#175)", () => {
   });
 
   test("the list endpoint still hides the inactive seed", async () => {
-    const list = await call(visaController.getVisaTypesByCountry.bind(visaController), "uid-applicant", "x");
+    const list = await call(visaController.getVisaTypes.bind(visaController), "uid-applicant", "x");
     const ids = (list.body?.data ?? []).map((v: any) => v.id);
     assert.ok(!ids.includes("uk-visitor"));
   });
