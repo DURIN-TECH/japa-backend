@@ -318,3 +318,112 @@ describe("gates: acknowledgements, note, sample, wording", () => {
     assert.equal(reasonInWords("something_else"), "something_else");
   });
 });
+
+// ============================================
+// INTEGRATION of #201 with #207 (specialist rules are KEPT)
+// ============================================
+
+import type { IntakeQuestion } from "../../../src/types/rubric";
+import { sameScope, unanchoredScopedRules } from "../../../src/scrapers/rubric/rubric-gates";
+
+describe("integration: flags #207 raises are known to the gates", () => {
+  test("specialist_rules_without_trigger and rule_trigger_simplified never hold a draft", () => {
+    const flags = [flag("specialist_rules_without_trigger", "rubric"), flag("rule_trigger_simplified", "rubric")];
+    const r = evaluateGates(input({ flags }));
+    assert.deepEqual(r.reasonCodes, []);
+    assert.equal(r.informationalFlags.specialist_rules_without_trigger, 1);
+    assert.equal(r.flagResolutions["rule_trigger_simplified:rubric"], "informational");
+  });
+});
+
+describe("integration: a duplicate flag between rules that apply to different applicants", () => {
+  const dup = (target: string, partner: string) => flag("possible_duplicate", target, `this criterion's quote is nearly the same as that of ${partner}. Decide whether they are one rule.`);
+  const trig = (anyOf: string[]) => ({ applicability: "specialist" as const, trigger: { questionId: "activity", anyOf } });
+
+  test("different triggers: both stay (the pair is two rules)", () => {
+    const crits = rules().map((c) => (c.criterionId === "r1" ? { ...c, ...trig(["alpha"]) } : c.criterionId === "r2" ? { ...c, ...trig(["beta"]) } : c));
+    const r = evaluateGates(input({ criteria: crits, flags: [dup("r1", "r2")] }));
+    assert.deepEqual(r.excludedCriterionIds, []);
+    assert.equal(r.flagResolutions["possible_duplicate:r1"], "kept_distinct_scope");
+  });
+
+  test("a specialist rule and a general rule: both stay", () => {
+    const crits = rules().map((c) => (c.criterionId === "r1" ? { ...c, ...trig(["alpha"]) } : c));
+    assert.deepEqual(evaluateGates(input({ criteria: crits, flags: [dup("r1", "r2")] })).excludedCriterionIds, []);
+  });
+
+  test("the same trigger (values in any order): still a duplicate, one is left out", () => {
+    const crits = rules().map((c) => (c.criterionId === "r1" ? { ...c, ...trig(["alpha", "beta"]) } : c.criterionId === "r2" ? { ...c, ...trig(["beta", "alpha"]) } : c));
+    const r = evaluateGates(input({ criteria: crits, flags: [dup("r1", "r2")] }));
+    assert.deepEqual(r.excludedCriterionIds, ["r1"]);
+  });
+
+  test("sameScope: untriggered conditional rules compare their condition wording", () => {
+    const a = rule("a", { applicability: "conditional", applicabilityCondition: "When  the applicant is X" });
+    const b = rule("b", { applicability: "conditional", applicabilityCondition: "when the applicant is x" });
+    const c = rule("c", { applicability: "conditional", applicabilityCondition: "when the applicant is Y" });
+    assert.equal(sameScope(a, b), true);
+    assert.equal(sameScope(a, c), false);
+    assert.equal(sameScope(rule("d"), rule("e")), true);
+  });
+});
+
+describe("integration: the leave-out budget counts correctness only, group by group", () => {
+  const scoped = (i: number) => rule(`s${i}`, { applicability: "specialist", trigger: { questionId: "activity", anyOf: ["alpha"] } });
+  // 20 general rules and 60 scoped rules (a rulebook that keeps its specialist rules).
+  const crits = [...rules(20), ...Array.from({ length: 60 }, (_, i) => scoped(i))];
+
+  test("a duplicate left out is not counted (the partner says the same)", () => {
+    const dups = Array.from({ length: 6 }, (_, i) => flag("possible_duplicate", `r${i + 1}`, `this criterion's quote is nearly the same as that of r${i + 7}. Decide whether they are one rule.`));
+    const r = evaluateGates(input({ criteria: crits, flags: dups }));
+    assert.equal(r.counts.leftOut, 6, "recorded");
+    assert.deepEqual(r.reasonCodes, [], "but not counted: 6 of 80 would be fine, and 6 of 20 general would not be");
+  });
+
+  test("a bad reading of the GENERAL rules is not hidden by the many specialist rules kept", () => {
+    // 4 of 20 general = 20% > 15%, although 4 of 80 overall = 5%.
+    const flags = ["r1", "r2", "r3", "r4"].map((id) => flag("quote_starts_mid_sentence", id));
+    assert.deepEqual(evaluateGates(input({ criteria: crits, flags })).reasonCodes, ["leave_out_budget_exceeded"]);
+  });
+
+  test("and the same number of leave-outs among 60 scoped rules passes", () => {
+    const flags = ["s0", "s1", "s2", "s3"].map((id) => flag("quote_starts_mid_sentence", id));
+    assert.deepEqual(evaluateGates(input({ criteria: crits, flags })).reasonCodes, []);
+  });
+
+  test("the scoped group has its own share too", () => {
+    const flags = Array.from({ length: 10 }, (_, i) => flag("combined_sub_conditions", `s${i}`));
+    assert.deepEqual(evaluateGates(input({ criteria: crits, flags })).reasonCodes, ["leave_out_budget_exceeded"]);
+  });
+});
+
+describe("integration: scoped rules without a usable trigger are counted, never blocking", () => {
+  const activity = { id: "activity", answerType: "single_choice", options: [{ value: "alpha", label: "A" }] } as unknown as IntakeQuestion;
+  const crits = [
+    rule("g1"),
+    rule("c1", { applicability: "conditional", trigger: { questionId: "activity", anyOf: ["alpha"] } }),
+    rule("c2", { applicability: "conditional" }),
+    rule("c3", { applicability: "conditional", trigger: { questionId: "gone", anyOf: ["alpha"] } }),
+    rule("s1", { applicability: "specialist" }),
+    rule("s2", { applicability: "specialist", trigger: { questionId: "activity", anyOf: ["alpha"] } }),
+  ];
+
+  test("counts conditional rules with no, a dangling, or a dropped trigger; and unanchored specialist rules", () => {
+    assert.deepEqual(unanchoredScopedRules(crits, [activity]), { conditional: 2, specialist: 1 });
+    assert.deepEqual(unanchoredScopedRules(crits, [activity], ["c1", "s2"]), { conditional: 3, specialist: 2 });
+  });
+
+  test("the run record shows it as informational flags and a gate line; the draft is not held", () => {
+    const r = evaluateGates(input({ criteria: crits, intakeQuestions: [activity], droppedTriggerIds: [] }));
+    assert.deepEqual(r.reasonCodes, []);
+    assert.equal(r.informationalFlags.conditional_rules_without_trigger, 2);
+    assert.equal(r.informationalFlags.specialist_rules_unanchored, 1);
+    assert.ok(r.gates.some((g) => g.gate === "scoped_rules_without_trigger" && g.passed));
+  });
+
+  test("nothing is added when the questions are not given, or when every scoped rule is anchored", () => {
+    assert.equal(evaluateGates(input({ criteria: crits })).informationalFlags.conditional_rules_without_trigger, undefined);
+    const ok = evaluateGates(input({ criteria: [rule("g1"), crits[1]], intakeQuestions: [activity] }));
+    assert.equal(ok.informationalFlags.conditional_rules_without_trigger, undefined);
+  });
+});

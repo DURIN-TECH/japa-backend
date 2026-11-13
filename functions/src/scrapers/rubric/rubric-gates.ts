@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
-import type { AssessmentCriterion, RubricPublishGateResult, RubricPublishLeftOut } from "../../types/rubric";
+import type { AssessmentCriterion, IntakeQuestion, RubricPublishGateResult, RubricPublishLeftOut } from "../../types/rubric";
+import { isValidTrigger } from "../../utils/rubric-trigger";
 import { EXCLUSION_NOTE_MAX } from "./rubric-exclusions";
 import type { RubricPublishSettings } from "./rubric-publish-settings";
 
@@ -83,7 +84,7 @@ export const INFORMATIONAL_FLAG_CODES: readonly string[] = [
 export const CHECKER_RESOLVED_FLAG_CODES: readonly string[] = ["nationality_codes_model_proposed", "nationality_code_name_mismatch", "title_wording_uncited", "intake_wording_uncited"];
 
 /** What a flag is resolved as, recorded per flag key (`code:target`) in the run. */
-export type FlagResolution = "left_out" | "kept_partner_left_out" | "informational" | "resolved_by_checker";
+export type FlagResolution = "left_out" | "kept_partner_left_out" | "kept_distinct_scope" | "informational" | "resolved_by_checker";
 
 // ============================================
 // Input and output
@@ -122,6 +123,11 @@ export interface GateInput {
   servingKeptCount: number | null;
   settings: Pick<RubricPublishSettings, "maxLeftOutShare" | "maxPrimaryLeftOutShare" | "minKeptShareOfServing">;
   checker?: GateCheckerResult | null;
+  // INTEGRATION (#207): the questions as they will be SERVED (after the question plan), and the rules
+  // whose trigger the check dropped. With them the run record counts the kept rules that are
+  // scoped (`conditional` / `specialist`) but have no usable trigger. Absent = not counted.
+  intakeQuestions?: readonly IntakeQuestion[];
+  droppedTriggerIds?: readonly string[];
 }
 
 /** The verdict of the gates. */
@@ -147,6 +153,50 @@ export interface GateReport {
 /** Protected = a mandatory bar, or any rule scoped to a named group. */
 export function isProtectedRule(c: Pick<AssessmentCriterion, "kind" | "appliesTo">): boolean {
   return c.kind === "mandatory_bar" || c.appliesTo !== undefined;
+}
+
+/** A rule whose scope depends on the applicant (#207): not "everyone". */
+export const isScopedRule = (c: Pick<AssessmentCriterion, "applicability">): boolean => c.applicability === "specialist" || c.applicability === "conditional";
+
+/**
+ * True when two rules apply to the SAME applicants: the same applicability and the
+ * same trigger (same question and same set of answers), or, with no trigger on
+ * either, the same applicability condition. INTEGRATION (#207): the duplicate flag
+ * compares QUOTES only, and a rulebook that now keeps specialist rules holds many
+ * near-identical sentences that apply to different activities. Leaving one of those
+ * out would drop a rule for a group of applicants the partner does not cover, so
+ * only a same-scope pair is a duplicate.
+ */
+export function sameScope(a: AssessmentCriterion, b: AssessmentCriterion): boolean {
+  if ((a.applicability ?? "all_applicants") !== (b.applicability ?? "all_applicants")) return false;
+  if (a.trigger || b.trigger) {
+    if (!a.trigger || !b.trigger || a.trigger.questionId !== b.trigger.questionId) return false;
+    const x = [...new Set(a.trigger.anyOf)].sort().join("\u0000");
+    const y = [...new Set(b.trigger.anyOf)].sort().join("\u0000");
+    return x === y;
+  }
+  const cond = (c: AssessmentCriterion): string => (c.applicabilityCondition ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  return cond(a) === cond(b);
+}
+
+/**
+ * Kept rules that are scoped but have no usable trigger in what will be served
+ * (INTEGRATION, #207). A `specialist` one is read as "could not tell whether this
+ * applies"; a `conditional` one keeps the pre-#207 behaviour and APPLIES TO
+ * EVERYONE. Both are counted so the run record shows how much of the rulebook
+ * rests on that.
+ */
+export function unanchoredScopedRules(kept: readonly AssessmentCriterion[], questions: readonly IntakeQuestion[], droppedTriggerIds: readonly string[] = []): { conditional: number; specialist: number } {
+  const dropped = new Set(droppedTriggerIds);
+  const out = { conditional: 0, specialist: 0 };
+  for (const c of kept) {
+    if (!isScopedRule(c)) continue;
+    const anchored = !dropped.has(c.criterionId) && isValidTrigger(c.trigger, questions);
+    if (anchored) continue;
+    if (c.applicability === "conditional") out.conditional += 1;
+    else out.specialist += 1;
+  }
+  return out;
 }
 
 /** The other rule of a `possible_duplicate` flag, read from its code-written message; null when it cannot be read. */
@@ -262,6 +312,12 @@ export function evaluateGates(input: GateInput): GateReport {
       if (!heldRuleIds.includes(rule.criterionId)) heldRuleIds.push(rule.criterionId);
       continue;
     }
+    // INTEGRATION (#207): similar words are not enough. A pair that applies to DIFFERENT applicants
+    // (another activity, another trigger) is two rules, both kept; only the flag is resolved.
+    if (!sameScope(rule, partner)) {
+      flagResolutions[f.key] = "kept_distinct_scope";
+      continue;
+    }
     if (leftOutIds.has(rule.criterionId)) {
       flagResolutions[f.key] = "left_out";
     } else if (!leftOutIds.has(partner.criterionId)) {
@@ -314,12 +370,47 @@ export function evaluateGates(input: GateInput): GateReport {
   gate("shrink_guard", shrinkFailures, `${kept.length} kept${input.servingKeptCount !== null ? ` against ${input.servingKeptCount} serving` : ""}`);
 
   // ---- 5b. leave-out budget ----
+  // A SAFETY NET against a systematically broken draft (a bad reading usually loses rules). It is
+  // NOT a size limit: nothing is ever left out for being many (owner decision 2026-11-13).
+  //
+  //   counted      = leave-outs for CORRECTNESS: a quote that does not stand alone (mid-sentence,
+  //                  several conditions, several dates) and every verdict of the independent check.
+  //                  NOT counted: a `possible_duplicate` (the partner stays and says the same: no
+  //                  information is lost) and a dropped trigger (the rule is kept).
+  //   share(group) = counted in the group / rules in the group, for each of two groups:
+  //                  GENERAL (apply to everyone) and SCOPED (`specialist` / `conditional`), and
+  //                  for the whole draft. Held when ANY share is over `maxLeftOutShare`.
+  //   primary      = the same, over the rules of `primary` sources, with `maxPrimaryLeftOutShare`.
+  // Why two groups: since #207 a rulebook keeps several hundred more rules (the specialist ones).
+  // One share over the whole draft would dilute a bad reading of the general rules by the size of
+  // that addition, so each group answers for itself and keeping more rules never hides a bad one.
+  const counted = leftOut.filter((l) => l.flagCode !== DUPLICATE_FLAG_CODE);
+  const groupOf = (c: AssessmentCriterion | undefined): "scoped" | "general" => (c !== undefined && isScopedRule(c) ? "scoped" : "general");
   const primaryRules = input.criteria.filter((c) => input.primarySourceIds.has(c.source?.sourceId));
+  const primaryCounted = counted.filter((l) => input.primarySourceIds.has(byId.get(l.criterionId)?.source?.sourceId as string));
   const primaryLeftOut = leftOut.filter((l) => input.primarySourceIds.has(byId.get(l.criterionId)?.source?.sourceId as string));
   const budgetFailures: string[] = [];
-  if (total > 0 && leftOut.length / total > input.settings.maxLeftOutShare) budgetFailures.push("leave_out_budget_exceeded");
-  if (primaryRules.length > 0 && primaryLeftOut.length / primaryRules.length > input.settings.maxPrimaryLeftOutShare) budgetFailures.push("primary_leave_out_budget_exceeded");
-  gate("leave_out_budget", budgetFailures, `${leftOut.length} of ${total} left out, ${primaryLeftOut.length} of ${primaryRules.length} primary`);
+  const details: string[] = [`${counted.length} of ${total} left out for correctness (${leftOut.length - counted.length} duplicate(s) not counted)`];
+  if (total > 0 && counted.length / total > input.settings.maxLeftOutShare) budgetFailures.push("leave_out_budget_exceeded");
+  for (const group of ["general", "scoped"] as const) {
+    const inGroup = input.criteria.filter((c) => groupOf(c) === group).length;
+    const outInGroup = counted.filter((l) => groupOf(byId.get(l.criterionId)) === group).length;
+    if (inGroup > 0 && outInGroup / inGroup > input.settings.maxLeftOutShare && !budgetFailures.includes("leave_out_budget_exceeded")) budgetFailures.push("leave_out_budget_exceeded");
+    if (inGroup > 0) details.push(`${group}: ${outInGroup} of ${inGroup}`);
+    const primInGroup = primaryRules.filter((c) => groupOf(c) === group).length;
+    const primOutInGroup = primaryCounted.filter((l) => groupOf(byId.get(l.criterionId)) === group).length;
+    if (primInGroup > 0 && primOutInGroup / primInGroup > input.settings.maxPrimaryLeftOutShare && !budgetFailures.includes("primary_leave_out_budget_exceeded")) budgetFailures.push("primary_leave_out_budget_exceeded");
+  }
+  if (primaryRules.length > 0 && primaryCounted.length / primaryRules.length > input.settings.maxPrimaryLeftOutShare && !budgetFailures.includes("primary_leave_out_budget_exceeded")) budgetFailures.push("primary_leave_out_budget_exceeded");
+  gate("leave_out_budget", budgetFailures, `${details.join("; ")}; ${primaryCounted.length} of ${primaryRules.length} primary`);
+
+  // ---- INTEGRATION (#207): scoped rules that rest on no usable trigger, counted, never blocking ----
+  if (input.intakeQuestions !== undefined) {
+    const unanchored = unanchoredScopedRules(kept, input.intakeQuestions, input.droppedTriggerIds ?? []);
+    if (unanchored.conditional > 0) informationalFlags.conditional_rules_without_trigger = unanchored.conditional;
+    if (unanchored.specialist > 0) informationalFlags.specialist_rules_unanchored = unanchored.specialist;
+    gates.push({ gate: "scoped_rules_without_trigger", passed: true, detail: `${unanchored.conditional} conditional rule(s) without a usable trigger apply to everyone (as before #207); ${unanchored.specialist} specialist rule(s) are read as "could not tell"` });
+  }
 
   const leftOutByReason: Record<string, number> = {};
   for (const l of leftOut) leftOutByReason[l.reason] = (leftOutByReason[l.reason] ?? 0) + 1;

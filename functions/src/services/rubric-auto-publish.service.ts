@@ -454,6 +454,8 @@ export class RubricAutoPublishService {
         allSourceIds: sourceIds,
         servingKeptCount,
         settings: loaded.settings,
+        // INTEGRATION (#207): lets the gates count kept scoped rules that rest on no usable trigger.
+        intakeQuestions: rubric.intakeQuestions ?? [],
       };
 
       // ---- 5. the code gates ----
@@ -498,7 +500,7 @@ export class RubricAutoPublishService {
             polarity = outcome.intentPolarity;
             // Re-run the gates with the check's leave-outs: the budget and the
             // shrink guard must see the FINAL kept set.
-            report = evaluateGates({ ...gateInput, checker: { leftOut: outcome.leftOut, resolvedFlagCodes: outcome.resolvedFlagCodes } });
+            report = evaluateGates({ ...gateInput, droppedTriggerIds: outcome.droppedTriggerIds ?? [], checker: { leftOut: outcome.leftOut, resolvedFlagCodes: outcome.resolvedFlagCodes } });
             // (#203) The question plan resolves `intake_wording_uncited` AFTER this
             // point, so that one flag must not hold the draft before the planner
             // has run. It is evaluated again below, once the plan has answered.
@@ -514,7 +516,11 @@ export class RubricAutoPublishService {
                 questionPlan = "built";
                 plannerFields = plan.reviewFields;
                 // The plan may resolve more flag codes (the question wording): gate again.
-                report = evaluateGates({ ...gateInput, checker: { leftOut: outcome.leftOut, resolvedFlagCodes: [...outcome.resolvedFlagCodes, ...(plan.resolvedFlagCodes ?? [])] } });
+                // The scoped-rules count is taken over the questions as they will be SERVED (a question the
+                // wording check removed can leave a trigger without its question).
+                const planned = plan.reviewFields?.questionPlan as VisaRubric["questionPlan"];
+                const servedQuestions = applyExclusions({ ...rubric, excludedCriterionIds: [...report.excludedCriterionIds], questionPlan: planned }).intakeQuestions ?? [];
+                report = evaluateGates({ ...gateInput, intakeQuestions: servedQuestions, droppedTriggerIds: outcome.droppedTriggerIds ?? [], checker: { leftOut: outcome.leftOut, resolvedFlagCodes: [...outcome.resolvedFlagCodes, ...(plan.resolvedFlagCodes ?? [])] } });
                 for (const code of report.reasonCodes) if (!reasons.includes(code)) reasons.push(code);
               }
             }
