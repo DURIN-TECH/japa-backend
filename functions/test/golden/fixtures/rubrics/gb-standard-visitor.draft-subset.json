@@ -1,0 +1,2024 @@
+{
+ "_fixture": {
+  "notice": "EXTRACTED DRAFT, NOT APPROVED, TEST DATA ONLY. Do not treat anything in this file as the approved rules of any route.",
+  "source": "local draft 3 of the Standard Visitor rubric (#112), review status pending_review, 276 criteria",
+  "reducedWith": "applyExclusions (src/scrapers/rubric/rubric-exclusions.ts); no quote, check or title edited, no criterion added",
+  "builtBy": "test/golden/build-rubric-fixture.ts",
+  "keptCriterionIds": [
+   "crit_bbcbf75eca0a33ea",
+   "crit_0179e361d0b306e4",
+   "crit_eb69a8754bd82075",
+   "crit_933b17521a137e13",
+   "crit_a1953936aa9bb049",
+   "crit_e15f6548bcd161d4",
+   "crit_59f00013daef496c",
+   "crit_5175afe9469a7d4c",
+   "crit_b4324d35a09ca6ea",
+   "crit_20ab5662fabb4db1",
+   "crit_5ffc37848994f6c1",
+   "crit_8ab7173ebc0de0c7",
+   "crit_449b39d3b892cbf7",
+   "crit_71539e092ae87035",
+   "crit_bdcc89356811795c",
+   "crit_2d31cb96e73e420b",
+   "crit_7256046bc8894bc6",
+   "crit_77c35c7610d721b5",
+   "crit_204d86052fe47168",
+   "crit_aa2be985d797c90c",
+   "crit_e11e1bd8bf2c3f4d",
+   "crit_52a33245bfca81a7",
+   "crit_294206ebcab3a49e",
+   "crit_82884e5d69bb3ccf",
+   "crit_1597dbd5e344983a",
+   "crit_a6efd28d5c5e8b21",
+   "crit_c832ab9cd1a8bc8b",
+   "crit_01aa3b76aa14511b",
+   "crit_aadfe74b10983a2c",
+   "crit_47fc4bc353520e7e",
+   "crit_c710077a5986e35b",
+   "crit_3e0fc62a83fc412c",
+   "crit_2456f6f820599e2a"
+  ],
+  "keptByParagraph": {
+   "V 4.2(a)-(e)": [
+    "crit_933b17521a137e13",
+    "crit_a1953936aa9bb049",
+    "crit_e15f6548bcd161d4",
+    "crit_59f00013daef496c",
+    "crit_5175afe9469a7d4c"
+   ],
+   "V 4.3(a)-(c)": [
+    "crit_b4324d35a09ca6ea",
+    "crit_20ab5662fabb4db1",
+    "crit_5ffc37848994f6c1"
+   ],
+   "V 4.4(a)": [
+    "crit_8ab7173ebc0de0c7"
+   ],
+   "Guidance 7.x": [
+    "crit_bdcc89356811795c",
+    "crit_2d31cb96e73e420b",
+    "crit_7256046bc8894bc6",
+    "crit_77c35c7610d721b5",
+    "crit_204d86052fe47168",
+    "crit_aa2be985d797c90c",
+    "crit_e11e1bd8bf2c3f4d",
+    "crit_52a33245bfca81a7",
+    "crit_294206ebcab3a49e",
+    "crit_82884e5d69bb3ccf",
+    "crit_1597dbd5e344983a"
+   ],
+   "Guidance 8.x": [
+    "crit_a6efd28d5c5e8b21",
+    "crit_c832ab9cd1a8bc8b",
+    "crit_01aa3b76aa14511b",
+    "crit_aadfe74b10983a2c",
+    "crit_c710077a5986e35b",
+    "crit_3e0fc62a83fc412c",
+    "crit_2456f6f820599e2a"
+   ],
+   "Objective checks": [
+    "crit_47fc4bc353520e7e",
+    "crit_bbcbf75eca0a33ea",
+    "crit_0179e361d0b306e4",
+    "crit_eb69a8754bd82075"
+   ]
+  },
+  "intentPolarityNote": "intentPolarity is the extractor's PROPOSAL, set for test purposes; the draft has null (no admin decision)."
+ },
+ "id": "1",
+ "schemaVersion": 1,
+ "routeKey": "GB_gb-standard-visitor",
+ "countryCode": "GB",
+ "visaTypeId": "gb-standard-visitor",
+ "reviewStatus": "pending_review",
+ "intentPolarity": "immigrant_intent_penalised",
+ "reviewedBy": null,
+ "reviewedAt": null,
+ "rejectReason": null,
+ "revision": 0,
+ "supersededAt": null,
+ "intentPolarityProposal": {
+  "value": "immigrant_intent_penalised",
+  "source": {
+   "quote": "(b) will not live in the UK for extended periods through frequent or successive visits, or make the UK their main home; and",
+   "sourceId": "gb-appendix-v-visitor",
+   "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+   "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+   "retrievedAt": "2026-11-12T02:39:45.211Z"
+  }
+ },
+ "severityLevels": [
+  "critical",
+  "high",
+  "medium",
+  "low"
+ ],
+ "criteria": [
+  {
+   "criterionId": "crit_bbcbf75eca0a33ea",
+   "title": "Funds not considered if institution does not use electronic record keeping",
+   "kind": "objective",
+   "stage": "eligibility",
+   "severity": "high",
+   "ruleRef": "FIN 2.1(c)",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "(c) the financial institution does not use electronic record keeping.",
+    "sourceId": "gb-appendix-finance",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-finance",
+    "contentHash": "12d7089b98578dc7379bc40672a99364e4b0fa10a199004b1aaf0d3c20596847",
+    "retrievedAt": "2026-11-12T02:39:43.720Z"
+   },
+   "check": {
+    "field": "financialInstitution.usesElectronicRecordKeeping",
+    "op": "eq",
+    "value": true
+   },
+   "confidence": 0.75,
+   "intakeQuestionIds": [
+    "institution_electronic_records"
+   ]
+  },
+  {
+   "criterionId": "crit_0179e361d0b306e4",
+   "title": "Overdraft facilities not counted",
+   "kind": "objective",
+   "stage": "eligibility",
+   "severity": "medium",
+   "ruleRef": "FIN 3.1",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "Overdraft facilities will not be counted towards meeting financial requirements.",
+    "sourceId": "gb-appendix-finance",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-finance",
+    "contentHash": "12d7089b98578dc7379bc40672a99364e4b0fa10a199004b1aaf0d3c20596847",
+    "retrievedAt": "2026-11-12T02:39:43.720Z"
+   },
+   "check": {
+    "field": "funds.includesOverdraftFacility",
+    "op": "eq",
+    "value": false
+   },
+   "confidence": 0.75,
+   "intakeQuestionIds": [
+    "relies_on_overdraft"
+   ]
+  },
+  {
+   "criterionId": "crit_eb69a8754bd82075",
+   "title": "Most recent financial evidence dated within 31 days before application",
+   "kind": "objective",
+   "stage": "eligibility",
+   "severity": "medium",
+   "ruleRef": "FIN 7.1",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "The most recently dated piece of financial evidence must be dated within 31 days before the date of application.",
+    "sourceId": "gb-appendix-finance",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-finance",
+    "contentHash": "12d7089b98578dc7379bc40672a99364e4b0fa10a199004b1aaf0d3c20596847",
+    "retrievedAt": "2026-11-12T02:39:43.720Z"
+   },
+   "check": {
+    "field": "financialEvidence.mostRecentDateDaysBeforeApplication",
+    "op": "lte",
+    "value": 31,
+    "unit": "days"
+   },
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "latest_evidence_date"
+   ]
+  },
+  {
+   "criterionId": "crit_933b17521a137e13",
+   "title": "Will leave the UK at the end of the visit",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "critical",
+   "ruleRef": "V 4.2(a)",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "(a) will leave the UK at the end of their visit; and",
+    "sourceId": "gb-appendix-v-visitor",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+    "retrievedAt": "2026-11-12T02:39:45.211Z"
+   },
+   "probeFactors": [
+    "intention to leave the UK at the end of the visit"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.9,
+   "intakeQuestionIds": [
+    "visit_dates",
+    "employed_overseas",
+    "main_home"
+   ]
+  },
+  {
+   "criterionId": "crit_a1953936aa9bb049",
+   "title": "Will not live in UK through frequent or successive visits or make it main home",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "critical",
+   "ruleRef": "V 4.2(b)",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "(b) will not live in the UK for extended periods through frequent or successive visits, or make the UK their main home; and",
+    "sourceId": "gb-appendix-v-visitor",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+    "retrievedAt": "2026-11-12T02:39:45.211Z"
+   },
+   "probeFactors": [
+    "frequency of visits",
+    "successive visits",
+    "extended periods in the UK",
+    "whether the UK is becoming the main home"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.9,
+   "intakeQuestionIds": [
+    "main_home",
+    "previous_uk_time"
+   ]
+  },
+  {
+   "criterionId": "crit_e15f6548bcd161d4",
+   "title": "Genuinely seeking entry for a permitted purpose",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "critical",
+   "ruleRef": "V 4.2(c)",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "(c) is genuinely seeking entry or stay for a purpose that is permitted under the Visitor route as set out in Appendix Visitor: Permitted Activities and at V 13.3; and",
+    "sourceId": "gb-appendix-v-visitor",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+    "retrievedAt": "2026-11-12T02:39:45.211Z"
+   },
+   "probeFactors": [
+    "purpose of visit",
+    "whether purpose is permitted under Appendix Visitor: Permitted Activities"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.9,
+   "intakeQuestionIds": [
+    "visit_purpose",
+    "visit_plans"
+   ]
+  },
+  {
+   "criterionId": "crit_59f00013daef496c",
+   "title": "Will not undertake prohibited activities",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "critical",
+   "ruleRef": "V 4.2(d)",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "(d) will not undertake any of the prohibited activities set out in V 4.4. to V 4.6; and",
+    "sourceId": "gb-appendix-v-visitor",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+    "retrievedAt": "2026-11-12T02:39:45.211Z"
+   },
+   "probeFactors": [
+    "intended activities in the UK",
+    "prohibited activities set out in V 4.4. to V 4.6"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.85,
+   "intakeQuestionIds": [
+    "visit_plans"
+   ]
+  },
+  {
+   "criterionId": "crit_5175afe9469a7d4c",
+   "title": "Sufficient funds for all reasonable costs of the visit",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "critical",
+   "ruleRef": "V 4.2(e)",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "(e) must have sufficient funds to cover all reasonable costs in relation to their visit without working or accessing public funds, including the cost of the return or onward journey, any costs relating to their dependants, and the cost of planned activities such as private medical treatment. The applicant must show that any funds they rely upon are held in a financial institution permitted under FIN 2.1 in Appendix Finance.",
+    "sourceId": "gb-appendix-v-visitor",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+    "retrievedAt": "2026-11-12T02:39:45.211Z"
+   },
+   "probeFactors": [
+    "cost of the return or onward journey",
+    "costs relating to dependants",
+    "cost of planned activities",
+    "no working or accessing public funds",
+    "funds held in a financial institution permitted under FIN 2.1 in Appendix Finance"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.9,
+   "intakeQuestionIds": [
+    "visit_cost",
+    "funding_source",
+    "own_funds_amount",
+    "funds_institution"
+   ]
+  },
+  {
+   "criterionId": "crit_b4324d35a09ca6ea",
+   "title": "Third-party sponsor has genuine relationship with applicant",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "high",
+   "ruleRef": "V 4.3(a)",
+   "applicability": "conditional",
+   "applicabilityCondition": "In assessing whether an applicant has sufficient funds under V 4.2.(e), the applicant’s travel, maintenance and accommodation may be provided by a third party only if that third party:",
+   "source": {
+    "quote": "(a) has a genuine professional or personal relationship with the applicant; and",
+    "sourceId": "gb-appendix-v-visitor",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+    "retrievedAt": "2026-11-12T02:39:45.211Z"
+   },
+   "probeFactors": [
+    "genuine professional or personal relationship between third party and applicant"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.85,
+   "intakeQuestionIds": [
+    "funding_source",
+    "sponsor_name",
+    "sponsor_relationship"
+   ]
+  },
+  {
+   "criterionId": "crit_20ab5662fabb4db1",
+   "title": "Third-party sponsor not in breach of immigration laws",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "high",
+   "ruleRef": "V 4.3(b)",
+   "applicability": "conditional",
+   "applicabilityCondition": "In assessing whether an applicant has sufficient funds under V 4.2.(e), the applicant’s travel, maintenance and accommodation may be provided by a third party only if that third party:",
+   "source": {
+    "quote": "(b) is not, or will not be, in breach of immigration laws at the time of the decision or the applicant’s entry to the UK as a Visitor; and",
+    "sourceId": "gb-appendix-v-visitor",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+    "retrievedAt": "2026-11-12T02:39:45.211Z"
+   },
+   "probeFactors": [
+    "third party's immigration status at decision and at entry"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.85,
+   "intakeQuestionIds": [
+    "funding_source",
+    "sponsor_name",
+    "sponsor_immigration_status"
+   ]
+  },
+  {
+   "criterionId": "crit_5ffc37848994f6c1",
+   "title": "Third-party sponsor can and will support for duration of stay",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "high",
+   "ruleRef": "V 4.3(c)",
+   "applicability": "conditional",
+   "applicabilityCondition": "In assessing whether an applicant has sufficient funds under V 4.2.(e), the applicant’s travel, maintenance and accommodation may be provided by a third party only if that third party:",
+   "source": {
+    "quote": "(c) can and will provide support to the applicant for the intended duration of the applicant’s stay as a Visitor.",
+    "sourceId": "gb-appendix-v-visitor",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+    "retrievedAt": "2026-11-12T02:39:45.211Z"
+   },
+   "probeFactors": [
+    "third party's ability to support",
+    "third party's willingness to support",
+    "intended duration of stay"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.85,
+   "intakeQuestionIds": [
+    "funding_source",
+    "sponsor_name",
+    "sponsor_support"
+   ]
+  },
+  {
+   "criterionId": "crit_8ab7173ebc0de0c7",
+   "title": "Must not intend to work in the UK",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "critical",
+   "ruleRef": "V 4.4(a)",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "(a) work in the UK, which includes:",
+    "sourceId": "gb-appendix-v-visitor",
+    "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+    "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+    "retrievedAt": "2026-11-12T02:39:45.211Z"
+   },
+   "probeFactors": [
+    "taking employment in the UK",
+    "doing work for an organisation or business in the UK",
+    "establishing or running a business as a self-employed person",
+    "doing a work placement or internship",
+    "direct selling to the public",
+    "providing goods and services",
+    "whether expressly allowed by Appendix Visitor: Permitted Activities or Appendix Visitor: Permit Free Festival List"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "visit_plans",
+    "intends_to_work"
+   ]
+  },
+  {
+   "criterionId": "crit_449b39d3b892cbf7",
+   "title": "British citizens and those with right of abode cannot be given permission",
+   "kind": "mandatory_bar",
+   "stage": "validity",
+   "severity": "critical",
+   "ruleRef": "2.3",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "A person who is a British citizen, or who has right of abode in the UK cannot be given permission to enter or stay under the Immigration Rules.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "appliesTo": {
+    "nationalities": [
+     "GB"
+    ],
+    "asWritten": [
+     "British citizen"
+    ],
+    "codeNames": [
+     "United Kingdom"
+    ]
+   },
+   "confidence": 0.75,
+   "intakeQuestionIds": [
+    "british_or_roa"
+   ]
+  },
+  {
+   "criterionId": "crit_71539e092ae87035",
+   "title": "Irish citizens not eligible under Visitor rules except listed exceptions",
+   "kind": "mandatory_bar",
+   "stage": "validity",
+   "severity": "critical",
+   "ruleRef": "3.3",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "Irish citizens are not eligible to apply for permission (leave) to enter or stay under the Visitor rules, except where they are subject to any of the following:",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "appliesTo": {
+    "nationalities": [
+     "IE"
+    ],
+    "asWritten": [
+     "Irish citizens"
+    ],
+    "codeNames": [
+     "Ireland"
+    ]
+   },
+   "confidence": 0.75,
+   "intakeQuestionIds": [
+    "irish_citizen",
+    "irish_exception"
+   ]
+  },
+  {
+   "criterionId": "crit_bdcc89356811795c",
+   "title": "Previous immigration history",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "7.2",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "their previous immigration history, including visits to the UK and other countries",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "visits to the UK",
+    "visits to other countries"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "prev_uk_visits",
+    "other_travel",
+    "other_travel_details",
+    "foreign_noncompliance"
+   ]
+  },
+  {
+   "criterionId": "crit_2d31cb96e73e420b",
+   "title": "Duration of previous visits compared with stated duration",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "7.2",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "the duration of previous visits and whether this was significantly longer than they originally stated on their visa application or on arrival - if this is the case, you should not automatically presume that the visitor is not genuine, but this may be a reason to question the applicant’s overall intentions",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "duration of previous visits",
+    "whether stays were significantly longer than stated on application or on arrival"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "overstayed_stated",
+    "overstayed_details"
+   ]
+  },
+  {
+   "criterionId": "crit_7256046bc8894bc6",
+   "title": "Financial circumstances and family, social and economic background",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "7.2",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "their financial circumstances as well as their family, social and economic background",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "financial circumstances",
+    "family background",
+    "social background",
+    "economic background"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "monthly_income",
+    "occupation",
+    "home_ties"
+   ]
+  },
+  {
+   "criterionId": "crit_77c35c7610d721b5",
+   "title": "Personal and economic ties to country of residence",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "7.2",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "their personal and economic ties to their country of residence",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "personal ties to country of residence",
+    "economic ties to country of residence"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "occupation",
+    "home_ties"
+   ]
+  },
+  {
+   "criterionId": "crit_204d86052fe47168",
+   "title": "Cumulative time in UK and pattern of travel over last 12 months",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "7.2",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "the cumulative period the applicant has visited the UK and their pattern of travel over the last 12-month period, and whether this amounts to ‘de-facto’ residence in the UK",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "cumulative period visited the UK",
+    "pattern of travel over the last 12-month period",
+    "whether this amounts to de-facto residence in the UK"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "visit_dates",
+    "uk_visits_12m"
+   ]
+  },
+  {
+   "criterionId": "crit_aa2be985d797c90c",
+   "title": "Consideration of travel history",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "7.3",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "You must consider the applicant’s travel history in their passport or travel document (and, for visa applications, that listed on the application form).",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "previous compliance with UK immigration law",
+    "travel to other countries, especially the USA, Canada, Australia, New Zealand, Ireland, Schengen countries or Switzerland"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "prev_uk_visits",
+    "other_travel",
+    "other_travel_details"
+   ]
+  },
+  {
+   "criterionId": "crit_e11e1bd8bf2c3f4d",
+   "title": "First-time traveller: rely on other evidence",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "7.3",
+   "applicability": "conditional",
+   "applicabilityCondition": "Where the applicant is a first-time traveller",
+   "source": {
+    "quote": "Where the applicant is a first-time traveller, you will need to rely on other evidence to satisfy you they are a genuine visitor.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "other evidence of genuine visitor intentions"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "prev_uk_visits",
+    "other_travel"
+   ]
+  },
+  {
+   "criterionId": "crit_52a33245bfca81a7",
+   "title": "Previous refusal under Family rules: avoidance of family route",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "7.4",
+   "applicability": "conditional",
+   "applicabilityCondition": "if the visitor has previously been refused under the Family rules and subsequently wants to enter as a visitor",
+   "source": {
+    "quote": "the history of previous applications, for example if the visitor has previously been refused under the Family rules and subsequently wants to enter as a visitor you must assess if they are using the visitor route to avoid the rules in place for family migrants joining British or settled persons in the UK",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "history of previous applications",
+    "whether visitor route used to avoid Family rules"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "family_refusal"
+   ]
+  },
+  {
+   "criterionId": "crit_294206ebcab3a49e",
+   "title": "Seeking to remain for extended periods or make UK home",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "high",
+   "ruleRef": "7.4",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "However, if it is clear from an applicant’s travel history that they are seeking to remain in the UK for extended periods or making the UK their home you should refuse their application.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "travel history",
+    "extended periods in the UK",
+    "UK as home"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.85,
+   "intakeQuestionIds": [
+    "visit_dates",
+    "uk_visits_12m"
+   ]
+  },
+  {
+   "criterionId": "crit_82884e5d69bb3ccf",
+   "title": "Few ties to country of residence and family in UK",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "7.5",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "the applicant has few or no family and economic ties to their country of residence, and has several family members in the UK - for example a person with most of their family in the UK and no job or studies in their own country may be considered to have few ties to their home country",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "family ties to country of residence",
+    "economic ties",
+    "family members in the UK",
+    "job or studies in own country"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "concernsIntent": true,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "occupation",
+    "home_ties",
+    "family_in_uk",
+    "family_in_uk_details"
+   ]
+  },
+  {
+   "criterionId": "crit_1597dbd5e344983a",
+   "title": "Previous deception by applicant, sponsor or immediate family",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "high",
+   "ruleRef": "7.5",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "the applicant, their sponsor (if they are visiting a friend or relative) or other immediate family member has, or has attempted to, deceive the Home Office in a previous application for entry clearance, permission to enter or stay",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "previous deception or attempted deception by applicant",
+    "by sponsor",
+    "by immediate family member"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "deception"
+   ]
+  },
+  {
+   "criterionId": "crit_a6efd28d5c5e8b21",
+   "title": "Sufficient resources for maintenance and accommodation",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "high",
+   "ruleRef": "8.1",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "Check the applicant has access to sufficient resources to maintain and accommodate themselves adequately for the whole of their planned visit to the UK or for the period of any application for permission to stay.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "likely cost of the stay",
+    "sources of revenue continuing during the visit",
+    "where the applicant will be staying",
+    "application form and financial supporting documents"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.85,
+   "intakeQuestionIds": [
+    "visit_dates",
+    "trip_cost",
+    "accommodation",
+    "savings",
+    "tp_support"
+   ]
+  },
+  {
+   "criterionId": "crit_c832ab9cd1a8bc8b",
+   "title": "Ongoing financial commitments and dependants",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "medium",
+   "ruleRef": "8.1",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "You must also take into account any ongoing financial commitments the applicant has in their country of residence such as rent / mortgage payments and any dependants who they support financially, including those who are not travelling with them.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "rent / mortgage payments",
+    "dependants supported financially, including those not travelling"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.85,
+   "intakeQuestionIds": [
+    "monthly_commitments",
+    "dependants",
+    "dependants_details"
+   ]
+  },
+  {
+   "criterionId": "crit_01aa3b76aa14511b",
+   "title": "Income or savings minus commitments sufficient and reasonable",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "high",
+   "ruleRef": "8.1",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "Their income or savings, minus their financial commitments, must be sufficient to meet the likely costs they will incur in the UK and be reasonable expenditure in light of their financial situation.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "income or savings",
+    "financial commitments",
+    "likely costs in the UK",
+    "reasonableness of expenditure in light of financial situation"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.85,
+   "intakeQuestionIds": [
+    "monthly_income",
+    "trip_cost",
+    "savings",
+    "monthly_commitments",
+    "dependants_details"
+   ]
+  },
+  {
+   "criterionId": "crit_aadfe74b10983a2c",
+   "title": "Origin of recently deposited funds",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "8.1",
+   "applicability": "conditional",
+   "applicabilityCondition": "Where an individual provides documents which show sufficient funds for their planned stay, but either all or most of these funds have not been held in their account for long",
+   "source": {
+    "quote": "Where an individual provides documents which show sufficient funds for their planned stay, but either all or most of these funds have not been held in their account for long, you may want to make further checks to establish the origin of this money.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "how long funds have been held",
+    "origin of the money"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "recent_deposit",
+    "recent_deposit_origin"
+   ]
+  },
+  {
+   "criterionId": "crit_47fc4bc353520e7e",
+   "title": "Funds held in a financial institution permitted under Appendix Finance",
+   "kind": "objective",
+   "stage": "eligibility",
+   "severity": "high",
+   "ruleRef": "8.1",
+   "applicability": "all_applicants",
+   "source": {
+    "quote": "Any funds relied upon by the applicant to demonstrate that they have sufficient funds must be held in a financial institution permitted under Appendix Finance.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "check": {
+    "field": "funds_held_in_permitted_financial_institution",
+    "op": "eq",
+    "value": true
+   },
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "funds_bank"
+   ]
+  },
+  {
+   "criterionId": "crit_c710077a5986e35b",
+   "title": "Third-party funds must meet third-party rules",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "high",
+   "ruleRef": "8.1",
+   "applicability": "conditional",
+   "applicabilityCondition": "If the money is from a third party",
+   "source": {
+    "quote": "If the money is from a third party you must check whether the rules on maintenance and accommodation provided by a third party are met.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "whether third-party maintenance and accommodation rules are met"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "third_party",
+    "tp_name",
+    "tp_support"
+   ]
+  },
+  {
+   "criterionId": "crit_3e0fc62a83fc412c",
+   "title": "Undeclared third-party support not counted",
+   "kind": "judgement",
+   "stage": "eligibility",
+   "severity": "medium",
+   "ruleRef": "8.1",
+   "applicability": "conditional",
+   "applicabilityCondition": "If the applicant has not declared the third-party support",
+   "source": {
+    "quote": "If the applicant has not declared the third-party support, for example on the application form, and they are unable to show that the funds are genuinely theirs, they should not be counted in any assessment.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "declaration of third-party support",
+    "whether funds are genuinely the applicant's"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "recent_deposit_origin",
+    "third_party"
+   ]
+  },
+  {
+   "criterionId": "crit_2456f6f820599e2a",
+   "title": "Genuine relationship with third-party supporter",
+   "kind": "judgement",
+   "stage": "credibility",
+   "severity": "medium",
+   "ruleRef": "8.2",
+   "applicability": "conditional",
+   "applicabilityCondition": "Maintenance and accommodation support can be provided by a third party",
+   "source": {
+    "quote": "Maintenance and accommodation support can be provided by a third party, including family members, friends and other people with whom the applicant has a genuine personal or professional relationship.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   },
+   "probeFactors": [
+    "third party's previous history of sponsoring visitors",
+    "relationship between applicant and third party",
+    "where and how they met",
+    "how often and by what method they communicate"
+   ],
+   "requiresInterviewBeforeRefusal": false,
+   "confidence": 0.8,
+   "intakeQuestionIds": [
+    "tp_name",
+    "tp_relationship",
+    "tp_contact"
+   ]
+  }
+ ],
+ "intake": {
+  "title": "Your money and bank accounts",
+  "cardTitle": "Funds",
+  "intro": "These questions cover the money you will rely on for your visit: where it is held, whose name the account is in, and the dates of your financial documents."
+ },
+ "intakeQuestions": [
+  {
+   "id": "institution_electronic_records",
+   "label": "Does the bank or financial institution keep its records electronically?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_bbcbf75eca0a33ea"
+   ],
+   "group": "Funds",
+   "party": "applicant"
+  },
+  {
+   "id": "relies_on_overdraft",
+   "label": "Does any of the money you are relying on come from an overdraft facility?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_0179e361d0b306e4"
+   ],
+   "group": "Funds",
+   "party": "applicant"
+  },
+  {
+   "id": "latest_evidence_date",
+   "label": "What is the closing balance date on your most recent bank statement or financial document?",
+   "answerType": "date",
+   "required": true,
+   "criterionIds": [
+    "crit_eb69a8754bd82075"
+   ],
+   "group": "Financial documents",
+   "party": "applicant",
+   "dateLimits": {
+    "relativeToToday": "past_only"
+   }
+  },
+  {
+   "id": "visit_dates",
+   "label": "When do you plan to arrive in and leave the UK?",
+   "answerType": "date_range",
+   "required": true,
+   "criterionIds": [
+    "crit_933b17521a137e13",
+    "crit_204d86052fe47168",
+    "crit_294206ebcab3a49e",
+    "crit_a6efd28d5c5e8b21"
+   ],
+   "dateLimits": {
+    "relativeToToday": "future_only"
+   }
+  },
+  {
+   "id": "visit_purpose",
+   "label": "What is the main purpose of your visit?",
+   "answerType": "single_choice",
+   "required": true,
+   "criterionIds": [
+    "crit_e15f6548bcd161d4"
+   ],
+   "options": [
+    {
+     "value": "tourism",
+     "label": "Tourism or holiday"
+    },
+    {
+     "value": "family_friends",
+     "label": "Visiting family or friends"
+    },
+    {
+     "value": "business",
+     "label": "Business activity"
+    },
+    {
+     "value": "short_study",
+     "label": "Short course of study"
+    },
+    {
+     "value": "medical",
+     "label": "Private medical treatment or organ donation"
+    },
+    {
+     "value": "other",
+     "label": "Something else"
+    }
+   ]
+  },
+  {
+   "id": "visit_plans",
+   "label": "Describe what you plan to do during your visit.",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_e15f6548bcd161d4",
+    "crit_59f00013daef496c",
+    "crit_8ab7173ebc0de0c7"
+   ],
+   "textLimits": {
+    "maxLength": 1500
+   }
+  },
+  {
+   "id": "intends_to_work",
+   "label": "Do you plan to do any work, internship, work placement, selling or providing services for any person or business in the UK?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_8ab7173ebc0de0c7"
+   ]
+  },
+  {
+   "id": "employed_overseas",
+   "label": "Are you currently employed or paid outside the UK, and will you stay employed during your visit?",
+   "answerType": "single_choice",
+   "required": true,
+   "criterionIds": [
+    "crit_933b17521a137e13"
+   ],
+   "options": [
+    {
+     "value": "employed_remain",
+     "label": "Yes, and I will stay employed"
+    },
+    {
+     "value": "employed_leaving",
+     "label": "Yes, but I will not stay employed"
+    },
+    {
+     "value": "not_employed",
+     "label": "I am not employed"
+    }
+   ]
+  },
+  {
+   "id": "main_home",
+   "label": "Which country is your main home, and what will you return to after your visit?",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_933b17521a137e13",
+    "crit_a1953936aa9bb049"
+   ],
+   "textLimits": {
+    "maxLength": 1000
+   }
+  },
+  {
+   "id": "previous_uk_time",
+   "label": "How much time have you spent in the UK in the last 12 months, and over how many visits?",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_a1953936aa9bb049"
+   ],
+   "textLimits": {
+    "maxLength": 500
+   }
+  },
+  {
+   "id": "visit_cost",
+   "label": "What is the estimated total cost of your visit, including your return or onward journey and any dependants?",
+   "answerType": "amount",
+   "required": true,
+   "criterionIds": [
+    "crit_5175afe9469a7d4c"
+   ],
+   "group": "funds"
+  },
+  {
+   "id": "funding_source",
+   "label": "Who will pay for your travel, accommodation and living costs?",
+   "answerType": "single_choice",
+   "required": true,
+   "criterionIds": [
+    "crit_5175afe9469a7d4c",
+    "crit_b4324d35a09ca6ea",
+    "crit_20ab5662fabb4db1",
+    "crit_5ffc37848994f6c1"
+   ],
+   "group": "funds",
+   "options": [
+    {
+     "value": "self",
+     "label": "I will pay myself"
+    },
+    {
+     "value": "third_party",
+     "label": "Someone else will pay or provide some of it"
+    }
+   ]
+  },
+  {
+   "id": "own_funds_amount",
+   "label": "How much money do you have available for this visit?",
+   "answerType": "amount",
+   "required": true,
+   "criterionIds": [
+    "crit_5175afe9469a7d4c"
+   ],
+   "group": "funds"
+  },
+  {
+   "id": "funds_institution",
+   "label": "Name of the bank or financial institution where these funds are held",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_5175afe9469a7d4c"
+   ],
+   "group": "funds",
+   "textLimits": {
+    "maxLength": 200
+   }
+  },
+  {
+   "id": "sponsor_name",
+   "label": "Full name of the person supporting you, as written on their documents",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_b4324d35a09ca6ea",
+    "crit_20ab5662fabb4db1",
+    "crit_5ffc37848994f6c1"
+   ],
+   "group": "sponsor",
+   "party": "sponsor",
+   "textLimits": {
+    "maxLength": 200
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "funding_source",
+      "op": "eq",
+      "value": "third_party"
+     }
+    ]
+   }
+  },
+  {
+   "id": "sponsor_relationship",
+   "label": "What is your relationship with this person?",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_b4324d35a09ca6ea"
+   ],
+   "group": "sponsor",
+   "party": "sponsor",
+   "textLimits": {
+    "maxLength": 500
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "funding_source",
+      "op": "eq",
+      "value": "third_party"
+     }
+    ]
+   }
+  },
+  {
+   "id": "sponsor_immigration_status",
+   "label": "What is this person's immigration status in the UK (if they live in the UK)?",
+   "answerType": "single_choice",
+   "required": true,
+   "criterionIds": [
+    "crit_20ab5662fabb4db1"
+   ],
+   "group": "sponsor",
+   "party": "sponsor",
+   "options": [
+    {
+     "value": "british_or_settled",
+     "label": "British citizen or settled"
+    },
+    {
+     "value": "valid_permission",
+     "label": "Has valid permission to be in the UK"
+    },
+    {
+     "value": "no_valid_permission",
+     "label": "Does not have valid permission"
+    },
+    {
+     "value": "lives_outside_uk",
+     "label": "Lives outside the UK"
+    }
+   ],
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "funding_source",
+      "op": "eq",
+      "value": "third_party"
+     }
+    ]
+   }
+  },
+  {
+   "id": "sponsor_support",
+   "label": "What will this person provide (travel, accommodation, money) and for how long?",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_5ffc37848994f6c1"
+   ],
+   "group": "sponsor",
+   "party": "sponsor",
+   "textLimits": {
+    "maxLength": 1000
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "funding_source",
+      "op": "eq",
+      "value": "third_party"
+     }
+    ]
+   }
+  },
+  {
+   "id": "british_or_roa",
+   "label": "Are you a British citizen, or do you have the right of abode in the UK?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_449b39d3b892cbf7"
+   ]
+  },
+  {
+   "id": "irish_citizen",
+   "label": "Are you an Irish citizen?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_71539e092ae87035"
+   ]
+  },
+  {
+   "id": "irish_exception",
+   "label": "Are you subject to a deportation order, an exclusion decision or order, or a travel ban?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_71539e092ae87035"
+   ],
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "irish_citizen",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "monthly_income",
+   "label": "What is your monthly income?",
+   "answerType": "amount",
+   "required": true,
+   "criterionIds": [
+    "crit_7256046bc8894bc6",
+    "crit_01aa3b76aa14511b"
+   ]
+  },
+  {
+   "id": "trip_cost",
+   "label": "How much do you expect the whole trip to cost?",
+   "answerType": "amount",
+   "required": true,
+   "criterionIds": [
+    "crit_a6efd28d5c5e8b21",
+    "crit_01aa3b76aa14511b"
+   ]
+  },
+  {
+   "id": "accommodation",
+   "label": "Where will you stay during your visit?",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_a6efd28d5c5e8b21"
+   ],
+   "textLimits": {
+    "maxLength": 500
+   }
+  },
+  {
+   "id": "prev_uk_visits",
+   "label": "Have you visited the UK before?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_bdcc89356811795c",
+    "crit_aa2be985d797c90c",
+    "crit_e11e1bd8bf2c3f4d"
+   ],
+   "group": "Travel history"
+  },
+  {
+   "id": "uk_visits_12m",
+   "label": "List your UK visits in the last 12 months with dates of arrival and departure, and the purpose of each trip home in between",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_204d86052fe47168",
+    "crit_294206ebcab3a49e"
+   ],
+   "group": "Travel history",
+   "textLimits": {
+    "maxLength": 2000
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "prev_uk_visits",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "overstayed_stated",
+   "label": "Did any previous UK visit last significantly longer than you stated on your application or on arrival?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_2d31cb96e73e420b"
+   ],
+   "group": "Travel history",
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "prev_uk_visits",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "overstayed_details",
+   "label": "Explain which visit and why it lasted longer",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_2d31cb96e73e420b"
+   ],
+   "group": "Travel history",
+   "textLimits": {
+    "maxLength": 1000
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "overstayed_stated",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "other_travel",
+   "label": "Have you travelled to other countries outside your country of residence in recent years?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_bdcc89356811795c",
+    "crit_aa2be985d797c90c",
+    "crit_e11e1bd8bf2c3f4d"
+   ],
+   "group": "Travel history"
+  },
+  {
+   "id": "other_travel_details",
+   "label": "List the countries you have visited and when",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_bdcc89356811795c",
+    "crit_aa2be985d797c90c"
+   ],
+   "group": "Travel history",
+   "textLimits": {
+    "maxLength": 2000
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "other_travel",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "foreign_noncompliance",
+   "label": "Have you ever been refused entry to, removed from, or broken the immigration law of any country?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_bdcc89356811795c"
+   ],
+   "group": "Travel history"
+  },
+  {
+   "id": "family_refusal",
+   "label": "Have you previously been refused a UK application under the Family rules?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_52a33245bfca81a7"
+   ],
+   "group": "Travel history"
+  },
+  {
+   "id": "deception",
+   "label": "Have you, the person you are visiting, or an immediate family member ever used or tried to use deception in a UK immigration application?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_1597dbd5e344983a"
+   ],
+   "group": "Travel history"
+  },
+  {
+   "id": "occupation",
+   "label": "What is your current situation in your country of residence?",
+   "answerType": "single_choice",
+   "required": true,
+   "criterionIds": [
+    "crit_7256046bc8894bc6",
+    "crit_77c35c7610d721b5",
+    "crit_82884e5d69bb3ccf"
+   ],
+   "group": "Ties to home",
+   "options": [
+    {
+     "value": "employed",
+     "label": "Employed"
+    },
+    {
+     "value": "self_employed",
+     "label": "Self-employed"
+    },
+    {
+     "value": "student",
+     "label": "Student"
+    },
+    {
+     "value": "retired",
+     "label": "Retired"
+    },
+    {
+     "value": "unemployed",
+     "label": "Not working or studying"
+    }
+   ]
+  },
+  {
+   "id": "home_ties",
+   "label": "Describe your family and other ties in your country of residence, including who you live with, property, long-term commitments and where you pay tax",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_7256046bc8894bc6",
+    "crit_77c35c7610d721b5",
+    "crit_82884e5d69bb3ccf"
+   ],
+   "group": "Ties to home",
+   "textLimits": {
+    "maxLength": 2000
+   }
+  },
+  {
+   "id": "family_in_uk",
+   "label": "Do you have family members living in the UK?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_82884e5d69bb3ccf"
+   ],
+   "group": "Ties to home"
+  },
+  {
+   "id": "family_in_uk_details",
+   "label": "Who are they and how are they related to you?",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_82884e5d69bb3ccf"
+   ],
+   "group": "Ties to home",
+   "textLimits": {
+    "maxLength": 1000
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "family_in_uk",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "savings",
+   "label": "How much savings do you have available for this trip?",
+   "answerType": "amount",
+   "required": true,
+   "criterionIds": [
+    "crit_a6efd28d5c5e8b21",
+    "crit_01aa3b76aa14511b"
+   ],
+   "group": "Finances"
+  },
+  {
+   "id": "funds_bank",
+   "label": "Name of the bank or financial institution where these funds are held",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_47fc4bc353520e7e"
+   ],
+   "group": "Finances",
+   "textLimits": {
+    "maxLength": 200
+   }
+  },
+  {
+   "id": "recent_deposit",
+   "label": "Were all or most of these funds paid into your account recently?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_aadfe74b10983a2c"
+   ],
+   "group": "Finances"
+  },
+  {
+   "id": "recent_deposit_origin",
+   "label": "Where did this money come from?",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_aadfe74b10983a2c",
+    "crit_3e0fc62a83fc412c"
+   ],
+   "group": "Finances",
+   "textLimits": {
+    "maxLength": 1000
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "recent_deposit",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "monthly_commitments",
+   "label": "What are your monthly financial commitments at home, such as rent or mortgage?",
+   "answerType": "amount",
+   "required": true,
+   "criterionIds": [
+    "crit_c832ab9cd1a8bc8b",
+    "crit_01aa3b76aa14511b"
+   ],
+   "group": "Finances"
+  },
+  {
+   "id": "dependants",
+   "label": "Do you financially support anyone, including people not travelling with you?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_c832ab9cd1a8bc8b"
+   ],
+   "group": "Finances"
+  },
+  {
+   "id": "dependants_details",
+   "label": "Who do you support and how much do you spend on them each month?",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_c832ab9cd1a8bc8b",
+    "crit_01aa3b76aa14511b"
+   ],
+   "group": "Finances",
+   "textLimits": {
+    "maxLength": 1000
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "dependants",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "third_party",
+   "label": "Will someone else pay for or provide your maintenance or accommodation?",
+   "answerType": "yes_no",
+   "required": true,
+   "criterionIds": [
+    "crit_c710077a5986e35b",
+    "crit_3e0fc62a83fc412c"
+   ],
+   "group": "Support"
+  },
+  {
+   "id": "tp_name",
+   "label": "Full name of the person or organisation supporting you, as written on their documents",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_c710077a5986e35b",
+    "crit_2456f6f820599e2a"
+   ],
+   "group": "Support",
+   "party": "sponsor",
+   "textLimits": {
+    "maxLength": 200
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "third_party",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "tp_support",
+   "label": "What support will they provide?",
+   "answerType": "multi_choice",
+   "required": true,
+   "criterionIds": [
+    "crit_c710077a5986e35b",
+    "crit_a6efd28d5c5e8b21"
+   ],
+   "group": "Support",
+   "party": "sponsor",
+   "options": [
+    {
+     "value": "money",
+     "label": "Money"
+    },
+    {
+     "value": "accommodation",
+     "label": "Accommodation"
+    }
+   ],
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "third_party",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "tp_relationship",
+   "label": "How are you related to or connected with this person?",
+   "answerType": "single_choice",
+   "required": true,
+   "criterionIds": [
+    "crit_2456f6f820599e2a"
+   ],
+   "group": "Support",
+   "party": "sponsor",
+   "options": [
+    {
+     "value": "parent",
+     "label": "Parent"
+    },
+    {
+     "value": "other_family",
+     "label": "Other family member"
+    },
+    {
+     "value": "friend",
+     "label": "Friend"
+    },
+    {
+     "value": "professional",
+     "label": "Professional contact or employer"
+    },
+    {
+     "value": "other",
+     "label": "Other"
+    }
+   ],
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "third_party",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "tp_contact",
+   "label": "Where and how did you meet, and how often and by what method do you communicate?",
+   "answerType": "text",
+   "required": true,
+   "criterionIds": [
+    "crit_2456f6f820599e2a"
+   ],
+   "group": "Support",
+   "textLimits": {
+    "maxLength": 1000
+   },
+   "showWhen": {
+    "anyOf": [
+     {
+      "questionId": "third_party",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  }
+ ],
+ "evidenceItems": [
+  {
+   "key": "passport_travel_history",
+   "title": "Passport or travel document showing travel history",
+   "party": "applicant",
+   "criterionIds": [
+    "crit_bdcc89356811795c",
+    "crit_2d31cb96e73e420b",
+    "crit_204d86052fe47168",
+    "crit_aa2be985d797c90c"
+   ],
+   "expects": {
+    "documentType": "passport",
+    "fields": [
+     "previous visas",
+     "entry and exit stamps",
+     "countries visited"
+    ]
+   },
+   "source": {
+    "quote": "You must consider the applicant’s travel history in their passport or travel document (and, for visa applications, that listed on the application form).",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   }
+  },
+  {
+   "key": "financial_documents",
+   "title": "Financial supporting documents",
+   "party": "applicant",
+   "criterionIds": [
+    "crit_a6efd28d5c5e8b21",
+    "crit_01aa3b76aa14511b",
+    "crit_aadfe74b10983a2c",
+    "crit_47fc4bc353520e7e"
+   ],
+   "expects": {
+    "documentType": "financial_statement",
+    "fields": [
+     "account holder name",
+     "financial institution",
+     "balance",
+     "transaction history"
+    ]
+   },
+   "source": {
+    "quote": "For visa and permission to stay applications you should look at the application form and any financial supporting documents to assess this requirement.",
+    "sourceId": "gb-visit-guidance-html",
+    "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+    "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+    "retrievedAt": "2026-11-12T02:39:48.359Z",
+    "publishedDate": "2026-10-08"
+   }
+  }
+ ],
+ "sourceSnapshots": [
+  {
+   "sourceId": "gb-appendix-finance",
+   "contentHash": "12d7089b98578dc7379bc40672a99364e4b0fa10a199004b1aaf0d3c20596847",
+   "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-finance",
+   "docType": "html"
+  },
+  {
+   "sourceId": "gb-appendix-v-visitor",
+   "contentHash": "fc9142666910e764a61bcf377bc52e84653dbfc231d5b8b3ed9095da94fbd6aa",
+   "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-v-visitor",
+   "docType": "html"
+  },
+  {
+   "sourceId": "gb-part-suitability",
+   "contentHash": "75e7884bf7a91b9d7064c6bbe9ef884c617a30c9c48b19f9f6cf6311c25c7e35",
+   "url": "https://www.gov.uk/guidance/immigration-rules/immigration-rules-part-suitability",
+   "docType": "html"
+  },
+  {
+   "sourceId": "gb-visit-guidance-html",
+   "contentHash": "4427af933123fdb6273c4d0f27165e11bc41b03cd2ab0605041b8fda0cb27a0c",
+   "url": "https://www.gov.uk/government/publications/visit-guidance/visit-caseworker-guidance-accessible--2",
+   "docType": "html",
+   "publishedDate": "2026-10-08"
+  }
+ ],
+ "sourceSetHash": "d7d5e7db71f745bff5fea670b14891454cab99ba2dd2564b4d766c9cb674bfc9",
+ "extractorModel": "claude-opus-5-5",
+ "extractorPromptVersion": "2026-11-rubric-v5",
+ "extractionRunId": "0f0fa544-3a1f-4f16-9e0a-e5d7729f775e",
+ "discardedCount": 0,
+ "suspiciousPassages": [],
+ "flags": [
+  {
+   "code": "combined_sub_conditions",
+   "message": "the quote spans two or more list items of the same level, or is only the lead-in of a list. Each lettered or numbered sub-condition should be its own criterion with its own quote: check the source and split or add criteria before approving.",
+   "target": "crit_8ab7173ebc0de0c7"
+  },
+  {
+   "code": "nationality_code_name_mismatch",
+   "message": "entry 1 of the group: code GB is \"United Kingdom\" on this platform, which is not how the source names that entry. Confirm or reject the code.",
+   "target": "crit_449b39d3b892cbf7"
+  },
+  {
+   "code": "nationality_code_name_mismatch",
+   "message": "entry 1 of the group: code IE is \"Ireland\" on this platform, which is not how the source names that entry. Confirm or reject the code.",
+   "target": "crit_71539e092ae87035"
+  }
+ ],
+ "createdAt": "2026-11-12T03:06:49.117Z",
+ "version": 1,
+ "discarded": []
+}
