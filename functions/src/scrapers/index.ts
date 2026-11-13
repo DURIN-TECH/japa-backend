@@ -108,6 +108,9 @@ export {
   PUBLISH_SETTINGS_DOC_ID,
 } from "./rubric/rubric-publish-settings";
 export type { RubricPublishSettings, LoadedPublishSettings, PublishSettingsView, PublishSettingsPatch } from "./rubric/rubric-publish-settings";
+/** The independent AI check of every rule (part B, #202): registered on the publish pipeline. */
+export { rubricChecker, RubricCheckerService, estimateCheckerLoad, judgeRule, decidePolarity } from "./rubric/rubric-checker";
+export type { RubricCheckerRun } from "./rubric/rubric-checker";
 /** The pure code gates, the sample audit and the reason wording. */
 export { evaluateGates, acknowledgementsFor, buildExclusionNote, sampleAudit, reasonInWords, isProtectedRule, SAMPLE_AUDIT_SIZE } from "./rubric/rubric-gates";
 export type { GateInput, GateReport, GateFlag, GateCheckerResult, FlagResolution, SampleAuditRule } from "./rubric/rubric-gates";

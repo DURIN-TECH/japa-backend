@@ -420,6 +420,32 @@ export class SnapshotQuoteIndex {
     return { before: text.slice(from, found.at), after: text.slice(quoteEnd, to), truncatedBefore: from > 0, truncatedAfter: to < text.length };
   }
 
+  /**
+   * The lead-in of a LIST ITEM (issue #202): when the located quote is one
+   * bracketed item of a list ("(a) ...", "(ii) ..."), the nearest earlier line
+   * that is not itself a list item, i.e. the sentence that introduces the
+   * list and carries the circumstance every item shares. `contextAround`
+   * cannot give it (it stays inside the quote's own line). Cut to its LAST
+   * `maxChars` characters (the end of a long paragraph is the sentence that
+   * introduces the list). Empty for anything that is not a list item, and for
+   * a PDF page (one unit: the layout is lost). Bounded twice: one line, and
+   * `maxChars`.
+   */
+  listLeadIn(found: Extract<QuoteLookup, { ok: true }>, maxChars: number): string {
+    if (this.paginated) return "";
+    const line = this.units[found.unit].text;
+    const limb = LIMB_RE.exec(line);
+    if (!limb || !(found.at <= limb[0].length || line.slice(limb[0].length, found.at).trim() === "")) return "";
+    for (let i = found.unit - 1; i >= 0 && found.unit - i <= MAX_PARENT_LOOKBACK_LINES; i--) {
+      const text = this.units[i].text;
+      if (!text) continue;
+      // A sibling item: keep walking back to the sentence above the list.
+      if (LIMB_RE.test(text)) continue;
+      return text.length <= maxChars ? text : text.slice(text.length - Math.max(0, maxChars));
+    }
+    return "";
+  }
+
   /** True when a literal appears in the document, verbatim and token-bounded. */
   containsLiteral(literal: string): boolean {
     return tokenBoundedPositions(this.joined, normalizeForQuoteMatch(literal)).length > 0;

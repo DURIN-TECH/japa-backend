@@ -14,6 +14,7 @@ import {
   reasonInWords,
   rubricStore,
   routeAllowed,
+  rubricChecker,
   sampleAudit,
   scrapeAlertService,
 } from "../scrapers";
@@ -215,6 +216,11 @@ function errorClass(err: unknown): string {
 /** The system actor, as the review service takes it. */
 const SYSTEM_ACTOR: RubricReviewActor = { kind: RUBRIC_ACTOR_KIND.SYSTEM, id: RUBRIC_SYSTEM_ACTOR_ID };
 
+/** Hold reasons that can clear by themselves, so the hourly sweep retries them (part B, #202). */
+export const RETRYABLE_REASONS: readonly string[] = ["checker_unavailable", "checker_capped", "checker_output_invalid"];
+/** Most runs of one version (the first and the sweep's retries together) before it stays held with its final reason. */
+export const MAX_SWEEP_ATTEMPTS = 3;
+
 /** Reason of the system's rejection of an older pending version (at least the 10 characters a reject needs). */
 export const SUPERSEDED_REASON = "superseded_by_newer_version";
 
@@ -307,6 +313,42 @@ export class RubricAutoPublishService {
     const parsed = parseRubricVersionId(id);
     if (!parsed) throw new RubricReviewError("NOT_FOUND", "Rubric version not found", 404);
     return this.run(parsed.routeKey, parsed.version, { trigger: opts.trigger ?? "admin_endpoint", dryRun: opts.dryRun, skipChecker: opts.skipChecker });
+  }
+
+  /**
+   * The hourly sweep (part B, #202): re-run held drafts whose ONLY reasons are
+   * ones that can clear by themselves (the check was unavailable, over a daily
+   * cap, or got an unreadable answer), at most `MAX_SWEEP_ATTEMPTS` runs per
+   * version in all, only while `mode` is `auto` and the route is allowed. A
+   * re-run is the same pipeline (same gates, same shared transaction); the
+   * check reuses the batches it already stored, so a retry pays only for what
+   * is missing. Never throws; stops starting new runs after `budgetMs`.
+   */
+  async sweepRetryable(budgetMs = 400_000): Promise<{ considered: number; retried: number }> {
+    const out = { considered: 0, retried: 0 };
+    try {
+      const loaded = await this.deps.loadSettings();
+      if (loaded.readError !== undefined || loaded.settings.mode !== "auto") return out;
+      const started = Date.now();
+      const snap = await collections.rubricPublishRuns.where("outcome", "==", "held").get();
+      for (const d of snap.docs) {
+        const run = d.data() as RubricPublishRun;
+        const retryable = run.reasonCodes.length > 0 && run.reasonCodes.every((c) => RETRYABLE_REASONS.includes(c));
+        if (!retryable || run.attempts >= MAX_SWEEP_ATTEMPTS || !routeAllowed(loaded.settings, run.routeKey)) continue;
+        out.considered += 1;
+        if (Date.now() - started > budgetMs) break;
+        try {
+          await this.run(run.routeKey, run.version, { trigger: "sweep" });
+          out.retried += 1;
+        } catch (err) {
+          // A version decided or superseded since: nothing to retry.
+          console.error(`Rubric auto-publish sweep: ${run.runId} not retried (${errorClass(err)})`);
+        }
+      }
+    } catch (err) {
+      console.error(`Rubric auto-publish sweep failed (${errorClass(err)})`);
+    }
+    return out;
   }
 
   /**
@@ -921,3 +963,7 @@ function isPaused(head: RubricHead): boolean {
 
 /** Singleton over the project's Firestore. Parts B and C register their implementations on it. */
 export const rubricAutoPublishService = new RubricAutoPublishService();
+// Part B (#202): the independent check plugs in here, so every entry point
+// (the version-created trigger, the admin endpoint, the script, the sweep)
+// has it. Part C registers its planner the same way.
+rubricAutoPublishService.registerChecker(rubricChecker);

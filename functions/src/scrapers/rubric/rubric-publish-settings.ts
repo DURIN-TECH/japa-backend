@@ -52,7 +52,48 @@ export interface RubricPublishSettings {
   maxPrimaryLeftOutShare: number;
   // The new version must keep at least this share of the serving version's rules.
   minKeptShareOfServing: number;
+  // ---- the independent check's spend caps (part B, #202): see CHECKER_CAP_RANGES ----
+  checkerMaxRulesPerDraft: number;
+  checkerMaxRequestsPerRun: number;
+  checkerMaxInputCharsPerRun: number;
+  checkerMaxOutputTokensPerRequest: number;
+  checkerMaxRunsPerDay: number;
+  checkerRequestTimeoutMs: number;
 }
+
+/**
+ * The independent check's caps (part B, #202). They are SPEND caps, never a
+ * rulebook-size limit: the owner's decision (2026-11-13) is that a rule is
+ * never left out because the rulebook is long, so a draft over a cap is HELD
+ * (`checker_capped`), not trimmed. Sized for the real draft (about 270 rules,
+ * growing to about 500): 500 rules are 50 requests of 10 plus a handful for
+ * the protected rules and the intention-to-stay check, with room for retries.
+ *  - checkerMaxRulesPerDraft           rules the check will read in one draft
+ *  - checkerMaxRequestsPerRun          model requests (retries included) per run
+ *  - checkerMaxInputCharsPerRun        prompt characters sent per run
+ *  - checkerMaxOutputTokensPerRequest  generated tokens per request (thinking included)
+ *  - checkerMaxRunsPerDay              checker runs that reached the model, per UTC day
+ *  - checkerRequestTimeoutMs           wall clock per request
+ */
+export const DEFAULT_CHECKER_CAPS = Object.freeze({
+  checkerMaxRulesPerDraft: 1_000,
+  checkerMaxRequestsPerRun: 120,
+  checkerMaxInputCharsPerRun: 2_000_000,
+  checkerMaxOutputTokensPerRequest: 8_000,
+  checkerMaxRunsPerDay: 20,
+  checkerRequestTimeoutMs: 240_000,
+});
+type CheckerCapKey = keyof typeof DEFAULT_CHECKER_CAPS;
+
+/** Allowed range (inclusive, integers) of each checker cap. */
+const CHECKER_CAP_RANGES: Record<CheckerCapKey, readonly [number, number]> = {
+  checkerMaxRulesPerDraft: [1, 5_000],
+  checkerMaxRequestsPerRun: [1, 1_000],
+  checkerMaxInputCharsPerRun: [10_000, 20_000_000],
+  checkerMaxOutputTokensPerRequest: [1_000, 64_000],
+  checkerMaxRunsPerDay: [1, 1_000],
+  checkerRequestTimeoutMs: [10_000, 600_000],
+};
 
 /** Defaults, from the issue (#201). `mode` defaults to `manual`: fail closed. */
 export const DEFAULT_PUBLISH_SETTINGS: Readonly<Omit<RubricPublishSettings, "routeAllowlist">> = Object.freeze({
@@ -61,6 +102,7 @@ export const DEFAULT_PUBLISH_SETTINGS: Readonly<Omit<RubricPublishSettings, "rou
   maxLeftOutShare: 0.15,
   maxPrimaryLeftOutShare: 0.2,
   minKeptShareOfServing: 0.7,
+  ...DEFAULT_CHECKER_CAPS,
 });
 
 /** The share settings and their allowed range (inclusive). A share is a fraction, not a percentage. */
@@ -121,6 +163,14 @@ export function resolvePublishSettings(raw: unknown): ResolvedPublishSettings {
     if (typeof v === "number" && Number.isFinite(v) && v >= min && v <= max) settings[key] = v;
     else problems.push(`${key}: must be a number ${min}..${max}, using default`);
   }
+  // ---- the independent check's caps (integers) ----
+  for (const key of Object.keys(CHECKER_CAP_RANGES) as CheckerCapKey[]) {
+    const v = doc[key];
+    if (v === undefined) continue;
+    const [min, max] = CHECKER_CAP_RANGES[key];
+    if (typeof v === "number" && Number.isInteger(v) && v >= min && v <= max) settings[key] = v;
+    else problems.push(`${key}: must be an integer ${min}..${max}, using default`);
+  }
   return { settings, problems };
 }
 
@@ -174,7 +224,7 @@ export class PublishSettingsValidationError extends Error {
 }
 
 /** Keys a patch may carry. Anything else is refused, not ignored. */
-const PATCH_KEYS = ["mode", "routeAllowlist", "pauseAfterRollback", ...Object.keys(SHARE_RANGES)];
+const PATCH_KEYS = ["mode", "routeAllowlist", "pauseAfterRollback", ...Object.keys(SHARE_RANGES), ...Object.keys(CHECKER_CAP_RANGES)];
 
 /** A validated patch: a present key is set, a null value clears the key (the allowlist only). */
 export type PublishSettingsPatch = Partial<Omit<RubricPublishSettings, "routeAllowlist">> & { routeAllowlist?: string[] | null };
@@ -211,6 +261,13 @@ export function parsePublishSettingsPatch(body: unknown): PublishSettingsPatch {
     if (v === undefined) continue;
     const [min, max] = SHARE_RANGES[key];
     if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) throw new PublishSettingsValidationError(`${key} must be a number from ${min} to ${max}`);
+    patch[key] = v;
+  }
+  for (const key of Object.keys(CHECKER_CAP_RANGES) as CheckerCapKey[]) {
+    const v = b[key];
+    if (v === undefined) continue;
+    const [min, max] = CHECKER_CAP_RANGES[key];
+    if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) throw new PublishSettingsValidationError(`${key} must be a whole number from ${min} to ${max}`);
     patch[key] = v;
   }
   return patch;
