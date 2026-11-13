@@ -197,6 +197,10 @@ export class ConsultationController {
    *
    * The controller detects which flow by checking if the auth'd user has an agent profile.
    * If not, the auth'd user is treated as the client and `agentId` from the body is used.
+   *
+   * UNITS (#148): `fee` in the body is WHOLE NAIRA and is stored as supplied (no
+   * scaling), same unit as the guest flow below. Paystack kobo conversion only
+   * happens where a charge is initialised.
    */
   async createConsultation(
     req: AuthenticatedRequest,
@@ -829,7 +833,9 @@ export class ConsultationController {
           consultationId,
           clientUserId: consultation.userId,
           agentUserId: consultation.agentId,
-          amount: consultation.fee,
+          // `consultation.fee` is whole NAIRA; `Transaction.amount` is KOBO like every
+          // other transaction, so convert here (50,000 naira -> 5,000,000 kobo).
+          amount: consultation.fee * 100,
           reference,
           clientName: consultation.clientName,
           clientEmail: consultation.clientEmail,
