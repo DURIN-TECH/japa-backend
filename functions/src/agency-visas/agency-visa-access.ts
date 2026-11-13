@@ -272,8 +272,45 @@ class AgencyVisaAccessService {
       return toApplicantSafeVisa(visa);
     }
 
+    // 3b. Issue #175: a seeded/scraped visa that was HIDDEN (isActive:false,
+    //     e.g. uk-visitor once its scraped twin is live) stays readable by a
+    //     caller with an application on that exact visa, so their case still
+    //     loads. Pending / rejected reviews and agency/agent docs never
+    //     qualify; the list endpoint still hides it and new starts are
+    //     refused elsewhere (getStartableVisa).
+    if (
+      visa.isActive === false &&
+      visa.source !== AGENCY_VISA_SOURCE &&
+      visa.source !== "agent" &&
+      (visa.reviewStatus === undefined || visa.reviewStatus === "approved") &&
+      (await this.hasOwnApplicationOnVisa(req, visa))
+    ) {
+      return visa;
+    }
+
     // 4. Hidden from this caller.
     return null;
+  }
+
+  /**
+   * True when the caller has an application of their own on EXACTLY this visa
+   * (same id and country) that they may read. Deliberately narrower than
+   * reachesThroughApplication: no owning-agency match, which is meaningless
+   * for a visa without an owner.
+   */
+  private async hasOwnApplicationOnVisa(req: AuthenticatedRequest, visa: VisaType): Promise<boolean> {
+    const uid = req.userId;
+    if (!uid) return false;
+    const cc = String(visa.countryCode ?? "").toUpperCase();
+    const snap = await collections.applications.where("userId", "==", uid).get();
+    return snap.docs.some((d) => {
+      const app = d.data() as Application;
+      return (
+        app.visaTypeId === visa.id &&
+        String(app.countryCode ?? "").toUpperCase() === cc &&
+        can(req, "read", asSubject("Application", { ...(app as unknown as Record<string, unknown>) }))
+      );
+    });
   }
 }
 
