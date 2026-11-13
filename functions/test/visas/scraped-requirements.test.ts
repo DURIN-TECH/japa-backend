@@ -63,6 +63,14 @@ describe("deriveRequirementsFromScrape", () => {
     assert.deepEqual(docs.map((d) => d.isRequired), [true, false, false]);
     assert.equal(isQuoteOptional("This is optional"), true);
     assert.equal(isQuoteOptional("You must show your passport"), false);
+    // The month "May" must not mark a document optional; lowercase "may" does.
+    assert.equal(isQuoteOptional("Passport issued after 1 May 2020"), false);
+    assert.equal(isQuoteOptional("you may also provide it"), true);
+  });
+
+  test("citation sourceUrl prefers scrapeMeta.sourceUrl over the editable top-level one", () => {
+    const [req] = deriveRequirementsFromScrape(scraped({ sourceUrl: "https://evil.example/x" }));
+    assert.ok(req.requiredDocuments.every((d) => d.citation?.sourceUrl === URL));
   });
 
   test("not scraped / no docs / no source url / all uncited -> []", () => {

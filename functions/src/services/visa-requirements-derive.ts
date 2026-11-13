@@ -29,7 +29,10 @@ export const DERIVED_REQUIREMENT_ID = "scraped-required-documents";
 
 // Words in a quote that make the document optional or conditional.
 // "may" / "if" / "optional" per the decision, plus "unless" and "depending on".
-const OPTIONAL_QUOTE = /\b(if|may|optional|unless|depending on)\b/i;
+// "may" is matched CASE-SENSITIVELY so the month "May" ("after 1 May 2020")
+// never marks a document optional; the other words are case-insensitive.
+const OPTIONAL_QUOTE = /\b(if|optional|unless|depending on)\b/i;
+const OPTIONAL_MAY = /\bmay\b/;
 
 // Platform upload defaults (what the app accepts), not claims about the visa.
 const DEFAULT_FORMATS = ["pdf", "jpg", "png"];
@@ -37,7 +40,7 @@ const DEFAULT_MAX_MB = 10;
 
 /** True when the quote marks the document as optional or conditional. */
 export function isQuoteOptional(quote: string): boolean {
-  return OPTIONAL_QUOTE.test(quote);
+  return OPTIONAL_QUOTE.test(quote) || OPTIONAL_MAY.test(quote);
 }
 
 /**
@@ -48,7 +51,7 @@ export function deriveRequirementsFromScrape(visa: VisaType): VisaRequirement[] 
   if (visa.source !== "scraped") return [];
   const names = Array.isArray(visa.requiredDocuments) ? visa.requiredDocuments : [];
   const citations = visa.scrapeMeta?.citations ?? {};
-  const sourceUrl = visa.sourceUrl ?? visa.scrapeMeta?.sourceUrl;
+  const sourceUrl = visa.scrapeMeta?.sourceUrl ?? visa.sourceUrl; // scrape provenance first: top-level sourceUrl is admin-editable
   if (!sourceUrl) return []; // no official page to cite -> nothing we may show
 
   const docs: RequiredDocument[] = [];
