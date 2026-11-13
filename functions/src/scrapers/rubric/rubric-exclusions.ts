@@ -182,6 +182,27 @@ function analyseDrops(rubric: Filterable, excluded: ReadonlySet<string>): DropAn
  * describe a decision about content that is no longer there.
  */
 export function applyExclusions<T extends Filterable>(rubric: T): T {
+  // INTEGRATION (#200 + #207): after the exclusions and the plan's shape, ignore the triggers the
+  // independent check could not confirm. Done HERE (the one read-side filter every consumer and
+  // the planner itself go through) so intake, assessment, checklist, chat and the background
+  // readers cannot disagree. The rules stay; only their `trigger` is removed from what is served.
+  const dropped = rubric.questionPlan?.droppedTriggerCriterionIds;
+  const served = applyExclusionsCore(rubric);
+  if (!Array.isArray(dropped) || dropped.length === 0) return served;
+  const ids = new Set(dropped);
+  if (!served.criteria.some((c) => c.trigger !== undefined && ids.has(c.criterionId))) return served;
+  return { ...served, criteria: served.criteria.map((c) => (c.trigger !== undefined && ids.has(c.criterionId) ? withoutTrigger(c) : c)) };
+}
+
+/** A copy of a rule without its trigger. */
+function withoutTrigger(c: AssessmentCriterion): AssessmentCriterion {
+  const { trigger: _trigger, ...rest } = c;
+  void _trigger;
+  return rest;
+}
+
+/** The exclusions, merges, conditions and order (everything `applyExclusions` did before the integration). */
+function applyExclusionsCore<T extends Filterable>(rubric: T): T {
   const excluded = effectiveExcluded(rubric);
   const omittedByPlan = planOmissions(rubric);
   if (excluded.size === 0 && omittedByPlan.questions.size === 0 && omittedByPlan.evidence.size === 0) {

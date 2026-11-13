@@ -34,6 +34,21 @@ export function seenRules(req: LlmRequest): SeenRule[] {
   return JSON.parse(m[2]);
 }
 
+/** One item of a trigger-check request (INTEGRATION): the rule's condition and quote, and the linked question's answers. */
+export type SeenTrigger = Record<string, any>;
+
+/** The items of a trigger-check request. */
+export function seenTriggers(req: LlmRequest): SeenTrigger[] {
+  const m = /<(triggers_data_[0-9a-f]{16})>\n(.*)\n<\/\1>/s.exec(req.user);
+  if (!m) throw new Error("not a trigger-check request");
+  return JSON.parse(m[2]);
+}
+
+/** True for a trigger-check request. */
+export function isTriggerRequest(req: LlmRequest): boolean {
+  return req.user.includes("<triggers_data_");
+}
+
 /** The sentence of a polarity request. */
 export function seenSentence(req: LlmRequest): string {
   const m = /<(sentence_data_[0-9a-f]{16})>\n(.*)\n<\/\1>/s.exec(req.user);
@@ -46,6 +61,8 @@ export class ScriptedProvider implements LlmProvider {
   readonly requests: LlmRequest[] = [];
   policy: RowPolicy = () => undefined;
   polarity: (role: AiModelRole, sentence: string) => string = () => "immigrant_intent_penalised";
+  // INTEGRATION: the verdict on a rule's trigger (default `yes`), by role and the item the model sees.
+  triggerPolicy: (ctx: { role: AiModelRole; item: SeenTrigger }) => "yes" | "no" | "unsure" = () => "yes";
   script: CallScript = () => undefined;
   usage = { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
@@ -64,6 +81,9 @@ export class ScriptedProvider implements LlmProvider {
     if (scripted === "truncated") return base("{\"verdicts\":[", "max_tokens");
     if (scripted) return base(scripted.text);
     if ("answer" in (req.schema as any).properties) return base(JSON.stringify({ answer: this.polarity(req.role, seenSentence(req)) }));
+    if (isTriggerRequest(req)) {
+      return base(JSON.stringify({ verdicts: seenTriggers(req).map((item) => ({ id: item.id, trigger_faithful: this.triggerPolicy({ role: req.role, item }) })) }));
+    }
     const rules = seenRules(req);
     return base(
       JSON.stringify({

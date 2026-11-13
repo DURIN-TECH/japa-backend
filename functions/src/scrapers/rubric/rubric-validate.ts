@@ -395,6 +395,21 @@ function validateQuestionPlan(
     }
   }
 
+  // ---- dropped triggers (INTEGRATION): this version's own rules that carry a trigger ----
+  if (plan.droppedTriggerCriterionIds !== undefined) {
+    const dropped = plan.droppedTriggerCriterionIds;
+    if (!Array.isArray(dropped)) bad("droppedTriggerCriterionIds must be a list");
+    else {
+      const withTrigger = new Set(rubric.criteria.filter((c) => c.trigger !== undefined).map((c) => c.criterionId));
+      const seen = new Set<string>();
+      for (const id of dropped) {
+        if (typeof id !== "string" || !withTrigger.has(id)) bad("droppedTriggerCriterionIds names a rule that has no trigger in this version", String(id));
+        else if (seen.has(id)) bad("a trigger is dropped twice", id);
+        else seen.add(id);
+      }
+    }
+  }
+
   // ---- order ----
   const order = list("order");
   if (!order) return bad("order must be a list");

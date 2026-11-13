@@ -39,6 +39,8 @@ export interface PlannerInput {
   rubric: VisaRubric;
   excludedCriterionIds: readonly string[];
   checkerLeftOut: readonly { criterionId: string; reason: string }[];
+  // INTEGRATION: rules whose trigger the independent check could not confirm. Optional so an older caller still works.
+  droppedTriggerIds?: readonly string[];
 }
 
 /** Structurally the same as the pipeline's `QuestionPlanOutcome`. */
@@ -50,7 +52,11 @@ export type PlannerOutcome = { ok: true; reviewFields?: Record<string, unknown>;
  *
  * `check` is the record of the check run (null for an offline plan).
  */
-export function buildQuestionPlan(rubric: VisaRubric, excludedCriterionIds: readonly string[], failed: CheckOmissions, check: QuestionPlan["check"]): QuestionPlan {
+export function buildQuestionPlan(rubric: VisaRubric, excludedCriterionIds: readonly string[], failed: CheckOmissions, check: QuestionPlan["check"], droppedTriggerIds: readonly string[] = []): QuestionPlan {
+  // INTEGRATION: only ids of this version's own rules that really carry a trigger are recorded
+  // (a stale or foreign id is ignored), in rulebook order, so the plan always validates.
+  const dropped = new Set(droppedTriggerIds);
+  const droppedTriggerCriterionIds = rubric.criteria.filter((c) => c.trigger !== undefined && dropped.has(c.criterionId)).map((c) => c.criterionId);
   // The draft as served without the plan: leave-outs applied, plan stripped.
   const base = applyExclusions({ ...rubric, excludedCriterionIds: [...excludedCriterionIds], questionPlan: undefined });
   const baseQuestionIds = new Set(base.intakeQuestions.map((q) => q.id));
@@ -59,7 +65,8 @@ export function buildQuestionPlan(rubric: VisaRubric, excludedCriterionIds: read
   const omittedQuestions = base.intakeQuestions.filter((q) => failed.questions.some((f) => f.id === q.id)).map((q) => ({ id: q.id, failed: [...(failed.questions.find((f) => f.id === q.id)?.failed ?? [])].sort() }));
   const omittedEvidence = base.evidenceItems.filter((e) => failed.evidence.some((f) => f.key === e.key)).map((e) => ({ key: e.key, failed: [...(failed.evidence.find((f) => f.key === e.key)?.failed ?? [])].sort() }));
   // The same dependency analysis the read side runs, with the failures seeded.
-  const withOmissions = applyExclusions({ ...rubric, excludedCriterionIds: [...excludedCriterionIds], questionPlan: { ...EMPTY_SHAPE, omittedQuestions, omittedEvidence } as QuestionPlan });
+  // The dropped triggers are seeded too, so the conditions derived below never come from a link nobody confirmed.
+  const withOmissions = applyExclusions({ ...rubric, excludedCriterionIds: [...excludedCriterionIds], questionPlan: { ...EMPTY_SHAPE, omittedQuestions, omittedEvidence, droppedTriggerCriterionIds } as QuestionPlan });
   const keptQ = new Set(withOmissions.intakeQuestions.map((q) => q.id));
   const keptE = new Set(withOmissions.evidenceItems.map((e) => e.key));
   const direct = new Set(omittedQuestions.map((o) => o.id));
@@ -70,7 +77,7 @@ export function buildQuestionPlan(rubric: VisaRubric, excludedCriterionIds: read
   };
   // Merges, conditions and order, on the view as it is left after the removals.
   const shape = buildPlanShape(withOmissions);
-  return { ...shape, omittedQuestions, omittedEvidence, droppedWithDependents, check };
+  return { ...shape, omittedQuestions, omittedEvidence, droppedWithDependents, droppedTriggerCriterionIds, check };
 }
 
 /** A plan with no content, used to seed the omissions on the way. */
@@ -123,7 +130,7 @@ export class RubricQuestionPlanner {
       evidenceItemsChecked: result.evidenceItemsChecked,
       questionsFailed: result.failedQuestions.size,
       evidenceItemsFailed: result.failedEvidence.size,
-    });
+    }, input.droppedTriggerIds ?? []);
     // A check that removes EVERY question of a draft that had some is a
     // malfunction, not a verdict: hold rather than serve a rulebook with none.
     if (view.intakeQuestions.length > 0 && plan.order.length === 0) return { ok: false, reasonCodes: [QUESTION_PLAN_REASONS.unusable] };

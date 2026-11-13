@@ -2,6 +2,7 @@ import { collections } from "../../utils/firebase";
 import { AnthropicNotConfiguredError } from "../../services/ai/anthropic-client";
 import { AnthropicLlmProvider, LlmProviderError, emptyLlmUsage, llmRequestHash, type LlmProvider, type LlmRequest, type LlmUsage } from "../../services/ai/llm-provider";
 import type { AssessmentCriterion, IntentPolarity, VisaRubric } from "../../types/rubric";
+import { isValidTrigger } from "../../utils/rubric-trigger";
 import { guidanceSnapshotStore } from "../guidance/guidance-snapshot.store";
 import type { GuidanceSnapshotContent } from "../guidance/types";
 import { isProtectedRule } from "./rubric-gates";
@@ -10,19 +11,24 @@ import {
   CHECKER_BATCH_SIZE,
   CHECKER_LEAD_IN_CHARS,
   CHECKER_PROMPT_VERSION,
+  CHECKER_TRIGGER_BATCH_SIZE,
   CHECKER_WINDOW_CHARS,
   CheckerAnswerError,
   CheckerPromptError,
   buildBatchRequest,
   buildPolarityRequest,
+  buildTriggerRequest,
   decodeRow,
   encodeRow,
   handleFor,
   parsePolarityAnswer,
+  parseTriggerVerdicts,
   parseVerdicts,
   type CheckerAspect,
   type CheckerRuleView,
   type PolarityAnswer,
+  type TriggerCheckView,
+  type TriggerVerdict,
   type VerdictRow,
 } from "./rubric-checker-prompt";
 import { loadPublishSettings, type LoadedPublishSettings, type RubricPublishSettings } from "./rubric-publish-settings";
@@ -60,6 +66,25 @@ import { isTransientProviderError } from "./rubric-extraction.service";
 //   protected, either model fails an aspect / disagrees        -> HOLD
 //   protected, its quote cannot be found                       -> HOLD
 //   any batch: missing / extra / repeated id, extra key, bad enum, cut-off -> HOLD `checker_output_invalid`
+//
+// THE TRIGGER CHECK (INTEGRATION of #202 and #207): a rule kept as specialist or
+// conditional carries `trigger = { questionId, anyOf }`, the link that decides
+// which applicants it is applied to. The six aspects above judge what the rule
+// SAYS, not that link, so a small separate call (same module, same fail-closed
+// rules, own prompt version) asks whether "an applicant who gives one of these
+// answers is exactly an applicant the quote describes". Code maps:
+//   ordinary rule, verdict `yes`                        -> keep the trigger
+//   ordinary rule, `no` / `unsure` (or a wrong link)    -> DROP THE TRIGGER, keep the rule
+//   protected rule, both models `yes`                   -> keep
+//   protected rule, anything else                       -> HOLD `protected_rule_failed:<id>`
+// A wrong trigger must never REMOVE a rule: a dropped trigger leaves the rule
+// kept, and it is then read as "could not tell whether this applies" (specialist)
+// or by the pre-#207 rule that a conditional rule without a trigger applies to
+// everyone (counted in the run record). The dropped ids are written on the
+// version's question plan and applied on the read side, so the stored rule is
+// never edited. Only rules whose trigger is usable against the draft's own
+// questions are asked about (an unusable trigger is already ignored by every
+// consumer). A dropped trigger never counts toward the leave-out budget.
 //
 // WHAT THE CHECK NEVER DOES: write, edit or add a rule; return a free-text
 // field; assume "faithful" when an answer is incomplete. It can only subtract
@@ -163,6 +188,17 @@ export function decidePolarity(proposal: Exclude<IntentPolarity, "not_assessed">
   return answers.length === 2 && answers.every((a) => a === proposal) ? proposal : null;
 }
 
+/**
+ * The trigger table (pure, tested row by row). `verification` is the first
+ * model's verdict, `judgement` the second model's (protected rules only).
+ *   protected: both `yes` -> keep; anything else, or a missing verdict -> hold
+ *   ordinary:  `yes` -> keep; `no`, `unsure` or missing -> drop the trigger
+ */
+export function judgeTrigger(rule: Pick<AssessmentCriterion, "kind" | "appliesTo">, verdicts: { verification?: TriggerVerdict; judgement?: TriggerVerdict }): "keep" | "drop" | "hold" {
+  if (isProtectedRule(rule)) return verdicts.verification === "yes" && verdicts.judgement === "yes" ? "keep" : "hold";
+  return verdicts.verification === "yes" ? "keep" : "drop";
+}
+
 // ============================================
 // Expected load (for the cost statement)
 // ============================================
@@ -179,11 +215,14 @@ const EST_OUTPUT_TOKENS_PER_RULE = 100;
  * estimate (the real figures are on the run record); the system prompt is
  * counted on every request although it is cached after the first.
  */
-export function estimateCheckerLoad(ruleCount: number, protectedCount = 0, polarityRequests = 2): { requests: number; inputTokens: number; outputTokens: number } {
+export function estimateCheckerLoad(ruleCount: number, protectedCount = 0, polarityRequests = 2, triggerRules = 0): { requests: number; inputTokens: number; outputTokens: number } {
   const ordinary = Math.max(0, ruleCount - protectedCount);
-  const requests = Math.ceil(ordinary / CHECKER_BATCH_SIZE) + 2 * Math.ceil(protectedCount / CHECKER_BATCH_SIZE) + polarityRequests;
-  const inputTokens = (ordinary + 2 * protectedCount) * EST_INPUT_TOKENS_PER_RULE + requests * EST_SYSTEM_PROMPT_TOKENS;
-  const outputTokens = (ordinary + 2 * protectedCount) * EST_OUTPUT_TOKENS_PER_RULE + polarityRequests * 20;
+  // INTEGRATION: the trigger check is one small request per CHECKER_TRIGGER_BATCH_SIZE rules that carry a
+  // usable trigger (about 220 input tokens and 12 output tokens per rule: no source window, one verdict).
+  const triggerRequests = Math.ceil(triggerRules / CHECKER_TRIGGER_BATCH_SIZE);
+  const requests = Math.ceil(ordinary / CHECKER_BATCH_SIZE) + 2 * Math.ceil(protectedCount / CHECKER_BATCH_SIZE) + polarityRequests + triggerRequests;
+  const inputTokens = (ordinary + 2 * protectedCount) * EST_INPUT_TOKENS_PER_RULE + requests * EST_SYSTEM_PROMPT_TOKENS + triggerRules * 220;
+  const outputTokens = (ordinary + 2 * protectedCount) * EST_OUTPUT_TOKENS_PER_RULE + polarityRequests * 20 + triggerRules * 12;
   return { requests, inputTokens, outputTokens };
 }
 
@@ -201,7 +240,7 @@ export interface RubricCheckInputShape {
   codeLeftOutIds: readonly string[];
 }
 export type RubricCheckOutcomeShape =
-  | { ok: true; leftOut: { criterionId: string; reason: string }[]; resolvedFlagCodes: string[]; intentPolarity: IntentPolarity | null }
+  | { ok: true; leftOut: { criterionId: string; reason: string }[]; resolvedFlagCodes: string[]; intentPolarity: IntentPolarity | null; droppedTriggerIds?: string[] }
   | { ok: false; reasonCodes: string[]; protectedRuleIds?: string[] };
 
 /** What one stored answer holds: closed verdicts only. */
@@ -213,6 +252,8 @@ export interface StoredResponse {
   rows?: Record<string, string>;
   // Polarity readings: the closed choice.
   answer?: string;
+  // Trigger batches: handle -> `yes` | `no` | `unsure`.
+  triggers?: Record<string, string>;
 }
 
 /** Token and request counts. */
@@ -299,6 +340,8 @@ interface Job {
   hash: string;
   // Rule batches: the criterion ids behind r1, r2, ... Absent for a polarity reading.
   criterionIds?: string[];
+  // True for a trigger batch (INTEGRATION): `criterionIds` then names the rules whose trigger is judged.
+  triggerBatch?: boolean;
 }
 
 /** UTC day, `YYYY-MM-DD`. */
@@ -389,7 +432,15 @@ export class RubricCheckerService {
     for (const role of ["verification", "judgement"] as const) protectedJobs.push(...this.batchJobs(role, protectedRules, views, limits));
     const polarityJobs: Job[] = polarityPlan.kind === "ask" ? (["verification", "judgement"] as const).map((role) => this.polarityJob(role, polarityPlan.quote, limits)) : [];
     const ordinaryJobs = this.batchJobs("verification", readableOrdinary, views, limits);
-    const allJobs = [...protectedJobs, ...polarityJobs, ...ordinaryJobs];
+    // The trigger check (INTEGRATION): every rule whose trigger is usable against the draft's questions.
+    const questions = rubric.intakeQuestions ?? [];
+    const triggered = rules.filter((r) => r.trigger !== undefined && isValidTrigger(r.trigger, questions) && views.has(r.criterionId));
+    const protectedTriggered = triggered.filter(isProtectedRule);
+    const ordinaryTriggered = triggered.filter((r) => !isProtectedRule(r));
+    const protectedTriggerJobs: Job[] = [];
+    for (const role of ["verification", "judgement"] as const) protectedTriggerJobs.push(...this.triggerJobs(role, protectedTriggered, views, questions, limits));
+    const ordinaryTriggerJobs = this.triggerJobs("verification", ordinaryTriggered, views, questions, limits);
+    const allJobs = [...protectedJobs, ...protectedTriggerJobs, ...polarityJobs, ...ordinaryJobs, ...ordinaryTriggerJobs];
 
     // ---- reuse what a previous run of this version already stored ----
     const previous = await this.deps.ledger.load(input.runId);
@@ -419,7 +470,7 @@ export class RubricCheckerService {
     };
 
     // Phase 1: protected rules and the polarity readings. Any failure holds now.
-    const phase1 = needed.filter((j) => protectedJobs.includes(j) || polarityJobs.includes(j));
+    const phase1 = needed.filter((j) => protectedJobs.includes(j) || protectedTriggerJobs.includes(j) || polarityJobs.includes(j));
     const f1 = await this.runJobs(phase1, ctx);
     if (f1) return stop([f1 === "capped" ? "checker_capped" : f1 === "invalid" ? "checker_output_invalid" : "checker_unavailable"]);
 
@@ -429,6 +480,12 @@ export class RubricCheckerService {
     for (const r of protectedRules) {
       const action = judgeRule(r, { verification: protectedVerdicts.verification.get(r.criterionId), judgement: protectedVerdicts.judgement.get(r.criterionId) });
       if (action.action !== "keep") failedIds.push(r.criterionId);
+    }
+    // A protected rule's trigger must be confirmed by BOTH models too, or the draft is held.
+    const protectedTriggerVerdicts = { verification: this.triggerVerdictsFrom("verification", protectedTriggerJobs, responses), judgement: this.triggerVerdictsFrom("judgement", protectedTriggerJobs, responses) };
+    for (const r of protectedTriggered) {
+      const verdict = judgeTrigger(r, { verification: protectedTriggerVerdicts.verification.get(r.criterionId), judgement: protectedTriggerVerdicts.judgement.get(r.criterionId) });
+      if (verdict === "hold" && !failedIds.includes(r.criterionId)) failedIds.push(r.criterionId);
     }
     if (failedIds.length > 0) {
       this.noteVerdicts(ctx, protectedVerdicts.verification, protectedVerdicts.judgement);
@@ -449,7 +506,7 @@ export class RubricCheckerService {
 
     // Phase 2: every ordinary rule.
     const f2 = await this.runJobs(
-      needed.filter((j) => ordinaryJobs.includes(j)),
+      needed.filter((j) => ordinaryJobs.includes(j) || ordinaryTriggerJobs.includes(j)),
       ctx
     );
     if (f2) return stop([f2 === "capped" ? "checker_capped" : f2 === "invalid" ? "checker_output_invalid" : "checker_unavailable"]);
@@ -471,8 +528,14 @@ export class RubricCheckerService {
     // remark is resolved. The two group remarks are resolved when every rule
     // with a group had `yes` on that aspect from BOTH models (a failure held above).
     const resolvedFlagCodes = ["title_wording_uncited", "nationality_codes_model_proposed", "nationality_code_name_mismatch"];
+    // ---- triggers to drop (INTEGRATION): ordinary rules still kept whose link was not confirmed ----
+    // A rule left out above needs no verdict on its trigger. A dropped trigger never removes the rule.
+    const ordinaryTriggerVerdicts = this.triggerVerdictsFrom("verification", ordinaryTriggerJobs, responses);
+    const droppedTriggerIds = ordinaryTriggered
+      .filter((r) => !decided.has(r.criterionId) && judgeTrigger(r, { verification: ordinaryTriggerVerdicts.get(r.criterionId) }) === "drop")
+      .map((r) => r.criterionId);
     await this.persist(ctx, "completed", []);
-    return { ok: true, leftOut, resolvedFlagCodes, intentPolarity };
+    return { ok: true, leftOut, resolvedFlagCodes, intentPolarity, droppedTriggerIds };
   }
 
   // ---------- windows ----------
@@ -514,6 +577,21 @@ export class RubricCheckerService {
       const batch = rules.slice(i, i + CHECKER_BATCH_SIZE);
       const request = buildBatchRequest(role, batch.map((r) => views.get(r.criterionId) as CheckerRuleView), limits);
       jobs.push({ request, role, hash: llmRequestHash(request), criterionIds: batch.map((r) => r.criterionId) });
+    }
+    return jobs;
+  }
+
+  /** Batches of CHECKER_TRIGGER_BATCH_SIZE rules with a usable trigger, in rulebook order, for one model role. */
+  private triggerJobs(role: "verification" | "judgement", rules: readonly AssessmentCriterion[], views: Map<string, CheckerRuleView>, questions: NonNullable<VisaRubric["intakeQuestions"]>, limits: { maxOutputTokens: number; timeoutMs: number }): Job[] {
+    const jobs: Job[] = [];
+    for (let i = 0; i < rules.length; i += CHECKER_TRIGGER_BATCH_SIZE) {
+      const batch = rules.slice(i, i + CHECKER_TRIGGER_BATCH_SIZE);
+      const triggerViews: TriggerCheckView[] = batch.map((r) => {
+        const q = questions.find((x) => x.id === r.trigger?.questionId);
+        return { rule: r, listLeadIn: views.get(r.criterionId)?.listLeadIn ?? "", question: { label: q?.label ?? "", options: (q?.options ?? []).map((o) => ({ value: o.value, label: o.label })) } };
+      });
+      const request = buildTriggerRequest(role, triggerViews, limits);
+      jobs.push({ request, role, hash: llmRequestHash(request), criterionIds: batch.map((r) => r.criterionId), triggerBatch: true });
     }
     return jobs;
   }
@@ -593,7 +671,13 @@ export class RubricCheckerService {
       if (response.stopReason === "refusal") return "unavailable";
       if (response.stopReason !== "end_turn") return "invalid";
       try {
-        if (job.criterionIds) {
+        if (job.triggerBatch && job.criterionIds) {
+          const handles = job.criterionIds.map((_, k) => handleFor(k));
+          const verdicts = parseTriggerVerdicts(response.text, handles);
+          const stored: Record<string, string> = {};
+          for (const [h, v] of verdicts) stored[h] = v;
+          ctx.responses[job.hash] = { role: job.role, model: ctx.models[job.role], triggers: stored };
+        } else if (job.criterionIds) {
           const handles = job.criterionIds.map((_, k) => handleFor(k));
           const rows = parseVerdicts(response.text, handles);
           const stored: Record<string, string> = {};
@@ -615,11 +699,25 @@ export class RubricCheckerService {
   private rowsFrom(role: "verification" | "judgement", jobs: Job[], responses: Record<string, StoredResponse>): Map<string, VerdictRow> {
     const out = new Map<string, VerdictRow>();
     for (const job of jobs) {
-      if (job.role !== role || !job.criterionIds) continue;
+      if (job.role !== role || !job.criterionIds || job.triggerBatch) continue;
       const stored = responses[job.hash]?.rows;
       job.criterionIds.forEach((id, k) => {
         const row = decodeRow(stored?.[handleFor(k)]);
         if (row) out.set(id, row);
+      });
+    }
+    return out;
+  }
+
+  /** The trigger verdicts of one role's trigger batches, keyed by criterion id; a missing or odd stored value is absent. */
+  private triggerVerdictsFrom(role: "verification" | "judgement", jobs: Job[], responses: Record<string, StoredResponse>): Map<string, TriggerVerdict> {
+    const out = new Map<string, TriggerVerdict>();
+    for (const job of jobs) {
+      if (job.role !== role || !job.criterionIds || !job.triggerBatch) continue;
+      const stored = responses[job.hash]?.triggers;
+      job.criterionIds.forEach((id, k) => {
+        const v = stored?.[handleFor(k)];
+        if (v === "yes" || v === "no" || v === "unsure") out.set(id, v);
       });
     }
     return out;

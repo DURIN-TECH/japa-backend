@@ -114,7 +114,10 @@ export interface RubricCheckInput {
  *                 are the flag codes it has fully verified (every title, every
  *                 group mapping); `intentPolarity` is the verified reading on
  *                 an intention to stay, or null when it could not be verified
- *                 (the draft is then held `polarity_unverified`).
+ *                 (the draft is then held `polarity_unverified`);
+ *                 `droppedTriggerIds` are kept rules whose `trigger` (the link to
+ *                 the intake answer that makes them apply, #207) the check could not
+ *                 confirm: the rule stays, its trigger is ignored (never a leave-out).
  *  - `ok: false`  the draft is held with these reason codes
  *                 (`checker_unavailable`, `checker_capped`,
  *                 `checker_output_invalid`, `protected_rule_failed:<id>`, ...).
@@ -122,7 +125,7 @@ export interface RubricCheckInput {
  * A checker must not throw; if it does the draft is held `checker_unavailable`.
  */
 export type RubricCheckOutcome =
-  | { ok: true; leftOut: { criterionId: string; reason: string }[]; resolvedFlagCodes: string[]; intentPolarity: IntentPolarity | null }
+  | { ok: true; leftOut: { criterionId: string; reason: string }[]; resolvedFlagCodes: string[]; intentPolarity: IntentPolarity | null; droppedTriggerIds?: string[] }
   | { ok: false; reasonCodes: string[]; protectedRuleIds?: string[] };
 
 /** The independent check (part B registers its implementation: see `registerChecker`). */
@@ -140,6 +143,8 @@ export interface QuestionPlanInput {
   excludedCriterionIds: readonly string[];
   // The checker's rule-level leave-outs, so a plan can tell code leave-outs from check ones.
   checkerLeftOut: readonly { criterionId: string; reason: string }[];
+  // Rules whose trigger the check could not confirm: the plan records them and ignores their triggers.
+  droppedTriggerIds: readonly string[];
 }
 
 /**
@@ -196,6 +201,8 @@ export interface RubricPublishReport {
   dryRun: boolean;
   // True when a run record was written.
   recorded: boolean;
+  // INTEGRATION: rules whose trigger the independent check could not confirm (kept, trigger ignored).
+  droppedTriggerIds?: string[];
   // The audit entry of a publish.
   auditId: string | null;
   previousApprovedVersion: number | null;
@@ -464,6 +471,7 @@ export class RubricAutoPublishService {
       let polarity: IntentPolarity | null = null;
       let plannerFields: Record<string, unknown> | undefined;
       let protectedFromChecker: string[] = [];
+      let droppedTriggerIds: string[] = [];
 
       if (checkerNotRun) {
         // Report mode: say plainly that the check has not run.
@@ -497,7 +505,8 @@ export class RubricAutoPublishService {
             for (const code of report.reasonCodes) if (code !== PLAN_RESOLVED_FLAG_REASON && !reasons.includes(code)) reasons.push(code);
             if (polarity === null && !reasons.includes("polarity_unverified")) reasons.push("polarity_unverified");
             if (reasons.length === 0) {
-              const plan = await this.callPlanner(this.deps.planner, { routeKey, version, runId, rubric, excludedCriterionIds: report.excludedCriterionIds, checkerLeftOut: outcome.leftOut });
+              droppedTriggerIds = outcome.droppedTriggerIds ?? [];
+              const plan = await this.callPlanner(this.deps.planner, { routeKey, version, runId, rubric, excludedCriterionIds: report.excludedCriterionIds, checkerLeftOut: outcome.leftOut, droppedTriggerIds });
               if (!plan.ok) {
                 questionPlan = "failed";
                 for (const code of plan.reasonCodes) if (!reasons.includes(code)) reasons.push(code);
@@ -547,11 +556,12 @@ export class RubricAutoPublishService {
           codeGatesPassed,
           settingsUnreadable,
           protectedHold: report.protectedHold || protectedFromChecker.length > 0,
+          droppedTriggerIds,
         });
       }
 
       // ---- 7. publish through the SHARED approval transaction ----
-      return await this.publish(rubric, head, report, { runId, opts, mode, attempts, startedAt, previousRun, checker, questionPlan, polarity: polarity as IntentPolarity, plannerFields });
+      return await this.publish(rubric, head, report, { runId, opts, mode, attempts, startedAt, previousRun, checker, questionPlan, polarity: polarity as IntentPolarity, plannerFields, droppedTriggerIds });
     } catch (err) {
       // ---- ANY error: the draft stays pending, the serving version untouched ----
       if (err instanceof RubricReviewError && explicit && (err.code === "NOT_FOUND" || err.code === "ALREADY_DECIDED")) throw err;
@@ -580,7 +590,7 @@ export class RubricAutoPublishService {
     rubric: VisaRubric,
     head: RubricHead,
     report: GateReport,
-    ctx: { runId: string; opts: RunOptions; mode: "manual" | "auto"; attempts: number; startedAt: Timestamp; previousRun: RubricPublishRun | null; checker: RubricPublishRun["checker"]; questionPlan: RubricPublishRun["questionPlan"]; polarity: IntentPolarity; plannerFields?: Record<string, unknown> }
+    ctx: { runId: string; opts: RunOptions; mode: "manual" | "auto"; attempts: number; startedAt: Timestamp; previousRun: RubricPublishRun | null; checker: RubricPublishRun["checker"]; questionPlan: RubricPublishRun["questionPlan"]; polarity: IntentPolarity; plannerFields?: Record<string, unknown>; droppedTriggerIds?: string[] }
   ): Promise<RubricPublishReport> {
     // The flags the version has under the decided polarity: only those with a
     // recorded gate result are acknowledged. Anything else the transaction
@@ -635,6 +645,7 @@ export class RubricAutoPublishService {
       auditId: result.auditId,
       previousApprovedVersion: result.previousApprovedVersion,
     });
+    finished.droppedTriggerIds = ctx.droppedTriggerIds ?? [];
     finished.recorded = await this.writeRecord(rubric, finished, ctx.startedAt, ctx.previousRun !== null);
     await this.supersedeOlderPending(rubric.routeKey, rubric.version, ctx.runId);
     await this.alertPublished(rubric, report, finished);
@@ -649,7 +660,7 @@ export class RubricAutoPublishService {
     head: RubricHead,
     report: GateReport,
     reasons: string[],
-    ctx: { runId: string; opts: RunOptions; mode: "manual" | "auto"; attempts: number; startedAt: Timestamp; previousRun: RubricPublishRun | null; checker: RubricPublishRun["checker"]; questionPlan: RubricPublishRun["questionPlan"]; codeGatesPassed: boolean; settingsUnreadable: boolean; protectedHold: boolean }
+    ctx: { runId: string; opts: RunOptions; mode: "manual" | "auto"; attempts: number; startedAt: Timestamp; previousRun: RubricPublishRun | null; checker: RubricPublishRun["checker"]; questionPlan: RubricPublishRun["questionPlan"]; codeGatesPassed: boolean; settingsUnreadable: boolean; protectedHold: boolean; droppedTriggerIds?: string[] }
   ): Promise<RubricPublishReport> {
     const finished = this.buildReport(ctx.runId, rubric, report, {
       outcome: "held",
@@ -665,6 +676,7 @@ export class RubricAutoPublishService {
       auditId: null,
       previousApprovedVersion: head.approvedVersion ?? null,
     });
+    finished.droppedTriggerIds = ctx.droppedTriggerIds ?? [];
     finished.recorded = await this.writeRecord(rubric, finished, ctx.startedAt, ctx.previousRun !== null);
     await this.alertHeld(rubric, report, finished, { protectedHold: ctx.protectedHold, settingsUnreadable: ctx.settingsUnreadable });
     return finished;
@@ -872,6 +884,7 @@ export class RubricAutoPublishService {
       attempts: report.attempts,
       checker: report.checker,
       questionPlan: report.questionPlan,
+      ...(report.droppedTriggerIds !== undefined ? { droppedTriggerIds: report.droppedTriggerIds } : {}),
       auditId: report.auditId,
       previousApprovedVersion: report.previousApprovedVersion,
       startedAt,

@@ -622,6 +622,12 @@ export interface QuestionPlan {
   proposedConditions: { questionId: string; showWhen: { anyOf: IntakeCondition[] }; derivedFromCriterionIds: string[] }[];
   // The served order of the surviving questions (deciding questions first).
   order: string[];
+  // INTEGRATION (#200 + #207): rules whose `trigger` the independent check could not confirm.
+  // The RULE STAYS (never left out for this); only its trigger is ignored on the read side
+  // (`applyExclusions` strips it), so it is read as "could not tell whether this applies"
+  // (specialist) or by the legacy rule for a conditional rule without a trigger. Ids are this
+  // version's own rules. Absent on a plan written before the integration.
+  droppedTriggerCriterionIds?: string[];
   // How many questions an applicant sees, with the plan applied (before the
   // wording check's omissions, which only lower them). `exact` is false when the
   // best / worst search hit its budget and the figures are sampled bounds.
@@ -750,6 +756,8 @@ export interface RubricPublishRun {
   // The independent check and the question plan (parts B and C): what happened.
   checker: "not_configured" | "not_run" | "passed" | "failed";
   questionPlan: "not_configured" | "not_run" | "built" | "failed";
+  // INTEGRATION: rules whose trigger the independent check could not confirm (the rule is kept, its trigger ignored).
+  droppedTriggerIds?: string[];
   // Set when published: the audit entry and the version it replaced.
   auditId: string | null;
   previousApprovedVersion: number | null;
