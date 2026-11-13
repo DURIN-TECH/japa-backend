@@ -84,12 +84,12 @@ describe("extractor validator (kind + need)", () => {
       { pageText: page }
     );
     const m = v.requiredDocumentMeta!;
-    assert.deepEqual(m[0], { kind: "information", kindQuote: INFO_LEAD, need: "required" });
+    assert.deepEqual(m[0], { item: docs[0], kind: "information", kindQuote: INFO_LEAD, need: "required" });
     assert.equal(m[1].need, "conditional");
     assert.equal(m[1].appliesWhen, "if you have an income");
     assert.equal(m[2].appliesWhen, "if you’re visiting for more than 6 months");
     assert.equal(m[2].kindQuote, LEAD_IN); // lead-in kept as kindQuote
-    assert.deepEqual(m[3], { kind: "document", kindQuote: "You must have a passport", need: "required" });
+    assert.deepEqual(m[3], { item: docs[3], kind: "document", kindQuote: "You must have a passport", need: "required" });
   });
 
   test("a kind whose quote is not on the page becomes document + kindReview", () => {
@@ -100,7 +100,7 @@ describe("extractor validator (kind + need)", () => {
       },
       { pageText: page }
     );
-    assert.deepEqual(v.requiredDocumentMeta![0], { kind: "document", kindReview: true, need: "required" });
+    assert.deepEqual(v.requiredDocumentMeta![0], { item: "a passport", kind: "document", kindReview: true, need: "required" });
   });
 
   test("missing meta list, or an invented appliesWhen, degrade safely; meta follows dedupe/drops", () => {
@@ -117,7 +117,7 @@ describe("extractor validator (kind + need)", () => {
     );
     assert.deepEqual(v.requiredDocuments, ["a passport"]);
     assert.equal(v.requiredDocumentMeta!.length, 1);
-    assert.deepEqual(v.requiredDocumentMeta![0], { kind: "document", kindQuote: "You must have a passport", need: "required" });
+    assert.deepEqual(v.requiredDocumentMeta![0], { item: "a passport", kind: "document", kindQuote: "You must have a passport", need: "required" });
     const none = validateExtractedVisa({ ...base, requiredDocuments: ["a passport"], citations: { "requiredDocuments.0": "You must have a passport" } }, { pageText: page });
     assert.equal(none.requiredDocumentMeta![0].kindReview, true);
   });
@@ -144,16 +144,32 @@ describe("kindQuote two-part rule (lead-in: item), real uk-family strings", () =
       { pageText: FAMILY_PAGE }
     ).requiredDocumentMeta![0];
 
-  test("lead-in + a LATER item passes and is stored as the model returned it", () => {
+  test("lead-in + a LATER item passes; the verbatim lead-in is stored, not the joined string", () => {
     const q = `You\u2019ll need to provide: ${PASSPORT}`;
-    assert.deepEqual(kindFor(q), { kind: "document", kindQuote: q, need: "required" });
+    assert.deepEqual(kindFor(q), { item: PASSPORT, kind: "document", kindQuote: "You\u2019ll need to provide", need: "required" });
   });
   test("an item part that is not on the page fails", () => {
     assert.equal(kindFor("You\u2019ll need to provide: your lucky charm").kindReview, true);
   });
+  test("an item part that is another item's line fails (it must contain the item being classified)", () => {
+    assert.equal(kindFor("You\u2019ll need to provide: all your names").kindReview, true);
+  });
   test("a lead-in that appears only AFTER the item fails", () => {
-    // "You'll also need to provide either" is on the page only after the passport line.
     assert.equal(kindFor(`You\u2019ll also need to provide either: ${PASSPORT}`).kindReview, true);
+  });
+  test("a later, different lead-in between the two parts fails", () => {
+    const EVISA = "online proof of your immigration status if you have an eVisa";
+    const v = validateExtractedVisa(
+      {
+        ...base, requiredDocuments: [EVISA], citations: { "requiredDocuments.0": EVISA },
+        requiredDocumentMeta: [{ kind: "document", kindQuote: `You\u2019ll need to provide: ${EVISA}`, need: "required" }],
+      },
+      { pageText: FAMILY_PAGE }
+    );
+    assert.equal(v.requiredDocumentMeta![0].kindReview, true); // it sits under "You'll also need to provide either:"
+  });
+  test("a lead-in fragment that is not a lead-in line fails", () => {
+    assert.equal(kindFor(`your current: ${PASSPORT}`).kindReview, true);
   });
   test("a lead-in that is not on the page fails", () => {
     assert.equal(kindFor(`Bring along: ${PASSPORT}`).kindReview, true);
@@ -204,19 +220,29 @@ describe("derive + checklist carry kind and need", () => {
 
 describe("backfill plan", () => {
   const visa: any = {
-    requiredDocuments: ["a", "b"],
+    requiredDocuments: ["your income", "a passport"],
     scrapeMeta: { citations: { "requiredDocuments.0": "your income (if you have one)", "requiredDocuments.1": "a passport" } },
   };
-  test("derives need from the stored quote, kind stays document + kindReview, counts reported", () => {
+  test("derives need from the stored quote, kind stays document + kindReview, counts reported, item text stored", () => {
     const p = planItemKindBackfill(visa);
     assert.equal(p.outcome, "backfill");
     assert.deepEqual(p.counts, { items: 2, required: 1, conditional: 1, optional: 0, kindReview: 2 });
     assert.equal(p.meta[0].appliesWhen, "if you have one");
+    assert.deepEqual(p.meta.map((m) => m.item), ["your income", "a passport"]);
   });
-  test("idempotent: already classified (same length) is left alone; no documents is skipped", () => {
-    const done = { ...visa, scrapeMeta: { ...visa.scrapeMeta, requiredDocumentMeta: [{ kind: "information", need: "required" }, { kind: "document", need: "required" }] } };
+  test("idempotent by item TEXT: every item has its entry = done; none overwritten; no documents skipped", () => {
+    const done = { ...visa, scrapeMeta: { ...visa.scrapeMeta, requiredDocumentMeta: [
+      { item: "your income", kind: "information", need: "required" }, { item: "a passport", kind: "document", need: "required" }] } };
     assert.equal(planItemKindBackfill(done).outcome, "already_done");
     assert.equal(planItemKindBackfill({ scrapeMeta: {} } as any).outcome, "no_documents");
+  });
+  test("same length but different item texts is NOT done; a real classification is kept, the new item gets the quote-only reading", () => {
+    const edited = { ...visa, requiredDocuments: ["your income", "a photo"], scrapeMeta: { ...visa.scrapeMeta, requiredDocumentMeta: [
+      { item: "your income", kind: "information", need: "required" }, { item: "a passport", kind: "document", need: "required" }] } };
+    const p = planItemKindBackfill(edited);
+    assert.equal(p.outcome, "backfill");
+    assert.deepEqual(p.meta[0], { item: "your income", kind: "information", need: "required" }); // kept
+    assert.equal(p.meta[1].kindReview, true); // "a photo" had no entry
   });
 });
 

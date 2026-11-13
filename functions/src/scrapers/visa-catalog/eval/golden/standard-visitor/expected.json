@@ -10,8 +10,7 @@
     "Fee rule (#59): the standard (up to 6 months) Standard Visitor visa is £135. Long-term (2/5/10 year), medical and academic variants and the £1,172 in-UK extension are excluded. No IHS for visitors.",
     "isExtendable: true — a stay under 6 months can be extended up to a total of 6 months (and longer for medical treatment / academics).",
     "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK visa decision (3 weeks), max = inside-UK extension decision, standard service (8 weeks).",
-    "documentKinds (#187): kind and need as the page's own wording says (drafted from guide.json only).",
-    "documentKinds: the passport sentence ('You must have a passport or travel document...') is prose, not an item of the page's list, so it is not expected as an item; of the listed items only the TB certificate is a document."
+    "documentKinds (#187) scores ALL 13 items of the page's two lists ('information in your online application' = required unless an inline 'if'; 'Depending on your circumstances' = conditional). Only the TB certificate is a document. The passport sentence ('You must have a passport or travel document ...') is PROSE above those lists, not a list item, so it is not an expected item: the criterion 'only passport + TB certificate are documents' is read as 'every listed item is information except the TB certificate (and the passport, when the model lists it)'."
   ],
   "name": {
     "value": "Standard Visitor",
@@ -120,12 +119,11 @@
     "items": [
       {
         "match": [
-          "tuberculosis",
-          "TB"
+          "planning to travel"
         ],
-        "kind": "document",
-        "need": "conditional",
-        "source": "a certificate proving that you’ve had a tuberculosis (TB) test if you’re visiting for more than 6 months"
+        "kind": "information",
+        "need": "required",
+        "source": "the dates you’re planning to travel to the UK"
       },
       {
         "match": [
@@ -137,11 +135,19 @@
       },
       {
         "match": [
-          "earn"
+          "trip will cost"
         ],
         "kind": "information",
-        "need": "conditional",
-        "source": "how much you earn in a year (if you have an income)"
+        "need": "required",
+        "source": "how much you think your trip will cost"
+      },
+      {
+        "match": [
+          "home address"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "your current home address and how long you’ve lived there"
       },
       {
         "match": [
@@ -150,6 +156,14 @@
         "kind": "information",
         "need": "conditional",
         "source": "your parents’ names and dates of birth (if known)"
+      },
+      {
+        "match": [
+          "earn"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "how much you earn in a year (if you have an income)"
       },
       {
         "match": [
@@ -166,6 +180,46 @@
         "kind": "information",
         "need": "conditional",
         "source": "details of your travel history for the past 10 years"
+      },
+      {
+        "match": [
+          "employer"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "your employer’s address and telephone number"
+      },
+      {
+        "match": [
+          "partner"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "your partner’s name, date of birth and passport number"
+      },
+      {
+        "match": [
+          "anyone paying"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "the name and address of anyone paying for your trip"
+      },
+      {
+        "match": [
+          "family members"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "the name, address and passport number of any family members you have in the UK"
+      },
+      {
+        "match": [
+          "tuberculosis"
+        ],
+        "kind": "document",
+        "need": "conditional",
+        "source": "a certificate proving that you’ve had a tuberculosis (TB) test if you’re visiting for more than 6 months"
       }
     ]
   }

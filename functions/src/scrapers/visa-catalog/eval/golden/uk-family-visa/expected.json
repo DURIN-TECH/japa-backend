@@ -10,7 +10,7 @@
     "One guide, several routes: the registry extracts the PARTNER / SPOUSE route (VISA_SOURCE_OVERRIDES includeSections: overview, partner-spouse, proof-income-partner, knowledge-of-english, provide-information). Expected values are for that route.",
     "Fee rule (#59): outside-UK application fee for joining a partner is £2,064. The IHS is printed as a TOTAL per length (not per year): for an adult staying 2 years and 9 months (the partner visa's length from outside the UK) it is £3,105. Expected as ONE surcharge component of 3105 GBP per application. VERIFIER: confirm this reading (the alternative, 1035 x 3, is not printed on this page).",
     "Processing time (user decision, 2026-11-09): FULL RANGE: here the inside-UK time (8 weeks, meeting the financial and English requirements) is SHORTER than the outside-UK time (12 weeks), so the range is min 56 (inside) to max 84 (outside). The 'about 12 months' case for in-UK applicants who do not meet the financial and English requirements is not the standard case and is excluded. VERIFIER: confirm.",
-    "documentKinds (#187): kind and need as the page's own wording says (drafted from guide.json only)."
+    "documentKinds (#187): the issue's two named examples (copies of the photo page = document, details of any criminal convictions = information) plus passport, TB results and certified translation, as the page's own wording says."
   ],
   "name": {
     "value": "Family",
@@ -145,11 +145,19 @@
     "items": [
       {
         "match": [
-          "all your names"
+          "photo page"
+        ],
+        "kind": "document",
+        "need": "required",
+        "source": "copies of the photo page and any visa or entry stamps in your previous passports"
+      },
+      {
+        "match": [
+          "criminal convictions"
         ],
         "kind": "information",
         "need": "required",
-        "source": "all your names"
+        "source": "details of any criminal convictions"
       },
       {
         "match": [
@@ -158,14 +166,6 @@
         "kind": "document",
         "need": "required",
         "source": "your current passport or other valid travel ID"
-      },
-      {
-        "match": [
-          "national insurance"
-        ],
-        "kind": "information",
-        "need": "conditional",
-        "source": "your national insurance number, if you have one"
       },
       {
         "match": [
