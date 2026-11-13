@@ -66,6 +66,10 @@ export interface GuidanceSourceListItem {
   // streak: `consecutiveFailures` / `status` never move for these.
   lastInfrastructureError: string | null;
   lastInfrastructureErrorAt: string | null;
+  // Issue #150: the passages the post-crawl quote check could not find in the
+  // latest snapshot (ids and labels only; never the document's text), or null
+  // when every declared passage was found at the last check.
+  quoteDrift: { checkedAt: string | null; contentHash: string | null; failed: Array<{ checkId: string; label: string; problem: string }> } | null;
 }
 
 /** Firestore Timestamp -> ISO string (null when absent or not a Timestamp). */
@@ -81,6 +85,20 @@ const str = (v: unknown): string | null => (typeof v === "string" && v ? v : nul
  * Map a stored doc to its list item. An explicit field-by-field copy (not a
  * spread), so a field added to the doc later is not exposed by accident.
  */
+/** The stored `quoteDrift` field as the list returns it (null when absent or malformed). */
+function quoteDriftOf(value: unknown, toIso: (v: unknown) => string | null): GuidanceSourceListItem["quoteDrift"] {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  const failed = Array.isArray(v.failed) ? v.failed : [];
+  return {
+    checkedAt: toIso(v.checkedAt),
+    contentHash: typeof v.contentHash === "string" ? v.contentHash : null,
+    failed: failed
+      .filter((f): f is Record<string, unknown> => !!f && typeof f === "object")
+      .map((f) => ({ checkId: String(f.checkId ?? ""), label: String(f.label ?? ""), problem: String(f.problem ?? "") })),
+  };
+}
+
 export function toGuidanceSourceListItem(id: string, data: Partial<GuidanceSource>): GuidanceSourceListItem {
   return {
     id,
@@ -112,6 +130,7 @@ export function toGuidanceSourceListItem(id: string, data: Partial<GuidanceSourc
     backoffUntil: iso(data.backoffUntil),
     lastInfrastructureError: str(data.lastInfrastructureError),
     lastInfrastructureErrorAt: iso(data.lastInfrastructureErrorAt),
+    quoteDrift: quoteDriftOf((data as Record<string, unknown>).quoteDrift, iso),
   };
 }
 

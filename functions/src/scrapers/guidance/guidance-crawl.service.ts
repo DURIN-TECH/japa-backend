@@ -31,6 +31,11 @@ import type { ScrapeRunSourceStatus, ScrapeRunTrigger } from "../shared/runs/typ
 import { extractPublishedDate, publishedDateSelectorProblem } from "./guidance-published-date";
 import { GuidanceResolveError, linkPatternHost, resolveDocumentUrl } from "./guidance-resolve";
 import { GUIDANCE_SOURCE_ID_RE, guidanceSnapshotStore, type GuidanceSnapshotStore } from "./guidance-snapshot.store";
+// Issue #150: the post-crawl quote check (pure report builder + the declared
+// passages, which are data).
+import { GUIDANCE_QUOTE_CHECKS } from "./data/guidance-quote-checks";
+import { checkQuotesAfterCrawl, type QuoteDriftFinding } from "./guidance-post-crawl-quote-check";
+import type { GuidanceQuoteCheck } from "./guidance-quote-check";
 import type { GuidanceSnapshotMeta, GuidanceSource, GuidanceSourceStatus } from "./types";
 
 // ============================================
@@ -195,6 +200,16 @@ export interface GuidanceCrawlSummary {
   // Non-fatal problems (a listener that threw, an unreadable registry entry,
   // an id asked for that is not in the registry).
   warnings: string[];
+  // ---- Quote check after the crawl (issue #150) ----
+  // Ids of the sources whose declared passages were all judged against their
+  // latest snapshot (empty when the run touched no source with declared
+  // checks). Only these may raise or resolve a drift alert.
+  quoteChecked: string[];
+  // The sources with a passage missing from their latest snapshot.
+  quoteDrift: QuoteDriftFinding[];
+  // (passage, source) pairs judged and not confirmed.
+  quoteChecksRun: number;
+  quoteChecksFailed: number;
   results: GuidanceSourceResult[];
 }
 
@@ -239,6 +254,13 @@ export interface GuidanceCrawlOptions {
   // and for how long (ms). Defaults: the constants in shared/runs/source-health.ts.
   infraErrorLimit?: number;
   infraBackoffMs?: number;
+  // ---- Issue #150: quote integrity check after the crawl ----
+  // The passages to confirm in the snapshots of the sources the run fetched.
+  // Default: the declared data (data/guidance-quote-checks.ts) for a
+  // scheduled or manual run, and NONE for a "script" run (the seed script
+  // runs its own `--check-quotes` and must keep its exact behaviour). Tests
+  // inject their own.
+  quoteChecks?: readonly GuidanceQuoteCheck[];
 }
 
 /**
@@ -350,6 +372,10 @@ function emptySummary(): GuidanceCrawlSummary {
     failing: [],
     infrastructureErrors: [],
     warnings: [],
+    quoteChecked: [],
+    quoteDrift: [],
+    quoteChecksRun: 0,
+    quoteChecksFailed: 0,
     results: [],
   };
 }
@@ -527,6 +553,26 @@ export class GuidanceCrawlService {
       console.error(`Guidance crawl: failing source(s): ${summary.failing.join(", ")}`);
     }
 
+    // ---- 3b. Quote integrity check (issue #150) ----
+    // After every source is done and BEFORE the record is finalised, so its
+    // findings are in the stored summary the alert rules read. It can never
+    // fail the run (see runQuoteCheckHook).
+    await this.runQuoteCheckHook(
+      summary,
+      now,
+      opts.quoteChecks ?? (trigger === "script" ? [] : GUIDANCE_QUOTE_CHECKS),
+      // `d.data()` can throw for a corrupt doc: such a source falls back to its id.
+      new Map(
+        docs.map((d): [string, string] => {
+          try {
+            return [d.id, String((d.data() as Partial<GuidanceSource>)?.title ?? d.id)];
+          } catch {
+            return [d.id, d.id];
+          }
+        })
+      )
+    );
+
     // ---- 4. Finalise the run record ----
     // Warnings (a refused date selector, a listener that threw, ...) are
     // run-level warnings: they never change `errorCount` or the status.
@@ -536,6 +582,93 @@ export class GuidanceCrawlService {
     // errors and no fetch -> failed).
     await recorder.finalize({ summary: storedSummary(summary), anySuccess: summary.sourcesFetched > 0 });
     return summary;
+  }
+
+  /**
+   * The quote integrity check after a crawl (issue #150).
+   *
+   * Runs over the sources THIS run fetched successfully (changed or
+   * unchanged: an unchanged source is re-checked so a drift alert whose
+   * passage is restored, or a check list edited since, is picked up) that have
+   * declared checks. A run that touched none reads nothing.
+   *
+   * It REPORTS, in three places:
+   *  - the run: `quoteChecked` / `quoteDrift` / counters in the summary (the
+   *    alert rule reads them) and one run WARNING per drifted source. Never an
+   *    error: the run's status and error count are untouched;
+   *  - the source doc: `quoteDrift` (set while a passage is missing, cleared
+   *    once all are found; written only when it changes, so a passing run
+   *    writes nothing here);
+   *  - the shared alert service, via the run's finalize hook.
+   * An unreadable snapshot (our Storage) goes down the existing infrastructure
+   * path (`infrastructureErrors`, the `infrastructure_error` alert), never as
+   * drift. It never writes a snapshot and never throws: any failure here is
+   * one more warning.
+   */
+  private async runQuoteCheckHook(
+    summary: GuidanceCrawlSummary,
+    now: Timestamp,
+    checks: readonly GuidanceQuoteCheck[],
+    titles: ReadonlyMap<string, string>
+  ): Promise<void> {
+    try {
+      const touched = summary.results.filter((r) => r.outcome === "changed" || r.outcome === "unchanged").map((r) => r.sourceId);
+      // Source docs read for the check, kept to decide whether a write is needed.
+      const docsRead = new Map<string, Record<string, unknown>>();
+      const report = await checkQuotesAfterCrawl(checks, touched, titles, {
+        latestSnapshotId: async (sourceId) => {
+          const snap = await collections.guidanceSources.doc(sourceId).get();
+          const data = (snap.exists ? snap.data() : undefined) as Record<string, unknown> | undefined;
+          if (data) docsRead.set(sourceId, data);
+          const id = data?.latestSnapshotId;
+          return typeof id === "string" && id ? id : null;
+        },
+        readSnapshot: (sourceId, hash) => this.store.read(sourceId, hash),
+      });
+
+      summary.quoteChecked = report.checkedSourceIds;
+      summary.quoteDrift = report.drift;
+      summary.quoteChecksRun = report.pairsChecked;
+      summary.quoteChecksFailed = report.pairsFailed;
+
+      // Our storage, not the publisher: the existing infrastructure path.
+      for (const p of report.infra) this.noteInfraError(summary, p.sourceId, "storage_error", p.message);
+
+      // The run record: one warning per drifted source (never an error).
+      for (const d of report.drift) {
+        summary.warnings.push(
+          `source ${d.sourceId}: quote check: ${d.failed.length} passage(s) not found in the latest snapshot (${d.failed
+            .map((f) => f.checkId)
+            .join(", ")})`.slice(0, MAX_STORED_ERROR_CHARS)
+        );
+      }
+
+      // The source doc: set on drift, cleared when it passes again, and
+      // only written when the stored value would change.
+      const drifted = new Map(report.drift.map((d) => [d.sourceId, d]));
+      for (const sourceId of report.checkedSourceIds) {
+        const had = docsRead.get(sourceId)?.quoteDrift;
+        const finding = drifted.get(sourceId);
+        if (!finding && !had) continue;
+        try {
+          await collections.guidanceSources.doc(sourceId).update({
+            quoteDrift: finding
+              ? {
+                checkedAt: now,
+                contentHash: finding.contentHash,
+                failed: finding.failed.map((f) => ({ checkId: f.checkId, label: f.label, problem: f.problem })),
+              }
+              : null,
+            updatedAt: now,
+          });
+        } catch (err) {
+          summary.warnings.push(`source ${sourceId}: could not record the quote check result: ${describeError(err).slice(0, MAX_STORED_ERROR_CHARS)}`);
+        }
+      }
+    } catch (err) {
+      // The check itself broke: a report, never a failed run.
+      summary.warnings.push(`quote check could not run: ${describeError(err).slice(0, MAX_STORED_ERROR_CHARS)}`);
+    }
   }
 
   /**

@@ -221,6 +221,16 @@ export interface GuidanceSource
   autoPausedAt?: Timestamp | null;
   autoPausedReason?: string | null;
   autoPauseCause?: string | null;
+  // ---- Quote check state (issue #150) ----
+  // Set by the post-crawl quote check while a passage declared in
+  // data/guidance-quote-checks.ts is missing from the latest snapshot; cleared
+  // (null) once every passage is found again. Absent / null = no known drift.
+  // Ids and labels only: never the passage or the document's text.
+  quoteDrift?: {
+    checkedAt: Timestamp;
+    contentHash: string;
+    failed: Array<{ checkId: string; label: string; problem: string }>;
+  } | null;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;

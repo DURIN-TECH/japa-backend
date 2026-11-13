@@ -118,6 +118,10 @@ export const DEFAULT_SEVERITY: Record<ScrapeAlertRule, ScrapeAlertSeverity> = {
   // new rule text is not being kept. Admins can turn it off or change its
   // severity in appConfig/scrapeAlerts like every other rule.
   infrastructure_error: "critical",
+  // Issue #150: a publisher reworded a passage a rubric will cite. Not an
+  // outage (the crawl worked), but the rubric must be re-read: a warning,
+  // configurable like every other rule.
+  guidance_quote_drift: "warning",
 };
 
 /** Issue #96: most extra alert recipient addresses (extraRecipientEmails). */
@@ -484,6 +488,76 @@ export function evaluateInfrastructureErrors(run: ScrapeRunDoc, config: ScrapeAl
       },
     ],
   };
+}
+
+// ============================================
+// GUIDANCE QUOTE DRIFT (finalize hook, issue #150)
+// ============================================
+
+/** Dedupe key of one source's drift alert. */
+export const quoteDriftKey = (sourceId: string): string => `guidance_quote_drift:${sourceId}`;
+
+/** Most failed passage ids quoted in the alert message. */
+const MAX_QUOTED_DRIFT_CHECKS = 5;
+
+/**
+ * guidance_quote_drift (guidance runs only), post-run. The crawl's quote
+ * check puts its findings in the run summary: `quoteChecked` (sources whose
+ * snapshot was read and every declared passage judged) and `quoteDrift` (the
+ * ones with a passage missing). One alert per drifted source,
+ * `guidance_quote_drift:<sourceId>`, with the run id as its occurrence (the
+ * next run that still finds it missing BUMPS it).
+ *
+ * Auto-resolve: the scope is exactly the keys of the `quoteChecked` sources,
+ * so a source whose passages are found again resolves its alert, while a
+ * source this run did not check (not due, failed to fetch, snapshot
+ * unreadable: nothing was confirmed) keeps whatever alert it had. That is
+ * also why a manual single-source crawl cannot resolve other sources' alerts.
+ *
+ * An unreadable snapshot is NOT drift: it is an `infrastructure_error`, and
+ * the source is left out of `quoteChecked`. Visa / news runs, a run still
+ * `running` and a summary without the fields say nothing (empty scope).
+ */
+export function evaluateQuoteDrift(run: ScrapeRunDoc, config: ScrapeAlertsConfig): RuleEvaluation {
+  const none: RuleEvaluation = { rule: "guidance_quote_drift", signals: [], scope: { keys: [] } };
+  if (run.kind !== "guidance" || run.status === "running") return none;
+  const summary = (run.summary ?? {}) as Record<string, unknown>;
+  const checked = Array.isArray(summary.quoteChecked) ? summary.quoteChecked.filter((x): x is string => typeof x === "string") : [];
+  const drift = Array.isArray(summary.quoteDrift) ? (summary.quoteDrift as Array<Record<string, unknown>>) : [];
+
+  const signals: AlertSignal[] = [];
+  for (const d of drift) {
+    const sourceId = typeof d?.sourceId === "string" ? d.sourceId : "";
+    if (!sourceId) continue;
+    const title = typeof d.title === "string" && d.title ? d.title : sourceId;
+    const failed = Array.isArray(d.failed) ? (d.failed as Array<Record<string, unknown>>) : [];
+    const ids = failed.map((f) => String(f?.checkId ?? "")).filter(Boolean);
+    const labels = failed.map((f) => String(f?.label ?? "")).filter(Boolean);
+    signals.push({
+      rule: "guidance_quote_drift",
+      key: quoteDriftKey(sourceId),
+      severity: ruleSeverity(config, "guidance_quote_drift"),
+      kind: run.kind,
+      subject: { type: "source", id: sourceId, label: `${title} (guidance source)` },
+      message: (
+        `${title} (guidance source): ${failed.length} cited passage(s) no longer appear verbatim in its latest snapshot ` +
+        `(${ids.slice(0, MAX_QUOTED_DRIFT_CHECKS).join(", ")}${ids.length > MAX_QUOTED_DRIFT_CHECKS ? ", ..." : ""}); ` +
+        "the publisher may have reworded them. Re-read the source and update the passages or the rubric."
+      ).slice(0, 600),
+      details: {
+        sourceId,
+        failedPassages: failed.length,
+        checkIds: ids.slice(0, MAX_QUOTED_DRIFT_CHECKS).join(", "),
+        labels: labels.slice(0, MAX_QUOTED_DRIFT_CHECKS).join(", "),
+        contentHash: typeof d.contentHash === "string" ? d.contentHash : null,
+      },
+      // One occurrence per run: the hourly re-read of the same run does not bump twice.
+      eventId: run.id,
+      runId: run.id,
+    });
+  }
+  const keys = new Set<string>([...checked, ...signals.map((s) => (s.subject as { id: string }).id)].map(quoteDriftKey));
+  return { rule: "guidance_quote_drift", signals, scope: { keys: [...keys] } };
 }
 
 // ============================================

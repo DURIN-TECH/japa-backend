@@ -19,6 +19,7 @@ unit test enforces that.
 | `guidance-crawl.service.ts` | Fetch, hash gate, snapshot |
 | `guidance-resolve.ts` | Looks up a document's current address on a parent page (`resolveFrom`) |
 | `guidance-quote-check.ts` | The quote integrity check |
+| `guidance-post-crawl-quote-check.ts` | The same check run after a crawl (issue #150): sorts results into drift and infrastructure problems |
 | `guidance-seed-run.ts` | The script's guards: which project a run may touch, and whether a crawl did its job |
 | `guidance-snapshot.store.ts` | Snapshot text in Cloud Storage, read back by hash |
 | `scripts/seed-guidance-sources.ts` | The CLI below |
@@ -236,6 +237,20 @@ and `lastErrorKind` per source.
 - **`http_error`**, **`fetch_error`**, **`host_backoff`**, **`robots_blocked`**:
   nothing to change in the data unless the document moved. The crawl never
   works around a block or a rate limit.
+
+### Quote check after every crawl (issue #150)
+
+A scheduled crawl and an admin single-source crawl run the quote check
+themselves, over the sources that run fetched and that have declared passages
+(`data/guidance-quote-checks.ts`); a source with none is skipped without reading
+anything. A passage that is no longer found is reported as a *run warning*, as
+`quoteDrift` on the source doc (cleared when the passages are found again) and
+as the admin alert `guidance_quote_drift:<sourceId>` (see
+`../shared/alerts/scrape-alerts.md`). The check never fails the run and never
+writes a snapshot. A snapshot whose text is missing from Cloud Storage is an
+infrastructure error (`infrastructure_error:guidance`), not drift. Seed-script
+runs (`trigger: "script"`) skip it: the script's own `--check-quotes` is
+unchanged.
 
 A quote check that starts failing after a crawl means the publisher changed
 the wording (a new snapshot was written; the old one is still readable by its

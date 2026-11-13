@@ -50,6 +50,7 @@ still catches `run_failed`, the other per-run rules are lost for that run.
 | `budget_hard_stop` (#96) | `budget_hard_stop:visa` | a visa run's `summary.budgetHardStop` is true: the hard stop (`appConfig/scraperSettings.budget.hardStop`) skipped extraction because month-to-date cost reached the budget | a visa run that checked the budget and found it under (`budgetChecked && !budgetOver`), or the hourly check: stop off / no budget / spend under budget | critical |
 | `settings_unreadable` (#96) | `settings_unreadable:scrapers` | hourly: `appConfig/scraperSettings` could not be read (scheduled ticks fail closed meanwhile) | a later read succeeds | critical |
 | `infrastructure_error` (#143) | `infrastructure_error:guidance` | post-run, guidance runs: `summary.infrastructureErrors` non-empty (Cloud Storage / Firestore failed on our side; never blames a source). A persistent outage bumps this one alert | the next guidance run with an empty `infrastructureErrors` | critical |
+| `guidance_quote_drift` (#150) | `guidance_quote_drift:<sourceId>` | post-run, guidance runs: the quote check after the crawl found a passage declared in `guidance/data/guidance-quote-checks.ts` missing from the source's latest snapshot (`summary.quoteDrift`). One alert per source, bumped by each run that still finds it missing. `details`: `sourceId`, `failedPassages`, `checkIds`, `labels`, `contentHash` (never the passage text) | the source was checked again (`summary.quoteChecked`) and every passage was found. A source the run did not check (not due, failed, or its snapshot unreadable: that is `infrastructure_error`, never drift) keeps its alert, so a manual single-source crawl cannot resolve another source's | warning |
 | `review_queue_stale` | `review_queue_stale:visa` | a scraped visa pending review (queued at max(createdAt, restoredAt)) or an open `pendingVisaChanges` row waiting longer than `reviewQueueMaxAgeDays` | nothing is that old | info |
 
 How `host_backoff` sees hosts: visa page lines (`pages[]`, every line's host is
@@ -247,4 +248,26 @@ resolve tombstone; deleted on auto-resolve, replaced by the next occurrence).
 same rules as visa and news: `run_failed`, `run_stuck`, `host_backoff`, and
 `source_broken`, where a guidance source's `failing` status counts as `broken`
 (`source_broken:guidance:<sourceId>`, auto-resolved when the source is `active`
-again). `infrastructure_error` is guidance-only.
+again). `infrastructure_error` and `guidance_quote_drift` are guidance-only.
+
+### Quote check after the crawl (issue #150)
+
+After a scheduled or manual guidance crawl (not a `script` run, whose seed
+script runs `--check-quotes` itself) the crawl checks the declared passages
+against the latest snapshot of every source the run fetched (changed or
+unchanged) that has declared checks. A source with none is skipped without
+reading anything. The check only reads; it never fails the run or writes a
+snapshot. Findings:
+
+- run record: `summary.quoteChecked` (sources judged), `summary.quoteDrift`
+  (per source: check ids, labels, problem), the counters `quoteChecksRun` /
+  `quoteChecksFailed`, and one run *warning* per drifted source (never an
+  error, so the run's status is unchanged);
+- source doc: `quoteDrift` (`checkedAt`, `contentHash`, `failed[]`), set while a
+  passage is missing and set back to `null` when all are found again;
+- alert: `guidance_quote_drift:<sourceId>` (above), configurable like the other
+  rules (`rules.guidance_quote_drift.enabled` / `.severity`);
+- an unreadable snapshot (Storage object missing or failing its hash check, or
+  no snapshot for a fetched source) is reported as an infrastructure error
+  line (`infrastructure_error:guidance`), not as drift, and neither raises nor
+  resolves a drift alert.

@@ -77,7 +77,11 @@ export const SCRAPE_ALERT_STATUSES: readonly ScrapeAlertStatus[] = ["open", "ack
  *  - infrastructure_error (issue #143): a guidance run could not store its
  *    results (`summary.infrastructureErrors` non-empty: Cloud Storage or
  *    Firestore failed on OUR side). One alert per scraper, bumped by each
- *    run with the problem, resolved by the next run without it.
+ *    run with the problem, resolved by the next run without it;
+ *  - guidance_quote_drift (issue #150): after a guidance crawl, a passage a
+ *    source must contain verbatim (data/guidance-quote-checks.ts) is missing
+ *    from its latest snapshot: the publisher reworded it. One alert per
+ *    source, resolved when the passages are found again.
  */
 export type ScrapeAlertRule =
   | "run_failed"
@@ -93,7 +97,8 @@ export type ScrapeAlertRule =
   | "budget_hard_stop"
   | "source_no_yield"
   | "settings_unreadable"
-  | "infrastructure_error";
+  | "infrastructure_error"
+  | "guidance_quote_drift";
 
 /** Every rule id (config validation, docs). */
 export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
@@ -111,6 +116,7 @@ export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
   "source_no_yield",
   "settings_unreadable",
   "infrastructure_error",
+  "guidance_quote_drift",
 ];
 
 /**

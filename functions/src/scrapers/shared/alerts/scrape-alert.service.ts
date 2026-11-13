@@ -28,6 +28,7 @@ import {
   evaluateHostBackoff,
   evaluateHostBackoffClears,
   evaluateInfrastructureErrors,
+  evaluateQuoteDrift,
   evaluateLinkedSurcharge,
   evaluateMissedWindows,
   evaluateReviewQueue,
@@ -153,6 +154,7 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   source_no_yield: "source returns no articles",
   settings_unreadable: "scraper settings unreadable",
   infrastructure_error: "guidance crawl infrastructure error",
+  guidance_quote_drift: "guidance quote drift",
 };
 
 /** Cloud Logging severity per alert severity (resolutions log as INFO). */
@@ -333,6 +335,9 @@ export class ScrapeAlertService {
         evaluateBudgetHardStop(run, config),
         // Issue #143: a guidance run that could not store its results.
         evaluateInfrastructureErrors(run, config),
+        // Issue #150: a passage a guidance source must contain went missing
+        // (or came back).
+        evaluateQuoteDrift(run, config),
       ];
       // Host backoff needs the earlier runs of the same scraper.
       await this.isolated("host_backoff", skippedRules, async () => {
