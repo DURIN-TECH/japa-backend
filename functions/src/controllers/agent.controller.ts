@@ -5,6 +5,7 @@ import {
   AgentNotVerifiedError,
   InvalidAvailabilityError,
 } from "../services/agent.service";
+import { toPublicAgent } from "../agents/public-agent";
 import { agencyService } from "../services/agency.service";
 import { notificationService } from "../services/notification.service";
 import {
@@ -39,7 +40,8 @@ export class AgentController {
       };
 
       const agents = await agentService.getAgents(filters);
-      sendSuccess(res, agents);
+      // Issue #147: anonymous route -> allow-listed shape only
+      sendSuccess(res, agents.map(toPublicAgent));
     } catch (error) {
       console.error("Error getting agents:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -55,7 +57,8 @@ export class AgentController {
       const limit = parseInt(req.query.limit as string) || 10;
       const agents = await agentService.getTopAgents(limit);
 
-      sendSuccess(res, agents);
+      // Issue #147: allow-listed shape only
+      sendSuccess(res, agents.map(toPublicAgent));
     } catch (error) {
       console.error("Error getting top agents:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -82,7 +85,8 @@ export class AgentController {
         return;
       }
 
-      sendSuccess(res, agent);
+      // Issue #147: allow-listed shape only (the full doc stays on /agents/me)
+      sendSuccess(res, toPublicAgent(agent));
     } catch (error) {
       console.error("Error getting agent:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -115,7 +119,8 @@ export class AgentController {
       const { visaTypeId } = req.params;
       const agents = await agentService.getAgentsForVisaType(visaTypeId);
 
-      sendSuccess(res, agents);
+      // Issue #147: allow-listed shape only
+      sendSuccess(res, agents.map(toPublicAgent));
     } catch (error) {
       console.error("Error getting agents for visa type:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);

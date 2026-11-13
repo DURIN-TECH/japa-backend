@@ -28,6 +28,24 @@ export interface BackfillTargetInput {
   emulatorHost?: string;
 }
 
+/**
+ * Wording used in the guard's messages, so another script can reuse the guard
+ * and still name ITSELF (issue #148). Defaults keep the expireAt backfill's
+ * messages exactly as they were.
+ */
+export interface GuardWording {
+  /** Printed as `<label> ABORTED.` */
+  label: string;
+  /** The npm command with its arguments, shown in the "no target project" hint. */
+  example: string;
+}
+
+const NEWS_WORDING: GuardWording = {
+  label: "expireAt backfill",
+  example:
+    "`npm run backfill:expireat -- --project japa-platform` (or use `npm run backfill:expireat:dev`)",
+};
+
 /** Outcome of the decision: run (with the project to use) or abort (why). */
 export type BackfillTargetDecision =
   | { ok: true; projectId: string; emulator: boolean; message: string }
@@ -46,7 +64,10 @@ export type BackfillTargetDecision =
  *  - Any difference from `asked` aborts. If nothing is set at all the run is
  *    allowed and the caller pins both env vars to `asked` before init.
  */
-export function decideBackfillTarget(input: BackfillTargetInput): BackfillTargetDecision {
+export function decideBackfillTarget(
+  input: BackfillTargetInput,
+  wording: GuardWording = NEWS_WORDING
+): BackfillTargetDecision {
   if (input.emulatorHost) {
     return {
       ok: true,
@@ -62,8 +83,7 @@ export function decideBackfillTarget(input: BackfillTargetInput): BackfillTarget
     return {
       ok: false,
       message:
-        "No target project. Pass --project <id>, e.g. `npm run backfill:expireat -- --project japa-platform` " +
-        "(or use `npm run backfill:expireat:dev`). Refusing to guess.",
+        `No target project. Pass --project <id>, e.g. ${wording.example}. Refusing to guess.`,
     };
   }
 
@@ -129,16 +149,23 @@ export function parseProjectArg(argv: string[]): string | undefined {
  * exits non-zero on a mismatch, and on success pins both env vars to the
  * confirmed project so the Admin SDK (initialised right after) uses it.
  */
-export function enforceBackfillTarget(argv: string[], env: NodeJS.ProcessEnv = process.env): string {
-  const decision = decideBackfillTarget({
-    asked: parseProjectArg(argv),
-    credentialProject: readCredentialProject(env.GOOGLE_APPLICATION_CREDENTIALS),
-    googleCloudProject: env.GOOGLE_CLOUD_PROJECT,
-    gcloudProject: env.GCLOUD_PROJECT,
-    emulatorHost: env.FIRESTORE_EMULATOR_HOST,
-  });
+export function enforceBackfillTarget(
+  argv: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  wording: GuardWording = NEWS_WORDING
+): string {
+  const decision = decideBackfillTarget(
+    {
+      asked: parseProjectArg(argv),
+      credentialProject: readCredentialProject(env.GOOGLE_APPLICATION_CREDENTIALS),
+      googleCloudProject: env.GOOGLE_CLOUD_PROJECT,
+      gcloudProject: env.GCLOUD_PROJECT,
+      emulatorHost: env.FIRESTORE_EMULATOR_HOST,
+    },
+    wording
+  );
   if (!decision.ok) {
-    console.error(`\nexpireAt backfill ABORTED. ${decision.message}\n`);
+    console.error(`\n${wording.label} ABORTED. ${decision.message}\n`);
     process.exit(1);
   }
   console.log(`\n${decision.message}\n`);
