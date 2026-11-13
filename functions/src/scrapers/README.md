@@ -198,3 +198,55 @@ version keeps serving, admins are alerted). Admins can still reject, roll back
 - **Run on an existing draft**: `POST /admin/rubrics/:id/auto-publish`
   (`?dryRun=true` writes nothing) or
   `npm run publish:rubric -- --project <id> --route <routeKey> --version <n> [--dry-run] [--skip-checker]`.
+
+## Independent AI check of every rule (`rubric-checker.ts`, `rubric-checker-prompt.ts`; issue #202, part B of #200)
+
+A second model, with its own prompt (`CHECKER_PROMPT_VERSION`, no text shared
+with extraction), reads **every rule of the draft** against its own quoted
+sentence plus a bounded window of the stored source (400 characters each side,
+inside the quote's own line or page, plus the lead-in of a list item) and
+returns **closed verdicts only**. The pipeline calls it after every code gate
+passed, never in a dry run. It never writes, edits or adds a rule and returns
+no free text; code decides.
+
+- **Roles**: ordinary rules are read by `verification` (mid tier, not the
+  extractor's `judgement`). Protected rules (a mandatory bar, or any rule with
+  `appliesTo`) are read by BOTH `verification` and `judgement`, and so is the
+  intention-to-stay reading (which sees only the proposal's quote). Honest
+  limit: the second reading of a protected rule uses the extractor's model with
+  a different prompt.
+- **Aspects** (each `yes | no | unsure | na`): `title_faithful`, `kind_right`,
+  `stage_right`, `condition_faithful`, `check_faithful` (`na` without a check),
+  `group_matches_codes` (`na` without `appliesTo`). The schema is flat, with
+  no union type and no free-text key but the batch handle (`r1`, `r2`, ...).
+- **Verdict to action** (`judgeRule`, table-tested): ordinary rule, every
+  applicable aspect `yes` -> keep; any applicable aspect `no` / `unsure` / `na`
+  (or a doubt on an aspect that does not apply) -> leave out as
+  `checker:<first failing aspect>`; protected rule, both models `yes` on every
+  applicable aspect -> keep, anything else -> HOLD
+  `protected_rule_failed:<id>` (never in `leftOut`); a quote that cannot be
+  found in its cited snapshot -> `checker:source_text` (ordinary) or hold
+  (protected). A rule is never left out for size or to keep the rulebook short.
+- **Fail closed**: an answer that is not exactly the handles sent (missing,
+  extra or repeated id, extra key, bad enum, cut off) -> `checker_output_invalid`;
+  provider error after ONE retry, no key, unreadable settings, a refusal, a
+  run cut off by the clock -> `checker_unavailable`; a cap -> `checker_capped`;
+  intention-to-stay not confirmed by both models -> `polarity_unverified`.
+  Nothing is published on a partial check.
+- **Order and spend**: protected rules and the polarity readings first (a
+  failure holds before the bulk is spent), then ordinary rules in rulebook
+  order, batches of 10, 6 requests in flight. Caps (in
+  `appConfig/rubricPublishSettings`, checked BEFORE the first call): rules per
+  draft 1000, requests per run 120 (retries count), input characters per run
+  2,000,000, output tokens per request 8000, runs per UTC day 20, request
+  timeout 240 s. A draft over a cap is held, not trimmed. Expected load:
+  `estimateCheckerLoad` (270 rules: about 31 requests; 500 rules: about 54).
+- **Reuse**: every closed answer is stored in `rubricCheckerRuns/{routeKey}__v{n}`
+  under its request hash with calls and tokens. A re-run of the same version
+  makes no model call; a run cut off resumes from what it stored.
+- **Sweep**: `sweepHeldRubricDrafts` (hourly) re-runs held drafts whose only
+  reasons are `checker_unavailable`, `checker_capped` or `checker_output_invalid`,
+  up to 3 runs per version, only in `auto` mode.
+- **Flag codes it resolves**: `title_wording_uncited`,
+  `nationality_codes_model_proposed`, `nationality_code_name_mismatch`.
+  (`intake_wording_uncited` is part C's.)

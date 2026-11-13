@@ -38,6 +38,7 @@ import {
   rubricVersionId,
 } from "../../../src/services/rubric-review.service";
 import { RubricAutoPublishService } from "../../../src/services/rubric-auto-publish.service";
+import { DEFAULT_PUBLISH_SETTINGS } from "../../../src/scrapers/rubric/rubric-publish-settings";
 import { DEFAULT_CONFIG } from "../../../src/scrapers/shared/alerts/scrape-alert-rules";
 import { RUBRIC_SYSTEM_ACTOR_ID } from "../../../src/types/rubric";
 import { A_TEXT, SOURCE_A_ID, SOURCE_A_URL } from "./fixtures/synthetic-guidance";
@@ -194,7 +195,7 @@ suite("rubric review on the Firestore emulator (issue #125)", () => {
     await seed();
     const auto = new RubricAutoPublishService({
       review: service,
-      loadSettings: async () => ({ settings: { mode: "auto", pauseAfterRollback: true, maxLeftOutShare: 0.15, maxPrimaryLeftOutShare: 0.2, minKeptShareOfServing: 0.7 }, exists: true, problems: [] }),
+      loadSettings: async () => ({ settings: { ...DEFAULT_PUBLISH_SETTINGS, mode: "auto" }, exists: true, problems: [] }),
       checker: { check: async () => ({ ok: true, leftOut: [], resolvedFlagCodes: [], intentPolarity: "immigrant_intent_penalised" }) },
       planner: { plan: async () => ({ ok: true }) },
       raiseAlerts: async () => [],

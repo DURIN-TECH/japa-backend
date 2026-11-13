@@ -59,6 +59,12 @@ export interface LlmRequest {
   timeoutMs: number;
   // Thinking depth. Optional: the provider's default applies when absent.
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  // Mark the system prompt as cacheable (issue #202): a caller that sends the
+  // SAME system prompt many times in a row (one request per batch of rules)
+  // pays for it once. Absent for every other caller, whose request shape and
+  // recording hash are unchanged (the hash ignores this flag: it changes the
+  // price, not the answer).
+  cacheSystem?: boolean;
 }
 
 /** Token counts of one call, as the API reported them (never estimated). */
@@ -144,7 +150,9 @@ export function messageParamsFor(request: LlmRequest, model: string): Anthropic.
   return {
     model,
     max_tokens: request.maxOutputTokens,
-    system: request.system,
+    system: request.cacheSystem
+      ? [{ type: "text", text: request.system, cache_control: { type: "ephemeral" } }]
+      : request.system,
     messages: [{ role: "user", content: userContent(request) }],
     output_config: {
       format: { type: "json_schema", schema: request.schema },

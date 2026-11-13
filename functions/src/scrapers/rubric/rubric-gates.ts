@@ -397,6 +397,9 @@ export function reasonInWords(code: string): string {
     checker_not_configured: "the independent AI check is not set up yet",
     question_plan_missing: "the applicant question plan is not set up yet",
     polarity_unverified: "the reading on an intention to stay was not verified",
+    checker_unavailable: "the independent AI check could not be completed (unavailable, timed out or not set up), so nothing was published",
+    checker_capped: "the independent AI check would exceed its spend limits, so it was not run",
+    checker_output_invalid: "the independent AI check returned an answer that did not match what was asked, so nothing was published",
     settings_unreadable: "the publishing settings could not be read, so nothing was published",
     paused_after_rollback: "automatic publishing for this route is paused after a roll-back",
     route_not_in_allowlist: "this route is not in the automatic publishing allowlist",
@@ -422,6 +425,8 @@ export function reasonInWords(code: string): string {
     flag_unresolved: "a remark that only the independent check can resolve was not resolved",
     protected_rule_flagged: "a protected rule (a bar on a named group) failed a check",
     primary_source_empty: "a main official source has no rule left",
+    protected_rule_failed: "the independent check did not confirm a protected rule (a bar on a named group)",
+    checker: "the independent check did not confirm this rule",
   };
   return prefixed[head] ? `${prefixed[head]}${rest ? ` (${rest})` : ""}` : code;
 }

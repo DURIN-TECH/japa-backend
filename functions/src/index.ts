@@ -900,6 +900,23 @@ export const onRubricVersionCreated = functions
   });
 
 /**
+ * Issue #202: every hour, retry the held drafts whose only reasons can clear on
+ * their own (the independent check was unavailable, over a daily cap, or got an
+ * unreadable answer), at most 3 runs per version, only in `auto` mode. The same
+ * pipeline and the same shared approval transaction as the trigger; a retry
+ * reuses the check's stored batches. Binds AI_SECRETS and EMAIL_SECRETS like
+ * the trigger. Never throws.
+ */
+export const sweepHeldRubricDrafts = functions
+  .runWith({ memory: "1GB", timeoutSeconds: 540, secrets: [...AI_SECRETS, ...EMAIL_SECRETS] })
+  .pubsub.schedule("17 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const result = await rubricAutoPublishService.sweepRetryable();
+    if (result.considered > 0) console.log(`[rubric-auto-publish] sweep: ${JSON.stringify(result)}`);
+  });
+
+/**
  * Issue #201: when a rubric version is decided (approved or rejected, by an
  * admin or by the automatic publisher), resolve the "draft held" alerts that
  * decision settles: an approval settles every held draft of the route, a

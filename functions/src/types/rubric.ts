@@ -612,7 +612,7 @@ export const RUBRIC_PUBLISH_OUTCOMES = ["published", "held", "skipped"] as const
 export type RubricPublishOutcome = (typeof RUBRIC_PUBLISH_OUTCOMES)[number];
 
 /** What started a run. */
-export type RubricPublishTrigger = "version_created" | "admin_endpoint" | "script";
+export type RubricPublishTrigger = "version_created" | "admin_endpoint" | "script" | "sweep";
 
 /** One gate's verdict, as recorded on the run. `detail` is code-written (ids, counts), never model or source text. */
 export interface RubricPublishGateResult {

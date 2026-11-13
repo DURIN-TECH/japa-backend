@@ -29,12 +29,18 @@
  *    of a case for an agent). Mid tier.
  *  - `judgement`:  decisions that weigh evidence against rules (eligibility
  *    assessment, agent pre-review). Most capable tier of the three.
+ *  - `verification`: the INDEPENDENT second reader of the automatic rulebook
+ *    publisher (issue #202): it re-reads each rule an extraction produced
+ *    against its own quoted sentence and answers closed verdicts only. It is
+ *    its own role, on the mid tier, so it is never the extractor's model
+ *    (`judgement` drafts the rulebook) and its tier can be changed on its own.
  */
-export type AiModelRole = "extraction" | "drafting" | "judgement";
+export type AiModelRole = "extraction" | "drafting" | "judgement" | "verification";
 
 /** Role -> Claude model id. The single source of truth for model ids. */
 export const AI_MODELS: Readonly<Record<AiModelRole, string>> = Object.freeze({
   extraction: "claude-haiku-5-5",
   drafting: "claude-sonnet-5-5",
   judgement: "claude-opus-5-5",
+  verification: "claude-sonnet-5-5",
 });
