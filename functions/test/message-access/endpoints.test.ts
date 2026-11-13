@@ -241,6 +241,17 @@ describe("per-chat switch", () => {
     assert.equal((store.get(`conversations/${CONV}`) as any).aiAccessOffAgent, undefined);
   });
 
+  test("a caller who matches BOTH sides (id-swap) changes only the applicant side, never the other", async () => {
+    // The attack state: the agent has written their own uid into conv.userId.
+    store.set(`conversations/${CONV}`, { ...(store.get(`conversations/${CONV}`) as object), userId: AGENT_USER, aiAccessOffUser: true });
+    await setAiAccess(agentReq({ params: { id: CONV }, body: { off: false } }), mockRes());
+    const conv: any = store.get(`conversations/${CONV}`);
+    // One side only: the applicant-side field is the one the caller matched first,
+    // and the agent side is untouched (no both-sides write).
+    assert.equal(conv.aiAccessOffAgent, undefined);
+    assert.equal(auditRows().length, 1);
+  });
+
   test("switching to the value it already has writes no audit row", async () => {
     await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: false } }), mockRes());
     assert.equal(auditRows().length, 0);
@@ -289,6 +300,14 @@ describe("conversation response", () => {
     await getConversation(agentReq({ params: { id: CONV } }), theirs);
     assert.equal(theirs.body.data.aiAccess.otherSwitchedOff, true);
     assert.equal(theirs.body.data.aiAccess.myAiAccess, "on");
+  });
+
+  test("`qualifies` comes from the database-resolved plan, not the token claims", async () => {
+    seedPlan(APPLICANT); // the DB says this client has an AI plan
+    const res = mockRes();
+    // Token claims say admin (no plan): a stale token must not change the label.
+    await getConversation(req(APPLICANT, { params: { id: CONV } }, ROLES.ADMIN), res);
+    assert.equal(res.body.data.aiAccess.qualifies, true);
   });
 
   test("an old conversation with no switch fields reads as on", async () => {

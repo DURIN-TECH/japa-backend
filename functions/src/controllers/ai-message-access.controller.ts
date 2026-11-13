@@ -35,7 +35,7 @@ function refusedForeignUser(req: AuthenticatedRequest, res: Response): boolean {
 
 /** Load the caller's state for a response. */
 async function respondWithState(req: AuthenticatedRequest, res: Response, message?: string, status = 200) {
-  const state = await aiMessageAccessService.getUserState(req.userId!, req.authz!);
+  const state = await aiMessageAccessService.getUserState(req.userId!);
   sendSuccess(res, state, message, status);
 }
 

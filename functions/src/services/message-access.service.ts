@@ -95,6 +95,48 @@ class MessageAccessService {
   }
 
   /**
+   * Evaluate the rule for one chat for this principal: who the parties are and
+   * which senders may be released right now. Null when nothing can be released
+   * (missing chat, unresolved party, principal not allowed, chat off, nobody
+   * qualifies). Throws on a failed read; callers fail closed.
+   */
+  private async evaluate(
+    conversationId: string,
+    principal: MessageAccessPrincipal
+  ): Promise<{ participants: Participants; applicantReleased: boolean; agentReleased: boolean } | null> {
+    const convSnap = await collections.conversations.doc(conversationId).get();
+    if (!convSnap.exists) return null;
+    const conv = convSnap.data() as Conversation;
+
+    const participants = await this.resolveParticipants(conv);
+    if (!participants) return null;
+    if (!this.principalMaySee(principal, participants)) return null;
+
+    // Both parties' status is read BEFORE any message is read, so a chat that
+    // is off or has nobody qualifying never even loads its content.
+    const [applicant, agent] = await Promise.all([
+      this.partyStatus(participants.applicantUid),
+      this.partyStatus(participants.agentUid),
+    ]);
+    const decision = decideMessageAccess({
+      switchOffUser: conv.aiAccessOffUser === true,
+      switchOffAgent: conv.aiAccessOffAgent === true,
+      applicant,
+      agent,
+    });
+    if (decision.chatOff || (!decision.applicantReleased && !decision.agentReleased)) return null;
+    return { participants, applicantReleased: decision.applicantReleased, agentReleased: decision.agentReleased };
+  }
+
+  /** True when a message's SENDER (by uid, never the `senderType` label) may be released. */
+  private senderReleased(m: Message, e: { participants: Participants; applicantReleased: boolean; agentReleased: boolean }): boolean {
+    return (
+      (m.senderId === e.participants.applicantUid && e.applicantReleased) ||
+      (m.senderId === e.participants.agentUid && e.agentReleased)
+    );
+  }
+
+  /**
    * The messages of one chat that may be used for AI right now, or [].
    *
    * Never throws: any failure returns [] (fail closed), logged without content.
@@ -107,28 +149,8 @@ class MessageAccessService {
     limit: number = DEFAULT_MESSAGE_LIMIT
   ): Promise<Message[]> {
     try {
-      const convSnap = await collections.conversations.doc(conversationId).get();
-      if (!convSnap.exists) return [];
-      const conv = convSnap.data() as Conversation;
-
-      const participants = await this.resolveParticipants(conv);
-      if (!participants) return [];
-      if (!this.principalMaySee(principal, participants)) return [];
-
-      // Both parties' status is read BEFORE any message is read, so a chat that
-      // is off or has nobody qualifying never even loads its content.
-      const [applicant, agent] = await Promise.all([
-        this.partyStatus(participants.applicantUid),
-        this.partyStatus(participants.agentUid),
-      ]);
-      const decision = decideMessageAccess({
-        switchOffUser: conv.aiAccessOffUser === true,
-        switchOffAgent: conv.aiAccessOffAgent === true,
-        applicant,
-        agent,
-      });
-      if (decision.chatOff || (!decision.applicantReleased && !decision.agentReleased)) return [];
-
+      const e = await this.evaluate(conversationId, principal);
+      if (!e) return [];
       const cap = Math.min(Math.max(1, Math.floor(limit) || DEFAULT_MESSAGE_LIMIT), MAX_MESSAGE_LIMIT);
       const snap = await subcollections
         .messages(conversationId)
@@ -136,14 +158,7 @@ class MessageAccessService {
         .limit(cap)
         .get();
       const messages = snap.docs.map((d) => d.data() as Message).reverse();
-
-      // Filter by the SENDER's uid (`senderId`), never by the `senderType` label.
-      // A sender who is neither participant is not released (fail closed).
-      return messages.filter(
-        (m) =>
-          (m.senderId === participants.applicantUid && decision.applicantReleased) ||
-          (m.senderId === participants.agentUid && decision.agentReleased)
-      );
+      return messages.filter((m) => this.senderReleased(m, e));
     } catch (error) {
       console.error("[message-access] read failed; releasing nothing:", (error as Error)?.message);
       return [];
@@ -174,8 +189,8 @@ class MessageAccessService {
    * a chat off (or withdrew approval, or the plan lapsed) in between, the stale
    * request must not go out. This re-runs the rule for every item: an item that
    * no longer releases anything is dropped, and an item keeps only messages the
-   * rule still releases (matched by message id, so edited content can never slip
-   * in: the content comes from the fresh read, not from the old item).
+   * rule still releases (the content comes from the fresh read by id, never from
+   * the old item).
    */
   async recheckAiMessageBatch(
     principal: MessageAccessPrincipal,
@@ -183,10 +198,23 @@ class MessageAccessService {
   ): Promise<AiMessageBatchItem[]> {
     const fresh: AiMessageBatchItem[] = [];
     for (const item of items) {
-      const allowedNow = await this.getMessagesForAi(item.conversationId, principal);
-      const wantedIds = new Set(item.messages.map((m) => m.id));
-      const messages = allowedNow.filter((m) => wantedIds.has(m.id));
-      if (messages.length > 0) fresh.push({ conversationId: item.conversationId, messages });
+      try {
+        const e = await this.evaluate(item.conversationId, principal);
+        if (!e) continue;
+        // Re-read exactly the messages the build released, BY ID. Re-reading "the
+        // latest N" would silently lose older messages when the build used a
+        // bigger window or the chat has grown since.
+        const reread = await Promise.all(
+          item.messages.map((m) => subcollections.messages(item.conversationId).doc(m.id).get())
+        );
+        const messages = reread
+          .filter((d) => d.exists)
+          .map((d) => d.data() as Message)
+          .filter((m) => this.senderReleased(m, e));
+        if (messages.length > 0) fresh.push({ conversationId: item.conversationId, messages });
+      } catch (error) {
+        console.error("[message-access] re-check failed; dropping request:", (error as Error)?.message);
+      }
     }
     return fresh;
   }

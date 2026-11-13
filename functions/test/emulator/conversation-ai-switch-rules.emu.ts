@@ -66,6 +66,33 @@ describe("conversation AI switch is backend-only", () => {
     assert.equal(await isDenied(db.collection("conversations").doc(CONV).update({ unreadCountUser: 5 })), false);
   });
 
+  test("a participant cannot rewrite userId or agentId (the id-swap override attack)", async () => {
+    // Attack: the agent writes userId = own uid so the API sees them on both
+    // sides, clears the applicant's switch, then restores userId.
+    const agent = await clientDb(AGENT_USER, { role: "agent", agencyId: null });
+    const ref = agent.collection("conversations").doc(CONV);
+    assert.equal(await isDenied(ref.update({ userId: AGENT_USER })), true);
+    assert.equal(await isDenied(ref.update({ agentId: "agent-doc-other" })), true);
+    // The applicant cannot repoint the agent side either.
+    const applicant = await clientDb(APPLICANT, { role: "client", agencyId: null });
+    assert.equal(await isDenied(applicant.collection("conversations").doc(CONV).update({ agentId: "x" })), true);
+  });
+
+  test("any field outside the allow-list is refused, even beside an allowed one", async () => {
+    const db = await clientDb(APPLICANT, { role: "client", agencyId: null });
+    const ref = db.collection("conversations").doc(CONV);
+    assert.equal(await isDenied(ref.update({ lastMessage: "forged" })), true);
+    assert.equal(await isDenied(ref.update({ unreadCountUser: 0, userId: APPLICANT })), true);
+  });
+
+  test("ids and switch fields were never changed", async () => {
+    await withoutRules(async (db) => {
+      const d = (await db.collection("conversations").doc(CONV).get()).data();
+      assert.equal(d.userId, APPLICANT);
+      assert.equal(d.agentId, "agent-doc-1");
+    });
+  });
+
   test("the switch fields were never written", async () => {
     await withoutRules(async (db) => {
       const d = (await db.collection("conversations").doc(CONV).get()).data();

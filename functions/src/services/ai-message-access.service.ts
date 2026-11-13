@@ -129,11 +129,16 @@ class AiMessageAccessService {
     return this.subjectHasAiPlan({ uid, role, agencyId });
   }
 
-  /** The signed-in person's own state. `subject` is `req.authz` (already resolved by verifyAuth). */
-  async getUserState(userId: string, subject: AuthzSubject): Promise<UserAiAccessState> {
+  /**
+   * The signed-in person's own state. The plan comes from `uidHasAiPlan` (role and
+   * agency resolved from the database), the SAME source the access check uses, so
+   * a label here can never disagree with what is actually released (token claims
+   * can be stale after an agency change).
+   */
+  async getUserState(userId: string): Promise<UserAiAccessState> {
     const [record, hasAiPlan] = await Promise.all([
       this.getRecord(userId),
-      this.subjectHasAiPlan(subject),
+      this.uidHasAiPlan(userId),
     ]);
     const approved = isApprovalActive(record);
     return {
@@ -288,8 +293,8 @@ class AiMessageAccessService {
    * Set the caller's OWN side of a chat's switch.
    *
    * Participant rule is the messaging module's: the applicant (`conv.userId`) or
-   * the agent whose doc id is `conv.agentId`. The side(s) written are only ever
-   * the caller's own (both only if the same person sits on both sides). The
+   * the agent whose doc id is `conv.agentId`. Exactly one side is written: the
+   * caller's own (applicant side first if they somehow match both). The
    * conversation is re-read inside the transaction so the decision and the write
    * see the same document. Returns the updated conversation.
    *
@@ -306,8 +311,11 @@ class AiMessageAccessService {
       const snap = await tx.get(ref);
       if (!snap.exists) throw new AiMessageAccessError("NOT_FOUND", "Conversation not found");
       const conv = snap.data() as Conversation;
+      // ONE side only. The applicant side wins if the caller matches both (the
+      // same person on both sides is not a legitimate chat; it is what an id-swap
+      // attack looks like), so a caller can never reach the other side's switch.
       const userSide = conv.userId === userId;
-      const agentSide = !!callerAgentId && conv.agentId === callerAgentId;
+      const agentSide = !userSide && !!callerAgentId && conv.agentId === callerAgentId;
       if (!userSide && !agentSide) throw new AiMessageAccessError("FORBIDDEN", "Not a participant");
 
       const updates: Record<string, unknown> = {};

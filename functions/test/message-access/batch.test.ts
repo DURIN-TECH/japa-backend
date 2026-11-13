@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { before, beforeEach, describe, test } from "node:test";
 import { ROLES } from "@durin-tech/authz";
-import { installMessageAccessFakes, resetMessageAccess, seedApproval, seedChat, seedPlan } from "./harness";
+import { installMessageAccessFakes, resetMessageAccess, seedApproval, seedChat, seedMessage, seedPlan } from "./harness";
 import { aiMessageAccessService } from "../../src/services/ai-message-access.service";
 import { messageAccessService, type AiMessageBatchItem, type MessageAccessPrincipal } from "../../src/services/message-access.service";
 
@@ -80,5 +80,17 @@ describe("batch built through the helper", () => {
     const trimmed = [{ ...built[0], messages: built[0].messages.slice(0, 1) }];
     const out = await messageAccessService.recheckAiMessageBatch(admin, trimmed);
     assert.deepEqual(out[0].messages.map((m) => m.id), [built[0].messages[0].id]);
+  });
+
+  test("the re-check covers exactly what the build released, even past 200 messages and after the chat grew", async () => {
+    for (let i = 0; i < 250; i++) seedMessage("c-ok", `big-${i}`, "app-ok", "user", `w${i}`, 100 + i);
+    const built = await messageAccessService.buildAiMessageBatch(admin, ["c-ok"], 500);
+    const builtCount = built[0].messages.length;
+    assert.ok(builtCount > 200, "build used the larger window");
+    // The chat gains newer messages after the build.
+    for (let i = 0; i < 100; i++) seedMessage("c-ok", `late-${i}`, "app-ok", "user", `l${i}`, 5000 + i);
+    const out = await messageAccessService.recheckAiMessageBatch(admin, built);
+    assert.equal(out[0].messages.length, builtCount, "no older message silently lost at send time");
+    assert.ok(out[0].messages.every((m) => !m.id.startsWith("late-")), "and no message the build did not release is added");
   });
 });

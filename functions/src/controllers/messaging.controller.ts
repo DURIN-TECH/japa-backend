@@ -124,7 +124,8 @@ async function withAiAccess<T extends Conversation>(
     try {
       const [record, hasAiPlan] = await Promise.all([
         aiMessageAccessService.getRecord(userId),
-        req.authz ? aiMessageAccessService.subjectHasAiPlan(req.authz) : Promise.resolve(false),
+        // Same source as the access check (resolved from the database, not token claims).
+        aiMessageAccessService.uidHasAiPlan(userId),
       ]);
       return { record, hasAiPlan };
     } catch (e) {
@@ -400,7 +401,7 @@ export async function getConversation(req: AuthenticatedRequest, res: Response):
       return;
     }
     const agentId = await getAgentId(userId);
-    if (!(conv.userId === userId || (!!agentId && conv.agentId === agentId))) {
+    if (!(await isParticipant(userId, agentId, req.params.id))) {
       sendForbidden(res);
       return;
     }
