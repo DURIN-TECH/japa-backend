@@ -598,6 +598,11 @@ service cloud.firestore {
     //    Do NOT add a match: a rule here could only widen that access.
     //  - appConfig/{docId}: backend config, e.g. appConfig/fx exchange rates
     //    (issue #59).
+    //  - exchangeRates/{currency} and exchangeRateAudit/{id}: the rate used to
+    //    price in a local currency, any admin override of it and the history
+    //    of overrides (issue #178). The public rate view is GET /rates;
+    //    overrides go through /admin/exchange-rates only. A client write here
+    //    would let a user set their own price. Do NOT add a match.
     //  - pendingVisaChanges/{changeId}: proposed field-level edits to
     //    approved scraped visas, staged by the crawl and approved/rejected by
     //    admins via /admin/visa-changes (issue #61). Do NOT add a match.
