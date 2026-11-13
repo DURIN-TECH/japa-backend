@@ -368,4 +368,8 @@ export async function installFakes(): Promise<void> {
   firebase.collections.aiCosts = fakeCollection("aiCosts");
   const screening: any = await import("../../src/agency-visas/agency-visa-screening.service");
   screening.agencyVisaScreeningService.deps.runTransaction = fakeRunTransaction;
+  // Never the real model in a unit test: a request with no recording throws
+  // (screening then records `model_failed`), so a test cannot reach the network.
+  const llm: any = await import("../../src/services/ai/llm-provider");
+  screening.agencyVisaScreeningService.deps.provider = new llm.RecordedLlmProvider();
 }

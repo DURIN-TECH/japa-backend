@@ -606,6 +606,12 @@ service cloud.firestore {
     //    read and decide them through /admin/risk-signals only, so the subject
     //    and every other client principal can never see a signal or a count of
     //    signals. Do NOT add a match, not even an admin one.
+    //  - listingScreenings/{countryCode}__{visaId}: the screening result of an
+    //    agency-created visa listing (code comparison with the verified record,
+    //    validated language flags with the listing's own quotes, signal ids,
+    //    issue #120). Admins read it only through GET /admin/visas and the
+    //    rerun route, so the agency and applicants can never see it. Do NOT add
+    //    a match, not even an admin one.
     //  - guidanceSources/{sourceId} and its snapshots/{contentHash}
     //    subcollection: the caseworker-guidance source registry and the
     //    metadata of its immutable text snapshots (issue #39). Admins read

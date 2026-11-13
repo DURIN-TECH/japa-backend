@@ -135,7 +135,7 @@ export function buildListingScreeningSystemPrompt(): string {
     ...LISTING_LANGUAGE_RULES.map((r) => `- ${r.ruleId}: ${r.description}`),
     "",
     "Rules:",
-    `- Return ONLY JSON: {"flags":[{"indicator":"<id>","field":"<field name>","quote":"<exact words>"}]}.`,
+    "- Return ONLY JSON: {\"flags\":[{\"indicator\":\"<id>\",\"field\":\"<field name>\",\"quote\":\"<exact words>\"}]}.",
     `- "field" is the field name shown before the text. "quote" must be copied EXACTLY, character for character, from that field, at most ${MAX_FLAG_QUOTE_CHARS} characters.`,
     `- Return at most ${MAX_FLAGS_PER_LISTING} flags. Return {"flags":[]} when nothing matches.`,
     "- Flag only wording that matches an indicator. Do not flag ordinary fees, ordinary requirements or ordinary advice.",
