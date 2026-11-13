@@ -10,6 +10,8 @@ import {
   INTENT_POLARITIES,
   RUBRIC_REVIEW_FIELDS,
   RUBRIC_REVIEW_STATUSES,
+  RUBRIC_ACTOR_KIND,
+  RUBRIC_SYSTEM_ACTOR_ID,
   type AssessmentCriterion,
   type EvidenceItem,
   type IntentPolarity,
@@ -17,6 +19,7 @@ import {
   type RubricCitation,
   type RubricFlag,
   type RubricHead,
+  type RubricReviewActor,
   type RubricReviewStatus,
   type VisaRubric,
 } from "../types/rubric";
@@ -80,6 +83,20 @@ import { diffRubricVersions, type ChangedCriterion, type IntentPolarityDiff, typ
 // in the request, always. It is never copied from the extractor's proposal:
 // the admin may send the same value (accept) or another (override), and the
 // audit entry records which.
+//
+// ---- Who may decide (issue #201) ----
+//
+// The approve (and the reject) branch takes an ACTOR: `{ kind: ADMIN, uid }`
+// from the verified token, or `{ kind: SYSTEM, id: RUBRIC_SYSTEM_ACTOR_ID }`
+// for the automatic publisher (services/rubric-auto-publish.service.ts). There
+// is ONE approval transaction and ONE validator for both: every invariant
+// above (newest version only, sources unchanged, stale citations, structural
+// check, bars never excluded, pending only, flags acknowledged, primary
+// exclusions confirmed) applies to the machine exactly as to a person. The
+// system actor differs only in what it writes: `reviewedBy` / audit `by` is the
+// system id, and the audit entry carries `automatic: true` and `publishRunId`.
+// An admin whose uid equals the system id is refused, so the id can never be
+// claimed by a person.
 //
 // ---- Concurrency ----
 //
@@ -707,8 +724,13 @@ export interface RubricDecisionResult {
 export interface RubricReviewAuditEntry {
   id: string;
   at: Timestamp;
-  // uid of the admin who decided.
+  // uid of the admin who decided, or RUBRIC_SYSTEM_ACTOR_ID (#201).
   by: string;
+  // (#201) Present and true ONLY on a decision by the automatic publisher;
+  // absent on an admin's, so an admin entry is unchanged in shape.
+  automatic?: boolean;
+  // (#201) The run record (`rubricPublishRuns/{routeKey}__v{version}`) behind an automatic decision.
+  publishRunId?: string;
   action: "approve" | "reject";
   routeKey: string;
   countryCode: string;
@@ -942,11 +964,11 @@ function citationBlockers(citations: CitationCheck): ApprovalBlocker[] {
  * with `polarity`. Shared by the detail (so `canApprove` is false exactly
  * when `decide` would answer RUBRIC_INVALID) and by `decide`.
  */
-function structuralErrors(
+export function structuralErrors(
   rubric: VisaRubric,
   polarity: IntentPolarity,
   knownEligibilityQuestionIds: ReadonlySet<string> | undefined,
-  adminSet: Pick<VisaRubric, "outcomeStatistics" | "evidenceHelpsCriterionIds" | "excludedCriterionIds" | "exclusionNote"> = {}
+  adminSet: Partial<Pick<VisaRubric, (typeof RUBRIC_REVIEW_FIELDS)[number]>> = {}
 ): RubricIssue[] {
   // The admin-set fields of the request, as they would be stored.
   // The validator refuses an "approved" rubric with no reviewer (it is how the
@@ -964,6 +986,35 @@ function structuralErrors(
     reviewedAt: rubric.reviewedAt ?? Timestamp.now(),
   };
   return validateVisaRubric(candidate, { knownEligibilityQuestionIds }).errors;
+}
+
+/**
+ * What only the automatic publisher may pass to `decideAs` (issue #201).
+ */
+export interface SystemDecisionExtras {
+  // `rubricPublishRuns/{routeKey}__v{version}`: written to the audit entry.
+  publishRunId?: string;
+  // Review fields the question planner (part C, #203) adds to the version
+  // (e.g. `questionPlan`). Only keys in PLANNER_WRITABLE_FIELDS are accepted.
+  extraReviewFields?: Record<string, unknown>;
+}
+
+/**
+ * The review fields the question planner may set on a version through the
+ * automatic path. EMPTY in part A: part C adds `"questionPlan"` here (and to
+ * RUBRIC_REVIEW_FIELDS, `reviewFieldsUpdate` and the validator). Everything
+ * else a decision writes (status, polarity, reviewer, exclusions, ...) is set
+ * by this file only and can never come from a caller.
+ */
+export const PLANNER_WRITABLE_FIELDS: readonly string[] = [];
+
+/** Validate the planner's fields against the allow-list; a key outside it throws (never silently dropped). */
+function plannerReviewFields(raw: Record<string, unknown> | undefined): Partial<Pick<VisaRubric, (typeof RUBRIC_REVIEW_FIELDS)[number]>> {
+  if (!raw) return {};
+  for (const key of Object.keys(raw)) {
+    if (!PLANNER_WRITABLE_FIELDS.includes(key)) throw new Error(`rubric review: the planner may not write "${key}" on a version`);
+  }
+  return raw as Partial<Pick<VisaRubric, (typeof RUBRIC_REVIEW_FIELDS)[number]>>;
 }
 
 export class RubricReviewService {
@@ -1312,7 +1363,7 @@ export class RubricReviewService {
    * refused (fail closed). Storage-independent, so `decide` calls it BEFORE
    * its transaction and passes the result in.
    */
-  private async knownEligibilityIds(rubric: VisaRubric): Promise<ReadonlySet<string> | undefined> {
+  async knownEligibilityIds(rubric: VisaRubric): Promise<ReadonlySet<string> | undefined> {
     const criteria = Array.isArray(rubric.criteria) ? rubric.criteria : [];
     if (!criteria.some((c) => c?.eligibilityQuestionId !== undefined)) return undefined;
     try {
@@ -1391,7 +1442,9 @@ export class RubricReviewService {
   // ---------- Decide ----------
 
   /**
-   * Approve or reject a whole version. See the file header for the rules.
+   * Approve or reject a whole version as an ADMIN. See the file header for the
+   * rules. A thin wrapper over `decideAs`, so the admin path and the automatic
+   * path share one implementation.
    *
    * @param id          API id of the version (`{routeKey}__v{version}`)
    * @param input       a parsed decision (`parseRubricDecision`)
@@ -1400,10 +1453,34 @@ export class RubricReviewService {
    *   written when it throws.
    */
   async decide(id: string, input: RubricDecisionInput, reviewerUid: string): Promise<RubricDecisionResult> {
+    return this.decideAs(id, input, { kind: RUBRIC_ACTOR_KIND.ADMIN, uid: reviewerUid });
+  }
+
+  /**
+   * The ONE decision implementation (issue #201). `decide` calls it with an
+   * admin; the automatic publisher calls it with the system actor and the
+   * `extras` below. Same transaction, same validator, same error codes.
+   *
+   * @param extras only for the system actor: the run record's id (written to
+   *   the audit entry), and review fields the question planner (part C) adds to
+   *   the version. The planner's fields are limited to `PLANNER_WRITABLE_FIELDS`
+   *   (empty today) and still go through `reviewFieldsUpdate`.
+   */
+  async decideAs(id: string, input: RubricDecisionInput, actor: RubricReviewActor, extras: SystemDecisionExtras = {}): Promise<RubricDecisionResult> {
     const parsed = parseRubricVersionId(id);
     if (!parsed) throw notFound();
+    // The id written as `reviewedBy` / audit `by`.
+    const reviewerUid = actor.kind === RUBRIC_ACTOR_KIND.ADMIN ? actor.uid : actor.id;
     if (!reviewerUid) throw new Error("rubric review: a decision needs the reviewer's uid");
+    // A person can never act as the system: refuse its id as an admin uid.
+    if (actor.kind === RUBRIC_ACTOR_KIND.ADMIN && actor.uid === RUBRIC_SYSTEM_ACTOR_ID) throw new Error("rubric review: that uid is reserved for the automatic publisher");
+    if (actor.kind === RUBRIC_ACTOR_KIND.SYSTEM && actor.id !== RUBRIC_SYSTEM_ACTOR_ID) throw new Error("rubric review: unknown system actor");
+    if (actor.kind !== RUBRIC_ACTOR_KIND.SYSTEM && (extras.publishRunId !== undefined || extras.extraReviewFields !== undefined)) throw new Error("rubric review: automatic-publish extras need the system actor");
     const { routeKey, version } = parsed;
+    // (#201) What an automatic decision adds to its audit entry.
+    const automaticMarks = actor.kind === RUBRIC_ACTOR_KIND.SYSTEM ? { automatic: true as const, ...(extras.publishRunId ? { publishRunId: extras.publishRunId } : {}) } : {};
+    // (#201) Review fields the planner adds (system only); validated by reviewFieldsUpdate and the allow-list.
+    const plannerFields = actor.kind === RUBRIC_ACTOR_KIND.SYSTEM ? plannerReviewFields(extras.extraReviewFields) : {};
 
     // ---- Before the transaction: the stale-citation check (Storage reads
     // cannot run inside a Firestore transaction). Approve only. The version
@@ -1457,6 +1534,7 @@ export class RubricReviewService {
         id: auditRef.id,
         at: now,
         by: reviewerUid,
+        ...automaticMarks,
         routeKey,
         countryCode: rubric.countryCode,
         visaTypeId: rubric.visaTypeId,
@@ -1550,7 +1628,7 @@ export class RubricReviewService {
       }
 
       // ---- the rubric exactly as it would be approved ----
-      const errors = structuralErrors({ ...rubric, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter }, input.intentPolarity, knownEligibilityIds, adminSetOf(input));
+      const errors = structuralErrors({ ...rubric, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter }, input.intentPolarity, knownEligibilityIds, { ...adminSetOf(input), ...plannerFields });
       if (errors.length > 0) {
         const codes = [...new Set(errors.map((e) => e.code))].join(", ");
         throw conflict("RUBRIC_INVALID", `This rubric version is not internally consistent and cannot be approved (${codes}). Reject it and re-extract.`);
@@ -1576,7 +1654,7 @@ export class RubricReviewService {
       // ======== WRITES ========
       // 1. The version: review fields only.
       //    The admin-set fields go in the same write, only when sent.
-      tx.update(versionRef, reviewFieldsUpdate({ reviewStatus: "approved", intentPolarity: input.intentPolarity, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter, ...adminSetOf(input) }));
+      tx.update(versionRef, reviewFieldsUpdate({ reviewStatus: "approved", intentPolarity: input.intentPolarity, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter, ...adminSetOf(input), ...plannerFields }));
       // 2. The version it replaces: marked superseded (it stays `approved`
       //    as a record, but the head no longer points at it).
       if (supersededRef && supersededSnap?.exists) {

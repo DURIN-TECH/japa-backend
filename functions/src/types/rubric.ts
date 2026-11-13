@@ -22,6 +22,8 @@ import type { Timestamp } from "firebase-admin/firestore";
 //   visaRubrics/{countryCode}_{visaTypeId}                    RubricHead
 //   visaRubrics/{routeKey}/rubricVersions/{version}           VisaRubric
 //   rubricExtractionRuns/{runId}                              RubricExtractionRun
+//   rubricPublishRuns/{routeKey}__v{version}                  RubricPublishRun (#201)
+//   rubricPublishSettingsHistory/{auto id}                    settings change audit (#201)
 //
 // A head doc plus a versions subcollection, so an APPROVED version can keep
 // serving while a newer PENDING one waits for review (#125 needs both at
@@ -74,8 +76,10 @@ export type DecisionStage = (typeof DECISION_STAGES)[number];
 
 /**
  * Review state of one rubric VERSION. Extraction only ever writes
- * `pending_review`; only a human review (#125) moves a version on. Nothing is
- * autopublished.
+ * `pending_review`. A version moves on through the ONE approval transaction
+ * (rubric-review.service.ts), run either by an admin (#125) or, when
+ * `appConfig/rubricPublishSettings.mode` is `auto`, by the named system actor
+ * after the automatic gates pass (#201). Extraction itself never publishes.
  */
 export const RUBRIC_REVIEW_STATUSES = ["pending_review", "approved", "rejected"] as const;
 export type RubricReviewStatus = (typeof RUBRIC_REVIEW_STATUSES)[number];
@@ -568,6 +572,103 @@ export const RUBRIC_REVIEW_FIELDS = [
   "excludedCriterionIds",
   "exclusionNote",
 ] as const;
+
+// ============================================
+// Automatic publishing (issue #201, part of #200)
+// ============================================
+
+/**
+ * The NAMED system actor that publishes (and supersedes) rubric versions
+ * without a person. It is written as `reviewedBy` on the version and as `by`
+ * on the audit entry, so every place that shows or checks a reviewer can tell
+ * a machine decision from an admin's.
+ *
+ * Why this exact shape: the structural validator only needs `reviewedBy` to be
+ * a non-empty string, and the two audit consumers (bulk re-assessment, rule-
+ * change alerts) copy `entry.by` into their records without looking it up as a
+ * user. A fixed, namespaced constant (never a uid a client could send: every
+ * `reviewedBy` is written by the server from the verified token or from this
+ * constant) is therefore enough. The review service additionally REFUSES an
+ * admin whose uid equals it, so the value can never be claimed by a person.
+ */
+export const RUBRIC_SYSTEM_ACTOR_ID = "system:rubric-auto-publish" as const;
+
+/** True when a `reviewedBy` / audit `by` value is the automatic publisher. */
+export function isRubricSystemActor(id: unknown): boolean {
+  return id === RUBRIC_SYSTEM_ACTOR_ID;
+}
+
+/**
+ * The two kinds of decider. Named constants, so the review code never writes
+ * the role word as a string literal (its test refuses that).
+ */
+export const RUBRIC_ACTOR_KIND = { ADMIN: "admin", SYSTEM: "system" } as const;
+
+/** Who is deciding: an admin (verified uid) or the automatic publisher. */
+export type RubricReviewActor = { kind: typeof RUBRIC_ACTOR_KIND.ADMIN; uid: string } | { kind: typeof RUBRIC_ACTOR_KIND.SYSTEM; id: typeof RUBRIC_SYSTEM_ACTOR_ID };
+
+/** How a publish run ended. `skipped`: refused before any gate ran (kill switch, allowlist, already decided). */
+export const RUBRIC_PUBLISH_OUTCOMES = ["published", "held", "skipped"] as const;
+export type RubricPublishOutcome = (typeof RUBRIC_PUBLISH_OUTCOMES)[number];
+
+/** What started a run. */
+export type RubricPublishTrigger = "version_created" | "admin_endpoint" | "script";
+
+/** One gate's verdict, as recorded on the run. `detail` is code-written (ids, counts), never model or source text. */
+export interface RubricPublishGateResult {
+  gate: string;
+  passed: boolean;
+  detail?: string;
+}
+
+/** One rule the run left out of the served rulebook, and why (a flag code, or `checker:<aspect>`). */
+export interface RubricPublishLeftOut {
+  criterionId: string;
+  reason: string;
+  // The extraction flag that caused it; null for a checker leave-out (part B).
+  flagCode: string | null;
+}
+
+/**
+ * `rubricPublishRuns/{routeKey}__v{version}`: the record of the automatic
+ * publish run of ONE version (backend-only: no firestore.rules match). The id
+ * is deterministic, so a re-delivered trigger finds the record and does not run
+ * (or publish) twice; it is written with `create()`.
+ */
+export interface RubricPublishRun {
+  runId: string;
+  routeKey: string;
+  countryCode: string;
+  visaTypeId: string;
+  version: number;
+  outcome: RubricPublishOutcome;
+  // Machine-readable reasons for a hold / skip (empty when published).
+  reasonCodes: string[];
+  gates: RubricPublishGateResult[];
+  counts: {
+    rules: number;
+    kept: number;
+    leftOut: number;
+    leftOutByReason: Record<string, number>;
+    // Rules that made the draft HOLD (a protected rule that failed a gate).
+    held: number;
+    informationalFlags: Record<string, number>;
+  };
+  leftOut: RubricPublishLeftOut[];
+  // The mode the run saw (`manual` when settings were missing or unreadable).
+  mode: "manual" | "auto";
+  trigger: RubricPublishTrigger;
+  // 1 for the first run; an admin or script re-run of a held version adds one.
+  attempts: number;
+  // The independent check and the question plan (parts B and C): what happened.
+  checker: "not_configured" | "not_run" | "passed" | "failed";
+  questionPlan: "not_configured" | "not_run" | "built" | "failed";
+  // Set when published: the audit entry and the version it replaced.
+  auditId: string | null;
+  previousApprovedVersion: number | null;
+  startedAt: Timestamp;
+  finishedAt: Timestamp;
+}
 
 /**
  * `visaRubrics/{countryCode}_{visaTypeId}`: the head of one route's rubric.

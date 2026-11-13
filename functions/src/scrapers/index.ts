@@ -93,6 +93,28 @@ export type { ExclusionPreview } from "./rubric/rubric-exclusions";
 export type { RubricIssue } from "./rubric/rubric-validate";
 /** Verbatim-quote lookup in a stored snapshot (the review API's stale-citation check). */
 export { SnapshotQuoteIndex } from "./rubric/rubric-quote";
+// ---- Automatic rubric publishing (issue #201) ----
+/** Publish settings + kill switch (`appConfig/rubricPublishSettings`), the admin edit, and the allowlist check. */
+export {
+  loadPublishSettings,
+  readPublishSettingsView,
+  updatePublishSettings,
+  parsePublishSettingsPatch,
+  routeAllowed,
+  resolvePublishSettings,
+  publishSettingsTx,
+  PublishSettingsValidationError,
+  DEFAULT_PUBLISH_SETTINGS,
+  PUBLISH_SETTINGS_DOC_ID,
+} from "./rubric/rubric-publish-settings";
+export type { RubricPublishSettings, LoadedPublishSettings, PublishSettingsView, PublishSettingsPatch } from "./rubric/rubric-publish-settings";
+/** The pure code gates, the sample audit and the reason wording. */
+export { evaluateGates, acknowledgementsFor, buildExclusionNote, sampleAudit, reasonInWords, isProtectedRule, SAMPLE_AUDIT_SIZE } from "./rubric/rubric-gates";
+export type { GateInput, GateReport, GateFlag, GateCheckerResult, FlagResolution, SampleAuditRule } from "./rubric/rubric-gates";
+export type { ScrapeAlertsConfig } from "./shared/alerts/types";
+/** The two rubric alert rules, raised by the publish pipeline (`scrapeAlertService.raise`). */
+export { evaluateRubricAutoPublished, evaluateRubricDraftHeld, evaluateRubricHeldCleared } from "./shared/alerts/scrape-alert-rules";
+export type { RubricPublishAlertFacts, RubricAlertRule, RuleEvaluation } from "./shared/alerts/scrape-alert-rules";
 /** Rubric types for consumers (the assessment engine, #42). Type-only. */
 export type {
   AssessmentCriterion,

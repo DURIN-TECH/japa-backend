@@ -232,6 +232,15 @@ export const collections = {
   // so a decision never exists without its record. Append-only.
   // Backend-only: no firestore.rules match -> clients denied.
   rubricReviewHistory: db.collection("rubricReviewHistory"),
+  // Automatic rubric publishing (issue #201). BACKEND-ONLY (no firestore.rules
+  // match, so clients are denied):
+  //  - rubricPublishRuns/{routeKey}__v{version}: one record per version's
+  //    automatic publish run (outcome, gates, leave-outs); created once with
+  //    `create()`, so a re-delivered trigger cannot run a version twice;
+  //  - rubricPublishSettingsHistory/{auto}: who changed
+  //    appConfig/rubricPublishSettings, with before and after.
+  rubricPublishRuns: db.collection("rubricPublishRuns"),
+  rubricPublishSettingsHistory: db.collection("rubricPublishSettingsHistory"),
   // The AI case-officer assessment (issue #42): one document per assessment,
   // which is also its job record. The id is derived from the application id and
   // the input hash, so the same inputs address the same document. Backend-only:

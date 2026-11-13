@@ -77,7 +77,14 @@ export const SCRAPE_ALERT_STATUSES: readonly ScrapeAlertStatus[] = ["open", "ack
  *  - infrastructure_error (issue #143): a guidance run could not store its
  *    results (`summary.infrastructureErrors` non-empty: Cloud Storage or
  *    Firestore failed on OUR side). One alert per scraper, bumped by each
- *    run with the problem, resolved by the next run without it.
+ *    run with the problem, resolved by the next run without it;
+ *  - rubric_auto_published (issue #201): a rulebook version went live with no
+ *    person approving it (informational record, one alert per version, never
+ *    auto-resolved: an admin acknowledges it after the spot check);
+ *  - rubric_draft_held (issue #201): a draft failed an automatic gate (or the
+ *    pipeline errored) and was NOT published; the serving version keeps
+ *    serving. One alert per route + version; auto-resolves when a later version
+ *    publishes or the held version is rejected or approved.
  */
 export type ScrapeAlertRule =
   | "run_failed"
@@ -93,7 +100,9 @@ export type ScrapeAlertRule =
   | "budget_hard_stop"
   | "source_no_yield"
   | "settings_unreadable"
-  | "infrastructure_error";
+  | "infrastructure_error"
+  | "rubric_auto_published"
+  | "rubric_draft_held";
 
 /** Every rule id (config validation, docs). */
 export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
@@ -111,6 +120,8 @@ export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
   "source_no_yield",
   "settings_unreadable",
   "infrastructure_error",
+  "rubric_auto_published",
+  "rubric_draft_held",
 ];
 
 /**
@@ -122,9 +133,10 @@ export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
  *  - host: a hostname (host_backoff);
  *  - fx: the appConfig/fx rate doc (id "fx");
  *  - budget: a month, id = "YYYY-MM" (UTC);
- *  - review_queue: the visa review queue (id "visa").
+ *  - review_queue: the visa review queue (id "visa");
+ *  - rubric_route: one route's rulebook (id = the route key, #201).
  */
-export type ScrapeAlertSubjectType = "scraper" | "run" | "source" | "host" | "fx" | "budget" | "review_queue";
+export type ScrapeAlertSubjectType = "scraper" | "run" | "source" | "host" | "fx" | "budget" | "review_queue" | "rubric_route";
 
 /** The alert's subject: what to link to and how to name it. */
 export interface ScrapeAlertSubject {

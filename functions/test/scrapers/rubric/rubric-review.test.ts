@@ -277,14 +277,17 @@ describe("rubric review: admin only", () => {
     assert.equal(out.body.data.total, 1);
   });
 
-  test("exactly four routes exist (one read-only preview), each behind verifyAuth, the admin guard and verifyAdmin: no partial approval endpoint", () => {
+  test("exactly these routes exist (a read-only preview, and #201's settings and auto-publish routes), each behind verifyAuth, the admin guard and verifyAdmin: no partial approval endpoint", () => {
     const routes = (adminRubricRoutes as any).stack.filter((l: any) => l.route).map((l: any) => ({
       path: l.route.path,
       methods: Object.keys(l.route.methods),
       chain: l.route.stack.slice(0, 3).map((s: any) => s.handle),
     }));
     // #161 added one READ-ONLY route (the exclusion preview). Still no route that approves part of a version.
-    assert.deepEqual(routes.map((r: any) => `${r.methods.join(",")} ${r.path}`), ["get /", "get /:id", "post /:id/exclusion-preview", "patch /:id/review"]);
+    // #201 (EXPLICIT extension of this list) added three admin routes: the
+    // publish settings (GET, PATCH; registered before `/:id`) and the run of the
+    // automatic pipeline on a pending draft. Still no route that approves part of a version.
+    assert.deepEqual(routes.map((r: any) => `${r.methods.join(",")} ${r.path}`), ["get /publish-settings", "patch /publish-settings", "get /", "get /:id", "post /:id/exclusion-preview", "post /:id/auto-publish", "patch /:id/review"]);
     for (const r of routes) assert.deepEqual(r.chain, [verifyAuth, requireRubricAdmin, verifyAdmin], r.path);
   });
 });
@@ -1316,10 +1319,13 @@ describe("rubric review: nothing unapproved is served", () => {
     // entry an approval writes. Those are allowed to name it; the containment
     // property is checked on the next assertion, which keeps the VERSION readers
     // (any-status versions, the collection group) to the original three files.
+    // #201 (EXPLICIT extension): the automatic publisher reads the version it
+    // publishes and the serving one through getVersionForReview. Backend-only; no route reaches it except the admin one.
     assert.deepEqual(users, [
       "index.ts",
       path.join("scrapers", "rubric", "rubric.store.ts"),
       path.join("services", "ai-bulk-reassessment.service.ts"),
+      path.join("services", "rubric-auto-publish.service.ts"),
       path.join("services", "rubric-review.service.ts"),
       path.join("services", "rule-change-alerts.service.ts"),
       path.join("types", "bulk-reassessment.ts"),
@@ -1337,6 +1343,7 @@ describe("rubric review: nothing unapproved is served", () => {
     assert.deepEqual(versionReaders, [
       path.join("scrapers", "rubric", "rubric.store.ts"),
       path.join("services", "ai-bulk-reassessment.service.ts"),
+      path.join("services", "rubric-auto-publish.service.ts"),
       path.join("services", "rubric-review.service.ts"),
       path.join("services", "rule-change-alerts.service.ts"),
     ]);
@@ -1347,7 +1354,10 @@ describe("rubric review: nothing unapproved is served", () => {
       .filter((f) => /^import (?!type\b)[^;]*rubric-review\.(service|controller|routes)"/m.test(fs.readFileSync(f, "utf8")))
       .map((f) => path.relative(src, f))
       .sort();
-    assert.deepEqual(importers, ["app.ts", path.join("controllers", "rubric-review.controller.ts"), path.join("routes", "rubric-review.routes.ts")]);
+    // #201 (EXPLICIT extension): the automatic publisher is the one other
+    // caller of the review service: it publishes through `decideAs`, the same
+    // approval transaction an admin uses.
+    assert.deepEqual(importers, ["app.ts", path.join("controllers", "rubric-review.controller.ts"), path.join("routes", "rubric-review.routes.ts"), path.join("services", "rubric-auto-publish.service.ts")]);
     const app = fs.readFileSync(path.join(src, "app.ts"), "utf8");
     assert.deepEqual([...app.matchAll(/app\.use\("([^"]*)",\s*adminRubricRoutes\)/g)].map((m) => m[1]), ["/admin/rubrics"]);
     // The collections have no client rules.

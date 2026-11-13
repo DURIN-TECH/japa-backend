@@ -118,6 +118,12 @@ export const DEFAULT_SEVERITY: Record<ScrapeAlertRule, ScrapeAlertSeverity> = {
   // new rule text is not being kept. Admins can turn it off or change its
   // severity in appConfig/scrapeAlerts like every other rule.
   infrastructure_error: "critical",
+  // Issue #201: a rulebook went live with no person approving it. Worth an
+  // immediate look (the default email threshold is "warning"), not an outage.
+  rubric_auto_published: "warning",
+  // Issue #201: a draft was held. Warning by default; the rule raises it to
+  // critical itself for a protected-rule hold or unreadable publish settings.
+  rubric_draft_held: "warning",
 };
 
 /** Issue #96: most extra alert recipient addresses (extraRecipientEmails). */
@@ -1079,5 +1085,196 @@ export function evaluateReviewQueue(items: ReviewQueueItem[], nowMs: number, con
         details: { staleItems: stale.length, scrapedVisas: visas, proposedChanges: changes, oldestDays, maxAgeDays: config.thresholds.reviewQueueMaxAgeDays },
       },
     ],
+  };
+}
+
+// ============================================
+// RUBRIC AUTOMATIC PUBLISHING (issue #201)
+// ============================================
+//
+// Two rules, both RAISED BY THE PUBLISH PIPELINE (services/rubric-auto-publish
+// .service.ts) rather than found by a scan: it hands the facts of one run to
+// the evaluators below and the alert engine upserts / resolves as for every
+// other rule (dedupe key, count, severity override in appConfig/scrapeAlerts,
+// immediate email at or above the configured severity).
+//
+//   rubric_auto_published   key `rubric_auto_published:<routeKey>__v<n>`
+//       One alert per automatic publish: what went live, the counts, the
+//       primary-source rules left out (by title and reference), informational
+//       flags, the 10-rule sample audit and a link to the version. Never
+//       auto-resolved (an admin acknowledges it after looking).
+//   rubric_draft_held       key `rubric_draft_held:<routeKey>__v<n>`
+//       One alert per held draft: reasons in words and the same link. Its
+//       severity is critical for a protected-rule hold and for unreadable
+//       publish settings. Resolved when a later version publishes (every held
+//       alert of the route) or when the held version is rejected / approved.
+//
+// The facts carry text the pipeline built from stored rules (titles, quotes,
+// references: published guidance) and code-written reasons. No model output.
+
+/** Longest quote shown per rule of the sample audit. */
+const SAMPLE_QUOTE_MAX = 240;
+/** Longest alert message. The email shows the message, so the sample audit lives in it. */
+const RUBRIC_ALERT_MESSAGE_MAX = 6000;
+/** Most primary-source leave-outs listed by name (the count is always shown). */
+const MAX_LISTED_PRIMARY_LEAVE_OUTS = 20;
+
+/** One rule shown in an alert. */
+export interface RubricAlertRule {
+  title: string;
+  ruleRef: string | null;
+  quote?: string;
+  url?: string;
+}
+
+/** The facts of one publish run an alert is built from. */
+export interface RubricPublishAlertFacts {
+  routeKey: string;
+  version: number;
+  previousVersion: number | null;
+  // Link to the version in the admin Rubrics tab (APP_URL based).
+  link: string;
+  rules: number;
+  kept: number;
+  leftOutByReason: Record<string, number>;
+  // Rules that made the draft hold.
+  held: number;
+  primaryLeftOut: RubricAlertRule[];
+  informationalFlags: Record<string, number>;
+  sample: RubricAlertRule[];
+  // Hold reasons in words (held only).
+  reasons: string[];
+  // Critical when true (a protected rule failed a gate).
+  protectedHold: boolean;
+  // Critical when true (the publish settings could not be read).
+  settingsUnreadable: boolean;
+  // Distinguishes a re-run of the same version from a re-delivery of one run.
+  attempt: number;
+}
+
+/** `route key + version`, the id shown in the link and used in dedupe keys. */
+const rubricVersionKey = (routeKey: string, version: number) => `${routeKey}__v${version}`;
+
+/** Dedupe key of a version's held alert. */
+export const rubricHeldKey = (routeKey: string, version: number) => `rubric_draft_held:${rubricVersionKey(routeKey, version)}`;
+/** Prefix of every held alert of a route (all versions). */
+export const rubricHeldRoutePrefix = (routeKey: string) => `rubric_draft_held:${routeKey}__v`;
+
+/** The alert subject of a route's rulebook. */
+function rubricSubject(routeKey: string): ScrapeAlertSubject {
+  return { type: "rubric_route", id: routeKey, label: `${routeKey} rulebook` };
+}
+
+/** "3 quote_starts_mid_sentence, 1 possible_duplicate" (or "none"). */
+function countsLine(by: Record<string, number>): string {
+  const parts = Object.entries(by).sort(([a], [b]) => a.localeCompare(b)).map(([k, n]) => `${n} ${k}`);
+  return parts.length > 0 ? parts.join(", ") : "none";
+}
+
+/** Clip a string to `max` characters with an ellipsis. */
+const clipText = (v: string, max: number) => (v.length > max ? `${v.slice(0, max - 1)}\u2026` : v);
+
+/**
+ * rubric_auto_published: raised once per automatic publish. The message is the
+ * whole report (counts, primary-source leave-outs, informational flags, the
+ * sample audit, the link): the alert email shows the message as it is.
+ */
+export function evaluateRubricAutoPublished(facts: RubricPublishAlertFacts, config: ScrapeAlertsConfig): RuleEvaluation {
+  const key = `rubric_auto_published:${rubricVersionKey(facts.routeKey, facts.version)}`;
+  const leftOut = Object.values(facts.leftOutByReason).reduce((a, b) => a + b, 0);
+  const lines: string[] = [
+    `Published ${facts.routeKey} version ${facts.version}${facts.previousVersion !== null ? ` (replacing version ${facts.previousVersion})` : " (first rulebook for this route)"} with no person approving it.`,
+    `Rules: ${facts.kept} kept, ${leftOut} left out (${countsLine(facts.leftOutByReason)}), ${facts.held} held, of ${facts.rules}.`,
+  ];
+  if (facts.primaryLeftOut.length > 0) {
+    lines.push(
+      `Left out from the main official source (${facts.primaryLeftOut.length}): ` +
+        facts.primaryLeftOut.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((r) => `${r.title}${r.ruleRef ? ` [${r.ruleRef}]` : ""}`).join("; ") +
+        (facts.primaryLeftOut.length > MAX_LISTED_PRIMARY_LEAVE_OUTS ? "; ..." : "")
+    );
+  }
+  lines.push(`Informational remarks: ${countsLine(facts.informationalFlags)}.`);
+  if (facts.sample.length > 0) {
+    lines.push("Spot-check these rules against their quotes:");
+    facts.sample.forEach((r, i) => lines.push(`${i + 1}. ${r.title}${r.ruleRef ? ` [${r.ruleRef}]` : ""}: "${clipText(r.quote ?? "", SAMPLE_QUOTE_MAX)}" ${r.url ?? ""}`.trim()));
+  }
+  lines.push(`Open it: ${facts.link}`);
+  return {
+    rule: "rubric_auto_published",
+    // A published alert is a record, never "cleared" by a later check.
+    scope: { keys: [] },
+    signals: [
+      {
+        rule: "rubric_auto_published",
+        key,
+        severity: ruleSeverity(config, "rubric_auto_published"),
+        kind: null,
+        subject: rubricSubject(facts.routeKey),
+        message: clipText(lines.join("\n"), RUBRIC_ALERT_MESSAGE_MAX),
+        details: {
+          routeKey: facts.routeKey,
+          version: facts.version,
+          previousVersion: facts.previousVersion,
+          kept: facts.kept,
+          leftOut,
+          held: facts.held,
+          rules: facts.rules,
+          primaryLeftOut: facts.primaryLeftOut.length,
+          link: facts.link,
+        },
+        eventId: `v${facts.version}:a${facts.attempt}`,
+      },
+    ],
+  };
+}
+
+/**
+ * rubric_draft_held: raised once per held draft (a re-run of the same version
+ * bumps it). Critical for a protected-rule hold and for unreadable publish
+ * settings, unless an admin overrides the severity in appConfig/scrapeAlerts.
+ */
+export function evaluateRubricDraftHeld(facts: RubricPublishAlertFacts, config: ScrapeAlertsConfig): RuleEvaluation {
+  const key = rubricHeldKey(facts.routeKey, facts.version);
+  const critical = facts.protectedHold || facts.settingsUnreadable;
+  // An admin's override of the rule's severity wins; otherwise critical for the two special cases.
+  const severity: ScrapeAlertSeverity = config.rules.rubric_draft_held?.severity ?? (critical ? "critical" : DEFAULT_SEVERITY.rubric_draft_held);
+  const lines: string[] = [
+    `Held ${facts.routeKey} version ${facts.version}: it was NOT published${facts.previousVersion !== null ? `, version ${facts.previousVersion} keeps serving` : ", the route stays unavailable"}.`,
+    `Why: ${facts.reasons.length > 0 ? facts.reasons.join("; ") : "see the run record"}.`,
+    `Rules: ${facts.kept} would be kept, ${Object.values(facts.leftOutByReason).reduce((a, b) => a + b, 0)} left out (${countsLine(facts.leftOutByReason)}), ${facts.held} held, of ${facts.rules}.`,
+  ];
+  if (facts.primaryLeftOut.length > 0) {
+    lines.push(`Would leave out from the main official source: ${facts.primaryLeftOut.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((r) => `${r.title}${r.ruleRef ? ` [${r.ruleRef}]` : ""}`).join("; ")}.`);
+  }
+  lines.push(`Informational remarks: ${countsLine(facts.informationalFlags)}.`);
+  lines.push(`Look at it, run the check again or publish it by hand: ${facts.link}`);
+  return {
+    rule: "rubric_draft_held",
+    scope: { keys: [key] },
+    signals: [
+      {
+        rule: "rubric_draft_held",
+        key,
+        severity,
+        kind: null,
+        subject: rubricSubject(facts.routeKey),
+        message: clipText(lines.join("\n"), RUBRIC_ALERT_MESSAGE_MAX),
+        details: { routeKey: facts.routeKey, version: facts.version, reasons: facts.reasons.length, held: facts.held, rules: facts.rules, link: facts.link },
+        eventId: `v${facts.version}:a${facts.attempt}`,
+      },
+    ],
+  };
+}
+
+/**
+ * Resolve held alerts, with no signal: of ONE version (it was rejected or
+ * approved by hand), or of EVERY version of the route (a later version
+ * published: all of them are older).
+ */
+export function evaluateRubricHeldCleared(routeKey: string, version: number | null): RuleEvaluation {
+  return {
+    rule: "rubric_draft_held",
+    signals: [],
+    scope: version === null ? { keyPrefix: rubricHeldRoutePrefix(routeKey) } : { keys: [rubricHeldKey(routeKey, version)] },
   };
 }

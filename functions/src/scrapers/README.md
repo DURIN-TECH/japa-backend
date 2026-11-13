@@ -94,7 +94,13 @@ scrapers/
     rubric.store.ts                    visaRubrics head + rubricVersions; writes pending only;
                                        getApprovedRubric is the only consumer read
     rubric-settings.ts                 appConfig/rubricExtractionSettings: kill switch + caps
-    scripts/                           extract-rubric (CLI, dry run by default)
+    rubric-publish-settings.ts         appConfig/rubricPublishSettings: auto-publish mode (fails
+                                       closed to `manual`), allowlist, gate numbers (#201)
+    rubric-gates.ts                    PURE automatic gates: flag table, leave-outs, shrink guard,
+                                       leave-out budget, protected rules, sample audit (#201)
+    scripts/                           extract-rubric (CLI, dry run by default);
+                                       publish-rubric (#201: run the auto-publish pipeline on a
+                                       pending draft; --project required, --dry-run, --skip-checker)
 ```
 
 Tests mirror this layout under `functions/test/scrapers/`; shared test helpers
@@ -147,3 +153,48 @@ runs across a chunk or page boundary may be missing (`multiple_chunks`,
 `page_ends_mid_sentence`); the model can silently omit a rule, which nothing
 detects. Number words and month names are recognised in English only; anything
 else is not recognised and the criterion that relies on it is rejected.
+
+## Automatic rulebook publishing (`rubric-gates.ts`, `rubric-publish-settings.ts`; issue #201, umbrella #200)
+
+There is **no human sign-off** before a rulebook goes live when
+`appConfig/rubricPublishSettings.mode` is `auto`. A draft that passes the
+automatic safeguards is published by the named system actor
+`system:rubric-auto-publish`; a draft that fails is **held** (the serving
+version keeps serving, admins are alerted). Admins can still reject, roll back
+(part D) or publish a held draft by hand.
+
+- **Settings** (`appConfig/rubricPublishSettings`, fails closed): `mode`
+  (`manual` | `auto`, default and any fallback `manual`), `routeAllowlist`
+  (route keys; absent = all routes; a malformed list publishes nowhere),
+  `pauseAfterRollback` (true), `maxLeftOutShare` (0.15), `maxPrimaryLeftOutShare`
+  (0.20), `minKeptShareOfServing` (0.7). Edit the doc in the console or
+  `PATCH /admin/rubrics/publish-settings` (audited in `rubricPublishSettingsHistory`).
+  A missing or unreadable doc is `manual`; an unreadable one is recorded as
+  `settings_unreadable` and alerted (critical).
+- **Trigger**: `onRubricVersionCreated` (src/index.ts) on creation of a
+  `pending_review` version with an `extractionRunId`. One record per version,
+  `rubricPublishRuns/{routeKey}__v{n}`, written with `create()`: a re-delivered
+  trigger publishes nothing twice.
+- **Gates** (`rubric-gates.ts`, pure): structural validator; suspicious
+  passages; flags `no_criteria` / `intent_polarity_conflict` /
+  `intent_criteria_without_polarity` hold; an unknown flag code holds; shrink
+  guard; leave-out budget; the per-rule flags (`quote_starts_mid_sentence`,
+  `quote_ends_mid_sentence`, `combined_sub_conditions`,
+  `multiple_dates_in_quote`, `possible_duplicate` only when its partner is
+  kept) LEAVE THE RULE OUT through the existing `excludedCriterionIds`; the same
+  flag on a protected rule (a mandatory bar, or any rule with `appliesTo`)
+  holds. A rule is never edited or reworded.
+- **Plug-in points**: the independent AI check (part B) and the question plan
+  (part C) register on `rubricAutoPublishService` (`registerChecker` /
+  `registerPlanner`). Until they exist, `auto` holds every draft
+  (`checker_not_configured`, `question_plan_missing`).
+- **Publish** goes through the SAME approval transaction and validator as a
+  human approval (`RubricReviewService.decideAs`); the audit entry has
+  `action: "approve"`, `by: "system:rubric-auto-publish"`, `automatic: true`
+  and `publishRunId`, so `onRubricApproved` and `onRubricApprovedRecordAlert`
+  fire unchanged.
+- **Alerts** (`scrape-alerts.md`): `rubric_auto_published` and
+  `rubric_draft_held`, subject type `rubric_route`.
+- **Run on an existing draft**: `POST /admin/rubrics/:id/auto-publish`
+  (`?dryRun=true` writes nothing) or
+  `npm run publish:rubric -- --project <id> --route <routeKey> --version <n> [--dry-run] [--skip-checker]`.
