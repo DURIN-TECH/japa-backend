@@ -28,14 +28,20 @@ import type { ProviderResult, RateProvider } from "./types";
 export const OANDA_SPOT_URL = "https://exchange-rates-api.oanda.com/v2/rates/spot.json";
 
 /** Pure parse of the OANDA spot response (midpoint of the first quote). */
-export function parseOandaSpot(json: unknown): { rate: number; asOf: Date } | null {
+export function parseOandaSpot(json: unknown, requested: string): { rate: number; asOf: Date } | null {
   const quotes = (json as { quotes?: unknown } | null)?.quotes;
   if (!Array.isArray(quotes) || quotes.length === 0) return null;
   const q = quotes[0] as Record<string, unknown>;
+  // The pair returned must be the pair asked for (USD -> requested).
+  if (q.base_currency !== "USD" || q.quote_currency !== requested) return null;
   const rate = Number(q.midpoint);
   if (!Number.isFinite(rate) || rate <= 0) return null;
+  // A real timestamp is required: never fall back to "now", which would make
+  // an undated rate look fresh. (The service also applies the range, age and
+  // jump checks to every provider.)
   const time = typeof q.end_time === "string" ? new Date(q.end_time) : new Date(NaN);
-  return { rate, asOf: Number.isNaN(time.getTime()) ? new Date() : time };
+  if (Number.isNaN(time.getTime())) return null;
+  return { rate, asOf: time };
 }
 
 export class OandaRateProvider implements RateProvider {
@@ -77,7 +83,7 @@ export class OandaRateProvider implements RateProvider {
         headers: { Authorization: `Bearer ${key.trim()}` },
       });
       if (res.status !== 200) return { ok: false, reason: `OANDA answered ${res.status}` };
-      const parsed = parseOandaSpot(res.data);
+      const parsed = parseOandaSpot(res.data, currency);
       if (!parsed) return { ok: false, reason: "OANDA response had no usable rate" };
       return { ok: true, rate: parsed.rate, asOf: parsed.asOf };
     } catch (err) {

@@ -26,8 +26,21 @@ import type { RateAuditEntry, RateStore, StoredRate } from "./rate.types";
 const HOUR_MS = 60 * 60 * 1000;
 /** An override can last at most a week, however it is asked for. */
 const MAX_OVERRIDE_TTL_HOURS = 168;
+/** A rate dated this far ahead of our clock is refused (clock skew / bad upstream row). */
+const FUTURE_TOLERANCE_MS = 6 * HOUR_MS;
 const MIN_REASON = 5;
 const MAX_REASON = 500;
+
+/**
+ * True when `candidate` differs from `reference` by more than `percent`
+ * percent. Integer maths on the 6-decimal scaled rates (no float compare).
+ */
+export function exceedsBand(candidate: number, reference: number, percent: number): boolean {
+  const c = scaleRate(candidate);
+  const r = scaleRate(reference);
+  const diff = c > r ? c - r : r - c;
+  return diff * 100_000n > r * BigInt(Math.round(percent * 1000));
+}
 
 export interface RateServiceDeps {
   config: ConfigStore;
@@ -95,7 +108,10 @@ export class RateService {
     // 2. Provider rate within the freshness limit.
     if (stored?.provider) {
       const ageMs = nowMs - stored.provider.fetchedAt.getTime();
-      if (ageMs <= config.freshnessHours * HOUR_MS) {
+      // The rate's OWN date must also be recent: re-reading an old row from a
+      // stuck upstream refreshes `fetchedAt` but never `asOf`.
+      const rateAgeMs = nowMs - stored.provider.asOf.getTime();
+      if (ageMs <= config.freshnessHours * HOUR_MS && rateAgeMs <= config.maxRateAgeHours * HOUR_MS) {
         return {
           currency,
           rate: stored.provider.rate,
@@ -106,7 +122,7 @@ export class RateService {
       }
       throw new MoneyError(
         "RATE_STALE",
-        `The ${currency} exchange rate is older than ${config.freshnessHours} hours`,
+        `The ${currency} exchange rate is out of date`,
         currency
       );
     }
@@ -129,7 +145,14 @@ export class RateService {
     const outcomes: RefreshOutcome[] = [];
     for (const [currency, entry] of Object.entries(config.currencies)) {
       if (!entry.enabled) continue;
-      outcomes.push(await this.refreshOne(currency, config));
+      // One currency failing (even a store error) must not stop the others.
+      try {
+        outcomes.push(await this.refreshOne(currency, config));
+      } catch (err) {
+        const reason = `refresh failed: ${err instanceof Error ? err.message.slice(0, 200) : "unknown error"}`;
+        console.error(`Exchange rate refresh ${currency}: ${reason}`);
+        outcomes.push({ currency, ok: false, reason });
+      }
     }
     return outcomes;
   }
@@ -137,6 +160,7 @@ export class RateService {
   /** Try each provider in order; save the first rate that passes validation. */
   private async refreshOne(currency: CurrencyCode, config: CurrenciesConfig): Promise<RefreshOutcome> {
     const reasons: string[] = [];
+    const stored = await this.deps.rates.get(currency);
     for (const provider of selectProviders(config, this.deps.providers)) {
       if (!provider.supports(currency)) {
         reasons.push(`${provider.id}: does not cover ${currency}`);
@@ -147,10 +171,11 @@ export class RateService {
         reasons.push(`${provider.id}: ${result.reason}`);
         continue;
       }
-      try {
-        scaleRate(result.rate); // positive, finite, bounded
-      } catch {
-        reasons.push(`${provider.id}: returned an invalid rate`);
+      const rejection = this.rejectProviderRate(result.rate, result.asOf, config.currencies[currency], config, stored);
+      if (rejection) {
+        // Loud on purpose: a rejected rate means the upstream looks wrong.
+        console.error(`Exchange rate ${currency}: ${provider.id} rate ${result.rate} rejected: ${rejection}`);
+        reasons.push(`${provider.id}: rejected (${rejection})`);
         continue;
       }
       await this.deps.rates.saveProvider(currency, {
@@ -162,8 +187,81 @@ export class RateService {
       return { currency, ok: true, source: provider.id, rate: result.rate };
     }
     const reason = reasons.join("; ").slice(0, 500) || "no provider available";
+    console.error(`Exchange rate ${currency}: refresh failed, keeping stored rate: ${reason}`);
     await this.deps.rates.saveError(currency, { at: this.now(), message: reason });
     return { currency, ok: false, reason };
+  }
+
+  /**
+   * Why a provider rate must NOT be stored, or null when it is acceptable.
+   * Applies to every provider. Checks, in order: valid number; its own date
+   * is not in the future and not older than `maxRateAgeHours` (so a stuck
+   * upstream is recorded as an error instead of re-stamped fresh); inside the
+   * currency's plausible range; and not a jump of more than
+   * `maxProviderJumpPercent` from the stored provider rate (when one exists).
+   * With nothing stored and no configured range there is nothing to judge a
+   * first rate by, so it is refused.
+   */
+  private rejectProviderRate(
+    rate: number,
+    asOf: Date,
+    entry: CurrenciesConfig["currencies"][string] | undefined,
+    config: CurrenciesConfig,
+    stored: StoredRate | null
+  ): string | null {
+    try {
+      scaleRate(rate);
+    } catch {
+      return "not a valid rate";
+    }
+    const nowMs = this.now().getTime();
+    if (!(asOf instanceof Date) || Number.isNaN(asOf.getTime())) return "no valid date";
+    if (asOf.getTime() > nowMs + FUTURE_TOLERANCE_MS) return "dated in the future";
+    if (nowMs - asOf.getTime() > config.maxRateAgeHours * HOUR_MS) {
+      return `dated more than ${config.maxRateAgeHours} hours ago`;
+    }
+    const hasRange = entry?.minRate !== undefined && entry?.maxRate !== undefined;
+    if (hasRange && (rate < (entry?.minRate as number) || rate > (entry?.maxRate as number))) {
+      return `outside the plausible range ${entry?.minRate}-${entry?.maxRate}`;
+    }
+    if (stored?.provider) {
+      if (exceedsBand(rate, stored.provider.rate, config.maxProviderJumpPercent)) {
+        return `more than ${config.maxProviderJumpPercent}% away from the stored rate ${stored.provider.rate}`;
+      }
+    } else if (!hasRange) {
+      return "no stored rate and no plausible range configured to judge it by";
+    }
+    return null;
+  }
+
+  /**
+   * Admin accepts a genuine large move: drops the stored provider rate (so
+   * the jump guard has no reference) and audits it. The next refresh, or an
+   * override in the meantime, then sets the new level; a first rate is still
+   * held to the plausible range. This is THE deliberate path for a real
+   * devaluation: the override band is relative to the same stale reference
+   * and cannot reach a big move.
+   */
+  async resetReference(currencyInput: string, reasonInput: unknown, adminUid: string): Promise<void> {
+    const currency = normalizeCurrencyCode(currencyInput);
+    if (!currency) throw new MoneyError("CURRENCY_UNSUPPORTED", "Unknown currency");
+    const reason = typeof reasonInput === "string" ? reasonInput.trim() : "";
+    if (reason.length < MIN_REASON || reason.length > MAX_REASON) {
+      throw new MoneyError("INVALID_INPUT", `reason must be ${MIN_REASON}-${MAX_REASON} characters`);
+    }
+    const stored = await this.deps.rates.get(currency);
+    if (!stored?.provider && !stored?.providerCorrupt) {
+      throw new MoneyError("INVALID_INPUT", "There is no stored provider rate to reset", currency);
+    }
+    await this.deps.rates.clearProvider(currency, {
+      currency,
+      action: "provider_reset",
+      by: adminUid,
+      at: this.now(),
+      reason,
+      old: stored.provider ? { rate: stored.provider.rate, source: stored.provider.source } : null,
+      new: null,
+    });
   }
 
   // ---------- admin override ----------
@@ -210,12 +308,12 @@ export class RateService {
 
     const stored = await this.deps.rates.get(currency);
     let unreferenced = false;
+    if (stored?.providerCorrupt) {
+      // A damaged reference must not silently downgrade to "no reference".
+      throw new MoneyError("INVALID_INPUT", "The stored provider rate is unreadable; reset it first", currency);
+    }
     if (stored?.provider) {
-      // |new - ref| * 100 <= ref * band%   (all integers; band in 1/1000 %)
-      const ref = scaleRate(stored.provider.rate);
-      const diff = scaled > ref ? scaled - ref : ref - scaled;
-      const bandMilli = BigInt(Math.round(config.overrideBandPercent * 1000));
-      if (diff * 100_000n > ref * bandMilli) {
+      if (scaled > 0n && exceedsBand(rate, stored.provider.rate, config.overrideBandPercent)) {
         throw new MoneyError(
           "INVALID_INPUT",
           `rate is more than ${config.overrideBandPercent}% away from the last provider rate`,
@@ -223,6 +321,15 @@ export class RateService {
         );
       }
     } else {
+      // Nothing to compare with: the rate must sit inside the currency's
+      // plausible range; with no range configured it is refused.
+      const entry = config.currencies[currency];
+      if (entry?.minRate === undefined || entry?.maxRate === undefined) {
+        throw new MoneyError("INVALID_INPUT", "No provider rate and no plausible range configured to check against", currency);
+      }
+      if (rate < entry.minRate || rate > entry.maxRate) {
+        throw new MoneyError("INVALID_INPUT", `rate is outside the plausible range ${entry.minRate}-${entry.maxRate}`, currency);
+      }
       unreferenced = true;
     }
 

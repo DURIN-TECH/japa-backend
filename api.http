@@ -271,6 +271,14 @@ Authorization: Bearer {{adminToken}}
 
 { "reason": "CBN is back" }
 
+### Admin: accept a genuine large provider move (drops the stored provider
+### rate, audited; the next refresh sets the new level, held to the plausible range)
+POST {{baseUrl}}/admin/exchange-rates/NGN/reset-reference
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "reason": "Genuine devaluation confirmed against CBN notice" }
+
 # ============================================================
 # DEV — Seed endpoints (emulator only)
 # ============================================================

@@ -42,6 +42,10 @@ export function memoryRateStore(): RateStore & { docs: Map<string, StoredRate>; 
       docs.set(c, { ...(docs.get(c) ?? blank(c)), override });
       audit.push(entry);
     },
+    async clearProvider(c, entry) {
+      docs.set(c, { ...(docs.get(c) ?? blank(c)), provider: null });
+      audit.push(entry);
+    },
     async listAudit(c, limit) {
       return audit.filter((a) => a.currency === c).reverse().slice(0, limit);
     },

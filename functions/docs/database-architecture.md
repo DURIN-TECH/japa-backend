@@ -464,8 +464,11 @@ exchangeRateAudit/{auto id}   append-only admin override history, backend-only
 | ------------------- | ------ | --------------------------------------------------------------------------------------------- |
 | defaultCurrency     | string | Charge currency when the client has no profile country or an unmapped one ("NGN")             |
 | currencies          | map    | `{ NGN: { enabled, countries: ["NG","Nigeria"], marginBps? } }`; adding a currency = config   |
-| freshnessHours      | number | How long a provider rate may serve after the provider last confirmed it (72)                  |
+| freshnessHours      | number | How long a provider rate may serve after the provider last confirmed it (72; cap 168)        |
 | defaultMarginBps    | number | Margin in basis points when a currency sets none (0)                                          |
+| maxRateAgeHours     | number | Oldest a rate's own date (`asOf`) may be and still price (120 = 5 days; cap 240). Re-reading an old row never refreshes it |
+| maxProviderJumpPercent | number | A new provider rate further than this from the stored one is rejected and logged (10; cap 50). Accept a real move via `POST /admin/exchange-rates/:currency/reset-reference` |
+| currencies.X.minRate / maxRate | number | Plausible range for first-run provider rates and unreferenced overrides (NGN 200-5000). Without a range those are refused |
 | provider            | enum   | `cbn` (default) or `oanda` (used only when the `OANDA_API_KEY` secret exists)                 |
 | overrideBandPercent | number | An admin override must be within this % of the last provider rate (10)                        |
 | overrideTtlHours    | number | Default life of an admin override (24; request may set 1-168)                                 |

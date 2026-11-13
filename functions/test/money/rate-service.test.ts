@@ -84,7 +84,7 @@ describe("quote(): rate, freshness expiry, unsupported currency", () => {
     const { service } = makeService({ config: { defaultMarginBps: 50 } });
     await service.refreshAll();
     assert.equal((await quote(usd(100), "NGN", service)).marginBps, 50);
-    const b = makeService({ config: { currencies: { NGN: { enabled: true, countries: [], marginBps: 200 } }, defaultMarginBps: 50 } });
+    const b = makeService({ config: { currencies: { NGN: { enabled: true, countries: [], marginBps: 200, minRate: 200, maxRate: 5000 } }, defaultMarginBps: 50 } });
     await b.service.refreshAll();
     assert.equal((await quote(usd(100), "NGN", b.service)).marginBps, 200);
   });
@@ -152,7 +152,7 @@ describe("provider selection and fallback", () => {
     assert.equal(store.docs.get("NGN")?.provider?.source, "cbn");
   });
   test("refresh uses oanda when it answers", async () => {
-    const oanda = fakeProvider("oanda", { configured: true, supports: ["NGN"], result: { ok: true, rate: 1450, asOf: new Date() } });
+    const oanda = fakeProvider("oanda", { configured: true, supports: ["NGN"], result: { ok: true, rate: 1450, asOf: new Date("2026-11-13T00:00:00Z") } });
     const { service, cbn } = makeService({ config: { provider: "oanda" }, oanda });
     const out = await service.refreshAll();
     assert.equal(out[0].source, "oanda");
@@ -273,5 +273,167 @@ describe("admin override: bounds and audit", () => {
     assert.equal(row.audit.length, 1);
     assert.equal(row.stored?.override?.reason, "CBN site is down today");
     assert.equal(row.effective?.source, "manual");
+  });
+});
+
+// ============================================
+// Review fixes (issue #178): stale-date guard, jump guard, plausible range, caps
+// ============================================
+
+describe("rate's own date (asOf) limits staleness", () => {
+  test("an old asOf with a fresh fetchedAt is RATE_STALE (stuck upstream re-read)", async () => {
+    // Provider keeps answering with a 6-day-old row; refresh must NOT store/re-stamp it.
+    const old = fakeProvider("cbn", { result: { ok: true, rate: 1500, asOf: new Date("2026-11-07T00:00:00Z") } });
+    const { service, store } = makeService({ cbn: old });
+    const out = await service.refreshAll();
+    assert.equal(out[0].ok, false);
+    assert.match(store.docs.get("NGN")?.lastError?.message ?? "", /hours ago/);
+    assert.equal(store.docs.get("NGN")?.provider ?? null, null);
+    await assert.rejects(service.getRate("NGN"), (e) => code(e) === "RATE_UNAVAILABLE");
+  });
+  test("a stored rate whose asOf passes the limit goes stale even while fetchedAt is fresh", async () => {
+    const { service, store, clock } = makeService();
+    await service.refreshAll();
+    // simulate a re-stamp: fetchedAt now, asOf 6 days old
+    const doc = store.docs.get("NGN")!;
+    doc.provider = { ...doc.provider!, asOf: new Date(clock.now().getTime() - 6 * 24 * 3_600_000), fetchedAt: clock.now() };
+    await assert.rejects(service.getRate("NGN"), (e) => code(e) === "RATE_STALE");
+  });
+  test("a weekend-old rate (3 days) still prices", async () => {
+    const fri = fakeProvider("cbn", { result: { ok: true, rate: 1500, asOf: new Date("2026-11-13T00:00:00Z") } });
+    const { service, clock } = makeService({ cbn: fri, config: { freshnessHours: 168 } });
+    await service.refreshAll();
+    clock.advanceHours(24 * 3 - 9);
+    assert.equal((await service.getRate("NGN")).rate, 1500);
+  });
+  test("a future-dated provider rate is rejected", async () => {
+    const fut = fakeProvider("cbn", { result: { ok: true, rate: 1500, asOf: new Date("2026-11-20T00:00:00Z") } });
+    const { service, store } = makeService({ cbn: fut });
+    const out = await service.refreshAll();
+    assert.equal(out[0].ok, false);
+    assert.match(store.docs.get("NGN")?.lastError?.message ?? "", /future/);
+  });
+});
+
+describe("jump guard and plausible range", () => {
+  test("decimal slip 1353.97 -> 135.39 is rejected, stored rate kept, lastError recorded", async () => {
+    const { service, store, cbn, clock } = makeService();
+    cbn.result = { ok: true, rate: 1353.97, asOf: new Date("2026-11-13T00:00:00Z") };
+    await service.refreshAll();
+    clock.advanceHours(6);
+    cbn.result = { ok: true, rate: 135.39, asOf: new Date("2026-11-13T12:00:00Z") };
+    const out = await service.refreshAll();
+    assert.equal(out[0].ok, false);
+    assert.equal(store.docs.get("NGN")?.provider?.rate, 1353.97);
+    assert.ok(store.docs.get("NGN")?.lastError);
+    assert.equal((await service.getRate("NGN")).rate, 1353.97);
+  });
+  test("a move inside the jump limit is accepted", async () => {
+    const { service, cbn } = makeService();
+    cbn.result = { ok: true, rate: 1500, asOf: new Date("2026-11-13T00:00:00Z") };
+    await service.refreshAll();
+    cbn.result = { ok: true, rate: 1560, asOf: new Date("2026-11-13T01:00:00Z") };
+    assert.equal((await service.refreshAll())[0].ok, true);
+  });
+  test("first-run value outside the plausible range is rejected (nothing stored)", async () => {
+    for (const bad of [135.39, 13539, 1]) {
+      const p = fakeProvider("cbn", { result: { ok: true, rate: bad, asOf: new Date("2026-11-13T00:00:00Z") } });
+      const { service, store } = makeService({ cbn: p });
+      assert.equal((await service.refreshAll())[0].ok, false, String(bad));
+      assert.equal(store.docs.get("NGN")?.provider ?? null, null);
+    }
+  });
+  test("no stored rate and no configured range -> refused (nothing to judge by)", async () => {
+    const { service } = makeService({ config: { currencies: { NGN: { enabled: true, countries: [] } } } });
+    assert.equal((await service.refreshAll())[0].ok, false);
+  });
+  test("the guard applies to every provider (oanda too)", async () => {
+    const oanda = fakeProvider("oanda", { configured: true, result: { ok: true, rate: 150, asOf: new Date("2026-11-13T00:00:00Z") } });
+    const { service } = makeService({ config: { provider: "oanda" }, oanda });
+    const out = await service.refreshAll();
+    // oanda rejected (range) -> falls back to cbn 1500
+    assert.equal(out[0].source, "cbn");
+  });
+  test("the admin path for a real large move: reset-reference (audited), then the new level is accepted", async () => {
+    const { service, store, cbn, clock } = makeService();
+    cbn.result = { ok: true, rate: 1500, asOf: new Date("2026-11-13T00:00:00Z") };
+    await service.refreshAll();
+    clock.advanceHours(6);
+    cbn.result = { ok: true, rate: 2100, asOf: new Date("2026-11-13T12:00:00Z") };
+    assert.equal((await service.refreshAll())[0].ok, false);
+    await service.resetReference("NGN", "Genuine devaluation confirmed", "admin-9");
+    assert.deepEqual(
+      [store.audit.at(-1)?.action, store.audit.at(-1)?.by, store.audit.at(-1)?.old],
+      ["provider_reset", "admin-9", { rate: 1500, source: "cbn" }]
+    );
+    assert.equal((await service.refreshAll())[0].ok, true);
+    assert.equal((await service.getRate("NGN")).rate, 2100);
+    await assert.rejects(service.resetReference("NGN", "x", "a"), MoneyError); // reason too short
+  });
+  test("one currency failing does not abort the others, and failures are logged at error level", async () => {
+    const calls: string[] = [];
+    const p = fakeProvider("cbn", { supports: ["NGN", "GHS"], result: { ok: true, rate: 1500, asOf: new Date("2026-11-13T00:00:00Z") } });
+    p.fetchRate = async (c: string) => {
+      calls.push(c);
+      if (c === "NGN") throw new Error("boom");
+      return { ok: true, rate: 12, asOf: new Date("2026-11-13T00:00:00Z") };
+    };
+    const { service } = makeService({
+      cbn: p,
+      config: { currencies: { NGN: { enabled: true, countries: [] }, GHS: { enabled: true, countries: [], minRate: 1, maxRate: 100 } } },
+    });
+    const errors: string[] = [];
+    const orig = console.error;
+    console.error = (...a: unknown[]) => void errors.push(a.join(" "));
+    try {
+      const out = await service.refreshAll();
+      assert.deepEqual(out.map((o) => [o.currency, o.ok]), [["NGN", false], ["GHS", true]]);
+    } finally {
+      console.error = orig;
+    }
+    assert.ok(errors.some((e) => /NGN/.test(e)));
+    assert.deepEqual(calls, ["NGN", "GHS"]);
+  });
+});
+
+describe("override reference rules and config caps", () => {
+  test("an unreferenced override must be inside the plausible range", async () => {
+    const { service } = makeService();
+    for (const bad of [150, 6000, 1e9]) {
+      await assert.rejects(service.setOverride("NGN", { rate: bad, reason: "CBN site is down today" }, "a"), MoneyError, String(bad));
+    }
+    await service.setOverride("NGN", { rate: 1500, reason: "CBN site is down today" }, "a");
+  });
+  test("an unreferenced override with no configured range is refused", async () => {
+    const { service } = makeService({ config: { currencies: { NGN: { enabled: true, countries: [] } } } });
+    await assert.rejects(service.setOverride("NGN", { rate: 1500, reason: "CBN site is down today" }, "a"), MoneyError);
+  });
+  test("an unreadable stored provider map blocks the unreferenced path", async () => {
+    const { service, store } = makeService();
+    store.docs.set("NGN", { currency: "NGN", provider: null, override: null, lastError: null, providerCorrupt: true });
+    await assert.rejects(service.setOverride("NGN", { rate: 1500, reason: "CBN site is down today" }, "a"), MoneyError);
+  });
+  test("config caps: a typo cannot disable freshness, age, band or jump protection", () => {
+    const c = parseCurrenciesConfig({
+      freshnessHours: 100000, maxRateAgeHours: 1e9, overrideBandPercent: 5000, maxProviderJumpPercent: 99999, overrideTtlHours: 1e6,
+    });
+    assert.equal(c.freshnessHours, 168);
+    assert.equal(c.maxRateAgeHours, 240);
+    assert.equal(c.overrideBandPercent, 25);
+    assert.equal(c.maxProviderJumpPercent, 50);
+    assert.equal(c.overrideTtlHours, 168);
+    assert.equal(parseCurrenciesConfig({ freshnessHours: "x" }).freshnessHours, 72);
+  });
+  test("a plausible range with min >= max is dropped", () => {
+    const c = parseCurrenciesConfig({ currencies: { NGN: { enabled: true, countries: [], minRate: 5000, maxRate: 200 } } });
+    assert.equal(c.currencies.NGN.minRate, undefined);
+  });
+});
+
+describe("quote never returns a zero local amount", () => {
+  test("a price that rounds to zero is refused; so is a zero price", () => {
+    const tiny = { currency: "NGN", rate: 0.4, asOf: "2026-11-13T00:00:00.000Z", source: "cbn" as const, marginBps: 0 };
+    assert.throws(() => quoteWithRate(usd(1), tiny), (e) => code(e) === "INVALID_INPUT");
+    assert.throws(() => quoteWithRate(usd(0), { ...tiny, rate: 1500 }), (e) => code(e) === "INVALID_INPUT");
   });
 });

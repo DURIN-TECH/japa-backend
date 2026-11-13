@@ -117,6 +117,23 @@ describe("CbnRateProvider", () => {
     const none = fakeHttp({ [CBN_ROBOTS_URL]: { status: 404, data: "" }, [CBN_NFEM_URL]: { status: 200, data: fixture } });
     assert.equal((await new CbnRateProvider(none.http).fetchRate("NGN")).ok, true);
   });
+  test("robots 403 or 429 -> unavailable and the data endpoint is NOT requested", async () => {
+    for (const status of [403, 429]) {
+      const { http, calls } = fakeHttp({ [CBN_ROBOTS_URL]: { status, data: "" }, [CBN_NFEM_URL]: { status: 200, data: fixture } });
+      const r = await new CbnRateProvider(http).fetchRate("NGN");
+      assert.equal(r.ok, false, String(status));
+      assert.equal(calls.length, 1);
+    }
+  });
+  test("a future-dated row is ignored, never 'the latest'", () => {
+    const now = new Date("2026-11-13T09:00:00Z");
+    const rows = [
+      { ratedate: "December-30-2026", weightedAvgRate: "135.3974" },
+      { ratedate: "November-13-2026", weightedAvgRate: "1353.9741" },
+    ];
+    assert.equal(parseCbnNfemRates(rows, now)?.rate, 1353.9741);
+    assert.equal(parseCbnNfemRates([rows[0]], now), null);
+  });
   test("a block (403/429), bad JSON or a network error is 'unavailable', never a throw or a guess", async () => {
     for (const data of [{ status: 403, data: "" }, { status: 429, data: "" }, { status: 200, data: { oops: true } }]) {
       const { http } = fakeHttp({ [CBN_ROBOTS_URL]: { status: 200, data: ROBOTS_OK }, [CBN_NFEM_URL]: data });
@@ -158,6 +175,14 @@ describe("OandaRateProvider", () => {
     assert.ok(!JSON.stringify(r).includes("SECRET-VALUE"));
   });
   test("parseOandaSpot rejects shapes it does not understand", () => {
-    for (const bad of [null, {}, { quotes: [] }, { quotes: [{ midpoint: "x" }] }]) assert.equal(parseOandaSpot(bad), null);
+    for (const bad of [null, {}, { quotes: [] }, { quotes: [{ midpoint: "x" }] }]) assert.equal(parseOandaSpot(bad, "NGN"), null);
+  });
+  test("parseOandaSpot checks the returned pair and requires a real timestamp", () => {
+    const q = { base_currency: "USD", quote_currency: "NGN", midpoint: "1500", end_time: "2026-11-13T09:00:00+00:00" };
+    assert.equal(parseOandaSpot({ quotes: [q] }, "NGN")?.rate, 1500);
+    assert.equal(parseOandaSpot({ quotes: [q] }, "GHS"), null); // wrong pair
+    assert.equal(parseOandaSpot({ quotes: [{ ...q, base_currency: "EUR" }] }, "NGN"), null);
+    assert.equal(parseOandaSpot({ quotes: [{ ...q, end_time: undefined }] }, "NGN"), null); // no now() fallback
+    assert.equal(parseOandaSpot({ quotes: [{ ...q, end_time: "garbage" }] }, "NGN"), null);
   });
 });

@@ -35,12 +35,17 @@ export const firestoreRateStore: RateStore = {
     const setAt = toDate(d.override?.setAt);
     const expiresAt = toDate(d.override?.expiresAt);
     const errAt = toDate(d.lastError?.at);
+    const providerOk =
+      !!d.provider && !!asOf && !!fetchedAt && typeof d.provider.rate === "number" &&
+      Number.isFinite(d.provider.rate) && d.provider.rate > 0 &&
+      (d.provider.source === "cbn" || d.provider.source === "oanda");
     return {
       currency,
-      provider:
-        d.provider && asOf && fetchedAt && typeof d.provider.rate === "number"
-          ? { rate: d.provider.rate, asOf, fetchedAt, source: d.provider.source as StoredProviderRate["source"] }
-          : null,
+      // A present-but-unreadable provider map is flagged, never silently null.
+      providerCorrupt: !!d.provider && !providerOk,
+      provider: providerOk
+        ? { rate: d.provider.rate, asOf: asOf as Date, fetchedAt: fetchedAt as Date, source: d.provider.source as StoredProviderRate["source"] }
+        : null,
       override:
         d.override && setAt && expiresAt && typeof d.override.rate === "number"
           ? { rate: d.override.rate, reason: String(d.override.reason ?? ""), setBy: String(d.override.setBy ?? ""), setAt, expiresAt }
@@ -96,6 +101,14 @@ export const firestoreRateStore: RateStore = {
       ...audit,
       at: Timestamp.fromDate(audit.at),
     });
+    await batch.commit();
+  },
+
+  async clearProvider(currency, audit) {
+    // Remove the provider map and write the audit record together.
+    const batch = collections.exchangeRates.firestore.batch();
+    batch.set(collections.exchangeRates.doc(currency), { currency, provider: null }, { merge: true });
+    batch.set(collections.exchangeRateAudit.doc(), { ...audit, at: Timestamp.fromDate(audit.at) });
     await batch.commit();
   },
 

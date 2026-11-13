@@ -66,6 +66,12 @@ export interface Quote {
  * `Transaction.amount` keeps meaning "minor units of `Transaction.currency`";
  * `chargedAmountMinor` / `chargedCurrency` repeat that on the records that
  * are not themselves a Transaction.
+ *
+ * Re-deriving an amount from `priceUsdCents` and `fxRate` MUST go through
+ * `scaleRate` / `convertUsdToLocal` (the rate is held to 6 decimals; a raw
+ * float multiply can differ by a kobo). Prefer the stored `chargedAmountMinor`.
+ * The quote-lock / expiry time (how long a quote may be charged) is added by
+ * #180 on the checkout record; this snapshot only records what was charged.
  */
 export interface ChargeSnapshot {
   /** The price as set by the agent, in US cents. */
@@ -99,6 +105,14 @@ export interface CurrencyConfigEntry {
   countries: string[];
   /** Optional per-currency margin; falls back to `defaultMarginBps`. */
   marginBps?: number;
+  /**
+   * Plausible range for the rate (local units per USD). A provider rate or an
+   * unreferenced admin override outside it is refused. When a currency has no
+   * range, a first-run rate and an unreferenced override are refused outright
+   * (there is nothing to judge them against).
+   */
+  minRate?: number;
+  maxRate?: number;
 }
 
 /** `appConfig/currencies`: supported currencies and rate rules. */
@@ -113,6 +127,19 @@ export interface CurrenciesConfig {
   freshnessHours: number;
   /** Margin in basis points when a currency sets none (default 0). */
   defaultMarginBps: number;
+  /**
+   * Oldest a provider rate's OWN date (`asOf`) may be and still price, in
+   * hours (default 120 = 5 days: a Friday rate covers a weekend plus a
+   * Monday holiday). Unlike `freshnessHours` this cannot be refreshed by
+   * re-reading the same old row. Capped at 240.
+   */
+  maxRateAgeHours: number;
+  /**
+   * A new provider rate that differs from the stored one by more than this
+   * percent is rejected (default 10, capped at 50). A genuine large move is
+   * accepted by an admin through POST /admin/exchange-rates/:currency/reset-reference.
+   */
+  maxProviderJumpPercent: number;
   /** Which provider is preferred. `oanda` is used only when its key exists. */
   provider: "cbn" | "oanda";
   /** An admin override must be within this percent of the last provider rate. */

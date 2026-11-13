@@ -39,12 +39,18 @@ export interface StoredRate {
   override: StoredOverride | null;
   /** Last failed provider attempt (message only, never a secret). */
   lastError: { at: Date; message: string } | null;
+  /**
+   * True when a `provider` map exists in storage but cannot be read. It is
+   * NOT the same as "no provider rate": an override must not take the
+   * unreferenced path over a damaged reference.
+   */
+  providerCorrupt?: boolean;
 }
 
 /** One append-only audit record per admin change (who, when, old, new). */
 export interface RateAuditEntry {
   currency: CurrencyCode;
-  action: "override_set" | "override_cleared";
+  action: "override_set" | "override_cleared" | "provider_reset";
   by: string;
   at: Date;
   reason: string;
@@ -64,6 +70,8 @@ export interface RateStore {
   saveError(currency: CurrencyCode, error: { at: Date; message: string }): Promise<void>;
   /** Write the override (or null to clear) AND the audit entry together. */
   saveOverride(currency: CurrencyCode, override: StoredOverride | null, audit: RateAuditEntry): Promise<void>;
+  /** Remove the stored provider rate (admin accepts a large move) and audit it. */
+  clearProvider(currency: CurrencyCode, audit: RateAuditEntry): Promise<void>;
   /** Newest-first audit history for one currency. */
   listAudit(currency: CurrencyCode, limit: number): Promise<RateAuditEntry[]>;
 }

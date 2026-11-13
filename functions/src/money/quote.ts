@@ -26,6 +26,11 @@ export function quoteWithRate(usd: Money, rate: ExchangeRate): Quote {
   if (usd.currency !== "USD") throw new MoneyError("INVALID_INPUT", "quote() prices a USD amount");
   const checked = makeMoney(usd.amountMinor, "USD");
   const local = convertUsdToLocal(checked, rate.rate, rate.currency, rate.marginBps);
+  // A price that rounds (or starts) at zero must never reach a charge path:
+  // the caller would charge nothing. Free items are not priced via quote().
+  if (local.amountMinor <= 0) {
+    throw new MoneyError("INVALID_INPUT", "The amount converts to zero in the local currency");
+  }
   return {
     usd: checked,
     local,

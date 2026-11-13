@@ -13,6 +13,7 @@ import { getCurrencyInfo } from "../money/currencies";
 //   GET    /admin/exchange-rates          admin: stored state + override history
 //   PUT    /admin/exchange-rates/:currency    admin: set a manual rate { rate, reason, ttlHours? }
 //   DELETE /admin/exchange-rates/:currency    admin: clear it { reason }
+//   POST   /admin/exchange-rates/:currency/reset-reference  admin: accept a large provider move { reason }
 //
 // The factories take the RateService so tests can mount them on a fake.
 
@@ -96,6 +97,18 @@ export function createAdminExchangeRateRouter(service: RateService): Router {
         uid
       );
       sendSuccess(res, stored, "Override saved");
+    } catch (err) {
+      sendMoneyError(res, err);
+    }
+  });
+
+  // Accept a genuine large move: drops the stored provider rate (audited).
+  router.post("/:currency/reset-reference", verifyAuth, verifyAdmin, async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const uid = (req as AuthenticatedRequest).userId as string;
+      await service.resetReference(req.params.currency, body.reason, uid);
+      sendSuccess(res, { reset: true }, "Provider rate reset; the next refresh sets the new level");
     } catch (err) {
       sendMoneyError(res, err);
     }

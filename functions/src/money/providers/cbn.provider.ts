@@ -47,6 +47,9 @@ const SUPPORTED = "NGN";
 const MIN_PLAUSIBLE_NGN_PER_USD = 50;
 const MAX_PLAUSIBLE_NGN_PER_USD = 100_000;
 
+/** Rows dated further ahead than this are ignored (clock skew allowance). */
+const FUTURE_TOLERANCE_MS = 6 * 60 * 60 * 1000;
+
 const MONTHS = [
   "january", "february", "march", "april", "may", "june",
   "july", "august", "september", "october", "november", "december",
@@ -77,7 +80,11 @@ export function parseCbnDate(text: unknown): Date | null {
  * with a missing/invalid date or rate, or a rate outside the sanity band, are
  * skipped; if none is usable the result is null (provider "unavailable").
  */
-export function parseCbnNfemRates(json: unknown): { rate: number; asOf: Date } | null {
+export function parseCbnNfemRates(
+  json: unknown,
+  /** Clock for the future-date check (injectable for tests). */
+  now: Date = new Date()
+): { rate: number; asOf: Date } | null {
   if (!Array.isArray(json)) return null;
   let best: { rate: number; asOf: Date } | null = null;
   for (const row of json) {
@@ -88,6 +95,8 @@ export function parseCbnNfemRates(json: unknown): { rate: number; asOf: Date } |
       ? Number(String(r.weightedAvgRate).replace(/,/g, "").trim())
       : NaN;
     if (!asOf || !Number.isFinite(rate)) continue;
+    // A row dated ahead of our clock (beyond skew) is never "the latest".
+    if (asOf && asOf.getTime() > now.getTime() + FUTURE_TOLERANCE_MS) continue;
     if (rate < MIN_PLAUSIBLE_NGN_PER_USD || rate > MAX_PLAUSIBLE_NGN_PER_USD) continue;
     if (!best || asOf.getTime() > best.asOf.getTime()) best = { rate, asOf };
   }
@@ -139,16 +148,20 @@ export class CbnRateProvider implements RateProvider {
     try {
       // 1. robots.txt first.
       const robots = await this.http.get(CBN_ROBOTS_URL, { responseType: "text", transformResponse: (d) => d });
-      if (robots.status >= 500) return { ok: false, reason: `robots.txt answered ${robots.status}` };
+      // 200 = read the rules. 404/410 = the site has no robots.txt = no rules.
+      // Anything else (403/429 = refusing or throttling us, 5xx, odd codes)
+      // means "do not fetch": we never press on past a block.
       if (robots.status === 200 && typeof robots.data === "string") {
         if (isPathDisallowed(parseRobotsDisallows(robots.data), CBN_NFEM_PATH)) {
           return { ok: false, reason: "robots.txt disallows the CBN rates endpoint" };
         }
+      } else if (robots.status !== 404 && robots.status !== 410) {
+        return { ok: false, reason: `robots.txt answered ${robots.status}` };
       }
       // 2. The data.
       const res = await this.http.get(CBN_NFEM_URL);
       if (res.status !== 200) return { ok: false, reason: `CBN answered ${res.status}` };
-      const parsed = parseCbnNfemRates(res.data);
+      const parsed = parseCbnNfemRates(res.data, new Date());
       if (!parsed) return { ok: false, reason: "CBN response had no usable NFEM rate" };
       return { ok: true, rate: parsed.rate, asOf: parsed.asOf };
     } catch (err) {

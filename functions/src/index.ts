@@ -697,8 +697,10 @@ export const refreshExchangeRates = functions
   .timeZone("UTC")
   .onRun(async () => {
     const outcomes = await rateService.refreshAll();
+    // refreshAll isolates each currency; failures are logged at error level.
     for (const o of outcomes) {
-      console.log(`Exchange rate refresh ${o.currency}: ${o.ok ? `${o.source} ${o.rate}` : `unavailable (${o.reason})`}`);
+      if (o.ok) console.log(`Exchange rate refresh ${o.currency}: ${o.source} ${o.rate}`);
+      else console.error(`Exchange rate refresh ${o.currency}: unavailable (${o.reason})`);
     }
   });
 
