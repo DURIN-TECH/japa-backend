@@ -6,6 +6,7 @@
 import { test, describe, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { Timestamp } from "firebase-admin/firestore";
+import { defineAbilitiesFor, ROLES } from "@durin-tech/authz";
 
 import { installFakes, resetStore, store } from "../helpers/fake-firestore";
 import { visaService } from "../../src/services/visa.service";
@@ -21,7 +22,7 @@ const T0 = Timestamp.fromMillis(1_700_000_000_000);
 const URL = "https://www.gov.uk/standard-visitor";
 
 // A scraped visa with 4 documents: [0] cited, [1] cited + conditional ("if"),
-// [2] UNCITED (must be dropped), [3] cited with "may" (optional).
+// [2] UNCITED (must be dropped), [3] cited with "optional".
 function scraped(over: Record<string, unknown> = {}): any {
   return {
     id: "gb-standard-visitor", countryCode: "GB", name: "Standard Visitor", code: "SVV",
@@ -33,8 +34,8 @@ function scraped(over: Record<string, unknown> = {}): any {
       sourceUrl: URL,
       citations: {
         "requiredDocuments.0": "You must have a valid passport",
-        "requiredDocuments.1": "a letter from your employer if you are working",
-        "requiredDocuments.3": "you may also provide bank statements",
+        "requiredDocuments.1": "a letter from your employer, if applicable",
+        "requiredDocuments.3": "bank statements are optional",
       },
     },
     createdAt: T0, updatedAt: T0, ...over,
@@ -58,14 +59,17 @@ describe("deriveRequirementsFromScrape", () => {
     }
   });
 
-  test("isRequired true by default; false when the quote says if/may/optional", () => {
+  test("isRequired true by default; false only for optional / if applicable / if relevant / unless", () => {
     const docs = deriveRequirementsFromScrape(scraped())[0].requiredDocuments;
     assert.deepEqual(docs.map((d) => d.isRequired), [true, false, false]);
     assert.equal(isQuoteOptional("This is optional"), true);
     assert.equal(isQuoteOptional("You must show your passport"), false);
-    // The month "May" must not mark a document optional; lowercase "may" does.
+    // "may" never marks a document optional (month or modal verb).
     assert.equal(isQuoteOptional("Passport issued after 1 May 2020"), false);
-    assert.equal(isQuoteOptional("you may also provide it"), true);
+    assert.equal(isQuoteOptional("any offences you may have committed"), false);
+    assert.equal(isQuoteOptional("a letter, if applicable"), true);
+    assert.equal(isQuoteOptional("Proof of funds IF RELEVANT"), true);
+    assert.equal(isQuoteOptional("unless you are under 18"), true);
   });
 
   test("citation sourceUrl prefers scrapeMeta.sourceUrl over the editable top-level one", () => {
@@ -123,6 +127,53 @@ describe("getRequirements + endpoints", () => {
   test("seeded visa without requirements stays empty", async () => {
     store.set("countries/GB/visaTypes/uk-visitor", scraped({ id: "uk-visitor", source: undefined }));
     assert.deepEqual(await visaService.getRequirements("GB", "uk-visitor"), []);
+  });
+});
+
+describe("inactive seeded visa stays readable by its applicants (#175)", () => {
+  before(() => installFakes());
+  beforeEach(() => {
+    resetStore();
+    store.set("countries/GB", { code: "GB", name: "United Kingdom", isSupported: true, createdAt: T0, updatedAt: T0 });
+    // Hidden seed (what the deactivation script leaves) + a pending scraped visa.
+    store.set("countries/GB/visaTypes/uk-visitor", scraped({ id: "uk-visitor", source: undefined, reviewStatus: undefined, isActive: false }));
+    store.set("countries/GB/visaTypes/gb-pending", scraped({ id: "gb-pending", reviewStatus: "pending_review", isActive: false }));
+    store.set("applications/a1", { id: "a1", userId: "uid-applicant", visaTypeId: "uk-visitor", countryCode: "GB", status: "draft" });
+    store.set("applications/a2", { id: "a2", userId: "uid-pending-applicant", visaTypeId: "gb-pending", countryCode: "GB", status: "draft" });
+    store.set("applications/a3", { id: "a3", userId: "uid-other", visaTypeId: "uk-student", countryCode: "GB", status: "draft" });
+  });
+  const ability = (uid: string) => defineAbilitiesFor({ uid, role: ROLES.CLIENT, agencyId: null });
+  async function call(handler: any, uid: string | undefined, visaId: string) {
+    const out: any = {};
+    const res: any = { status(c: number) { out.status = c; return res; }, json(b: unknown) { out.body = b; return res; } };
+    await handler({ params: { code: "GB", visaId }, query: {}, body: {}, headers: {}, userId: uid, ability: uid ? ability(uid) : undefined }, res);
+    return out;
+  }
+  const detail = visaController.getVisaType.bind(visaController);
+  const full = visaController.getVisaTypeWithRequirements.bind(visaController);
+  const reqs = visaController.getRequirements.bind(visaController);
+
+  test("applicant on the exact visa reads detail, /full and /requirements", async () => {
+    assert.equal((await call(detail, "uid-applicant", "uk-visitor")).status, 200);
+    assert.equal((await call(full, "uid-applicant", "uk-visitor")).status, 200);
+    assert.equal((await call(reqs, "uid-applicant", "uk-visitor")).status, 200);
+  });
+
+  test("anonymous, other users and applicants of a different visa get 404", async () => {
+    for (const uid of [undefined, "uid-other", "uid-nobody"]) {
+      assert.equal((await call(detail, uid, "uk-visitor")).status, 404);
+      assert.equal((await call(full, uid, "uk-visitor")).status, 404);
+    }
+  });
+
+  test("a pending (never approved) inactive scraped visa is NOT opened by an application", async () => {
+    assert.equal((await call(detail, "uid-pending-applicant", "gb-pending")).status, 404);
+  });
+
+  test("the list endpoint still hides the inactive seed", async () => {
+    const list = await call(visaController.getVisaTypesByCountry.bind(visaController), "uid-applicant", "x");
+    const ids = (list.body?.data ?? []).map((v: any) => v.id);
+    assert.ok(!ids.includes("uk-visitor"));
   });
 });
 

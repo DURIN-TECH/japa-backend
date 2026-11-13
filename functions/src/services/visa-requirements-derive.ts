@@ -16,8 +16,8 @@
 // Rules (orchestrator decisions on #175):
 //  - an item WITHOUT a cited quote is dropped, never shown (no invented data);
 //  - `isRequired` is true by default (the scraper only extracts the page's
-//    required-documents list); false only when the cited quote itself marks
-//    the item optional or conditional;
+//    required-documents list); false only when the cited quote itself says
+//    "optional", "if applicable", "if relevant" or "unless";
 //  - no format / size / period / amount is invented: the platform upload
 //    defaults are used for acceptedFormats / maxSizeMb (not domain data).
 
@@ -27,12 +27,11 @@ import type { RequiredDocument, VisaRequirement, VisaType } from "../types";
 // Id of the single derived requirement. Stable so clients can key on it.
 export const DERIVED_REQUIREMENT_ID = "scraped-required-documents";
 
-// Words in a quote that make the document optional or conditional.
-// "may" / "if" / "optional" per the decision, plus "unless" and "depending on".
-// "may" is matched CASE-SENSITIVELY so the month "May" ("after 1 May 2020")
-// never marks a document optional; the other words are case-insensitive.
-const OPTIONAL_QUOTE = /\b(if|optional|unless|depending on)\b/i;
-const OPTIONAL_MAY = /\bmay\b/;
+// Words in a quote that make the document optional or conditional (QA on #175:
+// "may" is NOT used: "offences you may have committed" is not optional).
+// Only an explicit "optional", "if applicable", "if relevant" or "unless",
+// any case.
+const OPTIONAL_QUOTE = /\b(optional|if applicable|if relevant|unless)\b/i;
 
 // Platform upload defaults (what the app accepts), not claims about the visa.
 const DEFAULT_FORMATS = ["pdf", "jpg", "png"];
@@ -40,7 +39,7 @@ const DEFAULT_MAX_MB = 10;
 
 /** True when the quote marks the document as optional or conditional. */
 export function isQuoteOptional(quote: string): boolean {
-  return OPTIONAL_QUOTE.test(quote) || OPTIONAL_MAY.test(quote);
+  return OPTIONAL_QUOTE.test(quote);
 }
 
 /**

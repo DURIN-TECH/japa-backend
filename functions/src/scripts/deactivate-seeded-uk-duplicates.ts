@@ -9,8 +9,11 @@
  * public list, so it is hidden with `isActive: false`.
  *
  * "Hide" means ONLY `isActive: false` (orchestrator decision on #175): the doc
- * and its requirements stay, so existing applications on these ids still load
- * (single-visa reads are unfiltered by isActive) and nothing is deleted.
+ * and its requirements stay, so existing applications on these ids still load:
+ * the single-visa reads (/countries/:code/visas/:id, /full, /requirements) serve
+ * an inactive seed to a caller who has an application on that exact visa
+ * (agency-visa-access.ts, step 3b); the list hides it and new starts are
+ * refused. Nothing is deleted.
  * Deleting the seeds and migrating references stays in issue #65.
  *
  * A seed is deactivated ONLY when its mapped scraped visa exists, is
