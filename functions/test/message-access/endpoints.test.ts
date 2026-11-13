@@ -70,6 +70,16 @@ describe("own approval: read and change", () => {
     assert.equal(d.noticeWording.versionId, CURRENT_NOTICE_WORDING.versionId);
   });
 
+  test("an approval stored under draft-1 stays active and keeps its stored version and text (#193)", async () => {
+    seedApproval(APPLICANT);
+    const res = mockRes();
+    await aiMessageAccessController.getState(req(APPLICANT), res);
+    assert.equal(res.body.data.approved, true);
+    assert.equal(res.body.data.wordingVersion, "ai-message-access-approval.draft-1");
+    assert.equal(res.body.data.wording, "x"); // the seeded stored text, not the current wording
+    assert.notEqual(res.body.data.wordingVersion, CURRENT_APPROVAL_WORDING.versionId);
+  });
+
   test("approve stores user, time, version and the EXACT server-side wording, even if the client sends other text", async () => {
     const res = mockRes();
     await aiMessageAccessController.approve(
@@ -89,7 +99,7 @@ describe("own approval: read and change", () => {
 
   test("approve with an unknown or stale version: 409 and nothing stored; missing version: 400", async () => {
     let res = mockRes();
-    await aiMessageAccessController.approve(req(APPLICANT, { body: { wordingVersion: "ai-message-access-approval.draft-0" } }), res);
+    await aiMessageAccessController.approve(req(APPLICANT, { body: { wordingVersion: "ai-message-access-approval.draft-1" } }), res);
     assert.equal(res.statusCode, 409);
     assert.equal(res.body.error, "WORDING_VERSION_MISMATCH");
     assert.equal(store.has(`aiMessageAccess/${APPLICANT}`), false);

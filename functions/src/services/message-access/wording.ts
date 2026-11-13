@@ -53,11 +53,28 @@ export const APPROVAL_WORDING_DRAFT_1: WordingVersion = {
   ],
 };
 
+/**
+ * Approval wording, draft 2 (issue #193). The owner found draft 1 too long, so
+ * this is ONE short paragraph (reworded in place before release: no per-chat
+ * mention, owner change 2 on #193). A new id (draft 1 above is untouched): approvals
+ * stored under draft 1 stay active and keep their own stored text, nobody is
+ * asked to re-approve. Like draft 1, it states no retention period, no
+ * AI-provider terms and nothing about redaction (undecided, see #128).
+ */
+export const APPROVAL_WORDING_DRAFT_2: WordingVersion = {
+  versionId: "ai-message-access-approval.draft-2",
+  draft: true,
+  title: "AI message access",
+  paragraphs: [
+    "Seli’s AI may read the messages I send in my chats. I can switch this off for all my chats, and withdraw this approval, at any time.",
+  ],
+};
+
 /** Every approval wording ever published, oldest first. Lookup by version id. */
-export const APPROVAL_WORDING_HISTORY: readonly WordingVersion[] = [APPROVAL_WORDING_DRAFT_1];
+export const APPROVAL_WORDING_HISTORY: readonly WordingVersion[] = [APPROVAL_WORDING_DRAFT_1, APPROVAL_WORDING_DRAFT_2];
 
 /** The approval wording shown today. */
-export const CURRENT_APPROVAL_WORDING: WordingVersion = APPROVAL_WORDING_DRAFT_1;
+export const CURRENT_APPROVAL_WORDING: WordingVersion = APPROVAL_WORDING_DRAFT_2;
 
 // ---- One-time notice wording (people who qualify through a plan) ----------------
 

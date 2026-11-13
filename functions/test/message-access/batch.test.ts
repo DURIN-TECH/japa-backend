@@ -14,6 +14,7 @@ import { before, beforeEach, describe, test } from "node:test";
 import { ROLES } from "@durin-tech/authz";
 import { installMessageAccessFakes, resetMessageAccess, seedApproval, seedChat, seedMessage, seedPlan } from "./harness";
 import { aiMessageAccessService } from "../../src/services/ai-message-access.service";
+import { CURRENT_APPROVAL_WORDING } from "../../src/services/message-access/wording";
 import { messageAccessService, type AiMessageBatchItem, type MessageAccessPrincipal } from "../../src/services/message-access.service";
 
 const admin: MessageAccessPrincipal = { uid: "uid-admin", role: ROLES.ADMIN, agencyId: null };
@@ -67,7 +68,7 @@ describe("batch built through the helper", () => {
   });
 
   test("approval withdrawn or account-wide off after build also drops the request", async () => {
-    await aiMessageAccessService.approve("app-none", "ai-message-access-approval.draft-1");
+    await aiMessageAccessService.approve("app-none", CURRENT_APPROVAL_WORDING.versionId);
     const built = await messageAccessService.buildAiMessageBatch(admin, ["c-ok", "c-none"]);
     assert.equal(built.length, 2);
     await aiMessageAccessService.revoke("app-none");
