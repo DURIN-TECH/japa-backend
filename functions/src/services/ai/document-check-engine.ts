@@ -1,4 +1,5 @@
 import type { DurationUnit, VisaRubric } from "../../types/rubric";
+import { applicableCriterionIds } from "./rule-applicability";
 import type { DocumentExtraction } from "./assessment-engine";
 import { findBannedWording } from "./prompt-safety";
 
@@ -133,16 +134,22 @@ function evidenceItemFor(rubric: Pick<VisaRubric, "evidenceItems"> | null, check
  * @param holder the item's holder, from the stored request
  */
 export function expectationsFor(
-  rubric: Pick<VisaRubric, "evidenceItems" | "criteria"> | null,
+  rubric: (Pick<VisaRubric, "evidenceItems" | "criteria"> & Partial<Pick<VisaRubric, "intakeQuestions">>) | null,
   checklistItemId: string,
   title: string,
-  holder: "applicant" | "sponsor"
+  holder: "applicant" | "sponsor",
+  // (#207) The applicant's intake answers. When given, only the criteria that
+  // APPLY to them contribute expectations (a document is not held to a
+  // requirement of a specialist rule their answers do not trigger). Absent =
+  // every linked criterion, as before.
+  intakeAnswers?: Record<string, unknown> | null
 ): Expectations {
   const item = evidenceItemFor(rubric, checklistItemId);
   let maxAge: DeclaredDuration | null = null;
   let requiredPeriod: DeclaredDuration | null = null;
   if (rubric && item) {
-    const linked = rubric.criteria.filter((c) => item.criterionIds.includes(c.criterionId));
+    const applies = intakeAnswers === undefined ? null : applicableCriterionIds({ criteria: rubric.criteria, intakeQuestions: rubric.intakeQuestions ?? [] }, intakeAnswers);
+    const linked = rubric.criteria.filter((c) => item.criterionIds.includes(c.criterionId) && (applies === null || applies.has(c.criterionId)));
     for (const c of linked) {
       const check = c.check;
       if (c.kind !== "objective" || !check || typeof check.value !== "number" || !(check.value > 0)) continue;

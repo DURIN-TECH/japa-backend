@@ -1,6 +1,20 @@
 {
   "indexes": [
     {
+      "collectionGroup": "exchangeRateAudit",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "currency",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "at",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
       "collectionGroup": "countries",
       "queryScope": "COLLECTION",
       "fields": [

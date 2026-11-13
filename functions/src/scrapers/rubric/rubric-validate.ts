@@ -11,6 +11,7 @@ import {
   type VisaRubric,
 } from "../../types/rubric";
 
+import { isValidTrigger } from "../../services/ai/rule-applicability";
 import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA } from "./rubric-exclusions";
 
 // ============================================
@@ -229,6 +230,14 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
     for (const id of c.intakeQuestionIds ?? []) {
       if (!questionIds.has(id)) err("criterion_intake_unknown", `criterion reads intake question ${id}, which is not in the rubric`, c.criterionId);
     }
+    // (#207) A rule trigger names a question of this rubric and answer values
+    // that question can give. Extraction only stores checked triggers, so a
+    // failure here means damaged data: the rubric is not stored or approved.
+    if (c.trigger !== undefined) {
+      const q = questions.find((x) => x.id === c.trigger?.questionId);
+      if (!q) err("criterion_trigger_question_unknown", `trigger names question ${String(c.trigger.questionId)}, which is not in the rubric`, c.criterionId);
+      else if (!isValidTrigger(c.trigger, questions)) err("criterion_trigger_value_unknown", "trigger values must be option values of the question it names (true / false for a yes/no question)", c.criterionId);
+    }
     if (c.eligibilityQuestionId !== undefined) {
       const known = options.knownEligibilityQuestionIds;
       if (!known) err("eligibility_question_unverified", "eligibilityQuestionId is set but no question list was supplied to check it against", c.criterionId);
@@ -286,6 +295,9 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
     err("exclusion_note_invalid", `exclusionNote must be a string of at most ${EXCLUSION_NOTE_MAX} characters`);
   }
 
+  // ---- question plan (written with the automatic approval, #203) ----
+  if (rubric.questionPlan !== undefined) validateQuestionPlan(rubric, questionIds, new Set(evidence.map((e) => e.key)), err);
+
   // ---- intent: criteria about intent need a polarity to be scored by ----
   // The decision wins when there is one; before review, the proposal stands in.
   const polarity = rubric.intentPolarity ?? rubric.intentPolarityProposal?.value ?? null;
@@ -300,4 +312,115 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
   if (criteria.length === 0) flags.push({ code: "no_criteria", message: "the rubric has no criteria", target: "rubric" });
 
   return { errors, flags };
+}
+
+/**
+ * (#203) Shape checks for the stored question plan. Every problem is an ERROR:
+ * a plan that names an id the version does not have, lists a question twice,
+ * or merges inconsistently must never be stored, because the read side would
+ * have to guess. A plan only ever names this version's own questions and
+ * document items; it never adds one.
+ */
+function validateQuestionPlan(
+  rubric: VisaRubric,
+  questionIds: ReadonlySet<string>,
+  evidenceKeys: ReadonlySet<string>,
+  err: (code: string, message: string, target?: string) => void
+): void {
+  const plan = rubric.questionPlan as unknown as Record<string, unknown> | null;
+  const bad = (message: string, target = "questionPlan") => err("question_plan_invalid", message, target);
+  if (!plan || typeof plan !== "object" || Array.isArray(plan)) return bad("questionPlan must be an object");
+  const list = (key: string): unknown[] | null => (Array.isArray(plan[key]) ? (plan[key] as unknown[]) : null);
+  if (typeof plan.algorithmVersion !== "string" || !plan.algorithmVersion) bad("algorithmVersion is required");
+
+  // ---- omitted questions / document items ----
+  const omittedQ = list("omittedQuestions");
+  const omittedE = list("omittedEvidence");
+  if (!omittedQ || !omittedE) return bad("omittedQuestions and omittedEvidence must be lists");
+  const omittedQuestionIds = new Set<string>();
+  for (const o of omittedQ as { id?: unknown; failed?: unknown }[]) {
+    if (!o || typeof o.id !== "string" || !questionIds.has(o.id)) bad("omittedQuestions names a question this version does not have", String(o?.id));
+    else if (omittedQuestionIds.has(o.id)) bad("a question is omitted twice", o.id);
+    else omittedQuestionIds.add(o.id);
+    if (!Array.isArray(o?.failed) || o.failed.some((f) => typeof f !== "string")) bad("omittedQuestions.failed must be a list of aspects", String(o?.id));
+  }
+  const seenKeys = new Set<string>();
+  for (const o of omittedE as { key?: unknown; failed?: unknown }[]) {
+    if (!o || typeof o.key !== "string" || !evidenceKeys.has(o.key)) bad("omittedEvidence names a document item this version does not have", String(o?.key));
+    else if (seenKeys.has(o.key)) bad("a document item is omitted twice", o.key);
+    else seenKeys.add(o.key);
+    if (!Array.isArray(o?.failed) || o.failed.some((f) => typeof f !== "string")) bad("omittedEvidence.failed must be a list of aspects", String(o?.key));
+  }
+
+  // ---- merges: a star over existing, kept questions ----
+  const merges = list("merges");
+  if (!merges) return bad("merges must be a list");
+  const from = new Set<string>();
+  const to = new Set<string>();
+  for (const m of merges as { from?: unknown; to?: unknown }[]) {
+    if (!m || typeof m.from !== "string" || typeof m.to !== "string") {
+      bad("a merge needs from and to");
+      continue;
+    }
+    if (!questionIds.has(m.from) || !questionIds.has(m.to)) bad("a merge names a question this version does not have", m.from);
+    if (m.from === m.to) bad("a question cannot be merged into itself", m.from);
+    if (from.has(m.from)) bad("a question is merged away twice", m.from);
+    if (omittedQuestionIds.has(m.from) || omittedQuestionIds.has(m.to)) bad("a merge names an omitted question", m.from);
+    from.add(m.from);
+    to.add(m.to);
+  }
+  for (const id of to) if (from.has(id)) bad("a merge target is itself merged away", id);
+
+  // ---- proposed conditions ----
+  const conditions = list("proposedConditions");
+  if (!conditions) return bad("proposedConditions must be a list");
+  const conditioned = new Set<string>();
+  for (const c of conditions as { questionId?: unknown; showWhen?: { anyOf?: unknown } }[]) {
+    if (!c || typeof c.questionId !== "string" || !questionIds.has(c.questionId)) {
+      bad("proposedConditions names a question this version does not have", String(c?.questionId));
+      continue;
+    }
+    if (conditioned.has(c.questionId)) bad("a question has two proposed conditions", c.questionId);
+    conditioned.add(c.questionId);
+    if (from.has(c.questionId) || omittedQuestionIds.has(c.questionId)) bad("a proposed condition names a merged or omitted question", c.questionId);
+    const anyOf = c.showWhen?.anyOf;
+    if (!Array.isArray(anyOf) || anyOf.length === 0) {
+      bad("a proposed condition needs at least one condition", c.questionId);
+      continue;
+    }
+    for (const cond of anyOf as { questionId?: unknown; op?: unknown }[]) {
+      if (!cond || typeof cond.questionId !== "string" || !questionIds.has(cond.questionId)) bad("a proposed condition reads a question this version does not have", c.questionId);
+      else if (cond.questionId === c.questionId) bad("a question cannot wait on itself", c.questionId);
+      if (!cond || !["eq", "neq", "in"].includes(String(cond.op))) bad("a proposed condition has an unknown operator", c.questionId);
+    }
+  }
+
+  // ---- dropped triggers (INTEGRATION): this version's own rules that carry a trigger ----
+  if (plan.droppedTriggerCriterionIds !== undefined) {
+    const dropped = plan.droppedTriggerCriterionIds;
+    if (!Array.isArray(dropped)) bad("droppedTriggerCriterionIds must be a list");
+    else {
+      const withTrigger = new Set(rubric.criteria.filter((c) => c.trigger !== undefined).map((c) => c.criterionId));
+      const seen = new Set<string>();
+      for (const id of dropped) {
+        if (typeof id !== "string" || !withTrigger.has(id)) bad("droppedTriggerCriterionIds names a rule that has no trigger in this version", String(id));
+        else if (seen.has(id)) bad("a trigger is dropped twice", id);
+        else seen.add(id);
+      }
+    }
+  }
+
+  // ---- order ----
+  const order = list("order");
+  if (!order) return bad("order must be a list");
+  const placed = new Set<string>();
+  for (const id of order) {
+    if (typeof id !== "string" || !questionIds.has(id)) bad("order names a question this version does not have", String(id));
+    else if (placed.has(id)) bad("a question appears twice in the order", id);
+    else {
+      placed.add(id);
+      if (from.has(id) || omittedQuestionIds.has(id)) bad("order names a merged or omitted question", id);
+    }
+  }
+  if (!plan.sizing || typeof plan.sizing !== "object") bad("sizing is required");
 }

@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import type { AssessmentCriterion, VisaRubric, IntentPolarity } from "../../scrapers";
+import type { DecisionStage } from "../../types/rubric";
 import type {
   CredibilityFlag,
   InsufficientItem,
@@ -482,6 +483,93 @@ export function judgementCriteriaOf(rubric: Pick<VisaRubric, "criteria">): Asses
   return rubric.criteria.filter((c) => c.kind === "judgement");
 }
 
+// ----- Batching (#207): a long rulebook never shrinks, it is split -----
+
+/**
+ * Most judgement criteria one stage 3 call is asked about. A rulebook keeps
+ * every rule the guidance states, so the rules that apply to ONE applicant can
+ * number in the hundreds; one call over all of them would pass the model's
+ * output limit (12 000 tokens: about 300 per rule at this size) and fail as a
+ * whole. Above this the rules are split into several calls, never dropped.
+ */
+export const JUDGEMENT_BATCH_MAX_CRITERIA = 40;
+
+/**
+ * The order a caseworker applies the stages in (the contract in
+ * types/rubric.ts DECISION_STAGES). Written out here, typed against the
+ * stage type, because a value import from the rubric module is not allowed
+ * outside it (see the boundary test).
+ */
+const STAGE_ORDER: readonly DecisionStage[] = ["validity", "suitability", "eligibility", "credibility"];
+
+/** Most characters of rule text (titles, factors, quotes) in one stage 3 call. */
+export const JUDGEMENT_BATCH_MAX_CHARS = 50_000;
+
+/** Characters one criterion adds to the criteria block of a stage 3 request. */
+function criterionBlockChars(c: AssessmentCriterion): number {
+  return c.criterionId.length + c.title.length + (c.probeFactors ?? []).join("; ").length + c.source.quote.length + 60;
+}
+
+/**
+ * Split the judgement criteria of ONE applicant into the groups each stage 3
+ * call is asked about. Pure and deterministic: the same criteria always give
+ * the same batches, so the same inputs make the same calls.
+ *
+ *  - criteria are grouped by decision STAGE, in the order a caseworker applies
+ *    them (validity, suitability, eligibility, credibility), keeping rubric
+ *    order inside a stage: a call reasons about rules of one kind;
+ *  - consecutive stage groups share a call while they fit under both limits
+ *    (JUDGEMENT_BATCH_MAX_CRITERIA, JUDGEMENT_BATCH_MAX_CHARS), so a short
+ *    list is still ONE call, exactly as before;
+ *  - a stage group that is over a limit by itself is cut into consecutive
+ *    runs that each fit.
+ *
+ * EVERY input criterion is in exactly one batch (a test asserts it): nothing
+ * is truncated. The caller makes one request per batch and keeps the spend
+ * caps, so a rulebook too large for the caps fails with the cap error rather
+ * than being assessed in part.
+ */
+export function planJudgementBatches(criteria: readonly AssessmentCriterion[]): AssessmentCriterion[][] {
+  const stageRank = (c: AssessmentCriterion) => {
+    const i = STAGE_ORDER.indexOf(c.stage);
+    return i < 0 ? STAGE_ORDER.length : i;
+  };
+  // Stable sort by stage (Array.prototype.sort is stable): rubric order inside a stage.
+  const ordered = criteria.map((c, i) => ({ c, i })).sort((a, b) => stageRank(a.c) - stageRank(b.c) || a.i - b.i).map((x) => x.c);
+  const batches: AssessmentCriterion[][] = [];
+  let current: AssessmentCriterion[] = [];
+  let chars = 0;
+  for (const c of ordered) {
+    const size = criterionBlockChars(c);
+    const wouldOverflow = current.length >= JUDGEMENT_BATCH_MAX_CRITERIA || (current.length > 0 && chars + size > JUDGEMENT_BATCH_MAX_CHARS);
+    if (wouldOverflow) {
+      batches.push(current);
+      current = [];
+      chars = 0;
+    }
+    current.push(c);
+    chars += size;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+/**
+ * Combine the validated answers of several stage 3 calls into one, by
+ * concatenation in batch order, summing the counters. Each batch's ids were
+ * checked against that batch alone, so the union is exactly the criteria asked.
+ */
+export function mergeJudgementOutputs(outputs: readonly JudgementOutput[]): JudgementOutput {
+  return {
+    findings: outputs.flatMap((o) => o.findings),
+    strengths: outputs.flatMap((o) => o.strengths),
+    statementNotes: outputs.flatMap((o) => o.statementNotes),
+    suspiciousPassages: [...new Set(outputs.flatMap((o) => o.suspiciousPassages))],
+    dropped: outputs.reduce((n, o) => n + o.dropped, 0),
+    unanchored: outputs.reduce((n, o) => n + o.unanchored, 0),
+  };
+}
+
 /** The polarity sentence. Taken from the rubric's decision; never inferred by the model. */
 export function polaritySentence(polarity: IntentPolarity | null): string {
   switch (polarity) {
@@ -739,6 +827,15 @@ export interface AssembleInput {
   suspiciousDocumentIds: string[];
   // Judgement was requested but the stage failed: recorded as insufficient on every judgement criterion.
   judgementFailed: boolean;
+  // (#207) Judgement ran in several calls and SOME failed: the criteria of
+  // the failed calls are recorded as insufficient (the others keep their
+  // findings). Never a pass, never a subset reported as the whole.
+  unjudgedCriterionIds?: string[];
+  // (#207) Criteria whose applicability to this applicant could not be
+  // decided (trigger question unanswered, or a specialist rule with no valid
+  // trigger). They are in the rubric, so they are reported here as "could not
+  // be assessed", not as a failure and not as a pass.
+  notAssessed?: InsufficientItem[];
 }
 
 /** Why judgement did not run on a route that has judgement criteria. */
@@ -801,6 +898,9 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     }
   }
 
+  // (#207) Rules whose applicability could not be decided are reported, not dropped.
+  for (const n of input.notAssessed ?? []) insufficient.push(n);
+
   let judgementOutcome: StageOutcomes["judgement"] = "not_run";
   const judgementIds = new Set(judgementCriteriaOf(rubric).map((c) => c.criterionId));
   if (input.judgementFailed) {
@@ -816,6 +916,11 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     }
   } else if (input.judgement) {
     judgementOutcome = "clear";
+    // (#207) Criteria of a judgement call that failed while others succeeded.
+    for (const id of input.unjudgedCriterionIds ?? []) {
+      const c = criterionById(rubric, id);
+      if (c) insufficient.push({ criterionId: id, title: c.title, reason: "the judgement check could not be completed" });
+    }
     for (const f of input.judgement.findings) {
       const c = criterionById(rubric, f.criterionId);
       if (!c || !f.concern) continue;
@@ -894,17 +999,22 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     credibility: credibilityFlags.length > 0 ? "at_risk" : "clear",
   };
 
+  // (#207) A specialist rule that cannot be tied to any question ("no_trigger")
+  // is listed, but cannot be resolved by the applicant either, so it does not
+  // lower the band or the confidence (else every applicant on a route with
+  // unlinked specialist rules would be capped for something nobody can fix).
+  const countable = insufficient.filter((i) => i.notAssessed !== "no_trigger");
   const readiness = readinessFor({
     hit: input.mandatoryHits.length > 0,
     refusalCount: refusalGrounds.length,
     score: input.score,
-    insufficientCount: insufficient.length,
+    insufficientCount: countable.length,
     flagCount: credibilityFlags.length,
     documentCount: input.documents.length,
   });
 
   const confidence: AssessmentContent["confidence"] =
-    insufficient.length === 0 && input.documents.length > 0 ? "high" : insufficient.length <= 2 ? "medium" : "low";
+    countable.length === 0 && input.documents.length > 0 ? "high" : countable.length <= 2 ? "medium" : "low";
 
   return {
     stageOutcomes,
@@ -966,7 +1076,8 @@ export function topIssuesOf(rubric: Pick<VisaRubric, "criteria" | "severityLevel
   const candidates = new Set<string>([
     ...content.refusalGrounds.map((g) => g.criterionId),
     ...content.credibilityFlags.map((f) => f.criterionId),
-    ...content.insufficientInformation.map((i) => i.criterionId),
+    // (#207) A rule that could not be told to apply is not an "issue" to show.
+    ...content.insufficientInformation.filter((i) => !i.notAssessed).map((i) => i.criterionId),
   ]);
   const ranked = [...candidates]
     .map((id) => {

@@ -50,6 +50,8 @@ still catches `run_failed`, the other per-run rules are lost for that run.
 | `budget_hard_stop` (#96) | `budget_hard_stop:visa` | a visa run's `summary.budgetHardStop` is true: the hard stop (`appConfig/scraperSettings.budget.hardStop`) skipped extraction because month-to-date cost reached the budget | a visa run that checked the budget and found it under (`budgetChecked && !budgetOver`), or the hourly check: stop off / no budget / spend under budget | critical |
 | `settings_unreadable` (#96) | `settings_unreadable:scrapers` | hourly: `appConfig/scraperSettings` could not be read (scheduled ticks fail closed meanwhile) | a later read succeeds | critical |
 | `infrastructure_error` (#143) | `infrastructure_error:guidance` | post-run, guidance runs: `summary.infrastructureErrors` non-empty (Cloud Storage / Firestore failed on our side; never blames a source). A persistent outage bumps this one alert | the next guidance run with an empty `infrastructureErrors` | critical |
+| `rubric_auto_published` (#201) | `rubric_auto_published:<routeKey>__v<n>` | raised by the rubric publish pipeline (`rubricAutoPublishService`, not a scan) once per automatic publish: subject type `rubric_route`; the message is the whole report (version and the one it replaced, kept / left out by reason / held, primary-source leave-outs by title and reference, informational flag counts, the 10-rule sample audit chosen by hash of criterion id + version, link to `{APP_URL}/admin/visa-review?tab=rubrics&rubric=<routeKey>__v<n>`) | never auto-resolved (an admin acknowledges it after the spot check) | warning (emails immediately under the default config) |
+| `rubric_draft_held` (#201) | `rubric_draft_held:<routeKey>__v<n>` | raised once per held draft (a gate failed, a shared-transaction refusal such as `NOT_LATEST_VERSION`, a pipeline error, or unreadable publish settings): the reasons in words, counts, the same link. A re-run of the same version bumps it | a LATER version of the route publishes (resolves every held alert of the route), or the held version is rejected or approved by hand | warning; **critical** for a protected-rule hold or `settings_unreadable` |
 | `review_queue_stale` | `review_queue_stale:visa` | a scraped visa pending review (queued at max(createdAt, restoredAt)) or an open `pendingVisaChanges` row waiting longer than `reviewQueueMaxAgeDays` | nothing is that old | info |
 
 How `host_backoff` sees hosts: visa page lines (`pages[]`, every line's host is
@@ -248,3 +250,16 @@ same rules as visa and news: `run_failed`, `run_stuck`, `host_backoff`, and
 `source_broken`, where a guidance source's `failing` status counts as `broken`
 (`source_broken:guidance:<sourceId>`, auto-resolved when the source is `active`
 again). `infrastructure_error` is guidance-only.
+
+## Rubric rules (issue #201)
+
+`rubric_auto_published` and `rubric_draft_held` are the only rules that are not
+found by a check: the publish pipeline (`src/services/rubric-auto-publish.service.ts`)
+hands the facts of one run to `evaluateRubricAutoPublished` /
+`evaluateRubricDraftHeld` / `evaluateRubricHeldCleared` (in
+`scrape-alert-rules.ts`) and applies them with `scrapeAlertService.raise`, which
+upserts, auto-resolves and emails exactly like the scheduled rules, and NEVER
+throws: an alert failure cannot fail or undo a publish. Both are subject to the
+usual config in `appConfig/scrapeAlerts` (`rules.<rule>.enabled`,
+`rules.<rule>.severity`). In `manual` publish mode neither rule is ever raised.
+The message carries the report because the alert email shows the message.

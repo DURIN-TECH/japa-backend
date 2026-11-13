@@ -3,7 +3,7 @@
 // ============================================
 //
 // The helper over the in-memory Firestore. State changes go through the REAL
-// settings service (approve, revoke, switch, account-wide) so the tests prove
+// settings service (approve, revoke, account-wide) so the tests prove
 // the rule reads what the writes produce, with nothing cached in between.
 
 import assert from "node:assert/strict";
@@ -97,31 +97,22 @@ describe("rule through the helper (state built with the real writers)", () => {
     assert.deepEqual(await released(), AGENT_ONLY);
   });
 
-  test("switched off by the applicant, by the agent, by both then back on by one (stays off)", async () => {
+  test("old per-chat fields on a conversation are ignored: they neither block nor release (#209)", async () => {
+    // Legacy documents may still carry the retired fields. With an approved pair
+    // the messages are released whatever the old values say.
     seedApproval(APPLICANT);
     seedApproval(AGENT_USER);
-    assert.deepEqual(await released(), BOTH);
-
-    await aiMessageAccessService.setChatSwitch(CONV, APPLICANT, null, true);
-    assert.deepEqual(await released(), [], "applicant off");
-    await aiMessageAccessService.setChatSwitch(CONV, APPLICANT, null, false);
-    assert.deepEqual(await released(), BOTH, "applicant back on");
-
-    await aiMessageAccessService.setChatSwitch(CONV, AGENT_USER, AGENT_DOC, true);
-    assert.deepEqual(await released(), [], "agent off");
-
-    await aiMessageAccessService.setChatSwitch(CONV, APPLICANT, null, true); // both off
-    await aiMessageAccessService.setChatSwitch(CONV, APPLICANT, null, false); // applicant back on
-    assert.deepEqual(await released(), [], "agent still off: stays off");
-    await aiMessageAccessService.setChatSwitch(CONV, AGENT_USER, AGENT_DOC, false);
-    assert.deepEqual(await released(), BOTH, "both on again");
+    store.set(`conversations/${CONV}`, { ...(store.get(`conversations/${CONV}`) as object), aiAccessOffUser: true, aiAccessOffAgent: true });
+    assert.deepEqual(await released(), BOTH, "old switches are not read");
+    // ...and they cannot release anything for a person who does not qualify.
+    resetMessageAccess();
+    seedChat({ aiAccessOffUser: true, aiAccessOffAgent: true });
+    assert.deepEqual(await released(), [], "no approval, no plan: still nothing");
   });
 
-  test("a person who does not qualify can still switch their side off, and it holds back the other's messages", async () => {
+  test("a person who does not qualify holds nothing back: only the qualifying person's messages come out", async () => {
     seedApproval(APPLICANT); // agent has neither approval nor plan
     assert.deepEqual(await released(), APPLICANT_ONLY);
-    await aiMessageAccessService.setChatSwitch(CONV, AGENT_USER, AGENT_DOC, true);
-    assert.deepEqual(await released(), [], "agent (not qualifying) switched off: nothing is released");
   });
 
   describe("account-wide off", () => {
@@ -130,17 +121,13 @@ describe("rule through the helper (state built with the real writers)", () => {
       await aiMessageAccessService.setAccountWideOff(APPLICANT, true);
       assert.deepEqual(await released(), []);
     });
-    test("approval + account-wide off: nothing, then back on: per-chat switches apply as before", async () => {
+    test("approval + account-wide off: nothing, then back on: released again", async () => {
       seedApproval(APPLICANT);
       seedApproval(AGENT_USER);
       await aiMessageAccessService.setAccountWideOff(APPLICANT, true);
       assert.deepEqual(await released(), [], "off");
       await aiMessageAccessService.setAccountWideOff(APPLICANT, false);
-      assert.deepEqual(await released(), BOTH, "back on, chat switch untouched (on)");
-      await aiMessageAccessService.setChatSwitch(CONV, AGENT_USER, AGENT_DOC, true);
-      await aiMessageAccessService.setAccountWideOff(APPLICANT, true);
-      await aiMessageAccessService.setAccountWideOff(APPLICANT, false);
-      assert.deepEqual(await released(), [], "the agent's chat switch still applies");
+      assert.deepEqual(await released(), BOTH, "back on");
     });
     test("applies to a chat created AFTER the setting (new chats)", async () => {
       seedApproval(APPLICANT);
@@ -152,6 +139,14 @@ describe("rule through the helper (state built with the real writers)", () => {
       seedApproval(APPLICANT);
       seedAccountWideOff(AGENT_USER);
       assert.deepEqual(await released(), []);
+    });
+    test("the agent's own account-wide off (set through the real writer) blocks the whole chat, then back on releases", async () => {
+      seedApproval(APPLICANT);
+      seedApproval(AGENT_USER);
+      await aiMessageAccessService.setAccountWideOff(AGENT_USER, true);
+      assert.deepEqual(await released(), []);
+      await aiMessageAccessService.setAccountWideOff(AGENT_USER, false);
+      assert.deepEqual(await released(), BOTH);
     });
   });
 
@@ -175,10 +170,10 @@ describe("read-time evaluation", () => {
     assert.deepEqual(await released(), APPLICANT_ONLY, "older messages follow today's state");
   });
 
-  test("a switch takes effect on the very next call", async () => {
+  test("the account-wide setting takes effect on the very next call", async () => {
     seedApproval(APPLICANT);
     assert.deepEqual(await released(), APPLICANT_ONLY);
-    await aiMessageAccessService.setChatSwitch(CONV, APPLICANT, null, true);
+    await aiMessageAccessService.setAccountWideOff(APPLICANT, true);
     assert.deepEqual(await released(), []);
   });
 });

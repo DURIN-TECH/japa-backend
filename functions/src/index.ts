@@ -82,6 +82,7 @@ export const api = functions
 // ============================================
 
 import { collections } from "./utils/firebase";
+import { rateService, FX_RATE_SECRETS } from "./money";
 import { agentService } from "./services/agent.service";
 import { visaService } from "./services/visa.service";
 import { newsScraperService } from "./scrapers";
@@ -100,6 +101,7 @@ import { bulkReassessmentService } from "./services/ai-bulk-reassessment.service
 import { ruleChangeAlertsService } from "./services/rule-change-alerts.service";
 import { rubricExtractionService } from "./scrapers";
 import type { RubricReviewAuditEntry } from "./services/rubric-review.service";
+import { rubricAutoPublishService } from "./services/rubric-auto-publish.service";
 import { outcomeImportService, outcomeRunWorker, registeredDestinations } from "./scrapers";
 import { documentCheckService } from "./services/ai/document-check.service";
 import { NewsArticle } from "./types/news";
@@ -682,6 +684,28 @@ export const importOutcomeStatistics = functions
   });
 
 /**
+ * Refresh the exchange rate used to charge in a local currency (issue #178).
+ * Every 6 hours: the CBN publishes once per working day, so most ticks just
+ * re-confirm the same rate (which is what keeps it "fresh"); a provider
+ * outage leaves the stored rate serving until the freshness limit in
+ * appConfig/currencies, then pricing reports unavailable. Failures are logged
+ * and recorded on the rate doc, never thrown. Secrets: FX_RATE_SECRETS is
+ * empty until an OANDA key exists (see money/index.ts).
+ */
+export const refreshExchangeRates = functions
+  .runWith({ timeoutSeconds: 120, memory: "256MB", secrets: FX_RATE_SECRETS })
+  .pubsub.schedule("15 */6 * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const outcomes = await rateService.refreshAll();
+    // refreshAll isolates each currency; failures are logged at error level.
+    for (const o of outcomes) {
+      if (o.ok) console.log(`Exchange rate refresh ${o.currency}: ${o.source} ${o.rate}`);
+      else console.error(`Exchange rate refresh ${o.currency}: unavailable (${o.reason})`);
+    }
+  });
+
+/**
  * Manual "Run now" for outcome statistics: the admin API
  * (POST /admin/outcome-statistics/runs) writes an `outcomeStatisticsRunRequests`
  * doc and returns 202; this trigger runs the import with the same 2 GB budget
@@ -866,6 +890,69 @@ export const onGuidanceSourceChanged = functions
     } catch (error) {
       console.error("Re-extraction after a guidance change failed:", error);
     }
+  });
+
+/**
+ * Issue #201: automatic rubric publishing. Fires when a rulebook version is
+ * CREATED (`visaRubrics/{routeKey}/rubricVersions/{version}`): both a manual
+ * first extraction and the automatic re-draft after a guidance change write a
+ * `pending_review` version with an `extractionRunId`. In `auto` mode (see
+ * `appConfig/rubricPublishSettings`) the draft goes through the automatic code
+ * gates and, when every one passes, is published by the system actor through
+ * the SAME approval transaction a human approval uses; otherwise it is HELD and
+ * admins are alerted. In `manual` mode (or with no settings) it does nothing.
+ *
+ * A SEPARATE function from `onGuidanceSourceChanged`: extraction's 540 s budget
+ * is not shared with the independent check (part B), and it has its own
+ * timeout. Binds AI_SECRETS (the check calls a model) and EMAIL_SECRETS (the
+ * alerts email admins). Idempotent per version (`rubricPublishRuns/{id}`), and
+ * it never throws: a failure is recorded as a hold and alerted, so a retry can
+ * never publish twice.
+ */
+export const onRubricVersionCreated = functions
+  .runWith({ memory: "1GB", timeoutSeconds: 540, secrets: [...AI_SECRETS, ...EMAIL_SECRETS] })
+  .firestore.document("visaRubrics/{routeKey}/rubricVersions/{version}")
+  .onCreate(async (snap, context) => {
+    const data = snap.data() as { reviewStatus?: string; extractionRunId?: string } | undefined;
+    // Only a fresh draft written by an extraction run is a candidate.
+    if (data?.reviewStatus !== "pending_review" || !data.extractionRunId) return;
+    const version = Number(context.params.version);
+    if (!Number.isInteger(version) || version < 1) return;
+    const report = await rubricAutoPublishService.onVersionCreated(context.params.routeKey, version);
+    if (report) console.log(`[rubric-auto-publish] ${report.runId}: ${report.outcome}${report.reasonCodes.length ? ` (${report.reasonCodes.join(", ")})` : ""}`);
+  });
+
+/**
+ * Issue #202: every hour, retry the held drafts whose only reasons can clear on
+ * their own (the independent check was unavailable, over a daily cap, or got an
+ * unreadable answer), at most 3 runs per version, only in `auto` mode. The same
+ * pipeline and the same shared approval transaction as the trigger; a retry
+ * reuses the check's stored batches. Binds AI_SECRETS and EMAIL_SECRETS like
+ * the trigger. Never throws.
+ */
+export const sweepHeldRubricDrafts = functions
+  .runWith({ memory: "1GB", timeoutSeconds: 540, secrets: [...AI_SECRETS, ...EMAIL_SECRETS] })
+  .pubsub.schedule("17 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const result = await rubricAutoPublishService.sweepRetryable();
+    if (result.considered > 0) console.log(`[rubric-auto-publish] sweep: ${JSON.stringify(result)}`);
+  });
+
+/**
+ * Issue #201: when a rubric version is decided (approved or rejected, by an
+ * admin or by the automatic publisher), resolve the "draft held" alerts that
+ * decision settles: an approval settles every held draft of the route, a
+ * rejection settles that version's. A separate function on the same audit
+ * document as the two triggers above, so none of them is touched. Writes only
+ * alert state; never throws.
+ */
+export const onRubricDecisionResolveHeldAlerts = functions
+  .runWith({ memory: "256MB", timeoutSeconds: 120 })
+  .firestore.document("rubricReviewHistory/{auditId}")
+  .onCreate(async (snap) => {
+    const entry = snap.data() as RubricReviewAuditEntry;
+    await rubricAutoPublishService.afterDecision(entry);
   });
 
 /**

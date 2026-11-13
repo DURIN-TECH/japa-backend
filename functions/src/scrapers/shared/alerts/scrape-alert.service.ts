@@ -153,6 +153,8 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   source_no_yield: "source returns no articles",
   settings_unreadable: "scraper settings unreadable",
   infrastructure_error: "guidance crawl infrastructure error",
+  rubric_auto_published: "rulebook published automatically",
+  rubric_draft_held: "rulebook draft held",
 };
 
 /** Cloud Logging severity per alert severity (resolutions log as INFO). */
@@ -483,6 +485,25 @@ export class ScrapeAlertService {
     if (hourly) await this.clearEmailPending(toEmail);
     const digestSent = hourly ? await this.sendDigestIfDue(config, nowMs) : false;
     return { actions, emailed, recipients, digestSent, skippedRules };
+  }
+
+  /**
+   * Apply evaluations raised by ANOTHER pipeline (issue #201: the rubric
+   * publish pipeline hands the facts of one run to the rubric rules) and email
+   * the new / escalated ones like any other alert. NEVER throws: an alert
+   * failure must not fail or undo a publish. Returns the actions taken (empty
+   * when alerting is switched off or failed).
+   */
+  async raise(evals: RuleEvaluation[], config?: ScrapeAlertsConfig): Promise<AlertAction[]> {
+    try {
+      const cfg = config ?? (await this.loadConfig());
+      if (!cfg.enabled) return [];
+      const result = await this.finish(evals, cfg, this.realClock(), [], false);
+      return result.actions;
+    } catch (err) {
+      this.engineError("raise", err);
+      return [];
+    }
   }
 
   /** Run one rule's reads; on failure log, note the rule as skipped, go on. */

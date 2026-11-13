@@ -10,7 +10,6 @@ import {
   markAsRead,
   deleteConversation,
   getConversation,
-  setAiAccess,
 } from "../controllers/messaging.controller";
 
 const router = Router();
@@ -23,11 +22,10 @@ router.use(verifyAuth);
 router.get("/", listConversations);
 router.post("/", requireFeature(FEATURES.MESSAGING), createConversation);
 
-// One conversation (with the caller's AI-access view), and the per-chat AI
-// access switch (issue #172). Any participant can switch their OWN side; it is
-// a privacy control so it is not behind the messaging entitlement.
+// One conversation (with the caller's AI-access view). There is no per-chat AI
+// switch route any more (retired in #209): AI access is off only through the
+// account-wide setting.
 router.get("/:id", getConversation);
-router.put("/:id/ai-access", setAiAccess);
 
 // Message routes (nested under conversation)
 router.get("/:id/messages", getMessages);

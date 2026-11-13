@@ -4,6 +4,9 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { can, forbidden } from "../middleware/authz";
 import { ErrorMessages, sendError, sendSuccess } from "../utils/response";
 import type { RubricReviewStatus } from "../types/rubric";
+// Reached through the scrapers module's public entry point (ESLint boundary, #91).
+import { PublishSettingsValidationError, parsePublishSettingsPatch, readPublishSettingsView, updatePublishSettings } from "../scrapers";
+import { rubricAutoPublishService } from "../services/rubric-auto-publish.service";
 import {
   RUBRIC_LIST_DEFAULT_LIMIT,
   RUBRIC_LIST_MAX_LIMIT,
@@ -24,6 +27,9 @@ import {
 //   GET   /admin/rubrics/:id
 //   PATCH /admin/rubrics/:id/review
 //   POST  /admin/rubrics/:id/exclusion-preview   (read-only; #161)
+//   GET   /admin/rubrics/publish-settings        (#201)
+//   PATCH /admin/rubrics/publish-settings        (#201, audited)
+//   POST  /admin/rubrics/:id/auto-publish        (#201, ?dryRun=true writes nothing)
 //
 // `:id` is `{countryCode}_{visaTypeId}__v{version}`.
 //
@@ -198,6 +204,69 @@ class RubricReviewController {
       sendSuccess(res, result, `Rubric version ${result.action === "approve" ? "approved" : "rejected"}`);
     } catch (error) {
       this.sendServiceError(res, error, "reviewing a rubric version");
+    }
+  }
+
+  /**
+   * GET /admin/rubrics/publish-settings (#201)
+   * The automatic-publishing settings as the pipeline resolves them
+   * (`{ settings, exists, problems }`). A failed read is a 500, never an
+   * invented value.
+   */
+  async getPublishSettings(_req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      sendSuccess(res, await readPublishSettingsView());
+    } catch (error) {
+      this.sendServiceError(res, error, "reading the rubric publish settings");
+    }
+  }
+
+  /**
+   * PATCH /admin/rubrics/publish-settings (#201)
+   * Body: any of `mode` ("manual" | "auto"), `routeAllowlist` (route keys, or
+   * null to clear), `pauseAfterRollback`, `maxLeftOutShare`,
+   * `maxPrimaryLeftOutShare`, `minKeptShareOfServing`. Strict: an unknown key
+   * or a bad value is a 400. Writes an audit doc (who, before, after).
+   * 200 -> the settings after the change.
+   */
+  async patchPublishSettings(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      // The author of the change is the verified caller; a body can never name one.
+      if (!req.userId) {
+        forbidden(res, "Only admins can change the publish settings");
+        return;
+      }
+      const patch = parsePublishSettingsPatch(req.body);
+      sendSuccess(res, await updatePublishSettings(patch, req.userId), "Publish settings updated");
+    } catch (error) {
+      if (error instanceof PublishSettingsValidationError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      this.sendServiceError(res, error, "changing the rubric publish settings");
+    }
+  }
+
+  /**
+   * POST /admin/rubrics/:id/auto-publish?dryRun=true (#201)
+   * Run the automatic pipeline on this PENDING, NEWEST version now, whatever
+   * `mode` is (an explicit admin action), still subject to every gate.
+   * `dryRun=true` writes nothing and returns gates, planned leave-outs and
+   * counts. 200 -> the run report (outcome published | held, reason codes,
+   * gates, counts, leftOut, plannedExcludedCriterionIds, ...). 404 unknown
+   * version; 409 ALREADY_DECIDED (not pending) / NOT_LATEST_VERSION.
+   */
+  async autoPublish(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const raw = req.query.dryRun;
+      if (raw !== undefined && raw !== "true" && raw !== "false") {
+        sendError(res, "VALIDATION_ERROR", "dryRun must be true or false", 400);
+        return;
+      }
+      const report = await rubricAutoPublishService.runOnDraft(req.params.id, { dryRun: raw === "true", trigger: "admin_endpoint" });
+      sendSuccess(res, report);
+    } catch (error) {
+      this.sendServiceError(res, error, "running the automatic rubric publish");
     }
   }
 }

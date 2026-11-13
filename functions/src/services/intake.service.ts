@@ -22,6 +22,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { collections } from "../utils/firebase";
 import { rubricStore, rubricRouteKey } from "../scrapers";
 import { Application, ApplicationStatus } from "../types";
+import { answerIncludesAny, effectiveIntakeQuestions } from "./ai/rule-applicability";
 import {
   ApplicationIntake,
   IntakeCondition,
@@ -100,8 +101,12 @@ async function loadApprovedIntake(
     return null;
   }
   if (!rubric) return null;
-  const questions = Array.isArray(rubric.intakeQuestions) ? rubric.intakeQuestions : [];
-  if (questions.length === 0) return null;
+  if (!Array.isArray(rubric.intakeQuestions) || rubric.intakeQuestions.length === 0) return null;
+  // (#207) A question that only specialist or conditional rules read is shown
+  // only once an answer triggers one of those rules (their `trigger`s become
+  // each question's `showWhen`); one that only unassessable specialist rules
+  // read is left out. See effectiveIntakeQuestions.
+  const questions = effectiveIntakeQuestions(rubric);
   return {
     routeKey: rubricRouteKey(countryCode, visaTypeId),
     version: rubric.version,
@@ -123,7 +128,9 @@ function conditionHolds(cond: IntakeCondition, answers: Record<string, unknown>)
     // An unanswered question is not "different from" the value: stay hidden.
     return actual !== undefined && actual !== null && actual !== cond.value;
   case "in":
-    return Array.isArray(cond.value) && typeof actual === "string" && cond.value.includes(actual);
+    // (#207) A multi-choice answer is an array and a yes/no answer a boolean:
+    // `in` holds when any selected value is one of the wanted ones.
+    return Array.isArray(cond.value) && answerIncludesAny(actual, cond.value.map((v) => String(v)));
   default:
     return false;
   }
@@ -140,12 +147,23 @@ function visibleAnswers(
 ): { visibleIds: Set<string>; effective: Record<string, unknown> } {
   const visibleIds = new Set<string>();
   const effective: Record<string, unknown> = {};
-  for (const q of questions) {
-    const any = q.showWhen?.anyOf;
-    const visible = !any || any.length === 0 || any.some((c) => conditionHolds(c, effective));
-    if (visible) {
-      visibleIds.add(q.id);
-      if (answers[q.id] !== undefined) effective[q.id] = answers[q.id];
+  // (#207) Passes repeat until nothing changes: a question may depend on one
+  // that comes LATER in the list (a rule's triggering question can be asked in
+  // a later part of the guidance), and a hidden question's answer still never
+  // counts. Starting from nothing visible, a question becomes visible only
+  // through questions already visible, so a cycle never makes itself visible.
+  // The list is finite, so at most `questions.length` passes change anything.
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const q of questions) {
+      if (visibleIds.has(q.id)) continue;
+      const any = q.showWhen?.anyOf;
+      const visible = !any || any.length === 0 || any.some((c) => conditionHolds(c, effective));
+      if (visible) {
+        visibleIds.add(q.id);
+        if (answers[q.id] !== undefined) effective[q.id] = answers[q.id];
+        changed = true;
+      }
     }
   }
   return { visibleIds, effective };

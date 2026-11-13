@@ -162,6 +162,13 @@ export const collections = {
   // USD exchange rates (Frankfurter / ECB) the visa scraper converts
   // published fees with (issue #59). No firestore.rules match → clients denied.
   appConfig: db.collection("appConfig"),
+  // Exchange rates for charging in a local currency (issue #178):
+  // `exchangeRates/{CURRENCY}` holds the provider's last rate and an optional
+  // admin override; `exchangeRateAudit` is the append-only history of admin
+  // changes. Config for both lives in `appConfig/currencies`. Backend-only:
+  // no firestore.rules match -> clients denied.
+  exchangeRates: db.collection("exchangeRates"),
+  exchangeRateAudit: db.collection("exchangeRateAudit"),
   // Proposed field-level edits to already-approved scraped visas (issue #61):
   // the crawl stages one `open` row per visa here instead of touching the
   // live doc, and an admin approves/rejects it via /admin/visa-changes.
@@ -232,6 +239,22 @@ export const collections = {
   // so a decision never exists without its record. Append-only.
   // Backend-only: no firestore.rules match -> clients denied.
   rubricReviewHistory: db.collection("rubricReviewHistory"),
+  // Automatic rubric publishing (issue #201). BACKEND-ONLY (no firestore.rules
+  // match, so clients are denied):
+  //  - rubricPublishRuns/{routeKey}__v{version}: one record per version's
+  //    automatic publish run (outcome, gates, leave-outs); created once with
+  //    `create()`, so a re-delivered trigger cannot run a version twice;
+  //  - rubricPublishSettingsHistory/{auto}: who changed
+  //    appConfig/rubricPublishSettings, with before and after.
+  rubricPublishRuns: db.collection("rubricPublishRuns"),
+  rubricPublishSettingsHistory: db.collection("rubricPublishSettingsHistory"),
+  // The independent check's record of one version (issue #202):
+  // `rubricCheckerRuns/{routeKey}__v{version}`, the same id as the publish run.
+  // Holds the closed verdicts (keyed by request hash, so a re-run of the same
+  // version reuses them and calls no model), the per-rule verdicts, and the
+  // calls and tokens spent. Never holds source text or model prose.
+  // Backend-only: no firestore.rules match.
+  rubricCheckerRuns: db.collection("rubricCheckerRuns"),
   // The AI case-officer assessment (issue #42): one document per assessment,
   // which is also its job record. The id is derived from the application id and
   // the input hash, so the same inputs address the same document. Backend-only:
@@ -293,6 +316,13 @@ export const collections = {
   // by admins through /admin/risk-signals. Visible to admins only and never
   // to the subject: backend-only, no firestore.rules match -> clients denied.
   riskSignals: db.collection("riskSignals"),
+  // Agency listing screening results (issue #120): `listingScreenings/{countryCode}__{visaId}`
+  // (the same key as `visaRevisions`), one per listing: code comparisons against
+  // the verified record, the model's validated language flags (with the listing's
+  // own quotes) and the ids of the signals raised. Admin-only, through
+  // GET /admin/visas and the rerun route. Backend-only: no firestore.rules match,
+  // so clients are denied.
+  listingScreenings: db.collection("listingScreenings"),
   // AI message access (issue #172). `aiMessageAccess/{userId}`: one per user, holds
   // their express approval (with the exact wording), the account-wide "off" setting
   // and the one-time-notice dismissal. `aiMessageAccessAudit/{id}`: append-only

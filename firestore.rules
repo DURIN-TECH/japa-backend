@@ -476,19 +476,18 @@ service cloud.firestore {
                      (exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid));
       
-      // AI message access (issue #172): the per-side chat switch and WHO the two
-      // sides are. The switch fields are written ONLY by the backend
-      // (PUT /conversations/:id/ai-access, Admin SDK, which bypasses these rules):
-      // the API enforces "you can change only your own side" and writes the audit
-      // record in the same transaction.
+      // AI message access (issues #172, #209): WHO the two sides are must not be
+      // client-writable. The per-chat switch fields (`aiAccessOffUser/Agent`) are
+      // RETIRED (#209): nothing writes or reads them any more, and clients still
+      // cannot write them (the allow-list below and the create check).
       //
-      // Updates are an ALLOW-LIST, not a deny-list. A deny-list of the two switch
-      // fields was not enough: a participant could rewrite `userId` / `agentId`
-      // (the rule only checks the document as it was BEFORE the write), make the
-      // API see them as both sides, clear the other person's switch, then restore
-      // the ids. So a client may update only the fields below. No client code
-      // writes this document today (mobile and portal only read it, through the
-      // API or a listener); the API writes everything else with the Admin SDK.
+      // Updates are an ALLOW-LIST, not a deny-list. The AI access check resolves
+      // the two people of a chat from `conv.userId` / `conv.agentId`, and the rule
+      // only checks the document as it was BEFORE the write, so a participant who
+      // could rewrite either id could make the check see the wrong people. A client
+      // may therefore update only the fields below. No client code writes this
+      // document today (mobile and portal only read it, through the API or a
+      // listener); the API writes everything else with the Admin SDK.
       function onlyClientEditableConversationFields() {
         return request.resource.data.diff(resource.data).affectedKeys()
                  .hasOnly(['unreadCountUser', 'unreadCountAgent', 'updatedAt']);
@@ -607,6 +606,11 @@ service cloud.firestore {
     //    Do NOT add a match: a rule here could only widen that access.
     //  - appConfig/{docId}: backend config, e.g. appConfig/fx exchange rates
     //    (issue #59).
+    //  - exchangeRates/{currency} and exchangeRateAudit/{id}: the rate used to
+    //    price in a local currency, any admin override of it and the history
+    //    of overrides (issue #178). The public rate view is GET /rates;
+    //    overrides go through /admin/exchange-rates only. A client write here
+    //    would let a user set their own price. Do NOT add a match.
     //  - pendingVisaChanges/{changeId}: proposed field-level edits to
     //    approved scraped visas, staged by the crawl and approved/rejected by
     //    admins via /admin/visa-changes (issue #61). Do NOT add a match.
@@ -615,6 +619,12 @@ service cloud.firestore {
     //    read and decide them through /admin/risk-signals only, so the subject
     //    and every other client principal can never see a signal or a count of
     //    signals. Do NOT add a match, not even an admin one.
+    //  - listingScreenings/{countryCode}__{visaId}: the screening result of an
+    //    agency-created visa listing (code comparison with the verified record,
+    //    validated language flags with the listing's own quotes, signal ids,
+    //    issue #120). Admins read it only through GET /admin/visas and the
+    //    rerun route, so the agency and applicants can never see it. Do NOT add
+    //    a match, not even an admin one.
     //  - guidanceSources/{sourceId} and its snapshots/{contentHash}
     //    subcollection: the caseworker-guidance source registry and the
     //    metadata of its immutable text snapshots (issue #39). Admins read
@@ -628,6 +638,11 @@ service cloud.firestore {
     //    decisions (who approved or rejected which version, why, and which
     //    flags they acknowledged), written with each decision by the admin
     //    review API, /admin/rubrics (issue #125). Do NOT add a match.
+    //  - rubricPublishRuns/{routeKey}__v{version} and
+    //    rubricPublishSettingsHistory/{entryId}: the record of each automatic
+    //    rulebook publish run (gates, leave-outs, outcome) and the audit trail
+    //    of changes to the publish settings (issue #201). Backend only: an
+    //    applicant must never see internal notes. Do NOT add a match.
 
     //  - ruleChangeEvents/{eventId} and ruleChangeNotices/{eventId}__{appId}:
     //    one event per ADMIN-APPROVED rule or visa-record change, and one

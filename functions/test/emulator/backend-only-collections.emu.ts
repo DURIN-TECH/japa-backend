@@ -30,7 +30,18 @@ import { anonymousDb, clientDb, isDenied, resetEmulators, rulesEnv, withoutRules
 /** Top-level backend-only collections (names from src/utils/firebase.ts). */
 const COLLECTIONS = [
   "riskSignals",
+  // Agency listing screening results (issue #120): admin-only through the API.
+  "listingScreenings",
   "rubricReviewHistory",
+  // Automatic rubric publishing (issue #201): the run record of each version
+  // and the audit of changes to the publish settings. Internal notes: an
+  // applicant (or anyone) must never read or write them from a client.
+  "rubricPublishRuns",
+  "rubricPublishSettingsHistory",
+  // appConfig/{docId} is backend config. It now holds the automatic-publishing
+  // kill switch (appConfig/rubricPublishSettings, issue #201), so a client that
+  // could write it could turn automatic publishing on.
+  "appConfig",
   "applicationAssessments",
   "aiConversations",
   "aiChatUsage",

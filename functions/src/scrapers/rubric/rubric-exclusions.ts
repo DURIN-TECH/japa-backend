@@ -1,4 +1,5 @@
 import type { AssessmentCriterion, EvidenceItem, IntakeQuestion, VisaRubric } from "../../types/rubric";
+import { applyPlanShape } from "./rubric-question-plan";
 
 // ============================================
 // RUBRIC — CRITERION EXCLUSIONS (issue #161)
@@ -64,7 +65,7 @@ export interface ExclusionPreview {
  * (`no_kept_criterion`), or the question its condition reads is itself dropped
  * so the condition can never be true (`depends_on_dropped_question`).
  */
-export type DropReason = "no_kept_criterion" | "depends_on_dropped_question";
+export type DropReason = "no_kept_criterion" | "depends_on_dropped_question" | "failed_check";
 
 export interface DroppedIntakeQuestion {
   id: string;
@@ -90,7 +91,24 @@ export interface DroppedEvidenceItem {
 
 /** The parts of a rubric the filter reads and rewrites. */
 type Filterable = Pick<VisaRubric, "criteria" | "intakeQuestions" | "evidenceItems"> &
-  Partial<Pick<VisaRubric, "excludedCriterionIds" | "exclusionNote" | "evidenceHelpsCriterionIds">>;
+  Partial<Pick<VisaRubric, "excludedCriterionIds" | "exclusionNote" | "evidenceHelpsCriterionIds" | "questionPlan">>;
+
+/**
+ * (#203) The wording check's omissions stored in the question plan. A question
+ * or document item the automatic check found wrong is dropped through the SAME
+ * dependency analysis as an excluded rule's questions, so its dependents go
+ * with it. This is a correctness removal; the linked rules stay.
+ */
+function planOmissions(rubric: Filterable): { questions: Set<string>; evidence: Set<string> } {
+  const plan = rubric.questionPlan;
+  const questions = new Set<string>();
+  const evidence = new Set<string>();
+  if (plan && typeof plan === "object") {
+    for (const o of Array.isArray(plan.omittedQuestions) ? plan.omittedQuestions : []) if (o && typeof o.id === "string") questions.add(o.id);
+    for (const o of Array.isArray(plan.omittedEvidence) ? plan.omittedEvidence : []) if (o && typeof o.key === "string") evidence.add(o.key);
+  }
+  return { questions, evidence };
+}
 
 /** The ids actually excluded: listed, present in the rubric, and not a mandatory bar. */
 function effectiveExcluded(rubric: Filterable): Set<string> {
@@ -126,6 +144,9 @@ function analyseDrops(rubric: Filterable, excluded: ReadonlySet<string>): DropAn
 
   // ---- questions whose every linked criterion is excluded ----
   for (const q of questions) if (allExcluded(q.criterionIds, excluded)) dq.set(q.id, { reason: "no_kept_criterion" });
+  // ---- (#203) questions the automatic wording check failed: seed the same analysis ----
+  const omitted = planOmissions(rubric);
+  for (const q of questions) if (!dq.has(q.id) && omitted.questions.has(q.id)) dq.set(q.id, { reason: "failed_check" });
 
   // ---- dead conditions: repeat until no further question becomes unreachable ----
   for (let changed = true; changed; ) {
@@ -147,6 +168,7 @@ function analyseDrops(rubric: Filterable, excluded: ReadonlySet<string>): DropAn
   const de = new Map<string, { reason: DropReason; dependsOn?: string }>();
   for (const e of evidence) {
     if (allExcluded(e.criterionIds, excluded)) de.set(e.key, { reason: "no_kept_criterion" });
+    else if (omitted.evidence.has(e.key)) de.set(e.key, { reason: "failed_check" });
     else if (e.when && dq.has(e.when.questionId)) de.set(e.key, { reason: "depends_on_dropped_question", dependsOn: e.when.questionId });
   }
   return { questions: dq, evidence: de };
@@ -160,15 +182,41 @@ function analyseDrops(rubric: Filterable, excluded: ReadonlySet<string>): DropAn
  * describe a decision about content that is no longer there.
  */
 export function applyExclusions<T extends Filterable>(rubric: T): T {
+  // INTEGRATION (#200 + #207): after the exclusions and the plan's shape, ignore the triggers the
+  // independent check could not confirm. Done HERE (the one read-side filter every consumer and
+  // the planner itself go through) so intake, assessment, checklist, chat and the background
+  // readers cannot disagree. The rules stay; only their `trigger` is removed from what is served.
+  const dropped = rubric.questionPlan?.droppedTriggerCriterionIds;
+  const served = applyExclusionsCore(rubric);
+  if (!Array.isArray(dropped) || dropped.length === 0) return served;
+  const ids = new Set(dropped);
+  if (!served.criteria.some((c) => c.trigger !== undefined && ids.has(c.criterionId))) return served;
+  return { ...served, criteria: served.criteria.map((c) => (c.trigger !== undefined && ids.has(c.criterionId) ? withoutTrigger(c) : c)) };
+}
+
+/** A copy of a rule without its trigger. */
+function withoutTrigger(c: AssessmentCriterion): AssessmentCriterion {
+  const { trigger: _trigger, ...rest } = c;
+  void _trigger;
+  return rest;
+}
+
+/** The exclusions, merges, conditions and order (everything `applyExclusions` did before the integration). */
+function applyExclusionsCore<T extends Filterable>(rubric: T): T {
   const excluded = effectiveExcluded(rubric);
-  if (excluded.size === 0) {
-    // Nothing to remove. Still strip a stored-but-empty list so the shape is
-    // the same either way for the consumer.
-    if (rubric.excludedCriterionIds === undefined && rubric.exclusionNote === undefined) return rubric;
-    const { excludedCriterionIds: _ids, exclusionNote: _note, ...rest } = rubric;
+  const omittedByPlan = planOmissions(rubric);
+  if (excluded.size === 0 && omittedByPlan.questions.size === 0 && omittedByPlan.evidence.size === 0) {
+    // Nothing to remove. Still strip a stored-but-empty list (and the plan,
+    // after applying its merges / conditions / order) so the shape is the
+    // same either way for the consumer.
+    const hasPlan = rubric.questionPlan !== undefined;
+    if (rubric.excludedCriterionIds === undefined && rubric.exclusionNote === undefined && !hasPlan) return rubric;
+    const { excludedCriterionIds: _ids, exclusionNote: _note, questionPlan: _plan, ...rest } = rubric;
     void _ids;
     void _note;
-    return rest as unknown as T;
+    void _plan;
+    const bare = rest as unknown as T & Filterable;
+    return (hasPlan && rubric.questionPlan ? applyPlanShape(bare, rubric.questionPlan) : bare) as unknown as T;
   }
 
   const questions: IntakeQuestion[] = Array.isArray(rubric.intakeQuestions) ? rubric.intakeQuestions : [];
@@ -196,13 +244,17 @@ export function applyExclusions<T extends Filterable>(rubric: T): T {
     .filter((c) => !excluded.has(c.criterionId))
     .map((c) => (c.intakeQuestionIds ? { ...c, intakeQuestionIds: c.intakeQuestionIds.filter((id) => !dropped.has(id)) } : c));
 
-  const { excludedCriterionIds: _ids, exclusionNote: _note, ...rest } = rubric;
+  const { excludedCriterionIds: _ids, exclusionNote: _note, questionPlan: _plan, ...rest } = rubric;
   void _ids;
   void _note;
-  const out = { ...rest, criteria: keptCriteria, intakeQuestions: keptQuestions, evidenceItems: keptEvidence } as unknown as T & Filterable;
+  void _plan;
+  let out = { ...rest, criteria: keptCriteria, intakeQuestions: keptQuestions, evidenceItems: keptEvidence } as unknown as T & Filterable;
+  // ---- (#203) the plan's merges, conditions and order, on what is left ----
+  // After the removals, so a merge or an order never names a dropped question.
+  if (rubric.questionPlan) out = applyPlanShape(out, rubric.questionPlan);
   // ---- 4c. admin tag of criteria where extra evidence helps ----
   if (Array.isArray(rubric.evidenceHelpsCriterionIds)) out.evidenceHelpsCriterionIds = rubric.evidenceHelpsCriterionIds.filter((id) => !excluded.has(id));
-  return out;
+  return out as T;
 }
 
 /**

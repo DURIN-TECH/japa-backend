@@ -43,6 +43,15 @@ import { notificationService, NotifyUserInput } from "../services/notification.s
 import { assertVisaApprovable } from "../scrapers";
 import { AGENCY_VISA_CONTENT_FIELDS, AgencyVisaError } from "./agency-visa.validation";
 import { revisionId } from "./agency-visa.service";
+// Issue #120: screening results on the admin list, and the approve gate.
+import {
+  agencyVisaScreeningService,
+  isScreeningClean,
+  screeningKey,
+  screeningTargetFor,
+} from "./agency-visa-screening.service";
+import { screeningContentHash } from "../services/ai/listing-screening-prompt";
+import type { ListingScreening } from "../types/listing-screening";
 
 // ============================================
 // Types
@@ -74,6 +83,14 @@ export type AdminVisaRow = VisaType & {
   countryName: string;
   agencyName?: string | null;
   pendingRevision?: VisaRevision | null;
+  /**
+   * Issue #120, agency rows only: the listing screening result (the stored
+   * `listingScreenings` doc, or null when none ran) and the count of active
+   * risk signals about this visa. ADMIN-ONLY: they come from this admin list
+   * and nowhere else.
+   */
+  screening?: ListingScreening | null;
+  openScreeningSignals?: number;
 };
 
 /**
@@ -98,6 +115,12 @@ export interface AgencyVisaReviewInput {
    * visa has a pending revision; ignored otherwise.
    */
   revisionUpdatedAtMillis?: number;
+  /**
+   * Issue #120: the admin has seen the screening result and approves anyway.
+   * Without it, approve is refused (409 SCREENING_OPEN) unless the screening
+   * is clean. Ignored on reject.
+   */
+  acknowledgeScreening?: boolean;
 }
 
 /**
@@ -138,6 +161,13 @@ const notFound = () => new AgencyVisaError("NOT_FOUND", "Visa type not found", 4
  * show "add the government fee first" instead of the scraped-fee message.
  */
 export const VISA_COST_MISSING = "VISA_COST_MISSING";
+
+/**
+ * Approve of an agency visa whose listing screening is not clean (no result for
+ * this content, a failed language check, a mismatch or a flag) and the body had
+ * no `acknowledgeScreening: true` (issue #120). Nothing is written.
+ */
+export const SCREENING_OPEN = "SCREENING_OPEN";
 
 // ============================================
 // Pure helpers (exported for tests)
@@ -227,6 +257,28 @@ export function assertAgencyVisaApprovable(visa: VisaType): void {
   assertVisaApprovable(visa);
 }
 
+/**
+ * Issue #120: refuse an approve whose screening is not clean for the content
+ * about to go live, unless the admin acknowledged it. Pure apart from the throw;
+ * runs before any write, so nothing is written on a 409. A listing therefore
+ * never goes live without a person having seen the result.
+ */
+export function assertScreeningAcknowledged(
+  doc: ListingScreening | null,
+  target: ReturnType<typeof screeningTargetFor>,
+  acknowledged: boolean | undefined
+): void {
+  if (acknowledged === true || !target) return;
+  const clean = isScreeningClean(doc, { target: target.target, contentHash: screeningContentHash(target.target, target.content) });
+  if (clean) return;
+  throw new AgencyVisaError(
+    SCREENING_OPEN,
+    "This listing has screening results that need your attention before it goes live. " +
+      "Review them, then approve again with acknowledgeScreening set to true.",
+    409
+  );
+}
+
 /** 409 for an agency visa that is not waiting for review. */
 function notInReview(status: string | undefined): AgencyVisaError {
   return new AgencyVisaError(
@@ -287,6 +339,9 @@ class AgencyVisaReviewService {
     const agencyRows = rows.filter((v) => v.source === AGENCY_VISA_SOURCE);
     if (agencyRows.length === 0) return rows;
 
+    // Issue #120: screening result + open signal count, admin-only (this list).
+    const screenings = await agencyVisaScreeningService.adminViews(agencyRows);
+
     // ---- Enrichment: agency names + pending revisions ----
     const agencyIds = [...new Set(agencyRows.map((v) => v.ownerAgencyId).filter((id): id is string => !!id))];
     const [names, revSnap] = await Promise.all([
@@ -302,6 +357,8 @@ class AgencyVisaReviewService {
         ...v,
         agencyName: v.ownerAgencyId ? names.get(v.ownerAgencyId) ?? null : null,
         pendingRevision: revisions.get(revisionId(v.countryCode, v.id)) ?? null,
+        screening: screenings.get(screeningKey(v.countryCode, v.id))?.screening ?? null,
+        openScreeningSignals: screenings.get(screeningKey(v.countryCode, v.id))?.openScreeningSignals ?? 0,
       };
     });
   }
@@ -375,6 +432,10 @@ class AgencyVisaReviewService {
       }
       const revSnap = await tx.get(revRef);
       const revision = revSnap.exists ? (revSnap.data() as VisaRevision) : null;
+      // Issue #120: the screening result, read with the other reads so the
+      // approve gate below decides on what is stored right now.
+      const screeningSnap = await tx.get(collections.listingScreenings.doc(screeningKey(cc, input.visaId)));
+      const screening = screeningSnap.exists ? (screeningSnap.data() as ListingScreening) : null;
 
       const now = this.now();
       const status = visa.reviewStatus;
@@ -386,6 +447,7 @@ class AgencyVisaReviewService {
       if (status === "pending_review") {
         if (input.action === "approve") {
           assertAgencyVisaApprovable(visa);
+          assertScreeningAcknowledged(screening, screeningTargetFor(visa, null), input.acknowledgeScreening);
           tx.update(ref, {
             reviewStatus: "approved",
             isActive: true,
@@ -434,6 +496,7 @@ class AgencyVisaReviewService {
 
           if (input.action === "approve") {
             assertAgencyVisaApprovable(applyRevision(visa, revision.changes ?? {}));
+            assertScreeningAcknowledged(screening, screeningTargetFor(visa, revision), input.acknowledgeScreening);
             tx.update(ref, {
               ...revisionUpdate(revision.changes ?? {}),
               reviewedBy: input.reviewedBy,

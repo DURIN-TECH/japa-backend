@@ -1,14 +1,13 @@
 // ============================================
-// Emulator test: clients cannot write the AI chat switch directly (issue #172)
+// Emulator test: conversation update allow-list and the retired switch fields (#172, #209)
 // ============================================
 //
 // Run with `npm run test:emulator`. The repo's real firestore.rules through
-// @firebase/rules-unit-testing. The per-side AI switch on a conversation
-// (`aiAccessOffUser` / `aiAccessOffAgent`) may only be written by the backend
-// (PUT /conversations/:id/ai-access), which enforces "own side only" and writes
-// the audit record. A participant who writes the field from a client SDK is
-// refused, whether by update, create or deleting the field; ordinary updates by
-// a participant still work.
+// @firebase/rules-unit-testing. The per-chat AI switch was retired in #209 (the
+// backend route is gone and the old fields are ignored), but the rules still
+// refuse any client write of `aiAccessOffUser` / `aiAccessOffAgent`, and still
+// allow a participant to update ONLY the allow-listed fields (the id-swap and
+// allow-list cases below). Ordinary updates by a participant still work.
 
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -39,7 +38,7 @@ after(async () => {
   await (await rulesEnv()).cleanup();
 });
 
-describe("conversation AI switch is backend-only", () => {
+describe("conversation ids are not client-writable; retired switch fields stay refused", () => {
   test("applicant cannot set or clear either switch field by update", async () => {
     const db = await clientDb(APPLICANT, { role: "client", agencyId: null });
     const ref = db.collection("conversations").doc(CONV);
@@ -67,8 +66,9 @@ describe("conversation AI switch is backend-only", () => {
   });
 
   test("a participant cannot rewrite userId or agentId (the id-swap override attack)", async () => {
-    // Attack: the agent writes userId = own uid so the API sees them on both
-    // sides, clears the applicant's switch, then restores userId.
+    // The AI access check resolves the two people of a chat from userId and
+    // agentId, so a client must never be able to rewrite either one (for example
+    // an agent writing their own uid into userId).
     const agent = await clientDb(AGENT_USER, { role: "agent", agencyId: null });
     const ref = agent.collection("conversations").doc(CONV);
     assert.equal(await isDenied(ref.update({ userId: AGENT_USER })), true);

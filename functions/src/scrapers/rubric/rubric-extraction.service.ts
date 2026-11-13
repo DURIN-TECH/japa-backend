@@ -37,8 +37,12 @@ import {
   type RawCriterion,
   type RawEvidenceItem,
   type RawIntakeQuestion,
+  type RawRuleTrigger,
   type RawRubricOutput,
+  type AcceptedCriterionView,
+  type KnownQuestionView,
 } from "./rubric-prompt";
+import { triggerValuesOf } from "../../services/ai/rule-applicability";
 import {
   SnapshotQuoteIndex,
   appendixNamesIn,
@@ -151,6 +155,8 @@ export interface ExtractRouteResult {
   plan: PlannedSource[];
   chunks: number;
   criteriaAccepted: number;
+  // (#207) Accepted criteria that are specialist-activity rules (kept).
+  specialistKept: number;
   discardedCount: number;
   discardedByReason: Record<string, number>;
   usage: RubricRunUsage;
@@ -330,6 +336,9 @@ export interface ChunkAssessment {
   intake: IntakeMeta | null;
   intakeQuestions: RawIntakeQuestion[];
   evidenceItems: { raw: RawEvidenceItem; source: RubricCitation }[];
+  // (#207) The model's proposed rule triggers (call 2). Resolved and checked
+  // at merge time, when every question of the rubric is known. Absent = none.
+  ruleTriggers?: RawRuleTrigger[];
   // Counts of things done to criteria (see CriterionNotes), for flags.
   counters: { judgementChecksStripped: number; ruleRefsRemoved: number; ruleRefsDerived: number };
 }
@@ -344,6 +353,7 @@ export function combineAssessments(criteriaPart: ChunkAssessment, intakePart: Ch
     intake: intakePart.intake,
     intakeQuestions: intakePart.intakeQuestions,
     evidenceItems: intakePart.evidenceItems,
+    ruleTriggers: intakePart.ruleTriggers ?? [],
     counters: {
       judgementChecksStripped: criteriaPart.counters.judgementChecksStripped + intakePart.counters.judgementChecksStripped,
       ruleRefsRemoved: criteriaPart.counters.ruleRefsRemoved + intakePart.counters.ruleRefsRemoved,
@@ -368,7 +378,6 @@ const DETAIL = {
   citationField: "a supporting citation names a field outside the allowed list",
   citation: "a supporting citation is not in the stored text of the source",
   scope: "from a cross-route source the route's own source does not point to, or not a rule for applicants of the route",
-  specialist: "the rule applies only to a specialist activity or sub-category the source singles out",
   otherRoute: "the text says the rule applies to a different route or category of applicant",
   condition: "the applicability condition is not verbatim in the source",
   ruleRef: "the rule reference is not printed in, or directly before, the quote",
@@ -521,7 +530,7 @@ export function assessChunkOutput(
     else evidenceItems.push({ raw: e, source: cite(found.matched, found.page) });
   }
 
-  return { criteria, discards, suspiciousPassages, polarity, intake: cleanIntakeMeta(raw.intake), intakeQuestions: raw.intakeQuestions, evidenceItems, counters };
+  return { criteria, discards, suspiciousPassages, polarity, intake: cleanIntakeMeta(raw.intake), intakeQuestions: raw.intakeQuestions, evidenceItems, ruleTriggers: raw.ruleTriggers, counters };
 }
 
 /** Drop null / blank fields of the model's intake headings; null when none is left. */
@@ -613,24 +622,28 @@ function assessCriterion(
   //        else is `out_of_route_scope`.
   //     A criterion with no applicability (a caller that predates the field)
   //     is read as `all_applicants`.
+  //     (#207) A `specialist` criterion is KEPT like a conditional one: every
+  //     rule the guidance states for the route stays, however long the
+  //     rulebook gets. It is assessed only for applicants its condition covers
+  //     (see `trigger`). The size of the rulebook is never a reason to drop
+  //     a rule; `other_route` and `out_of_route_scope` are about correctness.
   const applicability = c.applicability ?? "all_applicants";
   if (scope) {
-    const wanted = applicability === "all_applicants" || applicability === "conditional";
+    const wanted = applicability === "all_applicants" || applicability === "conditional" || applicability === "specialist";
     if (scope.role === "secondary") {
       const pointedAt = scope.namedByPrimary || (ruleRef !== undefined && scope.allow.refs.has(ruleRef));
       if (!pointedAt || !wanted) return { reason: "out_of_route_scope", detail: DETAIL.scope };
-    } else if (applicability === "specialist") {
-      return { reason: "specialist_activity", detail: DETAIL.specialist };
     } else if (applicability === "other_route") {
       return { reason: "other_route", detail: DETAIL.otherRoute };
     }
   }
 
-  // 3d. A conditional criterion's condition is the source's own words, found
-  //     verbatim like any quote. (A criterion that is not conditional keeps
-  //     no condition.)
+  // 3d. A conditional or specialist criterion's condition is the source's own
+  //     words, found verbatim like any quote (a condition that is not found
+  //     discards the criterion, as for any quote). A criterion that is neither
+  //     keeps no condition.
   let applicabilityCondition: string | undefined;
-  if (applicability === "conditional" && c.applicabilityCondition?.trim()) {
+  if ((applicability === "conditional" || applicability === "specialist") && c.applicabilityCondition?.trim()) {
     const cond = index.locate(c.applicabilityCondition);
     if (!cond.ok) return { reason: cond.reason, detail: DETAIL.condition };
     applicabilityCondition = cond.matched;
@@ -772,6 +785,10 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
   let simplifiedTriggers = 0;
   // Trigger conditions of evidence items, resolved once every question is in.
   const evidenceConditions = new Map<string, NonNullable<RawEvidenceItem["showWhenAnyOf"]>>();
+  // (#207) Rule triggers the model proposed, with the stable id of the rule
+  // each is for. Checked once every question of the rubric is known (the
+  // question may be asked in another excerpt than the rule).
+  const pendingTriggers: { criterionId: string; raw: RawRuleTrigger }[] = [];
 
   for (const { chunk, assessment } of parts) {
     discards.push(...assessment.discards);
@@ -835,6 +852,11 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
         });
       }
     }
+    // (#207) Remember this excerpt's proposed triggers against stable ids.
+    for (const t of assessment.ruleTriggers ?? []) {
+      const id = refToId.get(t.criterionRef);
+      if (id !== undefined) pendingTriggers.push({ criterionId: id, raw: t });
+    }
     /** Stable ids of the surviving criteria a list of handles points at. */
     const resolve = (refs: string[]) => [...new Set(refs.map((r) => refToId.get(r)).filter((id): id is string => id !== undefined))];
 
@@ -865,6 +887,16 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
         // first wording, add the criteria.
         const first = questions.get(q.id) as IntakeQuestion;
         first.criterionIds = [...new Set([...first.criterionIds, ...ids])];
+        // (#207) Another excerpt may name another activity or sub-category for
+        // the same question (the activity question is asked once): add the
+        // options the first wording lacks. The first wording of each option wins.
+        if (q.options.length > 0 && (first.answerType === "single_choice" || first.answerType === "multi_choice")) {
+          const have = new Set((first.options ?? []).map((o) => o.value));
+          const extra = q.options.filter((o) => !have.has(o.value));
+          if (extra.length > 0) {
+            first.options = [...(first.options ?? []), ...extra.map((o) => ({ value: o.value, label: o.label, ...(o.description?.trim() ? { description: o.description.trim() } : {}) }))];
+          }
+        }
       } else {
         questions.set(q.id, {
           id: q.id,
@@ -954,6 +986,36 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
     }
   }
 
+  // ---- rule triggers (#207) ----
+  // A scoped (specialist or conditional) rule applies only when an intake
+  // answer says so. The model proposes the question and the answer values;
+  // CODE checks the link before it is stored: the rule exists and is scoped,
+  // the question exists in the rubric (and survived the show-when pass above),
+  // its answers can be enumerated, and every value is one of its options. A
+  // proposal that fails any of these is ignored: the rule is KEPT with no
+  // trigger, which an assessment reads as "could not tell whether this
+  // applies" (specialist) - never as dropped, never as applying to everyone.
+  // The rule is also added to the question's `criterionIds`, so the question
+  // is not removed with the rules that did not need it (exclusions) and the
+  // validator's rule-question join holds.
+  let simplifiedRuleTriggers = 0;
+  for (const { criterionId, raw: t } of pendingTriggers) {
+    const c = byId.get(criterionId);
+    const q = questions.get(t.questionId);
+    if (!c || !q || (c.applicability !== "specialist" && c.applicability !== "conditional")) continue;
+    const allowed = triggerValuesOf(q);
+    const wanted = [...new Set(t.answerValues)];
+    if (!allowed || wanted.length === 0 || wanted.some((v) => !allowed.includes(v))) continue;
+    if (c.trigger && c.trigger.questionId !== q.id) {
+      // Two different questions for one rule: the stored shape is ONE
+      // question; the first stays and a reviewer flag says so.
+      simplifiedRuleTriggers++;
+      continue;
+    }
+    c.trigger = { questionId: q.id, anyOf: [...new Set([...(c.trigger?.anyOf ?? []), ...wanted])] };
+    q.criterionIds = [...new Set([...q.criterionIds, criterionId])];
+  }
+
   // ---- back-links: which questions each criterion reads ----
   const intakeQuestions = [...questions.values()];
   for (const q of intakeQuestions) {
@@ -985,14 +1047,22 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
       target: "rubric",
     });
   }
-  // Specialist-activity criteria are dropped on purpose (they apply to a
-  // sub-category of applicants only). Said once, with the count, so the
-  // reviewer knows this rubric covers the general case.
-  const specialistDropped = discards.filter((d) => d.itemType === "criterion" && d.reason === "specialist_activity").length;
-  if (specialistDropped > 0) {
+  // (#207) Specialist-activity rules are KEPT. Said once, with the count, for
+  // the ones code could not tie to an intake question: they stay in the
+  // rubric, and an assessment reports each as "could not tell whether this
+  // applies" until a question links them.
+  const unlinkedSpecialist = criteria.filter((c) => c.applicability === "specialist" && !c.trigger).length;
+  if (unlinkedSpecialist > 0) {
     flags.push({
-      code: "specialist_criteria_dropped",
-      message: `${specialistDropped} criteria that apply only to a specialist activity or sub-category the sources single out were left out. This rubric covers the general case only.`,
+      code: "specialist_rules_without_trigger",
+      message: `${unlinkedSpecialist} specialist-activity rule(s) could not be tied to an intake question and answer, so they are kept but cannot be told apart by an applicant's answers: an assessment reports each as "could not tell whether this applies". They are never dropped and never applied to everyone.`,
+      target: "rubric",
+    });
+  }
+  if (simplifiedRuleTriggers > 0) {
+    flags.push({
+      code: "rule_trigger_simplified",
+      message: `${simplifiedRuleTriggers} rule trigger(s) named a second, different question for a rule; only the first question is stored. Read the rule's condition in the source.`,
       target: "rubric",
     });
   }
@@ -1247,7 +1317,7 @@ export class RubricExtractionService {
     /** The run record for a status (the same doc id from start to finish). */
     const runRecord = (
       status: RubricRunStatus,
-      r: Pick<ExtractRouteResult, "reasonCode" | "error" | "version" | "criteriaAccepted" | "discardedCount" | "discardedByReason" | "costUsd">
+      r: Pick<ExtractRouteResult, "reasonCode" | "error" | "version" | "criteriaAccepted" | "specialistKept" | "discardedCount" | "discardedByReason" | "costUsd">
     ): RubricExtractionRun => ({
       runId,
       routeKey,
@@ -1267,6 +1337,7 @@ export class RubricExtractionService {
       usage,
       costUsd: r.costUsd,
       criteriaAccepted: r.criteriaAccepted,
+      specialistKept: r.specialistKept,
       discardedCount: r.discardedCount,
       discardedByReason: r.discardedByReason,
       startedAt,
@@ -1276,7 +1347,7 @@ export class RubricExtractionService {
     /** Assemble a result (and, when asked, store the run record). */
     const finish = async (
       status: ExtractRouteResult["status"],
-      fields: Partial<Pick<ExtractRouteResult, "reasonCode" | "error" | "version" | "criteriaAccepted" | "discardedCount" | "discardedByReason">>,
+      fields: Partial<Pick<ExtractRouteResult, "reasonCode" | "error" | "version" | "criteriaAccepted" | "specialistKept" | "discardedCount" | "discardedByReason">>,
       record: boolean
     ): Promise<ExtractRouteResult> => {
       const costUsd = usage.requests > 0 ? costOfUsage("judgement", usage) : null;
@@ -1290,6 +1361,7 @@ export class RubricExtractionService {
         plan,
         chunks: chunkCount,
         criteriaAccepted: fields.criteriaAccepted ?? 0,
+        specialistKept: fields.specialistKept ?? 0,
         discardedCount: fields.discardedCount ?? 0,
         discardedByReason: fields.discardedByReason ?? {},
         usage,
@@ -1307,7 +1379,7 @@ export class RubricExtractionService {
       // Ids, counts and token totals only.
       console.log(
         `${TAG} ${routeKey}: ${status}${result.reasonCode ? ` (${result.reasonCode})` : ""} ` +
-          `version=${result.version ?? "-"} chunks=${chunkCount} accepted=${result.criteriaAccepted} discarded=${result.discardedCount} ` +
+          `version=${result.version ?? "-"} chunks=${chunkCount} accepted=${result.criteriaAccepted} specialistKept=${result.specialistKept} discarded=${result.discardedCount} ` +
           `requests=${usage.requests} in=${usage.inputTokens} out=${usage.outputTokens}`
       );
       return result;
@@ -1373,7 +1445,7 @@ export class RubricExtractionService {
       // is how a cap stops being one.
       reachedModel = true;
       try {
-        await this.store.writeRun(runRecord("started", { reasonCode: null, error: null, version: null, criteriaAccepted: 0, discardedCount: 0, discardedByReason: {}, costUsd: null }));
+        await this.store.writeRun(runRecord("started", { reasonCode: null, error: null, version: null, criteriaAccepted: 0, specialistKept: 0, discardedCount: 0, discardedByReason: {}, costUsd: null }));
       } catch (err) {
         reachedModel = false;
         throw new RunStop("skipped", "run_record_unavailable", "the run could not be recorded, so it was not started");
@@ -1391,6 +1463,8 @@ export class RubricExtractionService {
       const primaries = sources.filter((s) => s.role === "primary");
       const scope = primaries.length > 0 ? routeScopeFrom(primaries.map((s) => (indexes.get(s.snapshot.sourceId) as SnapshotQuoteIndex).allText())) : null;
       const parts: { chunk: SourceChunk; assessment: ChunkAssessment }[] = [];
+      // (#207) Questions asked so far, by id, shown to the next excerpt's call 2.
+      const knownQuestions = new Map<string, KnownQuestionView>();
       // Failed attempts so far, counted against the request cap with the successes.
       const attempts: CallAttempts = { failed: 0, cap: settings.maxRequestsPerRun };
       for (const chunk of chunks) {
@@ -1414,9 +1488,30 @@ export class RubricExtractionService {
         const criteriaPart = assessChunkOutput(raw1, chunk, index, base, severityLevels, scopeForChunk);
         let assessment = criteriaPart;
         if (criteriaPart.criteria.length > 0) {
-          const accepted = criteriaPart.criteria.map((a) => ({ ref: a.ref, title: a.criterion.title, quote: a.criterion.source.quote }));
-          const raw2 = await this.callModel(buildIntakeRequest(chunk, accepted, limits, route), usage, attempts);
+          // (#207) Scoped rules go with their applicability and condition words,
+          // and the questions asked in earlier excerpts go too, so the question
+          // that establishes an activity is asked once and reused.
+          const accepted: AcceptedCriterionView[] = criteriaPart.criteria.map((a) => ({
+            ref: a.ref,
+            title: a.criterion.title,
+            quote: a.criterion.source.quote,
+            ...(a.criterion.applicability === "specialist" || a.criterion.applicability === "conditional"
+              ? { applicability: a.criterion.applicability, ...(a.criterion.applicabilityCondition ? { condition: a.criterion.applicabilityCondition } : {}) }
+              : {}),
+          }));
+          const raw2 = await this.callModel(buildIntakeRequest(chunk, accepted, limits, route, [...knownQuestions.values()]), usage, attempts);
           assessment = combineAssessments(criteriaPart, assessChunkOutput(raw2, chunk, index, base, severityLevels));
+          // Remember each question (and its options) for the excerpts that follow.
+          for (const q of assessment.intakeQuestions) {
+            const prior = knownQuestions.get(q.id);
+            const have = new Set((prior?.options ?? []).map((o) => o.value));
+            knownQuestions.set(q.id, {
+              id: q.id,
+              label: prior?.label ?? q.label,
+              answerType: prior?.answerType ?? q.answerType,
+              options: [...(prior?.options ?? []), ...q.options.filter((o) => !have.has(o.value)).map((o) => ({ value: o.value, label: o.label }))],
+            });
+          }
         }
         parts.push({ chunk, assessment });
       }
@@ -1481,7 +1576,7 @@ export class RubricExtractionService {
         // Another run wrote this source set while this one was extracting.
         return await finish("unchanged", { reasonCode: "source_unchanged", version: written.version }, true);
       }
-      return await finish("succeeded", { version: written.version, criteriaAccepted: merged.criteria.length, discardedCount: merged.discards.length, discardedByReason }, true);
+      return await finish("succeeded", { version: written.version, criteriaAccepted: merged.criteria.length, specialistKept: merged.criteria.filter((c) => c.applicability === "specialist").length, discardedCount: merged.discards.length, discardedByReason }, true);
     } catch (err) {
       if (err instanceof RunStop) {
         // Record the run when it cost something or is a real failure; a
