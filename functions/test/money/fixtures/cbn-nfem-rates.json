@@ -1,0 +1,80 @@
+[
+  {
+    "id": 2496,
+    "closingrate": "1353.5000",
+    "ratedate": "November-13-2026",
+    "highestrate": "1359.0000",
+    "lowestrate": "1350.1500",
+    "weightedAvgRate": "1353.9741",
+    "simpleAvgRate": "1354.1436",
+    "noOfDeals": "0",
+    "noOfDeals_InterBank": "146",
+    "nfeM_Total_Turnover": "0.0000",
+    "interBank_Total_Turnover": "466965245.8600"
+  },
+  {
+    "id": 2495,
+    "closingrate": "1358.5000",
+    "ratedate": "November-12-2026",
+    "highestrate": "1363.7500",
+    "lowestrate": "1348.0000",
+    "weightedAvgRate": "1355.8815",
+    "simpleAvgRate": "1356.5107",
+    "noOfDeals": "486",
+    "noOfDeals_InterBank": "242",
+    "nfeM_Total_Turnover": "1208499895.2600",
+    "interBank_Total_Turnover": "644845391.4700"
+  },
+  {
+    "id": 2494,
+    "closingrate": "1364.0000",
+    "ratedate": "November-11-2026",
+    "highestrate": "1365.0000",
+    "lowestrate": "1352.7500",
+    "weightedAvgRate": "1358.3385",
+    "simpleAvgRate": "1359.2454",
+    "noOfDeals": "256",
+    "noOfDeals_InterBank": "99",
+    "nfeM_Total_Turnover": "397537965.4600",
+    "interBank_Total_Turnover": "93010707.0700"
+  },
+  {
+    "id": 2493,
+    "closingrate": "1353.5000",
+    "ratedate": "November-10-2026",
+    "highestrate": "1354.0000",
+    "lowestrate": "1349.2500",
+    "weightedAvgRate": "1350.8587",
+    "simpleAvgRate": "1351.4980",
+    "noOfDeals": "341",
+    "noOfDeals_InterBank": "144",
+    "nfeM_Total_Turnover": "813542416.4900",
+    "interBank_Total_Turnover": "248071975.4600"
+  },
+  {
+    "id": 2492,
+    "closingrate": "1350.0000",
+    "ratedate": "November-09-2026",
+    "highestrate": "1355.0000",
+    "lowestrate": "1346.3000",
+    "weightedAvgRate": "1349.3413",
+    "simpleAvgRate": "1350.3984",
+    "noOfDeals": "271",
+    "noOfDeals_InterBank": "116",
+    "nfeM_Total_Turnover": "368799066.1200",
+    "interBank_Total_Turnover": "210375407.4000"
+  },
+  {
+    "id": 2491,
+    "closingrate": "1349.0000",
+    "ratedate": "November-06-2026",
+    "highestrate": "1353.0000",
+    "lowestrate": "1345.0000",
+    "weightedAvgRate": "1346.7945",
+    "simpleAvgRate": "1347.7695",
+    "noOfDeals": "313",
+    "noOfDeals_InterBank": "147",
+    "nfeM_Total_Turnover": "475124611.0100",
+    "interBank_Total_Turnover": "232980481.9200"
+  }
+]

@@ -244,6 +244,42 @@ GET {{baseUrl}}/conversations
 Authorization: Bearer {{agent1Token}}
 
 # ============================================================
+# EXCHANGE RATES (issue #178) — prices are USD, charged in local currency
+# ============================================================
+
+### Public: current rate per supported currency (no auth, cacheable)
+# Returns { base: "USD", currencies: [{ currency, exponent, available, rate, asOf }] }.
+# `available: false` means the rate is stale or missing: show no local amount.
+GET {{baseUrl}}/rates
+
+### Admin: stored rates, active override and override history
+GET {{baseUrl}}/admin/exchange-rates
+Authorization: Bearer {{adminToken}}
+
+### Admin: set a manual rate (naira per US dollar). Must be within the band
+### (default 10%) of the last provider rate. ttlHours optional (1-168).
+PUT {{baseUrl}}/admin/exchange-rates/NGN
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "rate": 1500, "reason": "CBN site unreachable, using bank quote", "ttlHours": 24 }
+
+### Admin: clear the manual rate (the provider rate serves again)
+DELETE {{baseUrl}}/admin/exchange-rates/NGN
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "reason": "CBN is back" }
+
+### Admin: accept a genuine large provider move (drops the stored provider
+### rate, audited; the next refresh sets the new level, held to the plausible range)
+POST {{baseUrl}}/admin/exchange-rates/NGN/reset-reference
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "reason": "Genuine devaluation confirmed against CBN notice" }
+
+# ============================================================
 # DEV — Seed endpoints (emulator only)
 # ============================================================
 

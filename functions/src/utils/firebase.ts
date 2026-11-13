@@ -162,6 +162,13 @@ export const collections = {
   // USD exchange rates (Frankfurter / ECB) the visa scraper converts
   // published fees with (issue #59). No firestore.rules match → clients denied.
   appConfig: db.collection("appConfig"),
+  // Exchange rates for charging in a local currency (issue #178):
+  // `exchangeRates/{CURRENCY}` holds the provider's last rate and an optional
+  // admin override; `exchangeRateAudit` is the append-only history of admin
+  // changes. Config for both lives in `appConfig/currencies`. Backend-only:
+  // no firestore.rules match -> clients denied.
+  exchangeRates: db.collection("exchangeRates"),
+  exchangeRateAudit: db.collection("exchangeRateAudit"),
   // Proposed field-level edits to already-approved scraped visas (issue #61):
   // the crawl stages one `open` row per visa here instead of touching the
   // live doc, and an admin approves/rejects it via /admin/visa-changes.

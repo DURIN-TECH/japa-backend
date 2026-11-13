@@ -82,6 +82,7 @@ export const api = functions
 // ============================================
 
 import { collections } from "./utils/firebase";
+import { rateService, FX_RATE_SECRETS } from "./money";
 import { agentService } from "./services/agent.service";
 import { visaService } from "./services/visa.service";
 import { newsScraperService } from "./scrapers";
@@ -679,6 +680,28 @@ export const importOutcomeStatistics = functions
       } catch (error) {
         console.error(`Outcome statistics import (${destination}) failed:`, error);
       }
+    }
+  });
+
+/**
+ * Refresh the exchange rate used to charge in a local currency (issue #178).
+ * Every 6 hours: the CBN publishes once per working day, so most ticks just
+ * re-confirm the same rate (which is what keeps it "fresh"); a provider
+ * outage leaves the stored rate serving until the freshness limit in
+ * appConfig/currencies, then pricing reports unavailable. Failures are logged
+ * and recorded on the rate doc, never thrown. Secrets: FX_RATE_SECRETS is
+ * empty until an OANDA key exists (see money/index.ts).
+ */
+export const refreshExchangeRates = functions
+  .runWith({ timeoutSeconds: 120, memory: "256MB", secrets: FX_RATE_SECRETS })
+  .pubsub.schedule("15 */6 * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const outcomes = await rateService.refreshAll();
+    // refreshAll isolates each currency; failures are logged at error level.
+    for (const o of outcomes) {
+      if (o.ok) console.log(`Exchange rate refresh ${o.currency}: ${o.source} ${o.rate}`);
+      else console.error(`Exchange rate refresh ${o.currency}: unavailable (${o.reason})`);
     }
   });
 

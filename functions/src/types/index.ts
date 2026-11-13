@@ -1149,7 +1149,9 @@ export interface Transaction {
   
   // Payment details
   type: TransactionType;
-  amount: number; // In cents
+  // Minor units of `currency` (kobo for NGN, cents for USD). Never a bare
+  // number: always read together with `currency` (issue #178).
+  amount: number;
   currency: string;
   
   // Status
@@ -1635,3 +1637,6 @@ export interface AiMessageAccessAuditRecord {
   wordingVersion?: string;
   createdAt: Timestamp;
 }
+
+// Money, exchange-rate and charge-snapshot types (issue #178)
+export * from "./money";

@@ -58,6 +58,8 @@ import {
   adminPlansRouter,
   webhooksRouter,
 } from "./routes/entitlement.routes";
+// Public exchange rates + admin rate overrides (issue #178).
+import { publicRatesRoutes, adminExchangeRateRoutes } from "./routes/exchange-rate.routes";
 import { verificationWebhookRoutes } from "./routes/verification-webhook.routes";
 // Admin review queue for trafficking / scam risk signals (issue #119).
 import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
@@ -153,6 +155,10 @@ app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
 app.use("/admin/rubrics", adminRubricRoutes);
 // Outcome statistics imports (issue #116): admin-only run records + manual run.
 app.use("/admin/outcome-statistics", adminOutcomeStatisticsRoutes);
+// Public, unauthenticated, cacheable local-currency rates (issue #178).
+app.use("/rates", publicRatesRoutes);
+// Admin-only rate overrides + audit history (issue #178).
+app.use("/admin/exchange-rates", adminExchangeRateRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);
