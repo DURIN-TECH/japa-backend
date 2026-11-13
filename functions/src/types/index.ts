@@ -682,6 +682,10 @@ export interface RequiredDocument {
   isRequired: boolean;
   validationCriteria?: string[];
   sampleUrl?: string; // Link to sample document
+  // Issue #175: set ONLY on documents derived at read time from a scraped
+  // visa record. The verbatim quote (scrapeMeta.citations) and the official
+  // page it came from. Absent on seeded / admin-authored documents.
+  citation?: { quote: string; sourceUrl: string };
 }
 
 // ============================================

@@ -15,6 +15,7 @@ import {
 // FieldValue.delete() clears `staleSince` on approval (issue #62).
 import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 // Approval guard for visas with no usable USD cost (issue #59).
+import { deriveRequirementsFromScrape } from "./visa-requirements-derive";
 import { assertVisaApprovable } from "../scrapers";
 // Finite-only min for the denormalized country stats.
 import { finiteMin } from "../scrapers";
@@ -429,10 +430,17 @@ class VisaService {
       .orderBy("orderIndex")
       .get();
 
-    return snapshot.docs.map((doc) => ({
+    const stored = snapshot.docs.map((doc) => ({
       id: doc.id,
       ...doc.data(),
     })) as VisaRequirement[];
+    if (stored.length > 0) return stored;
+
+    // Issue #175: a scraped visa has no stored requirements, so derive them
+    // from its own cited `requiredDocuments` (read time, nothing written).
+    // Unfiltered read on purpose: callers gate visibility before this.
+    const visa = await this.getVisaType(countryCode, visaTypeId);
+    return visa ? deriveRequirementsFromScrape(visa) : [];
   }
 
   /**
