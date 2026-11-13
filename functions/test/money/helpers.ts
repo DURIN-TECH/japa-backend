@@ -70,9 +70,9 @@ export function fakeProvider(
 /** A RateService over in-memory parts. `config` is the raw stored doc (null = defaults). */
 export function makeService(opts: {
   config?: Record<string, unknown> | null;
-  cbn?: RateProvider;
-  oanda?: RateProvider;
-  clock?: { now: () => Date };
+  cbn?: ReturnType<typeof fakeProvider>;
+  oanda?: ReturnType<typeof fakeProvider>;
+  clock?: ReturnType<typeof fakeClock>;
   store?: ReturnType<typeof memoryRateStore>;
 } = {}) {
   const store = opts.store ?? memoryRateStore();

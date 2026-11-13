@@ -164,7 +164,7 @@ describe("outage keeps the last rate until the limit; never invents one", () => 
   test("failed refresh keeps the stored rate and records the error", async () => {
     const { service, store, cbn, clock } = makeService();
     await service.refreshAll();
-    (cbn as { result: unknown }).result = { ok: false, reason: "CBN answered 503" };
+    cbn.result = { ok: false, reason: "CBN answered 503" };
     clock.advanceHours(6);
     const out = await service.refreshAll();
     assert.equal(out[0].ok, false);
