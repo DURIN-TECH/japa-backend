@@ -421,14 +421,14 @@ type Sim = string | number | boolean | typeof UNANSWERED | typeof OTHER;
 function conditionHolds(c: IntakeCondition, actual: Sim | undefined): boolean {
   if (actual === undefined || actual === UNANSWERED) return false;
   switch (c.op) {
-    case "eq":
-      return actual === c.value;
-    case "neq":
-      return actual !== c.value;
-    case "in":
-      return Array.isArray(c.value) && typeof actual === "string" && c.value.includes(actual);
-    default:
-      return false;
+  case "eq":
+    return actual === c.value;
+  case "neq":
+    return actual !== c.value;
+  case "in":
+    return Array.isArray(c.value) && typeof actual === "string" && c.value.includes(actual);
+  default:
+    return false;
   }
 }
 
