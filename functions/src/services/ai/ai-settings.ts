@@ -48,6 +48,12 @@ export interface AiSettings {
   chatTokensPerUserPerDay: number;
   // Global cap: chat turns that reached the model, per UTC day, all users.
   chatTurnsPerDay: number;
+  // ---- agency listing screening (issue #120) ----
+  // Model calls the listing language check may make per UTC day, all agencies,
+  // and per agency. Counted in requests (the price table is empty). The code
+  // comparison is not capped: it costs no model call.
+  listingScreeningsPerDay: number;
+  listingScreeningsPerAgencyPerDay: number;
 }
 
 /** Defaults. Sized for one application with a handful of documents. */
@@ -64,6 +70,8 @@ export const DEFAULT_AI_SETTINGS: Readonly<AiSettings> = Object.freeze({
   chatMessagesPerUserPerDay: 100,
   chatTokensPerUserPerDay: 400_000,
   chatTurnsPerDay: 5_000,
+  listingScreeningsPerDay: 200,
+  listingScreeningsPerAgencyPerDay: 20,
 });
 
 /** Allowed range of each numeric setting. A stored value outside it falls back to its default. */
@@ -78,6 +86,8 @@ const RANGES: Record<Exclude<keyof AiSettings, "enabled" | "chatEnabled">, [numb
   chatMessagesPerUserPerDay: [1, 10_000],
   chatTokensPerUserPerDay: [10_000, 50_000_000],
   chatTurnsPerDay: [1, 1_000_000],
+  listingScreeningsPerDay: [1, 10_000],
+  listingScreeningsPerAgencyPerDay: [1, 1_000],
 };
 
 /** Result of a settings read. */

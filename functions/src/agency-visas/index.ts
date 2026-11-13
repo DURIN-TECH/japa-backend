@@ -23,6 +23,7 @@ export {
   agencyVisaReviewService,
   ADMIN_VISA_SOURCE_FILTERS,
   VISA_COST_MISSING,
+  SCREENING_OPEN,
   parseExpectedTimestamp,
 } from "./agency-visa-review.service";
 export type {
@@ -32,3 +33,6 @@ export type {
   AgencyVisaReviewOutcome,
   AgencyVisaVisibilityOutcome,
 } from "./agency-visa-review.service";
+
+// Listing screening (issue #120): admin-only results and the rerun.
+export { agencyVisaScreeningService } from "./agency-visa-screening.service";

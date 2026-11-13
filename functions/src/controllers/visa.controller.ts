@@ -29,6 +29,7 @@ import {
   AdminVisaSourceFilter,
   AgencyVisaError,
   agencyVisaReviewService,
+  agencyVisaScreeningService,
   parseExpectedTimestamp,
 } from "../agency-visas";
 
@@ -557,6 +558,14 @@ export class VisaController {
         return;
       }
 
+      // Issue #120: `acknowledgeScreening: true` approves past an open
+      // screening result. Only a boolean is accepted (anything else is a 400).
+      const ack = req.body?.acknowledgeScreening;
+      if (ack !== undefined && typeof ack !== "boolean") {
+        sendError(res, "VALIDATION_ERROR", "acknowledgeScreening must be true or false", 400);
+        return;
+      }
+
       const { outcome, visa } = await agencyVisaReviewService.review(
         {
           countryCode: body.countryCode,
@@ -565,6 +574,7 @@ export class VisaController {
           reviewedBy: req.userId!,
           rejectionReason: body.reason,
           revisionUpdatedAtMillis: millis ?? undefined,
+          acknowledgeScreening: ack === true,
         },
         (doc, field) => canAdminWriteVisa(req, field, { ...doc })
       );
@@ -588,6 +598,52 @@ export class VisaController {
         return;
       }
       console.error("Error reviewing agency visa:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /admin/visas/:id/screening/rerun (issue #120)
+   *
+   * Body: { countryCode }. Re-runs listing screening on the visa's current
+   * target (a submitted visa, or the pending revision of an approved one).
+   * The recovery path after a model outage; same idempotency rule as the
+   * automatic run and it counts against the daily caps.
+   * 200 -> { screening, openScreeningSignals, status } where status is
+   * "screened" or "unchanged". 400 VALIDATION_ERROR, 403 FORBIDDEN (CASL
+   * probe on `reviewStatus`, after the route's verifyAdmin), 404 NOT_FOUND
+   * (unknown or non-agency visa), 409 NO_SCREENING_TARGET.
+   */
+  async rerunScreening(req: AuthenticatedRequest, res: Response): Promise<void> {
+    // ---- CASL gate (tagged probe, like the review routes) ----
+    if (!canAdminWriteVisa(req, "reviewStatus")) {
+      forbidden(res, "Only Seli admins can rerun listing screening");
+      return;
+    }
+    try {
+      const { id } = req.params;
+      const { countryCode } = req.body ?? {};
+      if (typeof countryCode !== "string" || !countryCode) {
+        sendError(res, "VALIDATION_ERROR", "countryCode is required", 400);
+        return;
+      }
+      // An unaddressable id or country would make Firestore throw -> 404.
+      if (!isValidDocId(id) || !isValidDocId(countryCode.toUpperCase())) {
+        sendError(res, "NOT_FOUND", "Visa type not found", 404);
+        return;
+      }
+      const { result, openScreeningSignals } = await agencyVisaScreeningService.rerun(countryCode, id);
+      sendSuccess(
+        res,
+        { screening: result.screening, openScreeningSignals, status: result.status },
+        result.status === "unchanged" ? "Screening is already up to date" : "Screening re-run"
+      );
+    } catch (error) {
+      if (error instanceof AgencyVisaError) {
+        sendError(res, error.code, error.message, error.httpStatus);
+        return;
+      }
+      console.error("Error re-running listing screening:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

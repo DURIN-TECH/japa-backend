@@ -238,8 +238,11 @@ async function call(
 /** Handler shorthands. */
 const V = visaController;
 const list = (who: Principal, query: Data = {}) => call(V.getAdminVisas.bind(V), who, { query });
+// Issue #120: these suites test the review logic, not screening, so they approve
+// with `acknowledgeScreening: true` (a visa with no screening result is "open").
+// The screening gate itself is tested in agency-visa-screening.test.ts.
 const review = (who: Principal, id: string, body: Data) =>
-  call(V.reviewVisa.bind(V), who, { params: { id }, body: { countryCode: CC, ...body } });
+  call(V.reviewVisa.bind(V), who, { params: { id }, body: { countryCode: CC, acknowledgeScreening: true, ...body } });
 const setVisibility = (who: Principal, id: string, visibility: unknown) =>
   call(V.setVisibility.bind(V), who, { params: { id }, body: { countryCode: CC, visibility } });
 
