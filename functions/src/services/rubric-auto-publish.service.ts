@@ -228,7 +228,12 @@ const PLAN_RESOLVED_FLAG_REASON = "flag_unresolved:intake_wording_uncited";
 const SYSTEM_ACTOR: RubricReviewActor = { kind: RUBRIC_ACTOR_KIND.SYSTEM, id: RUBRIC_SYSTEM_ACTOR_ID };
 
 /** Hold reasons that can clear by themselves, so the hourly sweep retries them (part B, #202). */
-export const RETRYABLE_REASONS: readonly string[] = ["checker_unavailable", "checker_capped", "checker_output_invalid"];
+// INTEGRATION (#202 + #203): the question planner's own provider failure surfaces as
+// `question_plan_unusable` (its wording check could not finish, or answered unusably), which is just as
+// transient as the rule check's. The sweep only retried part B's reasons, so a hiccup in the planner left a
+// good draft held until someone ran it by hand. At most MAX_SWEEP_ATTEMPTS runs per version still bounds the
+// spend. `question_check_capped` is NOT retryable: the same draft would hit the same cap again.
+export const RETRYABLE_REASONS: readonly string[] = ["checker_unavailable", "checker_capped", "checker_output_invalid", "question_plan_unusable"];
 /** Most runs of one version (the first and the sweep's retries together) before it stays held with its final reason. */
 export const MAX_SWEEP_ATTEMPTS = 3;
 

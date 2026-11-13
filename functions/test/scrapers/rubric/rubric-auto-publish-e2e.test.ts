@@ -49,7 +49,7 @@ import { BulkReassessmentService } from "../../../src/services/ai-bulk-reassessm
 import { RuleChangeAlertsService } from "../../../src/services/rule-change-alerts.service";
 import { IntakeService } from "../../../src/services/intake.service";
 import { RUBRIC_SYSTEM_ACTOR_ID, type RubricPublishRun, type VisaRubric } from "../../../src/types/rubric";
-import type { LlmProvider, LlmRequest } from "../../../src/services/ai/llm-provider";
+import { LlmProviderError, type LlmProvider, type LlmRequest } from "../../../src/services/ai/llm-provider";
 import { ROUTE_A, SOURCE_A_ID, SOURCE_A_URL } from "./fixtures/synthetic-guidance";
 import { answer, crit, headDoc, installRubricFakes, makeHarness, quiet, recordAnswers, resetBucket, seedSource, snapshotStore, versionDoc, type Harness } from "./rubric-harness";
 import { MemoryLedger, ScriptedProvider as CheckerProvider, settingsWith } from "./checker-fakes";
@@ -199,11 +199,11 @@ async function extractDraft(): Promise<RubricDraft> {
 }
 
 /** The pipeline: real check over a scripted provider, real planner over a fake model, real approval, real alerts. */
-function wire(opts: { check?: (p: CheckerProvider) => void; failQuestionsMatching?: RegExp | null } = {}) {
+function wire(opts: { check?: (p: CheckerProvider) => void; failQuestionsMatching?: RegExp | null; questionModel?: LlmProvider & { requests: LlmRequest[] } } = {}) {
   const provider = new CheckerProvider();
   opts.check?.(provider);
   const checker = new RubricCheckerService({ provider: () => provider, readSnapshot: (s, hash) => snapshotStore.read(s, hash), loadSettings: settingsWith(), ledger: new MemoryLedger(), nowMs: () => nowMs, sleep: async () => undefined });
-  const questionModel = fakeQuestionModel(opts.failQuestionsMatching === undefined ? /surely/ : opts.failQuestionsMatching);
+  const questionModel = opts.questionModel ?? fakeQuestionModel(opts.failQuestionsMatching === undefined ? /surely/ : opts.failQuestionsMatching);
   const decideCalls: any[][] = [];
   const review = { decideAs: (...args: any[]) => (decideCalls.push(args), (rubricReviewService as any).decideAs(...args)), knownEligibilityIds: (r: any) => rubricReviewService.knownEligibilityIds(r) };
   const svc = new RubricAutoPublishService({ review: review as any, checker, planner: new RubricQuestionPlanner({ provider: questionModel }), now: () => Timestamp.fromMillis(nowMs), appUrl: () => "https://portal.test" });
@@ -529,6 +529,27 @@ describe("e2e 5: a draft that fails a safeguard is held and the previous version
     assert.equal(versionDoc(KEY, 2).reviewStatus, "rejected");
     assert.equal(versionDoc(KEY, 2).reviewedBy, RUBRIC_SYSTEM_ACTOR_ID);
     assert.equal(versionDoc(KEY, 2).rejectReason, "superseded_by_newer_version");
+  });
+
+  test("a hiccup in the question check (not the rule check) is retried by the hourly sweep and then publishes", async () => {
+    await extractDraft();
+    // The planner's model fails its first request, then works.
+    const good = fakeQuestionModel(/surely/);
+    let failures = 1;
+    const flaky: LlmProvider & { requests: LlmRequest[] } = { requests: good.requests, modelFor: () => "fake-model", complete: async (req) => { if (failures-- > 0) throw new LlmProviderError("provider_error", "status=529 overloaded"); return good.complete(req); } };
+    const w = wire({ questionModel: flaky });
+    const first = await trigger(w.svc);
+    assert.equal(first?.outcome, "held");
+    assert.deepEqual(first?.reasonCodes, ["question_plan_unusable"]);
+    assert.equal(headDoc(KEY).approvedVersion, null);
+    // The sweep re-runs it: the rule check reuses its stored batches (no second spend), the planner now succeeds.
+    const before = w.provider.requests.length;
+    const swept = await quiet(() => w.svc.sweepRetryable());
+    assert.deepEqual(swept.result, { considered: 1, retried: 1 });
+    assert.equal(w.provider.requests.length, before, "the rule check made no model call on the retry");
+    assert.equal(headDoc(KEY).approvedVersion, 1);
+    assert.equal(runs()[0].outcome, "published");
+    assert.equal(runs()[0].attempts, 2);
   });
 
   test("manual mode (and a missing settings doc) does nothing at all: no check, no publish", async () => {
