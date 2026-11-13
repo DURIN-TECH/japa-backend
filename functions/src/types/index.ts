@@ -688,6 +688,15 @@ export interface RequiredDocument {
   // visa record. The verbatim quote (scrapeMeta.citations) and the official
   // page it came from. Absent on seeded / admin-authored documents.
   citation?: { quote: string; sourceUrl: string };
+  // Issue #187: what the applicant does with the item and how firmly the page
+  // asks for it. Seeded / admin-authored documents are always `document` +
+  // `required` (the defaults, written out by the derive/checklist code, not
+  // stored on those records). `isRequired` above is true ONLY for `required`.
+  kind?: "document" | "information";
+  kindReview?: true; // could not classify from the page's wording: stays `document`
+  kindQuote?: string; // verbatim page text behind `kind` (or the lead-in)
+  need?: "required" | "conditional" | "optional";
+  appliesWhen?: string; // verbatim "if ..." / "unless ..." / "depending on ..." clause or lead-in
 }
 
 // ============================================
@@ -993,6 +1002,13 @@ export interface DocumentRequest {
   // --- Denormalized application context (saves an N+1 fetch on the to-do list) --
   visaTypeName?: string;
   countryName?: string;
+
+  // --- Issue #187: kind + need carried from the checklist item -----------------
+  kind?: "document" | "information";
+  kindReview?: true;
+  kindQuote?: string;
+  need?: "required" | "conditional" | "optional";
+  appliesWhen?: string;
 
   // --- Lifecycle --------------------------------------------------------------
   status: DocumentRequestStatus;

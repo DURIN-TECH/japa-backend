@@ -2,6 +2,7 @@
 import type { LlmUsage } from "../shared/cost/types";
 import { Timestamp } from "firebase-admin/firestore";
 import type { VisaCategory, VisaType } from "../../types/index";
+import type { RequiredDocumentMeta } from "./required-document-meta";
 
 // ============================================
 // VISA CATALOG SCRAPING TYPES
@@ -275,6 +276,12 @@ export interface VisaScrapeMeta {
   // page and were therefore DROPPED (ExtractedVisa.requiredDocumentsDropped).
   // Audit trail so a reviewer sees what the model claimed. Absent when none.
   requiredDocumentsDropped?: string[];
+  // Issue #187: kind (document | information) and need (required | conditional
+  // | optional) of each item of the visa's `requiredDocuments`, INDEX-ALIGNED
+  // with it (copied from ExtractedVisa.requiredDocumentMeta). Travels with the
+  // scrape provenance, so it is replaced wholesale on approve like `citations`.
+  // Absent on visas crawled before #187 (read as document + kindReview).
+  requiredDocumentMeta?: RequiredDocumentMeta[];
   // Supplementary registry pages whose text was appended to this route's
   // page before extraction (issue #86, e.g. the Korea Visa Portal fee table
   // for the HiKorea C-3 route). Absent when the route uses none.
@@ -639,6 +646,11 @@ export interface ExtractedVisa {
   // Issue #129: model-returned documents dropped for lacking a verbatim quote
   // on the page. Only present when something was dropped.
   requiredDocumentsDropped?: string[];
+  // Issue #187: classification of each kept item, index-aligned with
+  // `requiredDocuments` (same length). Validated in code: a kind without a
+  // verbatim quote on the page is replaced by document + kindReview, and
+  // `need` is decided by code from the quote (required-document-meta.ts).
+  requiredDocumentMeta?: RequiredDocumentMeta[];
   applicationUrl?: string;
   applicationInstructions?: string;
   // Set by the validator (issue #87) when processingDaysMin/Max is more than

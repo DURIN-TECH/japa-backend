@@ -43,6 +43,7 @@ export function buildScrapeMeta(params: {
     | "uncitedFieldsDropped"
     | "processingUnverifiedReasons"
     | "requiredDocumentsDropped"
+    | "requiredDocumentMeta"
   >;
   extractedAt: Timestamp;
   sourceMeta?: ScrapeSourceMeta;
@@ -78,6 +79,11 @@ export function buildScrapeMeta(params: {
   // Issue #129: audit trail of uncited documents the validator dropped.
   if (params.extracted.requiredDocumentsDropped && params.extracted.requiredDocumentsDropped.length > 0) {
     meta.requiredDocumentsDropped = [...params.extracted.requiredDocumentsDropped];
+  }
+  // Issue #187: kind + need per document item (index-aligned with
+  // requiredDocuments); only when present, so older shapes are unchanged.
+  if (params.extracted.requiredDocumentMeta && params.extracted.requiredDocumentMeta.length > 0) {
+    meta.requiredDocumentMeta = params.extracted.requiredDocumentMeta.map((m) => ({ ...m }));
   }
   if (params.supplementaryPages && params.supplementaryPages.length > 0) {
     meta.supplementaryPages = params.supplementaryPages.map((p) => ({ ...p }));

@@ -15,6 +15,8 @@ import { checkWithinLimit, paymentRequired } from "../middleware/authz";
 import { checkApplicationAccessForRequest } from "../utils/access";
 import { complianceService } from "../services/compliance.service";
 import { intakeService, IntakeValidationError } from "../services/intake.service";
+import { answersService, AnswerValidationError } from "../services/answers.service";
+import { isWithinApplicantEditWindow } from "../utils/editable-window";
 import { LIMITS, ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -591,6 +593,69 @@ export class ApplicationController {
       }
       // Never log the answers: they are personal data.
       console.error("Error saving application intake:", error instanceof Error ? error.message : "unknown");
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /applications/:id/answers  (issue #187)
+   * `{ answers: { [checklistItemId]: { text, updatedAt } } }`. Needs `read`
+   * access. Not affected by the edit window.
+   */
+  async getAnswers(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "read")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      sendSuccess(res, { answers: await answersService.getAnswers(application.id) });
+    } catch (error) {
+      console.error("Error getting application answers:", error instanceof Error ? error.message : "unknown");
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /applications/:id/answers/:itemId  (issue #187)
+   * Body `{ text }` (trimmed, <= 2000 chars, "" clears). Needs `update`
+   * access. 400 VALIDATION_ERROR for a bad text / unknown item / document item;
+   * 409 ANSWERS_LOCKED once the application is past the same editable window
+   * the statement uses (STATEMENT_LOCKED). The plan read-only block is the
+   * global one in verifyAuth (402).
+   */
+  async saveAnswer(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "update")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      if (!isWithinApplicantEditWindow(application.status)) {
+        sendError(
+          res,
+          "ANSWERS_LOCKED",
+          "Your answers can no longer be edited because your application is already under review.",
+          409
+        );
+        return;
+      }
+      sendSuccess(res, await answersService.saveAnswer(application, req.params.itemId, req.body?.text, req.userId!));
+    } catch (error) {
+      if (error instanceof AnswerValidationError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      // Never log the answer text: it is personal data.
+      console.error("Error saving application answer:", error instanceof Error ? error.message : "unknown");
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

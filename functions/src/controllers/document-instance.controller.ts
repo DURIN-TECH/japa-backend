@@ -18,6 +18,7 @@
  * applicant, but ONLY for their own statement (see the "applicant statement"
  * section). Every other route stays agent-only in routes/document-instance.routes.ts.
  */
+import { APPLICANT_EDITABLE_STATUSES } from "../utils/editable-window";
 import { Response } from "express";
 import { AuthenticatedRequest, isAgentSideRequest } from "../middleware/auth";
 import { checkApplicationAccessForRequest } from "../utils/access";
@@ -43,13 +44,8 @@ import { sendSuccess, sendCreated, sendError, ErrorMessages } from "../utils/res
 // `templateId` is compared against it, never trusted to select a template.
 const STATEMENT_TEMPLATE_ID = "global-sop";
 
-// Application statuses in which the applicant may still create/edit the
-// statement. From `under_review` onward (and for terminal states) it is read-only.
-const STATEMENT_EDITABLE_STATUSES: ReadonlySet<string> = new Set([
-  "draft",
-  "pending_payment",
-  "pending_documents",
-]);
+// The editable window is shared with the answers API (#187): see utils/editable-window.ts.
+const STATEMENT_EDITABLE_STATUSES = APPLICANT_EDITABLE_STATUSES;
 
 // Upper bound on a saved statement body (serialised JSON chars), so an applicant
 // cannot store megabytes in a document they control. Firestore's hard limit is 1 MiB.

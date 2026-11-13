@@ -434,7 +434,18 @@ class VisaService {
       id: doc.id,
       ...doc.data(),
     })) as VisaRequirement[];
-    if (stored.length > 0) return stored;
+    if (stored.length > 0) {
+      // Issue #187: seeded / admin documents are always `document`; `need` is
+      // "required" unless the author set isRequired false (then "optional").
+      return stored.map((req) => ({
+        ...req,
+        requiredDocuments: (req.requiredDocuments ?? []).map((d) => ({
+          ...d,
+          kind: d.kind ?? ("document" as const),
+          need: d.need ?? (d.isRequired === false ? ("optional" as const) : ("required" as const)),
+        })),
+      }));
+    }
 
     // Issue #175: a scraped visa has no stored requirements, so derive them
     // from its own cited `requiredDocuments` (read time, nothing written).

@@ -350,6 +350,12 @@ export const subcollections = {
   reviews: (agentId: string) =>
     collections.agents.doc(agentId).collection("reviews"),
   
+  // Answers to "information" checklist items under applications (issue #187):
+  // `applications/{id}/answers/{checklistItemId}` = { text, updatedAt, updatedBy }.
+  // Backend-only: firestore.rules deny every client read and write.
+  answers: (applicationId: string) =>
+    collections.applications.doc(applicationId).collection("answers"),
+
   // Notes under applications
   notes: (applicationId: string) =>
     collections.applications.doc(applicationId).collection("notes"),

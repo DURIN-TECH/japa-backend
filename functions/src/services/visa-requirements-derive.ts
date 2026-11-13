@@ -13,34 +13,29 @@
 // mobile app and the application service already read, at READ time (nothing is
 // written, so a re-approved scrape is picked up immediately).
 //
-// Rules (orchestrator decisions on #175):
+// Rules (orchestrator decisions on #175, extended by #187):
 //  - an item WITHOUT a cited quote is dropped, never shown (no invented data);
-//  - `isRequired` is true by default (the scraper only extracts the page's
-//    required-documents list); false only when the cited quote itself says
-//    "optional", "if applicable", "if relevant" or "unless";
+//  - every item has a `kind` ("document" | "information") and a `need`
+//    ("required" | "conditional" | "optional") read from the classification the
+//    extractor stored next to the item (`scrapeMeta.requiredDocumentMeta`, index
+//    aligned). A visa crawled before #187 has none: its items read as
+//    `document` + `kindReview`, and `need` comes from the item's own stored quote
+//    by the same rules (required-document-meta.ts: "if" / "unless" /
+//    "depending on" = conditional, "optional" = optional, "may" never counts);
+//  - `isRequired` stays for compatibility and is true ONLY for `required`;
 //  - no format / size / period / amount is invented: the platform upload
 //    defaults are used for acceptedFormats / maxSizeMb (not domain data).
 
 import { Timestamp } from "firebase-admin/firestore";
 import type { RequiredDocument, VisaRequirement, VisaType } from "../types";
+import { metaFromQuoteOnly, normaliseStoredMeta } from "../scrapers/visa-catalog/required-document-meta";
 
 // Id of the single derived requirement. Stable so clients can key on it.
 export const DERIVED_REQUIREMENT_ID = "scraped-required-documents";
 
-// Words in a quote that make the document optional or conditional (QA on #175:
-// "may" is NOT used: "offences you may have committed" is not optional).
-// Only an explicit "optional", "if applicable", "if relevant" or "unless",
-// any case.
-const OPTIONAL_QUOTE = /\b(optional|if applicable|if relevant|unless)\b/i;
-
 // Platform upload defaults (what the app accepts), not claims about the visa.
 const DEFAULT_FORMATS = ["pdf", "jpg", "png"];
 const DEFAULT_MAX_MB = 10;
-
-/** True when the quote marks the document as optional or conditional. */
-export function isQuoteOptional(quote: string): boolean {
-  return OPTIONAL_QUOTE.test(quote);
-}
 
 /**
  * Build the derived requirements for a visa, or [] when it is not a scraped
@@ -60,14 +55,23 @@ export function deriveRequirementsFromScrape(visa: VisaType): VisaRequirement[] 
     const quote = citations[`requiredDocuments.${index}`];
     if (typeof name !== "string" || !name.trim()) return;
     if (typeof quote !== "string" || !quote.trim()) return; // uncited: drop
+    // Issue #187: the stored classification for THIS (original) index, or the
+    // quote-only fallback when the visa has none yet.
+    const storedMeta = visa.scrapeMeta?.requiredDocumentMeta?.[index];
+    const meta = storedMeta ? normaliseStoredMeta(storedMeta, quote) : metaFromQuoteOnly(quote);
     docs.push({
       id: `${DERIVED_REQUIREMENT_ID}-${index}`,
       name: name.trim(),
       description: quote.trim(), // the official wording behind the item
       acceptedFormats: DEFAULT_FORMATS,
       maxSizeMb: DEFAULT_MAX_MB,
-      isRequired: !isQuoteOptional(quote),
+      isRequired: meta.need === "required",
       citation: { quote: quote.trim(), sourceUrl },
+      kind: meta.kind,
+      ...(meta.kindReview ? { kindReview: true as const } : {}),
+      ...(meta.kindQuote ? { kindQuote: meta.kindQuote } : {}),
+      need: meta.need,
+      ...(meta.appliesWhen ? { appliesWhen: meta.appliesWhen } : {}),
     });
   });
   if (docs.length === 0) return [];
