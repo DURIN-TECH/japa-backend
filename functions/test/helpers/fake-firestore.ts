@@ -72,9 +72,26 @@ function applyUpdate(target: Data, update: Data): Data {
 }
 
 /** Raw writes (no transaction). */
+/** Deep-merge plain objects (what a real set(..., {merge:true}) does with nested maps). */
+function deepMerge(base: Data, patch: Data): Data {
+  const out: Data = clone(base);
+  for (const [k, v] of Object.entries(patch)) {
+    const cur = out[k];
+    const plain = (x: unknown) => !!x && typeof x === "object" && Object.getPrototypeOf(x) === Object.prototype;
+    out[k] = plain(v) && plain(cur) ? deepMerge(cur as Data, v as Data) : clone(v);
+  }
+  return out;
+}
 function doSet(path: string, data: Data, merge?: boolean): void {
   writes.push({ op: "set", path, data: { ...data } });
-  store.set(path, applyUpdate(merge ? store.get(path) ?? {} : {}, data));
+  // Merge keeps untouched nested map keys (issue #120: per-agency cap counters);
+  // FieldValue sentinels still go through applyUpdate at the top level.
+  if (merge) {
+    const merged = deepMerge(store.get(path) ?? {}, data);
+    store.set(path, applyUpdate(merged, Object.fromEntries(Object.entries(data).filter(([, v]) => v instanceof FieldValue))));
+  } else {
+    store.set(path, applyUpdate({}, data));
+  }
 }
 function doUpdate(path: string, data: Data): void {
   const cur = store.get(path);
@@ -344,4 +361,15 @@ export async function installFakes(): Promise<void> {
   firebase.collections.aiMessageAccessAudit = fakeCollection("aiMessageAccessAudit");
   const riskSignals: any = await import("../../src/services/risk-signal.service");
   riskSignals.riskSignalService.runTransaction = fakeRunTransaction;
+
+  // Issue #120: listing screening results, the daily AI counters it claims
+  // caps from, and its transactional cap claim.
+  firebase.collections.listingScreenings = fakeCollection("listingScreenings");
+  firebase.collections.aiCosts = fakeCollection("aiCosts");
+  const screening: any = await import("../../src/agency-visas/agency-visa-screening.service");
+  screening.agencyVisaScreeningService.deps.runTransaction = fakeRunTransaction;
+  // Never the real model in a unit test: a request with no recording throws
+  // (screening then records `model_failed`), so a test cannot reach the network.
+  const llm: any = await import("../../src/services/ai/llm-provider");
+  screening.agencyVisaScreeningService.deps.provider = new llm.RecordedLlmProvider();
 }

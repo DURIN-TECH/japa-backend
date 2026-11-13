@@ -30,6 +30,8 @@ import { anonymousDb, clientDb, isDenied, resetEmulators, rulesEnv, withoutRules
 /** Top-level backend-only collections (names from src/utils/firebase.ts). */
 const COLLECTIONS = [
   "riskSignals",
+  // Agency listing screening results (issue #120): admin-only through the API.
+  "listingScreenings",
   "rubricReviewHistory",
   "applicationAssessments",
   "aiConversations",

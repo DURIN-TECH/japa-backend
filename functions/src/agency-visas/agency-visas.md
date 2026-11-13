@@ -462,6 +462,108 @@ on the Firestore emulator (alternate port, `demo-` project): seed, global,
 agency-only, pending and inactive visas, their requirements, a revision and a
 price, as anonymous, a client token and an admin token.
 
+## Listing screening (issue #120)
+
+Code: `agency-visa-screening.service.ts` (storage, caps, signals, hook,
+rerun), `../services/risk-rules/listing-comparison.rules.ts` (pure code
+comparisons), `../services/risk-rules/listing-language.rules.ts` (the three
+indicators and flag validation), `../services/ai/listing-screening-prompt.ts`
+(prompt, schema, content hash). Tests: `test/agency-visas/agency-visa-screening.test.ts`,
+`listing-screening-rules.test.ts`, `listing-screening-generic.test.ts`, and the
+emulator role matrix `test/emulator/listing-screening.emu.ts`.
+
+Seli screens a listing **for an admin**, never for the agency or applicants.
+Screening never changes the listing, its review state, `isActive`,
+`visibility` or a revision, never notifies anyone, and never appears in an
+agency or applicant response. The agency endpoints answer exactly the same
+whether screening succeeded, failed or was skipped.
+
+**When it runs** (inside the request, after the transaction commits, never
+throws, stops waiting after 20 s, failures logged without listing text):
+
+- `POST /agency/visas/:id/submit` (draft or rejected to `pending_review`):
+  screens the visa content (`target: "visa"`).
+- `PUT|PATCH /agency/visas/:id` on an `approved` visa that writes or changes a
+  `visaRevisions` doc: screens live content plus the proposal
+  (`target: "revision"`). The live doc stays untouched and visible.
+- Not on draft create, draft edit, a rejected edit, or an edit that deletes
+  the revision.
+
+**Code comparison** (no model). The listing is compared only with a verified
+record: a `countries/{cc}/visaTypes` doc with `source: "scraped"`,
+`reviewStatus: "approved"`, `isActive`, and the same `code` after trim and
+upper-casing. If none matches (or more than one does) nothing is judged. Each
+field is skipped on its own when the verified side lacks it, and a mismatch is
+only raised when the verified record gives a verbatim citation and an http(s)
+`scrapeMeta.sourceUrl`; the signal carries both as its source.
+
+| Field | Rule |
+| --- | --- |
+| `baseCostUsd` | Whole USD both sides; verified fee must have none of `feeUnverified`, `fxMissing`, `fxStale`, `noPublishedFee` and a finite value. Flagged when `|listing - verified| > max(1, ceil(5% of verified))` (`LISTING_FEE_TOLERANCE_PCT`, a screening noise threshold, not an immigration fact). Citation `fee.application`. |
+| `category` | Exact. Citation `category`. |
+| `isExtendable` | Exact boolean. Citation `isExtendable`. |
+| `processingDays` | The `[min, max]` ranges must overlap; skipped when the verified record is `processingUnknown` or lacks a value. Citation `processingTime`. |
+
+**Language check** (model locates, code decides). Three indicators registered
+in `RISK_RULES`, each with its published quote and URL on the rule entry:
+`listing_guaranteed_outcome`, `listing_payment_for_job_offer`,
+`listing_identity_document_retention`. The model (role `extraction`, no tools)
+gets only the listing's text fields (`name`, `description`,
+`applicationInstructions`, each eligibility criterion,
+`sponsor.organisationName`), wrapped with `wrapUntrusted(text, "listing")`.
+It returns `{ flags: [{ indicator, field, quote }] }`; code accepts a flag only
+when the indicator is registered, the field is one of the fields above, and the
+quote is non-empty, at most 200 characters and an exact substring of that
+field. At most 10 are accepted; the rest are counted in `droppedFlags`. A reply
+that is not valid JSON is a model failure. Severity comes from a code table
+(identity documents `high`, the others `medium`).
+
+**Storage.** `listingScreenings/{cc}__{visaId}` (backend-only, no
+`firestore.rules` match): `target`, `contentHash`, `ranAt`, `countryCode`,
+`visaId`, `ownerAgencyId`, `comparisons[]`, `verifiedVisaId`, `languageCheck`
+(`done | not_run`) with `notRunReason` (`ai_disabled | settings_unavailable |
+cap_reached | model_failed`), `flags[]` (the quotes, admin-only),
+`droppedFlags`, `injectionSuspected`, `signalIds[]`.
+
+**Signals** are raised only through `riskSignalService.raiseRiskSignal`, subject
+`{ type: "visa", id: "{cc}__{visaId}" }`, `source.kind: "rule"`, `dedupeKey`
+`{ruleId}:visa:{cc}__{visaId}`. Types: `listing_contradicts_verified_record`,
+`listing_recruitment_language`, and a low `listing_screening_incomplete` when
+the language check did not run. Evidence is references and structured facts
+only (field name, indicator, character offsets, a hash of the quote,
+`contentHash`, money as `{ value, currency: "USD", unit: "major" }`). A listing
+with no mismatch and no flag raises nothing. The same `contentHash` again
+writes nothing; a changed edit adds new evidence and merges into the active
+signal.
+
+**Caps and settings** (`appConfig/aiSettings`): `listingScreeningsPerDay`
+(default 200, 1 to 10000) and `listingScreeningsPerAgencyPerDay` (default 20,
+1 to 1000), counted in requests in `aiCosts/{day}` (`listingScreenings` and a
+per-agency map) in one transaction, failing closed. The model call is skipped
+when AI is disabled, the settings cannot be read, a cap is reached or the
+provider fails. The code comparison always runs. No entitlement is needed.
+
+**Admin touchpoints.**
+
+- `GET /admin/visas`: agency rows gain `screening` (the stored doc, or `null`;
+  `ranAt` is a serialised Timestamp `{ _seconds, _nanoseconds }` like the other
+  dates on the row) and `openScreeningSignals` (count of open or in-review
+  risk signals for this visa). Scraped and seed rows are unchanged.
+- `PATCH /admin/visas/:id/review` with `action: "approve"` on a new submit or a
+  pending revision: **409 `SCREENING_OPEN`** unless the screening is clean for
+  the content about to go live (a doc for this target and hash with
+  `languageCheck: "done"`, no mismatch, no flag) or the body has
+  `acknowledgeScreening: true`. Nothing is written on the 409. Reject is never
+  blocked. An approve of an already approved visa with no revision stays
+  idempotent.
+- `POST /admin/visas/:id/screening/rerun` with `{ countryCode }`: re-screens the
+  current target (the recovery path after a model outage). 404 for an unknown
+  or non-agency visa, 409 `NO_SCREENING_TARGET` when nothing is waiting for
+  review. 200 `{ screening, openScreeningSignals, status }`.
+
+Out of scope (follow-ups): comparing sponsor requirement and work rights;
+re-screening live listings when a verified record changes.
+
 ## Follow-ups (out of scope for #100)
 
 - ~~`firestore.rules` direct read of agency-only visas~~: done in #102.

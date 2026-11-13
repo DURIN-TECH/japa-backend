@@ -63,6 +63,13 @@ adminVisaRoutes.patch("/:id/review", verifyAuth, verifyAdmin, (req, res) =>
   visaController.reviewVisa(req, res)
 );
 
+// Re-run listing screening on an agency visa's current target (issue #120).
+// Body { countryCode }. Admin only: verifyAuth, verifyAdmin, then a CASL probe
+// on `reviewStatus` in the controller.
+adminVisaRoutes.post("/:id/screening/rerun", verifyAuth, verifyAdmin, (req, res) =>
+  visaController.rerunScreening(req, res)
+);
+
 // Make an approved agency visa global, or take it back to agency-only
 // (issue #101). Body { countryCode, visibility: "global" | "agency" }.
 // Same admin gate as the review route; the controller adds a CASL check on

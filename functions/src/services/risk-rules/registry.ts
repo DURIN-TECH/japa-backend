@@ -9,8 +9,12 @@
 
 import type { AnyRiskRule } from "./types";
 import { sharedContactRule } from "./shared-contact.rule";
+import { LISTING_LANGUAGE_RULES } from "./listing-language.rules";
 
-export const RISK_RULES: readonly AnyRiskRule[] = [sharedContactRule];
+// Issue #120 adds the three listing language indicators. The listing COMPARISON
+// rules are deliberately not here: their source is the verified record's own
+// citation, which is dynamic (see listing-comparison.rules.ts).
+export const RISK_RULES: readonly AnyRiskRule[] = [sharedContactRule, ...LISTING_LANGUAGE_RULES];
 
 /**
  * Problems with the registry, as readable strings (empty = fine). A rule

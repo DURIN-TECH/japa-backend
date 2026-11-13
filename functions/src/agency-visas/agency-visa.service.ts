@@ -36,6 +36,7 @@ import {
   mergeContent,
   pickContent,
 } from "./agency-visa.validation";
+import { agencyVisaScreeningService, type ScreenInput } from "./agency-visa-screening.service";
 import type { DocumentData, UpdateData } from "firebase-admin/firestore";
 // Transaction.update() wants UpdateData<DocumentData>; the field maps built here are
 // Record<string, unknown> (dotted paths + FieldValue sentinels), which tsc rejects.
@@ -261,7 +262,13 @@ class AgencyVisaService {
     // Fields this request writes (for the per-field CASL check).
     const written = [...Object.keys(parsed.fields), ...parsed.cleared];
 
+    // Issue #120: set only when this request wrote a revision (see below);
+    // screening runs AFTER the commit, from this value.
+    let toScreen: ScreenInput | null = null;
+
     await this.runTransaction(async (tx) => {
+      // A transaction may retry: start each attempt with nothing to screen.
+      toScreen = null;
       // ---- Re-read inside the transaction ----
       const snap = await tx.get(ref);
       if (!snap.exists) throw visaNotFound();
@@ -315,6 +322,14 @@ class AgencyVisaService {
         // set() without merge: a reopened rejected revision loses its old
         // rejectionReason / reviewedBy / reviewedAt.
         tx.set(revRef, revision);
+        // Screen what would go live: live content + the whole proposal (#120).
+        toScreen = {
+          target: "revision",
+          countryCode: cc,
+          visaId,
+          ownerAgencyId: actor.agencyId,
+          content: proposed as Record<string, unknown>,
+        };
         return;
       }
 
@@ -325,6 +340,11 @@ class AgencyVisaService {
       for (const field of parsed.cleared) update[field] = FieldValue.delete();
       tx.update(ref, update as FsUpdate);
     });
+
+    // ---- Issue #120: screen the staged revision (after the commit) ----
+    // Never throws and never changes the response; draft / rejected edits and
+    // an edit that deleted the revision are not screened.
+    if (toScreen) await agencyVisaScreeningService.screenAfterCommit(toScreen);
 
     return this.get(actor.agencyId, visaId, () => true);
   }
@@ -349,8 +369,11 @@ class AgencyVisaService {
     const found = await this.findOwned(actor.agencyId, visaId);
     if (!found) throw visaNotFound();
     const { ref } = found;
+    // Issue #120: the submitted content, captured inside the transaction.
+    let toScreen: ScreenInput | null = null;
 
     await this.runTransaction(async (tx) => {
+      toScreen = null; // a retried transaction starts clean
       const snap = await tx.get(ref);
       if (!snap.exists) throw visaNotFound();
       const visa = { id: snap.id, ...snap.data() } as VisaType;
@@ -379,7 +402,18 @@ class AgencyVisaService {
         submittedBy: actor.uid,
         updatedAt: now,
       });
+      toScreen = {
+        target: "visa",
+        countryCode: visa.countryCode,
+        visaId,
+        ownerAgencyId: actor.agencyId,
+        content: pickContent(visa) as Record<string, unknown>,
+      };
     });
+
+    // ---- Issue #120: screen the submitted listing (after the commit) ----
+    // Never throws; the response below is identical whatever screening did.
+    if (toScreen) await agencyVisaScreeningService.screenAfterCommit(toScreen);
 
     return this.get(actor.agencyId, visaId, () => true);
   }

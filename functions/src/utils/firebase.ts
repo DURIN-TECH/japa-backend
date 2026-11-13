@@ -293,6 +293,13 @@ export const collections = {
   // by admins through /admin/risk-signals. Visible to admins only and never
   // to the subject: backend-only, no firestore.rules match -> clients denied.
   riskSignals: db.collection("riskSignals"),
+  // Agency listing screening results (issue #120): `listingScreenings/{countryCode}__{visaId}`
+  // (the same key as `visaRevisions`), one per listing: code comparisons against
+  // the verified record, the model's validated language flags (with the listing's
+  // own quotes) and the ids of the signals raised. Admin-only, through
+  // GET /admin/visas and the rerun route. Backend-only: no firestore.rules match,
+  // so clients are denied.
+  listingScreenings: db.collection("listingScreenings"),
   // AI message access (issue #172). `aiMessageAccess/{userId}`: one per user, holds
   // their express approval (with the exact wording), the account-wide "off" setting
   // and the one-time-notice dismissal. `aiMessageAccessAudit/{id}`: append-only
