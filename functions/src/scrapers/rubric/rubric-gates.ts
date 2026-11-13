@@ -31,7 +31,8 @@ import type { RubricPublishSettings } from "./rubric-publish-settings";
 //                          cure these without editing a rule, which it never does.
 //   INFORMATIONAL only:    rule_ref_removed, rule_ref_derived,
 //                          judgement_check_stripped, evidence_trigger_simplified,
-//                          specialist_criteria_dropped, multiple_chunks,
+//                          specialist_criteria_dropped, specialist_rules_without_trigger,
+//                          rule_trigger_simplified, multiple_chunks,
 //                          page_ends_mid_sentence, intake_answer_type_unknown
 //   RESOLVED BY THE CHECK: nationality_codes_model_proposed,
 //                          nationality_code_name_mismatch, title_wording_uncited,
@@ -63,7 +64,17 @@ export const INFORMATIONAL_FLAG_CODES: readonly string[] = [
   "rule_ref_derived",
   "judgement_check_stripped",
   "evidence_trigger_simplified",
+  // (#207) `specialist_criteria_dropped` is no longer raised (specialist rules are kept) but old
+  // stored versions may still carry it, so it stays known.
   "specialist_criteria_dropped",
+  // INTEGRATION (#200): #207 raises these two. Part A's table was written before
+  // #207 existed, so without them every draft with a specialist rule would be held
+  // `unknown_flag:...` forever. Both describe rules that are KEPT:
+  //  - specialist_rules_without_trigger: the rule stays and an assessment reports it as "could not tell";
+  //  - rule_trigger_simplified: only the first trigger question was stored (the independent check
+  //    still verifies that stored trigger and drops it if it is wrong).
+  "specialist_rules_without_trigger",
+  "rule_trigger_simplified",
   "multiple_chunks",
   "page_ends_mid_sentence",
   "intake_answer_type_unknown",

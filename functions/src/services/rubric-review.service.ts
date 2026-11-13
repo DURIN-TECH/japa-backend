@@ -198,7 +198,10 @@ const NON_BLOCKING_FLAG_CODES: ReadonlySet<string> = new Set(["intake_answer_typ
  *  - multiple_chunks: the source was read in several excerpts;
  *  - page_ends_mid_sentence: a rule crossing a page break may be cut short;
  *  - title_wording_uncited: criterion titles are the model's own wording (raised on
- *    essentially every version).
+ *    essentially every version);
+ *  - specialist_rules_without_trigger / rule_trigger_simplified (#207): some kept rules
+ *    could not be tied to an intake answer (assessed as "could not tell") or only their
+ *    first trigger question was stored.
  */
 const STANDING_NOTICE_FLAG_CODES: ReadonlySet<string> = new Set([
   "nationality_codes_model_proposed",
@@ -206,6 +209,10 @@ const STANDING_NOTICE_FLAG_CODES: ReadonlySet<string> = new Set([
   "multiple_chunks",
   "page_ends_mid_sentence",
   "title_wording_uncited",
+  // INTEGRATION (#200): raised by #207, which keeps specialist rules. Both are limits of the
+  // extraction that hold for the version as a whole (one key per code), not one thing to fix.
+  "specialist_rules_without_trigger",
+  "rule_trigger_simplified",
 ]);
 
 /** `{countryCode}_{visaTypeId}__v{version}`: the id of one rubric version in the API. */
