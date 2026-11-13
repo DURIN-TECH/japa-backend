@@ -9,10 +9,13 @@
 //   1. its sender qualifies: they have an active express approval, OR their
 //      resolved entitlements include `ai.case_officer` (an AI plan; false for a
 //      lapsed or unpaid plan), AND
-//   2. the chat is not switched off: neither participant has switched this chat
-//      off, and neither participant has the account-wide "off" setting on. An
-//      account-wide off counts as that person having switched EVERY chat off, so
-//      it blocks the whole chat, including the other person's messages.
+//   2. the chat is not switched off: neither participant has the account-wide
+//      "off" setting on. An account-wide off blocks EVERY chat of that person,
+//      including the other person's messages in it.
+//
+// There is no per-chat switch any more (retired in #209). Old
+// `Conversation.aiAccessOffUser/Agent` values may still sit on documents; they
+// are ignored here and by every caller, so they can neither block nor release.
 //
 // Nothing here is cached or stored per message: evaluating at read time is what
 // makes a revoked approval, a lapsed plan or a switch take effect on the very
@@ -29,12 +32,8 @@ export interface AccessParty {
   accountWideOff: boolean;
 }
 
-/** Inputs to the rule: both sides' chat switches and both parties' status. */
+/** Inputs to the rule: both parties' status (approval, plan, account-wide off). */
 export interface AccessInput {
-  /** Applicant side has switched THIS chat off (`Conversation.aiAccessOffUser`). */
-  switchOffUser: boolean;
-  /** Agent side has switched THIS chat off (`Conversation.aiAccessOffAgent`). */
-  switchOffAgent: boolean;
   applicant: AccessParty;
   agent: AccessParty;
 }
@@ -49,18 +48,15 @@ export interface AccessDecision {
   agentReleased: boolean;
 }
 
-/** True when this party qualifies on their own (approval or AI plan), ignoring switches. */
+/** True when this party qualifies on their own (approval or AI plan), ignoring the off setting. */
 export function partyQualifies(p: AccessParty): boolean {
   return p.approved || p.hasAiPlan;
 }
 
 /** Apply the rule. See the header for the full statement. */
 export function decideMessageAccess(input: AccessInput): AccessDecision {
-  const chatOff =
-    input.switchOffUser ||
-    input.switchOffAgent ||
-    input.applicant.accountWideOff ||
-    input.agent.accountWideOff;
+  // Only the two account-wide settings can turn a chat off.
+  const chatOff = input.applicant.accountWideOff || input.agent.accountWideOff;
   return {
     chatOff,
     applicantReleased: !chatOff && partyQualifies(input.applicant),

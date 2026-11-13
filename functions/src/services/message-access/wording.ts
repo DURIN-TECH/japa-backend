@@ -17,6 +17,11 @@
 // place, an approval stored against an old id must keep matching its text),
 // point `CURRENT_*` at it, and keep the old entry in the `*_HISTORY` list.
 
+// NOTE (#209): the per-chat AI switch was retired, so the draft-1 approval text
+// and the draft-1 notice below still describe per-chat switching that no longer
+// exists. They are kept verbatim on purpose (stored approvals must keep matching
+// their text) and are NOT edited here; rewording is tracked in #210.
+
 /** One versioned block of wording. */
 export interface WordingVersion {
   /** Stable id stored on the approval record, e.g. "ai-message-access-approval.draft-1". */

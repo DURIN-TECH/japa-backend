@@ -467,19 +467,18 @@ service cloud.firestore {
                      (exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid));
       
-      // AI message access (issue #172): the per-side chat switch and WHO the two
-      // sides are. The switch fields are written ONLY by the backend
-      // (PUT /conversations/:id/ai-access, Admin SDK, which bypasses these rules):
-      // the API enforces "you can change only your own side" and writes the audit
-      // record in the same transaction.
+      // AI message access (issues #172, #209): WHO the two sides are must not be
+      // client-writable. The per-chat switch fields (`aiAccessOffUser/Agent`) are
+      // RETIRED (#209): nothing writes or reads them any more, and clients still
+      // cannot write them (the allow-list below and the create check).
       //
-      // Updates are an ALLOW-LIST, not a deny-list. A deny-list of the two switch
-      // fields was not enough: a participant could rewrite `userId` / `agentId`
-      // (the rule only checks the document as it was BEFORE the write), make the
-      // API see them as both sides, clear the other person's switch, then restore
-      // the ids. So a client may update only the fields below. No client code
-      // writes this document today (mobile and portal only read it, through the
-      // API or a listener); the API writes everything else with the Admin SDK.
+      // Updates are an ALLOW-LIST, not a deny-list. The AI access check resolves
+      // the two people of a chat from `conv.userId` / `conv.agentId`, and the rule
+      // only checks the document as it was BEFORE the write, so a participant who
+      // could rewrite either id could make the check see the wrong people. A client
+      // may therefore update only the fields below. No client code writes this
+      // document today (mobile and portal only read it, through the API or a
+      // listener); the API writes everything else with the Admin SDK.
       function onlyClientEditableConversationFields() {
         return request.resource.data.diff(resource.data).affectedKeys()
                  .hasOnly(['unreadCountUser', 'unreadCountAgent', 'updatedAt']);
