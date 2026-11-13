@@ -169,8 +169,8 @@ export function decidePolarity(proposal: Exclude<IntentPolarity, "not_assessed">
 
 /** Rough tokens per rule sent (rule fields, quote, window) and in the constant system prompt, and per verdict answered. */
 const EST_INPUT_TOKENS_PER_RULE = 450;
-const EST_SYSTEM_PROMPT_TOKENS = 1_100;
-const EST_OUTPUT_TOKENS_PER_RULE = 70;
+const EST_SYSTEM_PROMPT_TOKENS = 1_900;
+const EST_OUTPUT_TOKENS_PER_RULE = 100;
 
 /**
  * Expected size of one check of a draft, before any thinking tokens. Requests:

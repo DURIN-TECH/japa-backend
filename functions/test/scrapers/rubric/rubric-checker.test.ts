@@ -183,9 +183,9 @@ describe("answers are parsed strictly", () => {
     assert.throws(() => parseVerdicts(ok(["r1", "r1"]), ["r1", "r2"]), /repeats/);
   });
   test("the polarity answer is one closed choice", () => {
-    assert.equal(parsePolarityAnswer('{"answer":"unsure"}'), "unsure");
-    assert.throws(() => parsePolarityAnswer('{"answer":"yes"}'), CheckerAnswerError);
-    assert.throws(() => parsePolarityAnswer('{"answer":"unsure","why":"x"}'), CheckerAnswerError);
+    assert.equal(parsePolarityAnswer("{\"answer\":\"unsure\"}"), "unsure");
+    assert.throws(() => parsePolarityAnswer("{\"answer\":\"yes\"}"), CheckerAnswerError);
+    assert.throws(() => parsePolarityAnswer("{\"answer\":\"unsure\",\"why\":\"x\"}"), CheckerAnswerError);
   });
   test("the verdict schema is small and flat: no union type, no free-text key but the handle", () => {
     const schema = JSON.stringify(buildVerdictSchema());
@@ -450,7 +450,7 @@ describe("check: batching is deterministic", () => {
         : JSON.stringify({ answer: "immigrant_intent_penalised" });
       recorded.record(q, { text, usage: { inputTokens: 10, outputTokens: 5 } });
     }
-    const make = (rb: typeof rubric) => new RubricCheckerService({ provider: () => recorded, readSnapshot: async () => pageOf(40), loadSettings: settingsWith(), ledger: new MemoryLedger(), nowMs: () => 1, sleep: async () => undefined });
+    const make = (_rb: typeof rubric) => new RubricCheckerService({ provider: () => recorded, readSnapshot: async () => pageOf(40), loadSettings: settingsWith(), ledger: new MemoryLedger(), nowMs: () => 1, sleep: async () => undefined });
     const replay = await make(rubric).check(input(rubric));
     assert.equal(replay.ok, true);
     // One word of a title changes: no recording, so the check cannot answer and the draft is held.

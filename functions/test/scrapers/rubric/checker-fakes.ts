@@ -61,7 +61,7 @@ export class ScriptedProvider implements LlmProvider {
     if (scripted === "transient") throw new LlmProviderError("provider_error", "status=529 overloaded");
     if (scripted === "hard") throw new LlmProviderError("provider_error", "status=400 bad request");
     if (scripted === "refusal") return base("", "refusal");
-    if (scripted === "truncated") return base('{"verdicts":[', "max_tokens");
+    if (scripted === "truncated") return base("{\"verdicts\":[", "max_tokens");
     if (scripted) return base(scripted.text);
     if ("answer" in (req.schema as any).properties) return base(JSON.stringify({ answer: this.polarity(req.role, seenSentence(req)) }));
     const rules = seenRules(req);
