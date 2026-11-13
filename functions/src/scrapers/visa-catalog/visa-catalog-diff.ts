@@ -533,7 +533,11 @@ export interface ProposalInput {
 
 /** What the proposal transaction writes. */
 export type ProposalWritePlan =
-  | { action: "none" } // same hash as the open row, or no diff
+  // Same hash + prompt version as the open row, or no diff. `stampVersion` (issue
+  // #187): the no-diff case where the live doc's stored prompt version is older
+  // than this extraction's. The caller records it on the live doc (metadata
+  // only, no proposal) so the visa is not re-extracted on every crawl.
+  | { action: "none"; stampVersion?: string }
   | { action: "create"; row: Omit<PendingVisaChange, "id"> }
   | { action: "replace"; id: string; row: Omit<PendingVisaChange, "id"> };
 
@@ -571,7 +575,12 @@ export function planProposalWrite(params: {
     proposedBaseCostUsd: input.proposedBaseCostUsd,
     proposedMeta: input.scrapeMeta.requiredDocumentMeta,
   });
-  if (result.diff.length === 0) return { action: "none" };
+  if (result.diff.length === 0) {
+    const version = input.scrapeMeta.extractorPromptVersion;
+    return version && live.scrapeMeta?.extractorPromptVersion !== version
+      ? { action: "none", stampVersion: version }
+      : { action: "none" };
+  }
 
   // Full scrapeMeta for the approve-time wholesale replace, with the fee the
   // diff chose (new one, or the live block carried forward).

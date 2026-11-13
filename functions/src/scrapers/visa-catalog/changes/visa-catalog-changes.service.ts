@@ -150,14 +150,23 @@ class VisaChangeService {
       if (!visaSnap.exists) return "skipped";
       const live = visaSnap.data() as VisaType;
       // The doc may have changed since ingest's first read (e.g. withdrawn).
-      const branch = planIngest(live, input.contentHash);
+      // The prompt version lets a same-hash approved visa from an older prompt
+      // still plan "propose" (issue #187); without it that would read "unchanged".
+      const branch = planIngest(live, input.contentHash, input.scrapeMeta.extractorPromptVersion);
       if (branch === "unchanged") return "unchanged";
       if (branch !== "propose") return "skipped";
       const openRow = openSnap.docs[0] ? rowFrom(openSnap.docs[0]) : undefined;
 
       // ---- Plan + write ----
       const plan = planProposalWrite({ live, openRow, input, now: Timestamp.now() });
-      if (plan.action === "none") return "unchanged";
+      if (plan.action === "none") {
+        // Issue #187: the re-extraction found nothing to change but the live
+        // doc was read by an older prompt. Record the current version on it
+        // (one dotted key, no content change, no proposal) so it is not
+        // re-extracted on every crawl.
+        if (plan.stampVersion) tx.update(visaRef, { "scrapeMeta.extractorPromptVersion": plan.stampVersion });
+        return "unchanged";
+      }
       if (plan.action === "replace") {
         // set() (not merge): the replacement row is complete, and a stale key
         // from the previous revision (e.g. an old blockReason) must not linger.

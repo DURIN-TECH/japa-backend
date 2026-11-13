@@ -110,6 +110,16 @@ describe("approved visas are classified through a proposal (#187)", () => {
     assert.equal(isPendingPromptStale({ ...live(extraction(), "h1", "v-old"), source: undefined } as unknown as VisaType, "v-new"), false);
   });
 
+  test("re-extraction with identical meta stages nothing but asks to stamp the new prompt version", () => {
+    const same = live(extraction(), "h1", "v-old");
+    const plan = planProposalWrite({ live: same, input: ingestInput(extraction(), "h1", "v-new"), now: NOW });
+    assert.deepEqual(plan, { action: "none", stampVersion: "v-new" });
+    // Once stamped, the visa is no longer stale and the next crawl plans nothing.
+    const stamped = { ...same, scrapeMeta: { ...same.scrapeMeta!, extractorPromptVersion: "v-new" } } as VisaType;
+    assert.equal(isPendingPromptStale(stamped, "v-new"), false);
+    assert.deepEqual(planProposalWrite({ live: stamped, input: ingestInput(extraction(), "h1", "v-new"), now: NOW }), { action: "none" });
+  });
+
   test("an open row for the same page from an older prompt version is replaced, not skipped", () => {
     const liveDoc = live(BACKFILLED, "h1", "v-old");
     const first = planProposalWrite({ live: liveDoc, input: ingestInput(extraction(), "h1", "v-mid"), now: NOW });
