@@ -18,10 +18,10 @@
  * applicant, but ONLY for their own statement (see the "applicant statement"
  * section). Every other route stays agent-only in routes/document-instance.routes.ts.
  */
-import { APPLICANT_EDITABLE_STATUSES } from "../utils/editable-window";
 import { Response } from "express";
 import { AuthenticatedRequest, isAgentSideRequest } from "../middleware/auth";
 import { checkApplicationAccessForRequest } from "../utils/access";
+import { APPLICANT_EDITABLE_STATUSES } from "../utils/editable-window";
 import { documentInstanceService } from "../services/document-instance.service";
 import { documentTemplateService } from "../services/document-template.service";
 import { applicationService } from "../services/application.service";

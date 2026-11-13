@@ -43,6 +43,10 @@ export type DocumentNeed = "required" | "conditional" | "optional";
 
 /** The stored classification of ONE required-document item. */
 export interface RequiredDocumentMeta {
+  // The item's own text (as in `requiredDocuments`). Meta is matched to items
+  // BY THIS TEXT, never by position alone, so a reordered list cannot hand an
+  // item its neighbour's classification (review fix on #187).
+  item?: string;
   kind: DocumentKind;
   // True when the item could not be classified from the page's wording (no
   // verifiable kind quote). The item stays "document".
@@ -60,6 +64,44 @@ export const DEFAULT_DOCUMENT_META: Readonly<RequiredDocumentMeta> = Object.free
   kind: "document",
   need: "required",
 });
+
+// ----- Matching meta to items by text -----
+
+/**
+ * Comparison key of an item's text: curly quotes/dashes unified, whitespace
+ * collapsed, lower-cased. Characters only; never fuzzy word matching.
+ */
+export function itemKey(text: string): string {
+  return text
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, "\"")
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * The stored meta entry for the item `name` at `index` of `requiredDocuments`.
+ *  - an entry whose `item` text equals the item's text wins (the reliable key);
+ *  - otherwise the entry at `index` is used ONLY for a legacy list where no
+ *    entry carries an `item` and the lengths match (nothing to contradict it);
+ *  - otherwise undefined: the caller falls back to "document + kindReview",
+ *    never to a neighbour's classification.
+ */
+export function findMetaForItem(
+  list: RequiredDocumentMeta[] | undefined,
+  index: number,
+  name: string,
+  itemCount: number
+): RequiredDocumentMeta | undefined {
+  if (!Array.isArray(list) || list.length === 0) return undefined;
+  const key = itemKey(name);
+  const byText = list.find((m) => typeof m?.item === "string" && itemKey(m.item) === key);
+  if (byText) return byText;
+  const legacy = list.every((m) => !m || typeof m.item !== "string");
+  return legacy && list.length === itemCount ? list[index] : undefined;
+}
 
 // ----- The rules -----
 
@@ -87,7 +129,8 @@ export function extractConditionalClause(text: string): string | null {
   for (let i = m.index; i < text.length; i++) {
     const c = text[i];
     const sentenceEnd = c === "." && (i + 1 >= text.length || /\s/.test(text[i + 1]));
-    if (c === ")" || c === "]" || c === ";" || c === "\n" || sentenceEnd) {
+    // A colon also ends the clause: after it comes the item list, not the condition.
+    if (c === ")" || c === "]" || c === ";" || c === ":" || c === "\n" || sentenceEnd) {
       end = i;
       break;
     }
@@ -108,21 +151,44 @@ export function extractLeadIn(quote: string): string | null {
 }
 
 /**
+ * The part of an item's quote that speaks about THIS item: from the item's own
+ * text to the end of its sentence. A quote may run on into the next sentence
+ * ("a passport. If you're under 18 ...") or start with a lead-in; neither says
+ * anything about this item. When the item text is not found in the quote (or
+ * not given) the whole quote is used.
+ */
+function ownText(quote: string, itemText?: string): string {
+  if (!itemText || !itemText.trim()) return quote;
+  // Same-length folding (curly -> straight apostrophe, lower case) keeps indices valid.
+  const fold = (t: string) => t.replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, "\"").toLowerCase();
+  const at = fold(quote).indexOf(fold(itemText.trim()));
+  if (at < 0) return quote;
+  const rest = quote.slice(at);
+  // End at the first sentence end (". " or a line break) after the item text.
+  const after = rest.slice(itemText.trim().length);
+  const m = /\.(?:\s|$)|\n/.exec(after);
+  return m ? rest.slice(0, itemText.trim().length + m.index) : rest;
+}
+
+/**
  * Decide `need` (+ `appliesWhen`) for one item.
  *
  * Order: "optional" wins; then an inline "if / unless / depending on" clause in
- * the item's OWN quote (the most specific statement); then the page's lead-in
- * (the item sits under "Depending on your circumstances ..."); otherwise
- * required. No quote at all is "required" (the item default), never a guess.
+ * the item's OWN text (see ownText; the most specific statement); then the
+ * page's lead-in (the item sits under "Depending on your circumstances ...");
+ * otherwise required. No quote at all is "required" (the item default), never
+ * a guess.
  *
  * @param itemQuote the verbatim quote that cites the item
  * @param kindQuote the stored kind quote, which may be the lead-in
+ * @param itemText  the item's own text, to ignore what the quote says around it
  */
 export function classifyNeed(
   itemQuote: string | undefined,
-  kindQuote?: string
+  kindQuote?: string,
+  itemText?: string
 ): { need: DocumentNeed; appliesWhen?: string } {
-  const quote = (itemQuote ?? "").trim();
+  const quote = ownText((itemQuote ?? "").trim(), itemText);
   if (OPTIONAL_CUE.test(quote)) return { need: "optional" };
   const clause = extractConditionalClause(quote);
   if (clause) return { need: "conditional", appliesWhen: clause };
@@ -137,17 +203,27 @@ export function classifyNeed(
  * stays "document" with `kindReview`, and `need` is still derived from the
  * stored quote with the same rules. Nothing is invented.
  */
-export function metaFromQuoteOnly(itemQuote: string | undefined): RequiredDocumentMeta {
-  const { need, appliesWhen } = classifyNeed(itemQuote);
-  return { kind: "document", kindReview: true, need, ...(appliesWhen ? { appliesWhen } : {}) };
+export function metaFromQuoteOnly(itemQuote: string | undefined, itemText?: string): RequiredDocumentMeta {
+  const { need, appliesWhen } = classifyNeed(itemQuote, undefined, itemText);
+  return {
+    ...(itemText ? { item: itemText } : {}),
+    kind: "document",
+    kindReview: true,
+    need,
+    ...(appliesWhen ? { appliesWhen } : {}),
+  };
 }
 
 /**
  * Normalise a stored meta value read from Firestore into a well-formed one.
  * Anything malformed falls back to `metaFromQuoteOnly` (never throws).
  */
-export function normaliseStoredMeta(stored: unknown, itemQuote: string | undefined): RequiredDocumentMeta {
-  if (!stored || typeof stored !== "object") return metaFromQuoteOnly(itemQuote);
+export function normaliseStoredMeta(
+  stored: unknown,
+  itemQuote: string | undefined,
+  itemText?: string
+): RequiredDocumentMeta {
+  if (!stored || typeof stored !== "object") return metaFromQuoteOnly(itemQuote, itemText);
   const s = stored as Record<string, unknown>;
   const kind: DocumentKind = s.kind === "information" ? "information" : "document";
   const need: DocumentNeed =

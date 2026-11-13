@@ -16,9 +16,10 @@
  *    with `kindReview: true` until the next weekly crawl classifies it with the
  *    new prompt (which replaces this field wholesale).
  *
- * IDEMPOTENT: a visa that already has a meta list of the same length as its
- * documents (from this script or from a v7 crawl) is left untouched, so a v7
- * classification is never overwritten.
+ * IDEMPOTENT: items are matched to stored entries by their TEXT. A visa where
+ * every item already has its entry (from this script or a v8 crawl) is left
+ * untouched, and when only some items lack one the real classifications of the
+ * others are kept: nothing is overwritten wholesale.
  *
  * DRY RUN BY DEFAULT, with per-visa counts:
  *   npm run backfill:item-kinds         # dry run
@@ -26,7 +27,7 @@
  *   npm run backfill:item-kinds:dev     # dry run on durin-seli-dev
  */
 import { collections, subcollections } from "../utils/firebase";
-import { metaFromQuoteOnly, type RequiredDocumentMeta } from "../scrapers";
+import { findMetaForItem, metaFromQuoteOnly, type RequiredDocumentMeta } from "../scrapers";
 import type { VisaType } from "../types";
 
 export type BackfillOutcome = "backfill" | "already_done" | "no_documents";
@@ -45,14 +46,25 @@ export function planItemKindBackfill(
   const counts = { items: names.length, required: 0, conditional: 0, optional: 0, kindReview: 0 };
   if (names.length === 0) return { outcome: "no_documents", meta: [], counts };
   const existing = visa.scrapeMeta?.requiredDocumentMeta;
-  if (Array.isArray(existing) && existing.length === names.length) {
-    return { outcome: "already_done", meta: existing, counts };
-  }
   const citations = visa.scrapeMeta?.citations ?? {};
-  const meta = names.map((_, i) => metaFromQuoteOnly(citations[`requiredDocuments.${i}`]));
+  // Match by the item's TEXT (not by list length): an entry that already
+  // classifies this item (a v8 crawl, an earlier backfill) is kept as it is;
+  // only items with no entry get the quote-only reading.
+  let allKnown = true;
+  const meta = names.map((name, i) => {
+    const found = findMetaForItem(existing, i, name, names.length);
+    if (found && typeof found.item === "string") return found;
+    allKnown = false;
+    // A legacy entry without its item text is kept but stamped with the text.
+    return found ? { ...found, item: name } : metaFromQuoteOnly(citations[`requiredDocuments.${i}`], name);
+  });
   for (const m of meta) {
     counts[m.need]++;
     if (m.kindReview) counts.kindReview++;
+  }
+  // Done only when every item already had its own entry and there is none left over.
+  if (allKnown && Array.isArray(existing) && existing.length === names.length) {
+    return { outcome: "already_done", meta, counts };
   }
   return { outcome: "backfill", meta, counts };
 }

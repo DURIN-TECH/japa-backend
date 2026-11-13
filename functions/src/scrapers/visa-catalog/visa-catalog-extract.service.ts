@@ -236,66 +236,102 @@ function validateRequiredDocuments(
     if (seen.has(key)) return; // repeat of a kept document: collapse silently
     seen.add(key);
     quotes[requiredDocumentCitationKey(items.length)] = (quote as string).trim();
-    meta.push(validateItemMeta(metaList[i], (quote as string).trim(), page));
+    meta.push(validateItemMeta(metaList[i], item, (quote as string).trim(), page));
     items.push(item);
   });
   return { items, quotes, dropped, meta };
 }
 
 /**
+ * Resolve the kind quote to STORE, or null when it cannot be verified on the
+ * page (issue #187). `page` is the already-normalised page text (undefined =
+ * the page is not available, only non-emptiness is checked).
+ *
+ * Valid when EITHER the whole quote is on the page (normalised as the citation
+ * check does; stored as returned), OR it is "lead-in: item" where, at the FIRST
+ * ": ":
+ *  - the lead-in part is on the page and is a real lead-in line (the page
+ *    continues with ":" right after it);
+ *  - the item part is on the page AND contains the text of the item being
+ *    classified (so it is not another item's line);
+ *  - the item part occurs after that lead-in with NO other lead-in (a ":")
+ *    between them, i.e. the item really sits under this lead-in.
+ * For the two-part form the VERBATIM LEAD-IN is stored (the item's own text is
+ * already stored beside it), never the joined string, which is not on the page.
+ * Characters only: no fuzzy word matching.
+ */
+export function resolveKindQuote(quote: string, page: string | undefined, itemText: string): string | null {
+  if (quote.length === 0) return null;
+  if (page === undefined) return quote;
+  const at = quote.indexOf(": ");
+  const own0 = normForQuote(itemText);
+  if (page.includes(normForQuote(quote))) {
+    // A contiguous "lead-in: text" must be about THIS item: its tail has to
+    // contain the item's own text (it may not be another item's line).
+    if (at < 0 || normForQuote(quote.slice(at + 2)).includes(own0)) return quote;
+    return null;
+  }
+  if (at < 0) return null;
+  const leadRaw = quote.slice(0, at).trim();
+  const lead = normForQuote(leadRaw);
+  const itemPart = normForQuote(quote.slice(at + 2));
+  const own = normForQuote(itemText);
+  if (!lead || !itemPart || !own || !itemPart.includes(own)) return null;
+  // Try every place the lead-in occurs (the same words can open two lists).
+  for (let from = page.indexOf(lead); from >= 0; from = page.indexOf(lead, from + 1)) {
+    const afterLead = page.slice(from + lead.length);
+    // A lead-in line: the page goes on with its colon.
+    if (!/^\s*:/.test(afterLead)) continue;
+    const body = afterLead.replace(/^\s*:/, "");
+    const itemAt = body.indexOf(itemPart);
+    if (itemAt < 0) continue;
+    // Another lead-in (a colon) before the item means it sits under that one.
+    if (body.slice(0, itemAt).includes(":")) continue;
+    return leadRaw;
+  }
+  return null;
+}
+
+/**
  * Validate ONE item's classification (issue #187). Never throws and never
  * drops the item: a classification that cannot be verified degrades to the
  * safe default instead.
- *  - `kind` "information" is kept only with a `kindQuote` that appears on the
- *    page (normalised, exact otherwise). A "document" kind needs one too; with
- *    no verifiable quote the item is "document" + `kindReview: true`
- *    ("could not classify"), the model's claim is discarded.
- *  - `need` is decided by code from the item's own quote and the lead-in quote
- *    (classifyNeed). The model's `appliesWhen` is used only when it is a verbatim
- *    slice of the page, carries an "if / unless / depending on" cue and sits
- *    inside the item's quote or the kind quote (so it is the item's own clause);
- *    otherwise the clause is cut from the quote by code. The model's `need` is
- *    ignored: a quote with "if" is conditional whatever the model said.
+ *  - `kind` "information" is kept only with a `kindQuote` that resolves on the
+ *    page (resolveKindQuote). A "document" kind needs one too; with no
+ *    verifiable quote the item is "document" + `kindReview: true` ("could not
+ *    classify"), the model's claim is discarded.
+ *  - `need` is decided by code from the item's own text within its quote and
+ *    the lead-in quote (classifyNeed). The model's `appliesWhen` is used only
+ *    when it is a verbatim slice of the page, carries an "if / unless /
+ *    depending on" cue and sits inside the item's quote or the kind quote (so
+ *    it is the item's own clause); otherwise the clause is cut from the quote by
+ *    code. The model's `need` is ignored: a quote with "if" is conditional
+ *    whatever the model said.
+ *  - the item's text is stored on the entry (`item`) so readers match meta to
+ *    items by text, never by position alone.
  */
-/**
- * Is a kind quote verbatim on the page? (issue #187, orchestrator decision)
- * Valid when EITHER the whole quote is on the page (normalised as the citation
- * check does), OR it splits at the FIRST ": " into a lead-in and an item text
- * where BOTH parts are on the page AND the item part sits AFTER the lead-in
- * (so the item really is listed under that lead-in). This covers the model
- * writing "You'll need to provide: your current passport ..." for a list whose
- * lead-in and items are separate lines. Characters only: no fuzzy word match.
- * `page` is the already-normalised page text (undefined = not checked).
- */
-export function kindQuoteOnPage(quote: string, page: string | undefined): boolean {
-  if (quote.length === 0) return false;
-  if (page === undefined) return true;
-  if (page.includes(normForQuote(quote))) return true;
-  const at = quote.indexOf(": ");
-  if (at < 0) return false;
-  const lead = normForQuote(quote.slice(0, at));
-  const item = normForQuote(quote.slice(at + 2));
-  if (!lead || !item) return false;
-  const leadAt = page.indexOf(lead);
-  // The item must occur somewhere after the lead-in's first occurrence.
-  return leadAt >= 0 && page.lastIndexOf(item) > leadAt;
-}
-
-function validateItemMeta(rawItemMeta: unknown, itemQuote: string, page: string | undefined): RequiredDocumentMeta {
+function validateItemMeta(
+  rawItemMeta: unknown,
+  itemText: string,
+  itemQuote: string,
+  page: string | undefined
+): RequiredDocumentMeta {
   const m = rawItemMeta && typeof rawItemMeta === "object" ? (rawItemMeta as Record<string, unknown>) : {};
   // Plain verbatim check, used for the model's appliesWhen clause.
   const onPage = (q: string) => q.length > 0 && (page === undefined || page.includes(normForQuote(q)));
 
   // ---- kind + its quote ----
   const claimedKind = m.kind === "information" ? "information" : "document";
-  const kindQuote = typeof m.kindQuote === "string" ? m.kindQuote.trim() : "";
-  const kindVerified = m.kind !== undefined && (m.kind === "document" || m.kind === "information") && kindQuoteOnPage(kindQuote, page);
-  const out: RequiredDocumentMeta = kindVerified
-    ? { kind: claimedKind, kindQuote, need: "required" }
-    : { kind: "document", kindReview: true, need: "required" };
+  const rawKindQuote = typeof m.kindQuote === "string" ? m.kindQuote.trim() : "";
+  const kindQuote =
+    m.kind === "document" || m.kind === "information" ? resolveKindQuote(rawKindQuote, page, itemText) : null;
+  const out: RequiredDocumentMeta =
+    kindQuote !== null
+      ? { item: itemText, kind: claimedKind, kindQuote, need: "required" }
+      : { item: itemText, kind: "document", kindReview: true, need: "required" };
 
   // ---- need (+ appliesWhen) ----
-  const decided = classifyNeed(itemQuote, out.kindQuote);
+  const decided = classifyNeed(itemQuote, out.kindQuote, itemText);
   out.need = decided.need;
   if (decided.need === "conditional" && decided.appliesWhen) {
     let when = decided.appliesWhen;
@@ -304,6 +340,7 @@ function validateItemMeta(rawItemMeta: unknown, itemQuote: string, page: string 
     if (
       claimed &&
       extractConditionalClause(claimed) !== null &&
+      !claimed.includes(":") &&
       onPage(claimed) &&
       hay.includes(normForQuote(claimed))
     ) {

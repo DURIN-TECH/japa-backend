@@ -28,7 +28,7 @@
 
 import { Timestamp } from "firebase-admin/firestore";
 import type { RequiredDocument, VisaRequirement, VisaType } from "../types";
-import { metaFromQuoteOnly, normaliseStoredMeta } from "../scrapers";
+import { findMetaForItem, metaFromQuoteOnly, normaliseStoredMeta } from "../scrapers";
 
 // Id of the single derived requirement. Stable so clients can key on it.
 export const DERIVED_REQUIREMENT_ID = "scraped-required-documents";
@@ -57,8 +57,10 @@ export function deriveRequirementsFromScrape(visa: VisaType): VisaRequirement[] 
     if (typeof quote !== "string" || !quote.trim()) return; // uncited: drop
     // Issue #187: the stored classification for THIS (original) index, or the
     // quote-only fallback when the visa has none yet.
-    const storedMeta = visa.scrapeMeta?.requiredDocumentMeta?.[index];
-    const meta = storedMeta ? normaliseStoredMeta(storedMeta, quote) : metaFromQuoteOnly(quote);
+    // Looked up by the item's OWN text, never by position alone (a reordered
+    // list must not hand an item its neighbour's classification).
+    const storedMeta = findMetaForItem(visa.scrapeMeta?.requiredDocumentMeta, index, name, names.length);
+    const meta = storedMeta ? normaliseStoredMeta(storedMeta, quote, name) : metaFromQuoteOnly(quote, name);
     docs.push({
       id: `${DERIVED_REQUIREMENT_ID}-${index}`,
       name: name.trim(),

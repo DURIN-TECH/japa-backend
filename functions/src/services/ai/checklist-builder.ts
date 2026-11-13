@@ -30,6 +30,7 @@
 import type { EvidenceItem, IntakeCondition, VisaRubric } from "../../types/rubric";
 import type { DocumentRequestCitation } from "../../types";
 import {
+  findMetaForItem,
   metaFromQuoteOnly,
   normaliseStoredMeta,
   type DocumentKind,
@@ -269,8 +270,9 @@ export function buildChecklist(input: BuildChecklistInput): ChecklistResult {
     seenTitles.add(normaliseTitle(name));
     // Issue #187: the stored classification for this index (quote-only
     // fallback for a visa crawled before it). `required` is true ONLY for need "required".
-    const stored = visaRecord?.scrapeMeta?.requiredDocumentMeta?.[i];
-    const meta = stored ? normaliseStoredMeta(stored, quote) : metaFromQuoteOnly(quote);
+    // By the item's own text, never by position alone (review fix on #187).
+    const stored = findMetaForItem(visaRecord?.scrapeMeta?.requiredDocumentMeta, i, name, docs.length);
+    const meta = stored ? normaliseStoredMeta(stored, quote, name) : metaFromQuoteOnly(quote, name);
     items.push({
       checklistItemId: id,
       title: name.trim(),
