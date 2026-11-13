@@ -427,7 +427,7 @@ describe("language screening", () => {
     assert.equal(byRule.listing_identity_document_retention.severity, "high");
     assert.equal(byRule.listing_identity_document_retention.category, "trafficking");
     assert.equal(byRule.listing_guaranteed_outcome.severity, "medium");
-    for (const s of Object.values(byRule)) {
+    for (const s of Object.values(byRule) as any[]) {
       assert.equal(s.type, "listing_recruitment_language");
       assert.equal(s.source.kind, "rule");
       assert.match(s.source.sourceUrl, /^https:\/\//);
