@@ -188,7 +188,7 @@ describe("secret binding in src/index.ts (Gen 1 runWith)", () => {
     assert.match(runWithOf("onApplicationUpdated"), /EMAIL_SECRETS/);
   });
 
-  test("only the named AI functions are bound (issues #42, #37, #115, #117, #118)", () => {
+  test("only the named AI functions are bound (issues #42, #37, #115, #117, #118, #201)", () => {
     // TODO(test-pass): was "api + the assessment worker" (count 2). The later AI
     // tasks each bind the key on their OWN worker, as the AI_SECRETS comment in
     // index.ts says they would. The list is explicit so a new binding must be a
@@ -197,6 +197,10 @@ describe("secret binding in src/index.ts (Gen 1 runWith)", () => {
       "api",
       "processAssessmentJob",
       "onGuidanceSourceChanged",
+      // #201: the automatic rubric publisher binds the key for the independent
+      // check (part B, #202); part A makes no model call itself. A conscious,
+      // EXPLICIT extension of this list.
+      "onRubricVersionCreated",
       "processBulkReassessments",
       "processDocumentCheck",
       "processRefusalAnalysisJob",

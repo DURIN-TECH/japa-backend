@@ -140,7 +140,7 @@ export function isProtectedRule(c: Pick<AssessmentCriterion, "kind" | "appliesTo
 
 /** The other rule of a `possible_duplicate` flag, read from its code-written message; null when it cannot be read. */
 export function duplicatePartnerOf(flag: Pick<GateFlag, "message">): string | null {
-  const m = /nearly the same as (\S+?)\. Decide/.exec(flag.message);
+  const m = /nearly the same as that of (\S+?)\. Decide/.exec(flag.message);
   return m ? m[1] : null;
 }
 
@@ -409,6 +409,10 @@ export function reasonInWords(code: string): string {
     PRIMARY_EXCLUSION_UNCONFIRMED: "rules from the main official source would be left out without confirmation",
     REVISION_MISMATCH: "the draft changed while it was being checked",
     pipeline_error: "the automatic check failed unexpectedly",
+    checker_not_run: "report only: the independent AI check was not run",
+    mode_manual: "automatic publishing is off (manual mode)",
+    already_decided: "the draft was already decided",
+    version_missing: "the draft could not be found",
   };
   if (fixed[code]) return fixed[code];
   const [head, rest] = [code.split(":")[0], code.includes(":") ? code.slice(code.indexOf(":") + 1) : ""];

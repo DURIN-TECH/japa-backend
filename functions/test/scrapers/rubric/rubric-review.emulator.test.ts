@@ -37,6 +37,9 @@ import {
   RubricReviewService,
   rubricVersionId,
 } from "../../../src/services/rubric-review.service";
+import { RubricAutoPublishService } from "../../../src/services/rubric-auto-publish.service";
+import { DEFAULT_CONFIG } from "../../../src/scrapers/shared/alerts/scrape-alert-rules";
+import { RUBRIC_SYSTEM_ACTOR_ID } from "../../../src/types/rubric";
 import { A_TEXT, SOURCE_A_ID, SOURCE_A_URL } from "./fixtures/synthetic-guidance";
 import { KEY_A, REVIEW_T0, routeAV1 } from "./rubric-review-fixtures";
 
@@ -111,6 +114,7 @@ suite("rubric review on the Firestore emulator (issue #125)", () => {
     await db.recursiveDelete(db.collection("visaRubrics"));
     await db.recursiveDelete(db.collection("guidanceSources"));
     await db.recursiveDelete(db.collection("rubricReviewHistory"));
+    await db.recursiveDelete(db.collection("rubricPublishRuns"));
   });
 
   after(async () => {
@@ -180,6 +184,35 @@ suite("rubric review on the Firestore emulator (issue #125)", () => {
       () => service.decide(ID_A1, { action: "reject", revision: 1, reason: "changed my mind after the fact" }, "admin-three"),
       (err: unknown) => err instanceof RubricReviewError && err.code === "ALREADY_DECIDED" && err.httpStatus === 409
     );
+    assert.equal((await db.collection("rubricReviewHistory").get()).size, 1);
+  });
+
+  // Issue #201: the automatic publisher on REAL transactions. The unit suite's
+  // in-memory transaction never contends, so "a re-delivered trigger publishes
+  // nothing twice" is proved here, with two deliveries of one version in flight.
+  test("the automatic publisher delivered twice at once publishes ONCE: one audit entry by the system actor, one head move, one run record", async () => {
+    await seed();
+    const auto = new RubricAutoPublishService({
+      review: service,
+      loadSettings: async () => ({ settings: { mode: "auto", pauseAfterRollback: true, maxLeftOutShare: 0.15, maxPrimaryLeftOutShare: 0.2, minKeptShareOfServing: 0.7 }, exists: true, problems: [] }),
+      checker: { check: async () => ({ ok: true, leftOut: [], resolvedFlagCodes: [], intentPolarity: "immigrant_intent_penalised" }) },
+      planner: { plan: async () => ({ ok: true }) },
+      raiseAlerts: async () => [],
+      loadAlertConfig: async () => DEFAULT_CONFIG,
+      now: () => NOW,
+      appUrl: () => "https://portal.test",
+    });
+    const outcomes = await Promise.all([auto.onVersionCreated(KEY_A, 1), auto.onVersionCreated(KEY_A, 1)]);
+    assert.equal(outcomes.filter((o) => o?.outcome === "published").length, 1, JSON.stringify(outcomes.map((o) => [o?.outcome, o?.reasonCodes])));
+    const audit = await db.collection("rubricReviewHistory").get();
+    assert.equal(audit.size, 1, "exactly one audit entry");
+    assert.equal(audit.docs[0].data().by, RUBRIC_SYSTEM_ACTOR_ID);
+    assert.equal(audit.docs[0].data().automatic, true);
+    assert.equal((await rubricStore.getHead(KEY_A))?.approvedVersion, 1);
+    assert.equal((await db.collection("rubricPublishRuns").get()).size, 1, "one run record");
+    // A third delivery afterwards is a quiet no-op.
+    const third = await auto.onVersionCreated(KEY_A, 1);
+    assert.equal(third?.outcome, "skipped");
     assert.equal((await db.collection("rubricReviewHistory").get()).size, 1);
   });
 });
