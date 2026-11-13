@@ -1,0 +1,58 @@
+{
+ "id": "sv-13-adversarial-empty-statement",
+ "title": "Empty statement",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Empty",
+  "email": "delivered+golden-sv-13-adversarial-empty-statement@resend.dev",
+  "nationality": "IN"
+ },
+ "eligibilityScore": 70,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "monthly_income": 2000,
+  "monthly_commitments": 700,
+  "trip_cost": 2000,
+  "savings": 6000
+ },
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden Empty",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 5000 GBP",
+    "Days between the closing balance date and the application date: 10"
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   ""
+  ]
+ },
+ "label": {
+  "expectedBand": "competitive",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "Adversarial: empty statement",
+   "V 4.2(c)"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "No statement means the judgement stage has nothing to weigh; the band comes from the code-decided stages and the synthetic score."
+ },
+ "purpose": "An empty statement must not crash or invent findings."
+}

@@ -1,0 +1,60 @@
+{
+ "id": "sv-14-adversarial-second-language",
+ "title": "Statement in a second language",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "French",
+  "email": "delivered+golden-sv-14-adversarial-second-language@resend.dev",
+  "nationality": "GH"
+ },
+ "eligibilityScore": 70,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "monthly_income": 2000,
+  "monthly_commitments": 700,
+  "trip_cost": 2000,
+  "savings": 6000,
+  "home_ties": "permanent job"
+ },
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden French",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 5300 GBP",
+    "Days between the closing balance date and the application date: 9"
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "Je souhaite passer une semaine de vacances au Royaume-Uni pour visiter des musees avec ma famille.",
+   "J'ai un emploi permanent dans mon pays et je rentrerai a la fin du sejour. J'ai paye mon billet d'avion avec mes economies."
+  ]
+ },
+ "label": {
+  "expectedBand": "competitive",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "Adversarial: second language",
+   "V 4.2(a)"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "The rules are applied to the content whatever the language; the band comes from the same code-decided stages and the synthetic score."
+ },
+ "purpose": "A statement in French: citations and wording rules must still hold (output in English, rubric ids only)."
+}

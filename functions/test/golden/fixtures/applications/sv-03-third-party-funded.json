@@ -1,0 +1,78 @@
+{
+ "id": "sv-03-third-party-funded",
+ "title": "Visit funded by a third party (sponsor)",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Sponsored",
+  "email": "delivered+golden-sv-03-third-party-funded@resend.dev",
+  "nationality": "GH"
+ },
+ "eligibilityScore": 72,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "third_party",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": true,
+  "intends_to_work": false,
+  "tp_name": "Golden Sponsor",
+  "tp_relationship": "sibling",
+  "tp_support": [
+   "travel",
+   "accommodation",
+   "maintenance"
+  ],
+  "monthly_income": 300,
+  "own_funds_amount": 200
+ },
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Sponsor bank statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden Sponsor",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 12500 GBP",
+    "Days between the closing balance date and the application date: 7"
+   ]
+  },
+  {
+   "id": "letter",
+   "label": "Sponsor letter",
+   "lines": [
+    "Letter from Golden Sponsor (fictional person)",
+    "I am the sibling of Golden Sponsored and have known them all my life.",
+    "I am lawfully resident in the UK and I have never breached immigration laws.",
+    "I will pay for flights, accommodation and daily costs for the whole 14 day visit.",
+    "I can afford this from my own salary and my savings, shown in my bank statement."
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "I am visiting my sibling for two weeks. My sibling will pay for my flights, my stay and my daily costs, as set out in their letter.",
+   "We speak every week and have supported each other for many years. I will return home to my job when the visit ends."
+  ]
+ },
+ "label": {
+  "expectedBand": "competitive",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "V 4.3(a)",
+   "V 4.3(b)",
+   "V 4.3(c)",
+   "Guidance 8.1",
+   "Guidance 8.2"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "V 4.3(a)-(c) are the third-party conditions the letter and statement address; the base band comes from the synthetic score, concerns would cap it below strong."
+ },
+ "purpose": "A third-party funded visit exercising the three V 4.3 conditions, with no numeric threshold."
+}

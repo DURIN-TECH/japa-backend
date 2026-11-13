@@ -1,0 +1,63 @@
+{
+ "id": "sv-04-previous-refusal",
+ "title": "Previous refusal declared",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Refused",
+  "email": "delivered+golden-sv-04-previous-refusal@resend.dev",
+  "nationality": "NG"
+ },
+ "eligibilityScore": 65,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": true,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "other_travel": true,
+  "other_travel_details": "Previous UK visit application refused three years ago; declared here.",
+  "monthly_income": 1800,
+  "monthly_commitments": 600,
+  "trip_cost": 2000,
+  "savings": 5000,
+  "home_ties": "permanent job and family home"
+ },
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden Refused",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 5200 GBP",
+    "Days between the closing balance date and the application date: 11"
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "I applied for a UK visit visa three years ago and it was refused because my documents were incomplete. I am applying again with full evidence.",
+   "I will visit for one week for a friend's graduation and I will return to my job at the end."
+  ]
+ },
+ "label": {
+  "expectedBand": "competitive",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "Guidance 7.2",
+   "Guidance 7.4",
+   "V 4.2(c)"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "Guidance 7.2 (previous immigration history) makes a declared past refusal a factor to weigh; nothing in the kept rules makes it an objective failure."
+ },
+ "purpose": "A declared previous refusal: expected to be weighed as a concern at most, never a refusal ground."
+}

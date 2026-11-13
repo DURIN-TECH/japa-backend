@@ -1,0 +1,49 @@
+{
+ "fixtureId": "sv-01-strong-self-funded",
+ "recordedOn": "2026-11-13",
+ "recordedOutcome": {
+  "readiness": "competitive",
+  "refusalGroundIds": []
+ },
+ "recordings": [
+  {
+   "hash": "3351fb61167c01b4750990b5b2c14d8f7fbe2ca22599c91f5dae53824d37e394",
+   "role": "extraction",
+   "model": "claude-haiku-5-5",
+   "stopReason": "end_turn",
+   "usage": {
+    "inputTokens": 2575,
+    "outputTokens": 449,
+    "cacheReadTokens": 0,
+    "cacheWriteTokens": 0
+   },
+   "text": "{\"readable\":true,\"values\":[{\"field\":\"financialEvidence.mostRecentDateDaysBeforeApplication\",\"value\":9,\"unit\":\"days\",\"page\":1,\"quote\":\"Days between the closing balance date and the application date: 9\"},{\"field\":\"financialInstitution.usesElectronicRecordKeeping\",\"value\":true,\"unit\":null,\"page\":1,\"quote\":\"keeps all records electronically\"},{\"field\":\"funds.includesOverdraftFacility\",\"value\":false,\"unit\":null,\"page\":1,\"quote\":\"Overdraft facility: none\"},{\"field\":\"funds_held_in_permitted_financial_institution\",\"value\":true,\"unit\":null,\"page\":1,\"quote\":\"a financial institution permitted for visa funds\"}]}"
+  },
+  {
+   "hash": "bf0a7752c5add6730e7dd12ba989c4a6c8aff4d7e4650a3bce2358d477f7663b",
+   "role": "extraction",
+   "model": "claude-haiku-5-5",
+   "stopReason": "end_turn",
+   "usage": {
+    "inputTokens": 2522,
+    "outputTokens": 15,
+    "cacheReadTokens": 0,
+    "cacheWriteTokens": 0
+   },
+   "text": "{\"readable\":true,\"values\":[]}"
+  },
+  {
+   "hash": "07d8dd8d6bb071742438ede8af00b01cd6a4c797b0ab62e1d2bb04266113cdbd",
+   "role": "judgement",
+   "model": "claude-opus-5-5",
+   "stopReason": "end_turn",
+   "usage": {
+    "inputTokens": 6407,
+    "outputTokens": 1968,
+    "cacheReadTokens": 0,
+    "cacheWriteTokens": 0
+   },
+   "text": "{\"findings\":[{\"criterionId\":\"crit_aa2be985d797c90c\",\"detail\":\"The intake records no previous UK visits. Nothing provided shows travel to other countries, including the USA, Canada, Australia, New Zealand, Ireland, Schengen countries or Switzerland, so there is no travel history to weigh.\",\"whatWouldHelp\":\"Passport pages or a list of previous international travel, if any.\",\"concern\":false},{\"criterionId\":\"crit_e11e1bd8bf2c3f4d\",\"detail\":\"The applicant appears to be a first-time traveller to the UK, so other evidence of genuine visitor intent must be relied on. The stated ties are a permanent job, a rented flat, two dependants at home and leave taken from work. However, no supporting documents for these ties are described.\",\"whatWouldHelp\":\"An employer letter confirming the job and approved leave dates, a tenancy agreement, and evidence of the dependants.\",\"concern\":true},{\"criterionId\":\"crit_aadfe74b10983a2c\",\"detail\":\"Savings of 9000 are declared, but the extraction does not show how long the funds have been held. It only shows that the most recent statement entry is 9 days before the application.\",\"whatWouldHelp\":\"Bank statements covering several months that show the savings building up over time and regular salary credits.\",\"concern\":false},{\"criterionId\":\"crit_5175afe9469a7d4c\",\"detail\":\"The statement says the applicant is travelling with a partner. It is unclear whether the declared trip cost of 2200 covers both people or who is paying the partner's costs.\",\"whatWouldHelp\":\"A breakdown of flight and hotel costs, and a statement of who is paying for the partner.\",\"concern\":true},{\"criterionId\":\"crit_c832ab9cd1a8bc8b\",\"detail\":\"There are ongoing commitments of 900 per month, a rented home and two financially dependent children who are not travelling. It is not stated who will care for the children while both the applicant and the partner are away.\",\"whatWouldHelp\":\"A brief explanation of childcare arrangements during the trip.\",\"concern\":false}],\"strengths\":[{\"criterionId\":\"crit_01aa3b76aa14511b\",\"detail\":\"Monthly income is 2500 against commitments of 900, leaving about 1600 a month. Savings are 9000. A trip cost of 2200 appears reasonable expenditure against this.\"},{\"criterionId\":\"crit_5175afe9469a7d4c\",\"detail\":\"The extraction records that the funds are held in a permitted financial institution that uses electronic record keeping, with no overdraft facility relied on. The return flight and the hotel are reported as already paid.\"},{\"criterionId\":\"crit_e15f6548bcd161d4\",\"detail\":\"The stated purpose is a 10-day holiday visiting museums and gardens. This is tourism, which is consistent with permitted visitor activities.\"},{\"criterionId\":\"crit_8ab7173ebc0de0c7\",\"detail\":\"The intake records no intention to work, and the statement describes only leisure activities.\"},{\"criterionId\":\"crit_77c35c7610d721b5\",\"detail\":\"The applicant declares a permanent job, a rented home and two children remaining in the country of residence, and states they will return to work the day after the trip.\"},{\"criterionId\":\"crit_933b17521a137e13\",\"detail\":\"A return flight is booked and paid, the hotel covers the full 10-day stay, and a return-to-work date is stated.\"},{\"criterionId\":\"crit_a1953936aa9bb049\",\"detail\":\"There are no previous UK visits, and the planned stay is short. Nothing indicates successive visits or that the UK is becoming the applicant's main home.\"},{\"criterionId\":\"crit_52a33245bfca81a7\",\"detail\":\"The intake records no previous refusal under the Family rules.\"},{\"criterionId\":\"crit_1597dbd5e344983a\",\"detail\":\"The intake records no previous deception.\"}],\"statementNotes\":[{\"criterionId\":\"crit_5175afe9469a7d4c\",\"detail\":\"The block mentions travelling with a partner, but it does not say who pays the partner's share or whether the declared trip cost includes the partner.\",\"blockIndex\":0},{\"criterionId\":\"crit_933b17521a137e13\",\"detail\":\"The block states that a return flight and a hotel for the full stay are booked and paid, which supports an intention to leave.\",\"blockIndex\":0},{\"criterionId\":\"crit_77c35c7610d721b5\",\"detail\":\"The block asserts a job, a rented home, children and approved leave in the home country. These claims would benefit from documentary support.\",\"blockIndex\":1},{\"criterionId\":\"crit_c832ab9cd1a8bc8b\",\"detail\":\"The children remain at home, but the care arrangements during the trip are not stated.\",\"blockIndex\":1},{\"criterionId\":\"crit_aadfe74b10983a2c\",\"detail\":\"The block says the trip is paid from own savings shown in a bank statement. The statement's coverage period is not specified.\",\"blockIndex\":2}],\"suspiciousPassages\":[]}"
+  }
+ ]
+}

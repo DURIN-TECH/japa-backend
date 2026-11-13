@@ -1,0 +1,41 @@
+{
+ "id": "sv-06-mandatory-bar-citizen",
+ "title": "Mandatory bar applies (British citizen)",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Barred",
+  "email": "delivered+golden-sv-06-mandatory-bar-citizen@resend.dev",
+  "nationality": "GB"
+ },
+ "eligibilityScore": 80,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "british_or_roa": true
+ },
+ "documents": [],
+ "statement": {
+  "paragraphs": [
+   "I would like to apply for a visitor visa."
+  ]
+ },
+ "label": {
+  "expectedBand": "not_ready",
+  "expectedGrounds": [
+   "crit_449b39d3b892cbf7"
+  ],
+  "paragraphs": [
+   "V 2.3 (mandatory bar)"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "The kept mandatory bar says a British citizen cannot be given permission under the Rules; it is decided in code from the nationality, with no model call."
+ },
+ "purpose": "A mandatory bar hit: stage 1 stops the assessment with zero model calls."
+}

@@ -1,0 +1,75 @@
+{
+ "id": "sv-01-strong-self-funded",
+ "title": "Strong self-funded visitor",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Strong",
+  "email": "delivered+golden-sv-01-strong-self-funded@resend.dev",
+  "nationality": "IN"
+ },
+ "eligibilityScore": 82,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "monthly_income": 2500,
+  "monthly_commitments": 900,
+  "trip_cost": 2200,
+  "savings": 9000,
+  "home_ties": "permanent job, rented flat, two dependants staying at home",
+  "dependants": true
+ },
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden Strong",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 6400 GBP",
+    "Days between the closing balance date and the application date: 9"
+   ]
+  },
+  {
+   "id": "employer",
+   "label": "Employment letter",
+   "lines": [
+    "Letter from Example Employer Ltd (fictional)",
+    "Golden Strong has worked for us as a project analyst since 2019.",
+    "Ten days of annual leave are approved for the stated visit.",
+    "The post is permanent and will be held for them on return."
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "I plan a 10 day holiday in the UK in spring to visit museums and gardens with my partner. I have booked and paid for a return flight and a hotel for the full stay.",
+   "My job, my rented home and my two children are all at home. I have taken leave and will go back to work the day after I return.",
+   "I paid for the trip from my own savings, shown in my bank statement."
+  ]
+ },
+ "label": {
+  "expectedBand": "strong",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "V 4.2(a)",
+   "V 4.2(b)",
+   "V 4.2(c)",
+   "V 4.2(e)",
+   "Guidance 8.1"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "Every kept objective check can be met from the documents and the statement addresses V 4.2(a) (leaves at the end of the visit) and Guidance 7.2 (ties); the label follows the rubric's wording only."
+ },
+ "purpose": "A well-evidenced self-funded visit: expected to produce no refusal ground and no concern."
+}

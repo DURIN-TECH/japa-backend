@@ -1,0 +1,40 @@
+{
+ "id": "fic-03-route-b-funds-short",
+ "title": "Fictional route B, funds short",
+ "rubric": "fictional-route-b",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Short",
+  "email": "delivered+golden-fic-03-route-b-funds-short@resend.dev",
+  "nationality": "BR"
+ },
+ "eligibilityScore": 70,
+ "intake": {},
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Fictional bank statement",
+    "Closing balance: 300 USD"
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "A short statement about ties to home and a steady job."
+  ]
+ },
+ "label": {
+  "expectedBand": "not_ready",
+  "expectedGrounds": [
+   "b-funds"
+  ],
+  "paragraphs": [
+   "fictional b-funds"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "b-funds asks for a balance of at least 500 USD; 300 USD is below it, so code fails the check."
+ },
+ "purpose": "Generic engine: an objective failure on a second rubric."
+}

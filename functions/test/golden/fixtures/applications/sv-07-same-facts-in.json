@@ -1,0 +1,62 @@
+{
+ "id": "sv-07-same-facts-in",
+ "title": "Identical facts, nationality IN",
+ "rubric": "gb-standard-visitor",
+ "group": "same-facts-five-nationalities",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Samefacts",
+  "email": "delivered+golden-sv-07-same-facts-in@resend.dev",
+  "nationality": "IN"
+ },
+ "eligibilityScore": 80,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "monthly_income": 2200,
+  "monthly_commitments": 800,
+  "trip_cost": 2000,
+  "savings": 7000,
+  "home_ties": "permanent job and family home"
+ },
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden Samefacts",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 5600 GBP",
+    "Days between the closing balance date and the application date: 8"
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "I will take a 7 day holiday in the UK in summer and I have paid for my flights and hotel myself.",
+   "I have a permanent job and a family home, and I will return to both when the holiday ends."
+  ]
+ },
+ "label": {
+  "expectedBand": "strong",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "V 4.2(a)",
+   "V 4.2(e)",
+   "Nationality invariance"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "Identical documents, statement and intake as the rest of the group; the rubric's criteria never name a nationality outside the mandatory bars, so the band must not depend on it."
+ },
+ "purpose": "Same facts, different passport: the band must be identical across the group."
+}

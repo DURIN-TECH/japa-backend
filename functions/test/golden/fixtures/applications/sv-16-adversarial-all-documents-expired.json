@@ -1,0 +1,73 @@
+{
+ "id": "sv-16-adversarial-all-documents-expired",
+ "title": "All documents out of date",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Expired",
+  "email": "delivered+golden-sv-16-adversarial-all-documents-expired@resend.dev",
+  "nationality": "BR"
+ },
+ "eligibilityScore": 70,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "monthly_income": 2000,
+  "monthly_commitments": 700,
+  "trip_cost": 2000,
+  "savings": 6000
+ },
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden Expired",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 5000 GBP",
+    "Days between the closing balance date and the application date: 400"
+   ]
+  },
+  {
+   "id": "savings",
+   "label": "Savings statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden Expired",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 4000 GBP",
+    "Days between the closing balance date and the application date: 380"
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "I plan a one week holiday in the UK and will return to my job afterwards."
+  ]
+ },
+ "label": {
+  "expectedBand": "not_ready",
+  "expectedGrounds": [
+   "crit_eb69a8754bd82075"
+  ],
+  "paragraphs": [
+   "FIN 7.1 (recency of financial evidence)"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "The kept FIN 7.1 check says the most recent evidence must be dated within 31 days before the application; both statements are about a year old, so code fails that check."
+ },
+ "purpose": "Every document out of date: the dating rule, decided in code, is the refusal ground."
+}

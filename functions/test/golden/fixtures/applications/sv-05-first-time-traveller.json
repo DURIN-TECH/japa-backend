@@ -1,0 +1,69 @@
+{
+ "id": "sv-05-first-time-traveller",
+ "title": "First-time traveller",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "First",
+  "email": "delivered+golden-sv-05-first-time-traveller@resend.dev",
+  "nationality": "BR"
+ },
+ "eligibilityScore": 70,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "other_travel": false,
+  "monthly_income": 1600,
+  "monthly_commitments": 500,
+  "trip_cost": 1800,
+  "savings": 4200,
+  "home_ties": "permanent job, owns a flat"
+ },
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden First",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 4800 GBP",
+    "Days between the closing balance date and the application date: 6"
+   ]
+  },
+  {
+   "id": "employer",
+   "label": "Employment letter",
+   "lines": [
+    "Letter from Example Employer Ltd (fictional)",
+    "Golden First is a permanent employee and has approved leave for the visit."
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "This is my first trip outside my country. I want to see London for a week and I have booked a hotel and return flights.",
+   "I have a permanent job and I own my home, so I will be back at the end of the week."
+  ]
+ },
+ "label": {
+  "expectedBand": "competitive",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "Guidance 7.3",
+   "V 4.2(a)"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "Guidance 7.3 (first-time traveller: rely on other evidence) names the factor; the rubric does not treat having no travel history as a failure."
+ },
+ "purpose": "No travel history: expected to rely on other evidence, not to be a refusal ground."
+}

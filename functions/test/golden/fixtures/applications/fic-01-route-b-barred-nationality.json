@@ -1,0 +1,31 @@
+{
+ "id": "fic-01-route-b-barred-nationality",
+ "title": "Fictional route B, barred nationality",
+ "rubric": "fictional-route-b",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Barred",
+  "email": "delivered+golden-fic-01-route-b-barred-nationality@resend.dev",
+  "nationality": "NG"
+ },
+ "eligibilityScore": 70,
+ "intake": {},
+ "documents": [],
+ "statement": {
+  "paragraphs": [
+   "A short statement."
+  ]
+ },
+ "label": {
+  "expectedBand": "not_ready",
+  "expectedGrounds": [
+   "b-bar"
+  ],
+  "paragraphs": [
+   "fictional b-bar"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "The fictional rubric's bar b-bar lists this nationality; decided in code."
+ },
+ "purpose": "Generic engine: a bar on a different rubric and destination."
+}

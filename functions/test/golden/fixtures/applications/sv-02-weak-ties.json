@@ -1,0 +1,64 @@
+{
+ "id": "sv-02-weak-ties",
+ "title": "Weak ties to the country of residence",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Ties",
+  "email": "delivered+golden-sv-02-weak-ties@resend.dev",
+  "nationality": "PK"
+ },
+ "eligibilityScore": 45,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "unemployed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "monthly_income": 0,
+  "monthly_commitments": 100,
+  "trip_cost": 2500,
+  "savings": 3000,
+  "home_ties": "none stated",
+  "family_in_uk": true,
+  "family_in_uk_details": "two siblings live in the UK"
+ },
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Example Bank (fictional) - statement of account",
+    "Account holder: Golden Ties",
+    "Account number: ACC-0000-0001 (synthetic)",
+    "Account type: current account",
+    "Institution status: regulated bank; a financial institution permitted for visa funds; keeps all records electronically",
+    "Overdraft facility: none",
+    "Closing balance: 3100 GBP",
+    "Days between the closing balance date and the application date: 20"
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "I want to visit my siblings in the UK. I have no job at the moment and I am not sure how long I will stay.",
+   "I have no property or family where I live now and most of my close family are in the UK."
+  ]
+ },
+ "label": {
+  "expectedBand": "weak",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "V 4.2(a)",
+   "V 4.2(b)",
+   "Guidance 7.2",
+   "Guidance 7.5"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "Guidance 7.5 (few ties to the country of residence and family in the UK) and V 4.2(a) are the factors the statement raises; no objective check should fail."
+ },
+ "purpose": "Weak ties: expected concerns on intention criteria, never a refusal ground."
+}

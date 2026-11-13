@@ -1,0 +1,11 @@
+{
+ "fixtureId": "fic-01-route-b-barred-nationality",
+ "recordedOn": "2026-11-13",
+ "recordedOutcome": {
+  "readiness": "not_ready",
+  "refusalGroundIds": [
+   "b-bar"
+  ]
+ },
+ "recordings": []
+}

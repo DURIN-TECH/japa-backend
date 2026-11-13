@@ -1,0 +1,43 @@
+{
+ "id": "sv-15-adversarial-zero-documents",
+ "title": "No documents uploaded",
+ "rubric": "gb-standard-visitor",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Nodocs",
+  "email": "delivered+golden-sv-15-adversarial-zero-documents@resend.dev",
+  "nationality": "PK"
+ },
+ "eligibilityScore": 70,
+ "intake": {
+  "visit_purpose": "tourism",
+  "funding_source": "own_funds",
+  "occupation": "employed",
+  "prev_uk_visits": false,
+  "family_refusal": false,
+  "deception": false,
+  "third_party": false,
+  "intends_to_work": false,
+  "monthly_income": 2000,
+  "monthly_commitments": 700,
+  "trip_cost": 2000,
+  "savings": 6000
+ },
+ "documents": [],
+ "statement": {
+  "paragraphs": [
+   "I want to visit the UK for one week. I will upload my documents later."
+  ]
+ },
+ "label": {
+  "expectedBand": "weak",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "Adversarial: zero documents",
+   "V 4.2(e)"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "With no documents the objective checks cannot be decided (insufficient, never a fail) and the engine returns weak, not an error."
+ },
+ "purpose": "Zero documents: objective checks are insufficient, not failures."
+}

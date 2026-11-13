@@ -1,0 +1,36 @@
+{
+ "fixtureId": "fic-02-route-b-funds-met",
+ "recordedOn": "2026-11-13",
+ "recordedOutcome": {
+  "readiness": "competitive",
+  "refusalGroundIds": []
+ },
+ "recordings": [
+  {
+   "hash": "d9360edfe987cb058b0b02952be608228519fbae31e94fc5bd6ef1f4d5865108",
+   "role": "extraction",
+   "model": "claude-haiku-5-5",
+   "stopReason": "end_turn",
+   "usage": {
+    "inputTokens": 2314,
+    "outputTokens": 60,
+    "cacheReadTokens": 0,
+    "cacheWriteTokens": 0
+   },
+   "text": "{\"readable\":true,\"values\":[{\"field\":\"funds.balance\",\"value\":900,\"unit\":\"USD\",\"page\":1,\"quote\":\"Closing balance: 900 USD\"}]}"
+  },
+  {
+   "hash": "8e890c25b9c24c2ad2783918e245140b61783d0c3caf6bb4016bbcf1d41fe7ed",
+   "role": "judgement",
+   "model": "claude-opus-5-5",
+   "stopReason": "end_turn",
+   "usage": {
+    "inputTokens": 1328,
+    "outputTokens": 465,
+    "cacheReadTokens": 0,
+    "cacheWriteTokens": 0
+   },
+   "text": "{\"findings\":[{\"criterionId\":\"b-ties\",\"detail\":\"Employment at home is asserted only in general terms. The statement mentions a steady job but gives no employer, role, length of service or return-to-work arrangement. The intake record is empty, and the extraction contains only a funds balance, so no document supports the claimed employment.\",\"whatWouldHelp\":\"An employer letter confirming the position, length of employment, approved leave dates and an expected return date, together with recent payslips or similar proof of current employment at home.\",\"concern\":true}],\"strengths\":[{\"criterionId\":\"b-ties\",\"detail\":\"The applicant states that they have ties to home and a steady job, which is directly relevant to the employment-at-home factor.\"}],\"statementNotes\":[{\"criterionId\":\"b-ties\",\"detail\":\"The block refers to ties to home and a steady job but gives no specifics, such as employer, role or duration, that would allow the employment tie to be weighed.\",\"blockIndex\":0}],\"suspiciousPassages\":[]}"
+  }
+ ]
+}

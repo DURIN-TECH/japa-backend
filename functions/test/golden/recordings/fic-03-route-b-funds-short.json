@@ -1,0 +1,38 @@
+{
+ "fixtureId": "fic-03-route-b-funds-short",
+ "recordedOn": "2026-11-13",
+ "recordedOutcome": {
+  "readiness": "not_ready",
+  "refusalGroundIds": [
+   "b-funds"
+  ]
+ },
+ "recordings": [
+  {
+   "hash": "bf66db9ff45d4e1c475ee8e144892a5cb6e66da737a2779731285d816fe7b9cc",
+   "role": "extraction",
+   "model": "claude-haiku-5-5",
+   "stopReason": "end_turn",
+   "usage": {
+    "inputTokens": 2314,
+    "outputTokens": 60,
+    "cacheReadTokens": 0,
+    "cacheWriteTokens": 0
+   },
+   "text": "{\"readable\":true,\"values\":[{\"field\":\"funds.balance\",\"value\":300,\"unit\":\"USD\",\"page\":1,\"quote\":\"Closing balance: 300 USD\"}]}"
+  },
+  {
+   "hash": "02708caa69767b028bbcc672b7579a9f0ad3b6e1392f6939760e753acbee2844",
+   "role": "judgement",
+   "model": "claude-opus-5-5",
+   "stopReason": "end_turn",
+   "usage": {
+    "inputTokens": 1327,
+    "outputTokens": 308,
+    "cacheReadTokens": 0,
+    "cacheWriteTokens": 0
+   },
+   "text": "{\"findings\":[{\"criterionId\":\"b-ties\",\"detail\":\"The statement mentions a steady job but gives no details about the employment at home: no employer, role, length of service, or confirmation of a position to return to. No employment documents appear in the extraction or intake data, which is empty.\",\"whatWouldHelp\":\"An employer letter confirming the role, length of service, salary, and approved leave or a return date. Recent payslips or a contract would also help.\",\"concern\":true}],\"strengths\":[{\"criterionId\":\"b-ties\",\"detail\":\"The applicant states they hold a steady job, which is relevant to the employment-at-home factor if it can be documented.\"}],\"statementNotes\":[{\"criterionId\":\"b-ties\",\"detail\":\"This block refers only in general terms to ties to home and a steady job. It does not name an employer, role or duration, so it adds little weight on employment at home by itself.\",\"blockIndex\":0}],\"suspiciousPassages\":[]}"
+  }
+ ]
+}

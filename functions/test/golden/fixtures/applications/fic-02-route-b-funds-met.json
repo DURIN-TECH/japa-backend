@@ -1,0 +1,38 @@
+{
+ "id": "fic-02-route-b-funds-met",
+ "title": "Fictional route B, funds met",
+ "rubric": "fictional-route-b",
+ "applicant": {
+  "firstName": "Golden",
+  "lastName": "Funds",
+  "email": "delivered+golden-fic-02-route-b-funds-met@resend.dev",
+  "nationality": "IN"
+ },
+ "eligibilityScore": 70,
+ "intake": {},
+ "documents": [
+  {
+   "id": "bank",
+   "label": "Bank statement",
+   "lines": [
+    "Fictional bank statement",
+    "Closing balance: 900 USD"
+   ]
+  }
+ ],
+ "statement": {
+  "paragraphs": [
+   "A short statement about ties to home and a steady job."
+  ]
+ },
+ "label": {
+  "expectedBand": "competitive",
+  "expectedGrounds": [],
+  "paragraphs": [
+   "fictional b-funds"
+  ],
+  "labelSource": "draft-unreviewed",
+  "rationale": "b-funds asks for a balance of at least 500 USD; 900 USD meets it, so no ground; band from the synthetic score."
+ },
+ "purpose": "Generic engine: the same code over a second rubric, an objective check that passes."
+}
