@@ -12,6 +12,7 @@ import {
   evaluateRubricHeldCleared,
   loadPublishSettings,
   reasonInWords,
+  RubricQuestionPlanner,
   rubricStore,
   routeAllowed,
   rubricChecker,
@@ -212,6 +213,9 @@ function errorClass(err: unknown): string {
   if (typeof code === "string" || typeof code === "number") return `code ${code}`;
   return (err as { constructor?: { name?: string } } | null)?.constructor?.name ?? "unknown error";
 }
+
+/** The unresolved-flag reason the question plan (not the rule check) is able to clear (#203). */
+const PLAN_RESOLVED_FLAG_REASON = "flag_unresolved:intake_wording_uncited";
 
 /** The system actor, as the review service takes it. */
 const SYSTEM_ACTOR: RubricReviewActor = { kind: RUBRIC_ACTOR_KIND.SYSTEM, id: RUBRIC_SYSTEM_ACTOR_ID };
@@ -487,7 +491,10 @@ export class RubricAutoPublishService {
             // Re-run the gates with the check's leave-outs: the budget and the
             // shrink guard must see the FINAL kept set.
             report = evaluateGates({ ...gateInput, checker: { leftOut: outcome.leftOut, resolvedFlagCodes: outcome.resolvedFlagCodes } });
-            for (const code of report.reasonCodes) if (!reasons.includes(code)) reasons.push(code);
+            // (#203) The question plan resolves `intake_wording_uncited` AFTER this
+            // point, so that one flag must not hold the draft before the planner
+            // has run. It is evaluated again below, once the plan has answered.
+            for (const code of report.reasonCodes) if (code !== PLAN_RESOLVED_FLAG_REASON && !reasons.includes(code)) reasons.push(code);
             if (polarity === null && !reasons.includes("polarity_unverified")) reasons.push("polarity_unverified");
             if (reasons.length === 0) {
               const plan = await this.callPlanner(this.deps.planner, { routeKey, version, runId, rubric, excludedCriterionIds: report.excludedCriterionIds, checkerLeftOut: outcome.leftOut });
@@ -965,5 +972,7 @@ function isPaused(head: RubricHead): boolean {
 export const rubricAutoPublishService = new RubricAutoPublishService();
 // Part B (#202): the independent check plugs in here, so every entry point
 // (the version-created trigger, the admin endpoint, the script, the sweep)
-// has it. Part C registers its planner the same way.
+// has it.
 rubricAutoPublishService.registerChecker(rubricChecker);
+// Part C (#203): the question planner (wording check, plan) is registered the same way.
+rubricAutoPublishService.registerPlanner(new RubricQuestionPlanner());

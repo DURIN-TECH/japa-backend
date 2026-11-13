@@ -1321,9 +1321,11 @@ describe("rubric review: nothing unapproved is served", () => {
     // (any-status versions, the collection group) to the original three files.
     // #201 (EXPLICIT extension): the automatic publisher reads the version it
     // publishes and the serving one through getVersionForReview. Backend-only; no route reaches it except the admin one.
+    // #203 (EXPLICIT extension): the read-only `plan:questions` script prints a draft's figures.
     assert.deepEqual(users, [
       "index.ts",
       path.join("scrapers", "rubric", "rubric.store.ts"),
+      path.join("scrapers", "rubric", "scripts", "plan-questions.ts"),
       path.join("services", "ai-bulk-reassessment.service.ts"),
       path.join("services", "rubric-auto-publish.service.ts"),
       path.join("services", "rubric-review.service.ts"),
@@ -1342,6 +1344,7 @@ describe("rubric review: nothing unapproved is served", () => {
     // (utils/firebase.ts only declares the collection group; it no longer matches by name.)
     assert.deepEqual(versionReaders, [
       path.join("scrapers", "rubric", "rubric.store.ts"),
+      path.join("scrapers", "rubric", "scripts", "plan-questions.ts"),
       path.join("services", "ai-bulk-reassessment.service.ts"),
       path.join("services", "rubric-auto-publish.service.ts"),
       path.join("services", "rubric-review.service.ts"),

@@ -532,6 +532,11 @@ export interface VisaRubric {
   excludedCriterionIds?: string[];
   // Admin-set (#161): the reviewer's one note for the exclusions above.
   exclusionNote?: string;
+  // Written with the AUTOMATIC approval (#203): the question plan (what the
+  // wording check removed, exact duplicates merged, conditions, order). Never
+  // extracted, never client-visible: `applyExclusions` applies it on the read
+  // side and strips it from the served rubric. Absent = serve as extracted.
+  questionPlan?: QuestionPlan;
 
   // ---- provenance (immutable) ----
   sourceSnapshots: RubricSourceSnapshot[];
@@ -555,6 +560,55 @@ export interface VisaRubric {
   createdAt: Timestamp;
 }
 
+// ============================================
+// Question plan (issue #203, part of #200)
+// ============================================
+
+/**
+ * The plan for the applicant-facing questions of one version. It REMOVES
+ * nothing for size: the only removals are the ones the automatic wording check
+ * found wrong (a correctness removal, recorded with the reason). Everything
+ * else is merging of exact duplicates, conditions and order.
+ *
+ * Applied on the read side (`applyExclusions`); the version's own questions
+ * are never edited. Every id below is one of the version's own.
+ */
+export interface QuestionPlan {
+  // Version of the deterministic algorithm (merge / condition / order rules).
+  algorithmVersion: string;
+  // Questions the wording check failed, with the failed aspects. They are removed
+  // together with their dependents through the exclusion dependency logic.
+  omittedQuestions: { id: string; failed: string[] }[];
+  // Document items the check failed, with the failed aspects.
+  omittedEvidence: { key: string; failed: string[] }[];
+  // INFORMATIONAL: what else the dependency logic removed because of the above.
+  droppedWithDependents: { questionIds: string[]; evidenceKeys: string[] };
+  // Exact duplicate questions folded into `to` (the earlier one). Always a star:
+  // no `to` is itself a `from`.
+  merges: { from: string; to: string }[];
+  // Conditions added to a question that had none, derived in code from its
+  // rules' own validated trigger data; `derivedFromCriterionIds` are those rules.
+  proposedConditions: { questionId: string; showWhen: { anyOf: IntakeCondition[] }; derivedFromCriterionIds: string[] }[];
+  // The served order of the surviving questions (deciding questions first).
+  order: string[];
+  // How many questions an applicant sees, with the plan applied (before the
+  // wording check's omissions, which only lower them). `exact` is false when the
+  // best / worst search hit its budget and the figures are sampled bounds.
+  sizing: { total: number; unconditional: number; deciding: number; best: number; typical: number; worst: number; exact: boolean; samples: number };
+  // What the wording check did; null when it did not run (an offline plan).
+  check: {
+    promptVersion: string;
+    model: string;
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    questionsChecked: number;
+    evidenceItemsChecked: number;
+    questionsFailed: number;
+    evidenceItemsFailed: number;
+  } | null;
+}
+
 /**
  * The fields of a version doc that a review (#125) may write. Everything else
  * is content or provenance and must never be updated.
@@ -571,6 +625,8 @@ export const RUBRIC_REVIEW_FIELDS = [
   "evidenceHelpsCriterionIds",
   "excludedCriterionIds",
   "exclusionNote",
+  // (#203) the automatic approval's question plan (see QuestionPlan).
+  "questionPlan",
 ] as const;
 
 // ============================================
