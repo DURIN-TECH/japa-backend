@@ -19,13 +19,13 @@ import { getCurrencyInfo } from "../money/currencies";
 /** HTTP status for each typed money error. */
 function statusFor(err: MoneyError): number {
   switch (err.code) {
-    case "RATE_UNAVAILABLE":
-    case "RATE_STALE":
-      return 503;
-    case "CURRENCY_UNSUPPORTED":
-      return 404;
-    default:
-      return 400;
+  case "RATE_UNAVAILABLE":
+  case "RATE_STALE":
+    return 503;
+  case "CURRENCY_UNSUPPORTED":
+    return 404;
+  default:
+    return 400;
   }
 }
 

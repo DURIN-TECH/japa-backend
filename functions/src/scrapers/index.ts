@@ -113,3 +113,12 @@ export { outcomeRunWorker } from "./outcome-statistics/outcome-run-worker";
 export { adminOutcomeStatisticsRoutes } from "./outcome-statistics/outcome-statistics.routes";
 /** Destinations with an outcome data source adapter. */
 export { registeredDestinations } from "./outcome-statistics/registry";
+
+// Outbound-fetch building blocks reused outside the scrapers (issue #178: the
+// exchange-rate providers read a public rates endpoint with the SAME guarded
+// client, honest SeliBot user agent and robots.txt parser the crawlers use).
+export { createGuardedHttpClient } from "./shared/fetch/address-guard";
+export {
+  VISA_CATALOG_USER_AGENT,
+  parseRobotsDisallows,
+} from "./shared/fetch/visa-catalog-fetch.service";

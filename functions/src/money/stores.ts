@@ -82,12 +82,12 @@ export const firestoreRateStore: RateStore = {
         currency,
         override: override
           ? {
-              rate: override.rate,
-              reason: override.reason,
-              setBy: override.setBy,
-              setAt: Timestamp.fromDate(override.setAt),
-              expiresAt: Timestamp.fromDate(override.expiresAt),
-            }
+            rate: override.rate,
+            reason: override.reason,
+            setBy: override.setBy,
+            setAt: Timestamp.fromDate(override.setAt),
+            expiresAt: Timestamp.fromDate(override.expiresAt),
+          }
           : null,
       },
       { merge: true }

@@ -1,6 +1,5 @@
 import type { AxiosInstance } from "axios";
-import { createGuardedHttpClient } from "../../scrapers/shared/fetch/address-guard";
-import { VISA_CATALOG_USER_AGENT } from "../../scrapers/shared/fetch/visa-catalog-fetch.service";
+import { createGuardedHttpClient, VISA_CATALOG_USER_AGENT } from "../../scrapers";
 import type { CurrencyCode } from "../../types/money";
 import type { ProviderResult, RateProvider } from "./types";
 

@@ -433,8 +433,8 @@ Every financial event. System-managed (Cloud Functions only -- client writes dis
 | applicationId           | string? | **FK → applications**                                                             |
 | consultationId          | string? | **FK → consultations**                                                            |
 | type                    | enum    | consultation_fee, service_fee, government_fee, refund, escrow_release, withdrawal |
-| amount                  | number  | Cents                                                                             |
-| currency                | string  | e.g., "NGN"                                                                       |
+| amount                  | number  | Minor units of `currency` (kobo for NGN, cents for USD); never read without `currency` |
+| currency                | string  | ISO 4217, e.g., "NGN"                                                             |
 | status                  | enum    | pending, processing, completed, failed, refunded, held_in_escrow, released        |
 | isEscrow                | boolean |                                                                                   |
 | escrowReleaseCondition  | string? |                                                                                   |
@@ -443,6 +443,49 @@ Every financial event. System-managed (Cloud Functions only -- client writes dis
 | description             | string  |                                                                                   |
 | metadata                | Record? | e.g., bank account details for withdrawals                                        |
 | clientName, clientEmail | string? | Denormalized                                                                      |
+
+---
+
+### Money, exchange rates and the charge snapshot (issue #178)
+
+Prices are set and stored in US dollars; a client sees the price in their local currency at the current rate and pays that amount. This slice is the foundation (nothing user-visible changes yet). Code: `functions/src/money/`, types in `functions/src/types/money.ts`.
+
+**Money** is `{ amountMinor: integer, currency: ISO 4217 }`. The currency table (`money/currencies.ts`) holds each currency's minor-unit exponent (NGN 2, USD 2) and is the only place a minor-unit factor is applied. Rounding is defined once in `convertUsdToLocal`: `USD cents x rate x (10000 + marginBps) / 10000`, in the target currency's minor unit, rounded half up, once, with integer (BigInt) arithmetic.
+
+```
+appConfig/currencies          backend-only config (no firestore.rules match)
+exchangeRates/{CURRENCY}      one rate doc per currency, backend-only
+exchangeRateAudit/{auto id}   append-only admin override history, backend-only
+```
+
+`appConfig/currencies` (missing doc = these defaults):
+
+| Field               | Type   | Description                                                                                   |
+| ------------------- | ------ | --------------------------------------------------------------------------------------------- |
+| defaultCurrency     | string | Charge currency when the client has no profile country or an unmapped one ("NGN")             |
+| currencies          | map    | `{ NGN: { enabled, countries: ["NG","Nigeria"], marginBps? } }`; adding a currency = config   |
+| freshnessHours      | number | How long a provider rate may serve after the provider last confirmed it (72)                  |
+| defaultMarginBps    | number | Margin in basis points when a currency sets none (0)                                          |
+| provider            | enum   | `cbn` (default) or `oanda` (used only when the `OANDA_API_KEY` secret exists)                 |
+| overrideBandPercent | number | An admin override must be within this % of the last provider rate (10)                        |
+| overrideTtlHours    | number | Default life of an admin override (24; request may set 1-168)                                 |
+
+`exchangeRates/{CURRENCY}`:
+
+| Field     | Type    | Description                                                                                              |
+| --------- | ------- | -------------------------------------------------------------------------------------------------------- |
+| currency  | string  | Doc id                                                                                                   |
+| provider  | map?    | `{ rate, asOf, fetchedAt, source: "cbn"\|"oanda" }`. `rate` = local units per 1 USD. Freshness = `fetchedAt` |
+| override  | map?    | `{ rate, reason, setBy, setAt, expiresAt }`; wins while unexpired (source `manual`)                      |
+| lastError | map?    | `{ at, message }` of the last failed provider attempt                                                    |
+
+Effective rate: active override, else provider rate within `freshnessHours`, else `quote()` fails with a typed error (`RATE_STALE`, `RATE_UNAVAILABLE`, `CURRENCY_UNSUPPORTED`, `CURRENCY_DISABLED`). A rate is never invented. A scheduled function (`refreshExchangeRates`, every 6 hours) refreshes enabled currencies; CBN reads https://www.cbn.gov.ng/api/GetAllNFEM_Rates (the data source behind the official rates page; weighted-average NFEM rate).
+
+`exchangeRateAudit`: `{ currency, action: override_set|override_cleared, by, at, reason, old, new, unreferenced? }`, indexed by (`currency`, `at` desc).
+
+**Charge snapshot.** Bookings, payment requests and transactions that are charged in local currency store (type `ChargeSnapshot`, names fixed): `priceUsdCents`, `chargedCurrency`, `chargedAmountMinor`, `fxRate` (margin not included), `fxRateAsOf`, `fxRateSource`, `fxMarginBps`. The existing visa-fee FX (`appConfig/fx`, Frankfurter/ECB) is a separate flow and is unchanged.
+
+Public view: `GET /rates` (no auth, cacheable) returns only currency, exponent, availability, rate and asOf.
 
 ---
 
