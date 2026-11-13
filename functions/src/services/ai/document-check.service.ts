@@ -384,7 +384,9 @@ export class DocumentCheckService {
     // ---- expectations: from the approved rubric only ----
     const rubric = await this.deps.rubrics.getApprovedRubric(application.countryCode.toUpperCase(), application.visaTypeId);
     const holder = request.holder ?? "applicant";
-    const expectations = expectationsFor(rubric, request.checklistItemId ?? rec.checklistItemId, request.documentType, holder);
+    // (#207) The applicant's intake answers decide which linked rules apply.
+    const savedAnswers = (application as Application & { intake?: { answers?: Record<string, unknown> } }).intake?.answers ?? null;
+    const expectations = expectationsFor(rubric, request.checklistItemId ?? rec.checklistItemId, request.documentType, holder, savedAnswers);
 
     // ---- the name the document must carry ----
     let expectedName: string | null;

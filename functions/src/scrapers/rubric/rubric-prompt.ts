@@ -65,8 +65,15 @@ import type { SourceChunk } from "./rubric-chunk";
  *    rule; one criterion per lettered / numbered sub-condition, each carrying
  *    the paragraph's triggering circumstance as its condition; a statement
  *    about the absence of something is extracted, not skipped.
+ *  - "2026-11-rubric-v6" (#207): a `specialist` rule is KEPT (it is no longer
+ *    left out): its condition is quoted like a conditional rule's. Call 2 also
+ *    asks, generically, for the question that establishes the applicant's
+ *    activity / sub-category where the source distinguishes them, and for a
+ *    `ruleTriggers` entry per specialist or conditional rule naming that
+ *    question and the answer values that trigger the rule. The accepted
+ *    criteria and the questions asked so far are sent to call 2.
  */
-export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v5";
+export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v6";
 
 /** Instructions shared by both calls: what the excerpt is, and how to treat it. */
 const COMMON_INSTRUCTIONS = [
@@ -84,9 +91,9 @@ export const RUBRIC_SYSTEM_PROMPT = [
   "Scope. Give every criterion an `applicability`:",
   "- `all_applicants`: the rule applies to every applicant on the route.",
   "- `conditional`: the rule applies depending on THIS applicant's circumstances (for example who is paying, or the applicant's earlier immigration history). Give `applicabilityCondition`: the words of the excerpt that state the circumstance, copied character for character. If the circumstance is stated in a lead-in sentence above a list, copy that sentence.",
-  "- `specialist`: the rule applies only to applicants who come for a particular specialist activity or sub-category that the source singles out. Give `applicabilityCondition` the same way.",
+  "- `specialist`: the rule applies only to applicants who come for a particular specialist activity or sub-category that the source singles out. Give `applicabilityCondition` the same way: the words of the excerpt (a heading, a lead-in sentence or the rule itself) that name the activity or sub-category, copied character for character. The rule is KEPT, however many such rules there are: list every one.",
   "- `other_route`: the text says the rule applies to a different route or category of applicant.",
-  "A requirement every applicant on the route must meet is `all_applicants` even when it is written in a long general document. From a ROUTE GUIDANCE source, everything is about the route: list what applies to every applicant or depends on the applicant's circumstances, and mark activity-specific parts `specialist`. From a SECONDARY source, list the rules that apply to applicants of the route (and mark rules written for other routes, activities or categories `other_route` or `specialist`); do not stretch a rule written for another route to this one. From a PRIMARY source, list every criterion the excerpt states.",
+  "A requirement every applicant on the route must meet is `all_applicants` even when it is written in a long general document. From a ROUTE GUIDANCE source, everything is about the route: list what applies to every applicant or depends on the applicant's circumstances, and mark activity-specific parts `specialist` (do not leave them out). From a SECONDARY source, list the rules that apply to applicants of the route (mark rules written for other routes or categories of applicant `other_route`, and rules for a specialist activity or sub-category of THIS route `specialist`); do not stretch a rule written for another route to this one. From a PRIMARY source, list every criterion the excerpt states.",
   "",
   "Lists:",
   "- When a paragraph lists lettered or numbered sub-conditions that must each be satisfied, extract ONE criterion per sub-condition. Each has its own `quote`, starting at its own marker (for example \"(a)\") and not running into the next marker, and its own `title`. Carry the paragraph's triggering circumstance (its lead-in sentence) onto each of them as `applicabilityCondition`. Do not merge sub-conditions into one criterion, and do not quote only the lead-in sentence.",
@@ -125,6 +132,8 @@ export const RUBRIC_INTAKE_SYSTEM_PROMPT = [
   "`intakeQuestions`: questions an applicant would need to answer for the listed criteria to be assessed. Each lists, in `criterionRefs`, the `ref` of every criterion that reads the answer. Ask only what a listed criterion needs, and ask each thing once. If a question matters only when an earlier answer has a certain value (for example a question about someone else only when someone else is involved), give `showWhenAnyOf` with the id of that earlier question and the value. A question about another person's details sets `party` accordingly. When another person takes part (pays, hosts, sponsors, vouches) and criteria read facts about them, also ask for that person's full name as written on their documents, with the same condition.",
   "",
   "`evidenceItems`: documents the excerpt itself names as evidence, each with the verbatim passage naming it (`quote`, copied character for character from one paragraph of the excerpt), the `documentType`, whose document it is (`party`), the `ref` of the criteria it evidences and, when it is asked for only after a certain answer, `showWhenAnyOf` naming the intake question and the value that triggers it. Do not add documents the excerpt does not name.",
+  "",
+  "`ruleTriggers`: some accepted criteria carry an `applicability` of `specialist` or `conditional` and a `condition`, the words of the source that say when the rule applies. For each such criterion, say which answer establishes that it applies: give its `criterionRef`, the `questionId` of an intake question, and `answerValues`, the option values of that question for which the rule applies. The question must be one of your `intakeQuestions` or one listed under \"Questions already asked\". Where the source distinguishes applicants by activity, sub-category or purpose (the conditions name them), include one `single_choice` question (or `multi_choice` when an applicant can be in several) that establishes it, with one option per activity or sub-category the source names, the option `label` in the source's own words and the `value` a short lowercase slug. Reuse that same question, with the same `id`, for every rule of that kind, and add an option to it when the source names another one; reuse a question listed under \"Questions already asked\" the same way. For a yes_no question the `answerValues` are \"true\" or \"false\". Use only activities, sub-categories and circumstances the excerpt itself names: never add one from general knowledge. If no question could establish when a rule applies, leave it out of `ruleTriggers`.",
   "",
   "`intake`: a short title, card title and introduction for the questions, in plain words, only if you list questions.",
   "",
@@ -227,6 +236,10 @@ export function buildRubricOutputSchema(severityLevels: readonly string[]): Reco
  * evidence items) of one chunk.
  */
 export function buildIntakeOutputSchema(): Record<string, unknown> {
+  // (#207) "This rule applies when the answer to `questionId` is one of
+  // `answerValues`." No union types here: the provider caps those at 16 per
+  // schema, and this schema already has two (the show-when `value`).
+  const ruleTrigger = object({ criterionRef: STRING, questionId: STRING, answerValues: STRINGS });
   // "Show when the answer to `questionId` is `value`."
   const condition = object({
     questionId: STRING,
@@ -265,6 +278,7 @@ export function buildIntakeOutputSchema(): Record<string, unknown> {
     intake: optional(object({ title: optional(STRING), cardTitle: optional(STRING), intro: optional(STRING) })),
     intakeQuestions: { type: "array", items: intakeQuestion },
     evidenceItems: { type: "array", items: evidenceItem },
+    ruleTriggers: { type: "array", items: ruleTrigger },
     suspiciousPassages: SUSPICIOUS,
   });
 }
@@ -284,6 +298,27 @@ export class RubricPromptError extends Error {
     super(message);
     this.name = "RubricPromptError";
   }
+}
+
+/**
+ * One accepted criterion as call 2 sees it (#207): the handle, title and quote,
+ * plus, for a rule that applies only in some circumstances, its applicability
+ * and the verbatim words of its condition.
+ */
+export interface AcceptedCriterionView {
+  ref: string;
+  title: string;
+  quote: string;
+  applicability?: "conditional" | "specialist";
+  condition?: string;
+}
+
+/** A question already asked earlier in the document, so later excerpts reuse its id. */
+export interface KnownQuestionView {
+  id: string;
+  label: string;
+  answerType: string;
+  options: { value: string; label: string }[];
 }
 
 /** What the model is told about the route and the excerpt's source. */
@@ -318,7 +353,8 @@ function describeRole(role: RubricRouteContext["sourceRole"]): string {
 export function renderRubricUserMessage(
   chunk: SourceChunk,
   route: RubricRouteContext = NO_ROUTE,
-  accepted?: readonly { ref: string; title: string; quote: string }[]
+  accepted?: readonly AcceptedCriterionView[],
+  known: readonly KnownQuestionView[] = []
 ): string {
   const tag = delimiterTag(chunk.contentHash);
   // A document that somehow carries the delimiter is refused outright rather
@@ -341,7 +377,13 @@ export function renderRubricUserMessage(
     `</${tag}>`,
     "",
     ...(accepted
-      ? ["Accepted criteria for this excerpt (JSON):", JSON.stringify(accepted), "", "List the intake questions and evidence items for these criteria, following the rules you were given."]
+      ? [
+        "Accepted criteria for this excerpt (JSON):",
+        JSON.stringify(accepted),
+        "",
+        ...(known.length > 0 ? ["Questions already asked earlier in the document (JSON):", JSON.stringify(known), ""] : []),
+        "List the intake questions, evidence items and rule triggers for these criteria, following the rules you were given.",
+      ]
       : ["List the assessment criteria this excerpt states for the route, following the rules you were given."]),
   ].join("\n");
 }
@@ -370,14 +412,15 @@ export function buildRubricRequest(chunk: SourceChunk, severityLevels: readonly 
 /** Build the provider request for call 2 (intake questions, evidence) of one chunk. */
 export function buildIntakeRequest(
   chunk: SourceChunk,
-  accepted: readonly { ref: string; title: string; quote: string }[],
+  accepted: readonly AcceptedCriterionView[],
   limits: RubricRequestLimits,
-  route: RubricRouteContext
+  route: RubricRouteContext,
+  known: readonly KnownQuestionView[] = []
 ): LlmRequest {
   return {
     role: "judgement",
     system: RUBRIC_INTAKE_SYSTEM_PROMPT,
-    user: renderRubricUserMessage(chunk, route, accepted),
+    user: renderRubricUserMessage(chunk, route, accepted, known),
     schema: buildIntakeOutputSchema(),
     maxOutputTokens: limits.maxOutputTokens,
     timeoutMs: limits.timeoutMs,
@@ -502,6 +545,13 @@ export interface RawEvidenceItem {
   showWhenAnyOf?: { questionId: string; op: "eq" | "neq"; value: string | number | boolean }[];
 }
 
+/** One rule trigger as the model proposes it (#207). Checked in code before use. */
+export interface RawRuleTrigger {
+  criterionRef: string;
+  questionId: string;
+  answerValues: string[];
+}
+
 /** The model's whole answer for one chunk. */
 export interface RawRubricOutput {
   criteria: RawCriterion[];
@@ -509,6 +559,8 @@ export interface RawRubricOutput {
   intake: { title: string | null; cardTitle: string | null; intro: string | null } | null;
   intakeQuestions: RawIntakeQuestion[];
   evidenceItems: RawEvidenceItem[];
+  // (#207) Empty for call 1's answer.
+  ruleTriggers: RawRuleTrigger[];
   suspiciousPassages: { quote: string }[];
 }
 
@@ -546,7 +598,7 @@ export function parseRubricOutput(text: string, schema: Record<string, unknown>)
   // The two calls answer different halves of RawRubricOutput: the half a
   // schema does not have is empty, so one assessment function serves both.
   const out = parsed as Record<string, unknown>;
-  for (const key of ["criteria", "intakeQuestions", "evidenceItems", "suspiciousPassages"]) if (!(key in out)) out[key] = [];
+  for (const key of ["criteria", "intakeQuestions", "evidenceItems", "ruleTriggers", "suspiciousPassages"]) if (!(key in out)) out[key] = [];
   for (const key of ["intentPolarity", "intake"]) if (!(key in out)) out[key] = null;
   // `citations` (reviewer aids) are not asked for any more.
   for (const c of (out.criteria as Record<string, unknown>[])) c.citations = [];

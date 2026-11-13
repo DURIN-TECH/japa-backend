@@ -131,7 +131,7 @@ export function crit(fields: Partial<RawCriterion> & Pick<RawCriterion, "ref" | 
 
 /** A full answer from the parts a test cares about. */
 export function answer(fields: Partial<RawRubricOutput>): RawRubricOutput {
-  return { criteria: [], intentPolarity: null, intake: null, intakeQuestions: [], evidenceItems: [], suspiciousPassages: [], ...fields };
+  return { criteria: [], intentPolarity: null, intake: null, intakeQuestions: [], evidenceItems: [], ruleTriggers: [], suspiciousPassages: [], ...fields };
 }
 
 /** Token usage every recorded answer reports (so totals are predictable). */
@@ -202,6 +202,8 @@ export function intakeWire(a: RawRubricOutput): string {
     ...(a.intake ? { intake: a.intake } : {}),
     intakeQuestions: a.intakeQuestions,
     evidenceItems: a.evidenceItems.map((e) => ({ ...e, showWhenAnyOf: e.showWhenAnyOf ?? [] })),
+    // (#207) The schema requires the list; an empty one is a valid answer.
+    ruleTriggers: a.ruleTriggers ?? [],
     suspiciousPassages: [],
   });
 }

@@ -215,6 +215,17 @@ export interface CriterionAppliesTo {
   codeNames?: string[];
 }
 
+/**
+ * (#207) The machine-readable form of a criterion's applicability condition:
+ * the rule applies when the applicant's answer to intake question
+ * `questionId` is one of `anyOf` (option values of that question). The
+ * condition's own words stay in `applicabilityCondition`, verbatim.
+ */
+export interface RuleTrigger {
+  questionId: string;
+  anyOf: string[];
+}
+
 /** One criterion of a rubric. */
 export interface AssessmentCriterion {
   // Stable id, derived in code from the source id, the normalised quote, the
@@ -255,14 +266,25 @@ export interface AssessmentCriterion {
   // by extraction, editable in review. A rubric with such a criterion but no
   // polarity is flagged by the validator.
   concernsIntent?: boolean;
-  // Scope (#112): does the rule apply to every applicant on the route, or
-  // only in some circumstances? `applicabilityCondition` is those
+  // Scope (#112, #207): does the rule apply to every applicant on the route,
+  // or only in some circumstances? `applicabilityCondition` is those
   // circumstances in the source's words, found verbatim in the source.
-  // Four values (see CRITERION_APPLICABILITIES): only `all_applicants` and
-  // `conditional` are ever stored; `specialist` and `other_route` are
-  // proposed by the model and dropped in code (with a discard record).
+  // Four values (see CRITERION_APPLICABILITIES): `all_applicants`,
+  // `conditional` and `specialist` are stored (#207: a specialist-activity
+  // rule is KEPT, however long that makes the rulebook; it applies only to
+  // applicants its condition covers). `other_route` is proposed by the model
+  // and dropped in code (with a discard record): it is about a different route.
   applicability?: "all_applicants" | "conditional" | "specialist" | "other_route";
   applicabilityCondition?: string;
+  // (#207) WHEN the rule applies, in a form code can evaluate: "this rule
+  // applies when the applicant's answer to intake question `questionId` is one
+  // of `anyOf`" (for a multi-choice question: includes any of them). Set by
+  // extraction only after code has checked that the question exists in the
+  // rubric and that every value is one of its options. Absent on a
+  // `specialist` rule = "could not tell whether this applies" (the rule is
+  // kept, and an assessment reports it as not assessable, never as failed and
+  // never as applying to everyone). See services/ai/rule-applicability.ts.
+  trigger?: RuleTrigger;
   // Links to an existing EligibilityQuestion (types/eligibility.ts).
   eligibilityQuestionId?: string;
   // Ids of the rubric's intake questions whose answers this criterion reads.
@@ -440,15 +462,24 @@ export const RUBRIC_DISCARD_REASONS = [
   "duplicate", // same criterion already produced by an earlier chunk
   "unresolved_reference", // points at criteria that did not survive
   "out_of_route_scope", // from a cross-route source the route's own source does not point to, or not for every applicant of the route
-  "specialist_activity", // applies only to a specialist activity or sub-category the source singles out
   "other_route", // the text says it applies to a different route or category of applicant
 ] as const;
 export type RubricDiscardReason = (typeof RUBRIC_DISCARD_REASONS)[number];
 
+/**
+ * (#207) Reasons that older stored versions may still carry but that extraction
+ * can no longer produce. `specialist_activity` was the reason a rule for a
+ * specialist activity was left out; such rules are now kept (see
+ * AssessmentCriterion.trigger). Kept in the type so a stored version that holds
+ * the value is still read as valid data.
+ */
+export const LEGACY_DISCARD_REASONS = ["specialist_activity"] as const;
+export type LegacyDiscardReason = (typeof LEGACY_DISCARD_REASONS)[number];
+
 /** One discarded item, kept for the reviewer. Never holds source text. */
 export interface RubricDiscard {
   itemType: "criterion" | "intake_question" | "evidence_item" | "intent_polarity";
-  reason: RubricDiscardReason;
+  reason: RubricDiscardReason | LegacyDiscardReason;
   // Fixed, code-written detail (which field failed which rule). Never holds
   // a string the model supplied, and never source text.
   detail: string;
@@ -802,6 +833,9 @@ export interface RubricExtractionRun {
   // Null when the model has no entry in the price table (the default).
   costUsd: number | null;
   criteriaAccepted: number;
+  // (#207) How many of the accepted criteria are specialist-activity rules,
+  // kept (they used to be discarded). Optional: older run records lack it.
+  specialistKept?: number;
   discardedCount: number;
   // Discards by reason, for a quick look without opening the version.
   discardedByReason: Record<string, number>;

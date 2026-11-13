@@ -11,6 +11,7 @@ import {
   type VisaRubric,
 } from "../../types/rubric";
 
+import { isValidTrigger } from "../../services/ai/rule-applicability";
 import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA } from "./rubric-exclusions";
 
 // ============================================
@@ -228,6 +229,14 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
   for (const c of criteria) {
     for (const id of c.intakeQuestionIds ?? []) {
       if (!questionIds.has(id)) err("criterion_intake_unknown", `criterion reads intake question ${id}, which is not in the rubric`, c.criterionId);
+    }
+    // (#207) A rule trigger names a question of this rubric and answer values
+    // that question can give. Extraction only stores checked triggers, so a
+    // failure here means damaged data: the rubric is not stored or approved.
+    if (c.trigger !== undefined) {
+      const q = questions.find((x) => x.id === c.trigger?.questionId);
+      if (!q) err("criterion_trigger_question_unknown", `trigger names question ${String(c.trigger.questionId)}, which is not in the rubric`, c.criterionId);
+      else if (!isValidTrigger(c.trigger, questions)) err("criterion_trigger_value_unknown", "trigger values must be option values of the question it names (true / false for a yes/no question)", c.criterionId);
     }
     if (c.eligibilityQuestionId !== undefined) {
       const known = options.knownEligibilityQuestionIds;
