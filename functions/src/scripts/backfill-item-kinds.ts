@@ -26,7 +26,7 @@
  *   npm run backfill:item-kinds:dev     # dry run on durin-seli-dev
  */
 import { collections, subcollections } from "../utils/firebase";
-import { metaFromQuoteOnly, type RequiredDocumentMeta } from "../scrapers/visa-catalog/required-document-meta";
+import { metaFromQuoteOnly, type RequiredDocumentMeta } from "../scrapers";
 import type { VisaType } from "../types";
 
 export type BackfillOutcome = "backfill" | "already_done" | "no_documents";

@@ -299,7 +299,31 @@ describe("scorer (eval/score.ts)", () => {
     const r = scoreRoute(SW, perfectSW());
     assert.equal(r.score, 1);
     assert.equal(r.feeMismatch, false);
-    assert.equal(r.weightTotal, Object.values(FIELD_WEIGHTS).reduce((a, b) => a + b, 0));
+    // documentKinds (#187) is scored only on routes whose expected.json has it.
+    assert.equal(r.weightTotal, Object.values(FIELD_WEIGHTS).reduce((a, b) => a + b, 0) - FIELD_WEIGHTS.documentKinds);
+  });
+
+  test("documentKinds (#187): scored only when expected; kind and need must both match", () => {
+    const exp: ExpectedVisa = {
+      ...SW,
+      documentKinds: {
+        items: [
+          { match: ["passport"], kind: "document", need: "required", source: "" },
+          { match: ["earn"], kind: "information", need: "conditional", source: "" },
+        ],
+      },
+    };
+    const a = perfectSW();
+    a.requiredDocuments = ["a passport", "how much you earn"];
+    a.requiredDocumentMeta = [
+      { kind: "document", need: "required" },
+      { kind: "information", need: "conditional", appliesWhen: "if you have an income" },
+    ];
+    assert.equal(field(scoreRoute(exp, a), "documentKinds").score, 1);
+    a.requiredDocumentMeta[1] = { kind: "information", need: "required" };
+    assert.equal(field(scoreRoute(exp, a), "documentKinds").score, 0.5);
+    a.requiredDocumentMeta[1] = { kind: "document", kindReview: true, need: "conditional" };
+    assert.equal(field(scoreRoute(exp, a), "documentKinds").score, 0.5);
   });
 
   test("exact: category and isExtendable pass/fail", () => {

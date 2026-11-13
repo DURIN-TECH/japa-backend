@@ -28,7 +28,7 @@
 
 import { Timestamp } from "firebase-admin/firestore";
 import type { RequiredDocument, VisaRequirement, VisaType } from "../types";
-import { metaFromQuoteOnly, normaliseStoredMeta } from "../scrapers/visa-catalog/required-document-meta";
+import { metaFromQuoteOnly, normaliseStoredMeta } from "../scrapers";
 
 // Id of the single derived requirement. Stable so clients can key on it.
 export const DERIVED_REQUIREMENT_ID = "scraped-required-documents";

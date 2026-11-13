@@ -59,6 +59,10 @@ export const FIELD_WEIGHTS = {
   eligibility: 2,
   applicationUrlHost: 1,
   feeComponents: 3,
+  // Issue #187: kind (document vs information) and need (required /
+  // conditional / optional) of the items the page lists. Scored ONLY on routes
+  // whose expected.json has `documentKinds` (the others are not scored for it).
+  documentKinds: 2,
 } as const;
 
 /** One scored field name (the keys of FIELD_WEIGHTS). */

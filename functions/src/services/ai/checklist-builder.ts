@@ -35,7 +35,7 @@ import {
   type DocumentKind,
   type DocumentNeed,
   type RequiredDocumentMeta,
-} from "../../scrapers/visa-catalog/required-document-meta";
+} from "../../scrapers";
 
 // ============================================
 // Types
