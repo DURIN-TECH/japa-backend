@@ -103,6 +103,13 @@ export interface InsufficientItem {
   criterionId: string;
   title: string;
   reason: string;
+  // (#207) Set when the rule was NOT assessed because it could not be told
+  // whether it applies to this applicant: "unanswered" (its trigger question
+  // has no answer yet) or "no_trigger" (a specialist rule the guidance did not
+  // let us tie to a question). What is missing is an intake answer, not a
+  // document, so no evidence request or proposed action is made for it, and it
+  // is never one of the free tier's top issues.
+  notAssessed?: "unanswered" | "no_trigger";
 }
 
 /**

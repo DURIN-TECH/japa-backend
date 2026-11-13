@@ -532,11 +532,17 @@ describe("prompt version pin", () => {
     // v5 (#112): three source roles, four applicabilities, one criterion per
     // sub-condition, absence statements. Criteria prompt and schema.
     "2026-11-rubric-v5": "ee0ca17869187a2c1d7ba3f8bdb9cf4c1842aad30fb83a02da90ccea95af132e",
+    // v6 (#207): specialist rules kept (criteria prompt reworded), so the
+    // criteria hash changes with the prompt text.
+    "2026-11-rubric-v6": "d8dd48beab3645b2d5bbe3d03d25b3c8457ec3bce5268a457f00b34e4f69c2bb",
   };
   // v5 onwards: the intake prompt and its schema are pinned too (call 2),
   // so a change to either also needs a version bump.
   const PINNED_INTAKE: Record<string, string> = {
     "2026-11-rubric-v5": "688856deafdcd93a6ec428cf7899db3a439040a59ee62b5d7fdf4269a52bf8ce",
+    // v6 (#207): the intake call also asks for the activity question and
+    // `ruleTriggers` (new schema array, longer prompt).
+    "2026-11-rubric-v6": "9e2beb3d9d80f26c1bfbd51e5bde106492fc39702b072d3f9a7d0bf25d4c7290",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {
