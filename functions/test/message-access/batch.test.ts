@@ -3,10 +3,11 @@
 // ============================================
 //
 // A TEST-ONLY consumer builds a batch of provider requests from the helper's
-// output. Shows (1) a switched-off chat and a non-qualifying person produce
-// nothing, (2) only the qualifying chat's qualifying messages are in the request
-// list, and (3) a switch turned off after the batch was built but before it is
-// sent is caught by the re-check at send time and the request is dropped.
+// output. Shows (1) a chat where someone has AI off in all their chats, and a
+// non-qualifying person, produce nothing, (2) only the qualifying chat's
+// qualifying messages are in the request list, and (3) an all-chats "off" turned
+// on after the batch was built but before it is sent is caught by the re-check at
+// send time and the request is dropped.
 // No route exposes any of this.
 
 import assert from "node:assert/strict";

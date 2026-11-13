@@ -38,7 +38,7 @@ after(async () => {
   await (await rulesEnv()).cleanup();
 });
 
-describe("conversation AI switch is backend-only", () => {
+describe("conversation ids are not client-writable; retired switch fields stay refused", () => {
   test("applicant cannot set or clear either switch field by update", async () => {
     const db = await clientDb(APPLICANT, { role: "client", agencyId: null });
     const ref = db.collection("conversations").doc(CONV);
@@ -66,8 +66,9 @@ describe("conversation AI switch is backend-only", () => {
   });
 
   test("a participant cannot rewrite userId or agentId (the id-swap override attack)", async () => {
-    // Attack: the agent writes userId = own uid so the API sees them on both
-    // sides, clears the applicant's switch, then restores userId.
+    // The AI access check resolves the two people of a chat from userId and
+    // agentId, so a client must never be able to rewrite either one (for example
+    // an agent writing their own uid into userId).
     const agent = await clientDb(AGENT_USER, { role: "agent", agencyId: null });
     const ref = agent.collection("conversations").doc(CONV);
     assert.equal(await isDenied(ref.update({ userId: AGENT_USER })), true);

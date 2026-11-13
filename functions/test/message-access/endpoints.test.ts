@@ -201,13 +201,40 @@ describe("account-wide off and the one-time notice", () => {
 });
 
 describe("per-chat switch is retired (#209)", () => {
-  test("PUT /conversations/:id/ai-access has no route (the router answers 404)", () => {
+  test("PUT /conversations/:id/ai-access through the real app answers 404 and changes nothing, for both participants", async () => {
+    // Real express app (real router, real verifyAuth, real 404 handler) on an
+    // ephemeral port. Only the Firebase token check is stubbed, so each request
+    // is authenticated as a participant.
+    const { app } = await import("../../src/app");
+    const { auth } = await import("../../src/utils/firebase");
+    const originalVerify = auth.verifyIdToken;
+    (auth as any).verifyIdToken = async (token: string) => ({ uid: token, role: token === AGENT_USER ? ROLES.AGENT : ROLES.CLIENT });
+    const server = app.listen(0);
+    try {
+      await new Promise((r) => server.once("listening", r));
+      const { port } = server.address() as { port: number };
+      const before = snapshot();
+      for (const [uid, off] of [[APPLICANT, true], [AGENT_USER, true], [APPLICANT, false]] as const) {
+        const res = await fetch(`http://127.0.0.1:${port}/conversations/${CONV}/ai-access`, {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${uid}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ off }),
+        });
+        assert.equal(res.status, 404, `${uid} off=${off}`);
+        const body: any = await res.json();
+        assert.equal(body.error, "NOT_FOUND");
+        assert.equal(body.message, `Route PUT /conversations/${CONV}/ai-access not found`);
+      }
+      assert.equal(snapshot(), before, "the conversation (and the whole store) is unchanged");
+      assert.equal(auditRows().length, 0, "no audit row written");
+    } finally {
+      (auth as any).verifyIdToken = originalVerify;
+      await new Promise((r) => server.close(r));
+    }
+  });
+
+  test("the messaging router registers no handler for /:id/ai-access (static check)", () => {
     const stack: any[] = (messagingRouter as any).stack;
-    const matches = stack.filter(
-      (l) => l.route && l.route.methods.put && l.match(`/${CONV}/ai-access`)
-    );
-    assert.equal(matches.length, 0, "no PUT handler matches /:id/ai-access");
-    // Any method on that path: nothing registered either.
     assert.equal(stack.filter((l) => l.route && l.match(`/${CONV}/ai-access`)).length, 0);
   });
 
@@ -301,6 +328,7 @@ describe("conversation response", () => {
     await listConversations(req(APPLICANT), res);
     assert.equal(res.statusCode, 200);
     const [c] = res.body.data;
+    assert.deepEqual(Object.keys(c.aiAccess).sort(), ["accountWideOff", "myAiAccess", "otherSwitchedOff", "qualifies"]);
     assert.equal(c.aiAccess.myAiAccess, "off");
     assert.equal("aiAccessOffUser" in c, false);
     assert.equal("aiAccessOffAgent" in c, false);

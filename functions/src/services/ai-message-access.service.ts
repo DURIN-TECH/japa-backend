@@ -32,7 +32,7 @@ import type {
 /** Errors the controllers map to HTTP codes. */
 export class AiMessageAccessError extends Error {
   constructor(
-    public readonly code: "NOT_FOUND" | "FORBIDDEN" | "WORDING_VERSION_MISMATCH",
+    public readonly code: "WORDING_VERSION_MISMATCH",
     message: string
   ) {
     super(message);
@@ -179,7 +179,11 @@ class AiMessageAccessService {
 
   // ---------- writes ----------
 
-  /** Queue an audit record on a transaction (a fresh id, so it can never overwrite one). */
+  /**
+   * Queue an audit record on a transaction (a fresh id, so it can never overwrite one).
+   * `action` is typed as the current actions only, so the retired `chat_switched_*`
+   * values (old rows stay readable) cannot be written by this class any more (#209).
+   */
   private queueAudit(
     tx: Transaction,
     rec: Omit<AiMessageAccessAuditRecord, "id" | "createdAt"> & { action: AiMessageAccessAuditAction }

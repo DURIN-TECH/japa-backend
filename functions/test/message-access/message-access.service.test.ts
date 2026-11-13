@@ -106,7 +106,7 @@ describe("rule through the helper (state built with the real writers)", () => {
     assert.deepEqual(await released(), BOTH, "old switches are not read");
     // ...and they cannot release anything for a person who does not qualify.
     resetMessageAccess();
-    seedChat({ aiAccessOffUser: false, aiAccessOffAgent: false });
+    seedChat({ aiAccessOffUser: true, aiAccessOffAgent: true });
     assert.deepEqual(await released(), [], "no approval, no plan: still nothing");
   });
 

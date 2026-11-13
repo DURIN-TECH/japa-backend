@@ -21,10 +21,10 @@ import type { Agent, Conversation, Message } from "../types";
 //    empty list), never "everything" and never a thrown message that a caller
 //    might swallow into "no filter".
 //  - EVALUATED AT READ TIME. The rule (access-rule.ts) is applied against
-//    today's approvals, plans and switches on every call. Nothing is stored per
+//    today's approvals, plans and account-wide settings on every call. Nothing is stored per
 //    message and nothing is cached, so a message sent before someone approved,
-//    or before they switched a chat back on, is released only if the rule holds
-//    NOW; and a revoke or switch takes effect on the very next call.
+//    or before they turned the account-wide setting back on, is released only if the
+//    rule holds NOW; and a revoke or setting change takes effect on the very next call.
 //  - ONLY THE QUALIFYING PERSON'S MESSAGES. In a chat where one person
 //    qualifies, the other person's messages are not in the output.
 //  - THE CALLER MUST BE ALLOWED TO SEE THE CHAT. The acting principal must be a
@@ -184,7 +184,7 @@ class MessageAccessService {
    * Re-check an already built batch RIGHT BEFORE it is sent to the provider.
    *
    * A batch can sit for a while between "built" and "sent". If someone switched
-   * a chat off (or withdrew approval, or the plan lapsed) in between, the stale
+   * AI off for all their chats (or withdrew approval, or the plan lapsed) in between, the stale
    * request must not go out. This re-runs the rule for every item: an item that
    * no longer releases anything is dropped, and an item keeps only messages the
    * rule still releases (the content comes from the fresh read by id, never from
