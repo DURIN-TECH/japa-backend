@@ -635,7 +635,7 @@ describe("news orchestrator counts API requests per provider", () => {
           { id: "api1", name: "API", strategy: "news_api", url: "https://newsdata.io/", countryCodes: ["GB"], config: { maxArticlesPerRun: 10, fetchFullContent: false, apiConfig: { provider: "newsdata", query: "visa" } } },
         ],
         createScrapeRun: async () => "log",
-        isDuplicate: async () => false,
+        findExistingHashes: async () => new Set<string>(),
         createArticlesBatch: async (a: unknown[]) => a.length,
         updateSourceAfterScrape: async () => undefined,
         completeScrapeRun: async () => undefined,

@@ -270,9 +270,9 @@ describe("extractor prompt — fee rule", () => {
     }
   });
 
-  // v5 (#87): each processing figure must be tied to the quote stating it.
-  test("prompt version is bumped (v5 #87: processing range tied to its citations)", () => {
-    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-processing-cited-v5");
+  // v6 (#129): requiredDocuments added.
+  test("prompt version is bumped (v6 #129: required documents extracted with citations)", () => {
+    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-required-documents-v6");
   });
 
   test("states the deterministic visa-length rule with the Skilled Worker example", () => {

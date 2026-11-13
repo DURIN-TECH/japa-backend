@@ -114,6 +114,16 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     actionLabel: "View case",
     path: casePath,
   },
+  assessment_rules_updated: {
+    subject: "Rules changed: a case needs your review",
+    actionLabel: "View case",
+    path: casePath,
+  },
+  // No fixed subject: the call site's title names the route the change is about.
+  rule_change_alert: {
+    actionLabel: "View case",
+    path: casePath,
+  },
   application_withdrawn: {
     subject: "An application was withdrawn",
     actionLabel: "View case",

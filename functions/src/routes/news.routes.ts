@@ -19,10 +19,8 @@ router.put("/subscriptions/me", verifyAuth, (req, res) =>
 );
 
 // Admin routes
-router.get("/admin/sources", verifyAuth, (req, res) =>
-  newsController.getSources(req, res)
-);
-
+// (GET /admin/sources was removed in issue #17; it is superseded by
+// GET /admin/scrape-sources?kind=news.)
 router.get("/admin/sources/:sourceId/runs", verifyAuth, (req, res) =>
   newsController.getScrapeRuns(req, res)
 );

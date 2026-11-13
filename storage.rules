@@ -1,5 +1,23 @@
 rules_version = '2';
 
+// WHAT CLIENTS CAN REACH DIRECTLY (issue #141)
+// Rules are deny-by-default: a path with no `match` below cannot be read or
+// written with a client SDK by anyone. That is deliberate for every prefix
+// the BACKEND uploads into or owns:
+//   documents/…            application documents   (API: /documents)
+//   verification/…         agent verification docs (API: /agents/me/verification)
+//   compliance/…           agency KYC/KYB docs     (API: /agencies/me/compliance)
+//   agency-logos/…         agency logos            (API: /agencies/me/logo)
+//   guidance-snapshots/…   backend-only scraper snapshots
+// The apps reach those only through the API, which authorises the caller and
+// hands out short-lived signed URLs for validated paths
+// (functions/src/utils/storage-paths.ts). Do NOT add a `match` for them.
+//
+// The matches below are older client-SDK paths. Neither the portal nor the
+// mobile app reads or writes through the Storage SDK today, so reads that
+// used to be open to "any signed-in user" are now admin-only: being signed in
+// says nothing about whose file it is. Covered by
+// functions/test/emulator/storage-rules.emu.ts.
 service firebase.storage {
   match /b/{bucket}/o {
     
@@ -55,8 +73,11 @@ service firebase.storage {
     // ============================================
     
     match /applications/{applicationId}/documents/{fileName} {
-      // Document owners, assigned agents, and admins can read
-      allow read: if isAuthenticated(); // Simplified - use Firestore for actual auth
+      // Admins only. This used to be "any signed-in user", which let every
+      // account read every object under this prefix (issue #141). Application
+      // documents are served by the API from `documents/…` via signed URLs;
+      // no client reads this path.
+      allow read: if isAdmin();
       
       // Authenticated users can upload documents
       allow create: if isAuthenticated() &&
@@ -96,8 +117,10 @@ service firebase.storage {
     // ============================================
     
     match /consultations/{consultationId}/recordings/{fileName} {
-      // Only participants and admins can access recordings
-      allow read: if isAuthenticated(); // Simplified - actual auth in Firestore
+      // Admins only (was "any signed-in user"; issue #141). Rules cannot tell
+      // who took part in a consultation, so participant access must go
+      // through the API if recordings are ever served.
+      allow read: if isAdmin();
       
       // Only system can upload recordings (via Cloud Functions)
       allow write: if false;
@@ -110,8 +133,10 @@ service firebase.storage {
     // ============================================
     
     match /messages/{conversationId}/{fileName} {
-      // Conversation participants can read attachments
-      allow read: if isAuthenticated();
+      // Admins only (was "any signed-in user"; issue #141). Rules cannot tell
+      // who the conversation's participants are, so attachment access must go
+      // through the API if attachments are ever uploaded here.
+      allow read: if isAdmin();
       
       // Authenticated users can upload attachments
       allow create: if isAuthenticated() &&
@@ -136,5 +161,16 @@ service firebase.storage {
       
       allow delete: if isOwner(userId) || isAdmin();
     }
+
+    // ============================================
+    // BACKEND-ONLY PATHS: deliberately NO match block
+    // ============================================
+    // Storage rules deny by default, so a path with no `match` here is closed
+    // to every client SDK; only the backend (Admin SDK, which bypasses rules)
+    // can touch it. Do NOT add a match for these, and do NOT add a catch-all
+    // (`match /{allPaths=**}`) that would open them:
+    //  - guidance-snapshots/{sourceId}/{contentHash}.json: cleaned text of
+    //    fetched caseworker guidance, kept for internal quote validation only
+    //    (issue #39). Never served to a client.
   }
 }

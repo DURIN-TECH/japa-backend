@@ -216,7 +216,7 @@ export interface NewsSubscription {
 | `src/utils/firebase.ts` | Add `newsArticles`, `newsSources`, `newsSubscriptions` to collections; `scrapeRuns` to subcollections |
 | `src/types/index.ts` | Add `"visa_news"` to `NotificationType`, `"news_article"` to `relatedEntityType`, re-export `./news` |
 | `src/app.ts` | Mount `/news` routes |
-| `src/index.ts` | Add `scrapeNewsOrchestrator`, `cleanupOldNews`, `onNewsArticleCreated` exports |
+| `src/index.ts` | Add `scrapeNewsOrchestrator`, `onNewsArticleCreated` exports (`cleanupOldNews` was removed in #19, see Retention) |
 | `firestore.indexes.json` | Add composite indexes for news queries |
 | `package.json` | Add `axios`, `cheerio`, `rss-parser` dependencies |
 
@@ -230,10 +230,12 @@ export interface NewsSubscription {
 - For each source: fetch -> normalize -> dedup -> batch write -> update source health
 - Memory: 512MB, Timeout: 540s
 
-### `cleanupOldNews` (Scheduled, weekly Sunday 4 AM)
-- Deletes articles older than 90 days
-- Deletes scrape runs older than 30 days
-- Memory: 256MB, Timeout: 120s
+### Retention (Firestore TTL, issue #19; replaced the weekly `cleanupOldNews`)
+- No scheduled function: Firestore TTL deletes expired docs (within ~24h of `expireAt`)
+- `newsArticles.expireAt` = max(`publishedAt`, `createdAt`) + 90 days
+- `newsSources/{id}/scrapeRuns.expireAt` = `startedAt` + 30 days
+- Policies are declared in `firestore.indexes.json` (`fieldOverrides`); docs written before #19 are covered by `npm run backfill:expireat`
+- Dedup: one batched `newsService.findExistingHashes` per source (`in` queries, 30 values each) instead of two queries per article
 
 ### `onNewsArticleCreated` (Firestore trigger on `newsArticles/{articleId}`)
 - Fires when a new article is created with `isPublished: true`
@@ -312,7 +314,7 @@ Auto-classify articles by scanning title + summary for keyword patterns:
 
 ### Phase 3: Scheduled Functions
 - [ ] Add `scrapeNewsOrchestrator` to `src/index.ts`
-- [ ] Add `cleanupOldNews` to `src/index.ts`
+- [x] ~~Add `cleanupOldNews` to `src/index.ts`~~ (replaced by Firestore TTL in #19)
 - [ ] Test with emulator + seed data
 
 ### Phase 4: User-Facing API

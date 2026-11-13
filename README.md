@@ -222,6 +222,7 @@ The `role` query parameter controls which applications are returned:
 | `transactions` | Payment records |
 | `notifications` | Push notification records |
 | `conversations` | Agent-user chat conversations |
+| `documents` | Uploaded application documents, linked by `applicationId` (top-level; there is no `applications/{id}/documents` subcollection) |
 
 ### Subcollections
 
@@ -229,7 +230,6 @@ The `role` query parameter controls which applications are returned:
 |------|-------------|
 | `countries/{code}/visaTypes/{id}` | Visa types for a country |
 | `countries/{code}/visaTypes/{id}/requirements/{id}` | Required documents per visa |
-| `applications/{id}/documents/{id}` | Uploaded documents for an application |
 | `applications/{id}/timeline/{id}` | Status timeline entries |
 | `applications/{id}/notes/{id}` | Agent/owner case notes |
 | `agents/{id}/reviews/{id}` | Client reviews for an agent |

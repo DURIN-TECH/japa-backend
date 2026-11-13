@@ -1,6 +1,11 @@
 import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { agentService } from "../services/agent.service";
+import {
+  agentService,
+  AgentNotVerifiedError,
+  InvalidAvailabilityError,
+} from "../services/agent.service";
+import { toPublicAgent } from "../agents/public-agent";
 import { agencyService } from "../services/agency.service";
 import { notificationService } from "../services/notification.service";
 import {
@@ -35,7 +40,8 @@ export class AgentController {
       };
 
       const agents = await agentService.getAgents(filters);
-      sendSuccess(res, agents);
+      // Issue #147: anonymous route -> allow-listed shape only
+      sendSuccess(res, agents.map(toPublicAgent));
     } catch (error) {
       console.error("Error getting agents:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -51,7 +57,8 @@ export class AgentController {
       const limit = parseInt(req.query.limit as string) || 10;
       const agents = await agentService.getTopAgents(limit);
 
-      sendSuccess(res, agents);
+      // Issue #147: allow-listed shape only
+      sendSuccess(res, agents.map(toPublicAgent));
     } catch (error) {
       console.error("Error getting top agents:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -78,7 +85,8 @@ export class AgentController {
         return;
       }
 
-      sendSuccess(res, agent);
+      // Issue #147: allow-listed shape only (the full doc stays on /agents/me)
+      sendSuccess(res, toPublicAgent(agent));
     } catch (error) {
       console.error("Error getting agent:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -111,7 +119,8 @@ export class AgentController {
       const { visaTypeId } = req.params;
       const agents = await agentService.getAgentsForVisaType(visaTypeId);
 
-      sendSuccess(res, agents);
+      // Issue #147: allow-listed shape only
+      sendSuccess(res, agents.map(toPublicAgent));
     } catch (error) {
       console.error("Error getting agents for visa type:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -231,6 +240,22 @@ export class AgentController {
       const updatedAgent = await agentService.updateAgent(agent.id, updates);
       sendSuccess(res, updatedAgent, "Profile updated successfully");
     } catch (error) {
+      // `isAvailable` in a profile update passes the same rule as
+      // PUT /agents/me/availability (issue #138), with the same answers.
+      // Nothing was written when either of these is thrown.
+      if (error instanceof InvalidAvailabilityError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      if (error instanceof AgentNotVerifiedError) {
+        sendError(
+          res,
+          "FORBIDDEN",
+          "Agent must be verified before becoming available",
+          403
+        );
+        return;
+      }
       console.error("Error updating agent profile:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
@@ -471,8 +496,10 @@ export class AgentController {
         return;
       }
 
-      // Verify the caller owns an agency
-      const agency = await agencyService.getAgencyByOwnerId(ownerUserId);
+      // Verify the caller owns an agency: the resolved principal says owner
+      // and the agency's own record names them (issue #138, see
+      // agencyService.getOwnedAgencyForPrincipal).
+      const agency = await agencyService.getOwnedAgencyForPrincipal(req.authz);
       if (!agency) {
         sendForbidden(res, "Only agency owners can manage agent status");
         return;

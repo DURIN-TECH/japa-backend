@@ -1,4 +1,4 @@
-import axios, { AxiosInstance } from "axios";
+import type { AxiosInstance } from "axios";
 import * as cheerio from "cheerio";
 import Parser from "rss-parser";
 import { createHash } from "crypto";
@@ -7,6 +7,7 @@ import { newsService } from "../../services/news.service";
 // crawler's fetch layer (#64) — robots.txt parsing + cache, per-host rate
 // limit and 429/503 detection — instead of keeping its own copy. See
 // "Crawler etiquette" below.
+import { createGuardedHttpClient, isUrlAllowed, type AddressGuardOptions } from "../shared/fetch/address-guard";
 import { VisaCatalogFetchService, type VisaCatalogHttpClient } from "../shared/fetch/visa-catalog-fetch.service";
 import {
   HostBackoffTracker,
@@ -125,8 +126,10 @@ export const NEWS_HTTP_TIMEOUT_MS = 15_000;
 /** Largest per-source timeout honoured (keeps a run inside the function timeout). */
 export const NEWS_MAX_REQUEST_TIMEOUT_MS = 60_000;
 
-export function createNewsHttpClient(): AxiosInstance {
-  return axios.create({
+export function createNewsHttpClient(guard?: AddressGuardOptions): AxiosInstance {
+  // Issue #159: built by the shared address guard (connect-time DNS check,
+  // literal + port check on every hop, no env proxy). `guard` is TEST-ONLY.
+  return createGuardedHttpClient({
     timeout: NEWS_HTTP_TIMEOUT_MS,
     headers: {
       "User-Agent": NEWS_BOT_USER_AGENT,
@@ -136,7 +139,7 @@ export function createNewsHttpClient(): AxiosInstance {
     maxRedirects: 3,
     maxContentLength: 5 * 1024 * 1024, // 5MB limit
     validateStatus: () => true,
-  });
+  }, guard);
 }
 
 // ============================================
@@ -165,7 +168,8 @@ export type NewsScraperStore = Pick<
   // Issue #96: manual "Run now" on one source reads it by id.
   | "getSourceById"
   | "createScrapeRun"
-  | "isDuplicate"
+  // Issue #19: one batched hash lookup per source (replaces isDuplicate).
+  | "findExistingHashes"
   | "createArticlesBatch"
   | "completeScrapeRun"
 > & {
@@ -175,7 +179,7 @@ export type NewsScraperStore = Pick<
     success: boolean,
     errorMessage?: string,
     notBeforeMs?: number,
-    opts?: { failureLimit?: number }
+    opts?: { failureLimit?: number; articlesFound?: number }
   ) => Promise<NewsSourceHealthResult | null | void>;
   pauseForMissingApiKey?: (sourceId: string, provider: string) => Promise<boolean>;
 };
@@ -190,7 +194,7 @@ function defaultNewsStore(): NewsScraperStore {
     getDueSources: (limit) => newsService.getDueSources(limit),
     getSourceById: (id) => newsService.getSourceById(id),
     createScrapeRun: (id, runId) => newsService.createScrapeRun(id, runId),
-    isDuplicate: (u, t) => newsService.isDuplicate(u, t),
+    findExistingHashes: (u, t) => newsService.findExistingHashes(u, t),
     createArticlesBatch: (a) => newsService.createArticlesBatch(a),
     completeScrapeRun: (id, runId, r) => newsService.completeScrapeRun(id, runId, r),
     updateSourceAfterScrape: (id, ok, msg, nb, o) => newsSourceHealthService.updateSourceAfterScrape(id, ok, msg, nb, o),
@@ -674,6 +678,8 @@ export class NewsScraperService {
 
     try {
       // 1. Fetch raw articles using the appropriate strategy
+      // (fetchMs / dedupMs / writeMs below feed the per-source log line)
+      const fetchStart = Date.now();
       let rawArticles: RawArticle[];
 
       switch (source.strategy) {
@@ -689,6 +695,7 @@ export class NewsScraperService {
       default:
         throw new Error(`Unknown strategy: ${source.strategy}`);
       }
+      const fetchMs = Date.now() - fetchStart;
 
       // 2. Normalize and deduplicate
       let articlesNew = 0;
@@ -696,25 +703,16 @@ export class NewsScraperService {
       let articlesFailed = 0;
       const newArticles: Omit<
         NewsArticle,
-        "id" | "viewCount" | "bookmarkCount" | "createdAt" | "updatedAt"
+        "id" | "viewCount" | "bookmarkCount" | "createdAt" | "updatedAt" | "expireAt"
       >[] = [];
 
+      // 2a. Normalize every article first (no I/O). A failure on one article
+      //     counts articlesFailed and does not abort the others.
+      const dedupStart = Date.now();
+      const candidates: (typeof newArticles)[number][] = [];
       for (const raw of rawArticles.slice(0, source.config.maxArticlesPerRun)) {
         try {
-          const normalized = this.normalizeArticle(raw, source);
-
-          const isDup = await this.store.isDuplicate(
-            normalized.urlHash,
-            normalized.titleHash
-          );
-
-          if (isDup) {
-            articlesDuplicate++;
-            continue;
-          }
-
-          newArticles.push(normalized);
-          articlesNew++;
+          candidates.push(this.normalizeArticle(raw, source));
         } catch (parseError) {
           articlesFailed++;
           console.warn(
@@ -723,15 +721,53 @@ export class NewsScraperService {
         }
       }
 
+      // 2b. ONE batched lookup for the whole source (2 * ceil(N / 30)
+      //     concurrent queries) instead of two awaited queries per article.
+      let existing = new Set<string>();
+      if (candidates.length > 0) {
+        existing = await this.store.findExistingHashes(
+          candidates.map((c) => c.urlHash),
+          candidates.map((c) => c.titleHash)
+        );
+      }
+
+      // 2c. A duplicate = urlHash OR titleHash already stored (as before) OR
+      //     already seen earlier in THIS batch (nothing is written until
+      //     after the loop, so the store cannot know about those yet).
+      const seenUrlHashes = new Set<string>();
+      const seenTitleHashes = new Set<string>();
+      for (const normalized of candidates) {
+        const isDup =
+          existing.has(normalized.urlHash) ||
+          existing.has(normalized.titleHash) ||
+          seenUrlHashes.has(normalized.urlHash) ||
+          seenTitleHashes.has(normalized.titleHash);
+
+        if (isDup) {
+          articlesDuplicate++;
+          continue;
+        }
+
+        seenUrlHashes.add(normalized.urlHash);
+        seenTitleHashes.add(normalized.titleHash);
+        newArticles.push(normalized);
+        articlesNew++;
+      }
+      const dedupMs = Date.now() - dedupStart;
+
       // 3. Batch write new articles
+      const writeStart = Date.now();
       if (newArticles.length > 0) {
         await this.store.createArticlesBatch(newArticles);
       }
+      const writeMs = Date.now() - writeStart;
 
       // 4. Update source health (issue #107: a success on an auto-paused
       //    source, i.e. a manual retry, makes it active again)
       const okHealth = await this.store.updateSourceAfterScrape(source.id, true, undefined, undefined, {
         failureLimit: link?.trace?.failureLimit,
+        // Issue #17: the pre-slice count feeds the zero-yield streak.
+        articlesFound: rawArticles.length,
       });
       if (okHealth && link?.trace) link.trace.health = okHealth;
       markHealthRecorded();
@@ -751,7 +787,7 @@ export class NewsScraperService {
       if (link?.trace) link.trace.requestsAttempted = this.requestsAttempted - requestsBefore;
 
       console.log(
-        `Source "${source.name}": found=${rawArticles.length}, new=${articlesNew}, dup=${articlesDuplicate}, failed=${articlesFailed}`
+        `Source "${source.name}": found=${rawArticles.length}, new=${articlesNew}, dup=${articlesDuplicate}, failed=${articlesFailed}, fetchMs=${fetchMs}, dedupMs=${dedupMs}, writeMs=${writeMs}`
       );
 
       return {
@@ -1004,6 +1040,11 @@ export class NewsScraperService {
     if (source.config.fetchFullContent && selectors.articleBody) {
       for (const article of articles.slice(0, MAX_FULL_CONTENT_ARTICLES)) {
         if (tracker.blocking(hostOf(article.url))) continue;
+        // Issue #159: article links are scraped off a third-party page. One
+        // that points at a non-public address or port is skipped silently
+        // (summary kept), with no request and no failed run. Names are
+        // judged again at connect time by the guarded client.
+        if (!isUrlAllowed(article.url)) continue;
         try {
           const detailHtml = await this.crawlGet(article.url, {}, sourceTimeoutMs(source));
           const detail$ = cheerio.load(detailHtml);
@@ -1134,7 +1175,7 @@ export class NewsScraperService {
     source: NewsSource
   ): Omit<
     NewsArticle,
-    "id" | "viewCount" | "bookmarkCount" | "createdAt" | "updatedAt"
+    "id" | "viewCount" | "bookmarkCount" | "createdAt" | "updatedAt" | "expireAt"
   > {
     const normalizedUrl = this.normalizeUrl(raw.url);
     const normalizedTitle = raw.title.toLowerCase().trim();

@@ -63,6 +63,38 @@ scrapers/
     news-source-health.ts              per-run source health write + missing-key pause (#107)
     seed-news-sources.ts               news source registry seed
     docs/                              news scraping plan
+  guidance/                            caseworker-guidance registry (#39): HOW OFFICERS DECIDE,
+                                       separate from visa-catalog's visaSources (what a visa is)
+    types.ts                           GuidanceSource, seed entry, snapshot metadata + stored object
+    guidance-crawl.service.ts          orchestrator: shared fetch -> hash gate -> snapshot; skips
+                                       unverified sources; N failures -> status "failing"
+    guidance-snapshot.store.ts         snapshot text in Cloud Storage, keyed by content hash,
+                                       create-only, backend-only (never served to a client)
+    guidance-published-date.ts         publisher's own date, found by a per-source selector
+    guidance-resolve.ts                current address of a document that moves with each
+                                       publication, read from a stable parent page (#111)
+    guidance-quote-check.ts            passages that must appear verbatim in stored snapshots (#111)
+    guidance-source.{controller,routes}.ts   GET /admin/guidance-sources (admin-only list)
+    data/                              seed-guidance-sources.ts: entries (data) + validator + loader;
+                                       guidance-quote-checks.ts: the passages (data) (#111)
+    scripts/                           seed-guidance-sources (CLI, dry run by default)
+    README.md                          runbook: adding a source, seeding, crawling, recovering
+  rubric/                              visa rubrics (#40): guidance snapshots -> cited, versioned,
+                                       machine-checkable criteria, staged `pending_review`.
+                                       Types live in src/types/rubric.ts. Not scheduled, no routes.
+    rubric-extraction.service.ts       orchestrator: settings (fail closed) -> hash gate -> chunk ->
+                                       one model call per chunk -> validate in code -> merge ->
+                                       version N+1 (pending) + run record
+    rubric-quote.ts                    verbatim quote lookup in a snapshot (per page for PDFs);
+                                       numbers / dates / units must be in the quote
+    rubric-chunk.ts                    bounded, deterministic chunks (whole pages / paragraphs)
+    rubric-prompt.ts                   constant system prompt, delimited data frame, output JSON
+                                       schema + the in-code schema check of the answer
+    rubric-validate.ts                 structural validator (kind rules, id joins, intent flag)
+    rubric.store.ts                    visaRubrics head + rubricVersions; writes pending only;
+                                       getApprovedRubric is the only consumer read
+    rubric-settings.ts                 appConfig/rubricExtractionSettings: kill switch + caps
+    scripts/                           extract-rubric (CLI, dry run by default)
 ```
 
 Tests mirror this layout under `functions/test/scrapers/`; shared test helpers
@@ -80,3 +112,38 @@ stay in `functions/test/helpers/`.
   `findVisaSourcesMarkdown` (data/seed-visa-sources.ts) probes its own dir, then
   `../../../../src/scrapers/visa-catalog/data/`. That resolves to the committed copy
   from both `src/` (tsx) and `lib/` (compiled seed in CI).
+
+## Rubric extraction (`rubric/`): what the code checks, and what it cannot
+
+Every criterion the model proposes is checked in code against the stored
+snapshot before it is written (`rubric-quote.ts`,
+`rubric-extraction.service.ts`):
+
+- the quote is in its own source verbatim, starts and ends on a whole word or
+  number, and sits within one PDF page or one line of a web page;
+- a threshold is a JSON number written in the criterion's **own quote** (not
+  the day or year of a date in it); a unit, a date (day, month and year in one
+  expression) and each group name are in that quote too. Supporting
+  `citations` are reviewer aids and never count as support;
+- a rule reference is printed in the quote or directly before it.
+
+**The limit code cannot close.** A verbatim, whole-word quote can still mean
+something else than its source. A quote that begins after a negation or a
+condition passes every check: "required to interview the applicant", quoted
+from "is **not** required to interview the applicant", is verbatim. The
+extractor raises `quote_starts_mid_sentence` on a criterion whose quote begins
+part-way through a sentence and `quote_ends_mid_sentence` when it stops before
+the end of its sentence (an exception such as "only where ..." may follow),
+but those are prompts to look, not verdicts, and they do not cover a qualifier
+in another sentence. Also per criterion: `multiple_dates_in_quote`. Standing on
+every version that has the content: `title_wording_uncited`. **A human reviewer must read each quote in its source
+context before approving a rubric.**
+
+Also for the reviewer, raised as flags on the version rather than decided by
+code: country codes on a mandatory bar are the model's mapping of the source's
+wording (`nationality_codes_model_proposed`, `nationality_code_name_mismatch`);
+intake question wording is the model's (`intake_wording_uncited`); a rule that
+runs across a chunk or page boundary may be missing (`multiple_chunks`,
+`page_ends_mid_sentence`); the model can silently omit a rule, which nothing
+detects. Number words and month names are recognised in English only; anything
+else is not recognised and the criterion that relies on it is rejected.

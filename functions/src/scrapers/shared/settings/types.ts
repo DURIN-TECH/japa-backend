@@ -1,6 +1,6 @@
 import type { Timestamp } from "firebase-admin/firestore";
 import type { CrawlWindow } from "../../visa-catalog/types";
-import type { ScrapeRunKind } from "../runs/types";
+import type { ScraperSettingsKind } from "../runs/types";
 
 // ============================================
 // SCRAPER SETTINGS — shapes (issue #96)
@@ -99,6 +99,16 @@ export interface SettingsHistoryDoc {
 export type AdminSourceStatus = "active" | "paused" | "retired";
 export const ADMIN_SOURCE_STATUSES: readonly AdminSourceStatus[] = ["active", "paused", "retired"];
 
+/** Issue #17: the admin-edited news config fields (flat; selectors per key). */
+export interface NewsConfigOverrides {
+  scrapeIntervalMinutes?: number;
+  priority?: number;
+  countryCodes?: string[];
+  feedUrl?: string;
+  selectors?: Record<string, string>;
+  maxArticlesPerRun?: number;
+}
+
 /**
  * `adminOverrides` block on a source doc. Applied to the live fields at once
  * by the admin API, and kept by the seeders on every re-seed (#57 / #78), so
@@ -108,6 +118,11 @@ export interface SourceAdminOverrides {
   status?: AdminSourceStatus; // the status the admin last set
   reason?: string; // why (required for paused / retired)
   crawlWindow?: CrawlWindow; // visa only: replaces the registry window
+  // Issue #17 (news only): ONLY the config fields an admin edited, kept by
+  // the seeder over the registry values. Shape:
+  // { scrapeIntervalMinutes?, priority?, countryCodes?, feedUrl?,
+  //   selectors?: {<key>: selector}, maxArticlesPerRun? }
+  config?: NewsConfigOverrides;
   updatedAt?: Timestamp;
   updatedBy?: string;
 }
@@ -133,7 +148,7 @@ export type ScrapeRunRequestStatus = "queued" | "running" | "succeeded" | "faile
 /** The `scrapeRunRequests/{id}` doc. */
 export interface ScrapeRunRequestDoc {
   id: string;
-  kind: ScrapeRunKind;
+  kind: ScraperSettingsKind;
   scope: ScrapeRunRequestScope;
   sourceId: string | null; // set for scope "source"
   force: boolean; // ignore the content-hash gate (visa only)

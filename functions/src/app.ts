@@ -18,6 +18,12 @@ import {
   adminScraperRunRoutes,
   adminScraperSettingsRoutes,
 } from "./scrapers";
+// Caseworker-guidance source registry: admin list (issue #39).
+import { adminGuidanceSourceRoutes } from "./scrapers";
+// Rubric review (issue #125): admin queue, detail with diff, approve / reject.
+import { adminRubricRoutes } from "./routes/rubric-review.routes";
+// Published outcome statistics imports: admin run list + Run now (issue #116).
+import { adminOutcomeStatisticsRoutes } from "./scrapers";
 // Agency-scoped visa drafts / edits / submit (issue #100).
 import { agencyVisaRoutes } from "./agency-visas";
 // Agency per-visa service prices, in whole naira (issue #103).
@@ -30,6 +36,7 @@ import { documentRoutes } from "./routes/document.routes";
 import { documentTemplateRoutes } from "./routes/document-template.routes";
 import { documentInstanceRoutes } from "./routes/document-instance.routes";
 // Durable agent→client document asks (backs the client web workspace to-do list)
+import { checklistRoutes } from "./routes/checklist.routes";
 import { documentRequestRoutes } from "./routes/document-request.routes";
 import {
   eligibilityRoutes,
@@ -44,6 +51,7 @@ import { newsRoutes } from "./routes/news.routes";
 import { bankAccountRoutes } from "./routes/bank-account.routes";
 import { onboardingRoutes } from "./routes/onboarding.routes";
 import { analyticsRoutes } from "./routes/analytics.routes";
+import { aiRoutes } from "./routes/ai.routes";
 import {
   plansRouter,
   subscriptionsRouter,
@@ -51,6 +59,8 @@ import {
   webhooksRouter,
 } from "./routes/entitlement.routes";
 import { verificationWebhookRoutes } from "./routes/verification-webhook.routes";
+// Admin review queue for trafficking / scam risk signals (issue #119).
+import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
 
 // Create Express app
 const app = express();
@@ -93,6 +103,8 @@ app.use("/agency/visas", agencyVisaRoutes);
 // prices (agency from the token). Contract: src/agency-visa-prices/agency-visa-prices.md.
 app.use("/agency/visa-prices", agencyVisaPriceRoutes);
 app.use("/invitations", invitationRoutes);
+// Personal document checklist (issue #114): extra-segment paths on /applications.
+app.use("/applications", checklistRoutes);
 app.use("/applications", applicationRoutes);
 app.use("/documents", documentRoutes);
 // Document templates: catalog (read-only) + editable instances cloned from them
@@ -109,10 +121,16 @@ app.use("/onboarding", onboardingRoutes);
 app.use("/analytics", analyticsRoutes);
 app.use("/news", newsRoutes);
 app.use("/eligibility", eligibilityRoutes);
+// AI case-officer assessments (issue #42): async jobs, tier decided in the handler.
+app.use("/ai", aiRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
 app.use("/admin/visas", adminVisaRoutes);
 // Admin queue of proposed edits to live scraped visas (CASL `VisaChange`).
 app.use("/admin/visa-changes", adminVisaChangeRoutes);
+// Admin-only review queue for trafficking / scam risk signals (issue #119).
+// Signals are raised by backend code, never through HTTP; this mount only
+// lists, reads and records an admin decision.
+app.use("/admin/risk-signals", adminRiskSignalRoutes);
 // Scraper monitoring (issue #81): run records + per-source health (CASL `ScrapeRun`).
 app.use("/admin/scrape-runs", adminScrapeRunRoutes);
 app.use("/admin/scrape-sources", adminScrapeSourceRoutes);
@@ -127,6 +145,14 @@ app.use("/admin/scrape-run-requests", adminScrapeRunRequestRoutes);
 app.use("/admin/scrape-alerts", adminScrapeAlertRoutes);
 // Scraping cost report from the monthly rollup (issue #82; CASL `ScrapeRun`).
 app.use("/admin/scrape-costs", adminScrapeCostRoutes);
+// Caseworker-guidance source registry (issue #39): read-only admin list
+// (CASL `read ScrapeRun`, admin-only). No route serves snapshot text.
+app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
+// Rubric review (issue #125): admin-only (verifyAuth + admin gate on every
+// route). The only routes that read an unapproved rubric version.
+app.use("/admin/rubrics", adminRubricRoutes);
+// Outcome statistics imports (issue #116): admin-only run records + manual run.
+app.use("/admin/outcome-statistics", adminOutcomeStatisticsRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);

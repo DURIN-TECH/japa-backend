@@ -1,5 +1,9 @@
 import * as functions from "firebase-functions";
 import { app } from "./app";
+// The Anthropic secret list (issue #31). Importing this module is cheap: it
+// does not load the Anthropic SDK (that happens lazily on the first model call).
+import { refusalLetterService } from "./services/ai/refusal-letter.service";
+import { AI_SECRETS } from "./services/ai/anthropic-client";
 
 // ============================================
 // HTTP FUNCTIONS
@@ -15,6 +19,7 @@ import { app } from "./app";
  *   - PAYSTACK_CALLBACK_URL  — where Paystack redirects after checkout
  *   - RESEND_API_KEY         — Resend API key for transactional email (re_…)
  *   - EMAIL_FROM             — verified sender, e.g. "Seli <noreply@weareseli.com>"
+ *   - ANTHROPIC_API_KEY      — Anthropic API key for the AI tasks (AI_SECRETS, see below)
  * Set them with `firebase functions:secrets:set <NAME>` before deploying.
  * Locally, the emulator reads them from `functions/.env.local` instead.
  *
@@ -44,6 +49,21 @@ const VERIFICATION_SECRETS = [
 // so deploying without a key is safe — no visas are ever wrongly published.
 const VISA_CATALOG_SECRETS = ["DEEPSEEK_API_KEY"];
 
+// Anthropic API key for the AI tasks (issue #31). `AI_SECRETS` is declared and
+// exported in ONE place, services/ai/anthropic-client.ts (next to the factory
+// that is the only reader of the key), and imported at the top of this file.
+// Bound to:
+//   - `api` only, for now — it will host the `/ai` routes.
+// NOT bound to `onApplicationUpdated`: it only enqueues work and never calls
+// the model. Assessments run in a dedicated Firestore-triggered worker built
+// in #42; that worker adds `AI_SECRETS` to its own runWith when it lands,
+// as do the later AI tasks (#115, #117, #118) for their functions.
+// Absent at runtime => getAnthropicClient() throws "ANTHROPIC_API_KEY is not
+// set for this project". Absent in Secret Manager at DEPLOY time => deploying
+// `api` fails, so create the secret first
+// (`firebase functions:secrets:set ANTHROPIC_API_KEY`). Only `durin-seli-dev`
+// has it for now; production (`japa-platform`) is deliberately left unset.
+
 export const api = functions
   .runWith({
     secrets: [
@@ -51,6 +71,8 @@ export const api = functions
       "PAYSTACK_CALLBACK_URL",
       ...EMAIL_SECRETS,
       ...VERIFICATION_SECRETS,
+      // Anthropic key for the upcoming `/ai` routes (issue #31).
+      ...AI_SECRETS,
     ],
   })
   .https.onRequest(app);
@@ -64,7 +86,7 @@ import { agentService } from "./services/agent.service";
 import { visaService } from "./services/visa.service";
 import { newsScraperService } from "./scrapers";
 import { visaCatalogCrawlService } from "./scrapers";
-import { newsService } from "./services/news.service";
+import { guidanceCrawlService } from "./scrapers";
 import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
 import { notificationService } from "./services/notification.service";
@@ -72,8 +94,17 @@ import { unreadMessageReminderService } from "./services/unread-message-reminder
 import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
 import { scrapeRunWorker } from "./scrapers";
+import { aiCaseOfficerService } from "./services/ai-case-officer.service";
+import { assessmentAutoRunService } from "./services/assessment-auto-run.service";
+import { bulkReassessmentService } from "./services/ai-bulk-reassessment.service";
+import { ruleChangeAlertsService } from "./services/rule-change-alerts.service";
+import { rubricExtractionService } from "./scrapers";
+import type { RubricReviewAuditEntry } from "./services/rubric-review.service";
+import { outcomeImportService, outcomeRunWorker, registeredDestinations } from "./scrapers";
+import { documentCheckService } from "./services/ai/document-check.service";
 import { NewsArticle } from "./types/news";
 import { Timestamp } from "firebase-admin/firestore";
+import { onUserContactWritten } from "./services/risk-rules/shared-contact.runner";
 
 /**
  * When a new user is created via Firebase Auth
@@ -225,6 +256,13 @@ export const onApplicationUpdated = functions
     ) {
       await agentService.updateAgentStats(after.agentId);
     }
+
+    // AI case-officer (issue #42): moving to under review queues an assessment.
+    // Only writes the job document; it makes no model call and never throws.
+    // The worker (processAssessmentJob) does the work, idempotently, by id.
+    if (before.status !== after.status && after.status === "under_review") {
+      await aiCaseOfficerService.enqueueForStatusChange(context.params.applicationId);
+    }
   });
 
 /**
@@ -287,6 +325,23 @@ export const onPaymentRequestCreated = functions
     } catch (error) {
       console.error("Error sending payment request notification:", error);
     }
+  });
+
+/**
+ * Risk rule (issue #121): shared contact detail across applicant accounts.
+ *
+ * Fires when a user document is created or its phone / email changes. The
+ * handler only ever raises an admin-only risk signal (#119); it never touches
+ * the user, notifies anyone or blocks anything, and it swallows its own
+ * failures so the user write that triggered it is never affected.
+ */
+export const onUserContactChanged = functions.firestore
+  .document("users/{userId}")
+  .onWrite(async (change) => {
+    await onUserContactWritten(
+      change.before.exists ? (change.before.data() as Record<string, unknown>) : undefined,
+      change.after.exists ? (change.after.data() as Record<string, unknown>) : undefined
+    );
   });
 
 /**
@@ -496,12 +551,47 @@ export const crawlVisaCatalogOrchestrator = functions
     }
   });
 
+/**
+ * Caseworker-guidance crawler (issue #143) — ONCE A NIGHT at 03:20 UTC.
+ * Weekly-or-nightly cadence per source is not decided here: every source
+ * carries its own `checkIntervalHours`, and a tick only requests the sources
+ * that are due (a source checked recently answers `not_due` without a
+ * request), so a tick with nothing due returns at once: no run record, no
+ * alert. :20 is off the other ticks (:00 / :15 / :30 / :45), so it never
+ * lands on the same minute as the news, visa or alert-check functions.
+ *
+ * Fetches go through the shared fetch service (robots.txt, per-host gap,
+ * 429/503 backoff) that `guidanceCrawlService` uses by default; each run is a
+ * `scrapeRuns` doc of kind "guidance", each source is crawled under its own
+ * lease, and the finalize hook below alerts admins when a source turns
+ * `failing` or the crawl could not store its results. The crawl never sends
+ * a document to a model, so it needs no LLM secret, only the email secrets.
+ */
+export const crawlGuidanceOrchestrator = functions
+  // EMAIL_SECRETS: post-run alert emails, see scrapeNewsOrchestrator.
+  .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: [...EMAIL_SECRETS] })
+  .pubsub.schedule("20 3 * * *") // nightly at 03:20 UTC (issue #143)
+  .timeZone("UTC")
+  .onRun(async () => {
+    console.log("Running guidance crawl orchestrator...");
+    try {
+      const result = await guidanceCrawlService.runOrchestrator();
+      console.log(
+        `Guidance crawl: ${result.sourcesConsidered} sources, ${result.sourcesFetched} fetched, ` +
+          `${result.changed} changed / ${result.unchanged} unchanged / ${result.failed} failed, ` +
+          `${result.infraErrors} infrastructure errors, ${result.notDue} not due`
+      );
+    } catch (error) {
+      console.error("Guidance crawl orchestrator failed:", error);
+    }
+  });
+
 // ============================================
 // SCRAPER ALERTS (issue #83)
 // ============================================
 
 /**
- * Post-run alert rules: every visa / news run, once finalised (#81), is
+ * Post-run alert rules: every visa / news / guidance run, once finalised (#81), is
  * checked for run_failed / error_rate / linked_surcharge / host_backoff /
  * source_broken (scrapers/shared/alerts/scrape-alert.service.ts onRunFinalized). The hook
  * never throws, and the run's record is already written when it runs.
@@ -558,24 +648,53 @@ export const processScrapeRunRequest = functions
     await scrapeRunWorker.process(context.params.requestId);
   });
 
+// ============================================
+// PUBLISHED OUTCOME STATISTICS (issue #116)
+// ============================================
+
 /**
- * Weekly: Clean up old news articles and scrape runs
- * Runs every Sunday at 4 AM UTC
+ * Quarterly import of published decision statistics (one run per registered
+ * destination). Governments publish quarterly (the UK Home Office in the
+ * second half of Feb / May / Aug / Nov), so this ticks every MONDAY at 05:00
+ * UTC but only in those four months: an unchanged release is detected by one
+ * cheap page fetch and skipped (same file address / same file hash), so the
+ * weekly tick inside a release month is how a late publication is still
+ * caught. Heavy: the release file is streamed from disk, never held, but the
+ * function gets 2 GB and the full 9 minutes. No secrets needed (public data).
+ * Kill switch: appConfig/outcomeStatistics.scheduledImportEnabled.
  */
-export const cleanupOldNews = functions.pubsub
-  .schedule("0 4 * * 0")
+export const importOutcomeStatistics = functions
+  .runWith({ memory: "2GB", timeoutSeconds: 540 })
+  .pubsub.schedule("0 5 * 2,5,8,11 1")
   .timeZone("UTC")
   .onRun(async () => {
-    console.log("Running news cleanup...");
-    try {
-      const articlesDeleted = await newsService.cleanupOldArticles(90);
-      const runsDeleted = await newsService.cleanupOldScrapeRuns(30);
-      console.log(
-        `News cleanup: ${articlesDeleted} articles, ${runsDeleted} scrape runs deleted`
-      );
-    } catch (error) {
-      console.error("News cleanup failed:", error);
+    for (const destination of registeredDestinations()) {
+      try {
+        const outcome = await outcomeImportService.run(destination, "scheduled");
+        console.log(
+          `Outcome statistics import (${destination}): ` +
+            (outcome ? `${outcome.result}${outcome.error ? ` (${outcome.error})` : ""}` : "disabled by settings")
+        );
+      } catch (error) {
+        console.error(`Outcome statistics import (${destination}) failed:`, error);
+      }
     }
+  });
+
+/**
+ * Manual "Run now" for outcome statistics: the admin API
+ * (POST /admin/outcome-statistics/runs) writes an `outcomeStatisticsRunRequests`
+ * doc and returns 202; this trigger runs the import with the same 2 GB budget
+ * as the scheduled one. The worker never throws; the outcome is written on
+ * the request doc and as an `outcomeStatisticsRuns` record. Region pinned like
+ * processScrapeRunRequest.
+ */
+export const processOutcomeStatisticsRunRequest = functions
+  .region("us-central1")
+  .runWith({ memory: "2GB", timeoutSeconds: 540 })
+  .firestore.document("outcomeStatisticsRunRequests/{requestId}")
+  .onCreate(async (_snapshot, context) => {
+    await outcomeRunWorker.process(context.params.requestId);
   });
 
 /**
@@ -606,4 +725,227 @@ export const onNewsArticleCreated = functions.firestore
     } catch (error) {
       console.error("Error notifying subscribers:", error);
     }
+  });
+
+// ============================================
+// AI CASE-OFFICER WORKER (issue #42)
+// ============================================
+//
+// Runs an assessment job. It returns at once unless the write moved the document
+// INTO `queued` (created queued, or failed -> queued). runJob then claims the
+// document `queued -> running` in a transaction, so a duplicate delivery of the
+// same event never runs twice. Function-level retry stays off: a failed job is
+// retried by a new request, which moves the same document back to queued.
+//
+// Binds AI_SECRETS: this is the function that calls the model. Timeout and
+// memory follow the crawler's pattern (540 s, the Gen-1 maximum). The memory is
+// for holding one attached document at a time.
+export const processAssessmentJob = functions
+  .runWith({ secrets: [...AI_SECRETS], timeoutSeconds: 540, memory: "1GB" })
+  .firestore.document("applicationAssessments/{assessmentId}")
+  .onWrite(async (change, context) => {
+    if (!change.after.exists) return;
+    const after = change.after.data() ?? {};
+    const before = change.before.exists ? change.before.data() ?? {} : {};
+    if (after.status !== "queued" || before.status === "queued") return;
+    // Bulk re-assessment jobs (#37) belong to the Batch API sweep, never to this worker.
+    if (after.viaBatch === true) return;
+    const result = await aiCaseOfficerService.runJob(context.params.assessmentId);
+    // Issue #117: after a successful AUTO-run, tell the assigned agent once if the
+    // findings changed. No-op for manual runs, failures, and an identical finding set.
+    if (result === "succeeded") await assessmentAutoRunService.notifyIfNew(context.params.assessmentId);
+  });
+
+// ============================================
+// AGENT PRE-REVIEW AUTO-RUN (issue #117)
+// ============================================
+//
+// Neither function below calls the model, so neither binds AI_SECRETS. They only
+// write the `queued` assessment document; the worker above (which holds the
+// secret) does the work, and it only ever sees entitled, gated applications.
+
+/**
+ * A document was added to, or replaced on, an application: record (or push out)
+ * the debounce marker. Fires for creates and for a changed `storageUrl` only.
+ */
+export const recordAssessmentDebounce = functions
+  .firestore.document("documents/{documentId}")
+  .onWrite(async (change) => {
+    if (!change.after.exists) return; // a delete never starts a run
+    const after = change.after.data() ?? {};
+    const before = change.before.exists ? change.before.data() ?? {} : null;
+    if (before && before.storageUrl === after.storageUrl) return; // not a new or replaced file
+    await assessmentAutoRunService.recordDocumentChange(after.applicationId);
+  });
+
+/**
+ * Every 5 minutes: start ONE assessment per application whose quiet period has
+ * passed (entitled, agent-assigned, open cases only), and re-queue a transient
+ * auto-run failure once.
+ */
+export const sweepAssessmentDebounce = functions
+  .runWith({ timeoutSeconds: 300, memory: "256MB" })
+  .pubsub.schedule("*/5 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const r = await assessmentAutoRunService.sweep();
+    console.log(`Assessment auto-run sweep: ${r.due} due, ${r.requested} requested, ${r.skipped} skipped, ${r.retried} retried`);
+  });
+
+// ============================================
+// BULK RE-ASSESSMENT AFTER A RUBRIC APPROVAL (issue #37)
+// ============================================
+
+/**
+ * Fires on the durable audit document #125 writes in the SAME transaction as a
+ * rubric approval (`rubricReviewHistory`, action "approve"), and enqueues the
+ * bulk re-assessment of the route's open applications. Triggering from the
+ * document, not from an in-memory listener, means a crash or a cold start after
+ * the approval commits cannot lose the event; a re-delivered event is harmless
+ * (the run id is the audit id). No model call happens here: it only writes jobs.
+ * Memory and timeout follow the crawler pattern (512 MB, 540 s); the enqueue
+ * scan is resumable, so a very large route is finished by the sweep below.
+ */
+export const onRubricApproved = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 540 })
+  .firestore.document("rubricReviewHistory/{auditId}")
+  .onCreate(async (snap, context) => {
+    try {
+      const outcome = await bulkReassessmentService.startRun(context.params.auditId, snap.data() as RubricReviewAuditEntry);
+      console.log(`[bulk-reassess] approval ${context.params.auditId}: ${outcome}`);
+    } catch (error) {
+      // Logged, not rethrown: function retry is off, and the sweep resumes any
+      // run whose document was created before the failure.
+      console.error("Bulk re-assessment enqueue failed:", error);
+    }
+  });
+
+/**
+ * Issue #123: record a rule-change event when an admin approves a rubric
+ * version. Fires on the SAME durable audit document as `onRubricApproved`
+ * (separate function, so neither can hold up or break the other). It only ever
+ * sees an approval: a raw crawl diff or an unapproved extraction writes no
+ * audit document. Makes no model call. The event id is derived from the route
+ * and version, so a re-delivered trigger records nothing twice. The alerts
+ * themselves go out from `processRuleChangeAlerts` below.
+ */
+export const onRubricApprovedRecordAlert = functions
+  .runWith({ memory: "256MB", timeoutSeconds: 120 })
+  .firestore.document("rubricReviewHistory/{auditId}")
+  .onCreate(async (snap, context) => {
+    try {
+      const outcome = await ruleChangeAlertsService.recordRubricApproval(context.params.auditId, snap.data() as RubricReviewAuditEntry);
+      console.log(`[rule-change] approval ${context.params.auditId}: ${outcome}`);
+    } catch (error) {
+      // Logged, not rethrown: function retry is off.
+      console.error("Recording the rule-change event failed:", error);
+    }
+  });
+
+/**
+ * Issue #123: when a guidance source's snapshot hash changes (the crawl moved
+ * `latestSnapshotId`, which IS the content hash), re-extract every route that
+ * uses the source. #40's own hash gate means an unchanged source set costs
+ * nothing; the result is only ever STAGED `pending_review` (never approved),
+ * and its spend caps apply: a capped run is skipped and leaves the previous
+ * approved rubric serving. Nobody is alerted here: an alert needs an admin's
+ * approval of the staged version. Binds AI_SECRETS (the extraction reads it).
+ */
+export const onGuidanceSourceChanged = functions
+  .runWith({ memory: "1GB", timeoutSeconds: 540, secrets: [...AI_SECRETS] })
+  .firestore.document("guidanceSources/{sourceId}")
+  .onUpdate(async (change, context) => {
+    const before = (change.before.data() as { latestSnapshotId?: string | null }).latestSnapshotId ?? null;
+    const after = (change.after.data() as { latestSnapshotId?: string | null }).latestSnapshotId ?? null;
+    // Only a moved hash is a change; every other source write (fetch stamps,
+    // health, pauses) leaves it alone.
+    if (!after || after === before) return;
+    try {
+      const results = await rubricExtractionService.onGuidanceChanged({ sourceId: context.params.sourceId });
+      console.log(`[rule-change] source ${context.params.sourceId} changed: ${results.map((r) => r.status).join(",") || "no route uses it"}`);
+    } catch (error) {
+      console.error("Re-extraction after a guidance change failed:", error);
+    }
+  });
+
+/**
+ * Issue #123: every 15 minutes, send the alerts of recorded rule-change events
+ * (admin-approved rubric versions and visa-record edits): a notification per
+ * affected in-flight application to the case's agent / owner, and the neutral,
+ * factual notices an applicant may be sent. Idempotent per event and
+ * application. Binds EMAIL_SECRETS (the notifications email). No model call.
+ */
+export const processRuleChangeAlerts = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 540, secrets: [...EMAIL_SECRETS] })
+  .pubsub.schedule("*/15 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    try {
+      const result = await ruleChangeAlertsService.runSweep();
+      if (result.eventsSeen > 0) console.log(`Rule-change alert sweep: ${JSON.stringify(result)}`);
+    } catch (error) {
+      console.error("Rule-change alert sweep failed:", error);
+    }
+  });
+
+/**
+ * Every 15 minutes: advance bulk re-assessments. Polls the provider's batches
+ * and writes their results, plans waiting jobs into new batches (within the
+ * daily cap; the remainder waits for the next day), and closes finished runs.
+ * Binds AI_SECRETS (it submits and reads batches) and EMAIL_SECRETS (a worse
+ * result notifies the reviewing agent). Memory and timeout follow
+ * `crawlVisaCatalogOrchestrator`; the sweep keeps its own time budget under 540 s.
+ */
+export const processBulkReassessments = functions
+  .runWith({ memory: "1GB", timeoutSeconds: 540, secrets: [...AI_SECRETS, ...EMAIL_SECRETS] })
+  .pubsub.schedule("*/15 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    try {
+      const result = await bulkReassessmentService.runSweep();
+      if (result.skipped) console.log(`Bulk re-assessment sweep skipped: ${result.skipped}`);
+    } catch (error) {
+      console.error("Bulk re-assessment sweep failed:", error);
+    }
+  });
+
+// ============================================
+// PER-UPLOAD DOCUMENT CHECK WORKER (issue #115)
+// ============================================
+//
+// Runs a document check job. POST /documents only WRITES the queued record (and
+// only for a paid applicant), so the upload response never waits on this. The
+// worker returns at once unless the write moved the record INTO `queued`
+// (created queued, or a retry), then claims `queued -> running` in a
+// transaction so a duplicate delivery never runs twice. Function-level retry
+// stays off: a retry is a new request. Binds AI_SECRETS because it calls the
+// model. 120 s covers the job's own 90 s limit, after which the job stores
+// `could_not_check` instead of being killed mid-write.
+export const processDocumentCheck = functions
+  .runWith({ secrets: [...AI_SECRETS], timeoutSeconds: 120, memory: "512MB" })
+  .firestore.document("documentChecks/{documentId}")
+  .onWrite(async (change, context) => {
+    if (!change.after.exists) return;
+    const after = change.after.data() ?? {};
+    const before = change.before.exists ? change.before.data() ?? {} : {};
+    if (after.status !== "queued" || before.status === "queued") return;
+    await documentCheckService.runJob(context.params.documentId);
+  });
+
+// ============================================
+// REFUSAL-LETTER WORKER (issue #122)
+// ============================================
+//
+// Same shape as processAssessmentJob: returns at once unless the write moved the
+// document INTO `queued`; runJob claims `queued -> running` in a transaction so a
+// duplicate delivery never runs twice. Binds AI_SECRETS (it calls the model).
+export const processRefusalAnalysisJob = functions
+  .runWith({ secrets: [...AI_SECRETS], timeoutSeconds: 300, memory: "1GB" })
+  .firestore.document("refusalAnalyses/{analysisId}")
+  .onWrite(async (change, context) => {
+    if (!change.after.exists) return;
+    const after = change.after.data() ?? {};
+    const before = change.before.exists ? change.before.data() ?? {} : {};
+    if (after.status !== "queued" || before.status === "queued") return;
+    await refusalLetterService.runJob(context.params.analysisId);
   });

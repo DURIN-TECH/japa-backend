@@ -8,6 +8,11 @@ import {
 import { storageService } from "./storage.service";
 import { noteService } from "./note.service";
 import { userService } from "./user.service";
+import {
+  requireRequestedPath,
+  requireStoredPath,
+  validateStoragePath,
+} from "../utils/storage-paths";
 
 const db = getFirestore();
 
@@ -155,8 +160,23 @@ export class DocumentService {
     const applicationRef = db.collection("applications").doc(applicationId);
     const { ownerUserId } = await this.resolveUploadTarget(applicationId, actor);
 
+    // The path comes from the request, so it is validated like any other
+    // input (issue #141): it must be exactly an object the upload-url endpoint
+    // would have issued for THIS application — i.e. inside the client's own
+    // folder for this application (`documents/{clientUid}/{applicationId}/`).
+    // `ownerUserId` is read from the application document above, and the
+    // caller has already been authorised for that application, so the same
+    // rule covers self-uploads and uploads by staff on the client's behalf.
+    // Throws StoragePathRejectedError (→ 400) BEFORE anything is looked up in
+    // the bucket or written, for every role including admin.
+    const validatedPath = requireRequestedPath(storagePath, {
+      purpose: "application-document",
+      ownerUserId,
+      applicationId,
+    });
+
     // Verify the file exists in storage
-    const fileExists = await storageService.fileExists(storagePath);
+    const fileExists = await storageService.fileExists(validatedPath);
     if (!fileExists) {
       throw new Error("File not found in storage");
     }
@@ -180,7 +200,9 @@ export class DocumentService {
       fileName,
       fileType,
       fileSizeMb,
-      storageUrl: storagePath,
+      // Despite the field name this is the bucket-relative object path, and
+      // only ever a validated one.
+      storageUrl: validatedPath,
       status: "uploaded",
       resubmissionCount: 0,
       uploadedAt: now,
@@ -396,11 +418,32 @@ export class DocumentService {
       throw new Error("Cannot delete document in current status");
     }
 
-    // Delete from storage
-    await storageService.deleteFile(document.storageUrl);
+    // Delete from storage — but only an object that really is this
+    // document's upload (issue #141). The stored path is re-validated against
+    // the record's owner and application; if it does not pass (a record
+    // written before paths were validated, or a seeded placeholder), the
+    // record is still removed so the user can clear it, and the object it
+    // pointed at is left untouched.
+    const stored = validateStoragePath(document.storageUrl, {
+      purpose: "application-document",
+      ownerUserId: document.userId,
+      applicationId: document.applicationId,
+    });
+    if (stored.ok) {
+      await storageService.deleteFile(stored.key);
+    } else {
+      console.warn(
+        `[document] ${documentId}: stored path failed validation (${stored.issue}); ` +
+          "deleting the record only, not the object"
+      );
+    }
 
     // Delete the document record
     await docRef.delete();
+
+    // Its per-upload check (issue #115) holds values read from the file: it goes
+    // with the document. Best effort: a missing check is not an error.
+    await db.collection("documentChecks").doc(documentId).delete().catch((e) => console.error("[document] deleting its check failed:", e));
 
     // Update application document counts
     const applicationRef = db.collection("applications").doc(document.applicationId);
@@ -451,7 +494,19 @@ export class DocumentService {
       throw new Error("Unauthorized");
     }
 
-    return storageService.getSignedDownloadUrl(document.storageUrl);
+    // Re-validate the STORED path at read time (issue #141). Access to the
+    // record was decided above; this decides whether the record points at an
+    // object that belongs to it: inside the document owner's folder for this
+    // application. A record that fails (written before registration validated
+    // paths, or a seeded placeholder) is never signed, for any caller —
+    // throws StoredPathInvalidError (→ 409).
+    const validatedPath = requireStoredPath(document.storageUrl, {
+      purpose: "application-document",
+      ownerUserId: document.userId,
+      applicationId: document.applicationId,
+    });
+
+    return storageService.getSignedDownloadUrl(validatedPath);
   }
 }
 

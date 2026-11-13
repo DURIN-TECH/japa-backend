@@ -17,8 +17,8 @@ Code: `src/scrapers/shared/alerts/scrape-alert-rules.ts` (pure rule logic),
 
 | Trigger | Where | Rules |
 | --- | --- | --- |
-| After every run (scheduled / manual) | #81 finalize hook, registered in `index.ts` (`scrapeAlertService.onRunFinalized`) | `run_failed`, `run_stuck` (clears the run's own), `error_rate`, `linked_surcharge`, `budget_hard_stop` (#96), `host_backoff`, `source_broken` (that scraper) |
-| Hourly, :45 UTC | `checkScrapeAlerts` scheduled function (`runHourlyCheck`; 300s timeout, 256MB) | `run_stuck`, `run_failed` (latest finished run per scraper), `missed_window`, `source_broken`, `host_backoff` clears (below), `fx_refresh_failing`, `llm_budget`, `budget_hard_stop` clears (#96), `settings_unreadable` (#96), `review_queue_stale`; then emails held back by a late hook (`emailPending`) and the daily digest |
+| After every run (scheduled / manual) | #81 finalize hook, registered in `index.ts` (`scrapeAlertService.onRunFinalized`) | `run_failed`, `run_stuck` (clears the run's own), `error_rate`, `linked_surcharge`, `budget_hard_stop` (#96), `host_backoff`, `source_broken` (that scraper), `source_no_yield` (news runs) |
+| Hourly, :45 UTC | `checkScrapeAlerts` scheduled function (`runHourlyCheck`; 300s timeout, 256MB) | `run_stuck`, `run_failed` (latest finished run per scraper), `missed_window`, `source_broken`, `source_no_yield`, `host_backoff` clears (below), `fx_refresh_failing`, `llm_budget`, `budget_hard_stop` clears (#96), `settings_unreadable` (#96), `review_queue_stale`; then emails held back by a late hook (`emailPending`) and the daily digest |
 
 Script runs (`trigger: "script"`, the CLI) never alert. Stale sweeps (#81) fire
 no hook, so the hourly check reads the latest finished run of each scraper
@@ -41,6 +41,7 @@ still catches `run_failed`, the other per-run rules are lost for that run.
 | `run_stuck` | `run_stuck:<runId>` | `running` for more than `stuckRunMinutes` | the run is no longer running | critical |
 | `missed_window` | `missed_window:<cc>` | an `active` visa source with a `crawlWindow` (#63): its last window closed (+ `missedWindowGraceHours`) and `lastCrawledAt` is before that window opened. Sources created after the opening are skipped | it is crawled | warning |
 | `source_broken` | `source_broken:<kind>:<id>` | status `broken`: auto-paused by the crawler at `<kind>.consecutiveFailureLimit` consecutive failures (default 5, #107). `details`: `sourceId`, `consecutiveFailures`, `lastError` (the `autoPausedReason`). A `paused` source never alerts (admin / registry pause, or the crawler's missing-API-key pause; before #107 a `paused` source with >= 5 failures did) | the source is no longer `broken` (`resetFailures`, a successful manual run, or an admin status change) | critical |
+| `source_no_yield` (#17) | `source_no_yield:news:<id>` | an `active` news source with `zeroYieldRuns >= thresholds.zeroYieldRuns` (default 3): that many consecutive SUCCESSFUL runs found zero articles (`articlesFound`, never `articlesNew`: a quiet week of duplicates does not count). `details`: `sourceId`, `zeroYieldRuns`, `zeroYieldSince`, `threshold`. Never pauses the source | a run finds an article (streak resets), or the source is paused / broken / retired | warning |
 | `error_rate` | `error_rate:<kind>` | `errorCount / pagesAttempted` above `errorRatePct`, runs with >= `errorRateMinPages` pages | such a run is under the threshold | warning |
 | `host_backoff` | `host_backoff:<kind>:<host>` | a host answered 429/503 (#64) on `backoffConsecutiveRuns` consecutive runs **that touched it** (runs for other countries do not break the streak) | a run touches the host without a backoff | warning |
 | `linked_surcharge` | `linked_surcharge:visa` | `summary.linkedSurchargeErrors >= linkedSurchargeErrors` (#69) | a visa run below it | warning |
@@ -48,6 +49,7 @@ still catches `run_failed`, the other per-run rules are lost for that run.
 | `llm_budget` | `llm_budget:<YYYY-MM>` | month-to-date LLM cost >= a `budgetPcts` level; `level` = highest reached | new month / under every level | 50% info, 80% warning, 100% critical |
 | `budget_hard_stop` (#96) | `budget_hard_stop:visa` | a visa run's `summary.budgetHardStop` is true: the hard stop (`appConfig/scraperSettings.budget.hardStop`) skipped extraction because month-to-date cost reached the budget | a visa run that checked the budget and found it under (`budgetChecked && !budgetOver`), or the hourly check: stop off / no budget / spend under budget | critical |
 | `settings_unreadable` (#96) | `settings_unreadable:scrapers` | hourly: `appConfig/scraperSettings` could not be read (scheduled ticks fail closed meanwhile) | a later read succeeds | critical |
+| `infrastructure_error` (#143) | `infrastructure_error:guidance` | post-run, guidance runs: `summary.infrastructureErrors` non-empty (Cloud Storage / Firestore failed on our side; never blames a source). A persistent outage bumps this one alert | the next guidance run with an empty `infrastructureErrors` | critical |
 | `review_queue_stale` | `review_queue_stale:visa` | a scraped visa pending review (queued at max(createdAt, restoredAt)) or an open `pendingVisaChanges` row waiting longer than `reviewQueueMaxAgeDays` | nothing is that old | info |
 
 How `host_backoff` sees hosts: visa page lines (`pages[]`, every line's host is
@@ -144,7 +146,7 @@ validated on its own; an invalid one falls back to its default and is logged.
   "thresholds": {
     "stuckRunMinutes": 60, "errorRatePct": 20, "errorRateMinPages": 5,
     "backoffConsecutiveRuns": 2, "linkedSurchargeErrors": 1, "fxFailingHours": 48,
-    "budgetPcts": [50, 80, 100], "reviewQueueMaxAgeDays": 7, "missedWindowGraceHours": 2
+    "budgetPcts": [50, 80, 100], "reviewQueueMaxAgeDays": 7, "missedWindowGraceHours": 2, "zeroYieldRuns": 3
   },
   "rules": { "review_queue_stale": { "enabled": false }, "error_rate": { "severity": "critical" } }
 }
@@ -238,3 +240,11 @@ like the #81 one. The rules also use existing indexes: `scrapeRuns`
 `scrapeAlertKeys` needs no index or TTL (one doc per active alert or manual
 resolve tombstone; deleted on auto-resolve, replaced by the next occurrence).
 `emailPending == true` uses the automatic single-field index. Both collections are backend-only (no `firestore.rules` match).
+
+## Guidance crawl (issue #143)
+
+`kind: "guidance"` runs (`crawlGuidanceOrchestrator`, nightly 03:20 UTC) use the
+same rules as visa and news: `run_failed`, `run_stuck`, `host_backoff`, and
+`source_broken`, where a guidance source's `failing` status counts as `broken`
+(`source_broken:guidance:<sourceId>`, auto-resolved when the source is `active`
+again). `infrastructure_error` is guidance-only.

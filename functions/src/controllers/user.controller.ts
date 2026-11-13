@@ -4,9 +4,10 @@ import { userService } from "../services/user.service";
 import { storageService } from "../services/storage.service";
 import { claimsService } from "../services/claims.service";
 import { notificationService } from "../services/notification.service";
-import { emailService } from "../services/email/email.service";
+import { emailService, LOCAL_SUPPRESSED_REASON } from "../services/email/email.service";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { auth } from "../utils/firebase";
+import { validateStoragePath } from "../utils/storage-paths";
 import { Role, ROLES, packAbility } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -257,13 +258,16 @@ export class UserController {
 
       // Guard against registering a path that isn't theirs — the path must live
       // under this user's own profile prefix.
-      if (!storagePath.startsWith(`users/${userId}/profile/`)) {
+      // Shared validator (issue #141): an issued object directly under
+      // `users/{userId}/profile/`, a plain bucket-relative key and nothing else.
+      const checked = validateStoragePath(storagePath, { purpose: "profile-photo", userId });
+      if (!checked.ok) {
         sendError(res, "VALIDATION_ERROR", "storagePath does not belong to this user", 400);
         return;
       }
 
       // Confirm the client actually completed the upload.
-      const exists = await storageService.fileExists(storagePath);
+      const exists = await storageService.fileExists(checked.key);
       if (!exists) {
         sendError(res, "VALIDATION_ERROR", "File not found at the specified path", 400);
         return;
@@ -272,7 +276,7 @@ export class UserController {
       // Make the object public and capture its stable URL for persistent rendering
       // (avatars appear in the header/sidebar on every page, so a short-lived
       // signed download URL would expire — mirrors the agency-logo flow).
-      const profilePhotoUrl = await storageService.makeFilePublic(storagePath);
+      const profilePhotoUrl = await storageService.makeFilePublic(checked.key);
 
       const updatedUser = await userService.updateUser(userId, { profilePhotoUrl });
 
@@ -517,7 +521,18 @@ export class UserController {
         // isn't attached to any account yet, so an address lookup would miss.
         brandFor: { userId },
       });
-      if (confirmResult.status !== "sent") {
+      if (
+        confirmResult.status === "skipped" &&
+        confirmResult.error === LOCAL_SUPPRESSED_REASON
+      ) {
+        // Deliberate local suppression (EMAIL_SENDING_ENABLED off under the emulator):
+        // expected, not a failure — log at info level only.
+        console.info(
+          `[user:change-email] confirmation email to ${newEmail} not sent — local ` +
+            "email sending is off (set EMAIL_SENDING_ENABLED=true in functions/.env.local to enable)."
+        );
+      } else if (confirmResult.status !== "sent") {
+        // Real failure or genuinely unconfigured provider: keep error-level logging.
         console.error(
           `[user:change-email] confirmation email to ${newEmail} was not sent ` +
             `(status=${confirmResult.status}${confirmResult.error ? `: ${confirmResult.error}` : ""}).`

@@ -10,7 +10,15 @@ export type SourceStatus = "active" | "paused" | "broken" | "retired";
 
 export type ArticleImportance = "breaking" | "high" | "normal" | "low";
 
-export type SupportedCountryCode = "CA" | "AU" | "IE" | "GB";
+/**
+ * The ONE list of country codes news sources and articles may carry (issue
+ * #17). `SupportedCountryCode` is derived from it, and the news-source config
+ * validation checks edits against it, so widening the list (issue #26) is a
+ * one-line change here.
+ */
+export const SUPPORTED_COUNTRY_CODES = ["CA", "AU", "IE", "GB"] as const;
+
+export type SupportedCountryCode = (typeof SUPPORTED_COUNTRY_CODES)[number];
 
 export type ScrapeRunStatus = "running" | "success" | "partial" | "failed";
 
@@ -95,6 +103,15 @@ export interface NewsSource {
   lastErrorMessage?: string;
   lastErrorAt?: Timestamp;
 
+  // Issue #17: zero-yield streak. `zeroYieldRuns` counts consecutive
+  // SUCCESSFUL runs whose `articlesFound` was 0 (reset by a run that found
+  // any article; a failed run leaves it alone). `zeroYieldSince` is when the
+  // streak began (cleared on reset). Both are maintained by
+  // news-source-health.ts and feed the `source_no_yield` alert. Optional:
+  // docs written before #17 lack them (= 0 / none).
+  zeroYieldRuns?: number;
+  zeroYieldSince?: Timestamp | null;
+
   // Issue #107: set by the CRAWLER when it pauses the source itself
   // (scrapers/shared/runs/source-health.ts): `broken` after
   // `news.consecutiveFailureLimit` consecutive failures (cause
@@ -161,6 +178,12 @@ export interface NewsArticle {
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
+
+  // Retention (issue #19): max(publishedAt, createdAt) + 90 days. Firestore
+  // TTL deletes the doc after this; policy = the `newsArticles` / `expireAt`
+  // entry in `fieldOverrides` of firestore.indexes.json. Docs written before
+  // #19 get it from `npm run backfill:expireat`.
+  expireAt: Timestamp;
 }
 
 // ============================================
@@ -195,6 +218,11 @@ export interface ScrapeRun {
   // Debug
   httpStatusCode?: number;
   responseTimeMs?: number;
+
+  // Retention (issue #19): startedAt + 30 days. Covered by the `scrapeRuns`
+  // `expireAt` TTL entry in `fieldOverrides` of firestore.indexes.json (its
+  // collection-group scope also matches newsSources/{id}/scrapeRuns).
+  expireAt: Timestamp;
 }
 
 // ============================================

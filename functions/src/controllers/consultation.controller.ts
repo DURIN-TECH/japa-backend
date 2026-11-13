@@ -197,6 +197,10 @@ export class ConsultationController {
    *
    * The controller detects which flow by checking if the auth'd user has an agent profile.
    * If not, the auth'd user is treated as the client and `agentId` from the body is used.
+   *
+   * UNITS (#148): `fee` in the body is WHOLE NAIRA and is stored as supplied (no
+   * scaling), same unit as the guest flow below. Paystack kobo conversion only
+   * happens where a charge is initialised.
    */
   async createConsultation(
     req: AuthenticatedRequest,
@@ -243,7 +247,13 @@ export class ConsultationController {
         }
         resolvedClientId = bodyClientId;
         resolvedAgentUserId = authUserId;
-        agentAgencyId = agentProfile.agencyId;
+        // The agency comes from the RESOLVED PRINCIPAL (issue #138), not from
+        // the caller's own agent document: the principal is the membership
+        // that was checked against the agency's records, and it is the same
+        // value the monthly-limit scope below uses. An agent document that
+        // names an agency the principal does not belong to must not file a
+        // consultation under that agency.
+        agentAgencyId = req.authz?.agencyId ?? undefined;
         agentDisplayName = agentProfile.displayName;
       } else {
         // Client-initiated flow: auth'd user is the client, body has agentId
@@ -823,7 +833,9 @@ export class ConsultationController {
           consultationId,
           clientUserId: consultation.userId,
           agentUserId: consultation.agentId,
-          amount: consultation.fee,
+          // `consultation.fee` is whole NAIRA; `Transaction.amount` is KOBO like every
+          // other transaction, so convert here (50,000 naira -> 5,000,000 kobo).
+          amount: consultation.fee * 100,
           reference,
           clientName: consultation.clientName,
           clientEmail: consultation.clientEmail,

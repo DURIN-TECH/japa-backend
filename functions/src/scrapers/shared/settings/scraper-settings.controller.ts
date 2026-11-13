@@ -3,7 +3,7 @@ import { AuthenticatedRequest } from "../../../middleware/auth";
 import { asSubject, can, forbidden } from "../../../middleware/authz";
 import { sendError, sendSuccess, ErrorMessages } from "../../../utils/response";
 import { scrapeRunService } from "../runs/scrape-run.service";
-import { SCRAPE_RUN_KINDS, type ScrapeRunKind } from "../runs/types";
+import { SCRAPER_SETTINGS_KINDS, type ScraperSettingsKind } from "../runs/types";
 import { isValidDocId } from "../../visa-catalog/changes/visa-catalog-changes.service";
 import {
   InvalidHistoryCursorError,
@@ -74,10 +74,10 @@ class ScraperSettingsController {
    * `:kind` + `:id` of a per-source route. Sends 400 / 404 and returns null
    * when invalid (an id that cannot exist is a 404, like an unknown one).
    */
-  private sourceParams(req: AuthenticatedRequest, res: Response): { kind: ScrapeRunKind; id: string } | null {
+  private sourceParams(req: AuthenticatedRequest, res: Response): { kind: ScraperSettingsKind; id: string } | null {
     const { kind, id } = req.params as { kind?: string; id?: string };
-    if (!SCRAPE_RUN_KINDS.includes(kind as ScrapeRunKind)) {
-      validationError(res, "kind", `kind must be one of: ${SCRAPE_RUN_KINDS.join(", ")}`);
+    if (!SCRAPER_SETTINGS_KINDS.includes(kind as ScraperSettingsKind)) {
+      validationError(res, "kind", `kind must be one of: ${SCRAPER_SETTINGS_KINDS.join(", ")}`);
       return null;
     }
     const ok = kind === "visa" ? VISA_SOURCE_ID_RE.test(id ?? "") : isValidDocId(id);
@@ -85,7 +85,7 @@ class ScraperSettingsController {
       sendError(res, "NOT_FOUND", `${kind} source not found`, 404);
       return null;
     }
-    return { kind: kind as ScrapeRunKind, id: id as string };
+    return { kind: kind as ScraperSettingsKind, id: id as string };
   }
 
   /** `{ force?: boolean }` of a Run now body; null after sending 400. */
@@ -213,19 +213,19 @@ class ScraperSettingsController {
   async runScraper(req: AuthenticatedRequest, res: Response): Promise<void> {
     if (!this.allowed(req, res, "update")) return;
     const kind = (req.params as { kind?: string }).kind;
-    if (!SCRAPE_RUN_KINDS.includes(kind as ScrapeRunKind)) {
-      validationError(res, "kind", `kind must be one of: ${SCRAPE_RUN_KINDS.join(", ")}`);
+    if (!SCRAPER_SETTINGS_KINDS.includes(kind as ScraperSettingsKind)) {
+      validationError(res, "kind", `kind must be one of: ${SCRAPER_SETTINGS_KINDS.join(", ")}`);
       return;
     }
     const body = this.runBody(req, res);
     if (!body) return;
-    await this.createRequest(res, { kind: kind as ScrapeRunKind, sourceId: null, force: body.force, uid: this.uid(req) });
+    await this.createRequest(res, { kind: kind as ScraperSettingsKind, sourceId: null, force: body.force, uid: this.uid(req) });
   }
 
   /** Shared tail of both Run now routes: create the request, map refusals. */
   private async createRequest(
     res: Response,
-    input: { kind: ScrapeRunKind; sourceId: string | null; force: boolean; uid: string }
+    input: { kind: ScraperSettingsKind; sourceId: string | null; force: boolean; uid: string }
   ): Promise<void> {
     try {
       sendSuccess(res, await scrapeRunRequestService.create(input), undefined, 202);

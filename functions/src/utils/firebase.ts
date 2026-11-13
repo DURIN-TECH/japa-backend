@@ -72,6 +72,19 @@ export const collections = {
   agencies: db.collection("agencies"),
   countries: db.collection("countries"),
   applications: db.collection("applications"),
+  // CANONICAL home of uploaded application documents (issue #28): the
+  // TOP-LEVEL `documents` collection, one doc per uploaded file, linked to its
+  // application by the `applicationId` field (and to the client by `userId`).
+  // This is the path services/document.service.ts reads and writes, the seeder
+  // (data/seed-portal-data.ts) writes, and the per-application document limit
+  // counts. There is deliberately NO `applications/{id}/documents`
+  // subcollection and no `subcollections.documents()` helper: that second path
+  // was the "split-brain" (seeded there, read here, so nothing seeded was ever
+  // visible). Do not reintroduce it. Composite indexes for this collection
+  // (applicationId + uploadedAt, applicationId + requirementId + uploadedAt)
+  // live in firestore.indexes.json. Backend-only: no firestore.rules match ->
+  // clients are denied and go through the API, which authorizes via CASL.
+  documents: db.collection("documents"),
   transactions: db.collection("transactions"),
   consultations: db.collection("consultations"),
   notifications: db.collection("notifications"),
@@ -113,6 +126,38 @@ export const collections = {
   //   reviewStatus="pending_review" / source="scraped" and reviewed via the
   //   existing admin visa-review flow (no separate queue).
   visaSources: db.collection("visaSources"),
+  // Caseworker-guidance source registry (issue #39), kept SEPARATE from
+  // visaSources on purpose:
+  // - visaSources describes WHAT A VISA IS (the public pages the catalog
+  //   crawler turns into visa types, fees and requirements);
+  // - guidanceSources describes HOW OFFICERS DECIDE (the published rules and
+  //   caseworker guidance a rubric is extracted from).
+  // One doc per document (web page or PDF), keyed by a generic
+  // jurisdiction + route. Written by the seed
+  // (scrapers/guidance/data/seed-guidance-sources.ts) and the guidance crawl
+  // (scrapers/guidance/guidance-crawl.service.ts); read by admins through
+  // GET /admin/guidance-sources. Immutable text snapshots hang off each
+  // source (see `subcollections.guidanceSnapshots`).
+  // Backend-only: no firestore.rules match -> clients denied.
+  guidanceSources: db.collection("guidanceSources"),
+  // Published outcome statistics (issue #116): decision counts per destination,
+  // published category and nationality, imported from a government's own
+  // statistics release (src/scrapers/outcome-statistics). One doc per
+  // (release, category, nationality) plus an "ALL" nationality doc per category.
+  // Read only by the assessment's country-context lookup
+  // (services/outcome-statistics); never exposed as a list endpoint.
+  // Backend-only: no firestore.rules match -> clients denied.
+  outcomeStatistics: db.collection("outcomeStatistics"),
+  // Which release is current per destination: `outcomeStatisticsReleases/{destination}`.
+  // Flipped last by the import, so a failed import changes nothing. Backend-only.
+  outcomeStatisticsReleases: db.collection("outcomeStatisticsReleases"),
+  // One record per import attempt (release date, file, hash, period, counts,
+  // unmapped names, result), listed by GET /admin/outcome-statistics/runs.
+  // Backend-only.
+  outcomeStatisticsRuns: db.collection("outcomeStatisticsRuns"),
+  // Admin "Run now" requests; a Firestore trigger runs the import in a
+  // higher-memory function than the API. Backend-only.
+  outcomeStatisticsRunRequests: db.collection("outcomeStatisticsRunRequests"),
   // Backend-only app configuration documents. Today: `appConfig/fx`, the
   // USD exchange rates (Frankfurter / ECB) the visa scraper converts
   // published fees with (issue #59). No firestore.rules match → clients denied.
@@ -168,6 +213,94 @@ export const collections = {
   // src/agency-visas, reviewed by the admin (#101). Backend-only: no
   // firestore.rules match -> clients denied.
   visaRevisions: db.collection("visaRevisions"),
+  // Visa rubrics (issue #40): `visaRubrics/{countryCode}_{visaTypeId}` is the
+  // HEAD of one route's rubric (which version is approved, which is newest,
+  // which guidance sources it is extracted from). The rubric itself is in the
+  // `rubricVersions` subcollection (see subcollections.rubricVersions), so an
+  // approved version and a newer pending one can exist together. Written by
+  // scrapers/rubric (extraction, always `pending_review`) and by the rubric
+  // review API (#125). Backend-only: no firestore.rules match -> clients denied.
+  visaRubrics: db.collection("visaRubrics"),
+  // One record per rubric extraction run (issue #40): status, token usage,
+  // cost (null while the model is unpriced), what was discarded and why.
+  // Backend-only: no firestore.rules match.
+  rubricExtractionRuns: db.collection("rubricExtractionRuns"),
+  // Audit trail of rubric review decisions (issue #125): one doc per approve
+  // or reject (who, when, route, version, action, reason, the flags the
+  // reviewer acknowledged, the version that was serving before). Written in
+  // the SAME transaction as the decision by services/rubric-review.service.ts,
+  // so a decision never exists without its record. Append-only.
+  // Backend-only: no firestore.rules match -> clients denied.
+  rubricReviewHistory: db.collection("rubricReviewHistory"),
+  // The AI case-officer assessment (issue #42): one document per assessment,
+  // which is also its job record. The id is derived from the application id and
+  // the input hash, so the same inputs address the same document. Backend-only:
+  // no firestore.rules match, so clients read it only through /ai routes.
+  applicationAssessments: db.collection("applicationAssessments"),
+  // Auto-run debounce markers (issue #117): `assessmentDebounce/{applicationId}`,
+  // one per application with a recent document change. Backend-only.
+  assessmentDebounce: db.collection("assessmentDebounce"),
+  // One-per-assessment notification claims (issue #117), id = assessmentId.
+  // Created with `create()`, so a duplicate trigger delivery cannot notify twice. Backend-only.
+  assessmentNotifications: db.collection("assessmentNotifications"),
+  // Eligibility checks (read by the assessment for the score and nationality).
+  // The same collection EligibilityService writes; listed here so the AI path
+  // reads it through the registry, not a second `db.collection` call.
+  eligibilityChecks: db.collection("eligibilityChecks"),
+  // Per-day AI spend counters, one document per UTC day (`aiCosts/{YYYY-MM-DD}`).
+  // Written in a transaction per assessment; read by the daily cap. Backend-only.
+  aiCosts: db.collection("aiCosts"),
+  // Bulk re-assessment after a rubric approval (issue #37). One run per approval
+  // (id = the approval's audit id), one doc per provider batch, and a cache of
+  // stage 2 document extractions. All backend-only (no firestore.rules match).
+  bulkReassessments: db.collection("bulkReassessments"),
+  assessmentBatches: db.collection("assessmentBatches"),
+  documentExtractions: db.collection("documentExtractions"),
+  // Rule-change alerts (issue #123): one event per admin-approved change, one
+  // notice (the dedupe claim) per event and application. Backend-only.
+  ruleChangeEvents: db.collection("ruleChangeEvents"),
+  ruleChangeNotices: db.collection("ruleChangeNotices"),
+  // Ask-anywhere chat (issue #45). `aiConversations/{id}`: one conversation per
+  // (application, user), id = sha256(applicationId:uid), so a caller can only
+  // ever address their OWN conversation. Messages hang off it (see
+  // `subcollections.aiChatMessages`). Backend-only: no firestore.rules match, so
+  // clients read history only through GET /ai/applications/:id/chat.
+  aiConversations: db.collection("aiConversations"),
+  // Per-user chat usage counters, one doc per user per UTC day
+  // (`aiChatUsage/{uid}_{YYYY-MM-DD}`): messages per hour and per day, tokens
+  // spent. Read and written by the chat rate / spend caps. Backend-only.
+  aiChatUsage: db.collection("aiChatUsage"),
+  // Per-upload document checks (issue #115): `documentChecks/{documentId}`, one
+  // per uploaded document, which is also its job record (queued -> running ->
+  // done | could_not_check). Read only through the /documents/:id/check and
+  // /applications/:id/document-checks routes, tier-trimmed. Backend-only: no
+  // firestore.rules match, so clients are denied.
+  documentChecks: db.collection("documentChecks"),
+  // Per-day counters that bound the cost of document checks (issue #115):
+  // `documentCheckCaps/{applicationId|userId}__{YYYY-MM-DD}` -> { count }.
+  // Backend-only, same as above.
+  documentCheckCaps: db.collection("documentCheckCaps"),
+  // Refusal-letter analyses (issue #122): one document per letter version, which
+  // is also its job record. The id is a hash of the user, document, storage path
+  // and updatedAt, so asking twice for the same letter is a no-op. Holds the
+  // letter's quoted reasons (personal data). Backend-only: no firestore.rules
+  // match, so clients read it only through /ai/refusal-letters.
+  refusalAnalyses: db.collection("refusalAnalyses"),
+  // Trafficking / scam signals for a human to review (issue #119). One
+  // `riskSignals/{signalId}` per finding, plus an append-only
+  // `riskSignals/{signalId}/events` audit trail. Raised only by backend code
+  // (riskSignalService.raiseRiskSignal, used by #120 / #121), read and decided
+  // by admins through /admin/risk-signals. Visible to admins only and never
+  // to the subject: backend-only, no firestore.rules match -> clients denied.
+  riskSignals: db.collection("riskSignals"),
+  // AI message access (issue #172). `aiMessageAccess/{userId}`: one per user, holds
+  // their express approval (with the exact wording), the account-wide "off" setting
+  // and the one-time-notice dismissal. `aiMessageAccessAudit/{id}`: append-only
+  // trail of every change (approval, chat switch, account-wide setting). Both are
+  // backend-only: no firestore.rules match, so clients are denied and read/write
+  // only through the API (the audit trail only through the admin route).
+  aiMessageAccess: db.collection("aiMessageAccess"),
+  aiMessageAccessAudit: db.collection("aiMessageAccessAudit"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all
@@ -178,10 +311,21 @@ export const collectionGroups = {
   // knowing their country (indexes: visaTypes ownerAgencyId + createdAt and
   // ownerAgencyId + id, COLLECTION_GROUP scope).
   visaTypes: () => db.collectionGroup("visaTypes"),
+  // Every `visaRubrics/{routeKey}/rubricVersions` subcollection at once
+  // (issue #125): the admin review queue lists rubric versions of all routes
+  // by review status, newest first (index: rubricVersions reviewStatus +
+  // createdAt DESC, COLLECTION_GROUP scope). ADMIN REVIEW ONLY: it returns
+  // versions of any status, so it must never back a client-facing route.
+  rubricVersions: () => db.collectionGroup("rubricVersions"),
 };
 
 // Helper to get subcollection references
 export const subcollections = {
+  // `applicationAssessments/{assessmentId}/proposedActions/{actionId}` (issue #44).
+  // Backend-only: no firestore.rules match, so clients read it via /ai routes.
+  proposedActions: (assessmentId: string) =>
+    collections.applicationAssessments.doc(assessmentId).collection("proposedActions"),
+
   // Visa types under countries
   visaTypes: (countryCode: string) => 
     collections.countries.doc(countryCode).collection("visaTypes"),
@@ -194,10 +338,10 @@ export const subcollections = {
       .doc(visaTypeId)
       .collection("requirements"),
   
-  // Documents under applications
-  documents: (applicationId: string) =>
-    collections.applications.doc(applicationId).collection("documents"),
-  
+  // NOTE: there is intentionally no `documents` helper here. Application
+  // documents live in the TOP-LEVEL `collections.documents` (filter by
+  // `applicationId`), never under `applications/{id}/documents` (issue #28).
+
   // Timeline under applications
   timeline: (applicationId: string) =>
     collections.applications.doc(applicationId).collection("timeline"),
@@ -210,6 +354,10 @@ export const subcollections = {
   notes: (applicationId: string) =>
     collections.applications.doc(applicationId).collection("notes"),
 
+  // Chat turns under an AI conversation (issue #45).
+  aiChatMessages: (conversationId: string) =>
+    collections.aiConversations.doc(conversationId).collection("messages"),
+
   // Messages under conversations
   messages: (conversationId: string) =>
     collections.conversations.doc(conversationId).collection("messages"),
@@ -221,6 +369,22 @@ export const subcollections = {
   // Immutable content snapshots under a document instance (version history).
   documentVersions: (instanceId: string) =>
     collections.documentInstances.doc(instanceId).collection("versions"),
+
+  // Immutable snapshots of one guidance source (issue #39):
+  // `guidanceSources/{sourceId}/snapshots/{contentHash}`. METADATA only; the
+  // snapshot's text lives in Cloud Storage (see
+  // scrapers/guidance/guidance-snapshot.store.ts). Backend-only, like its
+  // parent: no firestore.rules match.
+  guidanceSnapshots: (sourceId: string) =>
+    collections.guidanceSources.doc(sourceId).collection("snapshots"),
+
+  // Versions of one route's rubric (issue #40):
+  // `visaRubrics/{routeKey}/rubricVersions/{version}`. The id is
+  // `rubricVersions`, not `versions`, because `documentInstances/{id}/versions`
+  // already exists and a collection-group query on `versions` would see both.
+  // A version's content is immutable once written. Backend-only, like its parent.
+  rubricVersions: (routeKey: string) =>
+    collections.visaRubrics.doc(routeKey).collection("rubricVersions"),
 
   // An agency's per-visa service prices (issue #103), in whole NAIRA:
   // `agencies/{agencyId}/visaPrices/{countryCode}__{visaTypeId}`. Written and

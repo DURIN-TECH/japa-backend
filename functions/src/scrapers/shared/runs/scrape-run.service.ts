@@ -5,6 +5,7 @@ import {
   ScrapeRunDoc,
   ScrapeRunError,
   ScrapeRunKind,
+  ScraperSettingsKind,
   ScrapeRunPageEntry,
   ScrapeRunSourceEntry,
   ScrapeRunStatus,
@@ -12,6 +13,7 @@ import {
 } from "./types";
 import type { VisaSource } from "../../visa-catalog/types";
 import type { NewsSource } from "../../../types/news";
+import { newsEditableConfigOf, type NewsEditableConfig } from "../../news/news-source-config.shape";
 import { hostBackoffEntriesFromSource } from "../etiquette/visa-crawl-host-backoff-store";
 // Issue #82: per-run usage / cost accumulation (pure helpers, no Firestore).
 import {
@@ -432,7 +434,7 @@ function utcDay(ms: number): string {
 
 /** One source's health, normalised across kinds (GET /admin/scrape-sources). */
 export interface ScrapeSourceHealth {
-  kind: ScrapeRunKind;
+  kind: ScraperSettingsKind; // visa | news (guidance health lives in /admin/guidance-sources)
   sourceId: string;
   name: string;
   countryCodes: string[];
@@ -466,10 +468,40 @@ export interface ScrapeSourceHealth {
   consecutiveFailureLimit: number;
   // Why the registry seed ships the source paused / retired (news), or null.
   statusReason: string | null;
+  // ---- Issue #17 (additive; all null on visa rows) ----
+  // The editable slice of a news source (what the edit form pre-fills):
+  // never customHeaders / apiConfig.
+  newsConfig: NewsEditableConfig | null;
+  // newsArticles with sourceId == id and scrapedAt in the last 7 days; null
+  // when the count failed (e.g. the composite index is still building).
+  articlesLast7d: number | null;
+  // Zero-yield streak (successful runs that found no article) and its start.
+  zeroYieldRuns: number | null;
+  zeroYieldSince: string | null;
+}
+
+/** Window of the `articlesLast7d` count. */
+const ARTICLE_COUNT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Issue #17: count a news source's articles scraped in the last 7 days with a
+ * Firestore count() aggregation (needs the `newsArticles(sourceId, scrapedAt)`
+ * composite index on a deployed project). Never throws: returns null and logs
+ * when the count fails, so the health list still renders.
+ */
+export async function countArticlesLast7d(sourceId: string, nowMs: number): Promise<number | null> {
+  try {
+    const since = Timestamp.fromMillis(nowMs - ARTICLE_COUNT_WINDOW_MS);
+    const snap = await collections.newsArticles.where("sourceId", "==", sourceId).where("scrapedAt", ">=", since).count().get();
+    return snap.data().count;
+  } catch (err) {
+    console.error(`Scrape sources: articlesLast7d for ${sourceId} unavailable: ${(err as Error)?.message ?? err}`);
+    return null;
+  }
 }
 
 /** Per-kind failure limits passed to the row builders. */
-type FailureLimits = Record<ScrapeRunKind, number>;
+type FailureLimits = Record<ScraperSettingsKind, number>;
 
 /** Read the limits in force (settings read never throws: defaults on error). */
 async function loadFailureLimits(): Promise<FailureLimits> {
@@ -744,7 +776,7 @@ export class ScrapeRunService {
   }
 
   /** Per-source health for one kind, or both when `kind` is omitted. */
-  async listSourceHealth(kind: ScrapeRunKind | undefined, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth[]> {
+  async listSourceHealth(kind: ScraperSettingsKind | undefined, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth[]> {
     const out: ScrapeSourceHealth[] = [];
     // Issue #107: one settings read for the limit shown on every row.
     const limits = await loadFailureLimits();
@@ -754,7 +786,9 @@ export class ScrapeRunService {
     }
     if (!kind || kind === "news") {
       const snap = await collections.newsSources.get();
-      for (const d of snap.docs) out.push(newsHealth(d.id, d.data() as NewsSource, limits.news));
+      // Issue #17: the 7-day counts run concurrently (one count() per source).
+      const counts = await Promise.all(snap.docs.map((d) => countArticlesLast7d(d.id, nowMs)));
+      snap.docs.forEach((d, i) => out.push(newsHealth(d.id, d.data() as NewsSource, limits.news, counts[i])));
     }
     return out;
   }
@@ -763,13 +797,12 @@ export class ScrapeRunService {
    * Issue #96: the health row of ONE source (after an admin edit), or null
    * when the doc does not exist. One read.
    */
-  async getSourceHealth(kind: ScrapeRunKind, id: string, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth | null> {
+  async getSourceHealth(kind: ScraperSettingsKind, id: string, nowMs: number = this.realClock()): Promise<ScrapeSourceHealth | null> {
     const snap = await (kind === "visa" ? collections.visaSources : collections.newsSources).doc(id).get();
     if (!snap.exists) return null;
     const limits = await loadFailureLimits();
-    return kind === "visa"
-      ? visaHealth(id, snap.data() as VisaSource, nowMs, limits.visa)
-      : newsHealth(id, snap.data() as NewsSource, limits.news);
+    if (kind === "visa") return visaHealth(id, snap.data() as VisaSource, nowMs, limits.visa);
+    return newsHealth(id, snap.data() as NewsSource, limits.news, await countArticlesLast7d(id, nowMs));
   }
 }
 
@@ -828,11 +861,15 @@ function visaHealth(id: string, s: VisaSource, nowMs: number, failureLimit: numb
     adminOverrides: adminOverridesJson((s as { adminOverrides?: unknown }).adminOverrides),
     ...autoPauseJson(s as unknown as Record<string, unknown>),
     consecutiveFailureLimit: failureLimit,
+    newsConfig: null,
+    articlesLast7d: null,
+    zeroYieldRuns: null,
+    zeroYieldSince: null,
   };
 }
 
-/** News source -> health row. */
-function newsHealth(id: string, s: NewsSource, failureLimit: number): ScrapeSourceHealth {
+/** News source -> health row (`articlesLast7d` is counted by the caller). */
+function newsHealth(id: string, s: NewsSource, failureLimit: number, articlesLast7d: number | null): ScrapeSourceHealth {
   return {
     kind: "news",
     sourceId: id,
@@ -852,6 +889,10 @@ function newsHealth(id: string, s: NewsSource, failureLimit: number): ScrapeSour
     adminOverrides: adminOverridesJson((s as { adminOverrides?: unknown }).adminOverrides),
     ...autoPauseJson(s as unknown as Record<string, unknown>),
     consecutiveFailureLimit: failureLimit,
+    newsConfig: newsEditableConfigOf(s as unknown as Record<string, unknown>),
+    articlesLast7d,
+    zeroYieldRuns: typeof s.zeroYieldRuns === "number" ? s.zeroYieldRuns : 0,
+    zeroYieldSince: iso(s.zeroYieldSince),
   };
 }
 

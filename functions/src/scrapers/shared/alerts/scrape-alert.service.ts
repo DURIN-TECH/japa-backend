@@ -4,6 +4,7 @@ import type { LogEntry } from "firebase-functions/logger";
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../../utils/firebase";
 import { notificationService, type NotifyUserInput } from "../../../services/notification.service";
+import { claimsService } from "../../../services/claims.service";
 import { EMAIL_BRANDING } from "../../../services/email/branding";
 // Issue #96: alert emails to the extra (non-user) addresses go straight
 // through the branded email service (notifyUser needs a user id).
@@ -17,6 +18,7 @@ import { scrapeCostMonthToDateSource, type MonthToDateCostSource } from "./scrap
 import {
   DEFAULT_CONFIG,
   evaluateBrokenSources,
+  evaluateNoYieldSources,
   evaluateBudget,
   evaluateBudgetHardStop,
   evaluateBudgetHardStopClears,
@@ -25,6 +27,7 @@ import {
   evaluateFx,
   evaluateHostBackoff,
   evaluateHostBackoffClears,
+  evaluateInfrastructureErrors,
   evaluateLinkedSurcharge,
   evaluateMissedWindows,
   evaluateReviewQueue,
@@ -50,7 +53,11 @@ import {
   type ScrapeAlertsConfig,
   type ScrapeAlertsState,
 } from "./types";
-import type { ScrapeRunDoc, ScrapeRunKind } from "../runs/types";
+import { SCRAPE_RUN_KINDS, type ScrapeRunDoc, type ScrapeRunKind } from "../runs/types";
+import type { DocumentData, UpdateData } from "firebase-admin/firestore";
+// Transaction.update() wants UpdateData<DocumentData>; the field maps built here are
+// Record<string, unknown> (dotted paths + FieldValue sentinels), which tsc rejects.
+type FsUpdate = UpdateData<DocumentData>;
 
 // ============================================
 // SCRAPE ALERTS — store, email, checks, admin reads (issue #83)
@@ -143,7 +150,9 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   llm_budget: "LLM budget",
   review_queue_stale: "review queue waiting",
   budget_hard_stop: "LLM budget hard stop",
+  source_no_yield: "source returns no articles",
   settings_unreadable: "scraper settings unreadable",
+  infrastructure_error: "guidance crawl infrastructure error",
 };
 
 /** Cloud Logging severity per alert severity (resolutions log as INFO). */
@@ -322,6 +331,8 @@ export class ScrapeAlertService {
         evaluateLinkedSurcharge(run, config),
         // Issue #96: the hard stop blocked extraction in this run.
         evaluateBudgetHardStop(run, config),
+        // Issue #143: a guidance run that could not store its results.
+        evaluateInfrastructureErrors(run, config),
       ];
       // Host backoff needs the earlier runs of the same scraper.
       await this.isolated("host_backoff", skippedRules, async () => {
@@ -332,6 +343,12 @@ export class ScrapeAlertService {
       await this.isolated("source_broken", skippedRules, async () => {
         evals.push(evaluateBrokenSources(run.kind, await this.sourceFacts(run.kind), config));
       });
+      // Issue #17: a news run may just have extended a zero-yield streak.
+      if (run.kind === "news") {
+        await this.isolated("source_no_yield", skippedRules, async () => {
+          evals.push(evaluateNoYieldSources((await this.sourceFacts("news")) as NewsSourceFacts[], config));
+        });
+      }
       return await this.finish(evals, config, nowMs, skippedRules, false, deferEmail);
     } catch (err) {
       this.engineError("finalize", err, run.id);
@@ -361,7 +378,8 @@ export class ScrapeAlertService {
         evals.push(evaluateStuckRuns(snap.docs.map((d) => d.data() as ScrapeRunDoc), nowMs, config));
       });
       const latest: Partial<Record<ScrapeRunKind, ScrapeRunDoc>> = {};
-      for (const kind of ["visa", "news"] as ScrapeRunKind[]) {
+      // Every kind (visa, news, guidance): SCRAPE_RUN_KINDS, not a literal list.
+      for (const kind of SCRAPE_RUN_KINDS) {
         await this.isolated(`run_failed:${kind}`, skippedRules, async () => {
           const run = await this.latestFinishedRun(kind);
           latest[kind] = run;
@@ -373,11 +391,15 @@ export class ScrapeAlertService {
       await this.isolated("missed_window", skippedRules, async () => {
         evals.push(evaluateMissedWindows((await this.sourceFacts("visa")) as VisaSourceFacts[], nowMs, config));
       });
-      for (const kind of ["visa", "news"] as ScrapeRunKind[]) {
+      for (const kind of SCRAPE_RUN_KINDS) {
         await this.isolated(`source_broken:${kind}`, skippedRules, async () => {
           evals.push(evaluateBrokenSources(kind, await this.sourceFacts(kind), config));
         });
       }
+      // Issue #17: zero-yield news sources (next to source_broken).
+      await this.isolated("source_no_yield", skippedRules, async () => {
+        evals.push(evaluateNoYieldSources((await this.sourceFacts("news")) as NewsSourceFacts[], config));
+      });
 
       // ---- host_backoff clears no run reports (review fix) ----
       // Paused / retired / removed sources, or the host's retry-after passed.
@@ -388,7 +410,7 @@ export class ScrapeAlertService {
           .get();
         if (active.empty) return;
         const sourceStatus: Partial<Record<ScrapeRunKind, Map<string, string>>> = {};
-        for (const kind of ["visa", "news"] as ScrapeRunKind[]) {
+        for (const kind of SCRAPE_RUN_KINDS) {
           sourceStatus[kind] = new Map((await this.sourceFacts(kind)).map((f) => [f.id, String(f.status ?? "")]));
         }
         evals.push(evaluateHostBackoffClears(active.docs.map((d) => d.data() as ScrapeAlertDoc), sourceStatus, nowMs));
@@ -588,7 +610,7 @@ export class ScrapeAlertService {
             update.acknowledgedAt = null;
           }
         }
-        tx.update(alertRef, update);
+        tx.update(alertRef, update as FsUpdate);
         return { action: escalated ? "escalated" : "bumped", alert: { ...existing, ...update } as ScrapeAlertDoc };
       }
 
@@ -657,7 +679,7 @@ export class ScrapeAlertService {
         updatedAt: now,
         expireAt: expireAtFrom(nowMs),
       };
-      tx.update(alertRef, update);
+      tx.update(alertRef, update as FsUpdate);
       return { action: "resolved", alert: { ...alert, ...update } };
     });
   }
@@ -714,19 +736,17 @@ export class ScrapeAlertService {
 
   /**
    * Admin uids to email: `recipientUserIds` (config) filtered to users that
-   * really are admins, or every admin when the list is empty. Admins carry
-   * `admin: true` on users/{uid} (kept in lockstep with the role claim by
-   * claimsService), the same lookup compliance notifications use.
+   * really are admins, or every admin when the list is empty. "Admin" means
+   * the account holds the admin custom claim (issue #135): the
+   * `users/{uid}.admin` document field is not an authority and is not read.
    */
   async recipients(config: ScrapeAlertsConfig): Promise<string[]> {
     if (config.recipientUserIds.length === 0) {
-      const snap = await collections.users.where("admin", "==", true).get();
-      return snap.docs.map((d) => d.id);
+      return claimsService.listAdminUids();
     }
     const out: string[] = [];
     for (const uid of new Set(config.recipientUserIds)) {
-      const snap = await collections.users.doc(uid).get();
-      if (snap.exists && snap.data()?.admin === true) out.push(uid);
+      if (await claimsService.isAdmin(uid)) out.push(uid);
       else console.warn(`Scrape alerts: recipient ${uid} is not an admin user, skipped`);
     }
     return out;
@@ -940,6 +960,26 @@ export class ScrapeAlertService {
 
   /** Source facts for one scraper's registry (a few dozen docs at most). */
   private async sourceFacts(kind: ScrapeRunKind): Promise<Array<VisaSourceFacts | NewsSourceFacts>> {
+    // Issue #143: the guidance registry. Its "failing" status (the crawler
+    // stopped after N consecutive failures) is the same thing the other
+    // registries call "broken", so it is mapped to that word here and
+    // source_broken needs no second code path; the source title is its name
+    // and the stored last error is the auto-pause reason.
+    if (kind === "guidance") {
+      const g = await collections.guidanceSources.get();
+      return g.docs.map((d) => {
+        const data = d.data() as Record<string, unknown>;
+        return {
+          id: d.id,
+          name: typeof data.title === "string" && data.title ? data.title : d.id,
+          status: data.status === "failing" ? "broken" : (data.status as string | undefined),
+          consecutiveFailures: typeof data.consecutiveFailures === "number" ? data.consecutiveFailures : 0,
+          autoPausedReason:
+            (typeof data.autoPausedReason === "string" && data.autoPausedReason) ||
+            (typeof data.lastError === "string" ? data.lastError : null),
+        } as NewsSourceFacts;
+      });
+    }
     const snap = await (kind === "visa" ? collections.visaSources : collections.newsSources).get();
     return snap.docs.map((d) => ({ ...(d.data() as Record<string, unknown>), id: d.id }) as VisaSourceFacts | NewsSourceFacts);
   }

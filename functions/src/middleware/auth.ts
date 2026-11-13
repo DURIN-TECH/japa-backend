@@ -134,7 +134,15 @@ export async function verifyAuth(
     const isAccountSecurityWrite =
       path.endsWith("/users/me/password-changed") ||
       path.endsWith("/users/me/change-email") ||
-      (method === "DELETE" && path.endsWith("/users/me"));
+      (method === "DELETE" && path.endsWith("/users/me")) ||
+      // AI message access (#172): withdrawing approval, the account-wide off
+      // setting, a chat's AI switch and the notice dismissal are privacy
+      // controls over a person's own messages. A lapsed plan must not stop them.
+      // Listed route by route and method (granting approval stays plan-gated).
+      (method === "DELETE" && path.endsWith("/users/me/ai-message-access/approval")) ||
+      (method === "PUT" && path.endsWith("/users/me/ai-message-access/account-wide-off")) ||
+      (method === "POST" && path.endsWith("/users/me/ai-message-access/notice-dismissed")) ||
+      (method === "PUT" && /\/conversations\/[^/]+\/ai-access$/.test(path));
 
     if (
       isWrite &&
@@ -185,6 +193,16 @@ export async function optionalAuth(
   }
 
   next();
+}
+
+/**
+ * True when the caller is agent-side (agent, owner or admin). Same rule as
+ * `verifyAgent`, exposed as a predicate so a handler that is open to applicants
+ * as well can branch to the (much narrower) applicant path (#43).
+ */
+export function isAgentSideRequest(req: AuthenticatedRequest): boolean {
+  const role = req.authz?.role ?? (req.user?.role as string | undefined);
+  return role === "agent" || role === "owner" || role === "admin" || !!req.user?.agent || !!req.user?.admin;
 }
 
 /**

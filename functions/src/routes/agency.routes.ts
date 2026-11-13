@@ -123,7 +123,10 @@ agencyRoutes.put("/:id/compliance/decision", verifyAuth, verifyAdmin, (req, res)
 agencyRoutes.get("/:id/members", verifyAuth, (req, res) =>
   agencyController.getMembers(req, res)
 );
-agencyRoutes.post("/:id/members", verifyAuth, (req, res) =>
+// "Add an existing agent" sends that agent an invitation they must accept
+// (issue #138), so it carries the same entitlement gate as the invitation
+// route below.
+agencyRoutes.post("/:id/members", verifyAuth, requireFeature(FEATURES.AGENCY_INVITE_AGENTS), (req, res) =>
   agencyController.addMember(req, res)
 );
 agencyRoutes.delete("/:id/members/:agentId", verifyAuth, (req, res) =>

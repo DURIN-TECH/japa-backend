@@ -930,12 +930,26 @@ export async function seedCountriesAndVisas(): Promise<{
   let totalVisas = 0;
   for (const [countryCode, visas] of Object.entries(visasByCountry)) {
     const visaBatch = db.batch();
-    for (const visa of visas) {
-      const ref = db
+
+    // Issue #191: read the docs that already exist for this country BEFORE
+    // writing, so a re-seed (it runs on every dev deploy) can keep the fields
+    // that admins and scripts own: isActive (e.g. the deactivate:uk-seeds
+    // script from #175), agentIds and createdAt. One getAll per country.
+    const refs = visas.map((visa) =>
+      db
         .collection("countries")
         .doc(countryCode)
         .collection("visaTypes")
-        .doc(visa.id);
+        .doc(visa.id)
+    );
+    const existingSnaps = await db.getAll(...refs);
+    const existingById = new Map(
+      existingSnaps.filter((snap) => snap.exists).map((snap) => [snap.id, snap.data()])
+    );
+
+    for (const [i, visa] of visas.entries()) {
+      const ref = refs[i];
+      const existing = existingById.get(visa.id);
 
       visaBatch.set(ref, {
         id: visa.id,
@@ -958,9 +972,13 @@ export async function seedCountriesAndVisas(): Promise<{
         ...(visa.applicationInstructions && {
           applicationInstructions: visa.applicationInstructions,
         }),
-        isActive: true,
-        agentIds: [],
-        createdAt: now,
+        // Runtime-owned fields. A NEW doc starts active, with no agents and
+        // createdAt = now (unchanged behaviour). An EXISTING doc keeps what is
+        // stored; the `?? default` covers a legacy doc missing the field.
+        // Everything above this comment is seed-owned and is refreshed.
+        isActive: existing ? existing.isActive ?? true : true,
+        agentIds: existing ? existing.agentIds ?? [] : [],
+        createdAt: existing ? existing.createdAt ?? now : now,
         updatedAt: now,
       });
     }

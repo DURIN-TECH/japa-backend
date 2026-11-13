@@ -1,4 +1,5 @@
 import { Timestamp } from "firebase-admin/firestore";
+import type { ApplicationIntake } from "./intake";
 // Automated-verification result shapes live with the provider contract; the
 // compliance file below embeds them as optional signals (see the verification
 // service). One-way import (types -> verification.types), so no cycle.
@@ -335,7 +336,12 @@ export interface Agent {
   responseTime: string; // e.g., "24-48 hours"
 
   // Pricing
-  consultationFee: number; // In cents
+  // WHOLE NAIRA (issue #148), same unit as `Agency.consultationFee`. Display with no
+  // /100; Paystack kobo conversion (`* 100`) happens only at the payment boundary.
+  consultationFee: number;
+  // Migration marker (#148): set to "naira" by migrate-agent-consultation-fee-to-naira
+  // so a re-run never divides an already-converted fee by 100 again.
+  consultationFeeUnit?: "naira";
   /**
    * @deprecated Issue #103: SUPERSEDED by the agency-level per-visa service
    * price (`agencies/{agencyId}/visaPrices/{cc}__{visaTypeId}`, whole NAIRA,
@@ -354,6 +360,38 @@ export interface Agent {
   availableSlots?: AvailabilitySlot[];
 
   // Metadata
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+/**
+ * Issue #147: the ONLY shape an unauthenticated agent route may return.
+ *
+ * It is an allow-list (built field by field in `toPublicAgent`, never by
+ * spreading or omitting from `Agent`), so a field added to `Agent` later stays
+ * private until someone adds it here on purpose. Deliberately NOT included:
+ * `userId` (the account uid), `licenseNumber`, `verificationDocuments`,
+ * `verifiedBy`, `verifiedAt`, `availableSlots`, `serviceFees`.
+ */
+export interface PublicAgent {
+  id: string;
+  agencyId?: string; // Agency the agent belongs to (absent = independent)
+  agencyRole?: AgencyMemberRole; // Role in that agency (mobile labels agents with it)
+  displayName: string;
+  bio: string;
+  profilePhotoUrl?: string;
+  yearsOfExperience: number;
+  specializations: string[];
+  languages: string[];
+  featuredVisas: string[];
+  verificationStatus: AgentVerificationStatus;
+  rating: number;
+  totalReviews: number;
+  totalApplications: number;
+  successRate: number;
+  responseTime: string;
+  consultationFee: number; // passed through unchanged (unit is issue #148's concern)
+  isAvailable: boolean;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -417,6 +455,12 @@ export interface VisaType {
 
   // Eligibility
   eligibilityCriteria: string[];
+
+  // Issue #129: official "documents you must provide", extracted verbatim from
+  // the scraped page and written only on admin approval (scrapeMeta.citations
+  // holds the per-item quote under "requiredDocuments.<index>"). ABSENT when
+  // the page lists none; plain strings, never invented.
+  requiredDocuments?: string[];
 
   // Official application
   applicationUrl?: string; // URL to official online application form (e.g., AVATS for Ireland)
@@ -640,6 +684,10 @@ export interface RequiredDocument {
   isRequired: boolean;
   validationCriteria?: string[];
   sampleUrl?: string; // Link to sample document
+  // Issue #175: set ONLY on documents derived at read time from a scraped
+  // visa record. The verbatim quote (scrapeMeta.citations) and the official
+  // page it came from. Absent on seeded / admin-authored documents.
+  citation?: { quote: string; sourceUrl: string };
 }
 
 // ============================================
@@ -738,6 +786,11 @@ export interface Application {
   clientPhone?: string; // Captured when an agent starts an application for a client
   visaTypeName?: string;
   countryName?: string;
+
+  // Answers to the route's intake questions (issue #113). Written only by
+  // PUT /applications/:id/intake, which validates them against the approved
+  // rubric; never through the generic application update.
+  intake?: ApplicationIntake;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -946,12 +999,59 @@ export interface DocumentRequest {
   /** Id of the `Document` the client uploaded to satisfy this request. */
   fulfilledDocumentId?: string;
   fulfilledAt?: Timestamp;
-  /** Uid of whoever moved it to a terminal non-fulfilled state (waive/cancel). */
+  /** Uid of whoever moved it to a terminal non-fulfilled state (waive/cancel).
+   *  `"system"` (CHECKLIST_SYSTEM_ACTOR_ID) when the checklist sync cancelled it. */
   resolvedBy?: string;
+
+  // --- Back-reference to an accepted AI proposed action (issue #44) ------------
+  // Additive and optional: set only on a request created by accepting a proposed
+  // action (`applicationAssessments/{sourceAssessmentId}/proposedActions/{sourceActionId}`).
+  // Existing consumers ignore them. They make accept idempotent and let a
+  // fulfilled / waived / cancelled request update the action it came from.
+  sourceAssessmentId?: string;
+  sourceActionId?: string;
+  // --- Checklist-origin fields (issue #114) ------------------------------------
+  // All OPTIONAL: agent-raised requests and every pre-existing document carry
+  // none of them and behave exactly as before.
+  /** `"checklist"` when the request was generated from the verified visa
+   *  record by the checklist builder; absent for agent-raised requests. */
+  origin?: "checklist";
+  /** Stable id of the checklist item (from the rubric evidence key, or the
+   *  visa record's document list). With `applicationId` it is the idempotency
+   *  key: the doc id is `{applicationId}__{checklistItemId}`. */
+  checklistItemId?: string;
+  /** Whose document it is. `sponsor` documents are still uploaded by the
+   *  applicant (the sponsor has no account) and belong to the applicant. */
+  holder?: "applicant" | "sponsor";
+  /** Why the document is asked for: a deterministic template filled from the
+   *  rubric criterion, so it is always present on a checklist item. */
+  reason?: string;
+  /** Whether the source calls the document required (false = optional). */
+  required?: boolean;
+  /** The rubric criterion this item mainly evidences (its `ruleRef` or
+   *  `criterionId`), for display and audit. */
+  criterionRef?: string;
+  /** The published source behind the item: verbatim quote + official URL. */
+  citation?: DocumentRequestCitation;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
+
+/** Verbatim quote + URL behind a checklist item (never model-written). */
+export interface DocumentRequestCitation {
+  /** The exact words of the published source. */
+  quote: string;
+  /** The official page the quote is on. */
+  url: string;
+  /** The publisher's own paragraph / section number, when the rubric has one. */
+  ruleRef?: string;
+}
+
+/** Actor recorded as `requestedBy` / `resolvedBy` on system-built requests. */
+export const CHECKLIST_SYSTEM_ACTOR_ID = "system";
+/** Display name shown to the applicant for system-built requests. */
+export const CHECKLIST_SYSTEM_ACTOR_NAME = "Seli";
 
 // ============================================
 // CONSULTATION TYPES
@@ -1000,7 +1100,9 @@ export interface Consultation {
   meetingPlatform?: "zoom" | "google_meet" | "teams";
   
   // Payment
-  fee: number; // In cents
+  // WHOLE NAIRA (issue #148) for agent-originated and agency (guest) bookings alike.
+  // Paystack kobo (`fee * 100`) is computed only when a charge is initialised.
+  fee: number;
   paymentStatus: PaymentStatus;
   transactionId?: string;
   
@@ -1161,6 +1263,14 @@ export type NotificationType =
   | "application_created" // An agent started an application on a client's behalf
   | "application_assigned" // An application was assigned to an agent
   | "application_withdrawn"
+  // The approved rules changed and a bulk re-assessment (#37) produced a worse
+  // or blocking result: sent to the assigned agent / agency owner / admins,
+  // NEVER to the applicant.
+  | "assessment_rules_updated"
+  // The published rules or details of an in-flight application's route changed
+  // (issue #123), raised only from an ADMIN-APPROVED change. Staff get the
+  // detail; an applicant only ever gets a neutral, factual notice.
+  | "rule_change_alert"
   // Documents
   | "document_status"
   | "document_uploaded" // Client uploaded a document for review
@@ -1229,6 +1339,9 @@ export type NotificationType =
   // exists precisely because the real-time channels were missed.
   | "message_unread_reminder"
   | "visa_news"
+  // Issue #117: an automatic pre-review run produced findings that differ from
+  // the previous run. Goes to the assigned agent only, never to the applicant.
+  | "assessment_insights"
   | "system";
 
 // Delivery channels supported by the unified notifier (`notifyUser`). Each channel
@@ -1295,6 +1408,16 @@ export interface Conversation {
   // Absent on conversations that predate the feature — treated as "never sent".
   unreadReminderSentAtUser?: Timestamp;
   unreadReminderSentAtAgent?: Timestamp;
+
+  // --- AI message access: per-participant chat switch (issue #172) -------------
+  // True when that side has switched AI access to this chat OFF. A missing field
+  // means ON (not switched off), so existing conversations need no migration.
+  // `User` = the applicant (`userId`), `Agent` = the agent side (`agentId`). Each
+  // side can change only its own field, and only through
+  // PUT /conversations/:id/ai-access (firestore.rules refuses client writes).
+  // While EITHER side is off, nothing from the chat is released for AI use.
+  aiAccessOffUser?: boolean;
+  aiAccessOffAgent?: boolean;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -1442,4 +1565,71 @@ export interface AgencyVisaPrice {
   updatedBy: string;
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+
+// ============================================
+// AI MESSAGE ACCESS TYPES (issue #172)
+// ============================================
+
+/**
+ * A person's express approval for intelligent analysis of the messages they
+ * send. Same idea as the KYC `ConsentRecord`: who, when, which wording version
+ * and the exact text shown. Stored on `aiMessageAccess/{userId}`.
+ */
+export interface AiMessageApproval {
+  userId: string;
+  grantedAt: Timestamp;
+  /** Id of the wording version the person saw (see message-access/wording.ts). */
+  wordingVersion: string;
+  /** The exact wording stored at approval time (never the client's copy). */
+  wording: string;
+  ipAddress?: string;
+  /** Set when the person withdraws. A revoked approval no longer counts. */
+  revokedAt?: Timestamp;
+}
+
+/** The per-user AI message access document, `aiMessageAccess/{userId}`. */
+export interface AiMessageAccessRecord {
+  userId: string;
+  /** The current approval (revoked or not); null/absent = never approved. */
+  approval?: AiMessageApproval | null;
+  /** Account-wide off: while true no chat of this user releases anything. */
+  accountWideOff?: boolean;
+  accountWideOffChangedAt?: Timestamp;
+  /** One-time notice dismissal, stored on the server so it follows the person across devices. */
+  noticeDismissedAt?: Timestamp;
+  noticeDismissedVersion?: string;
+  updatedAt: Timestamp;
+}
+
+/** What an audit record describes. */
+export type AiMessageAccessAuditAction =
+  | "approval_granted"
+  | "approval_revoked"
+  | "chat_switched_off"
+  | "chat_switched_on"
+  | "account_wide_off_enabled"
+  | "account_wide_off_disabled";
+
+/**
+ * One append-only audit record, `aiMessageAccessAudit/{id}`. Written with
+ * `create()` in the same transaction as the change; the API has no update or
+ * delete path. Readable only by admins.
+ */
+export interface AiMessageAccessAuditRecord {
+  id: string;
+  /** Who made the change (always the person whose setting it is). */
+  actorUid: string;
+  /** Whose setting changed. Equal to `actorUid` today; kept explicit for the audit reader. */
+  subjectUid: string;
+  action: AiMessageAccessAuditAction;
+  /** The new value: approved / switched-off / account-wide-off. */
+  newValue: boolean;
+  /** Chat switches only: which chat, and which side of it. */
+  conversationId?: string;
+  side?: "user" | "agent";
+  /** Approvals only: the wording version recorded. */
+  wordingVersion?: string;
+  createdAt: Timestamp;
 }

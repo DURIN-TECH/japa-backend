@@ -9,6 +9,8 @@ import {
   sendMessage,
   markAsRead,
   deleteConversation,
+  getConversation,
+  setAiAccess,
 } from "../controllers/messaging.controller";
 
 const router = Router();
@@ -20,6 +22,12 @@ router.use(verifyAuth);
 // "messaging" entitlement.
 router.get("/", listConversations);
 router.post("/", requireFeature(FEATURES.MESSAGING), createConversation);
+
+// One conversation (with the caller's AI-access view), and the per-chat AI
+// access switch (issue #172). Any participant can switch their OWN side; it is
+// a privacy control so it is not behind the messaging entitlement.
+router.get("/:id", getConversation);
+router.put("/:id/ai-access", setAiAccess);
 
 // Message routes (nested under conversation)
 router.get("/:id/messages", getMessages);
