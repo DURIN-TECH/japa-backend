@@ -191,7 +191,7 @@ const settings = (over: Record<string, unknown> = { mode: "auto" }) => store.set
 /** Stored audit entries, oldest first. */
 const audits = () => [...store.entries()].filter(([p]) => p.startsWith("rubricReviewHistory/")).map(([, d]) => d as any);
 /** Stored publish run records. */
-const runs = () => [...store.entries()].filter(([p]) => p.startsWith("rubricPublishRuns/")).map(([, d]) => d as RubricPublishRun);
+const runs = () => [...store.entries()].filter(([p]) => p.startsWith("rubricPublishRuns/")).map(([, d]) => d as unknown as RubricPublishRun);
 /** Stored scrape alerts. */
 const alerts = () => [...store.entries()].filter(([p]) => p.startsWith("scrapeAlerts/")).map(([, d]) => d as any);
 
