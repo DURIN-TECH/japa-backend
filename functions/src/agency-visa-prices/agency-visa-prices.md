@@ -194,13 +194,65 @@ still 404s for an unknown slug or an agency that is not `approved`.
 - **Errors.** If the pricing read fails, the error is logged and the page is
   served with `[]`, so the rest of the page still loads.
 
+## Public agency directory: `GET /agencies/browse*` (no auth, #144)
+
+Three read-only routes for the mobile Explorer's agency screens. No
+`Authorization` header. Only `approved` agencies are served; anything else is
+`404 NOT_FOUND` with the same body as an unknown id. Other methods on
+`/agencies/browse*` answer `405` and write nothing.
+
+| Route | Returns |
+| --- | --- |
+| `GET /agencies/browse?limit=&search=` | `PublicAgency[]`, newest first, **no** `visaPrices` (keeps the list one query) |
+| `GET /agencies/browse/:id` | `PublicAgency` + `visaPrices[]` |
+| `GET /agencies/browse/:id/agents` | the agency's `verified` + `isAvailable` agents, same shape as `GET /agents`; 404 when the agency is not public |
+
+- `?limit=`: a positive integer, capped at 100 (also the default). Anything
+  else (`abc`, `0`, `-1`) is ignored. It applies after `?search=`.
+- `?search=`: case-insensitive substring match on the agency name. No match
+  is `200 []`.
+
+`PublicAgency` is an allow-list (`toPublicAgency()` in
+`services/agency.service.ts`):
+
+```jsonc
+{
+  "id": "agency-a", "name": "Acme Visas", "slug": "acme",   // slug null until backfilled
+  "ownerName": "Ada Owner", "state": "Lagos", "address": "…", // optional fields omitted when unset
+  "description": "…", "logoUrl": "https://…",
+  "consultationFee": 15000,                                  // whole NAIRA, as stored
+  "services": [{ "id": "svc-1", "name": "CV review", "price": 25000 }], // whole NAIRA
+  "agentCount": 3, "totalCases": 12,
+  "status": "approved",
+  "verified": false,       // compliance badge only; approved + unverified agencies are still listed
+  "createdAt": { "_seconds": 1700000000, "_nanoseconds": 0 }
+}
+```
+
+Never present: `ownerId`, `compliance`, `reviewedBy`, `reviewedAt`,
+`rejectionReason`, `activeCases`, bank / BVN / NIN data.
+
+`visaPrices[]` on `/browse/:id` is built by the same
+`agencyVisaPriceService.listPublic(agency.id)` call as the slug page, so each
+entry is identical (same keys, same values) to the one in
+`GET /agencies/public/:slug` (see above). A pricing read failure is logged and
+served as `[]`.
+
+Indexes: `/browse` uses `agencies (status ASC, createdAt DESC)` and
+`/browse/:id/agents` uses `agents (agencyId ASC, displayName ASC)`; both
+already exist, no new index was added.
+
 ## For #106 (portal and mobile)
 
 **Start-case picker.** To show an agency's price next to each visa in the
 picker, the agency side calls `GET /agency/visa-prices` and joins on
 `countryCode__visaTypeId`.
 
-**Public and mobile.** Read `visaPrices` from `GET /agencies/public/:slug`.
+**Public web page.** Read `visaPrices` from `GET /agencies/public/:slug`.
+
+**Mobile.** Read `visaPrices` from `GET /agencies/browse/:id` (#144); the
+entries are the same as the slug page's. `useAgencyVisaPrices` already reads
+the field there.
 
 **#102** (reachable through the agency) added the applicant-safe visa detail
 to the same `visaPrices[]` entries (above), built on `listOffered`. See

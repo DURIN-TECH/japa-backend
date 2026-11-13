@@ -223,6 +223,35 @@ class AgentService {
   }
 
   /**
+   * The publicly visible agents of one agency, for the unauthenticated
+   * `GET /agencies/browse/:id/agents` (issue #144).
+   *
+   * Same rule and same shape as the public `GET /agents`: only
+   * `verificationStatus === "verified"` agents, returned as the stored Agent
+   * doc (exactly what `getAgents()` returns, so nothing beyond what
+   * `GET /agents` already exposes). The directory also requires
+   * `isAvailable === true`. Only agents whose `agencyId` is this agency.
+   *
+   * Query: `agencyId ==` ordered by `displayName asc`, served by the
+   * existing `agents (agencyId ASC, displayName ASC)` index; the verified /
+   * available filters run in memory (an agency's roster is small), so no
+   * new composite index is needed.
+   *
+   * The caller must check the agency is public first (the controller 404s
+   * otherwise), so a non-approved agency's roster is never exposed.
+   */
+  async getPublicAgentsByAgency(agencyId: string): Promise<Agent[]> {
+    const snapshot = await collections.agents
+      .where("agencyId", "==", agencyId)
+      .orderBy("displayName", "asc")
+      .get();
+
+    return snapshot.docs
+      .map((doc) => doc.data() as Agent)
+      .filter((a) => a.agencyId === agencyId && a.verificationStatus === "verified" && a.isAvailable === true);
+  }
+
+  /**
    * Get top-rated agents
    */
   async getTopAgents(limit = 10): Promise<Agent[]> {

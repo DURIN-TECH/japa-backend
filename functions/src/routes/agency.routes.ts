@@ -5,6 +5,7 @@ import { consultationController } from "../controllers/consultation.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
 import { requireFeature } from "../middleware/authz";
 import { FEATURES } from "@durin-tech/authz";
+import { sendError } from "../utils/response";
 
 // Routes mounted at /agencies
 const agencyRoutes = Router();
@@ -22,6 +23,33 @@ agencyRoutes.get("/public/:slug", (req, res) =>
 agencyRoutes.post("/public/:slug/consultations", (req, res) =>
   consultationController.createPublicConsultation(req, res)
 );
+
+// PUBLIC — no auth: agency directory for the mobile Explorer (issue #144).
+// Registered BEFORE every "/:id..." param route so the literal "browse"
+// segment is never captured as an ":id" (e.g. GET /agencies/browse is not
+// "agency browse"). Read-only; each returns the PUBLIC-safe projection only.
+agencyRoutes.get("/browse", (req, res) =>
+  agencyController.browseAgencies(req, res)
+);
+agencyRoutes.get("/browse/:id", (req, res) =>
+  agencyController.getPublicAgencyById(req, res)
+);
+agencyRoutes.get("/browse/:id/agents", (req, res) =>
+  agencyController.getPublicAgencyAgents(req, res)
+);
+
+// The directory is read-only: any other method on /browse or below gets a
+// 405 here and writes nothing. Without this, e.g. PUT /agencies/browse/approval
+// would fall through to the "/:id/approval" route (id = "browse"). GET / HEAD
+// requests that matched no route above fall through to the normal 404.
+agencyRoutes.all(["/browse", "/browse/*"], (req, res, next) => {
+  if (req.method === "GET" || req.method === "HEAD") {
+    next();
+    return;
+  }
+  res.set("Allow", "GET, HEAD");
+  sendError(res, "METHOD_NOT_ALLOWED", "Method not allowed", 405);
+});
 
 // Agency CRUD — /me routes before /:id
 agencyRoutes.get("/me", verifyAuth, (req, res) =>
