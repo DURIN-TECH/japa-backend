@@ -1409,13 +1409,11 @@ export interface Conversation {
   unreadReminderSentAtUser?: Timestamp;
   unreadReminderSentAtAgent?: Timestamp;
 
-  // --- AI message access: per-participant chat switch (issue #172) -------------
-  // True when that side has switched AI access to this chat OFF. A missing field
-  // means ON (not switched off), so existing conversations need no migration.
-  // `User` = the applicant (`userId`), `Agent` = the agent side (`agentId`). Each
-  // side can change only its own field, and only through
-  // PUT /conversations/:id/ai-access (firestore.rules refuses client writes).
-  // While EITHER side is off, nothing from the chat is released for AI use.
+  // --- RETIRED (issue #209): per-participant chat switch from #172 -------------
+  // Nothing writes these any more and nothing reads them for access decisions:
+  // the PUT /conversations/:id/ai-access route is gone. Old values may still sit
+  // on existing documents; they are IGNORED by the access check and stripped from
+  // every API response. Kept only so those documents still type-check.
   aiAccessOffUser?: boolean;
   aiAccessOffAgent?: boolean;
 
@@ -1607,10 +1605,14 @@ export interface AiMessageAccessRecord {
 export type AiMessageAccessAuditAction =
   | "approval_granted"
   | "approval_revoked"
-  | "chat_switched_off"
-  | "chat_switched_on"
   | "account_wide_off_enabled"
   | "account_wide_off_disabled";
+
+/**
+ * Actions that may be READ from old audit rows but can no longer be written
+ * (the per-chat switch was retired in #209). Old rows stay in the trail.
+ */
+export type LegacyAiMessageAccessAuditAction = "chat_switched_off" | "chat_switched_on";
 
 /**
  * One append-only audit record, `aiMessageAccessAudit/{id}`. Written with
@@ -1623,10 +1625,10 @@ export interface AiMessageAccessAuditRecord {
   actorUid: string;
   /** Whose setting changed. Equal to `actorUid` today; kept explicit for the audit reader. */
   subjectUid: string;
-  action: AiMessageAccessAuditAction;
-  /** The new value: approved / switched-off / account-wide-off. */
+  action: AiMessageAccessAuditAction | LegacyAiMessageAccessAuditAction;
+  /** The new value: approved / account-wide-off (or switched-off, on old chat-switch rows). */
   newValue: boolean;
-  /** Chat switches only: which chat, and which side of it. */
+  /** Old chat-switch rows only: which chat, and which side of it. */
   conversationId?: string;
   side?: "user" | "agent";
   /** Approvals only: the wording version recorded. */

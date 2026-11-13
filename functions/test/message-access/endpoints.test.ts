@@ -6,13 +6,14 @@
 // response are plain objects (no HTTP server). Covers: own-data-only (403 and no
 // change), the approval record (exact server-side wording, version check),
 // revoke and re-approve, the account-wide setting, the notice dismissal, the
-// per-chat switch (participant-only, own side only, 404/403), the conversation
+// retired per-chat switch (no route, no writer), the conversation
 // response (own state, yes/no for the other side, nothing of the other person's
-// approval or plan, no raw per-side fields), and the audit trail (written for
+// approval or plan, no raw per-side fields, old per-chat values ignored), and the audit trail (written for
 // every change, append-only, admin-only route).
 
 import assert from "node:assert/strict";
 import { before, beforeEach, describe, test } from "node:test";
+import { Timestamp } from "firebase-admin/firestore";
 import { ROLES } from "@durin-tech/authz";
 import { store } from "../helpers/fake-firestore";
 import {
@@ -20,9 +21,11 @@ import {
   auditRows, installMessageAccessFakes, resetMessageAccess, seedApproval, seedChat, seedPlan,
 } from "./harness";
 import { aiMessageAccessController } from "../../src/controllers/ai-message-access.controller";
-import { getConversation, listConversations, setAiAccess } from "../../src/controllers/messaging.controller";
+import { getConversation, listConversations } from "../../src/controllers/messaging.controller";
 import { adminUsersRouter, userRoutes } from "../../src/routes/user.routes";
 import { verifyAdmin } from "../../src/middleware/auth";
+import { messagingRoutes as messagingRouter } from "../../src/routes/messaging.routes";
+import { aiMessageAccessService } from "../../src/services/ai-message-access.service";
 import { CURRENT_APPROVAL_WORDING, CURRENT_NOTICE_WORDING, wordingText } from "../../src/services/message-access/wording";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -197,82 +200,19 @@ describe("account-wide off and the one-time notice", () => {
   });
 });
 
-describe("per-chat switch", () => {
-  test("applicant switches own side only; the agent's side is untouched; audit says who/what/which chat", async () => {
-    const res = mockRes();
-    await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: true } }), res);
-    assert.equal(res.statusCode, 200);
-    const conv: any = store.get(`conversations/${CONV}`);
-    assert.equal(conv.aiAccessOffUser, true);
-    assert.equal(conv.aiAccessOffAgent, undefined);
-    assert.deepEqual(auditRows().map((r) => ({ a: r.actorUid, act: r.action, c: r.conversationId, s: r.side, v: r.newValue })), [
-      { a: APPLICANT, act: "chat_switched_off", c: CONV, s: "user", v: true },
-    ]);
+describe("per-chat switch is retired (#209)", () => {
+  test("PUT /conversations/:id/ai-access has no route (the router answers 404)", () => {
+    const stack: any[] = (messagingRouter as any).stack;
+    const matches = stack.filter(
+      (l) => l.route && l.route.methods.put && l.match(`/${CONV}/ai-access`)
+    );
+    assert.equal(matches.length, 0, "no PUT handler matches /:id/ai-access");
+    // Any method on that path: nothing registered either.
+    assert.equal(stack.filter((l) => l.route && l.match(`/${CONV}/ai-access`)).length, 0);
   });
 
-  test("agent switches own side only", async () => {
-    await setAiAccess(agentReq({ params: { id: CONV }, body: { off: true } }), mockRes());
-    const conv: any = store.get(`conversations/${CONV}`);
-    assert.equal(conv.aiAccessOffAgent, true);
-    assert.equal(conv.aiAccessOffUser, undefined);
-  });
-
-  test("a participant can never change the other side, even by naming it in the body", async () => {
-    await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: true, side: "agent", aiAccessOffAgent: true } }), mockRes());
-    const conv: any = store.get(`conversations/${CONV}`);
-    assert.equal(conv.aiAccessOffAgent, undefined);
-    // Switching back on only undoes the caller's own side.
-    await setAiAccess(agentReq({ params: { id: CONV }, body: { off: true } }), mockRes());
-    await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: false } }), mockRes());
-    const after: any = store.get(`conversations/${CONV}`);
-    assert.equal(after.aiAccessOffUser, false);
-    assert.equal(after.aiAccessOffAgent, true, "the agent's switch stays off");
-  });
-
-  test("a non-participant gets 403 and nothing changes; an unknown id gets 404; a bad body gets 400", async () => {
-    const before = snapshot();
-    let res = mockRes();
-    await setAiAccess(req("uid-stranger", { params: { id: CONV }, body: { off: true } }), res);
-    assert.equal(res.statusCode, 403);
-    res = mockRes();
-    await setAiAccess(req("uid-stranger", { params: { id: "no-such" }, body: { off: true } }), res);
-    assert.equal(res.statusCode, 404);
-    res = mockRes();
-    await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: "no" } }), res);
-    assert.equal(res.statusCode, 400);
-    assert.equal(snapshot(), before);
-  });
-
-  test("an agent of another agency who is not a participant is refused", async () => {
-    store.set("agents/agent-doc-b", { id: "agent-doc-b", userId: "uid-agent-b", agencyId: "agency-b" });
-    const res = mockRes();
-    await setAiAccess(req("uid-agent-b", { params: { id: CONV }, body: { off: true } }, ROLES.AGENT), res);
-    assert.equal(res.statusCode, 403);
-    assert.equal((store.get(`conversations/${CONV}`) as any).aiAccessOffAgent, undefined);
-  });
-
-  test("a caller who matches BOTH sides (id-swap) changes only the applicant side, never the other", async () => {
-    // The attack state: the agent has written their own uid into conv.userId.
-    store.set(`conversations/${CONV}`, { ...(store.get(`conversations/${CONV}`) as object), userId: AGENT_USER, aiAccessOffUser: true });
-    await setAiAccess(agentReq({ params: { id: CONV }, body: { off: false } }), mockRes());
-    const conv: any = store.get(`conversations/${CONV}`);
-    // One side only: the applicant-side field is the one the caller matched first,
-    // and the agent side is untouched (no both-sides write).
-    assert.equal(conv.aiAccessOffAgent, undefined);
-    assert.equal(auditRows().length, 1);
-  });
-
-  test("switching to the value it already has writes no audit row", async () => {
-    await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: false } }), mockRes());
-    assert.equal(auditRows().length, 0);
-  });
-
-  test("works for a person who does not qualify (owner decision)", async () => {
-    const res = mockRes();
-    await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: true } }), res);
-    assert.equal(res.statusCode, 200);
-    assert.equal(res.body.data.aiAccess.qualifies, false);
-    assert.equal(res.body.data.aiAccess.myAiAccess, "off");
+  test("the service has no chat-switch writer any more", () => {
+    assert.equal((aiMessageAccessService as any).setChatSwitch, undefined);
   });
 });
 
@@ -281,14 +221,14 @@ describe("conversation response", () => {
     seedApproval(AGENT_USER);
     seedPlan(AGENT_USER);
     seedPlan(APPLICANT);
-    await setAiAccess(agentReq({ params: { id: CONV }, body: { off: true } }), mockRes());
+    // The other person (agent) has AI off in all their chats.
+    await aiMessageAccessController.setAccountWideOff(agentReq({ body: { off: true } }), mockRes());
 
     const res = mockRes();
     await getConversation(req(APPLICANT, { params: { id: CONV } }), res);
     const d = res.body.data;
     assert.deepEqual(d.aiAccess, {
       myAiAccess: "on",
-      myChatSwitchOff: false,
       accountWideOff: false,
       otherSwitchedOff: true,
       qualifies: true,
@@ -304,7 +244,6 @@ describe("conversation response", () => {
     const mine = mockRes();
     await getConversation(req(APPLICANT, { params: { id: CONV } }), mine);
     assert.equal(mine.body.data.aiAccess.myAiAccess, "off");
-    assert.equal(mine.body.data.aiAccess.myChatSwitchOff, false);
     assert.equal(mine.body.data.aiAccess.accountWideOff, true);
     const theirs = mockRes();
     await getConversation(agentReq({ params: { id: CONV } }), theirs);
@@ -318,6 +257,24 @@ describe("conversation response", () => {
     // Token claims say admin (no plan): a stale token must not change the label.
     await getConversation(req(APPLICANT, { params: { id: CONV } }, ROLES.ADMIN), res);
     assert.equal(res.body.data.aiAccess.qualifies, true);
+  });
+
+  test("old per-chat values on the document are ignored in the view and stripped from the response", async () => {
+    store.set(`conversations/${CONV}`, { ...(store.get(`conversations/${CONV}`) as object), aiAccessOffUser: true, aiAccessOffAgent: true });
+    const res = mockRes();
+    await getConversation(req(APPLICANT, { params: { id: CONV } }), res);
+    assert.deepEqual(Object.keys(res.body.data.aiAccess).sort(), ["accountWideOff", "myAiAccess", "otherSwitchedOff", "qualifies"]);
+    assert.equal(res.body.data.aiAccess.myAiAccess, "on");
+    assert.equal(res.body.data.aiAccess.otherSwitchedOff, false);
+    assert.equal("aiAccessOffUser" in res.body.data, false);
+    assert.equal("aiAccessOffAgent" in res.body.data, false);
+  });
+
+  test("otherSwitchedOff is true when the other person cannot be resolved (agent doc missing)", async () => {
+    store.delete("agents/agent-doc-1");
+    const res = mockRes();
+    await getConversation(req(APPLICANT, { params: { id: CONV } }), res);
+    assert.equal(res.body.data.aiAccess.otherSwitchedOff, true);
   });
 
   test("an old conversation with no switch fields reads as on", async () => {
@@ -337,29 +294,27 @@ describe("conversation response", () => {
   });
 
   test("the list carries the same view and strips the raw fields", async () => {
-    await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: true } }), mockRes());
+    await aiMessageAccessController.setAccountWideOff(req(APPLICANT, { body: { off: true } }), mockRes());
+    store.set(`conversations/${CONV}`, { ...(store.get(`conversations/${CONV}`) as object), aiAccessOffUser: true });
     store.set(`users/${APPLICANT}`, { firstName: "A", lastName: "B", email: "delivered+applicant@resend.dev" });
     const res = mockRes();
     await listConversations(req(APPLICANT), res);
     assert.equal(res.statusCode, 200);
     const [c] = res.body.data;
     assert.equal(c.aiAccess.myAiAccess, "off");
-    assert.equal(c.aiAccess.myChatSwitchOff, true);
     assert.equal("aiAccessOffUser" in c, false);
     assert.equal("aiAccessOffAgent" in c, false);
   });
 });
 
 describe("audit trail", () => {
-  test("every approval, revoke, switch and account-wide change writes who/what/which chat/new value/time", async () => {
+  test("every approval, revoke and account-wide change writes who/what/new value/time", async () => {
     await aiMessageAccessController.approve(req(APPLICANT, { body: { wordingVersion: CURRENT_APPROVAL_WORDING.versionId } }), mockRes());
     await aiMessageAccessController.revoke(req(APPLICANT), mockRes());
-    await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: true } }), mockRes());
-    await setAiAccess(req(APPLICANT, { params: { id: CONV }, body: { off: false } }), mockRes());
     await aiMessageAccessController.setAccountWideOff(req(APPLICANT, { body: { off: true } }), mockRes());
     const rows = auditRows();
     assert.deepEqual(rows.map((r) => r.action), [
-      "approval_granted", "approval_revoked", "chat_switched_off", "chat_switched_on", "account_wide_off_enabled",
+      "approval_granted", "approval_revoked", "account_wide_off_enabled",
     ]);
     for (const r of rows) {
       assert.equal(r.actorUid, APPLICANT);
@@ -368,7 +323,6 @@ describe("audit trail", () => {
       assert.ok(r.createdAt && r.id);
     }
     assert.equal(rows[0].wordingVersion, CURRENT_APPROVAL_WORDING.versionId);
-    assert.equal(rows[2].conversationId, CONV);
   });
 
   test("the admin read route is behind verifyAdmin, and nothing can edit or delete audit rows", () => {
@@ -380,6 +334,18 @@ describe("audit trail", () => {
     // No route anywhere on the user router mentions the audit trail (so no write path).
     const userAudit = (userRoutes as any).stack.filter((l: any) => String(l.route?.path ?? "").includes("audit"));
     assert.equal(userAudit.length, 0);
+  });
+
+  test("old chat_switched_* audit rows stay readable through the admin route", async () => {
+    // Rows written by the retired switch (#172) are history: still returned as they are.
+    store.set("aiMessageAccessAudit/old-1", {
+      id: "old-1", actorUid: APPLICANT, subjectUid: APPLICANT, action: "chat_switched_off",
+      newValue: true, conversationId: CONV, side: "user", createdAt: Timestamp.fromMillis(1000),
+    });
+    const res = mockRes();
+    await aiMessageAccessController.listAudit({ params: { uid: APPLICANT }, query: {} } as any, res);
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.body.data.map((r: any) => [r.action, r.conversationId, r.side]), [["chat_switched_off", CONV, "user"]]);
   });
 
   test("admin route returns the person's rows (ordered by time, newest first)", async () => {

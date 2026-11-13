@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { before, beforeEach, describe, test } from "node:test";
 import { ROLES } from "@durin-tech/authz";
-import { installMessageAccessFakes, resetMessageAccess, seedApproval, seedChat, seedMessage, seedPlan } from "./harness";
+import { installMessageAccessFakes, resetMessageAccess, seedAccountWideOff, seedApproval, seedChat, seedMessage, seedPlan } from "./harness";
 import { aiMessageAccessService } from "../../src/services/ai-message-access.service";
 import { CURRENT_APPROVAL_WORDING } from "../../src/services/message-access/wording";
 import { messageAccessService, type AiMessageBatchItem, type MessageAccessPrincipal } from "../../src/services/message-access.service";
@@ -30,10 +30,11 @@ before(async () => {
 
 beforeEach(() => {
   resetMessageAccess();
-  // c-off: both qualify but the applicant switched the chat off.
-  seedChat({ convId: "c-off", applicantUid: "app-off", agentUid: "ag-off", agentDocId: "agd-off", aiAccessOffUser: true });
+  // c-off: both qualify but the applicant has the account-wide "off" setting on.
+  seedChat({ convId: "c-off", applicantUid: "app-off", agentUid: "ag-off", agentDocId: "agd-off" });
   seedApproval("app-off");
   seedApproval("ag-off");
+  seedAccountWideOff("app-off");
   // c-none: nobody qualifies.
   seedChat({ convId: "c-none", applicantUid: "app-none", agentUid: "ag-none", agentDocId: "agd-none" });
   // c-ok: only the applicant qualifies (plan), so only their messages may appear.
@@ -52,11 +53,11 @@ describe("batch built through the helper", () => {
     assert.equal(items.length, 1);
   });
 
-  test("a chat switched off after the batch is built is dropped at send time", async () => {
+  test("a chat whose owner turns AI off in all chats after the batch is built is dropped at send time", async () => {
     const built = await messageAccessService.buildAiMessageBatch(admin, ["c-ok"]);
     assert.equal(built.length, 1);
-    // The applicant switches the chat off between build and send.
-    await aiMessageAccessService.setChatSwitch("c-ok", "app-ok", null, true);
+    // The applicant turns the account-wide setting on between build and send.
+    await aiMessageAccessService.setAccountWideOff("app-ok", true);
     const toSend = await messageAccessService.recheckAiMessageBatch(admin, built);
     assert.deepEqual(toRequests(toSend), []);
   });

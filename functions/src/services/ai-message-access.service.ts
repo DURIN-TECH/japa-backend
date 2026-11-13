@@ -15,11 +15,10 @@ import type {
   AiMessageAccessAuditAction,
   AiMessageAccessAuditRecord,
   AiMessageAccessRecord,
-  Conversation,
 } from "../types";
 
 // ============================================
-// AI message access: approvals, account-wide setting, notice, chat switch (#172)
+// AI message access: approvals, account-wide setting, notice (#172; per-chat switch retired in #209)
 // ============================================
 //
 // Owns every WRITE to the consent state and the audit trail. It never reads
@@ -43,13 +42,11 @@ export class AiMessageAccessError extends Error {
 
 /** The switch / plan view of one conversation for ONE participant. */
 export interface ConversationAiAccessView {
-  /** Effective state for me: "off" when my chat switch OR my account-wide setting is off. */
+  /** Effective state for me: "off" only when my account-wide setting is off (no per-chat switch). */
   myAiAccess: "on" | "off";
-  /** My own per-chat switch only (true = I switched this chat off). */
-  myChatSwitchOff: boolean;
   /** My account-wide off setting (so the UI can say "off in all your chats"). */
   accountWideOff: boolean;
-  /** Yes/no only: the OTHER person has this chat off (their switch or their account-wide off). */
+  /** Yes/no only: the OTHER person has AI access off (their account-wide off), or cannot be resolved. */
   otherSwitchedOff: boolean;
   /** I currently qualify (active approval or AI plan). Says nothing about the other person. */
   qualifies: boolean;
@@ -158,27 +155,24 @@ class AiMessageAccessService {
   }
 
   /**
-   * Build the switch view of a conversation for one participant.
-   * `side` says which participant the caller is; `otherUid` is the other
-   * person's USER uid (the applicant's, or the agent doc's user), `null` when it
-   * cannot be resolved (then the other side is treated as off: unknown is not on).
+   * Build the AI-access view of a conversation for one participant.
+   * It depends only on the two people's account-wide settings and the caller's
+   * own approval/plan (there is no per-chat switch, retired in #209).
+   * `otherResolved` is false when the other person's user could not be resolved:
+   * then the other side is treated as off (unknown is not on).
    */
   buildConversationView(
-    conv: Conversation,
-    side: "user" | "agent",
     me: { record: AiMessageAccessRecord | null; hasAiPlan: boolean },
     otherRecord: AiMessageAccessRecord | null,
     otherResolved: boolean
   ): ConversationAiAccessView {
-    const mySwitch = (side === "user" ? conv.aiAccessOffUser : conv.aiAccessOffAgent) === true;
-    const otherSwitch = (side === "user" ? conv.aiAccessOffAgent : conv.aiAccessOffUser) === true;
+    // Old per-chat values on the conversation document are deliberately never read.
     const myAccountOff = me.record?.accountWideOff === true;
     const otherAccountOff = otherRecord?.accountWideOff === true;
     return {
-      myAiAccess: mySwitch || myAccountOff ? "off" : "on",
-      myChatSwitchOff: mySwitch,
+      myAiAccess: myAccountOff ? "off" : "on",
       accountWideOff: myAccountOff,
-      otherSwitchedOff: otherSwitch || otherAccountOff || !otherResolved,
+      otherSwitchedOff: otherAccountOff || !otherResolved,
       qualifies: isApprovalActive(me.record) || me.hasAiPlan,
     };
   }
@@ -287,62 +281,6 @@ class AiMessageAccessService {
       { userId, noticeDismissedAt: now, noticeDismissedVersion: CURRENT_NOTICE_WORDING.versionId, updatedAt: now },
       { merge: true }
     );
-  }
-
-  /**
-   * Set the caller's OWN side of a chat's switch.
-   *
-   * Participant rule is the messaging module's: the applicant (`conv.userId`) or
-   * the agent whose doc id is `conv.agentId`. Exactly one side is written: the
-   * caller's own (applicant side first if they somehow match both). The
-   * conversation is re-read inside the transaction so the decision and the write
-   * see the same document. Returns the updated conversation.
-   *
-   * @param callerAgentId the caller's agent doc id (null when they are not an agent)
-   */
-  async setChatSwitch(
-    conversationId: string,
-    userId: string,
-    callerAgentId: string | null,
-    off: boolean
-  ): Promise<Conversation> {
-    const ref = collections.conversations.doc(conversationId);
-    return this.runTransaction(async (tx) => {
-      const snap = await tx.get(ref);
-      if (!snap.exists) throw new AiMessageAccessError("NOT_FOUND", "Conversation not found");
-      const conv = snap.data() as Conversation;
-      // ONE side only. The applicant side wins if the caller matches both (the
-      // same person on both sides is not a legitimate chat; it is what an id-swap
-      // attack looks like), so a caller can never reach the other side's switch.
-      const userSide = conv.userId === userId;
-      const agentSide = !userSide && !!callerAgentId && conv.agentId === callerAgentId;
-      if (!userSide && !agentSide) throw new AiMessageAccessError("FORBIDDEN", "Not a participant");
-
-      const updates: Record<string, unknown> = {};
-      const changed: ("user" | "agent")[] = [];
-      if (userSide && (conv.aiAccessOffUser === true) !== off) {
-        updates.aiAccessOffUser = off;
-        changed.push("user");
-      }
-      if (agentSide && (conv.aiAccessOffAgent === true) !== off) {
-        updates.aiAccessOffAgent = off;
-        changed.push("agent");
-      }
-      // Deliberately no `updatedAt` bump: a privacy switch is not chat activity.
-      if (changed.length === 0) return conv;
-      tx.update(ref, updates);
-      for (const side of changed) {
-        this.queueAudit(tx, {
-          actorUid: userId,
-          subjectUid: userId,
-          action: off ? "chat_switched_off" : "chat_switched_on",
-          newValue: off,
-          conversationId,
-          side,
-        });
-      }
-      return { ...conv, ...updates } as Conversation;
-    });
   }
 
   // ---------- admin read of the audit trail ----------

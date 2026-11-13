@@ -8,7 +8,6 @@ import { collections } from "../utils/firebase";
 import { Conversation, Agent, AiMessageAccessRecord } from "../types";
 import {
   aiMessageAccessService,
-  AiMessageAccessError,
   type ConversationAiAccessView,
 } from "../services/ai-message-access.service";
 
@@ -101,10 +100,10 @@ async function notifyRecipient(
 
 /**
  * Turn stored conversations into API conversations for ONE participant:
- *  - removes the raw per-side switch fields (`aiAccessOffUser/Agent`): the client
- *    gets its OWN state and a yes/no for the other side, never which side is which;
- *  - adds `aiAccess`: { myAiAccess, myChatSwitchOff, accountWideOff,
- *    otherSwitchedOff, qualifies } (see ConversationAiAccessView).
+ *  - strips the old per-side switch fields (`aiAccessOffUser/Agent`, retired in
+ *    #209 and ignored everywhere) so they never reach a client;
+ *  - adds `aiAccess`: { myAiAccess, accountWideOff, otherSwitchedOff, qualifies }
+ *    (see ConversationAiAccessView).
  *
  * `aiAccess` is `null` when it could not be computed (a failed read). Clients
  * must treat null as "unknown", never as "on". It never exposes the other
@@ -162,7 +161,7 @@ async function withAiAccess<T extends Conversation>(
           const side: "user" | "agent" = conv.userId === userId ? "user" : "agent";
           const otherUid = side === "user" ? await agentUid(conv.agentId) : conv.userId;
           const otherRecord = otherUid ? await recordOf(otherUid) : null;
-          aiAccess = aiMessageAccessService.buildConversationView(conv, side, me, otherRecord, !!otherUid);
+          aiAccess = aiMessageAccessService.buildConversationView(me, otherRecord, !!otherUid);
         }
       } catch (e) {
         console.error("[messaging] AI access view failed:", (e as Error)?.message);
@@ -243,7 +242,7 @@ export async function createConversation(req: AuthenticatedRequest, res: Respons
       applicationId
     );
 
-    // Same shape as the list: own switch state in, raw per-side fields out (#172).
+    // Same shape as the list: own AI-access view in, old per-side fields out.
     const [withAccess] = await withAiAccess([conversation], req);
     sendCreated(res, withAccess);
   } catch (error: unknown) {
@@ -409,45 +408,6 @@ export async function getConversation(req: AuthenticatedRequest, res: Response):
     sendSuccess(res, { ...withAccess, ...(await withNames(conv)) });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Failed to fetch conversation";
-    sendError(res, "INTERNAL_ERROR", message, 500);
-  }
-}
-
-/**
- * PUT /conversations/:id/ai-access — switch AI access to this chat off or on
- * for the CALLER's own side only (issue #172).
- *
- * Body: { off: boolean }.  Any participant may switch their side off or on,
- * whether or not they currently qualify (owner decision, 2026-11-13). Nobody can
- * touch the other side. Takes effect on the next read (no cache).
- *
- * 200 -> the conversation (same shape as GET /conversations/:id)
- * 400 VALIDATION_ERROR (off not a boolean), 403 not a participant, 404 unknown id.
- */
-export async function setAiAccess(req: AuthenticatedRequest, res: Response): Promise<void> {
-  try {
-    const userId = req.userId!;
-    const { off } = (req.body ?? {}) as { off?: unknown };
-    if (typeof off !== "boolean") {
-      sendError(res, "VALIDATION_ERROR", "`off` must be a boolean", 400);
-      return;
-    }
-    const agentId = await getAgentId(userId);
-    const conv = await aiMessageAccessService.setChatSwitch(req.params.id, userId, agentId, off);
-    const [withAccess] = await withAiAccess([conv], req);
-    sendSuccess(res, { ...withAccess, ...(await withNames(conv)) });
-  } catch (error: unknown) {
-    if (error instanceof AiMessageAccessError) {
-      if (error.code === "NOT_FOUND") {
-        sendNotFound(res, "Conversation not found");
-        return;
-      }
-      if (error.code === "FORBIDDEN") {
-        sendForbidden(res);
-        return;
-      }
-    }
-    const message = error instanceof Error ? error.message : "Failed to update AI access";
     sendError(res, "INTERNAL_ERROR", message, 500);
   }
 }

@@ -119,8 +119,6 @@ class MessageAccessService {
       this.partyStatus(participants.agentUid),
     ]);
     const decision = decideMessageAccess({
-      switchOffUser: conv.aiAccessOffUser === true,
-      switchOffAgent: conv.aiAccessOffAgent === true,
       applicant,
       agent,
     });

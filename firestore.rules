@@ -467,11 +467,10 @@ service cloud.firestore {
                      (exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid));
       
-      // AI message access (issue #172): the per-side chat switch and WHO the two
-      // sides are. The switch fields are written ONLY by the backend
-      // (PUT /conversations/:id/ai-access, Admin SDK, which bypasses these rules):
-      // the API enforces "you can change only your own side" and writes the audit
-      // record in the same transaction.
+      // AI message access (issues #172, #209): WHO the two sides are must not be
+      // client-writable. The per-chat switch fields (`aiAccessOffUser/Agent`) are
+      // RETIRED (#209): nothing writes or reads them any more, and clients still
+      // cannot write them (the allow-list below and the create check).
       //
       // Updates are an ALLOW-LIST, not a deny-list. A deny-list of the two switch
       // fields was not enough: a participant could rewrite `userId` / `agentId`

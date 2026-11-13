@@ -136,13 +136,12 @@ export async function verifyAuth(
       path.endsWith("/users/me/change-email") ||
       (method === "DELETE" && path.endsWith("/users/me")) ||
       // AI message access (#172): withdrawing approval, the account-wide off
-      // setting, a chat's AI switch and the notice dismissal are privacy
+      // setting and the notice dismissal are privacy
       // controls over a person's own messages. A lapsed plan must not stop them.
       // Listed route by route and method (granting approval stays plan-gated).
       (method === "DELETE" && path.endsWith("/users/me/ai-message-access/approval")) ||
       (method === "PUT" && path.endsWith("/users/me/ai-message-access/account-wide-off")) ||
-      (method === "POST" && path.endsWith("/users/me/ai-message-access/notice-dismissed")) ||
-      (method === "PUT" && /\/conversations\/[^/]+\/ai-access$/.test(path));
+      (method === "POST" && path.endsWith("/users/me/ai-message-access/notice-dismissed"));
 
     if (
       isWrite &&
