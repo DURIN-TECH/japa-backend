@@ -82,7 +82,11 @@ describe("conversation AI switch is backend-only", () => {
     const db = await clientDb(APPLICANT, { role: "client", agencyId: null });
     const ref = db.collection("conversations").doc(CONV);
     assert.equal(await isDenied(ref.update({ lastMessage: "forged" })), true);
-    assert.equal(await isDenied(ref.update({ unreadCountUser: 0, userId: APPLICANT })), true);
+    // (A write that sets a field to the value it already has changes nothing, so it is
+    // not a "changed key" and is allowed: use a field whose value really changes.)
+    assert.equal(await isDenied(ref.update({ unreadCountUser: 0, lastMessage: "x" })), true);
+    assert.equal(await isDenied(ref.update({ unreadCountUser: 0, userId: "someone-else" })), true);
+    assert.equal(await isDenied(ref.update({ unreadCountUser: 0, aiAccessOffAgent: true })), true);
   });
 
   test("ids and switch fields were never changed", async () => {
