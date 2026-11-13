@@ -50,6 +50,9 @@ const COLLECTIONS = [
   "outcomeStatisticsRunRequests",
   // Rubric tree: the parent and its backend-only version subcollection.
   "visaRubrics",
+  // AI message access (issue #172): approvals + the append-only audit trail.
+  "aiMessageAccess",
+  "aiMessageAccessAudit",
 ];
 
 /** Subcollections the backend writes (parent collection, parent id, name). */

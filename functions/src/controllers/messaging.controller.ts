@@ -5,7 +5,12 @@ import { notificationService } from "../services/notification.service";
 import { userService } from "../services/user.service";
 import { sendSuccess, sendCreated, sendError, sendNotFound, sendForbidden } from "../utils/response";
 import { collections } from "../utils/firebase";
-import { Conversation } from "../types";
+import { Conversation, Agent, AiMessageAccessRecord } from "../types";
+import {
+  aiMessageAccessService,
+  AiMessageAccessError,
+  type ConversationAiAccessView,
+} from "../services/ai-message-access.service";
 
 /**
  * Check if the authenticated user is a participant in the conversation.
@@ -90,6 +95,97 @@ async function notifyRecipient(
   });
 }
 
+// ============================================
+// AI message access view (issue #172)
+// ============================================
+
+/**
+ * Turn stored conversations into API conversations for ONE participant:
+ *  - removes the raw per-side switch fields (`aiAccessOffUser/Agent`): the client
+ *    gets its OWN state and a yes/no for the other side, never which side is which;
+ *  - adds `aiAccess`: { myAiAccess, myChatSwitchOff, accountWideOff,
+ *    otherSwitchedOff, qualifies } (see ConversationAiAccessView).
+ *
+ * `aiAccess` is `null` when it could not be computed (a failed read). Clients
+ * must treat null as "unknown", never as "on". It never exposes the other
+ * person's approval or plan: `otherSwitchedOff` is a single yes/no that also
+ * covers their account-wide setting.
+ *
+ * Reads are shared across the list: the caller's record + plan once, and each
+ * distinct other person's record once.
+ */
+async function withAiAccess<T extends Conversation>(
+  convs: T[],
+  req: AuthenticatedRequest
+): Promise<(Omit<T, "aiAccessOffUser" | "aiAccessOffAgent"> & { aiAccess: ConversationAiAccessView | null })[]> {
+  const userId = req.userId!;
+  // Caller's own record + plan, once. A failure leaves `me` null -> aiAccess null.
+  const mePromise: Promise<{ record: AiMessageAccessRecord | null; hasAiPlan: boolean } | null> = (async () => {
+    try {
+      const [record, hasAiPlan] = await Promise.all([
+        aiMessageAccessService.getRecord(userId),
+        req.authz ? aiMessageAccessService.subjectHasAiPlan(req.authz) : Promise.resolve(false),
+      ]);
+      return { record, hasAiPlan };
+    } catch (e) {
+      console.error("[messaging] AI access state failed:", (e as Error)?.message);
+      return null;
+    }
+  })();
+
+  // Per-request caches so a long list does not re-read the same person.
+  const agentUidCache = new Map<string, Promise<string | null>>();
+  const recordCache = new Map<string, Promise<AiMessageAccessRecord | null>>();
+  const agentUid = (agentDocId: string) => {
+    if (!agentUidCache.has(agentDocId)) {
+      agentUidCache.set(
+        agentDocId,
+        collections.agents.doc(agentDocId).get().then((d) => (d.exists ? ((d.data() as Agent).userId ?? null) : null))
+      );
+    }
+    return agentUidCache.get(agentDocId)!;
+  };
+  const recordOf = (uid: string) => {
+    if (!recordCache.has(uid)) recordCache.set(uid, aiMessageAccessService.getRecord(uid));
+    return recordCache.get(uid)!;
+  };
+
+  return Promise.all(
+    convs.map(async (conv) => {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { aiAccessOffUser, aiAccessOffAgent, ...rest } = conv;
+      let aiAccess: ConversationAiAccessView | null = null;
+      try {
+        const me = await mePromise;
+        if (me) {
+          const side: "user" | "agent" = conv.userId === userId ? "user" : "agent";
+          const otherUid = side === "user" ? await agentUid(conv.agentId) : conv.userId;
+          const otherRecord = otherUid ? await recordOf(otherUid) : null;
+          aiAccess = aiMessageAccessService.buildConversationView(conv, side, me, otherRecord, !!otherUid);
+        }
+      } catch (e) {
+        console.error("[messaging] AI access view failed:", (e as Error)?.message);
+      }
+      return { ...rest, aiAccess };
+    })
+  );
+}
+
+/** Add participant names to a conversation (list + single-conversation responses). */
+async function withNames<T extends Conversation>(conv: T) {
+  const [userDoc, agentDoc] = await Promise.all([
+    collections.users.doc(conv.userId).get(),
+    collections.agents.doc(conv.agentId).get(),
+  ]);
+  const userData = userDoc.data();
+  const agentData = agentDoc.data();
+  return {
+    userName: userData ? `${userData.firstName} ${userData.lastName}` : "Unknown",
+    userEmail: userData?.email,
+    agentName: agentData?.displayName || "Unknown",
+  };
+}
+
 /**
  * GET /conversations — list conversations for the authenticated user
  */
@@ -99,22 +195,10 @@ export async function listConversations(req: AuthenticatedRequest, res: Response
     const agentId = await getAgentId(userId);
     const conversations = await messagingService.getConversations(userId, agentId || undefined);
 
-    // Enrich with participant names
+    // Enrich with participant names and the caller's AI-access view (#172).
+    const withAccess = await withAiAccess(conversations, req);
     const enriched = await Promise.all(
-      conversations.map(async (conv) => {
-        const [userDoc, agentDoc] = await Promise.all([
-          collections.users.doc(conv.userId).get(),
-          collections.agents.doc(conv.agentId).get(),
-        ]);
-        const userData = userDoc.data();
-        const agentData = agentDoc.data();
-        return {
-          ...conv,
-          userName: userData ? `${userData.firstName} ${userData.lastName}` : "Unknown",
-          userEmail: userData?.email,
-          agentName: agentData?.displayName || "Unknown",
-        };
-      })
+      withAccess.map(async (conv, i) => ({ ...conv, ...(await withNames(conversations[i])) }))
     );
 
     sendSuccess(res, enriched);
@@ -158,7 +242,9 @@ export async function createConversation(req: AuthenticatedRequest, res: Respons
       applicationId
     );
 
-    sendCreated(res, conversation);
+    // Same shape as the list: own switch state in, raw per-side fields out (#172).
+    const [withAccess] = await withAiAccess([conversation], req);
+    sendCreated(res, withAccess);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Failed to create conversation";
     sendError(res, "INTERNAL_ERROR", message, 500);
@@ -295,6 +381,72 @@ export async function deleteConversation(req: AuthenticatedRequest, res: Respons
     sendSuccess(res, { deleted: true });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Failed to delete conversation";
+    sendError(res, "INTERNAL_ERROR", message, 500);
+  }
+}
+
+/**
+ * GET /conversations/:id — one conversation, with names and the caller's
+ * AI-access view (issue #172). Lets a client refetch a single chat after a
+ * switch or an approval without reloading the whole list.
+ * 404 unknown id, 403 not a participant.
+ */
+export async function getConversation(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const userId = req.userId!;
+    const conv = await messagingService.getConversationById(req.params.id);
+    if (!conv) {
+      sendNotFound(res, "Conversation not found");
+      return;
+    }
+    const agentId = await getAgentId(userId);
+    if (!(conv.userId === userId || (!!agentId && conv.agentId === agentId))) {
+      sendForbidden(res);
+      return;
+    }
+    const [withAccess] = await withAiAccess([conv], req);
+    sendSuccess(res, { ...withAccess, ...(await withNames(conv)) });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Failed to fetch conversation";
+    sendError(res, "INTERNAL_ERROR", message, 500);
+  }
+}
+
+/**
+ * PUT /conversations/:id/ai-access — switch AI access to this chat off or on
+ * for the CALLER's own side only (issue #172).
+ *
+ * Body: { off: boolean }.  Any participant may switch their side off or on,
+ * whether or not they currently qualify (owner decision, 2026-11-13). Nobody can
+ * touch the other side. Takes effect on the next read (no cache).
+ *
+ * 200 -> the conversation (same shape as GET /conversations/:id)
+ * 400 VALIDATION_ERROR (off not a boolean), 403 not a participant, 404 unknown id.
+ */
+export async function setAiAccess(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const userId = req.userId!;
+    const { off } = (req.body ?? {}) as { off?: unknown };
+    if (typeof off !== "boolean") {
+      sendError(res, "VALIDATION_ERROR", "`off` must be a boolean", 400);
+      return;
+    }
+    const agentId = await getAgentId(userId);
+    const conv = await aiMessageAccessService.setChatSwitch(req.params.id, userId, agentId, off);
+    const [withAccess] = await withAiAccess([conv], req);
+    sendSuccess(res, { ...withAccess, ...(await withNames(conv)) });
+  } catch (error: unknown) {
+    if (error instanceof AiMessageAccessError) {
+      if (error.code === "NOT_FOUND") {
+        sendNotFound(res, "Conversation not found");
+        return;
+      }
+      if (error.code === "FORBIDDEN") {
+        sendForbidden(res);
+        return;
+      }
+    }
+    const message = error instanceof Error ? error.message : "Failed to update AI access";
     sendError(res, "INTERNAL_ERROR", message, 500);
   }
 }

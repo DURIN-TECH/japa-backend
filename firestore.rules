@@ -467,12 +467,25 @@ service cloud.firestore {
                      (exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid));
       
-      // Authenticated users can create conversations
+      // AI message access (issue #172): the per-side chat switch. These two
+      // fields are written ONLY by the backend (PUT /conversations/:id/ai-access,
+      // Admin SDK, which bypasses these rules), because the API enforces "you can
+      // change only your own side" and writes the audit record in the same
+      // transaction. A direct client write would skip both.
+      function touchesAiSwitch() {
+        return request.resource.data.diff(resource.data).affectedKeys()
+                 .hasAny(['aiAccessOffUser', 'aiAccessOffAgent']);
+      }
+
+      // Authenticated users can create conversations (but cannot create one that
+      // already carries a chat switch value).
       allow create: if isAuthenticated() && 
-                      request.resource.data.userId == request.auth.uid;
+                      request.resource.data.userId == request.auth.uid &&
+                      !request.resource.data.keys().hasAny(['aiAccessOffUser', 'aiAccessOffAgent']);
       
-      // Participants can update conversations
+      // Participants can update conversations, except the AI switch fields.
       allow update: if isAuthenticated() &&
+                      !touchesAiSwitch() &&
                       (resource.data.userId == request.auth.uid ||
                        (exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
                         get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid));

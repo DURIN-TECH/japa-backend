@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { userController } from "../controllers/user.controller";
 import { clientVerificationController } from "../controllers/client-verification.controller";
+import { aiMessageAccessController } from "../controllers/ai-message-access.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
 
 const router = Router();
@@ -11,6 +12,12 @@ const router = Router();
 const adminUsersRouter = Router();
 adminUsersRouter.get("/", verifyAuth, verifyAdmin, (req, res) =>
   userController.listAllUsers(req, res)
+);
+
+// Admin-only: read one person's AI message access audit trail (issue #172).
+// Read-only by design: there is no route that edits or deletes audit records.
+adminUsersRouter.get("/:uid/ai-message-access-audit", verifyAuth, verifyAdmin, (req, res) =>
+  aiMessageAccessController.listAudit(req, res)
 );
 
 // Admin-only: manage a user's RBAC role/claims.
@@ -44,6 +51,26 @@ router.post("/me/change-email", verifyAuth, (req, res) =>
 // toggle one or both channels.
 router.patch("/me/notification-preferences", verifyAuth, (req, res) =>
   userController.updateNotificationPreferences(req, res)
+);
+
+// AI message access (issue #172): the caller's own approval for intelligent
+// analysis of their messages, the account-wide "off" setting and the one-time
+// notice dismissal. Always the caller's own data (/me); a request naming another
+// user id is refused with 403.
+router.get("/me/ai-message-access", verifyAuth, (req, res) =>
+  aiMessageAccessController.getState(req, res)
+);
+router.post("/me/ai-message-access/approval", verifyAuth, (req, res) =>
+  aiMessageAccessController.approve(req, res)
+);
+router.delete("/me/ai-message-access/approval", verifyAuth, (req, res) =>
+  aiMessageAccessController.revoke(req, res)
+);
+router.put("/me/ai-message-access/account-wide-off", verifyAuth, (req, res) =>
+  aiMessageAccessController.setAccountWideOff(req, res)
+);
+router.post("/me/ai-message-access/notice-dismissed", verifyAuth, (req, res) =>
+  aiMessageAccessController.dismissNotice(req, res)
 );
 
 // Profile photo (avatar) upload — two-step signed-URL flow:

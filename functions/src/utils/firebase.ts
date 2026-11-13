@@ -293,6 +293,14 @@ export const collections = {
   // by admins through /admin/risk-signals. Visible to admins only and never
   // to the subject: backend-only, no firestore.rules match -> clients denied.
   riskSignals: db.collection("riskSignals"),
+  // AI message access (issue #172). `aiMessageAccess/{userId}`: one per user, holds
+  // their express approval (with the exact wording), the account-wide "off" setting
+  // and the one-time-notice dismissal. `aiMessageAccessAudit/{id}`: append-only
+  // trail of every change (approval, chat switch, account-wide setting). Both are
+  // backend-only: no firestore.rules match, so clients are denied and read/write
+  // only through the API (the audit trail only through the admin route).
+  aiMessageAccess: db.collection("aiMessageAccess"),
+  aiMessageAccessAudit: db.collection("aiMessageAccessAudit"),
 } as const;
 
 // Collection-group queries (every subcollection with that id, across all
