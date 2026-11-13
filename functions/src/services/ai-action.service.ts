@@ -121,7 +121,9 @@ export function deriveProposedActions(
   const findings: Finding[] = [
     ...content.refusalGrounds.map((g) => ({ criterionId: g.criterionId, origin: "refusal_ground" as const, whatWouldHelp: g.whatWouldHelp ?? "" })),
     ...content.credibilityFlags.map((f) => ({ criterionId: f.criterionId, origin: "credibility_flag" as const, whatWouldHelp: f.whatWouldHelp ?? "" })),
-    ...content.insufficientInformation.map((i) => ({ criterionId: i.criterionId, origin: "insufficient_information" as const, whatWouldHelp: "" })),
+    // (#207) A rule that could not be told to apply is waiting on an intake
+    // answer, not on a document: no evidence action is proposed for it.
+    ...content.insufficientInformation.filter((i) => !i.notAssessed).map((i) => ({ criterionId: i.criterionId, origin: "insufficient_information" as const, whatWouldHelp: "" })),
   ];
 
   const actions: DerivedActions["actions"] = [];

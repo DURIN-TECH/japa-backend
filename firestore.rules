@@ -625,6 +625,11 @@ service cloud.firestore {
     //    decisions (who approved or rejected which version, why, and which
     //    flags they acknowledged), written with each decision by the admin
     //    review API, /admin/rubrics (issue #125). Do NOT add a match.
+    //  - rubricPublishRuns/{routeKey}__v{version} and
+    //    rubricPublishSettingsHistory/{entryId}: the record of each automatic
+    //    rulebook publish run (gates, leave-outs, outcome) and the audit trail
+    //    of changes to the publish settings (issue #201). Backend only: an
+    //    applicant must never see internal notes. Do NOT add a match.
 
     //  - ruleChangeEvents/{eventId} and ruleChangeNotices/{eventId}__{appId}:
     //    one event per ADMIN-APPROVED rule or visa-record change, and one

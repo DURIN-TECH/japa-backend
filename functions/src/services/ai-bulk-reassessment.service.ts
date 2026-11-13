@@ -32,6 +32,7 @@ import {
   parseExtraction,
   numberStatementBlocks,
   parseJudgement,
+  planJudgementBatches,
   type AssessmentContent,
   type DocumentExtraction,
   type Facts,
@@ -39,6 +40,8 @@ import {
   type ObjectiveResult,
 } from "./ai/assessment-engine";
 import { AI_MODELS } from "./ai/ai-models";
+import { notAssessedItems, splitByApplicability } from "./ai/rule-applicability";
+import type { InsufficientItem } from "../types/assessment";
 import { BATCH_PRICE_MULTIPLIER, costOfUsage, rolesArePriced } from "./ai/ai-pricing";
 import { readAiSettings, type AiSettings } from "./ai/ai-settings";
 import { AnthropicBatchProvider, type BatchItemOutcome, type BatchRequestItem, type LlmBatchProvider } from "./ai/batch-provider";
@@ -223,7 +226,13 @@ interface MissingDocument {
 /** Everything the assembly needs, loaded once per job. */
 interface JobContext {
   app: Application;
+  // The rulebook NARROWED to the rules that apply to this applicant (#207):
+  // what the engine and the assembly run on.
   rubric: VisaRubric;
+  // The whole rulebook, for what must look rules up by id (titles, top issues, actions).
+  fullRubric: VisaRubric;
+  // Rules whose applicability could not be decided: reported as "could not be assessed".
+  notAssessed: InsufficientItem[];
   statementText: string;
   score: number | null;
   extractions: DocumentExtraction[];
@@ -623,14 +632,18 @@ export class BulkReassessmentService {
       return { kind: "stop", code: "application_closed", message: "the application is closed, submitted or withdrawn" };
     }
 
-    const rubric = await this.deps.getApprovedRubric(app.countryCode, app.visaTypeId);
-    if (!rubric || rubric.version !== doc.rubricVersion) {
+    const fullRubric = await this.deps.getApprovedRubric(app.countryCode, app.visaTypeId);
+    if (!fullRubric || fullRubric.version !== doc.rubricVersion) {
       return { kind: "stop", code: "rubric_changed", message: "the approved rubric changed after this re-assessment was queued" };
     }
     const loaded = await officer.loadInputs(app);
-    if (computeInputHash(officer.inputsFor(loaded, rubric.version)) !== doc.inputHash) {
+    if (computeInputHash(officer.inputsFor(loaded, fullRubric.version)) !== doc.inputHash) {
       return { kind: "stop", code: "inputs_changed", message: "the application's inputs changed after this re-assessment was queued" };
     }
+    // ---- which rules apply to THIS applicant (#207): see AiCaseOfficerService.execute ----
+    const split = splitByApplicability(fullRubric, loaded.intake);
+    const rubric: VisaRubric = { ...fullRubric, criteria: split.applicable };
+    const notAssessed = notAssessedItems(split);
 
     const now = this.deps.now();
     const score = loaded.eligibilityScore;
@@ -640,18 +653,27 @@ export class BulkReassessmentService {
     if (hits.length > 0) {
       const content = assembleContent({
         rubric, mandatoryHits: hits, objective: [], judgement: null, documents: [],
-        statementReadable: loaded.statements.length > 0, score, suspiciousDocumentIds: [], judgementFailed: false,
+        statementReadable: loaded.statements.length > 0, score, suspiciousDocumentIds: [], judgementFailed: false, notAssessed,
       });
-      return { kind: "final_no_model", content, rubric, app };
+      return { kind: "final_no_model", content, rubric: fullRubric, app };
     }
     // ---- nothing to read: a valid low-readiness result, no model call ----
     const hasContent = loaded.documents.length > 0 || loaded.statements.some((s) => s.text.trim().length > 0);
     if (!hasContent) {
       const content = assembleContent({
         rubric, mandatoryHits: [], objective: [], judgement: null, documents: [],
-        statementReadable: false, score, suspiciousDocumentIds: [], judgementFailed: false,
+        statementReadable: false, score, suspiciousDocumentIds: [], judgementFailed: false, notAssessed,
       });
-      return { kind: "final_no_model", content, rubric, app };
+      return { kind: "final_no_model", content, rubric: fullRubric, app };
+    }
+    // ---- (#207) one judgement request per application on this path ----
+    // A batch result is keyed by the assessment id, so this path carries ONE
+    // judgement request. The rules that apply to this applicant normally fit in
+    // one (see planJudgementBatches); when they need several, the job fails
+    // with the cost-cap code rather than assessing a subset. The live
+    // assessment path makes as many calls as it needs.
+    if (planJudgementBatches(judgementCriteriaOf(rubric)).length > 1) {
+      return { kind: "stop", code: "cost_cap_exceeded", message: "the rules that apply to this application need more than one judgement request; re-assess it from the application instead of in bulk" };
     }
 
     // ---- stage 2: what is already extracted, and what is missing ----
@@ -732,7 +754,7 @@ export class BulkReassessmentService {
     return {
       kind: "ready",
       ctx: {
-        app, rubric, statementText, score, extractions, suspiciousContent, objective,
+        app, rubric, fullRubric, notAssessed, statementText, score, extractions, suspiciousContent, objective,
         judgementCriteriaIds: judgementCriteria.map((c) => c.criterionId),
         judgementRequest, extractUsage, usedExtraction,
         hasStatementReadable: statementText.trim().length > 0,
@@ -951,13 +973,14 @@ export class BulkReassessmentService {
       score: ctx.score,
       suspiciousDocumentIds: ctx.suspiciousContent.map((s) => s.documentId ?? "statement"),
       judgementFailed: judgement.kind === "failed",
+      notAssessed: ctx.notAssessed,
     });
     if (content.droppedCount > 0) {
       // A count only; model text may carry an applicant's words.
       console.warn(`[bulk-reassess] assessment ${doc.id}: ${content.droppedCount} model item(s) dropped by code checks`);
     }
     const judgeUsage = judgement.kind === "ok" ? oneRequest(judgement.usage) : judgement.kind === "failed" && judgement.usage ? oneRequest(judgement.usage) : zeroUsage();
-    return this.storeResult(doc, content, ctx.rubric, ctx.app, { extract: ctx.extractUsage, judge: judgeUsage }, ctx.suspiciousContent);
+    return this.storeResult(doc, content, ctx.fullRubric, ctx.app, { extract: ctx.extractUsage, judge: judgeUsage }, ctx.suspiciousContent);
   }
 
   // ----------------------------------------------------------------

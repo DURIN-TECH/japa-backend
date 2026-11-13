@@ -22,6 +22,8 @@ import type { Timestamp } from "firebase-admin/firestore";
 //   visaRubrics/{countryCode}_{visaTypeId}                    RubricHead
 //   visaRubrics/{routeKey}/rubricVersions/{version}           VisaRubric
 //   rubricExtractionRuns/{runId}                              RubricExtractionRun
+//   rubricPublishRuns/{routeKey}__v{version}                  RubricPublishRun (#201)
+//   rubricPublishSettingsHistory/{auto id}                    settings change audit (#201)
 //
 // A head doc plus a versions subcollection, so an APPROVED version can keep
 // serving while a newer PENDING one waits for review (#125 needs both at
@@ -74,8 +76,10 @@ export type DecisionStage = (typeof DECISION_STAGES)[number];
 
 /**
  * Review state of one rubric VERSION. Extraction only ever writes
- * `pending_review`; only a human review (#125) moves a version on. Nothing is
- * autopublished.
+ * `pending_review`. A version moves on through the ONE approval transaction
+ * (rubric-review.service.ts), run either by an admin (#125) or, when
+ * `appConfig/rubricPublishSettings.mode` is `auto`, by the named system actor
+ * after the automatic gates pass (#201). Extraction itself never publishes.
  */
 export const RUBRIC_REVIEW_STATUSES = ["pending_review", "approved", "rejected"] as const;
 export type RubricReviewStatus = (typeof RUBRIC_REVIEW_STATUSES)[number];
@@ -211,6 +215,17 @@ export interface CriterionAppliesTo {
   codeNames?: string[];
 }
 
+/**
+ * (#207) The machine-readable form of a criterion's applicability condition:
+ * the rule applies when the applicant's answer to intake question
+ * `questionId` is one of `anyOf` (option values of that question). The
+ * condition's own words stay in `applicabilityCondition`, verbatim.
+ */
+export interface RuleTrigger {
+  questionId: string;
+  anyOf: string[];
+}
+
 /** One criterion of a rubric. */
 export interface AssessmentCriterion {
   // Stable id, derived in code from the source id, the normalised quote, the
@@ -251,14 +266,25 @@ export interface AssessmentCriterion {
   // by extraction, editable in review. A rubric with such a criterion but no
   // polarity is flagged by the validator.
   concernsIntent?: boolean;
-  // Scope (#112): does the rule apply to every applicant on the route, or
-  // only in some circumstances? `applicabilityCondition` is those
+  // Scope (#112, #207): does the rule apply to every applicant on the route,
+  // or only in some circumstances? `applicabilityCondition` is those
   // circumstances in the source's words, found verbatim in the source.
-  // Four values (see CRITERION_APPLICABILITIES): only `all_applicants` and
-  // `conditional` are ever stored; `specialist` and `other_route` are
-  // proposed by the model and dropped in code (with a discard record).
+  // Four values (see CRITERION_APPLICABILITIES): `all_applicants`,
+  // `conditional` and `specialist` are stored (#207: a specialist-activity
+  // rule is KEPT, however long that makes the rulebook; it applies only to
+  // applicants its condition covers). `other_route` is proposed by the model
+  // and dropped in code (with a discard record): it is about a different route.
   applicability?: "all_applicants" | "conditional" | "specialist" | "other_route";
   applicabilityCondition?: string;
+  // (#207) WHEN the rule applies, in a form code can evaluate: "this rule
+  // applies when the applicant's answer to intake question `questionId` is one
+  // of `anyOf`" (for a multi-choice question: includes any of them). Set by
+  // extraction only after code has checked that the question exists in the
+  // rubric and that every value is one of its options. Absent on a
+  // `specialist` rule = "could not tell whether this applies" (the rule is
+  // kept, and an assessment reports it as not assessable, never as failed and
+  // never as applying to everyone). See services/ai/rule-applicability.ts.
+  trigger?: RuleTrigger;
   // Links to an existing EligibilityQuestion (types/eligibility.ts).
   eligibilityQuestionId?: string;
   // Ids of the rubric's intake questions whose answers this criterion reads.
@@ -436,15 +462,24 @@ export const RUBRIC_DISCARD_REASONS = [
   "duplicate", // same criterion already produced by an earlier chunk
   "unresolved_reference", // points at criteria that did not survive
   "out_of_route_scope", // from a cross-route source the route's own source does not point to, or not for every applicant of the route
-  "specialist_activity", // applies only to a specialist activity or sub-category the source singles out
   "other_route", // the text says it applies to a different route or category of applicant
 ] as const;
 export type RubricDiscardReason = (typeof RUBRIC_DISCARD_REASONS)[number];
 
+/**
+ * (#207) Reasons that older stored versions may still carry but that extraction
+ * can no longer produce. `specialist_activity` was the reason a rule for a
+ * specialist activity was left out; such rules are now kept (see
+ * AssessmentCriterion.trigger). Kept in the type so a stored version that holds
+ * the value is still read as valid data.
+ */
+export const LEGACY_DISCARD_REASONS = ["specialist_activity"] as const;
+export type LegacyDiscardReason = (typeof LEGACY_DISCARD_REASONS)[number];
+
 /** One discarded item, kept for the reviewer. Never holds source text. */
 export interface RubricDiscard {
   itemType: "criterion" | "intake_question" | "evidence_item" | "intent_polarity";
-  reason: RubricDiscardReason;
+  reason: RubricDiscardReason | LegacyDiscardReason;
   // Fixed, code-written detail (which field failed which rule). Never holds
   // a string the model supplied, and never source text.
   detail: string;
@@ -528,6 +563,11 @@ export interface VisaRubric {
   excludedCriterionIds?: string[];
   // Admin-set (#161): the reviewer's one note for the exclusions above.
   exclusionNote?: string;
+  // Written with the AUTOMATIC approval (#203): the question plan (what the
+  // wording check removed, exact duplicates merged, conditions, order). Never
+  // extracted, never client-visible: `applyExclusions` applies it on the read
+  // side and strips it from the served rubric. Absent = serve as extracted.
+  questionPlan?: QuestionPlan;
 
   // ---- provenance (immutable) ----
   sourceSnapshots: RubricSourceSnapshot[];
@@ -551,6 +591,61 @@ export interface VisaRubric {
   createdAt: Timestamp;
 }
 
+// ============================================
+// Question plan (issue #203, part of #200)
+// ============================================
+
+/**
+ * The plan for the applicant-facing questions of one version. It REMOVES
+ * nothing for size: the only removals are the ones the automatic wording check
+ * found wrong (a correctness removal, recorded with the reason). Everything
+ * else is merging of exact duplicates, conditions and order.
+ *
+ * Applied on the read side (`applyExclusions`); the version's own questions
+ * are never edited. Every id below is one of the version's own.
+ */
+export interface QuestionPlan {
+  // Version of the deterministic algorithm (merge / condition / order rules).
+  algorithmVersion: string;
+  // Questions the wording check failed, with the failed aspects. They are removed
+  // together with their dependents through the exclusion dependency logic.
+  omittedQuestions: { id: string; failed: string[] }[];
+  // Document items the check failed, with the failed aspects.
+  omittedEvidence: { key: string; failed: string[] }[];
+  // INFORMATIONAL: what else the dependency logic removed because of the above.
+  droppedWithDependents: { questionIds: string[]; evidenceKeys: string[] };
+  // Exact duplicate questions folded into `to` (the earlier one). Always a star:
+  // no `to` is itself a `from`.
+  merges: { from: string; to: string }[];
+  // Conditions added to a question that had none, derived in code from its
+  // rules' own validated trigger data; `derivedFromCriterionIds` are those rules.
+  proposedConditions: { questionId: string; showWhen: { anyOf: IntakeCondition[] }; derivedFromCriterionIds: string[] }[];
+  // The served order of the surviving questions (deciding questions first).
+  order: string[];
+  // INTEGRATION (#200 + #207): rules whose `trigger` the independent check could not confirm.
+  // The RULE STAYS (never left out for this); only its trigger is ignored on the read side
+  // (`applyExclusions` strips it), so it is read as "could not tell whether this applies"
+  // (specialist) or by the legacy rule for a conditional rule without a trigger. Ids are this
+  // version's own rules. Absent on a plan written before the integration.
+  droppedTriggerCriterionIds?: string[];
+  // How many questions an applicant sees, with the plan applied (before the
+  // wording check's omissions, which only lower them). `exact` is false when the
+  // best / worst search hit its budget and the figures are sampled bounds.
+  sizing: { total: number; unconditional: number; deciding: number; best: number; typical: number; worst: number; exact: boolean; samples: number };
+  // What the wording check did; null when it did not run (an offline plan).
+  check: {
+    promptVersion: string;
+    model: string;
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    questionsChecked: number;
+    evidenceItemsChecked: number;
+    questionsFailed: number;
+    evidenceItemsFailed: number;
+  } | null;
+}
+
 /**
  * The fields of a version doc that a review (#125) may write. Everything else
  * is content or provenance and must never be updated.
@@ -567,7 +662,108 @@ export const RUBRIC_REVIEW_FIELDS = [
   "evidenceHelpsCriterionIds",
   "excludedCriterionIds",
   "exclusionNote",
+  // (#203) the automatic approval's question plan (see QuestionPlan).
+  "questionPlan",
 ] as const;
+
+// ============================================
+// Automatic publishing (issue #201, part of #200)
+// ============================================
+
+/**
+ * The NAMED system actor that publishes (and supersedes) rubric versions
+ * without a person. It is written as `reviewedBy` on the version and as `by`
+ * on the audit entry, so every place that shows or checks a reviewer can tell
+ * a machine decision from an admin's.
+ *
+ * Why this exact shape: the structural validator only needs `reviewedBy` to be
+ * a non-empty string, and the two audit consumers (bulk re-assessment, rule-
+ * change alerts) copy `entry.by` into their records without looking it up as a
+ * user. A fixed, namespaced constant (never a uid a client could send: every
+ * `reviewedBy` is written by the server from the verified token or from this
+ * constant) is therefore enough. The review service additionally REFUSES an
+ * admin whose uid equals it, so the value can never be claimed by a person.
+ */
+export const RUBRIC_SYSTEM_ACTOR_ID = "system:rubric-auto-publish" as const;
+
+/** True when a `reviewedBy` / audit `by` value is the automatic publisher. */
+export function isRubricSystemActor(id: unknown): boolean {
+  return id === RUBRIC_SYSTEM_ACTOR_ID;
+}
+
+/**
+ * The two kinds of decider. Named constants, so the review code never writes
+ * the role word as a string literal (its test refuses that).
+ */
+export const RUBRIC_ACTOR_KIND = { ADMIN: "admin", SYSTEM: "system" } as const;
+
+/** Who is deciding: an admin (verified uid) or the automatic publisher. */
+export type RubricReviewActor = { kind: typeof RUBRIC_ACTOR_KIND.ADMIN; uid: string } | { kind: typeof RUBRIC_ACTOR_KIND.SYSTEM; id: typeof RUBRIC_SYSTEM_ACTOR_ID };
+
+/** How a publish run ended. `skipped`: refused before any gate ran (kill switch, allowlist, already decided). */
+export const RUBRIC_PUBLISH_OUTCOMES = ["published", "held", "skipped"] as const;
+export type RubricPublishOutcome = (typeof RUBRIC_PUBLISH_OUTCOMES)[number];
+
+/** What started a run. */
+export type RubricPublishTrigger = "version_created" | "admin_endpoint" | "script" | "sweep";
+
+/** One gate's verdict, as recorded on the run. `detail` is code-written (ids, counts), never model or source text. */
+export interface RubricPublishGateResult {
+  gate: string;
+  passed: boolean;
+  detail?: string;
+}
+
+/** One rule the run left out of the served rulebook, and why (a flag code, or `checker:<aspect>`). */
+export interface RubricPublishLeftOut {
+  criterionId: string;
+  reason: string;
+  // The extraction flag that caused it; null for a checker leave-out (part B).
+  flagCode: string | null;
+}
+
+/**
+ * `rubricPublishRuns/{routeKey}__v{version}`: the record of the automatic
+ * publish run of ONE version (backend-only: no firestore.rules match). The id
+ * is deterministic, so a re-delivered trigger finds the record and does not run
+ * (or publish) twice; it is written with `create()`.
+ */
+export interface RubricPublishRun {
+  runId: string;
+  routeKey: string;
+  countryCode: string;
+  visaTypeId: string;
+  version: number;
+  outcome: RubricPublishOutcome;
+  // Machine-readable reasons for a hold / skip (empty when published).
+  reasonCodes: string[];
+  gates: RubricPublishGateResult[];
+  counts: {
+    rules: number;
+    kept: number;
+    leftOut: number;
+    leftOutByReason: Record<string, number>;
+    // Rules that made the draft HOLD (a protected rule that failed a gate).
+    held: number;
+    informationalFlags: Record<string, number>;
+  };
+  leftOut: RubricPublishLeftOut[];
+  // The mode the run saw (`manual` when settings were missing or unreadable).
+  mode: "manual" | "auto";
+  trigger: RubricPublishTrigger;
+  // 1 for the first run; an admin or script re-run of a held version adds one.
+  attempts: number;
+  // The independent check and the question plan (parts B and C): what happened.
+  checker: "not_configured" | "not_run" | "passed" | "failed";
+  questionPlan: "not_configured" | "not_run" | "built" | "failed";
+  // INTEGRATION: rules whose trigger the independent check could not confirm (the rule is kept, its trigger ignored).
+  droppedTriggerIds?: string[];
+  // Set when published: the audit entry and the version it replaced.
+  auditId: string | null;
+  previousApprovedVersion: number | null;
+  startedAt: Timestamp;
+  finishedAt: Timestamp;
+}
 
 /**
  * `visaRubrics/{countryCode}_{visaTypeId}`: the head of one route's rubric.
@@ -645,6 +841,9 @@ export interface RubricExtractionRun {
   // Null when the model has no entry in the price table (the default).
   costUsd: number | null;
   criteriaAccepted: number;
+  // (#207) How many of the accepted criteria are specialist-activity rules,
+  // kept (they used to be discarded). Optional: older run records lack it.
+  specialistKept?: number;
   discardedCount: number;
   // Discards by reason, for a quick look without opening the version.
   discardedByReason: Record<string, number>;

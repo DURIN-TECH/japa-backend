@@ -232,6 +232,22 @@ export const collections = {
   // so a decision never exists without its record. Append-only.
   // Backend-only: no firestore.rules match -> clients denied.
   rubricReviewHistory: db.collection("rubricReviewHistory"),
+  // Automatic rubric publishing (issue #201). BACKEND-ONLY (no firestore.rules
+  // match, so clients are denied):
+  //  - rubricPublishRuns/{routeKey}__v{version}: one record per version's
+  //    automatic publish run (outcome, gates, leave-outs); created once with
+  //    `create()`, so a re-delivered trigger cannot run a version twice;
+  //  - rubricPublishSettingsHistory/{auto}: who changed
+  //    appConfig/rubricPublishSettings, with before and after.
+  rubricPublishRuns: db.collection("rubricPublishRuns"),
+  rubricPublishSettingsHistory: db.collection("rubricPublishSettingsHistory"),
+  // The independent check's record of one version (issue #202):
+  // `rubricCheckerRuns/{routeKey}__v{version}`, the same id as the publish run.
+  // Holds the closed verdicts (keyed by request hash, so a re-run of the same
+  // version reuses them and calls no model), the per-rule verdicts, and the
+  // calls and tokens spent. Never holds source text or model prose.
+  // Backend-only: no firestore.rules match.
+  rubricCheckerRuns: db.collection("rubricCheckerRuns"),
   // The AI case-officer assessment (issue #42): one document per assessment,
   // which is also its job record. The id is derived from the application id and
   // the input hash, so the same inputs address the same document. Backend-only:

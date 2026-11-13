@@ -12,6 +12,10 @@ import { requireRubricAdmin, rubricReviewController } from "../controllers/rubri
 // criterion (a version is approved or rejected whole), and no route
 // that serves a snapshot's text.
 //
+// Issue #201 added THREE more (publish settings GET / PATCH, and
+// `POST /:id/auto-publish`). The settings routes are registered BEFORE `/:id`
+// so `publish-settings` is never captured as a version id.
+//
 // Every route runs the same chain:
 //  1. `verifyAuth`          no / bad token -> 401; builds the principal and
 //                           its ability from the token's claims;
@@ -31,6 +35,10 @@ const adminRubricRoutes = Router();
 /** The gate every route shares, in order. */
 const adminOnly = [verifyAuth, requireRubricAdmin, verifyAdmin];
 
+// (#201) The automatic-publishing settings and kill switch. Registered BEFORE
+// `/:id` so it is not captured by it.
+adminRubricRoutes.get("/publish-settings", ...adminOnly, (req, res) => rubricReviewController.getPublishSettings(req, res));
+adminRubricRoutes.patch("/publish-settings", ...adminOnly, (req, res) => rubricReviewController.patchPublishSettings(req, res));
 // The queue: versions by review status (default pending_review), newest first.
 adminRubricRoutes.get("/", ...adminOnly, (req, res) => rubricReviewController.list(req, res));
 // One version: criteria with `staleCitation`, diff against the serving
@@ -39,6 +47,10 @@ adminRubricRoutes.get("/:id", ...adminOnly, (req, res) => rubricReviewController
 // What a proposed exclusion set would remove (read-only; for long id lists
 // that do not fit a query string). Writes nothing.
 adminRubricRoutes.post("/:id/exclusion-preview", ...adminOnly, (req, res) => rubricReviewController.exclusionPreview(req, res));
+// (#201) Run the automatic pipeline on a pending draft now (`?dryRun=true`
+// writes nothing). The same gates and the same approval transaction as the
+// trigger, whatever `mode` is.
+adminRubricRoutes.post("/:id/auto-publish", ...adminOnly, (req, res) => rubricReviewController.autoPublish(req, res));
 // Approve or reject the whole version, with the `revision` the reviewer saw
 // (409 when it is stale or the version is already decided).
 adminRubricRoutes.patch("/:id/review", ...adminOnly, (req, res) => rubricReviewController.review(req, res));
