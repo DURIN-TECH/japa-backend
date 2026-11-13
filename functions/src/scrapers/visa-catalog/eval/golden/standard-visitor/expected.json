@@ -10,7 +10,8 @@
     "Fee rule (#59): the standard (up to 6 months) Standard Visitor visa is £135. Long-term (2/5/10 year), medical and academic variants and the £1,172 in-UK extension are excluded. No IHS for visitors.",
     "isExtendable: true — a stay under 6 months can be extended up to a total of 6 months (and longer for medical treatment / academics).",
     "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK visa decision (3 weeks), max = inside-UK extension decision, standard service (8 weeks).",
-    "documentKinds (#187): kind and need as the page's own wording says (drafted from guide.json only)."
+    "documentKinds (#187): kind and need as the page's own wording says (drafted from guide.json only).",
+    "documentKinds: the passport sentence ('You must have a passport or travel document...') is prose, not an item of the page's list, so it is not expected as an item; of the listed items only the TB certificate is a document."
   ],
   "name": {
     "value": "Standard Visitor",
@@ -117,14 +118,6 @@
   },
   "documentKinds": {
     "items": [
-      {
-        "match": [
-          "passport"
-        ],
-        "kind": "document",
-        "need": "required",
-        "source": "You must have a passport or travel document that is valid for the whole of your stay in the UK."
-      },
       {
         "match": [
           "tuberculosis",
