@@ -257,14 +257,39 @@ function validateRequiredDocuments(
  *    otherwise the clause is cut from the quote by code. The model's `need` is
  *    ignored: a quote with "if" is conditional whatever the model said.
  */
+/**
+ * Is a kind quote verbatim on the page? (issue #187, orchestrator decision)
+ * Valid when EITHER the whole quote is on the page (normalised as the citation
+ * check does), OR it splits at the FIRST ": " into a lead-in and an item text
+ * where BOTH parts are on the page AND the item part sits AFTER the lead-in
+ * (so the item really is listed under that lead-in). This covers the model
+ * writing "You'll need to provide: your current passport ..." for a list whose
+ * lead-in and items are separate lines. Characters only: no fuzzy word match.
+ * `page` is the already-normalised page text (undefined = not checked).
+ */
+export function kindQuoteOnPage(quote: string, page: string | undefined): boolean {
+  if (quote.length === 0) return false;
+  if (page === undefined) return true;
+  if (page.includes(normForQuote(quote))) return true;
+  const at = quote.indexOf(": ");
+  if (at < 0) return false;
+  const lead = normForQuote(quote.slice(0, at));
+  const item = normForQuote(quote.slice(at + 2));
+  if (!lead || !item) return false;
+  const leadAt = page.indexOf(lead);
+  // The item must occur somewhere after the lead-in's first occurrence.
+  return leadAt >= 0 && page.lastIndexOf(item) > leadAt;
+}
+
 function validateItemMeta(rawItemMeta: unknown, itemQuote: string, page: string | undefined): RequiredDocumentMeta {
   const m = rawItemMeta && typeof rawItemMeta === "object" ? (rawItemMeta as Record<string, unknown>) : {};
+  // Plain verbatim check, used for the model's appliesWhen clause.
   const onPage = (q: string) => q.length > 0 && (page === undefined || page.includes(normForQuote(q)));
 
   // ---- kind + its quote ----
   const claimedKind = m.kind === "information" ? "information" : "document";
   const kindQuote = typeof m.kindQuote === "string" ? m.kindQuote.trim() : "";
-  const kindVerified = m.kind !== undefined && (m.kind === "document" || m.kind === "information") && onPage(kindQuote);
+  const kindVerified = m.kind !== undefined && (m.kind === "document" || m.kind === "information") && kindQuoteOnPage(kindQuote, page);
   const out: RequiredDocumentMeta = kindVerified
     ? { kind: claimedKind, kindQuote, need: "required" }
     : { kind: "document", kindReview: true, need: "required" };

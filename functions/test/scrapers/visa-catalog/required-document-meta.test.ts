@@ -123,6 +123,43 @@ describe("extractor validator (kind + need)", () => {
   });
 });
 
+describe("kindQuote two-part rule (lead-in: item), real uk-family strings", () => {
+  const base = {
+    name: "Family visa", code: "FV", description: "d", category: "family", processingTime: "12 weeks",
+    processingDaysMin: 56, processingDaysMax: 84, feeComponents: [], validityPeriod: "2 years and 9 months",
+    isExtendable: true, eligibilityCriteria: ["x"], confidence: 0.9,
+  };
+  // The adapter's flattened list: lead-in, blank line, then items.
+  const FAMILY_PAGE =
+    "You\u2019ll need to provide:\n\nall your names\n\nyour date of birth\n\n" +
+    "your current passport or other valid travel ID\n\ncopies of the photo page\n\n" +
+    "You\u2019ll also need to provide either:\n\nonline proof of your immigration status if you have an eVisa";
+  const PASSPORT = "your current passport or other valid travel ID";
+  const kindFor = (quote: string) =>
+    validateExtractedVisa(
+      {
+        ...base, requiredDocuments: [PASSPORT], citations: { "requiredDocuments.0": PASSPORT },
+        requiredDocumentMeta: [{ kind: "document", kindQuote: quote, need: "required" }],
+      },
+      { pageText: FAMILY_PAGE }
+    ).requiredDocumentMeta![0];
+
+  test("lead-in + a LATER item passes and is stored as the model returned it", () => {
+    const q = `You\u2019ll need to provide: ${PASSPORT}`;
+    assert.deepEqual(kindFor(q), { kind: "document", kindQuote: q, need: "required" });
+  });
+  test("an item part that is not on the page fails", () => {
+    assert.equal(kindFor("You\u2019ll need to provide: your lucky charm").kindReview, true);
+  });
+  test("a lead-in that appears only AFTER the item fails", () => {
+    // "You'll also need to provide either" is on the page only after the passport line.
+    assert.equal(kindFor(`You\u2019ll also need to provide either: ${PASSPORT}`).kindReview, true);
+  });
+  test("a lead-in that is not on the page fails", () => {
+    assert.equal(kindFor(`Bring along: ${PASSPORT}`).kindReview, true);
+  });
+});
+
 describe("derive + checklist carry kind and need", () => {
   const URL = "https://www.gov.uk/standard-visitor";
   const visa: any = {
