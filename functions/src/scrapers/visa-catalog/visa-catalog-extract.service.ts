@@ -91,10 +91,15 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *    "Depending on your circumstances, you might also need to provide:"
  *    lead-in). "may" never counts. The validator drops a kind whose quote is not
  *    on the page (-> document + kindReview) and decides `need` in code.
+ *  - "2026-11-item-kinds-v8" (#187): the v7 prompt change shifted the model to
+ *    a LONGER surcharge option on the same page (UK Family returned the 5-year
+ *    IHS 5175 instead of the 2y9m 3105). The surcharge rule now says to take the
+ *    amount the page gives for THIS visa's own stay length, never a longer
+ *    option listed beside it (same intent as v4's surcharge-total rule).
  * Before merging a bump (or a model change), run `npm run eval:visa-extract`
  * and attach the result — see functions/src/scrapers/visa-catalog/eval/README.md.
  */
-export const EXTRACTOR_PROMPT_VERSION = "2026-11-item-kinds-v7";
+export const EXTRACTOR_PROMPT_VERSION = "2026-11-item-kinds-v8";
 
 // A duration phrase: a number (digits or a word) followed by year(s)/month(s),
 // e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
@@ -776,6 +781,11 @@ export function buildSystemPrompt(): string {
     "- When several such totals are listed by stay length, pick the one for the visa length chosen above",
     "  (the main adult applicant's standard stay when applying from outside the country). No 'fee.years'",
     "  citation is needed for a per: 'application' surcharge; cite the amount line in 'fee.surcharge'.",
+    "- The surcharge amount must be the one the page gives for THIS visa's own length of stay (the same",
+    "  length as the application fee and validityPeriod you report), never a larger amount for a longer stay",
+    "  that the page lists on the same line or list. If the page lists '£3,105 if you're staying for 2 years",
+    "  and 9 months' and '£5,175 if you're staying for 5 years' and this visa's stay is 2 years and 9 months,",
+    "  report 3105, not 5175.",
     "  Example (UK Family, partner): '£3,105 if you're staying for 2 years and 9 months' -> surcharge amount",
     "  3105, per 'application'. WRONG: 3105 per year with years 3.",
     "",

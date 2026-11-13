@@ -1,7 +1,7 @@
 /**
  * Backfill kind + need for the items of EXISTING scraped visas (issue #187).
  *
- * Background: from prompt version 2026-11-item-kinds-v7 the extractor stores
+ * Background: from prompt version 2026-11-item-kinds-v8 the extractor stores
  * `scrapeMeta.requiredDocumentMeta` (kind + need per `requiredDocuments` item,
  * index-aligned). Scraped visas extracted earlier have none.
  *
