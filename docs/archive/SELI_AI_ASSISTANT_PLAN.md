@@ -1,3 +1,24 @@
+> **ARCHIVED 2026-11-11 (issue DURIN-TECH/japa#32). Do not implement from this document.**
+>
+> This is the first draft of the AI assistant plan (Cloud Functions Gen-1, Firestore-delta
+> "streaming", 1.5s mobile polling, portal `onSnapshot`, three cached prompt blocks, stale model
+> ids, `japa-*` folder names). Nothing in it is current. It is kept for history only.
+>
+> **Superseded by** (all in the meta-repo, `DURIN-TECH/japa`):
+>
+> - `docs/plans/2026-11-10-ai-integration.md` (scope and backlog) and
+>   `docs/plans/2026-11-10-ai-integration-technical-design.md` (technical design): the source of
+>   truth for all AI work. The AI case officer ships first; its first route is UK Standard Visitor.
+> - `misc/AI_ASSISTANT_PLAN.md`: the one surviving chat document, re-scoped as Phase 4
+>   (ask-anywhere chat, #45).
+>
+> Model ids are not written in documents or call sites any more: they live in
+> `functions/src/services/ai/ai-models.ts`, keyed by role (#31).
+>
+> Everything below this line is the original text, unchanged.
+
+---
+
 # Japa AI Assistant — Implementation Plan
 
 ## Context
