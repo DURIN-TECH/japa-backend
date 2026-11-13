@@ -36,7 +36,8 @@ import { validateAgainstSchema } from "./rubric-prompt";
  * Version of the check's prompts and schemas. Part of every request (so part of
  * its replay hash and of the stored verdict key): change a prompt, bump this.
  */
-export const CHECKER_PROMPT_VERSION = "2026-11-checker-v1";
+// v2 (INTEGRATION of #202 and #207): the prompt defines `specialist`, which extraction now keeps.
+export const CHECKER_PROMPT_VERSION = "2026-11-checker-v2";
 
 /** Rules per request, in rulebook order. Part of the determinism contract: a stable boundary means a stable request. */
 export const CHECKER_BATCH_SIZE = 10;
@@ -99,7 +100,7 @@ export const CHECKER_SYSTEM_PROMPT = [
   "- `title_faithful`: the title states only what the quote says. It adds no condition, number, date or group the quote does not contain, and it is neither wider nor narrower than the quote.",
   "- `kind_right`: `objective` means the quote sets a fixed figure or a plain fact that a program can compare; `judgement` means the quote asks a decision maker to weigh evidence or be satisfied about something and sets no fixed figure; `mandatory_bar` means the quote bars a stated group whatever else is true. The kind given must be the one the quote supports.",
   "- `stage_right`: `validity` is whether an application can be considered at all; `suitability` is a ground for refusal whatever the merits; `eligibility` is a requirement of the category itself; `credibility` is whether the account given is believed. The stage given must be the one the quote belongs to.",
-  "- `condition_faithful`: `applicability` says whether the rule applies to every applicant (`all_applicants`) or only in some circumstances (`conditional`, with those circumstances in `applicabilityCondition`). Judge that this is what the quote, its list lead-in and the surrounding text say, and that the surrounding text does not add an exception, an \"unless\" or an \"only if\" that changes it.",
+  "- `condition_faithful`: `applicability` says whether the rule applies to every applicant (`all_applicants`), only in some circumstances (`conditional`), or only to applicants who come for one particular activity or sub-category that the guidance singles out (`specialist`); for the last two, `applicabilityCondition` holds the words that name those circumstances or that activity. Judge that this is what the quote, its list lead-in and the surrounding text say, and that the surrounding text does not add an exception, an \"unless\" or an \"only if\" that changes it.",
   "- `check_faithful`: when `check` is not null, its `field`, `op`, `value` and `unit` mean what the quote says (`gte` is at least, `lte` is at most, `eq` is exactly, `present` means it must exist, `heldForDays` means a condition held for the period written, as the quote writes it). Answer `na` when `check` is null.",
   "- `group_matches_codes`: when `appliesTo` is not null, `asWritten` lists the groups as the quote names them and `codes` gives a two-letter country code for each, in the same order. Judge that every code is the code of the group named in the same position, that the quote names exactly these groups, and that no group is missing. Answer `na` when `appliesTo` is null.",
   "",
