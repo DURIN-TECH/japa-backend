@@ -115,5 +115,5 @@ export { adminOutcomeStatisticsRoutes } from "./outcome-statistics/outcome-stati
 export { registeredDestinations } from "./outcome-statistics/registry";
 // ---- Required-document item kind + need rules (issue #187) ----
 /** Pure rules shared with the checklist, the derived requirements and the backfill script. */
-export { classifyNeed, metaFromQuoteOnly, normaliseStoredMeta } from "./visa-catalog/required-document-meta";
+export { classifyNeed, findMetaForItem, itemKey, metaFromQuoteOnly, normaliseStoredMeta } from "./visa-catalog/required-document-meta";
 export type { DocumentKind, DocumentNeed, RequiredDocumentMeta } from "./visa-catalog/required-document-meta";

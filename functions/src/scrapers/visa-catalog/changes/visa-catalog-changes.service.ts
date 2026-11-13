@@ -248,7 +248,7 @@ class VisaChangeService {
 
       // ---- Writes ----
       const now = Timestamp.now();
-      const { update, appliedFields } = buildApprovalUpdate(change, reviewerUid, now);
+      const { update, appliedFields } = buildApprovalUpdate(change, reviewerUid, now, Array.isArray(live.requiredDocuments) ? live.requiredDocuments : []);
       tx.update(visaRef, update as FsUpdate);
       tx.update(rowRef, {
         status: "approved",

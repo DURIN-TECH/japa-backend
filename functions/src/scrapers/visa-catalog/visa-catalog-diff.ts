@@ -6,10 +6,19 @@ import type {
   PendingVisaChange,
   VisaFeeComponentMeta,
   VisaFeeMeta,
+  RequiredDocumentMetaChange,
+  RequiredDocumentMetaView,
   VisaFieldDiff,
   VisaScalarDiffField,
   VisaScrapeMeta,
 } from "./types";
+import { alignScrapeMetaToLive } from "./required-document-align";
+import {
+  findMetaForItem,
+  itemKey,
+  metaFromQuoteOnly,
+  type RequiredDocumentMeta,
+} from "./required-document-meta";
 import { assertVisaApprovable, planFeeReconvert } from "./visa-catalog-fx";
 import { markManualCostReplaced } from "./visa-manual-cost";
 
@@ -154,6 +163,9 @@ export function diffVisa(params: {
   proposedFields: Partial<VisaType>;
   proposedFee: VisaFeeMeta;
   proposedBaseCostUsd?: number;
+  // Issue #187: the new extraction's per-item classification, index-aligned
+  // with `proposedFields.requiredDocuments`. Absent = nothing to compare.
+  proposedMeta?: RequiredDocumentMeta[];
 }): VisaDiffResult {
   const { live, proposedFields } = params;
   const liveRec = live as Record<string, unknown>;
@@ -224,6 +236,16 @@ export function diffVisa(params: {
     if (propDocs.length > 0) proposed.requiredDocuments = propDocs;
   }
 
+  // ---- requiredDocumentMeta (issue #187): kind / need of items that stay ----
+  // Compared item by item BY TEXT (never by position): the live reading is the
+  // stored meta for that item, or "document + kindReview" with need from the
+  // stored quote when it has none. Items new to the list are covered by the
+  // requiredDocuments diff above; only items on BOTH sides are compared here.
+  const metaChanges = diffItemMeta(live, propDocs, params.proposedMeta);
+  if (metaChanges.length > 0) {
+    diff.push({ field: "requiredDocumentMeta", kind: "changed", changes: metaChanges });
+  }
+
   // ---- Fee ----
   const liveFee = live.scrapeMeta?.fee;
   // Pre-#59 doc: no stored fee block → every proposed component is new, and
@@ -255,6 +277,50 @@ export function diffVisa(params: {
   };
 }
 
+
+// ----- Item classification diff (issue #187) -----
+
+/** The fields of a meta entry a reviewer compares. */
+function metaView(m: RequiredDocumentMeta): RequiredDocumentMetaView {
+  return {
+    kind: m.kind,
+    need: m.need,
+    ...(m.appliesWhen ? { appliesWhen: m.appliesWhen } : {}),
+    ...(m.kindReview ? { kindReview: true as const } : {}),
+  };
+}
+
+/** Same classification (kind, need, clause, review flag). */
+function sameView(a: RequiredDocumentMetaView, b: RequiredDocumentMetaView): boolean {
+  return a.kind === b.kind && a.need === b.need && a.appliesWhen === b.appliesWhen && !!a.kindReview === !!b.kindReview;
+}
+
+/**
+ * Items present in BOTH the live list and the proposed list whose
+ * classification differs. Pure; [] when there is no proposed meta.
+ */
+function diffItemMeta(
+  live: Partial<VisaType>,
+  proposedDocs: string[],
+  proposedMeta: RequiredDocumentMeta[] | undefined
+): RequiredDocumentMetaChange[] {
+  if (!Array.isArray(proposedMeta) || proposedMeta.length === 0) return [];
+  const liveDocs = Array.isArray(live.requiredDocuments) ? live.requiredDocuments : [];
+  const liveMeta = live.scrapeMeta?.requiredDocumentMeta;
+  const out: RequiredDocumentMetaChange[] = [];
+  proposedDocs.forEach((name, j) => {
+    const after = proposedMeta[j];
+    const i = liveDocs.findIndex((x) => itemKey(String(x)) === itemKey(name));
+    if (!after || i < 0) return;
+    const stored = findMetaForItem(liveMeta, i, String(liveDocs[i]), liveDocs.length);
+    const before = stored ?? metaFromQuoteOnly(live.scrapeMeta?.citations?.[`requiredDocuments.${i}`], String(liveDocs[i]));
+    const b = metaView(before);
+    const a = metaView(after);
+    if (!sameView(b, a)) out.push({ item: name, before: b, after: a });
+  });
+  return out;
+}
+
 // ----- Which ingest branch a doc takes -----
 
 /** What ingest does with one extraction, by the state of the doc at its id. */
@@ -274,10 +340,13 @@ export type IngestPlan =
  * a pre-#59 doc (no fee block, no `extractorPromptVersion` at all) stays
  * blocked by the approval guard forever. A missing version counts as stale.
  *
- * Deliberately ONLY pending_review scraped docs:
- *  - approved scraped docs keep the #61 rule — a pendingVisaChanges row is
- *    proposed only on a REAL content change, never because the prompt moved
- *    (that would flood admins with prompt-only "edits");
+ * Which docs:
+ *  - pending_review scraped docs: always (refreshed in place);
+ *  - APPROVED scraped docs (issue #187), when not withdrawn and they list
+ *    documents: re-extracted so they get the kind/need reading. This never
+ *    writes the live doc: the result is only a pendingVisaChanges proposal,
+ *    and only when the classification (or another field) actually differs,
+ *    so admins are not flooded with prompt-only "edits";
  *  - seeded / agent / rejected docs are never touched by the crawl at all.
  *
  * Pure (the current version is passed in, not imported), so this module stays
@@ -287,12 +356,23 @@ export type IngestPlan =
  * @param currentPromptVersion EXTRACTOR_PROMPT_VERSION of the running code
  */
 export function isPendingPromptStale(
-  existing: Pick<VisaType, "source" | "reviewStatus" | "scrapeMeta"> | undefined,
+  existing: Pick<VisaType, "source" | "reviewStatus" | "scrapeMeta" | "staleSince" | "requiredDocuments"> | undefined,
   currentPromptVersion: string
 ): boolean {
   if (!existing) return false; // nothing stored → the normal "create" path
-  if (existing.source !== "scraped" || existing.reviewStatus !== "pending_review") return false;
-  return existing.scrapeMeta?.extractorPromptVersion !== currentPromptVersion;
+  if (existing.source !== "scraped") return false;
+  if (existing.scrapeMeta?.extractorPromptVersion === currentPromptVersion) return false;
+  if (existing.reviewStatus === "pending_review") return true;
+  // Issue #187: an APPROVED scraped visa (not withdrawn) that lists documents is
+  // re-extracted too, so it gets its kind/need reading. Its result only ever
+  // becomes a proposal. A visa with no documents has nothing to classify, so it
+  // is not re-extracted on every prompt bump.
+  return (
+    existing.reviewStatus === "approved" &&
+    !existing.staleSince &&
+    Array.isArray(existing.requiredDocuments) &&
+    existing.requiredDocuments.length > 0
+  );
 }
 
 /**
@@ -345,10 +425,12 @@ export function planIngest(
 ): IngestPlan {
   if (!existing) return "create";
   if (existing.scrapeMeta?.contentHash === contentHash) {
-    // Same page text. Only a pending scraped doc from an older prompt is
-    // re-written (it is not live yet, so refreshing in place is safe).
+    // Same page text. A scraped doc from an older prompt is re-processed: a
+    // pending one is refreshed in place (not live yet), an APPROVED one goes
+    // through the normal proposal path so an admin approves the new reading
+    // (issue #187: never auto-applied).
     if (currentPromptVersion !== undefined && isPendingPromptStale(existing, currentPromptVersion)) {
-      return "refresh";
+      return existing.reviewStatus === "approved" ? "propose" : "refresh";
     }
     return "unchanged";
   }
@@ -362,7 +444,14 @@ export function planIngest(
 
 /** The visa field a diff entry writes (`fee` writes `baseCostUsd`). */
 export function diffTargetField(d: VisaFieldDiff): keyof VisaType {
-  return d.field === "fee" ? "baseCostUsd" : d.field;
+  // `requiredDocumentMeta` is not a visa field (it lives in scrapeMeta): every
+  // caller skips it before writing a field (see isMetaDiff).
+  return d.field === "fee" ? "baseCostUsd" : (d.field as keyof VisaType);
+}
+
+/** True for the #187 classification diff, which writes no visa field of its own. */
+function isMetaDiff(d: VisaFieldDiff): boolean {
+  return d.field === "requiredDocumentMeta";
 }
 
 /**
@@ -378,6 +467,7 @@ export function mergeProposal(
   const merged: Record<string, unknown> = { ...live };
   const proposed = change.proposed as Record<string, unknown>;
   for (const d of change.diff) {
+    if (isMetaDiff(d)) continue; // classification only: carried by scrapeMeta below
     const field = diffTargetField(d);
     if (proposed[field] !== undefined) merged[field] = proposed[field];
     else delete merged[field];
@@ -464,13 +554,22 @@ export function planProposalWrite(params: {
   now: Timestamp;
 }): ProposalWritePlan {
   const { live, openRow, input, now } = params;
-  if (openRow && openRow.contentHash === input.contentHash) return { action: "none" };
+  // Same page AND same prompt version as the open row = already proposed. A
+  // newer prompt version over the same page is a new reading (issue #187).
+  if (
+    openRow &&
+    openRow.contentHash === input.contentHash &&
+    openRow.extractorPromptVersion === input.scrapeMeta.extractorPromptVersion
+  ) {
+    return { action: "none" };
+  }
 
   const result = diffVisa({
     live,
     proposedFields: input.proposedFields,
     proposedFee: input.proposedFee,
     proposedBaseCostUsd: input.proposedBaseCostUsd,
+    proposedMeta: input.scrapeMeta.requiredDocumentMeta,
   });
   if (result.diff.length === 0) return { action: "none" };
 
@@ -544,6 +643,7 @@ export function findStaleReason(live: Partial<VisaType>, change: PendingVisaChan
   const liveRec = live as Record<string, unknown>;
   const current = (change.current ?? {}) as Record<string, unknown>;
   for (const d of change.diff) {
+    if (isMetaDiff(d)) continue; // no visa field to compare (the content hash guards scrapeMeta)
     const field = diffTargetField(d);
     if (!valuesEqual(liveRec[field], current[field])) {
       return `The live value of "${field}" changed since this proposal was made.`;
@@ -569,17 +669,30 @@ export function findStaleReason(live: Partial<VisaType>, change: PendingVisaChan
 export function buildApprovalUpdate(
   change: Pick<PendingVisaChange, "diff" | "proposed" | "proposedScrapeMeta" | "proposedSourceUrl">,
   reviewerUid: string,
-  now: Timestamp
+  now: Timestamp,
+  // Issue #187: the LIVE `requiredDocuments` (before this update). When given,
+  // the new scrapeMeta's document quotes and classifications are re-keyed to the
+  // list the visa will have AFTER the update (see required-document-align.ts).
+  liveRequiredDocuments?: string[]
 ): { update: Record<string, unknown>; appliedFields: string[] } {
   const update: Record<string, unknown> = {};
   const appliedFields: string[] = [];
   const proposed = change.proposed as Record<string, unknown>;
   for (const d of change.diff) {
+    if (isMetaDiff(d)) continue; // classification only: written through scrapeMeta below
     const field = diffTargetField(d);
     update[field] = proposed[field] !== undefined ? proposed[field] : FieldValue.delete();
     appliedFields.push(field);
   }
-  update.scrapeMeta = change.proposedScrapeMeta;
+  // The documents list the visa has after this update: the proposed one when
+  // the list is part of the diff (empty = deleted), else the live one.
+  const docsInDiff = change.diff.some((d) => d.field === "requiredDocuments");
+  const finalDocs = docsInDiff
+    ? (Array.isArray(proposed.requiredDocuments) ? (proposed.requiredDocuments as string[]) : [])
+    : liveRequiredDocuments;
+  update.scrapeMeta = finalDocs
+    ? alignScrapeMetaToLive(change.proposedScrapeMeta, finalDocs)
+    : change.proposedScrapeMeta;
   update.sourceUrl = change.proposedSourceUrl;
   update.lastVerifiedAt = now;
   // The approver is recorded on the visa too (checkpoint-1 decision).

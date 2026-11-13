@@ -536,6 +536,12 @@ export type VisaFieldDiff =
   // documents disappear from the live doc on approve, as the proposed array
   // replaces the live one wholesale (an empty proposed list deletes the field).
   | { field: "requiredDocuments"; kind: "changed"; added: string[]; removed: string[] }
+  // Issue #187: the kind (document / information) and need (required /
+  // conditional / optional) of items that stay on the list, when a new
+  // extraction classifies them differently. NOT a visa field: approving it
+  // writes only the new `scrapeMeta` (which carries `requiredDocumentMeta`).
+  // Shown to the admin as item, old kind/need -> new kind/need.
+  | { field: "requiredDocumentMeta"; kind: "changed"; changes: RequiredDocumentMetaChange[] }
   // The fee. Applying it writes `baseCostUsd` (+ `scrapeMeta.fee` via the
   // wholesale scrapeMeta replace) in the same transaction.
   | {
@@ -545,6 +551,21 @@ export type VisaFieldDiff =
       baseCostUsdBefore?: number;
       baseCostUsdAfter?: number;
     };
+
+/** The classification fields a reviewer compares for one item (issue #187). */
+export interface RequiredDocumentMetaView {
+  kind: "document" | "information";
+  need: "required" | "conditional" | "optional";
+  appliesWhen?: string;
+  kindReview?: true;
+}
+
+/** One item whose classification changes: `before` is the live reading. */
+export interface RequiredDocumentMetaChange {
+  item: string;
+  before: RequiredDocumentMetaView;
+  after: RequiredDocumentMetaView;
+}
 
 /** A staged, field-level edit to a live (approved, scraped) visa. */
 export interface PendingVisaChange {
