@@ -1,6 +1,20 @@
 {
   "indexes": [
     {
+      "collectionGroup": "countries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "isSupported",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "popularityRank",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
       "collectionGroup": "visaSources",
       "queryScope": "COLLECTION",
       "fields": [
