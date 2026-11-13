@@ -85,13 +85,13 @@ describe("no bypass of the message-access helper", () => {
   test("the guard bites: synthetic offenders are caught", () => {
     const offenderA: [string, string] = [
       "services/sneaky.ts",
-      `import { callModel } from "./ai/llm-provider";\nconst m = subcollections.messages(id).get();`,
+      "import { callModel } from \"./ai/llm-provider\";\nconst m = subcollections.messages(id).get();",
     ];
     const offenderB: [string, string] = [
       "services/sneaky2.ts",
-      `import { messagingService } from "./messaging.service";\nimport { x } from "./ai/batch-provider";`,
+      "import { messagingService } from \"./messaging.service\";\nimport { x } from \"./ai/batch-provider\";",
     ];
-    const ok: [string, string] = ["services/fine.ts", `// subcollections.messages( in a comment\nimport { callModel } from "./ai/llm-provider";`];
+    const ok: [string, string] = ["services/fine.ts", "// subcollections.messages( in a comment\nimport { callModel } from \"./ai/llm-provider\";"];
     assert.equal(offenders([offenderA]).length, 1);
     assert.equal(offenders([offenderB]).length, 1);
     assert.equal(offenders([ok]).length, 0);

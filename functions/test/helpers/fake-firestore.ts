@@ -338,6 +338,10 @@ export async function installFakes(): Promise<void> {
   // attachAuthz reads the caller's resolved-entitlements cache for every
   // non-admin token (null means RBAC-only, which is what these tests want).
   firebase.collections.entitlements = fakeCollection("entitlements");
+  // Issue #172: the conversation list/response reads the caller's AI message
+  // access record (approval, account-wide setting) for the `aiAccess` view.
+  firebase.collections.aiMessageAccess = fakeCollection("aiMessageAccess");
+  firebase.collections.aiMessageAccessAudit = fakeCollection("aiMessageAccessAudit");
   const riskSignals: any = await import("../../src/services/risk-signal.service");
   riskSignals.riskSignalService.runTransaction = fakeRunTransaction;
 }

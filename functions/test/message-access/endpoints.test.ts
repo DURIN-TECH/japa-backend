@@ -16,7 +16,7 @@ import { before, beforeEach, describe, test } from "node:test";
 import { ROLES } from "@durin-tech/authz";
 import { store } from "../helpers/fake-firestore";
 import {
-  AGENT_DOC, AGENT_USER, APPLICANT, CONV,
+  AGENT_USER, APPLICANT, CONV,
   auditRows, installMessageAccessFakes, resetMessageAccess, seedApproval, seedChat, seedPlan,
 } from "./harness";
 import { aiMessageAccessController } from "../../src/controllers/ai-message-access.controller";
