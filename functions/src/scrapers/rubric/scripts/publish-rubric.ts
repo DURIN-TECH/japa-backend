@@ -96,9 +96,19 @@ async function main(): Promise<void> {
   // ---- the report (the same fields the admin endpoint returns) ----
   console.log(`\n${TAG} outcome: ${report.outcome}${report.dryRun ? " (report only)" : ""}`);
   console.log(`${TAG} code gates passed: ${report.codeGatesPassed ? "yes" : "no"}`);
-  if (skipChecker || report.checker !== "passed") {
+  // (#223) Say what really happened. "failed" means the check RAN and did not confirm the draft (or could
+  // not finish): calling that "has NOT run" sent people looking for a missing key when the check had run.
+  if (skipChecker || report.checker === "not_run" || report.checker === "not_configured") {
     console.log(`${TAG} the independent AI check has NOT run (${report.checker}); question plan: ${report.questionPlan}.`);
+  } else if (report.checker === "failed") {
+    console.log(`${TAG} the independent AI check ran and failed (see the reasons below); question plan: ${report.questionPlan}.`);
   }
+  if (report.checkerRequests) console.log(`${TAG} check requests: ${report.checkerRequests.total} (of which ${report.checkerRequests.repair} for repairs).`);
+  // (#223) Protected rules (bars on a named group) the check did not confirm, with the one automatic repair.
+  section(
+    "Protected rules not confirmed",
+    (report.protectedFailures ?? []).map((f) => `${f.criterionId}${f.ruleRef ? ` [${f.ruleRef}]` : ""} "${f.title}": failed ${f.failedAspects.join(", ") || "(trigger)"}; repair ${f.repair.status}${f.repair.detail ? ` (${f.repair.detail})` : ""}${f.repair.replacementFailedAspects && f.repair.replacementFailedAspects.length > 0 ? `; replacement still failed ${f.repair.replacementFailedAspects.join(", ")}` : ""}`)
+  );
   section("Reasons", report.reasonCodes.map((c, i) => `${c}: ${report.reasons[i]}`));
   section("Gates", report.gates.map((g) => `${g.passed ? "pass" : "FAIL"}  ${g.gate}${g.detail ? ` (${g.detail})` : ""}`));
   const c = report.counts;

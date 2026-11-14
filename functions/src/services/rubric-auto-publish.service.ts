@@ -5,6 +5,7 @@ import { collections, subcollections } from "../utils/firebase";
 import {
   acknowledgementsFor,
   applyExclusions,
+  applyRuleRepairs,
   buildExclusionNote,
   evaluateGates,
   evaluateRubricAutoPublished,
@@ -16,6 +17,7 @@ import {
   rubricStore,
   routeAllowed,
   rubricChecker,
+  ruleHashOf,
   sampleAudit,
   scrapeAlertService,
 } from "../scrapers";
@@ -37,11 +39,13 @@ import {
   RUBRIC_SYSTEM_ACTOR_ID,
   type IntentPolarity,
   type RubricHead,
+  type RubricProtectedFailure,
   type RubricPublishGateResult,
   type RubricPublishLeftOut,
   type RubricPublishRun,
   type RubricPublishTrigger,
   type RubricReviewActor,
+  type RubricRuleRepair,
   type VisaRubric,
 } from "../types/rubric";
 
@@ -125,8 +129,28 @@ export interface RubricCheckInput {
  * A checker must not throw; if it does the draft is held `checker_unavailable`.
  */
 export type RubricCheckOutcome =
-  | { ok: true; leftOut: { criterionId: string; reason: string }[]; resolvedFlagCodes: string[]; intentPolarity: IntentPolarity | null; droppedTriggerIds?: string[] }
-  | { ok: false; reasonCodes: string[]; protectedRuleIds?: string[] };
+  | {
+    ok: true;
+    leftOut: { criterionId: string; reason: string }[];
+    resolvedFlagCodes: string[];
+    intentPolarity: IntentPolarity | null;
+    droppedTriggerIds?: string[];
+    // (#223) Failed protected rules that were re-drafted once and confirmed by both models: the
+    // replacements to record on the version (`ruleRepairs`), and the record of every attempt.
+    repairs?: RubricRuleRepair[];
+    protectedFailures?: RubricProtectedFailure[];
+    requests?: { total: number; repair: number };
+  }
+  | {
+    ok: false;
+    reasonCodes: string[];
+    protectedRuleIds?: string[];
+    // (#223) The complete held report: each protected failure (per-aspect verdicts and the repair
+    // attempt), the ordinary rules the check would have left out, and the spend.
+    protectedFailures?: RubricProtectedFailure[];
+    leftOut?: { criterionId: string; reason: string }[];
+    requests?: { total: number; repair: number };
+  };
 
 /** The independent check (part B registers its implementation: see `registerChecker`). */
 export interface RubricChecker {
@@ -176,6 +200,12 @@ export interface RunOptions {
   skipChecker?: boolean;
 }
 
+/** (#223) What the independent check reports beyond keep / leave out / hold, carried to the record and the alert. */
+interface RunExtras {
+  protectedFailures?: RubricProtectedFailure[];
+  checkerRequests?: { total: number; repair: number };
+}
+
 /** The report of one run (also what the admin endpoint and the script return). */
 export interface RubricPublishReport {
   runId: string;
@@ -203,6 +233,10 @@ export interface RubricPublishReport {
   recorded: boolean;
   // INTEGRATION: rules whose trigger the independent check could not confirm (kept, trigger ignored).
   droppedTriggerIds?: string[];
+  // (#223) Protected rules the check did not confirm, with the repair attempt of each (also on the run record).
+  protectedFailures?: RubricProtectedFailure[];
+  // (#223) Model requests the check made, repair requests shown apart.
+  checkerRequests?: { total: number; repair: number };
   // The audit entry of a publish.
   auditId: string | null;
   previousApprovedVersion: number | null;
@@ -223,6 +257,23 @@ function errorClass(err: unknown): string {
 
 /** The unresolved-flag reason the question plan (not the rule check) is able to clear (#203). */
 const PLAN_RESOLVED_FLAG_REASON = "flag_unresolved:intake_wording_uncited";
+
+/** The repair statuses in plain words (for the alert). */
+const REPAIR_IN_WORDS: Record<string, string> = {
+  repaired: "re-drafted once from its own source passage and confirmed by both checks",
+  failed_check: "re-drafted once, but the checks still did not confirm it",
+  cannot_be_repaired: "the re-draft said the passage cannot be drafted into this rule",
+  invalid_redraft: "the re-draft did not pass the code checks (its quote or group was not in the official text)",
+  not_attempted: "no repair was tried",
+  attempt_unfinished: "the repair could not finish (the check will be retried)",
+};
+
+/** One failed bar as a line of plain words: its title, reference, the aspects that failed and what the repair did. */
+function findingInWords(f: RubricProtectedFailure): string {
+  const aspects = f.failedAspects.length > 0 ? `failed ${f.failedAspects.join(", ")}` : "not confirmed";
+  const detail = f.repair.detail ? ` (${f.repair.detail})` : "";
+  return `${f.title}${f.ruleRef ? ` [${f.ruleRef}]` : ""}: ${aspects}; ${REPAIR_IN_WORDS[f.repair.status] ?? f.repair.status}${detail}. Rule id ${f.criterionId}.`;
+}
 
 /** The system actor, as the review service takes it. */
 const SYSTEM_ACTOR: RubricReviewActor = { kind: RUBRIC_ACTOR_KIND.SYSTEM, id: RUBRIC_SYSTEM_ACTOR_ID };
@@ -349,7 +400,8 @@ export class RubricAutoPublishService {
       const snap = await collections.rubricPublishRuns.where("outcome", "==", "held").get();
       for (const d of snap.docs) {
         const run = d.data() as RubricPublishRun;
-        const retryable = run.reasonCodes.length > 0 && run.reasonCodes.every((c) => RETRYABLE_REASONS.includes(c));
+        // (#223) A reason may carry a detail after a colon (`checker_unavailable:provider`): the base code decides.
+        const retryable = run.reasonCodes.length > 0 && run.reasonCodes.every((c) => RETRYABLE_REASONS.includes(c.split(":")[0]));
         if (!retryable || run.attempts >= MAX_SWEEP_ATTEMPTS || !routeAllowed(loaded.settings, run.routeKey)) continue;
         out.considered += 1;
         if (Date.now() - started > budgetMs) break;
@@ -479,6 +531,13 @@ export class RubricAutoPublishService {
       let plannerFields: Record<string, unknown> | undefined;
       let protectedFromChecker: string[] = [];
       let droppedTriggerIds: string[] = [];
+      // (#223) What the check says about failed bars and its spend, for the run record and the alert;
+      // the replacements of repaired bars; and the rulebook as it will be SERVED with them (what the
+      // check verified, what the gates, the planner and the approval validate).
+      const extras: RunExtras = {};
+      let repairs: RubricRuleRepair[] = [];
+      let effective: VisaRubric = rubric;
+      let activeGateInput = gateInput;
 
       if (checkerNotRun) {
         // Report mode: say plainly that the check has not run.
@@ -496,16 +555,34 @@ export class RubricAutoPublishService {
         if (this.deps.checker !== null && this.deps.planner !== null) {
           // Both exist: spend on the check only now that every code gate passed.
           const outcome = await this.callChecker(this.deps.checker, { routeKey, version, runId, rubric, codeLeftOutIds: report.excludedCriterionIds });
+          extras.checkerRequests = outcome.requests;
           if (!outcome.ok) {
             checker = "failed";
             for (const code of outcome.reasonCodes) if (!reasons.includes(code)) reasons.push(code);
             protectedFromChecker = outcome.protectedRuleIds ?? [];
+            // (#223) The held record lists everything: each failed bar (per-aspect verdicts and the repair
+            // attempt), and the ordinary rules the check would have left out with their shares.
+            extras.protectedFailures = outcome.protectedFailures ?? (protectedFromChecker.length > 0 ? protectedFromChecker.map((id) => this.bareFailure(rubric, id)) : undefined);
+            if (outcome.leftOut) {
+              report = evaluateGates({ ...gateInput, checker: { leftOut: outcome.leftOut, resolvedFlagCodes: [] } });
+              // The leave-out shares are reasons in their own right (the report shows them either way).
+              for (const code of report.reasonCodes) if ((code === "leave_out_budget_exceeded" || code === "primary_leave_out_budget_exceeded") && !reasons.includes(code)) reasons.push(code);
+            }
           } else {
             checker = "passed";
             polarity = outcome.intentPolarity;
+            // (#223) A failed bar the check REPAIRED: from here on the rulebook is the one WITH the
+            // replacement (what the check verified), for the gates, the planner and the approval.
+            if (outcome.repairs && outcome.repairs.length > 0) {
+              repairs = outcome.repairs;
+              extras.protectedFailures = outcome.protectedFailures;
+              effective = applyRuleRepairs({ ...rubric, ruleRepairs: repairs });
+              const structuralWithRepairs = structuralErrors(effective, rubric.intentPolarityProposal?.value ?? "not_assessed", knownIds);
+              activeGateInput = { ...gateInput, criteria: effective.criteria, flags: reviewFlagsFor(effective, null), structuralErrorCodes: structuralWithRepairs.map((e) => e.code) };
+            }
             // Re-run the gates with the check's leave-outs: the budget and the
             // shrink guard must see the FINAL kept set.
-            report = evaluateGates({ ...gateInput, droppedTriggerIds: outcome.droppedTriggerIds ?? [], checker: { leftOut: outcome.leftOut, resolvedFlagCodes: outcome.resolvedFlagCodes } });
+            report = evaluateGates({ ...activeGateInput, droppedTriggerIds: outcome.droppedTriggerIds ?? [], checker: { leftOut: outcome.leftOut, resolvedFlagCodes: outcome.resolvedFlagCodes } });
             // (#203) The question plan resolves `intake_wording_uncited` AFTER this
             // point, so that one flag must not hold the draft before the planner
             // has run. It is evaluated again below, once the plan has answered.
@@ -513,19 +590,20 @@ export class RubricAutoPublishService {
             if (polarity === null && !reasons.includes("polarity_unverified")) reasons.push("polarity_unverified");
             if (reasons.length === 0) {
               droppedTriggerIds = outcome.droppedTriggerIds ?? [];
-              const plan = await this.callPlanner(this.deps.planner, { routeKey, version, runId, rubric, excludedCriterionIds: report.excludedCriterionIds, checkerLeftOut: outcome.leftOut, droppedTriggerIds });
+              const plan = await this.callPlanner(this.deps.planner, { routeKey, version, runId, rubric: effective, excludedCriterionIds: report.excludedCriterionIds, checkerLeftOut: outcome.leftOut, droppedTriggerIds });
               if (!plan.ok) {
                 questionPlan = "failed";
                 for (const code of plan.reasonCodes) if (!reasons.includes(code)) reasons.push(code);
               } else {
                 questionPlan = "built";
-                plannerFields = plan.reviewFields;
+                // The question plan and (#223) the recorded replacements are written with the approval, together.
+                plannerFields = { ...(plan.reviewFields ?? {}), ...(repairs.length > 0 ? { ruleRepairs: repairs } : {}) };
                 // The plan may resolve more flag codes (the question wording): gate again.
                 // The scoped-rules count is taken over the questions as they will be SERVED (a question the
                 // wording check removed can leave a trigger without its question).
                 const planned = plan.reviewFields?.questionPlan as VisaRubric["questionPlan"];
-                const servedQuestions = applyExclusions({ ...rubric, excludedCriterionIds: [...report.excludedCriterionIds], questionPlan: planned }).intakeQuestions ?? [];
-                report = evaluateGates({ ...gateInput, intakeQuestions: servedQuestions, droppedTriggerIds: outcome.droppedTriggerIds ?? [], checker: { leftOut: outcome.leftOut, resolvedFlagCodes: [...outcome.resolvedFlagCodes, ...(plan.resolvedFlagCodes ?? [])] } });
+                const servedQuestions = applyExclusions({ ...effective, excludedCriterionIds: [...report.excludedCriterionIds], questionPlan: planned }).intakeQuestions ?? [];
+                report = evaluateGates({ ...activeGateInput, intakeQuestions: servedQuestions, droppedTriggerIds: outcome.droppedTriggerIds ?? [], checker: { leftOut: outcome.leftOut, resolvedFlagCodes: [...outcome.resolvedFlagCodes, ...(plan.resolvedFlagCodes ?? [])] } });
                 for (const code of report.reasonCodes) if (!reasons.includes(code)) reasons.push(code);
               }
             }
@@ -568,11 +646,12 @@ export class RubricAutoPublishService {
           settingsUnreadable,
           protectedHold: report.protectedHold || protectedFromChecker.length > 0,
           droppedTriggerIds,
+          extras,
         });
       }
 
       // ---- 7. publish through the SHARED approval transaction ----
-      return await this.publish(rubric, head, report, { runId, opts, mode, attempts, startedAt, previousRun, checker, questionPlan, polarity: polarity as IntentPolarity, plannerFields, droppedTriggerIds });
+      return await this.publish(rubric, head, report, { runId, opts, mode, attempts, startedAt, previousRun, checker, questionPlan, polarity: polarity as IntentPolarity, plannerFields, droppedTriggerIds, effective, extras });
     } catch (err) {
       // ---- ANY error: the draft stays pending, the serving version untouched ----
       if (err instanceof RubricReviewError && explicit && (err.code === "NOT_FOUND" || err.code === "ALREADY_DECIDED")) throw err;
@@ -601,12 +680,13 @@ export class RubricAutoPublishService {
     rubric: VisaRubric,
     head: RubricHead,
     report: GateReport,
-    ctx: { runId: string; opts: RunOptions; mode: "manual" | "auto"; attempts: number; startedAt: Timestamp; previousRun: RubricPublishRun | null; checker: RubricPublishRun["checker"]; questionPlan: RubricPublishRun["questionPlan"]; polarity: IntentPolarity; plannerFields?: Record<string, unknown>; droppedTriggerIds?: string[] }
+    ctx: { runId: string; opts: RunOptions; mode: "manual" | "auto"; attempts: number; startedAt: Timestamp; previousRun: RubricPublishRun | null; checker: RubricPublishRun["checker"]; questionPlan: RubricPublishRun["questionPlan"]; polarity: IntentPolarity; plannerFields?: Record<string, unknown>; droppedTriggerIds?: string[]; effective: VisaRubric; extras?: RunExtras }
   ): Promise<RubricPublishReport> {
     // The flags the version has under the decided polarity: only those with a
     // recorded gate result are acknowledged. Anything else the transaction
     // refuses (FLAGS_NOT_ACKNOWLEDGED) and the draft is held.
-    const proposedKeys = reviewFlagsFor(rubric, null).map((f) => f.key);
+    // (#223) The flags of the rulebook AS SERVED (with any repaired bar swapped in): the approval computes them the same way.
+    const proposedKeys = reviewFlagsFor(ctx.effective, null).map((f) => f.key);
     const acknowledgedFlags = acknowledgementsFor(proposedKeys, report.flagResolutions).acknowledged;
     const excluded = report.excludedCriterionIds;
     // Primary-source rules left out need the explicit confirmation: only the
@@ -636,7 +716,7 @@ export class RubricAutoPublishService {
           return this.buildReport(ctx.runId, rubric, report, { outcome: "skipped", reasonCodes: ["already_decided"], mode: ctx.mode, trigger: ctx.opts.trigger, attempts: ctx.attempts, checker: ctx.checker, questionPlan: ctx.questionPlan, codeGatesPassed: true, dryRun: false, recorded: false, auditId: null, previousApprovedVersion: head.approvedVersion ?? null });
         }
         // The shared transaction refused: held with ITS code (a newer draft will supersede it).
-        return this.hold(rubric, head, report, [err.code], { runId: ctx.runId, opts: ctx.opts, mode: ctx.mode, attempts: ctx.attempts, startedAt: ctx.startedAt, previousRun: ctx.previousRun, checker: ctx.checker, questionPlan: ctx.questionPlan, codeGatesPassed: true, settingsUnreadable: false, protectedHold: false });
+        return this.hold(rubric, head, report, [err.code], { runId: ctx.runId, opts: ctx.opts, mode: ctx.mode, attempts: ctx.attempts, startedAt: ctx.startedAt, previousRun: ctx.previousRun, checker: ctx.checker, questionPlan: ctx.questionPlan, codeGatesPassed: true, settingsUnreadable: false, protectedHold: false, extras: ctx.extras });
       }
       throw err;
     }
@@ -657,6 +737,7 @@ export class RubricAutoPublishService {
       previousApprovedVersion: result.previousApprovedVersion,
     });
     finished.droppedTriggerIds = ctx.droppedTriggerIds ?? [];
+    this.applyExtras(finished, ctx.extras);
     finished.recorded = await this.writeRecord(rubric, finished, ctx.startedAt, ctx.previousRun !== null);
     await this.supersedeOlderPending(rubric.routeKey, rubric.version, ctx.runId);
     await this.alertPublished(rubric, report, finished);
@@ -671,7 +752,7 @@ export class RubricAutoPublishService {
     head: RubricHead,
     report: GateReport,
     reasons: string[],
-    ctx: { runId: string; opts: RunOptions; mode: "manual" | "auto"; attempts: number; startedAt: Timestamp; previousRun: RubricPublishRun | null; checker: RubricPublishRun["checker"]; questionPlan: RubricPublishRun["questionPlan"]; codeGatesPassed: boolean; settingsUnreadable: boolean; protectedHold: boolean; droppedTriggerIds?: string[] }
+    ctx: { runId: string; opts: RunOptions; mode: "manual" | "auto"; attempts: number; startedAt: Timestamp; previousRun: RubricPublishRun | null; checker: RubricPublishRun["checker"]; questionPlan: RubricPublishRun["questionPlan"]; codeGatesPassed: boolean; settingsUnreadable: boolean; protectedHold: boolean; droppedTriggerIds?: string[]; extras?: RunExtras }
   ): Promise<RubricPublishReport> {
     const finished = this.buildReport(ctx.runId, rubric, report, {
       outcome: "held",
@@ -688,6 +769,7 @@ export class RubricAutoPublishService {
       previousApprovedVersion: head.approvedVersion ?? null,
     });
     finished.droppedTriggerIds = ctx.droppedTriggerIds ?? [];
+    this.applyExtras(finished, ctx.extras);
     finished.recorded = await this.writeRecord(rubric, finished, ctx.startedAt, ctx.previousRun !== null);
     await this.alertHeld(rubric, report, finished, { protectedHold: ctx.protectedHold, settingsUnreadable: ctx.settingsUnreadable });
     return finished;
@@ -775,10 +857,11 @@ export class RubricAutoPublishService {
       primaryLeftOut: report.primaryLeftOutIds.map(ruleOf),
       informationalFlags: report.informationalFlags,
       sample: sampleAudit(rubric.criteria.filter((c) => kept.has(c.criterionId)), rubric.version).map((r) => ({ title: r.title, ruleRef: r.ruleRef, quote: r.quote, url: r.url })),
-      reasons: finished.reasonCodes.map(reasonInWords),
+      reasons: this.reasonsInWords(rubric, finished.reasonCodes),
       protectedHold: false,
       settingsUnreadable: false,
       attempt: finished.attempts,
+      ...(finished.protectedFailures && finished.protectedFailures.length > 0 ? { protectedFindings: finished.protectedFailures.map(findingInWords) } : {}),
     };
   }
 
@@ -801,6 +884,34 @@ export class RubricAutoPublishService {
     } catch (err) {
       console.error(`Rubric auto-publish: the alert for ${rubric.routeKey} v${rubric.version} failed (${errorClass(err)})`);
     }
+  }
+
+  // ---------- Words (#223) ----------
+
+  /**
+   * Hold reasons in words. A reason that names a rule by id (`protected_rule_failed:<id>`) also names it
+   * by TITLE, read from the draft (data, never code), so the alert says which bar failed.
+   */
+  private reasonsInWords(rubric: VisaRubric, codes: readonly string[]): string[] {
+    const titleOf = new Map(rubric.criteria.map((c) => [c.criterionId, c.title]));
+    return codes.map((code) => {
+      const m = /^protected_rule_failed:(.+)$/.exec(code);
+      const title = m ? titleOf.get(m[1]) : undefined;
+      return title ? `${reasonInWords(code)}: "${title}"` : reasonInWords(code);
+    });
+  }
+
+  /** Copy the check's report onto a run report (the record is written from the report). */
+  private applyExtras(finished: RubricPublishReport, extras: RunExtras | undefined): void {
+    if (!extras) return;
+    if (extras.protectedFailures !== undefined) finished.protectedFailures = extras.protectedFailures;
+    if (extras.checkerRequests !== undefined) finished.checkerRequests = extras.checkerRequests;
+  }
+
+  /** A failed bar with no check detail (an older checker, or a hold before any spend): id, title and ref only. */
+  private bareFailure(rubric: VisaRubric, id: string): RubricProtectedFailure {
+    const c = rubric.criteria.find((x) => x.criterionId === id);
+    return { criterionId: id, ruleRef: c?.ruleRef ?? null, title: c?.title ?? id, failedAspects: [], verdicts: {}, repair: { status: "not_attempted", detail: "not_checked", ruleHash: c ? ruleHashOf(c) : "", requests: 0 } };
   }
 
   // ---------- Reads ----------
@@ -856,7 +967,7 @@ export class RubricAutoPublishService {
       return await checker.check(input);
     } catch (err) {
       console.error(`Rubric auto-publish: the independent check threw for ${input.runId} (${errorClass(err)})`);
-      return { ok: false, reasonCodes: ["checker_unavailable"] };
+      return { ok: false, reasonCodes: ["checker_unavailable:internal"] };
     }
   }
 
@@ -896,6 +1007,8 @@ export class RubricAutoPublishService {
       checker: report.checker,
       questionPlan: report.questionPlan,
       ...(report.droppedTriggerIds !== undefined ? { droppedTriggerIds: report.droppedTriggerIds } : {}),
+      ...(report.protectedFailures !== undefined ? { protectedFailures: report.protectedFailures } : {}),
+      ...(report.checkerRequests !== undefined ? { checkerRequests: report.checkerRequests } : {}),
       auditId: report.auditId,
       previousApprovedVersion: report.previousApprovedVersion,
       startedAt,
@@ -967,7 +1080,7 @@ export class RubricAutoPublishService {
       routeKey: rubric.routeKey,
       version: rubric.version,
       ...f,
-      reasons: f.reasonCodes.map(reasonInWords),
+      reasons: this.reasonsInWords(rubric, f.reasonCodes),
       gates: report.gates,
       counts: {
         rules: report.counts.rules,

@@ -484,6 +484,18 @@ export function sampleAudit(kept: readonly AssessmentCriterion[], version: numbe
     .map(({ c }) => ({ criterionId: c.criterionId, title: c.title, ruleRef: c.ruleRef ?? null, quote: c.source.quote, url: c.source.url }));
 }
 
+/** (#223) The `<what>` of `checker_unavailable:<what>` in words. */
+const CHECKER_UNAVAILABLE_WORDS: Record<string, string> = {
+  settings_read: "the publishing settings could not be read",
+  snapshot_read: "the stored official text a quote comes from could not be read",
+  ledger: "the check's own record could not be read or written",
+  provider: "the AI provider could not be reached (the request failed after one retry)",
+  provider_refused: "the AI model declined a request",
+  not_configured: "no AI key is set up for the check",
+  deadline: "the check ran out of time (the hourly retry resumes it)",
+  internal: "the check hit an unexpected error",
+};
+
 /** Reason codes in words, for the alert. Unknown codes are shown as they are (never hidden). */
 export function reasonInWords(code: string): string {
   const fixed: Record<string, string> = {
@@ -531,6 +543,9 @@ export function reasonInWords(code: string): string {
     primary_source_empty: "a main official source has no rule left",
     protected_rule_failed: "the independent check did not confirm a protected rule (a bar on a named group)",
     checker: "the independent check did not confirm this rule",
+    // (#223) What was unreachable: named so a person knows where to look. Never error text.
+    checker_unavailable: `the independent AI check could not be completed because ${CHECKER_UNAVAILABLE_WORDS[rest] ?? "something it needs could not be reached"}, so nothing was published`,
   };
+  if (head === "checker_unavailable") return prefixed[head];
   return prefixed[head] ? `${prefixed[head]}${rest ? ` (${rest})` : ""}` : code;
 }

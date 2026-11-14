@@ -1150,6 +1150,10 @@ export interface RubricPublishAlertFacts {
   settingsUnreadable: boolean;
   // Distinguishes a re-run of the same version from a re-delivery of one run.
   attempt: number;
+  // (#223) Protected rules (bars) the independent check did not confirm, named by title, with the
+  // aspects that failed and what the one automatic repair did (a held alert), or the bars that were
+  // repaired (a published alert). Each line is plain words built by the pipeline from data, never code.
+  protectedFindings?: string[];
 }
 
 /** `route key + version`, the id shown in the link and used in dedupe keys. */
@@ -1192,6 +1196,9 @@ export function evaluateRubricAutoPublished(facts: RubricPublishAlertFacts, conf
         facts.primaryLeftOut.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((r) => `${r.title}${r.ruleRef ? ` [${r.ruleRef}]` : ""}`).join("; ") +
         (facts.primaryLeftOut.length > MAX_LISTED_PRIMARY_LEAVE_OUTS ? "; ..." : "")
     );
+  }
+  if (facts.protectedFindings && facts.protectedFindings.length > 0) {
+    lines.push("Protected rules re-drafted once automatically and confirmed by both checks:", ...facts.protectedFindings.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((f) => `- ${f}`));
   }
   lines.push(`Informational remarks: ${countsLine(facts.informationalFlags)}.`);
   if (facts.sample.length > 0) {
@@ -1245,6 +1252,10 @@ export function evaluateRubricDraftHeld(facts: RubricPublishAlertFacts, config: 
   ];
   if (facts.primaryLeftOut.length > 0) {
     lines.push(`Would leave out from the main official source: ${facts.primaryLeftOut.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((r) => `${r.title}${r.ruleRef ? ` [${r.ruleRef}]` : ""}`).join("; ")}.`);
+  }
+  if (facts.protectedFindings && facts.protectedFindings.length > 0) {
+    lines.push("Protected rules (bars on a named group) the check did not confirm:", ...facts.protectedFindings.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((f) => `- ${f}`));
+    if (facts.protectedFindings.length > MAX_LISTED_PRIMARY_LEAVE_OUTS) lines.push("- ...");
   }
   lines.push(`Informational remarks: ${countsLine(facts.informationalFlags)}.`);
   lines.push(`Look at it, run the check again or publish it by hand: ${facts.link}`);

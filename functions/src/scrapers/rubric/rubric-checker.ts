@@ -858,9 +858,10 @@ export class RubricCheckerService {
     // The drafting call's own transient retry counts against what is left of the run's request cap.
     const attempts = { failed: 0, cap: ctx.caps.checkerMaxRequestsPerRun - ctx.usage.requests };
     const args: RedraftArgs = { rule, aspects, index, routeName, limits: ctx.limits, sent: { chars: 0 } };
-    const account = (): number => {
-      // Every request, answered or failed, is a request; its tokens were billed.
-      const n = used.requests + attempts.failed;
+    const account = (lastFailed = false): number => {
+      // Every request, answered or failed, is a request; its tokens were billed. The drafting call counts
+      // an answered request and each RETRIED failure, but not the final failure it throws: `lastFailed` adds it.
+      const n = used.requests + attempts.failed + (lastFailed ? 1 : 0);
       ctx.usage.requests += n;
       ctx.repairRequests += n;
       ctx.usage.inputChars += args.sent.chars;
@@ -882,7 +883,7 @@ export class RubricCheckerService {
       const outcome = await this.deps.redraft(ctx.provider, args, used, attempts, { deadlineAt: ctx.startedMs + 540_000, nowMs: this.deps.nowMs, sleep: this.deps.sleep });
       return finish(outcome, account());
     } catch (err) {
-      const requests = account();
+      const requests = account(err instanceof RunStop && err.reasonCode === "provider_error");
       if (err instanceof RunStop) {
         // No key, or the provider could not be reached: not an attempt (nothing is stored; a retry may try).
         if (err.reasonCode === "ai_not_configured") return { kind: "infra", failure: "unavailable_not_configured", requests };

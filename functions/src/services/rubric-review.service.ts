@@ -2,7 +2,7 @@ import { Timestamp, type DocumentData, type Transaction, type UpdateData } from 
 import { collectionGroups, collections, db, subcollections } from "../utils/firebase";
 // The scrapers module is reached through its public entry point only (the
 // ESLint boundary rule of issue #91 refuses deep imports from here).
-import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA, SnapshotQuoteIndex, guidanceSnapshotStore, previewExclusions, rubricStore, validateVisaRubric } from "../scrapers";
+import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA, applyRuleRepairs, SnapshotQuoteIndex, guidanceSnapshotStore, previewExclusions, rubricStore, validateVisaRubric } from "../scrapers";
 import type { ExclusionPreview } from "../scrapers";
 import type { GuidanceSnapshotContent } from "../scrapers/types";
 import type { RubricIssue } from "../scrapers";
@@ -768,6 +768,8 @@ export interface RubricReviewAuditEntry {
   // Approve only (#161): the primary-source criteria excluded under an explicit
   // confirmation (empty when none, or none from a primary source).
   confirmedPrimaryExclusions?: string[];
+  // (#223) Protected rules replaced by their one automatic re-draft with this approval (the replacements are on the version as `ruleRepairs`).
+  repairedCriterionIds?: string[];
   // The version serving before this decision.
   previousApprovedVersion: number | null;
   // The version serving after it.
@@ -989,14 +991,16 @@ export function structuralErrors(
   // a still-pending version, whose reviewedBy / reviewedAt are null, so without a
   // stand-in EVERY pending version reported RUBRIC_INVALID and could never be
   // approved from the UI. The stand-in only satisfies that one check: it is never stored.
-  const candidate: VisaRubric = {
+  const candidate: VisaRubric = applyRuleRepairs({
     ...rubric,
     ...adminSet,
     reviewStatus: "approved",
     intentPolarity: polarity,
     reviewedBy: rubric.reviewedBy ?? "preview",
     reviewedAt: rubric.reviewedAt ?? Timestamp.now(),
-  };
+  });
+  // (#223) `applyRuleRepairs` swaps in any recorded replacement of a repaired protected rule, so the
+  // validator judges the rulebook exactly as it will be served (the replacement, not the original).
   return validateVisaRubric(candidate, { knownEligibilityQuestionIds }).errors;
 }
 
@@ -1018,7 +1022,8 @@ export interface SystemDecisionExtras {
  * else a decision writes (status, polarity, reviewer, exclusions, ...) is set
  * by this file only and can never come from a caller.
  */
-export const PLANNER_WRITABLE_FIELDS: readonly string[] = ["questionPlan"];
+// (#223) `ruleRepairs`: the replacements of protected rules the automatic check re-drafted once and confirmed.
+export const PLANNER_WRITABLE_FIELDS: readonly string[] = ["questionPlan", "ruleRepairs"];
 
 /** Validate the planner's fields against the allow-list; a key outside it throws (never silently dropped). */
 function plannerReviewFields(raw: Record<string, unknown> | undefined): Partial<Pick<VisaRubric, (typeof RUBRIC_REVIEW_FIELDS)[number]>> {
@@ -1653,8 +1658,10 @@ export class RubricReviewService {
       // computed under the PROPOSAL: a key from either set is accepted (a key
       // the decision resolves is simply not recorded as acknowledged), and
       // only a key that belongs to neither is refused.
-      const flags = reviewFlagsFor(rubric, input.intentPolarity);
-      const proposedFlags = reviewFlagsFor(rubric, null);
+      // (#223) The flags of the rulebook AS IT WILL BE SERVED: a repaired protected rule is judged as its replacement.
+      const served = applyRuleRepairs({ ...rubric, ...plannerFields } as VisaRubric);
+      const flags = reviewFlagsFor(served, input.intentPolarity);
+      const proposedFlags = reviewFlagsFor(served, null);
       const blocking = flags.filter((f) => f.blocking);
       const unknownKeys = input.acknowledgedFlags.filter((k) => !flags.some((f) => f.key === k) && !proposedFlags.some((f) => f.key === k));
       if (unknownKeys.length > 0) throw invalid(`acknowledgedFlags names flag(s) this version does not have: ${unknownKeys.join(", ")}`);
@@ -1694,6 +1701,8 @@ export class RubricReviewService {
         exclusionNote: input.exclusionNote ?? null,
         exclusionCount: input.excludedCriterionIds?.length ?? 0,
         confirmedPrimaryExclusions: confirmedPrimary,
+        // (#223) Protected rules swapped for their automatic re-draft with this approval (empty when none).
+        ...(plannerFields.ruleRepairs && plannerFields.ruleRepairs.length > 0 ? { repairedCriterionIds: plannerFields.ruleRepairs.map((r) => r.criterionId) } : {}),
         approvedVersion: version,
       };
       tx.set(auditRef, audit as unknown as Record<string, unknown>);
