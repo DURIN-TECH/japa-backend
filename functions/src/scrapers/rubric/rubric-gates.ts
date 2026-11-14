@@ -3,6 +3,7 @@ import type { AssessmentCriterion, IntakeQuestion, RubricPublishGateResult, Rubr
 import { isValidTrigger } from "../../utils/rubric-trigger";
 import { EXCLUSION_NOTE_MAX } from "./rubric-exclusions";
 import type { RubricPublishSettings } from "./rubric-publish-settings";
+import { languageSupport } from "../language/language-lexicon";
 
 // ============================================
 // RUBRIC AUTOMATIC PUBLISHING — THE CODE GATES (issue #201)
@@ -23,7 +24,7 @@ import type { RubricPublishSettings } from "./rubric-publish-settings";
 // acts on the verdict; nothing here reads or writes anything.
 //
 // ---- The flag table (every code extraction or the validator can raise) ----
-//   HOLD the draft:        no_criteria, intent_polarity_conflict,
+//   HOLD the draft:        language_not_supported (#220), no_criteria, intent_polarity_conflict,
 //                          intent_criteria_without_polarity, suspicious_passages
 //   LEAVE THE RULE OUT:    quote_starts_mid_sentence, quote_ends_mid_sentence,
 //                          combined_sub_conditions, multiple_dates_in_quote, list_not_readable (#222),
@@ -123,6 +124,11 @@ export interface GateInput {
   servingKeptCount: number | null;
   settings: Pick<RubricPublishSettings, "maxLeftOutShare" | "maxPrimaryLeftOutShare" | "minKeptShareOfServing">;
   checker?: GateCheckerResult | null;
+  // (#220) The languages the version's sources are written in, and the languages the settings
+  // support (`appConfig/routeOnboardingSettings.supportedLanguages`). When given, the draft is HELD
+  // `language_not_supported` unless every source language is supported AND has its language data.
+  // Absent = the gate is not evaluated (callers that predate #220).
+  languages?: { sourceLanguages: readonly string[]; supportedLanguages: readonly string[] };
   // INTEGRATION (#207): the questions as they will be SERVED (after the question plan), and the rules
   // whose trigger the check dropped. With them the run record counts the kept rules that are
   // scoped (`conditional` / `specialist`) but have no usable trigger. Absent = not counted.
@@ -242,6 +248,13 @@ export function evaluateGates(input: GateInput): GateReport {
 
   // ---- 1a. structural validity (the same validator a human approval runs) ----
   gate("structural_validity", input.structuralErrorCodes.length > 0 ? ["rubric_invalid"] : [], input.structuralErrorCodes.length > 0 ? [...new Set(input.structuralErrorCodes)].join(", ") : undefined);
+
+  // ---- 1a2. (#220) every source language must be supported: the AI reading and the quote
+  //      reading of a language nobody has evaluated is not trusted to publish by itself ----
+  if (input.languages) {
+    const support = languageSupport(input.languages.sourceLanguages, input.languages.supportedLanguages);
+    gate("language_support", support.ok ? [] : ["language_not_supported"], support.ok ? undefined : `not supported: ${support.unsupported.join(", ")}`);
+  }
 
   // ---- 1b. passages addressed to a reader model: the injection signal ----
   const suspicious = input.suspiciousPassageCount > 0 || input.flags.some((f) => f.code === "suspicious_passages");
@@ -512,6 +525,7 @@ const CHECKER_UNAVAILABLE_WORDS: Record<string, string> = {
 /** Reason codes in words, for the alert. Unknown codes are shown as they are (never hidden). */
 export function reasonInWords(code: string): string {
   const fixed: Record<string, string> = {
+    language_not_supported: "a source is written in a language that is not yet supported for automatic publishing (it waits for an admin to read it, or for the language to be enabled)",
     rubric_invalid: "the rulebook failed the structural check a person's approval also runs",
     suspicious_passages: "the source contains text that reads as instructions to an AI reader",
     no_criteria: "the draft has no rules",

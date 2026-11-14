@@ -4,6 +4,7 @@ import type { PlannedSource } from "../rubric/rubric-extraction.service";
 import type { RubricExtractionSettings } from "../rubric/rubric-settings";
 import { routeAllowed, type LoadedPublishSettings } from "../rubric/rubric-publish-settings";
 import { reasonInWords } from "../rubric/rubric-gates";
+import { needsTranslation } from "../language/language-lexicon";
 import type { JobView } from "../rubric/rubric-extraction-job";
 import type { OnboardingSettings } from "./onboarding-settings";
 import {
@@ -104,7 +105,7 @@ export interface EstimateInput {
   routeKey: string;
   plan: readonly PlannedSource[];
   // Registry facts per source, for the admin's preview table.
-  sourceFacts: ReadonlyMap<string, { title: string; host: string; role: string }>;
+  sourceFacts: ReadonlyMap<string, { title: string; host: string; role: string; language?: string }>;
   extraction: Pick<RubricExtractionSettings, "maxRequestsPerRun" | "maxInputCharsPerRun">;
   checkerMaxRequestsPerRun: number;
   onboarding: Pick<OnboardingSettings, "maxChunksPerRun" | "maxRunsPerDay">;
@@ -118,11 +119,13 @@ export function buildEstimate(input: EstimateInput): RunEstimate {
     .sort((a, b) => a.sourceId.localeCompare(b.sourceId))
     .map((p) => {
       const f = input.sourceFacts.get(p.sourceId);
-      return { sourceId: p.sourceId, title: f?.title ?? p.sourceId, host: f?.host ?? "", role: f?.role ?? "secondary", docType: p.docType, characters: p.chars, chunks: p.chunks, contentHashPrefix: p.contentHashPrefix };
+      return { sourceId: p.sourceId, title: f?.title ?? p.sourceId, host: f?.host ?? "", role: f?.role ?? "secondary", docType: p.docType, characters: p.chars, chunks: p.chunks, contentHashPrefix: p.contentHashPrefix, ...(f?.language ? { language: f.language } : {}) };
     });
   const chunks = sources.reduce((n, s) => n + s.chunks, 0);
   const characters = sources.reduce((n, s) => n + s.characters, 0);
   const extractionCallsAtMost = chunks * 2;
+  // (#220) One translation call at most per text part of a page in another language.
+  const translationCallsAtMost = sources.filter((s) => needsTranslation(s.language)).reduce((n, s) => n + s.chunks, 0);
   // "About 3.7 per chunk, never more than the checker's cap".
   const checkCap = input.checkerMaxRequestsPerRun;
   const checkCallsAbout = Math.min(Math.ceil(chunks * CHECK_CALLS_PER_CHUNK), checkCap);
@@ -140,6 +143,7 @@ export function buildEstimate(input: EstimateInput): RunEstimate {
   const plain =
     `${sources.length} page${sources.length === 1 ? "" : "s"} read (${characters.toLocaleString("en-US")} characters). ` +
     `Drafting needs up to ${extractionCallsAtMost} model calls; the independent checks need about ${checkCallsAbout} more (at most ${checkCap}). ` +
+    (translationCallsAtMost > 0 ? `Because some pages are not in English, up to ${translationCallsAtMost} more calls translate their quotes for readers (unofficial, never used as evidence). ` : "") +
     `Drafting alone is about ${inputTokensApprox.toLocaleString("en-US")} tokens in and ${outputTokensApprox.toLocaleString("en-US")} out. ` +
     input.publishState.plain;
   return {
@@ -153,6 +157,7 @@ export function buildEstimate(input: EstimateInput): RunEstimate {
     extractionCallsAtMost,
     checkCallsAbout,
     checkCallsAtMost: checkCap,
+    ...(translationCallsAtMost > 0 ? { translationCallsAtMost } : {}),
     inputTokensApprox,
     outputTokensApprox,
     caps,

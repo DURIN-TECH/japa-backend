@@ -888,13 +888,13 @@ export class RouteOnboardingService {
   }
 
   /** Registry facts of each source, for the estimate's page table. */
-  private async sourceFacts(ids: readonly string[]): Promise<Map<string, { title: string; host: string; role: string }>> {
-    const out = new Map<string, { title: string; host: string; role: string }>();
+  private async sourceFacts(ids: readonly string[]): Promise<Map<string, { title: string; host: string; role: string; language?: string }>> {
+    const out = new Map<string, { title: string; host: string; role: string; language?: string }>();
     for (const id of ids) {
       const snap = await collections.guidanceSources.doc(id).get();
       if (!snap.exists) continue;
       const g = snap.data() as GuidanceSource;
-      out.set(id, { title: g.title, host: hostOf(g.url), role: g.role ?? "secondary" });
+      out.set(id, { title: g.title, host: hostOf(g.url), role: g.role ?? "secondary", ...(g.language ? { language: g.language } : {}) });
     }
     return out;
   }
