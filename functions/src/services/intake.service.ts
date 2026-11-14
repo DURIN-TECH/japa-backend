@@ -28,9 +28,12 @@ import { defaultRulebookStack, type ApplicationStackRef } from "./ai/application
 import type { RulebookStackLayer } from "../types/rubric";
 import { Application, ApplicationStatus } from "../types";
 import { answerIncludesAny, effectiveIntakeQuestions } from "./ai/rule-applicability";
+// (#235) Destination questions list the route's member countries when asked.
+import { withDestinationOptions } from "./route-destinations";
 import {
   ApplicationIntake,
   IntakeCondition,
+  OrphanedIntakeAnswer,
   IntakeMeta,
   IntakeQuestion,
   IntakeResponse,
@@ -129,7 +132,10 @@ async function loadApprovedIntake(application: ApplicationStackRef): Promise<App
   // only once an answer triggers one of those rules (their `trigger`s become
   // each question's `showWhen`); one that only unassessable specialist rules
   // read is left out. See effectiveIntakeQuestions.
-  const questions = effectiveIntakeQuestions(rubric);
+  // (#235) A question whose options are the route's member countries gets
+  // them NOW, from membership data on today's date (never stored, never typed
+  // in). Validation below then accepts exactly the countries the applicant saw.
+  const questions = await withDestinationOptions(effectiveIntakeQuestions(rubric), rubric.routeKey);
   const layerVersions = layerVersionsOf(rubric);
   return {
     routeKey: rubricRouteKey(countryCode, visaTypeId),
@@ -144,7 +150,11 @@ async function loadApprovedIntake(application: ApplicationStackRef): Promise<App
 // Visibility (showWhen)
 // ============================================
 
-function conditionHolds(cond: IntakeCondition, answers: Record<string, unknown>): boolean {
+/**
+ * Does one condition hold on these answers? Exported (#235) so the "apply
+ * through" steps read their `when` conditions exactly like `showWhen`.
+ */
+export function conditionHolds(cond: IntakeCondition, answers: Record<string, unknown>): boolean {
   const actual = answers[cond.questionId];
   switch (cond.op) {
   case "eq":
@@ -329,7 +339,92 @@ function validateAnswer(q: IntakeQuestion, raw: unknown): unknown {
 // Service
 // ============================================
 
+/**
+ * Validate a full set of answers against a question list (the steps
+ * `saveIntake` applies, exported for #235 so the "apply through" questions are
+ * checked by the same code):
+ *  1. unknown ids are rejected (never silently dropped, never stored);
+ *  2. visibility is decided on the submitted answers; hidden questions'
+ *     answers are dropped; a blank answer clears the question;
+ *  3. every remaining answer is validated per type.
+ * Throws `IntakeValidationError`. Returns the answers to store.
+ */
+export function cleanAnswers(questions: IntakeQuestion[], rawAnswers: unknown): Record<string, unknown> {
+  if (!rawAnswers || typeof rawAnswers !== "object" || Array.isArray(rawAnswers)) {
+    throw new IntakeValidationError("", "answers must be an object keyed by question id");
+  }
+  const input = rawAnswers as Record<string, unknown>;
+  const byId = new Map(questions.map((q) => [q.id, q]));
+  for (const id of Object.keys(input)) {
+    if (!byId.has(id)) throw new IntakeValidationError(id, "That question is not part of this application");
+  }
+  const { visibleIds } = visibleAnswers(questions, input);
+  const toStore: Record<string, unknown> = {};
+  for (const q of questions) {
+    if (!visibleIds.has(q.id)) continue;
+    const raw = input[q.id];
+    if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) continue;
+    toStore[q.id] = validateAnswer(q, raw);
+  }
+  return toStore;
+}
+
+/** What `IntakeService.rebuildIntake` returns: the intake to store and what was set aside. */
+export interface RebuiltIntake {
+  // The intake to store (null when the new stack has no intake and nothing was set aside).
+  intake: ApplicationIntake | null;
+  // How many answers were kept / set aside by this rebuild.
+  kept: number;
+  setAside: number;
+}
+
 export class IntakeService {
+  /**
+   * (#235) Rebuild an application's saved intake for a NEW rulebook stack (the
+   * country applied through changed, or the application is starting with
+   * answers already given). Answers whose question still exists in the new
+   * stack are kept as they are; every other answer is moved to
+   * `orphanedAnswers` (with the route and version it was given against), never
+   * deleted. Earlier orphans are kept. Pure apart from the rulebook read.
+   *
+   * @param target the application's NEW country / visa / stack
+   * @param previous the saved intake (or a fresh set of answers to start with)
+   */
+  async rebuildIntake(
+    target: ApplicationStackRef,
+    previous: { answers: Record<string, unknown>; routeKey?: string; rubricVersion?: number; orphanedAnswers?: OrphanedIntakeAnswer[] },
+    now: Timestamp = Timestamp.now()
+  ): Promise<RebuiltIntake> {
+    const approved = await loadApprovedIntake(target);
+    const known = new Set((approved?.questions ?? []).map((q) => q.id));
+    const answers: Record<string, unknown> = {};
+    const orphaned: OrphanedIntakeAnswer[] = [...(previous.orphanedAnswers ?? [])];
+    let setAside = 0;
+    for (const [id, value] of Object.entries(previous.answers ?? {})) {
+      if (known.has(id)) answers[id] = value;
+      else {
+        orphaned.push({
+          questionId: id,
+          value,
+          ...(previous.routeKey ? { routeKey: previous.routeKey } : {}),
+          ...(typeof previous.rubricVersion === "number" ? { rubricVersion: previous.rubricVersion } : {}),
+          setAsideAt: now,
+        });
+        setAside++;
+      }
+    }
+    if (!approved && orphaned.length === 0 && Object.keys(answers).length === 0) return { intake: null, kept: 0, setAside: 0 };
+    const intake: ApplicationIntake = {
+      routeKey: approved?.routeKey ?? rubricRouteKey(target.countryCode, target.visaTypeId),
+      rubricVersion: approved?.version ?? 0,
+      ...(approved?.layerVersions ? { layerVersions: approved.layerVersions } : {}),
+      answers,
+      ...(orphaned.length > 0 ? { orphanedAnswers: orphaned } : {}),
+      updatedAt: now,
+    };
+    return { intake, kept: Object.keys(answers).length, setAside };
+  }
+
   /** Is the application still open to edits by its applicant? */
   isEditable(application: Application): boolean {
     return INTAKE_EDITABLE_STATUSES.includes(application.status);
@@ -403,27 +498,8 @@ export class IntakeService {
     const approved = await loadApprovedIntake(application);
     if (!approved) throw new Error("NO_INTAKE");
 
-    if (!rawAnswers || typeof rawAnswers !== "object" || Array.isArray(rawAnswers)) {
-      throw new IntakeValidationError("", "answers must be an object keyed by question id");
-    }
-    const input = rawAnswers as Record<string, unknown>;
-
-    // 1. Unknown ids are rejected (never silently dropped, never stored).
-    const byId = new Map(approved.questions.map((q) => [q.id, q]));
-    for (const id of Object.keys(input)) {
-      if (!byId.has(id)) throw new IntakeValidationError(id, "That question is not part of this application");
-    }
-
-    // 2. Visibility is decided on the submitted answers; hidden questions'
-    //    answers are dropped. A blank answer clears the question.
-    const { visibleIds } = visibleAnswers(approved.questions, input);
-    const toStore: Record<string, unknown> = {};
-    for (const q of approved.questions) {
-      if (!visibleIds.has(q.id)) continue;
-      const raw = input[q.id];
-      if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) continue;
-      toStore[q.id] = validateAnswer(q, raw);
-    }
+    // 1-2. Unknown ids rejected, hidden answers dropped, each answer validated.
+    const toStore = cleanAnswers(approved.questions, rawAnswers);
 
     // 3. Write. Only the `intake` field and `updatedAt` change; the answers
     //    come from the validated copy above, never from the request body.
@@ -433,6 +509,10 @@ export class IntakeService {
       // (#233) Every layer's version, on a multi-layer stack only.
       ...(approved.layerVersions ? { layerVersions: approved.layerVersions } : {}),
       answers: toStore,
+      // (#235) Answers kept aside when the country applied through changed are
+      // never lost by a later save (they are not this route's answers any more,
+      // so they are carried over as they are, never validated or edited).
+      ...(application.intake?.orphanedAnswers ? { orphanedAnswers: application.intake.orphanedAnswers } : {}),
       updatedAt: Timestamp.now(),
     };
     await collections.applications.doc(application.id).update({

@@ -41,6 +41,8 @@ import { feedbackRoutes } from "./routes/feedback.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
+// Issue #235: "which country do I apply through" for a shared route (applicant-facing, read-only).
+import { applyThroughRoutes } from "./routes/apply-through.routes";
 import { documentRoutes } from "./routes/document.routes";
 // Document templates feature (rich-text templates + editable case-linked instances)
 import { documentTemplateRoutes } from "./routes/document-template.routes";
@@ -125,6 +127,7 @@ app.use("/invitations", invitationRoutes);
 // Personal document checklist (issue #114): extra-segment paths on /applications.
 app.use("/applications", checklistRoutes);
 app.use("/applications", applicationRoutes);
+app.use("/shared-routes", applyThroughRoutes);
 app.use("/documents", documentRoutes);
 // Document templates: catalog (read-only) + editable instances cloned from them
 app.use("/document-templates", documentTemplateRoutes);

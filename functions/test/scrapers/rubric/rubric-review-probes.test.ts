@@ -545,6 +545,8 @@ describe("prompt version pin", () => {
     "2026-11-rubric-v10": "ba427491eff3803bd1e5e874d3e1c302f21352f147847dd4361ab153e7a3066c",
     // v11 (#234): a bar's group may hold `appliesTo.groups` members (residence, holds, members_of).
     "2026-11-rubric-v11": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
+    // v12 (#235): the criteria call is unchanged, so its hash is v11's.
+    "2026-11-rubric-v12": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
   };
   // v5 onwards: the intake prompt and its schema are pinned too (call 2),
   // so a change to either also needs a version bump.
@@ -563,6 +565,8 @@ describe("prompt version pin", () => {
     "2026-11-rubric-v10": "c13a6c6236fef82fea10928454e975b6012affa247c9e34af00b3bb1fb7beea9",
     // v11 (#234): the intake call is unchanged.
     "2026-11-rubric-v11": "c13a6c6236fef82fea10928454e975b6012affa247c9e34af00b3bb1fb7beea9",
+    // v12 (#235): the intake call may draft competence steps and destination questions (`optionsFrom`).
+    "2026-11-rubric-v12": "71aae5b23c5e0671f8d95841c65e4ccce8707cab634e01cb7044af6fe60fbbec",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {

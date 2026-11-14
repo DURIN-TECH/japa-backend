@@ -1,4 +1,4 @@
-import type { AssessmentCriterion, EvidenceItem, IntakeQuestion, IntentPolarity, RulebookStackLayer, VisaRubric } from "../../types/rubric";
+import type { AssessmentCriterion, CompetenceBlock, EvidenceItem, IntakeQuestion, IntentPolarity, RulebookStackLayer, VisaRubric } from "../../types/rubric";
 import type { RouteLayer } from "../../types/shared-route";
 import { keyFieldsOf, rulebookTargetOfKey } from "./rubric-key";
 import { planStack, type StackPlanProblem } from "./rubric-question-plan";
@@ -146,13 +146,51 @@ function layerView(read: StackLayerRead & { rubric: VisaRubric }): VisaRubric {
     ...(e.when ? { when: { ...e.when, questionId: scope(e.when.questionId) } } : {}),
     layerKey: key,
   }));
+  // (#235) A shared layer's competence steps point at its own rule and
+  // questions: scope those references the same way, and tag each step.
+  const competence: CompetenceBlock | undefined = r.competence
+    ? {
+      steps: r.competence.steps.map((st) => ({
+        ...st,
+        criterionId: scope(st.criterionId),
+        questionId: scope(st.questionId),
+        ...(st.when ? { when: st.when.map((cond) => ({ ...cond, questionId: scope(cond.questionId) })) } : {}),
+        layerKey: key,
+      })),
+    }
+    : undefined;
   return {
     ...r,
     criteria,
     intakeQuestions,
     evidenceItems,
     ...(r.evidenceHelpsCriterionIds ? { evidenceHelpsCriterionIds: r.evidenceHelpsCriterionIds.map(scope) } : {}),
+    ...(competence ? { competence } : {}),
   };
+}
+
+/**
+ * (#235) A SHARED layer's served rubric as it appears inside a stack: every id
+ * scoped `{rulebookKey}::{id}` and every item tagged with its layer, exactly
+ * as `mergeRulebookStack` shows it. Used before an application exists (the
+ * "apply through" step reads the shared layer alone), so the question ids the
+ * applicant answers are the very ids the application's intake stores. Pure.
+ */
+export function sharedLayerView(rulebookKey: string, authorityId: string, rubric: VisaRubric): VisaRubric {
+  return layerView({ layer: { rulebookKey, authorityId, role: "shared" }, rubric });
+}
+
+/**
+ * (#235) The competence block of a merged stack: the block of the ONE approved
+ * SHARED layer that has one (already scoped by `layerView`). A country's own
+ * layer never decides which member to apply through, and when two shared
+ * layers both carry a block the stack cannot say which one applies, so it
+ * serves none (the applicant then picks: never a guess). Pure.
+ */
+export function stackCompetence(reads: readonly StackLayerRead[], views: readonly VisaRubric[]): CompetenceBlock | undefined {
+  const approved = reads.filter((r) => r.rubric !== null);
+  const blocks = views.filter((v, i) => approved[i]?.layer.role === "shared" && v.competence !== undefined).map((v) => v.competence as CompetenceBlock);
+  return blocks.length === 1 ? blocks[0] : undefined;
 }
 
 // ============================================
@@ -335,6 +373,7 @@ export function mergeRulebookStack(reads: readonly StackLayerRead[]): VisaRubric
     ownRead.layer.rulebookKey
   );
   const evidenceHelps = lists.evidenceHelpsCriterionIds;
+  const competence = stackCompetence(reads, views);
 
   return {
     schemaVersion: base.schemaVersion,
@@ -358,6 +397,8 @@ export function mergeRulebookStack(reads: readonly StackLayerRead[]): VisaRubric
     ...(intake ? { intake } : {}),
     intakeQuestions: lists.intakeQuestions,
     evidenceItems: lists.evidenceItems,
+    // (#235) Which member to apply through: the one shared layer's block, if any.
+    ...(competence ? { competence } : {}),
     // Outcome statistics are per destination country: only the own layer's.
     ...(ownView?.outcomeStatistics ? { outcomeStatistics: ownView.outcomeStatistics } : {}),
     ...(evidenceHelps ? { evidenceHelpsCriterionIds: evidenceHelps } : {}),

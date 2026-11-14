@@ -871,8 +871,52 @@ export interface Application {
   // applications started before #234. Never written by the generic update.
   applicantFacts?: ApplicantFacts;
 
+  // Issue #235 (P6 of #228): on a SHARED route, the member country the
+  // application goes through, CONFIRMED by the applicant (or their agent).
+  // `countryCode` / `visaTypeId` above are that member's own inheriting record,
+  // so prices, agencies and the rest of the system read it unchanged. ABSENT on
+  // every application that was not started through a shared route.
+  throughCountryCode?: string;
+  // Who confirmed it, and the rule shown at that time (see ThroughCountryChoice).
+  throughCountry?: ThroughCountryChoice;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+/**
+ * (#235) The confirmed "country I apply through" of a shared-route
+ * application, with what the applicant was shown when they confirmed it.
+ * The proposal is NEVER forced: `followedProposal` is false when the applicant
+ * picked another member, and `reasonShown` is the line they saw ("The rule
+ * says X; you chose Y"). Written only by the create and change-country paths.
+ */
+export interface ThroughCountryChoice {
+  /** The shared route the application is on. */
+  sharedRouteId: string;
+  /** The confirmed member country (same as `Application.throughCountryCode`). */
+  countryCode: string;
+  /** Who confirmed it: their uid and role at the time. */
+  chosenByUid: string;
+  chosenByRole?: string;
+  confirmedAt: Timestamp;
+  /**
+   * The proposal shown at that time, from the shared rulebook's competence
+   * steps (null when the rulebook has no such rule or the answers did not
+   * point to a country: the applicant then simply picked).
+   */
+  proposal: { countryCode: string; stepIndex: number; restsOn: string; quote: string; url: string } | null;
+  /** The answers the proposal was worked out from (scoped question ids). */
+  answers: Record<string, unknown>;
+  /** Why there was no proposal (a code from the resolver), when there was none. */
+  noProposalReason?: string;
+  /** True when the confirmed country is the proposed one; null when there was no proposal. */
+  followedProposal: boolean | null;
+  /** The plain line shown when the applicant chose another member than the rule's. */
+  reasonShown?: string;
+  /** The shared rulebook (key and approved version) the steps came from, when one was read. */
+  rulebookKey?: string;
+  rulebookVersion?: number;
 }
 
 export type PaymentStatus = 
