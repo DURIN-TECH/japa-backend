@@ -18,13 +18,16 @@
  *  - The target project must be named with `--project` (no default: this
  *    machine's gcloud default is production); `japa-platform` (production) is
  *    refused unless `--allow-production` is also passed.
- *  - `--dry-run` makes the model calls (paid) but writes nothing.
+ *  - `--no-write` makes the model calls (PAID) but writes nothing. It is
+ *    deliberately not called `--dry-run`: every other rulebook script's dry run
+ *    is free (no model call), so a paid one under the same name would surprise
+ *    an operator. `--dry-run` is refused with an explanation.
  *  - Spend is bounded by the rulebook settings (requests, input characters,
  *    runs per day, kill switch); over a cap the run stops before spending.
  *  - Prints ids, counts and reason codes only, never page text.
  *
  * Run (from functions/):
- *   npm run draft:entry-rules -- --project <id> --authority <id> --sources <sourceId,...> [--dry-run] [--allow-production]
+ *   npm run draft:entry-rules -- --project <id> --authority <id> --sources <sourceId,...> [--no-write] [--allow-production]
  * (also accepts `--flag=value`).
  */
 export {};
@@ -47,7 +50,15 @@ async function main(): Promise<void> {
   const project = flag(args, "project") ?? "";
   const authorityId = flag(args, "authority") ?? "";
   const sourceIds = (flag(args, "sources") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  const dryRun = args.includes("--dry-run");
+  // `--no-write`: paid model calls, nothing stored (see SAFETY above).
+  const dryRun = args.includes("--no-write");
+  // `--dry-run` means "free, no model call" in every other rulebook script.
+  // This script has no free preview, so refuse the flag rather than spend.
+  if (args.includes("--dry-run")) {
+    console.error(`${TAG} --dry-run is not supported here: drafting always makes paid model calls. Use --no-write to run the paid calls without storing anything.`);
+    process.exitCode = 1;
+    return;
+  }
 
   // ---- the project must be explicit, and never production by accident ----
   if (!project) {

@@ -36,7 +36,7 @@ Admin review (read-only, no screen): `GET /admin/entry-rules?authorityId=&status
 ## Drafting (paid AI): `npm run draft:entry-rules`
 
 ```
-npm run draft:entry-rules -- --project <id> --authority <id> --sources <sourceId,...> [--dry-run]
+npm run draft:entry-rules -- --project <id> --authority <id> --sources <sourceId,...> [--no-write]   # --no-write still makes the PAID model calls; there is no free dry run
 ```
 
 Needs first: the authority (a country code, or an active bloc/treaty with
