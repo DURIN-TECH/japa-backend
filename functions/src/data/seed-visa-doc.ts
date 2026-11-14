@@ -1,5 +1,7 @@
 import type { Timestamp } from "firebase-admin/firestore";
 import type { SharedRouteRef } from "../types/shared-route";
+// #299: the fee of a shared route, already converted by the pure helper.
+import type { SourcedFeeFields } from "./seed-sourced-fee";
 
 // ============================================
 // SEED VISA DOCUMENT BUILDER (issue #239, P10 of #228)
@@ -12,6 +14,11 @@ import type { SharedRouteRef } from "../types/shared-route";
 // it does not name is dropped from an existing doc. `inheritsFrom` (written by
 // the shared-routes admin API, or by the migration script from the data file)
 // must therefore survive a re-seed, which runs on every dev deploy.
+//
+// Issue #299: `baseCostUsd` + `sourcedFee` of a record that inherits a shared
+// route with a fee are SEED-OWNED too. The seed decides them on every run
+// (seed-sourced-fee.ts) and passes the result in; when it passes none, the
+// whole-document set drops both, which is how a removed fee disappears.
 
 /** The seed-owned fields of one visa record (the optional ones may be absent: see seed-countries-visas.ts). */
 export interface SeedVisaFields {
@@ -43,6 +50,10 @@ export interface SeedVisaFields {
  * @param now       timestamp for createdAt (new doc) and updatedAt
  * @param fromData  shared routes the DATA FILE says this record inherits
  *                  (`inheritsFromFor`); the seed itself names none
+ * @param sourced   #299: the record's sourced fee (`sourcedFeeFields` of the
+ *                  seed's decision), or undefined when it has none. The seed
+ *                  refuses an entry that has both this and its own
+ *                  `baseCostUsd`, so the two never compete here.
  *
  * `inheritsFrom`: a stored value always wins (it was set deliberately by the
  * admin API or the migration, and may have been changed since); the data
@@ -53,7 +64,8 @@ export function buildVisaTypeDoc(
   visa: SeedVisaFields,
   existing: Record<string, unknown> | undefined,
   now: Timestamp,
-  fromData: SharedRouteRef[] = []
+  fromData: SharedRouteRef[] = [],
+  sourced?: SourcedFeeFields
 ): Record<string, unknown> {
   const storedInherits = Array.isArray(existing?.inheritsFrom) ? (existing!.inheritsFrom as SharedRouteRef[]) : undefined;
   const inheritsFrom = storedInherits && storedInherits.length > 0 ? storedInherits : fromData.length > 0 ? fromData : undefined;
@@ -69,6 +81,9 @@ export function buildVisaTypeDoc(
     processingDaysMax: visa.processingDaysMax,
     // Omitted (not 0, not ""), exactly like a scraped visa whose page states no fee.
     ...(visa.baseCostUsd !== undefined && { baseCostUsd: visa.baseCostUsd }),
+    // #299: the shared route's fee in whole USD, with its source and dated
+    // rate beside it. Written together or not at all (never `undefined`).
+    ...(sourced && { baseCostUsd: sourced.baseCostUsd, sourcedFee: sourced.sourcedFee }),
     ...(visa.validityPeriod !== undefined && { validityPeriod: visa.validityPeriod }),
     isExtendable: visa.isExtendable,
     ...(visa.maxExtensions !== undefined && { maxExtensions: visa.maxExtensions }),

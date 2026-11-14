@@ -25,7 +25,8 @@ export * from "./news";
 export * from "../scrapers/types";
 // Local import so VisaType (below) can reference the scrape provenance shape.
 // Type-only, so the visa-catalog <-> index cycle is erased at compile time.
-import type { VisaScrapeMeta } from "../scrapers/types";
+// #299: `VisaFeeMeta` (the fee block `computeFee` builds) is reused by `VisaSourcedFee`.
+import type { VisaFeeMeta, VisaScrapeMeta } from "../scrapers/types";
 
 // ============================================
 // USER TYPES
@@ -470,6 +471,40 @@ export interface Country {
   updatedAt: Timestamp;
 }
 
+// ============================================
+// SOURCED FEE OF A SHARED ROUTE (issue #299)
+// ============================================
+//
+// A shared route's official source can set ONE government fee for every
+// member country. That fact is recorded once, on the route, in the shared
+// visa data file (src/data/shared-visa-data.ts). The seed converts it to USD
+// with the stored exchange rate (`appConfig/fx`, the same `computeFee` a
+// scraped visa uses) and writes the whole-dollar figure as `baseCostUsd` on
+// each record that inherits the route, with this block beside it so the
+// figure can always be traced to the sentence and the dated rate behind it.
+//
+// Fields are absent (never `undefined`) when they do not apply, like
+// `VisaFeeMeta`.
+export interface VisaSourcedFee {
+  /** The shared route whose source states the fee. */
+  sharedRouteId: string;
+  /** The sentence of the official source that states the fee, word for word. */
+  quote: string;
+  /** The official document the quote is from (https). */
+  url: string;
+  /** The stored official source the quote is in (`guidanceSources/{id}`). */
+  guidanceSourceId: string;
+  /** Optional: the published rule the quote was read from. */
+  ruleRef?: { routeKey: string; version: number; criterionId: string };
+  /**
+   * The conversion, exactly as `computeFee` returned it: the fee in its source
+   * currency (`components`, `totals`), the unrounded `totalUsd`, and the rate
+   * used (`fxRateToUsd`, `fxDate`, `fxSource`). `baseCostUsd` on the record is
+   * `Math.round(fee.totalUsd)`.
+   */
+  fee: VisaFeeMeta;
+}
+
 export interface VisaType {
   id: string;
   countryCode: string;
@@ -536,6 +571,12 @@ export interface VisaType {
   // BEFORE the country's own one (see shared-routes/route-stack.ts). Written
   // only by the admin shared-routes API; absent on every existing record.
   inheritsFrom?: SharedRouteRef[];
+
+  // Issue #299: where `baseCostUsd` comes from when it is the government fee
+  // of a shared route this record inherits (see `VisaSourcedFee` below).
+  // Written and removed ONLY by the countries/visas seed, together with
+  // `baseCostUsd`; absent on every record whose fee has another origin.
+  sourcedFee?: VisaSourcedFee;
 
   // Availability
   isActive: boolean;

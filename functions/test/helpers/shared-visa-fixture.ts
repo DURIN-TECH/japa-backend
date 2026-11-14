@@ -29,3 +29,23 @@ export const FIXTURE_DATA = {
     },
   ],
 };
+
+// ---- Issue #299: a MADE-UP fee for the fixture route ----
+// A placeholder sentence, amount and ids. The currency code is a real ISO 4217
+// code only because the validator requires one; nothing here is a real fee.
+export const FIXTURE_FEE = {
+  amount: 250,
+  currency: "SEK",
+  label: "Placeholder fee",
+  quote: "Placeholder sentence stating that the fee is SEK 250.",
+  url: `https://${BLOC_HOST}/fees`,
+  guidanceSourceId: "example-area-fee-source",
+  ruleRef: { routeKey: "example-area_example-short-stay", version: 1, criterionId: "crit_example" },
+};
+
+/** FIXTURE_DATA with the made-up fee on its one route (a fresh copy every call). */
+export function fixtureDataWithFee(): typeof FIXTURE_DATA & { sharedRoutes: Array<{ fee: typeof FIXTURE_FEE }> } {
+  const copy = JSON.parse(JSON.stringify(FIXTURE_DATA));
+  copy.sharedRoutes[0].fee = JSON.parse(JSON.stringify(FIXTURE_FEE));
+  return copy;
+}

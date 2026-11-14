@@ -11,7 +11,10 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { buildVisaTypeDoc } from "./seed-visa-doc";
 // #239: which shared routes a record inherits comes from the DATA FILE, never from this seed.
-import { inheritsFromFor, loadSharedVisaData } from "./shared-visa-data-format";
+import { inheritsFromFor, loadSharedVisaData, routeFeesFor } from "./shared-visa-data-format";
+// #299: the fee of a shared route, converted with the stored rate (pure rules in seed-sourced-fee.ts).
+import { effectiveSeedCost, planSourcedFee, seedFeeProblems, sourcedFeeFields, type SourcedFeeDecision } from "./seed-sourced-fee";
+import type { FxRatesDoc } from "../types";
 
 const db = getFirestore();
 
@@ -898,33 +901,121 @@ const VISA_TYPES: SeedVisaType[] = [
 // SEED FUNCTION
 // ============================================
 
-export async function seedCountriesAndVisas(): Promise<{
+/**
+ * What a caller may replace (issue #299). The deploy seed passes nothing and
+ * gets the lists above and the repo's data file. The emulator tests pass
+ * made-up countries, visas and data, so no real bloc or fee appears in a test.
+ */
+export interface SeedCountriesAndVisasOptions {
+  countries?: SeedCountry[];
+  visaTypes?: SeedVisaType[];
+  /** A raw shared visa data file (validated like the repo's own). */
+  sharedVisaData?: unknown;
+  /** The seed's clock (rate freshness, createdAt / updatedAt). Default: now. */
+  now?: Timestamp;
+}
+
+export type { SeedCountry, SeedVisaType };
+
+export async function seedCountriesAndVisas(options: SeedCountriesAndVisasOptions = {}): Promise<{
   countries: number;
   visaTypes: number;
 }> {
-  const now = Timestamp.now();
+  const now = options.now ?? Timestamp.now();
+  const countries = options.countries ?? COUNTRIES;
+  const visaTypes = options.visaTypes ?? VISA_TYPES;
   // #239: validated up front; an invalid data file stops the seed with a list of problems.
-  const sharedVisaData = loadSharedVisaData();
+  const sharedVisaData = loadSharedVisaData(options.sharedVisaData);
+
+  // #299: a record cannot have two fee sources. Checked before ANY write, so a
+  // conflicting seed entry stops the run with every problem listed.
+  const feeProblems = seedFeeProblems(visaTypes, sharedVisaData);
+  if (feeProblems.length > 0) {
+    throw new Error(`The seed's visa fees conflict with the shared visa data file:\n - ${feeProblems.join("\n - ")}`);
+  }
 
   // Group visa types by country for stats computation
   const visasByCountry: Record<string, SeedVisaType[]> = {};
-  for (const visa of VISA_TYPES) {
+  for (const visa of visaTypes) {
     if (!visasByCountry[visa.countryCode]) {
       visasByCountry[visa.countryCode] = [];
     }
     visasByCountry[visa.countryCode].push(visa);
   }
 
+  // ============================================
+  // READS (before any write)
+  // ============================================
+
+  // Issue #191: read the docs that already exist BEFORE writing, so a re-seed
+  // (it runs on every dev deploy) can keep the fields that admins and scripts
+  // own: isActive (e.g. the deactivate:uk-seeds script from #175), agentIds
+  // and createdAt. One getAll per country. Since #299 this happens up front
+  // (it used to sit in the write loop): the stored fee of a record decides
+  // what the seed writes for it, and the country's minimum cost needs that.
+  const visaRef = (visa: SeedVisaType) => db.collection("countries").doc(visa.countryCode).collection("visaTypes").doc(visa.id);
+  /** Stored visa docs, keyed "<countryCode>/<visaId>". */
+  const existingByKey = new Map<string, Record<string, unknown>>();
+  const keyOf = (visa: SeedVisaType) => `${visa.countryCode}/${visa.id}`;
+  for (const visas of Object.values(visasByCountry)) {
+    if (visas.length === 0) continue;
+    const snaps = await db.getAll(...visas.map(visaRef));
+    snaps.forEach((snap, i) => {
+      if (snap.exists) existingByKey.set(keyOf(visas[i]), snap.data() as Record<string, unknown>);
+    });
+  }
+
+  // ---- #299: the sourced fee of every record the data file gives one ----
+  // Only records listed under a route's `inheritedBy` with a `fee` are
+  // looked at; for every other record nothing below runs and its fee is
+  // exactly what the seed entry says.
+  const feeDecisions = new Map<string, SourcedFeeDecision>();
+  const visasWithRouteFee = visaTypes.filter((v) => routeFeesFor(sharedVisaData, v.countryCode, v.id).length > 0);
+  if (visasWithRouteFee.length > 0) {
+    // The stored exchange rates (`appConfig/fx`, refreshed by the visa-catalog
+    // crawl). READ ONLY here: the seed never fetches or writes a rate.
+    const fxSnap = await db.collection("appConfig").doc("fx").get();
+    const fx = fxSnap.exists ? (fxSnap.data() as FxRatesDoc) : undefined;
+    // Which of the official sources the fees cite are on record.
+    const sourceIds = [...new Set(visasWithRouteFee.flatMap((v) => routeFeesFor(sharedVisaData, v.countryCode, v.id).map((r) => r.fee.guidanceSourceId)))];
+    const sourceSnaps = await db.getAll(...sourceIds.map((id) => db.collection("guidanceSources").doc(id)));
+    const sourcesOnRecord = new Set(sourceSnaps.filter((snap) => snap.exists).map((snap) => snap.id));
+
+    for (const visa of visasWithRouteFee) {
+      const decision = planSourcedFee({
+        routeFees: routeFeesFor(sharedVisaData, visa.countryCode, visa.id),
+        existing: existingByKey.get(keyOf(visa)),
+        fx,
+        now,
+        guidanceSourceExists: (id) => sourcesOnRecord.has(id),
+      });
+      feeDecisions.set(keyOf(visa), decision);
+      // Every outcome is logged, so a deploy log says why a price is or is not there.
+      if (decision.action === "write") {
+        console.log(`[seed] ${keyOf(visa)}: sourced fee written, baseCostUsd ${decision.baseCostUsd} (rate date ${decision.sourcedFee.fee.fxDate ?? "n/a"})`);
+      } else if (decision.action === "keep") {
+        console.log(`[seed] ${keyOf(visa)}: sourced fee NOT re-converted, baseCostUsd ${decision.baseCostUsd} kept: ${decision.reason}`);
+      } else if (decision.action === "omit") {
+        console.log(`[seed] ${keyOf(visa)}: NO sourced fee written (no baseCostUsd, no sourcedFee): ${decision.reason}`);
+      }
+    }
+  }
+
+  // ============================================
+  // WRITES
+  // ============================================
+
   // Seed countries
   const countryBatch = db.batch();
-  for (const country of COUNTRIES) {
+  for (const country of countries) {
     const visas = visasByCountry[country.code] || [];
     const minProcessingDays =
       visas.length > 0
         ? Math.min(...visas.map((v) => v.processingDaysMin))
         : 0;
     // #239: a visa with no recorded fee does not count towards the minimum.
-    const costs = visas.map((v) => v.baseCostUsd).filter((c): c is number => c !== undefined);
+    // #299: a sourced fee counts exactly like a seed entry's own fee.
+    const costs = visas.map((v) => effectiveSeedCost(v, feeDecisions.get(keyOf(v)))).filter((c): c is number => c !== undefined);
     const minCostUsd = costs.length > 0 ? Math.min(...costs) : 0;
 
     countryBatch.set(db.collection("countries").doc(country.code), {
@@ -941,39 +1032,30 @@ export async function seedCountriesAndVisas(): Promise<{
     });
   }
   await countryBatch.commit();
-  console.log(`✅ Seeded ${COUNTRIES.length} countries`);
+  console.log(`✅ Seeded ${countries.length} countries`);
 
   // Seed visa types (batch per country since subcollections differ)
   let totalVisas = 0;
-  for (const [countryCode, visas] of Object.entries(visasByCountry)) {
+  for (const visas of Object.values(visasByCountry)) {
     const visaBatch = db.batch();
 
-    // Issue #191: read the docs that already exist for this country BEFORE
-    // writing, so a re-seed (it runs on every dev deploy) can keep the fields
-    // that admins and scripts own: isActive (e.g. the deactivate:uk-seeds
-    // script from #175), agentIds and createdAt. One getAll per country.
-    const refs = visas.map((visa) =>
-      db
-        .collection("countries")
-        .doc(countryCode)
-        .collection("visaTypes")
-        .doc(visa.id)
-    );
-    const existingSnaps = await db.getAll(...refs);
-    const existingById = new Map(
-      existingSnaps.filter((snap) => snap.exists).map((snap) => [snap.id, snap.data()])
-    );
-
-    for (const [i, visa] of visas.entries()) {
-      const ref = refs[i];
-      const existing = existingById.get(visa.id);
+    for (const visa of visas) {
+      const existing = existingByKey.get(keyOf(visa));
+      const decision = feeDecisions.get(keyOf(visa));
 
       // #239: built by a pure function (seed-visa-doc.ts). It keeps the stored
       // `inheritsFrom` (this is a whole-document set, which would drop it) and
       // adds the data file's shared routes to a record that has none.
+      // #299: plus the record's sourced fee, when the decision carries one.
       visaBatch.set(
-        ref,
-        buildVisaTypeDoc(visa, existing, now, inheritsFromFor(sharedVisaData, visa.countryCode, visa.id))
+        visaRef(visa),
+        buildVisaTypeDoc(
+          visa,
+          existing,
+          now,
+          inheritsFromFor(sharedVisaData, visa.countryCode, visa.id),
+          decision ? sourcedFeeFields(decision) : undefined
+        )
       );
     }
     await visaBatch.commit();
@@ -981,5 +1063,5 @@ export async function seedCountriesAndVisas(): Promise<{
   }
   console.log(`✅ Seeded ${totalVisas} visa types across ${Object.keys(visasByCountry).length} countries`);
 
-  return { countries: COUNTRIES.length, visaTypes: totalVisas };
+  return { countries: countries.length, visaTypes: totalVisas };
 }
