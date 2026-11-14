@@ -294,9 +294,9 @@ describe("rate's own date (asOf) limits staleness", () => {
   test("a stored rate whose asOf passes the limit goes stale even while fetchedAt is fresh", async () => {
     const { service, store, clock } = makeService();
     await service.refreshAll();
-    // simulate a re-stamp: fetchedAt now, asOf 6 days old
+    // simulate a re-stamp: fetchedAt now, asOf 7 days old (past the 144h default)
     const doc = store.docs.get("NGN")!;
-    doc.provider = { ...doc.provider!, asOf: new Date(clock.now().getTime() - 6 * 24 * 3_600_000), fetchedAt: clock.now() };
+    doc.provider = { ...doc.provider!, asOf: new Date(clock.now().getTime() - 7 * 24 * 3_600_000), fetchedAt: clock.now() };
     await assert.rejects(service.getRate("NGN"), (e) => code(e) === "RATE_STALE");
   });
   test("a weekend-old rate (3 days) still prices", async () => {
@@ -344,8 +344,11 @@ describe("jump guard and plausible range", () => {
     }
   });
   test("no stored rate and no configured range -> refused (nothing to judge by)", async () => {
-    const { service } = makeService({ config: { currencies: { NGN: { enabled: true, countries: [] } } } });
-    assert.equal((await service.refreshAll())[0].ok, false);
+    // GHS has no default entry, so no default range to merge in (#214).
+    const ghs = fakeProvider("cbn", { supports: ["GHS"], result: { ok: true, rate: 12, asOf: new Date("2026-11-13T00:00:00Z") } });
+    const { service } = makeService({ cbn: ghs, config: { currencies: { NGN: { enabled: false }, GHS: { enabled: true, countries: [] } } } });
+    const out = await service.refreshAll();
+    assert.deepEqual(out.map((o) => [o.currency, o.ok]), [["GHS", false]]);
   });
   test("the guard applies to every provider (oanda too)", async () => {
     const oanda = fakeProvider("oanda", { configured: true, result: { ok: true, rate: 150, asOf: new Date("2026-11-13T00:00:00Z") } });
@@ -380,7 +383,7 @@ describe("jump guard and plausible range", () => {
     };
     const { service } = makeService({
       cbn: p,
-      config: { currencies: { NGN: { enabled: true, countries: [] }, GHS: { enabled: true, countries: [], minRate: 1, maxRate: 100 } } },
+      config: { currencies: { NGN: { enabled: true, countries: [] }, GHS: { enabled: true, countries: [], minRate: 5, maxRate: 100 } } },
     });
     const errors: string[] = [];
     const orig = console.error;
@@ -405,8 +408,9 @@ describe("override reference rules and config caps", () => {
     await service.setOverride("NGN", { rate: 1500, reason: "CBN site is down today" }, "a");
   });
   test("an unreferenced override with no configured range is refused", async () => {
-    const { service } = makeService({ config: { currencies: { NGN: { enabled: true, countries: [] } } } });
-    await assert.rejects(service.setOverride("NGN", { rate: 1500, reason: "CBN site is down today" }, "a"), MoneyError);
+    // GHS has no default entry, so no range (#214: NGN would keep its default range).
+    const { service } = makeService({ config: { currencies: { GHS: { enabled: true, countries: [] } } } });
+    await assert.rejects(service.setOverride("GHS", { rate: 12, reason: "CBN site is down today" }, "a"), MoneyError);
   });
   test("an unreadable stored provider map blocks the unreferenced path", async () => {
     const { service, store } = makeService();
@@ -424,9 +428,13 @@ describe("override reference rules and config caps", () => {
     assert.equal(c.overrideTtlHours, 168);
     assert.equal(parseCurrenciesConfig({ freshnessHours: "x" }).freshnessHours, 72);
   });
-  test("a plausible range with min >= max is dropped", () => {
-    const c = parseCurrenciesConfig({ currencies: { NGN: { enabled: true, countries: [], minRate: 5000, maxRate: 200 } } });
-    assert.equal(c.currencies.NGN.minRate, undefined);
+  test("a plausible range with min >= max is ignored: the default range is kept, or none for a currency without one", () => {
+    const c = parseCurrenciesConfig({
+      currencies: { NGN: { enabled: true, countries: [], minRate: 5000, maxRate: 200 }, GHS: { enabled: true, countries: [], minRate: 20, maxRate: 10 } },
+    });
+    assert.deepEqual([c.currencies.NGN.minRate, c.currencies.NGN.maxRate], [200, 5000]);
+    assert.equal(c.currencies.GHS.minRate, undefined);
+    assert.equal(c.currencies.GHS.maxRate, undefined);
   });
 });
 

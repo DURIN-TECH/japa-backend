@@ -68,6 +68,9 @@ describe("admin routes are admin-only (real app mount)", () => {
     ["GET", "/admin/exchange-rates"],
     ["PUT", "/admin/exchange-rates/NGN"],
     ["DELETE", "/admin/exchange-rates/NGN"],
+    // Issue #214: reset-reference and the new refresh-now route on the real app.
+    ["POST", "/admin/exchange-rates/NGN/reset-reference"],
+    ["POST", "/admin/exchange-rates/NGN/refresh"],
   ];
   test("no token -> 401", async () => {
     for (const [method, path] of routes) {
@@ -86,6 +89,14 @@ describe("admin routes are admin-only (real app mount)", () => {
   });
 });
 
+describe("public /rates on the real app mount (issue #214)", () => {
+  test("reachable with no token", async () => {
+    const r = await call(realBase, "/rates");
+    assert.equal(r.status, 200);
+    assert.equal(r.json.data.base, "USD");
+  });
+});
+
 describe("rate behaviour (in-memory service)", () => {
   let server: Server;
   let base = "";
@@ -96,7 +107,8 @@ describe("rate behaviour (in-memory service)", () => {
     await ctx.service.refreshAll();
     const a = express();
     a.use(express.json());
-    a.use("/rates", createPublicRatesRouter(ctx.service));
+    // The router's cache follows the test clock, so moving the clock ages it.
+    a.use("/rates", createPublicRatesRouter(ctx.service, { now: () => ctx.clock.now().getTime() }));
     a.use("/admin/exchange-rates", createAdminExchangeRateRouter(ctx.service));
     await new Promise<void>((resolve) => {
       server = a.listen(0, "127.0.0.1", resolve);
@@ -145,5 +157,67 @@ describe("rate behaviour (in-memory service)", () => {
     const row = list.json.data.currencies[0];
     assert.equal(row.stored.override.reason, "CBN outage today");
     assert.equal(row.audit[0].by, "uid-admin");
+  });
+});
+
+// ============================================
+// Issue #214: refresh-now route and the in-process GET /rates cache
+// ============================================
+
+describe("POST /admin/exchange-rates/:currency/refresh and the /rates cache", () => {
+  let server: Server;
+  let base = "";
+  let ctx: ReturnType<typeof makeService>;
+  /** How many times the router asked the service for the config (one per uncached build). */
+  let builds = 0;
+
+  before(async () => {
+    ctx = makeService();
+    const realGetConfig = ctx.service.getConfig.bind(ctx.service);
+    ctx.service.getConfig = async () => {
+      builds++;
+      return realGetConfig();
+    };
+    const a = express();
+    a.use(express.json());
+    a.use("/rates", createPublicRatesRouter(ctx.service, { now: () => ctx.clock.now().getTime() }));
+    a.use("/admin/exchange-rates", createAdminExchangeRateRouter(ctx.service));
+    await new Promise<void>((resolve) => {
+      server = a.listen(0, "127.0.0.1", resolve);
+    });
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+  after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  test("refresh: 200 with the outcome, then 429 with Retry-After inside the cooldown", async () => {
+    const ok = await call(base, "/admin/exchange-rates/NGN/refresh", { token: "admin", method: "POST", body: {} });
+    assert.equal(ok.status, 200);
+    assert.deepEqual([ok.json.data.ok, ok.json.data.rate], [true, 1500]);
+    const again = await call(base, "/admin/exchange-rates/NGN/refresh", { token: "admin", method: "POST", body: { reason: "second try now" } });
+    assert.equal(again.status, 429);
+    assert.equal(again.json.error, "RATE_LIMITED");
+    assert.ok(Number(again.headers.get("retry-after")) > 0);
+    const audit = await ctx.store.listAudit("NGN", 5);
+    assert.equal(audit.filter((x) => x.action === "provider_refresh").length, 1);
+  });
+
+  test("GET /rates is served from cache within 60s, rebuilt after it, and rebuilt at once after an override", async () => {
+    builds = 0;
+    const first = await call(base, "/rates");
+    const second = await call(base, "/rates");
+    assert.equal(builds, 1, "second call served from cache");
+    assert.deepEqual(second.json, first.json);
+
+    await ctx.service.setOverride("NGN", { rate: 1520, reason: "cache invalidation test" }, "uid-admin");
+    builds = 1; // setOverride reads the config itself; count router builds only
+    const afterOverride = await call(base, "/rates");
+    assert.equal(builds, 2, "override invalidates the cache");
+    assert.equal(afterOverride.json.data.currencies[0].rate, 1520);
+
+    ctx.clock.advanceHours(61 / 3600);
+    await call(base, "/rates");
+    assert.equal(builds, 3, "expired after 60s");
   });
 });

@@ -18,14 +18,18 @@ export type MoneyErrorCode =
   /** A rate exists but is older than the freshness limit. */
   | "RATE_STALE"
   /** An input (amount, rate, reason, ...) failed validation. */
-  | "INVALID_INPUT";
+  | "INVALID_INPUT"
+  /** Asked again too soon (issue #214: admin "refresh now" cooldown). */
+  | "RATE_LIMITED";
 
 export class MoneyError extends Error {
   constructor(
     readonly code: MoneyErrorCode,
     message: string,
     /** The currency involved, when there is one. */
-    readonly currency?: string
+    readonly currency?: string,
+    /** For RATE_LIMITED: seconds until a retry can succeed (sent as Retry-After). */
+    readonly retryAfterSeconds?: number
   ) {
     super(message);
     this.name = "MoneyError";
