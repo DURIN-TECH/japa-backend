@@ -87,7 +87,9 @@ describe("verdict -> action table", () => {
   const bar = barOf(3);
 
   test("applicable aspects follow the fields the rule has", () => {
-    assert.deepEqual([...applicableAspects(ordinary)], ["title_faithful", "kind_right", "stage_right", "condition_faithful"]);
+    // (#240) A judgement rule's stage is not judged, so it is not an aspect the rule must be `yes` on.
+    assert.deepEqual([...applicableAspects(ordinary)], ["title_faithful", "kind_right", "condition_faithful"]);
+    assert.deepEqual([...applicableAspects(objective)], ["title_faithful", "kind_right", "stage_right", "condition_faithful", "check_faithful"]);
     assert.ok(applicableAspects(objective).has("check_faithful"));
     assert.ok(applicableAspects(bar).has("group_matches_codes"));
     assert.ok(!applicableAspects({}).has("condition_faithful"));
@@ -105,7 +107,9 @@ describe("verdict -> action table", () => {
     for (const bad of ["no", "unsure"] as const) {
       test(`ordinary: ${aspect} = ${bad} leaves the rule out with that aspect`, () => {
         // Use a rule for which the aspect applies (or not: a doubt on a non-applicable aspect also fails).
-        const r = aspect === "check_faithful" ? objective : aspect === "group_matches_codes" ? ruleOf(9, { applicability: "all_applicants" }) : ordinary;
+        // (#240) kind / stage `unsure` or stage anything are tolerated on a judgement rule, so those two
+        // aspects are exercised on an OBJECTIVE rule (the tolerated cases have their own table below).
+        const r = aspect === "check_faithful" || aspect === "kind_right" || aspect === "stage_right" ? objective : aspect === "group_matches_codes" ? ruleOf(9, { applicability: "all_applicants" }) : ordinary;
         assert.deepEqual(judgeRule(r, { verification: row({ [aspect]: bad }) }), { action: "leave_out", aspect });
       });
     }
@@ -117,7 +121,7 @@ describe("verdict -> action table", () => {
   });
 
   test("ordinary: the FIRST failing aspect in the fixed order is recorded", () => {
-    assert.equal(failedAspect(ordinary, row({ stage_right: "no", title_faithful: "unsure" })), "title_faithful");
+    assert.equal(failedAspect(objective, row({ stage_right: "no", title_faithful: "unsure", check_faithful: "yes" })), "title_faithful");
   });
 
   // ---- (#226) a mandatory bar's stage is not judged ----
@@ -152,15 +156,16 @@ describe("verdict -> action table", () => {
     assert.deepEqual(failedAspectsOf(bar, row({ stage_right: "no", kind_right: "unsure", group_matches_codes: "yes" })), ["kind_right"]);
   });
 
-  test("(#226) NOT widened: a rule that is not a mandatory bar is still judged on its stage, `unsure` included, scoped to named groups or not", () => {
-    const scoped = ruleOf(7, { kind: "judgement", appliesTo: { nationalities: ["QM"], asWritten: ["Group One"] } });
-    assert.deepEqual([...unjudgedAspects(scoped)], []);
-    for (const r of [ordinary, objective, scoped]) {
+  test("(#226, #240) NOT widened: an OBJECTIVE rule is still judged on its stage, `unsure` included, scoped to named groups or not", () => {
+    // (#240) a judgement rule is no longer in this list: its stage is not judged (see the #240 table below).
+    const scopedObjective = ruleOf(7, { kind: "objective", check: { field: "x.y", op: "gte", value: 3 }, appliesTo: { nationalities: ["QM"], asWritten: ["Group One"] } });
+    assert.deepEqual([...unjudgedAspects(scopedObjective)], []);
+    for (const r of [objective, scopedObjective]) {
       assert.ok(applicableAspects(r).has("stage_right"));
-      for (const bad of ["no", "unsure", "na"] as const) assert.equal(failedAspect(r, row({ stage_right: bad, group_matches_codes: "yes" })), "stage_right", `${r.criterionId} ${bad}`);
+      for (const bad of ["no", "unsure", "na"] as const) assert.equal(failedAspect(r, row({ stage_right: bad, group_matches_codes: "yes", check_faithful: "yes" })), "stage_right", `${r.criterionId} ${bad}`);
     }
-    // Protected (scoped) non-bar: one model's `unsure` on stage still holds.
-    assert.deepEqual(judgeRule(scoped, { verification: row({ group_matches_codes: "yes" }), judgement: row({ group_matches_codes: "yes", stage_right: "unsure" }) }), { action: "hold", aspect: "stage_right" });
+    // Protected (scoped) non-bar objective rule: one model's `unsure` on stage still holds.
+    assert.deepEqual(judgeRule(scopedObjective, { verification: row({ group_matches_codes: "yes", check_faithful: "yes" }), judgement: row({ group_matches_codes: "yes", check_faithful: "yes", stage_right: "unsure" }) }), { action: "hold", aspect: "stage_right" });
   });
 
   test("ordinary with no verdict is never 'faithful'", () => {
@@ -268,20 +273,20 @@ describe("check: keep, leave out, hold", () => {
     const out = await r.svc.check(input(rubricOf(rules(25), PROPOSAL)));
     assert.equal(out.ok, true);
     if (!out.ok) return;
-    assert.deepEqual(out.leftOut, [
-      { criterionId: "crit-0003", reason: "checker:kind_right" },
-      { criterionId: "crit-0014", reason: "checker:title_faithful" },
-    ]);
+    // (#240) Rule 3 is an ordinary JUDGEMENT rule: its `kind_right = unsure` no longer leaves it out.
+    // Only the title `no` does, and it is recorded as found wrong.
+    assert.deepEqual(out.leftOut, [{ criterionId: "crit-0014", reason: "checker:title_faithful", basis: "found_wrong" }]);
   });
 
   test("a rule left out is never replaced or edited: the outcome carries ids and reasons only", async () => {
     const r = rig();
-    r.provider.policy = () => ({ stage_right: "no" });
+    r.provider.policy = () => ({ title_faithful: "no" });
     const out = await r.svc.check(input(rubricOf(rules(12), PROPOSAL)));
     assert.equal(out.ok, true);
     if (!out.ok) return;
     assert.equal(out.leftOut.length, 12);
-    for (const l of out.leftOut) assert.deepEqual(Object.keys(l).sort(), ["criterionId", "reason"]);
+    // (#240) plus the closed `basis` word (found wrong / not confirmed): still no free text.
+    for (const l of out.leftOut) assert.deepEqual(Object.keys(l).sort(), ["basis", "criterionId", "reason"]);
   });
 
   test("(#226) a bar with `unsure` / `no` on its stage from EITHER model and yes on everything else is confirmed, through the whole check", async () => {
@@ -309,16 +314,18 @@ describe("check: keep, leave out, hold", () => {
 
     const scoped = rig();
     scoped.provider.policy = ({ role, rule }) => (rule.appliesTo && role === "judgement" ? { stage_right: "unsure" } : undefined);
-    const b = await scoped.svc.check(input(rubricOf([...rules(12), barOf(30, { kind: "judgement" })], PROPOSAL)));
-    assert.equal(b.ok, false, "a rule scoped to named groups but not a bar keeps its stage check");
+    const b = await scoped.svc.check(input(rubricOf([...rules(12), barOf(30, { kind: "objective", check: { field: "x.y", op: "gte", value: 3, unit: "days" } })], PROPOSAL)));
+    assert.equal(b.ok, false, "an objective rule scoped to named groups but not a bar keeps its stage check");
     if (!b.ok) assert.deepEqual(b.protectedFailures?.[0].failedAspects, ["stage_right"]);
 
     // An ordinary rule with `unsure` on stage is still left out.
     const ord = rig();
     ord.provider.policy = ({ rule }) => (rule.title === "Matter 4" ? { stage_right: "unsure" } : undefined);
-    const c = await ord.svc.check(input(rubricOf(rules(12), PROPOSAL)));
+    // (#240) ... of an OBJECTIVE kind (a judgement rule's stage is not judged any more).
+    const objective4 = ruleOf(4, { kind: "objective", probeFactors: undefined, check: { field: "x.y", op: "gte", value: 3, unit: "days" } });
+    const c = await ord.svc.check(input(rubricOf([...rules(3), objective4, ...rules(8, 5)], PROPOSAL)));
     assert.equal(c.ok, true);
-    if (c.ok) assert.deepEqual(c.leftOut, [{ criterionId: "crit-0004", reason: "checker:stage_right" }]);
+    if (c.ok) assert.deepEqual(c.leftOut, [{ criterionId: "crit-0004", reason: "checker:stage_right", basis: "not_confirmed" }]);
   });
 
   test("(#226) the prompt version is bumped (stored v3 answers are not reused), and the prompt tells the model `na` for a bar's stage", () => {
@@ -375,7 +382,7 @@ describe("check: keep, leave out, hold", () => {
     const out = await r.svc.check(input(rubricOf([...rules(6), lost], PROPOSAL)));
     assert.equal(out.ok, true);
     if (!out.ok) return;
-    assert.deepEqual(out.leftOut, [{ criterionId: "crit-0007", reason: "checker:source_text" }]);
+    assert.deepEqual(out.leftOut, [{ criterionId: "crit-0007", reason: "checker:source_text", basis: "not_confirmed" }]);
     assert.ok(r.provider.requests.every((q) => !JSON.stringify(seenRulesSafe(q)).includes("crit-0007")));
   });
 

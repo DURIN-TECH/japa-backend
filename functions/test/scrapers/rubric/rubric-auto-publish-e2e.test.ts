@@ -354,7 +354,7 @@ describe("e2e 2-3: the pipeline publishes automatically and applicants are serve
     // among nine general rules would rightly trip the leave-out budget.)
     const redraft = { ...pristine, flags: pristine.flags.filter((f) => f.code !== "quote_ends_mid_sentence"), createdAt: Timestamp.fromMillis(REVIEW_T0 + 86_400_000) };
     await rubricStore.writePendingVersion(redraft, [SOURCE_A_ID], { force: true, now: Timestamp.fromMillis(REVIEW_T0 + 86_400_000) });
-    const w2 = wire({ check: (p) => { p.policy = ({ rule }) => (rule.title === "Shows where they will stay" ? { stage_right: "no" } : undefined); } });
+    const w2 = wire({ check: (p) => { p.policy = ({ rule }) => (rule.title === "Shows where they will stay" ? { title_faithful: "no" } : undefined); } });
     assert.equal((await trigger(w2.svc, 2))?.outcome, "published");
     const second = audits().find((a) => a.version === 2);
     assert.equal(second.by, RUBRIC_SYSTEM_ACTOR_ID);

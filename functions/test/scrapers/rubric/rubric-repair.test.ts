@@ -213,7 +213,7 @@ describe("a bar that is still not confirmed holds the draft (#223)", () => {
     // 2 ordinary batches ran although the bar failed, and the report carries what they found.
     const ordinaryBatches = batchRequests(r.provider).filter((q) => q.role === "verification" && q.user.includes("Matter 1"));
     assert.equal(ordinaryBatches.length, 2, "12 ordinary rules, batches of 10");
-    assert.deepEqual(out.leftOut, [{ criterionId: "crit-0004", reason: "checker:kind_right" }]);
+    assert.deepEqual(out.leftOut, [{ criterionId: "crit-0004", reason: "checker:kind_right", basis: "found_wrong" }]);
     // Every ordinary verdict is stored with the check's record, so a re-run needs nothing.
     assert.equal(Object.keys([...r.ledger.docs.values()][0].responses).length >= 4, true);
   });
@@ -317,12 +317,15 @@ describe("a bar that is still not confirmed holds the draft (#223)", () => {
   });
 
   test("(#226) the re-draft instructions say: same line, keep the kind; the version is bumped", () => {
-    assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v2");
+    assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v3");
     const chunk = { sourceId: SRC_ID, contentHash: SRC_HASH, docType: "html", chunkIndex: 0, chunkCount: 1, text: BAR_QUOTE } as any;
     const req = buildRepairRequest(chunk, { rule: { title: "T", kind: "mandatory_bar", stage: "validity", quote: BAR_QUOTE }, aspects: ["group_matches_codes"] }, ["high"], { maxOutputTokens: 1000, timeoutMs: 1000 });
     assert.match(req.user, /taken from the same line of the excerpt/);
     assert.match(req.user, /discarded by code/);
     assert.match(req.user, /Keep the rule's kind/);
+    // (#240) v3: and its applicability, unless condition_faithful is among the failed aspects.
+    assert.match(req.user, /Keep the rule's applicability/);
+    assert.match(req.user, /unless condition_faithful is one of the aspects/);
   });
 
   test("a bar whose quote cannot be found is held before any spend, and no repair is tried", async () => {
