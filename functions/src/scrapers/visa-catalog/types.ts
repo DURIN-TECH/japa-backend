@@ -573,7 +573,15 @@ export type VisaFieldDiff =
   // document repeated in different case is the same document). `removed`
   // documents disappear from the live doc on approve, as the proposed array
   // replaces the live one wholesale (an empty proposed list deletes the field).
-  | { field: "requiredDocuments"; kind: "changed"; added: string[]; removed: string[] }
+  // Issue #212: `removedDetails` pairs each removed item with the live visa's own
+  // verbatim citation quote for it (absent when the live visa has none).
+  | {
+      field: "requiredDocuments";
+      kind: "changed";
+      added: string[];
+      removed: string[];
+      removedDetails?: { item: string; quote?: string }[];
+    }
   // Issue #187: the kind (document / information) and need (required /
   // conditional / optional) of items that stay on the list, when a new
   // extraction classifies them differently. NOT a visa field: approving it

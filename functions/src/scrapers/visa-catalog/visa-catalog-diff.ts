@@ -216,7 +216,13 @@ export function diffVisa(params: {
   // Keyed by the normalised form (trim + collapse whitespace + lower-case) but
   // reported with the original text. Absent live + empty proposed = no diff, so
   // a record whose page never lists documents never gets a proposal.
-  const docKey = (s: unknown) => String(s).trim().replace(/\s+/g, " ").toLowerCase();
+  // Issue #212: the key is the citation validator's normalisation (curly vs
+  // straight apostrophes/quotes, en/em dashes, whitespace, case). `itemKey` IS
+  // that function (a pure twin of `normForQuote`, test-pinned equal), imported
+  // from the pure meta module so this file stays free of the extractor's client.
+  // Without it a re-crawl whose page text turned ' into ’ showed EVERY item as
+  // removed + re-added.
+  const docKey = (s: unknown) => itemKey(String(s));
   const liveDocs = Array.isArray(live.requiredDocuments) ? live.requiredDocuments : [];
   const propDocs = Array.isArray(proposedFields.requiredDocuments) ? proposedFields.requiredDocuments : [];
   const liveDocKeys = new Set(liveDocs.map(docKey));
@@ -229,6 +235,19 @@ export function diffVisa(params: {
       kind: "changed",
       added: docsAdded.map((s) => String(s).trim()),
       removed: docsRemoved.map((s) => String(s).trim()),
+      // Issue #212: each removed item with the verbatim quote the LIVE visa
+      // stored for it (by the item's index in the live list), so the admin sees
+      // what the page said. Omitted per item when the live visa has no quote
+      // (pre-#129 records). This is the shrink guard's evidence; nothing here
+      // applies anything.
+      removedDetails: docsRemoved.map((s) => {
+        const at = liveDocs.findIndex((x) => docKey(x) === docKey(s));
+        const quote = live.scrapeMeta?.citations?.[`requiredDocuments.${at}`];
+        return {
+          item: String(s).trim(),
+          ...(typeof quote === "string" && quote.trim() ? { quote } : {}),
+        };
+      }),
     });
     // Live value verbatim (stale check). The FULL proposed list is applied;
     // when it is empty the key is left OUT of `proposed`, which approve turns

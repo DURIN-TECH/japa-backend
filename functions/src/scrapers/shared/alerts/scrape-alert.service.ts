@@ -31,6 +31,8 @@ import {
   evaluateLinkedSurcharge,
   evaluateMissedWindows,
   evaluateReviewQueue,
+  evaluateChecklistShrink,
+  type ChecklistShrinkRow,
   evaluateRunFailed,
   evaluateRunNoLongerStuck,
   evaluateStuckRuns,
@@ -156,6 +158,7 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   rubric_auto_published: "rulebook published automatically",
   rubric_draft_held: "rulebook draft held",
   route_onboarding_attention: "route onboarding needs attention",
+  checklist_shrink: "visa checklist would shrink",
 };
 
 /** Cloud Logging severity per alert severity (resolutions log as INFO). */
@@ -352,6 +355,14 @@ export class ScrapeAlertService {
           evals.push(evaluateNoYieldSources((await this.sourceFacts("news")) as NewsSourceFacts[], config));
         });
       }
+      // Issue #212: a visa run may just have created / replaced a proposal that
+      // shrinks a checklist. Evaluated over all open rows (a superset of the
+      // run's own), so the alert appears now instead of at :45.
+      if (run.kind === "visa") {
+        await this.isolated("checklist_shrink", skippedRules, async () => {
+          evals.push(evaluateChecklistShrink(await this.checklistShrinkRows(), config));
+        });
+      }
       return await this.finish(evals, config, nowMs, skippedRules, false, deferEmail);
     } catch (err) {
       this.engineError("finalize", err, run.id);
@@ -454,6 +465,11 @@ export class ScrapeAlertService {
       // ---- Review queue ----
       await this.isolated("review_queue_stale", skippedRules, async () => {
         evals.push(evaluateReviewQueue(await this.reviewQueueItems(nowMs, config), nowMs, config));
+      });
+
+      // ---- Issue #212: proposals that would shrink a visa's checklist ----
+      await this.isolated("checklist_shrink", skippedRules, async () => {
+        evals.push(evaluateChecklistShrink(await this.checklistShrinkRows(), config));
       });
 
       const result = await this.finish(evals, config, nowMs, skippedRules, true);
@@ -1014,6 +1030,41 @@ export class ScrapeAlertService {
    *  - open pendingVisaChanges created on/before the age cutoff (served by
    *    the existing status+createdAt DESC index), capped.
    */
+  /**
+   * Issue #212: the open pendingVisaChanges rows that carry a requiredDocuments
+   * diff, as plain facts for evaluateChecklistShrink. One equality query
+   * (`status == "open"`), served by the single-field index like the other
+   * open-row reads; capped so a flood of rows cannot blow the check.
+   */
+  private async checklistShrinkRows(): Promise<ChecklistShrinkRow[]> {
+    const snap = await collections.pendingVisaChanges.where("status", "==", "open").limit(500).get();
+    const rows: ChecklistShrinkRow[] = [];
+    for (const d of snap.docs) {
+      const row = d.data() as {
+        countryCode?: string;
+        visaId?: string;
+        revision?: number;
+        diff?: Array<{ field?: string; removed?: unknown }>;
+        current?: { requiredDocuments?: unknown };
+        proposed?: { requiredDocuments?: unknown };
+      };
+      const entry = (row.diff ?? []).find((x) => x.field === "requiredDocuments");
+      if (!entry || !row.countryCode || !row.visaId) continue;
+      const removed = Array.isArray(entry.removed) ? entry.removed.map(String) : [];
+      const count = (v: unknown) => (Array.isArray(v) ? v.length : 0);
+      rows.push({
+        changeId: d.id,
+        countryCode: row.countryCode,
+        visaId: row.visaId,
+        revision: row.revision ?? 1,
+        liveCount: count(row.current?.requiredDocuments),
+        proposedCount: count(row.proposed?.requiredDocuments),
+        removed,
+      });
+    }
+    return rows;
+  }
+
   private async reviewQueueItems(nowMs: number, config: ScrapeAlertsConfig): Promise<ReviewQueueItem[]> {
     const items: ReviewQueueItem[] = [];
     const sources = await collections.visaSources.get();

@@ -753,3 +753,72 @@ describe("visaChangeController — status codes, validation, authz", () => {
     for (const action of ["read", "approve", "reject"]) assert.equal(admin.can(action, "VisaChange"), true);
   });
 });
+
+// ============================================
+// Issue #212: the checklist shrink guard + normalised diff
+// ============================================
+
+describe("requiredDocuments diff — shrink guard (issue #212)", () => {
+  /** A live visa listing `items` with a verbatim quote for each. */
+  async function seedLiveWithDocs(items: string[], quotes: boolean = true): Promise<void> {
+    await seedLive();
+    const cur = store.get(VISA_PATH)!;
+    const scrapeMeta = { ...(cur.scrapeMeta as any), citations: quotes ? Object.fromEntries(items.map((t, i) => [`requiredDocuments.${i}`, `quote of ${t}`])) : {} };
+    store.set(VISA_PATH, { ...cur, requiredDocuments: items, scrapeMeta });
+  }
+  const docs = (items: string[]) => ({
+    requiredDocuments: items,
+    citations: Object.fromEntries(items.map((t, i) => [`requiredDocuments.${i}`, t])),
+  });
+
+  test("a shrinking extraction creates an open row with removedDetails (item + the live visa's own quote); the live list is untouched", async () => {
+    await seedLiveWithDocs(["a passport", "a photo", "a TB test"]);
+    const liveBefore = clone(store.get(VISA_PATH));
+    const mark = writes.length;
+    const r = await ingest(extraction(docs(["a photo"])), "h2");
+    assert.equal(r.outcome, "proposed");
+    assert.deepEqual(store.get(VISA_PATH), liveBefore);
+    assert.equal(visaWritesSince(mark).length, 0);
+    const [, row] = onlyRow();
+    const d = (row.diff as any[]).find((x) => x.field === "requiredDocuments");
+    assert.deepEqual(d.removed, ["a passport", "a TB test"]);
+    assert.deepEqual(d.removedDetails, [
+      { item: "a passport", quote: "quote of a passport" },
+      { item: "a TB test", quote: "quote of a TB test" },
+    ]);
+  });
+
+  test("a removed item the live visa has no quote for carries no quote", async () => {
+    await seedLiveWithDocs(["a passport", "a photo"], false);
+    await ingest(extraction(docs(["a photo"])), "h2");
+    const d = (onlyRow()[1].diff as any[]).find((x) => x.field === "requiredDocuments");
+    assert.deepEqual(d.removedDetails, [{ item: "a passport" }]);
+  });
+
+  test("an empty proposed list shows every live item as removed; a newer shrinking extraction replaces the open row", async () => {
+    await seedLiveWithDocs(["a passport", "a photo"]);
+    await ingest(extraction(docs([])), "h2");
+    let [id, row] = onlyRow();
+    assert.deepEqual((row.diff as any[]).find((x) => x.field === "requiredDocuments").removed, ["a passport", "a photo"]);
+    await ingest(extraction(docs(["a photo"])), "h3");
+    [, row] = onlyRow();
+    assert.equal(onlyRow()[0], id);
+    assert.equal(row.revision, 2);
+    assert.deepEqual((row.diff as any[]).find((x) => x.field === "requiredDocuments").removed, ["a passport"]);
+  });
+
+  test("curly vs straight apostrophes are the same item: no remove + add", async () => {
+    await seedLiveWithDocs(["your parents' names", "a photo"]);
+    // The re-crawl text now carries the curly apostrophe; everything else is identical.
+    const r = await ingest(extraction(docs(["your parents’ names", "a photo"])), "h2");
+    assert.equal(r.outcome, "unchanged");
+    assert.equal(rows().length, 0);
+  });
+
+  test("itemKey (used by the diff) is exactly normForQuote", async () => {
+    const { itemKey } = await import("../../../../src/scrapers/visa-catalog/required-document-meta");
+    for (const s of ["Your parents’ names", "a – b — c", "  Two   spaces ", "“quoted”"]) {
+      assert.equal(itemKey(s), extractMod.normForQuote(s));
+    }
+  });
+});
