@@ -232,6 +232,11 @@ describe("guidance seed: the doc that is written", () => {
         "gb-student-guidance-html": "route_guidance",
         "gb-student-guidance-pdf": "route_guidance",
         "gb-appendix-atas": "secondary",
+        // ---- Graduate (issue #260): the appendix is primary, the caseworker
+        // guidance (web + PDF) route guidance; its cross-route documents are reused by id.
+        "gb-appendix-graduate": "primary",
+        "gb-graduate-guidance-html": "route_guidance",
+        "gb-graduate-guidance-pdf": "route_guidance",
       }
     );
   });

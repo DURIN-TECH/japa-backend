@@ -36,6 +36,9 @@ const SKILLED_WORKER_GUIDANCE_RENDITIONS = ["gb-skilled-worker-guidance-html", "
 /** The two renditions of the Student and Child Student caseworker guidance (issue #260). */
 const STUDENT_GUIDANCE_RENDITIONS = ["gb-student-guidance-html", "gb-student-guidance-pdf"];
 
+/** The two renditions of the Graduate caseworker guidance (issue #260). */
+const GRADUATE_GUIDANCE_RENDITIONS = ["gb-graduate-guidance-html", "gb-graduate-guidance-pdf"];
+
 export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
   // ---- The visitor rules ----
   {
@@ -400,5 +403,67 @@ export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
     passage:
       "To assess an applicant’s credibility, the caseworker must consider all of the information provided in the application and, if applicable, in the credibility interview.",
     sourceIds: STUDENT_GUIDANCE_RENDITIONS,
+  },
+
+  // ============================================
+  // GRADUATE (route key "graduate-visa"; issue #260)
+  // ============================================
+  // Copied on 2026-11-14 from the text retrieved that day, and checked against
+  // it with the seed script's matcher before commit (as for Family above).
+
+  // ---- The route's rules (Appendix Graduate) ----
+  {
+    id: "appendix-gr-1-3-student-permission",
+    label: "GR 1.3",
+    passage: "GR 1.3. The applicant must have, or have last had, permission as a Student.",
+    sourceIds: ["gb-appendix-graduate"],
+  },
+  {
+    id: "appendix-gr-2-1-suitability",
+    label: "GR 2.1",
+    passage: "GR 2.1. The applicant must not fall for refusal under Part Suitability.",
+    sourceIds: ["gb-appendix-graduate"],
+  },
+  {
+    id: "appendix-gr-3-1-seventy-points",
+    label: "GR 3.1",
+    passage: "GR 3.1. The applicant must be awarded all 70 points in the table below.",
+    sourceIds: ["gb-appendix-graduate"],
+  },
+  {
+    id: "appendix-gr-4-3-sponsor-notification",
+    label: "GR 4.3",
+    passage:
+      "GR 4.3. The student sponsor must have notified the Home Office, by the date of application, that the applicant has successfully completed the course of study in GR 4.2.",
+    sourceIds: ["gb-appendix-graduate"],
+  },
+  {
+    id: "appendix-gr-8-2-d-atas",
+    label: "GR 8.2(d)",
+    // The reference that makes Appendix ATAS (gb-appendix-atas) apply here.
+    passage: "(d) study is subject to the ATAS condition in Appendix ATAS.",
+    sourceIds: ["gb-appendix-graduate"],
+  },
+
+  // ---- The Graduate caseworker guidance: web version and PDF must agree ----
+  {
+    id: "graduate-guidance-about-based-on",
+    label: "About this guidance",
+    passage: "This guidance is based on Appendix Graduate and Appendix ATAS of the Immigration Rules.",
+    sourceIds: GRADUATE_GUIDANCE_RENDITIONS,
+  },
+  {
+    id: "graduate-guidance-sponsor-notification",
+    label: "Eligibility requirements: sponsor notification",
+    passage:
+      "The Student Sponsor must have notified the Home Office, by the date of application, that the applicant has successfully completed the course of study.",
+    sourceIds: GRADUATE_GUIDANCE_RENDITIONS,
+  },
+  {
+    id: "graduate-guidance-no-notification-no-refusal",
+    label: "Eligibility requirements: sponsor notification",
+    passage:
+      "If a notification has not been received from the Student Sponsor, but the CAS shows that the applicant had been studying a qualifying qualification, the caseworker must not refuse the application if it would otherwise be granted.",
+    sourceIds: GRADUATE_GUIDANCE_RENDITIONS,
   },
 ];

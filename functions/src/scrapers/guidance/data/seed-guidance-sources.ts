@@ -628,6 +628,97 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
       "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
     retrievedAt: "2026-11-14T12:11:08Z",
   },
+
+  // ============================================
+  // GRADUATE (route key "graduate-visa", visa type gb-graduate-visa; issue #260)
+  // ============================================
+  //
+  // Documents, each requested once on 2026-11-14 through the shared fetch
+  // service (numbers in each note are from that request):
+  //  - Appendix Graduate (the route's own rules)               -> primary
+  //  - the Graduate caseworker guidance, web + PDF             -> route_guidance
+  // Reused by id: gb-part-suitability (GR 2.1) and gb-appendix-atas (GR 8.2(d),
+  // the study condition; registered with Student above). The guidance says it
+  // "is based on Appendix Graduate and Appendix ATAS", which is the same set.
+  // The route has no financial or English language requirement in its rules,
+  // so neither of those appendices is listed for it.
+  //
+  // Not registered: Appendix Relationship with Partner (GR 11.2, dependent
+  // partners only).
+  {
+    id: "gb-appendix-graduate",
+    // The route's own rules document.
+    role: "primary",
+    title: "Immigration Rules Appendix Graduate",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-graduate",
+    jurisdiction: "GB",
+    route: "graduate-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:12 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "13,287 characters of cleaned text, sha256 8067a67ea995fa375e3b335941f45917b24421c84949ce127d2d602136115c56. " +
+      "The address is the one the publisher's index of the rules linked to on that day. The text runs from the page " +
+      "title to the conditions for a partner or child (it is not cut short). Read closely: the paragraph numbers and " +
+      "opening sentences of GR 1 to GR 16, and GR 2.1, GR 3.1, GR 4.1 to GR 4.3 and GR 8.2 in full; the rest was " +
+      "retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:12:47Z",
+  },
+  {
+    id: "gb-graduate-guidance-html",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Graduate caseworker guidance (accessible web version)",
+    url: "https://www.gov.uk/government/publications/graduate-caseworker-guidance/graduate-caseworker-guidance-accessible-version",
+    jurisdiction: "GB",
+    route: "graduate-visa",
+    docType: "html",
+    // The document's own line, "published for Home Office staff on <date>".
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:12 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "44,132 characters of cleaned text, sha256 f59a04799068b3eaa56312ce9c0a9b5abcf9ee6ccf57eaeb9163750deede4dae. " +
+      "The address is the one the publication page linked to on that day. The text states version 6.0, " +
+      "published for staff on 3 August 2026, and runs through the closing section on translated documents (its " +
+      "headings are not numbered). Read closely: 'About this guidance', 'Publication' and 'Eligibility requirements' " +
+      "(successful completion, sponsor notification, qualification); the rest was retrieved and skimmed, not read " +
+      "line by line.",
+    retrievedAt: "2026-11-14T12:12:49Z",
+  },
+  {
+    id: "gb-graduate-guidance-pdf",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Graduate caseworker guidance (PDF)",
+    // The file's address ON THE DAY IT WAS RETRIEVED (per-release id); the
+    // crawl reads the current address from `resolveFrom` each time.
+    url: "https://assets.publishing.service.gov.uk/media/6a4bbe12e50f952c9b89e603/Graduate_route__1_.pdf",
+    resolveFrom: {
+      // The stable publication page that always links to the current file.
+      pageUrl: "https://www.gov.uk/government/publications/graduate-caseworker-guidance",
+      // The one PDF attachment on that page: any release id, any file name.
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]+\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "graduate-visa",
+    docType: "pdf",
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:13 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "390,717-byte PDF, 32 pages, every page with a text layer, 52,715 characters of cleaned text, " +
+      "sha256 102e749800aaf6c37726a0dd45f07c5203ed10b1f24cec1ef940a37a61941994. The file's address was read from the " +
+      "publication page on that day (it was the only PDF linked there; the resolveFrom lookup returned it). Each page " +
+      "is headed 'Published for Home Office staff on 3 August 2026'; page 1 states version 6.0. " +
+      "Read closely: the passages pinned in guidance-quote-checks.ts; the rest was retrieved and skimmed, " +
+      "not read line by line.",
+    retrievedAt: "2026-11-14T12:13:00Z",
+  },
 ];
 
 /** Statuses a seed may set (`failing` belongs to the crawler). */
