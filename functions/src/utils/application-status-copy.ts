@@ -42,7 +42,7 @@ const SHARED_COPY: Record<ApplicationStatus, string> = {
 
 /** Self-service-only overrides (the applicant is the only person involved). */
 const SELF_SERVICE_COPY: Partial<Record<ApplicationStatus, string>> = {
-  under_review: "Your application is in. A readiness review will follow, and we’ll tell you when it’s ready.",
+  under_review: "Your application is in. A readiness review is the next step.",
   withdrawn: "You’ve withdrawn your application. You can start a new one whenever you like.",
 };
 

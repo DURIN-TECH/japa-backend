@@ -18,7 +18,7 @@ import { DEFAULT_CHANNELS_BY_TYPE } from "../../src/services/notification-policy
 // ---------------------------------------------------------------------------
 describe("applicationStatusMessage", () => {
   // The eight statuses the issue lists, for agent and self-service.
-  const eight = ["pending_documents", "pending_payment", "expired", "withdrawn", "draft", "under_review"];
+  const eight = ["pending_documents", "pending_payment", "expired", "withdrawn", "draft", "under_review", "submitted_to_embassy", "interview_scheduled"];
 
   test("the five existing statuses keep their agent copy word for word", () => {
     assert.equal(applicationStatusMessage("under_review", false), "Your application is now under review.");

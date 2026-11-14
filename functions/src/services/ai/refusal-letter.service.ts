@@ -160,9 +160,18 @@ export class RefusalLetterService {
           outcome: rec.outcome,
           createdAt: Timestamp.fromDate(this.deps.now()),
         });
-      } catch {
+      } catch (err) {
+        // Only ALREADY_EXISTS (gRPC code 6) means "a duplicate delivery claimed it
+        // first". Anything else is a real fault: log it (error name only, no data)
+        // and still return, because this method never throws.
+        if ((err as { code?: number }).code !== 6) {
+          console.error(`[refusal-letter] claim failed for ${analysisId}: ${(err as Error).name}`);
+        }
         return;
       }
+      // Claiming BEFORE sending is deliberate at-most-once delivery: the trigger has
+      // no retries, so a failure after this point loses the notice rather than
+      // risking a double send.
 
       const analysed = rec.outcome === "analysed";
       await notificationService.notifyUser({
