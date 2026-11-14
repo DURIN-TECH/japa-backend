@@ -18,7 +18,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { installFakes, resetStore, fakeCollection, fakeRunTransaction, store } from "../helpers/fake-firestore";
 import { makeService, fakeClock } from "../money/helpers";
 import { consultationCharging } from "../../src/services/consultation-charge.service";
-import { paystackProvider, PaystackTransactionLookup } from "../../src/services/billing/paystack.provider";
+import { PaystackApiError, paystackProvider, PaystackTransactionLookup } from "../../src/services/billing/paystack.provider";
 import { notificationService } from "../../src/services/notification.service";
 import type { Money } from "../../src/types/money";
 
@@ -70,6 +70,15 @@ export const harness = {
   /** Throw this from the next initializeCharge (provider outage). */
   failNextCharge: false,
   /**
+   * Issue #181 review round 2: answer a lookup of a reference Paystack has
+   * never seen the way real Paystack does (HTTP 400 "Transaction reference
+   * not found", thrown as the provider's PaystackApiError) instead of null.
+   * Off by default, so the older tests keep their null answer.
+   */
+  realisticNotFound: false,
+  /** Throw a network failure (no HTTP status) from the next lookup (provider outage). */
+  failNextLookup: false,
+  /**
    * Review fix race tests: called on every Paystack lookup BEFORE it answers,
    * so a test can run another request "while" this one is mid-flight (e.g. a
    * verify confirming the booking between a retry's lookup and its re-price).
@@ -84,6 +93,8 @@ export const harness = {
     this.paystack.clear();
     this.countries = {};
     this.failNextCharge = false;
+    this.realisticNotFound = false;
+    this.failNextLookup = false;
     this.onLookup = undefined;
     const clock = fakeClock(NOW_ISO);
     this.clock = clock;
@@ -156,6 +167,20 @@ export async function useHarness(): Promise<void> {
     return { authorizationUrl: `https://checkout.paystack.test/${reference}`, reference };
   };
   ps.getTransactionMetadata = async (reference: string) => {
+    // A Paystack outage: the same error the real client throws when no
+    // response came back (no HTTP status).
+    if (harness.failNextLookup) {
+      harness.failNextLookup = false;
+      throw new PaystackApiError("PAYSTACK_ERROR: connect ETIMEDOUT", {});
+    }
+    // A reference Paystack never saw, answered as real Paystack does.
+    if (harness.realisticNotFound && !harness.paystack.has(reference)) {
+      throw new PaystackApiError("PAYSTACK_ERROR: Transaction reference not found (HTTP 400)", {
+        httpStatus: 400,
+        providerMessage: "Transaction reference not found",
+        providerCode: "transaction_not_found",
+      });
+    }
     // Snapshot the answer BEFORE the hook runs: the caller saw this state.
     const seen = harness.paystack.get(reference) ?? null;
     if (harness.onLookup) {
