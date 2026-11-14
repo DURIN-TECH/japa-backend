@@ -318,3 +318,53 @@ export async function updatePublishSettings(patch: PublishSettingsPatch, uid: st
   });
   return readPublishSettingsView();
 }
+
+// ============================================
+// Add ONE route to the allow-list (issue #217, route onboarding)
+// ============================================
+
+/** What `addRouteToAllowlist` did. */
+export type AllowlistAddResult =
+  // The route key was appended and an audit doc written.
+  | "added"
+  // Nothing to do: there is no allow-list (every route is allowed) or the key is already on it.
+  | "already_allowed"
+  // The stored allow-list is malformed or full: it was NOT touched (an admin fixes it by hand).
+  | "refused";
+
+/**
+ * Append `routeKey` to the stored allow-list, the audited way (one audit doc in
+ * `rubricPublishSettingsHistory`, written in the same transaction), for an admin
+ * who ticked "add this route to the allow-list" when confirming an onboarding run.
+ *
+ * Deliberately NARROWER than `updatePublishSettings`:
+ *  - it reads and writes in ONE transaction, so two admins adding two routes at
+ *    once cannot overwrite each other's entry (a read-modify-write outside a
+ *    transaction would);
+ *  - it NEVER creates an allow-list. An absent list means "every route", and
+ *    writing a list holding only this route would silently TURN OFF automatic
+ *    publishing for every other route;
+ *  - it never touches `mode` (turning publishing on is a separate, explicit act);
+ *  - it never "repairs" a malformed list (that would publish somewhere nobody chose).
+ */
+export async function addRouteToAllowlist(routeKey: string, uid: string): Promise<AllowlistAddResult> {
+  if (!uid) throw new Error("a settings change needs the admin's uid");
+  if (!ROUTE_KEY_RE.test(routeKey)) throw new Error("not a route key");
+  const ref = collections.appConfig.doc(PUBLISH_SETTINGS_DOC_ID);
+  const auditRef = collections.rubricPublishSettingsHistory.doc();
+  return publishSettingsTx.run(async (tx) => {
+    const snap = await tx.get(ref);
+    const before = snap.exists ? { ...(snap.data() as Record<string, unknown>) } : null;
+    const list = before?.routeAllowlist;
+    // No list: every route is allowed already.
+    if (list === undefined || list === null) return "already_allowed" as const;
+    // A list that is not a list of route keys, or is full: leave it alone.
+    if (!Array.isArray(list) || list.some((k) => typeof k !== "string" || !ROUTE_KEY_RE.test(k))) return "refused" as const;
+    if (list.includes(routeKey)) return "already_allowed" as const;
+    if (list.length >= MAX_ROUTE_ALLOWLIST) return "refused" as const;
+    const after = { ...(before as Record<string, unknown>), routeAllowlist: [...list, routeKey] };
+    tx.set(ref, after);
+    tx.set(auditRef, { id: auditRef.id, at: Timestamp.now(), by: uid, before, after });
+    return "added" as const;
+  });
+}
