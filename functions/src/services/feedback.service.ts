@@ -12,7 +12,7 @@
 // logic against in-memory fakes (no Firestore, Storage or Resend).
 
 import { Timestamp } from "firebase-admin/firestore";
-import { collections } from "../utils/firebase";
+import { collections, db } from "../utils/firebase";
 import { emailService } from "./email/email.service";
 import type { EmailResult } from "./email/email.types";
 import { storageService } from "./storage.service";
@@ -33,6 +33,9 @@ export const DEFAULT_FEEDBACK_RECIPIENT = "info@weareseli.com";
 
 /** How long the screenshot link in the email stays valid, in minutes (just under the 7-day v4 maximum). */
 export const SCREENSHOT_LINK_MINUTES = 7 * 24 * 60 - 5;
+
+/** Screenshot upload URLs one user may mint per clock hour. */
+export const SCREENSHOT_URL_HOURLY_LIMIT = 20;
 
 /** How much of the message goes into the email subject. */
 const SUBJECT_PREVIEW_CHARS = 60;
@@ -56,6 +59,8 @@ export interface FeedbackDeps {
   signDownload(path: string, minutes: number): Promise<string>;
   /** Send the team email. */
   sendEmail(message: { to: string; subject: string; html: string; text: string }): Promise<EmailResult>;
+  /** Atomically use one screenshot-URL slot for the hour; false when the hour's limit is reached. */
+  consumeUploadSlot(userId: string, hour: number, limit: number): Promise<boolean>;
   /** Clock, epoch ms. */
   now(): number;
 }
@@ -159,8 +164,25 @@ export class FeedbackService {
     fileExists: (path) => storageService.fileExists(path),
     signDownload: (path, minutes) => storageService.getSignedDownloadUrl(path, minutes),
     sendEmail: (message) => emailService.send(message),
+    // One counter doc per user and clock hour, read and bumped in a transaction
+    // so parallel requests cannot both slip under the limit.
+    consumeUploadSlot: (userId, hour, limit) =>
+      db.runTransaction(async (tx) => {
+        const ref = collections.feedbackUploadLimits.doc(`${userId}__${hour}`);
+        const snap = await tx.get(ref);
+        const count = snap.exists ? Number((snap.data() as { count?: number }).count ?? 0) : 0;
+        if (count >= limit) return false;
+        tx.set(ref, { userId, hour, count: count + 1 });
+        return true;
+      }),
     now: () => Date.now(),
   };
+
+  /** True when the user may mint another screenshot upload URL this hour. */
+  async allowScreenshotUrl(userId: string): Promise<boolean> {
+    const hour = Math.floor(this.deps.now() / FEEDBACK_WINDOW_MS);
+    return this.deps.consumeUploadSlot(userId, hour, SCREENSHOT_URL_HOURLY_LIMIT);
+  }
 
   /** Team inbox: FEEDBACK_TO_EMAIL (non-secret env) or the default. */
   get recipient(): string {

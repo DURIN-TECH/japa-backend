@@ -99,6 +99,9 @@ export const collections = {
   // and test/emulator/backend-only-collections.emu.ts pins it. The rate limit
   // counts by userId + createdAt (composite index in firestore.indexes.json).
   feedback: db.collection("feedback"),
+  // Per-user hourly counters for screenshot upload URL mints (`{uid}__{hour}`),
+  // so the signed-URL endpoint cannot be hammered. Backend-only, rules deny.
+  feedbackUploadLimits: db.collection("feedbackUploadLimits"),
   // Audit trail of outbound multi-channel deliveries (email/sms/push) attempted by
   // the unified notifier. Email/SMS are currently stubbed, so this collection is the
   // record that a message "would have been" sent; it becomes a real delivery log once

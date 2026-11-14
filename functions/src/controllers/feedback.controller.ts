@@ -130,12 +130,19 @@ export class FeedbackController {
         return;
       }
 
-      const { uploadUrl, storagePath } = await storageService.getSignedFeedbackScreenshotUploadUrl(
+      // Abuse guard: a user may mint only so many upload URLs per hour.
+      if (!(await feedbackService.allowScreenshotUrl(userId))) {
+        res.setHeader("Retry-After", "3600");
+        sendError(res, "RATE_LIMITED", "Too many uploads. Please try again later.", 429);
+        return;
+      }
+
+      const { uploadUrl, storagePath, uploadHeaders } = await storageService.getSignedFeedbackScreenshotUploadUrl(
         userId,
         fileName,
         contentType
       );
-      sendSuccess(res, { uploadUrl, storagePath });
+      sendSuccess(res, { uploadUrl, storagePath, uploadHeaders });
     } catch (error) {
       console.error("Error getting feedback screenshot upload URL:", error);
       sendError(res, "INTERNAL_ERROR", "Something went wrong", 500);

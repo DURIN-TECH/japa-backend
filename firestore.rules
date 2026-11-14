@@ -691,5 +691,11 @@ service cloud.firestore {
     match /feedback/{feedbackId} {
       allow read, write: if false;
     }
+
+    // feedbackUploadLimits/{uid}__{hour}: rate-limit counters for feedback
+    // screenshot upload URLs (issue #257). Backend only.
+    match /feedbackUploadLimits/{limitId} {
+      allow read, write: if false;
+    }
   }
 }

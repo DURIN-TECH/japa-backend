@@ -116,13 +116,13 @@ interface Harness {
   svc: FeedbackService;
   saved: Record<string, unknown>[];
   emails: { to: string; subject: string; html: string; text: string }[];
-  state: { recent: number; fileExists: boolean; emailResult: "sent" | "failed" | "throw" };
+  state: { recent: number; slotOk: boolean; fileExists: boolean; emailResult: "sent" | "failed" | "throw" };
 }
 
 function harness(): Harness {
   const saved: Record<string, unknown>[] = [];
   const emails: Harness["emails"] = [];
-  const state: Harness["state"] = { recent: 0, fileExists: true, emailResult: "sent" };
+  const state: Harness["state"] = { recent: 0, slotOk: true, fileExists: true, emailResult: "sent" };
   const deps: FeedbackDeps = {
     countSince: async () => state.recent,
     save: async (doc) => {
@@ -136,6 +136,7 @@ function harness(): Harness {
       if (state.emailResult === "throw") throw new Error("boom");
       return state.emailResult === "sent" ? { status: "sent" } : { status: "failed", error: "nope" };
     },
+    consumeUploadSlot: async () => state.slotOk,
     now: () => 1_700_000_000_000,
   };
   const svc = new FeedbackService();
@@ -337,6 +338,7 @@ describe("FeedbackController", () => {
       uploadUrl: "https://upload.example/put",
       storagePath: buildIssuedPath({ purpose: "feedback-screenshot", userId: uid }, f),
       expiresAt: new Date(),
+      uploadHeaders: { "x-goog-content-length-range": "0,5242880" },
     }));
     const { api, res } = fakeRes();
     await feedbackController.getScreenshotUploadUrl(fakeReq({ fileName: "s.png", contentType: "image/png" }), api);
@@ -344,6 +346,27 @@ describe("FeedbackController", () => {
     assert.equal(res.body.data.uploadUrl, "https://upload.example/put");
     assert.match(res.body.data.storagePath, /^users\/uidA\/feedback\//);
     assert.equal(m.mock.callCount(), 1);
-    assert.equal(Object.keys(res.body.data).sort().join(), "storagePath,uploadUrl");
+    assert.equal(Object.keys(res.body.data).sort().join(), "storagePath,uploadHeaders,uploadUrl");
+    assert.equal(res.body.data.uploadHeaders["x-goog-content-length-range"], "0,5242880");
+  });
+
+  test("screenshot-url: 429 once the hourly mint limit is used up, nothing minted", async () => {
+    h.state.slotOk = false;
+    const m = mock.method(storageService, "getSignedFeedbackScreenshotUploadUrl", async () => {
+      throw new Error("must not be called");
+    });
+    const { api, res } = fakeRes();
+    await feedbackController.getScreenshotUploadUrl(fakeReq({ fileName: "s.png", contentType: "image/png" }), api);
+    assert.equal(res.statusCode, 429);
+    assert.equal(m.mock.callCount(), 0);
+  });
+});
+
+// The lapsed-plan exemption must match exactly these two POST paths.
+describe("feedback write-block exemption", () => {
+  const re = /^(\/api)?\/feedback(\/screenshot-url)?\/?$/;
+  test("matches the two routes only", () => {
+    for (const ok of ["/feedback", "/feedback/", "/feedback/screenshot-url", "/api/feedback"]) assert.ok(re.test(ok), ok);
+    for (const no of ["/users/feedback", "/feedback/x", "/applications/1/feedback", "/feedbacks"]) assert.ok(!re.test(no), no);
   });
 });

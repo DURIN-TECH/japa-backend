@@ -14,6 +14,9 @@ import { assertClientReachableKey, buildIssuedPath } from "../utils/storage-path
 // download, publish or delete an object refuse, as a last line of defence, any
 // value that is not a plain bucket-relative key or that sits under a
 // backend-only prefix (`assertClientReachableKey`).
+/** Largest feedback screenshot the signed upload URL accepts (5 MB). */
+export const FEEDBACK_SCREENSHOT_MAX_BYTES = 5 * 1024 * 1024;
+
 export class StorageService {
   // Resolve the default bucket for the active Firebase project.
   //
@@ -246,6 +249,7 @@ export class StorageService {
     uploadUrl: string;
     storagePath: string;
     expiresAt: Date;
+    uploadHeaders: Record<string, string>;
   }> {
     // users/{uid}/feedback/{uuid}_{file}
     const storagePath = buildIssuedPath({ purpose: "feedback-screenshot", userId }, fileName);
@@ -255,14 +259,19 @@ export class StorageService {
     // Short-lived (15 min) write URL, bound to the declared content type.
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
+    // The size cap is part of the signature: a PUT without this header, or with
+    // a body outside the range, is refused by Cloud Storage. The client must
+    // send the returned `uploadHeaders` with the PUT.
+    const uploadHeaders = { "x-goog-content-length-range": `0,${FEEDBACK_SCREENSHOT_MAX_BYTES}` };
     const [uploadUrl] = await file.getSignedUrl({
       version: "v4",
       action: "write",
       expires: expiresAt,
       contentType,
+      extensionHeaders: uploadHeaders,
     });
 
-    return { uploadUrl, storagePath, expiresAt };
+    return { uploadUrl, storagePath, expiresAt, uploadHeaders };
   }
 
   /**

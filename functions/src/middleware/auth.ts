@@ -132,10 +132,12 @@ export async function verifyAuth(
     const path = req.originalUrl.split("?")[0];
     const method = req.method.toUpperCase();
     // Feedback (#257): a tester on a lapsed plan can still report a bug, and a
-    // bug about the lapsed plan itself is exactly what we want to hear. Exact
-    // routes, POST only; the endpoints are rate limited per user.
+    // bug about the lapsed plan itself is exactly what we want to hear. EXACTLY
+    // `POST /feedback` and `POST /feedback/screenshot-url` (optional `/api`
+    // function prefix, trailing slash tolerated); no other path ending in
+    // "/feedback" is exempt. Both endpoints are rate limited per user.
     const isFeedbackWrite =
-      method === "POST" && (path.endsWith("/feedback") || path.endsWith("/feedback/screenshot-url"));
+      method === "POST" && /^(\/api)?\/feedback(\/screenshot-url)?\/?$/.test(path);
     const isAccountSecurityWrite =
       isFeedbackWrite ||
       path.endsWith("/users/me/password-changed") ||
