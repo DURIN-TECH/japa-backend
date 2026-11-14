@@ -24,6 +24,7 @@
     "recheck:list-group": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/recheck-list-and-group.js",
     "evaluate:language": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/evaluate-language.js",
     "repair:saved-rule": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/repair-saved-rule.js",
+    "draft:entry-rules": "npm run build && node --env-file-if-exists=.env.local lib/entry-requirements/scripts/draft-entry-rules.js",
     "plan:questions": "npm run build && node lib/scrapers/rubric/scripts/plan-questions.js",
     "remediate:sources-107": "npm run build && node lib/scrapers/shared/scripts/remediate-failing-sources.js",
     "paystack:sync": "npm run build && node lib/scripts/sync-paystack-plans.js",

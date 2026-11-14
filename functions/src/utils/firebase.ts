@@ -165,10 +165,11 @@ export const collections = {
   //   register, edit and removal (never updated or deleted).
   // - sourceRegistryRateLimits/{uid}__{kind}__{hour}: per-admin hourly counters.
   officialDomains: db.collection("officialDomains"),
-  // Entry-requirement rows ("does this nationality need a visa for that
-  // country", read by eligibility preCheck). Referenced here so the #239
-  // migration can list and delete the retired seed row; the eligibility service
-  // keeps its own handle on the same collection.
+  // RETIRED (issue #236): the old hand-seeded "does this nationality need a
+  // visa for that country" rows. They had no verbatim quote, so nothing reads
+  // them any more (eligibility preCheck answers from `entryRules` below).
+  // Referenced here only so the #239 migration can list and delete the stored
+  // rows.
   visaExemptions: db.collection("visaExemptions"),
   officialDomainPreviews: db.collection("officialDomainPreviews"),
   sourceRegistryAudit: db.collection("sourceRegistryAudit"),
@@ -287,6 +288,20 @@ export const collections = {
   // (src/shared-routes), every write audited. Backend-only: no firestore.rules
   // match -> clients denied.
   sharedRoutes: db.collection("sharedRoutes"),
+  // Entry requirements (issue #236, P7 of #228): "do you need a visa at all".
+  // ALL backend-only (no firestore.rules match -> clients denied; pinned by
+  // test/emulator/backend-only-collections.emu.ts). Written only by the
+  // entry-rule drafting pipeline (src/entry-requirements); read by the lookup
+  // endpoint, which serves only published rules through the API.
+  // - entryRules/{ruleId}: one sourced rule (outcome, group, destination
+  //   scope, verbatim quote + URL). Status published / held / left_out / superseded.
+  // - entryRuleHeads/{authorityId}: which drafting run is the one SERVED for an
+  //   issuing authority (`publishedRunId`); switching it is the atomic publish.
+  // - entryRuleRuns/{runId}: one record per drafting run (spend, counts,
+  //   refusals, gate results, hold reasons) -- the admin's review data.
+  entryRules: db.collection("entryRules"),
+  entryRuleHeads: db.collection("entryRuleHeads"),
+  entryRuleRuns: db.collection("entryRuleRuns"),
   // One record per rubric extraction run (issue #40): status, token usage,
   // cost (null while the model is unpriced), what was discarded and why.
   // Backend-only: no firestore.rules match.

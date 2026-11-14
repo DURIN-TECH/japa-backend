@@ -205,6 +205,25 @@ export { registeredDestinations } from "./outcome-statistics/registry";
 export { ANSWER_TYPES, answerTypeOf, classifyAnswerType, classifyNeed, findMetaForItem, isAnswerType, itemKey, metaFromQuoteOnly, normaliseStoredMeta } from "./visa-catalog/required-document-meta";
 export type { AnswerType, DocumentKind, DocumentNeed, RequiredDocumentMeta } from "./visa-catalog/required-document-meta";
 
+// ---- Entry requirements (issue #236, P7 of #228) ----
+// The entry-rule drafting pipeline (src/entry-requirements) reuses the rulebook
+// pipeline's BUILDING BLOCKS through this public API rather than copying them:
+// the stored source snapshots and their chunking, the verbatim quote check (and
+// the number / group-name checks on a quote), the extraction caps and kill
+// switch, and the catalog's FX conversion. The rulebook prompts and the rulebook
+// checker are NOT shared: entry rules have their own prompts and version.
+export { chunkSnapshot } from "./rubric/rubric-chunk";
+export type { SourceChunk } from "./rubric/rubric-chunk";
+export { unsupportedNumbers, groupNameSupported, uncodedNameSupported, containsTokenBounded } from "./rubric/rubric-quote";
+export type { QuoteLookup } from "./rubric/rubric-quote";
+export { LIST_ITEM_MAX_CHARS } from "./rubric/rubric-list-items";
+export { loadRubricSettings } from "./rubric/rubric-settings";
+export type { RubricExtractionSettings, LoadedRubricSettings } from "./rubric/rubric-settings";
+export { computeFee } from "./visa-catalog/visa-catalog-fx";
+export { normalizeForQuoteMatch } from "./shared/fetch/pdf-text";
+// The lexicon a source's quotes are read with (numbers, dates) in its own language (#220).
+export { lexiconFor } from "./language/language-lexicon";
+
 // Outbound-fetch building blocks reused outside the scrapers (issue #178: the
 // exchange-rate providers read a public rates endpoint with the SAME guarded
 // client, honest SeliBot user agent and robots.txt parser the crawlers use).
