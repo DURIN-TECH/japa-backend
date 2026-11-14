@@ -125,6 +125,11 @@ export {
   DEFAULT_PUBLISH_SETTINGS,
   PUBLISH_SETTINGS_DOC_ID,
 } from "./rubric/rubric-publish-settings";
+// (#220) Language data and the unofficial translation of a quote (see language/README.md).
+export { languageSupport, productLanguageCode, hasLexicon, availableLanguageCodes, resolveSourceLanguage, needsTranslation, sourceLanguagesOf } from "./language/language-lexicon";
+export { translationView, UNOFFICIAL_TRANSLATION_LABEL } from "./rubric/rubric-translation";
+export type { TranslationView } from "./rubric/rubric-translation";
+export { loadRegistrySettings } from "./shared/registry/registry-settings";
 export type { RubricPublishSettings, LoadedPublishSettings, PublishSettingsView, PublishSettingsPatch } from "./rubric/rubric-publish-settings";
 /** The independent AI check of every rule (part B, #202): registered on the publish pipeline. */
 export { rubricChecker, RubricCheckerService, estimateCheckerLoad, judgeRule, decidePolarity } from "./rubric/rubric-checker";

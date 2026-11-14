@@ -12,6 +12,8 @@ import {
   evaluateRubricDraftHeld,
   evaluateRubricHeldCleared,
   loadPublishSettings,
+  loadRegistrySettings,
+  productLanguageCode,
   reasonInWords,
   RubricQuestionPlanner,
   rubricStore,
@@ -23,8 +25,6 @@ import {
 } from "../scrapers";
 import type { GateReport, LoadedPublishSettings, RubricAlertRule, RubricPublishAlertFacts, RuleEvaluation, ScrapeAlertsConfig } from "../scrapers";
 import { EMAIL_BRANDING } from "./email/branding";
-import { loadRegistrySettings } from "../scrapers/shared/registry/registry-settings";
-import { productLanguageCode } from "../scrapers/language/language-lexicon";
 import {
   RubricReviewError,
   parseRubricVersionId,
