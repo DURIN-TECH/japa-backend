@@ -26,13 +26,16 @@ import {
   type RubricRunUsage,
   type RubricSourceSnapshot,
 } from "../../types/rubric";
-import { chunkSnapshot, type SourceChunk } from "./rubric-chunk";
+import { chunkSnapshot, pageMarker, type SourceChunk } from "./rubric-chunk";
+import { isBar, REPAIR_WINDOW_CHARS, REPAIR_WINDOW_LINES_AFTER, REPAIR_WINDOW_LINES_BEFORE } from "./rubric-repair";
 import {
   RUBRIC_PROMPT_VERSION,
   RubricOutputError,
   buildIntakeRequest,
+  buildRepairRequest,
   buildRubricRequest,
   parseRubricOutput,
+  type RepairRuleView,
   type RubricRouteContext,
   type RawCriterion,
   type RawEvidenceItem,
@@ -1414,6 +1417,18 @@ export interface LoadedSource {
   title: string;
 }
 
+/**
+ * (#223) What the one-rule re-draft of a protected rule gave back.
+ *  - `replacement`        a rule that passed the SAME code validation as any
+ *                         drafted rule (verbatim quote, group names in the quote,
+ *                         check values in the quote, list items attached from the
+ *                         stored text), for the same passage, still a bar;
+ *  - `cannot_be_repaired` the model returned no rule for the passage (its
+ *                         explicit "cannot be repaired" answer);
+ *  - `invalid`            code refused what came back (`detail` is a code, never text).
+ */
+export type RedraftOutcome = { kind: "replacement"; criterion: AssessmentCriterion } | { kind: "cannot_be_repaired" } | { kind: "invalid"; detail: string };
+
 export class RubricExtractionService {
   /** @param deps overrides for tests; production passes nothing. */
   constructor(private readonly deps: RubricExtractionDeps = {}) {}
@@ -1782,6 +1797,98 @@ export class RubricExtractionService {
     // that establishes an activity is asked once and reused.
     const raw = await this.callModel(buildIntakeRequest(chunk, acceptedViewOf(criteriaPart), ctx.limits, route, known), usage, attempts, opts);
     return assessChunkOutput(raw, chunk, index, base, ctx.severityLevels);
+  }
+
+  /**
+   * (#223) ONE re-draft of ONE protected rule that failed the independent
+   * check: a fresh draft from the rule's own source passage (the quote's line,
+   * the lines above it and the list lines below it, bounded), through the SAME
+   * request schema, `assessChunkOutput` validation and list attach as the main
+   * drafting path. There is no second drafting path: this only changes what is
+   * shown to the model (a window instead of a chunk, plus the failed rule and
+   * the aspects that failed) and which accepted rule is taken back.
+   *
+   * What is taken back: exactly one accepted rule that quotes the SAME line of
+   * the stored text as the original, is still a bar (a repair can never turn a
+   * bar into something that is not one), and has a readable list. The
+   * replacement keeps the original's `criterionId` and its link fields
+   * (`trigger`, `eligibilityQuestionId`, `intakeQuestionIds`), so every
+   * reference to the rule stays valid. A rule with a trigger keeps the SAME
+   * applicability (the trigger is bound to it); a rule without one may differ.
+   *
+   * One model call (plus the call's own transient retry, which counts in
+   * `attempts`). Throws `RunStop` for a provider failure, like the other steps.
+   */
+  async redraftRule(
+    input: { rule: AssessmentCriterion; aspects: readonly string[]; index: SnapshotQuoteIndex; routeName: string; limits: { maxOutputTokens: number; timeoutMs: number }; sent?: { chars: number } },
+    usage: RubricRunUsage,
+    attempts: CallAttempts,
+    opts: CallOptions = {}
+  ): Promise<RedraftOutcome> {
+    const { rule, index } = input;
+    const found = index.locate(rule.source.quote);
+    if (!found.ok) return { kind: "invalid", detail: "quote_not_found" };
+
+    // ---- the passage the model is shown: verbatim source lines around the quote ----
+    const window = index.passageWindow(found, REPAIR_WINDOW_LINES_BEFORE, REPAIR_WINDOW_LINES_AFTER, REPAIR_WINDOW_CHARS);
+    const chunk: SourceChunk = {
+      sourceId: rule.source.sourceId,
+      contentHash: rule.source.contentHash,
+      docType: index.snapshot.docType,
+      chunkIndex: 0,
+      chunkCount: 1,
+      ...(window.page !== undefined ? { pageStart: window.page, pageEnd: window.page } : {}),
+      text: window.page !== undefined ? `${pageMarker(window.page)}\n${window.text}` : window.text,
+    };
+    // The source role is the rule's own source's: not needed to choose a window, so left unspecified.
+    const route: RubricRouteContext = { routeName: input.routeName, sourceRole: "unspecified" };
+    const shown: RepairRuleView = {
+      title: rule.title,
+      kind: rule.kind,
+      stage: rule.stage,
+      quote: rule.source.quote,
+      ...(rule.source.listItems ? { listItems: rule.source.listItems } : {}),
+      ...(rule.appliesTo ? { appliesTo: { nationalities: rule.appliesTo.nationalities, asWritten: rule.appliesTo.asWritten, ...(rule.appliesTo.uncoded ? { uncoded: rule.appliesTo.uncoded } : {}) } } : {}),
+    };
+    const levels = [...DEFAULT_SEVERITY_LEVELS];
+    const request = buildRepairRequest(chunk, { rule: shown, aspects: input.aspects }, levels, input.limits, route);
+    // The caller's input-size cap counts what is really sent (the prompt plus the bounded window).
+    if (input.sent) input.sent.chars += request.system.length + request.user.length;
+    const raw = await this.callModel(request, usage, attempts, opts);
+    // The model's own "cannot be repaired": no rule at all.
+    if (raw.criteria.length === 0) return { kind: "cannot_be_repaired" };
+
+    // ---- the SAME validation as any drafted rule; citations come from the original's own source ----
+    const base: CitationBase = {
+      sourceId: rule.source.sourceId,
+      url: rule.source.url,
+      contentHash: rule.source.contentHash,
+      retrievedAt: rule.source.retrievedAt,
+      ...(rule.source.publishedDate ? { publishedDate: rule.source.publishedDate } : {}),
+    };
+    const assessed = assessChunkOutput(raw, chunk, index, base, levels, null);
+    if (assessed.criteria.length === 0) return { kind: "invalid", detail: assessed.discards.find((d) => d.itemType === "criterion")?.reason ?? "invalid_shape" };
+
+    // ---- the one accepted rule that is the same rule again ----
+    const sameRule = assessed.criteria.filter((a) => {
+      const at = index.locate(a.criterion.source.quote);
+      return at.ok && at.unit === found.unit && isBar(a.criterion);
+    });
+    if (sameRule.length === 0) return { kind: "invalid", detail: "not_the_same_bar" };
+    if (sameRule.length > 1) return { kind: "invalid", detail: "ambiguous_redraft" };
+    const accepted = sameRule[0];
+    // A lead-in whose list could not be read cleanly is refused here, as the gates would hold it anyway.
+    if (accepted.listUnreadable !== undefined) return { kind: "invalid", detail: accepted.listUnreadable };
+    const normApplicability = (c: AssessmentCriterion): string => c.applicability ?? "all_applicants";
+    if (rule.trigger !== undefined && normApplicability(rule) !== normApplicability(accepted.criterion)) return { kind: "invalid", detail: "applicability_changed" };
+    const criterion: AssessmentCriterion = {
+      ...accepted.criterion,
+      criterionId: rule.criterionId,
+      ...(rule.trigger !== undefined ? { trigger: rule.trigger } : {}),
+      ...(rule.eligibilityQuestionId !== undefined ? { eligibilityQuestionId: rule.eligibilityQuestionId } : {}),
+      ...(rule.intakeQuestionIds !== undefined ? { intakeQuestionIds: rule.intakeQuestionIds } : {}),
+    };
+    return { kind: "replacement", criterion };
   }
 
   /** Refuse the run when its plan would pass a per-run cap. (#216: public, the job start checks the same caps.) */

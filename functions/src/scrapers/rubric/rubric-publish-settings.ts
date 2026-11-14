@@ -59,6 +59,8 @@ export interface RubricPublishSettings {
   checkerMaxOutputTokensPerRequest: number;
   checkerMaxRunsPerDay: number;
   checkerRequestTimeoutMs: number;
+  // (#223) Most failed protected rules one run will try to repair (0 = never repair: any failed bar holds at once).
+  repairMaxRulesPerRun: number;
 }
 
 /**
@@ -74,6 +76,11 @@ export interface RubricPublishSettings {
  *  - checkerMaxOutputTokensPerRequest  generated tokens per request (thinking included)
  *  - checkerMaxRunsPerDay              checker runs that reached the model, per UTC day
  *  - checkerRequestTimeoutMs           wall clock per request
+ *  - repairMaxRulesPerRun              (#223) failed protected rules one run will re-draft once each.
+ *                                      More failures than this is something systemic: no repair is
+ *                                      attempted and the draft is held whole. Each repaired rule costs
+ *                                      one re-draft request plus the check's requests, all counted
+ *                                      inside `checkerMaxRequestsPerRun`.
  */
 export const DEFAULT_CHECKER_CAPS = Object.freeze({
   checkerMaxRulesPerDraft: 1_000,
@@ -82,6 +89,7 @@ export const DEFAULT_CHECKER_CAPS = Object.freeze({
   checkerMaxOutputTokensPerRequest: 8_000,
   checkerMaxRunsPerDay: 20,
   checkerRequestTimeoutMs: 240_000,
+  repairMaxRulesPerRun: 5,
 });
 type CheckerCapKey = keyof typeof DEFAULT_CHECKER_CAPS;
 
@@ -93,6 +101,7 @@ const CHECKER_CAP_RANGES: Record<CheckerCapKey, readonly [number, number]> = {
   checkerMaxOutputTokensPerRequest: [1_000, 64_000],
   checkerMaxRunsPerDay: [1, 1_000],
   checkerRequestTimeoutMs: [10_000, 600_000],
+  repairMaxRulesPerRun: [0, 50],
 };
 
 /** Defaults, from the issue (#201). `mode` defaults to `manual`: fail closed. */

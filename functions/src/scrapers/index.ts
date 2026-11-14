@@ -100,6 +100,8 @@ export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
 export { validateVisaRubric } from "./rubric/rubric-validate";
 /** Criterion exclusions (#161): the pure read-side filter, the preview and the limits. */
 export { applyExclusions, previewExclusions, MAX_EXCLUDED_CRITERIA, EXCLUSION_NOTE_MAX } from "./rubric/rubric-exclusions";
+// (#223) Repaired protected rules: the hash that keys a repair attempt, and the read-side swap.
+export { applyRuleRepairs, ruleHashOf } from "./rubric/rubric-repair";
 export type { ExclusionPreview } from "./rubric/rubric-exclusions";
 /** (#203) The question plan: check, planner and pure plan functions. */
 export { RubricQuestionPlanner, buildQuestionPlan, QUESTION_PLAN_REASONS } from "./rubric/rubric-question-planner";

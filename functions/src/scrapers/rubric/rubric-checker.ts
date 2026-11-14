@@ -1,7 +1,7 @@
 import { collections } from "../../utils/firebase";
 import { AnthropicNotConfiguredError } from "../../services/ai/anthropic-client";
 import { AnthropicLlmProvider, LlmProviderError, emptyLlmUsage, llmRequestHash, type LlmProvider, type LlmRequest, type LlmUsage } from "../../services/ai/llm-provider";
-import type { AssessmentCriterion, IntentPolarity, VisaRubric } from "../../types/rubric";
+import type { AssessmentCriterion, IntentPolarity, RubricProtectedFailure, RubricRepairStatus, RubricRuleRepair, VisaRubric } from "../../types/rubric";
 import { isValidTrigger } from "../../utils/rubric-trigger";
 import { guidanceSnapshotStore } from "../guidance/guidance-snapshot.store";
 import type { GuidanceSnapshotContent } from "../guidance/types";
@@ -34,7 +34,9 @@ import {
 import { loadPublishSettings, type LoadedPublishSettings, type RubricPublishSettings } from "./rubric-publish-settings";
 import { SnapshotQuoteIndex } from "./rubric-quote";
 import { quoteIsLeadIn, verifyListItems } from "./rubric-list-items";
-import { isTransientProviderError } from "./rubric-extraction.service";
+import { RubricExtractionService, RunStop, isTransientProviderError, type RedraftOutcome } from "./rubric-extraction.service";
+import { RUBRIC_REPAIR_PROMPT_VERSION, RUBRIC_SYSTEM_PROMPT } from "./rubric-prompt";
+import { REPAIR_WINDOW_CHARS, ruleHashOf } from "./rubric-repair";
 
 // ============================================
 // INDEPENDENT RULE CHECK — VERDICTS TO ACTIONS, AND THE RUN (issue #202, part of #200)
@@ -158,6 +160,27 @@ export function failedAspect(rule: Parameters<typeof applicableAspects>[0], row:
 }
 
 /**
+ * (#223) EVERY aspect a rule failed, from either model's row, in the checker's
+ * fixed order (the held report and the re-draft are told all of them, not just
+ * the first). A missing row fails the first aspect, like `judgeRule` treats it.
+ */
+export function failedAspectsOf(rule: Parameters<typeof applicableAspects>[0], ...rows: (VerdictRow | undefined)[]): CheckerAspect[] {
+  const failed = new Set<CheckerAspect>();
+  for (const row of rows) {
+    if (!row) {
+      failed.add(CHECKER_ASPECTS[0]);
+      continue;
+    }
+    const applicable = applicableAspects(rule);
+    for (const a of CHECKER_ASPECTS) {
+      const v = row[a];
+      if (applicable.has(a) ? v !== "yes" : v === "no" || v === "unsure") failed.add(a);
+    }
+  }
+  return CHECKER_ASPECTS.filter((a) => failed.has(a));
+}
+
+/**
  * The table: verdicts -> keep / leave out / hold. `verification` is the first
  * model's row, `judgement` the second model's (protected rules only). A missing
  * row on a protected rule holds; a missing row on an ordinary rule is the
@@ -241,8 +264,28 @@ export interface RubricCheckInputShape {
   codeLeftOutIds: readonly string[];
 }
 export type RubricCheckOutcomeShape =
-  | { ok: true; leftOut: { criterionId: string; reason: string }[]; resolvedFlagCodes: string[]; intentPolarity: IntentPolarity | null; droppedTriggerIds?: string[] }
-  | { ok: false; reasonCodes: string[]; protectedRuleIds?: string[] };
+  | {
+    ok: true;
+    leftOut: { criterionId: string; reason: string }[];
+    resolvedFlagCodes: string[];
+    intentPolarity: IntentPolarity | null;
+    droppedTriggerIds?: string[];
+    // (#223) Protected rules that failed the check and were REPAIRED: the replacements the pipeline
+    // records on the version (`ruleRepairs`), and the record of each attempt for the run record.
+    repairs?: RubricRuleRepair[];
+    protectedFailures?: RubricProtectedFailure[];
+    requests?: { total: number; repair: number };
+  }
+  | {
+    ok: false;
+    reasonCodes: string[];
+    protectedRuleIds?: string[];
+    // (#223) The complete held report: every protected failure with its per-aspect verdicts and its
+    // repair attempt, the ordinary rules the check would have left out, and the spend.
+    protectedFailures?: RubricProtectedFailure[];
+    leftOut?: { criterionId: string; reason: string }[];
+    requests?: { total: number; repair: number };
+  };
 
 /** What one stored answer holds: closed verdicts only. */
 export interface StoredResponse {
@@ -284,7 +327,31 @@ export interface RubricCheckerRun {
   usage: CheckerUsage;
   // Summed over every run of this version (a retry adds to it).
   lifetimeUsage: CheckerUsage;
+  // (#223) The ONE re-draft of each failed protected rule, keyed by rule id (the entry holds the rule's
+  // hash: an entry for a different hash is ignored). A re-delivered trigger, a sweep retry or an admin
+  // re-run finds the answer here and never asks the model to re-draft that rule again. Optional: older
+  // records have none.
+  repairs?: Record<string, StoredRedraft>;
   updatedAtMs: number;
+}
+
+/**
+ * (#223) What one finished re-draft attempt stored. Only a FINISHED attempt is
+ * stored (a replacement, the model's "cannot be repaired", or a refusal by the
+ * code validation); a provider that could not be reached stores nothing, so
+ * that is not counted as the rule's one attempt.
+ */
+export interface StoredRedraft {
+  // sha256 of the original rule this attempt was made for.
+  ruleHash: string;
+  kind: "replacement" | "cannot_be_repaired" | "invalid";
+  // Code (never model text) for `invalid`.
+  detail?: string;
+  // The validated replacement (kind `replacement`); the check of it is replayed from the stored answers.
+  replacement?: AssessmentCriterion;
+  // Requests the re-draft used (its transient retry included).
+  requests: number;
+  promptVersion: string;
 }
 
 /** Where the check keeps its record. A property of the deps so tests use memory. */
@@ -318,6 +385,27 @@ export interface RubricCheckerDeps {
   ledger: CheckerLedger;
   nowMs: () => number;
   sleep: (ms: number) => Promise<void>;
+  // (#223) The one-rule re-draft. Default: the drafting path of `RubricExtractionService` over THIS
+  // check's provider (tests inject the scripted provider through `provider`, so they need no override).
+  redraft: (provider: LlmProvider, args: RedraftArgs, usage: RubricRunUsageShape, attempts: { failed: number; cap: number }, opts: { deadlineAt: number; nowMs: () => number; sleep: (ms: number) => Promise<void> }) => Promise<RedraftOutcome>;
+}
+
+/** The arguments of one re-draft (see `RubricExtractionService.redraftRule`). */
+export interface RedraftArgs {
+  rule: AssessmentCriterion;
+  aspects: readonly string[];
+  index: SnapshotQuoteIndex;
+  routeName: string;
+  limits: { maxOutputTokens: number; timeoutMs: number };
+  sent: { chars: number };
+}
+/** The token and request counts a re-draft call adds up (the drafting path's usage shape). */
+export interface RubricRunUsageShape {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
 }
 
 /** Requests in flight at once (rule batches are independent of each other). */
@@ -331,8 +419,26 @@ export const CHECKER_RETRY_BACKOFF_MS = 2_000;
  */
 export const CHECKER_START_DEADLINE_MS = 330_000;
 
-/** Why one job did not produce an answer. */
-type JobFailure = "unavailable" | "invalid" | "capped";
+/**
+ * Why one job did not produce an answer. The `unavailable_*` forms say WHAT was
+ * unreachable (#223), so the hold reason is `checker_unavailable:<what>` rather
+ * than a bare code: `provider` (the request failed after its one retry),
+ * `provider_refused` (the model declined), `not_configured` (no AI key bound),
+ * `deadline` (the run ran out of time; the sweep resumes it).
+ */
+type JobFailure = "unavailable_provider" | "unavailable_provider_refused" | "unavailable_not_configured" | "unavailable_deadline" | "invalid" | "capped";
+
+/** The hold reason code of a job failure. */
+function reasonOf(f: JobFailure): string {
+  if (f === "capped") return "checker_capped";
+  if (f === "invalid") return "checker_output_invalid";
+  return `checker_unavailable:${f.slice("unavailable_".length)}`;
+}
+
+/** What the check was doing when something unexpected threw (the `checker_unavailable:<stage>` detail). */
+interface StageBox {
+  name: "internal" | "settings_read" | "snapshot_read" | "ledger" | "provider";
+}
 
 /** One request to make: a rule batch or a polarity reading. */
 interface Job {
@@ -378,54 +484,72 @@ export class RubricCheckerService {
       ledger: firestoreCheckerLedger,
       nowMs: () => Date.now(),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      redraft: (provider, args, usage, attempts, opts) => new RubricExtractionService({ provider }).redraftRule(args, usage, attempts, opts),
       ...deps,
     };
   }
 
   /**
    * The pipeline's entry. NEVER throws: any unexpected error is a held draft
-   * (`checker_unavailable`), logged by class only.
+   * (`checker_unavailable:<what was unreachable>`, #223), logged by class only
+   * (never the error's text, which can carry a path or a secret).
    */
   async check(input: RubricCheckInputShape): Promise<RubricCheckOutcomeShape> {
+    // What the check was doing when something threw: becomes the reason's detail.
+    const stage: StageBox = { name: "internal" };
     try {
-      return await this.checkInner(input);
+      return await this.checkInner(input, stage);
     } catch (err) {
-      console.error(`Rubric checker: ${input.runId} failed (${errorClass(err)})`);
-      return { ok: false, reasonCodes: [err instanceof CheckerPromptError ? "checker_output_invalid" : "checker_unavailable"] };
+      console.error(`Rubric checker: ${input.runId} failed while ${stage.name} (${errorClass(err)})`);
+      return { ok: false, reasonCodes: [err instanceof CheckerPromptError ? "checker_output_invalid" : `checker_unavailable:${stage.name}`] };
     }
   }
 
-  private async checkInner(input: RubricCheckInputShape): Promise<RubricCheckOutcomeShape> {
+  /** Run `fn` with the stage named, so an error thrown inside it is reported as that stage. */
+  private async at<T>(stage: StageBox, name: StageBox["name"], fn: () => Promise<T>): Promise<T> {
+    stage.name = name;
+    // Reset only on success: when `fn` throws, `check()`'s catch must still see WHICH stage it was.
+    const out = await fn();
+    stage.name = "internal";
+    return out;
+  }
+
+  private async checkInner(input: RubricCheckInputShape, stage: StageBox): Promise<RubricCheckOutcomeShape> {
     const startedMs = this.deps.nowMs();
     const rubric = input.rubric;
     const rules = rubric.criteria;
 
     // ---- settings: unreadable = unavailable (never a default cap on a read error) ----
-    const loaded = await this.deps.loadSettings();
-    if (loaded.readError !== undefined) return { ok: false, reasonCodes: ["checker_unavailable"] };
+    const loaded = await this.at(stage, "settings_read", () => this.deps.loadSettings());
+    if (loaded.readError !== undefined) return { ok: false, reasonCodes: ["checker_unavailable:settings_read"] };
     const caps = loaded.settings;
     if (rules.length === 0) return { ok: true, leftOut: [], resolvedFlagCodes: [], intentPolarity: null };
     // A cap, not a trim: a draft over it is held whole.
     if (rules.length > caps.checkerMaxRulesPerDraft) return { ok: false, reasonCodes: ["checker_capped"] };
 
+    stage.name = "provider";
     const provider = this.deps.provider();
     const models = { verification: provider.modelFor("verification"), judgement: provider.modelFor("judgement") };
+    stage.name = "internal";
     const limits = { maxOutputTokens: caps.checkerMaxOutputTokensPerRequest, timeoutMs: caps.checkerRequestTimeoutMs };
 
     // ---- the official text around each quote (its cited snapshot, bounded) ----
-    const views = await this.buildViews(rules);
+    // One cache of prepared snapshots for the whole run (the check and any re-draft read each once).
+    const indexes = new Map<string, Promise<SnapshotQuoteIndex>>();
+    const views = await this.at(stage, "snapshot_read", () => this.buildViews(rules, indexes));
 
     // ---- who is protected, and who cannot be read ----
     const protectedRules = rules.filter(isProtectedRule);
     const ordinaryRules = rules.filter((r) => !isProtectedRule(r));
     const failedProtected = new Set<string>(protectedRules.filter((r) => !views.has(r.criterionId)).map((r) => r.criterionId));
-    // A protected rule whose quote cannot be found cannot be verified: hold before spending anything.
+    // A protected rule whose quote cannot be found cannot be verified: hold before spending anything
+    // (and a re-draft needs the quote's passage, so there is nothing to repair from).
     if (failedProtected.size > 0) return this.protectedFailure([...failedProtected]);
     const unreadableOrdinary = ordinaryRules.filter((r) => !views.has(r.criterionId));
     const readableOrdinary = ordinaryRules.filter((r) => views.has(r.criterionId));
 
     // ---- intention to stay ----
-    const polarityPlan = await this.planPolarity(rubric, input.codeLeftOutIds, limits);
+    const polarityPlan = await this.at(stage, "snapshot_read", () => this.planPolarity(rubric, input.codeLeftOutIds, limits));
     if (polarityPlan.kind === "unverified") return { ok: false, reasonCodes: ["polarity_unverified"] };
 
     // ---- the jobs, in a fixed order: protected first, then polarity, then the rest ----
@@ -444,7 +568,7 @@ export class RubricCheckerService {
     const allJobs = [...protectedJobs, ...protectedTriggerJobs, ...polarityJobs, ...ordinaryJobs, ...ordinaryTriggerJobs];
 
     // ---- reuse what a previous run of this version already stored ----
-    const previous = await this.deps.ledger.load(input.runId);
+    const previous = await this.at(stage, "ledger", () => this.deps.ledger.load(input.runId));
     const reusable = previous && previous.promptVersion === CHECKER_PROMPT_VERSION ? previous.responses : {};
     const responses: Record<string, StoredResponse> = {};
     const needed: Job[] = [];
@@ -458,59 +582,73 @@ export class RubricCheckerService {
     const neededChars = needed.reduce((n, j) => n + j.request.system.length + j.request.user.length, 0);
     if (needed.length > caps.checkerMaxRequestsPerRun || neededChars > caps.checkerMaxInputCharsPerRun) return { ok: false, reasonCodes: ["checker_capped"] };
     const day = utcDay(startedMs);
-    if (needed.length > 0 && (await this.deps.ledger.countRunsOnDay(day, input.runId)) >= caps.checkerMaxRunsPerDay) return { ok: false, reasonCodes: ["checker_capped"] };
+    if (needed.length > 0 && (await this.at(stage, "ledger", () => this.deps.ledger.countRunsOnDay(day, input.runId))) >= caps.checkerMaxRunsPerDay) return { ok: false, reasonCodes: ["checker_capped"] };
 
     // ---- run ----
     const usage = emptyUsage();
     const lifetimeBase = emptyUsage();
     if (previous?.lifetimeUsage) addUsage(lifetimeBase, previous.lifetimeUsage);
-    const ctx: RunContext = { provider, caps, responses, usage, startedMs, models, input, rules, day, verdicts: {}, lifetimeBase };
-    const stop = async (reasonCodes: string[], protectedRuleIds?: string[]): Promise<RubricCheckOutcomeShape> => {
+    const ctx: RunContext = {
+      provider, caps, responses, usage, startedMs, models, input, rules, day, verdicts: {}, lifetimeBase, stage, limits, indexes,
+      // (#223) Re-drafts stored by an earlier run of this version: reused, never asked for again.
+      repairs: { ...(previous?.repairs ?? {}) },
+      repairRequests: 0,
+      reusable,
+    };
+    const stop = async (reasonCodes: string[], extra: { protectedRuleIds?: string[]; protectedFailures?: RubricProtectedFailure[]; leftOut?: { criterionId: string; reason: string }[] } = {}): Promise<RubricCheckOutcomeShape> => {
       await this.persist(ctx, "failed", reasonCodes);
-      return { ok: false, reasonCodes, ...(protectedRuleIds ? { protectedRuleIds } : {}) };
+      // The spend is reported when a repair was involved (a failed bar, or repair requests); the checker's
+      // own record holds it for every other run.
+      return { ok: false, reasonCodes, ...extra, ...(extra.protectedFailures !== undefined || ctx.repairRequests > 0 ? { requests: this.requestsOf(ctx) } : {}) };
     };
 
-    // Phase 1: protected rules and the polarity readings. Any failure holds now.
+    // Phase 1: protected rules and the polarity readings. A provider/cap/format failure holds now.
     const phase1 = needed.filter((j) => protectedJobs.includes(j) || protectedTriggerJobs.includes(j) || polarityJobs.includes(j));
     const f1 = await this.runJobs(phase1, ctx);
-    if (f1) return stop([f1 === "capped" ? "checker_capped" : f1 === "invalid" ? "checker_output_invalid" : "checker_unavailable"]);
+    if (f1) return stop([reasonOf(f1)]);
 
     const rowsOf = (role: "verification" | "judgement", jobs: Job[]): Map<string, VerdictRow> => this.rowsFrom(role, jobs, responses);
     const protectedVerdicts = { verification: rowsOf("verification", protectedJobs), judgement: rowsOf("judgement", protectedJobs) };
-    const failedIds: string[] = [];
+    // The aspects each failing protected rule failed (either model), in the checker's fixed order.
+    const aspectFailures = new Map<string, CheckerAspect[]>();
     for (const r of protectedRules) {
-      const action = judgeRule(r, { verification: protectedVerdicts.verification.get(r.criterionId), judgement: protectedVerdicts.judgement.get(r.criterionId) });
-      if (action.action !== "keep") failedIds.push(r.criterionId);
+      const v = protectedVerdicts.verification.get(r.criterionId);
+      const j = protectedVerdicts.judgement.get(r.criterionId);
+      if (judgeRule(r, { verification: v, judgement: j }).action !== "keep") aspectFailures.set(r.criterionId, failedAspectsOf(r, v, j));
     }
-    // A protected rule's trigger must be confirmed by BOTH models too, or the draft is held.
+    const failedIds: string[] = [...aspectFailures.keys()];
+    // A protected rule's trigger must be confirmed by BOTH models too, or the draft is held. A rule that
+    // fails ONLY its trigger has no failed aspect to hand a re-draft, so it is not repairable.
     const protectedTriggerVerdicts = { verification: this.triggerVerdictsFrom("verification", protectedTriggerJobs, responses), judgement: this.triggerVerdictsFrom("judgement", protectedTriggerJobs, responses) };
     for (const r of protectedTriggered) {
       const verdict = judgeTrigger(r, { verification: protectedTriggerVerdicts.verification.get(r.criterionId), judgement: protectedTriggerVerdicts.judgement.get(r.criterionId) });
       if (verdict === "hold" && !failedIds.includes(r.criterionId)) failedIds.push(r.criterionId);
     }
-    if (failedIds.length > 0) {
-      this.noteVerdicts(ctx, protectedVerdicts.verification, protectedVerdicts.judgement);
-      const out = this.protectedFailure(failedIds);
-      await this.persist(ctx, "failed", out.ok ? [] : out.reasonCodes);
-      return out;
-    }
+    this.noteVerdicts(ctx, protectedVerdicts.verification, protectedVerdicts.judgement);
 
+    // ---- intention to stay (a failure holds; with a failed bar the report is still completed below) ----
+    const extraHoldReasons: string[] = [];
     let intentPolarity: IntentPolarity | null = null;
     if (polarityPlan.kind === "ask") {
       const answers = polarityJobs.map((j) => responses[j.hash]?.answer as PolarityAnswer);
       intentPolarity = decidePolarity(polarityPlan.value, answers);
       if (intentPolarity === null) {
-        this.noteVerdicts(ctx, protectedVerdicts.verification, protectedVerdicts.judgement);
-        return stop(["polarity_unverified"]);
+        if (failedIds.length === 0) return stop(["polarity_unverified"]);
+        extraHoldReasons.push("polarity_unverified");
       }
     } else intentPolarity = polarityPlan.value;
 
-    // Phase 2: every ordinary rule.
+    // Phase 2: every ordinary rule. (#223) Run EVEN WHEN a protected rule failed, so the held report lists
+    // every problem, not just the first. Same code path, same caps, ordinary rules checked once.
     const f2 = await this.runJobs(
       needed.filter((j) => ordinaryJobs.includes(j) || ordinaryTriggerJobs.includes(j)),
       ctx
     );
-    if (f2) return stop([f2 === "capped" ? "checker_capped" : f2 === "invalid" ? "checker_output_invalid" : "checker_unavailable"]);
+    if (f2) {
+      // The ordinary rules could not be checked: report the failed bars (critical) AND why the run is incomplete.
+      if (failedIds.length > 0) return stop([reasonOf(f2)], { protectedRuleIds: failedIds, protectedFailures: this.unrepairedReport(ctx, failedIds, aspectFailures) });
+      return stop([reasonOf(f2)]);
+    }
 
     // ---- decide each ordinary rule from its verdicts ----
     const ordinaryVerdicts = rowsOf("verification", ordinaryJobs);
@@ -535,8 +673,235 @@ export class RubricCheckerService {
     const droppedTriggerIds = ordinaryTriggered
       .filter((r) => !decided.has(r.criterionId) && judgeTrigger(r, { verification: ordinaryTriggerVerdicts.get(r.criterionId) }) === "drop")
       .map((r) => r.criterionId);
-    await this.persist(ctx, "completed", []);
-    return { ok: true, leftOut, resolvedFlagCodes, intentPolarity, droppedTriggerIds };
+
+    if (failedIds.length === 0) {
+      await this.persist(ctx, "completed", []);
+      // (no `requests` here: with no failed bar there was no repair, and the checker's own record holds the spend)
+      return { ok: true, leftOut, resolvedFlagCodes, intentPolarity, droppedTriggerIds };
+    }
+
+    // ---- (#223) a protected rule failed: ONE bounded repair of each, then hold unless every bar was repaired ----
+    const rulesById = new Map(protectedRules.map((r) => [r.criterionId, r]));
+    const repaired = await this.repairFailed(ctx, { failedIds, aspectFailures, rulesById, questions, routeName: rubric.routeKey });
+    const unrepaired = repaired.failures.filter((f) => f.repair.status !== "repaired");
+    if (unrepaired.length === 0 && extraHoldReasons.length === 0) {
+      // Every failed bar has a replacement that BOTH models confirmed and code validated: the run goes on.
+      await this.persist(ctx, "completed", []);
+      return { ok: true, leftOut, resolvedFlagCodes, intentPolarity, droppedTriggerIds, repairs: repaired.repairs, protectedFailures: repaired.failures, requests: this.requestsOf(ctx) };
+    }
+    // Held. When a repair could not FINISH (the provider, or a cap) the reason is that retryable one, so the
+    // sweep may finish the job (the stored attempts are reused, nothing is paid for twice); otherwise each
+    // bar that is still not confirmed is named. The held report carries everything either way.
+    const reasons = repaired.infra ? [reasonOf(repaired.infra)] : unrepaired.map((f) => `protected_rule_failed:${f.criterionId}`);
+    for (const r of extraHoldReasons) if (!reasons.includes(r)) reasons.push(r);
+    return stop(reasons, { protectedRuleIds: unrepaired.map((f) => f.criterionId), protectedFailures: repaired.failures, leftOut });
+  }
+
+  /** `{total, repair}` requests of this run (the request counter includes repair requests). */
+  private requestsOf(ctx: RunContext): { total: number; repair: number } {
+    return { total: ctx.usage.requests, repair: ctx.repairRequests };
+  }
+
+  /**
+   * The held report's entry for each failed bar when NO repair was tried
+   * (the run could not finish checking the ordinary rules): the verdicts of both
+   * models, and why nothing was attempted.
+   */
+  private unrepairedReport(ctx: RunContext, failedIds: readonly string[], aspectFailures: ReadonlyMap<string, CheckerAspect[]>): RubricProtectedFailure[] {
+    return failedIds.map((id) => this.failureRecord(ctx, ctx.rules.find((r) => r.criterionId === id) as AssessmentCriterion, aspectFailures.get(id) ?? [], "not_attempted", "check_incomplete", 0));
+  }
+
+  /** One protected failure's record (see RubricProtectedFailure). */
+  private failureRecord(ctx: RunContext, rule: AssessmentCriterion, aspects: readonly CheckerAspect[], status: RubricRepairStatus, detail: string | undefined, requests: number): RubricProtectedFailure {
+    return {
+      criterionId: rule.criterionId,
+      ruleRef: rule.ruleRef ?? null,
+      title: rule.title,
+      failedAspects: [...aspects],
+      verdicts: { ...(ctx.verdicts[rule.criterionId] ?? {}) },
+      repair: { status, ...(detail !== undefined ? { detail } : {}), ruleHash: ruleHashOf(rule), requests },
+    };
+  }
+
+  // ---------- (#223) the one repair of each failed protected rule ----------
+
+  /**
+   * Repair each failed protected rule ONCE, then check only the replacements.
+   *
+   *  1. More failed bars than `repairMaxRulesPerRun` (or the cap is 0): something
+   *     systemic. No re-draft is attempted; every bar is reported not-attempted.
+   *  2. A bar that failed ONLY the trigger check has no failed aspect to give a
+   *     re-draft, and an "unsure" on something a re-draft cannot change stays a
+   *     failure: not attempted, held.
+   *  3. For each other failed bar, in rulebook order, ONE re-draft request
+   *     (`redraftRule`: the drafting path, the rule's own source passage). A stored
+   *     result for the same rule hash is reused (idempotent: a re-delivered trigger,
+   *     a sweep retry and an admin re-run never re-draft twice). Only a FINISHED
+   *     attempt is stored; a provider failure or a cap stores nothing and is not
+   *     counted as the rule's attempt.
+   *  4. The replacements that passed code validation are checked by BOTH models
+   *     (and their trigger, when they carry one), in batches. They are judged by
+   *     the SAME `judgeRule` / `judgeTrigger` as the original. The checker's
+   *     standards, thresholds and the meaning of "unsure" are untouched.
+   *
+   * Every request counts in the run's counters and against its caps.
+   */
+  private async repairFailed(
+    ctx: RunContext,
+    p: { failedIds: readonly string[]; aspectFailures: ReadonlyMap<string, CheckerAspect[]>; rulesById: ReadonlyMap<string, AssessmentCriterion>; questions: NonNullable<VisaRubric["intakeQuestions"]>; routeName: string }
+  ): Promise<{ failures: RubricProtectedFailure[]; repairs: RubricRuleRepair[]; infra: JobFailure | null }> {
+    const failures = new Map<string, RubricProtectedFailure>();
+    const redraftRequests = new Map<string, number>();
+    const rule = (id: string): AssessmentCriterion => p.rulesById.get(id) as AssessmentCriterion;
+    const setFailure = (id: string, status: RubricRepairStatus, detail?: string): void => {
+      failures.set(id, this.failureRecord(ctx, rule(id), p.aspectFailures.get(id) ?? [], status, detail, redraftRequests.get(id) ?? 0));
+    };
+    let infra: JobFailure | null = null;
+
+    // ---- 1 + 2. which failed bars may be repaired at all ----
+    const tooMany = p.failedIds.length > ctx.caps.repairMaxRulesPerRun;
+    const eligible: string[] = [];
+    for (const id of p.failedIds) {
+      if (tooMany) setFailure(id, "not_attempted", ctx.caps.repairMaxRulesPerRun === 0 ? "repair_disabled" : "cap_exceeded");
+      else if ((p.aspectFailures.get(id) ?? []).length === 0) setFailure(id, "not_attempted", "trigger_not_repairable");
+      else eligible.push(id);
+    }
+
+    // ---- 3. the one re-draft of each eligible bar ----
+    const pendingCheck: AssessmentCriterion[] = [];
+    for (const id of eligible) {
+      if (infra) {
+        setFailure(id, "attempt_unfinished", "earlier_attempt_unfinished");
+        continue;
+      }
+      const original = rule(id);
+      const hash = ruleHashOf(original);
+      let stored = ctx.repairs[id];
+      if (!stored || stored.ruleHash !== hash) {
+        const result = await this.redraftOnce(ctx, original, p.aspectFailures.get(id) ?? [], p.routeName);
+        if (result.kind === "infra") {
+          infra = result.failure;
+          redraftRequests.set(id, result.requests);
+          setFailure(id, "attempt_unfinished", result.failure);
+          continue;
+        }
+        stored = result.stored;
+        ctx.repairs[id] = stored;
+        // The finished attempt is stored NOW: a crash after this line still never re-drafts this rule again.
+        await this.persist(ctx, "failed", []);
+      }
+      redraftRequests.set(id, stored.requests);
+      if (stored.kind === "cannot_be_repaired") setFailure(id, "cannot_be_repaired");
+      else if (stored.kind === "invalid") setFailure(id, "invalid_redraft", stored.detail);
+      else pendingCheck.push(stored.replacement as AssessmentCriterion);
+    }
+
+    // ---- 4. the replacements are checked by both models, and judged by the same table ----
+    const repairs: RubricRuleRepair[] = [];
+    if (pendingCheck.length > 0 && !infra) {
+      const views = await this.at(ctx.stage, "snapshot_read", () => this.buildViews(pendingCheck, ctx.indexes));
+      const checkable = pendingCheck.filter((r) => views.has(r.criterionId));
+      for (const r of pendingCheck) if (!views.has(r.criterionId)) setFailure(r.criterionId, "invalid_redraft", "quote_unverifiable");
+      const triggered = checkable.filter((r) => r.trigger !== undefined && isValidTrigger(r.trigger, p.questions));
+      const jobs: Job[] = [];
+      for (const role of ["verification", "judgement"] as const) {
+        jobs.push(...this.batchJobs(role, checkable, views, ctx.limits));
+        jobs.push(...this.triggerJobs(role, triggered, views, p.questions, ctx.limits));
+      }
+      // A replacement's check made by an earlier run of this version is replayed from its stored answers
+      // (same request hash, same model), never asked for again.
+      for (const j of jobs) {
+        const hit = ctx.reusable[j.hash];
+        if (!ctx.responses[j.hash] && hit && hit.model === ctx.models[j.role] && hit.role === j.role) ctx.responses[j.hash] = hit;
+      }
+      const need = jobs.filter((j) => !ctx.responses[j.hash]);
+      const before = ctx.usage.requests;
+      const failure = await this.runJobs(need, ctx);
+      ctx.repairRequests += ctx.usage.requests - before;
+      if (failure) {
+        infra = failure;
+        for (const r of checkable) setFailure(r.criterionId, "attempt_unfinished", failure);
+      } else {
+        const rowsV = (role: "verification" | "judgement") => this.rowsFrom(role, jobs, ctx.responses);
+        const verification = rowsV("verification");
+        const judgement = rowsV("judgement");
+        const trigV = this.triggerVerdictsFrom("verification", jobs, ctx.responses);
+        const trigJ = this.triggerVerdictsFrom("judgement", jobs, ctx.responses);
+        for (const r of checkable) {
+          const v = verification.get(r.criterionId);
+          const j = judgement.get(r.criterionId);
+          const aspectsFailed = judgeRule(r, { verification: v, judgement: j }).action === "keep" ? [] : failedAspectsOf(r, v, j);
+          const triggerFailed = triggered.includes(r) && judgeTrigger(r, { verification: trigV.get(r.criterionId), judgement: trigJ.get(r.criterionId) }) === "hold";
+          const base = this.failureRecord(ctx, rule(r.criterionId), p.aspectFailures.get(r.criterionId) ?? [], aspectsFailed.length === 0 && !triggerFailed ? "repaired" : "failed_check", triggerFailed && aspectsFailed.length === 0 ? "trigger_not_confirmed" : undefined, redraftRequests.get(r.criterionId) ?? 0);
+          failures.set(r.criterionId, { ...base, repair: { ...base.repair, replacementFailedAspects: aspectsFailed, replacementVerdicts: { ...(v ? { verification: encodeRow(v) } : {}), ...(j ? { judgement: encodeRow(j) } : {}) } } });
+          if (base.repair.status === "repaired") repairs.push({ criterionId: r.criterionId, replacement: r, originalRuleHash: ruleHashOf(rule(r.criterionId)), runId: ctx.input.runId });
+        }
+      }
+    }
+    // Rulebook order, like every other list of this run.
+    return { failures: p.failedIds.map((id) => failures.get(id) as RubricProtectedFailure), repairs, infra };
+  }
+
+  /**
+   * ONE re-draft request of one bar, with every guard the checker's own requests
+   * have: the run clock, the request cap (retries count), the input cap (an
+   * estimate before, the real figure after). Returns the finished attempt to
+   * store, or the infrastructure failure that stopped it (nothing is stored then).
+   */
+  private async redraftOnce(ctx: RunContext, rule: AssessmentCriterion, aspects: readonly CheckerAspect[], routeName: string): Promise<{ kind: "done"; stored: StoredRedraft } | { kind: "infra"; failure: JobFailure; requests: number }> {
+    if (this.deps.nowMs() - ctx.startedMs > CHECKER_START_DEADLINE_MS) return { kind: "infra", failure: "unavailable_deadline", requests: 0 };
+    // The request cap counts the re-draft; so does the input cap (the prompt is the drafting prompt plus a bounded window).
+    const estimateChars = RUBRIC_SYSTEM_PROMPT.length + 2 * REPAIR_WINDOW_CHARS + 5_000;
+    if (ctx.usage.requests >= ctx.caps.checkerMaxRequestsPerRun || ctx.usage.inputChars + estimateChars > ctx.caps.checkerMaxInputCharsPerRun) return { kind: "infra", failure: "capped", requests: 0 };
+
+    const index = await this.at(ctx.stage, "snapshot_read", async () => {
+      const key = `${rule.source.sourceId}:${rule.source.contentHash}`;
+      let ready = ctx.indexes.get(key);
+      if (!ready) {
+        ready = this.deps.readSnapshot(rule.source.sourceId, rule.source.contentHash).then((c) => new SnapshotQuoteIndex(c));
+        ctx.indexes.set(key, ready);
+      }
+      return ready;
+    });
+    const used: RubricRunUsageShape = { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    // The drafting call's own transient retry counts against what is left of the run's request cap.
+    const attempts = { failed: 0, cap: ctx.caps.checkerMaxRequestsPerRun - ctx.usage.requests };
+    const args: RedraftArgs = { rule, aspects, index, routeName, limits: ctx.limits, sent: { chars: 0 } };
+    const account = (lastFailed = false): number => {
+      // Every request, answered or failed, is a request; its tokens were billed. The drafting call counts
+      // an answered request and each RETRIED failure, but not the final failure it throws: `lastFailed` adds it.
+      const n = used.requests + attempts.failed + (lastFailed ? 1 : 0);
+      ctx.usage.requests += n;
+      ctx.repairRequests += n;
+      ctx.usage.inputChars += args.sent.chars;
+      addUsage(ctx.usage, { inputTokens: used.inputTokens, outputTokens: used.outputTokens, cacheReadTokens: used.cacheReadTokens, cacheWriteTokens: used.cacheWriteTokens });
+      return n;
+    };
+    const finish = (outcome: RedraftOutcome, requests: number): { kind: "done"; stored: StoredRedraft } => ({
+      kind: "done",
+      stored: {
+        ruleHash: ruleHashOf(rule),
+        kind: outcome.kind === "replacement" ? "replacement" : outcome.kind,
+        ...(outcome.kind === "invalid" ? { detail: outcome.detail } : {}),
+        ...(outcome.kind === "replacement" ? { replacement: outcome.criterion } : {}),
+        requests,
+        promptVersion: RUBRIC_REPAIR_PROMPT_VERSION,
+      },
+    });
+    try {
+      const outcome = await this.deps.redraft(ctx.provider, args, used, attempts, { deadlineAt: ctx.startedMs + 540_000, nowMs: this.deps.nowMs, sleep: this.deps.sleep });
+      return finish(outcome, account());
+    } catch (err) {
+      const requests = account(err instanceof RunStop && err.reasonCode === "provider_error");
+      if (err instanceof RunStop) {
+        // No key, or the provider could not be reached: not an attempt (nothing is stored; a retry may try).
+        if (err.reasonCode === "ai_not_configured") return { kind: "infra", failure: "unavailable_not_configured", requests };
+        if (err.reasonCode === "provider_error") return { kind: "infra", failure: "unavailable_provider", requests };
+        // The model answered but not usably (declined, cut off, wrong shape): that WAS the one attempt.
+        return finish({ kind: "invalid", detail: err.reasonCode }, requests);
+      }
+      throw err;
+    }
   }
 
   // ---------- windows ----------
@@ -547,8 +912,7 @@ export class RubricCheckerService {
    * absent from the result (it cannot be verified). A snapshot that cannot be
    * READ throws: the official text is unavailable, not the rule unfaithful.
    */
-  private async buildViews(rules: readonly AssessmentCriterion[]): Promise<Map<string, CheckerRuleView>> {
-    const indexes = new Map<string, Promise<SnapshotQuoteIndex>>();
+  private async buildViews(rules: readonly AssessmentCriterion[], indexes: Map<string, Promise<SnapshotQuoteIndex>> = new Map()): Promise<Map<string, CheckerRuleView>> {
     const indexOf = (sourceId: string, hash: string): Promise<SnapshotQuoteIndex> => {
       const key = `${sourceId}:${hash}`;
       let p = indexes.get(key);
@@ -643,7 +1007,7 @@ export class RubricCheckerService {
   private async runJobs(jobs: Job[], ctx: RunContext): Promise<JobFailure | null> {
     for (let i = 0; i < jobs.length; i += CHECKER_CONCURRENCY) {
       // The clock: no new wave once the run has used its start budget.
-      if (this.deps.nowMs() - ctx.startedMs > CHECKER_START_DEADLINE_MS) return "unavailable";
+      if (this.deps.nowMs() - ctx.startedMs > CHECKER_START_DEADLINE_MS) return "unavailable_deadline";
       const wave = jobs.slice(i, i + CHECKER_CONCURRENCY);
       const results = await Promise.all(wave.map((j) => this.execute(j, ctx)));
       // Progress first (even a failed wave's good answers), then the verdict on the wave.
@@ -665,17 +1029,17 @@ export class RubricCheckerService {
       try {
         response = await ctx.provider.complete(job.request);
       } catch (err) {
-        if (err instanceof AnthropicNotConfiguredError) return "unavailable";
+        if (err instanceof AnthropicNotConfiguredError) return "unavailable_not_configured";
         const transient = err instanceof LlmProviderError && isTransientProviderError(err.message);
         if (transient && attempt < 2) {
           await this.deps.sleep(CHECKER_RETRY_BACKOFF_MS * attempt);
           continue;
         }
-        return "unavailable";
+        return "unavailable_provider";
       }
       addUsage(ctx.usage, response.usage);
       // A declined answer is "the check could not run"; a cut-off or odd stop is an incomplete answer.
-      if (response.stopReason === "refusal") return "unavailable";
+      if (response.stopReason === "refusal") return "unavailable_provider_refused";
       if (response.stopReason !== "end_turn") return "invalid";
       try {
         if (job.triggerBatch && job.criterionIds) {
@@ -699,7 +1063,7 @@ export class RubricCheckerService {
         throw err;
       }
     }
-    return "unavailable";
+    return "unavailable_provider";
   }
 
   /** The verdict rows of one role's rule batches, keyed by criterion id, from the stored answers. */
@@ -751,6 +1115,7 @@ export class RubricCheckerService {
     const total = { ...ctx.lifetimeBase };
     addUsage(total, ctx.usage);
     const record: RubricCheckerRun = {
+      repairs: ctx.repairs,
       runId: ctx.input.runId,
       routeKey: ctx.input.routeKey,
       version: ctx.input.version,
@@ -767,7 +1132,7 @@ export class RubricCheckerService {
       lifetimeUsage: total,
       updatedAtMs: this.deps.nowMs(),
     };
-    await this.deps.ledger.save(record);
+    await this.at(ctx.stage, "ledger", () => this.deps.ledger.save(record));
   }
 }
 
@@ -784,6 +1149,18 @@ interface RunContext {
   day: string;
   verdicts: Record<string, { verification?: string; judgement?: string }>;
   lifetimeBase: CheckerUsage;
+  // What the check is doing now (the detail of `checker_unavailable:<what>`).
+  stage: StageBox;
+  // The per-request limits of this run (the re-draft uses the same).
+  limits: { maxOutputTokens: number; timeoutMs: number };
+  // Prepared snapshots of this run, shared by the check and the re-draft.
+  indexes: Map<string, Promise<SnapshotQuoteIndex>>;
+  // (#223) Finished re-drafts by rule id (loaded from the ledger, written back by `persist`).
+  repairs: Record<string, StoredRedraft>;
+  // Model requests of this run spent on repair (re-drafts and the check of replacements).
+  repairRequests: number;
+  // The stored answers of an earlier run of this version that may be reused (same prompt version).
+  reusable: Record<string, StoredResponse>;
 }
 
 /** The check, over Firestore, the snapshot store and the Anthropic provider. */

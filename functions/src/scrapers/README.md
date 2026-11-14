@@ -179,6 +179,23 @@ Two defects found by the first real run (a "protected" bar rejected by the indep
 - Prompt versions: extraction `2026-11-rubric-v7`, check `2026-11-checker-v3`. Both fields are optional: earlier stored versions load unchanged.
 - Re-check two saved rules without a re-extraction: `scripts/recheck-list-and-group.ts` (offline by default; `--live` runs the two-model check on only those rules).
 
+## A failed bar: one repair, then hold (issue #223)
+
+Before #223 any protected rule that failed the independent check stopped the run on the spot: the ordinary rules were never checked, no question plan was built and a route with no earlier version served nothing. Now (`rubric-checker.ts`, `repairFailed`; the drafting entry is `RubricExtractionService.redraftRule`):
+
+1. **The ordinary rules are checked anyway** (same code path, same caps, once), so a held record lists every problem: each failed bar with both models' per-aspect verdicts, the ordinary leave-outs, and their shares (`counts.leftOutByReason`, plus `leave_out_budget_exceeded` when a share is over). A bar whose quote cannot be found is still held before any spend (there is no passage to repair from), and a provider, cap or format failure still holds at once.
+2. **ONE automatic re-draft per failed bar**, from its own source passage: the quote's line, up to 6 lines above (the lead-in) and 40 below (the list lines), at most 6000 characters (`SnapshotQuoteIndex.passageWindow`). There is no second drafting path: the request is the drafting call's system prompt and output schema plus a REPAIR block (the failed rule and the aspects that failed, `buildRepairRequest`), the answer goes through `assessChunkOutput` (verbatim quote, group names in the quote, check values, list lines attached from the stored text), and an empty `criteria` list is the model's "cannot be repaired". Code takes back exactly one accepted rule that quotes the SAME line, is still a bar and has a readable list; it keeps the original `criterionId` and its `trigger` / question links.
+3. **The replacement goes through the SAME check**: both models, `judgeRule`, `judgeTrigger` when it carries a trigger. Nothing about the check is weakened: an "unsure" on an aspect a re-draft cannot change is still a failure.
+4. **Confirmed -> the run continues** (gates on the rulebook with the replacement, the question plan, publish). **Not confirmed -> HOLD** `protected_rule_failed:<id>` with a critical alert naming the rule title, reference and failed aspects. Never published with a bar missing, never dropped.
+5. **Caps** (`appConfig/rubricPublishSettings`): `repairMaxRulesPerRun` (default 5, 0 = never repair). More failed bars than that is something systemic: no repair is attempted and every bar is held as `protected_rule_failed:<id>`. Every repair request (re-draft, its transient retry, the check of the replacements) counts in the run's request counter and against `checkerMaxRequestsPerRun`, `checkerMaxInputCharsPerRun` and the daily run limit; a run that cannot afford a repair holds `checker_capped` (retryable; the failed bar is still reported and alerted). At the default cap the repair adds at most 5 re-drafts (+ retries) and, because replacements are checked in batches, 2 check requests (+ 2 for triggers) per batch of 10.
+6. **Idempotent**: the finished attempt is stored with the check's record (`rubricCheckerRuns/{routeKey}__v{n}.repairs[ruleId]`, keyed by the rule's content hash `ruleHashOf`). A re-delivered trigger, an admin re-run and a sweep retry find it and never re-draft that rule again; the check of the replacement replays from the stored answers. Only a FINISHED attempt is stored (a replacement, "cannot be repaired", or a re-draft code refused). A provider failure stores nothing, is reported as `checker_unavailable:provider` (retryable), and is not the rule's attempt.
+
+**Where the repaired rule lives.** Versions are immutable drafts, so the replacement is never written into `criteria`. When the version is published, the replacements are recorded on it as the review field `ruleRepairs` (written by the pipeline through the same approval write as the question plan; the planner's allow-list is `questionPlan`, `ruleRepairs`). `applyExclusions` (the one read-side filter, `rubric-exclusions.ts`) swaps each replacement in at the original's position (`applyRuleRepairs`, `rubric-repair.ts`), and the publish gates, the question planner and the approval transaction's structural check and flag acknowledgement all run on the rulebook WITH the replacement. So what the check verified, what is served and what the audit says agree: the check was shown exactly the replacement; the replacement is what applicants get; the original stays in `criteria` (the audit trail); the approval's audit entry lists `repairedCriterionIds`; the publish run record (`rubricPublishRuns`) holds `protectedFailures` (per-aspect verdicts of both models on the original, the repair status and code, the replacement's verdicts) and `checkerRequests {total, repair}`. A bar can never be repaired away: a replacement is applied only for a protected original, only if it is itself protected, with the same id. A hold changes nothing for applicants (a version already serving keeps serving).
+
+Wording and diagnostics fixed with it: `publish-rubric.ts` says "the independent AI check ran and failed" when it ran and did not confirm the draft, and "has NOT run" only for `not_run`, `not_configured` and `--skip-checker` (`checkerStatusLine`); `checker_unavailable` names what was unreachable (above). Hold reasons and alerts name rules by title (data read from the draft, never code).
+
+Try one saved bar without a run: `scripts/repair-saved-rule.ts` (`npm run repair:saved-rule -- --page <stored-page.json> --rules <one-rule.json> [--live]`; offline by default; `--live` runs the production check and, only if the rule fails, its one repair, and prints the held-record entry). Nothing is written.
+
 ## Drafting a rulebook as a resumable background job (`rubric-extraction-job.ts`; issue #216, part P2 of #211)
 
 `extractRoute` drafts a whole rulebook in one call chain (a real route took
@@ -304,17 +321,22 @@ no free text; code decides.
   (or a doubt on an aspect that does not apply) -> leave out as
   `checker:<first failing aspect>`; protected rule, both models `yes` on every
   applicable aspect -> keep, anything else -> HOLD
-  `protected_rule_failed:<id>` (never in `leftOut`); a quote that cannot be
-  found in its cited snapshot -> `checker:source_text` (ordinary) or hold
-  (protected). A rule is never left out for size or to keep the rulebook short.
+  `protected_rule_failed:<id>` (never in `leftOut`), after the ONE repair of
+  that rule described in "A failed bar: one repair, then hold" below; a quote
+  that cannot be found in its cited snapshot -> `checker:source_text` (ordinary) or hold
+  (protected, before any spend). A rule is never left out for size or to keep the rulebook short.
 - **Fail closed**: an answer that is not exactly the handles sent (missing,
   extra or repeated id, extra key, bad enum, cut off) -> `checker_output_invalid`;
   provider error after ONE retry, no key, unreadable settings, a refusal, a
-  run cut off by the clock -> `checker_unavailable`; a cap -> `checker_capped`;
+  run cut off by the clock -> `checker_unavailable:<what>` (`provider`,
+  `provider_refused`, `not_configured`, `deadline`, `settings_read`,
+  `snapshot_read`, `ledger`, `internal`: WHAT was unreachable, a code, never error
+  text; the sweep reads the part before the colon); a cap -> `checker_capped`;
   intention-to-stay not confirmed by both models -> `polarity_unverified`.
   Nothing is published on a partial check.
 - **Order and spend**: protected rules and the polarity readings first (a
-  failure holds before the bulk is spent), then ordinary rules in rulebook
+  provider, cap or format failure holds before the bulk is spent; a bar that
+  FAILED a verdict no longer does, see below), then ordinary rules in rulebook
   order, batches of 10, 6 requests in flight. Caps (in
   `appConfig/rubricPublishSettings`, checked BEFORE the first call): rules per
   draft 1000, requests per run 120 (retries count), input characters per run

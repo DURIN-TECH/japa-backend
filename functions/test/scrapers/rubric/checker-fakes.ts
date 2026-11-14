@@ -49,6 +49,21 @@ export function isTriggerRequest(req: LlmRequest): boolean {
   return req.user.includes("<triggers_data_");
 }
 
+/** True for a re-draft request (#223): the drafting prompt with the failed rule and its aspects after the excerpt. */
+export function isRepairRequest(req: LlmRequest): boolean {
+  return req.user.includes("REPAIR. An earlier draft of ONE rule");
+}
+
+/** The failed rule a re-draft request shows (JSON on the line after the REPAIR sentence). */
+export function seenRepairRule(req: LlmRequest): Record<string, any> {
+  const m = /REPAIR\. An earlier draft of ONE rule[^\n]*\n(\{.*\})\n/.exec(req.user);
+  if (!m) throw new Error("not a re-draft request");
+  return JSON.parse(m[1]);
+}
+
+/** The text of a scripted answer. */
+const asText = (v: unknown): string => (typeof v === "string" ? v : JSON.stringify(v));
+
 /** The sentence of a polarity request. */
 export function seenSentence(req: LlmRequest): string {
   const m = /<(sentence_data_[0-9a-f]{16})>\n(.*)\n<\/\1>/s.exec(req.user);
@@ -63,6 +78,9 @@ export class ScriptedProvider implements LlmProvider {
   polarity: (role: AiModelRole, sentence: string) => string = () => "immigrant_intent_penalised";
   // INTEGRATION: the verdict on a rule's trigger (default `yes`), by role and the item the model sees.
   triggerPolicy: (ctx: { role: AiModelRole; item: SeenTrigger }) => "yes" | "no" | "unsure" = () => "yes";
+  // (#223) What the model answers to a re-draft request: a raw drafting answer (an object, sent as JSON) or text.
+  // Default: an empty `criteria` list, the model's own "cannot be repaired".
+  redraftPolicy: ((ctx: { req: LlmRequest; shown: Record<string, any> }) => unknown) | unknown = () => ({ criteria: [], suspiciousPassages: [] });
   script: CallScript = () => undefined;
   usage = { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
@@ -84,6 +102,8 @@ export class ScriptedProvider implements LlmProvider {
     if (isTriggerRequest(req)) {
       return base(JSON.stringify({ verdicts: seenTriggers(req).map((item) => ({ id: item.id, trigger_faithful: this.triggerPolicy({ role: req.role, item }) })) }));
     }
+    // (#223) The one-rule re-draft of a failed protected rule: the drafting call's schema plus the REPAIR block.
+    if (isRepairRequest(req)) return base(typeof this.redraftPolicy === "function" ? asText(this.redraftPolicy({ req, shown: seenRepairRule(req) })) : asText(this.redraftPolicy));
     const rules = seenRules(req);
     return base(
       JSON.stringify({

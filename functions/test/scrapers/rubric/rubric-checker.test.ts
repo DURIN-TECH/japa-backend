@@ -241,7 +241,7 @@ describe("check: keep, leave out, hold", () => {
     for (const l of out.leftOut) assert.deepEqual(Object.keys(l).sort(), ["criterionId", "reason"]);
   });
 
-  test("a protected rule that fails is a HOLD, never in leftOut, and nothing more is spent", async () => {
+  test("a protected rule that fails is a HOLD, never in leftOut; (#223) the ordinary rules are STILL checked and the one repair says it cannot be repaired", async () => {
     const r = rig();
     r.provider.policy = ({ rule }) => (rule.appliesTo ? { group_matches_codes: "no" } : undefined);
     const out = await r.svc.check(input(rubricOf([...rules(25), barOf(30)], PROPOSAL)));
@@ -249,9 +249,12 @@ describe("check: keep, leave out, hold", () => {
     if (out.ok) return;
     assert.deepEqual(out.reasonCodes, ["protected_rule_failed:crit-0030"]);
     assert.deepEqual(out.protectedRuleIds, ["crit-0030"]);
-    // Protected batches (both models) and the polarity readings ran; no ordinary batch did.
-    assert.equal(r.provider.requests.length, 4);
-    assert.ok(r.provider.requests.every((q) => q.role === "judgement" || q.role === "verification"));
+    // Protected batches (both models), the polarity readings, ALL THREE ordinary batches, and one re-draft.
+    assert.equal(r.provider.requests.length, 2 + 2 + 3 + 1);
+    assert.equal(out.requests?.repair, 1);
+    assert.equal(out.protectedFailures?.[0].repair.status, "cannot_be_repaired");
+    assert.deepEqual(out.protectedFailures?.[0].failedAspects, ["group_matches_codes"]);
+    assert.deepEqual(out.leftOut, []);
     assert.equal([...r.ledger.docs.values()][0].status, "failed");
   });
 
@@ -386,7 +389,7 @@ describe("check: invalid, missing and extra ids fail closed", () => {
     assert.deepEqual(await t.svc.check(input(rubricOf(rules(3), null))), { ok: false, reasonCodes: ["checker_output_invalid"] });
     const f = rig();
     f.provider.script = () => "refusal";
-    assert.deepEqual(await f.svc.check(input(rubricOf(rules(3), null))), { ok: false, reasonCodes: ["checker_unavailable"] });
+    assert.deepEqual(await f.svc.check(input(rubricOf(rules(3), null))), { ok: false, reasonCodes: ["checker_unavailable:provider_refused"] });
   });
 });
 
@@ -456,7 +459,7 @@ describe("check: batching is deterministic", () => {
     // One word of a title changes: no recording, so the check cannot answer and the draft is held.
     const changed = rubricOf([ruleOf(1, { title: "Matter one, reworded" }), ...rules(11, 2)], PROPOSAL);
     const miss = await make(changed).check(input(changed));
-    assert.deepEqual(miss, { ok: false, reasonCodes: ["checker_unavailable"] });
+    assert.deepEqual(miss, { ok: false, reasonCodes: ["checker_unavailable:provider"] });
   });
 });
 
@@ -529,13 +532,14 @@ describe("check: failures fail closed", () => {
   test("a transient error twice (a timeout, say) holds as checker_unavailable", async () => {
     const r = rig();
     r.provider.script = () => "transient";
-    assert.deepEqual(await r.svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable"] });
+    // (#223) The reason says WHAT was unreachable: the provider.
+    assert.deepEqual(await r.svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable:provider"] });
     assert.equal(r.provider.requests.length, 2);
   });
   test("a non-transient error is not retried", async () => {
     const r = rig();
     r.provider.script = () => "hard";
-    assert.deepEqual(await r.svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable"] });
+    assert.deepEqual(await r.svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable:provider"] });
     assert.equal(r.provider.requests.length, 1);
   });
   test("no API key configured", async () => {
@@ -543,16 +547,16 @@ describe("check: failures fail closed", () => {
     r.provider.complete = async () => {
       throw new AnthropicNotConfiguredError();
     };
-    assert.deepEqual(await r.svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable"] });
+    assert.deepEqual(await r.svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable:not_configured"] });
   });
   test("settings unreadable", async () => {
     const r = rig({ loadSettings: async () => ({ settings: { ...settingsDefault() }, readError: "boom", exists: false, problems: [] }) });
-    assert.deepEqual(await r.svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable"] });
+    assert.deepEqual(await r.svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable:settings_read"] });
     assert.equal(r.provider.requests.length, 0);
   });
   test("an unreadable snapshot is unavailable (the official text could not be read)", async () => {
     const svc = new RubricCheckerService({ provider: () => new ScriptedProvider(), readSnapshot: async () => { throw new Error("no such object"); }, loadSettings: settingsWith(), ledger: new MemoryLedger() });
-    assert.deepEqual(await svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable"] });
+    assert.deepEqual(await svc.check(input(rubricOf(rules(5), null))), { ok: false, reasonCodes: ["checker_unavailable:snapshot_read"] });
   });
   test("the clock: no new request after the start budget; finished batches are kept", async () => {
     const r = rig({ lines: 120 });
@@ -562,7 +566,7 @@ describe("check: failures fail closed", () => {
       return undefined;
     };
     const out = await r.svc.check(input(rubricOf(rules(100), null)));
-    assert.deepEqual(out, { ok: false, reasonCodes: ["checker_unavailable"] });
+    assert.deepEqual(out, { ok: false, reasonCodes: ["checker_unavailable:deadline"] });
     assert.equal(r.provider.requests.length, 6);
     assert.equal(Object.keys([...r.ledger.docs.values()][0].responses).length, 6);
   });

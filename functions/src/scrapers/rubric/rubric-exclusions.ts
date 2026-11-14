@@ -1,5 +1,6 @@
 import type { AssessmentCriterion, EvidenceItem, IntakeQuestion, VisaRubric } from "../../types/rubric";
 import { applyPlanShape } from "./rubric-question-plan";
+import { applyRuleRepairs } from "./rubric-repair";
 
 // ============================================
 // RUBRIC — CRITERION EXCLUSIONS (issue #161)
@@ -91,7 +92,7 @@ export interface DroppedEvidenceItem {
 
 /** The parts of a rubric the filter reads and rewrites. */
 type Filterable = Pick<VisaRubric, "criteria" | "intakeQuestions" | "evidenceItems"> &
-  Partial<Pick<VisaRubric, "excludedCriterionIds" | "exclusionNote" | "evidenceHelpsCriterionIds" | "questionPlan">>;
+  Partial<Pick<VisaRubric, "excludedCriterionIds" | "exclusionNote" | "evidenceHelpsCriterionIds" | "questionPlan" | "ruleRepairs">>;
 
 /**
  * (#203) The wording check's omissions stored in the question plan. A question
@@ -181,7 +182,12 @@ function analyseDrops(rubric: Filterable, excluded: ReadonlySet<string>): DropAn
  * never mutated). The exclusion fields are dropped from the result: they
  * describe a decision about content that is no longer there.
  */
-export function applyExclusions<T extends Filterable>(rubric: T): T {
+export function applyExclusions<T extends Filterable>(input: T): T {
+  // (#223) FIRST swap in the recorded replacements of repaired protected rules
+  // (same id, same position), so every step below, and every consumer, only
+  // ever sees the rule the independent check actually verified. The original
+  // stays in the stored `criteria` as the audit trail.
+  const rubric = applyRuleRepairs(input);
   // INTEGRATION (#200 + #207): after the exclusions and the plan's shape, ignore the triggers the
   // independent check could not confirm. Done HERE (the one read-side filter every consumer and
   // the planner itself go through) so intake, assessment, checklist, chat and the background
