@@ -46,6 +46,19 @@ describe("initializeCharge", () => {
     assert.deepEqual(calls[0].payload.metadata, { purpose: "consultation", consultationId: "c1" });
   });
 
+  test("sends OUR reference when one is given (issue #180 review fix), and none otherwise", async () => {
+    const { provider, calls } = recordingProvider({ data: { authorization_url: "https://pay/x", access_code: "a", reference: "cons-c1-abc" } });
+    const out = await provider.initializeCharge({
+      email: "delivered+x@resend.dev",
+      amount: { amountMinor: 15_000, currency: "NGN" },
+      reference: "cons-c1-abc",
+    });
+    assert.equal(calls[0].payload.reference, "cons-c1-abc");
+    assert.equal(out.reference, "cons-c1-abc");
+    await provider.initializeCharge({ email: "delivered+x@resend.dev", amount: { amountMinor: 15_000, currency: "NGN" } });
+    assert.equal("reference" in calls[1].payload, false);
+  });
+
   test("refuses a zero, negative or fractional amount without calling Paystack", async () => {
     const { provider, calls } = recordingProvider();
     for (const amountMinor of [0, -5, 10.5]) {
@@ -78,6 +91,22 @@ describe("getTransactionMetadata", () => {
       currency: "GHS",
       paidAt: "2026-11-13T09:05:00Z",
     });
+  });
+
+  test("returns requested_amount (what we asked, before fees passed to the customer) when Paystack reports it", async () => {
+    const { provider } = recordingProvider({
+      data: { status: "success", metadata: {}, amount: 15_225, requested_amount: 15_000, currency: "NGN" },
+    });
+    const r = await provider.getTransactionMetadata("r1");
+    assert.equal(r?.amount, 15_225);
+    assert.equal(r?.requestedAmount, 15_000);
+  });
+
+  test("a malformed requested_amount is left out (the check falls back to amount)", async () => {
+    const { provider } = recordingProvider({ data: { status: "success", amount: 15_000, requested_amount: "15000", currency: "NGN" } });
+    const r = await provider.getTransactionMetadata("r1");
+    assert.equal(r?.requestedAmount, undefined);
+    assert.equal("requestedAmount" in (r as object), false);
   });
 
   test("malformed amount / currency come back undefined", async () => {

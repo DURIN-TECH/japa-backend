@@ -51,6 +51,8 @@ export interface ChargeCall {
   amount: Money;
   metadata?: Record<string, unknown>;
   callbackUrl?: string;
+  /** Our own reference (issue #180 review fix). */
+  reference?: string;
 }
 
 /** Shared state the tests read and drive. */
@@ -67,6 +69,13 @@ export const harness = {
   countries: {} as Record<string, string>,
   /** Throw this from the next initializeCharge (provider outage). */
   failNextCharge: false,
+  /**
+   * Review fix race tests: called on every Paystack lookup BEFORE it answers,
+   * so a test can run another request "while" this one is mid-flight (e.g. a
+   * verify confirming the booking between a retry's lookup and its re-price).
+   * Its return value (when not undefined) replaces the lookup's answer.
+   */
+  onLookup: undefined as undefined | ((reference: string) => Promise<PaystackTransactionLookup | null | undefined>),
 
   /** Clear all state and restore the default rates and clock. */
   reset(): void {
@@ -75,6 +84,7 @@ export const harness = {
     this.paystack.clear();
     this.countries = {};
     this.failNextCharge = false;
+    this.onLookup = undefined;
     const clock = fakeClock(NOW_ISO);
     this.clock = clock;
     const { service, store: rates } = makeService({ config: HARNESS_CONFIG, clock });
@@ -109,10 +119,25 @@ let refCounter = 0;
 export async function useHarness(): Promise<void> {
   await installFakes();
   const firebase: any = await import("../../src/utils/firebase");
-  for (const name of ["consultations", "transactions", "agents", "agencies", "users", "notifications"]) {
+  for (const name of [
+    "consultations", "transactions", "agents", "agencies", "users", "notifications",
+    // Issue #180 review fix: payments held for refund.
+    "consultationPaymentExceptions",
+  ]) {
     firebase.collections[name] = fakeCollection(name);
   }
-  consultationCharging.runTransaction = fakeRunTransaction as any;
+  // The shared fake transaction neither isolates nor retries. Real Firestore
+  // transactions are serializable (a conflicting one is retried on fresh
+  // data), so run ours one at a time: an interleaving the real database
+  // would never commit can then not pass a test either.
+  let txChain: Promise<unknown> = Promise.resolve();
+  consultationCharging.runTransaction = ((fn: any) => {
+    const run = txChain.then(() => fakeRunTransaction(fn));
+    txChain = run.catch(() => undefined);
+    return run;
+  }) as any;
+  // A caller that lost a checkout race re-reads without a real pause.
+  consultationCharging.sleep = () => new Promise((resolve) => setImmediate(resolve));
   consultationCharging.profileCountry = async (uid: string) => harness.countries[uid];
 
   // ---- Paystack: recorders, never the network ----
@@ -123,10 +148,23 @@ export async function useHarness(): Promise<void> {
       throw new Error("PAYSTACK_ERROR: simulated outage (HTTP 503)");
     }
     harness.charges.push(input);
-    const reference = `ref-${++refCounter}`;
+    // Paystack echoes a caller-supplied reference (issue #180 review fix:
+    // the charge path generates its own); else it makes one up.
+    const reference = input.reference ?? `ref-${++refCounter}`;
+    // Yield like a network call, so concurrent requests really interleave.
+    await new Promise((resolve) => setImmediate(resolve));
     return { authorizationUrl: `https://checkout.paystack.test/${reference}`, reference };
   };
-  ps.getTransactionMetadata = async (reference: string) => harness.paystack.get(reference) ?? null;
+  ps.getTransactionMetadata = async (reference: string) => {
+    // Snapshot the answer BEFORE the hook runs: the caller saw this state.
+    const seen = harness.paystack.get(reference) ?? null;
+    if (harness.onLookup) {
+      const hook = harness.onLookup;
+      const replaced = await hook(reference);
+      if (replaced !== undefined) return replaced;
+    }
+    return seen;
+  };
 
   // ---- Guest account provisioning: a fake Auth user + no claim email ----
   let uidCounter = 0;
@@ -164,15 +202,30 @@ export async function seed(collection: string, id: string, data: Record<string, 
 /** A fixed timestamp for seeded docs. */
 export const T0 = Timestamp.fromDate(new Date(NOW_ISO));
 
-/** Mark a reference as paid at Paystack with the given amount/currency. */
-export function paystackPaid(reference: string, consultationId: string, amount: Money, paidAt = harness.clock.now()): void {
+/**
+ * Mark a reference as paid at Paystack with the given amount/currency.
+ * `extra` overrides lookup fields (e.g. `requestedAmount`, issue #180 review).
+ */
+export function paystackPaid(
+  reference: string,
+  consultationId: string,
+  amount: Money,
+  paidAt = harness.clock.now(),
+  extra: Partial<PaystackTransactionLookup> = {}
+): void {
   harness.paystack.set(reference, {
     status: "success",
     metadata: { purpose: "consultation", consultationId },
     amount: amount.amountMinor,
     currency: amount.currency,
     paidAt: paidAt.toISOString(),
+    ...extra,
   });
+}
+
+/** Mark a reference with any Paystack status (e.g. "ongoing" for an in-flight bank transfer). */
+export function paystackStatus(reference: string, consultationId: string, status: string): void {
+  harness.paystack.set(reference, { status, metadata: { purpose: "consultation", consultationId } });
 }
 
 /** Mark a reference as not (yet) paid at Paystack. */

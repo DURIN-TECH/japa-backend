@@ -661,6 +661,14 @@ service cloud.firestore {
     //    dedupe claim per application it was handled for (who was told what,
     //    issue #123). Written by the backend only. Do NOT add a match.
 
+    //  - consultationPaymentExceptions/{reference}: consultation payments we
+    //    hold but cannot apply (a second charge on a superseded checkout of an
+    //    already-paid booking, or a payment on a cancelled booking), recorded
+    //    for a human to refund (issue #180). Amounts, references and booking
+    //    ids of other people: no client may read or forge one. Do NOT add a
+    //    match. (The superseded checkouts themselves live on the booking, as
+    //    `supersededCheckouts`.)
+
     //  - documentChecks/{documentId} and documentCheckCaps/{id}: per-upload
     //    document checks and their daily cost counters (issue #115). Clients read
     //    the check only through GET /documents/:id/check (tier-trimmed). Do NOT

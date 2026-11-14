@@ -87,6 +87,11 @@ export const collections = {
   documents: db.collection("documents"),
   transactions: db.collection("transactions"),
   consultations: db.collection("consultations"),
+  // Issue #180 (review fix): consultation payments we hold but cannot apply
+  // (a second charge on a superseded checkout of an already-paid booking, or a
+  // payment on a cancelled booking), for a human to refund. Doc id = the
+  // Paystack reference. Backend only: firestore.rules denies every client.
+  consultationPaymentExceptions: db.collection("consultationPaymentExceptions"),
   notifications: db.collection("notifications"),
   // Audit trail of outbound multi-channel deliveries (email/sms/push) attempted by
   // the unified notifier. Email/SMS are currently stubbed, so this collection is the

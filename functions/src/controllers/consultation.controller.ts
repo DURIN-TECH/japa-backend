@@ -10,17 +10,18 @@ import { EMAIL_BRANDING } from "../services/email/branding";
 import {
   bookingSummary,
   chargeCurrencyFor,
-  checkReportedCharge,
+  CheckoutState,
   classifyStoredFee,
-  confirmPaid,
-  consultationCharging,
   hasChargeSnapshot,
   isPricingFailure,
   isQuoteExpired,
+  issueCheckout,
   LockedCharge,
   lockQuote,
-  openCheckout,
-  requote,
+  paystackState,
+  reissueCheckout,
+  settlePayment,
+  SettleOutcome,
   snapshotOf,
 } from "../services/consultation-charge.service";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
@@ -415,12 +416,21 @@ export class ConsultationController {
       }
 
       // --- Open the Paystack checkout for exactly the stored charge ---------
-      const { authorizationUrl, reference } = await openCheckout({
+      // Race-safe (claim our own reference in a transaction, then open it):
+      // a client "Pay now" retry racing this create can never leave two
+      // checkouts (issue #180 review).
+      const state = await issueCheckout({
         consultationId: consultation.id,
+        observedReference: null,
+        charge: null, // the snapshot was locked a moment ago, at create
         email: client.email,
-        charge,
         callbackUrl: this.signedInCallbackUrl(),
       });
+      if (state.kind !== "checkout") {
+        this.sendNoCheckout(res, state);
+        return;
+      }
+      const { authorizationUrl, reference } = state;
       sendCreated(res, {
         ...consultation,
         transactionId: reference,
@@ -444,13 +454,20 @@ export class ConsultationController {
    * the booking's own client may call it.
    *
    *  - Already paid: `{ requiresPayment: false }` with the booking.
-   *  - The current reference was in fact paid: confirmed here, with the same
+   *  - The current checkout was in fact paid: settled here, with the same
    *    checks as verify (reference, amount, currency; a late exact payment is
    *    honoured and flagged paidAfterQuoteExpiry).
+   *  - Paystack reports the current checkout as still in progress (`ongoing`,
+   *    `pending`, `processing`, `queued`, anything but `failed`/`abandoned`):
+   *    409 PAYMENT_IN_PROGRESS with the SAME checkout; never re-priced while
+   *    a bank transfer or USSD payment may still land on it (review fix).
    *  - Quote lock still open and a checkout exists: the SAME checkout is
    *    returned (no second charge is opened while the first can be paid).
    *  - Lock passed (or no checkout was ever opened): a FRESH quote and a new
-   *    checkout; never the stale snapshot. No usable rate: 503, no Paystack call.
+   *    checkout, decided inside a Firestore transaction so a concurrent
+   *    verify or retry can never produce a second one (review fix): a lost
+   *    race answers with the booking's current state instead. No usable rate:
+   *    503, no Paystack call.
    */
   async checkoutConsultation(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
@@ -476,51 +493,52 @@ export class ConsultationController {
         return;
       }
 
-      // Was the current checkout paid after all? Then confirm, never re-charge.
-      if (consultation.transactionId) {
+      // An opened checkout: what does Paystack say about it?
+      if (consultation.transactionId && consultation.checkoutUrl) {
         const result = await paystackProvider.getTransactionMetadata(consultation.transactionId);
-        if (result?.status === "success") {
-          const check = checkReportedCharge(consultation, result, consultationCharging.now());
-          if (!check.ok) {
-            this.sendChargeRefused(res, check.reason, consultation.transactionId);
-            return;
-          }
-          const outcome = await confirmPaid(id, consultation.transactionId, check);
-          if (!outcome) {
-            sendError(res, "BOOKING_CHANGED", "The booking changed; please try again", 409);
-            return;
-          }
-          sendSuccess(res, { requiresPayment: false, consultation: bookingSummary(outcome.consultation) });
+        const state = paystackState(result);
+        // Paid after all: settle it, never re-charge.
+        if (state === "paid") {
+          const outcome = await settlePayment(id, consultation.transactionId, result!);
+          this.sendSettleOutcome(res, outcome, consultation.transactionId, "retry");
+          return;
+        }
+        // A payment may still land on it: keep it, do not re-price.
+        if (state === "in_progress") {
+          this.sendPaymentInProgress(res, consultation);
+          return;
+        }
+        // Inside the lock: hand back the same checkout.
+        if (!isQuoteExpired(consultation)) {
+          sendSuccess(res, {
+            requiresPayment: true,
+            authorizationUrl: consultation.checkoutUrl,
+            reference: consultation.transactionId,
+            consultation: bookingSummary(consultation),
+          });
           return;
         }
       }
 
-      // Inside the lock: hand back the same checkout.
-      if (!isQuoteExpired(consultation) && consultation.checkoutUrl && consultation.transactionId) {
-        sendSuccess(res, {
-          requiresPayment: true,
-          authorizationUrl: consultation.checkoutUrl,
-          reference: consultation.transactionId,
-          consultation: bookingSummary(consultation),
-        });
-        return;
-      }
-
-      // Lock passed (or no checkout yet): a fresh quote and a new checkout.
-      let fresh;
+      // Lock passed (or no checkout opened): a fresh quote and a new checkout.
+      let state: CheckoutState;
       try {
-        fresh = await requote(consultation, this.signedInCallbackUrl());
+        state = await reissueCheckout(consultation, { fallbackCallbackUrl: this.signedInCallbackUrl() });
       } catch (err) {
         if (!isPricingFailure(err)) throw err;
         this.sendPricingUnavailable(res);
         return;
       }
-      sendSuccess(res, {
-        requiresPayment: true,
-        authorizationUrl: fresh.authorizationUrl,
-        reference: fresh.reference,
-        consultation: bookingSummary({ ...consultation, ...fresh.charge }),
-      });
+      if (state.kind === "checkout") {
+        sendSuccess(res, {
+          requiresPayment: true,
+          authorizationUrl: state.authorizationUrl,
+          reference: state.reference,
+          consultation: bookingSummary(state.consultation),
+        });
+        return;
+      }
+      this.sendNoCheckout(res, state);
     } catch (error) {
       if (this.sendIfProviderError(res, error, "consultation checkout retry")) return;
       console.error("Error resuming consultation checkout:", error);
@@ -913,13 +931,20 @@ export class ConsultationController {
 
       // --- Payment: paid agencies must checkout before the booking confirms --
       if (charge) {
-        const { authorizationUrl, reference } = await openCheckout({
+        // Race-safe checkout under our own reference (issue #180 review).
+        const state = await issueCheckout({
           consultationId: consultation.id,
+          observedReference: null,
+          charge: null, // the snapshot was locked a moment ago, at create
           email: normalizedEmail,
-          charge,
           callbackUrl: `${EMAIL_BRANDING.appUrl}/a/${slug}/confirm`,
           metadata: { agencySlug: slug },
         });
+        if (state.kind !== "checkout") {
+          this.sendNoCheckout(res, state);
+          return;
+        }
+        const { authorizationUrl, reference } = state;
         sendCreated(res, {
           consultationId: consultation.id,
           requiresPayment: true,
@@ -954,20 +979,30 @@ export class ConsultationController {
    * recognizes subscription-shaped metadata).
    *
    * Issue #180 checks, in order:
-   *  1. the reference is a consultation payment AND is the reference stored on
-   *     that booking (a reference from another booking or a superseded
-   *     checkout is refused, 400);
-   *  2. already paid: idempotent success, nothing written (a second verify
-   *     never writes a second transaction);
-   *  3. not paid at Paystack: if the quote lock has passed, the booking gets a
-   *     FRESH quote and a new checkout (409 QUOTE_EXPIRED with the new
-   *     `authorizationUrl`); else 400 "not completed";
-   *  4. paid: the amount AND currency Paystack reports must equal the stored
-   *     `chargedAmountMinor` / `chargedCurrency` (legacy: the naira `fee`),
-   *     else 400 PAYMENT_MISMATCH, the booking stays pending and nothing is
-   *     recorded. An exact payment that landed after the quote lock is
-   *     honoured (the checkout was ours) and flagged `paidAfterQuoteExpiry`;
-   *  5. confirm + record the fee Transaction in ONE Firestore transaction.
+   *  1. the reference is a consultation payment of an existing booking;
+   *  2. PAID at Paystack: settled in ONE Firestore transaction
+   *     (settlePayment). The reference must be the booking's current one or a
+   *     superseded one; Paystack's amount (`requested_amount` when reported)
+   *     and currency must equal what THAT checkout asked, else 400
+   *     PAYMENT_MISMATCH and nothing is recorded. A superseded reference
+   *     settles a still-unpaid booking at its own snapshot
+   *     (`paidOnSupersededReference`); on a booking already paid it is a
+   *     second charge, recorded in consultationPaymentExceptions for refund
+   *     (200 with `refundPending: true`), never a second Transaction. A late
+   *     exact payment is honoured and flagged `paidAfterQuoteExpiry`. A second
+   *     verify writes nothing;
+   *  3. NOT paid, and Paystack reports it in progress (`ongoing`, `pending`,
+   *     `processing`, `queued`, anything but `failed`/`abandoned`): 409
+   *     PAYMENT_IN_PROGRESS with the current checkout; never re-priced;
+   *  4. NOT paid (failed / abandoned) on the current reference: inside the
+   *     lock 400 "not completed"; after it a FRESH quote and a new checkout,
+   *     issued race-safely (409 QUOTE_EXPIRED with the new `authorizationUrl`;
+   *     a lost race answers with the winner's checkout, or 200 when the
+   *     booking was paid meanwhile);
+   *  5. NOT paid on a superseded reference: 409 CHECKOUT_REPLACED with the
+   *     booking's current checkout (or, when that one never opened, a new
+   *     one as in 4).
+   * A Paystack failure while re-pricing answers 502 BILLING_PROVIDER_ERROR.
    */
   async verifyPublicConsultation(
     req: AuthenticatedRequest,
@@ -980,43 +1015,41 @@ export class ConsultationController {
         return;
       }
 
-      // Reference lookup returns { status, metadata, amount, currency, paidAt }
-      // — the generic (non-subscription) verify path.
+      // Reference lookup returns { status, metadata, amount, requestedAmount,
+      // currency, paidAt } — the generic (non-subscription) verify path.
       const result = await paystackProvider.getTransactionMetadata(reference);
       if (!result) {
         sendError(res, "NOT_FOUND", "Transaction not found", 404);
         return;
       }
 
+      // (1) A consultation payment of an existing booking.
       const consultationId = result.metadata?.consultationId as string | undefined;
       if (result.metadata?.purpose !== "consultation" || !consultationId || typeof consultationId !== "string") {
         sendError(res, "VALIDATION_ERROR", "Reference is not a consultation payment", 400);
         return;
       }
-
       const consultation = await consultationService.getConsultationById(consultationId);
       if (!consultation) {
         sendError(res, "NOT_FOUND", "Consultation not found", 404);
         return;
       }
 
-      // (1) The reference must be the one stored on THIS booking. Without this
-      // a valid reference from an older, re-priced checkout could settle the
-      // booking at the stale amount.
-      if (consultation.transactionId !== reference) {
-        // A COMPLETED payment on a superseded checkout is money we hold for a
-        // booking it cannot settle: log it for review / refund.
-        if (result.status === "success") {
-          console.error(
-            `[consultation] Paystack charge ${reference} was paid on a superseded checkout of ${consultationId}; ` +
-              "not confirmed, needs manual review"
-          );
-        }
-        sendError(res, "VALIDATION_ERROR", "This payment reference does not belong to this booking", 400);
+      // (2) Paid: settle it (all checks re-done on the fresh booking, atomically).
+      const state = paystackState(result);
+      if (state === "paid") {
+        const outcome = await settlePayment(consultationId, reference, result);
+        this.sendSettleOutcome(res, outcome, reference, "verify");
         return;
       }
 
-      // (2) Idempotent short-circuit: already confirmed.
+      // Not paid. Only this booking's current or superseded checkouts count.
+      const isCurrent = consultation.transactionId === reference;
+      const isSuperseded = (consultation.supersededCheckouts ?? []).some((s) => s.reference === reference);
+      if (!isCurrent && !isSuperseded) {
+        sendError(res, "VALIDATION_ERROR", "This payment reference does not belong to this booking", 400);
+        return;
+      }
       if (consultation.paymentStatus === "paid") {
         sendSuccess(res, { verified: true, consultation: bookingSummary(consultation) });
         return;
@@ -1026,52 +1059,44 @@ export class ConsultationController {
         return;
       }
 
-      // (3) Not paid at Paystack.
-      if (result.status !== "success") {
-        if (hasChargeSnapshot(consultation) && isQuoteExpired(consultation)) {
-          let fresh;
-          try {
-            const slug = typeof result.metadata?.agencySlug === "string" ? result.metadata.agencySlug : undefined;
-            fresh = await requote(
-              consultation,
-              slug ? `${EMAIL_BRANDING.appUrl}/a/${slug}/confirm` : this.signedInCallbackUrl()
-            );
-          } catch (err) {
-            if (!isPricingFailure(err)) throw err;
-            this.sendPricingUnavailable(res);
-            return;
-          }
-          res.status(409).json({
-            success: false,
-            error: "QUOTE_EXPIRED",
-            message: "The price quote expired, so it was refreshed. Please pay the new amount.",
-            data: {
-              authorizationUrl: fresh.authorizationUrl,
-              reference: fresh.reference,
-              consultation: bookingSummary({ ...consultation, ...fresh.charge }),
-            },
-          });
+      // (3) A payment may still land on this reference: keep everything as is.
+      if (state === "in_progress") {
+        this.sendPaymentInProgress(res, consultation);
+        return;
+      }
+
+      // Guest checkouts return to the agency page; keep that on a re-price.
+      const slug = typeof result.metadata?.agencySlug === "string" ? result.metadata.agencySlug : undefined;
+      const reissue = () =>
+        reissueCheckout(consultation, {
+          fallbackCallbackUrl: slug ? `${EMAIL_BRANDING.appUrl}/a/${slug}/confirm` : this.signedInCallbackUrl(),
+          ...(slug ? { metadata: { agencySlug: slug } } : {}),
+        });
+
+      // (4) Failed / abandoned on the CURRENT checkout.
+      if (isCurrent) {
+        if (!hasChargeSnapshot(consultation) || !isQuoteExpired(consultation)) {
+          sendError(res, "VALIDATION_ERROR", "Payment has not been completed", 400);
           return;
         }
-        sendError(res, "VALIDATION_ERROR", "Payment has not been completed", 400);
+        await this.answerReissue(res, reissue, "QUOTE_EXPIRED");
         return;
       }
 
-      // (4) Paid: what Paystack charged must be exactly what we stored.
-      const check = checkReportedCharge(consultation, result, consultationCharging.now());
-      if (!check.ok) {
-        this.sendChargeRefused(res, check.reason, reference);
+      // (5) Failed / abandoned on a SUPERSEDED checkout: point at the current one.
+      if (consultation.transactionId && consultation.checkoutUrl) {
+        this.sendCheckoutConflict(res, "CHECKOUT_REPLACED", "This checkout was replaced by a newer one.", {
+          authorizationUrl: consultation.checkoutUrl,
+          reference: consultation.transactionId,
+          consultation,
+        });
         return;
       }
-
-      // (5) Confirm + record, atomically and once.
-      const outcome = await confirmPaid(consultationId, reference, check);
-      if (!outcome) {
-        sendError(res, "BOOKING_CHANGED", "The booking changed while confirming; please try again", 409);
-        return;
-      }
-      sendSuccess(res, { verified: true, consultation: bookingSummary(outcome.consultation) });
+      // The current checkout never opened (a Paystack outage): issue one.
+      await this.answerReissue(res, reissue, "QUOTE_EXPIRED");
     } catch (error) {
+      // A Paystack failure while re-pricing (or looking up) is the provider's.
+      if (this.sendIfProviderError(res, error, "consultation verify")) return;
       console.error("Error verifying public consultation:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
@@ -1080,6 +1105,143 @@ export class ConsultationController {
   // ============================================
   // HELPERS
   // ============================================
+
+  /**
+   * Re-price on verify (issue #180) and answer: a checkout (new, or the
+   * winner's after a lost race) is 409 `code` with it; a booking paid
+   * meanwhile is 200 verified; anything else as sendNoCheckout. No usable
+   * rate: 503 before any Paystack call.
+   */
+  private async answerReissue(
+    res: Response,
+    reissue: () => Promise<CheckoutState>,
+    code: "QUOTE_EXPIRED"
+  ): Promise<void> {
+    let state: CheckoutState;
+    try {
+      state = await reissue();
+    } catch (err) {
+      if (!isPricingFailure(err)) throw err;
+      this.sendPricingUnavailable(res);
+      return;
+    }
+    if (state.kind === "checkout") {
+      this.sendCheckoutConflict(
+        res,
+        code,
+        "The price quote expired, so it was refreshed. Please pay the new amount.",
+        state
+      );
+      return;
+    }
+    if (state.kind === "paid") {
+      sendSuccess(res, { verified: true, consultation: bookingSummary(state.consultation) });
+      return;
+    }
+    this.sendNoCheckout(res, state);
+  }
+
+  /** A 409 that carries a checkout the payer should use instead (QUOTE_EXPIRED, CHECKOUT_REPLACED, PAYMENT_IN_PROGRESS). */
+  private sendCheckoutConflict(
+    res: Response,
+    code: string,
+    message: string,
+    checkout: { authorizationUrl?: string | null; reference?: string | null; consultation: Consultation }
+  ): void {
+    res.status(409).json({
+      success: false,
+      error: code,
+      message,
+      data: {
+        authorizationUrl: checkout.authorizationUrl ?? null,
+        reference: checkout.reference ?? null,
+        consultation: bookingSummary(checkout.consultation),
+      },
+    });
+  }
+
+  /**
+   * 409 PAYMENT_IN_PROGRESS (issue #180 review): Paystack reports the
+   * current checkout as not final (a bank transfer or USSD payment may
+   * still complete on it). Nothing is re-priced; the current checkout is
+   * returned unchanged.
+   */
+  private sendPaymentInProgress(res: Response, c: Consultation): void {
+    this.sendCheckoutConflict(
+      res,
+      "PAYMENT_IN_PROGRESS",
+      "A payment for this booking is still being processed. Please wait a few minutes and check again.",
+      { authorizationUrl: c.checkoutUrl, reference: c.transactionId, consultation: c }
+    );
+  }
+
+  /** Answer a checkout state that is not a usable checkout (paid, closed, or still opening). */
+  private sendNoCheckout(res: Response, state: Exclude<CheckoutState, { kind: "checkout" }>): void {
+    switch (state.kind) {
+    case "paid":
+      sendSuccess(res, { requiresPayment: false, consultation: bookingSummary(state.consultation) });
+      return;
+    case "opening":
+      // Another request is opening the checkout right now.
+      sendError(res, "CHECKOUT_OPENING", "Your checkout is being prepared. Please try again in a moment.", 409);
+      return;
+    case "not_payable":
+    default:
+      sendError(res, "BOOKING_NOT_PAYABLE", "This booking cannot be paid", 409);
+      return;
+    }
+  }
+
+  /**
+   * Answer the result of settling a successful Paystack payment (issue
+   * #180). `mode` picks the success shape: verify answers `{ verified }`,
+   * the retry route `{ requiresPayment: false }`.
+   */
+  private sendSettleOutcome(
+    res: Response,
+    outcome: SettleOutcome | null,
+    reference: string,
+    mode: "verify" | "retry"
+  ): void {
+    const ok = (c: Consultation, extra: Record<string, unknown> = {}) =>
+      sendSuccess(res, {
+        ...(mode === "verify" ? { verified: true } : { requiresPayment: false }),
+        ...extra,
+        consultation: bookingSummary(c),
+      });
+    if (!outcome) {
+      sendError(res, "NOT_FOUND", "Consultation not found", 404);
+      return;
+    }
+    switch (outcome.kind) {
+    case "confirmed":
+    case "already_paid":
+      ok(outcome.consultation);
+      return;
+    case "refund_recorded":
+      // The booking is paid; this extra payment is held for a refund.
+      ok(outcome.consultation, { refundPending: true });
+      return;
+    case "not_payable_recorded":
+      sendError(res, "BOOKING_NOT_PAYABLE", "This booking is no longer awaiting payment", 409);
+      return;
+    case "mismatch":
+      this.sendChargeRefused(res, "mismatch", reference);
+      return;
+    case "not_chargeable":
+      this.sendChargeRefused(res, "not_chargeable", reference);
+      return;
+    case "unknown_reference":
+    default:
+      // Paid, but never a checkout of this booking: money we cannot place.
+      console.error(
+        `[consultation] Paystack charge ${reference} is paid but is not a checkout of its booking; ` +
+          "not confirmed, needs manual review"
+      );
+      sendError(res, "VALIDATION_ERROR", "This payment reference does not belong to this booking", 400);
+      return;
+    }
+  }
 
   /** 503 PRICING_UNAVAILABLE: no usable rate, an unsupported currency, or a malformed stored fee (issue #180). */
   private sendPricingUnavailable(res: Response): void {

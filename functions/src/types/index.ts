@@ -1178,6 +1178,17 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   // Issue #180: true when an exact payment landed after `quoteExpiresAt` and
   // was honoured anyway; flagged for review (also on the Transaction).
   paidAfterQuoteExpiry?: boolean;
+  // Issue #180 (review fix): every checkout this booking has REPLACED, each
+  // with the snapshot and lock it was priced at. A re-price never forgets the
+  // old reference: an exact payment that completes on it later can still
+  // settle a still-unpaid booking at THAT reference's own price, or is
+  // recorded for refund (consultationPaymentExceptions) when the booking was
+  // already paid. Appended inside the same Firestore transaction that stores
+  // the new reference.
+  supersededCheckouts?: SupersededCheckout[];
+  // Issue #180 (review fix): true when the booking was settled by an exact
+  // payment on a superseded reference (also on the Transaction).
+  paidOnSupersededReference?: boolean;
   
   // After consultation
   summary?: string;
@@ -1190,6 +1201,47 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+/**
+ * A Paystack checkout a consultation booking no longer offers (issue #180
+ * review fix): replaced by a re-price after the quote lock passed, or by a
+ * reissue after a checkout that never opened. Kept with the exact price it
+ * asked for, so a payment that completes on it later is judged against what
+ * THAT checkout asked, never the booking's newer price.
+ */
+export interface SupersededCheckout extends ChargeSnapshot, Partial<QuoteLock> {
+  /** Our own Paystack reference for that checkout. */
+  reference: string;
+  /** When it was replaced. */
+  supersededAt: Timestamp;
+}
+
+/**
+ * Money we hold for a consultation that cannot be applied to it (issue #180
+ * review fix): an exact payment on a superseded checkout of a booking that
+ * was already paid (a second charge), or a payment on a booking that is no
+ * longer awaiting payment (e.g. cancelled while the payer was paying).
+ *
+ * Collection `consultationPaymentExceptions`, doc id = the Paystack
+ * reference (so a second verify of the same payment never records it twice).
+ * Backend only: firestore.rules denies every client. Written for a human to
+ * refund; NEVER a second Transaction.
+ */
+export interface ConsultationPaymentException {
+  id: string;
+  consultationId: string;
+  /** The Paystack reference that was paid. */
+  reference: string;
+  /** What Paystack charged (its `amount`, minor units of `currency`). */
+  amountMinor: number;
+  currency: string;
+  /** Paystack's own payment time (`paid_at`), when it reported one. */
+  paystackPaidAt: Timestamp | null;
+  reason: "paid_on_superseded_reference_after_booking_paid" | "booking_not_payable";
+  /** Open until a human refunds it (no automated refund yet). */
+  status: "open";
+  createdAt: Timestamp;
 }
 
 // ============================================
@@ -1228,6 +1280,8 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   // an exact payment honoured after the booking's quote lock.
   paystackPaidAt?: Timestamp;
   paidAfterQuoteExpiry?: boolean;
+  // Issue #180 review fix: settled by an exact payment on a superseded checkout.
+  paidOnSupersededReference?: boolean;
   userId: string;
   agentId?: string;
   applicationId?: string;

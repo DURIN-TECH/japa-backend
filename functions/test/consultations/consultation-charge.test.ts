@@ -276,7 +276,7 @@ describe("guest booking: the server decides the amount", () => {
     assert.equal(harness.charges.length, 0);
   });
 
-  test("a Paystack outage is 502 and leaves the booking pending with no reference", async () => {
+  test("a Paystack outage is 502 and leaves the booking pending with no open checkout", async () => {
     await seedAgency();
     harness.failNextCharge = true;
     const out = await guestBook();
@@ -284,7 +284,10 @@ describe("guest booking: the server decides the amount", () => {
     assert.equal(out.body.error, "BILLING_PROVIDER_ERROR");
     const b = onlyBooking();
     assert.equal(b.paymentStatus, "pending");
-    assert.equal(b.transactionId, undefined);
+    // Review fix: our own reference is claimed BEFORE Paystack is called, so
+    // it is stored; it never got a checkout URL and was never handed out.
+    assert.ok(b.transactionId);
+    assert.equal(b.checkoutUrl, null);
   });
 
   test("an unapproved agency is 404", async () => {
@@ -521,11 +524,14 @@ describe("verify: Paystack's amount and currency must match the stored charge", 
     assert.equal(b.fxRate, 1600);
     assert.equal(b.transactionId, fresh.reference);
     assert.ok(b.quoteExpiresAt.toMillis() > harness.clock.now().getTime());
-    // The old reference can no longer settle the booking.
-    paystackPaid(reference, id, { amountMinor: AGENCY_FEE_KOBO, currency: "NGN" });
-    const stale = await verify(reference);
-    assert.equal(stale.status, 400);
-    assert.equal(docsIn("transactions").length, 0);
+    // The old reference is kept with ITS snapshot (review fix), not forgotten.
+    assert.equal(b.supersededCheckouts.length, 1);
+    assert.equal(b.supersededCheckouts[0].reference, reference);
+    assert.equal(b.supersededCheckouts[0].chargedAmountMinor, AGENCY_FEE_KOBO);
+    assert.equal(b.supersededCheckouts[0].fxRate, NGN_RATE);
+    // The new checkout keeps the guest's return page and slug.
+    assert.equal(harness.charges[1].metadata?.agencySlug, "acme");
+    assert.match(harness.charges[1].callbackUrl!, /\/a\/acme\/confirm$/);
   });
 
   test("after the lock with no usable rate: 503 and no new checkout", async () => {
@@ -591,25 +597,54 @@ describe("verify: Paystack's amount and currency must match the stored charge", 
     assert.equal(docsIn("transactions").length, 0);
   });
 
-  test("a payment on a SUPERSEDED reference (re-priced since) is refused and logged, even at its exact old amount", async () => {
+  test("an exact payment on a SUPERSEDED reference settles a still-unpaid booking at THAT reference's price", async () => {
     const { id, reference: oldRef } = await bookPaid();
     harness.clock.advanceHours(1);
+    setRate("NGN", 1600);
     paystackAbandoned(oldRef, id, { agencySlug: "acme" });
     const requoted = await verify(oldRef); // past the lock: fresh quote + new reference
     assert.equal(requoted.status, 409);
     const newRef = requoted.body.data.reference;
-    // The payer then pays the OLD checkout, exactly.
+    // The payer then completes the OLD (abandoned) checkout, exactly.
     paystackPaid(oldRef, id, { amountMinor: AGENCY_FEE_KOBO, currency: "NGN" });
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    console.warn = () => {};
+    const out = await verify(oldRef);
+    assert.ok(okStatus(out.status), JSON.stringify(out.body));
+    assert.equal(out.body.data.verified, true);
+    const b = onlyBooking();
+    assert.equal(b.paymentStatus, "paid");
+    assert.equal(b.status, "scheduled");
+    assert.equal(b.paidOnSupersededReference, true);
+    assert.equal(b.transactionId, oldRef);
+    // The booking carries the snapshot it was PAID at, matching its Transaction.
+    assert.equal(b.chargedAmountMinor, AGENCY_FEE_KOBO);
+    assert.equal(b.fxRate, NGN_RATE);
+    // The then-current checkout is now the superseded one.
+    assert.deepEqual(b.supersededCheckouts.map((s: any) => s.reference), [newRef]);
+    assert.equal(b.supersededCheckouts[0].chargedAmountMinor, 16_000_000);
+    const txs = docsIn("transactions");
+    assert.equal(txs.length, 1);
+    assert.equal(txs[0][1].amount, AGENCY_FEE_KOBO);
+    assert.equal(txs[0][1].fxRate, NGN_RATE);
+    assert.equal(txs[0][1].providerTransactionId, oldRef);
+    assert.equal(txs[0][1].paidOnSupersededReference, true);
+    // Idempotent.
+    await verify(oldRef);
+    assert.equal(docsIn("transactions").length, 1);
+  });
+
+  test("a payment on a reference that was never this booking's is refused and logged", async () => {
+    const { id } = await bookPaid();
+    paystackPaid("ref-stranger", id, { amountMinor: AGENCY_FEE_KOBO, currency: "NGN" });
     writes.length = 0;
     let logged = "";
     console.error = (m: string) => void (logged += m);
-    const out = await verify(oldRef);
+    const out = await verify("ref-stranger");
     assert.equal(out.status, 400);
     assert.match(out.body.message, /does not belong/);
-    assert.match(logged, /superseded checkout/);
-    const b = onlyBooking();
-    assert.equal(b.paymentStatus, "pending");
-    assert.equal(b.transactionId, newRef);
+    assert.match(logged, /not a checkout of its booking/);
+    assert.equal(onlyBooking().paymentStatus, "pending");
     assert.equal(docsIn("transactions").length, 0);
     assert.deepEqual(writes, []);
   });

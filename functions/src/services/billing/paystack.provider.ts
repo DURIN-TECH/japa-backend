@@ -121,6 +121,14 @@ export class PaystackProvider implements BillingProvider {
     amount: Money;
     metadata?: Record<string, unknown>;
     callbackUrl?: string;
+    /**
+     * Issue #180 review fix: OUR reference for this checkout. Paystack
+     * accepts a caller-supplied `reference` on transaction/initialize, so the
+     * consultation charge path generates it, stores it on the booking inside
+     * the Firestore transaction that decides the checkout, and only then
+     * opens it here. Omitted: Paystack generates one (other callers).
+     */
+    reference?: string;
   }): Promise<{ authorizationUrl: string; reference: string }> {
     // Never hand Paystack a malformed or zero amount: a charge path that got
     // here with one is a bug upstream, and failing loudly beats charging 0.
@@ -134,6 +142,7 @@ export class PaystackProvider implements BillingProvider {
       currency: input.amount.currency,
       metadata: input.metadata ?? {},
       ...(callback ? { callback_url: callback } : {}),
+      ...(input.reference ? { reference: input.reference } : {}),
     };
 
     const res = await this.client().post<{ data: PaystackInitData }>(
@@ -271,6 +280,7 @@ export class PaystackProvider implements BillingProvider {
         status: string;
         metadata?: Record<string, unknown>;
         amount?: unknown;
+        requested_amount?: unknown;
         currency?: unknown;
         paid_at?: unknown;
         paidAt?: unknown;
@@ -283,6 +293,14 @@ export class PaystackProvider implements BillingProvider {
       status: data.status,
       metadata: data.metadata ?? {},
       amount: typeof data.amount === "number" && Number.isSafeInteger(data.amount) ? data.amount : undefined,
+      // What WE asked for. When the account passes Paystack's fees to the
+      // customer, `amount` includes those fees and `requested_amount` holds
+      // the original; the consultation charge check compares this one when
+      // present (issue #180 review).
+      // (Only set when well-formed, so callers fall back to `amount` otherwise.)
+      ...(typeof data.requested_amount === "number" && Number.isSafeInteger(data.requested_amount)
+        ? { requestedAmount: data.requested_amount }
+        : {}),
       currency: typeof data.currency === "string" ? data.currency.toUpperCase() : undefined,
       paidAt: typeof paidAtRaw === "string" && paidAtRaw ? paidAtRaw : undefined,
     };
@@ -408,8 +426,17 @@ export interface PaystackTransactionLookup {
   status: string;
   /** Our own metadata, echoed back by Paystack. */
   metadata: Record<string, unknown>;
-  /** The amount Paystack charged, in minor units of `currency`. */
+  /**
+   * The amount Paystack charged, in minor units of `currency`. Includes
+   * Paystack's fees when the account passes them to the customer.
+   */
   amount?: number;
+  /**
+   * Issue #180 review: the amount the checkout ASKED for (Paystack's
+   * `requested_amount`), before any fee passed to the customer. Compared in
+   * preference to `amount` when present.
+   */
+  requestedAmount?: number;
   /** The currency Paystack charged in, upper case. */
   currency?: string;
   /** When the payment completed (ISO 8601), when Paystack reports it. */

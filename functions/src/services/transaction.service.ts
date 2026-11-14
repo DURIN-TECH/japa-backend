@@ -219,7 +219,7 @@ class TransactionService {
   /**
    * Build (but do not write) a completed consultation-fee Transaction
    * (Paystack). Used inside the verify transaction
-   * (services/consultation-charge.service.ts `confirmPaid`), which writes it
+   * (services/consultation-charge.service.ts `settlePayment`), which writes it
    * in the SAME commit that flips the booking to paid, so a booking is never
    * paid without its transaction and a second verify never writes a second
    * one.
