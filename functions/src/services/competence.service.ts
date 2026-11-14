@@ -53,9 +53,10 @@ import { rubricStore, sharedLayerView } from "../scrapers";
 import type { CompetenceBlock, IntakeQuestion, VisaRubric } from "../types/rubric";
 import type { ApplicantFacts } from "../types/applicant-facts";
 import type { Application, ThroughCountryChoice, VisaType } from "../types";
-import { cleanAnswers, conditionHolds, INTAKE_EDITABLE_STATUSES, intakeService } from "./intake.service";
+import { cleanAnswers, conditionHolds, intakeService } from "./intake.service";
 import { destinationOptions, routeDestinationReader, withDestinationOptions } from "./route-destinations";
 import { visaService } from "./visa.service";
+import { throughCountryRefusal } from "../shared-routes/through-country-rule";
 import { applicationService } from "./application.service";
 
 // ============================================
@@ -231,6 +232,8 @@ export interface ResolvedThroughCountry {
   visaTypeId: string;
   visaType: VisaType;
   choice: ThroughCountryChoice;
+  // (#237) The shared route's name at this moment, stored on the application as `routeName`.
+  routeName: string;
   // The validated answers to the competence questions (scoped ids), to seed the intake with.
   answers: Record<string, unknown>;
 }
@@ -401,7 +404,7 @@ class CompetenceService {
       rulebookKey: view.rulebookKey,
       ...(view.rulebookVersion !== null ? { rulebookVersion: view.rulebookVersion } : {}),
     };
-    return { countryCode, visaTypeId: option.visaTypeId, visaType: { ...visaType, id: visaType.id ?? option.visaTypeId }, choice, answers: view.answers };
+    return { countryCode, visaTypeId: option.visaTypeId, visaType: { ...visaType, id: visaType.id ?? option.visaTypeId }, choice, routeName: view.sharedRoute.name, answers: view.answers };
   }
 
   /**
@@ -419,15 +422,10 @@ class CompetenceService {
    */
   async changeThroughCountry(application: Application, rawCountry: unknown, actor: CompetenceActor): Promise<ChangeThroughCountryResult> {
     const current = application.throughCountry;
-    if (!current || !application.throughCountryCode) {
-      throw new CompetenceError("NOT_SHARED_ROUTE", 409, "This application is not on a route you apply for through a member country");
-    }
-    if (!INTAKE_EDITABLE_STATUSES.includes(application.status)) {
-      throw new CompetenceError("NOT_EDITABLE", 409, "This application has been submitted, so the country you apply through can't be changed.");
-    }
-    if ((application.amountPaid ?? 0) > 0) {
-      throw new CompetenceError("ALREADY_PAID", 409, "You've already paid for this application, so the country you apply through can't be changed here. Contact support to change it.");
-    }
+    // (#237) The state rule lives in ONE place, shared with the
+    // `canChangeThroughCountry` flag served on every application.
+    const refusal = throughCountryRefusal(application);
+    if (refusal || !current) throw new CompetenceError(refusal?.code ?? "NOT_SHARED_ROUTE", 409, refusal?.message ?? "This application is not on a route you apply for through a member country");
     if (!isCountryCode(rawCountry)) throw new CompetenceError("VALIDATION_ERROR", 400, "throughCountryCode must be a two-letter country code in capitals");
     if (rawCountry === application.throughCountryCode) return { changed: false, application, answersKept: Object.keys(application.intake?.answers ?? {}).length, answersSetAside: 0 };
 
@@ -460,6 +458,9 @@ class CompetenceService {
       visaTypeId: resolved.visaTypeId,
       visaTypeName: visa.name,
       countryName: country?.name || resolved.countryCode,
+      // (#237) Kept in step with the country change: the route's name now (the
+      // route is the same, but its name may have been edited since creation).
+      routeName: resolved.routeName,
       // The member record's own price, as at creation (cents).
       totalCost: visa.baseCostUsd * 100,
       documentsRequired,

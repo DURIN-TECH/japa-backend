@@ -69,7 +69,7 @@ export interface CreateApplicationInput {
   // (checked by services/competence.service.ts `resolveForCreate`). The answers
   // the proposal was worked out from seed the intake, so they are not asked
   // again. Absent for every other application.
-  throughCountry?: { choice: ThroughCountryChoice; answers: Record<string, unknown> };
+  throughCountry?: { choice: ThroughCountryChoice; answers: Record<string, unknown>; routeName?: string };
 }
 
 export interface UpdateApplicationInput {
@@ -245,6 +245,9 @@ class ApplicationService {
     if (input.throughCountry) {
       application.throughCountryCode = input.throughCountry.choice.countryCode;
       application.throughCountry = input.throughCountry.choice;
+      // (#237) The shared route's name at creation, beside `countryName` (the
+      // country applied through), so screens can say "<route> through <country>".
+      if (input.throughCountry.routeName) application.routeName = input.throughCountry.routeName;
       if (Object.keys(input.throughCountry.answers).length > 0) {
         const seeded = await intakeService.rebuildIntake({ countryCode: input.countryCode, visaTypeId: input.visaTypeId, routeStack }, { answers: input.throughCountry.answers }, now);
         if (seeded.intake) application.intake = seeded.intake;

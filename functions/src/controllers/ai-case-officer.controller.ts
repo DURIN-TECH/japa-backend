@@ -5,6 +5,7 @@ import { collections } from "../utils/firebase";
 import { checkApplicationAccessForRequest } from "../utils/access";
 import { sendError, sendSuccess, sendNotFound, sendForbidden } from "../utils/response";
 import type { Application } from "../types";
+import { stackLayersField } from "../shared-routes/stack-layers-view";
 import type { ApplicationAssessment } from "../types/assessment";
 import { rubricRouteKey } from "../scrapers";
 import { aiCaseOfficerService } from "../services/ai-case-officer.service";
@@ -120,7 +121,11 @@ export class AiCaseOfficerController {
     // Staff only (#43): a display name for who asked, never the uid. Applicants
     // get nothing, so the lookup is skipped for them.
     const requestedByName = await this.requesterNameFor(assessment, tier, req.authz?.role);
-    return envelope(assessment, tier, req.authz?.role, staleReason, requestedByName);
+    const env = envelope(assessment, tier, req.authz?.role, staleReason, requestedByName);
+    // (#237) Which layers of the rulebook stack the assessment ran on (keys =
+    // the findings' `layerKey`), with names and ready / missing. Layer names
+    // and status only, so it is served on every tier. Omitted on one layer.
+    return { ...env, meta: { ...env.meta, ...(await stackLayersField(assessment.rulebookLayers)) } };
   }
 
   /**

@@ -25,6 +25,7 @@ import { isAnswerType, rubricStore } from "../../scrapers";
 import { defaultRulebookStack, rulebookFor } from "./application-rulebook";
 import { visaService } from "../visa.service";
 import { documentRequestService } from "../document-request.service";
+import { publicStackLayers, type PublicStackLayer } from "../../shared-routes/stack-layers-view";
 import { buildChecklist, ChecklistItem, ChecklistState } from "./checklist-builder";
 import { applicantContextOf } from "./rule-applicability";
 import type { Application, DocumentRequest, DocumentRequestStatus } from "../../types";
@@ -43,6 +44,8 @@ export interface ChecklistView {
   emptyReason?: string;
   rubricVersion: number | null;
   items: ChecklistItemView[];
+  // (#237) The rulebook stack's layers (key = the items' `layerKey`); absent on a single-layer route.
+  stackLayers?: PublicStackLayer[];
 }
 
 /** Rebuild a ChecklistItem from a stored request (for items no longer on the list). */
@@ -87,13 +90,15 @@ class ChecklistService {
     // `scrapeMeta.citations`) are both on this branch, so the real types are used
     // here instead of the local casts #114 shipped with.
     const intake = application.intake;
-    return buildChecklist({
+    const built = buildChecklist({
       rubric,
       visaRecord: visaType,
       intakeAnswers: intake?.answers ?? null,
       // (#234) Rules triggered by what the applicant holds read the application's copy (today).
       applicantContext: applicantContextOf(application, new Date().toISOString().slice(0, 10)),
     });
+    // (#237) Carry the stack's layer list to the view (undefined on one layer).
+    return { ...built, layers: rubric?.stackLayers };
   }
 
   /** Join built items with stored requests; keep fulfilled leftovers visible. */
@@ -141,7 +146,13 @@ class ChecklistService {
       documentRequestService.listChecklistForApplication(application.id),
     ]);
     // Items not stored yet read as `documentRequestId: null` (not yet generated).
-    return this.join(built, stored);
+    return this.withLayers(this.join(built, stored), built.layers);
+  }
+
+  /** (#237) Add the app-facing `stackLayers` to a view. */
+  private async withLayers(view: ChecklistView, layers: Parameters<typeof publicStackLayers>[0]): Promise<ChecklistView> {
+    const stackLayers = await publicStackLayers(layers);
+    return stackLayers ? { ...view, stackLayers } : view;
   }
 
   /** Build, store (idempotent) and return the checklist. */
@@ -152,7 +163,7 @@ class ChecklistService {
       await documentRequestService.syncChecklist(application, built.items);
     }
     const stored = await documentRequestService.listChecklistForApplication(application.id);
-    return this.join(built, stored);
+    return this.withLayers(this.join(built, stored), built.layers);
   }
 }
 

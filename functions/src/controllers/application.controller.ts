@@ -27,6 +27,9 @@ import {
   sendNoContent,
   ErrorMessages,
 } from "../utils/response";
+import type { RulebookStackLayer } from "../types/rubric";
+import { withThroughCountryFlag } from "../shared-routes/through-country-rule";
+import { stackLayersField, type PublicStackLayer } from "../shared-routes/stack-layers-view";
 import {
   Application,
   ApplicationStatus,
@@ -119,7 +122,7 @@ export class ApplicationController {
       // the country and visa from that member's own record. The case's agency
       // (from its agent) decides which records may be used, exactly as for any
       // case, so an agency-only record of another agency is never used.
-      let throughCountry: { choice: ThroughCountryChoice; answers: Record<string, unknown> } | undefined;
+      let throughCountry: { choice: ThroughCountryChoice; answers: Record<string, unknown>; routeName?: string } | undefined;
       if (viaSharedRoute) {
         const caseAgencyId = await applicationService.resolveAgentAgencyId(mode === "agent" ? agentId : undefined);
         const resolved = await competenceService.resolveForCreate(
@@ -129,7 +132,7 @@ export class ApplicationController {
         );
         countryCode = resolved.countryCode;
         visaTypeId = resolved.visaTypeId;
-        throughCountry = { choice: resolved.choice, answers: resolved.answers };
+        throughCountry = { choice: resolved.choice, answers: resolved.answers, routeName: resolved.routeName };
       }
 
       // Duplicate guard (#253): the user already has a live application for
@@ -160,6 +163,7 @@ export class ApplicationController {
                 id: existing.id,
                 visaTypeName: existing.visaTypeName,
                 countryName: existing.countryName,
+                ...(existing.routeName ? { routeName: existing.routeName } : {}),
                 status: existing.status,
                 progress: existing.progress,
                 mode: existing.mode,
@@ -191,7 +195,7 @@ export class ApplicationController {
         throughCountry,
       });
 
-      sendCreated(res, application, "Application created successfully");
+      sendCreated(res, withThroughCountryFlag(application), "Application created successfully");
     } catch (error) {
       // Issue #235: the "apply through" refusals carry their own status and plain message.
       if (error instanceof CompetenceError) {
@@ -600,7 +604,7 @@ export class ApplicationController {
       applications = applications.map(withoutApplicantFacts);
 
       // Resolve who is handling each case so client-facing UIs can name them.
-      sendSuccess(res, await this.withHandlerNames(applications));
+      sendSuccess(res, (await this.withHandlerNames(applications)).map(withThroughCountryFlag));
     } catch (error) {
       console.error("Error getting applications:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -633,7 +637,7 @@ export class ApplicationController {
       }
 
       const [enriched] = await this.withHandlerNames([application]);
-      sendSuccess(res, enriched);
+      sendSuccess(res, withThroughCountryFlag(enriched));
     } catch (error) {
       console.error("Error getting application:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -657,7 +661,7 @@ export class ApplicationController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
-      sendSuccess(res, await intakeService.getIntake(application));
+      sendSuccess(res, await this.withStackLayers(await intakeService.getIntake(application)));
     } catch (error) {
       console.error("Error getting application intake:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -682,7 +686,7 @@ export class ApplicationController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
-      sendSuccess(res, await intakeService.saveIntake(application, req.body?.answers));
+      sendSuccess(res, await this.withStackLayers(await intakeService.saveIntake(application, req.body?.answers)));
     } catch (error) {
       if (error instanceof IntakeValidationError) {
         sendError(res, "VALIDATION_ERROR", error.message, 400);
@@ -730,7 +734,7 @@ export class ApplicationController {
         return;
       }
       const result = await competenceService.changeThroughCountry(application, body.throughCountryCode, { uid: req.userId!, role: req.authz?.role });
-      sendSuccess(res, result);
+      sendSuccess(res, { ...result, application: withThroughCountryFlag(result.application) });
     } catch (error) {
       if (error instanceof CompetenceError) {
         sendError(res, error.code, error.message, error.status);
@@ -949,7 +953,7 @@ export class ApplicationController {
           .catch((e) => console.error("[application] assign notify failed:", e));
       }
 
-      sendSuccess(res, updated, "Application updated successfully");
+      sendSuccess(res, updated ? withThroughCountryFlag(updated) : updated, "Application updated successfully");
     } catch (error) {
       console.error("Error updating application:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -1146,7 +1150,7 @@ export class ApplicationController {
         actorName,
       });
 
-      sendSuccess(res, updated, "Status updated successfully");
+      sendSuccess(res, updated ? withThroughCountryFlag(updated) : updated, "Status updated successfully");
     } catch (error) {
       console.error("Error updating status:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -1228,6 +1232,11 @@ export class ApplicationController {
    * NOTE `Application.agentId` is a USER uid (unlike Conversation.agentId, which
    * is an agent DOC id), so agents are resolved by querying on `userId`.
    */
+  /** (#237) Add the app-facing `stackLayers` to an intake response (from its `layers`; omitted on a single-layer route). */
+  private async withStackLayers<T extends { layers?: RulebookStackLayer[] }>(intake: T): Promise<T & { stackLayers?: PublicStackLayer[] }> {
+    return { ...intake, ...(await stackLayersField(intake.layers)) };
+  }
+
   private async withHandlerNames(
     applications: Application[]
   ): Promise<Application[]> {
