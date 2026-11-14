@@ -1418,6 +1418,14 @@ export type NotificationType =
   // (issue #123), raised only from an ADMIN-APPROVED change. Staff get the
   // detail; an applicant only ever gets a neutral, factual notice.
   | "rule_change_alert"
+  // Self-service applicant notices (issue #266). Sent ONLY for an application the
+  // applicant runs alone (see `isSelfServiceApplication`); agent cases keep their
+  // agent-side notices. All four set relatedEntityType "application" and
+  // relatedEntityId = the application id, so the mobile app can open it.
+  | "readiness_review_ready" // The readiness review finished (in_app + push + email)
+  | "document_check_problems" // An upload check found something to fix
+  | "document_check_could_not_check" // An upload was saved but could not be checked
+  | "document_check_passed" // An upload check passed (in_app only)
   // Documents
   | "document_status"
   | "document_uploaded" // Client uploaded a document for review

@@ -35,6 +35,12 @@ interface EventTemplate {
    */
   subject?: string;
   actionLabel: string;
+  /**
+   * When true the email carries NO button or link (resolved `actionUrl` is "").
+   * For events a mobile-only applicant gets: the portal paths above would not
+   * work for them, and no mobile universal link exists yet (issue #266).
+   */
+  noLink?: boolean;
   /** Relative path (joined to APP_URL) for the CTA, derived from the context. */
   path?: (ctx: EventEmailContext) => string | undefined;
 }
@@ -128,6 +134,15 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     subject: "An application was withdrawn",
     actionLabel: "View case",
     path: casePath,
+  },
+
+  // Self-service readiness review (#266). The applicant uses the mobile app, so
+  // there is no web link: the body tells them to open the Seli app. Only this
+  // type has an email; the document-check notices are app-only.
+  readiness_review_ready: {
+    subject: "Your readiness review is ready",
+    actionLabel: "Open Seli",
+    noLink: true,
   },
 
   // Documents
@@ -361,6 +376,7 @@ export function resolveEventEmail(
     subject: template?.subject ?? ctx.title,
     actionLabel: template?.actionLabel ?? `Open ${EMAIL_BRANDING.appName}`,
     // Caller's explicit deep link wins; else the template's path; else app home.
-    actionUrl: ctx.actionUrl ?? toUrl(template?.path?.(ctx)) ?? EMAIL_BRANDING.appUrl,
+    // `noLink` templates never carry a link, even if the caller passed one.
+    actionUrl: template?.noLink ? "" : ctx.actionUrl ?? toUrl(template?.path?.(ctx)) ?? EMAIL_BRANDING.appUrl,
   };
 }

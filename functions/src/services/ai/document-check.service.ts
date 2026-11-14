@@ -3,11 +3,13 @@ import { Timestamp, type DocumentReference, type Transaction } from "firebase-ad
 import { getStorage } from "firebase-admin/storage";
 import { collections, db } from "../../utils/firebase";
 import { validateStoragePath } from "../../utils/storage-paths";
+import { isSelfServiceApplication } from "../../utils/self-service";
+import { notificationService } from "../notification.service";
 import { rubricStore, type VisaRubric } from "../../scrapers";
 import type { Application, Document, DocumentRequest, User } from "../../types";
 import type { DocumentCheckRecord } from "../../types/document-check";
 import { readAiSettings, type AiSettingsRead } from "./ai-settings";
-import { CHECK_FIELDS, COULD_NOT_CHECK_MESSAGES, evaluateDocumentCheck, expectationsFor, maskName, rawFactsOf, type CouldNotCheckCode, type RawFacts } from "./document-check-engine";
+import { CHECK_FIELDS, COULD_NOT_CHECK_MESSAGES, evaluateDocumentCheck, expectationsFor, hasFix, maskName, rawFactsOf, type CouldNotCheckCode, type RawFacts } from "./document-check-engine";
 import { extractOneDocument, type ExtractionFailureCode } from "./document-extraction";
 import { AnthropicLlmProvider, type LlmProvider } from "./llm-provider";
 import { ASSESSMENT_PROMPT_VERSION } from "./prompt-safety";
@@ -325,6 +327,86 @@ export class DocumentCheckService {
       const code: CouldNotCheckCode = err instanceof CheckStop ? err.code : "unavailable";
       // Only the code is kept: never the error text (it could hold request detail).
       await this.finish(ref, { ...(err instanceof CheckStop ? err.extra : {}), status: "could_not_check", reason: { code, message: COULD_NOT_CHECK_MESSAGES[code] } });
+    }
+  }
+
+  /**
+   * Issue #266: tell a SELF-SERVICE applicant how a check ended. Called by the
+   * worker after `runJob`; reads the stored record, so it sees the final status
+   * whichever path set it (`done`, or `could_not_check` from a stop, a timeout or
+   * a failure) and does nothing for a record that is not final (still queued or
+   * running, or missing).
+   *
+   *   done + a `fix`      -> document_check_problems       (in_app + push)
+   *   could_not_check     -> document_check_could_not_check (in_app + push)
+   *   done, no `fix`      -> document_check_passed          (in_app only)
+   *
+   * One notice per check RUN: the claim id carries `requestedAt`, which a retry or
+   * re-upload resets, so a new run notifies again and a duplicate delivery does not.
+   * Agent cases (agentId / agencyId on the application) never get these.
+   *
+   * NEVER throws and never writes to the check record. The copy names the document
+   * by its request's `documentType` only: no extracted value, no check detail.
+   */
+  async notifyApplicant(documentId: string): Promise<void> {
+    try {
+      const rec = await this.getByDocumentId(documentId);
+      if (!rec || (rec.status !== "done" && rec.status !== "could_not_check")) return;
+
+      const appSnap = await collections.applications.doc(rec.applicationId).get();
+      if (!appSnap.exists) return;
+      const app = { id: appSnap.id, ...appSnap.data() } as Application;
+      if (!isSelfServiceApplication(app)) return;
+
+      // Pick the notice from the final status.
+      let type: "document_check_problems" | "document_check_could_not_check" | "document_check_passed";
+      if (rec.status === "could_not_check") type = "document_check_could_not_check";
+      else type = rec.checks && hasFix(rec.checks) ? "document_check_problems" : "document_check_passed";
+
+      // One claim per check run: `create()` fails if a duplicate delivery got here first.
+      try {
+        await collections.documentCheckNotifications.doc(`${documentId}_${rec.requestedAt.toMillis()}`).create({
+          applicationId: rec.applicationId,
+          userId: app.userId,
+          type,
+          createdAt: Timestamp.fromDate(this.deps.now()),
+        });
+      } catch {
+        return;
+      }
+
+      // The document is named the way the applicant knows it, e.g. "Bank statement".
+      const reqSnap = await collections.documentRequests.doc(rec.documentRequestId).get();
+      const raw = reqSnap.exists ? (reqSnap.data() as { documentType?: string }).documentType : undefined;
+      const name = typeof raw === "string" && raw.trim() ? raw.trim() : "document";
+      // Sentence-start form: "Bank statement" reads fine; the fallback "document" is capitalised.
+      const lead = name.charAt(0).toUpperCase() + name.slice(1);
+
+      const copy = {
+        document_check_problems: {
+          title: `${lead}: something to fix`,
+          body: `We looked at your ${name} and found something to fix. Open the Seli app to see what.`,
+        },
+        document_check_could_not_check: {
+          title: `${lead}: we couldn’t check it`,
+          body: `Your ${name} is saved, but we couldn’t check it just now. Open the Seli app to see why.`,
+        },
+        document_check_passed: {
+          title: `${lead} looks good`,
+          body: `Your ${name} looks good.`,
+        },
+      }[type];
+
+      await notificationService.notifyUser({
+        userId: app.userId,
+        type,
+        title: copy.title,
+        body: copy.body,
+        relatedEntityType: "application",
+        relatedEntityId: app.id,
+      });
+    } catch (err) {
+      console.error(`[document-check] applicant notify failed for ${documentId}: ${(err as Error).name}`);
     }
   }
 

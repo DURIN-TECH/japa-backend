@@ -765,7 +765,8 @@ export const onNewsArticleCreated = functions.firestore
 // memory follow the crawler's pattern (540 s, the Gen-1 maximum). The memory is
 // for holding one attached document at a time.
 export const processAssessmentJob = functions
-  .runWith({ secrets: [...AI_SECRETS], timeoutSeconds: 540, memory: "1GB" })
+  // EMAIL_SECRETS too (#266): the self-service readiness notice sends an email.
+  .runWith({ secrets: [...AI_SECRETS, ...EMAIL_SECRETS], timeoutSeconds: 540, memory: "1GB" })
   .firestore.document("applicationAssessments/{assessmentId}")
   .onWrite(async (change, context) => {
     if (!change.after.exists) return;
@@ -777,7 +778,12 @@ export const processAssessmentJob = functions
     const result = await aiCaseOfficerService.runJob(context.params.assessmentId);
     // Issue #117: after a successful AUTO-run, tell the assigned agent once if the
     // findings changed. No-op for manual runs, failures, and an identical finding set.
-    if (result === "succeeded") await assessmentAutoRunService.notifyIfNew(context.params.assessmentId);
+    if (result === "succeeded") {
+      await assessmentAutoRunService.notifyIfNew(context.params.assessmentId);
+      // #266: a self-service applicant hears that their readiness review is ready.
+      // Never throws; a no-op for agent cases, failures and an unchanged result.
+      await assessmentAutoRunService.notifyApplicantIfReady(context.params.assessmentId);
+    }
   });
 
 // ============================================
@@ -1136,6 +1142,9 @@ export const processDocumentCheck = functions
     const before = change.before.exists ? change.before.data() ?? {} : {};
     if (after.status !== "queued" || before.status === "queued") return;
     await documentCheckService.runJob(context.params.documentId);
+    // #266: tell a self-service applicant how the check ended. Never throws, and
+    // does nothing unless the job reached a final status. No email, so no new secret.
+    await documentCheckService.notifyApplicant(context.params.documentId);
   });
 
 // ============================================
