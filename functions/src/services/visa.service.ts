@@ -16,8 +16,7 @@ import {
 import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 // Approval guard for visas with no usable USD cost (issue #59).
 import { deriveRequirementsFromScrape } from "./visa-requirements-derive";
-import { assertVisaApprovable } from "../scrapers";
-import { assertMissingItemsAcknowledged } from "../scrapers/visa-catalog/missing-items-gate";
+import { assertVisaApprovable, assertMissingItemsAcknowledged } from "../scrapers";
 // Finite-only min for the denormalized country stats.
 import { finiteMin } from "../scrapers";
 // Manual USD cost on a pending scraped visa (issue #70): pure rules.

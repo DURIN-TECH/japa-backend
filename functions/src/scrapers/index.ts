@@ -59,6 +59,8 @@ export { scrapeCostService } from "./shared/cost/scrape-cost.service";
 export { assertVisaApprovable, isIso4217, VisaFeeNotConvertibleError } from "./visa-catalog/visa-catalog-fx";
 /** Finite-only min for the denormalized country stats. */
 export { finiteMin } from "./visa-catalog/visa-catalog-meta";
+// Issue #212: the approve gate for page items the extractor missed (pure module).
+export { assertMissingItemsAcknowledged, MissingItemsUnacknowledgedError } from "./visa-catalog/missing-items-gate";
 /** Manual USD cost on a pending scraped visa (#70). */
 export { ManualCostError, parseManualCostInput, planManualCost } from "./visa-catalog/visa-manual-cost";
 export type { ManualCostInput } from "./visa-catalog/visa-manual-cost";

@@ -10,9 +10,8 @@ import {
 import { VisaCategory, VisaType } from "../types";
 // Agency drafts can't be reviewed (issue #100).
 import { VisaIsDraftError } from "../services/visa.service";
-import { MissingItemsUnacknowledgedError } from "../scrapers/visa-catalog/missing-items-gate";
 // Typed error from the approval guard (fee not converted to USD, issue #59).
-import { VisaFeeNotConvertibleError } from "../scrapers";
+import { MissingItemsUnacknowledgedError, VisaFeeNotConvertibleError } from "../scrapers";
 // Manual USD cost (issue #70): CASL gate, body validation, typed errors.
 import { asSubject, can, forbidden } from "../middleware/authz";
 import { ManualCostError, parseManualCostInput } from "../scrapers";

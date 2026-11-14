@@ -798,10 +798,11 @@ describe("requiredDocuments diff — shrink guard (issue #212)", () => {
   test("an empty proposed list shows every live item as removed; a newer shrinking extraction replaces the open row", async () => {
     await seedLiveWithDocs(["a passport", "a photo"]);
     await ingest(extraction(docs([])), "h2");
-    let [id, row] = onlyRow();
+    const [id, first] = onlyRow();
+    let row = first;
     assert.deepEqual((row.diff as any[]).find((x) => x.field === "requiredDocuments").removed, ["a passport", "a photo"]);
     await ingest(extraction(docs(["a photo"])), "h3");
-    [, row] = onlyRow();
+    row = onlyRow()[1];
     assert.equal(onlyRow()[0], id);
     assert.equal(row.revision, 2);
     assert.deepEqual((row.diff as any[]).find((x) => x.field === "requiredDocuments").removed, ["a passport"]);
