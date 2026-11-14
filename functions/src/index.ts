@@ -91,6 +91,9 @@ import { guidanceCrawlService } from "./scrapers";
 import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
 import { notificationService } from "./services/notification.service";
+// Issue #181: payment-request amounts in copy, with explicit currency codes.
+import { describeRequestAmount } from "./services/payment-request-charge.service";
+import type { PaymentRequest } from "./types";
 import { unreadMessageReminderService } from "./services/unread-message-reminder.service";
 import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
@@ -312,12 +315,15 @@ export const onPaymentRequestCreated = functions
     console.log(`New payment request created: ${context.params.requestId}`);
 
     try {
-      const amountDisplay = (request.amount / 100).toLocaleString();
+      // Issue #181: the amount with an explicit currency code ("USD 150.00"
+      // for a dollar request, "NGN 25,000.00" for a legacy one), never a
+      // hard-coded naira sign or a hand-made `/ 100`.
+      const amountDisplay = describeRequestAmount(request as PaymentRequest);
       await notificationService.notifyUser({
         userId: request.clientId,
         type: "payment_request",
         title: "New Payment Request",
-        body: `Your agent requests ₦${amountDisplay} for ${request.description}.`,
+        body: `Your agent requests ${amountDisplay} for ${request.description}.`,
         relatedEntityType: "payment_request",
         relatedEntityId: context.params.requestId,
         data: request.applicationId

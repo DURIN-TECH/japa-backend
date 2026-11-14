@@ -1,29 +1,47 @@
 import { collections, serverTimestamp } from "../utils/firebase";
 import { PaymentRequest, PaymentRequestStatus, PaymentRequestCategory } from "../types";
+import type { Money } from "../types/money";
 import { Timestamp } from "firebase-admin/firestore";
 
+/**
+ * What the controller hands over to create a request (issue #181): the
+ * dollar price as `Money` (already validated with parseUsdPriceInput), never
+ * a bare number and never a client-chosen currency.
+ */
 export interface CreatePaymentRequestInput {
   applicationId: string;
+  /** The requesting agent's profile id (`agents/{id}`). */
   agentId: string;
   agencyId?: string;
   clientId: string;
   clientName: string;
   clientEmail: string;
-  amount: number;
-  currency: string;
+  /** The price in US dollars ({ amountMinor: cents, currency: "USD" }). */
+  priceUsd: Money;
   description: string;
   category: PaymentRequestCategory;
 }
 
 class PaymentRequestService {
   /**
-   * Create a new payment request
+   * Create a new payment request (pending). Issue #181: stored in dollars; no
+   * rate is read until the client starts checkout.
    */
   async createPaymentRequest(input: CreatePaymentRequestInput): Promise<PaymentRequest> {
+    if (input.priceUsd.currency !== "USD") {
+      // The controller only ever passes parseUsdPriceInput's result; anything
+      // else is a bug, and must never be stored as a request.
+      throw new Error("A payment request is priced in US dollars");
+    }
     const ref = collections.paymentRequests.doc();
     const paymentRequest: Omit<PaymentRequest, "id"> & { id: string } = {
       id: ref.id,
       ...input,
+      priceUsd: { amountMinor: input.priceUsd.amountMinor, currency: "USD" },
+      // Mirror of `priceUsd` for readers that show `amount` in minor units of
+      // `currency` (the portal list): US cents, "USD". Never kobo any more.
+      amount: input.priceUsd.amountMinor,
+      currency: "USD",
       status: "pending",
       createdAt: serverTimestamp() as unknown as Timestamp,
       updatedAt: serverTimestamp() as unknown as Timestamp,

@@ -154,26 +154,6 @@ export class PaystackProvider implements BillingProvider {
   }
 
   /**
-   * Legacy naira one-off charge, kept ONLY for the payment-request flow until
-   * #181 moves it onto `initializeCharge` with its own stored currency.
-   * `amountKobo` is the charge in the smallest NGN unit. Consultations no
-   * longer use this (issue #180).
-   */
-  async initializeOneOffCharge(input: {
-    email: string;
-    amountKobo: number;
-    metadata?: Record<string, unknown>;
-    callbackUrl?: string;
-  }): Promise<{ authorizationUrl: string; reference: string }> {
-    return this.initializeCharge({
-      email: input.email,
-      amount: { amountMinor: input.amountKobo, currency: "NGN" },
-      metadata: input.metadata,
-      callbackUrl: input.callbackUrl,
-    });
-  }
-
-  /**
    * Ensure a Paystack Plan exists for a recurring package and return its `plan_code`.
    * Paystack only auto-recurs against a Plan object, so each paid package needs one.
    * Our `interval` ("month"/"year") maps to Paystack's cadence vocabulary
@@ -288,22 +268,7 @@ export class PaystackProvider implements BillingProvider {
     }>(`/transaction/verify/${encodeURIComponent(reference)}`);
     const data = res.data.data;
     if (!data) return null;
-    const paidAtRaw = data.paid_at ?? data.paidAt;
-    return {
-      status: data.status,
-      metadata: data.metadata ?? {},
-      amount: typeof data.amount === "number" && Number.isSafeInteger(data.amount) ? data.amount : undefined,
-      // What WE asked for. When the account passes Paystack's fees to the
-      // customer, `amount` includes those fees and `requested_amount` holds
-      // the original; the consultation charge check compares this one when
-      // present (issue #180 review).
-      // (Only set when well-formed, so callers fall back to `amount` otherwise.)
-      ...(typeof data.requested_amount === "number" && Number.isSafeInteger(data.requested_amount)
-        ? { requestedAmount: data.requested_amount }
-        : {}),
-      currency: typeof data.currency === "string" ? data.currency.toUpperCase() : undefined,
-      paidAt: typeof paidAtRaw === "string" && paidAtRaw ? paidAtRaw : undefined,
-    };
+    return toTransactionLookup(data);
   }
 
   async cancelSubscription(providerRef: string): Promise<void> {
@@ -441,6 +406,42 @@ export interface PaystackTransactionLookup {
   currency?: string;
   /** When the payment completed (ISO 8601), when Paystack reports it. */
   paidAt?: string;
+}
+
+/**
+ * Turn a Paystack transaction payload (the `data` of transaction/verify, or
+ * of a signature-verified `charge.success` webhook) into the lookup shape
+ * the charge paths compare against. Issue #181: shared by verify and the
+ * payment-request webhook, so both read amount, currency and payment time the
+ * same way. Each field is undefined when the payload does not carry a
+ * well-formed value; callers treat undefined as a mismatch, never as a match.
+ */
+export function toTransactionLookup(data: {
+  status?: unknown;
+  metadata?: unknown;
+  amount?: unknown;
+  requested_amount?: unknown;
+  currency?: unknown;
+  paid_at?: unknown;
+  paidAt?: unknown;
+}): PaystackTransactionLookup {
+  const paidAtRaw = data.paid_at ?? data.paidAt;
+  const metadata = data.metadata && typeof data.metadata === "object" ? (data.metadata as Record<string, unknown>) : {};
+  return {
+    status: typeof data.status === "string" ? data.status : "",
+    metadata,
+    amount: typeof data.amount === "number" && Number.isSafeInteger(data.amount) ? data.amount : undefined,
+    // What WE asked for. When the account passes Paystack's fees to the
+    // customer, `amount` includes those fees and `requested_amount` holds
+    // the original; the charge checks compare this one when present (issue
+    // #180 review). Only set when well-formed, so callers fall back to
+    // `amount` otherwise.
+    ...(typeof data.requested_amount === "number" && Number.isSafeInteger(data.requested_amount)
+      ? { requestedAmount: data.requested_amount }
+      : {}),
+    currency: typeof data.currency === "string" ? data.currency.toUpperCase() : undefined,
+    paidAt: typeof paidAtRaw === "string" && paidAtRaw ? paidAtRaw : undefined,
+  };
 }
 
 interface PaystackMetadata {

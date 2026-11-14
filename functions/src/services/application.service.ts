@@ -2,7 +2,6 @@ import {
   collections,
   subcollections,
   serverTimestamp,
-  increment,
 } from "../utils/firebase";
 import {
   Application,
@@ -18,6 +17,21 @@ import { noteService } from "./note.service";
 // Case-start rule for agency visas (issue #102). Imported from its file, not
 // the agency-visas index, so this service does not pull in routes.
 import { canStartCaseOnVisa } from "../agency-visas/agency-visa-access";
+import { fromMajor } from "../money/money";
+import { getCurrencyInfo } from "../money/currencies";
+
+/**
+ * A dollar figure from a visa record (`baseCostUsd`, a plain number of
+ * dollars) as US cents, through the currency table (issue #181: no literal
+ * `* 100`). A value with more decimals than USD has is rounded to the cent
+ * first (it is a published fee, not a payment); anything that is not a
+ * finite, non-negative number counts as 0 (no total yet).
+ */
+export function usdCentsFromDollars(dollars: unknown): number {
+  if (typeof dollars !== "number" || !Number.isFinite(dollars) || dollars < 0) return 0;
+  const exponent = getCurrencyInfo("USD")!.exponent;
+  return fromMajor(dollars.toFixed(exponent), "USD").amountMinor;
+}
 
 export interface CreateApplicationInput {
   visaTypeId: string;
@@ -132,8 +146,11 @@ class ApplicationService {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: visaType.baseCostUsd * 100, // Convert to cents
+      // Issue #181: US cents with an explicit currency (see Application in
+      // types/index.ts). Converted through the currency table, never `* 100`.
+      totalCost: usdCentsFromDollars(visaType.baseCostUsd),
       amountPaid: 0,
+      costCurrency: "USD",
       paymentStatus: "pending",
       userNotes: input.userNotes,
       agentNotes: input.agentNotes,
@@ -485,40 +502,6 @@ class ApplicationService {
     }
 
     await collections.applications.doc(applicationId).update(updates);
-  }
-
-  /**
-   * Atomically increment the amountPaid on an application
-   * and recalculate paymentStatus based on totalCost.
-   */
-  async incrementAmountPaid(applicationId: string, amount: number): Promise<void> {
-    const appRef = collections.applications.doc(applicationId);
-    const doc = await appRef.get();
-
-    if (!doc.exists) {
-      throw new Error("Application not found");
-    }
-
-    const application = doc.data() as Application;
-    const newAmountPaid = (application.amountPaid || 0) + amount;
-    const totalCost = application.totalCost || 0;
-
-    // Determine new payment status
-    let paymentStatus: PaymentStatus;
-    if (newAmountPaid >= totalCost && totalCost > 0) {
-      paymentStatus = "paid";
-    } else if (newAmountPaid > 0) {
-      paymentStatus = "partial";
-    } else {
-      paymentStatus = "pending";
-    }
-
-    await appRef.update({
-      amountPaid: increment(amount),
-      paymentStatus,
-      updatedAt: serverTimestamp(),
-      lastUpdated: serverTimestamp(),
-    });
   }
 
   // ============================================
