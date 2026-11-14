@@ -20,7 +20,8 @@ export interface StoredProviderRate {
    * fresh, while a provider that stops answering ages out.
    */
   fetchedAt: Date;
-  source: Exclude<FxRateSource, "manual">;
+  /** Only a provider writes this map, so it never says "manual" or "hold". */
+  source: Exclude<FxRateSource, "manual" | "hold">;
 }
 
 /** An admin-entered rate, valid until `expiresAt`. */
@@ -44,6 +45,27 @@ export interface StoredOverride {
    * unreferenced one (see `isUnreferencedOverride`), which fails safe.
    */
   referenceRate?: number;
+}
+
+/**
+ * An admin HOLD (pin) of a currency's rate (issue #241), valid until
+ * `expiresAt` (1-168h after `setAt`).
+ *
+ * Why it exists: CBN is always in the provider chain, so when CBN lags a real
+ * devaluation by more than the 10% band (and OANDA has no key) an override of
+ * the true rate is superseded at CBN's next refresh. A hold is the explicit
+ * "price at this rate for now" switch: while it is active it IS the effective
+ * rate (source `hold`), ahead of any override and whatever the provider says
+ * or however fresh it is. Refreshes still fetch and store the provider rate
+ * behind it (same guards), so the admin overview can show the gap and normal
+ * rules resume the moment the hold expires or is cleared.
+ */
+export interface StoredHold {
+  rate: number;
+  reason: string;
+  setBy: string;
+  setAt: Date;
+  expiresAt: Date;
 }
 
 /**
@@ -89,6 +111,12 @@ export interface StoredRate {
   currency: CurrencyCode;
   provider: StoredProviderRate | null;
   override: StoredOverride | null;
+  /**
+   * Issue #241: an admin hold (see StoredHold), or null/absent when none.
+   * Optional so docs and test fixtures written before #241 still type-check;
+   * absent and null mean the same thing.
+   */
+  hold?: StoredHold | null;
   /** Last failed provider attempt (message only, never a secret). */
   lastError: { at: Date; message: string } | null;
   /**
@@ -97,6 +125,14 @@ export interface StoredRate {
    * unreferenced path over a damaged reference.
    */
   providerCorrupt?: boolean;
+  /**
+   * Issue #241 (review): true when a `hold` map exists in storage but cannot
+   * be read (a console edit, a bad migration). `hold` is then null, so
+   * pricing follows the normal rules (override / provider / typed error), but
+   * the admin overview flags it (HOLD_CORRUPT) and DELETE .../hold can clear
+   * the map. Absent means false.
+   */
+  holdCorrupt?: boolean;
   /**
    * When an admin last asked for a refresh now (issue #214). Used only to
    * rate-limit POST /admin/exchange-rates/:currency/refresh.
@@ -107,18 +143,34 @@ export interface StoredRate {
 /** One append-only audit record per admin change (who, when, old, new). */
 export interface RateAuditEntry {
   currency: CurrencyCode;
-  action: "override_set" | "override_cleared" | "provider_reset" | "provider_refresh";
+  /** `hold_set` / `hold_cleared` added by issue #241. */
+  action: "override_set" | "override_cleared" | "provider_reset" | "provider_refresh" | "hold_set" | "hold_cleared";
   by: string;
   at: Date;
   reason: string;
   /** The effective rate before the change (null when none existed). */
   old: { rate: number; source: FxRateSource } | null;
-  /** The effective rate after the change (null when none). */
+  /**
+   * The effective rate after the change (null when none). Exception,
+   * override_set: the override the admin entered (`source: "manual"`), so the
+   * rate they typed is always on record even when something else prices
+   * (issue #241 review); the rate really in effect is then in `effective`.
+   */
   new: { rate: number; source: FxRateSource } | null;
+  /**
+   * override_set only (issue #241 review): the rate really in effect right
+   * after the change. Usually the override itself; an active hold outranks
+   * it, and null means nothing usable prices.
+   */
+  effective?: { rate: number; source: FxRateSource } | null;
+  /** hold_cleared only (issue #241 review): the map cleared was unreadable. */
+  holdCorrupt?: boolean;
   /** True when no provider rate existed to check the band against. */
   unreferenced?: boolean;
   /** provider_refresh only: what the refresh did ("ok: cbn 1500" or "failed: ..."). */
   outcome?: string;
+  /** hold_set only (issue #241): when the new hold expires. */
+  holdExpiresAt?: Date;
 }
 
 /**
@@ -128,10 +180,18 @@ export interface RateAuditEntry {
 export interface RateMutation {
   /** New override, or null to clear it; undefined leaves it as is. */
   override?: StoredOverride | null;
+  /** Issue #241: new hold, or null to clear it; undefined leaves it as is. */
+  hold?: StoredHold | null;
   /** True drops the stored provider rate (and any "corrupt" flag with it). */
   clearProvider?: boolean;
   /** The audit record; written in the same transaction as the change. */
   audit: RateAuditEntry;
+  /**
+   * Issue #241: further audit records for the same change, written in the
+   * same transaction (e.g. a reset-reference that also clears a superseded
+   * override writes `provider_reset` AND `override_cleared`).
+   */
+  extraAudits?: RateAuditEntry[];
 }
 
 /**
@@ -141,7 +201,10 @@ export interface RateMutation {
  * write (null when there is none), i.e. the override that now sits in front
  * of the rate just stored.
  */
-export type SaveProviderResult = { saved: false } | { saved: true; override: StoredOverride | null };
+export type SaveProviderResult =
+  | { saved: false }
+  /** Issue #241: `hold` is the doc's hold as re-read in the same transaction (null when none). */
+  | { saved: true; override: StoredOverride | null; hold: StoredHold | null };
 
 /** Persistence for rate docs and the audit trail. */
 export interface RateStore {

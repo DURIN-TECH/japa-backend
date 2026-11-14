@@ -1,5 +1,5 @@
 import type { CurrenciesConfig, CurrencyCode, ExchangeRate } from "../types/money";
-import { assertChargeable, MAX_OVERRIDE_TTL_HOURS, parseCurrenciesConfig, type ConfigStore } from "./config";
+import { assertChargeable, MAX_HOLD_TTL_HOURS, MAX_OVERRIDE_TTL_HOURS, parseCurrenciesConfig, type ConfigStore } from "./config";
 import { MAX_RATE, scaleRate } from "./money";
 import { MoneyError } from "./errors";
 import { normalizeCurrencyCode } from "./currencies";
@@ -9,6 +9,7 @@ import {
   isUnreferencedOverride,
   type RateAuditEntry,
   type RateStore,
+  type StoredHold,
   type StoredOverride,
   type StoredProviderRate,
   type StoredRate,
@@ -22,6 +23,9 @@ import {
 // and lets an admin override it.
 //
 // Which rate is "effective" for a currency, in order:
+//  0. an admin HOLD that has not expired (source "hold", issue #241). It
+//     outranks any override and does not depend on the provider rate's
+//     freshness: only its own expiry (1-168h) ends it;
 //  1. an admin override that has not expired (source "manual"), unless it
 //     is unreferenced and a fresh provider rate is out of its band (#229);
 //  2. the provider's last rate, if the provider confirmed it within the
@@ -55,9 +59,35 @@ import {
 //  - refreshNow audits every outcome (try/finally), including store errors,
 //    and gives the 5-minute slot back when it failed before the provider was
 //    contacted.
+//
+// Issue #241 (from the #229 round-2 review):
+//  - an admin can HOLD (pin) a currency's rate for 1-168h: PUT/DELETE
+//    /admin/exchange-rates/:currency/hold. CBN is always in the provider
+//    chain, so when it lags a real devaluation by more than the 10% band an
+//    override of the true rate would be superseded at CBN's next refresh; a
+//    hold is not. While held, scheduled and manual refreshes still fetch and
+//    store the provider rate (same guards) so the overview shows the gap, but
+//    the effective rate stays the held one. The held rate must sit inside the
+//    plausible range, and a hold cannot be set over a corrupt provider map;
+//    each change is written with its audit entry (hold_set / hold_cleared) in
+//    one transaction;
+//  - a provider map damaged outside the app counts as DISAGREEING for an
+//    unreferenced or legacy override, so a superseded override cannot price
+//    again once the map is damaged;
+//  - reset-reference also clears an active unreferenced (or legacy) override
+//    that the provider rate being reset had superseded (audited), so the
+//    reset does not bring it back for the rest of its 24h.
 
 /** Hours -> milliseconds. */
 const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * Issue #241 review: clock skew allowed when re-checking a stored hold's
+ * expiry against the 168h cap. The hold's `setAt` comes from whichever
+ * instance set it; an instance whose clock runs slightly behind must not
+ * drop a legitimate 168h hold as "too long".
+ */
+const HOLD_CLOCK_SKEW_MS = 5 * 60 * 1000;
 /**
  * An unreferenced override (set while no provider rate existed) lasts at most
  * this long (issue #214), whatever TTL was asked for: with nothing to check it
@@ -111,14 +141,50 @@ export interface RefreshOutcome {
   warning?: string;
 }
 
-/** A problem with a currency's active override, shown in the admin overview (issue #214). */
+/** A problem with a currency's active override or hold, shown in the admin overview (issue #214). */
 export interface RateWarning {
   /**
    * OVERRIDE_SUPERSEDED (issue #229): an unreferenced or legacy override is
-   * being ignored because a fresh provider rate is out of its band.
+   * being ignored because a stored provider rate is out of its band (or,
+   * since #241, the provider map is unreadable).
+   * HOLD_OUTSIDE_PROVIDER_BAND (issue #241): the held rate is more than
+   * `overrideBandPercent` away from the latest stored provider rate.
+   * HOLD_CORRUPT (issue #241 review): the stored hold map is unreadable. It
+   * is ignored for pricing (the normal rules apply); DELETE .../hold clears it.
+   * HOLD_INVALID (issue #241 review): the stored hold reads fine but fails the
+   * checks it was set under (plausible range, 168h expiry cap), so it was
+   * changed outside the API. It is ignored for pricing too.
    */
-  code: "OVERRIDE_OUTSIDE_PROVIDER_BAND" | "OVERRIDE_UNREFERENCED" | "OVERRIDE_SUPERSEDED";
+  code:
+    | "OVERRIDE_OUTSIDE_PROVIDER_BAND"
+    | "OVERRIDE_UNREFERENCED"
+    | "OVERRIDE_SUPERSEDED"
+    | "HOLD_OUTSIDE_PROVIDER_BAND"
+    | "HOLD_CORRUPT"
+    | "HOLD_INVALID";
   message: string;
+}
+
+/**
+ * Issue #241: an active hold as shown in the admin overview, next to the
+ * latest stored provider rate and the gap between them.
+ */
+export interface HoldView {
+  rate: number;
+  reason: string;
+  setBy: string;
+  setAt: Date;
+  expiresAt: Date;
+  /** The latest STORED provider rate (fresh or not), or null when none is stored. */
+  provider: (StoredProviderRate & { fresh: boolean }) | null;
+  /**
+   * held - provider, null when no provider rate is stored. `rate` is the
+   * difference in local units per USD (exact on the 6-decimal scale, then
+   * shown as a number); `bps` is that difference relative to the provider
+   * rate in basis points, truncated toward zero (integer maths);
+   * `outsideBand` is true past `overrideBandPercent` (same test as exceedsBand).
+   */
+  gap: { rate: number; bps: number; outsideBand: boolean } | null;
 }
 
 export class RateService {
@@ -199,12 +265,84 @@ export class RateService {
    * is necessarily one that arrived AFTER it was set, because reset-reference
    * drops the provider rate and is the only way to set one unreferenced.
    */
+  //
+  // Issue #241: a provider map that is present but UNREADABLE (damaged
+  // outside the app: a console edit, a bad migration) now counts as a
+  // disagreeing provider for an unreferenced or legacy override. Before, it
+  // read as "no provider rate", so an override that a provider rate had
+  // already superseded priced again the moment the map was damaged. Now such
+  // an override stays superseded and pricing fails closed (RATE_UNAVAILABLE:
+  // there is no readable provider rate) until an admin resets the map.
   private overrideSuperseded(stored: StoredRate | null, config: CurrenciesConfig): boolean {
     const override = stored?.override;
     if (!override || override.expiresAt.getTime() <= this.now().getTime()) return false;
     if (!isUnreferencedOverride(override)) return false;
+    if (stored?.providerCorrupt) return true;
     const provider = stored?.provider ?? null;
     return !!provider && exceedsBand(override.rate, provider.rate, config.overrideBandPercent);
+  }
+
+  /**
+   * Issue #241: the doc's hold if it has not expired yet AND it still passes
+   * the checks it was set under, else null.
+   *
+   * #241 review: a hold has no provider cross-check at all, so a hold edited
+   * outside the API (a console edit of the rate to 1e6, or a year-long
+   * expiry) must not price just because it parses. It is re-checked here on
+   * every read (see holdInvalidReason); one that fails is treated as not
+   * held, and holdWarnings flags it (HOLD_INVALID) in the admin overview.
+   */
+  private activeHold(stored: StoredRate | null, config: CurrenciesConfig): StoredHold | null {
+    const hold = stored?.hold ?? null;
+    if (!hold || hold.expiresAt.getTime() <= this.now().getTime()) return null;
+    return this.holdInvalidReason(stored?.currency ?? "", hold, config) ? null : hold;
+  }
+
+  /**
+   * Issue #241 review: why a stored, unexpired hold must NOT price, or null
+   * when it may. The same rules setHold applies, re-checked on read:
+   *  - the expiry is at most MAX_HOLD_TTL_HOURS after it was set, and at most
+   *    that far from now (catches a `setAt` moved into the future), with a
+   *    small allowance for clock skew between instances;
+   *  - the rate is a valid rate inside the currency's plausible range; with
+   *    no range configured (any more) a hold is not allowed, as in setHold.
+   */
+  private holdInvalidReason(currency: CurrencyCode, hold: StoredHold, config: CurrenciesConfig): string | null {
+    const capMs = MAX_HOLD_TTL_HOURS * HOUR_MS + HOLD_CLOCK_SKEW_MS;
+    const expiresMs = hold.expiresAt.getTime();
+    if (expiresMs - hold.setAt.getTime() > capMs || expiresMs - this.now().getTime() > capMs) {
+      return `its expiry ${hold.expiresAt.toISOString()} is more than ${MAX_HOLD_TTL_HOURS}h after it was set`;
+    }
+    try {
+      scaleRate(hold.rate); // throws for <= 0, NaN, Infinity, > MAX_RATE
+    } catch {
+      return `the held rate ${hold.rate} is not a valid rate`;
+    }
+    const entry = config.currencies[currency];
+    if (entry?.minRate === undefined || entry?.maxRate === undefined) {
+      return "no plausible range is configured to check the held rate against";
+    }
+    if (hold.rate < entry.minRate || hold.rate > entry.maxRate) {
+      return `the held rate ${hold.rate} is outside the plausible range ${entry.minRate}-${entry.maxRate}`;
+    }
+    return null;
+  }
+
+  /**
+   * Issue #241 review: what prices for this doc, in words, for warning text
+   * ("the held rate 1800", "the override 1350", "the provider rate 1300
+   * (cbn) while it is fresh", or "nothing (RATE_STALE)"). Same rules as
+   * quote(), so a message never claims a rate prices when it does not.
+   */
+  private describePricing(stored: StoredRate | null, config: CurrenciesConfig): string {
+    try {
+      const r = this.effectiveRate(stored?.currency ?? "", stored, config, 0);
+      if (r.source === "hold") return `the held rate ${r.rate}`;
+      if (r.source === "manual") return `the override ${r.rate}`;
+      return `the provider rate ${r.rate} (${r.source}) while it is fresh`;
+    } catch (err) {
+      return `nothing (${err instanceof MoneyError ? err.code : "ERROR"})`;
+    }
   }
 
   /** Pure selection of the effective rate from a stored doc (see header). */
@@ -215,6 +353,22 @@ export class RateService {
     marginBps: number
   ): ExchangeRate {
     const nowMs = this.now().getTime();
+
+    // 0. Issue #241: an active admin HOLD is the rate, full stop. It outranks
+    //    any override, and the provider rate's freshness (or absence) does not
+    //    stop it: the admin pinned it deliberately because the provider is
+    //    wrong, it was range-checked when set, and its own expiry (at most
+    //    168h) is what ends it. Once it expires, steps 1-3 apply as before.
+    const hold = this.activeHold(stored, config);
+    if (hold) {
+      return {
+        currency,
+        rate: hold.rate,
+        asOf: hold.setAt.toISOString(),
+        source: "hold",
+        marginBps,
+      };
+    }
 
     // 1. Active admin override, unless it is an unreferenced one that a stored
     //    provider rate (fresh or stale) has shown to be out of band (issue
@@ -346,7 +500,26 @@ export class RateService {
       // (`save.override`), not `stored.override` from before the fetch, so an
       // override set or cleared while the fetch ran is judged correctly in
       // the log and in the outcome text.
-      const warning = this.overrideBandWarning(save.override, result.rate, config);
+      // Issue #241: while a hold is active the rate just stored does NOT price
+      // (the hold does); it is kept for comparison. A gap past the band is
+      // reported the same way as an override's, so ops notices the provider
+      // and the held rate drifting apart (or the provider catching up).
+      // #241 review: the warnings are judged on the doc as it is AFTER this
+      // save (new provider rate, override and hold as re-read in the save
+      // transaction), so their "what prices" text is what quote() now does.
+      const after: StoredRate = {
+        ...(stored ?? { currency, provider: null, override: null, lastError: null }),
+        currency,
+        provider: { rate: result.rate, asOf: result.asOf, fetchedAt: this.now(), source: provider.id },
+        providerCorrupt: false,
+        lastError: null,
+        override: save.override,
+        hold: save.hold,
+      };
+      const warning =
+        [this.overrideBandWarning(after, config), this.holdBandWarning(after, config)]
+          .filter((w): w is string => !!w)
+          .join("; ") || null;
       if (warning) console.error(`Exchange rate ${currency}: ${warning}`);
       return { currency, ok: true, source: provider.id, rate: result.rate, ...(warning ? { warning } : {}) };
     }
@@ -406,6 +579,16 @@ export class RateService {
    * devaluation: the override band is relative to the same stale reference
    * and cannot reach a big move.
    */
+  //
+  // Issue #241: the reset also CLEARS an active unreferenced (or legacy)
+  // override that the provider rate being reset has superseded (out of its
+  // band, or the map is unreadable). Without this, dropping the provider rate
+  // left the override with nothing to disagree with, so it priced again for
+  // the rest of its 24h. That clear is audited as its own `override_cleared`
+  // entry in the same transaction. An unreferenced override INSIDE the band
+  // agreed with the provider rate, so it is kept (it prices until the next
+  // provider rate, as after any reset). A referenced override is never
+  // superseded, so it is never cleared here. A hold is not touched.
   async resetReference(currencyInput: string, reasonInput: unknown, adminUid: string): Promise<void> {
     const currency = normalizeCurrencyCode(currencyInput);
     if (!currency) throw new MoneyError("CURRENCY_UNSUPPORTED", "Unknown currency");
@@ -413,19 +596,42 @@ export class RateService {
     if (reason.length < MIN_REASON || reason.length > MAX_REASON) {
       throw new MoneyError("INVALID_INPUT", `reason must be ${MIN_REASON}-${MAX_REASON} characters`);
     }
+    // Issue #241: the band check below needs the config.
+    const config = await this.getConfig();
     // Check and write in one transaction (issue #214), so the audited `old`
     // is the provider rate actually dropped.
     await this.deps.rates.transact(currency, (stored) => {
       if (!stored?.provider && !stored?.providerCorrupt) {
         throw new MoneyError("INVALID_INPUT", "There is no stored provider rate to reset", currency);
       }
+      const now = this.now();
+      // Issue #241: decided from the doc as read INSIDE the transaction.
+      const clearOverride = this.overrideSuperseded(stored, config);
+      const extraAudits: RateAuditEntry[] = [];
+      if (clearOverride && stored.override) {
+        const why = stored.provider
+          ? `it is more than ${config.overrideBandPercent}% away from the provider rate ${stored.provider.rate} being reset`
+          : "the provider rate being reset was unreadable";
+        extraAudits.push({
+          currency,
+          action: "override_cleared",
+          by: adminUid,
+          at: now,
+          reason: `Cleared by reset-reference: unreferenced override ${stored.override.rate}, ${why}. ${reason}`.slice(0, MAX_REASON),
+          old: this.summarizeEffective(stored, config),
+          new: this.summarizeEffective({ ...stored, provider: null, providerCorrupt: false, override: null }, config),
+          unreferenced: true,
+        });
+      }
       return {
         clearProvider: true,
+        ...(clearOverride ? { override: null } : {}),
+        extraAudits,
         audit: {
           currency,
           action: "provider_reset",
           by: adminUid,
-          at: this.now(),
+          at: now,
           reason,
           old: stored.provider ? { rate: stored.provider.rate, source: stored.provider.source } : null,
           new: null,
@@ -646,7 +852,14 @@ export class RateService {
           at: now,
           reason,
           old: this.summarizeEffective(stored, config),
+          // Issue #241 review: `new` is the override the admin ENTERED, always,
+          // so the rate they typed is on record even while a hold outranks it
+          // (it prices once the hold ends, and an expiry writes no audit entry).
           new: { rate, source: "manual" },
+          // ... and the rate really in effect after the change goes in its own
+          // field: the override itself, an active hold, or null if nothing
+          // usable prices (kept as null on purpose, not dropped).
+          effective: this.summarizeEffective({ ...(stored ?? { currency, provider: null, lastError: null }), override }, config),
           ...(unreferenced ? { unreferenced: true } : {}),
         },
       };
@@ -686,6 +899,181 @@ export class RateService {
     this.changeCounter++;
   }
 
+  // ---------- admin hold (issue #241) ----------
+
+  /**
+   * Hold (pin) a currency's rate for `ttlHours` (required, 1-168). While
+   * active it is the effective rate (source "hold"), ahead of any override and
+   * of the provider rate, fresh or not; refreshes keep storing the provider
+   * rate behind it for comparison.
+   *
+   * Validated: currency known and enabled; rate positive and finite, inside
+   * the currency's plausible range (a currency with no range refuses holds);
+   * reason 5-500 chars. There is deliberately NO band check against the
+   * provider rate: the hold exists for when the provider is wrong by more
+   * than the band. Refused (inside the transaction) when the stored provider
+   * map is corrupt: a damaged reference must be reset first, so the overview
+   * can show a real gap. A new hold replaces an existing one. Written with its
+   * `hold_set` audit entry (who, when, old/new effective rate, reason, expiry)
+   * in one transaction.
+   */
+  async setHold(
+    currencyInput: string,
+    input: { rate: unknown; reason: unknown; ttlHours: unknown },
+    adminUid: string
+  ): Promise<StoredHold> {
+    const config = await this.getConfig();
+    const { currency, entry } = assertChargeable(currencyInput, config);
+
+    if (typeof input.rate !== "number") throw new MoneyError("INVALID_INPUT", "rate must be a number");
+    const rate = input.rate;
+    scaleRate(rate); // throws for <= 0, NaN, Infinity, > MAX_RATE
+    // Same plausible-range check as a first provider rate or an unreferenced override.
+    if (entry.minRate === undefined || entry.maxRate === undefined) {
+      throw new MoneyError("INVALID_INPUT", "No plausible range is configured to check the held rate against", currency);
+    }
+    if (rate < entry.minRate || rate > entry.maxRate) {
+      throw new MoneyError("INVALID_INPUT", `rate is outside the plausible range ${entry.minRate}-${entry.maxRate}`, currency);
+    }
+
+    if (typeof input.reason !== "string") throw new MoneyError("INVALID_INPUT", "reason is required");
+    const reason = input.reason.trim();
+    if (reason.length < MIN_REASON || reason.length > MAX_REASON) {
+      throw new MoneyError("INVALID_INPUT", `reason must be ${MIN_REASON}-${MAX_REASON} characters`);
+    }
+
+    // The expiry is REQUIRED for a hold (no config default): a pinned rate
+    // must always be a deliberate, bounded decision.
+    const ttlHours = input.ttlHours;
+    if (
+      typeof ttlHours !== "number" ||
+      !Number.isFinite(ttlHours) ||
+      ttlHours < 1 ||
+      ttlHours > MAX_HOLD_TTL_HOURS
+    ) {
+      throw new MoneyError("INVALID_INPUT", `ttlHours must be between 1 and ${MAX_HOLD_TTL_HOURS}`);
+    }
+
+    let saved: StoredHold | null = null;
+    await this.deps.rates.transact(currency, (stored) => {
+      if (stored?.providerCorrupt) {
+        throw new MoneyError("INVALID_INPUT", "The stored provider rate is unreadable; reset it first", currency);
+      }
+      const now = this.now();
+      const hold: StoredHold = {
+        rate,
+        reason,
+        setBy: adminUid,
+        setAt: now,
+        expiresAt: new Date(now.getTime() + ttlHours * HOUR_MS),
+      };
+      saved = hold;
+      return {
+        hold,
+        audit: {
+          currency,
+          action: "hold_set",
+          by: adminUid,
+          at: now,
+          reason,
+          old: this.summarizeEffective(stored, config),
+          new: { rate, source: "hold" },
+          holdExpiresAt: hold.expiresAt,
+        },
+      };
+    });
+    this.changeCounter++;
+    return saved as unknown as StoredHold;
+  }
+
+  /**
+   * Remove a hold (normal rules resume at once: override, else the provider
+   * rate if fresh, else a typed error). Reason 5-500 chars. Works on a
+   * disabled currency too, like clearOverride. Audited as `hold_cleared` with
+   * the effective rate before and after, in the same transaction.
+   */
+  async clearHold(currencyInput: string, reasonInput: unknown, adminUid: string): Promise<void> {
+    const currency = normalizeCurrencyCode(currencyInput);
+    if (!currency) throw new MoneyError("CURRENCY_UNSUPPORTED", "Unknown currency");
+    const reason = typeof reasonInput === "string" ? reasonInput.trim() : "";
+    if (reason.length < MIN_REASON || reason.length > MAX_REASON) {
+      throw new MoneyError("INVALID_INPUT", `reason must be ${MIN_REASON}-${MAX_REASON} characters`);
+    }
+    const config = await this.getConfig();
+    await this.deps.rates.transact(currency, (stored) => {
+      // #241 review: an unreadable hold map (holdCorrupt) can be cleared too;
+      // otherwise the only way to remove it would be a new PUT. The audit
+      // entry says it was unreadable. `old` / `new` are the rates in effect,
+      // which for a corrupt or invalid hold are the same (it never priced).
+      if (!stored?.hold && !stored?.holdCorrupt) {
+        throw new MoneyError("INVALID_INPUT", "There is no hold to clear", currency);
+      }
+      return {
+        hold: null,
+        audit: {
+          currency,
+          action: "hold_cleared",
+          by: adminUid,
+          at: this.now(),
+          reason,
+          old: this.summarizeEffective(stored, config),
+          new: this.summarizeEffective({ ...stored, hold: null, holdCorrupt: false }, config),
+          ...(stored.holdCorrupt ? { holdCorrupt: true } : {}),
+        },
+      };
+    });
+    this.changeCounter++;
+  }
+
+  /**
+   * Issue #241: a warning when an ACTIVE hold is further than
+   * `overrideBandPercent` from `providerRate` (integer maths via
+   * exceedsBand), else null.
+   */
+  //
+  // #241 review: takes the whole doc so it can (a) ignore a hold that fails
+  // its read-back checks (activeHold) and (b) say what prices once the hold
+  // ends: an active override outranks the provider rate then, and the
+  // message must not claim the provider rate does.
+  private holdBandWarning(stored: StoredRate | null, config: CurrenciesConfig): string | null {
+    const hold = this.activeHold(stored, config);
+    const providerRate = stored?.provider?.rate;
+    if (!hold || providerRate === undefined) return null;
+    if (!exceedsBand(hold.rate, providerRate, config.overrideBandPercent)) return null;
+    const afterHold = this.describePricing(stored ? { ...stored, hold: null } : null, config);
+    return `held rate ${hold.rate} is more than ${config.overrideBandPercent}% away from the provider rate ${providerRate}; ` +
+      `the held rate prices until ${hold.expiresAt.toISOString()}, then ${afterHold} would price as things stand`;
+  }
+
+  /** Issue #241: the overview's view of an active hold, with the gap to the latest stored provider rate. */
+  private holdView(stored: StoredRate | null, config: CurrenciesConfig): HoldView | null {
+    const hold = this.activeHold(stored, config);
+    if (!hold) return null;
+    const provider = stored?.provider ?? null;
+    let gap: HoldView["gap"] = null;
+    if (provider) {
+      // Integer maths on the 6-decimal scaled rates; only the final display
+      // value of the difference is turned back into a number.
+      const held = scaleRate(hold.rate);
+      const ref = scaleRate(provider.rate);
+      const diff = held - ref;
+      gap = {
+        rate: Number(diff) / 1_000_000,
+        bps: Number((diff * 10_000n) / ref),
+        outsideBand: exceedsBand(hold.rate, provider.rate, config.overrideBandPercent),
+      };
+    }
+    return {
+      rate: hold.rate,
+      reason: hold.reason,
+      setBy: hold.setBy,
+      setAt: hold.setAt,
+      expiresAt: hold.expiresAt,
+      provider: provider ? { ...provider, fresh: this.freshProvider(stored, config) !== null } : null,
+      gap,
+    };
+  }
+
   /**
    * The rate a currency is priced with for this stored doc (override if
    * active, else the provider rate if fresh), as `{ rate, source }` for an
@@ -707,13 +1095,25 @@ export class RateService {
    * message says it has stopped pricing, since a fresh provider rate that
    * far away supersedes it (see overrideSuperseded).
    */
-  private overrideBandWarning(override: StoredOverride | null, providerRate: number, config: CurrenciesConfig): string | null {
-    if (!override || override.expiresAt.getTime() <= this.now().getTime()) return null;
+  //
+  // #241 review: takes the whole doc so the "what prices" part names an
+  // active hold when there is one, instead of claiming the provider rate does.
+  private overrideBandWarning(stored: StoredRate | null, config: CurrenciesConfig): string | null {
+    const override = stored?.override ?? null;
+    const providerRate = stored?.provider?.rate;
+    if (!override || providerRate === undefined || override.expiresAt.getTime() <= this.now().getTime()) return null;
     if (!exceedsBand(override.rate, providerRate, config.overrideBandPercent)) return null;
     const head = `active override ${override.rate} is more than ${config.overrideBandPercent}% away from the provider rate ${providerRate}`;
-    return isUnreferencedOverride(override)
-      ? `${head}; it has no recorded provider rate it was checked against (none when set, or unknown), so it no longer prices (the provider rate does); clear or replace it`
-      : `${head}; check it and clear or replace it`;
+    const hold = this.activeHold(stored, config);
+    if (!isUnreferencedOverride(override)) {
+      return hold
+        ? `${head}; the held rate ${hold.rate} prices until ${hold.expiresAt.toISOString()}, then this override does; check it and clear or replace it`
+        : `${head}; check it and clear or replace it`;
+    }
+    const prices = hold
+      ? `the held rate ${hold.rate} prices until ${hold.expiresAt.toISOString()}, then the provider rate does while it is fresh`
+      : "the provider rate does";
+    return `${head}; it has no recorded provider rate it was checked against (none when set, or unknown), so it no longer prices (${prices}); clear or replace it`;
   }
 
   /** Issue #214: everything wrong with a currency's active override, for the admin overview. */
@@ -727,22 +1127,64 @@ export class RateService {
         message: `This override was set with no provider rate to check it against; it expires at ${override.expiresAt.toISOString()}`,
       });
     }
-    const band = stored?.provider ? this.overrideBandWarning(override, stored.provider.rate, config) : null;
+    const band = this.overrideBandWarning(stored, config);
     if (band) warnings.push({ code: "OVERRIDE_OUTSIDE_PROVIDER_BAND", message: band });
     // Issue #229: say plainly when the override is being ignored for pricing.
     if (this.overrideSuperseded(stored, config)) {
+      // #241 review: an active hold prices ahead of all of this; say so first,
+      // and describe the provider-side behaviour as what follows the hold.
+      const hold = this.activeHold(stored, config);
+      const holdFirst = hold ? `The held rate ${hold.rate} prices until ${hold.expiresAt.toISOString()}; after that, ` : "";
+      const then = (text: string) => (hold ? text : text.charAt(0).toUpperCase() + text.slice(1));
       warnings.push({
         code: "OVERRIDE_SUPERSEDED",
-        message:
+        message: stored?.providerCorrupt
+          // Issue #241: a damaged provider map supersedes too (fails closed).
+          ? `This override (${override.rate}) is not used for pricing: it has no recorded provider rate it was ` +
+            "checked against, and the stored provider rate is unreadable. " +
+            holdFirst + then("pricing stops (no rate available) until the provider rate is reset and refreshed")
           // #229 review: true for both kinds that can be superseded: an
           // override set after reset-reference (no provider rate to check)
           // and a legacy override whose reference was never recorded.
-          `This override (${override.rate}) is not used for pricing: it has no recorded provider rate it was ` +
-          "checked against (none existed when it was set, or its reference is unknown), and the stored provider rate " +
-          `${stored?.provider?.rate} is more than ${config.overrideBandPercent}% away. ` +
-          "Pricing uses the provider rate while it is fresh, and stops (rate out of date) when it is not",
+          : `This override (${override.rate}) is not used for pricing: it has no recorded provider rate it was ` +
+            "checked against (none existed when it was set, or its reference is unknown), and the stored provider rate " +
+            `${stored?.provider?.rate} is more than ${config.overrideBandPercent}% away. ` +
+            holdFirst + then("pricing uses the provider rate while it is fresh, and stops (rate out of date) when it is not"),
       });
     }
+    return warnings;
+  }
+
+  /** Issue #241: problems with a currency's active hold, for the admin overview. */
+  //
+  // #241 review: also flags a hold that is NOT pricing although one is
+  // stored: an unreadable map (HOLD_CORRUPT) or a readable hold that fails
+  // its read-back checks (HOLD_INVALID). Both are ignored for pricing, and
+  // the message says what prices instead, so an admin who pinned 1800 sees
+  // at once that clients are being quoted something else.
+  private holdWarnings(stored: StoredRate | null, config: CurrenciesConfig): RateWarning[] {
+    const warnings: RateWarning[] = [];
+    const pricing = () => this.describePricing(stored, config);
+    if (stored?.holdCorrupt) {
+      warnings.push({
+        code: "HOLD_CORRUPT",
+        message: "The stored hold is unreadable, so it is ignored: pricing follows the normal rules and uses " +
+          `${pricing()}. Clear it (DELETE .../hold) or set a new hold`,
+      });
+    }
+    const raw = stored?.hold ?? null;
+    if (raw && raw.expiresAt.getTime() > this.now().getTime()) {
+      const invalid = this.holdInvalidReason(stored?.currency ?? "", raw, config);
+      if (invalid) {
+        warnings.push({
+          code: "HOLD_INVALID",
+          message: `The stored hold (${raw.rate}) is ignored because ${invalid}; it was changed outside the admin API. ` +
+            `Pricing follows the normal rules and uses ${pricing()}. Clear it or set a new hold`,
+        });
+      }
+    }
+    const band = this.holdBandWarning(stored, config);
+    if (band) warnings.push({ code: "HOLD_OUTSIDE_PROVIDER_BAND", message: band });
     return warnings;
   }
 
@@ -755,8 +1197,10 @@ export class RateService {
       enabled: boolean;
       effective: ExchangeRate | null;
       effectiveError: string | null;
-      /** Issue #214: problems with the active override (empty when none). */
+      /** Issue #214: problems with the active override (and, #241, hold); empty when none. */
       warnings: RateWarning[];
+      /** Issue #241: the active hold next to the latest provider rate and the gap; null when none. */
+      hold: HoldView | null;
       stored: StoredRate | null;
       audit: RateAuditEntry[];
     }[]
@@ -777,7 +1221,8 @@ export class RateService {
         enabled: entry.enabled,
         effective,
         effectiveError,
-        warnings: this.overrideWarnings(stored, config),
+        warnings: [...this.overrideWarnings(stored, config), ...this.holdWarnings(stored, config)],
+        hold: this.holdView(stored, config),
         stored,
         audit: await this.deps.rates.listAudit(currency, auditLimit),
       });

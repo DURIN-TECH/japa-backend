@@ -329,7 +329,8 @@ describe("check: keep, leave out, hold", () => {
   });
 
   test("(#226) the prompt version is bumped (stored v3 answers are not reused), and the prompt tells the model `na` for a bar's stage", () => {
-    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v5");
+    // (#242) bumped again to v6 (the check is now shown headings and the trigger): the #226 wording below is unchanged.
+    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v6");
     assert.match(CHECKER_SYSTEM_PROMPT, /Answer `na` when the rule's `kind` is `mandatory_bar`/);
     // The answer shape is unchanged: the same six aspects, the same closed verdicts (`na` is already one).
     assert.deepEqual([...CHECKER_ASPECTS], ["title_faithful", "kind_right", "stage_right", "condition_faithful", "check_faithful", "group_matches_codes"]);
@@ -399,7 +400,7 @@ describe("check: keep, leave out, hold", () => {
     const text = r.provider.requests.map((q) => q.user).join("\n");
     assert.ok(!text.includes("SECRET-FACTOR") && !text.includes("0.123"));
     const seen = seenRules(r.provider.requests.find((q) => (q.schema as any).properties.verdicts) as any)[0];
-    assert.deepEqual(Object.keys(seen).sort(), ["applicability", "applicabilityCondition", "appliesTo", "check", "id", "kind", "listItems", "listLeadIn", "quote", "severity", "stage", "textAfter", "textBefore", "title"]);
+    assert.deepEqual(Object.keys(seen).sort(), ["applicability", "applicabilityCondition", "appliesTo", "check", "conditionFoundAt", "conditionLine", "id", "kind", "listItems", "listLeadIn", "quote", "sectionHeadings", "severity", "stage", "textAfter", "textBefore", "title", "triggerAnswers", "triggerQuestion"]);
     assert.equal(seen.id, "r1");
     assert.ok(seen.textAfter.length <= 400 + 10 && seen.textBefore.length <= 400 + 10);
   });
