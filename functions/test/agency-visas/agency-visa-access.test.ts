@@ -369,7 +369,9 @@ describe("public agency page (GET /agencies/public/:slug)", () => {
       countryCode: CC,
       visaName: "Agency a-own",
       category: "work",
-      price: null,
+      // Issue #179: dollar price + local figure; both null when unpriced.
+      priceUsd: null,
+      priceLocal: null,
       isAgencyVisa: true,
       visibility: "agency",
       visaCode: "A-OWN",
@@ -406,14 +408,14 @@ describe("public agency page (GET /agencies/public/:slug)", () => {
 
   test("a priced global visa is listed as not the agency's own", async () => {
     store.set(`agencies/${AGENCY_C}/visaPrices/${CC}__uk-sw`, {
-      id: `${CC}__uk-sw`, agencyId: AGENCY_C, visaTypeId: "uk-sw", countryCode: CC, price: 12500,
+      id: `${CC}__uk-sw`, agencyId: AGENCY_C, visaTypeId: "uk-sw", countryCode: CC, priceUsd: { amountMinor: 12500, currency: "USD" },
       updatedBy: "uid-owner-agency-c", createdAt: T0, updatedAt: T0,
     });
     const c = await publicAgency("charlie");
     assert.equal(c.body.data.visaPrices.length, 1);
     assert.equal(c.body.data.visaPrices[0].isAgencyVisa, false);
     assert.equal(c.body.data.visaPrices[0].visibility, "global");
-    assert.equal(c.body.data.visaPrices[0].price, 12500);
+    assert.deepEqual(c.body.data.visaPrices[0].priceUsd, { amountMinor: 12500, currency: "USD" });
   });
 
   test("unknown slug and a suspended agency are 404 (no visas exposed)", async () => {

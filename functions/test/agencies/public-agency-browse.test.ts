@@ -25,8 +25,9 @@
 //    sponsor licence, createdBy, review fields, ownerAgencyId or agentIds;
 //  - agents: only this agency's verified + available agents, same shape as
 //    GET /agents;
-//  - naira: price 12500 stays 12500; consultationFee + services unchanged;
-//    baseCostUsd stays the government fee;
+//  - dollars (issue #179): every price is the stored USD Money plus its
+//    local figure at the (fixed, test) rate of ₦1,500 per dollar;
+//    baseCostUsd stays the government fee; a missing rate still serves;
 //  - resilience: a visaPrices read failure is logged and served as [];
 //  - writes: POST / PUT / PATCH / DELETE on /browse* are 405 and write
 //    nothing; POST /agencies and PUT /agencies/me still 401 without a token;
@@ -48,6 +49,19 @@ import { agencyVisaPriceService } from "../../src/agency-visa-prices/agency-visa
 import { consultationController } from "../../src/controllers/consultation.controller";
 import { parseBrowseLimit, parseBrowseSearch } from "../../src/controllers/agency.controller";
 import { toPublicAgency, isAgencyPubliclyVisible } from "../../src/services/agency.service";
+import { pricerFromRate } from "../../src/money/local-price";
+import { useFixedRate } from "../helpers/local-pricing";
+
+/** USD Money in cents (issue #179). */
+const usd = (cents: number) => ({ amountMinor: cents, currency: "USD" });
+/** The local figure at the suite's ₦1,500 rate for `cents` US cents. */
+const ngn = (cents: number) => ({
+  amountMinor: cents * 1500, // cents x rate = kobo, since both minor units are 1/100
+  currency: "NGN",
+  rate: 1500,
+  asOf: "2026-11-13T09:00:00.000Z",
+  available: true,
+});
 import type { Agency } from "../../src/types";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -81,7 +95,8 @@ const PUBLIC_AGENCY_KEYS = [
   "address",
   "description",
   "logoUrl",
-  "consultationFee",
+  "consultationFeeUsd",
+  "consultationFeeLocal",
   "services",
   "agentCount",
   "totalCases",
@@ -104,6 +119,10 @@ const FORBIDDEN = [
   "settlement",
   "22233344455", // the seeded BVN value
   "secret-internal",
+  // Issue #179: the migration audit and the old naira keys never go public.
+  "\"migratedFrom\"",
+  "\"consultationFee\"",
+  "\"price\"",
 ];
 
 /** Seed one agency doc, full of private fields the projection must drop. */
@@ -118,9 +137,10 @@ function seedAgency(id: string, over: Data = {}): void {
     address: "1 Marina, Lagos",
     description: "We help with UK visas",
     logoUrl: "https://example.invalid/logo.png",
-    // Whole naira, as the portal stores them.
-    consultationFee: 15000,
-    services: [{ id: "svc-1", name: "CV review", price: 25000, internalNote: "secret-internal" }],
+    // US dollars (issue #179): $100.00 fee, $25.00 service.
+    consultationFeeUsd: usd(10000),
+    services: [{ id: "svc-1", name: "CV review", priceUsd: usd(2500), internalNote: "secret-internal" }],
+    migratedFrom: { consultationFee: { amount: 150000, currency: "NGN", rate: 1500 } },
     totalAgents: 3,
     totalCases: 12,
     activeCases: 4,
@@ -159,7 +179,7 @@ function seedAgent(id: string, agencyId: string | undefined, over: Data = {}): v
     totalApplications: 3,
     successRate: 90,
     responseTime: "24 hours",
-    consultationFee: 5000,
+    consultationFeeUsd: usd(1000),
     isAvailable: true,
     createdAt: at(1),
     updatedAt: at(1),
@@ -219,15 +239,15 @@ function seedAgencyVisa(id: string, agencyId: string, over: Data = {}, cc = CC):
   );
 }
 
-/** Seed an agency's price doc (whole naira, or null). */
-function seedPrice(agencyId: string, visaTypeId: string, price: number | null, cc = CC): void {
+/** Seed an agency's price doc (US cents, issue #179; null = no price). */
+function seedPrice(agencyId: string, visaTypeId: string, cents: number | null, cc = CC): void {
   const id = `${cc}__${visaTypeId}`;
   store.set(`agencies/${agencyId}/visaPrices/${id}`, {
     id,
     agencyId,
     visaTypeId,
     countryCode: cc,
-    price,
+    priceUsd: cents === null ? null : usd(cents),
     updatedBy: `uid-owner-${agencyId}`,
     createdAt: at(1),
     updatedAt: at(1),
@@ -238,7 +258,7 @@ function seedPrice(agencyId: string, visaTypeId: string, price: number | null, c
 function seedWorld(): void {
   // ---- Agencies ----
   seedAgency(A, { name: "Acme Visas", compliance: { status: "verified", bvn: "22233344455" }, createdAt: at(5) });
-  seedAgency(B, { name: "Bravo Travel", consultationFee: undefined, createdAt: at(4) });
+  seedAgency(B, { name: "Bravo Travel", consultationFeeUsd: undefined, createdAt: at(4) });
   seedAgency(PENDING, { name: "Pending Acme", status: "pending_review", createdAt: at(9) });
   seedAgency(REJECTED, { name: "Rejected Acme", status: "rejected", rejectionReason: "fake docs", createdAt: at(8) });
   seedAgency(SUSPENDED, { name: "Suspended Acme", status: "suspended", createdAt: at(7) });
@@ -268,7 +288,7 @@ function seedWorld(): void {
   seedGlobal("uk-visitor");
   seedGlobal("uk-graduate");
 
-  // ---- Prices (whole naira) ----
+  // ---- Prices (US cents: 12500 = $125.00) ----
   seedPrice(A, "uk-student", 12500);
   // A also has (stale) prices on its own hidden visas: never shown.
   seedPrice(A, "a-draft", 100);
@@ -323,7 +343,10 @@ function recording(col: any, name: string, calls: [string, ...unknown[]][] = [])
   };
 }
 
+let restoreRate: () => void;
 before(async () => {
+  // Issue #179: price reads at a fixed ₦1,500 per dollar (no Firestore rate).
+  restoreRate = useFixedRate(1500);
   await installFakes();
   const firebase: any = await import("../../src/utils/firebase");
   firebase.collections.agencies = recording(fakeCollection("agencies"), "agencies");
@@ -345,6 +368,7 @@ before(async () => {
 
 after(() => {
   server.close();
+  restoreRate();
 });
 
 beforeEach(() => {
@@ -384,12 +408,26 @@ describe("?limit= and ?search= parsing", () => {
 describe("toPublicAgency", () => {
   test("copies only allow-listed fields; slug null when the agency has none", () => {
     const agency = { ...(store.get(`agencies/${A}`) as any), slug: undefined } as Agency;
-    const p = toPublicAgency(agency);
+    const p = toPublicAgency(agency, pricerFromRate("NGN", { currency: "NGN", rate: 1500, asOf: "2026-11-13T09:00:00.000Z", source: "cbn", marginBps: 0 }));
     assert.deepEqual(Object.keys(p).sort(), PUBLIC_AGENCY_KEYS);
     assert.equal(p.slug, null);
     assert.equal(p.verified, true);
     assert.equal(p.agentCount, 3);
-    assert.deepEqual(p.services, [{ id: "svc-1", name: "CV review", price: 25000 }]);
+    assert.deepEqual(p.services, [{ id: "svc-1", name: "CV review", priceUsd: usd(2500), priceLocal: ngn(2500) }]);
+  });
+
+  test("a service or fee without a valid dollar price shows null, never an old naira number", () => {
+    const agency = {
+      ...(store.get(`agencies/${A}`) as any),
+      consultationFee: 150000,
+      consultationFeeUsd: undefined,
+      services: [{ id: "old", name: "Old", price: 25000 }],
+    } as Agency;
+    const p = toPublicAgency(agency, pricerFromRate("NGN", null)) as any;
+    assert.equal(p.consultationFeeUsd, null);
+    assert.equal(p.consultationFeeLocal, null);
+    assert.deepEqual(p.services, [{ id: "old", name: "Old", priceUsd: null, priceLocal: null }]);
+    assert.equal("consultationFee" in p, false);
   });
 
   test("only approved agencies are publicly visible", () => {
@@ -423,14 +461,15 @@ describe("GET /agencies/browse", () => {
     for (const bad of FORBIDDEN) assert.ok(!r.text.includes(bad), bad);
   });
 
-  test("the mobile ApiAgency fields: full key set, verified badge, naira unchanged", async () => {
+  test("the mobile ApiAgency fields: full key set, verified badge, dollar prices + local figure", async () => {
     const r = await req("/agencies/browse");
     const [a, b] = r.body.data;
     assert.deepEqual(Object.keys(a).sort(), PUBLIC_AGENCY_KEYS);
     assert.equal(a.slug, "a");
     assert.equal(a.ownerName, "Ada Owner");
-    assert.equal(a.consultationFee, 15000);
-    assert.deepEqual(a.services, [{ id: "svc-1", name: "CV review", price: 25000 }]);
+    assert.deepEqual(a.consultationFeeUsd, usd(10000));
+    assert.deepEqual(a.consultationFeeLocal, ngn(10000)); // ₦150,000.00
+    assert.deepEqual(a.services, [{ id: "svc-1", name: "CV review", priceUsd: usd(2500), priceLocal: ngn(2500) }]);
     assert.equal(a.agentCount, 3);
     assert.equal(a.totalCases, 12);
     assert.equal(a.verified, true);
@@ -439,8 +478,28 @@ describe("GET /agencies/browse", () => {
     // Approved but compliance not verified: still listed, with verified false.
     assert.equal(b.id, B);
     assert.equal(b.verified, false);
-    // An unset fee is simply absent (mobile: optional).
-    assert.equal("consultationFee" in b, false);
+    // An unset fee is null (issue #179: both keys always present).
+    assert.equal(b.consultationFeeUsd, null);
+    assert.equal(b.consultationFeeLocal, null);
+  });
+
+  test("no usable rate: 200 with the dollar prices, every local figure unavailable (issue #179)", async () => {
+    const restore = useFixedRate(null);
+    try {
+      for (const path of ["/agencies/browse", `/agencies/browse/${A}`, "/agencies/public/a", `/agencies/browse/${A}/agents`]) {
+        const r = await req(path);
+        assert.equal(r.status, 200, path);
+        const body = Array.isArray(r.body.data) ? r.body.data[0] : r.body.data;
+        const local = body.consultationFeeLocal;
+        assert.ok(body.consultationFeeUsd, path);
+        assert.deepEqual(local, { amountMinor: null, currency: "NGN", rate: null, asOf: null, available: false }, path);
+      }
+      const page = (await req("/agencies/public/a")).body.data;
+      assert.equal(page.services[0].priceLocal.available, false);
+      assert.deepEqual(page.visaPrices.find((v: any) => v.visaTypeId === "uk-student").priceUsd, usd(12500));
+    } finally {
+      restore();
+    }
   });
 
   test("?search= is a case-insensitive name match; no match is 200 []", async () => {
@@ -510,21 +569,20 @@ describe("GET /agencies/browse/:id", () => {
     for (const bad of FORBIDDEN) assert.ok(!r.text.includes(bad), bad);
   });
 
-  test("visaPrices: own approved visa + priced global only; whole naira; no hidden or foreign visas", async () => {
+  test("visaPrices: own approved visa + priced global only; dollars; no hidden or foreign visas", async () => {
     const r = await req(`/agencies/browse/${A}`);
     const prices = r.body.data.visaPrices;
     assert.deepEqual(
-      prices.map((v: any) => [v.countryCode, v.visaTypeId, v.price]),
+      prices.map((v: any) => [v.countryCode, v.visaTypeId, v.priceUsd, v.priceLocal]),
       [
-        [CC, "a-own", null],
-        [CC, "uk-student", 12500],
+        [CC, "a-own", null, null],
+        [CC, "uk-student", usd(12500), ngn(12500)],
       ]
     );
     // Government fee untouched and separate from the agency price.
     const student = prices.find((v: any) => v.visaTypeId === "uk-student");
     assert.equal(student.baseCostUsd, 719);
-    assert.notEqual(student.price, 1250000);
-    assert.notEqual(student.price, 125);
+    assert.equal("price" in student, false);
     // Not listed: A's draft / pending / rejected / inactive visas, B's visas
     // (incl. B's CA "a-own" with the same id), B's prices, unpriced globals.
     const json = JSON.stringify(prices);
@@ -555,9 +613,9 @@ describe("GET /agencies/browse/:id", () => {
     const svc: any = agencyVisaPriceService;
     const original = svc.listPublic;
     const seen: string[] = [];
-    svc.listPublic = async (id: string) => {
+    svc.listPublic = async (id: string, pricer: unknown) => {
       seen.push(id);
-      return original.call(svc, id);
+      return original.call(svc, id, pricer);
     };
     try {
       await req(`/agencies/browse/${A}`);

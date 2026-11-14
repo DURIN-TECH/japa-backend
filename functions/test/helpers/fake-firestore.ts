@@ -277,6 +277,11 @@ export async function fakeRunTransaction<T>(fn: (tx: any) => Promise<T>): Promis
 export async function installFakes(): Promise<void> {
   const firebase: any = await import("../../src/utils/firebase");
   firebase.collections.appConfig = fakeCollection("appConfig");
+  // Issue #179: public agent / agency reads look up the exchange rate to add
+  // a local figure; an empty fake means "no rate stored" (local figures
+  // unavailable, dollar prices still served). Suites that want a rate call
+  // useFixedRate() from test/helpers/local-pricing.ts.
+  firebase.collections.exchangeRates = fakeCollection("exchangeRates");
   firebase.collections.visaSources = fakeCollection("visaSources");
   firebase.collections.guidanceSources = fakeCollection("guidanceSources");
   firebase.collections.countries = fakeCollection("countries");

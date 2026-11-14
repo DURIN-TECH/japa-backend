@@ -13,8 +13,13 @@
 //  - every item's key set is exactly the allow-list (PUBLIC_AGENT_FIELDS);
 //  - an empty result is `200 []`.
 // Plus: non-verified GET /agents/:id is 404, and /agents/me keeps the full doc.
+//
+// Issue #179: the fee is the stored dollar Money (`consultationFeeUsd`) plus
+// its local figure (`consultationFeeLocal`); the old naira `consultationFee`,
+// its `consultationFeeUnit` marker and the `migratedFrom` audit never appear,
+// and a missing rate still serves the dollar price.
 
-import { test, describe, before, beforeEach } from "node:test";
+import { test, describe, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -24,6 +29,8 @@ import { agentController } from "../../src/controllers/agent.controller";
 import { agentService } from "../../src/services/agent.service";
 import { PUBLIC_AGENT_FIELDS, toPublicAgent } from "../../src/agents/public-agent";
 import type { Agent } from "../../src/types";
+import { pricerFromRate } from "../../src/money/local-price";
+import { useFixedRate } from "../helpers/local-pricing";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -38,7 +45,16 @@ const FORBIDDEN_KEYS = [
   "verifiedAt",
   "availableSlots",
   "serviceFees",
+  // Issue #179: old naira fields and the migration audit stay private.
+  "consultationFee",
+  "consultationFeeUnit",
+  "migratedFrom",
 ];
+
+/** A pricer at ₦1,500 per dollar (pure, no rate service). */
+const NGN_1500 = pricerFromRate("NGN", {
+  currency: "NGN", rate: 1500, asOf: "2026-11-13T00:00:00.000Z", source: "cbn", marginBps: 0,
+});
 
 /** A full stored agent doc, every private field populated. */
 function agentDoc(id: string, over: Data = {}): Data {
@@ -64,7 +80,11 @@ function agentDoc(id: string, over: Data = {}): Data {
     totalApplications: 7,
     successRate: 90,
     responseTime: "24 hours",
+    consultationFeeUsd: { amountMinor: 1000, currency: "USD" }, // $10.00
+    // Leftovers a not-yet-cleaned doc might carry: must never leak.
     consultationFee: 5000,
+    consultationFeeUnit: "naira",
+    migratedFrom: { consultationFee: { amount: 5000, currency: "NGN", rate: 1500 } },
     serviceFees: {},
     isAvailable: true,
     availableSlots: [{ dayOfWeek: 1, startTime: "09:00", endTime: "17:00" }],
@@ -116,22 +136,50 @@ function assertPublicShape(item: any): void {
   assert.deepEqual(Object.keys(item).sort(), [...PUBLIC_AGENT_FIELDS].sort());
 }
 
+let restoreRate: () => void;
 before(async () => {
   await installFakes();
   const firebase: any = await import("../../src/utils/firebase");
   firebase.collections.agents = fakeCollection("agents");
+  // Issue #179: price reads at a fixed ₦1,500 per dollar (no Firestore).
+  restoreRate = useFixedRate(1500);
 });
+after(() => restoreRate());
 
 beforeEach(() => {
   resetStore();
 });
 
 describe("toPublicAgent", () => {
-  test("copies only allow-listed fields and passes consultationFee through", () => {
-    const pub = toPublicAgent(agentDoc("a1") as unknown as Agent);
+  test("copies only allow-listed fields: the dollar fee plus its local figure", () => {
+    const pub = toPublicAgent(agentDoc("a1") as unknown as Agent, NGN_1500);
     assertPublicShape(pub);
-    assert.equal(pub.consultationFee, 5000);
+    assert.deepEqual(pub.consultationFeeUsd, { amountMinor: 1000, currency: "USD" });
+    // $10.00 x 1500 = ₦15,000.00 = 1,500,000 kobo.
+    assert.deepEqual(pub.consultationFeeLocal, {
+      amountMinor: 1_500_000, currency: "NGN", rate: 1500, asOf: "2026-11-13T00:00:00.000Z", available: true,
+    });
     assert.equal(pub.agencyRole, "agent");
+  });
+
+  test("no usable rate: the dollar fee is still returned, the local figure is unavailable", () => {
+    const pub = toPublicAgent(agentDoc("a1") as unknown as Agent, pricerFromRate("NGN", null));
+    assert.deepEqual(pub.consultationFeeUsd, { amountMinor: 1000, currency: "USD" });
+    assert.deepEqual(pub.consultationFeeLocal, { amountMinor: null, currency: "NGN", rate: null, asOf: null, available: false });
+  });
+
+  test("a doc with no valid dollar fee (not migrated, or corrupt) shows no fee, never the naira number", () => {
+    for (const bad of [undefined, 5000, { amountMinor: 1000, currency: "NGN" }, { amountMinor: 1.5, currency: "USD" }]) {
+      const pub = toPublicAgent(agentDoc("a1", { consultationFeeUsd: bad }) as unknown as Agent, NGN_1500);
+      assert.equal(pub.consultationFeeUsd, null);
+      assert.equal(pub.consultationFeeLocal, null);
+    }
+  });
+
+  test("a zero-dollar fee shows as zero local", () => {
+    const pub = toPublicAgent(agentDoc("a1", { consultationFeeUsd: { amountMinor: 0, currency: "USD" } }) as unknown as Agent, NGN_1500);
+    assert.equal(pub.consultationFeeLocal?.amountMinor, 0);
+    assert.equal(pub.consultationFeeLocal?.available, true);
   });
 
   test("omits optional keys the doc does not have", () => {
@@ -139,7 +187,7 @@ describe("toPublicAgent", () => {
     delete doc.agencyId;
     delete doc.agencyRole;
     delete doc.profilePhotoUrl;
-    const pub = toPublicAgent(doc as unknown as Agent) as any;
+    const pub = toPublicAgent(doc as unknown as Agent, NGN_1500) as any;
     assert.equal("agencyId" in pub, false);
     assert.equal("agencyRole" in pub, false);
     assert.equal("profilePhotoUrl" in pub, false);
@@ -187,6 +235,20 @@ describe("GET /agents/:id", () => {
     const r = await call(agentController.getAgent.bind(agentController), { params: { id: "a1" } });
     assert.equal(r.status, 200);
     assertPublicShape(r.body.data);
+  });
+
+  test("rate unavailable: still 200 with the dollar fee (issue #179)", async () => {
+    seed("a1");
+    const restore = useFixedRate(null);
+    try {
+      const r = await call(agentController.getAgent.bind(agentController), { params: { id: "a1" } });
+      assert.equal(r.status, 200);
+      assert.deepEqual(r.body.data.consultationFeeUsd, { amountMinor: 1000, currency: "USD" });
+      assert.equal(r.body.data.consultationFeeLocal.available, false);
+      assert.equal(r.body.data.consultationFeeLocal.amountMinor, null);
+    } finally {
+      restore(); // back to the suite's ₦1,500 wiring
+    }
   });
 
   test("non-verified agent -> 404", async () => {
