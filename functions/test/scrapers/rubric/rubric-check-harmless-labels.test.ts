@@ -431,18 +431,26 @@ describe("(#240) the protected re-draft keeps applicability and accepts a harmle
     assert.deepEqual([...triggerRoles].sort(), ["judgement", "verification"]);
   });
 
-  test("the replacement's trigger is still judged by both models: one model's `no` on it fails the replacement (trigger_not_confirmed)", async () => {
+  // (#248) CHANGED on purpose. The replacement's trigger is still judged by BOTH models (nothing about the
+  // trigger check is relaxed), but a replacement BAR that passed every aspect and lost only its trigger is no
+  // longer a failure: it is repaired and served WITHOUT the trigger, judged and never decided by code (this was
+  // exactly the one hold of the second real UK run). Full set: rubric-bar-trigger.test.ts.
+  test("the replacement's trigger is still judged by both models: one model's `no` drops the trigger and the bar is served judged", async () => {
     const r = repairRig();
     // The original fails on its condition (so a re-draft happens); then the judgement model refuses the trigger.
     r.provider.policy = unsureGroup;
     r.provider.triggerPolicy = ({ role }) => (role === "judgement" ? "no" : "yes");
     r.provider.redraftPolicy = () => redraft("specialist");
     const out = await r.svc.check(input(draft(barWithTrigger())));
-    assert.equal(out.ok, false);
-    if (!out.ok) {
-      assert.equal(out.protectedFailures?.[0].repair.status, "failed_check");
-      assert.equal(out.protectedFailures?.[0].repair.detail, "trigger_not_confirmed");
+    assert.equal(out.ok, true);
+    if (out.ok) {
+      assert.equal(out.protectedFailures?.[0].repair.status, "repaired");
+      assert.equal(out.protectedFailures?.[0].repair.detail, "trigger_not_confirmed_served_judged");
+      assert.deepEqual(out.judgedBars?.map((b) => b.replaced), [true]);
+      assert.ok(out.droppedTriggerIds?.includes(out.protectedFailures?.[0].criterionId as string));
     }
+    const triggerRoles = new Set(r.provider.requests.filter((q) => q.user.includes("<triggers_data_")).map((q) => q.role));
+    assert.deepEqual([...triggerRoles].sort(), ["judgement", "verification"], "both models judged the trigger");
   });
 
   test("the same swap the other way (specialist to conditional) is accepted too", async () => {
