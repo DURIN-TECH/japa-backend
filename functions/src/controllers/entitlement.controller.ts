@@ -16,6 +16,8 @@ import {
   PlanInterval,
 } from "@durin-tech/authz";
 import { StoredPlan } from "../types/billing";
+// Issue #252: optional `returnTo: "app"` → Paystack returns to the app return page.
+import { parseReturnTo, selectCallbackUrl } from "../services/billing/payment-return";
 import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
 
 const SUBSCRIBER_TYPES: SubscriberType[] = ["agency", "agent", "client"];
@@ -265,9 +267,16 @@ export class EntitlementController {
         sendError(res, "UNAUTHORIZED", "Not authenticated", 401);
         return;
       }
-      const { planId } = req.body as { planId?: string };
+      const { planId, returnTo: rawReturnTo } = req.body as { planId?: string; returnTo?: unknown };
       if (!planId) {
         sendError(res, "VALIDATION_ERROR", "planId is required", 400);
+        return;
+      }
+      // Issue #252: the mobile app opts in with `returnTo: "app"`. Absent =
+      // the portal flow, unchanged (provider default PAYSTACK_CALLBACK_URL).
+      const returnTo = parseReturnTo(rawReturnTo);
+      if (!returnTo.ok) {
+        sendError(res, "VALIDATION_ERROR", "returnTo must be \"app\" when given", 400);
         return;
       }
       const subscriber = entitlementService.resolveSubscriber(req.authz);
@@ -280,11 +289,14 @@ export class EntitlementController {
         sendError(res, "VALIDATION_ERROR", "A billing email is required", 400);
         return;
       }
+      // `callbackUrl` undefined (no returnTo) → provider default applies.
+      const callbackUrl = selectCallbackUrl(returnTo.value);
       const session = await billingService.createCheckout(
         subscriber.type,
         subscriber.id,
         planId,
-        email
+        email,
+        { callbackUrl }
       );
       // A free-plan switch is applied immediately (no redirect); a paid plan
       // returns a hosted checkout URL to send the user to.

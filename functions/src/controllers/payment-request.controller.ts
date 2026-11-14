@@ -24,6 +24,8 @@ import { notificationService } from "../services/notification.service";
 import { paystackProvider } from "../services/billing/paystack.provider";
 import { settlePaymentRequest } from "../services/payment-request-settlement.service";
 import { EMAIL_BRANDING } from "../services/email/branding";
+// Issue #252: optional `returnTo: "app"` → Paystack returns to the app return page.
+import { parseReturnTo, selectCallbackUrl } from "../services/billing/payment-return";
 import { collections } from "../utils/firebase";
 import { PaymentRequestStatus } from "../types";
 import { ROLES } from "@durin-tech/authz";
@@ -335,6 +337,14 @@ class PaymentRequestController {
       const { id } = req.params;
       const userId = req.user!.uid;
 
+      // Issue #252: the mobile app opts in with `returnTo: "app"` so Paystack
+      // returns to the app return page. Validated BEFORE anything changes, so
+      // a bad value never leaves the request approved without a checkout.
+      const returnTo = parseReturnTo((req.body as { returnTo?: unknown } | undefined)?.returnTo);
+      if (!returnTo.ok) {
+        return sendError(res, "VALIDATION_ERROR", "returnTo must be \"app\" when given", 400);
+      }
+
       // Fetch the payment request to validate and authorize
       const request = await paymentRequestService.getPaymentRequestById(id);
       if (!request) {
@@ -352,6 +362,16 @@ class PaymentRequestController {
         return sendError(res, "VALIDATION_ERROR", "Only pending payment requests can be approved", 400);
       }
 
+      // Resolve the Paystack return URL BEFORE approving (#252 review): it
+      // throws when the API base can't be built (no project id / bad
+      // API_PUBLIC_URL), and that must not leave the request approved with no
+      // checkout. App opt-in → the app return page; otherwise the portal's
+      // client payments page, exactly as before (portal unchanged).
+      const callbackUrl = selectCallbackUrl(
+        returnTo.value,
+        `${EMAIL_BRANDING.appUrl}/client/payments?reference={reference}`
+      );
+
       // Mark approved — the client has consented to be charged. The request
       // stays "approved" (not "paid") until Paystack confirms the money landed.
       const approved = await paymentRequestService.approvePaymentRequest(id);
@@ -368,7 +388,7 @@ class PaymentRequestController {
             paymentRequestId: id,
             applicationId: request.applicationId,
           },
-          callbackUrl: `${EMAIL_BRANDING.appUrl}/client/payments?reference={reference}`,
+          callbackUrl, // resolved above, before the approve write
         });
 
       // Persist the reference so a replayed or mismatched one can't be credited
