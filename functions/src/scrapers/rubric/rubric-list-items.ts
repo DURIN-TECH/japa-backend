@@ -157,6 +157,9 @@ export function readListLines(leadLine: string, following: readonly string[]): L
  * colon, or the quote stops just before the colon that closes the line.
  */
 export function quoteIsLeadIn(index: SnapshotQuoteIndex, found: Extract<QuoteLookup, { ok: true }>): boolean {
+  // A PDF page is ONE unit whose lines are collapsed: text follows the quote
+  // on the page even when it is the end of a line, so only the colon can say.
+  if (index.isPaginated) return found.matched.endsWith(":");
   const rest = index.unitText(found.unit).slice(found.at + found.matched.length).trim();
   return (rest === "" && found.matched.endsWith(":")) || rest === ":";
 }
