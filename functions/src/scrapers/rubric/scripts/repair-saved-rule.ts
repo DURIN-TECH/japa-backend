@@ -24,7 +24,7 @@
  *
  * Run (from functions/):
  *   npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/repair-saved-rule.js --page <stored-page.json> --rules <one-rule.json> --live
- * Prints rule titles and stored quote lines only, and never keys or error text.
+ * Prints rule titles, verdict letters and counts only (never quote text, keys or error text).
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { readFileSync } from "node:fs";
@@ -104,7 +104,8 @@ async function main(): Promise<void> {
   if (outcome.ok && outcome.repairs && outcome.repairs.length > 0) {
     const rep = outcome.repairs[0].replacement;
     console.log(`replacement (kept by the repair): "${rep.title}", kind ${rep.kind}, stage ${rep.stage}`);
-    console.log(`replacement quote: ${rep.source.quote}`);
+    // (A quote is never logged, like everywhere else in the module: the saved page is the place to read it.)
+    console.log("replacement quote: found verbatim in the saved page (not printed)");
   }
   for (const f of outcome.protectedFailures ?? []) {
     console.log(`failed aspects of the original: ${f.failedAspects.join(", ") || "(trigger)"}; verdicts ${JSON.stringify(f.verdicts)}`);
