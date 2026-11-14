@@ -37,7 +37,7 @@ describe("the criteria prompt holds the new instructions (#243)", () => {
 
   test("titles keep every exception, the quote's modal strength, and add no intent words", () => {
     assert.match(p, /Titles\. A title states what the quote states, neither wider nor narrower/);
-    for (const w of ["unless", "except", "other than", "provided that"]) assert.ok(p.includes(`\"${w}\"`), `names "${w}"`);
+    for (const w of ["unless", "except", "other than", "provided that"]) assert.ok(p.includes(`"${w}"`), `names "${w}"`);
     assert.match(p, /ends with "unless an exception applies"/);
     assert.match(p, /"should" stays "should" \(never "must"\)/);
     assert.match(p, /adds no word about intent, belief or continuation/);
@@ -169,18 +169,18 @@ describe("repair-saved-rule (#243)", () => {
     for (const secret of ["SECRET TITLE", "applicant must pay", "gadget licence", "Gadget Holder", "nowhere in the page"]) assert.ok(!out.includes(secret), `leaked ${secret}`);
   });
 
-  test("the aspects come from the stored letters through the production mapping; no letters = all six", () => {
+  test("the aspects come from the stored letters through the production mapping; no letters = all six", async () => {
     const rule: any = { kind: "judgement", applicability: "all_applicants" };
     // A tolerated label (stage of a judgement rule, kind `unsure` on an ordinary one) is not asked for.
-    assert.deepEqual(aspectsToRepair(rule, "yuuyaa"), []);
-    assert.deepEqual(aspectsToRepair(rule, "nnyyaa"), ["title_faithful", "kind_right"]);
-    assert.equal(aspectsToRepair(rule, undefined).length, 6);
-    assert.equal(aspectsToRepair(rule, "garbage").length, 6);
+    assert.deepEqual(await aspectsToRepair(rule, "yuuyaa"), []);
+    assert.deepEqual(await aspectsToRepair(rule, "nnyyaa"), ["title_faithful", "kind_right"]);
+    assert.equal((await aspectsToRepair(rule, undefined)).length, 6);
+    assert.equal((await aspectsToRepair(rule, "garbage")).length, 6);
   });
 
   test("live: a title re-draft passes; a definition item comes back as the lead-in (different line); a bar is refused; requests are counted", async () => {
     const provider = new ScriptedProvider();
-    provider.redraftPolicy = ({ shown }) => {
+    provider.redraftPolicy = ({ shown }: { shown: Record<string, any> }) => {
       // The fee rule: same line, title now keeps the exception.
       if (shown.quote === FEE_QUOTE) return JSON.parse(criteriaWire(answer({ criteria: [crit({ ref: "r1", title: "Fee must be paid unless it has been waived", kind: "judgement", quote: FEE_QUOTE, probeFactors: ["whether the fee was waived"] })] })));
       // The definition item: ONE rule quoting the lead-in (the list lines are attached by the program).

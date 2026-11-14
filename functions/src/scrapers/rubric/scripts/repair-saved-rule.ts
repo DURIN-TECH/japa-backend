@@ -46,11 +46,9 @@ import type { GuidanceSnapshotContent } from "../../guidance/types";
 import type { LlmProvider, LlmRequest, LlmResponse } from "../../../services/ai/llm-provider";
 import type { AiModelRole } from "../../../services/ai/ai-models";
 import { CHECKER_ASPECTS, decodeRow, type CheckerAspect } from "../rubric-checker-prompt";
-import { failedAspectsOf } from "../rubric-checker";
 import { SnapshotQuoteIndex } from "../rubric-quote";
 import { readLeadInList, verifyListItems } from "../rubric-list-items";
 import { REPAIR_WINDOW_CHARS, REPAIR_WINDOW_LINES_AFTER, REPAIR_WINDOW_LINES_BEFORE, isBar } from "../rubric-repair";
-import { DEFAULT_PUBLISH_SETTINGS } from "../rubric-publish-settings";
 
 /** A saved rule as the input file holds it (the shape of `recheck-list-and-group.ts`, plus the stored letters). */
 export interface SavedRuleInput {
@@ -102,7 +100,10 @@ class CountingProvider implements LlmProvider {
 }
 
 /** The aspects a re-draft is told: those the check's stored letters fail under the PRODUCTION mapping (all six without letters). */
-export function aspectsToRepair(rule: AssessmentCriterion, letters: string | undefined): CheckerAspect[] {
+export async function aspectsToRepair(rule: AssessmentCriterion, letters: string | undefined): Promise<CheckerAspect[]> {
+  // The checker module is loaded here, after `main()` has made sure a (placeholder) project id exists: its imports
+  // resolve a storage bucket at load time and throw without one.
+  const { failedAspectsOf } = await import("../rubric-checker");
   const row = letters === undefined ? undefined : decodeRow(letters) ?? undefined;
   if (letters !== undefined && !row) return [...CHECKER_ASPECTS];
   return row ? failedAspectsOf(rule, row) : [...CHECKER_ASPECTS];
@@ -143,7 +144,7 @@ export async function runRepairs(snapshot: GuidanceSnapshotContent, inputs: read
       opts.print(`${input.criterionId}: quote NOT found (${built.notFound}); a real run would leave this rule out before any spend.`);
       continue;
     }
-    const aspects = aspectsToRepair(built.rule, input.verdicts);
+    const aspects = await aspectsToRepair(built.rule, input.verdicts);
     const old = input.verdicts ?? "none";
     opts.print(
       `${input.criterionId}: quote found; ${isBar(built.rule) ? "bar" : "ordinary"}, kind ${built.rule.kind}; old letters ${old}; ` +
@@ -165,7 +166,8 @@ export async function runRepairs(snapshot: GuidanceSnapshotContent, inputs: read
   // ---- live half: the ONLY place a model is called ----
   const provider = new CountingProvider(opts.provider);
   const { RubricExtractionService } = await import("../rubric-extraction.service");
-  const { RubricCheckerService } = await import("../rubric-checker");
+  const { RubricCheckerService, failedAspectsOf } = await import("../rubric-checker");
+  const { DEFAULT_PUBLISH_SETTINGS } = await import("../rubric-publish-settings");
   const drafter = new RubricExtractionService({ provider });
   const limits = { maxOutputTokens: DEFAULT_PUBLISH_SETTINGS.checkerMaxOutputTokensPerRequest, timeoutMs: DEFAULT_PUBLISH_SETTINGS.checkerRequestTimeoutMs };
   const usage = { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -246,6 +248,9 @@ const arg = (name: string): string | undefined => {
   return i >= 0 ? a[i + 1] : undefined;
 };
 
+/** Print one report line (the lines are ids, letters and counts only; see the header). */
+const printLine = (line: string): void => console.log(line);
+
 /** The command line: parse the arguments, read the two files, build the real provider only for `--live`. */
 async function main(): Promise<void> {
   const pagePath = arg("page");
@@ -254,11 +259,14 @@ async function main(): Promise<void> {
     console.error("usage: --page <stored-page.json> --rules <rules.json> [--route <name>] [--live]");
     process.exit(2);
   }
+  // The service modules resolve a storage bucket when loaded, though this script never touches storage. A
+  // PLACEHOLDER project id (never a real one) lets them load; a value already in the environment is kept.
+  process.env.GCLOUD_PROJECT ??= "saved-rules-offline";
   const snapshot = JSON.parse(readFileSync(pagePath, "utf8")) as GuidanceSnapshotContent;
   const inputs = JSON.parse(readFileSync(rulesPath, "utf8")) as SavedRuleInput[];
   const live = process.argv.includes("--live");
   const provider = live ? new (await import("../../../services/ai/llm-provider")).AnthropicLlmProvider() : undefined;
-  await runRepairs(snapshot, inputs, { live, routeName: arg("route"), print: (l) => console.log(l), provider });
+  await runRepairs(snapshot, inputs, { live, routeName: arg("route"), print: printLine, provider });
 }
 
 // Run only when started as a script, never when a test imports `runRepairs`.

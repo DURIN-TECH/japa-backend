@@ -254,7 +254,7 @@ Before #223 any protected rule that failed the independent check stopped the run
 
 Wording and diagnostics fixed with it: `publish-rubric.ts` says "the independent AI check ran and failed" when it ran and did not confirm the draft, and "has NOT run" only for `not_run`, `not_configured` and `--skip-checker` (`checkerStatusLine`); `checker_unavailable` names what was unreachable (above). Hold reasons and alerts name rules by title (data read from the draft, never code).
 
-Try one saved bar without a run: `scripts/repair-saved-rule.ts` (`npm run repair:saved-rule -- --page <stored-page.json> --rules <one-rule.json> [--live]`; offline by default; `--live` runs the production check and, only if the rule fails, its one repair, and prints the held-record entry). Nothing is written.
+Try saved rules without a run: `scripts/repair-saved-rule.ts` (see "Drafting instructions" below; since #243 it takes several rules, bars or ordinary, and re-drafts each once). Nothing is written.
 
 ## A bar's stage is not judged; why a re-draft is refused (issue #226)
 
@@ -432,3 +432,20 @@ no free text; code decides.
 - **Flag codes it resolves**: `title_wording_uncited`,
   `nationality_codes_model_proposed`, `nationality_code_name_mismatch`.
   (`intake_wording_uncited` is part C's.)
+
+## Drafting instructions that stop the defects the check found (issue #243, step 3 of #240)
+
+The second check found 57 UK rules WRONG (a `no`) in the first real draft. Reading them, most were drafting defects the prompt itself caused, so `RUBRIC_SYSTEM_PROMPT` (`rubric-prompt.ts`, `RUBRIC_PROMPT_VERSION` `2026-11-rubric-v9`; the intake prompt of call 2 is unchanged) now says, as pure reading instructions (no route, country or publisher knowledge, nothing about producing fewer rules):
+
+- **Titles**: keep every "unless" / "except" / "other than" / "provided that" of the quote (or end with "unless an exception applies"); keep the modal strength ("should" never becomes "must"); add no intent words ("continues to intend").
+- **Definitions and alternatives**: a passage that defines a term or lists alternative circumstances is ONE rule quoting its lead-in (the #222 path attaches the list lines), not one rule per item. Sub-conditions that must each be met still get one rule per item.
+- **Conditions**: ONE rule replaces the two conflicting instructions (list items carry the lead-in; specialist conditions name the activity): the circumstance, never the outcome; a list item takes its own lead-in, never a sibling's text; a `specialist` rule's condition names the activity, which is the lead-in when it names it, else the section heading.
+- **Exemptions**: a quote that exempts a group ("unless they are applying as ...") is `conditional`, not `all_applicants`.
+- **Not rules**: examples, summary sentences and link labels in a checklist. Every line that does state a requirement, permission, definition, method or instruction (including caseworker procedure) is still drafted.
+- **Kind wording**: `RUBRIC_KIND_WORDING` / `RUBRIC_KIND_WORDING_SENTENCE` is the ONE wording of the three kinds (`judgement` covers what the applicant must show, permitted activities, definitions, methods of calculation and instructions to the decision maker). The checker prompt should build its `kind_right` line from the same constant (hand-off to the #242 work; the drafting side is done).
+
+The one-time re-draft reuses the system prompt, so it carries all of this. `RUBRIC_REPAIR_PROMPT_VERSION` is `2026-11-repair-v4`: for an ORDINARY rule the REPAIR block allows the lead-in of the definition the rule is an item of, and says it must not become a bar; for a bar it is unchanged (same line only). `RubricExtractionService.redraftRule` accepts an ordinary original's replacement when it is not a bar (same-line is reported as `sameLine`, not required); it still refuses a replacement quote that is not in the stored text, and the bar path is untouched.
+
+### Measure it without a full extraction: `scripts/repair-saved-rule.ts`
+
+`npm run repair:saved-rule -- --page <stored-page.json> --rules <rules.json> [--route <name>] [--live]`. `--rules` is an array of saved rules (`criterionId`, `title`, `kind`, `stage`, `severity`, `quote`, `applicability`, `applicabilityCondition`, `appliesTo`, and `verdicts`: the check's stored six letters). **Offline by default (0 model calls):** per rule it prints whether the quote is found, ordinary or bar, the aspects a re-draft would be told (the stored letters through the production mapping, so labels the check no longer judges are not asked for), the lead-in list and the window size. **`--live`** (the only model use) re-drafts each rule once through `redraftRule`, then runs the production check on all replacements (batches of 10, no repair of its own) and prints, per rule: old letters, new letters, whether the replacement quotes the same line, whether an ordinary rule became a bar, and whether it passes every aspect by the production mapping. Requests = one re-draft per rule with a failed aspect + ceil(replacements / 10) check requests (twice that when replacements are bars). Output is ids, letters, aspect names, code words and counts only: never a title, quote or model text. Nothing is written.
