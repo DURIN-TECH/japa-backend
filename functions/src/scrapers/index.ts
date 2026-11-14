@@ -112,7 +112,23 @@ export type { JobView, StartJobInput, StartJobResult } from "./rubric/rubric-ext
  * is never returned by it); the `...ForReview` reads are for the admin review
  * API (#125).
  */
-export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
+export { rubricStore, rubricRouteKey, rulebookKeyOf } from "./rubric/rubric.store";
+/**
+ * (#233) Rulebook keys for ANY issuing authority (`{authorityId}_{routeSlug}`):
+ * build a checked target, read the parts of a stored document whichever shape
+ * it was written in.
+ */
+export { rulebookTargetOf, rulebookTargetOfKey, rulebookPartsOf, keyFieldsOf, targetInputOf, withKeyParts, isCountryRulebookKey, RulebookKeyError } from "./rubric/rubric-key";
+export type { RulebookTarget, RulebookTargetInput } from "./rubric/rubric-key";
+/**
+ * (#233) Rulebook STACKS: the approved version of every layer of a route
+ * (shared bloc / treaty layer first, the country's own layer last), merged into
+ * one served view. A single-layer route reads exactly its own rulebook.
+ */
+export { loadRulebookStack, mergeRulebookStack, stackFromReads, layerVersionsOf, sameStackVersions, scopedId, STACK_ID_SEPARATOR } from "./rubric/rubric-stack";
+export type { RulebookStack, StackLayerRead, StackLayerReader, StackUnusableReason } from "./rubric/rubric-stack";
+export { planStack } from "./rubric/rubric-question-plan";
+export type { StackPlanLayer, StackPlanProblem, StackPlanResult } from "./rubric/rubric-question-plan";
 /** Structural rubric validator (the review API re-runs it before approving). */
 export { validateVisaRubric } from "./rubric/rubric-validate";
 /** Criterion exclusions (#161): the pure read-side filter, the preview and the limits. */

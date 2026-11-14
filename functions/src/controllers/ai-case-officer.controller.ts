@@ -87,8 +87,9 @@ export class AiCaseOfficerController {
     if (!latest) {
       // Two different empty states, told apart: the route has no approved rubric
       // (nothing can be assessed yet), or it has one and no review has been run.
-      const approved = await aiCaseOfficerService.approvedVersionOf(app.countryCode, app.visaTypeId);
-      if (approved === null) {
+      // (#233) For a route on a rulebook stack: "assessable" means at least one
+      // layer approved (single-layer routes: the old head check, unchanged).
+      if (!(await aiCaseOfficerService.hasApprovedRulebook(app))) {
         return sendError(
           res,
           "NO_APPROVED_RUBRIC",

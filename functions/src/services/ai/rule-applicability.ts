@@ -136,8 +136,9 @@ export function splitByApplicability(rubric: ApplicabilityRubric, answers: Recor
  * applicability is unknown, in rubric order, in the existing insufficient-
  * information shape. Plain words, no verdict.
  */
-export function notAssessedItems(split: ApplicabilitySplit): Array<{ criterionId: string; title: string; reason: string; notAssessed: UnknownReason }> {
-  return split.unknown.map((u) => ({ criterionId: u.criterion.criterionId, title: u.criterion.title, reason: couldNotAssessReason(u), notAssessed: u.reason }));
+export function notAssessedItems(split: ApplicabilitySplit): Array<{ criterionId: string; title: string; reason: string; notAssessed: UnknownReason; layerKey?: string }> {
+  // (#233) The rule's layer rides along on a multi-layer stack (absent otherwise).
+  return split.unknown.map((u) => ({ criterionId: u.criterion.criterionId, title: u.criterion.title, reason: couldNotAssessReason(u), notAssessed: u.reason, ...(u.criterion.layerKey ? { layerKey: u.criterion.layerKey } : {}) }));
 }
 
 /**

@@ -97,13 +97,22 @@ scrapers/
                                        schema + the in-code schema check of the answer
     rubric-validate.ts                 structural validator (kind rules, id joins, intent flag)
     rubric.store.ts                    visaRubrics head + rubricVersions; writes pending only;
-                                       getApprovedRubric is the only consumer read
+                                       getApprovedRubric(ByKey) is the only consumer read
+    rubric-key.ts                      (#233) rulebook keys {authorityId}_{routeSlug} for any
+                                       issuing authority (country, bloc, treaty); reads the parts
+                                       of a document stored before #233 (no data move)
+    rubric-stack.ts                    (#233) loadRulebookStack: the approved version of every
+                                       layer of a route (shared first, own last) merged into one
+                                       served view; a missing layer is reported; a single layer is
+                                       served unchanged. Consumers reach it through
+                                       services/ai/application-rulebook.ts
     rubric-settings.ts                 appConfig/rubricExtractionSettings: kill switch + caps
     rubric-publish-settings.ts         appConfig/rubricPublishSettings: auto-publish mode (fails
                                        closed to `manual`), allowlist, gate numbers (#201)
     rubric-gates.ts                    PURE automatic gates: flag table, leave-outs, shrink guard,
                                        leave-out budget, protected rules, sample audit (#201)
-    scripts/                           extract-rubric (CLI, dry run by default);
+    scripts/                           extract-rubric (CLI, dry run by default; #233: a bloc or
+                                       treaty layer with --authority=<id> --slug=<shared route id>);
                                        publish-rubric (#201: run the auto-publish pipeline on a
                                        pending draft; --project required, --dry-run, --skip-checker)
 ```

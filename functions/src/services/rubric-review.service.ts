@@ -2,7 +2,7 @@ import { Timestamp, type DocumentData, type Transaction, type UpdateData } from 
 import { collectionGroups, collections, db, subcollections } from "../utils/firebase";
 // The scrapers module is reached through its public entry point only (the
 // ESLint boundary rule of issue #91 refuses deep imports from here).
-import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA, applyRuleRepairs, barsServedWithoutTrigger, SnapshotQuoteIndex, guidanceSnapshotStore, previewExclusions, rubricStore, validateVisaRubric } from "../scrapers";
+import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA, applyRuleRepairs, barsServedWithoutTrigger, SnapshotQuoteIndex, guidanceSnapshotStore, previewExclusions, rubricStore, rulebookPartsOf, targetInputOf, validateVisaRubric } from "../scrapers";
 import type { ExclusionPreview } from "../scrapers";
 import type { GuidanceSnapshotContent } from "../scrapers/types";
 import type { RubricIssue } from "../scrapers";
@@ -216,9 +216,15 @@ const STANDING_NOTICE_FLAG_CODES: ReadonlySet<string> = new Set([
   "rule_trigger_simplified",
 ]);
 
-/** `{countryCode}_{visaTypeId}__v{version}`: the id of one rubric version in the API. */
-// The country code is two UPPER-CASE letters, as `rubricRouteKey` requires.
-const VERSION_ID_RE = /^([A-Z]{2}_[A-Za-z0-9][A-Za-z0-9_-]*)__v([1-9]\d{0,8})$/;
+/**
+ * `{routeKey}__v{version}`: the id of one rubric version in the API.
+ * (#233) The route key is any authority's rulebook key `{authorityId}_{routeSlug}`
+ * (a country's `{countryCode}_{visaTypeId}` as before, or a bloc / treaty's
+ * shared layer). The pattern keeps the old character classes (no `/`, so a
+ * parsed key can never steer a path), and `parseRubricVersionId` then checks
+ * the key against the authority id rules.
+ */
+const VERSION_ID_RE = /^([A-Za-z0-9][A-Za-z0-9_-]*)__v([1-9]\d{0,8})$/;
 
 // ============================================
 // Errors
@@ -281,6 +287,18 @@ export function rubricVersionId(routeKey: string, version: number): string {
 }
 
 /**
+ * (#233) The naming pair of a rulebook document for API rows, audit entries and
+ * approval events: `countryCode` + `visaTypeId` for a country's rulebook
+ * (exactly the fields these carried before), `authorityId` + `routeSlug` for a
+ * bloc / treaty layer (which has no country). Empty for a document whose key
+ * cannot be read (the validator reports that one).
+ */
+function namingOf(doc: { routeKey: string; authorityId?: string; routeSlug?: string; countryCode?: string; visaTypeId?: string }): { countryCode?: string; visaTypeId?: string; authorityId?: string; routeSlug?: string } {
+  const parts = rulebookPartsOf(doc);
+  return parts ? targetInputOf(parts) : {};
+}
+
+/**
  * Split an API id into its route key and version, or null when the text is
  * not such an id. The pattern is anchored and its character classes hold no
  * `/`, so a parsed route key can never steer a document path elsewhere.
@@ -288,7 +306,11 @@ export function rubricVersionId(routeKey: string, version: number): string {
 export function parseRubricVersionId(id: unknown): { routeKey: string; version: number } | null {
   if (typeof id !== "string") return null;
   const m = VERSION_ID_RE.exec(id);
-  return m ? { routeKey: m[1], version: Number(m[2]) } : null;
+  if (!m) return null;
+  // (#233) The key must be a valid rulebook key (a country code in capitals,
+  // or a bloc / treaty id), exactly as the store would address it.
+  if (!rulebookPartsOf({ routeKey: m[1] })) return null;
+  return { routeKey: m[1], version: Number(m[2]) };
 }
 
 // ============================================
@@ -612,8 +634,12 @@ export interface ApprovalBlocker {
 export interface RubricVersionListItem {
   id: string;
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key parts: `authorityId` + `routeSlug` for any rulebook; the
+  // country pair only for a country's own rulebook (absent on a shared layer).
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
   version: number;
   reviewStatus: RubricReviewStatus;
   revision: number;
@@ -711,8 +737,12 @@ export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intent
 export interface RubricDecisionResult {
   id: string;
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key parts: `authorityId` + `routeSlug` for any rulebook; the
+  // country pair only for a country's own rulebook (absent on a shared layer).
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
   version: number;
   action: "approve" | "reject";
   reviewStatus: RubricReviewStatus;
@@ -744,8 +774,12 @@ export interface RubricReviewAuditEntry {
   publishRunId?: string;
   action: "approve" | "reject";
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key parts: `authorityId` + `routeSlug` for any rulebook; the
+  // country pair only for a country's own rulebook (absent on a shared layer).
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
   version: number;
   // Reject reason, or the optional approval note.
   reason: string | null;
@@ -790,8 +824,12 @@ export interface RubricReviewAuditEntry {
 /** Sent to `onApproved` listeners after an approval has committed. */
 export interface RubricApprovedEvent {
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key parts: `authorityId` + `routeSlug` for any rulebook; the
+  // country pair only for a country's own rulebook (absent on a shared layer).
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
   // The version now serving.
   version: number;
   // The version it replaced, or null for a route's first approval.
@@ -879,8 +917,8 @@ function toListItem(rubric: VisaRubric, head: RubricHead | null): RubricVersionL
   return {
     id: rubricVersionId(rubric.routeKey, rubric.version),
     routeKey: rubric.routeKey,
-    countryCode: rubric.countryCode,
-    visaTypeId: rubric.visaTypeId,
+    // (#233) The rulebook's naming pair: the country pair for a country (as before), authorityId + routeSlug for a shared layer.
+    ...namingOf(rubric),
     version: rubric.version,
     reviewStatus: rubric.reviewStatus,
     revision: rubric.revision,
@@ -1303,8 +1341,7 @@ export class RubricReviewService {
     return {
       id: item.id,
       routeKey: item.routeKey,
-      countryCode: item.countryCode,
-      visaTypeId: item.visaTypeId,
+      ...namingOf(item),
       version: item.version,
       schemaVersion: rubric.schemaVersion,
       reviewStatus: item.reviewStatus,
@@ -1562,8 +1599,8 @@ export class RubricReviewService {
         by: reviewerUid,
         ...automaticMarks,
         routeKey,
-        countryCode: rubric.countryCode,
-        visaTypeId: rubric.visaTypeId,
+        // (#233) The rulebook's naming pair: the country pair for a country (as before), authorityId + routeSlug for a shared layer.
+        ...namingOf(rubric),
         version,
         previousApprovedVersion,
         revisionBefore: rubric.revision,
@@ -1574,8 +1611,8 @@ export class RubricReviewService {
       const resultBase = {
         id: rubricVersionId(routeKey, version),
         routeKey,
-        countryCode: rubric.countryCode,
-        visaTypeId: rubric.visaTypeId,
+        // (#233) The rulebook's naming pair: the country pair for a country (as before), authorityId + routeSlug for a shared layer.
+        ...namingOf(rubric),
         version,
         revision: revisionAfter,
         reviewedBy: reviewerUid,
@@ -1727,8 +1764,7 @@ export class RubricReviewService {
     if (result.action === "approve") {
       await this.emitApproved({
         routeKey: result.routeKey,
-        countryCode: result.countryCode,
-        visaTypeId: result.visaTypeId,
+        ...namingOf(result),
         version: result.version,
         previousApprovedVersion: result.previousApprovedVersion,
         approvedBy: reviewerUid,

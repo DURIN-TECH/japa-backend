@@ -125,6 +125,9 @@ export interface AssessmentContent {
 /** Everything the assessment reads. Any change here means a new assessment. */
 export interface AssessmentInputs {
   rubricVersion: number;
+  // (#233) Only on a rulebook stack of more than one layer: rulebook key ->
+  // approved version. Absent otherwise, so a single-layer hash is unchanged.
+  layerVersions?: Record<string, number | null>;
   // Document paths and their `updatedAt` (ms). A changed file changes the hash.
   documents: Array<{ path: string; updatedAtMs: number }>;
   // Statements, by CONTENT hash (see hashStatementContent), not by `version`:
@@ -906,6 +909,16 @@ export interface AssembleInput {
   notAssessed?: InsufficientItem[];
 }
 
+/**
+ * (#233) "Findings carry their layer": the rulebook layer of a rule, copied
+ * from the rubric in code (never model text), spread into every finding made
+ * from it. Empty for a single-layer rulebook (no `layerKey`), so those results
+ * are exactly as before.
+ */
+function layerOf(c: Pick<AssessmentCriterion, "layerKey">): { layerKey?: string } {
+  return c.layerKey ? { layerKey: c.layerKey } : {};
+}
+
 /** Why judgement did not run on a route that has judgement criteria. */
 const NO_STATEMENT_REASON = "there is no statement or document to weigh";
 
@@ -922,6 +935,7 @@ function groundFrom(c: AssessmentCriterion, detail: string, whatWouldHelp: strin
     sourceQuote: c.source.quote,
     detail,
     whatWouldHelp,
+    ...layerOf(c),
   };
 }
 
@@ -962,7 +976,7 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
       seenRefusal.add(c.criterionId);
       refusalGrounds.push(groundFrom(c, r.reason, "Provide evidence that meets this requirement."));
     } else if (r.outcome === "insufficient") {
-      insufficient.push({ criterionId: c.criterionId, title: c.title, reason: r.reason });
+      insufficient.push({ criterionId: c.criterionId, title: c.title, reason: r.reason, ...layerOf(c) });
     }
   }
 
@@ -974,20 +988,20 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   if (input.judgementFailed) {
     for (const id of judgementIds) {
       const c = criterionById(rubric, id)!;
-      insufficient.push({ criterionId: id, title: c.title, reason: "the judgement check could not be completed" });
+      insufficient.push({ criterionId: id, title: c.title, reason: "the judgement check could not be completed", ...layerOf(c) });
     }
   } else if (!input.judgement && input.mandatoryHits.length === 0) {
     // Judgement was not run because there was nothing to read. Said, not silent.
     for (const id of judgementIds) {
       const c = criterionById(rubric, id)!;
-      insufficient.push({ criterionId: id, title: c.title, reason: NO_STATEMENT_REASON });
+      insufficient.push({ criterionId: id, title: c.title, reason: NO_STATEMENT_REASON, ...layerOf(c) });
     }
   } else if (input.judgement) {
     judgementOutcome = "clear";
     // (#207) Criteria of a judgement call that failed while others succeeded.
     for (const id of input.unjudgedCriterionIds ?? []) {
       const c = criterionById(rubric, id);
-      if (c) insufficient.push({ criterionId: id, title: c.title, reason: "the judgement check could not be completed" });
+      if (c) insufficient.push({ criterionId: id, title: c.title, reason: "the judgement check could not be completed", ...layerOf(c) });
     }
     for (const f of input.judgement.findings) {
       const c = criterionById(rubric, f.criterionId);
@@ -1031,11 +1045,12 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
         sourceQuote: c.source.quote,
         detail: f.detail,
         whatWouldHelp: f.whatWouldHelp,
+        ...layerOf(c),
       });
     }
     for (const s of input.judgement.strengths) {
       const c = criterionById(rubric, s.criterionId);
-      if (c) strengths.push({ criterionId: c.criterionId, title: c.title, detail: s.detail });
+      if (c) strengths.push({ criterionId: c.criterionId, title: c.title, detail: s.detail, ...layerOf(c) });
     }
     for (const n of input.judgement.statementNotes) {
       const c = criterionById(rubric, n.criterionId);
@@ -1067,6 +1082,7 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
         statementVersion: statementRef ? statementRef.version : null,
         // Already range-checked against the blocks sent. Absent when not valid.
         ...(n.blockIndex !== null && statementRef ? { nodePath: [n.blockIndex] } : {}),
+        ...layerOf(c),
       });
     }
   }

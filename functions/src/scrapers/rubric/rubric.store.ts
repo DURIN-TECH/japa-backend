@@ -2,6 +2,7 @@ import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../utils/firebase";
 import type { RubricExtractionRun, RubricHead, VisaRubric } from "../../types/rubric";
 import { applyExclusions } from "./rubric-exclusions";
+import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, withKeyParts } from "./rubric-key";
 
 // ============================================
 // RUBRIC — FIRESTORE STORE (issue #40)
@@ -9,7 +10,10 @@ import { applyExclusions } from "./rubric-exclusions";
 //
 // Layout (all backend-only: no firestore.rules match, clients are denied):
 //
-//   visaRubrics/{countryCode}_{visaTypeId}                 RubricHead
+//   visaRubrics/{authorityId}_{routeSlug}                  RubricHead
+//     (#233: for a country authority that is `{countryCode}_{visaTypeId}`,
+//     every key that existed before; for a bloc or treaty it is
+//     `{issuingAuthorityId}_{sharedRouteId}`. See rubric-key.ts.)
 //   visaRubrics/{routeKey}/rubricVersions/{version}        VisaRubric
 //   rubricExtractionRuns/{runId}                           RubricExtractionRun
 //
@@ -30,6 +34,11 @@ import { applyExclusions } from "./rubric-exclusions";
 //
 // Immutable versions: a version doc is only ever created. A version number
 // that already exists is refused, never overwritten.
+//
+// (#233) NO DATA MOVE. Every read below passes the document through
+// `withKeyParts`, so a head or version written before #233 (only
+// `countryCode` + `visaTypeId`) reads with `authorityId` + `routeSlug` filled
+// in from them, in memory. Nothing is ever rewritten to add them.
 
 /**
  * Head doc id of a route. Both parts are checked so neither can carry a `/`.
@@ -41,6 +50,17 @@ export function rubricRouteKey(countryCode: string, visaTypeId: string): string 
   if (!/^[A-Z]{2}$/.test(countryCode)) throw new Error(`Invalid country code (two upper-case letters expected): ${JSON.stringify(countryCode)}`);
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(visaTypeId)) throw new Error(`Invalid visa type id: ${JSON.stringify(visaTypeId)}`);
   return `${countryCode}_${visaTypeId}`;
+}
+
+/**
+ * (#233) Head doc id of ANY rulebook: `{authorityId}_{routeSlug}`, checked by
+ * the authority id rules (authorities/authority-ids.ts), so neither part can
+ * carry a `/` or an extra `_` in the authority. For a country authority this
+ * equals `rubricRouteKey(countryCode, visaTypeId)`.
+ * @throws Error for invalid parts.
+ */
+export function rulebookKeyOf(authorityId: string, routeSlug: string): string {
+  return rulebookTargetOf({ authorityId, routeSlug }).routeKey;
 }
 
 /** Thrown when a write would break the governance or immutability rules. */
@@ -91,13 +111,14 @@ export class RubricStore {
   /** The head of a route, or null when the route has no rubric yet. */
   async getHead(routeKey: string): Promise<RubricHead | null> {
     const snap = await collections.visaRubrics.doc(routeKey).get();
-    return snap.exists ? (snap.data() as RubricHead) : null;
+    // (#233) Old heads read with authorityId / routeSlug filled in (no data move).
+    return snap.exists ? withKeyParts(snap.data() as RubricHead) : null;
   }
 
   /** Every head (the registry of routes that have a rubric). Small. */
   async listHeads(): Promise<RubricHead[]> {
     const snap = await collections.visaRubrics.get();
-    return snap.docs.map((d) => d.data() as RubricHead);
+    return snap.docs.map((d) => withKeyParts(d.data() as RubricHead));
   }
 
   /**
@@ -114,12 +135,24 @@ export class RubricStore {
    * the assessments' staleness check keys on.
    */
   async getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null> {
-    const routeKey = rubricRouteKey(countryCode, visaTypeId);
+    return this.getApprovedRubricByKey(rubricRouteKey(countryCode, visaTypeId));
+  }
+
+  /**
+   * (#233) The same read for ANY rulebook key (`{authorityId}_{routeSlug}`):
+   * a country's own layer or a bloc/treaty's shared layer. The stack loader
+   * (rubric-stack.ts) reads every layer through this, so each layer gets
+   * exactly the guarantees above (approved only, re-checked, exclusions
+   * applied). Throws on a malformed key, like `getApprovedRubric`.
+   */
+  async getApprovedRubricByKey(routeKey: string): Promise<VisaRubric | null> {
+    if (!rulebookPartsOf({ routeKey })) throw new Error(`Invalid rulebook key: ${JSON.stringify(routeKey)}`);
     const head = await this.getHead(routeKey);
     if (!head || head.approvedVersion === null || head.approvedVersion === undefined) return null;
     const snap = await subcollections.rubricVersions(routeKey).doc(String(head.approvedVersion)).get();
     if (!snap.exists) return null;
-    const rubric = snap.data() as VisaRubric;
+    // (#233) A version written before #233 reads with its key parts filled in.
+    const rubric = withKeyParts(snap.data() as VisaRubric);
     // Belt and braces: trust the version's own status, not just the pointer.
     if (rubric.reviewStatus !== "approved") return null;
     // THE one read-side filter (#161): what the reviewer excluded at approval
@@ -138,7 +171,7 @@ export class RubricStore {
    */
   async getVersionForReview(routeKey: string, version: number): Promise<VisaRubric | null> {
     const snap = await subcollections.rubricVersions(routeKey).doc(String(version)).get();
-    return snap.exists ? (snap.data() as VisaRubric) : null;
+    return snap.exists ? withKeyParts(snap.data() as VisaRubric) : null;
   }
 
   /**
@@ -173,8 +206,18 @@ export class RubricStore {
     ) {
       throw new RubricStoreError("not_pending", "extraction may only write a pending_review rubric with untouched review fields");
     }
-    const routeKey = rubricRouteKey(draft.countryCode, draft.visaTypeId);
-    if (draft.routeKey !== routeKey) throw new RubricStoreError("route_mismatch", "routeKey does not match countryCode and visaTypeId");
+    // (#233) The draft names its rulebook by authorityId + routeSlug (any
+    // authority) or, as before, countryCode + visaTypeId; both must agree with
+    // its routeKey. A country draft keeps both pairs; a bloc/treaty draft has
+    // no country fields.
+    let target;
+    try {
+      target = rulebookTargetOf(draft);
+    } catch (err) {
+      throw new RubricStoreError("route_mismatch", (err as Error).message);
+    }
+    const routeKey = target.routeKey;
+    if (draft.routeKey !== routeKey) throw new RubricStoreError("route_mismatch", "routeKey does not match authorityId and routeSlug (countryCode and visaTypeId)");
 
     const now = opts.now ?? Timestamp.now();
     const headRef = collections.visaRubrics.doc(routeKey);
@@ -192,7 +235,8 @@ export class RubricStore {
       const existing = await tx.get(versionRef);
       if (existing.exists) throw new RubricStoreError("version_exists", `rubric version ${routeKey}/${version} already exists`);
 
-      const rubric: VisaRubric = { ...draft, version };
+      // (#233) Every new version carries authorityId + routeSlug (and the country pair for a country).
+      const rubric: VisaRubric = { ...draft, ...keyFieldsOf(target), version };
       tx.set(versionRef, rubric as unknown as Record<string, unknown>);
       opts.guard?.commit(tx, version);
       if (head) {
@@ -201,9 +245,8 @@ export class RubricStore {
         tx.update(headRef, { latestVersion: version, latestSourceSetHash: draft.sourceSetHash, sourceIds, updatedAt: now });
       } else {
         const newHead: RubricHead = {
-          routeKey,
-          countryCode: draft.countryCode,
-          visaTypeId: draft.visaTypeId,
+          // (#233) routeKey + authorityId + routeSlug, and countryCode + visaTypeId for a country only.
+          ...keyFieldsOf(target),
           sourceIds,
           approvedVersion: null,
           latestVersion: version,

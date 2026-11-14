@@ -17,10 +17,15 @@
 //  - Free-text answers are personal data: never logged here.
 //
 // The approved rubric is read through #40's `rubricStore.getApprovedRubric`.
+// (#233) Since P4a it is the application's rulebook STACK (shared layer(s)
+// plus its own), read through services/ai/application-rulebook.ts; for a route
+// without inheritance that is the same `getApprovedRubric` read.
 
 import { Timestamp } from "firebase-admin/firestore";
 import { collections } from "../utils/firebase";
-import { rubricStore, rubricRouteKey } from "../scrapers";
+import { layerVersionsOf, rubricRouteKey, type RulebookStack } from "../scrapers";
+import { defaultRulebookStack, type ApplicationStackRef } from "./ai/application-rulebook";
+import type { RulebookStackLayer } from "../types/rubric";
 import { Application, ApplicationStatus } from "../types";
 import { answerIncludesAny, effectiveIntakeQuestions } from "./ai/rule-applicability";
 import {
@@ -76,7 +81,22 @@ interface ApprovedIntake {
   version: number;
   meta: IntakeMeta;
   questions: IntakeQuestion[];
+  // (#233) Only for a rulebook stack of more than one layer: every layer's
+  // version (saved with the answers) and the layer list (approved / missing).
+  layerVersions?: Record<string, number | null>;
+  layers?: RulebookStackLayer[];
 }
+
+/**
+ * (#233) How the intake reads an application's rulebook: its STACK (shared
+ * layer(s) + its own), through services/ai/application-rulebook.ts. The
+ * default reader is the store's approved read (`getApprovedRubric` for the
+ * own layer alone, `getRulebookStack` for the whole stack). A property of the
+ * module so a test can swap it.
+ */
+export const intakeRulebookReader: { read: (app: ApplicationStackRef) => Promise<RulebookStack> } = {
+  read: (app) => defaultRulebookStack(app),
+};
 
 /**
  * The approved rubric's intake for a route, or null when there is no
@@ -89,17 +109,20 @@ interface ApprovedIntake {
  * rather than silently addressing a second key; the caller treats that as no
  * intake.
  */
-async function loadApprovedIntake(
-  countryCode: string,
-  visaTypeId: string
-): Promise<ApprovedIntake | null> {
-  let rubric;
+async function loadApprovedIntake(application: ApplicationStackRef): Promise<ApprovedIntake | null> {
+  const { countryCode, visaTypeId } = application;
+  let stack: RulebookStack;
   try {
-    rubric = await rubricStore.getApprovedRubric(countryCode, visaTypeId);
+    // (#233) The union of the stack's layers' questions, each asked once (a
+    // shared layer's question ids are scoped by its rulebook key, so two
+    // layers never share an answer). For a route without inheritance this is
+    // exactly the own layer's approved rubric, as before.
+    stack = await intakeRulebookReader.read(application);
   } catch {
     // Invalid route key parts: no such route, so no intake step.
     return null;
   }
+  const rubric = stack.usable ? stack.rubric : null;
   if (!rubric) return null;
   if (!Array.isArray(rubric.intakeQuestions) || rubric.intakeQuestions.length === 0) return null;
   // (#207) A question that only specialist or conditional rules read is shown
@@ -107,11 +130,13 @@ async function loadApprovedIntake(
   // each question's `showWhen`); one that only unassessable specialist rules
   // read is left out. See effectiveIntakeQuestions.
   const questions = effectiveIntakeQuestions(rubric);
+  const layerVersions = layerVersionsOf(rubric);
   return {
     routeKey: rubricRouteKey(countryCode, visaTypeId),
     version: rubric.version,
     meta: rubric.intake ?? {},
     questions,
+    ...(layerVersions ? { layerVersions, layers: rubric.stackLayers } : {}),
   };
 }
 
@@ -316,7 +341,7 @@ export class IntakeService {
    * `read` access to the application.
    */
   async getIntake(application: Application): Promise<IntakeResponse> {
-    const approved = await loadApprovedIntake(application.countryCode, application.visaTypeId);
+    const approved = await loadApprovedIntake(application);
     const editable = this.isEditable(application);
 
     // No approved rubric / no questions: the client shows no intake step.
@@ -358,6 +383,8 @@ export class IntakeService {
       openRequiredIds: openRequired(approved.questions, answers),
       // #42 (assessment engine) will fill this in.
       lastReviewAt: null,
+      // (#233) Only on a multi-layer stack: which layer is approved or missing.
+      ...(approved.layers ? { layers: approved.layers } : {}),
     };
   }
 
@@ -373,7 +400,7 @@ export class IntakeService {
   async saveIntake(application: Application, rawAnswers: unknown): Promise<IntakeResponse> {
     if (!this.isEditable(application)) throw new Error("NOT_EDITABLE");
 
-    const approved = await loadApprovedIntake(application.countryCode, application.visaTypeId);
+    const approved = await loadApprovedIntake(application);
     if (!approved) throw new Error("NO_INTAKE");
 
     if (!rawAnswers || typeof rawAnswers !== "object" || Array.isArray(rawAnswers)) {
@@ -403,6 +430,8 @@ export class IntakeService {
     const intake: ApplicationIntake = {
       routeKey: approved.routeKey,
       rubricVersion: approved.version,
+      // (#233) Every layer's version, on a multi-layer stack only.
+      ...(approved.layerVersions ? { layerVersions: approved.layerVersions } : {}),
       answers: toStore,
       updatedAt: Timestamp.now(),
     };

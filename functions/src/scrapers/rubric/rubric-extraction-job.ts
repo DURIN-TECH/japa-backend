@@ -27,7 +27,8 @@ import {
 } from "./rubric-extraction.service";
 import type { QuoteTranslation } from "../../types/rubric";
 import { loadRubricSettings, type LoadedRubricSettings } from "./rubric-settings";
-import { rubricRouteKey, rubricStore, type RubricStore } from "./rubric.store";
+import { rubricStore, type RubricStore } from "./rubric.store";
+import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, type RulebookTarget, type RulebookTargetInput } from "./rubric-key";
 import {
   isTerminalStatus,
   rubricExtractionJobStore,
@@ -132,8 +133,25 @@ import {
 /** Tag on every line this module logs. */
 const TAG = "[rubric-job]";
 
+/**
+ * (#233) The key fields of a stored job, whichever shape it was written in (a
+ * job stored before #233 has only `countryCode` + `visaTypeId`). The job's own
+ * `routeKey` is the document key the job was planned for, so it is kept.
+ * @throws Error for a job whose key cannot be read (never written by this module).
+ */
+function jobKeyFields(job: RubricExtractionJob): ReturnType<typeof keyFieldsOf> {
+  const parts = rulebookPartsOf(job);
+  if (!parts) throw new Error(`job ${job.jobId} has no readable rulebook key`);
+  return { ...keyFieldsOf(parts), routeKey: job.routeKey };
+}
+
 /** What `startJob` takes. */
-export interface StartJobInput extends Pick<ExtractRouteInput, "countryCode" | "visaTypeId" | "sourceIds" | "force" | "dryRun" | "trigger"> {
+/**
+ * (#233) The rulebook is named by `authorityId` + `routeSlug` (any authority,
+ * including a bloc or treaty's shared route) or, as before, `countryCode` +
+ * `visaTypeId`.
+ */
+export interface StartJobInput extends RulebookTargetInput, Pick<ExtractRouteInput, "sourceIds" | "force" | "dryRun" | "trigger"> {
   // The admin who started it, for the record.
   requestedBy?: string | null;
 }
@@ -394,8 +412,11 @@ export class RubricExtractionJobService {
       routeKey, outcome: "refused", jobId: null, jobStatus: null, reasonCode, message, plan, estimate,
     });
     let routeKey: string;
+    let target: RulebookTarget;
     try {
-      routeKey = rubricRouteKey(input.countryCode, input.visaTypeId);
+      // (#233) Any authority's rulebook key; invalid parts are refused as before.
+      target = rulebookTargetOf(input);
+      routeKey = target.routeKey;
     } catch (err) {
       return refuse("invalid_route", (err as Error).message);
     }
@@ -414,7 +435,7 @@ export class RubricExtractionJobService {
       }
 
       // ---- the plan: read the text, cut it, check the caps ----
-      const routeName = await this.service.routeName(input.countryCode, input.visaTypeId);
+      const routeName = await this.service.routeNameOf(target);
       const ctx = await this.service.buildRunContext(resolved.sources, settings, routeName);
       if (ctx.chunks.length === 0) throw new RunStop("failed", "no_text", "the snapshots hold no text to extract from");
       this.service.assertWithinCaps(ctx.chunks, settings);
@@ -453,9 +474,8 @@ export class RubricExtractionJobService {
       };
       const fresh: RubricExtractionJob = {
         jobId,
-        routeKey,
-        countryCode: input.countryCode,
-        visaTypeId: input.visaTypeId,
+        // (#233) routeKey + authorityId + routeSlug (+ the country pair for a country).
+        ...keyFieldsOf(target),
         status: "queued",
         reasonCode: null,
         message: null,
@@ -553,9 +573,8 @@ export class RubricExtractionJobService {
   private runRecordOf(job: RubricExtractionJob, status: RubricExtractionRun["status"], outcome: Outcome | null, finishedAt: Timestamp | null): RubricExtractionRun {
     return {
       runId: job.runId,
-      routeKey: job.routeKey,
-      countryCode: job.countryCode,
-      visaTypeId: job.visaTypeId,
+      // (#233) The job's key fields, whichever shape the job was stored in.
+      ...jobKeyFields(job),
       status,
       // A job counts against the daily cap from the moment it exists.
       reachedModel: true,
@@ -994,7 +1013,7 @@ export class RubricExtractionJobService {
     if (stale.length > 0) return this.stopped(jobId, owner, { status: "skipped", reasonCode: "sources_changed", message: "a source changed while the job was running; no version was written (the change starts a new job)" }, stepsRun);
 
     const assembled = assembleDraft(
-      { routeKey: job.routeKey, countryCode: job.countryCode, visaTypeId: job.visaTypeId, sources: job.sources, sourceSetHash: job.sourceSetHash, model: job.model, runId: job.runId, severityLevels: ctx.severityLevels, chunkCount: ctx.chunks.length, midSentence: ctx.midSentence, createdAt: this.now() },
+      { ...jobKeyFields(job), sources: job.sources, sourceSetHash: job.sourceSetHash, model: job.model, runId: job.runId, severityLevels: ctx.severityLevels, chunkCount: ctx.chunks.length, midSentence: ctx.midSentence, createdAt: this.now() },
       replay.parts,
       replay.translations
     );

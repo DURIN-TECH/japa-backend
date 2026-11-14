@@ -2,7 +2,8 @@ import { createHash } from "crypto";
 import { FieldValue, Timestamp, type Transaction } from "firebase-admin/firestore";
 import { ROLES } from "@durin-tech/authz";
 import { collections, db, subcollections } from "../utils/firebase";
-import { rubricStore, type VisaRubric } from "../scrapers";
+import { rubricStore, type RulebookStack, type VisaRubric } from "../scrapers";
+import { defaultRulebookStack, rulebookFor, type ApplicationStackRef } from "./ai/application-rulebook";
 import type { Application } from "../types";
 import type { ApplicationAssessment } from "../types/assessment";
 import {
@@ -166,6 +167,9 @@ export type ChatOutcome =
 export interface ChatDeps {
   provider: LlmProvider;
   getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null>;
+  // (#233) The application's merged rulebook STACK (set by the default deps;
+  // without it the own layer alone is read, as every route without inheritance).
+  getRulebookStack?(app: ApplicationStackRef): Promise<RulebookStack>;
   readSettings(): Promise<AiSettingsRead>;
   runTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>;
   now(): Date;
@@ -497,6 +501,7 @@ function defaultDeps(): ChatDeps {
   return {
     provider: new AnthropicLlmProvider(),
     getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc, vt),
+    getRulebookStack: (app) => defaultRulebookStack(app),
     readSettings: readAiSettings,
     runTransaction: (fn) => db.runTransaction(fn),
     now: () => new Date(),
@@ -570,7 +575,8 @@ export class AiChatService {
       if (!assessment) kind = found.inFlight ? "assessment_pending" : "no_assessment";
     }
     if (kind === null) {
-      rubric = await this.deps.getApprovedRubric(app.countryCode, app.visaTypeId);
+      // (#233) The chat answers from the application's whole rulebook stack (each rule keeps its own quote and URL).
+      rubric = await rulebookFor(app, this.deps);
       if (!rubric) kind = "no_rubric";
     }
     if (kind !== null) {
