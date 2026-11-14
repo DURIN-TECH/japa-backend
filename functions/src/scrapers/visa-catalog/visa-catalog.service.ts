@@ -235,7 +235,7 @@ class VisaCatalogService {
       linkedSurcharges: linked.meta,
     });
 
-    // Issue #212: the version stamp of THIS page's adapter (GB carries +items-v1).
+    // Issue #212: the version stamp of THIS page's adapter (GB carries +items-vN).
     const stamp = extractionVersionFor(params.sourceMeta?.sourceProvider);
 
     // Provenance + audit trail (adapter fields merged in when given).

@@ -21,6 +21,13 @@ import { itemKey } from "../required-document-meta";
 //      as "You must have ..." in a `<p>` of such a part,
 //      e.g. Standard Visitor's "You must have a passport or travel document
 //      that is valid for the whole of your stay in the UK."
+//   3. REQUIREMENT-WITH-EXCEPTIONS sentences (issue #276): a `<p>` that states
+//      the requirement itself and then lists only the EXCEPTIONS,
+//      "<who> will need to provide <X>, unless both of the following are true:"
+//      followed by a `<ul>` / `<ol>`. The item is <X>, a verbatim span of the
+//      sentence (BN(O)'s "evidence that their home address is the same as
+//      yours"); the sentence travels with it as `quote`. The listed exceptions
+//      are conditions, not items, and are never collected.
 //
 // PURE: no Firebase, no network (adapter modules must stay importable without
 // Admin init, see adapters/types.ts).
@@ -33,6 +40,13 @@ export interface PageListItem {
   leadIn: string;
   /** The part slug it was found in (e.g. "documents-you-must-provide"). */
   section: string;
+  /**
+   * Issue #276: the whole verbatim sentence, set only when `text` is a SPAN of
+   * a sentence (shape 3). Used as the appended item's citation quote and kind
+   * quote, so its "unless ..." condition is kept. Absent for shapes 1 and 2
+   * (there the item text is the whole `<li>` / sentence).
+   */
+  quote?: string;
 }
 
 /** One guide part as the collector needs it: slug + HTML body. */
@@ -69,6 +83,33 @@ export function isRecognisedLeadIn(text: string): boolean {
 // need to give details of your children ..."; UK Family alone has five), so only
 // "You must have" is collected (Standard Visitor's passport sentence is the case).
 const PROSE_CUE_RE = /^you must have /i;
+
+// Shape 3 (issue #276). A sentence that is itself the requirement and ends by
+// introducing the EXCEPTIONS list:
+//   "Your family members (‘dependants’) will need to provide evidence that their
+//    home address is the same as yours, unless both of the following are true:"
+// Group 1 is the item, verbatim. Deliberately narrow:
+//   - "will need to provide" / "'ll need to provide" (the provide verb the
+//     lead-ins use), so "You'll need to show ..." / "must apply ..." never match;
+//   - the object ends at ", unless <both|either|all|any|one|each> of the
+//     following is/are true:". Sentences whose list is the thing to provide,
+//     or whose "unless" names something else ("..., unless your job is in one
+//     of the following occupation codes:", Health and Care Worker) do not
+//     match: their list is not a set of exceptions of this shape.
+// On every recorded guide (the six golden guides, Health and Care Worker and
+// BN(O)) only the BN(O) home-address sentence matches.
+const REQUIREMENT_UNLESS_RE =
+  /^[^.:]*?(?:\bwill|['\u2019]ll) need to provide (.+?), unless (?:both|either|all|any|one|each) of the following (?:is|are) true:$/i;
+
+/**
+ * The item a shape-3 sentence asks for (verbatim span), or null when `text`
+ * is not that shape. Exported for tests.
+ */
+export function requirementWithExceptions(text: string): string | null {
+  const m = REQUIREMENT_UNLESS_RE.exec(text);
+  const item = m?.[1]?.trim();
+  return item ? item : null;
+}
 
 /** Collapse whitespace in text taken from HTML. */
 function collapse(s: string): string {
@@ -109,6 +150,9 @@ export function collectPageItems(
   const add = (item: PageListItem) => {
     const key = itemKey(item.text);
     if (!key || seen.has(key) || !seenText.includes(key)) return;
+    // A span item (shape 3) also needs its whole sentence in the sent text: the
+    // sentence is what the appended citation quotes.
+    if (item.quote && !seenText.includes(itemKey(item.quote))) return;
     seen.add(key);
     out.push(item);
   };
@@ -134,7 +178,14 @@ export function collectPageItems(
     const prose: PageListItem[] = [];
     $("p").each((_, p) => {
       const text = collapse(htmlFragmentToText($.html(p), textOpts));
-      if (text.endsWith(":")) return; // a lead-in line, not a sentence
+      if (text.endsWith(":")) {
+        // Shape 3 (issue #276): a requirement sentence that introduces its
+        // exceptions list. The list must DIRECTLY follow (same rule as lead-ins);
+        // its <li>s are the exceptions and are not collected.
+        const item = requirementWithExceptions(text);
+        if (item && $(p).next().is("ul, ol")) prose.push({ text: item, leadIn: "", section: part.slug, quote: text });
+        return; // otherwise a lead-in line, not a sentence
+      }
       for (const s of sentences(text)) {
         if (PROSE_CUE_RE.test(s)) prose.push({ text: s, leadIn: "", section: part.slug });
       }
