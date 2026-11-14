@@ -22,6 +22,7 @@ import { checkDraftedRule, readBoundedList, type DraftSource } from "../../src/e
 import { ENTRY_CHECK_SYSTEM_PROMPT, ENTRY_CODING_SYSTEM_PROMPT, ENTRY_DRAFT_SYSTEM_PROMPT, type RawEntryRule } from "../../src/entry-requirements/entry-rule-prompt";
 import { runEntryRuleDrafting, type PipelineDeps } from "../../src/entry-requirements/entry-rule-pipeline";
 import type { EntryRuleStore } from "../../src/entry-requirements/entry-rule.store";
+import { entryRuleProblems } from "../../src/entry-requirements/entry-rule-validate";
 import { emptyLlmUsage, type LlmProvider, type LlmRequest, type LlmResponse } from "../../src/services/ai/llm-provider";
 import type { EntryRule, EntryRuleHead, EntryRuleRun } from "../../src/types/entry-requirements";
 
@@ -249,8 +250,7 @@ class MemStore implements EntryRuleStore {
   }
   async saveRun(run: EntryRuleRun, rules: EntryRule[], opts: { publish: boolean; sourceUrls: string[] }): Promise<void> {
     // The real store's validation runs on every rule.
-    const { assertStorableEntryRule } = await import("../../src/entry-requirements/entry-rule-validate");
-    for (const r of rules) assertStorableEntryRule(r);
+    for (const r of rules) assert.deepEqual(entryRuleProblems(r), [], r.id);
     for (const r of rules) this.rules.set(r.id, r);
     this.runs.push(run);
     if (opts.publish) this.head = { authorityId: run.authorityId, publishedRunId: run.id, publishedAt: null, publishedRuleCount: rules.filter((r) => r.status === "published").length, lastRunId: run.id, lastRunStatus: run.status, sourceUrls: opts.sourceUrls, updatedAt: null as any };

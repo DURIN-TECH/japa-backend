@@ -236,7 +236,7 @@ describe("HTTP", () => {
 
   test("free for every signed-in role (no plan gate): an unseeded pair answers unknown", async () => {
     for (const t of ["t-client", "t-agent", "t-owner", "t-admin"]) {
-      const r = await get(`/entry-requirements?destination=XZ&nationality=XB`, t);
+      const r = await get("/entry-requirements?destination=XZ&nationality=XB", t);
       assert.equal(r.status, 200, t);
       assert.equal(r.body.data.status, "unknown");
       assert.equal(r.body.data.code, "no_rule");
