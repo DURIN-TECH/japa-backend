@@ -24,6 +24,7 @@ import { adminGuidanceSourceRoutes } from "./scrapers";
 import { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./scrapers";
 // Rubric review (issue #125): admin queue, detail with diff, approve / reject.
 import { adminRubricRoutes } from "./routes/rubric-review.routes";
+import { adminRubricExtractionJobRoutes } from "./routes/rubric-extraction-job.routes";
 // Published outcome statistics imports: admin run list + Run now (issue #116).
 import { adminOutcomeStatisticsRoutes } from "./scrapers";
 // Agency-scoped visa drafts / edits / submit (issue #100).
@@ -158,6 +159,9 @@ app.use("/admin/route-sources", adminRouteSourceRoutes);
 // Rubric review (issue #125): admin-only (verifyAuth + admin gate on every
 // route). The only routes that read an unapproved rubric version.
 app.use("/admin/rubrics", adminRubricRoutes);
+// Rulebook drafting jobs (issue #216): start, status and cancel of the
+// resumable background job. Admin-only, the same gate as /admin/rubrics.
+app.use("/admin/rubric-extraction-jobs", adminRubricExtractionJobRoutes);
 // Outcome statistics imports (issue #116): admin-only run records + manual run.
 app.use("/admin/outcome-statistics", adminOutcomeStatisticsRoutes);
 // Public, unauthenticated, cacheable local-currency rates (issue #178).

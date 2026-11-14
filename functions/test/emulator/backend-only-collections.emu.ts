@@ -50,6 +50,11 @@ const COLLECTIONS = [
   // applicant (or anyone) must never read or write them from a client.
   "rubricPublishRuns",
   "rubricPublishSettingsHistory",
+  // Rulebook drafting job (issue #216): the job document is the worker's
+  // trigger and holds usage and a cancel flag; its steps hold validated rule
+  // text. A client that could write it could start, restart or cancel a paid
+  // job, or read drafts before review.
+  "rubricExtractionJobs",
   // appConfig/{docId} is backend config. It now holds the automatic-publishing
   // kill switch (appConfig/rubricPublishSettings, issue #201), so a client that
   // could write it could turn automatic publishing on.
@@ -84,6 +89,9 @@ const SUBCOLLECTIONS: [string, string, string][] = [
   ["aiConversations", "seed", "messages"],
   ["riskSignals", "seed", "events"],
   ["visaRubrics", "seed", "rubricVersions"],
+  // (#216) The stored result of each drafting step, and the overflow parts of a large one.
+  ["rubricExtractionJobs", "seed", "steps"],
+  ["rubricExtractionJobs", "seed", "stepParts"],
 ];
 
 /** Who is asking. `uid` is the owner id seeded on documents so "own data" is tried too. */
@@ -138,7 +146,7 @@ describe("backend-only collections are denied to every client role", () => {
       }
       // Collection-group reads must not be a side door either.
       // (`messages` is left out: that name is shared with the user-facing conversations rules.)
-      for (const sub of ["proposedActions", "rubricVersions", "events"]) {
+      for (const sub of ["proposedActions", "rubricVersions", "events", "steps", "stepParts"]) {
         observed[`group ${sub}`] = await isDenied(db.collectionGroup(sub).get());
       }
       const leaks = Object.entries(observed).filter(([, denied]) => !denied).map(([k]) => k);

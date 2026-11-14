@@ -1360,7 +1360,9 @@ describe("rubric review: nothing unapproved is served", () => {
     // #201 (EXPLICIT extension): the automatic publisher is the one other
     // caller of the review service: it publishes through `decideAs`, the same
     // approval transaction an admin uses.
-    assert.deepEqual(importers, ["app.ts", path.join("controllers", "rubric-review.controller.ts"), path.join("routes", "rubric-review.routes.ts"), path.join("services", "rubric-auto-publish.service.ts")]);
+    // #216 (EXPLICIT extension): the drafting-job routes reuse the review router's
+    // admin gate (`requireRubricAdmin`), and nothing else of the review service.
+    assert.deepEqual(importers, ["app.ts", path.join("controllers", "rubric-review.controller.ts"), path.join("routes", "rubric-extraction-job.routes.ts"), path.join("routes", "rubric-review.routes.ts"), path.join("services", "rubric-auto-publish.service.ts")]);
     const app = fs.readFileSync(path.join(src, "app.ts"), "utf8");
     assert.deepEqual([...app.matchAll(/app\.use\("([^"]*)",\s*adminRubricRoutes\)/g)].map((m) => m[1]), ["/admin/rubrics"]);
     // The collections have no client rules.

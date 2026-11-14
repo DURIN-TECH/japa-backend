@@ -901,30 +901,24 @@ describe("rubric extraction: stale routes", () => {
     assert.deepEqual(await h.service.findStaleRoutes(), []);
   });
 
-  test("onGuidanceChanged re-extracts only the routes that use the changed source", async () => {
+  test("onGuidanceChanged looks at the routes that use the changed source (#216: it starts their drafting job, the job tests cover the rest)", async () => {
     await setUpRouteA(h);
     await runA(h);
+    // The listener starts jobs through this dependency; here it only records what it was asked.
+    const started: unknown[] = [];
+    (h.service as any).deps.startJob = async (input: unknown) => {
+      started.push(input);
+      return { routeKey: KEY_A, outcome: "unchanged", jobId: null, jobStatus: null, reasonCode: "source_unchanged", message: null, plan: [], estimate: null };
+    };
     // A change event for a source no route uses: nothing happens.
     assert.deepEqual((await quiet(() => h.service.onGuidanceChanged({ sourceId: "some-other-source" }))).result, []);
-    // A change event for route A's source while its hash is the same: free.
+    assert.equal(started.length, 0);
+    // A change event for route A's source: one job start for that route, nothing run inline.
     const same = await quiet(() => h.service.onGuidanceChanged({ sourceId: SOURCE_A_ID }));
-    assert.deepEqual(same.result.map((r) => r.status), ["unchanged"]);
-    // The first run's two calls; the unchanged re-check made none.
+    assert.deepEqual(same.result.map((r) => r.outcome), ["unchanged"]);
+    assert.deepEqual(started, [{ countryCode: ROUTE_A.countryCode, visaTypeId: ROUTE_A.visaTypeId, trigger: "guidance_changed" }]);
+    // The first run's two calls; the listener made none.
     assert.equal(h.provider.requests.length, 2);
-  });
-
-  test("(#169) onGuidanceChanged logs differently when no rubric exists yet and when heads exist but none uses the source", async () => {
-    await setUpRouteA(h);
-    // No head yet: the log says the first extraction is manual and names the script.
-    const none = await quiet(() => h.service.onGuidanceChanged({ sourceId: SOURCE_A_ID }));
-    assert.deepEqual(none.result, []);
-    assert.ok(none.lines.some((l) => l.includes("no rubric exists yet") && l.includes("by hand") && l.includes("extract:rubric")), none.lines.join("\n"));
-    // A head exists, but none lists this source: a different line, no "by hand" advice.
-    await runA(h);
-    const other = await quiet(() => h.service.onGuidanceChanged({ sourceId: "some-other-source" }));
-    assert.deepEqual(other.result, []);
-    assert.ok(other.lines.some((l) => l.includes("no rubric head lists this source")), other.lines.join("\n"));
-    assert.ok(!other.lines.some((l) => l.includes("no rubric exists yet")));
   });
 
   test("a dry run plans the chunks, calls no model and writes nothing", async () => {

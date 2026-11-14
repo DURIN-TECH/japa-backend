@@ -82,6 +82,9 @@ export { seedGuidanceSources } from "./guidance/data/seed-guidance-sources";
 // ---- Visa rubrics (issue #40) ----
 /** Rubric extraction from guidance snapshots (always writes `pending_review`). */
 export { rubricExtractionService } from "./rubric/rubric-extraction.service";
+/** (#216) The resumable background job that drafts a rulebook in saved steps (worker, sweep, start, cancel, status). */
+export { rubricExtractionJobService } from "./rubric/rubric-extraction-job";
+export type { JobView, StartJobInput, StartJobResult } from "./rubric/rubric-extraction-job";
 /**
  * Rubric store. Consumers use `getApprovedRubric` ONLY (an unapproved version
  * is never returned by it); the `...ForReview` reads are for the admin review

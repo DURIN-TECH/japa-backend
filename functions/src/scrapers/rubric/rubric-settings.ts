@@ -42,6 +42,22 @@ export interface RubricExtractionSettings {
   maxOutputTokensPerRequest: number;
   requestTimeoutMs: number;
   maxRunsPerDay: number;
+  // ---- (#216) the background job that drafts a rulebook in saved steps ----
+  // Model calls of one step that may fail (a transient provider error, a
+  // timeout, a crash while the call was in flight) before the job fails.
+  stepAttemptsMax: number;
+  // Wall clock one worker invocation may spend advancing a job. Must leave a
+  // margin under the function's 540 s cut-off; a new step starts only when a
+  // whole request timeout still fits inside it.
+  invocationBudgetMs: number;
+  // How long a worker's lease on a job lasts. A crashed worker's lease
+  // expires after this and the sweep resumes the job.
+  leaseMs: number;
+  // A job older than this is failed `job_timed_out` rather than left running.
+  jobMaxAgeMs: number;
+  // The sweep leaves a job alone while it made progress this recently (a
+  // worker is probably between two invocations).
+  jobIdleMs: number;
 }
 
 /**
@@ -67,6 +83,15 @@ export const DEFAULT_RUBRIC_SETTINGS: Readonly<RubricExtractionSettings> = Objec
   maxOutputTokensPerRequest: 48_000,
   requestTimeoutMs: 240_000,
   maxRunsPerDay: 20,
+  // (#216) Three tries of one step; a 450 s invocation budget (90 s under the
+  // function's 540 s limit); a lease slightly longer than a whole invocation;
+  // six hours for a job (a real route took 30-40 minutes, an outage is
+  // allowed for); two minutes of quiet before the sweep resumes a job.
+  stepAttemptsMax: 3,
+  invocationBudgetMs: 450_000,
+  leaseMs: 600_000,
+  jobMaxAgeMs: 21_600_000,
+  jobIdleMs: 120_000,
 });
 
 /** Allowed range of each numeric setting. */
@@ -77,6 +102,11 @@ const RANGES: Record<Exclude<keyof RubricExtractionSettings, "enabled">, [number
   maxOutputTokensPerRequest: [1_000, 128_000],
   requestTimeoutMs: [10_000, 600_000],
   maxRunsPerDay: [1, 1_000],
+  stepAttemptsMax: [1, 10],
+  invocationBudgetMs: [30_000, 500_000],
+  leaseMs: [60_000, 1_800_000],
+  jobMaxAgeMs: [600_000, 172_800_000],
+  jobIdleMs: [10_000, 3_600_000],
 };
 
 /**

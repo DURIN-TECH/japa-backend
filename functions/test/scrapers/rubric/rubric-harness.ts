@@ -20,6 +20,8 @@ import { RUBRIC_INTAKE_SYSTEM_PROMPT, delimiterTag, type RawCriterion, type RawR
 import { RubricExtractionService, type RubricExtractionDeps } from "../../../src/scrapers/rubric/rubric-extraction.service";
 import { DEFAULT_RUBRIC_SETTINGS, type RubricExtractionSettings } from "../../../src/scrapers/rubric/rubric-settings";
 import { RubricStore } from "../../../src/scrapers/rubric/rubric.store";
+import { RubricExtractionJobService, type RubricExtractionJobDeps } from "../../../src/scrapers/rubric/rubric-extraction-job";
+import { RubricExtractionJobStore } from "../../../src/scrapers/rubric/rubric-extraction-job.store";
 import { fakeCollection, fakeRunTransaction, store } from "../../helpers/fake-firestore";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -283,6 +285,10 @@ export async function installRubricFakes(): Promise<void> {
   firebase.collections.guidanceSources = fakeCollection("guidanceSources");
   firebase.collections.visaRubrics = fakeCollection("visaRubrics");
   firebase.collections.rubricExtractionRuns = fakeCollection("rubricExtractionRuns");
+  // (#216) The drafting job and the stored results of its steps.
+  firebase.collections.rubricExtractionJobs = fakeCollection("rubricExtractionJobs");
+  firebase.subcollections.rubricExtractionSteps = (id: string) => fakeCollection(`rubricExtractionJobs/${id}/steps`);
+  firebase.subcollections.rubricExtractionStepParts = (id: string) => fakeCollection(`rubricExtractionJobs/${id}/stepParts`);
   firebase.collections.appConfig = fakeCollection("appConfig");
   firebase.subcollections.guidanceSnapshots = (id: string) => fakeCollection(`guidanceSources/${id}/snapshots`);
   firebase.subcollections.rubricVersions = (key: string) => fakeCollection(`visaRubrics/${key}/rubricVersions`);
@@ -309,3 +315,89 @@ export const headDoc = (routeKey: string) => store.get(`visaRubrics/${routeKey}`
 export const versionPaths = () => [...store.keys()].filter((p) => p.includes("/rubricVersions/"));
 /** Every stored run record. */
 export const runDocs = () => [...store.entries()].filter(([p]) => p.startsWith("rubricExtractionRuns/")).map(([, d]) => d as any);
+
+// ----- (#216) The drafting job -----
+
+/**
+ * One in-memory transaction runner for EVERYTHING in a job test. Real Firestore
+ * transactions are serialisable; the plain fake runs callbacks as they come, so
+ * two racing workers could both read before either writes. Chaining them makes
+ * the fake behave like the real thing for the lease tests.
+ */
+let txChain: Promise<unknown> = Promise.resolve();
+export function serialTransaction<T>(fn: (tx: any) => Promise<T>): Promise<T> {
+  const run = txChain.then(() => fakeRunTransaction(fn));
+  txChain = run.catch(() => undefined);
+  return run;
+}
+
+/** The error a simulated process death throws out of every database call. */
+export class Killed extends Error {
+  constructor() {
+    super("the worker process was killed");
+  }
+}
+
+/** A job service plus the knobs a test turns. */
+export interface JobHarness {
+  h: Harness;
+  jobs: RubricExtractionJobService;
+  jobStore: RubricExtractionJobStore;
+  // Transactions started so far (every store: jobs and versions).
+  txCount: number;
+  // When set, every transaction from this number on throws `Killed` before touching anything (a dead process).
+  killAtTx: number | null;
+  // Model calls made, in order, as `<kind>|<snapshot tag>|<excerpt>`.
+  calls: string[];
+  // Milliseconds of the fake clock one model call takes.
+  callMs: number;
+  // Runs before each model call (may throw to script a failure); 1-based call number.
+  beforeCall: ((n: number, req: LlmRequest) => void) | null;
+  // Worker ids handed out, in order.
+  owners: string[];
+}
+
+/**
+ * Wire a job service over the harness: the same provider, snapshots, store,
+ * settings and clock, serialised transactions, an instant sleep, and a fake
+ * clock that moves `callMs` per model call.
+ */
+export function makeJobHarness(h: Harness, deps: Partial<RubricExtractionJobDeps> = {}): JobHarness {
+  const jobStore = new RubricExtractionJobStore();
+  const jh: JobHarness = { h, jobs: undefined as unknown as RubricExtractionJobService, jobStore, txCount: 0, killAtTx: null, calls: [], callMs: 0, beforeCall: null, owners: [] };
+  /** Count the transaction, die if it is time, else run it serialised. */
+  const run = <T>(fn: (tx: any) => Promise<T>): Promise<T> => {
+    jh.txCount += 1;
+    if (jh.killAtTx !== null && jh.txCount >= jh.killAtTx) return Promise.reject(new Killed());
+    return serialTransaction(fn);
+  };
+  jobStore.runTransaction = run as any;
+  h.rubrics.runTransaction = run as any;
+  // The provider: count calls, move the clock, allow scripted failures.
+  const base = h.provider.complete.bind(h.provider);
+  h.provider.complete = async (req: LlmRequest) => {
+    const kind = req.system === RUBRIC_INTAKE_SYSTEM_PROMPT ? "intake" : "criteria";
+    const tag = /<(source_text_[0-9a-f]+)> and/.exec(req.user)?.[1] ?? "?";
+    const excerpt = /Excerpt (\d+) of/.exec(req.user)?.[1] ?? "?";
+    jh.calls.push(`${kind}|${tag}|${excerpt}`);
+    jh.beforeCall?.(jh.calls.length, req);
+    h.state.nowMs += jh.callMs;
+    return base(req);
+  };
+  let n = 0;
+  jh.jobs = new RubricExtractionJobService({
+    service: h.service,
+    jobs: jobStore,
+    store: h.rubrics,
+    loadSettings: async () => ({ settings: h.settings, ...(h.state.readError ? { readError: h.state.readError } : {}) }),
+    clock: () => h.state.nowMs,
+    newOwnerId: () => {
+      const id = `worker-${++n}`;
+      jh.owners.push(id);
+      return id;
+    },
+    sleep: async () => undefined,
+    ...deps,
+  });
+  return jh;
+}

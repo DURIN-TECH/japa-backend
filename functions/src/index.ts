@@ -99,7 +99,7 @@ import { aiCaseOfficerService } from "./services/ai-case-officer.service";
 import { assessmentAutoRunService } from "./services/assessment-auto-run.service";
 import { bulkReassessmentService } from "./services/ai-bulk-reassessment.service";
 import { ruleChangeAlertsService } from "./services/rule-change-alerts.service";
-import { rubricExtractionService } from "./scrapers";
+import { rubricExtractionJobService, rubricExtractionService } from "./scrapers";
 import type { RubricReviewAuditEntry } from "./services/rubric-review.service";
 import { rubricAutoPublishService } from "./services/rubric-auto-publish.service";
 import { outcomeImportService, outcomeRunWorker, registeredDestinations } from "./scrapers";
@@ -886,10 +886,55 @@ export const onGuidanceSourceChanged = functions
     if (!after || after === before) return;
     try {
       const results = await rubricExtractionService.onGuidanceChanged({ sourceId: context.params.sourceId });
-      console.log(`[rule-change] source ${context.params.sourceId} changed: ${results.map((r) => r.status).join(",") || "no route uses it"}`);
+      console.log(`[rule-change] source ${context.params.sourceId} changed: ${results.map((r) => r.outcome).join(",") || "no route uses it"}`);
     } catch (error) {
       console.error("Re-extraction after a guidance change failed:", error);
     }
+  });
+
+/**
+ * Issue #216: the WORKER of the rulebook drafting job. Fires when a job
+ * document is created or its `kick` counter changes (the job bumps `kick` to
+ * hand over to the next invocation, and an admin start or the sweep bumps it to
+ * wake a worker); every other write to the job (a step finishing, the lease
+ * moving) is ignored, so a worker does not wake itself on its own progress.
+ * Each invocation takes a lease on the job and runs as many saved steps as fit
+ * in its time budget (under the 540 s cut-off), then hands over. A duplicate or
+ * late delivery finds a live lease or nothing left to do and returns. Binds
+ * AI_SECRETS: this is the function that makes the model calls of a draft. It
+ * never throws: a failure is recorded on the job.
+ */
+export const processRubricExtractionJob = functions
+  .runWith({ secrets: [...AI_SECRETS], timeoutSeconds: 540, memory: "1GB" })
+  .firestore.document("rubricExtractionJobs/{jobId}")
+  .onWrite(async (change, context) => {
+    const after = change.after.exists ? (change.after.data() as { status?: string; kick?: number }) : null;
+    if (!after || (after.status !== "queued" && after.status !== "running")) return;
+    const before = change.before.exists ? (change.before.data() as { kick?: number }) : null;
+    // Only a new job or a changed `kick` is a request for work.
+    if (before && before.kick === after.kick) return;
+    try {
+      const outcome = await rubricExtractionJobService.advance(context.params.jobId);
+      console.log(`[rubric-job] ${context.params.jobId}: ${outcome.kind}`);
+    } catch (error) {
+      console.error("Rubric drafting worker failed:", error);
+    }
+  });
+
+/**
+ * Issue #216: every 5 minutes, wake the drafting jobs that stalled: an active
+ * job with no live lease and no recent progress (its worker died, was
+ * redeployed or timed out, or the trigger was lost) gets its `kick` bumped,
+ * which fires `processRubricExtractionJob`. This function calls no model and
+ * takes no lease, so it binds no secret.
+ */
+export const sweepRubricExtractionJobs = functions
+  .runWith({ timeoutSeconds: 120, memory: "256MB" })
+  .pubsub.schedule("*/5 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const result = await rubricExtractionJobService.sweep();
+    if (result.considered > 0) console.log(`[rubric-job] sweep: ${JSON.stringify(result)}`);
   });
 
 /**
