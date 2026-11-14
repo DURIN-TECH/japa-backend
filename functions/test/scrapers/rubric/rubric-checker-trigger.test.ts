@@ -129,14 +129,30 @@ describe("the check run with triggers", () => {
     assert.deepEqual(out.ok && out.droppedTriggerIds, ["crit-0002"]);
   });
 
-  test("a protected rule's trigger needs BOTH models; one `no` holds the draft and names the rule", async () => {
+  // (#248) CHANGED on purpose: before #248 this held the draft. A BAR whose rule both models confirmed but
+  // whose trigger one did not is now served WITHOUT the trigger and judged, never code-decided (see
+  // rubric-bar-trigger.test.ts for the full set). The trigger still needs BOTH models to be KEPT.
+  test("a bar's trigger needs BOTH models to be kept; one `unsure` drops it and the bar is served judged, not held", async () => {
     const r = rig();
     const bar = barOf(5, { applicability: "specialist", applicabilityCondition: "Only for activity alpha", trigger: { questionId: "activity", anyOf: ["alpha"] } } as any);
     r.provider.triggerPolicy = ({ role }) => (role === "judgement" ? "unsure" : "yes");
     const out = await r.svc.check(input(draftOf([ruleOf(1), bar])));
+    assert.equal(out.ok, true);
+    assert.deepEqual(out.ok && out.droppedTriggerIds, ["crit-0005"]);
+    assert.deepEqual(out.ok && out.judgedBars?.map((b) => b.criterionId), ["crit-0005"]);
+    assert.equal(out.ok && out.protectedFailures, undefined, "not a protected failure");
+  });
+
+  // (#248) Only a BAR may lose its trigger: any other protected rule (here an objective rule scoped to a
+  // group, which code decides) still holds when its trigger is not confirmed, exactly as before.
+  test("a protected rule that is NOT a bar still holds when its trigger is not confirmed", async () => {
+    const r = rig();
+    const scoped = ruleOf(5, { kind: "objective", check: { field: "applicant.age", op: "gte", value: 18 }, probeFactors: undefined, appliesTo: { nationalities: ["QM"], asWritten: ["Group One"] }, applicability: "specialist", applicabilityCondition: "Only for activity alpha", trigger: { questionId: "activity", anyOf: ["alpha"] } } as any);
+    r.provider.triggerPolicy = ({ role }) => (role === "judgement" ? "unsure" : "yes");
+    const out = await r.svc.check(input(draftOf([ruleOf(1), scoped])));
     assert.equal(out.ok, false);
     assert.deepEqual(!out.ok && out.reasonCodes, ["protected_rule_failed:crit-0005"]);
-    assert.deepEqual(!out.ok && out.protectedRuleIds, ["crit-0005"]);
+    assert.equal(!out.ok && out.protectedFailures?.[0].repair.detail, "trigger_not_repairable");
   });
 
   test("a protected rule whose trigger both models confirm passes", async () => {
