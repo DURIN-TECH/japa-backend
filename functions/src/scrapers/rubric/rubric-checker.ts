@@ -1,7 +1,7 @@
 import { collections } from "../../utils/firebase";
 import { AnthropicNotConfiguredError } from "../../services/ai/anthropic-client";
 import { AnthropicLlmProvider, LlmProviderError, emptyLlmUsage, llmRequestHash, type LlmProvider, type LlmRequest, type LlmUsage } from "../../services/ai/llm-provider";
-import type { AssessmentCriterion, IntentPolarity, RubricProtectedFailure, RubricRepairStatus, RubricRuleRepair, VisaRubric } from "../../types/rubric";
+import type { AssessmentCriterion, IntentPolarity, LeaveOutBasis, RubricProtectedFailure, RubricRepairStatus, RubricRuleRepair, VisaRubric } from "../../types/rubric";
 import { isValidTrigger } from "../../utils/rubric-trigger";
 import { guidanceSnapshotStore } from "../guidance/guidance-snapshot.store";
 import type { GuidanceSnapshotContent } from "../guidance/types";
@@ -66,6 +66,9 @@ import { REPAIR_WINDOW_CHARS, ruleHashOf } from "./rubric-repair";
 //   ordinary, an applicable aspect no / unsure / na            -> leave out `checker:<first failing aspect>`
 //   ordinary, a not-applicable aspect no / unsure              -> leave out `checker:<that aspect>`
 //   a mandatory_bar, `stage_right` whatever the answer (#226)  -> not judged: cannot hold, cannot pass for it
+//   a judgement rule, `stage_right` whatever the answer (#240)  -> not judged, likewise (ordinary AND protected)
+//   an ORDINARY judgement rule, `kind_right` = unsure (#240)    -> passes (`no` still leaves it out; `na` still fails)
+//   an objective rule, stage or kind `unsure`                    -> leaves out, as before (both still matter, see below)
 //   ordinary, its quote cannot be found in its cited snapshot  -> leave out `checker:source_text`
 //   protected, both models pass every aspect                   -> keep
 //   protected, either model fails an aspect / disagrees        -> HOLD
@@ -152,27 +155,58 @@ export function applicableAspects(rule: RuleShape): ReadonlySet<CheckerAspect> {
 type RuleShape = Pick<AssessmentCriterion, "applicability" | "applicabilityCondition" | "check" | "appliesTo"> & { kind?: AssessmentCriterion["kind"] };
 
 /**
- * (#226) Aspects that are NEVER judged for a rule: whatever a model answers
+ * (#226, #240) Aspects that are NEVER judged for a rule: whatever a model answers
  * there (yes, no, unsure, na) can neither pass nor fail the rule.
  *
- * A mandatory bar's `stage` is only a label. The stage is read for ORDERING
- * alone (the order the assessment applies rules in, and the order of the
- * intake questions); a bar is decided by code from the applicant's group
- * whatever its stage, and nothing branches on it. A sentence that says a named
- * group "cannot be given permission" does not clearly belong to any of the four
- * stage definitions, so a careful model honestly answers `unsure`, and that
- * `unsure` held a rulebook over a label that changes no outcome. So for bars
- * the prompt tells the model to answer `na` for the stage, and code ignores the
- * aspect even if a model answers something else (a stray answer cannot hold).
+ * `stage_right` is not judged for a `mandatory_bar` (#226) and, since #240, not
+ * for a `judgement` rule either. Why it harms nobody on those two kinds:
+ *  - a bar is decided by code from the applicant's group whatever its stage;
+ *  - a judgement rule is never decided by code: `planJudgementBatches` only uses
+ *    the stage to SORT and batch the assessment model's reading (`stageRank` only
+ *    orders the intake questions), and the portal reads the stage only on a
+ *    code-decided REFUSAL GROUND (CaseAssessmentCard: "rejected as invalid" vs "a
+ *    refusal ground"), which a judgement rule can never be (it can only raise a
+ *    concern). So a wrong stage on a judgement rule changes an order and a label.
+ * A sentence that fits no stage definition made careful models honestly answer
+ * `unsure`, and that `unsure` held a real rulebook over a label (77 of the 213
+ * leave-outs of the first automatic run).
  *
- * Deliberately narrow: ONLY `stage_right`, ONLY for kind `mandatory_bar`. Every
- * other aspect of a bar, and every aspect of every other rule (including a
- * non-bar rule scoped to named countries, whose stage still orders and groups
- * its questions), is judged exactly as before. `unsure` still fails everywhere
- * it is judged.
+ * Deliberately narrow: stage is STILL judged for an `objective` rule (its stage
+ * decides the portal's "invalid" vs "refusal ground" note on a code-decided
+ * refusal), and every other aspect of every rule is judged. `unsure` still fails
+ * everywhere it is judged. Applies to ordinary AND protected rules alike.
  */
 export function unjudgedAspects(rule: { kind?: AssessmentCriterion["kind"] }): ReadonlySet<CheckerAspect> {
-  return rule.kind === "mandatory_bar" ? new Set<CheckerAspect>(["stage_right"]) : new Set<CheckerAspect>();
+  return rule.kind === "mandatory_bar" || rule.kind === "judgement" ? new Set<CheckerAspect>(["stage_right"]) : new Set<CheckerAspect>();
+}
+
+/**
+ * (#240) True when `kind_right = unsure` does NOT fail the rule: an ORDINARY rule
+ * already drafted as `judgement`. That is the safest handling there is at
+ * assessment: the rule is shown in full to the assessment model, never decided by
+ * code, and can only raise a concern. If the checker is unsure the kind is
+ * right, the worst outcome is the rule staying in that safest handling, so the
+ * doubt changes nothing for an applicant. Everything else keeps `unsure` = fail:
+ *  - `kind_right = no` still leaves the rule out (the checker is sure it is wrong);
+ *  - an `objective` rule (code decides: a wrong kind is a wrong code refusal);
+ *  - a PROTECTED rule (bar, or scoped to named groups): both models must say `yes`.
+ */
+function kindUnsureTolerated(rule: RuleShape): boolean {
+  return rule.kind === "judgement" && !isProtectedRule({ kind: rule.kind, appliesTo: rule.appliesTo });
+}
+
+/**
+ * The ONE place that says whether one verdict fails one aspect of a rule. Used by
+ * `failedAspect`, `failedAspectsOf` and `leaveOutBasis`, so they cannot disagree.
+ *  - never-judged aspect: never fails;
+ *  - ordinary judgement rule, `kind_right = unsure`: does not fail (#240);
+ *  - applicable aspect: only `yes` passes (`na` there is "not verified");
+ *  - not-applicable aspect: `na` and `yes` pass; `no` and `unsure` fail.
+ */
+function aspectFails(rule: RuleShape, aspect: CheckerAspect, verdict: VerdictRow[CheckerAspect], applicable: ReadonlySet<CheckerAspect>, unjudged: ReadonlySet<CheckerAspect>): boolean {
+  if (unjudged.has(aspect)) return false;
+  if (aspect === "kind_right" && verdict === "unsure" && kindUnsureTolerated(rule)) return false;
+  return applicable.has(aspect) ? verdict !== "yes" : verdict === "no" || verdict === "unsure";
 }
 
 /**
@@ -184,12 +218,23 @@ export function unjudgedAspects(rule: { kind?: AssessmentCriterion["kind"] }): R
 export function failedAspect(rule: RuleShape, row: VerdictRow): CheckerAspect | null {
   const applicable = applicableAspects(rule);
   const unjudged = unjudgedAspects(rule);
-  for (const a of CHECKER_ASPECTS) {
-    if (unjudged.has(a)) continue;
-    const v = row[a];
-    if (applicable.has(a) ? v !== "yes" : v === "no" || v === "unsure") return a;
-  }
+  for (const a of CHECKER_ASPECTS) if (aspectFails(rule, a, row[a], applicable, unjudged)) return a;
   return null;
+}
+
+/**
+ * (#240) Why an ORDINARY rule is left out, for the run record: `found_wrong` when
+ * any failing verdict is a `no` (a model said the rule is wrong), `not_confirmed`
+ * when every failing verdict is `unsure` or `na` (nobody said it is wrong; the
+ * check could not confirm it), or when there was no verdict row to read. Only
+ * FAILING verdicts count: a tolerated `unsure` (stage of a judgement rule, kind of
+ * an ordinary judgement rule) is not one. Both still count against the budget.
+ */
+export function leaveOutBasis(rule: RuleShape, row: VerdictRow | undefined): LeaveOutBasis {
+  if (!row) return "not_confirmed";
+  const applicable = applicableAspects(rule);
+  const unjudged = unjudgedAspects(rule);
+  return CHECKER_ASPECTS.some((a) => aspectFails(rule, a, row[a], applicable, unjudged) && row[a] === "no") ? "found_wrong" : "not_confirmed";
 }
 
 /**
@@ -206,11 +251,7 @@ export function failedAspectsOf(rule: RuleShape, ...rows: (VerdictRow | undefine
       continue;
     }
     const applicable = applicableAspects(rule);
-    for (const a of CHECKER_ASPECTS) {
-      if (unjudged.has(a)) continue;
-      const v = row[a];
-      if (applicable.has(a) ? v !== "yes" : v === "no" || v === "unsure") failed.add(a);
-    }
+    for (const a of CHECKER_ASPECTS) if (aspectFails(rule, a, row[a], applicable, unjudged)) failed.add(a);
   }
   return CHECKER_ASPECTS.filter((a) => failed.has(a));
 }
@@ -301,7 +342,7 @@ export interface RubricCheckInputShape {
 export type RubricCheckOutcomeShape =
   | {
     ok: true;
-    leftOut: { criterionId: string; reason: string }[];
+    leftOut: { criterionId: string; reason: string; basis?: LeaveOutBasis }[];
     resolvedFlagCodes: string[];
     intentPolarity: IntentPolarity | null;
     droppedTriggerIds?: string[];
@@ -318,7 +359,7 @@ export type RubricCheckOutcomeShape =
     // (#223) The complete held report: every protected failure with its per-aspect verdicts and its
     // repair attempt, the ordinary rules the check would have left out, and the spend.
     protectedFailures?: RubricProtectedFailure[];
-    leftOut?: { criterionId: string; reason: string }[];
+    leftOut?: { criterionId: string; reason: string; basis?: LeaveOutBasis }[];
     requests?: { total: number; repair: number };
   };
 
@@ -630,7 +671,7 @@ export class RubricCheckerService {
       repairRequests: 0,
       reusable,
     };
-    const stop = async (reasonCodes: string[], extra: { protectedRuleIds?: string[]; protectedFailures?: RubricProtectedFailure[]; leftOut?: { criterionId: string; reason: string }[] } = {}): Promise<RubricCheckOutcomeShape> => {
+    const stop = async (reasonCodes: string[], extra: { protectedRuleIds?: string[]; protectedFailures?: RubricProtectedFailure[]; leftOut?: { criterionId: string; reason: string; basis?: LeaveOutBasis }[] } = {}): Promise<RubricCheckOutcomeShape> => {
       await this.persist(ctx, "failed", reasonCodes);
       // The spend is reported when a repair was involved (a failed bar, or repair requests); the checker's
       // own record holds it for every other run.
@@ -688,14 +729,18 @@ export class RubricCheckerService {
     // ---- decide each ordinary rule from its verdicts ----
     const ordinaryVerdicts = rowsOf("verification", ordinaryJobs);
     this.noteVerdicts(ctx, new Map([...protectedVerdicts.verification, ...ordinaryVerdicts]), protectedVerdicts.judgement);
-    const decided = new Map<string, string>();
-    for (const r of unreadableOrdinary) decided.set(r.criterionId, "checker:source_text");
+    // (#240) Each leave-out also records WHY: `found_wrong` (a failing verdict is a `no`) or
+    // `not_confirmed` (every failing verdict is unsure / na, or there is no verdict to read). A quote
+    // that cannot be found in its snapshot was never confirmed by anyone: `not_confirmed`.
+    const decided = new Map<string, { reason: string; basis: LeaveOutBasis }>();
+    for (const r of unreadableOrdinary) decided.set(r.criterionId, { reason: "checker:source_text", basis: "not_confirmed" });
     for (const r of readableOrdinary) {
-      const action = judgeRule(r, { verification: ordinaryVerdicts.get(r.criterionId) });
-      if (action.action !== "keep") decided.set(r.criterionId, `checker:${action.aspect}`);
+      const row = ordinaryVerdicts.get(r.criterionId);
+      const action = judgeRule(r, { verification: row });
+      if (action.action !== "keep") decided.set(r.criterionId, { reason: `checker:${action.aspect}`, basis: leaveOutBasis(r, row) });
     }
     // Rulebook order, so the result is stable.
-    const leftOut = rules.filter((r) => decided.has(r.criterionId)).map((r) => ({ criterionId: r.criterionId, reason: decided.get(r.criterionId) as string }));
+    const leftOut = rules.filter((r) => decided.has(r.criterionId)).map((r) => ({ criterionId: r.criterionId, ...(decided.get(r.criterionId) as { reason: string; basis: LeaveOutBasis }) }));
 
     // ---- flag codes this check has fully verified ----
     // Every kept rule's title got `yes` (title always applies), so the title
@@ -804,6 +849,10 @@ export class RubricCheckerService {
 
     // ---- 3. the one re-draft of each eligible bar ----
     const pendingCheck: AssessmentCriterion[] = [];
+    // (#240) Replacements drafted in THIS run, apart from the ones replayed from an earlier run. A request is
+    // a pure function of its batch, so batching a replay together with a new replacement would change the
+    // replay's request hash and pay for its check again. Each group is batched on its own.
+    const freshIds = new Set<string>();
     for (const id of eligible) {
       if (infra) {
         setFailure(id, "attempt_unfinished", "earlier_attempt_unfinished");
@@ -812,7 +861,15 @@ export class RubricCheckerService {
       const original = rule(id);
       const hash = ruleHashOf(original);
       let stored = ctx.repairs[id];
-      if (!stored || stored.ruleHash !== hash) {
+      // (#240) A stored attempt is reused for the same rule hash under the CURRENT repair prompt version.
+      // An attempt made under an OLDER version that did not produce a replacement (the model said it
+      // cannot be repaired, or code refused the re-draft: the guard and the prompt have changed since)
+      // gets ONE more try; the new attempt is stored with the current version, so a rule is never
+      // re-drafted twice under one version. A stored REPLACEMENT is always replayed (its check comes
+      // from the stored answers, zero requests) whatever its version: a bar already repaired and
+      // confirmed must not be re-drafted just because the prompt text moved on.
+      const staleAttempt = stored !== undefined && stored.promptVersion !== RUBRIC_REPAIR_PROMPT_VERSION && stored.kind !== "replacement";
+      if (!stored || stored.ruleHash !== hash || staleAttempt) {
         const result = await this.redraftOnce(ctx, original, p.aspectFailures.get(id) ?? [], p.routeName);
         if (result.kind === "infra") {
           infra = result.failure;
@@ -821,6 +878,7 @@ export class RubricCheckerService {
           continue;
         }
         stored = result.stored;
+        freshIds.add(id);
         ctx.repairs[id] = stored;
         // The finished attempt is stored NOW: a crash after this line still never re-drafts this rule again.
         await this.persist(ctx, "failed", []);
@@ -839,9 +897,12 @@ export class RubricCheckerService {
       for (const r of pendingCheck) if (!views.has(r.criterionId)) setFailure(r.criterionId, "invalid_redraft", "quote_unverifiable");
       const triggered = checkable.filter((r) => r.trigger !== undefined && isValidTrigger(r.trigger, p.questions));
       const jobs: Job[] = [];
+      const replayed = (r: AssessmentCriterion) => !freshIds.has(r.criterionId);
       for (const role of ["verification", "judgement"] as const) {
-        jobs.push(...this.batchJobs(role, checkable, views, ctx.limits));
-        jobs.push(...this.triggerJobs(role, triggered, views, p.questions, ctx.limits));
+        for (const group of [checkable.filter(replayed), checkable.filter((r) => !replayed(r))]) {
+          jobs.push(...this.batchJobs(role, group, views, ctx.limits));
+          jobs.push(...this.triggerJobs(role, triggered.filter((r) => group.includes(r)), views, p.questions, ctx.limits));
+        }
       }
       // A replacement's check made by an earlier run of this version is replayed from its stored answers
       // (same request hash, same model), never asked for again.

@@ -1,5 +1,5 @@
 import { createHash } from "crypto";
-import type { AssessmentCriterion, IntakeQuestion, RubricPublishGateResult, RubricPublishLeftOut } from "../../types/rubric";
+import type { AssessmentCriterion, IntakeQuestion, LeaveOutBasis, RubricPublishGateResult, RubricPublishLeftOut } from "../../types/rubric";
 import { isValidTrigger } from "../../utils/rubric-trigger";
 import { EXCLUSION_NOTE_MAX } from "./rubric-exclusions";
 import type { RubricPublishSettings } from "./rubric-publish-settings";
@@ -102,7 +102,8 @@ export interface GateFlag {
 /** What the independent check (part B) reports back to the gates. Absent / null = it did not run. */
 export interface GateCheckerResult {
   // Rules the check says to leave out, with the aspect that failed (`checker:<aspect>`).
-  leftOut: readonly { criterionId: string; reason: string }[];
+  // (#240) `basis`: found wrong or not confirmed (absent = not recorded; counted as neither).
+  leftOut: readonly { criterionId: string; reason: string; basis?: LeaveOutBasis }[];
   // Flag CODES the check has fully resolved: a code is listed only when EVERY
   // flag of that code was verified (every title, every group mapping, ...).
   resolvedFlagCodes: readonly string[];
@@ -153,7 +154,7 @@ export interface GateReport {
   informationalFlags: Record<string, number>;
   // flag key -> how this run resolved it. Only these may be acknowledged.
   flagResolutions: Record<string, FlagResolution>;
-  counts: { rules: number; kept: number; leftOut: number; leftOutByReason: Record<string, number>; primaryRules: number };
+  counts: { rules: number; kept: number; leftOut: number; leftOutByReason: Record<string, number>; primaryRules: number; leftOutFoundWrong: number; leftOutNotConfirmed: number };
 }
 
 /** Protected = a mandatory bar, or any rule scoped to a named group. */
@@ -240,10 +241,10 @@ export function evaluateGates(input: GateInput): GateReport {
     for (const f of failures) if (!reasons.includes(f)) reasons.push(f);
   };
   /** Leave a rule out once (the first reason wins). */
-  const leaveOut = (criterionId: string, reason: string, flagCode: string | null): void => {
+  const leaveOut = (criterionId: string, reason: string, flagCode: string | null, basis?: LeaveOutBasis): void => {
     if (leftOutIds.has(criterionId)) return;
     leftOutIds.add(criterionId);
-    leftOut.push({ criterionId, reason, flagCode });
+    leftOut.push({ criterionId, reason, flagCode, ...(basis !== undefined ? { basis } : {}) });
   };
 
   // ---- 1a. structural validity (the same validator a human approval runs) ----
@@ -305,7 +306,7 @@ export function evaluateGates(input: GateInput): GateReport {
       if (!heldRuleIds.includes(rule.criterionId)) heldRuleIds.push(rule.criterionId);
       continue;
     }
-    leaveOut(rule.criterionId, l.reason, null);
+    leaveOut(rule.criterionId, l.reason, null, l.basis);
   }
   flagFailures.push(...checkerFailures);
 
@@ -415,6 +416,11 @@ export function evaluateGates(input: GateInput): GateReport {
     if (primInGroup > 0 && primOutInGroup / primInGroup > input.settings.maxPrimaryLeftOutShare && !budgetFailures.includes("primary_leave_out_budget_exceeded")) budgetFailures.push("primary_leave_out_budget_exceeded");
   }
   if (primaryRules.length > 0 && primaryCounted.length / primaryRules.length > input.settings.maxPrimaryLeftOutShare && !budgetFailures.includes("primary_leave_out_budget_exceeded")) budgetFailures.push("primary_leave_out_budget_exceeded");
+  // (#240) Say how many of the check's leave-outs were found wrong and how many were not confirmed.
+  // BOTH are in `counted` above and both count against every limit: this is wording, not a rule.
+  const foundWrong = leftOut.filter((l) => l.basis === "found_wrong").length;
+  const notConfirmed = leftOut.filter((l) => l.basis === "not_confirmed").length;
+  if (foundWrong + notConfirmed > 0) details.push(`${foundWrong} found wrong, ${notConfirmed} not confirmed`);
   gate("leave_out_budget", budgetFailures, `${details.join("; ")}; ${primaryCounted.length} of ${primaryRules.length} primary`);
 
   // ---- INTEGRATION (#207): scoped rules that rest on no usable trigger, counted, never blocking ----
@@ -438,7 +444,7 @@ export function evaluateGates(input: GateInput): GateReport {
     protectedHold: heldRuleIds.length > 0,
     informationalFlags,
     flagResolutions,
-    counts: { rules: total, kept: kept.length, leftOut: leftOut.length, leftOutByReason, primaryRules: primaryRules.length },
+    counts: { rules: total, kept: kept.length, leftOut: leftOut.length, leftOutByReason, primaryRules: primaryRules.length, leftOutFoundWrong: foundWrong, leftOutNotConfirmed: notConfirmed },
   };
 }
 

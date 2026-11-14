@@ -430,7 +430,9 @@ export function buildRubricRequest(chunk: SourceChunk, severityLevels: readonly 
 
 /** Version of the re-draft instructions below (recorded on the repair attempt; bump when they change). */
 // v2 (#226): the re-draft must quote the SAME line as the rejected rule and keep its kind.
-export const RUBRIC_REPAIR_PROMPT_VERSION = "2026-11-repair-v2";
+// v3 (#240): the re-draft also keeps the rule's applicability unless `condition_faithful` failed (a
+// fresh reading used to switch conditional to specialist, which the code then refused).
+export const RUBRIC_REPAIR_PROMPT_VERSION = "2026-11-repair-v3";
 
 /** What each checker aspect asks, in the words a re-draft needs (kept apart from the checker's own prompt: no shared text). */
 const ASPECT_MEANING: Record<string, string> = {
@@ -483,7 +485,7 @@ export function buildRepairRequest(
       JSON.stringify(failed.rule),
       "The reader did not confirm these aspects:",
       ...aspects,
-      "Draft that one rule again, from the passage of the excerpt that holds the quote above, following the rules you were given. The rest of the excerpt is only context for reading that sentence: the new rule's quote must be the quote above, or a continuous part of it, taken from the same line of the excerpt. A rule that quotes any other line, even one that restates the same point, is discarded by code. Keep the rule's kind unless the aspects above are about the kind itself. Every quote and every group name must be copied character for character from the excerpt; never add, widen or guess. Return exactly one criterion. If the passage cannot be drafted into a rule that satisfies the aspects above without adding anything the excerpt does not say, return an empty `criteria` list.",
+      "Draft that one rule again, from the passage of the excerpt that holds the quote above, following the rules you were given. The rest of the excerpt is only context for reading that sentence: the new rule's quote must be the quote above, or a continuous part of it, taken from the same line of the excerpt. A rule that quotes any other line, even one that restates the same point, is discarded by code. Keep the rule's kind unless the aspects above are about the kind itself. Keep the rule's applicability (and so its scope) exactly as it is in the fields above unless condition_faithful is one of the aspects the reader did not confirm; in that case change only what that aspect asks. Every quote and every group name must be copied character for character from the excerpt; never add, widen or guess. Return exactly one criterion. If the passage cannot be drafted into a rule that satisfies the aspects above without adding anything the excerpt does not say, return an empty `criteria` list.",
     ].join("\n"),
     schema: buildRubricOutputSchema(severityLevels),
     maxOutputTokens: limits.maxOutputTokens,

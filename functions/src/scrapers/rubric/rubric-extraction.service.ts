@@ -2007,7 +2007,15 @@ export class RubricExtractionService {
     // A lead-in whose list could not be read cleanly is refused here, as the gates would hold it anyway.
     if (accepted.listUnreadable !== undefined) return { kind: "invalid", detail: accepted.listUnreadable };
     const normApplicability = (c: AssessmentCriterion): string => c.applicability ?? "all_applicants";
-    if (rule.trigger !== undefined && normApplicability(rule) !== normApplicability(accepted.criterion)) return { kind: "invalid", detail: "applicability_changed" };
+    // (#240) The trigger was planned for the ORIGINAL's applicability, so a change is refused, EXCEPT
+    // between `conditional` and `specialist`: with a valid trigger the two behave identically in
+    // `resolveApplicability` (the rule applies by the applicant's answer), so swapping them changes
+    // nothing for any applicant, and the original's trigger is carried over below. A change to or from
+    // `all_applicants` (or to `other_route`) WOULD change who the rule applies to, so it is still
+    // refused. The replacement's trigger is still checked by both models like any other.
+    const scoped = (c: AssessmentCriterion): boolean => c.applicability === "conditional" || c.applicability === "specialist";
+    const applicabilitySwap = scoped(rule) && scoped(accepted.criterion);
+    if (rule.trigger !== undefined && normApplicability(rule) !== normApplicability(accepted.criterion) && !applicabilitySwap) return { kind: "invalid", detail: "applicability_changed" };
     const criterion: AssessmentCriterion = {
       ...accepted.criterion,
       criterionId: rule.criterionId,

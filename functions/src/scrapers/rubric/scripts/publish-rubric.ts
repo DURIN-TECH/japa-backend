@@ -113,6 +113,8 @@ async function main(): Promise<void> {
   section("Counts", [
     `rules ${c.rules}, kept ${c.kept}, left out ${c.leftOut}, held ${c.held}`,
     ...Object.entries(c.leftOutByReason).map(([k, n]) => `left out by ${k}: ${n}`),
+    // (#240) The check's leave-outs: found wrong (a `no`) vs not confirmed (only unsure / na).
+    `check leave-outs: ${c.leftOutFoundWrong ?? 0} found wrong, ${c.leftOutNotConfirmed ?? 0} not confirmed`,
     ...Object.entries(c.informationalFlags).map(([k, n]) => `informational ${k}: ${n}`),
   ]);
   section("Planned leave-outs", report.leftOut.map((l) => `${l.criterionId}  ${l.reason}`));

@@ -115,14 +115,17 @@ describe("the rule check over a Spanish rule", () => {
         ? rule("c9", "DOUBT Nationals refused", Q_BAR, { kind: "mandatory_bar", stage: "suitability", appliesTo: { nationalities: ["QM", "QN"], asWritten: ["Borduria", "Syldavia"] } })
         : aspect === "check_faithful"
           ? rule("c9", "DOUBT Stays 45 days", Q_DAYS, { kind: "objective", check: { field: "funds.balance", op: "heldForDays", value: 30, unit: "días" } as any })
-          : rule("c9", "DOUBT Stays 45 days", Q_DAYS);
+          // (#240) kind and stage are tolerated on a JUDGEMENT rule, so those two aspects are doubted on an objective one.
+          : aspect === "kind_right" || aspect === "stage_right"
+            ? rule("c9", "DOUBT Stays 45 days", Q_DAYS, { kind: "objective", check: { field: "funds.balance", op: "heldForDays", value: 30, unit: "días" } as any })
+            : rule("c9", "DOUBT Stays 45 days", Q_DAYS);
       const out = await r.svc.check(input(rubricOf([rule("c1", "Aged 18 or over", Q_AGE), doubted])));
       if (isGroup) {
         assert.equal(out.ok, false);
         if (!out.ok) assert.ok(out.reasonCodes.includes("protected_rule_failed:c9"));
       } else {
         assert.equal(out.ok, true);
-        if (out.ok) assert.deepEqual(out.leftOut, [{ criterionId: "c9", reason: `checker:${aspect}` }]);
+        if (out.ok) assert.deepEqual(out.leftOut, [{ criterionId: "c9", reason: `checker:${aspect}`, basis: "found_wrong" }]);
       }
     });
   }
