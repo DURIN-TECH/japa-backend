@@ -134,6 +134,15 @@ export interface RateMutation {
   audit: RateAuditEntry;
 }
 
+/**
+ * Result of RateStore.saveProvider (issue #229). `saved: false` = the provider
+ * part changed since the caller read it, nothing written. `saved: true`
+ * carries the doc's override as re-read in the same transaction as the
+ * write (null when there is none), i.e. the override that now sits in front
+ * of the rate just stored.
+ */
+export type SaveProviderResult = { saved: false } | { saved: true; override: StoredOverride | null };
+
 /** Persistence for rate docs and the audit trail. */
 export interface RateStore {
   get(currency: CurrencyCode): Promise<StoredRate | null>;
@@ -146,12 +155,16 @@ export interface RateStore {
    * so a rate judged against a reference that was just dropped is never
    * stored over the reset. The provider fetch itself must happen BEFORE this
    * call, never inside the transaction (it may be retried).
+   *
+   * On success it also returns the override as read INSIDE that transaction,
+   * so the caller judges the override as it is now, not as it was before the
+   * fetch (an admin may have set or cleared one meanwhile; #229 review).
    */
   saveProvider(
     currency: CurrencyCode,
     provider: StoredProviderRate,
     expected: Pick<StoredRate, "provider" | "providerCorrupt"> | null
-  ): Promise<boolean>;
+  ): Promise<SaveProviderResult>;
   saveError(currency: CurrencyCode, error: { at: Date; message: string }): Promise<void>;
   /**
    * Read the doc, let `decide` check it and say what to change, then write the

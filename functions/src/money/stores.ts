@@ -122,7 +122,7 @@ export const firestoreRateStore: RateStore & {
     return this.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       const current = snap.exists ? parseRateDoc(currency, snap.data() as Record<string, unknown>) : null;
-      if (!sameProviderState(current, expected)) return false;
+      if (!sameProviderState(current, expected)) return { saved: false } as const;
       // merge: an existing override must survive a provider refresh.
       tx.set(
         ref,
@@ -138,7 +138,9 @@ export const firestoreRateStore: RateStore & {
         },
         { merge: true }
       );
-      return true;
+      // The merge leaves the override untouched, so the one read here is the
+      // one in front of the new rate once this commits.
+      return { saved: true, override: current?.override ?? null } as const;
     });
   },
 

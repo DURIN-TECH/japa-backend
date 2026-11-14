@@ -178,18 +178,32 @@ export class RateService {
   /**
    * Issue #229: true when an ACTIVE override must give way to the provider
    * rate: it is unreferenced (or legacy, reference unknown; see
-   * isUnreferencedOverride), a FRESH provider rate exists, and the override
-   * is more than `overrideBandPercent` away from it (integer maths via
+   * isUnreferencedOverride), a provider rate is STORED, and the override is
+   * more than `overrideBandPercent` away from it (integer maths via
    * exceedsBand). Such an override was never checked against anything, and
-   * a fresh rate now says it is wrong, so it must not price for the rest of
-   * its 24h. A referenced override is never superseded here: it passed the
-   * band when it was set, and a later drift is only flagged.
+   * a provider rate now says it is wrong, so it must not price for the rest
+   * of its life. A referenced override is never superseded here: it passed
+   * the band when it was set, and a later drift is only flagged.
+   *
+   * Any stored provider rate counts, fresh or STALE (#229 review). Judging
+   * only against a fresh one failed open: once that provider rate aged past
+   * `freshnessHours` / `maxRateAgeHours` (a stuck upstream after a holiday,
+   * or a legacy override outliving the 72h freshness limit), the override
+   * that had already been shown wrong priced again. Now supersession, once
+   * a provider rate has disagreed, sticks: effectiveRate falls through to
+   * step 2, which prices from the provider while it is fresh and throws
+   * RATE_STALE once it is not, i.e. it fails closed and never falls back to
+   * the superseded override. A corrupt provider map is absent here
+   * (`provider` null), so it never supersedes; that state is refused for
+   * pricing anyway. For an unreferenced override the stored provider rate
+   * is necessarily one that arrived AFTER it was set, because reset-reference
+   * drops the provider rate and is the only way to set one unreferenced.
    */
   private overrideSuperseded(stored: StoredRate | null, config: CurrenciesConfig): boolean {
     const override = stored?.override;
     if (!override || override.expiresAt.getTime() <= this.now().getTime()) return false;
     if (!isUnreferencedOverride(override)) return false;
-    const provider = this.freshProvider(stored, config);
+    const provider = stored?.provider ?? null;
     return !!provider && exceedsBand(override.rate, provider.rate, config.overrideBandPercent);
   }
 
@@ -202,9 +216,10 @@ export class RateService {
   ): ExchangeRate {
     const nowMs = this.now().getTime();
 
-    // 1. Active admin override, unless it is an unreferenced one that a fresh
-    //    provider rate has shown to be out of band (issue #229): then it is
-    //    skipped and step 2 prices from the provider instead.
+    // 1. Active admin override, unless it is an unreferenced one that a stored
+    //    provider rate (fresh or stale) has shown to be out of band (issue
+    //    #229): then it is skipped and step 2 prices from the provider if it
+    //    is fresh, or throws RATE_STALE if not. Never back to the override.
     if (stored?.override && stored.override.expiresAt.getTime() > nowMs && !this.overrideSuperseded(stored, config)) {
       return {
         currency,
@@ -306,12 +321,12 @@ export class RateService {
         reasons.push(`${provider.id}: rejected (${rejection})`);
         continue;
       }
-      const saved = await this.deps.rates.saveProvider(
+      const save = await this.deps.rates.saveProvider(
         currency,
         { rate: result.rate, asOf: result.asOf, fetchedAt: this.now(), source: provider.id },
         stored
       );
-      if (!saved) {
+      if (!save.saved) {
         // Issue #229: the provider part changed while we fetched (typically a
         // reset-reference). Keep the admin's change; record nothing on the
         // doc (it is not a provider failure) and say what happened.
@@ -327,7 +342,11 @@ export class RateService {
       // here and flagged in the admin overview until it is fixed or expires.
       // Issue #229: if that override is unreferenced it has now stopped
       // pricing (see overrideSuperseded); the warning says so.
-      const warning = this.overrideBandWarning(stored?.override ?? null, result.rate, config);
+      // #229 review: check the override as re-read in the save transaction
+      // (`save.override`), not `stored.override` from before the fetch, so an
+      // override set or cleared while the fetch ran is judged correctly in
+      // the log and in the outcome text.
+      const warning = this.overrideBandWarning(save.override, result.rate, config);
       if (warning) console.error(`Exchange rate ${currency}: ${warning}`);
       return { currency, ok: true, source: provider.id, rate: result.rate, ...(warning ? { warning } : {}) };
     }
@@ -693,7 +712,7 @@ export class RateService {
     if (!exceedsBand(override.rate, providerRate, config.overrideBandPercent)) return null;
     const head = `active override ${override.rate} is more than ${config.overrideBandPercent}% away from the provider rate ${providerRate}`;
     return isUnreferencedOverride(override)
-      ? `${head}; it was never checked against a provider rate, so it no longer prices (the provider rate does); clear or replace it`
+      ? `${head}; it has no recorded provider rate it was checked against (none when set, or unknown), so it no longer prices (the provider rate does); clear or replace it`
       : `${head}; check it and clear or replace it`;
   }
 
@@ -715,8 +734,13 @@ export class RateService {
       warnings.push({
         code: "OVERRIDE_SUPERSEDED",
         message:
-          `This override (${override.rate}) is not used for pricing: it was not checked against a provider rate ` +
-          `when set, and the fresh provider rate ${stored?.provider?.rate} is more than ${config.overrideBandPercent}% away`,
+          // #229 review: true for both kinds that can be superseded: an
+          // override set after reset-reference (no provider rate to check)
+          // and a legacy override whose reference was never recorded.
+          `This override (${override.rate}) is not used for pricing: it has no recorded provider rate it was ` +
+          "checked against (none existed when it was set, or its reference is unknown), and the stored provider rate " +
+          `${stored?.provider?.rate} is more than ${config.overrideBandPercent}% away. ` +
+          "Pricing uses the provider rate while it is fresh, and stops (rate out of date) when it is not",
       });
     }
     return warnings;

@@ -5,8 +5,9 @@
 // Hermetic: the in-memory rate service (test/money/helpers.ts), and for the
 // Firestore store the in-memory Firestore fake with its fake transaction
 // runner. One `describe` per decision of the issue, in the plan's order:
-//  1. an unreferenced (or legacy) override outside the band of a FRESH
-//     provider rate stops winning; the overview flags it
+//  1. an unreferenced (or legacy) override outside the band of a stored
+//     provider rate stops winning, and keeps not winning once that rate goes
+//     stale (fails closed, RATE_STALE); the overview flags it
 //  2. a stored currency range may only narrow the default
 //  3. refreshNow audits every outcome; the slot is released when the refresh
 //     failed before the provider was contacted
@@ -59,9 +60,9 @@ const providerAt = (rate: number, fetchedAt: Date) => ({
 });
 
 // ---------------------------------------------------------------
-// 1. Unreferenced override vs a fresh provider rate
+// 1. Unreferenced override vs a stored (fresh or stale) provider rate
 // ---------------------------------------------------------------
-describe("an unreferenced override outside the band of a fresh provider rate stops winning", () => {
+describe("an unreferenced override outside the band of a stored provider rate stops winning", () => {
   test("reset -> override 1050 -> provider 1500 prices at 1500 at once, and the overview says why", async () => {
     const { service, store, clock } = makeService();
     await service.refreshAll(); // provider 1500
@@ -97,7 +98,10 @@ describe("an unreferenced override outside the band of a fresh provider rate sto
     assert.deepEqual(row.warnings.map((w) => w.code), ["OVERRIDE_UNREFERENCED"]);
   });
 
-  test("an unreferenced override facing only a STALE provider rate keeps winning (nothing fresh to replace it)", async () => {
+  // #229 review (blocking): supersession is judged against ANY stored
+  // provider rate, fresh or stale. Before the fix, an out-of-band unreferenced
+  // override priced again as soon as the provider rate went stale.
+  test("an unreferenced override facing only a STALE out-of-band provider rate fails closed (RATE_STALE)", async () => {
     const store = memoryRateStore();
     const clock = fakeClock();
     const { service } = makeService({ store, clock });
@@ -109,9 +113,54 @@ describe("an unreferenced override outside the band of a fresh provider rate sto
       override: { rate: 1050, reason: REASON, setBy: "a", setAt, expiresAt: new Date(setAt.getTime() + 24 * HOUR), unreferenced: true },
       lastError: null,
     });
-    assert.deepEqual([(await service.getRate("NGN")).rate, (await service.getRate("NGN")).source], [1050, "manual"]);
+    await assert.rejects(service.getRate("NGN"), (e) => code(e) === "RATE_STALE");
     const [row] = await service.adminOverview();
-    assert.equal(row.warnings.some((w) => w.code === "OVERRIDE_SUPERSEDED"), false);
+    assert.equal(row.effective, null);
+    assert.ok(row.warnings.some((w) => w.code === "OVERRIDE_SUPERSEDED"), "still flagged as superseded");
+  });
+
+  test("an unreferenced override INSIDE the band of a stale provider rate keeps winning (not superseded)", async () => {
+    const store = memoryRateStore();
+    const clock = fakeClock();
+    const { service } = makeService({ store, clock });
+    const setAt = clock.now();
+    store.docs.set("NGN", {
+      currency: "NGN",
+      provider: providerAt(1500, new Date(setAt.getTime() - 100 * HOUR)),
+      override: { rate: 1450, reason: REASON, setBy: "a", setAt, expiresAt: new Date(setAt.getTime() + 24 * HOUR), unreferenced: true },
+      lastError: null,
+    });
+    assert.deepEqual([(await service.getRate("NGN")).rate, (await service.getRate("NGN")).source], [1450, "manual"]);
+  });
+
+  // The reviewer's reproduction, end to end through the real refresh path:
+  // an accepted provider row that is already ~130h old (holiday closure)
+  // ages past the 144h rate-age limit while the 24h override is still live.
+  test("reviewer scenario: aged asOf ages out under a superseded override -> RATE_STALE, never 1050 manual", async () => {
+    const { service, cbn, clock } = makeService();
+    await service.refreshAll(); // 1500, current
+    await service.resetReference("NGN", "Genuine devaluation confirmed", "admin-1");
+    await service.setOverride("NGN", { rate: 1050, reason: REASON }, "admin-1"); // typo, unreferenced, 24h
+
+    // The upstream serves a row dated 130h ago; it is within 144h, so accepted.
+    clock.advanceHours(1);
+    cbn.result = { ok: true, rate: 1500, asOf: new Date(clock.now().getTime() - 130 * HOUR) };
+    const first = await quietly(() => service.refreshAll());
+    assert.equal(first.result![0].ok, true);
+    assert.deepEqual([(await service.getRate("NGN")).rate, (await service.getRate("NGN")).source], [1500, "cbn"]);
+
+    // 15h later the upstream is still stuck on the same row: now 145h old,
+    // refused. The stored provider rate is past the rate-age limit.
+    clock.advanceHours(15);
+    const second = await quietly(() => service.refreshAll());
+    assert.equal(second.result![0].ok, false);
+    assert.match(second.result![0].reason ?? "", /dated more than 144 hours ago/);
+
+    // The override (still active: 16h of 24h) must NOT price again.
+    await assert.rejects(service.getRate("NGN"), (e) => code(e) === "RATE_STALE");
+    const [row] = await service.adminOverview();
+    assert.equal(row.effective, null);
+    assert.ok(row.warnings.some((w) => w.code === "OVERRIDE_SUPERSEDED"));
   });
 
   test("a referenced override inside the band keeps winning and records the rate it was checked against", async () => {
@@ -154,6 +203,45 @@ describe("an unreferenced override outside the band of a fresh provider rate sto
     // A legacy override inside the band still prices.
     store.docs.set("NGN", { ...store.docs.get("NGN")!, override: { ...store.docs.get("NGN")!.override!, rate: 1480 } });
     assert.equal((await service.getRate("NGN")).rate, 1480);
+  });
+
+  // #229 review (blocking): a legacy override can live up to 168h, longer
+  // than the 72h freshness limit (fetchedAt). When that lapses, the override
+  // that the provider rate had shown wrong must not price again.
+  test("a legacy out-of-band override fails closed when the 72h freshness limit lapses", async () => {
+    const store = memoryRateStore();
+    const clock = fakeClock();
+    const { service } = makeService({ store, clock });
+    const setAt = new Date(clock.now().getTime() - HOUR);
+    store.docs.set("NGN", {
+      currency: "NGN",
+      provider: providerAt(1500, clock.now()), // fresh now
+      override: { rate: 1050, reason: REASON, setBy: "a", setAt, expiresAt: new Date(setAt.getTime() + 168 * HOUR) },
+      lastError: null,
+    });
+    assert.equal((await service.getRate("NGN")).rate, 1500);
+    clock.advanceHours(73); // fetchedAt now 73h old; override still has ~94h
+    await assert.rejects(service.getRate("NGN"), (e) => code(e) === "RATE_STALE");
+    // A legacy override INSIDE the band is not superseded, stale or not.
+    store.docs.set("NGN", { ...store.docs.get("NGN")!, override: { ...store.docs.get("NGN")!.override!, rate: 1480 } });
+    assert.deepEqual([(await service.getRate("NGN")).rate, (await service.getRate("NGN")).source], [1480, "manual"]);
+  });
+
+  // #229 review: the old text claimed every superseded override "was not
+  // checked against a provider rate when set", untrue for legacy ones.
+  test("the OVERRIDE_SUPERSEDED message is true for both a post-reset and a legacy override", async () => {
+    const store = memoryRateStore();
+    const clock = fakeClock();
+    const { service } = makeService({ store, clock });
+    const setAt = clock.now();
+    const base = { rate: 1050, reason: REASON, setBy: "a", setAt, expiresAt: new Date(setAt.getTime() + 24 * HOUR) };
+    for (const override of [{ ...base, unreferenced: true }, base]) {
+      store.docs.set("NGN", { currency: "NGN", provider: providerAt(1500, clock.now()), override, lastError: null });
+      const [row] = await service.adminOverview();
+      const msg = row.warnings.find((w) => w.code === "OVERRIDE_SUPERSEDED")?.message ?? "";
+      assert.match(msg, /reference is unknown/);
+      assert.doesNotMatch(msg, /was not checked against a provider rate/);
+    }
   });
 
   test("audits agree with pricing: clearing a superseded override records the provider rate as `old`", async () => {
@@ -347,7 +435,7 @@ describe("the scheduled refresh writes the provider rate conditionally", () => {
       const expected = await firestoreRateStore.get("NGN");
       await firestoreRateStore.claimManualRefresh("NGN", t0, 5 * 60_000); // touches the same doc
       const ok = await firestoreRateStore.saveProvider("NGN", providerAt(1520, new Date(t0.getTime() + HOUR)), expected);
-      assert.equal(ok, true);
+      assert.equal(ok.saved, true);
       assert.equal((await firestoreRateStore.get("NGN"))?.provider?.rate, 1520);
     });
 
@@ -356,7 +444,7 @@ describe("the scheduled refresh writes the provider rate conditionally", () => {
       const expected = await firestoreRateStore.get("NGN");
       fakeDocs.set("exchangeRates/NGN", docWith(null)); // reset-reference committed
       const ok = await firestoreRateStore.saveProvider("NGN", providerAt(1520, t0), expected);
-      assert.equal(ok, false);
+      assert.equal(ok.saved, false);
       assert.equal((await firestoreRateStore.get("NGN"))?.provider, null);
     });
 
@@ -364,11 +452,34 @@ describe("the scheduled refresh writes the provider rate conditionally", () => {
       fakeDocs.set("exchangeRates/NGN", docWith(p1500));
       const expected = await firestoreRateStore.get("NGN");
       fakeDocs.set("exchangeRates/NGN", docWith(providerAt(1510, t0)));
-      assert.equal(await firestoreRateStore.saveProvider("NGN", providerAt(1520, t0), expected), false);
+      assert.equal((await firestoreRateStore.saveProvider("NGN", providerAt(1520, t0), expected)).saved, false);
       // No doc read (null) and none there: the first rate is written.
       resetStore();
-      assert.equal(await firestoreRateStore.saveProvider("NGN", p1500, null), true);
-      assert.equal(await firestoreRateStore.saveProvider("NGN", p1500, null), false, "a doc now exists");
+      assert.equal((await firestoreRateStore.saveProvider("NGN", p1500, null)).saved, true);
+      assert.equal((await firestoreRateStore.saveProvider("NGN", p1500, null)).saved, false, "a doc now exists");
+    });
+
+    // #229 review: saveProvider hands back the override as read inside its
+    // transaction, so refreshOne's warning reflects the doc at write time.
+    test("on success it returns the override read in the transaction (null when none)", async () => {
+      fakeDocs.set("exchangeRates/NGN", docWith(p1500));
+      const expected = await firestoreRateStore.get("NGN");
+      // An override lands after the caller's read, before the save.
+      const setAt = t0;
+      fakeDocs.set("exchangeRates/NGN", {
+        ...docWith(p1500),
+        override: {
+          rate: 1050, reason: REASON, setBy: "a", unreferenced: true,
+          setAt: Timestamp.fromDate(setAt), expiresAt: Timestamp.fromDate(new Date(setAt.getTime() + 24 * HOUR)),
+        },
+      });
+      const res = await firestoreRateStore.saveProvider("NGN", providerAt(1520, new Date(t0.getTime() + HOUR)), expected);
+      assert.equal(res.saved, true);
+      assert.equal(res.saved && res.override?.rate, 1050);
+      assert.equal((await firestoreRateStore.get("NGN"))?.override?.rate, 1050, "the merge keeps the override");
+      resetStore();
+      const first = await firestoreRateStore.saveProvider("NGN", p1500, null);
+      assert.deepEqual(first, { saved: true, override: null });
     });
 
     test("the provider fetch never runs inside a transaction", async () => {
@@ -435,6 +546,61 @@ describe("the scheduled refresh writes the provider rate conditionally", () => {
       assert.equal(legacy.override?.referenceRate, undefined);
       assert.equal(isUnreferencedOverride(legacy.override!), true);
     });
+  });
+});
+
+// ---------------------------------------------------------------
+// 4b. #229 review: the refresh warning judges the override as it is when the
+//     rate is written, not as it was read before the provider fetch
+// ---------------------------------------------------------------
+describe("the refresh warning uses the override re-read at write time", () => {
+  /** A cbn provider that runs `during` while its fetch is "in flight". */
+  function providerWith(during: () => void, rate = 1500) {
+    const p = fakeProvider("cbn", { result: { ok: true, rate, asOf: new Date("2026-11-13T10:00:00Z") } });
+    const inner = p.fetchRate.bind(p);
+    p.fetchRate = async (currency) => {
+      during();
+      return inner(currency);
+    };
+    return p;
+  }
+
+  test("an override CLEARED while the fetch ran gives no warning", async () => {
+    const store = memoryRateStore();
+    const clock = fakeClock();
+    const cbn = providerWith(() => {
+      store.docs.set("NGN", { ...store.docs.get("NGN")!, override: null }); // admin clears it
+    });
+    const { service } = makeService({ store, clock, cbn });
+    const setAt = clock.now();
+    store.docs.set("NGN", {
+      currency: "NGN",
+      provider: null,
+      override: { rate: 1050, reason: REASON, setBy: "a", setAt, expiresAt: new Date(setAt.getTime() + 24 * HOUR), unreferenced: true },
+      lastError: null,
+    });
+    clock.advanceHours(1);
+    const { result, logged } = await quietly(() => service.refreshAll());
+    assert.equal(result![0].ok, true);
+    assert.equal(result![0].warning, undefined);
+    assert.equal(logged.some((l) => /active override/.test(l)), false);
+  });
+
+  test("an override SET while the fetch ran is warned about", async () => {
+    const store = memoryRateStore();
+    const clock = fakeClock();
+    const cbn = providerWith(() => {
+      const setAt = clock.now();
+      store.docs.set("NGN", {
+        ...(store.docs.get("NGN") ?? { currency: "NGN", provider: null, override: null, lastError: null }),
+        override: { rate: 1050, reason: REASON, setBy: "a", setAt, expiresAt: new Date(setAt.getTime() + 24 * HOUR), unreferenced: true },
+      });
+    });
+    const { service } = makeService({ store, clock, cbn });
+    const { result, logged } = await quietly(() => service.refreshAll());
+    assert.equal(result![0].ok, true);
+    assert.match(result![0].warning ?? "", /active override 1050 .*no longer prices/);
+    assert.ok(logged.some((l) => /active override 1050/.test(l)));
   });
 });
 

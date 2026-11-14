@@ -35,9 +35,10 @@ export function memoryRateStore(): RateStore & { docs: Map<string, StoredRate>; 
     // Issue #229: same contract as the Firestore store: written only while
     // the provider part is still what the caller read (`expected`).
     async saveProvider(c, provider, expected) {
-      if (!sameProviderState(docs.get(c) ?? null, expected)) return false;
-      docs.set(c, { ...(docs.get(c) ?? blank(c)), provider, lastError: null });
-      return true;
+      if (!sameProviderState(docs.get(c) ?? null, expected)) return { saved: false };
+      const current = docs.get(c) ?? blank(c);
+      docs.set(c, { ...current, provider, lastError: null });
+      return { saved: true, override: current.override };
     },
     async saveError(c, error) {
       docs.set(c, { ...(docs.get(c) ?? blank(c)), lastError: error });
