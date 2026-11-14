@@ -91,6 +91,7 @@ async function main(): Promise<void> {
   // Loaded here so the checks above fail before Firebase initialises.
   const { rubricAutoPublishService } = await import("../../../services/rubric-auto-publish.service");
   const { rubricVersionId } = await import("../../../services/rubric-review.service");
+  const { checkerStatusLine } = await import("../rubric-gates");
   const report = await rubricAutoPublishService.runOnDraft(rubricVersionId(route, version), { dryRun, skipChecker, trigger: "script" });
 
   // ---- the report (the same fields the admin endpoint returns) ----
@@ -98,11 +99,8 @@ async function main(): Promise<void> {
   console.log(`${TAG} code gates passed: ${report.codeGatesPassed ? "yes" : "no"}`);
   // (#223) Say what really happened. "failed" means the check RAN and did not confirm the draft (or could
   // not finish): calling that "has NOT run" sent people looking for a missing key when the check had run.
-  if (skipChecker || report.checker === "not_run" || report.checker === "not_configured") {
-    console.log(`${TAG} the independent AI check has NOT run (${report.checker}); question plan: ${report.questionPlan}.`);
-  } else if (report.checker === "failed") {
-    console.log(`${TAG} the independent AI check ran and failed (see the reasons below); question plan: ${report.questionPlan}.`);
-  }
+  const checkerLine = checkerStatusLine(report.checker, skipChecker, report.questionPlan);
+  if (checkerLine) console.log(`${TAG} ${checkerLine}`);
   if (report.checkerRequests) console.log(`${TAG} check requests: ${report.checkerRequests.total} (of which ${report.checkerRequests.repair} for repairs).`);
   // (#223) Protected rules (bars on a named group) the check did not confirm, with the one automatic repair.
   section(

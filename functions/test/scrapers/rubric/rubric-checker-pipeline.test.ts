@@ -16,6 +16,8 @@
 
 import { after, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import http from "node:http";
 import express from "express";
 import { Timestamp } from "firebase-admin/firestore";
@@ -31,15 +33,17 @@ import {
   RubricAutoPublishService,
   type QuestionPlanner,
   type RubricChecker,
+  RETRYABLE_REASONS,
   rubricAutoPublishService,
 } from "../../../src/services/rubric-auto-publish.service";
-import { rubricReviewService, rubricVersionId } from "../../../src/services/rubric-review.service";
+import { PLANNER_WRITABLE_FIELDS, rubricReviewService, rubricVersionId } from "../../../src/services/rubric-review.service";
 import { RUBRIC_SYSTEM_ACTOR_ID, type RubricPublishRun } from "../../../src/types/rubric";
 import { adminRubricRoutes } from "../../../src/routes/rubric-review.routes";
 import { A_LINES, A_TEXT, ROUTE_A, SOURCE_A_ID, SOURCE_A_URL } from "./fixtures/synthetic-guidance";
-import { headDoc, installRubricFakes, quiet, resetBucket, seedSource, snapshotStore, versionDoc } from "./rubric-harness";
+import { answer, crit, criteriaWire, headDoc, installRubricFakes, quiet, resetBucket, seedSource, snapshotStore, versionDoc } from "./rubric-harness";
 import { RubricCheckerService } from "../../../src/scrapers/rubric/rubric-checker";
-import { MemoryLedger, ScriptedProvider, seenRules, settingsWith } from "./checker-fakes";
+import { checkerStatusLine, reasonInWords } from "../../../src/scrapers/rubric/rubric-gates";
+import { MemoryLedger, ScriptedProvider, isRepairRequest, ruleOf, rubricOf, seenRules, settingsWith } from "./checker-fakes";
 import { A_POLARITY_QUOTE, KEY_A, REVIEW_T0, body, criterion, draft, sourceA } from "./rubric-review-fixtures";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -401,5 +405,270 @@ describe("independent check through the pipeline", () => {
     assert.deepEqual((await quiet(() => svc2.sweepRetryable())).result, { considered: 0, retried: 0 }, "polarity_unverified is not retryable");
     settings({ mode: "manual" });
     assert.deepEqual((await quiet(() => svc2.sweepRetryable())).result, { considered: 0, retried: 0 });
+  });
+});
+
+// ============================================
+// Protected-rule repair through the pipeline (issue #223)
+// ============================================
+//
+// A bar that fails the independent check is re-drafted ONCE and checked again by
+// both models. A repaired bar is recorded on the version when it is published
+// and served in place of the original; a bar that is still not confirmed holds
+// the draft, whatever else is fine. The previously approved version never changes.
+
+const BAR_TITLE = "Nationals refused from a stated date";
+const REPAIRED_TITLE = "Applicants from named countries are refused from a stated date";
+
+/** The failure of the first real run in miniature: ONE `unsure` on `stage_right`, from the judgement model, on the bar. */
+const barUnsureOnStage = ({ role, rule }: { role: string; rule: any }) => (rule.appliesTo && role === "judgement" ? { stage_right: "unsure" as const } : undefined);
+
+/** What the model answers to the re-draft: the same passage, drafted again (a different title and stage). */
+const redraftOfBar = () =>
+  criteriaWire(
+    answer({
+      criteria: [
+        crit({
+          ref: "r1",
+          title: REPAIRED_TITLE,
+          kind: "mandatory_bar",
+          stage: "validity",
+          severity: "critical",
+          ruleRef: "SV 4.1",
+          quote: body(A_LINES.bar),
+          appliesTo: { nationalities: ["QM", "QN"], asWritten: ["Borduria", "Syldavia"] },
+          validFrom: "2026-03-26",
+        }),
+      ],
+    })
+  );
+
+const repairCalls = (p: ScriptedProvider) => p.requests.filter(isRepairRequest);
+const servedA = async () => (await rubricStore.getApprovedRubric(ROUTE_A.countryCode, ROUTE_A.visaTypeId)) as any;
+
+describe("a failed bar is repaired once, through the pipeline (#223)", () => {
+  test("repaired and confirmed by both models: published, and what is served is exactly the replacement the check verified; the original stays in the draft; the record and the audit say so", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    // The ORIGINAL bar fails (as in the real run); the re-drafted one passes.
+    w.provider.policy = (ctx) => (ctx.rule.title === BAR_TITLE ? barUnsureOnStage(ctx) : undefined);
+    w.provider.redraftPolicy = redraftOfBar;
+    const planner = plannerStub();
+    const svc = service({ checker: w.checker, planner });
+    const r = await trigger(svc);
+
+    assert.equal(r?.outcome, "published");
+    assert.equal(r?.checker, "passed");
+    assert.equal(planner.calls, 1);
+
+    // The stored draft is byte-identical (never edited); the replacement is recorded beside it.
+    const stored = versionDoc(KEY_A, 1);
+    const originalBar = stored.criteria.find((c: any) => c.title === BAR_TITLE);
+    assert.ok(originalBar, "the original rule is still in the draft: the audit trail");
+    assert.equal(stored.ruleRepairs.length, 1);
+    assert.equal(stored.ruleRepairs[0].criterionId, originalBar.criterionId);
+    assert.equal(stored.ruleRepairs[0].replacement.title, REPAIRED_TITLE);
+
+    // SERVED = the replacement, in the original's place, still a bar; the original is not served.
+    const served = await servedA();
+    assert.equal(served.criteria.length, 10);
+    const servedBar = served.criteria.find((c: any) => c.criterionId === originalBar.criterionId);
+    assert.equal(servedBar.title, REPAIRED_TITLE);
+    assert.equal(servedBar.kind, "mandatory_bar");
+    assert.ok(!served.criteria.some((c: any) => c.title === BAR_TITLE));
+    assert.equal("ruleRepairs" in served, false, "the record is not client-visible");
+
+    // CHECKED = served: both models were shown exactly the rule that is now served.
+    const seen = batchRequests(w.provider).flatMap((q) => seenRules(q).map((x) => ({ role: q.role, x }))).filter((s) => s.x.title === REPAIRED_TITLE);
+    assert.deepEqual(seen.map((s) => s.role).sort(), ["judgement", "verification"]);
+    for (const s of seen) {
+      assert.equal(s.x.stage, servedBar.stage);
+      assert.equal(s.x.quote, servedBar.source.quote);
+    }
+
+    // AUDIT agrees: the approval names the repaired rule; the run record shows the attempt and the spend.
+    assert.deepEqual(audits()[0].repairedCriterionIds, [originalBar.criterionId]);
+    const rec = runs()[0];
+    assert.equal(rec.protectedFailures?.[0].repair.status, "repaired");
+    assert.equal(rec.protectedFailures?.[0].title, BAR_TITLE);
+    assert.deepEqual(rec.protectedFailures?.[0].failedAspects, ["stage_right"]);
+    // 2 bar batches + 1 ordinary batch of 9 + 2 polarity + 1 re-draft + 2 checks of the replacement.
+    assert.deepEqual(rec.checkerRequests, { total: 8, repair: 3 });
+    assert.equal(w.provider.requests.length, 8);
+    // The published alert says a bar was re-drafted.
+    assert.match(alerts().find((a) => a.rule === "rubric_auto_published").message, /re-drafted once/);
+  });
+
+  test("the replacement still fails the check: HELD, critical alert names the rule title and the aspect, nothing published, ordinary rules were checked, the draft is untouched", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    // The model's `unsure` on the bar's stage cannot be changed by a re-draft: it reads the new one the same way.
+    w.provider.policy = barUnsureOnStage;
+    w.provider.redraftPolicy = redraftOfBar;
+    const r = await trigger(pipeline(w.checker));
+
+    assert.equal(r?.outcome, "held");
+    assert.equal(r?.checker, "failed");
+    assert.equal(r?.reasonCodes.length, 1);
+    assert.match(r?.reasonCodes[0] as string, /^protected_rule_failed:/);
+    assertUntouched(KEY_A, 1, 0, null);
+    assert.equal(versionDoc(KEY_A, 1).ruleRepairs, undefined, "no replacement is recorded on a held draft");
+    // Held record: the failed bar with both models' verdicts and the repair attempt.
+    const f = runs()[0].protectedFailures?.[0];
+    assert.equal(f?.repair.status, "failed_check", String(f?.repair.detail));
+    assert.deepEqual(f?.repair.replacementFailedAspects, ["stage_right"]);
+    assert.equal(f?.verdicts.judgement?.[2], "u", "the judgement model's unsure on stage_right");
+    // Complete report: the ordinary rules were checked.
+    assert.ok(batchRequests(w.provider).some((q) => !seenRules(q).some((x) => x.appliesTo)));
+    // The alert is critical and names the bar by title and the aspect that failed.
+    const a = alerts().find((x) => x.rule === "rubric_draft_held");
+    assert.equal(a.severity, "critical");
+    assert.ok(a.message.includes(BAR_TITLE), "the rule title (data) is named");
+    assert.match(a.message, /stage_right/);
+    assert.match(a.message, /Rule id crit_/);
+    assert.deepEqual(r?.reasons[0].includes(BAR_TITLE), true, "the plain-words reason names the title too");
+  });
+
+  test("a re-draft the model cannot make, or code refuses: held, the draft untouched, the attempt recorded", async () => {
+    for (const [name, policy, status] of [
+      ["cannot be repaired", () => ({ criteria: [], suspiciousPassages: [] }), "cannot_be_repaired"],
+      ["invalid quote", () => redraftOfBar().replace(body(A_LINES.bar), "A sentence that the official text does not hold."), "invalid_redraft"],
+    ] as const) {
+      resetStore();
+      resetBucket();
+      store.set("users/admin1", { email: "delivered+admin1@resend.dev", admin: true });
+      await seedA();
+      settings();
+      const w = wired();
+      w.provider.policy = barUnsureOnStage;
+      w.provider.redraftPolicy = policy;
+      const r = await trigger(pipeline(w.checker));
+      assert.equal(r?.outcome, "held", name);
+      assertUntouched(KEY_A, 1, 0, null);
+      assert.equal(runs()[0].protectedFailures?.[0].repair.status, status, name);
+      assert.equal(alerts().find((x) => x.rule === "rubric_draft_held").severity, "critical", name);
+    }
+  });
+
+  test("the version that was serving keeps serving, exactly as before, while the new draft is held", async () => {
+    await seedA();
+    settings();
+    const good = wired();
+    assert.equal((await trigger(pipeline(good.checker)))?.outcome, "published");
+    const servedBefore = JSON.stringify(await servedA());
+    const auditsBefore = audits().length;
+
+    // A newer draft whose bar the check does not confirm, even after its one repair.
+    const pristine = bigDraft(await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: A_TEXT }));
+    await rubricStore.writePendingVersion({ ...pristine, createdAt: Timestamp.fromMillis(REVIEW_T0 + 86_400_000) }, [SOURCE_A_ID], { force: true, now: Timestamp.fromMillis(REVIEW_T0 + 86_400_000) });
+    const bad = wired();
+    bad.provider.policy = barUnsureOnStage;
+    bad.provider.redraftPolicy = redraftOfBar;
+    const held = await trigger(pipeline(bad.checker), KEY_A, 2);
+
+    assert.equal(held?.outcome, "held");
+    assert.equal(headDoc(KEY_A).approvedVersion, 1);
+    assert.equal(JSON.stringify(await servedA()), servedBefore, "applicants see the same rulebook");
+    assert.equal(versionDoc(KEY_A, 2).reviewStatus, "pending_review");
+    assert.equal(versionDoc(KEY_A, 2).ruleRepairs, undefined);
+    assert.equal(audits().length, auditsBefore, "no audit entry for a hold");
+  });
+
+  test("never published with a failed bar silently missing: the bar is always in the served rulebook, as the original or as its confirmed replacement", async () => {
+    // Repaired -> the replacement is served (proved above). Held -> nothing is served at all, so no rulebook lacks it.
+    await seedA();
+    settings();
+    const w = wired();
+    w.provider.policy = barUnsureOnStage;
+    w.provider.redraftPolicy = redraftOfBar;
+    await trigger(pipeline(w.checker));
+    assert.equal(await rubricStore.getApprovedRubric(ROUTE_A.countryCode, ROUTE_A.visaTypeId), null);
+  });
+
+  test("a re-delivered trigger, an admin re-run and the sweep never re-draft twice; a protected hold is not retried by the sweep", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    w.provider.policy = barUnsureOnStage;
+    w.provider.redraftPolicy = redraftOfBar;
+    const svc = pipeline(w.checker);
+    await trigger(svc);
+    assert.equal(repairCalls(w.provider).length, 1);
+    const spent = w.provider.requests.length;
+
+    await trigger(svc);
+    assert.equal(w.provider.requests.length, spent, "re-delivered trigger");
+    await quiet(() => svc.runOnDraft(ID_A1, { trigger: "admin_endpoint" }));
+    assert.equal(w.provider.requests.length, spent, "admin re-run replays the stored answers: no model call at all");
+    assert.equal(runs()[0].attempts, 2);
+    assert.deepEqual((await quiet(() => svc.sweepRetryable())).result, { considered: 0, retried: 0 });
+    assert.equal(repairCalls(w.provider).length, 1);
+  });
+
+  test("the provider failing during the re-draft holds with a retryable reason, still critical; the sweep finishes it, with ONE re-draft in all", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    w.provider.policy = (ctx) => (ctx.rule.title === BAR_TITLE ? barUnsureOnStage(ctx) : undefined);
+    w.provider.redraftPolicy = redraftOfBar;
+    const svc = pipeline(w.checker);
+    w.provider.script = (_n, req) => (isRepairRequest(req) ? "hard" : undefined);
+    const r = await trigger(svc);
+    assert.deepEqual(r?.reasonCodes, ["checker_unavailable:provider"]);
+    assert.equal(alerts().find((x) => x.rule === "rubric_draft_held").severity, "critical", "a bar failed, so it is critical");
+    assertUntouched(KEY_A, 1, 0, null);
+
+    w.provider.script = () => undefined;
+    const sweep = (await quiet(() => svc.sweepRetryable())).result;
+    assert.deepEqual(sweep, { considered: 1, retried: 1 });
+    assert.equal(versionDoc(KEY_A, 1).reviewStatus, "approved");
+    assert.equal(versionDoc(KEY_A, 1).ruleRepairs.length, 1);
+    // One failed re-draft request (not an attempt) and one that worked.
+    assert.equal(repairCalls(w.provider).length, 2);
+  });
+});
+
+describe("wording and records (#223)", () => {
+  test("the script's line: 'ran and failed' when the check ran, 'has NOT run' only when it did not", () => {
+    assert.match(checkerStatusLine("failed", false, "not_run") as string, /ran and failed/);
+    assert.doesNotMatch(checkerStatusLine("failed", false, "not_run") as string, /NOT run/);
+    for (const checker of ["not_run", "not_configured"] as const) assert.match(checkerStatusLine(checker, false, "not_run") as string, new RegExp(`has NOT run \\(${checker}\\)`));
+    assert.match(checkerStatusLine("failed", true, "not_run") as string, /has NOT run/, "--skip-checker");
+    assert.equal(checkerStatusLine("passed", false, "built"), null);
+  });
+
+  test("checker_unavailable carries what was unreachable, in words for each, and the sweep still treats it as retryable", () => {
+    for (const what of ["snapshot_read", "settings_read", "provider", "provider_refused", "not_configured", "deadline", "ledger", "internal"]) {
+      const words = reasonInWords(`checker_unavailable:${what}`);
+      assert.match(words, /independent AI check could not be completed because/);
+      assert.doesNotMatch(words, /something it needs/, what);
+      assert.ok(RETRYABLE_REASONS.includes(`checker_unavailable:${what}`.split(":")[0]));
+    }
+    assert.match(reasonInWords("checker_unavailable:made_up"), /something it needs could not be reached/);
+    assert.match(reasonInWords("checker_unavailable"), /could not be completed/);
+  });
+
+  test("an unexpected error is logged by class only, never its text, and the reason names the stage", async () => {
+    const svc = new RubricCheckerService({ provider: () => new ScriptedProvider(), readSnapshot: async () => { throw new Error("secret-token-123 /private/path"); }, loadSettings: settingsWith(), ledger: new MemoryLedger() });
+    const { result, lines } = await quiet(() => svc.check({ routeKey: "XA_xa-test", version: 1, runId: "XA_xa-test__v1", rubric: rubricOf([ruleOf(1)], null), codeLeftOutIds: [] }));
+    assert.deepEqual(result, { ok: false, reasonCodes: ["checker_unavailable:snapshot_read"] });
+    assert.ok(lines.length > 0);
+    assert.ok(lines.every((l) => !l.includes("secret-token-123") && !l.includes("/private/path")), "the error text is never logged");
+  });
+
+  test("containment: only the review service, the pipeline and the read-side filter name the recorded replacements", () => {
+    const src = path.join(__dirname, "..", "..", "..", "src");
+    const walk = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : e.name.endsWith(".ts") ? [path.join(dir, e.name)] : []));
+    const users = walk(src)
+      .filter((f) => /\bruleRepairs\b/.test(fs.readFileSync(f, "utf8")))
+      .map((f) => path.relative(src, f))
+      .sort();
+    // #223 (EXPLICIT extension): the replacements are WRITTEN by the pipeline (through the approval transaction's
+    // planner fields), VALIDATED by the review service, APPLIED by the read-side filter, and typed in the types file.
+    assert.deepEqual(users, [path.join("scrapers", "rubric", "rubric-checker.ts"), path.join("scrapers", "rubric", "rubric-exclusions.ts"), path.join("scrapers", "rubric", "rubric-repair.ts"), path.join("services", "rubric-auto-publish.service.ts"), path.join("services", "rubric-review.service.ts"), path.join("types", "rubric.ts")]);
+    // The planner's allow-list names exactly the two fields.
+    assert.deepEqual([...PLANNER_WRITABLE_FIELDS], ["questionPlan", "ruleRepairs"]);
   });
 });

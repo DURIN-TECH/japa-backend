@@ -484,6 +484,19 @@ export function sampleAudit(kept: readonly AssessmentCriterion[], version: numbe
     .map(({ c }) => ({ criterionId: c.criterionId, title: c.title, ruleRef: c.ruleRef ?? null, quote: c.source.quote, url: c.source.url }));
 }
 
+/**
+ * (#223) What the publish script says about the independent AI check. `failed`
+ * means the check RAN and did not confirm the draft (or could not finish); the
+ * old line said "has NOT run" for that too and sent people looking for a missing
+ * key. "Has NOT run" is now only for `not_run`, `not_configured` and a
+ * `--skip-checker` report. Null when the check passed (nothing to say).
+ */
+export function checkerStatusLine(checker: "not_configured" | "not_run" | "passed" | "failed", skipChecker: boolean, questionPlan: string): string | null {
+  if (skipChecker || checker === "not_run" || checker === "not_configured") return `the independent AI check has NOT run (${checker}); question plan: ${questionPlan}.`;
+  if (checker === "failed") return `the independent AI check ran and failed (see the reasons below); question plan: ${questionPlan}.`;
+  return null;
+}
+
 /** (#223) The `<what>` of `checker_unavailable:<what>` in words. */
 const CHECKER_UNAVAILABLE_WORDS: Record<string, string> = {
   settings_read: "the publishing settings could not be read",
