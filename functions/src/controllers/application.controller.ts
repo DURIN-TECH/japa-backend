@@ -47,7 +47,8 @@ export class ApplicationController {
   ): Promise<void> {
     try {
       const userId = req.userId!;
-      const { visaTypeId, countryCode, mode, agentId, userNotes } = req.body;
+      const { visaTypeId, countryCode, mode, agentId, userNotes, confirmNew } =
+        req.body;
 
       // Validate required fields
       if (!visaTypeId || !countryCode || !mode) {
@@ -80,6 +81,45 @@ export class ApplicationController {
           400
         );
         return;
+      }
+
+      // Duplicate guard (#253): the user already has a live application for
+      // this exact country + visa. Answer 409 with that application so the
+      // client can offer "continue it" vs "start another". Creation is never
+      // blocked outright: the client re-sends with `confirmNew: true` (strictly
+      // the boolean `true`, so a stray "false" string can't bypass) to proceed.
+      // Runs BEFORE the plan limit so the user sees the existing application
+      // rather than an upgrade wall.
+      // Self mode only: an agent-mode start is a deliberate choice of agent and
+      // is not guarded.
+      if (mode === "self" && confirmNew !== true) {
+        const existing = await applicationService.findActiveDuplicate(
+          userId,
+          countryCode,
+          visaTypeId
+        );
+        if (existing) {
+          res.status(409).json({
+            success: false,
+            error: "DUPLICATE_ACTIVE_APPLICATION",
+            message:
+              "You already have an active application for this visa. Continue it, or confirm to start a new one.",
+            // Slim summary only (#253 review): no notes, admin fields,
+            // contact details or cost leave the server here.
+            data: {
+              existingApplication: {
+                id: existing.id,
+                visaTypeName: existing.visaTypeName,
+                countryName: existing.countryName,
+                status: existing.status,
+                progress: existing.progress,
+                mode: existing.mode,
+                lastUpdated: existing.lastUpdated,
+              },
+            },
+          });
+          return;
+        }
       }
 
       // Enforce the per-plan active-application limit (self-serve → the client's own
