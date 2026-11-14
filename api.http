@@ -271,6 +271,57 @@ Authorization: Bearer {{agent1Token}}
 GET {{baseUrl}}/consultations
 Authorization: Bearer {{agent1Token}}
 
+### Book a consultation as a signed-in client (issue #180). The price is the
+### agent's own consultationFeeUsd, quoted in the client's profile currency and
+### locked for 30 minutes; any fee/amount/rate/currency sent here is IGNORED.
+### Paid: 201 with the booking + snapshot (priceUsdCents, chargedCurrency,
+### chargedAmountMinor, fxRate, fxRateAsOf, fxRateSource, fxMarginBps,
+### quoteLockedAt, quoteExpiresAt) and requiresPayment: true, authorizationUrl,
+### reference. $0 / no fee: 201, scheduled, requiresPayment: false.
+### No usable rate, unsupported currency or a malformed stored fee: 503 PRICING_UNAVAILABLE.
+### Agent not verified/available (or agency not approved): 404.
+POST {{baseUrl}}/consultations
+Content-Type: application/json
+Authorization: Bearer {{clientToken}}
+
+{
+  "agentId": "seed-agent-001",
+  "type": "initial",
+  "scheduledDate": "2026-12-01",
+  "scheduledTime": "10:00"
+}
+
+### Resume paying a pending booking (issue #180, the booking's own client only).
+### Inside the 30-minute lock: the same checkout. After it: a fresh quote and a
+### new checkout. If the current reference was in fact paid it is confirmed.
+POST {{baseUrl}}/consultations/{{consultationId}}/checkout
+Authorization: Bearer {{clientToken}}
+
+### Guest booking from the public agency page (no auth). The agency's
+### consultationFeeUsd is quoted in the default currency (NGN) and locked;
+### the response carries authorizationUrl, reference and the snapshot.
+POST {{baseUrl}}/agencies/public/acme/consultations
+Content-Type: application/json
+
+{
+  "clientName": "Gina Guest",
+  "clientEmail": "delivered+guest@resend.dev",
+  "scheduledDate": "2026-12-01",
+  "scheduledTime": "10:00"
+}
+
+### Verify a consultation payment on return from Paystack (no auth).
+### 200 { verified, consultation } when Paystack's amount AND currency equal
+### the stored chargedAmountMinor / chargedCurrency (idempotent: a second call
+### writes nothing). 400 PAYMENT_MISMATCH on an underpayment or wrong currency
+### (booking stays pending, nothing recorded). 409 QUOTE_EXPIRED when the quote
+### lock passed: unpaid -> data has a fresh authorizationUrl/reference; paid
+### after the lock -> not confirmed, held for manual review.
+POST {{baseUrl}}/consultations/public/verify
+Content-Type: application/json
+
+{ "reference": "{{paystackReference}}" }
+
 # ============================================================
 # CONVERSATIONS
 # ============================================================
