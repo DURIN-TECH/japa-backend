@@ -312,7 +312,7 @@ export class EligibilityController {
       sendSuccess(
         res,
         result,
-        `Seeded ${result.questionsSeeded} questions and ${result.exemptionsSeeded} exemption(s) for Nigeria → Ireland`
+        `Seeded ${result.questionsSeeded} questions for Nigeria → Ireland`
       );
     } catch (error) {
       console.error("Error seeding Nigeria-Ireland eligibility:", error);

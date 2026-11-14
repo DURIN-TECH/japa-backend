@@ -79,7 +79,7 @@ function readName(raw: unknown): string {
   return name;
 }
 
-function readCategory(raw: unknown): VisaCategory {
+export function readCategory(raw: unknown): VisaCategory {
   if (typeof raw !== "string" || !(CATEGORIES as readonly string[]).includes(raw)) {
     throw new RegistryError("INVALID_CATEGORY", 400, `The category must be one of: ${CATEGORIES.join(", ")}`, { field: "category" });
   }
