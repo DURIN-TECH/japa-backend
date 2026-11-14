@@ -37,6 +37,10 @@ const FIELD_ALLOWED = new Set([
   "scrapers/rubric/rubric-extraction.service.ts", // writes it onto the draft
   // The evaluation tooling copies translations into the human sample sheet, labelled: it calls no model with them.
   "scrapers/rubric/scripts/evaluate-language.ts",
+  // (#278) EXPLICIT extension: the storage layout names the field only to move it, unread, into a
+  // version's part documents and back (a large version is split over several documents). It hands
+  // the field to no prompt, checker or consumer; the served rubric is exactly the one-document one.
+  "scrapers/rubric/rubric-version-storage.ts",
 ]);
 /** The ONLY files that may import the translation module. */
 const IMPORT_ALLOWED = new Set([
