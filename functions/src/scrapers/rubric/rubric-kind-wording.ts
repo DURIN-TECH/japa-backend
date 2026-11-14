@@ -11,11 +11,11 @@
 // definition drafted as `judgement` was answered "unsure" by the check (70 of
 // 70 `kind_right = unsure` rules in the first real run).
 //
-// This file is deliberately SEPARATE from `rubric-prompt.ts` (owned by the
-// drafting-prompt work): the drafting branch can import these constants instead
-// of its own sentences when it next changes that prompt. Until then a test
-// (`rubric-check-context.test.ts`) pins that the drafting prompt still carries
-// the same key ideas, so the two cannot drift apart unnoticed.
+// (#243) This file is the ONE source of truth. BOTH the drafting prompt
+// (`rubric-prompt.ts`, "Kinds") and the check's prompt (`rubric-checker-prompt.ts`,
+// `kind_right`) embed `KIND_WORDING_SENTENCE`, so the drafter and the checker can
+// never again disagree on what a kind means; a test pins that both prompts carry
+// that exact sentence.
 //
 // Nothing here is a standard: it defines words, it never says what to answer
 // when in doubt (the check's "Never guess yes" is in the check's own prompt).
@@ -34,3 +34,9 @@ export const KIND_MANDATORY_BAR = "a bar on a stated group of applicants, whatev
  */
 export const KIND_JUDGEMENT =
   "everything else that a decision maker decides without such a fixed figure, including a requirement the applicant must show, a permitted activity, a definition, a method of calculation and an instruction to the decision maker";
+
+/**
+ * (#243) The three meanings as ONE sentence, embedded word for word in the drafting prompt and in the
+ * check's `kind_right` line. Change the wording above and both prompts change (bump both versions).
+ */
+export const KIND_WORDING_SENTENCE = `\`objective\` means the quote sets ${KIND_OBJECTIVE}; \`mandatory_bar\` means the quote sets ${KIND_MANDATORY_BAR}; \`judgement\` covers ${KIND_JUDGEMENT}.`;

@@ -404,7 +404,7 @@ const repairRequestsOf = (p: ScriptedProvider) => p.requests.filter(isRepairRequ
 
 describe("(#240) the protected re-draft keeps applicability and accepts a harmless swap", () => {
   test("the repair prompt says to keep the applicability unless condition_faithful failed, and its version moved", () => {
-    assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v3");
+    assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v4");
     const chunk = { sourceId: SRC_ID, contentHash: SRC_HASH, docType: "html", chunkIndex: 0, chunkCount: 1, text: BAR_QUOTE } as any;
     const req = buildRepairRequest(chunk, { rule: { title: "T", kind: "mandatory_bar", stage: "validity", quote: BAR_QUOTE }, aspects: ["group_matches_codes"] }, ["high"], { maxOutputTokens: 1000, timeoutMs: 1000 });
     assert.match(req.user, /Keep the rule's applicability/);

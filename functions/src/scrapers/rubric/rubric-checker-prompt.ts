@@ -3,7 +3,7 @@ import type { LlmRequest } from "../../services/ai/llm-provider";
 import { sanitizeUntrusted } from "../../services/ai/prompt-safety";
 import { INTENT_POLARITIES, type AssessmentCriterion } from "../../types/rubric";
 import { validateAgainstSchema } from "./rubric-prompt";
-import { KIND_JUDGEMENT, KIND_MANDATORY_BAR, KIND_OBJECTIVE } from "./rubric-kind-wording";
+import { KIND_WORDING_SENTENCE } from "./rubric-kind-wording";
 import type { ConditionFoundAt } from "./rubric-quote";
 
 // ============================================
@@ -115,7 +115,7 @@ export const CHECKER_SYSTEM_PROMPT = [
   "",
   "Judge these aspects for every rule:",
   "- `title_faithful`: the title states only what the quote says. It adds no condition, number, date or group the quote does not contain, and it is neither wider nor narrower than the quote.",
-  `- \`kind_right\`: \`objective\` means the quote sets ${KIND_OBJECTIVE}; \`mandatory_bar\` means the quote sets ${KIND_MANDATORY_BAR}; \`judgement\` covers ${KIND_JUDGEMENT}. The kind given must be the one the quote supports.`,
+  `- \`kind_right\`: ${KIND_WORDING_SENTENCE} The kind given must be the one the quote supports.`,
   "- `stage_right`: `validity` is whether an application can be considered at all; `suitability` is a ground for refusal whatever the merits; `eligibility` is a requirement of the category itself; `credibility` is whether the account given is believed. The stage given must be the one the quote belongs to. Answer `na` when the rule's `kind` is `mandatory_bar` or `judgement`: a bar on a stated group applies to that group whatever its stage, and a judgement is weighed by a decision maker, so for both the stage is only a label and is not judged.",
   "- `condition_faithful`: `applicability` says whether the rule applies to every applicant (`all_applicants`), only in some circumstances (`conditional`), or only to applicants who come for one particular activity or sub-category that the guidance singles out (`specialist`); for the last two, `applicabilityCondition` holds the words that name those circumstances or that activity. Judge that this is what the quote, its `listItems`, its list lead-in and the surrounding text say, and that the surrounding text does not add an exception, an \"unless\" or an \"only if\" that changes it. For a `specialist` rule the activity may be named by a section heading above the quote (`sectionHeadings`), or by the trigger's question and answers (`triggerQuestion`, `triggerAnswers`) rather than by the quote itself: the condition is faithful when the quote, read under those headings and that lead-in, applies to exactly those applicants, and the surrounding text adds no exception that changes it. `conditionFoundAt` tells you where the condition's words are written (`not_found` means they are written nowhere in the official text: judge whether the quote, its headings and its lead-in still support them, and when you cannot tell, answer `unsure`). Never use general knowledge about any particular country or route.",
   "- `check_faithful`: when `check` is not null, its `field`, `op`, `value` and `unit` mean what the quote says (`gte` is at least, `lte` is at most, `eq` is exactly, `present` means it must exist, `heldForDays` means a condition held for the period written, as the quote writes it). Answer `na` when `check` is null.",

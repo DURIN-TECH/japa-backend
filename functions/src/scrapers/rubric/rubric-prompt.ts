@@ -8,6 +8,7 @@ import {
   INTENT_POLARITIES,
 } from "../../types/rubric";
 import type { SourceChunk } from "./rubric-chunk";
+import { KIND_WORDING_SENTENCE } from "./rubric-kind-wording";
 
 // ============================================
 // RUBRIC — EXTRACTION PROMPT AND OUTPUT SCHEMA (issue #40)
@@ -84,8 +85,22 @@ import type { SourceChunk } from "./rubric-chunk";
  *    nothing in that English wording may state a number, date, amount or group
  *    the quote does not state (in either language). Both calls share the
  *    paragraph (COMMON_INSTRUCTIONS), so both hashes change.
+ *  - "2026-11-rubric-v9" (#243): drafting instructions that stop the defects the second
+ *    check found in the first real draft (all are about HOW TO READ an excerpt, none holds
+ *    route knowledge): a title keeps every "unless" / "except" / "other than" / "provided
+ *    that" and the quote's modal strength and adds no intent words; a definition or a set of
+ *    alternatives is ONE rule quoting its lead-in, not one rule per item; a list item's
+ *    condition is its own lead-in (the old "lead-in" and "name the activity" instructions,
+ *    which conflicted, are one rule that says which wins); a quote that exempts a group is
+ *    `conditional`; a condition is a circumstance, never an outcome; examples, summaries and
+ *    link labels are not rules; the kind wording is shared with the checker
+ *    (`KIND_WORDING`). Only the criteria prompt changed: the intake prompt (call 2)
+ *    is byte-for-byte what v8 had.
+ *  - "2026-11-rubric-v10" (#243, after #242 merged): the kind sentence is the one in
+ *    `rubric-kind-wording.ts` (`KIND_WORDING_SENTENCE`), the same text the check's prompt
+ *    embeds; v9 was never released.
  */
-export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v8";
+export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v10";
 
 /** Instructions shared by both calls: what the excerpt is, and how to treat it. */
 const COMMON_INSTRUCTIONS = [
@@ -104,29 +119,36 @@ export const RUBRIC_SYSTEM_PROMPT = [
   COMMON_INSTRUCTIONS,
   "Scope. Give every criterion an `applicability`:",
   "- `all_applicants`: the rule applies to every applicant on the route.",
-  "- `conditional`: the rule applies depending on THIS applicant's circumstances (for example who is paying, or the applicant's earlier immigration history). Give `applicabilityCondition`: the words of the excerpt that state the circumstance, copied character for character. If the circumstance is stated in a lead-in sentence above a list, copy that sentence.",
-  "- `specialist`: the rule applies only to applicants who come for a particular specialist activity or sub-category that the source singles out. Give `applicabilityCondition` the same way: the words of the excerpt (a heading, a lead-in sentence or the rule itself) that name the activity or sub-category, copied character for character. The rule is KEPT, however many such rules there are: list every one.",
+  "- `conditional`: the rule applies depending on THIS applicant's circumstances (for example who is paying, or the applicant's earlier immigration history). Give `applicabilityCondition` as the \"Conditions\" paragraph below says. A rule whose own quote exempts a group, route or category of applicant (\"unless ...\", \"other than ...\", \"this does not apply to ...\") is `conditional`, never `all_applicants`: it does not apply to everyone.",
+  "- `specialist`: the rule applies only to applicants who come for a particular specialist activity or sub-category that the source singles out. Give `applicabilityCondition` as the \"Conditions\" paragraph below says: it must name the activity or sub-category. The rule is KEPT, however many such rules there are: list every one.",
   "- `other_route`: the text says the rule applies to a different route or category of applicant.",
   "A requirement every applicant on the route must meet is `all_applicants` even when it is written in a long general document. From a ROUTE GUIDANCE source, everything is about the route: list what applies to every applicant or depends on the applicant's circumstances, and mark activity-specific parts `specialist` (do not leave them out). From a SECONDARY source, list the rules that apply to applicants of the route (mark rules written for other routes or categories of applicant `other_route`, and rules for a specialist activity or sub-category of THIS route `specialist`); do not stretch a rule written for another route to this one. From a PRIMARY source, list every criterion the excerpt states.",
   "",
   "Lists:",
-  "- When a paragraph lists lettered or numbered sub-conditions that must each be satisfied, extract ONE criterion per sub-condition. Each has its own `quote`, starting at its own marker (for example \"(a)\") and not running into the next marker, and its own `title`. Carry the paragraph's triggering circumstance (its lead-in sentence) onto each of them as `applicabilityCondition`. Do not merge sub-conditions into one criterion, and do not quote only the lead-in sentence for them (the one exception is the next rule).",
-  "- When the items of a list are alternatives or separate rules, extract each one separately in the same way.",
+  "- When a paragraph lists lettered or numbered sub-conditions that must each be satisfied, extract ONE criterion per sub-condition. Each has its own `quote`, starting at its own marker (for example \"(a)\") and not running into the next marker, and its own `title`. Do not merge sub-conditions into one criterion, and do not quote only the lead-in sentence for them (the exceptions are the next two rules).",
+  "- Definitions and alternatives. When a passage DEFINES a term (it says that a word \"means\" or \"is\" a person or thing that is one or more of the following) or lists ALTERNATIVE circumstances (\"could arise in the following circumstances\", \"any of the following\", \"either (a) or (b)\"), the items are ways of meeting the lead-in, not rules of their own. Draft ONE criterion whose `quote` is the lead-in sentence only, and do NOT draft one criterion per item: the program attaches the list lines from the stored text. A single item on its own would state more or less than the passage does. This is different from sub-conditions that must EACH be met (previous rule), which keep one criterion per item. When the items of a list are separate rules, each complete in itself without the lead-in, extract each one separately.",
   "- A statement about how to treat the ABSENCE of something (for example, what to do when an applicant has no history of a kind) is a criterion or a probe factor in the source's words. Extract it; do not skip it because it describes a missing fact.",
+  "- Not rules. An example (\"An example would be ...\"), a sentence that only summarises or introduces what other passages say, and a link label or topic name in a checklist (a line that names a subject or points to another document or section without stating anything) are not criteria: do not draft them. This is only about lines that state no requirement, permission, definition, method or instruction. Every line that does state one is still drafted, including an instruction to the decision maker about what to do or check, and none is left out because there are many.",
   "",
-  "Rules for every criterion:",
+  "Conditions. `applicabilityCondition` is the circumstance in which THIS rule applies, copied character for character from the excerpt. One order of choice applies to every rule:",
+  "- The condition is the CIRCUMSTANCE, never the outcome. A sentence that only says what may happen to the application (\"the application may be refused\", \"permission may be granted\") is not a condition; the condition is the situation that makes it happen (\"where the decision maker is satisfied that ...\").",
+  "- A rule that is one item of a list takes its own lead-in sentence, the sentence directly above the list that the item completes, as its condition. Never the text of a sibling item or of another sentence nearby.",
+  "- For a `specialist` rule the condition must name the activity or sub-category. When the item's own lead-in names it, the lead-in is the condition. When the lead-in does not name it and only the heading of the section does, the condition is that heading, copied exactly. When the rule itself names it, the rule's own words are the condition.",
+  "",  "Rules for every criterion:",
   "- `quote` is copied character for character from the excerpt: one continuous passage from a single paragraph, made of whole words, no ellipsis, nothing added, nothing corrected, nothing joined from two places. Include the whole sentence, with any \"not\", \"unless\" or \"only if\" it contains. It will be checked by a program against the stored document and discarded if it is not found.",
   "- Lines of the form [[page N]] are page markers added by the program. Never include one in a quote, and never let a quote run from one page into the next.",
+  "- Titles. A title states what the quote states, neither wider nor narrower. It keeps every \"unless\", \"except\", \"other than\" and \"provided that\" of the quote (in short words), or, when the title cannot carry the exception, ends with \"unless an exception applies\". It keeps the strength of the quote's modal word: \"should\" stays \"should\" (never \"must\"), \"may\" stays \"may\", \"must\" stays \"must\". It adds no word about intent, belief or continuation (\"intends\", \"continues to\") that the quote does not have.",
   "- State nothing the quote does not say. Any number, amount, duration, unit, date or named group you give (in `check`, `title`, `probeFactors`, `validFrom`, `validUntil`, `appliesTo`) must be written in that criterion's own `quote`; choose the quote so that it contains them. Never convert, round or calculate: give `check.value` as a JSON number, and `check.unit` exactly as the quote writes the unit.",
   "- If the excerpt sets no fixed figure for something, it is not an objective check. Use kind `judgement` and list the factors the excerpt tells the decision maker to weigh in `probeFactors`.",
   "- `ruleRef` is the publisher's own reference for the rule as printed in the excerpt: the paragraph or section number that labels the quote's paragraph, or that heads the section the paragraph is in. Where the quote is one lettered or numbered item of a list, a program derives the reference from the list's own label; you may give the label of the paragraph the list belongs to. Leave the property out when you are not sure. Never construct a reference that is not printed.",
   "- Never decide an outcome. You describe the rule and the fact to read; you do not say whether anyone passes.",
   "",
-  "Kinds:",
-  "- `objective`: a rule a program can check. Give `check` with the `field` to read, an `op` and, unless the op is `present`, a `value`.",
-  "- `mandatory_bar`: a bar that applies to a stated group whatever else is true. Give `appliesTo`: `asWritten` lists the group members exactly as the excerpt names them, `nationalities` gives the matching two-letter codes in the same order. Give `validFrom` / `validUntil` (YYYY-MM-DD) only when the excerpt states the dates. `appliesTo.nationalities` and `asWritten` are for members that really are a nationality. A member that is NOT a nationality (a status or category of person, for example one defined by a right or a legal status) goes in `appliesTo.uncoded`, written exactly as the quote names it: it has no code, so never invent one and never put a nationality's code for a group that is wider than, or different from, that nationality. A bar needs at least one member in `asWritten` or in `uncoded`.",
-  "- A rule whose own sentence ends with a lead-in (a colon: \"... except where they are subject to any of the following:\") may use that sentence as its `quote`, when the rule is itself the bar or the requirement the list qualifies. Quote the lead-in sentence only. Do NOT copy the list lines under it into any field: the program attaches them from the stored text. This does not change the rule for lettered sub-conditions: a paragraph that lists sub-conditions the applicant must each satisfy still gives one criterion per item.",
-  "- `judgement`: a matter the decision maker weighs. Give `probeFactors` and set `requiresInterviewBeforeRefusal` to true only when the excerpt says the person should be interviewed or asked before a refusal on this point. A judgement criterion NEVER has a `check`: leave `check` out.",
+  "Kinds. What each kind means (the independent check reads the same words):",
+  `- ${KIND_WORDING_SENTENCE}`,
+  "- `objective`: give `check` with the `field` to read, an `op` and, unless the op is `present`, a `value`.",
+  "- `mandatory_bar`: give `appliesTo`: `asWritten` lists the group members exactly as the excerpt names them, `nationalities` gives the matching two-letter codes in the same order. Give `validFrom` / `validUntil` (YYYY-MM-DD) only when the excerpt states the dates. `appliesTo.nationalities` and `asWritten` are for members that really are a nationality. A member that is NOT a nationality (a status or category of person, for example one defined by a right or a legal status) goes in `appliesTo.uncoded`, written exactly as the quote names it: it has no code, so never invent one and never put a nationality's code for a group that is wider than, or different from, that nationality. A bar needs at least one member in `asWritten` or in `uncoded`.",
+  "- A rule whose own sentence ends with a lead-in (a colon: \"... except where they are subject to any of the following:\") may use that sentence as its `quote`, when the rule is itself the bar or the requirement the list qualifies, or the definition or set of alternatives the list spells out. Quote the lead-in sentence only. Do NOT copy the list lines under it into any field: the program attaches them from the stored text. This does not change the rule for lettered sub-conditions: a paragraph that lists sub-conditions the applicant must each satisfy still gives one criterion per item.",
+  "- `judgement`: give `probeFactors` and set `requiresInterviewBeforeRefusal` to true only when the excerpt says the person should be interviewed or asked before a refusal on this point. A judgement criterion NEVER has a `check`: leave `check` out.",
   "",
   "Stages, in the order they are applied: `validity` (whether the application can be considered at all), `suitability` (grounds for refusal whatever the merits), `eligibility` (the requirements of the category), `credibility` (whether the account given is believed).",
   "",
@@ -432,7 +454,9 @@ export function buildRubricRequest(chunk: SourceChunk, severityLevels: readonly 
 // v2 (#226): the re-draft must quote the SAME line as the rejected rule and keep its kind.
 // v3 (#240): the re-draft also keeps the rule's applicability unless `condition_faithful` failed (a
 // fresh reading used to switch conditional to specialist, which the code then refused).
-export const RUBRIC_REPAIR_PROMPT_VERSION = "2026-11-repair-v3";
+// v4 (#243): the re-draft shows the drafting prompt's new instructions (it reuses the system prompt), and
+// for an ORDINARY rule (not a bar) it may quote a definition's lead-in instead of one item of it.
+export const RUBRIC_REPAIR_PROMPT_VERSION = "2026-11-repair-v4";
 
 /** What each checker aspect asks, in the words a re-draft needs (kept apart from the checker's own prompt: no shared text). */
 const ASPECT_MEANING: Record<string, string> = {
@@ -443,6 +467,19 @@ const ASPECT_MEANING: Record<string, string> = {
   check_faithful: "the machine check (field, operator, value, unit) must say exactly what the quote sets",
   group_matches_codes: "every member of the named group must be covered, by a country code for a nationality or by an `uncoded` entry for anything that is not a nationality, and no code may stretch to a wider group",
 };
+
+/** (#226) What a re-draft of a BAR must quote: its own line, nothing else (code discards any other rule). */
+const BAR_QUOTE_SENTENCE =
+  "the new rule's quote must be the quote above, or a continuous part of it, taken from the same line of the excerpt. A rule that quotes any other line, even one that restates the same point, is discarded by code.";
+
+/**
+ * (#243) What a re-draft of an ORDINARY rule may quote: its own line, or, when that line is one item
+ * of a definition or of a set of alternatives, the lead-in sentence of that list (one rule for the
+ * whole passage, as the drafting rules say). Either way the quote is copied from the excerpt, and
+ * code still refuses a quote that is not in the stored text.
+ */
+const ORDINARY_QUOTE_SENTENCE =
+  "the new rule's quote must be copied from the excerpt: the quote above, or a continuous part of it, from the same line. If the quote above is one item of a definition or of a set of alternatives, follow the rules you were given for those: draft ONE rule from the lead-in sentence of the list instead. The new rule must not be a mandatory bar.";
 
 /** The stored rule fields a re-draft is shown (data we hold: never source text we did not verify). */
 export interface RepairRuleView {
@@ -474,6 +511,9 @@ export function buildRepairRequest(
   // Drop the generic closing line of call 1; the repair instruction replaces it.
   const closing = "List the assessment criteria this excerpt states for the route, following the rules you were given.";
   const body = base.endsWith(closing) ? base.slice(0, base.length - closing.length).trimEnd() : base;
+  // A bar must come back quoting the SAME line (code refuses anything else); an ordinary rule may instead
+  // come back as the definition or alternatives it belongs to (see ORDINARY_QUOTE_SENTENCE).
+  const ordinary = failed.rule.kind !== "mandatory_bar" && failed.rule.appliesTo === undefined;
   const aspects = failed.aspects.map((a) => `- ${a}: ${ASPECT_MEANING[a] ?? "this aspect"}`);
   return {
     role: "judgement",
@@ -485,7 +525,7 @@ export function buildRepairRequest(
       JSON.stringify(failed.rule),
       "The reader did not confirm these aspects:",
       ...aspects,
-      "Draft that one rule again, from the passage of the excerpt that holds the quote above, following the rules you were given. The rest of the excerpt is only context for reading that sentence: the new rule's quote must be the quote above, or a continuous part of it, taken from the same line of the excerpt. A rule that quotes any other line, even one that restates the same point, is discarded by code. Keep the rule's kind unless the aspects above are about the kind itself. Keep the rule's applicability (and so its scope) exactly as it is in the fields above unless condition_faithful is one of the aspects the reader did not confirm; in that case change only what that aspect asks. Every quote and every group name must be copied character for character from the excerpt; never add, widen or guess. Return exactly one criterion. If the passage cannot be drafted into a rule that satisfies the aspects above without adding anything the excerpt does not say, return an empty `criteria` list.",
+      "Draft that one rule again, from the passage of the excerpt that holds the quote above, following the rules you were given. The rest of the excerpt is only context for reading that sentence: " + (ordinary ? ORDINARY_QUOTE_SENTENCE : BAR_QUOTE_SENTENCE) + " Keep the rule's kind unless the aspects above are about the kind itself. Keep the rule's applicability (and so its scope) exactly as it is in the fields above unless condition_faithful is one of the aspects the reader did not confirm; in that case change only what that aspect asks. Every quote and every group name must be copied character for character from the excerpt; never add, widen or guess. Return exactly one criterion. If the passage cannot be drafted into a rule that satisfies the aspects above without adding anything the excerpt does not say, return an empty `criteria` list.",
     ].join("\n"),
     schema: buildRubricOutputSchema(severityLevels),
     maxOutputTokens: limits.maxOutputTokens,
