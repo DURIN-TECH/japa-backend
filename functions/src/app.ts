@@ -66,6 +66,8 @@ import {
 // Public exchange rates + admin rate overrides (issue #178).
 import { publicRatesRoutes, adminExchangeRateRoutes } from "./routes/exchange-rate.routes";
 import { verificationWebhookRoutes } from "./routes/verification-webhook.routes";
+// Public Paystack return page that bounces the in-app browser back to the mobile app (issue #252).
+import { paymentReturnRoutes } from "./routes/payment-return.routes";
 // Admin review queue for trafficking / scam risk signals (issue #119).
 import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
 
@@ -99,6 +101,11 @@ app.get("/health", (req: Request, res: Response) => {
 app.use("/users", userRoutes);
 app.use("/countries", countryRoutes);
 app.use("/visas", visaSearchRoutes);
+// Public Paystack return page (issue #252) — no verifyAuth: Paystack's browser
+// redirect carries no token. It only redirects to the fixed app deep link
+// `durintech://payment-return`; payment is confirmed by the authenticated
+// verify endpoints, never by this page.
+app.use("/payments", paymentReturnRoutes);
 // Public auth flows (forgot-password) — no verifyAuth (user isn't signed in).
 app.use("/auth", authRoutes);
 app.use("/agents", agentRoutes);
