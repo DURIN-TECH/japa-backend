@@ -39,6 +39,11 @@ router.get("/:id/answers", verifyAuth, (req, res) =>
 router.put("/:id/answers/:itemId", verifyAuth, (req, res) =>
   applicationController.saveAnswer(req, res)
 );
+// Issue #235: change the member country a shared-route application goes
+// through, before submission. Access (update) is checked in the handler.
+router.put("/:id/through-country", verifyAuth, (req, res) =>
+  applicationController.changeThroughCountry(req, res)
+);
 router.put("/:id", verifyAuth, (req, res) =>
   applicationController.updateApplication(req, res)
 );

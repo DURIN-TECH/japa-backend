@@ -1261,7 +1261,7 @@ export class EligibilityService {
    * Seed Nigeria → Ireland eligibility questions
    * Admin function to populate the database with initial data
    */
-  async seedNigeriaIreland(): Promise<{ questionsSeeded: number; exemptionsSeeded: number }> {
+  async seedNigeriaIreland(): Promise<{ questionsSeeded: number }> {
     const { seedNigeriaIrelandEligibility } = await import("../data/eligibility-seed-nigeria-ireland");
     return seedNigeriaIrelandEligibility();
   }

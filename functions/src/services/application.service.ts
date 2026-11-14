@@ -17,6 +17,13 @@ import { noteService } from "./note.service";
 // Case-start rule for agency visas (issue #102). Imported from its file, not
 // the agency-visas index, so this service does not pull in routes.
 import { canStartCaseOnVisa } from "../agency-visas/agency-visa-access";
+// Issue #231: the rulebook stack fixed on a new application (light import: no authorities service).
+import { resolveRouteStackFor, routeStackKeys } from "../shared-routes/route-stack";
+// Issue #234: the applicant's holdings, copied onto the application when it starts.
+import { applicantFactsFromUser } from "./applicant-holdings.service";
+import type { ThroughCountryChoice, User } from "../types";
+// Issue #235: the answers given in the "apply through" step seed the intake.
+import { intakeService } from "./intake.service";
 import { fromMajor } from "../money/money";
 import { getCurrencyInfo } from "../money/currencies";
 
@@ -56,6 +63,13 @@ export interface CreateApplicationInput {
   createdByAdminId?: string;
   createdByAdminName?: string;
   adminCreationReason?: string;
+  // Issue #235 (P6 of #228): set when the application is on a SHARED route and
+  // the applicant confirmed the member country to apply through. `countryCode`
+  // and `visaTypeId` above are then that member's own inheriting record
+  // (checked by services/competence.service.ts `resolveForCreate`). The answers
+  // the proposal was worked out from seed the intake, so they are not asked
+  // again. Absent for every other application.
+  throughCountry?: { choice: ThroughCountryChoice; answers: Record<string, unknown> };
 }
 
 export interface UpdateApplicationInput {
@@ -66,7 +80,49 @@ export interface UpdateApplicationInput {
   mode?: "self" | "agent";
 }
 
+/**
+ * Statuses that end an application (#253). Same set the plan-limit count
+ * treats as "not active" (application.controller `countActiveApplications`).
+ * A finished or abandoned application never counts as a duplicate.
+ */
+const TERMINAL_STATUSES: ApplicationStatus[] = [
+  "approved",
+  "rejected",
+  "withdrawn",
+  "expired",
+];
+
 class ApplicationService {
+  /**
+   * Find the user's live application for this exact country + visa (#253).
+   *
+   * Query shape: three equality filters only (userId, countryCode,
+   * visaTypeId), which Firestore serves by merging single-field indexes, so
+   * no composite index is needed. Status is filtered in memory (a `not-in`
+   * on top would need one). The result set is tiny (one user, one visa).
+   *
+   * Returns the most recently updated live match, or null.
+   */
+  async findActiveDuplicate(
+    userId: string,
+    countryCode: string,
+    visaTypeId: string
+  ): Promise<Application | null> {
+    const snap = await collections.applications
+      .where("userId", "==", userId)
+      .where("countryCode", "==", countryCode)
+      .where("visaTypeId", "==", visaTypeId)
+      .get();
+    const live = snap.docs
+      .map((d) => d.data() as Application)
+      .filter((a) => !TERMINAL_STATUSES.includes(a.status));
+    if (live.length === 0) return null;
+    // Newest activity first (Timestamps; fall back to 0 if one is missing).
+    const ms = (a: Application) => a.lastUpdated?.toMillis?.() ?? 0;
+    live.sort((a, b) => ms(b) - ms(a));
+    return live[0];
+  }
+
   /**
    * Create a new application
    */
@@ -88,6 +144,15 @@ class ApplicationService {
       input.countryCode,
       input.visaTypeId,
       agencyId
+    );
+
+    // Issue #231 (P2 of #228): fix the rulebook stack this application runs on
+    // NOW (shared layer(s) first, the country's own layer last), so a later
+    // change of the visa's `inheritsFrom` does not rewrite a running
+    // application. A visa that inherits nothing costs no extra read and gets
+    // just its own key `{countryCode}_{visaTypeId}`.
+    const routeStack = routeStackKeys(
+      await resolveRouteStackFor(input.countryCode, input.visaTypeId, visaType.inheritsFrom)
     );
 
     // Get requirements to count required documents
@@ -160,9 +225,31 @@ class ApplicationService {
       clientPhone,
       visaTypeName: visaType.name,
       countryName: country?.name || input.countryCode,
+      routeStack,
+      // Issue #234 (P5 of #228): what the applicant holds (nationalities,
+      // country of residence, held visas and permits), COPIED from their
+      // profile now, with the time taken (same pattern as the intake answers).
+      // Assessment reads this copy, never the live profile, so a later profile
+      // edit does not change what this application is assessed on. Facts the
+      // applicant has not stated are copied as "not stated", never guessed.
+      applicantFacts: applicantFactsFromUser(userData as Partial<User> | null, now),
       createdAt: now,
       updatedAt: now,
     };
+
+    // Issue #235: a shared-route application records the confirmed member
+    // country, who chose it and the rule shown at the time, and starts its
+    // intake with the answers already given (only those whose question is in
+    // this application's stack; nothing is ever dropped silently: anything
+    // else is set aside on the intake, see rebuildIntake).
+    if (input.throughCountry) {
+      application.throughCountryCode = input.throughCountry.choice.countryCode;
+      application.throughCountry = input.throughCountry.choice;
+      if (Object.keys(input.throughCountry.answers).length > 0) {
+        const seeded = await intakeService.rebuildIntake({ countryCode: input.countryCode, visaTypeId: input.visaTypeId, routeStack }, { answers: input.throughCountry.answers }, now);
+        if (seeded.intake) application.intake = seeded.intake;
+      }
+    }
 
     await docRef.set(application);
 

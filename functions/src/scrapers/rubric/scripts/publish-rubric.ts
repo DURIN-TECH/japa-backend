@@ -21,6 +21,9 @@
  *
  * Run (from functions/):
  *   npm run publish:rubric -- --project <id> --route <routeKey> --version <n> [--dry-run] [--skip-checker] [--allow-production]
+ * (#233) `<routeKey>` is any rulebook key: `{countryCode}_{visaTypeId}` for a
+ * country, or `{authorityId}_{sharedRouteId}` for a bloc / treaty's shared
+ * layer. Every gate is the same for both.
  * (also accepts `--flag=value`).
  */
 

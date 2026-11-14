@@ -1,5 +1,5 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
-import { EligibilityQuestion, VisaExemption } from "../types/eligibility";
+import { EligibilityQuestion } from "../types/eligibility";
 
 const db = getFirestore();
 
@@ -399,33 +399,22 @@ const studentQuestions: QuestionSeed[] = [
 ];
 
 // ============================================
-// VISA EXEMPTION DATA
+// VISA EXEMPTION DATA — RETIRED (issue #239, P10 of #228)
 // ============================================
-const visaExemption: Omit<VisaExemption, "id" | "createdAt" | "updatedAt"> = {
-  nationality: "NG",
-  destinationCountry: "IE",
-  requirementType: "visa_required",
-  workPermitRequired: true,
-  studyPermitRequired: true,
-  conditions: [
-    "Nigerian citizens require a visa for all visits to Ireland",
-    "Apply online through AVATS system",
-    "Submit documents at VFS Global centre",
-    "Processing typically takes 8-12 weeks",
-  ],
-  source: "Irish Naturalisation and Immigration Service (INIS)",
-  lastVerified: Timestamp.now(),
-};
+// The Nigeria -> Ireland `visaExemptions` row that used to be seeded here
+// ("visa required", with conditions and a source NAME but no quoted official
+// sentence) is gone: an entry rule with no verbatim official quote must not be
+// seeded. The migration script (scripts/migrate-shared-visa-model.ts) deletes
+// the rows already stored. Entry rules come back, from sources, with the
+// "do you need a visa at all" work (#236).
 
 // ============================================
 // SEED FUNCTION
 // ============================================
 export async function seedNigeriaIrelandEligibility(): Promise<{
   questionsSeeded: number;
-  exemptionsSeeded: number;
 }> {
   const questionsCollection = db.collection("eligibilityQuestions");
-  const exemptionsCollection = db.collection("visaExemptions");
 
   const now = Timestamp.now();
 
@@ -454,19 +443,10 @@ export async function seedNigeriaIrelandEligibility(): Promise<{
     questionCount++;
   }
 
-  // Add visa exemption
-  const exemptionRef = exemptionsCollection.doc();
-  batch.set(exemptionRef, {
-    ...visaExemption,
-    createdAt: now,
-    updatedAt: now,
-  });
-
   await batch.commit();
 
   return {
     questionsSeeded: questionCount,
-    exemptionsSeeded: 1,
   };
 }
 
@@ -481,4 +461,3 @@ export const nigeriaIrelandQuestions = {
   student: studentQuestions,
 };
 
-export const nigeriaIrelandExemption = visaExemption;

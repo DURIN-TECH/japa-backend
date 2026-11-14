@@ -1373,3 +1373,102 @@ describe("auto-publish: the language gate", () => {
     assert.equal(again.outcome, "published");
   });
 });
+
+// ============================================
+// (#233 P4b) The layer check: an own layer against its shared layer(s)
+// ============================================
+//
+// Route A stands in for a member country's OWN layer; the shared layers are
+// injected (`sharedLayersOf`), the layer check is a stub (its own logic is
+// pinned in rubric-layer-check.test.ts). What is pinned here: the check runs
+// LAST, only for a draft about to be published; what it returns is written with
+// the approval (`layerCheck`, `layerConflicts`) and shown as a gate line; it
+// NEVER holds; a route with no shared layer gets nothing new at all.
+
+describe("auto-publish: the layer check of an own layer (#233 P4b)", () => {
+  const SHARED = "zq-bloc_zq-short-stay";
+  const shared = [{ rulebookKey: SHARED, version: 3, criteria: [{ criterionId: "s-1", title: "Shared rule", source: { quote: "A shared sentence.", url: "https://rules.example/s" } } as any] }];
+  const conflict = { criterionId: "c1", title: "Own rule", quote: "An own sentence.", url: "https://rules.example/o", sharedRulebookKey: SHARED, sharedVersion: 3, sharedCriterionId: "s-1", sharedTitle: "Shared rule", sharedQuote: "A shared sentence.", sharedUrl: "https://rules.example/s" };
+  /** A layer checker stub that records its calls and returns a checked record with one conflict. */
+  const layerStub = (status: "checked" | "not_checked" = "checked") => {
+    const calls: any[] = [];
+    return {
+      calls,
+      check: async (input: any, caps: any) => {
+        calls.push({ input, caps });
+        return {
+          record: { status, reason: status === "checked" ? null : "capped", promptVersion: "layer-check-test", model: "m", sharedLayers: [{ rulebookKey: SHARED, version: 3 }], ownRulesChecked: input.ownCriteria.length, sharedRulesChecked: 1, calls: 1, inputTokens: 10, outputTokens: 2, restates: [], refusedLinks: [], unsure: [], conflictCount: status === "checked" ? 1 : 0 },
+          conflicts: status === "checked" ? [conflict] : [],
+        };
+      },
+    };
+  };
+
+  test("published with the record and the conflicts written on the version; a gate line; the settings caps passed on", async () => {
+    await seedA();
+    settings();
+    const layer = layerStub();
+    const r = await trigger(service({ checker: checkerStub(), planner: plannerStub(), layerChecker: layer, sharedLayersOf: async () => shared }));
+    assert.equal(r?.outcome, "published");
+    assert.equal(layer.calls.length, 1);
+    assert.equal(layer.calls[0].input.shared[0].rulebookKey, SHARED);
+    assert.equal(typeof layer.calls[0].caps.maxRequests, "number", "the publish settings' request cap");
+    const v = versionDoc(KEY_A, 1);
+    assert.equal(v.reviewStatus, "approved");
+    assert.equal(v.layerCheck.status, "checked");
+    assert.deepEqual(v.layerConflicts, [conflict]);
+    const gate = runs()[0].gates.find((g) => g.gate === "layer_check");
+    assert.ok(gate?.passed);
+    assert.match(String(gate?.detail), /1 conflict/);
+  });
+
+  test("not checked never holds: published, the not-checked record stored visibly", async () => {
+    await seedA();
+    settings();
+    const r = await trigger(service({ checker: checkerStub(), planner: plannerStub(), layerChecker: layerStub("not_checked"), sharedLayersOf: async () => shared }));
+    assert.equal(r?.outcome, "published");
+    assert.equal(versionDoc(KEY_A, 1).layerCheck.status, "not_checked");
+    assert.deepEqual(versionDoc(KEY_A, 1).layerConflicts, []);
+    assert.match(String(runs()[0].gates.find((g) => g.gate === "layer_check")?.detail), /^not_checked:capped/);
+  });
+
+  test("a shared layer with no approved version, or an unreadable stack: not checked, no call, published", async () => {
+    await seedA();
+    settings();
+    const layer = layerStub();
+    const r = await trigger(service({ checker: checkerStub(), planner: plannerStub(), layerChecker: layer, sharedLayersOf: async () => [{ rulebookKey: SHARED, version: null, criteria: [] }] }));
+    assert.equal(r?.outcome, "published");
+    assert.equal(layer.calls.length, 0);
+    assert.equal(versionDoc(KEY_A, 1).layerCheck.reason, "shared_layer_not_approved");
+  });
+
+  test("a route with no shared layer: no call, and nothing new on the version or the run (exactly as before)", async () => {
+    await seedA();
+    settings();
+    const layer = layerStub();
+    const r = await trigger(service({ checker: checkerStub(), planner: plannerStub(), layerChecker: layer, sharedLayersOf: async () => null }));
+    assert.equal(r?.outcome, "published");
+    assert.equal(layer.calls.length, 0);
+    assert.equal("layerCheck" in versionDoc(KEY_A, 1), false);
+    assert.equal("layerConflicts" in versionDoc(KEY_A, 1), false);
+    assert.equal(runs()[0].gates.some((g) => g.gate === "layer_check"), false);
+  });
+
+  test("a held draft spends nothing on the layer check", async () => {
+    await seedA();
+    settings();
+    const layer = layerStub();
+    const r = await trigger(service({ checker: checkerStub({ ok: false, reasonCodes: ["checker_capped"] }), planner: plannerStub(), layerChecker: layer, sharedLayersOf: async () => shared }));
+    assert.equal(r?.outcome, "held");
+    assert.equal(layer.calls.length, 0);
+  });
+
+  test("the admin review data shows the conflicts and the record (rules data only)", async () => {
+    await seedA();
+    settings();
+    await trigger(service({ checker: checkerStub(), planner: plannerStub(), layerChecker: layerStub(), sharedLayersOf: async () => shared }));
+    const detail: any = await rubricReviewService.getVersion(ID_A1);
+    assert.deepEqual(detail.layerConflicts, [conflict]);
+    assert.equal(detail.layerCheck.status, "checked");
+  });
+});

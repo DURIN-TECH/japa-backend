@@ -1,6 +1,6 @@
 import type { Timestamp } from "firebase-admin/firestore";
 import type { CountryContextResult } from "../services/outcome-statistics/country-context";
-import type { CriterionKind, DecisionStage } from "./rubric";
+import type { CriterionKind, DecisionStage, RulebookStackLayer } from "./rubric";
 
 // ============================================
 // APPLICATION ASSESSMENT — TYPES (issue #42)
@@ -109,7 +109,12 @@ export interface InsufficientItem {
   // let us tie to a question). What is missing is an intake answer, not a
   // document, so no evidence request or proposed action is made for it, and it
   // is never one of the free tier's top issues.
-  notAssessed?: "unanswered" | "no_trigger";
+  // (#234) `missing_fact`: a rule decided from what the applicant holds needs a fact they have not stated.
+  notAssessed?: "unanswered" | "no_trigger" | "missing_fact";
+  // (#233) The rulebook layer the rule came from (its rulebook key), set only
+  // when the application runs on a stack of more than one layer. Copied from
+  // the rubric in code, never from model text.
+  layerKey?: string;
 }
 
 /**
@@ -134,6 +139,10 @@ export interface RefusalGround {
   sourceQuote: string;
   detail: string;
   whatWouldHelp: string;
+  // (#233) The rulebook layer the rule came from (its rulebook key), set only
+  // when the application runs on a stack of more than one layer. Copied from
+  // the rubric in code, never from model text.
+  layerKey?: string;
 }
 
 /** A credibility flag. Judgement concerns end here, never in refusalGrounds. */
@@ -152,6 +161,10 @@ export interface CredibilityFlag {
   sourceQuote: string;
   detail: string;
   whatWouldHelp: string;
+  // (#233) The rulebook layer the rule came from (its rulebook key), set only
+  // when the application runs on a stack of more than one layer. Copied from
+  // the rubric in code, never from model text.
+  layerKey?: string;
 }
 
 /**
@@ -163,6 +176,10 @@ export interface CredibilityFlag {
  */
 export interface StatementFinding {
   criterionId: string;
+  // (#233) The rulebook layer the rule came from (its rulebook key), set only
+  // when the application runs on a stack of more than one layer. Copied from
+  // the rubric in code, never from model text.
+  layerKey?: string;
   title: string;
   // The model's explanation. `detail` carries the same text so consumers
   // written before `comment` existed keep working.
@@ -219,7 +236,19 @@ export interface ApplicationAssessment {
   countryCode: string;
   visaTypeId: string;
 
+  // The approved version of the route's rulebook. (#233) On a stack of more
+  // than one layer: the country's OWN layer's version (0 when the own layer has
+  // none approved), with every layer's version in `layerVersions`.
   rubricVersion: number;
+  // (#233) Set only on a stack of more than one layer: rulebook key -> the
+  // approved version used (null for a missing layer). Part of the input hash,
+  // and compared for "the rules changed", so a new version of ANY layer makes
+  // the assessment out of date. Absent for a single-layer route (unchanged).
+  layerVersions?: Record<string, number | null>;
+  // (#233) Set only on a stack of more than one layer: every layer, with the
+  // version used or `missing`, so the application shows which layer had no
+  // approved rulebook (never silently ignored).
+  rulebookLayers?: RulebookStackLayer[];
   inputHash: string;
   // The judgement model when stage 3 ran, else the extraction model, else null.
   model: string | null;
@@ -240,7 +269,7 @@ export interface ApplicationAssessment {
   readiness: ReadinessBand | null;
   refusalGrounds: RefusalGround[];
   credibilityFlags: CredibilityFlag[];
-  strengths: Array<{ criterionId: string; title: string; detail: string }>;
+  strengths: Array<{ criterionId: string; title: string; detail: string; layerKey?: string }>;
   statementFindings: StatementFinding[];
   // The statement read at assessment time (null when none). Findings'
   // `nodePath` is only valid against this instance at this version.

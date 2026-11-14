@@ -1,4 +1,6 @@
 import type { Timestamp } from "firebase-admin/firestore";
+// (#234) The held-document kinds a `holds` group names (a closed list shared with the profile).
+import type { ApplicantFactKind, HeldDocumentKind } from "./applicant-facts";
 
 // ============================================
 // VISA RUBRIC — TYPES (issue #40)
@@ -15,6 +17,18 @@ import type { Timestamp } from "firebase-admin/firestore";
 // Generic by design: a route is DATA, keyed by `countryCode` + `visaTypeId`.
 // Nothing in this file (or in the validator and extractor built on it) names a
 // country, a route, a publisher or a nationality.
+//
+// (#233, P4 of #228) A rulebook is owned by an ISSUING AUTHORITY: its key is
+// `{authorityId}_{routeSlug}` (see authorities/authority-ids.ts). For a
+// COUNTRY authority that is exactly today's `{countryCode}_{visaTypeId}`, so
+// every stored rulebook keeps its key and nothing moves. For a BLOC or TREATY
+// authority the key is `{issuingAuthorityId}_{sharedRouteId}` (a shared route,
+// types/shared-route.ts) and the document carries NO `countryCode` /
+// `visaTypeId`: there is no single country. Documents written since #233 carry
+// `authorityId` + `routeSlug`; documents written before only carry
+// `countryCode` + `visaTypeId`, and every read fills the two new fields in
+// from them (rubric-key.ts `rulebookPartsOf`, applied by the store), so old
+// documents read unchanged without any data move.
 //
 // Storage (all backend-only: no firestore.rules match, so client SDKs are
 // denied; see scrapers/rubric/rubric.store.ts):
@@ -229,6 +243,70 @@ export interface CriterionAppliesTo {
   // parallel, for real nationalities only). A bar needs at least one coded or
   // uncoded member. Absent on versions stored before #222 (additive, optional).
   uncoded?: string[];
+  // (#234, P5 of #228) Members of the group that are decided from what the
+  // applicant HOLDS rather than from their nationality: "people who live in X"
+  // (`residence`), "holders of a valid X permit" (`holds`), "citizens of any
+  // member of X" (`members_of`). Each carries `asWritten`, the member exactly
+  // as the criterion's own quote names it (checked in code like `asWritten`
+  // above). A member that cannot be coded this way stays in `uncoded`: no
+  // code, country or authority id is ever made up for it.
+  // Nationality members stay in `nationalities` / `asWritten` (the stored
+  // shape since #42); readers see them as `nationality` groups through
+  // `groupsOf` (services/ai/applicant-groups.ts), so no stored version needs a
+  // rewrite. Absent on versions stored before #234 (additive, optional).
+  groups?: StoredApplicantGroup[];
+}
+
+/**
+ * (#234) One coded member of a bar's group that is decided from the
+ * applicant's holdings (the stored kinds; a `nationality` member is stored in
+ * `CriterionAppliesTo.nationalities`, see above).
+ *
+ *  - `residence`:  the applicant lives in country `code`.
+ *  - `holds`:      the applicant holds a document of kind `document`, issued
+ *                  by `issuer` (a two-letter country code or an authority id,
+ *                  matched exactly as the applicant recorded it), still valid
+ *                  on the date the rule is checked on. An expired document
+ *                  never matches.
+ *  - `members_of`: the applicant's nationality (`fact: "nationality"`) or
+ *                  country of residence (`fact: "residence"`) is a member of
+ *                  authority `authorityId` (P1 of #228) on the application's
+ *                  start date, resolved through the recorded membership data.
+ *                  An authority with no recorded members gives "could not be
+ *                  assessed", never "nobody".
+ */
+export type StoredApplicantGroup =
+  | { kind: "residence"; code: string; asWritten: string }
+  | { kind: "holds"; document: HeldDocumentKind; issuer: string; asWritten: string }
+  | { kind: "members_of"; authorityId: string; fact: "nationality" | "residence"; asWritten: string };
+
+/** (#234) The kinds a stored group may have (a nationality member is stored in `nationalities`). */
+export const STORED_APPLICANT_GROUP_KINDS = ["residence", "holds", "members_of"] as const;
+
+/**
+ * (#234) The facts a `FactTrigger` can read: the applicant's nationalities,
+ * their country of residence, or the documents they hold.
+ */
+// The list itself lives with the profile types (types/applicant-facts.ts), so
+// pure helpers can use it without value-importing this rubric module.
+export { APPLICANT_FACT_KINDS, type ApplicantFactKind } from "./applicant-facts";
+
+/**
+ * (#234, P5 of #228) The second trigger form, BESIDE the question trigger
+ * (`RuleTrigger`): "this rule applies when the applicant's `fact` is one of
+ * `anyOf`".
+ *   - `nationality` / `residence`: `anyOf` holds two-letter country codes;
+ *     any one of the applicant's nationalities counts.
+ *   - `holds`: each entry is `"{documentKind}:{issuer}"` (for example
+ *     `"residence_permit:XX"`, issuer a country code or an authority id): the
+ *     applicant holds such a document, still valid on the date checked.
+ * Stored in its own criterion field (`factTrigger`), so no reader of the
+ * question trigger can mistake one for the other. A missing fact resolves to
+ * "could not be assessed: we need to know your nationality" (never a guess).
+ */
+export interface FactTrigger {
+  fact: ApplicantFactKind;
+  anyOf: string[];
 }
 
 /**
@@ -301,6 +379,44 @@ export interface AssessmentCriterion {
   // kept, and an assessment reports it as not assessable, never as failed and
   // never as applying to everyone). See services/ai/rule-applicability.ts.
   trigger?: RuleTrigger;
+  // (#234) WHEN the rule applies, read from what the applicant HOLDS (their
+  // nationality, residence or held documents; see `FactTrigger`). Only read on
+  // a `specialist` / `conditional` rule. When both triggers are present the
+  // rule applies only when BOTH hold (either one ruling it out rules it out; a
+  // missing answer or fact on either makes it "could not tell"). Absent on
+  // every version stored before #234 (additive, optional); extraction does not
+  // draft it yet.
+  factTrigger?: FactTrigger;
+  // (#248) SERVED-SIDE ONLY, never stored on a version and never extracted: set by
+  // `applyExclusions` (rubric-exclusions.ts) on a mandatory bar that is served WITHOUT
+  // its trigger because the independent check could not confirm the trigger (the
+  // rule itself was confirmed by both models). It means "never decide this rule in
+  // code": `mandatoryBarHits` skips it, `judgementCriteriaOf` puts it, in full, to the
+  // assessment model, and `resolveApplicability` puts it to every applicant (the model
+  // reads its condition words). Why: removing a trigger widens who a rule is put to;
+  // a bar that code decided from nationality would then bar EVERY applicant of that
+  // nationality, including ones its condition does not cover. Derived from the
+  // version's own review fields on every read, so the same stored version always
+  // gives the same served rule; a stored value is ignored and stripped.
+  notCodeDecided?: true;
+  // (#233) SERVED-SIDE ONLY, never stored on a version: set by the stack merge
+  // (scrapers/rubric/rubric-stack.ts) on a rulebook STACK of more than one layer,
+  // naming the rulebook key of the layer this item came from. Absent on a
+  // single-layer rulebook (every route without inheritance), so those read
+  // exactly as before.
+  layerKey?: string;
+  // (#233 P4b) SERVED-SIDE ONLY, never stored: on the merged view of a stack,
+  // the OWN-layer rules folded into this SHARED rule because the layer check
+  // found they state the same requirement (`restates`). Each keeps its own
+  // verbatim quote and URL here, so nothing the national page says is lost;
+  // the applicant is asked and assessed once, under this rule.
+  restatedBy?: RestatedByEntry[];
+  // (#233 P4b) SERVED-SIDE ONLY, never stored: on the merged view of a stack,
+  // the ids (as served) of the rules in ANOTHER layer that the layer check
+  // found DISAGREE with this one on the same subject. Both rules stay and are
+  // both assessed, so a failure of either fails the application (the stricter
+  // result decides). Informational: nothing reads it to decide anything.
+  layerConflictWith?: string[];
   // Links to an existing EligibilityQuestion (types/eligibility.ts).
   eligibilityQuestionId?: string;
   // Ids of the rubric's intake questions whose answers this criterion reads.
@@ -362,8 +478,69 @@ export interface IntakeQuestion {
   // date_range questions: the longest allowed range, in days (#113). Optional:
   // the renderer and validator degrade safely when it is absent.
   maxLengthDays?: number;
+  // (#233) SERVED-SIDE ONLY, never stored on a version: set by the stack merge
+  // (scrapers/rubric/rubric-stack.ts) on a rulebook STACK of more than one layer,
+  // naming the rulebook key of the layer this item came from. Absent on a
+  // single-layer rulebook (every route without inheritance), so those read
+  // exactly as before.
+  layerKey?: string;
   // amount questions: the allowed ISO 4217 codes (#113). Any code when absent.
   currencies?: string[];
+  // (#235, P6 of #228) Choice questions only: where the country options come
+  // from. `route_destinations` = the member countries of the shared route this
+  // question's layer belongs to, read from MEMBERSHIP DATA (`expandDestinations`)
+  // on the day the question is asked. The stored version never holds a country
+  // option (the validator refuses one): the intake service adds them when it
+  // serves the question, so an option list is never typed into code or into a
+  // rulebook. Any stored `options` are non-country answers (for example "I
+  // can't say") shown after the countries. Absent on every other question.
+  optionsFrom?: IntakeOptionsSource;
+}
+
+/** (#235) Where a choice question's options come from at the time of asking (see `IntakeQuestion.optionsFrom`). */
+export const INTAKE_OPTIONS_SOURCES = ["route_destinations"] as const;
+export type IntakeOptionsSource = (typeof INTAKE_OPTIONS_SOURCES)[number];
+
+// ============================================
+// Which country do I apply through (issue #235, P6 of #228)
+// ============================================
+
+/**
+ * One step of a shared rulebook's competence rule: "which member country
+ * examines the application". Steps are tried IN ORDER; the first step whose
+ * `when` holds and whose answer names exactly one country decides (see
+ * services/competence.service.ts `resolveCompetence`).
+ *
+ * Everything a step claims rests on the guidance: it points at a rule of the
+ * SAME layer (`criterionId`), carries that rule's verbatim quote and URL
+ * (`source`, copied by code from the rule, never from the model), and the
+ * words of the quote the step applies (`restsOn`, which code checks are in the
+ * quote). The result is read from the applicant's ANSWER only: code never
+ * works out a country from dates, lengths of stay or anything else.
+ */
+export interface CompetenceStep {
+  // The rule of the same layer the step rests on (its own verbatim quote and URL).
+  criterionId: string;
+  // The intake question of the same layer whose answer names the country.
+  // A choice question with `optionsFrom: "route_destinations"`.
+  questionId: string;
+  // Plain-words condition: the step applies only when ALL of these hold
+  // (absent or empty = always). Reuses the intake condition shape.
+  when?: IntakeCondition[];
+  // Where the country comes from: always the answer to `questionId`.
+  resultFrom: "answer";
+  // The words of the quote this step applies, copied from it (for example the
+  // phrase that names the case it covers). Code checks they are in `source.quote`.
+  restsOn: string;
+  // The quote and URL, exactly like any rule's (copied from the rule `criterionId`).
+  source: RubricCitation;
+  // (#233-style) SERVED-SIDE ONLY: on a merged stack view, the layer the step came from.
+  layerKey?: string;
+}
+
+/** (#235) The competence block of a SHARED rulebook. Absent when the guidance states no such rule. */
+export interface CompetenceBlock {
+  steps: CompetenceStep[];
 }
 
 /** Headings of the intake section as a whole. */
@@ -393,6 +570,12 @@ export interface EvidenceItem {
   // What the per-upload check (#115) should expect to read.
   expects?: { documentType?: string; fields?: string[] };
   // The sentence of the source that names the document. Validated verbatim.
+  // (#233) SERVED-SIDE ONLY, never stored on a version: set by the stack merge
+  // (scrapers/rubric/rubric-stack.ts) on a rulebook STACK of more than one layer,
+  // naming the rulebook key of the layer this item came from. Absent on a
+  // single-layer rulebook (every route without inheritance), so those read
+  // exactly as before.
+  layerKey?: string;
   source: RubricCitation;
 }
 
@@ -544,18 +727,136 @@ export interface RubricFlag {
 }
 
 /**
+ * (#233) One layer of a rulebook STACK as an application sees it: whose
+ * rulebook (`rulebookKey`, `authorityId`), its role (`shared` for a bloc /
+ * treaty layer, `own` for the country's own layer), and the approved version
+ * served (`approved`) or that it has none (`missing`, `version` null). A
+ * missing layer is always listed, never left out.
+ */
+export interface RulebookStackLayer {
+  rulebookKey: string;
+  authorityId: string;
+  role: "shared" | "own";
+  status: "approved" | "missing";
+  version: number | null;
+}
+
+// ============================================
+// (#233 P4b) The layer check: a country's own layer against its shared layer(s)
+// ============================================
+//
+// After a country's OWN layer drafts (and before the automatic approval), an
+// independent model compares each of its rules with the rules of the shared
+// layer(s) the route inherits, ON THE SAME SUBJECT (scrapers/rubric/rubric-layer-check.ts).
+// Its evidence is always the two verbatim quotes; it never writes or changes a
+// rule. What it found is written with the approval as two review fields:
+//   - `layerCheck`      the record of the run (status, spend, links, refusals);
+//   - `layerConflicts`  every disagreement, both quotes and URLs, for the admin.
+// Neither ever blocks publishing.
+
+/** A shared-layer rule that an own-layer rule restates (a `restates` link, recorded on the own version). */
+export interface RestatesLink {
+  // The own layer's rule (its id as stored on the own version).
+  criterionId: string;
+  // The shared twin: which layer, which version, which rule (its id as the SHARED layer stores it, unscoped).
+  sharedRulebookKey: string;
+  sharedVersion: number;
+  sharedCriterionId: string;
+  // The twin's verbatim quote as compared. The merge honours the link only
+  // while the served shared rule still has exactly this quote, so a link can
+  // never silently point at a different rule after the shared layer changes.
+  sharedQuote: string;
+}
+
+/** One own-layer rule folded into a shared rule on the merged view (see AssessmentCriterion.restatedBy). */
+export interface RestatedByEntry {
+  rulebookKey: string;
+  criterionId: string;
+  title: string;
+  // The own rule's own verbatim quote and URL, kept on the record.
+  quote: string;
+  url: string;
+}
+
+/** A disagreement between an own-layer rule and a shared-layer rule on the same subject. */
+export interface LayerConflict {
+  // The own layer's rule: id, title, verbatim quote and URL.
+  criterionId: string;
+  title: string;
+  quote: string;
+  url: string;
+  // The shared layer's rule: which layer and version, and its id, title, verbatim quote and URL.
+  sharedRulebookKey: string;
+  sharedVersion: number;
+  sharedCriterionId: string;
+  sharedTitle: string;
+  sharedQuote: string;
+  sharedUrl: string;
+}
+
+/** The record of one layer check, written on the own version with the approval. */
+export interface LayerCheckRecord {
+  // `checked`: the check ran over every rule. `not_checked`: it could not run
+  // (`reason` says why: capped, provider error, unusable answer, no shared
+  // layer approved). A `not_checked` record links NOTHING (duplicates stay).
+  status: "checked" | "not_checked";
+  reason: string | null;
+  promptVersion: string;
+  model: string | null;
+  // The shared layers compared against, with the approved version of each.
+  sharedLayers: { rulebookKey: string; version: number }[];
+  ownRulesChecked: number;
+  sharedRulesChecked: number;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  // The links made (only on a confident `same_requirement` answer that also
+  // passed the code guards).
+  restates: RestatesLink[];
+  // A `same_requirement` answer code refused to turn into a link, with why
+  // (a different kind of rule, a different check, two twins, ...). The rules stay duplicated.
+  refusedLinks: { criterionId: string; sharedRulebookKey: string; sharedCriterionId: string; reason: string }[];
+  // Pairs the model could not judge (`unsure`): recorded, nothing linked.
+  unsure: { criterionId: string; sharedRulebookKey: string; sharedCriterionId: string }[];
+  conflictCount: number;
+}
+
+/**
+ * (#233) The key fields every rulebook document carries (head, version,
+ * extraction run, publish run). `routeKey` is the document key
+ * `{authorityId}_{routeSlug}`.
+ *
+ *  - `authorityId` / `routeSlug`: written on every document since #233.
+ *    OPTIONAL in the type only because documents written before #233 do not
+ *    have them; the store fills them in on every read (`rulebookPartsOf`), and
+ *    code that needs them calls `rulebookPartsOf` rather than reading the
+ *    fields directly.
+ *  - `countryCode` / `visaTypeId`: present ONLY on a country authority's
+ *    rulebook, where they equal `authorityId` / `routeSlug` (today's shape).
+ *    A bloc or treaty rulebook has neither: code that needs a country must
+ *    not invent one.
+ */
+export interface RulebookKeyFields {
+  // `${authorityId}_${routeSlug}`: the head doc id.
+  routeKey: string;
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
+}
+
+/**
  * One VERSION of a route's rubric:
- * `visaRubrics/{countryCode}_{visaTypeId}/rubricVersions/{version}`.
+ * `visaRubrics/{authorityId}_{routeSlug}/rubricVersions/{version}` (for a
+ * country: `{countryCode}_{visaTypeId}`, unchanged).
  *
  * Content is immutable once written. The only fields that may change after
  * creation are the REVIEW fields (RUBRIC_REVIEW_FIELDS), written by #125.
  */
-export interface VisaRubric {
+export interface VisaRubric extends RulebookKeyFields {
   schemaVersion: number;
-  // `${countryCode}_${visaTypeId}`: the head doc id.
-  routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key fields (`routeKey`, `authorityId`, `routeSlug`, and for a
+  // country authority `countryCode` + `visaTypeId`): see RulebookKeyFields.
   // Monotonic per route, starting at 1. Also the doc id (as a string).
   version: number;
 
@@ -583,6 +884,13 @@ export interface VisaRubric {
   intake?: IntakeMeta;
   intakeQuestions: IntakeQuestion[];
   evidenceItems: EvidenceItem[];
+  // (#235, P6 of #228) Only on a SHARED (bloc / treaty) rulebook whose guidance
+  // states which member country examines an application: the ordered steps
+  // that propose the country to apply through. Absent on every other rulebook
+  // (and on every version written before #235): the applicant then simply
+  // picks, nothing is guessed. Served only while every step still passes the
+  // code check (scrapers/rubric/rubric-competence.ts), else left out whole.
+  competence?: CompetenceBlock;
   // Set by an admin (never by extraction); absent until then.
   outcomeStatistics?: OutcomeStatisticsMapping;
   // Admin-set tag (#116): ids of the criteria for which extra supporting
@@ -612,8 +920,24 @@ export interface VisaRubric {
   // exactly what the check verified, and the original stays in `criteria` as
   // the audit trail. Never extracted, never client-visible. Absent = none.
   ruleRepairs?: RubricRuleRepair[];
+  // (#233 P4b) Written with the AUTOMATIC approval of a country's OWN layer
+  // when its route inherits a shared layer: the record of the layer check
+  // (status, spend, `restates` links). Absent on a single-layer route and on a
+  // shared layer, so those are exactly as before. Never extracted.
+  layerCheck?: LayerCheckRecord;
+  // (#233 P4b) Written with it: every disagreement the layer check found
+  // between this layer's rules and the shared layer's on the same subject, both
+  // quotes and URLs. Shown in the admin review data; never blocks publishing.
+  layerConflicts?: LayerConflict[];
 
   // ---- provenance (immutable) ----
+  // (#233) SERVED-SIDE ONLY, never stored: present on the MERGED view of a
+  // rulebook stack of more than one layer (rubric-stack.ts). One entry per
+  // layer in stack order (shared layers first, the country's own layer last),
+  // with the approved version served or `missing`. Absent on a single-layer
+  // rulebook. Consumers record it so an application shows which layer is
+  // missing and which versions it was assessed against.
+  stackLayers?: RulebookStackLayer[];
   sourceSnapshots: RubricSourceSnapshot[];
   // (#220) The languages the sources of this version are written in (primary
   // language codes, sorted, de-duplicated). Written at extraction from each
@@ -685,6 +1009,9 @@ export interface QuestionPlan {
   // (`applyExclusions` strips it), so it is read as "could not tell whether this applies"
   // (specialist) or by the legacy rule for a conditional rule without a trigger. Ids are this
   // version's own rules. Absent on a plan written before the integration.
+  // (#248) A MANDATORY BAR can be listed too (its rule confirmed by both models, its trigger
+  // not): `applyExclusions` then serves it without the trigger AND marks it `notCodeDecided`,
+  // derived from this list on every read (no second stored list that could disagree).
   droppedTriggerCriterionIds?: string[];
   // How many questions an applicant sees, with the plan applied (before the
   // wording check's omissions, which only lower them). `exact` is false when the
@@ -724,6 +1051,9 @@ export const RUBRIC_REVIEW_FIELDS = [
   "questionPlan",
   // (#223) the automatic approval's recorded replacements of repaired protected rules.
   "ruleRepairs",
+  // (#233 P4b) the automatic approval's layer check of an own layer against its shared layer(s).
+  "layerCheck",
+  "layerConflicts",
 ] as const;
 
 // ============================================
@@ -918,16 +1248,35 @@ export interface RubricProtectedFailure {
 }
 
 /**
+ * (#248) One bar served without its trigger (see `AssessmentCriterion.notCodeDecided`).
+ * The trigger (the intake question and answers that narrow which applicants the bar is
+ * put to) was not confirmed by both check models while every judged aspect of the rule
+ * was. The rule is served with the trigger removed and is NEVER decided by code: the
+ * assessment model is shown it in full and can raise a concern on it.
+ */
+export interface RubricJudgedBar {
+  criterionId: string;
+  ruleRef: string | null;
+  // The rule's title (data, so alerts can name it).
+  title: string;
+  // True when the bar served is its one automatic re-draft (#223); false for the rule as drafted.
+  replaced: boolean;
+  // The trigger that was removed: its question id and answer values (ids from the draft, not text).
+  removedTrigger: RuleTrigger;
+}
+
+/** (#248) The fixed words that say what happened to such a bar, in the run record, the alerts and the audit. */
+export const JUDGED_BAR_NOTE = "its trigger was not confirmed by the independent check, so it is served without the trigger and is assessed by judgement (never decided by code)";
+
+/**
  * `rubricPublishRuns/{routeKey}__v{version}`: the record of the automatic
  * publish run of ONE version (backend-only: no firestore.rules match). The id
  * is deterministic, so a re-delivered trigger finds the record and does not run
  * (or publish) twice; it is written with `create()`.
  */
-export interface RubricPublishRun {
+export interface RubricPublishRun extends RulebookKeyFields {
   runId: string;
-  routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) routeKey / authorityId / routeSlug (+ countryCode / visaTypeId for a country): RulebookKeyFields.
   version: number;
   outcome: RubricPublishOutcome;
   // Machine-readable reasons for a hold / skip (empty when published).
@@ -967,6 +1316,10 @@ export interface RubricPublishRun {
   protectedFailures?: RubricProtectedFailure[];
   // (#244) One line per ordinary rule that was eligible for the automatic re-draft, with how it ended.
   ordinaryRepairs?: RubricOrdinaryRepair[];
+  // (#248) Bars served WITHOUT their trigger: both models confirmed every judged aspect of the
+  // rule (or of its one re-draft), but not its trigger. Each is assessed by judgement, never by
+  // code. Absent on records written before #248 and when there is none.
+  barsJudgedWithoutTrigger?: RubricJudgedBar[];
   // (#223) Model requests the independent check made in this run, repair requests shown apart
   // (both count against `checkerMaxRequestsPerRun`; since #244 `repair` also holds the ordinary re-drafts).
   checkerRequests?: { total: number; repair: number };
@@ -978,13 +1331,12 @@ export interface RubricPublishRun {
 }
 
 /**
- * `visaRubrics/{countryCode}_{visaTypeId}`: the head of one route's rubric.
+ * `visaRubrics/{authorityId}_{routeSlug}`: the head of one route's rubric (for
+ * a country: `{countryCode}_{visaTypeId}`, unchanged).
  * Consumers read the head, then the version `approvedVersion` points at.
  */
-export interface RubricHead {
-  routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+export interface RubricHead extends RulebookKeyFields {
+  // (#233) routeKey / authorityId / routeSlug (+ countryCode / visaTypeId for a country): RulebookKeyFields.
   // The guidance sources this route's rubric is extracted from. Set when the
   // route is first extracted; this is what lets a later run find "the newest
   // snapshots have no rubric version yet".
@@ -1028,11 +1380,9 @@ export interface RubricRunUsage {
 export type RubricRunStatus = "started" | "succeeded" | "unchanged" | "skipped" | "failed";
 
 /** `rubricExtractionRuns/{runId}`: the record of one run (cost + audit). */
-export interface RubricExtractionRun {
+export interface RubricExtractionRun extends RulebookKeyFields {
   runId: string;
-  routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) routeKey / authorityId / routeSlug (+ countryCode / visaTypeId for a country): RulebookKeyFields.
   status: RubricRunStatus;
   // True once the run was about to make its first model call. The daily cap
   // counts exactly these runs.

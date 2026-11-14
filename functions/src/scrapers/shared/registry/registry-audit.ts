@@ -35,7 +35,14 @@ export type RegistryAuditAction =
   | "onboarding_confirmed"
   | "onboarding_cancelled"
   | "onboarding_allowlist_added"
-  | "onboarding_settings_changed";
+  | "onboarding_settings_changed"
+  // Issuing authorities (issue #230): who created or edited an authority (a
+  // country, bloc or treaty), and who added or changed a bloc/treaty member
+  // (with the before/after quote and URL, since membership is a legal claim).
+  | "authority_created"
+  | "authority_changed"
+  | "authority_member_added"
+  | "authority_member_changed" | "shared_route_created" | "shared_route_changed" | "visa_inheritance_changed"; // #231
 
 /** One audit entry as stored. */
 export interface RegistryAuditEntry {
@@ -43,7 +50,8 @@ export interface RegistryAuditEntry {
   // uid of the admin (or "system:..." for an automatic consequence such as a revoke pausing a source).
   actorUid: string;
   at: Timestamp;
-  // What the entry is about: "officialDomain" | "country" | "visaSource" | "guidanceSource" | "route" | "onboardingRun" | "setting".
+  // What the entry is about: "officialDomain" | "country" | "visaSource" | "guidanceSource" | "route" | "onboardingRun" | "setting"
+  // | "authority" | "authorityMember" (#230; a member's id is `{authorityId}/{countryCode}`).
   targetType: string;
   targetId: string;
   // The object before and after the change (null when it did not exist / no longer applies).

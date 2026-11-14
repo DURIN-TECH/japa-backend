@@ -151,6 +151,9 @@ export async function makeOnboarding(opts: { sources?: number; paragraphs?: numb
       oh.raised.push(evals as any[]);
     },
     appUrl: () => "https://admin.test",
+    // (#233 P4b) Shared routes read from the fake store; member records counted from `inheritsFrom` there.
+    getSharedRoute: async (id) => (store.get(`sharedRoutes/${id}`) as any) ?? null,
+    countMemberRecords: async (id) => [...store.entries()].filter(([p, d]) => /^countries\/[^/]+\/visaTypes\/[^/]+$/.test(p) && Array.isArray((d as any).inheritsFrom) && (d as any).inheritsFrom.some((r: any) => r.sharedRouteId === id)).length,
   };
   oh.deps = deps;
   oh.svc = new RouteOnboardingService(deps);

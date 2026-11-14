@@ -4,6 +4,7 @@ import { ErrorMessages, sendError, sendSuccess } from "../utils/response";
 // Reached through the scrapers module's public entry point (ESLint boundary, #91).
 import { rubricExtractionJobService } from "../scrapers";
 import type { StartJobInput, StartJobResult } from "../scrapers";
+import { rulebookTargetOf } from "../scrapers";
 
 // ============================================
 // ADMIN — RULEBOOK DRAFTING JOBS (issue #216)
@@ -22,8 +23,13 @@ import type { StartJobInput, StartJobResult } from "../scrapers";
 // Thin on purpose: validate the request, call the job service, map the result
 // to HTTP. The rules live in scrapers/rubric/rubric-extraction-job.ts.
 
-/** Body of `POST /`: exactly these keys, nothing else (a strict body). */
-const START_KEYS = ["countryCode", "visaTypeId", "sourceIds", "dryRun", "force"] as const;
+/**
+ * Body of `POST /`: exactly these keys, nothing else (a strict body).
+ * (#233) The rulebook is named EITHER `countryCode` + `visaTypeId` (a
+ * country's own rulebook, as before) OR `authorityId` + `routeSlug` (any
+ * issuing authority, including a bloc or treaty's shared route), never a mix.
+ */
+const START_KEYS = ["countryCode", "visaTypeId", "authorityId", "routeSlug", "sourceIds", "dryRun", "force"] as const;
 /** At most this many sources per route (a route has a handful). */
 const MAX_SOURCES = 50;
 /** A guidance source id as the registry writes it (a slug-like document id). */
@@ -39,8 +45,29 @@ export function parseStartBody(raw: unknown): { ok: true; input: StartJobInput }
   const body = raw as Record<string, unknown>;
   const extra = Object.keys(body).filter((k) => !(START_KEYS as readonly string[]).includes(k));
   if (extra.length > 0) return { ok: false, message: `unknown field(s): ${extra.slice(0, 5).join(", ")}` };
-  if (typeof body.countryCode !== "string" || !/^[A-Z]{2}$/.test(body.countryCode)) return { ok: false, message: "countryCode must be two upper-case letters" };
-  if (typeof body.visaTypeId !== "string" || !VISA_TYPE_ID_RE.test(body.visaTypeId)) return { ok: false, message: "visaTypeId is missing or not a valid visa type id" };
+  // (#233) Which pair names the rulebook. The general pair is checked by the
+  // authority id rules (the same check that builds the key); the country pair
+  // keeps exactly its old checks and messages.
+  const general = body.authorityId !== undefined || body.routeSlug !== undefined;
+  if (general && (body.countryCode !== undefined || body.visaTypeId !== undefined)) {
+    return { ok: false, message: "name the rulebook by countryCode and visaTypeId, or by authorityId and routeSlug, not both" };
+  }
+  let key: { countryCode: string; visaTypeId: string } | { authorityId: string; routeSlug: string };
+  if (general) {
+    if (typeof body.authorityId !== "string" || typeof body.routeSlug !== "string" || !VISA_TYPE_ID_RE.test(body.routeSlug)) {
+      return { ok: false, message: "authorityId and routeSlug must both be given" };
+    }
+    try {
+      rulebookTargetOf({ authorityId: body.authorityId, routeSlug: body.routeSlug });
+    } catch {
+      return { ok: false, message: "authorityId / routeSlug do not make a valid rulebook key" };
+    }
+    key = { authorityId: body.authorityId, routeSlug: body.routeSlug };
+  } else {
+    if (typeof body.countryCode !== "string" || !/^[A-Z]{2}$/.test(body.countryCode)) return { ok: false, message: "countryCode must be two upper-case letters" };
+    if (typeof body.visaTypeId !== "string" || !VISA_TYPE_ID_RE.test(body.visaTypeId)) return { ok: false, message: "visaTypeId is missing or not a valid visa type id" };
+    key = { countryCode: body.countryCode, visaTypeId: body.visaTypeId };
+  }
   let sourceIds: string[] | undefined;
   if (body.sourceIds !== undefined) {
     if (!Array.isArray(body.sourceIds) || body.sourceIds.length === 0 || body.sourceIds.length > MAX_SOURCES) return { ok: false, message: `sourceIds must be a list of 1 to ${MAX_SOURCES} source ids` };
@@ -53,8 +80,7 @@ export function parseStartBody(raw: unknown): { ok: true; input: StartJobInput }
   return {
     ok: true,
     input: {
-      countryCode: body.countryCode,
-      visaTypeId: body.visaTypeId,
+      ...key,
       ...(sourceIds ? { sourceIds } : {}),
       ...(body.dryRun === true ? { dryRun: true } : {}),
       ...(body.force === true ? { force: true } : {}),
@@ -66,6 +92,7 @@ export function parseStartBody(raw: unknown): { ok: true; input: StartJobInput }
 function refusal(result: StartJobResult): { status: number; code: string } {
   switch (result.reasonCode) {
   case "visa_type_not_found":
+  case "shared_route_not_found": // (#233) a bloc / treaty rulebook whose shared route is missing or retired
   case "source_not_found":
     return { status: 404, code: "NOT_FOUND" };
   case "invalid_route":

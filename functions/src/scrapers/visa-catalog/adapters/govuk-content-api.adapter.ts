@@ -3,6 +3,7 @@ import { htmlFragmentToText, type VisaCatalogFetchService } from "../../shared/f
 import { officialHostsFor, officialHttpsUrl } from "../visa-catalog-official-hosts";
 import { capText, effectiveSectionPatterns, formatSections, selectSections } from "./sections";
 import type { SourceAdapter, SourceDocument, SourceSection } from "./types";
+import { collectPageItems } from "./govuk-list-items";
 
 // ============================================
 // SOURCE ADAPTER — govuk-content-api (GB)
@@ -115,12 +116,20 @@ export function govukContentApiUrl(pageUrl: string): string {
   return `${GOVUK_CONTENT_API}${pathname}`;
 }
 
+/** Text options used for part bodies (shared with the item collector so both read the same text). */
+const PART_TEXT_OPTIONS = { baseUrl: GOVUK_BASE_URL, renderLinkUrl: govukApplyLinkUrl };
+
+/** A section plus its raw HTML body (internal: the collector, issue #212, reads the HTML). */
+type SectionWithHtml = SourceSection & { html: string };
+
 /** Narrow the raw `details.parts` value to well-formed parts (string slug). */
-function toSections(parts: unknown): SourceSection[] {
+function toSections(parts: unknown): SectionWithHtml[] {
   if (!Array.isArray(parts)) return [];
   return (parts as GovukPart[])
     .filter((p) => p && typeof p.slug === "string" && p.slug.trim())
     .map((p) => ({
+      // Raw HTML kept for the item collector (issue #212); never sent anywhere.
+      html: typeof p.body === "string" ? p.body : "",
       slug: (p.slug as string).trim(),
       // Fall back to the slug if a part has no title (never seen, but safe).
       title: typeof p.title === "string" && p.title.trim() ? p.title.trim() : (p.slug as string),
@@ -129,7 +138,7 @@ function toSections(parts: unknown): SourceSection[] {
       // GB content hashes once, so GB pages re-extract on the next crawl.
       text:
         typeof p.body === "string"
-          ? htmlFragmentToText(p.body, { baseUrl: GOVUK_BASE_URL, renderLinkUrl: govukApplyLinkUrl })
+          ? htmlFragmentToText(p.body, PART_TEXT_OPTIONS)
           : "",
     }));
 }
@@ -234,11 +243,20 @@ export class GovukContentApiAdapter implements SourceAdapter {
           `text truncated for ${page.url}`
       );
     }
+    // ---- Issue #212: the page's own list items, for the coverage check ----
+    // Collected from the selected parts' HTML; items cut by the cap are skipped.
+    const listItems = collectPageItems(
+      selected.map((s) => ({ slug: s.slug, html: s.html })),
+      PART_TEXT_OPTIONS,
+      text
+    );
     return {
       ...base,
       withdrawn: false,
-      sections: selected,
+      // Strip the internal html field: SourceSection is slug/title/text only.
+      sections: selected.map(({ slug, title, text: t }) => ({ slug, title, text: t })),
       text,
+      listItems,
       contentHash: this.fetchService.hash(text),
       truncated,
     };

@@ -214,9 +214,10 @@ describe("(#240) through the check", () => {
   test("the checker prompt and schema are pinned: #240 itself did not touch them (#242 later bumped them: see rubric-check-context.test.ts)", () => {
     // (#242) The checker prompt moved to v6 on purpose (headings and the trigger are shown). #240's mapping tests below do not depend on it;
     // what #240 proved (a mapping-only change replays) stays true for any version, so only the pin moved.
-    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v6");
+    // (#234) v7: `appliesTo.groups` is shown and judged; #240's point still holds for any version.
+    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v7");
     const hash = createHash("sha256").update(`${CHECKER_SYSTEM_PROMPT}\n${JSON.stringify(buildVerdictSchema())}\n${CHECKER_POLARITY_SYSTEM_PROMPT}`).digest("hex");
-    assert.equal(hash, "6c9410ad8e9df18e7cab534cde25cc74e40a92e2527ccac25c79dd409901d49e", "the hash pinned at the v6 bump (#242)");
+    assert.equal(hash, "9e49085b9ac950adf79e7ddc5d583ca718d75cd2c674e76149ee2e40f3aa9070", "the hash pinned at the v6 bump (#242)");
   });
 
   test("a protected rule is still held by the stage of an objective rule and by kind `unsure` from one model", async () => {
@@ -404,7 +405,8 @@ const repairRequestsOf = (p: ScriptedProvider) => p.requests.filter(isRepairRequ
 
 describe("(#240) the protected re-draft keeps applicability and accepts a harmless swap", () => {
   test("the repair prompt says to keep the applicability unless condition_faithful failed, and its version moved", () => {
-    assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v4");
+    // (#234) v5: the re-draft reuses the v11 system prompt (groups); the applicability wording is unchanged.
+    assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v5");
     const chunk = { sourceId: SRC_ID, contentHash: SRC_HASH, docType: "html", chunkIndex: 0, chunkCount: 1, text: BAR_QUOTE } as any;
     const req = buildRepairRequest(chunk, { rule: { title: "T", kind: "mandatory_bar", stage: "validity", quote: BAR_QUOTE }, aspects: ["group_matches_codes"] }, ["high"], { maxOutputTokens: 1000, timeoutMs: 1000 });
     assert.match(req.user, /Keep the rule's applicability/);
@@ -431,18 +433,26 @@ describe("(#240) the protected re-draft keeps applicability and accepts a harmle
     assert.deepEqual([...triggerRoles].sort(), ["judgement", "verification"]);
   });
 
-  test("the replacement's trigger is still judged by both models: one model's `no` on it fails the replacement (trigger_not_confirmed)", async () => {
+  // (#248) CHANGED on purpose. The replacement's trigger is still judged by BOTH models (nothing about the
+  // trigger check is relaxed), but a replacement BAR that passed every aspect and lost only its trigger is no
+  // longer a failure: it is repaired and served WITHOUT the trigger, judged and never decided by code (this was
+  // exactly the one hold of the second real UK run). Full set: rubric-bar-trigger.test.ts.
+  test("the replacement's trigger is still judged by both models: one model's `no` drops the trigger and the bar is served judged", async () => {
     const r = repairRig();
     // The original fails on its condition (so a re-draft happens); then the judgement model refuses the trigger.
     r.provider.policy = unsureGroup;
     r.provider.triggerPolicy = ({ role }) => (role === "judgement" ? "no" : "yes");
     r.provider.redraftPolicy = () => redraft("specialist");
     const out = await r.svc.check(input(draft(barWithTrigger())));
-    assert.equal(out.ok, false);
-    if (!out.ok) {
-      assert.equal(out.protectedFailures?.[0].repair.status, "failed_check");
-      assert.equal(out.protectedFailures?.[0].repair.detail, "trigger_not_confirmed");
+    assert.equal(out.ok, true);
+    if (out.ok) {
+      assert.equal(out.protectedFailures?.[0].repair.status, "repaired");
+      assert.equal(out.protectedFailures?.[0].repair.detail, "trigger_not_confirmed_served_judged");
+      assert.deepEqual(out.judgedBars?.map((b) => b.replaced), [true]);
+      assert.ok(out.droppedTriggerIds?.includes(out.protectedFailures?.[0].criterionId as string));
     }
+    const triggerRoles = new Set(r.provider.requests.filter((q) => q.user.includes("<triggers_data_")).map((q) => q.role));
+    assert.deepEqual([...triggerRoles].sort(), ["judgement", "verification"], "both models judged the trigger");
   });
 
   test("the same swap the other way (specialist to conditional) is accepted too", async () => {

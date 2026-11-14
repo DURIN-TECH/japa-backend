@@ -61,7 +61,7 @@ describe("registry settings", () => {
 
 describe("parseRegisterRouteBody", () => {
   const good = () => ({
-    countryCode: "sv",
+    authorityId: "sv",
     routeName: "Visit",
     visaPage: { url: "https://a.example.org/v", language: "EN" },
     guidance: [{ url: "https://a.example.org/g", title: "Rules", role: "primary", docType: "html", language: "en" }],
@@ -69,8 +69,20 @@ describe("parseRegisterRouteBody", () => {
   });
   test("normalises country code and language", () => {
     const b = parseRegisterRouteBody(good());
-    assert.equal(b.countryCode, "SV");
+    assert.equal(b.authorityId, "SV");
+    assert.equal(b.authorityIsCountry, true);
     assert.equal(b.visaPage.language, "en");
+  });
+  test("issue #232: a bloc or treaty id is kept as is (existence is checked later); bad ids are INVALID_AUTHORITY", () => {
+    const b = parseRegisterRouteBody({ ...good(), authorityId: "test-bloc" });
+    assert.equal(b.authorityId, "test-bloc");
+    assert.equal(b.authorityIsCountry, false);
+    for (const bad of ["ZZ", "bad_id", "Test-Bloc", "x", "", 3]) {
+      assert.throws(() => parseRegisterRouteBody({ ...good(), authorityId: bad }), (e: any) => e.code === "INVALID_AUTHORITY", String(bad));
+    }
+    // The visa id must carry the authority's prefix.
+    assert.throws(() => parseRegisterRouteBody({ ...good(), authorityId: "test-bloc", visaId: "sv-visit" }), (e: any) => e.code === "INVALID_VISA_ID");
+    assert.equal(parseRegisterRouteBody({ ...good(), authorityId: "test-bloc", visaId: "test-bloc-visit" }).visaId, "test-bloc-visit");
   });
   test("rejects a bad time zone and a bad check interval", () => {
     assert.throws(() => parseRegisterRouteBody({ ...good(), crawlTimeZone: "Nowhere/Land" }), /time zone/);

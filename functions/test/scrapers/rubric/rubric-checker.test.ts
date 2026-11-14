@@ -330,7 +330,8 @@ describe("check: keep, leave out, hold", () => {
 
   test("(#226) the prompt version is bumped (stored v3 answers are not reused), and the prompt tells the model `na` for a bar's stage", () => {
     // (#242) bumped again to v6 (the check is now shown headings and the trigger): the #226 wording below is unchanged.
-    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v6");
+    // (#234) and to v7 (`appliesTo.groups`).
+    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v7");
     assert.match(CHECKER_SYSTEM_PROMPT, /Answer `na` when the rule's `kind` is `mandatory_bar`/);
     // The answer shape is unchanged: the same six aspects, the same closed verdicts (`na` is already one).
     assert.deepEqual([...CHECKER_ASPECTS], ["title_faithful", "kind_right", "stage_right", "condition_faithful", "check_faithful", "group_matches_codes"]);

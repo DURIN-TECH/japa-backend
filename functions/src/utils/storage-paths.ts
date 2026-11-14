@@ -23,6 +23,7 @@
 //   compliance-document   compliance/{agencyId}/{slot}/{uuid}_{file}
 //   agency-logo           agency-logos/{agencyId}/{uuid}_{file}
 //   profile-photo         users/{uid}/profile/{uuid}_{file}
+//   feedback-screenshot   users/{uid}/feedback/{uuid}_{file}   (issue #257)
 //
 // where `{uuid}` is a v4 UUID and `{file}` is the client's file name reduced
 // to [A-Za-z0-9._-]. These shapes have not changed since each upload flow was
@@ -116,6 +117,15 @@ export type StorageScope =
   | {
       /** A user's profile photo. */
       purpose: "profile-photo";
+      userId: string;
+    }
+  | {
+      /**
+       * A screenshot attached to an in-app feedback note (issue #257). Private:
+       * storage.rules has no match for `users/{uid}/feedback/`, so only the
+       * backend (signed URLs) can touch it.
+       */
+      purpose: "feedback-screenshot";
       userId: string;
     };
 
@@ -234,6 +244,9 @@ function scopeFolders(scope: StorageScope): string[] | null {
   case "profile-photo":
     if (!isSafeSegment(scope.userId)) return null;
     return [`users/${scope.userId}/profile/`];
+  case "feedback-screenshot":
+    if (!isSafeSegment(scope.userId)) return null;
+    return [`users/${scope.userId}/feedback/`];
   default:
     return null;
   }

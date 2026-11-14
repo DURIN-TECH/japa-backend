@@ -3,6 +3,8 @@ import type { Timestamp } from "firebase-admin/firestore";
 import { AuthenticatedRequest } from "../../middleware/auth";
 import { asSubject, can, forbidden } from "../../middleware/authz";
 import { ErrorMessages, sendError, sendSuccess } from "../../utils/response";
+// Issue #232: authority id shapes (pure; no Firebase).
+import { checkAuthorityId } from "../../authorities/authority-ids";
 import { loadOnboardingSettings, parseOnboardingSettingsPatch, updateOnboardingSettings } from "./onboarding-settings";
 import { routeOnboardingService, type ChecklistItem } from "./route-onboarding.service";
 import { OnboardingError, RUN_STATUSES, type RouteOnboardingRun, type RunStatus } from "./onboarding-types";
@@ -41,8 +43,13 @@ export function runView(run: RouteOnboardingRun) {
   return {
     runId: run.runId,
     routeKey: run.routeKey,
-    countryCode: run.countryCode,
+    // (#233 P4b) `countryCode` is null on a shared layer's run; `authorityId`,
+    // `routeSlug` and `layer` say which rulebook the run drafts.
+    countryCode: run.countryCode ?? null,
     visaTypeId: run.visaTypeId,
+    authorityId: run.authorityId ?? run.countryCode ?? null,
+    routeSlug: run.routeSlug ?? run.visaTypeId,
+    layer: run.layer ?? "own",
     status: run.status,
     summary: run.summary,
     steps: run.steps.map((s) => ({ id: s.id, label: s.label, status: s.status, startedAt: iso(s.startedAt), finishedAt: iso(s.finishedAt), detail: s.detail })),
@@ -69,7 +76,10 @@ function confirmationView(c: NonNullable<RouteOnboardingRun["confirmation"]>) {
 /** The list row: enough for a table. */
 function runRow(run: RouteOnboardingRun) {
   return {
-    runId: run.runId, routeKey: run.routeKey, countryCode: run.countryCode, visaTypeId: run.visaTypeId, status: run.status, summary: run.summary,
+    runId: run.runId, routeKey: run.routeKey, countryCode: run.countryCode ?? null, visaTypeId: run.visaTypeId,
+    // (#233 P4b) Which rulebook: a country's own route or a shared layer (both are listed).
+    authorityId: run.authorityId ?? run.countryCode ?? null, routeSlug: run.routeSlug ?? run.visaTypeId, layer: run.layer ?? "own",
+    status: run.status, summary: run.summary,
     createdBy: run.createdBy, createdAt: iso(run.createdAt), finishedAt: iso(run.finishedAt), counters: run.counters, holdReason: run.holdReason,
   };
 }
@@ -102,14 +112,29 @@ class OnboardingController {
     return false;
   }
 
-  /** POST / { countryCode, visaTypeId } */
+  /**
+   * POST / { authorityId, visaTypeId }
+   *
+   * Issue #232: the route's issuing authority is `authorityId` (a country
+   * code, or a bloc/treaty id). `countryCode` is still accepted in its place
+   * (same value for a country) so the existing screen keeps working until it
+   * sends `authorityId`; give exactly one of the two.
+   */
   async start(req: AuthenticatedRequest, res: Response): Promise<void> {
     if (!this.allowed(req, res, "update")) return;
     try {
-      const body = strictBody(req.body, ["countryCode", "visaTypeId"]);
-      if (typeof body.countryCode !== "string" || !/^[A-Z]{2}$/.test(body.countryCode)) throw new OnboardingError("VALIDATION_ERROR", 400, "countryCode must be two upper-case letters", { field: "countryCode" });
+      const body = strictBody(req.body, ["authorityId", "countryCode", "visaTypeId"]);
+      if (body.authorityId !== undefined && body.countryCode !== undefined) {
+        throw new OnboardingError("VALIDATION_ERROR", 400, "Give authorityId or countryCode, not both", { field: "authorityId" });
+      }
+      const field = body.authorityId !== undefined ? "authorityId" : "countryCode";
+      const authorityId = body[field];
+      // Shape only here; the service checks the id rules and the registry.
+      if (typeof authorityId !== "string" || !checkAuthorityId(authorityId).ok) {
+        throw new OnboardingError("VALIDATION_ERROR", 400, "authorityId must be a two-letter country code in capitals, or a bloc or treaty id", { field });
+      }
       if (typeof body.visaTypeId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(body.visaTypeId)) throw new OnboardingError("VALIDATION_ERROR", 400, "visaTypeId is missing or not a valid visa id", { field: "visaTypeId" });
-      const run = await routeOnboardingService.start(body.countryCode, body.visaTypeId, uid(req));
+      const run = await routeOnboardingService.start(authorityId, body.visaTypeId, uid(req));
       sendSuccess(res, { runId: run.runId, status: run.status, run: runView(run) }, undefined, 201);
     } catch (err) {
       fail(res, err, "starting a run");

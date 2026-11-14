@@ -210,6 +210,8 @@ export function fakeCollection(
             if (op === "==") return a === b;
             // `in`: the value is an array of candidates (issue #83).
             if (op === "in") return (v as unknown[]).map(cmpValue).includes(a);
+            // `array-contains` (issue #231): the stored array holds the value (objects compared by JSON).
+            if (op === "array-contains") return Array.isArray(a) && a.some((x) => JSON.stringify(x) === JSON.stringify(b));
             if (a === undefined) return false;
             if (op === "<") return a < b;
             if (op === "<=") return a <= b;
@@ -297,6 +299,8 @@ export async function installFakes(): Promise<void> {
   firebase.collections.officialDomainPreviews = fakeCollection("officialDomainPreviews");
   firebase.collections.sourceRegistryAudit = fakeCollection("sourceRegistryAudit");
   firebase.collections.sourceRegistryRateLimits = fakeCollection("sourceRegistryRateLimits");
+  // Issue #232: the registry checks the authority a website or route belongs to.
+  firebase.collections.authorities = fakeCollection("authorities");
   firebase.collections.countries = fakeCollection("countries");
   firebase.collections.pendingVisaChanges = fakeCollection("pendingVisaChanges");
   // Issue #81: run records + the news registry (source health, news runs).

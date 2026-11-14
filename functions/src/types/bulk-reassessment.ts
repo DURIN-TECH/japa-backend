@@ -23,8 +23,12 @@ import type { AssessmentUsage } from "./assessment";
 //
 // Pure module: types and constants only.
 
-/** Lifecycle of a run. */
-export const BULK_RUN_STATUSES = ["enqueuing", "running", "completed", "cancelled"] as const;
+/**
+ * Lifecycle of a run. (#233 P4b) `awaiting_confirmation`: a SHARED layer's
+ * fan-out has its estimate and waits for an admin to confirm it. Nothing is
+ * queued, and nothing can be spent, in that state (the sweep never reads it).
+ */
+export const BULK_RUN_STATUSES = ["enqueuing", "running", "awaiting_confirmation", "completed", "cancelled"] as const;
 export type BulkRunStatus = (typeof BULK_RUN_STATUSES)[number];
 
 /**
@@ -34,9 +38,14 @@ export interface BulkReassessmentRun {
   // = the approval's audit id.
   id: string;
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // The country's route of a run for a country's OWN layer. (#233 P4b) Absent
+  // on a SHARED layer's fan-out run (`fanOut` set): its applications are on
+  // many member routes, listed in `fanOut.estimate.memberRoutes`.
+  countryCode?: string;
+  visaTypeId?: string;
   // The version now serving, which every job of this run assesses against.
+  // (#233 P4b) On a fan-out run: the SHARED layer's approved version (each job
+  // records its application's own layer version and every layer's version).
   rubricVersion: number;
   previousApprovedVersion: number | null;
   approvedBy: string;
@@ -68,6 +77,85 @@ export interface BulkReassessmentRun {
   succeeded: number | null;
   failed: number | null;
   completedAt: Timestamp | null;
+
+  // (#233 P4b) Present ONLY on the run for a SHARED layer's approval.
+  fanOut?: SharedLayerFanOut;
+}
+
+// ============================================
+// (#233 P4b) A shared layer's fan-out: estimate, confirmation, then the bulk path
+// ============================================
+//
+// When a shared (bloc / treaty) layer publishes a new version, the open
+// applications whose stack includes it are re-assessed through THIS bulk path,
+// within its spend caps, but never before an admin confirms the estimate:
+//
+//   1. estimating               the candidates are found (open, with a succeeded
+//                               assessment, not already on this version) and
+//                               stored at `bulkReassessments/{runId}/candidates/{appId}`,
+//                               each with its upper bound of requests. No job, no spend.
+//   2. awaiting_confirmation    the run status says so; the estimate is stored.
+//   3. confirmed                an admin confirmed THIS estimate id (statement
+//                               accepted); the candidates are enqueued as ordinary
+//                               batch jobs. Enqueueing stops before the running
+//                               bound would pass the confirmed number; the rest
+//                               waits for a new confirmation (the old one is voided).
+//
+// One run per approval event (the run id is the audit id), and the jobs' ids
+// are deterministic, so a re-delivered event or a repeated confirm does
+// nothing twice. No application, applicant or agency is named in what the
+// admin is shown: counts per member route only.
+
+/** What the admin confirms. */
+export interface FanOutEstimate {
+  // Sent back on confirm; a different id is refused (the estimate changed).
+  estimateId: string;
+  applications: number;
+  // Upper bound of provider requests: one judgement per application plus one
+  // extraction per stored document (stored extractions are reused, so usually far fewer).
+  requestsAtMost: number;
+  // Applications per member route (country route through which they applied).
+  memberRoutes: { countryCode: string; visaTypeId: string; applications: number }[];
+  // The estimate in plain words (what the portal shows).
+  plain: string;
+  computedAt: Timestamp;
+}
+
+/** One confirmation of an estimate. */
+export interface FanOutConfirmation {
+  estimateId: string;
+  by: string;
+  at: Timestamp;
+  // The number confirmed: enqueueing never passes it.
+  maxRequests: number;
+  statementAccepted: true;
+}
+
+/** `bulkReassessments/{runId}.fanOut`. */
+export interface SharedLayerFanOut {
+  layerKey: string;
+  layerVersion: number;
+  phase: "estimating" | "awaiting_confirmation" | "confirmed";
+  // Running tallies of the candidate scan (resumable: `scanCursor` is the last application id passed).
+  scanCursor: string | null;
+  candidates: number;
+  requestsAtMost: number;
+  estimate: FanOutEstimate | null;
+  confirmation: FanOutConfirmation | null;
+  voidedConfirmations: FanOutConfirmation[];
+  // Requests counted against the confirmation so far (the bound of each enqueued job).
+  requestsEnqueued: number;
+}
+
+/** `bulkReassessments/{runId}/candidates/{applicationId}`: one application of a fan-out. Backend-only. */
+export interface FanOutCandidate {
+  applicationId: string;
+  countryCode: string;
+  visaTypeId: string;
+  // One judgement plus one extraction per stored document (an upper bound).
+  requestsAtMost: number;
+  // Set when this candidate's job was enqueued (or found current / excluded).
+  handled: boolean;
 }
 
 /** Lifecycle of one provider batch. */

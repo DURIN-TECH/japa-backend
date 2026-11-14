@@ -39,6 +39,7 @@ const scopes: Record<string, StorageScope> = {
   compliance: { purpose: "compliance-document", agencyId: "agency1", slots: ["idDocument"] },
   logo: { purpose: "agency-logo", agencyId: "agency1" },
   photo: { purpose: "profile-photo", userId: "uidA" },
+  feedback: { purpose: "feedback-screenshot", userId: "uidA" },
 };
 
 /** The issue code for a refused path (fails the test if it was accepted). */
@@ -60,6 +61,7 @@ describe("issued paths", () => {
     );
     assert.match(buildIssuedPath(scopes.logo, file), new RegExp(`^agency-logos/agency1/${uuid}_my_scan__1_\\.pdf$`));
     assert.match(buildIssuedPath(scopes.photo, file), new RegExp(`^users/uidA/profile/${uuid}_my_scan__1_\\.pdf$`));
+    assert.match(buildIssuedPath(scopes.feedback, file), new RegExp(`^users/uidA/feedback/${uuid}_my_scan__1_\\.pdf$`));
   });
 
   test("an issued path validates for its own scope, whatever the file name", () => {
@@ -80,6 +82,7 @@ describe("issued paths", () => {
       otherAgencyKyc: { purpose: "compliance-document", agencyId: "agency2", slots: ["idDocument"] },
       otherAgencyLogo: { purpose: "agency-logo", agencyId: "agency2" },
       otherPhoto: { purpose: "profile-photo", userId: "uidB" },
+      otherFeedback: { purpose: "feedback-screenshot", userId: "uidB" },
     };
     for (const [issuedFor, scope] of Object.entries(scopes)) {
       const issued = buildIssuedPath(scope, "f.pdf");

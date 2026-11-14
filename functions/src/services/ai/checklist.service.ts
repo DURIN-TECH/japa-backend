@@ -22,9 +22,11 @@
  * `checkApplicationAccess`. NO model call anywhere in this file.
  */
 import { isAnswerType, rubricStore } from "../../scrapers";
+import { defaultRulebookStack, rulebookFor } from "./application-rulebook";
 import { visaService } from "../visa.service";
 import { documentRequestService } from "../document-request.service";
 import { buildChecklist, ChecklistItem, ChecklistState } from "./checklist-builder";
+import { applicantContextOf } from "./rule-applicability";
 import type { Application, DocumentRequest, DocumentRequestStatus } from "../../types";
 
 /** A checklist item joined with its stored DocumentRequest (if any). */
@@ -73,7 +75,13 @@ class ChecklistService {
   /** Compute the list for an application from approved data. Read-only. */
   private async compute(application: Application) {
     // Approved rubrics only, and only through the store (never a pending one).
-    const rubric = await rubricStore.getApprovedRubric(application.countryCode.toUpperCase(), application.visaTypeId);
+    // (#233) The application's rulebook STACK: every approved layer's document
+    // items (shared layer(s) and its own), each with its own citation. For a
+    // route without inheritance, exactly the own layer's approved rubric.
+    const rubric = await rulebookFor(
+      { ...application, countryCode: application.countryCode.toUpperCase() },
+      { getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc, vt), getRulebookStack: (app) => defaultRulebookStack(app) }
+    );
     const visaType = await visaService.getVisaType(application.countryCode, application.visaTypeId);
     // Integration: #113 (`Application.intake`) and #129 (`VisaType.requiredDocuments`,
     // `scrapeMeta.citations`) are both on this branch, so the real types are used
@@ -83,6 +91,8 @@ class ChecklistService {
       rubric,
       visaRecord: visaType,
       intakeAnswers: intake?.answers ?? null,
+      // (#234) Rules triggered by what the applicant holds read the application's copy (today).
+      applicantContext: applicantContextOf(application, new Date().toISOString().slice(0, 10)),
     });
   }
 

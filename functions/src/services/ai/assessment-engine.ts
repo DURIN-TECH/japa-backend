@@ -12,6 +12,8 @@ import type {
 } from "../../types/assessment";
 import type { LlmRequest } from "./llm-provider";
 import { AI_MODELS } from "./ai-models";
+// (#234) Group matching from what the applicant holds (pure).
+import { decideGroups, factsFromNationality, groupsOf, needWords, type FactNeed, type FactsForRules, type MembershipOnDate } from "./applicant-groups";
 import { DATA_ONLY_RULE, findBannedWording, findInjectionSignals, sanitizeUntrusted, wrapUntrusted, MAX_UNTRUSTED_CHARS } from "./prompt-safety";
 
 // ============================================
@@ -125,6 +127,9 @@ export interface AssessmentContent {
 /** Everything the assessment reads. Any change here means a new assessment. */
 export interface AssessmentInputs {
   rubricVersion: number;
+  // (#233) Only on a rulebook stack of more than one layer: rulebook key ->
+  // approved version. Absent otherwise, so a single-layer hash is unchanged.
+  layerVersions?: Record<string, number | null>;
   // Document paths and their `updatedAt` (ms). A changed file changes the hash.
   documents: Array<{ path: string; updatedAtMs: number }>;
   // Statements, by CONTENT hash (see hashStatementContent), not by `version`:
@@ -134,6 +139,15 @@ export interface AssessmentInputs {
   eligibilityAnswers: Record<string, unknown> | null;
   // Intake answers (#113). Empty until that feature stores them.
   intake: Record<string, unknown>;
+  // (#234) The application's copy of what the applicant holds, as rules read
+  // it (codes, kinds, issuers, dates; never the applicant's note). Only when
+  // the application HAS a copy: absent otherwise, so the hash of every
+  // application started before #234 is unchanged (no re-run is forced).
+  applicantFacts?: {
+    nationalities: string[];
+    residentialCountry: string | null;
+    heldDocuments: Array<{ kind: string; issuer: string | null; validUntil: string }> | null;
+  };
 }
 
 /** Stable JSON: object keys sorted at every depth, so the hash is order-free. */
@@ -182,29 +196,92 @@ function withinBar(criterion: AssessmentCriterion, applicationDate: string): boo
 }
 
 /**
- * The mandatory bars that apply to this applicant. An applicant matches a bar
- * when their nationality code is in `appliesTo.nationalities` and the date
- * falls inside `validFrom` / `validUntil`. Null nationality matches nothing.
- * (#222) Only the CODED members of a group can match here. Members listed in
- * `appliesTo.uncoded` (not nationalities) have no code to compare, so code
- * never decides them: `judgementCriteriaOf` puts such a bar, in full, to the
- * assessment model instead. They are never treated as matching nobody-silently
- * or everybody.
+ * (#234) What code decided about the mandatory bars for one applicant.
+ *  - `hits`:    bars the applicant is in the group of, on the bar date (a
+ *               refusal ground, decided by code alone).
+ *  - `unknown`: bars code could not decide because a fact the group needs is
+ *               not stated (or an authority has no recorded members): each is
+ *               reported "could not be assessed: we need to know ..." and is
+ *               never read as "applies" nor as "does not apply".
+ * A bar not in either list was decided "not in the group" from stated facts.
+ */
+export interface BarDecisions {
+  hits: AssessmentCriterion[];
+  unknown: Array<{ criterion: AssessmentCriterion; needs: FactNeed[] }>;
+}
+
+/**
+ * Decide every mandatory bar of a rubric for one applicant. An applicant is in
+ * a bar's group when ANY coded member matches (`groupsOf`: the stored
+ * `appliesTo.nationalities`, read as `nationality` members, plus #234
+ * `appliesTo.groups`: residence, holds, members_of) and the date falls inside
+ * `validFrom` / `validUntil`. Several nationalities: any one counts. An
+ * expired held document never matches.
+ *
+ * Kept from before #234, unchanged:
+ *  - (#222) only CODED members are decided here; members in
+ *    `appliesTo.uncoded` have no code, so `judgementCriteriaOf` puts such a
+ *    bar, in full, to the assessment model (never "nobody", never "everybody");
+ *  - (#248) a bar served WITHOUT its trigger (`notCodeDecided`) is never
+ *    decided here at all (neither a hit nor an "unknown"): it is judged in full.
+ * No model call, no network.
+ *
+ * @param membership members of each `members_of` authority on the
+ *   application's start date (missing = no recorded members = unknown)
+ */
+export function decideMandatoryBars(
+  rubric: Pick<VisaRubric, "criteria">,
+  facts: FactsForRules,
+  applicationDate: string,
+  membership: MembershipOnDate = {}
+): BarDecisions {
+  const out: BarDecisions = { hits: [], unknown: [] };
+  for (const c of rubric.criteria) {
+    if (c.kind !== "mandatory_bar" || c.appliesTo === undefined) continue;
+    // (#248) With no trigger, a group match alone would bar every applicant in the group,
+    // including ones the bar's condition does not cover: never decided by code.
+    if (c.notCodeDecided === true) continue;
+    // Outside the bar's own dates it does not run at all (as before).
+    if (!withinBar(c, applicationDate)) continue;
+    const groups = groupsOf(c.appliesTo);
+    // Only uncoded members: nothing for code to decide (the model judges it, #222).
+    if (groups.length === 0) continue;
+    const d = decideGroups(groups, facts, applicationDate, membership);
+    if (d.status === "match") out.hits.push(c);
+    else if (d.status === "unknown") out.unknown.push({ criterion: c, needs: d.needs });
+  }
+  return out;
+}
+
+/**
+ * The mandatory bars that apply to this applicant (the `hits` of
+ * `decideMandatoryBars`). Accepts a single nationality code, as before #234
+ * (null matches nothing), or the applicant's full facts.
  * No model call, no network.
  */
 export function mandatoryBarHits(
   rubric: Pick<VisaRubric, "criteria">,
-  nationality: string | null,
-  applicationDate: string
+  facts: string | null | FactsForRules,
+  applicationDate: string,
+  membership: MembershipOnDate = {}
 ): AssessmentCriterion[] {
-  if (!nationality) return [];
-  return rubric.criteria.filter(
-    (c) =>
-      c.kind === "mandatory_bar" &&
-      c.appliesTo !== undefined &&
-      c.appliesTo.nationalities.includes(nationality) &&
-      withinBar(c, applicationDate)
-  );
+  const read = typeof facts === "string" || facts === null ? factsFromNationality(facts) : facts;
+  return decideMandatoryBars(rubric, read, applicationDate, membership).hits;
+}
+
+/**
+ * (#234) The "could not be assessed" items for bars code could not decide,
+ * in the shape of `notAssessedItems` (rule-applicability.ts), so they join the
+ * same insufficient-information list. Plain words, no verdict.
+ */
+export function barNotAssessedItems(unknown: BarDecisions["unknown"]): Array<{ criterionId: string; title: string; reason: string; notAssessed: "missing_fact"; layerKey?: string }> {
+  return unknown.map((u) => ({
+    criterionId: u.criterion.criterionId,
+    title: u.criterion.title,
+    reason: `could not be assessed: we need to know ${needWords(u.needs)}`,
+    notAssessed: "missing_fact" as const,
+    ...(u.criterion.layerKey ? { layerKey: u.criterion.layerKey } : {}),
+  }));
 }
 
 // ============================================
@@ -491,12 +568,44 @@ export function judgementCriteriaOf(rubric: Pick<VisaRubric, "criteria">): Asses
   // (see `mandatoryBarHits`), and the rest must never read as "applies to
   // nobody" nor as "applies to everybody". The model can only raise a concern
   // on it; a refusal on a bar stays decided by code alone.
-  return rubric.criteria.filter((c) => c.kind === "judgement" || hasUncodedGroup(c));
+  // (#248) A bar served without its unconfirmed trigger (`notCodeDecided`) is put to the model
+  // the same way, for the whole of its group: code does not decide it at all (see
+  // `mandatoryBarHits`), so the model's reading is the only one it gets.
+  return rubric.criteria.filter((c) => c.kind === "judgement" || isJudgedBar(c));
 }
 
 /** True for a rule whose group names members that are not nationalities (no code to match by). */
 export function hasUncodedGroup(c: Pick<AssessmentCriterion, "kind" | "appliesTo">): boolean {
   return c.kind === "mandatory_bar" && (c.appliesTo?.uncoded?.length ?? 0) > 0;
+}
+
+/** (#248) True for a bar code does NOT decide: served without its trigger. */
+export function isNotCodeDecidedBar(c: Pick<AssessmentCriterion, "kind" | "notCodeDecided">): boolean {
+  return c.kind === "mandatory_bar" && c.notCodeDecided === true;
+}
+
+/**
+ * (#222, #248) True for a bar the assessment model is shown: one with uncoded group members,
+ * or one code does not decide at all. Both may only ever become a CONCERN (a credibility flag),
+ * never a refusal ground (see `assembleContent`).
+ */
+export function isJudgedBar(c: Pick<AssessmentCriterion, "kind" | "appliesTo" | "notCodeDecided">): boolean {
+  return hasUncodedGroup(c) || isNotCodeDecidedBar(c);
+}
+
+/**
+ * (#248) What the model is told about a bar that code does not decide: that code does not decide
+ * it, the group AS WRITTEN in the source (its own words, coded and uncoded members alike: no code
+ * is shown as if it settled anything), and the rule's original condition words, so the model can
+ * weigh whether this applicant is one the bar covers. Text from the rubric only (trusted data).
+ */
+function notCodeDecidedBlock(c: AssessmentCriterion): string {
+  const group = [...(c.appliesTo?.asWritten ?? []), ...(c.appliesTo?.uncoded ?? [])];
+  return (
+    " | mandatory bar NOT decided by code (which applicants it covers was not confirmed): weigh whether it applies to this applicant and raise a concern if it does" +
+    ` | group as written: ${group.join("; ") || "none stated"}` +
+    ` | applies when: ${c.applicabilityCondition ? `"${c.applicabilityCondition}"` : "not stated (read the source)"}`
+  );
 }
 
 /** The rule's own text as the model is shown it: the quote, then any list lines under a lead-in (#222). */
@@ -529,7 +638,9 @@ export const JUDGEMENT_BATCH_MAX_CHARS = 50_000;
 
 /** Characters one criterion adds to the criteria block of a stage 3 request. */
 function criterionBlockChars(c: AssessmentCriterion): number {
-  return c.criterionId.length + c.title.length + (c.probeFactors ?? []).join("; ").length + ruleSourceText(c).length + (c.appliesTo?.uncoded ?? []).join("; ").length + 60;
+  // (#248) A bar code does not decide also carries its group as written and its condition words.
+  const judgedExtra = isNotCodeDecidedBar(c) ? notCodeDecidedBlock(c).length : 0;
+  return c.criterionId.length + c.title.length + (c.probeFactors ?? []).join("; ").length + ruleSourceText(c).length + (c.appliesTo?.uncoded ?? []).join("; ").length + judgedExtra + 60;
 }
 
 /**
@@ -714,9 +825,13 @@ export function buildJudgementRequest(input: JudgementRequestInput): LlmRequest 
       (c) =>
         `- ${c.criterionId} | ${c.title} | factors: ${(c.probeFactors ?? []).join("; ") || "none stated"} | ` +
         `source: "${ruleSourceText(c)}"` +
-        (hasUncodedGroup(c)
-          ? ` | group (code matches only its nationalities ${(c.appliesTo?.nationalities ?? []).join(", ") || "none"}; also named, with no code: ${(c.appliesTo?.uncoded ?? []).join("; ")})`
-          : "") +
+        // (#248) A bar code does not decide gets its own block (group as written + condition words);
+        // a bar with uncoded members that code still decides for its coded members keeps the #222 text.
+        (isNotCodeDecidedBar(c)
+          ? notCodeDecidedBlock(c)
+          : hasUncodedGroup(c)
+            ? ` | group (code matches only its nationalities ${(c.appliesTo?.nationalities ?? []).join(", ") || "none"}; also named, with no code: ${(c.appliesTo?.uncoded ?? []).join("; ")})`
+            : "") +
         (c.concernsIntent ? " | concerns intention" : "")
     )
     .join("\n");
@@ -863,6 +978,16 @@ export interface AssembleInput {
   notAssessed?: InsufficientItem[];
 }
 
+/**
+ * (#233) "Findings carry their layer": the rulebook layer of a rule, copied
+ * from the rubric in code (never model text), spread into every finding made
+ * from it. Empty for a single-layer rulebook (no `layerKey`), so those results
+ * are exactly as before.
+ */
+function layerOf(c: Pick<AssessmentCriterion, "layerKey">): { layerKey?: string } {
+  return c.layerKey ? { layerKey: c.layerKey } : {};
+}
+
 /** Why judgement did not run on a route that has judgement criteria. */
 const NO_STATEMENT_REASON = "there is no statement or document to weigh";
 
@@ -879,6 +1004,7 @@ function groundFrom(c: AssessmentCriterion, detail: string, whatWouldHelp: strin
     sourceQuote: c.source.quote,
     detail,
     whatWouldHelp,
+    ...layerOf(c),
   };
 }
 
@@ -919,7 +1045,7 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
       seenRefusal.add(c.criterionId);
       refusalGrounds.push(groundFrom(c, r.reason, "Provide evidence that meets this requirement."));
     } else if (r.outcome === "insufficient") {
-      insufficient.push({ criterionId: c.criterionId, title: c.title, reason: r.reason });
+      insufficient.push({ criterionId: c.criterionId, title: c.title, reason: r.reason, ...layerOf(c) });
     }
   }
 
@@ -931,20 +1057,20 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   if (input.judgementFailed) {
     for (const id of judgementIds) {
       const c = criterionById(rubric, id)!;
-      insufficient.push({ criterionId: id, title: c.title, reason: "the judgement check could not be completed" });
+      insufficient.push({ criterionId: id, title: c.title, reason: "the judgement check could not be completed", ...layerOf(c) });
     }
   } else if (!input.judgement && input.mandatoryHits.length === 0) {
     // Judgement was not run because there was nothing to read. Said, not silent.
     for (const id of judgementIds) {
       const c = criterionById(rubric, id)!;
-      insufficient.push({ criterionId: id, title: c.title, reason: NO_STATEMENT_REASON });
+      insufficient.push({ criterionId: id, title: c.title, reason: NO_STATEMENT_REASON, ...layerOf(c) });
     }
   } else if (input.judgement) {
     judgementOutcome = "clear";
     // (#207) Criteria of a judgement call that failed while others succeeded.
     for (const id of input.unjudgedCriterionIds ?? []) {
       const c = criterionById(rubric, id);
-      if (c) insufficient.push({ criterionId: id, title: c.title, reason: "the judgement check could not be completed" });
+      if (c) insufficient.push({ criterionId: id, title: c.title, reason: "the judgement check could not be completed", ...layerOf(c) });
     }
     for (const f of input.judgement.findings) {
       const c = criterionById(rubric, f.criterionId);
@@ -952,7 +1078,18 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
       // Only a judgement criterion can be flagged here: a finding the model
       // attached to an objective or bar criterion id is ignored, so model text
       // can never add to, or override, a code-decided rule.
-      if (c.kind !== "judgement") continue;
+      // (#248) EXTENDED, not loosened: a bar the model was SHOWN as a judgement
+      // (`isJudgedBar`: uncoded members, or served without its trigger so code does
+      // not decide it) may also become a concern. Before, such a concern was dropped
+      // here, so "the model can raise a concern on it" had no effect at all and a
+      // barred applicant code cannot match heard nothing. It is still never a refusal
+      // ground and never touches `mandatoryHits`: what code decided stays exactly as
+      // code decided it, and the model cannot clear it. A bar code already refused on
+      // for this applicant is not flagged twice. Objective criteria and bars the model
+      // was not shown stay ignored (pinned by tests).
+      const judgedBar = c.kind === "mandatory_bar" && isJudgedBar(c);
+      if (c.kind !== "judgement" && !judgedBar) continue;
+      if (judgedBar && seenRefusal.has(c.criterionId)) continue;
       // THE CONTAINMENT POINT. A judgement criterion produces a credibility
       // flag, never a refusal ground, and this is enforced here in code, not by
       // the prompt. Why: the engine cannot verify genuineness (leaves at the end
@@ -967,7 +1104,9 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
         criterionId: c.criterionId,
         title: c.title,
         kind: c.kind,
-        isMandatoryBar: false,
+        // (#248) True only for a judged bar's concern: staff can tell a concern about a bar
+        // from an ordinary one. It is still a FLAG (no refusal ground, no `hasBlockingRule`).
+        isMandatoryBar: judgedBar,
         // Stage comes from the rubric criterion, never from model text (#43).
         stage: c.stage,
         ruleRef: c.ruleRef ?? null,
@@ -975,11 +1114,12 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
         sourceQuote: c.source.quote,
         detail: f.detail,
         whatWouldHelp: f.whatWouldHelp,
+        ...layerOf(c),
       });
     }
     for (const s of input.judgement.strengths) {
       const c = criterionById(rubric, s.criterionId);
-      if (c) strengths.push({ criterionId: c.criterionId, title: c.title, detail: s.detail });
+      if (c) strengths.push({ criterionId: c.criterionId, title: c.title, detail: s.detail, ...layerOf(c) });
     }
     for (const n of input.judgement.statementNotes) {
       const c = criterionById(rubric, n.criterionId);
@@ -1011,6 +1151,7 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
         statementVersion: statementRef ? statementRef.version : null,
         // Already range-checked against the blocks sent. Absent when not valid.
         ...(n.blockIndex !== null && statementRef ? { nodePath: [n.blockIndex] } : {}),
+        ...layerOf(c),
       });
     }
   }

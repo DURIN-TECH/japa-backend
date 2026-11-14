@@ -1,4 +1,6 @@
 import type { Timestamp } from "firebase-admin/firestore";
+// (#225) Type-only: the head also carries the automatic re-draft's claims and deferral.
+import type { RedraftHeadFields } from "./onboarding-redraft";
 
 // ============================================
 // ROUTE ONBOARDING RUN — TYPES (issue #217, part P3 of umbrella #211)
@@ -180,8 +182,20 @@ export interface Confirmation {
 export interface RouteOnboardingRun {
   runId: string;
   routeKey: string;
-  countryCode: string;
+  // The country of a country's route. (#233 P4b) ABSENT on a run for a SHARED
+  // layer (a bloc's or treaty's rulebook): that run files no country visa
+  // record and drafts the rulebook under `{authorityId}_{routeSlug}`.
+  countryCode?: string;
+  // The visa id (a country's route) or the shared route id (a shared layer):
+  // the same value as `routeSlug`, kept under this name for the portal.
   visaTypeId: string;
+  // (#233 P4b) The issuing authority and route slug of the rulebook drafted
+  // (for a country these equal `countryCode` and `visaTypeId`). Absent on runs
+  // started before P4b (read them from `countryCode` / `visaTypeId`).
+  authorityId?: string;
+  routeSlug?: string;
+  // (#233 P4b) "shared" on a run for a bloc's or treaty's shared layer; absent on a country's route.
+  layer?: "shared";
   status: RunStatus;
   // One plain sentence about where the run stands (the portal headline).
   summary: string;
@@ -221,8 +235,13 @@ export interface RouteOnboardingRun {
   handedToSafeguardsAt: Timestamp | null;
 }
 
-/** `routeOnboardingRoutes/{routeKey}`. */
-export interface RouteOnboardingHead {
+/**
+ * `routeOnboardingRoutes/{routeKey}`. (#225) Also the meeting point of the
+ * automatic re-draft and the runs: its claims and deferral (see
+ * onboarding-redraft.ts). A head may exist with `lastSeq: 0` when the trigger
+ * wrote it before any run was started.
+ */
+export interface RouteOnboardingHead extends RedraftHeadFields {
   routeKey: string;
   // Runs created so far (the next run is `r{lastSeq + 1}`).
   lastSeq: number;

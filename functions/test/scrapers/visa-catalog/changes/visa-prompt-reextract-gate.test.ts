@@ -37,6 +37,8 @@ function ingest(e: ExtractedVisa) {
   return catalog.ingestExtraction({
     countryCode: CC, sourceUrl: URL, routeName: "Standard Visitor", contentHash: "h1", extracted: e,
     model: "stub", visaId: VISA_ID, fx: undefined,
+    // A GB page: its adapter carries the +items-vN stamp (issue #212).
+    sourceMeta: { sourceProvider: "govuk-content-api" },
   });
 }
 
@@ -62,18 +64,18 @@ const rows = (): [string, Data][] =>
 before(async () => {
   await installFakes();
   catalog = (await import("../../../../src/scrapers/visa-catalog/visa-catalog.service")).visaCatalogService;
-  version = (await import("../../../../src/scrapers/visa-catalog/visa-catalog-extract.service")).EXTRACTOR_PROMPT_VERSION;
+  version = (await import("../../../../src/scrapers/visa-catalog/visa-catalog-extract.service")).EXTRACTION_PIPELINE_VERSION;
 });
 beforeEach(() => resetStore());
 
 test("approved + older prompt version: re-extract; the new reading becomes an OPEN proposal; then no re-extract", async () => {
   seedLiveOld();
-  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1"), true);
+  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1", version), true);
   assert.equal(await ingest(extraction("information")).then((r: any) => r.outcome), "proposed");
   assert.equal(rows().length, 1);
   assert.equal(rows()[0][1].extractorPromptVersion, version);
   // An open row for this text + version: the next crawl makes no extraction.
-  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1"), false);
+  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1", version), false);
 });
 
 test("after the admin REJECTS the proposal: next crawl still no extraction and no new row", async () => {
@@ -81,7 +83,7 @@ test("after the admin REJECTS the proposal: next crawl still no extraction and n
   await ingest(extraction("information"));
   const [id, row] = rows()[0];
   store.set(`pendingVisaChanges/${id}`, { ...row, status: "rejected" });
-  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1"), false);
+  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1", version), false);
   assert.equal(rows().length, 1); // nothing re-proposed
 });
 
@@ -90,7 +92,7 @@ test("a NEWER prompt version re-extracts again, even with a rejected row from th
   await ingest(extraction("information"));
   const [id, row] = rows()[0];
   store.set(`pendingVisaChanges/${id}`, { ...row, status: "rejected", extractorPromptVersion: "v-older-than-current" });
-  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1"), true);
+  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1", version), true);
 });
 
 test("re-read with identical classification: no proposal, the live prompt version is stamped, then not stale", async () => {
@@ -99,5 +101,5 @@ test("re-read with identical classification: no proposal, the live prompt versio
   assert.equal(outcome, "unchanged");
   assert.equal(rows().length, 0);
   assert.equal((store.get(VISA_PATH) as any).scrapeMeta.extractorPromptVersion, version);
-  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1"), false);
+  assert.equal(await catalog.needsPromptReextract(CC, VISA_ID, undefined, "h1", version), false);
 });

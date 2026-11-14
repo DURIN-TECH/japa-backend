@@ -22,6 +22,10 @@ import {
 import { adminGuidanceSourceRoutes } from "./scrapers";
 // Source registry API (issue #215): confirmed hosts + route registration.
 import { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./scrapers";
+// Issuing authorities and bloc membership (issue #230): admin-only API.
+import { adminAuthorityRoutes } from "./authorities";
+// Shared routes and inheriting visa records (issue #231): admin-only API.
+import { adminSharedRouteRoutes } from "./shared-routes";
 // Route onboarding runs (issue #217).
 import { adminRouteOnboardingRoutes } from "./scrapers";
 // Rubric review (issue #125): admin queue, detail with diff, approve / reject.
@@ -33,9 +37,12 @@ import { adminOutcomeStatisticsRoutes } from "./scrapers";
 import { agencyVisaRoutes } from "./agency-visas";
 // Agency per-visa service prices, in whole naira (issue #103).
 import { agencyVisaPriceRoutes } from "./agency-visa-prices";
+import { feedbackRoutes } from "./routes/feedback.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
+// Issue #235: "which country do I apply through" for a shared route (applicant-facing, read-only).
+import { applyThroughRoutes } from "./routes/apply-through.routes";
 import { documentRoutes } from "./routes/document.routes";
 // Document templates feature (rich-text templates + editable case-linked instances)
 import { documentTemplateRoutes } from "./routes/document-template.routes";
@@ -66,6 +73,8 @@ import {
 // Public exchange rates + admin rate overrides (issue #178).
 import { publicRatesRoutes, adminExchangeRateRoutes } from "./routes/exchange-rate.routes";
 import { verificationWebhookRoutes } from "./routes/verification-webhook.routes";
+// Public Paystack return page that bounces the in-app browser back to the mobile app (issue #252).
+import { paymentReturnRoutes } from "./routes/payment-return.routes";
 // Admin review queue for trafficking / scam risk signals (issue #119).
 import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
 
@@ -99,6 +108,11 @@ app.get("/health", (req: Request, res: Response) => {
 app.use("/users", userRoutes);
 app.use("/countries", countryRoutes);
 app.use("/visas", visaSearchRoutes);
+// Public Paystack return page (issue #252) — no verifyAuth: Paystack's browser
+// redirect carries no token. It only redirects to the fixed app deep link
+// `durintech://payment-return`; payment is confirmed by the authenticated
+// verify endpoints, never by this page.
+app.use("/payments", paymentReturnRoutes);
 // Public auth flows (forgot-password) — no verifyAuth (user isn't signed in).
 app.use("/auth", authRoutes);
 app.use("/agents", agentRoutes);
@@ -113,6 +127,7 @@ app.use("/invitations", invitationRoutes);
 // Personal document checklist (issue #114): extra-segment paths on /applications.
 app.use("/applications", checklistRoutes);
 app.use("/applications", applicationRoutes);
+app.use("/shared-routes", applyThroughRoutes);
 app.use("/documents", documentRoutes);
 // Document templates: catalog (read-only) + editable instances cloned from them
 app.use("/document-templates", documentTemplateRoutes);
@@ -121,6 +136,8 @@ app.use("/document-requests", documentRequestRoutes);
 app.use("/transactions", transactionRoutes);
 app.use("/consultations", consultationRoutes);
 app.use("/notifications", notificationRoutes);
+// In-app tester feedback (issue #257).
+app.use("/feedback", feedbackRoutes);
 app.use("/payment-requests", paymentRequestRoutes);
 app.use("/conversations", messagingRoutes);
 app.use("/bank-accounts", bankAccountRoutes);
@@ -158,6 +175,11 @@ app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
 // Issue #215: admin-only (verifyAuth + the ScrapeRun admin gate on every route).
 app.use("/admin/official-domains", adminOfficialDomainRoutes);
 app.use("/admin/route-sources", adminRouteSourceRoutes);
+// Issue #230: issuing authorities (country, bloc, treaty) and bloc members.
+// Admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route.
+app.use("/admin/authorities", adminAuthorityRoutes);
+// Issue #231: shared routes (a visa defined once by a bloc) and the visa records that inherit them.
+app.use("/admin/shared-routes", adminSharedRouteRoutes);
 // Issue #217: route onboarding runs (admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route).
 app.use("/admin/route-onboarding", adminRouteOnboardingRoutes);
 // Rubric review (issue #125): admin-only (verifyAuth + admin gate on every

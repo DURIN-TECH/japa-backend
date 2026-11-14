@@ -11,6 +11,7 @@ import { assertValidCrawlWindow, nextWindowOpening } from "../etiquette/visa-cra
 import { officialDomainsService } from "./official-domains.service";
 import { appendRegistryAudit, stripUndefined } from "./registry-audit";
 import { REGISTRY_ID_MAX, VISA_ID_RE, lookupRegionName, parseRegistryUrl } from "./registry-address";
+import { parseAuthorityRef, resolveRegistryAuthority, type RegistryAuthority } from "./registry-authority";
 import { RegistryError } from "./registry-errors";
 import { registryRateLimiter } from "./registry-rate-limit";
 import { loadRegistrySettings } from "./registry-settings";
@@ -47,6 +48,22 @@ import { sourcePreviewService, type AddressPreview } from "./source-preview.serv
 //
 // Repeating the same body changes nothing (200, created: false) and makes no
 // request: the stored objects already match.
+//
+// ISSUE #232 (P3 of #228): a route is registered under an ISSUING AUTHORITY
+// (`authorityId`: a country code, or the id of a bloc or treaty that exists
+// in `authorities`). Everything is keyed by that id: `visaSources/{authorityId}`,
+// guidance `jurisdiction`, the visa id prefix `{authorityId}-` and so the
+// rulebook key `{authorityId}_{visaId}` (authority-ids.ts buildRulebookKey).
+// For a country nothing changes (same values as before). For a bloc or treaty:
+//   - NO country is created and nothing under `countries/` is read or written;
+//   - the visa source is stored WITHOUT `nextCrawlAt`, so the scheduled visa
+//     crawl never picks it (that crawl files visa records under a country;
+//     a shared route's record is P2's job), and the crawl also skips any
+//     non-country source by hand;
+//   - so, as for a country, nothing becomes visible to applicants.
+// The confirmed-host check (step 3) and the preview policy (step 6) use the
+// hosts confirmed for THIS authority only: a host confirmed for a different
+// authority is refused, before any request and on any redirect.
 
 // ---------- Body ----------
 
@@ -62,7 +79,10 @@ export interface RegisterGuidanceInput {
 
 /** The validated request body. */
 export interface RegisterRouteInput {
-  countryCode: string;
+  /** The authority id, normalised (country codes upper-case). Existence is checked later (a read). */
+  authorityId: string;
+  /** True when `authorityId` is a country code (its shape says so; no read needed). */
+  authorityIsCountry: boolean;
   routeName: string;
   visaId?: string;
   visaPage: { url: string; language: string };
@@ -73,8 +93,13 @@ export interface RegisterRouteInput {
 /** What a registration reports. */
 export interface RegisterRouteResult {
   created: boolean;
-  countryCode: string;
-  countryName: string;
+  /** The authority the route was registered under. */
+  authorityId: string;
+  /** Its display name (a country's stored or English name; a bloc's or treaty's own name). */
+  authorityName: string;
+  /** country, bloc or treaty. */
+  authorityKind: RegistryAuthority["kind"];
+  /** True only when a NEW (hidden) country record was created; always false for a bloc or treaty. */
   countryCreated: boolean;
   visaId: string;
   visaPageUrl: string;
@@ -84,7 +109,7 @@ export interface RegisterRouteResult {
 }
 
 /** Keys allowed at each level (unknown keys are rejected). */
-const BODY_KEYS = ["countryCode", "routeName", "visaId", "visaPage", "guidance", "crawlTimeZone"] as const;
+const BODY_KEYS = ["authorityId", "routeName", "visaId", "visaPage", "guidance", "crawlTimeZone"] as const;
 const VISA_PAGE_KEYS = ["url", "language"] as const;
 const GUIDANCE_KEYS = ["url", "title", "role", "docType", "language", "checkIntervalHours"] as const;
 
@@ -133,15 +158,17 @@ export function leastLoadedWeekday(counts: readonly number[]): number {
 /** Shape-validate the body (pure apart from reading Intl). Throws RegistryError 400. */
 export function parseRegisterRouteBody(raw: unknown): RegisterRouteInput {
   const body = strictObject(raw, BODY_KEYS, "body");
-  const region = lookupRegionName(body.countryCode);
-  if (!region) throw bad("INVALID_COUNTRY_CODE", "The country code is not a known two-letter code", 400, { field: "countryCode" });
+  // Shape only here (pure); whether a bloc/treaty exists is read in register().
+  const authority = parseAuthorityRef(body.authorityId);
+  // Every id of the route starts with the authority id in lower case ("ab-", "my-bloc-").
+  const prefix = `${authority.id.toLowerCase()}-`;
   const routeName = text(body.routeName, "routeName", ROUTE_NAME_MIN, ROUTE_NAME_MAX);
 
   let visaId: string | undefined;
   if (body.visaId !== undefined) {
     visaId = text(body.visaId, "visaId", 1, REGISTRY_ID_MAX);
-    if (!VISA_ID_RE.test(visaId) || !visaId.startsWith(`${region.code.toLowerCase()}-`) || visaId.length === region.code.length + 1) {
-      throw bad("INVALID_VISA_ID", `visaId must be lowercase letters, digits and hyphens, starting with "${region.code.toLowerCase()}-"`, 400, { field: "visaId" });
+    if (!VISA_ID_RE.test(visaId) || !visaId.startsWith(prefix) || visaId.length === prefix.length) {
+      throw bad("INVALID_VISA_ID", `visaId must be lowercase letters, digits and hyphens, starting with "${prefix}"`, 400, { field: "visaId" });
     }
   }
 
@@ -189,7 +216,8 @@ export function parseRegisterRouteBody(raw: unknown): RegisterRouteInput {
   }
 
   return {
-    countryCode: region.code,
+    authorityId: authority.id,
+    authorityIsCountry: authority.isCountry,
     routeName,
     ...(visaId ? { visaId } : {}),
     visaPage: { url: visaUrl.url.href, language: visaLanguage },
@@ -221,19 +249,19 @@ class RouteRegistrationService {
   async register(raw: unknown, actorUid: string): Promise<RegisterRouteResult> {
     // 1+2. Shape, enums, ids.
     const input = parseRegisterRouteBody(raw);
-    const region = lookupRegionName(input.countryCode)!;
-    const cc = input.countryCode;
-    const ccLower = cc.toLowerCase();
-    const visaId = input.visaId ?? `${ccLower}-${slugify(input.routeName)}`;
-    if (!VISA_ID_RE.test(visaId) || visaId === `${ccLower}-` || visaId.length > REGISTRY_ID_MAX) {
+    // `aid` keys every object of the route: visaSources/{aid}, jurisdiction, id prefixes.
+    const aid = input.authorityId;
+    const aidLower = aid.toLowerCase();
+    const visaId = input.visaId ?? `${aidLower}-${slugify(input.routeName)}`;
+    if (!VISA_ID_RE.test(visaId) || visaId === `${aidLower}-` || visaId.length > REGISTRY_ID_MAX) {
       throw bad("INVALID_VISA_ID", "A visa id could not be made from the route name: give one in visaId", 400, { field: "visaId" });
     }
-    const routeKey = visaId.slice(ccLower.length + 1); // the id without its country prefix
+    const routeKey = visaId.slice(aidLower.length + 1); // the id without its authority prefix
 
     // Guidance ids come from the TITLE, never from the address.
     const guidanceIds = input.guidance.map((g, i) => {
-      const id = `${ccLower}-${slugify(g.title)}`;
-      if (!GUIDANCE_SOURCE_ID_RE.test(id) || id === `${ccLower}-` || id.length > REGISTRY_ID_MAX) {
+      const id = `${aidLower}-${slugify(g.title)}`;
+      if (!GUIDANCE_SOURCE_ID_RE.test(id) || id === `${aidLower}-` || id.length > REGISTRY_ID_MAX) {
         throw bad("VALIDATION_ERROR", `guidance[${i}].title cannot be turned into an id: use letters or digits`, 400, { field: `guidance[${i}].title` });
       }
       return id;
@@ -257,11 +285,21 @@ class RouteRegistrationService {
       }
     }
 
-    // 3. Confirmed hosts, BEFORE anything is requested.
-    const confirmed = await officialDomainsService.confirmedHosts();
+    // 2b. The authority must exist (a bloc or treaty in `authorities`) and
+    //     not be retired. Read again inside the write transaction below.
+    const authority = await resolveRegistryAuthority(aid);
+
+    // 3. Confirmed hosts OF THIS AUTHORITY, BEFORE anything is requested.
+    //    A host confirmed for a different authority counts as unconfirmed.
+    const confirmed = await officialDomainsService.confirmedHostsFor(authority.id);
     const unconfirmed = hostsOf(input).filter((h) => !confirmed.has(h));
     if (unconfirmed.length > 0) {
-      throw bad("HOST_NOT_CONFIRMED", `These websites are not confirmed as official yet: ${unconfirmed.join(", ")}. Confirm each one first`, 422, { hosts: unconfirmed });
+      throw bad(
+        "HOST_NOT_CONFIRMED",
+        `These websites are not confirmed as official websites of this authority yet: ${unconfirmed.join(", ")}. Confirm each one for this authority first`,
+        422,
+        { hosts: unconfirmed }
+      );
     }
 
     // 4. Rate limit.
@@ -271,12 +309,13 @@ class RouteRegistrationService {
     }
 
     // 5. Conflicts and idempotency, from what is stored.
-    const state = await this.readState(cc, visaId, guidanceIds, input);
+    const state = await this.readState(authority, visaId, guidanceIds, input);
     if (state.alreadyRegistered) {
       return {
         created: false,
-        countryCode: cc,
-        countryName: state.countryName ?? region.name,
+        authorityId: aid,
+        authorityName: state.countryName || authority.name,
+        authorityKind: authority.kind,
         countryCreated: false,
         visaId,
         visaPageUrl: input.visaPage.url,
@@ -286,7 +325,8 @@ class RouteRegistrationService {
       };
     }
 
-    // 6. Preview every page just before saving, with the host policy.
+    // 6. Preview every page just before saving, with the host policy: every
+    //    hop must be a host confirmed for this authority.
     const allowedHost = (h: string) => confirmed.has(h.toLowerCase());
     const warnings: string[] = [];
     const withUrl = async (url: string, run: () => Promise<AddressPreview>): Promise<AddressPreview> => {
@@ -317,29 +357,41 @@ class RouteRegistrationService {
     const at = Timestamp.fromMillis(now);
     const retrievedAtIso = new Date(now).toISOString();
     return this.runTransaction(async (tx) => {
-      const countryRef = collections.countries.doc(cc);
-      const sourceRef = collections.visaSources.doc(cc);
+      // The authority again, inside the transaction (it may have been retired since step 2b).
+      const current = await resolveRegistryAuthority(aid, (ref) => tx.get(ref));
+      const isCountry = current.isCountry;
+      const countryRef = isCountry ? collections.countries.doc(aid) : undefined;
+      const sourceRef = collections.visaSources.doc(aid);
       const guidanceRefs = guidanceIds.map((id) => collections.guidanceSources.doc(id));
-      const [countrySnap, sourceSnap, ...guidanceSnaps] = await Promise.all([tx.get(countryRef), tx.get(sourceRef), ...guidanceRefs.map((r) => tx.get(r))]);
+      const [countrySnap, sourceSnap, ...guidanceSnaps] = await Promise.all([
+        countryRef ? tx.get(countryRef) : Promise.resolve(undefined),
+        tx.get(sourceRef),
+        ...guidanceRefs.map((r) => tx.get(r)),
+      ]);
       // Re-check inside the transaction: a concurrent registration may have won.
       if (guidanceSnaps.some((s) => s.exists)) throw bad("GUIDANCE_ID_TAKEN", "A guidance source with one of these titles was registered a moment ago", 409);
       const existingSource = sourceSnap.exists ? (sourceSnap.data() as Record<string, unknown>) : undefined;
       const existingPages = (existingSource?.pages as VisaSourcePage[] | undefined) ?? [];
       if (existingPages.some((p) => p.url === input.visaPage.url)) throw bad("PAGE_ALREADY_REGISTERED", "That visa page was registered a moment ago", 409);
 
-      // Country: created hidden, only when absent.
+      // Country (a country authority only): created hidden, only when absent.
+      // A bloc or treaty creates no country and touches nothing under `countries/`.
       let countryCreated = false;
-      let countryName = region.name;
-      if (!countrySnap.exists) {
-        const country = visaService.buildNewCountry({ code: cc, name: region.name, isSupported: false }, at);
-        tx.create(countryRef, country as unknown as Record<string, unknown>);
-        countryCreated = true;
-        appendRegistryAudit(tx, { action: "country_created", actorUid, at, targetType: "country", targetId: cc, before: null, after: country as unknown as Record<string, unknown> });
-      } else {
-        countryName = String((countrySnap.data() as { name?: string }).name ?? region.name);
+      let authorityName = current.name;
+      if (isCountry && countryRef && countrySnap) {
+        const regionName = lookupRegionName(aid)?.name ?? current.name;
+        if (!countrySnap.exists) {
+          const country = visaService.buildNewCountry({ code: aid, name: regionName, isSupported: false }, at);
+          tx.create(countryRef, country as unknown as Record<string, unknown>);
+          countryCreated = true;
+          authorityName = regionName;
+          appendRegistryAudit(tx, { action: "country_created", actorUid, at, targetType: "country", targetId: aid, before: null, after: country as unknown as Record<string, unknown> });
+        } else {
+          authorityName = String((countrySnap.data() as { name?: string }).name ?? regionName);
+        }
       }
 
-      // Visa page: appended to the country's registry doc (created when absent).
+      // Visa page: appended to the authority's registry doc (created when absent).
       const page: VisaSourcePage = stripUndefined({
         url: input.visaPage.url,
         routeName: input.routeName,
@@ -357,7 +409,7 @@ class RouteRegistrationService {
         tx.update(sourceRef, { pages: [...existingPages, page], officialHosts: union, updatedAt: at });
         crawlWindow = (existingSource.crawlWindow as CrawlWindow | undefined) ?? null;
         appendRegistryAudit(tx, {
-          action: "visa_page_added", actorUid, at, targetType: "visaSource", targetId: `${cc}#${page.url}`,
+          action: "visa_page_added", actorUid, at, targetType: "visaSource", targetId: `${aid}#${page.url}`,
           before: { pageCount: existingPages.length, officialHosts: existingSource.officialHosts ?? null },
           after: { page, officialHosts: union },
         });
@@ -365,16 +417,23 @@ class RouteRegistrationService {
         crawlWindow = { timeZone: input.crawlTimeZone, dayOfWeek: state.weekday, startHour: WINDOW_START_HOUR, endHour: WINDOW_END_HOUR };
         assertValidCrawlWindow(crawlWindow);
         const doc = stripUndefined({
-          id: cc,
-          countryCode: cc,
-          countryName,
+          id: aid,
+          // The issuing authority (issue #232). `countryCode` is kept for a
+          // country only: the visa crawl and its readers file records under
+          // `countries/{countryCode}`, which a bloc or treaty does not have.
+          authorityId: aid,
+          countryCode: isCountry ? aid : undefined,
+          // Display name of the source (readers show it as the source's name).
+          countryName: authorityName,
           isOfficial: true, // every page is on a host an admin confirmed
           pages: [page],
           adapter: "generic-html" as const,
           crawlWindow,
           officialHosts: hosts,
           crawlIntervalHours: DEFAULT_CHECK_INTERVAL_HOURS,
-          nextCrawlAt: Timestamp.fromDate(nextWindowOpening(crawlWindow, now)),
+          // A bloc's or treaty's page is NOT scheduled for the visa crawl (see
+          // the file header): without `nextCrawlAt` the due query never picks it.
+          nextCrawlAt: isCountry ? Timestamp.fromDate(nextWindowOpening(crawlWindow, now)) : undefined,
           status: "active" as const,
           reliabilityScore: 100,
           consecutiveFailures: 0,
@@ -385,7 +444,7 @@ class RouteRegistrationService {
           addedAt: at,
         });
         tx.create(sourceRef, doc as unknown as Record<string, unknown>);
-        appendRegistryAudit(tx, { action: "visa_page_added", actorUid, at, targetType: "visaSource", targetId: `${cc}#${page.url}`, before: null, after: doc as unknown as Record<string, unknown> });
+        appendRegistryAudit(tx, { action: "visa_page_added", actorUid, at, targetType: "visaSource", targetId: `${aid}#${page.url}`, before: null, after: doc as unknown as Record<string, unknown> });
       }
 
       // Guidance sources: one doc and one audit entry each.
@@ -394,7 +453,8 @@ class RouteRegistrationService {
           id: guidanceIds[i],
           title: g.title,
           url: g.url,
-          jurisdiction: cc,
+          // The issuing authority's id (issue #232): same value as before for a country.
+          jurisdiction: aid,
           route: routeKey,
           docType: g.docType,
           role: g.role,
@@ -417,11 +477,11 @@ class RouteRegistrationService {
       });
 
       appendRegistryAudit(tx, {
-        action: "route_registered", actorUid, at, targetType: "route", targetId: `${cc}/${visaId}`, before: null,
-        after: { countryCode: cc, visaId, visaPageUrl: input.visaPage.url, guidanceSourceIds: guidanceIds, countryCreated },
+        action: "route_registered", actorUid, at, targetType: "route", targetId: `${aid}/${visaId}`, before: null,
+        after: { authorityId: aid, authorityKind: current.kind, visaId, visaPageUrl: input.visaPage.url, guidanceSourceIds: guidanceIds, countryCreated },
       });
 
-      return { created: true, countryCode: cc, countryName, countryCreated, visaId, visaPageUrl: input.visaPage.url, guidanceSourceIds: guidanceIds, crawlWindow, warnings };
+      return { created: true, authorityId: aid, authorityName, authorityKind: current.kind, countryCreated, visaId, visaPageUrl: input.visaPage.url, guidanceSourceIds: guidanceIds, crawlWindow, warnings };
     });
   }
 
@@ -440,15 +500,17 @@ class RouteRegistrationService {
    * should use (the least loaded) and the existing source's window.
    */
   private async readState(
-    cc: string,
+    authority: RegistryAuthority,
     visaId: string,
     guidanceIds: string[],
     input: RegisterRouteInput
   ): Promise<{ alreadyRegistered: boolean; countryName?: string; crawlWindow: CrawlWindow | null; weekday: number }> {
+    const aid = authority.id;
+    // Country records exist only for a country authority; a bloc or treaty reads nothing under `countries/`.
     const [sourceSnap, countrySnap, visaDocSnap, allSources, ...guidanceSnaps] = await Promise.all([
-      collections.visaSources.doc(cc).get(),
-      collections.countries.doc(cc).get(),
-      subcollections.visaTypes(cc).doc(visaId).get(),
+      collections.visaSources.doc(aid).get(),
+      authority.isCountry ? collections.countries.doc(aid).get() : Promise.resolve(undefined),
+      authority.isCountry ? subcollections.visaTypes(aid).doc(visaId).get() : Promise.resolve(undefined),
       collections.visaSources.get(),
       ...guidanceIds.map((id) => collections.guidanceSources.doc(id).get()),
     ]);
@@ -475,14 +537,15 @@ class RouteRegistrationService {
       if (p.url === input.visaPage.url || p.supplementOnly) continue;
       let theirs: string | undefined;
       try {
-        theirs = deriveVisaId({ countryCode: cc, sourceUrl: p.url, visaId: p.visaId });
+        // Derived ids exist only for country sources (seeded pages); a bloc's pages are portal-added and pinned.
+        theirs = authority.isCountry ? deriveVisaId({ countryCode: aid, sourceUrl: p.url, visaId: p.visaId }) : p.visaId;
       } catch {
         theirs = p.visaId;
       }
-      if (theirs === visaId) throw bad("VISA_ID_TAKEN", `The visa id ${visaId} already belongs to another page of this country`, 409);
+      if (theirs === visaId) throw bad("VISA_ID_TAKEN", `The visa id ${visaId} already belongs to another page of this authority`, 409);
     }
-    // An existing visa record must have come from THIS page.
-    if (visaDocSnap.exists) {
+    // An existing visa record (country authorities only) must have come from THIS page.
+    if (visaDocSnap?.exists) {
       const meta = (visaDocSnap.data() as { scrapeMeta?: { sourceUrl?: string } }).scrapeMeta;
       if (meta?.sourceUrl !== input.visaPage.url) throw bad("VISA_ID_TAKEN", `A visa record ${visaId} already exists from another source`, 409);
     }
@@ -497,7 +560,7 @@ class RouteRegistrationService {
         continue;
       }
       const d = snap.data() as Record<string, unknown>;
-      const same = d.addedVia === "portal" && d.url === g.url && d.jurisdiction === cc && d.role === g.role && d.docType === g.docType;
+      const same = d.addedVia === "portal" && d.url === g.url && d.jurisdiction === aid && d.role === g.role && d.docType === g.docType;
       if (!same) throw bad("GUIDANCE_ID_TAKEN", `The id ${guidanceIds[i]} (made from the title) is already used by a different source: change the title`, 409);
     }
     // The same address registered under another id is a mistake, not a repeat.
@@ -510,7 +573,7 @@ class RouteRegistrationService {
 
     return {
       alreadyRegistered: visaIdentical && guidanceIdentical,
-      countryName: countrySnap.exists ? String((countrySnap.data() as { name?: string }).name ?? "") : undefined,
+      countryName: countrySnap?.exists ? String((countrySnap.data() as { name?: string }).name ?? "") : undefined,
       crawlWindow: source?.crawlWindow ?? null,
       weekday,
     };

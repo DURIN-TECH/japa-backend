@@ -97,13 +97,25 @@ scrapers/
                                        schema + the in-code schema check of the answer
     rubric-validate.ts                 structural validator (kind rules, id joins, intent flag)
     rubric.store.ts                    visaRubrics head + rubricVersions; writes pending only;
-                                       getApprovedRubric is the only consumer read
+                                       getApprovedRubric(ByKey) is the only consumer read
+    rubric-key.ts                      (#233) rulebook keys {authorityId}_{routeSlug} for any
+                                       issuing authority (country, bloc, treaty); reads the parts
+                                       of a document stored before #233 (no data move)
+    rubric-stack.ts                    (#233) loadRulebookStack: the approved version of every
+                                       layer of a route (shared first, own last) merged into one
+                                       served view; a missing layer is reported; a single layer is
+                                       served unchanged. Consumers reach it through
+                                       services/ai/application-rulebook.ts
+    rubric-competence.ts               (#235) the one code check of a shared rulebook's competence
+                                       steps ("which member country examines the application"),
+                                       used by drafting, the validator and the read side
     rubric-settings.ts                 appConfig/rubricExtractionSettings: kill switch + caps
     rubric-publish-settings.ts         appConfig/rubricPublishSettings: auto-publish mode (fails
                                        closed to `manual`), allowlist, gate numbers (#201)
     rubric-gates.ts                    PURE automatic gates: flag table, leave-outs, shrink guard,
                                        leave-out budget, protected rules, sample audit (#201)
-    scripts/                           extract-rubric (CLI, dry run by default);
+    scripts/                           extract-rubric (CLI, dry run by default; #233: a bloc or
+                                       treaty layer with --authority=<id> --slug=<shared route id>);
                                        publish-rubric (#201: run the auto-publish pipeline on a
                                        pending draft; --project required, --dry-run, --skip-checker)
 ```
@@ -175,9 +187,27 @@ Two defects found by the first real run (a "protected" bar rejected by the indep
   - Not readable cleanly (`no_list_follows`, `item_too_long` over 2000 characters, `ambiguous_list_end`, `nested_unmarked_lead_in`, `pdf_layout_lost`): the rule is kept without items and flagged **`list_not_readable`**, a leave-out flag, so the gates HOLD a protected rule and leave out an ordinary one, by that named reason. A list is never truncated and a lead-in is never published alone. PDF pages lose their line layout (wrapped lines), so a lead-in quoted from a PDF is held; the same rule printed on a web page is read.
   - The checker is shown `listItems`; a lead-in quote with no verified items has no check view, so it cannot pass.
 - **A group that is not purely a nationality.** `appliesTo.nationalities` / `asWritten` stay parallel for real nationalities. Members that are not nationalities go in **`appliesTo.uncoded`**: verbatim in the quote (`uncodedNameSupported`: `groupNameSupported` without its capital-letter rule, which would refuse "right of abode"; a lower-case entry must be a phrase of two words or more), no code ever made up. A bar needs at least one coded or uncoded member. `reviewFlagsFor` lists uncoded members in the "confirm every code" flag.
-- **Serving.** Code still decides only the coded members (`mandatoryBarHits`). A bar with uncoded members is also put to the assessment model in full (quote, list lines, group) through `judgementCriteriaOf`; the model can only raise a concern on it. It is never read as "applies to nobody" or "applies to everybody". How an applicant with such a status is asked and matched is a product question (not built).
+- **Serving.** Code still decides only the coded members (`mandatoryBarHits`). A bar with uncoded members is also put to the assessment model in full (quote, list lines, group) through `judgementCriteriaOf`; the model can only raise a concern on it. (Since #248 that concern is a credibility flag marked as a bar; before, assembly dropped it. A bar served without its unconfirmed trigger is judged the same way and not decided by code at all, see #248 below.) It is never read as "applies to nobody" or "applies to everybody". How an applicant with such a status is asked and matched is a product question (not built).
 - Prompt versions: extraction `2026-11-rubric-v8`, check `2026-11-checker-v5` (v6 since #242, below), re-draft `2026-11-repair-v3`. Both fields are optional: earlier stored versions load unchanged.
 - Re-check two saved rules without a re-extraction: `scripts/recheck-list-and-group.ts` (offline by default; `--live` runs the two-model check on only those rules).
+
+## Groups decided from what the applicant holds (issue #234, P5 of #228)
+
+- **The applicant's facts.** The profile holds `nationalities` (one or more codes), `residentialCountry` and `heldDocuments` (`visa` / `residence_permit` / `travel_authorisation`, issuer country code OR authority id, `validUntil`, a private note), written only through `/users/me/holdings`. When an application starts they are copied onto it as `applicantFacts` with `takenAt` (`applicantFactsFromUser`, the intake-answers pattern). Assessment reads the COPY (`factsFromApplicantFacts`); an application with no copy falls back to the latest eligibility check's nationality (dev data only).
+- **Bar groups.** `appliesTo.groups` (optional, additive) holds coded members decided from those facts: `residence` (`code`), `holds` (`document`, `issuer`) and `members_of` (`authorityId`, `fact`: nationality or residence, resolved through `authorities/{id}/members` on the application's START date). Each carries `asWritten`, checked against the quote like the nationality names. Stored `appliesTo.nationalities` / `asWritten` are read as `nationality` members by `groupsOf` (services/ai/applicant-groups.ts): **no stored version is rewritten**. Uncoded members stay uncoded.
+- **Never guess.** `decideMandatoryBars` returns hits and bars it could not decide: a fact not stated, or an authority with no recorded members, is "could not be assessed: we need to know your nationality" (`notAssessed: "missing_fact"`), never "applies" nor "does not apply". Several nationalities: any one matches. An expired held document never matches. `notCodeDecided` bars and uncoded members are still never decided by code (#222, #248); every bar keeps both model checks (`isProtectedRule`: any rule with `appliesTo`).
+- **Fact triggers.** `criterion.factTrigger = { fact: nationality | residence | holds, anyOf }` (holds values `kind:issuer`), beside the question trigger, read by `resolveApplicability` with an `ApplicantContext`. With both triggers the rule applies only when both hold. Extraction does not draft fact triggers yet.
+- **Drafting.** The drafting prompt (`2026-11-rubric-v11`) may propose `groups` members only with the quote's own wording; codes only when the quote names that country; authority ids only from the "Blocs and treaties" list the criteria call carries (active bloc / treaty authorities, pinned on the job; `rawGroupProblem` refuses any other). Anything else stays in `uncoded`. The check (`2026-11-checker-v7`) is shown `groups` (only on rules that have them) and judges them under `group_matches_codes`; re-draft `2026-11-repair-v5`. The intake call is unchanged.
+- **What reaches the model.** `factsSummaryForModel`: nationality codes (as before, now all of them); residence and VALID held documents (kind, issuer, date) only when an applicable rule reads them or a judged bar exists. The applicant's note never.
+
+## Which country do I apply through (issue #235, P6 of #228)
+
+- **The block.** A SHARED (bloc / treaty) rulebook may carry `competence: { steps }` (types/rubric.ts `CompetenceStep`): an ordered list, each step resting on a rule of the same layer (`criterionId`, its verbatim `source` quote and URL copied by code), the words of that quote it applies (`restsOn`, checked verbatim), a `questionId`, an optional `when` (all conditions must hold, `IntakeCondition` shape) and `resultFrom: "answer"`. Absent on every existing rulebook and on any country's own rulebook (refused there).
+- **Questions with member options.** A step reads a choice question with `optionsFrom: "route_destinations"`. Its stored version holds NO country option (the validator refuses one; drafting drops any the model typed in). The intake service and the "apply through" service list the members from membership data on the day of asking (`services/route-destinations.ts`, through `sharedRouteService.destinationsOn` / `expandDestinations`), then the question's own non-country options.
+- **Drafting.** The intake call (`2026-11-rubric-v12`) may return `competenceSteps` only when the excerpt states which member examines an application; a basis the excerpt leaves to the applicant ("length or purpose") is asked, never chosen. Code builds the block in `mergeAssessments` and keeps it only when EVERY step passes `competenceProblems` (one failing step drops the whole block: the steps are an order). The criteria call is unchanged, so the re-draft prompt (`2026-11-repair-v5`) and the rule check (`2026-11-checker-v7`) are unchanged.
+- **Checked like any rule.** The rule a step rests on is an ordinary rule of the draft, so the independent check reads it; on the read side `applyExclusions` serves the block only while every step still passes against the served view (its rule kept and unchanged, its question asked). Otherwise there is no block and the applicant simply picks. The wording check is shown one fixed data line for a destination question's member options.
+- **Stacks.** `rubric-stack.ts` scopes a shared layer's steps like its questions and serves the block of the ONE shared layer that has one (two: none).
+- **Resolver and API.** `services/competence.service.ts`: `resolveCompetence` (pure), `GET|POST /shared-routes/:id/apply-through`, `POST /applications` with `sharedRouteId` + `throughCountryCode`, `PUT /applications/:id/through-country`.
 
 ## Non-English sources (`language/`, `rubric-translation.ts`, `rubric-language-eval.ts`; issue #220, part P5 of #211)
 
@@ -293,6 +323,18 @@ Bars already get one automatic re-draft (#223). Since #244 an ORDINARY rule the 
 
 **Estimate offline.** `npm run build && node lib/scrapers/rubric/scripts/replay-check-verdicts.js --rules <stored.json> --primary <sourceId> --repair [--rates 0.5,0.62,0.75]` prints the eligible rules, the guard, the request estimate against the cap and the shares under stated repair-success assumptions. Zero requests; the success rates are assumptions, not measurements.
 
+## A bar whose trigger is not confirmed: served without it, judged, never code-decided (issue #248)
+
+Before #248 a bar (a mandatory bar on a named group) whose rule BOTH check models confirmed on every judged aspect, but whose `trigger` (the intake question and answers that narrow which applicants it is put to) they did not, held the whole rulebook: `trigger_not_repairable` on the rule as drafted, `failed_check` / `trigger_not_confirmed` on its one re-draft. Now neither holds.
+
+- **What happens.** The bar (as drafted, or its re-draft from #223) is served with the trigger REMOVED and is NEVER decided by code. The check returns it in `droppedTriggerIds` (as for an ordinary rule) and in `judgedBars`; a repaired one keeps status `repaired` with `detail: trigger_not_confirmed_served_judged`. A bar that fails any ASPECT (title, kind, condition, check, group) with either model is handled exactly as before (one re-draft, then hold). Any protected rule that is not a bar (an objective or judgement rule scoped to a group) still holds on its trigger alone (`servableWithoutTrigger`). No threshold, prompt, request or ordinary rule changed.
+- **Why it is safe, both ways.** A barred applicant told they may apply: removing a trigger only WIDENS who the bar is put to, so it cannot hide the bar from anyone its condition covers. An eligible applicant wrongly barred: a bar code decides from nationality would, without its trigger, bar EVERY applicant of that nationality, so such a bar is never decided by code.
+- **Where the mark lives.** Nowhere stored. The question plan's `droppedTriggerCriterionIds` (already written by the pipeline with the approval) now may list a bar; `applyExclusions` (the one read-side filter, behind `getApprovedRubric`) removes its trigger AND sets `notCodeDecided: true` on the served rule (`isJudgedBarShape`: kind `mandatory_bar`). It is derived on every read, so the same stored version always serves the same rule, and a stored `notCodeDecided` is stripped (only this filter can stop code deciding a bar). A version approved before #248 never lists a bar there, so it reads exactly as before.
+- **The question links.** The removed trigger's question stops linking to the bar (both `criterionIds` and `intakeQuestionIds`), but only when the question still serves another rule: a question is never orphaned or deleted, so its answer still reaches the assessment model. The question plan is built on that view.
+- **Serving** (`services/ai`). `mandatoryBarHits` skips a `notCodeDecided` bar; `judgementCriteriaOf` includes it (`isJudgedBar`: uncoded members, #222, or `notCodeDecided`); the model is shown its quote and list lines, "NOT decided by code", the group AS WRITTEN and the original condition words (`applicabilityCondition`), never its codes; `resolveApplicability` puts it to EVERY applicant (never "could not tell"), and `effectiveIntakeQuestions` keeps a question only it reads. A concern the model raises on a judged bar (#222's uncoded bars included) is now a credibility flag with `isMandatoryBar: true`; before #248 such a concern was dropped at assembly, so "the model can raise a concern" had no effect. It is never a refusal ground and never `hasBlockingRule`; a bar code already refused on for this applicant is not flagged twice; a concern on an objective rule or a bar the model was not shown is still ignored. What protection remains for an applicant the bar really covers: no code refusal; the model reads the rule against their answers and statement and a concern caps their readiness below strong and becomes a "check with your agent" action. That is weaker than a code refusal and is the accepted price of not barring eligible applicants by nationality alone.
+- **Record and words.** `rubricPublishRuns.barsJudgedWithoutTrigger` (`criterionId`, `ruleRef`, `title`, `replaced`, `removedTrigger`), a gate line `bars_judged_without_trigger`, a section in the published (and held) alert, and `barsJudgedWithoutTrigger` on the approval's audit entry (`criterionId`, `title`, `note`), all with the fixed wording `JUDGED_BAR_NOTE`. Such a bar is not counted in `conditional_rules_without_trigger` / `specialist_rules_unanchored`.
+- **Re-running a held draft.** The check's answers, the re-draft and the replacement's check are already stored, so this change alone makes zero model requests (`rubric-bar-trigger.test.ts`, `rubric-bar-trigger-e2e.test.ts`). Steps that never ran because the bar held (the ordinary re-drafts of #244, the question plan) run then, with their usual caps.
+
 ## The check is shown where a rule's condition comes from (issue #242, part of #240)
 
 In the first real run 69 rules were `unsure` on `condition_faithful` because the condition is a section heading or a list lead-in far above the quote (outside the 400-character window), or is the intake question that decides who the rule applies to, and 70 judgement rules were `unsure` on `kind_right` because the check defined `judgement` more narrowly than the drafter. Checker prompt `2026-11-checker-v6` (stored answers of v5 are not reused: the request content and the prompt both changed) fixes the CONTEXT, not the standard: "Never guess `yes`. When in doubt, answer `unsure`." and every verdict meaning are unchanged, and nothing turns `unsure` into `yes`.
@@ -404,6 +446,43 @@ version keeps serving, admins are alerted). Admins can still reject, roll back
 - **Run on an existing draft**: `POST /admin/rubrics/:id/auto-publish`
   (`?dryRun=true` writes nothing) or
   `npm run publish:rubric -- --project <id> --route <routeKey> --version <n> [--dry-run] [--skip-checker]`.
+
+## The layer check: a country's own layer against its shared layer(s) (`rubric-layer-check.ts`; issue #233, P4b of #228)
+
+A route that inherits a shared (bloc / treaty) route is served as a STACK
+(`rubric-stack.ts`). After a country's OWN layer drafts, and only when the
+automatic publisher is about to publish it (the last step of the pipeline, so a
+held draft spends nothing on it), an independent reader compares each of its
+rules with the approved shared layer's rules on the same subject.
+
+- **Prompt**: `LAYER_CHECK_SYSTEM_PROMPT`, version `LAYER_CHECK_PROMPT_VERSION`
+  (`layer-check-2026-11-14.1`), recorded on every run. Role `verification` (the
+  checker's independent reader, never the extractor's model).
+- **Evidence**: ONLY the two verbatim quotes, under batch-local ids. Closed
+  answers: per national rule, the shared ids it shares a subject with and one of
+  `same_requirement | adds_to | disagrees | unsure`, re-validated in code (any
+  other shape: `output_invalid`). The model never writes or changes a rule.
+- **What code makes of it** (`decideLayerLinks`): `disagrees` is a
+  `layerConflicts` entry (both quotes and URLs); `same_requirement` is a
+  `restates` link only when it is the rule's single twin, the rule has no
+  `disagrees`/`unsure` answer, and `linkRefusal` passes (same kind,
+  applicability, trigger presence, coded check and bar groups; the national rule
+  not more severe). Refused links and `unsure` pairs are recorded; nothing else.
+- **Not checked**: over a cap (refused before any call), a provider failure, a
+  refusal or an unusable answer give `status: "not_checked"` with the reason and
+  the spend so far, and NOTHING is linked or flagged (repeats stay duplicated).
+- **Spend**: hard caps per run (`DEFAULT_LAYER_CHECK_LIMITS`: 40 calls, 400,000
+  tokens), lowered further by the publish settings' `checkerMaxRequestsPerRun` and
+  `checkerRequestTimeoutMs`. One run per version (the pipeline's run record).
+- **Written** with the automatic approval as `layerCheck` + `layerConflicts`
+  (planner-writable review fields), shown in `GET /admin/rubrics/:id`, and as a
+  `layer_check` gate line of the run record. It NEVER holds a draft.
+- **Read side**: the merge folds an honoured link (the national rule leaves the
+  merged `criteria`, is listed on its twin's `restatedBy` with its own quote and
+  URL, its only-own question is not asked again, its document items name the
+  twin) and tags both sides of a conflict (`layerConflictWith`). A link is
+  honoured only while the twin is served with the compared quote and the guards
+  still hold. A single-layer route is untouched.
 
 ## Independent AI check of every rule (`rubric-checker.ts`, `rubric-checker-prompt.ts`; issue #202, part B of #200)
 

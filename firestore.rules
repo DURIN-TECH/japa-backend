@@ -636,7 +636,9 @@ service cloud.firestore {
     //    metadata of its immutable text snapshots (issue #39). Admins read
     //    the registry via GET /admin/guidance-sources. Do NOT add a match.
     //  - visaRubrics/{routeKey} and its rubricVersions/{version}
-    //    subcollection, and rubricExtractionRuns/{runId}: rubrics extracted
+    //    subcollection (with, for a large version, its
+    //    rubricVersions/{version}/rubricVersionParts/{n} parts, issue #278),
+    //    and rubricExtractionRuns/{runId}: rubrics extracted
     //    from caseworker guidance, staged `pending_review` for an admin, and
     //    the record of each extraction run (issue #40). Consumers only ever
     //    get an APPROVED version, through the backend. Do NOT add a match.
@@ -692,6 +694,21 @@ service cloud.firestore {
     // /admin/visas). Denied for every client, admins included, so the
     // unreviewed text can never be read or forged directly.
     match /visaRevisions/{revisionId} {
+      allow read, write: if false;
+    }
+
+    // ---- In-app tester feedback (issue #257), explicit deny ----
+    // feedback/{id}: notes (and the user id, email and device details that
+    // come with them) sent from the mobile app. Written by the backend only
+    // (POST /feedback); the team reads them in the Firestore console and by
+    // email. Denied for every client, admins included.
+    match /feedback/{feedbackId} {
+      allow read, write: if false;
+    }
+
+    // feedbackUploadLimits/{uid}__{hour}: rate-limit counters for feedback
+    // screenshot upload URLs (issue #257). Backend only.
+    match /feedbackUploadLimits/{limitId} {
       allow read, write: if false;
     }
   }

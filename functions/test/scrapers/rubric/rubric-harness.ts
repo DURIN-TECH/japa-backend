@@ -291,6 +291,9 @@ export function makeHarness(deps: Partial<RubricExtractionDeps> = {}): Harness {
     loadSettings: async () => ({ settings: h.settings, ...(h.state.readError ? { readError: h.state.readError } : {}) }),
     visaTypeExists: async (cc, id) => h.state.knownVisaTypes.has(`${cc}/${id}`),
     now: () => Timestamp.fromMillis(h.state.nowMs),
+    // (#225) No onboarding run exists in the rubric tests: the re-draft guard
+    // lets every start through (the onboarding tests wire the real guard).
+    redraftGuard: { guardedRedraft: async (_input, start) => ({ kind: "ran", result: await start(), settled: false }) },
     ...deps,
   });
   return h;
@@ -309,6 +312,8 @@ export async function installRubricFakes(): Promise<void> {
   firebase.collections.appConfig = fakeCollection("appConfig");
   firebase.subcollections.guidanceSnapshots = (id: string) => fakeCollection(`guidanceSources/${id}/snapshots`);
   firebase.subcollections.rubricVersions = (key: string) => fakeCollection(`visaRubrics/${key}/rubricVersions`);
+  // (#278) The parts of a large version (read back by the store's dual read).
+  firebase.subcollections.rubricVersionParts = (key: string, version: number) => fakeCollection(`visaRubrics/${key}/rubricVersions/${version}/rubricVersionParts`);
   firebase.subcollections.visaTypes = (cc: string) => fakeCollection(`countries/${cc}/visaTypes`);
 }
 

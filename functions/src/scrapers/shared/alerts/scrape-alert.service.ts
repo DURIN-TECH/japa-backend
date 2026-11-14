@@ -31,6 +31,8 @@ import {
   evaluateLinkedSurcharge,
   evaluateMissedWindows,
   evaluateReviewQueue,
+  evaluateChecklistShrink,
+  type ChecklistShrinkRow,
   evaluateRunFailed,
   evaluateRunNoLongerStuck,
   evaluateStuckRuns,
@@ -106,6 +108,8 @@ const BACKOFF_LOOKBACK_RUNS = 20;
 const LATEST_RUN_LOOKBACK = 10;
 /** Open review-queue changes read at most (they are counted, not listed). */
 const REVIEW_QUEUE_MAX_CHANGES = 500;
+// Issue #212: most open proposal rows the shrink rule reads in one pass.
+const CHECKLIST_SHRINK_MAX_ROWS = 2000;
 /** Admin list defaults (GET /admin/scrape-alerts). */
 export const SCRAPE_ALERT_LIST_DEFAULT_LIMIT = 25;
 export const SCRAPE_ALERT_LIST_MAX_LIMIT = 100;
@@ -156,6 +160,7 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   rubric_auto_published: "rulebook published automatically",
   rubric_draft_held: "rulebook draft held",
   route_onboarding_attention: "route onboarding needs attention",
+  checklist_shrink: "visa checklist would shrink",
 };
 
 /** Cloud Logging severity per alert severity (resolutions log as INFO). */
@@ -352,6 +357,16 @@ export class ScrapeAlertService {
           evals.push(evaluateNoYieldSources((await this.sourceFacts("news")) as NewsSourceFacts[], config));
         });
       }
+      // Issue #212: a visa run may just have created / replaced a proposal that
+      // shrinks a checklist. Evaluated over all open rows (a superset of the
+      // run's own), so the alert appears now instead of at :45.
+      if (run.kind === "visa") {
+        await this.isolated("checklist_shrink", skippedRules, async () => {
+          const rows = await this.checklistShrinkRows();
+          if (!rows) throw new Error("too many open visa change rows to evaluate checklist_shrink safely");
+          evals.push(evaluateChecklistShrink(rows, config));
+        });
+      }
       return await this.finish(evals, config, nowMs, skippedRules, false, deferEmail);
     } catch (err) {
       this.engineError("finalize", err, run.id);
@@ -454,6 +469,13 @@ export class ScrapeAlertService {
       // ---- Review queue ----
       await this.isolated("review_queue_stale", skippedRules, async () => {
         evals.push(evaluateReviewQueue(await this.reviewQueueItems(nowMs, config), nowMs, config));
+      });
+
+      // ---- Issue #212: proposals that would shrink a visa's checklist ----
+      await this.isolated("checklist_shrink", skippedRules, async () => {
+        const rows = await this.checklistShrinkRows();
+        if (!rows) throw new Error("too many open visa change rows to evaluate checklist_shrink safely");
+        evals.push(evaluateChecklistShrink(rows, config));
       });
 
       const result = await this.finish(evals, config, nowMs, skippedRules, true);
@@ -1004,6 +1026,44 @@ export class ScrapeAlertService {
     }
     const snap = await (kind === "visa" ? collections.visaSources : collections.newsSources).get();
     return snap.docs.map((d) => ({ ...(d.data() as Record<string, unknown>), id: d.id }) as VisaSourceFacts | NewsSourceFacts);
+  }
+
+  /**
+   * Issue #212: the open pendingVisaChanges rows that carry a requiredDocuments
+   * diff, as plain facts for evaluateChecklistShrink. One equality query
+   * (`status == "open"`), served by the single-field index like the other
+   * open-row reads; never read partially: past CHECKLIST_SHRINK_MAX_ROWS it returns undefined and the rule is skipped (not cleared).
+   */
+  private async checklistShrinkRows(): Promise<ChecklistShrinkRow[] | undefined> {
+    const snap = await collections.pendingVisaChanges.where("status", "==", "open").limit(CHECKLIST_SHRINK_MAX_ROWS + 1).get();
+    // More open rows than we read: the scope ("every shrink key") would auto-resolve
+    // live alerts for rows we never saw, so skip this evaluation (the caller logs it).
+    if (snap.size > CHECKLIST_SHRINK_MAX_ROWS) return undefined;
+    const rows: ChecklistShrinkRow[] = [];
+    for (const d of snap.docs) {
+      const row = d.data() as {
+        countryCode?: string;
+        visaId?: string;
+        revision?: number;
+        diff?: Array<{ field?: string; removed?: unknown }>;
+        current?: { requiredDocuments?: unknown };
+        proposed?: { requiredDocuments?: unknown };
+      };
+      const entry = (row.diff ?? []).find((x) => x.field === "requiredDocuments");
+      if (!entry || !row.countryCode || !row.visaId) continue;
+      const removed = Array.isArray(entry.removed) ? entry.removed.map(String) : [];
+      const count = (v: unknown) => (Array.isArray(v) ? v.length : 0);
+      rows.push({
+        changeId: d.id,
+        countryCode: row.countryCode,
+        visaId: row.visaId,
+        revision: row.revision ?? 1,
+        liveCount: count(row.current?.requiredDocuments),
+        proposedCount: count(row.proposed?.requiredDocuments),
+        removed,
+      });
+    }
+    return rows;
   }
 
   /**

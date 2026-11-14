@@ -81,7 +81,8 @@ describe("the prompts say a quote may be in any language", () => {
   // Pins (additive, like the extraction prompt's): changing a prompt without a bump fails here.
   test("the check prompts and schema match the hash pinned for their version", () => {
     const PINNED: Record<string, string> = {
-      "2026-11-checker-v6": sha(`${CHECKER_SYSTEM_PROMPT}\n${JSON.stringify(buildVerdictSchema())}\n${CHECKER_POLARITY_SYSTEM_PROMPT}`),
+      // (#234) v7: `appliesTo.groups` (the hash literal below moved with the bump).
+      "2026-11-checker-v7": sha(`${CHECKER_SYSTEM_PROMPT}\n${JSON.stringify(buildVerdictSchema())}\n${CHECKER_POLARITY_SYSTEM_PROMPT}`),
     };
     // The literal below is the hash at the time of the bump; recompute and re-pin ONLY with a version bump.
     assert.equal(PINNED[CHECKER_PROMPT_VERSION], CHECKER_PINNED_HASH);
@@ -91,7 +92,7 @@ describe("the prompts say a quote may be in any language", () => {
 });
 
 // Pinned at the #242 bump (v6; v5 was 894d66bb... at the #220 bump). v5 was #220's language wording merged with #226's bar-stage wording. Another change to these prompts needs its own version bump and a new pin here.
-const CHECKER_PINNED_HASH = "6c9410ad8e9df18e7cab534cde25cc74e40a92e2527ccac25c79dd409901d49e";
+const CHECKER_PINNED_HASH = "9e49085b9ac950adf79e7ddc5d583ca718d75cd2c674e76149ee2e40f3aa9070";
 const QUESTION_PINNED_HASH: Record<string, string> = { "question-check-2026-11-14.1": "9ac4afe53da9d37bc3331164ec2e4ce41d37f8e4b5e8466654e09dc82f42509b" };
 
 describe("the rule check over a Spanish rule", () => {

@@ -753,3 +753,130 @@ describe("visaChangeController — status codes, validation, authz", () => {
     for (const action of ["read", "approve", "reject"]) assert.equal(admin.can(action, "VisaChange"), true);
   });
 });
+
+// ============================================
+// Issue #212: the checklist shrink guard + normalised diff
+// ============================================
+
+describe("requiredDocuments diff — shrink guard (issue #212)", () => {
+  /** A live visa listing `items` with a verbatim quote for each. */
+  async function seedLiveWithDocs(items: string[], quotes: boolean = true): Promise<void> {
+    await seedLive();
+    const cur = store.get(VISA_PATH)!;
+    const scrapeMeta = { ...(cur.scrapeMeta as any), citations: quotes ? Object.fromEntries(items.map((t, i) => [`requiredDocuments.${i}`, `quote of ${t}`])) : {} };
+    store.set(VISA_PATH, { ...cur, requiredDocuments: items, scrapeMeta });
+  }
+  const docs = (items: string[]) => ({
+    requiredDocuments: items,
+    citations: Object.fromEntries(items.map((t, i) => [`requiredDocuments.${i}`, t])),
+  });
+
+  test("a shrinking extraction creates an open row with removedDetails (item + the live visa's own quote); the live list is untouched", async () => {
+    await seedLiveWithDocs(["a passport", "a photo", "a TB test"]);
+    const liveBefore = clone(store.get(VISA_PATH));
+    const mark = writes.length;
+    const r = await ingest(extraction(docs(["a photo"])), "h2");
+    assert.equal(r.outcome, "proposed");
+    assert.deepEqual(store.get(VISA_PATH), liveBefore);
+    assert.equal(visaWritesSince(mark).length, 0);
+    const [, row] = onlyRow();
+    const d = (row.diff as any[]).find((x) => x.field === "requiredDocuments");
+    assert.deepEqual(d.removed, ["a passport", "a TB test"]);
+    assert.deepEqual(d.removedDetails, [
+      { item: "a passport", quote: "quote of a passport" },
+      { item: "a TB test", quote: "quote of a TB test" },
+    ]);
+  });
+
+  test("a removed item the live visa has no quote for carries no quote", async () => {
+    await seedLiveWithDocs(["a passport", "a photo"], false);
+    await ingest(extraction(docs(["a photo"])), "h2");
+    const d = (onlyRow()[1].diff as any[]).find((x) => x.field === "requiredDocuments");
+    assert.deepEqual(d.removedDetails, [{ item: "a passport" }]);
+  });
+
+  test("an empty proposed list shows every live item as removed; a newer shrinking extraction replaces the open row", async () => {
+    await seedLiveWithDocs(["a passport", "a photo"]);
+    await ingest(extraction(docs([])), "h2");
+    const [id, first] = onlyRow();
+    let row = first;
+    assert.deepEqual((row.diff as any[]).find((x) => x.field === "requiredDocuments").removed, ["a passport", "a photo"]);
+    await ingest(extraction(docs(["a photo"])), "h3");
+    row = onlyRow()[1];
+    assert.equal(onlyRow()[0], id);
+    assert.equal(row.revision, 2);
+    assert.deepEqual((row.diff as any[]).find((x) => x.field === "requiredDocuments").removed, ["a passport"]);
+  });
+
+  test("curly vs straight apostrophes are the same item: no remove + add", async () => {
+    await seedLiveWithDocs(["your parents' names", "a photo"]);
+    // The re-crawl text now carries the curly apostrophe; everything else is identical.
+    const r = await ingest(extraction(docs(["your parents’ names", "a photo"])), "h2");
+    assert.equal(r.outcome, "unchanged");
+    assert.equal(rows().length, 0);
+  });
+
+  test("itemKey (used by the diff) is exactly normForQuote", async () => {
+    const { itemKey } = await import("../../../../src/scrapers/visa-catalog/required-document-meta");
+    for (const s of ["Your parents’ names", "a – b — c", "  Two   spaces ", "“quoted”"]) {
+      assert.equal(itemKey(s), extractMod.normForQuote(s));
+    }
+  });
+});
+
+// ============================================
+// Issue #212: approving a proposal with missing items needs the acknowledgement
+// ============================================
+
+describe("approveChange — missingFromExtraction acknowledgement (issue #212)", () => {
+  const missing = [{ text: "a passport", leadIn: "", section: "s", appended: true }];
+  /** Propose a change whose scrapeMeta records `missingFromExtraction`. */
+  async function proposedWithMissing(list: unknown[] | undefined): Promise<string> {
+    await seedLive();
+    await ingest(extraction({ processingDaysMax: 30, ...(list ? { missingFromExtraction: list as any } : {}) }), "h2");
+    return onlyRow()[0];
+  }
+
+  test("non-empty and not acknowledged: 409 MISSING_ITEMS_UNACKNOWLEDGED, nothing written, row stays open", async () => {
+    const id = await proposedWithMissing(missing);
+    const mark = writes.length;
+    await assert.rejects(changes.approveChange(id, "admin-1"), { code: "MISSING_ITEMS_UNACKNOWLEDGED", httpStatus: 409 });
+    assert.equal(visaWritesSince(mark).length, 0);
+    assert.equal(store.get(`pendingVisaChanges/${id}`)!.status, "open");
+    // Through the controller.
+    const out = await call("approve", req(ROLES.ADMIN, { params: { id } }));
+    assert.equal(out.status, 409);
+    assert.equal(out.body.error, "MISSING_ITEMS_UNACKNOWLEDGED");
+    // A non-boolean flag is a 400.
+    const bad = await call("approve", req(ROLES.ADMIN, { params: { id }, body: { acknowledgeMissingItems: 1 } }));
+    assert.equal(bad.status, 400);
+  });
+
+  test("acknowledged: approves, stores who and when on the visa", async () => {
+    const id = await proposedWithMissing(missing);
+    const out = await call("approve", req(ROLES.ADMIN, { params: { id }, body: { acknowledgeMissingItems: true } }));
+    assert.equal(out.status, 200);
+    const after = store.get(VISA_PATH)!;
+    assert.equal(typeof after.missingItemsAcknowledgedBy, "string");
+    assert.ok((after.missingItemsAcknowledgedBy as string).length > 0);
+    assert.ok(after.missingItemsAcknowledgedAt instanceof Timestamp);
+    assert.deepEqual((after.scrapeMeta as any).missingFromExtraction, missing);
+  });
+
+  test("an approve with nothing missing clears an old acknowledgement", async () => {
+    const id = await proposedWithMissing([]);
+    store.set(VISA_PATH, { ...store.get(VISA_PATH)!, missingItemsAcknowledgedBy: "someone", missingItemsAcknowledgedAt: Timestamp.now() });
+    await changes.approveChange(id, "admin-1");
+    assert.equal("missingItemsAcknowledgedBy" in store.get(VISA_PATH)!, false);
+    assert.equal("missingItemsAcknowledgedAt" in store.get(VISA_PATH)!, false);
+  });
+
+  test("[] and an absent field approve as today", async () => {
+    for (const list of [[], undefined]) {
+      resetStore();
+      const id = await proposedWithMissing(list as any);
+      await changes.approveChange(id, "admin-1");
+      assert.equal("missingItemsAcknowledgedBy" in store.get(VISA_PATH)!, false);
+    }
+  });
+});

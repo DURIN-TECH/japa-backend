@@ -76,6 +76,15 @@ export function isPaystackReferenceNotFound(err: unknown): boolean {
   return !!err.providerMessage && REFERENCE_NOT_FOUND_MESSAGES.test(err.providerMessage.trim());
 }
 
+/**
+ * `CreateCheckoutInput` (shared contract from @durin-tech/authz) plus an
+ * optional per-request `callbackUrl` (issue #252). When set it overrides the
+ * provider default `PAYSTACK_CALLBACK_URL`, e.g. so a mobile-initiated
+ * checkout returns to the app return page instead of the portal. Kept local
+ * (not in the shared package) because only the Paystack provider reads it.
+ */
+export type PaystackCheckoutInput = CreateCheckoutInput & { callbackUrl?: string };
+
 interface PaystackInitData {
   authorization_url: string;
   access_code: string;
@@ -141,9 +150,15 @@ export class PaystackProvider implements BillingProvider {
    * Initialize a Paystack transaction. If the plan maps to a Paystack plan code
    * (passed via metadata.paystackPlanCode), Paystack auto-creates a recurring
    * subscription; otherwise it's a one-off charge for the plan amount.
+   *
+   * Issue #252: `input.callbackUrl`, when given, is where Paystack sends the
+   * payer afterwards (same override `initializeCharge` already had); without
+   * it the provider default `PAYSTACK_CALLBACK_URL` applies, unchanged.
    */
-  async createCheckout(input: CreateCheckoutInput): Promise<CheckoutSession> {
+  async createCheckout(input: PaystackCheckoutInput): Promise<CheckoutSession> {
     const planCode = input.metadata?.paystackPlanCode;
+    // Per-request override first, then the deploy-time default (may be unset).
+    const callback = input.callbackUrl ?? this.callbackUrl;
     const payload: Record<string, unknown> = {
       email: input.email,
       amount: input.amountKobo,
@@ -155,7 +170,7 @@ export class PaystackProvider implements BillingProvider {
         ...input.metadata,
       },
       ...(planCode ? { plan: planCode } : {}),
-      ...(this.callbackUrl ? { callback_url: this.callbackUrl } : {}),
+      ...(callback ? { callback_url: callback } : {}),
     };
 
     const res = await this.client().post<{ data: PaystackInitData }>(

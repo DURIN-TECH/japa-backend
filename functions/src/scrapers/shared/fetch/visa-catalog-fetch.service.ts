@@ -9,6 +9,18 @@ import { HostBackoffError, backoffDelayMs, isBackoffStatus } from "../etiquette/
 // PDF support (issue #33): detection, limits and text extraction live in
 // pdf-text.ts; this service only routes a PDF response to it.
 import { DEFAULT_PDF_LIMITS, PdfFetchError, PdfLimits, PdfText, extractPdfText, isPdfResponse } from "./pdf-text";
+// EU law reader (issue #261): the pure rules for publications.europa.eu CELEX
+// addresses (headers, redirect policy, marker stripping). Applied only when
+// `isEuLawCelexUrl(url)` is true; every other address is untouched.
+import {
+  EU_LAW_MAX_TEXT_CHARS,
+  EU_LAW_REQUEST_HEADERS,
+  euLawHttpErrorMessage,
+  euLawRedirectHostCheck,
+  isAcceptableEuLawFinalUrl,
+  isEuLawCelexUrl,
+  stripConsolidationMarkers,
+} from "./eu-law";
 
 // ============================================
 // VISA CATALOG — FETCH SERVICE (Step 2)
@@ -724,10 +736,19 @@ export class VisaCatalogFetchService {
   private async fetchBody(
     url: string,
     acceptPdf: boolean,
-    allowedHost?: (host: string) => boolean
+    allowedHost?: (host: string) => boolean,
+    // Issue #261: true for a publications.europa.eu CELEX address. Adds the
+    // two machine-route headers, confines redirects to that host, reports a
+    // non-2xx answer in plain words and allows the long-document byte cap.
+    euLaw = false
   ): Promise<{ kind: "html" | "pdf"; body: Buffer | string; status: number; finalUrl: string }> {
     const host = this.hostOf(url);
     await this.rateLimit(host);
+    // Redirect policy for this request: the caller's host policy (issue #215)
+    // AND, for EU law, "stay on publications.europa.eu". Both must pass.
+    const hopCheck: ((h: string) => boolean) | undefined = euLaw
+      ? (h) => euLawRedirectHostCheck(h) && (allowedHost ? allowedHost(h) : true)
+      : allowedHost;
     let resp: Awaited<ReturnType<VisaCatalogHttpClient["get"]>>;
     try {
       resp = await this.http.get(url, {
@@ -737,7 +758,10 @@ export class VisaCatalogFetchService {
         // actual kind is enforced below, while reading.
         maxContentLength: Math.max(MAX_HTML_BYTES, this.pdfLimits.maxBytes),
         // Issue #215: refuse a redirect hop to a refused host before it is requested.
-        ...(allowedHost ? { redirectHostCheck: allowedHost } : {}),
+        ...(hopCheck ? { redirectHostCheck: hopCheck } : {}),
+        // Issue #261: Accept + Accept-Language for the EU machine route (our
+        // user agent still comes from the client defaults).
+        ...(euLaw ? { headers: { ...EU_LAW_REQUEST_HEADERS } } : {}),
       });
     } catch (err) {
       // Issue #215: a redirect hop refused by the host policy (thrown by the
@@ -772,7 +796,15 @@ export class VisaCatalogFetchService {
     // also what an HTML 404 page served as `application/pdf` ends in.
     if (resp.status < 200 || resp.status >= 300) {
       discardBody(data);
-      throw new Error(`Fetch failed for ${url} (HTTP ${resp.status})`);
+      throw new Error(euLaw ? euLawHttpErrorMessage(url, resp.status) : `Fetch failed for ${url} (HTTP ${resp.status})`);
+    }
+
+    // Issue #261: the machine route must end on the document, on the same
+    // host. A redirect anywhere else (e.g. the EUR-Lex site root) is refused
+    // before the body is read.
+    if (euLaw && !isAcceptableEuLawFinalUrl(url, finalUrl)) {
+      discardBody(data);
+      throw new Error(`Unexpected redirect for ${url}: the EU Publications Office answered from ${finalUrl}, which is not the document`);
     }
 
     // Header lookup: axios lowercases header names; tolerate plain objects
@@ -781,7 +813,8 @@ export class VisaCatalogFetchService {
     const contentType = String(hdrs["content-type"] ?? hdrs["Content-Type"] ?? "");
     const declaredLength = Number(hdrs["content-length"] ?? hdrs["Content-Length"]);
     const kind: "html" | "pdf" = isPdfResponse(contentType, url, finalUrl) ? "pdf" : "html";
-    const maxBytes = kind === "pdf" ? this.pdfLimits.maxBytes : MAX_HTML_BYTES;
+    // Long documents (PDF, and EU law texts, issue #261) share the larger byte cap.
+    const maxBytes = kind === "pdf" || euLaw ? this.pdfLimits.maxBytes : MAX_HTML_BYTES;
 
     // The caller does not take PDFs: refuse now, on the headers alone, so the
     // document is neither downloaded nor parsed.
@@ -979,7 +1012,10 @@ export class VisaCatalogFetchService {
 
     // One request for both kinds; a non-2xx status has already thrown
     // "Fetch failed for … (HTTP n)" inside fetchBody.
-    const { kind, body, status, finalUrl } = await this.fetchBody(url, options?.acceptPdf ?? true, options?.allowedHost);
+    // Issue #261: an EU-law (publications.europa.eu CELEX) address takes the
+    // machine route; see eu-law.ts. False for every other address.
+    const euLaw = isEuLawCelexUrl(url);
+    const { kind, body, status, finalUrl } = await this.fetchBody(url, options?.acceptPdf ?? true, options?.allowedHost, euLaw);
 
     // ---- PDF (issue #33) ----
     // Extract the text layer per page. Every refusal (not a PDF, encrypted,
@@ -1018,8 +1054,14 @@ export class VisaCatalogFetchService {
     // Default: the capped visa-page text, exactly as before. With
     // `maxHtmlTextChars` (issue #39): the full text, refused when over the
     // caller's limit rather than cut short.
-    const htmlLimit = options?.maxHtmlTextChars;
-    const cleanText = htmlLimit === undefined ? this.htmlToCleanText(html) : this.htmlToCleanText(html, Infinity);
+    // Issue #261: an EU-law text is long-document material. It is never sliced
+    // at MAX_CLEAN_TEXT_CHARS: without a caller limit it gets
+    // EU_LAW_MAX_TEXT_CHARS and fails (HtmlTextTooLongError) when over it.
+    const htmlLimit = options?.maxHtmlTextChars ?? (euLaw ? EU_LAW_MAX_TEXT_CHARS : undefined);
+    let cleanText = htmlLimit === undefined ? this.htmlToCleanText(html) : this.htmlToCleanText(html, Infinity);
+    // Consolidation markers ("▼M7", "►M5 ... ◄") are dropped from the stored
+    // text, so quotes match and drafting never copies them (see eu-law.ts).
+    if (euLaw) cleanText = stripConsolidationMarkers(cleanText);
     if (htmlLimit !== undefined && cleanText.length > htmlLimit) {
       throw new HtmlTextTooLongError(url, cleanText.length, htmlLimit);
     }

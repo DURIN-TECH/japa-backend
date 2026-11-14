@@ -1,5 +1,9 @@
 import { Timestamp } from "firebase-admin/firestore";
 import type { ApplicationIntake } from "./intake";
+import type { SharedRouteRef } from "./shared-route";
+// Issue #234: what the applicant holds (profile) and its copy on an application.
+import type { ApplicantFacts, HeldDocument } from "./applicant-facts";
+export * from "./applicant-facts";
 // Issue #179: stored prices are dollar Money; reads add a local quote.
 import type { ChargeSnapshot, CurrencyCode, LocalPriceQuote, Money, PriceMigrationRecord, QuoteLock } from "./money";
 // Automated-verification result shapes live with the provider contract; the
@@ -50,7 +54,19 @@ export interface User {
   address?: Address;
   residentialCountry?: string;
   profilePhotoUrl?: string;
-  
+
+  // ---- What the applicant holds (issue #234; see types/applicant-facts.ts) ----
+  // Written ONLY through PUT /users/me/holdings and its document sub-routes
+  // (validated server-side); never through PUT /users/me or a client SDK
+  // write (not in USER_SELF_EDITABLE_FIELDS / firestore.rules on purpose).
+  // Nationalities: two-letter codes, one or more. Absent or empty = not stated.
+  nationalities?: string[];
+  // Held visas / permits / travel authorisations. ABSENT = never stated;
+  // an empty list = the applicant said they hold none.
+  heldDocuments?: HeldDocument[];
+  // When the holdings were last saved.
+  holdingsUpdatedAt?: Timestamp;
+
   // Onboarding status
   onboardingCompleted: boolean;
   onboardingCompletedAt?: Timestamp;
@@ -503,10 +519,23 @@ export interface VisaType {
   // scrape), so a re-withdrawal before review can put it back to approved.
   // Cleared by an admin review (approve or reject) and by that re-withdrawal.
   restoredAt?: Timestamp;
+  // Issue #212: set when an admin approved this scraped visa (or a re-crawl
+  // proposal for it) while `scrapeMeta.missingFromExtraction` listed items the
+  // extractor missed: who acknowledged them and when.
+  missingItemsAcknowledgedBy?: string;
+  missingItemsAcknowledgedAt?: Timestamp;
 
   // Stats
   successRate?: number;
   totalApplications?: number;
+
+  // Issue #231 (P2 of #228): shared routes this record inherits, in order. The
+  // country must be in each shared route's destinations on the day it is set.
+  // The record stays the key of everything country-keyed (agency prices,
+  // screenings, revisions, alerts); this only adds shared rulebook layers
+  // BEFORE the country's own one (see shared-routes/route-stack.ts). Written
+  // only by the admin shared-routes API; absent on every existing record.
+  inheritsFrom?: SharedRouteRef[];
 
   // Availability
   isActive: boolean;
@@ -845,8 +874,68 @@ export interface Application {
   // rubric; never through the generic application update.
   intake?: ApplicationIntake;
 
+  // Issue #231 (P2 of #228): the rulebook keys this application runs on, shared
+  // layer(s) first and the country's own `{countryCode}_{visaTypeId}` last,
+  // fixed when the application starts so a later change of the visa's
+  // `inheritsFrom` does not rewrite a running application. ABSENT on
+  // applications started before P2: those resolve live
+  // (shared-routes/route-stack.ts `resolveApplicationStack`).
+  routeStack?: string[];
+
+  // Issue #234 (P5 of #228): the applicant's holdings (nationalities, country
+  // of residence, held visas and permits) COPIED from their profile when the
+  // application started, with the time taken. Assessment reads this copy, not
+  // the live profile. Personal data: returned only by GET /applications/:id
+  // (behind `checkApplicationAccess`) and stripped from case lists. ABSENT on
+  // applications started before #234. Never written by the generic update.
+  applicantFacts?: ApplicantFacts;
+
+  // Issue #235 (P6 of #228): on a SHARED route, the member country the
+  // application goes through, CONFIRMED by the applicant (or their agent).
+  // `countryCode` / `visaTypeId` above are that member's own inheriting record,
+  // so prices, agencies and the rest of the system read it unchanged. ABSENT on
+  // every application that was not started through a shared route.
+  throughCountryCode?: string;
+  // Who confirmed it, and the rule shown at that time (see ThroughCountryChoice).
+  throughCountry?: ThroughCountryChoice;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+/**
+ * (#235) The confirmed "country I apply through" of a shared-route
+ * application, with what the applicant was shown when they confirmed it.
+ * The proposal is NEVER forced: `followedProposal` is false when the applicant
+ * picked another member, and `reasonShown` is the line they saw ("The rule
+ * says X; you chose Y"). Written only by the create and change-country paths.
+ */
+export interface ThroughCountryChoice {
+  /** The shared route the application is on. */
+  sharedRouteId: string;
+  /** The confirmed member country (same as `Application.throughCountryCode`). */
+  countryCode: string;
+  /** Who confirmed it: their uid and role at the time. */
+  chosenByUid: string;
+  chosenByRole?: string;
+  confirmedAt: Timestamp;
+  /**
+   * The proposal shown at that time, from the shared rulebook's competence
+   * steps (null when the rulebook has no such rule or the answers did not
+   * point to a country: the applicant then simply picked).
+   */
+  proposal: { countryCode: string; stepIndex: number; restsOn: string; quote: string; url: string } | null;
+  /** The answers the proposal was worked out from (scoped question ids). */
+  answers: Record<string, unknown>;
+  /** Why there was no proposal (a code from the resolver), when there was none. */
+  noProposalReason?: string;
+  /** True when the confirmed country is the proposed one; null when there was no proposal. */
+  followedProposal: boolean | null;
+  /** The plain line shown when the applicant chose another member than the rule's. */
+  reasonShown?: string;
+  /** The shared rulebook (key and approved version) the steps came from, when one was read. */
+  rulebookKey?: string;
+  rulebookVersion?: number;
 }
 
 export type PaymentStatus = 
@@ -1876,3 +1965,37 @@ export interface AiMessageAccessAuditRecord {
 
 // Money, exchange-rate and charge-snapshot types (issue #178)
 export * from "./money";
+
+// ============================================
+// Feedback (issue #257)
+// ============================================
+
+/** What the tester is reporting. */
+export type FeedbackKind = "bug" | "idea";
+
+/**
+ * One in-app feedback note, stored in the backend-only `feedback` collection.
+ * `userId`, `userEmail` and `role` come from the verified token, never from the
+ * request body; the rest is validated client input.
+ */
+export interface Feedback {
+  id?: string;
+  userId: string;
+  userEmail: string;
+  role: string;
+  kind: FeedbackKind;
+  /** Trimmed, 1 to 2000 characters. */
+  message: string;
+  /** Screen the tester was on (route path only, no params), max 200 chars. */
+  route: string;
+  appVersion: string;
+  platform: string;
+  osVersion: string;
+  /** App environment the build points at (dev/prod). */
+  appEnv: string;
+  /** Private storage key of the screenshot, or null when none was sent. */
+  screenshotPath: string | null;
+  /** Triage state; the team edits this in the console. */
+  status: "new";
+  createdAt: Timestamp;
+}

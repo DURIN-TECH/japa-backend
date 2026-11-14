@@ -2,7 +2,8 @@ import { createHash } from "crypto";
 import { Timestamp } from "firebase-admin/firestore";
 import { ROLES } from "@durin-tech/authz";
 import { db, subcollections } from "../utils/firebase";
-import { rubricRouteKey, rubricStore, type VisaRubric } from "../scrapers";
+import { layerVersionsOf, rubricRouteKey, rubricStore, sameStackVersions, type VisaRubric } from "../scrapers";
+import { defaultRulebookStack } from "./ai/application-rulebook";
 import type { Application, DocumentRequest } from "../types";
 import type {
   ApplicationAssessment,
@@ -361,9 +362,21 @@ export class AiActionService {
     const actionRef = subcollections.proposedActions(assessment.id).doc(actionId);
 
     // Reads that need no transaction: the warning and the name shown on the request.
-    const head = await rubricStore.getHead(rubricRouteKey(app.countryCode, app.visaTypeId));
-    const approvedVersion: number | null = head?.approvedVersion ?? null;
-    const rubricCurrent = approvedVersion === assessment.rubricVersion;
+    // (#233) An assessment made on a rulebook STACK is current only while EVERY
+    // layer still serves the version it used; a single-layer assessment keeps
+    // the head check exactly as before.
+    let approvedVersion: number | null;
+    let rubricCurrent: boolean;
+    if (assessment.layerVersions) {
+      const stack = await defaultRulebookStack(app);
+      const current = stack.usable ? stack.rubric : null;
+      approvedVersion = current ? current.version : null;
+      rubricCurrent = current !== null && sameStackVersions({ version: assessment.rubricVersion, layerVersions: assessment.layerVersions }, { version: current.version, layerVersions: layerVersionsOf(current) });
+    } else {
+      const head = await rubricStore.getHead(rubricRouteKey(app.countryCode, app.visaTypeId));
+      approvedVersion = head?.approvedVersion ?? null;
+      rubricCurrent = approvedVersion === assessment.rubricVersion;
+    }
     const requestedByName = actor.name || "Your agent";
 
     const outcome = await db.runTransaction(async (tx): Promise<AcceptOutcome> => {

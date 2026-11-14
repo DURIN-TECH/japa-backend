@@ -287,7 +287,7 @@ describe("rubric review: admin only", () => {
     // #201 (EXPLICIT extension of this list) added three admin routes: the
     // publish settings (GET, PATCH; registered before `/:id`) and the run of the
     // automatic pipeline on a pending draft. Still no route that approves part of a version.
-    assert.deepEqual(routes.map((r: any) => `${r.methods.join(",")} ${r.path}`), ["get /publish-settings", "patch /publish-settings", "get /", "get /:id", "post /:id/exclusion-preview", "post /:id/auto-publish", "patch /:id/review"]);
+    assert.deepEqual(routes.map((r: any) => `${r.methods.join(",")} ${r.path}`), ["get /publish-settings", "patch /publish-settings", "get /fan-outs", "post /fan-outs/:id/confirm", "get /", "get /:id", "post /:id/exclusion-preview", "post /:id/auto-publish", "patch /:id/review"]);
     for (const r of routes) assert.deepEqual(r.chain, [verifyAuth, requireRubricAdmin, verifyAdmin], r.path);
   });
 });

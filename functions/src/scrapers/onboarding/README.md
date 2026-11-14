@@ -61,6 +61,54 @@ Run statuses: `preparing | awaiting_confirmation | running | waiting_for_publish
   `_allowlist_added`, `_settings_changed`). Index: `routeOnboardingRuns`
   (`status`, `createdAt` desc) in `firestore.indexes.json`.
 
+## A run for a shared layer (issue #233, P4b of #228)
+
+A route registered under a bloc or treaty (`authorityId` is not a country
+code) starts a run on the SHARED layer. `visaTypeId` is the shared route's id
+(`sharedRoutes/{id}`), which must exist, be owned by `authorityId` and be
+`active`: checked at start (422, before any write) and again at `check_setup`.
+The run is keyed `{authorityId}_{routeSlug}__r{n}` and carries `layer:
+"shared"`, `authorityId`, `routeSlug` and no `countryCode`.
+
+- `read_visa_page` is **skipped**: a shared route files no country visa record
+  (each member country's own record inherits it, `inheritsFrom`).
+- `plan` and `draft` start the drafting job with `{authorityId, routeSlug}`, so
+  the rulebook is drafted, checked and published under `{authorityId}_{routeSlug}`
+  through the same safeguards as a country's.
+- The end checklist has one item, `link_member_records` (done once at least one
+  visa record inherits the shared route).
+- A member country's own (thin) layer is an ordinary country run, unchanged.
+- The existing list and detail show both kinds; every row now also has
+  `authorityId`, `routeSlug` and `layer` (`own` | `shared`), and `countryCode`
+  is null on a shared run.
+
+## The automatic re-draft waits for an active run (issue #225)
+
+When a route already has a rulebook, `onGuidanceSourceChanged` starts a paid
+re-draft whenever a page's stored text changes. A run re-reads the pages, so
+that trigger now goes through `routeOnboardingService.guardedRedraft`
+(`onboarding-redraft.ts`) first:
+
+- **Run active** (`preparing`, `awaiting_confirmation`, `running`,
+  `waiting_for_publish`): nothing is started. The deferral is recorded on
+  `routeOnboardingRoutes/{routeKey}` (`deferredRedraft`, `redraftDeferredPending`)
+  and the trigger's result is `refused` / `onboarding_run_active`. The run
+  drafts after the admin confirms.
+- **No run active**: unchanged behaviour. The trigger takes a short claim on
+  the head (`redraftClaims`) while its `startJob` pins the snapshots. A run
+  created in that window waits in `read_rule_pages` until the claim is released
+  or expires, so it never crawls a page under the trigger's job. The head is
+  read and written in a transaction by both `start()` and the guard, so the two
+  cannot both miss each other.
+- **The run ends** (any final status): the deferral is re-evaluated through
+  the same guard, with the same start the trigger makes. The drafting job's
+  hash gate and deterministic id decide: the run drafted the change, so
+  nothing starts (no double spend); the run failed or was cancelled first, so
+  the normal re-draft starts (nothing lost). If the run's own job is still
+  being cancelled, the deferral stays, and the 5-minute sweep tries again.
+- **The guard cannot be read** (a database error): the trigger starts nothing
+  (it fails closed, because money is involved).
+
 ## Settings: `appConfig/routeOnboardingSettings`
 
 Shared with the registry (it ignores these fields and this ignores its). Fail
@@ -72,7 +120,7 @@ closed: a missing doc is OFF. `enabled` (default false), `maxRunsPerDay` (3),
 
 | Request | Success | Errors |
 |---|---|---|
-| `POST /admin/route-onboarding` `{countryCode, visaTypeId}` | 201 `{runId, status, run}` | 400 `VALIDATION_ERROR`; 404 `ROUTE_NOT_REGISTERED`; 409 `RUN_ACTIVE` (+`activeRunId`); 429 `DAILY_LIMIT_REACHED`; 503 `SETTINGS_UNAVAILABLE` / `ONBOARDING_DISABLED` |
+| `POST /admin/route-onboarding` `{authorityId, visaTypeId}` (#232; `countryCode` still accepted in place of `authorityId`, not both) | 201 `{runId, status, run}` | 400 `VALIDATION_ERROR`; 404 `ROUTE_NOT_REGISTERED`; 409 `RUN_ACTIVE` (+`activeRunId`); 422 `SHARED_ROUTE_NOT_FOUND` / `SHARED_ROUTE_NOT_ACTIVE` (a bloc or treaty route whose shared route `visaTypeId` is missing, another authority's, or retired; #233 P4b); 429 `DAILY_LIMIT_REACHED`; 503 `SETTINGS_UNAVAILABLE` / `ONBOARDING_DISABLED` |
 | `GET /admin/route-onboarding?status=&limit=` | 200 `{runs[], total}` (newest first) | 400 |
 | `GET /admin/route-onboarding/:id` | 200 `{run, checklist[]}` (progress read live from the job) | 404 |
 | `POST /:id/confirm` `{estimateId, statementAccepted: true, addToAllowlist?}` | 200 `{alreadyConfirmed, run}` | 400 `VALIDATION_ERROR` / `STATEMENT_REQUIRED`; 404; 409 `ESTIMATE_MISMATCH` (+`currentEstimateId`) / `NOT_AWAITING_CONFIRMATION`; 503 |

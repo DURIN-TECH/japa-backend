@@ -201,8 +201,56 @@ describe("guidance seed: the doc that is written", () => {
     // cross-route documents secondary.
     assert.deepEqual(
       Object.fromEntries(GUIDANCE_SOURCE_SEEDS.map((x) => [x.id, x.role])),
-      { "gb-appendix-v-visitor": "primary", "gb-visit-guidance-html": "route_guidance", "gb-visit-guidance-pdf": "route_guidance", "gb-part-suitability": "secondary", "gb-appendix-finance": "secondary" }
+      {
+        // ---- Standard Visitor (issue #111) ----
+        "gb-appendix-v-visitor": "primary",
+        "gb-visit-guidance-html": "route_guidance",
+        "gb-visit-guidance-pdf": "route_guidance",
+        "gb-part-suitability": "secondary",
+        "gb-appendix-finance": "secondary",
+        // ---- UK Family (issue #260): Appendix FM is the route's rules, FM-SE
+        // the cross-route evidence appendix, the two caseworker guidances
+        // (Family Policy web + PDF, minimum income requirement PDF) route guidance.
+        "gb-appendix-fm-family-members": "primary",
+        "gb-appendix-fm-se-specified-evidence": "secondary",
+        "gb-family-life-guidance-html": "route_guidance",
+        "gb-family-life-guidance-pdf": "route_guidance",
+        "gb-family-financial-requirement-pdf": "route_guidance",
+        // ---- Skilled Worker (issue #260): the appendix is primary, the
+        // caseworker guidance (web + PDF) route guidance, and the appendices
+        // its rules name (English Language, Skilled Occupations, Immigration
+        // Salary List) secondary.
+        "gb-appendix-skilled-worker": "primary",
+        "gb-skilled-worker-guidance-html": "route_guidance",
+        "gb-skilled-worker-guidance-pdf": "route_guidance",
+        "gb-appendix-english-language": "secondary",
+        "gb-appendix-skilled-occupations": "secondary",
+        "gb-appendix-immigration-salary-list": "secondary",
+        // ---- Student (issue #260): the appendix is primary, the Student and
+        // Child Student guidance (web + PDF) route guidance, Appendix ATAS secondary.
+        "gb-appendix-student": "primary",
+        "gb-student-guidance-html": "route_guidance",
+        "gb-student-guidance-pdf": "route_guidance",
+        "gb-appendix-atas": "secondary",
+        // ---- Graduate (issue #260): the appendix is primary, the caseworker
+        // guidance (web + PDF) route guidance; its cross-route documents are reused by id.
+        "gb-appendix-graduate": "primary",
+        "gb-graduate-guidance-html": "route_guidance",
+        "gb-graduate-guidance-pdf": "route_guidance",
+      }
     );
+  });
+
+  test("every route in the real seed has exactly one primary source (its own rules)", () => {
+    // Issue #260: once several routes share the list, a second primary under
+    // one route key (or a route with none) would be a copy-paste slip: the
+    // rubric is built around ONE rules document per route.
+    const primaries = new Map<string, number>();
+    for (const seed of GUIDANCE_SOURCE_SEEDS) {
+      if (!primaries.has(seed.route)) primaries.set(seed.route, 0);
+      if (seed.role === "primary") primaries.set(seed.route, primaries.get(seed.route)! + 1);
+    }
+    for (const [route, count] of primaries) assert.equal(count, 1, `${route} has ${count} primary sources`);
   });
 
   test("an unknown source role is rejected by the seed validator", () => {

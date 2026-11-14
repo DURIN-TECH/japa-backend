@@ -16,7 +16,7 @@ import {
 import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 // Approval guard for visas with no usable USD cost (issue #59).
 import { deriveRequirementsFromScrape } from "./visa-requirements-derive";
-import { assertVisaApprovable } from "../scrapers";
+import { assertVisaApprovable, assertMissingItemsAcknowledged } from "../scrapers";
 // Finite-only min for the denormalized country stats.
 import { finiteMin } from "../scrapers";
 // Manual USD cost on a pending scraped visa (issue #70): pure rules.
@@ -74,6 +74,43 @@ export function isVisaPubliclyVisible(visa: VisaVisibilityFields): boolean {
  */
 export function filterPubliclyVisible<T extends VisaVisibilityFields>(visas: T[]): T[] {
   return visas.filter(isVisaPubliclyVisible);
+}
+
+/**
+ * Explore ordering for `GET /visas` (#258).
+ *
+ * 1. Visas whose requirements come from the official source
+ *    (`source === "scraped"`) come first, across ALL countries, so the best-
+ *    grounded visas land on page 1 even when their country ranks low.
+ * 2. Within each group the pre-existing order is kept: country
+ *    `popularityRank` (missing = 999), then category.
+ *
+ * Seed visas (no `source`), `agent` and `agency` visas all fall in the
+ * second group and keep their current relative order. Callers must pass only
+ * publicly visible visas (the per-country reads already filter them), so a
+ * hidden scraped visa is never ranked. Sorts in place and returns the array;
+ * Array#sort is stable, so ties keep their incoming order.
+ */
+export function sortVisasForExplore<
+  T extends Pick<VisaType, "countryCode" | "category" | "source">,
+>(visas: T[], countries: Pick<Country, "code" | "popularityRank">[]): T[] {
+  // Lookup once instead of a countries.find() per comparison.
+  const rankByCode = new Map<string, number>();
+  for (const c of countries) rankByCode.set(c.code, c.popularityRank || 999);
+
+  return visas.sort((a, b) => {
+    // Group 1: scraped first (0 sorts before 1).
+    const scrapedDiff =
+      (a.source === "scraped" ? 0 : 1) - (b.source === "scraped" ? 0 : 1);
+    if (scrapedDiff !== 0) return scrapedDiff;
+
+    // Existing order: country rank, then category.
+    const rankDiff =
+      (rankByCode.get(a.countryCode) ?? 999) -
+      (rankByCode.get(b.countryCode) ?? 999);
+    if (rankDiff !== 0) return rankDiff;
+    return a.category.localeCompare(b.category);
+  });
 }
 
 /**
@@ -600,15 +637,10 @@ class VisaService {
       results.push(...visaTypes);
     }
 
-    // Sort by country popularity rank, then by category
-    results.sort((a, b) => {
-      const countryA = countries.find((c) => c.code === a.countryCode);
-      const countryB = countries.find((c) => c.code === b.countryCode);
-      const rankDiff =
-        (countryA?.popularityRank || 999) - (countryB?.popularityRank || 999);
-      if (rankDiff !== 0) return rankDiff;
-      return a.category.localeCompare(b.category);
-    });
+    // Order BEFORE the pagination slice below (#258): scraped visas first,
+    // then country popularity rank, then category. Doing it here (not on the
+    // client) keeps page 1 and every later page consistent.
+    sortVisasForExplore(results, countries);
 
     const total = results.length;
     const limit = options?.limit || 20;
@@ -705,7 +737,13 @@ class VisaService {
     visaTypeId: string,
     action: "approve" | "reject",
     reviewedBy: string,
-    rejectionReason?: string
+    rejectionReason?: string,
+    // Issue #212: approve past the page items the extractor missed
+    // (`scrapeMeta.missingFromExtraction`); without it a non-empty list is a 409.
+    acknowledgeMissingItems?: boolean,
+    // The `scrapeMeta.extractedAt` (millis) the admin was shown; the acknowledgement
+    // is only valid for that extraction (null = not sent).
+    seenExtractedAtMs?: number | null
   ): Promise<VisaType> {
     // Country docs are keyed by the upper-case code; use it for the visa ref
     // AND the stats recompute so both hit the same country.
@@ -730,6 +768,15 @@ class VisaService {
     if (action === "approve") {
       assertVisaApprovable(current);
     }
+    // Issue #212: missing page items must be acknowledged before approval
+    // (throws MissingItemsUnacknowledgedError, nothing written).
+    const acknowledgedMissing =
+      action === "approve"
+        ? assertMissingItemsAcknowledged(current.scrapeMeta, acknowledgeMissingItems, {
+          seenAtMs: seenExtractedAtMs ?? null,
+          currentAtMs: current.scrapeMeta?.extractedAt?.toMillis?.() ?? null,
+        })
+        : false;
 
     // ---- Review fields (both actions) ----
     const updates: Record<string, unknown> = {
@@ -741,6 +788,15 @@ class VisaService {
 
     if (action === "reject" && rejectionReason) {
       updates.rejectionReason = rejectionReason;
+    }
+    // Issue #212: who acknowledged the missing items, and when.
+    if (acknowledgedMissing) {
+      updates.missingItemsAcknowledgedBy = reviewedBy;
+      updates.missingItemsAcknowledgedAt = serverTimestamp();
+    } else if (action === "approve" && current.missingItemsAcknowledgedBy !== undefined) {
+      // Nothing is missing now: an acknowledgement from an earlier version must not linger.
+      updates.missingItemsAcknowledgedBy = FieldValue.delete();
+      updates.missingItemsAcknowledgedAt = FieldValue.delete();
     }
 
     // Issue #68: an admin review (either action) resolves a restored-guide

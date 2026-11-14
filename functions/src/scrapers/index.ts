@@ -59,6 +59,8 @@ export { scrapeCostService } from "./shared/cost/scrape-cost.service";
 export { assertVisaApprovable, isIso4217, VisaFeeNotConvertibleError } from "./visa-catalog/visa-catalog-fx";
 /** Finite-only min for the denormalized country stats. */
 export { finiteMin } from "./visa-catalog/visa-catalog-meta";
+// Issue #212: the approve gate for page items the extractor missed (pure module).
+export { assertMissingItemsAcknowledged, MissingItemsChangedError, MissingItemsUnacknowledgedError } from "./visa-catalog/missing-items-gate";
 /** Manual USD cost on a pending scraped visa (#70). */
 export { ManualCostError, parseManualCostInput, planManualCost } from "./visa-catalog/visa-manual-cost";
 export type { ManualCostInput } from "./visa-catalog/visa-manual-cost";
@@ -73,6 +75,21 @@ export { routeOnboardingService } from "./onboarding/route-onboarding.service";
 // ---- Source registry API (issue #215) ----
 /** Confirmed official websites + route registration (admin only). */
 export { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./shared/registry/registry.routes";
+/**
+ * (#230) The registry's error type, append-only audit write and address rules,
+ * reused by the authorities API (src/authorities) so its admin endpoints share
+ * the same error shape, audit trail and https/host rules.
+ */
+export { RegistryError, isRegistryError } from "./shared/registry/registry-errors";
+export { appendRegistryAudit, stripUndefined } from "./shared/registry/registry-audit";
+export type { RegistryAuditAction, RegistryAuditEntry } from "./shared/registry/registry-audit";
+export { parseRegistryUrl } from "./shared/registry/registry-address";
+/**
+ * (#232) Which authority a stored official website belongs to (reads the
+ * pre-#232 `countryCode` field too, until the #239 migration). The
+ * authorities API uses it to check a membership quote's host.
+ */
+export { officialDomainAuthorityId } from "./shared/registry/official-domains.service";
 
 // ---- Caseworker-guidance registry (issue #39) ----
 /** Admin list of guidance sources (GET /admin/guidance-sources). */
@@ -95,11 +112,33 @@ export type { JobView, StartJobInput, StartJobResult } from "./rubric/rubric-ext
  * is never returned by it); the `...ForReview` reads are for the admin review
  * API (#125).
  */
-export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
+export { rubricStore, rubricRouteKey, rulebookKeyOf } from "./rubric/rubric.store";
+/**
+ * (#233) Rulebook keys for ANY issuing authority (`{authorityId}_{routeSlug}`):
+ * build a checked target, read the parts of a stored document whichever shape
+ * it was written in.
+ */
+export { rulebookTargetOf, rulebookTargetOfKey, rulebookPartsOf, keyFieldsOf, targetInputOf, withKeyParts, isCountryRulebookKey, RulebookKeyError } from "./rubric/rubric-key";
+export type { RulebookTarget, RulebookTargetInput } from "./rubric/rubric-key";
+/**
+ * (#233) Rulebook STACKS: the approved version of every layer of a route
+ * (shared bloc / treaty layer first, the country's own layer last), merged into
+ * one served view. A single-layer route reads exactly its own rulebook.
+ */
+export { loadRulebookStack, mergeRulebookStack, stackFromReads, layerVersionsOf, sameStackVersions, scopedId, sharedLayerView, STACK_ID_SEPARATOR } from "./rubric/rubric-stack";
+// (#235) The code check of a competence block (which member country examines an application).
+export { competenceProblems, servableCompetence, isDestinationQuestion, quoteContains } from "./rubric/rubric-competence";
+export type { RulebookStack, StackLayerRead, StackLayerReader, StackUnusableReason } from "./rubric/rubric-stack";
+// (#233 P4b) The layer check: an own layer's rules against its shared layer(s) (restates links, conflicts).
+export { RubricLayerChecker, runLayerCheck, decideLayerLinks, linkRefusal, notCheckedRecord, LAYER_CHECK_PROMPT_VERSION, DEFAULT_LAYER_CHECK_LIMITS } from "./rubric/rubric-layer-check";
+export type { LayerCheckInput, LayerCheckLimits, LayerCheckOutcome, SharedLayerRules } from "./rubric/rubric-layer-check";
+export { planStack } from "./rubric/rubric-question-plan";
+export type { StackPlanLayer, StackPlanProblem, StackPlanResult } from "./rubric/rubric-question-plan";
 /** Structural rubric validator (the review API re-runs it before approving). */
 export { validateVisaRubric } from "./rubric/rubric-validate";
 /** Criterion exclusions (#161): the pure read-side filter, the preview and the limits. */
-export { applyExclusions, previewExclusions, MAX_EXCLUDED_CRITERIA, EXCLUSION_NOTE_MAX } from "./rubric/rubric-exclusions";
+// (#248) `barsServedWithoutTrigger`: the bars a version serves without their unconfirmed trigger (judged, never code-decided).
+export { applyExclusions, previewExclusions, barsServedWithoutTrigger, MAX_EXCLUDED_CRITERIA, EXCLUSION_NOTE_MAX } from "./rubric/rubric-exclusions";
 // (#223) Repaired protected rules: the hash that keys a repair attempt, and the read-side swap.
 export { applyRuleRepairs, ruleHashOf } from "./rubric/rubric-repair";
 export type { ExclusionPreview } from "./rubric/rubric-exclusions";
@@ -132,7 +171,7 @@ export type { TranslationView } from "./rubric/rubric-translation";
 export { loadRegistrySettings } from "./shared/registry/registry-settings";
 export type { RubricPublishSettings, LoadedPublishSettings, PublishSettingsView, PublishSettingsPatch } from "./rubric/rubric-publish-settings";
 /** The independent AI check of every rule (part B, #202): registered on the publish pipeline. */
-export { rubricChecker, RubricCheckerService, estimateCheckerLoad, judgeRule, decidePolarity } from "./rubric/rubric-checker";
+export { rubricChecker, RubricCheckerService, estimateCheckerLoad, judgeRule, decidePolarity, JUDGED_BAR_DETAIL } from "./rubric/rubric-checker";
 export type { RubricCheckerRun } from "./rubric/rubric-checker";
 /** The pure code gates, the sample audit and the reason wording. */
 export { evaluateGates, acknowledgementsFor, buildExclusionNote, sampleAudit, reasonInWords, isProtectedRule, SAMPLE_AUDIT_SIZE } from "./rubric/rubric-gates";
