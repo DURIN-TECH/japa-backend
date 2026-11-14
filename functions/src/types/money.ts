@@ -75,8 +75,9 @@ export interface Quote {
  * Re-deriving an amount from `priceUsdCents` and `fxRate` MUST go through
  * `scaleRate` / `convertUsdToLocal` (the rate is held to 6 decimals; a raw
  * float multiply can differ by a kobo). Prefer the stored `chargedAmountMinor`.
- * The quote-lock / expiry time (how long a quote may be charged) is added by
- * #180 on the checkout record; this snapshot only records what was charged.
+ * The quote-lock / expiry time (how long a quote may be charged) is the
+ * separate `QuoteLock` below (issue #180), stored next to the snapshot on a
+ * booking; this snapshot only records what was (to be) charged.
  */
 export interface ChargeSnapshot {
   /** The price as set by the agent, in US cents. */
@@ -92,6 +93,24 @@ export interface ChargeSnapshot {
   fxRateSource: FxRateSource;
   /** Margin applied on top of `fxRate`, in basis points. */
   fxMarginBps: number;
+}
+
+/**
+ * The quote lock stored next to a ChargeSnapshot on a record that is charged
+ * LATER than it is priced (issue #180: a consultation booking that waits for
+ * a Paystack checkout).
+ *
+ * The snapshot is priced when the booking is created (`quoteLockedAt`) and
+ * may be charged until `quoteExpiresAt` (30 minutes later, see
+ * `QUOTE_LOCK_MINUTES` in services/consultation-charge.service.ts). After
+ * that a verify or a retry re-prices with a FRESH quote; a stale snapshot is
+ * never charged again.
+ */
+export interface QuoteLock {
+  /** When the snapshot was priced. */
+  quoteLockedAt: Timestamp;
+  /** After this, the snapshot may no longer be charged (fresh quote needed). */
+  quoteExpiresAt: Timestamp;
 }
 
 // ============================================

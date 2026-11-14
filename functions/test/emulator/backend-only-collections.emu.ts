@@ -30,6 +30,9 @@ import { anonymousDb, clientDb, isDenied, resetEmulators, rulesEnv, withoutRules
 /** Top-level backend-only collections (names from src/utils/firebase.ts). */
 const COLLECTIONS = [
   "riskSignals",
+  // Consultation payments held for refund (issue #180 review fix): amounts,
+  // references and other people's booking ids. Never read or forged by a client.
+  "consultationPaymentExceptions",
   // Agency listing screening results (issue #120): admin-only through the API.
   "listingScreenings",
   "rubricReviewHistory",

@@ -7,6 +7,7 @@ import {
   NormalizedSubscriptionEvent,
   SubscriberType,
 } from "@durin-tech/authz";
+import type { Money } from "../../types/money";
 
 /**
  * Paystack implementation of the provider-agnostic `BillingProvider`. The rest of
@@ -106,23 +107,42 @@ export class PaystackProvider implements BillingProvider {
    * so it deliberately does NOT flow through the subscription-shaped
    * `subscriberType/subscriberId/planId` contract — those transactions are
    * confirmed via `getTransactionMetadata` (reference lookup), not the
-   * subscription webhook. `amountKobo` is the charge in the smallest NGN unit.
-   * `callbackUrl` overrides the provider default so the payer can be returned to
-   * a purpose-specific confirmation page.
+   * subscription webhook. `callbackUrl` overrides the provider default so the
+   * payer can be returned to a purpose-specific confirmation page.
+   *
+   * Issue #180: the charge is a `Money` (integer minor units + an EXPLICIT
+   * currency), passed to Paystack as-is: `amount = amountMinor`, `currency =
+   * currency`. Nothing here converts or assumes naira; callers pass the
+   * `chargedAmountMinor` / `chargedCurrency` they stored on the booking.
    */
-  async initializeOneOffCharge(input: {
+  async initializeCharge(input: {
     email: string;
-    amountKobo: number;
+    /** The exact amount to charge, in minor units of its own currency. */
+    amount: Money;
     metadata?: Record<string, unknown>;
     callbackUrl?: string;
+    /**
+     * Issue #180 review fix: OUR reference for this checkout. Paystack
+     * accepts a caller-supplied `reference` on transaction/initialize, so the
+     * consultation charge path generates it, stores it on the booking inside
+     * the Firestore transaction that decides the checkout, and only then
+     * opens it here. Omitted: Paystack generates one (other callers).
+     */
+    reference?: string;
   }): Promise<{ authorizationUrl: string; reference: string }> {
+    // Never hand Paystack a malformed or zero amount: a charge path that got
+    // here with one is a bug upstream, and failing loudly beats charging 0.
+    if (!Number.isSafeInteger(input.amount.amountMinor) || input.amount.amountMinor <= 0) {
+      throw new Error("PAYSTACK_ERROR: refusing to initialize a charge with a non-positive amount");
+    }
     const callback = input.callbackUrl ?? this.callbackUrl;
     const payload: Record<string, unknown> = {
       email: input.email,
-      amount: input.amountKobo,
-      currency: "NGN",
+      amount: input.amount.amountMinor,
+      currency: input.amount.currency,
       metadata: input.metadata ?? {},
       ...(callback ? { callback_url: callback } : {}),
+      ...(input.reference ? { reference: input.reference } : {}),
     };
 
     const res = await this.client().post<{ data: PaystackInitData }>(
@@ -131,6 +151,26 @@ export class PaystackProvider implements BillingProvider {
     );
     const data = res.data.data;
     return { authorizationUrl: data.authorization_url, reference: data.reference };
+  }
+
+  /**
+   * Legacy naira one-off charge, kept ONLY for the payment-request flow until
+   * #181 moves it onto `initializeCharge` with its own stored currency.
+   * `amountKobo` is the charge in the smallest NGN unit. Consultations no
+   * longer use this (issue #180).
+   */
+  async initializeOneOffCharge(input: {
+    email: string;
+    amountKobo: number;
+    metadata?: Record<string, unknown>;
+    callbackUrl?: string;
+  }): Promise<{ authorizationUrl: string; reference: string }> {
+    return this.initializeCharge({
+      email: input.email,
+      amount: { amountMinor: input.amountKobo, currency: "NGN" },
+      metadata: input.metadata,
+      callbackUrl: input.callbackUrl,
+    });
   }
 
   /**
@@ -224,17 +264,46 @@ export class PaystackProvider implements BillingProvider {
 
   /**
    * Fetch a verified transaction's status + metadata (used to confirm one-off seat
-   * purchases server-side, which aren't subscription events).
+   * purchases, payment requests and consultation fees server-side, which aren't
+   * subscription events).
+   *
+   * Issue #180: also returns what Paystack says was actually charged — `amount`
+   * (minor units) and `currency` — and when (`paidAt`, ISO, when Paystack
+   * reports it), so a caller can compare the charge with what it stored and
+   * refuse an underpayment or a wrong currency. Each is undefined when the
+   * payload does not carry a well-formed value; callers treat undefined as a
+   * mismatch, never as a match.
    */
-  async getTransactionMetadata(
-    reference: string
-  ): Promise<{ status: string; metadata: Record<string, unknown> } | null> {
-    const res = await this.client().get<{ data: { status: string; metadata?: Record<string, unknown> } }>(
-      `/transaction/verify/${encodeURIComponent(reference)}`
-    );
+  async getTransactionMetadata(reference: string): Promise<PaystackTransactionLookup | null> {
+    const res = await this.client().get<{
+      data: {
+        status: string;
+        metadata?: Record<string, unknown>;
+        amount?: unknown;
+        requested_amount?: unknown;
+        currency?: unknown;
+        paid_at?: unknown;
+        paidAt?: unknown;
+      };
+    }>(`/transaction/verify/${encodeURIComponent(reference)}`);
     const data = res.data.data;
     if (!data) return null;
-    return { status: data.status, metadata: data.metadata ?? {} };
+    const paidAtRaw = data.paid_at ?? data.paidAt;
+    return {
+      status: data.status,
+      metadata: data.metadata ?? {},
+      amount: typeof data.amount === "number" && Number.isSafeInteger(data.amount) ? data.amount : undefined,
+      // What WE asked for. When the account passes Paystack's fees to the
+      // customer, `amount` includes those fees and `requested_amount` holds
+      // the original; the consultation charge check compares this one when
+      // present (issue #180 review).
+      // (Only set when well-formed, so callers fall back to `amount` otherwise.)
+      ...(typeof data.requested_amount === "number" && Number.isSafeInteger(data.requested_amount)
+        ? { requestedAmount: data.requested_amount }
+        : {}),
+      currency: typeof data.currency === "string" ? data.currency.toUpperCase() : undefined,
+      paidAt: typeof paidAtRaw === "string" && paidAtRaw ? paidAtRaw : undefined,
+    };
   }
 
   async cancelSubscription(providerRef: string): Promise<void> {
@@ -346,6 +415,32 @@ export class PaystackProvider implements BillingProvider {
       raw,
     };
   }
+}
+
+/**
+ * What `getTransactionMetadata` returns for one reference (issue #180 added
+ * the charged amount, currency and payment time).
+ */
+export interface PaystackTransactionLookup {
+  /** Paystack's transaction status ("success", "abandoned", "failed", ...). */
+  status: string;
+  /** Our own metadata, echoed back by Paystack. */
+  metadata: Record<string, unknown>;
+  /**
+   * The amount Paystack charged, in minor units of `currency`. Includes
+   * Paystack's fees when the account passes them to the customer.
+   */
+  amount?: number;
+  /**
+   * Issue #180 review: the amount the checkout ASKED for (Paystack's
+   * `requested_amount`), before any fee passed to the customer. Compared in
+   * preference to `amount` when present.
+   */
+  requestedAmount?: number;
+  /** The currency Paystack charged in, upper case. */
+  currency?: string;
+  /** When the payment completed (ISO 8601), when Paystack reports it. */
+  paidAt?: string;
 }
 
 interface PaystackMetadata {

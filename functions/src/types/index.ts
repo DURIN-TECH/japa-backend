@@ -1,7 +1,7 @@
 import { Timestamp } from "firebase-admin/firestore";
 import type { ApplicationIntake } from "./intake";
 // Issue #179: stored prices are dollar Money; reads add a local quote.
-import type { LocalPriceQuote, Money, PriceMigrationRecord } from "./money";
+import type { ChargeSnapshot, LocalPriceQuote, Money, PriceMigrationRecord, QuoteLock } from "./money";
 // Automated-verification result shapes live with the provider contract; the
 // compliance file below embeds them as optional signals (see the verification
 // service). One-way import (types -> verification.types), so no cycle.
@@ -1117,7 +1117,19 @@ export type ConsultationType =
   | "follow_up"
   | "general";
 
-export interface Consultation {
+/**
+ * A consultation booking.
+ *
+ * Issue #180: a PAID booking created from #180 on carries the charge
+ * snapshot (`ChargeSnapshot`: priceUsdCents, chargedCurrency,
+ * chargedAmountMinor, fxRate, fxRateAsOf, fxRateSource, fxMarginBps) and the
+ * quote lock (`QuoteLock`: quoteLockedAt, quoteExpiresAt), all priced on the
+ * SERVER from the agent's / agency's dollar fee. A FREE booking carries only
+ * `priceUsdCents: 0`. A LEGACY booking (before #180) carries only `fee`
+ * (whole naira) and no snapshot: it is shown as naira and never re-priced.
+ * The snapshot fields are optional in the type because legacy rows lack them.
+ */
+export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock> {
   id: string;
   userId: string;
   agentId: string;
@@ -1144,11 +1156,39 @@ export interface Consultation {
   meetingPlatform?: "zoom" | "google_meet" | "teams";
   
   // Payment
-  // WHOLE NAIRA (issue #148) for agent-originated and agency (guest) bookings alike.
-  // Paystack kobo (`fee * 100`) is computed only when a charge is initialised.
-  fee: number;
+  // LEGACY ONLY: whole naira (issue #148), on bookings made before #180. Not
+  // written any more (the snapshot fields above replace it) and never
+  // re-priced: a legacy row is displayed and verified as naira as stored.
+  fee?: number;
   paymentStatus: PaymentStatus;
+  // The Paystack reference of the CURRENT checkout while pending, then of the
+  // payment that settled it (used by verify to match the return leg).
   transactionId?: string;
+  // Issue #180: the Paystack checkout page for the current reference, so a
+  // retry inside the quote lock returns the SAME checkout (no second charge
+  // is opened while the first can still be paid).
+  checkoutUrl?: string;
+  // Issue #180: where Paystack sends the payer back (kept so a re-priced
+  // checkout returns the payer to the same page as the first one).
+  checkoutCallbackUrl?: string;
+  // Issue #180: when the payment was confirmed.
+  paidAt?: Timestamp;
+  // Issue #180: when Paystack says the payment completed (its `paid_at`).
+  paystackPaidAt?: Timestamp;
+  // Issue #180: true when an exact payment landed after `quoteExpiresAt` and
+  // was honoured anyway; flagged for review (also on the Transaction).
+  paidAfterQuoteExpiry?: boolean;
+  // Issue #180 (review fix): every checkout this booking has REPLACED, each
+  // with the snapshot and lock it was priced at. A re-price never forgets the
+  // old reference: an exact payment that completes on it later can still
+  // settle a still-unpaid booking at THAT reference's own price, or is
+  // recorded for refund (consultationPaymentExceptions) when the booking was
+  // already paid. Appended inside the same Firestore transaction that stores
+  // the new reference.
+  supersededCheckouts?: SupersededCheckout[];
+  // Issue #180 (review fix): true when the booking was settled by an exact
+  // payment on a superseded reference (also on the Transaction).
+  paidOnSupersededReference?: boolean;
   
   // After consultation
   summary?: string;
@@ -1161,6 +1201,47 @@ export interface Consultation {
   
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+/**
+ * A Paystack checkout a consultation booking no longer offers (issue #180
+ * review fix): replaced by a re-price after the quote lock passed, or by a
+ * reissue after a checkout that never opened. Kept with the exact price it
+ * asked for, so a payment that completes on it later is judged against what
+ * THAT checkout asked, never the booking's newer price.
+ */
+export interface SupersededCheckout extends ChargeSnapshot, Partial<QuoteLock> {
+  /** Our own Paystack reference for that checkout. */
+  reference: string;
+  /** When it was replaced. */
+  supersededAt: Timestamp;
+}
+
+/**
+ * Money we hold for a consultation that cannot be applied to it (issue #180
+ * review fix): an exact payment on a superseded checkout of a booking that
+ * was already paid (a second charge), or a payment on a booking that is no
+ * longer awaiting payment (e.g. cancelled while the payer was paying).
+ *
+ * Collection `consultationPaymentExceptions`, doc id = the Paystack
+ * reference (so a second verify of the same payment never records it twice).
+ * Backend only: firestore.rules denies every client. Written for a human to
+ * refund; NEVER a second Transaction.
+ */
+export interface ConsultationPaymentException {
+  id: string;
+  consultationId: string;
+  /** The Paystack reference that was paid. */
+  reference: string;
+  /** What Paystack charged (its `amount`, minor units of `currency`). */
+  amountMinor: number;
+  currency: string;
+  /** Paystack's own payment time (`paid_at`), when it reported one. */
+  paystackPaidAt: Timestamp | null;
+  reason: "paid_on_superseded_reference_after_booking_paid" | "booking_not_payable";
+  /** Open until a human refunds it (no automated refund yet). */
+  status: "open";
+  createdAt: Timestamp;
 }
 
 // ============================================
@@ -1184,8 +1265,23 @@ export type TransactionStatus =
   | "held_in_escrow"
   | "released";
 
-export interface Transaction {
+/**
+ * One financial event.
+ *
+ * Issue #180: a consultation-fee transaction also records the charge
+ * snapshot of the booking it settles (priceUsdCents, chargedCurrency,
+ * chargedAmountMinor, fxRate, fxRateAsOf, fxRateSource, fxMarginBps), so the
+ * payment never changes when the rate moves. Optional: older transaction
+ * kinds and legacy rows have none.
+ */
+export interface Transaction extends Partial<ChargeSnapshot> {
   id: string;
+  // Issue #180 (consultation_fee): Paystack's payment time, and the flag for
+  // an exact payment honoured after the booking's quote lock.
+  paystackPaidAt?: Timestamp;
+  paidAfterQuoteExpiry?: boolean;
+  // Issue #180 review fix: settled by an exact payment on a superseded checkout.
+  paidOnSupersededReference?: boolean;
   userId: string;
   agentId?: string;
   applicationId?: string;
