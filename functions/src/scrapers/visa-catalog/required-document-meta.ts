@@ -272,6 +272,15 @@ export function classifyAnswerType(itemText: string): { type: AnswerType; matche
 }
 
 /**
+ * True when the item's own words mix several fields or name an email (the same
+ * cues classifyAnswerType uses). For such an item the model's type is NOT
+ * trusted, even with a verified quote: the rule decides.
+ */
+export function hasMixedOrEmailCue(itemText: string): boolean {
+  return OTHER_FIELD_CUE.test(itemText) || EMAIL_CUE.test(itemText);
+}
+
+/**
  * The answer type to READ for a stored meta entry: its own `answerType` for an
  * information item, "text" when an information item has none yet, undefined for
  * a document (documents are uploaded, never answered).

@@ -146,6 +146,19 @@ describe("extractor validator: answerType + answerTypeQuote", () => {
     assert.equal(answerTypeQuoteOk("the dates", n(page), ITEM), false);
   });
 
+  test("a mixed item claimed as date WITH a whole-item quote is still text", () => {
+    const MIXED = "your partner’s name, date of birth and passport number";
+    const v = validateExtractedVisa(
+      {
+        ...base, requiredDocuments: [MIXED], citations: { "requiredDocuments.0": MIXED },
+        requiredDocumentMeta: [{ kind: "information", kindQuote: LEAD, need: "required", answerType: "date", answerTypeQuote: MIXED }],
+      },
+      { pageText: `${LEAD}: ${MIXED}.` }
+    ).requiredDocumentMeta!;
+    assert.equal(v[0].answerType, "text");
+    assert.equal(v[0].answerTypeQuote, undefined);
+  });
+
   test("a model claiming date with a fragment quote on a mixed item falls back to text", () => {
     const MIXED = "your partner’s name, date of birth and passport number";
     const pg = `${LEAD}: ${MIXED}.`;

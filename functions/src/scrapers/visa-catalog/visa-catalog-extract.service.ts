@@ -2,6 +2,7 @@ import {
   classifyAnswerType,
   classifyNeed,
   extractConditionalClause,
+  hasMixedOrEmailCue,
   isAnswerType,
   type RequiredDocumentMeta,
 } from "./required-document-meta";
@@ -382,7 +383,13 @@ function validateItemMeta(
     const rawTypeQuote = typeof m.answerTypeQuote === "string" ? m.answerTypeQuote.trim() : "";
     // Kept only when it is in the set, is not the model's "unsure" (text), and
     // its quote is verbatim page text about THIS item (see answerTypeQuoteOk).
-    if (isAnswerType(rawType) && rawType !== "text" && answerTypeQuoteOk(rawTypeQuote, page, itemText)) {
+    // An item with a mixed-field or email cue never keeps the model's type: the rule decides.
+    if (
+      isAnswerType(rawType) &&
+      rawType !== "text" &&
+      !hasMixedOrEmailCue(itemText) &&
+      answerTypeQuoteOk(rawTypeQuote, page, itemText)
+    ) {
       out.answerType = rawType;
       out.answerTypeQuote = rawTypeQuote;
     } else {
