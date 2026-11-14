@@ -250,10 +250,9 @@ class OfficialDomainsService {
   /**
    * The exact hosts whose status is `confirmed`, for ANY authority.
    *
-   * Only the guidance crawl still uses this (its per-source policy moves to
-   * `confirmedHostsFor(source.jurisdiction)` once the EU-law reader branch,
-   * which edits the same check, has merged). Every other caller asks for one
-   * authority's hosts.
+   * No crawl uses this any more: every fetch policy, including the guidance
+   * crawl's, asks for ONE authority's hosts through `confirmedHostsFor`. Kept
+   * for admin listings and tests only; never use it to decide what to fetch.
    */
   async confirmedHosts(): Promise<Set<string>> {
     const snap = await collections.officialDomains.where("status", "==", "confirmed").get();
