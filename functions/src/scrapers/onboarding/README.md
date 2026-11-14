@@ -61,6 +61,33 @@ Run statuses: `preparing | awaiting_confirmation | running | waiting_for_publish
   `_allowlist_added`, `_settings_changed`). Index: `routeOnboardingRuns`
   (`status`, `createdAt` desc) in `firestore.indexes.json`.
 
+## The automatic re-draft waits for an active run (issue #225)
+
+When a route already has a rulebook, `onGuidanceSourceChanged` starts a paid
+re-draft whenever a page's stored text changes. A run re-reads the pages, so
+that trigger now goes through `routeOnboardingService.guardedRedraft`
+(`onboarding-redraft.ts`) first:
+
+- **Run active** (`preparing`, `awaiting_confirmation`, `running`,
+  `waiting_for_publish`): nothing is started. The deferral is recorded on
+  `routeOnboardingRoutes/{routeKey}` (`deferredRedraft`, `redraftDeferredPending`)
+  and the trigger's result is `refused` / `onboarding_run_active`. The run
+  drafts after the admin confirms.
+- **No run active**: unchanged behaviour. The trigger takes a short claim on
+  the head (`redraftClaims`) while its `startJob` pins the snapshots. A run
+  created in that window waits in `read_rule_pages` until the claim is released
+  or expires, so it never crawls a page under the trigger's job. The head is
+  read and written in a transaction by both `start()` and the guard, so the two
+  cannot both miss each other.
+- **The run ends** (any final status): the deferral is re-evaluated through
+  the same guard, with the same start the trigger makes. The drafting job's
+  hash gate and deterministic id decide: the run drafted the change, so
+  nothing starts (no double spend); the run failed or was cancelled first, so
+  the normal re-draft starts (nothing lost). If the run's own job is still
+  being cancelled, the deferral stays, and the 5-minute sweep tries again.
+- **The guard cannot be read** (a database error): the trigger starts nothing
+  (it fails closed, because money is involved).
+
 ## Settings: `appConfig/routeOnboardingSettings`
 
 Shared with the registry (it ignores these fields and this ignores its). Fail

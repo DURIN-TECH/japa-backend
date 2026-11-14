@@ -70,6 +70,8 @@ import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSet
 import { rubricRouteKey, rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
 import type { RubricHead } from "../../types/rubric";
 import type { StartJobInput, StartJobResult } from "./rubric-extraction-job";
+// (#225) The guard that defers the automatic re-draft to an active onboarding run (pure module: no cycle).
+import { deferredResult, GUARD_UNAVAILABLE_REASON_CODE, type RedraftGuard } from "../onboarding/onboarding-redraft";
 import { validateCriterionShape, validateVisaRubric } from "./rubric-validate";
 
 // ============================================
@@ -186,6 +188,9 @@ export interface RubricExtractionDeps {
   now?: () => Timestamp;
   // (#216) Starts a route's drafting job (default: the job service, resolved at call time).
   startJob?: (input: StartJobInput) => Promise<StartJobResult>;
+  // (#225) The guard that defers the automatic re-draft to an active route
+  // onboarding run (default: the onboarding service, resolved at call time).
+  redraftGuard?: RedraftGuard;
 }
 
 /**
@@ -2193,9 +2198,35 @@ export class RubricExtractionService {
     }
     for (const head of heads) {
       if (!(head.sourceIds ?? []).includes(event.sourceId)) continue;
-      results.push(await this.startJob({ countryCode: head.countryCode, visaTypeId: head.visaTypeId, trigger: "guidance_changed" }));
+      const input: StartJobInput = { countryCode: head.countryCode, visaTypeId: head.visaTypeId, trigger: "guidance_changed" };
+      // (#225) Every start goes through the onboarding guard: while a route
+      // onboarding run is active for this route, nothing is started (the run
+      // drafts after an admin confirms its estimate) and the deferral is
+      // recorded on the run's route head, to be re-evaluated when the run ends.
+      // With no active run the start is exactly the one above.
+      try {
+        const guard = await this.redraftGuard();
+        const out = await guard.guardedRedraft({ routeKey: head.routeKey, countryCode: head.countryCode, visaTypeId: head.visaTypeId, sourceId: event.sourceId }, () => this.startJob(input));
+        results.push(out.kind === "deferred" ? deferredResult(head.routeKey, out.runId, out.status) : out.result);
+      } catch (err) {
+        // The guard could not be read: FAIL CLOSED (money). Nothing is started;
+        // the route stays stale and `runPending` (or the next change) picks it up.
+        console.error(`${TAG} source ${event.sourceId}: the onboarding guard for ${head.routeKey} could not be read, so no re-draft was started (${(err as { code?: unknown })?.code ?? (err as Error)?.name ?? "error"})`);
+        results.push({ routeKey: head.routeKey, outcome: "refused", jobId: null, jobStatus: null, reasonCode: GUARD_UNAVAILABLE_REASON_CODE, message: "the onboarding guard could not be read; nothing was started", plan: [], estimate: null });
+      }
     }
     return results;
+  }
+
+  /**
+   * (#225) The re-draft guard (injectable for tests). The default resolves the
+   * onboarding service at CALL time: it imports the job module, which imports
+   * this one, so a top-level import would make a cycle.
+   */
+  private async redraftGuard(): Promise<RedraftGuard> {
+    if (this.deps.redraftGuard) return this.deps.redraftGuard;
+    const { routeOnboardingService } = await import("../onboarding/route-onboarding.service");
+    return routeOnboardingService;
   }
 
   /**

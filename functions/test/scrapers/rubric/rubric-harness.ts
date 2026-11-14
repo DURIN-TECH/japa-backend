@@ -291,6 +291,9 @@ export function makeHarness(deps: Partial<RubricExtractionDeps> = {}): Harness {
     loadSettings: async () => ({ settings: h.settings, ...(h.state.readError ? { readError: h.state.readError } : {}) }),
     visaTypeExists: async (cc, id) => h.state.knownVisaTypes.has(`${cc}/${id}`),
     now: () => Timestamp.fromMillis(h.state.nowMs),
+    // (#225) No onboarding run exists in the rubric tests: the re-draft guard
+    // lets every start through (the onboarding tests wire the real guard).
+    redraftGuard: { guardedRedraft: async (_input, start) => ({ kind: "ran", result: await start(), settled: false }) },
     ...deps,
   });
   return h;
