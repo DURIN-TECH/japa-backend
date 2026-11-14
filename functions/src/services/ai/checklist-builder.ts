@@ -293,7 +293,12 @@ export function buildChecklist(input: BuildChecklistInput): ChecklistResult {
       ...(meta.kindQuote ? { kindQuote: meta.kindQuote } : {}),
       need: meta.need,
       ...(meta.appliesWhen ? { appliesWhen: meta.appliesWhen } : {}),
-      reason: "Listed as a document you must provide on the official visa page.",
+      // The reason follows the item's kind (#187 e2e): an information item is
+      // something you type into the official online form, not a document.
+      reason:
+        meta.kind === "information"
+          ? "Listed as information you give in your online application on the official visa page."
+          : "Listed as a document you must provide on the official visa page.",
       citation: { quote, url },
     });
   });

@@ -55,6 +55,25 @@ describe("checklist builder: an item without a citation is never shown", () => {
     assert.equal(noUrl.state, "no_checklist");
   });
 
+  // #187 e2e: an information item must not say "a document you must provide".
+  test("the reason follows the item's kind: information vs document", () => {
+    const record = {
+      requiredDocuments: ["all your names", "your current passport"],
+      scrapeMeta: {
+        sourceUrl: "https://www.gov.uk/uk-family-visa",
+        citations: { "requiredDocuments.0": "all your names", "requiredDocuments.1": "your current passport" },
+        requiredDocumentMeta: [
+          { item: "all your names", kind: "information" as const, need: "required" as const },
+          { item: "your current passport", kind: "document" as const, need: "required" as const },
+        ],
+      },
+    };
+    const out = buildChecklist({ rubric: null, visaRecord: record, intakeAnswers: null });
+    const byTitle = Object.fromEntries(out.items.map((i) => [i.title, i.reason]));
+    assert.match(byTitle["all your names"], /information you give in your online application/);
+    assert.match(byTitle["your current passport"], /a document you must provide/);
+  });
+
   test("a document named by both sources is listed once", () => {
     const out = buildChecklist({
       rubric: rubric([item("p", { title: "Passport" })]),

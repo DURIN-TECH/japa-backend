@@ -27,7 +27,15 @@ export type RegistryAuditAction =
   | "visa_page_added"
   | "source_added"
   | "source_changed"
-  | "route_registered";
+  | "route_registered"
+  // Route onboarding runs (issue #217): who started, confirmed (the number they
+  // saw) and cancelled a run, who added a route to the publish allow-list
+  // through it, and who changed the onboarding settings.
+  | "onboarding_started"
+  | "onboarding_confirmed"
+  | "onboarding_cancelled"
+  | "onboarding_allowlist_added"
+  | "onboarding_settings_changed";
 
 /** One audit entry as stored. */
 export interface RegistryAuditEntry {
@@ -35,7 +43,7 @@ export interface RegistryAuditEntry {
   // uid of the admin (or "system:..." for an automatic consequence such as a revoke pausing a source).
   actorUid: string;
   at: Timestamp;
-  // What the entry is about: "officialDomain" | "country" | "visaSource" | "guidanceSource" | "route".
+  // What the entry is about: "officialDomain" | "country" | "visaSource" | "guidanceSource" | "route" | "onboardingRun" | "setting".
   targetType: string;
   targetId: string;
   // The object before and after the change (null when it did not exist / no longer applies).

@@ -111,6 +111,12 @@ scrapers/
 Tests mirror this layout under `functions/test/scrapers/`; shared test helpers
 stay in `functions/test/helpers/`.
 
+## Route onboarding runs (`onboarding/`; issue #217)
+
+One run per route takes registered pages to a published or held rulebook, with a
+stored step list, a spend estimate the admin must confirm before any model call,
+progress, cancel and crash-safe advancing. See `onboarding/README.md`.
+
 ## Paths that moved with the code
 
 - **Eval** (`visa-catalog/eval/`): excluded from the build (`tsconfig.json`),

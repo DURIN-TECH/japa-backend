@@ -154,6 +154,18 @@ export const collections = {
   officialDomainPreviews: db.collection("officialDomainPreviews"),
   sourceRegistryAudit: db.collection("sourceRegistryAudit"),
   sourceRegistryRateLimits: db.collection("sourceRegistryRateLimits"),
+  // Route onboarding runs (issue #217): one document per attempt to take a
+  // registered route from its sources to a published or held rulebook
+  // (`routeOnboardingRuns/{routeKey}__r{n}`: status, ordered step list, the
+  // estimate the admin confirmed, counters, links, lease). The document is also
+  // the worker's trigger. `routeOnboardingRoutes/{routeKey}` is the per-route
+  // head: the run counter and the id of the run that is active, read and
+  // written in the same transaction that creates a run, so a double click
+  // cannot open two runs for one route. Both are backend-only (no
+  // firestore.rules match): a client that could write them could start, confirm
+  // or cancel a run that spends model calls.
+  routeOnboardingRuns: db.collection("routeOnboardingRuns"),
+  routeOnboardingRoutes: db.collection("routeOnboardingRoutes"),
   // Published outcome statistics (issue #116): decision counts per destination,
   // published category and nationality, imported from a government's own
   // statistics release (src/scrapers/outcome-statistics). One doc per

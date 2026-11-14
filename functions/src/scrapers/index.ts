@@ -65,6 +65,11 @@ export type { ManualCostInput } from "./visa-catalog/visa-manual-cost";
 /** Firestore doc-id check shared with the visa change routes. */
 export { isValidDocId } from "./visa-catalog/changes/visa-catalog-changes.service";
 
+// ---- Route onboarding runs (issue #217) ----
+/** Admin routes, and the service the worker / sweep / wake-up triggers in src/index.ts call. */
+export { adminRouteOnboardingRoutes } from "./onboarding/onboarding.routes";
+export { routeOnboardingService } from "./onboarding/route-onboarding.service";
+
 // ---- Source registry API (issue #215) ----
 /** Confirmed official websites + route registration (admin only). */
 export { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./shared/registry/registry.routes";
@@ -129,7 +134,7 @@ export { evaluateGates, acknowledgementsFor, buildExclusionNote, sampleAudit, re
 export type { GateInput, GateReport, GateFlag, GateCheckerResult, FlagResolution, SampleAuditRule } from "./rubric/rubric-gates";
 export type { ScrapeAlertsConfig } from "./shared/alerts/types";
 /** The two rubric alert rules, raised by the publish pipeline (`scrapeAlertService.raise`). */
-export { evaluateRubricAutoPublished, evaluateRubricDraftHeld, evaluateRubricHeldCleared } from "./shared/alerts/scrape-alert-rules";
+export { evaluateRubricAutoPublished, evaluateRubricDraftHeld, evaluateRubricHeldCleared, evaluateRouteOnboardingAttention, evaluateRouteOnboardingCleared } from "./shared/alerts/scrape-alert-rules";
 export type { RubricPublishAlertFacts, RubricAlertRule, RuleEvaluation } from "./shared/alerts/scrape-alert-rules";
 /** Rubric types for consumers (the assessment engine, #42). Type-only. */
 export type {
