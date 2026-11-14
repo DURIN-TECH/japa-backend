@@ -94,7 +94,7 @@ describe("approved visas are classified through a proposal (#187)", () => {
     assert.deepEqual(d.changes[0], {
       item: STAY,
       before: { kind: "document", need: "required", kindReview: true },
-      after: { kind: "information", need: "required" },
+      after: { kind: "information", answerType: "text", need: "required" },
     });
   });
 

@@ -30,9 +30,11 @@
 import type { EvidenceItem, IntakeCondition, VisaRubric } from "../../types/rubric";
 import type { DocumentRequestCitation } from "../../types";
 import {
+  answerTypeOf,
   findMetaForItem,
   metaFromQuoteOnly,
   normaliseStoredMeta,
+  type AnswerType,
   type DocumentKind,
   type DocumentNeed,
   type RequiredDocumentMeta,
@@ -58,6 +60,10 @@ export interface ChecklistItem {
   kindReview?: true;
   /** Issue #187: verbatim page text behind `kind` (or the lead-in). */
   kindQuote?: string;
+  /** Issue #187 regroom: answer shape of an information item; absent on documents. */
+  answerType?: AnswerType;
+  /** Issue #187 regroom: verbatim page text behind `answerType` (absent when the rule decided). */
+  answerTypeQuote?: string;
   /** Issue #187: required | conditional | optional. `required` above is true ONLY for "required". */
   need: DocumentNeed;
   /** Issue #187: verbatim "if ..." / "unless ..." / "depending on ..." clause or lead-in. */
@@ -291,6 +297,8 @@ export function buildChecklist(input: BuildChecklistInput): ChecklistResult {
       kind: meta.kind,
       ...(meta.kindReview ? { kindReview: true as const } : {}),
       ...(meta.kindQuote ? { kindQuote: meta.kindQuote } : {}),
+      ...(answerTypeOf(meta) ? { answerType: answerTypeOf(meta) } : {}),
+      ...(meta.kind === "information" && meta.answerTypeQuote ? { answerTypeQuote: meta.answerTypeQuote } : {}),
       need: meta.need,
       ...(meta.appliesWhen ? { appliesWhen: meta.appliesWhen } : {}),
       // The reason follows the item's kind (#187 e2e): an information item is

@@ -28,6 +28,11 @@
 //  - "may" never counts: "details of any offences you may have committed" stays
 //    required (QA on #175).
 //  - `appliesWhen` is always a verbatim slice of the quote it came from.
+//  - `answerType` (information items only, issue #187 regroom) says what SHAPE
+//    the applicant's answer takes (date, date_range, money, address, list,
+//    text). It must be traceable to the item's OWN words: the model returns it
+//    with a verbatim `answerTypeQuote`; when that is missing, invalid or not on
+//    the page, `classifyAnswerType` decides from the item's text; `text` last.
 //
 // This module is PURE (no Firebase, no model call, no I/O) so the extractor's
 // validator, the read-time derivation, the checklist builder and the backfill
@@ -41,6 +46,18 @@ export type DocumentKind = "document" | "information";
 /** How firmly the page asks for the item. */
 export type DocumentNeed = "required" | "conditional" | "optional";
 
+/**
+ * The shape of the answer to an INFORMATION item (issue #187 regroom). A type
+ * is added only when a real item on a real official page needs it.
+ */
+export const ANSWER_TYPES = ["date", "date_range", "money", "address", "list", "text"] as const;
+export type AnswerType = (typeof ANSWER_TYPES)[number];
+
+/** True for a string that is one of ANSWER_TYPES. */
+export function isAnswerType(v: unknown): v is AnswerType {
+  return typeof v === "string" && (ANSWER_TYPES as readonly string[]).includes(v);
+}
+
 /** The stored classification of ONE required-document item. */
 export interface RequiredDocumentMeta {
   // The item's own text (as in `requiredDocuments`). Meta is matched to items
@@ -53,6 +70,13 @@ export interface RequiredDocumentMeta {
   kindReview?: true;
   // Verbatim page text that backs `kind` (or the lead-in an item sits under).
   kindQuote?: string;
+  // Issue #187 regroom: the answer shape of an INFORMATION item. Absent on
+  // documents. Absent on an information item stored before the regroom (read as
+  // "text" until the backfill sets it).
+  answerType?: AnswerType;
+  // Verbatim page text that backs `answerType`; absent when the type came from
+  // the deterministic rule (classifyAnswerType) instead of the model.
+  answerTypeQuote?: string;
   need: DocumentNeed;
   // Verbatim "if ..." / "unless ..." / "depending on ..." clause, or the
   // "Depending on your circumstances ..." lead-in. Only when need is conditional.
@@ -201,6 +225,59 @@ export function classifyNeed(
   return { need: "required" };
 }
 
+// ----- Answer type rules (issue #187 regroom) -----
+
+// Words that make an item a LIST of entries (several people / places / events,
+// the applicant adds as many as apply): "details of any ...", a "history",
+// "any family members", "anyone paying", "all your names", "parents' names".
+const LIST_CUE =
+  /\bdetails of any\b|\bhistory\b|\bfamily members\b|\banyone\b|\ball your names\b|\bparents['\u2019]? names\b/i;
+// An address ("your employer's address and telephone number" stays an address:
+// the phone goes in the address note) or "where you'll be staying".
+const ADDRESS_CUE = /\baddress\b|\bwhere you['\u2019]ll be staying\b/i;
+// Other single fields that make the item a MIXED one (text): the app has no
+// shape for "name, date of birth and passport number" in one box.
+const OTHER_FIELD_CUE =
+  /\b(?:name|number|nationality|passport|job title|licence|reference|sponsorship|code|national insurance|partner)\b/i;
+// An amount of money: "how much you think your trip will cost", "how much you
+// earn in a year", salary, income.
+const MONEY_CUE = /\bhow much\b|\bsalary\b|\bearn\b|\bcost\b|\bincome\b/i;
+// A single date ("your date of birth") vs a span ("the dates you're planning to travel").
+const DATE_CUE = /\bdate of birth\b|\bdate\b/i;
+const DATES_CUE = /\bdates\b/i;
+
+/**
+ * Decide the answer type of one INFORMATION item from the item's OWN words
+ * (pure, deterministic; no model). Order matters and mirrors the regroom:
+ *   list -> address -> mixed fields (text) -> money -> date_range / date -> text.
+ * `text` is always last: when no cue matches, or the item mixes several fields,
+ * the applicant gets the plain box (never a guessed shape).
+ * `matched` is false when the result is the `text` fallback, so a backfill can
+ * log every item that fell back.
+ */
+export function classifyAnswerType(itemText: string): { type: AnswerType; matched: boolean } {
+  const t = itemText.trim();
+  if (LIST_CUE.test(t)) return { type: "list", matched: true };
+  if (ADDRESS_CUE.test(t)) return { type: "address", matched: true };
+  // A mixed item ("job title and annual salary", "partner's name, date of
+  // birth and passport number") stays text even though it has a money / date cue.
+  if (OTHER_FIELD_CUE.test(t)) return { type: "text", matched: false };
+  if (MONEY_CUE.test(t)) return { type: "money", matched: true };
+  if (DATES_CUE.test(t)) return { type: "date_range", matched: true };
+  if (DATE_CUE.test(t)) return { type: "date", matched: true };
+  return { type: "text", matched: false };
+}
+
+/**
+ * The answer type to READ for a stored meta entry: its own `answerType` for an
+ * information item, "text" when an information item has none yet, undefined for
+ * a document (documents are uploaded, never answered).
+ */
+export function answerTypeOf(meta: Pick<RequiredDocumentMeta, "kind" | "answerType">): AnswerType | undefined {
+  if (meta.kind !== "information") return undefined;
+  return isAnswerType(meta.answerType) ? meta.answerType : "text";
+}
+
 /**
  * Meta for an item that has no stored classification (a scraped visa crawled
  * before #187, or one the backfill has not reached): kind is NOT known, so it
@@ -234,6 +311,13 @@ export function normaliseStoredMeta(
     s.need === "conditional" || s.need === "optional" || s.need === "required" ? s.need : "required";
   const out: RequiredDocumentMeta = { kind, need };
   if (s.kindReview === true) out.kindReview = true;
+  // The answer type belongs to information items only; an unknown value is dropped.
+  if (kind === "information" && isAnswerType(s.answerType)) {
+    out.answerType = s.answerType;
+    if (typeof s.answerTypeQuote === "string" && s.answerTypeQuote.trim()) {
+      out.answerTypeQuote = s.answerTypeQuote.trim();
+    }
+  }
   if (typeof s.kindQuote === "string" && s.kindQuote.trim()) out.kindQuote = s.kindQuote.trim();
   if (need === "conditional" && typeof s.appliesWhen === "string" && s.appliesWhen.trim()) {
     out.appliesWhen = s.appliesWhen.trim();

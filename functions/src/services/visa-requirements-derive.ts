@@ -28,7 +28,7 @@
 
 import { Timestamp } from "firebase-admin/firestore";
 import type { RequiredDocument, VisaRequirement, VisaType } from "../types";
-import { findMetaForItem, metaFromQuoteOnly, normaliseStoredMeta } from "../scrapers";
+import { answerTypeOf, findMetaForItem, metaFromQuoteOnly, normaliseStoredMeta } from "../scrapers";
 
 // Id of the single derived requirement. Stable so clients can key on it.
 export const DERIVED_REQUIREMENT_ID = "scraped-required-documents";
@@ -72,6 +72,9 @@ export function deriveRequirementsFromScrape(visa: VisaType): VisaRequirement[] 
       kind: meta.kind,
       ...(meta.kindReview ? { kindReview: true as const } : {}),
       ...(meta.kindQuote ? { kindQuote: meta.kindQuote } : {}),
+      // Information items carry their answer type ("text" until typed); documents none.
+      ...(answerTypeOf(meta) ? { answerType: answerTypeOf(meta) } : {}),
+      ...(meta.kind === "information" && meta.answerTypeQuote ? { answerTypeQuote: meta.answerTypeQuote } : {}),
       need: meta.need,
       ...(meta.appliesWhen ? { appliesWhen: meta.appliesWhen } : {}),
     });

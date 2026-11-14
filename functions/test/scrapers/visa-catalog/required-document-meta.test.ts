@@ -84,7 +84,7 @@ describe("extractor validator (kind + need)", () => {
       { pageText: page }
     );
     const m = v.requiredDocumentMeta!;
-    assert.deepEqual(m[0], { item: docs[0], kind: "information", kindQuote: INFO_LEAD, need: "required" });
+    assert.deepEqual(m[0], { item: docs[0], kind: "information", kindQuote: INFO_LEAD, answerType: "address", need: "required" });
     assert.equal(m[1].need, "conditional");
     assert.equal(m[1].appliesWhen, "if you have an income");
     assert.equal(m[2].appliesWhen, "if you’re visiting for more than 6 months");

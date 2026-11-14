@@ -1,6 +1,8 @@
 import {
+  classifyAnswerType,
   classifyNeed,
   extractConditionalClause,
+  isAnswerType,
   type RequiredDocumentMeta,
 } from "./required-document-meta";
 import type {
@@ -96,10 +98,15 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *    IHS 5175 instead of the 2y9m 3105). The surcharge rule now says to take the
  *    amount the page gives for THIS visa's own stay length, never a longer
  *    option listed beside it (same intent as v4's surcharge-total rule).
+ *  - "2026-11-answer-types-v9" (#187 regroom): each INFORMATION item also gets
+ *    an `answerType` (date | date_range | money | address | list | text) with a
+ *    verbatim `answerTypeQuote`. The validator drops a type outside the set or a
+ *    quote not on the page and decides from the item's own words instead
+ *    (classifyAnswerType), `text` last.
  * Before merging a bump (or a model change), run `npm run eval:visa-extract`
  * and attach the result — see functions/src/scrapers/visa-catalog/eval/README.md.
  */
-export const EXTRACTOR_PROMPT_VERSION = "2026-11-item-kinds-v8";
+export const EXTRACTOR_PROMPT_VERSION = "2026-11-answer-types-v9";
 
 // A duration phrase: a number (digits or a word) followed by year(s)/month(s),
 // e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
@@ -311,6 +318,20 @@ function itemListedUnder(page: string, lead: string, text: string): boolean {
 }
 
 /**
+ * Is `quote` an acceptable `answerTypeQuote` for the item `itemText`? It must
+ * be non-empty, appear verbatim on the page (normalised as citations are; when
+ * the page is unavailable only non-emptiness is checked) and be about THIS
+ * item: it contains the item's text, or is a piece of it. Characters only.
+ */
+export function answerTypeQuoteOk(quote: string, page: string | undefined, itemText: string): boolean {
+  if (quote.length === 0) return false;
+  const nq = normForQuote(quote);
+  if (page !== undefined && !page.includes(nq)) return false;
+  const own = normForQuote(itemText);
+  return nq.includes(own) || own.includes(nq);
+}
+
+/**
  * Validate ONE item's classification (issue #187). Never throws and never
  * drops the item: a classification that cannot be verified degrades to the
  * safe default instead.
@@ -347,6 +368,21 @@ function validateItemMeta(
     kindQuote !== null
       ? { item: itemText, kind: claimedKind, kindQuote, need: "required" }
       : { item: itemText, kind: "document", kindReview: true, need: "required" };
+
+  // ---- answer type (information items only) ----
+  if (out.kind === "information") {
+    const rawType = typeof m.answerType === "string" ? m.answerType.trim() : "";
+    const rawTypeQuote = typeof m.answerTypeQuote === "string" ? m.answerTypeQuote.trim() : "";
+    // Kept only when it is in the set, is not the model's "unsure" (text), and
+    // its quote is verbatim page text about THIS item (see answerTypeQuoteOk).
+    if (isAnswerType(rawType) && rawType !== "text" && answerTypeQuoteOk(rawTypeQuote, page, itemText)) {
+      out.answerType = rawType;
+      out.answerTypeQuote = rawTypeQuote;
+    } else {
+      // Deterministic fallback from the item's own words; `text` last.
+      out.answerType = classifyAnswerType(itemText).type;
+    }
+  }
 
   // ---- need (+ appliesWhen) ----
   const decided = classifyNeed(itemQuote, out.kindQuote, itemText);
@@ -925,7 +961,7 @@ export function buildSystemPrompt(): string {
     "",
     // ---- #187: what kind of item it is, and how firmly the page asks for it ----
     "DOCUMENT KIND AND NEED (requiredDocumentMeta; one object per requiredDocuments item, SAME order, SAME length):",
-    "  { \"kind\": \"document\"|\"information\", \"kindQuote\": string, \"need\": \"required\"|\"conditional\"|\"optional\", \"appliesWhen\": string (only when need is conditional) }",
+    "  { \"kind\": \"document\"|\"information\", \"kindQuote\": string, \"need\": \"required\"|\"conditional\"|\"optional\", \"appliesWhen\": string (only when need is conditional), \"answerType\": \"date\"|\"date_range\"|\"money\"|\"address\"|\"list\"|\"text\" (information items only), \"answerTypeQuote\": string (information items only) }",
     "- kind: judge ONLY from the page's own wording. 'document' = something the applicant uploads or hands over",
     "  (a passport, a certificate, a letter, bank statements). 'information' = something the applicant types in or",
     "  states on the form (dates of travel, an address, a name, details of offences) - typically listed under a",
@@ -936,6 +972,15 @@ export function buildSystemPrompt(): string {
     "- kindQuote: a verbatim quote from the page that supports the kind: the lead-in sentence of the item's list,",
     "  or the item's own words. For an item listed under 'Depending on your circumstances, you might also need to",
     "  provide:' use that lead-in as its kindQuote. A kindQuote that is not on the page makes the kind be ignored.",
+    "- answerType (information items only; omit for documents): the SHAPE of the answer the applicant types in,",
+    "  judged from the item's own words: 'date' = one calendar date (a date of birth); 'date_range' = a start and an",
+    "  end date (the dates you're planning to travel); 'money' = an amount (how much a trip will cost, how much you",
+    "  earn); 'address' = a postal address (where you'll be staying, a home address); 'list' = any number of separate",
+    "  entries (travel history, details of any ..., all your names, family members); 'text' = anything else, and",
+    "  every item that asks for SEVERAL different fields at once (a name AND a date of birth AND a passport number).",
+    "  When unsure use 'text'. Do not invent other types.",
+    "- answerTypeQuote (information items only): the item's own words copied word for word from the page (the same",
+    "  text as the item). A quote that is not on the page makes the answerType be ignored.",
     "- need: 'conditional' when the item's own quote has an 'if ...', 'unless ...' or 'depending on ...' clause, or",
     "  when the item sits under the lead-in 'Depending on your circumstances, you might also need to provide:'.",
     "  'optional' only when the page says 'optional'. Otherwise 'required'. The word 'may' NEVER makes an item",
