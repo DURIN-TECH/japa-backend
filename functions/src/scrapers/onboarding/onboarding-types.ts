@@ -1,4 +1,6 @@
 import type { Timestamp } from "firebase-admin/firestore";
+// (#225) Type-only: the head also carries the automatic re-draft's claims and deferral.
+import type { RedraftHeadFields } from "./onboarding-redraft";
 
 // ============================================
 // ROUTE ONBOARDING RUN — TYPES (issue #217, part P3 of umbrella #211)
@@ -221,8 +223,13 @@ export interface RouteOnboardingRun {
   handedToSafeguardsAt: Timestamp | null;
 }
 
-/** `routeOnboardingRoutes/{routeKey}`. */
-export interface RouteOnboardingHead {
+/**
+ * `routeOnboardingRoutes/{routeKey}`. (#225) Also the meeting point of the
+ * automatic re-draft and the runs: its claims and deferral (see
+ * onboarding-redraft.ts). A head may exist with `lastSeq: 0` when the trigger
+ * wrote it before any run was started.
+ */
+export interface RouteOnboardingHead extends RedraftHeadFields {
   routeKey: string;
   // Runs created so far (the next run is `r{lastSeq + 1}`).
   lastSeq: number;
