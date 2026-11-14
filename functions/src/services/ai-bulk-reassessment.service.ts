@@ -2,7 +2,8 @@ import { createHash } from "crypto";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { collections, db } from "../utils/firebase";
-import { applyExclusions, rubricStore, type VisaRubric } from "../scrapers";
+import { applyExclusions, layerVersionsOf, rubricStore, sameStackVersions, type RulebookStack, type VisaRubric } from "../scrapers";
+import { defaultRulebookStack, rulebookStackFor, type ApplicationStackRef } from "./ai/application-rulebook";
 import type { Application } from "../types";
 import {
   READINESS_BANDS,
@@ -184,6 +185,10 @@ export interface BulkDeps {
   // The approved rubric of a route, and any version of it (for the diff).
   getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null>;
   getRubricVersion(routeKey: string, version: number): Promise<VisaRubric | null>;
+  // (#233) The application's merged rulebook STACK (services/ai/application-rulebook.ts).
+  // Set by the default deps; without it the own layer alone is read (every
+  // route without inheritance), which is how fakes written before #233 behave.
+  getRulebookStack?(app: ApplicationStackRef): Promise<RulebookStack>;
   loadBytes(storagePath: string): Promise<Buffer>;
   readSettings: typeof readAiSettings;
   notify: typeof notificationService.notifyUser;
@@ -198,6 +203,7 @@ function defaultDeps(): BulkDeps {
     batches: new AnthropicBatchProvider(),
     getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc, vt),
     getRubricVersion: (routeKey, version) => rubricStore.getVersionForReview(routeKey, version),
+    getRulebookStack: (app) => defaultRulebookStack(app),
     loadBytes: async (storagePath) => {
       const [bytes] = await getStorage().bucket().file(storagePath).download();
       return bytes;
@@ -521,11 +527,21 @@ export class BulkReassessmentService {
     const app = { id: appSnap.id, ...appSnap.data() } as Application;
     if (EXCLUDED_APPLICATION_STATUSES.includes(app.status)) return "excluded";
 
+    // (#233) An application on a rulebook STACK also records every layer's
+    // version: the job is planned on the stack as it stands now (the run's own
+    // layer at `run.rubricVersion`, the other layers at their approved
+    // versions), so the hash matches what `plan` recomputes. Read only when the
+    // application's stack has more than one layer; a single-layer application
+    // is handled exactly as before.
+    const stack = await this.stackOf(app);
+    const layerVersions = stack?.usable && stack.rubric ? layerVersionsOf(stack.rubric) : undefined;
+    if (stack && stack.layers.length > 1 && !layerVersions) return "excluded"; // no usable stack: nothing to re-assess against
+
     const previous = await this.latestSucceeded(applicationId);
-    if (previous && previous.rubricVersion === run.rubricVersion) return "already_current";
+    if (previous && sameStackVersions({ version: previous.rubricVersion, layerVersions: previous.layerVersions }, { version: run.rubricVersion, layerVersions })) return "already_current";
 
     const loaded = await this.deps.officer.loadInputs(app);
-    const inputHash = computeInputHash(this.deps.officer.inputsFor(loaded, run.rubricVersion));
+    const inputHash = computeInputHash(this.deps.officer.inputsFor(loaded, run.rubricVersion, layerVersions));
     const id = assessmentIdFor(app.id, inputHash);
 
     const job: ApplicationAssessment = {
@@ -533,6 +549,8 @@ export class BulkReassessmentService {
         id,
         app,
         rubricVersion: run.rubricVersion,
+        layerVersions,
+        rulebookLayers: layerVersions && stack?.rubric ? stack.rubric.stackLayers : undefined,
         inputHash,
         trigger: "rubric_bump",
         requestedBy: "system",
@@ -560,6 +578,14 @@ export class BulkReassessmentService {
       if (isAlreadyExists(err)) return "already_current";
       throw err;
     }
+  }
+
+  /**
+   * (#233) The application's stack when the deps can read one, else null (a
+   * reader without stack support: the own layer only, exactly as before).
+   */
+  private async stackOf(app: Application): Promise<RulebookStack | null> {
+    return this.deps.getRulebookStack ? this.deps.getRulebookStack(app) : null;
   }
 
   /** The newest succeeded assessment of an application (any version), or null. */
@@ -646,12 +672,15 @@ export class BulkReassessmentService {
       return { kind: "stop", code: "application_closed", message: "the application is closed, submitted or withdrawn" };
     }
 
-    const fullRubric = await this.deps.getApprovedRubric(app.countryCode, app.visaTypeId);
-    if (!fullRubric || fullRubric.version !== doc.rubricVersion) {
+    // (#233) The application's rulebook stack (its own layer alone without
+    // inheritance). ANY layer's new version is "the rules changed".
+    const stack = await rulebookStackFor(app, this.deps);
+    const fullRubric = stack.usable ? stack.rubric : null;
+    if (!fullRubric || !sameStackVersions({ version: fullRubric.version, layerVersions: layerVersionsOf(fullRubric) }, { version: doc.rubricVersion, layerVersions: doc.layerVersions })) {
       return { kind: "stop", code: "rubric_changed", message: "the approved rubric changed after this re-assessment was queued" };
     }
     const loaded = await officer.loadInputs(app);
-    if (computeInputHash(officer.inputsFor(loaded, fullRubric.version)) !== doc.inputHash) {
+    if (computeInputHash(officer.inputsFor(loaded, fullRubric.version, layerVersionsOf(fullRubric))) !== doc.inputHash) {
       return { kind: "stop", code: "inputs_changed", message: "the application's inputs changed after this re-assessment was queued" };
     }
     // ---- which rules apply to THIS applicant (#207): see AiCaseOfficerService.execute ----
@@ -876,7 +905,11 @@ export class BulkReassessmentService {
     const direction = before < 0 || after < 0 ? "unknown" : after < before ? "down" : after > before ? "up" : "same";
 
     // Rubric-level diff: which criterion ids were added, removed or changed.
-    const old = await this.rubricVersionOf(rubric, previous.rubricVersion);
+    // (#233) Not for a merged STACK view: the previous stored version is ONE
+    // layer, and diffing the union against it would call every other layer's
+    // rule "added". The result-level diff below still holds. A per-layer diff
+    // belongs with the shared-layer fan-out (P4b).
+    const old = rubric.stackLayers ? null : await this.rubricVersionOf(rubric, previous.rubricVersion);
     let criteria: AssessmentChangeSummary["criteria"] = null;
     if (old) {
       const diff = diffRubricVersions(rubric, old);

@@ -1,7 +1,8 @@
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { collections, db } from "../utils/firebase";
-import { rubricRouteKey, rubricStore, type VisaRubric } from "../scrapers";
+import { layerVersionsOf, rubricRouteKey, rubricStore, sameStackVersions, type RulebookStack, type VisaRubric } from "../scrapers";
+import { defaultRulebookStack, rulebookStackFor, type ApplicationStackRef } from "./ai/application-rulebook";
 import type { Application, Document, DocumentInstance, EligibilityCheck, ProseMirrorDoc, User } from "../types";
 import { buildCountryContext, type CountryContextResult } from "./outcome-statistics/country-context";
 import type {
@@ -89,6 +90,11 @@ class JobStop extends Error {
 export interface RubricReader {
   getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null>;
   approvedVersionOf(countryCode: string, visaTypeId: string): Promise<number | null>;
+  // (#233) The application's whole rulebook STACK (shared layer(s) + its own),
+  // merged (services/ai/application-rulebook.ts). Set by the default deps; a
+  // reader without it reads the own layer alone (every route without
+  // inheritance), which is how fakes written before #233 behave.
+  getRulebookStack?(app: ApplicationStackRef): Promise<RulebookStack>;
 }
 
 /** Everything the service reaches outside Firestore. Injected for tests. */
@@ -198,6 +204,7 @@ function defaultDeps(): AssessmentDeps {
     provider: new AnthropicLlmProvider(),
     rubrics: {
       getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc, vt),
+      getRulebookStack: (app) => defaultRulebookStack(app),
       async approvedVersionOf(cc, vt) {
         const head = await rubricStore.getHead(rubricRouteKey(cc, vt));
         return head?.approvedVersion ?? null;
@@ -218,6 +225,10 @@ export function newAssessmentDoc(args: {
   id: string;
   app: Application;
   rubricVersion: number;
+  // (#233) Only for a stack of more than one layer: every layer's version, and
+  // the layer list (approved / missing). Absent for a single-layer route.
+  layerVersions?: Record<string, number | null>;
+  rulebookLayers?: ApplicationAssessment["rulebookLayers"];
   inputHash: string;
   trigger: AssessmentTrigger;
   requestedBy: string;
@@ -231,6 +242,9 @@ export function newAssessmentDoc(args: {
     countryCode: args.app.countryCode,
     visaTypeId: args.app.visaTypeId,
     rubricVersion: args.rubricVersion,
+    // (#233) Spread only when present: a single-layer assessment is unchanged.
+    ...(args.layerVersions ? { layerVersions: args.layerVersions } : {}),
+    ...(args.rulebookLayers ? { rulebookLayers: args.rulebookLayers } : {}),
     inputHash: args.inputHash,
     model: null,
     createdAt: Timestamp.fromDate(args.now),
@@ -351,9 +365,14 @@ export class AiCaseOfficerService {
 
   /** The hash inputs for a loaded set and rubric version. */
   // Public since #37 (bulk re-assessment recomputes the same hash).
-  inputsFor(loaded: LoadedInputs, rubricVersion: number): AssessmentInputs {
+  // (#233) `layerVersions` only for a stack of more than one layer: a new
+  // version of ANY layer then changes the hash. Absent (undefined) it leaves
+  // the hash of every single-layer route exactly as before (the canonical form
+  // skips undefined fields).
+  inputsFor(loaded: LoadedInputs, rubricVersion: number, layerVersions?: Record<string, number | null>): AssessmentInputs {
     return {
       rubricVersion,
+      ...(layerVersions ? { layerVersions } : {}),
       documents: loaded.documents.map((d) => ({ path: `${d.id}:${d.path}`, updatedAtMs: d.updatedAtMs })),
       statements: loaded.statements.map((s) => ({ instanceId: s.instanceId, contentHash: s.contentHash })),
       eligibilityAnswers: loaded.eligibilityAnswers,
@@ -381,11 +400,19 @@ export class AiCaseOfficerService {
     app: Application,
     opts: { tier: AssessmentTier; trigger: AssessmentTrigger; requestedBy: string; maxAttempts?: number }
   ): Promise<RequestOutcome> {
-    const rubric = await this.deps.rubrics.getApprovedRubric(app.countryCode, app.visaTypeId);
+    // (#233) The application's rulebook STACK (its own layer alone for a route
+    // without inheritance: exactly the approved rubric read before). A stack
+    // with no approved layer, or one the stack plan refuses, is `no_rubric`:
+    // never a partial result. A stack with SOME layer approved is assessed,
+    // and the missing layer is recorded on the assessment (`rulebookLayers`).
+    const stack = await this.rulebookStackOf(app);
+    const rubric = stack.usable ? stack.rubric : null;
     if (!rubric) return { kind: "no_rubric", routeKey: rubricRouteKey(app.countryCode, app.visaTypeId) };
+    const layerVersions = layerVersionsOf(rubric);
+    const rulebookLayers = layerVersions ? rubric.stackLayers : undefined;
 
     const loaded = await this.loadInputs(app);
-    const inputHash = computeInputHash(this.inputsFor(loaded, rubric.version));
+    const inputHash = computeInputHash(this.inputsFor(loaded, rubric.version, layerVersions));
     const assessmentId = assessmentIdFor(app.id, inputHash);
     const now = this.deps.now();
 
@@ -426,7 +453,7 @@ export class AiCaseOfficerService {
       if (opts.tier === "free" && isRerunOfChanged) return { kind: "upgrade_required" };
       tx.set(
         ref,
-        newAssessmentDoc({ id: assessmentId, app, rubricVersion: rubric.version, inputHash, trigger: opts.trigger, requestedBy: opts.requestedBy, now })
+        newAssessmentDoc({ id: assessmentId, app, rubricVersion: rubric.version, layerVersions, rulebookLayers, inputHash, trigger: opts.trigger, requestedBy: opts.requestedBy, now })
       );
       return { kind: "created", assessmentId, status: "queued", rubricVersion: rubric.version };
     });
@@ -495,7 +522,17 @@ export class AiCaseOfficerService {
    */
   async staleReasonOf(app: Application, assessment: ApplicationAssessment): Promise<StaleReason | null> {
     const loaded = await this.loadInputs(app);
-    if (computeInputHash(this.inputsFor(loaded, assessment.rubricVersion)) !== assessment.inputHash) return "inputs_changed";
+    if (computeInputHash(this.inputsFor(loaded, assessment.rubricVersion, assessment.layerVersions)) !== assessment.inputHash) return "inputs_changed";
+    // (#233) An assessment made on a STACK compares the version of EVERY layer:
+    // a new version of the shared layer is "the rules changed" too. A stack
+    // that is no longer usable is treated like "no approved rubric" (not stale),
+    // as below.
+    if (assessment.layerVersions) {
+      const stack = await this.rulebookStackOf(app);
+      if (!stack.usable || !stack.rubric) return null;
+      const same = sameStackVersions({ version: assessment.rubricVersion, layerVersions: assessment.layerVersions }, { version: stack.rubric.version, layerVersions: layerVersionsOf(stack.rubric) });
+      return same ? null : "rules_updated";
+    }
     const approved = await this.approvedVersionOf(assessment.countryCode, assessment.visaTypeId);
     if (approved !== null && approved !== assessment.rubricVersion) return "rules_updated";
     return null;
@@ -504,6 +541,22 @@ export class AiCaseOfficerService {
   /** The approved version of a route. */
   async approvedVersionOf(countryCode: string, visaTypeId: string): Promise<number | null> {
     return this.deps.rubrics.approvedVersionOf(countryCode, visaTypeId);
+  }
+
+  /** (#233) The application's rulebook stack, through the injected reader (services/ai/application-rulebook.ts). */
+  async rulebookStackOf(app: ApplicationStackRef): Promise<RulebookStack> {
+    return rulebookStackFor(app, this.deps.rubrics);
+  }
+
+  /**
+   * (#233) Can this application be assessed at all? For a single-layer route
+   * exactly the old test (the head has an approved version); for a stack, at
+   * least one layer is approved and the stack plan accepts it.
+   */
+  async hasApprovedRulebook(app: Application): Promise<boolean> {
+    const stack = await this.rulebookStackOf(app);
+    if (stack.layers.length <= 1) return (await this.approvedVersionOf(app.countryCode, app.visaTypeId)) !== null;
+    return stack.usable;
   }
 
   // ----------------------------------------------------------------
@@ -565,12 +618,15 @@ export class AiCaseOfficerService {
     if (!appSnap.exists) throw new JobStop("inputs_changed", "the application no longer exists");
     const app = { id: appSnap.id, ...appSnap.data() } as Application;
 
-    const fullRubric = await this.deps.rubrics.getApprovedRubric(app.countryCode, app.visaTypeId);
-    if (!fullRubric || fullRubric.version !== cur.rubricVersion) {
+    // (#233) The same stack the request read; ANY layer's new version means the
+    // rules changed (a single-layer route compares `version` alone, as before).
+    const stack = await this.rulebookStackOf(app);
+    const fullRubric = stack.usable ? stack.rubric : null;
+    if (!fullRubric || !sameStackVersions({ version: fullRubric.version, layerVersions: layerVersionsOf(fullRubric) }, { version: cur.rubricVersion, layerVersions: cur.layerVersions })) {
       throw new JobStop("rubric_changed", "the approved rubric changed after this assessment was requested");
     }
     const loaded = await this.loadInputs(app);
-    if (computeInputHash(this.inputsFor(loaded, fullRubric.version)) !== cur.inputHash) {
+    if (computeInputHash(this.inputsFor(loaded, fullRubric.version, layerVersionsOf(fullRubric))) !== cur.inputHash) {
       throw new JobStop("inputs_changed", "the application's inputs changed after this assessment was requested");
     }
 

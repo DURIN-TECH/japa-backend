@@ -325,6 +325,12 @@ export interface AssessmentCriterion {
   // version's own review fields on every read, so the same stored version always
   // gives the same served rule; a stored value is ignored and stripped.
   notCodeDecided?: true;
+  // (#233) SERVED-SIDE ONLY, never stored on a version: set by the stack merge
+  // (scrapers/rubric/rubric-stack.ts) on a rulebook STACK of more than one layer,
+  // naming the rulebook key of the layer this item came from. Absent on a
+  // single-layer rulebook (every route without inheritance), so those read
+  // exactly as before.
+  layerKey?: string;
   // Links to an existing EligibilityQuestion (types/eligibility.ts).
   eligibilityQuestionId?: string;
   // Ids of the rubric's intake questions whose answers this criterion reads.
@@ -386,6 +392,12 @@ export interface IntakeQuestion {
   // date_range questions: the longest allowed range, in days (#113). Optional:
   // the renderer and validator degrade safely when it is absent.
   maxLengthDays?: number;
+  // (#233) SERVED-SIDE ONLY, never stored on a version: set by the stack merge
+  // (scrapers/rubric/rubric-stack.ts) on a rulebook STACK of more than one layer,
+  // naming the rulebook key of the layer this item came from. Absent on a
+  // single-layer rulebook (every route without inheritance), so those read
+  // exactly as before.
+  layerKey?: string;
   // amount questions: the allowed ISO 4217 codes (#113). Any code when absent.
   currencies?: string[];
 }
@@ -417,6 +429,12 @@ export interface EvidenceItem {
   // What the per-upload check (#115) should expect to read.
   expects?: { documentType?: string; fields?: string[] };
   // The sentence of the source that names the document. Validated verbatim.
+  // (#233) SERVED-SIDE ONLY, never stored on a version: set by the stack merge
+  // (scrapers/rubric/rubric-stack.ts) on a rulebook STACK of more than one layer,
+  // naming the rulebook key of the layer this item came from. Absent on a
+  // single-layer rulebook (every route without inheritance), so those read
+  // exactly as before.
+  layerKey?: string;
   source: RubricCitation;
 }
 
@@ -568,6 +586,21 @@ export interface RubricFlag {
 }
 
 /**
+ * (#233) One layer of a rulebook STACK as an application sees it: whose
+ * rulebook (`rulebookKey`, `authorityId`), its role (`shared` for a bloc /
+ * treaty layer, `own` for the country's own layer), and the approved version
+ * served (`approved`) or that it has none (`missing`, `version` null). A
+ * missing layer is always listed, never left out.
+ */
+export interface RulebookStackLayer {
+  rulebookKey: string;
+  authorityId: string;
+  role: "shared" | "own";
+  status: "approved" | "missing";
+  version: number | null;
+}
+
+/**
  * (#233) The key fields every rulebook document carries (head, version,
  * extraction run, publish run). `routeKey` is the document key
  * `{authorityId}_{routeSlug}`.
@@ -661,6 +694,13 @@ export interface VisaRubric extends RulebookKeyFields {
   ruleRepairs?: RubricRuleRepair[];
 
   // ---- provenance (immutable) ----
+  // (#233) SERVED-SIDE ONLY, never stored: present on the MERGED view of a
+  // rulebook stack of more than one layer (rubric-stack.ts). One entry per
+  // layer in stack order (shared layers first, the country's own layer last),
+  // with the approved version served or `missing`. Absent on a single-layer
+  // rulebook. Consumers record it so an application shows which layer is
+  // missing and which versions it was assessed against.
+  stackLayers?: RulebookStackLayer[];
   sourceSnapshots: RubricSourceSnapshot[];
   // (#220) The languages the sources of this version are written in (primary
   // language codes, sorted, de-duplicated). Written at extraction from each

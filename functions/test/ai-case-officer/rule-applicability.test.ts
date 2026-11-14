@@ -166,11 +166,14 @@ describe("intake shows a specialist rule's questions only after the triggering a
   });
 
   test("through the intake service: required follow-ups open only once the answer triggers them", async () => {
+    // (#233) The application carries its stored `routeStack` (every application
+    // stores one since #231), so the intake reads its one-layer stack without
+    // resolving the visa record live (no Firestore in unit tests).
     const original = rubricStore.getApprovedRubric;
     (rubricStore as any).getApprovedRubric = async () => rb;
     try {
       const svc = new IntakeService();
-      const app = (answers: Record<string, unknown>) => ({ id: "app-1", countryCode: "AA", visaTypeId: "route-s", status: "draft", intake: { routeKey: "AA_route-s", rubricVersion: 1, answers, updatedAt: null } }) as any;
+      const app = (answers: Record<string, unknown>) => ({ id: "app-1", countryCode: "AA", visaTypeId: "route-s", routeStack: ["AA_route-s"], status: "draft", intake: { routeKey: "AA_route-s", rubricVersion: 1, answers, updatedAt: null } }) as any;
       const none = await svc.getIntake(app({}));
       assert.deepEqual(none.openRequiredIds, ["activity", "third-party"], "no follow-up before an activity is chosen");
       const alpha = await svc.getIntake(app({ activity: "alpha" }));
