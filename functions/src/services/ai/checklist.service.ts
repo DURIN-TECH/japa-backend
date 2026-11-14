@@ -52,6 +52,12 @@ function itemFromRequest(r: DocumentRequest): ChecklistItem | null {
     title: r.documentType,
     holder: r.holder ?? "applicant",
     required: r.required === true,
+    // Issue #187: stored kind/need, defaulting to document + (required|optional).
+    kind: r.kind ?? "document",
+    ...(r.kindReview ? { kindReview: true as const } : {}),
+    ...(r.kindQuote ? { kindQuote: r.kindQuote } : {}),
+    need: r.need ?? (r.required === true ? "required" : "optional"),
+    ...(r.appliesWhen ? { appliesWhen: r.appliesWhen } : {}),
     reason: r.reason ?? "",
     criterionRef: r.criterionRef,
     citation: r.citation,

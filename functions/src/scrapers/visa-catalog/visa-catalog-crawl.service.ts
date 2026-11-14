@@ -737,17 +737,20 @@ class VisaCatalogCrawlService {
           };
           // ---- Hash gate (+ prompt-version re-extract, issue #71) ----
           // Same text as last crawl → normally skip the LLM. Exception: the
-          // doc at `visaId` is a PENDING scraped visa extracted by an older
+          // doc at `visaId` is a scraped visa extracted by an older
           // EXTRACTOR_PROMPT_VERSION — re-extract it so a prompt change
-          // reaches it without a manual --force. Approved / seeded / agent
-          // docs never qualify (approved ones only get a #61 proposal on a
-          // real content change). This goes through the same
+          // reaches it without a manual --force. A PENDING doc is refreshed in
+          // place; an APPROVED one that lists documents (issue #187) only ever
+          // gets a proposal, and is skipped once a proposal row of any status
+          // exists for this text from this prompt version (no repeat LLM call,
+          // no re-proposing what an admin rejected). Seeded / agent docs never
+          // qualify. This goes through the same
           // maxExtractions accounting below, so a version bump drains over
           // several runs instead of re-extracting everything at once.
           if (!changed) {
             const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId, {
               doc: restored.doc, // same doc, already read by markRestored (no second read)
-            });
+            }, gateHash);
             if (!promptStale) {
               notePage(page, "unchanged", { visaId });
               continue; // nothing new, skip the LLM

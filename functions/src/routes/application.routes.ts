@@ -32,6 +32,13 @@ router.get("/:id/intake", verifyAuth, (req, res) =>
 router.put("/:id/intake", verifyAuth, (req, res) =>
   applicationController.saveIntake(req, res)
 );
+// Answers to information checklist items (#187). Access is checked in the handlers.
+router.get("/:id/answers", verifyAuth, (req, res) =>
+  applicationController.getAnswers(req, res)
+);
+router.put("/:id/answers/:itemId", verifyAuth, (req, res) =>
+  applicationController.saveAnswer(req, res)
+);
 router.put("/:id", verifyAuth, (req, res) =>
   applicationController.updateApplication(req, res)
 );

@@ -41,6 +41,8 @@
     "migrate:agent-fee": "npm run build && node lib/scripts/migrate-agent-consultation-fee-to-naira.js",
     "backfill:visas": "npm run build && node lib/scripts/backfill-visa-ownership.js",
     "backfill:visas:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-visa-ownership.js",
+    "backfill:item-kinds": "npm run build && node lib/scripts/backfill-item-kinds.js",
+    "backfill:item-kinds:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-item-kinds.js",
     "deactivate:uk-seeds": "npm run build && node lib/scripts/deactivate-seeded-uk-duplicates.js",
     "deactivate:uk-seeds:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/deactivate-seeded-uk-duplicates.js",
     "test": "tsc -p tsconfig.test.json && node --import tsx --import ./test/helpers/setup.ts --test 'test/**/*.test.ts'",

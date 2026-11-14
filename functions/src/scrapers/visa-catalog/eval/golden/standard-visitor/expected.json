@@ -9,7 +9,8 @@
     "QA checked all fields vs live Content API 2026-11-09; user spot-checked fee lines",
     "Fee rule (#59): the standard (up to 6 months) Standard Visitor visa is £135. Long-term (2/5/10 year), medical and academic variants and the £1,172 in-UK extension are excluded. No IHS for visitors.",
     "isExtendable: true — a stay under 6 months can be extended up to a total of 6 months (and longer for medical treatment / academics).",
-    "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK visa decision (3 weeks), max = inside-UK extension decision, standard service (8 weeks)."
+    "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK visa decision (3 weeks), max = inside-UK extension decision, standard service (8 weeks).",
+    "documentKinds (#187) scores 14 items: the passport / travel document sentence (document, required) plus the 13 items of the page's two lists ('information in your online application' = required unless an inline 'if'; 'Depending on your circumstances' = conditional). Only the passport and the TB certificate are documents; every other item is information. The extractor lists the passport sentence as an item, so it is scored."
   ],
   "name": {
     "value": "Standard Visitor",
@@ -111,6 +112,122 @@
         "currency": "GBP",
         "per": "application",
         "source": "A Standard Visitor visa costs £135 for up to 6 months."
+      }
+    ]
+  },
+  "documentKinds": {
+    "items": [
+      {
+        "match": [
+          "travel document"
+        ],
+        "kind": "document",
+        "need": "required",
+        "source": "You must have a passport or travel document that is valid for the whole of your stay in the UK."
+      },
+      {
+        "match": [
+          "planning to travel"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "the dates you’re planning to travel to the UK"
+      },
+      {
+        "match": [
+          "staying"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "where you’ll be staying during your visit"
+      },
+      {
+        "match": [
+          "trip will cost"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "how much you think your trip will cost"
+      },
+      {
+        "match": [
+          "home address"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "your current home address and how long you’ve lived there"
+      },
+      {
+        "match": [
+          "parents"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "your parents’ names and dates of birth (if known)"
+      },
+      {
+        "match": [
+          "earn"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "how much you earn in a year (if you have an income)"
+      },
+      {
+        "match": [
+          "offences"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "details of any criminal, civil or immigration offences you may have committed"
+      },
+      {
+        "match": [
+          "travel history"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "details of your travel history for the past 10 years"
+      },
+      {
+        "match": [
+          "employer"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "your employer’s address and telephone number"
+      },
+      {
+        "match": [
+          "partner"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "your partner’s name, date of birth and passport number"
+      },
+      {
+        "match": [
+          "anyone paying"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "the name and address of anyone paying for your trip"
+      },
+      {
+        "match": [
+          "family members"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "the name, address and passport number of any family members you have in the UK"
+      },
+      {
+        "match": [
+          "tuberculosis"
+        ],
+        "kind": "document",
+        "need": "conditional",
+        "source": "a certificate proving that you’ve had a tuberculosis (TB) test if you’re visiting for more than 6 months"
       }
     ]
   }

@@ -260,6 +260,9 @@ export class RefusalLetterService {
         title: i.title,
         holder: i.holder,
         required: i.required,
+        // Refusal-letter items are documents; not-required reads as optional (#187).
+        kind: "document" as const,
+        need: i.required ? ("required" as const) : ("optional" as const),
         reason: i.reason,
         criterionRef: i.addressesCriterionIds[0],
         citation: i.citation,
