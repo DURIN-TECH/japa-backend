@@ -675,7 +675,17 @@ describe("check: reuse", () => {
     const calls = r.provider.requests.length;
     const second = await r.svc.check(input(rubricOf(rules(25), PROPOSAL)));
     assert.equal(r.provider.requests.length, calls);
-    assert.deepEqual(second, first);
+    // (#244) "Matter 2" is found wrong, so the FIRST run also spent one re-draft request on it (the scripted model says
+    // it cannot be repaired). The second run replays that stored attempt: nothing is asked, the verdicts are the same.
+    // Only the spend of THIS run differs, so it is taken out of both sides.
+    const withoutSpend = (o: any) => {
+      const { requests: _requests, ordinaryRepairs, ...rest } = o;
+      void _requests;
+      return { ...rest, ordinaryRepairs: ordinaryRepairs ? { ...ordinaryRepairs, counts: { ...ordinaryRepairs.counts, requests: undefined } } : undefined };
+    };
+    assert.deepEqual(withoutSpend(second), withoutSpend(first));
+    assert.equal((first as any).ordinaryRepairs.counts.requests.redraft, 1);
+    assert.equal((second as any).ordinaryRepairs.counts.requests.redraft, 0);
   });
   test("a run that failed part-way resumes: only the missing batches are asked again", async () => {
     const r = rig();
@@ -721,7 +731,7 @@ describe("independence, wording, settings", () => {
     }
   });
   test("the cap settings resolve, fall back and patch like the others", () => {
-    assert.equal(resolvePublishSettings({}).settings.checkerMaxRequestsPerRun, 120);
+    assert.equal(resolvePublishSettings({}).settings.checkerMaxRequestsPerRun, 200);
     const { settings, problems } = resolvePublishSettings({ checkerMaxRulesPerDraft: 700, checkerMaxRunsPerDay: 0, checkerRequestTimeoutMs: 1.5 });
     assert.equal(settings.checkerMaxRulesPerDraft, 700);
     assert.equal(settings.checkerMaxRunsPerDay, 20);
@@ -747,5 +757,5 @@ describe("independence, wording, settings", () => {
 });
 
 function settingsDefault() {
-  return { mode: "manual" as const, pauseAfterRollback: true, maxLeftOutShare: 0.15, maxPrimaryLeftOutShare: 0.2, minKeptShareOfServing: 0.7, ...DEFAULT_CHECKER_CAPS };
+  return { mode: "manual" as const, pauseAfterRollback: true, maxLeftOutShare: 0.15, maxPrimaryLeftOutShare: 0.2, minKeptShareOfServing: 0.7, ordinaryRepairMaxShare: 0.2, ...DEFAULT_CHECKER_CAPS };
 }

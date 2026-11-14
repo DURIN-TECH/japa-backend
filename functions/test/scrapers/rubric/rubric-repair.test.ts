@@ -538,11 +538,13 @@ describe("repair records and the read-side swap (#223)", () => {
     assert.equal(applyRuleRepairs(plain), plain);
   });
 
-  test("a bar can never be repaired away: a replacement that is not a bar, or has another id, or a repair of an ordinary rule, is ignored", () => {
+  test("a bar can never be repaired away: a replacement that is not a bar, or has another id, or an ordinary rule swapped for a bar, is ignored", () => {
     const notBar: AssessmentCriterion = { ...ruleOf(1), criterionId: original.criterionId, title: "Not a bar" };
     const anotherId: AssessmentCriterion = { ...replacement, criterionId: "crit-9999" };
     const ordinary = ruleOf(7);
-    for (const bad of [repair({ replacement: notBar }), repair({ replacement: anotherId }), repair({ criterionId: ordinary.criterionId, replacement: { ...ordinary, title: "Swapped" } })]) {
+    // (#244) an ordinary original is swapped only for an ordinary replacement; for a bar it is ignored.
+    const ordinaryBecomesBar: AssessmentCriterion = { ...replacement, criterionId: ordinary.criterionId, title: "Swapped" };
+    for (const bad of [repair({ replacement: notBar }), repair({ replacement: anotherId }), repair({ criterionId: ordinary.criterionId, replacement: ordinaryBecomesBar })]) {
       const out = applyRuleRepairs({ criteria: [original, ordinary], ruleRepairs: [bad] });
       assert.deepEqual(out.criteria.map((c) => c.title), [original.title, ordinary.title]);
       assert.ok(out.criteria.some(isBar), "the bar is still in force");
