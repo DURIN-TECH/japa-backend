@@ -302,7 +302,16 @@ export class PaystackProvider implements BillingProvider {
       .createHmac("sha512", this.secretKey)
       .update(rawBody)
       .digest("hex");
-    if (signature !== expected) {
+    // Issue #181 review fix: compare in constant time. A plain `!==` stops at
+    // the first differing character, so its timing leaks how much of a forged
+    // signature is right. `timingSafeEqual` needs two buffers of the SAME
+    // length (it throws otherwise), so a signature of the wrong length is
+    // refused before the compare; its length is not a secret (always 128 hex
+    // characters for SHA-512). Both sides are compared as raw bytes of the
+    // hex text, so a non-hex or mixed-case header simply does not match.
+    const given = Buffer.from(String(signature), "utf8");
+    const wanted = Buffer.from(expected, "utf8");
+    if (given.length !== wanted.length || !crypto.timingSafeEqual(given, wanted)) {
       console.warn("Paystack webhook signature mismatch");
       return false;
     }

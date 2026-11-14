@@ -25,7 +25,7 @@
 
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { paymentRequestService } from "../services/payment-request.service";
+import { paymentRequestService, AGENT_STATUS_TRANSITIONS } from "../services/payment-request.service";
 import { messagingService } from "../services/messaging.service";
 import { notificationService } from "../services/notification.service";
 import { paystackProvider } from "../services/billing/paystack.provider";
@@ -254,8 +254,24 @@ class PaymentRequestController {
         return sendForbidden(res, "Not authorized for this application");
       }
 
+      // ---- Which agency is billing? -------------------------------------------
+      // Issue #181 review fix: the CASE's agency (`app.agencyId`), never the
+      // caller's current one. Whose payout and compliance a request is
+      // follows the case. Decision: a caller whose current agency is not the
+      // case's agency is REFUSED (403), even when still the assigned agent.
+      // `requireAgencyVerified` checked the CALLER's agency, so an agent who
+      // has moved to agency B would otherwise bill agency A's client without
+      // A's compliance ever being checked, or under B. A case with no agency
+      // has nobody to bill under (the route already needs a verified
+      // agency), so it is refused the same way. Admins bill under the case's
+      // agency as they find it.
+      const agencyId = app.agencyId || undefined;
+      const isAdmin = req.authz?.role === ROLES.ADMIN;
+      if (!isAdmin && (!agencyId || agencyId !== req.authz?.agencyId)) {
+        return sendForbidden(res, "This case belongs to another agency, so you cannot request payment on it");
+      }
+
       // ---- Store it ----------------------------------------------------------
-      const agencyId = agent.data().agencyId as string | undefined;
       const request = await paymentRequestService.createPaymentRequest({
         applicationId,
         agentId: agent.id,
@@ -331,8 +347,28 @@ class PaymentRequestController {
         .get();
       if (!agentSnap.empty) {
         const agent = agentSnap.docs[0];
-        if (request.agentId === agent.id || request.agencyId === agent.data().agencyId) {
+        const callerAgencyId = agent.data().agencyId as string | undefined;
+        // Issue #181 review fix: every comparison is on a DEFINED owner id.
+        // Before, `request.agencyId === agent.agencyId` was
+        // `undefined === undefined` for two independent agents, so any
+        // independent agent could read any other's request (client name,
+        // email, checkout URL, rate snapshot).
+        //  1. the agent who created it (profile ids are doc ids: always set);
+        if (request.agentId && request.agentId === agent.id) {
           return sendSuccess(res, presentPaymentRequest(request));
+        }
+        //  2. a member of the agency it is billed under (both ids present);
+        if (request.agencyId && callerAgencyId && request.agencyId === callerAgencyId) {
+          return sendSuccess(res, presentPaymentRequest(request));
+        }
+        //  3. the case's current assignee (`Application.agentId` is the
+        //     agent's USER uid), e.g. after the case was reassigned.
+        if (request.applicationId) {
+          const appSnap = await collections.applications.doc(request.applicationId).get();
+          const assignee = appSnap.exists ? (appSnap.data() as Application).agentId : undefined;
+          if (assignee && assignee === userId) {
+            return sendSuccess(res, presentPaymentRequest(request));
+          }
         }
       }
 
@@ -352,18 +388,50 @@ class PaymentRequestController {
   /**
    * PUT /payment-requests/:id/status
    *
-   * Updates the status of a payment request (e.g., pending → cancelled).
-   * Only the creating agent or an admin can update the status.
+   * An agent (the one who created the request) or an admin WITHDRAWS a
+   * request the client has not paid.
    *
-   * Required body: { status: PaymentRequestStatus }
+   * Issue #181 review fix. Allowed by hand: `pending -> cancelled` and
+   * `approved -> cancelled`, nothing else:
+   *  - any other target status is 400 (`paid` is the settlement's,
+   *    `approved` / `rejected` are the client's decision, and `pending`
+   *    would let a client re-approve and pay a second time);
+   *  - an approved request with a checkout: Paystack is asked about the
+   *    CURRENT checkout first (the shared `paystackState`). In flight (a
+   *    bank transfer or USSD payment still completing) is 409
+   *    PAYMENT_IN_PROGRESS and nothing changes. Paid at Paystack: it is
+   *    settled here (never cancelled under the client) and the answer is 409
+   *    REQUEST_ALREADY_PAID;
+   *  - the check and the write then happen in ONE transaction that re-reads
+   *    the request (`cancelByAgent`). A settlement that committed meanwhile
+   *    wins: 409 REQUEST_ALREADY_PAID, nothing written. A checkout replaced
+   *    meanwhile: 409 CHECKOUT_CHANGED (the Paystack check is stale; retry).
+   *
+   * A payment that still lands on the cancelled checkout later (an
+   * `abandoned` checkout can be completed) is caught by the settlement and
+   * held for refund in `paymentRequestExceptions`, as for a cancel before.
+   *
+   * Required body: { status: "cancelled" }
    */
   async updatePaymentRequestStatus(req: AuthenticatedRequest, res: Response) {
     try {
       const { id } = req.params;
-      const { status } = req.body as { status: PaymentRequestStatus };
+      const { status } = (req.body ?? {}) as { status?: unknown };
 
       if (!status) {
         return sendError(res, "VALIDATION_ERROR", "status is required", 400);
+      }
+      // ---- Only one target status exists for an agent ------------------------
+      if (status === "paid") {
+        return sendError(res, "VALIDATION_ERROR", "A payment request is marked paid only when the payment is confirmed", 400);
+      }
+      if (status !== "cancelled") {
+        return sendError(
+          res,
+          "VALIDATION_ERROR",
+          "A payment request can only be cancelled here; the client approves or declines it",
+          400
+        );
       }
 
       // Fetch the existing payment request to verify it exists
@@ -387,21 +455,61 @@ class PaymentRequestController {
         }
       }
 
-      // Issue #181: "paid" is set ONLY by the settlement (after Paystack
-      // confirmed the exact charge, with its Transaction), and a paid request
-      // is final: moving it back to pending/approved would let its charge
-      // snapshot be re-quoted and the client be charged again.
-      if (status === "paid") {
-        return sendError(res, "VALIDATION_ERROR", "A payment request is marked paid only when the payment is confirmed", 400);
-      }
+      // Cheap early answers from the read (the transaction below re-checks
+      // both; these only spare a Paystack call).
       if (request.status === "paid") {
         return sendError(res, "REQUEST_ALREADY_PAID", "A paid payment request cannot be changed", 409);
       }
+      if (!(AGENT_STATUS_TRANSITIONS[request.status] ?? []).includes("cancelled")) {
+        return sendError(res, "INVALID_STATUS_TRANSITION", `A ${request.status} payment request cannot be cancelled`, 409);
+      }
 
-      // Delegate status update to service layer
-      const updated = await paymentRequestService.updateStatus(id, status);
-      return sendSuccess(res, presentPaymentRequest(updated));
+      // ---- Is a payment in flight on the current checkout? -------------------
+      // Asked OUTSIDE the transaction (a network call); the transaction then
+      // refuses if the checkout changed since (`checkedReference`).
+      const checkedReference = request.paystackReference ?? null;
+      // (Any request carrying a reference is checked, not only `approved`
+      // ones: a pre-fix request may have been moved back to `pending` with
+      // its checkout still open.)
+      if (checkedReference) {
+        const result = await paystackProvider.getTransactionMetadata(checkedReference);
+        const state = paystackState(result);
+        if (state === "in_progress") return this.sendPaymentInProgress(res, request);
+        if (state === "paid") {
+          // The client has paid: record it (the settlement checks the exact
+          // amount; a mismatch is logged and left for a human), never cancel.
+          const outcome = await settlePaymentRequest(id, checkedReference, result!);
+          if (outcome && (outcome.kind === "mismatch" || outcome.kind === "not_chargeable" || outcome.kind === "unknown_reference")) {
+            console.error(
+              `[payment-request] cancel refused: Paystack reports ${checkedReference} paid but it did not settle (${outcome.kind}); needs manual review`
+            );
+          }
+          return sendError(res, "REQUEST_ALREADY_PAID", "The client has already paid this request, so it cannot be cancelled", 409);
+        }
+      }
+
+      // ---- Check and write in ONE transaction --------------------------------
+      const outcome = await paymentRequestService.cancelByAgent(id, checkedReference);
+      switch (outcome.kind) {
+      case "cancelled":
+        return sendSuccess(res, presentPaymentRequest(outcome.request));
+      case "not_found":
+        return sendNotFound(res, "Payment request not found");
+      case "already_paid":
+        return sendError(res, "REQUEST_ALREADY_PAID", "A paid payment request cannot be changed", 409);
+      case "checkout_changed":
+        return sendError(res, "CHECKOUT_CHANGED", "The payment for this request changed just now. Please try again.", 409);
+      case "not_allowed":
+      default:
+        return sendError(
+          res,
+          "INVALID_STATUS_TRANSITION",
+          `A ${outcome.request.status} payment request cannot be cancelled`,
+          409
+        );
+      }
     } catch (error: unknown) {
+      if (this.sendIfProviderError(res, error, "payment request cancel")) return;
       const message = error instanceof Error ? error.message : "Unknown error";
       return sendError(res, "INTERNAL_ERROR", message, 500);
     }
@@ -853,9 +961,30 @@ class PaymentRequestController {
         }
       }
 
-      // Delegate deletion to the service layer
-      await paymentRequestService.deletePaymentRequest(id);
-      return sendSuccess(res, { message: "Payment request deleted" });
+      // Issue #181 review fix: decided in one transaction (the service).
+      // Only a PENDING request that never had a checkout can be deleted. A
+      // paid one, or one with a checkout (where a payment may still land),
+      // is 409: deleting it would leave a later payment untracked, because
+      // the settlement finds no request and records nothing. Cancel instead.
+      const outcome = await paymentRequestService.deletePaymentRequest(id);
+      switch (outcome.kind) {
+      case "deleted":
+        return sendSuccess(res, { message: "Payment request deleted" });
+      case "not_found":
+        return sendNotFound(res, "Payment request not found");
+      case "already_paid":
+        return sendError(res, "REQUEST_ALREADY_PAID", "A paid payment request cannot be deleted", 409);
+      case "checkout_open":
+        return sendError(
+          res,
+          "CHECKOUT_OPEN",
+          "The client has started paying this request, so it cannot be deleted. Cancel it instead.",
+          409
+        );
+      case "not_pending":
+      default:
+        return sendError(res, "REQUEST_NOT_DELETABLE", "Only a pending payment request can be deleted", 409);
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Unknown error";
       return sendError(res, "INTERNAL_ERROR", message, 500);

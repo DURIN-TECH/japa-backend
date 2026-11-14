@@ -595,8 +595,14 @@ describe("once paid, the snapshot is immutable", () => {
     const ref = (await approve(id)).body.data.paystackReference;
     paystackPaidRequest(ref, id, { amountMinor: NGN_KOBO, currency: "NGN" });
     await verify(id, ref);
+    // Review fix round 1: `approved` is never an agent's target status (400),
+    // and cancelling a paid request is 409; neither changes it.
     const back = await status("approved");
-    assert.equal(back.status, 409);
+    assert.equal(back.status, 400);
+    assert.equal(stored(id).status, "paid");
+    const cancel = await status("cancelled");
+    assert.equal(cancel.status, 409);
+    assert.equal(cancel.body.error, "REQUEST_ALREADY_PAID");
     assert.equal(stored(id).status, "paid");
   });
 });
