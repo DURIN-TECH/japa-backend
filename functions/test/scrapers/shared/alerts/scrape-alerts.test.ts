@@ -843,3 +843,109 @@ describe("llm_budget over #82's rollup", () => {
     assert.equal(alertDocs().filter((d) => d.rule === "llm_budget").length, 1); // one escalating alert
   });
 });
+
+// ============================================
+// checklist_shrink (issue #212)
+// ============================================
+
+describe("checklist_shrink", () => {
+  /** An open proposal row whose requiredDocuments diff removes `removed` items. */
+  function seedRow(id: string, over: Data = {}, removed: string[] = ["a passport"], status = "open"): void {
+    store.set(`pendingVisaChanges/${id}`, {
+      countryCode: "GB",
+      visaId: "gb-standard-visitor",
+      status,
+      revision: 1,
+      diff: [{ field: "requiredDocuments", kind: "changed", added: [], removed }],
+      current: { requiredDocuments: ["a passport", "a photo"] },
+      proposed: { requiredDocuments: ["a photo"] },
+      createdAt: Timestamp.fromMillis(NOW - HOUR),
+      ...over,
+    });
+  }
+  const shrinkAlerts = () => alertDocs().filter((d) => d.rule === "checklist_shrink");
+
+  test("pure rule: key, subject, severity and details; silent when only items are added", () => {
+    const row = { changeId: "c1", countryCode: "GB", visaId: "gb-x", revision: 1, liveCount: 12, proposedCount: 1, removed: Array.from({ length: 12 }, (_, i) => `item ${i}`) };
+    const e = rules.evaluateChecklistShrink([row, { ...row, changeId: "c2", visaId: "gb-y", removed: [] }], cfg());
+    assert.equal(e.signals.length, 1);
+    const s = e.signals[0];
+    assert.equal(s.key, "checklist_shrink:GB:gb-x");
+    assert.deepEqual(s.subject.type, "source");
+    assert.equal(s.subject.id, "GB");
+    assert.equal(s.kind, "visa");
+    assert.equal(s.severity, "warning");
+    assert.equal(s.details.liveCount, 12);
+    assert.equal(s.details.proposedCount, 1);
+    assert.equal(s.details.changeId, "c1");
+    assert.equal(String(s.details.removed).split("\n").length, 10); // first 10 only
+    assert.deepEqual(e.scope, { keyPrefix: "checklist_shrink:" });
+  });
+
+  test("the hourly check raises it, bumps (not duplicates) a new revision, and clears it on approve/reject/superseded", async () => {
+    seedRow("c1");
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts().length, 1);
+    assert.equal(shrinkAlerts()[0].count, 1);
+    assert.equal(shrinkAlerts()[0].status, "open");
+    assert.ok(emails.some((e) => /checklist/i.test(e.title) || /checklist/i.test(String(e.body))));
+
+    // Same row, same revision again: not counted twice.
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts()[0].count, 1);
+
+    // A newer revision of the row that still removes items: bumped, one alert.
+    seedRow("c1", { revision: 2 });
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts().length, 1);
+    assert.equal(shrinkAlerts()[0].count, 2);
+
+    // Superseded by a revision that only ADDS items: cleared.
+    seedRow("c1", { revision: 3 }, []);
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts()[0].status, "resolved");
+
+    // Raised again, then approved: cleared (row no longer open).
+    seedRow("c1", { revision: 4 });
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts().filter((a) => a.status === "open").length, 1);
+    seedRow("c1", { revision: 4 }, ["a passport"], "approved");
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts().filter((a) => a.status === "open").length, 0);
+
+    // Raised again, then rejected: cleared.
+    seedRow("c1", { revision: 5 });
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts().filter((a) => a.status === "open").length, 1);
+    seedRow("c1", { revision: 5 }, ["a passport"], "rejected");
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts().filter((a) => a.status === "open").length, 0);
+  });
+
+  test("the post-run hook of a visa run raises it; a news run does not look", async () => {
+    seedRow("c1");
+    await quiet(() => svc.onRunFinalized(run("n1", { kind: "news" })));
+    assert.equal(shrinkAlerts().length, 0);
+    await quiet(() => svc.onRunFinalized(run("v1")));
+    assert.equal(shrinkAlerts().length, 1);
+  });
+
+  test("past the read cap the rule is skipped, so live alerts are NOT auto-resolved", async () => {
+    seedRow("c1");
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts().filter((a) => a.status === "open").length, 1);
+    // Far more open rows than the cap (rows without a documents diff are cheap).
+    for (let i = 0; i < 2001; i++) {
+      store.set(`pendingVisaChanges/filler${i}`, { countryCode: "GB", visaId: `f${i}`, status: "open", revision: 1, diff: [], createdAt: Timestamp.fromMillis(NOW) });
+    }
+    const r = await quiet(() => svc.runHourlyCheck(NOW));
+    assert.ok(r.skippedRules.includes("checklist_shrink"));
+    assert.equal(shrinkAlerts().filter((a) => a.status === "open").length, 1);
+  });
+
+  test("it can be disabled in the rules config", () => {
+    const e = rules.evaluateChecklistShrink([], cfg({ rules: { checklist_shrink: { enabled: false } } }));
+    assert.equal(rules.ruleEnabled(cfg({ rules: { checklist_shrink: { enabled: false } } }), "checklist_shrink"), false);
+    assert.equal(e.signals.length, 0);
+  });
+});

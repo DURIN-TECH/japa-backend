@@ -1,13 +1,14 @@
 import { collections, db } from "../../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import { VisaSource, VisaSourcePage } from "./types";
-import { EXTRACTOR_PROMPT_VERSION, visaCatalogExtractor } from "./visa-catalog-extract.service";
+import { extractionVersionFor, visaCatalogExtractor } from "./visa-catalog-extract.service";
 import { visaCatalogService } from "./visa-catalog.service";
 import type { FxFetcher } from "./visa-catalog-fx";
 // Fetching goes through the source adapter picked from `source.adapter`
 // (govuk-content-api for GB, generic-html — today's fetch service — otherwise).
 import { HostNotAllowedError } from "../shared/fetch/visa-catalog-fetch.service";
 import { officialDomainsService } from "../shared/registry/official-domains.service";
+import { applyItemCoverage } from "./item-coverage";
 import { pickSourceAdapter, sourceMetaFromDocument, type SourceAdapterSet } from "./adapters";
 // Pure weekly-night-window helpers (issue #63): which due sources may run on
 // this tick, and when each runs next.
@@ -659,6 +660,8 @@ class VisaCatalogCrawlService {
         // Issue #82: the priced usage of this page's LLM call, set by the
         // extractor's onUsage callback (stays undefined when no call is made).
         let callUsage: PricedUsage | undefined;
+        // Issue #212: the stamp of this page's adapter, set once the page is fetched.
+        let stamp = extractionVersionFor(undefined);
         try {
           // ---- Resolve the record id FIRST (registry-owned identity) ----
           // From the page's pinned `visaId`, else its URL path — never from
@@ -690,6 +693,7 @@ class VisaCatalogCrawlService {
             allowedHost = (h: string) => hosts.has(h.toLowerCase());
           }
           const fetched = await adapter.fetch(page, allowedHost ? { allowedHost } : undefined);
+          stamp = extractionVersionFor(fetched.sourceProvider);
           if (allowedHost) {
             // Belt and braces for adapters that ignore the policy: the
             // document's own canonical address must be on a confirmed host.
@@ -769,7 +773,7 @@ class VisaCatalogCrawlService {
           // ---- Hash gate (+ prompt-version re-extract, issue #71) ----
           // Same text as last crawl → normally skip the LLM. Exception: the
           // doc at `visaId` is a scraped visa extracted by an older
-          // EXTRACTOR_PROMPT_VERSION — re-extract it so a prompt change
+          // stamp — re-extract it so a prompt change
           // reaches it without a manual --force. A PENDING doc is refreshed in
           // place; an APPROVED one that lists documents (issue #187) only ever
           // gets a proposal, and is skipped once a proposal row of any status
@@ -781,7 +785,7 @@ class VisaCatalogCrawlService {
           if (!changed) {
             const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId, {
               doc: restored.doc, // same doc, already read by markRestored (no second read)
-            }, gateHash);
+            }, gateHash, stamp);
             if (!promptStale) {
               notePage(page, "unchanged", { visaId });
               continue; // nothing new, skip the LLM
@@ -827,13 +831,18 @@ class VisaCatalogCrawlService {
           // Issue #96: a page deferred by the budget hard stop is caught up.
           pages[i] = { ...pages[i], lastExtractedAt: now, extractionDeferredAt: undefined };
 
+          // ---- Issue #212: item coverage ----
+          // Check the extraction against the page's own list items; missing ones
+          // are appended verbatim (kindReview) and recorded on scrapeMeta. `undefined`
+          // listItems (generic-html) = not checked, extraction untouched.
+          const covered = applyItemCoverage(extracted, fetched.listItems);
           const { outcome } = await visaCatalogService.ingestExtraction({
             countryCode: source.countryCode,
             sourceUrl: page.url,
             routeName: page.routeName,
             // The gate hash (= the page hash unless linked surcharges apply).
             contentHash: gateHash,
-            extracted,
+            extracted: covered,
             model: visaCatalogExtractor.model,
             // Registry-owned identity: the id resolved above (used verbatim by
             // ingest, not recomputed) + the pinned code, if any.
@@ -855,7 +864,7 @@ class VisaCatalogCrawlService {
           else if (outcome === "skipped") summary.skipped++;
           else if (outcome === "proposed") summary.proposed++;
           if (outcome !== "unchanged") ingested++;
-          notePage(page, outcome, { visaId, ...pageUsageFields(callUsage, EXTRACTOR_PROMPT_VERSION) });
+          notePage(page, outcome, { visaId, ...pageUsageFields(callUsage, stamp) });
         } catch (err) {
           pageErrors++;
           summary.errors++;
@@ -864,7 +873,7 @@ class VisaCatalogCrawlService {
           // Usage fields too when the failure came after a billed LLM call (#82).
           notePage(page, "error", {
             error: (err as Error)?.message ?? String(err),
-            ...pageUsageFields(callUsage, EXTRACTOR_PROMPT_VERSION),
+            ...pageUsageFields(callUsage, stamp),
           });
           // ---- 429/503: back off from the host (issue #64) ----
           // Record it for the rest of the run (and for persisting below)

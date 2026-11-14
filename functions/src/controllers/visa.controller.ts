@@ -11,7 +11,7 @@ import { VisaCategory, VisaType } from "../types";
 // Agency drafts can't be reviewed (issue #100).
 import { VisaIsDraftError } from "../services/visa.service";
 // Typed error from the approval guard (fee not converted to USD, issue #59).
-import { VisaFeeNotConvertibleError } from "../scrapers";
+import { MissingItemsChangedError, MissingItemsUnacknowledgedError, VisaFeeNotConvertibleError } from "../scrapers";
 // Manual USD cost (issue #70): CASL gate, body validation, typed errors.
 import { asSubject, can, forbidden } from "../middleware/authz";
 import { ManualCostError, parseManualCostInput } from "../scrapers";
@@ -495,12 +495,23 @@ export class VisaController {
         }
       }
 
+      // Issue #212: `acknowledgeMissingItems: true` approves past the page items
+      // the extractor missed. Only a boolean is accepted (anything else is a 400).
+      const ackMissing = req.body?.acknowledgeMissingItems;
+      if (ackMissing !== undefined && typeof ackMissing !== "boolean") {
+        sendError(res, "VALIDATION_ERROR", "acknowledgeMissingItems must be true or false", 400);
+        return;
+      }
+
       const updatedVisa = await visaService.updateVisaReviewStatus(
         countryCode,
         id,
         action,
         req.userId!,
-        reason
+        reason,
+        ackMissing === true,
+        // The extraction the admin saw, echoed as received (same pattern as revisionUpdatedAt).
+        parseExpectedTimestamp(req.body?.acknowledgedExtractedAt)
       );
 
       sendSuccess(res, updatedVisa, `Visa ${action === "approve" ? "approved" : "rejected"} successfully`);
@@ -520,6 +531,11 @@ export class VisaController {
       // Issue #100: an unsubmitted agency draft is not reviewable.
       if (error instanceof VisaIsDraftError) {
         sendError(res, error.code, error.message, 409);
+        return;
+      }
+      // Issue #212: page items the extractor missed were not acknowledged.
+      if (error instanceof MissingItemsUnacknowledgedError || error instanceof MissingItemsChangedError) {
+        sendError(res, error.code, error.message, error.httpStatus);
         return;
       }
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);

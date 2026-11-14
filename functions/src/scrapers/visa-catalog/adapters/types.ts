@@ -1,4 +1,5 @@
 import type { SourceAdapterId, VisaSourcePage } from "../types";
+import type { PageListItem } from "./govuk-list-items";
 
 // ============================================
 // VISA CATALOG — SOURCE ADAPTER CONTRACT
@@ -47,6 +48,11 @@ export interface SourceDocument {
   // True when the selected text exceeded the adapter cap and `text` was cut.
   // Only structured adapters set it (generic-html keeps its historic cap).
   truncated?: boolean;
+  // Issue #212: the items the page lists under a recognised "you'll need to
+  // provide:" lead-in (plus prose "You must have ..." requirements), collected
+  // from the HTML. PRESENT (possibly []) only for adapters that can read list
+  // structure (govuk-content-api); ABSENT = "not checked" (generic-html).
+  listItems?: PageListItem[];
 }
 
 /**

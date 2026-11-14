@@ -26,7 +26,7 @@ import {
   planFeeReconvert,
   refreshFxRates,
 } from "./visa-catalog-fx";
-import { EXTRACTOR_PROMPT_VERSION } from "./visa-catalog-extract.service";
+import { extractionVersionFor } from "./visa-catalog-extract.service";
 // Canonical country-stats recompute (issue #62: the only stats function).
 import { visaService } from "../../services/visa.service";
 import type { ScrapeSourceMeta } from "./adapters";
@@ -129,7 +129,9 @@ class VisaCatalogService {
     // Issue #68: the doc the caller already read this page (markRestored's
     // `doc`; `doc: undefined` = no doc). When given, no second read is made.
     known?: { doc: VisaType | undefined },
-    contentHash?: string
+    contentHash?: string,
+    // The stamp the page's adapter writes (extractionVersionFor); plain prompt version for non-GB.
+    version: string = extractionVersionFor(undefined)
   ): Promise<boolean> {
     let existing: VisaType | undefined;
     if (known) {
@@ -138,11 +140,11 @@ class VisaCatalogService {
       const snap = await subcollections.visaTypes(countryCode).doc(visaId).get();
       existing = snap.exists ? (snap.data() as VisaType) : undefined;
     }
-    if (!isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION)) return false;
+    if (!isPendingPromptStale(existing, version)) return false;
     // Approved visa: already turned into a proposal by this prompt version?
     if (existing?.reviewStatus === "approved") {
       const hash = contentHash ?? existing.scrapeMeta?.contentHash;
-      if (hash && (await visaChangeService.hasProposalForHash(countryCode, visaId, hash, EXTRACTOR_PROMPT_VERSION))) {
+      if (hash && (await visaChangeService.hasProposalForHash(countryCode, visaId, hash, version))) {
         return false;
       }
     }
@@ -233,6 +235,9 @@ class VisaCatalogService {
       linkedSurcharges: linked.meta,
     });
 
+    // Issue #212: the version stamp of THIS page's adapter (GB carries +items-v1).
+    const stamp = extractionVersionFor(params.sourceMeta?.sourceProvider);
+
     // Provenance + audit trail (adapter fields merged in when given).
     const scrapeMeta = buildScrapeMeta({
       sourceUrl,
@@ -243,7 +248,7 @@ class VisaCatalogService {
       extractedAt: now,
       sourceMeta: params.sourceMeta,
       fee: feeMeta,
-      extractorPromptVersion: EXTRACTOR_PROMPT_VERSION,
+      extractorPromptVersion: stamp,
       supplementaryPages: params.supplementaryPages,
       llmUsage: params.llmUsage,
     });
@@ -273,7 +278,7 @@ class VisaCatalogService {
     // the same — the crawl only re-extracts it for that reason (see
     // needsPromptReextract), so the new extraction must not be dropped as
     // "unchanged". Approved docs are unaffected by the version.
-    const branch = planIngest(existing, contentHash, EXTRACTOR_PROMPT_VERSION);
+    const branch = planIngest(existing, contentHash, stamp);
     if (branch === "unchanged") {
       return { visaId, outcome: "unchanged" };
     }
@@ -306,7 +311,7 @@ class VisaCatalogService {
         // Same prompt version as the outer plan (issue #71): a prompt-only
         // re-extract (same page hash) must still plan "refresh" here, or the
         // new extraction would be dropped as "unchanged".
-        const again = planIngest(current, contentHash, EXTRACTOR_PROMPT_VERSION);
+        const again = planIngest(current, contentHash, stamp);
         if (again === "unchanged") return { visaId, outcome: "unchanged" as IngestOutcome };
         if (again !== "refresh") return { visaId, outcome: "skipped" as IngestOutcome };
 

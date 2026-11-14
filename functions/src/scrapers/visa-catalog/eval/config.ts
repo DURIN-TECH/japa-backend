@@ -16,7 +16,11 @@ import * as path from "path";
 //     fee items covered by a route's `knownGaps`, AND
 //   - no processing citation mismatch (issue #87, hard gate):
 //     processingDaysMin/Max within PROCESSING_DAYS_TOLERANCE of at least one
-//     duration the output's own processing citations state.
+//     duration the output's own processing citations state, AND
+//   - no item coverage miss (issue #212, hard gate): every list item the page
+//     shows under a "you'll need to provide:" lead-in (collected from the
+//     recorded guide.json by the real adapter) must be cited by some extracted
+//     item, except items listed in the route's `itemCoverageGaps`.
 //
 // This module is pure config (path + constants): no network, no Firebase.
 

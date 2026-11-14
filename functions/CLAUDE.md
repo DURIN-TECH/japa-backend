@@ -21,3 +21,8 @@
 - **Prompt or model change? Attach `eval:visa-extract` result (version + overall).** Any change to
   the extractor prompt (`EXTRACTOR_PROMPT_VERSION` bump) or model runs `npm run eval:visa-extract`
   before merge and commits the `src/scrapers/visa-catalog/eval/results/…json` file. See `src/scrapers/visa-catalog/eval/README.md`.
+- **Checklist-shaping code change (no prompt change)?** Bump `ITEM_COVERAGE_VERSION` in
+  `visa-catalog-extract.service.ts` instead of `EXTRACTOR_PROMPT_VERSION`: the stamp
+  `EXTRACTION_PIPELINE_VERSION` (prompt + code version) is what the re-extract gate compares, so
+  approved visas re-extract on the next crawl as proposals, with no paid eval run (the prompt and
+  model are unchanged).

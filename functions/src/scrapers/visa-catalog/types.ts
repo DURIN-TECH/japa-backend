@@ -244,6 +244,20 @@ export interface VisaSource {
 // `source: "scraped"` and `reviewStatus: "pending_review"`, so they surface in
 // the EXISTING admin visa-review page for approval (no autopublish). This block
 // travels on the doc as the audit trail behind those values.
+/**
+ * Issue #212: one item the official page lists for the applicant to provide
+ * that the extractor did not return (no extracted item's citation quote contains
+ * it). Text is verbatim from the page.
+ */
+export interface MissingFromExtractionItem {
+  text: string; // the page item, verbatim
+  leadIn: string; // the lead-in it sits under, verbatim ("" for a prose requirement)
+  section: string; // the guide part slug it was found in
+  // True when code APPENDED it to `requiredDocuments` (document + kindReview)
+  // so the checklist is complete; the admin still sees what the model missed.
+  appended?: boolean;
+}
+
 export interface VisaScrapeMeta {
   sourceUrl: string;
   routeName: string; // the source-registry label the page was crawled under
@@ -302,6 +316,10 @@ export interface VisaScrapeMeta {
   // scrape provenance, so it is replaced wholesale on approve like `citations`.
   // Absent on visas crawled before #187 (read as document + kindReview).
   requiredDocumentMeta?: RequiredDocumentMeta[];
+  // Issue #212: page items the extractor missed (checked against the page's own
+  // HTML). ABSENT = not checked (any adapter but govuk-content-api); [] =
+  // checked, nothing missing. Replaced wholesale with the rest of scrapeMeta on approve.
+  missingFromExtraction?: MissingFromExtractionItem[];
   // Supplementary registry pages whose text was appended to this route's
   // page before extraction (issue #86, e.g. the Korea Visa Portal fee table
   // for the HiKorea C-3 route). Absent when the route uses none.
@@ -555,7 +573,15 @@ export type VisaFieldDiff =
   // document repeated in different case is the same document). `removed`
   // documents disappear from the live doc on approve, as the proposed array
   // replaces the live one wholesale (an empty proposed list deletes the field).
-  | { field: "requiredDocuments"; kind: "changed"; added: string[]; removed: string[] }
+  // Issue #212: `removedDetails` pairs each removed item with the live visa's own
+  // verbatim citation quote for it (absent when the live visa has none).
+  | {
+      field: "requiredDocuments";
+      kind: "changed";
+      added: string[];
+      removed: string[];
+      removedDetails?: { item: string; quote?: string }[];
+    }
   // Issue #187: the kind (document / information) and need (required /
   // conditional / optional) of items that stay on the list, when a new
   // extraction classifies them differently. NOT a visa field: approving it
@@ -694,6 +720,9 @@ export interface ExtractedVisa {
   // verbatim quote on the page is replaced by document + kindReview, and
   // `need` is decided by code from the quote (required-document-meta.ts).
   requiredDocumentMeta?: RequiredDocumentMeta[];
+  // Issue #212: set by applyItemCoverage (never by the validator); see
+  // VisaScrapeMeta.missingFromExtraction. Absent = not checked.
+  missingFromExtraction?: MissingFromExtractionItem[];
   applicationUrl?: string;
   applicationInstructions?: string;
   // Set by the validator (issue #87) when processingDaysMin/Max is more than

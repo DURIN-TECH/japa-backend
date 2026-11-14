@@ -34,6 +34,7 @@
     "audit:roles": "npm run build && node lib/scripts/audit-role-trust.js",
     "audit:storage-paths": "npm run build && node lib/scripts/audit-storage-paths.js",
     "audit:agencies": "npm run build && node lib/scripts/audit-agency-review.js",
+    "audit:visa-items": "npm run build && node lib/scripts/audit-visa-items.js",
     "backfill:slugs": "npm run build && node lib/scripts/backfill-agency-slugs.js",
     "backfill:slugs:dev": "npm run build && GCLOUD_PROJECT=durin-seli-dev node lib/scripts/backfill-agency-slugs.js",
     "backfill:expireat": "npm run build && node lib/scripts/backfill-news-expire-at.js",

@@ -14,7 +14,7 @@
  * the `scrapeMeta.contentHash` on the existing doc at the resolved id; when
  * equal the page is reported "unchanged (hash gate)" and NO extraction runs.
  * Exception (issue #71): a PENDING scraped doc whose
- * `scrapeMeta.extractorPromptVersion` differs from EXTRACTOR_PROMPT_VERSION is
+ * `scrapeMeta.extractorPromptVersion` differs from EXTRACTION_PIPELINE_VERSION is
  * re-extracted anyway (within --max-extractions). For an APPROVED scraped doc
  * (whose live hash ingest never updates — a changed page becomes a #61
  * proposal) the text also counts as unchanged when it equals the registry
@@ -183,9 +183,11 @@ async function main() {
   const { pickSourceAdapter, sourceMetaFromDocument } = await import(
     "../adapters"
   );
-  const { visaCatalogExtractor, EXTRACTOR_PROMPT_VERSION } = await import(
+  const { visaCatalogExtractor, extractionVersionFor } = await import(
     "../visa-catalog-extract.service"
   );
+  // Issue #212: append + record the page items the extraction missed.
+  const { applyItemCoverage } = await import("../item-coverage");
   // Pure prompt-version rule shared with the orchestrator (issue #71).
   const { isPendingPromptStale, isApprovedTextAlreadyHandled } = await import(
     "../visa-catalog-diff"
@@ -370,6 +372,8 @@ async function main() {
       let promptReextract = false;
       // Issue #82: priced usage of this page's LLM call (set by onUsage).
       let callUsage: PricedUsage | undefined;
+      // Issue #212: this page's adapter stamp, set once fetched (GB carries +items-v1).
+      let EXTRACTION_PIPELINE_VERSION = extractionVersionFor(undefined);
       try {
         console.log(`\n[${source.countryCode}] ${page.routeName}\n  ${page.url}`);
         // Resolve the record id BEFORE fetching/extracting (same rule as the
@@ -383,6 +387,7 @@ async function main() {
         // Fetch through the source's adapter (same choice as the orchestrator).
         const adapter = pickSourceAdapter(source.adapter, page.url);
         const fetched = await adapter.fetch(page);
+        EXTRACTION_PIPELINE_VERSION = extractionVersionFor(fetched.sourceProvider);
         totals.fetched++;
         src.fetched++;
         console.log(
@@ -448,8 +453,8 @@ async function main() {
             // --max-extractions below.
             const alreadyReRead =
               existing.reviewStatus === "approved" &&
-              (await visaChangeService.hasProposalForHash(source.countryCode, resolvedVisaId, gateHash, EXTRACTOR_PROMPT_VERSION));
-            if (!isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION) || alreadyReRead) {
+              (await visaChangeService.hasProposalForHash(source.countryCode, resolvedVisaId, gateHash, EXTRACTION_PIPELINE_VERSION));
+            if (!isPendingPromptStale(existing, EXTRACTION_PIPELINE_VERSION) || alreadyReRead) {
               totals.unchanged++;
               notePage(page, "unchanged", { visaId: resolvedVisaId });
               console.log(`  -> unchanged (hash gate, no extraction): ${resolvedVisaId}`);
@@ -459,7 +464,7 @@ async function main() {
             promptReextract = true;
             console.log(
               "  -> same hash, but extracted with prompt " +
-                `${existing.scrapeMeta?.extractorPromptVersion ?? "(none)"} ≠ ${EXTRACTOR_PROMPT_VERSION}: re-extracting`
+                `${existing.scrapeMeta?.extractorPromptVersion ?? "(none)"} ≠ ${EXTRACTION_PIPELINE_VERSION}: re-extracting`
             );
           } else if (
             // Approved doc (issue #68): its live hash never moves on ingest,
@@ -503,12 +508,14 @@ async function main() {
             recorder.recordUsage({ ...callUsage, sourceId: source.countryCode });
           },
         });
+        // Issue #212: coverage check against the page's own list items.
+        const covered = applyItemCoverage(extracted, fetched.listItems);
         const { visaId, outcome } = await visaCatalogService.ingestExtraction({
           countryCode: source.countryCode,
           sourceUrl: page.url,
           routeName: page.routeName,
           contentHash: gateHash, // page hash unless linked surcharges apply (#69)
-          extracted,
+          extracted: covered,
           model: visaCatalogExtractor.model,
           // Registry-owned identity: the id resolved above (used verbatim by
           // ingest, not recomputed) + the pinned code, if any.
@@ -526,7 +533,7 @@ async function main() {
           llmUsage: callUsage,
         });
         totals[outcome]++;
-        notePage(page, outcome, { visaId, ...pageUsageFields(callUsage, EXTRACTOR_PROMPT_VERSION) });
+        notePage(page, outcome, { visaId, ...pageUsageFields(callUsage, EXTRACTION_PIPELINE_VERSION) });
         if (callUsage) console.log(`     ${describeUsage(callUsage)}`);
         console.log(`  -> ${outcome}: ${visaId} (conf ${Math.round(extracted.confidence * 100)}%)`);
         // Issue #86: say when uncited numbers were left out (never written as 0).
@@ -543,7 +550,7 @@ async function main() {
           visaId: pageVisaId,
           error: (err as Error)?.message ?? String(err),
           // A call that failed validation was still billed (#82).
-          ...pageUsageFields(callUsage, EXTRACTOR_PROMPT_VERSION),
+          ...pageUsageFields(callUsage, EXTRACTION_PIPELINE_VERSION),
         });
         // 429/503: stop requesting this host for the rest of the manual run.
         // Recorded against the answering host, the requested host and the
@@ -655,7 +662,7 @@ function describeUsage(p: PricedUsage): string {
  */
 async function printEstimate(args: ReturnType<typeof parseArgs>): Promise<void> {
   const { collections, subcollections } = await import("../../../utils/firebase");
-  const { visaCatalogExtractor, EXTRACTOR_PROMPT_VERSION } = await import("../visa-catalog-extract.service");
+  const { visaCatalogExtractor, extractionVersionFor } = await import("../visa-catalog-extract.service");
   const { visaCatalogService } = await import("../visa-catalog.service");
   const { isPendingPromptStale } = await import("../visa-catalog-diff");
   const { scrapeCostService } = await import("../../shared/cost/scrape-cost.service");
@@ -666,7 +673,7 @@ async function printEstimate(args: ReturnType<typeof parseArgs>): Promise<void> 
     : await collections.visaSources.get();
   let queued = 0;
   let extractable = 0;
-  console.log(`\nRe-extract estimate (prompt ${EXTRACTOR_PROMPT_VERSION}${args.assumeBump ? ", assuming a version bump" : ""})`);
+  console.log(`\nRe-extract estimate (prompt ${extractionVersionFor("govuk-content-api")}${args.assumeBump ? ", assuming a version bump" : ""})`);
   for (const doc of sourcesSnap.docs) {
     const source = doc.data() as Pick<VisaSource, "countryCode" | "pages">;
     // Same page filter as a crawl: no supplement-only rows, optional --visa.
@@ -697,7 +704,7 @@ async function printEstimate(args: ReturnType<typeof parseArgs>): Promise<void> 
                 !existing.staleSince &&
                 Array.isArray(existing.requiredDocuments) &&
                 existing.requiredDocuments.length > 0))
-          : isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION);
+          : isPendingPromptStale(existing, extractionVersionFor(source.countryCode === "GB" ? "govuk-content-api" : undefined));
       if (stale) srcQueued++;
     }
     queued += srcQueued;

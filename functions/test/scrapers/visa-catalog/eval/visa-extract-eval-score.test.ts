@@ -47,7 +47,7 @@ import {
   type GuideFixture,
 } from "../../../../src/scrapers/visa-catalog/eval/golden";
 import { recordRoutes, toRecordedBody, RecordRejectedError, parseRecordArgs } from "../../../../src/scrapers/visa-catalog/eval/record";
-import { main, parseRunArgs, resultsFileName, type EvalResultFile } from "../../../../src/scrapers/visa-catalog/eval/run";
+import { evalPage, main, parseRunArgs, resultsFileName, type EvalResultFile } from "../../../../src/scrapers/visa-catalog/eval/run";
 import {
   containsKeyword,
   durationsIn,
@@ -826,13 +826,28 @@ describe("runner (eval/run.ts)", () => {
   });
 
   test("live run (stub extractor returning a perfect output) passes with exit 0", async () => {
+    // Issue #212: "perfect" now also means citing every item the page lists, so
+    // the stub returns each collected page item with its own text as quote.
+    const sw = EVAL_ROUTES.find((r) => r.route === "skilled-worker-visa")!;
+    const doc = await new GovukContentApiAdapter(fixtureFetchService(sw.url, loadGuide(sw.route))).fetch(evalPage(sw));
+    const items = (doc.listItems ?? []).map((i) => i.text);
     const code = await main(["--only", "skilled-worker-visa"], {
       env: {},
       writeResults: false,
       log: () => undefined,
       logError: () => undefined,
       gitInfo: () => ({ sha: "x", dirty: false }),
-      extractor: { model: "stub", extract: async () => perfectSW() },
+      extractor: {
+        model: "stub",
+        extract: async () => {
+          const out = perfectSW();
+          return {
+            ...out,
+            requiredDocuments: items,
+            citations: { ...out.citations, ...Object.fromEntries(items.map((t, i) => [`requiredDocuments.${i}`, t])) },
+          };
+        },
+      },
     });
     assert.equal(code, 0);
   });

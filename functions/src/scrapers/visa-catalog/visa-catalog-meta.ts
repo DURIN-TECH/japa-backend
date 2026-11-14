@@ -44,6 +44,7 @@ export function buildScrapeMeta(params: {
     | "processingUnverifiedReasons"
     | "requiredDocumentsDropped"
     | "requiredDocumentMeta"
+    | "missingFromExtraction"
   >;
   extractedAt: Timestamp;
   sourceMeta?: ScrapeSourceMeta;
@@ -84,6 +85,10 @@ export function buildScrapeMeta(params: {
   // requiredDocuments); only when present, so older shapes are unchanged.
   if (params.extracted.requiredDocumentMeta && params.extracted.requiredDocumentMeta.length > 0) {
     meta.requiredDocumentMeta = params.extracted.requiredDocumentMeta.map((m) => ({ ...m }));
+  }
+  // Issue #212: written even when [] ("checked, nothing missing"); absent = not checked.
+  if (params.extracted.missingFromExtraction) {
+    meta.missingFromExtraction = params.extracted.missingFromExtraction.map((m) => ({ ...m }));
   }
   if (params.supplementaryPages && params.supplementaryPages.length > 0) {
     meta.supplementaryPages = params.supplementaryPages.map((p) => ({ ...p }));

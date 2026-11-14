@@ -85,6 +85,9 @@ export const SCRAPE_ALERT_STATUSES: readonly ScrapeAlertStatus[] = ["open", "ack
  *    pipeline errored) and was NOT published; the serving version keeps
  *    serving. One alert per route + version; auto-resolves when a later version
  *    publishes or the held version is rejected or approved;
+ *  - checklist_shrink (issue #212): an open pendingVisaChanges row would REMOVE
+ *    items from an approved visa's `requiredDocuments` (a re-crawl lists fewer);
+ *    cleared when the row is no longer open or a newer revision removes nothing.
  *  - route_onboarding_attention (issue #217): a route onboarding run ended
  *    `failed` or `held` and an admin has to look. One alert per run (deduped
  *    by the run id), linking the run; auto-resolves when a held run later
@@ -107,7 +110,8 @@ export type ScrapeAlertRule =
   | "infrastructure_error"
   | "rubric_auto_published"
   | "rubric_draft_held"
-  | "route_onboarding_attention";
+  | "route_onboarding_attention"
+  | "checklist_shrink";
 
 /** Every rule id (config validation, docs). */
 export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
@@ -128,6 +132,7 @@ export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
   "rubric_auto_published",
   "rubric_draft_held",
   "route_onboarding_attention",
+  "checklist_shrink",
 ];
 
 /**

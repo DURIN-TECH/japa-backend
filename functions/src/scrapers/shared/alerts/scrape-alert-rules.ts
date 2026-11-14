@@ -122,6 +122,9 @@ export const DEFAULT_SEVERITY: Record<ScrapeAlertRule, ScrapeAlertSeverity> = {
   // immediate look (the default email threshold is "warning"), not an outage.
   rubric_auto_published: "warning",
   route_onboarding_attention: "warning",
+  // Issue #212: a re-crawl would drop items from an approved visa's checklist
+  // (shown to an admin, never applied): worth a look, not an outage.
+  checklist_shrink: "warning",
   // Issue #201: a draft was held. Warning by default; the rule raises it to
   // critical itself for a protected-rule hold or unreadable publish settings.
   rubric_draft_held: "warning",
@@ -1376,4 +1379,70 @@ export function evaluateRouteOnboardingAttention(facts: RouteOnboardingAlertFact
 /** Resolve a run's alert (a held run became published): no signal, scoped to its key. */
 export function evaluateRouteOnboardingCleared(runId: string): RuleEvaluation {
   return { rule: "route_onboarding_attention", signals: [], scope: { keys: [routeOnboardingKey(runId)] } };
+}
+
+// ============================================
+// CHECKLIST SHRINK (issue #212)
+// ============================================
+//
+// checklist_shrink   key `checklist_shrink:<countryCode>:<visaId>`
+//   Raised when an OPEN pendingVisaChanges row has a `requiredDocuments` diff
+//   with `removed.length > 0`: a re-crawl lists FEWER documents than the live
+//   visa. The row only PROPOSES (nothing is applied until an admin approves),
+//   so this is a heads-up that an admin should look before approving.
+//   Cleared when the row is no longer open (approved / rejected: it is absent
+//   from the open rows) or a newer revision removes nothing. Evaluated over ALL
+//   open rows by both the post-run hook (covers the rows the run created or
+//   replaced) and the hourly check, with the scope "every checklist_shrink key",
+//   so any alert whose row is not in the list has cleared.
+
+/** The facts of one open proposal row the rule reads. */
+export interface ChecklistShrinkRow {
+  changeId: string;
+  countryCode: string;
+  visaId: string;
+  revision: number;
+  liveCount: number; // items the live visa lists
+  proposedCount: number; // items the proposal would leave
+  removed: string[]; // the removed items' text (all of them; the rule keeps 10)
+}
+
+/** Dedupe key of a visa's shrink alert. */
+export const checklistShrinkKey = (countryCode: string, visaId: string) => `checklist_shrink:${countryCode}:${visaId}`;
+
+/** Prefix of every shrink key (the evaluation's scope). */
+export const CHECKLIST_SHRINK_PREFIX = "checklist_shrink:";
+
+/**
+ * Raise one alert per open row that removes items; resolve the rest (scope =
+ * every shrink key). A row with `removed: []` (items only added) is silent.
+ */
+export function evaluateChecklistShrink(rows: ChecklistShrinkRow[], config: ScrapeAlertsConfig): RuleEvaluation {
+  const signals: AlertSignal[] = rows
+    .filter((r) => r.removed.length > 0)
+    .map((r) => ({
+      rule: "checklist_shrink" as const,
+      key: checklistShrinkKey(r.countryCode, r.visaId),
+      severity: ruleSeverity(config, "checklist_shrink"),
+      kind: "visa" as const,
+      subject: { type: "source" as const, id: r.countryCode, label: `${r.countryCode} visa ${r.visaId}` },
+      message: clipText(
+        `A re-crawl of ${r.visaId} would shrink its checklist from ${r.liveCount} to ${r.proposedCount} item(s): ` +
+          `${r.removed.length} removed. Nothing is applied until an admin approves proposal ${r.changeId}.`,
+        600
+      ),
+      details: {
+        countryCode: r.countryCode,
+        visaId: r.visaId,
+        changeId: r.changeId,
+        liveCount: r.liveCount,
+        proposedCount: r.proposedCount,
+        // Alert details are scalars only: the first 10 removed items, one per line.
+        removed: clipText(r.removed.slice(0, 10).join("\n"), 1500),
+      },
+      // A new revision of the row is a new occurrence (bumps the count); the
+      // same revision seen again (post-run hook, then hourly) is not.
+      eventId: `${r.changeId}:r${r.revision}`,
+    }));
+  return { rule: "checklist_shrink", signals, scope: { keyPrefix: CHECKLIST_SHRINK_PREFIX } };
 }

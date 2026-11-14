@@ -95,6 +95,23 @@ The run **fails** (exit 1) when any of these is true:
   (`processingUnverifiedReasons`, confidence capped at 0.5). `npm test` also
   checks that every expected processing value is stated by its own `source`
   quote.
+- **Hard gate (#212): item coverage.** The page's own list items are collected
+  deterministically from each route's recorded `guide.json` through the real
+  adapter (`adapters/govuk-list-items.ts`: every `<li>` under a recognised
+  "you'll need to provide:" lead-in, plus a prose "You must have ..." sentence in
+  a part that has such a list). Every collected item must be matched by the run's
+  output: some extracted item's citation quote CONTAINS the item's text
+  (compared after `normForQuote`, so curly vs straight apostrophes agree). Any
+  unmatched item fails the run whatever the scores, in live runs and in
+  `--replay`; the report lists each as `route, section, leadIn, text`. The gate
+  checks the model's OWN output (before the crawl appends missing items), so it
+  measures the extractor, not the safety net. A page item that is knowingly
+  missing may be listed in the route's `expected.json` under
+  `itemCoverageGaps: [{ text, ref, note }]` (tracker ref + the verbatim page
+  text): it is printed but never fails. Replaying the committed v10 result
+  fails with 7 misses (Skilled Worker 6, Standard Visitor's passport sentence 1),
+  which is intended until the extractor reaches full coverage (#213); `npm test`
+  pins those numbers. No threshold is lowered and no golden edited to pass.
 - overall < **0.85** (`OVERALL_PASS_THRESHOLD`)
 - any single route < **0.7** (`ROUTE_PASS_THRESHOLD`)
 
