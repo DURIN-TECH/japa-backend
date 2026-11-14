@@ -263,7 +263,7 @@ describe("independent check through the pipeline", () => {
     assert.ok(!served?.criteria.some((c) => c.title === "Reasonable costs of the visit"));
   });
 
-  test("a protected rule that fails holds the draft (critical alert), nothing published, no ordinary batch spent", async () => {
+  test("a protected rule that fails holds the draft (critical alert), nothing published; (#223) the ordinary rules are still checked", async () => {
     await seedA();
     settings();
     const w = wired();
@@ -276,7 +276,8 @@ describe("independent check through the pipeline", () => {
     assertUntouched(KEY_A, 1, 0, null);
     assert.equal(alerts()[0].severity, "critical");
     assert.match(alerts()[0].message, /protected rule/);
-    assert.equal(batchRequests(w.provider).filter((q) => !seenRules(q).some((x) => x.appliesTo)).length, 0);
+    // (#223) The ordinary rules ARE checked now, so the held report is complete.
+    assert.ok(batchRequests(w.provider).filter((q) => !seenRules(q).some((x) => x.appliesTo)).length > 0);
   });
 
   test("role disagreement on the bar holds", async () => {
@@ -297,9 +298,10 @@ describe("independent check through the pipeline", () => {
     w.provider.script = () => "hard";
     const r = await trigger(pipeline(w.checker));
     assert.equal(r?.outcome, "held");
-    assert.deepEqual(r?.reasonCodes, ["checker_unavailable"]);
+    // (#223) The reason says what was unreachable.
+    assert.deepEqual(r?.reasonCodes, ["checker_unavailable:provider"]);
     assertUntouched(KEY_A, 1, 0, null);
-    assert.match(alerts()[0].message, /independent AI check could not be completed/);
+    assert.match(alerts()[0].message, /independent AI check could not be completed because the AI provider could not be reached/);
   });
 
   test("an answer that does not match what was asked: held checker_output_invalid", async () => {
@@ -364,7 +366,7 @@ describe("independent check through the pipeline", () => {
     const w = wired();
     const svc = pipeline(w.checker);
     w.provider.script = () => "hard";
-    assert.deepEqual((await trigger(svc))?.reasonCodes, ["checker_unavailable"]);
+    assert.deepEqual((await trigger(svc))?.reasonCodes, ["checker_unavailable:provider"]);
     w.provider.script = () => undefined;
     const sweep = (await quiet(() => svc.sweepRetryable())).result;
     assert.deepEqual(sweep, { considered: 1, retried: 1 });

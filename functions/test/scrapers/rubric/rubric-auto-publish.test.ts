@@ -351,7 +351,7 @@ describe("auto-publish: the plug-in points hold when empty", () => {
     const cases: [string, RubricChecker | null, QuestionPlanner | null, string[]][] = [
       ["checker not ok", checkerStub({ ok: false, reasonCodes: ["checker_capped"] }), plannerStub(), ["checker_capped"]],
       ["checker protected failure", checkerStub({ ok: false, reasonCodes: ["protected_rule_failed:x"], protectedRuleIds: ["x"] }), plannerStub(), ["protected_rule_failed:x"]],
-      ["checker throws", { check: async () => { throw new Error("boom"); } }, plannerStub(), ["checker_unavailable"]],
+      ["checker throws", { check: async () => { throw new Error("boom"); } }, plannerStub(), ["checker_unavailable:internal"]],
       ["planner not ok", checkerStub(), plannerStub({ ok: false, reasonCodes: ["question_plan_unusable"] }), ["question_plan_unusable"]],
       ["planner throws", checkerStub(), { plan: async () => { throw new Error("boom"); } }, ["question_plan_unusable"]],
       ["polarity not verified", checkerStub({ ok: true, leftOut: [], resolvedFlagCodes: [], intentPolarity: null }), plannerStub(), ["polarity_unverified"]],

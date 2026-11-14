@@ -508,11 +508,10 @@ export class RubricCheckerService {
   /** Run `fn` with the stage named, so an error thrown inside it is reported as that stage. */
   private async at<T>(stage: StageBox, name: StageBox["name"], fn: () => Promise<T>): Promise<T> {
     stage.name = name;
-    try {
-      return await fn();
-    } finally {
-      stage.name = "internal";
-    }
+    // Reset only on success: when `fn` throws, `check()`'s catch must still see WHICH stage it was.
+    const out = await fn();
+    stage.name = "internal";
+    return out;
   }
 
   private async checkInner(input: RubricCheckInputShape, stage: StageBox): Promise<RubricCheckOutcomeShape> {
@@ -597,7 +596,9 @@ export class RubricCheckerService {
     };
     const stop = async (reasonCodes: string[], extra: { protectedRuleIds?: string[]; protectedFailures?: RubricProtectedFailure[]; leftOut?: { criterionId: string; reason: string }[] } = {}): Promise<RubricCheckOutcomeShape> => {
       await this.persist(ctx, "failed", reasonCodes);
-      return { ok: false, reasonCodes, ...extra, requests: this.requestsOf(ctx) };
+      // The spend is reported when a repair was involved (a failed bar, or repair requests); the checker's
+      // own record holds it for every other run.
+      return { ok: false, reasonCodes, ...extra, ...(extra.protectedFailures !== undefined || ctx.repairRequests > 0 ? { requests: this.requestsOf(ctx) } : {}) };
     };
 
     // Phase 1: protected rules and the polarity readings. A provider/cap/format failure holds now.
@@ -674,7 +675,8 @@ export class RubricCheckerService {
 
     if (failedIds.length === 0) {
       await this.persist(ctx, "completed", []);
-      return { ok: true, leftOut, resolvedFlagCodes, intentPolarity, droppedTriggerIds, requests: this.requestsOf(ctx) };
+      // (no `requests` here: with no failed bar there was no repair, and the checker's own record holds the spend)
+      return { ok: true, leftOut, resolvedFlagCodes, intentPolarity, droppedTriggerIds };
     }
 
     // ---- (#223) a protected rule failed: ONE bounded repair of each, then hold unless every bar was repaired ----
