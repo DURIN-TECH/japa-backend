@@ -436,7 +436,9 @@ export class RubricExtractionJobService {
 
       // ---- the plan: read the text, cut it, check the caps ----
       const routeName = await this.service.routeNameOf(target);
-      const ctx = await this.service.buildRunContext(resolved.sources, settings, routeName);
+      // (#234) Read once here and pinned on the job (see RubricExtractionJob.groupAuthorities).
+      const groupAuthorities = await this.service.groupAuthoritiesOf();
+      const ctx = await this.service.buildRunContext(resolved.sources, settings, routeName, groupAuthorities);
       if (ctx.chunks.length === 0) throw new RunStop("failed", "no_text", "the snapshots hold no text to extract from");
       this.service.assertWithinCaps(ctx.chunks, settings);
       // (#220) One more call at most per excerpt of a source in another language (its translation).
@@ -489,6 +491,7 @@ export class RubricExtractionJobService {
         model,
         promptVersion: RUBRIC_PROMPT_VERSION,
         routeName,
+        ...(groupAuthorities.length > 0 ? { groupAuthorities } : {}),
         pinned,
         plan: ctx.plan,
         chunkRefs: chunkRefsOf(ctx.chunks),
@@ -777,7 +780,7 @@ export class RubricExtractionJobService {
     if (stale.length > 0) return this.stopped(jobId, owner, { status: "skipped", reasonCode: "sources_changed", message: "a source changed while the job was running; no version was written (the change starts a new job)" }, stepsRun);
 
     // ---- rebuild the run from the pinned snapshots, and replay the stored steps ----
-    const ctx = await this.service.buildRunContext(job.sources, job.pinned, job.routeName);
+    const ctx = await this.service.buildRunContext(job.sources, job.pinned, job.routeName, job.groupAuthorities ?? []);
     const refs = chunkRefsOf(ctx.chunks);
     if (refs.length !== job.chunkRefs.length || refs.some((r, i) => r !== job.chunkRefs[i])) {
       return this.stopped(jobId, owner, { status: "failed", reasonCode: "plan_changed", message: "the stored text no longer cuts into the same parts as when the job started; start a new draft" }, stepsRun);

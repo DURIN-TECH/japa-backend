@@ -1,4 +1,6 @@
-import type { IntakeCondition, IntakeQuestion, RuleTrigger } from "../types/rubric";
+import type { FactTrigger, IntakeCondition, IntakeQuestion, RuleTrigger } from "../types/rubric";
+import { APPLICANT_FACT_KINDS, HELD_DOCUMENT_KINDS, type HeldDocumentKind } from "../types/applicant-facts";
+import { checkAuthorityId, isCountryCode } from "../authorities/authority-ids";
 
 // ============================================
 // RUBRIC RULE TRIGGERS: THE ONE IMPLEMENTATION (INTEGRATION of #200 and #207)
@@ -93,4 +95,54 @@ export function conditionsForTriggers(triggers: readonly RuleTrigger[]): IntakeC
     byQuestion.set(t.questionId, set);
   }
   return [...byQuestion.entries()].map(([questionId, values]) => ({ questionId, op: "in" as const, value: [...values] }));
+}
+
+// ============================================
+// (#234, P5 of #228) FACT TRIGGERS: "applies when the applicant's fact is one of"
+// ============================================
+//
+// The second trigger form, `{ fact, anyOf }` (types/rubric.ts `FactTrigger`),
+// stored in `criterion.factTrigger` beside the question trigger. It reads what
+// the applicant HOLDS (copied onto the application as `applicantFacts`), not
+// an intake answer, so it never shows or hides an intake question. The
+// resolution itself (which needs the facts and a date) is in
+// services/ai/applicant-groups.ts; this file only says whether a stored
+// trigger is usable. Pure: no Firebase, no clock, no country named.
+
+/** A `holds` trigger value, split: the document kind and its issuer. */
+export interface HoldsValue {
+  document: HeldDocumentKind;
+  issuer: string;
+}
+
+/**
+ * Split a `holds` trigger value `"{documentKind}:{issuer}"`. Undefined when
+ * the kind is not one of HELD_DOCUMENT_KINDS or the issuer is neither a
+ * two-letter country code nor a valid authority id.
+ */
+export function parseHoldsValue(raw: unknown): HoldsValue | undefined {
+  if (typeof raw !== "string") return undefined;
+  const at = raw.indexOf(":");
+  if (at <= 0) return undefined;
+  const document = raw.slice(0, at);
+  const issuer = raw.slice(at + 1);
+  if (!(HELD_DOCUMENT_KINDS as readonly string[]).includes(document)) return undefined;
+  if (!isCountryCode(issuer) && !checkAuthorityId(issuer).ok) return undefined;
+  return { document: document as HeldDocumentKind, issuer };
+}
+
+/**
+ * Is a stored fact trigger usable? The fact must be one of
+ * APPLICANT_FACT_KINDS and `anyOf` a non-empty list of values of the right
+ * shape (two-letter codes for `nationality` / `residence`, `kind:issuer` for
+ * `holds`). A trigger that fails this is treated as ABSENT by consumers, the
+ * same as a damaged question trigger: a specialist rule without a usable
+ * trigger is "could not tell", never "applies to everyone".
+ */
+export function isValidFactTrigger(trigger: FactTrigger | undefined): trigger is FactTrigger {
+  if (!trigger || typeof trigger !== "object") return false;
+  if (!(APPLICANT_FACT_KINDS as readonly string[]).includes(trigger.fact as string)) return false;
+  if (!Array.isArray(trigger.anyOf) || trigger.anyOf.length === 0) return false;
+  if (trigger.fact === "holds") return trigger.anyOf.every((v) => parseHoldsValue(v) !== undefined);
+  return trigger.anyOf.every((v) => isCountryCode(v));
 }

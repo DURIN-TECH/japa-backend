@@ -1,6 +1,9 @@
 import { Timestamp } from "firebase-admin/firestore";
 import type { ApplicationIntake } from "./intake";
 import type { SharedRouteRef } from "./shared-route";
+// Issue #234: what the applicant holds (profile) and its copy on an application.
+import type { ApplicantFacts, HeldDocument } from "./applicant-facts";
+export * from "./applicant-facts";
 // Issue #179: stored prices are dollar Money; reads add a local quote.
 import type { ChargeSnapshot, LocalPriceQuote, Money, PriceMigrationRecord, QuoteLock } from "./money";
 // Automated-verification result shapes live with the provider contract; the
@@ -51,7 +54,19 @@ export interface User {
   address?: Address;
   residentialCountry?: string;
   profilePhotoUrl?: string;
-  
+
+  // ---- What the applicant holds (issue #234; see types/applicant-facts.ts) ----
+  // Written ONLY through PUT /users/me/holdings and its document sub-routes
+  // (validated server-side); never through PUT /users/me or a client SDK
+  // write (not in USER_SELF_EDITABLE_FIELDS / firestore.rules on purpose).
+  // Nationalities: two-letter codes, one or more. Absent or empty = not stated.
+  nationalities?: string[];
+  // Held visas / permits / travel authorisations. ABSENT = never stated;
+  // an empty list = the applicant said they hold none.
+  heldDocuments?: HeldDocument[];
+  // When the holdings were last saved.
+  holdingsUpdatedAt?: Timestamp;
+
   // Onboarding status
   onboardingCompleted: boolean;
   onboardingCompletedAt?: Timestamp;
@@ -847,6 +862,14 @@ export interface Application {
   // applications started before P2: those resolve live
   // (shared-routes/route-stack.ts `resolveApplicationStack`).
   routeStack?: string[];
+
+  // Issue #234 (P5 of #228): the applicant's holdings (nationalities, country
+  // of residence, held visas and permits) COPIED from their profile when the
+  // application started, with the time taken. Assessment reads this copy, not
+  // the live profile. Personal data: returned only by GET /applications/:id
+  // (behind `checkApplicationAccess`) and stripped from case lists. ABSENT on
+  // applications started before #234. Never written by the generic update.
+  applicantFacts?: ApplicantFacts;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;

@@ -31,6 +31,19 @@ import {
   NotificationChannel,
 } from "../types";
 
+/**
+ * Issue #234: an application WITHOUT its copy of the applicant's holdings
+ * (`applicantFacts`: nationalities, residence, held documents; personal data).
+ * Used on case lists, which are not behind `checkApplicationAccess`; the copy
+ * is only returned by GET /applications/:id. Exported for tests.
+ */
+export function withoutApplicantFacts(app: Application): Application {
+  if (app.applicantFacts === undefined) return app;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { applicantFacts: _omitted, ...rest } = app;
+  return rest as Application;
+}
+
 export class ApplicationController {
   /**
    * POST /applications
@@ -533,6 +546,12 @@ export class ApplicationController {
       if (mode && typeof mode === "string") {
         applications = applications.filter((app) => app.mode === mode);
       }
+
+      // Issue #234: a case LIST never carries the applicant's holdings copy
+      // (`applicantFacts`, personal data): the lists above are not filtered by
+      // `checkApplicationAccess`, so the copy is returned only by
+      // GET /applications/:id, which is.
+      applications = applications.map(withoutApplicantFacts);
 
       // Resolve who is handling each case so client-facing UIs can name them.
       sendSuccess(res, await this.withHandlerNames(applications));

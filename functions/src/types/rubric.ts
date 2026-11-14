@@ -1,4 +1,6 @@
 import type { Timestamp } from "firebase-admin/firestore";
+// (#234) The held-document kinds a `holds` group names (a closed list shared with the profile).
+import type { ApplicantFactKind, HeldDocumentKind } from "./applicant-facts";
 
 // ============================================
 // VISA RUBRIC — TYPES (issue #40)
@@ -241,6 +243,70 @@ export interface CriterionAppliesTo {
   // parallel, for real nationalities only). A bar needs at least one coded or
   // uncoded member. Absent on versions stored before #222 (additive, optional).
   uncoded?: string[];
+  // (#234, P5 of #228) Members of the group that are decided from what the
+  // applicant HOLDS rather than from their nationality: "people who live in X"
+  // (`residence`), "holders of a valid X permit" (`holds`), "citizens of any
+  // member of X" (`members_of`). Each carries `asWritten`, the member exactly
+  // as the criterion's own quote names it (checked in code like `asWritten`
+  // above). A member that cannot be coded this way stays in `uncoded`: no
+  // code, country or authority id is ever made up for it.
+  // Nationality members stay in `nationalities` / `asWritten` (the stored
+  // shape since #42); readers see them as `nationality` groups through
+  // `groupsOf` (services/ai/applicant-groups.ts), so no stored version needs a
+  // rewrite. Absent on versions stored before #234 (additive, optional).
+  groups?: StoredApplicantGroup[];
+}
+
+/**
+ * (#234) One coded member of a bar's group that is decided from the
+ * applicant's holdings (the stored kinds; a `nationality` member is stored in
+ * `CriterionAppliesTo.nationalities`, see above).
+ *
+ *  - `residence`:  the applicant lives in country `code`.
+ *  - `holds`:      the applicant holds a document of kind `document`, issued
+ *                  by `issuer` (a two-letter country code or an authority id,
+ *                  matched exactly as the applicant recorded it), still valid
+ *                  on the date the rule is checked on. An expired document
+ *                  never matches.
+ *  - `members_of`: the applicant's nationality (`fact: "nationality"`) or
+ *                  country of residence (`fact: "residence"`) is a member of
+ *                  authority `authorityId` (P1 of #228) on the application's
+ *                  start date, resolved through the recorded membership data.
+ *                  An authority with no recorded members gives "could not be
+ *                  assessed", never "nobody".
+ */
+export type StoredApplicantGroup =
+  | { kind: "residence"; code: string; asWritten: string }
+  | { kind: "holds"; document: HeldDocumentKind; issuer: string; asWritten: string }
+  | { kind: "members_of"; authorityId: string; fact: "nationality" | "residence"; asWritten: string };
+
+/** (#234) The kinds a stored group may have (a nationality member is stored in `nationalities`). */
+export const STORED_APPLICANT_GROUP_KINDS = ["residence", "holds", "members_of"] as const;
+
+/**
+ * (#234) The facts a `FactTrigger` can read: the applicant's nationalities,
+ * their country of residence, or the documents they hold.
+ */
+// The list itself lives with the profile types (types/applicant-facts.ts), so
+// pure helpers can use it without value-importing this rubric module.
+export { APPLICANT_FACT_KINDS, type ApplicantFactKind } from "./applicant-facts";
+
+/**
+ * (#234, P5 of #228) The second trigger form, BESIDE the question trigger
+ * (`RuleTrigger`): "this rule applies when the applicant's `fact` is one of
+ * `anyOf`".
+ *   - `nationality` / `residence`: `anyOf` holds two-letter country codes;
+ *     any one of the applicant's nationalities counts.
+ *   - `holds`: each entry is `"{documentKind}:{issuer}"` (for example
+ *     `"residence_permit:XX"`, issuer a country code or an authority id): the
+ *     applicant holds such a document, still valid on the date checked.
+ * Stored in its own criterion field (`factTrigger`), so no reader of the
+ * question trigger can mistake one for the other. A missing fact resolves to
+ * "could not be assessed: we need to know your nationality" (never a guess).
+ */
+export interface FactTrigger {
+  fact: ApplicantFactKind;
+  anyOf: string[];
 }
 
 /**
@@ -313,6 +379,14 @@ export interface AssessmentCriterion {
   // kept, and an assessment reports it as not assessable, never as failed and
   // never as applying to everyone). See services/ai/rule-applicability.ts.
   trigger?: RuleTrigger;
+  // (#234) WHEN the rule applies, read from what the applicant HOLDS (their
+  // nationality, residence or held documents; see `FactTrigger`). Only read on
+  // a `specialist` / `conditional` rule. When both triggers are present the
+  // rule applies only when BOTH hold (either one ruling it out rules it out; a
+  // missing answer or fact on either makes it "could not tell"). Absent on
+  // every version stored before #234 (additive, optional); extraction does not
+  // draft it yet.
+  factTrigger?: FactTrigger;
   // (#248) SERVED-SIDE ONLY, never stored on a version and never extracted: set by
   // `applyExclusions` (rubric-exclusions.ts) on a mandatory bar that is served WITHOUT
   // its trigger because the independent check could not confirm the trigger (the

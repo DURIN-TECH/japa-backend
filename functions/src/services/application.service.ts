@@ -20,6 +20,9 @@ import { noteService } from "./note.service";
 import { canStartCaseOnVisa } from "../agency-visas/agency-visa-access";
 // Issue #231: the rulebook stack fixed on a new application (light import: no authorities service).
 import { resolveRouteStackFor, routeStackKeys } from "../shared-routes/route-stack";
+// Issue #234: the applicant's holdings, copied onto the application when it starts.
+import { applicantFactsFromUser } from "./applicant-holdings.service";
+import type { User } from "../types";
 
 export interface CreateApplicationInput {
   visaTypeId: string;
@@ -197,6 +200,13 @@ class ApplicationService {
       visaTypeName: visaType.name,
       countryName: country?.name || input.countryCode,
       routeStack,
+      // Issue #234 (P5 of #228): what the applicant holds (nationalities,
+      // country of residence, held visas and permits), COPIED from their
+      // profile now, with the time taken (same pattern as the intake answers).
+      // Assessment reads this copy, never the live profile, so a later profile
+      // edit does not change what this application is assessed on. Facts the
+      // applicant has not stated are copied as "not stated", never guessed.
+      applicantFacts: applicantFactsFromUser(userData as Partial<User> | null, now),
       createdAt: now,
       updatedAt: now,
     };
