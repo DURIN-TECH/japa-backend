@@ -1322,8 +1322,11 @@ describe("rubric review: nothing unapproved is served", () => {
     // #201 (EXPLICIT extension): the automatic publisher reads the version it
     // publishes and the serving one through getVersionForReview. Backend-only; no route reaches it except the admin one.
     // #203 (EXPLICIT extension): the read-only `plan:questions` script prints a draft's figures.
+    // #217 (EXPLICIT extension): the route onboarding run reads ONE version's review status
+    // (getVersionForReview) to see whether a person or the pipeline decided it; read-only, admin routes only.
     assert.deepEqual(users, [
       "index.ts",
+      path.join("scrapers", "onboarding", "route-onboarding.service.ts"),
       path.join("scrapers", "rubric", "rubric.store.ts"),
       path.join("scrapers", "rubric", "scripts", "plan-questions.ts"),
       path.join("services", "ai-bulk-reassessment.service.ts"),
@@ -1342,7 +1345,9 @@ describe("rubric review: nothing unapproved is served", () => {
     // BACKEND-ONLY callers of getVersionForReview: they load the approved version
     // named by an approval's audit entry and the one it replaced. No route calls them.
     // (utils/firebase.ts only declares the collection group; it no longer matches by name.)
+    // #217 (EXPLICIT extension): the onboarding run reads one version's review status (read-only).
     assert.deepEqual(versionReaders, [
+      path.join("scrapers", "onboarding", "route-onboarding.service.ts"),
       path.join("scrapers", "rubric", "rubric.store.ts"),
       path.join("scrapers", "rubric", "scripts", "plan-questions.ts"),
       path.join("services", "ai-bulk-reassessment.service.ts"),
