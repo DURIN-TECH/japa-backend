@@ -42,6 +42,8 @@ strict (unknown keys: 400). Errors are `{ success:false, error, message, ... }`.
 - **Language**: `appConfig/routeOnboardingSettings.supportedLanguages`, default
   `["en"]`; anything else is 422 `LANGUAGE_NOT_SUPPORTED`. A malformed list falls
   back to the default, never to "everything". A failed settings read is 503.
+  (#220) The same list is the publish gate: a version whose sources are in a
+  language not listed here (or with no language data) is held `language_not_supported`.
 - **Registering a route** creates, in one transaction, only what is missing:
   `countries/{cc}` (hidden), the page in `visaSources/{cc}` (pinned `visaId`,
   `addedVia: "portal"`, generic-html, weekly night window on the least loaded

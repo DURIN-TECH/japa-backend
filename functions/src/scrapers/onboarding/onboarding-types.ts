@@ -85,6 +85,8 @@ export interface EstimateSource {
   characters: number;
   chunks: number;
   contentHashPrefix: string;
+  // (#220) The language the page was registered in (a code). Absent on an estimate stored before #220.
+  language?: string;
 }
 
 /** The state of automatic publishing for this route, in plain words. */
@@ -111,6 +113,9 @@ export interface RunEstimate {
   // Check and question-check calls: about 3.7 per chunk, never more than the checker cap.
   checkCallsAbout: number;
   checkCallsAtMost: number;
+  // (#220) Translation calls: at most one per text part of a page that is not in the product language
+  // (an unofficial courtesy, never evidence; it spends against the same request cap). Absent / 0 when none.
+  translationCallsAtMost?: number;
   // Tokens from the observed per-call averages, for the extraction calls only.
   inputTokensApprox: number;
   outputTokensApprox: number;

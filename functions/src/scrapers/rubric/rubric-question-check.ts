@@ -39,7 +39,8 @@ import { DATA_ONLY_RULE, wrapUntrusted } from "../../services/ai/prompt-safety";
 // Generic: no country, nationality, route or publisher is named here.
 
 /** Version of the prompts and schemas below. Recorded on every plan. */
-export const QUESTION_CHECK_PROMPT_VERSION = "question-check-2026-11-13.1";
+// 2026-11-14.1 (#220): the official sentence may be in any language; the wording for applicants is English by design.
+export const QUESTION_CHECK_PROMPT_VERSION = "question-check-2026-11-14.1";
 
 /** The aspects checked for a question. */
 export const QUESTION_ASPECTS = ["asks_only_what_quote_requires", "answer_type_fits", "neutral_wording"] as const;
@@ -190,6 +191,7 @@ const SHARED_RULES =
   "You do not judge whether the official rule is right or fair, and you never rewrite anything. " +
   "Answer for each item with `yes`, `no` or `unsure` for every aspect, keyed by the item's id. " +
   "Use `unsure` whenever the quoted sentence does not give you enough to judge: doubt is not a yes. " +
+  "The quoted official sentences may be written in any language; the wording written for applicants is in English by design, which is never a fault. Judge across the two languages (a question may ask only for what a quoted sentence requires, in whichever language the sentence is written), and answer `unsure` for an item whose sentence you cannot read well enough. " +
   `${DATA_ONLY_RULE}`;
 
 /** System prompt for questions. */

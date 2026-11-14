@@ -12,6 +12,8 @@ import {
   evaluateRubricDraftHeld,
   evaluateRubricHeldCleared,
   loadPublishSettings,
+  loadRegistrySettings,
+  productLanguageCode,
   reasonInWords,
   RubricQuestionPlanner,
   rubricStore,
@@ -307,6 +309,9 @@ export interface RubricAutoPublishDeps {
   now: () => Timestamp;
   // The admin portal's base URL (read at call time so APP_URL set per project is honoured).
   appUrl: () => string;
+  // (#220) The languages sources may be in: `appConfig/routeOnboardingSettings.supportedLanguages`
+  // (default: the product language only). A failed read gives that default, the strictest list.
+  loadSupportedLanguages: () => Promise<string[]>;
   // Part B / part C. null until they exist: `auto` then holds every draft.
   checker: RubricChecker | null;
   planner: QuestionPlanner | null;
@@ -332,6 +337,7 @@ export class RubricAutoPublishService {
       raiseAlerts: (evals, config) => scrapeAlertService.raise(evals, config),
       loadAlertConfig: () => scrapeAlertService.loadConfig(),
       now: () => Timestamp.now(),
+      loadSupportedLanguages: async () => (await loadRegistrySettings()).settings.supportedLanguages,
       appUrl: () => (process.env.APP_URL || EMAIL_BRANDING.appUrl).replace(/\/+$/, ""),
       // PART B (#202) and PART C (#203): put the implementations here, or call
       // `registerChecker` / `registerPlanner` at start-up. Until then both are
@@ -513,6 +519,12 @@ export class RubricAutoPublishService {
         settings: loaded.settings,
         // INTEGRATION (#207): lets the gates count kept scoped rules that rest on no usable trigger.
         intakeQuestions: rubric.intakeQuestions ?? [],
+        // (#220) A version written before the field has only product-language sources. A read that
+        // fails gives the default list (the product language only): never a looser one.
+        languages: {
+          sourceLanguages: rubric.sourceLanguages ?? [productLanguageCode()],
+          supportedLanguages: await this.deps.loadSupportedLanguages().catch(() => [productLanguageCode()]),
+        },
       };
 
       // ---- 5. the code gates ----

@@ -1,4 +1,4 @@
-import { LIMB_RE, LINE_LABEL_RE, type QuoteLookup, type SnapshotQuoteIndex } from "./rubric-quote";
+import { LIMB_RE, LINE_LABEL_RE as DEFAULT_LINE_LABEL_RE, lineLabelReFor, type QuoteLookup, type SnapshotQuoteIndex } from "./rubric-quote";
 import { composeMarkerChain } from "./rubric-marker-chain";
 import type { RubricFlag } from "../../types/rubric";
 
@@ -102,8 +102,12 @@ const startsLower = (line: string): boolean => /^\p{Ll}/u.test(line);
  *
  * @param leadLine the (normalised) line the lead-in is on
  * @param following the lines after it, in order, empty lines removed
+ * @param LINE_LABEL_RE what a reference label looks like in the document's
+ *   language (#220: the words that start a legal reference are language data;
+ *   default: the product language's). The other cues here (a colon, a bracketed
+ *   marker, a sentence end, a lower-case start) are not language words.
  */
-export function readListLines(leadLine: string, following: readonly string[]): ListRead {
+export function readListLines(leadLine: string, following: readonly string[], LINE_LABEL_RE: RegExp = DEFAULT_LINE_LABEL_RE): ListRead {
   if (following.length === 0) {
     // Nothing follows the lead-in at all.
     return { kind: "unreadable", reason: "no_list_follows" };
@@ -178,7 +182,7 @@ export function readLeadInList(index: SnapshotQuoteIndex, found: Extract<QuoteLo
     const text = index.unitText(i);
     if (text) following.push(text);
   }
-  return readListLines(index.unitText(found.unit), following);
+  return readListLines(index.unitText(found.unit), following, lineLabelReFor(index.lexicon));
 }
 
 /**

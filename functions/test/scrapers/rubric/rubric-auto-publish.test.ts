@@ -1284,3 +1284,92 @@ describe("auto-publish: no second approval path, and the new files are generic",
     assert.match(index, /ruleChangeAlertsService\.recordRubricApproval\(context\.params\.auditId, snap\.data\(\) as RubricReviewAuditEntry\)/);
   });
 });
+
+// ============================================
+// (#220) The language gate
+// ============================================
+
+describe("auto-publish: the language gate", () => {
+  /** The routeOnboardingSettings doc (what the registry reads `supportedLanguages` from). */
+  const languages = (supportedLanguages: string[]) => store.set("appConfig/routeOnboardingSettings", { supportedLanguages });
+
+  test("an English version (no sourceLanguages: written before #220) publishes as before, with the default list", async () => {
+    await seedA();
+    settings();
+    const r = await trigger(fullService());
+    assert.equal(r?.outcome, "published");
+  });
+
+  test("an English version that records sourceLanguages [en] publishes", async () => {
+    await seedA({ extra: { sourceLanguages: ["en"] } });
+    settings();
+    assert.equal((await trigger(fullService()))?.outcome, "published");
+  });
+
+  test("a Spanish version is HELD language_not_supported by default: no check spend, nothing published, one alert", async () => {
+    await seedA({ extra: { sourceLanguages: ["es"] } });
+    settings();
+    const checker = checkerStub();
+    const planner = plannerStub();
+    const svc = service({ checker, planner });
+    const r = await trigger(svc);
+    assert.equal(r?.outcome, "held");
+    assert.deepEqual(r?.reasonCodes, ["language_not_supported"]);
+    assert.ok(r?.gates.some((g) => g.gate === "language_support" && !g.passed && /es/.test(g.detail ?? "")));
+    assert.equal(checker.calls.length, 0, "no model spend on a language that is not supported");
+    assert.equal(planner.calls, 0);
+    assert.equal(svc.decideCalls.length, 0);
+    assertUntouched(KEY_A, 1, 0, null);
+    assert.equal(alerts().length, 1, "alerted like every other hold");
+    assert.equal(alerts()[0].rule, "rubric_draft_held");
+    assert.match(JSON.stringify(alerts()[0]), /not yet supported for automatic publishing/);
+  });
+
+  test("a mixed version (English and Spanish sources) is held too", async () => {
+    await seedA({ extra: { sourceLanguages: ["en", "es"] } });
+    settings();
+    assert.deepEqual((await trigger(fullService()))?.reasonCodes, ["language_not_supported"]);
+  });
+
+  test("once the settings list the language (and its data exists) the same version publishes through the same pipeline", async () => {
+    await seedA({ extra: { sourceLanguages: ["es"] } });
+    settings();
+    languages(["en", "es"]);
+    const r = await trigger(fullService());
+    assert.equal(r?.outcome, "published");
+  });
+
+  test("a language listed in the settings but with no language data stays held (the list alone is not enough)", async () => {
+    await seedA({ extra: { sourceLanguages: ["zz"] } });
+    settings();
+    languages(["en", "zz"]);
+    assert.deepEqual((await trigger(fullService()))?.reasonCodes, ["language_not_supported"]);
+  });
+
+  test("an unreadable language list fails to the default (product language only): a Spanish version is held", async () => {
+    await seedA({ extra: { sourceLanguages: ["es"] } });
+    settings();
+    const svc = service({ checker: checkerStub(), planner: plannerStub(), loadSupportedLanguages: async () => { throw new Error("blink"); } });
+    assert.deepEqual((await trigger(svc))?.reasonCodes, ["language_not_supported"]);
+  });
+
+  test("a held language is not retried by the hourly sweep (an admin decision, not a transient failure)", async () => {
+    await seedA({ extra: { sourceLanguages: ["es"] } });
+    settings();
+    const checker = checkerStub();
+    const svc = service({ checker, planner: plannerStub() });
+    await trigger(svc);
+    const swept = (await quiet(() => svc.sweepRetryable())).result;
+    assert.equal(swept.considered, 0);
+  });
+
+  test("an admin who enables the language can run the safeguards again on the held draft", async () => {
+    await seedA({ extra: { sourceLanguages: ["es"] } });
+    settings();
+    const svc = fullService();
+    assert.equal((await trigger(svc))?.outcome, "held");
+    languages(["en", "es"]);
+    const again = (await quiet(() => svc.runOnDraft(ID_A1, { trigger: "admin_endpoint" }))).result;
+    assert.equal(again.outcome, "published");
+  });
+});

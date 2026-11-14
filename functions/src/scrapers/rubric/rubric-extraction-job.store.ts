@@ -1,7 +1,7 @@
 import type { Timestamp, Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../utils/firebase";
 import type { RubricRunUsage } from "../../types/rubric";
-import type { ChunkAssessment, LoadedSource, PlannedSource, RunSettingsPin } from "./rubric-extraction.service";
+import type { ChunkAssessment, LoadedSource, PlannedSource, RunSettingsPin, TranslateStepResult } from "./rubric-extraction.service";
 
 // ============================================
 // RUBRIC DRAFTING JOB — TYPES AND FIRESTORE STORE (issue #216)
@@ -18,6 +18,13 @@ import type { ChunkAssessment, LoadedSource, PlannedSource, RunSettingsPin } fro
 //   `c{position}__intake`     call 2 of a chunk (reads the questions and the
 //                             document items for the rules call 1 produced;
 //                             a chunk whose call 1 produced no rule has none)
+//   `c{position}__translate`  (#220) the unofficial translation of the quotes of
+//                             the rules the chunk produced, only for a chunk of
+//                             a source whose language is not the product
+//                             language. It is OPTIONAL by design: it is stored
+//                             whether it worked, failed or was skipped (the
+//                             request cap), so a translation can never stop or
+//                             fail the job, and is never paid for twice.
 // `position` is the chunk's place in document order (sources sorted by id,
 // chunk index ascending), zero padded so the ids sort in run order.
 //
@@ -59,7 +66,7 @@ export function isTerminalStatus(status: JobStatus): boolean {
 }
 
 /** The two kinds of step (see the file header). */
-export type StepPhase = "criteria" | "intake";
+export type StepPhase = "criteria" | "intake" | "translate";
 
 /** Which step comes next (derived from the stored results, never trusted from the cursor). */
 export interface StepRef {
@@ -157,8 +164,8 @@ export interface StoredStep {
   phase: StepPhase;
   sourceId: string;
   chunkIndex: number;
-  // The validated result of the step's model call.
-  result: ChunkAssessment;
+  // The validated result of the step's model call (a `translate` step stores a TranslateStepResult).
+  result: ChunkAssessment | TranslateStepResult;
   // Tokens and attempts this step cost (already added to the job's counters).
   usage: RubricRunUsage;
   failedAttempts: number;
@@ -248,7 +255,7 @@ export class RubricExtractionJobStore {
         usage: doc.usage,
         failedAttempts: doc.failedAttempts,
         createdAt: doc.createdAt,
-        result: JSON.parse(json ?? "null") as ChunkAssessment,
+        result: JSON.parse(json ?? "null") as ChunkAssessment | TranslateStepResult,
       });
     }
     return out;

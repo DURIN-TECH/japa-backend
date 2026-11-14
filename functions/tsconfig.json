@@ -19,6 +19,6 @@
     }
   },
   "compileOnSave": true,
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "src/scrapers/language/lexicons/*.json"],
   "exclude": ["node_modules", "src/scrapers/visa-catalog/eval"]
 }

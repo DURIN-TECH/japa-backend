@@ -537,6 +537,8 @@ describe("prompt version pin", () => {
     "2026-11-rubric-v6": "d8dd48beab3645b2d5bbe3d03d25b3c8457ec3bce5268a457f00b34e4f69c2bb",
     // v7 (#222): lead-in quotes allowed, `appliesTo.uncoded`, no code for a wider group.
     "2026-11-rubric-v7": "eda0fba7aef9391d94bf0706e5064c63a9c203ddb0a7c09f4fbf34fb318ede53",
+    // v8 (#220): the shared language paragraph (quotes in the excerpt's language, wording in English).
+    "2026-11-rubric-v8": "3e285dd426c4610918cb210497dda94509ffb84965b9d353397966dc72290590",
   };
   // v5 onwards: the intake prompt and its schema are pinned too (call 2),
   // so a change to either also needs a version bump.
@@ -547,6 +549,8 @@ describe("prompt version pin", () => {
     "2026-11-rubric-v6": "9e2beb3d9d80f26c1bfbd51e5bde106492fc39702b072d3f9a7d0bf25d4c7290",
     // v7 (#222): the intake call is unchanged, so its hash is the same as v6's.
     "2026-11-rubric-v7": "9e2beb3d9d80f26c1bfbd51e5bde106492fc39702b072d3f9a7d0bf25d4c7290",
+    // v8 (#220): the intake call shares the language paragraph, so its prompt changed.
+    "2026-11-rubric-v8": "c13a6c6236fef82fea10928454e975b6012affa247c9e34af00b3bb1fb7beea9",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {

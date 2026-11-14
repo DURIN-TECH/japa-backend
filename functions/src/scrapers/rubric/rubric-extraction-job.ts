@@ -5,6 +5,7 @@ import { costOfUsage } from "../../services/ai/ai-pricing";
 import { emptyLlmUsage } from "../../services/ai/llm-provider";
 import { describeAnthropicError } from "../../services/ai/anthropic-client";
 import { RUBRIC_PROMPT_VERSION, type KnownQuestionView } from "./rubric-prompt";
+import { needsTranslation } from "../language/language-lexicon";
 import type { RubricExtractionRun, RubricHead, RubricRunUsage } from "../../types/rubric";
 import type { SourceChunk } from "./rubric-chunk";
 import {
@@ -17,11 +18,14 @@ import {
   rubricExtractionService,
   type CallAttempts,
   type ChunkAssessment,
+  type LoadedSource,
   type ExtractRouteInput,
   type PlannedSource,
   type RubricExtractionService,
   type RunContext,
+  type TranslateStepResult,
 } from "./rubric-extraction.service";
+import type { QuoteTranslation } from "../../types/rubric";
 import { loadRubricSettings, type LoadedRubricSettings } from "./rubric-settings";
 import { rubricRouteKey, rubricStore, type RubricStore } from "./rubric.store";
 import {
@@ -137,8 +141,11 @@ export interface StartJobInput extends Pick<ExtractRouteInput, "countryCode" | "
 /** Cost of a plan, known before any call. */
 export interface JobEstimate {
   chunks: number;
-  // Upper bound: two calls per chunk.
+  // Upper bound: two calls per chunk, plus (#220) one translation call per
+  // excerpt of a source that is not in the product language.
   maxRequests: number;
+  // (#220) The translation calls inside `maxRequests` (0 when every source is in the product language).
+  translationCallsAtMost: number;
   inputChars: number;
 }
 
@@ -262,30 +269,52 @@ export interface Replay {
   parts: { chunk: SourceChunk; assessment: ChunkAssessment }[];
   // The questions asked so far (what the next intake call is shown).
   known: Map<string, KnownQuestionView>;
+  // (#220) The unofficial translations stored so far, by rule id.
+  translations: Record<string, QuoteTranslation>;
   // The next step to run, or null when every step is stored.
-  next: (StepRef & { criteriaPart?: ChunkAssessment }) | null;
+  next: (StepRef & { criteriaPart?: ChunkAssessment; assessment?: ChunkAssessment }) | null;
 }
 
-/** Replay the stored steps against the pinned chunks. */
-export function replaySteps(chunks: readonly SourceChunk[], steps: ReadonlyMap<string, StoredStep>): Replay {
+/**
+ * Replay the stored steps against the pinned chunks.
+ *
+ * @param translateSourceIds (#220) the sources whose language is not the
+ *   product language: a chunk of one of them, with accepted rules, has one more
+ *   step after its intake step (the translation). Default none: a route in the
+ *   product language replays exactly as before.
+ */
+export function replaySteps(chunks: readonly SourceChunk[], steps: ReadonlyMap<string, StoredStep>, translateSourceIds: ReadonlySet<string> = new Set()): Replay {
   const parts: Replay["parts"] = [];
   const known = new Map<string, KnownQuestionView>();
+  const translations: Record<string, QuoteTranslation> = {};
   for (let position = 0; position < chunks.length; position++) {
     const chunk = chunks[position];
     const criteria = steps.get(stepIdOf(position, "criteria"));
-    if (!criteria) return { parts, known, next: { position, phase: "criteria" } };
+    if (!criteria) return { parts, known, translations, next: { position, phase: "criteria" } };
+    const criteriaResult = criteria.result as ChunkAssessment;
     // A chunk whose first call produced no accepted rule has no second call.
-    if (criteria.result.criteria.length === 0) {
-      parts.push({ chunk, assessment: criteria.result });
+    if (criteriaResult.criteria.length === 0) {
+      parts.push({ chunk, assessment: criteriaResult });
       continue;
     }
     const intake = steps.get(stepIdOf(position, "intake"));
-    if (!intake) return { parts, known, next: { position, phase: "intake", criteriaPart: criteria.result } };
-    const assessment = combineAssessments(criteria.result, intake.result);
+    if (!intake) return { parts, known, translations, next: { position, phase: "intake", criteriaPart: criteriaResult } };
+    const assessment = combineAssessments(criteriaResult, intake.result as ChunkAssessment);
     rememberQuestions(known, assessment);
+    // (#220) The optional translation step of this chunk.
+    if (translateSourceIds.has(chunk.sourceId)) {
+      const translate = steps.get(stepIdOf(position, "translate"));
+      if (!translate) return { parts, known, translations, next: { position, phase: "translate", assessment } };
+      Object.assign(translations, (translate.result as TranslateStepResult).translations);
+    }
     parts.push({ chunk, assessment });
   }
-  return { parts, known, next: null };
+  return { parts, known, translations, next: null };
+}
+
+/** (#220) The ids of the pinned sources whose language is not the product language. */
+function translateSourceIdsOf(sources: readonly LoadedSource[]): Set<string> {
+  return new Set(sources.filter((s) => needsTranslation(s.language)).map((s) => s.snapshot.sourceId));
 }
 
 /** A blank usage record. */
@@ -389,7 +418,9 @@ export class RubricExtractionJobService {
       const ctx = await this.service.buildRunContext(resolved.sources, settings, routeName);
       if (ctx.chunks.length === 0) throw new RunStop("failed", "no_text", "the snapshots hold no text to extract from");
       this.service.assertWithinCaps(ctx.chunks, settings);
-      const estimate: JobEstimate = { chunks: ctx.chunks.length, maxRequests: ctx.chunks.length * 2, inputChars: ctx.chunks.reduce((n, c) => n + c.text.length, 0) };
+      // (#220) One more call at most per excerpt of a source in another language (its translation).
+      const translateChunks = ctx.chunks.filter((c) => translateSourceIdsOf(resolved.sources).has(c.sourceId)).length;
+      const estimate: JobEstimate = { chunks: ctx.chunks.length, maxRequests: ctx.chunks.length * 2 + translateChunks, translationCallsAtMost: translateChunks, inputChars: ctx.chunks.reduce((n, c) => n + c.text.length, 0) };
       if (input.dryRun) {
         return { routeKey, outcome: "dry_run", jobId: null, jobStatus: null, reasonCode: null, message: null, plan: ctx.plan, estimate };
       }
@@ -442,7 +473,7 @@ export class RubricExtractionJobService {
         plan: ctx.plan,
         chunkRefs: chunkRefsOf(ctx.chunks),
         chunks: ctx.chunks.length,
-        stepsMax: ctx.chunks.length * 2,
+        stepsMax: ctx.chunks.length * 2 + translateChunks,
         stepsDone: 0,
         chunksDone: 0,
         usage: emptyUsage(),
@@ -669,15 +700,29 @@ export class RubricExtractionJobService {
       }
       // ---- a dead predecessor: its in-flight call counts as a failed attempt ----
       let next: RubricExtractionJob = job;
-      if (job.inFlight) {
-        const same = job.stepFailure.stepId === job.inFlight.stepId;
+      // (#220) A predecessor that died inside the OPTIONAL translation call: the call is counted as a
+      // failed attempt against the request cap, and the step is stored as failed (the rules keep no
+      // translation) so the job moves on. A translation can never fail a job, however often it dies.
+      if (job.inFlight && job.inFlight.stepId.endsWith("__translate")) {
+        const dead = job.inFlight.stepId;
+        const already = await tx.get(this.jobs.stepRef(jobId, dead));
+        if (!already.exists) {
+          const failedStep: TranslateStepResult = { translations: {}, outcome: "failed", reason: "worker_died" };
+          this.jobs.writeStepInTx(tx, jobId, { stepId: dead, position: Number(/^c(\d+)__/.exec(dead)?.[1] ?? 0), phase: "translate", sourceId: "", chunkIndex: 0, result: failedStep, usage: emptyUsage(), failedAttempts: 1, createdAt: Timestamp.fromMillis(nowMs) });
+        }
+        next = { ...job, failedAttempts: job.failedAttempts + 1, inFlight: null, stepsDone: job.stepsDone + (already.exists ? 0 : 1), chunksDone: job.chunksDone + (already.exists ? 0 : 1) };
+        console.warn(`${TAG} ${jobId}: the previous worker stopped during a translation call (counted as a failed attempt; the translation is skipped)`);
+      }
+      if (next.inFlight) {
+        const deadStep = next.inFlight.stepId;
+        const same = job.stepFailure.stepId === deadStep;
         next = {
-          ...job,
-          failedAttempts: job.failedAttempts + 1,
+          ...next,
+          failedAttempts: next.failedAttempts + 1,
           inFlight: null,
-          stepFailure: { stepId: job.inFlight.stepId, count: (same ? job.stepFailure.count : 0) + 1, lastReason: "provider_error" },
+          stepFailure: { stepId: deadStep, count: (same ? job.stepFailure.count : 0) + 1, lastReason: "provider_error" },
         };
-        console.warn(`${TAG} ${jobId}: the previous worker stopped during a model call (counted as a failed attempt of ${job.inFlight.stepId})`);
+        console.warn(`${TAG} ${jobId}: the previous worker stopped during a model call (counted as a failed attempt of ${deadStep})`);
       }
       if (next.stepFailure.count >= job.pinned.stepAttemptsMax) {
         this.finishInTx(tx, next, {
@@ -719,11 +764,14 @@ export class RubricExtractionJobService {
       return this.stopped(jobId, owner, { status: "failed", reasonCode: "plan_changed", message: "the stored text no longer cuts into the same parts as when the job started; start a new draft" }, stepsRun);
     }
     const steps = await this.jobs.readSteps(jobId);
-    let replay = replaySteps(ctx.chunks, steps);
+    // (#220) The sources whose chunks get a translation step.
+    const translateIds = translateSourceIdsOf(job.sources);
+    let replay = replaySteps(ctx.chunks, steps, translateIds);
 
     // ---- run steps while the invocation has time ----
     for (;;) {
       if (replay.next === null) return await this.finalize(job, owner, ctx, replay, stepsRun);
+      const optional = replay.next.phase === "translate";
 
       // A new step starts only if a whole request timeout still fits before
       // the deadline, so a call is never started that the function's cut-off
@@ -736,21 +784,38 @@ export class RubricExtractionJobService {
       const stepId = stepIdOf(ref.position, ref.phase);
 
       // ---- begin: re-check the lease, the cancel flag and the cap; mark the call in flight ----
-      const begun = await this.begin(jobId, owner, stepId);
+      const begun = await this.begin(jobId, owner, stepId, optional);
       if (begun.kind === "stopped") return { kind: "finished", status: begun.status, stepsRun, reasonCode: begun.reasonCode };
       const cur = begun.job;
+      // (#220) The request cap is used up and this step is the OPTIONAL translation: store it as skipped
+      // (no call) so the job moves on to its version. A translation never ends the job.
+      if (begun.kind === "cap_skip") {
+        const skipped: TranslateStepResult = { translations: {}, outcome: "skipped_cap" };
+        const done = await this.storeStep(jobId, owner, { stepId, ref, chunk, result: skipped, usage: emptyUsage(), failed: 0, chunkFinished: true });
+        if (!done) return { kind: "lease_lost", stepsRun };
+        stepsRun += 1;
+        report(stepsRun);
+        steps.set(stepId, done);
+        replay = replaySteps(ctx.chunks, steps, translateIds);
+        continue;
+      }
 
       // ---- the call: exactly one model call (plus a deadline-aware retry) ----
       const usage = emptyUsage();
       const attempts: CallAttempts = { failed: 0, cap: Math.max(1, cur.pinned.maxRequestsPerRun - cur.usage.requests - cur.failedAttempts) };
       const failuresSoFar = cur.stepFailure.stepId === stepId ? cur.stepFailure.count : 0;
       const maxAttempts = Math.max(1, Math.min(MAX_CALL_ATTEMPTS, cur.pinned.stepAttemptsMax - failuresSoFar));
-      let result: ChunkAssessment;
+      let result: ChunkAssessment | TranslateStepResult;
       try {
         const callOpts = { deadlineAt, nowMs: () => this.clock(), ...(this.deps.sleep ? { sleep: this.deps.sleep } : {}), maxAttempts };
-        result = ref.phase === "criteria"
-          ? await this.service.runCriteriaStep(ctx, chunk, usage, attempts, callOpts)
-          : await this.service.runIntakeStep(ctx, chunk, ref.criteriaPart as ChunkAssessment, [...replay.known.values()], usage, attempts, callOpts);
+        if (ref.phase === "translate") {
+          // (#220) Never throws, never fails the job: a failure is stored as the step's result.
+          result = await this.service.runTranslateStep(ctx, chunk, ref.assessment as ChunkAssessment, usage, attempts, callOpts).catch((): TranslateStepResult => ({ translations: {}, outcome: "failed", reason: "unexpected_error" }));
+        } else {
+          result = ref.phase === "criteria"
+            ? await this.service.runCriteriaStep(ctx, chunk, usage, attempts, callOpts)
+            : await this.service.runIntakeStep(ctx, chunk, ref.criteriaPart as ChunkAssessment, [...replay.known.values()], usage, attempts, callOpts);
+        }
       } catch (err) {
         report(stepsRun);
         if (err instanceof RunStop) return await this.recordFailure(jobId, owner, err.reasonCode, err.message, { usage, failed: attempts.failed }, stepsRun);
@@ -759,12 +824,15 @@ export class RubricExtractionJobService {
       }
 
       // ---- store the result and the counters in ONE transaction ----
-      const stored = await this.storeStep(jobId, owner, { stepId, ref, chunk, result, usage, failed: attempts.failed });
+      // A chunk is finished by its last step: the translation when it has one, else the intake, else a
+      // criteria step that accepted no rule (it has no second call).
+      const chunkFinished = ref.phase === "translate" || (ref.phase === "intake" && !translateIds.has(chunk.sourceId)) || (ref.phase === "criteria" && (result as ChunkAssessment).criteria.length === 0);
+      const stored = await this.storeStep(jobId, owner, { stepId, ref, chunk, result, usage, failed: attempts.failed, chunkFinished });
       if (!stored) return { kind: "lease_lost", stepsRun };
       stepsRun += 1;
       report(stepsRun);
       steps.set(stepId, stored);
-      replay = replaySteps(ctx.chunks, steps);
+      replay = replaySteps(ctx.chunks, steps, translateIds);
     }
   }
 
@@ -785,7 +853,7 @@ export class RubricExtractionJobService {
    * request, enforce the request cap across the whole job, and mark the step
    * `inFlight` (see point 4 of the file header).
    */
-  private async begin(jobId: string, owner: string, stepId: string): Promise<{ kind: "go"; job: RubricExtractionJob } | { kind: "stopped"; status: JobStatus; reasonCode: string | null }> {
+  private async begin(jobId: string, owner: string, stepId: string, optional = false): Promise<{ kind: "go"; job: RubricExtractionJob } | { kind: "cap_skip"; job: RubricExtractionJob } | { kind: "stopped"; status: JobStatus; reasonCode: string | null }> {
     return this.jobs.runTransaction(async (tx) => {
       const job = await this.readOwned(tx, jobId, owner);
       if (job.cancelRequested) {
@@ -793,6 +861,8 @@ export class RubricExtractionJobService {
         return { kind: "stopped" as const, status: "cancelled" as JobStatus, reasonCode: "cancelled" };
       }
       const used = job.usage.requests + job.failedAttempts;
+      // (#220) An OPTIONAL step (the translation) that would pass the cap is skipped, not fatal.
+      if (used >= job.pinned.maxRequestsPerRun && optional) return { kind: "cap_skip" as const, job };
       if (used >= job.pinned.maxRequestsPerRun) {
         this.finishInTx(tx, job, { status: "skipped", reasonCode: "run_cap_exceeded", message: `the job used its cap of ${job.pinned.maxRequestsPerRun} model calls; the steps already finished are kept` });
         return { kind: "stopped" as const, status: "skipped" as JobStatus, reasonCode: "run_cap_exceeded" };
@@ -811,7 +881,7 @@ export class RubricExtractionJobService {
    * cost counted, nor counted without being stored. Returns null when the lease
    * was lost (the result is dropped: the new owner will make the call again).
    */
-  private async storeStep(jobId: string, owner: string, s: { stepId: string; ref: StepRef; chunk: SourceChunk; result: ChunkAssessment; usage: RubricRunUsage; failed: number }): Promise<StoredStep | null> {
+  private async storeStep(jobId: string, owner: string, s: { stepId: string; ref: StepRef; chunk: SourceChunk; result: ChunkAssessment | TranslateStepResult; usage: RubricRunUsage; failed: number; chunkFinished: boolean }): Promise<StoredStep | null> {
     const settingsLease = (await (this.deps.loadSettings ?? loadRubricSettings)()).settings.leaseMs;
     try {
       return await this.jobs.runTransaction(async (tx) => {
@@ -831,10 +901,10 @@ export class RubricExtractionJobService {
           createdAt: Timestamp.fromMillis(nowMs),
         };
         this.jobs.writeStepInTx(tx, jobId, step);
-        // A chunk is finished by its intake step, or by a criteria step that
-        // accepted no rule (it has no second call).
-        const chunkFinished = s.ref.phase === "intake" || s.result.criteria.length === 0;
+        const chunkFinished = s.chunkFinished;
         tx.update(this.jobs.jobRef(jobId), {
+          // (#220) The translation steps are not in the count made at start (it is an upper bound); never show more done than the maximum.
+          stepsMax: Math.max(job.stepsMax, job.stepsDone + 1),
           usage: addUsage(job.usage, s.usage),
           failedAttempts: job.failedAttempts + s.failed,
           stepsDone: job.stepsDone + 1,
@@ -925,7 +995,8 @@ export class RubricExtractionJobService {
 
     const assembled = assembleDraft(
       { routeKey: job.routeKey, countryCode: job.countryCode, visaTypeId: job.visaTypeId, sources: job.sources, sourceSetHash: job.sourceSetHash, model: job.model, runId: job.runId, severityLevels: ctx.severityLevels, chunkCount: ctx.chunks.length, midSentence: ctx.midSentence, createdAt: this.now() },
-      replay.parts
+      replay.parts,
+      replay.translations
     );
     if (!assembled.ok) {
       const ok = await this.finishOwned(jobId, owner, { status: "failed", reasonCode: assembled.reasonCode, message: assembled.error, discardedCount: assembled.discardedCount, discardedByReason: assembled.discardedByReason });
@@ -1072,5 +1143,5 @@ export const rubricExtractionJobService = new RubricExtractionJobService();
 
 /** Which phase a step id names (for logs and tests). */
 export function phaseOfStepId(stepId: string): StepPhase {
-  return stepId.endsWith("__intake") ? "intake" : "criteria";
+  return stepId.endsWith("__intake") ? "intake" : stepId.endsWith("__translate") ? "translate" : "criteria";
 }
