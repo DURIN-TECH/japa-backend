@@ -111,7 +111,7 @@ describe("preparing", () => {
 
     forgetRuns();
     oh.h.settings.maxRequestsPerRun = 40;
-    oh.h.settings.maxInputCharsPerRun = 5000;
+    oh.h.settings.maxInputCharsPerRun = 500;
     const c = await prepare(oh);
     assert.equal(c.status, "failed");
     assert.match(c.summary, /maxInputCharsPerRun/);
