@@ -430,6 +430,21 @@ export interface IntentPolarityProposal {
   source?: RubricCitation;
 }
 
+/**
+ * (#220) The unofficial translation of one quote. `unofficial` is always true
+ * and `language` is the product language; `quoteHash` is the sha256 of the
+ * normalised quote that was translated, so a reader can tell the translation
+ * still belongs to the quote beside it (a repaired rule has a different quote).
+ */
+export interface QuoteTranslation {
+  text: string;
+  language: string;
+  model: string;
+  promptVersion: string;
+  unofficial: true;
+  quoteHash: string;
+}
+
 /** One snapshot a version was extracted from. */
 export interface RubricSourceSnapshot {
   sourceId: string;
@@ -596,6 +611,20 @@ export interface VisaRubric {
 
   // ---- provenance (immutable) ----
   sourceSnapshots: RubricSourceSnapshot[];
+  // (#220) The languages the sources of this version are written in (primary
+  // language codes, sorted, de-duplicated). Written at extraction from each
+  // source's declared language (a source with none counts as the product
+  // language). The publish gate HOLDS the version `language_not_supported`
+  // unless every one is in `appConfig/routeOnboardingSettings.supportedLanguages`.
+  // Absent on a version written before #220: read as the product language only.
+  sourceLanguages?: string[];
+  // (#220) An UNOFFICIAL, AI-written translation of each non-product-language
+  // quote, keyed by criterion id, kept APART from `criteria[].source.quote`.
+  // It is a courtesy for a reader and is NEVER evidence: no extractor, checker,
+  // question check, assessment or letter ever receives it (a test greps for
+  // that), and it never replaces or edits a quote. A rule whose translation
+  // failed has no entry. Absent when every source is in the product language.
+  quoteTranslations?: Record<string, QuoteTranslation>;
   // sha256 over the sorted `sourceId:contentHash` pairs: the hash gate. A
   // re-run over the same snapshots writes no new version.
   sourceSetHash: string;

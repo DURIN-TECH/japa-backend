@@ -17,6 +17,7 @@ import {
   type IntakeMeta,
   type IntakeQuestion,
   type IntentPolarityProposal,
+  type QuoteTranslation,
   type RubricCitation,
   type RubricDiscard,
   type RubricDiscardReason,
@@ -61,6 +62,8 @@ import {
   unsupportedNumbers,
   withoutLeadingParagraphNumber,
 } from "./rubric-quote";
+import { lexiconFor, resolveSourceLanguage, sourceLanguagesOf, needsTranslation, productLanguageCode, type Lexicon } from "../language/language-lexicon";
+import { TranslationError, buildTranslationRequest, parseTranslationOutput, toQuoteTranslation, type TranslationItem } from "./rubric-translation";
 import { listNotReadableFlag, readLeadInList, unreadableListReason, verifyListItems } from "./rubric-list-items";
 import { spansSiblingMarkers } from "./rubric-marker-chain";
 import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSettings } from "./rubric-settings";
@@ -270,13 +273,16 @@ export interface RouteScope {
 }
 
 /** Build the scope allow-list from the primary sources' normalised text. */
-export function routeScopeFrom(primaryTexts: readonly string[]): RouteScope {
+export function routeScopeFrom(primaryTexts: readonly string[], lexicons: readonly Lexicon[] = []): RouteScope {
   const refs = new Set<string>();
   const names = new Set<string>();
-  for (const t of primaryTexts) {
-    for (const r of refTokensIn(t)) refs.add(r);
-    for (const n of appendixNamesIn(t)) names.add(n);
-  }
+  // (#220) The reference shapes and the words that name an appendix or part are
+  // the language's (its lexicon, one per text, in the same order); with no
+  // lexicon given the product language's are used, as before.
+  primaryTexts.forEach((t, i) => {
+    for (const r of refTokensIn(t, lexicons[i])) refs.add(r);
+    for (const n of appendixNamesIn(t, lexicons[i])) names.add(n);
+  });
   return { refs, names };
 }
 
@@ -518,7 +524,7 @@ export function assessChunkOutput(
         notes,
         startsMidSentence: found.ok && index.startsMidSentence(found),
         endsMidSentence: found.ok && index.endsMidSentence(found),
-        multipleDates: Boolean(criterion.validFrom || criterion.validUntil) && datesIn(criterion.source.quote).length > 1,
+        multipleDates: Boolean(criterion.validFrom || criterion.validUntil) && datesIn(criterion.source.quote, index.lexicon).length > 1,
         combinedSubConditions: found.ok && (spansSiblingMarkers(criterion.source.quote) || (index.introducesList(found) && criterion.source.listItems === undefined)),
         listUnreadable: found.ok ? unreadableListReason(index, found, criterion.source.listItems) : undefined,
       });
@@ -542,7 +548,7 @@ export function assessChunkOutput(
     if (!found.ok) discard("evidence_item", found.reason, DETAIL.evidenceQuote, e.title);
     else if (flagged(found.matched)) discard("evidence_item", "quote_in_flagged_passage", DETAIL.evidenceFlagged, e.title);
     else if (!SLUG_RE.test(e.key)) discard("evidence_item", "invalid_shape", DETAIL.evidenceKey, e.title);
-    else if (unsupportedNumbers(e.title, found.matched).length > 0) discard("evidence_item", "number_not_in_quote", DETAIL.evidenceNumber, e.title);
+    else if (unsupportedNumbers(e.title, found.matched, { lexicon: index.lexicon }).length > 0) discard("evidence_item", "number_not_in_quote", DETAIL.evidenceNumber, e.title);
     else evidenceItems.push({ raw: e, source: cite(found.matched, found.page) });
   }
 
@@ -674,27 +680,30 @@ function assessCriterion(
     if (c.check.op === "present" && v !== null) return { reason: "invalid_shape", detail: DETAIL.valuePresent };
     // A paragraph number at the start of the quote labels the rule; it is
     // not something the rule states, so it supports no number.
-    const content = withoutLeadingParagraphNumber(quote);
-    if (typeof v === "number" && unsupportedNumbers(v, content, { outsideDates: true }).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.value };
+    // (#220) A quote is read in ITS source's language (`lex`); what the model
+    // wrote about it (title, factors) is in the product language.
+    const lex = index.lexicon;
+    const content = withoutLeadingParagraphNumber(quote, lex);
+    if (typeof v === "number" && unsupportedNumbers(v, content, { outsideDates: true, lexicon: lex }).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.value };
     if (typeof v === "string" && (!v.trim() || !containsTokenBounded(quote, v))) return { reason: "number_not_in_quote", detail: DETAIL.value };
     if (c.check.unit !== null && !unitSupported(c.check.unit, quote)) return { reason: "unit_not_in_quote", detail: DETAIL.unit };
     // The unit belongs to THIS number: "28 days or 4 weeks" does not make
     // (28, "weeks") a reading of the rule.
-    if (c.check.unit !== null && typeof v === "number" && !unitAdjacentToNumber(v, c.check.unit, content)) return { reason: "unit_not_in_quote", detail: DETAIL.unitNotAdjacent };
+    if (c.check.unit !== null && typeof v === "number" && !unitAdjacentToNumber(v, c.check.unit, content, lex)) return { reason: "unit_not_in_quote", detail: DETAIL.unitNotAdjacent };
   }
 
   // 5. Numbers in the applicant-facing wording must be in the quote as well.
   //    (The rule reference's own digits do not count.)
-  const body = withoutLeadingParagraphNumber(quote);
-  if (unsupportedNumbers(c.title, body).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.titleNumber };
+  const body = withoutLeadingParagraphNumber(quote, index.lexicon);
+  if (unsupportedNumbers(c.title, body, { lexicon: index.lexicon }).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.titleNumber };
   for (const factor of c.probeFactors) {
-    if (unsupportedNumbers(factor, body).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.factorNumber };
+    if (unsupportedNumbers(factor, body, { lexicon: index.lexicon }).length > 0) return { reason: "number_not_in_quote", detail: DETAIL.factorNumber };
   }
 
   // 6. Dates: the same date, as one date expression, in the quote.
   for (const key of ["validFrom", "validUntil"] as const) {
     const v = c[key];
-    if (v && !dateSupported(v, quote)) return { reason: "date_not_in_quote", detail: DETAIL.date };
+    if (v && !dateSupported(v, quote, index.lexicon)) return { reason: "date_not_in_quote", detail: DETAIL.date };
   }
 
   // 7. A bar's group: one source name per code, each a whole name in the quote.
@@ -1315,6 +1324,30 @@ export interface RunContext {
   scope: RouteScope | null;
 }
 
+/**
+ * (#220) The translations of the rules that are in the merged rulebook, and
+ * only those (a rule merged away as a duplicate keeps none), in rule order.
+ */
+export function keptTranslations(translations: Readonly<Record<string, QuoteTranslation>>, criteria: readonly Pick<AssessmentCriterion, "criterionId">[]): Record<string, QuoteTranslation> {
+  const out: Record<string, QuoteTranslation> = {};
+  for (const c of criteria) if (translations[c.criterionId]) out[c.criterionId] = translations[c.criterionId];
+  return out;
+}
+
+/** (#220) The quotes of a chunk's accepted rules, as the translation call is given them. */
+export function translationItemsOf(assessment: Pick<ChunkAssessment, "criteria">): TranslationItem[] {
+  return assessment.criteria.map((a) => ({ criterionId: a.criterion.criterionId, quote: a.criterion.source.quote }));
+}
+
+/** (#220) What the translation step of one excerpt produced. It never throws: a failure is `failed`, and the rules simply have none. */
+export interface TranslateStepResult {
+  translations: Record<string, QuoteTranslation>;
+  // done: asked and read; failed: the call or its answer was unusable; skipped_cap: the request cap was used up
+  outcome: "done" | "failed" | "skipped_cap";
+  // A stable code (never text) for `failed`.
+  reason?: string;
+}
+
 /** What `assembleDraft` produced. */
 export type AssembledDraft =
   | { ok: false; reasonCode: "no_criteria_accepted" | "rubric_invalid"; error: string; discardedCount: number; discardedByReason: Record<string, number> }
@@ -1343,7 +1376,7 @@ export interface AssembleInput {
  * this is the single place that decides what a rulebook looks like, which is
  * why the job's result equals the one-shot result.
  */
-export function assembleDraft(input: AssembleInput, parts: readonly { chunk: Pick<SourceChunk, "sourceId" | "chunkIndex">; assessment: ChunkAssessment }[]): AssembledDraft {
+export function assembleDraft(input: AssembleInput, parts: readonly { chunk: Pick<SourceChunk, "sourceId" | "chunkIndex">; assessment: ChunkAssessment }[], translations: Readonly<Record<string, QuoteTranslation>> = {}): AssembledDraft {
   const merged = mergeAssessments(parts);
   const discardedByReason = countByReason(merged.discards);
   // Every rejection is logged with its reason CODE and where it came
@@ -1352,6 +1385,7 @@ export function assembleDraft(input: AssembleInput, parts: readonly { chunk: Pic
   if (merged.criteria.length === 0) {
     return { ok: false, reasonCode: "no_criteria_accepted", error: "no criterion survived validation", discardedCount: merged.discards.length, discardedByReason };
   }
+  const keptQuoteTranslations = keptTranslations(translations, merged.criteria);
   const draft: RubricDraft = {
     schemaVersion: RUBRIC_SCHEMA_VERSION,
     routeKey: input.routeKey,
@@ -1372,6 +1406,13 @@ export function assembleDraft(input: AssembleInput, parts: readonly { chunk: Pic
     intakeQuestions: merged.intakeQuestions,
     evidenceItems: merged.evidenceItems,
     sourceSnapshots: input.sources.map((s) => s.snapshot),
+    // (#220) What language each source is written in: the publish gate holds a
+    // version unless every one of these is a supported language.
+    sourceLanguages: sourceLanguagesOf(input.sources),
+    // (#220) The unofficial translations, only for the rules that survived the
+    // merge (a quote dropped as a duplicate keeps no translation), in a field of
+    // their own, never in `source.quote`. Absent when there are none.
+    ...(Object.keys(keptQuoteTranslations).length > 0 ? { quoteTranslations: keptQuoteTranslations } : {}),
     sourceSetHash: input.sourceSetHash,
     extractorModel: input.model,
     extractorPromptVersion: RUBRIC_PROMPT_VERSION,
@@ -1415,6 +1456,10 @@ export interface LoadedSource {
   // The registry's title for the document (data), used to tell whether the
   // route's own source refers to it by name.
   title: string;
+  // (#220) The language the admin declared for the page (a code), as stored on
+  // the source. Absent = the source predates the field (read as the product
+  // language). The quote reader and the version's `sourceLanguages` use it.
+  language?: string;
 }
 
 /**
@@ -1485,6 +1530,7 @@ export class RubricExtractionService {
       retrievedAt: meta.fetchedAt.toDate().toISOString(),
       role: source.role === "primary" || source.role === "route_guidance" ? source.role : "secondary",
       title: typeof source.title === "string" ? source.title : "",
+      ...(typeof source.language === "string" && source.language.trim() ? { language: source.language.trim() } : {}),
     };
   }
 
@@ -1651,6 +1697,8 @@ export class RubricExtractionService {
       // `runCriteriaStep` / `runIntakeStep`, the same functions the
       // background job calls one at a time.)
       const parts: { chunk: SourceChunk; assessment: ChunkAssessment }[] = [];
+      // (#220) Unofficial translations of the quotes of non-product-language sources, by rule id.
+      const translations: Record<string, QuoteTranslation> = {};
       // (#207) Questions asked so far, by id, shown to the next excerpt's call 2.
       const knownQuestions = new Map<string, KnownQuestionView>();
       // Failed attempts so far, counted against the request cap with the successes.
@@ -1665,10 +1713,15 @@ export class RubricExtractionService {
           rememberQuestions(knownQuestions, assessment);
         }
         parts.push({ chunk, assessment });
+        // (#220) One more step for an excerpt of a source in another language that has accepted rules:
+        // a courtesy translation, never evidence, and never able to fail or block the run.
+        if (assessment.criteria.length > 0 && needsTranslation(ctx.sources.find((s) => s.snapshot.sourceId === chunk.sourceId)?.language)) {
+          Object.assign(translations, (await this.runTranslateStep(ctx, chunk, assessment, usage, attempts)).translations);
+        }
       }
 
       // ---- 7 + 8. merge, build the draft, validate its structure ----
-      const assembled = assembleDraft({ routeKey, countryCode: input.countryCode, visaTypeId: input.visaTypeId, sources, sourceSetHash: sourceSetHash as string, model, runId, severityLevels: ctx.severityLevels, chunkCount, midSentence: ctx.midSentence, createdAt: this.now() }, parts);
+      const assembled = assembleDraft({ routeKey, countryCode: input.countryCode, visaTypeId: input.visaTypeId, sources, sourceSetHash: sourceSetHash as string, model, runId, severityLevels: ctx.severityLevels, chunkCount, midSentence: ctx.midSentence, createdAt: this.now() }, parts, translations);
       if (!assembled.ok) {
         return await finish("failed", { reasonCode: assembled.reasonCode, error: assembled.error, discardedCount: assembled.discardedCount, discardedByReason: assembled.discardedByReason }, true);
       }
@@ -1726,7 +1779,8 @@ export class RubricExtractionService {
     const plan: PlannedSource[] = [];
     for (const s of sources) {
       const content: GuidanceSnapshotContent = await this.snapshots.read(s.snapshot.sourceId, s.snapshot.contentHash);
-      indexes.set(s.snapshot.sourceId, new SnapshotQuoteIndex(content));
+      // (#220) Each document is read in its own language (data: a lexicon file).
+      indexes.set(s.snapshot.sourceId, new SnapshotQuoteIndex(content, lexiconFor(s.language)));
       midSentence.push({ sourceId: s.snapshot.sourceId, pages: pagesEndingMidSentence(content) });
       const cut = chunkSnapshot(content, settings.maxChunkChars);
       chunks.push(...cut);
@@ -1734,7 +1788,7 @@ export class RubricExtractionService {
     }
     // The scope allow-list is built, in code, from the route's own source(s).
     const primaries = sources.filter((s) => s.role === "primary");
-    const scope = primaries.length > 0 ? routeScopeFrom(primaries.map((s) => (indexes.get(s.snapshot.sourceId) as SnapshotQuoteIndex).allText())) : null;
+    const scope = primaries.length > 0 ? routeScopeFrom(primaries.map((s) => (indexes.get(s.snapshot.sourceId) as SnapshotQuoteIndex).allText()), primaries.map((s) => (indexes.get(s.snapshot.sourceId) as SnapshotQuoteIndex).lexicon)) : null;
     return {
       sources,
       indexes,
@@ -1797,6 +1851,67 @@ export class RubricExtractionService {
     // that establishes an activity is asked once and reused.
     const raw = await this.callModel(buildIntakeRequest(chunk, acceptedViewOf(criteriaPart), ctx.limits, route, known), usage, attempts, opts);
     return assessChunkOutput(raw, chunk, index, base, ctx.severityLevels);
+  }
+
+  /**
+   * (#220) STEP "translate" of one excerpt: ONE model call that translates the
+   * quotes of the excerpt's accepted rules into the product language, as an
+   * UNOFFICIAL courtesy (see rubric-translation.ts for the firewall: never
+   * evidence, never shown to any model as support).
+   *
+   * It NEVER throws and never fails a run: the cap used up, a provider error,
+   * a refusal, a cut-off or an unusable answer all return `failed` /
+   * `skipped_cap` with no translations, and the rules simply have none. It does
+   * count: its tokens go into `usage` and its failed attempts into `attempts`,
+   * so it spends against the same request cap as every other call.
+   * Only the quotes (verbatim source text, already validated) are sent: no rule
+   * title, no question, nothing the model wrote.
+   */
+  async runTranslateStep(ctx: Pick<RunContext, "sources" | "limits">, chunk: Pick<SourceChunk, "sourceId">, assessment: Pick<ChunkAssessment, "criteria">, usage: RubricRunUsage, attempts: CallAttempts, opts: CallOptions = {}): Promise<TranslateStepResult> {
+    const items = translationItemsOf(assessment);
+    if (items.length === 0) return { translations: {}, outcome: "done" };
+    // The cap counts this call like any other; used up = no translation, not a failed run.
+    if (usage.requests + attempts.failed >= attempts.cap) return { translations: {}, outcome: "skipped_cap" };
+    const language = ctx.sources.find((s) => s.snapshot.sourceId === chunk.sourceId)?.language;
+    const code = resolveSourceLanguage(language);
+    let request: LlmRequest;
+    try {
+      request = buildTranslationRequest(items, lexiconFor(code).name, ctx.limits);
+    } catch (err) {
+      return { translations: {}, outcome: "failed", reason: err instanceof TranslationError ? "prompt_refused" : "unexpected_error" };
+    }
+    const maxAttempts = opts.maxAttempts ?? MAX_CALL_ATTEMPTS;
+    const nowMs = opts.nowMs ?? Date.now;
+    const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const response = await this.provider.complete(request);
+        usage.requests += 1;
+        usage.inputTokens += response.usage.inputTokens;
+        usage.outputTokens += response.usage.outputTokens;
+        usage.cacheReadTokens += response.usage.cacheReadTokens;
+        usage.cacheWriteTokens += response.usage.cacheWriteTokens;
+        if (response.stopReason !== "end_turn") return { translations: {}, outcome: "failed", reason: response.stopReason === "refusal" ? "provider_refused" : response.stopReason === "max_tokens" ? "output_truncated" : "provider_stopped" };
+        const read = parseTranslationOutput(response.text, items);
+        const model = this.provider.modelFor("judgement");
+        const quoteOf = new Map(items.map((i) => [i.criterionId, i.quote]));
+        const translations: Record<string, QuoteTranslation> = {};
+        for (const [id, text] of read) translations[id] = toQuoteTranslation(text, quoteOf.get(id) as string, model, productLanguageCode());
+        return { translations, outcome: "done" };
+      } catch (err) {
+        if (err instanceof TranslationError) return { translations: {}, outcome: "failed", reason: "invalid_model_output" };
+        const message = describeAnthropicError(err).slice(0, 300);
+        const retry = isTransientProviderError(message) && attempt < maxAttempts && usage.requests + attempts.failed + 1 < attempts.cap;
+        const backoff = RETRY_BACKOFF_MS * attempt;
+        if (!retry || (opts.deadlineAt !== undefined && nowMs() + backoff + request.timeoutMs > opts.deadlineAt)) {
+          // A provider error is a counted failed attempt (no answer was received), not a failed run.
+          attempts.failed += 1;
+          return { translations: {}, outcome: "failed", reason: err instanceof AnthropicNotConfiguredError ? "ai_not_configured" : "provider_error" };
+        }
+        attempts.failed += 1;
+        await sleep(backoff);
+      }
+    }
   }
 
   /**
