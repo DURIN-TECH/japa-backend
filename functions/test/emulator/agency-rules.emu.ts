@@ -55,8 +55,8 @@ const AGENCY_DOC = {
   state: "Lagos",
   description: "Study visas",
   logoUrl: "https://storage.googleapis.com/bucket/agency-logos/agency-1/logo.png",
-  consultationFee: 25000,
-  services: [{ id: "s1", name: "Study visa", price: 150000 }],
+  consultationFeeUsd: { amountMinor: 10000, currency: "USD" },
+  services: [{ id: "s1", name: "Study visa", priceUsd: { amountMinor: 5000, currency: "USD" } }],
   totalAgents: 2,
   totalCases: 3,
   activeCases: 1,
@@ -67,18 +67,31 @@ const AGENCY_DOC = {
 };
 
 /**
- * The fields the owner MAY write from a client SDK (issue #138): the same
- * list the API copies on PUT /agencies/me. Spelled out here on purpose, so a
- * change to the rule has to be a change to this test too.
+ * The fields the owner MAY write from a client SDK (issue #138). Spelled out
+ * here on purpose, so a change to the rule has to be a change to this test
+ * too. Issue #179: no money here any more (the API's PUT /agencies/me list
+ * additionally has the validated `consultationFeeUsd` and `services`).
  */
 const AGENCY_OWNER_EDITABLE_FIELDS: Record<string, unknown> = {
   name: "Renamed",
   address: "2 Other Street",
   state: "Abuja",
   description: "Changed",
-  consultationFee: 1,
-  services: [],
 };
+
+/**
+ * Issue #179 (closes #168): every MONEY field on an agency doc, with a value
+ * a client might try. Only the API writes prices (it validates the dollar
+ * amount), so the owner and a member are both denied each one.
+ */
+const AGENCY_MONEY_FIELDS: Array<[string, unknown]> = [
+  ["consultationFeeUsd", { amountMinor: 1, currency: "USD" }],
+  ["consultationFeeUsd.amountMinor", 1],
+  ["consultationFee", 1],
+  ["services", []],
+  ["services", [{ id: "s1", name: "Study visa", priceUsd: { amountMinor: 1, currency: "USD" } }]],
+  ["migratedFrom", { consultationFee: { amount: 1, currency: "NGN", rate: 1 } }],
+];
 
 /**
  * Every agency field a client must NOT be able to write, with a value a client
@@ -225,13 +238,16 @@ describe("agencies/{agencyId}: the owner may edit exactly the owner-editable pro
       (await asOwner()).collection("agencies").doc(AGENCY).update({
         name: "Renamed",
         address: "2 Other Street",
-        consultationFee: 30000,
+        description: "Changed",
       })
     );
     const after = await storedAgency();
     assert.equal(after.name, "Renamed");
     assert.equal(after.address, "2 Other Street");
-    assert.equal(after.consultationFee, 30000);
+    assert.equal(after.description, "Changed");
+    // The prices are untouched (issue #179).
+    assert.deepEqual(after.consultationFeeUsd, AGENCY_DOC.consultationFeeUsd);
+    assert.deepEqual(after.services, AGENCY_DOC.services);
     // The protected fields are untouched.
     assert.equal(after.status, AGENCY_DOC.status);
     assert.equal(after.ownerId, OWNER);
@@ -276,6 +292,36 @@ describe("agencies/{agencyId}: every other field is server-written", () => {
     // stale or forged claim must not turn into write access.
     const forged = await clientDb(STRANGER, { role: "owner", agencyId: AGENCY });
     await assertFails(forged.collection("agencies").doc(AGENCY).update({ name: "Mine now" }));
+  });
+});
+
+describe("agencies/{agencyId}: money fields are API-only (issue #179, closes #168)", () => {
+  for (const [field, value] of AGENCY_MONEY_FIELDS) {
+    test(`DENY the owner writing ${field} (${JSON.stringify(value).slice(0, 40)})`, async () => {
+      await assertFails((await asOwner()).collection("agencies").doc(AGENCY).update({ [field]: value }));
+    });
+    test(`DENY a member agent writing ${field} (${JSON.stringify(value).slice(0, 40)})`, async () => {
+      await assertFails((await asMember()).collection("agencies").doc(AGENCY).update({ [field]: value }));
+    });
+  }
+
+  test("DENY a price hidden in an otherwise allowed owner update", async () => {
+    await assertFails(
+      (await asOwner())
+        .collection("agencies")
+        .doc(AGENCY)
+        .update({ description: "hi", consultationFeeUsd: { amountMinor: 1, currency: "USD" } })
+    );
+  });
+
+  test("DENY the owner and a member writing a per-visa price (backend-only subcollection)", async () => {
+    for (const who of [asOwner, asMember]) {
+      const ref = (await who()).collection("agencies").doc(AGENCY).collection("visaPrices").doc("GB__uk-student");
+      await assertFails(
+        ref.set({ id: "GB__uk-student", agencyId: AGENCY, priceUsd: { amountMinor: 1, currency: "USD" } })
+      );
+      await assertFails(ref.set({ id: "GB__uk-student", agencyId: AGENCY, price: 1 }));
+    }
   });
 });
 

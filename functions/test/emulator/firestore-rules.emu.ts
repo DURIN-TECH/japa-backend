@@ -62,8 +62,7 @@ const ALICE_AGENT_DOC = {
   totalApplications: 0,
   successRate: 0,
   responseTime: "N/A",
-  consultationFee: 0,
-  serviceFees: {},
+  consultationFeeUsd: { amountMinor: 0, currency: "USD" },
   isAvailable: false,
   createdAt: new Date("2026-01-01T00:00:00Z"),
   updatedAt: new Date("2026-01-01T00:00:00Z"),
@@ -112,10 +111,23 @@ const AGENT_ALLOWED: Record<string, unknown> = {
   specializations: ["Student Visa"],
   languages: ["English", "Yoruba"],
   featuredVisas: ["visa-1"],
-  consultationFee: 10000,
-  serviceFees: { "visa-1": 50000 },
   availableSlots: [{ dayOfWeek: 1, startTime: "09:00", endTime: "17:00" }],
   updatedAt: new Date(),
+};
+
+/**
+ * Issue #179 (closes #168): every MONEY field on an agent doc, with a value a
+ * client might try. None may be written from a client SDK, by the agent
+ * or by their agency's owner: the API (PUT /agents/me) is the only writer of
+ * a price, because it validates the dollar amount.
+ */
+const AGENT_MONEY_FIELDS: Record<string, unknown> = {
+  consultationFeeUsd: { amountMinor: 1, currency: "USD" },
+  "consultationFeeUsd.amountMinor": 999999,
+  consultationFee: 10000,
+  consultationFeeUnit: "naira",
+  serviceFees: { "visa-1": 50000 },
+  migratedFrom: { consultationFee: { amount: 1, currency: "NGN", rate: 1 } },
 };
 
 /** A sample value for every agent field a client must NOT be able to write. */
@@ -132,6 +144,7 @@ const AGENT_PROTECTED: Record<string, unknown> = {
   totalApplications: 100,
   successRate: 100,
   responseTime: "1 hour",
+  ...AGENT_MONEY_FIELDS,
   someFutureField: "anything",
 };
 
@@ -139,6 +152,11 @@ const AGENT_PROTECTED: Record<string, unknown> = {
 const alice = () => clientDb(ALICE, { email: ALICE_EMAIL });
 /** Bob's client-side Firestore. */
 const bob = () => clientDb(BOB, { email: BOB_EMAIL });
+
+/** An agency owner (custom claims as the backend sets them) and their own agent doc. */
+const OWNER = "owner-uid";
+const OWNER_AGENT_DOC = { ...ALICE_AGENT_DOC, id: "agent-owner", userId: OWNER, agencyRole: "owner" };
+const owner = () => clientDb(OWNER, { email: "delivered+owner@resend.dev", role: "owner", agencyId: AGENCY });
 
 before(async () => {
   await rulesEnv();
@@ -154,6 +172,7 @@ beforeEach(async () => {
   await withoutRules(async (db) => {
     await db.collection("users").doc(ALICE).set(ALICE_USER_DOC);
     await db.collection("agents").doc(ALICE_AGENT_DOC.id).set(ALICE_AGENT_DOC);
+    await db.collection("agents").doc(OWNER_AGENT_DOC.id).set(OWNER_AGENT_DOC);
     await db.collection("agencyInvitations").doc("invite-1").set({
       id: "invite-1",
       agencyId: AGENCY,
@@ -292,6 +311,47 @@ describe("agents/{agentId}: update", () => {
     await assertSucceeds(
       adminDb.collection("agents").doc(ALICE_AGENT_DOC.id).update({ verificationStatus: "verified" })
     );
+  });
+});
+
+describe("agents/{agentId}: money fields are API-only (issue #179, closes #168)", () => {
+  for (const [field, value] of Object.entries(AGENT_MONEY_FIELDS)) {
+    test(`DENY the agent writing their own ${field}`, async () => {
+      await assertFails(
+        (await alice()).collection("agents").doc(ALICE_AGENT_DOC.id).update({ [field]: value })
+      );
+    });
+
+    test(`DENY an agency owner writing their own ${field}`, async () => {
+      await assertFails(
+        (await owner()).collection("agents").doc(OWNER_AGENT_DOC.id).update({ [field]: value })
+      );
+    });
+
+    test(`DENY an agency owner writing their member's ${field}`, async () => {
+      await assertFails(
+        (await owner()).collection("agents").doc(ALICE_AGENT_DOC.id).update({ [field]: value })
+      );
+    });
+  }
+
+  test("DENY a price hidden in an otherwise allowed update", async () => {
+    await assertFails(
+      (await alice())
+        .collection("agents")
+        .doc(ALICE_AGENT_DOC.id)
+        .update({ bio: "hi", consultationFeeUsd: { amountMinor: 1, currency: "USD" } })
+    );
+  });
+
+  test("DENY removing the stored price from a client", async () => {
+    const { consultationFeeUsd: _dropped, ...withoutFee } = ALICE_AGENT_DOC;
+    void _dropped;
+    await assertFails((await alice()).collection("agents").doc(ALICE_AGENT_DOC.id).set(withoutFee));
+  });
+
+  test("ALLOW the agent's non-money profile edit (the denial is the price, not the agent)", async () => {
+    await assertSucceeds((await alice()).collection("agents").doc(ALICE_AGENT_DOC.id).update({ bio: "hi" }));
   });
 });
 

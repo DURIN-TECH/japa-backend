@@ -336,7 +336,7 @@ describe("path (b): a user cannot attach themselves to an agency", () => {
       yearsOfExperience: 3,
       specializations: ["Student Visa"],
       languages: ["English"],
-      consultationFee: 5000,
+      consultationFeeUsd: { amount: "10.00", currency: "USD" }, // issue #179: dollars
     });
     assert.equal(created.status, 201, JSON.stringify(created.body));
 
