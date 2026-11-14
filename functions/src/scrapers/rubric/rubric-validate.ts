@@ -11,7 +11,10 @@ import {
   type VisaRubric,
 } from "../../types/rubric";
 
-import { isValidTrigger } from "../../services/ai/rule-applicability";
+import { isValidFactTrigger, isValidTrigger } from "../../services/ai/rule-applicability";
+// (#234) Shapes a stored applicant group may take (codes, kinds, authority ids).
+import { HELD_DOCUMENT_KINDS } from "../../types/applicant-facts";
+import { checkAuthorityId, isCountryCode } from "../../authorities/authority-ids";
 import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA } from "./rubric-exclusions";
 import { rulebookPartsOf } from "./rubric-key";
 
@@ -36,6 +39,31 @@ import { rulebookPartsOf } from "./rubric-key";
 // Dependency-free and pure, and it knows nothing about any particular
 // question, document, route or nationality: everything is checked as data.
 
+
+/**
+ * (#234) What is wrong with one stored applicant group (`appliesTo.groups[i]`),
+ * or null when it is usable. `asWritten` is the member exactly as the quote
+ * names it (3 characters or more, like every group name); codes are two
+ * upper-case letters; an issuer is a country code or an authority id; a
+ * `nationality` member is stored in `appliesTo.nationalities`, never here.
+ */
+export function storedGroupProblem(g: unknown): string | null {
+  if (!g || typeof g !== "object") return "each appliesTo.groups member must be an object";
+  const r = g as Record<string, unknown>;
+  if (typeof r.asWritten !== "string" || r.asWritten.trim().length < 3) return "each appliesTo.groups member needs asWritten: the source's own wording (3 characters or more)";
+  if (r.kind === "residence") return isCountryCode(r.code) ? null : "a residence group needs a two-letter code";
+  if (r.kind === "holds") {
+    if (typeof r.document !== "string" || !(HELD_DOCUMENT_KINDS as readonly string[]).includes(r.document)) return `a holds group's document must be one of ${HELD_DOCUMENT_KINDS.join(", ")}`;
+    return isCountryCode(r.issuer) || checkAuthorityId(r.issuer).ok ? null : "a holds group's issuer must be a two-letter code or an authority id";
+  }
+  if (r.kind === "members_of") {
+    const id = checkAuthorityId(r.authorityId);
+    if (!id.ok || id.shape !== "group") return "a members_of group needs the id of a bloc or treaty authority";
+    return r.fact === "nationality" || r.fact === "residence" ? null : "a members_of group's fact must be nationality or residence";
+  }
+  if (r.kind === "nationality") return "a nationality member goes in appliesTo.nationalities / asWritten, not appliesTo.groups";
+  return "appliesTo.groups member kind must be residence, holds or members_of";
+}
 /** One problem found by the validator. */
 export interface RubricIssue {
   code: string;
@@ -138,10 +166,18 @@ export function validateCriterionShape(c: AssessmentCriterion, severityLevels: r
     const uncodedOk = uncoded === undefined || (Array.isArray(uncoded) && uncoded.every((w) => filled(w) && w.trim().length >= 3));
     if (!uncodedOk) add("applies_to_uncoded_invalid", "appliesTo.uncoded must be a list of group members of 3 characters or more");
     const uncodedCount = Array.isArray(uncoded) ? uncoded.length : 0;
+    // (#234) Coded members decided from what the applicant holds (residence, holds, members_of).
+    const groups = a?.groups;
+    const groupsOk = groups === undefined || (Array.isArray(groups) && groups.every((g) => storedGroupProblem(g) === null));
+    if (!groupsOk) {
+      const first = Array.isArray(groups) ? groups.map(storedGroupProblem).find((p) => p !== null) : "appliesTo.groups must be a list";
+      add("applies_to_group_invalid", first ?? "appliesTo.groups is not valid");
+    }
+    const groupCount = Array.isArray(groups) ? groups.length : 0;
     const codedCount = a && Array.isArray(a.nationalities) ? a.nationalities.length : 0;
-    // A bar needs at least one member, coded or not.
-    if (!a || !Array.isArray(a.nationalities) || (codedCount === 0 && uncodedCount === 0)) {
-      add("bar_without_applies_to", "a mandatory bar needs at least one appliesTo.nationalities code or appliesTo.uncoded member");
+    // A bar needs at least one member, coded or not (a nationality, a #234 group, or an uncoded member).
+    if (!a || !Array.isArray(a.nationalities) || (codedCount === 0 && uncodedCount === 0 && groupCount === 0)) {
+      add("bar_without_applies_to", "a mandatory bar needs at least one appliesTo.nationalities code, appliesTo.groups member or appliesTo.uncoded member");
     } else if (codedCount > 0) {
       if (a.nationalities.some((n) => !/^[A-Z]{2}$/.test(n))) add("nationality_code_invalid", "appliesTo.nationalities must be two-letter uppercase codes");
       // One source name per code, in the same order. A name of one or two
@@ -272,6 +308,13 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
       const q = questions.find((x) => x.id === c.trigger?.questionId);
       if (!q) err("criterion_trigger_question_unknown", `trigger names question ${String(c.trigger.questionId)}, which is not in the rubric`, c.criterionId);
       else if (!isValidTrigger(c.trigger, questions)) err("criterion_trigger_value_unknown", "trigger values must be option values of the question it names (true / false for a yes/no question)", c.criterionId);
+    }
+    // (#234) A fact trigger reads what the applicant holds: its fact and values
+    // must have a usable shape, and only a scoped rule (specialist / conditional)
+    // may carry one (on an "everyone" rule it would silently narrow who it covers).
+    if (c.factTrigger !== undefined) {
+      if (!isValidFactTrigger(c.factTrigger)) err("criterion_fact_trigger_invalid", "factTrigger must name a fact (nationality, residence or holds) and values of its shape (two-letter codes, or kind:issuer for holds)", c.criterionId);
+      else if (c.applicability !== "specialist" && c.applicability !== "conditional") err("criterion_fact_trigger_unscoped", "only a specialist or conditional rule may carry a factTrigger", c.criterionId);
     }
     if (c.eligibilityQuestionId !== undefined) {
       const known = options.knownEligibilityQuestionIds;

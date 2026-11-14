@@ -42,6 +42,7 @@ import {
   type RawEvidenceItem,
   type RawIntakeQuestion,
   type RawRuleTrigger,
+  type RawApplicantGroup,
   type RawRubricOutput,
   type AcceptedCriterionView,
   type KnownQuestionView,
@@ -70,7 +71,9 @@ import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSet
 import { rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
 import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, targetInputOf, type RulebookTarget, type RulebookTargetInput } from "./rubric-key";
 import type { SharedRoute } from "../../types/shared-route";
-import type { RubricHead } from "../../types/rubric";
+import type { RubricHead, StoredApplicantGroup } from "../../types/rubric";
+// (#234) The held-document kinds a drafted `holds` group may name.
+import type { HeldDocumentKind } from "../../types/applicant-facts";
 import type { StartJobInput, StartJobResult } from "./rubric-extraction-job";
 // (#225) The guard that defers the automatic re-draft to an active onboarding run (pure module: no cycle).
 import { deferredResult, GUARD_UNAVAILABLE_REASON_CODE, type RedraftGuard } from "../onboarding/onboarding-redraft";
@@ -185,6 +188,10 @@ export interface ExtractRouteResult {
 /** Everything the service reaches outside itself; all injectable for tests. */
 export interface RubricExtractionDeps {
   provider?: LlmProvider;
+  // (#234) The bloc / treaty authorities a drafted group may name (id + name). Default: NONE, so a
+  // service built for a test or a script sends the pre-#234 frame; the production singleton
+  // (`rubricExtractionService`, below) reads the active ones from Firestore.
+  groupAuthorities?: () => Promise<{ id: string; name: string }[]>;
   snapshots?: Pick<GuidanceSnapshotStore, "read">;
   store?: RubricStore;
   loadSettings?: () => Promise<LoadedRubricSettings>;
@@ -464,6 +471,40 @@ export function regionDisplayName(code: string): string {
 }
 
 /**
+ * (#234) What is wrong with one drafted `appliesTo.groups` member, or null.
+ * Each kind needs its own fields: `residence` a two-letter `code`; `holds` a
+ * document kind and an `issuer` that is a two-letter code or one of the LISTED
+ * authority ids; `members_of` a listed `authorityId` and a `fact`. An id the
+ * drafting message did not list is refused: the model can never make one up.
+ */
+export function rawGroupProblem(g: RawApplicantGroup, knownAuthorityIds: ReadonlySet<string>): string | null {
+  const code = (v: unknown) => typeof v === "string" && /^[A-Z]{2}$/.test(v.trim().toUpperCase());
+  if (!g || typeof g.asWritten !== "string" || g.asWritten.trim().length < 3) return "a group member needs the source's own wording";
+  if (g.kind === "residence") return code(g.code) ? null : "a residence group member needs a two-letter code";
+  if (g.kind === "holds") {
+    if (g.document !== "visa" && g.document !== "residence_permit" && g.document !== "travel_authorisation") return "a holds group member needs a document kind";
+    const issuer = typeof g.issuer === "string" ? g.issuer.trim() : "";
+    return code(issuer) || knownAuthorityIds.has(issuer) ? null : "a holds group member's issuer must be a two-letter code or a listed authority id";
+  }
+  if (g.kind === "members_of") {
+    if (typeof g.authorityId !== "string" || !knownAuthorityIds.has(g.authorityId.trim())) return "a members_of group member must name a listed authority id";
+    return g.fact === "nationality" || g.fact === "residence" ? null : "a members_of group member needs a fact (nationality or residence)";
+  }
+  return "a group member's kind must be residence, holds or members_of";
+}
+
+/** (#234) A checked drafted group member in its stored form (trimmed, codes upper-case, only its kind's fields). */
+function storedGroupOf(g: RawApplicantGroup): StoredApplicantGroup {
+  const asWritten = g.asWritten.trim();
+  if (g.kind === "residence") return { kind: "residence", code: String(g.code).trim().toUpperCase(), asWritten };
+  if (g.kind === "holds") {
+    const issuer = String(g.issuer).trim();
+    return { kind: "holds", document: g.document as HeldDocumentKind, issuer: /^[a-z]{2}$/i.test(issuer) ? issuer.toUpperCase() : issuer, asWritten };
+  }
+  return { kind: "members_of", authorityId: String(g.authorityId).trim(), fact: g.fact as "nationality" | "residence", asWritten };
+}
+
+/**
  * Validate ONE chunk's answer against the snapshot it was cut from. This is
  * the real defence against an invented rule and against a document that
  * tries to steer the model: nothing is kept unless code finds its words in
@@ -481,7 +522,10 @@ export function assessChunkOutput(
   index: SnapshotQuoteIndex,
   base: CitationBase,
   severityLevels: readonly string[],
-  scope: SourceScope | null = null
+  scope: SourceScope | null = null,
+  // (#234) The bloc / treaty authority ids the drafting message listed: the only ids a
+  // drafted `members_of` group or `holds` issuer may name (any other is refused).
+  knownAuthorityIds: ReadonlySet<string> = new Set()
 ): ChunkAssessment {
   const discards: RubricDiscard[] = [];
   const counters = { judgementChecksStripped: 0, ruleRefsRemoved: 0, ruleRefsDerived: 0 };
@@ -517,7 +561,7 @@ export function assessChunkOutput(
   // ---- criteria ----
   const criteria: AcceptedCriterion[] = [];
   for (const c of raw.criteria) {
-    const accepted = assessCriterion(c, index, cite, flagged, severityLevels, scope);
+    const accepted = assessCriterion(c, index, cite, flagged, severityLevels, scope, knownAuthorityIds);
     if ("reason" in accepted) {
       // What the model proposed, so a reviewer can audit WHY it was dropped:
       // its reference, a hash of its quote and the quote's first characters.
@@ -600,7 +644,8 @@ function assessCriterion(
   cite: (matched: string, page: number | undefined) => RubricCitation,
   flagged: (quote: string) => boolean,
   severityLevels: readonly string[],
-  scope: SourceScope | null
+  scope: SourceScope | null,
+  knownAuthorityIds: ReadonlySet<string> = new Set()
 ): { criterion: AssessmentCriterion; notes: CriterionNotes } | { reason: RubricDiscardReason; detail: string } {
   // 1. The quote must be verbatim in THIS source's snapshot: whole words,
   //    one page / one paragraph. A paraphrase, an invented sentence, a
@@ -728,6 +773,14 @@ function assessCriterion(
     if (c.appliesTo.asWritten.some((w) => !groupNameSupported(w, quote))) return { reason: "applies_to_not_in_quote", detail: DETAIL.group };
     // (#222) Members that are not a nationality: each a whole name in the quote, no code.
     if ((c.appliesTo.uncoded ?? []).some((w) => !uncodedNameSupported(w, quote))) return { reason: "applies_to_not_in_quote", detail: DETAIL.group };
+    // (#234) Members decided from what the applicant holds: each must have the fields its kind
+    // needs (codes of the right shape, an authority id only from the listed ones) and its
+    // wording must be in the quote as a whole name or phrase. Refused, never repaired.
+    for (const g of c.appliesTo.groups ?? []) {
+      const problem = rawGroupProblem(g, knownAuthorityIds);
+      if (problem) return { reason: "invalid_shape", detail: problem };
+      if (!groupNameSupported(g.asWritten, quote) && !uncodedNameSupported(g.asWritten, quote)) return { reason: "applies_to_not_in_quote", detail: DETAIL.group };
+    }
   }
   // 7b. (#222) A quote that ends with a lead-in gets its list lines from the
   //     stored text (rubric-list-items.ts). An unreadable list is NOT a discard
@@ -768,6 +821,8 @@ function assessCriterion(
           // Platform data beside the model's proposal, for the reviewer.
           codeNames: nationalities.map(regionDisplayName),
           ...((c.appliesTo.uncoded ?? []).length > 0 ? { uncoded: (c.appliesTo.uncoded ?? []).map((w) => w.trim()) } : {}),
+          // (#234) Already checked above (shape and wording), stored in the clean stored form.
+          ...((c.appliesTo.groups ?? []).length > 0 ? { groups: (c.appliesTo.groups ?? []).map(storedGroupOf) } : {}),
         },
       }
       : {}),
@@ -1194,10 +1249,13 @@ export function reviewFlagsFor(content: Pick<MergedRubricContent, "criteria" | "
   const bars = content.criteria.filter((c) => c.kind === "mandatory_bar" && c.appliesTo);
   // (#222) Bars whose group has members with no code: the reviewer sees them listed too.
   const uncodedBars = bars.filter((c) => (c.appliesTo?.uncoded ?? []).length > 0);
+  // (#234) Bars whose group has members decided from what the applicant holds (codes, issuers and
+  // authority ids proposed by the model): the reviewer is told to confirm those too.
+  const groupBars = bars.filter((c) => (c.appliesTo?.groups ?? []).length > 0);
   if (bars.length > 0) {
     flags.push({
       code: "nationality_codes_model_proposed",
-      message: `${bars.length} mandatory bar(s) carry country codes proposed by the extraction model from the source's wording. Code has checked the wording is in the quote, not that each code is the right one: confirm every code against appliesTo.asWritten before approving.${uncodedBars.length > 0 ? ` ${uncodedBars.length} of them also name group members that are not nationalities and carry no code (appliesTo.uncoded: ${uncodedBars.map((c) => (c.appliesTo?.uncoded ?? []).join("; ")).join(" | ")}): confirm those too.` : ""}`,
+      message: `${bars.length} mandatory bar(s) carry country codes proposed by the extraction model from the source's wording. Code has checked the wording is in the quote, not that each code is the right one: confirm every code against appliesTo.asWritten before approving.${uncodedBars.length > 0 ? ` ${uncodedBars.length} of them also name group members that are not nationalities and carry no code (appliesTo.uncoded: ${uncodedBars.map((c) => (c.appliesTo?.uncoded ?? []).join("; ")).join(" | ")}): confirm those too.` : ""}${groupBars.length > 0 ? ` ${groupBars.length} of them also name members decided from what the applicant holds (appliesTo.groups: residence, holds, members_of), with codes, issuers or authority ids proposed by the model: confirm each against its asWritten wording.` : ""}`,
       target: "rubric",
     });
   }
@@ -1338,6 +1396,8 @@ export interface RunContext {
   routeName: string;
   primaries: LoadedSource[];
   scope: RouteScope | null;
+  // (#234) The bloc / treaty authorities the drafting message lists (pinned on the job). Empty when none.
+  groupAuthorities: readonly { id: string; name: string }[];
 }
 
 /**
@@ -1590,6 +1650,22 @@ export class RubricExtractionService {
    * for a country (exactly `routeName`), the shared route's name for a bloc
    * or treaty. Falls back to the route slug.
    */
+  /**
+   * (#234) The ACTIVE bloc and treaty authorities (P1 of #228), id and name,
+   * sorted by id and bounded: the only ids a drafted `members_of` group or
+   * `holds` issuer may name. Country authorities are left out (a country is
+   * named by its two-letter code). A failed read gives none (no group can then
+   * name an authority, which only sends such members to `uncoded`).
+   */
+  async groupAuthoritiesOf(): Promise<{ id: string; name: string }[]> {
+    if (!this.deps.groupAuthorities) return [];
+    try {
+      return (await this.deps.groupAuthorities()).slice(0, 50);
+    } catch {
+      return [];
+    }
+  }
+
   async routeNameOf(input: RulebookTargetInput): Promise<string> {
     const target = rulebookTargetOf(input);
     if (target.shape === "country") return this.routeName(target.authorityId, target.routeSlug);
@@ -1722,7 +1798,7 @@ export class RubricExtractionService {
 
       // ---- 4. plan: read the snapshot text, cut it, check the caps ----
       const routeName = await this.routeNameOf(target);
-      const ctx = await this.buildRunContext(sources, settings, routeName);
+      const ctx = await this.buildRunContext(sources, settings, routeName, await this.groupAuthoritiesOf());
       plan = ctx.plan;
       chunkCount = ctx.chunks.length;
       if (chunkCount === 0) throw new RunStop("failed", "no_text", "the snapshots hold no text to extract from");
@@ -1838,7 +1914,9 @@ export class RubricExtractionService {
    * only the sources and rebuilds this context at the start of each
    * invocation instead of storing the (large) text.
    */
-  async buildRunContext(sources: LoadedSource[], settings: Pick<RunSettingsPin, "maxChunkChars" | "maxOutputTokensPerRequest" | "requestTimeoutMs">, routeName: string): Promise<RunContext> {
+  // (#234) `groupAuthorities`: the bloc / treaty authorities to list in the drafting message (the job pins
+  // them when it starts, so every invocation of one job sends the same requests). Default: none.
+  async buildRunContext(sources: LoadedSource[], settings: Pick<RunSettingsPin, "maxChunkChars" | "maxOutputTokensPerRequest" | "requestTimeoutMs">, routeName: string, groupAuthorities: readonly { id: string; name: string }[] = []): Promise<RunContext> {
     const indexes = new Map<string, SnapshotQuoteIndex>();
     const midSentence: ReviewFlagContext["pagesEndingMidSentence"] = [];
     const chunks: SourceChunk[] = [];
@@ -1866,6 +1944,7 @@ export class RubricExtractionService {
       routeName,
       primaries,
       scope,
+      groupAuthorities,
     };
   }
 
@@ -1882,7 +1961,12 @@ export class RubricExtractionService {
     };
     // Scoping applies only when the run has a primary source. What is
     // kept from each source depends on its role (see assessCriterion 3c).
-    const route: RubricRouteContext = { routeName: ctx.routeName, sourceRole: ctx.primaries.length === 0 ? "unspecified" : source.role };
+    const route: RubricRouteContext = {
+      routeName: ctx.routeName,
+      sourceRole: ctx.primaries.length === 0 ? "unspecified" : source.role,
+      // (#234) Only when there are any, so a platform with no blocs sends the v10 frame.
+      ...((ctx.groupAuthorities ?? []).length > 0 ? { groupAuthorities: ctx.groupAuthorities } : {}),
+    };
     const scopeForChunk: SourceScope | null = ctx.scope
       ? { role: source.role, allow: ctx.scope, namedByPrimary: source.role === "secondary" && primaryNamesDocument(ctx.scope, source.title, index.allText()) }
       : null;
@@ -1898,7 +1982,7 @@ export class RubricExtractionService {
   async runCriteriaStep(ctx: RunContext, chunk: SourceChunk, usage: RubricRunUsage, attempts: CallAttempts, opts: CallOptions = {}): Promise<ChunkAssessment> {
     const { index, base, route, scopeForChunk } = this.chunkInputs(ctx, chunk);
     const raw = await this.callModel(buildRubricRequest(chunk, ctx.severityLevels, ctx.limits, route), usage, attempts, opts);
-    return assessChunkOutput(raw, chunk, index, base, ctx.severityLevels, scopeForChunk);
+    return assessChunkOutput(raw, chunk, index, base, ctx.severityLevels, scopeForChunk, new Set((ctx.groupAuthorities ?? []).map((a) => a.id)));
   }
 
   /**
@@ -2029,7 +2113,7 @@ export class RubricExtractionService {
       stage: rule.stage,
       quote: rule.source.quote,
       ...(rule.source.listItems ? { listItems: rule.source.listItems } : {}),
-      ...(rule.appliesTo ? { appliesTo: { nationalities: rule.appliesTo.nationalities, asWritten: rule.appliesTo.asWritten, ...(rule.appliesTo.uncoded ? { uncoded: rule.appliesTo.uncoded } : {}) } } : {}),
+      ...(rule.appliesTo ? { appliesTo: { nationalities: rule.appliesTo.nationalities, asWritten: rule.appliesTo.asWritten, ...(rule.appliesTo.uncoded ? { uncoded: rule.appliesTo.uncoded } : {}), ...(rule.appliesTo.groups ? { groups: rule.appliesTo.groups } : {}) } } : {}),
     };
     const levels = [...DEFAULT_SEVERITY_LEVELS];
     const request = buildRepairRequest(chunk, { rule: shown, aspects: input.aspects }, levels, input.limits, route);
@@ -2306,4 +2390,18 @@ export class RubricExtractionService {
 }
 
 /** Singleton over the real provider, bucket and Firestore. */
-export const rubricExtractionService = new RubricExtractionService();
+/**
+ * (#234) The ACTIVE bloc / treaty authorities from Firestore (`authorities`),
+ * id and name, sorted by id. Country authorities are left out (a country is
+ * named by its two-letter code).
+ */
+async function loadActiveGroupAuthorities(): Promise<{ id: string; name: string }[]> {
+  const snap = await collections.authorities.get();
+  return snap.docs
+    .map((d) => d.data() as { id?: string; kind?: string; name?: string; status?: string })
+    .filter((a) => typeof a.id === "string" && typeof a.name === "string" && a.kind !== "country" && a.status === "active")
+    .map((a) => ({ id: a.id as string, name: a.name as string }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+export const rubricExtractionService = new RubricExtractionService({ groupAuthorities: loadActiveGroupAuthorities });

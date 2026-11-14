@@ -36,7 +36,9 @@ import {
   evaluateObjective,
   extractionIsSuspicious,
   judgementCriteriaOf,
-  mandatoryBarHits,
+  barNotAssessedItems,
+  decideMandatoryBars,
+  isJudgedBar,
   parseExtraction,
   numberStatementBlocks,
   parseJudgement,
@@ -49,6 +51,8 @@ import {
 } from "./ai/assessment-engine";
 import { AI_MODELS } from "./ai/ai-models";
 import { notAssessedItems, splitByApplicability } from "./ai/rule-applicability";
+// (#234) The facts line of the model's profile summary: only what the rules need.
+import { factsSummaryForModel } from "./ai/applicant-groups";
 import type { InsufficientItem } from "../types/assessment";
 import { BATCH_PRICE_MULTIPLIER, costOfUsage, rolesArePriced } from "./ai/ai-pricing";
 import { readAiSettings, type AiSettings } from "./ai/ai-settings";
@@ -58,6 +62,7 @@ import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-saf
 import {
   aiCaseOfficerService,
   barDateOf,
+  startDateOf,
   dayKey,
   failed as failedExtraction,
   newAssessmentDoc,
@@ -1004,15 +1009,20 @@ export class BulkReassessmentService {
       return { kind: "stop", code: "inputs_changed", message: "the application's inputs changed after this re-assessment was queued" };
     }
     // ---- which rules apply to THIS applicant (#207): see AiCaseOfficerService.execute ----
-    const split = splitByApplicability(fullRubric, loaded.intake);
-    const rubric: VisaRubric = { ...fullRubric, criteria: split.applicable };
-    const notAssessed = notAssessedItems(split);
-
+    // (#234) Fact-triggered rules and bars read the application's copy of the applicant's facts
+    // (exactly as AiCaseOfficerService.execute: same date rules, same membership read).
     const now = this.deps.now();
+    const barDate = barDateOf(app, now);
+    const split = splitByApplicability(fullRubric, loaded.intake, { facts: loaded.facts, onDate: barDate });
+    const rubric: VisaRubric = { ...fullRubric, criteria: split.applicable };
+    const membership = await officer.membershipFor(rubric, startDateOf(app, now));
+    const bars = decideMandatoryBars(rubric, loaded.facts, barDate, membership);
+    const notAssessed = [...notAssessedItems(split), ...barNotAssessedItems(bars.unknown)];
+
     const score = loaded.eligibilityScore;
 
     // ---- stage 1: mandatory bars (code only, never batched) ----
-    const hits = mandatoryBarHits(rubric, loaded.nationality, barDateOf(app, now));
+    const hits = bars.hits;
     if (hits.length > 0) {
       const content = assembleContent({
         rubric, mandatoryHits: hits, objective: [], judgement: null, documents: [],
@@ -1104,7 +1114,8 @@ export class BulkReassessmentService {
         rubric,
         statementText: numbered ? numbered.text : statementText || null,
         otherStatementsText: otherText || null,
-        profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. Nationality code: ${loaded.nationality ?? "not given"}.`,
+        // (#234) Only the facts the rules need reach the model (see factsSummaryForModel).
+        profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. ${factsSummaryForModel(loaded.facts, rubric.criteria, barDateOf(app, this.deps.now()), rubric.criteria.some(isJudgedBar))}`,
         intakeSummary: JSON.stringify(loaded.intake),
         extractionSummary: extractions
           .filter((e) => e.readable && !e.failed && !e.suspicious)

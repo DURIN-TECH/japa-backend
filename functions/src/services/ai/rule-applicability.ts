@@ -23,11 +23,19 @@
  *                       know X"), never as a failed rule and never as applying
  *                       to everyone.
  *
+ * (#234) A rule may also carry a FACT trigger (`criterion.factTrigger`,
+ * `{ fact: nationality | residence | holds, anyOf }`): it reads what the
+ * applicant holds (the application's `applicantFacts` copy, passed in as an
+ * `ApplicantContext`), never an intake answer. A fact the applicant has not
+ * stated gives `unknown` ("we need to know your nationality"), never a guess.
+ *
  * Generic by design: nothing here names a country, route, activity or
  * nationality. Triggers are data in the rubric.
  */
 import type { AssessmentCriterion, IntakeCondition, IntakeQuestion, RuleTrigger, VisaRubric } from "../../types/rubric";
-import { answerIncludesAny, conditionsForTriggers, isUnanswered, isValidTrigger } from "../../utils/rubric-trigger";
+import { answerIncludesAny, conditionsForTriggers, isUnanswered, isValidFactTrigger, isValidTrigger } from "../../utils/rubric-trigger";
+// (#234) Fact triggers read what the applicant HOLDS (the application's copy), decided in a pure module.
+import { decideFactTrigger, factsFromApplicantFacts, NO_FACTS, needWords, type FactsForRules } from "./applicant-groups";
 
 // ============================================
 // Answers and trigger validity: ONE implementation (INTEGRATION, #200)
@@ -37,14 +45,43 @@ import { answerIncludesAny, conditionsForTriggers, isUnanswered, isValidTrigger 
 // utils/rubric-trigger.ts, a pure module the scrapers' question plan also uses
 // (it may not import from services). They are re-exported here so every
 // consumer keeps importing them from this file.
-export { answerIncludesAny, conditionsForTriggers, isUnanswered, isValidTrigger, triggerValuesOf } from "../../utils/rubric-trigger";
+export { answerIncludesAny, conditionsForTriggers, isUnanswered, isValidFactTrigger, isValidTrigger, triggerValuesOf } from "../../utils/rubric-trigger";
 
 // ============================================
 // Resolution
 // ============================================
 
-/** Why a rule's applicability is unknown. */
-export type UnknownReason = "unanswered" | "no_trigger";
+/**
+ * Why a rule's applicability is unknown.
+ *   - `unanswered`:   the trigger question has no answer yet;
+ *   - `no_trigger`:   a specialist rule with no usable trigger;
+ *   - `missing_fact`: (#234) a fact trigger needs a fact the applicant has not
+ *                     stated ("we need to know your nationality").
+ */
+export type UnknownReason = "unanswered" | "no_trigger" | "missing_fact";
+
+/**
+ * (#234) What a fact trigger is decided from: the applicant's facts (the
+ * application's copy, `Application.applicantFacts`) and the date the rule is
+ * checked on (held documents must still be valid on it). Optional everywhere:
+ * a caller that passes none has NO facts, so every fact-triggered rule is
+ * "could not tell" for it (never "applies" and never "not applicable").
+ */
+export interface ApplicantContext {
+  facts: FactsForRules;
+  // "YYYY-MM-DD".
+  onDate: string;
+}
+
+/**
+ * (#234) The applicant context of an application: its COPY of the applicant's
+ * facts (`applicantFacts`, taken when it started) on `onDate`. An application
+ * with no copy (started before #234) has no facts: fact-triggered rules are
+ * then "could not tell" for it.
+ */
+export function applicantContextOf(app: { applicantFacts?: Parameters<typeof factsFromApplicantFacts>[0] }, onDate: string): ApplicantContext {
+  return { facts: app.applicantFacts ? factsFromApplicantFacts(app.applicantFacts) : NO_FACTS, onDate };
+}
 
 /** What `resolveApplicability` says about one rule for one applicant. */
 export type RuleApplicability =
@@ -79,7 +116,8 @@ function isScoped(c: AssessmentCriterion): boolean {
 export function resolveApplicability(
   criterion: AssessmentCriterion,
   questions: readonly IntakeQuestion[],
-  answers: Record<string, unknown> | null | undefined
+  answers: Record<string, unknown> | null | undefined,
+  context?: ApplicantContext
 ): RuleApplicability {
   if (criterion.applicability === "other_route") return { status: "not_applicable" };
   if (!isScoped(criterion)) return { status: "applies" };
@@ -91,17 +129,35 @@ export function resolveApplicability(
   // only raise a concern; code never refuses on it (see `mandatoryBarHits`).
   if (criterion.kind === "mandatory_bar" && criterion.notCodeDecided === true) return { status: "applies" };
 
-  if (!isValidTrigger(criterion.trigger, questions)) {
+  const hasQuestionTrigger = isValidTrigger(criterion.trigger, questions);
+  // (#234) A usable fact trigger counts as a trigger too; a damaged one is ignored (treated as absent).
+  const hasFactTrigger = isValidFactTrigger(criterion.factTrigger);
+  if (!hasQuestionTrigger && !hasFactTrigger) {
     if (criterion.applicability === "conditional") return { status: "applies" };
     return { status: "unknown", reason: "no_trigger", need: "whether this rule applies to your application" };
   }
-  const trigger = criterion.trigger;
-  const q = questions.find((x) => x.id === trigger.questionId) as IntakeQuestion;
-  const answer = (answers ?? {})[trigger.questionId];
-  if (isUnanswered(answer)) {
-    return { status: "unknown", reason: "unanswered", questionId: q.id, need: q.label };
+
+  // Each present trigger is decided on its own; then they are combined:
+  // either one ruling the rule out rules it out, else either one that could
+  // not be decided makes the rule "could not tell", else it applies.
+  const results: RuleApplicability[] = [];
+  if (hasQuestionTrigger) {
+    const trigger = criterion.trigger as NonNullable<AssessmentCriterion["trigger"]>;
+    const q = questions.find((x) => x.id === trigger.questionId) as IntakeQuestion;
+    const answer = (answers ?? {})[trigger.questionId];
+    if (isUnanswered(answer)) results.push({ status: "unknown", reason: "unanswered", questionId: q.id, need: q.label });
+    else results.push(answerIncludesAny(answer, trigger.anyOf) ? { status: "applies" } : { status: "not_applicable" });
   }
-  return answerIncludesAny(answer, trigger.anyOf) ? { status: "applies" } : { status: "not_applicable" };
+  if (hasFactTrigger) {
+    // No context = no facts: the fact is "not stated", so this can only be unknown.
+    const d = decideFactTrigger(criterion.factTrigger, context?.facts ?? NO_FACTS, context?.onDate ?? "");
+    if (d.status === "match") results.push({ status: "applies" });
+    else if (d.status === "no_match") results.push({ status: "not_applicable" });
+    else results.push({ status: "unknown", reason: "missing_fact", need: needWords(d.needs) });
+  }
+  if (results.some((r) => r.status === "not_applicable")) return { status: "not_applicable" };
+  const unknown = results.find((r) => r.status === "unknown");
+  return unknown ?? { status: "applies" };
 }
 
 /** The split of a rubric's criteria for one applicant. */
@@ -119,11 +175,11 @@ export interface ApplicabilitySplit {
  * criterion lands in exactly ONE of the three lists, so nothing is silently
  * lost (a test asserts the three counts add up to the rubric's).
  */
-export function splitByApplicability(rubric: ApplicabilityRubric, answers: Record<string, unknown> | null | undefined): ApplicabilitySplit {
+export function splitByApplicability(rubric: ApplicabilityRubric, answers: Record<string, unknown> | null | undefined, context?: ApplicantContext): ApplicabilitySplit {
   const questions = Array.isArray(rubric.intakeQuestions) ? rubric.intakeQuestions : [];
   const out: ApplicabilitySplit = { applicable: [], notApplicableIds: [], unknown: [] };
   for (const c of rubric.criteria) {
-    const r = resolveApplicability(c, questions, answers);
+    const r = resolveApplicability(c, questions, answers, context);
     if (r.status === "applies") out.applicable.push(c);
     else if (r.status === "not_applicable") out.notApplicableIds.push(c.criterionId);
     else out.unknown.push({ criterion: c, reason: r.reason, ...(r.questionId ? { questionId: r.questionId } : {}), need: r.need });
@@ -146,7 +202,8 @@ export function notAssessedItems(split: ApplicabilitySplit): Array<{ criterionId
  * `need` is the rubric question's own label or a fixed phrase.
  */
 export function couldNotAssessReason(u: { reason: UnknownReason; need: string }): string {
-  return u.reason === "unanswered"
+  // (#234) A missing applicant fact reads the same way as a missing answer ("we need to know your nationality").
+  return u.reason === "unanswered" || u.reason === "missing_fact"
     ? `could not be assessed: we need to know ${u.need}`
     : `could not be assessed: we need to know ${u.need} (the guidance does not say which answer this rule depends on)`;
 }
@@ -159,8 +216,9 @@ export function couldNotAssessReason(u: { reason: UnknownReason; need: string })
  * Ids of the criteria that apply to the applicant. Used by consumers that only
  * need a membership test (the checklist and upload check).
  */
-export function applicableCriterionIds(rubric: ApplicabilityRubric, answers: Record<string, unknown> | null | undefined): Set<string> {
-  return new Set(splitByApplicability(rubric, answers).applicable.map((c) => c.criterionId));
+// (#234) `context`: the applicant's facts and the date, for rules with a fact trigger (absent = no facts known).
+export function applicableCriterionIds(rubric: ApplicabilityRubric, answers: Record<string, unknown> | null | undefined, context?: ApplicantContext): Set<string> {
+  return new Set(splitByApplicability(rubric, answers, context).applicable.map((c) => c.criterionId));
 }
 
 // ============================================
@@ -208,7 +266,9 @@ export function effectiveIntakeQuestions(rubric: ApplicabilityRubric): IntakeQue
     // every applicant (see `resolveApplicability`), so a question it reads must stay asked. Counting it as
     // hopeless would drop a question that only such a bar reads, and with it an answer the assessment
     // model needs to weigh the bar's condition.
-    const hopeless = relevant.filter((c) => c.applicability === "specialist" && !isValidTrigger(c.trigger, questions) && !(c.kind === "mandatory_bar" && c.notCodeDecided === true));
+    // (#234) Nor is a specialist rule with a usable FACT trigger: it is assessed for the applicants whose
+    // holdings trigger it, so a question it reads must stay asked (a fact cannot gate a question's showWhen).
+    const hopeless = relevant.filter((c) => c.applicability === "specialist" && !isValidTrigger(c.trigger, questions) && !isValidFactTrigger(c.factTrigger) && !(c.kind === "mandatory_bar" && c.notCodeDecided === true));
     if (gated.length + hopeless.length < relevant.length) {
       out.push(q);
       continue;

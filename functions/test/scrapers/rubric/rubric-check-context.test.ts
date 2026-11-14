@@ -353,9 +353,9 @@ describe("through the service", () => {
 // The prompt
 // ============================================
 
-describe("the prompt (version 6)", () => {
-  test("the version is v6", () => {
-    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v6");
+describe("the prompt (version 7)", () => {
+  test("the version is v7 (#234 bumped v6: `appliesTo.groups` is shown and judged)", () => {
+    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v7");
   });
 
   test("the rule fields list names the new fields and says what each is", () => {
@@ -399,11 +399,11 @@ describe("the prompt (version 6)", () => {
     assert.match(CHECKER_SYSTEM_PROMPT, /If you cannot read the language of a quote well enough to judge an aspect, answer `unsure` for it: never `yes`\./);
   });
 
-  test("the prompts and schema match the hash pinned for v6 (change the prompt: bump the version and re-pin)", () => {
+  test("the prompts and schema match the hash pinned for v7 (change the prompt: bump the version and re-pin)", () => {
     const hash = createHash("sha256").update(`${CHECKER_SYSTEM_PROMPT}\n${JSON.stringify(buildVerdictSchema())}\n${CHECKER_POLARITY_SYSTEM_PROMPT}`).digest("hex");
-    assert.equal(hash, V6_PINNED_HASH);
+    assert.equal(hash, V7_PINNED_HASH);
   });
 });
 
 // Pinned at the #242 bump (v5 was 894d66bb...). Another change to these prompts needs its own version bump and a new pin here.
-const V6_PINNED_HASH = "6c9410ad8e9df18e7cab534cde25cc74e40a92e2527ccac25c79dd409901d49e";
+const V7_PINNED_HASH = "9e49085b9ac950adf79e7ddc5d583ca718d75cd2c674e76149ee2e40f3aa9070";

@@ -317,7 +317,8 @@ describe("a bar that is still not confirmed holds the draft (#223)", () => {
   });
 
   test("(#226) the re-draft instructions say: same line, keep the kind; the version is bumped", () => {
-    assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v4");
+    // (#234) v5: reuses the v11 system prompt; the same-line / keep-kind wording is unchanged.
+    assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v5");
     const chunk = { sourceId: SRC_ID, contentHash: SRC_HASH, docType: "html", chunkIndex: 0, chunkCount: 1, text: BAR_QUOTE } as any;
     const req = buildRepairRequest(chunk, { rule: { title: "T", kind: "mandatory_bar", stage: "validity", quote: BAR_QUOTE }, aspects: ["group_matches_codes"] }, ["high"], { maxOutputTokens: 1000, timeoutMs: 1000 });
     assert.match(req.user, /taken from the same line of the excerpt/);

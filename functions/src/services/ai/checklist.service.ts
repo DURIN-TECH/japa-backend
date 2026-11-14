@@ -26,6 +26,7 @@ import { defaultRulebookStack, rulebookFor } from "./application-rulebook";
 import { visaService } from "../visa.service";
 import { documentRequestService } from "../document-request.service";
 import { buildChecklist, ChecklistItem, ChecklistState } from "./checklist-builder";
+import { applicantContextOf } from "./rule-applicability";
 import type { Application, DocumentRequest, DocumentRequestStatus } from "../../types";
 
 /** A checklist item joined with its stored DocumentRequest (if any). */
@@ -90,6 +91,8 @@ class ChecklistService {
       rubric,
       visaRecord: visaType,
       intakeAnswers: intake?.answers ?? null,
+      // (#234) Rules triggered by what the applicant holds read the application's copy (today).
+      applicantContext: applicantContextOf(application, new Date().toISOString().slice(0, 10)),
     });
   }
 

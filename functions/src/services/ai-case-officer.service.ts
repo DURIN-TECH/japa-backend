@@ -1,6 +1,10 @@
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
-import { collections, db } from "../utils/firebase";
+import { collections, db, subcollections } from "../utils/firebase";
+// (#234) Membership on a date (pure) for `members_of` groups; the AuthorityMember shape.
+import { membersOn } from "../authorities/authority-ids";
+import type { AuthorityMember } from "../types/authority";
+import { factsFromApplicantFacts, factsFromNationality, factsSummaryForModel, membershipAuthorityIdsOf, type FactsForRules, type MembershipOnDate } from "./ai/applicant-groups";
 import { layerVersionsOf, rubricRouteKey, rubricStore, sameStackVersions, type RulebookStack, type VisaRubric } from "../scrapers";
 import { defaultRulebookStack, rulebookStackFor, type ApplicationStackRef } from "./ai/application-rulebook";
 import type { Application, Document, DocumentInstance, EligibilityCheck, ProseMirrorDoc, User } from "../types";
@@ -22,8 +26,10 @@ import {
   documentFieldsFor,
   evaluateObjective,
   hashStatementContent,
+  barNotAssessedItems,
+  decideMandatoryBars,
+  isJudgedBar,
   judgementCriteriaOf,
-  mandatoryBarHits,
   mergeJudgementOutputs,
   numberStatementBlocks,
   parseJudgement,
@@ -108,6 +114,9 @@ export interface AssessmentDeps {
   // Country-context lookup (#116). Optional so existing fakes keep working;
   // defaults to the real builder. Reads published statistics only, no model.
   buildCountryContext?: (input: Parameters<typeof buildCountryContext>[0]) => Promise<CountryContextResult>;
+  // (#234) Every member ever recorded for an authority (`authorities/{id}/members`).
+  // Optional so existing fakes keep working; defaults to the Firestore read.
+  loadAuthorityMembers?: (authorityId: string) => Promise<AuthorityMember[]>;
 }
 
 /** What a POST resolved to. */
@@ -122,7 +131,14 @@ export type RequestOutcome =
 /** Inputs the job and the request both read, loaded once. */
 export interface LoadedInputs {
   applicantName: string | null;
+  // The first stated nationality (kept for callers that read one value).
   nationality: string | null;
+  // (#234) What the applicant holds, as rules read it: the APPLICATION'S COPY
+  // (`applicantFacts`) when it has one, else (applications started before
+  // #234, dev data only) the latest eligibility check's nationality alone.
+  facts: FactsForRules;
+  // True when `facts` came from the application's copy (it is then in the input hash).
+  factsFromCopy: boolean;
   eligibilityScore: number | null;
   eligibilityAnswers: Record<string, unknown> | null;
   intake: Record<string, unknown>;
@@ -175,6 +191,37 @@ function isoDate(now: Date): string {
 }
 
 /**
+ * (#234) The application's START date ("YYYY-MM-DD"): `startDate`, else
+ * `createdAt`, else today. `members_of` groups resolve their membership on this
+ * date (the applicant's facts were copied at this moment too).
+ */
+export function startDateOf(app: Pick<Application, "startDate" | "createdAt">, now: Date): string {
+  for (const ts of [app.startDate, app.createdAt] as Array<{ toDate?: () => Date } | undefined>) {
+    if (ts && typeof ts.toDate === "function") {
+      const d = ts.toDate();
+      if (d instanceof Date && !Number.isNaN(d.getTime())) return isoDate(d);
+    }
+  }
+  return isoDate(now);
+}
+
+/**
+ * (#234) The facts as the input hash holds them: codes, kinds, issuers and
+ * dates in a stable order (never the applicant's note, which no rule reads).
+ */
+export function hashableFacts(facts: FactsForRules): NonNullable<AssessmentInputs["applicantFacts"]> {
+  return {
+    nationalities: [...facts.nationalities].sort(),
+    residentialCountry: facts.residentialCountry,
+    heldDocuments: facts.heldDocuments === null
+      ? null
+      : facts.heldDocuments
+        .map((d) => ({ kind: d.kind, issuer: d.issuerCountryCode ?? d.issuerAuthorityId ?? null, validUntil: d.validUntil }))
+        .sort((a, b) => `${a.kind}|${a.issuer}|${a.validUntil}`.localeCompare(`${b.kind}|${b.issuer}|${b.validUntil}`)),
+  };
+}
+
+/**
  * The date a mandatory bar is checked against.
  *
  * - `submittedAt`, when the application has one: a rule in force when the
@@ -196,6 +243,12 @@ export function barDateOf(app: Pick<Application, "submittedAt">, now: Date): str
     if (d instanceof Date && !Number.isNaN(d.getTime())) return isoDate(d);
   }
   return isoDate(now);
+}
+
+/** (#234) Every member ever recorded for an authority, from Firestore (`authorities/{id}/members`). */
+async function defaultLoadAuthorityMembers(authorityId: string): Promise<AuthorityMember[]> {
+  const snap = await subcollections.authorityMembers(authorityId).get();
+  return snap.docs.map((d) => d.data() as AuthorityMember);
 }
 
 /** The default deps: Firestore, Cloud Storage, the Anthropic provider and the settings doc. */
@@ -300,7 +353,15 @@ export class AiCaseOfficerService {
       .limit(1)
       .get();
     const check = checkSnap.empty ? null : ({ id: checkSnap.docs[0].id, ...checkSnap.docs[0].data() } as EligibilityCheck & { id: string });
-    const nationality = check && /^[A-Z]{2}$/.test(check.nationality ?? "") ? check.nationality : null;
+    // (#234) The applicant's facts come from the application's COPY of their
+    // holdings (taken when the application started), never the live profile.
+    // The eligibility check's nationality is the fallback ONLY for an
+    // application that has no copy (started before #234: dev data only).
+    const copy = (app as Application).applicantFacts;
+    const facts: FactsForRules = copy
+      ? factsFromApplicantFacts(copy)
+      : factsFromNationality(check && /^[A-Z]{2}$/.test(check.nationality ?? "") ? check.nationality : null);
+    const nationality = facts.nationalities[0] ?? null;
     const eligibilityAnswers = check
       ? Object.fromEntries(
         (check.answers ?? []).map((a) => [String((a as { questionId: string }).questionId), (a as { answer?: unknown }).answer ?? null])
@@ -355,12 +416,41 @@ export class AiCaseOfficerService {
     return {
       applicantName,
       nationality,
+      facts,
+      factsFromCopy: copy !== undefined,
       eligibilityScore: check && typeof check.score === "number" ? check.score : null,
       eligibilityAnswers,
       intake,
       documents,
       statements,
     };
+  }
+
+  /**
+   * (#234) Membership, ON `onDate`, of every authority the rubric's
+   * `members_of` groups name (no read at all when none does, which is every
+   * rulebook stored before #234). An authority with NO recorded members (or
+   * one that does not exist) is left out, so its groups resolve to "could not
+   * tell", never to "nobody"; one whose recorded members are all past or
+   * future is an empty list (known: nobody current). A failed read is treated
+   * the same as no record (unknown), never as an empty membership.
+   * Public: the bulk re-assessment reads the same membership.
+   */
+  async membershipFor(rubric: Pick<VisaRubric, "criteria">, onDate: string): Promise<MembershipOnDate> {
+    const ids = membershipAuthorityIdsOf(rubric.criteria);
+    if (ids.length === 0) return {};
+    const load = this.deps.loadAuthorityMembers ?? defaultLoadAuthorityMembers;
+    const out: Record<string, string[] | null> = {};
+    for (const id of ids) {
+      try {
+        const recorded = await load(id);
+        out[id] = recorded.length === 0 ? null : membersOn(recorded, onDate).map((m) => m.countryCode);
+      } catch {
+        // Unknown, not "nobody": the bar is reported "could not be assessed".
+        out[id] = null;
+      }
+    }
+    return out;
   }
 
   /** The hash inputs for a loaded set and rubric version. */
@@ -377,6 +467,8 @@ export class AiCaseOfficerService {
       statements: loaded.statements.map((s) => ({ instanceId: s.instanceId, contentHash: s.contentHash })),
       eligibilityAnswers: loaded.eligibilityAnswers,
       intake: loaded.intake,
+      // (#234) Only with a copy: a changed copy changes the hash; old applications hash as before.
+      ...(loaded.factsFromCopy ? { applicantFacts: hashableFacts(loaded.facts) } : {}),
     };
   }
 
@@ -642,18 +734,30 @@ export class AiCaseOfficerService {
     // The intake answers are part of the input hash, so this is a pure function
     // of inputs the hash already covers. `fullRubric` is kept for what needs the
     // WHOLE rulebook (titles of could-not-assess rules, top issues, actions).
-    const split = splitByApplicability(fullRubric, loaded.intake);
-    const rubric: VisaRubric = { ...fullRubric, criteria: split.applicable };
-    const notAssessed = notAssessedItems(split);
-
+    // (#234) A rule triggered by what the applicant holds is decided from the
+    // application's copy of their facts, on the bar date (held documents must
+    // still be valid on it); a fact not stated is "could not be assessed".
     const now = this.deps.now();
+    const barDate = barDateOf(app, now);
+    const split = splitByApplicability(fullRubric, loaded.intake, { facts: loaded.facts, onDate: barDate });
+    const rubric: VisaRubric = { ...fullRubric, criteria: split.applicable };
+
+    // ---- stage 1 input (#234): bars decided from the applicant's facts ----
+    // `members_of` groups resolve through membership data on the application's
+    // START date; an authority with no recorded members is "could not tell".
+    // A bar code cannot decide because a fact is missing is reported "could not
+    // be assessed: we need to know ...", beside the rules split out above.
+    const membership = await this.membershipFor(rubric, startDateOf(app, now));
+    const bars = decideMandatoryBars(rubric, loaded.facts, barDate, membership);
+    const notAssessed = [...notAssessedItems(split), ...barNotAssessedItems(bars.unknown)];
+
     const score = loaded.eligibilityScore;
 
     // ---- stage 1: mandatory bars (no model call) ----
     // The bar is checked against the date the application was SUBMITTED when
     // there is one, else today (see barDateOf for why never startDate and why
     // a missing date never means "skip the bar").
-    const hits = mandatoryBarHits(rubric, loaded.nationality, barDateOf(app, now));
+    const hits = bars.hits;
     if (hits.length > 0) {
       const content = assembleContent({
         rubric,
@@ -788,7 +892,8 @@ export class AiCaseOfficerService {
           rubric: { criteria: batch, intentPolarity: rubric.intentPolarity },
           statementText: numbered ? numbered.text : statementText || null,
           otherStatementsText: otherText || null,
-          profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. Nationality code: ${loaded.nationality ?? "not given"}.`,
+          // (#234) Only the facts the rules need reach the model (see factsSummaryForModel).
+          profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. ${factsSummaryForModel(loaded.facts, rubric.criteria, barDate, rubric.criteria.some(isJudgedBar))}`,
           intakeSummary: JSON.stringify(loaded.intake),
           extractionSummary: extractions
             .filter((e) => e.readable && !e.failed && !e.suspicious)

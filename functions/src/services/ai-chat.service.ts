@@ -25,7 +25,7 @@ import {
 } from "./ai/llm-provider";
 import { DATA_ONLY_RULE, findBannedWording, findInjectionSignals, wrapUntrusted } from "./ai/prompt-safety";
 import { serializeFree, stripKeyDeep, type AssessmentTier } from "./ai/tier-serializer";
-import { applicableCriterionIds } from "./ai/rule-applicability";
+import { applicableCriterionIds, applicantContextOf } from "./ai/rule-applicability";
 
 // ============================================
 // ASK-ANYWHERE CHAT SERVICE (issue #45)
@@ -331,7 +331,8 @@ export function buildChatContext(
     // answers do not trigger are not placed in the prompt (they apply to them
     // no more than to anyone else): only rules that apply, plus any rule the
     // assessment itself referenced.
-    const applies = applicableCriterionIds(rubric, app.intake?.answers);
+    // (#234) Rules triggered by what the applicant holds read the application's copy of their facts (today).
+    const applies = applicableCriterionIds(rubric, app.intake?.answers, applicantContextOf(app, new Date().toISOString().slice(0, 10)));
     const ordered = [
       ...rubric.criteria.filter((c) => referenced.has(c.criterionId)),
       // An applicant is not shown judgement-criterion rules that no finding of theirs touches.

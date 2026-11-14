@@ -12,6 +12,8 @@ import type {
 } from "../../types/assessment";
 import type { LlmRequest } from "./llm-provider";
 import { AI_MODELS } from "./ai-models";
+// (#234) Group matching from what the applicant holds (pure).
+import { decideGroups, factsFromNationality, groupsOf, needWords, type FactNeed, type FactsForRules, type MembershipOnDate } from "./applicant-groups";
 import { DATA_ONLY_RULE, findBannedWording, findInjectionSignals, sanitizeUntrusted, wrapUntrusted, MAX_UNTRUSTED_CHARS } from "./prompt-safety";
 
 // ============================================
@@ -137,6 +139,15 @@ export interface AssessmentInputs {
   eligibilityAnswers: Record<string, unknown> | null;
   // Intake answers (#113). Empty until that feature stores them.
   intake: Record<string, unknown>;
+  // (#234) The application's copy of what the applicant holds, as rules read
+  // it (codes, kinds, issuers, dates; never the applicant's note). Only when
+  // the application HAS a copy: absent otherwise, so the hash of every
+  // application started before #234 is unchanged (no re-run is forced).
+  applicantFacts?: {
+    nationalities: string[];
+    residentialCountry: string | null;
+    heldDocuments: Array<{ kind: string; issuer: string | null; validUntil: string }> | null;
+  };
 }
 
 /** Stable JSON: object keys sorted at every depth, so the hash is order-free. */
@@ -185,34 +196,92 @@ function withinBar(criterion: AssessmentCriterion, applicationDate: string): boo
 }
 
 /**
- * The mandatory bars that apply to this applicant. An applicant matches a bar
- * when their nationality code is in `appliesTo.nationalities` and the date
- * falls inside `validFrom` / `validUntil`. Null nationality matches nothing.
- * (#222) Only the CODED members of a group can match here. Members listed in
- * `appliesTo.uncoded` (not nationalities) have no code to compare, so code
- * never decides them: `judgementCriteriaOf` puts such a bar, in full, to the
- * assessment model instead. They are never treated as matching nobody-silently
- * or everybody.
+ * (#234) What code decided about the mandatory bars for one applicant.
+ *  - `hits`:    bars the applicant is in the group of, on the bar date (a
+ *               refusal ground, decided by code alone).
+ *  - `unknown`: bars code could not decide because a fact the group needs is
+ *               not stated (or an authority has no recorded members): each is
+ *               reported "could not be assessed: we need to know ..." and is
+ *               never read as "applies" nor as "does not apply".
+ * A bar not in either list was decided "not in the group" from stated facts.
+ */
+export interface BarDecisions {
+  hits: AssessmentCriterion[];
+  unknown: Array<{ criterion: AssessmentCriterion; needs: FactNeed[] }>;
+}
+
+/**
+ * Decide every mandatory bar of a rubric for one applicant. An applicant is in
+ * a bar's group when ANY coded member matches (`groupsOf`: the stored
+ * `appliesTo.nationalities`, read as `nationality` members, plus #234
+ * `appliesTo.groups`: residence, holds, members_of) and the date falls inside
+ * `validFrom` / `validUntil`. Several nationalities: any one counts. An
+ * expired held document never matches.
+ *
+ * Kept from before #234, unchanged:
+ *  - (#222) only CODED members are decided here; members in
+ *    `appliesTo.uncoded` have no code, so `judgementCriteriaOf` puts such a
+ *    bar, in full, to the assessment model (never "nobody", never "everybody");
+ *  - (#248) a bar served WITHOUT its trigger (`notCodeDecided`) is never
+ *    decided here at all (neither a hit nor an "unknown"): it is judged in full.
+ * No model call, no network.
+ *
+ * @param membership members of each `members_of` authority on the
+ *   application's start date (missing = no recorded members = unknown)
+ */
+export function decideMandatoryBars(
+  rubric: Pick<VisaRubric, "criteria">,
+  facts: FactsForRules,
+  applicationDate: string,
+  membership: MembershipOnDate = {}
+): BarDecisions {
+  const out: BarDecisions = { hits: [], unknown: [] };
+  for (const c of rubric.criteria) {
+    if (c.kind !== "mandatory_bar" || c.appliesTo === undefined) continue;
+    // (#248) With no trigger, a group match alone would bar every applicant in the group,
+    // including ones the bar's condition does not cover: never decided by code.
+    if (c.notCodeDecided === true) continue;
+    // Outside the bar's own dates it does not run at all (as before).
+    if (!withinBar(c, applicationDate)) continue;
+    const groups = groupsOf(c.appliesTo);
+    // Only uncoded members: nothing for code to decide (the model judges it, #222).
+    if (groups.length === 0) continue;
+    const d = decideGroups(groups, facts, applicationDate, membership);
+    if (d.status === "match") out.hits.push(c);
+    else if (d.status === "unknown") out.unknown.push({ criterion: c, needs: d.needs });
+  }
+  return out;
+}
+
+/**
+ * The mandatory bars that apply to this applicant (the `hits` of
+ * `decideMandatoryBars`). Accepts a single nationality code, as before #234
+ * (null matches nothing), or the applicant's full facts.
  * No model call, no network.
  */
 export function mandatoryBarHits(
   rubric: Pick<VisaRubric, "criteria">,
-  nationality: string | null,
-  applicationDate: string
+  facts: string | null | FactsForRules,
+  applicationDate: string,
+  membership: MembershipOnDate = {}
 ): AssessmentCriterion[] {
-  if (!nationality) return [];
-  return rubric.criteria.filter(
-    (c) =>
-      c.kind === "mandatory_bar" &&
-      // (#248) A bar served WITHOUT its trigger (the check could not confirm which applicants
-      // it is put to) is never decided here: with no trigger, a nationality match alone would
-      // bar every applicant of that nationality, including ones its condition does not cover.
-      // It is judged in full instead (`judgementCriteriaOf`).
-      c.notCodeDecided !== true &&
-      c.appliesTo !== undefined &&
-      c.appliesTo.nationalities.includes(nationality) &&
-      withinBar(c, applicationDate)
-  );
+  const read = typeof facts === "string" || facts === null ? factsFromNationality(facts) : facts;
+  return decideMandatoryBars(rubric, read, applicationDate, membership).hits;
+}
+
+/**
+ * (#234) The "could not be assessed" items for bars code could not decide,
+ * in the shape of `notAssessedItems` (rule-applicability.ts), so they join the
+ * same insufficient-information list. Plain words, no verdict.
+ */
+export function barNotAssessedItems(unknown: BarDecisions["unknown"]): Array<{ criterionId: string; title: string; reason: string; notAssessed: "missing_fact"; layerKey?: string }> {
+  return unknown.map((u) => ({
+    criterionId: u.criterion.criterionId,
+    title: u.criterion.title,
+    reason: `could not be assessed: we need to know ${needWords(u.needs)}`,
+    notAssessed: "missing_fact" as const,
+    ...(u.criterion.layerKey ? { layerKey: u.criterion.layerKey } : {}),
+  }));
 }
 
 // ============================================

@@ -121,6 +121,9 @@ export interface RubricExtractionJob extends RulebookKeyFields {
   model: string;
   promptVersion: string;
   routeName: string;
+  // (#234) The bloc / treaty authorities the drafting message lists, pinned when the job
+  // starts so every invocation sends the same requests. Absent on jobs started before #234 (= none).
+  groupAuthorities?: { id: string; name: string }[];
   pinned: RunSettingsPin & { stepAttemptsMax: number };
   plan: PlannedSource[];
   // Fingerprint of every chunk (`sourceId#chunkIndex#characters`), so a change

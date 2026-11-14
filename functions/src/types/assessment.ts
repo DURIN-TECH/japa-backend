@@ -109,7 +109,8 @@ export interface InsufficientItem {
   // let us tie to a question). What is missing is an intake answer, not a
   // document, so no evidence request or proposed action is made for it, and it
   // is never one of the free tier's top issues.
-  notAssessed?: "unanswered" | "no_trigger";
+  // (#234) `missing_fact`: a rule decided from what the applicant holds needs a fact they have not stated.
+  notAssessed?: "unanswered" | "no_trigger" | "missing_fact";
   // (#233) The rulebook layer the rule came from (its rulebook key), set only
   // when the application runs on a stack of more than one layer. Copied from
   // the rubric in code, never from model text.
