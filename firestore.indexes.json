@@ -1289,6 +1289,16 @@
       ]
     },
     {
+      "collectionGroup": "applications",
+      "fieldPath": "routeStack",
+      "indexes": [
+        {
+          "arrayConfig": "CONTAINS",
+          "queryScope": "COLLECTION"
+        }
+      ]
+    },
+    {
       "collectionGroup": "scrapeRuns",
       "fieldPath": "expireAt",
       "ttl": true,

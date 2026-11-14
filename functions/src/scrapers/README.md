@@ -426,6 +426,43 @@ version keeps serving, admins are alerted). Admins can still reject, roll back
   (`?dryRun=true` writes nothing) or
   `npm run publish:rubric -- --project <id> --route <routeKey> --version <n> [--dry-run] [--skip-checker]`.
 
+## The layer check: a country's own layer against its shared layer(s) (`rubric-layer-check.ts`; issue #233, P4b of #228)
+
+A route that inherits a shared (bloc / treaty) route is served as a STACK
+(`rubric-stack.ts`). After a country's OWN layer drafts, and only when the
+automatic publisher is about to publish it (the last step of the pipeline, so a
+held draft spends nothing on it), an independent reader compares each of its
+rules with the approved shared layer's rules on the same subject.
+
+- **Prompt**: `LAYER_CHECK_SYSTEM_PROMPT`, version `LAYER_CHECK_PROMPT_VERSION`
+  (`layer-check-2026-11-14.1`), recorded on every run. Role `verification` (the
+  checker's independent reader, never the extractor's model).
+- **Evidence**: ONLY the two verbatim quotes, under batch-local ids. Closed
+  answers: per national rule, the shared ids it shares a subject with and one of
+  `same_requirement | adds_to | disagrees | unsure`, re-validated in code (any
+  other shape: `output_invalid`). The model never writes or changes a rule.
+- **What code makes of it** (`decideLayerLinks`): `disagrees` is a
+  `layerConflicts` entry (both quotes and URLs); `same_requirement` is a
+  `restates` link only when it is the rule's single twin, the rule has no
+  `disagrees`/`unsure` answer, and `linkRefusal` passes (same kind,
+  applicability, trigger presence, coded check and bar groups; the national rule
+  not more severe). Refused links and `unsure` pairs are recorded; nothing else.
+- **Not checked**: over a cap (refused before any call), a provider failure, a
+  refusal or an unusable answer give `status: "not_checked"` with the reason and
+  the spend so far, and NOTHING is linked or flagged (repeats stay duplicated).
+- **Spend**: hard caps per run (`DEFAULT_LAYER_CHECK_LIMITS`: 40 calls, 400,000
+  tokens), lowered further by the publish settings' `checkerMaxRequestsPerRun` and
+  `checkerRequestTimeoutMs`. One run per version (the pipeline's run record).
+- **Written** with the automatic approval as `layerCheck` + `layerConflicts`
+  (planner-writable review fields), shown in `GET /admin/rubrics/:id`, and as a
+  `layer_check` gate line of the run record. It NEVER holds a draft.
+- **Read side**: the merge folds an honoured link (the national rule leaves the
+  merged `criteria`, is listed on its twin's `restatedBy` with its own quote and
+  URL, its only-own question is not asked again, its document items name the
+  twin) and tags both sides of a conflict (`layerConflictWith`). A link is
+  honoured only while the twin is served with the compared quote and the guards
+  still hold. A single-layer route is untouched.
+
 ## Independent AI check of every rule (`rubric-checker.ts`, `rubric-checker-prompt.ts`; issue #202, part B of #200)
 
 A second model, with its own prompt (`CHECKER_PROMPT_VERSION`, no text shared

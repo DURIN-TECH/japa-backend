@@ -686,6 +686,13 @@ export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intent
   // (#203) The automatic approval's question plan, null when there is none.
   // The lists above stay the FULL, unfiltered draft; the plan is shown beside them.
   questionPlan: VisaRubric["questionPlan"] | null;
+  // (#233 P4b) The layer check of a country's own layer against the shared
+  // layer(s) its route inherits (null when none ran: a single-layer route, a
+  // shared layer, or a version approved by hand), and every disagreement it
+  // found, both quotes and URLs (empty when none). Rules data only: no
+  // application or agency data is ever in either.
+  layerCheck: VisaRubric["layerCheck"] | null;
+  layerConflicts: NonNullable<VisaRubric["layerConflicts"]>;
   // What the PROPOSED exclusion set (query `previewExcluded`) would remove,
   // or what the stored one did remove; null when there is nothing to count.
   exclusionPreview: ExclusionPreview | null;
@@ -1069,7 +1076,8 @@ export interface SystemDecisionExtras {
  * by this file only and can never come from a caller.
  */
 // (#223) `ruleRepairs`: the replacements of protected rules the automatic check re-drafted once and confirmed.
-export const PLANNER_WRITABLE_FIELDS: readonly string[] = ["questionPlan", "ruleRepairs"];
+// (#233 P4b) `layerCheck` + `layerConflicts`: the layer check of an own layer against its shared layer(s).
+export const PLANNER_WRITABLE_FIELDS: readonly string[] = ["questionPlan", "ruleRepairs", "layerCheck", "layerConflicts"];
 
 /** Validate the planner's fields against the allow-list; a key outside it throws (never silently dropped). */
 function plannerReviewFields(raw: Record<string, unknown> | undefined): Partial<Pick<VisaRubric, (typeof RUBRIC_REVIEW_FIELDS)[number]>> {
@@ -1379,6 +1387,8 @@ export class RubricReviewService {
       excludedCriterionIds: rubric.excludedCriterionIds ?? null,
       exclusionNote: rubric.exclusionNote ?? null,
       questionPlan: rubric.questionPlan ?? null,
+      layerCheck: rubric.layerCheck ?? null,
+      layerConflicts: rubric.layerConflicts ?? [],
       exclusionPreview,
       sourceSnapshots: (rubric.sourceSnapshots ?? []).map((s) => ({
         sourceId: s.sourceId,

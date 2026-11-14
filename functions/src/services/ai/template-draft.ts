@@ -4,6 +4,7 @@ import { AnthropicNotConfiguredError } from "./anthropic-client";
 import { readAiSettings } from "./ai-settings";
 import { DATA_ONLY_RULE, findBannedWording, findInjectionSignals, wrapUntrusted } from "./prompt-safety";
 import { rubricStore } from "../../scrapers";
+import { defaultRulebookStack, rulebookFor } from "./application-rulebook";
 import { collections } from "../../utils/firebase";
 import type { Application, ProseMirrorDoc, TemplateCategory } from "../../types";
 
@@ -401,8 +402,12 @@ export function buildDraftDocument(
 /** Everything the service needs from outside, so a test can replace it. */
 export interface TemplateDraftDeps {
   provider: LlmProvider;
-  /** Approved rubric lookup (rubricStore.getApprovedRubric). Null when none. */
-  evidenceFor(countryCode: string, visaTypeId: string): Promise<DraftEvidenceItem[]>;
+  /**
+   * Approved rubric lookup: the evidence items of the application's rulebook.
+   * (#233 P4b) `routeStack` is the application's stored stack, so a route with
+   * a shared layer also covers the shared layer's document items.
+   */
+  evidenceFor(countryCode: string, visaTypeId: string, routeStack?: string[]): Promise<DraftEvidenceItem[]>;
   /** Count one draft against the agent's and the platform's daily caps; throws RATE_LIMITED. */
   claimQuota(uid: string, now: Date): Promise<void>;
 }
@@ -417,9 +422,13 @@ export interface DraftRequest {
 }
 
 /** Real evidence lookup: the approved rubric's evidence items, capped. A route with none gets []. */
-async function realEvidenceFor(countryCode: string, visaTypeId: string): Promise<DraftEvidenceItem[]> {
+async function realEvidenceFor(countryCode: string, visaTypeId: string, routeStack?: string[]): Promise<DraftEvidenceItem[]> {
   try {
-    const rubric = await rubricStore.getApprovedRubric(countryCode, visaTypeId);
+    // (#233 P4b) The merged STACK; exactly `getApprovedRubric` for a route with no inheritance.
+    const rubric = await rulebookFor(
+      { countryCode, visaTypeId, ...(routeStack ? { routeStack } : {}) },
+      { getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc, vt), getRulebookStack: (a) => defaultRulebookStack(a) }
+    );
     if (!rubric) return [];
     return rubric.evidenceItems.slice(0, MAX_EVIDENCE_ITEMS).map((e) => ({ title: e.title, party: String(e.party) }));
   } catch {
@@ -477,7 +486,7 @@ export class TemplateDraftService {
       }
       : null;
     // What to cover: the approved rubric's evidence items for THIS application's route.
-    const evidence = app ? await this.deps.evidenceFor(app.countryCode, app.visaTypeId) : [];
+    const evidence = app ? await this.deps.evidenceFor(app.countryCode, app.visaTypeId, app.routeStack) : [];
 
     const user = buildDraftUserMessage({ description: req.description, category: req.category, facts, evidence });
 

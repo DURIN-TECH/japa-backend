@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { verifyAdmin, verifyAuth } from "../middleware/auth";
 import { requireRubricAdmin, rubricReviewController } from "../controllers/rubric-review.controller";
+import { rubricFanOutController } from "../controllers/rubric-fan-out.controller";
 
 // ============================================
 // Routes mounted at /admin/rubrics (issue #125)
@@ -39,6 +40,11 @@ const adminOnly = [verifyAuth, requireRubricAdmin, verifyAdmin];
 // `/:id` so it is not captured by it.
 adminRubricRoutes.get("/publish-settings", ...adminOnly, (req, res) => rubricReviewController.getPublishSettings(req, res));
 adminRubricRoutes.patch("/publish-settings", ...adminOnly, (req, res) => rubricReviewController.patchPublishSettings(req, res));
+// (#233 P4b) A shared layer's re-assessment fan-out: the estimate waits for
+// this confirmation before anything is queued or spent. Registered BEFORE
+// `/:id` so `fan-outs` is never captured as a version id.
+adminRubricRoutes.get("/fan-outs", ...adminOnly, (req, res) => rubricFanOutController.list(req, res));
+adminRubricRoutes.post("/fan-outs/:id/confirm", ...adminOnly, (req, res) => rubricFanOutController.confirm(req, res));
 // The queue: versions by review status (default pending_review), newest first.
 adminRubricRoutes.get("/", ...adminOnly, (req, res) => rubricReviewController.list(req, res));
 // One version: criteria with `staleCitation`, diff against the serving

@@ -127,6 +127,9 @@ export type { RulebookTarget, RulebookTargetInput } from "./rubric/rubric-key";
  */
 export { loadRulebookStack, mergeRulebookStack, stackFromReads, layerVersionsOf, sameStackVersions, scopedId, STACK_ID_SEPARATOR } from "./rubric/rubric-stack";
 export type { RulebookStack, StackLayerRead, StackLayerReader, StackUnusableReason } from "./rubric/rubric-stack";
+// (#233 P4b) The layer check: an own layer's rules against its shared layer(s) (restates links, conflicts).
+export { RubricLayerChecker, runLayerCheck, decideLayerLinks, linkRefusal, notCheckedRecord, LAYER_CHECK_PROMPT_VERSION, DEFAULT_LAYER_CHECK_LIMITS } from "./rubric/rubric-layer-check";
+export type { LayerCheckInput, LayerCheckLimits, LayerCheckOutcome, SharedLayerRules } from "./rubric/rubric-layer-check";
 export { planStack } from "./rubric/rubric-question-plan";
 export type { StackPlanLayer, StackPlanProblem, StackPlanResult } from "./rubric/rubric-question-plan";
 /** Structural rubric validator (the review API re-runs it before approving). */

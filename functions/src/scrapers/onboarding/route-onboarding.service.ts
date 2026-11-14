@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
-import { collections, db, subcollections } from "../../utils/firebase";
+import { collectionGroups, collections, db, subcollections } from "../../utils/firebase";
 import type { GuidanceSource } from "../guidance/types";
 import type { GuidanceCrawlSummary } from "../guidance/guidance-crawl.service";
 import { deriveVisaId } from "../visa-catalog/visa-catalog-ids";
@@ -171,6 +171,10 @@ export interface OnboardingDeps {
   loadAlertConfig: () => Promise<ScrapeAlertsConfig>;
   raiseAlerts: (evals: RuleEvaluation[], config?: ScrapeAlertsConfig) => Promise<unknown>;
   appUrl: () => string;
+  // (#233 P4b) A shared route (`sharedRoutes/{id}`), for a run on a shared layer. Null when there is none.
+  getSharedRoute: (id: string) => Promise<{ id: string; issuingAuthorityId: string; status: string } | null>;
+  // (#233 P4b) How many visa records inherit a shared route today (the shared run's end checklist).
+  countMemberRecords: (sharedRouteId: string) => Promise<number>;
 }
 
 /** The lease was taken over by another worker, or the run ended: stop touching it. */
@@ -244,6 +248,31 @@ function currentStep(steps: readonly RunStep[]): RunStep | undefined {
   return steps.find((s) => s.status !== "done" && s.status !== "skipped");
 }
 
+/** (#233 P4b) True for a run on a SHARED layer (a bloc's or treaty's rulebook). */
+function isSharedRun(run: Pick<RouteOnboardingRun, "layer">): boolean {
+  return run.layer === "shared";
+}
+
+/** (#233 P4b) The issuing authority of a run (a run from before P4b has only `countryCode`). */
+function authorityOf(run: Pick<RouteOnboardingRun, "authorityId" | "countryCode">): string {
+  return run.authorityId ?? (run.countryCode as string);
+}
+
+/** (#233 P4b) The country of a COUNTRY run. Never called for a shared layer's run (no country visa record is filed). */
+function countryOf(run: Pick<RouteOnboardingRun, "countryCode" | "runId">): string {
+  if (!run.countryCode) throw new Error(`run ${run.runId} has no country (a shared layer's run files no country visa record)`);
+  return run.countryCode;
+}
+
+/**
+ * (#233 P4b) The drafting job's target: a country's route by its historic pair
+ * (exactly as before), a shared layer by `{authorityId, routeSlug}`, so its
+ * rulebook is drafted under `{authorityId}_{routeSlug}`.
+ */
+function jobTargetOf(run: RouteOnboardingRun): { countryCode: string; visaTypeId: string } | { authorityId: string; routeSlug: string } {
+  return isSharedRun(run) ? { authorityId: authorityOf(run), routeSlug: run.routeSlug ?? run.visaTypeId } : { countryCode: countryOf(run), visaTypeId: run.visaTypeId };
+}
+
 /** Summaries a registered route is found from. */
 interface RegisteredRoute {
   page: VisaSourcePage;
@@ -277,6 +306,8 @@ export class RouteOnboardingService implements RedraftGuard {
       loadAlertConfig: o.loadAlertConfig ?? defaultLoadAlertConfig,
       raiseAlerts: o.raiseAlerts ?? defaultRaiseAlerts,
       appUrl: o.appUrl ?? (() => (process.env.APP_URL || "").replace(/\/+$/, "")),
+      getSharedRoute: o.getSharedRoute ?? defaultGetSharedRoute,
+      countMemberRecords: o.countMemberRecords ?? defaultCountMemberRecords,
     };
   }
 
@@ -339,15 +370,19 @@ export class RouteOnboardingService implements RedraftGuard {
    * POST /admin/route-onboarding. Creates a run in `preparing`.
    *   503 SETTINGS_UNAVAILABLE / ONBOARDING_DISABLED, 404 ROUTE_NOT_REGISTERED,
    *   409 RUN_ACTIVE (with the active run's id), 429 DAILY_LIMIT_REACHED,
-   *   422 SHARED_LAYER_NOT_READY (a route registered under a bloc or treaty).
+   *   422 SHARED_ROUTE_NOT_FOUND / SHARED_ROUTE_NOT_ACTIVE (a bloc or treaty
+   *   route whose shared route is missing, another authority's, or retired).
    *
    * Issue #232: `authorityId` is the route's issuing authority. The run key
    * is the rulebook key `{authorityId}_{visaTypeId}` (buildRulebookKey): for a
-   * country it is exactly the old `{countryCode}_{visaTypeId}`. A route
-   * registered under a BLOC or TREATY is found, but no run is started for it
-   * yet: the run's later steps file a country visa record and draft a country
-   * rulebook, and the shared-layer versions of those steps are P4 of #228.
-   * Refusing here (before any write or spend) is the safe reading.
+   * country it is exactly the old `{countryCode}_{visaTypeId}`.
+   * (#233 P4b) A route registered under a BLOC or TREATY starts a run on the
+   * SHARED layer: `visaTypeId` is the shared route's id, which must exist, be
+   * the authority's own and be active (checked here, before any write or
+   * spend, and again at `check_setup`). The run files NO country visa record
+   * (its `read_visa_page` step is skipped) and drafts the rulebook under
+   * `{authorityId}_{routeSlug}`. A member country's own layer is an ordinary
+   * country run, as before.
    * The head doc, the active-run check, the daily count and the new run are one
    * transaction, so a double click opens ONE run: the second click finds it.
    */
@@ -367,15 +402,11 @@ export class RouteOnboardingService implements RedraftGuard {
     if (!registered) {
       throw new OnboardingError("ROUTE_NOT_REGISTERED", 404, "That route is not registered. Register its visa page and rule pages first.");
     }
-    if (idCheck.ok && idCheck.shape !== "country") {
-      throw new OnboardingError(
-        "SHARED_LAYER_NOT_READY",
-        422,
-        "This route belongs to a bloc or treaty. Its sources are registered, but drafting a shared rulebook is not available yet, so no run was started."
-      );
+    const shared = idCheck.ok && idCheck.shape !== "country";
+    if (shared) {
+      const problem = await this.sharedRouteProblem(authorityId, visaTypeId);
+      if (problem) throw new OnboardingError(problem.code, 422, problem.plain);
     }
-    // From here on the authority is a country: the run keeps its `countryCode` field.
-    const countryCode = authorityId;
     const nowMs = this.d.clock();
     const now = Timestamp.fromMillis(nowMs);
     const dayStart = Timestamp.fromMillis(Math.floor(nowMs / 86_400_000) * 86_400_000);
@@ -396,23 +427,40 @@ export class RouteOnboardingService implements RedraftGuard {
       }
       const seq = (head?.lastSeq ?? 0) + 1;
       const runId = `${routeKey}__r${seq}`;
-      const run = this.newRun(runId, routeKey, countryCode, visaTypeId, uid, now);
+      const run = this.newRun(runId, routeKey, authorityId, visaTypeId, shared, uid, now);
       tx.create(this.runRef(runId), run as unknown as Record<string, unknown>);
       // (#225) Spread the stored head first: it may carry the automatic
       // re-draft's claims and a pending deferral, which must survive a new run.
       const nextHead: RouteOnboardingHead = { ...(head ?? {}), routeKey, lastSeq: seq, activeRunId: runId, updatedAt: now };
       tx.set(headRef, nextHead as unknown as Record<string, unknown>);
-      appendRegistryAudit(tx, { action: "onboarding_started", actorUid: uid, at: now, targetType: "onboardingRun", targetId: runId, before: null, after: { routeKey, countryCode, visaTypeId } });
+      appendRegistryAudit(tx, { action: "onboarding_started", actorUid: uid, at: now, targetType: "onboardingRun", targetId: runId, before: null, after: shared ? { routeKey, authorityId, routeSlug: visaTypeId, layer: "shared" } : { routeKey, countryCode: authorityId, visaTypeId } });
       return run;
     });
     console.log(`${TAG} ${created.runId}: started`);
     return created;
   }
 
-  /** A blank run. */
-  private newRun(runId: string, routeKey: string, countryCode: string, visaTypeId: string, uid: string, now: Timestamp): RouteOnboardingRun {
+  /**
+   * (#233 P4b) Why a shared layer's run cannot go ahead, or null: the shared
+   * route `routeSlug` must exist, be owned by `authorityId` and be active.
+   */
+  private async sharedRouteProblem(authorityId: string, routeSlug: string): Promise<{ code: "SHARED_ROUTE_NOT_FOUND" | "SHARED_ROUTE_NOT_ACTIVE"; plain: string } | null> {
+    const route = await this.d.getSharedRoute(routeSlug);
+    if (!route || route.issuingAuthorityId !== authorityId) {
+      return { code: "SHARED_ROUTE_NOT_FOUND", plain: "This route belongs to a bloc or treaty, but there is no shared route with this id for that authority. Create the shared route first. No run was started." };
+    }
+    if (route.status !== "active") return { code: "SHARED_ROUTE_NOT_ACTIVE", plain: "The shared route is retired, so no rulebook is drafted for it. No run was started." };
+    return null;
+  }
+
+  /** A blank run. (#233 P4b) A shared layer's run has no `countryCode` and is marked `layer: "shared"`. */
+  private newRun(runId: string, routeKey: string, authorityId: string, visaTypeId: string, shared: boolean, uid: string, now: Timestamp): RouteOnboardingRun {
     return {
-      runId, routeKey, countryCode, visaTypeId,
+      runId, routeKey,
+      ...(shared ? { layer: "shared" as const } : { countryCode: authorityId }),
+      visaTypeId,
+      authorityId,
+      routeSlug: visaTypeId,
       status: "preparing",
       summary: STATUS_PLAIN.preparing,
       steps: initialSteps(),
@@ -586,14 +634,32 @@ export class RouteOnboardingService implements RedraftGuard {
 
   /** The end checklist, read from the live documents so it is "pending until true". Never throws. */
   async checklistOf(run: RouteOnboardingRun): Promise<ChecklistItem[]> {
+    // (#233 P4b) A shared layer has no country visa record and no country to
+    // make visible: what is left is linking the member countries' records.
+    if (isSharedRun(run)) {
+      let members = 0;
+      try {
+        members = await this.d.countMemberRecords(run.routeSlug ?? run.visaTypeId);
+      } catch {
+        // Shown as pending: the safe reading.
+      }
+      return [
+        {
+          id: "link_member_records",
+          plain: members > 0 ? `${members} member visa record${members === 1 ? "" : "s"} inherit this shared route.` : "Link the member countries' visa records to this shared route (Shared routes screen); until then no applicant uses its rulebook.",
+          visaTypeId: run.visaTypeId,
+          done: members > 0,
+        },
+      ];
+    }
     let visaActive = false;
     let visaExists = false;
     let countrySupported = false;
     try {
-      const visa = await subcollections.visaTypes(run.countryCode).doc(run.visaTypeId).get();
+      const visa = await subcollections.visaTypes(countryOf(run)).doc(run.visaTypeId).get();
       visaExists = visa.exists;
       visaActive = visa.exists && (visa.data() as { isActive?: boolean }).isActive === true;
-      const country = await collections.countries.doc(run.countryCode).get();
+      const country = await collections.countries.doc(countryOf(run)).get();
       countrySupported = country.exists && (country.data() as { isSupported?: boolean }).isSupported === true;
     } catch {
       // Shown as pending: the safe reading.
@@ -608,7 +674,7 @@ export class RouteOnboardingService implements RedraftGuard {
       {
         id: "make_country_visible",
         plain: "Make the country visible to applicants on the Countries screen (isSupported is off until you do).",
-        countryCode: run.countryCode,
+        countryCode: countryOf(run),
         done: countrySupported,
       },
     ];
@@ -831,10 +897,16 @@ export class RouteOnboardingService implements RedraftGuard {
     const loaded = await this.d.loadSettings();
     if (loaded.readError) return this.failChange(run, "Settings could not be read, so the run stopped before reading anything.");
     if (!loaded.settings.enabled) return this.failChange(run, "Route onboarding was switched off, so the run stopped before reading anything.");
-    const reg = await this.findRegistered(run.countryCode, run.visaTypeId);
+    const reg = await this.findRegistered(authorityOf(run), run.visaTypeId);
     if (!reg) return this.failChange(run, "The route is no longer registered, so the run stopped.");
-    const country = await collections.countries.doc(run.countryCode).get();
-    if (!country.exists) return this.failChange(run, "The country record does not exist, so the visa page cannot be filed. Register the route again.");
+    if (isSharedRun(run)) {
+      // (#233 P4b) The shared route must still exist, be the authority's and be active.
+      const problem = await this.sharedRouteProblem(authorityOf(run), run.routeSlug ?? run.visaTypeId);
+      if (problem) return this.failChange(run, problem.plain.replace(" No run was started.", " The run stopped before reading anything."));
+    } else {
+      const country = await collections.countries.doc(countryOf(run)).get();
+      if (!country.exists) return this.failChange(run, "The country record does not exist, so the visa page cannot be filed. Register the route again.");
+    }
     // The visa source and every rule page must be allowed to be read now.
     if (reg.source.status === "retired" || reg.source.status === "paused") return this.failChange(run, `The visa page's source is ${reg.source.status}. Resume it, then start a new run.`);
     if (reg.guidance.length === 0) return this.failChange(run, "No rule pages are registered for this route. Register at least one, then start a new run.");
@@ -843,8 +915,18 @@ export class RouteOnboardingService implements RedraftGuard {
       if (g.data.status === "paused") return this.failChange(run, `The rule page "${g.data.title}" is paused. Resume it, then start a new run. Nothing was extracted.`);
       if (!["verified", "partial", "registered"].includes(String(g.data.verificationStatus))) return this.failChange(run, `The rule page "${g.data.title}" is not verified for reading. Nothing was extracted.`);
     }
+    const setupDone = withStep(run.steps, "check_setup", { status: "done", detail: `${reg.guidance.length} rule page${reg.guidance.length === 1 ? "" : "s"} and the visa page are registered and ready.` }, now);
+    if (isSharedRun(run)) {
+      // (#233 P4b) No country visa record is filed for a shared layer: each member's own record inherits it.
+      const skipped = withStep(setupDone, "read_visa_page", { status: "skipped", detail: "Not needed: a shared route files no country visa record; each member country's own record inherits it." }, now);
+      return {
+        steps: withStep(skipped, "read_rule_pages", { status: "running", detail: "" }, now),
+        links: { ...run.links, visaSourceUrl: reg.page.url, guidanceSourceIds: reg.guidance.map((g) => g.id) },
+        wake: true,
+      };
+    }
     return {
-      steps: withStep(withStep(run.steps, "check_setup", { status: "done", detail: `${reg.guidance.length} rule page${reg.guidance.length === 1 ? "" : "s"} and the visa page are registered and ready.` }, now), "read_visa_page", { status: "running", detail: "" }, now),
+      steps: withStep(setupDone, "read_visa_page", { status: "running", detail: "" }, now),
       links: { ...run.links, visaSourceUrl: reg.page.url, guidanceSourceIds: reg.guidance.map((g) => g.id) },
       wake: true,
     };
@@ -854,8 +936,8 @@ export class RouteOnboardingService implements RedraftGuard {
 
   private async actVisaPage(run: RouteOnboardingRun): Promise<Change> {
     const now = this.now();
-    const visaRef = subcollections.visaTypes(run.countryCode).doc(run.visaTypeId);
-    const reg = await this.findRegistered(run.countryCode, run.visaTypeId);
+    const visaRef = subcollections.visaTypes(countryOf(run)).doc(run.visaTypeId);
+    const reg = await this.findRegistered(countryOf(run), run.visaTypeId);
     if (!reg) return this.failChange(run, "The route is no longer registered, so the run stopped.");
     const done = (detail: string): Change => ({
       steps: withStep(withStep(run.steps, "read_visa_page", { status: "done", detail }, now), "read_rule_pages", { status: "running", detail: "" }, now),
@@ -872,13 +954,13 @@ export class RouteOnboardingService implements RedraftGuard {
     if (await exists()) return done("The visa record already exists; the weekly visa crawl keeps it up to date. It waits for approval in Visa Review.");
     // `force` only when the page was read before but left no record: otherwise the
     // content gate reads this new page and leaves the country's other pages alone.
-    const facts = await this.d.crawlVisa(run.countryCode, Boolean(reg.page.lastContentHash));
+    const facts = await this.d.crawlVisa(countryOf(run), Boolean(reg.page.lastContentHash));
     if (await exists()) return done("The visa page was read. The visa record was created and waits for approval in Visa Review; it stays hidden from applicants.");
     if (facts.sourcesLeased > 0) return this.waitChange(run, "read_visa_page", "visa", "another crawl of this country is running.");
     if (facts.budgetHardStop || facts.extractionsSkippedBudget > 0) {
       return this.failChange(run, "The monthly budget for reading visa pages is spent, so the visa page was not read. Nothing was extracted.");
     }
-    const fresh = await this.findRegistered(run.countryCode, run.visaTypeId);
+    const fresh = await this.findRegistered(countryOf(run), run.visaTypeId);
     const err = fresh?.page.lastError;
     if (err) return this.failChange(run, `The visa page could not be read: ${clip(err, 300)} Nothing was extracted.`);
     return this.failChange(run, "The visa page was read but produced no visa record (the page may not describe a visa route). Nothing was extracted.");
@@ -956,8 +1038,8 @@ export class RouteOnboardingService implements RedraftGuard {
   /** The drafting job's DRY plan, as a result the run can use (no model call is made here). */
   private async dryPlan(run: RouteOnboardingRun): Promise<StartJobResult> {
     return this.d.jobs().startJob({
-      countryCode: run.countryCode,
-      visaTypeId: run.visaTypeId,
+      // (#233 P4b) A shared layer drafts under {authorityId}_{routeSlug}.
+      ...jobTargetOf(run),
       sourceIds: run.links.guidanceSourceIds,
       dryRun: true,
       trigger: "manual",
@@ -1099,8 +1181,7 @@ export class RouteOnboardingService implements RedraftGuard {
 
       // ---- action 3: start the drafting job (deterministic id: a repeat is `existing`) ----
       const started = await this.d.jobs().startJob({
-        countryCode: run.countryCode,
-        visaTypeId: run.visaTypeId,
+        ...jobTargetOf(run),
         sourceIds: run.links.guidanceSourceIds,
         trigger: "manual",
         requestedBy: confirmation.by,
@@ -1477,7 +1558,8 @@ export class RouteOnboardingService implements RedraftGuard {
 
 /** One item of the end checklist (not blocking; read from live documents). */
 export interface ChecklistItem {
-  id: "approve_visa_record" | "make_country_visible";
+  // (#233 P4b) `link_member_records`: the one item of a shared layer's run.
+  id: "approve_visa_record" | "make_country_visible" | "link_member_records";
   plain: string;
   done: boolean;
   visaTypeId?: string;
@@ -1497,6 +1579,19 @@ function errClass(err: unknown): string {
 }
 
 // ---------- Default dependencies (resolved lazily: import-cycle rule of scrapers/index.ts) ----------
+
+/** (#233 P4b) A shared route, read directly (no import of the shared-routes module, which imports this one through the scrapers index). */
+async function defaultGetSharedRoute(id: string): Promise<{ id: string; issuingAuthorityId: string; status: string } | null> {
+  if (!/^[a-z0-9][a-z0-9-]{2,59}$/.test(id)) return null;
+  const snap = await collections.sharedRoutes.doc(id).get();
+  return snap.exists ? (snap.data() as { id: string; issuingAuthorityId: string; status: string }) : null;
+}
+
+/** (#233 P4b) Visa records inheriting a shared route today (a count aggregation). */
+async function defaultCountMemberRecords(sharedRouteId: string): Promise<number> {
+  const agg = await collectionGroups.visaTypes().where("inheritsFrom", "array-contains", { sharedRouteId }).count().get();
+  return agg.data().count;
+}
 
 async function defaultCrawlVisa(countryCode: string, force: boolean): Promise<VisaCrawlFacts> {
   const { visaCatalogCrawlService } = await import("../visa-catalog/visa-catalog-crawl.service");

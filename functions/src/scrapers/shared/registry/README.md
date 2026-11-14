@@ -95,8 +95,11 @@ strict (unknown keys: 400). Errors are `{ success:false, error, message, ... }`.
   `countryCode` or `nextCrawlAt`: the visa crawl files records under a country,
   so it never crawls such a source (it also skips any non-country id by hand).
   Route onboarding finds the route (`visaSources/{authorityId}`, guidance by
-  `jurisdiction`) but answers 422 `SHARED_LAYER_NOT_READY` until shared
-  rulebooks land (P4). Run keys are `buildRulebookKey(authorityId, visaId)`.
+  `jurisdiction`) and (#233 P4b) runs it as a SHARED layer: the shared route
+  `visaId` must exist, be the authority's own and be active (else 422
+  `SHARED_ROUTE_NOT_FOUND` / `SHARED_ROUTE_NOT_ACTIVE`); no country visa record
+  is filed and the rulebook is drafted under `{authorityId}_{visaId}`. Run keys
+  are `buildRulebookKey(authorityId, visaId)`.
 - **Membership quotes** (authorities API): the quote's host must be confirmed
   for the bloc itself, the member being saved, or a current member.
 - **Documents from before #232** carry `countryCode` instead of `authorityId`.

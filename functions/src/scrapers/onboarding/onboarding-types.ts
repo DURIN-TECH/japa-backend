@@ -182,8 +182,20 @@ export interface Confirmation {
 export interface RouteOnboardingRun {
   runId: string;
   routeKey: string;
-  countryCode: string;
+  // The country of a country's route. (#233 P4b) ABSENT on a run for a SHARED
+  // layer (a bloc's or treaty's rulebook): that run files no country visa
+  // record and drafts the rulebook under `{authorityId}_{routeSlug}`.
+  countryCode?: string;
+  // The visa id (a country's route) or the shared route id (a shared layer):
+  // the same value as `routeSlug`, kept under this name for the portal.
   visaTypeId: string;
+  // (#233 P4b) The issuing authority and route slug of the rulebook drafted
+  // (for a country these equal `countryCode` and `visaTypeId`). Absent on runs
+  // started before P4b (read them from `countryCode` / `visaTypeId`).
+  authorityId?: string;
+  routeSlug?: string;
+  // (#233 P4b) "shared" on a run for a bloc's or treaty's shared layer; absent on a country's route.
+  layer?: "shared";
   status: RunStatus;
   // One plain sentence about where the run stands (the portal headline).
   summary: string;

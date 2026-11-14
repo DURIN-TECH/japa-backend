@@ -668,8 +668,8 @@ describe("wording and records (#223)", () => {
     // #223 (EXPLICIT extension): the replacements are WRITTEN by the pipeline (through the approval transaction's
     // planner fields), VALIDATED by the review service, APPLIED by the read-side filter, and typed in the types file.
     assert.deepEqual(users, [path.join("scrapers", "rubric", "rubric-checker.ts"), path.join("scrapers", "rubric", "rubric-exclusions.ts"), path.join("scrapers", "rubric", "rubric-repair.ts"), path.join("services", "rubric-auto-publish.service.ts"), path.join("services", "rubric-review.service.ts"), path.join("types", "rubric.ts")]);
-    // The planner's allow-list names exactly the two fields.
-    assert.deepEqual([...PLANNER_WRITABLE_FIELDS], ["questionPlan", "ruleRepairs"]);
+    // The planner's allow-list names exactly these fields ((#233 P4b) EXPLICIT extension: the layer check's record and conflicts).
+    assert.deepEqual([...PLANNER_WRITABLE_FIELDS], ["questionPlan", "ruleRepairs", "layerCheck", "layerConflicts"]);
   });
 });
 
