@@ -64,6 +64,13 @@ export const MAX_JUMP_PERCENT = 50;
  */
 export const MAX_OVERRIDE_TTL_HOURS = 168;
 /**
+ * The longest an admin HOLD may last (issue #241), checked on every request
+ * (a hold has no default life: its ttlHours is required, 1 to this). Kept
+ * equal to the override cap: a week covers a lagging Central Bank feed while
+ * forcing a fresh, audited decision at least weekly.
+ */
+export const MAX_HOLD_TTL_HOURS = MAX_OVERRIDE_TTL_HOURS;
+/**
  * Widest plausible range allowed in config, as maxRate / minRate (issue #214).
  * NGN's default 200-5000 is 25x. A typo like maxRate 1e9 would make the range
  * meaningless, so a stored range wider than 50x is ignored and the currency

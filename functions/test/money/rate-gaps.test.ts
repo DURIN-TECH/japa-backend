@@ -479,7 +479,7 @@ describe("the scheduled refresh writes the provider rate conditionally", () => {
       assert.equal((await firestoreRateStore.get("NGN"))?.override?.rate, 1050, "the merge keeps the override");
       resetStore();
       const first = await firestoreRateStore.saveProvider("NGN", p1500, null);
-      assert.deepEqual(first, { saved: true, override: null });
+      assert.deepEqual(first, { saved: true, override: null, hold: null });
     });
 
     test("the provider fetch never runs inside a transaction", async () => {
