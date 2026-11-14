@@ -27,6 +27,9 @@ import type { GuidanceQuoteCheck } from "../guidance-quote-check";
 /** Registry ids used below (the two renditions of the caseworker guidance). */
 const GUIDANCE_RENDITIONS = ["gb-visit-guidance-html", "gb-visit-guidance-pdf"];
 
+/** The two renditions of the UK Family caseworker guidance (issue #260). */
+const FAMILY_GUIDANCE_RENDITIONS = ["gb-family-life-guidance-html", "gb-family-life-guidance-pdf"];
+
 export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
   // ---- The visitor rules ----
   {
@@ -133,5 +136,103 @@ export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
     passage:
       "Where you believe it is more likely than not that the third party will be unable to provide this support, you may refuse the application.",
     sourceIds: GUIDANCE_RENDITIONS,
+  },
+
+  // ============================================
+  // UK FAMILY (route key "uk-family-visa"; issue #260)
+  // ============================================
+  // Every passage below was copied on 2026-11-14 from the text retrieved that
+  // day through the shared fetch service (see the entries' verification notes
+  // in seed-guidance-sources.ts), and checked against that same text with the
+  // matcher the seed script uses (findPassage) before it was committed.
+
+  // ---- The family rules (Appendix FM) ----
+  {
+    id: "appendix-fm-s-ec-1-1-suitability",
+    label: "S-EC.1.1",
+    // The rule that makes Part Suitability (gb-part-suitability) apply here.
+    passage: "S-EC.1.1. The applicant must not fall for refusal under Part Suitability.",
+    sourceIds: ["gb-appendix-fm-family-members"],
+  },
+  {
+    id: "appendix-fm-e-ecp-2-6-genuine-relationship",
+    label: "E-ECP.2.6",
+    passage: "E-ECP.2.6. The relationship between the applicant and their partner must be genuine and subsisting.",
+    sourceIds: ["gb-appendix-fm-family-members"],
+  },
+  {
+    id: "appendix-fm-e-ecp-2-10-live-together",
+    label: "E-ECP.2.10",
+    passage: "E-ECP.2.10. The applicant and partner must intend to live together permanently in the UK.",
+    sourceIds: ["gb-appendix-fm-family-members"],
+  },
+  {
+    id: "appendix-fm-e-ecp-3-1-a-income",
+    label: "E-ECP.3.1(a)",
+    // Pinned so a change to the published figure fails the check loudly.
+    passage: "(a) a specified gross annual income of at least £29,000",
+    sourceIds: ["gb-appendix-fm-family-members"],
+  },
+
+  // ---- The specified evidence appendix (Appendix FM-SE) ----
+  {
+    id: "appendix-fm-se-a-opening",
+    label: "Paragraph A",
+    // An identity check from the opening.
+    passage:
+      "A. This Appendix sets out the specified evidence applicants need to provide to meet the requirements of rules contained in Appendix FM",
+    sourceIds: ["gb-appendix-fm-se-specified-evidence"],
+  },
+  {
+    id: "appendix-fm-se-1-a-i-finance",
+    label: "Paragraph 1(a)(i)",
+    // The reference that makes Appendix Finance (gb-appendix-finance) apply here.
+    passage: "(i) be from a financial institution to which Appendix Finance applies.",
+    sourceIds: ["gb-appendix-fm-se-specified-evidence"],
+  },
+
+  // ---- The Family Policy caseworker guidance: web version and PDF must agree ----
+  {
+    id: "family-guidance-1-about",
+    label: "1. About this guidance",
+    passage:
+      "This guidance tells decision makers how to decide applications or claims for leave to enter or remain on the basis of family life as a partner or parent or exceptional circumstances",
+    sourceIds: FAMILY_GUIDANCE_RENDITIONS,
+  },
+  {
+    id: "family-guidance-5-1-suitability",
+    label: "5.1 Suitability",
+    // Typographic apostrophe in "person’s", as published.
+    passage:
+      "In considering all applications on the basis of a person’s family life as a partner or parent, you must consider whether the suitability requirements under Part Suitability of the Immigration rules are met.",
+    sourceIds: FAMILY_GUIDANCE_RENDITIONS,
+  },
+  {
+    id: "family-guidance-7-2-under-two-years",
+    label: "7.2 Eligibility (relationship)",
+    passage:
+      "Where the definition of partner is not met because a couple who are in a genuine and subsisting relationship have been together for less than 2 years, the requirements of Appendix FM cannot be satisfied other than on the basis of exceptional circumstances.",
+    sourceIds: FAMILY_GUIDANCE_RENDITIONS,
+  },
+  {
+    id: "family-guidance-7-2-genuine-subsisting",
+    label: "7.2 Eligibility (genuine and subsisting)",
+    passage:
+      "When considering paragraph E-ECP.2.6. and paragraph E-LTRP.1.7., you must be satisfied that the relationship between the applicant and their partner is genuine and subsisting.",
+    sourceIds: FAMILY_GUIDANCE_RENDITIONS,
+  },
+
+  // ---- The minimum income requirement guidance (PDF only) ----
+  {
+    id: "family-financial-guidance-form",
+    label: "Who needs to meet the financial requirement",
+    passage: "Unless exempt, the applicant must meet the financial requirement in the form of a minimum income requirement.",
+    sourceIds: ["gb-family-financial-requirement-pdf"],
+  },
+  {
+    id: "family-financial-guidance-no-child-variation",
+    label: "Financial requirement for a first application on or after 11 April 2024",
+    passage: "Unlike the previous threshold, this amount does not vary where there are dependent children within the family.",
+    sourceIds: ["gb-family-financial-requirement-pdf"],
   },
 ];

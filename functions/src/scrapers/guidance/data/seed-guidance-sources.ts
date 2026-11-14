@@ -187,6 +187,172 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
       "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
     retrievedAt: "2026-11-11T10:48:41Z",
   },
+
+  // ============================================
+  // UK FAMILY (route key "uk-family-visa", visa type gb-uk-family-visa; issue #260)
+  // ============================================
+  //
+  // The route key follows the registry convention: the visa type id without
+  // its country prefix (gb-uk-family-visa -> uk-family-visa), the same rule
+  // route-onboarding.service.ts uses to find a route's guidance.
+  //
+  // Documents, each requested once on 2026-11-14 through the shared fetch
+  // service (the crawl's own code path: bot user agent, robots.txt checked,
+  // per-host delay), with the numbers in each note taken from that request:
+  //  - Appendix FM (the route's own rules)                       -> primary
+  //  - Appendix FM-SE (the evidence Appendix FM specifies)       -> secondary
+  //  - the Family Policy caseworker guidance, web + PDF          -> route_guidance
+  //  - the minimum income requirement caseworker guidance (PDF)  -> route_guidance
+  //
+  // Cross-route documents reused BY ID, not re-registered (one source per URL;
+  // the validator refuses a duplicate URL):
+  //  - gb-part-suitability: Appendix FM S-EC.1.1 says "The applicant must not
+  //    fall for refusal under Part Suitability."
+  //  - gb-appendix-finance: Appendix FM-SE paragraph 1(a)(i) says bank
+  //    statements must "be from a financial institution to which Appendix
+  //    Finance applies."
+  // Both stay registered under the visitor route key; the rubric extraction
+  // reads a source by id (`--sources`), whatever route key it carries.
+  //
+  // Addresses: the two rules pages were taken from the publisher's index of
+  // the Immigration Rules (https://www.gov.uk/guidance/immigration-rules) on
+  // 2026-11-14; the guidance addresses from their publication pages that day.
+  {
+    id: "gb-appendix-fm-family-members",
+    // The route's own rules document.
+    role: "primary",
+    title: "Immigration Rules Appendix FM: family members",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-fm-family-members",
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (11:56 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "92,178 characters of cleaned text, sha256 4708f9d0ba479877bf397e8162eb6fd26058ee30c509aa061f222e95cd7e51c1. " +
+      "The address is the one the publisher's index of the rules linked to on that day. The text runs from the page " +
+      "title to the closing 'Deportation and removal' paragraph (it is not cut short). Read closely: GEN.1.1 to GEN.1.3, " +
+      "S-EC.1.1 and E-ECP.1.1 to E-ECP.4.1; the rest was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T11:56:56Z",
+  },
+  {
+    id: "gb-appendix-fm-se-specified-evidence",
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
+    role: "secondary",
+    title: "Immigration Rules Appendix FM-SE: family members specified evidence",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-fm-se-family-members-specified-evidence",
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (11:56 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "79,574 characters of cleaned text, sha256 9a7c644e39fc808fc4cd4426d3d233ccfd0f771eb3d06250f2976b6bd24ef801. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because Appendix FM " +
+      "(E-ECP.3.1, E-ECP.4.1 of the entry above) requires 'specified evidence', which this appendix specifies; it also " +
+      "serves other appendices, hence secondary. The text runs from the title to paragraph 37 (it is not cut short). " +
+      "Read closely: paragraphs A, A1 and 1(a); the rest was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T11:56:58Z",
+  },
+  {
+    id: "gb-family-life-guidance-html",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Family life (as a partner or parent) and exceptional circumstances caseworker guidance (accessible web version)",
+    url:
+      "https://www.gov.uk/government/publications/family-life-as-a-partner-or-parent-private-life-and-exceptional-circumstance/" +
+      "family-life-as-a-partner-or-parent-and-exceptional-circumstances-accessible",
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "html",
+    // The document's own line, "published for Home Office staff on <date>".
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (11:58 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "198,207 characters of cleaned text, sha256 d9edda222fa8d5b54cdc67c1fe66432d502e9777ec7f0d8cc85d06382bd84edb. " +
+      "The address is the one the publication page linked to on that day. The text states version 30.0, " +
+      "published for staff on 8 October 2026, and runs through the last numbered section (17, Coronavirus concessions). " +
+      "Read closely: sections 1, 5.1, the opening of 7.2, and 7.4 to 7.6; the rest was retrieved and skimmed, " +
+      "not read line by line.",
+    retrievedAt: "2026-11-14T11:58:53Z",
+  },
+  {
+    id: "gb-family-life-guidance-pdf",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Family life (as a partner or parent) and exceptional circumstances caseworker guidance (PDF)",
+    // The file's address ON THE DAY IT WAS RETRIEVED. It carries a per-release
+    // id and changes with every publication, so the crawl does not request
+    // this value: it reads the current address from `resolveFrom` each time.
+    url: "https://assets.publishing.service.gov.uk/media/6aec80a1d77f87d8c7b52f77/Family_life__as_a_partner_or_parent__and_exceptional_circumstances.pdf",
+    resolveFrom: {
+      // The stable publication page that always links to the current file.
+      pageUrl: "https://www.gov.uk/government/publications/family-life-as-a-partner-or-parent-private-life-and-exceptional-circumstance",
+      // The one PDF attachment on that page: any release id, any file name.
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]+\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "pdf",
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (11:59 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "851,541-byte PDF, 91 pages, every page with a text layer, 216,336 characters of cleaned text, " +
+      "sha256 e3506e178d3f87225cf0c3679eb5b2937b657d6a9f8376e07ebef417266b1583. The file's address was read from the " +
+      "publication page on that day (it was the only PDF linked there; the resolveFrom lookup returned it). Each page " +
+      "is headed 'Published for Home Office staff on 8 October 2026'; page 1 states version 30.0. " +
+      "Read closely: the passages pinned in guidance-quote-checks.ts, which correspond to sections 1, 5.1 and 7.2 of the " +
+      "web version (the PDF's headings are not numbered); the rest was retrieved and skimmed, not read line by line.",
+    retrievedAt: "2026-11-14T11:59:10Z",
+  },
+  {
+    id: "gb-family-financial-requirement-pdf",
+    // Guidance written for this route's financial requirement (Appendix FM,
+    // and Appendix HM Armed Forces which shares it).
+    role: "route_guidance",
+    title: "Family Migration: Appendix FM and Appendix HM Armed Forces, minimum income requirement caseworker guidance (PDF)",
+    // The file's address on the day it was retrieved (per-release id).
+    url:
+      "https://assets.publishing.service.gov.uk/media/691209e3e9348ac8fb54f4ba/" +
+      "Family+Migration+Appendix+FM+Section+and+Appendix+HM+Armed+Forces+Financial+Requirement.pdf",
+    resolveFrom: {
+      // The stable publication page. It links to FIVE PDFs (this one, the
+      // adequate maintenance guidance, two children annexes and the adult
+      // dependent relatives guidance), so the pattern names this file by the
+      // words its name carries ("Financial+Requirement"), not just ".pdf".
+      pageUrl: "https://www.gov.uk/government/publications/chapter-8-appendix-fm-family-members",
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]*Financial\\+Requirement[^/?#]*\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "pdf",
+    // Anchored on the bullet of the document's "Publication" section. The page
+    // headers cannot be used: page 1 is headed "12 March 2025" while pages 2 to
+    // 80 and the Publication section say "11 November 2025", and the match is
+    // case-insensitive, so the plain lead-in would pick page 1's older date.
+    publishedDateSelector: "• published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:00 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "759,302-byte PDF, 80 pages, every page with a text layer, 193,643 characters of cleaned text, " +
+      "sha256 440d223989d76cceaa30e695bbef48ae55e9fada222b540fac3422a453084279. The file's address was read from the " +
+      "publication page on that day; the resolveFrom pattern matched exactly this one of the five PDFs there. " +
+      "There is no web rendition: the 'accessible version' address the search index still lists " +
+      "(.../appendix-fm-17-financial-requirement-accessible-version) redirected to the publication page that day. " +
+      "The Publication section states version 13.0, published for staff on 11 November 2025 (page 1's header says " +
+      "12 March 2025; pages 2 to 80 say 11 November 2025). Read closely: pages 1, 5 and 11 to 13 (publication, the " +
+      "summary of thresholds and the 11 April 2024 rules); the rest was retrieved and skimmed, not read line by line.",
+    retrievedAt: "2026-11-14T12:00:20Z",
+  },
 ];
 
 /** Statuses a seed may set (`failing` belongs to the crawler). */
