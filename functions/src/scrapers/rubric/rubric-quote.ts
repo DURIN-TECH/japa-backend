@@ -458,24 +458,39 @@ export class SnapshotQuoteIndex {
       const around = this.contextAround(found, maxChars);
       return { text: `${around.before}${found.matched}${around.after}`, ...(found.page !== undefined ? { page: found.page } : {}) };
     }
-    const from = Math.max(0, found.unit - Math.max(0, linesBefore));
-    const to = Math.min(this.units.length - 1, found.unit + Math.max(0, linesAfter));
-    const lines: string[] = [];
-    let used = 0;
-    for (let i = from; i <= to; i++) {
-      const line = this.units[i].text;
-      if (!line) continue;
-      let clipped = line.length > maxChars ? line.slice(0, maxChars) : line;
-      if (i === found.unit && line.length > maxChars) {
-        // The quote's own line is too long: keep the characters AROUND the quote so the quote itself is never cut.
-        const around = this.contextAround(found, Math.floor(maxChars / 2));
-        clipped = `${around.before}${found.matched}${around.after}`;
-      }
-      // The quote's own line is always included; the other lines stop once the overall bound is reached.
-      if (i !== found.unit && used + clipped.length > maxChars) break;
-      lines.push(clipped);
-      used += clipped.length;
+    // The quote's own line first (always whole up to the bound, never cut short of the quote) ...
+    const own = this.units[found.unit].text;
+    let ownText = own.length > maxChars ? own.slice(0, maxChars) : own;
+    if (own.length > maxChars) {
+      // ... too long: keep the characters AROUND the quote so the quote itself is never cut.
+      const around = this.contextAround(found, Math.floor(maxChars / 2));
+      ownText = `${around.before}${found.matched}${around.after}`;
     }
+    let used = ownText.length;
+    // ... then the neighbours, NEAREST first in each direction, while the overall bound allows.
+    const take = (i: number): string | null => {
+      const line = this.units[i]?.text;
+      if (!line) return line === "" ? "" : null;
+      const clipped = line.length > maxChars ? line.slice(0, maxChars) : line;
+      if (used + clipped.length > maxChars) return null;
+      used += clipped.length;
+      return clipped;
+    };
+    const above: string[] = [];
+    for (let i = found.unit - 1, n = 0; i >= 0 && n < Math.max(0, linesBefore); i--) {
+      const t = take(i);
+      if (t === null) break;
+      if (t !== "") above.unshift(t);
+      n += 1;
+    }
+    const below: string[] = [];
+    for (let i = found.unit + 1, n = 0; i < this.units.length && n < Math.max(0, linesAfter); i++) {
+      const t = take(i);
+      if (t === null) break;
+      if (t !== "") below.push(t);
+      n += 1;
+    }
+    const lines = [...above, ownText, ...below];
     return { text: lines.join("\n\n") };
   }
 

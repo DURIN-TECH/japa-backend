@@ -593,6 +593,7 @@ export class RubricCheckerService {
       // (#223) Re-drafts stored by an earlier run of this version: reused, never asked for again.
       repairs: { ...(previous?.repairs ?? {}) },
       repairRequests: 0,
+      reusable,
     };
     const stop = async (reasonCodes: string[], extra: { protectedRuleIds?: string[]; protectedFailures?: RubricProtectedFailure[]; leftOut?: { criterionId: string; reason: string }[] } = {}): Promise<RubricCheckOutcomeShape> => {
       await this.persist(ctx, "failed", reasonCodes);
@@ -806,6 +807,12 @@ export class RubricCheckerService {
       for (const role of ["verification", "judgement"] as const) {
         jobs.push(...this.batchJobs(role, checkable, views, ctx.limits));
         jobs.push(...this.triggerJobs(role, triggered, views, p.questions, ctx.limits));
+      }
+      // A replacement's check made by an earlier run of this version is replayed from its stored answers
+      // (same request hash, same model), never asked for again.
+      for (const j of jobs) {
+        const hit = ctx.reusable[j.hash];
+        if (!ctx.responses[j.hash] && hit && hit.model === ctx.models[j.role] && hit.role === j.role) ctx.responses[j.hash] = hit;
       }
       const need = jobs.filter((j) => !ctx.responses[j.hash]);
       const before = ctx.usage.requests;
@@ -1152,6 +1159,8 @@ interface RunContext {
   repairs: Record<string, StoredRedraft>;
   // Model requests of this run spent on repair (re-drafts and the check of replacements).
   repairRequests: number;
+  // The stored answers of an earlier run of this version that may be reused (same prompt version).
+  reusable: Record<string, StoredResponse>;
 }
 
 /** The check, over Firestore, the snapshot store and the Anthropic provider. */
