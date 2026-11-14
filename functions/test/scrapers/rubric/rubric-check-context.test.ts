@@ -27,7 +27,7 @@ import {
   selectedAnswerLabels,
   type CheckerRuleView,
 } from "../../../src/scrapers/rubric/rubric-checker-prompt";
-import { KIND_JUDGEMENT, KIND_MANDATORY_BAR, KIND_OBJECTIVE } from "../../../src/scrapers/rubric/rubric-kind-wording";
+import { KIND_JUDGEMENT, KIND_MANDATORY_BAR, KIND_OBJECTIVE, KIND_WORDING_SENTENCE } from "../../../src/scrapers/rubric/rubric-kind-wording";
 import { RUBRIC_SYSTEM_PROMPT } from "../../../src/scrapers/rubric/rubric-prompt";
 import { RubricCheckerService, viewOf } from "../../../src/scrapers/rubric/rubric-checker";
 import { SnapshotQuoteIndex, conditionParts, type QuoteLookup } from "../../../src/scrapers/rubric/rubric-quote";
@@ -379,9 +379,9 @@ describe("the prompt (version 6)", () => {
   test("the drafting prompt still says the same things (so the two cannot drift): fixed figure, whatever else is true, decision maker, no fixed figure means judgement", () => {
     assert.match(RUBRIC_SYSTEM_PROMPT, /sets no fixed figure/);
     assert.match(RUBRIC_SYSTEM_PROMPT, /Use kind `judgement`/);
-    assert.match(RUBRIC_SYSTEM_PROMPT, /a rule a program can check/);
-    assert.match(RUBRIC_SYSTEM_PROMPT, /applies to a stated group whatever else is true/);
-    assert.match(RUBRIC_SYSTEM_PROMPT, /the decision maker weighs/);
+    // (#243) The drafting prompt now embeds the shared sentence itself (the three kind bullets it had are gone).
+    assert.ok(RUBRIC_SYSTEM_PROMPT.includes(KIND_WORDING_SENTENCE));
+    assert.ok(CHECKER_SYSTEM_PROMPT.includes(KIND_WORDING_SENTENCE));
     // And the shared wording says those same three things.
     assert.match(KIND_OBJECTIVE, /fixed figure/);
     assert.match(KIND_MANDATORY_BAR, /whatever else is true/);

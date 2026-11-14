@@ -19,13 +19,13 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import {
   RUBRIC_INTAKE_SYSTEM_PROMPT,
-  RUBRIC_KIND_WORDING,
-  RUBRIC_KIND_WORDING_SENTENCE,
   RUBRIC_PROMPT_VERSION,
   RUBRIC_REPAIR_PROMPT_VERSION,
   RUBRIC_SYSTEM_PROMPT,
   buildRepairRequest,
 } from "../../../src/scrapers/rubric/rubric-prompt";
+import { KIND_JUDGEMENT, KIND_MANDATORY_BAR, KIND_OBJECTIVE, KIND_WORDING_SENTENCE } from "../../../src/scrapers/rubric/rubric-kind-wording";
+import { CHECKER_SYSTEM_PROMPT } from "../../../src/scrapers/rubric/rubric-checker-prompt";
 import { runRepairs, aspectsToRepair, type SavedRuleInput } from "../../../src/scrapers/rubric/scripts/repair-saved-rule";
 import { answer, crit, criteriaWire } from "./rubric-harness";
 import { ScriptedProvider, SRC_HASH, SRC_ID, isRepairRequest } from "./checker-fakes";
@@ -78,7 +78,7 @@ describe("the criteria prompt holds the new instructions (#243)", () => {
 
   test("nothing asks the model to drop, cap or reduce rules", () => {
     assert.ok(!/\b(fewer|at most|no more than|only the most|skip rules|drop rules|cap the number|limit the number|as few)\b/i.test(p));
-    assert.ok(!/\b(fewer|at most|no more than|only the most|as few)\b/i.test(RUBRIC_KIND_WORDING_SENTENCE));
+    assert.ok(!/\b(fewer|at most|no more than|only the most|as few)\b/i.test(KIND_WORDING_SENTENCE));
   });
 
   test("the criteria prompt still lacks the word 'intake' (a test detects the intake call by it)", () => {
@@ -95,18 +95,20 @@ describe("the criteria prompt holds the new instructions (#243)", () => {
 
 describe("versions moved, and the kind wording is shared (#243)", () => {
   test("versions", () => {
-    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v9");
+    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v10");
     assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v4");
   });
 
-  test("the drafting prompt carries the shared kind wording word for word, and judgement covers the five things", () => {
-    assert.ok(RUBRIC_SYSTEM_PROMPT.includes(RUBRIC_KIND_WORDING_SENTENCE));
-    for (const k of Object.values(RUBRIC_KIND_WORDING)) assert.ok(RUBRIC_SYSTEM_PROMPT.includes(k));
-    for (const w of ["a requirement the applicant must show", "a permitted activity", "a definition", "a method of calculation", "an instruction to the decision maker"]) {
-      assert.ok(RUBRIC_KIND_WORDING.judgement.includes(w), w);
+  test("ONE kind wording (rubric-kind-wording.ts): the drafting prompt and the check's prompt carry the same sentence word for word", () => {
+    assert.ok(RUBRIC_SYSTEM_PROMPT.includes(KIND_WORDING_SENTENCE));
+    assert.ok(CHECKER_SYSTEM_PROMPT.includes(KIND_WORDING_SENTENCE));
+    for (const k of [KIND_OBJECTIVE, KIND_MANDATORY_BAR, KIND_JUDGEMENT]) {
+      assert.ok(RUBRIC_SYSTEM_PROMPT.includes(k));
+      assert.ok(CHECKER_SYSTEM_PROMPT.includes(k));
     }
-    // TODO(#243, the #242 engineer): rubric-checker-prompt.ts should build its `kind_right` line from
-    // RUBRIC_KIND_WORDING_SENTENCE; add the "same text in both prompts" assertion here once it does.
+    for (const w of ["a requirement the applicant must show", "a permitted activity", "a definition", "a method of calculation", "an instruction to the decision maker"]) {
+      assert.ok(KIND_JUDGEMENT.includes(w), w);
+    }
   });
 });
 

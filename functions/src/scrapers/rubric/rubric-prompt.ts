@@ -8,6 +8,7 @@ import {
   INTENT_POLARITIES,
 } from "../../types/rubric";
 import type { SourceChunk } from "./rubric-chunk";
+import { KIND_WORDING_SENTENCE } from "./rubric-kind-wording";
 
 // ============================================
 // RUBRIC — EXTRACTION PROMPT AND OUTPUT SCHEMA (issue #40)
@@ -93,35 +94,13 @@ import type { SourceChunk } from "./rubric-chunk";
  *    which conflicted, are one rule that says which wins); a quote that exempts a group is
  *    `conditional`; a condition is a circumstance, never an outcome; examples, summaries and
  *    link labels are not rules; the kind wording is shared with the checker
- *    (`RUBRIC_KIND_WORDING`). Only the criteria prompt changed: the intake prompt (call 2)
+ *    (`KIND_WORDING`). Only the criteria prompt changed: the intake prompt (call 2)
  *    is byte-for-byte what v8 had.
+ *  - "2026-11-rubric-v10" (#243, after #242 merged): the kind sentence is the one in
+ *    `rubric-kind-wording.ts` (`KIND_WORDING_SENTENCE`), the same text the check's prompt
+ *    embeds; v9 was never released.
  */
-export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v9";
-
-/**
- * (#243) The meaning of each rule kind, ONE wording shared by the drafting prompt below and
- * the independent check (`rubric-checker-prompt.ts` should build its `kind_right` line from
- * the same constant, so the drafter and the checker can never again disagree on what a kind
- * means: the first real run's 93 kind failures came from a checker that read `judgement` more
- * narrowly than the drafter did).
- *
- * `judgement` is the broad kind on purpose. It is the safe one at assessment (the rule is shown
- * in full to the assessment model, never decided by code, and can only raise a concern), so
- * everything that is not a fixed figure, a plain comparable fact or a bar on a group belongs to
- * it: what the applicant must show, what is permitted, what a word means, how an amount is
- * worked out, and what the decision maker is told to do.
- *
- * Generic by construction: it names no country, route or publisher.
- */
-export const RUBRIC_KIND_WORDING = {
-  objective: "the quote sets a fixed figure, or a plain fact, that a program can compare",
-  judgement:
-    "the quote asks the decision maker to weigh evidence or be satisfied about something and sets no fixed figure; this covers a requirement the applicant must show, a permitted activity, a definition, a method of calculation and an instruction to the decision maker",
-  mandatory_bar: "the quote bars a stated group whatever else is true",
-} as const;
-
-/** The three meanings as one sentence, for a prompt that lists them together (the checker's `kind_right`). */
-export const RUBRIC_KIND_WORDING_SENTENCE = `\`objective\` means ${RUBRIC_KIND_WORDING.objective}; \`judgement\` means ${RUBRIC_KIND_WORDING.judgement}; \`mandatory_bar\` means ${RUBRIC_KIND_WORDING.mandatory_bar}.`;
+export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v10";
 
 /** Instructions shared by both calls: what the excerpt is, and how to treat it. */
 const COMMON_INSTRUCTIONS = [
@@ -165,7 +144,7 @@ export const RUBRIC_SYSTEM_PROMPT = [
   "- Never decide an outcome. You describe the rule and the fact to read; you do not say whether anyone passes.",
   "",
   "Kinds. What each kind means (the independent check reads the same words):",
-  `- ${RUBRIC_KIND_WORDING_SENTENCE}`,
+  `- ${KIND_WORDING_SENTENCE}`,
   "- `objective`: give `check` with the `field` to read, an `op` and, unless the op is `present`, a `value`.",
   "- `mandatory_bar`: give `appliesTo`: `asWritten` lists the group members exactly as the excerpt names them, `nationalities` gives the matching two-letter codes in the same order. Give `validFrom` / `validUntil` (YYYY-MM-DD) only when the excerpt states the dates. `appliesTo.nationalities` and `asWritten` are for members that really are a nationality. A member that is NOT a nationality (a status or category of person, for example one defined by a right or a legal status) goes in `appliesTo.uncoded`, written exactly as the quote names it: it has no code, so never invent one and never put a nationality's code for a group that is wider than, or different from, that nationality. A bar needs at least one member in `asWritten` or in `uncoded`.",
   "- A rule whose own sentence ends with a lead-in (a colon: \"... except where they are subject to any of the following:\") may use that sentence as its `quote`, when the rule is itself the bar or the requirement the list qualifies, or the definition or set of alternatives the list spells out. Quote the lead-in sentence only. Do NOT copy the list lines under it into any field: the program attaches them from the stored text. This does not change the rule for lettered sub-conditions: a paragraph that lists sub-conditions the applicant must each satisfy still gives one criterion per item.",
