@@ -201,6 +201,11 @@ export function mandatoryBarHits(
   return rubric.criteria.filter(
     (c) =>
       c.kind === "mandatory_bar" &&
+      // (#248) A bar served WITHOUT its trigger (the check could not confirm which applicants
+      // it is put to) is never decided here: with no trigger, a nationality match alone would
+      // bar every applicant of that nationality, including ones its condition does not cover.
+      // It is judged in full instead (`judgementCriteriaOf`).
+      c.notCodeDecided !== true &&
       c.appliesTo !== undefined &&
       c.appliesTo.nationalities.includes(nationality) &&
       withinBar(c, applicationDate)
@@ -491,12 +496,44 @@ export function judgementCriteriaOf(rubric: Pick<VisaRubric, "criteria">): Asses
   // (see `mandatoryBarHits`), and the rest must never read as "applies to
   // nobody" nor as "applies to everybody". The model can only raise a concern
   // on it; a refusal on a bar stays decided by code alone.
-  return rubric.criteria.filter((c) => c.kind === "judgement" || hasUncodedGroup(c));
+  // (#248) A bar served without its unconfirmed trigger (`notCodeDecided`) is put to the model
+  // the same way, for the whole of its group: code does not decide it at all (see
+  // `mandatoryBarHits`), so the model's reading is the only one it gets.
+  return rubric.criteria.filter((c) => c.kind === "judgement" || isJudgedBar(c));
 }
 
 /** True for a rule whose group names members that are not nationalities (no code to match by). */
 export function hasUncodedGroup(c: Pick<AssessmentCriterion, "kind" | "appliesTo">): boolean {
   return c.kind === "mandatory_bar" && (c.appliesTo?.uncoded?.length ?? 0) > 0;
+}
+
+/** (#248) True for a bar code does NOT decide: served without its trigger. */
+export function isNotCodeDecidedBar(c: Pick<AssessmentCriterion, "kind" | "notCodeDecided">): boolean {
+  return c.kind === "mandatory_bar" && c.notCodeDecided === true;
+}
+
+/**
+ * (#222, #248) True for a bar the assessment model is shown: one with uncoded group members,
+ * or one code does not decide at all. Both may only ever become a CONCERN (a credibility flag),
+ * never a refusal ground (see `assembleContent`).
+ */
+export function isJudgedBar(c: Pick<AssessmentCriterion, "kind" | "appliesTo" | "notCodeDecided">): boolean {
+  return hasUncodedGroup(c) || isNotCodeDecidedBar(c);
+}
+
+/**
+ * (#248) What the model is told about a bar that code does not decide: that code does not decide
+ * it, the group AS WRITTEN in the source (its own words, coded and uncoded members alike: no code
+ * is shown as if it settled anything), and the rule's original condition words, so the model can
+ * weigh whether this applicant is one the bar covers. Text from the rubric only (trusted data).
+ */
+function notCodeDecidedBlock(c: AssessmentCriterion): string {
+  const group = [...(c.appliesTo?.asWritten ?? []), ...(c.appliesTo?.uncoded ?? [])];
+  return (
+    " | mandatory bar NOT decided by code (which applicants it covers was not confirmed): weigh whether it applies to this applicant and raise a concern if it does" +
+    ` | group as written: ${group.join("; ") || "none stated"}` +
+    ` | applies when: ${c.applicabilityCondition ? `"${c.applicabilityCondition}"` : "not stated (read the source)"}`
+  );
 }
 
 /** The rule's own text as the model is shown it: the quote, then any list lines under a lead-in (#222). */
@@ -529,7 +566,9 @@ export const JUDGEMENT_BATCH_MAX_CHARS = 50_000;
 
 /** Characters one criterion adds to the criteria block of a stage 3 request. */
 function criterionBlockChars(c: AssessmentCriterion): number {
-  return c.criterionId.length + c.title.length + (c.probeFactors ?? []).join("; ").length + ruleSourceText(c).length + (c.appliesTo?.uncoded ?? []).join("; ").length + 60;
+  // (#248) A bar code does not decide also carries its group as written and its condition words.
+  const judgedExtra = isNotCodeDecidedBar(c) ? notCodeDecidedBlock(c).length : 0;
+  return c.criterionId.length + c.title.length + (c.probeFactors ?? []).join("; ").length + ruleSourceText(c).length + (c.appliesTo?.uncoded ?? []).join("; ").length + judgedExtra + 60;
 }
 
 /**
@@ -714,9 +753,13 @@ export function buildJudgementRequest(input: JudgementRequestInput): LlmRequest 
       (c) =>
         `- ${c.criterionId} | ${c.title} | factors: ${(c.probeFactors ?? []).join("; ") || "none stated"} | ` +
         `source: "${ruleSourceText(c)}"` +
-        (hasUncodedGroup(c)
-          ? ` | group (code matches only its nationalities ${(c.appliesTo?.nationalities ?? []).join(", ") || "none"}; also named, with no code: ${(c.appliesTo?.uncoded ?? []).join("; ")})`
-          : "") +
+        // (#248) A bar code does not decide gets its own block (group as written + condition words);
+        // a bar with uncoded members that code still decides for its coded members keeps the #222 text.
+        (isNotCodeDecidedBar(c)
+          ? notCodeDecidedBlock(c)
+          : hasUncodedGroup(c)
+            ? ` | group (code matches only its nationalities ${(c.appliesTo?.nationalities ?? []).join(", ") || "none"}; also named, with no code: ${(c.appliesTo?.uncoded ?? []).join("; ")})`
+            : "") +
         (c.concernsIntent ? " | concerns intention" : "")
     )
     .join("\n");
@@ -952,7 +995,18 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
       // Only a judgement criterion can be flagged here: a finding the model
       // attached to an objective or bar criterion id is ignored, so model text
       // can never add to, or override, a code-decided rule.
-      if (c.kind !== "judgement") continue;
+      // (#248) EXTENDED, not loosened: a bar the model was SHOWN as a judgement
+      // (`isJudgedBar`: uncoded members, or served without its trigger so code does
+      // not decide it) may also become a concern. Before, such a concern was dropped
+      // here, so "the model can raise a concern on it" had no effect at all and a
+      // barred applicant code cannot match heard nothing. It is still never a refusal
+      // ground and never touches `mandatoryHits`: what code decided stays exactly as
+      // code decided it, and the model cannot clear it. A bar code already refused on
+      // for this applicant is not flagged twice. Objective criteria and bars the model
+      // was not shown stay ignored (pinned by tests).
+      const judgedBar = c.kind === "mandatory_bar" && isJudgedBar(c);
+      if (c.kind !== "judgement" && !judgedBar) continue;
+      if (judgedBar && seenRefusal.has(c.criterionId)) continue;
       // THE CONTAINMENT POINT. A judgement criterion produces a credibility
       // flag, never a refusal ground, and this is enforced here in code, not by
       // the prompt. Why: the engine cannot verify genuineness (leaves at the end
@@ -967,7 +1021,9 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
         criterionId: c.criterionId,
         title: c.title,
         kind: c.kind,
-        isMandatoryBar: false,
+        // (#248) True only for a judged bar's concern: staff can tell a concern about a bar
+        // from an ordinary one. It is still a FLAG (no refusal ground, no `hasBlockingRule`).
+        isMandatoryBar: judgedBar,
         // Stage comes from the rubric criterion, never from model text (#43).
         stage: c.stage,
         ruleRef: c.ruleRef ?? null,

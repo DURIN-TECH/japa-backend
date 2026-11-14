@@ -301,6 +301,18 @@ export interface AssessmentCriterion {
   // kept, and an assessment reports it as not assessable, never as failed and
   // never as applying to everyone). See services/ai/rule-applicability.ts.
   trigger?: RuleTrigger;
+  // (#248) SERVED-SIDE ONLY, never stored on a version and never extracted: set by
+  // `applyExclusions` (rubric-exclusions.ts) on a mandatory bar that is served WITHOUT
+  // its trigger because the independent check could not confirm the trigger (the
+  // rule itself was confirmed by both models). It means "never decide this rule in
+  // code": `mandatoryBarHits` skips it, `judgementCriteriaOf` puts it, in full, to the
+  // assessment model, and `resolveApplicability` puts it to every applicant (the model
+  // reads its condition words). Why: removing a trigger widens who a rule is put to;
+  // a bar that code decided from nationality would then bar EVERY applicant of that
+  // nationality, including ones its condition does not cover. Derived from the
+  // version's own review fields on every read, so the same stored version always
+  // gives the same served rule; a stored value is ignored and stripped.
+  notCodeDecided?: true;
   // Links to an existing EligibilityQuestion (types/eligibility.ts).
   eligibilityQuestionId?: string;
   // Ids of the rubric's intake questions whose answers this criterion reads.
@@ -685,6 +697,9 @@ export interface QuestionPlan {
   // (`applyExclusions` strips it), so it is read as "could not tell whether this applies"
   // (specialist) or by the legacy rule for a conditional rule without a trigger. Ids are this
   // version's own rules. Absent on a plan written before the integration.
+  // (#248) A MANDATORY BAR can be listed too (its rule confirmed by both models, its trigger
+  // not): `applyExclusions` then serves it without the trigger AND marks it `notCodeDecided`,
+  // derived from this list on every read (no second stored list that could disagree).
   droppedTriggerCriterionIds?: string[];
   // How many questions an applicant sees, with the plan applied (before the
   // wording check's omissions, which only lower them). `exact` is false when the
@@ -918,6 +933,27 @@ export interface RubricProtectedFailure {
 }
 
 /**
+ * (#248) One bar served without its trigger (see `AssessmentCriterion.notCodeDecided`).
+ * The trigger (the intake question and answers that narrow which applicants the bar is
+ * put to) was not confirmed by both check models while every judged aspect of the rule
+ * was. The rule is served with the trigger removed and is NEVER decided by code: the
+ * assessment model is shown it in full and can raise a concern on it.
+ */
+export interface RubricJudgedBar {
+  criterionId: string;
+  ruleRef: string | null;
+  // The rule's title (data, so alerts can name it).
+  title: string;
+  // True when the bar served is its one automatic re-draft (#223); false for the rule as drafted.
+  replaced: boolean;
+  // The trigger that was removed: its question id and answer values (ids from the draft, not text).
+  removedTrigger: RuleTrigger;
+}
+
+/** (#248) The fixed words that say what happened to such a bar, in the run record, the alerts and the audit. */
+export const JUDGED_BAR_NOTE = "its trigger was not confirmed by the independent check, so it is served without the trigger and is assessed by judgement (never decided by code)";
+
+/**
  * `rubricPublishRuns/{routeKey}__v{version}`: the record of the automatic
  * publish run of ONE version (backend-only: no firestore.rules match). The id
  * is deterministic, so a re-delivered trigger finds the record and does not run
@@ -967,6 +1003,10 @@ export interface RubricPublishRun {
   protectedFailures?: RubricProtectedFailure[];
   // (#244) One line per ordinary rule that was eligible for the automatic re-draft, with how it ended.
   ordinaryRepairs?: RubricOrdinaryRepair[];
+  // (#248) Bars served WITHOUT their trigger: both models confirmed every judged aspect of the
+  // rule (or of its one re-draft), but not its trigger. Each is assessed by judgement, never by
+  // code. Absent on records written before #248 and when there is none.
+  barsJudgedWithoutTrigger?: RubricJudgedBar[];
   // (#223) Model requests the independent check made in this run, repair requests shown apart
   // (both count against `checkerMaxRequestsPerRun`; since #244 `repair` also holds the ordinary re-drafts).
   checkerRequests?: { total: number; repair: number };
