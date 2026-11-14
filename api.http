@@ -315,6 +315,15 @@ Authorization: Bearer {{adminToken}}
 
 { "reason": "Genuine devaluation confirmed against CBN notice" }
 
+### Admin: refresh one currency from the provider now (issue #214). Same
+### checks as the 6-hourly schedule; audited; one call per currency per 5 minutes
+### (429 with Retry-After otherwise). reason is optional.
+POST {{baseUrl}}/admin/exchange-rates/NGN/refresh
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "reason": "Undo a mistaken reset-reference" }
+
 # ============================================================
 # DEV — Seed endpoints (emulator only)
 # ============================================================

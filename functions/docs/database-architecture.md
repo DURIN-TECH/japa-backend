@@ -465,15 +465,15 @@ exchangeRateAudit/{auto id}   append-only admin override history, backend-only
 | Field               | Type   | Description                                                                                   |
 | ------------------- | ------ | --------------------------------------------------------------------------------------------- |
 | defaultCurrency     | string | Charge currency when the client has no profile country or an unmapped one ("NGN")             |
-| currencies          | map    | `{ NGN: { enabled, countries: ["NG","Nigeria"], marginBps? } }`; adding a currency = config   |
+| currencies          | map    | `{ NGN: { enabled: true, countries: ["NG","Nigeria"], marginBps: 0, minRate: 200, maxRate: 5000 } }`; adding a currency = config. A stored entry merges over the default entry field by field (#214): omitting `minRate`/`maxRate` keeps the default range; `{ NGN: { enabled: false } }` switches NGN off |
 | freshnessHours      | number | How long a provider rate may serve after the provider last confirmed it (72; cap 168)        |
 | defaultMarginBps    | number | Margin in basis points when a currency sets none (0)                                          |
-| maxRateAgeHours     | number | Oldest a rate's own date (`asOf`) may be and still price (120 = 5 days; cap 240). Re-reading an old row never refreshes it |
+| maxRateAgeHours     | number | Oldest a rate's own date (`asOf`) may be and still price (144 = 6 days, covers a four-day closure such as Easter; cap 240). Re-reading an old row never refreshes it |
 | maxProviderJumpPercent | number | A new provider rate further than this from the stored one is rejected and logged (10; cap 50). Accept a real move via `POST /admin/exchange-rates/:currency/reset-reference` |
-| currencies.X.minRate / maxRate | number | Plausible range for first-run provider rates and unreferenced overrides (NGN 200-5000). Without a range those are refused |
+| currencies.X.minRate / maxRate | number | Plausible range for first-run provider rates and unreferenced overrides (NGN 200-5000). Judged as a pair: min > 0, max > min, max <= 1e9 and max/min <= 50; an invalid pair is ignored (default range kept, or none). Without a range those are refused |
 | provider            | enum   | `cbn` (default) or `oanda` (used only when the `OANDA_API_KEY` secret exists)                 |
 | overrideBandPercent | number | An admin override must be within this % of the last provider rate (10)                        |
-| overrideTtlHours    | number | Default life of an admin override (24; request may set 1-168)                                 |
+| overrideTtlHours    | number | Default life of an admin override (24; cap 168; request may set 1-168). An unreferenced override (no provider rate to check it against) lasts 24h at most |
 
 `exchangeRates/{CURRENCY}`:
 
@@ -481,16 +481,19 @@ exchangeRateAudit/{auto id}   append-only admin override history, backend-only
 | --------- | ------- | -------------------------------------------------------------------------------------------------------- |
 | currency  | string  | Doc id                                                                                                   |
 | provider  | map?    | `{ rate, asOf, fetchedAt, source: "cbn"\|"oanda" }`. `rate` = local units per 1 USD. Freshness = `fetchedAt` |
-| override  | map?    | `{ rate, reason, setBy, setAt, expiresAt }`; wins while unexpired (source `manual`)                      |
+| override  | map?    | `{ rate, reason, setBy, setAt, expiresAt, unreferenced? }`; wins while unexpired (source `manual`). When a refresh stores a provider rate outside `overrideBandPercent` of an active override, it is logged at error level and flagged in `GET /admin/exchange-rates` (`warnings`) |
+| manualRefreshAt | timestamp? | Last admin "refresh now" (rate limit: one per currency per 5 minutes)                           |
 | lastError | map?    | `{ at, message }` of the last failed provider attempt                                                    |
 
 Effective rate: active override, else provider rate within `freshnessHours`, else `quote()` fails with a typed error (`RATE_STALE`, `RATE_UNAVAILABLE`, `CURRENCY_UNSUPPORTED`, `CURRENCY_DISABLED`). A rate is never invented. A scheduled function (`refreshExchangeRates`, every 6 hours) refreshes enabled currencies; CBN reads https://www.cbn.gov.ng/api/GetAllNFEM_Rates (the data source behind the official rates page; weighted-average NFEM rate).
 
-`exchangeRateAudit`: `{ currency, action: override_set|override_cleared, by, at, reason, old, new, unreferenced? }`, indexed by (`currency`, `at` desc).
+`exchangeRateAudit`: `{ currency, action: override_set|override_cleared|provider_reset|provider_refresh, by, at, reason, old, new, unreferenced?, outcome? }`, indexed by (`currency`, `at` desc). `old`/`new` are the effective rates before and after (freshness included); each override change is written with its audit entry in one transaction. `outcome` (refresh only) says what the refresh did.
 
 **Charge snapshot.** Bookings, payment requests and transactions that are charged in local currency store (type `ChargeSnapshot`, names fixed): `priceUsdCents`, `chargedCurrency`, `chargedAmountMinor`, `fxRate` (margin not included), `fxRateAsOf`, `fxRateSource`, `fxMarginBps`. The existing visa-fee FX (`appConfig/fx`, Frankfurter/ECB) is a separate flow and is unchanged.
 
-Public view: `GET /rates` (no auth, cacheable) returns only currency, exponent, availability, rate and asOf.
+Public view: `GET /rates` (no auth, cacheable) returns only currency, exponent, availability, rate and asOf. Each instance caches the body for 60 s, dropped at once when that instance changes a rate.
+
+Admin "refresh now": `POST /admin/exchange-rates/:currency/refresh` (admin only, `{ reason? }`) runs the same refresh as the schedule for one currency, audited as `provider_refresh`; a second call within 5 minutes gets 429 with `Retry-After`.
 
 #### Agent and agency prices in US dollars (#179)
 
