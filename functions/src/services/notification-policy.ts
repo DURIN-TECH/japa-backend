@@ -40,6 +40,8 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   document_check_problems: APP_ONLY,
   document_check_could_not_check: APP_ONLY,
   document_check_passed: IN_APP_ONLY,
+  // Refusal-letter analysis (#268): in-app + push, no email (the applicant is in the app).
+  refusal_analysis_ready: APP_ONLY,
   // Documents
   document_status: FULL,
   document_uploaded: FULL,

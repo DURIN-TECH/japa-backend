@@ -17,6 +17,8 @@ import {
   identityWarnings,
   parseRefusalAnswer,
 } from "./refusal-letter-logic";
+import { isSelfServiceApplication } from "../../utils/self-service";
+import { notificationService } from "../notification.service";
 import { documentRequestService } from "../document-request.service";
 import { resolveDisclosureNotice } from "./refusal-disclosure-notice";
 import { sniffMediaType } from "./document-extraction";
@@ -121,6 +123,65 @@ export function refusalAnalysisIdFor(args: { userId: string; documentId: string;
 
 export class RefusalLetterService {
   constructor(private readonly deps: RefusalDeps = defaultDeps()) {}
+
+  /**
+   * Tell a self-service applicant how their refusal-letter analysis ended (#268).
+   * Called by the worker after `runJob` returns "succeeded".
+   *
+   *   outcome "analysed"                          -> in_app + push, "read, here is what to do"
+   *   outcome "unreadable" / "not_a_refusal_letter" -> in_app only, "could not use it"
+   *
+   * Rules:
+   *   - only a `succeeded` analysis of a self-service application (no agentId, no
+   *     agencyId); the agent path is untouched;
+   *   - one claim per analysis id (`refusalAnalysisNotifications/{id}`, `create()`),
+   *     so a duplicate trigger delivery sends nothing; a re-requested letter version
+   *     has a new id and notifies once;
+   *   - the copy is fixed text: NO reason, date or any other value from the letter;
+   *   - NEVER throws and never writes to the analysis record.
+   * The "unreadable" notice drops the push by passing explicit channels (the type's
+   * default policy is in_app + push).
+   */
+  async notifyApplicant(analysisId: string): Promise<void> {
+    try {
+      const rec = await this.getById(analysisId);
+      if (!rec || rec.status !== "succeeded" || !rec.outcome) return;
+
+      const appSnap = await collections.applications.doc(rec.applicationId).get();
+      if (!appSnap.exists) return;
+      const app = { id: appSnap.id, ...appSnap.data() } as Application;
+      if (!isSelfServiceApplication(app)) return;
+
+      // One claim per analysis: `create()` fails if a duplicate delivery got here first.
+      try {
+        await collections.refusalAnalysisNotifications.doc(analysisId).create({
+          applicationId: rec.applicationId,
+          userId: app.userId,
+          outcome: rec.outcome,
+          createdAt: Timestamp.fromDate(this.deps.now()),
+        });
+      } catch {
+        return;
+      }
+
+      const analysed = rec.outcome === "analysed";
+      await notificationService.notifyUser({
+        userId: app.userId,
+        type: "refusal_analysis_ready",
+        title: analysed ? "Your refusal letter has been read" : "We couldn’t use your refusal letter",
+        body: analysed
+          ? "We’ve read your refusal letter. Open the Seli app to see what to do next."
+          : "We couldn’t use that file. A clearer copy of the letter may help, so try uploading it again.",
+        relatedEntityType: "application",
+        relatedEntityId: app.id,
+        data: { analysisId },
+        // Unusable letter: a quiet inbox line only, no push.
+        ...(analysed ? {} : { channels: ["in_app"] }),
+      });
+    } catch (err) {
+      console.error(`[refusal-letter] applicant notify failed for ${analysisId}: ${(err as Error).name}`);
+    }
+  }
 
   /** One analysis by id, or null. */
   async getById(id: string): Promise<RefusalAnalysis | null> {

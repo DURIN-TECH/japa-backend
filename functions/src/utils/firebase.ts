@@ -387,6 +387,10 @@ export const collections = {
   // `{documentId}_{requestedAt millis}`. Created with `create()`, so a duplicate
   // trigger delivery cannot notify twice while a retry (new requestedAt) can. Backend-only.
   documentCheckNotifications: db.collection("documentCheckNotifications"),
+  // One-per-analysis applicant notification claims (issue #268), id = the analysis
+  // id (a re-requested letter version has a new id, so it notifies once more).
+  // Created with `create()` so a duplicate trigger delivery sends nothing. Backend-only.
+  refusalAnalysisNotifications: db.collection("refusalAnalysisNotifications"),
   // Per-day counters that bound the cost of document checks (issue #115):
   // `documentCheckCaps/{applicationId|userId}__{YYYY-MM-DD}` -> { count }.
   // Backend-only, same as above.
