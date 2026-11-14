@@ -430,19 +430,19 @@ service cloud.firestore {
                      get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
                     isAdmin();
       
-      // Users can create consultations
-      allow create: if isAuthenticated() && 
-                      request.resource.data.userId == request.auth.uid;
-      
-      // Users and agents can update consultations
-      allow update: if isOwner(resource.data.userId) ||
-                      (isAgent() &&
-                       exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
-                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
-                      isAdmin();
-      
-      // Only admins can delete consultations
-      allow delete: if isAdmin();
+      // WRITES ARE BACKEND ONLY (issue #180). A consultation carries the
+      // money the client is charged (priceUsdCents, chargedCurrency,
+      // chargedAmountMinor, the fx snapshot, the quote lock), the Paystack
+      // reference that settles it, the superseded checkouts and the
+      // payment status. A client-side create or update could book a
+      // consultation already `paymentStatus: "paid"`, lower the amount
+      // Paystack is asked for, or plant a superseded reference, bypassing the
+      // server-side price, quote lock and Paystack check entirely. Every
+      // write therefore goes through the API (POST /consultations, the
+      // public booking route, PUT/DELETE /consultations/:id, checkout and
+      // verify), which authorizes with CASL; admins too. No portal or app
+      // code writes this collection through the client SDK.
+      allow create, update, delete: if false;
     }
     
     // =====================================    // TRANSACTIONS COLLECTION
@@ -660,6 +660,14 @@ service cloud.firestore {
     //    one event per ADMIN-APPROVED rule or visa-record change, and one
     //    dedupe claim per application it was handled for (who was told what,
     //    issue #123). Written by the backend only. Do NOT add a match.
+
+    //  - consultationPaymentExceptions/{reference}: consultation payments we
+    //    hold but cannot apply (a second charge on a superseded checkout of an
+    //    already-paid booking, or a payment on a cancelled booking), recorded
+    //    for a human to refund (issue #180). Amounts, references and booking
+    //    ids of other people: no client may read or forge one. Do NOT add a
+    //    match. (The superseded checkouts themselves live on the booking, as
+    //    `supersededCheckouts`.)
 
     //  - documentChecks/{documentId} and documentCheckCaps/{id}: per-upload
     //    document checks and their daily cost counters (issue #115). Clients read

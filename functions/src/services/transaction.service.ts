@@ -1,6 +1,7 @@
 import { collections } from "../utils/firebase";
 import { Transaction, TransactionStatus, BankAccount, PaymentRequest } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
+import type { ChargeSnapshot } from "../types/money";
 
 export interface TransactionFilters {
   status?: TransactionStatus;
@@ -216,35 +217,51 @@ class TransactionService {
   }
 
   /**
-   * Record a completed consultation-fee payment (Paystack). Called after a guest
-   * consultation booking's payment is verified, so it's created already
-   * `completed`. Links back to the consultation and the paying client, and stores
-   * the Paystack reference in `providerTransactionId` for reconciliation.
+   * Build (but do not write) a completed consultation-fee Transaction
+   * (Paystack). Used inside the verify transaction
+   * (services/consultation-charge.service.ts `settlePayment`), which writes it
+   * in the SAME commit that flips the booking to paid, so a booking is never
+   * paid without its transaction and a second verify never writes a second
+   * one.
    *
-   * Idempotent by design at the caller: the verify handler only calls this once,
-   * gated on the consultation not already being `paid`.
+   * Issue #180: `amount` is the booking's `chargedAmountMinor` in
+   * `currency` = its `chargedCurrency` (kobo for NGN, as before), and
+   * `snapshot` carries `priceUsdCents` and the rate snapshot (`fxRate`,
+   * `fxRateAsOf`, `fxRateSource`, `fxMarginBps`, `chargedCurrency`,
+   * `chargedAmountMinor`). A LEGACY booking has no snapshot: its naira fee in
+   * kobo is recorded with an empty one. The currency is always explicit:
+   * there is no naira default here any more.
    */
-  async createConsultationFee(input: {
-    consultationId: string;
-    clientUserId: string;
-    agentUserId?: string;
-    amount: number; // in kobo (minor units), like every Transaction.amount
-    currency?: string;
-    reference: string; // Paystack transaction reference
-    clientName?: string;
-    clientEmail?: string;
-  }): Promise<Transaction> {
-    const ref = collections.transactions.doc();
-    const now = Timestamp.now();
-
-    const transaction: Transaction = {
-      id: ref.id,
+  buildConsultationFee(
+    id: string,
+    now: Timestamp,
+    input: {
+      consultationId: string;
+      clientUserId: string;
+      agentUserId?: string;
+      /** Minor units of `currency`, like every Transaction.amount. */
+      amount: number;
+      /** ISO 4217 code of the charge (the booking's chargedCurrency). */
+      currency: string;
+      /** Paystack transaction reference. */
+      reference: string;
+      clientName?: string;
+      clientEmail?: string;
+      /** The booking's charge snapshot (empty for a legacy naira booking). */
+      snapshot?: Partial<ChargeSnapshot>;
+    }
+  ): Transaction {
+    return {
+      // Snapshot first, so the explicit fields below always win.
+      ...(input.snapshot ?? {}),
+      id,
       userId: input.clientUserId,
-      agentId: input.agentUserId,
+      // Undefined is not a valid Firestore value: only set the agent when known.
+      ...(input.agentUserId ? { agentId: input.agentUserId } : {}),
       consultationId: input.consultationId,
       type: "consultation_fee",
       amount: input.amount,
-      currency: input.currency || "NGN",
+      currency: input.currency,
       status: "completed",
       isEscrow: false,
       paymentProvider: "paystack",
@@ -254,14 +271,11 @@ class TransactionService {
         consultationId: input.consultationId,
         reference: input.reference,
       },
-      clientName: input.clientName,
-      clientEmail: input.clientEmail,
+      ...(input.clientName !== undefined ? { clientName: input.clientName } : {}),
+      ...(input.clientEmail !== undefined ? { clientEmail: input.clientEmail } : {}),
       createdAt: now,
       updatedAt: now,
     };
-
-    await ref.set(transaction);
-    return transaction;
   }
 
   // ============================================
