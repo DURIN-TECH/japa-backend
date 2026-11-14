@@ -17,7 +17,8 @@ import {
   validateSharedVisaData,
 } from "../../src/data/shared-visa-data-format";
 import { buildVisaTypeDoc, type SeedVisaFields } from "../../src/data/seed-visa-doc";
-import { FIXTURE_DATA } from "../helpers/shared-visa-fixture";
+import { FIXTURE_DATA, FIXTURE_FEE, fixtureDataWithFee } from "../helpers/shared-visa-fixture";
+import { routeFeesFor } from "../../src/data/shared-visa-data-format";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
@@ -106,6 +107,111 @@ describe("validateSharedVisaData", () => {
   });
 });
 
+// ============================================
+// Issue #299: the optional fee of a shared route
+// ============================================
+describe("validateSharedVisaData: a route's fee (#299)", () => {
+  /** The errors of the fixture with one fee field replaced (or removed with `undefined`). */
+  const errorsWith = (field: string, value: unknown): string[] => {
+    const d: any = fixtureDataWithFee();
+    if (value === undefined) delete d.sharedRoutes[0].fee[field];
+    else d.sharedRoutes[0].fee[field] = value;
+    const r = validateSharedVisaData(d);
+    return r.ok ? [] : r.errors;
+  };
+
+  test("a complete fee is valid and kept as written; a route with no fee stays valid", () => {
+    const r = validateSharedVisaData(fixtureDataWithFee());
+    assert.equal(r.ok, true);
+    if (r.ok) assert.deepEqual(r.data.sharedRoutes[0].fee, FIXTURE_FEE);
+    const none = validateSharedVisaData(FIXTURE_DATA);
+    assert.equal(none.ok, true);
+    if (none.ok) assert.equal("fee" in none.data.sharedRoutes[0], false);
+  });
+
+  test("the rule reference is optional, and absent stays absent", () => {
+    const d: any = fixtureDataWithFee();
+    delete d.sharedRoutes[0].fee.ruleRef;
+    const r = validateSharedVisaData(d);
+    assert.equal(r.ok, true);
+    if (r.ok) assert.equal("ruleRef" in r.data.sharedRoutes[0].fee!, false);
+    assert.ok(errorsWith("ruleRef", { routeKey: "", version: 0, criterionId: "" }).length >= 3);
+  });
+
+  test("the amount must be a finite number above 0", () => {
+    for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, "250", undefined]) {
+      assert.ok(errorsWith("amount", bad).some((e) => e.includes("fee.amount")), `amount=${String(bad)}`);
+    }
+  });
+
+  test("the currency must be a known ISO 4217 code", () => {
+    for (const bad of ["XXQ", "sek", "", 5, undefined]) {
+      assert.ok(errorsWith("currency", bad).some((e) => e.includes("fee.currency")), `currency=${String(bad)}`);
+    }
+  });
+
+  test("the quote must state both the amount and the currency code, as written", () => {
+    // The amount is missing, or only appears inside another number.
+    assert.ok(errorsWith("quote", "Placeholder sentence stating that the fee is SEK 1250.").some((e) => e.includes("does not state the amount")));
+    assert.ok(errorsWith("quote", "Placeholder sentence stating that the fee is SEK 250.50.").some((e) => e.includes("does not state the amount")));
+    assert.ok(errorsWith("quote", "Placeholder sentence stating a fee in SEK.").some((e) => e.includes("does not state the amount")));
+    // The currency code is missing, or only appears inside another word.
+    assert.ok(errorsWith("quote", "Placeholder sentence stating that the fee is 250.").some((e) => e.includes("does not state the currency")));
+    assert.ok(errorsWith("quote", "Placeholder sentence: SEKTOR fee 250.").some((e) => e.includes("does not state the currency")));
+    assert.ok(errorsWith("quote", "").some((e) => e.includes("fee.quote")));
+    // Thousands separators and trailing decimals are read as the source writes them.
+    const d: any = fixtureDataWithFee();
+    d.sharedRoutes[0].fee.amount = 1500;
+    d.sharedRoutes[0].fee.quote = "Placeholder sentence stating that the fee is SEK 1,500.00.";
+    assert.equal(validateSharedVisaData(d).ok, true);
+  });
+
+  test("the address must be https, and the source id must not be empty", () => {
+    for (const bad of ["http://bloc.example.org/fees", "not a url", "", undefined]) {
+      assert.ok(errorsWith("url", bad).some((e) => e.includes("fee.url")), `url=${String(bad)}`);
+    }
+    for (const bad of ["", "   ", undefined]) {
+      assert.ok(errorsWith("guidanceSourceId", bad).some((e) => e.includes("fee.guidanceSourceId")), `id=${String(bad)}`);
+    }
+  });
+
+  test("every problem of a fee is listed at once, and the file is refused", () => {
+    const d: any = fixtureDataWithFee();
+    d.sharedRoutes[0].fee = { amount: -1, currency: "nope", label: "", quote: "", url: "http://x.example.org", guidanceSourceId: "", surprise: 1 };
+    const r = validateSharedVisaData(d);
+    assert.equal(r.ok, false);
+    if (!r.ok) {
+      for (const field of ["amount", "currency", "label", "quote", "url", "guidanceSourceId", "surprise"]) {
+        assert.ok(r.errors.some((e) => e.includes(`fee.${field}`)), `${field} is listed: ${r.errors.join(" | ")}`);
+      }
+    }
+    assert.throws(() => loadSharedVisaData(d), SharedVisaDataError);
+    const notObject: any = fixtureDataWithFee();
+    notObject.sharedRoutes[0].fee = "250 SEK";
+    assert.equal(validateSharedVisaData(notObject).ok, false);
+  });
+
+  test("the shipped file: any fee in it passes the same checks (shape only, no legal fact asserted)", () => {
+    for (const route of loadSharedVisaData().sharedRoutes) {
+      if (!route.fee) continue;
+      assert.ok(route.fee.amount > 0);
+      assert.match(route.fee.url, /^https:\/\//);
+      assert.ok(route.fee.quote.includes(route.fee.currency));
+    }
+  });
+});
+
+describe("routeFeesFor (#299)", () => {
+  test("gives the fee only to a record the data file lists under a route that has one", () => {
+    const data = loadSharedVisaData(fixtureDataWithFee());
+    assert.deepEqual(routeFeesFor(data, "XA", "xa-visitor"), [{ sharedRouteId: "example-short-stay", fee: FIXTURE_FEE }]);
+    assert.deepEqual(routeFeesFor(data, "XA", "xa-work"), []);
+    assert.deepEqual(routeFeesFor(data, "XB", "xa-visitor"), []);
+    // The same record, but the route has no fee.
+    assert.deepEqual(routeFeesFor(loadSharedVisaData(FIXTURE_DATA), "XA", "xa-visitor"), []);
+  });
+});
+
 describe("inheritsFromFor", () => {
   test("names the shared route only for the record the data file lists", () => {
     const data = loadSharedVisaData(FIXTURE_DATA);
@@ -155,5 +261,49 @@ describe("buildVisaTypeDoc (the seed's whole-document write)", () => {
     assert.deepEqual(buildVisaTypeDoc(visa, { inheritsFrom: [] }, NOW, [{ sharedRouteId: "from-data" }]).inheritsFrom, [{ sharedRouteId: "from-data" }]);
     assert.equal("inheritsFrom" in buildVisaTypeDoc(visa, undefined, NOW, []), false);
     assert.equal("inheritsFrom" in buildVisaTypeDoc(visa, { inheritsFrom: [] }, NOW, []), false);
+  });
+});
+
+describe("buildVisaTypeDoc with a sourced fee (#299)", () => {
+  const NOW = Timestamp.fromMillis(Date.parse("2026-11-14T10:00:00Z"));
+  const visa: SeedVisaFields = {
+    id: "xa-visitor", countryCode: "XA", name: "Short Stay Visa", code: "SHORT-STAY", description: "d", category: "tourist",
+    processingTime: "2-4 weeks", processingDaysMin: 14, processingDaysMax: 28, isExtendable: false, eligibilityCriteria: [],
+  };
+  const sourced = {
+    baseCostUsd: 27,
+    sourcedFee: {
+      sharedRouteId: "example-short-stay", quote: FIXTURE_FEE.quote, url: FIXTURE_FEE.url, guidanceSourceId: FIXTURE_FEE.guidanceSourceId,
+      fee: { components: [], totals: [], totalUsd: 27.2 },
+    },
+  };
+  /** Every key of a value, at any depth, whose value is `undefined`. */
+  const undefinedKeys = (v: unknown, at = ""): string[] =>
+    v && typeof v === "object" && !(v instanceof Timestamp)
+      ? Object.entries(v as Record<string, unknown>).flatMap(([k, x]) => (x === undefined ? [`${at}${k}`] : undefinedKeys(x, `${at}${k}.`)))
+      : [];
+
+  test("writes baseCostUsd and sourcedFee together, keeps inheritsFrom, and has no undefined key", () => {
+    const stored = { inheritsFrom: [{ sharedRouteId: "example-short-stay" }], isActive: true, agentIds: [], createdAt: NOW };
+    const doc = buildVisaTypeDoc(visa, stored, NOW, [{ sharedRouteId: "example-short-stay" }], sourced);
+    assert.equal(doc.baseCostUsd, 27);
+    assert.deepEqual(doc.sourcedFee, sourced.sourcedFee);
+    assert.deepEqual(doc.inheritsFrom, [{ sharedRouteId: "example-short-stay" }]);
+    assert.deepEqual(undefinedKeys(doc), []);
+  });
+
+  test("without a sourced fee neither field is written (a re-seed drops a stored one), and no key is undefined", () => {
+    const stored = { baseCostUsd: 27, sourcedFee: sourced.sourcedFee, inheritsFrom: [{ sharedRouteId: "example-short-stay" }] };
+    const doc = buildVisaTypeDoc(visa, stored, NOW, [{ sharedRouteId: "example-short-stay" }], undefined);
+    assert.equal("baseCostUsd" in doc, false);
+    assert.equal("sourcedFee" in doc, false);
+    assert.deepEqual(doc.inheritsFrom, [{ sharedRouteId: "example-short-stay" }]);
+    assert.deepEqual(undefinedKeys(doc), []);
+  });
+
+  test("a record with its own seed fee and no sourced fee is written exactly as before", () => {
+    const doc = buildVisaTypeDoc({ ...visa, baseCostUsd: 5 }, undefined, NOW);
+    assert.equal(doc.baseCostUsd, 5);
+    assert.equal("sourcedFee" in doc, false);
   });
 });

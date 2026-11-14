@@ -44,6 +44,22 @@
 //         destinations: { mode: "members_of", authorityId: "example-area" },
 //         // The visa records (through-country records) that inherit the route:
 //         inheritedBy: [{ countryCode: "XA", visaTypeId: "xa-visitor" }],
+//         // OPTIONAL (issue #299): the government fee the route's official
+//         // source sets for every member, in the source's own currency. The
+//         // seed converts it to USD with the stored exchange rate and writes
+//         // it on each record under `inheritedBy` (which must then have no
+//         // `baseCostUsd` of its own in the seed). Copy `quote` and `url`
+//         // from the official source; the quote must itself state the amount
+//         // and the currency code, or the file is refused.
+//         fee: {
+//           amount: 250,                   // the figure the quote states, above 0
+//           currency: "SEK",               // ISO 4217, as the quote writes it
+//           label: "Visa fee",             // the source's own name for the fee
+//           quote: "<verbatim sentence stating the fee, e.g. '... SEK 250.'>",
+//           url: "https://www.gov.example.org/fees",   // https only
+//           guidanceSourceId: "<id of the stored official source (guidanceSources)>",
+//           // ruleRef: { routeKey: "<rulebook key>", version: 1, criterionId: "<rule id>" },  // optional
+//         },
 //       },
 //     ],
 //   };
