@@ -196,6 +196,45 @@ const MAX_PARENT_LOOKBACK_LINES = 250;
 /** Longest title a label line may have and still read as a heading. */
 const MAX_HEADING_TITLE_CHARS = 120;
 
+/** How many lines above a quote the heading reader looks (a section is long; one page of guidance is about 2,000 lines). */
+const MAX_HEADING_LOOKBACK_LINES = 1500;
+
+/** A plain section number that starts a line: "9.6 Title", "12. Title", "3) Title". Language-neutral digits only. */
+const SECTION_NUMBER_RE = /^(?:\d+(?:\.\d+)+[.)]?|\d+[.)])(?=\s)/u;
+
+/** A mark that ends a sentence or a clause, in the scripts the product reads (ASCII, CJK, Arabic, Devanagari danda). */
+const SENTENCE_END_RE = /[.:;,!?\u2026\u3002\uFF01\uFF1F\uFF1A\uFF1B\uFF0C\u061B\u061F\u060C\u0964]$/u;
+
+/**
+ * A title that has words in it: a run of three letters in any alphabet, or two characters of an ideographic or
+ * Korean script (which write a word in two). A label followed by something that is not words ("S3 8WA", a postcode)
+ * is not a heading.
+ */
+const HAS_WORDS_RE = /\p{L}{3,}|[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]{2,}/u;
+
+/** Shortest part of a condition that can be located in the text (a shorter one would match almost anywhere). */
+export const MIN_CONDITION_PART_CHARS = 8;
+
+/** Where a rule's applicability condition is written in the stored text (decided by code, see `conditionSite`). */
+export const CONDITION_FOUND_AT = ["in_quote", "list_lead_in", "section_heading", "text_before", "elsewhere_on_page", "not_found"] as const;
+export type ConditionFoundAt = (typeof CONDITION_FOUND_AT)[number];
+
+/**
+ * A condition as the parts that must be found: whitespace-normalised, trimmed of
+ * surrounding marks and quotation marks, split at an ellipsis, lower-cased;
+ * parts under MIN_CONDITION_PART_CHARS are dropped. [] = cannot be located.
+ */
+export function conditionParts(condition: string): string[] {
+  const norm = normalizeForQuoteMatch(condition).toLocaleLowerCase();
+  const out: string[] = [];
+  for (const raw of norm.split(/\s*(?:\.{3}|\u2026)\s*/u)) {
+    const part = raw.replace(/^[\s.:;,"'\u201C\u201D\u2018\u2019(]+|[\s.:;,"'\u201C\u201D\u2018\u2019)]+$/gu, "");
+    if (part.length >= MIN_CONDITION_PART_CHARS) out.push(part);
+  }
+  // A condition with a part too short to locate cannot be located as a whole: do not claim a match on the rest.
+  return out.length === norm.split(/\s*(?:\.{3}|\u2026)\s*/u).filter((x) => x.trim()).length ? out : [];
+}
+
 /** A label with its trailing full stop removed and spaces collapsed. */
 function normalizeRefLabel(label: string): string {
   return label.replace(/\s+/gu, " ").replace(/\.$/u, "").trim();
@@ -540,6 +579,16 @@ export class SnapshotQuoteIndex {
    * `maxChars`.
    */
   listLeadIn(found: Extract<QuoteLookup, { ok: true }>, maxChars: number): string {
+    const text = this.leadInLine(found);
+    return text.length <= maxChars ? text : text.slice(text.length - Math.max(0, maxChars));
+  }
+
+  /**
+   * (#242) The WHOLE line `listLeadIn` cuts from (same rules, no cut): the
+   * nearest earlier line that is not a list item, when the quote is a bracketed
+   * list item. "" for anything else and for a PDF page.
+   */
+  leadInLine(found: Extract<QuoteLookup, { ok: true }>): string {
     if (this.paginated) return "";
     const line = this.units[found.unit].text;
     const limb = LIMB_RE.exec(line);
@@ -549,9 +598,151 @@ export class SnapshotQuoteIndex {
       if (!text) continue;
       // A sibling item: keep walking back to the sentence above the list.
       if (LIMB_RE.test(text)) continue;
-      return text.length <= maxChars ? text : text.slice(text.length - Math.max(0, maxChars));
+      return text;
     }
     return "";
+  }
+
+  // ---- (#242) section headings and where a condition is written ----
+
+  /** The lines (normalised) of the quote's own unit that come BEFORE the quote, for the heading reader: web = whole earlier lines; PDF = the page's earlier lines. */
+  private linesBefore(found: Extract<QuoteLookup, { ok: true }>): string[] {
+    if (!this.paginated) {
+      const out: string[] = [];
+      for (let i = found.unit - 1; i >= 0 && found.unit - i <= MAX_HEADING_LOOKBACK_LINES; i--) if (this.units[i].text) out.push(this.units[i].text);
+      return out.reverse();
+    }
+    // A PDF page is ONE unit and its normalised text has lost the line breaks; the stored per-page text
+    // has not. Keep only the raw lines that END before the quote starts (found by walking a cursor through the
+    // normalised page), so headings come from the SAME PAGE and from ABOVE the quote only.
+    const raw = this.snapshot.pages?.[found.unit]?.text ?? "";
+    const page = this.units[found.unit].text;
+    const out: string[] = [];
+    let cursor = 0;
+    for (const rawLine of raw.split(/\n/u)) {
+      const line = normalizeForQuoteMatch(rawLine);
+      if (!line) continue;
+      const pos = page.indexOf(line, cursor);
+      if (pos < 0 || pos + line.length > found.at) break;
+      out.push(line);
+      cursor = pos + line.length;
+    }
+    return out;
+  }
+
+  /**
+   * (#242) The section headings above a located quote, NEAREST LAST, at most
+   * `maxHeadings`, each at most `maxChars` characters. Read from the stored
+   * text by code; no model writes or edits one.
+   *
+   * What counts as a heading, with NO language-specific word:
+   *  - a LABELLED heading: a line that begins with a reference label of this
+   *    document's language (the lexicon's `lineLabelReFor`, #220) or a plain
+   *    section number ("9.6", "1."), followed by a short title with no
+   *    sentence punctuation at the end;
+   *  - an UNLABELLED heading: a short line (at most MAX_HEADING_TITLE_CHARS) that
+   *    does not end with a sentence or clause mark, does not start with a list
+   *    marker or a lower-case letter (a lower-case start continues a sentence:
+   *    the same strict reading `rubric-list-items.ts` uses for unmarked lists),
+   *    and is not directly followed by another such short line (a run of short
+   *    lines is a list, not a heading).
+   * The chain: the nearest heading, then (going further up) only headings that
+   * are LABELLED with a shallower depth than the one before (the sections it
+   * sits in). The shape is advisory context for the reader; it never decides
+   * anything by itself.
+   *
+   * Web: lines of the cleaned text. PDF: the lines of the quote's own page that
+   * come before the quote (never another page). Empty list when there is none.
+   */
+  headingsAbove(found: Extract<QuoteLookup, { ok: true }>, maxHeadings = 3, maxChars = 200): string[] {
+    const lines = this.linesBefore(found);
+    const labelRe = lineLabelReFor(this.lexicon);
+    /** Depth of a labelled line (count of numeric parts), or undefined when it is not a labelled heading. */
+    const labelledDepth = (line: string): number | undefined => {
+      const m = labelRe.exec(line) ?? SECTION_NUMBER_RE.exec(line);
+      if (!m || !isHeadingLine(line, m[0].length) || !HAS_WORDS_RE.test(line.slice(m[0].length))) return undefined;
+      return (m[0].match(/\d+/gu) ?? []).length || 1;
+    };
+    /** True for a short, unpunctuated line that does not look like a list item or a sentence continuation. */
+    const looksLikeTitle = (line: string): boolean => line.length <= MAX_HEADING_TITLE_CHARS && HAS_WORDS_RE.test(line) && !SENTENCE_END_RE.test(line) && !LIMB_RE.test(line) && !/^\p{Ll}/u.test(line);
+    const isShortRunLine = (line: string | undefined): boolean => line !== undefined && line.length <= MAX_HEADING_TITLE_CHARS && !SENTENCE_END_RE.test(line);
+
+    const chain: string[] = [];
+    let depth: number | undefined; // depth of the last labelled heading taken (undefined: none yet)
+    // The line right after the candidate (the quote's own line for the last one).
+    for (let i = lines.length - 1; i >= 0 && chain.length < Math.max(0, maxHeadings); i--) {
+      const line = lines[i];
+      const d = labelledDepth(line);
+      if (d !== undefined) {
+        // A labelled heading counts when it is the nearest of all or sits shallower than the last one taken.
+        if (chain.length === 0 || depth === undefined || d < depth) {
+          chain.push(line);
+          depth = d;
+        }
+        continue;
+      }
+      // An unlabelled heading only OPENS the chain (nothing taken yet), and only when it is not part of a run of short lines.
+      if (chain.length === 0 && looksLikeTitle(line) && !isShortRunLine(lines[i + 1])) {
+        chain.push(line);
+      }
+    }
+    return chain.reverse().map((h) => (h.length <= maxChars ? h : h.slice(0, maxChars)));
+  }
+
+  /**
+   * (#242) WHERE the rule's `applicabilityCondition` is written in the stored
+   * text, decided by code: the first of these that holds.
+   *   in_quote            every part of the condition is inside the quote
+   *   list_lead_in        inside the sentence that introduces the list the quote is an item of
+   *   section_heading     equals (or is contained in / contains) one of `headings`
+   *   text_before         earlier in the quote's own line (or PDF page)
+   *   elsewhere_on_page   elsewhere in the stored text
+   *   not_found           nowhere (the condition is the model's own words)
+   * `line` is the whole line the condition sits on, at most `maxLine` characters
+   * (cut around the condition), for every site except in_quote and not_found.
+   *
+   * A condition is written by the drafter as an excerpt: trailing marks are
+   * ignored and an ellipsis ("...", "…") splits it into parts that must ALL be
+   * found. Case is ignored (a heading may be printed in capitals); nothing else
+   * is folded. A part shorter than MIN_CONDITION_PART_CHARS cannot be located
+   * (it would match almost anywhere), so a condition made only of such parts is
+   * `not_found`.
+   */
+  conditionSite(found: Extract<QuoteLookup, { ok: true }>, condition: string, headings: readonly string[], maxLine = 400): { at: ConditionFoundAt; line?: string } {
+    const parts = conditionParts(condition);
+    if (parts.length === 0) return { at: "not_found" };
+    const lower = (t: string) => t.toLocaleLowerCase();
+    const hasAll = (haystack: string): boolean => {
+      const h = lower(haystack);
+      return parts.every((p) => tokenBoundedPositions(h, p).length > 0);
+    };
+    /** The line text cut to maxLine around the first part found in it. */
+    const clip = (line: string): string => {
+      if (line.length <= maxLine) return line;
+      const first = Math.max(0, lower(line).indexOf(parts[0]));
+      const from = Math.min(Math.max(0, first - Math.floor(maxLine / 4)), line.length - maxLine);
+      return line.slice(from, from + maxLine);
+    };
+    const quoteText = found.matched;
+    if (hasAll(quoteText)) return { at: "in_quote" };
+    const leadIn = this.leadInLine(found);
+    if (leadIn && hasAll(leadIn)) return { at: "list_lead_in", line: clip(leadIn) };
+    const wholeCondition = lower(parts.join(" "));
+    for (let i = headings.length - 1; i >= 0; i--) {
+      const h = lower(headings[i]);
+      // A heading contained in the condition counts only when it is long enough to mean something.
+      if (hasAll(headings[i]) || (h.length >= MIN_CONDITION_PART_CHARS && lower(condition).includes(h)) || h === wholeCondition) return { at: "section_heading", line: clip(headings[i]) };
+    }
+    const own = this.units[found.unit].text;
+    if (hasAll(own.slice(0, found.at))) return { at: "text_before", line: clip(own) };
+    // Elsewhere: the nearest earlier line first, then any other line.
+    const order: number[] = [];
+    for (let i = found.unit - 1; i >= 0; i--) order.push(i);
+    for (let i = found.unit + 1; i < this.units.length; i++) order.push(i);
+    for (const i of order) {
+      if (this.units[i].text && hasAll(this.units[i].text)) return { at: "elsewhere_on_page", line: clip(this.units[i].text) };
+    }
+    return { at: "not_found" };
   }
 
   /** True when a literal appears in the document, verbatim and token-bounded. */
