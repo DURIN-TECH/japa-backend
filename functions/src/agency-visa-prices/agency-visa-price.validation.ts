@@ -4,27 +4,34 @@
 //
 // Pure functions (no I/O), unit-tested in test/agency-visa-prices/.
 //
-// MONEY UNIT: prices are WHOLE NAIRA. ₦12,500 is sent and stored as 12500.
-// There is no kobo / cents conversion anywhere in this module, and there must
-// never be one (the old `Agent.serviceFees` comment said "cents" and was
-// never used; see the gotcha on `consultationFee`).
+// MONEY UNIT (issue #179): prices are US DOLLARS. The body sends
+// `{ "priceUsd": { "amount": "125.00", "currency": "USD" } }` and the doc
+// stores the Money `{ amountMinor: 12500, currency: "USD" }`. The dollar ->
+// cents step happens in `parseUsdPriceInput` (money/usd-price.ts, currency
+// table), never with a literal 100 here. The old whole-naira `price` number
+// is gone; sending it is a 400.
 //
 // Errors reuse `AgencyVisaError` from the agency visa module (#100), so every
 // `/agency/...` endpoint answers with the same envelope:
 // `{ success: false, error, message, field? }`.
 
 import { AgencyVisaError } from "../agency-visas/agency-visa.validation";
+import type { Money } from "../types/money";
+import { isPriceInputError, MAX_PRICE_USD_CENTS, parseUsdPriceInput } from "../money/usd-price";
 
 // ============================================
 // Limits
 // ============================================
 
 /**
- * Largest price an agency can set, in naira (₦100,000,000). Anything above it
- * is treated as a typo ("absurdly large" in the issue) and refused with 400.
- * Well inside Number.MAX_SAFE_INTEGER, so integer checks stay exact.
+ * Largest price an agency can set, in US cents: the one cap every dollar
+ * price shares (MAX_PRICE_USD_CENTS, $100,000.00, issue #179). Anything above
+ * it is treated as a typo and refused with 400.
  */
-export const MAX_VISA_SERVICE_PRICE_NAIRA = 100_000_000;
+export const MAX_VISA_SERVICE_PRICE_USD_CENTS = MAX_PRICE_USD_CENTS;
+
+/** The one body key this endpoint accepts. */
+const PRICE_FIELD = "priceUsd";
 
 /** Longest visa id accepted in the path (Firestore ids are far shorter in practice). */
 const MAX_VISA_ID_LENGTH = 200;
@@ -40,8 +47,8 @@ function invalid(field: string, message: string): AgencyVisaError {
 
 /** A parsed `PUT` body: a price to store, or `null` to clear it. */
 export interface ParsedVisaPriceBody {
-  /** Whole naira, 0..MAX_VISA_SERVICE_PRICE_NAIRA; null = clear the price. */
-  price: number | null;
+  /** A validated dollar price (0..MAX_VISA_SERVICE_PRICE_USD_CENTS cents); null = clear it. */
+  priceUsd: Money | null;
 }
 
 /** The visa a request targets: `countries/{countryCode}/visaTypes/{visaTypeId}`. */
@@ -58,13 +65,16 @@ export interface VisaPriceTarget {
 /**
  * Validate the body of `PUT /agency/visa-prices/:countryCode/:visaTypeId`.
  *
- * Accepts exactly `{ price }`:
- *  - a JSON number that is an integer, >= 0 and <= MAX_VISA_SERVICE_PRICE_NAIRA;
+ * Accepts exactly `{ priceUsd }` (issue #179):
+ *  - a dollar price `{ amount: "125.00" | 125, currency?: "USD" }`, checked by
+ *    `parseUsdPriceInput`: finite, >= 0, whole cents, at most the cap, USD
+ *    only;
  *  - or `null`, which clears the price (same as DELETE).
- * Refused with 400 (field "price", nothing saved): a missing price, a string
- * (even "12500": the client must send a number), a boolean, NaN / Infinity,
- * a fraction (no kobo), a negative or a too-large value. Any other key is a
- * 400 UNKNOWN_FIELD, so tampering is visible instead of silently dropped.
+ * Refused with 400 (field "priceUsd", nothing saved): a missing price, a
+ * bare number, a string, a fraction of a cent, a negative, a too-large value
+ * or another currency. Any other key (the old naira `price` included) is a
+ * 400 UNKNOWN_FIELD, so tampering or a stale client is visible instead of
+ * silently dropped.
  *
  * @param body the raw request body
  * @returns the parsed price (or null to clear)
@@ -72,35 +82,39 @@ export interface VisaPriceTarget {
  */
 export function parseVisaPriceBody(body: unknown): ParsedVisaPriceBody {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
-    throw invalid("price", "send a JSON object like { \"price\": 12500 }");
+    throw invalid(PRICE_FIELD, "send a JSON object like { \"priceUsd\": { \"amount\": \"125.00\", \"currency\": \"USD\" } }");
   }
   const record = body as Record<string, unknown>;
 
-  // ---- Only `price` is accepted ----
+  // ---- Only `priceUsd` is accepted ----
   for (const key of Object.keys(record)) {
-    if (key !== "price") {
+    if (key === "price") {
+      // The retired naira field: say where it went.
+      throw new AgencyVisaError(
+        "UNKNOWN_FIELD",
+        "price: was replaced by priceUsd (US dollars), e.g. { \"amount\": \"125.00\", \"currency\": \"USD\" }",
+        400,
+        key
+      );
+    }
+    if (key !== PRICE_FIELD) {
       throw new AgencyVisaError("UNKNOWN_FIELD", `${key}: is not a field you can set here`, 400, key);
     }
   }
-  if (!("price" in record)) throw invalid("price", "is required (send null to clear it)");
-
-  const price = record.price;
+  if (!(PRICE_FIELD in record)) throw invalid(PRICE_FIELD, "is required (send null to clear it)");
 
   // ---- null clears ----
-  if (price === null) return { price: null };
+  if (record.priceUsd === null) return { priceUsd: null };
 
-  // ---- A whole, non-negative, bounded number of naira ----
-  if (typeof price !== "number" || !Number.isFinite(price)) {
-    throw invalid("price", "must be a number of naira");
+  // ---- A dollar price, validated in the one shared place ----
+  try {
+    return { priceUsd: parseUsdPriceInput(record.priceUsd, PRICE_FIELD) };
+  } catch (error) {
+    if (isPriceInputError(error)) {
+      throw new AgencyVisaError("VALIDATION_ERROR", error.message, 400, PRICE_FIELD);
+    }
+    throw error;
   }
-  if (!Number.isInteger(price)) {
-    throw invalid("price", "must be a whole number of naira (no kobo)");
-  }
-  if (price < 0) throw invalid("price", "must be 0 or more");
-  if (price > MAX_VISA_SERVICE_PRICE_NAIRA) {
-    throw invalid("price", `must be at most ${MAX_VISA_SERVICE_PRICE_NAIRA} naira`);
-  }
-  return { price };
 }
 
 // ============================================

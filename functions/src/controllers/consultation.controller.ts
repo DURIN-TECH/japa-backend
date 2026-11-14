@@ -7,6 +7,8 @@ import { userService } from "../services/user.service";
 import { transactionService } from "../services/transaction.service";
 import { paystackProvider } from "../services/billing/paystack.provider";
 import { EMAIL_BRANDING } from "../services/email/branding";
+// Issue #179: the agency fee is stored in US dollars now.
+import { readStoredUsd } from "../money/usd-price";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
 import { authController } from "./auth.controller";
 import { collections, auth } from "../utils/firebase";
@@ -563,10 +565,13 @@ export class ConsultationController {
    * body, so a guest can't set their own price. No per-plan monthly limit applies
    * to guest bookings — the fee itself is the gate.
    *
-   * UNITS: `agency.consultationFee` is stored in whole Naira by the portal (raw
-   * value from a ₦ input, displayed with no /100). Paystack expects kobo, so the
-   * charge is `fee * 100`. The consultation/transaction `amount` fields keep the
-   * same Naira unit as the source for display consistency.
+   * UNITS (issue #179): the agency fee is now stored in US DOLLARS
+   * (`agency.consultationFeeUsd`). Turning it into a naira charge (quote at
+   * the current rate, lock it, store the ChargeSnapshot) is issue #180. Until
+   * #180 lands this path FAILS CLOSED for a paid agency: it answers 503
+   * PRICING_UNAVAILABLE before creating any account, booking or checkout,
+   * rather than read the removed naira field as 0 and book a paid
+   * consultation for free. A zero-fee (or no-fee) agency still books free.
    */
   async createPublicConsultation(
     req: AuthenticatedRequest,
@@ -625,6 +630,24 @@ export class ConsultationController {
         return;
       }
 
+      // --- Paid booking needs the #180 dollar charge path (fail closed) ------
+      // Checked BEFORE anything is written (no account, no booking).
+      const feeUsd = readStoredUsd(agency.consultationFeeUsd);
+      const legacyNairaFee = (agency as unknown as { consultationFee?: unknown }).consultationFee;
+      const hasPaidFee =
+        (feeUsd !== null && feeUsd.amountMinor > 0) ||
+        // A not-yet-migrated doc still carrying a naira fee is paid too.
+        (typeof legacyNairaFee === "number" && legacyNairaFee > 0);
+      if (hasPaidFee) {
+        sendError(
+          res,
+          "PRICING_UNAVAILABLE",
+          "Paid consultation booking is temporarily unavailable. Please try again later.",
+          503
+        );
+        return;
+      }
+
       // --- Resolve or provision the client by email --------------------------
       // Mirrors application.controller.ts:269-321 so a guest booking links to a
       // real (claimable) account the client can later sign into with this email.
@@ -669,11 +692,11 @@ export class ConsultationController {
         }
       }
 
-      // --- Fee is server-authoritative (Naira) -------------------------------
-      const feeNaira =
-        agency.consultationFee && agency.consultationFee > 0
-          ? agency.consultationFee
-          : 0;
+      // --- Fee is server-authoritative ------------------------------------
+      // Only free bookings reach here until #180 (see the paid check above),
+      // so the naira fee is always 0. The paid branch below is kept for #180
+      // to rewire onto the dollar quote.
+      const feeNaira = 0 as number;
 
       // --- Create the consultation -------------------------------------------
       const { Timestamp } = await import("firebase-admin/firestore");

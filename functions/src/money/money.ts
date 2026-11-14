@@ -137,6 +137,35 @@ export function convertUsdToLocal(usd: Money, rate: number, localCurrency: Curre
   return { amountMinor: bigToSafeNumber(rounded), currency: local };
 }
 
+/**
+ * The reverse conversion: a LOCAL amount -> US cents at `rate` (local units
+ * per 1 USD), rounded HALF UP to a whole cent, once, at the end (issue #179).
+ *
+ *   usdCents = localMinor / 10^localExp  /  rate  x  10^usdExp
+ *
+ * Used ONLY by the one-off price migration (naira prices -> dollars at the
+ * owner-chosen rate). No margin: a migration restates a price, it does not
+ * charge anyone. Same integer-only maths as `convertUsdToLocal` (the rate is
+ * scaled to 6 decimals first), and the minor-unit factors come from the
+ * currency table, never from a literal 100.
+ */
+export function convertLocalToUsd(local: Money, rate: number): Money {
+  const code = normalizeCurrencyCode(local.currency);
+  if (!code || !getCurrencyInfo(code)) {
+    throw new MoneyError("CURRENCY_UNSUPPORTED", `Unknown currency "${String(local.currency)}"`);
+  }
+  if (!Number.isSafeInteger(local.amountMinor) || local.amountMinor < 0) {
+    throw new MoneyError("INVALID_INPUT", "Amount must be a non-negative integer number of minor units");
+  }
+  // localMinor x 10^usdExp x 10^6  /  (10^localExp x rate x 10^6)
+  const numerator = BigInt(local.amountMinor) * minorUnitFactor("USD") * RATE_SCALE_FACTOR;
+  const denominator = minorUnitFactor(code) * scaleRate(rate);
+
+  // Half up: add half the denominator, then floor-divide (all values >= 0).
+  const rounded = (numerator * 2n + denominator) / (denominator * 2n);
+  return { amountMinor: bigToSafeNumber(rounded), currency: "USD" };
+}
+
 /** BigInt -> number, refusing anything past Number.MAX_SAFE_INTEGER. */
 function bigToSafeNumber(value: bigint): number {
   if (value > BigInt(Number.MAX_SAFE_INTEGER)) {

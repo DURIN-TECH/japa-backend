@@ -11,8 +11,19 @@ import {
   Agent,
   User,
 } from "../types";
-import { Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { claimsService } from "./claims.service";
+// Issue #179: prices are US dollars (validated input, tolerant stored reads,
+// and the local figure on public reads).
+import type { LocalPriceQuote, Money } from "../types/money";
+import {
+  isPriceInputError,
+  parseUsdPriceInput,
+  PriceInputError,
+  readStoredUsd,
+  type LocalPricer,
+} from "../money";
+import { zeroUsd } from "../money/usd-price";
 import { entitlementService } from "./entitlement.service";
 import { AuthzSubject, ROLES } from "@durin-tech/authz";
 
@@ -68,9 +79,18 @@ export const AGENCY_OWNER_EDITABLE_FIELDS = [
   "address",
   "state",
   "description",
-  "consultationFee",
+  // Issue #179: the dollar fee replaces the naira `consultationFee`; both
+  // prices (this and each service's `priceUsd`) are validated by
+  // readAgencyProfileInput before they reach this list.
+  "consultationFeeUsd",
   "services",
 ] as const;
+
+/**
+ * Body keys of the old naira prices (#144/#148). Sending one is a 400 (not a
+ * silent drop), so a client still on the naira screen learns the field moved.
+ */
+const RETIRED_AGENCY_PRICE_FIELDS = ["consultationFee"] as const;
 
 /** The owner-editable profile of an agency (see AGENCY_OWNER_EDITABLE_FIELDS). */
 export interface AgencyProfileInput {
@@ -78,7 +98,9 @@ export interface AgencyProfileInput {
   address?: string | null;
   state?: string | null;
   description?: string | null;
-  consultationFee?: number | null;
+  /** Validated dollar fee; null clears it (issue #179). */
+  consultationFeeUsd?: Money | null;
+  /** Each entry's `priceUsd` is a validated dollar price (issue #179). */
   services?: AgencyServiceType[];
 }
 
@@ -101,11 +123,6 @@ export type AgencyProfileCheck =
   | { ok: true; profile: AgencyProfileInput }
   | { ok: false; message: string };
 
-/** True for a number that can be an amount of money (finite, not negative). */
-function isAmount(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0;
-}
-
 /**
  * Read the owner-editable agency profile out of an untrusted request body
  * (issue #138). Only the keys in AGENCY_OWNER_EDITABLE_FIELDS are looked at;
@@ -114,9 +131,14 @@ function isAmount(value: unknown): value is number {
  * than being stored as it came:
  *  - `name`: a non-empty string;
  *  - `address`, `state`, `description`: a string, or null to clear;
- *  - `consultationFee`: a non-negative number (naira), or null to clear;
- *  - `services`: an array of `{ id, name, price }`. Only those three keys of
- *    each entry are kept (the public agency page shows this list).
+ *  - `consultationFeeUsd` (issue #179): a dollar price
+ *    `{ amount: "100.00", currency?: "USD" }` (see `parseUsdPriceInput`:
+ *    finite, >= 0, whole cents, capped, USD only), or null to clear. The old
+ *    naira `consultationFee` key is refused;
+ *  - `services`: an array of `{ id, name, priceUsd }`, `priceUsd` the same
+ *    dollar price shape. An entry with the old naira `price` is refused.
+ *    Only those three keys of each entry are kept (the public agency page
+ *    shows this list).
  * Keys that are absent stay absent, so a partial update changes only what it
  * names.
  */
@@ -141,11 +163,23 @@ export function readAgencyProfileInput(body: unknown): AgencyProfileCheck {
     profile[field] = value;
   }
 
-  if (raw.consultationFee !== undefined) {
-    if (raw.consultationFee !== null && !isAmount(raw.consultationFee)) {
-      return { ok: false, message: "consultationFee must be a non-negative number" };
+  // ---- Prices (issue #179): US dollars only, validated in one place ----
+  for (const retired of RETIRED_AGENCY_PRICE_FIELDS) {
+    if (raw[retired] !== undefined) {
+      return {
+        ok: false,
+        message: `${retired}: was replaced by consultationFeeUsd (US dollars), e.g. { "amount": "100.00", "currency": "USD" }`,
+      };
     }
-    profile.consultationFee = raw.consultationFee;
+  }
+  if (raw.consultationFeeUsd !== undefined) {
+    if (raw.consultationFeeUsd === null) {
+      profile.consultationFeeUsd = null;
+    } else {
+      const fee = tryParsePrice(raw.consultationFeeUsd, "consultationFeeUsd");
+      if (!fee.ok) return fee;
+      profile.consultationFeeUsd = fee.money;
+    }
   }
 
   if (raw.services !== undefined) {
@@ -159,21 +193,45 @@ export function readAgencyProfileInput(body: unknown): AgencyProfileCheck {
         !service ||
         typeof service !== "object" ||
         (typeof service.id !== "string" && typeof service.id !== "number") ||
-        typeof service.name !== "string" ||
-        !isAmount(service.price)
+        typeof service.name !== "string"
       ) {
         return {
           ok: false,
-          message: "Each service needs an id, a name and a non-negative price",
+          message: "Each service needs an id, a name and a priceUsd",
         };
       }
+      // The old naira `price` is refused (issue #179), never stored as dollars.
+      if (service.price !== undefined) {
+        return {
+          ok: false,
+          message: "services[].price: was replaced by priceUsd (US dollars), e.g. { \"amount\": \"50.00\", \"currency\": \"USD\" }",
+        };
+      }
+      const price = tryParsePrice(service.priceUsd, "services[].priceUsd");
+      if (!price.ok) return price;
       // Copy the three known keys only; anything else on the entry is dropped.
-      services.push({ id: String(service.id), name: service.name, price: service.price });
+      services.push({ id: String(service.id), name: service.name, priceUsd: price.money });
     }
     profile.services = services;
   }
 
   return { ok: true, profile };
+}
+
+/**
+ * `parseUsdPriceInput` as an AgencyProfileCheck-style result, so
+ * readAgencyProfileInput keeps answering `{ ok: false, message }` (a 400).
+ */
+function tryParsePrice(
+  value: unknown,
+  field: string
+): { ok: true; money: Money } | { ok: false; message: string } {
+  try {
+    return { ok: true, money: parseUsdPriceInput(value, field) };
+  } catch (error) {
+    if (isPriceInputError(error)) return { ok: false, message: (error as PriceInputError).message };
+    throw error;
+  }
 }
 
 // ============================================
@@ -197,9 +255,11 @@ export const PUBLIC_AGENCY_LIST_MAX = 100;
  *   - `reviewedBy` / `reviewedAt` / `rejectionReason` (admin review metadata)
  *   - `activeCases`        (operational load, not for public consumption)
  *
- * `consultationFee` and `services` ARE included: they are customer-facing
- * pricing, not financial internals. Both are in WHOLE NAIRA, exactly as
- * stored (never divided or multiplied by 100).
+ * `consultationFeeUsd` and `services` ARE included: they are customer-facing
+ * pricing, not financial internals. Issue #179: each price is the stored
+ * US-dollar Money plus its local figure at the current rate (`...Local`,
+ * `available: false` when there is no usable rate). The `migratedFrom`
+ * audit and any old naira field are never included.
  */
 export interface PublicAgency {
   id: string;
@@ -214,10 +274,12 @@ export interface PublicAgency {
   address?: string;
   description?: string;
   logoUrl?: string;
-  /** Default consultation fee in WHOLE NAIRA. Omitted when unset. */
-  consultationFee?: number;
-  /** Public service menu: id, name and price (WHOLE NAIRA) only. */
-  services: { id: string; name: string; price: number }[];
+  /** Default consultation fee in US dollars; null when unset (issue #179). */
+  consultationFeeUsd: Money | null;
+  /** The fee in the viewer's local currency; null when there is no fee. */
+  consultationFeeLocal: LocalPriceQuote | null;
+  /** Public service menu: id, name and the dollar price + local figure only. */
+  services: PublicAgencyServiceEntry[];
   /** Denormalized member count (the agency's `totalAgents`). */
   agentCount: number;
   /** Track-record stat (the agency's `totalCases`). */
@@ -228,6 +290,16 @@ export interface PublicAgency {
   verified: boolean;
   /** Serializes as `{ _seconds, _nanoseconds }` over JSON. */
   createdAt: Timestamp;
+}
+
+/** One public service entry (issue #179: dollar price + local figure). */
+export interface PublicAgencyServiceEntry {
+  id: string;
+  name: string;
+  /** The stored dollar price; null when the entry has none (not migrated / corrupt). */
+  priceUsd: Money | null;
+  /** The price in the viewer's local currency; null when there is no price. */
+  priceLocal: LocalPriceQuote | null;
 }
 
 /**
@@ -254,14 +326,31 @@ export function isAgencyComplianceVerified(agency: Pick<Agency, "compliance">): 
 }
 
 /**
- * The public service menu: id, name and price (whole naira) only, so any
- * extra field ever added to a stored service can't leak. Shared with the
+ * The public service menu: id, name and the dollar price with its local
+ * figure only, so any extra field ever added to a stored service (or an old
+ * naira `price` on a not-yet-migrated entry) can't leak. Shared with the
  * slug page.
  */
 export function toPublicAgencyServices(
-  services: AgencyServiceType[] | undefined
-): { id: string; name: string; price: number }[] {
-  return (services || []).map((s) => ({ id: s.id, name: s.name, price: s.price }));
+  services: AgencyServiceType[] | undefined,
+  pricer: LocalPricer
+): PublicAgencyServiceEntry[] {
+  return (services || []).map((s) => {
+    const priceUsd = readStoredUsd(s.priceUsd);
+    return { id: s.id, name: s.name, priceUsd, priceLocal: priceUsd ? pricer.price(priceUsd) : null };
+  });
+}
+
+/**
+ * The agency's public consultation fee: stored dollars + local figure, or
+ * both null when no valid dollar fee is stored. Shared with the slug page.
+ */
+export function toPublicAgencyFee(
+  agency: Pick<Agency, "consultationFeeUsd">,
+  pricer: LocalPricer
+): { consultationFeeUsd: Money | null; consultationFeeLocal: LocalPriceQuote | null } {
+  const fee = readStoredUsd(agency.consultationFeeUsd);
+  return { consultationFeeUsd: fee, consultationFeeLocal: fee ? pricer.price(fee) : null };
 }
 
 /**
@@ -271,7 +360,7 @@ export function toPublicAgencyServices(
  * fields stay `undefined` when unset (dropped from the JSON), as mobile's
  * `ApiAgency` expects.
  */
-export function toPublicAgency(agency: Agency): PublicAgency {
+export function toPublicAgency(agency: Agency, pricer: LocalPricer): PublicAgency {
   return {
     id: agency.id,
     name: agency.name,
@@ -281,9 +370,9 @@ export function toPublicAgency(agency: Agency): PublicAgency {
     address: agency.address,
     description: agency.description,
     logoUrl: agency.logoUrl,
-    // Whole naira, unchanged from storage.
-    consultationFee: agency.consultationFee,
-    services: toPublicAgencyServices(agency.services),
+    // Issue #179: dollars as stored + the local figure (one rate per request).
+    ...toPublicAgencyFee(agency, pricer),
+    services: toPublicAgencyServices(agency.services, pricer),
     agentCount: agency.totalAgents ?? 0,
     totalCases: agency.totalCases ?? 0,
     status: agency.status,
@@ -349,7 +438,8 @@ class AgencyService {
       address: input.address ?? undefined,
       state: input.state ?? undefined,
       description: input.description ?? undefined,
-      consultationFee: input.consultationFee ?? undefined,
+      // Issue #179: dollars (validated); null/absent = no fee set.
+      consultationFeeUsd: input.consultationFeeUsd ?? undefined,
       services: input.services || [],
       totalAgents: 1, // Owner counts as the first member
       totalCases: 0,
@@ -539,6 +629,13 @@ class AgencyService {
     const updates: Record<string, unknown> = {};
     for (const field of AGENCY_OWNER_EDITABLE_FIELDS) {
       if (profile[field] !== undefined) updates[field] = profile[field];
+    }
+    // Issue #179: writing (or clearing, null) the dollar fee also REMOVES the
+    // old naira `consultationFee`, so a doc never holds two prices. A cleared
+    // fee is removed, not stored as null (absent = no fee).
+    if (profile.consultationFeeUsd !== undefined) {
+      if (profile.consultationFeeUsd === null) updates.consultationFeeUsd = FieldValue.delete();
+      updates.consultationFee = FieldValue.delete();
     }
     if (serverFields.logoUrl !== undefined) updates.logoUrl = serverFields.logoUrl;
 
@@ -822,8 +919,7 @@ class AgencyService {
         totalApplications: 0,
         successRate: 0,
         responseTime: "N/A",
-        consultationFee: 0,
-        consultationFeeUnit: "naira", // server-owned marker (#148): fee is whole naira
+        consultationFeeUsd: zeroUsd(), // issue #179: new agents start at zero US dollars
         isAvailable: true,
         createdAt: now,
         updatedAt: now,
@@ -1054,7 +1150,9 @@ class AgencyService {
    *   (default: the max). Pushed into the query only when there is no
    *   search, else it would truncate before the name filter runs.
    */
-  async listPublicAgencies(options?: { limit?: number; search?: string }): Promise<PublicAgency[]> {
+  async listPublicAgencies(
+    options: { limit?: number; search?: string; pricer: LocalPricer }
+  ): Promise<PublicAgency[]> {
     const search = options?.search?.trim().toLowerCase() || undefined;
     const requested = options?.limit;
     const limit =
@@ -1072,7 +1170,7 @@ class AgencyService {
       agencies = agencies.filter((a) => (a.name ?? "").toLowerCase().includes(search)).slice(0, limit);
     }
 
-    return agencies.map(toPublicAgency);
+    return agencies.map((a) => toPublicAgency(a, options.pricer));
   }
 
   /**
@@ -1080,11 +1178,11 @@ class AgencyService {
    * not publicly visible (not approved). Callers 404 on null with the SAME
    * body either way, so a non-approved agency's existence never leaks.
    */
-  async getPublicAgencyById(agencyId: string): Promise<PublicAgency | null> {
+  async getPublicAgencyById(agencyId: string, pricer: LocalPricer): Promise<PublicAgency | null> {
     const agency = await this.getAgencyById(agencyId);
     if (!agency || !isAgencyPubliclyVisible(agency)) return null;
     // A doc missing its own `id` field would be corrupt; trust the path.
-    return toPublicAgency({ ...agency, id: agency.id ?? agencyId });
+    return toPublicAgency({ ...agency, id: agency.id ?? agencyId }, pricer);
   }
 }
 

@@ -147,3 +147,47 @@ export interface CurrenciesConfig {
   /** How long an admin override stays active by default, in hours. */
   overrideTtlHours: number;
 }
+
+// ============================================
+// DOLLAR PRICES ON AGENTS AND AGENCIES (issue #179)
+// ============================================
+
+/**
+ * A dollar price shown with its local-currency equivalent (issue #179).
+ *
+ * Returned by the public reads (agents, agencies, visa prices) NEXT TO the
+ * stored dollar `Money`; never stored. Built from the #178 effective rate by
+ * `money/local-price.ts`. When the rate is missing or stale the read still
+ * succeeds: `available` is false and the amount, rate and asOf are null (the
+ * client shows the dollar price only). `currency` is always set, so a client
+ * can still say which currency is unavailable.
+ */
+export interface LocalPriceQuote {
+  /** Minor units of `currency` (kobo for NGN); null when unavailable. */
+  amountMinor: number | null;
+  currency: CurrencyCode;
+  /** Local units per 1 USD used for this figure; null when unavailable. */
+  rate: number | null;
+  /** When the rate was published (ISO 8601); null when unavailable. */
+  asOf: string | null;
+  available: boolean;
+}
+
+/**
+ * Audit trail of one price converted from naira by the #179 migration
+ * (`scripts/migrate-prices-to-usd.ts`). Stored next to the dollar price under
+ * the doc's `migratedFrom` map, keyed by the OLD field name, so the original
+ * value can always be traced and, if the rate was wrong, recomputed.
+ */
+export interface PriceMigrationRecord {
+  /** The old price in WHOLE NAIRA (major units), whatever unit it was stored in. */
+  amount: number;
+  currency: "NGN";
+  /** Naira per 1 USD the conversion used (the script's required `--rate`). */
+  rate: number;
+  /** The raw number that was stored before the migration. */
+  storedValue: number;
+  /** How `storedValue` was read: whole naira, or pre-#148 kobo (agent fees only). */
+  storedUnit: "naira" | "kobo";
+  migratedAt: Timestamp;
+}

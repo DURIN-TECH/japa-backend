@@ -5,9 +5,46 @@ import {
   AgentVerificationStatus,
   AvailabilitySlot,
 } from "../types";
-import { Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { claimsService } from "./claims.service";
 import { pickAllowedFields } from "../utils/pick-allowed-fields";
+import type { Money } from "../types/money";
+import { parseUsdPriceInput, PriceInputError, zeroUsd } from "../money/usd-price";
+
+/**
+ * Issue #179: the agent's fee is set in US DOLLARS through this body key,
+ * `{ "consultationFeeUsd": { "amount": "10.00", "currency": "USD" } }`, and
+ * validated by `parseUsdPriceInput` (finite, >= 0, whole cents, capped,
+ * USD only). It is deliberately NOT in AGENT_SELF_EDITABLE_FIELDS: that list
+ * copies values through unchecked, and a price must always be validated.
+ */
+export const AGENT_FEE_INPUT_FIELD = "consultationFeeUsd";
+
+/**
+ * Body keys of the old naira fee (#148). Sending one is a 400, not a silent
+ * drop, so a client still on the naira screen learns the field moved.
+ */
+const RETIRED_AGENT_FEE_FIELDS = ["consultationFee", "consultationFeeUnit"] as const;
+
+/**
+ * Read the dollar fee from an untrusted body, if one was sent.
+ *
+ * @returns the validated Money, or undefined when the key is absent
+ * @throws PriceInputError for a bad value or a retired naira key
+ */
+export function readAgentFeeInput(body: Record<string, unknown>): Money | undefined {
+  for (const retired of RETIRED_AGENT_FEE_FIELDS) {
+    if (body[retired] !== undefined) {
+      throw new PriceInputError(
+        retired,
+        `was replaced by ${AGENT_FEE_INPUT_FIELD} (US dollars), e.g. { "amount": "10.00", "currency": "USD" }`
+      );
+    }
+  }
+  const raw = body[AGENT_FEE_INPUT_FIELD];
+  if (raw === undefined) return undefined;
+  return parseUsdPriceInput(raw, AGENT_FEE_INPUT_FIELD);
+}
 
 export interface CreateAgentInput {
   userId: string;
@@ -19,7 +56,8 @@ export interface CreateAgentInput {
   specializations: string[];
   languages: string[];
   featuredVisas: string[];
-  consultationFee: number;
+  /** Already validated (readAgentFeeInput); absent = start at zero dollars. */
+  consultationFeeUsd?: Money;
   availableSlots?: AvailabilitySlot[];
 }
 
@@ -32,7 +70,8 @@ export interface UpdateAgentInput {
   specializations?: string[];
   languages?: string[];
   featuredVisas?: string[];
-  consultationFee?: number;
+  /** Raw body value; validated inside updateAgent (issue #179). */
+  consultationFeeUsd?: unknown;
   isAvailable?: boolean;
   availableSlots?: AvailabilitySlot[];
 }
@@ -70,8 +109,9 @@ export const AGENT_SELF_EDITABLE_FIELDS = [
   "specializations",
   "languages",
   "featuredVisas",
-  "consultationFee",
-  "serviceFees",
+  // Issue #179: no price here. `consultationFeeUsd` is written by updateAgent
+  // only after `readAgentFeeInput` validated it; the naira `consultationFee`
+  // and the never-used `serviceFees` are gone.
   "isAvailable",
   "availableSlots",
 ] as const;
@@ -149,8 +189,8 @@ class AgentService {
       totalApplications: 0,
       successRate: 0,
       responseTime: "24-48 hours",
-      consultationFee: input.consultationFee,
-      consultationFeeUnit: "naira", // server-owned marker (#148): fee is whole naira
+      // Issue #179: dollars; a new agent starts at $0 unless a fee was sent.
+      consultationFeeUsd: input.consultationFeeUsd ?? zeroUsd(),
       isAvailable: false, // Not available until verified
       availableSlots: input.availableSlots || [],
       createdAt: now,
@@ -293,6 +333,11 @@ class AgentService {
     // what must stay server-written). Unknown keys are dropped silently.
     const updates = pickAllowedFields(input, AGENT_SELF_EDITABLE_FIELDS);
 
+    // The dollar fee (issue #179): validated here, before anything is
+    // written, so a bad value (or an old naira key) is a 400 that changes
+    // nothing. Throws PriceInputError.
+    const fee = readAgentFeeInput(input as Record<string, unknown>);
+
     // `isAvailable` is the one allow-listed field with a condition attached:
     // the same verified-only rule as PUT /agents/me/availability (issue #138).
     // Checked BEFORE anything is written, so a refused request changes
@@ -301,17 +346,20 @@ class AgentService {
       this.assertMayBeAvailable(doc.data() as Agent, updates.isAvailable);
     }
 
-    // Server-owned unit marker (#148): whenever the fee is written it is whole
-    // naira, so stamp it. It is NOT in AGENT_SELF_EDITABLE_FIELDS, so a client
-    // can neither set nor clear it; it is only added here, and only together
-    // with a fee, because stamping an unrelated edit would mark a still-kobo
-    // fee as naira and make the migration skip it.
-    const feeMarker =
-      updates.consultationFee !== undefined ? { consultationFeeUnit: "naira" as const } : {};
+    // Writing the dollar fee also REMOVES the old naira fee and its #148
+    // marker, so a doc never holds two prices (replace, not shadow). The
+    // migration then sees the dollar field and leaves the doc alone.
+    const feeWrite = fee
+      ? {
+        consultationFeeUsd: fee,
+        consultationFee: FieldValue.delete(),
+        consultationFeeUnit: FieldValue.delete(),
+      }
+      : {};
 
     await agentRef.update({
       ...updates,
-      ...feeMarker,
+      ...feeWrite,
       updatedAt: serverTimestamp(),
     });
 

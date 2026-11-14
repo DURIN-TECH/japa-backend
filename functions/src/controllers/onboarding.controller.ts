@@ -8,6 +8,8 @@ import { claimsService } from "../services/claims.service";
 import { agencyService } from "../services/agency.service";
 import { entitlementService } from "../services/entitlement.service";
 import { notificationService } from "../services/notification.service";
+// Issue #179: new agent docs start with a zero-dollar fee.
+import { zeroUsd } from "../money/usd-price";
 
 class OnboardingController {
   /**
@@ -87,8 +89,7 @@ class OnboardingController {
         totalApplications: 0,
         successRate: 0,
         responseTime: "N/A",
-        consultationFee: 0,
-        consultationFeeUnit: "naira", // server-owned marker (#148): fee is whole naira
+        consultationFeeUsd: zeroUsd(), // issue #179: new agents start at zero US dollars
         isAvailable: false,
         createdAt: now,
         updatedAt: now,
@@ -293,8 +294,7 @@ class OnboardingController {
           totalApplications: 0,
           successRate: 0,
           responseTime: "N/A",
-          consultationFee: 0,
-          consultationFeeUnit: "naira", // server-owned marker (#148): fee is whole naira
+          consultationFeeUsd: zeroUsd(), // issue #179: new agents start at zero US dollars
           isAvailable: true,
           createdAt: now,
           updatedAt: now,

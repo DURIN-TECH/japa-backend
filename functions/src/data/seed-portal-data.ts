@@ -429,12 +429,14 @@ async function seedAgency() {
     state: "Lagos",
     description:
       "Premier immigration consulting agency specializing in Irish, UK, and Canadian visas for Nigerian applicants.",
-    consultationFee: 50000, // ₦50,000, whole naira (#148)
+    // Issue #179: every price is US dollars, a Money in whole CENTS with an
+    // explicit currency (shown in local currency at the current rate).
+    consultationFeeUsd: { amountMinor: 10000, currency: "USD" }, // $100.00
     services: [
-      { id: "svc-1", name: "Visa Application Processing", price: 15000 },
-      { id: "svc-2", name: "Document Review & Verification", price: 5000 },
-      { id: "svc-3", name: "Interview Preparation", price: 8000 },
-      { id: "svc-4", name: "Embassy Submission Support", price: 10000 },
+      { id: "svc-1", name: "Visa Application Processing", priceUsd: { amountMinor: 5000, currency: "USD" } }, // $50.00
+      { id: "svc-2", name: "Document Review & Verification", priceUsd: { amountMinor: 2000, currency: "USD" } }, // $20.00
+      { id: "svc-3", name: "Interview Preparation", priceUsd: { amountMinor: 3000, currency: "USD" } }, // $30.00
+      { id: "svc-4", name: "Embassy Submission Support", priceUsd: { amountMinor: 4000, currency: "USD" } }, // $40.00
     ],
     totalAgents: 2,
     totalCases: 10,
@@ -471,8 +473,7 @@ async function seedAgents() {
       totalApplications: 156,
       successRate: 92,
       responseTime: "2-4 hours",
-      consultationFee: 5000,
-      consultationFeeUnit: "naira", // marker (#148): re-seeding then migrating must not /100 this
+      consultationFeeUsd: { amountMinor: 1000, currency: "USD" }, // $10.00 (issue #179: US cents)
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "09:00", endTime: "17:00" },
@@ -502,8 +503,7 @@ async function seedAgents() {
       totalApplications: 63,
       successRate: 87,
       responseTime: "4-8 hours",
-      consultationFee: 3000,
-      consultationFeeUnit: "naira", // marker (#148): re-seeding then migrating must not /100 this
+      consultationFeeUsd: { amountMinor: 600, currency: "USD" }, // $6.00 (issue #179: US cents)
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "10:00", endTime: "18:00" },
@@ -533,8 +533,7 @@ async function seedAgents() {
       totalApplications: 28,
       successRate: 85,
       responseTime: "6-12 hours",
-      consultationFee: 2500,
-      consultationFeeUnit: "naira", // marker (#148): re-seeding then migrating must not /100 this
+      consultationFeeUsd: { amountMinor: 500, currency: "USD" }, // $5.00 (issue #179: US cents)
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "09:00", endTime: "15:00" },
