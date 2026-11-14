@@ -710,7 +710,12 @@ function isCi(): boolean {
  *    window) are kept: the block is copied over and its window replaces the
  *    registry window.
  */
-export async function seedVisaSources(markdownPath?: string): Promise<number> {
+export async function seedVisaSources(
+  markdownPath?: string,
+  // Issue #215: the Firestore handle (tests pass an in-memory one). Production
+  // passes nothing and gets the real one.
+  database?: FirebaseFirestore.Firestore
+): Promise<number> {
   const file = markdownPath || findVisaSourcesMarkdown();
   if (!file || !fs.existsSync(file)) {
     const msg =
@@ -727,7 +732,7 @@ export async function seedVisaSources(markdownPath?: string): Promise<number> {
   }
 
   // Resolved here (not at module load) — see the note at the top of the file.
-  const db = getFirestore();
+  const db = database ?? getFirestore();
   const countries = parseVisaSourcesMarkdown(fs.readFileSync(file, "utf8"));
   const collection = db.collection("visaSources");
   const now = Timestamp.now();

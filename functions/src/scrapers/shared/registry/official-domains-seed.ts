@@ -1,4 +1,4 @@
-import { Timestamp } from "firebase-admin/firestore";
+import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db } from "../../../utils/firebase";
 import { VISA_SOURCE_OFFICIAL_HOSTS } from "../../visa-catalog/visa-catalog-official-hosts";
 import { appendRegistryAudit } from "./registry-audit";
@@ -68,18 +68,28 @@ export function planOfficialDomainImport(
  * Import the planned hosts that have no doc yet. Returns what was created and
  * what already existed. `apply: false` only reports.
  */
-export async function importOfficialDomains(options: { apply: boolean; now?: number } = { apply: false }): Promise<{
+export async function importOfficialDomains(
+  options: {
+    apply: boolean;
+    now?: number;
+    // Which hosts to import (default: the code constant) and how to run a
+    // transaction: both are injectable so tests need no Firestore.
+    hosts?: Record<string, readonly string[]>;
+    runTransaction?: <T>(fn: (tx: Transaction) => Promise<T>) => Promise<T>;
+  } = { apply: false }
+): Promise<{
   created: string[];
   existing: string[];
   skipped: Array<{ entry: string; reason: string }>;
 }> {
-  const { planned, skipped } = planOfficialDomainImport();
+  const { planned, skipped } = planOfficialDomainImport(options.hosts);
+  const run = options.runTransaction ?? ((fn) => db.runTransaction(fn));
   const now = Timestamp.fromMillis(options.now ?? Date.now());
   const created: string[] = [];
   const existing: string[] = [];
   for (const p of planned) {
     const ref = collections.officialDomains.doc(p.host);
-    await db.runTransaction(async (tx) => {
+    await run(async (tx) => {
       const snap = await tx.get(ref);
       if (snap.exists) {
         existing.push(p.host);

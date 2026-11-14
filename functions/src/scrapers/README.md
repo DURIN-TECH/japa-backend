@@ -42,6 +42,8 @@ scrapers/
     scripts/               one-off data fixes, e.g. remediate-failing-sources (#107, dry run by default)
     cost/                  LLM price table, monthly cost rollup, /admin/scrape-costs (#82), scrape-costs.md
     alerts/                post-run + hourly alert rules, emails, /admin/scrape-alerts (#83), scrape-alerts.md
+    registry/              source registry API (#215): confirmed official hosts, address check, route
+                           registration, audit trail; README.md in that folder
     settings/              appConfig/scraperSettings (kill switch, limits, hard stop), /admin/scraper-settings,
                            per-source controls, Run now requests + worker (#96), scraper-settings.md
   visa-catalog/

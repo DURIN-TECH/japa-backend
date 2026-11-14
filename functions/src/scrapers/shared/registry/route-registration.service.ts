@@ -207,7 +207,7 @@ export function hostsOf(input: RegisterRouteInput): string[] {
 /** Plain-words note stored with a registered guidance source. */
 function verificationNote(preview: AddressPreview, nowMs: number): string {
   return (
-    `Registered from the admin portal. The whole document was retrieved in full by the registration check ` +
+    "Registered from the admin portal. The whole document was retrieved in full by the registration check " +
     `(${preview.characterCount} characters, ${preview.docType}); no person has read it. ` +
     `Retrieved ${new Date(nowMs).toISOString()}.`
   );

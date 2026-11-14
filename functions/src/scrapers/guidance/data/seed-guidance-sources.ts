@@ -456,7 +456,11 @@ export function buildSeededGuidanceSource(
  * @param seeds the entries to write (default: GUIDANCE_SOURCE_SEEDS)
  * @returns the number of sources seeded
  */
-export async function seedGuidanceSources(seeds: readonly GuidanceSourceSeed[] = GUIDANCE_SOURCE_SEEDS): Promise<number> {
+export async function seedGuidanceSources(
+  seeds: readonly GuidanceSourceSeed[] = GUIDANCE_SOURCE_SEEDS,
+  // Issue #215: the Firestore handle (tests pass an in-memory one).
+  database?: FirebaseFirestore.Firestore
+): Promise<number> {
   const problems = validateGuidanceSourceSeeds(seeds);
   if (problems.length > 0) {
     throw new Error(`Invalid guidance source seed(s), nothing written:\n- ${problems.join("\n- ")}`);
@@ -467,7 +471,7 @@ export async function seedGuidanceSources(seeds: readonly GuidanceSourceSeed[] =
   }
 
   // Resolved here (not at module load): see the note at the top of the file.
-  const db = getFirestore();
+  const db = database ?? getFirestore();
   const collection = db.collection("guidanceSources");
   const now = Timestamp.now();
 

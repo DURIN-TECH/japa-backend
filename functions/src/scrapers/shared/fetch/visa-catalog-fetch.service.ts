@@ -731,14 +731,14 @@ export class VisaCatalogFetchService {
     let resp: Awaited<ReturnType<VisaCatalogHttpClient["get"]>>;
     try {
       resp = await this.http.get(url, {
-      responseType: "stream",
-      // The larger of the two caps: if the client enforces a size limit of
-      // its own, it must not cut a PDF off at the HTML limit. The cap for the
-      // actual kind is enforced below, while reading.
-      maxContentLength: Math.max(MAX_HTML_BYTES, this.pdfLimits.maxBytes),
-      // Issue #215: refuse a redirect hop to a refused host before it is requested.
-      ...(allowedHost ? { redirectHostCheck: allowedHost } : {}),
-    });
+        responseType: "stream",
+        // The larger of the two caps: if the client enforces a size limit of
+        // its own, it must not cut a PDF off at the HTML limit. The cap for the
+        // actual kind is enforced below, while reading.
+        maxContentLength: Math.max(MAX_HTML_BYTES, this.pdfLimits.maxBytes),
+        // Issue #215: refuse a redirect hop to a refused host before it is requested.
+        ...(allowedHost ? { redirectHostCheck: allowedHost } : {}),
+      });
     } catch (err) {
       // Issue #215: a redirect hop refused by the host policy (thrown by the
       // guarded client before the hop was requested) becomes our typed error.
