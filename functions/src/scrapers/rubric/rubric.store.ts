@@ -1,8 +1,9 @@
-import { Timestamp, type Transaction } from "firebase-admin/firestore";
+import { Timestamp, type DocumentSnapshot, type Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../utils/firebase";
 import type { RubricExtractionRun, RubricHead, VisaRubric } from "../../types/rubric";
 import { applyExclusions } from "./rubric-exclusions";
 import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, withKeyParts } from "./rubric-key";
+import { INLINE_MAX_BYTES, VersionPartsError, VersionTooLargeError, assembleVersion, firestoreDocSize, isPartitioned, layoutVersion, type VersionPartDoc } from "./rubric-version-storage";
 
 // ============================================
 // RUBRIC — FIRESTORE STORE (issue #40)
@@ -15,7 +16,18 @@ import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, withKeyParts } from "./
 //     every key that existed before; for a bloc or treaty it is
 //     `{issuingAuthorityId}_{sharedRouteId}`. See rubric-key.ts.)
 //   visaRubrics/{routeKey}/rubricVersions/{version}        VisaRubric
+//     (#278) or, for a LARGE version, its header, with the large arrays in
+//   visaRubrics/{routeKey}/rubricVersions/{version}/rubricVersionParts/{n}
 //   rubricExtractionRuns/{runId}                           RubricExtractionRun
+//
+// (#278) SPLIT STORAGE. A version too big for one 1 MiB document is written as
+// a header plus part documents, in the same transaction (layout and limits:
+// rubric-version-storage.ts). Every read of a version's CONTENT goes through
+// `readVersionData` / `readVersionDataInTx` below, which put the parts back
+// together, so callers always get the whole `VisaRubric` whichever layout it
+// was stored in. A version written before #278 (or any small one) has no
+// `contentStorage` and is read as the single document it is: dual read, no
+// data move.
 //
 // Two guarantees live here, in the only module that touches these paths:
 //
@@ -66,7 +78,10 @@ export function rulebookKeyOf(authorityId: string, routeSlug: string): string {
 /** Thrown when a write would break the governance or immutability rules. */
 export class RubricStoreError extends Error {
   constructor(
-    readonly code: "not_pending" | "version_exists" | "route_mismatch",
+    // (#278) `too_large`: the version cannot be stored even split into parts
+    // (nothing was written). `parts_missing`: a split version's parts could
+    // not all be read (a reader must never get half a rulebook).
+    readonly code: "not_pending" | "version_exists" | "route_mismatch" | "too_large" | "parts_missing",
     message: string
   ) {
     super(message);
@@ -151,8 +166,20 @@ export class RubricStore {
     if (!head || head.approvedVersion === null || head.approvedVersion === undefined) return null;
     const snap = await subcollections.rubricVersions(routeKey).doc(String(head.approvedVersion)).get();
     if (!snap.exists) return null;
+    // (#278) Reassemble a split version. A version whose parts cannot all be
+    // read serves NOTHING (like a missing version doc), never a partial rulebook.
+    let data: VisaRubric;
+    try {
+      data = await this.readVersionData(routeKey, head.approvedVersion, snap.data());
+    } catch (err) {
+      if (err instanceof RubricStoreError && err.code === "parts_missing") {
+        console.error(`[rubric-store] ${routeKey} v${head.approvedVersion}: ${err.message}; serving no rulebook`);
+        return null;
+      }
+      throw err;
+    }
     // (#233) A version written before #233 reads with its key parts filled in.
-    const rubric = withKeyParts(snap.data() as VisaRubric);
+    const rubric = withKeyParts(data);
     // Belt and braces: trust the version's own status, not just the pointer.
     if (rubric.reviewStatus !== "approved") return null;
     // THE one read-side filter (#161): what the reviewer excluded at approval
@@ -171,7 +198,98 @@ export class RubricStore {
    */
   async getVersionForReview(routeKey: string, version: number): Promise<VisaRubric | null> {
     const snap = await subcollections.rubricVersions(routeKey).doc(String(version)).get();
-    return snap.exists ? withKeyParts(snap.data() as VisaRubric) : null;
+    // (#278) Whole version whichever layout; throws RubricStoreError("parts_missing") for a broken split one.
+    return snap.exists ? withKeyParts(await this.readVersionData(routeKey, version, snap.data())) : null;
+  }
+
+  // ---------- (#278) reading either layout ----------
+
+  /**
+   * The whole version from its stored document's data: the data itself for a
+   * single-document version (every version before #278, and every small one),
+   * or the header with its parts put back together for a split one. The
+   * result never carries `contentStorage`.
+   *
+   * Use this for any version document read outside the store (a list or
+   * collection-group query): `snap.data()` alone is only the header of a
+   * large version.
+   *
+   * @throws RubricStoreError("parts_missing") when a split version's parts do
+   *   not all read back.
+   */
+  async readVersionData(routeKey: string, version: number, data: unknown): Promise<VisaRubric> {
+    if (!isPartitioned(data)) return data as VisaRubric;
+    const col = subcollections.rubricVersionParts(routeKey, version);
+    const snaps = await Promise.all(Array.from({ length: data.contentStorage.partCount }, (_, i) => col.doc(String(i)).get()));
+    return assembleOrThrow(routeKey, version, data, snaps);
+  }
+
+  /**
+   * The same read inside a transaction (all reads before any write, as
+   * Firestore requires): the review decision reads the version it decides
+   * this way, so the parts are read at the same consistent point as the header.
+   */
+  async readVersionDataInTx(tx: Transaction, routeKey: string, version: number, data: unknown): Promise<VisaRubric> {
+    if (!isPartitioned(data)) return data as VisaRubric;
+    const col = subcollections.rubricVersionParts(routeKey, version);
+    const snaps: DocumentSnapshot[] = [];
+    for (let i = 0; i < data.contentStorage.partCount; i++) snaps.push(await tx.get(col.doc(String(i))));
+    return assembleOrThrow(routeKey, version, data, snaps);
+  }
+
+  /**
+   * (#278) Apply a decision's REVIEW-field update to a version, inside the
+   * decision's transaction, without ever overflowing the 1 MiB document.
+   *
+   * An approval ADDS fields to the version document (the question plan, rule
+   * repairs, layer conflicts). On a version stored before #278 as one document
+   * close to the limit (Student v1, Skilled Worker v1 on dev), a plain update
+   * would push it over and the whole approval would fail. So:
+   *  - a version already in parts: the update goes on its header, as before
+   *    (the content arrays are not on the header, so it has room);
+   *  - a single-document version that stays at or under `INLINE_MAX_BYTES`
+   *    with the update: a plain update, exactly as before;
+   *  - a single-document version that would grow past that: it is REWRITTEN as
+   *    header + parts in this same transaction, with the update applied to the
+   *    header. The content is the stored content, unchanged (`full` is what
+   *    `readVersionDataInTx` read in this transaction); only its layout moves.
+   *    The version-created trigger does not fire (the document already exists).
+   *
+   * @param storedData the version document's data as read in `tx`.
+   * @param full the whole version as read in `tx` (`readVersionDataInTx`).
+   * @param update review fields only (the caller has checked them).
+   * @returns how it was written.
+   * @throws RubricStoreError("too_large") when even parts cannot hold it.
+   */
+  writeReviewUpdateInTx(tx: Transaction, routeKey: string, version: number, storedData: unknown, full: VisaRubric, update: Record<string, unknown>): "updated" | "split" {
+    const versionRef = subcollections.rubricVersions(routeKey).doc(String(version));
+    if (isPartitioned(storedData)) {
+      tx.update(versionRef, update);
+      return "updated";
+    }
+    // The document as it would be after the update (undefined fields are not stored).
+    const merged: Record<string, unknown> = { ...(full as unknown as Record<string, unknown>) };
+    for (const [k, v] of Object.entries(update)) if (v !== undefined) merged[k] = v;
+    if (firestoreDocSize(versionRef.path, merged) <= INLINE_MAX_BYTES) {
+      tx.update(versionRef, update);
+      return "updated";
+    }
+    let layout;
+    try {
+      layout = layoutVersion(merged as unknown as VisaRubric, versionRef.path);
+    } catch (err) {
+      if (err instanceof VersionTooLargeError) throw new RubricStoreError("too_large", `rubric version ${routeKey}/${version} cannot take this decision: ${err.message}`);
+      throw err;
+    }
+    // Over INLINE_MAX_BYTES always lays out as parts; the inline branch is a guard only.
+    if (layout.kind === "inline") {
+      tx.update(versionRef, update);
+      return "updated";
+    }
+    tx.set(versionRef, layout.header);
+    const parts = subcollections.rubricVersionParts(routeKey, version);
+    for (const part of layout.parts) tx.set(parts.doc(String(part.index)), part as unknown as Record<string, unknown>);
+    return "split";
   }
 
   /**
@@ -237,7 +355,23 @@ export class RubricStore {
 
       // (#233) Every new version carries authorityId + routeSlug (and the country pair for a country).
       const rubric: VisaRubric = { ...draft, ...keyFieldsOf(target), version };
-      tx.set(versionRef, rubric as unknown as Record<string, unknown>);
+      // (#278) One document when small (exactly as before), else a header plus
+      // parts, all in THIS transaction. A version too large even for parts is
+      // refused here, before anything is written.
+      let layout;
+      try {
+        layout = layoutVersion(rubric, versionRef.path);
+      } catch (err) {
+        if (err instanceof VersionTooLargeError) throw new RubricStoreError("too_large", `rubric version ${routeKey}/${version} cannot be stored: ${err.message}`);
+        throw err;
+      }
+      if (layout.kind === "inline") {
+        tx.set(versionRef, rubric as unknown as Record<string, unknown>);
+      } else {
+        tx.set(versionRef, layout.header);
+        const parts = subcollections.rubricVersionParts(routeKey, version);
+        for (const part of layout.parts) tx.set(parts.doc(String(part.index)), part as unknown as Record<string, unknown>);
+      }
       opts.guard?.commit(tx, version);
       if (head) {
         // Only the "newest" pointers move. approvedVersion is not in this
@@ -275,6 +409,19 @@ export class RubricStore {
   async countRunsSince(since: Timestamp): Promise<number> {
     const snap = await collections.rubricExtractionRuns.where("startedAt", ">=", since).get();
     return snap.docs.filter((d) => (d.data() as RubricExtractionRun).reachedModel === true).length;
+  }
+}
+
+/**
+ * (#278) Put a split version back together from its part snapshots, turning
+ * a missing or inconsistent part into RubricStoreError("parts_missing").
+ */
+function assembleOrThrow(routeKey: string, version: number, header: Parameters<typeof assembleVersion>[0], snaps: readonly { exists: boolean; data(): unknown }[]): VisaRubric {
+  try {
+    return assembleVersion(header, snaps.map((s) => (s.exists ? (s.data() as VersionPartDoc) : undefined)));
+  } catch (err) {
+    if (err instanceof VersionPartsError) throw new RubricStoreError("parts_missing", `rubric version ${routeKey}/${version} is stored in parts that do not read back whole: ${err.message}`);
+    throw err;
   }
 }
 

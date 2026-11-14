@@ -490,6 +490,18 @@ export const subcollections = {
   rubricVersions: (routeKey: string) =>
     collections.visaRubrics.doc(routeKey).collection("rubricVersions"),
 
+  // (#278) The PART documents of a large rubric version:
+  // `visaRubrics/{routeKey}/rubricVersions/{version}/rubricVersionParts/{n}`.
+  // A version too big for one 1 MiB document keeps its header (status, review
+  // fields, counts, hashes) in the version doc and its large arrays (criteria,
+  // evidence items, intake questions, discarded / suspicious lists, flags,
+  // translations) here, written in the same transaction. Read only through
+  // rubric.store.ts, which reassembles them (rubric-version-storage.ts).
+  // Immutable, backend-only like its parent. The id is not `parts`, so a
+  // collection-group query can never mix it with another collection.
+  rubricVersionParts: (routeKey: string, version: number) =>
+    collections.visaRubrics.doc(routeKey).collection("rubricVersions").doc(String(version)).collection("rubricVersionParts"),
+
   // Members of one bloc or treaty (issue #230):
   // `authorities/{authorityId}/members/{countryCode}`, each with joinedOn,
   // optional leftOn, and the verbatim official quote + URL that proves it.

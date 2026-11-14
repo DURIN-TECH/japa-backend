@@ -27,7 +27,7 @@ import {
 } from "./rubric-extraction.service";
 import type { QuoteTranslation } from "../../types/rubric";
 import { loadRubricSettings, type LoadedRubricSettings } from "./rubric-settings";
-import { rubricStore, type RubricStore } from "./rubric.store";
+import { RubricStoreError, rubricStore, type PendingWriteResult, type RubricStore } from "./rubric.store";
 import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, type RulebookTarget, type RulebookTargetInput } from "./rubric-key";
 import {
   isTerminalStatus,
@@ -1035,23 +1035,43 @@ export class RubricExtractionJobService {
     // The version, the head, the job's completion and the final run record are
     // written in ONE transaction. `guard.read` is the exactly-once check.
     let committed: RubricExtractionJob | null = null;
-    const written = await this.store.writePendingVersion(draft, job.sourceIds, {
-      force: job.force,
-      now: this.now(),
-      guard: {
-        read: async (tx) => {
-          const snap = await tx.get(this.jobs.jobRef(jobId));
-          const cur = snap.exists ? (snap.data() as RubricExtractionJob) : null;
-          // Still ours, still running, not cancelled, and no version recorded.
-          if (!cur || cur.status !== "running" || cur.leaseOwner !== owner || cur.cancelRequested || cur.version !== null) return false;
-          committed = cur;
-          return true;
+    let written: PendingWriteResult;
+    try {
+      written = await this.store.writePendingVersion(draft, job.sourceIds, {
+        force: job.force,
+        now: this.now(),
+        guard: {
+          read: async (tx) => {
+            const snap = await tx.get(this.jobs.jobRef(jobId));
+            const cur = snap.exists ? (snap.data() as RubricExtractionJob) : null;
+            // Still ours, still running, not cancelled, and no version recorded.
+            if (!cur || cur.status !== "running" || cur.leaseOwner !== owner || cur.cancelRequested || cur.version !== null) return false;
+            committed = cur;
+            return true;
+          },
+          commit: (tx, version) => {
+            this.finishInTx(tx, committed as unknown as RubricExtractionJob, { status: "succeeded", reasonCode: null, message: null, version, ...summary });
+          },
         },
-        commit: (tx, version) => {
-          this.finishInTx(tx, committed as unknown as RubricExtractionJob, { status: "succeeded", reasonCode: null, message: null, version, ...summary });
-        },
-      },
-    });
+      });
+    } catch (err) {
+      // (#278) The draft cannot be stored even split into parts. Retrying the
+      // save cannot fix that, so the job FAILS at once with a named reason
+      // instead of being counted as a transient error. Every finished step
+      // stays stored: once the cause is fixed, starting the same job again
+      // (same sources, prompt and model) re-queues it and goes straight to this
+      // final step without paying for a single call again (see `startJob`).
+      if (err instanceof RubricStoreError && err.code === "too_large") {
+        const ok = await this.finishOwned(jobId, owner, {
+          status: "failed",
+          reasonCode: "rubric_too_large",
+          message: `${err.message.slice(0, 300)}. Every finished step is kept; starting the same draft again resumes from them`,
+          ...summary,
+        });
+        return ok ? { kind: "finished", status: "failed", stepsRun, reasonCode: "rubric_too_large" } : { kind: "lease_lost", stepsRun };
+      }
+      throw err;
+    }
 
     if ("guarded" in written) {
       // Nothing was written. Why? Cancelled meanwhile, or another worker
