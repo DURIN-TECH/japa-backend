@@ -16,7 +16,7 @@ import type { ApplicationStatus } from "../types";
  *     `withdrawn`, `expired`);
  *   - a self-service applicant (see `isSelfServiceApplication`) gets two
  *     different sentences: `under_review` (their submission landed and a
- *     readiness review follows) and `withdrawn` (a short confirmation);
+ *     readiness review is the next step; no promise it will run) and `withdrawn` (a short confirmation);
  *   - the humanised fallback survives only as a last resort for a value that is
  *     not an `ApplicationStatus`;
  *   - the word "case" is for agents and is never used here, and the raw word
