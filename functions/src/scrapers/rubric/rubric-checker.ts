@@ -849,6 +849,10 @@ export class RubricCheckerService {
 
     // ---- 3. the one re-draft of each eligible bar ----
     const pendingCheck: AssessmentCriterion[] = [];
+    // (#240) Replacements drafted in THIS run, apart from the ones replayed from an earlier run. A request is
+    // a pure function of its batch, so batching a replay together with a new replacement would change the
+    // replay's request hash and pay for its check again. Each group is batched on its own.
+    const freshIds = new Set<string>();
     for (const id of eligible) {
       if (infra) {
         setFailure(id, "attempt_unfinished", "earlier_attempt_unfinished");
@@ -857,7 +861,15 @@ export class RubricCheckerService {
       const original = rule(id);
       const hash = ruleHashOf(original);
       let stored = ctx.repairs[id];
-      if (!stored || stored.ruleHash !== hash) {
+      // (#240) A stored attempt is reused for the same rule hash under the CURRENT repair prompt version.
+      // An attempt made under an OLDER version that did not produce a replacement (the model said it
+      // cannot be repaired, or code refused the re-draft: the guard and the prompt have changed since)
+      // gets ONE more try; the new attempt is stored with the current version, so a rule is never
+      // re-drafted twice under one version. A stored REPLACEMENT is always replayed (its check comes
+      // from the stored answers, zero requests) whatever its version: a bar already repaired and
+      // confirmed must not be re-drafted just because the prompt text moved on.
+      const staleAttempt = stored !== undefined && stored.promptVersion !== RUBRIC_REPAIR_PROMPT_VERSION && stored.kind !== "replacement";
+      if (!stored || stored.ruleHash !== hash || staleAttempt) {
         const result = await this.redraftOnce(ctx, original, p.aspectFailures.get(id) ?? [], p.routeName);
         if (result.kind === "infra") {
           infra = result.failure;
@@ -866,6 +878,7 @@ export class RubricCheckerService {
           continue;
         }
         stored = result.stored;
+        freshIds.add(id);
         ctx.repairs[id] = stored;
         // The finished attempt is stored NOW: a crash after this line still never re-drafts this rule again.
         await this.persist(ctx, "failed", []);
@@ -884,9 +897,12 @@ export class RubricCheckerService {
       for (const r of pendingCheck) if (!views.has(r.criterionId)) setFailure(r.criterionId, "invalid_redraft", "quote_unverifiable");
       const triggered = checkable.filter((r) => r.trigger !== undefined && isValidTrigger(r.trigger, p.questions));
       const jobs: Job[] = [];
+      const replayed = (r: AssessmentCriterion) => !freshIds.has(r.criterionId);
       for (const role of ["verification", "judgement"] as const) {
-        jobs.push(...this.batchJobs(role, checkable, views, ctx.limits));
-        jobs.push(...this.triggerJobs(role, triggered, views, p.questions, ctx.limits));
+        for (const group of [checkable.filter(replayed), checkable.filter((r) => !replayed(r))]) {
+          jobs.push(...this.batchJobs(role, group, views, ctx.limits));
+          jobs.push(...this.triggerJobs(role, triggered.filter((r) => group.includes(r)), views, p.questions, ctx.limits));
+        }
       }
       // A replacement's check made by an earlier run of this version is replayed from its stored answers
       // (same request hash, same model), never asked for again.
