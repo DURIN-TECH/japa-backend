@@ -49,6 +49,17 @@ export interface SourceDocument {
   truncated?: boolean;
 }
 
+/**
+ * Optional per-fetch policy (issue #215). `allowedHost` is set by the crawl for
+ * a page an admin added from the portal: the adapter must refuse any host it
+ * returns false for (the requested host, every redirect hop, the final URL).
+ * Adapters that talk to one fixed host may ignore it; the crawl re-checks the
+ * document's canonical URL afterwards either way.
+ */
+export interface SourceFetchOptions {
+  allowedHost?: (host: string) => boolean;
+}
+
 /** One implementation per kind of source, not per country. */
 export interface SourceAdapter {
   readonly id: SourceAdapterId;
@@ -59,5 +70,5 @@ export interface SourceAdapter {
    * non-2xx, bad payload, nothing selected…) so the crawl records it as the
    * page's `lastError` without extracting.
    */
-  fetch(page: VisaSourcePage): Promise<SourceDocument>;
+  fetch(page: VisaSourcePage, opts?: SourceFetchOptions): Promise<SourceDocument>;
 }

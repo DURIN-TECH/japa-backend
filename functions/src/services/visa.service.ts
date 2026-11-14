@@ -159,19 +159,15 @@ class VisaService {
   }
 
   /**
-   * Create a new country (admin only)
+   * The doc a NEW country starts as (pure, issue #215). The ONE place the
+   * defaults live (flag from flagcdn, `isSupported` default true, rank 999, zero
+   * stats), shared by `createCountry` and the registry API's transactional
+   * route registration, which passes `isSupported: false` so a country it
+   * creates stays hidden from applicants until an admin switches it on.
    */
-  async createCountry(input: CreateCountryInput): Promise<Country> {
+  buildNewCountry(input: CreateCountryInput, now: Timestamp): Country {
     const code = input.code.toUpperCase();
-    const countryRef = collections.countries.doc(code);
-
-    const existing = await countryRef.get();
-    if (existing.exists) {
-      throw new Error("Country already exists");
-    }
-
-    const now = Timestamp.now();
-    const country: Country = {
+    return {
       code,
       name: input.name,
       flagUrl: input.flagUrl || `https://flagcdn.com/${code.toLowerCase()}.svg`,
@@ -183,6 +179,21 @@ class VisaService {
       createdAt: now,
       updatedAt: now,
     };
+  }
+
+  /**
+   * Create a new country (admin only)
+   */
+  async createCountry(input: CreateCountryInput): Promise<Country> {
+    const code = input.code.toUpperCase();
+    const countryRef = collections.countries.doc(code);
+
+    const existing = await countryRef.get();
+    if (existing.exists) {
+      throw new Error("Country already exists");
+    }
+
+    const country = this.buildNewCountry(input, Timestamp.now());
 
     await countryRef.set(country);
     return country;

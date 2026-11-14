@@ -17,6 +17,7 @@
     "seed:prod": "npm run build && node lib/scripts/seed-prod-bootstrap.js --project japa-platform",
     "seed:prod:full": "npm run build && node lib/scripts/seed-all.js --project japa-platform",
     "sync:visa-sources": "npm run build && node lib/scrapers/visa-catalog/scripts/sync-visa-sources.js",
+    "seed:official-domains": "npm run build && node lib/scrapers/shared/registry/scripts/seed-official-domains.js",
     "seed:guidance-sources": "npm run build && node lib/scrapers/guidance/scripts/seed-guidance-sources.js",
     "extract:rubric": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/extract-rubric.js",
     "publish:rubric": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/publish-rubric.js",

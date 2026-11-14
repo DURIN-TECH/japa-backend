@@ -572,12 +572,34 @@ export function buildSeededVisaSource(params: {
   const pinned = applyVisaSourcePins(c.pages, overrides);
 
   // 2. Crawler-owned page fields: carried over by URL from the stored doc.
-  const pages = mergePageCrawlState(pinned.pages, existing?.pages as VisaSourcePage[] | undefined);
+  const mergedPages = mergePageCrawlState(pinned.pages, existing?.pages as VisaSourcePage[] | undefined);
+
+  // 2a. Portal-added pages (issue #215). The doc below is a FULL overwrite
+  //     rebuilt from the markdown, which would silently delete every page an
+  //     admin registered from the portal on a country that is also in the
+  //     markdown. Firestore is the source of truth for those: each stored page
+  //     with `addedVia: "portal"` is carried over untouched (crawl state,
+  //     visaId pin, language, pause flags) and appended after the seeded rows.
+  //     If a markdown row has the same URL, the seeded row stands (one row per
+  //     address).
+  const seededUrls = new Set(mergedPages.map((p) => p.url));
+  const portalPages = ((existing?.pages as VisaSourcePage[] | undefined) ?? []).filter(
+    (p) => p && p.addedVia === "portal" && typeof p.url === "string" && !seededUrls.has(p.url)
+  );
+  const pages = [...mergedPages, ...portalPages];
 
   // 3. Registry-owned adapter (absent → field omitted → generic-html default).
   const adapter = adapters[c.countryCode];
   // 3a. Registry-owned official hosts (#74); absent → field omitted.
-  const officialHosts = officialHostMap[c.countryCode];
+  const codeHosts = officialHostMap[c.countryCode] ?? [];
+  // 3a'. Issue #215: the confirmed hosts of portal-added pages are stored on
+  //      the doc. The code list stays authoritative for what it names, and the
+  //      stored extras are UNIONED in (code first), so a re-seed neither drops
+  //      a host an admin confirmed nor lets the stored list shadow the code.
+  const storedHosts = Array.isArray(existing?.officialHosts)
+    ? (existing!.officialHosts as unknown[]).filter((h): h is string => typeof h === "string" && h.trim().length > 0)
+    : [];
+  const officialHosts = [...new Set([...codeHosts, ...storedHosts])];
 
   // 3b. Registry-owned night window (absent → field omitted → legacy
   //     interval scheduling). Validated here so a typo in the map fails the
@@ -615,6 +637,11 @@ export function buildSeededVisaSource(params: {
     ...(adapter ? { adapter } : {}),
     ...(crawlWindow ? { crawlWindow } : {}),
     ...(officialHosts && officialHosts.length ? { officialHosts: [...officialHosts] } : {}),
+    // Issue #215: provenance of a doc first created from the portal (a country
+    // that is also in the markdown was created by a seed, so it has none).
+    ...(existing?.addedVia === "portal"
+      ? { addedVia: "portal", addedBy: existing.addedBy, addedAt: existing.addedAt }
+      : {}),
     // Issue #96: carried over verbatim (the full overwrite below would drop it).
     ...(adminOverrides && typeof adminOverrides === "object" ? { adminOverrides } : {}),
     crawlIntervalHours: CRAWL_INTERVAL_HOURS,
@@ -683,7 +710,12 @@ function isCi(): boolean {
  *    window) are kept: the block is copied over and its window replaces the
  *    registry window.
  */
-export async function seedVisaSources(markdownPath?: string): Promise<number> {
+export async function seedVisaSources(
+  markdownPath?: string,
+  // Issue #215: the Firestore handle (tests pass an in-memory one). Production
+  // passes nothing and gets the real one.
+  database?: FirebaseFirestore.Firestore
+): Promise<number> {
   const file = markdownPath || findVisaSourcesMarkdown();
   if (!file || !fs.existsSync(file)) {
     const msg =
@@ -700,7 +732,7 @@ export async function seedVisaSources(markdownPath?: string): Promise<number> {
   }
 
   // Resolved here (not at module load) — see the note at the top of the file.
-  const db = getFirestore();
+  const db = database ?? getFirestore();
   const countries = parseVisaSourcesMarkdown(fs.readFileSync(file, "utf8"));
   const collection = db.collection("visaSources");
   const now = Timestamp.now();

@@ -65,6 +65,10 @@ export type { ManualCostInput } from "./visa-catalog/visa-manual-cost";
 /** Firestore doc-id check shared with the visa change routes. */
 export { isValidDocId } from "./visa-catalog/changes/visa-catalog-changes.service";
 
+// ---- Source registry API (issue #215) ----
+/** Confirmed official websites + route registration (admin only). */
+export { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./shared/registry/registry.routes";
+
 // ---- Caseworker-guidance registry (issue #39) ----
 /** Admin list of guidance sources (GET /admin/guidance-sources). */
 export { adminGuidanceSourceRoutes } from "./guidance/guidance-source.routes";

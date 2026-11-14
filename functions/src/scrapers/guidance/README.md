@@ -240,3 +240,13 @@ and `lastErrorKind` per source.
 A quote check that starts failing after a crawl means the publisher changed
 the wording (a new snapshot was written; the old one is still readable by its
 hash). That is a signal for the rubric owner, not something to patch here.
+
+## Portal-added sources (issue #215)
+
+An admin can register sources through the API in `scrapers/shared/registry/`
+(see its README). Such a source has `addedVia: "portal"`, `verificationStatus:
+"registered"` (retrieved in full by the registration fetch; no person has read
+it; crawlable like `verified`), `addedBy`, `addedAt`, `language`. The crawl
+fetches it only from **confirmed hosts** (a redirect to anything else fails with
+`host_not_confirmed`), the seed never overwrites it, and `PATCH
+/admin/guidance-sources/:id` sets its `status` or `role`. There is no delete.
