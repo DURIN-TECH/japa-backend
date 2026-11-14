@@ -16,6 +16,7 @@ import { RecordedLlmProvider, LlmProviderError, type LlmRecording, type LlmReque
 import { GuidanceSnapshotStore, type SnapshotBucket } from "../../../src/scrapers/guidance/guidance-snapshot.store";
 import { PDF_PAGE_SEPARATOR } from "../../../src/scrapers/shared/fetch/pdf-text";
 import { chunkSnapshot } from "../../../src/scrapers/rubric/rubric-chunk";
+import { QUOTE_TRANSLATION_SYSTEM_PROMPT } from "../../../src/scrapers/rubric/rubric-translation";
 import { RUBRIC_INTAKE_SYSTEM_PROMPT, delimiterTag, type RawCriterion, type RawRubricOutput } from "../../../src/scrapers/rubric/rubric-prompt";
 import { RubricExtractionService, type RubricExtractionDeps } from "../../../src/scrapers/rubric/rubric-extraction.service";
 import { DEFAULT_RUBRIC_SETTINGS, type RubricExtractionSettings } from "../../../src/scrapers/rubric/rubric-settings";
@@ -72,6 +73,8 @@ export interface SeedSourceInput {
   pages?: string[];
   publishedDate?: string;
   fetchedAtMs?: number;
+  // (#220) The language the admin declared for the page (a code); absent = a source from before the field.
+  language?: string;
 }
 
 /**
@@ -93,6 +96,7 @@ export async function seedSource(input: SeedSourceInput): Promise<string> {
     latestSnapshotId: written.contentHash,
     lastContentHash: written.contentHash,
     publishedDate: input.publishedDate ?? null,
+    ...(input.language ? { language: input.language } : {}),
   });
   store.set(`guidanceSources/${input.id}/snapshots/${written.contentHash}`, {
     sourceId: input.id,
@@ -151,6 +155,13 @@ export const RECORDED_USAGE = { inputTokens: 1000, outputTokens: 200, cacheReadT
  */
 export class ScriptedProvider extends RecordedLlmProvider {
   private readonly scripts = new Map<string, LlmRecording>();
+  /**
+   * (#220) What answers a translation request (the one call that is neither
+   * criteria nor intake). Null = no recording: the call fails like any
+   * unscripted request. `translationRequests` lists the ones received.
+   */
+  translate: ((req: LlmRequest) => LlmRecording) | null = null;
+  readonly translationRequests: LlmRequest[] = [];
 
   /** Key of a request: kind of call, snapshot tag, excerpt number. */
   private static keyOf(kind: "criteria" | "intake", user: string): string {
@@ -166,6 +177,12 @@ export class ScriptedProvider extends RecordedLlmProvider {
 
   override async complete(request: LlmRequest): Promise<LlmResponse> {
     this.requests.push(request);
+    if (request.system === QUOTE_TRANSLATION_SYSTEM_PROMPT) {
+      this.translationRequests.push(request);
+      if (!this.translate) throw new LlmProviderError("missing_recording", "no recording for the translation call");
+      const rec = this.translate(request);
+      return { text: rec.text ?? "", stopReason: rec.stopReason === undefined ? "end_turn" : rec.stopReason, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, ...(rec.usage ?? {}) }, model: this.modelFor("judgement") };
+    }
     const kind = request.system === RUBRIC_INTAKE_SYSTEM_PROMPT ? "intake" : "criteria";
     const hit = this.scripts.get(ScriptedProvider.keyOf(kind, request.user));
     if (!hit) throw new LlmProviderError("missing_recording", `no recording for the ${kind} call`);
@@ -376,7 +393,7 @@ export function makeJobHarness(h: Harness, deps: Partial<RubricExtractionJobDeps
   // The provider: count calls, move the clock, allow scripted failures.
   const base = h.provider.complete.bind(h.provider);
   h.provider.complete = async (req: LlmRequest) => {
-    const kind = req.system === RUBRIC_INTAKE_SYSTEM_PROMPT ? "intake" : "criteria";
+    const kind = req.system === QUOTE_TRANSLATION_SYSTEM_PROMPT ? "translate" : req.system === RUBRIC_INTAKE_SYSTEM_PROMPT ? "intake" : "criteria";
     const tag = /<(source_text_[0-9a-f]+)> and/.exec(req.user)?.[1] ?? "?";
     const excerpt = /Excerpt (\d+) of/.exec(req.user)?.[1] ?? "?";
     jh.calls.push(`${kind}|${tag}|${excerpt}`);
