@@ -46,14 +46,6 @@ function sendMoneyError(res: Response, err: unknown): void {
   res.status(500).json({ success: false, error: "INTERNAL_ERROR", message: "An unexpected error occurred" });
 }
 
-/**
- * Public rates. Exposes ONLY: base currency, per currency the rate (local
- * units per 1 USD), its asOf, the minor-unit exponent for display and an
- * `available` flag. NOT exposed: margin, source (it would reveal a manual
- * override), override reason/author, audit, errors, or anything per-agency or
- * per-user. No auth, and a short public cache so mobile/web can show local
- * amounts without hammering the API.
- */
 /** How long one instance reuses a built GET /rates body (issue #214). */
 export const PUBLIC_RATES_CACHE_MS = 60_000;
 
@@ -65,6 +57,14 @@ export interface PublicRatesRouterOptions {
   now?: () => number;
 }
 
+/**
+ * Public rates. Exposes ONLY: base currency, per currency the rate (local
+ * units per 1 USD), its asOf, the minor-unit exponent for display and an
+ * `available` flag. NOT exposed: margin, source (it would reveal a manual
+ * override), override reason/author, audit, errors, or anything per-agency or
+ * per-user. No auth, and a short public cache so mobile/web can show local
+ * amounts without hammering the API.
+ */
 export function createPublicRatesRouter(service: RateService, opts: PublicRatesRouterOptions = {}): Router {
   const router = Router();
   const cacheMs = opts.cacheMs ?? PUBLIC_RATES_CACHE_MS;

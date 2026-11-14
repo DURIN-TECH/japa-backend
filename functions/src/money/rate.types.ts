@@ -36,6 +36,52 @@ export interface StoredOverride {
    * admin overview while active.
    */
   unreferenced?: boolean;
+  /**
+   * The provider rate the override's band was checked against when it was
+   * set (issue #229). Written on every REFERENCED override from #229 on, so
+   * an override carrying neither this nor `unreferenced` is one stored before
+   * #214/#229 whose reference is unknown: it is then treated like an
+   * unreferenced one (see `isUnreferencedOverride`), which fails safe.
+   */
+  referenceRate?: number;
+}
+
+/**
+ * Issue #229: true when an override was NOT checked against a provider rate
+ * when it was set, or when that can no longer be told:
+ *  - `unreferenced: true` (set with no provider rate, #214 onwards); or
+ *  - a legacy override with neither `unreferenced` nor `referenceRate`
+ *    (written before #229, where a referenced and an unreferenced override
+ *    looked the same). Treating those as unreferenced is the safe reading:
+ *    they only lose to a FRESH provider rate they are far away from.
+ */
+export function isUnreferencedOverride(override: StoredOverride): boolean {
+  return override.unreferenced === true || override.referenceRate === undefined;
+}
+
+/**
+ * Issue #229: true when two provider states are the same, i.e. the doc's
+ * provider part has not changed between a read and a later re-read. Compares
+ * every field of the provider map (rate, both dates, source) and the
+ * "corrupt" flag. Two missing providers are equal. Used by the conditional
+ * provider write in refreshOne, so a reset-reference (provider -> null) or
+ * another refresh landing in between is detected.
+ */
+export function sameProviderState(
+  a: Pick<StoredRate, "provider" | "providerCorrupt"> | null,
+  b: Pick<StoredRate, "provider" | "providerCorrupt"> | null
+): boolean {
+  const pa = a?.provider ?? null;
+  const pb = b?.provider ?? null;
+  // A corrupt map and a missing map are different states (reset clears one).
+  if (!!a?.providerCorrupt !== !!b?.providerCorrupt) return false;
+  if (pa === null || pb === null) return pa === pb;
+  return (
+    pa.rate === pb.rate &&
+    pa.source === pb.source &&
+    pa.asOf.getTime() === pb.asOf.getTime() &&
+    pa.fetchedAt.getTime() === pb.fetchedAt.getTime()
+  );
 }
 
 /** The whole per-currency document. */
@@ -88,11 +134,37 @@ export interface RateMutation {
   audit: RateAuditEntry;
 }
 
+/**
+ * Result of RateStore.saveProvider (issue #229). `saved: false` = the provider
+ * part changed since the caller read it, nothing written. `saved: true`
+ * carries the doc's override as re-read in the same transaction as the
+ * write (null when there is none), i.e. the override that now sits in front
+ * of the rate just stored.
+ */
+export type SaveProviderResult = { saved: false } | { saved: true; override: StoredOverride | null };
+
 /** Persistence for rate docs and the audit trail. */
 export interface RateStore {
   get(currency: CurrencyCode): Promise<StoredRate | null>;
-  /** Replace/merge the provider part (or lastError) of a currency doc. */
-  saveProvider(currency: CurrencyCode, provider: StoredProviderRate): Promise<void>;
+  /**
+   * Store a new provider rate (merge: the override and other fields stay),
+   * but ONLY if the doc's provider part is still `expected`, the state the
+   * caller read before it fetched the rate (issue #229). Read, compare and
+   * write run in one transaction. Returns false, writing nothing, when the
+   * provider part changed in between (typically an admin reset-reference),
+   * so a rate judged against a reference that was just dropped is never
+   * stored over the reset. The provider fetch itself must happen BEFORE this
+   * call, never inside the transaction (it may be retried).
+   *
+   * On success it also returns the override as read INSIDE that transaction,
+   * so the caller judges the override as it is now, not as it was before the
+   * fetch (an admin may have set or cleared one meanwhile; #229 review).
+   */
+  saveProvider(
+    currency: CurrencyCode,
+    provider: StoredProviderRate,
+    expected: Pick<StoredRate, "provider" | "providerCorrupt"> | null
+  ): Promise<SaveProviderResult>;
   saveError(currency: CurrencyCode, error: { at: Date; message: string }): Promise<void>;
   /**
    * Read the doc, let `decide` check it and say what to change, then write the
@@ -115,6 +187,14 @@ export interface RateStore {
     at: Date,
     cooldownMs: number
   ): Promise<{ allowed: boolean; retryAfterSeconds?: number }>;
+  /**
+   * Give back a "refresh now" slot claimed at `claimedAt` (issue #229), used
+   * when the refresh failed before the provider was contacted (e.g. a
+   * Firestore read error): no outbound request was made, so the admin may
+   * retry at once. Clears `manualRefreshAt` only while it still equals
+   * `claimedAt`, in a transaction, so a later claim is never released.
+   */
+  releaseManualRefresh(currency: CurrencyCode, claimedAt: Date): Promise<void>;
   /** Newest-first audit history for one currency. */
   listAudit(currency: CurrencyCode, limit: number): Promise<RateAuditEntry[]>;
 }

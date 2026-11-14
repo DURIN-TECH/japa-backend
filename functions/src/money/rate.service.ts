@@ -5,7 +5,14 @@ import { MoneyError } from "./errors";
 import { normalizeCurrencyCode } from "./currencies";
 import { selectProviders } from "./providers/select";
 import type { ProviderId, RateProvider } from "./providers/types";
-import type { RateAuditEntry, RateStore, StoredOverride, StoredRate } from "./rate.types";
+import {
+  isUnreferencedOverride,
+  type RateAuditEntry,
+  type RateStore,
+  type StoredOverride,
+  type StoredProviderRate,
+  type StoredRate,
+} from "./rate.types";
 
 // ============================================
 // RATE SERVICE (issue #178)
@@ -15,7 +22,8 @@ import type { RateAuditEntry, RateStore, StoredOverride, StoredRate } from "./ra
 // and lets an admin override it.
 //
 // Which rate is "effective" for a currency, in order:
-//  1. an admin override that has not expired (source "manual");
+//  1. an admin override that has not expired (source "manual"), unless it
+//     is unreferenced and a fresh provider rate is out of its band (#229);
 //  2. the provider's last rate, if the provider confirmed it within the
 //     freshness limit (`config.freshnessHours`);
 //  3. otherwise the call FAILS: RATE_STALE (a rate exists but is too old) or
@@ -34,6 +42,19 @@ import type { RateAuditEntry, RateStore, StoredOverride, StoredRate } from "./ra
 //    written with its audit entry in ONE transaction;
 //  - an admin can ask for a refresh now (rate-limited, audited), so a
 //    mistaken reset-reference does not stop pricing until the next 6-hourly run.
+//
+// Issue #229 closes the gaps left after #214:
+//  - an UNREFERENCED override (or a legacy one whose reference is unknown)
+//    stops winning as soon as a fresh provider rate exists and the override
+//    sits outside `overrideBandPercent` of it: the provider rate prices, and
+//    the admin overview flags OVERRIDE_SUPERSEDED. (Before, the typo
+//    "reset -> override 1050 -> provider 1500" priced ~30% low for up to 24h.)
+//    A referenced override keeps winning as before, flagged when it drifts.
+//  - refreshOne writes the provider rate conditionally on the doc as it read
+//    it, so a reset-reference landing mid-refresh is not undone;
+//  - refreshNow audits every outcome (try/finally), including store errors,
+//    and gives the 5-minute slot back when it failed before the provider was
+//    contacted.
 
 /** Hours -> milliseconds. */
 const HOUR_MS = 60 * 60 * 1000;
@@ -63,6 +84,11 @@ export function exceedsBand(candidate: number, reference: number, percent: numbe
   return diff * 100_000n > r * BigInt(Math.round(percent * 1000));
 }
 
+/** A short, safe message from an unknown thrown value (for audit text and logs). */
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message.slice(0, 200) : "unknown error";
+}
+
 export interface RateServiceDeps {
   config: ConfigStore;
   rates: RateStore;
@@ -87,7 +113,11 @@ export interface RefreshOutcome {
 
 /** A problem with a currency's active override, shown in the admin overview (issue #214). */
 export interface RateWarning {
-  code: "OVERRIDE_OUTSIDE_PROVIDER_BAND" | "OVERRIDE_UNREFERENCED";
+  /**
+   * OVERRIDE_SUPERSEDED (issue #229): an unreferenced or legacy override is
+   * being ignored because a fresh provider rate is out of its band.
+   */
+  code: "OVERRIDE_OUTSIDE_PROVIDER_BAND" | "OVERRIDE_UNREFERENCED" | "OVERRIDE_SUPERSEDED";
   message: string;
 }
 
@@ -129,6 +159,54 @@ export class RateService {
     return this.effectiveRate(currency, stored, config, marginBps);
   }
 
+  /**
+   * The stored provider rate if it is usable right now, else null: confirmed
+   * within `freshnessHours` (fetchedAt) AND its own date within
+   * `maxRateAgeHours` (asOf). Re-reading an old row from a stuck upstream
+   * refreshes `fetchedAt` but never `asOf`, hence both checks.
+   */
+  private freshProvider(stored: StoredRate | null, config: CurrenciesConfig): StoredProviderRate | null {
+    if (!stored?.provider) return null;
+    const nowMs = this.now().getTime();
+    const ageMs = nowMs - stored.provider.fetchedAt.getTime();
+    const rateAgeMs = nowMs - stored.provider.asOf.getTime();
+    return ageMs <= config.freshnessHours * HOUR_MS && rateAgeMs <= config.maxRateAgeHours * HOUR_MS
+      ? stored.provider
+      : null;
+  }
+
+  /**
+   * Issue #229: true when an ACTIVE override must give way to the provider
+   * rate: it is unreferenced (or legacy, reference unknown; see
+   * isUnreferencedOverride), a provider rate is STORED, and the override is
+   * more than `overrideBandPercent` away from it (integer maths via
+   * exceedsBand). Such an override was never checked against anything, and
+   * a provider rate now says it is wrong, so it must not price for the rest
+   * of its life. A referenced override is never superseded here: it passed
+   * the band when it was set, and a later drift is only flagged.
+   *
+   * Any stored provider rate counts, fresh or STALE (#229 review). Judging
+   * only against a fresh one failed open: once that provider rate aged past
+   * `freshnessHours` / `maxRateAgeHours` (a stuck upstream after a holiday,
+   * or a legacy override outliving the 72h freshness limit), the override
+   * that had already been shown wrong priced again. Now supersession, once
+   * a provider rate has disagreed, sticks: effectiveRate falls through to
+   * step 2, which prices from the provider while it is fresh and throws
+   * RATE_STALE once it is not, i.e. it fails closed and never falls back to
+   * the superseded override. A corrupt provider map is absent here
+   * (`provider` null), so it never supersedes; that state is refused for
+   * pricing anyway. For an unreferenced override the stored provider rate
+   * is necessarily one that arrived AFTER it was set, because reset-reference
+   * drops the provider rate and is the only way to set one unreferenced.
+   */
+  private overrideSuperseded(stored: StoredRate | null, config: CurrenciesConfig): boolean {
+    const override = stored?.override;
+    if (!override || override.expiresAt.getTime() <= this.now().getTime()) return false;
+    if (!isUnreferencedOverride(override)) return false;
+    const provider = stored?.provider ?? null;
+    return !!provider && exceedsBand(override.rate, provider.rate, config.overrideBandPercent);
+  }
+
   /** Pure selection of the effective rate from a stored doc (see header). */
   private effectiveRate(
     currency: CurrencyCode,
@@ -138,8 +216,11 @@ export class RateService {
   ): ExchangeRate {
     const nowMs = this.now().getTime();
 
-    // 1. Active admin override.
-    if (stored?.override && stored.override.expiresAt.getTime() > nowMs) {
+    // 1. Active admin override, unless it is an unreferenced one that a stored
+    //    provider rate (fresh or stale) has shown to be out of band (issue
+    //    #229): then it is skipped and step 2 prices from the provider if it
+    //    is fresh, or throws RATE_STALE if not. Never back to the override.
+    if (stored?.override && stored.override.expiresAt.getTime() > nowMs && !this.overrideSuperseded(stored, config)) {
       return {
         currency,
         rate: stored.override.rate,
@@ -149,21 +230,19 @@ export class RateService {
       };
     }
 
-    // 2. Provider rate within the freshness limit.
+    // 2. Provider rate within the freshness limit (fetchedAt) and the rate-age
+    //    limit (its own asOf date).
+    const provider = this.freshProvider(stored, config);
+    if (provider) {
+      return {
+        currency,
+        rate: provider.rate,
+        asOf: provider.asOf.toISOString(),
+        source: provider.source,
+        marginBps,
+      };
+    }
     if (stored?.provider) {
-      const ageMs = nowMs - stored.provider.fetchedAt.getTime();
-      // The rate's OWN date must also be recent: re-reading an old row from a
-      // stuck upstream refreshes `fetchedAt` but never `asOf`.
-      const rateAgeMs = nowMs - stored.provider.asOf.getTime();
-      if (ageMs <= config.freshnessHours * HOUR_MS && rateAgeMs <= config.maxRateAgeHours * HOUR_MS) {
-        return {
-          currency,
-          rate: stored.provider.rate,
-          asOf: stored.provider.asOf.toISOString(),
-          source: stored.provider.source,
-          marginBps,
-        };
-      }
       throw new MoneyError(
         "RATE_STALE",
         `The ${currency} exchange rate is out of date`,
@@ -193,7 +272,7 @@ export class RateService {
       try {
         outcomes.push(await this.refreshOne(currency, config));
       } catch (err) {
-        const reason = `refresh failed: ${err instanceof Error ? err.message.slice(0, 200) : "unknown error"}`;
+        const reason = `refresh failed: ${errorMessage(err)}`;
         console.error(`Exchange rate refresh ${currency}: ${reason}`);
         outcomes.push({ currency, ok: false, reason });
       }
@@ -201,8 +280,27 @@ export class RateService {
     return outcomes;
   }
 
-  /** Try each provider in order; save the first rate that passes validation. */
-  private async refreshOne(currency: CurrencyCode, config: CurrenciesConfig): Promise<RefreshOutcome> {
+  /**
+   * Try each provider in order; save the first rate that passes validation.
+   *
+   * Issue #229: the save is CONDITIONAL on the doc's provider part being what
+   * was read at the start (`stored`). The provider fetch runs outside any
+   * transaction (it is an outbound request and must not be retried); only
+   * the final re-read + compare + write is transactional. If an admin's
+   * reset-reference (or another refresh) committed in between, nothing is
+   * stored and the outcome says so: the rate was judged against a reference
+   * that no longer exists, and storing it would silently undo the reset. The
+   * next refresh judges it again against the doc as it is then.
+   *
+   * `progress.contactedProvider` is set just before the first outbound fetch,
+   * so refreshNow can tell a failure before any provider was contacted (the
+   * slot is then given back) from one after.
+   */
+  private async refreshOne(
+    currency: CurrencyCode,
+    config: CurrenciesConfig,
+    progress: { contactedProvider: boolean } = { contactedProvider: false }
+  ): Promise<RefreshOutcome> {
     const reasons: string[] = [];
     const stored = await this.deps.rates.get(currency);
     for (const provider of selectProviders(config, this.deps.providers)) {
@@ -210,6 +308,7 @@ export class RateService {
         reasons.push(`${provider.id}: does not cover ${currency}`);
         continue;
       }
+      progress.contactedProvider = true;
       const result = await provider.fetchRate(currency);
       if (!result.ok) {
         reasons.push(`${provider.id}: ${result.reason}`);
@@ -222,18 +321,32 @@ export class RateService {
         reasons.push(`${provider.id}: rejected (${rejection})`);
         continue;
       }
-      await this.deps.rates.saveProvider(currency, {
-        rate: result.rate,
-        asOf: result.asOf,
-        fetchedAt: this.now(),
-        source: provider.id,
-      });
+      const save = await this.deps.rates.saveProvider(
+        currency,
+        { rate: result.rate, asOf: result.asOf, fetchedAt: this.now(), source: provider.id },
+        stored
+      );
+      if (!save.saved) {
+        // Issue #229: the provider part changed while we fetched (typically a
+        // reset-reference). Keep the admin's change; record nothing on the
+        // doc (it is not a provider failure) and say what happened.
+        const reason = `${provider.id}: rate ${result.rate} not stored, the stored rate changed during the refresh ` +
+          "(e.g. reset-reference); the next refresh will check it again";
+        console.warn(`Exchange rate ${currency}: ${reason}`);
+        return { currency, ok: false, reason };
+      }
       this.changeCounter++;
       // Issue #214: the override beats the provider rate and was only checked
       // when it was set. Re-check it against the rate just accepted; a big gap
       // (typically an override typed after reset-reference) is shouted about
       // here and flagged in the admin overview until it is fixed or expires.
-      const warning = this.overrideBandWarning(stored?.override ?? null, result.rate, config);
+      // Issue #229: if that override is unreferenced it has now stopped
+      // pricing (see overrideSuperseded); the warning says so.
+      // #229 review: check the override as re-read in the save transaction
+      // (`save.override`), not `stored.override` from before the fetch, so an
+      // override set or cleared while the fetch ran is judged correctly in
+      // the log and in the outcome text.
+      const warning = this.overrideBandWarning(save.override, result.rate, config);
       if (warning) console.error(`Exchange rate ${currency}: ${warning}`);
       return { currency, ok: true, source: provider.id, rate: result.rate, ...(warning ? { warning } : {}) };
     }
@@ -335,7 +448,10 @@ export class RateService {
    * each call makes an outbound request to the provider. Refused with
    * RATE_LIMITED (HTTP 429). `reason` is optional (5-500 chars when given).
    * Always audited as `provider_refresh` with the effective rate before and
-   * after and what the refresh did, whether it succeeded or not.
+   * after and what the refresh did, whether it succeeded or not, including a
+   * store error mid-refresh (issue #229). A failed audit write is logged and
+   * never changes the response. A refresh that fails before any provider was
+   * contacted gives its slot back.
    */
   async refreshNow(currencyInput: string, reasonInput: unknown, adminUid: string): Promise<RefreshOutcome> {
     const config = await this.getConfig();
@@ -348,7 +464,10 @@ export class RateService {
       }
     }
 
-    const claim = await this.deps.rates.claimManualRefresh(currency, this.now(), MANUAL_REFRESH_COOLDOWN_MINUTES * 60_000);
+    // The claim time is kept: releasing the slot later only clears a claim
+    // that is still this one (issue #229).
+    const claimedAt = this.now();
+    const claim = await this.deps.rates.claimManualRefresh(currency, claimedAt, MANUAL_REFRESH_COOLDOWN_MINUTES * 60_000);
     if (!claim.allowed) {
       throw new MoneyError(
         "RATE_LIMITED",
@@ -358,23 +477,74 @@ export class RateService {
       );
     }
 
-    const before = await this.deps.rates.get(currency);
-    const outcome = await this.refreshOne(currency, config);
-    const after = await this.deps.rates.get(currency);
-    await this.deps.rates.appendAudit({
-      currency,
-      action: "provider_refresh",
-      by: adminUid,
-      at: this.now(),
-      reason,
-      old: this.summarizeEffective(before, config),
-      new: this.summarizeEffective(after, config),
-      outcome: (outcome.ok
-        ? `ok: ${outcome.source} ${outcome.rate}${outcome.warning ? ` (${outcome.warning})` : ""}`
-        : `failed: ${outcome.reason ?? "unknown"}`
-      ).slice(0, 500),
-    });
-    return outcome;
+    // Issue #229: EVERY outcome past the claim is audited, in a finally
+    // block. Before, only a failed provider fetch was: a Firestore error in
+    // a read or write threw past the audit (500, no entry, slot used up), and
+    // a failed audit write after a successful refresh turned a real rate
+    // change into a 500. The audit stays OUTSIDE any transaction, because
+    // the provider fetch inside refreshOne must not run in one.
+    const progress = { contactedProvider: false };
+    let before: StoredRate | null = null;
+    let outcome: RefreshOutcome | null = null;
+    let failure: unknown = null;
+    let slotReleased = false;
+    try {
+      before = await this.deps.rates.get(currency);
+      outcome = await this.refreshOne(currency, config, progress);
+    } catch (err) {
+      failure = err;
+    } finally {
+      // Failed before any provider was contacted (e.g. the first read threw):
+      // no outbound request was made, so give the 5-minute slot back and let
+      // the admin retry at once. A failure after contact keeps the slot (the
+      // limit exists to bound outbound requests). Best effort: a failed
+      // release only means waiting out the cooldown.
+      if (failure && !progress.contactedProvider) {
+        try {
+          await this.deps.rates.releaseManualRefresh(currency, claimedAt);
+          slotReleased = true;
+        } catch (releaseErr) {
+          console.error(`Exchange rate ${currency}: could not release the refresh slot:`, releaseErr);
+        }
+      }
+
+      // The effective rate after the attempt. If this read fails too, `new`
+      // is recorded as null and the outcome text says the state is unknown.
+      let after: StoredRate | null = null;
+      let afterUnread = false;
+      try {
+        after = await this.deps.rates.get(currency);
+      } catch {
+        afterUnread = true;
+      }
+
+      const outcomeText = failure
+        ? `failed: ${errorMessage(failure)}${slotReleased ? " (refresh slot released)" : ""}`
+        : outcome?.ok
+          ? `ok: ${outcome.source} ${outcome.rate}${outcome.warning ? ` (${outcome.warning})` : ""}`
+          : `failed: ${outcome?.reason ?? "unknown"}`;
+      try {
+        await this.deps.rates.appendAudit({
+          currency,
+          action: "provider_refresh",
+          by: adminUid,
+          at: this.now(),
+          reason,
+          old: this.summarizeEffective(before, config),
+          new: afterUnread ? null : this.summarizeEffective(after, config),
+          outcome: `${outcomeText}${afterUnread ? " (rate after the refresh could not be read)" : ""}`.slice(0, 500),
+        });
+      } catch (auditErr) {
+        // Never let a failed audit write hide what the refresh did: the rate
+        // may already have changed, and the response must say so. Logged at
+        // error level so the missing entry is noticed.
+        console.error(`Exchange rate ${currency}: refresh-now audit write failed (outcome "${outcomeText}"):`, auditErr);
+      }
+    }
+    // A store error during the refresh still surfaces (HTTP 500); it has
+    // been audited above.
+    if (failure) throw failure;
+    return outcome as RefreshOutcome;
   }
 
   // ---------- admin override ----------
@@ -461,7 +631,10 @@ export class RateService {
         setBy: adminUid,
         setAt: now,
         expiresAt: new Date(now.getTime() + effectiveTtlHours * HOUR_MS),
-        ...(unreferenced ? { unreferenced: true } : {}),
+        // Issue #229: a referenced override records the provider rate it was
+        // checked against, so it can be told apart from a legacy override
+        // whose reference is unknown (see isUnreferencedOverride).
+        ...(unreferenced ? { unreferenced: true } : { referenceRate: (stored?.provider as StoredProviderRate).rate }),
       };
       saved = { ...(stored ?? { currency, provider: null, lastError: null }), currency, override };
       return {
@@ -530,15 +703,17 @@ export class RateService {
   /**
    * Issue #214: a warning when an ACTIVE override is further than
    * `overrideBandPercent` from `providerRate`, else null. Integer maths via
-   * exceedsBand.
+   * exceedsBand. Issue #229: for an unreferenced (or legacy) override the
+   * message says it has stopped pricing, since a fresh provider rate that
+   * far away supersedes it (see overrideSuperseded).
    */
   private overrideBandWarning(override: StoredOverride | null, providerRate: number, config: CurrenciesConfig): string | null {
     if (!override || override.expiresAt.getTime() <= this.now().getTime()) return null;
     if (!exceedsBand(override.rate, providerRate, config.overrideBandPercent)) return null;
-    return (
-      `active override ${override.rate} is more than ${config.overrideBandPercent}% away from the provider rate ` +
-      `${providerRate}; check it and clear or replace it`
-    );
+    const head = `active override ${override.rate} is more than ${config.overrideBandPercent}% away from the provider rate ${providerRate}`;
+    return isUnreferencedOverride(override)
+      ? `${head}; it has no recorded provider rate it was checked against (none when set, or unknown), so it no longer prices (the provider rate does); clear or replace it`
+      : `${head}; check it and clear or replace it`;
   }
 
   /** Issue #214: everything wrong with a currency's active override, for the admin overview. */
@@ -554,6 +729,20 @@ export class RateService {
     }
     const band = stored?.provider ? this.overrideBandWarning(override, stored.provider.rate, config) : null;
     if (band) warnings.push({ code: "OVERRIDE_OUTSIDE_PROVIDER_BAND", message: band });
+    // Issue #229: say plainly when the override is being ignored for pricing.
+    if (this.overrideSuperseded(stored, config)) {
+      warnings.push({
+        code: "OVERRIDE_SUPERSEDED",
+        message:
+          // #229 review: true for both kinds that can be superseded: an
+          // override set after reset-reference (no provider rate to check)
+          // and a legacy override whose reference was never recorded.
+          `This override (${override.rate}) is not used for pricing: it has no recorded provider rate it was ` +
+          "checked against (none existed when it was set, or its reference is unknown), and the stored provider rate " +
+          `${stored?.provider?.rate} is more than ${config.overrideBandPercent}% away. ` +
+          "Pricing uses the provider rate while it is fresh, and stops (rate out of date) when it is not",
+      });
+    }
     return warnings;
   }
 

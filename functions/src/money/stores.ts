@@ -2,7 +2,14 @@ import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db } from "../utils/firebase";
 import type { FxRateSource } from "../types/money";
 import type { ConfigStore } from "./config";
-import type { RateAuditEntry, RateStore, StoredOverride, StoredProviderRate, StoredRate } from "./rate.types";
+import {
+  sameProviderState,
+  type RateAuditEntry,
+  type RateStore,
+  type StoredOverride,
+  type StoredProviderRate,
+  type StoredRate,
+} from "./rate.types";
 
 // ============================================
 // FIRESTORE STORES (issue #178)
@@ -55,6 +62,11 @@ function parseRateDoc(currency: string, d: Record<string, any>): StoredRate { //
           setAt,
           expiresAt,
           ...(d.override.unreferenced === true ? { unreferenced: true } : {}),
+          // Issue #229: the provider rate the band was checked against. A
+          // missing or malformed value reads as "unknown" (legacy override).
+          ...(typeof d.override.referenceRate === "number" && Number.isFinite(d.override.referenceRate)
+            ? { referenceRate: d.override.referenceRate }
+            : {}),
         }
         : null,
     lastError: d.lastError && errAt ? { at: errAt, message: String(d.lastError.message ?? "") } : null,
@@ -72,6 +84,7 @@ function overrideToDoc(override: StoredOverride | null) {
     setAt: Timestamp.fromDate(override.setAt),
     expiresAt: Timestamp.fromDate(override.expiresAt),
     ...(override.unreferenced ? { unreferenced: true } : {}),
+    ...(override.referenceRate !== undefined ? { referenceRate: override.referenceRate } : {}),
   };
 }
 
@@ -93,21 +106,42 @@ export const firestoreRateStore: RateStore & {
     return parseRateDoc(currency, snap.data() as Record<string, unknown>);
   },
 
-  async saveProvider(currency, provider) {
-    // merge: an existing override must survive a provider refresh.
-    await collections.exchangeRates.doc(currency).set(
-      {
-        currency,
-        provider: {
-          rate: provider.rate,
-          asOf: Timestamp.fromDate(provider.asOf),
-          fetchedAt: Timestamp.fromDate(provider.fetchedAt),
-          source: provider.source,
+  async saveProvider(currency, provider, expected) {
+    // Issue #229: a CONDITIONAL write. Before, the scheduled refresh read the
+    // doc, fetched from the provider, then merged the new rate in blind: a
+    // reset-reference committed in between was silently undone (the rate
+    // stored had been judged against the reference just dropped). Now the
+    // doc is re-read inside a transaction and the rate is written only when
+    // the provider part is exactly what the caller read before its fetch.
+    // The provider fetch is NOT in here: it ran before, so a transaction
+    // retry never repeats an outbound request.
+    // Comparing the provider fields (not the doc's update time) on purpose:
+    // the admin "refresh now" claim writes `manualRefreshAt` into the same
+    // doc just before its refresh, and that must not count as a conflict.
+    const ref = collections.exchangeRates.doc(currency);
+    return this.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const current = snap.exists ? parseRateDoc(currency, snap.data() as Record<string, unknown>) : null;
+      if (!sameProviderState(current, expected)) return { saved: false } as const;
+      // merge: an existing override must survive a provider refresh.
+      tx.set(
+        ref,
+        {
+          currency,
+          provider: {
+            rate: provider.rate,
+            asOf: Timestamp.fromDate(provider.asOf),
+            fetchedAt: Timestamp.fromDate(provider.fetchedAt),
+            source: provider.source,
+          },
+          lastError: null,
         },
-        lastError: null,
-      },
-      { merge: true }
-    );
+        { merge: true }
+      );
+      // The merge leaves the override untouched, so the one read here is the
+      // one in front of the new rate once this commits.
+      return { saved: true, override: current?.override ?? null } as const;
+    });
   },
 
   async saveError(currency, error) {
@@ -151,6 +185,18 @@ export const firestoreRateStore: RateStore & {
       if (waitMs > 0) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(waitMs / 1000)) };
       tx.set(ref, { currency, manualRefreshAt: Timestamp.fromDate(at) }, { merge: true });
       return { allowed: true };
+    });
+  },
+
+  async releaseManualRefresh(currency, claimedAt) {
+    // Issue #229: give the slot back only if it is still OUR claim.
+    const ref = collections.exchangeRates.doc(currency);
+    await this.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      const last = toDate((snap.data() as Record<string, unknown>).manualRefreshAt);
+      if (!last || last.getTime() !== claimedAt.getTime()) return;
+      tx.set(ref, { manualRefreshAt: null }, { merge: true });
     });
   },
 
