@@ -301,6 +301,12 @@ export async function installFakes(): Promise<void> {
   firebase.collections.sourceRegistryRateLimits = fakeCollection("sourceRegistryRateLimits");
   // Issue #232: the registry checks the authority a website or route belongs to.
   firebase.collections.authorities = fakeCollection("authorities");
+  // Issue #236: entry requirements. Eligibility's pre-check answers from these
+  // (no rule = "unknown"), and the lookup reads authority membership.
+  firebase.collections.entryRules = fakeCollection("entryRules");
+  firebase.collections.entryRuleHeads = fakeCollection("entryRuleHeads");
+  firebase.collections.entryRuleRuns = fakeCollection("entryRuleRuns");
+  firebase.subcollections.authorityMembers = (id: string) => fakeCollection(`authorities/${id}/members`);
   firebase.collections.countries = fakeCollection("countries");
   firebase.collections.pendingVisaChanges = fakeCollection("pendingVisaChanges");
   // Issue #81: run records + the news registry (source health, news runs).

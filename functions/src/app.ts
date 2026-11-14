@@ -75,6 +75,8 @@ import { verificationWebhookRoutes } from "./routes/verification-webhook.routes"
 import { paymentReturnRoutes } from "./routes/payment-return.routes";
 // Admin review queue for trafficking / scam risk signals (issue #119).
 import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
+// Issue #236: entry requirements ("do you need a visa at all") and their admin review data.
+import { entryRequirementsRoutes, adminEntryRuleRoutes } from "./entry-requirements";
 
 // Create Express app
 const app = express();
@@ -142,6 +144,8 @@ app.use("/onboarding", onboardingRoutes);
 app.use("/analytics", analyticsRoutes);
 app.use("/news", newsRoutes);
 app.use("/eligibility", eligibilityRoutes);
+// Issue #236: GET /entry-requirements (signed in, free: stored sourced data, no AI call).
+app.use("/entry-requirements", entryRequirementsRoutes);
 // AI case-officer assessments (issue #42): async jobs, tier decided in the handler.
 app.use("/ai", aiRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
@@ -175,6 +179,8 @@ app.use("/admin/route-sources", adminRouteSourceRoutes);
 // Issue #230: issuing authorities (country, bloc, treaty) and bloc members.
 // Admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route.
 app.use("/admin/authorities", adminAuthorityRoutes);
+// Issue #236: entry rules, their sources and drafting runs (admin review data, read-only).
+app.use("/admin/entry-rules", adminEntryRuleRoutes);
 // Issue #231: shared routes (a visa defined once by a bloc) and the visa records that inherit them.
 app.use("/admin/shared-routes", adminSharedRouteRoutes);
 // Issue #217: route onboarding runs (admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route).

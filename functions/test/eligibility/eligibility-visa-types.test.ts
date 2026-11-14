@@ -7,7 +7,9 @@
 //  - `subcollections.visaTypes(cc)` -> `countries/{cc}/visaTypes` (installFakes);
 //  - `collectionGroups.visaTypes()` -> every `*/visaTypes` in the store, with
 //    `ref.parent.parent.id` added (the service reads the country from it);
-//  - the service's own three collections (questions, checks, exemptions).
+//  - the service's own two collections (questions, checks);
+//  - (#236) the entry-rule collections the pre-check now answers from
+//    (installFakes), with the lookup's cache cleared before each test.
 //
 // Covers the acceptance criteria of issue #27:
 //  - recommendations come from `countries/{destination}/visaTypes`, one
@@ -39,6 +41,7 @@ import type { Data } from "../helpers/fake-firestore";
 import { fakeCollectionGroup } from "../helpers/fake-collection-group";
 import { eligibilityService } from "../../src/services/eligibility.service";
 import { eligibilityController } from "../../src/controllers/eligibility.controller";
+import { entryRequirementsService } from "../../src/entry-requirements/entry-requirements.service";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -227,15 +230,16 @@ let firebase: any;
 before(async () => {
   await installFakes();
   firebase = await import("../../src/utils/firebase");
-  // The service keeps its own three collection refs as (private) fields.
+  // The service keeps its own two collection refs as (private) fields.
   const svc = eligibilityService as any;
   svc.questionsCollection = fakeCollection("eligibilityQuestions");
   svc.checksCollection = fakeCollection("eligibilityChecks");
-  svc.exemptionsCollection = fakeCollection("visaExemptions");
 });
 
 beforeEach(() => {
   resetStore();
+  // (#236) The entry lookup caches per destination: start each test clean.
+  entryRequirementsService.clearCache();
   groupQueries = 0;
   firebase.collectionGroups.visaTypes = () => {
     groupQueries++;
@@ -255,7 +259,8 @@ describe("pre-check recommendations read countries/{code}/visaTypes", () => {
       destinationCountry: CC_A,
       travelPurpose: "work",
     });
-    assert.equal(result.visaRequired, true);
+    // (#236) No entry rule is seeded for this pair: unknown, never "required".
+    assert.equal(result.visaRequired, null);
     // Only the seed-like work visa: the student visa is another category and
     // the five hidden work visas are dropped.
     assert.deepEqual(recommendedIds(result), ["a-work-seed"]);
@@ -349,14 +354,16 @@ describe("pre-check recommendations read countries/{code}/visaTypes", () => {
     assert.deepEqual(result.recommendedVisaTypes, []);
   });
 
-  test("an unknown or unusable destination gives no recommendations, not an error", async () => {
+  test("an unknown or unusable destination gives no recommendations and an unknown answer, not an error", async () => {
     for (const destinationCountry of ["ZZ", "", "a/b", "../x", "has space"]) {
       const result = await eligibilityService.preCheck({
         nationality: NATIONALITY,
         destinationCountry,
         travelPurpose: "work",
       });
-      assert.equal(result.visaRequired, true);
+      // (#236) No official source: never "visa required" by default.
+      assert.equal(result.visaRequired, null);
+      assert.equal(result.status, "unknown");
       assert.deepEqual(result.recommendedVisaTypes, [], `destination ${JSON.stringify(destinationCountry)}`);
     }
   });
@@ -371,41 +378,99 @@ describe("pre-check recommendations read countries/{code}/visaTypes", () => {
     assert.equal(result.recommendedVisaTypes?.length, 3);
   });
 
-  test("the exemption lookup matches the destination in any case", async () => {
-    // Visa-free row stored under the upper-case code, as the seeds write it.
+  test("(#236) an unseeded pair is unknown, never 'visa required' by default", async () => {
+    const result = await eligibilityService.preCheck({
+      nationality: NATIONALITY,
+      destinationCountry: CC_B,
+      travelPurpose: "work",
+    });
+    assert.equal(result.visaRequired, null);
+    assert.equal(result.requirementType, "unknown");
+    assert.equal(result.status, "unknown");
+    assert.equal(result.entryRequirement.status, "unknown");
+    // Nothing in the text claims a visa is (or is not) needed.
+    for (const step of result.nextSteps) assert.doesNotMatch(step, /you need a visa|you don't need|without a visa/i);
+    // The destination's visas for the purpose are still listed (not a claim).
+    assert.deepEqual(recommendedIds(result), ["b-work"]);
+  });
+
+  test("(#236) an old visaExemptions row is ignored (retired: it had no quote)", async () => {
     store.set("visaExemptions/free", {
       nationality: NATIONALITY,
       destinationCountry: CC_C,
       requirementType: "visa_free",
       maxStayDays: 90,
     });
+    const result = await eligibilityService.preCheck({
+      nationality: NATIONALITY,
+      destinationCountry: CC_C,
+      travelPurpose: "tourism",
+    });
+    assert.equal(result.visaRequired, null);
+    assert.equal(result.status, "unknown");
+  });
+
+  test("(#236) a sourced visa-free rule answers false, in any case of the destination", async () => {
+    seedEntryRule(CC_C, "visa_free", { maxStayDays: 90 });
     for (const destinationCountry of [CC_C, CC_C.toLowerCase()]) {
+      entryRequirementsService.clearCache();
       const result = await eligibilityService.preCheck({
         nationality: NATIONALITY,
         destinationCountry,
         travelPurpose: "tourism",
       });
       assert.equal(result.visaRequired, false, destinationCountry);
+      assert.equal(result.status, "answer");
       assert.equal(result.maxStayDays, 90, destinationCountry);
+      assert.match(result.nextSteps[0], /^The official source says/);
     }
   });
 
-  test("a visa-required exemption still recommends from the canonical path", async () => {
-    // Second way into the recommendation code: an exemption row that says a
-    // visa is required (the first is "no exemption row").
-    store.set("visaExemptions/x1", {
-      nationality: NATIONALITY,
-      destinationCountry: CC_B,
-      requirementType: "visa_required",
-    });
+  test("(#236) a sourced visa-required rule still recommends from the canonical path", async () => {
+    seedEntryRule(CC_B, "visa_required", {});
     const result = await eligibilityService.preCheck({
       nationality: NATIONALITY,
       destinationCountry: CC_B,
       travelPurpose: "work",
     });
+    assert.equal(result.visaRequired, true);
+    assert.equal(result.requirementType, "visa_required");
     assert.deepEqual(recommendedIds(result), ["b-work"]);
+    assert.equal(result.entryRequirement.status, "answer");
   });
 });
+
+/**
+ * (#236) Seed one published entry rule for `cc` covering NATIONALITY, served
+ * by its authority's head, with a fresh source.
+ */
+function seedEntryRule(cc: string, outcome: string, over: Data): void {
+  const runId = `${cc}__run1`;
+  store.set(`entryRules/${runId}__0001`, {
+    id: `${runId}__0001`,
+    issuingAuthorityId: cc,
+    destination: { kind: "countries", countryCodes: [cc] },
+    destinationCodes: [cc],
+    scopeAuthorityId: null,
+    outcome,
+    group: { members: [{ kind: "nationality", code: NATIONALITY, asWritten: "Nationals of the listed country" }], uncoded: [] },
+    conditions: [],
+    quote: "Nationals of the listed country may enter as the rules say.",
+    url: "https://official.example/entry",
+    sourceId: "src-entry",
+    contentHash: "h1",
+    fetchedAt: new Date().toISOString(),
+    publishedAt: T0,
+    status: "published",
+    runId,
+    promptVersion: "p",
+    checkPromptVersion: "c",
+    createdAt: T0,
+    ...over,
+  });
+  store.set(`entryRuleHeads/${cc}`, { authorityId: cc, publishedRunId: runId, publishedAt: T0, publishedRuleCount: 1, lastRunId: runId, lastRunStatus: "published", sourceUrls: ["https://official.example/entry"], updatedAt: T0 });
+  store.set("guidanceSources/src-entry", { lastContentHash: "h1", lastFetchedAt: Timestamp.now() });
+}
 
 // ============================================
 // Lookup by visaTypeId (questions)
@@ -746,10 +811,19 @@ describe("endpoint JSON shape is unchanged", () => {
     });
     assert.equal(res.status, 200);
     assert.equal(res.body.success, true);
-    // `warnings` is undefined here, so JSON drops it (as before).
+    // `warnings` is undefined here, so JSON drops it (as before). (#236) With
+    // no entry rule for the pair the answer is `unknown` (visaRequired null),
+    // with the entry answer attached; the visa list is unchanged.
     assert.deepEqual(JSON.parse(JSON.stringify(res.body.data)), {
-      visaRequired: true,
-      requirementType: "visa_required",
+      visaRequired: null,
+      requirementType: "unknown",
+      status: "unknown",
+      entryRequirement: {
+        status: "unknown",
+        destination: CC_A,
+        code: "no_rule",
+        reason: "We don't have an official source for this yet.",
+      },
       recommendedVisaTypes: [
         {
           id: "a-work-seed",
@@ -759,12 +833,7 @@ describe("endpoint JSON shape is unchanged", () => {
           baseCostUsd: 155,
         },
       ],
-      nextSteps: [
-        "Review the recommended visa types below.",
-        "Check your eligibility before applying.",
-        "Gather required documents.",
-        "Submit your application online or through an agent.",
-      ],
+      nextSteps: ["We don't have an official source for this yet."],
     });
   });
 
