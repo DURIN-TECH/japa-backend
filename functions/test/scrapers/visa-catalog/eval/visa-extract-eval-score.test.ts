@@ -669,14 +669,17 @@ describe("scorer (eval/score.ts)", () => {
   });
 
   test("gate: overall below threshold, or one route below the route threshold, fails", () => {
-    const good = scoreRoute(SW, perfectSW());
+    // Skilled Worker WITHOUT its typed items, so the weights are the plain nine fields (total 12).
+    const plainSW: ExpectedVisa = { ...SW, documentKinds: undefined };
+    const plain = (): ExtractedVisa => ({ ...perfectSW(), requiredDocuments: [], requiredDocumentMeta: [] });
+    const good = scoreRoute(plainSW, plain());
     assert.equal(evaluateGate([good]).pass, true);
     // Route at 8/12 = 0.667 (< 0.7) with correct fees.
-    const a = perfectSW();
+    const a = plain();
     a.category = "other";
     a.isExtendable = false;
     a.eligibilityCriteria = ["nothing relevant"];
-    const weak = scoreRoute(SW, a);
+    const weak = scoreRoute(plainSW, a);
     assert.ok(weak.score < ROUTE_PASS_THRESHOLD && !weak.feeMismatch);
     const g = evaluateGate([good, good, good, good, good, weak]);
     assert.ok(g.overall >= OVERALL_PASS_THRESHOLD);
