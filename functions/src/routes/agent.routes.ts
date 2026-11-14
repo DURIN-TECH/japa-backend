@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { agentController } from "../controllers/agent.controller";
 import { verificationController } from "../controllers/verification.controller";
-import { verifyAuth, verifyAdmin } from "../middleware/auth";
+import { verifyAuth, verifyAdmin, optionalAuth } from "../middleware/auth";
 
 const router = Router();
 
@@ -33,10 +33,13 @@ router.delete("/me/verification/documents", verifyAuth, (req, res) =>
   verificationController.removeDocument(req, res)
 );
 
-// Public agent endpoints
-router.get("/", (req, res) => agentController.getAgents(req, res));
-router.get("/top", (req, res) => agentController.getTopAgents(req, res));
-router.get("/visa/:visaTypeId", (req, res) =>
+// Public agent endpoints. Issue #286: `optionalAuth` lets a signed-in
+// client be quoted in their own currency (`consultationFeeLocal`, from their
+// profile country); no token or an invalid one is served as a guest (default
+// currency), never a 401.
+router.get("/", optionalAuth, (req, res) => agentController.getAgents(req, res));
+router.get("/top", optionalAuth, (req, res) => agentController.getTopAgents(req, res));
+router.get("/visa/:visaTypeId", optionalAuth, (req, res) =>
   agentController.getAgentsForVisaType(req, res)
 );
 
@@ -46,7 +49,8 @@ router.post("/", verifyAuth, (req, res) =>
 );
 
 // Parameterized routes
-router.get("/:id", (req, res) => agentController.getAgent(req, res));
+// Public too (#286: optionalAuth for the viewer's quote currency).
+router.get("/:id", optionalAuth, (req, res) => agentController.getAgent(req, res));
 router.get("/:id/reviews", (req, res) =>
   agentController.getAgentReviews(req, res)
 );

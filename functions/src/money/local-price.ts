@@ -1,9 +1,10 @@
 import type { CurrencyCode, ExchangeRate, LocalPriceQuote, Money } from "../types/money";
-import { DEFAULT_CURRENCIES_CONFIG, resolveChargeCurrency } from "./config";
+import { DEFAULT_CURRENCIES_CONFIG } from "./config";
 import { convertUsdToLocal } from "./money";
 import { isMoneyError } from "./errors";
 import type { RateService } from "./rate.service";
-import { collections } from "../utils/firebase";
+// Issue #286: the quote currency rule is the SAME function the charge path uses.
+import { payerCurrency, readProfileCountry } from "./payer-currency";
 
 // ============================================
 // LOCAL PRICE NEXT TO A DOLLAR PRICE, FOR READS (issue #179)
@@ -33,7 +34,11 @@ import { collections } from "../utils/firebase";
 //
 // Which currency: the viewer's, resolved on the SERVER from their stored
 // profile country when the request is signed in (`uid`), else the config's
-// default currency (NGN). Never from a query string or body.
+// default currency (NGN). Never from a query string or body. Issue #286: the
+// rule is `payerCurrency` (payer-currency.ts), shared with the charge path,
+// so a signed-in client is quoted in exactly the currency POST /consultations
+// would charge them in. The public read routes run `optionalAuth` so `uid`
+// is set for a valid token (an invalid one is a guest).
 
 /** Converts dollar prices for one response. */
 export interface LocalPricer {
@@ -80,10 +85,8 @@ export const localPricing: {
   profileCountry: (uid: string) => Promise<string | undefined>;
 } = {
   rates: async () => (await import("./index")).rateService,
-  profileCountry: async (uid) => {
-    const snap = await collections.users.doc(uid).get();
-    return snap.exists ? (snap.data() as { residentialCountry?: string }).residentialCountry : undefined;
-  },
+  // The one production profile reader (shared with the charge path, #286).
+  profileCountry: readProfileCountry,
 };
 
 /**
@@ -98,12 +101,12 @@ export async function loadLocalPricer(opts: { uid?: string } = {}): Promise<Loca
   try {
     const service = await localPricing.rates();
     const config = await service.getConfig();
-    currency = config.defaultCurrency;
-    if (opts.uid) {
-      // A profile read failure must not hide the price: fall back to the default.
-      const country = await localPricing.profileCountry(opts.uid).catch(() => undefined);
-      currency = resolveChargeCurrency(country, config);
-    }
+    // The shared quote/charge rule (#286). A profile read failure must not
+    // hide the price: the reader's error becomes "no country", which the rule
+    // turns into the default currency (a read never fails on it).
+    currency = await payerCurrency(opts.uid, config, (uid) =>
+      localPricing.profileCountry(uid).catch(() => undefined)
+    );
     const rate = await service.getRate(currency, config);
     return pricerFromRate(currency, rate);
   } catch (err) {

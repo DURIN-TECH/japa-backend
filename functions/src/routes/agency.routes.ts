@@ -2,7 +2,7 @@ import { Router } from "express";
 import { agencyController } from "../controllers/agency.controller";
 import { complianceController } from "../controllers/compliance.controller";
 import { consultationController } from "../controllers/consultation.controller";
-import { verifyAuth, verifyAdmin } from "../middleware/auth";
+import { verifyAuth, verifyAdmin, optionalAuth } from "../middleware/auth";
 import { requireFeature } from "../middleware/authz";
 import { FEATURES } from "@durin-tech/authz";
 import { sendError } from "../utils/response";
@@ -13,7 +13,9 @@ const agencyRoutes = Router();
 // PUBLIC — no auth: powers the shareable public agency landing page.
 // Two-segment "/public/:slug" path, defined before the single-segment "/:id"
 // matcher so it can't be shadowed. Returns only whitelisted, non-sensitive fields.
-agencyRoutes.get("/public/:slug", (req, res) =>
+// Issue #286: `optionalAuth` on every public price read here, so a signed-in
+// client sees prices in their own currency; no / invalid token = guest.
+agencyRoutes.get("/public/:slug", optionalAuth, (req, res) =>
   agencyController.getPublicAgency(req, res)
 );
 
@@ -28,13 +30,13 @@ agencyRoutes.post("/public/:slug/consultations", (req, res) =>
 // Registered BEFORE every "/:id..." param route so the literal "browse"
 // segment is never captured as an ":id" (e.g. GET /agencies/browse is not
 // "agency browse"). Read-only; each returns the PUBLIC-safe projection only.
-agencyRoutes.get("/browse", (req, res) =>
+agencyRoutes.get("/browse", optionalAuth, (req, res) =>
   agencyController.browseAgencies(req, res)
 );
-agencyRoutes.get("/browse/:id", (req, res) =>
+agencyRoutes.get("/browse/:id", optionalAuth, (req, res) =>
   agencyController.getPublicAgencyById(req, res)
 );
-agencyRoutes.get("/browse/:id/agents", (req, res) =>
+agencyRoutes.get("/browse/:id/agents", optionalAuth, (req, res) =>
   agencyController.getPublicAgencyAgents(req, res)
 );
 
