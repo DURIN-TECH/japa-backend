@@ -203,7 +203,11 @@ export function effectiveIntakeQuestions(rubric: ApplicabilityRubric): IntakeQue
     }
     // A rule that always applies (or a conditional one we cannot gate) keeps the question visible.
     const gated = relevant.filter((c) => isScoped(c) && isValidTrigger(c.trigger, questions));
-    const hopeless = relevant.filter((c) => c.applicability === "specialist" && !isValidTrigger(c.trigger, questions));
+    // (#248) A bar served without its unconfirmed trigger (`notCodeDecided`) is NOT hopeless: it is put to
+    // every applicant (see `resolveApplicability`), so a question it reads must stay asked. Counting it as
+    // hopeless would drop a question that only such a bar reads, and with it an answer the assessment
+    // model needs to weigh the bar's condition.
+    const hopeless = relevant.filter((c) => c.applicability === "specialist" && !isValidTrigger(c.trigger, questions) && !(c.kind === "mandatory_bar" && c.notCodeDecided === true));
     if (gated.length + hopeless.length < relevant.length) {
       out.push(q);
       continue;
