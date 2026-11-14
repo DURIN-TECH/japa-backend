@@ -155,6 +155,7 @@ export const RULE_TITLES: Record<ScrapeAlertRule, string> = {
   infrastructure_error: "guidance crawl infrastructure error",
   rubric_auto_published: "rulebook published automatically",
   rubric_draft_held: "rulebook draft held",
+  route_onboarding_attention: "route onboarding needs attention",
 };
 
 /** Cloud Logging severity per alert severity (resolutions log as INFO). */

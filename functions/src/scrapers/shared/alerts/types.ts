@@ -84,7 +84,11 @@ export const SCRAPE_ALERT_STATUSES: readonly ScrapeAlertStatus[] = ["open", "ack
  *  - rubric_draft_held (issue #201): a draft failed an automatic gate (or the
  *    pipeline errored) and was NOT published; the serving version keeps
  *    serving. One alert per route + version; auto-resolves when a later version
- *    publishes or the held version is rejected or approved.
+ *    publishes or the held version is rejected or approved;
+ *  - route_onboarding_attention (issue #217): a route onboarding run ended
+ *    `failed` or `held` and an admin has to look. One alert per run (deduped
+ *    by the run id), linking the run; auto-resolves when a held run later
+ *    becomes published.
  */
 export type ScrapeAlertRule =
   | "run_failed"
@@ -102,7 +106,8 @@ export type ScrapeAlertRule =
   | "settings_unreadable"
   | "infrastructure_error"
   | "rubric_auto_published"
-  | "rubric_draft_held";
+  | "rubric_draft_held"
+  | "route_onboarding_attention";
 
 /** Every rule id (config validation, docs). */
 export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
@@ -122,6 +127,7 @@ export const SCRAPE_ALERT_RULES: readonly ScrapeAlertRule[] = [
   "infrastructure_error",
   "rubric_auto_published",
   "rubric_draft_held",
+  "route_onboarding_attention",
 ];
 
 /**

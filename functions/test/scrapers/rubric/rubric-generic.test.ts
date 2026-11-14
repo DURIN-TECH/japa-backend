@@ -172,7 +172,10 @@ describe("rubric module: stays inside the issue's boundaries", () => {
     assert.deepEqual([...app.matchAll(/app\.use\("([^"]*)"[^)]*rubric[^)]*\)/gi)].map((m) => m[1]), ["/admin/rubrics", "/admin/rubric-extraction-jobs"], "app.ts mounts only the admin rubric review and drafting-job routes");
     // #201 (EXPLICIT extension): services/rubric-auto-publish.service.ts is the automatic publisher
     // (gates, settings, system actor); it value-imports the rubric types and the review service.
-    const REVIEW_API_FILES = [path.join("services", "rubric-auto-publish.service.ts"), path.join("services", "rubric-review.service.ts"), path.join("services", "rubric-diff.ts"), path.join("controllers", "rubric-review.controller.ts"), path.join("routes", "rubric-review.routes.ts"), path.join("controllers", "rubric-extraction-job.controller.ts"), path.join("routes", "rubric-extraction-job.routes.ts")];
+    // #217 (EXPLICIT extension): the route onboarding run (scrapers/onboarding/) value-imports the
+    // drafting job, the settings and the publish settings of this module; it makes no model call itself.
+    const ONBOARDING_FILES = [path.join("scrapers", "onboarding", "route-onboarding.service.ts"), path.join("scrapers", "onboarding", "onboarding-words.ts"), path.join("scrapers", "onboarding", "onboarding-settings.ts")];
+    const REVIEW_API_FILES = [...ONBOARDING_FILES, path.join("services", "rubric-auto-publish.service.ts"), path.join("services", "rubric-review.service.ts"), path.join("services", "rubric-diff.ts"), path.join("controllers", "rubric-review.controller.ts"), path.join("routes", "rubric-review.routes.ts"), path.join("controllers", "rubric-extraction-job.controller.ts"), path.join("routes", "rubric-extraction-job.routes.ts")];
     // No other file outside the module and the scrapers barrel imports it.
     const outside = tsFiles(SRC).filter((f) => !MODULE_FILES.includes(f) && ![path.join("scrapers", "index.ts"), ...REVIEW_API_FILES].includes(path.relative(SRC, f)));
     // TODO(test-pass): the AI services (checklist builder, document check, refusal

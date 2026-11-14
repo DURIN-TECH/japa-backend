@@ -99,7 +99,7 @@ import { aiCaseOfficerService } from "./services/ai-case-officer.service";
 import { assessmentAutoRunService } from "./services/assessment-auto-run.service";
 import { bulkReassessmentService } from "./services/ai-bulk-reassessment.service";
 import { ruleChangeAlertsService } from "./services/rule-change-alerts.service";
-import { rubricExtractionJobService, rubricExtractionService } from "./scrapers";
+import { rubricExtractionJobService, rubricExtractionService, routeOnboardingService } from "./scrapers";
 import type { RubricReviewAuditEntry } from "./services/rubric-review.service";
 import { rubricAutoPublishService } from "./services/rubric-auto-publish.service";
 import { outcomeImportService, outcomeRunWorker, registeredDestinations } from "./scrapers";
@@ -935,6 +935,80 @@ export const sweepRubricExtractionJobs = functions
   .onRun(async () => {
     const result = await rubricExtractionJobService.sweep();
     if (result.considered > 0) console.log(`[rubric-job] sweep: ${JSON.stringify(result)}`);
+  });
+
+/**
+ * Issue #217: the WORKER of a route onboarding run. Fires when a run document
+ * is created or its `kick` counter changes (each action bumps `kick` to hand
+ * over to the next one; the sweep and the two wake-up triggers below bump it to
+ * wake a run). Takes a lease, runs ONE action (a crawl, the dry plan, the start
+ * of the drafting job, or a read of the safeguards' outcome) and hands over, so
+ * a run survives the 540 s limit and crashes. A duplicate or late delivery finds
+ * a live lease or nothing to do. Binds the visa crawl's DeepSeek key (the visa
+ * page read; no Claude call happens here) and the email secrets (alerts). Never
+ * throws: a failure is recorded on the run.
+ */
+export const processRouteOnboardingRun = functions
+  .runWith({ secrets: [...VISA_CATALOG_SECRETS, ...EMAIL_SECRETS], timeoutSeconds: 540, memory: "1GB" })
+  .firestore.document("routeOnboardingRuns/{runId}")
+  .onWrite(async (change, context) => {
+    const after = change.after.exists ? (change.after.data() as { status?: string; kick?: number }) : null;
+    if (!after || !["preparing", "running", "waiting_for_publish"].includes(after.status ?? "")) return;
+    const before = change.before.exists ? (change.before.data() as { kick?: number }) : null;
+    // Only a new run or a changed `kick` is a request for work.
+    if (before && before.kick === after.kick) return;
+    try {
+      const outcome = await routeOnboardingService.advance(context.params.runId);
+      console.log(`[route-onboarding] ${context.params.runId}: ${outcome.kind}`);
+    } catch (error) {
+      console.error("Route onboarding worker failed:", error);
+    }
+  });
+
+/**
+ * Issue #217: every 5 minutes, wake the onboarding runs that stalled (no live
+ * lease, nothing recent, any wait time passed), raise the alerts of runs that
+ * ended failed or held, and let a held run whose automatic retry is pending
+ * become published. Calls no model; binds the email secrets for the alerts.
+ */
+export const sweepRouteOnboardingRuns = functions
+  .runWith({ secrets: EMAIL_SECRETS, timeoutSeconds: 120, memory: "256MB" })
+  .pubsub.schedule("*/5 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const result = await routeOnboardingService.sweep();
+    if (result.considered > 0 || result.alertsRaised > 0 || result.heldChecked > 0) console.log(`[route-onboarding] sweep: ${JSON.stringify(result)}`);
+  });
+
+/**
+ * Issue #217: a drafting job reached a FINAL status: wake its route's onboarding
+ * run so it moves on at once instead of at the next poll. Fires on every write
+ * of the job but acts only when the status changed to a final one (a handful of
+ * times per job). Calls nothing but the wake-up.
+ */
+export const onRubricJobFinishedWakeOnboarding = functions
+  .runWith({ memory: "256MB", timeoutSeconds: 60 })
+  .firestore.document("rubricExtractionJobs/{jobId}")
+  .onWrite(async (change) => {
+    if (!change.after.exists) return;
+    const after = change.after.data() as { status?: string; routeKey?: string };
+    const before = change.before.exists ? (change.before.data() as { status?: string }) : null;
+    if (!after.routeKey || after.status === "queued" || after.status === "running" || before?.status === after.status) return;
+    await routeOnboardingService.wakeRoute(after.routeKey);
+  });
+
+/**
+ * Issue #217: the publishing pipeline wrote or changed a version's run record
+ * (published, held, skipped): wake the route's onboarding run (or re-read a held
+ * one whose retry the hourly sweep may just have cleared).
+ */
+export const onRubricPublishRunWakeOnboarding = functions
+  .runWith({ memory: "256MB", timeoutSeconds: 60 })
+  .firestore.document("rubricPublishRuns/{runId}")
+  .onWrite(async (change) => {
+    if (!change.after.exists) return;
+    const routeKey = (change.after.data() as { routeKey?: string }).routeKey;
+    if (routeKey) await routeOnboardingService.wakeRoute(routeKey);
   });
 
 /**

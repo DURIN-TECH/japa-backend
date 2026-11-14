@@ -121,6 +121,7 @@ export const DEFAULT_SEVERITY: Record<ScrapeAlertRule, ScrapeAlertSeverity> = {
   // Issue #201: a rulebook went live with no person approving it. Worth an
   // immediate look (the default email threshold is "warning"), not an outage.
   rubric_auto_published: "warning",
+  route_onboarding_attention: "warning",
   // Issue #201: a draft was held. Warning by default; the rule raises it to
   // critical itself for a protected-rule hold or unreadable publish settings.
   rubric_draft_held: "warning",
@@ -1277,4 +1278,55 @@ export function evaluateRubricHeldCleared(routeKey: string, version: number | nu
     signals: [],
     scope: version === null ? { keyPrefix: rubricHeldRoutePrefix(routeKey) } : { keys: [rubricHeldKey(routeKey, version)] },
   };
+}
+
+// ============================================
+// ROUTE ONBOARDING (issue #217)
+// ============================================
+//
+// route_onboarding_attention   key `route_onboarding_attention:<runId>`
+//   Raised once when an onboarding run ends `failed` or `held` (the worker
+//   hands the facts here; a re-raise of the same run only bumps the count, so
+//   the alert is deduplicated). The message is plain words and links the run.
+//   Resolved when a held run later becomes published. A run that PUBLISHES
+//   raises nothing here: the publishing pipeline already alerts (#200).
+
+/** What the alert is built from. */
+export interface RouteOnboardingAlertFacts {
+  runId: string;
+  routeKey: string;
+  status: "failed" | "held";
+  // The run's plain-words summary (why it ended).
+  summary: string;
+  // Link to the run in the admin portal (APP_URL based).
+  link: string;
+}
+
+/** Dedupe key of a run's alert. */
+export const routeOnboardingKey = (runId: string) => `route_onboarding_attention:${runId}`;
+
+/** Raise the alert for a run that ended failed or held. */
+export function evaluateRouteOnboardingAttention(facts: RouteOnboardingAlertFacts, config: ScrapeAlertsConfig): RuleEvaluation {
+  const key = routeOnboardingKey(facts.runId);
+  return {
+    rule: "route_onboarding_attention",
+    scope: { keys: [key] },
+    signals: [
+      {
+        rule: "route_onboarding_attention",
+        key,
+        severity: ruleSeverity(config, "route_onboarding_attention"),
+        kind: null,
+        subject: { type: "rubric_route", id: facts.routeKey, label: `${facts.routeKey} onboarding` },
+        message: clipText(`Onboarding of ${facts.routeKey} ended ${facts.status}. ${facts.summary}\nOpen the run: ${facts.link}`, 2000),
+        details: { runId: facts.runId, routeKey: facts.routeKey, status: facts.status, link: facts.link },
+        eventId: `${facts.runId}:${facts.status}`,
+      },
+    ],
+  };
+}
+
+/** Resolve a run's alert (a held run became published): no signal, scoped to its key. */
+export function evaluateRouteOnboardingCleared(runId: string): RuleEvaluation {
+  return { rule: "route_onboarding_attention", signals: [], scope: { keys: [routeOnboardingKey(runId)] } };
 }

@@ -55,6 +55,12 @@ const COLLECTIONS = [
   // text. A client that could write it could start, restart or cancel a paid
   // job, or read drafts before review.
   "rubricExtractionJobs",
+  // Route onboarding runs (issue #217): the run document is the worker's
+  // trigger and holds the confirmed estimate, the confirming admin and a cancel
+  // flag; the route head holds the active-run guard. A client that could write
+  // either could start, confirm (spend) or cancel a run, or open a second one.
+  "routeOnboardingRuns",
+  "routeOnboardingRoutes",
   // appConfig/{docId} is backend config. It now holds the automatic-publishing
   // kill switch (appConfig/rubricPublishSettings, issue #201), so a client that
   // could write it could turn automatic publishing on.
