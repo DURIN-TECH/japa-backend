@@ -770,3 +770,67 @@ describe("crash safety and re-delivery", () => {
     await oh.svc.wakeRoute("XA_no-such-route");
   });
 });
+
+// ============================================
+// (#233 P4b) A run on a SHARED layer (a bloc's or treaty's rulebook)
+// ============================================
+
+describe("a run for a shared layer's key (#233 P4b)", () => {
+  const BLOC = "zq-bloc";
+  const ROUTE = "zq-bloc-short-stay";
+  const KEY = `${BLOC}_${ROUTE}`;
+
+  /** Register the bloc's route as the registry does (visa page under the authority, rule page with jurisdiction = authority). */
+  function registerBloc(status = "active"): void {
+    store.set(`visaSources/${BLOC}`, { id: BLOC, authorityId: BLOC, status: "active", pages: [{ url: "https://bloc.invalid/short-stay", routeName: "Short stay", validation: "unverified", visaId: ROUTE, addedVia: "portal" }] });
+    store.set(`guidanceSources/${BLOC}-rules`, { title: "Shared rules", url: "https://bloc.invalid/rules", jurisdiction: BLOC, route: "short-stay", role: "primary", status: "active", verificationStatus: "registered", latestSnapshotId: "snap-bloc-1" });
+    store.set(`sharedRoutes/${ROUTE}`, { id: ROUTE, issuingAuthorityId: BLOC, status });
+  }
+
+  test("starts under {authorityId}_{routeSlug}, files NO country visa record, and drafts the shared rulebook", async () => {
+    registerBloc();
+    const jobInputs: any[] = [];
+    // The drafting job, stubbed: only its INPUT is pinned here (a refused plan ends the run, nothing is spent).
+    (oh.deps as any).jobs = () => ({ startJob: async (input: any) => (jobInputs.push(input), { routeKey: KEY, outcome: "refused", reasonCode: "no_text", plan: [], estimate: null }), getStatus: async () => null, cancel: async () => undefined });
+    const svc = new (oh.svc.constructor as any)(oh.deps);
+    const run = await svc.start(BLOC, ROUTE, ADMIN);
+    assert.equal(run.runId, `${KEY}__r1`);
+    assert.deepEqual([run.layer, run.authorityId, run.routeSlug, run.countryCode], ["shared", BLOC, ROUTE, undefined]);
+    for (let i = 0; i < 20; i++) {
+      const out = await svc.advance(run.runId);
+      if (out.kind === "finished" || out.kind === "idle") break;
+    }
+    const done = runOf(run.runId);
+    assert.equal(stepStatus(done, "read_visa_page"), "skipped");
+    assert.equal(oh.visaCrawls.length, 0, "no visa page crawl, no country visa record");
+    assert.equal(docsUnder("countries/").filter((k) => k.includes(ROUTE)).length, 0);
+    assert.deepEqual(oh.pageCrawls, [`${BLOC}-rules`]);
+    // The plan is made for the SHARED rulebook key, never a country pair.
+    assert.deepEqual(jobInputs[0], { authorityId: BLOC, routeSlug: ROUTE, sourceIds: [`${BLOC}-rules`], dryRun: true, trigger: "manual", requestedBy: ADMIN });
+    assert.equal(done.status, "too_thin");
+    // The end checklist of a shared layer: link the member records.
+    assert.deepEqual((await svc.checklistOf(done)).map((c: any) => [c.id, c.done]), [["link_member_records", false]]);
+  });
+
+  test("refused when the shared route is missing, another authority's or retired; re-checked at the setup step", async () => {
+    registerBloc();
+    store.delete(`sharedRoutes/${ROUTE}`);
+    assert.equal((await refused(oh.svc.start(BLOC, ROUTE, ADMIN))).code, "SHARED_ROUTE_NOT_FOUND");
+    registerBloc("retired");
+    assert.equal((await refused(oh.svc.start(BLOC, ROUTE, ADMIN))).code, "SHARED_ROUTE_NOT_ACTIVE");
+    // Retired after the run started: the setup check stops it before anything is read.
+    registerBloc();
+    const run = await oh.svc.start(BLOC, ROUTE, ADMIN);
+    registerBloc("retired");
+    await pump(oh, run.runId);
+    assert.equal(runOf(run.runId).status, "failed");
+    assert.equal(oh.pageCrawls.length, 0);
+  });
+
+  test("a member country's own layer is an ordinary country run, as before", async () => {
+    const run = await oh.svc.start(COUNTRY, VISA_ID, ADMIN);
+    assert.equal(run.layer, undefined);
+    assert.equal(run.countryCode, COUNTRY);
+    assert.equal(run.routeKey, ROUTE_KEY);
+  });
+});

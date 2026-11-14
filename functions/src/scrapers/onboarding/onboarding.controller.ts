@@ -43,8 +43,13 @@ export function runView(run: RouteOnboardingRun) {
   return {
     runId: run.runId,
     routeKey: run.routeKey,
-    countryCode: run.countryCode,
+    // (#233 P4b) `countryCode` is null on a shared layer's run; `authorityId`,
+    // `routeSlug` and `layer` say which rulebook the run drafts.
+    countryCode: run.countryCode ?? null,
     visaTypeId: run.visaTypeId,
+    authorityId: run.authorityId ?? run.countryCode ?? null,
+    routeSlug: run.routeSlug ?? run.visaTypeId,
+    layer: run.layer ?? "own",
     status: run.status,
     summary: run.summary,
     steps: run.steps.map((s) => ({ id: s.id, label: s.label, status: s.status, startedAt: iso(s.startedAt), finishedAt: iso(s.finishedAt), detail: s.detail })),
@@ -71,7 +76,10 @@ function confirmationView(c: NonNullable<RouteOnboardingRun["confirmation"]>) {
 /** The list row: enough for a table. */
 function runRow(run: RouteOnboardingRun) {
   return {
-    runId: run.runId, routeKey: run.routeKey, countryCode: run.countryCode, visaTypeId: run.visaTypeId, status: run.status, summary: run.summary,
+    runId: run.runId, routeKey: run.routeKey, countryCode: run.countryCode ?? null, visaTypeId: run.visaTypeId,
+    // (#233 P4b) Which rulebook: a country's own route or a shared layer (both are listed).
+    authorityId: run.authorityId ?? run.countryCode ?? null, routeSlug: run.routeSlug ?? run.visaTypeId, layer: run.layer ?? "own",
+    status: run.status, summary: run.summary,
     createdBy: run.createdBy, createdAt: iso(run.createdAt), finishedAt: iso(run.finishedAt), counters: run.counters, holdReason: run.holdReason,
   };
 }
