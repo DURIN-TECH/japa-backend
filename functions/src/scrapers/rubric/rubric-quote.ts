@@ -441,6 +441,45 @@ export class SnapshotQuoteIndex {
   }
 
   /**
+   * (#223) The source passage around a located quote, for the one-rule
+   * RE-DRAFT of a protected rule that failed the independent check: the
+   * quote's own line plus up to `linesBefore` lines above it (the lead-in and
+   * the paragraph it belongs to) and `linesAfter` lines below it (the list
+   * lines that follow a lead-in), in document order, each line as the source
+   * has it. BOUNDED three ways: line counts, `maxChars` per line, and
+   * `maxChars` overall (cut at the end, never at the quote). For a PDF the
+   * "line" is a whole page, so the window is the characters around the quote
+   * inside its page (`maxChars` on either side) with the page number returned.
+   * Verbatim source text only: nothing is added, so a quote taken from this
+   * window is found again by `locate` like any other.
+   */
+  passageWindow(found: Extract<QuoteLookup, { ok: true }>, linesBefore: number, linesAfter: number, maxChars: number): { text: string; page?: number } {
+    if (this.paginated) {
+      const around = this.contextAround(found, maxChars);
+      return { text: `${around.before}${found.matched}${around.after}`, ...(found.page !== undefined ? { page: found.page } : {}) };
+    }
+    const from = Math.max(0, found.unit - Math.max(0, linesBefore));
+    const to = Math.min(this.units.length - 1, found.unit + Math.max(0, linesAfter));
+    const lines: string[] = [];
+    let used = 0;
+    for (let i = from; i <= to; i++) {
+      const line = this.units[i].text;
+      if (!line) continue;
+      let clipped = line.length > maxChars ? line.slice(0, maxChars) : line;
+      if (i === found.unit && line.length > maxChars) {
+        // The quote's own line is too long: keep the characters AROUND the quote so the quote itself is never cut.
+        const around = this.contextAround(found, Math.floor(maxChars / 2));
+        clipped = `${around.before}${found.matched}${around.after}`;
+      }
+      // The quote's own line is always included; the other lines stop once the overall bound is reached.
+      if (i !== found.unit && used + clipped.length > maxChars) break;
+      lines.push(clipped);
+      used += clipped.length;
+    }
+    return { text: lines.join("\n\n") };
+  }
+
+  /**
    * The lead-in of a LIST ITEM (issue #202): when the located quote is one
    * bracketed item of a list ("(a) ...", "(ii) ..."), the nearest earlier line
    * that is not itself a list item, i.e. the sentence that introduces the

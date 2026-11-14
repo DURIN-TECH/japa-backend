@@ -585,6 +585,14 @@ export interface VisaRubric {
   // extracted, never client-visible: `applyExclusions` applies it on the read
   // side and strips it from the served rubric. Absent = serve as extracted.
   questionPlan?: QuestionPlan;
+  // Written with the AUTOMATIC approval (#223): protected rules (mandatory bars)
+  // that failed the independent check and were RE-DRAFTED once from their own
+  // source passage, with the replacement that passed the check. The extracted
+  // `criteria` list is never edited: `applyExclusions` (the one read-side
+  // filter) swaps each replacement in on the read side, so what is served is
+  // exactly what the check verified, and the original stays in `criteria` as
+  // the audit trail. Never extracted, never client-visible. Absent = none.
+  ruleRepairs?: RubricRuleRepair[];
 
   // ---- provenance (immutable) ----
   sourceSnapshots: RubricSourceSnapshot[];
@@ -681,6 +689,8 @@ export const RUBRIC_REVIEW_FIELDS = [
   "exclusionNote",
   // (#203) the automatic approval's question plan (see QuestionPlan).
   "questionPlan",
+  // (#223) the automatic approval's recorded replacements of repaired protected rules.
+  "ruleRepairs",
 ] as const;
 
 // ============================================
@@ -740,6 +750,61 @@ export interface RubricPublishLeftOut {
 }
 
 /**
+ * (#223) One repaired protected rule as recorded on a version (`ruleRepairs`).
+ * `replacement` keeps the original's `criterionId` (every link to the rule, the
+ * question plan and the exclusion list, stays valid) and its link fields
+ * (`trigger`, `intakeQuestionIds`); its own text, quote and group come from the
+ * re-draft, which code validated like any drafted rule.
+ */
+export interface RubricRuleRepair {
+  criterionId: string;
+  replacement: AssessmentCriterion;
+  // sha256 of the original rule as drafted (the idempotency key with `criterionId`).
+  originalRuleHash: string;
+  // The publish run that decided it (`{routeKey}__v{version}`).
+  runId: string;
+}
+
+/** How the one automatic repair of a failed protected rule ended. */
+export type RubricRepairStatus =
+  // Re-drafted, validated, and confirmed by both check models: it replaces the original.
+  | "repaired"
+  // Re-drafted and validated, but the check still did not confirm it.
+  | "failed_check"
+  // The model said the passage cannot be drafted into the rule (an empty answer, or none that fits).
+  | "cannot_be_repaired"
+  // The re-draft failed code validation (quote not found, group not in quote, wrong shape, ...).
+  | "invalid_redraft"
+  // No attempt was made (`detail` says why: a cap, or the failure is one a re-draft cannot change).
+  | "not_attempted"
+  // The attempt could not finish (provider unavailable, or a request cap was reached).
+  | "attempt_unfinished";
+
+/** What the held record and the alert say about one protected rule that failed the check. */
+export interface RubricProtectedFailure {
+  criterionId: string;
+  ruleRef: string | null;
+  // The rule's title (data, so alerts can name it).
+  title: string;
+  // Aspects (checker aspect names) that either model did not answer `yes` to, in the checker's fixed order.
+  failedAspects: string[];
+  // The six verdict letters of each model on the ORIGINAL rule (an audit trail, never rule content).
+  verdicts: { verification?: string; judgement?: string };
+  repair: {
+    status: RubricRepairStatus;
+    // A short code (never model text): `cap_exceeded`, `trigger_not_repairable`, `quote_not_found`, ...
+    detail?: string;
+    // sha256 of the original rule (with `criterionId`, the key that makes the attempt happen once).
+    ruleHash: string;
+    // Model requests this repair used (the re-draft and its check).
+    requests: number;
+    // Aspects the re-checked replacement still failed, and its verdict letters per model.
+    replacementFailedAspects?: string[];
+    replacementVerdicts?: { verification?: string; judgement?: string };
+  };
+}
+
+/**
  * `rubricPublishRuns/{routeKey}__v{version}`: the record of the automatic
  * publish run of ONE version (backend-only: no firestore.rules match). The id
  * is deterministic, so a re-delivered trigger finds the record and does not run
@@ -775,6 +840,14 @@ export interface RubricPublishRun {
   questionPlan: "not_configured" | "not_run" | "built" | "failed";
   // INTEGRATION: rules whose trigger the independent check could not confirm (the rule is kept, its trigger ignored).
   droppedTriggerIds?: string[];
+  // (#223) Protected rules (mandatory bars) the independent check did not confirm, each with the
+  // per-aspect verdicts of both models and the ONE automatic repair attempt and its result. The
+  // original rule stays in the draft; a repaired rule that passed is listed here too (status
+  // `repaired`) and is the one recorded on the version as `ruleRepairs`.
+  protectedFailures?: RubricProtectedFailure[];
+  // (#223) Model requests the independent check made in this run, repair requests shown apart
+  // (both count against `checkerMaxRequestsPerRun`).
+  checkerRequests?: { total: number; repair: number };
   // Set when published: the audit entry and the version it replaced.
   auditId: string | null;
   previousApprovedVersion: number | null;

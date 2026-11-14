@@ -416,6 +416,73 @@ export function buildRubricRequest(chunk: SourceChunk, severityLevels: readonly 
   };
 }
 
+// ============================================
+// One-rule RE-DRAFT of a protected rule that failed the check (issue #223)
+// ============================================
+
+/** Version of the re-draft instructions below (recorded on the repair attempt; bump when they change). */
+export const RUBRIC_REPAIR_PROMPT_VERSION = "2026-11-repair-v1";
+
+/** What each checker aspect asks, in the words a re-draft needs (kept apart from the checker's own prompt: no shared text). */
+const ASPECT_MEANING: Record<string, string> = {
+  title_faithful: "the title must state only what the quote says: no condition, number, date or group the quote lacks, neither wider nor narrower",
+  kind_right: "the kind (objective, judgement or mandatory_bar) must be the one the quote supports",
+  stage_right: "the decision stage (validity, suitability, eligibility or credibility) must be the one the quote belongs to",
+  condition_faithful: "the applicability and its condition must be the circumstance the quote's own words state",
+  check_faithful: "the machine check (field, operator, value, unit) must say exactly what the quote sets",
+  group_matches_codes: "every member of the named group must be covered, by a country code for a nationality or by an `uncoded` entry for anything that is not a nationality, and no code may stretch to a wider group",
+};
+
+/** The stored rule fields a re-draft is shown (data we hold: never source text we did not verify). */
+export interface RepairRuleView {
+  title: string;
+  kind: string;
+  stage: string;
+  quote: string;
+  listItems?: readonly string[];
+  appliesTo?: { nationalities: readonly string[]; asWritten: readonly string[]; uncoded?: readonly string[] };
+}
+
+/**
+ * The request for the ONE re-draft of a failed protected rule. It reuses the
+ * drafting call's system prompt and output schema unchanged (so the answer is
+ * validated by the same code as any drafted rule, see `assessChunkOutput`),
+ * and adds, after the excerpt, the failed rule and the aspects that failed.
+ * The model may answer with an empty `criteria` list: that is "cannot be
+ * repaired". The excerpt is the quote's own passage (bounded), never the whole
+ * document.
+ */
+export function buildRepairRequest(
+  chunk: SourceChunk,
+  failed: { rule: RepairRuleView; aspects: readonly string[] },
+  severityLevels: readonly string[],
+  limits: RubricRequestLimits,
+  route: RubricRouteContext = NO_ROUTE
+): LlmRequest {
+  const base = renderRubricUserMessage(chunk, route);
+  // Drop the generic closing line of call 1; the repair instruction replaces it.
+  const closing = "List the assessment criteria this excerpt states for the route, following the rules you were given.";
+  const body = base.endsWith(closing) ? base.slice(0, base.length - closing.length).trimEnd() : base;
+  const aspects = failed.aspects.map((a) => `- ${a}: ${ASPECT_MEANING[a] ?? "this aspect"}`);
+  return {
+    role: "judgement",
+    system: RUBRIC_SYSTEM_PROMPT,
+    user: [
+      body,
+      "",
+      "REPAIR. An earlier draft of ONE rule from this excerpt was rejected by an independent reader. Its fields (JSON, written by an earlier model, not source text):",
+      JSON.stringify(failed.rule),
+      "The reader did not confirm these aspects:",
+      ...aspects,
+      "Draft that one rule again, from the passage of the excerpt that holds the quote above, following the rules you were given. Every quote and every group name must be copied character for character from the excerpt; never add, widen or guess. Return exactly one criterion. If the passage cannot be drafted into a rule that satisfies the aspects above without adding anything the excerpt does not say, return an empty `criteria` list.",
+    ].join("\n"),
+    schema: buildRubricOutputSchema(severityLevels),
+    maxOutputTokens: limits.maxOutputTokens,
+    timeoutMs: limits.timeoutMs,
+    effort: "high",
+  };
+}
+
 /** Build the provider request for call 2 (intake questions, evidence) of one chunk. */
 export function buildIntakeRequest(
   chunk: SourceChunk,
