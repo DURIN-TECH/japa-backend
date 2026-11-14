@@ -226,6 +226,49 @@ describe("seedCountriesAndVisas: the sourced fee of a shared route (#299)", () =
     assert.deepEqual(d.inheritsFrom, [{ sharedRouteId: "example-short-stay" }]);
   });
 
+  // ---- #306: an entry that states no processing time and no extension flag ----
+  // Like the real short-stay records #306 adds, but made up: xa-visitor here
+  // has no processingTime / processingDaysMin / processingDaysMax /
+  // isExtendable, and is the ONLY visa of country XA.
+  test("#306: an entry with no processing fields or isExtendable is stored without them, and still gets the route fee", async () => {
+    await writeFx();
+    await writeSource();
+    const { processingTime, processingDaysMin, processingDaysMax, isExtendable, ...bare } = visaBase;
+    void processingTime; void processingDaysMin; void processingDaysMax; void isExtendable;
+    const onlyBare = [
+      { ...bare, id: "xa-visitor", countryCode: "XA" },
+      { ...visaBase, id: "xb-visitor", countryCode: "XB", baseCostUsd: 55 },
+    ];
+    await run({ visaTypes: onlyBare });
+    const d = await visa("XA", "xa-visitor");
+    for (const key of ["processingTime", "processingDaysMin", "processingDaysMax", "isExtendable"]) {
+      assert.equal(key in d, false, `${key} is not stored`);
+    }
+    // The route's fee is written as for any inheriting record.
+    assert.equal(d.baseCostUsd, Math.round(FIXTURE_FEE.amount / SEK_PER_USD));
+    assert.equal(d.sourcedFee.quote, FIXTURE_FEE.quote);
+    assert.deepEqual(d.inheritsFrom, [{ sharedRouteId: "example-short-stay" }]);
+    // The country minimum is a number (0: no visa of XA states one), never NaN.
+    const xa = await country("XA");
+    assert.equal(typeof xa.minProcessingDays, "number");
+    assert.equal(Number.isNaN(xa.minProcessingDays), false);
+    assert.equal(xa.minProcessingDays, 0);
+    // A country whose visas state one keeps the old rule.
+    assert.equal((await country("XB")).minProcessingDays, 5);
+  });
+
+  test("#306: the minimum processing time counts only the visas that state one", async () => {
+    const { processingTime, processingDaysMin, processingDaysMax, ...noProcessing } = visaBase;
+    void processingTime; void processingDaysMin; void processingDaysMax;
+    await run({
+      visaTypes: [
+        { ...noProcessing, id: "xa-visitor", countryCode: "XA" },
+        { ...visaBase, id: "xa-work", countryCode: "XA", baseCostUsd: 400, processingDaysMin: 12 },
+      ],
+    });
+    assert.equal((await country("XA")).minProcessingDays, 12);
+  });
+
   test("an entry with its own baseCostUsd that inherits a route with a fee stops the seed before any write", async () => {
     await writeFx();
     await writeSource();
