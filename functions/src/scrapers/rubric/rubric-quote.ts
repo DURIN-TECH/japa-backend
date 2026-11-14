@@ -164,10 +164,10 @@ export function containsTokenBounded(text: string, literal: string): boolean {
  * number ("7.2"). Shape only: it names no publisher and no document.
  */
 const REF_SHAPE = String.raw`(?:[A-Z]{1,6}\.?\s?\d+[A-Z]?(?:\.\d+)*|\d+[A-Z]?(?:\.\d+)+)`;
-const LINE_LABEL_RE = new RegExp(String.raw`^(${REF_SHAPE})(?:\.(?=\s|$)|(?=\s|$))`, "u");
+export const LINE_LABEL_RE = new RegExp(String.raw`^(${REF_SHAPE})(?:\.(?=\s|$)|(?=\s|$))`, "u");
 
 /** A bracketed list marker that begins a line: "(a)", "(ii)", "(3)". */
-const LIMB_RE = /^\(([a-z]{1,3}|\d{1,2})\)/u;
+export const LIMB_RE = /^\(([a-z]{1,3}|\d{1,2})\)/u;
 
 /** How many lines back a parent label is looked for before giving up. */
 const MAX_PARENT_LOOKBACK_LINES = 250;
@@ -364,6 +364,26 @@ export class SnapshotQuoteIndex {
       if (this.units[i].text) return LIMB_RE.test(this.units[i].text);
     }
     return false;
+  }
+
+  // ---- read access for rubric-list-items.ts (#222) ----
+  // The list reader needs the page's own LINE layout, which the lookups above
+  // keep private. These three accessors expose it read-only (the units are
+  // never mutable from outside).
+
+  /** True for a PDF snapshot (a page is one unit: its line layout is lost). */
+  get isPaginated(): boolean {
+    return this.paginated;
+  }
+
+  /** Number of units (lines of a web page, pages of a PDF). */
+  get unitCount(): number {
+    return this.units.length;
+  }
+
+  /** The normalised text of one unit ("" past the end). */
+  unitText(unit: number): string {
+    return this.units[unit]?.text ?? "";
   }
 
   /** The whole document as normalised text (lines joined by a space). */
@@ -775,6 +795,27 @@ export function unitAdjacentToNumber(value: number, unit: string, support: strin
  */
 export function withoutLeadingParagraphNumber(quote: string): string {
   return quote.replace(/^\s*(?:(?:[A-Za-z]{1,3}\s)?(?:\d+(?:\.\d+)+|\d+[.)])|\([A-Za-z0-9]{1,3}\))\s+/, "");
+}
+
+/**
+ * (#222) True when an UNCODED group member (an entry of `appliesTo.uncoded`:
+ * a member of the group that is not a nationality, for example a status the
+ * source names in lower case) is written in `support` as a whole name.
+ *
+ * It is `groupNameSupported` without the capital-letter rule, which exists to
+ * keep a lower-case word ("national", "refused") from being read as the name
+ * of a nationality and does not fit a descriptive phrase the source writes in
+ * lower case. In its place a lower-case entry must be a PHRASE (two words or
+ * more), so one common word cannot stand as a group. Everything else is the
+ * same: verbatim, token-bounded, at least MIN_GROUP_NAME_CHARS long. A
+ * capitalised entry is held to the full `groupNameSupported` test.
+ */
+export function uncodedNameSupported(name: string, support: string): boolean {
+  const needle = normalizeForQuoteMatch(name);
+  if (needle.length < MIN_GROUP_NAME_CHARS) return false;
+  if (/^\p{Lu}/u.test(needle)) return groupNameSupported(name, support);
+  if (!/\p{L}/u.test(needle) || needle.split(" ").length < 2) return false;
+  return tokenBoundedPositions(normalizeForQuoteMatch(support), needle).length > 0;
 }
 
 /**

@@ -179,6 +179,8 @@ export interface ChatCriterionContext {
   ruleRef: string | null;
   sourceUrl: string;
   sourceQuote: string;
+  // (#222) The list lines under a quote that is a lead-in ("...any of the following:"), verbatim, so the model sees the whole rule. Absent for other rules.
+  sourceListItems?: string[];
 }
 
 /** The material a turn is answered from. */
@@ -342,6 +344,7 @@ export function buildChatContext(
         ruleRef: c.ruleRef ?? null,
         sourceUrl: c.source.url,
         sourceQuote: c.source.quote.slice(0, MAX_QUOTE_CHARS),
+        ...(c.source.listItems && c.source.listItems.length > 0 ? { sourceListItems: c.source.listItems } : {}),
       };
       const size = JSON.stringify(entry).length;
       if (used + size > MAX_CRITERIA_CHARS_IN_PROMPT) {

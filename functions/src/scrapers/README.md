@@ -165,6 +165,20 @@ runs across a chunk or page boundary may be missing (`multiple_chunks`,
 detects. Number words and month names are recognised in English only; anything
 else is not recognised and the criterion that relies on it is rejected.
 
+## Lead-in lists and non-nationality group members (`rubric-list-items.ts`; issue #222)
+
+Two defects found by the first real run (a "protected" bar rejected by the independent check):
+
+- **A quote that ends with a lead-in** ("... except where they are subject to any of the following:") is half a rule. The quote validator accepts one passage inside one line, so a quote cannot span the list. **Code attaches the list**: `readLeadInList` reads the lines that follow the lead-in in the stored snapshot and the service stores each one, verbatim and whole, in `source.listItems`. The model never writes them; `verifyListItems` re-proves they are exactly the snapshot's lines (at extraction, and in the independent check's `buildViews`).
+  - Marked lists ("(a)", "(ii)"): the run of marked lines, nested lists included; a marked lead-in ends at its own sibling marker.
+  - Unmarked lists (plain lines): strict. Items start with a lower-case letter; the list ends at the first line that does not, a numbered label, a full stop on an item, or the end of the page. Capitalised unmarked lines are `ambiguous_list_end`, never guessed.
+  - Not readable cleanly (`no_list_follows`, `item_too_long` over 2000 characters, `ambiguous_list_end`, `nested_unmarked_lead_in`, `pdf_layout_lost`): the rule is kept without items and flagged **`list_not_readable`**, a leave-out flag, so the gates HOLD a protected rule and leave out an ordinary one, by that named reason. A list is never truncated and a lead-in is never published alone. PDF pages lose their line layout (wrapped lines), so a lead-in quoted from a PDF is held; the same rule printed on a web page is read.
+  - The checker is shown `listItems`; a lead-in quote with no verified items has no check view, so it cannot pass.
+- **A group that is not purely a nationality.** `appliesTo.nationalities` / `asWritten` stay parallel for real nationalities. Members that are not nationalities go in **`appliesTo.uncoded`**: verbatim in the quote (`uncodedNameSupported`: `groupNameSupported` without its capital-letter rule, which would refuse "right of abode"; a lower-case entry must be a phrase of two words or more), no code ever made up. A bar needs at least one coded or uncoded member. `reviewFlagsFor` lists uncoded members in the "confirm every code" flag.
+- **Serving.** Code still decides only the coded members (`mandatoryBarHits`). A bar with uncoded members is also put to the assessment model in full (quote, list lines, group) through `judgementCriteriaOf`; the model can only raise a concern on it. It is never read as "applies to nobody" or "applies to everybody". How an applicant with such a status is asked and matched is a product question (not built).
+- Prompt versions: extraction `2026-11-rubric-v7`, check `2026-11-checker-v3`. Both fields are optional: earlier stored versions load unchanged.
+- Re-check two saved rules without a re-extraction: `scripts/recheck-list-and-group.ts` (offline by default; `--live` runs the two-model check on only those rules).
+
 ## Drafting a rulebook as a resumable background job (`rubric-extraction-job.ts`; issue #216, part P2 of #211)
 
 `extractRoute` drafts a whole rulebook in one call chain (a real route took

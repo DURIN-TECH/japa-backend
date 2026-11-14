@@ -72,8 +72,14 @@ import type { SourceChunk } from "./rubric-chunk";
  *    `ruleTriggers` entry per specialist or conditional rule naming that
  *    question and the answer values that trigger the rule. The accepted
  *    criteria and the questions asked so far are sent to call 2.
+ *  - "2026-11-rubric-v7" (#222): a quote that ENDS WITH A LEAD-IN ("... any of
+ *    the following:") is allowed for a rule that is itself the bar: code then
+ *    attaches the list lines under it (`source.listItems`), so the model does
+ *    not copy them. `appliesTo.uncoded` carries group members that are not a
+ *    nationality (never a made-up code); a code is never given for a group
+ *    wider than a nationality.
  */
-export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v6";
+export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v7";
 
 /** Instructions shared by both calls: what the excerpt is, and how to treat it. */
 const COMMON_INSTRUCTIONS = [
@@ -96,7 +102,7 @@ export const RUBRIC_SYSTEM_PROMPT = [
   "A requirement every applicant on the route must meet is `all_applicants` even when it is written in a long general document. From a ROUTE GUIDANCE source, everything is about the route: list what applies to every applicant or depends on the applicant's circumstances, and mark activity-specific parts `specialist` (do not leave them out). From a SECONDARY source, list the rules that apply to applicants of the route (mark rules written for other routes or categories of applicant `other_route`, and rules for a specialist activity or sub-category of THIS route `specialist`); do not stretch a rule written for another route to this one. From a PRIMARY source, list every criterion the excerpt states.",
   "",
   "Lists:",
-  "- When a paragraph lists lettered or numbered sub-conditions that must each be satisfied, extract ONE criterion per sub-condition. Each has its own `quote`, starting at its own marker (for example \"(a)\") and not running into the next marker, and its own `title`. Carry the paragraph's triggering circumstance (its lead-in sentence) onto each of them as `applicabilityCondition`. Do not merge sub-conditions into one criterion, and do not quote only the lead-in sentence.",
+  "- When a paragraph lists lettered or numbered sub-conditions that must each be satisfied, extract ONE criterion per sub-condition. Each has its own `quote`, starting at its own marker (for example \"(a)\") and not running into the next marker, and its own `title`. Carry the paragraph's triggering circumstance (its lead-in sentence) onto each of them as `applicabilityCondition`. Do not merge sub-conditions into one criterion, and do not quote only the lead-in sentence for them (the one exception is the next rule).",
   "- When the items of a list are alternatives or separate rules, extract each one separately in the same way.",
   "- A statement about how to treat the ABSENCE of something (for example, what to do when an applicant has no history of a kind) is a criterion or a probe factor in the source's words. Extract it; do not skip it because it describes a missing fact.",
   "",
@@ -110,7 +116,8 @@ export const RUBRIC_SYSTEM_PROMPT = [
   "",
   "Kinds:",
   "- `objective`: a rule a program can check. Give `check` with the `field` to read, an `op` and, unless the op is `present`, a `value`.",
-  "- `mandatory_bar`: a bar that applies to a stated group whatever else is true. Give `appliesTo`: `asWritten` lists the group members exactly as the excerpt names them, `nationalities` gives the matching two-letter codes in the same order. Give `validFrom` / `validUntil` (YYYY-MM-DD) only when the excerpt states the dates.",
+  "- `mandatory_bar`: a bar that applies to a stated group whatever else is true. Give `appliesTo`: `asWritten` lists the group members exactly as the excerpt names them, `nationalities` gives the matching two-letter codes in the same order. Give `validFrom` / `validUntil` (YYYY-MM-DD) only when the excerpt states the dates. `appliesTo.nationalities` and `asWritten` are for members that really are a nationality. A member that is NOT a nationality (a status or category of person, for example one defined by a right or a legal status) goes in `appliesTo.uncoded`, written exactly as the quote names it: it has no code, so never invent one and never put a nationality's code for a group that is wider than, or different from, that nationality. A bar needs at least one member in `asWritten` or in `uncoded`.",
+  "- A rule whose own sentence ends with a lead-in (a colon: \"... except where they are subject to any of the following:\") may use that sentence as its `quote`, when the rule is itself the bar or the requirement the list qualifies. Quote the lead-in sentence only. Do NOT copy the list lines under it into any field: the program attaches them from the stored text. This does not change the rule for lettered sub-conditions: a paragraph that lists sub-conditions the applicant must each satisfy still gives one criterion per item.",
   "- `judgement`: a matter the decision maker weighs. Give `probeFactors` and set `requiresInterviewBeforeRefusal` to true only when the excerpt says the person should be interviewed or asked before a refusal on this point. A judgement criterion NEVER has a `check`: leave `check` out.",
   "",
   "Stages, in the order they are applied: `validity` (whether the application can be considered at all), `suitability` (grounds for refusal whatever the merits), `eligibility` (the requirements of the category), `credibility` (whether the account given is believed).",
@@ -216,7 +223,7 @@ export function buildRubricOutputSchema(severityLevels: readonly string[]): Reco
         unit: optional(STRING),
       })
     ),
-    appliesTo: optional(object({ nationalities: STRINGS, asWritten: STRINGS })),
+    appliesTo: optional(object({ nationalities: STRINGS, asWritten: STRINGS, uncoded: optional(STRINGS) })),
     validFrom: optional(STRING),
     validUntil: optional(STRING),
     probeFactors: STRINGS,
@@ -507,7 +514,7 @@ export interface RawCriterion {
   applicability?: (typeof CRITERION_APPLICABILITIES)[number];
   applicabilityCondition?: string | null;
   check: { field: string; op: (typeof CHECK_OPS)[number]; value: number | string | boolean | null; unit: string | null } | null;
-  appliesTo: { nationalities: string[]; asWritten: string[] } | null;
+  appliesTo: { nationalities: string[]; asWritten: string[]; uncoded?: string[] } | null;
   validFrom: string | null;
   validUntil: string | null;
   probeFactors: string[];
