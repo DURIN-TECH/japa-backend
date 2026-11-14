@@ -1,8 +1,8 @@
 {
-  "extractorPromptVersion": "2026-11-answer-types-v9",
+  "extractorPromptVersion": "2026-11-answer-types-v10",
   "model": "deepseek-flash",
-  "ranAt": "2026-11-14T06:50:09.997Z",
-  "gitSha": "c6c33e064985c7307d463e74b33b3898002f8e7c",
+  "ranAt": "2026-11-14T07:02:07.222Z",
+  "gitSha": "724f2c572c44071929cb027e17f00a948a613ef7",
   "gitDirty": false,
   "mode": "live",
   "partial": false,
@@ -57,7 +57,7 @@
       "extracted": {
         "name": "Skilled Worker visa",
         "code": "SKILLED_WORKER",
-        "description": "A Skilled Worker visa allows you to come to or stay in the UK to do an eligible job with an approved employer. You must have a confirmed job offer from a UK employer that's been approved by the Home Office, and meet salary and English language requirements.",
+        "description": "A Skilled Worker visa allows you to come to or stay in the UK to do an eligible job with an approved employer. You must have a confirmed job offer from a Home Office approved employer and meet salary and English language requirements.",
         "category": "work",
         "processingTime": "3-8 weeks",
         "processingDaysMin": 21,
@@ -65,7 +65,7 @@
         "feeComponents": [
           {
             "kind": "application",
-            "label": "Application fee (more than 3 years, outside the UK)",
+            "label": "Application fee (more than 3 years, outside UK)",
             "amount": 1618,
             "currency": "GBP",
             "per": "application"
@@ -83,10 +83,10 @@
         "isExtendable": true,
         "eligibilityCriteria": [
           "work for a UK employer that’s been approved by the Home Office",
-          "have a ‘certificate of sponsorship’ (CoS) from your employer with information about the role you’ve been offered in the UK",
+          "have a ‘certificate of sponsorship’ (CoS) from your employer",
           "do a job that’s on the list of eligible occupations",
           "be paid a minimum salary - how much depends on the type of work you do and the date you got your CoS",
-          "You must be able to speak, read, write and understand English."
+          "You must be able to speak, read, write and understand English"
         ],
         "requiredDocuments": [
           "your certificate of sponsorship reference number - your employer will give you this",
@@ -139,27 +139,17 @@
           }
         ],
         "applicationUrl": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/skilled_worker_out_uk",
-        "applicationInstructions": "You must apply online. You can apply for a visa up to 3 months before the day you are due to start work in the UK. As part of your application, you’ll need to prove your identity and provide your documents.",
+        "applicationInstructions": "You must apply online. You can apply up to 3 months before the day you are due to start work in the UK.",
         "confidence": 0.9,
         "citations": {
-          "name": "Skilled Worker visa",
-          "description": "A Skilled Worker visa allows you to come to or stay in the UK to do an eligible job with an approved employer.",
-          "category": "work",
-          "processingTime": "3 weeks, if you’re outside the UK / 8 weeks, if you’re inside the UK",
           "processingDaysMin": "3 weeks, if you’re outside the UK",
           "processingDaysMax": "8 weeks, if you’re inside the UK",
+          "processingTime": "3 weeks, if you’re outside the UK / 8 weeks, if you’re inside the UK",
           "fee.application": "more than 3 years - £1,618 per person",
           "fee.surcharge": "this is usually £1,035 per year",
           "fee.years": "Your visa can last for up to 5 years before you need to extend it.",
           "validityPeriod": "Your visa can last for up to 5 years before you need to extend it.",
           "isExtendable": "You can apply to extend your visa as many times as you like as long as you still meet the eligibility requirements.",
-          "eligibilityCriteria.0": "work for a UK employer that’s been approved by the Home Office",
-          "eligibilityCriteria.1": "have a ‘certificate of sponsorship’ (CoS) from your employer with information about the role you’ve been offered in the UK",
-          "eligibilityCriteria.2": "do a job that’s on the list of eligible occupations",
-          "eligibilityCriteria.3": "be paid a minimum salary - how much depends on the type of work you do and the date you got your CoS",
-          "eligibilityCriteria.4": "You must be able to speak, read, write and understand English.",
-          "applicationUrl": "Start now (https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/skilled_worker_out_uk)",
-          "applicationInstructions": "You must apply online. You can apply for a visa up to 3 months before the day you are due to start work in the UK. As part of your application, you’ll need to prove your identity and provide your documents.",
           "requiredDocuments.0": "your certificate of sponsorship reference number - your employer will give you this",
           "requiredDocuments.1": "proof of your knowledge of English",
           "requiredDocuments.2": "a valid passport or other document that shows your identity and nationality",
@@ -169,13 +159,13 @@
         }
       },
       "usage": {
-        "promptTokens": 10410,
-        "completionTokens": 1474,
-        "cacheHitTokens": 2176,
-        "cacheMissTokens": 8234,
-        "totalTokens": 11884
+        "promptTokens": 10548,
+        "completionTokens": 1150,
+        "cacheHitTokens": 2944,
+        "cacheMissTokens": 7604,
+        "totalTokens": 11698
       },
-      "costUsd": 0.00212603,
+      "costUsd": 0.00183943,
       "score": {
         "route": "skilled-worker-visa",
         "score": 1,
@@ -257,10 +247,10 @@
             ],
             "actual": [
               "work for a UK employer that’s been approved by the Home Office",
-              "have a ‘certificate of sponsorship’ (CoS) from your employer with information about the role you’ve been offered in the UK",
+              "have a ‘certificate of sponsorship’ (CoS) from your employer",
               "do a job that’s on the list of eligible occupations",
               "be paid a minimum salary - how much depends on the type of work you do and the date you got your CoS",
-              "You must be able to speak, read, write and understand English."
+              "You must be able to speak, read, write and understand English"
             ]
           },
           {
@@ -371,63 +361,56 @@
           "You must be able to show that you'll not live in the UK for extended periods through frequent or successive visits, or make the UK your main home"
         ],
         "requiredDocuments": [
-          "passport or travel document",
-          "the dates you're planning to travel to the UK",
-          "where you'll be staying during your visit",
+          "the dates you’re planning to travel to the UK",
+          "where you’ll be staying during your visit",
           "how much you think your trip will cost",
-          "your current home address and how long you've lived there",
-          "your parents' names and dates of birth (if known)",
+          "your current home address and how long you’ve lived there",
+          "your parents’ names and dates of birth (if known)",
           "how much you earn in a year (if you have an income)",
           "details of any criminal, civil or immigration offences you may have committed",
           "details of your travel history for the past 10 years",
-          "your employer's address and telephone number",
-          "your partner's name, date of birth and passport number",
+          "your employer’s address and telephone number",
+          "your partner’s name, date of birth and passport number",
           "the name and address of anyone paying for your trip",
           "the name, address and passport number of any family members you have in the UK",
-          "a certificate proving that you've had a tuberculosis (TB) test if you're visiting for more than 6 months"
+          "a certificate proving that you’ve had a tuberculosis (TB) test if you’re visiting for more than 6 months"
         ],
         "requiredDocumentMeta": [
           {
-            "item": "passport or travel document",
-            "kind": "document",
-            "kindQuote": "You must have a passport or travel document that is valid for the whole of your stay in the UK.",
-            "need": "required"
-          },
-          {
-            "item": "the dates you're planning to travel to the UK",
+            "item": "the dates you’re planning to travel to the UK",
             "kind": "information",
-            "kindQuote": "You'll need to provide the following information in your online application:",
+            "kindQuote": "You’ll need to provide the following information in your online application:",
             "need": "required",
             "answerType": "date_range",
-            "answerTypeQuote": "the dates you're planning to travel to the UK"
+            "answerTypeQuote": "the dates you’re planning to travel to the UK"
           },
           {
-            "item": "where you'll be staying during your visit",
+            "item": "where you’ll be staying during your visit",
             "kind": "information",
-            "kindQuote": "You'll need to provide the following information in your online application:",
+            "kindQuote": "You’ll need to provide the following information in your online application:",
             "need": "required",
             "answerType": "address",
-            "answerTypeQuote": "where you'll be staying during your visit"
+            "answerTypeQuote": "where you’ll be staying during your visit"
           },
           {
             "item": "how much you think your trip will cost",
             "kind": "information",
-            "kindQuote": "You'll need to provide the following information in your online application:",
+            "kindQuote": "You’ll need to provide the following information in your online application:",
             "need": "required",
             "answerType": "money",
             "answerTypeQuote": "how much you think your trip will cost"
           },
           {
-            "item": "your current home address and how long you've lived there",
+            "item": "your current home address and how long you’ve lived there",
             "kind": "information",
-            "kindQuote": "You'll need to provide the following information in your online application:",
+            "kindQuote": "You’ll need to provide the following information in your online application:",
             "need": "required",
             "answerType": "address"
           },
           {
-            "item": "your parents' names and dates of birth (if known)",
+            "item": "your parents’ names and dates of birth (if known)",
             "kind": "information",
-            "kindQuote": "You'll need to provide the following information in your online application:",
+            "kindQuote": "You’ll need to provide the following information in your online application:",
             "need": "conditional",
             "answerType": "list",
             "appliesWhen": "if known"
@@ -435,7 +418,7 @@
           {
             "item": "how much you earn in a year (if you have an income)",
             "kind": "information",
-            "kindQuote": "You'll need to provide the following information in your online application:",
+            "kindQuote": "You’ll need to provide the following information in your online application:",
             "need": "conditional",
             "answerType": "money",
             "answerTypeQuote": "how much you earn in a year (if you have an income)",
@@ -444,7 +427,7 @@
           {
             "item": "details of any criminal, civil or immigration offences you may have committed",
             "kind": "information",
-            "kindQuote": "You'll need to provide the following information in your online application:",
+            "kindQuote": "You’ll need to provide the following information in your online application:",
             "need": "required",
             "answerType": "list",
             "answerTypeQuote": "details of any criminal, civil or immigration offences you may have committed"
@@ -459,7 +442,7 @@
             "appliesWhen": "Depending on your circumstances, you might also need to provide"
           },
           {
-            "item": "your employer's address and telephone number",
+            "item": "your employer’s address and telephone number",
             "kind": "information",
             "kindQuote": "Depending on your circumstances, you might also need to provide:",
             "need": "conditional",
@@ -467,7 +450,7 @@
             "appliesWhen": "Depending on your circumstances, you might also need to provide"
           },
           {
-            "item": "your partner's name, date of birth and passport number",
+            "item": "your partner’s name, date of birth and passport number",
             "kind": "information",
             "kindQuote": "Depending on your circumstances, you might also need to provide:",
             "need": "conditional",
@@ -491,11 +474,11 @@
             "appliesWhen": "Depending on your circumstances, you might also need to provide"
           },
           {
-            "item": "a certificate proving that you've had a tuberculosis (TB) test if you're visiting for more than 6 months",
+            "item": "a certificate proving that you’ve had a tuberculosis (TB) test if you’re visiting for more than 6 months",
             "kind": "document",
             "kindQuote": "Depending on your circumstances, you might also need to provide:",
             "need": "conditional",
-            "appliesWhen": "if you're visiting for more than 6 months"
+            "appliesWhen": "if you’re visiting for more than 6 months"
           }
         ],
         "applicationUrl": "https://visas-immigration.service.gov.uk/apply-visa-type/visit",
@@ -505,50 +488,49 @@
           "name": "Standard Visitor visa",
           "description": "You can visit the UK as a Standard Visitor for tourism, business, study (courses up to 6 months) and other permitted activities. You can usually stay in the UK for up to 6 months.",
           "category": "You can visit the UK as a Standard Visitor for tourism, business, study (courses up to 6 months) and other permitted activities.",
-          "processingTime": "you'll usually get a decision on your visa within 3 weeks / a decision will usually be made within 8 weeks",
-          "processingDaysMin": "you'll usually get a decision on your visa within 3 weeks",
-          "processingDaysMax": "a decision will usually be made within 8 weeks",
+          "processingTime": "you’ll usually get a decision on your visa within 3 weeks / a decision will usually be made within 8 weeks of providing your supporting documents and proving your identity",
+          "processingDaysMin": "you’ll usually get a decision on your visa within 3 weeks",
+          "processingDaysMax": "a decision will usually be made within 8 weeks of providing your supporting documents and proving your identity",
           "fee.application": "A Standard Visitor visa costs £135 for up to 6 months.",
           "validityPeriod": "You can usually stay in the UK for up to 6 months.",
           "isExtendable": "You may be able to extend your stay if you have permission to be in the UK for less than 6 months.",
           "eligibilityCriteria.0": "You must have a passport or travel document to enter the UK. It should be valid for the whole of your stay.",
-          "eligibilityCriteria.1": "you'll leave the UK at the end of your visit",
-          "eligibilityCriteria.2": "you're able to support yourself and your dependants during your trip (or have funding from someone else to support you)",
-          "eligibilityCriteria.3": "you're able to pay for your return or onward journey (or have funding from someone else to pay for the journey)",
-          "eligibilityCriteria.4": "you'll not live in the UK for extended periods through frequent or successive visits, or make the UK your main home",
-          "applicationUrl": "Apply now (https://visas-immigration.service.gov.uk/apply-visa-type/visit)",
+          "eligibilityCriteria.1": "you’ll leave the UK at the end of your visit",
+          "eligibilityCriteria.2": "you’re able to support yourself and your dependants during your trip (or have funding from someone else to support you)",
+          "eligibilityCriteria.3": "you’re able to pay for your return or onward journey (or have funding from someone else to pay for the journey)",
+          "eligibilityCriteria.4": "you’ll not live in the UK for extended periods through frequent or successive visits, or make the UK your main home",
+          "applicationUrl": "https://visas-immigration.service.gov.uk/apply-visa-type/visit",
           "applicationInstructions": "You must apply for a Standard Visitor visa online before you travel to the UK and attend an appointment at a visa application centre. The earliest you can apply is 3 months before you travel.",
-          "requiredDocuments.0": "You must have a passport or travel document that is valid for the whole of your stay in the UK.",
-          "requiredDocuments.1": "the dates you're planning to travel to the UK",
-          "requiredDocuments.2": "where you'll be staying during your visit",
-          "requiredDocuments.3": "how much you think your trip will cost",
-          "requiredDocuments.4": "your current home address and how long you've lived there",
-          "requiredDocuments.5": "your parents' names and dates of birth (if known)",
-          "requiredDocuments.6": "how much you earn in a year (if you have an income)",
-          "requiredDocuments.7": "details of any criminal, civil or immigration offences you may have committed",
-          "requiredDocuments.8": "details of your travel history for the past 10 years",
-          "requiredDocuments.9": "your employer's address and telephone number",
-          "requiredDocuments.10": "your partner's name, date of birth and passport number",
-          "requiredDocuments.11": "the name and address of anyone paying for your trip",
-          "requiredDocuments.12": "the name, address and passport number of any family members you have in the UK",
-          "requiredDocuments.13": "a certificate proving that you've had a tuberculosis (TB) test if you're visiting for more than 6 months"
+          "requiredDocuments.0": "the dates you’re planning to travel to the UK",
+          "requiredDocuments.1": "where you’ll be staying during your visit",
+          "requiredDocuments.2": "how much you think your trip will cost",
+          "requiredDocuments.3": "your current home address and how long you’ve lived there",
+          "requiredDocuments.4": "your parents’ names and dates of birth (if known)",
+          "requiredDocuments.5": "how much you earn in a year (if you have an income)",
+          "requiredDocuments.6": "details of any criminal, civil or immigration offences you may have committed",
+          "requiredDocuments.7": "details of your travel history for the past 10 years",
+          "requiredDocuments.8": "your employer’s address and telephone number",
+          "requiredDocuments.9": "your partner’s name, date of birth and passport number",
+          "requiredDocuments.10": "the name and address of anyone paying for your trip",
+          "requiredDocuments.11": "the name, address and passport number of any family members you have in the UK",
+          "requiredDocuments.12": "a certificate proving that you’ve had a tuberculosis (TB) test if you’re visiting for more than 6 months"
         },
         "uncitedFieldsDropped": [
           "maxExtensions"
         ]
       },
       "usage": {
-        "promptTokens": 6590,
-        "completionTokens": 2381,
-        "cacheHitTokens": 2816,
-        "cacheMissTokens": 3774,
-        "totalTokens": 8971
+        "promptTokens": 6728,
+        "completionTokens": 2388,
+        "cacheHitTokens": 2944,
+        "cacheMissTokens": 3784,
+        "totalTokens": 9116
       },
-      "costUsd": 0.00200315,
+      "costUsd": 0.00200923,
       "score": {
         "route": "standard-visitor",
-        "score": 1,
-        "weightedSum": 16,
+        "score": 0.9910714285714286,
+        "weightedSum": 15.857142857142858,
         "weightTotal": 16,
         "fields": [
           {
@@ -658,8 +640,8 @@
             "field": "documentKinds",
             "type": "itemKinds",
             "weight": 2,
-            "score": 1,
-            "pass": true,
+            "score": 0.9285714285714286,
+            "pass": false,
             "expected": [
               "travel document: document/required",
               "planning to travel: information/required",
@@ -677,7 +659,7 @@
               "tuberculosis: document/conditional"
             ],
             "actual": [
-              "travel document: document/required",
+              "travel document: (not extracted)",
               "planning to travel: information/required",
               "staying: information/required",
               "trip will cost: information/required",
@@ -691,7 +673,8 @@
               "anyone paying: information/conditional",
               "family members: information/conditional",
               "tuberculosis: document/conditional"
-            ]
+            ],
+            "detail": "wrong or missing: travel document (expected document/required)"
           },
           {
             "field": "answerTypes",
@@ -846,19 +829,19 @@
         "applicationInstructions": "You must apply online for a Student visa. As part of your application, you'll need to prove your identity. How you do this depends on where you're from and what type of passport you have. You'll either use the 'UK Immigration: ID Check' app to scan your identity document or have your fingerprints and photo taken at a visa application centre.",
         "confidence": 0.95,
         "citations": {
-          "processingDaysMin": "3 weeks, if you’re outside the UK",
-          "processingDaysMax": "8 weeks, if you’re inside the UK",
-          "processingTime": "3 weeks, if you’re outside the UK / 8 weeks, if you’re inside the UK",
+          "processingDaysMin": "3 weeks, if you're outside the UK",
+          "processingDaysMax": "8 weeks, if you're inside the UK",
+          "processingTime": "3 weeks, if you're outside the UK / 8 weeks, if you're inside the UK",
           "fee.application": "£558 to apply for a Student visa from outside the UK",
-          "validityPeriod": "If you’re 18 or over and your course is at degree level, you can usually stay in the UK for up to 5 years.",
+          "validityPeriod": "If you're 18 or over and your course is at degree level, you can usually stay in the UK for up to 5 years.",
           "requiredDocuments.0": "a current passport or other valid travel documentation",
           "requiredDocuments.1": "a Confirmation of Acceptance for Studies (CAS) from your course provider",
           "requiredDocuments.2": "proof you have enough money to support yourself and pay for your course - this will vary depending on your circumstances",
           "requiredDocuments.3": "a valid ATAS certificate if your course and nationality require it",
-          "requiredDocuments.4": "proof of parental or other legal guardian consent if you’re under 18",
-          "requiredDocuments.5": "proof of your relationship to your parent or guardian if you’re under 18",
+          "requiredDocuments.4": "proof of parental or other legal guardian consent if you're under 18",
+          "requiredDocuments.5": "proof of your relationship to your parent or guardian if you're under 18",
           "requiredDocuments.6": "your tuberculosis test results",
-          "requiredDocuments.7": "written consent for your application from your financial sponsor if you’ve received sponsorship for your course fees and living costs in the last 12 months"
+          "requiredDocuments.7": "written consent for your application from your financial sponsor if you've received sponsorship for your course fees and living costs in the last 12 months"
         }
       },
       "linkedSurcharges": [
@@ -879,13 +862,13 @@
         }
       ],
       "usage": {
-        "promptTokens": 7696,
-        "completionTokens": 1213,
-        "cacheHitTokens": 2816,
-        "cacheMissTokens": 4880,
-        "totalTokens": 8909
+        "promptTokens": 7834,
+        "completionTokens": 1269,
+        "cacheHitTokens": 2944,
+        "cacheMissTokens": 4890,
+        "totalTokens": 9103
       },
-      "costUsd": 0.00146825,
+      "costUsd": 0.00150373,
       "score": {
         "route": "student-visa",
         "score": 1,
@@ -1106,9 +1089,9 @@
         "citations": {
           "name": "A Graduate visa gives you permission to stay in the UK for at least 18 months after successfully completing an eligible course in the UK.",
           "description": "A Graduate visa gives you permission to stay in the UK for at least 18 months after successfully completing an eligible course in the UK.",
-          "processingTime": "you’ll usually get a decision on your visa within 8 weeks.",
-          "processingDaysMin": "you’ll usually get a decision on your visa within 8 weeks.",
-          "processingDaysMax": "you’ll usually get a decision on your visa within 8 weeks.",
+          "processingTime": "you’ll usually get a decision on your visa within 8 weeks",
+          "processingDaysMin": "you’ll usually get a decision on your visa within 8 weeks",
+          "processingDaysMax": "you’ll usually get a decision on your visa within 8 weeks",
           "fee.application": "pay the £937 application fee",
           "fee.surcharge": "pay the healthcare surcharge - this is usually £1,035 for each year you’ll be in the UK",
           "fee.years": "2 years if you apply on or before 31 December 2026",
@@ -1118,6 +1101,13 @@
           "eligibilityCriteria.1": "your current visa is a Student visa or Tier 4 (General) student visa",
           "eligibilityCriteria.2": "you studied a UK bachelor’s degree, postgraduate degree or other eligible course for a minimum period of time with your Student visa or Tier 4 (General) student visa",
           "eligibilityCriteria.3": "your education provider (such as your university or college) has told the Home Office you’ve successfully completed your course",
+          "requiredDocumentMeta.0.kind": "When you apply you’ll need to provide:",
+          "requiredDocumentMeta.1.kind": "When you apply you’ll need to provide:",
+          "requiredDocumentMeta.1.answerType": "your Confirmation of Acceptance for Studies (CAS) reference number from when you applied for your Student visa or Tier 4 (General) student visa",
+          "requiredDocumentMeta.2.kind": "To prove you have a valid Student visa or Tier 4 (General) student visa, you’ll need to provide your biometric residence permit (BRP).",
+          "requiredDocumentMeta.3.kind": "Depending on your circumstances, you might be asked to provide:",
+          "requiredDocumentMeta.4.kind": "Depending on your circumstances, you might be asked to provide:",
+          "requiredDocumentMeta.5.kind": "If your documents are not in English or Welsh you’ll also need to provide a certified translation.",
           "applicationUrl": "Start now (https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/graduate_in_uk)",
           "applicationInstructions": "You must apply online for a Graduate visa.",
           "requiredDocuments.0": "a valid passport or other travel document that shows your identity and nationality",
@@ -1129,13 +1119,13 @@
         }
       },
       "usage": {
-        "promptTokens": 5699,
-        "completionTokens": 1497,
-        "cacheHitTokens": 2816,
-        "cacheMissTokens": 2883,
-        "totalTokens": 7196
+        "promptTokens": 5837,
+        "completionTokens": 1714,
+        "cacheHitTokens": 2944,
+        "cacheMissTokens": 2893,
+        "totalTokens": 7551
       },
-      "costUsd": 0.0013391,
+      "costUsd": 0.00147118,
       "score": {
         "route": "graduate-visa",
         "score": 1,
@@ -1298,7 +1288,7 @@
       "extracted": {
         "name": "Family visa",
         "code": "FAMILY",
-        "description": "A visa to live with a family member in the UK for more than 6 months. It allows joining a spouse or partner, fiancé(e) or proposed civil partner, child, parent, or a relative who will provide long-term care.",
+        "description": "A visa to live with a family member in the UK for more than 6 months. You can apply as a partner, child, parent, or relative providing long-term care.",
         "category": "family",
         "processingTime": "8-12 weeks",
         "processingDaysMin": 56,
@@ -1306,14 +1296,14 @@
         "feeComponents": [
           {
             "kind": "application",
-            "label": "Cost if joining your partner, parent or child (apply outside the UK)",
+            "label": "Application fee (joining partner, parent or child)",
             "amount": 2064,
             "currency": "GBP",
             "per": "application"
           },
           {
             "kind": "surcharge",
-            "label": "Healthcare surcharge for each adult (18 or older) staying for 2 years and 9 months",
+            "label": "Healthcare surcharge (adult)",
             "amount": 3105,
             "currency": "GBP",
             "per": "application"
@@ -1322,22 +1312,43 @@
         "validityPeriod": "2 years and 9 months",
         "isExtendable": true,
         "eligibilityCriteria": [
-          "You and your partner both need to be 18 or over",
-          "Your partner must be a British or Irish citizen, have settled in the UK, have pre-settled status from the EU, Switzerland, Norway, Iceland or Liechtenstein, have a Turkish Businessperson or Turkish Worker visa, have protection status, or have permission to stay as a stateless person",
-          "You and your partner must intend to live together permanently in the UK after you apply",
-          "You must be able to prove your relationship (e.g., marriage/civil partnership, living together for at least 2 years, or being a fiancé(e) planning to marry within 6 months)",
-          "You need to prove you have a good knowledge of English",
-          "You need to meet the financial requirements (combined income of at least £29,000 a year unless exempt)"
+          "You and your partner both need to be 18 or over (if applying as a partner).",
+          "Your partner must be a British or Irish citizen, have settled status, pre-settled status, a Turkish Businessperson or Worker visa, protection status, or permission to stay as a stateless person.",
+          "You and your partner must intend to live together permanently in the UK.",
+          "You must prove your relationship (e.g., marriage, civil partnership, or living together for at least 2 years).",
+          "You must prove you have a good knowledge of English.",
+          "You must meet the financial requirements (minimum income requirement of £29,000 per year, unless exempt)."
         ],
         "requiredDocuments": [
+          "all your names",
+          "your date of birth",
           "your current passport or other valid travel ID",
           "copies of the photo page and any visa or entry stamps in your previous passports",
-          "your tuberculosis test results if you're from a country where you have to take the test",
+          "details of any previous immigration applications you’ve made",
+          "details of any criminal convictions",
+          "your national insurance number, if you have one",
+          "your parents’ date of birth and nationality if you’re applying from outside the UK",
+          "your tuberculosis test results if you’re from a country where you have to take the test",
           "a certified translation of any document that is not in English or Welsh",
-          "online proof of your immigration status if you have an eVisa - you'll need to get a share code",
+          "online proof of your immigration status if you have an eVisa - you’ll need to get a share code",
           "your biometric residence permit (BRP) - you can use it for 24 months after the expiry date printed on your card or until 31 December 2026, whichever comes first"
         ],
         "requiredDocumentMeta": [
+          {
+            "item": "all your names",
+            "kind": "information",
+            "kindQuote": "You’ll need to provide:",
+            "need": "required",
+            "answerType": "list"
+          },
+          {
+            "item": "your date of birth",
+            "kind": "information",
+            "kindQuote": "You’ll need to provide:",
+            "need": "required",
+            "answerType": "date",
+            "answerTypeQuote": "your date of birth"
+          },
           {
             "item": "your current passport or other valid travel ID",
             "kind": "document",
@@ -1351,11 +1362,43 @@
             "need": "required"
           },
           {
-            "item": "your tuberculosis test results if you're from a country where you have to take the test",
+            "item": "details of any previous immigration applications you’ve made",
+            "kind": "information",
+            "kindQuote": "You’ll need to provide:",
+            "need": "required",
+            "answerType": "list",
+            "answerTypeQuote": "details of any previous immigration applications you’ve made"
+          },
+          {
+            "item": "details of any criminal convictions",
+            "kind": "information",
+            "kindQuote": "You’ll need to provide:",
+            "need": "required",
+            "answerType": "list",
+            "answerTypeQuote": "details of any criminal convictions"
+          },
+          {
+            "item": "your national insurance number, if you have one",
+            "kind": "information",
+            "kindQuote": "You’ll need to provide:",
+            "need": "conditional",
+            "answerType": "text",
+            "appliesWhen": "if you have one"
+          },
+          {
+            "item": "your parents’ date of birth and nationality if you’re applying from outside the UK",
+            "kind": "information",
+            "kindQuote": "You’ll need to provide:",
+            "need": "conditional",
+            "answerType": "text",
+            "appliesWhen": "if you’re applying from outside the UK"
+          },
+          {
+            "item": "your tuberculosis test results if you’re from a country where you have to take the test",
             "kind": "document",
             "kindQuote": "You’ll need to provide:",
             "need": "conditional",
-            "appliesWhen": "if you're from a country where you have to take the test"
+            "appliesWhen": "if you’re from a country where you have to take the test"
           },
           {
             "item": "a certified translation of any document that is not in English or Welsh",
@@ -1364,7 +1407,7 @@
             "need": "required"
           },
           {
-            "item": "online proof of your immigration status if you have an eVisa - you'll need to get a share code",
+            "item": "online proof of your immigration status if you have an eVisa - you’ll need to get a share code",
             "kind": "document",
             "kindQuote": "You’ll also need to provide either:",
             "need": "conditional",
@@ -1387,33 +1430,32 @@
           "fee.application": "Cost if joining your partner, parent or child £2,064",
           "fee.surcharge": "£3,105 if you’re staying for 2 years and 9 months",
           "validityPeriod": "You can stay in the UK for up to 2 years and 9 months.",
-          "isExtendable": "You can extend your visa more than once.",
-          "eligibilityCriteria.0": "To apply as a partner, you and your partner both need to be 18 or over.",
-          "eligibilityCriteria.1": "Your partner must also either: be a British or Irish citizen have settled in the UK - for example, they have indefinite leave to remain, settled status or proof of permanent residence be from the EU, Switzerland, Norway, Iceland or Liechtenstein and have pre-settled status - they must have started living in the UK before 1 January 2021 have a Turkish Businessperson visa or Turkish Worker visa have protection status (leave to remain as a refugee, permission to stay as a refugee or a person with humanitarian protection) have got permission to stay as a stateless person before you became their partner",
-          "eligibilityCriteria.2": "You and your partner must intend to live together permanently in the UK after you apply.",
-          "eligibilityCriteria.3": "You must be able to prove one of the following: you’re in a civil partnership or marriage that’s recognised in the UK you’ve been living together in a relationship for at least 2 years when you apply you are a fiancé, fiancée or proposed civil partner and will marry or enter into a civil partnership in the UK within 6 months of arriving you’ve been in a relationship for at least 2 years when you apply but you cannot live together, for example because you’re working or studying in different places, or it’s not accepted in your culture",
-          "eligibilityCriteria.4": "You also need to prove you: have a good knowledge of English meet the financial requirements",
-          "eligibilityCriteria.5": "If you apply for a family visa as a partner, you and your partner usually need to prove that your combined income is at least £29,000 a year.",
-          "requiredDocuments.0": "your current passport or other valid travel ID",
-          "requiredDocuments.1": "copies of the photo page and any visa or entry stamps in your previous passports",
-          "requiredDocuments.2": "your tuberculosis test results if you’re from a country where you have to take the test",
-          "requiredDocuments.3": "a certified translation of any document that is not in English or Welsh",
-          "requiredDocuments.4": "online proof of your immigration status if you have an eVisa -  you’ll need to get a share code",
-          "requiredDocuments.5": "your biometric residence permit (BRP) - you can use it for 24 months after the expiry date printed on your card or until 31 December 2026, whichever comes first"
+          "requiredDocuments.0": "all your names",
+          "requiredDocuments.1": "your date of birth",
+          "requiredDocuments.2": "your current passport or other valid travel ID",
+          "requiredDocuments.3": "copies of the photo page and any visa or entry stamps in your previous passports",
+          "requiredDocuments.4": "details of any previous immigration applications you’ve made",
+          "requiredDocuments.5": "details of any criminal convictions",
+          "requiredDocuments.6": "your national insurance number, if you have one",
+          "requiredDocuments.7": "your parents’ date of birth and nationality if you’re applying from outside the UK",
+          "requiredDocuments.8": "your tuberculosis test results if you’re from a country where you have to take the test",
+          "requiredDocuments.9": "a certified translation of any document that is not in English or Welsh",
+          "requiredDocuments.10": "online proof of your immigration status if you have an eVisa - you’ll need to get a share code",
+          "requiredDocuments.11": "your biometric residence permit (BRP) - you can use it for 24 months after the expiry date printed on your card or until 31 December 2026, whichever comes first"
         }
       },
       "usage": {
-        "promptTokens": 8585,
-        "completionTokens": 1689,
-        "cacheHitTokens": 2816,
-        "cacheMissTokens": 5769,
-        "totalTokens": 10274
+        "promptTokens": 8723,
+        "completionTokens": 1742,
+        "cacheHitTokens": 8576,
+        "cacheMissTokens": 147,
+        "totalTokens": 10465
       },
-      "costUsd": 0.0018872,
+      "costUsd": 0.00109298,
       "score": {
         "route": "uk-family-visa",
-        "score": 0.8,
-        "weightedSum": 12.8,
+        "score": 1,
+        "weightedSum": 16,
         "weightTotal": 16,
         "fields": [
           {
@@ -1492,12 +1534,12 @@
               "intend to live together permanently in the UK"
             ],
             "actual": [
-              "You and your partner both need to be 18 or over",
-              "Your partner must be a British or Irish citizen, have settled in the UK, have pre-settled status from the EU, Switzerland, Norway, Iceland or Liechtenstein, have a Turkish Businessperson or Turkish Worker visa, have protection status, or have permission to stay as a stateless person",
-              "You and your partner must intend to live together permanently in the UK after you apply",
-              "You must be able to prove your relationship (e.g., marriage/civil partnership, living together for at least 2 years, or being a fiancé(e) planning to marry within 6 months)",
-              "You need to prove you have a good knowledge of English",
-              "You need to meet the financial requirements (combined income of at least £29,000 a year unless exempt)"
+              "You and your partner both need to be 18 or over (if applying as a partner).",
+              "Your partner must be a British or Irish citizen, have settled status, pre-settled status, a Turkish Businessperson or Worker visa, protection status, or permission to stay as a stateless person.",
+              "You and your partner must intend to live together permanently in the UK.",
+              "You must prove your relationship (e.g., marriage, civil partnership, or living together for at least 2 years).",
+              "You must prove you have a good knowledge of English.",
+              "You must meet the financial requirements (minimum income requirement of £29,000 per year, unless exempt)."
             ]
           },
           {
@@ -1528,8 +1570,8 @@
             "field": "documentKinds",
             "type": "itemKinds",
             "weight": 2,
-            "score": 0.4,
-            "pass": false,
+            "score": 1,
+            "pass": true,
             "expected": [
               "photo page: document/required",
               "criminal convictions: information/required",
@@ -1544,24 +1586,23 @@
             ],
             "actual": [
               "photo page: document/required",
-              "criminal convictions: (not extracted)",
+              "criminal convictions: information/required",
               "current passport: document/required",
               "tuberculosis: document/conditional",
               "certified translation: document/required",
-              "all your names: (not extracted)",
-              "your date of birth: (not extracted)",
-              "previous immigration applications: (not extracted)",
-              "national insurance: (not extracted)",
-              "nationality: (not extracted)"
-            ],
-            "detail": "wrong or missing: criminal convictions (expected information/required); all your names (expected information/required); your date of birth (expected information/required); previous immigration applications (expected information/required); national insurance (expected information/conditional); nationality (expected information/conditional)"
+              "all your names: information/required",
+              "your date of birth: information/required",
+              "previous immigration applications: information/required",
+              "national insurance: information/conditional",
+              "nationality: information/conditional"
+            ]
           },
           {
             "field": "answerTypes",
             "type": "itemKinds",
             "weight": 2,
-            "score": 0,
-            "pass": false,
+            "score": 1,
+            "pass": true,
             "expected": [
               "criminal convictions: list",
               "all your names: list",
@@ -1571,14 +1612,13 @@
               "nationality: text"
             ],
             "actual": [
-              "criminal convictions: (not extracted)",
-              "all your names: (not extracted)",
-              "your date of birth: (not extracted)",
-              "previous immigration applications: (not extracted)",
-              "national insurance: (not extracted)",
-              "nationality: (not extracted)"
-            ],
-            "detail": "wrong or missing: criminal convictions (expected list, got none); all your names (expected list, got none); your date of birth (expected date, got none); previous immigration applications (expected list, got none); national insurance (expected text, got none); nationality (expected text, got none)"
+              "criminal convictions: list",
+              "all your names: list",
+              "your date of birth: date",
+              "previous immigration applications: list",
+              "national insurance: text",
+              "nationality: text"
+            ]
           }
         ],
         "feeMismatch": false,
@@ -1678,19 +1718,19 @@
           "eligibilityCriteria.3": "you’re applying within 3 months of receiving your endorsement letter",
           "eligibilityCriteria.4": "the organisation that endorsed you has not withdrawn its approval",
           "applicationUrl": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/global_talent_out_uk",
-          "applicationInstructions": "You must apply online. How you apply depends on whether you’re outside the UK and are coming to the UK, inside the UK and extending your current visa, inside the UK and switching from a different visa.",
+          "applicationInstructions": "You must apply online. How you apply depends on whether you’re: outside the UK and are coming to the UK; inside the UK and extending your current visa; inside the UK and switching from a different visa.",
           "requiredDocuments.0": "a valid passport or other document that shows your identity and nationality",
           "requiredDocuments.1": "your tuberculosis test results if you’re from a country where you have to take the test"
         }
       },
       "usage": {
-        "promptTokens": 5547,
-        "completionTokens": 1411,
-        "cacheHitTokens": 2816,
-        "cacheMissTokens": 2731,
-        "totalTokens": 6958
+        "promptTokens": 5685,
+        "completionTokens": 1472,
+        "cacheHitTokens": 2944,
+        "cacheMissTokens": 2741,
+        "totalTokens": 7157
       },
-      "costUsd": 0.0012647,
+      "costUsd": 0.00130318,
       "score": {
         "route": "global-talent",
         "score": 1,
@@ -1831,7 +1871,7 @@
     "eligibility": 1,
     "url": 1,
     "fee": 1,
-    "itemKinds": 0.8222222222222223
+    "itemKinds": 0.9920634920634921
   },
   "fieldScores": {
     "name": 1,
@@ -1843,24 +1883,24 @@
     "eligibility": 1,
     "applicationUrlHost": 1,
     "feeComponents": 1,
-    "documentKinds": 0.7333333333333334,
-    "answerTypes": 0.5
+    "documentKinds": 0.8214285714285715,
+    "answerTypes": 0.6666666666666666
   },
-  "overall": 0.9644444444444444,
+  "overall": 0.9984126984126984,
   "pass": true,
   "failures": [],
   "usage": {
     "runs": 1,
     "extractions": 6,
     "unpricedExtractions": 0,
-    "promptTokens": 44527,
-    "completionTokens": 9665,
-    "cacheHitTokens": 16256,
-    "cacheMissTokens": 28271,
-    "costUsd": 0.01008843,
+    "promptTokens": 45355,
+    "completionTokens": 9735,
+    "cacheHitTokens": 23296,
+    "cacheMissTokens": 22059,
+    "costUsd": 0.00921973,
     "requests": {}
   },
-  "costUsd": 0.01008843,
+  "costUsd": 0.00921973,
   "pricing": {
     "priceKey": "deepseek-flash",
     "sourceUrl": "https://api-docs.deepseek.com/quick_start/pricing",
