@@ -68,7 +68,9 @@ import { TranslationError, buildTranslationRequest, parseTranslationOutput, toQu
 import { listNotReadableFlag, readLeadInList, unreadableListReason, verifyListItems } from "./rubric-list-items";
 import { spansSiblingMarkers } from "./rubric-marker-chain";
 import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSettings } from "./rubric-settings";
-import { rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
+import { RubricStoreError, rubricStore, type PendingWriteResult, type RubricDraft, type RubricStore } from "./rubric.store";
+// (#278) The stored-size bound and the pre-flight projection.
+import { MAX_STORED_BYTES, projectStoredBytes } from "./rubric-version-storage";
 import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, targetInputOf, type RulebookTarget, type RulebookTargetInput } from "./rubric-key";
 import type { SharedRoute } from "../../types/shared-route";
 import type { RubricHead, StoredApplicantGroup } from "../../types/rubric";
@@ -1866,7 +1868,19 @@ export class RubricExtractionService {
       }
       const { draft, merged, discardedByReason } = assembled;
 
-      const written = await this.store.writePendingVersion(draft, sourceIds, { force: input.force, now: this.now() });
+      let written: PendingWriteResult;
+      try {
+        written = await this.store.writePendingVersion(draft, sourceIds, { force: input.force, now: this.now() });
+      } catch (err) {
+        // (#278) Too large even split into parts: a clear, named failure (the
+        // pre-flight projection should have refused it before any call). The
+        // one-shot run keeps nothing; the background job (rubric-extraction-
+        // job.ts) keeps every paid step and can be resumed.
+        if (err instanceof RubricStoreError && err.code === "too_large") {
+          return await finish("failed", { reasonCode: "rubric_too_large", error: err.message.slice(0, 500), discardedCount: merged.discards.length, discardedByReason }, true);
+        }
+        throw err;
+      }
       if (!written.written) {
         // Another run wrote this source set while this one was extracting.
         return await finish("unchanged", { reasonCode: "source_unchanged", version: written.version }, true);
@@ -2205,6 +2219,20 @@ export class RubricExtractionService {
     const chars = chunks.reduce((n, c) => n + c.text.length, 0);
     if (chars > settings.maxInputCharsPerRun) {
       throw new RunStop("skipped", "run_cap_exceeded", `the run would send ${chars} characters; the cap is ${settings.maxInputCharsPerRun}`);
+    }
+    // (#278) PRE-FLIGHT SIZE PROJECTION, before any model call is paid for.
+    // A version is stored split into parts when it is large, but even split
+    // there is a hard bound (MAX_STORED_BYTES, under Firestore's 10 MiB commit
+    // limit). A run whose projected result could not be saved is refused now,
+    // not after every call has been made (the #260 Family run spent ~$20 and
+    // then could not be saved). The projection is deliberately pessimistic.
+    const projected = projectStoredBytes(chars);
+    if (projected > MAX_STORED_BYTES) {
+      throw new RunStop(
+        "skipped",
+        "projected_too_large",
+        `the run would send ${chars} characters, projected to store about ${projected} bytes; one rulebook version may store at most ${MAX_STORED_BYTES}. Split the route's sources into smaller rulebooks.`
+      );
     }
   }
 

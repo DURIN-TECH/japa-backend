@@ -636,7 +636,9 @@ service cloud.firestore {
     //    metadata of its immutable text snapshots (issue #39). Admins read
     //    the registry via GET /admin/guidance-sources. Do NOT add a match.
     //  - visaRubrics/{routeKey} and its rubricVersions/{version}
-    //    subcollection, and rubricExtractionRuns/{runId}: rubrics extracted
+    //    subcollection (with, for a large version, its
+    //    rubricVersions/{version}/rubricVersionParts/{n} parts, issue #278),
+    //    and rubricExtractionRuns/{runId}: rubrics extracted
     //    from caseworker guidance, staged `pending_review` for an admin, and
     //    the record of each extraction run (issue #40). Consumers only ever
     //    get an APPROVED version, through the backend. Do NOT add a match.

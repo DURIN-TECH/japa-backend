@@ -110,6 +110,9 @@ const SUBCOLLECTIONS: [string, string, string][] = [
   ["rubricExtractionJobs", "seed", "stepParts"],
 ];
 
+/** (#278) A part of a large rubric version (two levels under visaRubrics). */
+const RUBRIC_PART_PATH = "visaRubrics/seed/rubricVersions/seed/rubricVersionParts/0";
+
 /** Who is asking. `uid` is the owner id seeded on documents so "own data" is tried too. */
 const ACTORS: { name: string; claims: Record<string, unknown> | null }[] = [
   { name: "signed-out", claims: null },
@@ -132,6 +135,8 @@ before(async () => {
     const owned = { userId: UID, uid: UID, applicationId: "app-1", agencyId: "agency-1", a: 1 };
     for (const c of COLLECTIONS) await db.collection(c).doc("seed").set(owned);
     for (const [c, id, sub] of SUBCOLLECTIONS) await db.collection(c).doc(id).collection(sub).doc("seed").set(owned);
+    // (#278) The parts of a large rubric version, one level deeper.
+    await db.doc(RUBRIC_PART_PATH).set(owned);
   });
 });
 
@@ -160,9 +165,15 @@ describe("backend-only collections are denied to every client role", () => {
         observed[`${c}/${sub} update`] = await isDenied(col.doc("seed").update({ a: 2 }));
         observed[`${c}/${sub} delete`] = await isDenied(col.doc("seed").delete());
       }
+      // (#278) The parts of a large rubric version: denied like their parent.
+      observed["rubricVersionParts get"] = await isDenied(db.doc(RUBRIC_PART_PATH).get());
+      observed["rubricVersionParts list"] = await isDenied(db.doc(RUBRIC_PART_PATH).parent.get());
+      observed["rubricVersionParts create"] = await isDenied(db.doc(RUBRIC_PART_PATH.replace(/0$/, "new")).set({ a: 1 }));
+      observed["rubricVersionParts update"] = await isDenied(db.doc(RUBRIC_PART_PATH).update({ a: 2 }));
+      observed["rubricVersionParts delete"] = await isDenied(db.doc(RUBRIC_PART_PATH).delete());
       // Collection-group reads must not be a side door either.
       // (`messages` is left out: that name is shared with the user-facing conversations rules.)
-      for (const sub of ["proposedActions", "rubricVersions", "events", "steps", "stepParts"]) {
+      for (const sub of ["proposedActions", "rubricVersions", "rubricVersionParts", "events", "steps", "stepParts"]) {
         observed[`group ${sub}`] = await isDenied(db.collectionGroup(sub).get());
       }
       const leaks = Object.entries(observed).filter(([, denied]) => !denied).map(([k]) => k);

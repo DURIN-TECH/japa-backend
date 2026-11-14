@@ -1148,10 +1148,16 @@ export class RubricReviewService {
       rubricStore.listHeads(),
     ]);
     const headByRoute = new Map(heads.map((h) => [h.routeKey, h]));
-    return snap.docs.map((d) => {
-      const rubric = d.data() as VisaRubric;
-      return toListItem(rubric, headByRoute.get(rubric.routeKey) ?? null);
-    });
+    // (#278) A large version's document is only its header: its criteria,
+    // flags and passages (which the list counts) are read back from its parts.
+    // A single-document version is used as it is (no extra read).
+    return Promise.all(
+      snap.docs.map(async (d) => {
+        const header = d.data() as VisaRubric;
+        const rubric = await rubricStore.readVersionData(header.routeKey, header.version, header);
+        return toListItem(rubric, headByRoute.get(rubric.routeKey) ?? null);
+      })
+    );
   }
 
   // ---------- Stale citations ----------
@@ -1591,7 +1597,10 @@ export class RubricReviewService {
       // ======== READS (all before any write) ========
       const [versionSnap, headSnap] = await Promise.all([tx.get(versionRef), tx.get(headRef)]);
       if (!versionSnap.exists || !headSnap.exists) throw notFound();
-      const rubric = versionSnap.data() as VisaRubric;
+      // (#278) The whole version, read inside this transaction: a large
+      // version's criteria and flags live in part documents beside the header.
+      // Only REVIEW fields are written below, and they live on the header.
+      const rubric = await rubricStore.readVersionDataInTx(tx, routeKey, version, versionSnap.data());
       const head = headSnap.data() as RubricHead;
 
       // ---- one decision per version ----

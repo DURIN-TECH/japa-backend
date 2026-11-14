@@ -312,6 +312,8 @@ export async function installRubricFakes(): Promise<void> {
   firebase.collections.appConfig = fakeCollection("appConfig");
   firebase.subcollections.guidanceSnapshots = (id: string) => fakeCollection(`guidanceSources/${id}/snapshots`);
   firebase.subcollections.rubricVersions = (key: string) => fakeCollection(`visaRubrics/${key}/rubricVersions`);
+  // (#278) The parts of a large version (read back by the store's dual read).
+  firebase.subcollections.rubricVersionParts = (key: string, version: number) => fakeCollection(`visaRubrics/${key}/rubricVersions/${version}/rubricVersionParts`);
   firebase.subcollections.visaTypes = (cc: string) => fakeCollection(`countries/${cc}/visaTypes`);
 }
 
