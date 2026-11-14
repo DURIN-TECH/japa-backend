@@ -1738,7 +1738,17 @@ export class RubricReviewService {
       // ======== WRITES ========
       // 1. The version: review fields only.
       //    The admin-set fields go in the same write, only when sent.
-      tx.update(versionRef, reviewFieldsUpdate({ reviewStatus: "approved", intentPolarity: input.intentPolarity, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter, ...adminSetOf(input), ...plannerFields }));
+      //    (#278) Through the store, so a near-limit version stored as one
+      //    document is moved into header + parts in this same transaction
+      //    instead of overflowing 1 MiB with the added plan / repairs.
+      rubricStore.writeReviewUpdateInTx(
+        tx,
+        routeKey,
+        version,
+        versionSnap.data(),
+        rubric,
+        reviewFieldsUpdate({ reviewStatus: "approved", intentPolarity: input.intentPolarity, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter, ...adminSetOf(input), ...plannerFields }) as Record<string, unknown>
+      );
       // 2. The version it replaces: marked superseded (it stays `approved`
       //    as a record, but the head no longer points at it).
       if (supersededRef && supersededSnap?.exists) {

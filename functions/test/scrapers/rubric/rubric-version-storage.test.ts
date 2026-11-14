@@ -338,3 +338,52 @@ describe("extraction", () => {
     assert.equal(jh.calls.length, callsPaid, "no model call was paid for twice");
   });
 });
+
+// ============================================
+// 6. A decision on a near-limit single-document version (#278 follow-up)
+// ============================================
+
+describe("review update on a version stored the old way", () => {
+  /** Apply one review update through the store, in a fake transaction; returns how it was written. */
+  async function applyUpdate(update: Record<string, unknown>): Promise<"updated" | "split"> {
+    return fakeRunTransaction(async (tx: any) => {
+      const snap = await tx.get(fakeCollection(`visaRubrics/${KEY_A}/rubricVersions`).doc("1"));
+      const full = await rubricStore.readVersionDataInTx(tx, KEY_A, 1, snap.data());
+      return rubricStore.writeReviewUpdateInTx(tx, KEY_A, 1, snap.data(), full, update);
+    });
+  }
+
+  test("a small single document takes a plain update (unchanged behaviour)", async () => {
+    const hash = await seedA();
+    store.set(versionPath(KEY_A, 1), { ...routeAV1(hash), version: 1 } as any);
+    assert.equal(await applyUpdate({ reviewStatus: "approved", revision: 1 }), "updated");
+    assert.equal((store.get(versionPath(KEY_A, 1)) as any).reviewStatus, "approved");
+    assert.deepEqual(partPaths(KEY_A, 1), []);
+  });
+
+  test("a near-limit single document that the update would push over is rewritten as header + parts, content unchanged", async () => {
+    const hash = await seedA();
+    const legacy = { ...routeAV1(hash), version: 1, discarded: bigDiscards(1_100), discardedCount: 1_100 } as any;
+    assert.ok(firestoreDocSize(versionPath(KEY_A, 1), legacy) > INLINE_MAX_BYTES && firestoreDocSize(versionPath(KEY_A, 1), legacy) < ONE_MIB);
+    store.set(versionPath(KEY_A, 1), legacy);
+    const questionPlan = { algorithmVersion: "v", order: Array.from({ length: 2_000 }, (_, i) => `question_${i}`) };
+    assert.equal(await applyUpdate({ reviewStatus: "approved", revision: 1, questionPlan }), "split");
+    const header = store.get(versionPath(KEY_A, 1)) as any;
+    assert.equal(header.reviewStatus, "approved");
+    assert.equal(header.questionPlan.order.length, 2_000);
+    assert.equal(header.discarded, undefined);
+    assert.ok(partPaths(KEY_A, 1).length >= 2);
+    const read = await rubricStore.getVersionForReview(KEY_A, 1);
+    assert.deepEqual(read?.discarded, legacy.discarded);
+    assert.deepEqual(read?.criteria, legacy.criteria);
+    assert.equal(read?.sourceSetHash, legacy.sourceSetHash);
+  });
+
+  test("a version already in parts takes the update on its header; the parts are untouched", async () => {
+    const hash = await seedA();
+    await rubricStore.writePendingVersion(bigDraft(hash), [SOURCE_A_ID]);
+    const before = partPaths(KEY_A, 1).map((p) => JSON.stringify(store.get(p)));
+    assert.equal(await applyUpdate({ reviewStatus: "approved", revision: 1 }), "updated");
+    assert.deepEqual(partPaths(KEY_A, 1).map((p) => JSON.stringify(store.get(p))), before);
+  });
+});

@@ -3,7 +3,7 @@ import { collections, db, subcollections } from "../../utils/firebase";
 import type { RubricExtractionRun, RubricHead, VisaRubric } from "../../types/rubric";
 import { applyExclusions } from "./rubric-exclusions";
 import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, withKeyParts } from "./rubric-key";
-import { VersionPartsError, VersionTooLargeError, assembleVersion, isPartitioned, layoutVersion, type VersionPartDoc } from "./rubric-version-storage";
+import { INLINE_MAX_BYTES, VersionPartsError, VersionTooLargeError, assembleVersion, firestoreDocSize, isPartitioned, layoutVersion, type VersionPartDoc } from "./rubric-version-storage";
 
 // ============================================
 // RUBRIC — FIRESTORE STORE (issue #40)
@@ -235,6 +235,61 @@ export class RubricStore {
     const snaps: DocumentSnapshot[] = [];
     for (let i = 0; i < data.contentStorage.partCount; i++) snaps.push(await tx.get(col.doc(String(i))));
     return assembleOrThrow(routeKey, version, data, snaps);
+  }
+
+  /**
+   * (#278) Apply a decision's REVIEW-field update to a version, inside the
+   * decision's transaction, without ever overflowing the 1 MiB document.
+   *
+   * An approval ADDS fields to the version document (the question plan, rule
+   * repairs, layer conflicts). On a version stored before #278 as one document
+   * close to the limit (Student v1, Skilled Worker v1 on dev), a plain update
+   * would push it over and the whole approval would fail. So:
+   *  - a version already in parts: the update goes on its header, as before
+   *    (the content arrays are not on the header, so it has room);
+   *  - a single-document version that stays at or under `INLINE_MAX_BYTES`
+   *    with the update: a plain update, exactly as before;
+   *  - a single-document version that would grow past that: it is REWRITTEN as
+   *    header + parts in this same transaction, with the update applied to the
+   *    header. The content is the stored content, unchanged (`full` is what
+   *    `readVersionDataInTx` read in this transaction); only its layout moves.
+   *    The version-created trigger does not fire (the document already exists).
+   *
+   * @param storedData the version document's data as read in `tx`.
+   * @param full the whole version as read in `tx` (`readVersionDataInTx`).
+   * @param update review fields only (the caller has checked them).
+   * @returns how it was written.
+   * @throws RubricStoreError("too_large") when even parts cannot hold it.
+   */
+  writeReviewUpdateInTx(tx: Transaction, routeKey: string, version: number, storedData: unknown, full: VisaRubric, update: Record<string, unknown>): "updated" | "split" {
+    const versionRef = subcollections.rubricVersions(routeKey).doc(String(version));
+    if (isPartitioned(storedData)) {
+      tx.update(versionRef, update);
+      return "updated";
+    }
+    // The document as it would be after the update (undefined fields are not stored).
+    const merged: Record<string, unknown> = { ...(full as unknown as Record<string, unknown>) };
+    for (const [k, v] of Object.entries(update)) if (v !== undefined) merged[k] = v;
+    if (firestoreDocSize(versionRef.path, merged) <= INLINE_MAX_BYTES) {
+      tx.update(versionRef, update);
+      return "updated";
+    }
+    let layout;
+    try {
+      layout = layoutVersion(merged as unknown as VisaRubric, versionRef.path);
+    } catch (err) {
+      if (err instanceof VersionTooLargeError) throw new RubricStoreError("too_large", `rubric version ${routeKey}/${version} cannot take this decision: ${err.message}`);
+      throw err;
+    }
+    // Over INLINE_MAX_BYTES always lays out as parts; the inline branch is a guard only.
+    if (layout.kind === "inline") {
+      tx.update(versionRef, update);
+      return "updated";
+    }
+    tx.set(versionRef, layout.header);
+    const parts = subcollections.rubricVersionParts(routeKey, version);
+    for (const part of layout.parts) tx.set(parts.doc(String(part.index)), part as unknown as Record<string, unknown>);
+    return "split";
   }
 
   /**

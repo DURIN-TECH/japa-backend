@@ -35,6 +35,8 @@ import { DEFAULT_CONFIG } from "../../../src/scrapers/shared/alerts/scrape-alert
 import { RUBRIC_SYSTEM_ACTOR_ID, type RubricDiscard } from "../../../src/types/rubric";
 import { A_TEXT, ROUTE_A, SOURCE_A_ID, SOURCE_A_URL } from "./fixtures/synthetic-guidance";
 import { KEY_A, REVIEW_T0, routeAV1 } from "./rubric-review-fixtures";
+import { firestoreDocSize } from "../../../src/scrapers/rubric/rubric-version-storage";
+import { QUESTION_PLAN_ALGORITHM_VERSION } from "../../../src/scrapers/rubric/rubric-question-plan";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -147,6 +149,63 @@ suite("rubric versions over 1 MiB on the Firestore emulator (issue #278)", () =>
     assert.equal(read?.criteria.length, 4);
     const list = await service.listVersions({ reviewStatus: "pending_review", limit: 10 });
     assert.equal(list[0].criterionCount, 4);
+  });
+
+  test("publishing a NEAR-LIMIT version stored the old way (one document, like Skilled Worker v1) moves it into parts in the same transaction instead of failing", async () => {
+    await seedSource();
+    // A pre-#278 single document just under 1 MiB (Student v1 is ~1.04 MB).
+    const path = `visaRubrics/${KEY_A}/rubricVersions/1`;
+    const base = { ...routeAV1(HASH), version: 1, authorityId: ROUTE_A.countryCode, routeSlug: ROUTE_A.visaTypeId } as any;
+    let n = 0;
+    while (firestoreDocSize(path, { ...base, discarded: bigDiscards(n + 50), discardedCount: n + 50 }) < 1_042_000) n += 50;
+    const legacy = { ...base, discarded: bigDiscards(n), discardedCount: n };
+    await db.doc(path).set(legacy);
+    await db.doc(`visaRubrics/${KEY_A}`).set({ routeKey: KEY_A, countryCode: ROUTE_A.countryCode, visaTypeId: ROUTE_A.visaTypeId, authorityId: ROUTE_A.countryCode, routeSlug: ROUTE_A.visaTypeId, approvedVersion: null, latestVersion: 1, latestSourceSetHash: legacy.sourceSetHash, sourceIds: [SOURCE_A_ID], createdAt: NOW, updatedAt: NOW });
+
+    // The question plan an approval writes: ~15 KB, enough to cross 1 MiB.
+    const questionPlan = {
+      algorithmVersion: QUESTION_PLAN_ALGORITHM_VERSION,
+      omittedQuestions: [],
+      omittedEvidence: [],
+      droppedWithDependents: { questionIds: Array.from({ length: 600 }, (_, i) => `q_padding_question_${String(i).padStart(4, "0")}`), evidenceKeys: [] },
+      merges: [],
+      proposedConditions: [],
+      order: [],
+      sizing: { total: 0, unconditional: 0, deciding: 0, best: 0, typical: 0, worst: 0, exact: true, samples: 0 },
+      check: null,
+    };
+    // The scenario is real: a plain update of that document is refused by Firestore.
+    await assert.rejects(db.doc(path).update({ questionPlan }), /exceeds the maximum allowed size|too large|INVALID_ARGUMENT/i);
+
+    const auto = new RubricAutoPublishService({
+      review: service,
+      loadSettings: async () => ({ settings: { ...DEFAULT_PUBLISH_SETTINGS, mode: "auto" }, exists: true, problems: [] }),
+      checker: { check: async () => ({ ok: true, leftOut: [], resolvedFlagCodes: [], intentPolarity: "immigrant_intent_penalised" }) },
+      planner: { plan: async () => ({ ok: true, reviewFields: { questionPlan } }) },
+      raiseAlerts: async () => [],
+      loadAlertConfig: async () => DEFAULT_CONFIG,
+      now: () => NOW,
+      appUrl: () => "https://portal.test",
+    } as any);
+    // The version already exists, so its created trigger is not what runs this: the hourly retry or
+    // `publish:rubric` calls the same pipeline. Here it is called directly.
+    const report = await auto.onVersionCreated(KEY_A, 1);
+    assert.equal(report?.outcome, "published", JSON.stringify(report?.reasonCodes));
+
+    // Now header + parts, approved, with the plan on the header.
+    const header = (await db.doc(path).get()).data() as any;
+    assert.equal(header.reviewStatus, "approved");
+    assert.equal(header.contentStorage?.layout, "parts");
+    assert.equal(header.discarded, undefined);
+    assert.equal(header.questionPlan.droppedWithDependents.questionIds.length, 600);
+    // The content is unchanged: same counts, same items, same hashes.
+    const served = await rubricStore.getVersionForReview(KEY_A, 1);
+    assert.ok(served);
+    assert.equal(served.sourceSetHash, legacy.sourceSetHash);
+    assert.equal(served.discarded.length, n);
+    assert.deepEqual(plain(served.discarded), plain(legacy.discarded));
+    assert.deepEqual(plain(served.criteria), plain(legacy.criteria));
+    assert.equal((await rubricStore.getApprovedRubric(ROUTE_A.countryCode, ROUTE_A.visaTypeId))?.version, 1);
   });
 
   test("the automatic publisher's gates and the shared approval transaction publish a split version, and consumers get it whole", async () => {
