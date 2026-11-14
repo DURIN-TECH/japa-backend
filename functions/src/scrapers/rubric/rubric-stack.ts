@@ -2,6 +2,8 @@ import type { AssessmentCriterion, EvidenceItem, IntakeQuestion, IntentPolarity,
 import type { RouteLayer } from "../../types/shared-route";
 import { keyFieldsOf, rulebookTargetOfKey } from "./rubric-key";
 import { planStack, type StackPlanProblem } from "./rubric-question-plan";
+// (P4b) The same code guards the layer check applied, re-checked at merge time against the twin as served now.
+import { linkRefusal } from "./rubric-layer-check";
 import { rubricStore } from "./rubric.store";
 
 // ============================================
@@ -48,19 +50,26 @@ import { rubricStore } from "./rubric.store";
 //     refused by the stack plan (rubric-question-plan.ts `planStack`), and an
 //     unusable stack is reported with the problems.
 //
-// SEAMS LEFT FOR P4b (not built here):
-//  - `restates`: a national rule that repeats a shared one is linked to it and
-//    asked / assessed once. Until then a repeated rule simply appears in both
-//    layers (shown twice, harmless but visible). The merge is where a link
-//    would be honoured (skip the restating rule's question, point its reads at
-//    the shared twin's).
+// P4b (this file's part): THE LAYER CHECK'S RESULTS ARE HONOURED HERE
+//  - `restates` (rubric-layer-check.ts): a national rule the layer check linked
+//    to a shared twin is FOLDED into it in the merged view: the national rule
+//    leaves `criteria` and is listed on its twin's `restatedBy` with its own
+//    verbatim quote and URL; references to it (questions, document items,
+//    evidence helps) point at the twin; a question that only the folded rule
+//    asked, and that nothing else reads, is not asked again. So the applicant
+//    is asked and assessed ONCE, under the shared rule. The stored national
+//    version is never changed. A link is honoured only while the twin is still
+//    served with exactly the quote that was compared AND the code guards still
+//    hold against the twin as served now (`linkRefusal`); otherwise the two
+//    rules simply both appear (duplicated: harmless but visible). No link (the
+//    check did not run, or found no repeat) = both appear, as before.
 //  - `layerConflicts`: both rules of a disagreeing pair stay in the merged view
-//    already, so "show both, the stricter result decides" holds today for any
-//    pass / fail rule (a failed rule in EITHER layer fails the application).
-//    P4b adds the flag on the national version and the admin review data.
+//    and are both assessed, so a failure of EITHER fails the application (the
+//    stricter result decides). Each is tagged `layerConflictWith` (the other's
+//    served id) so a reader can show both together. Nothing decides on it.
 //  - Fan-out when a shared layer publishes (bulk re-assessment queue and
-//    rule-change alerts): see the seams in services/ai-bulk-reassessment.service.ts
-//    and services/rule-change-alerts.service.ts.
+//    rule-change alerts) is in services/ai-bulk-reassessment.service.ts and
+//    services/rule-change-alerts.service.ts.
 //
 // Nothing here names a country, bloc, treaty or nationality: ids are data.
 
@@ -180,6 +189,99 @@ function unionOf<T>(lists: readonly (readonly T[] | undefined)[]): T[] {
   return out;
 }
 
+// ============================================
+// The layer check's links and conflicts (P4b, pure)
+// ============================================
+
+/** The merged lists the layer check's results are applied to. */
+interface MergedLists {
+  criteria: AssessmentCriterion[];
+  intakeQuestions: IntakeQuestion[];
+  evidenceItems: EvidenceItem[];
+  evidenceHelpsCriterionIds: string[] | undefined;
+}
+
+/**
+ * The `restates` links of the own layer that can be honoured on THIS stack:
+ * the own rule is served, its twin is served by an approved shared layer of the
+ * stack with exactly the quote that was compared, and the code guards still
+ * hold against the twin as served now. Returns own id -> twin's served id.
+ */
+export function honouredLinks(own: VisaRubric | null, lists: Pick<MergedLists, "criteria">, ownKey: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const links = own?.layerCheck?.status === "checked" ? own.layerCheck.restates ?? [] : [];
+  if (links.length === 0) return out;
+  const byId = new Map(lists.criteria.map((c) => [c.criterionId, c]));
+  for (const link of links) {
+    const ownRule = byId.get(link.criterionId);
+    const twinId = scopedId(link.sharedRulebookKey, link.sharedCriterionId);
+    const twin = byId.get(twinId);
+    if (!ownRule || ownRule.layerKey !== ownKey || !twin || twin.layerKey !== link.sharedRulebookKey) continue;
+    if ((twin.source?.quote ?? "") !== link.sharedQuote) continue; // the twin changed: never fold into a different rule
+    if (linkRefusal(ownRule, twin) !== null) continue;
+    out.set(link.criterionId, twinId);
+  }
+  return out;
+}
+
+/**
+ * Fold the honoured links and tag the conflicts (see the file header). PURE.
+ * Returns the lists unchanged (same arrays) when there is nothing to apply.
+ */
+function applyLayerResults(own: VisaRubric | null, lists: MergedLists, ownKey: string): MergedLists {
+  const fold = honouredLinks(own, lists, ownKey);
+  const conflicts = (own?.layerConflicts ?? []).filter((c) => !fold.has(c.criterionId));
+  if (fold.size === 0 && conflicts.length === 0) return lists;
+  const mapId = (id: string): string => fold.get(id) ?? id;
+  const mapIds = (ids: readonly string[]): string[] => [...new Set(ids.map(mapId))];
+
+  // ---- criteria: the folded rules leave; their twins list them; conflicts tagged ----
+  const folded = new Map(lists.criteria.filter((c) => fold.has(c.criterionId)).map((c) => [c.criterionId, c]));
+  const servedIds = new Set(lists.criteria.map((c) => c.criterionId));
+  const conflictWith = new Map<string, string[]>();
+  for (const c of conflicts) {
+    const sharedId = scopedId(c.sharedRulebookKey, c.sharedCriterionId);
+    if (!servedIds.has(c.criterionId) || !servedIds.has(sharedId)) continue;
+    conflictWith.set(c.criterionId, [...(conflictWith.get(c.criterionId) ?? []), sharedId]);
+    conflictWith.set(sharedId, [...(conflictWith.get(sharedId) ?? []), c.criterionId]);
+  }
+  const criteria: AssessmentCriterion[] = lists.criteria
+    .filter((c) => !fold.has(c.criterionId))
+    .map((c) => {
+      const restated = [...folded.values()].filter((r) => fold.get(r.criterionId) === c.criterionId);
+      const others = conflictWith.get(c.criterionId);
+      if (restated.length === 0 && !others) return c;
+      return {
+        ...c,
+        ...(restated.length > 0 ? { restatedBy: restated.map((r) => ({ rulebookKey: ownKey, criterionId: r.criterionId, title: r.title, quote: r.source?.quote ?? "", url: r.source?.url ?? "" })) } : {}),
+        ...(others ? { layerConflictWith: [...new Set(others)] } : {}),
+      };
+    });
+  if (fold.size === 0) return { ...lists, criteria };
+
+  // ---- questions: point at the twin; a question only folded rules asked, and nothing else reads, goes ----
+  const foldedIds = new Set(fold.keys());
+  // What the rules that STAY, the questions and the document items read: such a question is still asked.
+  const reads = new Set<string>();
+  for (const c of criteria) {
+    if (c.trigger) reads.add(c.trigger.questionId);
+    for (const q of c.intakeQuestionIds ?? []) reads.add(q);
+  }
+  for (const q of lists.intakeQuestions) for (const cond of q.showWhen?.anyOf ?? []) reads.add(cond.questionId);
+  for (const e of lists.evidenceItems) if (e.when) reads.add(e.when.questionId);
+  const intakeQuestions = lists.intakeQuestions
+    .filter((q) => {
+      const linked = q.criterionIds ?? [];
+      const onlyFolded = linked.length > 0 && linked.every((id) => foldedIds.has(id));
+      return !(onlyFolded && !reads.has(q.id));
+    })
+    .map((q) => (q.criterionIds ?? []).some((id) => foldedIds.has(id)) ? { ...q, criterionIds: mapIds(q.criterionIds) } : q);
+  // ---- document items: kept (a national document item is never dropped), pointed at the twin ----
+  const evidenceItems = lists.evidenceItems.map((e) => ((e.criterionIds ?? []).some((id) => foldedIds.has(id)) ? { ...e, criterionIds: mapIds(e.criterionIds) } : e));
+  const evidenceHelpsCriterionIds = lists.evidenceHelpsCriterionIds ? mapIds(lists.evidenceHelpsCriterionIds) : undefined;
+  return { criteria, intakeQuestions, evidenceItems, evidenceHelpsCriterionIds };
+}
+
 /**
  * Merge the reads of a stack into one served rubric. `reads` are in stack
  * order (shared first, own last) and must include EVERY layer, approved or not
@@ -215,9 +317,24 @@ export function mergeRulebookStack(reads: readonly StackLayerRead[]): VisaRubric
   // triggers were already applied by its own approved read, and its unofficial
   // quote translations stay with the layer (the admin review shows them per
   // version; no consumer reads them, and they are never evidence).
-  const evidenceHelps = views.some((v) => v.evidenceHelpsCriterionIds !== undefined) ? views.flatMap((v) => v.evidenceHelpsCriterionIds ?? []) : undefined;
+  const evidenceHelpsRaw = views.some((v) => v.evidenceHelpsCriterionIds !== undefined) ? views.flatMap((v) => v.evidenceHelpsCriterionIds ?? []) : undefined;
   const languages = unionOf(views.map((v) => v.sourceLanguages));
   const intake = ownView?.intake ?? views[0].intake;
+  // (P4b) EVERY rule, question and document item of every approved layer, in
+  // stack order; then the own layer's layer-check results: `restates` links
+  // folded (a repeat asked and assessed once, its quote kept on `restatedBy`)
+  // and conflicts tagged. No link = everything appears, as before.
+  const lists = applyLayerResults(
+    ownRubric,
+    {
+      criteria: views.flatMap((v) => v.criteria),
+      intakeQuestions: views.flatMap((v) => v.intakeQuestions),
+      evidenceItems: views.flatMap((v) => v.evidenceItems),
+      evidenceHelpsCriterionIds: evidenceHelpsRaw,
+    },
+    ownRead.layer.rulebookKey
+  );
+  const evidenceHelps = lists.evidenceHelpsCriterionIds;
 
   return {
     schemaVersion: base.schemaVersion,
@@ -236,11 +353,11 @@ export function mergeRulebookStack(reads: readonly StackLayerRead[]): VisaRubric
     intentPolarityProposal: null,
     severityLevels: unionOf(views.map((v) => v.severityLevels)),
     // EVERY rule, question and document item of every approved layer, in
-    // stack order. Nothing is dropped or deduplicated (P4b's `restates`).
-    criteria: views.flatMap((v) => v.criteria),
+    // stack order. Nothing is dropped; a linked repeat is folded (see above).
+    criteria: lists.criteria,
     ...(intake ? { intake } : {}),
-    intakeQuestions: views.flatMap((v) => v.intakeQuestions),
-    evidenceItems: views.flatMap((v) => v.evidenceItems),
+    intakeQuestions: lists.intakeQuestions,
+    evidenceItems: lists.evidenceItems,
     // Outcome statistics are per destination country: only the own layer's.
     ...(ownView?.outcomeStatistics ? { outcomeStatistics: ownView.outcomeStatistics } : {}),
     ...(evidenceHelps ? { evidenceHelpsCriterionIds: evidenceHelps } : {}),

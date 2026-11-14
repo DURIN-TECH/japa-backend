@@ -331,6 +331,18 @@ export interface AssessmentCriterion {
   // single-layer rulebook (every route without inheritance), so those read
   // exactly as before.
   layerKey?: string;
+  // (#233 P4b) SERVED-SIDE ONLY, never stored: on the merged view of a stack,
+  // the OWN-layer rules folded into this SHARED rule because the layer check
+  // found they state the same requirement (`restates`). Each keeps its own
+  // verbatim quote and URL here, so nothing the national page says is lost;
+  // the applicant is asked and assessed once, under this rule.
+  restatedBy?: RestatedByEntry[];
+  // (#233 P4b) SERVED-SIDE ONLY, never stored: on the merged view of a stack,
+  // the ids (as served) of the rules in ANOTHER layer that the layer check
+  // found DISAGREE with this one on the same subject. Both rules stay and are
+  // both assessed, so a failure of either fails the application (the stricter
+  // result decides). Informational: nothing reads it to decide anything.
+  layerConflictWith?: string[];
   // Links to an existing EligibilityQuestion (types/eligibility.ts).
   eligibilityQuestionId?: string;
   // Ids of the rubric's intake questions whose answers this criterion reads.
@@ -600,6 +612,86 @@ export interface RulebookStackLayer {
   version: number | null;
 }
 
+// ============================================
+// (#233 P4b) The layer check: a country's own layer against its shared layer(s)
+// ============================================
+//
+// After a country's OWN layer drafts (and before the automatic approval), an
+// independent model compares each of its rules with the rules of the shared
+// layer(s) the route inherits, ON THE SAME SUBJECT (scrapers/rubric/rubric-layer-check.ts).
+// Its evidence is always the two verbatim quotes; it never writes or changes a
+// rule. What it found is written with the approval as two review fields:
+//   - `layerCheck`      the record of the run (status, spend, links, refusals);
+//   - `layerConflicts`  every disagreement, both quotes and URLs, for the admin.
+// Neither ever blocks publishing.
+
+/** A shared-layer rule that an own-layer rule restates (a `restates` link, recorded on the own version). */
+export interface RestatesLink {
+  // The own layer's rule (its id as stored on the own version).
+  criterionId: string;
+  // The shared twin: which layer, which version, which rule (its id as the SHARED layer stores it, unscoped).
+  sharedRulebookKey: string;
+  sharedVersion: number;
+  sharedCriterionId: string;
+  // The twin's verbatim quote as compared. The merge honours the link only
+  // while the served shared rule still has exactly this quote, so a link can
+  // never silently point at a different rule after the shared layer changes.
+  sharedQuote: string;
+}
+
+/** One own-layer rule folded into a shared rule on the merged view (see AssessmentCriterion.restatedBy). */
+export interface RestatedByEntry {
+  rulebookKey: string;
+  criterionId: string;
+  title: string;
+  // The own rule's own verbatim quote and URL, kept on the record.
+  quote: string;
+  url: string;
+}
+
+/** A disagreement between an own-layer rule and a shared-layer rule on the same subject. */
+export interface LayerConflict {
+  // The own layer's rule: id, title, verbatim quote and URL.
+  criterionId: string;
+  title: string;
+  quote: string;
+  url: string;
+  // The shared layer's rule: which layer and version, and its id, title, verbatim quote and URL.
+  sharedRulebookKey: string;
+  sharedVersion: number;
+  sharedCriterionId: string;
+  sharedTitle: string;
+  sharedQuote: string;
+  sharedUrl: string;
+}
+
+/** The record of one layer check, written on the own version with the approval. */
+export interface LayerCheckRecord {
+  // `checked`: the check ran over every rule. `not_checked`: it could not run
+  // (`reason` says why: capped, provider error, unusable answer, no shared
+  // layer approved). A `not_checked` record links NOTHING (duplicates stay).
+  status: "checked" | "not_checked";
+  reason: string | null;
+  promptVersion: string;
+  model: string | null;
+  // The shared layers compared against, with the approved version of each.
+  sharedLayers: { rulebookKey: string; version: number }[];
+  ownRulesChecked: number;
+  sharedRulesChecked: number;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  // The links made (only on a confident `same_requirement` answer that also
+  // passed the code guards).
+  restates: RestatesLink[];
+  // A `same_requirement` answer code refused to turn into a link, with why
+  // (a different kind of rule, a different check, two twins, ...). The rules stay duplicated.
+  refusedLinks: { criterionId: string; sharedRulebookKey: string; sharedCriterionId: string; reason: string }[];
+  // Pairs the model could not judge (`unsure`): recorded, nothing linked.
+  unsure: { criterionId: string; sharedRulebookKey: string; sharedCriterionId: string }[];
+  conflictCount: number;
+}
+
 /**
  * (#233) The key fields every rulebook document carries (head, version,
  * extraction run, publish run). `routeKey` is the document key
@@ -692,6 +784,15 @@ export interface VisaRubric extends RulebookKeyFields {
   // exactly what the check verified, and the original stays in `criteria` as
   // the audit trail. Never extracted, never client-visible. Absent = none.
   ruleRepairs?: RubricRuleRepair[];
+  // (#233 P4b) Written with the AUTOMATIC approval of a country's OWN layer
+  // when its route inherits a shared layer: the record of the layer check
+  // (status, spend, `restates` links). Absent on a single-layer route and on a
+  // shared layer, so those are exactly as before. Never extracted.
+  layerCheck?: LayerCheckRecord;
+  // (#233 P4b) Written with it: every disagreement the layer check found
+  // between this layer's rules and the shared layer's on the same subject, both
+  // quotes and URLs. Shown in the admin review data; never blocks publishing.
+  layerConflicts?: LayerConflict[];
 
   // ---- provenance (immutable) ----
   // (#233) SERVED-SIDE ONLY, never stored: present on the MERGED view of a
@@ -814,6 +915,9 @@ export const RUBRIC_REVIEW_FIELDS = [
   "questionPlan",
   // (#223) the automatic approval's recorded replacements of repaired protected rules.
   "ruleRepairs",
+  // (#233 P4b) the automatic approval's layer check of an own layer against its shared layer(s).
+  "layerCheck",
+  "layerConflicts",
 ] as const;
 
 // ============================================
