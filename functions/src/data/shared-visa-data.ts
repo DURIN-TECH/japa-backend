@@ -107,6 +107,32 @@ export const SHARED_VISA_DATA: unknown = {
       destinations: { mode: "members_of", authorityId: "schengen-area" },
       // The Netherlands short-stay record is assessed against the shared rulebook.
       inheritedBy: [{ countryCode: "NL", visaTypeId: "nl-visitor" }],
+      // ---- The route's government fee (issue #299) ----
+      // Read on 2026-11-14 from the dev project (durin-seli-dev), not typed
+      // from memory:
+      //   - `quote` is the `source.quote` of rule crit_1cd0c13dfe34a0ff in the
+      //     published shared rulebook
+      //     visaRubrics/schengen-area_schengen-area-short-stay/rubricVersions/1,
+      //     copied word for word. `amount` and `currency` are the figure that
+      //     sentence states.
+      //   - `url` is the `url` of the stored official source
+      //     guidanceSources/<guidanceSourceId> (the Visa Code, consolidated
+      //     text of 28 June 2024). Owner decision on #299: the source's own
+      //     registered https address is recorded, NOT the rule's `source.url`,
+      //     which is the same document's address after the publisher's
+      //     redirect and is plain http (refused by the validator).
+      // The seed converts the figure to USD with the stored exchange rate and
+      // writes it on every record under `inheritedBy` (seed-sourced-fee.ts).
+      fee: {
+        amount: 90,
+        currency: "EUR",
+        // The quote's own name for it.
+        label: "Visa fee",
+        quote: "Applicants shall pay a visa fee of EUR 90.",
+        url: "https://publications.europa.eu/resource/celex/02009R0810-20240628",
+        guidanceSourceId: "schengen-area-visa-code-regulation-ec-no-810-2009-consolidated-text-of-28-june-2024",
+        ruleRef: { routeKey: "schengen-area_schengen-area-short-stay", version: 1, criterionId: "crit_1cd0c13dfe34a0ff" },
+      },
     },
   ],
 };
