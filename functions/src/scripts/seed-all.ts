@@ -126,7 +126,7 @@ async function main() {
     const portal = await seedPortalData();
 
     // 2. Eligibility questions — static question/exemption data for the
-    //    Nigeria → Ireland flow. Independent of portal data.
+    //    Nigeria → Ireland flow (the exemption row was retired in #239). Independent of portal data.
     console.log("→ Seeding eligibility questions...");
     const eligibility = await seedNigeriaIrelandEligibility();
 
@@ -193,7 +193,6 @@ async function main() {
     console.log(`  - Bank accounts:   ${portal.bankAccounts}`);
     console.log("Eligibility:");
     console.log(`  - Questions:       ${eligibility.questionsSeeded}`);
-    console.log(`  - Exemptions:      ${eligibility.exemptionsSeeded}`);
     console.log("News:");
     console.log(`  - Sources:         ${newsCount}`);
     console.log("Visa catalog:");

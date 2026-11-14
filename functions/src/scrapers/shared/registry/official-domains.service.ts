@@ -81,7 +81,10 @@ type StoredOfficialDomain = Omit<OfficialDomain, "authorityId"> & { authorityId?
 export function officialDomainAuthorityId(raw: unknown): string {
   const d = (raw ?? {}) as { authorityId?: unknown; countryCode?: unknown };
   if (typeof d.authorityId === "string" && d.authorityId) return d.authorityId;
-  // TODO(#239): delete this legacy branch after the officialDomains migration.
+  // TODO(#239): delete this legacy branch after the officialDomains migration
+  // (scripts/migrate-shared-visa-model.ts) has run on EVERY environment that
+  // holds old docs. Kept for now: the code deploys before the script runs, and
+  // without this branch an old doc matches no authority (the crawl fails closed).
   if (typeof d.countryCode === "string" && d.countryCode) return d.countryCode;
   return "";
 }
