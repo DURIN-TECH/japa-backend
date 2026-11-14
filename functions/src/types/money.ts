@@ -29,8 +29,13 @@ export interface Money {
   currency: CurrencyCode;
 }
 
-/** Where an exchange rate came from. `manual` = an admin-entered override. */
-export type FxRateSource = "cbn" | "oanda" | "manual";
+/**
+ * Where an exchange rate came from. `manual` = an admin-entered override.
+ * `hold` (issue #241) = an admin-held (pinned) rate that outranks the provider
+ * and any override until it expires; a charge snapshot priced with it records
+ * `fxRateSource: "hold"`, so the charge shows the rate was held.
+ */
+export type FxRateSource = "cbn" | "oanda" | "manual" | "hold";
 
 /**
  * A usable exchange rate: how many units of `currency` equal 1 US dollar

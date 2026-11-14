@@ -38,7 +38,7 @@ export function memoryRateStore(): RateStore & { docs: Map<string, StoredRate>; 
       if (!sameProviderState(docs.get(c) ?? null, expected)) return { saved: false };
       const current = docs.get(c) ?? blank(c);
       docs.set(c, { ...current, provider, lastError: null });
-      return { saved: true, override: current.override };
+      return { saved: true, override: current.override, hold: current.hold ?? null };
     },
     async saveError(c, error) {
       docs.set(c, { ...(docs.get(c) ?? blank(c)), lastError: error });
@@ -50,6 +50,7 @@ export function memoryRateStore(): RateStore & { docs: Map<string, StoredRate>; 
       const m = decide(current ? { ...current } : null);
       const next: StoredRate = { ...(current ?? blank(c)) };
       if (m.override !== undefined) next.override = m.override;
+      if (m.hold !== undefined) next.hold = m.hold; // issue #241
       // Like Firestore: dropping the provider map also clears providerCorrupt
       // (that flag is derived from the map being present but unreadable).
       if (m.clearProvider) {
@@ -58,6 +59,7 @@ export function memoryRateStore(): RateStore & { docs: Map<string, StoredRate>; 
       }
       docs.set(c, next);
       audit.push(m.audit);
+      for (const extra of m.extraAudits ?? []) audit.push(extra); // issue #241
     },
     async appendAudit(entry) {
       audit.push(entry);

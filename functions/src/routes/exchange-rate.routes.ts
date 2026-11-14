@@ -16,6 +16,8 @@ import { getCurrencyInfo } from "../money/currencies";
 //   POST   /admin/exchange-rates/:currency/reset-reference  admin: accept a large provider move { reason }
 //   POST   /admin/exchange-rates/:currency/refresh          admin: refresh from the provider now { reason? }
 //                                                           (issue #214; audited; 1 per currency per 5 min, else 429)
+//   PUT    /admin/exchange-rates/:currency/hold   admin: hold (pin) the rate { rate, reason, ttlHours } (issue #241)
+//   DELETE /admin/exchange-rates/:currency/hold   admin: clear the hold { reason } (issue #241)
 //
 // The factories take the RateService so tests can mount them on a fake.
 
@@ -62,7 +64,8 @@ export interface PublicRatesRouterOptions {
  * units per 1 USD), its asOf, the minor-unit exponent for display and an
  * `available` flag. NOT exposed: margin, source (it would reveal a manual
  * override), override reason/author, audit, errors, or anything per-agency or
- * per-user. No auth, and a short public cache so mobile/web can show local
+ * per-user. A held rate (issue #241) is shown simply as the rate: nothing says
+ * it is held. No auth, and a short public cache so mobile/web can show local
  * amounts without hammering the API.
  */
 export function createPublicRatesRouter(service: RateService, opts: PublicRatesRouterOptions = {}): Router {
@@ -73,7 +76,8 @@ export function createPublicRatesRouter(service: RateService, opts: PublicRatesR
   // The route is unauthenticated and each uncached request costs one config
   // read plus one read per currency, so the built body is kept for `cacheMs`.
   // It is dropped at once when THIS instance changes a rate (override set or
-  // cleared, reference reset, refresh): `service.changeVersion` moves on.
+  // cleared, hold set or cleared (#241), reference reset, refresh):
+  // `service.changeVersion` moves on.
   // Other instances pick the change up when their cache expires (60s at most).
   // Only successful bodies are cached; an error is never served from cache.
   let cached: { at: number; version: number; body: { base: string; currencies: unknown[] } } | null = null;
@@ -162,6 +166,39 @@ export function createAdminExchangeRateRouter(service: RateService): Router {
       const uid = (req as AuthenticatedRequest).userId as string;
       const outcome = await service.refreshNow(req.params.currency, body.reason, uid);
       sendSuccess(res, outcome, outcome.ok ? "Rate refreshed" : "Refresh failed; the stored rate is unchanged");
+    } catch (err) {
+      sendMoneyError(res, err);
+    }
+  });
+
+  // ---------- hold (issue #241) ----------
+  // Pin a currency's rate while the provider lags (e.g. CBN behind a real
+  // devaluation). Same gate as every admin route; the service validates
+  // (plausible range, reason 5-500, ttlHours 1-168, no corrupt provider map)
+  // and writes the hold with its audit entry in one transaction. Registered
+  // as `/:currency/hold`, which `/:currency` never matches (a param stops at
+  // a slash), so the override routes are unaffected.
+  router.put("/:currency/hold", verifyAuth, verifyAdmin, async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const uid = (req as AuthenticatedRequest).userId as string;
+      const hold = await service.setHold(
+        req.params.currency,
+        { rate: body.rate, reason: body.reason, ttlHours: body.ttlHours },
+        uid
+      );
+      sendSuccess(res, hold, "Rate held");
+    } catch (err) {
+      sendMoneyError(res, err);
+    }
+  });
+
+  router.delete("/:currency/hold", verifyAuth, verifyAdmin, async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const uid = (req as AuthenticatedRequest).userId as string;
+      await service.clearHold(req.params.currency, body.reason, uid);
+      sendSuccess(res, { cleared: true }, "Hold cleared; normal rate rules apply again");
     } catch (err) {
       sendMoneyError(res, err);
     }

@@ -71,6 +71,9 @@ describe("admin routes are admin-only (real app mount)", () => {
     // Issue #214: reset-reference and the new refresh-now route on the real app.
     ["POST", "/admin/exchange-rates/NGN/reset-reference"],
     ["POST", "/admin/exchange-rates/NGN/refresh"],
+    // Issue #241: the hold routes.
+    ["PUT", "/admin/exchange-rates/NGN/hold"],
+    ["DELETE", "/admin/exchange-rates/NGN/hold"],
   ];
   test("no token -> 401", async () => {
     for (const [method, path] of routes) {

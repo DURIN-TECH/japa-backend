@@ -6,6 +6,7 @@ import {
   sameProviderState,
   type RateAuditEntry,
   type RateStore,
+  type StoredHold,
   type StoredOverride,
   type StoredProviderRate,
   type StoredRate,
@@ -42,6 +43,14 @@ function parseRateDoc(currency: string, d: Record<string, any>): StoredRate { //
   const setAt = toDate(d.override?.setAt);
   const expiresAt = toDate(d.override?.expiresAt);
   const errAt = toDate(d.lastError?.at);
+  // Issue #241: the hold map. Read only when every field is usable; a
+  // malformed hold reads as "no hold", so pricing falls back to the normal
+  // rules (override / provider / typed error) rather than an unknown number.
+  const holdSetAt = toDate(d.hold?.setAt);
+  const holdExpiresAt = toDate(d.hold?.expiresAt);
+  const holdOk =
+    !!d.hold && !!holdSetAt && !!holdExpiresAt && typeof d.hold.rate === "number" &&
+    Number.isFinite(d.hold.rate) && d.hold.rate > 0;
   const providerOk =
     !!d.provider && !!asOf && !!fetchedAt && typeof d.provider.rate === "number" &&
     Number.isFinite(d.provider.rate) && d.provider.rate > 0 &&
@@ -69,6 +78,15 @@ function parseRateDoc(currency: string, d: Record<string, any>): StoredRate { //
             : {}),
         }
         : null,
+    hold: holdOk
+      ? {
+        rate: d.hold.rate,
+        reason: String(d.hold.reason ?? ""),
+        setBy: String(d.hold.setBy ?? ""),
+        setAt: holdSetAt as Date,
+        expiresAt: holdExpiresAt as Date,
+      }
+      : null,
     lastError: d.lastError && errAt ? { at: errAt, message: String(d.lastError.message ?? "") } : null,
     manualRefreshAt: toDate(d.manualRefreshAt),
   } satisfies StoredRate;
@@ -88,8 +106,24 @@ function overrideToDoc(override: StoredOverride | null) {
   };
 }
 
-/** Domain audit entry -> stored doc (Timestamp `at`). */
-const auditToDoc = (audit: RateAuditEntry) => ({ ...audit, at: Timestamp.fromDate(audit.at) });
+/** Issue #241: domain hold -> stored map (Timestamps), or null to clear. */
+function holdToDoc(hold: StoredHold | null) {
+  if (!hold) return null;
+  return {
+    rate: hold.rate,
+    reason: hold.reason,
+    setBy: hold.setBy,
+    setAt: Timestamp.fromDate(hold.setAt),
+    expiresAt: Timestamp.fromDate(hold.expiresAt),
+  };
+}
+
+/** Domain audit entry -> stored doc (Timestamp `at`, and `holdExpiresAt` when present). */
+const auditToDoc = (audit: RateAuditEntry) => ({
+  ...audit,
+  at: Timestamp.fromDate(audit.at),
+  ...(audit.holdExpiresAt ? { holdExpiresAt: Timestamp.fromDate(audit.holdExpiresAt) } : {}),
+});
 
 /**
  * The Firestore rate store. `runTransaction` is a field (like the other
@@ -138,9 +172,9 @@ export const firestoreRateStore: RateStore & {
         },
         { merge: true }
       );
-      // The merge leaves the override untouched, so the one read here is the
-      // one in front of the new rate once this commits.
-      return { saved: true, override: current?.override ?? null } as const;
+      // The merge leaves the override (and the hold, #241) untouched, so the
+      // ones read here are the ones in front of the new rate once this commits.
+      return { saved: true, override: current?.override ?? null, hold: current?.hold ?? null } as const;
     });
   },
 
@@ -164,11 +198,16 @@ export const firestoreRateStore: RateStore & {
       const mutation = decide(stored);
       const patch: Record<string, unknown> = { currency };
       if (mutation.override !== undefined) patch.override = overrideToDoc(mutation.override);
+      if (mutation.hold !== undefined) patch.hold = holdToDoc(mutation.hold); // issue #241
       // Dropping the provider map also drops the "corrupt" state, since that
       // flag is derived from the map being present but unreadable.
       if (mutation.clearProvider) patch.provider = null;
       tx.set(ref, patch, { merge: true });
       tx.set(collections.exchangeRateAudit.doc(), auditToDoc(mutation.audit));
+      // Issue #241: any further entries for the same change, same transaction.
+      for (const extra of mutation.extraAudits ?? []) {
+        tx.set(collections.exchangeRateAudit.doc(), auditToDoc(extra));
+      }
     });
   },
 
@@ -218,6 +257,7 @@ export const firestoreRateStore: RateStore & {
         new: (d.new ?? null) as { rate: number; source: FxRateSource } | null,
         ...(d.unreferenced ? { unreferenced: true } : {}),
         ...(typeof d.outcome === "string" ? { outcome: d.outcome } : {}),
+        ...(toDate(d.holdExpiresAt) ? { holdExpiresAt: toDate(d.holdExpiresAt) as Date } : {}),
       } satisfies RateAuditEntry;
     });
   },
