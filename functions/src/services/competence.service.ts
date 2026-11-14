@@ -57,7 +57,8 @@ import { cleanAnswers, conditionHolds, intakeService } from "./intake.service";
 import { destinationOptions, routeDestinationReader, withDestinationOptions } from "./route-destinations";
 import { visaService } from "./visa.service";
 import { throughCountryRefusal } from "../shared-routes/through-country-rule";
-import { applicationService } from "./application.service";
+// #299: `usdCentsFromDollars` is the one dollars-to-cents conversion (#181), shared with case creation.
+import { applicationService, usdCentsFromDollars } from "./application.service";
 
 // ============================================
 // Errors
@@ -461,8 +462,10 @@ class CompetenceService {
       // (#237) Kept in step with the country change: the route's name now (the
       // route is the same, but its name may have been edited since creation).
       routeName: resolved.routeName,
-      // The member record's own price, as at creation (cents).
-      totalCost: visa.baseCostUsd * 100,
+      // The member record's own price, as at creation (cents). #299: through
+      // the #181 helper, never a literal `* 100`: a record with no
+      // `baseCostUsd` (no fee on record yet) gives 0, not NaN.
+      totalCost: usdCentsFromDollars(visa.baseCostUsd),
       documentsRequired,
       routeStack,
       throughCountryCode: resolved.countryCode,

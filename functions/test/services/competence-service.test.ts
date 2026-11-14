@@ -467,6 +467,21 @@ describe("change the country applied through", () => {
     assert.equal((store.get(`applications/${app.id}`) as any).routeName, "Route One Renamed");
   });
 
+  test("(#299) changing to a record with no baseCostUsd stores totalCost 0, never NaN; a fee is stored in cents", async () => {
+    const app = await startThroughXA();
+    // XB's record has no fee on record (the field is absent, as on a record whose fee has no source yet).
+    const xb: any = { ...(store.get("countries/XB/visaTypes/xb-visit") as any) };
+    delete xb.baseCostUsd;
+    store.set("countries/XB/visaTypes/xb-visit", xb);
+    await competenceService.changeThroughCountry(app, "XB", actor);
+    const stored: any = store.get(`applications/${app.id}`);
+    assert.equal(stored.totalCost, 0);
+    assert.equal(Number.isNaN(stored.totalCost), false);
+    // Back to XA (100 dollars on record): whole cents through the shared helper.
+    await competenceService.changeThroughCountry(stored, "XA", actor);
+    assert.equal((store.get(`applications/${app.id}`) as any).totalCost, 10_000);
+  });
+
   test("the same country again changes nothing", async () => {
     const app = await startThroughXA();
     const before = JSON.stringify(store.get(`applications/${app.id}`));
