@@ -120,6 +120,9 @@ Authorization: Bearer {{adminToken}}
 # ============================================================
 
 ### Get all agents (public)
+# Issue #179: each agent carries consultationFeeUsd { amountMinor (US cents), currency: "USD" }
+# and consultationFeeLocal { amountMinor, currency, rate, asOf, available }.
+# available:false (rate stale/missing) -> show the dollar price only.
 GET {{baseUrl}}/agents
 
 ### Get agent profile (as agent1)
@@ -129,6 +132,14 @@ Authorization: Bearer {{agent1Token}}
 ### Get agent by ID
 GET {{baseUrl}}/agents/seed-user-agent-001
 Authorization: Bearer {{adminToken}}
+
+### Set my consultation fee in US dollars (issue #179). Whole cents, at most
+### $100,000.00, currency USD only (optional). The old naira `consultationFee` is a 400.
+PUT {{baseUrl}}/agents/me
+Content-Type: application/json
+Authorization: Bearer {{agent1Token}}
+
+{ "consultationFeeUsd": { "amount": "10.00", "currency": "USD" } }
 
 # ============================================================
 # AGENCIES
@@ -152,6 +163,31 @@ GET {{baseUrl}}/agencies/public/acme
 ### Get my agency (as owner)
 GET {{baseUrl}}/agencies/me
 Authorization: Bearer {{ownerToken}}
+
+### Set the agency fee and services in US dollars (issue #179, owner only).
+### consultationFeeUsd: null clears the fee. Old naira keys (consultationFee,
+### services[].price) are a 400.
+PUT {{baseUrl}}/agencies/me
+Content-Type: application/json
+Authorization: Bearer {{ownerToken}}
+
+{
+  "consultationFeeUsd": { "amount": "100.00", "currency": "USD" },
+  "services": [
+    { "id": "svc-1", "name": "Visa Application Processing", "priceUsd": { "amount": "50.00" } }
+  ]
+}
+
+### List this agency's visa service prices (priceUsd, US cents)
+GET {{baseUrl}}/agency/visa-prices
+Authorization: Bearer {{ownerToken}}
+
+### Set one visa's service price in US dollars ({ "priceUsd": null } clears it)
+PUT {{baseUrl}}/agency/visa-prices/GB/uk-student
+Content-Type: application/json
+Authorization: Bearer {{ownerToken}}
+
+{ "priceUsd": { "amount": "125.00", "currency": "USD" } }
 
 ### Get all agencies (admin)
 GET {{baseUrl}}/agencies

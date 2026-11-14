@@ -430,8 +430,9 @@ describe("B. an agency record cannot be created or promoted from a client", () =
       address: "1 Marina Road",
       state: "Lagos",
       description: "We help with study visas.",
-      consultationFee: 25000,
-      services: [{ id: "s1", name: "Study visa", price: 150000, internalFlag: true }],
+      // Issue #179: prices in US dollars.
+      consultationFeeUsd: { amount: "100.00", currency: "USD" },
+      services: [{ id: "s1", name: "Study visa", priceUsd: { amount: "50" }, internalFlag: true }],
       // everything below must be ignored
       status: "approved",
       compliance: { status: "verified" },
@@ -457,7 +458,7 @@ describe("B. an agency record cannot be created or promoted from a client", () =
         address: after.address,
         state: after.state,
         description: after.description,
-        consultationFee: after.consultationFee,
+        consultationFeeUsd: after.consultationFeeUsd,
         services: after.services,
         status: after.status,
         complianceStatus: after.compliance.status,
@@ -478,9 +479,9 @@ describe("B. an agency record cannot be created or promoted from a client", () =
         address: "1 Marina Road",
         state: "Lagos",
         description: "We help with study visas.",
-        consultationFee: 25000,
+        consultationFeeUsd: { amountMinor: 10000, currency: "USD" },
         // only the known keys of a service are kept
-        services: [{ id: "s1", name: "Study visa", price: 150000 }],
+        services: [{ id: "s1", name: "Study visa", priceUsd: { amountMinor: 5000, currency: "USD" } }],
         status: "pending_review",
         complianceStatus: "in_progress",
         ownerId: agency.owner.uid,
@@ -506,11 +507,19 @@ describe("B. an agency record cannot be created or promoted from a client", () =
       {
         nameObject: (await api.call("PUT", "/agencies/me", t, { name: { $set: "x" } })).status,
         emptyName: (await api.call("PUT", "/agencies/me", t, { name: "   " })).status,
-        negativeFee: (await api.call("PUT", "/agencies/me", t, { consultationFee: -1 })).status,
+        negativeFee: (await api.call("PUT", "/agencies/me", t, { consultationFeeUsd: { amount: -1 } })).status,
+        // Issue #179: the old naira fields and a non-USD currency are refused.
+        nairaFee: (await api.call("PUT", "/agencies/me", t, { consultationFee: 25000 })).status,
+        nairaService: (await api.call("PUT", "/agencies/me", t, { services: [{ id: "s1", name: "x", price: 1 }] })).status,
+        otherCurrency: (await api.call("PUT", "/agencies/me", t, { consultationFeeUsd: { amount: 1, currency: "NGN" } })).status,
+        subCent: (await api.call("PUT", "/agencies/me", t, { consultationFeeUsd: { amount: "1.001" } })).status,
         servicesNotArray: (await api.call("PUT", "/agencies/me", t, { services: "all of them" })).status,
         nameAfter: (await stored("agencies", agency.agencyId)).name,
       },
-      { nameObject: 400, emptyName: 400, negativeFee: 400, servicesNotArray: 400, nameAfter: "Agency b4" }
+      {
+        nameObject: 400, emptyName: 400, negativeFee: 400, nairaFee: 400, nairaService: 400,
+        otherCurrency: 400, subCent: 400, servicesNotArray: 400, nameAfter: "Agency b4",
+      }
     );
   });
 

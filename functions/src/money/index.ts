@@ -15,6 +15,9 @@ export * from "./money";
 export * from "./config";
 export * from "./quote";
 export { RateService } from "./rate.service";
+// Issue #179: dollar price input/stored reading and the local figure on reads.
+export * from "./usd-price";
+export * from "./local-price";
 
 /**
  * Secrets the scheduled rate refresh binds. EMPTY on purpose: the default

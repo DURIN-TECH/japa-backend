@@ -2,8 +2,11 @@
 // Agency per-visa service price: storage + rules (issue #103)
 // ============================================
 //
-// An agency sets its OWN service price, in whole NAIRA, on any visa it
-// offers. Contract: ./agency-visa-prices.md.
+// An agency sets its OWN service price, in US DOLLARS (issue #179: a Money
+// `{ amountMinor: <cents>, currency: "USD" }`, stored as `priceUsd`), on any
+// visa it offers. The public list adds the local-currency figure
+// (`priceLocal`) from the request's LocalPricer. Contract:
+// ./agency-visa-prices.md.
 //
 // Where it lives: `agencies/{agencyId}/visaPrices/{cc}__{visaTypeId}`
 // (`AgencyVisaPrice` in src/types). One doc per (agency, visa), so prices are
@@ -37,6 +40,9 @@ import type { VisaPriceTarget } from "./agency-visa-price.validation";
 // Applicant-safe sponsor projection (issue #102). Imported from its file, not
 // the agency-visas index, to keep the import graph flat.
 import { PublicVisaSponsor, toPublicSponsor } from "../agency-visas/agency-visa-access";
+import type { LocalPriceQuote, Money } from "../types/money";
+import { readStoredUsd } from "../money/usd-price";
+import type { LocalPricer } from "../money/local-price";
 
 // ============================================
 // Types
@@ -61,8 +67,12 @@ export interface AgencyVisaPriceView {
   isOwnVisa: boolean;
   /** The GOVERNMENT fee in USD, read-only here (never changed by a price). */
   baseCostUsd: number | null;
-  /** This agency's service price in whole NAIRA, or null when unset. */
-  price: number | null;
+  /**
+   * This agency's service price in US dollars (issue #179), or null when
+   * unset (or when the stored doc has no valid dollar price, e.g. it was not
+   * migrated yet).
+   */
+  priceUsd: Money | null;
   /** When the price was last set (null when unset). */
   priceUpdatedAt: Timestamp | null;
 }
@@ -83,8 +93,10 @@ export interface PublicAgencyVisaPrice {
   countryCode: string;
   visaName: string;
   category: VisaCategory;
-  /** Whole NAIRA, or null ("Contact for pricing"). */
-  price: number | null;
+  /** US dollars (issue #179), or null ("Contact for pricing"). */
+  priceUsd: Money | null;
+  /** The price in the viewer's local currency at the current rate; null when there is no price. */
+  priceLocal: LocalPriceQuote | null;
 
   // ---- Applicant-safe visa detail (issue #102) ----
   /** True for this agency's OWN agency visa (agency-only or made global). */
@@ -162,7 +174,8 @@ export function toPriceView(visa: VisaType, agencyId: string, price: AgencyVisaP
     visibility: visa.visibility ?? VISA_VISIBILITY.GLOBAL,
     isOwnVisa: isOwnAgencyVisa(visa, agencyId),
     baseCostUsd: typeof visa.baseCostUsd === "number" ? visa.baseCostUsd : null,
-    price: price ? price.price : null,
+    // Tolerant read: a doc without a valid dollar price shows as unset.
+    priceUsd: price ? readStoredUsd(price.priceUsd) : null,
     priceUpdatedAt: price ? price.updatedAt : null,
   };
 }
@@ -174,7 +187,7 @@ export function toPriceView(visa: VisaType, agencyId: string, price: AgencyVisaP
  * Missing optional values are `null` (never `undefined`, which JSON drops),
  * so the shape is the same for every entry.
  */
-export function toPublicAgencyVisa(v: AgencyVisaPriceView, visa: VisaType): PublicAgencyVisaPrice {
+export function toPublicAgencyVisa(v: AgencyVisaPriceView, visa: VisaType, pricer: LocalPricer): PublicAgencyVisaPrice {
   /** A string value, or null. */
   const str = (x: unknown): string | null => (typeof x === "string" && x ? x : null);
   /** A finite number, or null. */
@@ -185,7 +198,9 @@ export function toPublicAgencyVisa(v: AgencyVisaPriceView, visa: VisaType): Publ
     countryCode: v.countryCode,
     visaName: v.visaName,
     category: v.category,
-    price: v.price,
+    // ---- #179: dollars as stored + the local figure ----
+    priceUsd: v.priceUsd,
+    priceLocal: v.priceUsd ? pricer.price(v.priceUsd) : null,
     // ---- #102: applicant-safe detail ----
     isAgencyVisa: v.isOwnVisa,
     visibility: v.visibility,
@@ -313,10 +328,12 @@ class AgencyVisaPriceService {
    * The public `visaPrices[]` of an agency's page (`/a/<slug>`): the offered
    * visas (own approved + priced, NOT the whole global catalog), with the
    * price or null. Public data only.
+   *
+   * @param pricer this request's local-currency pricer (issue #179)
    */
-  async listPublic(agencyId: string): Promise<PublicAgencyVisaPrice[]> {
+  async listPublic(agencyId: string, pricer: LocalPricer): Promise<PublicAgencyVisaPrice[]> {
     const offered = await this.listOfferedEntries(agencyId);
-    return offered.map(({ view: v, visa }) => toPublicAgencyVisa(v, visa));
+    return offered.map(({ view: v, visa }) => toPublicAgencyVisa(v, visa, pricer));
   }
 
   // ------------------------------------------
@@ -335,10 +352,10 @@ class AgencyVisaPriceService {
    *  - the agency's OWN visa that is not approved and active yet -> 400
    *    VISA_NOT_APPROVED (the agency already knows this visa exists).
    *
-   * @param price whole naira (already validated)
+   * @param priceUsd the dollar price (already validated by parseVisaPriceBody)
    * @returns the visa's view with the new price
    */
-  async setPrice(agencyId: string, uid: string, target: VisaPriceTarget, price: number): Promise<AgencyVisaPriceView> {
+  async setPrice(agencyId: string, uid: string, target: VisaPriceTarget, priceUsd: Money): Promise<AgencyVisaPriceView> {
     const visaRef = subcollections.visaTypes(target.countryCode).doc(target.visaTypeId);
     const priceRef = subcollections
       .agencyVisaPrices(agencyId)
@@ -368,12 +385,16 @@ class AgencyVisaPriceService {
       // ---- Write ----
       const now = this.now();
       const prior = priceSnap.exists ? (priceSnap.data() as AgencyVisaPrice) : null;
+      // A full `set` (no merge): an old naira `price` on the doc is dropped,
+      // so the doc never holds two prices (issue #179). The migration audit
+      // (`migratedFrom`) is history, so it is carried over when present.
       const doc: AgencyVisaPrice = {
         id: priceRef.id,
         agencyId,
         visaTypeId: target.visaTypeId,
         countryCode: target.countryCode,
-        price,
+        priceUsd,
+        ...(prior?.migratedFrom ? { migratedFrom: prior.migratedFrom } : {}),
         updatedBy: uid,
         createdAt: prior?.createdAt ?? now,
         updatedAt: now,

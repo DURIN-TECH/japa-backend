@@ -16,7 +16,7 @@ const agencyVisaPriceRoutes = Router();
 // Every offered visa with this agency's price (`?include=global` adds the
 // rest of the public catalog, for the picker).
 agencyVisaPriceRoutes.get("/", verifyAuth, (req, res) => agencyVisaPriceController.list(req, res));
-// Set / change (or `{ price: null }` to clear) the price of one visa.
+// Set / change (or `{ priceUsd: null }` to clear) the price of one visa, in US dollars (#179).
 agencyVisaPriceRoutes.put("/:countryCode/:visaTypeId", verifyAuth, (req, res) =>
   agencyVisaPriceController.set(req, res)
 );

@@ -128,14 +128,18 @@ service cloud.firestore {
       //  - rating, totalReviews, totalApplications, successRate,
       //    responseTime: computed marketplace stats.
       //  - id, createdAt: server-managed.
+      //  - consultationFeeUsd, consultationFee, consultationFeeUnit,
+      //    serviceFees, migratedFrom: MONEY (issue #179, closes #168). The API
+      //    is the only writer of a price: PUT /agents/me validates the dollar
+      //    amount (whole cents, capped, USD only). None of them is listed
+      //    below, so a client write of any of them is denied.
       // No portal or mobile code writes this collection directly today (both
       // use the API). Keep in step with AGENT_SELF_EDITABLE_FIELDS in
       // functions/src/services/agent.service.ts (the API-side allow-list).
       function selfEditableAgentFields() {
         return ['displayName', 'bio', 'profilePhotoUrl', 'licenseNumber',
                 'yearsOfExperience', 'specializations', 'languages',
-                'featuredVisas', 'consultationFee', 'serviceFees',
-                'availableSlots', 'updatedAt'];
+                'featuredVisas', 'availableSlots', 'updatedAt'];
       }
 
       // Authenticated users can create their own agent profile, with profile
@@ -317,17 +321,19 @@ service cloud.firestore {
                      isAdmin());
 
       // ---- Owner-editable agency profile (ALLOW-LIST, issue #138) ----
-      // The ONLY fields the owner may change from a client SDK. This list is
-      // the same one the API copies (AGENCY_OWNER_EDITABLE_FIELDS in
-      // functions/src/services/agency.service.ts).
+      // The ONLY fields the owner may change from a client SDK.
+      // Issue #179: NO MONEY here. `consultationFeeUsd`, the old naira
+      // `consultationFee`, `services` (each entry carries a price) and the
+      // `migratedFrom` audit are written only by the API (PUT /agencies/me),
+      // which validates every dollar price; the API's own list
+      // (AGENCY_OWNER_EDITABLE_FIELDS in functions/src/services/
+      // agency.service.ts) therefore has two fields this one does not.
       function ownerEditableAgencyFields() {
         return [
           'name',
           'address',
           'state',
-          'description',
-          'consultationFee',
-          'services'
+          'description'
         ];
       }
 

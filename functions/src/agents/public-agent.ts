@@ -13,8 +13,15 @@
 // until they are added here deliberately.
 //
 // Reused by other public surfaces (e.g. #144's GET /agencies/browse/:id/agents).
+//
+// Issue #179: the fee is the stored DOLLAR price (`consultationFeeUsd`, a
+// Money) plus its local figure (`consultationFeeLocal`) from the request's
+// `LocalPricer`. The old naira `consultationFee` and its `consultationFeeUnit`
+// marker are not in the list, so they can never reach a public response
+// (not even from a doc the migration has not reached yet).
 
 import type { Agent, PublicAgent } from "../types";
+import { readStoredUsd, type LocalPricer } from "../money";
 
 /**
  * The exact key set of a public agent response. Exported so tests (and any
@@ -38,7 +45,8 @@ export const PUBLIC_AGENT_FIELDS = [
   "totalApplications",
   "successRate",
   "responseTime",
-  "consultationFee",
+  "consultationFeeUsd",
+  "consultationFeeLocal",
   "isAvailable",
   "createdAt",
   "updatedAt",
@@ -49,9 +57,15 @@ export const PUBLIC_AGENT_FIELDS = [
  * Optional fields are only set when present, so absent stays absent in JSON.
  *
  * @param agent - The full agent document
+ * @param pricer - This request's local-currency pricer (one rate lookup per
+ *   request, see money/local-price.ts); an unavailable rate gives
+ *   `consultationFeeLocal.available === false`, never an error
  * @returns The anonymous-safe view of that agent
  */
-export function toPublicAgent(agent: Agent): PublicAgent {
+export function toPublicAgent(agent: Agent, pricer: LocalPricer): PublicAgent {
+  // A doc without a valid dollar fee (not migrated yet, corrupt) shows no fee
+  // rather than a guess: both fee keys are null.
+  const feeUsd = readStoredUsd(agent.consultationFeeUsd);
   const pub: PublicAgent = {
     id: agent.id,
     displayName: agent.displayName,
@@ -66,7 +80,8 @@ export function toPublicAgent(agent: Agent): PublicAgent {
     totalApplications: agent.totalApplications,
     successRate: agent.successRate,
     responseTime: agent.responseTime,
-    consultationFee: agent.consultationFee,
+    consultationFeeUsd: feeUsd,
+    consultationFeeLocal: feeUsd ? pricer.price(feeUsd) : null,
     isAvailable: agent.isAvailable,
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt,

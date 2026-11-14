@@ -100,9 +100,10 @@ export class AgencyVisaPriceController {
   }
 
   /**
-   * PUT /agency/visa-prices/:countryCode/:visaTypeId  body `{ price }`
+   * PUT /agency/visa-prices/:countryCode/:visaTypeId  body `{ priceUsd }`
    *
-   * Set or change the price (whole naira). `{ price: null }` clears it, the
+   * Set or change the price, in US dollars (issue #179):
+   * `{ priceUsd: { amount: "125.00", currency: "USD" } }`. `{ priceUsd: null }` clears it, the
    * same as DELETE. 400 on a bad value, 404 on a visa this agency can't
    * price (unknown / another agency's agency-only), 400 VISA_NOT_APPROVED on
    * its own unapproved visa. Nothing is written on any error.
@@ -112,13 +113,13 @@ export class AgencyVisaPriceController {
     if (!actor) return;
     try {
       const target = parseVisaPriceTarget(req.params ?? {});
-      const { price } = parseVisaPriceBody(req.body);
-      if (price === null) {
+      const { priceUsd } = parseVisaPriceBody(req.body);
+      if (priceUsd === null) {
         await agencyVisaPriceService.clearPrice(actor.agencyId, target);
-        sendSuccess(res, { ...target, price: null }, "Price cleared");
+        sendSuccess(res, { ...target, priceUsd: null }, "Price cleared");
         return;
       }
-      const view = await agencyVisaPriceService.setPrice(actor.agencyId, actor.uid, target, price);
+      const view = await agencyVisaPriceService.setPrice(actor.agencyId, actor.uid, target, priceUsd);
       sendSuccess(res, view, "Price saved");
     } catch (error) {
       sendFailure(res, error, "setting");
@@ -136,7 +137,7 @@ export class AgencyVisaPriceController {
     try {
       const target = parseVisaPriceTarget(req.params ?? {});
       await agencyVisaPriceService.clearPrice(actor.agencyId, target);
-      sendSuccess(res, { ...target, price: null }, "Price cleared");
+      sendSuccess(res, { ...target, priceUsd: null }, "Price cleared");
     } catch (error) {
       sendFailure(res, error, "clearing");
     }

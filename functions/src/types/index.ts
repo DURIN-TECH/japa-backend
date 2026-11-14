@@ -1,5 +1,7 @@
 import { Timestamp } from "firebase-admin/firestore";
 import type { ApplicationIntake } from "./intake";
+// Issue #179: stored prices are dollar Money; reads add a local quote.
+import type { LocalPriceQuote, Money, PriceMigrationRecord } from "./money";
 // Automated-verification result shapes live with the provider contract; the
 // compliance file below embeds them as optional signals (see the verification
 // service). One-way import (types -> verification.types), so no cycle.
@@ -140,9 +142,22 @@ export type AgencyStatus = "pending_review" | "approved" | "rejected" | "suspend
 export interface AgencyService {
   id: string;
   name: string;
-  // Service price in WHOLE NAIRA (the portal stores the raw ₦ input, like the
-  // agency `consultationFee`). The old "in cents" comment was wrong (#144).
-  price: number;
+  /**
+   * The service price in US DOLLARS (issue #179): `{ amountMinor: <cents>,
+   * currency: "USD" }`. Replaces the old naira `price` number (whose comment
+   * once said "in cents" and was wrong; it held whole naira). Set only
+   * through PUT /agencies/me, validated by `parseUsdPriceInput`.
+   */
+  priceUsd: Money;
+}
+
+/**
+ * `migratedFrom` on an agency (issue #179): the naira values the migration
+ * converted, keyed by the OLD field name (`services` by service id).
+ */
+export interface AgencyPriceMigration {
+  consultationFee?: PriceMigrationRecord;
+  services?: Record<string, PriceMigrationRecord>;
 }
 
 // ============================================
@@ -250,10 +265,12 @@ export interface Agency {
   description?: string;
   logoUrl?: string;
 
-  // Pricing
-  // Agency-level default consultation fee in WHOLE NAIRA (the portal stores the
-  // raw ₦ input; the old "cents" comment was wrong, see consultation.controller).
-  consultationFee?: number;
+  // Pricing (issue #179: US dollars, an explicit currency, never a bare number)
+  // Agency-level default consultation fee, `{ amountMinor: <cents>, currency:
+  // "USD" }`. Absent = no fee set. Replaces the old whole-naira `consultationFee`.
+  consultationFeeUsd?: Money;
+  // Audit of the naira values the #179 migration converted (never rewritten).
+  migratedFrom?: AgencyPriceMigration;
 
   // Embedded services (small bounded list)
   services: AgencyService[];
@@ -335,22 +352,24 @@ export interface Agent {
   successRate: number; // Percentage
   responseTime: string; // e.g., "24-48 hours"
 
-  // Pricing
-  // WHOLE NAIRA (issue #148), same unit as `Agency.consultationFee`. Display with no
-  // /100; Paystack kobo conversion (`* 100`) happens only at the payment boundary.
-  consultationFee: number;
-  // Migration marker (#148): set to "naira" by migrate-agent-consultation-fee-to-naira
-  // so a re-run never divides an already-converted fee by 100 again.
-  consultationFeeUnit?: "naira";
+  // Pricing (issue #179)
+  // The agent's consultation fee in US DOLLARS, `{ amountMinor: <cents>,
+  // currency: "USD" }`. New agents start at zero dollars. Replaces the naira
+  // `consultationFee` number and its #148 `consultationFeeUnit` marker (both
+  // removed by scripts/migrate-prices-to-usd.ts and no longer written).
+  consultationFeeUsd: Money;
+  // Audit of the naira fee the #179 migration converted (never rewritten).
+  migratedFrom?: { consultationFee?: PriceMigrationRecord };
   /**
    * @deprecated Issue #103: SUPERSEDED by the agency-level per-visa service
-   * price (`agencies/{agencyId}/visaPrices/{cc}__{visaTypeId}`, whole NAIRA,
-   * see `AgencyVisaPrice` below and `src/agency-visa-prices/`).
+   * price (`agencies/{agencyId}/visaPrices/{cc}__{visaTypeId}`, US dollars since
+   * #179, see `AgencyVisaPrice` below and `src/agency-visa-prices/`).
    *
    * Legacy, never written by any UI and never read by any code: old agent
    * docs carry an empty `{}` here. It was documented as "fee in cents", so
    * it must NOT be read as naira (or at all). New agent docs no longer get
-   * it, and `PUT /agents/me` drops it from the body. Kept optional in the
+   * it, `PUT /agents/me` drops it from the body, and since #179 no client
+   * may write it directly either (firestore.rules). Kept optional in the
    * type only so existing docs still type-check.
    */
   serviceFees?: Record<string, number>;
@@ -390,7 +409,10 @@ export interface PublicAgent {
   totalApplications: number;
   successRate: number;
   responseTime: string;
-  consultationFee: number; // passed through unchanged (unit is issue #148's concern)
+  /** The fee in US dollars as stored; null when the doc has no valid dollar fee (issue #179). */
+  consultationFeeUsd: Money | null;
+  /** The same fee in the viewer's local currency at the current rate; null when there is no fee. */
+  consultationFeeLocal: LocalPriceQuote | null;
   isAvailable: boolean;
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -1560,7 +1582,7 @@ export interface DocumentVersion {
  * shows on another agency's page. Backend-only: no firestore.rules match for
  * the subcollection, so clients are denied; reads go through the API.
  *
- * Supersedes the legacy `Agent.serviceFees` (cents, never used). Contract:
+ * Supersedes the legacy `Agent.serviceFees` (never used). Contract:
  * `src/agency-visa-prices/agency-visa-prices.md`.
  */
 export interface AgencyVisaPrice {
@@ -1572,11 +1594,13 @@ export interface AgencyVisaPrice {
   visaTypeId: string;
   countryCode: string;
   /**
-   * The agency's service price in WHOLE NAIRA (not kobo, not cents): a
-   * non-negative integer, at most MAX_VISA_SERVICE_PRICE_NAIRA. ₦12,500 is
-   * stored as 12500. Never multiply or divide by 100.
+   * The agency's service price in US DOLLARS (issue #179): `{ amountMinor:
+   * <cents>, currency: "USD" }`, at most MAX_PRICE_USD_CENTS. Replaces the
+   * old whole-naira `price` number.
    */
-  price: number;
+  priceUsd: Money;
+  /** Audit of the naira price the #179 migration converted (never rewritten). */
+  migratedFrom?: { price?: PriceMigrationRecord };
   /** Uid of the agency member who last set it. */
   updatedBy: string;
   createdAt: Timestamp;

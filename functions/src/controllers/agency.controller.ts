@@ -8,6 +8,7 @@ import {
   isAgencyPubliclyVisible,
   isAgencyComplianceVerified,
   toPublicAgencyServices,
+  toPublicAgencyFee,
   PUBLIC_AGENCY_LIST_MAX,
 } from "../services/agency.service";
 // Issue #144: the public agency directory lists an agency's agents.
@@ -15,6 +16,8 @@ import { agentService } from "../services/agent.service";
 // Issue #147: the allow-listed public agent shape (no userId or contact
 // fields). The directory must return exactly what public GET /agents returns.
 import { toPublicAgent } from "../agents/public-agent";
+// Issue #179: the local-currency figure next to every dollar price on reads.
+import { loadLocalPricer } from "../money";
 import { storageService } from "../services/storage.service";
 import { notificationService } from "../services/notification.service";
 import { emailService } from "../services/email/email.service";
@@ -285,7 +288,9 @@ export class AgencyController {
    * Update the agency the current user owns.
    *
    * Copies ONLY the owner-editable profile fields (issue #138): name,
-   * address, state, description, consultationFee, services. Every other key
+   * address, state, description, consultationFeeUsd, services (issue #179:
+   * prices in US dollars; an old naira `consultationFee` or service `price`
+   * is a 400). Every other key
    * in the body is ignored (status, compliance, ownerId, counters, slug,
    * logoUrl, ...); a listed key with a value of the wrong type is a 400.
    */
@@ -678,12 +683,16 @@ export class AgencyController {
         return;
       }
 
+      // Issue #179: one rate lookup for every price on the page. Never fails:
+      // an unavailable rate gives `available: false` local figures.
+      const pricer = await loadLocalPricer({ uid: req.userId });
+
       // ---- Per-visa service prices (issue #103) ----
       // A pricing read failure must not take the whole public page down: log
       // it and serve the page without prices (it then shows no visa list).
       let visaPrices: PublicAgencyVisaPrice[] = [];
       try {
-        visaPrices = await agencyVisaPriceService.listPublic(agency.id);
+        visaPrices = await agencyVisaPriceService.listPublic(agency.id, pricer);
       } catch (error) {
         console.error("Error loading public agency visa prices:", error);
       }
@@ -695,19 +704,20 @@ export class AgencyController {
         logoUrl: agency.logoUrl ?? null,
         state: agency.state ?? null,
         ownerName: agency.ownerName,
-        // Agency-level default consultation fee in whole NAIRA (the old "in
-        // cents" comment was wrong; see consultation.controller). null when unset.
-        consultationFee: agency.consultationFee ?? null,
-        // Public service menu (name + price only).
+        // Issue #179: agency-level consultation fee in US dollars
+        // (`consultationFeeUsd`, a Money; null when unset) and its local
+        // figure (`consultationFeeLocal`). Shared with /browse (#144).
+        ...toPublicAgencyFee(agency, pricer),
+        // Public service menu (name + dollar price + local figure only).
         // (Shared with the /browse projection, issue #144.)
-        services: toPublicAgencyServices(agency.services),
+        services: toPublicAgencyServices(agency.services, pricer),
         // Social-proof stats (safe aggregates).
         totalAgents: agency.totalAgents,
         totalCases: agency.totalCases,
         // Trust badge only — never the raw compliance file.
         verified: isAgencyComplianceVerified(agency),
         // Issue #103: the visas this agency offers with ITS OWN service price
-        // in whole naira (null = "Contact for pricing"). Only this agency's
+        // (US dollars since #179 + local figure; null = "Contact for pricing"). Only this agency's
         // prices, only visas it may still price (own approved + priced
         // global). Separate from each visa's government fee (baseCostUsd).
         visaPrices,
@@ -747,6 +757,8 @@ export class AgencyController {
       const agencies = await agencyService.listPublicAgencies({
         limit: parseBrowseLimit(req.query.limit),
         search: parseBrowseSearch(req.query.search),
+        // Issue #179: one rate lookup for the whole list (never fails the read).
+        pricer: await loadLocalPricer({ uid: (req as AuthenticatedRequest).userId }),
       });
       sendSuccess(res, agencies);
     } catch (error) {
@@ -765,17 +777,20 @@ export class AgencyController {
    * Named `getPublicAgencyById` so it doesn't collide with the slug handler
    * `getPublicAgency` (`GET /agencies/public/:slug`).
    *
-   * `visaPrices[]` comes from `agencyVisaPriceService.listPublic(agency.id)`,
+   * `visaPrices[]` comes from `agencyVisaPriceService.listPublic(agency.id, pricer)`,
    * the SAME call the slug page makes, so entries are identical (same keys,
    * same values) on both routes: this agency's own approved active visas
-   * plus the visas it priced, `price` in whole NAIRA (null = "Contact for
-   * pricing"), `baseCostUsd` the separate government fee in USD. A pricing
+   * plus the visas it priced, `priceUsd` in US dollars with its local
+   * figure `priceLocal` (issue #179; both null = "Contact for pricing"),
+   * `baseCostUsd` the separate government fee in USD. A pricing
    * read failure is logged and served as `[]`, like the slug page.
    */
   async getPublicAgencyById(req: Request, res: Response): Promise<void> {
     try {
       const { id } = req.params;
-      const agency = await agencyService.getPublicAgencyById(id);
+      // Issue #179: one rate lookup for every price in the response.
+      const pricer = await loadLocalPricer({ uid: (req as AuthenticatedRequest).userId });
+      const agency = await agencyService.getPublicAgencyById(id, pricer);
       if (!agency) {
         sendError(res, "NOT_FOUND", "Agency not found", 404);
         return;
@@ -784,7 +799,7 @@ export class AgencyController {
       // ---- Per-visa service prices (#102/#103), never fatal ----
       let visaPrices: PublicAgencyVisaPrice[] = [];
       try {
-        visaPrices = await agencyVisaPriceService.listPublic(agency.id);
+        visaPrices = await agencyVisaPriceService.listPublic(agency.id, pricer);
       } catch (error) {
         console.error("Error loading public agency visa prices:", error);
       }
@@ -807,7 +822,9 @@ export class AgencyController {
   async getPublicAgencyAgents(req: Request, res: Response): Promise<void> {
     try {
       const { id } = req.params;
-      const agency = await agencyService.getPublicAgencyById(id);
+      // Issue #179: the agents' dollar fees come with a local figure.
+      const pricer = await loadLocalPricer({ uid: (req as AuthenticatedRequest).userId });
+      const agency = await agencyService.getPublicAgencyById(id, pricer);
       if (!agency) {
         sendError(res, "NOT_FOUND", "Agency not found", 404);
         return;
@@ -816,7 +833,7 @@ export class AgencyController {
       const agents = await agentService.getPublicAgentsByAgency(agency.id);
       // Project through the #147 allow-list so this unauthenticated route
       // never leaks internal fields (userId etc.) that GET /agents strips.
-      sendSuccess(res, agents.map(toPublicAgent));
+      sendSuccess(res, agents.map((a) => toPublicAgent(a, pricer)));
     } catch (error) {
       console.error("Error getting public agency agents:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
