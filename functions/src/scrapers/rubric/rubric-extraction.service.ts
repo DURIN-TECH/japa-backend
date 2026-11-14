@@ -1472,7 +1472,10 @@ export interface LoadedSource {
  *                         explicit "cannot be repaired" answer);
  *  - `invalid`            code refused what came back (`detail` is a code, never text).
  */
-export type RedraftOutcome = { kind: "replacement"; criterion: AssessmentCriterion } | { kind: "cannot_be_repaired" } | { kind: "invalid"; detail: string };
+// (#243) `sameLine` (replacement only): whether the replacement quotes the SAME line of the stored text as
+// the original. Always true for a bar (code refuses anything else); for an ordinary rule it can be false,
+// when the rule was one item of a definition and came back as the definition's lead-in.
+export type RedraftOutcome = { kind: "replacement"; criterion: AssessmentCriterion; sameLine?: boolean } | { kind: "cannot_be_repaired" } | { kind: "invalid"; detail: string };
 
 export class RubricExtractionService {
   /** @param deps overrides for tests; production passes nothing. */
@@ -1993,7 +1996,13 @@ export class RubricExtractionService {
       const at = index.locate(a.criterion.source.quote);
       return { a, sameLine: at.ok && at.unit === found.unit, bar: isBar(a.criterion) };
     });
-    const sameRule = tested.filter((t) => t.sameLine && t.bar).map((t) => t.a);
+    // (#243) An ORDINARY original (not a bar) is re-drafted by the one-off script (`repair-saved-rule`) and later
+    // by the publish run (#240-D). Its replacement must never be a bar (a repair can never make a rule a bar:
+    // that would change what the code refuses on), and it may quote the lead-in of the definition or alternatives
+    // the original was one item of, so the same-line rule is a preference here, not a requirement: it is reported.
+    const ordinaryOriginal = !isBar(rule);
+    const sameRule = ordinaryOriginal ? tested.filter((t) => !t.bar).map((t) => t.a) : tested.filter((t) => t.sameLine && t.bar).map((t) => t.a);
+    if (ordinaryOriginal && sameRule.length === 0) return { kind: "invalid", detail: `became_a_bar:returned=${raw.criteria.length}:accepted=${tested.length}` };
     if (sameRule.length === 0) {
       // Counts and a cause word only, stored on the repair record: never the quote or any model text.
       //   different_line: no accepted rule quotes the original's line (the model drafted another line of the window);
@@ -2002,8 +2011,11 @@ export class RubricExtractionService {
       const cause = sameLineCount === 0 ? "different_line" : "not_a_bar";
       return { kind: "invalid", detail: `not_the_same_bar:${cause}:returned=${raw.criteria.length}:accepted=${tested.length}:same_line=${sameLineCount}:bar=${tested.filter((t) => t.bar).length}` };
     }
-    if (sameRule.length > 1) return { kind: "invalid", detail: "ambiguous_redraft" };
-    const accepted = sameRule[0];
+    // Ordinary original: if more than one rule came back, the one on the original's own line wins, else it is ambiguous.
+    const sameLineOf = (a: (typeof sameRule)[number]): boolean => tested.find((t) => t.a === a)?.sameLine === true;
+    const pool = ordinaryOriginal && sameRule.length > 1 && sameRule.filter(sameLineOf).length === 1 ? sameRule.filter(sameLineOf) : sameRule;
+    if (pool.length > 1) return { kind: "invalid", detail: "ambiguous_redraft" };
+    const accepted = pool[0];
     // A lead-in whose list could not be read cleanly is refused here, as the gates would hold it anyway.
     if (accepted.listUnreadable !== undefined) return { kind: "invalid", detail: accepted.listUnreadable };
     const normApplicability = (c: AssessmentCriterion): string => c.applicability ?? "all_applicants";
@@ -2023,7 +2035,7 @@ export class RubricExtractionService {
       ...(rule.eligibilityQuestionId !== undefined ? { eligibilityQuestionId: rule.eligibilityQuestionId } : {}),
       ...(rule.intakeQuestionIds !== undefined ? { intakeQuestionIds: rule.intakeQuestionIds } : {}),
     };
-    return { kind: "replacement", criterion };
+    return { kind: "replacement", criterion, sameLine: sameLineOf(accepted) };
   }
 
   /** Refuse the run when its plan would pass a per-run cap. (#216: public, the job start checks the same caps.) */
