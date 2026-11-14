@@ -2,7 +2,7 @@ import { Timestamp, type DocumentData, type Transaction, type UpdateData } from 
 import { collectionGroups, collections, db, subcollections } from "../utils/firebase";
 // The scrapers module is reached through its public entry point only (the
 // ESLint boundary rule of issue #91 refuses deep imports from here).
-import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA, applyRuleRepairs, barsServedWithoutTrigger, SnapshotQuoteIndex, guidanceSnapshotStore, previewExclusions, rubricStore, validateVisaRubric } from "../scrapers";
+import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA, applyRuleRepairs, barsServedWithoutTrigger, SnapshotQuoteIndex, guidanceSnapshotStore, previewExclusions, rubricStore, rulebookPartsOf, targetInputOf, validateVisaRubric } from "../scrapers";
 import type { ExclusionPreview } from "../scrapers";
 import type { GuidanceSnapshotContent } from "../scrapers/types";
 import type { RubricIssue } from "../scrapers";
@@ -216,9 +216,15 @@ const STANDING_NOTICE_FLAG_CODES: ReadonlySet<string> = new Set([
   "rule_trigger_simplified",
 ]);
 
-/** `{countryCode}_{visaTypeId}__v{version}`: the id of one rubric version in the API. */
-// The country code is two UPPER-CASE letters, as `rubricRouteKey` requires.
-const VERSION_ID_RE = /^([A-Z]{2}_[A-Za-z0-9][A-Za-z0-9_-]*)__v([1-9]\d{0,8})$/;
+/**
+ * `{routeKey}__v{version}`: the id of one rubric version in the API.
+ * (#233) The route key is any authority's rulebook key `{authorityId}_{routeSlug}`
+ * (a country's `{countryCode}_{visaTypeId}` as before, or a bloc / treaty's
+ * shared layer). The pattern keeps the old character classes (no `/`, so a
+ * parsed key can never steer a path), and `parseRubricVersionId` then checks
+ * the key against the authority id rules.
+ */
+const VERSION_ID_RE = /^([A-Za-z0-9][A-Za-z0-9_-]*)__v([1-9]\d{0,8})$/;
 
 // ============================================
 // Errors
@@ -281,6 +287,18 @@ export function rubricVersionId(routeKey: string, version: number): string {
 }
 
 /**
+ * (#233) The naming pair of a rulebook document for API rows, audit entries and
+ * approval events: `countryCode` + `visaTypeId` for a country's rulebook
+ * (exactly the fields these carried before), `authorityId` + `routeSlug` for a
+ * bloc / treaty layer (which has no country). Empty for a document whose key
+ * cannot be read (the validator reports that one).
+ */
+function namingOf(doc: { routeKey: string; authorityId?: string; routeSlug?: string; countryCode?: string; visaTypeId?: string }): { countryCode?: string; visaTypeId?: string; authorityId?: string; routeSlug?: string } {
+  const parts = rulebookPartsOf(doc);
+  return parts ? targetInputOf(parts) : {};
+}
+
+/**
  * Split an API id into its route key and version, or null when the text is
  * not such an id. The pattern is anchored and its character classes hold no
  * `/`, so a parsed route key can never steer a document path elsewhere.
@@ -288,7 +306,11 @@ export function rubricVersionId(routeKey: string, version: number): string {
 export function parseRubricVersionId(id: unknown): { routeKey: string; version: number } | null {
   if (typeof id !== "string") return null;
   const m = VERSION_ID_RE.exec(id);
-  return m ? { routeKey: m[1], version: Number(m[2]) } : null;
+  if (!m) return null;
+  // (#233) The key must be a valid rulebook key (a country code in capitals,
+  // or a bloc / treaty id), exactly as the store would address it.
+  if (!rulebookPartsOf({ routeKey: m[1] })) return null;
+  return { routeKey: m[1], version: Number(m[2]) };
 }
 
 // ============================================
@@ -612,8 +634,12 @@ export interface ApprovalBlocker {
 export interface RubricVersionListItem {
   id: string;
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key parts: `authorityId` + `routeSlug` for any rulebook; the
+  // country pair only for a country's own rulebook (absent on a shared layer).
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
   version: number;
   reviewStatus: RubricReviewStatus;
   revision: number;
@@ -660,6 +686,13 @@ export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intent
   // (#203) The automatic approval's question plan, null when there is none.
   // The lists above stay the FULL, unfiltered draft; the plan is shown beside them.
   questionPlan: VisaRubric["questionPlan"] | null;
+  // (#233 P4b) The layer check of a country's own layer against the shared
+  // layer(s) its route inherits (null when none ran: a single-layer route, a
+  // shared layer, or a version approved by hand), and every disagreement it
+  // found, both quotes and URLs (empty when none). Rules data only: no
+  // application or agency data is ever in either.
+  layerCheck: VisaRubric["layerCheck"] | null;
+  layerConflicts: NonNullable<VisaRubric["layerConflicts"]>;
   // What the PROPOSED exclusion set (query `previewExcluded`) would remove,
   // or what the stored one did remove; null when there is nothing to count.
   exclusionPreview: ExclusionPreview | null;
@@ -711,8 +744,12 @@ export interface RubricVersionDetail extends Omit<RubricVersionListItem, "intent
 export interface RubricDecisionResult {
   id: string;
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key parts: `authorityId` + `routeSlug` for any rulebook; the
+  // country pair only for a country's own rulebook (absent on a shared layer).
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
   version: number;
   action: "approve" | "reject";
   reviewStatus: RubricReviewStatus;
@@ -744,8 +781,12 @@ export interface RubricReviewAuditEntry {
   publishRunId?: string;
   action: "approve" | "reject";
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key parts: `authorityId` + `routeSlug` for any rulebook; the
+  // country pair only for a country's own rulebook (absent on a shared layer).
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
   version: number;
   // Reject reason, or the optional approval note.
   reason: string | null;
@@ -790,8 +831,12 @@ export interface RubricReviewAuditEntry {
 /** Sent to `onApproved` listeners after an approval has committed. */
 export interface RubricApprovedEvent {
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key parts: `authorityId` + `routeSlug` for any rulebook; the
+  // country pair only for a country's own rulebook (absent on a shared layer).
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
   // The version now serving.
   version: number;
   // The version it replaced, or null for a route's first approval.
@@ -879,8 +924,8 @@ function toListItem(rubric: VisaRubric, head: RubricHead | null): RubricVersionL
   return {
     id: rubricVersionId(rubric.routeKey, rubric.version),
     routeKey: rubric.routeKey,
-    countryCode: rubric.countryCode,
-    visaTypeId: rubric.visaTypeId,
+    // (#233) The rulebook's naming pair: the country pair for a country (as before), authorityId + routeSlug for a shared layer.
+    ...namingOf(rubric),
     version: rubric.version,
     reviewStatus: rubric.reviewStatus,
     revision: rubric.revision,
@@ -1031,7 +1076,8 @@ export interface SystemDecisionExtras {
  * by this file only and can never come from a caller.
  */
 // (#223) `ruleRepairs`: the replacements of protected rules the automatic check re-drafted once and confirmed.
-export const PLANNER_WRITABLE_FIELDS: readonly string[] = ["questionPlan", "ruleRepairs"];
+// (#233 P4b) `layerCheck` + `layerConflicts`: the layer check of an own layer against its shared layer(s).
+export const PLANNER_WRITABLE_FIELDS: readonly string[] = ["questionPlan", "ruleRepairs", "layerCheck", "layerConflicts"];
 
 /** Validate the planner's fields against the allow-list; a key outside it throws (never silently dropped). */
 function plannerReviewFields(raw: Record<string, unknown> | undefined): Partial<Pick<VisaRubric, (typeof RUBRIC_REVIEW_FIELDS)[number]>> {
@@ -1102,10 +1148,16 @@ export class RubricReviewService {
       rubricStore.listHeads(),
     ]);
     const headByRoute = new Map(heads.map((h) => [h.routeKey, h]));
-    return snap.docs.map((d) => {
-      const rubric = d.data() as VisaRubric;
-      return toListItem(rubric, headByRoute.get(rubric.routeKey) ?? null);
-    });
+    // (#278) A large version's document is only its header: its criteria,
+    // flags and passages (which the list counts) are read back from its parts.
+    // A single-document version is used as it is (no extra read).
+    return Promise.all(
+      snap.docs.map(async (d) => {
+        const header = d.data() as VisaRubric;
+        const rubric = await rubricStore.readVersionData(header.routeKey, header.version, header);
+        return toListItem(rubric, headByRoute.get(rubric.routeKey) ?? null);
+      })
+    );
   }
 
   // ---------- Stale citations ----------
@@ -1303,8 +1355,7 @@ export class RubricReviewService {
     return {
       id: item.id,
       routeKey: item.routeKey,
-      countryCode: item.countryCode,
-      visaTypeId: item.visaTypeId,
+      ...namingOf(item),
       version: item.version,
       schemaVersion: rubric.schemaVersion,
       reviewStatus: item.reviewStatus,
@@ -1342,6 +1393,8 @@ export class RubricReviewService {
       excludedCriterionIds: rubric.excludedCriterionIds ?? null,
       exclusionNote: rubric.exclusionNote ?? null,
       questionPlan: rubric.questionPlan ?? null,
+      layerCheck: rubric.layerCheck ?? null,
+      layerConflicts: rubric.layerConflicts ?? [],
       exclusionPreview,
       sourceSnapshots: (rubric.sourceSnapshots ?? []).map((s) => ({
         sourceId: s.sourceId,
@@ -1544,7 +1597,10 @@ export class RubricReviewService {
       // ======== READS (all before any write) ========
       const [versionSnap, headSnap] = await Promise.all([tx.get(versionRef), tx.get(headRef)]);
       if (!versionSnap.exists || !headSnap.exists) throw notFound();
-      const rubric = versionSnap.data() as VisaRubric;
+      // (#278) The whole version, read inside this transaction: a large
+      // version's criteria and flags live in part documents beside the header.
+      // Only REVIEW fields are written below, and they live on the header.
+      const rubric = await rubricStore.readVersionDataInTx(tx, routeKey, version, versionSnap.data());
       const head = headSnap.data() as RubricHead;
 
       // ---- one decision per version ----
@@ -1562,8 +1618,8 @@ export class RubricReviewService {
         by: reviewerUid,
         ...automaticMarks,
         routeKey,
-        countryCode: rubric.countryCode,
-        visaTypeId: rubric.visaTypeId,
+        // (#233) The rulebook's naming pair: the country pair for a country (as before), authorityId + routeSlug for a shared layer.
+        ...namingOf(rubric),
         version,
         previousApprovedVersion,
         revisionBefore: rubric.revision,
@@ -1574,8 +1630,8 @@ export class RubricReviewService {
       const resultBase = {
         id: rubricVersionId(routeKey, version),
         routeKey,
-        countryCode: rubric.countryCode,
-        visaTypeId: rubric.visaTypeId,
+        // (#233) The rulebook's naming pair: the country pair for a country (as before), authorityId + routeSlug for a shared layer.
+        ...namingOf(rubric),
         version,
         revision: revisionAfter,
         reviewedBy: reviewerUid,
@@ -1682,7 +1738,17 @@ export class RubricReviewService {
       // ======== WRITES ========
       // 1. The version: review fields only.
       //    The admin-set fields go in the same write, only when sent.
-      tx.update(versionRef, reviewFieldsUpdate({ reviewStatus: "approved", intentPolarity: input.intentPolarity, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter, ...adminSetOf(input), ...plannerFields }));
+      //    (#278) Through the store, so a near-limit version stored as one
+      //    document is moved into header + parts in this same transaction
+      //    instead of overflowing 1 MiB with the added plan / repairs.
+      rubricStore.writeReviewUpdateInTx(
+        tx,
+        routeKey,
+        version,
+        versionSnap.data(),
+        rubric,
+        reviewFieldsUpdate({ reviewStatus: "approved", intentPolarity: input.intentPolarity, reviewedBy: reviewerUid, reviewedAt: now, rejectReason: null, revision: revisionAfter, ...adminSetOf(input), ...plannerFields }) as Record<string, unknown>
+      );
       // 2. The version it replaces: marked superseded (it stays `approved`
       //    as a record, but the head no longer points at it).
       if (supersededRef && supersededSnap?.exists) {
@@ -1727,8 +1793,7 @@ export class RubricReviewService {
     if (result.action === "approve") {
       await this.emitApproved({
         routeKey: result.routeKey,
-        countryCode: result.countryCode,
-        visaTypeId: result.visaTypeId,
+        ...namingOf(result),
         version: result.version,
         previousApprovedVersion: result.previousApprovedVersion,
         approvedBy: reviewerUid,

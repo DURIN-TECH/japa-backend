@@ -636,3 +636,116 @@ export function applyPlanShape<T extends PlanView>(view: T, plan: Pick<QuestionP
   const conditioned = applyConditions(merged, Array.isArray(plan.proposedConditions) ? plan.proposedConditions : []);
   return applyOrder(conditioned, Array.isArray(plan.order) ? plan.order : []);
 }
+
+// ============================================
+// 6. Stacks (#233, P4a of #228): the question plan across layers
+// ============================================
+//
+// A route whose visa inherits a shared route is assessed against a STACK of
+// rulebooks: the shared (bloc / treaty) layer(s) first, the country's own layer
+// last (shared-routes/route-stack.ts). Each layer is drafted, checked, planned
+// and published ON ITS OWN, so each layer's question plan already holds for
+// that layer. What is new is the UNION the applicant answers: the merged view
+// built by rubric-stack.ts (every layer's questions, asked once each; a shared
+// layer's ids scoped by its rulebook key so two layers can never share an id).
+//
+// THE RULE. A rule's trigger, a question's `showWhen` and a document item's
+// `when` may only read a question of their OWN layer. A reference that names
+// no question of its own layer but one of ANOTHER layer is ambiguous: in the
+// layer's own published view it reads nothing (so the rule was published
+// without that link), and merging it would silently change what the rule
+// does. Such a stack is REJECTED, never quietly repaired.
+//
+// THE SIMULATION. The merged view is then simulated exactly as a single
+// rulebook is (`sizeQuestions`: the intake service's evaluation in served
+// order). A stack is rejected when it cannot be simulated as ONE question set:
+// a cross-layer reference (above), or an id that appears twice in the union
+// (two layers' answers would land on one key). What a layer already does on
+// its own (a condition on a question its own plan dropped, say) is the same
+// in the stack, because the merge keeps each layer's order and links, so it is
+// not a stack problem.
+//
+// Pure: no Firebase, no model. Nothing is removed from any layer (the owner's
+// rule: no question or rule is cut for size).
+
+/** One layer as the stack plan reads it: its rulebook key, its role, and its SERVED view (ids as the layer stores them). */
+export interface StackPlanLayer {
+  rulebookKey: string;
+  role: "shared" | "own";
+  view: PlanView;
+}
+
+/** Why a stack was refused. Codes are stable; `detail` names ids only (never source text). */
+export interface StackPlanProblem {
+  code: "cross_layer_reference" | "duplicate_id";
+  // The layer the problem is in (the merged view for `duplicate_id` and the order checks).
+  rulebookKey: string | null;
+  detail: string;
+}
+
+/** The outcome of planning a stack. `sizing` is present only when the stack was simulated. */
+export type StackPlanResult = { ok: true; sizing: QuestionPlan["sizing"] } | { ok: false; problems: StackPlanProblem[] };
+
+/**
+ * Every question id a layer's rules, questions and document items READ, with
+ * what reads it (for the problem text). Criterion ids are not read here: a
+ * question's `criterionIds` names rules, which the merge scopes together with
+ * the question, so it cannot cross a layer.
+ */
+function readsOf(view: PlanView): { questionId: string; by: string }[] {
+  const out: { questionId: string; by: string }[] = [];
+  for (const c of view.criteria ?? []) {
+    const t = ruleTriggerOf(c);
+    if (t) out.push({ questionId: t.questionId, by: `rule ${c.criterionId} (trigger)` });
+    for (const q of c.intakeQuestionIds ?? []) out.push({ questionId: q, by: `rule ${c.criterionId} (reads)` });
+  }
+  for (const q of view.intakeQuestions ?? []) for (const p of parentsOf(q)) out.push({ questionId: p, by: `question ${q.id} (shown when)` });
+  for (const e of view.evidenceItems ?? []) if (e.when) out.push({ questionId: e.when.questionId, by: `document item ${e.key} (when)` });
+  return out;
+}
+
+/**
+ * Plan a stack: refuse cross-layer references (in the layers as each stores
+ * them), then simulate the MERGED view. `merged` is the union the applicant is
+ * served (rubric-stack.ts `mergeRulebookStack`).
+ */
+export function planStack(layers: readonly StackPlanLayer[], merged: PlanView): StackPlanResult {
+  const problems: StackPlanProblem[] = [];
+
+  // ---- 1. every reference stays inside its own layer ----
+  const idsOf = layers.map((l) => new Set((l.view.intakeQuestions ?? []).map((q) => q.id)));
+  layers.forEach((layer, i) => {
+    for (const r of readsOf(layer.view)) {
+      if (idsOf[i].has(r.questionId)) continue; // its own question: fine
+      const other = layers.findIndex((_l, j) => j !== i && idsOf[j].has(r.questionId));
+      // A reference that names no question anywhere reads nothing, as it
+      // already does in the layer's own published view: not a stack problem.
+      if (other < 0) continue;
+      problems.push({
+        code: "cross_layer_reference",
+        rulebookKey: layer.rulebookKey,
+        detail: `${r.by} reads question ${r.questionId}, which is not in its own layer but in ${layers[other].rulebookKey}; a rule or question may only read a question of its own layer`,
+      });
+    }
+  });
+
+  // ---- 2. the merged set: every id once ----
+  const questionIds = new Set<string>();
+  for (const q of merged.intakeQuestions ?? []) {
+    if (questionIds.has(q.id)) problems.push({ code: "duplicate_id", rulebookKey: null, detail: `question ${q.id} appears twice in the stack` });
+    questionIds.add(q.id);
+  }
+  const evidenceKeys = new Set<string>();
+  for (const e of merged.evidenceItems ?? []) {
+    if (evidenceKeys.has(e.key)) problems.push({ code: "duplicate_id", rulebookKey: null, detail: `document item ${e.key} appears twice in the stack` });
+    evidenceKeys.add(e.key);
+  }
+  const criterionIds = new Set<string>();
+  for (const c of merged.criteria ?? []) {
+    if (criterionIds.has(c.criterionId)) problems.push({ code: "duplicate_id", rulebookKey: null, detail: `rule ${c.criterionId} appears twice in the stack` });
+    criterionIds.add(c.criterionId);
+  }
+  if (problems.length > 0) return { ok: false, problems };
+  // ---- 3. the simulation itself ----
+  return { ok: true, sizing: sizeQuestions(merged) };
+}

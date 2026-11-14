@@ -15,6 +15,8 @@ import { checkWithinLimit, paymentRequired } from "../middleware/authz";
 import { checkApplicationAccessForRequest } from "../utils/access";
 import { complianceService } from "../services/compliance.service";
 import { intakeService, IntakeValidationError } from "../services/intake.service";
+// Issue #235: which member country a shared-route application goes through.
+import { competenceService, CompetenceError } from "../services/competence.service";
 import { answersService, AnswerValidationError } from "../services/answers.service";
 import { isWithinApplicantEditWindow } from "../utils/editable-window";
 import { LIMITS, ROLES } from "@durin-tech/authz";
@@ -25,11 +27,28 @@ import {
   sendNoContent,
   ErrorMessages,
 } from "../utils/response";
+import type { RulebookStackLayer } from "../types/rubric";
+import { withThroughCountryFlag } from "../shared-routes/through-country-rule";
+import { stackLayersField, type PublicStackLayer } from "../shared-routes/stack-layers-view";
 import {
   Application,
   ApplicationStatus,
   NotificationChannel,
+  ThroughCountryChoice,
 } from "../types";
+
+/**
+ * Issue #234: an application WITHOUT its copy of the applicant's holdings
+ * (`applicantFacts`: nationalities, residence, held documents; personal data).
+ * Used on case lists, which are not behind `checkApplicationAccess`; the copy
+ * is only returned by GET /applications/:id. Exported for tests.
+ */
+export function withoutApplicantFacts(app: Application): Application {
+  if (app.applicantFacts === undefined) return app;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { applicantFacts: _omitted, ...rest } = app;
+  return rest as Application;
+}
 
 export class ApplicationController {
   /**
@@ -47,15 +66,30 @@ export class ApplicationController {
   ): Promise<void> {
     try {
       const userId = req.userId!;
-      const { visaTypeId, countryCode, mode, agentId, userNotes, confirmNew } =
+      const { mode, agentId, userNotes, confirmNew, sharedRouteId, throughCountryCode, competenceAnswers } =
         req.body;
+      // Issue #235: on a SHARED route the client sends `sharedRouteId` +
+      // `throughCountryCode` (the member country the applicant confirmed)
+      // instead of a country and visa; both are then taken from that member's
+      // own inheriting record below.
+      let { visaTypeId, countryCode } = req.body;
+      const viaSharedRoute = sharedRouteId !== undefined;
 
       // Validate required fields
-      if (!visaTypeId || !countryCode || !mode) {
+      if (viaSharedRoute && (visaTypeId !== undefined || countryCode !== undefined)) {
         sendError(
           res,
           "VALIDATION_ERROR",
-          "visaTypeId, countryCode, and mode are required",
+          "Send either sharedRouteId and throughCountryCode, or visaTypeId and countryCode, not both",
+          400
+        );
+        return;
+      }
+      if (viaSharedRoute ? !throughCountryCode || !mode : !visaTypeId || !countryCode || !mode) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          viaSharedRoute ? "sharedRouteId, throughCountryCode, and mode are required" : "visaTypeId, countryCode, and mode are required",
           400
         );
         return;
@@ -81,6 +115,24 @@ export class ApplicationController {
           400
         );
         return;
+      }
+
+      // Issue #235: check the confirmed member country (a destination of the
+      // route TODAY, with a record this case may use: 422 otherwise) and take
+      // the country and visa from that member's own record. The case's agency
+      // (from its agent) decides which records may be used, exactly as for any
+      // case, so an agency-only record of another agency is never used.
+      let throughCountry: { choice: ThroughCountryChoice; answers: Record<string, unknown>; routeName?: string } | undefined;
+      if (viaSharedRoute) {
+        const caseAgencyId = await applicationService.resolveAgentAgencyId(mode === "agent" ? agentId : undefined);
+        const resolved = await competenceService.resolveForCreate(
+          { sharedRouteId, throughCountryCode, answers: competenceAnswers },
+          caseAgencyId,
+          { uid: userId, role: req.authz?.role }
+        );
+        countryCode = resolved.countryCode;
+        visaTypeId = resolved.visaTypeId;
+        throughCountry = { choice: resolved.choice, answers: resolved.answers, routeName: resolved.routeName };
       }
 
       // Duplicate guard (#253): the user already has a live application for
@@ -111,6 +163,7 @@ export class ApplicationController {
                 id: existing.id,
                 visaTypeName: existing.visaTypeName,
                 countryName: existing.countryName,
+                ...(existing.routeName ? { routeName: existing.routeName } : {}),
                 status: existing.status,
                 progress: existing.progress,
                 mode: existing.mode,
@@ -139,10 +192,20 @@ export class ApplicationController {
         mode,
         agentId,
         userNotes,
+        throughCountry,
       });
 
-      sendCreated(res, application, "Application created successfully");
+      sendCreated(res, withThroughCountryFlag(application), "Application created successfully");
     } catch (error) {
+      // Issue #235: the "apply through" refusals carry their own status and plain message.
+      if (error instanceof CompetenceError) {
+        sendError(res, error.code, error.message, error.status);
+        return;
+      }
+      if (error instanceof IntakeValidationError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
       console.error("Error creating application:", error);
       if ((error as Error).message === "Visa type not found") {
         sendError(res, "NOT_FOUND", "Visa type not found", 404);
@@ -534,8 +597,14 @@ export class ApplicationController {
         applications = applications.filter((app) => app.mode === mode);
       }
 
+      // Issue #234: a case LIST never carries the applicant's holdings copy
+      // (`applicantFacts`, personal data): the lists above are not filtered by
+      // `checkApplicationAccess`, so the copy is returned only by
+      // GET /applications/:id, which is.
+      applications = applications.map(withoutApplicantFacts);
+
       // Resolve who is handling each case so client-facing UIs can name them.
-      sendSuccess(res, await this.withHandlerNames(applications));
+      sendSuccess(res, (await this.withHandlerNames(applications)).map(withThroughCountryFlag));
     } catch (error) {
       console.error("Error getting applications:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -568,7 +637,7 @@ export class ApplicationController {
       }
 
       const [enriched] = await this.withHandlerNames([application]);
-      sendSuccess(res, enriched);
+      sendSuccess(res, withThroughCountryFlag(enriched));
     } catch (error) {
       console.error("Error getting application:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -592,7 +661,7 @@ export class ApplicationController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
-      sendSuccess(res, await intakeService.getIntake(application));
+      sendSuccess(res, await this.withStackLayers(await intakeService.getIntake(application)));
     } catch (error) {
       console.error("Error getting application intake:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -617,7 +686,7 @@ export class ApplicationController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
-      sendSuccess(res, await intakeService.saveIntake(application, req.body?.answers));
+      sendSuccess(res, await this.withStackLayers(await intakeService.saveIntake(application, req.body?.answers)));
     } catch (error) {
       if (error instanceof IntakeValidationError) {
         sendError(res, "VALIDATION_ERROR", error.message, 400);
@@ -633,6 +702,46 @@ export class ApplicationController {
       }
       // Never log the answers: they are personal data.
       console.error("Error saving application intake:", error instanceof Error ? error.message : "unknown");
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /applications/:id/through-country  (issue #235, P6 of #228)
+   * Body `{ throughCountryCode }`. Change the member country a shared-route
+   * application goes through, BEFORE submission. Needs `update` access.
+   * Answers `{ changed, application, answersKept, answersSetAside }`.
+   * 404 unknown application or route; 403 no access; 400 bad code or body;
+   * 409 NOT_SHARED_ROUTE / NOT_EDITABLE / ALREADY_PAID; 422
+   * COUNTRY_NOT_A_DESTINATION (not a member of the route today) /
+   * COUNTRY_NOT_OFFERED (no record this case may use).
+   */
+  async changeThroughCountry(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "update")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? (req.body as Record<string, unknown>) : {};
+      const extra = Object.keys(body).find((k) => k !== "throughCountryCode");
+      if (extra) {
+        sendError(res, "VALIDATION_ERROR", `"${extra}" is not a known field`, 400);
+        return;
+      }
+      const result = await competenceService.changeThroughCountry(application, body.throughCountryCode, { uid: req.userId!, role: req.authz?.role });
+      sendSuccess(res, { ...result, application: withThroughCountryFlag(result.application) });
+    } catch (error) {
+      if (error instanceof CompetenceError) {
+        sendError(res, error.code, error.message, error.status);
+        return;
+      }
+      // Never log answers: they are personal data.
+      console.error("Error changing the country applied through:", error instanceof Error ? error.message : "unknown");
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }
@@ -844,7 +953,7 @@ export class ApplicationController {
           .catch((e) => console.error("[application] assign notify failed:", e));
       }
 
-      sendSuccess(res, updated, "Application updated successfully");
+      sendSuccess(res, updated ? withThroughCountryFlag(updated) : updated, "Application updated successfully");
     } catch (error) {
       console.error("Error updating application:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -1041,7 +1150,7 @@ export class ApplicationController {
         actorName,
       });
 
-      sendSuccess(res, updated, "Status updated successfully");
+      sendSuccess(res, updated ? withThroughCountryFlag(updated) : updated, "Status updated successfully");
     } catch (error) {
       console.error("Error updating status:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -1123,6 +1232,11 @@ export class ApplicationController {
    * NOTE `Application.agentId` is a USER uid (unlike Conversation.agentId, which
    * is an agent DOC id), so agents are resolved by querying on `userId`.
    */
+  /** (#237) Add the app-facing `stackLayers` to an intake response (from its `layers`; omitted on a single-layer route). */
+  private async withStackLayers<T extends { layers?: RulebookStackLayer[] }>(intake: T): Promise<T & { stackLayers?: PublicStackLayer[] }> {
+    return { ...intake, ...(await stackLayersField(intake.layers)) };
+  }
+
   private async withHandlerNames(
     applications: Application[]
   ): Promise<Application[]> {

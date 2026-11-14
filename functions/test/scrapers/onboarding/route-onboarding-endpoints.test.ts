@@ -159,6 +159,45 @@ describe("the contract the portal builds against", () => {
     assert.equal(over.body.error, "DAILY_LIMIT_REACHED");
   });
 
+  test("issue #232 / #233 P4b: start takes authorityId (countryCode still accepted); a bloc route starts a SHARED layer's run only when its shared route exists and is active", async () => {
+    // authorityId in place of countryCode: same run key for a country.
+    const ok = await api("POST", "", "t-admin", { authorityId: COUNTRY, visaTypeId: VISA_ID });
+    assert.equal(ok.status, 201, JSON.stringify(ok.body));
+    assert.equal(ok.body.data.run.routeKey, ROUTE_KEY);
+    // Both keys at once, or a malformed authority id: 400.
+    assert.equal((await api("POST", "", "t-admin", { authorityId: COUNTRY, countryCode: COUNTRY, visaTypeId: VISA_ID })).status, 400);
+    assert.equal((await api("POST", "", "t-admin", { authorityId: "bad_id", visaTypeId: VISA_ID })).status, 400);
+    // A route registered under a made-up bloc: visaSources/{authorityId}, jurisdiction = authorityId.
+    store.set("visaSources/test-bloc", {
+      id: "test-bloc", authorityId: "test-bloc", status: "active",
+      pages: [{ url: "https://bloc.invalid/short-stay", routeName: "Short stay", validation: "unverified", visaId: "test-bloc-short-stay", addedVia: "portal" }],
+    });
+    store.set("guidanceSources/test-bloc-rules", { title: "Rules", url: "https://bloc.invalid/rules", jurisdiction: "test-bloc", route: "short-stay", role: "primary", status: "active", verificationStatus: "registered" });
+    const before = runDocs().length;
+    // (#233 P4b) No shared route with that id for the bloc: 422, nothing written.
+    const bloc = await api("POST", "", "t-admin", { authorityId: "test-bloc", visaTypeId: "test-bloc-short-stay" });
+    assert.equal(bloc.status, 422, JSON.stringify(bloc.body));
+    assert.equal(bloc.body.error, "SHARED_ROUTE_NOT_FOUND");
+    // Another authority's shared route, or a retired one: refused the same way, nothing written.
+    store.set("sharedRoutes/test-bloc-short-stay", { id: "test-bloc-short-stay", issuingAuthorityId: "test-other", status: "active" });
+    assert.equal((await api("POST", "", "t-admin", { authorityId: "test-bloc", visaTypeId: "test-bloc-short-stay" })).body.error, "SHARED_ROUTE_NOT_FOUND");
+    store.set("sharedRoutes/test-bloc-short-stay", { id: "test-bloc-short-stay", issuingAuthorityId: "test-bloc", status: "retired" });
+    assert.equal((await api("POST", "", "t-admin", { authorityId: "test-bloc", visaTypeId: "test-bloc-short-stay" })).body.error, "SHARED_ROUTE_NOT_ACTIVE");
+    // An unregistered route of the bloc is still a plain 404.
+    assert.equal((await api("POST", "", "t-admin", { authorityId: "test-bloc", visaTypeId: "test-bloc-other" })).body.error, "ROUTE_NOT_REGISTERED");
+    assert.equal(runDocs().length, before);
+    assert.equal(store.has("routeOnboardingRoutes/test-bloc_test-bloc-short-stay"), false);
+    // The bloc's own, active shared route: a run on the SHARED layer, keyed {authorityId}_{routeSlug}, no country.
+    store.set("sharedRoutes/test-bloc-short-stay", { id: "test-bloc-short-stay", issuingAuthorityId: "test-bloc", status: "active" });
+    const started = await api("POST", "", "t-admin", { authorityId: "test-bloc", visaTypeId: "test-bloc-short-stay" });
+    assert.equal(started.status, 201, JSON.stringify(started.body));
+    assert.equal(started.body.data.run.routeKey, "test-bloc_test-bloc-short-stay");
+    assert.deepEqual([started.body.data.run.layer, started.body.data.run.authorityId, started.body.data.run.routeSlug, started.body.data.run.countryCode], ["shared", "test-bloc", "test-bloc-short-stay", null]);
+    // The existing run list shows both kinds.
+    const listed = await api("GET", "", "t-admin");
+    assert.deepEqual(listed.body.data.runs.map((r: any) => r.layer).sort(), ["own", "shared"]);
+  });
+
   test("get: the run with steps, estimate, counters, links, checklist; no lease or retry internals", async () => {
     const run = await oh.svc.start(COUNTRY, VISA_ID, "admin-uid");
     await pump(oh, run.runId);
@@ -166,7 +205,7 @@ describe("the contract the portal builds against", () => {
     assert.equal(r.status, 200);
     const v = r.body.data.run;
     assert.equal(v.status, "awaiting_confirmation");
-    assert.deepEqual(Object.keys(v).sort(), ["allowlist", "cancelRequested", "confirmation", "counters", "countryCode", "createdAt", "createdBy", "estimate", "finishedAt", "holdReason", "links", "routeKey", "runId", "status", "steps", "summary", "unchanged", "updatedAt", "visaTypeId", "voidedConfirmations"].sort());
+    assert.deepEqual(Object.keys(v).sort(), ["allowlist", "authorityId", "cancelRequested", "confirmation", "counters", "countryCode", "createdAt", "createdBy", "estimate", "finishedAt", "holdReason", "layer", "links", "routeKey", "routeSlug", "runId", "status", "steps", "summary", "unchanged", "updatedAt", "visaTypeId", "voidedConfirmations"].sort());
     assert.equal(typeof v.createdAt, "string");
     assert.equal(typeof v.estimate.createdAt, "string");
     assert.deepEqual(Object.keys(v.counters).sort(), ["calls", "chunksDone", "chunksTotal", "costUsd", "inputTokens", "outputTokens"]);
@@ -179,7 +218,7 @@ describe("the contract the portal builds against", () => {
     await oh.svc.start(COUNTRY, VISA_ID, "admin-uid");
     const all = await api("GET", "", "t-admin");
     assert.equal(all.body.data.total, 1);
-    assert.deepEqual(Object.keys(all.body.data.runs[0]).sort(), ["countryCode", "counters", "createdAt", "createdBy", "finishedAt", "holdReason", "routeKey", "runId", "status", "summary", "visaTypeId"].sort());
+    assert.deepEqual(Object.keys(all.body.data.runs[0]).sort(), ["authorityId", "countryCode", "counters", "createdAt", "createdBy", "finishedAt", "holdReason", "layer", "routeKey", "routeSlug", "runId", "status", "summary", "visaTypeId"].sort());
     assert.equal((await api("GET", "?status=failed", "t-admin")).body.data.total, 0);
     assert.equal((await api("GET", "?status=bogus", "t-admin")).status, 400);
     assert.equal((await api("GET", "?limit=0", "t-admin")).status, 400);

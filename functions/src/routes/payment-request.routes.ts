@@ -34,6 +34,13 @@ paymentRequestRoutes.put("/:id/approve", verifyAuth, (req, res) =>
   paymentRequestController.approvePaymentRequest(req, res)
 );
 
+// Resume / re-issue the checkout of an approved, unpaid request (issues #152,
+// #181): the same checkout inside the quote lock, a fresh quote after it.
+// Only the request's client (or an admin); checked in the controller.
+paymentRequestRoutes.post("/:id/checkout", verifyAuth, (req, res) =>
+  paymentRequestController.checkoutPaymentRequest(req, res)
+);
+
 // Complete a payment after the client returns from Paystack. This is the only
 // path that marks a request "paid" and books the money-side effects.
 paymentRequestRoutes.post("/:id/verify", verifyAuth, (req, res) =>

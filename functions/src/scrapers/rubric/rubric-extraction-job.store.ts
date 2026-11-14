@@ -1,3 +1,4 @@
+import type { RulebookKeyFields } from "../../types/rubric";
 import type { Timestamp, Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../utils/firebase";
 import type { RubricRunUsage } from "../../types/rubric";
@@ -94,11 +95,11 @@ export interface StepFailure {
 }
 
 /** `rubricExtractionJobs/{jobId}`. */
-export interface RubricExtractionJob {
+export interface RubricExtractionJob extends RulebookKeyFields {
   jobId: string;
-  routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) routeKey + authorityId + routeSlug (+ countryCode / visaTypeId for a
+  // country's rulebook): see RulebookKeyFields. A job written before #233 has
+  // only the country pair; `rulebookPartsOf` reads either.
   status: JobStatus;
   // Machine-readable reason for failed / skipped / cancelled (an existing run
   // stop code such as `provider_error`, `run_cap_exceeded`, or `cancelled`).
@@ -120,6 +121,9 @@ export interface RubricExtractionJob {
   model: string;
   promptVersion: string;
   routeName: string;
+  // (#234) The bloc / treaty authorities the drafting message lists, pinned when the job
+  // starts so every invocation sends the same requests. Absent on jobs started before #234 (= none).
+  groupAuthorities?: { id: string; name: string }[];
   pinned: RunSettingsPin & { stepAttemptsMax: number };
   plan: PlannedSource[];
   // Fingerprint of every chunk (`sourceId#chunkIndex#characters`), so a change

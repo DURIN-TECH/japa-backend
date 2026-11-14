@@ -2,6 +2,7 @@ import { Router } from "express";
 import { userController } from "../controllers/user.controller";
 import { clientVerificationController } from "../controllers/client-verification.controller";
 import { aiMessageAccessController } from "../controllers/ai-message-access.controller";
+import { applicantHoldingsController } from "../controllers/applicant-holdings.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
 
 const router = Router();
@@ -45,6 +46,28 @@ router.post("/me/password-changed", verifyAuth, (req, res) =>
 );
 router.post("/me/change-email", verifyAuth, (req, res) =>
   userController.changeEmail(req, res)
+);
+
+// What the applicant holds (issue #234, P5 of #228): nationalities, country of
+// residence and held visas / permits / travel authorisations. ALWAYS the
+// caller's own profile (/me): no route names another user, so nobody else can
+// read or change them. The agent side sees an application's COPY only, through
+// GET /applications/:id (checkApplicationAccess).
+//   GET    /me/holdings                          -> HoldingsView
+//   PUT    /me/holdings                          -> replace any of the three fields
+//   POST   /me/holdings/documents                -> add one held document (201)
+//   DELETE /me/holdings/documents/:documentId    -> remove one held document
+router.get("/me/holdings", verifyAuth, (req, res) =>
+  applicantHoldingsController.get(req, res)
+);
+router.put("/me/holdings", verifyAuth, (req, res) =>
+  applicantHoldingsController.update(req, res)
+);
+router.post("/me/holdings/documents", verifyAuth, (req, res) =>
+  applicantHoldingsController.addDocument(req, res)
+);
+router.delete("/me/holdings/documents/:documentId", verifyAuth, (req, res) =>
+  applicantHoldingsController.removeDocument(req, res)
 );
 
 // Notification channel preferences (email/push on-off). PATCH a partial body to

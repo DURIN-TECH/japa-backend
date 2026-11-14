@@ -1,5 +1,6 @@
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db } from "../../utils/firebase";
+import { rulebookPartsOf } from "./rubric-key";
 
 // ============================================
 // RUBRIC AUTOMATIC PUBLISHING — SETTINGS AND KILL SWITCH (issue #201)
@@ -143,8 +144,15 @@ type ShareKey = keyof typeof SHARE_RANGES;
 
 /** Most route keys an allowlist may hold. */
 export const MAX_ROUTE_ALLOWLIST = 200;
-/** What a route key looks like (the head doc id: country code + visa type id). */
-const ROUTE_KEY_RE = /^[A-Z]{2}_[A-Za-z0-9][A-Za-z0-9_-]*$/;
+/**
+ * What a route key looks like: the head doc id. (#233) Any issuing authority's
+ * rulebook key `{authorityId}_{routeSlug}` (a country's `{countryCode}_{visaTypeId}`
+ * as before, or a bloc / treaty's shared layer), checked by the authority id
+ * rules. An object with a `test` method so every existing use reads the same.
+ * Without this a bloc key in the allowlist would make the WHOLE list invalid,
+ * and the list fails closed (publish nowhere).
+ */
+const ROUTE_KEY_RE = { test: (k: string): boolean => /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(k) && rulebookPartsOf({ routeKey: k }) !== null };
 
 /** Result of resolving a stored doc. */
 export interface ResolvedPublishSettings {

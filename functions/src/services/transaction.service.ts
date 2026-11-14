@@ -185,35 +185,70 @@ class TransactionService {
   }
 
   /**
-   * Create an escrow release transaction when a payment request is approved.
-   * Records the release of held funds to the agent.
+   * Build (but do not write) the Transaction for a PAID payment request
+   * (issue #181). Used inside the settlement's Firestore transaction
+   * (services/payment-request-settlement.service.ts), which writes it in the
+   * SAME commit that flips the request to paid, so a request is never paid
+   * without its Transaction and a second settlement never writes a second one.
+   *
+   * Kept as `type: "escrow_release"` / `status: "released"` (what the
+   * settlement wrote before #181), so earnings and dashboards read it as
+   * before. What changed:
+   *  - `amount` is what Paystack actually charged, in minor units of
+   *    `currency` = the request's `chargedCurrency` (a legacy naira request:
+   *    its kobo amount with "NGN", as before);
+   *  - `snapshot` carries `priceUsdCents` and the rate snapshot (`fxRate`,
+   *    `fxRateAsOf`, `fxRateSource`, `fxMarginBps`, `chargedCurrency`,
+   *    `chargedAmountMinor`); a legacy request has none;
+   *  - `paymentProvider` is "paystack" with the Paystack reference, and
+   *    `agentId` is the agent's USER uid (what GET /transactions filters
+   *    on), not the agent profile id the old record carried.
    */
-  async createEscrowRelease(paymentRequest: PaymentRequest): Promise<Transaction> {
-    const ref = collections.transactions.doc();
-    const now = Timestamp.now();
-
-    const transaction: Transaction = {
-      id: ref.id,
-      userId: paymentRequest.clientId,
-      agentId: paymentRequest.agentId,
-      applicationId: paymentRequest.applicationId,
+  buildPaymentRequestPayment(
+    id: string,
+    now: Timestamp,
+    input: {
+      paymentRequest: PaymentRequest;
+      /** The requesting agent's user uid (falls back to the profile id when unknown). */
+      agentUserId: string;
+      /** Minor units of `currency`, like every Transaction.amount. */
+      amount: number;
+      /** ISO 4217 code of the charge. */
+      currency: string;
+      /** Paystack transaction reference. */
+      reference: string;
+      /** The request's charge snapshot (empty for a legacy naira request). */
+      snapshot?: Partial<ChargeSnapshot>;
+    }
+  ): Transaction {
+    const pr = input.paymentRequest;
+    return {
+      // Snapshot first, so the explicit fields below always win.
+      ...(input.snapshot ?? {}),
+      id,
+      userId: pr.clientId,
+      agentId: input.agentUserId,
+      applicationId: pr.applicationId,
+      paymentRequestId: pr.id,
       type: "escrow_release",
-      amount: paymentRequest.amount,
-      currency: paymentRequest.currency,
+      amount: input.amount,
+      currency: input.currency,
       status: "released",
       isEscrow: false,
-      paymentProvider: "manual",
-      description: `Escrow release for: ${paymentRequest.description}`,
+      paymentProvider: "paystack",
+      providerTransactionId: input.reference,
+      description: `Escrow release for: ${pr.description}`,
       metadata: {
-        paymentRequestId: paymentRequest.id,
-        category: paymentRequest.category,
+        paymentRequestId: pr.id,
+        category: pr.category,
+        reference: input.reference,
+        agentProfileId: pr.agentId,
       },
+      ...(pr.clientName !== undefined ? { clientName: pr.clientName } : {}),
+      ...(pr.clientEmail !== undefined ? { clientEmail: pr.clientEmail } : {}),
       createdAt: now,
       updatedAt: now,
     };
-
-    await ref.set(transaction);
-    return transaction;
   }
 
   /**

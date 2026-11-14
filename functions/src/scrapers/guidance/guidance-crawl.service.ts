@@ -1,4 +1,5 @@
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
+import { isAcceptableEuLawFinalUrl, isEuLawCelexUrl } from "../shared/fetch/eu-law";
 import { collections, db, subcollections } from "../../utils/firebase";
 // The ONE fetch path every crawler uses (robots.txt, per-host gap, 429/503
 // backoff, PDF reading). The guidance crawl calls it directly: it is not
@@ -399,7 +400,12 @@ export class GuidanceCrawlService {
    * Issue #215: where the confirmed-hosts allow-list comes from. Tests replace
    * it. Called at most once per portal-added source crawl.
    */
-  confirmedHosts: () => Promise<Set<string>> = () => officialDomainsService.confirmedHosts();
+  // Issue #232: the allow-list is PER AUTHORITY. A portal-added source may
+  // only be read from websites confirmed for the authority it belongs to (its
+  // `jurisdiction`), never from a website confirmed for some other country or
+  // bloc. The argument is that authority id.
+  confirmedHosts: (authorityId: string) => Promise<Set<string>> = (authorityId) =>
+    officialDomainsService.confirmedHostsFor(authorityId);
   /** The snapshot text store in use. */
   private get store(): GuidanceSnapshotStore {
     return this.injectedStore ?? guidanceSnapshotStore;
@@ -916,7 +922,8 @@ export class GuidanceCrawlService {
     //    unchanged (they have their own `expectedFinalUrl` baseline).
     let allowedHost: ((h: string) => boolean) | undefined;
     if (source.addedVia === "portal") {
-      const hosts = await this.confirmedHosts();
+      // #232: only the hosts confirmed for this source's own authority.
+      const hosts = await this.confirmedHosts(source.jurisdiction);
       allowedHost = (h: string) => hosts.has(h.toLowerCase());
     }
     const page = await this.fetcher.fetchAndClean(requestUrl, {
@@ -951,7 +958,11 @@ export class GuidanceCrawlService {
     //    target. Both URLs are always recorded. See sameDocumentUrl() for
     //    what counts as the same address.
     const baseline = resolveFrom ? requestUrl : source.expectedFinalUrl || source.finalUrl || source.url;
-    if (!sameDocumentUrl(baseline, page.finalUrl)) {
+    // Issue #261: a publications.europa.eu CELEX address always redirects to
+    // /resource/cellar/<uuid>/DOC_1 on the same host (the fetch service has
+    // already enforced that), so that redirect is the expected one, not a change.
+    const euLawRedirect = isEuLawCelexUrl(requestUrl) && isAcceptableEuLawFinalUrl(requestUrl, page.finalUrl);
+    if (!euLawRedirect && !sameDocumentUrl(baseline, page.finalUrl)) {
       throw new GuidanceCrawlError(
         "redirect_changed",
         `Unexpected redirect for ${requestUrl}: expected to end at ${baseline}, got ${page.finalUrl}` +

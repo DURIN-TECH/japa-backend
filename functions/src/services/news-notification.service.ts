@@ -1,4 +1,5 @@
-import { collections, messaging } from "../utils/firebase";
+import { collections } from "../utils/firebase";
+import { notificationService } from "./notification.service";
 import { NewsArticle, NewsSubscription, ArticleImportance } from "../types/news";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -77,37 +78,26 @@ class NewsNotificationService {
           continue;
         }
 
-        // Get user's FCM tokens
-        const userDoc = await collections.users.doc(sub.userId).get();
-        const user = userDoc.data();
-
-        if (user?.fcmTokens?.length) {
-          await messaging.sendEachForMulticast({
-            tokens: user.fcmTokens,
-            notification: {
-              title: this.formatNotificationTitle(article),
-              body: article.summary.slice(0, 150),
-            },
-            data: {
-              type: "visa_news",
-              articleId: article.id,
-              countryCodes: article.countryCodes.join(","),
-              importance: article.importance,
-            },
-          });
-        }
-
-        // Create in-app notification record
-        await collections.notifications.add({
+        // Deliver through the unified notifier: it writes the inbox record and
+        // sends the push (with the sound/badge payload, dead-token pruning and
+        // the user's `notificationPreferences.push` opt-out). One body for both
+        // inbox and push. Explicit channels so this stays in_app + push whatever
+        // the central per-type policy says.
+        await notificationService.notifyUser({
           userId: sub.userId,
           type: "visa_news",
           title: this.formatNotificationTitle(article),
-          body: article.summary.slice(0, 200),
+          body: article.summary.slice(0, 150),
+          channels: ["in_app", "push"],
           relatedEntityType: "news_article",
           relatedEntityId: article.id,
           actionUrl: `/news/${article.id}`,
-          isRead: false,
-          createdAt: Timestamp.now(),
+          // FCM data values must be strings.
+          data: {
+            articleId: article.id,
+            countryCodes: article.countryCodes.join(","),
+            importance: article.importance,
+          },
         });
 
         sentCount++;

@@ -53,8 +53,8 @@ beforeEach(() => {
 });
 
 /** A confirmed host doc. */
-const confirmed = (host: string, countryCode: string) =>
-  store.set(`officialDomains/${host}`, { host, countryCode, status: "confirmed", confirmedBy: "u", confirmedAt: Timestamp.now(), statement: "An agency", addedVia: "portal" });
+const confirmed = (host: string, authorityId: string) =>
+  store.set(`officialDomains/${host}`, { host, authorityId, status: "confirmed", confirmedBy: "u", confirmedAt: Timestamp.now(), statement: "An agency", addedVia: "portal" });
 
 /** Register one route on `cc` through the real service (fetch faked). */
 async function registerOn(cc: string, host: string, path: string): Promise<void> {
@@ -65,7 +65,7 @@ async function registerOn(cc: string, host: string, path: string): Promise<void>
   fetcher.pages.set(rules, {});
   await registration.register(
     {
-      countryCode: cc,
+      authorityId: cc,
       routeName: `Route ${path}`,
       visaPage: { url: visa, language: "en" },
       guidance: [{ url: rules, title: `Rules ${path}`, role: "primary", docType: "html", language: "en" }],
@@ -218,7 +218,9 @@ describe("one-off import of the built-in hosts", () => {
     assert.equal(d.status, "confirmed");
     assert.equal(d.confirmedBy, "system:seed");
     assert.equal(d.addedVia, "seed");
-    assert.equal(d.countryCode, "AA");
+    // Issue #232: written as the country's authority; the old field is not written.
+    assert.equal(d.authorityId, "AA");
+    assert.equal(d.countryCode, undefined);
     assert.ok(!store.has("officialDomains/*.apps.example.org"));
     const audits = [...store.keys()].filter((p) => p.startsWith("sourceRegistryAudit/"));
     assert.equal(audits.length, 2);

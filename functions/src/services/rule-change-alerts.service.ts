@@ -10,6 +10,7 @@ import {
   MAX_SOURCE_URLS,
   MAX_SUMMARY_LINES,
   guidanceEventId,
+  layerEventId,
   ruleChangeNoticeId,
   visaEventId,
   type RuleChangeCriterionLine,
@@ -23,6 +24,9 @@ import { noteService } from "./note.service";
 import { notificationService } from "./notification.service";
 import { diffRubricVersions } from "./rubric-diff";
 import type { RubricReviewAuditEntry } from "./rubric-review.service";
+// (#233 P4b) The member routes and open applications of a shared layer (the service itself, not the module index).
+import { sharedRouteService } from "../shared-routes/shared-route.service";
+import type { SharedRoute } from "../types/shared-route";
 
 // ============================================
 // RULE-CHANGE ALERTS FOR IN-FLIGHT APPLICATIONS (issue #123)
@@ -80,6 +84,14 @@ import type { RubricReviewAuditEntry } from "./rubric-review.service";
 //  5. RECORD. Each handled application gets an activity note on the case
 //     (`noteService.addActivityNote`, staff-side) saying what was sent to whom,
 //     and its notice document holds the outcome.
+//
+// ---- (#233 P4b) A SHARED layer's new version ----
+// One event per affected MEMBER route (`recordLayerApproval`), keyed by the
+// layer, the version and the member route (`layerEventId`). The summary is the
+// shared layer's own diff; on the member route only applications whose stack
+// includes the layer are told (`skippedOtherStack` counts the rest). The staff
+// message says the shared rules changed and that the refresh waits for an
+// admin's confirmation of the re-assessment (the bulk fan-out).
 //
 // ---- Re-assessment ----
 // A rubric change re-assesses through #37's bulk path (the same approval starts
@@ -163,6 +175,19 @@ export interface RuleChangeDeps {
   notify: typeof notificationService.notifyUser;
   addNote: typeof noteService.addActivityNote;
   now(): Date;
+  // (#233 P4b) The member routes affected by a shared layer: every visa record
+  // that inherits it today plus every route an open application on the layer
+  // applied through. Optional so fakes written before P4b still type-check;
+  // without it a shared approval records nothing.
+  memberRoutesOfLayer?(route: Pick<SharedRoute, "id" | "issuingAuthorityId">): Promise<{ countryCode: string; visaTypeId: string }[]>;
+}
+
+/** (#233 P4b) The default member routes of a shared layer: records inheriting it, plus routes its open applications use. */
+async function defaultMemberRoutesOfLayer(route: Pick<SharedRoute, "id" | "issuingAuthorityId">): Promise<{ countryCode: string; visaTypeId: string }[]> {
+  const [records, apps] = await Promise.all([sharedRouteService.memberRecordsOf(route), sharedRouteService.openApplicationsUsing(route)]);
+  const byKey = new Map<string, { countryCode: string; visaTypeId: string }>();
+  for (const r of [...records, ...apps.map((a) => ({ countryCode: a.countryCode, visaTypeId: a.visaTypeId }))]) byKey.set(`${r.countryCode}_${r.visaTypeId}`, r);
+  return [...byKey.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, r]) => r);
 }
 
 /** The default deps: the real store, notifier and note service. */
@@ -172,6 +197,7 @@ function defaultDeps(): RuleChangeDeps {
     notify: (input) => notificationService.notifyUser(input),
     addNote: (applicationId, content, actor) => noteService.addActivityNote(applicationId, content, actor),
     now: () => new Date(),
+    memberRoutesOfLayer: defaultMemberRoutesOfLayer,
   };
 }
 
@@ -330,7 +356,11 @@ export function staffMessage(event: RuleChangeEvent, route: string): AlertMessag
       title: `Published rules changed for ${route}`,
       body:
         `Updated on ${dateOf(event.approvedAt)}: ${s.addedCount} added, ${s.removedCount} removed and ${s.changedCount} changed. ` +
-        `${parts.join(" ")}${source} The assessment is being refreshed. The client has not been told.`,
+        // (#233 P4b) A shared layer's change: say whose rules changed, and that the refresh waits for a confirmation.
+        (event.layerKey ? `These are the shared rules (${event.layerKey}) this route applies with its own. ` : "") +
+        `${parts.join(" ")}${source} ` +
+        (event.layerKey ? "The assessment will be refreshed once an admin confirms the re-assessment." : "The assessment is being refreshed.") +
+        " The client has not been told.",
     };
   }
   const lines = (event.fieldChanges ?? []).map(printFieldLine).join("; ");
@@ -467,13 +497,18 @@ export class RuleChangeAlertsService {
   async recordRubricApproval(auditId: string, entry: RubricReviewAuditEntry): Promise<"recorded" | "skipped" | "duplicate" | "ignored"> {
     // Only an approval that now serves a version is a change. A reject changes nothing.
     if (entry.action !== "approve" || entry.approvedVersion === null || entry.approvedVersion === undefined) return "ignored";
+    // (#233 P4b) A SHARED layer's approval (a bloc / treaty rulebook: no
+    // country pair): one event per affected MEMBER route (see recordLayerApproval).
+    if (entry.countryCode === undefined || entry.visaTypeId === undefined) return this.recordLayerApproval(auditId, entry);
+    const countryCode = entry.countryCode;
+    const visaTypeId = entry.visaTypeId;
     const version = entry.approvedVersion;
     const event = this.blankEvent({
       id: guidanceEventId(entry.routeKey, version),
       sourceKind: "guidance",
       sourceId: auditId,
-      countryCode: entry.countryCode,
-      visaTypeId: entry.visaTypeId,
+      countryCode,
+      visaTypeId,
       routeKey: entry.routeKey,
       approvedBy: entry.by,
     });
@@ -513,6 +548,64 @@ export class RuleChangeAlertsService {
     if (!summary) return skip("no_criteria_change");
     event.rubricSummary = summary;
     return (await this.createEvent(event)) ? "recorded" : "duplicate";
+  }
+
+  /**
+   * (#233 P4b) A SHARED layer's approval: ONE event per affected member route
+   * (every visa record inheriting the layer today, and every route an open
+   * application on the layer applied through), each keyed by the layer key,
+   * the version and the member route (`layerEventId`), so a re-delivered
+   * trigger records nothing twice. The summary is the shared layer's own diff
+   * (the same for every member). No member layer is re-drafted, and nothing is
+   * assessed here (the re-assessment is the bulk fan-out of the same approval,
+   * which waits for an admin's confirmation).
+   *
+   * @returns "recorded" when at least one member event was new and pending,
+   *   "skipped" when they were all recorded as sending nothing, "duplicate"
+   *   when every one existed, "ignored" when there is no member route.
+   */
+  private async recordLayerApproval(auditId: string, entry: RubricReviewAuditEntry): Promise<"recorded" | "skipped" | "duplicate" | "ignored"> {
+    const version = entry.approvedVersion as number;
+    if (!entry.authorityId || !entry.routeSlug || !this.deps.memberRoutesOfLayer) return "ignored";
+    const members = await this.deps.memberRoutesOfLayer({ issuingAuthorityId: entry.authorityId, id: entry.routeSlug });
+    if (members.length === 0) {
+      console.log(`Rule-change alerts: approval ${auditId} of ${entry.routeKey}: no member route, nothing recorded`);
+      return "ignored";
+    }
+    // The diff of the shared layer, once (it is the same news for every member).
+    const previous = entry.previousApprovedVersion ?? null;
+    let skipReason: string | null = null;
+    let summary: RuleChangeRubricSummary | null = null;
+    if (previous === null) skipReason = "first_approval";
+    else {
+      const [current, baseline] = await Promise.all([this.deps.getRubricVersion(entry.routeKey, version), this.deps.getRubricVersion(entry.routeKey, previous)]);
+      if (!current || !baseline) skipReason = "rubric_version_missing";
+      else if (current.reviewStatus !== "approved" || baseline.reviewStatus !== "approved") skipReason = "rubric_version_not_approved";
+      else {
+        summary = summariseRubricDiff(applyExclusions(current), applyExclusions(baseline));
+        if (!summary) skipReason = "no_criteria_change";
+      }
+    }
+    let created = 0;
+    for (const m of members) {
+      const memberKey = `${m.countryCode}_${m.visaTypeId}`;
+      const event = this.blankEvent({ id: layerEventId(entry.routeKey, version, memberKey), sourceKind: "guidance", sourceId: auditId, countryCode: m.countryCode, visaTypeId: m.visaTypeId, routeKey: memberKey, approvedBy: entry.by });
+      event.layerKey = entry.routeKey;
+      event.skippedOtherStack = 0;
+      event.approvedAt = entry.at ?? event.approvedAt;
+      event.rubricVersion = version;
+      event.previousRubricVersion = previous;
+      if (skipReason) {
+        event.status = "skipped";
+        event.skipReason = skipReason;
+        event.scanDone = true;
+        event.completedAt = event.createdAt;
+      } else event.rubricSummary = summary;
+      if (await this.createEvent(event)) created++;
+    }
+    console.log(`Rule-change alerts: approval ${auditId} of ${entry.routeKey}: ${created} member-route event(s) recorded of ${members.length}${skipReason ? ` (${skipReason})` : ""}`);
+    if (created === 0) return "duplicate";
+    return skipReason ? "skipped" : "recorded";
   }
 
   /**
@@ -590,7 +683,9 @@ export class RuleChangeAlertsService {
     if (event.sourceKind !== "guidance") return true;
     const run = await collections.bulkReassessments.doc(event.sourceId).get();
     const status = run.exists ? (run.data() as { status?: string }).status : null;
-    if (status === "completed" || status === "cancelled") return true;
+    // (#233 P4b) A shared layer's fan-out waiting for its confirmation has sent no
+    // reviewer notification (no job ran), so there is nothing to dedupe against: ready.
+    if (status === "completed" || status === "cancelled" || status === "awaiting_confirmation") return true;
     return this.deps.now().getTime() - event.createdAt.toMillis() >= MAX_WAIT_MS;
   }
 
@@ -632,6 +727,7 @@ export class RuleChangeAlertsService {
         scanned: tally.scanned,
         skippedDrafts: tally.skippedDrafts,
         skippedExcluded: tally.skippedExcluded,
+        ...(tally.layerKey ? { skippedOtherStack: tally.skippedOtherStack ?? 0 } : {}),
         alreadyHandled: tally.alreadyHandled,
         coveredByReviewNotice: tally.coveredByReviewNotice,
         staffNotified: tally.staffNotified,
@@ -691,6 +787,13 @@ export class RuleChangeAlertsService {
     // Closed, submitted onward or withdrawn: the same set #37 leaves alone.
     if (EXCLUDED_APPLICATION_STATUSES.includes(app.status)) {
       tally.skippedExcluded++;
+      return;
+    }
+    // (#233 P4b) A shared layer's event: an application whose stored stack does
+    // not include the layer runs on other rules and is not told. One with no
+    // stored stack resolves live from a record that inherits the layer: told.
+    if (tally.layerKey && Array.isArray(app.routeStack) && !app.routeStack.includes(tally.layerKey)) {
+      tally.skippedOtherStack = (tally.skippedOtherStack ?? 0) + 1;
       return;
     }
 

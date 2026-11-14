@@ -22,6 +22,10 @@ import {
 import { adminGuidanceSourceRoutes } from "./scrapers";
 // Source registry API (issue #215): confirmed hosts + route registration.
 import { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./scrapers";
+// Issuing authorities and bloc membership (issue #230): admin-only API.
+import { adminAuthorityRoutes } from "./authorities";
+// Shared routes and inheriting visa records (issue #231): admin-only API.
+import { adminSharedRouteRoutes } from "./shared-routes";
 // Route onboarding runs (issue #217).
 import { adminRouteOnboardingRoutes } from "./scrapers";
 // Rubric review (issue #125): admin queue, detail with diff, approve / reject.
@@ -37,6 +41,8 @@ import { feedbackRoutes } from "./routes/feedback.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
+// Issue #235: "which country do I apply through" for a shared route (applicant-facing, read-only).
+import { applyThroughRoutes } from "./routes/apply-through.routes";
 import { documentRoutes } from "./routes/document.routes";
 // Document templates feature (rich-text templates + editable case-linked instances)
 import { documentTemplateRoutes } from "./routes/document-template.routes";
@@ -71,6 +77,8 @@ import { verificationWebhookRoutes } from "./routes/verification-webhook.routes"
 import { paymentReturnRoutes } from "./routes/payment-return.routes";
 // Admin review queue for trafficking / scam risk signals (issue #119).
 import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
+// Issue #236: entry requirements ("do you need a visa at all") and their admin review data.
+import { entryRequirementsRoutes, adminEntryRuleRoutes } from "./entry-requirements";
 
 // Create Express app
 const app = express();
@@ -121,6 +129,7 @@ app.use("/invitations", invitationRoutes);
 // Personal document checklist (issue #114): extra-segment paths on /applications.
 app.use("/applications", checklistRoutes);
 app.use("/applications", applicationRoutes);
+app.use("/shared-routes", applyThroughRoutes);
 app.use("/documents", documentRoutes);
 // Document templates: catalog (read-only) + editable instances cloned from them
 app.use("/document-templates", documentTemplateRoutes);
@@ -138,6 +147,8 @@ app.use("/onboarding", onboardingRoutes);
 app.use("/analytics", analyticsRoutes);
 app.use("/news", newsRoutes);
 app.use("/eligibility", eligibilityRoutes);
+// Issue #236: GET /entry-requirements (signed in, free: stored sourced data, no AI call).
+app.use("/entry-requirements", entryRequirementsRoutes);
 // AI case-officer assessments (issue #42): async jobs, tier decided in the handler.
 app.use("/ai", aiRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
@@ -168,6 +179,13 @@ app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
 // Issue #215: admin-only (verifyAuth + the ScrapeRun admin gate on every route).
 app.use("/admin/official-domains", adminOfficialDomainRoutes);
 app.use("/admin/route-sources", adminRouteSourceRoutes);
+// Issue #230: issuing authorities (country, bloc, treaty) and bloc members.
+// Admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route.
+app.use("/admin/authorities", adminAuthorityRoutes);
+// Issue #236: entry rules, their sources and drafting runs (admin review data, read-only).
+app.use("/admin/entry-rules", adminEntryRuleRoutes);
+// Issue #231: shared routes (a visa defined once by a bloc) and the visa records that inherit them.
+app.use("/admin/shared-routes", adminSharedRouteRoutes);
 // Issue #217: route onboarding runs (admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route).
 app.use("/admin/route-onboarding", adminRouteOnboardingRoutes);
 // Rubric review (issue #125): admin-only (verifyAuth + admin gate on every

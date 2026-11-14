@@ -92,6 +92,8 @@ export const collections = {
   // payment on a cancelled booking), for a human to refund. Doc id = the
   // Paystack reference. Backend only: firestore.rules denies every client.
   consultationPaymentExceptions: db.collection("consultationPaymentExceptions"),
+  // Issue #181: payment-request payments held for refund (backend only, see firestore.rules).
+  paymentRequestExceptions: db.collection("paymentRequestExceptions"),
   notifications: db.collection("notifications"),
   // In-app tester feedback (issue #257): one doc per note (userId, kind, message,
   // route, app/device info, optional screenshotPath, status "new"). Written and
@@ -165,6 +167,12 @@ export const collections = {
   //   register, edit and removal (never updated or deleted).
   // - sourceRegistryRateLimits/{uid}__{kind}__{hour}: per-admin hourly counters.
   officialDomains: db.collection("officialDomains"),
+  // RETIRED (issue #236): the old hand-seeded "does this nationality need a
+  // visa for that country" rows. They had no verbatim quote, so nothing reads
+  // them any more (eligibility preCheck answers from `entryRules` below).
+  // Referenced here only so the #239 migration can list and delete the stored
+  // rows.
+  visaExemptions: db.collection("visaExemptions"),
   officialDomainPreviews: db.collection("officialDomainPreviews"),
   sourceRegistryAudit: db.collection("sourceRegistryAudit"),
   sourceRegistryRateLimits: db.collection("sourceRegistryRateLimits"),
@@ -268,6 +276,34 @@ export const collections = {
   // scrapers/rubric (extraction, always `pending_review`) and by the rubric
   // review API (#125). Backend-only: no firestore.rules match -> clients denied.
   visaRubrics: db.collection("visaRubrics"),
+  // Issuing authorities (issue #230, P1 of #228): `authorities/{authorityId}`
+  // is a country (id = its two-letter code), a bloc or a treaty that sets visa
+  // rules. Members of a bloc/treaty are in the `members` subcollection (see
+  // subcollections.authorityMembers). Written only by the admin authorities API
+  // (src/authorities), every write audited. Backend-only: no firestore.rules
+  // match -> clients denied (a client that could write membership could change
+  // which countries a shared rulebook covers).
+  authorities: db.collection("authorities"),
+  // Shared routes (issue #231, P2 of #228): `sharedRoutes/{sharedRouteId}` is a
+  // visa defined once by a bloc/treaty and inherited by member countries'
+  // visa records (`inheritsFrom`). Written only by the admin shared-routes API
+  // (src/shared-routes), every write audited. Backend-only: no firestore.rules
+  // match -> clients denied.
+  sharedRoutes: db.collection("sharedRoutes"),
+  // Entry requirements (issue #236, P7 of #228): "do you need a visa at all".
+  // ALL backend-only (no firestore.rules match -> clients denied; pinned by
+  // test/emulator/backend-only-collections.emu.ts). Written only by the
+  // entry-rule drafting pipeline (src/entry-requirements); read by the lookup
+  // endpoint, which serves only published rules through the API.
+  // - entryRules/{ruleId}: one sourced rule (outcome, group, destination
+  //   scope, verbatim quote + URL). Status published / held / left_out / superseded.
+  // - entryRuleHeads/{authorityId}: which drafting run is the one SERVED for an
+  //   issuing authority (`publishedRunId`); switching it is the atomic publish.
+  // - entryRuleRuns/{runId}: one record per drafting run (spend, counts,
+  //   refusals, gate results, hold reasons) -- the admin's review data.
+  entryRules: db.collection("entryRules"),
+  entryRuleHeads: db.collection("entryRuleHeads"),
+  entryRuleRuns: db.collection("entryRuleRuns"),
   // One record per rubric extraction run (issue #40): status, token usage,
   // cost (null while the model is unpriced), what was discarded and why.
   // Backend-only: no firestore.rules match.
@@ -474,6 +510,25 @@ export const subcollections = {
   // A version's content is immutable once written. Backend-only, like its parent.
   rubricVersions: (routeKey: string) =>
     collections.visaRubrics.doc(routeKey).collection("rubricVersions"),
+
+  // (#278) The PART documents of a large rubric version:
+  // `visaRubrics/{routeKey}/rubricVersions/{version}/rubricVersionParts/{n}`.
+  // A version too big for one 1 MiB document keeps its header (status, review
+  // fields, counts, hashes) in the version doc and its large arrays (criteria,
+  // evidence items, intake questions, discarded / suspicious lists, flags,
+  // translations) here, written in the same transaction. Read only through
+  // rubric.store.ts, which reassembles them (rubric-version-storage.ts).
+  // Immutable, backend-only like its parent. The id is not `parts`, so a
+  // collection-group query can never mix it with another collection.
+  rubricVersionParts: (routeKey: string, version: number) =>
+    collections.visaRubrics.doc(routeKey).collection("rubricVersions").doc(String(version)).collection("rubricVersionParts"),
+
+  // Members of one bloc or treaty (issue #230):
+  // `authorities/{authorityId}/members/{countryCode}`, each with joinedOn,
+  // optional leftOn, and the verbatim official quote + URL that proves it.
+  // Backend-only, like its parent.
+  authorityMembers: (authorityId: string) =>
+    collections.authorities.doc(authorityId).collection("members"),
 
   // (#216) The saved results of a drafting job's finished steps:
   // `rubricExtractionJobs/{jobId}/steps/{stepId}` (one per model call), and

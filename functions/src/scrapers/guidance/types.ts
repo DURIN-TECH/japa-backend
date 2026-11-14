@@ -84,7 +84,9 @@ export interface GuidanceSourceSeed {
   // The URL to request. Official government sources only (a seeding rule,
   // enforced by review of the seed data, not by code).
   url: string;
-  // Opaque key of the issuing jurisdiction (for example an ISO country code).
+  // Opaque key of the issuing jurisdiction. Issue #232: this is the issuing
+  // AUTHORITY's id (authorities/{id}): an ISO country code for a country
+  // (unchanged values), or a bloc/treaty id for a route registered under one.
   jurisdiction: string;
   // Opaque, generic route key the document applies to (for example a visa
   // category). Lowercase letters, digits and hyphens.

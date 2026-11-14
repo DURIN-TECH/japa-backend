@@ -1,7 +1,12 @@
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
-import { collections, db } from "../utils/firebase";
-import { rubricRouteKey, rubricStore, type VisaRubric } from "../scrapers";
+import { collections, db, subcollections } from "../utils/firebase";
+// (#234) Membership on a date (pure) for `members_of` groups; the AuthorityMember shape.
+import { membersOn } from "../authorities/authority-ids";
+import type { AuthorityMember } from "../types/authority";
+import { factsFromApplicantFacts, factsFromNationality, factsSummaryForModel, membershipAuthorityIdsOf, type FactsForRules, type MembershipOnDate } from "./ai/applicant-groups";
+import { layerVersionsOf, rubricRouteKey, rubricStore, sameStackVersions, type RulebookStack, type VisaRubric } from "../scrapers";
+import { defaultRulebookStack, rulebookStackFor, type ApplicationStackRef } from "./ai/application-rulebook";
 import type { Application, Document, DocumentInstance, EligibilityCheck, ProseMirrorDoc, User } from "../types";
 import { buildCountryContext, type CountryContextResult } from "./outcome-statistics/country-context";
 import type {
@@ -21,8 +26,10 @@ import {
   documentFieldsFor,
   evaluateObjective,
   hashStatementContent,
+  barNotAssessedItems,
+  decideMandatoryBars,
+  isJudgedBar,
   judgementCriteriaOf,
-  mandatoryBarHits,
   mergeJudgementOutputs,
   numberStatementBlocks,
   parseJudgement,
@@ -89,6 +96,11 @@ class JobStop extends Error {
 export interface RubricReader {
   getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null>;
   approvedVersionOf(countryCode: string, visaTypeId: string): Promise<number | null>;
+  // (#233) The application's whole rulebook STACK (shared layer(s) + its own),
+  // merged (services/ai/application-rulebook.ts). Set by the default deps; a
+  // reader without it reads the own layer alone (every route without
+  // inheritance), which is how fakes written before #233 behave.
+  getRulebookStack?(app: ApplicationStackRef): Promise<RulebookStack>;
 }
 
 /** Everything the service reaches outside Firestore. Injected for tests. */
@@ -102,6 +114,9 @@ export interface AssessmentDeps {
   // Country-context lookup (#116). Optional so existing fakes keep working;
   // defaults to the real builder. Reads published statistics only, no model.
   buildCountryContext?: (input: Parameters<typeof buildCountryContext>[0]) => Promise<CountryContextResult>;
+  // (#234) Every member ever recorded for an authority (`authorities/{id}/members`).
+  // Optional so existing fakes keep working; defaults to the Firestore read.
+  loadAuthorityMembers?: (authorityId: string) => Promise<AuthorityMember[]>;
 }
 
 /** What a POST resolved to. */
@@ -116,7 +131,14 @@ export type RequestOutcome =
 /** Inputs the job and the request both read, loaded once. */
 export interface LoadedInputs {
   applicantName: string | null;
+  // The first stated nationality (kept for callers that read one value).
   nationality: string | null;
+  // (#234) What the applicant holds, as rules read it: the APPLICATION'S COPY
+  // (`applicantFacts`) when it has one, else (applications started before
+  // #234, dev data only) the latest eligibility check's nationality alone.
+  facts: FactsForRules;
+  // True when `facts` came from the application's copy (it is then in the input hash).
+  factsFromCopy: boolean;
   eligibilityScore: number | null;
   eligibilityAnswers: Record<string, unknown> | null;
   intake: Record<string, unknown>;
@@ -169,6 +191,37 @@ function isoDate(now: Date): string {
 }
 
 /**
+ * (#234) The application's START date ("YYYY-MM-DD"): `startDate`, else
+ * `createdAt`, else today. `members_of` groups resolve their membership on this
+ * date (the applicant's facts were copied at this moment too).
+ */
+export function startDateOf(app: Pick<Application, "startDate" | "createdAt">, now: Date): string {
+  for (const ts of [app.startDate, app.createdAt] as Array<{ toDate?: () => Date } | undefined>) {
+    if (ts && typeof ts.toDate === "function") {
+      const d = ts.toDate();
+      if (d instanceof Date && !Number.isNaN(d.getTime())) return isoDate(d);
+    }
+  }
+  return isoDate(now);
+}
+
+/**
+ * (#234) The facts as the input hash holds them: codes, kinds, issuers and
+ * dates in a stable order (never the applicant's note, which no rule reads).
+ */
+export function hashableFacts(facts: FactsForRules): NonNullable<AssessmentInputs["applicantFacts"]> {
+  return {
+    nationalities: [...facts.nationalities].sort(),
+    residentialCountry: facts.residentialCountry,
+    heldDocuments: facts.heldDocuments === null
+      ? null
+      : facts.heldDocuments
+        .map((d) => ({ kind: d.kind, issuer: d.issuerCountryCode ?? d.issuerAuthorityId ?? null, validUntil: d.validUntil }))
+        .sort((a, b) => `${a.kind}|${a.issuer}|${a.validUntil}`.localeCompare(`${b.kind}|${b.issuer}|${b.validUntil}`)),
+  };
+}
+
+/**
  * The date a mandatory bar is checked against.
  *
  * - `submittedAt`, when the application has one: a rule in force when the
@@ -192,12 +245,19 @@ export function barDateOf(app: Pick<Application, "submittedAt">, now: Date): str
   return isoDate(now);
 }
 
+/** (#234) Every member ever recorded for an authority, from Firestore (`authorities/{id}/members`). */
+async function defaultLoadAuthorityMembers(authorityId: string): Promise<AuthorityMember[]> {
+  const snap = await subcollections.authorityMembers(authorityId).get();
+  return snap.docs.map((d) => d.data() as AuthorityMember);
+}
+
 /** The default deps: Firestore, Cloud Storage, the Anthropic provider and the settings doc. */
 function defaultDeps(): AssessmentDeps {
   return {
     provider: new AnthropicLlmProvider(),
     rubrics: {
       getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc, vt),
+      getRulebookStack: (app) => defaultRulebookStack(app),
       async approvedVersionOf(cc, vt) {
         const head = await rubricStore.getHead(rubricRouteKey(cc, vt));
         return head?.approvedVersion ?? null;
@@ -218,6 +278,10 @@ export function newAssessmentDoc(args: {
   id: string;
   app: Application;
   rubricVersion: number;
+  // (#233) Only for a stack of more than one layer: every layer's version, and
+  // the layer list (approved / missing). Absent for a single-layer route.
+  layerVersions?: Record<string, number | null>;
+  rulebookLayers?: ApplicationAssessment["rulebookLayers"];
   inputHash: string;
   trigger: AssessmentTrigger;
   requestedBy: string;
@@ -231,6 +295,9 @@ export function newAssessmentDoc(args: {
     countryCode: args.app.countryCode,
     visaTypeId: args.app.visaTypeId,
     rubricVersion: args.rubricVersion,
+    // (#233) Spread only when present: a single-layer assessment is unchanged.
+    ...(args.layerVersions ? { layerVersions: args.layerVersions } : {}),
+    ...(args.rulebookLayers ? { rulebookLayers: args.rulebookLayers } : {}),
     inputHash: args.inputHash,
     model: null,
     createdAt: Timestamp.fromDate(args.now),
@@ -286,7 +353,15 @@ export class AiCaseOfficerService {
       .limit(1)
       .get();
     const check = checkSnap.empty ? null : ({ id: checkSnap.docs[0].id, ...checkSnap.docs[0].data() } as EligibilityCheck & { id: string });
-    const nationality = check && /^[A-Z]{2}$/.test(check.nationality ?? "") ? check.nationality : null;
+    // (#234) The applicant's facts come from the application's COPY of their
+    // holdings (taken when the application started), never the live profile.
+    // The eligibility check's nationality is the fallback ONLY for an
+    // application that has no copy (started before #234: dev data only).
+    const copy = (app as Application).applicantFacts;
+    const facts: FactsForRules = copy
+      ? factsFromApplicantFacts(copy)
+      : factsFromNationality(check && /^[A-Z]{2}$/.test(check.nationality ?? "") ? check.nationality : null);
+    const nationality = facts.nationalities[0] ?? null;
     const eligibilityAnswers = check
       ? Object.fromEntries(
         (check.answers ?? []).map((a) => [String((a as { questionId: string }).questionId), (a as { answer?: unknown }).answer ?? null])
@@ -341,6 +416,8 @@ export class AiCaseOfficerService {
     return {
       applicantName,
       nationality,
+      facts,
+      factsFromCopy: copy !== undefined,
       eligibilityScore: check && typeof check.score === "number" ? check.score : null,
       eligibilityAnswers,
       intake,
@@ -349,15 +426,49 @@ export class AiCaseOfficerService {
     };
   }
 
+  /**
+   * (#234) Membership, ON `onDate`, of every authority the rubric's
+   * `members_of` groups name (no read at all when none does, which is every
+   * rulebook stored before #234). An authority with NO recorded members (or
+   * one that does not exist) is left out, so its groups resolve to "could not
+   * tell", never to "nobody"; one whose recorded members are all past or
+   * future is an empty list (known: nobody current). A failed read is treated
+   * the same as no record (unknown), never as an empty membership.
+   * Public: the bulk re-assessment reads the same membership.
+   */
+  async membershipFor(rubric: Pick<VisaRubric, "criteria">, onDate: string): Promise<MembershipOnDate> {
+    const ids = membershipAuthorityIdsOf(rubric.criteria);
+    if (ids.length === 0) return {};
+    const load = this.deps.loadAuthorityMembers ?? defaultLoadAuthorityMembers;
+    const out: Record<string, string[] | null> = {};
+    for (const id of ids) {
+      try {
+        const recorded = await load(id);
+        out[id] = recorded.length === 0 ? null : membersOn(recorded, onDate).map((m) => m.countryCode);
+      } catch {
+        // Unknown, not "nobody": the bar is reported "could not be assessed".
+        out[id] = null;
+      }
+    }
+    return out;
+  }
+
   /** The hash inputs for a loaded set and rubric version. */
   // Public since #37 (bulk re-assessment recomputes the same hash).
-  inputsFor(loaded: LoadedInputs, rubricVersion: number): AssessmentInputs {
+  // (#233) `layerVersions` only for a stack of more than one layer: a new
+  // version of ANY layer then changes the hash. Absent (undefined) it leaves
+  // the hash of every single-layer route exactly as before (the canonical form
+  // skips undefined fields).
+  inputsFor(loaded: LoadedInputs, rubricVersion: number, layerVersions?: Record<string, number | null>): AssessmentInputs {
     return {
       rubricVersion,
+      ...(layerVersions ? { layerVersions } : {}),
       documents: loaded.documents.map((d) => ({ path: `${d.id}:${d.path}`, updatedAtMs: d.updatedAtMs })),
       statements: loaded.statements.map((s) => ({ instanceId: s.instanceId, contentHash: s.contentHash })),
       eligibilityAnswers: loaded.eligibilityAnswers,
       intake: loaded.intake,
+      // (#234) Only with a copy: a changed copy changes the hash; old applications hash as before.
+      ...(loaded.factsFromCopy ? { applicantFacts: hashableFacts(loaded.facts) } : {}),
     };
   }
 
@@ -381,11 +492,19 @@ export class AiCaseOfficerService {
     app: Application,
     opts: { tier: AssessmentTier; trigger: AssessmentTrigger; requestedBy: string; maxAttempts?: number }
   ): Promise<RequestOutcome> {
-    const rubric = await this.deps.rubrics.getApprovedRubric(app.countryCode, app.visaTypeId);
+    // (#233) The application's rulebook STACK (its own layer alone for a route
+    // without inheritance: exactly the approved rubric read before). A stack
+    // with no approved layer, or one the stack plan refuses, is `no_rubric`:
+    // never a partial result. A stack with SOME layer approved is assessed,
+    // and the missing layer is recorded on the assessment (`rulebookLayers`).
+    const stack = await this.rulebookStackOf(app);
+    const rubric = stack.usable ? stack.rubric : null;
     if (!rubric) return { kind: "no_rubric", routeKey: rubricRouteKey(app.countryCode, app.visaTypeId) };
+    const layerVersions = layerVersionsOf(rubric);
+    const rulebookLayers = layerVersions ? rubric.stackLayers : undefined;
 
     const loaded = await this.loadInputs(app);
-    const inputHash = computeInputHash(this.inputsFor(loaded, rubric.version));
+    const inputHash = computeInputHash(this.inputsFor(loaded, rubric.version, layerVersions));
     const assessmentId = assessmentIdFor(app.id, inputHash);
     const now = this.deps.now();
 
@@ -426,7 +545,7 @@ export class AiCaseOfficerService {
       if (opts.tier === "free" && isRerunOfChanged) return { kind: "upgrade_required" };
       tx.set(
         ref,
-        newAssessmentDoc({ id: assessmentId, app, rubricVersion: rubric.version, inputHash, trigger: opts.trigger, requestedBy: opts.requestedBy, now })
+        newAssessmentDoc({ id: assessmentId, app, rubricVersion: rubric.version, layerVersions, rulebookLayers, inputHash, trigger: opts.trigger, requestedBy: opts.requestedBy, now })
       );
       return { kind: "created", assessmentId, status: "queued", rubricVersion: rubric.version };
     });
@@ -495,7 +614,17 @@ export class AiCaseOfficerService {
    */
   async staleReasonOf(app: Application, assessment: ApplicationAssessment): Promise<StaleReason | null> {
     const loaded = await this.loadInputs(app);
-    if (computeInputHash(this.inputsFor(loaded, assessment.rubricVersion)) !== assessment.inputHash) return "inputs_changed";
+    if (computeInputHash(this.inputsFor(loaded, assessment.rubricVersion, assessment.layerVersions)) !== assessment.inputHash) return "inputs_changed";
+    // (#233) An assessment made on a STACK compares the version of EVERY layer:
+    // a new version of the shared layer is "the rules changed" too. A stack
+    // that is no longer usable is treated like "no approved rubric" (not stale),
+    // as below.
+    if (assessment.layerVersions) {
+      const stack = await this.rulebookStackOf(app);
+      if (!stack.usable || !stack.rubric) return null;
+      const same = sameStackVersions({ version: assessment.rubricVersion, layerVersions: assessment.layerVersions }, { version: stack.rubric.version, layerVersions: layerVersionsOf(stack.rubric) });
+      return same ? null : "rules_updated";
+    }
     const approved = await this.approvedVersionOf(assessment.countryCode, assessment.visaTypeId);
     if (approved !== null && approved !== assessment.rubricVersion) return "rules_updated";
     return null;
@@ -504,6 +633,22 @@ export class AiCaseOfficerService {
   /** The approved version of a route. */
   async approvedVersionOf(countryCode: string, visaTypeId: string): Promise<number | null> {
     return this.deps.rubrics.approvedVersionOf(countryCode, visaTypeId);
+  }
+
+  /** (#233) The application's rulebook stack, through the injected reader (services/ai/application-rulebook.ts). */
+  async rulebookStackOf(app: ApplicationStackRef): Promise<RulebookStack> {
+    return rulebookStackFor(app, this.deps.rubrics);
+  }
+
+  /**
+   * (#233) Can this application be assessed at all? For a single-layer route
+   * exactly the old test (the head has an approved version); for a stack, at
+   * least one layer is approved and the stack plan accepts it.
+   */
+  async hasApprovedRulebook(app: Application): Promise<boolean> {
+    const stack = await this.rulebookStackOf(app);
+    if (stack.layers.length <= 1) return (await this.approvedVersionOf(app.countryCode, app.visaTypeId)) !== null;
+    return stack.usable;
   }
 
   // ----------------------------------------------------------------
@@ -565,12 +710,15 @@ export class AiCaseOfficerService {
     if (!appSnap.exists) throw new JobStop("inputs_changed", "the application no longer exists");
     const app = { id: appSnap.id, ...appSnap.data() } as Application;
 
-    const fullRubric = await this.deps.rubrics.getApprovedRubric(app.countryCode, app.visaTypeId);
-    if (!fullRubric || fullRubric.version !== cur.rubricVersion) {
+    // (#233) The same stack the request read; ANY layer's new version means the
+    // rules changed (a single-layer route compares `version` alone, as before).
+    const stack = await this.rulebookStackOf(app);
+    const fullRubric = stack.usable ? stack.rubric : null;
+    if (!fullRubric || !sameStackVersions({ version: fullRubric.version, layerVersions: layerVersionsOf(fullRubric) }, { version: cur.rubricVersion, layerVersions: cur.layerVersions })) {
       throw new JobStop("rubric_changed", "the approved rubric changed after this assessment was requested");
     }
     const loaded = await this.loadInputs(app);
-    if (computeInputHash(this.inputsFor(loaded, fullRubric.version)) !== cur.inputHash) {
+    if (computeInputHash(this.inputsFor(loaded, fullRubric.version, layerVersionsOf(fullRubric))) !== cur.inputHash) {
       throw new JobStop("inputs_changed", "the application's inputs changed after this assessment was requested");
     }
 
@@ -586,18 +734,30 @@ export class AiCaseOfficerService {
     // The intake answers are part of the input hash, so this is a pure function
     // of inputs the hash already covers. `fullRubric` is kept for what needs the
     // WHOLE rulebook (titles of could-not-assess rules, top issues, actions).
-    const split = splitByApplicability(fullRubric, loaded.intake);
-    const rubric: VisaRubric = { ...fullRubric, criteria: split.applicable };
-    const notAssessed = notAssessedItems(split);
-
+    // (#234) A rule triggered by what the applicant holds is decided from the
+    // application's copy of their facts, on the bar date (held documents must
+    // still be valid on it); a fact not stated is "could not be assessed".
     const now = this.deps.now();
+    const barDate = barDateOf(app, now);
+    const split = splitByApplicability(fullRubric, loaded.intake, { facts: loaded.facts, onDate: barDate });
+    const rubric: VisaRubric = { ...fullRubric, criteria: split.applicable };
+
+    // ---- stage 1 input (#234): bars decided from the applicant's facts ----
+    // `members_of` groups resolve through membership data on the application's
+    // START date; an authority with no recorded members is "could not tell".
+    // A bar code cannot decide because a fact is missing is reported "could not
+    // be assessed: we need to know ...", beside the rules split out above.
+    const membership = await this.membershipFor(rubric, startDateOf(app, now));
+    const bars = decideMandatoryBars(rubric, loaded.facts, barDate, membership);
+    const notAssessed = [...notAssessedItems(split), ...barNotAssessedItems(bars.unknown)];
+
     const score = loaded.eligibilityScore;
 
     // ---- stage 1: mandatory bars (no model call) ----
     // The bar is checked against the date the application was SUBMITTED when
     // there is one, else today (see barDateOf for why never startDate and why
     // a missing date never means "skip the bar").
-    const hits = mandatoryBarHits(rubric, loaded.nationality, barDateOf(app, now));
+    const hits = bars.hits;
     if (hits.length > 0) {
       const content = assembleContent({
         rubric,
@@ -732,7 +892,8 @@ export class AiCaseOfficerService {
           rubric: { criteria: batch, intentPolarity: rubric.intentPolarity },
           statementText: numbered ? numbered.text : statementText || null,
           otherStatementsText: otherText || null,
-          profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. Nationality code: ${loaded.nationality ?? "not given"}.`,
+          // (#234) Only the facts the rules need reach the model (see factsSummaryForModel).
+          profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. ${factsSummaryForModel(loaded.facts, rubric.criteria, barDate, rubric.criteria.some(isJudgedBar))}`,
           intakeSummary: JSON.stringify(loaded.intake),
           extractionSummary: extractions
             .filter((e) => e.readable && !e.failed && !e.suspicious)
@@ -819,6 +980,10 @@ export class AiCaseOfficerService {
         .filter((id) => byId.has(id))
         .map((id) => ({ id, label: byId.get(id) as string }));
 
+      // (#233) Statistics are per destination COUNTRY: a rubric with no country
+      // (a bloc / treaty layer read on its own) has none to show. A merged stack
+      // view always carries its own layer's country (rubric-stack.ts).
+      if (!rubric.countryCode) return undefined;
       const build = this.deps.buildCountryContext ?? buildCountryContext;
       const result = await build({
         destination: rubric.countryCode,

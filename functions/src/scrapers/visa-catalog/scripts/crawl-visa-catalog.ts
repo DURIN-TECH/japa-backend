@@ -372,7 +372,7 @@ async function main() {
       let promptReextract = false;
       // Issue #82: priced usage of this page's LLM call (set by onUsage).
       let callUsage: PricedUsage | undefined;
-      // Issue #212: this page's adapter stamp, set once fetched (GB carries +items-v1).
+      // Issue #212: this page's adapter stamp, set once fetched (GB carries +items-vN).
       let EXTRACTION_PIPELINE_VERSION = extractionVersionFor(undefined);
       try {
         console.log(`\n[${source.countryCode}] ${page.routeName}\n  ${page.url}`);

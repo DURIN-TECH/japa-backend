@@ -4,6 +4,7 @@ import {
   DECISION_STAGES,
   EVIDENCE_PARTIES,
   INTAKE_ANSWER_TYPES,
+  INTAKE_OPTIONS_SOURCES,
   INTENT_POLARITIES,
   RUBRIC_REVIEW_STATUSES,
   type AssessmentCriterion,
@@ -11,8 +12,14 @@ import {
   type VisaRubric,
 } from "../../types/rubric";
 
-import { isValidTrigger } from "../../services/ai/rule-applicability";
+import { isValidFactTrigger, isValidTrigger } from "../../services/ai/rule-applicability";
+// (#234) Shapes a stored applicant group may take (codes, kinds, authority ids).
+import { HELD_DOCUMENT_KINDS } from "../../types/applicant-facts";
+import { checkAuthorityId, isCountryCode } from "../../authorities/authority-ids";
 import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA } from "./rubric-exclusions";
+import { rulebookPartsOf } from "./rubric-key";
+// (#235) The one code check of a competence block and of destination questions.
+import { competenceProblems, storedCountryOptions } from "./rubric-competence";
 
 // ============================================
 // RUBRIC — STRUCTURAL VALIDATOR (issue #40)
@@ -35,6 +42,31 @@ import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA } from "./rubric-exclusions";
 // Dependency-free and pure, and it knows nothing about any particular
 // question, document, route or nationality: everything is checked as data.
 
+
+/**
+ * (#234) What is wrong with one stored applicant group (`appliesTo.groups[i]`),
+ * or null when it is usable. `asWritten` is the member exactly as the quote
+ * names it (3 characters or more, like every group name); codes are two
+ * upper-case letters; an issuer is a country code or an authority id; a
+ * `nationality` member is stored in `appliesTo.nationalities`, never here.
+ */
+export function storedGroupProblem(g: unknown): string | null {
+  if (!g || typeof g !== "object") return "each appliesTo.groups member must be an object";
+  const r = g as Record<string, unknown>;
+  if (typeof r.asWritten !== "string" || r.asWritten.trim().length < 3) return "each appliesTo.groups member needs asWritten: the source's own wording (3 characters or more)";
+  if (r.kind === "residence") return isCountryCode(r.code) ? null : "a residence group needs a two-letter code";
+  if (r.kind === "holds") {
+    if (typeof r.document !== "string" || !(HELD_DOCUMENT_KINDS as readonly string[]).includes(r.document)) return `a holds group's document must be one of ${HELD_DOCUMENT_KINDS.join(", ")}`;
+    return isCountryCode(r.issuer) || checkAuthorityId(r.issuer).ok ? null : "a holds group's issuer must be a two-letter code or an authority id";
+  }
+  if (r.kind === "members_of") {
+    const id = checkAuthorityId(r.authorityId);
+    if (!id.ok || id.shape !== "group") return "a members_of group needs the id of a bloc or treaty authority";
+    return r.fact === "nationality" || r.fact === "residence" ? null : "a members_of group's fact must be nationality or residence";
+  }
+  if (r.kind === "nationality") return "a nationality member goes in appliesTo.nationalities / asWritten, not appliesTo.groups";
+  return "appliesTo.groups member kind must be residence, holds or members_of";
+}
 /** One problem found by the validator. */
 export interface RubricIssue {
   code: string;
@@ -137,10 +169,18 @@ export function validateCriterionShape(c: AssessmentCriterion, severityLevels: r
     const uncodedOk = uncoded === undefined || (Array.isArray(uncoded) && uncoded.every((w) => filled(w) && w.trim().length >= 3));
     if (!uncodedOk) add("applies_to_uncoded_invalid", "appliesTo.uncoded must be a list of group members of 3 characters or more");
     const uncodedCount = Array.isArray(uncoded) ? uncoded.length : 0;
+    // (#234) Coded members decided from what the applicant holds (residence, holds, members_of).
+    const groups = a?.groups;
+    const groupsOk = groups === undefined || (Array.isArray(groups) && groups.every((g) => storedGroupProblem(g) === null));
+    if (!groupsOk) {
+      const first = Array.isArray(groups) ? groups.map(storedGroupProblem).find((p) => p !== null) : "appliesTo.groups must be a list";
+      add("applies_to_group_invalid", first ?? "appliesTo.groups is not valid");
+    }
+    const groupCount = Array.isArray(groups) ? groups.length : 0;
     const codedCount = a && Array.isArray(a.nationalities) ? a.nationalities.length : 0;
-    // A bar needs at least one member, coded or not.
-    if (!a || !Array.isArray(a.nationalities) || (codedCount === 0 && uncodedCount === 0)) {
-      add("bar_without_applies_to", "a mandatory bar needs at least one appliesTo.nationalities code or appliesTo.uncoded member");
+    // A bar needs at least one member, coded or not (a nationality, a #234 group, or an uncoded member).
+    if (!a || !Array.isArray(a.nationalities) || (codedCount === 0 && uncodedCount === 0 && groupCount === 0)) {
+      add("bar_without_applies_to", "a mandatory bar needs at least one appliesTo.nationalities code, appliesTo.groups member or appliesTo.uncoded member");
     } else if (codedCount > 0) {
       if (a.nationalities.some((n) => !/^[A-Z]{2}$/.test(n))) add("nationality_code_invalid", "appliesTo.nationalities must be two-letter uppercase codes");
       // One source name per code, in the same order. A name of one or two
@@ -187,8 +227,28 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
   const err = (code: string, message: string, target = "rubric") => errors.push({ code, message, target });
 
   // ---- identity and review state ----
-  if (!filled(rubric.countryCode) || !filled(rubric.visaTypeId)) err("route_missing", "countryCode and visaTypeId are required");
-  if (rubric.routeKey !== `${rubric.countryCode}_${rubric.visaTypeId}`) err("route_key_mismatch", "routeKey must be `${countryCode}_${visaTypeId}`");
+  // (#233) The key is `{authorityId}_{routeSlug}` for ANY issuing authority
+  // (a country, a bloc or a treaty). A version names its parts either as
+  // `authorityId` + `routeSlug` (written since #233) or, as every version
+  // written before, `countryCode` + `visaTypeId`; `rulebookPartsOf` reads
+  // either and checks them against the authority id rules. Then:
+  //   - route_missing:      neither pair is there (or the parts are invalid);
+  //   - route_key_mismatch: `routeKey` is not exactly `{authorityId}_{routeSlug}`,
+  //     or a document carrying BOTH pairs has them disagree, or a bloc/treaty
+  //     rulebook carries country fields (it has no single country).
+  const hasGeneralPair = filled(rubric.authorityId) && filled(rubric.routeSlug);
+  const hasCountryPair = filled(rubric.countryCode) && filled(rubric.visaTypeId);
+  const parts = hasGeneralPair || hasCountryPair ? rulebookPartsOf({ routeKey: rubric.routeKey, authorityId: rubric.authorityId, routeSlug: rubric.routeSlug, countryCode: rubric.countryCode, visaTypeId: rubric.visaTypeId }) : null;
+  if (!parts) err("route_missing", "authorityId and routeSlug (or, for a country, countryCode and visaTypeId) are required");
+  else {
+    if (rubric.routeKey !== `${parts.authorityId}_${parts.routeSlug}`) err("route_key_mismatch", "routeKey must be `${authorityId}_${routeSlug}`");
+    if (hasGeneralPair && hasCountryPair && (rubric.countryCode !== rubric.authorityId || rubric.visaTypeId !== rubric.routeSlug)) {
+      err("route_key_mismatch", "countryCode and visaTypeId must equal authorityId and routeSlug");
+    }
+    if (parts.shape === "group" && (filled(rubric.countryCode) || filled(rubric.visaTypeId))) {
+      err("route_key_mismatch", "a bloc or treaty rulebook has no countryCode or visaTypeId");
+    }
+  }
   if (!Number.isInteger(rubric.version) || rubric.version < 1) err("version_invalid", "version must be a positive integer");
   if (!RUBRIC_REVIEW_STATUSES.includes(rubric.reviewStatus)) err("review_status_invalid", `reviewStatus must be one of ${RUBRIC_REVIEW_STATUSES.join(", ")}`);
   if (rubric.intentPolarity !== null && !INTENT_POLARITIES.includes(rubric.intentPolarity)) err("intent_polarity_invalid", "intentPolarity is not a known value");
@@ -230,7 +290,13 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
       if (!criterionIds.has(id)) err("intake_criterion_unknown", `intake question names criterion ${id}, which is not in the rubric`, target);
     }
     if (q.party !== undefined && !EVIDENCE_PARTIES.includes(q.party)) err("intake_party_invalid", "intake question party is not a known value", target);
-    if ((q.answerType === "single_choice" || q.answerType === "multi_choice") && (!Array.isArray(q.options) || q.options.length === 0)) {
+    // (#235) A question whose options come from the route's member countries
+    // (`optionsFrom`) stores no country: its options are added when it is asked.
+    if (q.optionsFrom !== undefined) {
+      if (!(INTAKE_OPTIONS_SOURCES as readonly string[]).includes(q.optionsFrom)) err("intake_options_from_invalid", "optionsFrom is not a known source", target);
+      else if (q.answerType !== "single_choice" && q.answerType !== "multi_choice") err("intake_options_from_not_choice", "only a choice question can take its options from the route's member countries", target);
+      if (storedCountryOptions(q).length > 0) err("intake_options_from_country_stored", "a question whose options are the route's member countries must not store a country option", target);
+    } else if ((q.answerType === "single_choice" || q.answerType === "multi_choice") && (!Array.isArray(q.options) || q.options.length === 0)) {
       err("intake_options_missing", "a choice question needs options", target);
     }
     if (q.options && duplicates(q.options.map((o) => o.value)).length > 0) err("intake_option_duplicate", "option values must be unique within a question", target);
@@ -251,6 +317,13 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
       const q = questions.find((x) => x.id === c.trigger?.questionId);
       if (!q) err("criterion_trigger_question_unknown", `trigger names question ${String(c.trigger.questionId)}, which is not in the rubric`, c.criterionId);
       else if (!isValidTrigger(c.trigger, questions)) err("criterion_trigger_value_unknown", "trigger values must be option values of the question it names (true / false for a yes/no question)", c.criterionId);
+    }
+    // (#234) A fact trigger reads what the applicant holds: its fact and values
+    // must have a usable shape, and only a scoped rule (specialist / conditional)
+    // may carry one (on an "everyone" rule it would silently narrow who it covers).
+    if (c.factTrigger !== undefined) {
+      if (!isValidFactTrigger(c.factTrigger)) err("criterion_fact_trigger_invalid", "factTrigger must name a fact (nationality, residence or holds) and values of its shape (two-letter codes, or kind:issuer for holds)", c.criterionId);
+      else if (c.applicability !== "specialist" && c.applicability !== "conditional") err("criterion_fact_trigger_unscoped", "only a specialist or conditional rule may carry a factTrigger", c.criterionId);
     }
     if (c.eligibilityQuestionId !== undefined) {
       const known = options.knownEligibilityQuestionIds;
@@ -273,6 +346,16 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
     }
     if (e.when && !questionIds.has(e.when.questionId)) err("evidence_condition_unknown", `evidence item depends on question ${e.when.questionId}, which is not in the rubric`, target);
     if (!e.source || !filled(e.source.quote)) err("evidence_quote_empty", "an evidence item needs the quote that names the document", target);
+  }
+
+  // ---- (#235) competence block: which member country examines the application ----
+  // Extraction only stores a block that passed this same check, so a failure
+  // here means damaged data: the rubric is not stored or approved. A block on
+  // a COUNTRY's own rulebook is refused (it has no members to choose between).
+  if (rubric.competence !== undefined) {
+    for (const p of competenceProblems(rubric, { sharedRulebook: parts ? parts.shape === "group" : undefined })) {
+      err(p.code, p.message, p.stepIndex >= 0 ? `competence.steps[${p.stepIndex}]` : "competence");
+    }
   }
 
   // ---- outcome statistics mapping (admin-set; only checked when present) ----

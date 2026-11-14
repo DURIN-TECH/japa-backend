@@ -39,7 +39,7 @@ import {
   type DocumentNeed,
   type RequiredDocumentMeta,
 } from "../../scrapers";
-import { applicableCriterionIds } from "./rule-applicability";
+import { applicableCriterionIds, type ApplicantContext } from "./rule-applicability";
 
 // ============================================
 // Types
@@ -113,6 +113,12 @@ export interface BuildChecklistInput {
   intakeAnswers: Record<string, unknown> | null;
   /** Optional model rewordings, itemId -> text, already stored per rubric version. */
   wordings?: Record<string, string>;
+  /**
+   * (#234) The applicant's facts (the application's `applicantFacts` copy) and
+   * the date, for rules with a fact trigger. Absent = no facts known: such a
+   * rule is then "could not tell" and its documents are not asked for yet.
+   */
+  applicantContext?: ApplicantContext;
 }
 
 // ============================================
@@ -204,7 +210,7 @@ export function isFaithfulWording(candidate: string, quote: string, title: strin
  * rubric items dropped (one document is never listed twice).
  */
 export function buildChecklist(input: BuildChecklistInput): ChecklistResult {
-  const { rubric, visaRecord, intakeAnswers, wordings } = input;
+  const { rubric, visaRecord, intakeAnswers, wordings, applicantContext } = input;
   const items: ChecklistItem[] = [];
   const seenIds = new Set<string>();
   const seenTitles = new Set<string>();
@@ -221,7 +227,7 @@ export function buildChecklist(input: BuildChecklistInput): ChecklistResult {
     // for a specialist-activity rule the applicant's answers do not trigger
     // (or whose trigger is not yet answered) is not listed. An item that
     // evidences no known criterion keeps its own `when` as the only gate.
-    const applicable = applicableCriterionIds(rubric, intakeAnswers);
+    const applicable = applicableCriterionIds(rubric, intakeAnswers, applicantContext);
 
     if (!needsIntake) {
       for (const ev of rubric.evidenceItems ?? []) {

@@ -9,6 +9,9 @@
  */
 
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { buildVisaTypeDoc } from "./seed-visa-doc";
+// #239: which shared routes a record inherits comes from the DATA FILE, never from this seed.
+import { inheritsFromFor, loadSharedVisaData } from "./shared-visa-data-format";
 
 const db = getFirestore();
 
@@ -30,8 +33,11 @@ interface SeedVisaType {
   processingTime: string;
   processingDaysMin: number;
   processingDaysMax: number;
-  baseCostUsd: number;
-  validityPeriod: string;
+  // #239: both optional. An entry with no official source on record for the
+  // fee / validity omits it, so what applicants see comes from the rulebook
+  // and the scrape, not from seed text nobody can trace to a page.
+  baseCostUsd?: number;
+  validityPeriod?: string;
   isExtendable: boolean;
   maxExtensions?: number;
   eligibilityCriteria: string[];
@@ -718,20 +724,28 @@ const VISA_TYPES: SeedVisaType[] = [
   {
     id: "nl-visitor",
     countryCode: "NL",
-    name: "Short Stay Schengen Visa",
-    code: "SCHEN",
+    // #239: no bloc is named in the seed. The shared route this record
+    // inherits (its name, members and sources) comes from the data file
+    // (shared-visa-data.ts) and is attached below through `inheritsFromFor`.
+    // The old name, the old code and the description's bloc mention and
+    // "up to 90 days" were removed: they named a bloc and stated a duration
+    // with no official source on record.
+    name: "Short Stay Visa",
+    code: "SHORT-STAY",
     description:
-      "For tourism, business visits, or family visits to the Netherlands (and Schengen area) for up to 90 days.",
+      "For tourism, business visits, or family visits to the Netherlands for a short stay.",
     category: "tourist",
     processingTime: "2-4 weeks",
     processingDaysMin: 14,
     processingDaysMax: 28,
-    baseCostUsd: 90,
-    validityPeriod: "Up to 90 days within 180-day period",
+    // #239 REMOVED (no official source on record): baseCostUsd: 90.
+    // #239 REMOVED (no official source on record): validityPeriod:
+    //   "Up to 90 days within 180-day period".
     isExtendable: false,
     eligibilityCriteria: [
       "Valid passport (3+ months beyond planned stay)",
-      "Travel health insurance (€30,000 coverage)",
+      // #239 REMOVED the figure "(EUR 30,000 coverage)": no official source on record.
+      "Travel health insurance",
       "Proof of accommodation",
       "Sufficient funds for stay",
       "Return travel booking",
@@ -889,6 +903,8 @@ export async function seedCountriesAndVisas(): Promise<{
   visaTypes: number;
 }> {
   const now = Timestamp.now();
+  // #239: validated up front; an invalid data file stops the seed with a list of problems.
+  const sharedVisaData = loadSharedVisaData();
 
   // Group visa types by country for stats computation
   const visasByCountry: Record<string, SeedVisaType[]> = {};
@@ -907,8 +923,9 @@ export async function seedCountriesAndVisas(): Promise<{
       visas.length > 0
         ? Math.min(...visas.map((v) => v.processingDaysMin))
         : 0;
-    const minCostUsd =
-      visas.length > 0 ? Math.min(...visas.map((v) => v.baseCostUsd)) : 0;
+    // #239: a visa with no recorded fee does not count towards the minimum.
+    const costs = visas.map((v) => v.baseCostUsd).filter((c): c is number => c !== undefined);
+    const minCostUsd = costs.length > 0 ? Math.min(...costs) : 0;
 
     countryBatch.set(db.collection("countries").doc(country.code), {
       code: country.code,
@@ -951,36 +968,13 @@ export async function seedCountriesAndVisas(): Promise<{
       const ref = refs[i];
       const existing = existingById.get(visa.id);
 
-      visaBatch.set(ref, {
-        id: visa.id,
-        countryCode: visa.countryCode,
-        name: visa.name,
-        code: visa.code,
-        description: visa.description,
-        category: visa.category,
-        processingTime: visa.processingTime,
-        processingDaysMin: visa.processingDaysMin,
-        processingDaysMax: visa.processingDaysMax,
-        baseCostUsd: visa.baseCostUsd,
-        validityPeriod: visa.validityPeriod,
-        isExtendable: visa.isExtendable,
-        ...(visa.maxExtensions !== undefined && {
-          maxExtensions: visa.maxExtensions,
-        }),
-        eligibilityCriteria: visa.eligibilityCriteria,
-        ...(visa.applicationUrl && { applicationUrl: visa.applicationUrl }),
-        ...(visa.applicationInstructions && {
-          applicationInstructions: visa.applicationInstructions,
-        }),
-        // Runtime-owned fields. A NEW doc starts active, with no agents and
-        // createdAt = now (unchanged behaviour). An EXISTING doc keeps what is
-        // stored; the `?? default` covers a legacy doc missing the field.
-        // Everything above this comment is seed-owned and is refreshed.
-        isActive: existing ? existing.isActive ?? true : true,
-        agentIds: existing ? existing.agentIds ?? [] : [],
-        createdAt: existing ? existing.createdAt ?? now : now,
-        updatedAt: now,
-      });
+      // #239: built by a pure function (seed-visa-doc.ts). It keeps the stored
+      // `inheritsFrom` (this is a whole-document set, which would drop it) and
+      // adds the data file's shared routes to a record that has none.
+      visaBatch.set(
+        ref,
+        buildVisaTypeDoc(visa, existing, now, inheritsFromFor(sharedVisaData, visa.countryCode, visa.id))
+      );
     }
     await visaBatch.commit();
     totalVisas += visas.length;

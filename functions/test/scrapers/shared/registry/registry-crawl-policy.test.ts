@@ -365,14 +365,14 @@ describe("visa crawl: portal-added pages", () => {
       nextCrawlAt: Timestamp.fromMillis(NOW + 86_400_000), crawlIntervalHours: 168, consecutiveFailures: 0, reliabilityScore: 100, pages,
     });
 
-  const run = async (confirmedHosts: () => Promise<Set<string>>) => {
+  const run = async (confirmedHosts: (authorityId: string) => Promise<Set<string>>, sourceId = "AA") => {
     const original = extractMod.visaCatalogExtractor.extract;
     extractMod.visaCatalogExtractor.extract = async () => {
       extractions++;
       throw new Error("extractor stubbed: refuse so no record is written");
     };
     try {
-      return await quiet(() => crawl.runOrchestrator({ now: NOW, sourceId: "AA", trigger: "manual", adapters: adapters(), confirmedHosts, fetchFxRates: async () => ({ rates: { USD: 1 }, rateDate: "2026-11-09" }) }));
+      return await quiet(() => crawl.runOrchestrator({ now: NOW, sourceId, trigger: "manual", adapters: adapters(), confirmedHosts, fetchFxRates: async () => ({ rates: { USD: 1 }, rateDate: "2026-11-09" }) }));
     } finally {
       extractMod.visaCatalogExtractor.extract = original;
     }
@@ -421,5 +421,46 @@ describe("visa crawl: portal-added pages", () => {
     assert.equal(adapterCalls.length, 0);
     assert.equal(pageOf(PORTAL).lastContentHash, "keep");
     assert.equal(pageOf(PORTAL).paused, true);
+  });
+
+  // ---- Issue #232: the allow-list is the source's AUTHORITY's hosts ----
+
+  test("issue #232: the allow-list is asked for the source's own authority (its doc id)", async () => {
+    seed([{ url: PORTAL, routeName: "P", visaId: "aa-p", addedVia: "portal" }]);
+    const asked: string[] = [];
+    await run(async (id) => {
+      asked.push(id);
+      return new Set(["www.agency.example.org"]);
+    });
+    assert.deepEqual(asked, ["AA"]);
+    assert.deepEqual(adapterCalls, [{ url: PORTAL, policy: true }]);
+  });
+
+  test("issue #232: the default allow-list excludes a host confirmed for another authority", async () => {
+    seed([{ url: PORTAL, routeName: "P", visaId: "aa-p", addedVia: "portal" }]);
+    // The page's host is confirmed, but for a different authority.
+    store.set("officialDomains/www.agency.example.org", { host: "www.agency.example.org", authorityId: "test-bloc", status: "confirmed" });
+    const { officialDomainsService } = await import("../../../../src/scrapers/shared/registry/official-domains.service");
+    const hosts = await officialDomainsService.confirmedHostsFor("AA");
+    assert.equal(hosts.has("www.agency.example.org"), false);
+    assert.equal((await officialDomainsService.confirmedHostsFor("test-bloc")).has("www.agency.example.org"), true);
+    // The crawl, with the default lookup, refuses the page (recorded error, no extraction).
+    const summary: any = await run((id) => officialDomainsService.confirmedHostsFor(id));
+    assert.equal(summary.errors, 1);
+    assert.equal(extractions, 0);
+  });
+
+  test("issue #232: a bloc's or treaty's visa source is never crawled as a country source", async () => {
+    store.set("visaSources/test-bloc", {
+      id: "test-bloc", authorityId: "test-bloc", countryName: "Test Bloc", status: "active", isOfficial: true, adapter: "generic-html",
+      crawlIntervalHours: 168, consecutiveFailures: 0, reliabilityScore: 100,
+      pages: [{ url: PORTAL, routeName: "P", visaId: "test-bloc-p", addedVia: "portal" }],
+    });
+    const summary: any = await run(async () => new Set(["www.agency.example.org"]), "test-bloc");
+    assert.equal(adapterCalls.length, 0);
+    assert.equal(extractions, 0);
+    assert.equal(summary.sourcesProcessed, 0);
+    // Nothing was filed under countries/.
+    assert.equal([...store.keys()].filter((k) => k.startsWith("countries/test-bloc")).length, 0);
   });
 });

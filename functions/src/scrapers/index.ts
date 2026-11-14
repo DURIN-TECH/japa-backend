@@ -75,6 +75,21 @@ export { routeOnboardingService } from "./onboarding/route-onboarding.service";
 // ---- Source registry API (issue #215) ----
 /** Confirmed official websites + route registration (admin only). */
 export { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./shared/registry/registry.routes";
+/**
+ * (#230) The registry's error type, append-only audit write and address rules,
+ * reused by the authorities API (src/authorities) so its admin endpoints share
+ * the same error shape, audit trail and https/host rules.
+ */
+export { RegistryError, isRegistryError } from "./shared/registry/registry-errors";
+export { appendRegistryAudit, stripUndefined } from "./shared/registry/registry-audit";
+export type { RegistryAuditAction, RegistryAuditEntry } from "./shared/registry/registry-audit";
+export { parseRegistryUrl } from "./shared/registry/registry-address";
+/**
+ * (#232) Which authority a stored official website belongs to (reads the
+ * pre-#232 `countryCode` field too, until the #239 migration). The
+ * authorities API uses it to check a membership quote's host.
+ */
+export { officialDomainAuthorityId } from "./shared/registry/official-domains.service";
 
 // ---- Caseworker-guidance registry (issue #39) ----
 /** Admin list of guidance sources (GET /admin/guidance-sources). */
@@ -97,7 +112,28 @@ export type { JobView, StartJobInput, StartJobResult } from "./rubric/rubric-ext
  * is never returned by it); the `...ForReview` reads are for the admin review
  * API (#125).
  */
-export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
+export { rubricStore, rubricRouteKey, rulebookKeyOf } from "./rubric/rubric.store";
+/**
+ * (#233) Rulebook keys for ANY issuing authority (`{authorityId}_{routeSlug}`):
+ * build a checked target, read the parts of a stored document whichever shape
+ * it was written in.
+ */
+export { rulebookTargetOf, rulebookTargetOfKey, rulebookPartsOf, keyFieldsOf, targetInputOf, withKeyParts, isCountryRulebookKey, RulebookKeyError } from "./rubric/rubric-key";
+export type { RulebookTarget, RulebookTargetInput } from "./rubric/rubric-key";
+/**
+ * (#233) Rulebook STACKS: the approved version of every layer of a route
+ * (shared bloc / treaty layer first, the country's own layer last), merged into
+ * one served view. A single-layer route reads exactly its own rulebook.
+ */
+export { loadRulebookStack, mergeRulebookStack, stackFromReads, layerVersionsOf, sameStackVersions, scopedId, sharedLayerView, STACK_ID_SEPARATOR } from "./rubric/rubric-stack";
+// (#235) The code check of a competence block (which member country examines an application).
+export { competenceProblems, servableCompetence, isDestinationQuestion, quoteContains } from "./rubric/rubric-competence";
+export type { RulebookStack, StackLayerRead, StackLayerReader, StackUnusableReason } from "./rubric/rubric-stack";
+// (#233 P4b) The layer check: an own layer's rules against its shared layer(s) (restates links, conflicts).
+export { RubricLayerChecker, runLayerCheck, decideLayerLinks, linkRefusal, notCheckedRecord, LAYER_CHECK_PROMPT_VERSION, DEFAULT_LAYER_CHECK_LIMITS } from "./rubric/rubric-layer-check";
+export type { LayerCheckInput, LayerCheckLimits, LayerCheckOutcome, SharedLayerRules } from "./rubric/rubric-layer-check";
+export { planStack } from "./rubric/rubric-question-plan";
+export type { StackPlanLayer, StackPlanProblem, StackPlanResult } from "./rubric/rubric-question-plan";
 /** Structural rubric validator (the review API re-runs it before approving). */
 export { validateVisaRubric } from "./rubric/rubric-validate";
 /** Criterion exclusions (#161): the pure read-side filter, the preview and the limits. */
@@ -168,6 +204,25 @@ export { registeredDestinations } from "./outcome-statistics/registry";
 /** Pure rules shared with the checklist, the derived requirements and the backfill script. */
 export { ANSWER_TYPES, answerTypeOf, classifyAnswerType, classifyNeed, findMetaForItem, isAnswerType, itemKey, metaFromQuoteOnly, normaliseStoredMeta } from "./visa-catalog/required-document-meta";
 export type { AnswerType, DocumentKind, DocumentNeed, RequiredDocumentMeta } from "./visa-catalog/required-document-meta";
+
+// ---- Entry requirements (issue #236, P7 of #228) ----
+// The entry-rule drafting pipeline (src/entry-requirements) reuses the rulebook
+// pipeline's BUILDING BLOCKS through this public API rather than copying them:
+// the stored source snapshots and their chunking, the verbatim quote check (and
+// the number / group-name checks on a quote), the extraction caps and kill
+// switch, and the catalog's FX conversion. The rulebook prompts and the rulebook
+// checker are NOT shared: entry rules have their own prompts and version.
+export { chunkSnapshot } from "./rubric/rubric-chunk";
+export type { SourceChunk } from "./rubric/rubric-chunk";
+export { unsupportedNumbers, groupNameSupported, uncodedNameSupported, containsTokenBounded } from "./rubric/rubric-quote";
+export type { QuoteLookup } from "./rubric/rubric-quote";
+export { LIST_ITEM_MAX_CHARS } from "./rubric/rubric-list-items";
+export { loadRubricSettings } from "./rubric/rubric-settings";
+export type { RubricExtractionSettings, LoadedRubricSettings } from "./rubric/rubric-settings";
+export { computeFee } from "./visa-catalog/visa-catalog-fx";
+export { normalizeForQuoteMatch } from "./shared/fetch/pdf-text";
+// The lexicon a source's quotes are read with (numbers, dates) in its own language (#220).
+export { lexiconFor } from "./language/language-lexicon";
 
 // Outbound-fetch building blocks reused outside the scrapers (issue #178: the
 // exchange-rate providers read a public rates endpoint with the SAME guarded

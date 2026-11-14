@@ -1,7 +1,8 @@
 import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db } from "../../../utils/firebase";
 import { appendRegistryAudit, stripUndefined } from "./registry-audit";
-import { lookupRegionName, parseRegistryHost } from "./registry-address";
+import { parseRegistryHost } from "./registry-address";
+import { resolveRegistryAuthority } from "./registry-authority";
 import { RegistryError } from "./registry-errors";
 import { loadRegistrySettings } from "./registry-settings";
 import type { VisaSourcePage } from "../../visa-catalog/types";
@@ -25,11 +26,21 @@ import type { VisaSourcePage } from "../../visa-catalog/types";
 // Matching is on EXACT hosts. There are no subdomain wildcards in this version
 // (the codebase has no public-suffix list, so a pattern such as "*.co.xx" could
 // not be told apart from a real organisation); wildcards are refused outright.
+//
+// Issue #232 (P3 of #228): a host belongs to ONE ISSUING AUTHORITY (a country,
+// a bloc or a treaty), stored as `authorityId`. For a country the value is the
+// same two-letter code the old `countryCode` field held. A host confirmed for
+// one authority cannot be confirmed for another (409
+// HOST_CONFIRMED_FOR_OTHER_AUTHORITY); letting one host serve several
+// authorities is a separate follow-up (FU-3). Sources registered for an
+// authority may only use hosts confirmed for THAT authority
+// (`confirmedHostsFor`).
 
 /** The stored doc. */
 export interface OfficialDomain {
   host: string;
-  countryCode: string;
+  /** The issuing authority the host was confirmed for (country code, or bloc/treaty id). */
+  authorityId: string;
   status: "confirmed" | "revoked";
   confirmedBy: string; // uid, or "system:seed" for the one-off import
   confirmedAt: Timestamp;
@@ -49,6 +60,43 @@ export interface OfficialDomain {
   revokedBy?: string;
   revokedAt?: Timestamp;
   revokeReason?: string;
+}
+
+/**
+ * A stored doc as it may still be read before the dev migration (#239) runs:
+ * documents written before #232 carry `countryCode` and no `authorityId`.
+ */
+type StoredOfficialDomain = Omit<OfficialDomain, "authorityId"> & { authorityId?: string; countryCode?: string };
+
+/**
+ * The authority a stored host belongs to.
+ *
+ * LEGACY READ, the ONE place it happens: a document written before #232 has
+ * only `countryCode`; a country's authority id IS its code, so that value is
+ * used as the authority. REMOVE this fallback once the migration script of
+ * #239 (P10 of #228) has rewritten every `officialDomains` doc on dev; prod
+ * is migrated in the same deliberate release. Returns "" for a doc with
+ * neither field (never matches any authority, so it fails closed).
+ */
+export function officialDomainAuthorityId(raw: unknown): string {
+  const d = (raw ?? {}) as { authorityId?: unknown; countryCode?: unknown };
+  if (typeof d.authorityId === "string" && d.authorityId) return d.authorityId;
+  // TODO(#239): delete this legacy branch after the officialDomains migration
+  // (scripts/migrate-shared-visa-model.ts) has run on EVERY environment that
+  // holds old docs. Kept for now: the code deploys before the script runs, and
+  // without this branch an old doc matches no authority (the crawl fails closed).
+  if (typeof d.countryCode === "string" && d.countryCode) return d.countryCode;
+  return "";
+}
+
+/**
+ * A stored doc in today's shape: `authorityId` filled (legacy fallback above)
+ * and the old `countryCode` field dropped, so nothing downstream ever sees it.
+ */
+export function readOfficialDomain(raw: unknown): OfficialDomain {
+  const { countryCode: _legacy, ...rest } = (raw ?? {}) as StoredOfficialDomain;
+  void _legacy;
+  return { ...rest, authorityId: officialDomainAuthorityId(raw) } as OfficialDomain;
 }
 
 /** Bounds of the typed statement. */
@@ -80,7 +128,8 @@ export interface RevokeResult {
   domain: OfficialDomain;
   changed: boolean;
   pausedGuidanceSources: string[];
-  pausedVisaPages: Array<{ countryCode: string; url: string }>;
+  /** Paused visa pages: the visa source's id (its authority) and the page address. */
+  pausedVisaPages: Array<{ authorityId: string; url: string }>;
 }
 
 class OfficialDomainsService {
@@ -90,19 +139,20 @@ class OfficialDomainsService {
   clock: () => number = Date.now;
 
   /**
-   * Confirm one exact host for a country.
+   * Confirm one exact host for an issuing authority (issue #232).
    *
-   * Requires: a valid exact host (no wildcard), a known country code, a typed
-   * statement, and a fresh address check this admin made for exactly this host
-   * whose final host was that same host (a redirect to another site proves
-   * nothing about THIS site). Idempotent: confirming a host that is already
-   * confirmed for the same country changes and audits nothing.
+   * Requires: a valid exact host (no wildcard), an authority that exists (a
+   * real country code, or a bloc/treaty in `authorities`, not retired: see
+   * registry-authority.ts), a typed statement (the name of the body that runs
+   * the site), and a fresh address check this admin made for exactly this
+   * host whose final host was that same host (a redirect to another site
+   * proves nothing about THIS site). Idempotent: confirming a host that is
+   * already confirmed for the same authority changes and audits nothing; for
+   * a different authority it is 409 HOST_CONFIRMED_FOR_OTHER_AUTHORITY.
    */
-  async confirm(input: { host: unknown; countryCode: unknown; statement: unknown }, actorUid: string): Promise<{ domain: OfficialDomain; created: boolean }> {
+  async confirm(input: { host: unknown; authorityId: unknown; statement: unknown }, actorUid: string): Promise<{ domain: OfficialDomain; created: boolean }> {
     const host = parseRegistryHost(input.host);
     if (!host.ok) throw new RegistryError(host.code, 400, host.message);
-    const region = lookupRegionName(input.countryCode);
-    if (!region) throw new RegistryError("INVALID_COUNTRY_CODE", 400, "The country code is not a known two-letter code");
     const statement = typeof input.statement === "string" ? input.statement.trim() : "";
     if (statement.length < STATEMENT_MIN_CHARS) {
       throw new RegistryError("STATEMENT_REQUIRED", 400, "Type the name of the authority that runs this website");
@@ -119,13 +169,19 @@ class OfficialDomainsService {
     const previewRef = collections.officialDomainPreviews.doc(previewDocId(actorUid, host.host));
 
     return this.runTransaction(async (tx) => {
+      // All reads first. The authority is read in the SAME transaction, so a
+      // bloc retired a moment ago cannot receive a new website.
+      const authority = await resolveRegistryAuthority(input.authorityId, (ref) => tx.get(ref));
       const [domainSnap, previewSnap] = await Promise.all([tx.get(domainRef), tx.get(previewRef)]);
-      const existing = domainSnap.exists ? (domainSnap.data() as OfficialDomain) : undefined;
+      const existing = domainSnap.exists ? readOfficialDomain(domainSnap.data()) : undefined;
 
       // Idempotent: already confirmed -> same answer, no write, no audit entry.
+      // One host, one authority: another authority's claim is a conflict.
       if (existing?.status === "confirmed") {
-        if (existing.countryCode !== region.code) {
-          throw new RegistryError("HOST_CONFIRMED_FOR_OTHER_COUNTRY", 409, "That website is already confirmed for a different country");
+        if (existing.authorityId !== authority.id) {
+          throw new RegistryError("HOST_CONFIRMED_FOR_OTHER_AUTHORITY", 409, "That website is already confirmed for a different authority", {
+            confirmedFor: existing.authorityId,
+          });
         }
         return { domain: existing, created: false };
       }
@@ -146,7 +202,7 @@ class OfficialDomainsService {
 
       const domain: OfficialDomain = stripUndefined({
         host: host.host,
-        countryCode: region.code,
+        authorityId: authority.id,
         status: "confirmed",
         confirmedBy: actorUid,
         confirmedAt: Timestamp.fromMillis(now),
@@ -191,13 +247,39 @@ class OfficialDomainsService {
   /** Every host, sorted by host name. */
   async list(): Promise<OfficialDomain[]> {
     const snap = await collections.officialDomains.get();
-    return snap.docs.map((d) => d.data() as OfficialDomain).sort((a, b) => a.host.localeCompare(b.host));
+    return snap.docs.map((d) => readOfficialDomain(d.data())).sort((a, b) => a.host.localeCompare(b.host));
   }
 
-  /** The exact hosts whose status is `confirmed` (the allow-list used at crawl time). */
+  /**
+   * The exact hosts whose status is `confirmed`, for ANY authority.
+   *
+   * No crawl uses this any more: every fetch policy, including the guidance
+   * crawl's, asks for ONE authority's hosts through `confirmedHostsFor`. Kept
+   * for admin listings and tests only; never use it to decide what to fetch.
+   */
   async confirmedHosts(): Promise<Set<string>> {
     const snap = await collections.officialDomains.where("status", "==", "confirmed").get();
     return new Set(snap.docs.map((d) => String((d.data() as OfficialDomain).host).toLowerCase()));
+  }
+
+  /**
+   * The exact hosts confirmed for ONE authority (issue #232): the allow-list
+   * for registering, previewing, re-activating and crawling that authority's
+   * sources. A host confirmed for another authority is NOT in it, so a
+   * redirect to it is refused like a redirect to any unconfirmed host.
+   *
+   * Reads every confirmed host and filters in memory rather than querying
+   * `authorityId`: documents written before #232 only carry `countryCode`
+   * (see officialDomainAuthorityId), and the list is small. Fails closed: a
+   * read error propagates, and the caller fetches nothing.
+   */
+  async confirmedHostsFor(authorityId: string): Promise<Set<string>> {
+    const snap = await collections.officialDomains.where("status", "==", "confirmed").get();
+    return new Set(
+      snap.docs
+        .filter((d) => officialDomainAuthorityId(d.data()) === authorityId)
+        .map((d) => String((d.data() as OfficialDomain).host).toLowerCase())
+    );
   }
 
   /** Status of one host: "confirmed", "revoked" or "not_confirmed". */
@@ -228,7 +310,7 @@ class OfficialDomainsService {
     const { domain, changed } = await this.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       if (!snap.exists) throw new RegistryError("NOT_FOUND", 404, "That website is not in the confirmed list");
-      const existing = snap.data() as OfficialDomain;
+      const existing = readOfficialDomain(snap.data());
       if (existing.status === "revoked") return { domain: existing, changed: false };
       const next: OfficialDomain = stripUndefined({
         ...existing,
@@ -263,9 +345,9 @@ class OfficialDomainsService {
   private async pauseSourcesOnHost(
     host: string,
     now: number
-  ): Promise<{ pausedGuidanceSources: string[]; pausedVisaPages: Array<{ countryCode: string; url: string }> }> {
+  ): Promise<{ pausedGuidanceSources: string[]; pausedVisaPages: Array<{ authorityId: string; url: string }> }> {
     const pausedGuidanceSources: string[] = [];
-    const pausedVisaPages: Array<{ countryCode: string; url: string }> = [];
+    const pausedVisaPages: Array<{ authorityId: string; url: string }> = [];
     const at = Timestamp.fromMillis(now);
 
     // ---- Guidance sources ----
@@ -293,7 +375,7 @@ class OfficialDomainsService {
       });
     }
 
-    // ---- Visa pages (inside the per-country registry docs) ----
+    // ---- Visa pages (inside the per-authority registry docs, `visaSources/{authorityId}`) ----
     const visa = await collections.visaSources.get();
     for (const doc of visa.docs) {
       const first = doc.data() as { pages?: VisaSourcePage[] };
@@ -315,7 +397,7 @@ class OfficialDomainsService {
             before: { paused: p.paused ?? false },
             after: { paused: true, pausedReason: HOST_REVOKED_REASON },
           });
-          pausedVisaPages.push({ countryCode: doc.id, url: p.url });
+          pausedVisaPages.push({ authorityId: doc.id, url: p.url });
           return { ...p, paused: true, pausedReason: HOST_REVOKED_REASON };
         });
         // The revoked host also stops being an allowed apply-link host.

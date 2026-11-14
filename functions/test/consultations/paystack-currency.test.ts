@@ -13,7 +13,7 @@
 //    paid time, and leaves malformed values undefined (never a match).
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { PaystackProvider } from "../../src/services/billing/paystack.provider";
+import { PaystackProvider, toTransactionLookup } from "../../src/services/billing/paystack.provider";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -70,11 +70,31 @@ describe("initializeCharge", () => {
     assert.equal(calls.length, 0);
   });
 
-  test("the legacy naira one-off charge (payment requests) still sends NGN", async () => {
-    const { provider, calls } = recordingProvider();
-    await provider.initializeOneOffCharge({ email: "delivered+x@resend.dev", amountKobo: 500_000 });
-    assert.equal(calls[0].payload.amount, 500_000);
-    assert.equal(calls[0].payload.currency, "NGN");
+  test("issue #181: the naira-only initializeOneOffCharge wrapper is gone (payment requests use initializeCharge)", () => {
+    const { provider } = recordingProvider();
+    assert.equal((provider as any).initializeOneOffCharge, undefined);
+  });
+});
+
+describe("toTransactionLookup (issue #181: verify and the payment-request webhook read Paystack the same way)", () => {
+  test("parses a charge.success webhook payload like a verify lookup", () => {
+    assert.deepEqual(
+      toTransactionLookup({
+        status: "success", metadata: { purpose: "payment_request" }, amount: 22_500_000,
+        requested_amount: 22_500_000, currency: "ngn", paid_at: "2026-11-13T09:05:00Z",
+      }),
+      {
+        status: "success", metadata: { purpose: "payment_request" }, amount: 22_500_000,
+        requestedAmount: 22_500_000, currency: "NGN", paidAt: "2026-11-13T09:05:00Z",
+      }
+    );
+  });
+  test("missing or malformed fields come back undefined (a mismatch, never a match)", () => {
+    const r = toTransactionLookup({ status: "success", amount: "22500000", currency: 566 });
+    assert.equal(r.amount, undefined);
+    assert.equal(r.currency, undefined);
+    assert.equal("requestedAmount" in r, false);
+    assert.deepEqual(r.metadata, {});
   });
 });
 

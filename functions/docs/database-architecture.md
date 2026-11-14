@@ -24,6 +24,7 @@ Firestore
 ├── consultations/{consultationId}
 ├── transactions/{transactionId}
 ├── paymentRequests/{paymentRequestId}
+├── paymentRequestExceptions/{reference}   (#181, backend only)
 ├── bankAccounts/{bankAccountId}
 ├── notifications/{notificationId}
 ├── conversations/{conversationId}
@@ -344,7 +345,9 @@ The central workflow entity. A User applies for a VisaType, optionally assisted 
 | progress                                     | number            | 0-100                                                                                                                                               |
 | currentStep, nextStep                        | string            |                                                                                                                                                     |
 | documentsRequired/Uploaded/Verified/Rejected | number            | Denormalized counts                                                                                                                                 |
-| totalCost, amountPaid                        | number            | Cents                                                                                                                                               |
+| totalCost, amountPaid                        | number            | Integer minor units of `costCurrency`: **US cents** for every case since #181 (`totalCost` from the visa's `baseCostUsd`). A pre-#181 case with no `costCurrency` and a positive `totalCost` is US cents too |
+| costCurrency                                 | string?           | #181: the currency of `totalCost`/`amountPaid` (`"USD"` on create and after every dollar settlement) |
+| amountPaidOtherCurrencies                    | map?              | #181: payments in another currency than `costCurrency` (e.g. `{ NGN: 2500000 }` for a legacy naira request on a dollar case), minor units per ISO code; never added to `amountPaid` |
 | paymentStatus                                | enum              | pending, partial, paid, refunded, failed                                                                                                            |
 | clientName, clientEmail                      | string?           | Denormalized                                                                                                                                        |
 | visaTypeName, countryName                    | string?           | Denormalized                                                                                                                                        |
@@ -458,6 +461,7 @@ Every financial event. System-managed (Cloud Functions only -- client writes dis
 | priceUsdCents, chargedCurrency, chargedAmountMinor, fxRate, fxRateAsOf, fxRateSource, fxMarginBps | | #180, `consultation_fee` only: the booking's charge snapshot. `amount` = `chargedAmountMinor`, `currency` = `chargedCurrency`. Absent on legacy naira rows and other kinds |
 | paystackPaidAt, paidAfterQuoteExpiry | | #180, `consultation_fee` only: Paystack's `paid_at`, and the review flag for an exact payment honoured after the booking's quote lock |
 | paidOnSupersededReference | boolean? | #180, `consultation_fee` only: settled by an exact payment on a superseded checkout |
+| paymentRequestId        | string? | #181: the payment request an `escrow_release` settles. Its `amount`/`currency` are what Paystack charged (charged minor units), with `priceUsdCents` and the rate snapshot; `paymentProvider: "paystack"`, `providerTransactionId` = the reference, `agentId` = the agent's user uid. Legacy naira requests: kobo/"NGN", no snapshot. One per request, written in the settlement's Firestore transaction |
 | providerTransactionId   | string? |                                                                                   |
 | description             | string  |                                                                                   |
 | metadata                | Record? | e.g., bank account details for withdrawals                                        |
@@ -553,21 +557,44 @@ Every price an agent or agency owner sets is stored as a `Money` in US cents, ne
 paymentRequests/{paymentRequestId}
 ```
 
-An invoice sent by an Agent to a Client for application services.
+An invoice sent by an Agent to a Client for application services. Backend only (`firestore.rules` has no match: every client is denied; read through `GET /payment-requests`).
+
+Issue #181: the agent sets the price in **US dollars**; the client pays the local-currency amount quoted on the server when they start checkout. Code: `services/payment-request-charge.service.ts` (pricing + checkout, on the shared `services/charge-checkout.service.ts` also used by consultations) and `services/payment-request-settlement.service.ts`.
 
 | Field                   | Type       | Description                       |
 | ----------------------- | ---------- | --------------------------------- |
 | id                      | string     |                                   |
 | applicationId           | string     | **FK → applications**             |
-| agentId                 | string     | **FK → agents**                   |
+| agentId                 | string     | **FK → agents** (profile id)      |
 | agencyId                | string?    | **FK → agencies**                 |
 | clientId                | string     | **FK → users**                    |
 | clientName, clientEmail | string     | Denormalized                      |
-| amount                  | number     | Smallest currency unit            |
-| currency                | string     |                                   |
-| description             | string     |                                   |
-| status                  | enum       | pending, paid, cancelled, expired |
+| priceUsd                | Money?     | #181: `{ amountMinor: US cents, currency: "USD" }`, set by the agent. Absent on legacy rows |
+| amount                  | number     | Minor units of `currency`: US cents mirroring `priceUsd` (#181); legacy rows: kobo |
+| currency                | string     | `"USD"` (#181); legacy rows: `"NGN"` |
+| description, category   | string     |                                   |
+| status                  | enum       | pending, approved, paid, rejected, cancelled, expired |
+| priceUsdCents, chargedCurrency, chargedAmountMinor, fxRate, fxRateAsOf, fxRateSource, fxMarginBps | | #181: the charge snapshot, written when the client starts checkout (approve) and re-written only by a re-quote while the request is unpaid; immutable once `paid` |
+| quoteLockedAt, quoteExpiresAt | Timestamp? | #181: the 30-minute quote lock |
+| paystackReference       | string?    | Current checkout's reference while unpaid (ours: `preq-<id>-<uuid>`, stored before the checkout opens), then the one that paid |
+| checkoutUrl, checkoutCallbackUrl | string? | #181: the current checkout page (null while it opens) and the return URL |
+| supersededCheckouts     | array?     | #181: each replaced checkout `{ reference, supersededAt, snapshot, lock }` |
+| paidAt, paystackPaidAt  | Timestamp? | When settled; Paystack's `paid_at` |
+| paidAfterQuoteExpiry, paidOnSupersededReference | boolean? | #181 review flags (also on the Transaction) |
+| paymentTransactionId    | string?    | #181: the Transaction the settlement wrote |
 | expiresAt               | Timestamp? |                                   |
+
+**Flow (#181).**
+- **Create** (`POST /payment-requests`): `amount` in dollars, read with `parseUsdPriceInput` (whole cents, > 0, at most $100,000.00, `currency` `"USD"` or absent, anything else 400). Access: the `payments.request` entitlement, a compliance-`verified` agency, and `checkApplicationAccess(…, "update")` (the case's assigned agent or its agency's owner); another agency's agent is 403 with nothing written.
+- **Approve** (`PUT /:id/approve`, the client): quote first (no usable rate: 503 `PRICING_UNAVAILABLE`, still pending, nothing written), then approved, then the checkout opens race-safely (claim our reference + snapshot in a Firestore transaction → Paystack `initializeCharge` with exactly `chargedAmountMinor`/`chargedCurrency` → publish the URL).
+- **Re-issue** (`POST /:id/checkout`, #152): same rules as consultation retries (#180): same checkout inside the lock; after it a fresh quote of the same dollar price in the same currency; never while Paystack reports the checkout in progress (409 `PAYMENT_IN_PROGRESS`); the claim only goes on while the request is `approved` and unpaid.
+- **Settle** (`POST /:id/verify` and the `charge.success` webhook, both through `settlePaymentRequest`): in ONE Firestore transaction. The reference must be the current one or a superseded one; Paystack's `requested_amount` (else `amount`) and currency must equal what that checkout asked, else nothing is written (`400 PAYMENT_MISMATCH` on verify, an error log on the webhook). Confirmed: request → paid, one Transaction, and the case's totals (below). A second payment on a paid request, or a payment on a cancelled/rejected one, goes to `paymentRequestExceptions` for refund.
+- **Case totals rule**: a dollar request counts its `priceUsdCents` in USD on the case (not the local amount, which depends on the rate). A payment in the case's `costCurrency` (or on a case with no currency yet, which it then decides) adds to `amountPaid` and recomputes `paymentStatus`; a payment in another currency goes to `amountPaidOtherCurrencies`. So a legacy naira request settles into `amountPaid` at its own kobo amount only when the case has no dollar total yet (the case is then `costCurrency: "NGN"`); otherwise it is recorded separately.
+- **Legacy rows** (kobo, `"NGN"`, no `priceUsd`): list and display as before (`legacy: true`, `amountDisplay: "NGN 25,000.00"`), approve opens a naira checkout for their own amount, settle against that exact amount, never re-priced or rewritten.
+- **Copy**: notifications and emails use explicit codes (`USD 150.00 (NGN 225,000.00)`), never a hard-coded `₦`.
+- `PUT /:id/status` can no longer set `paid` (settlement only) or change a paid request (409).
+
+**`paymentRequestExceptions/{reference}`** (backend only, no rules match): `{ id, paymentRequestId, reference, amountMinor, currency, paystackPaidAt, reason: "paid_on_superseded_reference_after_request_paid" | "request_not_payable", status: "open", createdAt }`, for a human to refund.
 
 ---
 

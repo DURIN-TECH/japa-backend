@@ -1,7 +1,11 @@
 import { Timestamp } from "firebase-admin/firestore";
 import type { ApplicationIntake } from "./intake";
+import type { SharedRouteRef } from "./shared-route";
+// Issue #234: what the applicant holds (profile) and its copy on an application.
+import type { ApplicantFacts, HeldDocument } from "./applicant-facts";
+export * from "./applicant-facts";
 // Issue #179: stored prices are dollar Money; reads add a local quote.
-import type { ChargeSnapshot, LocalPriceQuote, Money, PriceMigrationRecord, QuoteLock } from "./money";
+import type { ChargeSnapshot, CurrencyCode, LocalPriceQuote, Money, PriceMigrationRecord, QuoteLock } from "./money";
 // Automated-verification result shapes live with the provider contract; the
 // compliance file below embeds them as optional signals (see the verification
 // service). One-way import (types -> verification.types), so no cycle.
@@ -50,7 +54,19 @@ export interface User {
   address?: Address;
   residentialCountry?: string;
   profilePhotoUrl?: string;
-  
+
+  // ---- What the applicant holds (issue #234; see types/applicant-facts.ts) ----
+  // Written ONLY through PUT /users/me/holdings and its document sub-routes
+  // (validated server-side); never through PUT /users/me or a client SDK
+  // write (not in USER_SELF_EDITABLE_FIELDS / firestore.rules on purpose).
+  // Nationalities: two-letter codes, one or more. Absent or empty = not stated.
+  nationalities?: string[];
+  // Held visas / permits / travel authorisations. ABSENT = never stated;
+  // an empty list = the applicant said they hold none.
+  heldDocuments?: HeldDocument[];
+  // When the holdings were last saved.
+  holdingsUpdatedAt?: Timestamp;
+
   // Onboarding status
   onboardingCompleted: boolean;
   onboardingCompletedAt?: Timestamp;
@@ -513,6 +529,14 @@ export interface VisaType {
   successRate?: number;
   totalApplications?: number;
 
+  // Issue #231 (P2 of #228): shared routes this record inherits, in order. The
+  // country must be in each shared route's destinations on the day it is set.
+  // The record stays the key of everything country-keyed (agency prices,
+  // screenings, revisions, alerts); this only adds shared rulebook layers
+  // BEFORE the country's own one (see shared-routes/route-stack.ts). Written
+  // only by the admin shared-routes API; absent on every existing record.
+  inheritsFrom?: SharedRouteRef[];
+
   // Availability
   isActive: boolean;
   quotaLimit?: number;
@@ -809,9 +833,28 @@ export interface Application {
   documentsVerified: number;
   documentsRejected: number;
   
-  // Financial
-  totalCost: number; // In cents
+  // Financial (issue #181: real unit and currency documented)
+  // `totalCost` and `amountPaid` are integer MINOR units of `costCurrency`.
+  // New applications are priced from the visa's `baseCostUsd`, so both are
+  // US CENTS with `costCurrency: "USD"` (written on create and by every
+  // payment-request settlement). An application stored before #181 has no
+  // `costCurrency`: a positive `totalCost` there is US cents too (it was always
+  // `baseCostUsd` in cents); with no total yet its currency is undecided, and
+  // the first settlement decides it (see payment-request-settlement.service.ts
+  // `applicationPaymentUpdate`). A payment in ANOTHER currency than
+  // `costCurrency` (a legacy naira request on a dollar case) is never added to
+  // `amountPaid`: it is recorded in `amountPaidOtherCurrencies` instead, so
+  // US cents and kobo are never summed.
+  totalCost: number;
   amountPaid: number;
+  /** The currency of `totalCost` and `amountPaid` ("USD" for every new case). */
+  costCurrency?: CurrencyCode;
+  /**
+   * Paid amounts in a currency other than `costCurrency`, in minor units of
+   * that currency, keyed by ISO code (e.g. `{ NGN: 2500000 }` for a legacy
+   * naira request settled on a dollar case). Never counted in `amountPaid`.
+   */
+  amountPaidOtherCurrencies?: Record<CurrencyCode, number>;
   paymentStatus: PaymentStatus;
   
   // Notes
@@ -825,14 +868,78 @@ export interface Application {
   clientPhone?: string; // Captured when an agent starts an application for a client
   visaTypeName?: string;
   countryName?: string;
+  // Issue #237 (P8 of #228): on a SHARED-route application, the shared route's
+  // name at creation (kept current by PUT /applications/:id/through-country).
+  // `countryName` stays the country applied through. ABSENT otherwise.
+  routeName?: string;
 
   // Answers to the route's intake questions (issue #113). Written only by
   // PUT /applications/:id/intake, which validates them against the approved
   // rubric; never through the generic application update.
   intake?: ApplicationIntake;
 
+  // Issue #231 (P2 of #228): the rulebook keys this application runs on, shared
+  // layer(s) first and the country's own `{countryCode}_{visaTypeId}` last,
+  // fixed when the application starts so a later change of the visa's
+  // `inheritsFrom` does not rewrite a running application. ABSENT on
+  // applications started before P2: those resolve live
+  // (shared-routes/route-stack.ts `resolveApplicationStack`).
+  routeStack?: string[];
+
+  // Issue #234 (P5 of #228): the applicant's holdings (nationalities, country
+  // of residence, held visas and permits) COPIED from their profile when the
+  // application started, with the time taken. Assessment reads this copy, not
+  // the live profile. Personal data: returned only by GET /applications/:id
+  // (behind `checkApplicationAccess`) and stripped from case lists. ABSENT on
+  // applications started before #234. Never written by the generic update.
+  applicantFacts?: ApplicantFacts;
+
+  // Issue #235 (P6 of #228): on a SHARED route, the member country the
+  // application goes through, CONFIRMED by the applicant (or their agent).
+  // `countryCode` / `visaTypeId` above are that member's own inheriting record,
+  // so prices, agencies and the rest of the system read it unchanged. ABSENT on
+  // every application that was not started through a shared route.
+  throughCountryCode?: string;
+  // Who confirmed it, and the rule shown at that time (see ThroughCountryChoice).
+  throughCountry?: ThroughCountryChoice;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+/**
+ * (#235) The confirmed "country I apply through" of a shared-route
+ * application, with what the applicant was shown when they confirmed it.
+ * The proposal is NEVER forced: `followedProposal` is false when the applicant
+ * picked another member, and `reasonShown` is the line they saw ("The rule
+ * says X; you chose Y"). Written only by the create and change-country paths.
+ */
+export interface ThroughCountryChoice {
+  /** The shared route the application is on. */
+  sharedRouteId: string;
+  /** The confirmed member country (same as `Application.throughCountryCode`). */
+  countryCode: string;
+  /** Who confirmed it: their uid and role at the time. */
+  chosenByUid: string;
+  chosenByRole?: string;
+  confirmedAt: Timestamp;
+  /**
+   * The proposal shown at that time, from the shared rulebook's competence
+   * steps (null when the rulebook has no such rule or the answers did not
+   * point to a country: the applicant then simply picked).
+   */
+  proposal: { countryCode: string; stepIndex: number; restsOn: string; quote: string; url: string } | null;
+  /** The answers the proposal was worked out from (scoped question ids). */
+  answers: Record<string, unknown>;
+  /** Why there was no proposal (a code from the resolver), when there was none. */
+  noProposalReason?: string;
+  /** True when the confirmed country is the proposed one; null when there was no proposal. */
+  followedProposal: boolean | null;
+  /** The plain line shown when the applicant chose another member than the rule's. */
+  reasonShown?: string;
+  /** The shared rulebook (key and approved version) the steps came from, when one was read. */
+  rulebookKey?: string;
+  rulebookVersion?: number;
 }
 
 export type PaymentStatus = 
@@ -1209,11 +1316,12 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
 }
 
 /**
- * A Paystack checkout a consultation booking no longer offers (issue #180
- * review fix): replaced by a re-price after the quote lock passed, or by a
- * reissue after a checkout that never opened. Kept with the exact price it
- * asked for, so a payment that completes on it later is judged against what
- * THAT checkout asked, never the booking's newer price.
+ * A Paystack checkout a consultation booking (issue #180 review fix) or a
+ * payment request (issue #181) no longer offers: replaced by a re-price after
+ * the quote lock passed, or by a reissue after a checkout that never opened.
+ * Kept with the exact price it asked for, so a payment that completes on it
+ * later is judged against what THAT checkout asked, never the record's newer
+ * price.
  */
 export interface SupersededCheckout extends ChargeSnapshot, Partial<QuoteLock> {
   /** Our own Paystack reference for that checkout. */
@@ -1244,6 +1352,33 @@ export interface ConsultationPaymentException {
   /** Paystack's own payment time (`paid_at`), when it reported one. */
   paystackPaidAt: Timestamp | null;
   reason: "paid_on_superseded_reference_after_booking_paid" | "booking_not_payable";
+  /** Open until a human refunds it (no automated refund yet). */
+  status: "open";
+  createdAt: Timestamp;
+}
+
+/**
+ * Money we hold for a payment request that cannot be applied to it (issue
+ * #181, same rules as ConsultationPaymentException): an exact payment on a
+ * superseded checkout of a request that was already paid (a second charge),
+ * or a payment on a request that is no longer awaiting payment (cancelled,
+ * rejected or expired while the client was paying).
+ *
+ * Collection `paymentRequestExceptions`, doc id = the Paystack reference.
+ * Backend only: firestore.rules denies every client. Written for a human to
+ * refund; NEVER a second Transaction.
+ */
+export interface PaymentRequestPaymentException {
+  id: string;
+  paymentRequestId: string;
+  /** The Paystack reference that was paid. */
+  reference: string;
+  /** What Paystack charged, in minor units of `currency`. */
+  amountMinor: number;
+  currency: string;
+  /** Paystack's own payment time (`paid_at`), when it reported one. */
+  paystackPaidAt: Timestamp | null;
+  reason: "paid_on_superseded_reference_after_request_paid" | "request_not_payable";
   /** Open until a human refunds it (no automated refund yet). */
   status: "open";
   createdAt: Timestamp;
@@ -1287,6 +1422,8 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   paidAfterQuoteExpiry?: boolean;
   // Issue #180 review fix: settled by an exact payment on a superseded checkout.
   paidOnSupersededReference?: boolean;
+  // Issue #181: the payment request a payment-request transaction settles.
+  paymentRequestId?: string;
   userId: string;
   agentId?: string;
   applicationId?: string;
@@ -1347,9 +1484,27 @@ export type PaymentRequestCategory =
   | "government_fee"
   | "other";
 
-export interface PaymentRequest {
+/**
+ * A payment an agent asks a client for, on one case (application).
+ *
+ * Issue #181: the agent sets the price in US DOLLARS. A request created from
+ * #181 on stores it as `priceUsd` (a `Money`, `currency: "USD"`), and mirrors
+ * it in `amount` (US cents) + `currency: "USD"` so every reader that already
+ * shows `amount` in minor units of `currency` keeps working. When the client
+ * starts checkout the server prices it in the client's charge currency and
+ * stores the charge snapshot (`ChargeSnapshot`: priceUsdCents,
+ * chargedCurrency, chargedAmountMinor, fxRate, fxRateAsOf, fxRateSource,
+ * fxMarginBps) and the quote lock (`QuoteLock`). Re-issuing an unpaid
+ * checkout re-quotes; once `status` is `paid` the snapshot never changes.
+ *
+ * A LEGACY request (before #181) has no `priceUsd` and no snapshot: `amount`
+ * is kobo and `currency` is "NGN". It lists, displays and settles as before
+ * and is never re-priced or rewritten.
+ */
+export interface PaymentRequest extends Partial<ChargeSnapshot>, Partial<QuoteLock> {
   id: string;
   applicationId: string;
+  /** The requesting agent's PROFILE id (`agents/{id}`), not their user uid. */
   agentId: string;
   agencyId?: string;
   clientId: string;
@@ -1359,7 +1514,17 @@ export interface PaymentRequest {
   clientEmail: string;
 
   // Payment details
-  amount: number; // In smallest currency unit (kobo/cents)
+  /**
+   * Issue #181: the price the agent asked for, in US dollars. Absent on a
+   * legacy request.
+   */
+  priceUsd?: Money;
+  /**
+   * Minor units of `currency`. New requests: US cents (= `priceUsd`).
+   * Legacy requests: kobo, with `currency: "NGN"`. Never a bare number:
+   * always read together with `currency`.
+   */
+  amount: number;
   currency: string;
   description: string;
   category: PaymentRequestCategory;
@@ -1368,11 +1533,28 @@ export interface PaymentRequest {
   status: PaymentRequestStatus;
   paidAt?: Timestamp;
   /**
-   * Paystack transaction reference, set when the client starts checkout.
-   * Kept so a return-from-Paystack can be tied back to THIS request, and so a
-   * replayed reference can't be credited to a different one.
+   * Paystack transaction reference of the CURRENT checkout while unpaid, then
+   * of the payment that settled it. Issue #181: generated by US
+   * (`preq-<id>-<uuid>`) and stored before the checkout opens, so a
+   * return-from-Paystack or a webhook can be tied back to THIS request and a
+   * replayed reference can't be credited to a different one. (A legacy
+   * request carries Paystack's own reference.)
    */
   paystackReference?: string;
+  /** Issue #181: the Paystack checkout page for the current reference (null while it opens). */
+  checkoutUrl?: string | null;
+  /** Issue #181: where Paystack sends the payer back (kept for a re-priced checkout). */
+  checkoutCallbackUrl?: string;
+  /** Issue #181: every checkout this request has replaced, with its own snapshot (see SupersededCheckout). */
+  supersededCheckouts?: SupersededCheckout[];
+  /** Issue #181: Paystack's own payment time (`paid_at`), when reported. */
+  paystackPaidAt?: Timestamp;
+  /** Issue #181: an exact payment honoured after `quoteExpiresAt` (flagged for review, also on the Transaction). */
+  paidAfterQuoteExpiry?: boolean;
+  /** Issue #181: settled by an exact payment on a superseded checkout (also on the Transaction). */
+  paidOnSupersededReference?: boolean;
+  /** Issue #181: the id of the Transaction the settlement wrote (one per request, ever). */
+  paymentTransactionId?: string;
   cancelledAt?: Timestamp;
   expiresAt?: Timestamp;
   approvedAt?: Timestamp;

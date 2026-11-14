@@ -19,6 +19,63 @@ import type { Money } from "../../types/money";
  */
 const PAYSTACK_BASE = "https://api.paystack.co";
 
+// ============================================
+// Classified Paystack errors (issue #181 review round 2)
+// ============================================
+
+/**
+ * What the Paystack client throws for every failed call. The message is the
+ * same `PAYSTACK_ERROR: <message> (HTTP <status>)` as before, so every
+ * existing `startsWith("PAYSTACK_ERROR")` check still maps it to 502; the
+ * fields let a caller look at what Paystack actually answered.
+ *
+ *  - `httpStatus`: Paystack's HTTP status, undefined when no response came
+ *    back at all (a network failure, a timeout, DNS);
+ *  - `providerMessage`: the `message` of Paystack's JSON error body;
+ *  - `providerCode`: the `code` of that body (e.g. `transaction_not_found`),
+ *    when Paystack sends one.
+ */
+export class PaystackApiError extends Error {
+  readonly httpStatus?: number;
+  readonly providerMessage?: string;
+  readonly providerCode?: string;
+
+  constructor(
+    message: string,
+    details: { httpStatus?: number; providerMessage?: string; providerCode?: string } = {}
+  ) {
+    super(message);
+    this.name = "PaystackApiError";
+    this.httpStatus = details.httpStatus;
+    this.providerMessage = details.providerMessage;
+    this.providerCode = details.providerCode;
+  }
+}
+
+/** Paystack's own messages for "there is no transaction with this reference". */
+const REFERENCE_NOT_FOUND_MESSAGES = /^(transaction reference not found|transaction not found)\.?$/i;
+
+/**
+ * Whether an error is Paystack's precise answer "there is no transaction
+ * with this reference" (transaction/verify on a reference it never saw).
+ *
+ * Paystack answers that with HTTP 400 (or 404) and the body
+ * `{ status: false, message: "Transaction reference not found", code:
+ * "transaction_not_found" }`. Only that exact answer counts: a network
+ * failure (no HTTP status), a 5xx, a 401 "Invalid key" or any other 4xx
+ * message is NOT "not found", and callers must keep failing closed on them.
+ *
+ * This says nothing about who made the reference: a caller only treats it as
+ * "never opened" for a reference it generated itself (see
+ * `lookupCheckoutState` in charge-checkout.service.ts).
+ */
+export function isPaystackReferenceNotFound(err: unknown): boolean {
+  if (!(err instanceof PaystackApiError)) return false;
+  if (err.httpStatus !== 400 && err.httpStatus !== 404) return false;
+  if (err.providerCode === "transaction_not_found") return true;
+  return !!err.providerMessage && REFERENCE_NOT_FOUND_MESSAGES.test(err.providerMessage.trim());
+}
+
 /**
  * `CreateCheckoutInput` (shared contract from @durin-tech/authz) plus an
  * optional per-request `callbackUrl` (issue #252). When set it overrides the
@@ -66,13 +123,23 @@ export class PaystackProvider implements BillingProvider {
       (err) => {
         // Prefer Paystack's structured error body; fall back to the axios message.
         const status = axios.isAxiosError(err) ? err.response?.status : undefined;
-        const providerMsg =
-          (axios.isAxiosError(err) &&
-            (err.response?.data as { message?: string } | undefined)?.message) ||
-          (err as Error)?.message ||
-          "unknown error";
-        throw new Error(
-          `PAYSTACK_ERROR: ${providerMsg}${status ? ` (HTTP ${status})` : ""}`
+        const body = axios.isAxiosError(err)
+          ? (err.response?.data as { message?: unknown; code?: unknown } | undefined)
+          : undefined;
+        const bodyMessage = typeof body?.message === "string" ? body.message : undefined;
+        const providerMsg = bodyMessage || (err as Error)?.message || "unknown error";
+        // Issue #181 review round 2: a classified error, not a bare Error, so
+        // a caller can tell Paystack's precise "no such transaction" answer
+        // apart from an outage (see `isPaystackReferenceNotFound`). The
+        // message keeps the `PAYSTACK_ERROR: ...` shape every controller
+        // already maps to 502.
+        throw new PaystackApiError(
+          `PAYSTACK_ERROR: ${providerMsg}${status ? ` (HTTP ${status})` : ""}`,
+          {
+            httpStatus: status,
+            providerMessage: bodyMessage,
+            providerCode: typeof body?.code === "string" ? body.code : undefined,
+          }
         );
       }
     );
@@ -166,26 +233,6 @@ export class PaystackProvider implements BillingProvider {
     );
     const data = res.data.data;
     return { authorizationUrl: data.authorization_url, reference: data.reference };
-  }
-
-  /**
-   * Legacy naira one-off charge, kept ONLY for the payment-request flow until
-   * #181 moves it onto `initializeCharge` with its own stored currency.
-   * `amountKobo` is the charge in the smallest NGN unit. Consultations no
-   * longer use this (issue #180).
-   */
-  async initializeOneOffCharge(input: {
-    email: string;
-    amountKobo: number;
-    metadata?: Record<string, unknown>;
-    callbackUrl?: string;
-  }): Promise<{ authorizationUrl: string; reference: string }> {
-    return this.initializeCharge({
-      email: input.email,
-      amount: { amountMinor: input.amountKobo, currency: "NGN" },
-      metadata: input.metadata,
-      callbackUrl: input.callbackUrl,
-    });
   }
 
   /**
@@ -303,22 +350,7 @@ export class PaystackProvider implements BillingProvider {
     }>(`/transaction/verify/${encodeURIComponent(reference)}`);
     const data = res.data.data;
     if (!data) return null;
-    const paidAtRaw = data.paid_at ?? data.paidAt;
-    return {
-      status: data.status,
-      metadata: data.metadata ?? {},
-      amount: typeof data.amount === "number" && Number.isSafeInteger(data.amount) ? data.amount : undefined,
-      // What WE asked for. When the account passes Paystack's fees to the
-      // customer, `amount` includes those fees and `requested_amount` holds
-      // the original; the consultation charge check compares this one when
-      // present (issue #180 review).
-      // (Only set when well-formed, so callers fall back to `amount` otherwise.)
-      ...(typeof data.requested_amount === "number" && Number.isSafeInteger(data.requested_amount)
-        ? { requestedAmount: data.requested_amount }
-        : {}),
-      currency: typeof data.currency === "string" ? data.currency.toUpperCase() : undefined,
-      paidAt: typeof paidAtRaw === "string" && paidAtRaw ? paidAtRaw : undefined,
-    };
+    return toTransactionLookup(data);
   }
 
   async cancelSubscription(providerRef: string): Promise<void> {
@@ -352,7 +384,16 @@ export class PaystackProvider implements BillingProvider {
       .createHmac("sha512", this.secretKey)
       .update(rawBody)
       .digest("hex");
-    if (signature !== expected) {
+    // Issue #181 review fix: compare in constant time. A plain `!==` stops at
+    // the first differing character, so its timing leaks how much of a forged
+    // signature is right. `timingSafeEqual` needs two buffers of the SAME
+    // length (it throws otherwise), so a signature of the wrong length is
+    // refused before the compare; its length is not a secret (always 128 hex
+    // characters for SHA-512). Both sides are compared as raw bytes of the
+    // hex text, so a non-hex or mixed-case header simply does not match.
+    const given = Buffer.from(String(signature), "utf8");
+    const wanted = Buffer.from(expected, "utf8");
+    if (given.length !== wanted.length || !crypto.timingSafeEqual(given, wanted)) {
       console.warn("Paystack webhook signature mismatch");
       return false;
     }
@@ -456,6 +497,42 @@ export interface PaystackTransactionLookup {
   currency?: string;
   /** When the payment completed (ISO 8601), when Paystack reports it. */
   paidAt?: string;
+}
+
+/**
+ * Turn a Paystack transaction payload (the `data` of transaction/verify, or
+ * of a signature-verified `charge.success` webhook) into the lookup shape
+ * the charge paths compare against. Issue #181: shared by verify and the
+ * payment-request webhook, so both read amount, currency and payment time the
+ * same way. Each field is undefined when the payload does not carry a
+ * well-formed value; callers treat undefined as a mismatch, never as a match.
+ */
+export function toTransactionLookup(data: {
+  status?: unknown;
+  metadata?: unknown;
+  amount?: unknown;
+  requested_amount?: unknown;
+  currency?: unknown;
+  paid_at?: unknown;
+  paidAt?: unknown;
+}): PaystackTransactionLookup {
+  const paidAtRaw = data.paid_at ?? data.paidAt;
+  const metadata = data.metadata && typeof data.metadata === "object" ? (data.metadata as Record<string, unknown>) : {};
+  return {
+    status: typeof data.status === "string" ? data.status : "",
+    metadata,
+    amount: typeof data.amount === "number" && Number.isSafeInteger(data.amount) ? data.amount : undefined,
+    // What WE asked for. When the account passes Paystack's fees to the
+    // customer, `amount` includes those fees and `requested_amount` holds
+    // the original; the charge checks compare this one when present (issue
+    // #180 review). Only set when well-formed, so callers fall back to
+    // `amount` otherwise.
+    ...(typeof data.requested_amount === "number" && Number.isSafeInteger(data.requested_amount)
+      ? { requestedAmount: data.requested_amount }
+      : {}),
+    currency: typeof data.currency === "string" ? data.currency.toUpperCase() : undefined,
+    paidAt: typeof paidAtRaw === "string" && paidAtRaw ? paidAtRaw : undefined,
+  };
 }
 
 interface PaystackMetadata {

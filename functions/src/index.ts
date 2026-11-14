@@ -91,6 +91,9 @@ import { guidanceCrawlService } from "./scrapers";
 import { newsNotificationService } from "./services/news-notification.service";
 import { claimsService } from "./services/claims.service";
 import { notificationService } from "./services/notification.service";
+// Issue #181: payment-request amounts in copy, with explicit currency codes.
+import { describeRequestAmount } from "./services/payment-request-charge.service";
+import type { PaymentRequest } from "./types";
 import { unreadMessageReminderService } from "./services/unread-message-reminder.service";
 import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
@@ -312,12 +315,15 @@ export const onPaymentRequestCreated = functions
     console.log(`New payment request created: ${context.params.requestId}`);
 
     try {
-      const amountDisplay = (request.amount / 100).toLocaleString();
+      // Issue #181: the amount with an explicit currency code ("USD 150.00"
+      // for a dollar request, "NGN 25,000.00" for a legacy one), never a
+      // hard-coded naira sign or a hand-made `/ 100`.
+      const amountDisplay = describeRequestAmount(request as PaymentRequest);
       await notificationService.notifyUser({
         userId: request.clientId,
         type: "payment_request",
         title: "New Payment Request",
-        body: `Your agent requests ₦${amountDisplay} for ${request.description}.`,
+        body: `Your agent requests ${amountDisplay} for ${request.description}.`,
         relatedEntityType: "payment_request",
         relatedEntityId: context.params.requestId,
         data: request.applicationId
@@ -880,6 +886,10 @@ export const onRubricApprovedRecordAlert = functions
  * and its spend caps apply: a capped run is skipped and leaves the previous
  * approved rubric serving. Nobody is alerted here: an alert needs an admin's
  * approval of the staged version. Binds AI_SECRETS (the extraction reads it).
+ * (#225) While a route onboarding run is active for a route, that route's
+ * re-draft is DEFERRED (nothing is started, the reason is recorded on the
+ * run's route head): the run drafts after an admin confirms its estimate, and
+ * the deferral is re-evaluated when the run ends (onboarding-redraft.ts).
  */
 export const onGuidanceSourceChanged = functions
   .runWith({ memory: "1GB", timeoutSeconds: 540, secrets: [...AI_SECRETS] })
@@ -983,7 +993,8 @@ export const sweepRouteOnboardingRuns = functions
   .timeZone("UTC")
   .onRun(async () => {
     const result = await routeOnboardingService.sweep();
-    if (result.considered > 0 || result.alertsRaised > 0 || result.heldChecked > 0) console.log(`[route-onboarding] sweep: ${JSON.stringify(result)}`);
+    // (#225) `redraftsChecked`: deferred automatic re-drafts re-evaluated (see onboarding-redraft.ts).
+    if (result.considered > 0 || result.alertsRaised > 0 || result.heldChecked > 0 || result.redraftsChecked > 0) console.log(`[route-onboarding] sweep: ${JSON.stringify(result)}`);
   });
 
 /**

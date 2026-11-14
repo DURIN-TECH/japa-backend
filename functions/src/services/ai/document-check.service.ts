@@ -5,7 +5,8 @@ import { collections, db } from "../../utils/firebase";
 import { validateStoragePath } from "../../utils/storage-paths";
 import { isSelfServiceApplication } from "../../utils/self-service";
 import { notificationService } from "../notification.service";
-import { rubricStore, type VisaRubric } from "../../scrapers";
+import { rubricStore, type RulebookStack, type VisaRubric } from "../../scrapers";
+import { defaultRulebookStack, rulebookFor, type ApplicationStackRef } from "./application-rulebook";
 import type { Application, Document, DocumentRequest, User } from "../../types";
 import type { DocumentCheckRecord } from "../../types/document-check";
 import { readAiSettings, type AiSettingsRead } from "./ai-settings";
@@ -91,7 +92,9 @@ export const STALE_CHECK_MS = 5 * 60 * 1000;
 
 export interface DocumentCheckDeps {
   provider: LlmProvider;
-  rubrics: { getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null> };
+  // (#233) `getRulebookStack` reads the application's whole rulebook stack
+  // (set by the default deps); without it the own layer alone is read.
+  rubrics: { getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null>; getRulebookStack?(app: ApplicationStackRef): Promise<RulebookStack> };
   loadBytes(storagePath: string): Promise<Buffer>;
   runTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>;
   readSettings(): Promise<AiSettingsRead>;
@@ -102,7 +105,7 @@ export interface DocumentCheckDeps {
 function defaultDeps(): DocumentCheckDeps {
   return {
     provider: new AnthropicLlmProvider(),
-    rubrics: { getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc, vt) },
+    rubrics: { getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc, vt), getRulebookStack: (app) => defaultRulebookStack(app) },
     loadBytes: async (storagePath) => {
       const [bytes] = await getStorage().bucket().file(storagePath).download();
       return bytes;
@@ -464,7 +467,8 @@ export class DocumentCheckService {
     const fileHash = sha256(bytes);
 
     // ---- expectations: from the approved rubric only ----
-    const rubric = await this.deps.rubrics.getApprovedRubric(application.countryCode.toUpperCase(), application.visaTypeId);
+    // (#233) The application's rulebook stack (its own layer alone without inheritance).
+    const rubric = await rulebookFor({ ...application, countryCode: application.countryCode.toUpperCase() }, this.deps.rubrics);
     const holder = request.holder ?? "applicant";
     // (#207) The applicant's intake answers decide which linked rules apply.
     const savedAnswers = (application as Application & { intake?: { answers?: Record<string, unknown> } }).intake?.answers ?? null;

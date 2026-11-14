@@ -2,7 +2,7 @@ import { Response, Request } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { entitlementService } from "../services/entitlement.service";
 import { billingService } from "../services/billing/billing.service";
-import { paystackProvider } from "../services/billing/paystack.provider";
+import { paystackProvider, toTransactionLookup } from "../services/billing/paystack.provider";
 import { settlePaymentRequest } from "../services/payment-request-settlement.service";
 import { collections } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
@@ -477,6 +477,10 @@ export class EntitlementController {
           reference?: string;
           status?: string;
           metadata?: Record<string, unknown>;
+          amount?: unknown;
+          requested_amount?: unknown;
+          currency?: unknown;
+          paid_at?: unknown;
         };
       };
 
@@ -501,16 +505,29 @@ export class EntitlementController {
       // status is checked anyway rather than trusting the event name alone.
       if (body.data?.status && body.data.status !== "success") return false;
 
-      const outcome = await settlePaymentRequest(paymentRequestId, reference);
-      if (outcome.alreadySettled) {
+      // Issue #181: what Paystack charged (amount / requested_amount,
+      // currency, paid_at) is read from the SIGNED payload exactly as verify
+      // reads its lookup, and the settlement only settles when it equals
+      // what the paid checkout asked. A missing amount or currency is a
+      // mismatch, never a match.
+      const reported = toTransactionLookup({ ...body.data, status: "success" });
+      const outcome = await settlePaymentRequest(paymentRequestId, reference, reported);
+      if (!outcome) {
+        console.error(
+          `[webhook] payment request ${paymentRequestId} not found for reference ${reference}.`
+        );
+      } else if (outcome.kind === "already_paid") {
         // Expected whenever the client DID return — verify-on-return got there
         // first. Not an error.
         console.log(
           `[webhook] payment request ${paymentRequestId} already settled; ignoring.`
         );
-      } else if (!outcome.request) {
+      } else if (outcome.kind === "mismatch" || outcome.kind === "not_chargeable" || outcome.kind === "unknown_reference") {
+        // Not settled and not marked paid: money we cannot place. Logged for
+        // a human (the payload amount is in the log; no secrets).
         console.error(
-          `[webhook] payment request ${paymentRequestId} not found for reference ${reference}.`
+          `[webhook] payment request ${paymentRequestId} charge ${reference} NOT settled (${outcome.kind}): ` +
+            `Paystack reported ${reported.requestedAmount ?? reported.amount ?? "no amount"} ${reported.currency ?? "no currency"}`
         );
       }
       return true;

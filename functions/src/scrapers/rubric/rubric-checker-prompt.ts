@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import type { LlmRequest } from "../../services/ai/llm-provider";
 import { sanitizeUntrusted } from "../../services/ai/prompt-safety";
-import { INTENT_POLARITIES, type AssessmentCriterion } from "../../types/rubric";
+import { INTENT_POLARITIES, type AssessmentCriterion, type StoredApplicantGroup } from "../../types/rubric";
 import { validateAgainstSchema } from "./rubric-prompt";
 import { KIND_WORDING_SENTENCE } from "./rubric-kind-wording";
 import type { ConditionFoundAt } from "./rubric-quote";
@@ -45,7 +45,10 @@ import type { ConditionFoundAt } from "./rubric-quote";
 // v6 (#242): each rule is also shown `sectionHeadings`, `conditionFoundAt`, `conditionLine`, `triggerQuestion`, `triggerAnswers`
 //     (so a condition written in a heading or in the intake question can be judged); `kind_right` uses the drafting prompt's meaning
 //     of each kind (rubric-kind-wording.ts); `stage_right` is `na` for a judgement rule as well. No standard changed.
-export const CHECKER_PROMPT_VERSION = "2026-11-checker-v6";
+// v7 (#234, P5 of #228): `appliesTo` may carry `groups` (members decided from what the applicant holds:
+//     residence, holds, members_of, each with its `asWritten` wording); `group_matches_codes` judges them
+//     like the nationality codes (shown only when a rule has them, so other rules' JSON is unchanged).
+export const CHECKER_PROMPT_VERSION = "2026-11-checker-v7";
 
 /** Rules per request, in rulebook order. Part of the determinism contract: a stable boundary means a stable request. */
 export const CHECKER_BATCH_SIZE = 10;
@@ -119,7 +122,7 @@ export const CHECKER_SYSTEM_PROMPT = [
   "- `stage_right`: `validity` is whether an application can be considered at all; `suitability` is a ground for refusal whatever the merits; `eligibility` is a requirement of the category itself; `credibility` is whether the account given is believed. The stage given must be the one the quote belongs to. Answer `na` when the rule's `kind` is `mandatory_bar` or `judgement`: a bar on a stated group applies to that group whatever its stage, and a judgement is weighed by a decision maker, so for both the stage is only a label and is not judged.",
   "- `condition_faithful`: `applicability` says whether the rule applies to every applicant (`all_applicants`), only in some circumstances (`conditional`), or only to applicants who come for one particular activity or sub-category that the guidance singles out (`specialist`); for the last two, `applicabilityCondition` holds the words that name those circumstances or that activity. Judge that this is what the quote, its `listItems`, its list lead-in and the surrounding text say, and that the surrounding text does not add an exception, an \"unless\" or an \"only if\" that changes it. For a `specialist` rule the activity may be named by a section heading above the quote (`sectionHeadings`), or by the trigger's question and answers (`triggerQuestion`, `triggerAnswers`) rather than by the quote itself: the condition is faithful when the quote, read under those headings and that lead-in, applies to exactly those applicants, and the surrounding text adds no exception that changes it. `conditionFoundAt` tells you where the condition's words are written (`not_found` means they are written nowhere in the official text: judge whether the quote, its headings and its lead-in still support them, and when you cannot tell, answer `unsure`). Never use general knowledge about any particular country or route.",
   "- `check_faithful`: when `check` is not null, its `field`, `op`, `value` and `unit` mean what the quote says (`gte` is at least, `lte` is at most, `eq` is exactly, `present` means it must exist, `heldForDays` means a condition held for the period written, as the quote writes it). Answer `na` when `check` is null.",
-  "- `group_matches_codes`: when `appliesTo` is not null, `asWritten` lists the groups that are nationalities as the quote names them and `codes` gives a two-letter country code for each, in the same order; `uncoded` lists members of the group that are not a nationality (a status or category of person), written as the quote names them, which deliberately have no code. Judge that every code is the code of the group named in the same position, that every member the quote (with its `listItems`) names is covered either by a code or by an `uncoded` entry, that no member is missing, and that nothing in `uncoded` is really a nationality that should have had a code. A code that stretches to a group wider than a nationality is `no`. Answer `na` when `appliesTo` is null.",
+  "- `group_matches_codes`: when `appliesTo` is not null, `asWritten` lists the groups that are nationalities as the quote names them and `codes` gives a two-letter country code for each, in the same order; `uncoded` lists members of the group that are not a nationality (a status or category of person), written as the quote names them, which deliberately have no code. Judge that every code is the code of the group named in the same position, that every member the quote (with its `listItems`) names is covered either by a code or by an `uncoded` entry, that no member is missing, and that nothing in `uncoded` is really a nationality that should have had a code. `groups`, when present, lists members decided by what a person holds rather than by nationality, each with `asWritten` (the member as the quote names it): `residence` (people who live in the country `code`), `holds` (holders of a `document` of that kind issued by `issuer`, a country code or the id of a bloc or treaty) and `members_of` (the nationals, or residents, as `fact` says, of the members of the bloc or treaty `authorityId`). Judge that each entry is the member the quote names in its `asWritten`, with the right code, document, issuer or bloc, and that no entry is wider or narrower than that member. A code, issuer or bloc the quote does not name is `no`. Answer `na` when `appliesTo` is null.",
   "",
   "Verdicts, for every aspect:",
   "- `yes`: you are confident the text supports the field as given.",
@@ -228,6 +231,13 @@ function clean(text: string | undefined): string {
   return text === undefined ? "" : sanitizeUntrusted(text);
 }
 
+/** (#234) One `appliesTo.groups` member as the check sees it (every string cleaned like the rest). */
+function groupJson(g: StoredApplicantGroup): Record<string, string> {
+  if (g.kind === "residence") return { kind: g.kind, code: clean(g.code), asWritten: clean(g.asWritten) };
+  if (g.kind === "holds") return { kind: g.kind, document: g.document, issuer: clean(g.issuer), asWritten: clean(g.asWritten) };
+  return { kind: g.kind, fact: g.fact, authorityId: clean(g.authorityId), asWritten: clean(g.asWritten) };
+}
+
 /** The JSON object of one rule, exactly the fields the check may see. No extraction output text beyond the rule's own fields. */
 function ruleJson(handle: string, v: CheckerRuleView): Record<string, unknown> {
   const c = v.rule;
@@ -240,7 +250,15 @@ function ruleJson(handle: string, v: CheckerRuleView): Record<string, unknown> {
     check: c.check
       ? { field: clean(c.check.field), op: c.check.op, ...(c.check.value !== undefined ? { value: typeof c.check.value === "string" ? clean(c.check.value) : c.check.value } : {}), ...(c.check.unit !== undefined ? { unit: clean(c.check.unit) } : {}) }
       : null,
-    appliesTo: c.appliesTo ? { codes: c.appliesTo.nationalities.map(clean), asWritten: c.appliesTo.asWritten.map(clean), uncoded: (c.appliesTo.uncoded ?? []).map(clean) } : null,
+    appliesTo: c.appliesTo
+      ? {
+        codes: c.appliesTo.nationalities.map(clean),
+        asWritten: c.appliesTo.asWritten.map(clean),
+        uncoded: (c.appliesTo.uncoded ?? []).map(clean),
+        // (#234) Only when present: a rule with no `groups` is shown exactly as before.
+        ...((c.appliesTo.groups ?? []).length > 0 ? { groups: (c.appliesTo.groups ?? []).map(groupJson) } : {}),
+      }
+      : null,
     applicability: c.applicability ?? null,
     applicabilityCondition: c.applicabilityCondition === undefined ? null : clean(c.applicabilityCondition),
     quote: clean(c.source.quote),

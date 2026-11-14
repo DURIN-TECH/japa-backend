@@ -120,8 +120,15 @@ export const EXTRACTOR_PROMPT_VERSION = "2026-11-answer-types-v10";
  * Bump it when that code changes what a re-extraction would store. It is a
  * separate constant so no paid eval run is needed: the prompt text and model are
  * unchanged (EXTRACTOR_PROMPT_VERSION stays, and the eval keeps stamping it).
+ *
+ * History:
+ *   items-v1  #212: list + "You must have" prose collector, append missing items.
+ *   items-v2  #276: list-item head match (no Health and Care Worker duplicates),
+ *             append-step head guard, and the BN(O) "will need to provide X,
+ *             unless both of the following are true:" sentence collected. Bumped
+ *             so the open GB proposals built with v1 re-extract once.
  */
-export const ITEM_COVERAGE_VERSION = "items-v1";
+export const ITEM_COVERAGE_VERSION = "items-v2";
 
 /**
  * The stamp written to `scrapeMeta.extractorPromptVersion` and compared by the
@@ -134,7 +141,7 @@ export const EXTRACTION_PIPELINE_VERSION = `${EXTRACTOR_PROMPT_VERSION}+${ITEM_C
 /**
  * The stamp for a visa extracted through source adapter `provider`. The coverage
  * check only runs for adapters that read list structure (govuk-content-api, i.e.
- * GB), so only those carry the `+items-v1` stamp. Every other visa keeps the plain
+ * GB), so only those carry the `+items-vN` stamp. Every other visa keeps the plain
  * prompt version: a coverage-code bump must not make non-GB visas re-extract (a
  * paid call each) for a result that cannot change.
  */

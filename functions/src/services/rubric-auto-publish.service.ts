@@ -18,6 +18,9 @@ import {
   productLanguageCode,
   reasonInWords,
   RubricQuestionPlanner,
+  // (#233 P4b) The layer check of an own layer against its shared layer(s).
+  RubricLayerChecker,
+  notCheckedRecord,
   rubricStore,
   routeAllowed,
   rubricChecker,
@@ -25,7 +28,9 @@ import {
   sampleAudit,
   scrapeAlertService,
 } from "../scrapers";
-import type { GateReport, LoadedPublishSettings, RubricAlertRule, RubricPublishAlertFacts, RuleEvaluation, ScrapeAlertsConfig } from "../scrapers";
+import type { GateReport, LayerCheckInput, LayerCheckOutcome, LoadedPublishSettings, RubricAlertRule, RubricPublishAlertFacts, RuleEvaluation, ScrapeAlertsConfig, SharedLayerRules } from "../scrapers";
+// (#233 P4b) The route's stack, read live (the resolver itself, not the module index, which also loads admin routes).
+import { resolveRouteStack } from "../shared-routes/route-stack";
 import { EMAIL_BRANDING } from "./email/branding";
 import {
   RubricReviewError,
@@ -43,6 +48,7 @@ import {
   RUBRIC_ACTOR_KIND,
   RUBRIC_SYSTEM_ACTOR_ID,
   type IntentPolarity,
+  type LayerCheckRecord,
   type RubricJudgedBar,
   type RubricHead,
   type RubricProtectedFailure,
@@ -202,6 +208,39 @@ export interface QuestionPlanner {
   plan(input: QuestionPlanInput): Promise<QuestionPlanOutcome>;
 }
 
+/**
+ * (#233 P4b) The layer check (scrapers/rubric/rubric-layer-check.ts): an own
+ * layer's rules against the shared layer(s) its route inherits. It NEVER
+ * blocks and never throws: what it found (or `not_checked`) is written with
+ * the approval as `layerCheck` + `layerConflicts`.
+ */
+export interface LayerChecker {
+  check(input: LayerCheckInput, settingsCaps?: { maxRequests?: number; timeoutMs?: number }): Promise<LayerCheckOutcome>;
+}
+
+/**
+ * (#233 P4b) The shared layers an OWN layer's route inherits, each with its
+ * approved version's served rules (a layer with none approved has
+ * `version: null`). Null when the version is not a country's own layer on a
+ * route with a shared layer: nothing to check, nothing written (every route
+ * without inheritance is exactly as before).
+ */
+export type SharedLayersReader = (rubric: VisaRubric) => Promise<(Omit<SharedLayerRules, "version"> & { version: number | null })[] | null>;
+
+/** The default reader: the route's stack, read live; each shared layer's approved read. */
+export const defaultSharedLayers: SharedLayersReader = async (rubric) => {
+  if (!rubric.countryCode || !rubric.visaTypeId) return null; // a shared layer itself: nothing to compare against
+  const stack = await resolveRouteStack(rubric.countryCode, rubric.visaTypeId);
+  const shared = stack.filter((l) => l.role === "shared");
+  if (shared.length === 0) return null;
+  return Promise.all(
+    shared.map(async (l) => {
+      const served = await rubricStore.getApprovedRubricByKey(l.rulebookKey);
+      return { rulebookKey: l.rulebookKey, version: served ? served.version : null, criteria: served ? served.criteria : [] };
+    })
+  );
+};
+
 // ============================================
 // Types
 // ============================================
@@ -224,6 +263,8 @@ interface RunExtras {
   ordinaryRepairs?: { counts: RubricOrdinaryRepairCounts; records: RubricOrdinaryRepair[] };
   // (#248) Bars served (or, on a hold, that would be served) without their unconfirmed trigger.
   judgedBars?: RubricJudgedBar[];
+  // (#233 P4b) The layer check's record (an own layer on a route with a shared layer): a gate line of the run.
+  layerCheck?: LayerCheckRecord;
 }
 
 /** The report of one run (also what the admin endpoint and the script return). */
@@ -313,6 +354,12 @@ function judgedBarGate(bars: readonly RubricJudgedBar[]): RubricPublishGateResul
   return { gate: "bars_judged_without_trigger", passed: true, detail: `${bars.length} bar(s) served without their unconfirmed trigger, assessed by judgement, never decided by code: ${bars.map((b) => b.criterionId).join(", ")}` };
 }
 
+/** (#233 P4b) The run record's gate line for the layer check. Never blocks (`passed: true`). */
+function layerCheckGate(r: LayerCheckRecord): RubricPublishGateResult {
+  if (r.status === "not_checked") return { gate: "layer_check", passed: true, detail: `not_checked:${r.reason ?? "unknown"} (nothing linked; repeated rules stay duplicated; ${r.calls} call(s))` };
+  return { gate: "layer_check", passed: true, detail: `${r.ownRulesChecked} own rule(s) against ${r.sharedRulesChecked} shared rule(s): ${r.restates.length} linked as restating, ${r.refusedLinks.length} link(s) refused, ${r.unsure.length} unsure, ${r.conflictCount} conflict(s); ${r.calls} call(s), prompt ${r.promptVersion}` };
+}
+
 /** The two leave-out budget reasons (#201). */
 const isBudgetReason = (code: string): boolean => code === "leave_out_budget_exceeded" || code === "primary_leave_out_budget_exceeded";
 
@@ -387,6 +434,10 @@ export interface RubricAutoPublishDeps {
   // Part B / part C. null until they exist: `auto` then holds every draft.
   checker: RubricChecker | null;
   planner: QuestionPlanner | null;
+  // (#233 P4b) The layer check and the read of the shared layers. A null
+  // checker writes nothing (and never holds: the check is informational).
+  layerChecker: LayerChecker | null;
+  sharedLayersOf: SharedLayersReader;
 }
 
 /** The facts of one version a run is decided from. */
@@ -416,6 +467,8 @@ export class RubricAutoPublishService {
       // null and `auto` holds every draft.
       checker: null,
       planner: null,
+      layerChecker: null,
+      sharedLayersOf: defaultSharedLayers,
       ...deps,
     };
   }
@@ -428,6 +481,11 @@ export class RubricAutoPublishService {
   /** Part C plugs the question planner in here. */
   registerPlanner(planner: QuestionPlanner | null): void {
     this.deps.planner = planner;
+  }
+
+  /** (#233 P4b) The layer check plugs in here. */
+  registerLayerChecker(layerChecker: LayerChecker | null): void {
+    this.deps.layerChecker = layerChecker;
   }
 
   // ---------- Entry points ----------
@@ -704,6 +762,16 @@ export class RubricAutoPublishService {
                 const servedQuestions = applyExclusions({ ...effective, excludedCriterionIds: [...report.excludedCriterionIds], questionPlan: planned }).intakeQuestions ?? [];
                 report = evaluateGates({ ...activeGateInput, intakeQuestions: servedQuestions, droppedTriggerIds: outcome.droppedTriggerIds ?? [], checker: { leftOut: outcome.leftOut, resolvedFlagCodes: [...outcome.resolvedFlagCodes, ...(plan.resolvedFlagCodes ?? [])] } });
                 for (const code of report.reasonCodes) if (!reasons.includes(code)) reasons.push(code);
+                // (#233 P4b) The layer check, LAST: only a draft about to be published spends on it,
+                // and it never adds a reason (it cannot hold). Its record and conflicts are written
+                // with the approval, together with the plan.
+                if (reasons.length === 0) {
+                  const layer = await this.layerCheckFor(effective, report.excludedCriterionIds, loaded.settings, runId);
+                  if (layer) {
+                    plannerFields = { ...plannerFields, layerCheck: layer.record, layerConflicts: layer.conflicts };
+                    extras.layerCheck = layer.record;
+                  }
+                }
               }
             }
           }
@@ -1025,6 +1093,8 @@ export class RubricAutoPublishService {
       finished.barsJudgedWithoutTrigger = extras.judgedBars;
       finished.gates = [...finished.gates, judgedBarGate(extras.judgedBars)];
     }
+    // (#233 P4b) The layer check: one gate line, never blocking.
+    if (extras.layerCheck !== undefined) finished.gates = [...finished.gates, layerCheckGate(extras.layerCheck)];
   }
 
   /** A failed bar with no check detail (an older checker, or a hold before any spend): id, title and ref only. */
@@ -1100,6 +1170,44 @@ export class RubricAutoPublishService {
     }
   }
 
+  /**
+   * (#233 P4b) The layer check of an own layer, or null when there is nothing
+   * to check (no layer checker, or not an own layer on a route with a shared
+   * layer). Never throws and never holds: a failure to read the shared layers
+   * or to run the check is a visible `not_checked` record, and nothing is
+   * linked (the rules simply stay duplicated).
+   *
+   * Compared: the own rules AS THEY WILL BE SERVED (the repaired rules swapped
+   * in, the leave-outs taken out) against each shared layer's APPROVED served
+   * rules. The spend is capped by the check's own hard caps and by the publish
+   * settings' `checkerMaxRequestsPerRun` / `checkerRequestTimeoutMs`.
+   */
+  private async layerCheckFor(effective: VisaRubric, excludedCriterionIds: readonly string[], settings: LoadedPublishSettings["settings"], runId: string): Promise<LayerCheckOutcome | null> {
+    if (this.deps.layerChecker === null) return null;
+    const ownCriteria = applyExclusions({ ...effective, excludedCriterionIds: [...excludedCriterionIds], questionPlan: undefined }).criteria;
+    let layers: Awaited<ReturnType<SharedLayersReader>>;
+    try {
+      layers = await this.deps.sharedLayersOf(effective);
+    } catch (err) {
+      console.error(`Rubric auto-publish: the shared layers of ${runId} could not be read (${errorClass(err)}); layer check not run`);
+      return { record: notCheckedRecord({ ownCriteria, shared: [] }, "shared_layers_unreadable"), conflicts: [] };
+    }
+    if (layers === null) return null;
+    const approved = layers.filter((l): l is SharedLayerRules => l.version !== null);
+    if (approved.length === 0) return { record: notCheckedRecord({ ownCriteria, shared: [] }, "shared_layer_not_approved"), conflicts: [] };
+    try {
+      const out = await this.deps.layerChecker.check(
+        { ownRulebookKey: effective.routeKey, ownCriteria, shared: approved },
+        { maxRequests: settings.checkerMaxRequestsPerRun, timeoutMs: settings.checkerRequestTimeoutMs }
+      );
+      console.log(`Rubric auto-publish: layer check of ${runId}: ${out.record.status}${out.record.reason ? ` (${out.record.reason})` : ""}, ${out.record.restates.length} link(s), ${out.conflicts.length} conflict(s), ${out.record.calls} call(s)`);
+      return out;
+    } catch (err) {
+      console.error(`Rubric auto-publish: the layer check threw for ${runId} (${errorClass(err)}); nothing linked`);
+      return { record: notCheckedRecord({ ownCriteria, shared: approved }, "provider_error"), conflicts: [] };
+    }
+  }
+
   // ---------- Records and reports ----------
 
   /**
@@ -1112,6 +1220,12 @@ export class RubricAutoPublishService {
     const record: RubricPublishRun = {
       runId: report.runId,
       routeKey: rubric.routeKey,
+      // (#233) Every publish run carries the rulebook's authorityId + routeSlug
+      // (the store fills them in for a version written before #233); the
+      // country pair stays for a country's rulebook and is absent on a bloc /
+      // treaty layer. The gates are the same for both.
+      authorityId: rubric.authorityId,
+      routeSlug: rubric.routeSlug,
       countryCode: rubric.countryCode,
       visaTypeId: rubric.visaTypeId,
       version: rubric.version,
@@ -1236,3 +1350,5 @@ export const rubricAutoPublishService = new RubricAutoPublishService();
 rubricAutoPublishService.registerChecker(rubricChecker);
 // Part C (#203): the question planner (wording check, plan) is registered the same way.
 rubricAutoPublishService.registerPlanner(new RubricQuestionPlanner());
+// (#233 P4b) The layer check of an own layer against its shared layer(s): informational, never holds.
+rubricAutoPublishService.registerLayerChecker(new RubricLayerChecker());
