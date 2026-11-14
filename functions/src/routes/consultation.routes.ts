@@ -33,6 +33,13 @@ router.put("/:id", verifyAuth, (req, res) =>
   consultationController.updateConsultation(req, res)
 );
 
+// Issue #180: resume paying a pending booking (same checkout inside the quote
+// lock, a fresh quote after it). Only the booking's own client may call it;
+// the controller checks that.
+router.post("/:id/checkout", verifyAuth, (req, res) =>
+  consultationController.checkoutConsultation(req, res)
+);
+
 router.put("/:id/status", verifyAuth, (req, res) =>
   consultationController.updateStatus(req, res)
 );

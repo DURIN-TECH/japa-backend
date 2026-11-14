@@ -1,7 +1,7 @@
 import { Timestamp } from "firebase-admin/firestore";
 import type { ApplicationIntake } from "./intake";
 // Issue #179: stored prices are dollar Money; reads add a local quote.
-import type { LocalPriceQuote, Money, PriceMigrationRecord } from "./money";
+import type { ChargeSnapshot, LocalPriceQuote, Money, PriceMigrationRecord, QuoteLock } from "./money";
 // Automated-verification result shapes live with the provider contract; the
 // compliance file below embeds them as optional signals (see the verification
 // service). One-way import (types -> verification.types), so no cycle.
@@ -1117,7 +1117,19 @@ export type ConsultationType =
   | "follow_up"
   | "general";
 
-export interface Consultation {
+/**
+ * A consultation booking.
+ *
+ * Issue #180: a PAID booking created from #180 on carries the charge
+ * snapshot (`ChargeSnapshot`: priceUsdCents, chargedCurrency,
+ * chargedAmountMinor, fxRate, fxRateAsOf, fxRateSource, fxMarginBps) and the
+ * quote lock (`QuoteLock`: quoteLockedAt, quoteExpiresAt), all priced on the
+ * SERVER from the agent's / agency's dollar fee. A FREE booking carries only
+ * `priceUsdCents: 0`. A LEGACY booking (before #180) carries only `fee`
+ * (whole naira) and no snapshot: it is shown as naira and never re-priced.
+ * The snapshot fields are optional in the type because legacy rows lack them.
+ */
+export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock> {
   id: string;
   userId: string;
   agentId: string;
@@ -1144,11 +1156,23 @@ export interface Consultation {
   meetingPlatform?: "zoom" | "google_meet" | "teams";
   
   // Payment
-  // WHOLE NAIRA (issue #148) for agent-originated and agency (guest) bookings alike.
-  // Paystack kobo (`fee * 100`) is computed only when a charge is initialised.
-  fee: number;
+  // LEGACY ONLY: whole naira (issue #148), on bookings made before #180. Not
+  // written any more (the snapshot fields above replace it) and never
+  // re-priced: a legacy row is displayed and verified as naira as stored.
+  fee?: number;
   paymentStatus: PaymentStatus;
+  // The Paystack reference of the CURRENT checkout while pending, then of the
+  // payment that settled it (used by verify to match the return leg).
   transactionId?: string;
+  // Issue #180: the Paystack checkout page for the current reference, so a
+  // retry inside the quote lock returns the SAME checkout (no second charge
+  // is opened while the first can still be paid).
+  checkoutUrl?: string;
+  // Issue #180: where Paystack sends the payer back (kept so a re-priced
+  // checkout returns the payer to the same page as the first one).
+  checkoutCallbackUrl?: string;
+  // Issue #180: when the payment was confirmed.
+  paidAt?: Timestamp;
   
   // After consultation
   summary?: string;
@@ -1184,7 +1208,16 @@ export type TransactionStatus =
   | "held_in_escrow"
   | "released";
 
-export interface Transaction {
+/**
+ * One financial event.
+ *
+ * Issue #180: a consultation-fee transaction also records the charge
+ * snapshot of the booking it settles (priceUsdCents, chargedCurrency,
+ * chargedAmountMinor, fxRate, fxRateAsOf, fxRateSource, fxMarginBps), so the
+ * payment never changes when the rate moves. Optional: older transaction
+ * kinds and legacy rows have none.
+ */
+export interface Transaction extends Partial<ChargeSnapshot> {
   id: string;
   userId: string;
   agentId?: string;

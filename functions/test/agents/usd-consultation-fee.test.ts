@@ -9,9 +9,8 @@
 //    key with nothing written;
 //  - an agent can only change their OWN fee: PUT /agents/me resolves the
 //    agent from the token, never from the body;
-//  - the guest-booking path fails closed for a paid agency until #180
-//    (503, nothing created);
-//  - the guest-booking verify path still records Transaction.amount in KOBO.
+//  (The guest-booking checks that lived here moved to
+//  test/consultations/consultation-charge.test.ts with issue #180.)
 import { test, describe, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { Timestamp } from "firebase-admin/firestore";
@@ -19,17 +18,11 @@ import { Timestamp } from "firebase-admin/firestore";
 import { installFakes, resetStore, fakeCollection, store, writes } from "../helpers/fake-firestore";
 import { agentService } from "../../src/services/agent.service";
 import { agentController } from "../../src/controllers/agent.controller";
-import { transactionService } from "../../src/services/transaction.service";
-import { consultationService } from "../../src/services/consultation.service";
-import { paystackProvider } from "../../src/services/billing/paystack.provider";
-import { consultationController } from "../../src/controllers/consultation.controller";
 
 before(async () => {
   await installFakes();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const firebase: any = await import("../../src/utils/firebase");
-  firebase.collections.transactions = fakeCollection("transactions");
-  firebase.collections.consultations = fakeCollection("consultations");
   firebase.collections.agents = fakeCollection("agents");
 });
 beforeEach(() => {
@@ -149,68 +142,6 @@ describe("updateAgent / PUT /agents/me", () => {
   });
 });
 
-describe("guest booking with a paid agency fails closed until #180", () => {
-  test("503 PRICING_UNAVAILABLE, no account, no booking, no checkout", async () => {
-    const as: any = (await import("../../src/services/agency.service")).agencyService; // eslint-disable-line @typescript-eslint/no-explicit-any
-    const original = as.getAgencyBySlug;
-    as.getAgencyBySlug = async () => ({
-      id: "ag1", slug: "acme", status: "approved", ownerId: "o1", ownerName: "O",
-      consultationFeeUsd: { amountMinor: 10000, currency: "USD" },
-    });
-    const ps: any = paystackProvider; // eslint-disable-line @typescript-eslint/no-explicit-any
-    const originalCharge = ps.initializeOneOffCharge;
-    let charged = false;
-    ps.initializeOneOffCharge = async () => ((charged = true), { authorizationUrl: "x", reference: "r" });
-    try {
-      const { out, res } = captureRes();
-      await consultationController.createPublicConsultation(
-        {
-          params: { slug: "acme" },
-          body: { clientName: "G Guest", clientEmail: "delivered+guest@resend.dev", scheduledDate: "2026-12-01", scheduledTime: "10:00" },
-        } as never,
-        res as never
-      );
-      assert.equal(out.status, 503);
-      assert.equal(out.body.error, "PRICING_UNAVAILABLE");
-      assert.equal(charged, false);
-      assert.deepEqual(writes, []);
-    } finally {
-      as.getAgencyBySlug = original;
-      ps.initializeOneOffCharge = originalCharge;
-    }
-  });
-});
-
-describe("guest booking verify records the transaction in kobo", () => {
-  test("a ₦50,000 booking records Transaction.amount 5,000,000", async () => {
-    const consultation = {
-      id: "c1", userId: "guest1", agentId: "owner1", clientName: "G", clientEmail: "delivered+g@resend.dev",
-      agentName: "A", type: "initial", scheduledTime: "10:00", timezone: "Africa/Lagos",
-      status: "pending_payment", paymentStatus: "pending", fee: 50000,
-    };
-    const restore = [
-      paystackProvider.getTransactionMetadata,
-      consultationService.getConsultationById,
-      consultationService.updateConsultation,
-    ];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ps: any = paystackProvider, cs: any = consultationService;
-    ps.getTransactionMetadata = async () => ({ status: "success", metadata: { purpose: "consultation", consultationId: "c1" } });
-    cs.getConsultationById = async () => consultation;
-    cs.updateConsultation = async () => ({ ...consultation, paymentStatus: "paid" });
-    try {
-      let status = 0;
-      const res = { status: (n: number) => ((status = n), res), json: () => res };
-      await consultationController.verifyPublicConsultation({ body: { reference: "ref-1" } } as never, res as never);
-      assert.ok(status === 0 || status === 200);
-      // createConsultationFee is fire-and-forget behind .catch; let it settle.
-      await new Promise((r) => setTimeout(r, 10));
-      const txs = [...store.entries()].filter(([k]) => k.startsWith("transactions/"));
-      assert.equal(txs.length, 1);
-      assert.equal(txs[0][1].amount, 5_000_000);
-      void transactionService;
-    } finally {
-      [ps.getTransactionMetadata, cs.getConsultationById, cs.updateConsultation] = restore;
-    }
-  });
-});
+// The guest-booking charge path and its verify (#179's fail-closed check and
+// the kobo transaction check) moved to test/consultations/consultation-charge.test.ts
+// when issue #180 replaced the 503 placeholder with the real charge.
