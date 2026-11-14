@@ -7,9 +7,11 @@ import {
   EligibilityAnswer,
   VisaPreCheckInput,
   VisaPreCheckResult,
-  VisaExemption,
   VisaRequirementType,
 } from "../types/eligibility";
+// Issue #236: "do you need a visa at all" is answered from sourced entry rules.
+import { entryRequirementsService } from "../entry-requirements/entry-requirements.service";
+import type { EntryRequirementResult } from "../types/entry-requirements";
 import { VisaCategory, VisaType } from "../types";
 // The ONE place visa types live: `countries/{code}/visaTypes` (see the
 // CANONICAL VISA TYPE PATH note below). Both helpers come from utils/firebase
@@ -121,88 +123,93 @@ type ResolvedVisaType =
 export class EligibilityService {
   private questionsCollection = db.collection("eligibilityQuestions");
   private checksCollection = db.collection("eligibilityChecks");
-  private exemptionsCollection = db.collection("visaExemptions");
 
   /**
-   * Pre-check: Does the user need a visa at all?
-   * Checks the exemptions matrix based on nationality and destination
+   * Pre-check: does the user need a visa at all? (Issue #236.)
+   *
+   * Answered ONLY from sourced entry rules (`entryRequirementsService`, the
+   * same lookup as GET /entry-requirements): every "you need a visa" / "you
+   * don't" rests on an official quote and URL. With no rule for the pair, a
+   * stale source, or a missing fact, the answer is `status: "unknown"` with
+   * `visaRequired: null` and the reason, plus the destination authority's
+   * official page when one is registered. The old fallback ("no exemption
+   * found - assume visa required") is gone: it was a guess.
+   *
+   * The visa types available for the travel purpose are still listed
+   * (`recommendedVisaTypes`) whenever the answer is not "no visa needed": they
+   * are the destination's published visas for that purpose, not a claim that
+   * one is required.
    */
   async preCheck(input: VisaPreCheckInput): Promise<VisaPreCheckResult> {
     const { nationality, destinationCountry, travelPurpose, intendedStayDays } = input;
+    // Codes are compared upper-case. A value that is not a two-letter code
+    // matches no rule (the lookup answers `unknown`), never an error.
+    const destination = typeof destinationCountry === "string" ? destinationCountry.trim().toUpperCase() : "";
+    const nat = typeof nationality === "string" ? nationality.trim().toUpperCase() : "";
+    const stay = typeof intendedStayDays === "number" && Number.isInteger(intendedStayDays) && intendedStayDays > 0 ? intendedStayDays : undefined;
 
-    // Country codes are stored upper-case (exemption rows and country doc
-    // ids alike), so the exemption lookup and the visa lookup normalise the
-    // caller's value the same way. A non-string (bad body) is left as it is
-    // and simply matches nothing.
-    const destinationCode = typeof destinationCountry === "string" ?
-      destinationCountry.toUpperCase() :
-      destinationCountry;
+    const entry: EntryRequirementResult = /^[A-Z]{2}$/.test(destination)
+      ? await entryRequirementsService.lookup({
+        destination,
+        nationalities: /^[A-Z]{2}$/.test(nat) ? [nat] : [],
+        purpose: travelPurpose,
+        stayDays: stay,
+      })
+      : { status: "unknown", destination, code: "no_rule", reason: "We don't have an official source for this yet." };
 
-    // Look up exemption for this nationality → destination
-    const exemptionSnapshot = await this.exemptionsCollection
-      .where("nationality", "==", nationality)
-      .where("destinationCountry", "==", destinationCode)
-      .limit(1)
-      .get();
+    return this.preCheckResultOf(entry, destinationCountry, travelPurpose);
+  }
 
-    if (exemptionSnapshot.empty) {
-      // No exemption found - assume visa required
-      return this.getVisaRequiredResult(destinationCountry, travelPurpose);
-    }
-
-    const exemption = {
-      id: exemptionSnapshot.docs[0].id,
-      ...exemptionSnapshot.docs[0].data(),
-    } as VisaExemption;
-
-    // Check if purpose is allowed for visa-free entry
-    const purposeAllowed = !exemption.purposesAllowed ||
-      exemption.purposesAllowed.includes(travelPurpose);
-
-    // Check if stay duration exceeds visa-free limit
-    const stayExceedsLimit = intendedStayDays &&
-      exemption.maxStayDays &&
-      intendedStayDays > exemption.maxStayDays;
-
-    // Check if work/study requires permit even for visa-free countries
-    const needsWorkPermit = travelPurpose === "work" && exemption.workPermitRequired;
-    const needsStudyPermit = travelPurpose === "study" && exemption.studyPermitRequired;
-
-    const visaRequired = exemption.requirementType === "visa_required" ||
-      !purposeAllowed ||
-      stayExceedsLimit ||
-      needsWorkPermit ||
-      needsStudyPermit;
-
-    const warnings: string[] = [];
-    if (stayExceedsLimit) {
-      warnings.push(`Your intended stay of ${intendedStayDays} days exceeds the visa-free limit of ${exemption.maxStayDays} days.`);
-    }
-    if (needsWorkPermit) {
-      warnings.push("Work authorization is required even for visa-free nationalities.");
-    }
-    if (needsStudyPermit) {
-      warnings.push("A study permit is required even for visa-free nationalities.");
-    }
-
-    if (!visaRequired) {
-      // User doesn't need a visa
+  /**
+   * Map a sourced entry answer onto the pre-check response (#236). Pure apart
+   * from the visa-type read. `visaRequired` is true / false ONLY when an
+   * official rule says so; `null` for `unknown`.
+   */
+  private async preCheckResultOf(entry: EntryRequirementResult, destinationCountry: string, travelPurpose: string): Promise<VisaPreCheckResult> {
+    if (entry.status === "unknown") {
+      // No source: no claim either way. The visas for the purpose are still
+      // listed, as what the destination publishes (never as "you need one").
+      const listed = await this.getVisaRequiredResult(destinationCountry, travelPurpose);
       return {
-        visaRequired: false,
-        requirementType: exemption.requirementType,
-        maxStayDays: exemption.maxStayDays,
-        conditions: exemption.conditions,
-        warnings: warnings.length > 0 ? warnings : undefined,
+        visaRequired: null,
+        requirementType: "unknown",
+        status: "unknown",
+        entryRequirement: entry,
+        recommendedVisaTypes: listed.recommendedVisaTypes,
         nextSteps: [
-          `You can enter ${destinationCountry} without a visa for up to ${exemption.maxStayDays} days.`,
-          "Ensure your passport is valid for at least 6 months.",
-          ...(exemption.conditions || []),
+          entry.reason,
+          ...(entry.destinationAuthorityPage ? [`Official page: ${entry.destinationAuthorityPage}`] : []),
         ],
       };
     }
-
-    // Visa is required - get recommended visa types
-    return this.getVisaRequiredResult(destinationCountry, travelPurpose, warnings);
+    // Sourced answer: the STRICTEST matching rule decides.
+    const needsVisa = entry.outcome === "visa_required" || entry.outcome === "transit_visa";
+    const requirementType: VisaRequirementType =
+      entry.outcome === "travel_authorisation" ? "eta" :
+        entry.outcome === "visa_on_arrival" ? "visa_on_arrival" :
+          needsVisa ? "visa_required" : "visa_free";
+    const conditions = entry.conditions.map((c) => c.text);
+    if (needsVisa) {
+      const listed = await this.getVisaRequiredResult(destinationCountry, travelPurpose);
+      return {
+        ...listed,
+        visaRequired: true,
+        requirementType,
+        status: "answer",
+        entryRequirement: entry,
+        conditions,
+        nextSteps: [entry.message, ...listed.nextSteps],
+      };
+    }
+    return {
+      visaRequired: false,
+      requirementType,
+      status: "answer",
+      entryRequirement: entry,
+      maxStayDays: entry.stay?.maxDays,
+      conditions,
+      nextSteps: [entry.message, ...(entry.authorisation ? [`Official page: ${entry.authorisation.applyUrl}`] : [])],
+    };
   }
 
   /**
@@ -228,7 +235,7 @@ export class EligibilityService {
     destinationCountry: string,
     travelPurpose: string,
     warnings?: string[]
-  ): Promise<VisaPreCheckResult> {
+  ): Promise<Pick<VisaPreCheckResult, "warnings" | "recommendedVisaTypes" | "nextSteps">> {
     // Categories that fit this purpose (none for an unlisted purpose).
     const matchingCategories = PURPOSE_TO_CATEGORIES[travelPurpose] || [];
 
@@ -257,10 +264,10 @@ export class EligibilityService {
         baseCostUsd: data.baseCostUsd,
       })) as VisaPreCheckResult["recommendedVisaTypes"];
 
+    // (#236) Only the visa list and the generic steps: whether a visa is
+    // required is decided by the sourced entry answer (preCheckResultOf).
     return {
-      visaRequired: true,
-      requirementType: "visa_required" as VisaRequirementType,
-      warnings,
+      ...(warnings ? { warnings } : {}),
       recommendedVisaTypes: recommendedVisas,
       nextSteps: [
         "Review the recommended visa types below.",
@@ -951,7 +958,10 @@ export class EligibilityService {
 
     // Determine suggested path
     let suggestedPath: "self_service" | "agent_assisted" | "not_eligible" | "visa_free";
-    if (!preCheckResult.visaRequired) {
+    // (#236) Only a SOURCED "no visa needed" (false) leads to visa_free. An
+    // unknown answer (null) is never read as "no visa needed": the score decides.
+    const sourcedVisaFree = preCheckResult.visaRequired === false;
+    if (sourcedVisaFree) {
       suggestedPath = "visa_free";
     } else if (result.eligibilityLevel === "high") {
       suggestedPath = "self_service";
@@ -972,15 +982,15 @@ export class EligibilityService {
       nationality,
       visaRequired: preCheckResult.visaRequired,
       visaRequirementType: preCheckResult.requirementType,
-      exemptionDetails: !preCheckResult.visaRequired ? {
+      exemptionDetails: sourcedVisaFree ? {
         maxStayDays: preCheckResult.maxStayDays,
         conditions: preCheckResult.conditions,
       } : undefined,
       score: result.score,
-      eligibilityLevel: preCheckResult.visaRequired ? result.eligibilityLevel : "not_applicable",
+      eligibilityLevel: sourcedVisaFree ? "not_applicable" : result.eligibilityLevel,
       answers,
       breakdown: result.breakdown,
-      recommendations: preCheckResult.visaRequired ? result.recommendations : preCheckResult.nextSteps,
+      recommendations: sourcedVisaFree ? preCheckResult.nextSteps : result.recommendations,
       missingRequirements: result.missingRequirements,
       suggestedPath,
       createdAt: now,

@@ -62,6 +62,13 @@ const COLLECTIONS = [
   // Issuing authorities and their members (issue #230): membership decides
   // which countries a shared rulebook covers, so no client may read or write it.
   "authorities",
+  // Entry requirements (issue #236): sourced "do you need a visa" rules, which
+  // run is served for an authority, and the drafting run records. A client that
+  // could write a rule or a head could make the app tell travellers they need
+  // no visa; the API serves only published rules.
+  "entryRules",
+  "entryRuleHeads",
+  "entryRuleRuns",
   // The registries the API now writes (also backend-only; pinned here too).
   "guidanceSources",
   "visaSources",

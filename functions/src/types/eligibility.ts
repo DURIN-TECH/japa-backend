@@ -1,43 +1,23 @@
 import { Timestamp } from "firebase-admin/firestore";
 
+import type { EntryRequirementResult } from "./entry-requirements";
+
 // ============================================
-// VISA EXEMPTION / REQUIREMENT MATRIX
+// VISA REQUIREMENT TYPES (pre-check answer)
 // ============================================
+//
+// Issue #236: the hand-seeded `visaExemptions` matrix (and its `VisaExemption`
+// row type) is RETIRED: its rows had no verbatim quote. The pre-check now
+// answers from sourced entry rules (types/entry-requirements.ts) and says
+// `unknown` when there is no official source, never "visa required" by default.
 
 export type VisaRequirementType =
-  | "visa_free"           // No visa needed
+  | "visa_free"           // No visa needed (the official source says so)
   | "visa_on_arrival"     // Can get visa at border
-  | "eta"                 // Electronic Travel Authorization (e.g., Canada eTA)
-  | "evisa"               // Online visa application
-  | "visa_required";      // Must apply at embassy/consulate
-
-export interface VisaExemption {
-  id: string;
-  nationality: string;         // ISO country code of passport holder
-  destinationCountry: string;  // ISO country code of destination
-
-  requirementType: VisaRequirementType;
-
-  // For visa-free / visa on arrival
-  maxStayDays?: number;        // e.g., 90 days
-  purposesAllowed?: string[];  // ["tourism", "business", "transit"]
-
-  // Conditions
-  conditions?: string[];       // e.g., "Must have return ticket", "Passport valid 6 months"
-
-  // For work/study, usually still need visa
-  workPermitRequired: boolean;
-  studyPermitRequired: boolean;
-
-  // Source and validity
-  source?: string;             // Where this info came from
-  lastVerified?: Timestamp;
-  validFrom?: Timestamp;
-  validUntil?: Timestamp;
-
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-}
+  | "eta"                 // Electronic travel authorisation (entry outcome `travel_authorisation`)
+  | "evisa"               // Online visa application (kept for stored checks; not produced since #236)
+  | "visa_required"       // Must hold a visa (the official source says so)
+  | "unknown";            // (#236) No official source for this trip: never a guess
 
 // ============================================
 // ELIGIBILITY QUESTIONS
@@ -143,8 +123,8 @@ export interface EligibilityCheck {
   countryCode: string;
   nationality: string;
 
-  // Pre-check result
-  visaRequired: boolean;
+  // Pre-check result. (#236) `null` when no official source answered it.
+  visaRequired: boolean | null;
   visaRequirementType: VisaRequirementType;
   exemptionDetails?: {
     maxStayDays?: number;
@@ -201,8 +181,15 @@ export interface VisaPreCheckInput {
 }
 
 export interface VisaPreCheckResult {
-  visaRequired: boolean;
+  // (#236) `null` when there is no official source for the trip (`status:
+  // "unknown"`): never guessed as true or false.
+  visaRequired: boolean | null;
   requirementType: VisaRequirementType;
+  // (#236) Whether the answer rests on an official source.
+  status: "answer" | "unknown";
+  // (#236) The full sourced answer from GET /entry-requirements (quotes, URLs,
+  // stay, conditions; or the unknown reason and the official page).
+  entryRequirement: EntryRequirementResult;
 
   // If visa free
   maxStayDays?: number;
