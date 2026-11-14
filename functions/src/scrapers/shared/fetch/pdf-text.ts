@@ -532,7 +532,12 @@ function runPdfWorker(input: PdfWorkerInput, limits: PdfLimits, label: string): 
     const watchdog = setInterval(() => {
       const growth = process.memoryUsage.rss() - baselineRss;
       if (growth <= budgetBytes) return;
-      const grownMb = Math.round(growth / BYTES_PER_MB);
+      // Round UP (issue #277). We only get here when growth is strictly over
+      // the budget, so the reported figure must also read as over it. With
+      // Math.round a growth of 64.3 MB against a 64 MB budget was reported as
+      // "grew by 64 MB, over the 64 MB budget": confusing for an admin, and it
+      // made the test's `rssGrowthMb > budget` check fail at random.
+      const grownMb = Math.ceil(growth / BYTES_PER_MB);
       finish(() =>
         reject(
           new PdfFetchError(
