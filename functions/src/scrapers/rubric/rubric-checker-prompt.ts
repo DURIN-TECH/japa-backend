@@ -3,6 +3,8 @@ import type { LlmRequest } from "../../services/ai/llm-provider";
 import { sanitizeUntrusted } from "../../services/ai/prompt-safety";
 import { INTENT_POLARITIES, type AssessmentCriterion } from "../../types/rubric";
 import { validateAgainstSchema } from "./rubric-prompt";
+import { KIND_JUDGEMENT, KIND_MANDATORY_BAR, KIND_OBJECTIVE } from "./rubric-kind-wording";
+import type { ConditionFoundAt } from "./rubric-quote";
 
 // ============================================
 // INDEPENDENT RULE CHECK — PROMPTS, SCHEMAS, PARSING (issue #202, part of #200)
@@ -40,13 +42,23 @@ import { validateAgainstSchema } from "./rubric-prompt";
 // v3 (#222): a rule is shown with `listItems` (the list lines under a lead-in quote) and `appliesTo.uncoded` (group members that are not nationalities).
 // v4 (#226): `stage_right` is not judged for a `mandatory_bar` (the prompt says `na`; code also ignores the aspect for bars).
 // v5 (#220 + #226 merged): v4's bar-stage wording AND the language wording (a quote may be in any language; titles are English by design; faithfulness is judged across languages).
-export const CHECKER_PROMPT_VERSION = "2026-11-checker-v5";
+// v6 (#242): each rule is also shown `sectionHeadings`, `conditionFoundAt`, `conditionLine`, `triggerQuestion`, `triggerAnswers`
+//     (so a condition written in a heading or in the intake question can be judged); `kind_right` uses the drafting prompt's meaning
+//     of each kind (rubric-kind-wording.ts); `stage_right` is `na` for a judgement rule as well. No standard changed.
+export const CHECKER_PROMPT_VERSION = "2026-11-checker-v6";
 
 /** Rules per request, in rulebook order. Part of the determinism contract: a stable boundary means a stable request. */
 export const CHECKER_BATCH_SIZE = 10;
 
 /** Characters of the source's own line / page kept on each side of a quote (the check's window). */
 export const CHECKER_WINDOW_CHARS = 400;
+
+/** (#242) Most section headings shown per rule (nearest last), and the longest one. */
+export const CHECKER_MAX_HEADINGS = 3;
+export const CHECKER_HEADING_CHARS = 200;
+
+/** (#242) Longest `conditionLine` shown (the line the condition sits on when it is not inside the quote). */
+export const CHECKER_CONDITION_LINE_CHARS = 400;
 
 /** Characters kept from the sentence that introduces a list the quote is an item of. */
 export const CHECKER_LEAD_IN_CHARS = 400;
@@ -99,13 +111,13 @@ export const CHECKER_SYSTEM_PROMPT = [
   "",
   "Language. The official text (the quote, its list lines, the text around it, the words of a condition, the names of a group and the unit of a check) may be written in any language, not only English. The `title` is written in English by design, whatever language the quote is in: that is never a fault. Judge faithfulness ACROSS the two languages: a title is faithful when it states only what the quote says, and a number, date, amount or group in a title must be written in the quote, in digits or in words of the quote's own language. A number, date, amount or group in the title that the quote does not contain, in either language, makes the title unfaithful. If you cannot read the language of a quote well enough to judge an aspect, answer `unsure` for it: never `yes`.",
   "",
-  "Each rule has: `id` (a short handle), `title`, `kind`, `stage`, `severity`, `check` (or null), `appliesTo` (or null), `applicability`, `applicabilityCondition` (or null), `quote` (the rule's own sentence), `listItems` (when the quote ends with a lead-in such as \"...any of the following:\", the list lines that follow it in the official text, verbatim and in order; otherwise an empty list), `listLeadIn` (the sentence that introduces a list the quote is an item of, or an empty string), `textBefore` and `textAfter` (the words of the same line or page just before and after the quote). The rule's full text is the quote followed by its `listItems`.",
+  "Each rule has: `id` (a short handle), `title`, `kind`, `stage`, `severity`, `check` (or null), `appliesTo` (or null), `applicability`, `applicabilityCondition` (or null), `quote` (the rule's own sentence), `listItems` (when the quote ends with a lead-in such as \"...any of the following:\", the list lines that follow it in the official text, verbatim and in order; otherwise an empty list), `listLeadIn` (the sentence that introduces a list the quote is an item of, or an empty string), `textBefore` and `textAfter` (the words of the same line or page just before and after the quote), `sectionHeadings` (the headings of the official text above the quote, up to three, the nearest last; an empty list when the page has none), `conditionFoundAt` (where code found the words of `applicabilityCondition` in the official text: `in_quote`, `list_lead_in`, `section_heading`, `text_before`, `elsewhere_on_page`, or `not_found` when they are written nowhere in it; null when the rule has no condition), `conditionLine` (the whole line of the official text the condition sits on when it is not inside the quote, or null), and `triggerQuestion` and `triggerAnswers` (when the rule is tied to one question put to every applicant: the question, and the answers of it that make the rule apply; otherwise null and an empty list). The `sectionHeadings`, `conditionLine` and the quote are the official text; `triggerQuestion` and `triggerAnswers` are the product's own labels. The rule's full text is the quote followed by its `listItems`.",
   "",
   "Judge these aspects for every rule:",
   "- `title_faithful`: the title states only what the quote says. It adds no condition, number, date or group the quote does not contain, and it is neither wider nor narrower than the quote.",
-  "- `kind_right`: `objective` means the quote sets a fixed figure or a plain fact that a program can compare; `judgement` means the quote asks a decision maker to weigh evidence or be satisfied about something and sets no fixed figure; `mandatory_bar` means the quote bars a stated group whatever else is true. The kind given must be the one the quote supports.",
-  "- `stage_right`: `validity` is whether an application can be considered at all; `suitability` is a ground for refusal whatever the merits; `eligibility` is a requirement of the category itself; `credibility` is whether the account given is believed. The stage given must be the one the quote belongs to. Answer `na` when the rule's `kind` is `mandatory_bar`: a bar on a stated group applies to that group whatever its stage, the stage of a bar is only a label and is not judged.",
-  "- `condition_faithful`: `applicability` says whether the rule applies to every applicant (`all_applicants`), only in some circumstances (`conditional`), or only to applicants who come for one particular activity or sub-category that the guidance singles out (`specialist`); for the last two, `applicabilityCondition` holds the words that name those circumstances or that activity. Judge that this is what the quote, its `listItems`, its list lead-in and the surrounding text say, and that the surrounding text does not add an exception, an \"unless\" or an \"only if\" that changes it.",
+  `- \`kind_right\`: \`objective\` means the quote sets ${KIND_OBJECTIVE}; \`mandatory_bar\` means the quote sets ${KIND_MANDATORY_BAR}; \`judgement\` covers ${KIND_JUDGEMENT}. The kind given must be the one the quote supports.`,
+  "- `stage_right`: `validity` is whether an application can be considered at all; `suitability` is a ground for refusal whatever the merits; `eligibility` is a requirement of the category itself; `credibility` is whether the account given is believed. The stage given must be the one the quote belongs to. Answer `na` when the rule's `kind` is `mandatory_bar` or `judgement`: a bar on a stated group applies to that group whatever its stage, and a judgement is weighed by a decision maker, so for both the stage is only a label and is not judged.",
+  "- `condition_faithful`: `applicability` says whether the rule applies to every applicant (`all_applicants`), only in some circumstances (`conditional`), or only to applicants who come for one particular activity or sub-category that the guidance singles out (`specialist`); for the last two, `applicabilityCondition` holds the words that name those circumstances or that activity. Judge that this is what the quote, its `listItems`, its list lead-in and the surrounding text say, and that the surrounding text does not add an exception, an \"unless\" or an \"only if\" that changes it. For a `specialist` rule the activity may be named by a section heading above the quote (`sectionHeadings`), or by the trigger's question and answers (`triggerQuestion`, `triggerAnswers`) rather than by the quote itself: the condition is faithful when the quote, read under those headings and that lead-in, applies to exactly those applicants, and the surrounding text adds no exception that changes it. `conditionFoundAt` tells you where the condition's words are written (`not_found` means they are written nowhere in the official text: judge whether the quote, its headings and its lead-in still support them, and when you cannot tell, answer `unsure`). Never use general knowledge about any particular country or route.",
   "- `check_faithful`: when `check` is not null, its `field`, `op`, `value` and `unit` mean what the quote says (`gte` is at least, `lte` is at most, `eq` is exactly, `present` means it must exist, `heldForDays` means a condition held for the period written, as the quote writes it). Answer `na` when `check` is null.",
   "- `group_matches_codes`: when `appliesTo` is not null, `asWritten` lists the groups that are nationalities as the quote names them and `codes` gives a two-letter country code for each, in the same order; `uncoded` lists members of the group that are not a nationality (a status or category of person), written as the quote names them, which deliberately have no code. Judge that every code is the code of the group named in the same position, that every member the quote (with its `listItems`) names is covered either by a code or by an `uncoded` entry, that no member is missing, and that nothing in `uncoded` is really a nationality that should have had a code. A code that stretches to a group wider than a nationality is `no`. Answer `na` when `appliesTo` is null.",
   "",
@@ -172,6 +184,26 @@ export interface CheckerRuleView {
   listLeadIn: string;
   textBefore: string;
   textAfter: string;
+  /** (#242) The headings above the quote in its stored snapshot, nearest last (code-read; at most CHECKER_MAX_HEADINGS). Absent = none. */
+  sectionHeadings?: readonly string[];
+  /** (#242) Where code found the applicability condition in the snapshot; absent for a rule that applies to everyone. */
+  conditionFoundAt?: ConditionFoundAt;
+  /** (#242) The line the condition sits on when it is not inside the quote. */
+  conditionLine?: string;
+  /** (#242) The intake question that triggers the rule and the labels of the answers that make it apply; absent = no usable trigger. */
+  trigger?: { question: string; answers: readonly string[] };
+}
+
+/** The two answers of a question stored without options (shared with the trigger check, so both show the same labels). */
+export const YES_NO_OPTIONS: readonly { value: string; label: string }[] = [{ value: "true", label: "Yes" }, { value: "false", label: "No" }];
+
+/**
+ * (#242) The labels of the answers that make a trigger apply, exactly as the
+ * trigger check shows them (a yes/no question has no stored options).
+ */
+export function selectedAnswerLabels(options: readonly { value: string; label: string }[], anyOf: readonly string[]): string[] {
+  const wanted = new Set(anyOf);
+  return (options.length > 0 ? options : YES_NO_OPTIONS).filter((o) => wanted.has(o.value)).map((o) => o.label);
 }
 
 /** Limits a request is built with (from the publish settings). */
@@ -217,6 +249,13 @@ function ruleJson(handle: string, v: CheckerRuleView): Record<string, unknown> {
     listLeadIn: clean(v.listLeadIn),
     textBefore: clean(v.textBefore),
     textAfter: clean(v.textAfter),
+    // (#242) Where the condition comes from. Official text (headings, the condition's line) and code-written labels
+    // (the intake question and answers), all cleaned like every other field and inside the same delimiter tag.
+    sectionHeadings: (v.sectionHeadings ?? []).map(clean),
+    conditionFoundAt: v.conditionFoundAt ?? null,
+    conditionLine: v.conditionLine === undefined ? null : clean(v.conditionLine),
+    triggerQuestion: v.trigger ? clean(v.trigger.question) : null,
+    triggerAnswers: v.trigger ? v.trigger.answers.map(clean) : [],
   };
 }
 
@@ -414,7 +453,7 @@ export function buildTriggerRequest(role: "verification" | "judgement", views: r
     const wanted = new Set(v.rule.trigger?.anyOf ?? []);
     const optionJson = (o: { value: string; label: string }) => ({ value: clean(o.value), label: clean(o.label) });
     // A yes/no question has no stored options: spell its two answers out.
-    const options = v.question.options.length > 0 ? v.question.options : [{ value: "true", label: "Yes" }, { value: "false", label: "No" }];
+    const options = v.question.options.length > 0 ? v.question.options : YES_NO_OPTIONS;
     return {
       id: handleFor(i),
       condition: v.rule.applicabilityCondition === undefined ? null : clean(v.rule.applicabilityCondition),

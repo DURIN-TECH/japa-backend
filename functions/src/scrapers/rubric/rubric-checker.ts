@@ -9,7 +9,10 @@ import { isProtectedRule } from "./rubric-gates";
 import {
   CHECKER_ASPECTS,
   CHECKER_BATCH_SIZE,
+  CHECKER_CONDITION_LINE_CHARS,
+  CHECKER_HEADING_CHARS,
   CHECKER_LEAD_IN_CHARS,
+  CHECKER_MAX_HEADINGS,
   CHECKER_PROMPT_VERSION,
   CHECKER_TRIGGER_BATCH_SIZE,
   CHECKER_WINDOW_CHARS,
@@ -24,6 +27,7 @@ import {
   parsePolarityAnswer,
   parseTriggerVerdicts,
   parseVerdicts,
+  selectedAnswerLabels,
   type CheckerAspect,
   type CheckerRuleView,
   type PolarityAnswer,
@@ -33,7 +37,7 @@ import {
 } from "./rubric-checker-prompt";
 import { loadPublishSettings, type LoadedPublishSettings, type RubricPublishSettings } from "./rubric-publish-settings";
 import { lexiconFor } from "../language/language-lexicon";
-import { SnapshotQuoteIndex } from "./rubric-quote";
+import { SnapshotQuoteIndex, type QuoteLookup } from "./rubric-quote";
 import { quoteIsLeadIn, verifyListItems } from "./rubric-list-items";
 import { RubricExtractionService, RunStop, isTransientProviderError, type RedraftOutcome } from "./rubric-extraction.service";
 import { RUBRIC_REPAIR_PROMPT_VERSION, RUBRIC_SYSTEM_PROMPT } from "./rubric-prompt";
@@ -1008,7 +1012,7 @@ export class RubricCheckerService {
    * absent from the result (it cannot be verified). A snapshot that cannot be
    * READ throws: the official text is unavailable, not the rule unfaithful.
    */
-  private async buildViews(rules: readonly AssessmentCriterion[], indexes: Map<string, Promise<SnapshotQuoteIndex>> = new Map(), rubric?: Pick<VisaRubric, "sourceSnapshots">): Promise<Map<string, CheckerRuleView>> {
+  private async buildViews(rules: readonly AssessmentCriterion[], indexes: Map<string, Promise<SnapshotQuoteIndex>> = new Map(), rubric?: Pick<VisaRubric, "sourceSnapshots" | "intakeQuestions">): Promise<Map<string, CheckerRuleView>> {
     const indexOf = (sourceId: string, hash: string): Promise<SnapshotQuoteIndex> => {
       const key = `${sourceId}:${hash}`;
       let p = indexes.get(key);
@@ -1029,8 +1033,7 @@ export class RubricCheckerService {
       // snapshot) has no view, so it cannot pass: a protected rule holds, an
       // ordinary rule is left out (`checker:source_text`).
       if (rule.source.listItems !== undefined ? !verifyListItems(index, found, rule.source.listItems).ok : quoteIsLeadIn(index, found)) continue;
-      const around = index.contextAround(found, CHECKER_WINDOW_CHARS);
-      views.set(rule.criterionId, { rule, listLeadIn: index.listLeadIn(found, CHECKER_LEAD_IN_CHARS), textBefore: around.before, textAfter: around.after });
+      views.set(rule.criterionId, viewOf(rule, index, found, rubric?.intakeQuestions ?? []));
     }
     return views;
   }
@@ -1230,6 +1233,34 @@ export class RubricCheckerService {
     };
     await this.at(ctx.stage, "ledger", () => this.deps.ledger.save(record));
   }
+}
+
+/**
+ * (#242) What the check is shown for ONE rule whose quote was found: the words
+ * around the quote, plus where the applicability condition comes from, all read
+ * by CODE from the stored snapshot (never written by a model): the headings above
+ * the quote, and where the condition's own words are written. A rule with no
+ * condition has none to place. The trigger's question and the labels of the
+ * selected answers are those the trigger check shows; a rule with no usable
+ * trigger gets none. Pure (no I/O): the offline preview script calls it too, so
+ * what it prints is exactly what a run sends.
+ */
+export function viewOf(rule: AssessmentCriterion, index: SnapshotQuoteIndex, found: Extract<QuoteLookup, { ok: true }>, questions: NonNullable<VisaRubric["intakeQuestions"]>): CheckerRuleView {
+  const around = index.contextAround(found, CHECKER_WINDOW_CHARS);
+  const sectionHeadings = index.headingsAbove(found, CHECKER_MAX_HEADINGS, CHECKER_HEADING_CHARS);
+  const scoped = rule.applicability !== undefined && rule.applicability !== "all_applicants" && rule.applicabilityCondition !== undefined;
+  const site = scoped ? index.conditionSite(found, rule.applicabilityCondition as string, sectionHeadings, CHECKER_CONDITION_LINE_CHARS) : undefined;
+  const question = rule.trigger !== undefined && isValidTrigger(rule.trigger, questions) ? questions.find((q) => q.id === rule.trigger?.questionId) : undefined;
+  return {
+    rule,
+    listLeadIn: index.listLeadIn(found, CHECKER_LEAD_IN_CHARS),
+    textBefore: around.before,
+    textAfter: around.after,
+    sectionHeadings,
+    ...(site ? { conditionFoundAt: site.at } : {}),
+    ...(site?.line !== undefined ? { conditionLine: site.line } : {}),
+    ...(question && rule.trigger ? { trigger: { question: question.label, answers: selectedAnswerLabels(question.options ?? [], rule.trigger.anyOf) } } : {}),
+  };
 }
 
 /**

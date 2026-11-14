@@ -211,10 +211,12 @@ describe("(#240) through the check", () => {
     assert.equal([...r.ledger.docs.values()][0].promptVersion, CHECKER_PROMPT_VERSION);
   });
 
-  test("the checker prompt, its version and its schema are untouched (stored answers keep replaying)", () => {
-    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v5");
+  test("the checker prompt and schema are pinned: #240 itself did not touch them (#242 later bumped them: see rubric-check-context.test.ts)", () => {
+    // (#242) The checker prompt moved to v6 on purpose (headings and the trigger are shown). #240's mapping tests below do not depend on it;
+    // what #240 proved (a mapping-only change replays) stays true for any version, so only the pin moved.
+    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v6");
     const hash = createHash("sha256").update(`${CHECKER_SYSTEM_PROMPT}\n${JSON.stringify(buildVerdictSchema())}\n${CHECKER_POLARITY_SYSTEM_PROMPT}`).digest("hex");
-    assert.equal(hash, "894d66bb1f58bd6250c6a00627ad325b333adf280346737220f93d54a0aa2d8b", "the same hash pinned at the v5 bump: #240 does not touch the prompt");
+    assert.equal(hash, "6c9410ad8e9df18e7cab534cde25cc74e40a92e2527ccac25c79dd409901d49e", "the hash pinned at the v6 bump (#242)");
   });
 
   test("a protected rule is still held by the stage of an objective rule and by kind `unsure` from one model", async () => {
