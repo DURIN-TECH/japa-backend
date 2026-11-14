@@ -184,21 +184,43 @@ class SharedRouteService {
 
   /** How many open applications use a shared route, across every member record. */
   async countOpenUsing(route: SharedRoute): Promise<number> {
+    return (await this.openApplicationsUsing(route)).length;
+  }
+
+  /**
+   * (#233 P4b) The OPEN applications that run on a shared route's layer, across
+   * every member record, sorted by id: those whose stored `routeStack` names
+   * the layer (the `routeStack` array-contains query, indexed in
+   * firestore.indexes.json), plus older ones with no stored stack on a record
+   * that inherits the route today (they resolve their stack live). Every
+   * agency's applications are returned: callers are backend jobs only and must
+   * never hand this list to a person (they report counts per member route).
+   */
+  async openApplicationsUsing(route: Pick<SharedRoute, "id" | "issuingAuthorityId">): Promise<Application[]> {
     const key = sharedRulebookKey(route.issuingAuthorityId, route.id);
-    const ids = new Set<string>();
+    const byId = new Map<string, Application>();
     // New applications: their stored stack names the shared layer.
     const stacked = await collections.applications.where("routeStack", "array-contains", key).get();
     for (const d of stacked.docs) {
-      const a = d.data() as Application;
-      if (isApplicationOpen(a.status)) ids.add(a.id);
+      const a = { ...(d.data() as Application), id: d.id };
+      if (isApplicationOpen(a.status)) byId.set(a.id, a);
     }
     // Older applications (no stored stack) on a record that inherits the route today.
-    const records = await collectionGroups.visaTypes().where("inheritsFrom", "array-contains", { sharedRouteId: route.id }).get();
-    for (const r of records.docs) {
-      const v = r.data() as VisaType;
-      for (const a of await this.openOnRecord(v.countryCode, v.id, key)) if (a.routeStack === undefined) ids.add(a.id);
+    for (const v of await this.memberRecordsOf(route)) {
+      for (const a of await this.openOnRecord(v.countryCode, v.visaTypeId, key)) if (a.routeStack === undefined) byId.set(a.id, a);
     }
-    return ids.size;
+    return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  /** (#233 P4b) The visa records that inherit a shared route today (country code + visa id), sorted. */
+  async memberRecordsOf(route: Pick<SharedRoute, "id">): Promise<{ countryCode: string; visaTypeId: string }[]> {
+    const records = await collectionGroups.visaTypes().where("inheritsFrom", "array-contains", { sharedRouteId: route.id }).get();
+    return records.docs
+      .map((r) => {
+        const v = r.data() as VisaType;
+        return { countryCode: v.countryCode, visaTypeId: v.id ?? r.id };
+      })
+      .sort((a, b) => `${a.countryCode}_${a.visaTypeId}`.localeCompare(`${b.countryCode}_${b.visaTypeId}`));
   }
 
   // ============================================

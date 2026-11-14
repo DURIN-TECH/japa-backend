@@ -2,7 +2,7 @@ import { createHash } from "crypto";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { collections, db } from "../utils/firebase";
-import { applyExclusions, layerVersionsOf, rubricStore, sameStackVersions, type RulebookStack, type VisaRubric } from "../scrapers";
+import { applyExclusions, layerVersionsOf, rubricStore, sameStackVersions, scopedId, type RulebookStack, type VisaRubric } from "../scrapers";
 import { defaultRulebookStack, rulebookStackFor, type ApplicationStackRef } from "./ai/application-rulebook";
 import type { Application } from "../types";
 import {
@@ -17,7 +17,14 @@ import type {
   AssessmentBatch,
   BulkReassessmentRun,
   DocumentExtractionRecord,
+  FanOutCandidate,
+  FanOutConfirmation,
+  FanOutEstimate,
+  SharedLayerFanOut,
 } from "../types/bulk-reassessment";
+// (#233 P4b) The open applications on a shared layer (the resolver's service, not the module index, which also loads admin routes).
+import { sharedRouteService } from "../shared-routes/shared-route.service";
+import type { SharedRoute } from "../types/shared-route";
 import {
   assembleContent,
   assessmentIdFor,
@@ -140,6 +147,22 @@ import type { RubricReviewAuditEntry } from "./rubric-review.service";
 //
 // Privacy: no log line holds a prompt, a model answer or applicant text. Log
 // lines carry ids, counts and fixed codes only.
+//
+// ---- (#233 P4b) A SHARED layer's new version: the fan-out ----
+// An approval of a bloc's or treaty's layer (no country pair) does NOT queue at
+// once. `startFanOut` finds the open applications whose stack includes the layer
+// (`sharedRouteService.openApplicationsUsing`: the indexed `routeStack`
+// array-contains query, plus older applications on inheriting records), keeps
+// the candidates (open, already assessed, not yet on this version) and stores an
+// ESTIMATE (applications per member route, an upper bound of requests). The run
+// waits in `awaiting_confirmation`, which the sweep never reads, so nothing can
+// be spent. `confirmFanOut` (admin, POST /admin/rubrics/fan-outs/:id/confirm,
+// the estimate id and the accepted statement, as the onboarding confirmation)
+// then enqueues the candidates as ORDINARY jobs of this path (the daily batch
+// caps above apply unchanged), and stops before the running request bound
+// would pass the confirmed number (the confirmation is voided and the admin is
+// asked again for the rest). One run per approval event (id = audit id); job ids
+// are deterministic; a repeated confirm is a no-op. No member layer is re-drafted.
 
 // ============================================
 // Constants
@@ -194,6 +217,10 @@ export interface BulkDeps {
   notify: typeof notificationService.notifyUser;
   adminUids(): Promise<string[]>;
   now(): Date;
+  // (#233 P4b) The open applications on a shared layer (every member route),
+  // sorted by id. Optional so fakes written before P4b still type-check; the
+  // default deps set it. Without it a shared approval queues nothing.
+  openApplicationsOnLayer?(route: Pick<SharedRoute, "id" | "issuingAuthorityId">): Promise<Application[]>;
 }
 
 /** The default deps: the real provider, store, Storage and notifier. */
@@ -212,7 +239,35 @@ function defaultDeps(): BulkDeps {
     notify: (input) => notificationService.notifyUser(input),
     adminUids: () => claimsService.listAdminUids(),
     now: () => new Date(),
+    openApplicationsOnLayer: (route) => sharedRouteService.openApplicationsUsing(route),
   };
+}
+
+// ============================================
+// (#233 P4b) A shared layer's fan-out: words and ids (pure)
+// ============================================
+
+/** The statement an admin accepts by confirming a fan-out (shown word for word). */
+export const FAN_OUT_STATEMENT =
+  "I confirm the re-assessment of these applications at batch rates. Requests are counted against the daily batch limit, and nothing beyond the number shown is started without a new confirmation.";
+
+/** The estimate id: a hash of what is confirmed (layer, version, candidates and their bounds). */
+export function fanOutEstimateId(layerKey: string, version: number, candidates: readonly Pick<FanOutCandidate, "applicationId" | "requestsAtMost">[]): string {
+  return createHash("sha256").update(JSON.stringify([layerKey, version, candidates.map((c) => [c.applicationId, c.requestsAtMost])])).digest("hex").slice(0, 24);
+}
+
+/** The estimate in plain words. */
+export function fanOutPlain(e: Pick<FanOutEstimate, "applications" | "requestsAtMost" | "memberRoutes">, layerKey: string): string {
+  if (e.applications === 0) return `No open application on ${layerKey} needs a re-assessment. Nothing will be spent.`;
+  return `${e.applications} open application${e.applications === 1 ? "" : "s"} on ${e.memberRoutes.length} member route${e.memberRoutes.length === 1 ? "" : "s"} use the new rules of ${layerKey}. Re-assessing them takes at most ${e.requestsAtMost} batch request${e.requestsAtMost === 1 ? "" : "s"} (stored document reads are reused, so usually far fewer), within the daily batch limit.`;
+}
+
+/** Thrown by the fan-out confirmation with an HTTP status and a stable code. */
+export class FanOutError extends Error {
+  constructor(readonly code: "NOT_FOUND" | "NOT_AWAITING_CONFIRMATION" | "ESTIMATE_MISMATCH" | "STATEMENT_REQUIRED", readonly status: number, message: string, readonly extra: Record<string, unknown> = {}) {
+    super(message);
+    this.name = "FanOutError";
+  }
 }
 
 // ============================================
@@ -379,6 +434,9 @@ function findingIdsOf(a: Pick<ApplicationAssessment, "refusalGrounds" | "credibi
 export class BulkReassessmentService {
   constructor(private readonly deps: BulkDeps = defaultDeps()) {}
 
+  /** (#233 P4b) Transaction runner of the fan-out confirmation (a property so tests can swap in the in-memory one). */
+  runTransaction: <T>(fn: (tx: FirebaseFirestore.Transaction) => Promise<T>) => Promise<T> = (fn) => db.runTransaction(fn);
+
   // Rubric versions read for diffs during one process lifetime of a sweep.
   // Cleared at the start of each sweep so a long-lived instance holds nothing stale.
   private rubricVersionCache = new Map<string, VisaRubric | null>();
@@ -400,18 +458,11 @@ export class BulkReassessmentService {
     // Only an approval that now serves a version starts anything. A reject
     // changes nothing about what is served.
     if (entry.action !== "approve" || entry.approvedVersion === null || entry.approvedVersion === undefined) return "ignored";
-    // (#233) SEAM FOR P4b. An approval of a SHARED layer (a bloc / treaty
-    // rulebook, no country pair) is not fanned out here yet: the open
-    // applications whose `routeStack` includes the layer are found and queued
-    // by P4b (through this same bulk path, within the same spend limits and
-    // the estimate confirmation). Until then nothing is queued for it; an
-    // application on that stack still re-assesses on its own next request,
-    // and its stored assessment reports `rules_updated` (staleReasonOf
-    // compares every layer's version). A country's own layer is unchanged.
-    if (entry.countryCode === undefined || entry.visaTypeId === undefined) {
-      console.log(`[bulk-reassess] approval ${auditId} is for the shared layer ${entry.routeKey}: fan-out to member routes is not built yet (P4b), nothing queued`);
-      return "ignored";
-    }
+    // (#233 P4b) An approval of a SHARED layer (a bloc / treaty rulebook, no
+    // country pair): the open applications whose stack includes the layer are
+    // found and ESTIMATED; nothing is queued until an admin confirms (see
+    // `startFanOut`). A country's own layer is handled exactly as before.
+    if (entry.countryCode === undefined || entry.visaTypeId === undefined) return this.startFanOut(auditId, entry);
     const countryCode = entry.countryCode;
     const visaTypeId = entry.visaTypeId;
 
@@ -448,9 +499,10 @@ export class BulkReassessmentService {
 
     // An older, unfinished run on the same route is overtaken by this approval:
     // its waiting jobs would fail `rubric_changed` anyway. Mark it so the record says why.
+    // (#233 P4b) A fan-out still waiting for its confirmation is overtaken the same way.
     const older = await collections.bulkReassessments
       .where("routeKey", "==", entry.routeKey)
-      .where("status", "in", ["enqueuing", "running"])
+      .where("status", "in", ["enqueuing", "running", "awaiting_confirmation"])
       .get();
     for (const d of older.docs) {
       if (d.id === auditId) continue;
@@ -469,6 +521,12 @@ export class BulkReassessmentService {
    * Stops when the scan is done or `deadlineMs` passes, saving its place.
    */
   private async enqueuePass(run: BulkReassessmentRun, deadlineMs: number): Promise<void> {
+    // (#233 P4b) A shared layer's fan-out has its own two passes (estimate, then the confirmed enqueue).
+    if (run.fanOut) {
+      if (run.fanOut.phase === "estimating") return this.estimatePass(run, deadlineMs);
+      if (run.fanOut.phase === "confirmed") return this.fanOutEnqueuePass(run, deadlineMs);
+      return; // awaiting confirmation: nothing to do, nothing to spend
+    }
     let cursor = run.enqueueCursor;
     let done = run.enqueueDone;
     while (!done && this.deps.now().getTime() < deadlineMs) {
@@ -536,19 +594,28 @@ export class BulkReassessmentService {
     const stack = await this.stackOf(app);
     const layerVersions = stack?.usable && stack.rubric ? layerVersionsOf(stack.rubric) : undefined;
     if (stack && stack.layers.length > 1 && !layerVersions) return "excluded"; // no usable stack: nothing to re-assess against
+    // (#233 P4b) A fan-out job: the run's version is the SHARED layer's. The
+    // stack must serve exactly that version (a newer approval has its own run);
+    // the job records the application's OWN layer version as `rubricVersion`,
+    // as every assessment of a stack does.
+    let ownVersion = run.rubricVersion;
+    if (run.fanOut) {
+      if (!layerVersions || layerVersions[run.fanOut.layerKey] !== run.fanOut.layerVersion || !stack?.rubric) return "excluded";
+      ownVersion = stack.rubric.version;
+    }
 
     const previous = await this.latestSucceeded(applicationId);
-    if (previous && sameStackVersions({ version: previous.rubricVersion, layerVersions: previous.layerVersions }, { version: run.rubricVersion, layerVersions })) return "already_current";
+    if (previous && sameStackVersions({ version: previous.rubricVersion, layerVersions: previous.layerVersions }, { version: ownVersion, layerVersions })) return "already_current";
 
     const loaded = await this.deps.officer.loadInputs(app);
-    const inputHash = computeInputHash(this.deps.officer.inputsFor(loaded, run.rubricVersion, layerVersions));
+    const inputHash = computeInputHash(this.deps.officer.inputsFor(loaded, ownVersion, layerVersions));
     const id = assessmentIdFor(app.id, inputHash);
 
     const job: ApplicationAssessment = {
       ...newAssessmentDoc({
         id,
         app,
-        rubricVersion: run.rubricVersion,
+        rubricVersion: ownVersion,
         layerVersions,
         rulebookLayers: layerVersions && stack?.rubric ? stack.rubric.stackLayers : undefined,
         inputHash,
@@ -578,6 +645,259 @@ export class BulkReassessmentService {
       if (isAlreadyExists(err)) return "already_current";
       throw err;
     }
+  }
+
+  // ----------------------------------------------------------------
+  // 1b. (#233 P4b) A shared layer's fan-out
+  // ----------------------------------------------------------------
+
+  /**
+   * Start the fan-out of a SHARED layer's approval: create the run (id = the
+   * audit id, so a re-delivered event finds it and returns "duplicate"), then
+   * estimate. NOTHING is queued and nothing is spent: the run waits in
+   * `awaiting_confirmation` for an admin (`confirmFanOut`). The per-member-route
+   * rule-change alerts are recorded by rule-change-alerts.service.ts from the
+   * same audit document. No member layer is re-drafted.
+   */
+  private async startFanOut(auditId: string, entry: RubricReviewAuditEntry): Promise<"started" | "duplicate" | "ignored"> {
+    const version = entry.approvedVersion as number;
+    const parts = entry.authorityId && entry.routeSlug ? { issuingAuthorityId: entry.authorityId, id: entry.routeSlug } : null;
+    if (!parts || !this.deps.openApplicationsOnLayer) {
+      console.log(`[bulk-reassess] approval ${auditId} of ${entry.routeKey}: no shared route to fan out to, nothing queued`);
+      return "ignored";
+    }
+    const now = Timestamp.fromDate(this.deps.now());
+    const fanOut: SharedLayerFanOut = {
+      layerKey: entry.routeKey,
+      layerVersion: version,
+      phase: "estimating",
+      scanCursor: null,
+      candidates: 0,
+      requestsAtMost: 0,
+      estimate: null,
+      confirmation: null,
+      voidedConfirmations: [],
+      requestsEnqueued: 0,
+    };
+    const run: BulkReassessmentRun = {
+      id: auditId,
+      routeKey: entry.routeKey,
+      rubricVersion: version,
+      previousApprovedVersion: entry.previousApprovedVersion ?? null,
+      approvedBy: entry.by,
+      status: "enqueuing",
+      createdAt: now,
+      updatedAt: now,
+      enqueueCursor: null,
+      enqueueDone: false,
+      enqueued: 0,
+      alreadyCurrent: 0,
+      excluded: 0,
+      deferredAtLastSweep: 0,
+      lastDeferredAt: null,
+      capMode: null,
+      succeeded: null,
+      failed: null,
+      completedAt: null,
+      fanOut,
+    };
+    try {
+      await collections.bulkReassessments.doc(auditId).create(run as unknown as Record<string, unknown>);
+    } catch (err) {
+      if (isAlreadyExists(err)) return "duplicate";
+      throw err;
+    }
+    // An older fan-out of the same layer (still estimating, waiting or running) is overtaken.
+    const older = await collections.bulkReassessments.where("routeKey", "==", entry.routeKey).where("status", "in", ["enqueuing", "running", "awaiting_confirmation"]).get();
+    for (const d of older.docs) if (d.id !== auditId) await d.ref.update({ status: "cancelled", updatedAt: now });
+    // The estimate, inline and bounded; the sweep continues a long one.
+    await this.estimatePass(run, this.deps.now().getTime() + SWEEP_BUDGET_MS);
+    console.log(`[bulk-reassess] fan-out ${auditId} started for ${entry.routeKey} v${version}: estimating, nothing queued before confirmation`);
+    return "started";
+  }
+
+  /** The candidates of a fan-out run. */
+  private candidatesRef(runId: string) {
+    return collections.bulkReassessments.doc(runId).collection("candidates");
+  }
+
+  /**
+   * The estimate pass: walk the open applications on the layer (in id order,
+   * resuming after `scanCursor`), store each CANDIDATE (it has a succeeded
+   * assessment and is not already on this layer version) with its request
+   * bound, and when the walk is done store the estimate and wait for the
+   * confirmation. Reads only: no job, no model call.
+   */
+  private async estimatePass(run: BulkReassessmentRun, deadlineMs: number): Promise<void> {
+    const f = run.fanOut as SharedLayerFanOut;
+    const [authorityId, ...rest] = f.layerKey.split("_");
+    const apps = await (this.deps.openApplicationsOnLayer as NonNullable<BulkDeps["openApplicationsOnLayer"]>)({ issuingAuthorityId: authorityId, id: rest.join("_") });
+    let cursor = f.scanCursor;
+    let candidates = f.candidates;
+    let bound = f.requestsAtMost;
+    let done = true;
+    for (const app of apps) {
+      if (cursor !== null && app.id <= cursor) continue;
+      if (this.deps.now().getTime() >= deadlineMs) {
+        done = false;
+        break;
+      }
+      cursor = app.id;
+      if (EXCLUDED_APPLICATION_STATUSES.includes(app.status)) continue;
+      const previous = await this.latestSucceeded(app.id);
+      // We never spend on an application nobody asked an assessment for (as #37).
+      if (!previous) continue;
+      if (previous.layerVersions && previous.layerVersions[f.layerKey] === f.layerVersion) continue;
+      const docs = await collections.documents.where("applicationId", "==", app.id).count().get();
+      const requestsAtMost = 1 + docs.data().count;
+      const candidate: FanOutCandidate = { applicationId: app.id, countryCode: app.countryCode, visaTypeId: app.visaTypeId, requestsAtMost, handled: false };
+      await this.candidatesRef(run.id).doc(app.id).set(candidate as unknown as Record<string, unknown>);
+      candidates += 1;
+      bound += requestsAtMost;
+    }
+    const stamp = Timestamp.fromDate(this.deps.now());
+    if (!done) {
+      await collections.bulkReassessments.doc(run.id).update({ "fanOut.scanCursor": cursor, "fanOut.candidates": candidates, "fanOut.requestsAtMost": bound, updatedAt: stamp });
+      return;
+    }
+    const estimate = await this.estimateOf(run.id, f, null);
+    if (estimate.applications === 0) {
+      // Nothing to re-assess: the run completes at once (no confirmation needed: nothing can be spent).
+      await collections.bulkReassessments.doc(run.id).update({ "fanOut.phase": "confirmed", "fanOut.scanCursor": cursor, "fanOut.candidates": 0, "fanOut.requestsAtMost": 0, "fanOut.estimate": estimate, enqueueDone: true, status: "running", updatedAt: stamp });
+      return;
+    }
+    await collections.bulkReassessments.doc(run.id).update({
+      "fanOut.phase": "awaiting_confirmation",
+      "fanOut.scanCursor": cursor,
+      "fanOut.candidates": candidates,
+      "fanOut.requestsAtMost": bound,
+      "fanOut.estimate": estimate,
+      status: "awaiting_confirmation",
+      updatedAt: stamp,
+    });
+    console.log(`[bulk-reassess] fan-out ${run.id}: ${estimate.applications} application(s), at most ${estimate.requestsAtMost} request(s); awaiting confirmation`);
+  }
+
+  /** The estimate over the candidates not yet handled (all of them before the first confirmation). */
+  private async estimateOf(runId: string, f: SharedLayerFanOut, afterId: string | null): Promise<FanOutEstimate> {
+    const snap = await this.candidatesRef(runId).get();
+    const open = snap.docs.map((d) => d.data() as FanOutCandidate).filter((c) => !c.handled && (afterId === null || c.applicationId > afterId)).sort((a, b) => a.applicationId.localeCompare(b.applicationId));
+    const routes = new Map<string, { countryCode: string; visaTypeId: string; applications: number }>();
+    for (const c of open) {
+      const k = `${c.countryCode}_${c.visaTypeId}`;
+      routes.set(k, { countryCode: c.countryCode, visaTypeId: c.visaTypeId, applications: (routes.get(k)?.applications ?? 0) + 1 });
+    }
+    const memberRoutes = [...routes.values()].sort((a, b) => `${a.countryCode}_${a.visaTypeId}`.localeCompare(`${b.countryCode}_${b.visaTypeId}`));
+    const base = { applications: open.length, requestsAtMost: open.reduce((n, c) => n + c.requestsAtMost, 0), memberRoutes };
+    return { estimateId: fanOutEstimateId(f.layerKey, f.layerVersion, open), ...base, plain: fanOutPlain(base, f.layerKey), computedAt: Timestamp.fromDate(this.deps.now()) };
+  }
+
+  /**
+   * The admin's confirmation of a fan-out estimate (POST
+   * /admin/rubrics/fan-outs/:id/confirm). Only from `awaiting_confirmation`,
+   * only with the STORED estimate id and the statement accepted. Records who,
+   * when and the number, then enqueues (bounded; the sweep continues). The
+   * spend itself happens in the sweep, inside the daily batch caps. A repeat
+   * with the same id after confirming is a harmless 200 (`alreadyConfirmed`).
+   *
+   * @throws FanOutError 404 / 409 NOT_AWAITING_CONFIRMATION / 409 ESTIMATE_MISMATCH / 400 STATEMENT_REQUIRED
+   */
+  async confirmFanOut(runId: string, input: { estimateId: string; statementAccepted: boolean }, uid: string): Promise<{ run: BulkReassessmentRun; alreadyConfirmed: boolean }> {
+    if (input.statementAccepted !== true) throw new FanOutError("STATEMENT_REQUIRED", 400, "Accept the statement to confirm the re-assessment.");
+    const ref = collections.bulkReassessments.doc(runId);
+    const result = await this.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) throw new FanOutError("NOT_FOUND", 404, "There is no such re-assessment run.");
+      const run = snap.data() as BulkReassessmentRun;
+      if (!run.fanOut) throw new FanOutError("NOT_FOUND", 404, "That run needs no confirmation.");
+      if (run.fanOut.confirmation?.estimateId === input.estimateId && run.status !== "awaiting_confirmation") return { run, alreadyConfirmed: true };
+      if (run.status !== "awaiting_confirmation" || !run.fanOut.estimate) throw new FanOutError("NOT_AWAITING_CONFIRMATION", 409, "This run is not waiting for a confirmation.");
+      if (run.fanOut.estimate.estimateId !== input.estimateId) throw new FanOutError("ESTIMATE_MISMATCH", 409, "The estimate changed. Confirm the current one.", { currentEstimateId: run.fanOut.estimate.estimateId });
+      const confirmation: FanOutConfirmation = { estimateId: input.estimateId, by: uid, at: Timestamp.fromDate(this.deps.now()), maxRequests: run.fanOut.estimate.requestsAtMost, statementAccepted: true };
+      // The confirmed number is what may be enqueued from here on (on top of what an earlier confirmation already covered).
+      const fanOut: SharedLayerFanOut = { ...run.fanOut, phase: "confirmed", confirmation, requestsEnqueued: 0 };
+      const next: BulkReassessmentRun = { ...run, status: "enqueuing", enqueueDone: false, fanOut, updatedAt: confirmation.at };
+      tx.update(ref, { status: "enqueuing", enqueueDone: false, fanOut, updatedAt: confirmation.at });
+      return { run: next, alreadyConfirmed: false };
+    });
+    if (!result.alreadyConfirmed) {
+      console.log(`[bulk-reassess] fan-out ${runId} confirmed by ${uid}: at most ${result.run.fanOut?.confirmation?.maxRequests} request(s)`);
+      await this.fanOutEnqueuePass(result.run, this.deps.now().getTime() + SWEEP_BUDGET_MS);
+    }
+    const fresh = await ref.get();
+    return { run: fresh.data() as BulkReassessmentRun, alreadyConfirmed: result.alreadyConfirmed };
+  }
+
+  /** The fan-out runs, newest first (the admin list; counts only, never an application). */
+  async listFanOuts(opts: { status?: BulkReassessmentRun["status"]; limit: number }): Promise<BulkReassessmentRun[]> {
+    const snap = await (opts.status ? collections.bulkReassessments.where("status", "==", opts.status) : collections.bulkReassessments).get();
+    return snap.docs
+      .map((d) => d.data() as BulkReassessmentRun)
+      .filter((r) => r.fanOut !== undefined)
+      .sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0))
+      .slice(0, opts.limit);
+  }
+
+  /**
+   * The confirmed enqueue: walk the unhandled candidates in id order, enqueue
+   * each through the ordinary `enqueueOne` (same checks, same deterministic job
+   * ids), and STOP before the running bound would pass the confirmed number.
+   * Stopping there voids the confirmation and asks again with an estimate of
+   * what is left, so spend never runs ahead of a confirmation.
+   */
+  private async fanOutEnqueuePass(run: BulkReassessmentRun, deadlineMs: number): Promise<void> {
+    const f = run.fanOut as SharedLayerFanOut;
+    const confirmation = f.confirmation;
+    if (f.phase !== "confirmed" || !confirmation) return; // never without a confirmation
+    const snap = await this.candidatesRef(run.id).get();
+    const open = snap.docs.map((d) => d.data() as FanOutCandidate).filter((c) => !c.handled).sort((a, b) => a.applicationId.localeCompare(b.applicationId));
+    let used = f.requestsEnqueued;
+    const counts = { enqueued: 0, alreadyCurrent: 0, excluded: 0 };
+    let overLimit = false;
+    let out = false;
+    for (const c of open) {
+      if (this.deps.now().getTime() >= deadlineMs) {
+        out = true;
+        break;
+      }
+      // The bound is re-read now: a document added since the estimate raises it.
+      const docs = await collections.documents.where("applicationId", "==", c.applicationId).count().get();
+      const need = 1 + docs.data().count;
+      if (used + need > confirmation.maxRequests) {
+        overLimit = true;
+        break;
+      }
+      const outcome = await this.enqueueOne(run, c.applicationId);
+      if (outcome === "enqueued") {
+        counts.enqueued++;
+        used += need;
+      } else if (outcome === "already_current") counts.alreadyCurrent++;
+      else counts.excluded++;
+      await this.candidatesRef(run.id).doc(c.applicationId).update({ handled: true });
+    }
+    const stamp = Timestamp.fromDate(this.deps.now());
+    const tallies = {
+      enqueued: FieldValue.increment(counts.enqueued),
+      alreadyCurrent: FieldValue.increment(counts.alreadyCurrent),
+      excluded: FieldValue.increment(counts.excluded),
+      "fanOut.requestsEnqueued": used,
+      updatedAt: stamp,
+    };
+    if (overLimit) {
+      // Ask again for what is left: the confirmation is voided (kept), a new estimate stored.
+      const estimate = await this.estimateOf(run.id, f, null);
+      await collections.bulkReassessments.doc(run.id).update({
+        ...tallies,
+        status: "awaiting_confirmation",
+        "fanOut.phase": "awaiting_confirmation",
+        "fanOut.confirmation": null,
+        "fanOut.voidedConfirmations": [...f.voidedConfirmations, confirmation],
+        "fanOut.estimate": estimate,
+      });
+      console.log(`[bulk-reassess] fan-out ${run.id}: the confirmed number was reached; ${estimate.applications} application(s) wait for a new confirmation`);
+      return;
+    }
+    await collections.bulkReassessments.doc(run.id).update({ ...tallies, ...(out ? {} : { enqueueDone: true, status: "running" }) });
   }
 
   /**
@@ -905,19 +1225,25 @@ export class BulkReassessmentService {
     const direction = before < 0 || after < 0 ? "unknown" : after < before ? "down" : after > before ? "up" : "same";
 
     // Rubric-level diff: which criterion ids were added, removed or changed.
-    // (#233) Not for a merged STACK view: the previous stored version is ONE
-    // layer, and diffing the union against it would call every other layer's
-    // rule "added". The result-level diff below still holds. A per-layer diff
-    // belongs with the shared-layer fan-out (P4b).
-    const old = rubric.stackLayers ? null : await this.rubricVersionOf(rubric, previous.rubricVersion);
+    // (#233 P4b) For a merged STACK view the diff is made PER LAYER: each layer
+    // whose version moved since the previous assessment is diffed against its
+    // own earlier version, and a shared layer's ids are scoped as the merged
+    // view serves them. Diffing the union against one stored layer would call
+    // every other layer's rule "added". A layer that cannot be read leaves the
+    // rubric diff out (null), as before; the result-level diff below holds.
     let criteria: AssessmentChangeSummary["criteria"] = null;
-    if (old) {
-      const diff = diffRubricVersions(rubric, old);
-      criteria = {
-        added: diff.added.map((c) => c.criterionId),
-        removed: diff.removed.map((c) => c.criterionId),
-        changed: diff.changed.map((c) => c.criterionId),
-      };
+    if (rubric.stackLayers) {
+      criteria = await this.stackDiff(rubric, previous);
+    } else {
+      const old = await this.rubricVersionOf(rubric, previous.rubricVersion);
+      if (old) {
+        const diff = diffRubricVersions(rubric, old);
+        criteria = {
+          added: diff.added.map((c) => c.criterionId),
+          removed: diff.removed.map((c) => c.criterionId),
+          changed: diff.changed.map((c) => c.criterionId),
+        };
+      }
     }
 
     // Result-level diff: which findings are newly raised or no longer raised.
@@ -937,11 +1263,45 @@ export class BulkReassessmentService {
     };
   }
 
+  /**
+   * (#233 P4b) The per-layer rule diff of a stack view against the previous
+   * assessment's layer versions. Null when the previous assessment recorded no
+   * layer versions, or a layer's versions cannot be read (never a guessed diff).
+   */
+  private async stackDiff(rubric: VisaRubric, previous: ApplicationAssessment): Promise<AssessmentChangeSummary["criteria"]> {
+    const before = previous.layerVersions;
+    if (!before || !rubric.stackLayers) return null;
+    const out = { added: [] as string[], removed: [] as string[], changed: [] as string[] };
+    for (const layer of rubric.stackLayers) {
+      const was = before[layer.rulebookKey] ?? null;
+      if (was === layer.version) continue;
+      const scope = (id: string) => (layer.role === "shared" ? scopedId(layer.rulebookKey, id) : id);
+      const [now, then] = await Promise.all([
+        layer.version === null ? Promise.resolve(null) : this.rubricVersionAt(layer.rulebookKey, layer.version),
+        was === null ? Promise.resolve(null) : this.rubricVersionAt(layer.rulebookKey, was),
+      ]);
+      // A layer that appeared adds all its rules; one that went missing removes them.
+      if (layer.version !== null && !now) return null;
+      if (was !== null && !then) return null;
+      if (now && !then) out.added.push(...now.criteria.map((c) => scope(c.criterionId)));
+      else if (!now && then) out.removed.push(...then.criteria.map((c) => scope(c.criterionId)));
+      else if (now && then) {
+        const diff = diffRubricVersions(now, then);
+        out.added.push(...diff.added.map((c) => scope(c.criterionId)));
+        out.removed.push(...diff.removed.map((c) => scope(c.criterionId)));
+        out.changed.push(...diff.changed.map((c) => scope(c.criterionId)));
+      }
+    }
+    return out;
+  }
+
   /** A stored rubric version of the same route, or null when it cannot be read (cached per sweep). */
   private async rubricVersionOf(current: VisaRubric, version: number): Promise<VisaRubric | null> {
-    // (#233) The version's own key (any authority). For a merged stack view the
-    // key is the own layer's; `changeSummaryOf` does not diff a stack (see there).
-    const routeKey = current.routeKey;
+    return this.rubricVersionAt(current.routeKey, version);
+  }
+
+  /** (#233) An approved version of ANY rulebook key, effective (exclusions applied), or null (cached per sweep). */
+  private async rubricVersionAt(routeKey: string, version: number): Promise<VisaRubric | null> {
     const key = `${routeKey}#${version}`;
     if (this.rubricVersionCache.has(key)) return this.rubricVersionCache.get(key) ?? null;
     let found: VisaRubric | null = null;

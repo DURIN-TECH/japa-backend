@@ -84,7 +84,13 @@ export interface RuleChangeEvent {
   sourceId: string;
   countryCode: string;
   visaTypeId: string;
+  // The member route's own rulebook key (`{countryCode}_{visaTypeId}`).
   routeKey: string;
+  // (#233 P4b) Set when the change is a SHARED layer's new version: that
+  // layer's rulebook key. The event is then one of several (one per member
+  // route), the summary is the shared layer's diff, and only applications whose
+  // stack includes this layer are told. Absent on every other event.
+  layerKey?: string;
   status: RuleChangeEventStatus;
   // Why an event was recorded but sends nothing (first approval, empty diff, ...).
   skipReason: string | null;
@@ -113,6 +119,9 @@ export interface RuleChangeEvent {
   scanned: number;
   skippedDrafts: number;
   skippedExcluded: number;
+  // (#233 P4b) Layer events only: applications on the member route whose stored
+  // stack does not include the layer (they run on other rules): not told.
+  skippedOtherStack?: number;
   alreadyHandled: number;
   // A staff notification was NOT sent because #37's reviewer notification already
   // told the same people the rules changed.
@@ -169,6 +178,15 @@ function safeIdPart(part: string): string {
  */
 export function guidanceEventId(routeKey: string, version: number): string {
   return `guidance_${safeIdPart(routeKey)}_v${version}`;
+}
+
+/**
+ * (#233 P4b) Event id of a SHARED layer's approval for ONE member route. Keyed
+ * on the LAYER AND VERSION and the member route, so the same version can never
+ * raise two events for one route, whatever delivers it.
+ */
+export function layerEventId(layerKey: string, version: number, memberRouteKey: string): string {
+  return `guidance_${safeIdPart(layerKey)}_v${version}__${safeIdPart(memberRouteKey)}`;
 }
 
 /** Event id of an approved visa-record change. */
