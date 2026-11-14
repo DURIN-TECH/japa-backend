@@ -50,7 +50,12 @@ export function memoryRateStore(): RateStore & { docs: Map<string, StoredRate>; 
       const m = decide(current ? { ...current } : null);
       const next: StoredRate = { ...(current ?? blank(c)) };
       if (m.override !== undefined) next.override = m.override;
-      if (m.hold !== undefined) next.hold = m.hold; // issue #241
+      // Issue #241: like Firestore, writing the hold map (a new hold or null)
+      // replaces any unreadable one, so holdCorrupt goes with it.
+      if (m.hold !== undefined) {
+        next.hold = m.hold;
+        delete next.holdCorrupt;
+      }
       // Like Firestore: dropping the provider map also clears providerCorrupt
       // (that flag is derived from the map being present but unreadable).
       if (m.clearProvider) {

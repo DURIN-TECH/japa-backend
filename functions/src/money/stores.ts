@@ -59,6 +59,11 @@ function parseRateDoc(currency: string, d: Record<string, any>): StoredRate { //
     currency,
     // A present-but-unreadable provider map is flagged, never silently null.
     providerCorrupt: !!d.provider && !providerOk,
+    // Issue #241 review: likewise a present-but-unreadable hold map is
+    // flagged (holdCorrupt) rather than read silently as "no hold", so the
+    // admin overview can warn about it and DELETE .../hold can remove it.
+    // Pricing still treats it as no hold (the normal rules apply).
+    ...(d.hold && !holdOk ? { holdCorrupt: true } : {}),
     provider: providerOk
       ? { rate: d.provider.rate, asOf: asOf as Date, fetchedAt: fetchedAt as Date, source: d.provider.source as StoredProviderRate["source"] }
       : null,
@@ -258,6 +263,11 @@ export const firestoreRateStore: RateStore & {
         ...(d.unreferenced ? { unreferenced: true } : {}),
         ...(typeof d.outcome === "string" ? { outcome: d.outcome } : {}),
         ...(toDate(d.holdExpiresAt) ? { holdExpiresAt: toDate(d.holdExpiresAt) as Date } : {}),
+        // Issue #241 review: override_set records the rate in effect
+        // separately from the override entered; null is kept (not dropped)
+        // because "nothing prices" is itself the fact worth recording.
+        ...(d.effective !== undefined ? { effective: (d.effective ?? null) as { rate: number; source: FxRateSource } | null } : {}),
+        ...(d.holdCorrupt === true ? { holdCorrupt: true } : {}),
       } satisfies RateAuditEntry;
     });
   },

@@ -17,6 +17,9 @@
 //     override; reset-reference clears a superseded unreferenced override
 //  5. the charge snapshot records fxRateSource "hold"
 //  6. the Firestore store round-trips the hold and the extra audit entries
+//  7. review round 1: override_set keeps the entered rate; damaged or
+//     hand-edited holds are ignored for pricing, flagged, and clearable;
+//     warning texts name the hold when it is what prices
 
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -224,9 +227,11 @@ describe("while held, the hold prices and refreshes only record the provider rat
     await service.setHold("NGN", { rate: 1800, reason: REASON, ttlHours: 24 }, "a");
     assert.deepEqual(store.audit.at(-1)!.old, { rate: 1350, source: "manual" });
     assert.deepEqual([(await service.getRate("NGN")).rate, (await service.getRate("NGN")).source], [1800, "hold"]);
-    // An override set while held is audited with the rate really in effect.
+    // An override set while held is audited with the rate ENTERED as `new`
+    // and the rate really in effect (the hold) as `effective` (#241 review).
     await service.setOverride("NGN", { rate: 1360, reason: "replace the override", ttlHours: 48 }, "a");
-    assert.deepEqual(store.audit.at(-1)!.new, { rate: 1800, source: "hold" });
+    assert.deepEqual(store.audit.at(-1)!.new, { rate: 1360, source: "manual" });
+    assert.deepEqual(store.audit.at(-1)!.effective, { rate: 1800, source: "hold" });
     await service.clearHold("NGN", "CBN caught up today", "a");
     assert.deepEqual([(await service.getRate("NGN")).rate, (await service.getRate("NGN")).source], [1360, "manual"]);
   });
@@ -676,5 +681,204 @@ describe("Firestore store and the hold", () => {
     const after = await firestoreRateStore.get("NGN");
     assert.equal(after?.provider?.rate, 1310);
     assert.equal(after?.hold?.rate, 1800, "the merge keeps the hold");
+  });
+});
+
+// ---------------------------------------------------------------
+// 7. Review round 1 (issue #241)
+// ---------------------------------------------------------------
+describe("review: override_set audit keeps the rate the admin entered", () => {
+  test("NGN held at 1800, override 1350 set: audit new = 1350 manual, effective = 1800 hold; 1350 prices after the hold", async () => {
+    const { service, store, clock } = await laggingCbn();
+    await service.setHold("NGN", { rate: 1800, reason: REASON, ttlHours: 6 }, "admin-1");
+    await service.setOverride("NGN", { rate: 1350, reason: "market rate for after the hold", ttlHours: 48 }, "admin-2");
+    const entry = store.audit.at(-1)!;
+    assert.equal(entry.action, "override_set");
+    assert.equal(entry.by, "admin-2");
+    assert.deepEqual(entry.old, { rate: 1800, source: "hold" });
+    assert.deepEqual(entry.new, { rate: 1350, source: "manual" });
+    assert.deepEqual(entry.effective, { rate: 1800, source: "hold" });
+    // The hold expires (no audit entry for that); 1350 now prices, and the
+    // trail above shows who chose it and when.
+    clock.advanceHours(7);
+    assert.deepEqual([(await service.getRate("NGN")).rate, (await service.getRate("NGN")).source], [1350, "manual"]);
+  });
+
+  test("with no hold, new and effective are both the override", async () => {
+    const { service, store } = await laggingCbn();
+    await service.setOverride("NGN", { rate: 1350, reason: REASON, ttlHours: 48 }, "a");
+    const entry = store.audit.at(-1)!;
+    assert.deepEqual(entry.new, { rate: 1350, source: "manual" });
+    assert.deepEqual(entry.effective, { rate: 1350, source: "manual" });
+  });
+});
+
+describe("review: a damaged or hand-edited hold is ignored for pricing, flagged, and clearable", () => {
+  const setAt = new Date("2026-11-13T09:00:00Z");
+  const holdFor = (extra: Record<string, unknown>) => ({
+    rate: 1800, reason: REASON, setBy: "a", setAt, expiresAt: new Date(setAt.getTime() + 24 * HOUR), ...extra,
+  });
+
+  test("unreadable hold map: prices as no hold, HOLD_CORRUPT says what prices; DELETE clears it (audited)", async () => {
+    const { service, store } = await laggingCbn();
+    store.docs.set("NGN", { ...store.docs.get("NGN")!, hold: null, holdCorrupt: true });
+    assert.deepEqual([(await service.getRate("NGN")).rate, (await service.getRate("NGN")).source], [1300, "cbn"]);
+    const [row] = await service.adminOverview();
+    assert.equal(row.hold, null);
+    const w = row.warnings.find((x) => x.code === "HOLD_CORRUPT");
+    assert.ok(w, "flagged");
+    assert.match(w!.message, /unreadable.*ignored.*provider rate 1300 \(cbn\)/);
+
+    await service.clearHold("NGN", "remove the damaged hold map", "admin-1");
+    const entry = store.audit.at(-1)!;
+    assert.equal(entry.action, "hold_cleared");
+    assert.equal(entry.holdCorrupt, true);
+    assert.deepEqual([entry.old, entry.new], [{ rate: 1300, source: "cbn" }, { rate: 1300, source: "cbn" }]);
+    assert.equal(store.docs.get("NGN")?.holdCorrupt, undefined);
+    const [after] = await service.adminOverview();
+    assert.equal(after.warnings.length, 0);
+    // Nothing left to clear now.
+    await assert.rejects(service.clearHold("NGN", "again please", "a"), (e) => code(e) === "INVALID_INPUT");
+  });
+
+  test("a hold edited past the plausible range (1e6) does not price; HOLD_INVALID; clearable", async () => {
+    const { service, store } = await laggingCbn();
+    store.docs.set("NGN", { ...store.docs.get("NGN")!, hold: holdFor({ rate: 1_000_000 }) });
+    assert.deepEqual([(await service.getRate("NGN")).rate, (await service.getRate("NGN")).source], [1300, "cbn"]);
+    const [row] = await service.adminOverview();
+    assert.equal(row.hold, null);
+    const w = row.warnings.find((x) => x.code === "HOLD_INVALID");
+    assert.ok(w);
+    assert.match(w!.message, /plausible range 200-5000/);
+    assert.ok(!row.warnings.some((x) => x.code === "HOLD_OUTSIDE_PROVIDER_BAND"), "an ignored hold has no band warning");
+    await service.clearHold("NGN", "remove the hand-edited hold", "a");
+    assert.equal(store.docs.get("NGN")?.hold, null);
+  });
+
+  test("a hold whose expiry is more than 168h after setAt (or from now) does not price; HOLD_INVALID", async () => {
+    const { service, store } = await laggingCbn();
+    store.docs.set("NGN", { ...store.docs.get("NGN")!, hold: holdFor({ expiresAt: new Date(setAt.getTime() + 365 * 24 * HOUR) }) });
+    assert.equal((await service.getRate("NGN")).source, "cbn");
+    let [row] = await service.adminOverview();
+    assert.match(row.warnings.find((x) => x.code === "HOLD_INVALID")!.message, /more than 168h/);
+    // setAt moved into the future to dodge the cap: still caught (from now).
+    store.docs.set("NGN", {
+      ...store.docs.get("NGN")!,
+      hold: holdFor({ setAt: new Date(setAt.getTime() + 300 * HOUR), expiresAt: new Date(setAt.getTime() + 400 * HOUR) }),
+    });
+    assert.equal((await service.getRate("NGN")).source, "cbn");
+    [row] = await service.adminOverview();
+    assert.ok(row.warnings.some((x) => x.code === "HOLD_INVALID"));
+  });
+
+  test("a legitimate 168h hold still prices (cap is inclusive, small clock skew allowed)", async () => {
+    const { service, store, clock } = await laggingCbn();
+    await service.setHold("NGN", { rate: 1800, reason: REASON, ttlHours: 168 }, "a");
+    assert.equal((await service.getRate("NGN")).source, "hold");
+    // Another instance whose clock is 1 minute behind the one that set it.
+    const h = store.docs.get("NGN")!.hold!;
+    store.docs.set("NGN", { ...store.docs.get("NGN")!, hold: { ...h, setAt: new Date(clock.now().getTime() + 60_000), expiresAt: new Date(h.expiresAt.getTime() + 60_000) } });
+    assert.equal((await service.getRate("NGN")).source, "hold");
+    const [row] = await service.adminOverview();
+    assert.ok(!row.warnings.some((x) => x.code === "HOLD_INVALID"));
+  });
+
+  test("a hold left outside its currency's plausible range after the range is narrowed in config is ignored", async () => {
+    const store = memoryRateStore();
+    const clock = fakeClock();
+    store.docs.set("NGN", { currency: "NGN", provider: null, override: null, lastError: null, hold: holdFor({}) });
+    const wide = makeService({ store, clock });
+    assert.equal((await wide.service.getRate("NGN")).source, "hold");
+    // Ops narrows NGN to 1000-1700 (inside the 200-5000 default): 1800 fails.
+    const narrow = makeService({ store, clock, config: { currencies: { NGN: { enabled: true, minRate: 1000, maxRate: 1700 } } } });
+    await assert.rejects(narrow.service.getRate("NGN"), (e) => code(e) === "RATE_UNAVAILABLE");
+    const [row] = await narrow.service.adminOverview();
+    assert.match(row.warnings.find((x) => x.code === "HOLD_INVALID")!.message, /1000-1700.*nothing \(RATE_UNAVAILABLE\)/);
+  });
+});
+
+describe("review: warning texts name the hold when it prices", () => {
+  test("refresh band warning under a hold names the override that prices after it, not the provider rate", async () => {
+    const { service, clock, cbn } = await laggingCbn();
+    await service.setOverride("NGN", { rate: 1350, reason: REASON, ttlHours: 48 }, "a");
+    await service.setHold("NGN", { rate: 1800, reason: REASON, ttlHours: 24 }, "a");
+    clock.advanceHours(1);
+    cbn.result = cbnAt(clock, 1310);
+    const [out] = await quietly(() => service.refreshAll());
+    assert.equal(out.ok, true);
+    assert.match(out.warning ?? "", /held rate 1800 .*then the override 1350 would price/);
+    assert.doesNotMatch(out.warning ?? "", /then the provider rate does/);
+  });
+
+  test("superseded-override overview text says the hold prices first", async () => {
+    const { service, clock, cbn } = makeService();
+    await service.refreshAll();
+    await service.resetReference("NGN", "Genuine devaluation confirmed", "a");
+    await service.setOverride("NGN", { rate: 1050, reason: REASON }, "a");
+    clock.advanceHours(1);
+    cbn.result = cbnAt(clock, 1500);
+    await quietly(() => service.refreshAll());
+    await service.setHold("NGN", { rate: 1600, reason: REASON, ttlHours: 24 }, "a");
+    const [row] = await service.adminOverview();
+    const w = row.warnings.find((x) => x.code === "OVERRIDE_SUPERSEDED");
+    assert.ok(w);
+    assert.match(w!.message, /The held rate 1600 prices until .*; after that, pricing uses the provider rate/);
+    const band = row.warnings.find((x) => x.code === "OVERRIDE_OUTSIDE_PROVIDER_BAND");
+    assert.match(band!.message, /no longer prices \(the held rate 1600 prices until .*then the provider rate does/);
+    // Without the hold the original wording stands.
+    await service.clearHold("NGN", "CBN caught up today", "a");
+    const [plain] = await service.adminOverview();
+    assert.match(plain.warnings.find((x) => x.code === "OVERRIDE_SUPERSEDED")!.message, /\. Pricing uses the provider rate while it is fresh/);
+  });
+});
+
+describe("review: Firestore store and damaged holds / the audit `effective` field", () => {
+  const t0 = new Date("2026-11-13T09:00:00Z");
+  const providerDoc = {
+    rate: 1300, source: "cbn", asOf: Timestamp.fromDate(new Date(t0.getTime() - HOUR)), fetchedAt: Timestamp.fromDate(t0),
+  };
+
+  before(async () => {
+    await installFakes();
+    (firebase.collections as any).exchangeRateAudit = fakeCollection("exchangeRateAudit");
+    (firestoreRateStore as any).runTransaction = fakeRunTransaction;
+  });
+  beforeEach(() => resetStore());
+
+  test("a malformed hold map is read as holdCorrupt; writing hold null clears it", async () => {
+    fakeDocs.set("exchangeRates/NGN", { currency: "NGN", provider: providerDoc, hold: { rate: "1800", setAt: "yesterday" } });
+    const read = await firestoreRateStore.get("NGN");
+    assert.equal(read?.hold, null);
+    assert.equal(read?.holdCorrupt, true);
+    await firestoreRateStore.transact("NGN", () => ({
+      hold: null,
+      audit: { currency: "NGN", action: "hold_cleared", by: "a", at: t0, reason: REASON, old: null, new: null, holdCorrupt: true },
+    }));
+    const after = await firestoreRateStore.get("NGN");
+    assert.equal(after?.holdCorrupt, undefined);
+    const [entry] = await firestoreRateStore.listAudit("NGN", 5);
+    assert.equal(entry.holdCorrupt, true);
+    // A well-formed doc has no flag at all.
+    fakeDocs.set("exchangeRates/USD", { currency: "USD", provider: providerDoc });
+    assert.equal((await firestoreRateStore.get("USD"))?.holdCorrupt, undefined);
+  });
+
+  test("override_set `effective` round-trips, including null", async () => {
+    fakeDocs.set("exchangeRates/NGN", { currency: "NGN", provider: providerDoc });
+    await firestoreRateStore.transact("NGN", () => ({
+      audit: {
+        currency: "NGN", action: "override_set", by: "a", at: t0, reason: REASON,
+        old: { rate: 1800, source: "hold" }, new: { rate: 1350, source: "manual" }, effective: { rate: 1800, source: "hold" },
+      },
+    }));
+    await firestoreRateStore.transact("NGN", () => ({
+      audit: {
+        currency: "NGN", action: "override_set", by: "a", at: new Date(t0.getTime() + 1), reason: REASON,
+        old: null, new: { rate: 1360, source: "manual" }, effective: null,
+      },
+    }));
+    const [latest, first] = await firestoreRateStore.listAudit("NGN", 5);
+    assert.deepEqual([latest.new, latest.effective], [{ rate: 1360, source: "manual" }, null]);
+    assert.deepEqual([first.new, first.effective], [{ rate: 1350, source: "manual" }, { rate: 1800, source: "hold" }]);
   });
 });

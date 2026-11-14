@@ -126,6 +126,14 @@ export interface StoredRate {
    */
   providerCorrupt?: boolean;
   /**
+   * Issue #241 (review): true when a `hold` map exists in storage but cannot
+   * be read (a console edit, a bad migration). `hold` is then null, so
+   * pricing follows the normal rules (override / provider / typed error), but
+   * the admin overview flags it (HOLD_CORRUPT) and DELETE .../hold can clear
+   * the map. Absent means false.
+   */
+  holdCorrupt?: boolean;
+  /**
    * When an admin last asked for a refresh now (issue #214). Used only to
    * rate-limit POST /admin/exchange-rates/:currency/refresh.
    */
@@ -142,8 +150,21 @@ export interface RateAuditEntry {
   reason: string;
   /** The effective rate before the change (null when none existed). */
   old: { rate: number; source: FxRateSource } | null;
-  /** The effective rate after the change (null when none). */
+  /**
+   * The effective rate after the change (null when none). Exception,
+   * override_set: the override the admin entered (`source: "manual"`), so the
+   * rate they typed is always on record even when something else prices
+   * (issue #241 review); the rate really in effect is then in `effective`.
+   */
   new: { rate: number; source: FxRateSource } | null;
+  /**
+   * override_set only (issue #241 review): the rate really in effect right
+   * after the change. Usually the override itself; an active hold outranks
+   * it, and null means nothing usable prices.
+   */
+  effective?: { rate: number; source: FxRateSource } | null;
+  /** hold_cleared only (issue #241 review): the map cleared was unreadable. */
+  holdCorrupt?: boolean;
   /** True when no provider rate existed to check the band against. */
   unreferenced?: boolean;
   /** provider_refresh only: what the refresh did ("ok: cbn 1500" or "failed: ..."). */
