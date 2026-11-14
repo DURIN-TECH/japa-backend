@@ -423,10 +423,24 @@ describe("(#240) the protected re-draft keeps applicability and accepts a harmle
     assert.equal(rep?.replacement.applicability, "specialist");
     assert.deepEqual(rep?.replacement.trigger, original.trigger, "the original's trigger, not whatever the model wrote");
     assert.equal(rep?.replacement.criterionId, original.criterionId);
-    // The replacement's trigger was asked about by BOTH models: after the original's pair of trigger
-    // requests (one per model) each model got a second one for the replacement.
-    const triggerRequests = r.provider.requests.filter((q) => q.user.includes("<triggers_data_"));
-    for (const role of ["verification", "judgement"]) assert.equal(triggerRequests.filter((q) => q.role === role).length, 2, role);
+    // The trigger request is the same text for the original and the replacement (same quote, condition and
+    // trigger), so each model's answer is asked once and reused; both models did judge it.
+    const triggerRoles = new Set(r.provider.requests.filter((q) => q.user.includes("<triggers_data_")).map((q) => q.role));
+    assert.deepEqual([...triggerRoles].sort(), ["judgement", "verification"]);
+  });
+
+  test("the replacement's trigger is still judged by both models: one model's `no` on it fails the replacement (trigger_not_confirmed)", async () => {
+    const r = repairRig();
+    // The original fails on its condition (so a re-draft happens); then the judgement model refuses the trigger.
+    r.provider.policy = unsureGroup;
+    r.provider.triggerPolicy = ({ role }) => (role === "judgement" ? "no" : "yes");
+    r.provider.redraftPolicy = () => redraft("specialist");
+    const out = await r.svc.check(input(draft(barWithTrigger())));
+    assert.equal(out.ok, false);
+    if (!out.ok) {
+      assert.equal(out.protectedFailures?.[0].repair.status, "failed_check");
+      assert.equal(out.protectedFailures?.[0].repair.detail, "trigger_not_confirmed");
+    }
   });
 
   test("the same swap the other way (specialist to conditional) is accepted too", async () => {
