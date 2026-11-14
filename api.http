@@ -293,8 +293,13 @@ Authorization: Bearer {{clientToken}}
 
 ### Resume paying a pending booking (issue #180, the booking's own client only).
 ### Inside the 30-minute lock: the same checkout. After it: a fresh quote and a
-### new checkout. If the current reference was in fact paid (even after the
+### new checkout, issued race-safely (concurrent calls all get the ONE new
+### checkout). If the current reference was in fact paid (even after the
 ### lock, exactly) it is confirmed; a late payment is flagged paidAfterQuoteExpiry.
+### 409 PAYMENT_IN_PROGRESS when Paystack reports the current checkout as not
+### final (ongoing / pending / processing / queued): nothing is re-priced and
+### data carries the current authorizationUrl/reference. 409 CHECKOUT_OPENING
+### when another request is opening the checkout right now (try again).
 POST {{baseUrl}}/consultations/{{consultationId}}/checkout
 Authorization: Bearer {{clientToken}}
 
@@ -318,9 +323,18 @@ Content-Type: application/json
 ### (booking stays pending, nothing recorded). An exact payment that landed
 ### after the 30-minute lock is still confirmed (200) and flagged
 ### paidAfterQuoteExpiry on the booking and transaction for review.
-### 409 QUOTE_EXPIRED only for an UNPAID booking past its lock: data has a fresh
-### authorizationUrl/reference. A reference that is not the booking's current
-### one (a superseded checkout) is 400 and logged.
+### The amount compared is Paystack's requested_amount when reported (fees
+### passed to the customer inflate amount), else amount.
+### 409 QUOTE_EXPIRED only for an UNPAID booking past its lock whose checkout
+### Paystack reports failed/abandoned: data has a fresh authorizationUrl/reference.
+### 409 PAYMENT_IN_PROGRESS when Paystack reports it not final: nothing re-priced.
+### SUPERSEDED references (booking.supersededCheckouts, each with its own
+### snapshot): an exact payment settles a still-unpaid booking at that price
+### (paidOnSupersededReference); on a booking already paid it is recorded in
+### consultationPaymentExceptions for refund: 200 { verified, refundPending: true },
+### no second transaction. Unpaid superseded: 409 CHECKOUT_REPLACED with the
+### current checkout. A reference that was never this booking's is 400 and logged.
+### 502 BILLING_PROVIDER_ERROR when Paystack fails while re-pricing.
 POST {{baseUrl}}/consultations/public/verify
 Content-Type: application/json
 
