@@ -1,6 +1,7 @@
 import { FEATURES, hasFeature, type Entitlements } from "@durin-tech/authz";
 import { Timestamp } from "firebase-admin/firestore";
 import { collections } from "../utils/firebase";
+import { isSelfServiceApplication } from "../utils/self-service";
 import type { Application } from "../types";
 import type { ApplicationAssessment, AssessmentErrorCode } from "../types/assessment";
 import { aiCaseOfficerService } from "./ai-case-officer.service";
@@ -276,6 +277,61 @@ export class AssessmentAutoRunService {
       });
     } catch (err) {
       console.error(`[auto-run] notify failed for ${assessmentId}: ${(err as Error).name}`);
+    }
+  }
+
+  /**
+   * Issue #266: after the worker finished a job, tell a SELF-SERVICE applicant
+   * (no agent, no agency) that their readiness review is ready. Sibling of
+   * `notifyIfNew`, which only ever speaks to the assigned agent.
+   *
+   * Rules, in order:
+   *   - only a `succeeded` assessment of a self-service application (the agent
+   *     path above is untouched, and an agent case never reaches the applicant);
+   *   - a run whose readiness band AND finding set equal the previous succeeded
+   *     assessment's says nothing (a re-run after an unrelated upload is not news).
+   *     The first succeeded assessment always notifies;
+   *   - one claim per assessment (`{id}_applicant`, created with `create()`), so a
+   *     duplicate trigger delivery sends nothing.
+   *
+   * NEVER throws and never touches the stored assessment. The copy is neutral on
+   * purpose, like `notifyIfNew`: no finding text, no score, nothing from a
+   * document, and the word "case" is for agents, so it is not used here.
+   * No `actionUrl`: the applicant is on mobile (tap routing uses
+   * relatedEntityId), and the email carries no web link (see event-templates).
+   */
+  async notifyApplicantIfReady(assessmentId: string): Promise<void> {
+    try {
+      const cur = await aiCaseOfficerService.getById(assessmentId);
+      if (!cur || cur.status !== "succeeded") return;
+      const app = await loadApplication(cur.applicationId);
+      if (!app || !isSelfServiceApplication(app)) return;
+
+      // Same band and same findings as last time: nothing new to say.
+      const previous = await this.previousSucceeded(cur);
+      if (previous && previous.readiness === cur.readiness && findingSignature(previous) === findingSignature(cur)) return;
+
+      // One claim per assessment: `create()` fails if a duplicate delivery got here first.
+      try {
+        await collections.assessmentNotifications.doc(`${assessmentId}_applicant`).create({
+          applicationId: cur.applicationId,
+          userId: app.userId,
+          createdAt: Timestamp.now(),
+        });
+      } catch {
+        return;
+      }
+
+      await notificationService.notifyUser({
+        userId: app.userId,
+        type: "readiness_review_ready",
+        title: "Your readiness review is ready",
+        body: "We’ve looked over your application and your review is ready. Open the Seli app to see it.",
+        relatedEntityType: "application",
+        relatedEntityId: app.id,
+      });
+    } catch (err) {
+      console.error(`[auto-run] applicant notify failed for ${assessmentId}: ${(err as Error).name}`);
     }
   }
 

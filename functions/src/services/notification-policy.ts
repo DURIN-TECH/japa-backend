@@ -17,6 +17,8 @@ const APP_ONLY: NotificationChannel[] = ["in_app", "push"];
  * Follow-up nudges that exist BECAUSE the in-app/push channels went unnoticed.
  * Re-delivering to those channels would be pure noise, so email is the only one.
  */
+/** Good news that needs no interruption: the inbox record only, no push, no email. */
+const IN_APP_ONLY: NotificationChannel[] = ["in_app"];
 const EMAIL_ONLY: NotificationChannel[] = ["email"];
 
 export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChannel[]> = {
@@ -30,6 +32,14 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   assessment_rules_updated: FULL,
   // Approved rule / published-detail change on a route with in-flight cases (#123).
   rule_change_alert: FULL,
+  // Self-service applicant notices (#266). The readiness review is the one
+  // moment worth an email too (the applicant may not have the app open). Document
+  // checks are frequent (one per upload), so problems and "could not check" are
+  // in-app + push only, and a pass is a quiet inbox line: no push, no email.
+  readiness_review_ready: FULL,
+  document_check_problems: APP_ONLY,
+  document_check_could_not_check: APP_ONLY,
+  document_check_passed: IN_APP_ONLY,
   // Documents
   document_status: FULL,
   document_uploaded: FULL,

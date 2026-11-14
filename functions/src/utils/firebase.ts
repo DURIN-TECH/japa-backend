@@ -383,6 +383,10 @@ export const collections = {
   // /applications/:id/document-checks routes, tier-trimmed. Backend-only: no
   // firestore.rules match, so clients are denied.
   documentChecks: db.collection("documentChecks"),
+  // One-per-check-run applicant notification claims (issue #266), id =
+  // `{documentId}_{requestedAt millis}`. Created with `create()`, so a duplicate
+  // trigger delivery cannot notify twice while a retry (new requestedAt) can. Backend-only.
+  documentCheckNotifications: db.collection("documentCheckNotifications"),
   // Per-day counters that bound the cost of document checks (issue #115):
   // `documentCheckCaps/{applicationId|userId}__{YYYY-MM-DD}` -> { count }.
   // Backend-only, same as above.
