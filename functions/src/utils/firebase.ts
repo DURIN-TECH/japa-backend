@@ -165,6 +165,11 @@ export const collections = {
   //   register, edit and removal (never updated or deleted).
   // - sourceRegistryRateLimits/{uid}__{kind}__{hour}: per-admin hourly counters.
   officialDomains: db.collection("officialDomains"),
+  // Entry-requirement rows ("does this nationality need a visa for that
+  // country", read by eligibility preCheck). Referenced here so the #239
+  // migration can list and delete the retired seed row; the eligibility service
+  // keeps its own handle on the same collection.
+  visaExemptions: db.collection("visaExemptions"),
   officialDomainPreviews: db.collection("officialDomainPreviews"),
   sourceRegistryAudit: db.collection("sourceRegistryAudit"),
   sourceRegistryRateLimits: db.collection("sourceRegistryRateLimits"),
