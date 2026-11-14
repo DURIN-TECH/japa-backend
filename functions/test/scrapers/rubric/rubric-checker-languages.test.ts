@@ -73,13 +73,15 @@ describe("the prompts say a quote may be in any language", () => {
 
   test("the versions moved: no stored verdict of an older prompt is reused", () => {
     assert.notEqual(CHECKER_PROMPT_VERSION, "2026-11-checker-v3");
+    assert.notEqual(CHECKER_PROMPT_VERSION, "2026-11-checker-v4", "differs from both v4 prompts (#220 and #226)");
+    assert.match(CHECKER_SYSTEM_PROMPT, /Answer `na` when the rule's `kind` is `mandatory_bar`/, "#226 wording kept");
     assert.notEqual(QUESTION_CHECK_PROMPT_VERSION, "question-check-2026-11-13.1");
   });
 
   // Pins (additive, like the extraction prompt's): changing a prompt without a bump fails here.
   test("the check prompts and schema match the hash pinned for their version", () => {
     const PINNED: Record<string, string> = {
-      "2026-11-checker-v4": sha(`${CHECKER_SYSTEM_PROMPT}\n${JSON.stringify(buildVerdictSchema())}\n${CHECKER_POLARITY_SYSTEM_PROMPT}`),
+      "2026-11-checker-v5": sha(`${CHECKER_SYSTEM_PROMPT}\n${JSON.stringify(buildVerdictSchema())}\n${CHECKER_POLARITY_SYSTEM_PROMPT}`),
     };
     // The literal below is the hash at the time of the bump; recompute and re-pin ONLY with a version bump.
     assert.equal(PINNED[CHECKER_PROMPT_VERSION], CHECKER_PINNED_HASH);
@@ -88,8 +90,8 @@ describe("the prompts say a quote may be in any language", () => {
   });
 });
 
-// Pinned at the #220 bump. Another change to these prompts (for example #226's stage wording) needs its own version bump and a new pin here.
-const CHECKER_PINNED_HASH = "e85de44afd19677eb2de7cd85fd198a143229a503b0e394628ee3a19b9e65437";
+// Pinned at the #220 bump. v5 is #220's language wording merged with #226's bar-stage wording. Another change to these prompts needs its own version bump and a new pin here.
+const CHECKER_PINNED_HASH = "894d66bb1f58bd6250c6a00627ad325b333adf280346737220f93d54a0aa2d8b";
 const QUESTION_PINNED_HASH: Record<string, string> = { "question-check-2026-11-14.1": "9ac4afe53da9d37bc3331164ec2e4ce41d37f8e4b5e8466654e09dc82f42509b" };
 
 describe("the rule check over a Spanish rule", () => {

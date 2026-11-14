@@ -21,8 +21,12 @@
 //    draft / pending / rejected -> 400; B on A's agency-only visa -> 404;
 //    unknown visa -> 404; hidden global (pending scraped) -> 404;
 //  - per agency: a visa made global gets independent prices from A and B;
-//  - authz: owner + agent OK; admin, client, client with agencyId, agent
-//    without agency -> 403; unauthenticated -> 401;
+//  - authz (issue #227: only owners and admins price): owner + admin
+//    (naming the agency with ?agencyId=) set / clear; a member agent reads
+//    but gets 403 on PUT / DELETE with nothing written; the owner or agent
+//    of another agency, a client (with or without an agencyId), an agent
+//    without agency -> 403; admin without / with an unknown agencyId -> 400
+//    / 404; unauthenticated -> 401;
 //  - reads: own approved + priced visas, include=global, stale prices hidden;
 //  - public agency page: `visaPrices` only with this agency's prices, `[]`
 //    when none, no auth;
@@ -35,7 +39,8 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import express from "express";
 import { Timestamp } from "firebase-admin/firestore";
-import { ROLES, defineAbilitiesFor } from "@durin-tech/authz";
+import { AGENCY_VISA_SOURCE, ROLES, defineAbilitiesFor } from "@durin-tech/authz";
+import { asSubject } from "../../src/middleware/authz";
 
 import { clone, fakeCollection, fakeRunTransaction, installFakes, resetStore, store, writes } from "../helpers/fake-firestore";
 import type { Data } from "../helpers/fake-firestore";
@@ -133,12 +138,14 @@ function seedBase(): void {
     createdAt: T0,
     updatedAt: T0,
   });
-  for (const [id, slug] of [[AGENCY_A, "acme"], [AGENCY_B, "bravo"]]) {
+  // ownerId matches the ownerA() / ownerB() principals below, so the
+  // owner-only pricing check (getOwnedAgencyForPrincipal, issue #227) passes.
+  for (const [id, slug, ownerId] of [[AGENCY_A, "acme", "uid-owner-a"], [AGENCY_B, "bravo", "uid-owner-b"]]) {
     store.set(`agencies/${id}`, {
       id,
       slug,
       name: `Agency ${slug}`,
-      ownerId: `uid-owner-${id}`,
+      ownerId,
       ownerName: "Owner",
       services: [],
       totalAgents: 1,
@@ -342,22 +349,24 @@ describe("set, change and clear", () => {
     assert.deepEqual(store.get(visaPath(id)), before);
   });
 
-  test("an agent of the agency can set and change the price; createdAt is kept", async () => {
+  // Issue #227: this used to be the member agent; pricing is now owner /
+  // admin only, so the owner changes an existing (migrated) price here.
+  test("the owner can change an existing price; createdAt is kept", async () => {
     const id = seedGlobal("uk-student");
     store.set(pricePath(AGENCY_A, id), {
       id: `${CC}__${id}`, agencyId: AGENCY_A, visaTypeId: id, countryCode: CC,
       // A doc still holding an old naira `price` plus its migration audit.
       price: 1000, migratedFrom: { price: { amount: 1000, currency: "NGN", rate: 1500 } },
-      updatedBy: "uid-owner-a", createdAt: T0, updatedAt: T0,
+      updatedBy: "uid-someone-else", createdAt: T0, updatedAt: T0,
     });
-    const r = await setPrice(agentA(), id, usdBody(2000));
+    const r = await setPrice(ownerA(), id, usdBody(2000));
     assert.equal(r.status, 200);
     const stored = store.get(pricePath(AGENCY_A, id)) as any;
     assert.deepEqual(stored.priceUsd, usd(2000));
     // Replace, not shadow: the naira price is gone, the audit kept.
     assert.equal("price" in stored, false);
     assert.equal(stored.migratedFrom.price.amount, 1000);
-    assert.equal(stored.updatedBy, "uid-agent-a");
+    assert.equal(stored.updatedBy, "uid-owner-a");
     assert.equal(stored.createdAt.toMillis(), T0.toMillis());
     assert.equal(stored.updatedAt.toMillis(), T1.toMillis());
   });
@@ -493,9 +502,9 @@ describe("prices are per agency", () => {
 // ============================================
 
 describe("authz", () => {
-  test("admin, client, a client whose token carries an agencyId, and an agent without agency: 403", async () => {
+  test("client, a client whose token carries an agencyId, and an agent without agency: 403", async () => {
     const id = seedGlobal("uk-student");
-    for (const who of [admin(), client(), principal("uid-c", ROLES.CLIENT, AGENCY_A), agentNoAgency()]) {
+    for (const who of [client(), principal("uid-c", ROLES.CLIENT, AGENCY_A), agentNoAgency()]) {
       assert.equal((await list(who)).status, 403, who.authz.role);
       assert.equal((await setPrice(who, id, usdBody(1))).status, 403, who.authz.role);
       assert.equal((await clearPrice(who, id)).status, 403, who.authz.role);
@@ -511,6 +520,127 @@ describe("authz", () => {
     assert.deepEqual(a.body.data, []);
     const withGlobal = await list(ownerA(), { include: "global" });
     assert.equal(withGlobal.body.data.find((v: any) => v.visaTypeId === id).priceUsd, null);
+  });
+
+  // ------------------------------------------
+  // Issue #227: only owners and admins set or clear prices
+  // ------------------------------------------
+  describe("pricing is owner / admin only (issue #227)", () => {
+    /** Handler call with an explicit query (admins name the agency there). */
+    const putQ = (who: Principal, id: string, body: unknown, query: Data) =>
+      call(C.set.bind(C), who, { params: { countryCode: CC, visaTypeId: id }, body, query });
+    const delQ = (who: Principal, id: string, query: Data) =>
+      call(C.clear.bind(C), who, { params: { countryCode: CC, visaTypeId: id }, query });
+    /** A member agent of agency B. */
+    const agentB = () => principal("uid-agent-b", ROLES.AGENT, AGENCY_B);
+    /** Writes to any price doc (must stay empty for a refused caller). */
+    const priceWrites = () => writes.filter((w) => w.path.includes("/visaPrices/"));
+
+    test("the owner sets (PUT) and clears (DELETE) a price: 200", async () => {
+      const id = seedGlobal("uk-student");
+      const put = await setPrice(ownerA(), id, usdBody(5000));
+      assert.equal(put.status, 200);
+      assert.deepEqual((store.get(pricePath(AGENCY_A, id)) as any).priceUsd, usd(5000));
+      const del = await clearPrice(ownerA(), id);
+      assert.equal(del.status, 200);
+      assert.equal(store.get(pricePath(AGENCY_A, id)), undefined);
+      // Naming their own agency in the query is fine too.
+      assert.equal((await putQ(ownerA(), id, usdBody(1), { agencyId: AGENCY_A })).status, 200);
+    });
+
+    test("an admin naming the agency (?agencyId=) reads, sets and clears its prices: 200", async () => {
+      const id = seedGlobal("uk-student");
+      const put = await putQ(admin(), id, usdBody(4200), { agencyId: AGENCY_A });
+      assert.equal(put.status, 200);
+      const stored = store.get(pricePath(AGENCY_A, id)) as any;
+      assert.deepEqual(stored.priceUsd, usd(4200));
+      assert.equal(stored.updatedBy, "uid-admin");
+      // Written under agency A only.
+      assert.equal(store.get(pricePath(AGENCY_B, id)), undefined);
+      const read = await list(admin(), { agencyId: AGENCY_A });
+      assert.equal(read.status, 200);
+      assert.deepEqual(read.body.data.find((v: any) => v.visaTypeId === id).priceUsd, usd(4200));
+      // PUT null and DELETE both clear.
+      assert.equal((await putQ(admin(), id, { priceUsd: null }, { agencyId: AGENCY_A })).status, 200);
+      await putQ(admin(), id, usdBody(1), { agencyId: AGENCY_A });
+      assert.equal((await delQ(admin(), id, { agencyId: AGENCY_A })).status, 200);
+      assert.equal(store.get(pricePath(AGENCY_A, id)), undefined);
+    });
+
+    test("an admin without a usable agencyId gets 400, an unknown agency 404; nothing written", async () => {
+      const id = seedGlobal("uk-student");
+      for (const query of [{}, { agencyId: "" }, { agencyId: "a/b" }, { agencyId: [AGENCY_A, AGENCY_B] }]) {
+        assert.equal((await putQ(admin(), id, usdBody(1), query)).status, 400, JSON.stringify(query));
+        assert.equal((await delQ(admin(), id, query)).status, 400, JSON.stringify(query));
+        assert.equal((await call(C.list.bind(C), admin(), { query })).status, 400, JSON.stringify(query));
+      }
+      assert.equal((await putQ(admin(), id, usdBody(1), { agencyId: "no-such-agency" })).status, 404);
+      assert.equal((await delQ(admin(), id, { agencyId: "no-such-agency" })).status, 404);
+      assert.deepEqual(writes, []);
+    });
+
+    test("a member agent can read the list but PUT, PUT null and DELETE are 403 with nothing written", async () => {
+      const id = seedGlobal("uk-student");
+      await setPrice(ownerA(), id, usdBody(3000));
+      const before = clone(store.get(pricePath(AGENCY_A, id)));
+      writes.length = 0;
+
+      // Reads unchanged for member agents (the start-case picker needs them).
+      const read = await list(agentA());
+      assert.equal(read.status, 200);
+      assert.deepEqual(read.body.data.find((v: any) => v.visaTypeId === id).priceUsd, usd(3000));
+
+      const put = await setPrice(agentA(), id, usdBody(1));
+      assert.equal(put.status, 403);
+      assert.equal(put.body.error, "FORBIDDEN");
+      assert.equal((await setPrice(agentA(), id, { priceUsd: null })).status, 403);
+      assert.equal((await clearPrice(agentA(), id)).status, 403);
+      // A brand-new price is refused too.
+      assert.equal((await setPrice(agentA(), seedGlobal("uk-visitor"), usdBody(1))).status, 403);
+
+      assert.deepEqual(priceWrites(), []);
+      assert.deepEqual(store.get(pricePath(AGENCY_A, id)), before);
+    });
+
+    test("a token claiming owner of A whose agency record names someone else is 403 on writes", async () => {
+      const id = seedGlobal("uk-student");
+      const fakeOwner = principal("uid-not-the-owner", ROLES.OWNER, AGENCY_A);
+      assert.equal((await setPrice(fakeOwner, id, usdBody(1))).status, 403);
+      assert.equal((await clearPrice(fakeOwner, id)).status, 403);
+      assert.deepEqual(writes, []);
+    });
+
+    test("the owner or an agent of another agency can't address agency A: 403, nothing written", async () => {
+      const id = seedGlobal("uk-student");
+      for (const who of [ownerB(), agentB()]) {
+        const q = { agencyId: AGENCY_A };
+        assert.equal((await call(C.list.bind(C), who, { query: q })).status, 403, who.authz.uid);
+        assert.equal((await putQ(who, id, usdBody(1), q)).status, 403, who.authz.uid);
+        assert.equal((await delQ(who, id, q)).status, 403, who.authz.uid);
+      }
+      // Without the query, agent B still can't price (its own agency, member only).
+      assert.equal((await setPrice(agentB(), id, usdBody(1))).status, 403);
+      assert.deepEqual(writes, []);
+    });
+
+    test("a client (with or without an agencyId, even naming one) is 403 on PUT and DELETE", async () => {
+      const id = seedGlobal("uk-student");
+      for (const who of [client(), principal("uid-c", ROLES.CLIENT, AGENCY_A)]) {
+        assert.equal((await setPrice(who, id, usdBody(1))).status, 403);
+        assert.equal((await clearPrice(who, id)).status, 403);
+        assert.equal((await putQ(who, id, usdBody(1), { agencyId: AGENCY_A })).status, 403);
+      }
+      assert.deepEqual(writes, []);
+    });
+
+    test("the shared CASL Visa rule is unchanged: an agent may still update the agency's visas (#106)", () => {
+      // Pricing adds its own owner check; the #98 grant agents rely on to
+      // create / edit agency visas is not narrowed.
+      const ability = agentA().ability as any;
+      const probe = asSubject("Visa", { ownerAgencyId: AGENCY_A, source: AGENCY_VISA_SOURCE });
+      assert.equal(ability.can("update", probe), true);
+      assert.equal(ability.can("create", probe), true);
+    });
   });
 
   describe("unauthenticated (real router over HTTP)", () => {

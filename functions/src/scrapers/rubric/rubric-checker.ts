@@ -65,6 +65,7 @@ import { REPAIR_WINDOW_CHARS, ruleHashOf } from "./rubric-repair";
 //   ordinary, all applicable aspects yes, others na/yes        -> keep
 //   ordinary, an applicable aspect no / unsure / na            -> leave out `checker:<first failing aspect>`
 //   ordinary, a not-applicable aspect no / unsure              -> leave out `checker:<that aspect>`
+//   a mandatory_bar, `stage_right` whatever the answer (#226)  -> not judged: cannot hold, cannot pass for it
 //   ordinary, its quote cannot be found in its cited snapshot  -> leave out `checker:source_text`
 //   protected, both models pass every aspect                   -> keep
 //   protected, either model fails an aspect / disagrees        -> HOLD
@@ -137,23 +138,54 @@ export type RuleAction = { action: "keep" } | { action: "leave_out"; aspect: Che
  * Title, kind and stage always apply; the others only when the rule has the
  * field they judge.
  */
-export function applicableAspects(rule: Pick<AssessmentCriterion, "applicability" | "applicabilityCondition" | "check" | "appliesTo">): ReadonlySet<CheckerAspect> {
+export function applicableAspects(rule: RuleShape): ReadonlySet<CheckerAspect> {
   const set = new Set<CheckerAspect>(["title_faithful", "kind_right", "stage_right"]);
   if (rule.applicability !== undefined || rule.applicabilityCondition !== undefined) set.add("condition_faithful");
   if (rule.check !== undefined) set.add("check_faithful");
   if (rule.appliesTo !== undefined) set.add("group_matches_codes");
+  // (#226) A mandatory bar's stage is not judged: see `unjudgedAspects`.
+  for (const a of unjudgedAspects(rule)) set.delete(a);
   return set;
+}
+
+/** The rule fields the aspect tables read. `kind` is optional so a bare field list still works. */
+type RuleShape = Pick<AssessmentCriterion, "applicability" | "applicabilityCondition" | "check" | "appliesTo"> & { kind?: AssessmentCriterion["kind"] };
+
+/**
+ * (#226) Aspects that are NEVER judged for a rule: whatever a model answers
+ * there (yes, no, unsure, na) can neither pass nor fail the rule.
+ *
+ * A mandatory bar's `stage` is only a label. The stage is read for ORDERING
+ * alone (the order the assessment applies rules in, and the order of the
+ * intake questions); a bar is decided by code from the applicant's group
+ * whatever its stage, and nothing branches on it. A sentence that says a named
+ * group "cannot be given permission" does not clearly belong to any of the four
+ * stage definitions, so a careful model honestly answers `unsure`, and that
+ * `unsure` held a rulebook over a label that changes no outcome. So for bars
+ * the prompt tells the model to answer `na` for the stage, and code ignores the
+ * aspect even if a model answers something else (a stray answer cannot hold).
+ *
+ * Deliberately narrow: ONLY `stage_right`, ONLY for kind `mandatory_bar`. Every
+ * other aspect of a bar, and every aspect of every other rule (including a
+ * non-bar rule scoped to named countries, whose stage still orders and groups
+ * its questions), is judged exactly as before. `unsure` still fails everywhere
+ * it is judged.
+ */
+export function unjudgedAspects(rule: { kind?: AssessmentCriterion["kind"] }): ReadonlySet<CheckerAspect> {
+  return rule.kind === "mandatory_bar" ? new Set<CheckerAspect>(["stage_right"]) : new Set<CheckerAspect>();
 }
 
 /**
  * The first aspect (in fixed order) a row fails for a rule, or null when it
  * passes. Applicable: only `yes` passes (`na` there is "not verified" and
  * fails like `unsure`). Not applicable: `na` and `yes` pass; `no` and `unsure`
- * fail (a doubt the model raised is never ignored).
+ * fail (a doubt the model raised is never ignored). Never judged (#226): skipped.
  */
-export function failedAspect(rule: Parameters<typeof applicableAspects>[0], row: VerdictRow): CheckerAspect | null {
+export function failedAspect(rule: RuleShape, row: VerdictRow): CheckerAspect | null {
   const applicable = applicableAspects(rule);
+  const unjudged = unjudgedAspects(rule);
   for (const a of CHECKER_ASPECTS) {
+    if (unjudged.has(a)) continue;
     const v = row[a];
     if (applicable.has(a) ? v !== "yes" : v === "no" || v === "unsure") return a;
   }
@@ -165,8 +197,9 @@ export function failedAspect(rule: Parameters<typeof applicableAspects>[0], row:
  * fixed order (the held report and the re-draft are told all of them, not just
  * the first). A missing row fails the first aspect, like `judgeRule` treats it.
  */
-export function failedAspectsOf(rule: Parameters<typeof applicableAspects>[0], ...rows: (VerdictRow | undefined)[]): CheckerAspect[] {
+export function failedAspectsOf(rule: RuleShape, ...rows: (VerdictRow | undefined)[]): CheckerAspect[] {
   const failed = new Set<CheckerAspect>();
+  const unjudged = unjudgedAspects(rule);
   for (const row of rows) {
     if (!row) {
       failed.add(CHECKER_ASPECTS[0]);
@@ -174,6 +207,7 @@ export function failedAspectsOf(rule: Parameters<typeof applicableAspects>[0], .
     }
     const applicable = applicableAspects(rule);
     for (const a of CHECKER_ASPECTS) {
+      if (unjudged.has(a)) continue;
       const v = row[a];
       if (applicable.has(a) ? v !== "yes" : v === "no" || v === "unsure") failed.add(a);
     }

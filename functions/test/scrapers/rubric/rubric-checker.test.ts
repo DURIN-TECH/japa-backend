@@ -37,7 +37,7 @@ import {
   parseVerdicts,
   type VerdictRow,
 } from "../../../src/scrapers/rubric/rubric-checker-prompt";
-import { CHECKER_START_DEADLINE_MS, RubricCheckerService, applicableAspects, decidePolarity, estimateCheckerLoad, failedAspect, judgeRule } from "../../../src/scrapers/rubric/rubric-checker";
+import { CHECKER_START_DEADLINE_MS, RubricCheckerService, applicableAspects, decidePolarity, estimateCheckerLoad, failedAspect, failedAspectsOf, unjudgedAspects, judgeRule } from "../../../src/scrapers/rubric/rubric-checker";
 import { resolvePublishSettings, parsePublishSettingsPatch, DEFAULT_CHECKER_CAPS } from "../../../src/scrapers/rubric/rubric-publish-settings";
 import { SnapshotQuoteIndex } from "../../../src/scrapers/rubric/rubric-quote";
 import { AI_MODELS } from "../../../src/services/ai/ai-models";
@@ -118,6 +118,49 @@ describe("verdict -> action table", () => {
 
   test("ordinary: the FIRST failing aspect in the fixed order is recorded", () => {
     assert.equal(failedAspect(ordinary, row({ stage_right: "no", title_faithful: "unsure" })), "title_faithful");
+  });
+
+  // ---- (#226) a mandatory bar's stage is not judged ----
+
+  test("(#226) a bar's `stage_right` is not applicable and is ignored whatever the model answers", () => {
+    assert.ok(!applicableAspects(bar).has("stage_right"), "not an aspect a bar must be `yes` on");
+    assert.deepEqual([...unjudgedAspects(bar)], ["stage_right"]);
+    for (const v of ["yes", "no", "unsure", "na"] as const) {
+      assert.equal(failedAspect(bar, row({ stage_right: v, group_matches_codes: "yes" })), null, `stage_right=${v}`);
+      // A bar confirmed by both models whatever either says about its stage.
+      assert.deepEqual(judgeRule(bar, { verification: row({ group_matches_codes: "yes", stage_right: v }), judgement: row({ group_matches_codes: "yes", stage_right: v }) }), { action: "keep" }, `stage_right=${v}`);
+      assert.deepEqual(failedAspectsOf(bar, row({ group_matches_codes: "yes", stage_right: v })), []);
+    }
+  });
+
+  test("(#226) the first real failure: bar, judgement model `unsure` on stage only, all else yes from both -> keep", () => {
+    const yes = row({ group_matches_codes: "yes" });
+    assert.deepEqual(judgeRule(bar, { verification: yes, judgement: { ...yes, stage_right: "unsure" } }), { action: "keep" });
+  });
+
+  test("(#226) a bar that fails ANY other aspect still holds, from either model, with `unsure` still a failure", () => {
+    const yes = row({ group_matches_codes: "yes" });
+    for (const aspect of CHECKER_ASPECTS.filter((a) => a !== "stage_right")) {
+      for (const bad of ["no", "unsure"] as const) {
+        const b = barOf(3, { check: aspect === "check_faithful" ? { field: "x.y", op: "gte", value: 3 } : undefined });
+        // Not every aspect "applies" to the fixture bar: a doubt on a non-applicable one fails too, so every aspect is covered.
+        assert.deepEqual(judgeRule(b, { verification: { ...yes, check_faithful: aspect === "check_faithful" ? "yes" : "na", [aspect]: bad }, judgement: yes }), { action: "hold", aspect }, `verification ${aspect}=${bad}`);
+        assert.deepEqual(judgeRule(b, { verification: { ...yes, check_faithful: aspect === "check_faithful" ? "yes" : "na" }, judgement: { ...yes, check_faithful: aspect === "check_faithful" ? "yes" : "na", [aspect]: bad } }), { action: "hold", aspect }, `judgement ${aspect}=${bad}`);
+      }
+    }
+    // A stray stage answer next to a real failure does not hide the real one, and is not listed with it.
+    assert.deepEqual(failedAspectsOf(bar, row({ stage_right: "no", kind_right: "unsure", group_matches_codes: "yes" })), ["kind_right"]);
+  });
+
+  test("(#226) NOT widened: a rule that is not a mandatory bar is still judged on its stage, `unsure` included, scoped to named groups or not", () => {
+    const scoped = ruleOf(7, { kind: "judgement", appliesTo: { nationalities: ["QM"], asWritten: ["Group One"] } });
+    assert.deepEqual([...unjudgedAspects(scoped)], []);
+    for (const r of [ordinary, objective, scoped]) {
+      assert.ok(applicableAspects(r).has("stage_right"));
+      for (const bad of ["no", "unsure", "na"] as const) assert.equal(failedAspect(r, row({ stage_right: bad, group_matches_codes: "yes" })), "stage_right", `${r.criterionId} ${bad}`);
+    }
+    // Protected (scoped) non-bar: one model's `unsure` on stage still holds.
+    assert.deepEqual(judgeRule(scoped, { verification: row({ group_matches_codes: "yes" }), judgement: row({ group_matches_codes: "yes", stage_right: "unsure" }) }), { action: "hold", aspect: "stage_right" });
   });
 
   test("ordinary with no verdict is never 'faithful'", () => {
@@ -239,6 +282,50 @@ describe("check: keep, leave out, hold", () => {
     if (!out.ok) return;
     assert.equal(out.leftOut.length, 12);
     for (const l of out.leftOut) assert.deepEqual(Object.keys(l).sort(), ["criterionId", "reason"]);
+  });
+
+  test("(#226) a bar with `unsure` / `no` on its stage from EITHER model and yes on everything else is confirmed, through the whole check", async () => {
+    for (const [verification, judgement] of [[undefined, "unsure"], ["unsure", undefined], ["no", "no"], ["unsure", "unsure"], ["na", "na"]] as const) {
+      const r = rig();
+      r.provider.policy = ({ role, rule }) => {
+        if (!rule.appliesTo) return undefined;
+        const v = role === "verification" ? verification : judgement;
+        return v ? { stage_right: v } : undefined;
+      };
+      const out = await r.svc.check(input(rubricOf([...rules(12), barOf(30)], PROPOSAL)));
+      assert.equal(out.ok, true, `${verification}/${judgement}`);
+      // No repair was needed or attempted: the stage did not fail the bar.
+      if (out.ok) assert.equal(out.repairs, undefined);
+      assert.equal(r.provider.requests.filter((q) => !(q.schema as any).properties.verdicts && !(q.schema as any).properties.answer).length, 0, "no re-draft request");
+    }
+  });
+
+  test("(#226) a bar failing any OTHER aspect still holds even when its stage is `yes`; a non-bar protected rule with `unsure` on stage still holds", async () => {
+    const other = rig();
+    other.provider.policy = ({ role, rule }) => (rule.appliesTo && role === "judgement" ? { kind_right: "unsure" } : undefined);
+    const a = await other.svc.check(input(rubricOf([...rules(12), barOf(30)], PROPOSAL)));
+    assert.equal(a.ok, false);
+    if (!a.ok) assert.deepEqual(a.protectedFailures?.[0].failedAspects, ["kind_right"]);
+
+    const scoped = rig();
+    scoped.provider.policy = ({ role, rule }) => (rule.appliesTo && role === "judgement" ? { stage_right: "unsure" } : undefined);
+    const b = await scoped.svc.check(input(rubricOf([...rules(12), barOf(30, { kind: "judgement" })], PROPOSAL)));
+    assert.equal(b.ok, false, "a rule scoped to named groups but not a bar keeps its stage check");
+    if (!b.ok) assert.deepEqual(b.protectedFailures?.[0].failedAspects, ["stage_right"]);
+
+    // An ordinary rule with `unsure` on stage is still left out.
+    const ord = rig();
+    ord.provider.policy = ({ rule }) => (rule.title === "Matter 4" ? { stage_right: "unsure" } : undefined);
+    const c = await ord.svc.check(input(rubricOf(rules(12), PROPOSAL)));
+    assert.equal(c.ok, true);
+    if (c.ok) assert.deepEqual(c.leftOut, [{ criterionId: "crit-0004", reason: "checker:stage_right" }]);
+  });
+
+  test("(#226) the prompt version is bumped (stored v3 answers are not reused), and the prompt tells the model `na` for a bar's stage", () => {
+    assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v5");
+    assert.match(CHECKER_SYSTEM_PROMPT, /Answer `na` when the rule's `kind` is `mandatory_bar`/);
+    // The answer shape is unchanged: the same six aspects, the same closed verdicts (`na` is already one).
+    assert.deepEqual([...CHECKER_ASPECTS], ["title_faithful", "kind_right", "stage_right", "condition_faithful", "check_faithful", "group_matches_codes"]);
   });
 
   test("a protected rule that fails is a HOLD, never in leftOut; (#223) the ordinary rules are STILL checked and the one repair says it cannot be repaired", async () => {

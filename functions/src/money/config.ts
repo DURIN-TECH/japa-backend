@@ -1,6 +1,7 @@
 import type { CurrenciesConfig, CurrencyCode, CurrencyConfigEntry } from "../types/money";
 import { getCurrencyInfo, normalizeCurrencyCode } from "./currencies";
 import { MoneyError } from "./errors";
+import { MAX_RATE } from "./money";
 
 // ============================================
 // CURRENCY CONFIG: appConfig/currencies (issue #178)
@@ -24,8 +25,13 @@ export const DEFAULT_CURRENCIES_CONFIG: CurrenciesConfig = {
   // still price on Sunday night. 72h covers a long weekend gap on top of the
   // 6-hourly refresh without serving a rate that is days old.
   freshnessHours: 72,
-  // 5 days of rate age: Friday's rate still prices through a weekend + Monday holiday.
-  maxRateAgeHours: 120,
+  // 6 days of rate age (issue #214). A CBN row is dated at the START of its
+  // Lagos day (23:00Z the day before). Over a four-day closure (Easter: Good
+  // Friday to Easter Monday) Thursday's row is 120h old at Monday 23:00Z and
+  // Tuesday's row lands some hours into Tuesday, so 120h left a gap of up to
+  // ~18h with no price. 144h covers that closure plus a day; the 240h cap
+  // below still stops a typo from serving a rate that is weeks old.
+  maxRateAgeHours: 144,
   // Daily naira moves are normally a few percent; 10% catches a slipped
   // decimal or garbage while leaving room for a volatile day.
   maxProviderJumpPercent: 10,
@@ -51,7 +57,70 @@ export const MAX_FRESHNESS_HOURS = 168;
 export const MAX_RATE_AGE_HOURS = 240;
 export const MAX_BAND_PERCENT = 25;
 export const MAX_JUMP_PERCENT = 50;
-export const MAX_OVERRIDE_TTL_HOURS_CAP = 168;
+/**
+ * The longest an admin override may last, however it is asked for (config
+ * default or request). THE one 168h constant (issue #214): the config cap and
+ * the request bound in rate.service.ts both use it, so they cannot drift.
+ */
+export const MAX_OVERRIDE_TTL_HOURS = 168;
+/**
+ * Widest plausible range allowed in config, as maxRate / minRate (issue #214).
+ * NGN's default 200-5000 is 25x. A typo like maxRate 1e9 would make the range
+ * meaningless, so a stored range wider than 50x is ignored and the default
+ * range (or none, which fails closed) applies.
+ */
+export const MAX_RATE_RANGE_RATIO = 50;
+
+/**
+ * A valid plausible range, or null. Both ends positive and finite, min < max,
+ * max no higher than the money module's absolute MAX_RATE, and the ratio
+ * max/min no wider than MAX_RATE_RANGE_RATIO.
+ */
+function validRange(minRate: unknown, maxRate: unknown): { minRate: number; maxRate: number } | null {
+  if (typeof minRate !== "number" || typeof maxRate !== "number") return null;
+  if (!Number.isFinite(minRate) || !Number.isFinite(maxRate)) return null;
+  if (minRate <= 0 || maxRate <= minRate || maxRate > MAX_RATE) return null;
+  if (maxRate > minRate * MAX_RATE_RANGE_RATIO) return null;
+  return { minRate, maxRate };
+}
+
+/** A margin in basis points (integer 0-10000), or undefined. */
+function validMarginBps(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 10_000 ? value : undefined;
+}
+
+/**
+ * One stored currency entry merged OVER its default entry (issue #214).
+ *
+ * Before #214 a stored entry replaced the default outright, so writing
+ * `{ NGN: { marginBps: 50 } }` silently dropped NGN's plausible range (and
+ * its enabled flag and countries). Now each field falls back to the default
+ * entry's value when the stored one is missing or malformed:
+ *  - `enabled`: a stored boolean wins, else the default (else false);
+ *  - `countries`: a stored array of strings wins, else the default (else []);
+ *  - `marginBps`: a valid stored margin wins, else the default's (if any);
+ *  - `minRate`/`maxRate`: judged as a PAIR. Each end missing from the stored
+ *    entry is taken from the default; if the resulting pair is not a valid
+ *    range (see validRange) the default pair is kept instead; with no valid
+ *    pair at all the currency has no range, which fails closed (a first-run
+ *    rate or an unreferenced override is then refused).
+ */
+function mergeCurrencyEntry(stored: Record<string, unknown>, fallback: CurrencyConfigEntry | undefined): CurrencyConfigEntry {
+  const enabled = typeof stored.enabled === "boolean" ? stored.enabled : fallback?.enabled ?? false;
+  const countries = Array.isArray(stored.countries)
+    ? stored.countries.filter((c): c is string => typeof c === "string")
+    : [...(fallback?.countries ?? [])];
+  const marginBps = validMarginBps(stored.marginBps) ?? fallback?.marginBps;
+  const range =
+    validRange(stored.minRate ?? fallback?.minRate, stored.maxRate ?? fallback?.maxRate) ??
+    validRange(fallback?.minRate, fallback?.maxRate);
+  return {
+    enabled,
+    countries,
+    ...(marginBps !== undefined ? { marginBps } : {}),
+    ...(range ?? {}),
+  };
+}
 
 /**
  * Merge a stored document over the defaults, dropping anything malformed
@@ -61,47 +130,37 @@ export function parseCurrenciesConfig(raw: Record<string, unknown> | null): Curr
   const d = DEFAULT_CURRENCIES_CONFIG;
   if (!raw) return { ...d, currencies: { ...d.currencies } };
 
-  // Currency entries: keep only well-formed ones for codes in the table.
+  // Currency entries (issue #214): start from the default entries and lay
+  // each well-formed stored entry OVER its default (see mergeCurrencyEntry).
+  // A stored code with no default entry (a new currency) merges over nothing.
+  // Codes not in the currency table, and non-object values, are ignored. To
+  // switch a default currency off, store `{ enabled: false }` for it.
   const currencies: Record<CurrencyCode, CurrencyConfigEntry> = {};
+  for (const [code, entry] of Object.entries(d.currencies)) {
+    currencies[code] = { ...entry, countries: [...entry.countries] };
+  }
   const storedCurrencies = raw.currencies;
   if (storedCurrencies && typeof storedCurrencies === "object") {
     for (const [key, value] of Object.entries(storedCurrencies as Record<string, unknown>)) {
       const code = normalizeCurrencyCode(key);
       if (!code || !getCurrencyInfo(code) || !value || typeof value !== "object") continue;
-      const v = value as Record<string, unknown>;
-      const marginBps = v.marginBps;
-      const minRate = v.minRate;
-      const maxRate = v.maxRate;
-      const rangeOk =
-        typeof minRate === "number" && typeof maxRate === "number" &&
-        Number.isFinite(minRate) && Number.isFinite(maxRate) && minRate > 0 && maxRate > minRate;
-      currencies[code] = {
-        ...(rangeOk ? { minRate, maxRate } : {}),
-        enabled: v.enabled === true,
-        countries: Array.isArray(v.countries) ? v.countries.filter((c): c is string => typeof c === "string") : [],
-        ...(typeof marginBps === "number" && Number.isInteger(marginBps) && marginBps >= 0 && marginBps <= 10_000
-          ? { marginBps }
-          : {}),
-      };
+      currencies[code] = mergeCurrencyEntry(value as Record<string, unknown>, d.currencies[code]);
     }
   }
 
   const margin = raw.defaultMarginBps;
   return {
     defaultCurrency: normalizeCurrencyCode(raw.defaultCurrency) ?? d.defaultCurrency,
-    // A stored doc with no valid entries must not silently turn every currency off or on:
-    // fall back to the default entries.
-    currencies: Object.keys(currencies).length > 0 ? currencies : { ...d.currencies },
+    // Always at least the default entries (merged above), so a stored doc
+    // with no valid entries cannot silently turn every currency off.
+    currencies,
     freshnessHours: bounded(raw.freshnessHours, d.freshnessHours, MAX_FRESHNESS_HOURS),
     maxRateAgeHours: bounded(raw.maxRateAgeHours, d.maxRateAgeHours, MAX_RATE_AGE_HOURS),
     maxProviderJumpPercent: bounded(raw.maxProviderJumpPercent, d.maxProviderJumpPercent, MAX_JUMP_PERCENT),
-    defaultMarginBps:
-      typeof margin === "number" && Number.isInteger(margin) && margin >= 0 && margin <= 10_000
-        ? margin
-        : d.defaultMarginBps,
+    defaultMarginBps: validMarginBps(margin) ?? d.defaultMarginBps,
     provider: raw.provider === "oanda" ? "oanda" : "cbn",
     overrideBandPercent: bounded(raw.overrideBandPercent, d.overrideBandPercent, MAX_BAND_PERCENT),
-    overrideTtlHours: bounded(raw.overrideTtlHours, d.overrideTtlHours, MAX_OVERRIDE_TTL_HOURS_CAP),
+    overrideTtlHours: bounded(raw.overrideTtlHours, d.overrideTtlHours, MAX_OVERRIDE_TTL_HOURS),
   };
 }
 

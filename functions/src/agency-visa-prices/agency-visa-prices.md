@@ -15,7 +15,8 @@ factors from the currency table). Public reads add the local figure
 
 Code: `agency-visa-price.validation.ts` (pure body and path rules),
 `agency-visa-price.service.ts` (storage and the "which visas" rule),
-`agency-visa-price.controller.ts` (HTTP and the CASL gate),
+`agency-visa-price.controller.ts` (HTTP, the CASL gate and the owner / admin
+write check),
 `agency-visa-price.routes.ts` (mounted at `/agency/visa-prices` in
 `src/app.ts`). Tests: `test/agency-visa-prices/agency-visa-prices.test.ts`.
 
@@ -96,28 +97,54 @@ Every route runs `verifyAuth` first:
 - **401** with no valid token;
 - **402** on writes while the plan is read-only.
 
-The controller then **gates the caller** and returns **403 `FORBIDDEN`**
-unless both of these hold:
+The controller then **gates the caller** (`gate()` in
+`agency-visa-price.controller.ts`). Since issue #227 (product decision
+2026-11-14, "only owners and admin"), reading and writing differ:
 
-- the caller has an `agencyId` claim;
-- their CASL ability allows the action on
-  `asSubject("Visa", { ownerAgencyId: <their agency>, source: "agency" })`.
-  This is the same #98 grant as the agency visa endpoints: `read` for GET and
-  `update` for PUT and DELETE.
+| Caller | `GET` | `PUT` / `DELETE` |
+| --- | --- | --- |
+| Owner of the agency | 200 | 200 |
+| Admin, naming the agency with `?agencyId=<id>` | 200 | 200 |
+| Member agent of the agency | 200 | **403**, nothing written |
+| Owner or agent of another agency (e.g. `?agencyId=<A>` from B) | 403 | 403 |
+| Client (even one whose token carries an `agencyId`), agent with no agency | 403 | 403 |
 
-So the agency's owner and agents pass. An agent with no agency, a client
-(even one whose token carries an `agencyId`) and an admin all get 403.
+How each row is decided:
 
-The agency always comes from the **token**, never from the URL or the body.
-Agency A cannot address agency B's prices.
+- **Member or better.** For everyone but an admin, the caller needs an
+  `agencyId` claim, and their CASL ability must allow the action on
+  `asSubject("Visa", { ownerAgencyId: <their agency>, source: "agency" })`:
+  the same #98 grant as the agency visa endpoints (`read` for GET, `update`
+  for PUT and DELETE). That shared rule is **not** changed by #227, so agents
+  still create and edit the agency's own visas (#106).
+- **Writes are owner-only on top of that.** PUT and DELETE also need
+  `agencyService.getOwnedAgencyForPrincipal(req.authz)` to return this
+  agency: the same owner check as `PUT /agencies/me`. The resolved principal
+  must be the owner of this agency, and the agency record must name them as
+  `ownerId`. A member agent passes the CASL check but stops here with 403
+  `FORBIDDEN` "Only the agency owner or an admin can set visa prices", before
+  any validation or write.
+- **Reads stay open to member agents.** The agency side's start-case picker
+  shows the agency's price next to each visa (see "For #106" below), so
+  agents need the list. #227 only takes away setting and clearing.
+- **Admins** (the `role: "admin"` claim or the legacy `admin: true` claim)
+  have no agency in their token, so they name it with `?agencyId=<id>` on
+  every route. If it is missing or not a usable id, they get **400**
+  `VALIDATION_ERROR`; if no agency has that id, **404** `NOT_FOUND`. An
+  admin's write is stored with `updatedBy` set to the admin's uid.
+
+For everyone except an admin, the agency always comes from the **token**,
+never from the URL or the body. Agency A cannot address agency B's prices: a
+non-admin who sends `?agencyId=` for any agency other than their own gets
+403. The query never silently switches to their own agency.
 
 | Method and path | Success | Errors |
 | --- | --- | --- |
-| `GET /agency/visa-prices` | 200 `AgencyVisaPriceView[]` | 403 |
+| `GET /agency/visa-prices` | 200 `AgencyVisaPriceView[]` | 400 / 404 (admin `agencyId`), 403 |
 | `GET /agency/visa-prices?include=global` | 200, the same list plus every public visa not yet priced (`priceUsd: null`), for the portal picker | 403 |
-| `PUT /agency/visa-prices/:countryCode/:visaTypeId` with body `{ "priceUsd": { "amount": "125.00", "currency": "USD" } }` | 200 `AgencyVisaPriceView` | 400, 403, 404 |
-| `PUT …` with body `{ "priceUsd": null }` | 200 `{ countryCode, visaTypeId, priceUsd: null }` (clears the price) | 400, 403 |
-| `DELETE /agency/visa-prices/:countryCode/:visaTypeId` | 200 `{ countryCode, visaTypeId, priceUsd: null }`. Idempotent: if no price is set, nothing is written | 400, 403 |
+| `PUT /agency/visa-prices/:countryCode/:visaTypeId` with body `{ "priceUsd": { "amount": "125.00", "currency": "USD" } }` | 200 `AgencyVisaPriceView` | 400, 403 (incl. member agents), 404 |
+| `PUT …` with body `{ "priceUsd": null }` | 200 `{ countryCode, visaTypeId, priceUsd: null }` (clears the price) | 400, 403 (incl. member agents) |
+| `DELETE /agency/visa-prices/:countryCode/:visaTypeId` | 200 `{ countryCode, visaTypeId, priceUsd: null }`. Idempotent: if no price is set, nothing is written | 400, 403 (incl. member agents) |
 
 **List order:**
 

@@ -38,13 +38,31 @@ export function memoryRateStore(): RateStore & { docs: Map<string, StoredRate>; 
     async saveError(c, error) {
       docs.set(c, { ...(docs.get(c) ?? blank(c)), lastError: error });
     },
-    async saveOverride(c, override, entry) {
-      docs.set(c, { ...(docs.get(c) ?? blank(c)), override });
+    // Issue #214: same contract as the Firestore store. `decide` sees the doc
+    // and may throw (nothing written); otherwise change + audit land together.
+    async transact(c, decide) {
+      const current = docs.get(c) ?? null;
+      const m = decide(current ? { ...current } : null);
+      const next: StoredRate = { ...(current ?? blank(c)) };
+      if (m.override !== undefined) next.override = m.override;
+      // Like Firestore: dropping the provider map also clears providerCorrupt
+      // (that flag is derived from the map being present but unreadable).
+      if (m.clearProvider) {
+        next.provider = null;
+        next.providerCorrupt = false;
+      }
+      docs.set(c, next);
+      audit.push(m.audit);
+    },
+    async appendAudit(entry) {
       audit.push(entry);
     },
-    async clearProvider(c, entry) {
-      docs.set(c, { ...(docs.get(c) ?? blank(c)), provider: null });
-      audit.push(entry);
+    async claimManualRefresh(c, at, cooldownMs) {
+      const last = docs.get(c)?.manualRefreshAt ?? null;
+      const waitMs = last ? last.getTime() + cooldownMs - at.getTime() : 0;
+      if (waitMs > 0) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(waitMs / 1000)) };
+      docs.set(c, { ...(docs.get(c) ?? blank(c)), manualRefreshAt: at });
+      return { allowed: true };
     },
     async listAudit(c, limit) {
       return audit.filter((a) => a.currency === c).reverse().slice(0, limit);

@@ -1,5 +1,5 @@
-import { Timestamp } from "firebase-admin/firestore";
-import { collections } from "../utils/firebase";
+import { Timestamp, type Transaction } from "firebase-admin/firestore";
+import { collections, db } from "../utils/firebase";
 import type { FxRateSource } from "../types/money";
 import type { ConfigStore } from "./config";
 import type { RateAuditEntry, RateStore, StoredOverride, StoredProviderRate, StoredRate } from "./rate.types";
@@ -25,33 +25,72 @@ export const firestoreConfigStore: ConfigStore = {
   },
 };
 
-export const firestoreRateStore: RateStore = {
+/**
+ * Stored doc data -> domain StoredRate. Shared by plain reads and reads
+ * inside a transaction (issue #214), so both see the doc the same way.
+ */
+function parseRateDoc(currency: string, d: Record<string, any>): StoredRate { // eslint-disable-line @typescript-eslint/no-explicit-any
+  const asOf = toDate(d.provider?.asOf);
+  const fetchedAt = toDate(d.provider?.fetchedAt);
+  const setAt = toDate(d.override?.setAt);
+  const expiresAt = toDate(d.override?.expiresAt);
+  const errAt = toDate(d.lastError?.at);
+  const providerOk =
+    !!d.provider && !!asOf && !!fetchedAt && typeof d.provider.rate === "number" &&
+    Number.isFinite(d.provider.rate) && d.provider.rate > 0 &&
+    (d.provider.source === "cbn" || d.provider.source === "oanda");
+  return {
+    currency,
+    // A present-but-unreadable provider map is flagged, never silently null.
+    providerCorrupt: !!d.provider && !providerOk,
+    provider: providerOk
+      ? { rate: d.provider.rate, asOf: asOf as Date, fetchedAt: fetchedAt as Date, source: d.provider.source as StoredProviderRate["source"] }
+      : null,
+    override:
+      d.override && setAt && expiresAt && typeof d.override.rate === "number"
+        ? {
+          rate: d.override.rate,
+          reason: String(d.override.reason ?? ""),
+          setBy: String(d.override.setBy ?? ""),
+          setAt,
+          expiresAt,
+          ...(d.override.unreferenced === true ? { unreferenced: true } : {}),
+        }
+        : null,
+    lastError: d.lastError && errAt ? { at: errAt, message: String(d.lastError.message ?? "") } : null,
+    manualRefreshAt: toDate(d.manualRefreshAt),
+  } satisfies StoredRate;
+}
+
+/** Domain override -> stored map (Timestamps), or null to clear. */
+function overrideToDoc(override: StoredOverride | null) {
+  if (!override) return null;
+  return {
+    rate: override.rate,
+    reason: override.reason,
+    setBy: override.setBy,
+    setAt: Timestamp.fromDate(override.setAt),
+    expiresAt: Timestamp.fromDate(override.expiresAt),
+    ...(override.unreferenced ? { unreferenced: true } : {}),
+  };
+}
+
+/** Domain audit entry -> stored doc (Timestamp `at`). */
+const auditToDoc = (audit: RateAuditEntry) => ({ ...audit, at: Timestamp.fromDate(audit.at) });
+
+/**
+ * The Firestore rate store. `runTransaction` is a field (like the other
+ * transactional services) so tests can swap in the in-memory fake.
+ */
+export const firestoreRateStore: RateStore & {
+  runTransaction: <T>(fn: (tx: Transaction) => Promise<T>) => Promise<T>;
+} = {
+  runTransaction: (fn) => db.runTransaction(fn),
+
   async get(currency) {
     const snap = await collections.exchangeRates.doc(currency).get();
     if (!snap.exists) return null;
-    const d = snap.data() as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
-    const asOf = toDate(d.provider?.asOf);
-    const fetchedAt = toDate(d.provider?.fetchedAt);
-    const setAt = toDate(d.override?.setAt);
-    const expiresAt = toDate(d.override?.expiresAt);
-    const errAt = toDate(d.lastError?.at);
-    const providerOk =
-      !!d.provider && !!asOf && !!fetchedAt && typeof d.provider.rate === "number" &&
-      Number.isFinite(d.provider.rate) && d.provider.rate > 0 &&
-      (d.provider.source === "cbn" || d.provider.source === "oanda");
-    return {
-      currency,
-      // A present-but-unreadable provider map is flagged, never silently null.
-      providerCorrupt: !!d.provider && !providerOk,
-      provider: providerOk
-        ? { rate: d.provider.rate, asOf: asOf as Date, fetchedAt: fetchedAt as Date, source: d.provider.source as StoredProviderRate["source"] }
-        : null,
-      override:
-        d.override && setAt && expiresAt && typeof d.override.rate === "number"
-          ? { rate: d.override.rate, reason: String(d.override.reason ?? ""), setBy: String(d.override.setBy ?? ""), setAt, expiresAt }
-          : null,
-      lastError: d.lastError && errAt ? { at: errAt, message: String(d.lastError.message ?? "") } : null,
-    } satisfies StoredRate;
+    return parseRateDoc(currency, snap.data() as Record<string, unknown>);
   },
 
   async saveProvider(currency, provider) {
@@ -78,38 +117,41 @@ export const firestoreRateStore: RateStore = {
       .set({ currency, lastError: { at: Timestamp.fromDate(error.at), message: error.message } }, { merge: true });
   },
 
-  async saveOverride(currency, override: StoredOverride | null, audit: RateAuditEntry) {
-    // The override change and its audit record commit together or not at all.
-    const batch = collections.exchangeRates.firestore.batch();
-    batch.set(
-      collections.exchangeRates.doc(currency),
-      {
-        currency,
-        override: override
-          ? {
-            rate: override.rate,
-            reason: override.reason,
-            setBy: override.setBy,
-            setAt: Timestamp.fromDate(override.setAt),
-            expiresAt: Timestamp.fromDate(override.expiresAt),
-          }
-          : null,
-      },
-      { merge: true }
-    );
-    batch.set(collections.exchangeRateAudit.doc(), {
-      ...audit,
-      at: Timestamp.fromDate(audit.at),
+  async transact(currency, decide) {
+    // Issue #214: read, check and write in ONE transaction. Before, the
+    // override was read, checked, then written in a batch, so a second admin
+    // (or a refresh) landing in between could leave an audit `old` that was
+    // not the effective rate, or a band checked against a rate that had just
+    // changed. A throw from `decide` aborts the transaction: nothing written.
+    const ref = collections.exchangeRates.doc(currency);
+    await this.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const stored = snap.exists ? parseRateDoc(currency, snap.data() as Record<string, unknown>) : null;
+      const mutation = decide(stored);
+      const patch: Record<string, unknown> = { currency };
+      if (mutation.override !== undefined) patch.override = overrideToDoc(mutation.override);
+      // Dropping the provider map also drops the "corrupt" state, since that
+      // flag is derived from the map being present but unreadable.
+      if (mutation.clearProvider) patch.provider = null;
+      tx.set(ref, patch, { merge: true });
+      tx.set(collections.exchangeRateAudit.doc(), auditToDoc(mutation.audit));
     });
-    await batch.commit();
   },
 
-  async clearProvider(currency, audit) {
-    // Remove the provider map and write the audit record together.
-    const batch = collections.exchangeRates.firestore.batch();
-    batch.set(collections.exchangeRates.doc(currency), { currency, provider: null }, { merge: true });
-    batch.set(collections.exchangeRateAudit.doc(), { ...audit, at: Timestamp.fromDate(audit.at) });
-    await batch.commit();
+  async appendAudit(audit) {
+    await collections.exchangeRateAudit.doc().set(auditToDoc(audit));
+  },
+
+  async claimManualRefresh(currency, at, cooldownMs) {
+    const ref = collections.exchangeRates.doc(currency);
+    return this.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const last = snap.exists ? toDate((snap.data() as Record<string, unknown>).manualRefreshAt) : null;
+      const waitMs = last ? last.getTime() + cooldownMs - at.getTime() : 0;
+      if (waitMs > 0) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(waitMs / 1000)) };
+      tx.set(ref, { currency, manualRefreshAt: Timestamp.fromDate(at) }, { merge: true });
+      return { allowed: true };
+    });
   },
 
   async listAudit(currency, limit) {
@@ -129,6 +171,7 @@ export const firestoreRateStore: RateStore = {
         old: (d.old ?? null) as { rate: number; source: FxRateSource } | null,
         new: (d.new ?? null) as { rate: number; source: FxRateSource } | null,
         ...(d.unreferenced ? { unreferenced: true } : {}),
+        ...(typeof d.outcome === "string" ? { outcome: d.outcome } : {}),
       } satisfies RateAuditEntry;
     });
   },

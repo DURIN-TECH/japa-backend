@@ -14,6 +14,8 @@ import { getCurrencyInfo } from "../money/currencies";
 //   PUT    /admin/exchange-rates/:currency    admin: set a manual rate { rate, reason, ttlHours? }
 //   DELETE /admin/exchange-rates/:currency    admin: clear it { reason }
 //   POST   /admin/exchange-rates/:currency/reset-reference  admin: accept a large provider move { reason }
+//   POST   /admin/exchange-rates/:currency/refresh          admin: refresh from the provider now { reason? }
+//                                                           (issue #214; audited; 1 per currency per 5 min, else 429)
 //
 // The factories take the RateService so tests can mount them on a fake.
 
@@ -25,6 +27,8 @@ function statusFor(err: MoneyError): number {
     return 503;
   case "CURRENCY_UNSUPPORTED":
     return 404;
+  case "RATE_LIMITED":
+    return 429;
   default:
     return 400;
   }
@@ -33,6 +37,8 @@ function statusFor(err: MoneyError): number {
 /** Typed error -> JSON; anything else -> 500 without leaking details. */
 function sendMoneyError(res: Response, err: unknown): void {
   if (isMoneyError(err)) {
+    // A rate-limited caller is told when to come back.
+    if (err.code === "RATE_LIMITED" && err.retryAfterSeconds) res.set("Retry-After", String(err.retryAfterSeconds));
     res.status(statusFor(err)).json({ success: false, error: err.code, message: err.message });
     return;
   }
@@ -48,10 +54,39 @@ function sendMoneyError(res: Response, err: unknown): void {
  * per-user. No auth, and a short public cache so mobile/web can show local
  * amounts without hammering the API.
  */
-export function createPublicRatesRouter(service: RateService): Router {
+/** How long one instance reuses a built GET /rates body (issue #214). */
+export const PUBLIC_RATES_CACHE_MS = 60_000;
+
+/** Options for the public router; tests pass a fake clock or a cache length. */
+export interface PublicRatesRouterOptions {
+  /** Cache lifetime in ms (default PUBLIC_RATES_CACHE_MS; 0 turns the cache off). */
+  cacheMs?: number;
+  /** Clock in epoch ms (default Date.now). */
+  now?: () => number;
+}
+
+export function createPublicRatesRouter(service: RateService, opts: PublicRatesRouterOptions = {}): Router {
   const router = Router();
+  const cacheMs = opts.cacheMs ?? PUBLIC_RATES_CACHE_MS;
+  const now = opts.now ?? Date.now;
+  // ---------- in-process cache (issue #214) ----------
+  // The route is unauthenticated and each uncached request costs one config
+  // read plus one read per currency, so the built body is kept for `cacheMs`.
+  // It is dropped at once when THIS instance changes a rate (override set or
+  // cleared, reference reset, refresh): `service.changeVersion` moves on.
+  // Other instances pick the change up when their cache expires (60s at most).
+  // Only successful bodies are cached; an error is never served from cache.
+  let cached: { at: number; version: number; body: { base: string; currencies: unknown[] } } | null = null;
+
   router.get("/", async (_req: Request, res: Response) => {
     try {
+      const t = now();
+      if (cached && cached.version === service.changeVersion && t - cached.at < cacheMs) {
+        res.set("Cache-Control", "public, max-age=300, s-maxage=300");
+        sendSuccess(res, cached.body);
+        return;
+      }
+      const version = service.changeVersion;
       const config = await service.getConfig();
       const currencies = [];
       for (const [code, entry] of Object.entries(config.currencies)) {
@@ -66,8 +101,12 @@ export function createPublicRatesRouter(service: RateService): Router {
           currencies.push({ currency: code, exponent, available: false, rate: null, asOf: null });
         }
       }
+      const body = { base: "USD", currencies };
+      // Stamped with the version read BEFORE building, so a change made while
+      // building makes this entry stale at once rather than hiding the change.
+      if (cacheMs > 0) cached = { at: t, version, body };
       res.set("Cache-Control", "public, max-age=300, s-maxage=300");
-      sendSuccess(res, { base: "USD", currencies });
+      sendSuccess(res, body);
     } catch (err) {
       sendMoneyError(res, err);
     }
@@ -109,6 +148,20 @@ export function createAdminExchangeRateRouter(service: RateService): Router {
       const uid = (req as AuthenticatedRequest).userId as string;
       await service.resetReference(req.params.currency, body.reason, uid);
       sendSuccess(res, { reset: true }, "Provider rate reset; the next refresh sets the new level");
+    } catch (err) {
+      sendMoneyError(res, err);
+    }
+  });
+
+  // Issue #214: refresh from the provider now (way back from a mistaken
+  // reset-reference). Same gate as every admin route; the service audits it
+  // and rate-limits it (429 with Retry-After).
+  router.post("/:currency/refresh", verifyAuth, verifyAdmin, async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const uid = (req as AuthenticatedRequest).userId as string;
+      const outcome = await service.refreshNow(req.params.currency, body.reason, uid);
+      sendSuccess(res, outcome, outcome.ok ? "Rate refreshed" : "Refresh failed; the stored rate is unchanged");
     } catch (err) {
       sendMoneyError(res, err);
     }
