@@ -56,7 +56,7 @@ export { scrapeCostService } from "./shared/cost/scrape-cost.service";
 
 // ---- Catalog rules used by the app-facing visa service / controller ----
 /** Approval guard + typed error for a fee with no USD conversion (#59). */
-export { assertVisaApprovable, VisaFeeNotConvertibleError } from "./visa-catalog/visa-catalog-fx";
+export { assertVisaApprovable, isIso4217, VisaFeeNotConvertibleError } from "./visa-catalog/visa-catalog-fx";
 /** Finite-only min for the denormalized country stats. */
 export { finiteMin } from "./visa-catalog/visa-catalog-meta";
 /** Manual USD cost on a pending scraped visa (#70). */

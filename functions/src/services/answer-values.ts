@@ -18,7 +18,7 @@
 // Validation errors name the bad field ("value.to", "value.line1", "value[3]")
 // and NEVER contain the answer text (it is personal data).
 
-import { isIso4217 } from "../scrapers/visa-catalog/visa-catalog-fx";
+import { isIso4217 } from "../scrapers";
 import type { AnswerType } from "../scrapers";
 
 /** Longest text answer, in characters (unchanged from #187). */
@@ -115,71 +115,71 @@ function addressField(o: Record<string, unknown>, key: string, required: boolean
  */
 export function validateAnswerValue(type: AnswerType, raw: unknown): AnswerValue {
   switch (type) {
-    case "text": {
-      if (typeof raw !== "string") throw new AnswerValidationError("\"value\" must be a string");
-      const text = raw.trim();
-      if (text.length > MAX_ANSWER_LENGTH) {
-        throw new AnswerValidationError(`"value" must be at most ${MAX_ANSWER_LENGTH} characters`);
+  case "text": {
+    if (typeof raw !== "string") throw new AnswerValidationError("\"value\" must be a string");
+    const text = raw.trim();
+    if (text.length > MAX_ANSWER_LENGTH) {
+      throw new AnswerValidationError(`"value" must be at most ${MAX_ANSWER_LENGTH} characters`);
+    }
+    return text;
+  }
+  case "date":
+    return dateField(raw, "value");
+  case "date_range": {
+    if (!isRecord(raw)) throw new AnswerValidationError("\"value\" must be an object { from, to }");
+    const from = dateField(raw.from, "value.from");
+    const to = dateField(raw.to, "value.to");
+    // ISO dates compare correctly as strings.
+    if (to < from) throw new AnswerValidationError("\"value.to\" must be on or after \"value.from\"");
+    return { from, to };
+  }
+  case "money": {
+    if (!isRecord(raw)) throw new AnswerValidationError("\"value\" must be an object { amount, currency }");
+    const amount = raw.amount;
+    if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0) {
+      throw new AnswerValidationError("\"value.amount\" must be a number, zero or more");
+    }
+    const cur = typeof raw.currency === "string" ? raw.currency.trim().toUpperCase() : "";
+    if (!/^[A-Z]{3}$/.test(cur) || !isIso4217(cur)) {
+      throw new AnswerValidationError("\"value.currency\" must be a 3-letter ISO 4217 code");
+    }
+    return { amount, currency: cur };
+  }
+  case "address": {
+    if (!isRecord(raw)) throw new AnswerValidationError("\"value\" must be an object { line1, city, country, ... }");
+    const max = MAX_ADDRESS_FIELD_LENGTH;
+    const out: AddressValue = {
+      line1: addressField(raw, "line1", true, max)!,
+      city: addressField(raw, "city", true, max)!,
+      country: addressField(raw, "country", true, max)!,
+    };
+    const line2 = addressField(raw, "line2", false, max);
+    const region = addressField(raw, "region", false, max);
+    const postcode = addressField(raw, "postcode", false, max);
+    const note = addressField(raw, "note", false, MAX_ADDRESS_NOTE_LENGTH);
+    if (line2) out.line2 = line2;
+    if (region) out.region = region;
+    if (postcode) out.postcode = postcode;
+    if (note) out.note = note;
+    return out;
+  }
+  case "list": {
+    if (!Array.isArray(raw)) throw new AnswerValidationError("\"value\" must be a list of text entries");
+    const entries: string[] = [];
+    raw.forEach((e, i) => {
+      if (blank(e)) return; // a blank row from the UI is dropped, not an error
+      if (typeof e !== "string") throw new AnswerValidationError(`"value[${i}]" must be a string`);
+      const s = e.trim();
+      if (s.length > MAX_LIST_ENTRY_LENGTH) {
+        throw new AnswerValidationError(`"value[${i}]" must be at most ${MAX_LIST_ENTRY_LENGTH} characters`);
       }
-      return text;
+      entries.push(s);
+    });
+    if (entries.length > MAX_LIST_ENTRIES) {
+      throw new AnswerValidationError(`"value" must have at most ${MAX_LIST_ENTRIES} entries`);
     }
-    case "date":
-      return dateField(raw, "value");
-    case "date_range": {
-      if (!isRecord(raw)) throw new AnswerValidationError("\"value\" must be an object { from, to }");
-      const from = dateField(raw.from, "value.from");
-      const to = dateField(raw.to, "value.to");
-      // ISO dates compare correctly as strings.
-      if (to < from) throw new AnswerValidationError("\"value.to\" must be on or after \"value.from\"");
-      return { from, to };
-    }
-    case "money": {
-      if (!isRecord(raw)) throw new AnswerValidationError("\"value\" must be an object { amount, currency }");
-      const amount = raw.amount;
-      if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0) {
-        throw new AnswerValidationError("\"value.amount\" must be a number, zero or more");
-      }
-      const cur = typeof raw.currency === "string" ? raw.currency.trim().toUpperCase() : "";
-      if (!/^[A-Z]{3}$/.test(cur) || !isIso4217(cur)) {
-        throw new AnswerValidationError("\"value.currency\" must be a 3-letter ISO 4217 code");
-      }
-      return { amount, currency: cur };
-    }
-    case "address": {
-      if (!isRecord(raw)) throw new AnswerValidationError("\"value\" must be an object { line1, city, country, ... }");
-      const max = MAX_ADDRESS_FIELD_LENGTH;
-      const out: AddressValue = {
-        line1: addressField(raw, "line1", true, max)!,
-        city: addressField(raw, "city", true, max)!,
-        country: addressField(raw, "country", true, max)!,
-      };
-      const line2 = addressField(raw, "line2", false, max);
-      const region = addressField(raw, "region", false, max);
-      const postcode = addressField(raw, "postcode", false, max);
-      const note = addressField(raw, "note", false, MAX_ADDRESS_NOTE_LENGTH);
-      if (line2) out.line2 = line2;
-      if (region) out.region = region;
-      if (postcode) out.postcode = postcode;
-      if (note) out.note = note;
-      return out;
-    }
-    case "list": {
-      if (!Array.isArray(raw)) throw new AnswerValidationError("\"value\" must be a list of text entries");
-      const entries: string[] = [];
-      raw.forEach((e, i) => {
-        if (blank(e)) return; // a blank row from the UI is dropped, not an error
-        if (typeof e !== "string") throw new AnswerValidationError(`"value[${i}]" must be a string`);
-        const s = e.trim();
-        if (s.length > MAX_LIST_ENTRY_LENGTH) {
-          throw new AnswerValidationError(`"value[${i}]" must be at most ${MAX_LIST_ENTRY_LENGTH} characters`);
-        }
-        entries.push(s);
-      });
-      if (entries.length > MAX_LIST_ENTRIES) {
-        throw new AnswerValidationError(`"value" must have at most ${MAX_LIST_ENTRIES} entries`);
-      }
-      return entries;
-    }
+    return entries;
+  }
   }
 }
 
