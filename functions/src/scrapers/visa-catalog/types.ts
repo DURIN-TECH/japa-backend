@@ -91,6 +91,20 @@ export interface VisaSourcePage {
   // next run within budget still sees the change). Cleared on extraction.
   extractionDeferredAt?: Timestamp;
   lastError?: string;
+  // ---- Portal provenance (issue #215; absent on every seeded page) ----
+  // `addedVia: "portal"` marks a page an admin registered through the API.
+  // Such a page (a) is carried over by a re-seed even when its country is in
+  // the markdown, (b) has its final host checked against the confirmed-hosts
+  // allow-list on every crawl, and (c) can be paused when its host is revoked.
+  addedVia?: "portal";
+  addedBy?: string; // uid of the admin
+  addedAt?: Timestamp;
+  // Language the admin declared for the page (from the supported list).
+  language?: string;
+  // True while the page must not be crawled (its host was revoked). The crawl
+  // skips it and leaves everything else about it as it is.
+  paused?: boolean;
+  pausedReason?: string;
 }
 
 // ----- Linked surcharges (issue #69) -----
@@ -178,6 +192,12 @@ export interface VisaSource {
   // Registry-owned: set from VISA_SOURCE_OFFICIAL_HOSTS on every re-seed.
   // Gates the extractor's `applicationUrl`; absent → code fallback / none.
   officialHosts?: string[];
+  // Issue #215: set when the source doc was first CREATED from the portal (a
+  // country that was not in the seed). A seeded source never has it. Carried
+  // over by a re-seed so the provenance is not lost.
+  addedVia?: "portal";
+  addedBy?: string;
+  addedAt?: Timestamp;
 
   // Scheduling. A source WITH a `crawlWindow` is crawled once a week inside
   // that local night window (issue #63) and `nextCrawlAt` is set to the

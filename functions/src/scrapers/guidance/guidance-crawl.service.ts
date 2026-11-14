@@ -312,7 +312,7 @@ const toSharedStatus = (s: string | undefined): string | undefined => (s === "fa
 const fromSharedStatus = (s: string): GuidanceSourceStatus => (s === "broken" ? "failing" : (s as GuidanceSourceStatus));
 
 /** Verification statuses the crawl will fetch. Anything else is skipped. */
-const CRAWLABLE_VERIFICATION_STATUSES: readonly string[] = ["verified", "partial"];
+const CRAWLABLE_VERIFICATION_STATUSES: readonly string[] = ["verified", "partial", "registered"];
 
 /**
  * Epoch ms of a stored Timestamp field, or 0 when it is absent or is not a

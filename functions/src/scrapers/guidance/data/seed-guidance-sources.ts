@@ -317,6 +317,14 @@ export function validateGuidanceSourceSeed(seed: GuidanceSourceSeed): string[] {
       problems.push("a source with a retrievalError cannot be verified: seed it as partial or unverified");
     }
   }
+  // "registered" (issue #215) claims the same thing as verified about
+  // retrieval (the whole text was fetched), so it carries the same two rules.
+  if (s.verificationStatus === "registered") {
+    if (s.retrievedAt === undefined) problems.push("a registered source needs retrievedAt (when the preview fetch retrieved it)");
+    if (s.retrievalError !== undefined) {
+      problems.push("a source with a retrievalError cannot be registered: it was not retrieved in full");
+    }
+  }
   if (s.verificationStatus === "partial" && s.retrievedAt === undefined) {
     problems.push("a partial source needs retrievedAt (when the part that was retrieved was retrieved)");
   }
@@ -343,6 +351,11 @@ export function validateGuidanceSourceSeeds(seeds: readonly GuidanceSourceSeed[]
     urls.add(seed.url);
   });
   return problems;
+}
+
+/** True for a stored guidance source an admin added through the portal API (issue #215). */
+export function isPortalAdded(existing: Record<string, unknown> | undefined): boolean {
+  return existing?.addedVia === "portal";
 }
 
 /**
@@ -461,11 +474,22 @@ export async function seedGuidanceSources(seeds: readonly GuidanceSourceSeed[] =
   const snaps = await db.getAll(...refs);
 
   const batch = db.batch();
+  let written = 0;
   seeds.forEach((seed, i) => {
     const existing = snaps[i]?.exists ? (snaps[i].data() as Record<string, unknown>) : undefined;
+    // Issue #215: a source an admin registered from the portal belongs to
+    // Firestore, not to this list. If a seed entry ever reuses its id, the
+    // stored doc wins: it is never overwritten (the merge would replace the
+    // admin's url, title, role and verification note). Said loudly, since a
+    // seed entry that cannot land is a mistake somebody should resolve.
+    if (isPortalAdded(existing)) {
+      console.warn(`[seed-guidance-sources] ${seed.id} was added from the portal: the seed entry was NOT applied`);
+      return;
+    }
     batch.set(refs[i], buildSeededGuidanceSource(seed, existing, now), { merge: true });
+    written++;
   });
   await batch.commit();
-  console.log(`Seeded ${seeds.length} guidance source(s)`);
-  return seeds.length;
+  console.log(`Seeded ${written} guidance source(s)`);
+  return written;
 }

@@ -629,6 +629,11 @@ class VisaCatalogCrawlService {
         // `supplementaryPages`, below. Its own crawl fields are updated there.
         if (page.supplementOnly) continue;
 
+        // ---- Paused page (issue #215)? Not crawled, nothing changed ----
+        // A portal-added page is paused when its host's confirmation is
+        // revoked. It keeps its crawl state; only an admin un-pauses it.
+        if (page.paused) continue;
+
         // ---- Host backed off? Skip WITHOUT any request (issue #64) ----
         // Blocked if the host answered 429/503 earlier in this run (for the
         // rest of the run), or a stored retry-after time is still ahead. The

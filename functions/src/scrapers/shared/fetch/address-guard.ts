@@ -59,6 +59,18 @@ function blockedMessage(host: string): string {
   return `Refusing to fetch from ${shown}: address not allowed`;
 }
 
+/**
+ * Thrown from the per-request redirect host policy (issue #215). The fetch
+ * service converts it to its own HostNotAllowedError; kept here so this module
+ * does not import the fetch service (which imports this one).
+ */
+export class HostRedirectRefusedError extends Error {
+  constructor(readonly host: string) {
+    super(`redirect to ${host} refused by the host policy`);
+    this.name = "HostRedirectRefusedError";
+  }
+}
+
 /** True for a BlockedAddressError, however many wrappers (axios, follow-redirects) sit around it. */
 export function isBlockedAddressError(err: unknown): boolean {
   return asBlockedAddressError(err) !== undefined;
@@ -323,10 +335,29 @@ export function createGuardedHttpClient(config: CreateAxiosDefaults = {}, opts: 
   // First request: literal host / port check before anything is sent.
   client.interceptors.request.use((cfg) => {
     assertUrlAllowed(new URL(cfg.url ?? "", cfg.baseURL), opts);
+    // Issue #215: an optional PER-REQUEST host policy (`redirectHostCheck`,
+    // set by the fetch service for portal-added registry sources). It is
+    // composed AFTER the address guard's own hop check, so it can only add
+    // refusals. Throwing here aborts the hop before any request is sent to it.
+    const hostCheck = (cfg as { redirectHostCheck?: (host: string) => boolean }).redirectHostCheck;
+    if (hostCheck) {
+      const guardHop = cfg.beforeRedirect;
+      cfg.beforeRedirect = (options, responseDetails) => {
+        guardHop?.(options, responseDetails);
+        const host = stripBrackets(String(options.hostname ?? options.host ?? "")).toLowerCase();
+        if (!hostCheck(host)) throw new HostRedirectRefusedError(host);
+      };
+    }
     return cfg;
   });
   // Unwrap: a refusal raised in lookup or beforeRedirect arrives wrapped.
   client.interceptors.response.use(undefined, (err) => {
+    // Issue #215: surface the host-policy refusal itself, too.
+    let cur: unknown = err;
+    for (let i = 0; i < 5 && cur; i++) {
+      if (cur instanceof HostRedirectRefusedError) throw cur;
+      cur = (cur as { cause?: unknown }).cause;
+    }
     throw asBlockedAddressError(err) ?? err;
   });
   return client;

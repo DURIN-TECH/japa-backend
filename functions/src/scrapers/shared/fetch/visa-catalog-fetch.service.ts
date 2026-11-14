@@ -222,6 +222,13 @@ export interface VisaCatalogHttpClient {
       headers?: Record<string, string>;
       timeout?: number;
       maxContentLength?: number;
+      // Issue #215: per-request host policy for registry sources an admin added
+      // from the portal. Called with the lowercased hostname of EVERY redirect
+      // hop BEFORE that hop is requested; returning false aborts the request
+      // (the guarded client turns it into a thrown error, so nothing is sent
+      // to the refused host). Test stubs may ignore it: fetchBody re-checks the
+      // final URL itself.
+      redirectHostCheck?: (host: string) => boolean;
     }
   ): Promise<{
     status: number;
@@ -368,6 +375,58 @@ export interface FetchedPage {
   // `findPdfQuote` in pdf-text.ts. For a PDF, `cleanText` is NOT capped at
   // MAX_CLEAN_TEXT_CHARS and is never truncated.
   pdf?: PdfText;
+  // Issue #215 (preview of an address an admin is registering). HTML only;
+  // absent for a PDF. Both are read from the markup, never trusted for
+  // anything but display: `htmlLang` is the `<html lang>` attribute as
+  // written (lowercased, trimmed; null when absent), `title` the `<title>`
+  // text (whitespace-collapsed; null when absent).
+  htmlLang?: string | null;
+  title?: string | null;
+}
+
+/**
+ * Thrown by the fetch service when the caller supplied an `allowedHost`
+ * policy (issue #215) and the request, or a redirect hop, or the final URL
+ * names a host the policy refuses. The message is plain words for an admin
+ * and names only the host; nothing was downloaded from a refused redirect hop.
+ */
+export class HostNotAllowedError extends Error {
+  readonly code = "HOST_NOT_ALLOWED";
+
+  constructor(
+    // The refused host (lowercased).
+    readonly host: string,
+    // "request" = the address asked for; "redirect" = a hop or the final URL.
+    readonly stage: "request" | "redirect"
+  ) {
+    super(
+      stage === "request"
+        ? `${host} is not a confirmed official website, so it was not requested`
+        : `The page redirected to ${host}, which is not a confirmed official website, so it was refused`
+    );
+    this.name = "HostNotAllowedError";
+  }
+}
+
+/** True for a HostNotAllowedError, however many wrappers sit around it. */
+export function isHostNotAllowedError(err: unknown): err is HostNotAllowedError {
+  let cur: unknown = err;
+  for (let i = 0; i < 5 && cur; i++) {
+    if (cur instanceof HostNotAllowedError) return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * `<html lang>` and `<title>` of an HTML document (issue #215). Pure; used only
+ * for the admin's address preview. Tolerates anything cheerio can parse.
+ */
+export function readHtmlMeta(html: string): { htmlLang: string | null; title: string | null } {
+  const $ = cheerio.load(html);
+  const lang = ($("html").attr("lang") ?? "").trim().toLowerCase();
+  const title = $("title").first().text().replace(/\s+/g, " ").trim();
+  return { htmlLang: lang || null, title: title || null };
 }
 
 /**
@@ -664,17 +723,30 @@ export class VisaCatalogFetchService {
    */
   private async fetchBody(
     url: string,
-    acceptPdf: boolean
+    acceptPdf: boolean,
+    allowedHost?: (host: string) => boolean
   ): Promise<{ kind: "html" | "pdf"; body: Buffer | string; status: number; finalUrl: string }> {
     const host = this.hostOf(url);
     await this.rateLimit(host);
-    const resp = await this.http.get(url, {
+    let resp: Awaited<ReturnType<VisaCatalogHttpClient["get"]>>;
+    try {
+      resp = await this.http.get(url, {
       responseType: "stream",
       // The larger of the two caps: if the client enforces a size limit of
       // its own, it must not cut a PDF off at the HTML limit. The cap for the
       // actual kind is enforced below, while reading.
       maxContentLength: Math.max(MAX_HTML_BYTES, this.pdfLimits.maxBytes),
+      // Issue #215: refuse a redirect hop to a refused host before it is requested.
+      ...(allowedHost ? { redirectHostCheck: allowedHost } : {}),
     });
+    } catch (err) {
+      // Issue #215: a redirect hop refused by the host policy (thrown by the
+      // guarded client before the hop was requested) becomes our typed error.
+      if (err instanceof Error && err.name === "HostRedirectRefusedError") {
+        throw new HostNotAllowedError((err as { host?: string }).host ?? "", "redirect");
+      }
+      throw err;
+    }
     const data = resp.data as ResponseBody;
 
     // 429/503 -> HostBackoffError (Retry-After honoured by the crawl).
@@ -685,6 +757,16 @@ export class VisaCatalogFetchService {
       throw err;
     }
     const finalUrl = resp.request?.res?.responseUrl || url;
+
+    // Issue #215: the final host must pass the policy too (covers a client that
+    // does not run the per-hop check). Refused BEFORE the body is read.
+    if (allowedHost) {
+      const finalHost = this.hostOf(finalUrl).replace(/:\d+$/, "");
+      if (!allowedHost(finalHost)) {
+        discardBody(data);
+        throw new HostNotAllowedError(finalHost, "redirect");
+      }
+    }
 
     // Any other error status: same message as before PDFs existed. This is
     // also what an HTML 404 page served as `application/pdf` ends in.
@@ -875,8 +957,17 @@ export class VisaCatalogFetchService {
     // MAX_CLEAN_TEXT_CHARS; a page whose clean text is longer than this value
     // fails with HtmlTextTooLongError instead, the same "never truncate
     // silently" rule the PDF path follows. Has no effect on a PDF response.
-    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number }
+    // allowedHost (issue #215, default unset = unchanged behaviour): a host
+    // policy for sources an admin added from the portal. Checked on the
+    // requested host BEFORE anything is sent (not even robots.txt), on every
+    // redirect hop before it is requested (guarded client), and on the final
+    // URL before the body is read. A refusal throws HostNotAllowedError.
+    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number; allowedHost?: (host: string) => boolean }
   ): Promise<FetchedPage> {
+    if (options?.allowedHost) {
+      const requested = this.hostOf(url).replace(/:\d+$/, "");
+      if (!options.allowedHost(requested)) throw new HostNotAllowedError(requested, "request");
+    }
     if (options?.checkRobots) {
       const allowed = await this.isAllowedByRobots(url);
       if (!allowed) {
@@ -886,7 +977,7 @@ export class VisaCatalogFetchService {
 
     // One request for both kinds; a non-2xx status has already thrown
     // "Fetch failed for … (HTTP n)" inside fetchBody.
-    const { kind, body, status, finalUrl } = await this.fetchBody(url, options?.acceptPdf ?? true);
+    const { kind, body, status, finalUrl } = await this.fetchBody(url, options?.acceptPdf ?? true, options?.allowedHost);
 
     // ---- PDF (issue #33) ----
     // Extract the text layer per page. Every refusal (not a PDF, encrypted,
@@ -936,6 +1027,8 @@ export class VisaCatalogFetchService {
       throw new Error(`Too little content extracted from ${url} (${cleanText.length} chars)`);
     }
 
+    // Issue #215: language hint and title, for the admin's address preview.
+    const meta = readHtmlMeta(html);
     return {
       url,
       finalUrl,
@@ -943,6 +1036,8 @@ export class VisaCatalogFetchService {
       cleanText,
       contentHash: this.hash(cleanText),
       fetchedAt: Date.now(),
+      htmlLang: meta.htmlLang,
+      title: meta.title,
     };
   }
 }

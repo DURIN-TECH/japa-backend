@@ -59,5 +59,5 @@ export interface SourceAdapter {
    * non-2xx, bad payload, nothing selected…) so the crawl records it as the
    * page's `lastError` without extracting.
    */
-  fetch(page: VisaSourcePage): Promise<SourceDocument>;
+  fetch(page: VisaSourcePage, opts?: SourceFetchOptions): Promise<SourceDocument>;
 }
