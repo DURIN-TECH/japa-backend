@@ -1870,11 +1870,21 @@ export class RubricExtractionService {
     if (assessed.criteria.length === 0) return { kind: "invalid", detail: assessed.discards.find((d) => d.itemType === "criterion")?.reason ?? "invalid_shape" };
 
     // ---- the one accepted rule that is the same rule again ----
-    const sameRule = assessed.criteria.filter((a) => {
+    // Each accepted rule is tested on the two conditions separately, so a refusal can say WHICH failed
+    // (#226 diagnostics): the rule quotes the same line of the stored text, and the rule is still a bar.
+    const tested = assessed.criteria.map((a) => {
       const at = index.locate(a.criterion.source.quote);
-      return at.ok && at.unit === found.unit && isBar(a.criterion);
+      return { a, sameLine: at.ok && at.unit === found.unit, bar: isBar(a.criterion) };
     });
-    if (sameRule.length === 0) return { kind: "invalid", detail: "not_the_same_bar" };
+    const sameRule = tested.filter((t) => t.sameLine && t.bar).map((t) => t.a);
+    if (sameRule.length === 0) {
+      // Counts and a cause word only, stored on the repair record: never the quote or any model text.
+      //   different_line: no accepted rule quotes the original's line (the model drafted another line of the window);
+      //   not_a_bar:      one does, but it is no longer a mandatory bar and has no named group (kind changed).
+      const sameLineCount = tested.filter((t) => t.sameLine).length;
+      const cause = sameLineCount === 0 ? "different_line" : "not_a_bar";
+      return { kind: "invalid", detail: `not_the_same_bar:${cause}:returned=${raw.criteria.length}:accepted=${tested.length}:same_line=${sameLineCount}:bar=${tested.filter((t) => t.bar).length}` };
+    }
     if (sameRule.length > 1) return { kind: "invalid", detail: "ambiguous_redraft" };
     const accepted = sameRule[0];
     // A lead-in whose list could not be read cleanly is refused here, as the gates would hold it anyway.
