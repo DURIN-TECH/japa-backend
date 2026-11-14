@@ -22,6 +22,8 @@ import {
 import { adminGuidanceSourceRoutes } from "./scrapers";
 // Source registry API (issue #215): confirmed hosts + route registration.
 import { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./scrapers";
+// Issuing authorities and bloc membership (issue #230): admin-only API.
+import { adminAuthorityRoutes } from "./authorities";
 // Route onboarding runs (issue #217).
 import { adminRouteOnboardingRoutes } from "./scrapers";
 // Rubric review (issue #125): admin queue, detail with diff, approve / reject.
@@ -168,6 +170,9 @@ app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
 // Issue #215: admin-only (verifyAuth + the ScrapeRun admin gate on every route).
 app.use("/admin/official-domains", adminOfficialDomainRoutes);
 app.use("/admin/route-sources", adminRouteSourceRoutes);
+// Issue #230: issuing authorities (country, bloc, treaty) and bloc members.
+// Admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route.
+app.use("/admin/authorities", adminAuthorityRoutes);
 // Issue #217: route onboarding runs (admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route).
 app.use("/admin/route-onboarding", adminRouteOnboardingRoutes);
 // Rubric review (issue #125): admin-only (verifyAuth + admin gate on every

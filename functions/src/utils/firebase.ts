@@ -268,6 +268,14 @@ export const collections = {
   // scrapers/rubric (extraction, always `pending_review`) and by the rubric
   // review API (#125). Backend-only: no firestore.rules match -> clients denied.
   visaRubrics: db.collection("visaRubrics"),
+  // Issuing authorities (issue #230, P1 of #228): `authorities/{authorityId}`
+  // is a country (id = its two-letter code), a bloc or a treaty that sets visa
+  // rules. Members of a bloc/treaty are in the `members` subcollection (see
+  // subcollections.authorityMembers). Written only by the admin authorities API
+  // (src/authorities), every write audited. Backend-only: no firestore.rules
+  // match -> clients denied (a client that could write membership could change
+  // which countries a shared rulebook covers).
+  authorities: db.collection("authorities"),
   // One record per rubric extraction run (issue #40): status, token usage,
   // cost (null while the model is unpriced), what was discarded and why.
   // Backend-only: no firestore.rules match.
@@ -470,6 +478,13 @@ export const subcollections = {
   // A version's content is immutable once written. Backend-only, like its parent.
   rubricVersions: (routeKey: string) =>
     collections.visaRubrics.doc(routeKey).collection("rubricVersions"),
+
+  // Members of one bloc or treaty (issue #230):
+  // `authorities/{authorityId}/members/{countryCode}`, each with joinedOn,
+  // optional leftOn, and the verbatim official quote + URL that proves it.
+  // Backend-only, like its parent.
+  authorityMembers: (authorityId: string) =>
+    collections.authorities.doc(authorityId).collection("members"),
 
   // (#216) The saved results of a drafting job's finished steps:
   // `rubricExtractionJobs/{jobId}/steps/{stepId}` (one per model call), and
