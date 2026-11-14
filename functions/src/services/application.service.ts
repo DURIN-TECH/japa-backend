@@ -18,6 +18,8 @@ import { noteService } from "./note.service";
 // Case-start rule for agency visas (issue #102). Imported from its file, not
 // the agency-visas index, so this service does not pull in routes.
 import { canStartCaseOnVisa } from "../agency-visas/agency-visa-access";
+// Issue #231: the rulebook stack fixed on a new application (light import: no authorities service).
+import { resolveRouteStackFor, routeStackKeys } from "../shared-routes/route-stack";
 
 export interface CreateApplicationInput {
   visaTypeId: string;
@@ -118,6 +120,15 @@ class ApplicationService {
       agencyId
     );
 
+    // Issue #231 (P2 of #228): fix the rulebook stack this application runs on
+    // NOW (shared layer(s) first, the country's own layer last), so a later
+    // change of the visa's `inheritsFrom` does not rewrite a running
+    // application. A visa that inherits nothing costs no extra read and gets
+    // just its own key `{countryCode}_{visaTypeId}`.
+    const routeStack = routeStackKeys(
+      await resolveRouteStackFor(input.countryCode, input.visaTypeId, visaType.inheritsFrom)
+    );
+
     // Get requirements to count required documents
     const requirements = await visaService.getRequirements(
       input.countryCode,
@@ -185,6 +196,7 @@ class ApplicationService {
       clientPhone,
       visaTypeName: visaType.name,
       countryName: country?.name || input.countryCode,
+      routeStack,
       createdAt: now,
       updatedAt: now,
     };

@@ -874,6 +874,10 @@ export const onRubricApprovedRecordAlert = functions
  * and its spend caps apply: a capped run is skipped and leaves the previous
  * approved rubric serving. Nobody is alerted here: an alert needs an admin's
  * approval of the staged version. Binds AI_SECRETS (the extraction reads it).
+ * (#225) While a route onboarding run is active for a route, that route's
+ * re-draft is DEFERRED (nothing is started, the reason is recorded on the
+ * run's route head): the run drafts after an admin confirms its estimate, and
+ * the deferral is re-evaluated when the run ends (onboarding-redraft.ts).
  */
 export const onGuidanceSourceChanged = functions
   .runWith({ memory: "1GB", timeoutSeconds: 540, secrets: [...AI_SECRETS] })
@@ -977,7 +981,8 @@ export const sweepRouteOnboardingRuns = functions
   .timeZone("UTC")
   .onRun(async () => {
     const result = await routeOnboardingService.sweep();
-    if (result.considered > 0 || result.alertsRaised > 0 || result.heldChecked > 0) console.log(`[route-onboarding] sweep: ${JSON.stringify(result)}`);
+    // (#225) `redraftsChecked`: deferred automatic re-drafts re-evaluated (see onboarding-redraft.ts).
+    if (result.considered > 0 || result.alertsRaised > 0 || result.heldChecked > 0 || result.redraftsChecked > 0) console.log(`[route-onboarding] sweep: ${JSON.stringify(result)}`);
   });
 
 /**

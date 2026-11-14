@@ -20,6 +20,16 @@ import {
 import type { ScrapeAlertsConfig } from "../shared/alerts/types";
 import { loadOnboardingSettings, type LoadedOnboardingSettings } from "./onboarding-settings";
 import {
+  hasLiveClaim,
+  isSettled,
+  liveClaims,
+  mergeDeferral,
+  runBlocksRedraft,
+  type GuardedRedraftInput,
+  type GuardedRedraftOutcome,
+  type RedraftGuard,
+} from "./onboarding-redraft";
+import {
   OnboardingError,
   isTerminalRun,
   STEP_IDS,
@@ -112,6 +122,9 @@ export interface OnboardingTiming {
   sweepIdleMs: number;
   // Waits (not failures) one action may make before the run fails with "still busy".
   maxWaits: number;
+  // (#225) How long a claim of the automatic re-draft holds the route's page reads
+  // (the claim covers the trigger's `startJob`, a few seconds; a dead holder's claim expires).
+  redraftClaimMs: number;
 }
 export const DEFAULT_TIMING: Readonly<OnboardingTiming> = Object.freeze({
   leaseMs: 10 * 60_000,
@@ -119,6 +132,7 @@ export const DEFAULT_TIMING: Readonly<OnboardingTiming> = Object.freeze({
   pollMs: 3 * 60_000,
   sweepIdleMs: 60_000,
   maxWaits: 24,
+  redraftClaimMs: 5 * 60_000,
 });
 
 /** The facts of a visa crawl the run needs (a subset of the crawl summary). */
@@ -236,7 +250,7 @@ interface RegisteredRoute {
   guidance: { id: string; data: GuidanceSource }[];
 }
 
-export class RouteOnboardingService {
+export class RouteOnboardingService implements RedraftGuard {
   /** @param overrides replacements for tests; production passes nothing. */
   constructor(private readonly overrides: Partial<OnboardingDeps> = {}) {}
 
@@ -383,7 +397,9 @@ export class RouteOnboardingService {
       const runId = `${routeKey}__r${seq}`;
       const run = this.newRun(runId, routeKey, countryCode, visaTypeId, uid, now);
       tx.create(this.runRef(runId), run as unknown as Record<string, unknown>);
-      const nextHead: RouteOnboardingHead = { routeKey, lastSeq: seq, activeRunId: runId, updatedAt: now };
+      // (#225) Spread the stored head first: it may carry the automatic
+      // re-draft's claims and a pending deferral, which must survive a new run.
+      const nextHead: RouteOnboardingHead = { ...(head ?? {}), routeKey, lastSeq: seq, activeRunId: runId, updatedAt: now };
       tx.set(headRef, nextHead as unknown as Record<string, unknown>);
       appendRegistryAudit(tx, { action: "onboarding_started", actorUid: uid, at: now, targetType: "onboardingRun", targetId: runId, before: null, after: { routeKey, countryCode, visaTypeId } });
       return run;
@@ -499,6 +515,9 @@ export class RouteOnboardingService {
       return done;
     });
     await this.afterCancel(run, uid);
+    // (#225) The run ended now: a re-draft it deferred is re-evaluated (only
+    // when it ended; a flagged run is settled by the worker that ends it).
+    if (run.status === "cancelled") await this.settleDeferredRedraft(run.routeKey);
     return run;
   }
 
@@ -642,7 +661,11 @@ export class RouteOnboardingService {
       tx.set(this.runRef(runId), claimed as unknown as Record<string, unknown>);
       return { kind: "claimed" as const, run: claimed };
     });
-    if (cancelled) await this.afterCancel(cancelled, (cancelled as RouteOnboardingRun).cancelRequestedBy ?? "system");
+    if (cancelled) {
+      await this.afterCancel(cancelled, (cancelled as RouteOnboardingRun).cancelRequestedBy ?? "system");
+      // (#225) The run ended here: re-evaluate a re-draft it deferred.
+      await this.settleDeferredRedraft((cancelled as RouteOnboardingRun).routeKey);
+    }
     return claim;
   }
 
@@ -691,13 +714,22 @@ export class RouteOnboardingService {
     });
   }
 
-  /** What follows a final status: a cancelled run cancels its job; a failed or held one raises its alert. Never throws. */
+  /**
+   * What follows a final status: a cancelled run cancels its job; a failed or
+   * held one raises its alert. (#225) Then, whatever the final status, a
+   * re-draft the run deferred is re-evaluated (see onboarding-redraft.ts): the
+   * job's hash gate starts nothing when the run drafted those pages, and the
+   * normal re-draft when it did not. Never throws.
+   */
   private async afterTerminal(run: RouteOnboardingRun): Promise<void> {
     if (run.status === "cancelled") {
+      // The job is cancelled FIRST, so the settle below can tell that the
+      // run's own job is on its way out (and leave the deferral for the sweep).
       await this.afterCancel(run, run.cancelRequestedBy ?? "system");
-      return;
+    } else if (run.alertPending) {
+      await this.raiseAlertFor(run);
     }
-    if (run.alertPending) await this.raiseAlertFor(run);
+    await this.settleDeferredRedraft(run.routeKey);
   }
 
   /** Raise (and then clear the flag of) a failed or held run's alert. Deduplicated by the run id. */
@@ -876,6 +908,16 @@ export class RouteOnboardingService {
       };
     };
     if (todo.length === 0) return finish(run.pinned.guidanceCrawled);
+    // (#225) An automatic re-draft that took its claim BEFORE this run was
+    // created may still be pinning the pages' snapshots for its job. Crawling
+    // now could change a page under it, so the run waits until the claim is
+    // released (or expires). No new claim can be taken while this run is
+    // active, so this read is enough (see onboarding-redraft.ts, point 2).
+    const routeHead = await collections.routeOnboardingRoutes.doc(run.routeKey).get();
+    const claims = routeHead.exists ? (routeHead.data() as RouteOnboardingHead).redraftClaims : undefined;
+    if (hasLiveClaim(claims, this.d.clock())) {
+      return this.waitChange(run, "read_rule_pages", "pages:redraft_claim", "an automatic re-draft of this route, from an earlier page change, is being started.");
+    }
     const id = todo[0];
     const docSnap = await collections.guidanceSources.doc(id).get();
     const title = docSnap.exists ? (docSnap.data() as GuidanceSource).title : id;
@@ -1169,8 +1211,8 @@ export class RouteOnboardingService {
    * not raised, and let held runs whose retry is scheduled turn `published`.
    * Calls nothing external but the alert engine; takes no lease.
    */
-  async sweep(): Promise<{ considered: number; kicked: number; alertsRaised: number; heldChecked: number }> {
-    const out = { considered: 0, kicked: 0, alertsRaised: 0, heldChecked: 0 };
+  async sweep(): Promise<{ considered: number; kicked: number; alertsRaised: number; heldChecked: number; redraftsChecked: number }> {
+    const out = { considered: 0, kicked: 0, alertsRaised: 0, heldChecked: 0, redraftsChecked: 0 };
     const active = await collections.routeOnboardingRuns.where("status", "in", [...WORKER_RUN_STATUSES]).get();
     for (const d of active.docs) {
       out.considered += 1;
@@ -1200,7 +1242,157 @@ export class RouteOnboardingService {
         await this.reobserveHeld(run);
       }
     }
+    // (#225) Deferred re-drafts still waiting: a settle that could not finish
+    // when its run ended (the run's job was still being cancelled, a transient
+    // refusal, an error) is tried again here. A route whose run is still
+    // active stays deferred (the guard reads the run; nothing is started).
+    const deferred = await collections.routeOnboardingRoutes.where("redraftDeferredPending", "==", true).get();
+    for (const d of deferred.docs) {
+      out.redraftsChecked += 1;
+      await this.settleDeferredRedraft(d.id);
+    }
     return out;
+  }
+
+  // ============================================
+  // (#225) The automatic re-draft defers to an active run
+  // ============================================
+
+  /**
+   * The ONE path through which an automatic re-draft of a route may start a
+   * drafting job (the trigger `onGuidanceSourceChanged`, through
+   * `rubricExtractionService.onGuidanceChanged`, and the re-evaluation after a
+   * run ended). See onboarding-redraft.ts for the reasoning.
+   *
+   *  1. A transaction on the route's onboarding head reads the active run.
+   *     Active: nothing is started; a trigger (`sourceId` set) records the
+   *     deferral on the head. Not active: a short-lived CLAIM is written, so a
+   *     run created from now on waits before it crawls.
+   *  2. `start` runs (the normal `startJob`; it never throws by contract).
+   *  3. The claim is released. When a deferral was pending and the result
+   *     settles it (`isSettled`), the deferral is cleared in the same write,
+   *     but only if it is still the one read in step 1 (`seq`).
+   *
+   * Throws only when step 1 cannot be done (a database error): the caller then
+   * starts nothing (fail closed: no spend that was not checked).
+   */
+  async guardedRedraft(input: GuardedRedraftInput, start: () => Promise<StartJobResult>): Promise<GuardedRedraftOutcome> {
+    const headRef = collections.routeOnboardingRoutes.doc(input.routeKey);
+    const claimId = `redraft-${this.d.newOwnerId()}`;
+    type Gate = { kind: "deferred"; runId: string; status: RunStatus } | { kind: "claimed"; pendingSeq: number | null };
+    const gate: Gate = await this.d.runTransaction(async (tx): Promise<Gate> => {
+      const nowMs = this.d.clock();
+      const now = Timestamp.fromMillis(nowMs);
+      const snap = await tx.get(headRef);
+      const head = snap.exists ? (snap.data() as RouteOnboardingHead) : null;
+      // Read the active run in the SAME transaction: `start()` writes the head
+      // when it creates a run, so this and that are serialised (no gap).
+      let active: RouteOnboardingRun | null = null;
+      if (head?.activeRunId) {
+        const runSnap = await tx.get(this.runRef(head.activeRunId));
+        active = runSnap.exists ? (runSnap.data() as RouteOnboardingRun) : null;
+      }
+      // A head the trigger writes before any run exists: a run started later counts from 1.
+      const base: RouteOnboardingHead = head ?? { routeKey: input.routeKey, lastSeq: 0, activeRunId: null, updatedAt: now };
+      if (active && runBlocksRedraft(active)) {
+        // DEFER. Only a trigger records it; a re-evaluation (sourceId null)
+        // leaves the pending deferral as it is, for this new run's end.
+        if (input.sourceId !== null) {
+          const deferredRedraft = mergeDeferral(head?.deferredRedraft, { countryCode: input.countryCode, visaTypeId: input.visaTypeId, sourceId: input.sourceId, runId: active.runId }, now);
+          const next: RouteOnboardingHead = { ...base, redraftClaims: liveClaims(base.redraftClaims, nowMs), deferredRedraft, redraftDeferredPending: true, updatedAt: now };
+          tx.set(headRef, next as unknown as Record<string, unknown>);
+        }
+        return { kind: "deferred", runId: active.runId, status: active.status };
+      }
+      // PROCEED: take a claim (expired claims of dead holders are dropped here).
+      const redraftClaims = { ...liveClaims(base.redraftClaims, nowMs), [claimId]: Timestamp.fromMillis(nowMs + this.d.timing.redraftClaimMs) };
+      tx.set(headRef, { ...base, redraftClaims, updatedAt: now } as unknown as Record<string, unknown>);
+      return { kind: "claimed", pendingSeq: head?.redraftDeferredPending && head.deferredRedraft ? head.deferredRedraft.seq : null };
+    });
+    if (gate.kind === "deferred") {
+      console.log(`${TAG} ${input.routeKey}: automatic re-draft deferred to run ${gate.runId} (${gate.status})${input.sourceId ? `, source ${input.sourceId}` : ""}`);
+      return gate;
+    }
+    let result: StartJobResult;
+    try {
+      result = await start();
+    } catch (err) {
+      // Not expected (startJob reports problems in its result). The claim is
+      // released and any deferral kept, so nothing is lost.
+      await this.releaseRedraftClaim(input.routeKey, claimId, null);
+      throw err;
+    }
+    // Did this start settle a pending deferral? An `existing` job is looked at:
+    // one whose cancel was requested does not cover the change.
+    let settled = false;
+    if (gate.pendingSeq !== null) {
+      let job: Awaited<ReturnType<ReturnType<OnboardingDeps["jobs"]>["getStatus"]>> = null;
+      if (result.outcome === "existing" && result.jobId) {
+        try {
+          job = await this.d.jobs().getStatus(result.jobId);
+        } catch {
+          // Unknown: not settled (safe; the sweep looks again).
+          job = null;
+        }
+      }
+      settled = isSettled(result, job);
+    }
+    await this.releaseRedraftClaim(input.routeKey, claimId, settled ? gate.pendingSeq : null);
+    return { kind: "ran", result, settled };
+  }
+
+  /**
+   * Drop one claim; with `clearSeq`, also clear the pending deferral when it is
+   * still that one. Never throws: a claim that cannot be released expires.
+   */
+  private async releaseRedraftClaim(routeKey: string, claimId: string, clearSeq: number | null): Promise<void> {
+    const headRef = collections.routeOnboardingRoutes.doc(routeKey);
+    try {
+      await this.d.runTransaction(async (tx) => {
+        const snap = await tx.get(headRef);
+        if (!snap.exists) return;
+        const head = snap.data() as RouteOnboardingHead;
+        const nowMs = this.d.clock();
+        const redraftClaims = liveClaims(head.redraftClaims, nowMs);
+        delete redraftClaims[claimId];
+        const clear = clearSeq !== null && head.deferredRedraft?.seq === clearSeq;
+        const next: RouteOnboardingHead = {
+          ...head,
+          redraftClaims,
+          ...(clear ? { deferredRedraft: null, redraftDeferredPending: false } : {}),
+          updatedAt: Timestamp.fromMillis(nowMs),
+        };
+        tx.set(headRef, next as unknown as Record<string, unknown>);
+      });
+    } catch (err) {
+      console.error(`${TAG} ${routeKey}: releasing the re-draft claim failed (${errClass(err)}); it expires by itself`);
+    }
+  }
+
+  /**
+   * (#225) Re-evaluate the re-draft a route deferred, once its run ended (and
+   * from the sweep). Goes through `guardedRedraft` with the SAME start the
+   * trigger makes (`trigger: "guidance_changed"`, the rulebook head's sources),
+   * so the job's hash gate and deterministic id rule out paying twice, and a
+   * run opened meanwhile defers it again. Never throws.
+   */
+  async settleDeferredRedraft(routeKey: string): Promise<"none" | "deferred" | "settled" | "pending"> {
+    try {
+      const snap = await collections.routeOnboardingRoutes.doc(routeKey).get();
+      const head = snap.exists ? (snap.data() as RouteOnboardingHead) : null;
+      const d = head?.redraftDeferredPending ? head.deferredRedraft : null;
+      if (!d) return "none";
+      const out = await this.guardedRedraft(
+        { routeKey, countryCode: d.countryCode, visaTypeId: d.visaTypeId, sourceId: null },
+        () => this.d.jobs().startJob({ countryCode: d.countryCode, visaTypeId: d.visaTypeId, trigger: "guidance_changed" })
+      );
+      if (out.kind === "deferred") return "deferred";
+      console.log(`${TAG} ${routeKey}: deferred re-draft re-evaluated: ${out.result.outcome}${out.result.reasonCode ? ` (${out.result.reasonCode})` : ""}${out.settled ? "" : ", kept for the sweep"}`);
+      return out.settled ? "settled" : "pending";
+    } catch (err) {
+      console.error(`${TAG} ${routeKey}: re-evaluating the deferred re-draft failed (${errClass(err)}); the sweep tries again`);
+      return "pending";
+    }
   }
 
   /**

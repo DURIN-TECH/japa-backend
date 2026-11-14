@@ -276,6 +276,12 @@ export const collections = {
   // match -> clients denied (a client that could write membership could change
   // which countries a shared rulebook covers).
   authorities: db.collection("authorities"),
+  // Shared routes (issue #231, P2 of #228): `sharedRoutes/{sharedRouteId}` is a
+  // visa defined once by a bloc/treaty and inherited by member countries'
+  // visa records (`inheritsFrom`). Written only by the admin shared-routes API
+  // (src/shared-routes), every write audited. Backend-only: no firestore.rules
+  // match -> clients denied.
+  sharedRoutes: db.collection("sharedRoutes"),
   // One record per rubric extraction run (issue #40): status, token usage,
   // cost (null while the model is unpriced), what was discarded and why.
   // Backend-only: no firestore.rules match.
