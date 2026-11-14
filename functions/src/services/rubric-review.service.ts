@@ -2,12 +2,13 @@ import { Timestamp, type DocumentData, type Transaction, type UpdateData } from 
 import { collectionGroups, collections, db, subcollections } from "../utils/firebase";
 // The scrapers module is reached through its public entry point only (the
 // ESLint boundary rule of issue #91 refuses deep imports from here).
-import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA, applyRuleRepairs, SnapshotQuoteIndex, guidanceSnapshotStore, previewExclusions, rubricStore, validateVisaRubric } from "../scrapers";
+import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA, applyRuleRepairs, barsServedWithoutTrigger, SnapshotQuoteIndex, guidanceSnapshotStore, previewExclusions, rubricStore, validateVisaRubric } from "../scrapers";
 import type { ExclusionPreview } from "../scrapers";
 import type { GuidanceSnapshotContent } from "../scrapers/types";
 import type { RubricIssue } from "../scrapers";
 import {
   INTENT_POLARITIES,
+  JUDGED_BAR_NOTE,
   RUBRIC_REVIEW_FIELDS,
   RUBRIC_REVIEW_STATUSES,
   RUBRIC_ACTOR_KIND,
@@ -773,6 +774,10 @@ export interface RubricReviewAuditEntry {
   // (#244) Originals that a repaired ordinary rule also stands for (several items of one definition that came back
   // as the same rule): left out as covered, listed so the audit says which rule replaced which.
   coveredCriterionIds?: string[];
+  // (#248) Bars this approval serves WITHOUT their trigger (the independent check confirmed the rule but not
+  // its trigger): each named with the fixed note that it is assessed by judgement, never decided by code.
+  // Derived from the approved review fields by the same function the read side uses. Absent when none.
+  barsJudgedWithoutTrigger?: { criterionId: string; title: string; note: string }[];
   // The version serving before this decision.
   previousApprovedVersion: number | null;
   // The version serving after it.
@@ -1689,6 +1694,9 @@ export class RubricReviewService {
       tx.update(headRef, { approvedVersion: version, updatedAt: now });
       // 4. The audit entry.
       const proposal = rubric.intentPolarityProposal?.value ?? null;
+      // (#248) The bars served without their trigger, from the version as approved (with the plan and repairs).
+      const titleOfServed = new Map(served.criteria.map((c) => [c.criterionId, c.title]));
+      const judgedBars = barsServedWithoutTrigger({ ...rubric, ...plannerFields } as VisaRubric).map((id) => ({ criterionId: id, title: titleOfServed.get(id) ?? id, note: JUDGED_BAR_NOTE }));
       const audit: RubricReviewAuditEntry = {
         ...auditBase,
         action: "approve",
@@ -1707,6 +1715,8 @@ export class RubricReviewService {
         // (#223) Protected rules swapped for their automatic re-draft with this approval (empty when none).
         ...(plannerFields.ruleRepairs && plannerFields.ruleRepairs.length > 0 ? { repairedCriterionIds: plannerFields.ruleRepairs.map((r) => r.criterionId) } : {}),
         ...(plannerFields.ruleRepairs && plannerFields.ruleRepairs.some((r) => (r.alsoReplaced ?? []).length > 0) ? { coveredCriterionIds: plannerFields.ruleRepairs.flatMap((r) => r.alsoReplaced ?? []) } : {}),
+        // (#248) Bars served without their unconfirmed trigger (judged, never code-decided), by title (data).
+        ...(judgedBars.length > 0 ? { barsJudgedWithoutTrigger: judgedBars } : {}),
         approvedVersion: version,
       };
       tx.set(auditRef, audit as unknown as Record<string, unknown>);

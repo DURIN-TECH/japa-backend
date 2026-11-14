@@ -11,6 +11,8 @@ import {
   evaluateRubricAutoPublished,
   evaluateRubricDraftHeld,
   evaluateRubricHeldCleared,
+  // (#248) The repair detail of a replacement bar served without its unconfirmed trigger.
+  JUDGED_BAR_DETAIL,
   loadPublishSettings,
   loadRegistrySettings,
   productLanguageCode,
@@ -37,9 +39,11 @@ import {
   type RubricReviewService,
 } from "./rubric-review.service";
 import {
+  JUDGED_BAR_NOTE,
   RUBRIC_ACTOR_KIND,
   RUBRIC_SYSTEM_ACTOR_ID,
   type IntentPolarity,
+  type RubricJudgedBar,
   type RubricHead,
   type RubricProtectedFailure,
   type RubricPublishGateResult,
@@ -146,6 +150,9 @@ export type RubricCheckOutcome =
     // (#244) The automatic re-draft of ordinary rules the check found wrong: counts and a line per eligible
     // rule. The replacements that passed are in `repairs` (the same record as the bars').
     ordinaryRepairs?: { counts: RubricOrdinaryRepairCounts; records: RubricOrdinaryRepair[] };
+    // (#248) Bars served without their unconfirmed trigger: judged, never code-decided. Their ids are also
+    // in `droppedTriggerIds` (the plan records them; the read side marks them `notCodeDecided`).
+    judgedBars?: RubricJudgedBar[];
     requests?: { total: number; repair: number };
   }
   | {
@@ -156,6 +163,8 @@ export type RubricCheckOutcome =
     // attempt), the ordinary rules the check would have left out, and the spend.
     protectedFailures?: RubricProtectedFailure[];
     leftOut?: { criterionId: string; reason: string }[];
+    // (#248) On a draft held for ANOTHER reason: the bars that would be served without their trigger.
+    judgedBars?: RubricJudgedBar[];
     requests?: { total: number; repair: number };
   };
 
@@ -213,6 +222,8 @@ interface RunExtras {
   checkerRequests?: { total: number; repair: number };
   // (#244) The ordinary re-draft's counts and per-rule lines, and how it ended when a cap or the clock cut it short.
   ordinaryRepairs?: { counts: RubricOrdinaryRepairCounts; records: RubricOrdinaryRepair[] };
+  // (#248) Bars served (or, on a hold, that would be served) without their unconfirmed trigger.
+  judgedBars?: RubricJudgedBar[];
 }
 
 /** The report of one run (also what the admin endpoint and the script return). */
@@ -246,6 +257,8 @@ export interface RubricPublishReport {
   protectedFailures?: RubricProtectedFailure[];
   // (#244) One line per ordinary rule eligible for the automatic re-draft, with how it ended.
   ordinaryRepairs?: RubricOrdinaryRepair[];
+  // (#248) Bars served without their unconfirmed trigger, assessed by judgement (also on the run record).
+  barsJudgedWithoutTrigger?: RubricJudgedBar[];
   // (#223) Model requests the check made, repair requests shown apart.
   checkerRequests?: { total: number; repair: number };
   // The audit entry of a publish.
@@ -282,8 +295,22 @@ const REPAIR_IN_WORDS: Record<string, string> = {
 /** One failed bar as a line of plain words: its title, reference, the aspects that failed and what the repair did. */
 function findingInWords(f: RubricProtectedFailure): string {
   const aspects = f.failedAspects.length > 0 ? `failed ${f.failedAspects.join(", ")}` : "not confirmed";
-  const detail = f.repair.detail ? ` (${f.repair.detail})` : "";
+  // (#248) "Confirmed by both checks" must not be read as covering the trigger: say what happened to it.
+  const detail = f.repair.detail === JUDGED_BAR_DETAIL ? `; the rule was confirmed, but ${JUDGED_BAR_NOTE}` : f.repair.detail ? ` (${f.repair.detail})` : "";
   return `${f.title}${f.ruleRef ? ` [${f.ruleRef}]` : ""}: ${aspects}; ${REPAIR_IN_WORDS[f.repair.status] ?? f.repair.status}${detail}. Rule id ${f.criterionId}.`;
+}
+
+/**
+ * (#248) One bar served without its unconfirmed trigger as a line of plain words: its title, reference,
+ * whether it is the re-draft, and the fixed note that it is assessed by judgement, never by code.
+ */
+export function judgedBarInWords(b: RubricJudgedBar): string {
+  return `${b.title}${b.ruleRef ? ` [${b.ruleRef}]` : ""}${b.replaced ? " (its one automatic re-draft)" : ""}: ${JUDGED_BAR_NOTE}. Rule id ${b.criterionId}.`;
+}
+
+/** (#248) The run record's gate line naming the bars served without their trigger. Never blocks. */
+function judgedBarGate(bars: readonly RubricJudgedBar[]): RubricPublishGateResult {
+  return { gate: "bars_judged_without_trigger", passed: true, detail: `${bars.length} bar(s) served without their unconfirmed trigger, assessed by judgement, never decided by code: ${bars.map((b) => b.criterionId).join(", ")}` };
 }
 
 /** The two leave-out budget reasons (#201). */
@@ -617,6 +644,8 @@ export class RubricAutoPublishService {
             checker = "failed";
             for (const code of outcome.reasonCodes) if (!reasons.includes(code)) reasons.push(code);
             protectedFromChecker = outcome.protectedRuleIds ?? [];
+            // (#248) Named on the held record too (they would be served without their trigger).
+            if (outcome.judgedBars && outcome.judgedBars.length > 0) extras.judgedBars = outcome.judgedBars;
             // (#223) The held record lists everything: each failed bar (per-aspect verdicts and the repair
             // attempt), and the ordinary rules the check would have left out with their shares.
             extras.protectedFailures = outcome.protectedFailures ?? (protectedFromChecker.length > 0 ? protectedFromChecker.map((id) => this.bareFailure(rubric, id)) : undefined);
@@ -630,6 +659,8 @@ export class RubricAutoPublishService {
             polarity = outcome.intentPolarity;
             // (#244) What the ordinary rules' automatic re-draft did, for the run record and the alert.
             if (outcome.ordinaryRepairs) extras.ordinaryRepairs = outcome.ordinaryRepairs;
+            // (#248) Bars served without their unconfirmed trigger, for the run record, the alert and (via the plan) the audit.
+            if (outcome.judgedBars && outcome.judgedBars.length > 0) extras.judgedBars = outcome.judgedBars;
             // (#223) A failed bar the check REPAIRED: from here on the rulebook is the one WITH the
             // replacement (what the check verified), for the gates, the planner and the approval.
             if (outcome.repairs && outcome.repairs.length > 0) {
@@ -937,6 +968,8 @@ export class RubricAutoPublishService {
       ...(finished.ordinaryRepairs && finished.ordinaryRepairs.some((r) => r.repair.status === "repaired")
         ? { ordinaryRepairedRules: finished.ordinaryRepairs.filter((r) => r.repair.status === "repaired").map((r) => `${r.title}${r.ruleRef ? ` [${r.ruleRef}]` : ""} (rule id ${r.criterionId}, failed ${r.failedAspects.join(", ")})`) }
         : {}),
+      // (#248) Each bar served without its unconfirmed trigger, named, with the fixed note (assessed by judgement).
+      ...(finished.barsJudgedWithoutTrigger && finished.barsJudgedWithoutTrigger.length > 0 ? { judgedBars: finished.barsJudgedWithoutTrigger.map(judgedBarInWords) } : {}),
     };
   }
 
@@ -986,6 +1019,11 @@ export class RubricAutoPublishService {
       finished.counts = { ...finished.counts, ordinaryRepairs: extras.ordinaryRepairs.counts };
       finished.ordinaryRepairs = extras.ordinaryRepairs.records;
       finished.gates = [...finished.gates, ordinaryRepairGate(extras.ordinaryRepairs.counts, finished.counts.rules)];
+    }
+    // (#248) The bars served without their trigger: a line each on the record, and a gate line.
+    if (extras.judgedBars !== undefined && extras.judgedBars.length > 0) {
+      finished.barsJudgedWithoutTrigger = extras.judgedBars;
+      finished.gates = [...finished.gates, judgedBarGate(extras.judgedBars)];
     }
   }
 
@@ -1090,6 +1128,7 @@ export class RubricAutoPublishService {
       ...(report.droppedTriggerIds !== undefined ? { droppedTriggerIds: report.droppedTriggerIds } : {}),
       ...(report.protectedFailures !== undefined ? { protectedFailures: report.protectedFailures } : {}),
       ...(report.ordinaryRepairs !== undefined ? { ordinaryRepairs: report.ordinaryRepairs } : {}),
+      ...(report.barsJudgedWithoutTrigger !== undefined ? { barsJudgedWithoutTrigger: report.barsJudgedWithoutTrigger } : {}),
       ...(report.checkerRequests !== undefined ? { checkerRequests: report.checkerRequests } : {}),
       auditId: report.auditId,
       previousApprovedVersion: report.previousApprovedVersion,

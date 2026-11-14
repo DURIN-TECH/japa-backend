@@ -1164,7 +1164,14 @@ export interface RubricPublishAlertFacts {
   // per rule that now stands as its replacement. Plain words built by the pipeline from data.
   ordinaryRepairSummary?: string;
   ordinaryRepairedRules?: string[];
+  // (#248) Bars served WITHOUT their trigger (the check confirmed the rule but not which applicants it is
+  // put to): one line each, naming the bar and saying it is assessed by judgement, never decided by code.
+  // Plain words built by the pipeline from data.
+  judgedBars?: string[];
 }
+
+/** (#248) The heading of the judged-bars lines: the same in the published and the held alert. */
+const JUDGED_BARS_HEADING = "Bars served without their trigger (the independent check did not confirm which applicants they apply to); each is assessed by judgement, never decided by code:";
 
 /** `route key + version`, the id shown in the link and used in dedupe keys. */
 const rubricVersionKey = (routeKey: string, version: number) => `${routeKey}__v${version}`;
@@ -1225,6 +1232,8 @@ export function evaluateRubricAutoPublished(facts: RubricPublishAlertFacts, conf
     lines.push("Ordinary rules the check found wrong, re-drafted once automatically and confirmed (served as the replacement):", ...facts.ordinaryRepairedRules.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((f) => `- ${f}`));
     if (facts.ordinaryRepairedRules.length > MAX_LISTED_PRIMARY_LEAVE_OUTS) lines.push("- ...");
   }
+  // (#248) Every such bar is listed (a rulebook has few bars): nothing about a bar is hidden behind "...".
+  if (facts.judgedBars && facts.judgedBars.length > 0) lines.push(JUDGED_BARS_HEADING, ...facts.judgedBars.map((f) => `- ${f}`));
   lines.push(`Informational remarks: ${countsLine(facts.informationalFlags)}.`);
   if (facts.sample.length > 0) {
     lines.push("Spot-check these rules against their quotes:");
@@ -1283,6 +1292,8 @@ export function evaluateRubricDraftHeld(facts: RubricPublishAlertFacts, config: 
     if (facts.protectedFindings.length > MAX_LISTED_PRIMARY_LEAVE_OUTS) lines.push("- ...");
   }
   if (facts.ordinaryRepairSummary) lines.push(facts.ordinaryRepairSummary);
+  // (#248) Held for another reason: the bars that would be served without their trigger, named.
+  if (facts.judgedBars && facts.judgedBars.length > 0) lines.push(JUDGED_BARS_HEADING, ...facts.judgedBars.map((f) => `- ${f}`));
   lines.push(`Informational remarks: ${countsLine(facts.informationalFlags)}.`);
   lines.push(`Look at it, run the check again or publish it by hand: ${facts.link}`);
   return {

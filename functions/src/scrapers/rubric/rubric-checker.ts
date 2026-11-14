@@ -1,11 +1,14 @@
 import { collections } from "../../utils/firebase";
 import { AnthropicNotConfiguredError } from "../../services/ai/anthropic-client";
 import { AnthropicLlmProvider, LlmProviderError, emptyLlmUsage, llmRequestHash, type LlmProvider, type LlmRequest, type LlmUsage } from "../../services/ai/llm-provider";
-import type { AssessmentCriterion, IntentPolarity, LeaveOutBasis, RubricOrdinaryRepair, RubricOrdinaryRepairCounts, RubricProtectedFailure, RubricRepairStatus, RubricRuleRepair, VisaRubric } from "../../types/rubric";
+import type { AssessmentCriterion, IntentPolarity, LeaveOutBasis, RubricJudgedBar, RubricOrdinaryRepair, RubricOrdinaryRepairCounts, RubricProtectedFailure, RubricRepairStatus, RubricRuleRepair, VisaRubric } from "../../types/rubric";
 import { isValidTrigger } from "../../utils/rubric-trigger";
 import { guidanceSnapshotStore } from "../guidance/guidance-snapshot.store";
 import type { GuidanceSnapshotContent } from "../guidance/types";
 import { isProtectedRule, sameScope } from "./rubric-gates";
+// (#248) The ONE test of "a protected rule that may be served without its unconfirmed trigger": the
+// read side (`applyExclusions`) marks exactly these `notCodeDecided`, so the check and what is served agree.
+import { isJudgedBarShape } from "./rubric-exclusions";
 import {
   CHECKER_ASPECTS,
   CHECKER_BATCH_SIZE,
@@ -327,6 +330,17 @@ export function judgeTrigger(rule: Pick<AssessmentCriterion, "kind" | "appliesTo
   return verdicts.verification === "yes" ? "keep" : "drop";
 }
 
+/**
+ * (#248) What a protected rule's "hold" on its trigger ALONE becomes: true for a mandatory bar
+ * (served without the trigger and judged, never code-decided; see `isJudgedBarShape` in
+ * rubric-exclusions.ts for the two-direction argument), false for any other protected rule (it
+ * still holds: an objective rule scoped to a group is decided by code, and widening it could
+ * fail applicants it does not cover). The trigger table itself (`judgeTrigger`) is unchanged.
+ */
+export function servableWithoutTrigger(rule: Pick<AssessmentCriterion, "kind">): boolean {
+  return isJudgedBarShape(rule);
+}
+
 // ============================================
 // Expected load (for the cost statement)
 // ============================================
@@ -381,6 +395,9 @@ export type RubricCheckOutcomeShape =
     // (#244) The automatic re-draft of ordinary rules the check found wrong: the counts and a line per
     // eligible rule. Their replacements that passed are in `repairs` above (the same record as the bars').
     ordinaryRepairs?: { counts: RubricOrdinaryRepairCounts; records: RubricOrdinaryRepair[] };
+    // (#248) Bars served without their unconfirmed trigger (judged, never code-decided). Their ids are
+    // also in `droppedTriggerIds`.
+    judgedBars?: RubricJudgedBar[];
     requests?: { total: number; repair: number };
   }
   | {
@@ -391,6 +408,8 @@ export type RubricCheckOutcomeShape =
     // repair attempt, the ordinary rules the check would have left out, and the spend.
     protectedFailures?: RubricProtectedFailure[];
     leftOut?: { criterionId: string; reason: string; basis?: LeaveOutBasis }[];
+    // (#248) On a draft held for ANOTHER bar: the bars that would have been served without their trigger.
+    judgedBars?: RubricJudgedBar[];
     requests?: { total: number; repair: number };
   };
 
@@ -573,6 +592,31 @@ export function sameRuleAs(replacement: AssessmentCriterion, other: AssessmentCr
   if (replacement.criterionId === other.criterionId) return false;
   if (possibleDuplicateFlags([replacement, other]).length === 0) return false;
   return isProtectedRule(other) || sameScope(replacement, other);
+}
+
+/**
+ * (#248) The repair record's `detail` for a replacement bar that both models confirmed on every judged
+ * aspect but whose trigger they did not: it is REPAIRED and served without the trigger, judged and
+ * never decided by code. A code, never text from a model.
+ */
+export const JUDGED_BAR_DETAIL = "trigger_not_confirmed_served_judged";
+
+/**
+ * (#248) The record of each bar served without its unconfirmed trigger, in rulebook order: the ones
+ * drafted that way (`asDrafted`) read from the draft, the ones whose one re-draft passed every aspect
+ * (`replaced`) read from their replacement (which carries the original's trigger). Pure.
+ */
+export function judgedBarRecords(rules: readonly AssessmentCriterion[], asDrafted: readonly string[], replaced: readonly string[], repairs: readonly RubricRuleRepair[]): RubricJudgedBar[] {
+  const replacementOf = new Map(repairs.map((r) => [r.criterionId, r.replacement]));
+  const out: RubricJudgedBar[] = [];
+  for (const original of rules) {
+    const isReplaced = replaced.includes(original.criterionId);
+    if (!isReplaced && !asDrafted.includes(original.criterionId)) continue;
+    const served = (isReplaced ? replacementOf.get(original.criterionId) : undefined) ?? original;
+    if (!served.trigger) continue;
+    out.push({ criterionId: original.criterionId, ruleRef: served.ruleRef ?? null, title: served.title, replaced: isReplaced, removedTrigger: { questionId: served.trigger.questionId, anyOf: [...served.trigger.anyOf] } });
+  }
+  return out;
 }
 
 /** Requests in flight at once (rule batches are independent of each other). */
@@ -764,7 +808,7 @@ export class RubricCheckerService {
       ordinaryCheckRequests: 0,
       reusable,
     };
-    const stop = async (reasonCodes: string[], extra: { protectedRuleIds?: string[]; protectedFailures?: RubricProtectedFailure[]; leftOut?: { criterionId: string; reason: string; basis?: LeaveOutBasis }[] } = {}): Promise<RubricCheckOutcomeShape> => {
+    const stop = async (reasonCodes: string[], extra: { protectedRuleIds?: string[]; protectedFailures?: RubricProtectedFailure[]; leftOut?: { criterionId: string; reason: string; basis?: LeaveOutBasis }[]; judgedBars?: RubricJudgedBar[] } = {}): Promise<RubricCheckOutcomeShape> => {
       await this.persist(ctx, "failed", reasonCodes);
       // The spend is reported when a repair was involved (a failed bar, or repair requests); the checker's
       // own record holds it for every other run.
@@ -789,9 +833,18 @@ export class RubricCheckerService {
     // A protected rule's trigger must be confirmed by BOTH models too, or the draft is held. A rule that
     // fails ONLY its trigger has no failed aspect to hand a re-draft, so it is not repairable.
     const protectedTriggerVerdicts = { verification: this.triggerVerdictsFrom("verification", protectedTriggerJobs, responses), judgement: this.triggerVerdictsFrom("judgement", protectedTriggerJobs, responses) };
+    // (#248) A BAR whose every judged aspect BOTH models confirmed but whose trigger they did not is
+    // no longer a protected failure: it is served WITHOUT the trigger and is never decided by code
+    // (`judgedBarIds`, recorded with the dropped triggers, marked `notCodeDecided` on the read side).
+    // Removing a trigger only widens who a rule is put to, so it cannot hide the bar from anyone it
+    // covers; not code-deciding it means the wider scope cannot bar anyone wrongly by nationality.
+    // Any other protected rule, and a bar that also failed an aspect, are handled exactly as before.
+    const judgedBarIds: string[] = [];
     for (const r of protectedTriggered) {
       const verdict = judgeTrigger(r, { verification: protectedTriggerVerdicts.verification.get(r.criterionId), judgement: protectedTriggerVerdicts.judgement.get(r.criterionId) });
-      if (verdict === "hold" && !failedIds.includes(r.criterionId)) failedIds.push(r.criterionId);
+      if (verdict !== "hold" || failedIds.includes(r.criterionId)) continue;
+      if (servableWithoutTrigger(r)) judgedBarIds.push(r.criterionId);
+      else failedIds.push(r.criterionId);
     }
     this.noteVerdicts(ctx, protectedVerdicts.verification, protectedVerdicts.judgement);
 
@@ -856,9 +909,15 @@ export class RubricCheckerService {
     // (#244) PROTECTED repairs run first: a draft held for a bar that could not be repaired spends nothing
     // on the ordinary rules' re-drafts (it is held either way).
     let protectedRepaired: { failures: RubricProtectedFailure[]; repairs: RubricRuleRepair[] } | null = null;
+    const replacedJudgedIds: string[] = [];
+    // (#248) Every bar served without its trigger, as drafted or as its replacement, in rulebook order: named on the
+    // record (held or published) and added to the dropped triggers the question plan records (`droppedTriggerIds`).
+    const judgedBarsOf = (): RubricJudgedBar[] => judgedBarRecords(rules, judgedBarIds, replacedJudgedIds, protectedRepaired?.repairs ?? []);
     if (failedIds.length > 0) {
       const rulesById = new Map(protectedRules.map((r) => [r.criterionId, r]));
       const repaired = await this.repairFailed(ctx, { failedIds, aspectFailures, rulesById, questions, routeName: rubric.routeKey });
+      // (#248) Replacement bars served without their unconfirmed trigger join the ones drafted that way.
+      replacedJudgedIds.push(...repaired.judgedIds);
       const unrepaired = repaired.failures.filter((f) => f.repair.status !== "repaired");
       if (unrepaired.length > 0 || extraHoldReasons.length > 0) {
         // Held. When a repair could not FINISH (the provider, or a cap) the reason is that retryable one, so the
@@ -866,7 +925,8 @@ export class RubricCheckerService {
         // bar that is still not confirmed is named. The held report carries everything either way.
         const reasons = repaired.infra ? [reasonOf(repaired.infra)] : unrepaired.map((f) => `protected_rule_failed:${f.criterionId}`);
         for (const r of extraHoldReasons) if (!reasons.includes(r)) reasons.push(r);
-        return stop(reasons, { protectedRuleIds: unrepaired.map((f) => f.criterionId), protectedFailures: repaired.failures, leftOut });
+        const judgedBars = judgedBarRecords(rules, judgedBarIds, replacedJudgedIds, repaired.repairs);
+        return stop(reasons, { protectedRuleIds: unrepaired.map((f) => f.criterionId), protectedFailures: repaired.failures, leftOut, ...(judgedBars.length > 0 ? { judgedBars } : {}) });
       }
       // Every failed bar has a replacement that BOTH models confirmed and code validated: the run goes on.
       protectedRepaired = { failures: repaired.failures, repairs: repaired.repairs };
@@ -894,12 +954,18 @@ export class RubricCheckerService {
     for (const [id] of ordinary.coveredIds) decided.set(id, { reason: REDRAFT_DUPLICATE_REASON });
 
     await this.persist(ctx, "completed", []);
+    const judgedBars = judgedBarsOf();
+    // (#248) The bars' triggers are dropped like an ordinary rule's (the plan records them); the read side
+    // tells them apart by kind and marks them `notCodeDecided`. Rulebook order, each id once.
+    const judgedIdSet = new Set(judgedBars.map((b) => b.criterionId));
+    const allDropped = rules.filter((r) => judgedIdSet.has(r.criterionId) || droppedTriggerIds.includes(r.criterionId)).map((r) => r.criterionId);
     return {
       ok: true,
       leftOut: leftOutOf(decided),
       resolvedFlagCodes,
       intentPolarity,
-      droppedTriggerIds,
+      droppedTriggerIds: allDropped,
+      ...(judgedBars.length > 0 ? { judgedBars } : {}),
       ...(protectedRepaired || ordinary.repairs.length > 0 ? { repairs: [...(protectedRepaired?.repairs ?? []), ...ordinary.repairs] } : {}),
       ...(protectedRepaired ? { protectedFailures: protectedRepaired.failures } : {}),
       ...(eligible.length > 0 ? { ordinaryRepairs: { counts: ordinary.counts, records: ordinary.records } } : {}),
@@ -960,8 +1026,10 @@ export class RubricCheckerService {
   private async repairFailed(
     ctx: RunContext,
     p: { failedIds: readonly string[]; aspectFailures: ReadonlyMap<string, CheckerAspect[]>; rulesById: ReadonlyMap<string, AssessmentCriterion>; questions: NonNullable<VisaRubric["intakeQuestions"]>; routeName: string }
-  ): Promise<{ failures: RubricProtectedFailure[]; repairs: RubricRuleRepair[]; infra: JobFailure | null }> {
+  ): Promise<{ failures: RubricProtectedFailure[]; repairs: RubricRuleRepair[]; infra: JobFailure | null; judgedIds: string[] }> {
     const failures = new Map<string, RubricProtectedFailure>();
+    // (#248) Replacement bars served without their unconfirmed trigger (judged, never code-decided).
+    const judgedIds: string[] = [];
     const redraftRequests = new Map<string, number>();
     const rule = (id: string): AssessmentCriterion => p.rulesById.get(id) as AssessmentCriterion;
     const setFailure = (id: string, status: RubricRepairStatus, detail?: string): void => {
@@ -1059,14 +1127,22 @@ export class RubricCheckerService {
           const j = judgement.get(r.criterionId);
           const aspectsFailed = judgeRule(r, { verification: v, judgement: j }).action === "keep" ? [] : failedAspectsOf(r, v, j);
           const triggerFailed = triggered.includes(r) && judgeTrigger(r, { verification: trigV.get(r.criterionId), judgement: trigJ.get(r.criterionId) }) === "hold";
-          const base = this.failureRecord(ctx, rule(r.criterionId), p.aspectFailures.get(r.criterionId) ?? [], aspectsFailed.length === 0 && !triggerFailed ? "repaired" : "failed_check", triggerFailed && aspectsFailed.length === 0 ? "trigger_not_confirmed" : undefined, redraftRequests.get(r.criterionId) ?? 0);
+          // (#248) A replacement BAR that passed every judged aspect with both models but whose trigger was
+          // not confirmed is REPAIRED and served without the trigger, judged and never code-decided (the
+          // same reasoning as a bar drafted that way, in `checkInner`). The detail says so on the record.
+          // Any other replacement whose trigger failed is `failed_check` / `trigger_not_confirmed` as before.
+          const judgedWithoutTrigger = triggerFailed && aspectsFailed.length === 0 && servableWithoutTrigger(r);
+          const status: RubricRepairStatus = aspectsFailed.length === 0 && (!triggerFailed || judgedWithoutTrigger) ? "repaired" : "failed_check";
+          const detail = judgedWithoutTrigger ? JUDGED_BAR_DETAIL : triggerFailed && aspectsFailed.length === 0 ? "trigger_not_confirmed" : undefined;
+          const base = this.failureRecord(ctx, rule(r.criterionId), p.aspectFailures.get(r.criterionId) ?? [], status, detail, redraftRequests.get(r.criterionId) ?? 0);
           failures.set(r.criterionId, { ...base, repair: { ...base.repair, replacementFailedAspects: aspectsFailed, replacementVerdicts: { ...(v ? { verification: encodeRow(v) } : {}), ...(j ? { judgement: encodeRow(j) } : {}) } } });
           if (base.repair.status === "repaired") repairs.push({ criterionId: r.criterionId, replacement: r, originalRuleHash: ruleHashOf(rule(r.criterionId)), runId: ctx.input.runId });
+          if (judgedWithoutTrigger) judgedIds.push(r.criterionId);
         }
       }
     }
     // Rulebook order, like every other list of this run.
-    return { failures: p.failedIds.map((id) => failures.get(id) as RubricProtectedFailure), repairs, infra };
+    return { failures: p.failedIds.map((id) => failures.get(id) as RubricProtectedFailure), repairs, infra, judgedIds };
   }
 
   /**

@@ -36,6 +36,13 @@ import { applyRuleRepairs } from "./rubric-repair";
 // question is unreachable the same way and is dropped. Nothing is ever left
 // pointing at a missing question.
 //
+// (#248) Dropped triggers: an ordinary rule only loses its trigger (as before).
+// A MANDATORY BAR whose trigger is dropped is also marked `notCodeDecided` (the
+// assessment engine never decides it in code, it judges it in full), and the
+// removed trigger's question stops linking to it when the question serves
+// another rule. The mark is derived here on every read and never trusted from
+// storage. See `isJudgedBarShape` for the two-direction safety argument.
+//
 // Pure and dependency-free: no Firebase, no clock, no I/O. It knows nothing
 // about any route, country or source.
 
@@ -193,11 +200,96 @@ export function applyExclusions<T extends Filterable>(input: T): T {
   // the planner itself go through) so intake, assessment, checklist, chat and the background
   // readers cannot disagree. The rules stay; only their `trigger` is removed from what is served.
   const dropped = rubric.questionPlan?.droppedTriggerCriterionIds;
-  const served = applyExclusionsCore(rubric);
+  // (#248) A stored `notCodeDecided` is never trusted: the mark is DERIVED below from the
+  // version's own review fields. Stripping any stored one first means the only way a bar stops
+  // being code-decided is the one path this file controls (a forged mark would weaken a bar).
+  const served = stripStoredMarks(applyExclusionsCore(rubric));
   if (!Array.isArray(dropped) || dropped.length === 0) return served;
   const ids = new Set(dropped);
   if (!served.criteria.some((c) => c.trigger !== undefined && ids.has(c.criterionId))) return served;
-  return { ...served, criteria: served.criteria.map((c) => (c.trigger !== undefined && ids.has(c.criterionId) ? withoutTrigger(c) : c)) };
+  // (#248) Bars whose trigger is dropped: served without it AND never decided by code.
+  const judged = served.criteria.filter((c) => c.trigger !== undefined && ids.has(c.criterionId) && isJudgedBarShape(c));
+  const criteria = served.criteria.map((c) => {
+    if (c.trigger === undefined || !ids.has(c.criterionId)) return c;
+    // An ordinary rule: exactly as before #248 (only the trigger is removed).
+    if (!isJudgedBarShape(c)) return withoutTrigger(c);
+    // A bar: the trigger is removed and the rule is marked `notCodeDecided` (see the type).
+    return { ...withoutTrigger(c), notCodeDecided: true as const };
+  });
+  return unlinkJudgedBars({ ...served, criteria }, judged);
+}
+
+/**
+ * (#248) The rules a dropped trigger turns into "judged, never code-decided": a MANDATORY BAR.
+ *
+ * WHY ONLY A BAR (both failure directions):
+ *  - A barred applicant told they may apply: removing a trigger only WIDENS who a rule is put to,
+ *    so it can never hide the bar from someone its condition covers; the bar is still served.
+ *  - An eligible applicant wrongly barred: a bar that code decides from nationality would, with
+ *    no trigger, bar EVERY applicant of that nationality. So a bar served without its trigger
+ *    is never decided by code; the assessment model reads the condition words instead and can
+ *    only raise a concern (never a refusal ground).
+ * An ordinary rule with a dropped trigger keeps its pre-#248 handling (#248 changes no ordinary
+ * rule). Any other protected rule is never in the list: the check holds it as before.
+ */
+export function isJudgedBarShape(c: Pick<AssessmentCriterion, "kind">): boolean {
+  return c.kind === "mandatory_bar";
+}
+
+/**
+ * (#248) Ids of the bars a version serves without their trigger, derived exactly as
+ * `applyExclusions` derives them (this version's own bars, with a trigger, listed in the
+ * question plan's dropped triggers), in rulebook order. For the audit entry and the run record.
+ */
+export function barsServedWithoutTrigger(rubric: Filterable): string[] {
+  const listed = new Set(rubric.questionPlan?.droppedTriggerCriterionIds ?? []);
+  if (listed.size === 0) return [];
+  return applyRuleRepairs(rubric as Filterable & { criteria: AssessmentCriterion[] }).criteria.filter((c) => c.trigger !== undefined && listed.has(c.criterionId) && isJudgedBarShape(c)).map((c) => c.criterionId);
+}
+
+/** (#248) The served criteria with any STORED `notCodeDecided` removed (only this file derives it). Identity when none has one. */
+function stripStoredMarks<T extends Filterable>(served: T): T {
+  if (!served.criteria.some((c) => c.notCodeDecided !== undefined)) return served;
+  return {
+    ...served,
+    criteria: served.criteria.map((c) => {
+      if (c.notCodeDecided === undefined) return c;
+      const { notCodeDecided: _mark, ...rest } = c;
+      void _mark;
+      return rest;
+    }),
+  };
+}
+
+/**
+ * (#248) The removed trigger no longer links its question to the bar: the bar's id leaves the
+ * question's `criterionIds` and the question's id leaves the bar's `intakeQuestionIds`, but ONLY
+ * when the question still serves at least one OTHER rule. A question that served the bar alone
+ * keeps the link: it is never orphaned (the structural rule "an intake question must name the
+ * criteria that read its answer") and never deleted, so its answer still reaches the assessment
+ * model, which needs it to judge the bar's condition. A question that cannot be found as served
+ * (merged away, dropped) is left alone. Pure; done after the exclusions so the dependency
+ * analysis can never drop a question because of it.
+ */
+function unlinkJudgedBars<T extends Filterable>(served: T, judged: readonly AssessmentCriterion[]): T {
+  if (judged.length === 0 || !Array.isArray(served.intakeQuestions)) return served;
+  const unlink = new Map<string, Set<string>>(); // question id -> bar ids to remove from it
+  for (const bar of judged) {
+    const qid = bar.trigger?.questionId;
+    const q = served.intakeQuestions.find((x) => x.id === qid);
+    if (!q || !(q.criterionIds ?? []).includes(bar.criterionId)) continue;
+    const others = (q.criterionIds ?? []).filter((id) => id !== bar.criterionId && !(unlink.get(q.id)?.has(id) ?? false));
+    if (others.length === 0) continue;
+    unlink.set(q.id, new Set([...(unlink.get(q.id) ?? []), bar.criterionId]));
+  }
+  if (unlink.size === 0) return served;
+  const intakeQuestions = served.intakeQuestions.map((q) => (unlink.has(q.id) ? { ...q, criterionIds: (q.criterionIds ?? []).filter((id) => !unlink.get(q.id)?.has(id)) } : q));
+  const criteria = served.criteria.map((c) => {
+    if (!c.intakeQuestionIds) return c;
+    const gone = c.intakeQuestionIds.filter((qid) => unlink.get(qid)?.has(c.criterionId) ?? false);
+    return gone.length === 0 ? c : { ...c, intakeQuestionIds: c.intakeQuestionIds.filter((qid) => !gone.includes(qid)) };
+  });
+  return { ...served, intakeQuestions, criteria };
 }
 
 /** A copy of a rule without its trigger. */
