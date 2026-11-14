@@ -37,7 +37,7 @@ function ingest(e: ExtractedVisa) {
   return catalog.ingestExtraction({
     countryCode: CC, sourceUrl: URL, routeName: "Standard Visitor", contentHash: "h1", extracted: e,
     model: "stub", visaId: VISA_ID, fx: undefined,
-    // A GB page: its adapter carries the +items-v1 stamp (issue #212).
+    // A GB page: its adapter carries the +items-vN stamp (issue #212).
     sourceMeta: { sourceProvider: "govuk-content-api" },
   });
 }

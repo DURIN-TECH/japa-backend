@@ -277,14 +277,14 @@ describe("prose requirements are not appended twice (review fix)", () => {
     const other = { ...passport, text: "You must have a job offer before you apply." };
     assert.equal(findMissingItems(ex("a passport", "You must have a passport or travel document to enter the UK."), [other]).length, 1);
   });
-  test("a list item is never matched by head (only prose has one)", () => {
+  test("a list item is never matched by the PROSE head (only prose has one)", () => {
     const li = { text: "a passport that is valid", leadIn: "You’ll need to provide:", section: "s" };
     assert.equal(findMissingItems(ex("a photo", "a photo"), [li]).length, 1);
   });
 });
 
 describe("version stamp is scoped to adapters that run the coverage check (review fix)", () => {
-  test("GB (govuk-content-api) carries +items-v1; everything else keeps the plain prompt version", () => {
+  test("GB (govuk-content-api) carries the +items-vN stamp; everything else keeps the plain prompt version", () => {
     assert.equal(extractionVersionFor("govuk-content-api"), EXTRACTION_PIPELINE_VERSION);
     assert.equal(extractionVersionFor("generic-html"), EXTRACTOR_PROMPT_VERSION);
     assert.equal(extractionVersionFor(undefined), EXTRACTOR_PROMPT_VERSION);
