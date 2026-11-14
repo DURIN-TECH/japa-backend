@@ -50,6 +50,7 @@ import {
   dateSupported,
   datesIn,
   groupNameSupported,
+  uncodedNameSupported,
   passagesOverlap,
   refTokensIn,
   unitAdjacentToNumber,
@@ -57,6 +58,7 @@ import {
   unsupportedNumbers,
   withoutLeadingParagraphNumber,
 } from "./rubric-quote";
+import { listNotReadableFlag, readLeadInList, unreadableListReason, verifyListItems } from "./rubric-list-items";
 import { spansSiblingMarkers } from "./rubric-marker-chain";
 import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSettings } from "./rubric-settings";
 import { rubricRouteKey, rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
@@ -325,6 +327,8 @@ interface AcceptedCriterion {
   // The quote spans two or more list markers of one level, or only introduces
   // a list ("...the third party:"): sub-conditions may have been merged.
   combinedSubConditions: boolean;
+  // (#222) The quote is a lead-in whose list could not be read cleanly (reason code).
+  listUnreadable?: string;
 }
 
 /** What one chunk's answer yields once validated. */
@@ -504,7 +508,8 @@ export function assessChunkOutput(
         startsMidSentence: found.ok && index.startsMidSentence(found),
         endsMidSentence: found.ok && index.endsMidSentence(found),
         multipleDates: Boolean(criterion.validFrom || criterion.validUntil) && datesIn(criterion.source.quote).length > 1,
-        combinedSubConditions: found.ok && (spansSiblingMarkers(criterion.source.quote) || index.introducesList(found)),
+        combinedSubConditions: found.ok && (spansSiblingMarkers(criterion.source.quote) || (index.introducesList(found) && criterion.source.listItems === undefined)),
+        listUnreadable: found.ok ? unreadableListReason(index, found, criterion.source.listItems) : undefined,
       });
     }
   }
@@ -685,7 +690,15 @@ function assessCriterion(
   if (c.appliesTo) {
     if (c.appliesTo.asWritten.length !== c.appliesTo.nationalities.length) return { reason: "invalid_shape", detail: DETAIL.groupShape };
     if (c.appliesTo.asWritten.some((w) => !groupNameSupported(w, quote))) return { reason: "applies_to_not_in_quote", detail: DETAIL.group };
+    // (#222) Members that are not a nationality: each a whole name in the quote, no code.
+    if ((c.appliesTo.uncoded ?? []).some((w) => !uncodedNameSupported(w, quote))) return { reason: "applies_to_not_in_quote", detail: DETAIL.group };
   }
+  // 7b. (#222) A quote that ends with a lead-in gets its list lines from the
+  //     stored text (rubric-list-items.ts). An unreadable list is NOT a discard
+  //     here: the rule is kept without items and flagged, so the gates hold a
+  //     protected rule / leave out an ordinary one by a named reason.
+  const list = readLeadInList(index, found);
+  const listItems = list.kind === "items" && verifyListItems(index, found, list.items).ok ? list.items : undefined;
 
   // 8. Build the stored criterion. Nothing is silently "repaired": a
   //    judgement criterion that came with a check keeps it here, and is then
@@ -700,7 +713,7 @@ function assessCriterion(
     ...(ruleRef ? { ruleRef } : {}),
     ...(c.applicability ? { applicability: c.applicability as "all_applicants" | "conditional" } : {}),
     ...(applicabilityCondition ? { applicabilityCondition } : {}),
-    source: cite(quote, found.page),
+    source: { ...cite(quote, found.page), ...(listItems ? { listItems } : {}) },
     ...(c.check
       ? {
         check: {
@@ -718,6 +731,7 @@ function assessCriterion(
           asWritten: c.appliesTo.asWritten.map((w) => w.trim()),
           // Platform data beside the model's proposal, for the reviewer.
           codeNames: nationalities.map(regionDisplayName),
+          ...((c.appliesTo.uncoded ?? []).length > 0 ? { uncoded: (c.appliesTo.uncoded ?? []).map((w) => w.trim()) } : {}),
         },
       }
       : {}),
@@ -803,7 +817,7 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
     // ---- criteria ----
     // The model's handles are only meaningful inside its own answer.
     const refToId = new Map<string, string>();
-    for (const { ref, criterion, startsMidSentence, endsMidSentence, multipleDates, combinedSubConditions } of assessment.criteria) {
+    for (const { ref, criterion, startsMidSentence, endsMidSentence, multipleDates, combinedSubConditions, listUnreadable } of assessment.criteria) {
       refToId.set(ref, criterion.criterionId);
       if (byId.has(criterion.criterionId)) {
         discard("criterion", "duplicate", "the same passage was already extracted", criterion.title);
@@ -835,6 +849,7 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
           target: criterion.criterionId,
         });
       }
+      listNotReadableFlag(criterion.criterionId, listUnreadable, flags);
       if (multipleDates) {
         flags.push({
           code: "multiple_dates_in_quote",
@@ -1141,10 +1156,12 @@ export function pagesEndingMidSentence(snapshot: Pick<GuidanceSnapshotContent, "
 export function reviewFlagsFor(content: Pick<MergedRubricContent, "criteria" | "intakeQuestions">, ctx: ReviewFlagContext): RubricFlag[] {
   const flags: RubricFlag[] = [];
   const bars = content.criteria.filter((c) => c.kind === "mandatory_bar" && c.appliesTo);
+  // (#222) Bars whose group has members with no code: the reviewer sees them listed too.
+  const uncodedBars = bars.filter((c) => (c.appliesTo?.uncoded ?? []).length > 0);
   if (bars.length > 0) {
     flags.push({
       code: "nationality_codes_model_proposed",
-      message: `${bars.length} mandatory bar(s) carry country codes proposed by the extraction model from the source's wording. Code has checked the wording is in the quote, not that each code is the right one: confirm every code against appliesTo.asWritten before approving.`,
+      message: `${bars.length} mandatory bar(s) carry country codes proposed by the extraction model from the source's wording. Code has checked the wording is in the quote, not that each code is the right one: confirm every code against appliesTo.asWritten before approving.${uncodedBars.length > 0 ? ` ${uncodedBars.length} of them also name group members that are not nationalities and carry no code (appliesTo.uncoded: ${uncodedBars.map((c) => (c.appliesTo?.uncoded ?? []).join("; ")).join(" | ")}): confirm those too.` : ""}`,
       target: "rubric",
     });
   }

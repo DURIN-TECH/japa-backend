@@ -40,6 +40,8 @@ export const RUBRIC_DIFF_FIELDS = [
   "source.quote",
   "source.url",
   "source.page",
+  // (#222) the list lines attached to a lead-in quote
+  "source.listItems",
   "check",
   "appliesTo",
   "validFrom",

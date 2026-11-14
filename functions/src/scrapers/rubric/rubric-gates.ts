@@ -26,7 +26,7 @@ import type { RubricPublishSettings } from "./rubric-publish-settings";
 //   HOLD the draft:        no_criteria, intent_polarity_conflict,
 //                          intent_criteria_without_polarity, suspicious_passages
 //   LEAVE THE RULE OUT:    quote_starts_mid_sentence, quote_ends_mid_sentence,
-//                          combined_sub_conditions, multiple_dates_in_quote,
+//                          combined_sub_conditions, multiple_dates_in_quote, list_not_readable (#222),
 //                          and possible_duplicate (only if the partner is kept,
 //                          applied LAST so a pair never disappears). Code cannot
 //                          cure these without editing a rule, which it never does.
@@ -56,7 +56,7 @@ import type { RubricPublishSettings } from "./rubric-publish-settings";
 /** Flags that hold the whole draft. */
 export const HOLD_FLAG_CODES: readonly string[] = ["no_criteria", "intent_polarity_conflict", "intent_criteria_without_polarity", "suspicious_passages"];
 /** Flags that leave the flagged rule out (the rule is `target`). */
-export const LEAVE_OUT_FLAG_CODES: readonly string[] = ["quote_starts_mid_sentence", "quote_ends_mid_sentence", "combined_sub_conditions", "multiple_dates_in_quote"];
+export const LEAVE_OUT_FLAG_CODES: readonly string[] = ["quote_starts_mid_sentence", "quote_ends_mid_sentence", "combined_sub_conditions", "multiple_dates_in_quote", "list_not_readable"];
 /** The duplicate flag: leaves `target` out only when the other rule of the pair is kept. */
 export const DUPLICATE_FLAG_CODE = "possible_duplicate";
 /** Flags that are recorded and counted but never block. */

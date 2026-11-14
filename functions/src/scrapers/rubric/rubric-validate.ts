@@ -111,6 +111,12 @@ export function validateCriterionShape(c: AssessmentCriterion, severityLevels: r
   if (!s || !HASH_RE.test(String(s.contentHash))) add("content_hash_invalid", "source.contentHash must be a sha256 hex digest");
   if (!s || !filled(s.retrievedAt) || Number.isNaN(Date.parse(s.retrievedAt))) add("retrieved_at_invalid", "source.retrievedAt must be an ISO-8601 instant");
   if (s && s.page !== undefined && (!Number.isInteger(s.page) || s.page < 1)) add("page_invalid", "source.page must be a positive integer");
+  // (#222) The list lines of a lead-in quote: a non-empty list of non-blank lines.
+  // That they are the snapshot's own lines is proven against the snapshot
+  // (rubric-list-items.ts `verifyListItems`), which this pure validator cannot do.
+  if (s && s.listItems !== undefined && (!Array.isArray(s.listItems) || s.listItems.length === 0 || s.listItems.some((l) => !filled(l)))) {
+    add("list_items_invalid", "source.listItems must be a non-empty list of non-blank lines");
+  }
 
   // ---- kind boundaries (the schema half of the containment rule in #42) ----
   if (c.kind === "judgement") {
@@ -125,9 +131,17 @@ export function validateCriterionShape(c: AssessmentCriterion, severityLevels: r
   }
   if (c.kind === "mandatory_bar") {
     const a = c.appliesTo;
-    if (!a || !Array.isArray(a.nationalities) || a.nationalities.length === 0) {
-      add("bar_without_applies_to", "a mandatory bar needs appliesTo.nationalities");
-    } else {
+    // (#222) Uncoded members: non-nationality group members, no code. Each at
+    // least 3 characters (the shortest group name), a list of strings.
+    const uncoded = a?.uncoded;
+    const uncodedOk = uncoded === undefined || (Array.isArray(uncoded) && uncoded.every((w) => filled(w) && w.trim().length >= 3));
+    if (!uncodedOk) add("applies_to_uncoded_invalid", "appliesTo.uncoded must be a list of group members of 3 characters or more");
+    const uncodedCount = Array.isArray(uncoded) ? uncoded.length : 0;
+    const codedCount = a && Array.isArray(a.nationalities) ? a.nationalities.length : 0;
+    // A bar needs at least one member, coded or not.
+    if (!a || !Array.isArray(a.nationalities) || (codedCount === 0 && uncodedCount === 0)) {
+      add("bar_without_applies_to", "a mandatory bar needs at least one appliesTo.nationalities code or appliesTo.uncoded member");
+    } else if (codedCount > 0) {
       if (a.nationalities.some((n) => !/^[A-Z]{2}$/.test(n))) add("nationality_code_invalid", "appliesTo.nationalities must be two-letter uppercase codes");
       // One source name per code, in the same order. A name of one or two
       // characters is not a name (it would "match" inside almost any text).

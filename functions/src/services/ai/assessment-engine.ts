@@ -185,6 +185,11 @@ function withinBar(criterion: AssessmentCriterion, applicationDate: string): boo
  * The mandatory bars that apply to this applicant. An applicant matches a bar
  * when their nationality code is in `appliesTo.nationalities` and the date
  * falls inside `validFrom` / `validUntil`. Null nationality matches nothing.
+ * (#222) Only the CODED members of a group can match here. Members listed in
+ * `appliesTo.uncoded` (not nationalities) have no code to compare, so code
+ * never decides them: `judgementCriteriaOf` puts such a bar, in full, to the
+ * assessment model instead. They are never treated as matching nobody-silently
+ * or everybody.
  * No model call, no network.
  */
 export function mandatoryBarHits(
@@ -480,7 +485,24 @@ export function deriveHolderFact(applicantName: string | null, docs: readonly Do
 
 /** The judgement criteria a stage 3 call is asked about. */
 export function judgementCriteriaOf(rubric: Pick<VisaRubric, "criteria">): AssessmentCriterion[] {
-  return rubric.criteria.filter((c) => c.kind === "judgement");
+  // (#222) A bar whose group has members code cannot match (`appliesTo.uncoded`:
+  // not a nationality, so no code) is ALSO put to the assessment model, in
+  // full, as a judgement: code can only decide the members that have a code
+  // (see `mandatoryBarHits`), and the rest must never read as "applies to
+  // nobody" nor as "applies to everybody". The model can only raise a concern
+  // on it; a refusal on a bar stays decided by code alone.
+  return rubric.criteria.filter((c) => c.kind === "judgement" || hasUncodedGroup(c));
+}
+
+/** True for a rule whose group names members that are not nationalities (no code to match by). */
+export function hasUncodedGroup(c: Pick<AssessmentCriterion, "kind" | "appliesTo">): boolean {
+  return c.kind === "mandatory_bar" && (c.appliesTo?.uncoded?.length ?? 0) > 0;
+}
+
+/** The rule's own text as the model is shown it: the quote, then any list lines under a lead-in (#222). */
+function ruleSourceText(c: Pick<AssessmentCriterion, "source">): string {
+  const items = c.source.listItems ?? [];
+  return items.length > 0 ? `${c.source.quote} ${items.join(" ")}` : c.source.quote;
 }
 
 // ----- Batching (#207): a long rulebook never shrinks, it is split -----
@@ -507,7 +529,7 @@ export const JUDGEMENT_BATCH_MAX_CHARS = 50_000;
 
 /** Characters one criterion adds to the criteria block of a stage 3 request. */
 function criterionBlockChars(c: AssessmentCriterion): number {
-  return c.criterionId.length + c.title.length + (c.probeFactors ?? []).join("; ").length + c.source.quote.length + 60;
+  return c.criterionId.length + c.title.length + (c.probeFactors ?? []).join("; ").length + ruleSourceText(c).length + (c.appliesTo?.uncoded ?? []).join("; ").length + 60;
 }
 
 /**
@@ -691,7 +713,10 @@ export function buildJudgementRequest(input: JudgementRequestInput): LlmRequest 
     .map(
       (c) =>
         `- ${c.criterionId} | ${c.title} | factors: ${(c.probeFactors ?? []).join("; ") || "none stated"} | ` +
-        `source: "${c.source.quote}"` +
+        `source: "${ruleSourceText(c)}"` +
+        (hasUncodedGroup(c)
+          ? ` | group (code matches only its nationalities ${(c.appliesTo?.nationalities ?? []).join(", ") || "none"}; also named, with no code: ${(c.appliesTo?.uncoded ?? []).join("; ")})`
+          : "") +
         (c.concernsIntent ? " | concerns intention" : "")
     )
     .join("\n");

@@ -831,6 +831,8 @@ function toCitation(c: RubricCitation): RubricCitation {
     ...(c.page !== undefined ? { page: c.page } : {}),
     retrievedAt: c.retrievedAt,
     ...(c.publishedDate !== undefined ? { publishedDate: c.publishedDate } : {}),
+    // (#222) The list lines of a lead-in quote travel with the citation.
+    ...(c.listItems !== undefined ? { listItems: [...c.listItems] } : {}),
   };
 }
 
