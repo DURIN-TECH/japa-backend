@@ -42,7 +42,7 @@ export type RegistryAuditAction =
   | "authority_created"
   | "authority_changed"
   | "authority_member_added"
-  | "authority_member_changed";
+  | "authority_member_changed" | "shared_route_created" | "shared_route_changed" | "visa_inheritance_changed"; // #231
 
 /** One audit entry as stored. */
 export interface RegistryAuditEntry {

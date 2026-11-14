@@ -1275,6 +1275,20 @@
       ]
     },
     {
+      "collectionGroup": "visaTypes",
+      "fieldPath": "inheritsFrom",
+      "indexes": [
+        {
+          "arrayConfig": "CONTAINS",
+          "queryScope": "COLLECTION"
+        },
+        {
+          "arrayConfig": "CONTAINS",
+          "queryScope": "COLLECTION_GROUP"
+        }
+      ]
+    },
+    {
       "collectionGroup": "scrapeRuns",
       "fieldPath": "expireAt",
       "ttl": true,

@@ -210,6 +210,8 @@ export function fakeCollection(
             if (op === "==") return a === b;
             // `in`: the value is an array of candidates (issue #83).
             if (op === "in") return (v as unknown[]).map(cmpValue).includes(a);
+            // `array-contains` (issue #231): the stored array holds the value (objects compared by JSON).
+            if (op === "array-contains") return Array.isArray(a) && a.some((x) => JSON.stringify(x) === JSON.stringify(b));
             if (a === undefined) return false;
             if (op === "<") return a < b;
             if (op === "<=") return a <= b;

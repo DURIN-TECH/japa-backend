@@ -1,5 +1,6 @@
 import { Timestamp } from "firebase-admin/firestore";
 import type { ApplicationIntake } from "./intake";
+import type { SharedRouteRef } from "./shared-route";
 // Issue #179: stored prices are dollar Money; reads add a local quote.
 import type { ChargeSnapshot, LocalPriceQuote, Money, PriceMigrationRecord, QuoteLock } from "./money";
 // Automated-verification result shapes live with the provider contract; the
@@ -513,6 +514,14 @@ export interface VisaType {
   successRate?: number;
   totalApplications?: number;
 
+  // Issue #231 (P2 of #228): shared routes this record inherits, in order. The
+  // country must be in each shared route's destinations on the day it is set.
+  // The record stays the key of everything country-keyed (agency prices,
+  // screenings, revisions, alerts); this only adds shared rulebook layers
+  // BEFORE the country's own one (see shared-routes/route-stack.ts). Written
+  // only by the admin shared-routes API; absent on every existing record.
+  inheritsFrom?: SharedRouteRef[];
+
   // Availability
   isActive: boolean;
   quotaLimit?: number;
@@ -830,6 +839,14 @@ export interface Application {
   // PUT /applications/:id/intake, which validates them against the approved
   // rubric; never through the generic application update.
   intake?: ApplicationIntake;
+
+  // Issue #231 (P2 of #228): the rulebook keys this application runs on, shared
+  // layer(s) first and the country's own `{countryCode}_{visaTypeId}` last,
+  // fixed when the application starts so a later change of the visa's
+  // `inheritsFrom` does not rewrite a running application. ABSENT on
+  // applications started before P2: those resolve live
+  // (shared-routes/route-stack.ts `resolveApplicationStack`).
+  routeStack?: string[];
 
   createdAt: Timestamp;
   updatedAt: Timestamp;

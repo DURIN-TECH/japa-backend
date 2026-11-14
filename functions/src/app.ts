@@ -24,6 +24,8 @@ import { adminGuidanceSourceRoutes } from "./scrapers";
 import { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./scrapers";
 // Issuing authorities and bloc membership (issue #230): admin-only API.
 import { adminAuthorityRoutes } from "./authorities";
+// Shared routes and inheriting visa records (issue #231): admin-only API.
+import { adminSharedRouteRoutes } from "./shared-routes";
 // Route onboarding runs (issue #217).
 import { adminRouteOnboardingRoutes } from "./scrapers";
 // Rubric review (issue #125): admin queue, detail with diff, approve / reject.
@@ -173,6 +175,8 @@ app.use("/admin/route-sources", adminRouteSourceRoutes);
 // Issue #230: issuing authorities (country, bloc, treaty) and bloc members.
 // Admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route.
 app.use("/admin/authorities", adminAuthorityRoutes);
+// Issue #231: shared routes (a visa defined once by a bloc) and the visa records that inherit them.
+app.use("/admin/shared-routes", adminSharedRouteRoutes);
 // Issue #217: route onboarding runs (admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route).
 app.use("/admin/route-onboarding", adminRouteOnboardingRoutes);
 // Rubric review (issue #125): admin-only (verifyAuth + admin gate on every
