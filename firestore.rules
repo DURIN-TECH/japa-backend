@@ -682,5 +682,20 @@ service cloud.firestore {
     match /visaRevisions/{revisionId} {
       allow read, write: if false;
     }
+
+    // ---- In-app tester feedback (issue #257), explicit deny ----
+    // feedback/{id}: notes (and the user id, email and device details that
+    // come with them) sent from the mobile app. Written by the backend only
+    // (POST /feedback); the team reads them in the Firestore console and by
+    // email. Denied for every client, admins included.
+    match /feedback/{feedbackId} {
+      allow read, write: if false;
+    }
+
+    // feedbackUploadLimits/{uid}__{hour}: rate-limit counters for feedback
+    // screenshot upload URLs (issue #257). Backend only.
+    match /feedbackUploadLimits/{limitId} {
+      allow read, write: if false;
+    }
   }
 }

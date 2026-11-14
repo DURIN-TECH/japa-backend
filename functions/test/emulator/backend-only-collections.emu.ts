@@ -30,6 +30,10 @@ import { anonymousDb, clientDb, isDenied, resetEmulators, rulesEnv, withoutRules
 /** Top-level backend-only collections (names from src/utils/firebase.ts). */
 const COLLECTIONS = [
   "riskSignals",
+  // In-app tester feedback (issue #257): user ids, emails and device details.
+  // Explicit deny in firestore.rules; backend (Admin SDK) only.
+  "feedback",
+  "feedbackUploadLimits",
   // Consultation payments held for refund (issue #180 review fix): amounts,
   // references and other people's booking ids. Never read or forged by a client.
   "consultationPaymentExceptions",

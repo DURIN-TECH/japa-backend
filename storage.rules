@@ -9,6 +9,8 @@ rules_version = '2';
 //   compliance/…           agency KYC/KYB docs     (API: /agencies/me/compliance)
 //   agency-logos/…         agency logos            (API: /agencies/me/logo)
 //   guidance-snapshots/…   backend-only scraper snapshots
+//   users/{uid}/feedback/… in-app feedback screenshots (issue #257; private,
+//                          read by the team through signed links in the email)
 // The apps reach those only through the API, which authorises the caller and
 // hands out short-lived signed URLs for validated paths
 // (functions/src/utils/storage-paths.ts). Do NOT add a `match` for them.
@@ -172,5 +174,9 @@ service firebase.storage {
     //  - guidance-snapshots/{sourceId}/{contentHash}.json: cleaned text of
     //    fetched caseworker guidance, kept for internal quote validation only
     //    (issue #39). Never served to a client.
+    //  - users/{uid}/feedback/{uuid}_{file}: screenshots attached to in-app
+    //    feedback (issue #257). Uploaded with a signed URL, read by the team
+    //    through a 7-day signed link. The `users/{userId}/profile/…` match
+    //    above is the ONLY `users/…` path with rules, so this folder is closed.
   }
 }

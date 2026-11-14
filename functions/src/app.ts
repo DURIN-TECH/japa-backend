@@ -33,6 +33,7 @@ import { adminOutcomeStatisticsRoutes } from "./scrapers";
 import { agencyVisaRoutes } from "./agency-visas";
 // Agency per-visa service prices, in whole naira (issue #103).
 import { agencyVisaPriceRoutes } from "./agency-visa-prices";
+import { feedbackRoutes } from "./routes/feedback.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
@@ -128,6 +129,8 @@ app.use("/document-requests", documentRequestRoutes);
 app.use("/transactions", transactionRoutes);
 app.use("/consultations", consultationRoutes);
 app.use("/notifications", notificationRoutes);
+// In-app tester feedback (issue #257).
+app.use("/feedback", feedbackRoutes);
 app.use("/payment-requests", paymentRequestRoutes);
 app.use("/conversations", messagingRoutes);
 app.use("/bank-accounts", bankAccountRoutes);
