@@ -2,7 +2,8 @@ import { createHash } from "crypto";
 import { getStorage } from "firebase-admin/storage";
 import { Timestamp } from "firebase-admin/firestore";
 import { collections, db } from "../../utils/firebase";
-import { rubricStore } from "../../scrapers";
+import { rubricStore, type RulebookStack } from "../../scrapers";
+import { defaultRulebookStack, rulebookFor, type ApplicationStackRef } from "./application-rulebook";
 import type { Application, Document, User } from "../../types";
 import type { VisaRubric } from "../../types/rubric";
 import type { RefusalAnalysis } from "../../types/refusal-letter";
@@ -72,6 +73,11 @@ export type RefusalRequestOutcome =
 export interface RefusalDeps {
   provider: LlmProvider;
   getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null>;
+  // (#233 P4b) The application's merged rulebook STACK (application-rulebook.ts). The
+  // letter's reasons are matched to rules and the re-application checklist cites them,
+  // so a route with a shared layer must see the shared rules too. Optional: without it
+  // (a fake written before) the own layer alone is read, exactly as before.
+  getRulebookStack?(app: ApplicationStackRef): Promise<RulebookStack>;
   loadBytes(storagePath: string): Promise<Buffer>;
   runTransaction<T>(fn: (tx: FirebaseFirestore.Transaction) => Promise<T>): Promise<T>;
   readSettings(): Promise<AiSettingsRead>;
@@ -82,6 +88,7 @@ function defaultDeps(): RefusalDeps {
   return {
     provider: new AnthropicLlmProvider(),
     getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc.toUpperCase(), vt),
+    getRulebookStack: (app) => defaultRulebookStack(app),
     loadBytes: async (storagePath) => {
       const [bytes] = await getStorage().bucket().file(storagePath).download();
       return bytes;
@@ -354,7 +361,9 @@ export class RefusalLetterService {
     }
 
     // ---- the approved rubric for the application's route (null is allowed) ----
-    const rubric = await this.deps.getApprovedRubric(app.countryCode, app.visaTypeId);
+    // (#233 P4b) The merged STACK (shared layers + the own layer); a route with
+    // no inheritance reads exactly `getApprovedRubric` as before.
+    const rubric = await rulebookFor(app, this.deps);
     // Per-destination, tied to the rubric's own criterion when it has one.
     const disclosureNotice = resolveDisclosureNotice(app.countryCode, rubric);
 
