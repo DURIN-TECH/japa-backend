@@ -90,7 +90,9 @@ export class ApplicationController {
       // the boolean `true`, so a stray "false" string can't bypass) to proceed.
       // Runs BEFORE the plan limit so the user sees the existing application
       // rather than an upgrade wall.
-      if (confirmNew !== true) {
+      // Self mode only: an agent-mode start is a deliberate choice of agent and
+      // is not guarded.
+      if (mode === "self" && confirmNew !== true) {
         const existing = await applicationService.findActiveDuplicate(
           userId,
           countryCode,
@@ -102,7 +104,19 @@ export class ApplicationController {
             error: "DUPLICATE_ACTIVE_APPLICATION",
             message:
               "You already have an active application for this visa. Continue it, or confirm to start a new one.",
-            data: { existingApplication: existing },
+            // Slim summary only (#253 review): no notes, admin fields,
+            // contact details or cost leave the server here.
+            data: {
+              existingApplication: {
+                id: existing.id,
+                visaTypeName: existing.visaTypeName,
+                countryName: existing.countryName,
+                status: existing.status,
+                progress: existing.progress,
+                mode: existing.mode,
+                lastUpdated: existing.lastUpdated,
+              },
+            },
           });
           return;
         }

@@ -147,13 +147,41 @@ describe("POST /applications duplicate guard", () => {
   });
 
   test("existing active application: 409 with it, nothing created", async () => {
-    existing = { id: "app-1", status: "draft" };
+    existing = {
+      id: "app-1",
+      status: "draft",
+      progress: 10,
+      mode: "self",
+      visaTypeName: "Skilled Worker",
+      countryName: "United Kingdom",
+      lastUpdated: "t",
+      // must NOT leak:
+      agentNotes: "secret",
+      clientEmail: "a@b.c",
+      totalCost: 5,
+    };
     const r = await post();
     assert.equal(r.status, 409);
     assert.equal(r.body.success, false);
     assert.equal(r.body.error, "DUPLICATE_ACTIVE_APPLICATION");
-    assert.deepEqual(r.body.data.existingApplication, existing);
+    assert.deepEqual(r.body.data.existingApplication, {
+      id: "app-1",
+      status: "draft",
+      progress: 10,
+      mode: "self",
+      visaTypeName: "Skilled Worker",
+      countryName: "United Kingdom",
+      lastUpdated: "t",
+    });
     assert.equal(created, 0);
+  });
+
+  test("agent mode is unaffected: no lookup, created", async () => {
+    existing = { id: "app-1", status: "draft" };
+    const r = await post({ mode: "agent", agentId: "ag1" });
+    assert.equal(r.status, 201);
+    assert.equal(created, 1);
+    assert.equal(lookups, 0);
   });
 
   test("confirmNew: true bypasses the guard (no lookup) and creates", async () => {
