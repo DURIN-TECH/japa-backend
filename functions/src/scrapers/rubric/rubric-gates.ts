@@ -2,6 +2,7 @@ import { createHash } from "crypto";
 import type { AssessmentCriterion, IntakeQuestion, LeaveOutBasis, RubricPublishGateResult, RubricPublishLeftOut } from "../../types/rubric";
 import { isValidTrigger } from "../../utils/rubric-trigger";
 import { EXCLUSION_NOTE_MAX } from "./rubric-exclusions";
+import { REDRAFT_DUPLICATE_REASON } from "./rubric-repair";
 import type { RubricPublishSettings } from "./rubric-publish-settings";
 import { languageSupport } from "../language/language-lexicon";
 
@@ -389,8 +390,8 @@ export function evaluateGates(input: GateInput): GateReport {
   //
   //   counted      = leave-outs for CORRECTNESS: a quote that does not stand alone (mid-sentence,
   //                  several conditions, several dates) and every verdict of the independent check.
-  //                  NOT counted: a `possible_duplicate` (the partner stays and says the same: no
-  //                  information is lost) and a dropped trigger (the rule is kept).
+  //                  NOT counted: a `possible_duplicate` and a `checker:redraft_duplicate` (the partner
+  //                  stays and says the same: no information is lost) and a dropped trigger (the rule is kept).
   //   share(group) = counted in the group / rules in the group, for each of two groups:
   //                  GENERAL (apply to everyone) and SCOPED (`specialist` / `conditional`), and
   //                  for the whole draft. Held when ANY share is over `maxLeftOutShare`.
@@ -398,7 +399,9 @@ export function evaluateGates(input: GateInput): GateReport {
   // Why two groups: since #207 a rulebook keeps several hundred more rules (the specialist ones).
   // One share over the whole draft would dilute a bad reading of the general rules by the size of
   // that addition, so each group answers for itself and keeping more rules never hides a bad one.
-  const counted = leftOut.filter((l) => l.flagCode !== DUPLICATE_FLAG_CODE);
+  // (#244) A rule the check found wrong whose confirmed replacement is the same rule as another served rule is left
+  // out as `checker:redraft_duplicate`: like a `possible_duplicate`, the rule that stays says the same, so it is not counted.
+  const counted = leftOut.filter((l) => l.flagCode !== DUPLICATE_FLAG_CODE && l.reason !== REDRAFT_DUPLICATE_REASON);
   const groupOf = (c: AssessmentCriterion | undefined): "scoped" | "general" => (c !== undefined && isScopedRule(c) ? "scoped" : "general");
   const primaryRules = input.criteria.filter((c) => input.primarySourceIds.has(c.source?.sourceId));
   const primaryCounted = counted.filter((l) => input.primarySourceIds.has(byId.get(l.criterionId)?.source?.sourceId as string));

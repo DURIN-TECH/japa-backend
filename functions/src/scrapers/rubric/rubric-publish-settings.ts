@@ -61,6 +61,11 @@ export interface RubricPublishSettings {
   checkerRequestTimeoutMs: number;
   // (#223) Most failed protected rules one run will try to repair (0 = never repair: any failed bar holds at once).
   repairMaxRulesPerRun: number;
+  // (#244) Systemic guard of the ONE automatic re-draft of ordinary rules the check found wrong: when the
+  // rules eligible for it are more than this share (0..1) of the draft, or more than `ordinaryRepairMaxRules`,
+  // no ordinary rule is re-drafted (something is wrong with the whole draft, not with single rules).
+  ordinaryRepairMaxShare: number;
+  ordinaryRepairMaxRules: number;
 }
 
 /**
@@ -81,15 +86,25 @@ export interface RubricPublishSettings {
  *                                      attempted and the draft is held whole. Each repaired rule costs
  *                                      one re-draft request plus the check's requests, all counted
  *                                      inside `checkerMaxRequestsPerRun`.
+ *  - ordinaryRepairMaxRules            (#244) most ordinary rules (found wrong by the check) one run will
+ *                                      re-draft once each; MORE eligible rules than this and no ordinary
+ *                                      rule is re-drafted (the draft is judged by the budget as before).
+ *                                      0 = never re-draft ordinary rules. Its share twin,
+ *                                      `ordinaryRepairMaxShare`, is a share and lives with the shares below.
+ *
+ * (#244) `checkerMaxRequestsPerRun` rose from 120 to 200 (owner-approved default): a run that re-drafts
+ * about 57 ordinary rules makes about 57 re-draft requests plus about 10 check requests for the
+ * replacements on top of the check's own ~90, over the old 120. All requests still count inside it.
  */
 export const DEFAULT_CHECKER_CAPS = Object.freeze({
   checkerMaxRulesPerDraft: 1_000,
-  checkerMaxRequestsPerRun: 120,
+  checkerMaxRequestsPerRun: 200,
   checkerMaxInputCharsPerRun: 2_000_000,
   checkerMaxOutputTokensPerRequest: 8_000,
   checkerMaxRunsPerDay: 20,
   checkerRequestTimeoutMs: 240_000,
   repairMaxRulesPerRun: 5,
+  ordinaryRepairMaxRules: 80,
 });
 type CheckerCapKey = keyof typeof DEFAULT_CHECKER_CAPS;
 
@@ -102,6 +117,7 @@ const CHECKER_CAP_RANGES: Record<CheckerCapKey, readonly [number, number]> = {
   checkerMaxRunsPerDay: [1, 1_000],
   checkerRequestTimeoutMs: [10_000, 600_000],
   repairMaxRulesPerRun: [0, 50],
+  ordinaryRepairMaxRules: [0, 500],
 };
 
 /** Defaults, from the issue (#201). `mode` defaults to `manual`: fail closed. */
@@ -111,6 +127,8 @@ export const DEFAULT_PUBLISH_SETTINGS: Readonly<Omit<RubricPublishSettings, "rou
   maxLeftOutShare: 0.15,
   maxPrimaryLeftOutShare: 0.2,
   minKeptShareOfServing: 0.7,
+  // (#244) Eligible ordinary rules above this share of the draft: no ordinary re-draft (a systemic fault).
+  ordinaryRepairMaxShare: 0.2,
   ...DEFAULT_CHECKER_CAPS,
 });
 
@@ -119,6 +137,7 @@ const SHARE_RANGES = {
   maxLeftOutShare: [0, 1],
   maxPrimaryLeftOutShare: [0, 1],
   minKeptShareOfServing: [0, 1],
+  ordinaryRepairMaxShare: [0, 1],
 } as const satisfies Record<string, readonly [number, number]>;
 type ShareKey = keyof typeof SHARE_RANGES;
 

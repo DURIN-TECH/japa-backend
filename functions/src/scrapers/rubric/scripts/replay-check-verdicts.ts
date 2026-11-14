@@ -9,7 +9,9 @@
  * `rubric-verdict-replay.ts`.
  *
  * Run (from functions/):
- *   npm run build && node lib/scrapers/rubric/scripts/replay-check-verdicts.js --rules <file.json> [--primary <sourceId>,<sourceId>]
+ *   npm run build && node lib/scrapers/rubric/scripts/replay-check-verdicts.js --rules <file.json> [--primary <sourceId>,<sourceId>] [--repair [--rates 0.5,0.62,0.75]]
+ * With --repair (#244) it also reports how many rules the ordinary re-draft would try, the request estimate against the
+ * cap and the leave-out shares if a stated share of the re-drafts were repaired and confirmed (an assumption, not a measurement).
  * Prints counts and rule ids only.
  */
 import { readFileSync } from "node:fs";
@@ -41,6 +43,19 @@ async function main(): Promise<void> {
   console.log(`check leave-outs: ${r.foundWrong} found wrong, ${r.notConfirmed} not confirmed; code leave-outs: ${JSON.stringify(r.codeLeftOut)}`);
   console.log(`by reason: ${JSON.stringify(r.byReason)}`);
   console.log(`now kept (left out in the stored run): ${r.nowKept}; protected rules that would hold: ${r.heldProtected.length}`);
+  if (process.argv.includes("--repair")) {
+    const { estimateOrdinaryRepair } = await import("../rubric-verdict-replay");
+    const { DEFAULT_PUBLISH_SETTINGS } = await import("../rubric-publish-settings");
+    const rates = (arg("rates") ?? "0.5,0.62,0.75").split(",").map(Number).filter((n) => Number.isFinite(n) && n >= 0 && n <= 1);
+    const e = estimateOrdinaryRepair(rules, primary, DEFAULT_PUBLISH_SETTINGS, rates);
+    const f = (n: number) => `${(100 * n).toFixed(1)} %`;
+    console.log(`\nordinary re-draft (#244): eligible ${e.eligible} (general ${e.eligibleBy.general}, scoped ${e.eligibleBy.scoped}, primary ${e.eligibleBy.primary}); guard: ${e.guard} (more than ${DEFAULT_PUBLISH_SETTINGS.ordinaryRepairMaxShare * 100} % of the draft or ${DEFAULT_PUBLISH_SETTINGS.ordinaryRepairMaxRules} rules skips every re-draft)`);
+    console.log(`requests: check ~${e.requests.baseCheck} + re-drafts ${e.requests.redraft} + replacement checks ~${e.requests.replacementCheck} = ~${e.requests.total} against the cap ${e.requests.cap}: ${e.requests.fitsCap ? "fits" : "OVER the cap"}`);
+    const line = (label: string, s: (typeof e.before)) => console.log(`${label}: overall ${s.overall.counted.toFixed(1)} of ${s.overall.of} (${f(s.overall.share)}); general ${f(s.general.share)}; scoped ${f(s.scoped.share)}; primary ${f(s.primary.share)}; budget ${s.withinBudget ? "passes" : "held"}`);
+    line("no repair   ", e.before);
+    for (const s of e.scenarios) line(`${Math.round(s.successRate * 100)} % repaired`.padEnd(12), s);
+    console.log(`eligible ids: ${e.eligibleIds.join(", ")}`);
+  }
 }
 
 main().catch((err) => {

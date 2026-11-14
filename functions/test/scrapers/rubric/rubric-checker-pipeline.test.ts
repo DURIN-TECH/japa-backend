@@ -672,3 +672,145 @@ describe("wording and records (#223)", () => {
     assert.deepEqual([...PLANNER_WRITABLE_FIELDS], ["questionPlan", "ruleRepairs"]);
   });
 });
+
+// ============================================
+// Ordinary-rule repair through the pipeline (issue #244)
+// ============================================
+//
+// An ordinary rule the check finds WRONG gets one re-draft; the replacement, checked by one model, is served in
+// its place. The gates, the question plan and the approval run on the rulebook WITH the replacements; the run
+// record, the alert and the audit list them. Route A has ten rules (nine ordinary): two found wrong is 20 %,
+// over the 15 % budget unless they are repaired, and exactly at (not over) the 20 % guard.
+
+const WRONG_A = "Valid application";
+const WRONG_B = "No set level of funds";
+
+/** What the model answers to an ordinary re-draft: the same quote, a renewed title. */
+const renewed = ({ shown }: { shown: Record<string, any> }) =>
+  criteriaWire(answer({ criteria: [crit({ ref: "r1", title: `Renewed ${shown.title}`, kind: shown.kind, stage: shown.stage, quote: shown.quote, probeFactors: ["a factor"] })] }));
+const bothWrong = ({ rule }: { rule: any }) => (rule.title === WRONG_A || rule.title === WRONG_B ? { title_faithful: "no" as const } : undefined);
+
+describe("an ordinary rule found wrong is repaired once, through the pipeline (#244)", () => {
+  test("both repaired and confirmed: published (the budget sees the replacements), served = the replacements, record, audit, alert and plan all say so", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    w.provider.policy = bothWrong;
+    w.provider.redraftPolicy = renewed;
+    const planner = plannerStub();
+    const planned: any[] = [];
+    const spyPlanner = { plan: async (i: any) => (planned.push(i), planner.plan(i)) } as any;
+    const r = await trigger(service({ checker: w.checker, planner: spyPlanner }));
+
+    assert.equal(r?.outcome, "published", JSON.stringify(r?.reasonCodes));
+    // The budget: nothing is left out, although 2 of 10 were found wrong (20 % would have held).
+    assert.equal(r?.counts.leftOut, 0);
+    assert.equal(r?.counts.ordinaryRepairs?.repaired, 2);
+    assert.equal(r?.counts.ordinaryRepairs?.eligible, 2);
+    // Stored draft untouched; the replacements recorded beside it; served = replacements.
+    const stored = versionDoc(KEY_A, 1);
+    assert.ok(stored.criteria.some((c: any) => c.title === WRONG_A), "the original stays: the audit trail");
+    assert.equal(stored.ruleRepairs.length, 2);
+    const served = await servedA();
+    assert.equal(served.criteria.length, 10);
+    assert.ok(served.criteria.some((c: any) => c.title === `Renewed ${WRONG_A}`) && !served.criteria.some((c: any) => c.title === WRONG_A));
+    // The question plan was built on the FINAL rule set: it saw the replacements and no exclusion of them.
+    assert.equal(planned.length, 1);
+    assert.ok(planned[0].rubric.criteria.some((c: any) => c.title === `Renewed ${WRONG_B}`));
+    assert.ok(!planned[0].rubric.criteria.some((c: any) => c.title === WRONG_B));
+    assert.deepEqual(planned[0].excludedCriterionIds, []);
+    // Run record, audit, alert.
+    const rec = runs()[0];
+    assert.deepEqual(rec.ordinaryRepairs?.map((x) => x.repair.status), ["repaired", "repaired"]);
+    assert.equal(rec.counts.ordinaryRepairs?.requests.redraft, 2);
+    assert.ok(rec.gates.some((g) => g.gate === "ordinary_repair" && /2 eligible: 2 repaired/.test(g.detail ?? "")));
+    assert.equal(audits()[0].repairedCriterionIds.length, 2);
+    assert.match(alerts().find((a) => a.rule === "rubric_auto_published").message, /Ordinary rules the check found wrong, re-drafted once automatically and confirmed/);
+    // ONE model read the replacements; 2 re-drafts; one check batch.
+    assert.equal(repairCalls(w.provider).length, 2);
+    assert.deepEqual(rec.checkerRequests, { total: 8, repair: 3 });
+  });
+
+  test("one repaired, one still failing: published with ONE leave-out (10 %), recorded with its repair status", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    w.provider.policy = (ctx) => (ctx.rule.title === `Renewed ${WRONG_B}` ? { condition_faithful: "no" as const } : bothWrong(ctx));
+    w.provider.redraftPolicy = renewed;
+    const r = await trigger(pipeline(w.checker));
+    assert.equal(r?.outcome, "published");
+    assert.equal(r?.counts.leftOut, 1);
+    assert.equal(r?.leftOut[0].basis, "found_wrong");
+    const rec = runs()[0];
+    assert.deepEqual(rec.ordinaryRepairs?.map((x) => x.repair.status), ["repaired", "failed_check"]);
+    assert.equal(versionDoc(KEY_A, 1).ruleRepairs.length, 1);
+    assert.equal(versionDoc(KEY_A, 1).excludedCriterionIds.length, 1);
+  });
+
+  test("both still failing: held on the budget as before, the run says by how much and what the repairs did; nothing published", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    w.provider.policy = (ctx) => (String(ctx.rule.title).startsWith("Renewed") ? { condition_faithful: "no" as const } : bothWrong(ctx));
+    w.provider.redraftPolicy = renewed;
+    const r = await trigger(pipeline(w.checker));
+    assert.equal(r?.outcome, "held");
+    assert.ok(r?.reasonCodes.includes("leave_out_budget_exceeded"));
+    assertUntouched(KEY_A, 1, 0, null);
+    assert.equal(versionDoc(KEY_A, 1).ruleRepairs, undefined);
+    assert.match(runs()[0].gates.find((g) => g.gate === "leave_out_budget")?.detail ?? "", /2 of 10 left out for correctness/);
+    assert.equal(runs()[0].counts.ordinaryRepairs?.failedCheck, 2);
+  });
+
+  test("a repair cut off by the provider while the budget fails holds with the RETRYABLE reason; the sweep finishes it and nothing is re-drafted twice", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    w.provider.policy = bothWrong;
+    w.provider.redraftPolicy = renewed;
+    // Every re-draft request fails hard (the provider): nothing is repaired, so both stay left out (20 %).
+    w.provider.script = (_n, req) => (isRepairRequest(req) ? "hard" : undefined);
+    const svc = pipeline(w.checker);
+    const r = await trigger(svc);
+    assert.equal(r?.outcome, "held");
+    assert.deepEqual(r?.reasonCodes, ["checker_unavailable:provider"], "not the budget code: the budget might still be met");
+    assert.equal(runs()[0].counts.ordinaryRepairs?.cutOff, "provider");
+    assertUntouched(KEY_A, 1, 0, null);
+
+    w.provider.script = () => undefined;
+    assert.deepEqual((await quiet(() => svc.sweepRetryable())).result, { considered: 1, retried: 1 });
+    assert.equal(versionDoc(KEY_A, 1).reviewStatus, "approved");
+    assert.equal(versionDoc(KEY_A, 1).ruleRepairs.length, 2);
+    // Two failed requests (not attempts: nothing was stored) and then the two re-drafts that worked: no rule twice.
+    assert.equal(repairCalls(w.provider).length, 4);
+  });
+
+  test("more eligible rules than the guard allows: no ordinary re-draft, the run record says ordinary_repair_skipped:too_many, judged by the budget as today", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    w.provider.policy = ({ rule }) => (["Valid application", "No set level of funds", "Third party support"].includes(rule.title) ? { title_faithful: "no" as const } : undefined);
+    w.provider.redraftPolicy = renewed;
+    const r = await trigger(pipeline(w.checker)); // 3 of 10 = 30 % > 20 %
+    assert.equal(r?.outcome, "held");
+    assert.equal(repairCalls(w.provider).length, 0);
+    assert.equal(runs()[0].counts.ordinaryRepairs?.skipped, "too_many");
+    assert.ok(runs()[0].gates.some((g) => g.gate === "ordinary_repair" && /ordinary_repair_skipped:too_many/.test(g.detail ?? "")));
+    assert.ok(runs()[0].reasonCodes.includes("leave_out_budget_exceeded"));
+  });
+
+  test("the approval validates the rulebook WITH the replacements: a replacement that breaks the structure is refused by the shared transaction, never served", async () => {
+    await seedA();
+    settings();
+    const w = wired();
+    w.provider.policy = bothWrong;
+    w.provider.redraftPolicy = renewed;
+    // The pipeline's own structural run already includes the replacements; prove the transaction does too by
+    // reading what it is given: the recorded field is the planner field `ruleRepairs`, applied before validation.
+    const svc = pipeline(w.checker);
+    await trigger(svc);
+    const extra = (svc as any).decideCalls[0][3].extraReviewFields;
+    assert.equal(extra.ruleRepairs.length, 2);
+    assert.ok(PLANNER_WRITABLE_FIELDS.includes("ruleRepairs"));
+  });
+});

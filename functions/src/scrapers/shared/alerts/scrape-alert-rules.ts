@@ -1159,6 +1159,11 @@ export interface RubricPublishAlertFacts {
   // aspects that failed and what the one automatic repair did (a held alert), or the bars that were
   // repaired (a published alert). Each line is plain words built by the pipeline from data, never code.
   protectedFindings?: string[];
+  // (#244) The automatic re-draft of ordinary rules the check found wrong: one line of counts (what was
+  // eligible, repaired, refused, covered by another rule, left over and the requests it cost), and one line
+  // per rule that now stands as its replacement. Plain words built by the pipeline from data.
+  ordinaryRepairSummary?: string;
+  ordinaryRepairedRules?: string[];
 }
 
 /** `route key + version`, the id shown in the link and used in dedupe keys. */
@@ -1214,6 +1219,11 @@ export function evaluateRubricAutoPublished(facts: RubricPublishAlertFacts, conf
   }
   if (facts.protectedFindings && facts.protectedFindings.length > 0) {
     lines.push("Protected rules re-drafted once automatically and confirmed by both checks:", ...facts.protectedFindings.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((f) => `- ${f}`));
+  }
+  if (facts.ordinaryRepairSummary) lines.push(facts.ordinaryRepairSummary);
+  if (facts.ordinaryRepairedRules && facts.ordinaryRepairedRules.length > 0) {
+    lines.push("Ordinary rules the check found wrong, re-drafted once automatically and confirmed (served as the replacement):", ...facts.ordinaryRepairedRules.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((f) => `- ${f}`));
+    if (facts.ordinaryRepairedRules.length > MAX_LISTED_PRIMARY_LEAVE_OUTS) lines.push("- ...");
   }
   lines.push(`Informational remarks: ${countsLine(facts.informationalFlags)}.`);
   if (facts.sample.length > 0) {
@@ -1272,6 +1282,7 @@ export function evaluateRubricDraftHeld(facts: RubricPublishAlertFacts, config: 
     lines.push("Protected rules (bars on a named group) the check did not confirm:", ...facts.protectedFindings.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((f) => `- ${f}`));
     if (facts.protectedFindings.length > MAX_LISTED_PRIMARY_LEAVE_OUTS) lines.push("- ...");
   }
+  if (facts.ordinaryRepairSummary) lines.push(facts.ordinaryRepairSummary);
   lines.push(`Informational remarks: ${countsLine(facts.informationalFlags)}.`);
   lines.push(`Look at it, run the check again or publish it by hand: ${facts.link}`);
   return {

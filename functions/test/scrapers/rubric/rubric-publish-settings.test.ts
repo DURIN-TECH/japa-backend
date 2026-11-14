@@ -37,14 +37,14 @@ beforeEach(() => resetStore());
 describe("publish settings: resolution and fallbacks", () => {
   test("no doc: manual with the issue's defaults, and no allowlist (every route)", () => {
     const { settings, problems } = resolvePublishSettings(undefined);
-    assert.deepEqual(settings, { mode: "manual", pauseAfterRollback: true, maxLeftOutShare: 0.15, maxPrimaryLeftOutShare: 0.2, minKeptShareOfServing: 0.7, ...DEFAULT_CHECKER_CAPS });
+    assert.deepEqual(settings, { mode: "manual", pauseAfterRollback: true, maxLeftOutShare: 0.15, maxPrimaryLeftOutShare: 0.2, minKeptShareOfServing: 0.7, ordinaryRepairMaxShare: 0.2, ...DEFAULT_CHECKER_CAPS });
     assert.deepEqual(problems, []);
     assert.equal(routeAllowed(settings, "XA_any"), true);
   });
 
   test("a valid doc is used as it is", () => {
     const { settings, problems } = resolvePublishSettings({ mode: "auto", routeAllowlist: ["XA_xa-short-visit"], pauseAfterRollback: false, maxLeftOutShare: 0.1, maxPrimaryLeftOutShare: 0.3, minKeptShareOfServing: 0.9 });
-    assert.deepEqual(settings, { mode: "auto", routeAllowlist: ["XA_xa-short-visit"], pauseAfterRollback: false, maxLeftOutShare: 0.1, maxPrimaryLeftOutShare: 0.3, minKeptShareOfServing: 0.9, ...DEFAULT_CHECKER_CAPS });
+    assert.deepEqual(settings, { mode: "auto", routeAllowlist: ["XA_xa-short-visit"], pauseAfterRollback: false, maxLeftOutShare: 0.1, maxPrimaryLeftOutShare: 0.3, minKeptShareOfServing: 0.9, ordinaryRepairMaxShare: 0.2, ...DEFAULT_CHECKER_CAPS });
     assert.deepEqual(problems, []);
     assert.equal(routeAllowed(settings, "XA_xa-short-visit"), true);
     assert.equal(routeAllowed(settings, "XZ_other"), false);
