@@ -35,9 +35,15 @@ const FIELD_ALLOWED = new Set([
   "types/rubric.ts", // the type
   "scrapers/rubric/rubric-translation.ts", // builds / reads it
   "scrapers/rubric/rubric-extraction.service.ts", // writes it onto the draft
+  // The evaluation tooling copies translations into the human sample sheet, labelled: it calls no model with them.
+  "scrapers/rubric/scripts/evaluate-language.ts",
 ]);
 /** The ONLY files that may import the translation module. */
-const IMPORT_ALLOWED = new Set(["scrapers/rubric/rubric-extraction.service.ts"]);
+const IMPORT_ALLOWED = new Set([
+  "scrapers/rubric/rubric-extraction.service.ts",
+  "scrapers/rubric/rubric-language-eval.ts", // the label, for the human sample sheet
+  "scrapers/index.ts", // the public API re-export (the label and the view clients will show)
+]);
 
 describe("an unofficial translation is never evidence", () => {
   test("only the files that define and write the field mention `quoteTranslations`", () => {
