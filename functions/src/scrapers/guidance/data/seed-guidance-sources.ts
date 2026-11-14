@@ -396,7 +396,9 @@ export function buildSeededGuidanceSource(
       : null,
     checkIntervalHours: seed.checkIntervalHours,
     // null (not undefined) so a role removed from the seed is cleared.
-    role: seed.role ?? null,
+    // Issue #215: an admin's role edit (PATCH /admin/guidance-sources/:id sets
+    // `roleEditedBy`) belongs to Firestore: the seed keeps the stored role.
+    role: existing?.roleEditedBy ? ((existing.role as string | null | undefined) ?? null) : (seed.role ?? null),
     verificationStatus: seed.verificationStatus,
     verificationNote: seed.verificationNote.trim(),
     retrievedAt: seed.retrievedAt ? Timestamp.fromMillis(Date.parse(seed.retrievedAt)) : null,

@@ -5,6 +5,7 @@ import { collections, db, subcollections } from "../../utils/firebase";
 // forked, wrapped in another HTTP client, or given its own etiquette.
 import {
   HtmlTextTooLongError,
+  isHostNotAllowedError,
   visaCatalogFetchService,
   type FetchedPage,
   type RawResponse,
@@ -30,6 +31,7 @@ import { leaseHeldReason, sourceLeaseService, type SourceLeaseService } from "..
 import type { ScrapeRunSourceStatus, ScrapeRunTrigger } from "../shared/runs/types";
 import { extractPublishedDate, publishedDateSelectorProblem } from "./guidance-published-date";
 import { GuidanceResolveError, linkPatternHost, resolveDocumentUrl } from "./guidance-resolve";
+import { officialDomainsService } from "../shared/registry/official-domains.service";
 import { GUIDANCE_SOURCE_ID_RE, guidanceSnapshotStore, type GuidanceSnapshotStore } from "./guidance-snapshot.store";
 import type { GuidanceSnapshotMeta, GuidanceSource, GuidanceSourceStatus } from "./types";
 
@@ -99,6 +101,7 @@ export type GuidanceFailureKind =
   | "resolve_failed" // `resolveFrom`: the parent page gave no single address (#111)
   | "robots_blocked" // robots.txt disallows the URL
   | "host_backoff" // the host answered 429/503
+  | "host_not_confirmed" // a portal-added source whose address or redirect is not on a confirmed host (#215)
   | "pdf_unreadable" // a PDF the reader refused (encrypted, scanned, too big, ...)
   | "text_too_long" // a web page over GUIDANCE_MAX_HTML_TEXT_CHARS
   | "storage_error" // the snapshot text could not be stored (OUR side)
@@ -202,7 +205,7 @@ export interface GuidanceCrawlSummary {
 export interface GuidanceFetcher {
   fetchAndClean(
     url: string,
-    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number }
+    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number; allowedHost?: (host: string) => boolean }
   ): Promise<FetchedPage>;
   // Needed only for a source with `resolveFrom` (issue #111): the robots
   // check and the raw GET of the parent page. Optional so a fetcher that
@@ -296,6 +299,7 @@ export function failureKindOf(err: unknown): GuidanceFailureKind {
   if (err instanceof GuidanceCrawlError || err instanceof GuidanceInfraError) return err.kind;
   if (err instanceof GuidanceResolveError) return "resolve_failed";
   if (isHostBackoffError(err)) return "host_backoff";
+  if (isHostNotAllowedError(err)) return "host_not_confirmed";
   if (isPdfFetchError(err)) {
     // "not-accepted" = the registry says web page but the URL served a PDF.
     return err.reason === "not-accepted" ? "content_type_changed" : "pdf_unreadable";
@@ -391,6 +395,11 @@ export class GuidanceCrawlService {
   private get fetcher(): GuidanceFetcher {
     return this.injectedFetcher ?? visaCatalogFetchService;
   }
+  /**
+   * Issue #215: where the confirmed-hosts allow-list comes from. Tests replace
+   * it. Called at most once per portal-added source crawl.
+   */
+  confirmedHosts: () => Promise<Set<string>> = () => officialDomainsService.confirmedHosts();
   /** The snapshot text store in use. */
   private get store(): GuidanceSnapshotStore {
     return this.injectedStore ?? guidanceSnapshotStore;
@@ -899,10 +908,22 @@ export class GuidanceCrawlService {
 
     // 1. Fetch through the shared path. `acceptPdf: false` for a web-page
     //    source refuses a PDF on its headers, before downloading it.
+    //    Issue #215: a source an admin added from the portal may only be read
+    //    from CONFIRMED hosts: the requested host, every redirect hop (refused
+    //    before it is requested) and the final URL. The allow-list is read
+    //    fresh and fails closed: if it cannot be read the source is not fetched
+    //    and the failure is recorded as the source's error. Seeded sources are
+    //    unchanged (they have their own `expectedFinalUrl` baseline).
+    let allowedHost: ((h: string) => boolean) | undefined;
+    if (source.addedVia === "portal") {
+      const hosts = await this.confirmedHosts();
+      allowedHost = (h: string) => hosts.has(h.toLowerCase());
+    }
     const page = await this.fetcher.fetchAndClean(requestUrl, {
       checkRobots: true,
       acceptPdf: source.docType === "pdf",
       maxHtmlTextChars: GUIDANCE_MAX_HTML_TEXT_CHARS,
+      ...(allowedHost ? { allowedHost } : {}),
     });
 
     // 2. The document must still be the kind the registry says it is.
