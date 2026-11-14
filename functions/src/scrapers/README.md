@@ -179,6 +179,66 @@ Two defects found by the first real run (a "protected" bar rejected by the indep
 - Prompt versions: extraction `2026-11-rubric-v7`, check `2026-11-checker-v3`. Both fields are optional: earlier stored versions load unchanged.
 - Re-check two saved rules without a re-extraction: `scripts/recheck-list-and-group.ts` (offline by default; `--live` runs the two-model check on only those rules).
 
+## Non-English sources (`language/`, `rubric-translation.ts`, `rubric-language-eval.ts`; issue #220, part P5 of #211)
+
+Official pages are not always in English. The rules for a language that has not
+been evaluated are conservative: it is held, never published by itself.
+
+- **Quotes stay in the page's language and are validated in it.** Nothing is
+  translated for validation. The quote check is a text match; the part that
+  READS numbers, dates, durations and reference shapes out of a quote
+  (`rubric-quote.ts`) takes its language facts from a per-language lexicon, a
+  DATA file in `language/lexicons/<code>.json` (format and how to add a language:
+  `language/README.md`). No language is named in code (a test fails if one is).
+  The product language's lexicon reproduces the old readings exactly (a golden
+  file produced by the old code, `test/scrapers/rubric/fixtures/english-readings.golden.json`).
+  A language with no file is read STRICTLY (whole digits only, no words, no month
+  names): fewer rules, never a guess, never another language's rules. An
+  unreadable number is still rejected, never accepted unverified.
+- **What the model writes is English.** Titles, questions, answer options and
+  document item names are written in the product language (extraction prompt
+  v8); no number, date, amount or group in that wording may be missing from the
+  quote, in digits or in words of the quote's language (the claim is read with
+  the product lexicon, the quote with the source's: "30 days" is supported by
+  "treinta días"). The independent check and the question check say the same
+  (prompt versions bumped: no stored verdict of an older version is reused).
+- **`sourceLanguages`** is recorded on every version (from each source's declared
+  `language`; a source with none counts as the product language, see
+  `language-lexicon.ts`), and each `sourceSnapshots[]` entry keeps its language
+  so the independent check reads the document in it.
+- **The publish gate**: a version is HELD `language_not_supported` (gate
+  `language_support`, before any check spend, alerted like every hold, not retried
+  by the sweep) unless every source language is in
+  `appConfig/routeOnboardingSettings.supportedLanguages` (default only the
+  product language) AND has a lexicon file. A failed settings read uses the
+  default list. After an admin enables a language, running the safeguards again
+  on the held draft publishes it through the same pipeline.
+- **Unofficial translations** (`quoteTranslations` on the version, keyed by rule
+  id: `text`, `language`, `model`, `promptVersion`, `unofficial: true`,
+  `quoteHash`): one model call per excerpt of a non-product-language source that
+  has accepted rules, a stored step of the drafting job (`c{n}__translate`),
+  counted against the request cap and in the onboarding estimate
+  (`translationCallsAtMost`). It is a courtesy and NEVER evidence: it is not in
+  `source.quote`, it is never passed to the extractor, checker, question check,
+  assessment or any letter (`rubric-translation-firewall.test.ts` greps the tree
+  and builds an assessment request to prove it), and a failed, cut-off or
+  capped translation just leaves the rule without one, never blocking the
+  version. The label is defined once (`UNOFFICIAL_TRANSLATION_LABEL`) and
+  exposed with the translation by `translationView`, which also refuses a
+  translation of a different quote (a repaired rule). Clients adopt it in their
+  own issues (FU-1).
+- **Evaluation before enabling**: `npm run evaluate:language` (script header
+  explains it). Offline by default (reads a stored version and the stored page
+  files, rechecks every kept rule in the page's language, writes a report and a
+  20-rule sample sheet); `--live` drafts and checks in memory and spends model
+  calls; `--score` computes the check's agreement with a person's read of the
+  sheet. It enables nothing: a person adds the language to `supportedLanguages`
+  after reading it.
+- **Known limit**: a group name must start with a capital letter
+  (`groupNameSupported`), which many languages do not do for nationality
+  adjectives; such a bar is rejected (fail closed) or, for a non-nationality
+  member, expressed as `appliesTo.uncoded` (a phrase of two words or more).
+
 ## A failed bar: one repair, then hold (issue #223)
 
 Before #223 any protected rule that failed the independent check stopped the run on the spot: the ordinary rules were never checked, no question plan was built and a route with no earlier version served nothing. Now (`rubric-checker.ts`, `repairFailed`; the drafting entry is `RubricExtractionService.redraftRule`):
