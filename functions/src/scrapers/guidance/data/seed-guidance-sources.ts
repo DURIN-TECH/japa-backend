@@ -187,6 +187,541 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
       "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
     retrievedAt: "2026-11-11T10:48:41Z",
   },
+
+  // ============================================
+  // UK FAMILY (route key "uk-family-visa", visa type gb-uk-family-visa; issue #260)
+  // ============================================
+  //
+  // The route key follows the registry convention: the visa type id without
+  // its country prefix (gb-uk-family-visa -> uk-family-visa), the same rule
+  // route-onboarding.service.ts uses to find a route's guidance.
+  //
+  // Documents, each requested once on 2026-11-14 through the shared fetch
+  // service (the crawl's own code path: bot user agent, robots.txt checked,
+  // per-host delay), with the numbers in each note taken from that request:
+  //  - Appendix FM (the route's own rules)                       -> primary
+  //  - Appendix FM-SE (the evidence Appendix FM specifies)       -> secondary
+  //  - the Family Policy caseworker guidance, web + PDF          -> route_guidance
+  //  - the minimum income requirement caseworker guidance (PDF)  -> route_guidance
+  //
+  // Cross-route documents reused BY ID, not re-registered (one source per URL;
+  // the validator refuses a duplicate URL):
+  //  - gb-part-suitability: Appendix FM S-EC.1.1 says "The applicant must not
+  //    fall for refusal under Part Suitability."
+  //  - gb-appendix-finance: Appendix FM-SE paragraph 1(a)(i) says bank
+  //    statements must "be from a financial institution to which Appendix
+  //    Finance applies."
+  // Both stay registered under the visitor route key; the rubric extraction
+  // reads a source by id (`--sources`), whatever route key it carries.
+  //
+  // Addresses: the two rules pages were taken from the publisher's index of
+  // the Immigration Rules (https://www.gov.uk/guidance/immigration-rules) on
+  // 2026-11-14; the guidance addresses from their publication pages that day.
+  {
+    id: "gb-appendix-fm-family-members",
+    // The route's own rules document.
+    role: "primary",
+    title: "Immigration Rules Appendix FM: family members",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-fm-family-members",
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (11:56 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "92,178 characters of cleaned text, sha256 4708f9d0ba479877bf397e8162eb6fd26058ee30c509aa061f222e95cd7e51c1. " +
+      "The address is the one the publisher's index of the rules linked to on that day. The text runs from the page " +
+      "title to the closing 'Deportation and removal' paragraph (it is not cut short). Read closely: GEN.1.1 to GEN.1.3, " +
+      "S-EC.1.1 and E-ECP.1.1 to E-ECP.4.1; the rest was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T11:56:56Z",
+  },
+  {
+    id: "gb-appendix-fm-se-specified-evidence",
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
+    role: "secondary",
+    title: "Immigration Rules Appendix FM-SE: family members specified evidence",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-fm-se-family-members-specified-evidence",
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (11:56 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "79,574 characters of cleaned text, sha256 9a7c644e39fc808fc4cd4426d3d233ccfd0f771eb3d06250f2976b6bd24ef801. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because Appendix FM " +
+      "(E-ECP.3.1, E-ECP.4.1 of the entry above) requires 'specified evidence', which this appendix specifies; it also " +
+      "serves other appendices, hence secondary. The text runs from the title to paragraph 37 (it is not cut short). " +
+      "Read closely: paragraphs A, A1 and 1(a); the rest was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T11:56:58Z",
+  },
+  {
+    id: "gb-family-life-guidance-html",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Family life (as a partner or parent) and exceptional circumstances caseworker guidance (accessible web version)",
+    url:
+      "https://www.gov.uk/government/publications/family-life-as-a-partner-or-parent-private-life-and-exceptional-circumstance/" +
+      "family-life-as-a-partner-or-parent-and-exceptional-circumstances-accessible",
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "html",
+    // The document's own line, "published for Home Office staff on <date>".
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (11:58 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "198,207 characters of cleaned text, sha256 d9edda222fa8d5b54cdc67c1fe66432d502e9777ec7f0d8cc85d06382bd84edb. " +
+      "The address is the one the publication page linked to on that day. The text states version 30.0, " +
+      "published for staff on 8 October 2026, and runs through the last numbered section (17, Coronavirus concessions). " +
+      "Read closely: sections 1, 5.1, the opening of 7.2, and 7.4 to 7.6; the rest was retrieved and skimmed, " +
+      "not read line by line.",
+    retrievedAt: "2026-11-14T11:58:53Z",
+  },
+  {
+    id: "gb-family-life-guidance-pdf",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Family life (as a partner or parent) and exceptional circumstances caseworker guidance (PDF)",
+    // The file's address ON THE DAY IT WAS RETRIEVED. It carries a per-release
+    // id and changes with every publication, so the crawl does not request
+    // this value: it reads the current address from `resolveFrom` each time.
+    url: "https://assets.publishing.service.gov.uk/media/6aec80a1d77f87d8c7b52f77/Family_life__as_a_partner_or_parent__and_exceptional_circumstances.pdf",
+    resolveFrom: {
+      // The stable publication page that always links to the current file.
+      pageUrl: "https://www.gov.uk/government/publications/family-life-as-a-partner-or-parent-private-life-and-exceptional-circumstance",
+      // The one PDF attachment on that page: any release id, any file name.
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]+\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "pdf",
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (11:59 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "851,541-byte PDF, 91 pages, every page with a text layer, 216,336 characters of cleaned text, " +
+      "sha256 e3506e178d3f87225cf0c3679eb5b2937b657d6a9f8376e07ebef417266b1583. The file's address was read from the " +
+      "publication page on that day (it was the only PDF linked there; the resolveFrom lookup returned it). Each page " +
+      "is headed 'Published for Home Office staff on 8 October 2026'; page 1 states version 30.0. " +
+      "Read closely: the passages pinned in guidance-quote-checks.ts, which correspond to sections 1, 5.1 and 7.2 of the " +
+      "web version (the PDF's headings are not numbered); the rest was retrieved and skimmed, not read line by line.",
+    retrievedAt: "2026-11-14T11:59:10Z",
+  },
+  {
+    id: "gb-family-financial-requirement-pdf",
+    // Guidance written for this route's financial requirement (Appendix FM,
+    // and Appendix HM Armed Forces which shares it).
+    role: "route_guidance",
+    title: "Family Migration: Appendix FM and Appendix HM Armed Forces, minimum income requirement caseworker guidance (PDF)",
+    // The file's address on the day it was retrieved (per-release id).
+    url:
+      "https://assets.publishing.service.gov.uk/media/691209e3e9348ac8fb54f4ba/" +
+      "Family+Migration+Appendix+FM+Section+and+Appendix+HM+Armed+Forces+Financial+Requirement.pdf",
+    resolveFrom: {
+      // The stable publication page. It links to FIVE PDFs (this one, the
+      // adequate maintenance guidance, two children annexes and the adult
+      // dependent relatives guidance), so the pattern names this file by the
+      // words its name carries ("Financial+Requirement"), not just ".pdf".
+      pageUrl: "https://www.gov.uk/government/publications/chapter-8-appendix-fm-family-members",
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]*Financial\\+Requirement[^/?#]*\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "uk-family-visa",
+    docType: "pdf",
+    // Anchored on the bullet of the document's "Publication" section. The page
+    // headers cannot be used: page 1 is headed "12 March 2025" while pages 2 to
+    // 80 and the Publication section say "11 November 2025", and the match is
+    // case-insensitive, so the plain lead-in would pick page 1's older date.
+    publishedDateSelector: "• published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:00 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "759,302-byte PDF, 80 pages, every page with a text layer, 193,643 characters of cleaned text, " +
+      "sha256 440d223989d76cceaa30e695bbef48ae55e9fada222b540fac3422a453084279. The file's address was read from the " +
+      "publication page on that day; the resolveFrom pattern matched exactly this one of the five PDFs there. " +
+      "There is no web rendition: the 'accessible version' address the search index still lists " +
+      "(.../appendix-fm-17-financial-requirement-accessible-version) redirected to the publication page that day. " +
+      "The Publication section states version 13.0, published for staff on 11 November 2025 (page 1's header says " +
+      "12 March 2025; pages 2 to 80 say 11 November 2025). Read closely: pages 1, 5 and 11 to 13 (publication, the " +
+      "summary of thresholds and the 11 April 2024 rules); the rest was retrieved and skimmed, not read line by line.",
+    retrievedAt: "2026-11-14T12:00:20Z",
+  },
+
+  // ============================================
+  // SKILLED WORKER (route key "skilled-worker-visa", visa type gb-skilled-worker-visa; issue #260)
+  // ============================================
+  //
+  // Documents, each requested once on 2026-11-14 through the shared fetch
+  // service (numbers in each note are from that request):
+  //  - Appendix Skilled Worker (the route's own rules)               -> primary
+  //  - the Skilled Worker caseworker guidance, web + PDF             -> route_guidance
+  //  - Appendix English Language (SW 7.2 names it)                   -> secondary
+  //  - Appendix Skilled Occupations (SW 6.1(a): eligible codes; SW 4.2
+  //    and SW 8.1: the tables the options and going rates come from) -> secondary
+  //  - Appendix Immigration Salary List (SW 6.1(b); options D and I in
+  //    the SW 4.2 table, detailed in SW 11.1)                        -> secondary
+  // Reused by id: gb-part-suitability (SW 2.1) and gb-appendix-finance
+  // (SW 15.3, funds "as specified in Appendix Finance").
+  //
+  // Not registered, though the rules name them for some applicants only:
+  // Appendix ATAS (SW 6.3A, certain researchers), Appendix Tuberculosis
+  // (SW 3.2, certain countries), Appendix KOL UK and Appendix Continuous
+  // Residence (settlement only). They can be added the same way if the
+  // rubric needs them.
+  //
+  // The Health and Care Worker visa (gb-health-care-worker-visa) is decided
+  // under this same appendix (its "Health and Care ASHE salary job" rules,
+  // SW A1.1), so its rubric can reuse these ids. The caseworker guidance above
+  // (section 3.1) also points to a separate "Health and Care visa guidance";
+  // that document has NOT been looked up or registered here.
+  {
+    id: "gb-appendix-skilled-worker",
+    // The route's own rules document.
+    role: "primary",
+    title: "Immigration Rules Appendix Skilled Worker",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-skilled-worker",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "75,506 characters of cleaned text, sha256 9e1a1d62cd239d066fc765cd3294d8ec6fed728904c4652622e27f2db6c7c96b. " +
+      "The address is the one the publisher's index of the rules linked to on that day. The text runs from the page " +
+      "title to SW 46.2 (it is not cut short). Read closely: SW 2.1, SW 3.2, SW 4.1, SW 4.2, SW 5.1, SW 7.2, SW 8.1 and " +
+      "SW 15.1 to SW 15.3; the rest was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:07:20Z",
+  },
+  {
+    id: "gb-skilled-worker-guidance-html",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Skilled Worker caseworker guidance (accessible web version)",
+    url: "https://www.gov.uk/government/publications/skilled-worker-visa-caseworker-guidance/skilled-worker-caseworker-guidance-accessible",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    // The document's own line, "published for Home Office staff on <date>".
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "124,377 characters of cleaned text, sha256 c2e7916e214946216c4affa1fb0077bcf0f3b0824ba29b260b565cd2a3972d5c. " +
+      "The address is the one the publication page linked to on that day. The text states version 20.0, " +
+      "published for staff on 3 August 2026, and runs through the last numbered section (30.8). " +
+      "Read closely: section 1 and the openings of sections 8 and 9; the rest was retrieved and skimmed, " +
+      "not read line by line.",
+    retrievedAt: "2026-11-14T12:07:34Z",
+  },
+  {
+    id: "gb-skilled-worker-guidance-pdf",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Skilled Worker caseworker guidance (PDF)",
+    // The file's address ON THE DAY IT WAS RETRIEVED (per-release id); the
+    // crawl reads the current address from `resolveFrom` each time.
+    url: "https://assets.publishing.service.gov.uk/media/6a6b4a63cceb23e86789771f/Skilled_worker__1_.pdf",
+    resolveFrom: {
+      // The stable publication page that always links to the current file.
+      pageUrl: "https://www.gov.uk/government/publications/skilled-worker-visa-caseworker-guidance",
+      // The one PDF attachment on that page: any release id, any file name.
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]+\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "pdf",
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "763,334-byte PDF, 76 pages, every page with a text layer, 141,042 characters of cleaned text, " +
+      "sha256 321757c1c0bd36a3c10de8f7f80c220ac73d08a3eb7d65d5fc5609f528a9f105. The file's address was read from the " +
+      "publication page on that day (it was the only PDF linked there; the resolveFrom lookup returned it). Each page " +
+      "is headed 'Published for Home Office staff on 3 August 2026'; page 1 states version 20.0. " +
+      "Read closely: the passages pinned in guidance-quote-checks.ts (sections 1, 8 and 9 of the web version; the " +
+      "PDF's headings are not numbered); the rest was retrieved and skimmed, not read line by line.",
+    retrievedAt: "2026-11-14T12:07:36Z",
+  },
+  {
+    id: "gb-appendix-english-language",
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
+    role: "secondary",
+    title: "Immigration Rules Appendix English Language",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-english-language",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "10,732 characters of cleaned text, sha256 236d13a2055429e1ed7f46f8a8cd8f23267825c53ddedebbd200d2dc70b03ce3. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 7.2 " +
+      "of Appendix Skilled Worker names it; its opening lists the appendices it applies to (Student among them). " +
+      "The text runs from the title to the last paragraph (it is not cut short). Read closely: the opening paragraphs; " +
+      "the rest was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:07:56Z",
+  },
+  {
+    id: "gb-appendix-skilled-occupations",
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
+    role: "secondary",
+    title: "Immigration Rules Appendix Skilled Occupations",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-skilled-occupations",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "199,859 characters of cleaned text, sha256 572db9d4776411c55da3f2100f42775fe14c4d8bd72ea3a473133ae215a73b5b. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 6.1(a) " +
+      "of Appendix Skilled Worker takes eligible occupation codes from its tables, and SW 4.2 and SW 8.1 take the " +
+      "going rates from them. The text runs " +
+      "from the title to the last occupation listed (9269; it is not cut short); it is mostly tables. Read closely: " +
+      "the title and the table headings only; the tables were retrieved, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:07:58Z",
+  },
+  {
+    id: "gb-appendix-immigration-salary-list",
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
+    role: "secondary",
+    title: "Immigration Rules Appendix Immigration Salary List",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-immigration-salary-list",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:08 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "5,076 characters of cleaned text, sha256 b3f2651bf6a288e11f55c96f2130ae1f3fd9b3b260f764bec4819fd8461f55f0. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 6.1(b) " +
+      "of Appendix Skilled Worker refers to it, and options D and I of the SW 4.2 points table (SW 11.1) are for a job " +
+      "on the Immigration Salary List. The text runs from the title to the last table row (it is not cut " +
+      "short). Read closely: the two opening paragraphs; the table was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:08:16Z",
+  },
+
+  // ============================================
+  // STUDENT (route key "student-visa", visa type gb-student-visa; issue #260)
+  // ============================================
+  //
+  // Documents, each requested once on 2026-11-14 through the shared fetch
+  // service (numbers in each note are from that request):
+  //  - Appendix Student (the route's own rules)                       -> primary
+  //  - the "Student and Child Student" caseworker guidance, web + PDF -> route_guidance
+  //  - Appendix ATAS (ST 8.4)                                         -> secondary
+  // Reused by id: gb-part-suitability (ST 2.1), gb-appendix-finance (ST 12.6)
+  // and gb-appendix-english-language (ST 13.2; registered with Skilled Worker
+  // above). The guidance itself says it "is based on Appendix Student,
+  // Appendix Child Student, Appendix English Language, Appendix Finance and
+  // Appendix ATAS", which is the same set.
+  //
+  // Not registered: Appendix Tuberculosis (ST 3.2, certain countries only).
+  // The publication page's web rendition is ".../student-and-child-student"
+  // (there is no "-accessible" suffix on this one; the older
+  // points-based-system-student-route address redirects to this page).
+  {
+    id: "gb-appendix-student",
+    // The route's own rules document.
+    role: "primary",
+    title: "Immigration Rules Appendix Student",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-student",
+    jurisdiction: "GB",
+    route: "student-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:10 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "50,639 characters of cleaned text, sha256 073ed78055dcc72821285477bcf05f99eaa9d3413c887277a2dd64030a9d7752. " +
+      "The address is the one the publisher's index of the rules linked to on that day. The text runs from the page " +
+      "title to the conditions for a partner or child (it is not cut short). Read closely: ST 2.1, ST 3.2, ST 4.1, " +
+      "ST 4.2, ST 5.1, ST 7.1, ST 7.2, ST 8.4, ST 12.1, ST 12.2, ST 12.6 and ST 13.2; the rest was retrieved and " +
+      "skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:10:46Z",
+  },
+  {
+    id: "gb-student-guidance-html",
+    // Guidance written for this same route (and Child Student): all of it is about the route.
+    role: "route_guidance",
+    title: "Student and Child Student caseworker guidance (web version)",
+    url: "https://www.gov.uk/government/publications/student-route-caseworker-guidance/student-and-child-student",
+    jurisdiction: "GB",
+    route: "student-visa",
+    docType: "html",
+    // The document's own line, "published for Home Office staff on <date>".
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:10 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "179,193 characters of cleaned text, sha256 7700bc3208ad4ce3b23e2094e926b794e84d39d3214d91cf6efa1bc6b261a487. " +
+      "The address is the one the publication page linked to on that day. The text states version 15.0, " +
+      "published for staff on 9 October 2026, and runs through the closing table of rules for a dependant child " +
+      "(its headings are not numbered). Read closely: 'About this guidance', 'Publication' and the opening of " +
+      "'Genuine student rule'; the rest was retrieved and skimmed, not read line by line.",
+    retrievedAt: "2026-11-14T12:10:48Z",
+  },
+  {
+    id: "gb-student-guidance-pdf",
+    // Guidance written for this same route (and Child Student): all of it is about the route.
+    role: "route_guidance",
+    title: "Student and Child Student caseworker guidance (PDF)",
+    // The file's address ON THE DAY IT WAS RETRIEVED (per-release id); the
+    // crawl reads the current address from `resolveFrom` each time.
+    url: "https://assets.publishing.service.gov.uk/media/6ad09e010f7b53973e0266f3/Student_and_Child_Student.pdf",
+    resolveFrom: {
+      // The stable publication page that always links to the current file.
+      pageUrl: "https://www.gov.uk/government/publications/student-route-caseworker-guidance",
+      // The one PDF attachment on that page: any release id, any file name.
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]+\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "student-visa",
+    docType: "pdf",
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:10 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "1,053,905-byte PDF, 113 pages, every page with a text layer, 210,094 characters of cleaned text, " +
+      "sha256 d1c5dd4058348002d38220b4275a9b6f7a259229acda8c64dfb59384c283bb22. The file's address was read from the " +
+      "publication page on that day (it was the only PDF linked there; the resolveFrom lookup returned it). Each page " +
+      "is headed 'Published for Home Office staff on 9 October 2026'; page 1 states version 15.0. " +
+      "Read closely: the passages pinned in guidance-quote-checks.ts; the rest was retrieved and skimmed, " +
+      "not read line by line.",
+    retrievedAt: "2026-11-14T12:10:50Z",
+  },
+  {
+    id: "gb-appendix-atas",
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
+    role: "secondary",
+    title: "Immigration Rules Appendix ATAS: Academic Technology Approval Scheme (ATAS)",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-atas-academic-technology-approval-scheme-atas",
+    jurisdiction: "GB",
+    route: "student-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:11 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "7,521 characters of cleaned text, sha256 e2baa6461d6dd9b31437723ea95ce24ca920877e17a2a27eb6438328ae82835f. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because ST 8.4 of " +
+      "Appendix Student refers to it (and the Student guidance names it). The text runs from the title to the last " +
+      "subject code listed (it is not cut short). Read closely: the two opening paragraphs; the code lists were " +
+      "retrieved, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:11:08Z",
+  },
+
+  // ============================================
+  // GRADUATE (route key "graduate-visa", visa type gb-graduate-visa; issue #260)
+  // ============================================
+  //
+  // Documents, each requested once on 2026-11-14 through the shared fetch
+  // service (numbers in each note are from that request):
+  //  - Appendix Graduate (the route's own rules)               -> primary
+  //  - the Graduate caseworker guidance, web + PDF             -> route_guidance
+  // Reused by id: gb-part-suitability (GR 2.1) and gb-appendix-atas (GR 8.2(d),
+  // the study condition; registered with Student above). The guidance says it
+  // "is based on Appendix Graduate and Appendix ATAS", which is the same set.
+  // The route has no financial or English language requirement in its rules,
+  // so neither of those appendices is listed for it.
+  //
+  // Not registered: Appendix Relationship with Partner (GR 11.2, dependent
+  // partners only).
+  {
+    id: "gb-appendix-graduate",
+    // The route's own rules document.
+    role: "primary",
+    title: "Immigration Rules Appendix Graduate",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-graduate",
+    jurisdiction: "GB",
+    route: "graduate-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:12 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "13,287 characters of cleaned text, sha256 8067a67ea995fa375e3b335941f45917b24421c84949ce127d2d602136115c56. " +
+      "The address is the one the publisher's index of the rules linked to on that day. The text runs from the page " +
+      "title to the conditions for a partner or child (it is not cut short). Read closely: the paragraph numbers and " +
+      "opening sentences of GR 1 to GR 16, and GR 2.1, GR 3.1, GR 4.1 to GR 4.3 and GR 8.2 in full; the rest was " +
+      "retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:12:47Z",
+  },
+  {
+    id: "gb-graduate-guidance-html",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Graduate caseworker guidance (accessible web version)",
+    url: "https://www.gov.uk/government/publications/graduate-caseworker-guidance/graduate-caseworker-guidance-accessible-version",
+    jurisdiction: "GB",
+    route: "graduate-visa",
+    docType: "html",
+    // The document's own line, "published for Home Office staff on <date>".
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:12 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "44,132 characters of cleaned text, sha256 f59a04799068b3eaa56312ce9c0a9b5abcf9ee6ccf57eaeb9163750deede4dae. " +
+      "The address is the one the publication page linked to on that day. The text states version 6.0, " +
+      "published for staff on 3 August 2026, and runs through the closing section on translated documents (its " +
+      "headings are not numbered). Read closely: 'About this guidance', 'Publication' and 'Eligibility requirements' " +
+      "(successful completion, sponsor notification, qualification); the rest was retrieved and skimmed, not read " +
+      "line by line.",
+    retrievedAt: "2026-11-14T12:12:49Z",
+  },
+  {
+    id: "gb-graduate-guidance-pdf",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Graduate caseworker guidance (PDF)",
+    // The file's address ON THE DAY IT WAS RETRIEVED (per-release id); the
+    // crawl reads the current address from `resolveFrom` each time.
+    url: "https://assets.publishing.service.gov.uk/media/6a4bbe12e50f952c9b89e603/Graduate_route__1_.pdf",
+    resolveFrom: {
+      // The stable publication page that always links to the current file.
+      pageUrl: "https://www.gov.uk/government/publications/graduate-caseworker-guidance",
+      // The one PDF attachment on that page: any release id, any file name.
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]+\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "graduate-visa",
+    docType: "pdf",
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:13 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "390,717-byte PDF, 32 pages, every page with a text layer, 52,715 characters of cleaned text, " +
+      "sha256 102e749800aaf6c37726a0dd45f07c5203ed10b1f24cec1ef940a37a61941994. The file's address was read from the " +
+      "publication page on that day (it was the only PDF linked there; the resolveFrom lookup returned it). Each page " +
+      "is headed 'Published for Home Office staff on 3 August 2026'; page 1 states version 6.0. " +
+      "Read closely: the passages pinned in guidance-quote-checks.ts; the rest was retrieved and skimmed, " +
+      "not read line by line.",
+    retrievedAt: "2026-11-14T12:13:00Z",
+  },
 ];
 
 /** Statuses a seed may set (`failing` belongs to the crawler). */
