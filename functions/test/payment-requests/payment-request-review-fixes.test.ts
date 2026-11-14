@@ -17,7 +17,9 @@
 //  - create: the request's `agencyId` is the CASE's; an agent whose current
 //    agency is not the case's is refused;
 //  - the Paystack webhook signature compare (constant time) still refuses a
-//    wrong signature.
+//    wrong signature;
+//  - approve and reject vs an agent's cancel: one transaction each, and a
+//    cancelled request is never handed a checkout.
 import { test, describe, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import * as crypto from "crypto";
@@ -44,15 +46,26 @@ import { store } from "../helpers/fake-firestore";
 import { paymentRequestController } from "../../src/controllers/payment-request.controller";
 import { chargeRuntime } from "../../src/services/charge-checkout.service";
 import { PaystackProvider } from "../../src/services/billing/paystack.provider";
+import { messagingService } from "../../src/services/messaging.service";
 import type { AuthzSubject } from "@durin-tech/authz";
 import { ROLES } from "@durin-tech/authz";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+// The harness's transaction runner and profile lookup, restored before every
+// test so a hook a test installed (and that never fired) cannot leak into
+// the next one.
+let harnessRunTransaction: typeof chargeRuntime.runTransaction;
+let harnessProfileCountry: typeof chargeRuntime.profileCountry;
+
 before(async () => {
   await usePaymentRequestHarness();
+  harnessRunTransaction = chargeRuntime.runTransaction;
+  harnessProfileCountry = chargeRuntime.profileCountry;
 });
 beforeEach(async () => {
+  chargeRuntime.runTransaction = harnessRunTransaction;
+  chargeRuntime.profileCountry = harnessProfileCountry;
   await resetPaymentRequests();
   // eslint-disable-next-line @typescript-eslint/no-empty-function
   console.log = () => {};
@@ -475,5 +488,188 @@ describe("Paystack webhook signature", () => {
     // Missing, and a tampered body with the old signature.
     assert.equal(provider.verifyWebhookSignature({}, body), false);
     assert.equal(provider.verifyWebhookSignature({ "x-paystack-signature": good }, body + " "), false);
+  });
+});
+
+// ============================================
+// Approve / reject vs an agent's cancel (fix round 1, second part)
+// ============================================
+//
+// Approve and reject now check `pending` and write in ONE transaction, and
+// approve claims the checkout only after that commits (the claim itself
+// needs the request still `approved`). These tests run the agent's cancel in
+// each gap and check that a cancelled request never gets a checkout.
+
+/** PUT /:id/approve as the Nigerian client (the raw answer). */
+async function approveRaw(id: string) {
+  const { out, res } = captureRes();
+  await paymentRequestController.approvePaymentRequest(reqFor(clientNg, { params: { id } }), res);
+  return out;
+}
+
+/** PUT /:id/reject as the Nigerian client. */
+async function rejectRaw(id: string) {
+  const { out, res } = captureRes();
+  await paymentRequestController.rejectPaymentRequest(
+    reqFor(clientNg, { params: { id }, body: { reason: "Not now" } }),
+    res
+  );
+  return out;
+}
+
+/**
+ * Run `before` once, just before the `nth` (1-based) transaction that starts
+ * from now on, then restore the harness's runner.
+ */
+function beforeTransaction(nth: number, before: () => Promise<void>): { fired: () => boolean } {
+  const original = chargeRuntime.runTransaction;
+  let count = 0;
+  let fired = false;
+  chargeRuntime.runTransaction = (async (fn: any) => {
+    count++;
+    if (count === nth && !fired) {
+      fired = true;
+      chargeRuntime.runTransaction = original;
+      await before();
+    }
+    return original(fn);
+  }) as any;
+  return { fired: () => fired };
+}
+
+/** The agent cancels `id`; asserts it went through. */
+async function agentCancels(id: string): Promise<void> {
+  const out = await setStatus(id, "cancelled");
+  assert.equal(out.status, 200, JSON.stringify(out.body));
+}
+
+describe("approve vs an agent's cancel", () => {
+  test("a cancel landing while approve prices the request (after its read): 409, no checkout, stays cancelled", async () => {
+    const id = await createRequest();
+    // Pricing reads the client's profile country: cancel right there,
+    // between approve's read of `pending` and its write.
+    const originalCountry = chargeRuntime.profileCountry;
+    let fired = false;
+    chargeRuntime.profileCountry = async (uid: string) => {
+      if (!fired) {
+        fired = true;
+        await agentCancels(id);
+      }
+      return originalCountry(uid);
+    };
+    try {
+      const out = await approveRaw(id);
+      assert.equal(out.status, 409, JSON.stringify(out.body));
+      assert.equal(out.body.error, "INVALID_STATUS_TRANSITION");
+    } finally {
+      chargeRuntime.profileCountry = originalCountry;
+    }
+    assert.equal(fired, true);
+    assert.equal(stored(id).status, "cancelled");
+    assert.equal(stored(id).paystackReference, undefined);
+    assert.equal(harness.charges.length, 0);
+  });
+
+  test("a cancel committing right before approve's transaction: 409, nothing written, no checkout", async () => {
+    const id = await createRequest();
+    const hook = beforeTransaction(1, () => agentCancels(id));
+    const out = await approveRaw(id);
+    assert.equal(hook.fired(), true);
+    assert.equal(out.status, 409, JSON.stringify(out.body));
+    assert.equal(out.body.error, "INVALID_STATUS_TRANSITION");
+    assert.equal(stored(id).status, "cancelled");
+    assert.equal(stored(id).approvedAt, undefined);
+    assert.equal(harness.charges.length, 0);
+  });
+
+  test("a cancel between approve's commit and the checkout claim: no checkout opened or handed out", async () => {
+    const id = await createRequest();
+    // Transaction 1 = the approve; 2 = the checkout claim.
+    const hook = beforeTransaction(2, () => agentCancels(id));
+    const out = await approveRaw(id);
+    assert.equal(hook.fired(), true);
+    assert.equal(out.status, 409, JSON.stringify(out.body));
+    assert.equal(out.body.data?.authorizationUrl, undefined);
+    assert.equal(stored(id).status, "cancelled");
+    assert.equal(harness.charges.length, 0);
+  });
+
+  test("legacy request: a cancel right before approve's transaction is 409 with no checkout", async () => {
+    await seedLegacyRequest("legacy-race");
+    const hook = beforeTransaction(1, () => agentCancels("legacy-race"));
+    const out = await approveRaw("legacy-race");
+    assert.equal(hook.fired(), true);
+    assert.equal(out.status, 409, JSON.stringify(out.body));
+    assert.equal(stored("legacy-race").status, "cancelled");
+    assert.equal(harness.charges.length, 0);
+  });
+
+  test("legacy request: a cancel between approve's commit and the claim opens no checkout", async () => {
+    await seedLegacyRequest("legacy-race-2");
+    const hook = beforeTransaction(2, () => agentCancels("legacy-race-2"));
+    const out = await approveRaw("legacy-race-2");
+    assert.equal(hook.fired(), true);
+    assert.equal(out.status, 409, JSON.stringify(out.body));
+    assert.equal(stored("legacy-race-2").status, "cancelled");
+    assert.equal(harness.charges.length, 0);
+  });
+
+  test("legacy request: approve still opens its own kobo checkout under our reference", async () => {
+    await seedLegacyRequest("legacy-ok");
+    const out = await approveRaw("legacy-ok");
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    const pr = stored("legacy-ok");
+    assert.equal(pr.status, "approved");
+    assert.match(pr.paystackReference, /^preq-/);
+    assert.equal(pr.checkoutUrl, out.body.data.authorizationUrl);
+    assert.deepEqual(harness.charges[0].amount, { amountMinor: 2_500_000, currency: "NGN" });
+    assert.equal(harness.charges[0].reference, pr.paystackReference);
+  });
+
+  test("reverse order: approve commits first, then the agent's cancel goes through the in-flight and paid checks", async () => {
+    // In flight: refused, the checkout stays.
+    const a = await createRequest();
+    const refA = await approveRef(a);
+    paystackRequestStatus(refA, a, "ongoing");
+    const inFlight = await setStatus(a, "cancelled");
+    assert.equal(inFlight.status, 409);
+    assert.equal(inFlight.body.error, "PAYMENT_IN_PROGRESS");
+    assert.equal(stored(a).status, "approved");
+    // Paid at Paystack: settled, never cancelled.
+    paystackPaidRequest(refA, a, { amountMinor: NGN_KOBO, currency: "NGN" });
+    const paid = await setStatus(a, "cancelled");
+    assert.equal(paid.status, 409);
+    assert.equal(paid.body.error, "REQUEST_ALREADY_PAID");
+    assert.equal(stored(a).status, "paid");
+    // Final unpaid: cancelled.
+    const b = await createRequest();
+    const refB = await approveRef(b);
+    paystackRequestStatus(refB, b, "abandoned");
+    assert.equal((await setStatus(b, "cancelled")).status, 200);
+    assert.equal(stored(b).status, "cancelled");
+  });
+});
+
+describe("reject vs an agent's cancel", () => {
+  test("a cancel committing right before reject's transaction: 409, stays cancelled, no reason stored", async () => {
+    const id = await createRequest();
+    const hook = beforeTransaction(1, () => agentCancels(id));
+    const out = await rejectRaw(id);
+    assert.equal(hook.fired(), true);
+    assert.equal(out.status, 409, JSON.stringify(out.body));
+    assert.equal(out.body.error, "INVALID_STATUS_TRANSITION");
+    assert.equal(stored(id).status, "cancelled");
+    assert.equal(stored(id).rejectionReason, undefined);
+  });
+
+  test("a pending request is still rejected with its reason", async () => {
+    // The rejection opens a conversation with the agent: stubbed (no Firestore).
+    (messagingService as any).getOrCreateConversation = async () => ({ id: "conv-1" });
+    (messagingService as any).sendMessage = async () => undefined;
+    const id = await createRequest();
+    const out = await rejectRaw(id);
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(stored(id).status, "rejected");
+    assert.equal(stored(id).rejectionReason, "Not now");
   });
 });

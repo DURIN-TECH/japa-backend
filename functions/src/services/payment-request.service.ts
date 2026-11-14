@@ -112,56 +112,56 @@ class PaymentRequestService {
   }
 
   /**
-   * Approve a payment request (client approves agent's fund request)
+   * Client approves a pending request: `pending -> approved`.
+   *
+   * Issue #181 review fix: the check and the write happen in ONE transaction
+   * that re-reads the request. Before, a plain read then `update` meant an
+   * agent's cancel committing in between was overwritten with `approved`,
+   * and a checkout was then opened on a request the agent had withdrawn.
+   * The caller opens (claims) the checkout only AFTER this commits, and the
+   * claim itself needs the request to still be `approved`, so a request that
+   * was cancelled is never handed a checkout.
+   *
+   * @throws "Payment request not found" / "Only pending payment requests can
+   *   be approved" (the controller maps the second to a 409).
    */
   async approvePaymentRequest(id: string): Promise<PaymentRequest> {
     const ref = collections.paymentRequests.doc(id);
-    const doc = await ref.get();
-
-    if (!doc.exists) {
-      throw new Error("Payment request not found");
-    }
-
-    const request = doc.data() as PaymentRequest;
-    if (request.status !== "pending") {
-      throw new Error("Only pending payment requests can be approved");
-    }
-
-    await ref.update({
-      status: "approved",
-      approvedAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+    return chargeRuntime.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) throw new Error("Payment request not found");
+      const request = snap.data() as PaymentRequest;
+      if (request.status !== "pending") {
+        throw new Error("Only pending payment requests can be approved");
+      }
+      const at = Timestamp.fromDate(chargeRuntime.now());
+      tx.update(ref, { status: "approved", approvedAt: at, updatedAt: at });
+      return { ...request, status: "approved", approvedAt: at, updatedAt: at } as PaymentRequest;
     });
-
-    const updated = await ref.get();
-    return updated.data() as PaymentRequest;
   }
 
   /**
-   * Reject a payment request (client rejects agent's fund request)
+   * Client rejects a pending request: `pending -> rejected`, with a reason.
+   *
+   * Issue #181 review fix: one transaction, like approve, so a cancel (or an
+   * approve) that committed first is never overwritten.
+   *
+   * @throws "Payment request not found" / "Only pending payment requests can
+   *   be rejected" (the controller maps the second to a 409).
    */
   async rejectPaymentRequest(id: string, rejectionReason: string): Promise<PaymentRequest> {
     const ref = collections.paymentRequests.doc(id);
-    const doc = await ref.get();
-
-    if (!doc.exists) {
-      throw new Error("Payment request not found");
-    }
-
-    const request = doc.data() as PaymentRequest;
-    if (request.status !== "pending") {
-      throw new Error("Only pending payment requests can be rejected");
-    }
-
-    await ref.update({
-      status: "rejected",
-      rejectedAt: serverTimestamp(),
-      rejectionReason,
-      updatedAt: serverTimestamp(),
+    return chargeRuntime.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) throw new Error("Payment request not found");
+      const request = snap.data() as PaymentRequest;
+      if (request.status !== "pending") {
+        throw new Error("Only pending payment requests can be rejected");
+      }
+      const at = Timestamp.fromDate(chargeRuntime.now());
+      tx.update(ref, { status: "rejected", rejectedAt: at, rejectionReason, updatedAt: at });
+      return { ...request, status: "rejected", rejectedAt: at, rejectionReason, updatedAt: at } as PaymentRequest;
     });
-
-    const updated = await ref.get();
-    return updated.data() as PaymentRequest;
   }
 
   /**

@@ -38,12 +38,14 @@ import {
   isUsdPaymentRequest,
   issuePaymentRequestCheckout,
   legacyRequestCharge,
+  newPaymentRequestReference,
   PaymentRequestCheckoutState,
   priceRequestForClient,
   reissuePaymentRequestCheckout,
   requestChargeSummary,
 } from "../services/payment-request-charge.service";
-import { isPricingFailure, isQuoteExpired, paystackState } from "../services/charge-checkout.service";
+import { chargeRuntime, isPricingFailure, isQuoteExpired, paystackState } from "../services/charge-checkout.service";
+import { Timestamp } from "firebase-admin/firestore";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { collections } from "../utils/firebase";
 import { checkApplicationAccess } from "../utils/access";
@@ -571,20 +573,61 @@ class PaymentRequestController {
         if (!legacyCharge) {
           return sendError(res, "REQUEST_NOT_PAYABLE", "This payment request cannot be paid", 409);
         }
+        // Approve first (one transaction); only then open the checkout.
         const approved = await this.approveOrNull(id);
-        if (!approved) return sendError(res, "VALIDATION_ERROR", "Only pending payment requests can be approved", 400);
-        const { authorizationUrl, reference } = await paystackProvider.initializeCharge({
+        if (!approved) return this.sendApproveLost(res);
+
+        // Issue #181 review fix: claim -> open -> publish, like the dollar
+        // path, so an agent's cancel that lands after the approve commits
+        // never ends with a checkout handed out on a cancelled request.
+        //  1. CLAIM our own reference, only while still approved with no
+        //     checkout (the cancel's transaction refuses a changed
+        //     reference, so the two cannot both win);
+        const reference = newPaymentRequestReference(id);
+        const docRef = collections.paymentRequests.doc(id);
+        const claimed = await chargeRuntime.runTransaction(async (tx) => {
+          const snap = await tx.get(docRef);
+          if (!snap.exists) return false;
+          const fresh = snap.data() as PaymentRequest;
+          // (A pre-#181 row may carry an old Paystack reference; as before,
+          // it is replaced, but only if nobody changed it since we read it.)
+          if (fresh.status !== "approved" || (fresh.paystackReference ?? null) !== (approved.paystackReference ?? null)) {
+            return false;
+          }
+          tx.update(docRef, { paystackReference: reference, checkoutUrl: null, updatedAt: Timestamp.fromDate(chargeRuntime.now()) });
+          return true;
+        });
+        if (!claimed) return this.sendApproveLost(res);
+        //  2. OPEN it at Paystack for the request's own kobo amount, under
+        //     OUR reference (stored above, so a payment on it always finds
+        //     this request: settled, or held for refund if cancelled);
+        const opened = await paystackProvider.initializeCharge({
           email: request.clientEmail,
           amount: legacyCharge,
           metadata: { purpose: "payment_request", paymentRequestId: id, applicationId: request.applicationId },
           callbackUrl: paymentRequestCallbackUrl(),
+          reference,
         });
-        // Persist the reference so a replayed or mismatched one can't be
-        // credited to a different request.
-        await collections.paymentRequests.doc(id).update({ paystackReference: reference });
+        // Paystack echoes the reference it was given; anything else is not
+        // the checkout stored on the request, so it is never handed out.
+        if (opened.reference && opened.reference !== reference) {
+          throw new Error("PAYSTACK_ERROR: checkout opened under an unexpected reference");
+        }
+        const authorizationUrl = opened.authorizationUrl;
+        //  3. PUBLISH the URL only if the request is still approved on this
+        //     reference; otherwise it is never handed out.
+        const published = await chargeRuntime.runTransaction(async (tx) => {
+          const snap = await tx.get(docRef);
+          if (!snap.exists) return null;
+          const fresh = snap.data() as PaymentRequest;
+          if (fresh.status !== "approved" || fresh.paystackReference !== reference) return null;
+          tx.update(docRef, { checkoutUrl: authorizationUrl, updatedAt: Timestamp.fromDate(chargeRuntime.now()) });
+          return { ...fresh, checkoutUrl: authorizationUrl } as PaymentRequest;
+        });
+        if (!published) return this.sendApproveLost(res);
         return sendSuccess(
           res,
-          { ...presentPaymentRequest({ ...approved, paystackReference: reference }), authorizationUrl },
+          { ...presentPaymentRequest(published), paystackReference: reference, authorizationUrl },
           "Payment request approved — continue to payment"
         );
       }
@@ -599,8 +642,10 @@ class PaymentRequestController {
       }
 
       // ---- (2) Approve -------------------------------------------------------
+      // One transaction (the service); the checkout below is claimed only
+      // after it committed, and the claim needs the request still approved.
       const approved = await this.approveOrNull(id);
-      if (!approved) return sendError(res, "VALIDATION_ERROR", "Only pending payment requests can be approved", 400);
+      if (!approved) return this.sendApproveLost(res);
 
       // ---- (3) Open the checkout, race-safely --------------------------------
       const state = await issuePaymentRequestCheckout({
@@ -881,8 +926,19 @@ class PaymentRequestController {
         return sendError(res, "VALIDATION_ERROR", "Only pending payment requests can be rejected", 400);
       }
 
-      // Step 1: Mark payment request as rejected and store the reason
-      const rejected = await paymentRequestService.rejectPaymentRequest(id, reason);
+      // Step 1: Mark payment request as rejected and store the reason, in one
+      // transaction (issue #181 review fix). If the agent cancelled (or the
+      // client approved) since the read above, it is 409 and nothing is
+      // written or sent.
+      let rejected: PaymentRequest;
+      try {
+        rejected = await paymentRequestService.rejectPaymentRequest(id, reason);
+      } catch (err) {
+        if ((err as Error)?.message === "Only pending payment requests can be rejected") {
+          return sendError(res, "INVALID_STATUS_TRANSITION", "This payment request is no longer pending", 409);
+        }
+        throw err;
+      }
 
       // Step 2: Get agent info for notifications and messaging
       const agentDoc = await collections.agents.doc(request.agentId).get();
@@ -1005,6 +1061,15 @@ class PaymentRequestController {
       if ((err as Error)?.message === "Only pending payment requests can be approved") return null;
       throw err;
     }
+  }
+
+  /**
+   * 409 INVALID_STATUS_TRANSITION: the request stopped being pending (or
+   * approved, for the checkout claim) between the read and the write, e.g.
+   * the agent cancelled it. Nothing was written and no checkout handed out.
+   */
+  private sendApproveLost(res: Response): void {
+    sendError(res, "INVALID_STATUS_TRANSITION", "This payment request is no longer awaiting your approval", 409);
   }
 
   /**
