@@ -20,6 +20,7 @@ import { collections } from "../../../utils/firebase";
 //   previewsPerHour      address checks one admin may make per hour.
 //   registrationsPerHour route registrations one admin may make per hour.
 //   previewMaxAgeMinutes how long a confirmation may rely on its address check.
+//   maxGuidancePerRoute  rule/guidance pages one registration may carry (each is fetched).
 
 /** The `appConfig` doc id. */
 export const ROUTE_ONBOARDING_SETTINGS_DOC_ID = "routeOnboardingSettings";
@@ -30,6 +31,7 @@ export interface RegistrySettings {
   previewsPerHour: number;
   registrationsPerHour: number;
   previewMaxAgeMinutes: number;
+  maxGuidancePerRoute: number;
 }
 
 /** Defaults; the issue's numbers (20 checks, 30 registrations per admin per hour). */
@@ -38,6 +40,7 @@ export const DEFAULT_REGISTRY_SETTINGS: Readonly<RegistrySettings> = Object.free
   previewsPerHour: 20,
   registrationsPerHour: 30,
   previewMaxAgeMinutes: 60,
+  maxGuidancePerRoute: 10,
 });
 
 /** Allowed range of each numeric setting. */
@@ -45,6 +48,7 @@ const RANGES: Record<Exclude<keyof RegistrySettings, "supportedLanguages">, [num
   previewsPerHour: [1, 1_000],
   registrationsPerHour: [1, 1_000],
   previewMaxAgeMinutes: [1, 24 * 60],
+  maxGuidancePerRoute: [1, 50],
 };
 
 /** A language code as stored: 2-3 lowercase letters, optional region/script part. */
