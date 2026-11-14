@@ -362,6 +362,16 @@ class PaymentRequestController {
         return sendError(res, "VALIDATION_ERROR", "Only pending payment requests can be approved", 400);
       }
 
+      // Resolve the Paystack return URL BEFORE approving (#252 review): it
+      // throws when the API base can't be built (no project id / bad
+      // API_PUBLIC_URL), and that must not leave the request approved with no
+      // checkout. App opt-in → the app return page; otherwise the portal's
+      // client payments page, exactly as before (portal unchanged).
+      const callbackUrl = selectCallbackUrl(
+        returnTo.value,
+        `${EMAIL_BRANDING.appUrl}/client/payments?reference={reference}`
+      );
+
       // Mark approved — the client has consented to be charged. The request
       // stays "approved" (not "paid") until Paystack confirms the money landed.
       const approved = await paymentRequestService.approvePaymentRequest(id);
@@ -378,12 +388,7 @@ class PaymentRequestController {
             paymentRequestId: id,
             applicationId: request.applicationId,
           },
-          // App opt-in → the app return page; otherwise the portal's
-          // client payments page, exactly as before (portal unchanged).
-          callbackUrl: selectCallbackUrl(
-            returnTo.value,
-            `${EMAIL_BRANDING.appUrl}/client/payments?reference={reference}`
-          ),
+          callbackUrl, // resolved above, before the approve write
         });
 
       // Persist the reference so a replayed or mismatched one can't be credited

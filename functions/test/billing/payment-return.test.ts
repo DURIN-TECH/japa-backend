@@ -7,7 +7,8 @@
 // are swapped for tiny in-memory stand-ins (restored after each test).
 //
 // Pinned here:
-//  1. The return page: a 302 to the FIXED `durintech://payment-return`, with
+//  1. The return page: a 200 page whose meta refresh AND visible link point at
+//     the FIXED `durintech://payment-return` (no 302: Android Custom Tabs), with
 //     only the validated, URL-encoded `reference` (or `trxref`) forwarded and
 //     every other param dropped; an HTML fallback link; no-store / CSP headers.
 //  2. `returnTo` parsing: absent → default, "app" → app, anything else → 400.
@@ -29,6 +30,7 @@ import {
   buildAppReturnUrl,
   extractReference,
   getApiBaseUrl,
+  readEmulatorFunctionsPort,
   getAppReturnCallbackUrl,
   parseReturnTo,
   renderReturnPage,
@@ -67,15 +69,26 @@ function fakeRes() {
   return { res, out };
 }
 
-/** Run the return page handler for a query object. */
+/**
+ * The meta-refresh target of a return page body, HTML-unescaped, or undefined.
+ * This is where the page sends the browser (review fix: no 302 any more).
+ */
+function refreshTarget(body: string): string | undefined {
+  const m = /<meta http-equiv="refresh" content="0;url=([^"]*)">/.exec(body);
+  return m ? m[1].replace(/&quot;/g, "\"").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#39;/g, "'").replace(/&amp;/g, "&") : undefined;
+}
+
+/** Run the return page handler; `location` = the page's meta-refresh target. */
 function hitReturnPage(query: Record<string, unknown>) {
   const { res, out } = fakeRes();
   paymentReturnController.handleReturn({ query } as any, res);
-  return out;
+  // The handler must not send a Location header (a 200 page, not a redirect).
+  assert.equal(out.location, undefined);
+  return { ...out, location: refreshTarget(String(out.body)) };
 }
 
 /** Env keys the base-URL logic reads; snapshot + restore so tests don't leak. */
-const ENV_KEYS = ["API_PUBLIC_URL", "FUNCTIONS_EMULATOR", "GCLOUD_PROJECT", "PAYSTACK_CALLBACK_URL"] as const;
+const ENV_KEYS = ["API_PUBLIC_URL", "FUNCTIONS_EMULATOR", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT", "PAYSTACK_CALLBACK_URL"] as const;
 let envSnapshot: Record<string, string | undefined> = {};
 /** Monkeypatches to undo after each test: [object, key, original value]. */
 const patches: Array<[any, string, unknown]> = [];
@@ -123,9 +136,11 @@ function recordPaystack() {
 // ============================================
 
 describe("GET /payments/return", () => {
-  test("302s to the fixed app deep link with the reference forwarded", () => {
+  test("200 page that meta-refreshes to the fixed app deep link with the reference", () => {
     const out = hitReturnPage({ reference: "ref_123", trxref: "ref_123" });
-    assert.equal(out.status, 302);
+    assert.equal(out.status, 200);
+    // No scripts at all: navigation is meta refresh + a visible link only.
+    assert.ok(!/<script/i.test(out.body));
     assert.equal(out.location, "durintech://payment-return?reference=ref_123");
     // HTML fallback link to the same target, and locked-down headers.
     assert.equal(out.type, "html");
@@ -161,7 +176,7 @@ describe("GET /payments/return", () => {
       "",
     ]) {
       const out = hitReturnPage({ reference });
-      assert.equal(out.status, 302);
+      assert.equal(out.status, 200);
       assert.equal(out.location, APP_RETURN_URL, `should drop ${JSON.stringify(reference)}`);
     }
   });
@@ -203,15 +218,32 @@ describe("returnTo + callback URL selection", () => {
     assert.equal(getAppReturnCallbackUrl(), "https://us-central1-japa-platform.cloudfunctions.net/api/payments/return");
   });
 
-  test("emulator base, and an explicit API_PUBLIC_URL override wins", () => {
+  test("emulator base uses the firebase.json port, and API_PUBLIC_URL (http ok) wins", () => {
     process.env.FUNCTIONS_EMULATOR = "true";
     process.env.GCLOUD_PROJECT = "japa-platform";
+    // The repo's firebase.json sets emulators.functions.port.
+    assert.equal(readEmulatorFunctionsPort(), 5001);
     assert.equal(getApiBaseUrl(), "http://127.0.0.1:5001/japa-platform/us-central1/api");
+    // A different emulator port is followed (injected reader).
+    assert.equal(getApiBaseUrl(process.env, () => 5099), "http://127.0.0.1:5099/japa-platform/us-central1/api");
     process.env.API_PUBLIC_URL = "http://10.0.2.2:5001/japa-platform/us-central1/api/";
     assert.equal(getApiBaseUrl(), "http://10.0.2.2:5001/japa-platform/us-central1/api");
-    // A non-http(s) override is ignored, not trusted.
+  });
+
+  test("API_PUBLIC_URL must be https outside the emulator; junk always throws", () => {
+    process.env.API_PUBLIC_URL = "https://api.seli.test/api/";
+    assert.equal(getApiBaseUrl(), "https://api.seli.test/api");
+    process.env.API_PUBLIC_URL = "http://api.seli.test/api";
+    assert.throws(() => getApiBaseUrl(), /https/);
     process.env.API_PUBLIC_URL = "durintech://x";
-    assert.equal(getApiBaseUrl(), "http://127.0.0.1:5001/japa-platform/us-central1/api");
+    assert.throws(() => getApiBaseUrl(), /https/);
+    process.env.FUNCTIONS_EMULATOR = "true";
+    assert.throws(() => getApiBaseUrl(), /http\(s\)/);
+  });
+
+  test("no project id (and no override) fails loudly instead of a broken URL", () => {
+    assert.throws(() => getApiBaseUrl({}), /no project id/);
+    assert.throws(() => getApiBaseUrl({ FUNCTIONS_EMULATOR: "true", GCLOUD_PROJECT: " " }), /no project id/);
   });
 
   test("selectCallbackUrl: app → return page, default → the given fallback", () => {
@@ -302,6 +334,15 @@ describe("POST /subscriptions/checkout returnTo", () => {
     assert.equal(calls[0].callback_url, "https://portal.test/settings/billing");
   });
 
+  test("returnTo: 'app' with no project id → 500, no checkout opened", async () => {
+    const calls = setup();
+    delete process.env.GCLOUD_PROJECT;
+    delete process.env.GOOGLE_CLOUD_PROJECT;
+    const out = await call({ planId: "client_pro", returnTo: "app" });
+    assert.equal(out.status, 500);
+    assert.equal(calls.length, 0);
+  });
+
   test("an unknown returnTo is a 400 and opens no checkout", async () => {
     const calls = setup();
     const out = await call({ planId: "client_pro", returnTo: "https://evil.example" });
@@ -370,6 +411,16 @@ describe("PUT /payment-requests/:id/approve returnTo", () => {
     assert.equal(calls[0].callback_url, `${EMAIL_BRANDING.appUrl}/client/payments?reference={reference}`);
   });
 
+  test("returnTo: 'app' with no project id → 500 BEFORE the request is approved", async () => {
+    const { calls, approved } = setup();
+    delete process.env.GCLOUD_PROJECT;
+    delete process.env.GOOGLE_CLOUD_PROJECT;
+    const out = await call({ returnTo: "app" });
+    assert.equal(out.status, 500);
+    assert.deepEqual(approved, []);
+    assert.equal(calls.length, 0);
+  });
+
   test("an unknown returnTo is refused BEFORE the request is approved", async () => {
     const { calls, approved } = setup();
     const out = await call({ returnTo: "web" });
@@ -384,7 +435,7 @@ describe("PUT /payment-requests/:id/approve returnTo", () => {
 // ============================================
 
 describe("app mounting", () => {
-  test("GET /payments/return is public and 302s without a token", async () => {
+  test("GET /payments/return is public and serves the return page without a token", async () => {
     // Imported lazily so the other suites don't pay for the full app import.
     const { app } = await import("../../src/app");
     const server = app.listen(0);
@@ -394,8 +445,10 @@ describe("app mounting", () => {
         `http://127.0.0.1:${port}/payments/return?trxref=ref_9&reference=ref_9&next=https://evil.example`,
         { redirect: "manual" }
       );
-      assert.equal(res.status, 302);
-      assert.equal(res.headers.get("location"), "durintech://payment-return?reference=ref_9");
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("location"), null);
+      assert.equal(res.headers.get("cache-control"), "no-store");
+      assert.equal(refreshTarget(await res.text()), "durintech://payment-return?reference=ref_9");
     } finally {
       server.close();
     }

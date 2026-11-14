@@ -15,9 +15,9 @@ import { buildAppReturnUrl, renderReturnPage } from "../services/billing/payment
 
 export class PaymentReturnController {
   /**
-   * Redirect (302) to the app deep link, with an HTML fallback link in the
-   * body for browsers that render it instead of following a custom-scheme
-   * redirect.
+   * Send the browser to the app deep link. Review fix (#252): a 200 page with
+   * a meta refresh + a visible "Return to Seli" link instead of a 302, because
+   * some Android Custom Tabs ignore a server redirect to a custom scheme.
    */
   handleReturn(req: Request, res: Response): void {
     // Target built ONLY from the fixed app URL + the validated reference.
@@ -33,7 +33,7 @@ export class PaymentReturnController {
       "Content-Security-Policy",
       "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
     );
-    res.status(302).location(target).type("html").send(renderReturnPage(target));
+    res.status(200).type("html").send(renderReturnPage(target));
   }
 }
 

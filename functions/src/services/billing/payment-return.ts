@@ -26,6 +26,10 @@
 // callbacks (`PAYSTACK_CALLBACK_URL` for subscriptions, the portal
 // `/client/payments` page for payment requests).
 
+// fs/path are only used on the emulator path (readEmulatorFunctionsPort).
+import * as fs from "fs";
+import * as path from "path";
+
 /**
  * The only accepted value of the optional `returnTo` body field on
  * `POST /subscriptions/checkout` and `PUT /payment-requests/:id/approve`.
@@ -71,30 +75,84 @@ export function parseReturnTo(raw: unknown): { ok: true; value: ReturnTo } | { o
   return { ok: false };
 }
 
+/** Default Functions emulator port (matches `emulators.functions.port` in firebase.json). */
+const DEFAULT_EMULATOR_FUNCTIONS_PORT = 5001;
+
+/**
+ * The Functions emulator's port, read from the repo's `firebase.json`
+ * (`emulators.functions.port`) so a changed port is followed automatically.
+ * The emulator runs the code from `functions/`, so the file is one level up
+ * (`lib/services/billing` → four levels up from this compiled module). Falls
+ * back to 5001 when the file or the key is missing. Emulator-only: never
+ * called in a deployed function.
+ */
+export function readEmulatorFunctionsPort(): number {
+  try {
+    const file = path.resolve(__dirname, "../../../../firebase.json");
+    const config = JSON.parse(fs.readFileSync(file, "utf8")) as {
+      emulators?: { functions?: { port?: unknown } };
+    };
+    const port = config.emulators?.functions?.port;
+    return typeof port === "number" && Number.isInteger(port) && port > 0
+      ? port
+      : DEFAULT_EMULATOR_FUNCTIONS_PORT;
+  } catch {
+    return DEFAULT_EMULATOR_FUNCTIONS_PORT;
+  }
+}
+
 /**
  * The public base URL of THIS deployed API, so the return page URL follows the
  * project it runs in (dev `durin-seli-dev`, prod `japa-platform`) instead of
  * being hard-coded to one of them.
  *
  * Resolution order:
- *  1. `API_PUBLIC_URL` (plain env var, not a secret), when set: an explicit
- *     override, e.g. for an Android emulator that reaches the host on
- *     10.0.2.2. A trailing slash is trimmed. Must be http(s), else ignored.
+ *  1. `API_PUBLIC_URL` (plain env var, not a secret; see `.env.example`), when
+ *     set: an explicit override, e.g. for an Android emulator that reaches
+ *     the host on 10.0.2.2. A trailing slash is trimmed. It MUST be https
+ *     outside the Functions emulator (http is only accepted there); anything
+ *     else throws rather than handing Paystack an insecure or bogus callback.
  *  2. Functions emulator (`FUNCTIONS_EMULATOR === "true"`): the emulator URL,
- *     which carries the project id in its path.
+ *     which carries the project id in its path; the port comes from
+ *     firebase.json (`readEmulatorFunctionsPort`, injectable for tests).
  *  3. Deployed: the `api` function's default URL in `us-central1` (the region
  *     the mobile app's `app.config.ts` already calls).
+ *
+ * Throws when no project id is known (and no override is set): a callback
+ * like `https://us-central1-.cloudfunctions.net/...` would strand the payer,
+ * so it fails loudly instead (the controllers turn the throw into a 500 and
+ * no checkout is opened).
  *
  * Read from the environment on every call (not cached at import) so tests can
  * vary it and so it always reflects the running project.
  */
-export function getApiBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
-  const override = env.API_PUBLIC_URL?.trim();
-  if (override && /^https?:\/\//i.test(override)) return override.replace(/\/+$/, "");
+export function getApiBaseUrl(
+  env: NodeJS.ProcessEnv = process.env,
+  emulatorPort: () => number = readEmulatorFunctionsPort
+): string {
+  const isEmulator = env.FUNCTIONS_EMULATOR === "true";
 
-  const projectId = env.GCLOUD_PROJECT || env.GOOGLE_CLOUD_PROJECT || "";
-  if (env.FUNCTIONS_EMULATOR === "true") {
-    return `http://127.0.0.1:5001/${projectId}/us-central1/api`;
+  const override = env.API_PUBLIC_URL?.trim();
+  if (override) {
+    const allowed = isEmulator ? /^https?:\/\/[^/\s]+/i : /^https:\/\/[^/\s]+/i;
+    if (!allowed.test(override)) {
+      throw new Error(
+        isEmulator
+          ? "API_PUBLIC_URL must be an http(s) URL"
+          : "API_PUBLIC_URL must be an https URL outside the Functions emulator"
+      );
+    }
+    return override.replace(/\/+$/, "");
+  }
+
+  const projectId = (env.GCLOUD_PROJECT || env.GOOGLE_CLOUD_PROJECT || "").trim();
+  if (!projectId) {
+    throw new Error(
+      "Cannot build the payment return URL: no project id in GCLOUD_PROJECT / GOOGLE_CLOUD_PROJECT (set API_PUBLIC_URL)"
+    );
+  }
+  if (isEmulator) {
+    return `http://127.0.0.1:${emulatorPort()}/${projectId}/us-central1/api`;
   }
   return `https://us-central1-${projectId}.cloudfunctions.net/api`;
 }
@@ -161,10 +219,13 @@ function escapeHtml(value: string): string {
 }
 
 /**
- * The HTML fallback body sent with the 302: some in-app browsers show the
- * body instead of following a redirect to a custom scheme, so the user gets a
- * plain "Return to Seli" link to tap. No scripts, no external resources (the
- * response also carries a `default-src 'none'` CSP).
+ * The return page body (issue #252 review). Served with HTTP 200, NOT a 302:
+ * some Android Custom Tabs ignore a server redirect to a custom scheme, but
+ * follow a `<meta http-equiv="refresh">` to it; and if the browser refuses
+ * that too, the visible "Return to Seli" link is a user tap, which every
+ * browser hands to the app. No scripts and no external resources (the
+ * response also carries a `default-src 'none'` CSP). `target` is the fixed
+ * app URL plus an encoded reference, escaped again here for HTML.
  */
 export function renderReturnPage(target: string): string {
   const href = escapeHtml(target);
@@ -174,6 +235,8 @@ export function renderReturnPage(target: string): string {
     "<head>",
     "<meta charset=\"utf-8\">",
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+    // Immediate navigation to the app deep link (the auth browser closes on it).
+    `<meta http-equiv="refresh" content="0;url=${href}">`,
     "<title>Return to Seli</title>",
     "</head>",
     "<body style=\"font-family:-apple-system,system-ui,sans-serif;text-align:center;padding:48px 16px\">",
