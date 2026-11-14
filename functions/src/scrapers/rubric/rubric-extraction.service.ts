@@ -62,6 +62,8 @@ import { listNotReadableFlag, readLeadInList, unreadableListReason, verifyListIt
 import { spansSiblingMarkers } from "./rubric-marker-chain";
 import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSettings } from "./rubric-settings";
 import { rubricRouteKey, rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
+import type { RubricHead } from "../../types/rubric";
+import type { StartJobInput, StartJobResult } from "./rubric-extraction-job";
 import { validateCriterionShape, validateVisaRubric } from "./rubric-validate";
 
 // ============================================
@@ -176,10 +178,16 @@ export interface RubricExtractionDeps {
   // The route's display name (default: the visa type document's `name`).
   visaTypeName?: (countryCode: string, visaTypeId: string) => Promise<string>;
   now?: () => Timestamp;
+  // (#216) Starts a route's drafting job (default: the job service, resolved at call time).
+  startJob?: (input: StartJobInput) => Promise<StartJobResult>;
 }
 
-/** A run stopped on purpose, with the code and status to record. */
-class RunStop extends Error {
+/**
+ * A run stopped on purpose, with the code and status to record.
+ * (#216) Exported: the background job (rubric-extraction-job.ts) stops for the
+ * same reasons with the same codes, so a job's reason codes ARE these codes.
+ */
+export class RunStop extends Error {
   constructor(
     readonly status: "skipped" | "failed",
     readonly reasonCode: string,
@@ -216,8 +224,8 @@ export function criterionIdOf(sourceId: string, quote: string, kind: string, che
   return `crit_${sha256([sourceId, normalizeForQuoteMatch(quote), kind, checkField ?? ""].join("\n")).slice(0, 16)}`;
 }
 
-/** Attempts per model call (first try plus one retry). */
-const MAX_CALL_ATTEMPTS = 2;
+/** Attempts per model call (first try plus one retry). (#216: the job bounds a step's attempts with it too.) */
+export const MAX_CALL_ATTEMPTS = 2;
 /** Pause before a retry, multiplied by the attempt number. */
 const RETRY_BACKOFF_MS = 3000;
 
@@ -1227,12 +1235,176 @@ function emptyRunUsage(): RubricRunUsage {
   return { requests: 0, ...emptyLlmUsage() };
 }
 
+/**
+ * (#216) How a model call behaves inside a background job. Absent (the
+ * one-shot `extractRoute` and the CLI) = exactly the behaviour before the job
+ * existed: no deadline, two attempts, real clock and sleep.
+ */
+export interface CallOptions {
+  // Wall-clock end (ms since epoch) of the invocation the call runs in.
+  deadlineAt?: number;
+  // Clock; tests inject a fake one.
+  nowMs?: () => number;
+  // Pause between attempts; tests inject an instant one.
+  sleep?: (ms: number) => Promise<void>;
+  // Attempts allowed for THIS call (default: MAX_CALL_ATTEMPTS).
+  maxAttempts?: number;
+}
+
+/** Re-exported so the job counts attempts the same way the one-shot run does. */
+export type { CallAttempts };
+
+/**
+ * The criteria of one chunk that the second call (intake questions and
+ * evidence) is told about: what code ACCEPTED from the first call. Pure, so
+ * the one-shot run and the job build the same request from the same stored
+ * first-call result.
+ */
+export function acceptedViewOf(criteriaPart: ChunkAssessment): AcceptedCriterionView[] {
+  return criteriaPart.criteria.map((a) => ({
+    ref: a.ref,
+    title: a.criterion.title,
+    quote: a.criterion.source.quote,
+    ...(a.criterion.applicability === "specialist" || a.criterion.applicability === "conditional"
+      ? { applicability: a.criterion.applicability, ...(a.criterion.applicabilityCondition ? { condition: a.criterion.applicabilityCondition } : {}) }
+      : {}),
+  }));
+}
+
+/**
+ * Remember the questions a chunk's second call asked (and their options) so the
+ * calls for the chunks that FOLLOW are shown them: the question that
+ * establishes an activity is asked once and reused (#207). This is what makes
+ * the chunks ORDER-DEPENDENT, and therefore the job's steps strictly sequential.
+ * Mutates `known`.
+ */
+export function rememberQuestions(known: Map<string, KnownQuestionView>, assessment: Pick<ChunkAssessment, "intakeQuestions">): void {
+  for (const q of assessment.intakeQuestions) {
+    const prior = known.get(q.id);
+    const have = new Set((prior?.options ?? []).map((o) => o.value));
+    known.set(q.id, {
+      id: q.id,
+      label: prior?.label ?? q.label,
+      answerType: prior?.answerType ?? q.answerType,
+      options: [...(prior?.options ?? []), ...q.options.filter((o) => !have.has(o.value)).map((o) => ({ value: o.value, label: o.label }))],
+    });
+  }
+}
+
+/** The run settings a plan is built from (and a job pins). */
+export type RunSettingsPin = Pick<RubricExtractionSettings, "maxChunkChars" | "maxOutputTokensPerRequest" | "requestTimeoutMs" | "maxRequestsPerRun" | "maxInputCharsPerRun">;
+
+/**
+ * Everything a run needs that is recomputed, never stored, from the pinned
+ * sources: the prepared snapshots, the chunks (the cut is deterministic, see
+ * `chunkSnapshot`), the scope allow-list and the request limits.
+ */
+export interface RunContext {
+  sources: LoadedSource[];
+  indexes: Map<string, SnapshotQuoteIndex>;
+  midSentence: ReviewFlagContext["pagesEndingMidSentence"];
+  chunks: SourceChunk[];
+  plan: PlannedSource[];
+  severityLevels: string[];
+  limits: { maxOutputTokens: number; timeoutMs: number };
+  routeName: string;
+  primaries: LoadedSource[];
+  scope: RouteScope | null;
+}
+
+/** What `assembleDraft` produced. */
+export type AssembledDraft =
+  | { ok: false; reasonCode: "no_criteria_accepted" | "rubric_invalid"; error: string; discardedCount: number; discardedByReason: Record<string, number> }
+  | { ok: true; draft: RubricDraft; merged: MergedRubricContent; discardedByReason: Record<string, number> };
+
+/** What `assembleDraft` needs besides the parts. */
+export interface AssembleInput {
+  routeKey: string;
+  countryCode: string;
+  visaTypeId: string;
+  sources: readonly LoadedSource[];
+  sourceSetHash: string;
+  model: string;
+  runId: string;
+  severityLevels: readonly string[];
+  chunkCount: number;
+  midSentence: ReviewFlagContext["pagesEndingMidSentence"];
+  createdAt: Timestamp;
+}
+
+/**
+ * Steps 7 and 8 up to (not including) the write, shared by the one-shot run
+ * and the job's final step: merge the parts (document order), count and log
+ * the discards, build the pending draft, validate its structure and add the
+ * standing flags. Pure apart from the log lines. Same inputs, same draft:
+ * this is the single place that decides what a rulebook looks like, which is
+ * why the job's result equals the one-shot result.
+ */
+export function assembleDraft(input: AssembleInput, parts: readonly { chunk: Pick<SourceChunk, "sourceId" | "chunkIndex">; assessment: ChunkAssessment }[]): AssembledDraft {
+  const merged = mergeAssessments(parts);
+  const discardedByReason = countByReason(merged.discards);
+  // Every rejection is logged with its reason CODE and where it came
+  // from. Never the detail, the label, the model's text or source text.
+  for (const d of merged.discards) console.warn(`${TAG} ${input.routeKey}: discarded ${d.itemType} (${d.reason}) from ${d.sourceId || "merge"}#${d.chunkIndex}`);
+  if (merged.criteria.length === 0) {
+    return { ok: false, reasonCode: "no_criteria_accepted", error: "no criterion survived validation", discardedCount: merged.discards.length, discardedByReason };
+  }
+  const draft: RubricDraft = {
+    schemaVersion: RUBRIC_SCHEMA_VERSION,
+    routeKey: input.routeKey,
+    countryCode: input.countryCode,
+    visaTypeId: input.visaTypeId,
+    // Governance: always pending, never decided, by construction.
+    reviewStatus: "pending_review",
+    intentPolarity: null,
+    reviewedBy: null,
+    reviewedAt: null,
+    rejectReason: null,
+    revision: 0,
+    supersededAt: null,
+    intentPolarityProposal: merged.intentPolarityProposal,
+    severityLevels: [...input.severityLevels],
+    criteria: merged.criteria,
+    ...(merged.intake ? { intake: merged.intake } : {}),
+    intakeQuestions: merged.intakeQuestions,
+    evidenceItems: merged.evidenceItems,
+    sourceSnapshots: input.sources.map((s) => s.snapshot),
+    sourceSetHash: input.sourceSetHash,
+    extractorModel: input.model,
+    extractorPromptVersion: RUBRIC_PROMPT_VERSION,
+    extractionRunId: input.runId,
+    discardedCount: merged.discards.length,
+    discarded: merged.discards.slice(0, MAX_STORED_DISCARDS),
+    suspiciousPassages: merged.suspiciousPassages,
+    flags: merged.flags,
+    createdAt: input.createdAt,
+  };
+  const validation = validateVisaRubric({ ...draft, version: 1 });
+  if (validation.errors.length > 0) {
+    const codes = [...new Set(validation.errors.map((e) => e.code))].join(", ");
+    return { ok: false, reasonCode: "rubric_invalid", error: `the merged rubric is not consistent: ${codes}`, discardedCount: merged.discards.length, discardedByReason };
+  }
+  draft.flags = [
+    ...merged.flags,
+    ...validation.flags,
+    ...reviewFlagsFor(merged, { chunkCount: input.chunkCount, pagesEndingMidSentence: input.midSentence }),
+  ];
+  if (merged.suspiciousPassages.length > 0) {
+    draft.flags.push({ code: "suspicious_passages", message: `${merged.suspiciousPassages.length} passage(s) of the source read as instructions to a reader model; no criterion quotes them. Read them before approving.`, target: "rubric" });
+  }
+  return { ok: true, draft, merged, discardedByReason };
+}
+
 // ============================================
 // The service
 // ============================================
 
-/** One source of a run, loaded. */
-interface LoadedSource {
+/**
+ * One source of a run, loaded. (#216) Exported and JSON-safe (plain strings and
+ * numbers only): a background job stores the list of its sources as they were
+ * when it started and rebuilds the run from it.
+ */
+export interface LoadedSource {
   snapshot: RubricSourceSnapshot;
   retrievedAt: string;
   // The source's role for its route (registry data); absent = secondary.
@@ -1260,6 +1432,10 @@ export class RubricExtractionService {
   private get store(): RubricStore {
     return this.deps.store ?? rubricStore;
   }
+  /** The model the drafting calls use (named on every run record and version). */
+  modelName(): string {
+    return this.provider.modelFor("judgement");
+  }
   private now(): Timestamp {
     return this.deps.now ? this.deps.now() : Timestamp.now();
   }
@@ -1274,7 +1450,7 @@ export class RubricExtractionService {
    * Read a source's registry entry and the metadata of its newest snapshot.
    * No document text is read here (that waits until after the hash gate).
    */
-  private async loadSource(sourceId: string): Promise<LoadedSource> {
+  async loadSource(sourceId: string): Promise<LoadedSource> {
     const doc = await collections.guidanceSources.doc(sourceId).get();
     if (!doc.exists) throw new RunStop("failed", "source_not_found", `guidance source ${sourceId} does not exist`);
     const source = doc.data() as GuidanceSource;
@@ -1302,7 +1478,7 @@ export class RubricExtractionService {
    * sent to the model so it knows which category it is extracting for. Falls
    * back to the visa type id (data either way, never code).
    */
-  private async routeName(countryCode: string, visaTypeId: string): Promise<string> {
+  async routeName(countryCode: string, visaTypeId: string): Promise<string> {
     if (this.deps.visaTypeName) return this.deps.visaTypeName(countryCode, visaTypeId);
     try {
       const data = (await subcollections.visaTypes(countryCode).doc(visaTypeId).get()).data() as { name?: unknown } | undefined;
@@ -1409,40 +1585,24 @@ export class RubricExtractionService {
       const settings = loaded.settings;
       if (!settings.enabled) throw new RunStop("skipped", "disabled", "rubric extraction is switched off");
 
-      // ---- 2. the route and its sources ----
+      // ---- 2 + 3. the route and its sources, then the hash gate ----
+      // (#216: the same steps start a background job, see `resolveRoute`.)
       const head = await this.store.getHead(routeKey);
-      const sourceIds = [...new Set(input.sourceIds && input.sourceIds.length > 0 ? input.sourceIds : head?.sourceIds ?? [])].sort();
-      if (sourceIds.length === 0) throw new RunStop("failed", "no_sources", "no guidance sources given, and the route has none recorded");
-      // A rubric is only ever attached to a real visa type.
-      if (!(await this.visaTypeExists(input.countryCode, input.visaTypeId))) {
-        throw new RunStop("failed", "visa_type_not_found", `no visa type ${input.visaTypeId} under ${input.countryCode}`);
-      }
-      sources = [];
-      for (const id of sourceIds) sources.push(await this.loadSource(id));
-
-      // ---- 3. hash gate: nothing changed -> nothing called, nothing written ----
-      sourceSetHash = sourceSetHashOf(sources.map((s) => s.snapshot));
+      const resolved = await this.resolveRoute(input, head);
+      const sourceIds = resolved.sourceIds;
+      sources = resolved.sources;
+      sourceSetHash = resolved.sourceSetHash;
       if (!input.force && head && head.latestSourceSetHash === sourceSetHash) {
         return await finish("unchanged", { reasonCode: "source_unchanged", version: head.latestVersion }, false);
       }
 
       // ---- 4. plan: read the snapshot text, cut it, check the caps ----
-      const indexes = new Map<string, SnapshotQuoteIndex>();
-      const midSentence: ReviewFlagContext["pagesEndingMidSentence"] = [];
-      const chunks: SourceChunk[] = [];
-      plan = [];
-      for (const s of sources) {
-        // `read` re-hashes the text and refuses a mismatch.
-        const content: GuidanceSnapshotContent = await this.snapshots.read(s.snapshot.sourceId, s.snapshot.contentHash);
-        indexes.set(s.snapshot.sourceId, new SnapshotQuoteIndex(content));
-        midSentence.push({ sourceId: s.snapshot.sourceId, pages: pagesEndingMidSentence(content) });
-        const cut = chunkSnapshot(content, settings.maxChunkChars);
-        chunks.push(...cut);
-        plan.push({ sourceId: s.snapshot.sourceId, contentHashPrefix: s.snapshot.contentHash.slice(0, 12), docType: s.snapshot.docType, chars: content.text.length, chunks: cut.length });
-      }
-      chunkCount = chunks.length;
+      const routeName = await this.routeName(input.countryCode, input.visaTypeId);
+      const ctx = await this.buildRunContext(sources, settings, routeName);
+      plan = ctx.plan;
+      chunkCount = ctx.chunks.length;
       if (chunkCount === 0) throw new RunStop("failed", "no_text", "the snapshots hold no text to extract from");
-      this.assertWithinCaps(chunks, settings);
+      this.assertWithinCaps(ctx.chunks, settings);
       if (input.dryRun) return await finish("dry_run", {}, false);
 
       // The daily cap counts the runs that REACHED THE MODEL today (UTC),
@@ -1472,121 +1632,32 @@ export class RubricExtractionService {
       // Call 1 reads the criteria; code validates them. Call 2 reads the
       // intake questions and evidence items for the criteria code accepted
       // (a chunk with none gets no second call). The split keeps each schema
-      // inside the provider's limits.
-      const severityLevels = [...DEFAULT_SEVERITY_LEVELS];
-      const limits = { maxOutputTokens: settings.maxOutputTokensPerRequest, timeoutMs: settings.requestTimeoutMs };
-      const routeName = await this.routeName(input.countryCode, input.visaTypeId);
-      // The scope allow-list is built, in code, from the route's own source(s).
-      const primaries = sources.filter((s) => s.role === "primary");
-      const scope = primaries.length > 0 ? routeScopeFrom(primaries.map((s) => (indexes.get(s.snapshot.sourceId) as SnapshotQuoteIndex).allText())) : null;
+      // inside the provider's limits. (#216: each call is one STEP, run by
+      // `runCriteriaStep` / `runIntakeStep`, the same functions the
+      // background job calls one at a time.)
       const parts: { chunk: SourceChunk; assessment: ChunkAssessment }[] = [];
       // (#207) Questions asked so far, by id, shown to the next excerpt's call 2.
       const knownQuestions = new Map<string, KnownQuestionView>();
       // Failed attempts so far, counted against the request cap with the successes.
       const attempts: CallAttempts = { failed: 0, cap: settings.maxRequestsPerRun };
-      for (const chunk of chunks) {
-        const source = sources.find((s) => s.snapshot.sourceId === chunk.sourceId) as LoadedSource;
-        const index = indexes.get(chunk.sourceId) as SnapshotQuoteIndex;
-        const base: CitationBase = {
-          sourceId: chunk.sourceId,
-          url: source.snapshot.url,
-          contentHash: chunk.contentHash,
-          retrievedAt: source.retrievedAt,
-          ...(source.snapshot.publishedDate ? { publishedDate: source.snapshot.publishedDate } : {}),
-        };
-        // Scoping applies only when the run has a primary source. What is
-        // kept from each source depends on its role (see assessCriterion 3c).
-        const route: RubricRouteContext = { routeName, sourceRole: primaries.length === 0 ? "unspecified" : source.role };
-        const scopeForChunk: SourceScope | null = scope
-          ? { role: source.role, allow: scope, namedByPrimary: source.role === "secondary" && primaryNamesDocument(scope, source.title, index.allText()) }
-          : null;
-
-        const raw1 = await this.callModel(buildRubricRequest(chunk, severityLevels, limits, route), usage, attempts);
-        const criteriaPart = assessChunkOutput(raw1, chunk, index, base, severityLevels, scopeForChunk);
+      for (const chunk of ctx.chunks) {
+        const criteriaPart = await this.runCriteriaStep(ctx, chunk, usage, attempts);
         let assessment = criteriaPart;
         if (criteriaPart.criteria.length > 0) {
-          // (#207) Scoped rules go with their applicability and condition words,
-          // and the questions asked in earlier excerpts go too, so the question
-          // that establishes an activity is asked once and reused.
-          const accepted: AcceptedCriterionView[] = criteriaPart.criteria.map((a) => ({
-            ref: a.ref,
-            title: a.criterion.title,
-            quote: a.criterion.source.quote,
-            ...(a.criterion.applicability === "specialist" || a.criterion.applicability === "conditional"
-              ? { applicability: a.criterion.applicability, ...(a.criterion.applicabilityCondition ? { condition: a.criterion.applicabilityCondition } : {}) }
-              : {}),
-          }));
-          const raw2 = await this.callModel(buildIntakeRequest(chunk, accepted, limits, route, [...knownQuestions.values()]), usage, attempts);
-          assessment = combineAssessments(criteriaPart, assessChunkOutput(raw2, chunk, index, base, severityLevels));
+          const intakePart = await this.runIntakeStep(ctx, chunk, criteriaPart, [...knownQuestions.values()], usage, attempts);
+          assessment = combineAssessments(criteriaPart, intakePart);
           // Remember each question (and its options) for the excerpts that follow.
-          for (const q of assessment.intakeQuestions) {
-            const prior = knownQuestions.get(q.id);
-            const have = new Set((prior?.options ?? []).map((o) => o.value));
-            knownQuestions.set(q.id, {
-              id: q.id,
-              label: prior?.label ?? q.label,
-              answerType: prior?.answerType ?? q.answerType,
-              options: [...(prior?.options ?? []), ...q.options.filter((o) => !have.has(o.value)).map((o) => ({ value: o.value, label: o.label }))],
-            });
-          }
+          rememberQuestions(knownQuestions, assessment);
         }
         parts.push({ chunk, assessment });
       }
 
-      // ---- 7. merge ----
-      const merged = mergeAssessments(parts);
-      const discardedByReason = countByReason(merged.discards);
-      // Every rejection is logged with its reason CODE and where it came
-      // from. Never the detail, the label, the model's text or source text.
-      for (const d of merged.discards) console.warn(`${TAG} ${routeKey}: discarded ${d.itemType} (${d.reason}) from ${d.sourceId || "merge"}#${d.chunkIndex}`);
-      if (merged.criteria.length === 0) {
-        return await finish("failed", { reasonCode: "no_criteria_accepted", error: "no criterion survived validation", discardedCount: merged.discards.length, discardedByReason }, true);
+      // ---- 7 + 8. merge, build the draft, validate its structure ----
+      const assembled = assembleDraft({ routeKey, countryCode: input.countryCode, visaTypeId: input.visaTypeId, sources, sourceSetHash: sourceSetHash as string, model, runId, severityLevels: ctx.severityLevels, chunkCount, midSentence: ctx.midSentence, createdAt: this.now() }, parts);
+      if (!assembled.ok) {
+        return await finish("failed", { reasonCode: assembled.reasonCode, error: assembled.error, discardedCount: assembled.discardedCount, discardedByReason: assembled.discardedByReason }, true);
       }
-
-      // ---- 8. build the draft, validate its structure, write ----
-      const draft: RubricDraft = {
-        schemaVersion: RUBRIC_SCHEMA_VERSION,
-        routeKey,
-        countryCode: input.countryCode,
-        visaTypeId: input.visaTypeId,
-        // Governance: always pending, never decided, by construction.
-        reviewStatus: "pending_review",
-        intentPolarity: null,
-        reviewedBy: null,
-        reviewedAt: null,
-        rejectReason: null,
-        revision: 0,
-        supersededAt: null,
-        intentPolarityProposal: merged.intentPolarityProposal,
-        severityLevels,
-        criteria: merged.criteria,
-        ...(merged.intake ? { intake: merged.intake } : {}),
-        intakeQuestions: merged.intakeQuestions,
-        evidenceItems: merged.evidenceItems,
-        sourceSnapshots: sources.map((s) => s.snapshot),
-        sourceSetHash,
-        extractorModel: model,
-        extractorPromptVersion: RUBRIC_PROMPT_VERSION,
-        extractionRunId: runId,
-        discardedCount: merged.discards.length,
-        discarded: merged.discards.slice(0, MAX_STORED_DISCARDS),
-        suspiciousPassages: merged.suspiciousPassages,
-        flags: merged.flags,
-        createdAt: this.now(),
-      };
-      const validation = validateVisaRubric({ ...draft, version: 1 });
-      if (validation.errors.length > 0) {
-        const codes = [...new Set(validation.errors.map((e) => e.code))].join(", ");
-        return await finish("failed", { reasonCode: "rubric_invalid", error: `the merged rubric is not consistent: ${codes}`, discardedCount: merged.discards.length, discardedByReason }, true);
-      }
-      draft.flags = [
-        ...merged.flags,
-        ...validation.flags,
-        ...reviewFlagsFor(merged, { chunkCount, pagesEndingMidSentence: midSentence }),
-      ];
-      if (merged.suspiciousPassages.length > 0) {
-        draft.flags.push({ code: "suspicious_passages", message: `${merged.suspiciousPassages.length} passage(s) of the source read as instructions to a reader model; no criterion quotes them. Read them before approving.`, target: "rubric" });
-      }
+      const { draft, merged, discardedByReason } = assembled;
 
       const written = await this.store.writePendingVersion(draft, sourceIds, { force: input.force, now: this.now() });
       if (!written.written) {
@@ -1606,8 +1677,115 @@ export class RubricExtractionService {
     }
   }
 
-  /** Refuse the run when its plan would pass a per-run cap. */
-  private assertWithinCaps(chunks: readonly SourceChunk[], settings: RubricExtractionSettings): void {
+  /**
+   * Steps 2 and 3 of a run, shared with the background job's start: the
+   * route's sources (given, or remembered on the head), the visa type check,
+   * and each source's registry entry with the metadata of its newest snapshot.
+   * Throws `RunStop` for an expected problem. The hash gate itself is left to
+   * the caller (it differs: the job also compares against running jobs).
+   */
+  async resolveRoute(input: Pick<ExtractRouteInput, "countryCode" | "visaTypeId" | "sourceIds">, head: RubricHead | null): Promise<{ sourceIds: string[]; sources: LoadedSource[]; sourceSetHash: string }> {
+    const sourceIds = [...new Set(input.sourceIds && input.sourceIds.length > 0 ? input.sourceIds : head?.sourceIds ?? [])].sort();
+    if (sourceIds.length === 0) throw new RunStop("failed", "no_sources", "no guidance sources given, and the route has none recorded");
+    // A rubric is only ever attached to a real visa type.
+    if (!(await this.visaTypeExists(input.countryCode, input.visaTypeId))) {
+      throw new RunStop("failed", "visa_type_not_found", `no visa type ${input.visaTypeId} under ${input.countryCode}`);
+    }
+    const sources: LoadedSource[] = [];
+    for (const id of sourceIds) sources.push(await this.loadSource(id));
+    return { sourceIds, sources, sourceSetHash: sourceSetHashOf(sources.map((s) => s.snapshot)) };
+  }
+
+  /**
+   * Step 4: read the text of each PINNED snapshot (by content hash, never by
+   * "latest": `read` re-hashes the text and refuses a mismatch), prepare it
+   * for quote lookups, and cut it into chunks. Everything here is a pure
+   * function of the sources and the settings, so a background job stores
+   * only the sources and rebuilds this context at the start of each
+   * invocation instead of storing the (large) text.
+   */
+  async buildRunContext(sources: LoadedSource[], settings: Pick<RunSettingsPin, "maxChunkChars" | "maxOutputTokensPerRequest" | "requestTimeoutMs">, routeName: string): Promise<RunContext> {
+    const indexes = new Map<string, SnapshotQuoteIndex>();
+    const midSentence: ReviewFlagContext["pagesEndingMidSentence"] = [];
+    const chunks: SourceChunk[] = [];
+    const plan: PlannedSource[] = [];
+    for (const s of sources) {
+      const content: GuidanceSnapshotContent = await this.snapshots.read(s.snapshot.sourceId, s.snapshot.contentHash);
+      indexes.set(s.snapshot.sourceId, new SnapshotQuoteIndex(content));
+      midSentence.push({ sourceId: s.snapshot.sourceId, pages: pagesEndingMidSentence(content) });
+      const cut = chunkSnapshot(content, settings.maxChunkChars);
+      chunks.push(...cut);
+      plan.push({ sourceId: s.snapshot.sourceId, contentHashPrefix: s.snapshot.contentHash.slice(0, 12), docType: s.snapshot.docType, chars: content.text.length, chunks: cut.length });
+    }
+    // The scope allow-list is built, in code, from the route's own source(s).
+    const primaries = sources.filter((s) => s.role === "primary");
+    const scope = primaries.length > 0 ? routeScopeFrom(primaries.map((s) => (indexes.get(s.snapshot.sourceId) as SnapshotQuoteIndex).allText())) : null;
+    return {
+      sources,
+      indexes,
+      midSentence,
+      chunks,
+      plan,
+      severityLevels: [...DEFAULT_SEVERITY_LEVELS],
+      limits: { maxOutputTokens: settings.maxOutputTokensPerRequest, timeoutMs: settings.requestTimeoutMs },
+      routeName,
+      primaries,
+      scope,
+    };
+  }
+
+  /** What validating one chunk's answer needs: its snapshot, citation base, route context and scope. */
+  private chunkInputs(ctx: RunContext, chunk: SourceChunk): { index: SnapshotQuoteIndex; base: CitationBase; route: RubricRouteContext; scopeForChunk: SourceScope | null } {
+    const source = ctx.sources.find((s) => s.snapshot.sourceId === chunk.sourceId) as LoadedSource;
+    const index = ctx.indexes.get(chunk.sourceId) as SnapshotQuoteIndex;
+    const base: CitationBase = {
+      sourceId: chunk.sourceId,
+      url: source.snapshot.url,
+      contentHash: chunk.contentHash,
+      retrievedAt: source.retrievedAt,
+      ...(source.snapshot.publishedDate ? { publishedDate: source.snapshot.publishedDate } : {}),
+    };
+    // Scoping applies only when the run has a primary source. What is
+    // kept from each source depends on its role (see assessCriterion 3c).
+    const route: RubricRouteContext = { routeName: ctx.routeName, sourceRole: ctx.primaries.length === 0 ? "unspecified" : source.role };
+    const scopeForChunk: SourceScope | null = ctx.scope
+      ? { role: source.role, allow: ctx.scope, namedByPrimary: source.role === "secondary" && primaryNamesDocument(ctx.scope, source.title, index.allText()) }
+      : null;
+    return { index, base, route, scopeForChunk };
+  }
+
+  /**
+   * STEP "criteria" of one chunk: exactly ONE model call (call 1) and the
+   * validation of its answer in code. Needs nothing from other chunks.
+   * Returns the validated criteria half of the chunk's assessment: plain JSON
+   * (no Map, Set or class), which is what a job stores.
+   */
+  async runCriteriaStep(ctx: RunContext, chunk: SourceChunk, usage: RubricRunUsage, attempts: CallAttempts, opts: CallOptions = {}): Promise<ChunkAssessment> {
+    const { index, base, route, scopeForChunk } = this.chunkInputs(ctx, chunk);
+    const raw = await this.callModel(buildRubricRequest(chunk, ctx.severityLevels, ctx.limits, route), usage, attempts, opts);
+    return assessChunkOutput(raw, chunk, index, base, ctx.severityLevels, scopeForChunk);
+  }
+
+  /**
+   * STEP "intake" of one chunk: exactly ONE model call (call 2) and the
+   * validation of its answer. It needs two things from earlier steps: the
+   * criteria code accepted from this chunk's own criteria step, and the
+   * questions already asked for EARLIER chunks (`known`, in document order).
+   * That second input is why chunks cannot be processed in parallel or out of
+   * order. Returns the intake half of the chunk's assessment (join it with
+   * the criteria half using `combineAssessments`).
+   */
+  async runIntakeStep(ctx: RunContext, chunk: SourceChunk, criteriaPart: ChunkAssessment, known: KnownQuestionView[], usage: RubricRunUsage, attempts: CallAttempts, opts: CallOptions = {}): Promise<ChunkAssessment> {
+    const { index, base, route } = this.chunkInputs(ctx, chunk);
+    // (#207) Scoped rules go with their applicability and condition words,
+    // and the questions asked in earlier excerpts go too, so the question
+    // that establishes an activity is asked once and reused.
+    const raw = await this.callModel(buildIntakeRequest(chunk, acceptedViewOf(criteriaPart), ctx.limits, route, known), usage, attempts, opts);
+    return assessChunkOutput(raw, chunk, index, base, ctx.severityLevels);
+  }
+
+  /** Refuse the run when its plan would pass a per-run cap. (#216: public, the job start checks the same caps.) */
+  assertWithinCaps(chunks: readonly SourceChunk[], settings: RubricExtractionSettings): void {
     // Two calls per chunk at most (criteria, then intake and evidence).
     if (chunks.length * 2 > settings.maxRequestsPerRun) {
       throw new RunStop("skipped", "run_cap_exceeded", `the run needs up to ${chunks.length * 2} requests; the cap is ${settings.maxRequestsPerRun}`);
@@ -1626,17 +1804,32 @@ export class RubricExtractionService {
    * schema are never retried. Every attempt counts against the run's request
    * cap, and calls already completed for earlier chunks are untouched (their
    * results sit in `parts`), so one dropped connection costs one call.
+   *
+   * (#216) Deadline aware. A background job runs inside a function invocation
+   * that is cut off at a fixed time. When `opts.deadlineAt` is given, the
+   * in-process retry (pause, then a second attempt that may itself take the
+   * whole request timeout) happens only if it can still finish before the
+   * deadline; otherwise the transient error is rethrown and the job records a
+   * failed attempt for this step, which the NEXT invocation retries. Nothing
+   * is retried silently forever: the job bounds the attempts per step.
    */
-  private async callModel(request: LlmRequest, usage: RubricRunUsage, attempts: CallAttempts): Promise<RawRubricOutput> {
+  private async callModel(request: LlmRequest, usage: RubricRunUsage, attempts: CallAttempts, opts: CallOptions = {}): Promise<RawRubricOutput> {
+    const maxAttempts = opts.maxAttempts ?? MAX_CALL_ATTEMPTS;
+    const nowMs = opts.nowMs ?? Date.now;
+    const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     for (let attempt = 1; ; attempt++) {
       try {
         return await this.callModelOnce(request, usage);
       } catch (err) {
         const retryable = err instanceof RunStop && err.reasonCode === "provider_error" && isTransientProviderError(err.message);
-        if (!retryable || attempt >= MAX_CALL_ATTEMPTS || usage.requests + attempts.failed + 1 >= attempts.cap) throw err;
+        if (!retryable || attempt >= maxAttempts || usage.requests + attempts.failed + 1 >= attempts.cap) throw err;
+        const backoff = RETRY_BACKOFF_MS * attempt;
+        // Not enough time left in this invocation for a pause and a whole
+        // second request: hand the retry to the next invocation.
+        if (opts.deadlineAt !== undefined && nowMs() + backoff + request.timeoutMs > opts.deadlineAt) throw err;
         attempts.failed += 1;
-        console.warn(`${TAG} model call failed transiently, retrying (attempt ${attempt + 1} of ${MAX_CALL_ATTEMPTS})`);
-        await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS * attempt));
+        console.warn(`${TAG} model call failed transiently, retrying (attempt ${attempt + 1} of ${maxAttempts})`);
+        await sleep(backoff);
       }
     }
   }
@@ -1708,13 +1901,18 @@ export class RubricExtractionService {
   }
 
   /**
-   * Listener for the guidance crawl's `onChanged` hook: re-extract every
-   * route that uses the changed source. It does not throw (extractRoute
-   * reports problems in its result). Should it fail anyway, the crawl does
-   * not retry a listener, and `runPending` picks the route up later.
+   * Listener for the guidance crawl's `onChanged` hook: re-draft every route
+   * that uses the changed source. (#216) It no longer runs the extraction
+   * inline: it creates (or finds) the route's background DRAFTING JOB, which a
+   * worker advances in saved steps (a route can need 30-40 minutes, far over
+   * the function's 540 seconds). The checks are the same as before and happen
+   * in the job's start: a hash gate (unchanged sources start nothing), the
+   * kill switch, the caps. It does not throw (`startJob` reports problems in
+   * its result). Should it fail anyway, the crawl does not retry a listener,
+   * and `runPending` picks the route up later.
    */
-  async onGuidanceChanged(event: Pick<GuidanceChangeEvent, "sourceId">): Promise<ExtractRouteResult[]> {
-    const results: ExtractRouteResult[] = [];
+  async onGuidanceChanged(event: Pick<GuidanceChangeEvent, "sourceId">): Promise<StartJobResult[]> {
+    const results: StartJobResult[] = [];
     const heads = await this.store.listHeads();
     // (#169) Tell the two "nothing to do" cases apart in the log. With no head
     // at all, no route has ever been extracted: a route's FIRST extraction is
@@ -1728,9 +1926,20 @@ export class RubricExtractionService {
     }
     for (const head of heads) {
       if (!(head.sourceIds ?? []).includes(event.sourceId)) continue;
-      results.push(await this.extractRoute({ countryCode: head.countryCode, visaTypeId: head.visaTypeId, trigger: "guidance_changed" }));
+      results.push(await this.startJob({ countryCode: head.countryCode, visaTypeId: head.visaTypeId, trigger: "guidance_changed" }));
     }
     return results;
+  }
+
+  /**
+   * Start a drafting job (injectable for tests). The default resolves the job
+   * module at CALL time: it imports this one, so a top-level import would make
+   * a cycle (see the note in scrapers/index.ts).
+   */
+  private async startJob(input: StartJobInput): Promise<StartJobResult> {
+    if (this.deps.startJob) return this.deps.startJob(input);
+    const { rubricExtractionJobService } = await import("./rubric-extraction-job");
+    return rubricExtractionJobService.startJob(input);
   }
 }
 

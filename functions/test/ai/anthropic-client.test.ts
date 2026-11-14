@@ -204,6 +204,9 @@ describe("secret binding in src/index.ts (Gen 1 runWith)", () => {
       "onRubricVersionCreated",
       // #202: the hourly sweep re-runs held drafts, so it runs the check too.
       "sweepHeldRubricDrafts",
+      // #216: the worker of the resumable rulebook drafting job makes the
+      // model calls of a draft. The sweep that wakes it binds NO key.
+      "processRubricExtractionJob",
       "processBulkReassessments",
       "processDocumentCheck",
       "processRefusalAnalysisJob",

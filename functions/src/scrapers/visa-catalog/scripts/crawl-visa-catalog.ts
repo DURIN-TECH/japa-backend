@@ -438,11 +438,18 @@ async function main() {
             .get();
           const existing = existingSnap.exists ? (existingSnap.data() as VisaType) : undefined;
           if (existing?.scrapeMeta?.contentHash === gateHash) {
-            // Same text — but a PENDING scraped doc from an older extractor
-            // prompt is re-extracted anyway (issue #71, same rule as the
-            // orchestrator). Approved / seeded / agent docs never qualify.
-            // Still counted against --max-extractions below.
-            if (!isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION)) {
+            // Same text — but a scraped doc from an older extractor prompt is
+            // re-extracted anyway (issue #71, same rule as the orchestrator):
+            // a PENDING doc is refreshed, an APPROVED one that lists documents
+            // (issue #187) only gets a proposal, and is skipped once a proposal
+            // row of any status exists for this text from this prompt version
+            // (no repeat LLM call, no re-proposing a rejected change).
+            // Seeded / agent docs never qualify. Still counted against
+            // --max-extractions below.
+            const alreadyReRead =
+              existing.reviewStatus === "approved" &&
+              (await visaChangeService.hasProposalForHash(source.countryCode, resolvedVisaId, gateHash, EXTRACTOR_PROMPT_VERSION));
+            if (!isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION) || alreadyReRead) {
               totals.unchanged++;
               notePage(page, "unchanged", { visaId: resolvedVisaId });
               console.log(`  -> unchanged (hash gate, no extraction): ${resolvedVisaId}`);
@@ -679,10 +686,17 @@ async function printEstimate(args: ReturnType<typeof parseArgs>): Promise<void> 
       const existing = snap.exists ? (snap.data() as VisaType) : undefined;
       // No doc yet: the next crawl extracts it. Pending scraped doc: stale
       // when from another prompt version (or always, with --assume-bump).
+      // --assume-bump: after a bump every pending scraped doc AND every approved
+      // scraped doc that lists documents (issue #187) is re-extracted.
       const stale = !existing
         ? true
         : args.assumeBump
-          ? existing.source === "scraped" && existing.reviewStatus === "pending_review"
+          ? existing.source === "scraped" &&
+            (existing.reviewStatus === "pending_review" ||
+              (existing.reviewStatus === "approved" &&
+                !existing.staleSince &&
+                Array.isArray(existing.requiredDocuments) &&
+                existing.requiredDocuments.length > 0))
           : isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION);
       if (stale) srcQueued++;
     }

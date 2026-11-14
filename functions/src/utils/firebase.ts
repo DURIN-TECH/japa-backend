@@ -140,6 +140,20 @@ export const collections = {
   // source (see `subcollections.guidanceSnapshots`).
   // Backend-only: no firestore.rules match -> clients denied.
   guidanceSources: db.collection("guidanceSources"),
+  // Source registry safeguards (issue #215). ALL backend-only (no
+  // firestore.rules match -> clients denied; pinned by
+  // test/emulator/backend-only-collections.emu.ts):
+  // - officialDomains/{host}: the allow-list of official websites an admin
+  //   confirmed. A portal-added source may only point at a confirmed host.
+  // - officialDomainPreviews/{uid}__{host}: the last address check an admin made
+  //   for a host; a confirmation must rest on it (server-held evidence).
+  // - sourceRegistryAudit/{id}: append-only record of every confirm, revoke,
+  //   register, edit and removal (never updated or deleted).
+  // - sourceRegistryRateLimits/{uid}__{kind}__{hour}: per-admin hourly counters.
+  officialDomains: db.collection("officialDomains"),
+  officialDomainPreviews: db.collection("officialDomainPreviews"),
+  sourceRegistryAudit: db.collection("sourceRegistryAudit"),
+  sourceRegistryRateLimits: db.collection("sourceRegistryRateLimits"),
   // Published outcome statistics (issue #116): decision counts per destination,
   // published category and nationality, imported from a government's own
   // statistics release (src/scrapers/outcome-statistics). One doc per
@@ -232,6 +246,14 @@ export const collections = {
   // cost (null while the model is unpriced), what was discarded and why.
   // Backend-only: no firestore.rules match.
   rubricExtractionRuns: db.collection("rubricExtractionRuns"),
+  // (#216) The background job that drafts one route's rulebook in small saved
+  // steps: `rubricExtractionJobs/{jobId}` (status, cursor, counters, lease,
+  // cancel flag), with the stored result of each finished step under
+  // `steps` / `stepParts` (see subcollections below). The job document is also
+  // the trigger of the worker. Backend-only: no firestore.rules match, so
+  // clients are denied (they would otherwise read validated rule text and
+  // model usage, or cancel or restart a paid job).
+  rubricExtractionJobs: db.collection("rubricExtractionJobs"),
   // Audit trail of rubric review decisions (issue #125): one doc per approve
   // or reject (who, when, route, version, action, reason, the flags the
   // reviewer acknowledged, the version that was serving before). Written in
@@ -380,6 +402,12 @@ export const subcollections = {
   reviews: (agentId: string) =>
     collections.agents.doc(agentId).collection("reviews"),
   
+  // Answers to "information" checklist items under applications (issue #187):
+  // `applications/{id}/answers/{checklistItemId}` = { text, updatedAt, updatedBy }.
+  // Backend-only: firestore.rules deny every client read and write.
+  answers: (applicationId: string) =>
+    collections.applications.doc(applicationId).collection("answers"),
+
   // Notes under applications
   notes: (applicationId: string) =>
     collections.applications.doc(applicationId).collection("notes"),
@@ -415,6 +443,13 @@ export const subcollections = {
   // A version's content is immutable once written. Backend-only, like its parent.
   rubricVersions: (routeKey: string) =>
     collections.visaRubrics.doc(routeKey).collection("rubricVersions"),
+
+  // (#216) The saved results of a drafting job's finished steps:
+  // `rubricExtractionJobs/{jobId}/steps/{stepId}` (one per model call), and
+  // `.../stepParts/{stepId}__{n}` for the overflow of an unusually large
+  // result (a Firestore document holds at most 1 MiB). Backend-only.
+  rubricExtractionSteps: (jobId: string) => collections.rubricExtractionJobs.doc(jobId).collection("steps"),
+  rubricExtractionStepParts: (jobId: string) => collections.rubricExtractionJobs.doc(jobId).collection("stepParts"),
 
   // An agency's per-visa service prices (issue #103), in whole NAIRA:
   // `agencies/{agencyId}/visaPrices/{countryCode}__{visaTypeId}`. Written and

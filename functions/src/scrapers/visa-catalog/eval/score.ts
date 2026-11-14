@@ -100,6 +100,17 @@ export interface ExpectedFeeComponent extends Sourced {
   yearsAssumed?: string;
 }
 
+/**
+ * Issue #187: one expected item classification. `match` = keyword alternatives
+ * (whole words, any one) that find the item in the extractor's
+ * `requiredDocuments`; `kind` / `need` are what the PAGE's wording says.
+ */
+export interface ExpectedItemKind extends Sourced {
+  match: string[];
+  kind: "document" | "information";
+  need: "required" | "conditional" | "optional";
+}
+
 /** A known, tracked gap: reported in every run, never fails it. */
 export interface KnownGap {
   field: ScoredField;
@@ -127,13 +138,15 @@ export interface ExpectedVisa {
   eligibility: { themes: ExpectedTheme[] };
   applicationUrlHost: ExpectedValue<string>;
   feeComponents: { components: ExpectedFeeComponent[] };
+  // Issue #187: optional; the field is scored only when present.
+  documentKinds?: { items: ExpectedItemKind[] };
   knownGaps?: KnownGap[];
 }
 
 // ----- Result shape -----
 
 /** Reporting group of a field. */
-export type FieldType = "exact" | "fee" | "numeric" | "text" | "eligibility" | "url";
+export type FieldType = "exact" | "fee" | "numeric" | "text" | "eligibility" | "url" | "itemKinds";
 
 /** Field → reporting group. */
 export const FIELD_TYPES: Record<ScoredField, FieldType> = {
@@ -146,6 +159,7 @@ export const FIELD_TYPES: Record<ScoredField, FieldType> = {
   eligibility: "eligibility",
   applicationUrlHost: "url",
   feeComponents: "fee",
+  documentKinds: "itemKinds",
 };
 
 /** One field's result. */
@@ -342,6 +356,35 @@ function scoreHost(expected: ExpectedValue<string>, actualUrl: unknown): FieldRe
   return result("applicationUrlHost", ok ? 1 : 0, expected.value, actualUrl ?? null, detail);
 }
 
+// ----- Item kinds + need (issue #187) -----
+
+/**
+ * documentKinds: for each expected item, find the extractor item whose text
+ * contains one of its keywords; the item scores when BOTH `kind` and `need`
+ * match (a missing item, or one flagged `kindReview`, scores 0). The field
+ * score is the fraction of expected items right.
+ */
+function scoreDocumentKinds(expected: { items: ExpectedItemKind[] }, actual: Partial<ExtractedVisa>): FieldResult {
+  const names = Array.isArray(actual.requiredDocuments) ? actual.requiredDocuments : [];
+  const meta = Array.isArray(actual.requiredDocumentMeta) ? actual.requiredDocumentMeta : [];
+  const wrong: string[] = [];
+  const got: string[] = [];
+  for (const e of expected.items) {
+    const i = names.findIndex((n) => e.match.some((kw) => containsKeyword(n, kw)));
+    const m = i >= 0 ? meta[i] : undefined;
+    got.push(m ? `${e.match[0]}: ${m.kind}/${m.need}${m.kindReview ? " (review)" : ""}` : `${e.match[0]}: (not extracted)`);
+    if (!m || m.kindReview || m.kind !== e.kind || m.need !== e.need) wrong.push(`${e.match[0]} (expected ${e.kind}/${e.need})`);
+  }
+  const n = expected.items.length;
+  return result(
+    "documentKinds",
+    n ? (n - wrong.length) / n : 1,
+    expected.items.map((e) => `${e.match[0]}: ${e.kind}/${e.need}`),
+    got,
+    wrong.length ? `wrong or missing: ${wrong.join("; ")}` : undefined
+  );
+}
+
 // ----- Fees (set-based, hard gate) -----
 
 /** Comparable key of a component: kind|amount|currency|per|years. Label ignored. */
@@ -444,7 +487,9 @@ export function scoreRoute(
 
   // ---- Failed extraction: route scores 0, fee is a mismatch ----
   if (!actual || error) {
-    const fields = SCORED_FIELDS.map((f) => result(f, 0, null, null, `extraction failed: ${error ?? "no output"}`));
+    const fields = SCORED_FIELDS.filter((f) => f !== "documentKinds" || expected.documentKinds).map((f) =>
+      result(f, 0, null, null, `extraction failed: ${error ?? "no output"}`)
+    );
     const weightTotal = fields.reduce((s, f) => s + f.weight, 0);
     return {
       route: expected.route,
@@ -471,6 +516,8 @@ export function scoreRoute(
     scoreEligibility(expected.eligibility, actual.eligibilityCriteria),
     scoreHost(expected.applicationUrlHost, actual.applicationUrl),
     fee.field,
+    // Issue #187: only routes with expected item kinds are scored for them.
+    ...(expected.documentKinds ? [scoreDocumentKinds(expected.documentKinds, actual)] : []),
   ];
   const weightedSum = fields.reduce((s, f) => s + f.weight * f.score, 0);
   const weightTotal = fields.reduce((s, f) => s + f.weight, 0);

@@ -65,6 +65,10 @@ export type { ManualCostInput } from "./visa-catalog/visa-manual-cost";
 /** Firestore doc-id check shared with the visa change routes. */
 export { isValidDocId } from "./visa-catalog/changes/visa-catalog-changes.service";
 
+// ---- Source registry API (issue #215) ----
+/** Confirmed official websites + route registration (admin only). */
+export { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./shared/registry/registry.routes";
+
 // ---- Caseworker-guidance registry (issue #39) ----
 /** Admin list of guidance sources (GET /admin/guidance-sources). */
 export { adminGuidanceSourceRoutes } from "./guidance/guidance-source.routes";
@@ -78,6 +82,9 @@ export { seedGuidanceSources } from "./guidance/data/seed-guidance-sources";
 // ---- Visa rubrics (issue #40) ----
 /** Rubric extraction from guidance snapshots (always writes `pending_review`). */
 export { rubricExtractionService } from "./rubric/rubric-extraction.service";
+/** (#216) The resumable background job that drafts a rulebook in saved steps (worker, sweep, start, cancel, status). */
+export { rubricExtractionJobService } from "./rubric/rubric-extraction-job";
+export type { JobView, StartJobInput, StartJobResult } from "./rubric/rubric-extraction-job";
 /**
  * Rubric store. Consumers use `getApprovedRubric` ONLY (an unapproved version
  * is never returned by it); the `...ForReview` reads are for the admin review
@@ -142,6 +149,10 @@ export { outcomeRunWorker } from "./outcome-statistics/outcome-run-worker";
 export { adminOutcomeStatisticsRoutes } from "./outcome-statistics/outcome-statistics.routes";
 /** Destinations with an outcome data source adapter. */
 export { registeredDestinations } from "./outcome-statistics/registry";
+// ---- Required-document item kind + need rules (issue #187) ----
+/** Pure rules shared with the checklist, the derived requirements and the backfill script. */
+export { classifyNeed, findMetaForItem, itemKey, metaFromQuoteOnly, normaliseStoredMeta } from "./visa-catalog/required-document-meta";
+export type { DocumentKind, DocumentNeed, RequiredDocumentMeta } from "./visa-catalog/required-document-meta";
 
 // Outbound-fetch building blocks reused outside the scrapers (issue #178: the
 // exchange-rate providers read a public rates endpoint with the SAME guarded

@@ -280,6 +280,15 @@ service cloud.firestore {
         allow write: if false;
       }
 
+      // Answers subcollection (issue #187): the applicant's typed answers to
+      // "information" checklist items. Personal data, so NO client access at
+      // all: read and written only through GET / PUT
+      // /applications/:id/answers[/:itemId], which run the application
+      // access check. Admin SDK bypasses these rules.
+      match /answers/{itemId} {
+        allow read, write: if false;
+      }
+
       // Notes subcollection
       match /notes/{noteId} {
         // Application access holders can read notes
@@ -634,6 +643,12 @@ service cloud.firestore {
     //    rulebook publish run (gates, leave-outs, outcome) and the audit trail
     //    of changes to the publish settings (issue #201). Backend only: an
     //    applicant must never see internal notes. Do NOT add a match.
+    //  - rubricExtractionJobs/{jobId} and its steps/{stepId} and
+    //    stepParts/{stepId}__{n} subcollections: the resumable background job
+    //    that drafts one route's rulebook (issue #216): its status, lease,
+    //    cancel flag, model usage, and the validated result of each step
+    //    (rule text quoted from the sources). Written and read only by the
+    //    backend worker and the admin job endpoints. Do NOT add a match.
 
     //  - ruleChangeEvents/{eventId} and ruleChangeNotices/{eventId}__{appId}:
     //    one event per ADMIN-APPROVED rule or visa-record change, and one

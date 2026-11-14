@@ -42,6 +42,8 @@ scrapers/
     scripts/               one-off data fixes, e.g. remediate-failing-sources (#107, dry run by default)
     cost/                  LLM price table, monthly cost rollup, /admin/scrape-costs (#82), scrape-costs.md
     alerts/                post-run + hourly alert rules, emails, /admin/scrape-alerts (#83), scrape-alerts.md
+    registry/              source registry API (#215): confirmed official hosts, address check, route
+                           registration, audit trail; README.md in that folder
     settings/              appConfig/scraperSettings (kill switch, limits, hard stop), /admin/scraper-settings,
                            per-source controls, Run now requests + worker (#96), scraper-settings.md
   visa-catalog/
@@ -81,10 +83,13 @@ scrapers/
     README.md                          runbook: adding a source, seeding, crawling, recovering
   rubric/                              visa rubrics (#40): guidance snapshots -> cited, versioned,
                                        machine-checkable criteria, staged `pending_review`.
-                                       Types live in src/types/rubric.ts. Not scheduled, no routes.
+                                       Types live in src/types/rubric.ts. Extraction is not scheduled; the drafting job (#216) has a trigger and a sweep.
     rubric-extraction.service.ts       orchestrator: settings (fail closed) -> hash gate -> chunk ->
                                        one model call per chunk -> validate in code -> merge ->
                                        version N+1 (pending) + run record
+    rubric-extraction-job.ts           (#216) the same drafting as a resumable BACKGROUND JOB: start,
+                                       worker (`advance`), sweep, cancel, status
+    rubric-extraction-job.store.ts     (#216) job + step documents (backend-only), large results split
     rubric-quote.ts                    verbatim quote lookup in a snapshot (per page for PDFs);
                                        numbers / dates / units must be in the quote
     rubric-chunk.ts                    bounded, deterministic chunks (whole pages / paragraphs)
@@ -167,6 +172,61 @@ Two defects found by the first real run (a "protected" bar rejected by the indep
 - **Serving.** Code still decides only the coded members (`mandatoryBarHits`). A bar with uncoded members is also put to the assessment model in full (quote, list lines, group) through `judgementCriteriaOf`; the model can only raise a concern on it. It is never read as "applies to nobody" or "applies to everybody". How an applicant with such a status is asked and matched is a product question (not built).
 - Prompt versions: extraction `2026-11-rubric-v7`, check `2026-11-checker-v3`. Both fields are optional: earlier stored versions load unchanged.
 - Re-check two saved rules without a re-extraction: `scripts/recheck-list-and-group.ts` (offline by default; `--live` runs the two-model check on only those rules).
+
+## Drafting a rulebook as a resumable background job (`rubric-extraction-job.ts`; issue #216, part P2 of #211)
+
+`extractRoute` drafts a whole rulebook in one call chain (a real route took
+30-40 minutes; a server function is cut off at 540 s). The job drafts the SAME
+rulebook in small saved steps that a worker can drop and another can pick up.
+`extractRoute` and the CLI are unchanged; both paths call the same step
+functions (`runCriteriaStep`, `runIntakeStep`) and the same `assembleDraft`
+(merge, draft, structural validation, flags), which is why the job's version
+equals the one-shot version (tested against one scripted provider).
+
+- **A step** is one model call and the validation of its answer in code:
+  `c{position}__criteria` (the rules of a chunk) and `c{position}__intake` (its
+  questions and document items, told the rules code accepted and the questions
+  already asked for earlier chunks; a chunk with no accepted rule has none).
+  Steps are ORDER-DEPENDENT, so they run strictly in document order.
+- **Where results are stored**: `rubricExtractionJobs/{jobId}/steps/{stepId}`,
+  the validated `ChunkAssessment` as a JSON string plus its cost; a result over
+  150,000 characters is split over `stepParts` in the same transaction (never
+  truncated). Firestore, not Cloud Storage, because the result must commit in
+  the same transaction as the job's counters. The source text is not stored:
+  the job pins each source by content hash and rebuilds chunks from it.
+- **The job** `rubricExtractionJobs/{jobId}` (id = route key + a digest of the
+  source-set hash, prompt version, model, chunk size, newest version number and
+  `force`: a duplicate start is a no-op returning the existing job). Statuses:
+  `queued | running | succeeded | failed | cancelled | skipped`, with a
+  `reasonCode` (the existing run stop codes, plus `cancelled`, `sources_changed`,
+  `plan_changed`, `job_timed_out`) and a plain-words `message`.
+- **Worker** `processRubricExtractionJob` (Firestore `onWrite`, fires on a new
+  job or a changed `kick`, binds the AI key, 540 s): takes a lease, runs as many
+  steps as fit in `invocationBudgetMs` (a new step starts only when a whole
+  request timeout still fits), then bumps `kick` to hand over. **Sweep**
+  `sweepRubricExtractionJobs` (every 5 minutes, no secret): kicks an active job
+  with no live lease and no recent progress. A dead worker leaves `inFlight`
+  set; the next worker counts it as one failed attempt of that step (and against
+  the cap); `stepAttemptsMax` failures of one step fail the job.
+- **Exactly one version**: the version, the head, the job's completion and the
+  final run record are written in one transaction whose guard checks the job is
+  still `running`, owned, not cancelled and has no version.
+- **Pinned inputs**: if a pinned source's newest snapshot moves mid-job the job
+  stops `skipped / sources_changed` before its next call and writes nothing; the
+  change starts a new job (`onGuidanceChanged` now starts a job instead of
+  running inline).
+- **Caps** (`maxRequestsPerRun`, `maxInputCharsPerRun`) hold across the whole
+  job: the counters live on the job and are checked before every call; a job
+  that would pass the cap stops `skipped / run_cap_exceeded` and keeps its
+  finished steps. The daily cap counts a job once (its `started` run record is
+  written with the job).
+- **Admin endpoints** (`/admin/rubric-extraction-jobs`, same gate as
+  `/admin/rubrics`): `POST /` `{countryCode, visaTypeId, sourceIds?, dryRun?, force?}`,
+  `GET /:id`, `POST /:id/cancel`. Cancel stops the job before its next step; a
+  cancelled job writes no version.
+- **Settings** (`appConfig/rubricExtractionSettings`): `stepAttemptsMax` (3),
+  `invocationBudgetMs` (450000), `leaseMs` (600000), `jobMaxAgeMs` (6 h),
+  `jobIdleMs` (120000).
 
 ## Automatic rulebook publishing (`rubric-gates.ts`, `rubric-publish-settings.ts`; issue #201, umbrella #200)
 

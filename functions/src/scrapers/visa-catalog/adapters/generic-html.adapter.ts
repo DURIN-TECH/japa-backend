@@ -1,6 +1,6 @@
 import type { VisaSourcePage } from "../types";
 import type { VisaCatalogFetchService } from "../../shared/fetch/visa-catalog-fetch.service";
-import type { SourceAdapter, SourceDocument } from "./types";
+import type { SourceAdapter, SourceDocument, SourceFetchOptions } from "./types";
 
 // ============================================
 // SOURCE ADAPTER — generic-html (default)
@@ -45,11 +45,16 @@ export class GenericHtmlAdapter implements SourceAdapter {
   }
 
   /** Fetch + clean the page; one section holding the whole cleaned text. */
-  async fetch(page: VisaSourcePage): Promise<SourceDocument> {
+  async fetch(page: VisaSourcePage, opts?: SourceFetchOptions): Promise<SourceDocument> {
     // Throws on robots block / non-2xx / too little content — unchanged.
     // `acceptPdf: false`: a PDF response is refused, not extracted (see the
     // header comment).
-    const fetched = await this.fetchService.fetchAndClean(page.url, { checkRobots: true, acceptPdf: false });
+    const fetched = await this.fetchService.fetchAndClean(page.url, {
+      checkRobots: true,
+      acceptPdf: false,
+      // Issue #215: host policy for portal-added pages (undefined = unchanged).
+      ...(opts?.allowedHost ? { allowedHost: opts.allowedHost } : {}),
+    });
     return {
       url: page.url,
       canonicalUrl: fetched.finalUrl,

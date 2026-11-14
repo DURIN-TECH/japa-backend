@@ -2,6 +2,7 @@
 import type { LlmUsage } from "../shared/cost/types";
 import { Timestamp } from "firebase-admin/firestore";
 import type { VisaCategory, VisaType } from "../../types/index";
+import type { RequiredDocumentMeta } from "./required-document-meta";
 
 // ============================================
 // VISA CATALOG SCRAPING TYPES
@@ -91,6 +92,20 @@ export interface VisaSourcePage {
   // next run within budget still sees the change). Cleared on extraction.
   extractionDeferredAt?: Timestamp;
   lastError?: string;
+  // ---- Portal provenance (issue #215; absent on every seeded page) ----
+  // `addedVia: "portal"` marks a page an admin registered through the API.
+  // Such a page (a) is carried over by a re-seed even when its country is in
+  // the markdown, (b) has its final host checked against the confirmed-hosts
+  // allow-list on every crawl, and (c) can be paused when its host is revoked.
+  addedVia?: "portal";
+  addedBy?: string; // uid of the admin
+  addedAt?: Timestamp;
+  // Language the admin declared for the page (from the supported list).
+  language?: string;
+  // True while the page must not be crawled (its host was revoked). The crawl
+  // skips it and leaves everything else about it as it is.
+  paused?: boolean;
+  pausedReason?: string;
 }
 
 // ----- Linked surcharges (issue #69) -----
@@ -178,6 +193,12 @@ export interface VisaSource {
   // Registry-owned: set from VISA_SOURCE_OFFICIAL_HOSTS on every re-seed.
   // Gates the extractor's `applicationUrl`; absent → code fallback / none.
   officialHosts?: string[];
+  // Issue #215: set when the source doc was first CREATED from the portal (a
+  // country that was not in the seed). A seeded source never has it. Carried
+  // over by a re-seed so the provenance is not lost.
+  addedVia?: "portal";
+  addedBy?: string;
+  addedAt?: Timestamp;
 
   // Scheduling. A source WITH a `crawlWindow` is crawled once a week inside
   // that local night window (issue #63) and `nextCrawlAt` is set to the
@@ -275,6 +296,12 @@ export interface VisaScrapeMeta {
   // page and were therefore DROPPED (ExtractedVisa.requiredDocumentsDropped).
   // Audit trail so a reviewer sees what the model claimed. Absent when none.
   requiredDocumentsDropped?: string[];
+  // Issue #187: kind (document | information) and need (required | conditional
+  // | optional) of each item of the visa's `requiredDocuments`, INDEX-ALIGNED
+  // with it (copied from ExtractedVisa.requiredDocumentMeta). Travels with the
+  // scrape provenance, so it is replaced wholesale on approve like `citations`.
+  // Absent on visas crawled before #187 (read as document + kindReview).
+  requiredDocumentMeta?: RequiredDocumentMeta[];
   // Supplementary registry pages whose text was appended to this route's
   // page before extraction (issue #86, e.g. the Korea Visa Portal fee table
   // for the HiKorea C-3 route). Absent when the route uses none.
@@ -529,6 +556,12 @@ export type VisaFieldDiff =
   // documents disappear from the live doc on approve, as the proposed array
   // replaces the live one wholesale (an empty proposed list deletes the field).
   | { field: "requiredDocuments"; kind: "changed"; added: string[]; removed: string[] }
+  // Issue #187: the kind (document / information) and need (required /
+  // conditional / optional) of items that stay on the list, when a new
+  // extraction classifies them differently. NOT a visa field: approving it
+  // writes only the new `scrapeMeta` (which carries `requiredDocumentMeta`).
+  // Shown to the admin as item, old kind/need -> new kind/need.
+  | { field: "requiredDocumentMeta"; kind: "changed"; changes: RequiredDocumentMetaChange[] }
   // The fee. Applying it writes `baseCostUsd` (+ `scrapeMeta.fee` via the
   // wholesale scrapeMeta replace) in the same transaction.
   | {
@@ -538,6 +571,21 @@ export type VisaFieldDiff =
       baseCostUsdBefore?: number;
       baseCostUsdAfter?: number;
     };
+
+/** The classification fields a reviewer compares for one item (issue #187). */
+export interface RequiredDocumentMetaView {
+  kind: "document" | "information";
+  need: "required" | "conditional" | "optional";
+  appliesWhen?: string;
+  kindReview?: true;
+}
+
+/** One item whose classification changes: `before` is the live reading. */
+export interface RequiredDocumentMetaChange {
+  item: string;
+  before: RequiredDocumentMetaView;
+  after: RequiredDocumentMetaView;
+}
 
 /** A staged, field-level edit to a live (approved, scraped) visa. */
 export interface PendingVisaChange {
@@ -639,6 +687,11 @@ export interface ExtractedVisa {
   // Issue #129: model-returned documents dropped for lacking a verbatim quote
   // on the page. Only present when something was dropped.
   requiredDocumentsDropped?: string[];
+  // Issue #187: classification of each kept item, index-aligned with
+  // `requiredDocuments` (same length). Validated in code: a kind without a
+  // verbatim quote on the page is replaced by document + kindReview, and
+  // `need` is decided by code from the quote (required-document-meta.ts).
+  requiredDocumentMeta?: RequiredDocumentMeta[];
   applicationUrl?: string;
   applicationInstructions?: string;
   // Set by the validator (issue #87) when processingDaysMin/Max is more than

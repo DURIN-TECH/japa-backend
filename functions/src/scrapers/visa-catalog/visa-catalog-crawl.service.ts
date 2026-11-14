@@ -6,6 +6,8 @@ import { visaCatalogService } from "./visa-catalog.service";
 import type { FxFetcher } from "./visa-catalog-fx";
 // Fetching goes through the source adapter picked from `source.adapter`
 // (govuk-content-api for GB, generic-html — today's fetch service — otherwise).
+import { HostNotAllowedError } from "../shared/fetch/visa-catalog-fetch.service";
+import { officialDomainsService } from "../shared/registry/official-domains.service";
 import { pickSourceAdapter, sourceMetaFromDocument, type SourceAdapterSet } from "./adapters";
 // Pure weekly-night-window helpers (issue #63): which due sources may run on
 // this tick, and when each runs next.
@@ -223,6 +225,10 @@ class VisaCatalogCrawlService {
     // Issue #96 review: the lease service (tests inject one; defaults to the
     // Firestore-backed singleton).
     leases?: SourceLeaseService;
+    // Issue #215: where the confirmed-hosts allow-list comes from (tests inject
+    // one; defaults to the `officialDomains` collection). Read at most once
+    // per source, and only when the source has a portal-added page.
+    confirmedHosts?: () => Promise<Set<string>>;
   }): Promise<CrawlSummary> {
     const trigger: ScrapeRunTrigger = opts?.trigger ?? "scheduled";
 
@@ -518,7 +524,7 @@ class VisaCatalogCrawlService {
       summary: CrawlSummary;
       recorder: ScrapeRunRecorder;
       maxExtractions: number;
-      opts?: { fetchFxRates?: FxFetcher; adapters?: SourceAdapterSet };
+      opts?: { fetchFxRates?: FxFetcher; adapters?: SourceAdapterSet; confirmedHosts?: () => Promise<Set<string>> };
       // Issue #96: the budget hard stop (null = not enforced) and `force`
       // (ignore the content-hash gate).
       budgetGate: BudgetGate | null;
@@ -616,6 +622,8 @@ class VisaCatalogCrawlService {
         return pickSourceAdapter(source.adapter, suppPage.url, opts?.adapters).fetch(suppPage);
       });
 
+      // Issue #215: the confirmed-hosts allow-list, loaded lazily for this source.
+      let confirmedHostSet: Set<string> | undefined;
       for (let i = 0; i < pages.length; i++) {
         // Respect the per-run extraction cap. The source is still rescheduled
         // below, so its remaining pages are picked up at its NEXT window
@@ -628,6 +636,11 @@ class VisaCatalogCrawlService {
         // It is fetched (once per run) only for the routes that list it in
         // `supplementaryPages`, below. Its own crawl fields are updated there.
         if (page.supplementOnly) continue;
+
+        // ---- Paused page (issue #215)? Not crawled, nothing changed ----
+        // A portal-added page is paused when its host's confirmation is
+        // revoked. It keeps its crawl state; only an admin un-pauses it.
+        if (page.paused) continue;
 
         // ---- Host backed off? Skip WITHOUT any request (issue #64) ----
         // Blocked if the host answered 429/503 earlier in this run (for the
@@ -664,7 +677,25 @@ class VisaCatalogCrawlService {
           // Throws on robots block / HTTP error / bad payload / nothing
           // selected → recorded as a page error below, no extraction.
           const adapter = pickSourceAdapter(source.adapter, page.url, opts?.adapters);
-          const fetched = await adapter.fetch(page);
+          // ---- Portal-added page (issue #215): confirmed hosts only ----
+          // The requested host, every redirect hop and the final URL must be a
+          // CONFIRMED host (an unconfirmed redirect target is refused BEFORE it
+          // is requested). The allow-list is read fresh (once per source) and
+          // FAILS CLOSED: if it cannot be read the page is not fetched, the
+          // error is recorded as the page's error. Seeded pages are unaffected.
+          let allowedHost: ((h: string) => boolean) | undefined;
+          if (page.addedVia === "portal") {
+            confirmedHostSet ??= await (opts?.confirmedHosts ?? (() => officialDomainsService.confirmedHosts()))();
+            const hosts: Set<string> = confirmedHostSet;
+            allowedHost = (h: string) => hosts.has(h.toLowerCase());
+          }
+          const fetched = await adapter.fetch(page, allowedHost ? { allowedHost } : undefined);
+          if (allowedHost) {
+            // Belt and braces for adapters that ignore the policy: the
+            // document's own canonical address must be on a confirmed host.
+            const finalHost = hostOf(fetched.canonicalUrl ?? page.url);
+            if (!allowedHost(finalHost)) throw new HostNotAllowedError(finalHost, "redirect");
+          }
           fetchedOk++;
           summary.pagesFetched++;
 
@@ -737,17 +768,20 @@ class VisaCatalogCrawlService {
           };
           // ---- Hash gate (+ prompt-version re-extract, issue #71) ----
           // Same text as last crawl → normally skip the LLM. Exception: the
-          // doc at `visaId` is a PENDING scraped visa extracted by an older
+          // doc at `visaId` is a scraped visa extracted by an older
           // EXTRACTOR_PROMPT_VERSION — re-extract it so a prompt change
-          // reaches it without a manual --force. Approved / seeded / agent
-          // docs never qualify (approved ones only get a #61 proposal on a
-          // real content change). This goes through the same
+          // reaches it without a manual --force. A PENDING doc is refreshed in
+          // place; an APPROVED one that lists documents (issue #187) only ever
+          // gets a proposal, and is skipped once a proposal row of any status
+          // exists for this text from this prompt version (no repeat LLM call,
+          // no re-proposing what an admin rejected). Seeded / agent docs never
+          // qualify. This goes through the same
           // maxExtractions accounting below, so a version bump drains over
           // several runs instead of re-extracting everything at once.
           if (!changed) {
             const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId, {
               doc: restored.doc, // same doc, already read by markRestored (no second read)
-            });
+            }, gateHash);
             if (!promptStale) {
               notePage(page, "unchanged", { visaId });
               continue; // nothing new, skip the LLM
