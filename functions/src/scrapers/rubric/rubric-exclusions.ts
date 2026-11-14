@@ -1,4 +1,6 @@
-import type { AssessmentCriterion, EvidenceItem, IntakeQuestion, VisaRubric } from "../../types/rubric";
+import type { AssessmentCriterion, CompetenceBlock, EvidenceItem, IntakeQuestion, VisaRubric } from "../../types/rubric";
+// (#235) The one code check of a competence block (also used by drafting and the validator).
+import { servableCompetence } from "./rubric-competence";
 import { applyPlanShape } from "./rubric-question-plan";
 import { applyRuleRepairs } from "./rubric-repair";
 
@@ -190,6 +192,29 @@ function analyseDrops(rubric: Filterable, excluded: ReadonlySet<string>): DropAn
  * describe a decision about content that is no longer there.
  */
 export function applyExclusions<T extends Filterable>(input: T): T {
+  // (#235) Last of all, the competence block: served only while every step
+  // still passes the code check against what is now SERVED (its rule kept and
+  // unchanged, its question still asked). Otherwise the whole block is left
+  // out and the applicant simply picks (rubric-competence.ts).
+  return withServableCompetence(applyExclusionsBase(input));
+}
+
+/**
+ * (#235) The served view with its competence block only when servable. Identity
+ * when there is no block, or when the block passes (so a rubric without one
+ * reads exactly as before).
+ */
+function withServableCompetence<T extends Filterable>(served: T): T {
+  const block = (served as { competence?: CompetenceBlock }).competence;
+  if (block === undefined) return served;
+  if (servableCompetence(served as unknown as Pick<VisaRubric, "competence" | "criteria" | "intakeQuestions">) !== undefined) return served;
+  const { competence: _dropped, ...rest } = served as T & { competence?: CompetenceBlock };
+  void _dropped;
+  return rest as T;
+}
+
+/** The read-side filter before the competence check (see `applyExclusions`). */
+function applyExclusionsBase<T extends Filterable>(input: T): T {
   // (#223) FIRST swap in the recorded replacements of repaired protected rules
   // (same id, same position), so every step below, and every consumer, only
   // ever sees the rule the independent check actually verified. The original

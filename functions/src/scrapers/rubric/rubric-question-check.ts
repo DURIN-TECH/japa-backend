@@ -123,6 +123,9 @@ export interface CheckItem {
   payload: Omit<PayloadItem, "id">;
 }
 
+/** (#235) The data line that stands for "one option per member country of the route, listed when asked". */
+export const DESTINATION_OPTIONS_LINE = "one option for each member country of the route, listed from membership data on the day the question is asked";
+
 /**
  * The items to check, in rubric order: every question with the quotes of its
  * linked rules (at most 3, in rubric order), every document item with its own
@@ -144,7 +147,14 @@ export function buildCheckItems(view: { criteria: AssessmentCriterion[]; intakeQ
         question: clip(q.label),
         ...(q.helpText ? { help: clip(q.helpText) } : {}),
         answer_type: q.answerType,
-        ...(q.options && q.options.length > 0 ? { options: q.options.map((o) => clip(o.label)) } : {}),
+        // (#235) A destination question stores no country: the checker is told,
+        // in one fixed line of data, that one option per member country is listed
+        // when it is asked (so the answer type is judged on what the applicant
+        // will see). Only such questions carry the line; every other request
+        // is byte-for-byte as before.
+        ...(q.optionsFrom === "route_destinations"
+          ? { options: [DESTINATION_OPTIONS_LINE, ...(q.options ?? []).map((o) => clip(o.label))] }
+          : q.options && q.options.length > 0 ? { options: q.options.map((o) => clip(o.label)) } : {}),
         ...(q.party ? { about_party: q.party } : {}),
         quotes: linked.slice(0, MAX_QUOTES_PER_QUESTION).map((c) => clip(c.source?.quote ?? "")),
       },

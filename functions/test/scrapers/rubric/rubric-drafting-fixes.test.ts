@@ -96,7 +96,8 @@ describe("the criteria prompt holds the new instructions (#243)", () => {
 describe("versions moved, and the kind wording is shared (#243)", () => {
   test("versions", () => {
     // (#234) moved on again: v11 (groups decided from what the applicant holds) and repair v5.
-    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v11");
+    // (#235) v12: the intake call drafts competence steps; the re-draft is unchanged (v5).
+    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v12");
     assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v5");
   });
 

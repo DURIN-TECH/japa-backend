@@ -125,7 +125,9 @@ export type { RulebookTarget, RulebookTargetInput } from "./rubric/rubric-key";
  * (shared bloc / treaty layer first, the country's own layer last), merged into
  * one served view. A single-layer route reads exactly its own rulebook.
  */
-export { loadRulebookStack, mergeRulebookStack, stackFromReads, layerVersionsOf, sameStackVersions, scopedId, STACK_ID_SEPARATOR } from "./rubric/rubric-stack";
+export { loadRulebookStack, mergeRulebookStack, stackFromReads, layerVersionsOf, sameStackVersions, scopedId, sharedLayerView, STACK_ID_SEPARATOR } from "./rubric/rubric-stack";
+// (#235) The code check of a competence block (which member country examines an application).
+export { competenceProblems, servableCompetence, isDestinationQuestion, quoteContains } from "./rubric/rubric-competence";
 export type { RulebookStack, StackLayerRead, StackLayerReader, StackUnusableReason } from "./rubric/rubric-stack";
 // (#233 P4b) The layer check: an own layer's rules against its shared layer(s) (restates links, conflicts).
 export { RubricLayerChecker, runLayerCheck, decideLayerLinks, linkRefusal, notCheckedRecord, LAYER_CHECK_PROMPT_VERSION, DEFAULT_LAYER_CHECK_LIMITS } from "./rubric/rubric-layer-check";
