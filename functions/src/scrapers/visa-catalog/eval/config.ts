@@ -63,6 +63,9 @@ export const FIELD_WEIGHTS = {
   // conditional / optional) of the items the page lists. Scored ONLY on routes
   // whose expected.json has `documentKinds` (the others are not scored for it).
   documentKinds: 2,
+  // Issue #187 regroom: the answer type of each information item. Scored ONLY
+  // on routes whose `documentKinds.items` carry an `answerType`.
+  answerTypes: 2,
 } as const;
 
 /** One scored field name (the keys of FIELD_WEIGHTS). */

@@ -116,6 +116,20 @@ the TB certificate are documents. UK Family uses the issue's two named examples 
 document, criminal convictions = information) plus passport, TB results and
 certified translation.
 
+### Answer types (`answerTypes`, issue #187 regroom)
+
+An item in `documentKinds.items` may also carry `answerType` (`date`,
+`date_range`, `money`, `address`, `list` or `text`): the shape of the answer its
+own words give. The `answerTypes` field (weight 2) is scored only on routes where
+at least one item sets it, and an item scores when the extractor's stored
+`answerType` equals the expected one (an untyped or missing item scores 0).
+Standard Visitor scores its 12 information items (travel dates `date_range`,
+trip cost and earnings `money`, where you'll be staying / home / employer's
+address `address`, the "details of ..." and people items `list`, the partner's
+mixed item `text`); UK Family, Skilled Worker and Graduate score the typed-in
+items they list (dates of birth `date`, names and details `list`, references
+and mixed items `text`).
+
 ### Known gaps
 
 `expected.json` may list `knownGaps` (e.g. `feeComponents`, a tracker ref,
