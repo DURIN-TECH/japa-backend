@@ -59,7 +59,27 @@ export type PendingWriteResult =
   | { written: true; version: number }
   // The head already records a version for this exact set of snapshots
   // (another run got there first): nothing was written.
-  | { written: false; version: number };
+  | { written: false; version: number }
+  // (#216) The caller's `guard.read` refused inside the transaction (the
+  // background job had already finished, was cancelled, or lost its lease):
+  // nothing was written. `version` is the head's newest version.
+  | { written: false; version: number; guarded: true };
+
+/**
+ * (#216) A caller's own writes joined to the version write, in the SAME
+ * transaction. The background job uses it to make "write the version" and
+ * "mark the job done" ONE atomic step: a re-delivered trigger or a resumed job
+ * finds the job already done and writes nothing, so a version can never be
+ * written twice for one job (a forced draft would otherwise take the next
+ * version number every time).
+ */
+export interface PendingWriteGuard {
+  // Runs after the head is read and before anything is written (a Firestore
+  // transaction reads first). Return false to abort the write.
+  read: (tx: Transaction) => Promise<boolean>;
+  // Runs once the version is certain to be written; add the caller's writes.
+  commit: (tx: Transaction, version: number) => void;
+}
 
 /** A rubric as built by extraction: everything but the version number. */
 export type RubricDraft = Omit<VisaRubric, "version">;
@@ -135,7 +155,7 @@ export class RubricStore {
    * @throws RubricStoreError("not_pending") when the draft is not a pristine
    *   `pending_review` rubric. Extraction can never write an approved one.
    */
-  async writePendingVersion(draft: RubricDraft, sourceIds: string[], opts: { force?: boolean; now?: Timestamp } = {}): Promise<PendingWriteResult> {
+  async writePendingVersion(draft: RubricDraft, sourceIds: string[], opts: { force?: boolean; now?: Timestamp; guard?: PendingWriteGuard } = {}): Promise<PendingWriteResult> {
     // Governance guard. Checked on the draft itself, so no caller can slip
     // a decided rubric through this path.
     if (
@@ -161,6 +181,8 @@ export class RubricStore {
     return this.runTransaction(async (tx) => {
       const headSnap = await tx.get(headRef);
       const head = headSnap.exists ? (headSnap.data() as RubricHead) : null;
+      // (#216) The caller's own read comes first: it may veto the whole write.
+      if (opts.guard && !(await opts.guard.read(tx))) return { written: false as const, version: head?.latestVersion ?? 0, guarded: true as const };
       if (head && !opts.force && head.latestSourceSetHash === draft.sourceSetHash) {
         return { written: false as const, version: head.latestVersion };
       }
@@ -172,6 +194,7 @@ export class RubricStore {
 
       const rubric: VisaRubric = { ...draft, version };
       tx.set(versionRef, rubric as unknown as Record<string, unknown>);
+      opts.guard?.commit(tx, version);
       if (head) {
         // Only the "newest" pointers move. approvedVersion is not in this
         // update at all, so it cannot change here.

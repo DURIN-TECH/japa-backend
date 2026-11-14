@@ -61,6 +61,7 @@ import { spansSiblingMarkers } from "./rubric-marker-chain";
 import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSettings } from "./rubric-settings";
 import { rubricRouteKey, rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
 import type { RubricHead } from "../../types/rubric";
+import type { StartJobInput, StartJobResult } from "./rubric-extraction-job";
 import { validateCriterionShape, validateVisaRubric } from "./rubric-validate";
 
 // ============================================
@@ -175,6 +176,8 @@ export interface RubricExtractionDeps {
   // The route's display name (default: the visa type document's `name`).
   visaTypeName?: (countryCode: string, visaTypeId: string) => Promise<string>;
   now?: () => Timestamp;
+  // (#216) Starts a route's drafting job (default: the job service, resolved at call time).
+  startJob?: (input: StartJobInput) => Promise<StartJobResult>;
 }
 
 /**
@@ -219,8 +222,8 @@ export function criterionIdOf(sourceId: string, quote: string, kind: string, che
   return `crit_${sha256([sourceId, normalizeForQuoteMatch(quote), kind, checkField ?? ""].join("\n")).slice(0, 16)}`;
 }
 
-/** Attempts per model call (first try plus one retry). */
-const MAX_CALL_ATTEMPTS = 2;
+/** Attempts per model call (first try plus one retry). (#216: the job bounds a step's attempts with it too.) */
+export const MAX_CALL_ATTEMPTS = 2;
 /** Pause before a retry, multiplied by the attempt number. */
 const RETRY_BACKOFF_MS = 3000;
 
@@ -1412,6 +1415,10 @@ export class RubricExtractionService {
   private get store(): RubricStore {
     return this.deps.store ?? rubricStore;
   }
+  /** The model the drafting calls use (named on every run record and version). */
+  modelName(): string {
+    return this.provider.modelFor("judgement");
+  }
   private now(): Timestamp {
     return this.deps.now ? this.deps.now() : Timestamp.now();
   }
@@ -1877,13 +1884,18 @@ export class RubricExtractionService {
   }
 
   /**
-   * Listener for the guidance crawl's `onChanged` hook: re-extract every
-   * route that uses the changed source. It does not throw (extractRoute
-   * reports problems in its result). Should it fail anyway, the crawl does
-   * not retry a listener, and `runPending` picks the route up later.
+   * Listener for the guidance crawl's `onChanged` hook: re-draft every route
+   * that uses the changed source. (#216) It no longer runs the extraction
+   * inline: it creates (or finds) the route's background DRAFTING JOB, which a
+   * worker advances in saved steps (a route can need 30-40 minutes, far over
+   * the function's 540 seconds). The checks are the same as before and happen
+   * in the job's start: a hash gate (unchanged sources start nothing), the
+   * kill switch, the caps. It does not throw (`startJob` reports problems in
+   * its result). Should it fail anyway, the crawl does not retry a listener,
+   * and `runPending` picks the route up later.
    */
-  async onGuidanceChanged(event: Pick<GuidanceChangeEvent, "sourceId">): Promise<ExtractRouteResult[]> {
-    const results: ExtractRouteResult[] = [];
+  async onGuidanceChanged(event: Pick<GuidanceChangeEvent, "sourceId">): Promise<StartJobResult[]> {
+    const results: StartJobResult[] = [];
     const heads = await this.store.listHeads();
     // (#169) Tell the two "nothing to do" cases apart in the log. With no head
     // at all, no route has ever been extracted: a route's FIRST extraction is
@@ -1897,9 +1909,20 @@ export class RubricExtractionService {
     }
     for (const head of heads) {
       if (!(head.sourceIds ?? []).includes(event.sourceId)) continue;
-      results.push(await this.extractRoute({ countryCode: head.countryCode, visaTypeId: head.visaTypeId, trigger: "guidance_changed" }));
+      results.push(await this.startJob({ countryCode: head.countryCode, visaTypeId: head.visaTypeId, trigger: "guidance_changed" }));
     }
     return results;
+  }
+
+  /**
+   * Start a drafting job (injectable for tests). The default resolves the job
+   * module at CALL time: it imports this one, so a top-level import would make
+   * a cycle (see the note in scrapers/index.ts).
+   */
+  private async startJob(input: StartJobInput): Promise<StartJobResult> {
+    if (this.deps.startJob) return this.deps.startJob(input);
+    const { rubricExtractionJobService } = await import("./rubric-extraction-job");
+    return rubricExtractionJobService.startJob(input);
   }
 }
 
