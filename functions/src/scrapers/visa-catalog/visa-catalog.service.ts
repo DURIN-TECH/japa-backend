@@ -112,9 +112,15 @@ class VisaCatalogService {
    * Used by both crawlers' hash gates (scheduled orchestrator + manual
    * script) right where they would otherwise skip the LLM. One doc read per
    * unchanged page; the rule itself is the pure isPendingPromptStale()
-   * (visa-catalog-diff.ts): approved / seeded / agent / rejected docs, and a
-   * missing doc, always return false.
+   * (visa-catalog-diff.ts): seeded / agent / rejected / withdrawn docs, and a
+   * missing doc, always return false. An APPROVED scraped visa that lists
+   * documents qualifies too (issue #187), unless a proposal row of any status
+   * (open, approved, rejected) already exists for this text from THIS prompt
+   * version: then it was already re-read, so no new LLM call and no repeat of a
+   * proposal an admin rejected. A newer prompt version re-extracts again.
    *
+   * @param contentHash the page text hash the crawl would ingest (defaults to
+   *   the live doc's hash, which is the same text for an unchanged page)
    * @returns true when the page must go to extraction despite the same hash
    */
   async needsPromptReextract(
@@ -122,7 +128,8 @@ class VisaCatalogService {
     visaId: string,
     // Issue #68: the doc the caller already read this page (markRestored's
     // `doc`; `doc: undefined` = no doc). When given, no second read is made.
-    known?: { doc: VisaType | undefined }
+    known?: { doc: VisaType | undefined },
+    contentHash?: string
   ): Promise<boolean> {
     let existing: VisaType | undefined;
     if (known) {
@@ -131,7 +138,15 @@ class VisaCatalogService {
       const snap = await subcollections.visaTypes(countryCode).doc(visaId).get();
       existing = snap.exists ? (snap.data() as VisaType) : undefined;
     }
-    return isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION);
+    if (!isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION)) return false;
+    // Approved visa: already turned into a proposal by this prompt version?
+    if (existing?.reviewStatus === "approved") {
+      const hash = contentHash ?? existing.scrapeMeta?.contentHash;
+      if (hash && (await visaChangeService.hasProposalForHash(countryCode, visaId, hash, EXTRACTOR_PROMPT_VERSION))) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**

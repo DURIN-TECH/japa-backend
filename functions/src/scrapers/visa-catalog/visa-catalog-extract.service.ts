@@ -263,33 +263,51 @@ function validateRequiredDocuments(
 export function resolveKindQuote(quote: string, page: string | undefined, itemText: string): string | null {
   if (quote.length === 0) return null;
   if (page === undefined) return quote;
+  const nq = normForQuote(quote);
   const at = quote.indexOf(": ");
-  const own0 = normForQuote(itemText);
-  if (page.includes(normForQuote(quote))) {
+  const own = normForQuote(itemText);
+  if (page.includes(nq)) {
     // A contiguous "lead-in: text" must be about THIS item: its tail has to
     // contain the item's own text (it may not be another item's line).
-    if (at < 0 || normForQuote(quote.slice(at + 2)).includes(own0)) return quote;
-    return null;
+    if (at >= 0) return normForQuote(quote.slice(at + 2)).includes(own) ? quote : null;
+    if (nq.includes(own)) return quote;
+    // A quote that is ONLY a lead-in line may back this item's kind only when
+    // the item is really listed under it (after it, before the next lead-in).
+    const lead = nq.replace(/\s*:$/, "");
+    if (isLeadInLine(page, lead)) return itemListedUnder(page, lead, own) ? quote : null;
+    return quote; // other page prose: verbatim, as before
   }
   if (at < 0) return null;
   const leadRaw = quote.slice(0, at).trim();
   const lead = normForQuote(leadRaw);
   const itemPart = normForQuote(quote.slice(at + 2));
-  const own = normForQuote(itemText);
   if (!lead || !itemPart || !own || !itemPart.includes(own)) return null;
-  // Try every place the lead-in occurs (the same words can open two lists).
+  return itemListedUnder(page, lead, itemPart) ? leadRaw : null;
+}
+
+/** True when `lead` occurs on the (normalised) page as a lead-in line: the page goes on with ":". */
+function isLeadInLine(page: string, lead: string): boolean {
+  if (!lead) return false;
+  for (let from = page.indexOf(lead); from >= 0; from = page.indexOf(lead, from + 1)) {
+    if (/^\s*:/.test(page.slice(from + lead.length))) return true;
+  }
+  return false;
+}
+
+/**
+ * Is `text` listed under the lead-in `lead` on the page? Tries every place the
+ * lead-in occurs (the same words can open two lists): the page must continue
+ * with its ":" and `text` must follow with NO other lead-in (a ":") between.
+ */
+function itemListedUnder(page: string, lead: string, text: string): boolean {
   for (let from = page.indexOf(lead); from >= 0; from = page.indexOf(lead, from + 1)) {
     const afterLead = page.slice(from + lead.length);
-    // A lead-in line: the page goes on with its colon.
     if (!/^\s*:/.test(afterLead)) continue;
     const body = afterLead.replace(/^\s*:/, "");
-    const itemAt = body.indexOf(itemPart);
-    if (itemAt < 0) continue;
-    // Another lead-in (a colon) before the item means it sits under that one.
-    if (body.slice(0, itemAt).includes(":")) continue;
-    return leadRaw;
+    const itemAt = body.indexOf(text);
+    if (itemAt >= 0 && !body.slice(0, itemAt).includes(":")) return true;
   }
-  return null;
+  return false;
 }
 
 /**

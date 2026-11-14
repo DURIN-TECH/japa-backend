@@ -449,17 +449,28 @@ class VisaChangeService {
    * text the admin just turned down. A row with this hash means "this text
    * was already turned into a proposal": nothing new to extract.
    *
-   * Equality-only query (countryCode, visaId, contentHash) + limit(1): served
-   * by Firestore's single-field indexes, no composite index needed (same as
-   * the open-row lookup in proposeChange).
+   * Issue #187: with `extractorPromptVersion` the row must ALSO have been made
+   * by that prompt version. The prompt-bump re-extract of an approved visa asks
+   * this, so an open, approved or rejected row for this text + this version
+   * means "already re-read": no new LLM call and, after a rejection, no new
+   * identical proposal. A newer prompt version has no such row and re-extracts.
+   *
+   * Equality-only query (countryCode, visaId, contentHash[, extractorPromptVersion])
+   * + limit(1): served by Firestore's single-field indexes, no composite index
+   * needed (same as the open-row lookup in proposeChange).
    */
-  async hasProposalForHash(countryCode: string, visaId: string, contentHash: string): Promise<boolean> {
-    const snap = await collections.pendingVisaChanges
+  async hasProposalForHash(
+    countryCode: string,
+    visaId: string,
+    contentHash: string,
+    extractorPromptVersion?: string
+  ): Promise<boolean> {
+    let query = collections.pendingVisaChanges
       .where("countryCode", "==", countryCode)
       .where("visaId", "==", visaId)
-      .where("contentHash", "==", contentHash)
-      .limit(1)
-      .get();
+      .where("contentHash", "==", contentHash);
+    if (extractorPromptVersion) query = query.where("extractorPromptVersion", "==", extractorPromptVersion);
+    const snap = await query.limit(1).get();
     return !snap.empty;
   }
 

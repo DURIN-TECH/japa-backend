@@ -192,7 +192,11 @@ export function classifyNeed(
   if (OPTIONAL_CUE.test(quote)) return { need: "optional" };
   const clause = extractConditionalClause(quote);
   if (clause) return { need: "conditional", appliesWhen: clause };
-  const lead = kindQuote ? extractLeadIn(kindQuote) : null;
+  // The lead-in: from the stored kind quote, else from the item's own FULL
+  // citation quote (it may carry "Depending on your circumstances ...:" in
+  // front of the item, e.g. every backfilled or kindReview item, which has no
+  // kind quote). ownText cut that part off for the inline-cue scan above.
+  const lead = (kindQuote ? extractLeadIn(kindQuote) : null) ?? extractLeadIn((itemQuote ?? "").trim());
   if (lead) return { need: "conditional", appliesWhen: lead };
   return { need: "required" };
 }

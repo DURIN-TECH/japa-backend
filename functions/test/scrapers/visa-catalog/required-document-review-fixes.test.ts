@@ -19,7 +19,8 @@ import {
   type ProposalInput,
 } from "../../../src/scrapers/visa-catalog/visa-catalog-diff";
 import { alignScrapeMetaToLive } from "../../../src/scrapers/visa-catalog/required-document-align";
-import { classifyNeed, extractConditionalClause } from "../../../src/scrapers/visa-catalog/required-document-meta";
+import { classifyNeed, extractConditionalClause, metaFromQuoteOnly } from "../../../src/scrapers/visa-catalog/required-document-meta";
+import { validateExtractedVisa } from "../../../src/scrapers/visa-catalog/visa-catalog-extract.service";
 import { deriveRequirementsFromScrape } from "../../../src/services/visa-requirements-derive";
 
 const NOW = Timestamp.now();
@@ -204,5 +205,50 @@ describe("need classifier scope (#187)", () => {
 
   test("the item's own clause still wins inside its sentence", () => {
     assert.deepEqual(classifyNeed(TB, undefined, TB), { need: "conditional", appliesWhen: TB_WHEN });
+  });
+});
+
+describe("lead-in handling (#187 round 3)", () => {
+  const LEAD = "Depending on your circumstances, you might also need to provide:";
+  const EMPLOYER = "your employer\u2019s address and telephone number";
+
+  test("an item whose own citation carries the lead-in is conditional even with no kind quote (backfilled / kindReview)", () => {
+    const quote = `${LEAD} ${EMPLOYER}`;
+    assert.deepEqual(classifyNeed(quote, undefined, EMPLOYER), {
+      need: "conditional",
+      appliesWhen: "Depending on your circumstances, you might also need to provide",
+    });
+    const m = metaFromQuoteOnly(quote, EMPLOYER);
+    assert.equal(m.need, "conditional");
+    assert.equal(m.kindReview, true);
+  });
+
+  const base = {
+    name: "Standard Visitor", code: "SV", description: "d", category: "tourist", processingTime: "3 weeks",
+    processingDaysMin: 15, processingDaysMax: 21, feeComponents: [], validityPeriod: "6 months",
+    isExtendable: true, eligibilityCriteria: ["x"], confidence: 0.9,
+  };
+  const INFO_LEAD = "You\u2019ll need to provide the following information in your online application:";
+  const PASSPORT = "a passport or travel document";
+  const PAGE =
+    `You must have ${PASSPORT} that is valid for the whole of your stay. ${INFO_LEAD}\n\n${STAY}\n\n` +
+    `${LEAD}\n\n${EMPLOYER}`;
+  const kindOf = (item: string, claimed: "document" | "information", quote: string) =>
+    validateExtractedVisa(
+      { ...base, requiredDocuments: [item], citations: { "requiredDocuments.0": item },
+        requiredDocumentMeta: [{ kind: claimed, kindQuote: quote, need: "required" }] },
+      { pageText: PAGE }
+    ).requiredDocumentMeta![0];
+
+  test("a lead-in-only kindQuote backs information only for an item listed under it", () => {
+    assert.equal(kindOf(STAY, "information", INFO_LEAD).kind, "information");
+    // The passport sentence comes BEFORE that lead-in, so the lead-in cannot back it.
+    assert.deepEqual(kindOf(PASSPORT, "information", INFO_LEAD), { item: PASSPORT, kind: "document", kindReview: true, need: "required" });
+  });
+
+  test("a lead-in-only kindQuote does not cover an item listed under a LATER, different lead-in", () => {
+    const m = kindOf(EMPLOYER, "information", INFO_LEAD);
+    assert.equal(m.kindReview, true);
+    assert.equal(kindOf(EMPLOYER, "information", LEAD).kind, "information"); // its own lead-in does
   });
 });

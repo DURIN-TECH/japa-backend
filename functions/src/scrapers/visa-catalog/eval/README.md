@@ -110,10 +110,9 @@ A route's `expected.json` may carry `documentKinds.items`: for each listed item,
 `conditional` / `optional`) the page's own wording gives, and a verbatim
 `source`. The field (weight 2) is scored only on routes that have it; an item
 scores when both kind and need match (a missing or `kindReview` item scores 0).
-Standard Visitor scores all 13 items of its two lists: only the TB certificate
-is a document. Its passport sentence ("You must have a passport or travel
-document ...") is prose above those lists, not a list item, so it is not an
-expected item. UK Family uses the issue's two named examples (photo-page copies =
+Standard Visitor scores 14 items: the passport / travel document sentence
+(document, required) and the 13 items of its two lists; only the passport and
+the TB certificate are documents. UK Family uses the issue's two named examples (photo-page copies =
 document, criminal convictions = information) plus passport, TB results and
 certified translation.
 
