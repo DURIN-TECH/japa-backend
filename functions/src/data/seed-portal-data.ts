@@ -597,8 +597,9 @@ export function buildSeedApplications() {
       documentsUploaded: 5,
       documentsVerified: 4,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 15000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 150_00, // US cents, same currency as totalCost
       paymentStatus: "partial",
       clientName: "John Doe",
       clientEmail: EMAILS.client1User,
@@ -626,8 +627,9 @@ export function buildSeedApplications() {
       documentsUploaded: 3,
       documentsVerified: 2,
       documentsRejected: 1,
-      totalCost: 35000_00,
-      amountPaid: 35000_00,
+      totalCost: 350_00, // US cents ($350.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 350_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Jane Smith",
       clientEmail: EMAILS.client2User,
@@ -656,8 +658,9 @@ export function buildSeedApplications() {
       documentsUploaded: 6,
       documentsVerified: 6,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 250_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Ahmed Ali",
       clientEmail: EMAILS.client3User,
@@ -685,8 +688,9 @@ export function buildSeedApplications() {
       documentsUploaded: 7,
       documentsVerified: 5,
       documentsRejected: 2,
-      totalCost: 30000_00,
-      amountPaid: 30000_00,
+      totalCost: 300_00, // US cents ($300.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 300_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       rejectionReason: "Insufficient proof of funds and weak ties to home country.",
       clientName: "Lisa Wong",
@@ -714,7 +718,8 @@ export function buildSeedApplications() {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Tunde Bakare",
@@ -742,7 +747,8 @@ export function buildSeedApplications() {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 30000_00,
+      totalCost: 300_00, // US cents ($300.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Kwame Asante",
@@ -771,8 +777,9 @@ export function buildSeedApplications() {
       documentsUploaded: 6,
       documentsVerified: 6,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 250_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Wanjiku Mwangi",
       clientEmail: EMAILS.client7User,
@@ -802,8 +809,9 @@ export function buildSeedApplications() {
       documentsUploaded: 7,
       documentsVerified: 6,
       documentsRejected: 0,
-      totalCost: 35000_00,
-      amountPaid: 35000_00,
+      totalCost: 350_00, // US cents ($350.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 350_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Sipho Ndlovu",
       clientEmail: EMAILS.client8User,
@@ -831,8 +839,9 @@ export function buildSeedApplications() {
       documentsUploaded: 3,
       documentsVerified: 2,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 15000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 150_00, // US cents, same currency as totalCost
       paymentStatus: "partial",
       clientName: "Priya Sharma",
       clientEmail: EMAILS.client9User,
@@ -860,8 +869,9 @@ export function buildSeedApplications() {
       documentsUploaded: 4,
       documentsVerified: 3,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 250_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Miguel Santos",
       clientEmail: EMAILS.client10User,
@@ -891,7 +901,8 @@ export function buildSeedApplications() {
       documentsUploaded: 3,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Kwame Asante",
@@ -916,7 +927,8 @@ export function buildSeedApplications() {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 35000_00,
+      totalCost: 350_00, // US cents ($350.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Wanjiku Mwangi",
@@ -941,7 +953,8 @@ export function buildSeedApplications() {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Sipho Ndlovu",
@@ -968,8 +981,9 @@ export function buildSeedApplications() {
       documentsUploaded: 6,
       documentsVerified: 6,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 250_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Priya Sharma",
       clientEmail: EMAILS.client9User,
@@ -2876,6 +2890,13 @@ async function seedNotifications(): Promise<number> {
 // MAIN EXPORT
 // ============================================
 
+/**
+ * Seed payment requests. Issue #181: new requests are in US DOLLARS
+ * (`priceUsd` Money, mirrored as US cents in `amount` + `currency: "USD"`);
+ * the client's local amount is only worked out when they pay. Three LEGACY
+ * naira rows (kobo, "NGN", no `priceUsd`) are kept on purpose, so the portal
+ * and the app keep showing old requests the way they are stored in real data.
+ */
 async function seedPaymentRequests(): Promise<number> {
   const now = Timestamp.now();
   const paymentRequests = [
@@ -2887,7 +2908,7 @@ async function seedPaymentRequests(): Promise<number> {
       clientId: IDS.client1User,
       clientName: "Adaeze Okafor",
       clientEmail: EMAILS.client1User,
-      amount: 75000_00, // ₦75,000 in kobo
+      amount: 75000_00, // LEGACY: ₦75,000 in kobo (pre-#181 row)
       currency: "NGN",
       description: "Visa Processing Fee",
       status: "paid",
@@ -2903,8 +2924,9 @@ async function seedPaymentRequests(): Promise<number> {
       clientId: IDS.client1User,
       clientName: "Adaeze Okafor",
       clientEmail: EMAILS.client1User,
-      amount: 25000_00, // ₦25,000 in kobo
-      currency: "NGN",
+      priceUsd: { amountMinor: 40_00, currency: "USD" }, // $40.00 (issue #181)
+      amount: 40_00, // US cents, mirrors priceUsd
+      currency: "USD",
       description: "Document Authentication Fee",
       status: "pending",
       createdAt: Timestamp.fromDate(new Date("2025-12-01")),
@@ -2918,8 +2940,9 @@ async function seedPaymentRequests(): Promise<number> {
       clientId: IDS.client2User,
       clientName: "Kwame Mensah",
       clientEmail: EMAILS.client2User,
-      amount: 150000_00, // ₦150,000 in kobo
-      currency: "NGN",
+      priceUsd: { amountMinor: 120_00, currency: "USD" }, // $120.00 (issue #181)
+      amount: 120_00, // US cents, mirrors priceUsd
+      currency: "USD",
       description: "Embassy Application Fee",
       status: "pending",
       createdAt: Timestamp.fromDate(new Date("2025-11-20")),
@@ -2933,7 +2956,7 @@ async function seedPaymentRequests(): Promise<number> {
       clientId: IDS.client5User,
       clientName: "Aisha Bello",
       clientEmail: EMAILS.client5User,
-      amount: 50000_00, // ₦50,000 in kobo
+      amount: 50000_00, // LEGACY: ₦50,000 in kobo (pre-#181 row)
       currency: "NGN",
       description: "Consultation Fee",
       status: "cancelled",
@@ -2949,7 +2972,7 @@ async function seedPaymentRequests(): Promise<number> {
       clientId: IDS.client3User,
       clientName: "Amara Njoku",
       clientEmail: EMAILS.client3User,
-      amount: 100000_00, // ₦100,000 in kobo
+      amount: 100000_00, // LEGACY: ₦100,000 in kobo (pre-#181 row)
       currency: "NGN",
       description: "Visa Service Fee",
       status: "paid",

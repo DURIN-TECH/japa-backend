@@ -92,6 +92,8 @@ export const collections = {
   // payment on a cancelled booking), for a human to refund. Doc id = the
   // Paystack reference. Backend only: firestore.rules denies every client.
   consultationPaymentExceptions: db.collection("consultationPaymentExceptions"),
+  // Issue #181: payment-request payments held for refund (backend only, see firestore.rules).
+  paymentRequestExceptions: db.collection("paymentRequestExceptions"),
   notifications: db.collection("notifications"),
   // In-app tester feedback (issue #257): one doc per note (userId, kind, message,
   // route, app/device info, optional screenshotPath, status "new"). Written and

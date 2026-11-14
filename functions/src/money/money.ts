@@ -93,6 +93,22 @@ export function format(money: Money): string {
   return `${negative ? "-" : ""}${info.symbol}${grouped}${fraction !== undefined ? `.${fraction}` : ""}`;
 }
 
+/**
+ * Display string with the ISO CODE instead of a symbol ("USD 12.50",
+ * "NGN 1,500,000.00"), for copy that must name its currency explicitly
+ * (issue #181: notifications and emails about payment requests; "$" alone is
+ * ambiguous and "₦" must never be assumed for a non-naira amount).
+ */
+export function formatWithCode(money: Money): string {
+  const info = getCurrencyInfo(money.currency);
+  if (!info) throw new MoneyError("CURRENCY_UNSUPPORTED", `Unknown currency "${money.currency}"`);
+  // Reuse `format` for the grouping and the decimals, then swap the symbol for the code.
+  const formatted = format(money);
+  const negative = formatted.startsWith("-");
+  const body = (negative ? formatted.slice(1) : formatted).slice(info.symbol.length);
+  return `${negative ? "-" : ""}${info.code} ${body}`;
+}
+
 // ---------- rates ----------
 
 /**

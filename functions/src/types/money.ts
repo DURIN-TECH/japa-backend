@@ -98,11 +98,12 @@ export interface ChargeSnapshot {
 /**
  * The quote lock stored next to a ChargeSnapshot on a record that is charged
  * LATER than it is priced (issue #180: a consultation booking that waits for
- * a Paystack checkout).
+ * a Paystack checkout; issue #181: a payment request, priced when the client
+ * starts checkout).
  *
  * The snapshot is priced when the booking is created (`quoteLockedAt`) and
  * may be charged until `quoteExpiresAt` (30 minutes later, see
- * `QUOTE_LOCK_MINUTES` in services/consultation-charge.service.ts). After
+ * `QUOTE_LOCK_MINUTES` in services/charge-checkout.service.ts). After
  * that a verify or a retry re-prices with a FRESH quote; a stale snapshot is
  * never charged again.
  */

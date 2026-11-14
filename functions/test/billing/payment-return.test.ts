@@ -17,9 +17,9 @@
 //  4. Subscription checkout: `returnTo: "app"` sends the return page as
 //     Paystack's `callback_url`; without it the provider default
 //     (`PAYSTACK_CALLBACK_URL`) is sent, as before.
-//  5. Payment-request approve: `returnTo: "app"` → return page; without it the
-//     portal `/client/payments` callback, as before; a bad value is refused
-//     BEFORE the request is approved.
+//  5. Payment-request approve: moved to
+//     test/payment-requests/payment-request-return-to.test.ts (needs the #181
+//     charge-path harness).
 
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -41,9 +41,6 @@ import { PaystackProvider, paystackProvider } from "../../src/services/billing/p
 import { billingService } from "../../src/services/billing/billing.service";
 import { entitlementController } from "../../src/controllers/entitlement.controller";
 import { entitlementService } from "../../src/services/entitlement.service";
-import { paymentRequestController } from "../../src/controllers/payment-request.controller";
-import { paymentRequestService } from "../../src/services/payment-request.service";
-import { EMAIL_BRANDING } from "../../src/services/email/branding";
 import { collections } from "../../src/utils/firebase";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -359,76 +356,12 @@ describe("POST /subscriptions/checkout returnTo", () => {
 });
 
 // ============================================
-// 5. PUT /payment-requests/:id/approve
+// 5. PUT /payment-requests/:id/approve: moved
 // ============================================
-
-describe("PUT /payment-requests/:id/approve returnTo", () => {
-  /** A pending request owned by client u1; record approve + Paystack calls. */
-  function setup() {
-    const calls = recordPaystack();
-    const approved: string[] = [];
-    const updates: any[] = [];
-    patch(paymentRequestService as any, "getPaymentRequestById", async (id: string) => ({
-      id,
-      clientId: "u1",
-      clientEmail: "delivered+u1@resend.dev",
-      status: "pending",
-      amount: 250_000,
-      applicationId: "app1",
-    }));
-    patch(paymentRequestService as any, "approvePaymentRequest", async (id: string) => {
-      approved.push(id);
-      return { id, status: "approved" };
-    });
-    patch(collections as any, "paymentRequests", {
-      doc: () => ({ update: async (data: unknown) => { updates.push(data); } }),
-    });
-    return { calls, approved, updates };
-  }
-  /** Call approve as client u1 with a body. */
-  async function call(body: unknown) {
-    const { res, out } = fakeRes();
-    await paymentRequestController.approvePaymentRequest(
-      { params: { id: "pr1" }, user: { uid: "u1" }, authz: { role: ROLES.CLIENT }, body } as any,
-      res
-    );
-    return out;
-  }
-
-  test("returnTo: 'app' sends the app return page as callback_url", async () => {
-    process.env.GCLOUD_PROJECT = "japa-platform";
-    const { calls, approved } = setup();
-    const out = await call({ returnTo: "app" });
-    assert.equal(out.body.success, true);
-    assert.equal(out.body.data.authorizationUrl, "https://checkout.paystack.com/x");
-    assert.deepEqual(approved, ["pr1"]);
-    assert.equal(calls[0].callback_url, "https://us-central1-japa-platform.cloudfunctions.net/api/payments/return");
-  });
-
-  test("no returnTo (and no body) keeps the portal /client/payments callback", async () => {
-    const { calls } = setup();
-    await call(undefined);
-    assert.equal(calls[0].callback_url, `${EMAIL_BRANDING.appUrl}/client/payments?reference={reference}`);
-  });
-
-  test("returnTo: 'app' with no project id → 500 BEFORE the request is approved", async () => {
-    const { calls, approved } = setup();
-    delete process.env.GCLOUD_PROJECT;
-    delete process.env.GOOGLE_CLOUD_PROJECT;
-    const out = await call({ returnTo: "app" });
-    assert.equal(out.status, 500);
-    assert.deepEqual(approved, []);
-    assert.equal(calls.length, 0);
-  });
-
-  test("an unknown returnTo is refused BEFORE the request is approved", async () => {
-    const { calls, approved } = setup();
-    const out = await call({ returnTo: "web" });
-    assert.equal(out.status, 400);
-    assert.deepEqual(approved, []);
-    assert.equal(calls.length, 0);
-  });
-});
+// Since #181 the approve opens its checkout through the shared charge path
+// (race-safe claim -> open -> publish in Firestore transactions), which these
+// hand-rolled stubs cannot drive. The same cases now run on the payment-request
+// harness: test/payment-requests/payment-request-return-to.test.ts.
 
 // ============================================
 // Mounting: the real Express app serves the page with NO auth

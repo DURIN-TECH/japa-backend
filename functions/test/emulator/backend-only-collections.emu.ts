@@ -37,6 +37,16 @@ const COLLECTIONS = [
   // Consultation payments held for refund (issue #180 review fix): amounts,
   // references and other people's booking ids. Never read or forged by a client.
   "consultationPaymentExceptions",
+  // Payment requests (issue #181): the agent's dollar price, the charge
+  // snapshot, the checkout references and the paid status. Only the API
+  // writes them (settlement in one Firestore transaction); a client that
+  // could write one could mark it paid or lower the amount charged, and a
+  // client that could read them would see other people's requests. The
+  // portal and the app read them through GET /payment-requests only.
+  "paymentRequests",
+  // Payment-request payments held for refund (issue #181): amounts and
+  // references. Never read or forged by a client.
+  "paymentRequestExceptions",
   // Agency listing screening results (issue #120): admin-only through the API.
   "listingScreenings",
   "rubricReviewHistory",
@@ -139,7 +149,8 @@ before(async () => {
   await resetEmulators();
   await withoutRules(async (db) => {
     // Seed docs that name the actor as owner, to prove ownership grants nothing.
-    const owned = { userId: UID, uid: UID, applicationId: "app-1", agencyId: "agency-1", a: 1 };
+    // `clientId` / `agentId` too (issue #181): a payment request names its client and agent that way.
+    const owned = { userId: UID, uid: UID, clientId: UID, agentId: UID, applicationId: "app-1", agencyId: "agency-1", a: 1 };
     for (const c of COLLECTIONS) await db.collection(c).doc("seed").set(owned);
     for (const [c, id, sub] of SUBCOLLECTIONS) await db.collection(c).doc(id).collection(sub).doc("seed").set(owned);
     // (#278) The parts of a large rubric version, one level deeper.
