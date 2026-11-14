@@ -6,7 +6,7 @@
 // Firestore, no network and a fixed clock.
 
 import type { ConfigStore } from "../../src/money/config";
-import type { RateAuditEntry, RateStore, StoredRate } from "../../src/money/rate.types";
+import { sameProviderState, type RateAuditEntry, type RateStore, type StoredRate } from "../../src/money/rate.types";
 import { RateService } from "../../src/money/rate.service";
 import type { ProviderResult, RateProvider } from "../../src/money/providers/types";
 
@@ -32,8 +32,12 @@ export function memoryRateStore(): RateStore & { docs: Map<string, StoredRate>; 
     async get(c) {
       return docs.get(c) ?? null;
     },
-    async saveProvider(c, provider) {
+    // Issue #229: same contract as the Firestore store: written only while
+    // the provider part is still what the caller read (`expected`).
+    async saveProvider(c, provider, expected) {
+      if (!sameProviderState(docs.get(c) ?? null, expected)) return false;
       docs.set(c, { ...(docs.get(c) ?? blank(c)), provider, lastError: null });
+      return true;
     },
     async saveError(c, error) {
       docs.set(c, { ...(docs.get(c) ?? blank(c)), lastError: error });
@@ -63,6 +67,13 @@ export function memoryRateStore(): RateStore & { docs: Map<string, StoredRate>; 
       if (waitMs > 0) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(waitMs / 1000)) };
       docs.set(c, { ...(docs.get(c) ?? blank(c)), manualRefreshAt: at });
       return { allowed: true };
+    },
+    // Issue #229: give a claimed refresh slot back while it is still ours.
+    async releaseManualRefresh(c, claimedAt) {
+      const doc = docs.get(c);
+      if (doc?.manualRefreshAt && doc.manualRefreshAt.getTime() === claimedAt.getTime()) {
+        docs.set(c, { ...doc, manualRefreshAt: null });
+      }
     },
     async listAudit(c, limit) {
       return audit.filter((a) => a.currency === c).reverse().slice(0, limit);

@@ -57,7 +57,7 @@ async function captureErrors(fn: () => Promise<unknown>): Promise<string[]> {
 // 1. Override re-check and unreferenced TTL
 // ---------------------------------------------------------------
 describe("an override that no longer fits the provider rate is flagged; unreferenced overrides expire within 24h", () => {
-  test("reset-reference, typo override 1050, next refresh stores 1500: logged, flagged in the overview, and gone within 24h", async () => {
+  test("reset-reference, typo override 1050, next refresh stores 1500: logged, flagged, priced at 1500 at once (#229)", async () => {
     const { service, store, clock } = makeService();
     await service.refreshAll(); // provider 1500
     await service.resetReference("NGN", "Genuine devaluation confirmed", "admin-1");
@@ -81,10 +81,16 @@ describe("an override that no longer fits the provider rate is flagged; unrefere
     assert.match(outcomes[0].warning ?? "", /1050.*more than 10%.*1500/);
     assert.ok(logged.some((l) => /NGN/.test(l) && /1050/.test(l)), "logged at error level");
     [row] = await service.adminOverview();
-    assert.deepEqual(row.warnings.map((w) => w.code).sort(), ["OVERRIDE_OUTSIDE_PROVIDER_BAND", "OVERRIDE_UNREFERENCED"]);
-    assert.equal((await service.getRate("NGN")).rate, 1050); // still wins until fixed or expired...
+    assert.deepEqual(row.warnings.map((w) => w.code).sort(), [
+      "OVERRIDE_OUTSIDE_PROVIDER_BAND",
+      "OVERRIDE_SUPERSEDED",
+      "OVERRIDE_UNREFERENCED",
+    ]);
+    // Issue #229: the unreferenced typo stops winning at once; 1500 prices.
+    assert.equal((await service.getRate("NGN")).rate, 1500);
+    assert.equal((await service.getRate("NGN")).source, "cbn");
 
-    // ...but for 24h at most: after that the provider rate prices again.
+    // After its 24h the override is simply gone; still 1500, nothing flagged.
     clock.advanceHours(23.5);
     assert.equal((await service.getRate("NGN")).rate, 1500);
     [row] = await service.adminOverview();
@@ -190,9 +196,10 @@ describe("a stored currency entry merges over the default", () => {
       const c = parseCurrenciesConfig({ currencies: { NGN: bad } });
       assert.deepEqual([c.currencies.NGN.minRate, c.currencies.NGN.maxRate], [200, 5000], JSON.stringify(bad));
     }
-    // Exactly at the cap is allowed.
-    const ok = parseCurrenciesConfig({ currencies: { NGN: { minRate: 100, maxRate: 5000 } } });
-    assert.deepEqual([ok.currencies.NGN.minRate, ok.currencies.NGN.maxRate], [100, 5000]);
+    // Issue #229: even inside the ratio cap, 100-5000 would WIDEN NGN's
+    // default 200-5000, so the min falls back to the default's 200.
+    const wide = parseCurrenciesConfig({ currencies: { NGN: { minRate: 100, maxRate: 5000 } } });
+    assert.deepEqual([wide.currencies.NGN.minRate, wide.currencies.NGN.maxRate], [200, 5000]);
   });
 
   test("a new currency with an over-wide range has no range (fails closed)", () => {

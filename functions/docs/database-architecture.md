@@ -470,7 +470,7 @@ exchangeRateAudit/{auto id}   append-only admin override history, backend-only
 | defaultMarginBps    | number | Margin in basis points when a currency sets none (0)                                          |
 | maxRateAgeHours     | number | Oldest a rate's own date (`asOf`) may be and still price (144 = 6 days, covers a four-day closure such as Easter; cap 240). Re-reading an old row never refreshes it |
 | maxProviderJumpPercent | number | A new provider rate further than this from the stored one is rejected and logged (10; cap 50). Accept a real move via `POST /admin/exchange-rates/:currency/reset-reference` |
-| currencies.X.minRate / maxRate | number | Plausible range for first-run provider rates and unreferenced overrides (NGN 200-5000). Judged as a pair: min > 0, max > min, max <= 1e9 and max/min <= 50; an invalid pair is ignored (default range kept, or none). Without a range those are refused |
+| currencies.X.minRate / maxRate | number | Plausible range for first-run provider rates and unreferenced overrides (NGN 200-5000). For a currency with a default range (NGN) a stored range may only NARROW it (#229): a min below the default min or a max above the default max falls back to the default bound. For a currency with no default: judged as a pair (min > 0, max > min, max <= 1e9, max/min <= 50), an invalid pair means no range. Without a range those are refused |
 | provider            | enum   | `cbn` (default) or `oanda` (used only when the `OANDA_API_KEY` secret exists)                 |
 | overrideBandPercent | number | An admin override must be within this % of the last provider rate (10)                        |
 | overrideTtlHours    | number | Default life of an admin override (24; cap 168; request may set 1-168). An unreferenced override (no provider rate to check it against) lasts 24h at most |
@@ -481,7 +481,7 @@ exchangeRateAudit/{auto id}   append-only admin override history, backend-only
 | --------- | ------- | -------------------------------------------------------------------------------------------------------- |
 | currency  | string  | Doc id                                                                                                   |
 | provider  | map?    | `{ rate, asOf, fetchedAt, source: "cbn"\|"oanda" }`. `rate` = local units per 1 USD. Freshness = `fetchedAt` |
-| override  | map?    | `{ rate, reason, setBy, setAt, expiresAt, unreferenced? }`; wins while unexpired (source `manual`). When a refresh stores a provider rate outside `overrideBandPercent` of an active override, it is logged at error level and flagged in `GET /admin/exchange-rates` (`warnings`) |
+| override  | map?    | `{ rate, reason, setBy, setAt, expiresAt, unreferenced?, referenceRate? }`; wins while unexpired (source `manual`), except (#229) an unreferenced override, or a legacy one with neither `unreferenced` nor `referenceRate` (the provider rate a referenced override was checked against), stops pricing once a FRESH provider rate exists more than `overrideBandPercent` from it (flagged `OVERRIDE_SUPERSEDED`). When a refresh stores a provider rate outside `overrideBandPercent` of an active override, it is logged at error level and flagged in `GET /admin/exchange-rates` (`warnings`) |
 | manualRefreshAt | timestamp? | Last admin "refresh now" (rate limit: one per currency per 5 minutes)                           |
 | lastError | map?    | `{ at, message }` of the last failed provider attempt                                                    |
 

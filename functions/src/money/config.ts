@@ -66,8 +66,9 @@ export const MAX_OVERRIDE_TTL_HOURS = 168;
 /**
  * Widest plausible range allowed in config, as maxRate / minRate (issue #214).
  * NGN's default 200-5000 is 25x. A typo like maxRate 1e9 would make the range
- * meaningless, so a stored range wider than 50x is ignored and the default
- * range (or none, which fails closed) applies.
+ * meaningless, so a stored range wider than 50x is ignored and the currency
+ * has no range (fails closed). Since issue #229 this only matters for a
+ * currency with NO default range: one that has a default may only narrow it.
  */
 export const MAX_RATE_RANGE_RATIO = 50;
 
@@ -82,6 +83,33 @@ function validRange(minRate: unknown, maxRate: unknown): { minRate: number; maxR
   if (minRate <= 0 || maxRate <= minRate || maxRate > MAX_RATE) return null;
   if (maxRate > minRate * MAX_RATE_RANGE_RATIO) return null;
   return { minRate, maxRate };
+}
+
+/** A positive finite number, or undefined. */
+function positiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * Issue #229: the plausible range for a currency that HAS a default range.
+ * A stored range may only NARROW the default, never widen it:
+ *  - stored minRate is used only when it is >= the default minRate,
+ *  - stored maxRate is used only when it is <= the default maxRate,
+ * and each bound that is missing, malformed or wider falls back to the
+ * default's bound on its own. If the result is not a valid range (e.g. a
+ * narrowed min at or above a narrowed max) the default pair is kept.
+ * Before #229 a stored 100-5000 for NGN (inside the 50x ratio cap) widened
+ * the default 200-5000, so a decimal slip of ~150 passed as a first rate.
+ */
+function narrowedRange(
+  stored: Record<string, unknown>,
+  fallback: { minRate: number; maxRate: number }
+): { minRate: number; maxRate: number } {
+  const storedMin = positiveNumber(stored.minRate);
+  const storedMax = positiveNumber(stored.maxRate);
+  const minRate = storedMin !== undefined && storedMin >= fallback.minRate ? storedMin : fallback.minRate;
+  const maxRate = storedMax !== undefined && storedMax <= fallback.maxRate ? storedMax : fallback.maxRate;
+  return validRange(minRate, maxRate) ?? fallback;
 }
 
 /** A margin in basis points (integer 0-10000), or undefined. */
@@ -99,11 +127,13 @@ function validMarginBps(value: unknown): number | undefined {
  *  - `enabled`: a stored boolean wins, else the default (else false);
  *  - `countries`: a stored array of strings wins, else the default (else []);
  *  - `marginBps`: a valid stored margin wins, else the default's (if any);
- *  - `minRate`/`maxRate`: judged as a PAIR. Each end missing from the stored
- *    entry is taken from the default; if the resulting pair is not a valid
- *    range (see validRange) the default pair is kept instead; with no valid
- *    pair at all the currency has no range, which fails closed (a first-run
- *    rate or an unreferenced override is then refused).
+ *  - `minRate`/`maxRate`, when the currency HAS a default range (issue
+ *    #229): a stored range may only narrow it (see narrowedRange); a wider
+ *    bound falls back to the default's bound.
+ *  - `minRate`/`maxRate`, for a currency with NO default range (a new
+ *    currency): judged as a PAIR by validRange (ratio cap included); with
+ *    no valid pair the currency has no range, which fails closed (a
+ *    first-run rate or an unreferenced override is then refused).
  */
 function mergeCurrencyEntry(stored: Record<string, unknown>, fallback: CurrencyConfigEntry | undefined): CurrencyConfigEntry {
   const enabled = typeof stored.enabled === "boolean" ? stored.enabled : fallback?.enabled ?? false;
@@ -111,9 +141,8 @@ function mergeCurrencyEntry(stored: Record<string, unknown>, fallback: CurrencyC
     ? stored.countries.filter((c): c is string => typeof c === "string")
     : [...(fallback?.countries ?? [])];
   const marginBps = validMarginBps(stored.marginBps) ?? fallback?.marginBps;
-  const range =
-    validRange(stored.minRate ?? fallback?.minRate, stored.maxRate ?? fallback?.maxRate) ??
-    validRange(fallback?.minRate, fallback?.maxRate);
+  const defaultRange = validRange(fallback?.minRate, fallback?.maxRate);
+  const range = defaultRange ? narrowedRange(stored, defaultRange) : validRange(stored.minRate, stored.maxRate);
   return {
     enabled,
     countries,
