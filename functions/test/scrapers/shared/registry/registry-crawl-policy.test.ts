@@ -58,23 +58,26 @@ describe("host policy over the real guarded client", () => {
     });
     await new Promise<void>((r) => b.listen(0, "127.0.0.1", r));
     portB = (b.address() as AddressInfo).port;
-    a = http.createServer((req, res) => {
+    a = http.createServer((req, res): void => {
       hitsA.push(req.url ?? "");
       const url = req.url ?? "/";
       if (url === "/to-b") {
         // Same machine, DIFFERENT host name: "localhost" instead of 127.0.0.1.
         res.statusCode = 302;
         res.setHeader("location", `http://localhost:${portB}/landing`);
-        return res.end();
+        res.end();
+        return;
       }
       if (url === "/same") {
         res.statusCode = 302;
         res.setHeader("location", "/plain");
-        return res.end();
+        res.end();
+        return;
       }
       if (url === "/robots.txt") {
         res.statusCode = 404;
-        return res.end();
+        res.end();
+        return;
       }
       res.setHeader("content-type", "text/html");
       res.end(BODY);
@@ -112,8 +115,11 @@ describe("host policy over the real guarded client", () => {
   test("a redirect inside the allowed host works", async () => {
     const page = await service().fetchAndClean(`${baseA}/same`, { allowedHost: (h) => h === "127.0.0.1" });
     assert.equal(page.finalUrl, `${baseA}/plain`);
-    assert.equal(page.htmlLang, null);
-    assert.equal(page.title, "Page");
+    // The result keeps its usual shape unless the preview asks for the page meta.
+    assert.equal("title" in page, false);
+    const withMeta = await service().fetchAndClean(`${baseA}/plain`, { readHtmlMeta: true });
+    assert.equal(withMeta.htmlLang, null);
+    assert.equal(withMeta.title, "Page");
   });
 
   test("a requested host that is not allowed is refused before ANY request, robots.txt included", async () => {
@@ -393,7 +399,7 @@ describe("visa crawl: portal-added pages", () => {
   test("a canonical address on an unconfirmed host (an adapter that ignored the policy) is the page's recorded error, not a crash", async () => {
     seed([{ url: PORTAL, routeName: "P", visaId: "aa-p", addedVia: "portal" }]);
     canonical[PORTAL] = "https://elsewhere.example.net/x";
-    const summary = await run(async () => new Set(["www.agency.example.org"]));
+    const summary: any = await run(async () => new Set(["www.agency.example.org"]));
     assert.equal(summary.errors, 1);
     assert.match(pageOf(PORTAL).lastError, /not a confirmed official website/);
     assert.equal(extractions, 0, "nothing was extracted from the unconfirmed host");
@@ -401,7 +407,7 @@ describe("visa crawl: portal-added pages", () => {
 
   test("fails closed when the allow-list cannot be read: the adapter is never called, the error is recorded", async () => {
     seed([{ url: PORTAL, routeName: "P", visaId: "aa-p", addedVia: "portal" }]);
-    const summary = await run(async () => {
+    const summary: any = await run(async () => {
       throw new Error("firestore unavailable");
     });
     assert.equal(summary.errors, 1);

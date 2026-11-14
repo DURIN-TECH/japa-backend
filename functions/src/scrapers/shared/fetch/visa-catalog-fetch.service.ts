@@ -962,7 +962,9 @@ export class VisaCatalogFetchService {
     // requested host BEFORE anything is sent (not even robots.txt), on every
     // redirect hop before it is requested (guarded client), and on the final
     // URL before the body is read. A refusal throws HostNotAllowedError.
-    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number; allowedHost?: (host: string) => boolean }
+    // readHtmlMeta (issue #215, default off): also return the page's `<html
+    // lang>` and `<title>` (HTML only), for the admin's address preview.
+    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number; allowedHost?: (host: string) => boolean; readHtmlMeta?: boolean }
   ): Promise<FetchedPage> {
     if (options?.allowedHost) {
       const requested = this.hostOf(url).replace(/:\d+$/, "");
@@ -1027,8 +1029,9 @@ export class VisaCatalogFetchService {
       throw new Error(`Too little content extracted from ${url} (${cleanText.length} chars)`);
     }
 
-    // Issue #215: language hint and title, for the admin's address preview.
-    const meta = readHtmlMeta(html);
+    // Issue #215: language hint and title, only when the caller asks for them
+    // (the admin's address preview), so every other result keeps its shape.
+    const meta = options?.readHtmlMeta ? readHtmlMeta(html) : undefined;
     return {
       url,
       finalUrl,
@@ -1036,8 +1039,7 @@ export class VisaCatalogFetchService {
       cleanText,
       contentHash: this.hash(cleanText),
       fetchedAt: Date.now(),
-      htmlLang: meta.htmlLang,
-      title: meta.title,
+      ...(meta ? { htmlLang: meta.htmlLang, title: meta.title } : {}),
     };
   }
 }

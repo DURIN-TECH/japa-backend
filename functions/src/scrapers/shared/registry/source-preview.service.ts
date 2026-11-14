@@ -82,7 +82,7 @@ export interface PreviewOptions {
 export interface PreviewFetcher {
   fetchAndClean(
     url: string,
-    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number; allowedHost?: (host: string) => boolean }
+    options?: { checkRobots?: boolean; acceptPdf?: boolean; maxHtmlTextChars?: number; allowedHost?: (host: string) => boolean; readHtmlMeta?: boolean }
   ): Promise<FetchedPage>;
 }
 
@@ -106,6 +106,7 @@ class SourcePreviewService {
     try {
       page = await this.fetcher.fetchAndClean(parsed.url.href, {
         checkRobots: true,
+        readHtmlMeta: true,
         // The visa page goes to the generic-html adapter, which refuses PDFs.
         acceptPdf: options.purpose !== "visa_page",
         ...(options.maxHtmlTextChars !== undefined ? { maxHtmlTextChars: options.maxHtmlTextChars } : {}),
