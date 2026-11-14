@@ -2,6 +2,7 @@ import { normalizeForQuoteMatch } from "../shared/fetch/pdf-text";
 import type { GuidanceSnapshotContent } from "../guidance/types";
 import type { RubricDiscardReason } from "../../types/rubric";
 import { composeMarkerChain } from "./rubric-marker-chain";
+import { productLexicon, type Lexicon } from "../language/language-lexicon";
 
 // ============================================
 // RUBRIC — QUOTE AND NUMBER VALIDATION (issue #40)
@@ -162,9 +163,29 @@ export function containsTokenBounded(text: string, literal: string): boolean {
  * The reference-shaped label a line may BEGIN with: a short capital prefix
  * and a number ("V 4.2", "SUI 10.1", "PA.5", "FIN 2.1"), or a bare dotted
  * number ("7.2"). Shape only: it names no publisher and no document.
+ *
+ * (#220) A language's lexicon may add REFERENCE WORDS (the words that start a
+ * legal reference in that language, in the lexicon file): `Word. 12` then also
+ * reads as a reference. A lexicon with none gives exactly the shape above, so
+ * the product language is unchanged.
  */
-const REF_SHAPE = String.raw`(?:[A-Z]{1,6}\.?\s?\d+[A-Z]?(?:\.\d+)*|\d+[A-Z]?(?:\.\d+)+)`;
-export const LINE_LABEL_RE = new RegExp(String.raw`^(${REF_SHAPE})(?:\.(?=\s|$)|(?=\s|$))`, "u");
+function refShape(lex: Lexicon): string {
+  const words = lex.referenceWordsAlt ? String.raw`(?:${lex.referenceWordsAlt})\.?\s?\d+[A-Z]?(?:\.\d+)*|` : "";
+  return String.raw`(?:${words}[A-Z]{1,6}\.?\s?\d+[A-Z]?(?:\.\d+)*|\d+[A-Z]?(?:\.\d+)+)`;
+}
+/** Compiled line-label expressions, one per lexicon (built once). */
+const LINE_LABEL_CACHE = new WeakMap<Lexicon, RegExp>();
+/** The "line begins with a reference label" expression for a language. */
+export function lineLabelReFor(lex: Lexicon): RegExp {
+  let re = LINE_LABEL_CACHE.get(lex);
+  if (!re) {
+    re = new RegExp(String.raw`^(${refShape(lex)})(?:\.(?=\s|$)|(?=\s|$))`, "u");
+    LINE_LABEL_CACHE.set(lex, re);
+  }
+  return re;
+}
+/** The expression for the product language (kept for callers that read English-written text). */
+export const LINE_LABEL_RE = lineLabelReFor(productLexicon());
 
 /** A bracketed list marker that begins a line: "(a)", "(ii)", "(3)". */
 export const LIMB_RE = /^\(([a-z]{1,3}|\d{1,2})\)/u;
@@ -192,17 +213,24 @@ function isHeadingLine(line: string, labelLength: number): boolean {
  * rules document makes (issue #112): shape only, so over-inclusion keeps
  * more, never less.
  */
-export function refTokensIn(text: string): Set<string> {
+export function refTokensIn(text: string, lex: Lexicon = productLexicon()): Set<string> {
   const out = new Set<string>();
-  const re = new RegExp(String.raw`(?<![\p{L}\p{N}.])${REF_SHAPE}(?![\p{L}\p{N}])`, "gu");
+  const re = new RegExp(String.raw`(?<![\p{L}\p{N}.])${refShape(lex)}(?![\p{L}\p{N}])`, "gu");
   for (const m of text.matchAll(re)) out.add(normalizeRefLabel(m[0]));
   return out;
 }
 
-/** Names of appendices and parts a text mentions ("Appendix X", "Part Y"), as printed. */
-export function appendixNamesIn(text: string): Set<string> {
+/**
+ * Names of appendices and parts a text mentions ("Appendix X", "Part Y"), as
+ * printed. The words that introduce one come from the language's lexicon
+ * (`scopeWords`); with none, nothing is found (fewer names kept in scope, never
+ * a wrong one).
+ */
+export function appendixNamesIn(text: string, lex: Lexicon = productLexicon()): Set<string> {
   const out = new Set<string>();
-  const re = /\b(?:Appendix|Part)\s+[\p{Lu}][\p{L}]*(?:\s+[\p{Lu}][\p{L}]*)*/gu;
+  if (lex.scopeWords.length === 0) return out;
+  const words = lex.scopeWords.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const re = new RegExp(String.raw`\b(?:${words})\s+[\p{Lu}][\p{L}]*(?:\s+[\p{Lu}][\p{L}]*)*`, "gu");
   for (const m of text.matchAll(re)) out.add(m[0].replace(/\s+/gu, " ").trim());
   return out;
 }
@@ -228,8 +256,13 @@ export class SnapshotQuoteIndex {
   /** True for a PDF snapshot. */
   private readonly paginated: boolean;
 
-  /** @param snapshot the stored snapshot (already hash-verified by the store). */
-  constructor(readonly snapshot: GuidanceSnapshotContent) {
+  /**
+   * @param snapshot the stored snapshot (already hash-verified by the store).
+   * @param lexicon   how to read this document's language (#220): its reference
+   *   shapes here, and the numbers / dates the validator reads from its quotes.
+   *   Default: the product language, so every existing caller is unchanged.
+   */
+  constructor(readonly snapshot: GuidanceSnapshotContent, readonly lexicon: Lexicon = productLexicon()) {
     this.paginated = Array.isArray(snapshot.pages);
     this.units = snapshot.pages
       ? snapshot.pages.map((p) => ({ page: p.page, text: normalizeForQuoteMatch(p.text) }))
@@ -314,7 +347,8 @@ export class SnapshotQuoteIndex {
   derivedRuleRef(found: Extract<QuoteLookup, { ok: true }>): string | undefined {
     if (this.paginated) return undefined;
     const line = this.units[found.unit].text;
-    const own = LINE_LABEL_RE.exec(line);
+    const labelRe = lineLabelReFor(this.lexicon);
+    const own = labelRe.exec(line);
     // The quote starts at the label, or after it with only spaces between.
     const startsAfter = (labelEnd: number) => found.at >= labelEnd && line.slice(labelEnd, found.at).trim() === "";
     if (own && (found.at <= own[0].length || startsAfter(own[0].length))) return normalizeRefLabel(own[1]);
@@ -335,7 +369,7 @@ export class SnapshotQuoteIndex {
       const markers: string[] = [limb[1]];
       for (const i of earlier(found.unit)) {
         const text = this.units[i].text;
-        const label = LINE_LABEL_RE.exec(text);
+        const label = labelRe.exec(text);
         if (label) return normalizeRefLabel(label[1]) + composeMarkerChain(markers.reverse()).join("");
         const m = LIMB_RE.exec(text);
         if (m) markers.push(m[1]);
@@ -344,7 +378,7 @@ export class SnapshotQuoteIndex {
     }
 
     for (const i of earlier(found.unit)) {
-      const label = LINE_LABEL_RE.exec(this.units[i].text);
+      const label = labelRe.exec(this.units[i].text);
       if (!label) continue;
       // The nearest label-line decides: it must be a heading.
       return isHeadingLine(this.units[i].text, label[0].length) ? normalizeRefLabel(label[1]) : undefined;
@@ -564,21 +598,17 @@ export function passagesOverlap(a: string, b: string): boolean {
 // threshold must be a JSON number; see rubric-validate.ts). So every gap
 // above ends in a rejection, never in an accepted, unverified number.
 
-/** Number words below one hundred. */
-const UNITS: Record<string, number> = {
-  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
-  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
-};
-const TENS: Record<string, number> = {
-  twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
-};
-/** Multiplier words. */
-const SCALES: Record<string, number> = { hundred: 100, thousand: 1_000, million: 1_000_000, billion: 1_000_000_000 };
-/** Words after which a lone "one" is a quantity. */
-const DURATION_WORD_RE = /^(day|week|month|year)s?$/;
-
 /** Marker returned by `unsupportedNumbers` for a claim with unreadable digits. */
 export const UNREADABLE_DIGITS = "unreadable-digits";
+
+// (#220) Everything below that depends on the LANGUAGE (the number words, the
+// separators, the duration words) comes from the language's lexicon, a data
+// file (see ../language/). Every function takes the lexicon as its last
+// argument and defaults to the product language's, which holds exactly the
+// readings this file had before: an English-written source reads the same.
+// The words that make a "lone one" a quantity only before a duration, and the
+// rule that a unit may complete a tens word, are rules of the engine; WHICH
+// words they apply to is data.
 
 /** The form numbers and dates are read from: compatibility-folded, lower case. */
 function readable(text: string): string {
@@ -595,10 +625,21 @@ function canonical(n: number): string {
   return String(n);
 }
 
-/** Value of a digit run, or undefined when it is not in a recognised shape. */
-function parseDigitRun(run: string): number | undefined {
-  if (!/^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$/.test(run)) return undefined;
-  const n = Number(run.replace(/,/g, ""));
+/**
+ * Value of a digit run, or undefined when it is not in a shape the language
+ * writes numbers in. Thousands separators are removed and the decimal
+ * separator becomes a point. A shape the lexicon does not list ("1.000,50"
+ * under rules that write "1,000.50") is unreadable: the number is then
+ * rejected by the callers, never guessed.
+ */
+function parseDigitRun(run: string, lex: Lexicon): number | undefined {
+  if (!lex.digitRunRe.test(run)) return undefined;
+  let plain = "";
+  for (const ch of run) {
+    if (lex.thousandsSeparators.has(ch)) continue;
+    plain += lex.decimalSeparator !== null && ch === lex.decimalSeparator ? "." : ch;
+  }
+  const n = Number(plain);
   return Number.isFinite(n) ? n : undefined;
 }
 
@@ -610,8 +651,9 @@ interface NumberToken {
 }
 
 /** Every number a text states, in order (see the section header for the rules). */
-function numberTokens(text: string): NumberToken[] {
+function numberTokens(text: string, lex: Lexicon): NumberToken[] {
   const folded = readable(text);
+  const { units: UNITS, tens: TENS, hundreds: HUNDREDS, scales: SCALES } = lex;
   // Words and digit runs, with their positions. A digit run ends on a digit,
   // so sentence punctuation after it is not part of it.
   // A digit run grouped with spaces ("1 270") is ONE run that parseDigitRun
@@ -620,6 +662,7 @@ function numberTokens(text: string): NumberToken[] {
   const raw = [...folded.matchAll(/\p{L}+|\d{1,3}(?: \d{3})+(?![\d.,])|\d[\d.,]*\d|\d/gu)].map((m) => ({ text: m[0], start: m.index as number, end: (m.index as number) + m[0].length }));
   /** True when only spaces / hyphens separate token i from token i+1. */
   const adjacent = (i: number) => i + 1 < raw.length && /^[\s-]*$/.test(folded.slice(raw[i].end, raw[i + 1].start));
+  const isNumberWord = (w: string) => UNITS.has(w) || TENS.has(w) || HUNDREDS.has(w) || SCALES.has(w);
   const out: NumberToken[] = [];
 
   let i = 0;
@@ -627,11 +670,11 @@ function numberTokens(text: string): NumberToken[] {
     const tok = raw[i];
     // ---- digits, optionally scaled by following words ("5 thousand") ----
     if (isDigit(tok.text[0])) {
-      let value = parseDigitRun(tok.text);
+      let value = parseDigitRun(tok.text, lex);
       let end = tok.end;
       let j = i;
-      while (value !== undefined && adjacent(j) && raw[j + 1].text in SCALES) {
-        value *= SCALES[raw[j + 1].text];
+      while (value !== undefined && adjacent(j) && SCALES.has(raw[j + 1].text)) {
+        value *= SCALES.get(raw[j + 1].text) as number;
         end = raw[j + 1].end;
         j++;
       }
@@ -640,44 +683,59 @@ function numberTokens(text: string): NumberToken[] {
       continue;
     }
     // ---- a run of number words, read as one number ----
-    if (!(tok.text in UNITS) && !(tok.text in TENS) && !(tok.text in SCALES)) {
+    if (!isNumberWord(tok.text)) {
       i++;
       continue;
     }
     let total = 0; // completed thousands / millions groups
     let current = 0; // the group being built (below one thousand)
     let lastUsed = i; // last token that is part of this number
+    let joined = false; // the last unit was reached through a tens-units joiner
     let j = i;
     while (j < raw.length) {
       const w = raw[j].text;
-      if (w in SCALES) {
-        if (SCALES[w] === 100) current = (current || 1) * 100;
+      if (SCALES.has(w)) {
+        const scale = SCALES.get(w) as number;
+        if (scale === 100) current = (current || 1) * 100;
         else {
-          total += (current || 1) * SCALES[w];
+          total += (current || 1) * scale;
           current = 0;
         }
-      } else if (w in UNITS || w in TENS) {
-        const v = w in UNITS ? UNITS[w] : TENS[w];
+      } else if (HUNDREDS.has(w)) {
+        // A word that is itself a number of hundreds ("doscientos"): it may open a group, never follow part of one.
+        if (current !== 0) break;
+        current += HUNDREDS.get(w) as number;
+      } else if (UNITS.has(w) || TENS.has(w)) {
+        const v = UNITS.has(w) ? (UNITS.get(w) as number) : (TENS.get(w) as number);
         const low = current % 100;
         // A small number may open a group, or a unit may complete a tens
         // word ("twenty" + "eight"). Anything else ("one two", "eight
-        // twenty") starts a NEW number: stop this one before it.
-        const fits = low === 0 || (v >= 1 && v <= 9 && low >= 20 && low % 10 === 0);
+        // twenty") starts a NEW number: stop this one before it. A language
+        // that always joins the two ("treinta y cinco") also needs its joiner.
+        const completesTens = v >= 1 && v <= 9 && low >= 20 && low % 10 === 0 && (!lex.tensUnitsNeedJoiner || joined);
+        const fits = low === 0 || completesTens;
         if (!fits) break;
         current += v;
       } else {
         break; // not a number word: the run is over
       }
       lastUsed = j;
+      joined = false;
       if (!adjacent(j)) break;
-      // Step over "and" only inside a number ("two hundred and fifty").
-      const afterAnd = raw[j + 2]?.text;
-      if (raw[j + 1].text === "and" && total + current >= 100 && adjacent(j + 1) && afterAnd !== undefined && (afterAnd in UNITS || afterAnd in TENS)) j += 2;
-      else j++;
+      // Step over a joiner only inside a number ("two hundred and fifty").
+      const next = raw[j + 1]?.text;
+      const afterNext = raw[j + 2]?.text;
+      const afterIsSmall = afterNext !== undefined && (UNITS.has(afterNext) || TENS.has(afterNext));
+      if (next !== undefined && lex.scaleJoiners.has(next) && total + current >= 100 && adjacent(j + 1) && afterIsSmall) j += 2;
+      // ... or between a tens word and its unit ("treinta y cinco").
+      else if (next !== undefined && lex.tensUnitsJoiners.has(next) && current % 100 >= 20 && current % 10 === 0 && adjacent(j + 1) && afterNext !== undefined && UNITS.has(afterNext)) {
+        joined = true;
+        j += 2;
+      } else j++;
     }
-    // A lone "one" is usually a pronoun: a quantity only before a duration.
-    const loneOne = lastUsed === i && tok.text === "one";
-    const beforeDuration = adjacent(i) && DURATION_WORD_RE.test(raw[i + 1].text);
+    // A lone "one" is usually a pronoun or an article: a quantity only before a duration.
+    const loneOne = lastUsed === i && lex.loneOneWords.has(tok.text);
+    const beforeDuration = adjacent(i) && lex.durationWords.has(raw[i + 1].text);
     if (!loneOne || beforeDuration) out.push({ value: total + current, start: tok.start, end: raw[lastUsed].end });
     i = lastUsed + 1;
   }
@@ -685,18 +743,18 @@ function numberTokens(text: string): NumberToken[] {
 }
 
 /** Every number a text states, canonicalised. */
-export function numbersIn(text: string): Set<string> {
-  return new Set(numberTokens(text).map((t) => canonical(t.value)));
+export function numbersIn(text: string, lex: Lexicon = productLexicon()): Set<string> {
+  return new Set(numberTokens(text, lex).map((t) => canonical(t.value)));
 }
 
 /**
  * The numbers a text states OUTSIDE its date expressions. A threshold must
  * not be "supported" by the day or the year of a date in the same sentence.
  */
-export function numbersOutsideDates(text: string): Set<string> {
-  const dates = dateSpans(text);
+export function numbersOutsideDates(text: string, lex: Lexicon = productLexicon()): Set<string> {
+  const dates = dateSpans(text, lex);
   return new Set(
-    numberTokens(text)
+    numberTokens(text, lex)
       .filter((t) => !dates.some((d) => t.start < d.end && t.end > d.start))
       .map((t) => canonical(t.value))
   );
@@ -709,25 +767,25 @@ export function numbersOutsideDates(text: string): Set<string> {
  *
  * @param opts.outsideDates ignore numbers that are part of a date in `support`
  *   (used for thresholds; a title may repeat a date's numbers)
+ * @param opts.lexicon      how `support` is read (default: the product language)
+ * @param opts.claimLexicon how a text `claim` is read (default: the product language)
  */
-export function unsupportedNumbers(claim: string | number, support: string, opts: { outsideDates?: boolean } = {}): string[] {
-  const have = opts.outsideDates ? numbersOutsideDates(support) : numbersIn(support);
+export function unsupportedNumbers(claim: string | number, support: string, opts: { outsideDates?: boolean; lexicon?: Lexicon; claimLexicon?: Lexicon } = {}): string[] {
+  // (#220) The SUPPORT (the quote) is read in the source's language; the CLAIM
+  // (a title, a document name: model wording) is written in the product
+  // language. Both default to the product language, which is the old behaviour.
+  const have = opts.outsideDates ? numbersOutsideDates(support, opts.lexicon) : numbersIn(support, opts.lexicon);
   if (typeof claim === "number") return Number.isFinite(claim) && have.has(canonical(claim)) ? [] : [canonical(claim)];
   if (hasUnreadableDigits(claim)) return [UNREADABLE_DIGITS];
-  return [...numbersIn(claim)].filter((n) => !have.has(n));
+  return [...numbersIn(claim, opts.claimLexicon)].filter((n) => !have.has(n));
 }
 
 // ============================================
 // Dates
 // ============================================
 
-/** English month names and abbreviations -> month number. */
-const MONTHS: Record<string, number> = {
-  january: 1, jan: 1, february: 2, feb: 2, march: 3, mar: 3, april: 4, apr: 4, may: 5, june: 6, jun: 6, july: 7, jul: 7,
-  august: 8, aug: 8, september: 9, sep: 9, sept: 9, october: 10, oct: 10, november: 11, nov: 11, december: 12, dec: 12,
-};
-/** Alternation of the month words, longest first so "march" wins over "mar". */
-const MONTH_ALT = Object.keys(MONTHS).sort((a, b) => b.length - a.length).join("|");
+// (#220) Month names and the shape of a written date ("26 March 2026",
+// "12 de marzo de 2024") are the language's: they come from its lexicon.
 
 /** `YYYY-MM-DD` for a real calendar date, else null. */
 function isoOf(year: number, month: number, day: number): string | null {
@@ -747,26 +805,26 @@ interface DateSpan {
 
 /**
  * Every date expression in a text (offsets in the folded text). Recognised:
- *   "26 March 2026", "26th of Mar 2026"      day, month word, year
- *   "March 26, 2026"                         month word, day, year
+ *   the written shapes of the language (its lexicon's date templates; for the
+ *     product language "26 March 2026", "26th of Mar 2026", "March 26, 2026")
  *   "2026-03-26"                             ISO
  *   "26/03/2026", "26.03.2026"               numeric, ONLY when day and month
  *                                            cannot be swapped (one of them
  *                                            is above 12, or they are equal);
  *                                            an ambiguous one is a date span
  *                                            that supports no date
- * Month words are English; a date written otherwise is not recognised, and
- * then supports nothing.
+ * Month words are the language's; a date written otherwise is not recognised,
+ * and then supports nothing.
  */
-function dateSpans(text: string): DateSpan[] {
+function dateSpans(text: string, lex: Lexicon): DateSpan[] {
   const folded = readable(text);
   const spans: DateSpan[] = [];
   const push = (m: RegExpMatchArray, iso: string | null) => spans.push({ iso, start: m.index as number, end: (m.index as number) + m[0].length });
-  for (const m of folded.matchAll(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?(?:\\s+of)?\\s+(${MONTH_ALT})\\b\\.?,?\\s+(\\d{4})\\b`, "g"))) {
-    push(m, isoOf(Number(m[3]), MONTHS[m[2]], Number(m[1])));
-  }
-  for (const m of folded.matchAll(new RegExp(`\\b(${MONTH_ALT})\\b\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(\\d{4})\\b`, "g"))) {
-    push(m, isoOf(Number(m[3]), MONTHS[m[1]], Number(m[2])));
+  for (const t of lex.dateTemplates) {
+    for (const m of folded.matchAll(t.re)) {
+      const g = m.groups as { day: string; month: string; year: string };
+      push(m, isoOf(Number(g.year), lex.months.get(g.month) as number, Number(g.day)));
+    }
   }
   for (const m of folded.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) {
     push(m, isoOf(Number(m[1]), Number(m[2]), Number(m[3])));
@@ -785,8 +843,8 @@ function dateSpans(text: string): DateSpan[] {
 }
 
 /** The dates (YYYY-MM-DD) a text states unambiguously. */
-export function datesIn(text: string): string[] {
-  return [...new Set(dateSpans(text).map((d) => d.iso).filter((d): d is string => d !== null))];
+export function datesIn(text: string, lex: Lexicon = productLexicon()): string[] {
+  return [...new Set(dateSpans(text, lex).map((d) => d.iso).filter((d): d is string => d !== null))];
 }
 
 /**
@@ -795,11 +853,11 @@ export function datesIn(text: string): string[] {
  * and year together). Scattered numbers that happen to include the day and
  * the year do not count.
  */
-export function dateSupported(isoDate: string, support: string): boolean {
+export function dateSupported(isoDate: string, support: string, lex: Lexicon = productLexicon()): boolean {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
   if (!m) return false;
   const iso = isoOf(Number(m[1]), Number(m[2]), Number(m[3]));
-  return iso !== null && datesIn(support).includes(iso);
+  return iso !== null && datesIn(support, lex).includes(iso);
 }
 
 // ============================================
@@ -823,11 +881,11 @@ export function unitSupported(unit: string, support: string): boolean {
  * "28 days or 4 weeks" does not support the pair (28, "weeks"): the unit is
  * written, and so is the number, but not together.
  */
-export function unitAdjacentToNumber(value: number, unit: string, support: string): boolean {
+export function unitAdjacentToNumber(value: number, unit: string, support: string, lex: Lexicon = productLexicon()): boolean {
   const folded = readable(support);
   const u = readable(normalizeForQuoteMatch(unit));
   if (!u) return false;
-  return numberTokens(support).some((t) => {
+  return numberTokens(support, lex).some((t) => {
     if (canonical(t.value) !== canonical(value)) return false;
     // Right after the number, or after ONE ordinary word ("28 consecutive
     // days"); two words or more ("28 days or 4 weeks") are a different phrase.
@@ -847,8 +905,12 @@ export function unitAdjacentToNumber(value: number, unit: string, support: strin
  * so it must not support a threshold or a number in a title. A plain integer
  * with no dot ("28 days") is not a label and is kept.
  */
-export function withoutLeadingParagraphNumber(quote: string): string {
-  return quote.replace(/^\s*(?:(?:[A-Za-z]{1,3}\s)?(?:\d+(?:\.\d+)+|\d+[.)])|\([A-Za-z0-9]{1,3}\))\s+/, "");
+export function withoutLeadingParagraphNumber(quote: string, lex: Lexicon = productLexicon()): string {
+  // (#220) A language's reference words ("Art. 12 ...") label a rule the same way a
+  // short capital prefix does, so the number after one is a label too. With no
+  // reference words the pattern is exactly the one it always was.
+  const words = lex.referenceWordsAlt ? String.raw`(?:${lex.referenceWordsAlt})\.?\s?\d+[A-Za-z]?(?:\.\d+)*[.)]?|` : "";
+  return quote.replace(new RegExp(String.raw`^\s*(?:${words}(?:[A-Za-z]{1,3}\s)?(?:\d+(?:\.\d+)+|\d+[.)])|\([A-Za-z0-9]{1,3}\))\s+`), "");
 }
 
 /**

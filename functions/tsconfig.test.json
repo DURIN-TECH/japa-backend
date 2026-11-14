@@ -9,6 +9,6 @@
   "compilerOptions": {
     "noEmit": true
   },
-  "include": ["src/**/*", "test/**/*"],
+  "include": ["src/**/*", "src/scrapers/language/lexicons/*.json", "test/**/*"],
   "exclude": ["node_modules"]
 }
