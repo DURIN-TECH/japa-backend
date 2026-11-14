@@ -1,7 +1,11 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { bankAccountService } from "../services/bank-account.service";
-import { transactionService } from "../services/transaction.service";
+import {
+  transactionService,
+  availableBalanceIn,
+  WITHDRAWAL_CURRENCY,
+} from "../services/transaction.service";
 import {
   sendSuccess,
   sendError,
@@ -153,9 +157,12 @@ class BankAccountController {
         return;
       }
 
-      // Check available balance
+      // Check available balance (issue #282): a withdrawal is paid out in
+      // WITHDRAWAL_CURRENCY (NGN, amount in kobo), so it is compared ONLY
+      // against the balance in that currency. Revenue in another currency
+      // (e.g. a USD charge) never makes a naira withdrawal possible.
       const stats = await transactionService.getStatsForAgent(userId);
-      if (amount > stats.availableBalance) {
+      if (amount > availableBalanceIn(stats, WITHDRAWAL_CURRENCY)) {
         sendError(
           res,
           "VALIDATION_ERROR",

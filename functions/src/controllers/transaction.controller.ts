@@ -75,6 +75,16 @@ export class TransactionController {
 
   /**
    * GET /transactions/stats?role=agent|owner|admin
+   *
+   * Issue #282: money is returned PER CURRENCY, never summed across
+   * currencies. Response `data`:
+   *   {
+   *     byCurrency: [{ currency, totalRevenue, pendingPayments, availableBalance }],
+   *     pendingClientsCount
+   *   }
+   * Amounts are integer minor units of each row's `currency`; rows are sorted
+   * by code; `byCurrency` is empty when the scope has no transactions. Role
+   * scoping is unchanged (admin: all; owner: own agency's agents; agent: own).
    */
   async getStats(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
@@ -116,6 +126,7 @@ export class TransactionController {
       }
       }
 
+      // Per-currency aggregation (see TransactionService.computeStats).
       const stats = transactionService.computeStats(transactions);
       sendSuccess(res, stats);
     } catch (error) {

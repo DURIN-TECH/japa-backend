@@ -89,7 +89,9 @@ export class AnalyticsController {
    *
    * Returns key performance indicators for the analytics dashboard:
    * - totalCases (with period-over-period change)
-   * - totalRevenue (with change)
+   * - revenueByCurrency: [{ currency, totalRevenue, previousRevenue,
+   *   totalRevenueChange }] — per currency, minor units, never summed
+   *   across currencies (issue #282)
    * - conversionRate (with change)
    * - avgProcessingDays (with change)
    *
@@ -194,8 +196,9 @@ export class AnalyticsController {
    * GET /analytics/revenue-trends
    *
    * Returns monthly revenue totals (completed transactions)
-   * for the line chart visualization.
-   * Each data point has { month, label, value }.
+   * for the line chart visualization, as one series per currency
+   * (issue #282): [{ currency, points: [{ month, label, value }] }],
+   * `value` in minor units of the series' currency.
    *
    * Query params: same as getKPIs (role, from, to)
    */
@@ -242,7 +245,8 @@ export class AnalyticsController {
    *
    * Returns per-agent performance data for the agent table:
    * - agentName, activeCases, completedCases
-   * - successRate, revenueGenerated, avgProcessingDays
+   * - successRate, avgProcessingDays
+   * - revenueByCurrency: [{ currency, amount }] (minor units, issue #282)
    *
    * Only available to admin and owner roles (agents can't
    * see other agents' metrics).
