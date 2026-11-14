@@ -77,6 +77,43 @@ export function filterPubliclyVisible<T extends VisaVisibilityFields>(visas: T[]
 }
 
 /**
+ * Explore ordering for `GET /visas` (#258).
+ *
+ * 1. Visas whose requirements come from the official source
+ *    (`source === "scraped"`) come first, across ALL countries, so the best-
+ *    grounded visas land on page 1 even when their country ranks low.
+ * 2. Within each group the pre-existing order is kept: country
+ *    `popularityRank` (missing = 999), then category.
+ *
+ * Seed visas (no `source`), `agent` and `agency` visas all fall in the
+ * second group and keep their current relative order. Callers must pass only
+ * publicly visible visas (the per-country reads already filter them), so a
+ * hidden scraped visa is never ranked. Sorts in place and returns the array;
+ * Array#sort is stable, so ties keep their incoming order.
+ */
+export function sortVisasForExplore<
+  T extends Pick<VisaType, "countryCode" | "category" | "source">,
+>(visas: T[], countries: Pick<Country, "code" | "popularityRank">[]): T[] {
+  // Lookup once instead of a countries.find() per comparison.
+  const rankByCode = new Map<string, number>();
+  for (const c of countries) rankByCode.set(c.code, c.popularityRank || 999);
+
+  return visas.sort((a, b) => {
+    // Group 1: scraped first (0 sorts before 1).
+    const scrapedDiff =
+      (a.source === "scraped" ? 0 : 1) - (b.source === "scraped" ? 0 : 1);
+    if (scrapedDiff !== 0) return scrapedDiff;
+
+    // Existing order: country rank, then category.
+    const rankDiff =
+      (rankByCode.get(a.countryCode) ?? 999) -
+      (rankByCode.get(b.countryCode) ?? 999);
+    if (rankDiff !== 0) return rankDiff;
+    return a.category.localeCompare(b.category);
+  });
+}
+
+/**
  * Thrown by updateVisaReviewStatus for an agency draft (issue #100): a draft
  * has not been submitted, so the admin can't review it. Controller -> 409.
  */
@@ -600,15 +637,10 @@ class VisaService {
       results.push(...visaTypes);
     }
 
-    // Sort by country popularity rank, then by category
-    results.sort((a, b) => {
-      const countryA = countries.find((c) => c.code === a.countryCode);
-      const countryB = countries.find((c) => c.code === b.countryCode);
-      const rankDiff =
-        (countryA?.popularityRank || 999) - (countryB?.popularityRank || 999);
-      if (rankDiff !== 0) return rankDiff;
-      return a.category.localeCompare(b.category);
-    });
+    // Order BEFORE the pagination slice below (#258): scraped visas first,
+    // then country popularity rank, then category. Doing it here (not on the
+    // client) keeps page 1 and every later page consistent.
+    sortVisasForExplore(results, countries);
 
     const total = results.length;
     const limit = options?.limit || 20;
