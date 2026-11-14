@@ -54,34 +54,47 @@ export function proseHead(item: Pick<PageListItem, "text" | "leadIn">): string |
 // ----- List-item head (issue #276) -----
 
 /**
- * Where a list item's "aside" starts: " - " (GOV.UK's explanatory dash, e.g.
- * "your certificate of sponsorship reference number - your employer will give
- * you this") or " (" (a parenthetical, e.g. "your parent's current or expired
- * passport (or a photocopy)"). Commas are deliberately NOT a boundary: in a
- * list item a comma can separate several different things ("your passport,
- * visa and BRP"), so cutting there could let one extracted thing cover others.
+ * Where a list item's "aside" starts. Two shapes only (review round 1 on #276):
+ *  - " - " anywhere: GOV.UK's explanatory dash, e.g. "your certificate of
+ *    sponsorship reference number - your employer will give you this";
+ *  - " (...)" ONLY when the bracket runs to the END of the item (optionally a
+ *    final "." or ";"), e.g. "your parent's current or expired passport (or a
+ *    photocopy)", "(if known)", "(unless your certificate of sponsorship ...)".
+ *    A bracket in the MIDDLE is usually an abbreviation followed by the words
+ *    that tell items apart: "your Biometric Residence Permit (BRP) number",
+ *    "your Confirmation of Acceptance for Studies (CAS) reference number ...",
+ *    "a certificate proving that you've had a tuberculosis (TB) test ...".
+ *    Cutting there would let "your Biometric Residence Permit" hide the number.
+ * Commas are deliberately NOT a boundary: in a list item a comma can separate
+ * several different things ("your passport, visa and BRP"), so cutting there
+ * could let one extracted thing cover others.
  * `normForQuote` has already turned en/em dashes into "-".
  */
-const LIST_ASIDE_RE = / - | \(/;
+const DASH_ASIDE_RE = / - /;
+const TRAILING_BRACKET_RE = / \([^()]*\)[.;]?$/;
 
 /** A cut head must have at least this many words ("a criminal record certificate" = 4). */
 const MIN_HEAD_WORDS = 3;
 
 /**
  * The head of a normalised item text: everything before its first aside
- * (LIST_ASIDE_RE), or null when there is no aside or the head is shorter than
+ * (DASH_ASIDE_RE / TRAILING_BRACKET_RE), or null when there is no aside or the head is shorter than
  * MIN_HEAD_WORDS words (too generic to say "this is the same item").
  */
 function asideHead(key: string): string | null {
-  const cut = key.search(LIST_ASIDE_RE);
-  if (cut <= 0) return null;
+  // The EARLIER of the two boundaries wins (a dash before a trailing bracket, or
+  // a trailing bracket on an item with no dash). -1 = that shape is absent.
+  const cuts = [key.search(DASH_ASIDE_RE), key.search(TRAILING_BRACKET_RE)].filter((c) => c > 0);
+  if (cuts.length === 0) return null;
+  const cut = Math.min(...cuts);
   const head = key.slice(0, cut).replace(/[\s.,;:]+$/, "").trim();
   return head.split(" ").length >= MIN_HEAD_WORDS ? head : null;
 }
 
 /**
  * The "head" of a LIST item (one with a lead-in), issue #276: the item's
- * normalised text up to its first aside (" - " or " ("). Null for a prose
+ * normalised text up to its first aside (" - ", or a " (...)" that ends the
+ * item). Null for a prose
  * item, for an item with no aside (then only the whole-text match applies) and
  * for a head of fewer than three words.
  *
@@ -180,7 +193,16 @@ function appendedItemMeta(item: PageListItem): RequiredDocumentMeta {
   // `quote`; it is the kind quote and the need source, so "..., unless both of
   // the following are true:" makes the item conditional.
   const kindQuote = item.quote ?? (item.leadIn || item.text);
-  const { need, appliesWhen } = classifyNeed(item.quote ?? item.text, item.leadIn || undefined, item.text);
+  const classified = classifyNeed(item.quote ?? item.text, item.leadIn || undefined, item.text);
+  const need = classified.need;
+  // Review round 1: for a span item (shape 3) the clause is "unless both of the
+  // following are true", and "the following" is the exceptions list, which is
+  // not part of the quote. Showing that clause alone points at nothing, and
+  // folding the list in would break the rule that `appliesWhen` is a verbatim
+  // slice of its quote (required-document-meta.ts). So the item stays
+  // `conditional` with NO appliesWhen; the full sentence is its kindQuote and
+  // the item is kindReview, so the admin sees the exceptions on the page.
+  const appliesWhen = item.quote ? undefined : classified.appliesWhen;
   return {
     item: item.text,
     kind: "document",
@@ -217,15 +239,21 @@ export function applyItemCoverage(extracted: ExtractedVisa, pageItems: PageListI
       ? []
       : undefined;
   const have = new Set(docs.map(itemKey));
-  // Issue #276 (belt and braces): the normalised text AND the aside-head of every
-  // listed item. A missing item whose own head is one of these is the same thing
-  // the checklist already asks for (it only adds where to get it), so it is
-  // recorded, never appended. findMissingItems should already have matched it;
-  // this guards the append step on its own (e.g. an item whose quote is absent).
+  // Issue #276 (belt and braces, narrowed in review round 1): the duplicate this
+  // guards against is "X" next to "X - aside" (or "X (aside)"), i.e. one item's
+  // HEAD equals the other's FULL text. Two items that merely share a head ("a
+  // bank statement ... (for you)" / "... (for your partner)") are different
+  // things and BOTH stay. So we keep, for every listed item, its full matchKey
+  // and its head separately:
+  //   - block when the missing item's head equals a listed item's FULL text;
+  //   - block when a listed item's head equals the missing item's FULL text.
+  // findMissingItems should already have matched such an item; this guards the
+  // append step on its own, including against items appended earlier here.
+  const haveFull = new Set<string>();
   const haveHeads = new Set<string>();
   const addHeads = (text: string) => {
     const k = matchKey(text);
-    haveHeads.add(k);
+    haveFull.add(k);
     const h = asideHead(k);
     if (h) haveHeads.add(h);
   };
@@ -233,8 +261,10 @@ export function applyItemCoverage(extracted: ExtractedVisa, pageItems: PageListI
   const recorded: MissingFromExtractionItem[] = [];
   for (const item of missing) {
     const base = { text: item.text, leadIn: item.leadIn, section: item.section };
-    const head = listHead(item) ?? proseHead(item) ?? matchKey(item.text);
-    if (have.has(itemKey(item.text)) || haveHeads.has(head)) {
+    const full = matchKey(item.text);
+    const head = listHead(item) ?? proseHead(item);
+    const sameAsListed = (head !== null && haveFull.has(head)) || haveHeads.has(full);
+    if (have.has(itemKey(item.text)) || haveFull.has(full) || sameAsListed) {
       recorded.push(base); // already listed: recorded, not duplicated
       continue;
     }

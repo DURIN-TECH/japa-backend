@@ -98,6 +98,10 @@ const PROSE_CUE_RE = /^you must have /i;
 //     match: their list is not a set of exceptions of this shape.
 // On every recorded guide (the six golden guides, Health and Care Worker and
 // BN(O)) only the BN(O) home-address sentence matches.
+// Known limit: `(.+?)` takes the WHOLE object as one item, so a sentence like
+// "... will need to provide A, B and C, unless both of the following are true:"
+// would become one row "A, B and C". No recorded page has that shape; if one
+// appears, split it here (verbatim spans) rather than in the matcher.
 const REQUIREMENT_UNLESS_RE =
   /^[^.:]*?(?:\bwill|['\u2019]ll) need to provide (.+?), unless (?:both|either|all|any|one|each) of the following (?:is|are) true:$/i;
 

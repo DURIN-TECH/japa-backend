@@ -207,7 +207,9 @@ describe("#276 BN(O): 'will need to provide X, unless both of the following are 
     assert.equal(meta.kindReview, true);
     assert.equal(meta.kindQuote, BNO_SENTENCE);
     assert.equal(meta.need, "conditional");
-    assert.equal(meta.appliesWhen, "unless both of the following are true");
+    // Review round 1: "unless both of the following are true" alone points at a
+    // list that is not in the quote, so no appliesWhen; the sentence is kindQuote.
+    assert.equal(meta.appliesWhen, undefined);
     assert.deepEqual(out.missingFromExtraction, [
       { text: BNO_ITEM, leadIn: "", section: "documents-youll-need-to-apply", appended: true },
     ]);
@@ -279,13 +281,58 @@ describe("#276 list-item head rule: conservative", () => {
     assert.deepEqual(findMissingItems(e, [li("a criminal record certificate - if you’re working in certain jobs")]), []);
   });
 
-  test("two missing page items with the same head are appended once (append-step head guard)", () => {
+  test("two DIFFERENT page items that share a head are both appended (review round 1)", () => {
     const out = applyItemCoverage(one("a photo"), [
-      li("a criminal record certificate - if you’re working in certain jobs"),
-      { ...li("a criminal record certificate (from each country you’ve lived in)"), leadIn: "You may also need to provide:" },
+      li("a bank statement for the last 6 months (for you)"),
+      li("a bank statement for the last 6 months (for your partner)"),
     ]);
-    assert.deepEqual(out.requiredDocuments, ["a photo", "a criminal record certificate - if you’re working in certain jobs"]);
-    assert.deepEqual(out.missingFromExtraction!.map((m) => m.appended), [true, undefined]);
+    assert.deepEqual(out.requiredDocuments, [
+      "a photo",
+      "a bank statement for the last 6 months (for you)",
+      "a bank statement for the last 6 months (for your partner)",
+    ]);
+    assert.deepEqual(out.missingFromExtraction!.map((m) => m.appended), [true, true]);
+  });
+
+  test("append guard: 'X' and 'X - aside' are the same row, whichever comes first", () => {
+    // The short one first: the aside version's head equals its full text.
+    const a = applyItemCoverage(one("a photo"), [
+      { ...li("a criminal record certificate"), leadIn: "You’ll need to provide:" },
+      { ...li("a criminal record certificate - if you’re working in certain jobs"), leadIn: "You may also need to provide:" },
+    ]);
+    assert.deepEqual(a.requiredDocuments, ["a photo", "a criminal record certificate"]);
+    assert.deepEqual(a.missingFromExtraction!.map((m) => m.appended), [true, undefined]);
+    // The aside one first: the short one's full text equals its head.
+    const b = applyItemCoverage(one("a photo"), [
+      li("a criminal record certificate - if you’re working in certain jobs"),
+      { ...li("a criminal record certificate"), leadIn: "You may also need to provide:" },
+    ]);
+    assert.deepEqual(b.requiredDocuments, ["a photo", "a criminal record certificate - if you’re working in certain jobs"]);
+  });
+
+  test("a bracket in the MIDDLE (an abbreviation) is not an aside: BRP number repro", () => {
+    assert.equal(listHead(li("your Biometric Residence Permit (BRP) number")), null);
+    assert.equal(findMissingItems(one("your Biometric Residence Permit"), [li("your Biometric Residence Permit (BRP) number")]).length, 1);
+    const out = applyItemCoverage(one("your Biometric Residence Permit"), [li("your Biometric Residence Permit (BRP) number")]);
+    assert.ok(out.requiredDocuments.includes("your Biometric Residence Permit (BRP) number"));
+  });
+
+  test("real golden items with a mid-item abbreviation keep no head (CAS, TB)", () => {
+    for (const t of [
+      "your Confirmation of Acceptance for Studies (CAS) reference number from when you applied for your Student visa or Tier 4 (General) student visa",
+      "a Confirmation of Acceptance for Studies (CAS) from your course provider",
+      "a certificate proving that you’ve had a tuberculosis (TB) test if you’re visiting for more than 6 months",
+    ]) {
+      assert.equal(listHead(li(t)), null, t);
+    }
+    const e = one("a letter from your course provider confirming your Confirmation of Acceptance for Studies was withdrawn");
+    assert.equal(findMissingItems(e, [li("your Confirmation of Acceptance for Studies (CAS) reference number from when you applied for your Student visa")]).length, 1);
+  });
+
+  test("a bracket that ENDS the item is still an aside", () => {
+    assert.equal(listHead(li("your parents’ names and dates of birth (if known)")), "your parents' names and dates of birth");
+    assert.equal(listHead(li("how much you earn in a year (if you have an income)")), "how much you earn in a year");
+    assert.equal(listHead(li("your parent’s current or expired passport (or a photocopy).")), "your parent's current or expired passport");
   });
 });
 
