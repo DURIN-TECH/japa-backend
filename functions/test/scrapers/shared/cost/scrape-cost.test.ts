@@ -604,7 +604,7 @@ describe("visa orchestrator records cost", () => {
     assert.equal(page.model, "deepseek-chat");
     // Served model "deepseek-v4.1-flash" is not in the table -> priced by the requested alias.
     assert.equal(page.pricedAs, "deepseek-flash");
-    assert.equal(page.promptVersion, extractMod.EXTRACTOR_PROMPT_VERSION);
+    assert.equal(page.promptVersion, extractMod.EXTRACTION_PIPELINE_VERSION);
     // Run totals
     assert.equal(run.costUsd, expectedCost);
     assert.equal(run.usage.extractions, 1);
@@ -614,7 +614,7 @@ describe("visa orchestrator records cost", () => {
     assert.deepEqual(visa.scrapeMeta.llmUsage, usage(5000, 700, 3000));
     assert.equal(visa.scrapeMeta.llmCostUsd, expectedCost);
     assert.equal(visa.scrapeMeta.llmResponseModel, "deepseek-v4.1-flash");
-    assert.equal(visa.scrapeMeta.extractorPromptVersion, extractMod.EXTRACTOR_PROMPT_VERSION);
+    assert.equal(visa.scrapeMeta.extractorPromptVersion, extractMod.EXTRACTION_PIPELINE_VERSION);
     // Rollup
     assert.equal((store.get("scrapeCosts/2026-11") as any).byCountry.GB.costUsd, expectedCost);
     // List item

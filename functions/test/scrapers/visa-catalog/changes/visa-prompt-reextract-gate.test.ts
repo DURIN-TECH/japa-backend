@@ -62,7 +62,7 @@ const rows = (): [string, Data][] =>
 before(async () => {
   await installFakes();
   catalog = (await import("../../../../src/scrapers/visa-catalog/visa-catalog.service")).visaCatalogService;
-  version = (await import("../../../../src/scrapers/visa-catalog/visa-catalog-extract.service")).EXTRACTOR_PROMPT_VERSION;
+  version = (await import("../../../../src/scrapers/visa-catalog/visa-catalog-extract.service")).EXTRACTION_PIPELINE_VERSION;
 });
 beforeEach(() => resetStore());
 

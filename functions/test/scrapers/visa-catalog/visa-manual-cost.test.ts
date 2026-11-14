@@ -761,7 +761,7 @@ describe("a later scrape replaces a manual cost — never silently", () => {
     assert.equal(warned.length, 0);
     const doc = store.get(VISA_PATH)! as any;
     assert.equal(doc.processingDaysMax, 7); // the new extraction was written...
-    assert.equal(doc.scrapeMeta.extractorPromptVersion, extractMod.EXTRACTOR_PROMPT_VERSION);
+    assert.equal(doc.scrapeMeta.extractorPromptVersion, extractMod.EXTRACTION_PIPELINE_VERSION);
     assert.equal(doc.scrapeMeta.fee.components[0].label, "Single-entry visa fee");
     // ...and the manual cost survived on top of it.
     assert.equal(doc.baseCostUsd, 52);

@@ -114,6 +114,23 @@ const VISA_CATEGORIES: VisaCategory[] = [
  */
 export const EXTRACTOR_PROMPT_VERSION = "2026-11-answer-types-v10";
 
+/**
+ * Issue #212: version of the CODE around the prompt that shapes what is stored
+ * for a visa's checklist (the item collector + coverage append, item-coverage.ts).
+ * Bump it when that code changes what a re-extraction would store. It is a
+ * separate constant so no paid eval run is needed: the prompt text and model are
+ * unchanged (EXTRACTOR_PROMPT_VERSION stays, and the eval keeps stamping it).
+ */
+export const ITEM_COVERAGE_VERSION = "items-v1";
+
+/**
+ * The stamp written to `scrapeMeta.extractorPromptVersion` and compared by the
+ * re-extract gate (isPendingPromptStale, hasProposalForHash): prompt version +
+ * coverage code version. Bumping either makes already-approved GB visas
+ * re-extract on the next crawl (as a proposal, never auto-applied).
+ */
+export const EXTRACTION_PIPELINE_VERSION = `${EXTRACTOR_PROMPT_VERSION}+${ITEM_COVERAGE_VERSION}`;
+
 // A duration phrase: a number (digits or a word) followed by year(s)/month(s),
 // e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
 const DURATION_RE =
@@ -186,7 +203,7 @@ export function requiredDocumentCitationKey(index: number): string {
  * quotes/dashes, collapse whitespace, lower-case. Matching is otherwise exact,
  * so a paraphrase never passes.
  */
-function normForQuote(s: string): string {
+export function normForQuote(s: string): string {
   return s
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201C\u201D]/g, "\"")

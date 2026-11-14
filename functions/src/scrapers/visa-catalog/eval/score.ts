@@ -1,3 +1,5 @@
+// Issue #212: type-only (the scorer stays free of the collector's dependencies).
+import type { PageListItem } from "../adapters/govuk-list-items";
 import type { ExtractedFeeComponent, ExtractedVisa, FeeComponentKind, FeeComponentPer } from "../types";
 import {
   FIELD_WEIGHTS,
@@ -121,6 +123,17 @@ export interface KnownGap {
   note: string;
 }
 
+/**
+ * Issue #212: a page item the extractor is KNOWN to miss on this route. Printed
+ * in every run, never fails it. Needs a tracker ref and the item's verbatim page
+ * text (it must be on the page: it is matched against the collector's output).
+ */
+export interface ItemCoverageGap {
+  text: string; // the page item, verbatim
+  ref: string; // tracker ref, e.g. "#213"
+  note: string; // why it is accepted for now
+}
+
 /** The whole expected.json for one route. */
 export interface ExpectedVisa {
   route: string; // golden dir name, e.g. "skilled-worker-visa"
@@ -144,6 +157,8 @@ export interface ExpectedVisa {
   // Issue #187: optional; the field is scored only when present.
   documentKinds?: { items: ExpectedItemKind[] };
   knownGaps?: KnownGap[];
+  // Issue #212: page items accepted as missing for now (see ItemCoverageGap).
+  itemCoverageGaps?: ItemCoverageGap[];
 }
 
 // ----- Result shape -----
@@ -189,6 +204,11 @@ export interface RouteScore {
   // Issue #87: processing range vs its cited durations; non-empty → hard gate
   // fails. Optional so results files written before #87 still type-check.
   processingCitationProblems?: string[];
+  // Issue #212: page items (collected from the route's recorded guide through
+  // the real adapter) that no extracted item's citation quote contains and that
+  // are not listed as a known gap; non-empty -> hard gate fails. Absent in
+  // results files written before #212 and when no coverage check ran.
+  itemCoverageMisses?: PageListItem[];
   notes: string[]; // known-gap notes etc. (never fail the run)
   knownGaps: KnownGap[];
   error?: string; // extraction failed → every field 0
@@ -518,10 +538,21 @@ function scoreFees(
 export function scoreRoute(
   expected: ExpectedVisa,
   actual: Partial<ExtractedVisa> | null | undefined,
-  error?: string
+  error?: string,
+  // Issue #212: the page items the extraction missed (findMissingItems over the
+  // adapter's collected items); undefined = coverage not checked for this route.
+  itemMisses?: PageListItem[]
 ): RouteScore {
   const knownGaps = expected.knownGaps ?? [];
   const notes = knownGaps.map((g) => `known gap ${g.ref} (${g.field}): ${g.note}`);
+  // ---- Issue #212: split misses into tracked gaps (printed) and real misses (gate) ----
+  const gapKeys = new Map((expected.itemCoverageGaps ?? []).map((g) => [normalizeWords(g.text), g]));
+  const realMisses: PageListItem[] = [];
+  for (const m of itemMisses ?? []) {
+    const gap = gapKeys.get(normalizeWords(m.text));
+    if (gap) notes.push(`known item gap ${gap.ref}: "${m.text}" (${gap.note})`);
+    else realMisses.push(m);
+  }
 
   // ---- Failed extraction: route scores 0, fee is a mismatch ----
   if (!actual || error) {
@@ -578,6 +609,7 @@ export function scoreRoute(
     fields,
     feeMismatch: fee.mismatch,
     processingCitationProblems,
+    ...(itemMisses ? { itemCoverageMisses: realMisses } : {}),
     notes: [...notes, ...fee.notes],
     knownGaps,
   };
@@ -588,6 +620,8 @@ export function scoreRoute(
  *  - HARD: any route with a fee mismatch fails (whatever the scores);
  *  - HARD (#87): any route whose processingDaysMin/Max is outside the
  *    tolerance of every duration in its processing citations fails;
+ *  - HARD (#212): any page item the collector finds that the output's citations
+ *    do not contain (and that is not a listed known gap) fails;
  *  - SOFT: overall weighted score < OVERALL_PASS_THRESHOLD fails;
  *  - SOFT: any route score < ROUTE_PASS_THRESHOLD fails.
  * Overall = sum(weight x score) / sum(weight) over every field of every route.
@@ -605,6 +639,16 @@ export function evaluateGate(routes: RouteScore[]): GateResult {
     // Issue #87: a processing figure no cited duration supports (hard gate).
     for (const problem of r.processingCitationProblems ?? []) {
       failures.push(`processing citation mismatch on ${r.route} (hard gate): ${problem}`);
+    }
+  }
+  // ---- Issue #212: item coverage, a hard gate like fee + processing ----
+  // Every page item the collector finds must be matched by the run's output;
+  // each miss is listed as `route, section, leadIn, text`.
+  for (const r of routes) {
+    for (const m of r.itemCoverageMisses ?? []) {
+      failures.push(
+        `item coverage miss on ${r.route} (hard gate): ${r.route}, ${m.section}, ${m.leadIn || "(no lead-in)"}, ${m.text}`
+      );
     }
   }
   if (routes.length === 0) failures.push("no routes scored");

@@ -826,7 +826,7 @@ describe("runOrchestrator — host backoff on 429/503", () => {
 // Every page here is UNCHANGED (its stored lastContentHash = the stub's text
 // hash, and the doc's scrapeMeta.contentHash = the same hash), so before #71
 // the hash gate would skip all of them. Only a PENDING scraped doc whose
-// scrapeMeta.extractorPromptVersion ≠ EXTRACTOR_PROMPT_VERSION may now reach
+// scrapeMeta.extractorPromptVersion ≠ EXTRACTION_PIPELINE_VERSION may now reach
 // the extractor, and only within maxExtractions.
 
 describe("runOrchestrator — prompt-version re-extract (issue #71)", () => {
@@ -930,7 +930,7 @@ describe("runOrchestrator — prompt-version re-extract (issue #71)", () => {
     assert.equal(summary.updated, 2); // refreshed in place, not "unchanged"
     for (const n of ["old", "none"]) {
       const doc = store.get(docPath(n))!;
-      assert.equal((doc.scrapeMeta as any).extractorPromptVersion, extractMod.EXTRACTOR_PROMPT_VERSION);
+      assert.equal((doc.scrapeMeta as any).extractorPromptVersion, extractMod.EXTRACTION_PIPELINE_VERSION);
       assert.equal((doc.scrapeMeta as any).contentHash, pageHash);
       assert.ok((doc.scrapeMeta as any).fee); // the new prompt's fee block reached it
       assert.equal(doc.reviewStatus, "pending_review");
@@ -940,7 +940,7 @@ describe("runOrchestrator — prompt-version re-extract (issue #71)", () => {
 
   test("pending doc on the current prompt is NOT re-extracted (hash gate as before)", async () => {
     putZz(["cur"]);
-    putDoc("cur", {}, extractMod.EXTRACTOR_PROMPT_VERSION);
+    putDoc("cur", {}, extractMod.EXTRACTION_PIPELINE_VERSION);
     const before = store.get(docPath("cur"));
 
     const summary = await run();
@@ -993,7 +993,7 @@ describe("runOrchestrator — prompt-version re-extract (issue #71)", () => {
     for (const n of ["a", "b", "c"]) {
       assert.equal(
         (store.get(docPath(n))!.scrapeMeta as any).extractorPromptVersion,
-        extractMod.EXTRACTOR_PROMPT_VERSION
+        extractMod.EXTRACTION_PIPELINE_VERSION
       );
     }
   });
@@ -1068,7 +1068,7 @@ describe("runOrchestrator — restored guide (issue #68)", () => {
       reviewStatus: "approved",
       isActive: true,
       name: "Work visa",
-      scrapeMeta: { contentHash: "hash-1", extractorPromptVersion: extractMod.EXTRACTOR_PROMPT_VERSION },
+      scrapeMeta: { contentHash: "hash-1", extractorPromptVersion: extractMod.EXTRACTION_PIPELINE_VERSION },
       ...over,
     });
   }

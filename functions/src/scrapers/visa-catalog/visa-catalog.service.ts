@@ -26,7 +26,7 @@ import {
   planFeeReconvert,
   refreshFxRates,
 } from "./visa-catalog-fx";
-import { EXTRACTOR_PROMPT_VERSION } from "./visa-catalog-extract.service";
+import { EXTRACTION_PIPELINE_VERSION } from "./visa-catalog-extract.service";
 // Canonical country-stats recompute (issue #62: the only stats function).
 import { visaService } from "../../services/visa.service";
 import type { ScrapeSourceMeta } from "./adapters";
@@ -138,11 +138,11 @@ class VisaCatalogService {
       const snap = await subcollections.visaTypes(countryCode).doc(visaId).get();
       existing = snap.exists ? (snap.data() as VisaType) : undefined;
     }
-    if (!isPendingPromptStale(existing, EXTRACTOR_PROMPT_VERSION)) return false;
+    if (!isPendingPromptStale(existing, EXTRACTION_PIPELINE_VERSION)) return false;
     // Approved visa: already turned into a proposal by this prompt version?
     if (existing?.reviewStatus === "approved") {
       const hash = contentHash ?? existing.scrapeMeta?.contentHash;
-      if (hash && (await visaChangeService.hasProposalForHash(countryCode, visaId, hash, EXTRACTOR_PROMPT_VERSION))) {
+      if (hash && (await visaChangeService.hasProposalForHash(countryCode, visaId, hash, EXTRACTION_PIPELINE_VERSION))) {
         return false;
       }
     }
@@ -243,7 +243,7 @@ class VisaCatalogService {
       extractedAt: now,
       sourceMeta: params.sourceMeta,
       fee: feeMeta,
-      extractorPromptVersion: EXTRACTOR_PROMPT_VERSION,
+      extractorPromptVersion: EXTRACTION_PIPELINE_VERSION,
       supplementaryPages: params.supplementaryPages,
       llmUsage: params.llmUsage,
     });
@@ -273,7 +273,7 @@ class VisaCatalogService {
     // the same — the crawl only re-extracts it for that reason (see
     // needsPromptReextract), so the new extraction must not be dropped as
     // "unchanged". Approved docs are unaffected by the version.
-    const branch = planIngest(existing, contentHash, EXTRACTOR_PROMPT_VERSION);
+    const branch = planIngest(existing, contentHash, EXTRACTION_PIPELINE_VERSION);
     if (branch === "unchanged") {
       return { visaId, outcome: "unchanged" };
     }
@@ -306,7 +306,7 @@ class VisaCatalogService {
         // Same prompt version as the outer plan (issue #71): a prompt-only
         // re-extract (same page hash) must still plan "refresh" here, or the
         // new extraction would be dropped as "unchanged".
-        const again = planIngest(current, contentHash, EXTRACTOR_PROMPT_VERSION);
+        const again = planIngest(current, contentHash, EXTRACTION_PIPELINE_VERSION);
         if (again === "unchanged") return { visaId, outcome: "unchanged" as IngestOutcome };
         if (again !== "refresh") return { visaId, outcome: "skipped" as IngestOutcome };
 

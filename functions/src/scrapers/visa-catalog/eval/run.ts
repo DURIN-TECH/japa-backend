@@ -9,6 +9,8 @@ import {
   type LlmExtractor,
 } from "../visa-catalog-extract.service";
 import { GovukContentApiAdapter } from "../adapters";
+import type { PageListItem } from "../adapters/govuk-list-items";
+import { findMissingItems } from "../item-coverage";
 // Same official-host gate on `applicationUrl` as a GB crawl (issue #74).
 import { officialHostsFor } from "../visa-catalog-official-hosts";
 import type { ExtractedVisa, VisaLinkedSurchargeMeta, VisaSourcePage } from "../types";
@@ -215,7 +217,7 @@ export function resultsFileName(promptVersion: string, model: string, ranAt: Dat
 }
 
 /** A registry page for a golden route, with the registry's section overrides. */
-function evalPage(route: EvalRoute): VisaSourcePage {
+export function evalPage(route: EvalRoute): VisaSourcePage {
   const pin = VISA_SOURCE_OVERRIDES[route.url] ?? {};
   return {
     url: route.url,
@@ -268,6 +270,22 @@ export function scoredOutput(
   return { output, meta: applied.meta };
 }
 
+/**
+ * Issue #212: the page items `extracted` misses for a route. The collector runs
+ * on the route's RECORDED guide through the real adapter (no hand-written
+ * expected list), so it works in live runs and in `--replay` alike. Items the
+ * output cites but the validator dropped never count as matched.
+ */
+export async function routeItemMisses(
+  route: EvalRoute,
+  goldenDir: string,
+  extracted: ExtractedVisa
+): Promise<PageListItem[]> {
+  const adapter = new GovukContentApiAdapter(fixtureFetchService(route.url, loadGuide(route.route, goldenDir)));
+  const doc = await adapter.fetch(evalPage(route));
+  return findMissingItems(extracted, doc.listItems ?? []);
+}
+
 /** Error → one-line message (ExtractionValidationError lists every problem). */
 function errorMessage(err: unknown): string {
   return err instanceof Error ? `${err.name}: ${err.message}` : String(err);
@@ -312,7 +330,7 @@ async function runRoute(route: EvalRoute, expected: ExpectedVisa, goldenDir: str
         extracted,
         ...(meta ? { linkedSurcharges: meta } : {}),
         ...usageFields(),
-        score: scoreRoute(expected, output),
+        score: scoreRoute(expected, output, undefined, findMissingItems(extracted, doc.listItems ?? [])),
       };
     } catch (err) {
       const error = errorMessage(err);
@@ -370,6 +388,11 @@ export function printReport(res: EvalResultFile, log: (l: string) => void): void
     }
   }
   if (!any) log("  none");
+
+  // Issue #212: every page item the output missed (hard gate), as route, section, leadIn, text.
+  const misses = res.routes.flatMap((r) => (r.score.itemCoverageMisses ?? []).map((m) => ({ route: r.route, ...m })));
+  log(`\nItem coverage misses (hard gate): ${misses.length}`);
+  for (const m of misses) log(`  ${m.route}, ${m.section}, ${m.leadIn || "(no lead-in)"}, ${m.text}`);
 
   // Known gaps / notes never fail the run, but are always shown.
   const notes = res.routes.flatMap((r) => r.score.notes.map((n) => `  ${r.route}: ${n}`));
@@ -513,7 +536,16 @@ export async function main(argv: string[], deps: RunDeps = {}): Promise<number> 
       rescored.push({
         ...rec,
         ...(meta ? { linkedSurcharges: meta } : {}),
-        score: scoreRoute(expected, output, rec.error),
+        score: scoreRoute(
+          expected,
+          output,
+          rec.error,
+          // Issue #212: the coverage check on the replayed output (none for a failed
+          // extraction, or when the golden dir has no recorded guide to collect from).
+          rec.extracted && !rec.error && fs.existsSync(guidePath(rec.route, goldenDir))
+            ? await routeItemMisses(EVAL_ROUTES.find((r) => r.route === rec.route) as EvalRoute, goldenDir, rec.extracted)
+            : undefined
+        ),
       });
     }
     const res = buildResults(rescored, {
