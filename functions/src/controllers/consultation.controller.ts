@@ -6,6 +6,9 @@ import { agencyService } from "../services/agency.service";
 import { userService } from "../services/user.service";
 import { paystackProvider } from "../services/billing/paystack.provider";
 import { EMAIL_BRANDING } from "../services/email/branding";
+// Issue #181 review round 2: the shared Paystack lookup that treats a
+// never-opened checkout of ours as final unpaid (see lookupCheckoutState).
+import { lookupCheckoutState } from "../services/charge-checkout.service";
 // Issue #180: server-side pricing, quote lock, checkout and confirmation.
 import {
   bookingSummary,
@@ -493,10 +496,17 @@ export class ConsultationController {
         return;
       }
 
-      // An opened checkout: what does Paystack say about it?
-      if (consultation.transactionId && consultation.checkoutUrl) {
-        const result = await paystackProvider.getTransactionMetadata(consultation.transactionId);
-        const state = paystackState(result);
+      // A current checkout: what does Paystack say about it?
+      //
+      // Issue #181 review round 2 (shared with payment requests): asked
+      // whenever the booking carries a reference, not only when a URL was
+      // published, so a checkout that opened at Paystack but whose publish
+      // never landed is still checked for a payment before it is replaced.
+      // A `cons-` reference we claimed that Paystack never opened (initialize
+      // failed after the claim) answers `final_unpaid` (lookupCheckoutState)
+      // instead of a 502 on every retry; an outage is still 502.
+      if (consultation.transactionId) {
+        const { state, result } = await lookupCheckoutState(consultation.transactionId);
         // Paid after all: settle it, never re-charge.
         if (state === "paid") {
           const outcome = await settlePayment(id, consultation.transactionId, result!);
@@ -508,8 +518,8 @@ export class ConsultationController {
           this.sendPaymentInProgress(res, consultation);
           return;
         }
-        // Inside the lock: hand back the same checkout.
-        if (!isQuoteExpired(consultation)) {
+        // Inside the lock, with a published URL: hand back the same checkout.
+        if (consultation.checkoutUrl && !isQuoteExpired(consultation)) {
           sendSuccess(res, {
             requiresPayment: true,
             authorizationUrl: consultation.checkoutUrl,

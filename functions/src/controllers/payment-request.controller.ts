@@ -44,7 +44,13 @@ import {
   reissuePaymentRequestCheckout,
   requestChargeSummary,
 } from "../services/payment-request-charge.service";
-import { chargeRuntime, isPricingFailure, isQuoteExpired, paystackState } from "../services/charge-checkout.service";
+import {
+  chargeRuntime,
+  isPricingFailure,
+  isQuoteExpired,
+  lookupCheckoutState,
+  paystackState,
+} from "../services/charge-checkout.service";
 import { Timestamp } from "firebase-admin/firestore";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { collections } from "../utils/firebase";
@@ -473,9 +479,17 @@ class PaymentRequestController {
       // (Any request carrying a reference is checked, not only `approved`
       // ones: a pre-fix request may have been moved back to `pending` with
       // its checkout still open.)
+      //
+      // Issue #181 review round 2: through `lookupCheckoutState`, so a
+      // checkout we claimed but Paystack never opened (initialize failed
+      // after the claim: our `preq-` reference is stored, `checkoutUrl` is
+      // null) answers `final_unpaid` instead of a 502 on every retry. The
+      // lookup is still made (never skipped on `checkoutUrl` alone: a
+      // pre-#181 row has a Paystack reference, no `checkoutUrl` field, and a
+      // URL the client already holds). A Paystack outage still throws here
+      // and is answered 502 below, with nothing written.
       if (checkedReference) {
-        const result = await paystackProvider.getTransactionMetadata(checkedReference);
-        const state = paystackState(result);
+        const { state, result } = await lookupCheckoutState(checkedReference);
         if (state === "in_progress") return this.sendPaymentInProgress(res, request);
         if (state === "paid") {
           // The client has paid: record it (the settlement checks the exact
@@ -714,10 +728,16 @@ class PaymentRequestController {
         return sendError(res, "REQUEST_NOT_PAYABLE", "This payment request cannot be paid", 409);
       }
 
-      // An opened checkout: what does Paystack say about it?
-      if (request.paystackReference && request.checkoutUrl) {
-        const result = await paystackProvider.getTransactionMetadata(request.paystackReference);
-        const state = paystackState(result);
+      // A current checkout: what does Paystack say about it?
+      //
+      // Issue #181 review round 2: asked whenever the request carries a
+      // reference, not only when a URL was published, so a checkout that
+      // opened at Paystack but whose publish never landed is still checked
+      // for a payment before it is replaced. A reference we claimed that
+      // Paystack never opened answers `final_unpaid` (lookupCheckoutState)
+      // and a fresh checkout is issued below; an outage is still 502.
+      if (request.paystackReference) {
+        const { state, result } = await lookupCheckoutState(request.paystackReference);
         // Paid after all: settle it, never re-charge.
         if (state === "paid") {
           const outcome = await settlePaymentRequest(id, request.paystackReference, result!);
@@ -725,8 +745,8 @@ class PaymentRequestController {
         }
         // A payment may still land on it: keep it, do not re-quote.
         if (state === "in_progress") return this.sendPaymentInProgress(res, request);
-        // Inside the lock: hand back the same checkout.
-        if (!isQuoteExpired(request)) {
+        // Inside the lock, with a published URL: hand back the same checkout.
+        if (request.checkoutUrl && !isQuoteExpired(request)) {
           return sendSuccess(res, {
             requiresPayment: true,
             authorizationUrl: request.checkoutUrl,

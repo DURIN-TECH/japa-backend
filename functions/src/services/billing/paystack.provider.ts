@@ -19,6 +19,63 @@ import type { Money } from "../../types/money";
  */
 const PAYSTACK_BASE = "https://api.paystack.co";
 
+// ============================================
+// Classified Paystack errors (issue #181 review round 2)
+// ============================================
+
+/**
+ * What the Paystack client throws for every failed call. The message is the
+ * same `PAYSTACK_ERROR: <message> (HTTP <status>)` as before, so every
+ * existing `startsWith("PAYSTACK_ERROR")` check still maps it to 502; the
+ * fields let a caller look at what Paystack actually answered.
+ *
+ *  - `httpStatus`: Paystack's HTTP status, undefined when no response came
+ *    back at all (a network failure, a timeout, DNS);
+ *  - `providerMessage`: the `message` of Paystack's JSON error body;
+ *  - `providerCode`: the `code` of that body (e.g. `transaction_not_found`),
+ *    when Paystack sends one.
+ */
+export class PaystackApiError extends Error {
+  readonly httpStatus?: number;
+  readonly providerMessage?: string;
+  readonly providerCode?: string;
+
+  constructor(
+    message: string,
+    details: { httpStatus?: number; providerMessage?: string; providerCode?: string } = {}
+  ) {
+    super(message);
+    this.name = "PaystackApiError";
+    this.httpStatus = details.httpStatus;
+    this.providerMessage = details.providerMessage;
+    this.providerCode = details.providerCode;
+  }
+}
+
+/** Paystack's own messages for "there is no transaction with this reference". */
+const REFERENCE_NOT_FOUND_MESSAGES = /^(transaction reference not found|transaction not found)\.?$/i;
+
+/**
+ * Whether an error is Paystack's precise answer "there is no transaction
+ * with this reference" (transaction/verify on a reference it never saw).
+ *
+ * Paystack answers that with HTTP 400 (or 404) and the body
+ * `{ status: false, message: "Transaction reference not found", code:
+ * "transaction_not_found" }`. Only that exact answer counts: a network
+ * failure (no HTTP status), a 5xx, a 401 "Invalid key" or any other 4xx
+ * message is NOT "not found", and callers must keep failing closed on them.
+ *
+ * This says nothing about who made the reference: a caller only treats it as
+ * "never opened" for a reference it generated itself (see
+ * `lookupCheckoutState` in charge-checkout.service.ts).
+ */
+export function isPaystackReferenceNotFound(err: unknown): boolean {
+  if (!(err instanceof PaystackApiError)) return false;
+  if (err.httpStatus !== 400 && err.httpStatus !== 404) return false;
+  if (err.providerCode === "transaction_not_found") return true;
+  return !!err.providerMessage && REFERENCE_NOT_FOUND_MESSAGES.test(err.providerMessage.trim());
+}
+
 interface PaystackInitData {
   authorization_url: string;
   access_code: string;
@@ -57,13 +114,23 @@ export class PaystackProvider implements BillingProvider {
       (err) => {
         // Prefer Paystack's structured error body; fall back to the axios message.
         const status = axios.isAxiosError(err) ? err.response?.status : undefined;
-        const providerMsg =
-          (axios.isAxiosError(err) &&
-            (err.response?.data as { message?: string } | undefined)?.message) ||
-          (err as Error)?.message ||
-          "unknown error";
-        throw new Error(
-          `PAYSTACK_ERROR: ${providerMsg}${status ? ` (HTTP ${status})` : ""}`
+        const body = axios.isAxiosError(err)
+          ? (err.response?.data as { message?: unknown; code?: unknown } | undefined)
+          : undefined;
+        const bodyMessage = typeof body?.message === "string" ? body.message : undefined;
+        const providerMsg = bodyMessage || (err as Error)?.message || "unknown error";
+        // Issue #181 review round 2: a classified error, not a bare Error, so
+        // a caller can tell Paystack's precise "no such transaction" answer
+        // apart from an outage (see `isPaystackReferenceNotFound`). The
+        // message keeps the `PAYSTACK_ERROR: ...` shape every controller
+        // already maps to 502.
+        throw new PaystackApiError(
+          `PAYSTACK_ERROR: ${providerMsg}${status ? ` (HTTP ${status})` : ""}`,
+          {
+            httpStatus: status,
+            providerMessage: bodyMessage,
+            providerCode: typeof body?.code === "string" ? body.code : undefined,
+          }
         );
       }
     );

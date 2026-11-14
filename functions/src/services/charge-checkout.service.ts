@@ -8,7 +8,11 @@ import { resolveChargeCurrency } from "../money/config";
 import { getCurrencyInfo } from "../money/currencies";
 import { isMoneyError } from "../money/errors";
 import type { RateService } from "../money/rate.service";
-import { paystackProvider, PaystackTransactionLookup } from "./billing/paystack.provider";
+import {
+  isPaystackReferenceNotFound,
+  paystackProvider,
+  PaystackTransactionLookup,
+} from "./billing/paystack.provider";
 
 // ============================================
 // CHARGING A DOLLAR PRICE THROUGH A PAYSTACK CHECKOUT (shared, issue #181)
@@ -189,6 +193,63 @@ export function paystackState(lookup: PaystackTransactionLookup | null): Paystac
   if (lookup.status === "success") return "paid";
   if (REPLACEABLE_STATUSES.has(lookup.status)) return "final_unpaid";
   return "in_progress";
+}
+
+/**
+ * Whether `reference` is one WE generated for a checkout
+ * (`newPrefixedReference`: `preq-<id>-<uuid>` for a payment request,
+ * `cons-<id>-<uuid>` for a consultation). A Paystack-generated reference
+ * (pre-#180 bookings, pre-#181 requests) never matches.
+ */
+const OWN_REFERENCE =
+  /^(preq|cons)-[A-Za-z0-9]*-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isOwnCheckoutReference(reference: string): boolean {
+  return OWN_REFERENCE.test(reference);
+}
+
+/**
+ * Ask Paystack about a record's current checkout and classify the answer
+ * (`paystackState`). Issue #181 review round 2.
+ *
+ * Why not just `paystackState(await getTransactionMetadata(ref))`: the
+ * charge path stores OUR reference in the claim BEFORE Paystack's
+ * transaction/initialize (claim -> open -> publish). When initialize fails
+ * (an outage, a timeout) or the function dies between the claim and the
+ * open, the record keeps a reference Paystack has never seen. Paystack's
+ * verify then answers HTTP 400 "Transaction reference not found", which the
+ * client turns into a PAYSTACK_ERROR, and every cancel / re-checkout of that
+ * record failed with 502 forever.
+ *
+ * So, for a reference we generated ONLY, Paystack's precise "not found"
+ * answer means "that checkout was never opened": nobody can have paid it,
+ * and it is `final_unpaid` (replaceable, cancellable). Its URL was never
+ * handed out either: the publish step only runs after a successful open.
+ *
+ * Everything else still fails closed (the error is rethrown, the controller
+ * answers 502 and changes nothing):
+ *  - a network failure, a timeout or a Paystack 5xx;
+ *  - any other 4xx (e.g. 401 "Invalid key");
+ *  - "not found" for a reference Paystack generated: that one Paystack did
+ *    issue, so "not found" there is an anomaly, not proof of "unpaid".
+ *
+ * @param reference the record's current checkout reference
+ * @returns the state, and Paystack's lookup (null when there is none)
+ */
+export async function lookupCheckoutState(
+  reference: string
+): Promise<{ state: PaystackState; result: PaystackTransactionLookup | null }> {
+  try {
+    const result = await paystackProvider.getTransactionMetadata(reference);
+    return { state: paystackState(result), result };
+  } catch (err) {
+    if (isOwnCheckoutReference(reference) && isPaystackReferenceNotFound(err)) {
+      console.warn(
+        `[charge-checkout] ${reference} is unknown at Paystack (never opened); treating it as final unpaid`
+      );
+      return { state: "final_unpaid", result: null };
+    }
+    throw err;
+  }
 }
 
 // ============================================
