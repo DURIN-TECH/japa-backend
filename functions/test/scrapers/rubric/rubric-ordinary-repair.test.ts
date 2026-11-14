@@ -689,3 +689,67 @@ describe("budget and shares with replacements (#244)", () => {
     assert.deepEqual(report.excludedCriterionIds, ["crit-0001", "crit-0002", "crit-0003", "crit-0004"]);
   });
 });
+
+// ============================================
+// Settings, the offline estimate, containment
+// ============================================
+
+describe("settings, estimate and containment (#244)", () => {
+  test("the new settings: names, defaults, ranges; the request cap is 200", async () => {
+    const { resolvePublishSettings, DEFAULT_CHECKER_CAPS } = await import("../../../src/scrapers/rubric/rubric-publish-settings");
+    const d = resolvePublishSettings({}).settings;
+    assert.equal(d.ordinaryRepairMaxShare, 0.2);
+    assert.equal(d.ordinaryRepairMaxRules, 80);
+    assert.equal(d.checkerMaxRequestsPerRun, 200);
+    assert.equal(DEFAULT_CHECKER_CAPS.checkerMaxRequestsPerRun, 200);
+    // Everything else stays as it was.
+    assert.deepEqual({ r: d.checkerMaxRulesPerDraft, c: d.checkerMaxInputCharsPerRun, o: d.checkerMaxOutputTokensPerRequest, day: d.checkerMaxRunsPerDay, t: d.checkerRequestTimeoutMs, p: d.repairMaxRulesPerRun, l: d.maxLeftOutShare, pl: d.maxPrimaryLeftOutShare }, { r: 1000, c: 2_000_000, o: 8000, day: 20, t: 240_000, p: 5, l: 0.15, pl: 0.2 });
+    const ok = resolvePublishSettings({ ordinaryRepairMaxShare: 0.5, ordinaryRepairMaxRules: 0 });
+    assert.equal(ok.settings.ordinaryRepairMaxShare, 0.5);
+    assert.equal(ok.settings.ordinaryRepairMaxRules, 0);
+    assert.deepEqual(ok.problems, []);
+    for (const bad of [{ ordinaryRepairMaxShare: 1.5 }, { ordinaryRepairMaxShare: -0.1 }, { ordinaryRepairMaxRules: 501 }, { ordinaryRepairMaxRules: 1.5 }, { ordinaryRepairMaxRules: "9" }]) {
+      const r = resolvePublishSettings(bad);
+      assert.equal(r.problems.length, 1, JSON.stringify(bad));
+      assert.equal(r.settings.ordinaryRepairMaxShare, 0.2);
+      assert.equal(r.settings.ordinaryRepairMaxRules, 80);
+    }
+  });
+
+  test("the offline estimate counts eligible rules with the production test, applies the guard and states shares per assumption", async () => {
+    const { estimateOrdinaryRepair } = await import("../../../src/scrapers/rubric/rubric-verdict-replay");
+    const mk = (n: number, letters: string, over: Record<string, unknown> = {}) => ({ id: `r${n}`, kind: "judgement", applicability: "all_applicants", sourceId: "s", verdicts: { verification: letters }, leftOut: null, ...over }) as any;
+    // 20 rules: 2 found wrong (title no), 1 unsure only, 1 code leave-out that is also wrong, 16 fine.
+    const rows = [mk(1, "nyyyaa"), mk(2, "yyyuaa"), mk(3, "nyyyaa"), mk(4, "nyyyaa", { leftOut: "list_not_readable" }), ...Array.from({ length: 16 }, (_, i) => mk(i + 5, "yyyyaa"))];
+    const settings = { ordinaryRepairMaxShare: 0.2, ordinaryRepairMaxRules: 80, checkerMaxRequestsPerRun: 200, maxLeftOutShare: 0.15, maxPrimaryLeftOutShare: 0.2 };
+    const e = estimateOrdinaryRepair(rows, new Set(["s"]), settings, [0, 0.5, 1]);
+    assert.deepEqual(e.eligibleIds, ["r1", "r3"], "an unsure-only rule and a code leave-out are not eligible");
+    assert.equal(e.guard, "ok");
+    assert.equal(e.requests.redraft, 2);
+    assert.equal(e.before.overall.counted, 4, "r1, r2, r3 and the code leave-out");
+    assert.equal(e.scenarios[1].overall.counted, 3, "half of the two repaired");
+    assert.equal(e.scenarios[2].overall.counted, 2);
+    assert.equal(e.scenarios[0].withinBudget, false);
+    // The guard: a tighter share skips every re-draft, and no repair is assumed.
+    const tight = estimateOrdinaryRepair(rows, new Set(["s"]), { ...settings, ordinaryRepairMaxShare: 0.05 }, [1]);
+    assert.equal(tight.guard, "too_many");
+    assert.equal(tight.requests.redraft, 0);
+    assert.equal(tight.scenarios[0].overall.counted, 4);
+  });
+
+  test("containment: the covered-duplicate reason and the ordinary-repair settings are named only where they are decided or applied", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const src = path.join(__dirname, "..", "..", "..", "src");
+    const walk = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : e.name.endsWith(".ts") ? [path.join(dir, e.name)] : []));
+    const users = (re: RegExp) => walk(src).filter((f) => re.test(fs.readFileSync(f, "utf8"))).map((f) => path.relative(src, f)).sort();
+    // EXPLICIT (#244): the reason is defined with the repair helpers, written by the check, and read by the gates.
+    assert.deepEqual(users(/REDRAFT_DUPLICATE_REASON/), [path.join("scrapers", "rubric", "rubric-checker.ts"), path.join("scrapers", "rubric", "rubric-gates.ts"), path.join("scrapers", "rubric", "rubric-repair.ts")]);
+    // The two caps are read by the check (and the offline estimate that mirrors it), defined with the settings.
+    assert.deepEqual(users(/ordinaryRepairMax(Share|Rules)/), [path.join("scrapers", "rubric", "rubric-checker.ts"), path.join("scrapers", "rubric", "rubric-publish-settings.ts"), path.join("scrapers", "rubric", "rubric-verdict-replay.ts"), path.join("scrapers", "rubric", "scripts", "replay-check-verdicts.ts")]);
+    // Nothing here names a country, nationality or route (the generic rule).
+    for (const f of ["rubric-checker.ts", "rubric-repair.ts", "rubric-verdict-replay.ts"]) {
+      assert.ok(!/\b(united kingdom|ireland|canada|nigeria|schengen|visitor)\b/i.test(fs.readFileSync(path.join(src, "scrapers", "rubric", f), "utf8")), f);
+    }
+  });
+});

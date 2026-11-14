@@ -22,7 +22,8 @@
 
 import type { AssessmentCriterion } from "../../types/rubric";
 import { decodeRow } from "./rubric-checker-prompt";
-import { judgeRule, leaveOutBasis } from "./rubric-checker";
+import { estimateCheckerLoad, judgeRule, leaveOutBasis, ordinaryRepairAspects } from "./rubric-checker";
+import { CHECKER_BATCH_SIZE, CHECKER_TRIGGER_BATCH_SIZE } from "./rubric-checker-prompt";
 import { isProtectedRule, isScopedRule } from "./rubric-gates";
 
 /** The duplicate flag code: a duplicate is left out but never counted against the budget (as in the gates). */
@@ -122,5 +123,107 @@ export function replayVerdicts(rules: readonly ReplayRule[], primarySourceIds: R
     heldProtected,
     nowKept,
     leftOutIds,
+  };
+}
+
+// ============================================
+// (#244) What the ordinary re-draft would do to a stored run
+// ============================================
+//
+// From the same stored verdicts: which ordinary rules the check found WRONG (a `no` on title, kind, condition or
+// check; the PRODUCTION test `ordinaryRepairAspects`), whether the systemic guard would let any be re-drafted, how
+// many requests a run would make against the cap, and what the leave-out shares would be if a stated share of the
+// re-drafts were repaired and confirmed. Zero requests: nothing is asked of a model, so the "repaired" share is an
+// ASSUMPTION the caller states (the live trial repaired 6 of 12), never a measurement.
+//
+// Simplifications, stated: a repaired rule is assumed to keep its group and source (a replacement may quote another
+// line, but it keeps the original's scope); covered duplicates are not modelled (they would only lower the counts);
+// repairs are spread over the groups in proportion to each group's eligible rules (expected values, so the shares
+// are fractional). The leave-out budget limits are the gates' own, passed in.
+
+/** The settings the estimate reads (the real names; see `RubricPublishSettings`). */
+export interface RepairEstimateSettings {
+  ordinaryRepairMaxShare: number;
+  ordinaryRepairMaxRules: number;
+  checkerMaxRequestsPerRun: number;
+  maxLeftOutShare: number;
+  maxPrimaryLeftOutShare: number;
+}
+
+/** Shares of one repair-success assumption. `counted` / `of` are expected values (fractional). */
+export interface RepairScenario {
+  successRate: number;
+  overall: { counted: number; of: number; share: number };
+  general: { counted: number; of: number; share: number };
+  scoped: { counted: number; of: number; share: number };
+  primary: { counted: number; of: number; share: number };
+  // True when every share is within its limit (the budget would pass; other gates not modelled).
+  withinBudget: boolean;
+}
+
+/** The estimate for one stored run. */
+export interface RepairEstimate {
+  eligible: number;
+  eligibleIds: string[];
+  // Eligible by group / primary, for reading the scenarios.
+  eligibleBy: { general: number; scoped: number; primary: number };
+  // "ok": re-drafts would run; "too_many": the guard skips them all (the run records ordinary_repair_skipped:too_many).
+  guard: "ok" | "too_many";
+  requests: { baseCheck: number; redraft: number; replacementCheck: number; total: number; cap: number; fitsCap: boolean };
+  // Left out before any repair, counted against the budget (the replay's own figure).
+  before: RepairScenario;
+  scenarios: RepairScenario[];
+}
+
+/** Estimate the ordinary re-draft for stored verdicts. `rates` are the assumed shares of re-drafts repaired and confirmed. */
+export function estimateOrdinaryRepair(rules: readonly ReplayRule[], primarySourceIds: ReadonlySet<string>, settings: RepairEstimateSettings, rates: readonly number[]): RepairEstimate {
+  const replay = replayVerdicts(rules, primarySourceIds);
+  const byId = new Map(rules.map((r) => [r.id, r]));
+  const groupOf = (id: string): "scoped" | "general" => (isScopedRule({ applicability: byId.get(id)?.applicability }) ? "scoped" : "general");
+  const isPrimary = (id: string): boolean => primarySourceIds.has(byId.get(id)?.sourceId as string);
+  // Eligible: left out by the CHECK (a code leave-out keeps its own reason) with a `no` on one of the four aspects.
+  const eligibleIds = Object.entries(replay.leftOutIds)
+    .filter(([id, reason]) => {
+      if (!reason.startsWith("checker:")) return false;
+      const r = byId.get(id) as ReplayRule;
+      if (isProtectedRule(r as unknown as AssessmentCriterion)) return false;
+      const row = r.verdicts?.verification ? decodeRow(r.verdicts.verification) ?? undefined : undefined;
+      return ordinaryRepairAspects(r as unknown as AssessmentCriterion, row) !== null;
+    })
+    .map(([id]) => id);
+  const eligibleBy = { general: eligibleIds.filter((id) => groupOf(id) === "general").length, scoped: eligibleIds.filter((id) => groupOf(id) === "scoped").length, primary: eligibleIds.filter(isPrimary).length };
+  const guard = eligibleIds.length > rules.length * settings.ordinaryRepairMaxShare || eligibleIds.length > settings.ordinaryRepairMaxRules ? "too_many" : "ok";
+  // Requests: the check of the whole draft (protected rules twice, the polarity readings), then one re-draft per eligible
+  // rule and the check of the replacements (one batch per 10, its trigger batches per 10, 2 requests of slack).
+  const protectedCount = rules.filter((r) => isProtectedRule(r as unknown as AssessmentCriterion)).length;
+  const triggerRules = rules.filter((r) => (r as unknown as { trigger?: unknown }).trigger !== undefined).length;
+  const base = estimateCheckerLoad(rules.length, protectedCount, 2, triggerRules).requests;
+  const redraft = guard === "ok" ? eligibleIds.length : 0;
+  const triggered = eligibleIds.filter((id) => (byId.get(id) as unknown as { trigger?: unknown }).trigger !== undefined).length;
+  const recheck = guard === "ok" && redraft > 0 ? Math.ceil(redraft / CHECKER_BATCH_SIZE) + Math.ceil(triggered / CHECKER_TRIGGER_BATCH_SIZE) + 2 : 0;
+  const total = base + redraft + recheck;
+  const scenario = (rate: number): RepairScenario => {
+    // `rate` of the eligible rules (when the guard lets them be re-drafted) stop counting, spread in proportion to the groups.
+    const fixed = guard === "ok" ? rate : 0;
+    const left = (counted: number, eligible: number): number => counted - fixed * eligible;
+    const countedIds = Object.entries(replay.leftOutIds).filter(([, reason]) => reason !== "possible_duplicate").map(([id]) => id);
+    const part = (pred: (id: string) => boolean) => ({ counted: left(countedIds.filter(pred).length, eligibleIds.filter(pred).length), of: rules.filter((r) => pred(r.id)).length });
+    const overall = part(() => true);
+    const general = part((id) => groupOf(id) === "general");
+    const scoped = part((id) => groupOf(id) === "scoped");
+    const primary = part(isPrimary);
+    const share = (x: { counted: number; of: number }) => ({ ...x, share: x.of > 0 ? x.counted / x.of : 0 });
+    const out = { successRate: rate, overall: share(overall), general: share(general), scoped: share(scoped), primary: share(primary) };
+    const withinBudget = out.overall.share <= settings.maxLeftOutShare && out.general.share <= settings.maxLeftOutShare && out.scoped.share <= settings.maxLeftOutShare && out.primary.share <= settings.maxPrimaryLeftOutShare;
+    return { ...out, withinBudget };
+  };
+  return {
+    eligible: eligibleIds.length,
+    eligibleIds,
+    eligibleBy,
+    guard,
+    requests: { baseCheck: base, redraft, replacementCheck: recheck, total, cap: settings.checkerMaxRequestsPerRun, fitsCap: total <= settings.checkerMaxRequestsPerRun },
+    before: scenario(0),
+    scenarios: rates.map(scenario),
   };
 }
