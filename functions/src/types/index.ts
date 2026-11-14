@@ -1787,3 +1787,37 @@ export interface AiMessageAccessAuditRecord {
 
 // Money, exchange-rate and charge-snapshot types (issue #178)
 export * from "./money";
+
+// ============================================
+// Feedback (issue #257)
+// ============================================
+
+/** What the tester is reporting. */
+export type FeedbackKind = "bug" | "idea";
+
+/**
+ * One in-app feedback note, stored in the backend-only `feedback` collection.
+ * `userId`, `userEmail` and `role` come from the verified token, never from the
+ * request body; the rest is validated client input.
+ */
+export interface Feedback {
+  id?: string;
+  userId: string;
+  userEmail: string;
+  role: string;
+  kind: FeedbackKind;
+  /** Trimmed, 1 to 2000 characters. */
+  message: string;
+  /** Screen the tester was on (route path only, no params), max 200 chars. */
+  route: string;
+  appVersion: string;
+  platform: string;
+  osVersion: string;
+  /** App environment the build points at (dev/prod). */
+  appEnv: string;
+  /** Private storage key of the screenshot, or null when none was sent. */
+  screenshotPath: string | null;
+  /** Triage state; the team edits this in the console. */
+  status: "new";
+  createdAt: Timestamp;
+}

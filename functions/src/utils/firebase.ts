@@ -93,6 +93,12 @@ export const collections = {
   // Paystack reference. Backend only: firestore.rules denies every client.
   consultationPaymentExceptions: db.collection("consultationPaymentExceptions"),
   notifications: db.collection("notifications"),
+  // In-app tester feedback (issue #257): one doc per note (userId, kind, message,
+  // route, app/device info, optional screenshotPath, status "new"). Written and
+  // read by the backend only; firestore.rules denies every client explicitly
+  // and test/emulator/backend-only-collections.emu.ts pins it. The rate limit
+  // counts by userId + createdAt (composite index in firestore.indexes.json).
+  feedback: db.collection("feedback"),
   // Audit trail of outbound multi-channel deliveries (email/sms/push) attempted by
   // the unified notifier. Email/SMS are currently stubbed, so this collection is the
   // record that a message "would have been" sent; it becomes a real delivery log once

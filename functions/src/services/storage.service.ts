@@ -230,6 +230,42 @@ export class StorageService {
   }
 
   /**
+   * Generate a signed upload URL for a feedback screenshot (issue #257).
+   *
+   * Same two-step flow as the profile photo: the client PUTs the image to this
+   * short-lived URL, then sends the returned `storagePath` with the feedback
+   * note. Unlike a profile photo the object is NEVER made public: the team
+   * reads it through a signed download link in the feedback email, and
+   * storage.rules has no match for `users/{uid}/feedback/` (deny by default).
+   */
+  async getSignedFeedbackScreenshotUploadUrl(
+    userId: string,
+    fileName: string,
+    contentType: string
+  ): Promise<{
+    uploadUrl: string;
+    storagePath: string;
+    expiresAt: Date;
+  }> {
+    // users/{uid}/feedback/{uuid}_{file}
+    const storagePath = buildIssuedPath({ purpose: "feedback-screenshot", userId }, fileName);
+
+    const file = this.bucket.file(storagePath);
+
+    // Short-lived (15 min) write URL, bound to the declared content type.
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    const [uploadUrl] = await file.getSignedUrl({
+      version: "v4",
+      action: "write",
+      expires: expiresAt,
+      contentType,
+    });
+
+    return { uploadUrl, storagePath, expiresAt };
+  }
+
+  /**
    * Mint a durable, publicly-fetchable download URL for an uploaded object.
    *
    * Agency logos are rendered persistently in the portal chrome (sidebar) on

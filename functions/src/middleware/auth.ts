@@ -131,7 +131,13 @@ export async function verifyAuth(
     // any mount prefix. Keep this list tiny and security-scoped.
     const path = req.originalUrl.split("?")[0];
     const method = req.method.toUpperCase();
+    // Feedback (#257): a tester on a lapsed plan can still report a bug, and a
+    // bug about the lapsed plan itself is exactly what we want to hear. Exact
+    // routes, POST only; the endpoints are rate limited per user.
+    const isFeedbackWrite =
+      method === "POST" && (path.endsWith("/feedback") || path.endsWith("/feedback/screenshot-url"));
     const isAccountSecurityWrite =
+      isFeedbackWrite ||
       path.endsWith("/users/me/password-changed") ||
       path.endsWith("/users/me/change-email") ||
       (method === "DELETE" && path.endsWith("/users/me")) ||
