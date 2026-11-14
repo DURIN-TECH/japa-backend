@@ -452,6 +452,10 @@ export interface RubricSourceSnapshot {
   url: string;
   docType: "html" | "pdf";
   publishedDate?: string;
+  // (#220) The language the source was registered in (a code), when one was declared. Lets every
+  // later reader of the version (the independent check and its re-draft) read the document's
+  // numbers and dates in its own language. Absent = the product language.
+  language?: string;
 }
 
 /**

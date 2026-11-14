@@ -21,6 +21,7 @@ import { CHECKER_ASPECTS, CHECKER_POLARITY_SYSTEM_PROMPT, CHECKER_PROMPT_VERSION
 import { RubricCheckerService } from "../../../src/scrapers/rubric/rubric-checker";
 import { EVIDENCE_SYSTEM_PROMPT, QUESTION_ASPECTS, QUESTION_CHECK_PROMPT_VERSION, QUESTION_SYSTEM_PROMPT, runQuestionCheck } from "../../../src/scrapers/rubric/rubric-question-check";
 import { type AssessmentCriterion, type IntakeQuestion, type VisaRubric } from "../../../src/types/rubric";
+import { answer, crit, criteriaWire } from "./rubric-harness";
 import { MemoryLedger, ScriptedProvider, SRC_HASH, SRC_ID, seenRules, seenSentence, settingsWith } from "./checker-fakes";
 import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
 
@@ -129,6 +130,26 @@ describe("the rule check over a Spanish rule", () => {
     const out = await r.svc.check(input(rubricOf([rule("c1", "Stays 30 consecutive days", Q_DAYS), rule("c2", "Aged 18 or over", Q_AGE), rule("c3", "Fee of 1,000.50 units", Q_FEE), rule("c5", "Documents when travelling with minors", Q_COND, { applicability: "conditional", applicabilityCondition: "Si el solicitante viaja con menores" })])));
     assert.equal(out.ok, true);
     if (out.ok) assert.deepEqual(out.leftOut, []);
+  });
+
+  test("the one-rule re-draft of a failed Spanish bar is validated in Spanish (the Spanish date is read) and can be confirmed", async () => {
+    const r = rig();
+    r.provider.policy = ({ rule: seen }) => (seen.title.startsWith("REPLACED") ? undefined : seen.appliesTo ? { group_matches_codes: "no" } : undefined);
+    r.provider.redraftPolicy = () =>
+      criteriaWire(answer({ criteria: [crit({ ref: "r", title: "REPLACED nationals refused", kind: "mandatory_bar", stage: "suitability", quote: Q_BAR, appliesTo: { nationalities: ["QM", "QN"], asWritten: ["Borduria", "Syldavia"] }, validFrom: "2024-03-12" })] }));
+    const bar = rule("c9", "Nationals refused", Q_BAR, { kind: "mandatory_bar", stage: "suitability", appliesTo: { nationalities: ["QM", "QN"], asWritten: ["Borduria", "Syldavia"] } });
+    const rubric = rubricOf([bar]);
+    (rubric as any).sourceSnapshots = [{ sourceId: SRC_ID, contentHash: SRC_HASH, url: "https://rules.example/es", docType: "html", language: "es" }];
+    const out = await r.svc.check(input(rubric));
+    assert.equal(out.ok, true, JSON.stringify(out));
+    if (out.ok) assert.equal(out.repairs?.length, 1, "the replacement passed the Spanish code validation and the check");
+
+    // The same version with NO recorded language reads the quote with the product language's rules: the date is unreadable, the re-draft is refused.
+    const r2 = rig();
+    r2.provider.policy = r.provider.policy;
+    r2.provider.redraftPolicy = r.provider.redraftPolicy;
+    const out2 = await r2.svc.check(input(rubricOf([bar])));
+    assert.equal(out2.ok, false);
   });
 
   test("the intention-to-stay reading is still shown ONLY the quote (Spanish, verbatim)", async () => {

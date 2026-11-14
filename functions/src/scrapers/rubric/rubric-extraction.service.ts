@@ -1526,6 +1526,8 @@ export class RubricExtractionService {
         url: meta.finalUrl || meta.url,
         docType: meta.docType,
         ...(meta.publishedDate ? { publishedDate: meta.publishedDate } : {}),
+        // (#220) Kept on the snapshot record too, so it travels with the version.
+        ...(typeof source.language === "string" && source.language.trim() ? { language: source.language.trim() } : {}),
       },
       retrievedAt: meta.fetchedAt.toDate().toISOString(),
       role: source.role === "primary" || source.role === "route_guidance" ? source.role : "secondary",

@@ -32,6 +32,7 @@ import {
   type VerdictRow,
 } from "./rubric-checker-prompt";
 import { loadPublishSettings, type LoadedPublishSettings, type RubricPublishSettings } from "./rubric-publish-settings";
+import { lexiconFor } from "../language/language-lexicon";
 import { SnapshotQuoteIndex } from "./rubric-quote";
 import { quoteIsLeadIn, verifyListItems } from "./rubric-list-items";
 import { RubricExtractionService, RunStop, isTransientProviderError, type RedraftOutcome } from "./rubric-extraction.service";
@@ -536,7 +537,7 @@ export class RubricCheckerService {
     // ---- the official text around each quote (its cited snapshot, bounded) ----
     // One cache of prepared snapshots for the whole run (the check and any re-draft read each once).
     const indexes = new Map<string, Promise<SnapshotQuoteIndex>>();
-    const views = await this.at(stage, "snapshot_read", () => this.buildViews(rules, indexes));
+    const views = await this.at(stage, "snapshot_read", () => this.buildViews(rules, indexes, rubric));
 
     // ---- who is protected, and who cannot be read ----
     const protectedRules = rules.filter(isProtectedRule);
@@ -799,7 +800,7 @@ export class RubricCheckerService {
     // ---- 4. the replacements are checked by both models, and judged by the same table ----
     const repairs: RubricRuleRepair[] = [];
     if (pendingCheck.length > 0 && !infra) {
-      const views = await this.at(ctx.stage, "snapshot_read", () => this.buildViews(pendingCheck, ctx.indexes));
+      const views = await this.at(ctx.stage, "snapshot_read", () => this.buildViews(pendingCheck, ctx.indexes, ctx.input.rubric));
       const checkable = pendingCheck.filter((r) => views.has(r.criterionId));
       for (const r of pendingCheck) if (!views.has(r.criterionId)) setFailure(r.criterionId, "invalid_redraft", "quote_unverifiable");
       const triggered = checkable.filter((r) => r.trigger !== undefined && isValidTrigger(r.trigger, p.questions));
@@ -858,7 +859,7 @@ export class RubricCheckerService {
       const key = `${rule.source.sourceId}:${rule.source.contentHash}`;
       let ready = ctx.indexes.get(key);
       if (!ready) {
-        ready = this.deps.readSnapshot(rule.source.sourceId, rule.source.contentHash).then((c) => new SnapshotQuoteIndex(c));
+        ready = this.deps.readSnapshot(rule.source.sourceId, rule.source.contentHash).then((c) => indexInItsLanguage(c, ctx.input.rubric, rule.source.sourceId));
         ctx.indexes.set(key, ready);
       }
       return ready;
@@ -912,12 +913,12 @@ export class RubricCheckerService {
    * absent from the result (it cannot be verified). A snapshot that cannot be
    * READ throws: the official text is unavailable, not the rule unfaithful.
    */
-  private async buildViews(rules: readonly AssessmentCriterion[], indexes: Map<string, Promise<SnapshotQuoteIndex>> = new Map()): Promise<Map<string, CheckerRuleView>> {
+  private async buildViews(rules: readonly AssessmentCriterion[], indexes: Map<string, Promise<SnapshotQuoteIndex>> = new Map(), rubric?: Pick<VisaRubric, "sourceSnapshots">): Promise<Map<string, CheckerRuleView>> {
     const indexOf = (sourceId: string, hash: string): Promise<SnapshotQuoteIndex> => {
       const key = `${sourceId}:${hash}`;
       let p = indexes.get(key);
       if (!p) {
-        p = this.deps.readSnapshot(sourceId, hash).then((c) => new SnapshotQuoteIndex(c));
+        p = this.deps.readSnapshot(sourceId, hash).then((c) => indexInItsLanguage(c, rubric, sourceId));
         indexes.set(key, p);
       }
       return p;
@@ -1134,6 +1135,16 @@ export class RubricCheckerService {
     };
     await this.at(ctx.stage, "ledger", () => this.deps.ledger.save(record));
   }
+}
+
+/**
+ * (#220) A snapshot prepared for lookups, read in the language its source was
+ * registered in (recorded on the version's `sourceSnapshots`). The language
+ * decides how numbers and dates in a quote are read, which the one-rule
+ * re-draft validates with; locating a quote is language neutral.
+ */
+function indexInItsLanguage(content: GuidanceSnapshotContent, rubric: Pick<VisaRubric, "sourceSnapshots"> | undefined, sourceId: string): SnapshotQuoteIndex {
+  return new SnapshotQuoteIndex(content, lexiconFor(rubric?.sourceSnapshots?.find((s) => s.sourceId === sourceId)?.language));
 }
 
 /** Everything one run shares. */
