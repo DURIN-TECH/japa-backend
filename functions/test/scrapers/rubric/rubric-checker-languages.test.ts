@@ -20,7 +20,7 @@ import type { LlmProvider, LlmRequest, LlmResponse } from "../../../src/services
 import { CHECKER_ASPECTS, CHECKER_POLARITY_SYSTEM_PROMPT, CHECKER_PROMPT_VERSION, CHECKER_SYSTEM_PROMPT, buildVerdictSchema } from "../../../src/scrapers/rubric/rubric-checker-prompt";
 import { RubricCheckerService } from "../../../src/scrapers/rubric/rubric-checker";
 import { EVIDENCE_SYSTEM_PROMPT, QUESTION_ASPECTS, QUESTION_CHECK_PROMPT_VERSION, QUESTION_SYSTEM_PROMPT, runQuestionCheck } from "../../../src/scrapers/rubric/rubric-question-check";
-import { RUBRIC_SCHEMA_VERSION, type AssessmentCriterion, type IntakeQuestion, type VisaRubric } from "../../../src/types/rubric";
+import { type AssessmentCriterion, type IntakeQuestion, type VisaRubric } from "../../../src/types/rubric";
 import { MemoryLedger, ScriptedProvider, SRC_HASH, SRC_ID, seenRules, seenSentence, settingsWith } from "./checker-fakes";
 import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
 
@@ -97,7 +97,7 @@ describe("the rule check over a Spanish rule", () => {
     const out = await r.svc.check(input(rubricOf([rule("c1", "Stays 30 consecutive days", Q_DAYS), rule("c2", "Aged 18 or over", Q_AGE)])));
     assert.equal(out.ok, true);
     const seen = r.provider.requests.flatMap((q) => ((q.schema as any).properties.verdicts ? seenRules(q) : []));
-    const first = seen.find((x) => x.title === "Stays 30 consecutive days");
+    const first = seen.find((x) => x.title === "Stays 30 consecutive days")!;
     assert.equal(first.quote, Q_DAYS, "the original, not a translation");
     assert.match(first.textBefore, /Art\. 1\./);
     assert.ok(r.provider.requests.every((q) => q.system !== undefined && !/UNOFFICIAL-EN/.test(q.user)));

@@ -440,7 +440,7 @@ let regionNames: Intl.DisplayNames | undefined;
  */
 export function regionDisplayName(code: string): string {
   try {
-    regionNames ??= new Intl.DisplayNames(["en"], { type: "region" });
+    regionNames ??= new Intl.DisplayNames([productLanguageCode()], { type: "region" });
     return regionNames.of(code) ?? code;
   } catch {
     return code;
