@@ -699,7 +699,7 @@ describe("an ordinary rule found wrong is repaired once, through the pipeline (#
     w.provider.redraftPolicy = renewed;
     const planner = plannerStub();
     const planned: any[] = [];
-    const spyPlanner = { plan: async (i: any) => (planned.push(i), planner.plan()) } as any;
+    const spyPlanner = { plan: async (i: any) => (planned.push(i), planner.plan(i)) } as any;
     const r = await trigger(service({ checker: w.checker, planner: spyPlanner }));
 
     assert.equal(r?.outcome, "published", JSON.stringify(r?.reasonCodes));
