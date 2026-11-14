@@ -232,7 +232,7 @@ export function applyExclusions<T extends Filterable>(input: T): T {
  * An ordinary rule with a dropped trigger keeps its pre-#248 handling (#248 changes no ordinary
  * rule). Any other protected rule is never in the list: the check holds it as before.
  */
-function isJudgedBarShape(c: Pick<AssessmentCriterion, "kind">): boolean {
+export function isJudgedBarShape(c: Pick<AssessmentCriterion, "kind">): boolean {
   return c.kind === "mandatory_bar";
 }
 

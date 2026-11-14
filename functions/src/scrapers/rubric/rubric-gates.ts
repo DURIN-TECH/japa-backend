@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import type { AssessmentCriterion, IntakeQuestion, LeaveOutBasis, RubricPublishGateResult, RubricPublishLeftOut } from "../../types/rubric";
 import { isValidTrigger } from "../../utils/rubric-trigger";
-import { EXCLUSION_NOTE_MAX } from "./rubric-exclusions";
+import { EXCLUSION_NOTE_MAX, isJudgedBarShape } from "./rubric-exclusions";
 import { REDRAFT_DUPLICATE_REASON } from "./rubric-repair";
 import type { RubricPublishSettings } from "./rubric-publish-settings";
 import { languageSupport } from "../language/language-lexicon";
@@ -199,6 +199,10 @@ export function unanchoredScopedRules(kept: readonly AssessmentCriterion[], ques
   const out = { conditional: 0, specialist: 0 };
   for (const c of kept) {
     if (!isScopedRule(c)) continue;
+    // (#248) A bar whose trigger is dropped is neither "applies to everyone as before" nor "could not tell":
+    // it is put to every applicant and only judged (never code-decided). The pipeline names it on its own gate
+    // line (`bars_judged_without_trigger`), so it is not counted here.
+    if (dropped.has(c.criterionId) && isJudgedBarShape(c)) continue;
     const anchored = !dropped.has(c.criterionId) && isValidTrigger(c.trigger, questions);
     if (anchored) continue;
     if (c.applicability === "conditional") out.conditional += 1;
