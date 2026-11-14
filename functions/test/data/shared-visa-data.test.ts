@@ -23,8 +23,23 @@ import { FIXTURE_DATA } from "../helpers/shared-visa-fixture";
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
 
 describe("shared visa data: the shipped file", () => {
-  test("is empty: real bloc data is entered by an admin from official pages, never by code", () => {
-    assert.deepEqual(loadSharedVisaData(), EMPTY_SHARED_VISA_DATA);
+  test("is valid, and every member carries a word-for-word quote and an https address", () => {
+    // The file holds real entries now (filled from official pages, issue #239), so
+    // this checks the SHAPE of whatever is in it, never specific legal facts.
+    const data = loadSharedVisaData();
+    for (const authority of data.authorities) {
+      for (const member of authority.members) {
+        assert.ok(member.sourceQuote.length > 0, `${authority.id}/${member.countryCode} has a quote`);
+        assert.match(member.sourceUrl, /^https:\/\//, `${authority.id}/${member.countryCode} has an https address`);
+        assert.match(member.joinedOn, /^\d{4}-\d{2}-\d{2}$/);
+      }
+    }
+    // Every inheriting record belongs to a member country listed in this same file.
+    for (const route of data.sharedRoutes) {
+      const issuer = data.authorities.find((a) => a.id === route.issuingAuthorityId);
+      assert.ok(issuer, `${route.id} is issued by an authority in this file`);
+      for (const x of route.inheritedBy) assert.ok(issuer.members.some((m) => m.countryCode === x.countryCode));
+    }
   });
 
   test("the seed names no bloc (the data file does)", () => {
