@@ -33,6 +33,7 @@ import {
 } from "./rubric-checker-prompt";
 import { loadPublishSettings, type LoadedPublishSettings, type RubricPublishSettings } from "./rubric-publish-settings";
 import { SnapshotQuoteIndex } from "./rubric-quote";
+import { quoteIsLeadIn, verifyListItems } from "./rubric-list-items";
 import { isTransientProviderError } from "./rubric-extraction.service";
 
 // ============================================
@@ -562,6 +563,12 @@ export class RubricCheckerService {
       const index = await indexOf(rule.source.sourceId, rule.source.contentHash);
       const found = index.locate(rule.source.quote);
       if (!found.ok) continue;
+      // (#222) A quote that ends with a lead-in is only shown with its list:
+      // the stored items must be exactly the lines the snapshot has after it.
+      // A lead-in without verified items (or items that no longer match the
+      // snapshot) has no view, so it cannot pass: a protected rule holds, an
+      // ordinary rule is left out (`checker:source_text`).
+      if (rule.source.listItems !== undefined ? !verifyListItems(index, found, rule.source.listItems).ok : quoteIsLeadIn(index, found)) continue;
       const around = index.contextAround(found, CHECKER_WINDOW_CHARS);
       views.set(rule.criterionId, { rule, listLeadIn: index.listLeadIn(found, CHECKER_LEAD_IN_CHARS), textBefore: around.before, textAfter: around.after });
     }

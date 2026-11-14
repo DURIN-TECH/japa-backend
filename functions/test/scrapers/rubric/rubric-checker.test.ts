@@ -302,7 +302,7 @@ describe("check: keep, leave out, hold", () => {
     const text = r.provider.requests.map((q) => q.user).join("\n");
     assert.ok(!text.includes("SECRET-FACTOR") && !text.includes("0.123"));
     const seen = seenRules(r.provider.requests.find((q) => (q.schema as any).properties.verdicts) as any)[0];
-    assert.deepEqual(Object.keys(seen).sort(), ["applicability", "applicabilityCondition", "appliesTo", "check", "id", "kind", "listLeadIn", "quote", "severity", "stage", "textAfter", "textBefore", "title"]);
+    assert.deepEqual(Object.keys(seen).sort(), ["applicability", "applicabilityCondition", "appliesTo", "check", "id", "kind", "listItems", "listLeadIn", "quote", "severity", "stage", "textAfter", "textBefore", "title"]);
     assert.equal(seen.id, "r1");
     assert.ok(seen.textAfter.length <= 400 + 10 && seen.textBefore.length <= 400 + 10);
   });

@@ -173,6 +173,15 @@ export interface RubricCitation {
   retrievedAt: string;
   // The publisher's own date for the document (YYYY-MM-DD), when it gave one.
   publishedDate?: string;
+  // (#222) Set only when `quote` is the LEAD-IN of a list ("... except where
+  // they are subject to any of the following:"): the list lines that directly
+  // follow it in the stored snapshot, in order, each one a WHOLE LINE of that
+  // snapshot, verbatim (list marker included). Attached by CODE, never written
+  // by the model, and each line is checked against the snapshot as its own line
+  // (the quote validator cannot span lines). The rule's full text is the quote
+  // plus these items. Absent for every other rule and for versions stored
+  // before #222 (additive, optional).
+  listItems?: string[];
 }
 
 /**
@@ -213,6 +222,13 @@ export interface CriterionAppliesTo {
   // criterion. The codes are a model PROPOSAL either way and every one must
   // be confirmed by the reviewer.
   codeNames?: string[];
+  // (#222) Members of the group that are NOT a nationality ("people with right
+  // of abode"), each exactly as the source's own quote names it and found in
+  // that quote as a whole name. They have NO code: none is ever made up for
+  // them, and they are never in `nationalities` / `asWritten` (those stay
+  // parallel, for real nationalities only). A bar needs at least one coded or
+  // uncoded member. Absent on versions stored before #222 (additive, optional).
+  uncoded?: string[];
 }
 
 /**
@@ -457,6 +473,7 @@ export const RUBRIC_DISCARD_REASONS = [
   "unit_not_in_quote",
   "rule_ref_not_in_source",
   "applies_to_not_in_quote",
+  "list_not_readable", // (#222) reserved: the list after a lead-in could not be read cleanly (raised as a flag today, see rubric-list-items.ts)
   "citation_not_found", // a per-field supporting quote is not verbatim in the source
   "invalid_shape", // breaks a kind rule (judgement with a check, ...)
   "duplicate", // same criterion already produced by an earlier chunk
