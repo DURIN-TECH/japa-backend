@@ -271,8 +271,8 @@ describe("extractor prompt — fee rule", () => {
   });
 
   // v6 (#129): requiredDocuments added.
-  test("prompt version is bumped (v8 #187: item kind + need)", () => {
-    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-item-kinds-v8");
+  test("prompt version is bumped (v10 #187: answer types)", () => {
+    assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-answer-types-v10");
   });
 
   test("states the deterministic visa-length rule with the Skilled Worker example", () => {

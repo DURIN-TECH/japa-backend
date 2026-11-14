@@ -575,6 +575,8 @@ export type VisaFieldDiff =
 /** The classification fields a reviewer compares for one item (issue #187). */
 export interface RequiredDocumentMetaView {
   kind: "document" | "information";
+  // Issue #187 regroom: the answer shape of an information item (absent on documents).
+  answerType?: "date" | "date_range" | "money" | "address" | "list" | "text";
   need: "required" | "conditional" | "optional";
   appliesWhen?: string;
   kindReview?: true;

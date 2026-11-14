@@ -56,7 +56,7 @@ export { scrapeCostService } from "./shared/cost/scrape-cost.service";
 
 // ---- Catalog rules used by the app-facing visa service / controller ----
 /** Approval guard + typed error for a fee with no USD conversion (#59). */
-export { assertVisaApprovable, VisaFeeNotConvertibleError } from "./visa-catalog/visa-catalog-fx";
+export { assertVisaApprovable, isIso4217, VisaFeeNotConvertibleError } from "./visa-catalog/visa-catalog-fx";
 /** Finite-only min for the denormalized country stats. */
 export { finiteMin } from "./visa-catalog/visa-catalog-meta";
 /** Manual USD cost on a pending scraped visa (#70). */
@@ -158,8 +158,8 @@ export { adminOutcomeStatisticsRoutes } from "./outcome-statistics/outcome-stati
 export { registeredDestinations } from "./outcome-statistics/registry";
 // ---- Required-document item kind + need rules (issue #187) ----
 /** Pure rules shared with the checklist, the derived requirements and the backfill script. */
-export { classifyNeed, findMetaForItem, itemKey, metaFromQuoteOnly, normaliseStoredMeta } from "./visa-catalog/required-document-meta";
-export type { DocumentKind, DocumentNeed, RequiredDocumentMeta } from "./visa-catalog/required-document-meta";
+export { ANSWER_TYPES, answerTypeOf, classifyAnswerType, classifyNeed, findMetaForItem, isAnswerType, itemKey, metaFromQuoteOnly, normaliseStoredMeta } from "./visa-catalog/required-document-meta";
+export type { AnswerType, DocumentKind, DocumentNeed, RequiredDocumentMeta } from "./visa-catalog/required-document-meta";
 
 // Outbound-fetch building blocks reused outside the scrapers (issue #178: the
 // exchange-rate providers read a public rates endpoint with the SAME guarded

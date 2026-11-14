@@ -599,8 +599,10 @@ export class ApplicationController {
 
   /**
    * GET /applications/:id/answers  (issue #187)
-   * `{ answers: { [checklistItemId]: { text, updatedAt } } }`. Needs `read`
-   * access. Not affected by the edit window.
+   * `{ answers: { [checklistItemId]: { answerType, value, text, legacy?, updatedAt } } }`
+   * (shapes in services/answer-values.ts; a legacy plain-string answer is
+   * re-read as the item's type with `legacy: true`). Needs `read` access. Not
+   * affected by the edit window.
    */
   async getAnswers(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
@@ -613,7 +615,7 @@ export class ApplicationController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
-      sendSuccess(res, { answers: await answersService.getAnswers(application.id) });
+      sendSuccess(res, { answers: await answersService.getAnswers(application) });
     } catch (error) {
       console.error("Error getting application answers:", error instanceof Error ? error.message : "unknown");
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -622,8 +624,11 @@ export class ApplicationController {
 
   /**
    * PUT /applications/:id/answers/:itemId  (issue #187)
-   * Body `{ text }` (trimmed, <= 2000 chars, "" clears). Needs `update`
-   * access. 400 VALIDATION_ERROR for a bad text / unknown item / document item;
+   * Body `{ value }` whose shape follows the item's `answerType` (date,
+   * date_range, money, address, list, text; see services/answer-values.ts);
+   * `{ text }` is still accepted as the value (back-compat). An empty value
+   * clears. Needs `update` access. 400 VALIDATION_ERROR (message names the bad
+   * field) for a bad value / unknown item / document item;
    * 409 ANSWERS_LOCKED once the application is past the same editable window
    * the statement uses (STATEMENT_LOCKED). The plan read-only block is the
    * global one in verifyAuth (402).
@@ -648,7 +653,14 @@ export class ApplicationController {
         );
         return;
       }
-      sendSuccess(res, await answersService.saveAnswer(application, req.params.itemId, req.body?.text, req.userId!));
+      // `value` is the contract; `text` is the pre-types body, still accepted.
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      if (!("value" in body) && !("text" in body)) {
+        sendError(res, "VALIDATION_ERROR", "\"value\" is required", 400);
+        return;
+      }
+      const raw = "value" in body ? body.value : body.text;
+      sendSuccess(res, await answersService.saveAnswer(application, req.params.itemId, raw, req.userId!));
     } catch (error) {
       if (error instanceof AnswerValidationError) {
         sendError(res, "VALIDATION_ERROR", error.message, 400);

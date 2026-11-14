@@ -717,6 +717,9 @@ export interface RequiredDocument {
   kind?: "document" | "information";
   kindReview?: true; // could not classify from the page's wording: stays `document`
   kindQuote?: string; // verbatim page text behind `kind` (or the lead-in)
+  // Issue #187 regroom: the answer shape of an INFORMATION item (absent on documents).
+  answerType?: "date" | "date_range" | "money" | "address" | "list" | "text";
+  answerTypeQuote?: string; // verbatim page text behind `answerType` (absent when the rule decided)
   need?: "required" | "conditional" | "optional";
   appliesWhen?: string; // verbatim "if ..." / "unless ..." / "depending on ..." clause or lead-in
 }
@@ -1029,6 +1032,9 @@ export interface DocumentRequest {
   kind?: "document" | "information";
   kindReview?: true;
   kindQuote?: string;
+  // Issue #187 regroom: answer shape of an information item.
+  answerType?: "date" | "date_range" | "money" | "address" | "list" | "text";
+  answerTypeQuote?: string;
   need?: "required" | "conditional" | "optional";
   appliesWhen?: string;
 

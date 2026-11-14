@@ -14,6 +14,7 @@ import type {
 } from "./types";
 import { alignScrapeMetaToLive } from "./required-document-align";
 import {
+  answerTypeOf,
   findMetaForItem,
   itemKey,
   metaFromQuoteOnly,
@@ -284,6 +285,8 @@ export function diffVisa(params: {
 function metaView(m: RequiredDocumentMeta): RequiredDocumentMetaView {
   return {
     kind: m.kind,
+    // Information items always show a type (text before the backfill).
+    ...(answerTypeOf(m) ? { answerType: answerTypeOf(m) } : {}),
     need: m.need,
     ...(m.appliesWhen ? { appliesWhen: m.appliesWhen } : {}),
     ...(m.kindReview ? { kindReview: true as const } : {}),
@@ -292,7 +295,7 @@ function metaView(m: RequiredDocumentMeta): RequiredDocumentMetaView {
 
 /** Same classification (kind, need, clause, review flag). */
 function sameView(a: RequiredDocumentMetaView, b: RequiredDocumentMetaView): boolean {
-  return a.kind === b.kind && a.need === b.need && a.appliesWhen === b.appliesWhen && !!a.kindReview === !!b.kindReview;
+  return a.kind === b.kind && a.answerType === b.answerType && a.need === b.need && a.appliesWhen === b.appliesWhen && !!a.kindReview === !!b.kindReview;
 }
 
 /**

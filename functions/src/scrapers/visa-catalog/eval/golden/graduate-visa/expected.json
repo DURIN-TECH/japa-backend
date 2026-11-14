@@ -10,7 +10,8 @@
     "Fee rule (#59): one application fee (£937, applied for inside the UK only). IHS £1,035 per year x 2: the standard length is 2 years for anyone applying on or before 31 December 2026. The 3-year length is only for PhD / doctoral holders (a variant, not the standard case). VERIFIER: confirm 2, not 3.",
     "DATE-SENSITIVE: from 1 January 2027 the standard length becomes 18 months (IHS £1,552.50 total). Re-record and re-verify this route then.",
     "category: 'work' (the visa is a post-study permission to work / look for work, not to study).",
-    "Processing time (user decision, 2026-11-09): FULL RANGE: the Graduate visa is applied for inside the UK only and the page gives one figure ('within 8 weeks'): max = 56, min = inclusive range 0..56."
+    "Processing time (user decision, 2026-11-09): FULL RANGE: the Graduate visa is applied for inside the UK only and the page gives one figure ('within 8 weeks'): max = 56, min = inclusive range 0..56.",
+    "documentKinds + answerTypes (#187 regroom): the CAS reference number is typed in (text)."
   ],
   "name": {
     "value": "Graduate",
@@ -115,6 +116,19 @@
         "years": 2,
         "source": "pay the healthcare surcharge - this is usually £1,035 for each year you’ll be in the UK",
         "yearsSource": "2 years if you apply on or before 31 December 2026"
+      }
+    ]
+  },
+  "documentKinds": {
+    "items": [
+      {
+        "match": [
+          "reference number"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "your Confirmation of Acceptance for Studies (CAS) reference number",
+        "answerType": "text"
       }
     ]
   }

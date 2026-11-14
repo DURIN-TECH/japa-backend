@@ -109,6 +109,9 @@ export interface ExpectedItemKind extends Sourced {
   match: string[];
   kind: "document" | "information";
   need: "required" | "conditional" | "optional";
+  // Issue #187 regroom: the answer type the item's own words give (information
+  // items only). Scored by the `answerTypes` field, only on items that set it.
+  answerType?: "date" | "date_range" | "money" | "address" | "list" | "text";
 }
 
 /** A known, tracked gap: reported in every run, never fails it. */
@@ -160,6 +163,7 @@ export const FIELD_TYPES: Record<ScoredField, FieldType> = {
   applicationUrlHost: "url",
   feeComponents: "fee",
   documentKinds: "itemKinds",
+  answerTypes: "itemKinds",
 };
 
 /** One field's result. */
@@ -385,6 +389,40 @@ function scoreDocumentKinds(expected: { items: ExpectedItemKind[] }, actual: Par
   );
 }
 
+/**
+ * answerTypes (issue #187 regroom): for each expected item that names an
+ * `answerType`, find the extractor item like documentKinds does; it scores when
+ * the extractor's stored `answerType` equals the expected one (a missing item,
+ * or an information item the validator left untyped, scores 0). The field score
+ * is the fraction right.
+ */
+function scoreAnswerTypes(expected: { items: ExpectedItemKind[] }, actual: Partial<ExtractedVisa>): FieldResult {
+  const names = Array.isArray(actual.requiredDocuments) ? actual.requiredDocuments : [];
+  const meta = Array.isArray(actual.requiredDocumentMeta) ? actual.requiredDocumentMeta : [];
+  const items = expected.items.filter((e) => e.answerType !== undefined);
+  const wrong: string[] = [];
+  const got: string[] = [];
+  for (const e of items) {
+    const i = names.findIndex((n) => e.match.some((kw) => containsKeyword(n, kw)));
+    const m = i >= 0 ? meta[i] : undefined;
+    got.push(`${e.match[0]}: ${m ? (m.answerType ?? "(none)") : "(not extracted)"}`);
+    if (!m || m.answerType !== e.answerType) wrong.push(`${e.match[0]} (expected ${e.answerType}, got ${m?.answerType ?? "none"})`);
+  }
+  const n = items.length;
+  return result(
+    "answerTypes",
+    n ? (n - wrong.length) / n : 1,
+    items.map((e) => `${e.match[0]}: ${e.answerType}`),
+    got,
+    wrong.length ? `wrong or missing: ${wrong.join("; ")}` : undefined
+  );
+}
+
+/** True when the route's expected items name at least one answerType. */
+function hasAnswerTypes(expected: ExpectedVisa): boolean {
+  return !!expected.documentKinds?.items.some((e) => e.answerType !== undefined);
+}
+
 // ----- Fees (set-based, hard gate) -----
 
 /** Comparable key of a component: kind|amount|currency|per|years. Label ignored. */
@@ -487,7 +525,9 @@ export function scoreRoute(
 
   // ---- Failed extraction: route scores 0, fee is a mismatch ----
   if (!actual || error) {
-    const fields = SCORED_FIELDS.filter((f) => f !== "documentKinds" || expected.documentKinds).map((f) =>
+    const fields = SCORED_FIELDS.filter(
+      (f) => (f !== "documentKinds" || expected.documentKinds) && (f !== "answerTypes" || hasAnswerTypes(expected))
+    ).map((f) =>
       result(f, 0, null, null, `extraction failed: ${error ?? "no output"}`)
     );
     const weightTotal = fields.reduce((s, f) => s + f.weight, 0);
@@ -518,6 +558,8 @@ export function scoreRoute(
     fee.field,
     // Issue #187: only routes with expected item kinds are scored for them.
     ...(expected.documentKinds ? [scoreDocumentKinds(expected.documentKinds, actual)] : []),
+    // Issue #187 regroom: only routes whose items name an answerType.
+    ...(hasAnswerTypes(expected) ? [scoreAnswerTypes(expected.documentKinds!, actual)] : []),
   ];
   const weightedSum = fields.reduce((s, f) => s + f.weight * f.score, 0);
   const weightTotal = fields.reduce((s, f) => s + f.weight, 0);

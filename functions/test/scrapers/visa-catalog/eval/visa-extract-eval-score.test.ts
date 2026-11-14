@@ -280,7 +280,15 @@ function perfectSW(): ExtractedVisa {
       "Minimum salary",
       "English",
     ],
-    requiredDocuments: [],
+    // The golden's own typed-in items (#187): each source line, with the kind,
+    // need and answerType the golden expects.
+    requiredDocuments: (SW.documentKinds?.items ?? []).map((i) => i.source),
+    requiredDocumentMeta: (SW.documentKinds?.items ?? []).map((i) => ({
+      item: i.source,
+      kind: i.kind,
+      need: i.need,
+      ...(i.answerType ? { answerType: i.answerType } : {}),
+    })),
     applicationUrl: "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/skilled_worker_out_uk",
     confidence: 0.9,
     citations: {},
@@ -299,8 +307,12 @@ describe("scorer (eval/score.ts)", () => {
     const r = scoreRoute(SW, perfectSW());
     assert.equal(r.score, 1);
     assert.equal(r.feeMismatch, false);
-    // documentKinds (#187) is scored only on routes whose expected.json has it.
-    assert.equal(r.weightTotal, Object.values(FIELD_WEIGHTS).reduce((a, b) => a + b, 0) - FIELD_WEIGHTS.documentKinds);
+    // documentKinds (#187) and answerTypes are scored only on routes whose
+    // expected.json has them; Skilled Worker has both since the regroom.
+    assert.equal(r.weightTotal, Object.values(FIELD_WEIGHTS).reduce((a, b) => a + b, 0));
+    // A route without typed items is not scored for them.
+    const plain = scoreRoute({ ...SW, documentKinds: undefined }, { ...perfectSW(), requiredDocuments: [], requiredDocumentMeta: [] });
+    assert.equal(plain.weightTotal, Object.values(FIELD_WEIGHTS).reduce((a, b) => a + b, 0) - FIELD_WEIGHTS.documentKinds - FIELD_WEIGHTS.answerTypes);
   });
 
   test("documentKinds (#187): scored only when expected; kind and need must both match", () => {
@@ -324,6 +336,31 @@ describe("scorer (eval/score.ts)", () => {
     assert.equal(field(scoreRoute(exp, a), "documentKinds").score, 0.5);
     a.requiredDocumentMeta[1] = { kind: "document", kindReview: true, need: "conditional" };
     assert.equal(field(scoreRoute(exp, a), "documentKinds").score, 0.5);
+  });
+
+  test("answerTypes (#187 regroom): scored only on items that name one; the type must match", () => {
+    const exp: ExpectedVisa = {
+      ...SW,
+      documentKinds: {
+        items: [
+          { match: ["dates"], kind: "information", need: "required", source: "", answerType: "date_range" },
+          { match: ["earn"], kind: "information", need: "required", source: "", answerType: "money" },
+          { match: ["passport"], kind: "document", need: "required", source: "" }, // no answerType: not scored here
+        ],
+      },
+    };
+    const a = perfectSW();
+    a.requiredDocuments = ["the dates you travel", "how much you earn", "a passport"];
+    a.requiredDocumentMeta = [
+      { kind: "information", need: "required", answerType: "date_range" },
+      { kind: "information", need: "required", answerType: "money" },
+      { kind: "document", need: "required" },
+    ];
+    assert.equal(field(scoreRoute(exp, a), "answerTypes").score, 1);
+    a.requiredDocumentMeta[1] = { kind: "information", need: "required", answerType: "text" };
+    assert.equal(field(scoreRoute(exp, a), "answerTypes").score, 0.5);
+    a.requiredDocumentMeta[1] = { kind: "information", need: "required" }; // untyped scores 0
+    assert.equal(field(scoreRoute(exp, a), "answerTypes").score, 0.5);
   });
 
   test("exact: category and isExtendable pass/fail", () => {
@@ -632,14 +669,17 @@ describe("scorer (eval/score.ts)", () => {
   });
 
   test("gate: overall below threshold, or one route below the route threshold, fails", () => {
-    const good = scoreRoute(SW, perfectSW());
+    // Skilled Worker WITHOUT its typed items, so the weights are the plain nine fields (total 12).
+    const plainSW: ExpectedVisa = { ...SW, documentKinds: undefined };
+    const plain = (): ExtractedVisa => ({ ...perfectSW(), requiredDocuments: [], requiredDocumentMeta: [] });
+    const good = scoreRoute(plainSW, plain());
     assert.equal(evaluateGate([good]).pass, true);
     // Route at 8/12 = 0.667 (< 0.7) with correct fees.
-    const a = perfectSW();
+    const a = plain();
     a.category = "other";
     a.isExtendable = false;
     a.eligibilityCriteria = ["nothing relevant"];
-    const weak = scoreRoute(SW, a);
+    const weak = scoreRoute(plainSW, a);
     assert.ok(weak.score < ROUTE_PASS_THRESHOLD && !weak.feeMismatch);
     const g = evaluateGate([good, good, good, good, good, weak]);
     assert.ok(g.overall >= OVERALL_PASS_THRESHOLD);

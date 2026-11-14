@@ -9,7 +9,8 @@
     "QA checked all fields vs live Content API 2026-11-09; user spot-checked fee lines",
     "Fee rule (#59): longest standard outside-UK option is 'more than 3 years - £1,618'; the visa can last up to 5 years, so IHS £1,035 x 5.",
     "applicationUrlHost is the host of the 'Start now' button on the apply-from-outside-the-uk part (an href; the extractor only sees text, so this is expected to be hard to get).",
-    "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK decision time (3 weeks), max = inside-UK decision time (8 weeks)."
+    "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK decision time (3 weeks), max = inside-UK decision time (8 weeks).",
+    "documentKinds + answerTypes (#187 regroom): the four typed-in items of 'When you apply you’ll need to provide:'. All are text: each is a single code or reference, or asks several fields at once (job title AND salary, employer name AND licence number)."
   ],
   "name": {
     "value": "Skilled Worker",
@@ -114,6 +115,46 @@
         "years": 5,
         "source": "pay the healthcare surcharge - this is usually £1,035 per year",
         "yearsSource": "Your visa can last for up to 5 years before you need to extend it."
+      }
+    ]
+  },
+  "documentKinds": {
+    "items": [
+      {
+        "match": [
+          "sponsorship reference"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "your certificate of sponsorship reference number",
+        "answerType": "text"
+      },
+      {
+        "match": [
+          "job title"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "your job title and annual salary",
+        "answerType": "text"
+      },
+      {
+        "match": [
+          "occupation code"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "your job’s occupation code",
+        "answerType": "text"
+      },
+      {
+        "match": [
+          "sponsor licence"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "the name of your employer and their sponsor licence number",
+        "answerType": "text"
       }
     ]
   }
