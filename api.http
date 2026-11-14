@@ -341,6 +341,74 @@ Content-Type: application/json
 { "reference": "{{paystackReference}}" }
 
 # ============================================================
+# PAYMENT REQUESTS (issue #181) — the agent asks in US dollars, the
+# client pays the local amount quoted at checkout start
+# ============================================================
+
+### Create a payment request (agent assigned to the case, or its agency's
+### owner; agency must be compliance-verified). `amount` is US DOLLARS
+### ("150.00" or 150), whole cents, > 0, at most $100,000.00; `currency` is
+### "USD" or absent (anything else 400). Stored: priceUsd { amountMinor: 15000,
+### currency: "USD" } mirrored as amount 15000 / currency "USD". No rate is read
+### here. Response adds amountDisplay ("USD 150.00"), legacy (false), priceUsd,
+### charge (null until priced). Another agency's agent: 403, nothing written.
+POST {{baseUrl}}/payment-requests
+Authorization: Bearer {{agent1Token}}
+Content-Type: application/json
+
+{
+  "applicationId": "seed-app-001",
+  "amount": "150.00",
+  "currency": "USD",
+  "description": "Visa Processing Fee",
+  "category": "visa_fee"
+}
+
+### List (role=agent|owner|admin|client). Each row carries amountDisplay with
+### explicit codes ("USD 150.00 (NGN 225,000.00)" once priced; a legacy naira
+### row: "NGN 25,000.00", legacy: true).
+GET {{baseUrl}}/payment-requests?role=client
+Authorization: Bearer {{clientToken}}
+
+### Approve and start checkout (the request's client). The server quotes the
+### dollar price in the client's profile currency, locks it for 30 minutes and
+### stores priceUsdCents, chargedCurrency, chargedAmountMinor, fxRate,
+### fxRateAsOf, fxRateSource, fxMarginBps, quoteLockedAt, quoteExpiresAt on the
+### request; Paystack is charged exactly chargedAmountMinor in chargedCurrency
+### under our reference (preq-<id>-<uuid>). Response: the request plus
+### authorizationUrl and paystackReference. 503 PRICING_UNAVAILABLE when no
+### usable rate (request stays pending). 502 BILLING_PROVIDER_ERROR on a
+### Paystack failure (then use /checkout). A legacy naira request opens a
+### naira checkout for its own stored kobo amount, as before.
+PUT {{baseUrl}}/payment-requests/{{paymentRequestId}}/approve
+Authorization: Bearer {{clientToken}}
+
+### Resume / re-issue the checkout of an approved, unpaid request (issue #152).
+### 200 { requiresPayment, authorizationUrl, reference, paymentRequest }:
+### inside the lock the same checkout; after it a fresh quote of the same
+### dollar price and a new checkout (old reference kept in supersededCheckouts).
+### Paid already: { requiresPayment: false }. 409 PAYMENT_IN_PROGRESS while
+### Paystack reports the checkout ongoing/pending/processing/queued (nothing
+### re-quoted). 409 REQUEST_NOT_PAYABLE for a pending, cancelled or legacy one.
+POST {{baseUrl}}/payment-requests/{{paymentRequestId}}/checkout
+Authorization: Bearer {{clientToken}}
+
+### Verify on return from Paystack. Settles ONLY when Paystack's
+### requested_amount (else amount) and currency equal what that checkout asked;
+### else 400 PAYMENT_MISMATCH and nothing is written (not marked paid). One
+### Transaction ever (amount = charged minor units, plus priceUsdCents and the
+### rate snapshot); the case's amountPaid moves by the dollar price in US
+### cents. Not paid inside the lock: 200 "Payment not completed"; after it:
+### 409 QUOTE_EXPIRED with a fresh checkout. Superseded reference: an exact
+### payment settles an unpaid request at that price; on a paid request it is
+### held in paymentRequestExceptions (200 refundPending: true).
+POST {{baseUrl}}/payment-requests/{{paymentRequestId}}/verify
+Authorization: Bearer {{clientToken}}
+Content-Type: application/json
+
+{ "reference": "{{paystackReference}}" }
+
+# ============================================================
 # CONVERSATIONS
 # ============================================================
 
