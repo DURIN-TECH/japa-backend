@@ -1,7 +1,13 @@
 import { collections } from "../utils/firebase";
 import { Transaction, TransactionStatus, BankAccount, PaymentRequest } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
-import type { ChargeSnapshot } from "../types/money";
+import type { ChargeSnapshot, CurrencyCode } from "../types/money";
+import {
+  CurrencyBuckets,
+  isPendingIncoming,
+  revenueEffect,
+  transactionCurrency,
+} from "../money/totals";
 
 export interface TransactionFilters {
   status?: TransactionStatus;
@@ -10,11 +16,61 @@ export interface TransactionFilters {
   endDate?: string;
 }
 
-export interface TransactionStats {
+/**
+ * Currency that agent withdrawals are paid out in. Payouts go to a Nigerian
+ * bank account (Paystack NGN), so `createWithdrawal` writes this currency and
+ * the withdrawal balance check compares against this currency's balance only.
+ */
+export const WITHDRAWAL_CURRENCY: CurrencyCode = "NGN";
+
+/**
+ * Money stats for ONE currency (issue #282). Every amount is an integer in
+ * MINOR units of `currency` (kobo for NGN, cents for USD).
+ */
+export interface CurrencyTransactionStats {
+  /** ISO 4217 code, upper case ("NGN", "USD"). */
+  currency: CurrencyCode;
+  /**
+   * Settled (completed / released) incoming transactions in this currency,
+   * minus settled refunds in this currency. Not clamped: may be negative
+   * when refunds exceed charges.
+   */
   totalRevenue: number;
+  /** Sum of pending / processing / held-in-escrow incoming transactions in this currency (refunds and withdrawals excluded). */
   pendingPayments: number;
+  /**
+   * `totalRevenue` minus the withdrawals (pending, processing or completed)
+   * in this currency, never below 0. Withdrawals only ever reduce the
+   * balance of their own currency.
+   */
   availableBalance: number;
+}
+
+/**
+ * Response of GET /transactions/stats (issue #282). Money is per currency:
+ * amounts in different currencies are never summed. `byCurrency` is sorted by
+ * currency code and is EMPTY when there are no transactions.
+ */
+export interface TransactionStats {
+  byCurrency: CurrencyTransactionStats[];
+  /** Distinct clients with a pending incoming payment (a count, not money). */
   pendingClientsCount: number;
+}
+
+/**
+ * Statuses of a withdrawal that hold money out of the balance: a completed
+ * payout has left, and a pending / processing one is reserved so it cannot
+ * be withdrawn twice. A failed withdrawal gives the money back.
+ */
+const WITHDRAWAL_HOLD_STATUSES: TransactionStatus[] = ["pending", "processing", "completed"];
+
+/**
+ * The available balance in one currency from a stats result (0 when that
+ * currency has no bucket). Used by the withdrawal check, which only ever
+ * compares a withdrawal against the balance of its own currency.
+ */
+export function availableBalanceIn(stats: TransactionStats, currency: CurrencyCode): number {
+  return stats.byCurrency.find((row) => row.currency === currency)?.availableBalance ?? 0;
 }
 
 class TransactionService {
@@ -100,52 +156,80 @@ class TransactionService {
   }
 
   /**
-   * Compute aggregate stats from a list of transactions.
+   * Compute aggregate stats from a list of transactions, PER CURRENCY
+   * (issue #282).
+   *
+   * Rules:
+   *  - each transaction lands in the bucket of its own `currency` (a legacy
+   *    row with no code counts as NGN); amounts of different currencies are
+   *    never added together;
+   *  - revenue follows the SHARED rule in money/totals.ts (`revenueEffect`,
+   *    also used by analytics): a settled (completed / released) incoming
+   *    transaction adds its amount, a settled refund subtracts it, both in
+   *    their own currency. `pendingPayments` sums pending / processing /
+   *    held-in-escrow incoming transactions (`isPendingIncoming`);
+   *  - withdrawals are outflows: they are NOT revenue or pending payments,
+   *    and a pending / processing / completed withdrawal is subtracted from
+   *    the `availableBalance` of ITS currency only (clamped at 0). Before
+   *    #282 a completed withdrawal was counted as revenue and a pending one
+   *    as a pending client payment;
+   *  - a currency appears in `byCurrency` as soon as any transaction in it
+   *    is seen (even one that adds 0, e.g. a failed charge), so the list is
+   *    empty only when there are no transactions at all.
+   *
+   * Used by GET /transactions/stats for every role, and by the withdrawal
+   * balance check (via getStatsForAgent), so both always agree.
    */
   computeStats(transactions: Transaction[]): TransactionStats {
-    const completedStatuses: TransactionStatus[] = ["completed", "released"];
-    const pendingStatuses: TransactionStatus[] = [
-      "pending",
-      "processing",
-      "held_in_escrow",
-    ];
-
-    let totalRevenue = 0;
-    let pendingPayments = 0;
+    // Separate running sums per currency for each figure.
+    const revenue = new CurrencyBuckets();
+    const pending = new CurrencyBuckets();
+    const withdrawn = new CurrencyBuckets();
+    // Distinct paying clients with a pending payment (count, not money).
     const pendingUserIds = new Set<string>();
 
     for (const txn of transactions) {
-      if (completedStatuses.includes(txn.status)) {
-        totalRevenue += txn.amount;
+      const currency = transactionCurrency(txn);
+      // Give the currency a row even if this transaction adds nothing.
+      revenue.touch(currency);
+
+      if (txn.type === "withdrawal") {
+        // Outflow: only ever reduces the balance of its own currency.
+        if (WITHDRAWAL_HOLD_STATUSES.includes(txn.status)) {
+          withdrawn.add(currency, txn.amount);
+        }
+        continue;
       }
-      if (pendingStatuses.includes(txn.status)) {
-        pendingPayments += txn.amount;
+
+      // Settled charge: +amount; settled refund: -amount; otherwise 0.
+      revenue.add(currency, revenueEffect(txn));
+      if (isPendingIncoming(txn)) {
+        pending.add(currency, txn.amount);
         pendingUserIds.add(txn.userId);
       }
     }
 
-    return {
-      totalRevenue,
-      pendingPayments,
-      availableBalance: totalRevenue,
-      pendingClientsCount: pendingUserIds.size,
-    };
+    // One row per currency seen, sorted by code (CurrencyBuckets sorts).
+    const byCurrency: CurrencyTransactionStats[] = revenue.currencies().map((currency) => ({
+      currency,
+      totalRevenue: revenue.get(currency),
+      pendingPayments: pending.get(currency),
+      // Refunds already lowered revenue; withdrawals come off here. The
+      // balance is the only figure clamped at 0.
+      availableBalance: Math.max(0, revenue.get(currency) - withdrawn.get(currency)),
+    }));
+
+    return { byCurrency, pendingClientsCount: pendingUserIds.size };
   }
 
   /**
-   * Convenience: get stats for an agent by userId
+   * Convenience: stats for one agent (by user uid), as used by the
+   * withdrawal balance check. Withdrawals are already subtracted per
+   * currency inside computeStats.
    */
   async getStatsForAgent(agentUserId: string): Promise<TransactionStats> {
     const transactions = await this.getTransactionsForAgent(agentUserId);
-
-    // Subtract completed withdrawals from available balance
-    const stats = this.computeStats(transactions);
-    const withdrawals = transactions
-      .filter((t) => t.type === "withdrawal" && (t.status === "completed" || t.status === "processing" || t.status === "pending"))
-      .reduce((sum, t) => sum + t.amount, 0);
-
-    stats.availableBalance = Math.max(0, stats.availableBalance - withdrawals);
-    return stats;
+    return this.computeStats(transactions);
   }
 
   /**
@@ -165,7 +249,8 @@ class TransactionService {
       agentId: agentUserId,
       type: "withdrawal",
       amount,
-      currency: "NGN",
+      // Payouts are in naira (minor units = kobo); see WITHDRAWAL_CURRENCY.
+      currency: WITHDRAWAL_CURRENCY,
       status: "pending",
       isEscrow: false,
       paymentProvider: "manual",

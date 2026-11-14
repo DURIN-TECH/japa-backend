@@ -19,6 +19,16 @@
 import { db, collections, serverTimestamp } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import { Application, Transaction } from "../types";
+import type { CurrencyCode } from "../types/money";
+import {
+  CurrencyAmount,
+  CurrencyBuckets,
+  LEGACY_APPLICATION_CURRENCY,
+  currencyOrDefault,
+  revenueEffect,
+  transactionCurrency,
+  unionCurrencies,
+} from "../money/totals";
 
 // ============================================
 // TYPES
@@ -66,6 +76,122 @@ const MAX_EVENTS_PER_BATCH = 50;
  * Prevents injection of arbitrary data as event names.
  */
 const EVENT_NAME_PATTERN = /^[a-z][a-z0-9_]{1,63}$/;
+
+// ============================================
+// PER-CURRENCY REVENUE HELPERS (issue #282)
+// ============================================
+//
+// Pure functions (no Firestore) so the money rules can be unit-tested
+// directly. Every helper buckets amounts by currency through
+// money/totals.ts and NEVER adds amounts of different currencies.
+
+/**
+ * Percent change between two values. From a previous value of 0 it returns
+ * 100 (up), -100 (down) or 0 (unchanged), avoiding a division by 0.
+ *
+ * The divisor is |prev| because revenue can be NEGATIVE (refunds exceeding
+ * charges, issue #282): -100 -> 100 is +200%, not -200%. For the usual
+ * positive values this is the same as the plain formula.
+ */
+export function percentChange(prev: number, current: number): number {
+  if (prev === 0) return Math.sign(current) * (current === 0 ? 0 : 100);
+  return ((current - prev) / Math.abs(prev)) * 100;
+}
+
+/**
+ * Sum the revenue of a list of transactions into per-currency buckets, using
+ * the SHARED rule in money/totals.ts (`revenueEffect`, the same one
+ * GET /transactions/stats uses): settled (completed / released) incoming
+ * payments add, settled refunds subtract, withdrawals and unsettled rows add
+ * nothing. Before #282 analytics counted only "completed" rows, so paid
+ * payment requests (stored as "released") were missing, refunds counted as
+ * revenue and completed withdrawals did too. Only transactions that touch
+ * revenue get a bucket.
+ */
+export function sumRevenueByCurrency(txns: Transaction[]): CurrencyBuckets {
+  const buckets = new CurrencyBuckets();
+  for (const txn of txns) {
+    const effect = revenueEffect(txn);
+    if (effect === 0) continue;
+    buckets.add(transactionCurrency(txn), effect);
+  }
+  return buckets;
+}
+
+/**
+ * Revenue KPI rows: one per currency seen in EITHER period (sorted by code),
+ * each compared with the previous period in the same currency.
+ */
+export function buildRevenueKpis(
+  currentTxns: Transaction[],
+  prevTxns: Transaction[]
+): RevenueKPI[] {
+  const current = sumRevenueByCurrency(currentTxns);
+  const previous = sumRevenueByCurrency(prevTxns);
+  return unionCurrencies(current, previous).map((currency) => {
+    const totalRevenue = current.get(currency);
+    const previousRevenue = previous.get(currency);
+    return {
+      currency,
+      totalRevenue,
+      previousRevenue,
+      // Rounded to one decimal, like the other KPI changes.
+      totalRevenueChange: Math.round(percentChange(previousRevenue, totalRevenue) * 10) / 10,
+    };
+  });
+}
+
+/**
+ * Monthly revenue series, one per currency that has revenue in `txns`
+ * (already date-filtered). Every series gets a point for every month in
+ * `months` (0 when that month has none), so chart axes line up.
+ */
+export function buildRevenueTrendSeries(
+  txns: Transaction[],
+  months: { month: string; label: string }[]
+): RevenueTrendSeries[] {
+  // currency -> (YYYY-MM -> sum in minor units of that currency)
+  const byCurrency = new Map<CurrencyCode, Map<string, number>>();
+  for (const txn of txns) {
+    // Same shared revenue rule as the KPIs and /transactions/stats.
+    const effect = revenueEffect(txn);
+    if (effect === 0) continue;
+    const currency = transactionCurrency(txn);
+    const d = txn.createdAt.toDate();
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const sums = byCurrency.get(currency) ?? new Map<string, number>();
+    sums.set(key, (sums.get(key) ?? 0) + effect);
+    byCurrency.set(currency, sums);
+  }
+  return Array.from(byCurrency.keys())
+    .sort()
+    .map((currency) => {
+      const sums = byCurrency.get(currency)!;
+      return {
+        currency,
+        points: months.map((m) => ({ month: m.month, label: m.label, value: sums.get(m.month) ?? 0 })),
+      };
+    });
+}
+
+/**
+ * Add what a client has paid on one application to per-currency buckets:
+ * `amountPaid` is minor units of `costCurrency` (US cents when the case has
+ * no `costCurrency`, see types/index.ts), and `amountPaidOtherCurrencies`
+ * holds payments in other currencies, each in its own minor units. A zero
+ * amount adds no bucket, so an agent with nothing paid gets an empty list.
+ */
+export function addApplicationPaid(buckets: CurrencyBuckets, app: Application): void {
+  if (app.amountPaid) {
+    buckets.add(currencyOrDefault(app.costCurrency, LEGACY_APPLICATION_CURRENCY), app.amountPaid);
+  }
+  for (const [code, amount] of Object.entries(app.amountPaidOtherCurrencies ?? {})) {
+    const currency = currencyOrDefault(code, "");
+    // Skip an unreadable code rather than guessing its currency.
+    if (!currency || !amount) continue;
+    buckets.add(currency, amount);
+  }
+}
 
 // ============================================
 // SERVICE
@@ -444,7 +570,9 @@ class AnalyticsService {
    *
    * Computes key performance indicators:
    * - totalCases: number of cases in the date range
-   * - totalRevenue: sum of completed transaction amounts
+   * - revenueByCurrency: settled (completed / released) transactions minus
+   *   settled refunds, PER CURRENCY
+   *   (minor units), each with its own previous-period change (issue #282)
    * - conversionRate: approved / (approved + rejected) as percentage
    * - avgProcessingDays: average days from creation to completion
    *
@@ -478,16 +606,13 @@ class AnalyticsService {
     // --- Total Cases ---
     const totalCases = currentApps.length;
     const prevTotalCases = prevApps.length;
-    const totalCasesChange = this.percentChange(prevTotalCases, totalCases);
+    const totalCasesChange = percentChange(prevTotalCases, totalCases);
 
-    // --- Total Revenue (sum of completed transactions, in cents) ---
-    const totalRevenue = currentTxns
-      .filter((t) => t.status === "completed")
-      .reduce((sum, t) => sum + t.amount, 0);
-    const prevRevenue = prevTxns
-      .filter((t) => t.status === "completed")
-      .reduce((sum, t) => sum + t.amount, 0);
-    const totalRevenueChange = this.percentChange(prevRevenue, totalRevenue);
+    // --- Revenue, PER CURRENCY (issue #282) ---
+    // Completed transactions summed in minor units of each currency, with
+    // the previous-period comparison done inside each currency. Kobo and
+    // cents are never added together.
+    const revenueByCurrency = buildRevenueKpis(currentTxns, prevTxns);
 
     // --- Conversion Rate (approved / decided) ---
     const approved = currentApps.filter((a) => a.status === "approved").length;
@@ -515,8 +640,7 @@ class AnalyticsService {
     return {
       totalCases,
       totalCasesChange: Math.round(totalCasesChange * 10) / 10,
-      totalRevenue,
-      totalRevenueChange: Math.round(totalRevenueChange * 10) / 10,
+      revenueByCurrency,
       conversionRate: Math.round(conversionRate * 10) / 10,
       conversionRateChange: Math.round(conversionRateChange * 10) / 10,
       avgProcessingDays: Math.round(processingDays),
@@ -560,7 +684,11 @@ class AnalyticsService {
   /**
    * GET /analytics/revenue-trends
    *
-   * Returns monthly revenue totals (completed transactions) within the date range.
+   * Returns monthly revenue (settled payments minus settled refunds, the
+   * shared rule in money/totals.ts) within the date
+   * range, as ONE SERIES PER CURRENCY (issue #282): each series has a point
+   * for every month in the range, with `value` in minor units of the
+   * series' currency. Empty array when there is no revenue in the range.
    * Used by the line chart on the analytics dashboard.
    */
   async getRevenueTrends(
@@ -569,26 +697,10 @@ class AnalyticsService {
     agencyId: string | undefined,
     from: string,
     to: string
-  ): Promise<MonthlyDataPoint[]> {
+  ): Promise<RevenueTrendSeries[]> {
     const allTxns = await this.getTransactionsForRole(role, userId, agencyId);
-    const filtered = this.filterTransactionsByDateRange(allTxns, from, to)
-      .filter((t) => t.status === "completed");
-
-    // Group revenue by month
-    const months = this.monthsBetween(from, to);
-    const sums: Record<string, number> = {};
-
-    for (const txn of filtered) {
-      const d = txn.createdAt.toDate();
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-      sums[key] = (sums[key] || 0) + txn.amount;
-    }
-
-    return months.map((m) => ({
-      month: m.month,
-      label: m.label,
-      value: sums[m.month] || 0,
-    }));
+    const filtered = this.filterTransactionsByDateRange(allTxns, from, to);
+    return buildRevenueTrendSeries(filtered, this.monthsBetween(from, to));
   }
 
   /**
@@ -601,7 +713,9 @@ class AnalyticsService {
    * - activeCases: non-terminal cases
    * - completedCases: approved + rejected
    * - successRate: approved / completed as percentage
-   * - revenueGenerated: sum of amountPaid on their cases
+   * - revenueByCurrency: what clients paid on their cases, PER CURRENCY
+   *   (issue #282): `amountPaid` in the case's `costCurrency` plus every
+   *   `amountPaidOtherCurrencies` entry in its own currency
    * - avgProcessingDays: average days to completion
    */
   async getAgentMetrics(
@@ -623,7 +737,8 @@ class AnalyticsService {
       active: number;
       completed: number;
       approved: number;
-      revenue: number;
+      /** Paid amounts per currency (minor units), never summed across currencies. */
+      revenue: CurrencyBuckets;
       days: number[];
     }>();
 
@@ -631,7 +746,13 @@ class AnalyticsService {
       if (!app.agentId) continue;
 
       if (!agentMap.has(app.agentId)) {
-        agentMap.set(app.agentId, { active: 0, completed: 0, approved: 0, revenue: 0, days: [] });
+        agentMap.set(app.agentId, {
+          active: 0,
+          completed: 0,
+          approved: 0,
+          revenue: new CurrencyBuckets(),
+          days: [],
+        });
       }
       const agent = agentMap.get(app.agentId)!;
 
@@ -648,8 +769,8 @@ class AnalyticsService {
         agent.active++;
       }
 
-      // Revenue from what the client has paid
-      agent.revenue += app.amountPaid;
+      // Revenue from what the client has paid, each amount in its own currency
+      addApplicationPaid(agent.revenue, app);
     }
 
     // Convert to response array
@@ -661,7 +782,7 @@ class AnalyticsService {
       successRate: data.completed > 0
         ? Math.round((data.approved / data.completed) * 1000) / 10
         : 0,
-      revenueGenerated: data.revenue,
+      revenueByCurrency: data.revenue.toList(),
       avgProcessingDays: data.days.length > 0
         ? Math.round(data.days.reduce((a, b) => a + b, 0) / data.days.length)
         : 0,
@@ -720,15 +841,6 @@ class AnalyticsService {
 
     if (days.length === 0) return 0;
     return days.reduce((a, b) => a + b, 0) / days.length;
-  }
-
-  /**
-   * Computes percent change between two values.
-   * Returns 0 when the previous value is 0 (avoids division by zero).
-   */
-  private percentChange(prev: number, current: number): number {
-    if (prev === 0) return current > 0 ? 100 : 0;
-    return ((current - prev) / prev) * 100;
   }
 
   /** Short month labels for chart axis */
@@ -794,8 +906,12 @@ class AnalyticsService {
 export interface AnalyticsKPIs {
   totalCases: number;
   totalCasesChange: number;
-  totalRevenue: number;
-  totalRevenueChange: number;
+  /**
+   * Revenue per currency (issue #282), sorted by code. Replaces the old bare
+   * `totalRevenue` / `totalRevenueChange`, which summed every currency.
+   * Empty when neither period has revenue.
+   */
+  revenueByCurrency: RevenueKPI[];
   conversionRate: number;
   conversionRateChange: number;
   avgProcessingDays: number;
@@ -808,13 +924,45 @@ export interface MonthlyDataPoint {
   value: number;
 }
 
+/**
+ * Revenue KPI for ONE currency (issue #282). Both totals are integer minor
+ * units of `currency`; the change compares them within that currency only.
+ */
+export interface RevenueKPI {
+  /** ISO 4217 code, upper case. */
+  currency: CurrencyCode;
+  /** Revenue (settled payments minus settled refunds) in the selected period, minor units; may be negative. */
+  totalRevenue: number;
+  /** Same figure for the previous period of the same length (minor units). */
+  previousRevenue: number;
+  /**
+   * Percent change previous -> current, one decimal. 100 when the previous
+   * period had none and this one has some; 0 when both are 0.
+   */
+  totalRevenueChange: number;
+}
+
+/**
+ * Monthly revenue for ONE currency (issue #282). `points` has an entry for
+ * every month of the range; each `value` is minor units of `currency`.
+ */
+export interface RevenueTrendSeries {
+  currency: CurrencyCode;
+  points: MonthlyDataPoint[];
+}
+
 export interface AgentMetric {
   agentId: string;
   agentName: string;
   activeCases: number;
   completedCases: number;
   successRate: number;
-  revenueGenerated: number;
+  /**
+   * What clients paid on this agent's cases, per currency (minor units),
+   * sorted by code (issue #282). Replaces the bare `revenueGenerated`.
+   * Empty when nothing was paid.
+   */
+  revenueByCurrency: CurrencyAmount[];
   avgProcessingDays: number;
 }
 
