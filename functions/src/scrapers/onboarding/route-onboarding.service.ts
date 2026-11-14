@@ -8,7 +8,8 @@ import type { VisaSource, VisaSourcePage } from "../visa-catalog/types";
 import { rubricExtractionJobService, type RubricExtractionJobService, type StartJobResult } from "../rubric/rubric-extraction-job";
 import { loadRubricSettings, type LoadedRubricSettings } from "../rubric/rubric-settings";
 import { loadPublishSettings, addRouteToAllowlist, type AllowlistAddResult, type LoadedPublishSettings } from "../rubric/rubric-publish-settings";
-import { rubricRouteKey } from "../rubric/rubric.store";
+// Issue #232: run keys are rulebook keys `{authorityId}_{routeSlug}` (pure rules, no Firebase).
+import { buildRulebookKey, checkAuthorityId } from "../../authorities/authority-ids";
 import type { RubricHead, VisaRubric } from "../../types/rubric";
 import { appendRegistryAudit } from "../shared/registry/registry-audit";
 import {
@@ -276,24 +277,38 @@ export class RouteOnboardingService {
   // Registry facts
   // ============================================
 
-  /** The registered route: its visa page and its guidance sources, or null when it is not registered. */
-  private async findRegistered(countryCode: string, visaTypeId: string): Promise<RegisteredRoute | null> {
-    const snap = await collections.visaSources.doc(countryCode).get();
+  /**
+   * The registered route: its visa page and its guidance sources, or null when it is not registered.
+   *
+   * Issue #232: `authorityId` is the route's issuing authority (a country code
+   * or a bloc/treaty id). The visa page lives in `visaSources/{authorityId}`
+   * and the guidance sources carry `jurisdiction == authorityId`, exactly as
+   * route registration writes them. For a country this is the same lookup as
+   * before (the code is the authority id).
+   */
+  private async findRegistered(authorityId: string, visaTypeId: string): Promise<RegisteredRoute | null> {
+    const snap = await collections.visaSources.doc(authorityId).get();
     if (!snap.exists) return null;
     const source = snap.data() as VisaSource;
+    // A country authority's id is its code; only then can page ids be derived from addresses.
+    const idCheck = checkAuthorityId(authorityId);
+    const isCountry = idCheck.ok && idCheck.shape === "country";
     const page = (source.pages ?? []).find((p) => {
       if (p.supplementOnly) return false;
+      // Address-derived ids exist only for (seeded) country pages; a bloc's
+      // or treaty's pages are portal-added with a pinned id.
+      if (!isCountry) return p.visaId === visaTypeId;
       try {
-        return deriveVisaId({ countryCode, sourceUrl: p.url, visaId: p.visaId }) === visaTypeId;
+        return deriveVisaId({ countryCode: authorityId, sourceUrl: p.url, visaId: p.visaId }) === visaTypeId;
       } catch {
         return p.visaId === visaTypeId;
       }
     });
     if (!page) return null;
-    // Guidance sources of the route: same country, same route name (the registration's convention).
-    const prefix = `${countryCode.toLowerCase()}-`;
+    // Guidance sources of the route: same authority, same route name (the registration's convention).
+    const prefix = `${authorityId.toLowerCase()}-`;
     const route = visaTypeId.startsWith(prefix) ? visaTypeId.slice(prefix.length) : visaTypeId;
-    const all = await collections.guidanceSources.where("jurisdiction", "==", countryCode).get();
+    const all = await collections.guidanceSources.where("jurisdiction", "==", authorityId).get();
     const guidance = all.docs
       .map((d) => ({ id: d.id, data: d.data() as GuidanceSource }))
       .filter((g) => g.data.route === route && g.data.status !== "retired")
@@ -308,24 +323,44 @@ export class RouteOnboardingService {
   /**
    * POST /admin/route-onboarding. Creates a run in `preparing`.
    *   503 SETTINGS_UNAVAILABLE / ONBOARDING_DISABLED, 404 ROUTE_NOT_REGISTERED,
-   *   409 RUN_ACTIVE (with the active run's id), 429 DAILY_LIMIT_REACHED.
+   *   409 RUN_ACTIVE (with the active run's id), 429 DAILY_LIMIT_REACHED,
+   *   422 SHARED_LAYER_NOT_READY (a route registered under a bloc or treaty).
+   *
+   * Issue #232: `authorityId` is the route's issuing authority. The run key
+   * is the rulebook key `{authorityId}_{visaTypeId}` (buildRulebookKey): for a
+   * country it is exactly the old `{countryCode}_{visaTypeId}`. A route
+   * registered under a BLOC or TREATY is found, but no run is started for it
+   * yet: the run's later steps file a country visa record and draft a country
+   * rulebook, and the shared-layer versions of those steps are P4 of #228.
+   * Refusing here (before any write or spend) is the safe reading.
    * The head doc, the active-run check, the daily count and the new run are one
    * transaction, so a double click opens ONE run: the second click finds it.
    */
-  async start(countryCode: string, visaTypeId: string, uid: string): Promise<RouteOnboardingRun> {
+  async start(authorityId: string, visaTypeId: string, uid: string): Promise<RouteOnboardingRun> {
     const loaded = await this.d.loadSettings();
     if (loaded.readError) throw new OnboardingError("SETTINGS_UNAVAILABLE", 503, "Settings could not be read, so no run was started. Try again shortly.");
     if (!loaded.settings.enabled) throw new OnboardingError("ONBOARDING_DISABLED", 503, "Route onboarding is switched off (appConfig/routeOnboardingSettings).");
     let routeKey: string;
+    const idCheck = checkAuthorityId(authorityId);
     try {
-      routeKey = rubricRouteKey(countryCode, visaTypeId);
+      if (!idCheck.ok) throw new Error(idCheck.message);
+      routeKey = buildRulebookKey(authorityId, visaTypeId);
     } catch {
-      throw new OnboardingError("VALIDATION_ERROR", 400, "That is not a valid country code and visa id.");
+      throw new OnboardingError("VALIDATION_ERROR", 400, "That is not a valid authority id and visa id.");
     }
-    const registered = await this.findRegistered(countryCode, visaTypeId);
+    const registered = await this.findRegistered(authorityId, visaTypeId);
     if (!registered) {
       throw new OnboardingError("ROUTE_NOT_REGISTERED", 404, "That route is not registered. Register its visa page and rule pages first.");
     }
+    if (idCheck.ok && idCheck.shape !== "country") {
+      throw new OnboardingError(
+        "SHARED_LAYER_NOT_READY",
+        422,
+        "This route belongs to a bloc or treaty. Its sources are registered, but drafting a shared rulebook is not available yet, so no run was started."
+      );
+    }
+    // From here on the authority is a country: the run keeps its `countryCode` field.
+    const countryCode = authorityId;
     const nowMs = this.d.clock();
     const now = Timestamp.fromMillis(nowMs);
     const dayStart = Timestamp.fromMillis(Math.floor(nowMs / 86_400_000) * 86_400_000);

@@ -99,7 +99,10 @@ export async function importOfficialDomains(
       if (!options.apply) return;
       const doc: OfficialDomain = {
         host: p.host,
-        countryCode: p.countryCode,
+        // Issue #232: hosts belong to an authority; the built-in list is
+        // per country, and a country's authority id is its code (content
+        // unchanged: country entries only).
+        authorityId: p.countryCode,
         status: "confirmed",
         confirmedBy: SEED_ACTOR,
         confirmedAt: now,

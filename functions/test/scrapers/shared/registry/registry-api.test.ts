@@ -58,16 +58,16 @@ function serveFixtures(): void {
 }
 
 /** Check, then confirm, one host (admin). */
-async function confirmHost(host: string, countryCode = "SV"): Promise<void> {
+async function confirmHost(host: string, authorityId = "SV"): Promise<void> {
   const p = await admin("POST", "/admin/official-domains/preview", { url: `https://${host}/` });
   assert.equal(p.status, 200, JSON.stringify(p.body));
-  const c = await admin("POST", "/admin/official-domains", { host, countryCode, statement: "The Example Agency" });
+  const c = await admin("POST", "/admin/official-domains", { host, authorityId, statement: "The Example Agency" });
   assert.ok(c.status === 201 || c.status === 200, JSON.stringify(c.body));
 }
 
 /** A valid registration body, with overrides. */
 const routeBody = (over: Record<string, unknown> = {}) => ({
-  countryCode: "SV",
+  authorityId: "SV",
   routeName: "Visitor route",
   visaPage: { url: VISA_URL, language: "en" },
   guidance: [
@@ -98,7 +98,7 @@ const auditDocs = () => [...store.entries()].filter(([p]) => p.startsWith("sourc
 describe("registry API: authorization (every endpoint)", () => {
   const ENDPOINTS: Array<[string, string, unknown]> = [
     ["POST", "/admin/official-domains/preview", { url: "https://www.agency.example.org/" }],
-    ["POST", "/admin/official-domains", { host: "www.agency.example.org", countryCode: "SV", statement: "x agency" }],
+    ["POST", "/admin/official-domains", { host: "www.agency.example.org", authorityId: "SV", statement: "x agency" }],
     ["GET", "/admin/official-domains", undefined],
     ["POST", "/admin/official-domains/www.agency.example.org/revoke", {}],
     ["GET", "/admin/route-sources/country-lookup?code=SV", undefined],
@@ -271,7 +271,8 @@ describe("official domains: confirm, list, revoke", () => {
     await confirmHost("www.agency.example.org");
     const doc = store.get("officialDomains/www.agency.example.org") as any;
     assert.equal(doc.host, "www.agency.example.org");
-    assert.equal(doc.countryCode, "SV");
+    assert.equal(doc.authorityId, "SV");
+    assert.equal(doc.countryCode, undefined); // the pre-#232 field is not written any more
     assert.equal(doc.status, "confirmed");
     assert.equal(doc.confirmedBy, "admin-uid");
     assert.equal(doc.confirmedAt.toMillis(), nowMs);
@@ -291,7 +292,7 @@ describe("official domains: confirm, list, revoke", () => {
 
   test("confirming needs the address check first, and it must be fresh", async () => {
     serveFixtures();
-    const body = { host: "www.agency.example.org", countryCode: "SV", statement: "The Example Agency" };
+    const body = { host: "www.agency.example.org", authorityId: "SV", statement: "The Example Agency" };
     const r = await admin("POST", "/admin/official-domains", body);
     assert.equal(r.status, 422);
     assert.equal(r.body.error, "PREVIEW_REQUIRED");
@@ -308,14 +309,14 @@ describe("official domains: confirm, list, revoke", () => {
     const k = "officialDomainPreviews/admin-uid__www.agency.example.org";
     store.set("officialDomainPreviews/other-uid__www.agency.example.org", store.get(k)!);
     store.delete(k);
-    const r = await admin("POST", "/admin/official-domains", { host: "www.agency.example.org", countryCode: "SV", statement: "The Example Agency" });
+    const r = await admin("POST", "/admin/official-domains", { host: "www.agency.example.org", authorityId: "SV", statement: "The Example Agency" });
     assert.equal(r.body.error, "PREVIEW_REQUIRED");
   });
 
   test("a check that ended on a different host cannot confirm the host that was typed", async () => {
     fetcher.pages.set("https://www.agency.example.org/", { finalUrl: "https://other.example.net/" });
     await admin("POST", "/admin/official-domains/preview", { url: "https://www.agency.example.org/" });
-    const r = await admin("POST", "/admin/official-domains", { host: "www.agency.example.org", countryCode: "SV", statement: "The Example Agency" });
+    const r = await admin("POST", "/admin/official-domains", { host: "www.agency.example.org", authorityId: "SV", statement: "The Example Agency" });
     assert.equal(r.status, 422);
     assert.equal(r.body.error, "PREVIEW_HOST_MISMATCH");
     assert.equal(store.has("officialDomains/www.agency.example.org"), false);
@@ -336,7 +337,7 @@ describe("official domains: confirm, list, revoke", () => {
   ];
   for (const [name, host, code] of BAD_HOSTS) {
     test(`refuses to confirm a ${name} host (${code})`, async () => {
-      const r = await admin("POST", "/admin/official-domains", { host, countryCode: "SV", statement: "The Example Agency" });
+      const r = await admin("POST", "/admin/official-domains", { host, authorityId: "SV", statement: "The Example Agency" });
       assert.equal(r.status, 400, JSON.stringify(r.body));
       assert.equal(r.body.error, code);
     });
@@ -345,27 +346,37 @@ describe("official domains: confirm, list, revoke", () => {
   test("refuses a bad country, a missing or empty statement, unknown keys", async () => {
     serveFixtures();
     await admin("POST", "/admin/official-domains/preview", { url: "https://www.agency.example.org/" });
-    const base = { host: "www.agency.example.org", countryCode: "SV", statement: "The Example Agency" };
-    assert.equal((await admin("POST", "/admin/official-domains", { ...base, countryCode: "ZZ" })).body.error, "INVALID_COUNTRY_CODE");
-    assert.equal((await admin("POST", "/admin/official-domains", { ...base, countryCode: "S" })).body.error, "INVALID_COUNTRY_CODE");
+    const base = { host: "www.agency.example.org", authorityId: "SV", statement: "The Example Agency" };
+    assert.equal((await admin("POST", "/admin/official-domains", { ...base, authorityId: "ZZ" })).body.error, "INVALID_AUTHORITY");
+    assert.equal((await admin("POST", "/admin/official-domains", { ...base, authorityId: "S" })).body.error, "INVALID_AUTHORITY");
+    // The old field name is an unknown key now.
+    assert.equal((await admin("POST", "/admin/official-domains", { host: base.host, countryCode: "SV", statement: base.statement })).status, 400);
     assert.equal((await admin("POST", "/admin/official-domains", { ...base, statement: "   " })).body.error, "STATEMENT_REQUIRED");
-    assert.equal((await admin("POST", "/admin/official-domains", { host: base.host, countryCode: "SV" })).body.error, "STATEMENT_REQUIRED");
+    assert.equal((await admin("POST", "/admin/official-domains", { host: base.host, authorityId: "SV" })).body.error, "STATEMENT_REQUIRED");
     assert.equal((await admin("POST", "/admin/official-domains", { ...base, status: "confirmed" })).status, 400);
     assert.equal((await admin("POST", "/admin/official-domains", { ...base, confirmedBy: "someone" })).status, 400);
     assert.equal(store.has("officialDomains/www.agency.example.org"), false);
   });
 
-  test("confirming is idempotent: same answer, no second audit entry; another country is a conflict", async () => {
+  test("confirming is idempotent: same answer, no second audit entry; another authority is a conflict", async () => {
     serveFixtures();
     await confirmHost("www.agency.example.org");
-    const again = await admin("POST", "/admin/official-domains", { host: "WWW.Agency.Example.org", countryCode: "SV", statement: "A different statement" });
+    const again = await admin("POST", "/admin/official-domains", { host: "WWW.Agency.Example.org", authorityId: "SV", statement: "A different statement" });
     assert.equal(again.status, 200);
     assert.equal(again.body.data.created, false);
     assert.equal(again.body.data.domain.statement, "The Example Agency"); // untouched
     assert.equal(auditDocs().length, 1);
-    const other = await admin("POST", "/admin/official-domains", { host: "www.agency.example.org", countryCode: "KE", statement: "The Example Agency" });
+    const other = await admin("POST", "/admin/official-domains", { host: "www.agency.example.org", authorityId: "KE", statement: "The Example Agency" });
     assert.equal(other.status, 409);
-    assert.equal(other.body.error, "HOST_CONFIRMED_FOR_OTHER_COUNTRY");
+    assert.equal(other.body.error, "HOST_CONFIRMED_FOR_OTHER_AUTHORITY");
+    assert.equal(other.body.message, "That website is already confirmed for a different authority");
+    assert.equal(other.body.confirmedFor, "SV");
+    // A bloc cannot take over a host confirmed for a country either.
+    store.set("authorities/test-bloc", { id: "test-bloc", kind: "bloc", name: "Test Bloc", status: "active" });
+    const bloc = await admin("POST", "/admin/official-domains", { host: "www.agency.example.org", authorityId: "test-bloc", statement: "Test Bloc secretariat" });
+    assert.equal(bloc.status, 409);
+    assert.equal(bloc.body.error, "HOST_CONFIRMED_FOR_OTHER_AUTHORITY");
+    assert.equal(auditDocs().length, 1);
   });
 
   test("list returns every host sorted, with ISO dates", async () => {
@@ -404,7 +415,7 @@ describe("official domains: confirm, list, revoke", () => {
     // Revoking the visa page's host pauses the visa page and drops the host from officialHosts.
     const r2 = await admin("POST", "/admin/official-domains/www.agency.example.org/revoke", {});
     assert.equal(r2.status, 200);
-    assert.deepEqual(r2.body.data.pausedVisaPages, [{ countryCode: "SV", url: VISA_URL }]);
+    assert.deepEqual(r2.body.data.pausedVisaPages, [{ authorityId: "SV", url: VISA_URL }]);
     const vs = store.get("visaSources/SV") as any;
     assert.equal(vs.pages[0].paused, true);
     assert.equal(vs.pages[0].pausedReason, "host_revoked");
@@ -472,8 +483,9 @@ describe("POST /admin/route-sources", () => {
     assert.equal(r.status, 201, JSON.stringify(r.body));
     const d = r.body.data;
     assert.equal(d.created, true);
-    assert.equal(d.countryCode, "SV");
-    assert.equal(d.countryName, "El Salvador");
+    assert.equal(d.authorityId, "SV");
+    assert.equal(d.authorityName, "El Salvador");
+    assert.equal(d.authorityKind, "country");
     assert.equal(d.countryCreated, true);
     assert.equal(d.visaId, "sv-visitor-route");
     assert.deepEqual(d.guidanceSourceIds, ["sv-visitor-rules", "sv-visitor-guide"]);
@@ -502,6 +514,9 @@ describe("POST /admin/route-sources", () => {
     assert.equal(vs.status, "active");
     assert.deepEqual(vs.crawlWindow, { timeZone: "Etc/UTC", dayOfWeek: 1, startHour: 2, endHour: 5 });
     assert.equal(vs.addedVia, "portal");
+    assert.equal(vs.authorityId, "SV");
+    assert.equal(vs.countryCode, "SV");
+    assert.ok(vs.nextCrawlAt, "a country source is scheduled for the visa crawl");
 
     // Guidance sources.
     const g = store.get("guidanceSources/sv-visitor-rules") as any;
@@ -789,6 +804,226 @@ describe("POST /admin/route-sources", () => {
     await readyToRegister();
     store.set("appConfig/routeOnboardingSettings", { maxGuidancePerRoute: 1 });
     assert.equal((await admin("POST", "/admin/route-sources", routeBody())).body.error, "TOO_MANY_PAGES");
+  });
+});
+
+// ============================================
+// Issue #232: websites and routes belong to an authority
+// ============================================
+
+describe("authorities: official websites and routes of a bloc or treaty (#232)", () => {
+  /** A made-up bloc (no real bloc is named in tests). */
+  const BLOC_ID = "test-bloc";
+  const BLOC_HOST = "www.bloc.example.org";
+  const BLOC_VISA_URL = `https://${BLOC_HOST}/short-stay`;
+  const BLOC_RULES_URL = `https://${BLOC_HOST}/rules`;
+
+  /** Create the bloc (as P1's API would store it). */
+  const putBloc = (status = "active") => store.set(`authorities/${BLOC_ID}`, { id: BLOC_ID, kind: "bloc", name: "Test Bloc", status });
+
+  /** Serve the bloc's pages. */
+  const serveBloc = () => {
+    fetcher.pages.set(`https://${BLOC_HOST}/`, { lang: "en", title: "Test Bloc" });
+    fetcher.pages.set(BLOC_VISA_URL, { lang: "en", title: "Short stay" });
+    fetcher.pages.set(BLOC_RULES_URL, { lang: "en", title: "Rules" });
+  };
+
+  /** A registration body under the bloc. */
+  const blocRoute = (over: Record<string, unknown> = {}) =>
+    routeBody({
+      authorityId: BLOC_ID,
+      routeName: "Short stay",
+      visaPage: { url: BLOC_VISA_URL, language: "en" },
+      guidance: [{ url: BLOC_RULES_URL, title: "Short stay rules", role: "primary", docType: "html", language: "en" }],
+      ...over,
+    });
+
+  test("a host is confirmed for a bloc: authorityId stored, statement kept, list and audit show it", async () => {
+    putBloc();
+    serveBloc();
+    await confirmHost(BLOC_HOST, BLOC_ID);
+    const doc = store.get(`officialDomains/${BLOC_HOST}`) as any;
+    assert.equal(doc.authorityId, BLOC_ID);
+    assert.equal(doc.statement, "The Example Agency");
+    const list = await admin("GET", "/admin/official-domains");
+    assert.equal(list.body.data.domains[0].authorityId, BLOC_ID);
+    assert.equal(list.body.data.domains[0].statement, "The Example Agency");
+    const audit = auditDocs().find((a) => a.action === "domain_confirmed");
+    assert.equal(audit.after.authorityId, BLOC_ID);
+    assert.equal(audit.statement, "The Example Agency");
+    // Same authority again: idempotent.
+    const again = await admin("POST", "/admin/official-domains", { host: BLOC_HOST, authorityId: BLOC_ID, statement: "Test Bloc" });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.data.created, false);
+    // A country cannot take the bloc's host.
+    const other = await admin("POST", "/admin/official-domains", { host: BLOC_HOST, authorityId: "SV", statement: "Test Bloc" });
+    assert.equal(other.status, 409);
+    assert.equal(other.body.error, "HOST_CONFIRMED_FOR_OTHER_AUTHORITY");
+  });
+
+  test("an unknown, malformed or retired authority is refused and nothing is stored", async () => {
+    serveBloc();
+    await admin("POST", "/admin/official-domains/preview", { url: `https://${BLOC_HOST}/` });
+    const body = (authorityId: unknown) => ({ host: BLOC_HOST, authorityId, statement: "Test Bloc" });
+    for (const id of ["no-such-bloc", "bad_id", "ab", "", 7, undefined]) {
+      const r = await admin("POST", "/admin/official-domains", body(id));
+      assert.equal(r.status, 400, JSON.stringify(id));
+      assert.equal(r.body.error, "INVALID_AUTHORITY", JSON.stringify(id));
+    }
+    putBloc("retired");
+    const retired = await admin("POST", "/admin/official-domains", body(BLOC_ID));
+    assert.equal(retired.status, 409);
+    assert.equal(retired.body.error, "AUTHORITY_RETIRED");
+    // A retired COUNTRY authority is refused too.
+    store.set("authorities/SV", { id: "SV", kind: "country", name: "Country", status: "retired" });
+    assert.equal((await admin("POST", "/admin/official-domains", body("SV"))).body.error, "AUTHORITY_RETIRED");
+    assert.equal(store.has(`officialDomains/${BLOC_HOST}`), false);
+    assert.equal(auditDocs().length, 0);
+  });
+
+  test("a route registered under a bloc creates no country, nothing visible, and is keyed by the bloc", async () => {
+    putBloc();
+    serveBloc();
+    await confirmHost(BLOC_HOST, BLOC_ID);
+    fetcher.calls.length = 0;
+    const r = await admin("POST", "/admin/route-sources", blocRoute());
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    const d = r.body.data;
+    assert.equal(d.authorityId, BLOC_ID);
+    assert.equal(d.authorityName, "Test Bloc");
+    assert.equal(d.authorityKind, "bloc");
+    assert.equal(d.countryCreated, false);
+    assert.equal(d.visaId, "test-bloc-short-stay");
+    assert.deepEqual(d.guidanceSourceIds, ["test-bloc-short-stay-rules"]);
+
+    // Nothing under countries/: no country, no visa record.
+    assert.equal([...store.keys()].filter((p) => p.startsWith("countries/")).length, 0);
+    // The visa source is the bloc's, unscheduled for the (country) visa crawl.
+    const vs = store.get(`visaSources/${BLOC_ID}`) as any;
+    assert.equal(vs.id, BLOC_ID);
+    assert.equal(vs.authorityId, BLOC_ID);
+    assert.equal(vs.countryCode, undefined);
+    assert.equal(vs.nextCrawlAt, undefined);
+    assert.equal(vs.pages[0].visaId, "test-bloc-short-stay");
+    // Guidance jurisdiction holds the authority id.
+    const g = store.get("guidanceSources/test-bloc-short-stay-rules") as any;
+    assert.equal(g.jurisdiction, BLOC_ID);
+    assert.equal(g.route, "short-stay");
+    // Audit names the bloc, never a country.
+    const actions = auditDocs().map((a) => a.action);
+    assert.ok(!actions.includes("country_created"));
+    const reg = auditDocs().find((a) => a.action === "route_registered");
+    assert.equal(reg.targetId, `${BLOC_ID}/test-bloc-short-stay`);
+    assert.equal(reg.after.authorityKind, "bloc");
+    // Every page was previewed with the host policy.
+    assert.ok(fetcher.calls.length === 2 && fetcher.calls.every((c) => c.allowedHost));
+
+    // Repeating the same body changes nothing and fetches nothing.
+    const snap = stateSnapshot();
+    const n = fetcher.calls.length;
+    const again = await admin("POST", "/admin/route-sources", blocRoute());
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    assert.equal(again.body.data.created, false);
+    assert.equal(again.body.data.authorityName, "Test Bloc");
+    assert.equal(stateSnapshot(), snap);
+    assert.equal(fetcher.calls.length, n);
+  });
+
+  test("registration needs hosts confirmed for THAT authority: a host confirmed for another one is refused before any request", async () => {
+    putBloc();
+    serveBloc();
+    serveFixtures();
+    // The bloc's host is confirmed for a COUNTRY, not for the bloc.
+    await confirmHost(BLOC_HOST, "SV");
+    fetcher.calls.length = 0;
+    const r = await admin("POST", "/admin/route-sources", blocRoute());
+    assert.equal(r.status, 422);
+    assert.equal(r.body.error, "HOST_NOT_CONFIRMED");
+    assert.deepEqual(r.body.hosts, [BLOC_HOST]);
+    assert.equal(fetcher.calls.length, 0);
+    // And the other way round: a country route cannot use a host confirmed for another country.
+    await confirmHost("www.agency.example.org", "KE");
+    await confirmHost("rules.agency.example.org", "SV");
+    fetcher.calls.length = 0;
+    const c = await admin("POST", "/admin/route-sources", routeBody());
+    assert.equal(c.status, 422);
+    assert.deepEqual(c.body.hosts, ["www.agency.example.org"]);
+    assert.equal(fetcher.calls.length, 0);
+  });
+
+  test("a redirect to a host confirmed for a different authority is refused (redirect policy per authority)", async () => {
+    putBloc();
+    serveBloc();
+    serveFixtures();
+    await confirmHost(BLOC_HOST, BLOC_ID);
+    await confirmHost("www.agency.example.org", "SV"); // confirmed, but for a country
+    // The bloc's visa page redirects onto the country's host.
+    fetcher.pages.set(BLOC_VISA_URL, { finalUrl: "https://www.agency.example.org/visit" });
+    const snap = stateSnapshot();
+    const r = await admin("POST", "/admin/route-sources", blocRoute());
+    assert.equal(r.status, 422);
+    assert.equal(r.body.error, "HOST_NOT_CONFIRMED");
+    assert.equal(r.body.url, BLOC_VISA_URL);
+    assert.equal(stateSnapshot(), snap);
+  });
+
+  test("registration refuses an unknown or retired bloc before any request", async () => {
+    serveBloc();
+    const unknown = await admin("POST", "/admin/route-sources", blocRoute());
+    assert.equal(unknown.status, 400);
+    assert.equal(unknown.body.error, "INVALID_AUTHORITY");
+    assert.equal((await admin("POST", "/admin/route-sources", blocRoute({ authorityId: "bad_id" }))).body.error, "INVALID_AUTHORITY");
+    assert.equal((await admin("POST", "/admin/route-sources", routeBody({ authorityId: "ZZ" }))).body.error, "INVALID_AUTHORITY");
+    // The old field name is an unknown key.
+    const old = routeBody();
+    delete (old as any).authorityId;
+    assert.equal((await admin("POST", "/admin/route-sources", { ...old, countryCode: "SV" })).status, 400);
+    putBloc("retired");
+    assert.equal((await admin("POST", "/admin/route-sources", blocRoute())).body.error, "AUTHORITY_RETIRED");
+    // A visa id must carry the bloc's prefix.
+    putBloc();
+    assert.equal((await admin("POST", "/admin/route-sources", blocRoute({ visaId: "sv-short-stay" }))).body.error, "INVALID_VISA_ID");
+    assert.equal(fetcher.calls.length, 0);
+  });
+
+  test("a guidance source cannot be switched on while its host is confirmed only for another authority", async () => {
+    await readyToRegister();
+    await admin("POST", "/admin/route-sources", routeBody());
+    await admin("POST", "/admin/official-domains/rules.agency.example.org/revoke", {});
+    // The host is re-confirmed, but for a different country.
+    await confirmHost("rules.agency.example.org", "KE");
+    const r = await admin("PATCH", "/admin/guidance-sources/sv-visitor-rules", { status: "active" });
+    assert.equal(r.status, 422);
+    assert.equal(r.body.error, "HOST_NOT_CONFIRMED");
+    assert.equal((store.get("guidanceSources/sv-visitor-rules") as any).status, "paused");
+  });
+
+  test("an officialDomains doc from before #232 (countryCode only) is read as that country's authority", async () => {
+    serveFixtures();
+    const legacy = (host: string) => ({ host, countryCode: "SV", status: "confirmed", confirmedBy: "u", confirmedAt: Timestamp.fromMillis(nowMs), statement: "The Example Agency", addedVia: "portal" });
+    store.set("officialDomains/www.agency.example.org", legacy("www.agency.example.org"));
+    store.set("officialDomains/rules.agency.example.org", legacy("rules.agency.example.org"));
+    // Listed with authorityId, without the old field.
+    const list = await admin("GET", "/admin/official-domains");
+    assert.equal(list.status, 200);
+    assert.deepEqual(list.body.data.domains.map((d: any) => [d.authorityId, d.countryCode]), [["SV", undefined], ["SV", undefined]]);
+    // Confirming for the same country is idempotent; for another, a conflict.
+    await admin("POST", "/admin/official-domains/preview", { url: "https://www.agency.example.org/" });
+    assert.equal((await admin("POST", "/admin/official-domains", { host: "www.agency.example.org", authorityId: "SV", statement: "x agency" })).body.data.created, false);
+    assert.equal((await admin("POST", "/admin/official-domains", { host: "www.agency.example.org", authorityId: "KE", statement: "x agency" })).body.error, "HOST_CONFIRMED_FOR_OTHER_AUTHORITY");
+    // Registration under that country accepts the old docs' hosts.
+    fetcher.calls.length = 0;
+    const r = await admin("POST", "/admin/route-sources", routeBody());
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    // A revoke rewrites the doc in today's shape.
+    await admin("POST", "/admin/official-domains/rules.agency.example.org/revoke", {});
+    const revoked = store.get("officialDomains/rules.agency.example.org") as any;
+    assert.equal(revoked.authorityId, "SV");
+    assert.equal(revoked.countryCode, undefined);
+    // A doc with neither field belongs to no authority (fails closed).
+    const { officialDomainAuthorityId } = await import("../../../../src/scrapers/shared/registry/official-domains.service");
+    assert.equal(officialDomainAuthorityId({ host: "x.example.org" }), "");
+    assert.equal(officialDomainAuthorityId({ authorityId: "test-bloc", countryCode: "SV" }), "test-bloc");
   });
 });
 

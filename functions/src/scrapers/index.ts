@@ -84,6 +84,12 @@ export { RegistryError, isRegistryError } from "./shared/registry/registry-error
 export { appendRegistryAudit, stripUndefined } from "./shared/registry/registry-audit";
 export type { RegistryAuditAction, RegistryAuditEntry } from "./shared/registry/registry-audit";
 export { parseRegistryUrl } from "./shared/registry/registry-address";
+/**
+ * (#232) Which authority a stored official website belongs to (reads the
+ * pre-#232 `countryCode` field too, until the #239 migration). The
+ * authorities API uses it to check a membership quote's host.
+ */
+export { officialDomainAuthorityId } from "./shared/registry/official-domains.service";
 
 // ---- Caseworker-guidance registry (issue #39) ----
 /** Admin list of guidance sources (GET /admin/guidance-sources). */

@@ -179,7 +179,16 @@ export interface VisaSourceHostBackoff {
 // One registry entry per country. Holds the known official pages for that
 // country plus health/scheduling fields (mirrors the news `NewsSource`).
 export interface VisaSource {
-  id: string; // ISO alpha-2 country code, e.g. "GB"
+  // The issuing authority's id (issue #232): an ISO alpha-2 country code,
+  // e.g. "GB", or a bloc/treaty id for a route registered under one.
+  id: string;
+  // Issue #232: the issuing authority, same as `id`. Written by route
+  // registration from #232 on; older docs (seeded or portal) lack it and are
+  // country sources whose authority is their `countryCode`.
+  authorityId?: string;
+  // The country the crawl files records under (`countries/{countryCode}`).
+  // Present for country sources only: a bloc's or treaty's source has none
+  // and is never crawled by the visa crawl (see isCountrySourceId).
   countryCode: string;
   countryName: string;
   isOfficial: boolean; // are all pages on official/government domains?

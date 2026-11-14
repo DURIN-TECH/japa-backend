@@ -3,7 +3,7 @@ import { collections, db } from "../../../utils/firebase";
 import { GUIDANCE_SOURCE_ROLES, type GuidanceSourceRole } from "../../guidance/types";
 import { appendRegistryAudit } from "./registry-audit";
 import { RegistryError } from "./registry-errors";
-import { officialDomainsService } from "./official-domains.service";
+import { officialDomainAuthorityId } from "./official-domains.service";
 
 // ============================================
 // GUIDANCE SOURCE EDITS (issue #215)
@@ -17,7 +17,9 @@ import { officialDomainsService } from "./official-domains.service";
 //
 // Guard rails:
 //  - a portal-added source cannot be set `active` while its host is not a
-//    confirmed host (a revoke paused it; re-confirm the host first);
+//    host confirmed FOR THE SOURCE'S AUTHORITY (its `jurisdiction`, issue
+//    #232): a revoke paused it, re-confirm the host first; a host confirmed
+//    for a different authority does not count;
 //  - setting `active` clears the system's `pausedReason`;
 //  - a role change that would leave the route (same jurisdiction + route,
 //    sources not retired) without a `primary` source is refused: without one,
@@ -76,9 +78,6 @@ class GuidanceSourceEditService {
     const ref = collections.guidanceSources.doc(id);
     const now = Timestamp.fromMillis(this.clock());
 
-    // Reads that need no transaction: the confirmed hosts (for re-activation).
-    const confirmed = patch.status === "active" ? await officialDomainsService.confirmedHosts() : undefined;
-
     return this.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       if (!snap.exists) throw new RegistryError("NOT_FOUND", 404, "That guidance source is not in the registry");
@@ -94,8 +93,18 @@ class GuidanceSourceEditService {
           } catch {
             /* an unreadable address is never confirmed */
           }
-          if (!confirmed!.has(host)) {
-            throw new RegistryError("HOST_NOT_CONFIRMED", 422, `${host || "This address"} is not a confirmed official website, so the source cannot be switched on`, { hosts: [host] });
+          // The host's own record, read in this transaction: it must be
+          // confirmed, and confirmed for the authority this source belongs to.
+          const domainSnap = host ? await tx.get(collections.officialDomains.doc(host)) : undefined;
+          const domain = domainSnap?.exists ? (domainSnap.data() as Record<string, unknown>) : undefined;
+          const ok = domain?.status === "confirmed" && officialDomainAuthorityId(domain) === String(cur.jurisdiction ?? "");
+          if (!ok) {
+            throw new RegistryError(
+              "HOST_NOT_CONFIRMED",
+              422,
+              `${host || "This address"} is not a confirmed official website of this source's authority, so the source cannot be switched on`,
+              { hosts: [host] }
+            );
           }
         }
         update.status = patch.status;
