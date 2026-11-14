@@ -1820,7 +1820,7 @@ export class RubricExtractionService {
    * `attempts`). Throws `RunStop` for a provider failure, like the other steps.
    */
   async redraftRule(
-    input: { rule: AssessmentCriterion; aspects: readonly string[]; index: SnapshotQuoteIndex; routeName: string; limits: { maxOutputTokens: number; timeoutMs: number } },
+    input: { rule: AssessmentCriterion; aspects: readonly string[]; index: SnapshotQuoteIndex; routeName: string; limits: { maxOutputTokens: number; timeoutMs: number }; sent?: { chars: number } },
     usage: RubricRunUsage,
     attempts: CallAttempts,
     opts: CallOptions = {}
@@ -1851,7 +1851,10 @@ export class RubricExtractionService {
       ...(rule.appliesTo ? { appliesTo: { nationalities: rule.appliesTo.nationalities, asWritten: rule.appliesTo.asWritten, ...(rule.appliesTo.uncoded ? { uncoded: rule.appliesTo.uncoded } : {}) } } : {}),
     };
     const levels = [...DEFAULT_SEVERITY_LEVELS];
-    const raw = await this.callModel(buildRepairRequest(chunk, { rule: shown, aspects: input.aspects }, levels, input.limits, route), usage, attempts, opts);
+    const request = buildRepairRequest(chunk, { rule: shown, aspects: input.aspects }, levels, input.limits, route);
+    // The caller's input-size cap counts what is really sent (the prompt plus the bounded window).
+    if (input.sent) input.sent.chars += request.system.length + request.user.length;
+    const raw = await this.callModel(request, usage, attempts, opts);
     // The model's own "cannot be repaired": no rule at all.
     if (raw.criteria.length === 0) return { kind: "cannot_be_repaired" };
 
