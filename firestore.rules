@@ -669,6 +669,18 @@ service cloud.firestore {
     //    match. (The superseded checkouts themselves live on the booking, as
     //    `supersededCheckouts`.)
 
+    //  - paymentRequests/{requestId}: an agent's request for payment, its
+    //    dollar price, the charge snapshot (rate, local amount), checkout
+    //    references and paid status (issue #181). Written only by the API
+    //    (the settlement flips it to paid in one Firestore transaction with
+    //    its Transaction); read through GET /payment-requests. A client that
+    //    could write one could mark it paid or change the amount charged. Do
+    //    NOT add a match.
+    //  - paymentRequestExceptions/{reference}: payment-request payments we
+    //    hold but cannot apply (a second charge on a superseded checkout, or a
+    //    payment on a cancelled request), for a human to refund (issue #181).
+    //    Do NOT add a match.
+
     //  - documentChecks/{documentId} and documentCheckCaps/{id}: per-upload
     //    document checks and their daily cost counters (issue #115). Clients read
     //    the check only through GET /documents/:id/check (tier-trimmed). Do NOT
