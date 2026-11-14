@@ -5,7 +5,7 @@
  *   - a rules file (JSON array of flat rules: `{ id, title, kind, stage, severity, applicability,
  *     applicabilityCondition?, trigger?, check?, appliesTo?, quote, listItems?, sourceId }`, the
  *     shape of an exported run's rules), and
- *   - one stored snapshot file per source (`--page <sourceId>=<snapshot.json>`, the JSON the
+ *   - one stored snapshot file per source (`--page <sourceId>=<page.json>`, the JSON the
  *     snapshot store keeps), and optionally
  *   - the draft's intake questions (`--questions <file.json>`, an array of `{ id, label, options }`),
  * and builds each rule's view with the PRODUCTION function (`viewOf`), so what is printed is exactly
@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   const rulesFile = args("rules")[0];
   const pages = args("page");
   if (!rulesFile || pages.length === 0) {
-    console.error("usage: --rules <file.json> --page <sourceId>=<snapshot.json> [--questions <file.json>] [--sample N | --ids a,b] [--show-headings]");
+    console.error("usage: --rules <file.json> --page <sourceId>=<page.json> [--questions <file.json>] [--sample N | --ids a,b] [--show-headings]");
     process.exit(2);
   }
   // The modules import the Firebase wrappers (they resolve a project id at load). This script never talks to
