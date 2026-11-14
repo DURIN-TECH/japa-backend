@@ -374,7 +374,12 @@ export class DocumentCheckService {
           type,
           createdAt: Timestamp.fromDate(this.deps.now()),
         });
-      } catch {
+      } catch (err) {
+        // Only ALREADY_EXISTS (gRPC code 6) means a duplicate delivery claimed it
+        // first; log anything else (name only) and still return, never throw.
+        if ((err as { code?: number }).code !== 6) {
+          console.error(`[document-check] claim failed for ${documentId}: ${(err as Error).name}`);
+        }
         return;
       }
 

@@ -1608,6 +1608,10 @@ export type NotificationType =
   | "document_check_problems" // An upload check found something to fix
   | "document_check_could_not_check" // An upload was saved but could not be checked
   | "document_check_passed" // An upload check passed (in_app only)
+  // Refusal-letter analysis finished (issue #268), self-service only, in_app + push.
+  // relatedEntityType "application", relatedEntityId = the application id,
+  // data.analysisId = the analysis. No reason text from the letter in the copy.
+  | "refusal_analysis_ready"
   // Documents
   | "document_status"
   | "document_uploaded" // Client uploaded a document for review

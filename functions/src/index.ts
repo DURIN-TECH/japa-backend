@@ -93,7 +93,9 @@ import { claimsService } from "./services/claims.service";
 import { notificationService } from "./services/notification.service";
 // Issue #181: payment-request amounts in copy, with explicit currency codes.
 import { describeRequestAmount } from "./services/payment-request-charge.service";
-import type { PaymentRequest } from "./types";
+import type { Application, PaymentRequest } from "./types";
+import { applicationStatusMessage } from "./utils/application-status-copy";
+import { isSelfServiceApplication } from "./utils/self-service";
 import { unreadMessageReminderService } from "./services/unread-message-reminder.service";
 import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
@@ -215,17 +217,10 @@ export const onApplicationUpdated = functions
       );
 
       try {
-        // Friendly per-status copy (falls back to a humanized status).
-        const statusMessages: Record<string, string> = {
-          under_review: "Your application is now under review.",
-          submitted_to_embassy: "Your application has been submitted to the embassy.",
-          interview_scheduled: "Your interview has been scheduled.",
-          approved: "Congratulations! Your visa has been approved.",
-          rejected: "Unfortunately, your visa application was not approved.",
-        };
-        const message =
-          statusMessages[after.status] ??
-          `Your application status is now: ${after.status.replace(/_/g, " ")}`;
+        // Per-status copy (issue #268): every status has its own sentence, and a
+        // self-service applicant (mode self, no agent, no agency) gets a friendlier
+        // `under_review` and `withdrawn`. See utils/application-status-copy.ts.
+        const message = applicationStatusMessage(after.status, isSelfServiceApplication(after as Application));
 
         // One call fans out to in-app + push + email (per the channel policy).
         await notificationService.notifyUser({
@@ -1173,5 +1168,9 @@ export const processRefusalAnalysisJob = functions
     const after = change.after.data() ?? {};
     const before = change.before.exists ? change.before.data() ?? {} : {};
     if (after.status !== "queued" || before.status === "queued") return;
-    await refusalLetterService.runJob(context.params.analysisId);
+    const result = await refusalLetterService.runJob(context.params.analysisId);
+    // #268: tell a self-service applicant their letter was read (or could not be
+    // used). Only after a job that actually ran and succeeded; a failed or skipped
+    // job says nothing here (failure notices are #271). Never throws, no email.
+    if (result === "succeeded") await refusalLetterService.notifyApplicant(context.params.analysisId);
   });
