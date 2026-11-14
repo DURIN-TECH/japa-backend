@@ -23,8 +23,11 @@
 //    is 503 with nothing written (the #179 review rule);
 //  - missing / stale rate, unsupported or disabled currency: 503
 //    PRICING_UNAVAILABLE, no Paystack call;
-//  - quote lock: verify / retry after expiry re-prices with a fresh quote;
-//    inside the lock a retry returns the same checkout;
+//  - quote lock: an UNPAID booking past its lock is re-priced with a fresh
+//    quote on verify / retry; inside the lock a retry returns the same
+//    checkout; an EXACT payment on the current reference that lands after
+//    the lock is honoured and flagged `paidAfterQuoteExpiry` (booking and
+//    transaction); a payment on a superseded reference is refused;
 //  - legacy `fee`-only bookings still verify as naira and are never re-priced.
 import { test, describe, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -536,16 +539,79 @@ describe("verify: Paystack's amount and currency must match the stored charge", 
     assert.equal(harness.charges.length, 1);
   });
 
-  test("paid at the right amount but after the lock: 409, not confirmed, nothing recorded", async () => {
+  test("paid exactly but after the lock: honoured (the checkout was ours) and flagged for review on booking + transaction", async () => {
+    const { id, reference } = await bookPaid();
+    const lockedUntil = onlyBooking().quoteExpiresAt.toMillis();
+    harness.clock.advanceHours(1);
+    setRate("NGN", 1700); // the rate moved meanwhile: the locked amount still settles it
+    const paidAt = new Date(lockedUntil + 10 * 60_000); // 10 minutes after the lock
+    paystackPaid(reference, id, { amountMinor: AGENCY_FEE_KOBO, currency: "NGN" }, paidAt);
+    let warned = "";
+    console.warn = (m: string) => void (warned += m);
+    const out = await verify(reference);
+    assert.ok(okStatus(out.status), JSON.stringify(out.body));
+    assert.equal(out.body.data.verified, true);
+
+    const b = onlyBooking();
+    assert.equal(b.paymentStatus, "paid");
+    assert.equal(b.status, "scheduled");
+    assert.equal(b.paidAfterQuoteExpiry, true);
+    assert.equal(b.paystackPaidAt.toMillis(), paidAt.getTime());
+    assert.equal(b.chargedAmountMinor, AGENCY_FEE_KOBO); // never re-priced
+    const txs = docsIn("transactions");
+    assert.equal(txs.length, 1);
+    assert.equal(txs[0][1].amount, AGENCY_FEE_KOBO);
+    assert.equal(txs[0][1].fxRate, NGN_RATE);
+    assert.equal(txs[0][1].paidAfterQuoteExpiry, true);
+    assert.equal(txs[0][1].paystackPaidAt.toMillis(), paidAt.getTime());
+    assert.match(warned, /paid after its quote expired/);
+    assert.equal(harness.charges.length, 1); // no second checkout opened
+
+    // Still idempotent.
+    await verify(reference);
+    assert.equal(docsIn("transactions").length, 1);
+  });
+
+  test("paid inside the lock: no late flag", async () => {
+    const { id, reference } = await bookPaid();
+    paystackPaid(reference, id, { amountMinor: AGENCY_FEE_KOBO, currency: "NGN" });
+    await verify(reference);
+    assert.equal("paidAfterQuoteExpiry" in onlyBooking(), false);
+    assert.equal("paidAfterQuoteExpiry" in docsIn("transactions")[0][1], false);
+  });
+
+  test("late but short: still 400 PAYMENT_MISMATCH, nothing recorded", async () => {
     const { id, reference } = await bookPaid();
     harness.clock.advanceHours(1);
-    paystackPaid(reference, id, { amountMinor: AGENCY_FEE_KOBO, currency: "NGN" });
+    paystackPaid(reference, id, { amountMinor: AGENCY_FEE_KOBO - 100, currency: "NGN" });
     const out = await verify(reference);
-    assert.equal(out.status, 409);
-    assert.equal(out.body.error, "QUOTE_EXPIRED");
+    assert.equal(out.status, 400);
+    assert.equal(out.body.error, "PAYMENT_MISMATCH");
     assert.equal(onlyBooking().paymentStatus, "pending");
     assert.equal(docsIn("transactions").length, 0);
-    assert.equal(harness.charges.length, 1); // no second checkout opened
+  });
+
+  test("a payment on a SUPERSEDED reference (re-priced since) is refused and logged, even at its exact old amount", async () => {
+    const { id, reference: oldRef } = await bookPaid();
+    harness.clock.advanceHours(1);
+    paystackAbandoned(oldRef, id, { agencySlug: "acme" });
+    const requoted = await verify(oldRef); // past the lock: fresh quote + new reference
+    assert.equal(requoted.status, 409);
+    const newRef = requoted.body.data.reference;
+    // The payer then pays the OLD checkout, exactly.
+    paystackPaid(oldRef, id, { amountMinor: AGENCY_FEE_KOBO, currency: "NGN" });
+    writes.length = 0;
+    let logged = "";
+    console.error = (m: string) => void (logged += m);
+    const out = await verify(oldRef);
+    assert.equal(out.status, 400);
+    assert.match(out.body.message, /does not belong/);
+    assert.match(logged, /superseded checkout/);
+    const b = onlyBooking();
+    assert.equal(b.paymentStatus, "pending");
+    assert.equal(b.transactionId, newRef);
+    assert.equal(docsIn("transactions").length, 0);
+    assert.deepEqual(writes, []);
   });
 
   test("a cancelled booking is not confirmed", async () => {
@@ -652,6 +718,21 @@ describe("retry an abandoned checkout", () => {
     assert.equal(out.body.data.requiresPayment, false);
     assert.equal(onlyBooking().paymentStatus, "paid");
     assert.equal(docsIn("transactions").length, 1);
+    assert.equal(harness.charges.length, 1);
+  });
+
+  test("the old checkout paid exactly after the lock: confirmed with the late flag, not charged again", async () => {
+    const { id, reference } = await bookSignedIn();
+    harness.clock.advanceHours(2);
+    paystackPaid(reference, id, { amountMinor: 1_500_000, currency: "NGN" });
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    console.warn = () => {};
+    const out = await retry(id, "uid-client1");
+    assert.ok(okStatus(out.status));
+    assert.equal(out.body.data.requiresPayment, false);
+    assert.equal(onlyBooking().paymentStatus, "paid");
+    assert.equal(onlyBooking().paidAfterQuoteExpiry, true);
+    assert.equal(docsIn("transactions")[0][1].paidAfterQuoteExpiry, true);
     assert.equal(harness.charges.length, 1);
   });
 

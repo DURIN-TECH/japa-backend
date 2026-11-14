@@ -445,7 +445,8 @@ export class ConsultationController {
    *
    *  - Already paid: `{ requiresPayment: false }` with the booking.
    *  - The current reference was in fact paid: confirmed here, with the same
-   *    checks as verify (amount, currency, inside the lock).
+   *    checks as verify (reference, amount, currency; a late exact payment is
+   *    honoured and flagged paidAfterQuoteExpiry).
    *  - Quote lock still open and a checkout exists: the SAME checkout is
    *    returned (no second charge is opened while the first can be paid).
    *  - Lock passed (or no checkout was ever opened): a FRESH quote and a new
@@ -484,7 +485,7 @@ export class ConsultationController {
             this.sendChargeRefused(res, check.reason, consultation.transactionId);
             return;
           }
-          const outcome = await confirmPaid(id, consultation.transactionId, check.charged);
+          const outcome = await confirmPaid(id, consultation.transactionId, check);
           if (!outcome) {
             sendError(res, "BOOKING_CHANGED", "The booking changed; please try again", 409);
             return;
@@ -964,7 +965,8 @@ export class ConsultationController {
    *  4. paid: the amount AND currency Paystack reports must equal the stored
    *     `chargedAmountMinor` / `chargedCurrency` (legacy: the naira `fee`),
    *     else 400 PAYMENT_MISMATCH, the booking stays pending and nothing is
-   *     recorded; a #180 booking paid after its lock is 409 and not confirmed;
+   *     recorded. An exact payment that landed after the quote lock is
+   *     honoured (the checkout was ours) and flagged `paidAfterQuoteExpiry`;
    *  5. confirm + record the fee Transaction in ONE Firestore transaction.
    */
   async verifyPublicConsultation(
@@ -1002,6 +1004,14 @@ export class ConsultationController {
       // a valid reference from an older, re-priced checkout could settle the
       // booking at the stale amount.
       if (consultation.transactionId !== reference) {
+        // A COMPLETED payment on a superseded checkout is money we hold for a
+        // booking it cannot settle: log it for review / refund.
+        if (result.status === "success") {
+          console.error(
+            `[consultation] Paystack charge ${reference} was paid on a superseded checkout of ${consultationId}; ` +
+              "not confirmed, needs manual review"
+          );
+        }
         sendError(res, "VALIDATION_ERROR", "This payment reference does not belong to this booking", 400);
         return;
       }
@@ -1055,7 +1065,7 @@ export class ConsultationController {
       }
 
       // (5) Confirm + record, atomically and once.
-      const outcome = await confirmPaid(consultationId, reference, check.charged);
+      const outcome = await confirmPaid(consultationId, reference, check);
       if (!outcome) {
         sendError(res, "BOOKING_CHANGED", "The booking changed while confirming; please try again", 409);
         return;
@@ -1087,26 +1097,13 @@ export class ConsultationController {
    */
   private sendChargeRefused(
     res: Response,
-    reason: "mismatch" | "paid_after_expiry" | "not_chargeable",
+    reason: "mismatch" | "not_chargeable",
     reference: string
   ): void {
     if (reason === "mismatch") {
       // Underpayment or wrong currency: log for reconciliation, record nothing.
       console.error(`[consultation] Paystack charge ${reference} does not match the stored charge; not confirmed`);
       sendError(res, "PAYMENT_MISMATCH", "The payment does not match the booking's price", 400);
-      return;
-    }
-    if (reason === "paid_after_expiry") {
-      // Paid at the right amount, but after the quote lock: not confirmed
-      // (a stale quote is never accepted). Logged so support can refund or
-      // settle it by hand; no new checkout is opened, to avoid a second charge.
-      console.error(`[consultation] Paystack charge ${reference} was paid after the quote expired; needs manual review`);
-      sendError(
-        res,
-        "QUOTE_EXPIRED",
-        "This payment arrived after the price quote expired. Our team will review it; you have not been booked yet.",
-        409
-      );
       return;
     }
     sendError(res, "BOOKING_NOT_PAYABLE", "This booking has nothing to pay", 409);

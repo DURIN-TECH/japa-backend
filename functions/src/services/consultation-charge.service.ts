@@ -44,7 +44,11 @@ import { transactionService } from "./transaction.service";
 //  5. Paystack receives `amount = chargedAmountMinor` and `currency =
 //     chargedCurrency` exactly as stored. On return, what Paystack reports it
 //     charged must equal the stored amount AND currency, or nothing is
-//     confirmed or recorded.
+//     confirmed or recorded. An exact payment on the booking's CURRENT
+//     reference is honoured even when it lands after the lock, and flagged
+//     `paidAfterQuoteExpiry` for review: the lock governs ISSUING a checkout,
+//     not honouring one we already issued. A payment on a superseded
+//     reference is still refused.
 //  6. Confirmation is ONE Firestore transaction: re-read the booking, and if
 //     it is not paid yet flip it to paid/scheduled and write the fee
 //     Transaction in the same commit. A second verify finds it paid and
@@ -299,21 +303,33 @@ export async function requote(c: Consultation, fallbackCallbackUrl: string): Pro
 // 4. Checking what Paystack reports, and confirming
 // ============================================
 
-/** Why a successful Paystack charge is not accepted for a booking. */
+/**
+ * Whether a successful Paystack charge is accepted for a booking.
+ *
+ * Accepted (`ok: true`) carries what was charged, Paystack's own payment
+ * time when it reported one, and `paidAfterQuoteExpiry` when a #180 booking
+ * was paid after its quote lock had passed (orchestrator decision on #180:
+ * an EXACT payment on the checkout we issued is honoured even when late; the
+ * flag marks it for review).
+ */
 export type ChargeCheck =
-  | { ok: true; charged: Money }
+  | { ok: true; charged: Money; paidAfterQuoteExpiry: boolean; providerPaidAt: Date | null }
   /** The amount or currency differs from the stored charge (underpayment, wrong currency). */
   | { ok: false; reason: "mismatch" }
-  /** A #180 booking paid after its quote lock had passed. */
-  | { ok: false; reason: "paid_after_expiry" }
   /** The booking has nothing chargeable stored. */
   | { ok: false; reason: "not_chargeable" };
 
 /**
  * Compare what Paystack reports it charged with what the booking stored
  * (rule 5). Pure. A missing amount / currency in the report is a mismatch.
- * For a #180 booking the payment must also have completed inside the quote
- * lock (Paystack's `paidAt`; when absent, the time of this check).
+ *
+ * Late payments (issue #180 decision): "never reuse a stale quote" governs
+ * ISSUING a checkout, not honouring one we already issued. A payment of
+ * exactly the stored amount and currency on the booking's current reference
+ * is accepted even when it completed after `quoteExpiresAt` (Paystack's
+ * `paidAt`; when absent, the time of this check); it is then flagged
+ * `paidAfterQuoteExpiry`. The reference check (only the reference stored on
+ * the booking may settle it) is done by the callers and again in confirmPaid.
  */
 export function checkReportedCharge(c: Consultation, reported: PaystackTransactionLookup, at: Date): ChargeCheck {
   const expected = expectedCharge(c);
@@ -321,12 +337,11 @@ export function checkReportedCharge(c: Consultation, reported: PaystackTransacti
   if (reported.amount !== expected.amountMinor || reported.currency !== expected.currency) {
     return { ok: false, reason: "mismatch" };
   }
-  if (hasChargeSnapshot(c)) {
-    const paidAtMs = reported.paidAt ? Date.parse(reported.paidAt) : NaN;
-    const when = Number.isNaN(paidAtMs) ? at : new Date(paidAtMs);
-    if (isQuoteExpired(c, when)) return { ok: false, reason: "paid_after_expiry" };
-  }
-  return { ok: true, charged: expected };
+  const paidAtMs = reported.paidAt ? Date.parse(reported.paidAt) : NaN;
+  const providerPaidAt = Number.isNaN(paidAtMs) ? null : new Date(paidAtMs);
+  // Only a #180 booking has a lock; a legacy naira row is never "late".
+  const paidAfterQuoteExpiry = hasChargeSnapshot(c) && isQuoteExpired(c, providerPaidAt ?? at);
+  return { ok: true, charged: expected, paidAfterQuoteExpiry, providerPaidAt };
 }
 
 /** Result of confirming a payment. */
@@ -348,15 +363,26 @@ export interface ConfirmOutcome {
  * `chargedCurrency`, plus `priceUsdCents` and the rate snapshot; a legacy
  * booking records its naira fee in kobo and no snapshot).
  *
+ * A payment accepted after the quote lock (see checkReportedCharge) stores
+ * `paidAfterQuoteExpiry: true` on BOTH the booking and the Transaction, and
+ * Paystack's own payment time as `paystackPaidAt` (whenever Paystack reports
+ * it), so late payments can be listed for review.
+ *
  * @param reference the Paystack reference that settled it
- * @param charged the amount Paystack charged (already checked against the booking)
+ * @param check the accepted check (what Paystack charged, when, late or not)
  * @returns null when the booking vanished or changed under us
  */
 export async function confirmPaid(
   consultationId: string,
   reference: string,
-  charged: Money
+  check: Extract<ChargeCheck, { ok: true }>
 ): Promise<ConfirmOutcome | null> {
+  const charged = check.charged;
+  // Review fields, written on the booking and the transaction alike.
+  const review: { paidAfterQuoteExpiry?: true; paystackPaidAt?: Timestamp } = {
+    ...(check.paidAfterQuoteExpiry ? { paidAfterQuoteExpiry: true as const } : {}),
+    ...(check.providerPaidAt ? { paystackPaidAt: Timestamp.fromDate(check.providerPaidAt) } : {}),
+  };
   const ref = collections.consultations.doc(consultationId);
   const txRef = collections.transactions.doc();
   return consultationCharging.runTransaction(async (tx) => {
@@ -383,6 +409,7 @@ export async function confirmPaid(
       status: "scheduled" as const,
       transactionId: reference,
       paidAt: now,
+      ...review,
       updatedAt: now,
     };
     const transaction = transactionService.buildConsultationFee(txRef.id, now, {
@@ -396,9 +423,18 @@ export async function confirmPaid(
       clientEmail: current.clientEmail,
       snapshot: snapshotOf(current),
     });
+    // The review fields ride on the Transaction too (see the doc comment).
+    const recorded: Transaction = { ...transaction, ...review };
+    if (check.paidAfterQuoteExpiry) {
+      // Honoured, but flagged: the FX exposure is small, a human checks it.
+      console.warn(
+        `[consultation] ${consultationId} paid after its quote expired (reference ${reference}, ` +
+          `paid ${check.providerPaidAt?.toISOString() ?? "time not reported"}); confirmed and flagged paidAfterQuoteExpiry`
+      );
+    }
     tx.update(ref, updates);
-    tx.set(txRef, transaction);
-    return { consultation: { ...current, ...updates }, alreadyPaid: false, transaction };
+    tx.set(txRef, recorded);
+    return { consultation: { ...current, ...updates }, alreadyPaid: false, transaction: recorded };
   });
 }
 

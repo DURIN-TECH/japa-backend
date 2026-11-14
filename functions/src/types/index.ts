@@ -1173,6 +1173,11 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   checkoutCallbackUrl?: string;
   // Issue #180: when the payment was confirmed.
   paidAt?: Timestamp;
+  // Issue #180: when Paystack says the payment completed (its `paid_at`).
+  paystackPaidAt?: Timestamp;
+  // Issue #180: true when an exact payment landed after `quoteExpiresAt` and
+  // was honoured anyway; flagged for review (also on the Transaction).
+  paidAfterQuoteExpiry?: boolean;
   
   // After consultation
   summary?: string;
@@ -1219,6 +1224,10 @@ export type TransactionStatus =
  */
 export interface Transaction extends Partial<ChargeSnapshot> {
   id: string;
+  // Issue #180 (consultation_fee): Paystack's payment time, and the flag for
+  // an exact payment honoured after the booking's quote lock.
+  paystackPaidAt?: Timestamp;
+  paidAfterQuoteExpiry?: boolean;
   userId: string;
   agentId?: string;
   applicationId?: string;

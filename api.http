@@ -293,7 +293,8 @@ Authorization: Bearer {{clientToken}}
 
 ### Resume paying a pending booking (issue #180, the booking's own client only).
 ### Inside the 30-minute lock: the same checkout. After it: a fresh quote and a
-### new checkout. If the current reference was in fact paid it is confirmed.
+### new checkout. If the current reference was in fact paid (even after the
+### lock, exactly) it is confirmed; a late payment is flagged paidAfterQuoteExpiry.
 POST {{baseUrl}}/consultations/{{consultationId}}/checkout
 Authorization: Bearer {{clientToken}}
 
@@ -314,9 +315,12 @@ Content-Type: application/json
 ### 200 { verified, consultation } when Paystack's amount AND currency equal
 ### the stored chargedAmountMinor / chargedCurrency (idempotent: a second call
 ### writes nothing). 400 PAYMENT_MISMATCH on an underpayment or wrong currency
-### (booking stays pending, nothing recorded). 409 QUOTE_EXPIRED when the quote
-### lock passed: unpaid -> data has a fresh authorizationUrl/reference; paid
-### after the lock -> not confirmed, held for manual review.
+### (booking stays pending, nothing recorded). An exact payment that landed
+### after the 30-minute lock is still confirmed (200) and flagged
+### paidAfterQuoteExpiry on the booking and transaction for review.
+### 409 QUOTE_EXPIRED only for an UNPAID booking past its lock: data has a fresh
+### authorizationUrl/reference. A reference that is not the booking's current
+### one (a superseded checkout) is 400 and logged.
 POST {{baseUrl}}/consultations/public/verify
 Content-Type: application/json
 
