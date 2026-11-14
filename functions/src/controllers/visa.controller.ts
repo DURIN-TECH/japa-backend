@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { visaService } from "../services/visa.service";
+import { attachSharedRoutes } from "../shared-routes/public-visa-route";
 import {
   sendSuccess,
   sendError,
@@ -195,7 +196,8 @@ export class VisaController {
         visaTypes = await visaService.getVisaTypesByCountry(code);
       }
 
-      sendSuccess(res, visaTypes);
+      // Issue #237: each visa on a shared route also carries `sharedRoute`.
+      sendSuccess(res, await attachSharedRoutes(visaTypes));
     } catch (error) {
       console.error("Error getting visa types:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -224,7 +226,9 @@ export class VisaController {
         return;
       }
 
-      sendSuccess(res, visaType);
+      // Issue #237: `sharedRoute` (or null) on the single-visa read too.
+      const [withRoute] = await attachSharedRoutes([visaType]);
+      sendSuccess(res, withRoute);
     } catch (error) {
       console.error("Error getting visa type:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -258,7 +262,9 @@ export class VisaController {
 
       const requirements = await visaService.getRequirements(code, visaId);
 
-      sendSuccess(res, { visaType, requirements });
+      // Issue #237: `sharedRoute` (or null) on the visa inside /full.
+      const [withRoute] = await attachSharedRoutes([visaType]);
+      sendSuccess(res, { visaType: withRoute, requirements });
     } catch (error) {
       console.error("Error getting visa type with requirements:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -794,7 +800,8 @@ export class VisaController {
         offset: offset ? parseInt(offset as string) : undefined,
       });
 
-      sendSuccess(res, result);
+      // Issue #237: only the page being returned is enriched.
+      sendSuccess(res, { ...result, visaTypes: await attachSharedRoutes(result.visaTypes) });
     } catch (error) {
       console.error("Error getting all visa types:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -815,7 +822,7 @@ export class VisaController {
       }
 
       const results = await visaService.searchVisaTypes(q);
-      sendSuccess(res, results);
+      sendSuccess(res, await attachSharedRoutes(results));
     } catch (error) {
       console.error("Error searching visa types:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -831,7 +838,7 @@ export class VisaController {
       const limit = parseInt(req.query.limit as string) || 10;
       const visaTypes = await visaService.getPopularVisaTypes(limit);
 
-      sendSuccess(res, visaTypes);
+      sendSuccess(res, await attachSharedRoutes(visaTypes));
     } catch (error) {
       console.error("Error getting popular visa types:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);

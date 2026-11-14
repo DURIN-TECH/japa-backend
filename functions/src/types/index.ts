@@ -849,6 +849,10 @@ export interface Application {
   clientPhone?: string; // Captured when an agent starts an application for a client
   visaTypeName?: string;
   countryName?: string;
+  // Issue #237 (P8 of #228): on a SHARED-route application, the shared route's
+  // name at creation (kept current by PUT /applications/:id/through-country).
+  // `countryName` stays the country applied through. ABSENT otherwise.
+  routeName?: string;
 
   // Answers to the route's intake questions (issue #113). Written only by
   // PUT /applications/:id/intake, which validates them against the approved

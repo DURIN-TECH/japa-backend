@@ -22,6 +22,7 @@
 import { before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Timestamp } from "firebase-admin/firestore";
+import { defineAbilitiesFor, ROLES } from "@durin-tech/authz";
 import { fakeCollection, fakeRunTransaction, installFakes, resetStore, store } from "../helpers/fake-firestore";
 import { DEFAULT_SEVERITY_LEVELS, type AssessmentCriterion, type IntakeQuestion, type VisaRubric } from "../../src/types/rubric";
 
@@ -332,11 +333,13 @@ describe("create through a member country", () => {
     const r = await competenceService.resolveForCreate({ sharedRouteId: "route-one", throughCountryCode: "XB", answers: { [sid("visit")]: ["XB"] } }, undefined, actor);
     assert.equal(r.choice.followedProposal, true);
     assert.equal(r.choice.reasonShown, undefined);
-    const app = await applicationService.createApplication("u1", { countryCode: r.countryCode, visaTypeId: r.visaTypeId, mode: "self", throughCountry: { choice: r.choice, answers: r.answers } });
+    const app = await applicationService.createApplication("u1", { countryCode: r.countryCode, visaTypeId: r.visaTypeId, mode: "self", throughCountry: { choice: r.choice, answers: r.answers, routeName: r.routeName } });
     const stored: any = store.get(`applications/${app.id}`);
     assert.equal(stored.countryCode, "XB");
     assert.equal(stored.visaTypeId, "xb-visit");
     assert.equal(stored.countryName, "Country XB");
+    // (#237) The route's name beside the country applied through.
+    assert.equal(stored.routeName, "Route One");
     assert.equal(stored.totalCost, 200 * 100);
     assert.deepEqual(stored.routeStack, [SHARED_KEY, "XB_xb-visit"]);
     assert.equal(stored.throughCountryCode, "XB");
@@ -350,6 +353,7 @@ describe("create through a member country", () => {
   test("an application on an ordinary visa is unchanged (no through-country fields)", async () => {
     store.set("countries/XA/visaTypes/plain", { ...(store.get("countries/XA/visaTypes/xa-visit") as any), id: "plain", inheritsFrom: undefined });
     const app = await applicationService.createApplication("u1", { countryCode: "XA", visaTypeId: "plain", mode: "self" });
+    assert.equal((store.get(`applications/${app.id}`) as any).routeName, undefined);
     const stored: any = store.get(`applications/${app.id}`);
     assert.equal(stored.throughCountryCode, undefined);
     assert.equal(stored.throughCountry, undefined);
@@ -394,6 +398,9 @@ describe("POST /applications with a shared route", () => {
   test("201 with the member's record; mixing both forms is 400", async () => {
     const res = await call({ sharedRouteId: "route-one", throughCountryCode: "XA", mode: "self", competenceAnswers: { [sid("visit")]: ["XA"] } });
     assert.equal(res.statusCode, 201);
+    // (#237) The route's name beside the country, and the flag from the shared rule.
+    assert.equal(res.body.data.routeName, "Route One");
+    assert.equal(res.body.data.canChangeThroughCountry, true);
     assert.equal(res.body.data.countryCode, "XA");
     assert.equal(res.body.data.visaTypeId, "xa-visit");
     assert.equal(res.body.data.throughCountry.followedProposal, true);
@@ -412,7 +419,7 @@ describe("change the country applied through", () => {
   /** An application through XA with a shared answer and an answer to XA's own question. */
   async function startThroughXA(): Promise<any> {
     const r = await competenceService.resolveForCreate({ sharedRouteId: "route-one", throughCountryCode: "XA", answers: { [sid("visit")]: ["XA", "XB"], [sid("border")]: "XA" } }, undefined, actor);
-    const app = await applicationService.createApplication("u1", { countryCode: r.countryCode, visaTypeId: r.visaTypeId, mode: "self", throughCountry: { choice: r.choice, answers: r.answers } });
+    const app = await applicationService.createApplication("u1", { countryCode: r.countryCode, visaTypeId: r.visaTypeId, mode: "self", throughCountry: { choice: r.choice, answers: r.answers, routeName: r.routeName } });
     const stored: any = store.get(`applications/${app.id}`);
     stored.intake.answers["own-q-xa"] = true;
     store.set(`applications/${app.id}`, stored);
@@ -431,6 +438,9 @@ describe("change the country applied through", () => {
     assert.equal(stored.totalCost, 200 * 100);
     assert.deepEqual(stored.routeStack, [SHARED_KEY, "XB_xb-visit"]);
     assert.equal(stored.throughCountryCode, "XB");
+    // (#237) routeName is correct after the change: still the route's name, countryName the new country.
+    assert.equal(stored.routeName, "Route One");
+    assert.equal(stored.countryName, "Country XB");
     // The border answer pointed at XA: the reason is shown and stored.
     assert.equal(stored.throughCountry.followedProposal, false);
     assert.equal(stored.throughCountry.reasonShown, "The rule says Country XA; you chose Country XB.");
@@ -448,6 +458,13 @@ describe("change the country applied through", () => {
     await competenceService.changeThroughCountry(after, "XA", actor);
     const back: any = store.get(`applications/${app.id}`);
     assert.deepEqual(back.intake.orphanedAnswers.map((o: any) => o.questionId), ["own-q-xa", "own-q-xb"]);
+  });
+
+  test("(#237) a route renamed since creation: the change of country stores the route's current name", async () => {
+    const app = await startThroughXA();
+    store.set("sharedRoutes/route-one", { ...(store.get("sharedRoutes/route-one") as any), name: "Route One Renamed" });
+    await competenceService.changeThroughCountry(app, "XB", actor);
+    assert.equal((store.get(`applications/${app.id}`) as any).routeName, "Route One Renamed");
   });
 
   test("the same country again changes nothing", async () => {
@@ -473,5 +490,79 @@ describe("change the country applied through", () => {
     await refused(competenceService.changeThroughCountry({ ...app, agencyId: "agency-2" }, "XE", actor), "COUNTRY_NOT_OFFERED", 422);
     const r = await competenceService.changeThroughCountry({ ...app, agencyId: "agency-1" }, "XE", actor);
     assert.equal(r.application.visaTypeId, "xe-visit");
+  });
+});
+
+
+// ============================================
+// (#237) stackLayers on the applicant's reads, and canChangeThroughCountry
+// ============================================
+
+describe("stackLayers and canChangeThroughCountry", () => {
+  const actor = { uid: "u1", role: "client" };
+  const authedReq = (id: string) => ({ userId: "u1", params: { id }, body: {}, authz: { uid: "u1", role: "client", agencyId: null }, ability: defineAbilitiesFor({ uid: "u1", role: ROLES.CLIENT, agencyId: null }) });
+
+  async function start(cc = "XA"): Promise<any> {
+    const r = await competenceService.resolveForCreate({ sharedRouteId: "route-one", throughCountryCode: cc, answers: { [sid("visit")]: [cc] } }, undefined, actor);
+    const app = await applicationService.createApplication("u1", { countryCode: r.countryCode, visaTypeId: r.visaTypeId, mode: "self", throughCountry: { choice: r.choice, answers: r.answers, routeName: r.routeName } });
+    return store.get(`applications/${app.id}`);
+  }
+
+  test("the intake read lists the layers: shared first with the route's name, the country last; keys match the questions' layerKey", async () => {
+    const app = await start();
+    const res = resDouble();
+    await applicationController.getIntake(authedReq(app.id), res);
+    const body = res.body.data;
+    assert.deepEqual(body.stackLayers, [
+      { key: SHARED_KEY, kind: "shared", name: "Route One", status: "ready" },
+      { key: "XA_xa-visit", kind: "country", countryCode: "XA", countryName: "Country XA", status: "ready" },
+    ]);
+    const keys = new Set(body.stackLayers.map((l: any) => l.key));
+    for (const q of body.questions) assert.ok(keys.has(q.layerKey), `question ${q.id} layerKey ${q.layerKey}`);
+  });
+
+  test("a layer with no approved rulebook is listed as missing", async () => {
+    const app = await start();
+    sharedRulebook = null;
+    const res = resDouble();
+    await applicationController.getIntake(authedReq(app.id), res);
+    const shared = res.body.data.stackLayers.find((l: any) => l.kind === "shared");
+    assert.equal(shared.status, "missing");
+    assert.equal(res.body.data.stackLayers.find((l: any) => l.kind === "country").status, "ready");
+  });
+
+  test("an ordinary single-layer application has no stackLayers (the field is omitted)", async () => {
+    store.set("countries/XA/visaTypes/plain", { ...(store.get("countries/XA/visaTypes/xa-visit") as any), id: "plain", inheritsFrom: undefined });
+    const app = await applicationService.createApplication("u1", { countryCode: "XA", visaTypeId: "plain", mode: "self" });
+    const res = resDouble();
+    await applicationController.getIntake(authedReq(app.id), res);
+    assert.equal(res.body.data?.stackLayers, undefined);
+  });
+
+  test("canChangeThroughCountry: true while editable and unpaid; false once submitted, once paid, and on an ordinary application", async () => {
+    const { canChangeThroughCountry, throughCountryRefusal } = await import("../../src/shared-routes/through-country-rule");
+    const app = await start();
+    assert.equal(canChangeThroughCountry(app), true);
+    assert.equal(canChangeThroughCountry({ ...app, status: "under_review" }), false);
+    assert.equal(canChangeThroughCountry({ ...app, amountPaid: 500 }), false);
+    assert.equal(canChangeThroughCountry({ ...app, throughCountry: undefined, throughCountryCode: undefined }), false);
+    // The endpoint refuses with exactly the helper's code in every false case.
+    for (const [over, code] of [[{ status: "under_review" }, "NOT_EDITABLE"], [{ amountPaid: 500 }, "ALREADY_PAID"], [{ throughCountry: undefined, throughCountryCode: undefined }, "NOT_SHARED_ROUTE"]] as const) {
+      const a = { ...app, ...over };
+      assert.equal(throughCountryRefusal(a)?.code, code);
+      await refused(competenceService.changeThroughCountry(a, "XB", actor), code, 409);
+    }
+  });
+
+  test("GET /applications/:id and the list carry the flag; the through-country result's application too", async () => {
+    const app = await start();
+    const res = resDouble();
+    await applicationController.getApplication(authedReq(app.id), res);
+    assert.equal(res.body.data.canChangeThroughCountry, true);
+    assert.equal(res.body.data.routeName, "Route One");
+    store.set(`applications/${app.id}`, { ...(store.get(`applications/${app.id}`) as any), amountPaid: 100 });
+    const res2 = resDouble();
+    await applicationController.getApplication(authedReq(app.id), res2);
+    assert.equal(res2.body.data.canChangeThroughCountry, false);
   });
 });
