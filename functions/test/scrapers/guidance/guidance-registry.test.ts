@@ -226,6 +226,12 @@ describe("guidance seed: the doc that is written", () => {
         "gb-appendix-english-language": "secondary",
         "gb-appendix-skilled-occupations": "secondary",
         "gb-appendix-immigration-salary-list": "secondary",
+        // ---- Student (issue #260): the appendix is primary, the Student and
+        // Child Student guidance (web + PDF) route guidance, Appendix ATAS secondary.
+        "gb-appendix-student": "primary",
+        "gb-student-guidance-html": "route_guidance",
+        "gb-student-guidance-pdf": "route_guidance",
+        "gb-appendix-atas": "secondary",
       }
     );
   });

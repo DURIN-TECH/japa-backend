@@ -33,6 +33,9 @@ const FAMILY_GUIDANCE_RENDITIONS = ["gb-family-life-guidance-html", "gb-family-l
 /** The two renditions of the Skilled Worker caseworker guidance (issue #260). */
 const SKILLED_WORKER_GUIDANCE_RENDITIONS = ["gb-skilled-worker-guidance-html", "gb-skilled-worker-guidance-pdf"];
 
+/** The two renditions of the Student and Child Student caseworker guidance (issue #260). */
+const STUDENT_GUIDANCE_RENDITIONS = ["gb-student-guidance-html", "gb-student-guidance-pdf"];
+
 export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
   // ---- The visitor rules ----
   {
@@ -322,5 +325,80 @@ export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
     passage:
       "The applicant must score 20 points for a job at the appropriate skill level. To award these points, you must be satisfied the applicant is being sponsored in an eligible occupation code.",
     sourceIds: SKILLED_WORKER_GUIDANCE_RENDITIONS,
+  },
+
+  // ============================================
+  // STUDENT (route key "student-visa"; issue #260)
+  // ============================================
+  // Copied on 2026-11-14 from the text retrieved that day, and checked against
+  // it with the seed script's matcher before commit (as for Family above).
+
+  // ---- The route's rules (Appendix Student) ----
+  {
+    id: "appendix-st-2-1-suitability",
+    label: "ST 2.1",
+    passage: "ST 2.1. The applicant must not fall for refusal under Part Suitability.",
+    sourceIds: ["gb-appendix-student"],
+  },
+  {
+    id: "appendix-st-5-1-genuine-student",
+    label: "ST 5.1",
+    passage: "ST 5.1. The applicant must be a genuine student.",
+    sourceIds: ["gb-appendix-student"],
+  },
+  {
+    id: "appendix-st-8-4-atas",
+    label: "ST 8.4",
+    // The reference that makes Appendix ATAS apply here.
+    passage:
+      "ST 8.4. If the Academic Technology Approval Scheme (ATAS) requirement in Appendix ATAS applies, the applicant must have a valid ATAS certificate and provide it with the application.",
+    sourceIds: ["gb-appendix-student"],
+  },
+  {
+    id: "appendix-st-12-6-finance",
+    label: "ST 12.6",
+    // The reference that makes Appendix Finance apply here (the sentence goes on).
+    passage:
+      "ST 12.6. The applicant must show that they have held the required level of funds for a 28-day period and as specified in Appendix Finance",
+    sourceIds: ["gb-appendix-student"],
+  },
+  {
+    id: "appendix-st-13-2-english",
+    label: "ST 13.2",
+    // The reference that makes Appendix English Language apply here.
+    passage: "ST 13.2. The applicant must show they meet the English language requirement as specified in Appendix English Language.",
+    sourceIds: ["gb-appendix-student"],
+  },
+
+  // ---- Appendix ATAS (identity check) ----
+  {
+    id: "appendix-atas-requirement",
+    label: "Opening, second paragraph",
+    passage: "The ATAS requirement means the applicant must obtain a valid ATAS certificate, issued by the Counter-Proliferation and Arms Control Centre",
+    sourceIds: ["gb-appendix-atas"],
+  },
+
+  // ---- The Student and Child Student caseworker guidance: web version and PDF must agree ----
+  {
+    id: "student-guidance-about-based-on",
+    label: "About this guidance",
+    passage:
+      "This guidance is based on Appendix Student, Appendix Child Student, Appendix English Language, Appendix Finance and Appendix ATAS of the Immigration Rules.",
+    sourceIds: STUDENT_GUIDANCE_RENDITIONS,
+  },
+  {
+    id: "student-guidance-genuine-balance-of-probability",
+    label: "Genuine student rule",
+    passage:
+      "For an applicant to qualify as a Student, or as a Child Student who is 16 or 17 years old, the caseworker must be satisfied on the balance of probability that the applicant is a genuine student.",
+    sourceIds: STUDENT_GUIDANCE_RENDITIONS,
+  },
+  {
+    id: "student-guidance-genuine-credibility",
+    label: "Genuine student rule",
+    // Typographic apostrophe in "applicant’s", as published.
+    passage:
+      "To assess an applicant’s credibility, the caseworker must consider all of the information provided in the application and, if applicable, in the credibility interview.",
+    sourceIds: STUDENT_GUIDANCE_RENDITIONS,
   },
 ];
