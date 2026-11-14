@@ -129,9 +129,9 @@ export interface CurrenciesConfig {
   defaultMarginBps: number;
   /**
    * Oldest a provider rate's OWN date (`asOf`) may be and still price, in
-   * hours (default 120 = 5 days: a Friday rate covers a weekend plus a
-   * Monday holiday). Unlike `freshnessHours` this cannot be refreshed by
-   * re-reading the same old row. Capped at 240.
+   * hours (default 144 = 6 days, issue #214: covers a four-day bank closure
+   * such as Good Friday to Easter Monday plus a day). Unlike `freshnessHours`
+   * this cannot be refreshed by re-reading the same old row. Capped at 240.
    */
   maxRateAgeHours: number;
   /**
