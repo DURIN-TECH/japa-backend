@@ -70,7 +70,9 @@
 // ---- CONTENTS ----
 // The first real entry (issue #239, owner instruction of 2026-11-14): the
 // Schengen area with ONE member recorded so far, the Netherlands. More members
-// are added the same way, one official quote each. The bloc's id and name and
+// are added the same way, one official quote each. Issue #306 (2026-11-14)
+// added the six other States the Netherlands' quoted sentence names (BE, DE,
+// FR, LU, ES, PT), from that same sentence. The bloc's id and name and
 // the route's id, name and category repeat what is already registered on dev
 // (so applying this file creates nothing new for them; it adds the member and
 // the inheritance).
@@ -95,6 +97,62 @@ export const SHARED_VISA_DATA: unknown = {
           // Same official host as the Visa Code source (already a confirmed official website).
           sourceUrl: "https://publications.europa.eu/resource/celex/41994D0029",
         },
+        // ---- #306: the six other States the same sentence names ----
+        // Owner request of 2026-11-14 ("add more ... members"). The quoted
+        // decision (same read, same point 1, same address as the NL entry
+        // above) brings the Convention into force on 26 March 1995 for the
+        // initial Signatory States Belgium, Germany, France, Luxembourg and the
+        // Netherlands and the acceding States Spain and Portugal. So each of
+        // the six below carries the SAME quote, link and date as NL, copied
+        // character for character (a unit test checks they are identical).
+        {
+          // Belgium: named in the quoted sentence (an initial Signatory State).
+          countryCode: "BE",
+          joinedOn: "1995-03-26",
+          sourceQuote:
+            "The Convention shall be brought into force in its entirety on 26 March 1995 for the initial Signatory States namely Belgium, Germany, France, Luxembourg and the Netherlands and the acceding States, Spain and Portugal.",
+          sourceUrl: "https://publications.europa.eu/resource/celex/41994D0029",
+        },
+        {
+          // Germany: named in the quoted sentence (an initial Signatory State).
+          countryCode: "DE",
+          joinedOn: "1995-03-26",
+          sourceQuote:
+            "The Convention shall be brought into force in its entirety on 26 March 1995 for the initial Signatory States namely Belgium, Germany, France, Luxembourg and the Netherlands and the acceding States, Spain and Portugal.",
+          sourceUrl: "https://publications.europa.eu/resource/celex/41994D0029",
+        },
+        {
+          // France: named in the quoted sentence (an initial Signatory State).
+          countryCode: "FR",
+          joinedOn: "1995-03-26",
+          sourceQuote:
+            "The Convention shall be brought into force in its entirety on 26 March 1995 for the initial Signatory States namely Belgium, Germany, France, Luxembourg and the Netherlands and the acceding States, Spain and Portugal.",
+          sourceUrl: "https://publications.europa.eu/resource/celex/41994D0029",
+        },
+        {
+          // Luxembourg: named in the quoted sentence (an initial Signatory State).
+          countryCode: "LU",
+          joinedOn: "1995-03-26",
+          sourceQuote:
+            "The Convention shall be brought into force in its entirety on 26 March 1995 for the initial Signatory States namely Belgium, Germany, France, Luxembourg and the Netherlands and the acceding States, Spain and Portugal.",
+          sourceUrl: "https://publications.europa.eu/resource/celex/41994D0029",
+        },
+        {
+          // Spain: named in the quoted sentence (an acceding State).
+          countryCode: "ES",
+          joinedOn: "1995-03-26",
+          sourceQuote:
+            "The Convention shall be brought into force in its entirety on 26 March 1995 for the initial Signatory States namely Belgium, Germany, France, Luxembourg and the Netherlands and the acceding States, Spain and Portugal.",
+          sourceUrl: "https://publications.europa.eu/resource/celex/41994D0029",
+        },
+        {
+          // Portugal: named in the quoted sentence (an acceding State).
+          countryCode: "PT",
+          joinedOn: "1995-03-26",
+          sourceQuote:
+            "The Convention shall be brought into force in its entirety on 26 March 1995 for the initial Signatory States namely Belgium, Germany, France, Luxembourg and the Netherlands and the acceding States, Spain and Portugal.",
+          sourceUrl: "https://publications.europa.eu/resource/celex/41994D0029",
+        },
       ],
     },
   ],
@@ -106,7 +164,18 @@ export const SHARED_VISA_DATA: unknown = {
       issuingAuthorityId: "schengen-area",
       destinations: { mode: "members_of", authorityId: "schengen-area" },
       // The Netherlands short-stay record is assessed against the shared rulebook.
-      inheritedBy: [{ countryCode: "NL", visaTypeId: "nl-visitor" }],
+      // #306: so are the short-stay records of the six members added above
+      // (seed-countries-visas.ts, ids `<code>-visitor`). Each takes its price
+      // from the route's `fee` below and states no fee of its own.
+      inheritedBy: [
+        { countryCode: "NL", visaTypeId: "nl-visitor" },
+        { countryCode: "BE", visaTypeId: "be-visitor" },
+        { countryCode: "DE", visaTypeId: "de-visitor" },
+        { countryCode: "FR", visaTypeId: "fr-visitor" },
+        { countryCode: "LU", visaTypeId: "lu-visitor" },
+        { countryCode: "ES", visaTypeId: "es-visitor" },
+        { countryCode: "PT", visaTypeId: "pt-visitor" },
+      ],
       // ---- The route's government fee (issue #299) ----
       // Read on 2026-11-14 from the dev project (durin-seli-dev), not typed
       // from memory:
