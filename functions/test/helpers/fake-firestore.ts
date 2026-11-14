@@ -299,6 +299,8 @@ export async function installFakes(): Promise<void> {
   firebase.collections.officialDomainPreviews = fakeCollection("officialDomainPreviews");
   firebase.collections.sourceRegistryAudit = fakeCollection("sourceRegistryAudit");
   firebase.collections.sourceRegistryRateLimits = fakeCollection("sourceRegistryRateLimits");
+  // Issue #232: the registry checks the authority a website or route belongs to.
+  firebase.collections.authorities = fakeCollection("authorities");
   firebase.collections.countries = fakeCollection("countries");
   firebase.collections.pendingVisaChanges = fakeCollection("pendingVisaChanges");
   // Issue #81: run records + the news registry (source health, news runs).

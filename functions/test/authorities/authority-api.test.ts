@@ -89,8 +89,9 @@ beforeEach(() => {
   resetStore();
   nowMs = Date.parse("2026-11-14T12:00:00Z");
   for (const cc of ["XA", "XB", "XC"]) store.set(`countries/${cc}`, { code: cc, isSupported: false });
-  store.set(`officialDomains/${HOST}`, { host: HOST, countryCode: "XA", status: "confirmed" });
-  store.set("officialDomains/revoked.example.org", { host: "revoked.example.org", countryCode: "XA", status: "revoked" });
+  // Issue #232: the quote's host is confirmed FOR THE BLOC itself.
+  store.set(`officialDomains/${HOST}`, { host: HOST, authorityId: "test-bloc", status: "confirmed" });
+  store.set("officialDomains/revoked.example.org", { host: "revoked.example.org", authorityId: "test-bloc", status: "revoked" });
 });
 
 const api = (method: string, path: string, token: string | null, body?: unknown) => call(baseUrl, method, `/admin/authorities${path}`, token, body);
@@ -297,6 +298,30 @@ describe("members", () => {
     assert.equal((await admin("PUT", "/bad_id/members/XA", member())).status, 400);
     await admin("POST", "", { id: "XB", kind: "country", name: "Country B" });
     assert.equal((await admin("PUT", "/XB/members/XA", member())).body.error, "AUTHORITY_HAS_NO_MEMBERS");
+  });
+
+  test("issue #232: the quote's host must be confirmed for the bloc, the member itself, or a current member", async () => {
+    // Hosts confirmed for other authorities (the member XB, member XA, an outsider XC, another bloc).
+    store.set("officialDomains/www.xb.example.org", { host: "www.xb.example.org", authorityId: "XB", status: "confirmed" });
+    store.set("officialDomains/www.xa.example.org", { host: "www.xa.example.org", authorityId: "XA", status: "confirmed" });
+    store.set("officialDomains/www.xc.example.org", { host: "www.xc.example.org", authorityId: "XC", status: "confirmed" });
+    store.set("officialDomains/www.other.example.org", { host: "www.other.example.org", authorityId: "other-bloc", status: "confirmed" });
+    // A pre-#232 doc (countryCode only) is read as that country's authority.
+    store.set("officialDomains/www.legacy.example.org", { host: "www.legacy.example.org", countryCode: "XB", status: "confirmed" });
+    const put = (cc: string, host: string) => admin("PUT", `/test-bloc/members/${cc}`, member({ sourceUrl: `https://${host}/members` }));
+    // XA is not a member yet: XC's site or another bloc's site says nothing about it.
+    assert.equal((await put("XA", "www.xc.example.org")).body.error, "HOST_NOT_CONFIRMED");
+    assert.equal((await put("XA", "www.other.example.org")).body.error, "HOST_NOT_CONFIRMED");
+    assert.equal((await put("XA", "www.xb.example.org")).body.error, "HOST_NOT_CONFIRMED"); // XB is not a member yet
+    // XA's own government site.
+    assert.equal((await put("XA", "www.xa.example.org")).status, 201);
+    // XB on a current member's (XA's) site, and on its own legacy-shaped doc.
+    assert.equal((await put("XB", "www.xa.example.org")).status, 201);
+    assert.equal((await put("XB", "www.legacy.example.org")).status, 200);
+    // A member that has LEFT no longer vouches for others.
+    await put("XA", "www.xa.example.org");
+    assert.equal((await admin("PUT", "/test-bloc/members/XA", member({ sourceUrl: "https://www.xa.example.org/members", leftOn: "2021-01-01" }))).status, 200);
+    assert.equal((await put("XC", "www.xa.example.org")).body.error, "HOST_NOT_CONFIRMED");
   });
 
   test("members on a date: before and after a leftOn; default today; empty list; 404; bad date", async () => {

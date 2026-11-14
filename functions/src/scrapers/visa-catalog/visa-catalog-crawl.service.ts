@@ -8,6 +8,15 @@ import type { FxFetcher } from "./visa-catalog-fx";
 // (govuk-content-api for GB, generic-html — today's fetch service — otherwise).
 import { HostNotAllowedError } from "../shared/fetch/visa-catalog-fetch.service";
 import { officialDomainsService } from "../shared/registry/official-domains.service";
+
+/**
+ * Issue #232: is a `visaSources` doc id a COUNTRY source (two upper-case
+ * letters)? Any other id is a bloc or treaty authority (see
+ * authorities/authority-ids.ts), whose pages this crawl does not file.
+ */
+export function isCountrySourceId(id: string): boolean {
+  return /^[A-Z]{2}$/.test(id);
+}
 import { applyItemCoverage } from "./item-coverage";
 import { pickSourceAdapter, sourceMetaFromDocument, type SourceAdapterSet } from "./adapters";
 // Pure weekly-night-window helpers (issue #63): which due sources may run on
@@ -229,7 +238,9 @@ class VisaCatalogCrawlService {
     // Issue #215: where the confirmed-hosts allow-list comes from (tests inject
     // one; defaults to the `officialDomains` collection). Read at most once
     // per source, and only when the source has a portal-added page.
-    confirmedHosts?: () => Promise<Set<string>>;
+    // Issue #232: called with the source's authority id (its doc id); the
+    // default answers only the hosts confirmed for THAT authority.
+    confirmedHosts?: (authorityId: string) => Promise<Set<string>>;
   }): Promise<CrawlSummary> {
     const trigger: ScrapeRunTrigger = opts?.trigger ?? "scheduled";
 
@@ -320,6 +331,19 @@ class VisaCatalogCrawlService {
     // call and no pending-visa scan. fxRefreshed stays false. FX freshness is
     // not at risk: every night of the week has sources, so a refresh happens
     // at least daily, well within FX_MAX_AGE_DAYS (7).
+    // ---- Country sources only (issue #232) ----
+    // `visaSources/{authorityId}`: a source registered under a bloc or treaty
+    // has an id that is not a country code. This crawl files every record
+    // under `countries/{countryCode}/visaTypes`, which a bloc or treaty does
+    // not have, so such a source is never crawled here (registration also
+    // leaves it unscheduled). Shared routes and their records are P2/P4 of
+    // #228; nothing about a bloc becomes visible through this crawl.
+    runnable = runnable.filter((doc) => {
+      const keep = isCountrySourceId(doc.ref.id);
+      if (!keep) console.log(`Visa catalog: source ${doc.ref.id} belongs to a bloc or treaty; not crawled as a country source`);
+      return keep;
+    });
+
     if (runnable.length === 0) return summary;
 
     // ---- Start the run record (issue #81) ----
@@ -525,7 +549,7 @@ class VisaCatalogCrawlService {
       summary: CrawlSummary;
       recorder: ScrapeRunRecorder;
       maxExtractions: number;
-      opts?: { fetchFxRates?: FxFetcher; adapters?: SourceAdapterSet; confirmedHosts?: () => Promise<Set<string>> };
+      opts?: { fetchFxRates?: FxFetcher; adapters?: SourceAdapterSet; confirmedHosts?: (authorityId: string) => Promise<Set<string>> };
       // Issue #96: the budget hard stop (null = not enforced) and `force`
       // (ignore the content-hash gate).
       budgetGate: BudgetGate | null;
@@ -688,7 +712,9 @@ class VisaCatalogCrawlService {
           // error is recorded as the page's error. Seeded pages are unaffected.
           let allowedHost: ((h: string) => boolean) | undefined;
           if (page.addedVia === "portal") {
-            confirmedHostSet ??= await (opts?.confirmedHosts ?? (() => officialDomainsService.confirmedHosts()))();
+            // Issue #232: only hosts confirmed for THIS source's authority (its doc id).
+            const authorityId = doc.ref.id;
+            confirmedHostSet ??= await (opts?.confirmedHosts ?? ((id: string) => officialDomainsService.confirmedHostsFor(id)))(authorityId);
             const hosts: Set<string> = confirmedHostSet;
             allowedHost = (h: string) => hosts.has(h.toLowerCase());
           }

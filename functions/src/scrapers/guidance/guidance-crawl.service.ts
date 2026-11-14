@@ -400,7 +400,12 @@ export class GuidanceCrawlService {
    * Issue #215: where the confirmed-hosts allow-list comes from. Tests replace
    * it. Called at most once per portal-added source crawl.
    */
-  confirmedHosts: () => Promise<Set<string>> = () => officialDomainsService.confirmedHosts();
+  // Issue #232: the allow-list is PER AUTHORITY. A portal-added source may
+  // only be read from websites confirmed for the authority it belongs to (its
+  // `jurisdiction`), never from a website confirmed for some other country or
+  // bloc. The argument is that authority id.
+  confirmedHosts: (authorityId: string) => Promise<Set<string>> = (authorityId) =>
+    officialDomainsService.confirmedHostsFor(authorityId);
   /** The snapshot text store in use. */
   private get store(): GuidanceSnapshotStore {
     return this.injectedStore ?? guidanceSnapshotStore;
@@ -917,7 +922,8 @@ export class GuidanceCrawlService {
     //    unchanged (they have their own `expectedFinalUrl` baseline).
     let allowedHost: ((h: string) => boolean) | undefined;
     if (source.addedVia === "portal") {
-      const hosts = await this.confirmedHosts();
+      // #232: only the hosts confirmed for this source's own authority.
+      const hosts = await this.confirmedHosts(source.jurisdiction);
       allowedHost = (h: string) => hosts.has(h.toLowerCase());
     }
     const page = await this.fetcher.fetchAndClean(requestUrl, {
