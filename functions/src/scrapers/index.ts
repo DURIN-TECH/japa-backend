@@ -75,6 +75,15 @@ export { routeOnboardingService } from "./onboarding/route-onboarding.service";
 // ---- Source registry API (issue #215) ----
 /** Confirmed official websites + route registration (admin only). */
 export { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./shared/registry/registry.routes";
+/**
+ * (#230) The registry's error type, append-only audit write and address rules,
+ * reused by the authorities API (src/authorities) so its admin endpoints share
+ * the same error shape, audit trail and https/host rules.
+ */
+export { RegistryError, isRegistryError } from "./shared/registry/registry-errors";
+export { appendRegistryAudit, stripUndefined } from "./shared/registry/registry-audit";
+export type { RegistryAuditAction, RegistryAuditEntry } from "./shared/registry/registry-audit";
+export { parseRegistryUrl } from "./shared/registry/registry-address";
 
 // ---- Caseworker-guidance registry (issue #39) ----
 /** Admin list of guidance sources (GET /admin/guidance-sources). */

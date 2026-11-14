@@ -49,6 +49,9 @@ const COLLECTIONS = [
   "officialDomainPreviews",
   "sourceRegistryAudit",
   "sourceRegistryRateLimits",
+  // Issuing authorities and their members (issue #230): membership decides
+  // which countries a shared rulebook covers, so no client may read or write it.
+  "authorities",
   // The registries the API now writes (also backend-only; pinned here too).
   "guidanceSources",
   "visaSources",
