@@ -30,6 +30,9 @@ const GUIDANCE_RENDITIONS = ["gb-visit-guidance-html", "gb-visit-guidance-pdf"];
 /** The two renditions of the UK Family caseworker guidance (issue #260). */
 const FAMILY_GUIDANCE_RENDITIONS = ["gb-family-life-guidance-html", "gb-family-life-guidance-pdf"];
 
+/** The two renditions of the Skilled Worker caseworker guidance (issue #260). */
+const SKILLED_WORKER_GUIDANCE_RENDITIONS = ["gb-skilled-worker-guidance-html", "gb-skilled-worker-guidance-pdf"];
+
 export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
   // ---- The visitor rules ----
   {
@@ -234,5 +237,90 @@ export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
     label: "Financial requirement for a first application on or after 11 April 2024",
     passage: "Unlike the previous threshold, this amount does not vary where there are dependent children within the family.",
     sourceIds: ["gb-family-financial-requirement-pdf"],
+  },
+
+  // ============================================
+  // SKILLED WORKER (route key "skilled-worker-visa"; issue #260)
+  // ============================================
+  // Copied on 2026-11-14 from the text retrieved that day, and checked against
+  // it with the seed script's matcher before commit (as for Family above).
+
+  // ---- The route's rules (Appendix Skilled Worker) ----
+  {
+    id: "appendix-sw-2-1-suitability",
+    label: "SW 2.1",
+    // The rule that makes Part Suitability (gb-part-suitability) apply here.
+    passage: "SW 2.1. The applicant must not fall for refusal under Part Suitability.",
+    sourceIds: ["gb-appendix-skilled-worker"],
+  },
+  {
+    id: "appendix-sw-4-1-fifty-points",
+    label: "SW 4.1",
+    passage: "SW 4.1. The applicant must be awarded all 50 points in the table below.",
+    sourceIds: ["gb-appendix-skilled-worker"],
+  },
+  {
+    id: "appendix-sw-5-1-certificate",
+    label: "SW 5.1",
+    passage:
+      "SW 5.1. The applicant must have a valid Certificate of Sponsorship for the job they are planning to do; which to be valid must:",
+    sourceIds: ["gb-appendix-skilled-worker"],
+  },
+  {
+    id: "appendix-sw-7-2-english",
+    label: "SW 7.2",
+    // The reference that makes Appendix English Language apply here.
+    passage: "SW 7.2. The applicant must show they meet the English language requirement as specified in Appendix English Language.",
+    sourceIds: ["gb-appendix-skilled-worker"],
+  },
+  {
+    id: "appendix-sw-15-3-finance",
+    label: "SW 15.3",
+    // The reference that makes Appendix Finance (gb-appendix-finance) apply here.
+    passage:
+      "SW 15.3. If SW 15.2.(a) applies, the applicant must show that they have held the required funds for a 28-day period and as specified in Appendix Finance.",
+    sourceIds: ["gb-appendix-skilled-worker"],
+  },
+
+  // ---- The appendices the Skilled Worker rules refer to (identity checks) ----
+  {
+    id: "appendix-english-language-opening",
+    label: "Opening",
+    passage: "This Appendix sets out how the English language requirement is met.",
+    sourceIds: ["gb-appendix-english-language"],
+  },
+  {
+    id: "appendix-skilled-occupations-heading",
+    label: "Opening heading",
+    passage: "Eligible SOC 2020 occupation codes and going rates for Skilled Worker, Global Business Mobility and Scale-up routes",
+    sourceIds: ["gb-appendix-skilled-occupations"],
+  },
+  {
+    id: "appendix-immigration-salary-list-opening",
+    label: "Opening",
+    passage: "Occupations where a reduced skills and salary threshold applies in the Skilled Worker route.",
+    sourceIds: ["gb-appendix-immigration-salary-list"],
+  },
+
+  // ---- The Skilled Worker caseworker guidance: web version and PDF must agree ----
+  {
+    id: "skilled-worker-guidance-1-alongside-rules",
+    label: "1. About this guidance",
+    passage: "This guidance is designed to be used alongside Appendix Skilled Worker of the Immigration Rules.",
+    sourceIds: SKILLED_WORKER_GUIDANCE_RENDITIONS,
+  },
+  {
+    id: "skilled-worker-guidance-8-sponsorship",
+    label: "8. Sponsorship",
+    passage:
+      "The applicant must score 20 points for sponsorship. To award these points, you must be satisfied the application meets the requirements in paragraphs SW 5.1. to SW 5.7.",
+    sourceIds: SKILLED_WORKER_GUIDANCE_RENDITIONS,
+  },
+  {
+    id: "skilled-worker-guidance-9-skill-level",
+    label: "9. Job at an appropriate skill level",
+    passage:
+      "The applicant must score 20 points for a job at the appropriate skill level. To award these points, you must be satisfied the applicant is being sponsored in an eligible occupation code.",
+    sourceIds: SKILLED_WORKER_GUIDANCE_RENDITIONS,
   },
 ];

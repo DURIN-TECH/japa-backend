@@ -353,6 +353,167 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
       "summary of thresholds and the 11 April 2024 rules); the rest was retrieved and skimmed, not read line by line.",
     retrievedAt: "2026-11-14T12:00:20Z",
   },
+
+  // ============================================
+  // SKILLED WORKER (route key "skilled-worker-visa", visa type gb-skilled-worker-visa; issue #260)
+  // ============================================
+  //
+  // Documents, each requested once on 2026-11-14 through the shared fetch
+  // service (numbers in each note are from that request):
+  //  - Appendix Skilled Worker (the route's own rules)               -> primary
+  //  - the Skilled Worker caseworker guidance, web + PDF             -> route_guidance
+  //  - Appendix English Language (SW 7.2 names it)                   -> secondary
+  //  - Appendix Skilled Occupations (SW 4.2, SW 8.1: eligible codes
+  //    and going rates)                                              -> secondary
+  //  - Appendix Immigration Salary List (SW 8.1(b))                  -> secondary
+  // Reused by id: gb-part-suitability (SW 2.1) and gb-appendix-finance
+  // (SW 15.3, funds "as specified in Appendix Finance").
+  //
+  // Not registered, though the rules name them for some applicants only:
+  // Appendix ATAS (SW 6.3A, certain researchers), Appendix Tuberculosis
+  // (SW 3.2, certain countries), Appendix KOL UK and Appendix Continuous
+  // Residence (settlement only). They can be added the same way if the
+  // rubric needs them.
+  //
+  // The Health and Care Worker visa (gb-health-care-worker-visa) is decided
+  // under this same appendix (its "Health and Care ASHE salary job" rules,
+  // SW A1.1), so its rubric can reuse these ids. The caseworker guidance above
+  // (section 3.1) also points to a separate "Health and Care visa guidance";
+  // that document has NOT been looked up or registered here.
+  {
+    id: "gb-appendix-skilled-worker",
+    // The route's own rules document.
+    role: "primary",
+    title: "Immigration Rules Appendix Skilled Worker",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-skilled-worker",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "75,506 characters of cleaned text, sha256 9e1a1d62cd239d066fc765cd3294d8ec6fed728904c4652622e27f2db6c7c96b. " +
+      "The address is the one the publisher's index of the rules linked to on that day. The text runs from the page " +
+      "title to SW 46.2 (it is not cut short). Read closely: SW 2.1, SW 3.2, SW 4.1, SW 4.2, SW 5.1, SW 7.2, SW 8.1 and " +
+      "SW 15.1 to SW 15.3; the rest was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:07:20Z",
+  },
+  {
+    id: "gb-skilled-worker-guidance-html",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Skilled Worker caseworker guidance (accessible web version)",
+    url: "https://www.gov.uk/government/publications/skilled-worker-visa-caseworker-guidance/skilled-worker-caseworker-guidance-accessible",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    // The document's own line, "published for Home Office staff on <date>".
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "124,377 characters of cleaned text, sha256 c2e7916e214946216c4affa1fb0077bcf0f3b0824ba29b260b565cd2a3972d5c. " +
+      "The address is the one the publication page linked to on that day. The text states version 20.0, " +
+      "published for staff on 3 August 2026, and runs through the last numbered section (30.8). " +
+      "Read closely: section 1 and the openings of sections 8 and 9; the rest was retrieved and skimmed, " +
+      "not read line by line.",
+    retrievedAt: "2026-11-14T12:07:34Z",
+  },
+  {
+    id: "gb-skilled-worker-guidance-pdf",
+    // Guidance written for this same route: all of it is about the route.
+    role: "route_guidance",
+    title: "Skilled Worker caseworker guidance (PDF)",
+    // The file's address ON THE DAY IT WAS RETRIEVED (per-release id); the
+    // crawl reads the current address from `resolveFrom` each time.
+    url: "https://assets.publishing.service.gov.uk/media/6a6b4a63cceb23e86789771f/Skilled_worker__1_.pdf",
+    resolveFrom: {
+      // The stable publication page that always links to the current file.
+      pageUrl: "https://www.gov.uk/government/publications/skilled-worker-visa-caseworker-guidance",
+      // The one PDF attachment on that page: any release id, any file name.
+      linkPattern: "https://assets\\.publishing\\.service\\.gov\\.uk/media/[0-9a-f]+/[^/?#]+\\.pdf",
+    },
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "pdf",
+    publishedDateSelector: "published for Home Office staff on (\\d{1,2} [A-Za-z]+ \\d{4})",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "763,334-byte PDF, 76 pages, every page with a text layer, 141,042 characters of cleaned text, " +
+      "sha256 321757c1c0bd36a3c10de8f7f80c220ac73d08a3eb7d65d5fc5609f528a9f105. The file's address was read from the " +
+      "publication page on that day (it was the only PDF linked there; the resolveFrom lookup returned it). Each page " +
+      "is headed 'Published for Home Office staff on 3 August 2026'; page 1 states version 20.0. " +
+      "Read closely: the passages pinned in guidance-quote-checks.ts (sections 1, 8 and 9 of the web version; the " +
+      "PDF's headings are not numbered); the rest was retrieved and skimmed, not read line by line.",
+    retrievedAt: "2026-11-14T12:07:36Z",
+  },
+  {
+    id: "gb-appendix-english-language",
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
+    role: "secondary",
+    title: "Immigration Rules Appendix English Language",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-english-language",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "10,732 characters of cleaned text, sha256 236d13a2055429e1ed7f46f8a8cd8f23267825c53ddedebbd200d2dc70b03ce3. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 7.2 " +
+      "of Appendix Skilled Worker names it; its opening lists the appendices it applies to (Student among them). " +
+      "The text runs from the title to the last paragraph (it is not cut short). Read closely: the opening paragraphs; " +
+      "the rest was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:07:56Z",
+  },
+  {
+    id: "gb-appendix-skilled-occupations",
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
+    role: "secondary",
+    title: "Immigration Rules Appendix Skilled Occupations",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-skilled-occupations",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "199,859 characters of cleaned text, sha256 572db9d4776411c55da3f2100f42775fe14c4d8bd72ea3a473133ae215a73b5b. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 4.2 and " +
+      "SW 8.1 of Appendix Skilled Worker take eligible occupation codes and going rates from its tables. The text runs " +
+      "from the title to the last occupation listed (9269; it is not cut short); it is mostly tables. Read closely: " +
+      "the title and the table headings only; the tables were retrieved, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:07:58Z",
+  },
+  {
+    id: "gb-appendix-immigration-salary-list",
+    // Cross-route document: only what the route's own rules point to, and what applies to its applicants.
+    role: "secondary",
+    title: "Immigration Rules Appendix Immigration Salary List",
+    url: "https://www.gov.uk/guidance/immigration-rules/immigration-rules-appendix-immigration-salary-list",
+    jurisdiction: "GB",
+    route: "skilled-worker-visa",
+    docType: "html",
+    checkIntervalHours: WEEKLY_HOURS,
+    verificationStatus: "verified",
+    verificationNote:
+      "Retrieved in full on 2026-11-14 (12:08 UTC) through the shared fetch service: HTTP 200, no redirect, " +
+      "5,076 characters of cleaned text, sha256 b3f2651bf6a288e11f55c96f2130ae1f3fd9b3b260f764bec4819fd8461f55f0. " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 8.1(b) " +
+      "of Appendix Skilled Worker refers to it. The text runs from the title to the last table row (it is not cut " +
+      "short). Read closely: the two opening paragraphs; the table was retrieved and skimmed, not read line by line. " +
+      "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
+    retrievedAt: "2026-11-14T12:08:16Z",
+  },
 ];
 
 /** Statuses a seed may set (`failing` belongs to the crawler). */

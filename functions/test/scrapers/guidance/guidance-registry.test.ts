@@ -216,6 +216,16 @@ describe("guidance seed: the doc that is written", () => {
         "gb-family-life-guidance-html": "route_guidance",
         "gb-family-life-guidance-pdf": "route_guidance",
         "gb-family-financial-requirement-pdf": "route_guidance",
+        // ---- Skilled Worker (issue #260): the appendix is primary, the
+        // caseworker guidance (web + PDF) route guidance, and the appendices
+        // its rules name (English Language, Skilled Occupations, Immigration
+        // Salary List) secondary.
+        "gb-appendix-skilled-worker": "primary",
+        "gb-skilled-worker-guidance-html": "route_guidance",
+        "gb-skilled-worker-guidance-pdf": "route_guidance",
+        "gb-appendix-english-language": "secondary",
+        "gb-appendix-skilled-occupations": "secondary",
+        "gb-appendix-immigration-salary-list": "secondary",
       }
     );
   });
