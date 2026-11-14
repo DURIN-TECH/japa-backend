@@ -324,6 +324,23 @@ Authorization: Bearer {{adminToken}}
 
 { "reason": "Undo a mistaken reset-reference" }
 
+### Admin: hold (pin) a rate while the provider lags a real move (issue #241).
+### While held it is THE rate (outranks any override); refreshes still store the
+### provider rate for comparison. rate must be inside the plausible range (NGN
+### 200-5000); reason 5-500 chars; ttlHours required, 1-168. Audited (hold_set).
+PUT {{baseUrl}}/admin/exchange-rates/NGN/hold
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "rate": 1800, "reason": "CBN lags the market after the devaluation", "ttlHours": 48 }
+
+### Admin: clear the hold (normal rules resume). Audited (hold_cleared).
+DELETE {{baseUrl}}/admin/exchange-rates/NGN/hold
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "reason": "CBN caught up with the market" }
+
 # ============================================================
 # DEV — Seed endpoints (emulator only)
 # ============================================================
