@@ -213,9 +213,10 @@ describe("combined sub-conditions", () => {
     assert.equal(flags.length, 1);
   });
 
-  test("a quote that is only the lead-in of a list is flagged", () => {
-    const flags = flagsFor([judgement("Z 1.2. If a third party pays for the stay, the third party:", { ref: "x", title: "Lead-in only" })]);
-    assert.equal(flags.length, 1);
+  test("a quote that is only the lead-in of a list is no longer flagged when code can attach its list (#222): the lines are stored", () => {
+    const out = assessChunkOutput(answer({ criteria: [judgement("Z 1.2. If a third party pays for the stay, the third party:", { ref: "x", title: "Lead-in only" })] }), CHUNK, INDEX, BASE, DEFAULT_SEVERITY_LEVELS, null);
+    assert.deepEqual(out.criteria[0].criterion.source.listItems, LINES.slice(2, 5));
+    assert.equal(flagsFor([judgement("Z 1.2. If a third party pays for the stay, the third party:", { ref: "x", title: "Lead-in only" })]).length, 0);
   });
 
   test("a bracketed letter in running text is a cross-reference, not a second marker", () => {

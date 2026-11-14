@@ -103,7 +103,7 @@ describe("lead-in detection and list attachment", () => {
     const lines = ["Z 1.1. Examplia citizens must be one of the following:", "Z 1.2. A different rule entirely."];
     const { index, found } = idx(lines, "Examplia citizens must be one of the following:");
     assert.deepEqual(readLeadInList(index, found), { kind: "unreadable", reason: "no_list_follows" });
-    const last = idx(["Z 1.1. Examplia citizens must be one of the following:"], "The applicant must be one of the following:");
+    const last = idx(["Z 1.1. Examplia citizens must be one of the following:"], "Examplia citizens must be one of the following:");
     assert.deepEqual(readLeadInList(last.index, last.found), { kind: "unreadable", reason: "no_list_follows" });
   });
 
@@ -309,5 +309,37 @@ describe("consumers carry the new fields", () => {
     const plain: AssessmentCriterion = { ...withBoth, appliesTo: { nationalities: ["BD"], asWritten: ["Borduria"] } };
     const rubric = fictionalRubric({ countryCode: "XX", visaTypeId: "visit", intentPolarity: null, criteria: [plain] });
     assert.deepEqual(judgementCriteriaOf(rubric), []);
+  });
+});
+
+// ---- the two real rules of the first held run, on the real page layout ----
+// Public gov.uk caseworker guidance text (the minimum needed): the two rules the
+// independent check rejected before #222. The page lists the exceptions as plain
+// lines (no list marker), and names "right of abode" in lower case.
+describe("the two saved rules from the first real run", () => {
+  const PAGE = [
+    "3.3 Irish citizens",
+    "Irish citizens are not eligible to apply for permission (leave) to enter or stay under the Visitor rules, except where they are subject to any of the following:",
+    "a deportation order made under section 5(1) of the Immigration Act 1971",
+    "an exclusion decision, or an exclusion order made under regulation 23(5) of the Immigration (European Economic Area) Regulations 2016",
+    "a travel ban implemented under section 8B of the Immigration Act 1971",
+    "Those who fall within one of the exemptions above do require permission to enter or stay.",
+    "2.3 People who are British citizens or who have right of abode",
+    "A person who is a British citizen, or who has right of abode in the UK cannot be given permission to enter or stay under the Immigration Rules.",
+  ];
+  const s = snap(PAGE);
+  const index = new SnapshotQuoteIndex(s);
+  const run = (c: ReturnType<typeof crit>) => assessChunkOutput(answer({ criteria: [c] }), CHUNK, index, baseOf(s), DEFAULT_SEVERITY_LEVELS, null).criteria[0];
+
+  test("ref 3.3: every exception line of the page is stored, in order", () => {
+    const r = run(crit({ ref: "i", title: "Irish citizens", kind: "mandatory_bar", quote: PAGE[1], appliesTo: { nationalities: ["IE"], asWritten: ["Irish citizens"] } }));
+    assert.deepEqual(r.criterion.source.listItems, PAGE.slice(2, 5));
+  });
+
+  test("ref 2.3: GB coded plus 'right of abode' uncoded; no code stretched over the status", () => {
+    const r = run(crit({ ref: "g", title: "British citizens", kind: "mandatory_bar", quote: PAGE[7], appliesTo: { nationalities: ["GB"], asWritten: ["British citizen"], uncoded: ["right of abode"] } }));
+    assert.deepEqual(r.criterion.appliesTo?.nationalities, ["GB"]);
+    assert.deepEqual(r.criterion.appliesTo?.uncoded, ["right of abode"]);
+    assert.equal(r.criterion.source.listItems, undefined);
   });
 });
