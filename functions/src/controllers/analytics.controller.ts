@@ -195,7 +195,7 @@ export class AnalyticsController {
   /**
    * GET /analytics/revenue-trends
    *
-   * Returns monthly revenue totals (completed transactions)
+   * Returns monthly revenue (settled payments minus settled refunds)
    * for the line chart visualization, as one series per currency
    * (issue #282): [{ currency, points: [{ month, label, value }] }],
    * `value` in minor units of the series' currency.

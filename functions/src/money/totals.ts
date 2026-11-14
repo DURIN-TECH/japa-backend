@@ -1,4 +1,5 @@
 import type { CurrencyCode } from "../types/money";
+import type { Transaction, TransactionStatus } from "../types";
 import { normalizeCurrencyCode } from "./currencies";
 
 // ============================================
@@ -95,4 +96,66 @@ export function unionCurrencies(...sets: CurrencyBuckets[]): CurrencyCode[] {
   const all = new Set<CurrencyCode>();
   for (const set of sets) for (const c of set.currencies()) all.add(c);
   return Array.from(all).sort();
+}
+
+// ============================================
+// SHARED REVENUE RULE (issue #282)
+// ============================================
+//
+// ONE rule for what a transaction does to revenue, used by BOTH
+// GET /transactions/stats (TransactionService.computeStats) and the analytics
+// revenue figures (KPIs, trends), so the two can never disagree:
+//
+//  - a SETTLED transaction (status completed or released) of an incoming type
+//    adds its amount to revenue. "released" is how a paid payment request is
+//    stored (escrow_release), "completed" a consultation fee, and so on;
+//  - a SETTLED transaction of type "refund" SUBTRACTS its amount from the
+//    revenue of its own currency (money given back to a client). Revenue is
+//    not clamped: a period with more refunds than charges shows a negative
+//    figure. Only the available balance keeps its floor of 0;
+//  - a charge whose own status is "refunded" is not settled, so it simply
+//    drops out of revenue (that is how a refund is recorded today when no
+//    separate refund transaction is written); a separate "refund"
+//    transaction is a different record, so nothing is subtracted twice;
+//  - a "withdrawal" is a payout to the agent, never revenue: it only reduces
+//    the available balance of its own currency (see computeStats).
+
+/** Statuses at which a transaction's money has actually moved. */
+export const SETTLED_STATUSES: readonly TransactionStatus[] = ["completed", "released"];
+
+/** Statuses of an incoming payment that is still on its way. */
+export const PENDING_STATUSES: readonly TransactionStatus[] = [
+  "pending",
+  "processing",
+  "held_in_escrow",
+];
+
+/** Whether a transaction's money has moved (completed or released). */
+export function isSettled(txn: Pick<Transaction, "status">): boolean {
+  return SETTLED_STATUSES.includes(txn.status);
+}
+
+/**
+ * Signed effect of one transaction on revenue, in minor units of the
+ * transaction's own currency: +amount for a settled incoming payment,
+ * -amount for a settled refund, 0 otherwise (unsettled rows, withdrawals).
+ */
+export function revenueEffect(txn: Pick<Transaction, "type" | "status" | "amount">): number {
+  if (txn.type === "withdrawal" || !isSettled(txn)) return 0;
+  return txn.type === "refund" ? -txn.amount : txn.amount;
+}
+
+/**
+ * Whether a transaction is an incoming payment still pending (counts toward
+ * `pendingPayments` and the pending-clients count). Refunds and withdrawals
+ * are outflows, so they are never pending payments.
+ */
+export function isPendingIncoming(txn: Pick<Transaction, "type" | "status">): boolean {
+  if (txn.type === "withdrawal" || txn.type === "refund") return false;
+  return PENDING_STATUSES.includes(txn.status);
+}
+
+/** The bucket currency of a transaction (a legacy row with no code = NGN). */
+export function transactionCurrency(txn: Pick<Transaction, "currency">): CurrencyCode {
+  return currencyOrDefault(txn.currency, LEGACY_TRANSACTION_CURRENCY);
 }

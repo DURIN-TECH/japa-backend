@@ -4,8 +4,9 @@ import { Timestamp } from "firebase-admin/firestore";
 import type { ChargeSnapshot, CurrencyCode } from "../types/money";
 import {
   CurrencyBuckets,
-  LEGACY_TRANSACTION_CURRENCY,
-  currencyOrDefault,
+  isPendingIncoming,
+  revenueEffect,
+  transactionCurrency,
 } from "../money/totals";
 
 export interface TransactionFilters {
@@ -29,9 +30,13 @@ export const WITHDRAWAL_CURRENCY: CurrencyCode = "NGN";
 export interface CurrencyTransactionStats {
   /** ISO 4217 code, upper case ("NGN", "USD"). */
   currency: CurrencyCode;
-  /** Sum of completed / released incoming transactions in this currency. */
+  /**
+   * Settled (completed / released) incoming transactions in this currency,
+   * minus settled refunds in this currency. Not clamped: may be negative
+   * when refunds exceed charges.
+   */
   totalRevenue: number;
-  /** Sum of pending / processing / held-in-escrow incoming transactions in this currency. */
+  /** Sum of pending / processing / held-in-escrow incoming transactions in this currency (refunds and withdrawals excluded). */
   pendingPayments: number;
   /**
    * `totalRevenue` minus the withdrawals (pending, processing or completed)
@@ -51,12 +56,6 @@ export interface TransactionStats {
   /** Distinct clients with a pending incoming payment (a count, not money). */
   pendingClientsCount: number;
 }
-
-/** Statuses whose incoming amount counts as earned revenue. */
-const COMPLETED_STATUSES: TransactionStatus[] = ["completed", "released"];
-
-/** Statuses whose incoming amount is still on its way. */
-const PENDING_STATUSES: TransactionStatus[] = ["pending", "processing", "held_in_escrow"];
 
 /**
  * Statuses of a withdrawal that hold money out of the balance: a completed
@@ -164,9 +163,11 @@ class TransactionService {
    *  - each transaction lands in the bucket of its own `currency` (a legacy
    *    row with no code counts as NGN); amounts of different currencies are
    *    never added together;
-   *  - incoming transactions (every type except "withdrawal") feed
-   *    `totalRevenue` (completed / released) and `pendingPayments`
-   *    (pending / processing / held in escrow);
+   *  - revenue follows the SHARED rule in money/totals.ts (`revenueEffect`,
+   *    also used by analytics): a settled (completed / released) incoming
+   *    transaction adds its amount, a settled refund subtracts it, both in
+   *    their own currency. `pendingPayments` sums pending / processing /
+   *    held-in-escrow incoming transactions (`isPendingIncoming`);
    *  - withdrawals are outflows: they are NOT revenue or pending payments,
    *    and a pending / processing / completed withdrawal is subtracted from
    *    the `availableBalance` of ITS currency only (clamped at 0). Before
@@ -188,7 +189,7 @@ class TransactionService {
     const pendingUserIds = new Set<string>();
 
     for (const txn of transactions) {
-      const currency = currencyOrDefault(txn.currency, LEGACY_TRANSACTION_CURRENCY);
+      const currency = transactionCurrency(txn);
       // Give the currency a row even if this transaction adds nothing.
       revenue.touch(currency);
 
@@ -200,10 +201,9 @@ class TransactionService {
         continue;
       }
 
-      if (COMPLETED_STATUSES.includes(txn.status)) {
-        revenue.add(currency, txn.amount);
-      }
-      if (PENDING_STATUSES.includes(txn.status)) {
+      // Settled charge: +amount; settled refund: -amount; otherwise 0.
+      revenue.add(currency, revenueEffect(txn));
+      if (isPendingIncoming(txn)) {
         pending.add(currency, txn.amount);
         pendingUserIds.add(txn.userId);
       }
@@ -214,6 +214,8 @@ class TransactionService {
       currency,
       totalRevenue: revenue.get(currency),
       pendingPayments: pending.get(currency),
+      // Refunds already lowered revenue; withdrawals come off here. The
+      // balance is the only figure clamped at 0.
       availableBalance: Math.max(0, revenue.get(currency) - withdrawn.get(currency)),
     }));
 

@@ -24,8 +24,9 @@ import {
   CurrencyAmount,
   CurrencyBuckets,
   LEGACY_APPLICATION_CURRENCY,
-  LEGACY_TRANSACTION_CURRENCY,
   currencyOrDefault,
+  revenueEffect,
+  transactionCurrency,
   unionCurrencies,
 } from "../money/totals";
 
@@ -85,29 +86,34 @@ const EVENT_NAME_PATTERN = /^[a-z][a-z0-9_]{1,63}$/;
 // money/totals.ts and NEVER adds amounts of different currencies.
 
 /**
- * Percent change between two values. Returns 100 when the previous value is 0
- * and the current one is positive, and 0 when both are 0 (no division by 0).
+ * Percent change between two values. From a previous value of 0 it returns
+ * 100 (up), -100 (down) or 0 (unchanged), avoiding a division by 0.
+ *
+ * The divisor is |prev| because revenue can be NEGATIVE (refunds exceeding
+ * charges, issue #282): -100 -> 100 is +200%, not -200%. For the usual
+ * positive values this is the same as the plain formula.
  */
 export function percentChange(prev: number, current: number): number {
-  if (prev === 0) return current > 0 ? 100 : 0;
-  return ((current - prev) / prev) * 100;
+  if (prev === 0) return Math.sign(current) * (current === 0 ? 0 : 100);
+  return ((current - prev) / Math.abs(prev)) * 100;
 }
 
 /**
- * Whether a transaction counts as analytics revenue: status "completed", as
- * before #282, and never a withdrawal (a payout is money going OUT; before
- * #282 a completed withdrawal was counted as revenue).
+ * Sum the revenue of a list of transactions into per-currency buckets, using
+ * the SHARED rule in money/totals.ts (`revenueEffect`, the same one
+ * GET /transactions/stats uses): settled (completed / released) incoming
+ * payments add, settled refunds subtract, withdrawals and unsettled rows add
+ * nothing. Before #282 analytics counted only "completed" rows, so paid
+ * payment requests (stored as "released") were missing, refunds counted as
+ * revenue and completed withdrawals did too. Only transactions that touch
+ * revenue get a bucket.
  */
-export function isAnalyticsRevenue(txn: Transaction): boolean {
-  return txn.status === "completed" && txn.type !== "withdrawal";
-}
-
-/** Sum the revenue transactions of a list into per-currency buckets. */
 export function sumRevenueByCurrency(txns: Transaction[]): CurrencyBuckets {
   const buckets = new CurrencyBuckets();
   for (const txn of txns) {
-    if (!isAnalyticsRevenue(txn)) continue;
-    buckets.add(currencyOrDefault(txn.currency, LEGACY_TRANSACTION_CURRENCY), txn.amount);
+    const effect = revenueEffect(txn);
+    if (effect === 0) continue;
+    buckets.add(transactionCurrency(txn), effect);
   }
   return buckets;
 }
@@ -147,12 +153,14 @@ export function buildRevenueTrendSeries(
   // currency -> (YYYY-MM -> sum in minor units of that currency)
   const byCurrency = new Map<CurrencyCode, Map<string, number>>();
   for (const txn of txns) {
-    if (!isAnalyticsRevenue(txn)) continue;
-    const currency = currencyOrDefault(txn.currency, LEGACY_TRANSACTION_CURRENCY);
+    // Same shared revenue rule as the KPIs and /transactions/stats.
+    const effect = revenueEffect(txn);
+    if (effect === 0) continue;
+    const currency = transactionCurrency(txn);
     const d = txn.createdAt.toDate();
     const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
     const sums = byCurrency.get(currency) ?? new Map<string, number>();
-    sums.set(key, (sums.get(key) ?? 0) + txn.amount);
+    sums.set(key, (sums.get(key) ?? 0) + effect);
     byCurrency.set(currency, sums);
   }
   return Array.from(byCurrency.keys())
@@ -562,7 +570,8 @@ class AnalyticsService {
    *
    * Computes key performance indicators:
    * - totalCases: number of cases in the date range
-   * - revenueByCurrency: completed transaction amounts summed PER CURRENCY
+   * - revenueByCurrency: settled (completed / released) transactions minus
+   *   settled refunds, PER CURRENCY
    *   (minor units), each with its own previous-period change (issue #282)
    * - conversionRate: approved / (approved + rejected) as percentage
    * - avgProcessingDays: average days from creation to completion
@@ -675,7 +684,8 @@ class AnalyticsService {
   /**
    * GET /analytics/revenue-trends
    *
-   * Returns monthly revenue totals (completed transactions) within the date
+   * Returns monthly revenue (settled payments minus settled refunds, the
+   * shared rule in money/totals.ts) within the date
    * range, as ONE SERIES PER CURRENCY (issue #282): each series has a point
    * for every month in the range, with `value` in minor units of the
    * series' currency. Empty array when there is no revenue in the range.
@@ -921,9 +931,9 @@ export interface MonthlyDataPoint {
 export interface RevenueKPI {
   /** ISO 4217 code, upper case. */
   currency: CurrencyCode;
-  /** Completed revenue in the selected period (minor units). */
+  /** Revenue (settled payments minus settled refunds) in the selected period, minor units; may be negative. */
   totalRevenue: number;
-  /** Completed revenue in the previous period of the same length (minor units). */
+  /** Same figure for the previous period of the same length (minor units). */
   previousRevenue: number;
   /**
    * Percent change previous -> current, one decimal. 100 when the previous
