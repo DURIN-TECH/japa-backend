@@ -73,7 +73,9 @@ function blank(v: unknown): boolean {
 export function isEmptyAnswer(type: AnswerType, raw: unknown): boolean {
   if (blank(raw)) return true;
   if (type === "list") return Array.isArray(raw) && raw.every(blank);
-  if (type === "date_range" || type === "money" || type === "address") {
+  // Money: a blank amount is empty whatever the currency chip says.
+  if (type === "money") return isRecord(raw) && blank(raw.amount);
+  if (type === "date_range" || type === "address") {
     return isRecord(raw) && Object.values(raw).every(blank);
   }
   return false;
@@ -180,6 +182,9 @@ export function validateAnswerValue(type: AnswerType, raw: unknown): AnswerValue
     }
     return entries;
   }
+  default:
+    // An unknown type must never fall through to a silent success.
+    throw new AnswerValidationError("This item has an unsupported answer type");
   }
 }
 

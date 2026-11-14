@@ -63,6 +63,10 @@ describe("classifyAnswerType on the real UK items", () => {
     assert.equal(classifyAnswerType("your job title and annual salary").type, "text");
     assert.equal(classifyAnswerType("your partner’s name, date of birth and passport number").type, "text");
   });
+  test("an email address is not a postal address; mixed birth items stay text", () => {
+    assert.equal(classifyAnswerType("your email address").type, "text");
+    assert.equal(classifyAnswerType("your date of birth and place of birth").type, "text");
+  });
   test("the type set is exactly the six the regroom names", () => {
     assert.deepEqual([...ANSWER_TYPES], ["date", "date_range", "money", "address", "list", "text"]);
   });
@@ -88,7 +92,7 @@ describe("extractor validator: answerType + answerTypeQuote", () => {
       { pageText: page }
     ).requiredDocumentMeta!;
 
-  test("prompt version is v9", () => assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-answer-types-v9"));
+  test("prompt version is v10", () => assert.equal(EXTRACTOR_PROMPT_VERSION, "2026-11-answer-types-v10"));
 
   test("a valid type with a verbatim quote is kept with its quote", () => {
     const m = run([
@@ -136,6 +140,24 @@ describe("extractor validator: answerType + answerTypeQuote", () => {
     assert.equal(answerTypeQuoteOk("", n(page), ITEM), false);
     assert.equal(answerTypeQuoteOk(COST, n(page), ITEM), false); // on the page but another item's words
     assert.equal(answerTypeQuoteOk(ITEM, undefined, ITEM), true); // no page: non-emptiness only
+    // A fragment of the item (or of the page) proves nothing: whole item required.
+    assert.equal(answerTypeQuoteOk("date", n(page), ITEM), false);
+    assert.equal(answerTypeQuoteOk("r", n(page), ITEM), false);
+    assert.equal(answerTypeQuoteOk("the dates", n(page), ITEM), false);
+  });
+
+  test("a model claiming date with a fragment quote on a mixed item falls back to text", () => {
+    const MIXED = "your partner’s name, date of birth and passport number";
+    const pg = `${LEAD}: ${MIXED}.`;
+    const v = validateExtractedVisa(
+      {
+        ...base, requiredDocuments: [MIXED], citations: { "requiredDocuments.0": MIXED },
+        requiredDocumentMeta: [{ kind: "information", kindQuote: LEAD, need: "required", answerType: "date", answerTypeQuote: "date of birth" }],
+      },
+      { pageText: pg }
+    ).requiredDocumentMeta!;
+    assert.equal(v[0].answerType, "text");
+    assert.equal(v[0].answerTypeQuote, undefined);
   });
 });
 

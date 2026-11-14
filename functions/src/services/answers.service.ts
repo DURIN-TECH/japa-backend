@@ -105,8 +105,9 @@ class AnswersService {
     try {
       const view = await checklistService.getChecklist(application);
       for (const i of view.items) if (i.kind === "information") types.set(i.checklistItemId, i.answerType ?? "text");
-    } catch {
-      /* stored types are used */
+    } catch (e) {
+      // Stored types are used. Logged WITHOUT any answer text (personal data).
+      console.error("Answers: checklist read failed, using stored types:", e instanceof Error ? e.message : "unknown");
     }
     const out: Record<string, AnswerView> = {};
     for (const doc of snap.docs) out[doc.id] = toAnswerView(doc.data() as StoredAnswer, types.get(doc.id));

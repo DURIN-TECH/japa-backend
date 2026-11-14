@@ -107,6 +107,9 @@ describe("an empty value clears for every type", () => {
     assert.equal(isEmptyAnswer("list", ["", " "]), true);
     assert.equal(isEmptyAnswer("date_range", { from: "", to: "" }), true);
     assert.equal(isEmptyAnswer("money", {}), true);
+    assert.equal(isEmptyAnswer("money", { amount: "", currency: "GBP" }), true); // blank amount clears despite the chip
+    assert.equal(isEmptyAnswer("money", { amount: null, currency: "GBP" }), true);
+    assert.match(msg("bogus" as never, "x") ?? "", /unsupported/);
     assert.equal(isEmptyAnswer("address", { line1: "", city: null }), true);
     assert.equal(isEmptyAnswer("date_range", { from: "2027-01-01", to: "" }), false); // partial: validated, 400
     assert.equal(isEmptyAnswer("list", ["a"]), false);

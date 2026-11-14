@@ -21,7 +21,7 @@
  * NO authorisation here: callers (controller) have already run
  * `checkApplicationAccess`. NO model call anywhere in this file.
  */
-import { rubricStore } from "../../scrapers";
+import { isAnswerType, rubricStore } from "../../scrapers";
 import { visaService } from "../visa.service";
 import { documentRequestService } from "../document-request.service";
 import { buildChecklist, ChecklistItem, ChecklistState } from "./checklist-builder";
@@ -57,7 +57,9 @@ function itemFromRequest(r: DocumentRequest): ChecklistItem | null {
     ...(r.kindReview ? { kindReview: true as const } : {}),
     ...(r.kindQuote ? { kindQuote: r.kindQuote } : {}),
     // A stored information request keeps its type; one saved before the regroom reads as text.
-    ...(r.kind === "information" ? { answerType: r.answerType ?? ("text" as const) } : {}),
+    ...(r.kind === "information"
+      ? { answerType: isAnswerType(r.answerType) ? r.answerType : ("text" as const) }
+      : {}),
     ...(r.answerTypeQuote ? { answerTypeQuote: r.answerTypeQuote } : {}),
     need: r.need ?? (r.required === true ? "required" : "optional"),
     ...(r.appliesWhen ? { appliesWhen: r.appliesWhen } : {}),

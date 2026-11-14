@@ -103,10 +103,15 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *    verbatim `answerTypeQuote`. The validator drops a type outside the set or a
  *    quote not on the page and decides from the item's own words instead
  *    (classifyAnswerType), `text` last.
+ *  - "2026-11-answer-types-v10" (#187): v9's extra answerType fields led the
+ *    model to drop whole lists of information items (UK Family's "You'll need
+ *    to provide:" bullets). The DOCUMENTS section now says to list EVERY bullet
+ *    under each provide-style lead-in, documents and information alike, and
+ *    that the answerType never decides whether an item is listed.
  * Before merging a bump (or a model change), run `npm run eval:visa-extract`
  * and attach the result — see functions/src/scrapers/visa-catalog/eval/README.md.
  */
-export const EXTRACTOR_PROMPT_VERSION = "2026-11-answer-types-v9";
+export const EXTRACTOR_PROMPT_VERSION = "2026-11-answer-types-v10";
 
 // A duration phrase: a number (digits or a word) followed by year(s)/month(s),
 // e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
@@ -320,15 +325,17 @@ function itemListedUnder(page: string, lead: string, text: string): boolean {
 /**
  * Is `quote` an acceptable `answerTypeQuote` for the item `itemText`? It must
  * be non-empty, appear verbatim on the page (normalised as citations are; when
- * the page is unavailable only non-emptiness is checked) and be about THIS
- * item: it contains the item's text, or is a piece of it. Characters only.
+ * the page is unavailable only that it is non-empty is checked) and be about THIS
+ * item: it contains the item's WHOLE text. Characters only.
  */
 export function answerTypeQuoteOk(quote: string, page: string | undefined, itemText: string): boolean {
   if (quote.length === 0) return false;
   const nq = normForQuote(quote);
   if (page !== undefined && !page.includes(nq)) return false;
   const own = normForQuote(itemText);
-  return nq.includes(own) || own.includes(nq);
+  // The quote must contain the WHOLE item text: a fragment ("date", "r") of
+  // the item (or of any text on the page) proves nothing about its type.
+  return own.length > 0 && nq.includes(own);
 }
 
 /**
@@ -954,6 +961,12 @@ export function buildSystemPrompt(): string {
     "  document, in the order the page lists them, using the page's own wording.",
     "- Never add a document the page does not name, even a typical one (passport, photo, ...). Do not infer",
     "  documents from eligibility rules. Do not split or merge the page's items.",
+    "- List EVERY bullet under each lead-in that asks the applicant to provide, give or tell something (\"You'll need",
+    "  to provide:\", \"You'll need to give details of:\", \"Depending on your circumstances, you might also need to",
+    "  provide:\", ...). Documents to upload AND information to type in (names, dates of birth, details of any",
+    "  convictions, addresses, reference numbers) are BOTH listed: an item is never left out because it is",
+    "  information rather than a document, or because its answerType is text or list. Check your array against the",
+    "  page's bullets before answering: every bullet under such a lead-in must be in it.",
     "- If the page has no such list, return [] (this is valid; do not lower confidence for it).",
     "- EVERY item needs a verbatim quote: citations['requiredDocuments.<index>'] where <index> is the item's",
     "  0-based position in YOUR array (citations['requiredDocuments.0'] for the first). The quote must be copied",

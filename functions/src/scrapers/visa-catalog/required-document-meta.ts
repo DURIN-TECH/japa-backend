@@ -238,7 +238,9 @@ const ADDRESS_CUE = /\baddress\b|\bwhere you['\u2019]ll be staying\b/i;
 // Other single fields that make the item a MIXED one (text): the app has no
 // shape for "name, date of birth and passport number" in one box.
 const OTHER_FIELD_CUE =
-  /\b(?:name|number|nationality|passport|job title|licence|reference|sponsorship|code|national insurance|partner)\b/i;
+  /\b(?:name|number|nationality|passport|job title|licence|reference|sponsorship|code|national insurance|partner|place of birth)\b/i;
+// An EMAIL address is not a postal address: it stays text (no email type yet).
+const EMAIL_CUE = /\be-?mail\b/i;
 // An amount of money: "how much you think your trip will cost", "how much you
 // earn in a year", salary, income.
 const MONEY_CUE = /\bhow much\b|\bsalary\b|\bearn\b|\bcost\b|\bincome\b/i;
@@ -258,6 +260,7 @@ const DATES_CUE = /\bdates\b/i;
 export function classifyAnswerType(itemText: string): { type: AnswerType; matched: boolean } {
   const t = itemText.trim();
   if (LIST_CUE.test(t)) return { type: "list", matched: true };
+  if (EMAIL_CUE.test(t)) return { type: "text", matched: false };
   if (ADDRESS_CUE.test(t)) return { type: "address", matched: true };
   // A mixed item ("job title and annual salary", "partner's name, date of
   // birth and passport number") stays text even though it has a money / date cue.

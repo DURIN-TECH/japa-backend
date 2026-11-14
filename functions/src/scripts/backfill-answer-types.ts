@@ -2,7 +2,7 @@
  * Backfill `answerType` on the information items of EXISTING scraped visas
  * (issue #187 regroom).
  *
- * Background: from prompt version 2026-11-answer-types-v9 the extractor stores
+ * Background: from prompt version 2026-11-answer-types-v9 or later the extractor stores
  * an `answerType` (date | date_range | money | address | list | text) on each
  * INFORMATION item of `scrapeMeta.requiredDocumentMeta`. Visas extracted earlier
  * have none; the API and the app read a missing type as "text", so nothing is
