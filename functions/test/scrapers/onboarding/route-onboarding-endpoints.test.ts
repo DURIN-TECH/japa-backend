@@ -159,6 +159,30 @@ describe("the contract the portal builds against", () => {
     assert.equal(over.body.error, "DAILY_LIMIT_REACHED");
   });
 
+  test("issue #232: start takes authorityId (countryCode still accepted); a bloc route is found but not started yet", async () => {
+    // authorityId in place of countryCode: same run key for a country.
+    const ok = await api("POST", "", "t-admin", { authorityId: COUNTRY, visaTypeId: VISA_ID });
+    assert.equal(ok.status, 201, JSON.stringify(ok.body));
+    assert.equal(ok.body.data.run.routeKey, ROUTE_KEY);
+    // Both keys at once, or a malformed authority id: 400.
+    assert.equal((await api("POST", "", "t-admin", { authorityId: COUNTRY, countryCode: COUNTRY, visaTypeId: VISA_ID })).status, 400);
+    assert.equal((await api("POST", "", "t-admin", { authorityId: "bad_id", visaTypeId: VISA_ID })).status, 400);
+    // A route registered under a made-up bloc: visaSources/{authorityId}, jurisdiction = authorityId.
+    store.set("visaSources/test-bloc", {
+      id: "test-bloc", authorityId: "test-bloc", status: "active",
+      pages: [{ url: "https://bloc.invalid/short-stay", routeName: "Short stay", validation: "unverified", visaId: "test-bloc-short-stay", addedVia: "portal" }],
+    });
+    store.set("guidanceSources/test-bloc-rules", { title: "Rules", url: "https://bloc.invalid/rules", jurisdiction: "test-bloc", route: "short-stay", role: "primary", status: "active", verificationStatus: "registered" });
+    const before = runDocs().length;
+    const bloc = await api("POST", "", "t-admin", { authorityId: "test-bloc", visaTypeId: "test-bloc-short-stay" });
+    assert.equal(bloc.status, 422, JSON.stringify(bloc.body));
+    assert.equal(bloc.body.error, "SHARED_LAYER_NOT_READY");
+    // An unregistered route of the bloc is still a plain 404.
+    assert.equal((await api("POST", "", "t-admin", { authorityId: "test-bloc", visaTypeId: "test-bloc-other" })).body.error, "ROUTE_NOT_REGISTERED");
+    assert.equal(runDocs().length, before);
+    assert.equal(store.has("routeOnboardingRoutes/test-bloc_test-bloc-short-stay"), false);
+  });
+
   test("get: the run with steps, estimate, counters, links, checklist; no lease or retry internals", async () => {
     const run = await oh.svc.start(COUNTRY, VISA_ID, "admin-uid");
     await pump(oh, run.runId);

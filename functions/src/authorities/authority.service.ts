@@ -2,7 +2,7 @@ import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../utils/firebase";
 // The source registry's error type, audit write and address rules, through
 // the scrapers module's public API (its internals are off limits, see #91).
-import { appendRegistryAudit, parseRegistryUrl, RegistryError, stripUndefined } from "../scrapers";
+import { appendRegistryAudit, officialDomainAuthorityId, parseRegistryUrl, RegistryError, stripUndefined } from "../scrapers";
 import { AUTHORITY_KINDS, AUTHORITY_STATUSES, MEMBERSHIP_KINDS, type Authority, type AuthorityKind, type AuthorityMember, type AuthorityStatus } from "../types/authority";
 import { checkAuthorityId, checkAuthorityIdForKind, isCountryCode, membersOn, parseCalendarDate, todayUtc } from "./authority-ids";
 
@@ -152,17 +152,28 @@ class AuthorityService {
   clock: () => number = Date.now;
 
   /**
-   * Is `host` an official website the system may take a membership quote from?
+   * Is `host` an official website the system may take a membership quote
+   * from, for a member `countryCode` of authority `authorityId`?
    *
-   * Until P3 moves official websites onto authorities, the check is the
-   * existing confirmed-hosts allow-list (`officialDomains/{host}` with status
-   * `confirmed`), whichever country it was confirmed for: a bloc's own site
-   * cannot be confirmed "for the bloc" yet. P3 replaces this body with
-   * "confirmed for this authority or one of its members"; callers stay the same.
+   * Issue #232 (P3): official websites belong to an authority
+   * (`officialDomains/{host}.authorityId`). The host must be `confirmed` AND
+   * confirmed for one of:
+   *   - the bloc or treaty itself (its own site lists its members);
+   *   - the country being saved (its own government says it is a member);
+   *   - a country that is a member of the authority today (a fellow member's
+   *     government publishing the list).
+   * A host confirmed for an unrelated authority does not count. All reads are
+   * in the caller's transaction (reads before writes).
    */
-  private async hostConfirmed(tx: Transaction, host: string, _authorityId: string): Promise<boolean> {
+  private async hostConfirmed(tx: Transaction, host: string, authorityId: string, countryCode: string): Promise<boolean> {
     const snap = await tx.get(collections.officialDomains.doc(host));
-    return snap.exists && (snap.data() as { status?: string }).status === "confirmed";
+    if (!snap.exists || (snap.data() as { status?: string }).status !== "confirmed") return false;
+    const owner = officialDomainAuthorityId(snap.data());
+    if (owner === authorityId || owner === countryCode) return true;
+    if (!isCountryCode(owner)) return false;
+    // Only a country can be a member: check the owner is a member today.
+    const memberSnap = await tx.get(subcollections.authorityMembers(authorityId).doc(owner));
+    return memberSnap.exists && membersOn([memberSnap.data() as AuthorityMember], todayUtc(this.clock())).length === 1;
   }
 
   // ============================================
@@ -307,7 +318,7 @@ class AuthorityService {
     return this.runTransaction(async (tx) => {
       // ---- Reads ----
       const [authoritySnap, memberSnap, countrySnap] = await Promise.all([tx.get(authorityRef), tx.get(memberRef), tx.get(collections.countries.doc(countryCode))]);
-      const confirmed = await this.hostConfirmed(tx, input.sourceHost, id);
+      const confirmed = await this.hostConfirmed(tx, input.sourceHost, id, countryCode);
 
       // ---- Checks, in the order an admin would fix them ----
       if (!authoritySnap.exists) throw new RegistryError("NOT_FOUND", 404, "There is no authority with that id");

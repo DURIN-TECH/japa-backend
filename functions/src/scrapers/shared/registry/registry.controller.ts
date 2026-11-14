@@ -17,11 +17,11 @@ import { sourcePreviewService } from "./source-preview.service";
 // ============================================
 //
 //   POST  /admin/official-domains/preview        update ScrapeRun   check an address
-//   POST  /admin/official-domains                update ScrapeRun   confirm one exact host
+//   POST  /admin/official-domains                update ScrapeRun   confirm one exact host for an authority
 //   GET   /admin/official-domains                read   ScrapeRun   list
 //   POST  /admin/official-domains/:host/revoke   update ScrapeRun   revoke + pause its sources
 //   GET   /admin/route-sources/country-lookup    read   ScrapeRun   code -> English name, what exists
-//   POST  /admin/route-sources                   update ScrapeRun   register a route
+//   POST  /admin/route-sources                   update ScrapeRun   register a route under an authority
 //   PATCH /admin/guidance-sources/:id            update ScrapeRun   status / role
 //
 // Every route runs `verifyAuth` first (401 without a valid token), then the
@@ -31,6 +31,12 @@ import { sourcePreviewService } from "./source-preview.service";
 // strict: unknown keys are rejected with 400.
 //
 // Error body: `{ success:false, error: CODE, message, ...extra }`.
+//
+// Issue #232 (P3 of #228): official websites and registered routes belong to
+// an issuing AUTHORITY (country, bloc or treaty). Bodies and views carry
+// `authorityId` where they carried `countryCode`; an unknown authority is
+// 400 INVALID_AUTHORITY, a retired one 409 AUTHORITY_RETIRED, and a host
+// already confirmed for another authority 409 HOST_CONFIRMED_FOR_OTHER_AUTHORITY.
 
 /** Admin uid for audit fields (verifyAuth always sets it). */
 const uid = (req: AuthenticatedRequest): string => req.userId ?? req.authz?.uid ?? "unknown";
@@ -52,7 +58,8 @@ const iso = (v: unknown): string | null => (v && typeof (v as Timestamp).toDate 
 function domainView(d: OfficialDomain) {
   return {
     host: d.host,
-    countryCode: d.countryCode,
+    // The authority the host belongs to (a country code, or a bloc/treaty id).
+    authorityId: d.authorityId,
     status: d.status,
     confirmedBy: d.confirmedBy,
     confirmedAt: iso(d.confirmedAt),
@@ -107,12 +114,12 @@ class RegistryController {
     }
   }
 
-  /** POST /admin/official-domains { host, countryCode, statement } */
+  /** POST /admin/official-domains { host, authorityId, statement } */
   async confirm(req: AuthenticatedRequest, res: Response): Promise<void> {
     if (!this.allowed(req, res, "update")) return;
     try {
-      const body = strictBody(req.body, ["host", "countryCode", "statement"]);
-      const { domain, created } = await officialDomainsService.confirm(body as { host: unknown; countryCode: unknown; statement: unknown }, uid(req));
+      const body = strictBody(req.body, ["host", "authorityId", "statement"]);
+      const { domain, created } = await officialDomainsService.confirm(body as { host: unknown; authorityId: unknown; statement: unknown }, uid(req));
       sendSuccess(res, { created, domain: domainView(domain) }, undefined, created ? 201 : 200);
     } catch (err) {
       fail(res, err, "confirming a host");

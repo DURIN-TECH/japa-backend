@@ -99,7 +99,7 @@ closed: a missing doc is OFF. `enabled` (default false), `maxRunsPerDay` (3),
 
 | Request | Success | Errors |
 |---|---|---|
-| `POST /admin/route-onboarding` `{countryCode, visaTypeId}` | 201 `{runId, status, run}` | 400 `VALIDATION_ERROR`; 404 `ROUTE_NOT_REGISTERED`; 409 `RUN_ACTIVE` (+`activeRunId`); 429 `DAILY_LIMIT_REACHED`; 503 `SETTINGS_UNAVAILABLE` / `ONBOARDING_DISABLED` |
+| `POST /admin/route-onboarding` `{authorityId, visaTypeId}` (#232; `countryCode` still accepted in place of `authorityId`, not both) | 201 `{runId, status, run}` | 400 `VALIDATION_ERROR`; 404 `ROUTE_NOT_REGISTERED`; 409 `RUN_ACTIVE` (+`activeRunId`); 422 `SHARED_LAYER_NOT_READY` (route registered under a bloc or treaty: found, not started until P4); 429 `DAILY_LIMIT_REACHED`; 503 `SETTINGS_UNAVAILABLE` / `ONBOARDING_DISABLED` |
 | `GET /admin/route-onboarding?status=&limit=` | 200 `{runs[], total}` (newest first) | 400 |
 | `GET /admin/route-onboarding/:id` | 200 `{run, checklist[]}` (progress read live from the job) | 404 |
 | `POST /:id/confirm` `{estimateId, statementAccepted: true, addToAllowlist?}` | 200 `{alreadyConfirmed, run}` | 400 `VALIDATION_ERROR` / `STATEMENT_REQUIRED`; 404; 409 `ESTIMATE_MISMATCH` (+`currentEstimateId`) / `NOT_AWAITING_CONFIRMATION`; 503 |
