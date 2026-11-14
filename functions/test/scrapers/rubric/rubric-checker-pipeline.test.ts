@@ -420,8 +420,8 @@ describe("independent check through the pipeline", () => {
 const BAR_TITLE = "Nationals refused from a stated date";
 const REPAIRED_TITLE = "Applicants from named countries are refused from a stated date";
 
-/** The failure of the first real run in miniature: ONE `unsure` on `stage_right`, from the judgement model, on the bar. */
-const barUnsureOnStage = ({ role, rule }: { role: string; rule: any }) => (rule.appliesTo && role === "judgement" ? { stage_right: "unsure" as const } : undefined);
+/** The failure of the first real run in miniature: ONE `unsure` on `group_matches_codes` (#226: a bar's stage is no longer judged, so these tests use another aspect), from the judgement model, on the bar. */
+const barUnsureOnGroup = ({ role, rule }: { role: string; rule: any }) => (rule.appliesTo && role === "judgement" ? { group_matches_codes: "unsure" as const } : undefined);
 
 /** What the model answers to the re-draft: the same passage, drafted again (a different title and stage). */
 const redraftOfBar = () =>
@@ -452,7 +452,7 @@ describe("a failed bar is repaired once, through the pipeline (#223)", () => {
     settings();
     const w = wired();
     // The ORIGINAL bar fails (as in the real run); the re-drafted one passes.
-    w.provider.policy = (ctx) => (ctx.rule.title === BAR_TITLE ? barUnsureOnStage(ctx) : undefined);
+    w.provider.policy = (ctx) => (ctx.rule.title === BAR_TITLE ? barUnsureOnGroup(ctx) : undefined);
     w.provider.redraftPolicy = redraftOfBar;
     const planner = plannerStub();
     const svc = service({ checker: w.checker, planner });
@@ -492,7 +492,7 @@ describe("a failed bar is repaired once, through the pipeline (#223)", () => {
     const rec = runs()[0];
     assert.equal(rec.protectedFailures?.[0].repair.status, "repaired");
     assert.equal(rec.protectedFailures?.[0].title, BAR_TITLE);
-    assert.deepEqual(rec.protectedFailures?.[0].failedAspects, ["stage_right"]);
+    assert.deepEqual(rec.protectedFailures?.[0].failedAspects, ["group_matches_codes"]);
     // 2 bar batches + 1 ordinary batch of 9 + 2 polarity + 1 re-draft + 2 checks of the replacement.
     assert.deepEqual(rec.checkerRequests, { total: 8, repair: 3 });
     assert.equal(w.provider.requests.length, 8);
@@ -505,7 +505,7 @@ describe("a failed bar is repaired once, through the pipeline (#223)", () => {
     settings();
     const w = wired();
     // The model's `unsure` on the bar's stage cannot be changed by a re-draft: it reads the new one the same way.
-    w.provider.policy = barUnsureOnStage;
+    w.provider.policy = barUnsureOnGroup;
     w.provider.redraftPolicy = redraftOfBar;
     const r = await trigger(pipeline(w.checker));
 
@@ -518,15 +518,15 @@ describe("a failed bar is repaired once, through the pipeline (#223)", () => {
     // Held record: the failed bar with both models' verdicts and the repair attempt.
     const f = runs()[0].protectedFailures?.[0];
     assert.equal(f?.repair.status, "failed_check", String(f?.repair.detail));
-    assert.deepEqual(f?.repair.replacementFailedAspects, ["stage_right"]);
-    assert.equal(f?.verdicts.judgement?.[2], "u", "the judgement model's unsure on stage_right");
+    assert.deepEqual(f?.repair.replacementFailedAspects, ["group_matches_codes"]);
+    assert.equal(f?.verdicts.judgement?.[5], "u", "the judgement model's unsure on group_matches_codes");
     // Complete report: the ordinary rules were checked.
     assert.ok(batchRequests(w.provider).some((q) => !seenRules(q).some((x) => x.appliesTo)));
     // The alert is critical and names the bar by title and the aspect that failed.
     const a = alerts().find((x) => x.rule === "rubric_draft_held");
     assert.equal(a.severity, "critical");
     assert.ok(a.message.includes(BAR_TITLE), "the rule title (data) is named");
-    assert.match(a.message, /stage_right/);
+    assert.match(a.message, /group_matches_codes/);
     assert.match(a.message, /Rule id crit_/);
     assert.deepEqual(r?.reasons[0].includes(BAR_TITLE), true, "the plain-words reason names the title too");
   });
@@ -542,7 +542,7 @@ describe("a failed bar is repaired once, through the pipeline (#223)", () => {
       await seedA();
       settings();
       const w = wired();
-      w.provider.policy = barUnsureOnStage;
+      w.provider.policy = barUnsureOnGroup;
       w.provider.redraftPolicy = policy;
       const r = await trigger(pipeline(w.checker));
       assert.equal(r?.outcome, "held", name);
@@ -564,7 +564,7 @@ describe("a failed bar is repaired once, through the pipeline (#223)", () => {
     const pristine = bigDraft(await seedSource({ id: SOURCE_A_ID, url: SOURCE_A_URL, text: A_TEXT }));
     await rubricStore.writePendingVersion({ ...pristine, createdAt: Timestamp.fromMillis(REVIEW_T0 + 86_400_000) }, [SOURCE_A_ID], { force: true, now: Timestamp.fromMillis(REVIEW_T0 + 86_400_000) });
     const bad = wired();
-    bad.provider.policy = barUnsureOnStage;
+    bad.provider.policy = barUnsureOnGroup;
     bad.provider.redraftPolicy = redraftOfBar;
     const held = await trigger(pipeline(bad.checker), KEY_A, 2);
 
@@ -581,7 +581,7 @@ describe("a failed bar is repaired once, through the pipeline (#223)", () => {
     await seedA();
     settings();
     const w = wired();
-    w.provider.policy = barUnsureOnStage;
+    w.provider.policy = barUnsureOnGroup;
     w.provider.redraftPolicy = redraftOfBar;
     await trigger(pipeline(w.checker));
     assert.equal(await rubricStore.getApprovedRubric(ROUTE_A.countryCode, ROUTE_A.visaTypeId), null);
@@ -591,7 +591,7 @@ describe("a failed bar is repaired once, through the pipeline (#223)", () => {
     await seedA();
     settings();
     const w = wired();
-    w.provider.policy = barUnsureOnStage;
+    w.provider.policy = barUnsureOnGroup;
     w.provider.redraftPolicy = redraftOfBar;
     const svc = pipeline(w.checker);
     await trigger(svc);
@@ -611,7 +611,7 @@ describe("a failed bar is repaired once, through the pipeline (#223)", () => {
     await seedA();
     settings();
     const w = wired();
-    w.provider.policy = (ctx) => (ctx.rule.title === BAR_TITLE ? barUnsureOnStage(ctx) : undefined);
+    w.provider.policy = (ctx) => (ctx.rule.title === BAR_TITLE ? barUnsureOnGroup(ctx) : undefined);
     w.provider.redraftPolicy = redraftOfBar;
     const svc = pipeline(w.checker);
     w.provider.script = (_n, req) => (isRepairRequest(req) ? "hard" : undefined);

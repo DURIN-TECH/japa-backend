@@ -76,10 +76,10 @@ interface Rig {
 }
 
 /** A check over `ordinary` rules and `bars` bar lines. */
-function rig(opts: { ordinary?: number; bars?: number; settings?: Parameters<typeof settingsWith>[0]; ledger?: MemoryLedger; provider?: ScriptedProvider } = {}): Rig {
+function rig(opts: { ordinary?: number; bars?: number; page?: ReturnType<typeof pageOf>; settings?: Parameters<typeof settingsWith>[0]; ledger?: MemoryLedger; provider?: ScriptedProvider } = {}): Rig {
   const provider = opts.provider ?? new ScriptedProvider();
   const ledger = opts.ledger ?? new MemoryLedger();
-  const p = page(opts.ordinary ?? 12, opts.bars ?? 1);
+  const p = opts.page ?? page(opts.ordinary ?? 12, opts.bars ?? 1);
   const svc = new RubricCheckerService({
     provider: () => provider,
     readSnapshot: async () => p,
@@ -102,8 +102,8 @@ const withoutSpend = (o: any) => {
 const repairRequests = (p: ScriptedProvider) => p.requests.filter(isRepairRequest);
 const batchRequests = (p: ScriptedProvider) => p.requests.filter((q) => (q.schema as any).properties.verdicts);
 
-/** The real failure of the first run, in miniature: ONE `unsure`, on `stage_right`, from the judgement-role model only. */
-const unsureStageFromJudgement = ({ role, rule }: { role: string; rule: any }) => (rule.appliesTo && role === "judgement" ? { stage_right: "unsure" as const } : undefined);
+/** The real failure of the first run, in miniature: ONE `unsure`, on `group_matches_codes` (#226: a bar's stage is no longer judged), from the judgement-role model only. */
+const unsureGroupFromJudgement = ({ role, rule }: { role: string; rule: any }) => (rule.appliesTo && role === "judgement" ? { group_matches_codes: "unsure" as const } : undefined);
 
 // ============================================
 // Repaired and confirmed
@@ -113,7 +113,7 @@ describe("a failed bar gets one repair (#223)", () => {
   test("re-drafted from its own passage, checked by BOTH models, confirmed: the run goes on with the replacement", async () => {
     const r = rig();
     // The original fails; the replacement (a different title) passes.
-    r.provider.policy = (ctx) => (ctx.rule.title === "Original bar 1" ? unsureStageFromJudgement(ctx) : undefined);
+    r.provider.policy = (ctx) => (ctx.rule.title === "Original bar 1" ? unsureGroupFromJudgement(ctx) : undefined);
     r.provider.redraftPolicy = () => goodRedraft();
     const rules = [...ordinaryRules(12), bar()];
     const out = await r.svc.check(input(rubricOf(rules, null)));
@@ -136,7 +136,7 @@ describe("a failed bar gets one repair (#223)", () => {
     // The record of the attempt.
     const f = out.protectedFailures?.[0];
     assert.equal(f?.repair.status, "repaired");
-    assert.deepEqual(f?.failedAspects, ["stage_right"]);
+    assert.deepEqual(f?.failedAspects, ["group_matches_codes"]);
     assert.equal(f?.title, "Original bar 1");
     assert.equal(f?.repair.ruleHash, ruleHashOf(rules[12]));
     assert.deepEqual(f?.repair.replacementFailedAspects, []);
@@ -153,11 +153,11 @@ describe("a failed bar gets one repair (#223)", () => {
 
   test("the re-draft is shown the failed rule, the aspect that failed and the source passage, and the SAME drafting prompt", async () => {
     const r = rig();
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     r.provider.redraftPolicy = () => goodRedraft();
     await r.svc.check(input(rubricOf([...ordinaryRules(3), bar()], null)));
     const [req] = repairRequests(r.provider);
-    assert.ok(req.user.includes("stage_right"), "the failed aspect");
+    assert.ok(req.user.includes("group_matches_codes"), "the failed aspect");
     assert.ok(req.user.includes("Original bar 1"), "the failed rule's own fields");
     assert.ok(req.user.includes(BAR_QUOTE), "the source passage");
     assert.equal(req.effort, "high");
@@ -168,7 +168,7 @@ describe("a failed bar gets one repair (#223)", () => {
 
   test("the replacement goes through the drafting validation: a rule whose group name is not in its quote is refused", async () => {
     const r = rig();
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     r.provider.redraftPolicy = () => goodRedraft(1, { appliesTo: { nationalities: ["QM"], asWritten: ["Atlantis"] } });
     const out = await r.svc.check(input(rubricOf([...ordinaryRules(3), bar()], null)));
     assert.equal(out.ok, false);
@@ -188,7 +188,7 @@ describe("a bar that is still not confirmed holds the draft (#223)", () => {
   test("the replacement fails the check again: held, with the aspect the replacement still fails; an 'unsure' a re-draft cannot change is still a failure", async () => {
     const r = rig();
     // EVERY reading of a bar by the judgement model is unsure on stage: the re-draft cannot change that.
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     r.provider.redraftPolicy = () => goodRedraft();
     const out = await r.svc.check(input(rubricOf([...ordinaryRules(12), bar()], null)));
     assert.equal(out.ok, false);
@@ -197,16 +197,16 @@ describe("a bar that is still not confirmed holds the draft (#223)", () => {
     assert.deepEqual(out.protectedRuleIds, ["crit-0101"]);
     const f = out.protectedFailures?.[0];
     assert.equal(f?.repair.status, "failed_check");
-    assert.deepEqual(f?.repair.replacementFailedAspects, ["stage_right"]);
-    assert.deepEqual(f?.repair.replacementVerdicts, { verification: "yyyyay", judgement: "yyuyay" });
+    assert.deepEqual(f?.repair.replacementFailedAspects, ["group_matches_codes"]);
+    assert.deepEqual(f?.repair.replacementVerdicts, { verification: "yyyyay", judgement: "yyyyau" });
     // The ORIGINAL's verdicts are on the record too.
-    assert.deepEqual(f?.verdicts, { verification: "yyyyay", judgement: "yyuyay" });
+    assert.deepEqual(f?.verdicts, { verification: "yyyyay", judgement: "yyyyau" });
     assert.equal([...r.ledger.docs.values()][0].status, "failed");
   });
 
   test("the ordinary rules are STILL checked when a bar failed, and the held report lists their leave-outs", async () => {
     const r = rig();
-    r.provider.policy = (ctx) => (ctx.rule.title === "Matter 4" ? { kind_right: "no" } : unsureStageFromJudgement(ctx));
+    r.provider.policy = (ctx) => (ctx.rule.title === "Matter 4" ? { kind_right: "no" } : unsureGroupFromJudgement(ctx));
     const out = await r.svc.check(input(rubricOf([...ordinaryRules(12), bar()], null)));
     assert.equal(out.ok, false);
     if (out.ok) return;
@@ -220,7 +220,7 @@ describe("a bar that is still not confirmed holds the draft (#223)", () => {
 
   test("the model says the passage cannot be repaired: held, one request spent", async () => {
     const r = rig();
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     // default redraftPolicy: an empty `criteria` list
     const out = await r.svc.check(input(rubricOf([...ordinaryRules(3), bar()], null)));
     assert.equal(out.ok, false);
@@ -232,7 +232,7 @@ describe("a bar that is still not confirmed holds the draft (#223)", () => {
 
   test("a re-draft whose quote is not in the official text is refused by code: held, nothing else spent", async () => {
     const r = rig();
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     r.provider.redraftPolicy = () => goodRedraft(1, { quote: "An application must be refused where the applicant is a national of Atlantis." });
     const out = await r.svc.check(input(rubricOf([...ordinaryRules(3), bar()], null)));
     assert.equal(out.ok, false);
@@ -245,22 +245,84 @@ describe("a bar that is still not confirmed holds the draft (#223)", () => {
   test("a re-draft that is no longer a bar, or quotes another line, is refused (a bar can never be repaired away)", async () => {
     // (1) The same passage drafted as an ordinary judgement rule: not a bar any more.
     const notBar = rig();
-    notBar.provider.policy = unsureStageFromJudgement;
+    notBar.provider.policy = unsureGroupFromJudgement;
     notBar.provider.redraftPolicy = () => goodRedraft(1, { kind: "judgement", appliesTo: null, probeFactors: ["a factor"] });
     const a = await notBar.svc.check(input(rubricOf([...ordinaryRules(3), bar()], null)));
     assert.equal(a.ok, false);
     if (a.ok) return;
     assert.equal(a.protectedFailures?.[0].repair.status, "invalid_redraft");
-    assert.equal(a.protectedFailures?.[0].repair.detail, "not_the_same_bar");
+    // (#226) The record says WHICH condition failed: the line was right, the rule is no longer a bar.
+    assert.equal(a.protectedFailures?.[0].repair.detail, "not_the_same_bar:not_a_bar:returned=1:accepted=1:same_line=1:bar=0");
 
     // (2) A valid bar, but of ANOTHER line of the page: it is not this rule again.
     const other = rig({ bars: 2 });
-    other.provider.policy = unsureStageFromJudgement;
+    other.provider.policy = unsureGroupFromJudgement;
     other.provider.redraftPolicy = () => goodRedraft(2);
     const b = await other.svc.check(input(rubricOf([...ordinaryRules(3), bar(1)], null)));
     assert.equal(b.ok, false);
     if (b.ok) return;
-    assert.equal(b.protectedFailures?.[0].repair.detail, "not_the_same_bar");
+    // (#226) ... and here the bar is intact but quotes another line.
+    assert.equal(b.protectedFailures?.[0].repair.detail, "not_the_same_bar:different_line:returned=1:accepted=1:same_line=0:bar=1");
+  });
+
+  test("(#226) a re-draft that drifts to a NEIGHBOURING line which restates the point is still refused, and the record says so", async () => {
+    // The first real run's shape: the model, asked about a bar's stage, drafts the line below that reads as a clearer fit.
+    const lines = [`B1.1 ${BAR_QUOTE}`, "B1.2 If a national of Borduria applies you should advise them that the application cannot be considered."];
+    const r = rig({ page: pageOf(12, lines) });
+    r.provider.policy = unsureGroupFromJudgement;
+    r.provider.redraftPolicy = () => goodRedraft(1, { quote: "If a national of Borduria applies you should advise them that the application cannot be considered.", appliesTo: { nationalities: ["QM"], asWritten: ["Borduria"] } });
+    const out = await r.svc.check(input(rubricOf([...ordinaryRules(12), bar()], null)));
+    assert.equal(out.ok, false);
+    if (out.ok) return;
+    assert.equal(out.protectedFailures?.[0].repair.status, "invalid_redraft");
+    assert.equal(out.protectedFailures?.[0].repair.detail, "not_the_same_bar:different_line:returned=1:accepted=1:same_line=0:bar=1");
+    // Nothing of the model's text is on the record.
+    assert.ok(!JSON.stringify(out.protectedFailures).includes("cannot be considered"));
+  });
+
+  test("(#226) a faithful re-draft that quotes ANOTHER SENTENCE of the same line (or the same one) is accepted: the test is the line, not the exact quote", async () => {
+    const second = "This is because a national of Borduria has no standing to apply.";
+    const lines = [`B1.1 ${BAR_QUOTE} ${second}`];
+    for (const quote of [BAR_QUOTE, second]) {
+      const r = rig({ page: pageOf(12, lines) });
+      r.provider.policy = (ctx) => (ctx.rule.title === "Original bar 1" ? unsureGroupFromJudgement(ctx) : undefined);
+      r.provider.redraftPolicy = () => goodRedraft(1, { quote, appliesTo: { nationalities: ["QM"], asWritten: ["Borduria"] } });
+      const out = await r.svc.check(input(rubricOf([...ordinaryRules(12), bar()], null)));
+      assert.equal(out.ok, true, quote);
+      if (!out.ok) return;
+      assert.equal(out.repairs?.[0].criterionId, "crit-0101");
+      assert.ok(isBar(out.repairs?.[0].replacement as AssessmentCriterion));
+    }
+  });
+
+  test("(#226) a re-draft can never let a DIFFERENT rule replace a bar: another id is ignored, the id and the original quoted line decide", async () => {
+    // The model returns a rule for the right line but the replacement always takes the ORIGINAL's id, so no other rule is displaced.
+    const r = rig();
+    r.provider.policy = (ctx) => (ctx.rule.title === "Original bar 1" ? unsureGroupFromJudgement(ctx) : undefined);
+    r.provider.redraftPolicy = () => goodRedraft(1);
+    const rules = [...ordinaryRules(12), bar()];
+    const out = await r.svc.check(input(rubricOf(rules, null)));
+    assert.equal(out.ok, true);
+    if (!out.ok) return;
+    assert.equal(out.repairs?.length, 1);
+    assert.equal(out.repairs?.[0].criterionId, "crit-0101");
+    assert.equal(out.repairs?.[0].replacement.criterionId, "crit-0101");
+    // And the read side refuses a replacement that is not a bar, or that carries another id.
+    const notBar = { ...(out.repairs?.[0].replacement as AssessmentCriterion), kind: "judgement" as const, appliesTo: undefined };
+    const swapped = applyRuleRepairs({ criteria: rules, ruleRepairs: [{ ...(out.repairs?.[0] as RubricRuleRepair), replacement: notBar }] });
+    assert.equal(swapped.criteria[12].title, "Original bar 1");
+    const otherId = applyRuleRepairs({ criteria: rules, ruleRepairs: [{ ...(out.repairs?.[0] as RubricRuleRepair), replacement: { ...(out.repairs?.[0].replacement as AssessmentCriterion), criterionId: "crit-0001" } }] });
+    assert.equal(otherId.criteria[12].title, "Original bar 1");
+    assert.equal(otherId.criteria[0].title, rules[0].title);
+  });
+
+  test("(#226) the re-draft instructions say: same line, keep the kind; the version is bumped", () => {
+    assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v2");
+    const chunk = { sourceId: SRC_ID, contentHash: SRC_HASH, docType: "html", chunkIndex: 0, chunkCount: 1, text: BAR_QUOTE } as any;
+    const req = buildRepairRequest(chunk, { rule: { title: "T", kind: "mandatory_bar", stage: "validity", quote: BAR_QUOTE }, aspects: ["group_matches_codes"] }, ["high"], { maxOutputTokens: 1000, timeoutMs: 1000 });
+    assert.match(req.user, /taken from the same line of the excerpt/);
+    assert.match(req.user, /discarded by code/);
+    assert.match(req.user, /Keep the rule's kind/);
   });
 
   test("a bar whose quote cannot be found is held before any spend, and no repair is tried", async () => {
@@ -279,7 +341,7 @@ describe("a bar that is still not confirmed holds the draft (#223)", () => {
 describe("repair is bounded (#223)", () => {
   test("more failed bars than the cap: NO repair is attempted, every bar is named, the draft is held whole", async () => {
     const r = rig({ bars: 6 });
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     r.provider.redraftPolicy = () => goodRedraft();
     const bars = [1, 2, 3, 4, 5, 6].map((n) => bar(n));
     const out = await r.svc.check(input(rubricOf([...ordinaryRules(3), ...bars], null)));
@@ -294,7 +356,7 @@ describe("repair is bounded (#223)", () => {
   test("exactly the cap is repaired; the setting can lower it, and 0 turns repair off", async () => {
     // 5 bars, default cap 5: all five re-drafted (5 requests).
     const five = rig({ bars: 5 });
-    five.provider.policy = (ctx) => (ctx.rule.title.startsWith("Original") ? unsureStageFromJudgement(ctx) : undefined);
+    five.provider.policy = (ctx) => (ctx.rule.title.startsWith("Original") ? unsureGroupFromJudgement(ctx) : undefined);
     five.provider.redraftPolicy = ({ shown }: any) => goodRedraft(Number(shown.title.slice("Original bar ".length)));
     const fiveBars = [1, 2, 3, 4, 5].map((n) => bar(n));
     const ok = await five.svc.check(input(rubricOf([...ordinaryRules(3), ...fiveBars], null)));
@@ -304,7 +366,7 @@ describe("repair is bounded (#223)", () => {
 
     for (const [cap, detail] of [[1, "cap_exceeded"], [0, "repair_disabled"]] as const) {
       const r = rig({ bars: 2, settings: { repairMaxRulesPerRun: cap } });
-      r.provider.policy = unsureStageFromJudgement;
+      r.provider.policy = unsureGroupFromJudgement;
       const out = await r.svc.check(input(rubricOf([...ordinaryRules(3), bar(1), bar(2)], null)));
       assert.equal(out.ok, false);
       if (out.ok) return;
@@ -316,7 +378,7 @@ describe("repair is bounded (#223)", () => {
   test("the request cap covers repair requests: a run that cannot afford the re-draft holds checker_capped, names the bar, stores nothing as an attempt", async () => {
     // 2 bar batches + 1 ordinary batch = 3 requests; a cap of 3 leaves nothing for the re-draft.
     const r = rig({ settings: { checkerMaxRequestsPerRun: 3 } });
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     r.provider.redraftPolicy = () => goodRedraft();
     const out = await r.svc.check(input(rubricOf([...ordinaryRules(3), bar()], null)));
     assert.equal(out.ok, false);
@@ -332,7 +394,7 @@ describe("repair is bounded (#223)", () => {
   test("the request cap also stops the CHECK of a replacement: capped, never over", async () => {
     // 3 + 1 re-draft = 4 requests fit; the two checks of the replacement would be the 5th and 6th.
     const r = rig({ settings: { checkerMaxRequestsPerRun: 4 } });
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     r.provider.redraftPolicy = () => goodRedraft();
     const out = await r.svc.check(input(rubricOf([...ordinaryRules(3), bar()], null)));
     assert.equal(out.ok, false);
@@ -346,12 +408,12 @@ describe("repair is bounded (#223)", () => {
     const rules = [...ordinaryRules(3), bar()];
     // Measure what the checks alone send (repair off), then allow just a little more: not enough for a re-draft.
     const probe = rig({ settings: { repairMaxRulesPerRun: 0 } });
-    probe.provider.policy = unsureStageFromJudgement;
+    probe.provider.policy = unsureGroupFromJudgement;
     await probe.svc.check(input(rubricOf(rules, null)));
     const checksOnly = [...probe.ledger.docs.values()][0].usage.inputChars;
 
     const r = rig({ settings: { checkerMaxInputCharsPerRun: checksOnly + 1_000 } });
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     r.provider.redraftPolicy = () => goodRedraft();
     const out = await r.svc.check(input(rubricOf(rules, null)));
     assert.equal(out.ok, false);
@@ -369,7 +431,7 @@ describe("repair is bounded (#223)", () => {
 describe("one attempt per rule, however often the run repeats (#223)", () => {
   test("a re-run of the same version (a re-delivered trigger, an admin re-run) makes ZERO requests and gives the same outcome", async () => {
     const r = rig();
-    r.provider.policy = (ctx) => (ctx.rule.title === "Original bar 1" ? unsureStageFromJudgement(ctx) : undefined);
+    r.provider.policy = (ctx) => (ctx.rule.title === "Original bar 1" ? unsureGroupFromJudgement(ctx) : undefined);
     r.provider.redraftPolicy = () => goodRedraft();
     const rubric = rubricOf([...ordinaryRules(12), bar()], null);
     const first = await r.svc.check(input(rubric));
@@ -382,7 +444,7 @@ describe("one attempt per rule, however often the run repeats (#223)", () => {
 
   test("a held repair is never re-drafted on a re-run either (the answer is stored, the check is replayed)", async () => {
     const r = rig();
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     r.provider.redraftPolicy = () => goodRedraft();
     const rubric = rubricOf([...ordinaryRules(3), bar()], null);
     const first = await r.svc.check(input(rubric));
@@ -395,7 +457,7 @@ describe("one attempt per rule, however often the run repeats (#223)", () => {
   test("an invalid or 'cannot be repaired' attempt is stored: a later run does not ask again", async () => {
     for (const policy of [() => ({ criteria: [], suspiciousPassages: [] }), () => goodRedraft(1, { quote: "Nothing like the stored text at all, sorry." })]) {
       const r = rig();
-      r.provider.policy = unsureStageFromJudgement;
+      r.provider.policy = unsureGroupFromJudgement;
       r.provider.redraftPolicy = policy;
       const rubric = rubricOf([...ordinaryRules(3), bar()], null);
       await r.svc.check(input(rubric));
@@ -407,7 +469,7 @@ describe("one attempt per rule, however often the run repeats (#223)", () => {
   test("a provider failure during the re-draft is NOT an attempt: the retry (the sweep) re-drafts, once, and the run after that spends nothing", async () => {
     const provider = new ScriptedProvider();
     const ledger = new MemoryLedger();
-    provider.policy = (ctx) => (ctx.rule.title === "Original bar 1" ? unsureStageFromJudgement(ctx) : undefined);
+    provider.policy = (ctx) => (ctx.rule.title === "Original bar 1" ? unsureGroupFromJudgement(ctx) : undefined);
     provider.redraftPolicy = () => goodRedraft();
     const rubric = rubricOf([...ordinaryRules(3), bar()], null);
 
@@ -439,7 +501,7 @@ describe("one attempt per rule, however often the run repeats (#223)", () => {
 
   test("a rule that changed (another hash) is a different attempt", async () => {
     const r = rig();
-    r.provider.policy = unsureStageFromJudgement;
+    r.provider.policy = unsureGroupFromJudgement;
     await r.svc.check(input(rubricOf([...ordinaryRules(3), bar()], null)));
     await r.svc.check(input(rubricOf([...ordinaryRules(3), bar(1, { title: "Original bar 1, reworded" })], null)));
     assert.equal(repairRequests(r.provider).length, 2);
