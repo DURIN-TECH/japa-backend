@@ -280,6 +280,15 @@ service cloud.firestore {
         allow write: if false;
       }
 
+      // Answers subcollection (issue #187): the applicant's typed answers to
+      // "information" checklist items. Personal data, so NO client access at
+      // all: read and written only through GET / PUT
+      // /applications/:id/answers[/:itemId], which run the application
+      // access check. Admin SDK bypasses these rules.
+      match /answers/{itemId} {
+        allow read, write: if false;
+      }
+
       // Notes subcollection
       match /notes/{noteId} {
         // Application access holders can read notes

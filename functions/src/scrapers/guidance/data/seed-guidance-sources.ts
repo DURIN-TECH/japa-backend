@@ -317,6 +317,14 @@ export function validateGuidanceSourceSeed(seed: GuidanceSourceSeed): string[] {
       problems.push("a source with a retrievalError cannot be verified: seed it as partial or unverified");
     }
   }
+  // "registered" (issue #215) claims the same thing as verified about
+  // retrieval (the whole text was fetched), so it carries the same two rules.
+  if (s.verificationStatus === "registered") {
+    if (s.retrievedAt === undefined) problems.push("a registered source needs retrievedAt (when the preview fetch retrieved it)");
+    if (s.retrievalError !== undefined) {
+      problems.push("a source with a retrievalError cannot be registered: it was not retrieved in full");
+    }
+  }
   if (s.verificationStatus === "partial" && s.retrievedAt === undefined) {
     problems.push("a partial source needs retrievedAt (when the part that was retrieved was retrieved)");
   }
@@ -343,6 +351,11 @@ export function validateGuidanceSourceSeeds(seeds: readonly GuidanceSourceSeed[]
     urls.add(seed.url);
   });
   return problems;
+}
+
+/** True for a stored guidance source an admin added through the portal API (issue #215). */
+export function isPortalAdded(existing: Record<string, unknown> | undefined): boolean {
+  return existing?.addedVia === "portal";
 }
 
 /**
@@ -383,7 +396,9 @@ export function buildSeededGuidanceSource(
       : null,
     checkIntervalHours: seed.checkIntervalHours,
     // null (not undefined) so a role removed from the seed is cleared.
-    role: seed.role ?? null,
+    // Issue #215: an admin's role edit (PATCH /admin/guidance-sources/:id sets
+    // `roleEditedBy`) belongs to Firestore: the seed keeps the stored role.
+    role: existing?.roleEditedBy ? ((existing.role as string | null | undefined) ?? null) : (seed.role ?? null),
     verificationStatus: seed.verificationStatus,
     verificationNote: seed.verificationNote.trim(),
     retrievedAt: seed.retrievedAt ? Timestamp.fromMillis(Date.parse(seed.retrievedAt)) : null,
@@ -441,7 +456,11 @@ export function buildSeededGuidanceSource(
  * @param seeds the entries to write (default: GUIDANCE_SOURCE_SEEDS)
  * @returns the number of sources seeded
  */
-export async function seedGuidanceSources(seeds: readonly GuidanceSourceSeed[] = GUIDANCE_SOURCE_SEEDS): Promise<number> {
+export async function seedGuidanceSources(
+  seeds: readonly GuidanceSourceSeed[] = GUIDANCE_SOURCE_SEEDS,
+  // Issue #215: the Firestore handle (tests pass an in-memory one).
+  database?: FirebaseFirestore.Firestore
+): Promise<number> {
   const problems = validateGuidanceSourceSeeds(seeds);
   if (problems.length > 0) {
     throw new Error(`Invalid guidance source seed(s), nothing written:\n- ${problems.join("\n- ")}`);
@@ -452,7 +471,7 @@ export async function seedGuidanceSources(seeds: readonly GuidanceSourceSeed[] =
   }
 
   // Resolved here (not at module load): see the note at the top of the file.
-  const db = getFirestore();
+  const db = database ?? getFirestore();
   const collection = db.collection("guidanceSources");
   const now = Timestamp.now();
 
@@ -461,11 +480,22 @@ export async function seedGuidanceSources(seeds: readonly GuidanceSourceSeed[] =
   const snaps = await db.getAll(...refs);
 
   const batch = db.batch();
+  let written = 0;
   seeds.forEach((seed, i) => {
     const existing = snaps[i]?.exists ? (snaps[i].data() as Record<string, unknown>) : undefined;
+    // Issue #215: a source an admin registered from the portal belongs to
+    // Firestore, not to this list. If a seed entry ever reuses its id, the
+    // stored doc wins: it is never overwritten (the merge would replace the
+    // admin's url, title, role and verification note). Said loudly, since a
+    // seed entry that cannot land is a mistake somebody should resolve.
+    if (isPortalAdded(existing)) {
+      console.warn(`[seed-guidance-sources] ${seed.id} was added from the portal: the seed entry was NOT applied`);
+      return;
+    }
     batch.set(refs[i], buildSeededGuidanceSource(seed, existing, now), { merge: true });
+    written++;
   });
   await batch.commit();
-  console.log(`Seeded ${seeds.length} guidance source(s)`);
-  return seeds.length;
+  console.log(`Seeded ${written} guidance source(s)`);
+  return written;
 }

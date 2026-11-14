@@ -587,7 +587,9 @@ describe("guidance snapshots are backend-only", () => {
     assert.ok(!/match\s+\/\{[A-Za-z_]+=\*\*\}/.test(text));
   });
 
-  test("the guidance router has exactly one route: the list", () => {
+  // Issue #215 added PATCH /:id (status / role). There is still no DELETE and no
+  // route that serves a snapshot.
+  test("the guidance router has exactly these routes: list, crawl, edit (no delete)", () => {
     const routes = (adminGuidanceSourceRoutes as any).stack.filter((l: any) => l.route).map((l: any) => ({
       path: l.route.path,
       methods: Object.keys(l.route.methods),
@@ -595,6 +597,7 @@ describe("guidance snapshots are backend-only", () => {
     assert.deepEqual(routes, [
       { path: "/", methods: ["get"] },
       { path: "/:id/crawl", methods: ["post"] },
+      { path: "/:id", methods: ["patch"] },
     ]);
   });
 

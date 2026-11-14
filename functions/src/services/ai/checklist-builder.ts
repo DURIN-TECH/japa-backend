@@ -29,6 +29,14 @@
  */
 import type { EvidenceItem, IntakeCondition, VisaRubric } from "../../types/rubric";
 import type { DocumentRequestCitation } from "../../types";
+import {
+  findMetaForItem,
+  metaFromQuoteOnly,
+  normaliseStoredMeta,
+  type DocumentKind,
+  type DocumentNeed,
+  type RequiredDocumentMeta,
+} from "../../scrapers";
 import { applicableCriterionIds } from "./rule-applicability";
 
 // ============================================
@@ -44,6 +52,16 @@ export interface ChecklistItem {
   /** True only when the source says so. Rubric evidence is optional unless the
    *  rubric item carries `required: true`; the visa record's list is required. */
   required: boolean;
+  /** Issue #187: "document" (uploaded) or "information" (typed in). Default document. */
+  kind: DocumentKind;
+  /** Issue #187: could not classify from the page's wording; stays "document". */
+  kindReview?: true;
+  /** Issue #187: verbatim page text behind `kind` (or the lead-in). */
+  kindQuote?: string;
+  /** Issue #187: required | conditional | optional. `required` above is true ONLY for "required". */
+  need: DocumentNeed;
+  /** Issue #187: verbatim "if ..." / "unless ..." / "depending on ..." clause or lead-in. */
+  appliesWhen?: string;
   /** Always present: deterministic template, or an accepted model wording. */
   reason: string;
   /** Rubric criterion id (first one the item evidences), or undefined. */
@@ -69,7 +87,12 @@ export interface ChecklistResult {
 /** The slice of the visa record the builder reads (#129 fields, all optional). */
 export interface VisaRecordDocuments {
   requiredDocuments?: string[];
-  scrapeMeta?: { sourceUrl?: string; citations?: Record<string, string> };
+  scrapeMeta?: {
+    sourceUrl?: string;
+    citations?: Record<string, string>;
+    /** Issue #187: kind + need per item, index-aligned with requiredDocuments. */
+    requiredDocumentMeta?: RequiredDocumentMeta[];
+  };
 }
 
 export interface BuildChecklistInput {
@@ -223,6 +246,10 @@ export function buildChecklist(input: BuildChecklistInput): ChecklistResult {
           // `required` is not part of #40's EvidenceItem: read it if a rubric
           // carries it, otherwise the source has not said the document is required.
           required: (ev as EvidenceItem & { required?: boolean }).required === true,
+          // Rubric evidence is always a document; not-required means optional
+          // (what the old boolean said). Issue #187.
+          kind: "document",
+          need: (ev as EvidenceItem & { required?: boolean }).required === true ? "required" : "optional",
           reason,
           criterionRef: ev.criterionIds[0],
           citation: { quote: ev.source.quote, url: ev.source.url, ...(ruleRef ? { ruleRef } : {}) },
@@ -251,11 +278,21 @@ export function buildChecklist(input: BuildChecklistInput): ChecklistResult {
     if (seenIds.has(id)) return;
     seenIds.add(id);
     seenTitles.add(normaliseTitle(name));
+    // Issue #187: the stored classification for this index (quote-only
+    // fallback for a visa crawled before it). `required` is true ONLY for need "required".
+    // By the item's own text, never by position alone (review fix on #187).
+    const stored = findMetaForItem(visaRecord?.scrapeMeta?.requiredDocumentMeta, i, name, docs.length);
+    const meta = stored ? normaliseStoredMeta(stored, quote, name) : metaFromQuoteOnly(quote, name);
     items.push({
       checklistItemId: id,
       title: name.trim(),
       holder: "applicant",
-      required: true,
+      required: meta.need === "required",
+      kind: meta.kind,
+      ...(meta.kindReview ? { kindReview: true as const } : {}),
+      ...(meta.kindQuote ? { kindQuote: meta.kindQuote } : {}),
+      need: meta.need,
+      ...(meta.appliesWhen ? { appliesWhen: meta.appliesWhen } : {}),
       reason: "Listed as a document you must provide on the official visa page.",
       citation: { quote, url },
     });

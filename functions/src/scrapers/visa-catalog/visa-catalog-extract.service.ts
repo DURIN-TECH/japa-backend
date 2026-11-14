@@ -1,3 +1,8 @@
+import {
+  classifyNeed,
+  extractConditionalClause,
+  type RequiredDocumentMeta,
+} from "./required-document-meta";
 import type {
   ExtractedFeeComponent,
   ExtractedVisa,
@@ -78,10 +83,23 @@ const VISA_CATEGORIES: VisaCategory[] = [
  *    (the page's own "documents you must provide" list, in page order), each
  *    item backed by a verbatim quote in citations["requiredDocuments.<index>"].
  *    The validator drops any item without a matching quote on the page.
+ *  - "2026-11-item-kinds-v7" (#187): each `requiredDocuments` item is also
+ *    classified, from the page's own wording, as `kind` "document" (uploaded)
+ *    or "information" (typed in) with a verbatim `kindQuote`, and `need`
+ *    "required" | "conditional" | "optional" with a verbatim `appliesWhen` for
+ *    conditional items ("if ...", "unless ...", "depending on ...", or the
+ *    "Depending on your circumstances, you might also need to provide:"
+ *    lead-in). "may" never counts. The validator drops a kind whose quote is not
+ *    on the page (-> document + kindReview) and decides `need` in code.
+ *  - "2026-11-item-kinds-v8" (#187): the v7 prompt change shifted the model to
+ *    a LONGER surcharge option on the same page (UK Family returned the 5-year
+ *    IHS 5175 instead of the 2y9m 3105). The surcharge rule now says to take the
+ *    amount the page gives for THIS visa's own stay length, never a longer
+ *    option listed beside it (same intent as v4's surcharge-total rule).
  * Before merging a bump (or a model change), run `npm run eval:visa-extract`
  * and attach the result — see functions/src/scrapers/visa-catalog/eval/README.md.
  */
-export const EXTRACTOR_PROMPT_VERSION = "2026-11-required-documents-v6";
+export const EXTRACTOR_PROMPT_VERSION = "2026-11-item-kinds-v8";
 
 // A duration phrase: a number (digits or a word) followed by year(s)/month(s),
 // e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
@@ -182,9 +200,15 @@ function validateRequiredDocuments(
   raw: unknown,
   citations: Record<string, string>,
   pageText: string | undefined,
-  errors: string[]
-): { items: string[]; quotes: Record<string, string>; dropped: string[] } {
-  const none = { items: [] as string[], quotes: {} as Record<string, string>, dropped: [] as string[] };
+  errors: string[],
+  rawMeta?: unknown
+): { items: string[]; quotes: Record<string, string>; dropped: string[]; meta: RequiredDocumentMeta[] } {
+  const none = {
+    items: [] as string[],
+    quotes: {} as Record<string, string>,
+    dropped: [] as string[],
+    meta: [] as RequiredDocumentMeta[],
+  };
   if (raw === undefined || raw === null) return none;
   if (!Array.isArray(raw) || raw.some((x) => typeof x !== "string" || x.trim().length === 0)) {
     errors.push("\"requiredDocuments\" must be an array of non-empty strings (empty when the page lists none)");
@@ -194,7 +218,10 @@ function validateRequiredDocuments(
   const items: string[] = [];
   const quotes: Record<string, string> = {};
   const dropped: string[] = [];
+  const meta: RequiredDocumentMeta[] = [];
   const seen = new Set<string>();
+  // The model's per-item classification, index-aligned with ITS array (issue #187).
+  const metaList: unknown[] = Array.isArray(rawMeta) ? rawMeta : [];
   (raw as string[]).forEach((rawItem, i) => {
     const item = rawItem.trim();
     const quote = citations[requiredDocumentCitationKey(i)];
@@ -209,9 +236,137 @@ function validateRequiredDocuments(
     if (seen.has(key)) return; // repeat of a kept document: collapse silently
     seen.add(key);
     quotes[requiredDocumentCitationKey(items.length)] = (quote as string).trim();
+    meta.push(validateItemMeta(metaList[i], item, (quote as string).trim(), page));
     items.push(item);
   });
-  return { items, quotes, dropped };
+  return { items, quotes, dropped, meta };
+}
+
+/**
+ * Resolve the kind quote to STORE, or null when it cannot be verified on the
+ * page (issue #187). `page` is the already-normalised page text (undefined =
+ * the page is not available, only non-emptiness is checked).
+ *
+ * Valid when EITHER the whole quote is on the page (normalised as the citation
+ * check does; stored as returned), OR it is "lead-in: item" where, at the FIRST
+ * ": ":
+ *  - the lead-in part is on the page and is a real lead-in line (the page
+ *    continues with ":" right after it);
+ *  - the item part is on the page AND contains the text of the item being
+ *    classified (so it is not another item's line);
+ *  - the item part occurs after that lead-in with NO other lead-in (a ":")
+ *    between them, i.e. the item really sits under this lead-in.
+ * For the two-part form the VERBATIM LEAD-IN is stored (the item's own text is
+ * already stored beside it), never the joined string, which is not on the page.
+ * Characters only: no fuzzy word matching.
+ */
+export function resolveKindQuote(quote: string, page: string | undefined, itemText: string): string | null {
+  if (quote.length === 0) return null;
+  if (page === undefined) return quote;
+  const nq = normForQuote(quote);
+  const at = quote.indexOf(": ");
+  const own = normForQuote(itemText);
+  if (page.includes(nq)) {
+    // A contiguous "lead-in: text" must be about THIS item: its tail has to
+    // contain the item's own text (it may not be another item's line).
+    if (at >= 0) return normForQuote(quote.slice(at + 2)).includes(own) ? quote : null;
+    if (nq.includes(own)) return quote;
+    // A quote that is ONLY a lead-in line may back this item's kind only when
+    // the item is really listed under it (after it, before the next lead-in).
+    const lead = nq.replace(/\s*:$/, "");
+    if (isLeadInLine(page, lead)) return itemListedUnder(page, lead, own) ? quote : null;
+    return quote; // other page prose: verbatim, as before
+  }
+  if (at < 0) return null;
+  const leadRaw = quote.slice(0, at).trim();
+  const lead = normForQuote(leadRaw);
+  const itemPart = normForQuote(quote.slice(at + 2));
+  if (!lead || !itemPart || !own || !itemPart.includes(own)) return null;
+  return itemListedUnder(page, lead, itemPart) ? leadRaw : null;
+}
+
+/** True when `lead` occurs on the (normalised) page as a lead-in line: the page goes on with ":". */
+function isLeadInLine(page: string, lead: string): boolean {
+  if (!lead) return false;
+  for (let from = page.indexOf(lead); from >= 0; from = page.indexOf(lead, from + 1)) {
+    if (/^\s*:/.test(page.slice(from + lead.length))) return true;
+  }
+  return false;
+}
+
+/**
+ * Is `text` listed under the lead-in `lead` on the page? Tries every place the
+ * lead-in occurs (the same words can open two lists): the page must continue
+ * with its ":" and `text` must follow with NO other lead-in (a ":") between.
+ */
+function itemListedUnder(page: string, lead: string, text: string): boolean {
+  for (let from = page.indexOf(lead); from >= 0; from = page.indexOf(lead, from + 1)) {
+    const afterLead = page.slice(from + lead.length);
+    if (!/^\s*:/.test(afterLead)) continue;
+    const body = afterLead.replace(/^\s*:/, "");
+    const itemAt = body.indexOf(text);
+    if (itemAt >= 0 && !body.slice(0, itemAt).includes(":")) return true;
+  }
+  return false;
+}
+
+/**
+ * Validate ONE item's classification (issue #187). Never throws and never
+ * drops the item: a classification that cannot be verified degrades to the
+ * safe default instead.
+ *  - `kind` "information" is kept only with a `kindQuote` that resolves on the
+ *    page (resolveKindQuote). A "document" kind needs one too; with no
+ *    verifiable quote the item is "document" + `kindReview: true` ("could not
+ *    classify"), the model's claim is discarded.
+ *  - `need` is decided by code from the item's own text within its quote and
+ *    the lead-in quote (classifyNeed). The model's `appliesWhen` is used only
+ *    when it is a verbatim slice of the page, carries an "if / unless /
+ *    depending on" cue and sits inside the item's quote or the kind quote (so
+ *    it is the item's own clause); otherwise the clause is cut from the quote by
+ *    code. The model's `need` is ignored: a quote with "if" is conditional
+ *    whatever the model said.
+ *  - the item's text is stored on the entry (`item`) so readers match meta to
+ *    items by text, never by position alone.
+ */
+function validateItemMeta(
+  rawItemMeta: unknown,
+  itemText: string,
+  itemQuote: string,
+  page: string | undefined
+): RequiredDocumentMeta {
+  const m = rawItemMeta && typeof rawItemMeta === "object" ? (rawItemMeta as Record<string, unknown>) : {};
+  // Plain verbatim check, used for the model's appliesWhen clause.
+  const onPage = (q: string) => q.length > 0 && (page === undefined || page.includes(normForQuote(q)));
+
+  // ---- kind + its quote ----
+  const claimedKind = m.kind === "information" ? "information" : "document";
+  const rawKindQuote = typeof m.kindQuote === "string" ? m.kindQuote.trim() : "";
+  const kindQuote =
+    m.kind === "document" || m.kind === "information" ? resolveKindQuote(rawKindQuote, page, itemText) : null;
+  const out: RequiredDocumentMeta =
+    kindQuote !== null
+      ? { item: itemText, kind: claimedKind, kindQuote, need: "required" }
+      : { item: itemText, kind: "document", kindReview: true, need: "required" };
+
+  // ---- need (+ appliesWhen) ----
+  const decided = classifyNeed(itemQuote, out.kindQuote, itemText);
+  out.need = decided.need;
+  if (decided.need === "conditional" && decided.appliesWhen) {
+    let when = decided.appliesWhen;
+    const claimed = typeof m.appliesWhen === "string" ? m.appliesWhen.trim() : "";
+    const hay = normForQuote(`${itemQuote} ${out.kindQuote ?? ""}`);
+    if (
+      claimed &&
+      extractConditionalClause(claimed) !== null &&
+      !claimed.includes(":") &&
+      onPage(claimed) &&
+      hay.includes(normForQuote(claimed))
+    ) {
+      when = claimed;
+    }
+    out.appliesWhen = when;
+  }
+  return out;
 }
 
 /** Citation key prefix that supports `maxExtensions`. */
@@ -377,7 +532,13 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
   );
 
   // ---- Required documents (issue #129): cited verbatim or dropped ----
-  const docs = validateRequiredDocuments(o.requiredDocuments, citations, options.pageText, errors);
+  const docs = validateRequiredDocuments(
+    o.requiredDocuments,
+    citations,
+    options.pageText,
+    errors,
+    o.requiredDocumentMeta
+  );
   // Re-key the document citations to the KEPT items' indices: strip the
   // model's (raw-index) keys, then add the remapped ones, so a dropped or
   // collapsed item never leaves a quote pointing at the wrong document.
@@ -471,6 +632,8 @@ export function validateExtractedVisa(raw: unknown, options: ValidateOptions = {
     ...(maxExtensions !== undefined ? { maxExtensions } : {}),
     eligibilityCriteria: eligibility,
     requiredDocuments: docs.items,
+    // Issue #187: kind + need per kept item, index-aligned (omitted when none).
+    ...(docs.meta.length > 0 ? { requiredDocumentMeta: docs.meta } : {}),
     // Audit trail, only when something was dropped (issue #129).
     ...(docs.dropped.length > 0 ? { requiredDocumentsDropped: docs.dropped } : {}),
     applicationUrl,
@@ -642,7 +805,8 @@ export function buildSystemPrompt(): string {
     "  feeComponents (array, see FEES below), validityPeriod (string, e.g. '3 years'),",
     "  isExtendable (boolean), maxExtensions (number, optional),",
     "  eligibilityCriteria (array of short strings),",
-    "  requiredDocuments (array of strings, see DOCUMENTS below), applicationUrl (string, optional),",
+    "  requiredDocuments (array of strings, see DOCUMENTS below), requiredDocumentMeta (array of objects, one per",
+    "  requiredDocuments item in the same order, see DOCUMENTS below), applicationUrl (string, optional),",
     "  applicationInstructions (string, optional),",
     "  confidence (number 0-1: how confident you are this is accurate FROM THE PAGE),",
     "  citations (object mapping field name -> a short verbatim quote from the page that supports it).",
@@ -697,6 +861,11 @@ export function buildSystemPrompt(): string {
     "- When several such totals are listed by stay length, pick the one for the visa length chosen above",
     "  (the main adult applicant's standard stay when applying from outside the country). No 'fee.years'",
     "  citation is needed for a per: 'application' surcharge; cite the amount line in 'fee.surcharge'.",
+    "- The surcharge amount must be the one the page gives for THIS visa's own length of stay (the same",
+    "  length as the application fee and validityPeriod you report), never a larger amount for a longer stay",
+    "  that the page lists on the same line or list. If the page lists '£3,105 if you're staying for 2 years",
+    "  and 9 months' and '£5,175 if you're staying for 5 years' and this visa's stay is 2 years and 9 months,",
+    "  report 3105, not 5175.",
     "  Example (UK Family, partner): '£3,105 if you're staying for 2 years and 9 months' -> surcharge amount",
     "  3105, per 'application'. WRONG: 3105 per year with years 3.",
     "",
@@ -753,6 +922,27 @@ export function buildSystemPrompt(): string {
     "- EVERY item needs a verbatim quote: citations['requiredDocuments.<index>'] where <index> is the item's",
     "  0-based position in YOUR array (citations['requiredDocuments.0'] for the first). The quote must be copied",
     "  word for word from the page and contain the item's text. An item without such a quote will be discarded.",
+    "",
+    // ---- #187: what kind of item it is, and how firmly the page asks for it ----
+    "DOCUMENT KIND AND NEED (requiredDocumentMeta; one object per requiredDocuments item, SAME order, SAME length):",
+    "  { \"kind\": \"document\"|\"information\", \"kindQuote\": string, \"need\": \"required\"|\"conditional\"|\"optional\", \"appliesWhen\": string (only when need is conditional) }",
+    "- kind: judge ONLY from the page's own wording. 'document' = something the applicant uploads or hands over",
+    "  (a passport, a certificate, a letter, bank statements). 'information' = something the applicant types in or",
+    "  states on the form (dates of travel, an address, a name, details of offences) - typically listed under a",
+    "  lead-in such as 'You'll need to provide the following information in your online application'.",
+    "  Decide each item from the sentence that introduces its list and from the item's own words; do not use",
+    "  outside knowledge of what such a document usually is. When the page does not make it clear, still pick the",
+    "  closer kind, but kindQuote must be real page text.",
+    "- kindQuote: a verbatim quote from the page that supports the kind: the lead-in sentence of the item's list,",
+    "  or the item's own words. For an item listed under 'Depending on your circumstances, you might also need to",
+    "  provide:' use that lead-in as its kindQuote. A kindQuote that is not on the page makes the kind be ignored.",
+    "- need: 'conditional' when the item's own quote has an 'if ...', 'unless ...' or 'depending on ...' clause, or",
+    "  when the item sits under the lead-in 'Depending on your circumstances, you might also need to provide:'.",
+    "  'optional' only when the page says 'optional'. Otherwise 'required'. The word 'may' NEVER makes an item",
+    "  conditional or optional ('details of any offences you may have committed' is required).",
+    "- appliesWhen (conditional only): the clause copied word for word, e.g. 'if you're visiting for more than 6",
+    "  months', 'if you have an income', 'if known'; for lead-in items the lead-in itself ('Depending on your",
+    "  circumstances, you might also need to provide'). Never reword it.",
   ].join("\n");
 }
 

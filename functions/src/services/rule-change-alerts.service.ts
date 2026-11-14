@@ -279,6 +279,8 @@ function feeLine(components: FeeComponentDiff[]): RuleChangeFieldLine {
 export function fieldLinesOf(diff: VisaFieldDiff[]): RuleChangeFieldLine[] {
   const lines: RuleChangeFieldLine[] = [];
   for (const d of diff) {
+    // Issue #187: a kind/need re-reading is not a rule change to tell users about.
+    if (d.field === "requiredDocumentMeta") continue;
     if (d.field === "fee") {
       lines.push(feeLine(d.components));
     } else if (d.field === "eligibilityCriteria" || d.field === "requiredDocuments") {

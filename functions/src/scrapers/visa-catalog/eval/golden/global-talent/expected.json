@@ -9,7 +9,8 @@
     "QA checked all fields vs live Content API 2026-11-09; user spot-checked fee lines",
     "Multi-stage fee: £766 in total, paid as £561 (endorsement) + £205 (visa) on the endorsement route, or £766 at once on the prize route. The validator allows ONE application component, so the expected component is the published total, 766 (no arithmetic needed: the page prints it). 561 or 205 alone is a mismatch.",
     "IHS £1,035 per year x 5 (the visa lasts up to 5 years at a time).",
-    "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK decision time (3 weeks), max = inside-UK decision time (8 weeks)."
+    "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK decision time (3 weeks), max = inside-UK decision time (8 weeks).",
+    "documentKinds (#187): kind and need as the page's own wording says (drafted from guide.json only)."
   ],
   "name": {
     "value": "Global Talent",
@@ -111,6 +112,26 @@
         "years": 5,
         "source": "this is usually £1,035 per year for each person applying.",
         "yearsSource": "You can live and work in the UK for up to 5 years at a time."
+      }
+    ]
+  },
+  "documentKinds": {
+    "items": [
+      {
+        "match": [
+          "passport"
+        ],
+        "kind": "document",
+        "need": "required",
+        "source": "a valid passport or other document that shows your identity and nationality"
+      },
+      {
+        "match": [
+          "tuberculosis"
+        ],
+        "kind": "document",
+        "need": "conditional",
+        "source": "your tuberculosis test results if you’re from a country where you have to take the test"
       }
     ]
   }

@@ -231,8 +231,11 @@ class DocumentRequestService {
       visaTypeName?: string;
       countryName?: string;
     },
-    items: ChecklistItem[]
+    allItems: ChecklistItem[]
   ): Promise<{ created: number; updated: number; cancelled: number }> {
+    // Issue #187: an "information" item is typed in, not uploaded, so it never
+    // becomes a pending DocumentRequest (it is answered through the answers API).
+    const items = allItems.filter((i) => i.kind !== "information");
     const existing = await this.listChecklistForApplication(application.id);
     const byItemId = new Map(existing.map((r) => [r.checklistItemId, r]));
     const wanted = new Set(items.map((i) => i.checklistItemId));
@@ -246,6 +249,11 @@ class DocumentRequestService {
         holder: item.holder,
         reason: item.reason,
         required: item.required,
+        kind: item.kind,
+        need: item.need,
+        ...(item.kindReview ? { kindReview: true as const } : {}),
+        ...(item.kindQuote ? { kindQuote: item.kindQuote } : {}),
+        ...(item.appliesWhen ? { appliesWhen: item.appliesWhen } : {}),
         citation: item.citation,
         ...(item.criterionRef ? { criterionRef: item.criterionRef } : {}),
       };
@@ -331,6 +339,11 @@ class DocumentRequestService {
         holder: item.holder,
         reason: item.reason,
         required: item.required,
+        kind: item.kind,
+        need: item.need,
+        ...(item.kindReview ? { kindReview: true as const } : {}),
+        ...(item.kindQuote ? { kindQuote: item.kindQuote } : {}),
+        ...(item.appliesWhen ? { appliesWhen: item.appliesWhen } : {}),
         citation: item.citation,
         ...(item.criterionRef ? { criterionRef: item.criterionRef } : {}),
       };

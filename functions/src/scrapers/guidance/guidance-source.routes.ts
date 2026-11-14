@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { verifyAuth } from "../../middleware/auth";
 import { guidanceSourceController } from "./guidance-source.controller";
+import { registryController } from "../shared/registry/registry.controller";
 
 // ============================================
 // Routes for the guidance source registry (issue #39)
@@ -20,5 +21,9 @@ adminGuidanceSourceRoutes.get("/", verifyAuth, (req, res) => guidanceSourceContr
 
 // Crawl exactly this source now (due or not, `failing` included).
 adminGuidanceSourceRoutes.post("/:id/crawl", verifyAuth, (req, res) => guidanceSourceController.crawl(req, res));
+
+// Issue #215: set a source's status (active / paused / retired) or role. There
+// is no DELETE route: retiring is the removal. Admin gate + audit in the service.
+adminGuidanceSourceRoutes.patch("/:id", verifyAuth, (req, res) => registryController.patchGuidanceSource(req, res));
 
 export { adminGuidanceSourceRoutes };

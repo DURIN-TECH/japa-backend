@@ -102,6 +102,20 @@ If the baseline (or any run) fails, report the failing fields. Do not lower a
 threshold or edit an expected value to make it pass. Change an expected value
 only when it is wrong against the source page, with the quote to prove it.
 
+### Item kind and need (`documentKinds`, issue #187)
+
+A route's `expected.json` may carry `documentKinds.items`: for each listed item,
+`match` (keywords that find it in the extractor's `requiredDocuments`), the
+`kind` (`document` uploaded / `information` typed in) and `need` (`required` /
+`conditional` / `optional`) the page's own wording gives, and a verbatim
+`source`. The field (weight 2) is scored only on routes that have it; an item
+scores when both kind and need match (a missing or `kindReview` item scores 0).
+Standard Visitor scores 14 items: the passport / travel document sentence
+(document, required) and the 13 items of its two lists; only the passport and
+the TB certificate are documents. UK Family uses the issue's two named examples (photo-page copies =
+document, criminal convictions = information) plus passport, TB results and
+certified translation.
+
 ### Known gaps
 
 `expected.json` may list `knownGaps` (e.g. `feeComponents`, a tracker ref,

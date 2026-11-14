@@ -140,6 +140,20 @@ export const collections = {
   // source (see `subcollections.guidanceSnapshots`).
   // Backend-only: no firestore.rules match -> clients denied.
   guidanceSources: db.collection("guidanceSources"),
+  // Source registry safeguards (issue #215). ALL backend-only (no
+  // firestore.rules match -> clients denied; pinned by
+  // test/emulator/backend-only-collections.emu.ts):
+  // - officialDomains/{host}: the allow-list of official websites an admin
+  //   confirmed. A portal-added source may only point at a confirmed host.
+  // - officialDomainPreviews/{uid}__{host}: the last address check an admin made
+  //   for a host; a confirmation must rest on it (server-held evidence).
+  // - sourceRegistryAudit/{id}: append-only record of every confirm, revoke,
+  //   register, edit and removal (never updated or deleted).
+  // - sourceRegistryRateLimits/{uid}__{kind}__{hour}: per-admin hourly counters.
+  officialDomains: db.collection("officialDomains"),
+  officialDomainPreviews: db.collection("officialDomainPreviews"),
+  sourceRegistryAudit: db.collection("sourceRegistryAudit"),
+  sourceRegistryRateLimits: db.collection("sourceRegistryRateLimits"),
   // Published outcome statistics (issue #116): decision counts per destination,
   // published category and nationality, imported from a government's own
   // statistics release (src/scrapers/outcome-statistics). One doc per
@@ -388,6 +402,12 @@ export const subcollections = {
   reviews: (agentId: string) =>
     collections.agents.doc(agentId).collection("reviews"),
   
+  // Answers to "information" checklist items under applications (issue #187):
+  // `applications/{id}/answers/{checklistItemId}` = { text, updatedAt, updatedBy }.
+  // Backend-only: firestore.rules deny every client read and write.
+  answers: (applicationId: string) =>
+    collections.applications.doc(applicationId).collection("answers"),
+
   // Notes under applications
   notes: (applicationId: string) =>
     collections.applications.doc(applicationId).collection("notes"),

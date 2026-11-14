@@ -11,7 +11,7 @@ import { defineAbilitiesFor, ROLES } from "@durin-tech/authz";
 import { installFakes, resetStore, store } from "../helpers/fake-firestore";
 import { visaService } from "../../src/services/visa.service";
 import { visaController } from "../../src/controllers/visa.controller";
-import { deriveRequirementsFromScrape, isQuoteOptional } from "../../src/services/visa-requirements-derive";
+import { deriveRequirementsFromScrape } from "../../src/services/visa-requirements-derive";
 import {
   deactivateSeededUkDuplicates,
   parseDeactivateArgs,
@@ -59,17 +59,13 @@ describe("deriveRequirementsFromScrape", () => {
     }
   });
 
-  test("isRequired true by default; false only for optional / if applicable / if relevant / unless", () => {
+  test("isRequired true only for need=required (issue #187 three-state rule, quote-only fallback)", () => {
     const docs = deriveRequirementsFromScrape(scraped())[0].requiredDocuments;
     assert.deepEqual(docs.map((d) => d.isRequired), [true, false, false]);
-    assert.equal(isQuoteOptional("This is optional"), true);
-    assert.equal(isQuoteOptional("You must show your passport"), false);
-    // "may" never marks a document optional (month or modal verb).
-    assert.equal(isQuoteOptional("Passport issued after 1 May 2020"), false);
-    assert.equal(isQuoteOptional("any offences you may have committed"), false);
-    assert.equal(isQuoteOptional("a letter, if applicable"), true);
-    assert.equal(isQuoteOptional("Proof of funds IF RELEVANT"), true);
-    assert.equal(isQuoteOptional("unless you are under 18"), true);
+    assert.deepEqual(docs.map((d) => d.need), ["required", "conditional", "optional"]);
+    assert.equal(docs[1].appliesWhen, "if applicable");
+    // No stored classification: kind is unknown, so document + kindReview.
+    assert.ok(docs.every((d) => d.kind === "document" && d.kindReview === true));
   });
 
   test("citation sourceUrl prefers scrapeMeta.sourceUrl over the editable top-level one", () => {

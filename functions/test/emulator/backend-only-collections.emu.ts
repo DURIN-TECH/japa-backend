@@ -33,6 +33,18 @@ const COLLECTIONS = [
   // Agency listing screening results (issue #120): admin-only through the API.
   "listingScreenings",
   "rubricReviewHistory",
+  // Source registry safeguards (issue #215): the confirmed-hosts allow-list,
+  // the server-held address checks behind a confirmation, the append-only audit
+  // trail and the per-admin rate-limit counters. A client that could write
+  // officialDomains could confirm any website as official; one that could
+  // write the audit trail could rewrite history.
+  "officialDomains",
+  "officialDomainPreviews",
+  "sourceRegistryAudit",
+  "sourceRegistryRateLimits",
+  // The registries the API now writes (also backend-only; pinned here too).
+  "guidanceSources",
+  "visaSources",
   // Automatic rubric publishing (issue #201): the run record of each version
   // and the audit of changes to the publish settings. Internal notes: an
   // applicant (or anyone) must never read or write them from a client.

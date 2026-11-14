@@ -381,7 +381,7 @@ describe("generic-html adapter: output + hash unchanged by #74", () => {
 describe("buildSeededVisaSource: officialHosts", () => {
   const now = Timestamp.fromMillis(1_800_000_000_000);
 
-  test("GB gets the registry officialHosts; an unregistered country gets no field", () => {
+  test("GB gets the registry officialHosts; an unregistered country gets none from code, and keeps what is stored (#215)", () => {
     const gb = buildSeededVisaSource({
       country: { countryCode: "GB", countryName: "United Kingdom", pages: [] },
       existing: undefined,
@@ -393,6 +393,15 @@ describe("buildSeededVisaSource: officialHosts", () => {
       existing: { officialHosts: ["stale.example"] },
       now,
     });
-    assert.equal("officialHosts" in ca.doc, false);
+    // Issue #215: the confirmed hosts of portal-added pages are stored on the
+    // doc, so a re-seed UNIONS stored and code hosts instead of dropping the
+    // stored ones. With nothing in code and nothing stored there is no field.
+    assert.deepEqual(ca.doc.officialHosts, ["stale.example"]);
+    const none = buildSeededVisaSource({
+      country: { countryCode: "CA", countryName: "Canada", pages: [] },
+      existing: undefined,
+      now,
+    });
+    assert.equal("officialHosts" in none.doc, false);
   });
 });

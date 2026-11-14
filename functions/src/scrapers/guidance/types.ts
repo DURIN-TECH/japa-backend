@@ -43,9 +43,14 @@ export type GuidanceSourceStatus = (typeof GUIDANCE_SOURCE_STATUSES)[number];
  *  - verified:   the whole document was retrieved and read;
  *  - partial:    only part of it could be retrieved (the note says which);
  *  - unverified: it could not be retrieved (the note and `retrievalError`
- *                say what happened). The crawler SKIPS unverified sources.
+ *                say what happened). The crawler SKIPS unverified sources;
+ *  - registered (issue #215): added from the admin portal. The whole text was
+ *                retrieved in full by the registration's preview fetch (through
+ *                the guarded fetch service), but NO PERSON has read it the way
+ *                a `verified` entry was read. It is crawlable like `verified`,
+ *                and the distinct value keeps that honesty visible.
  */
-export const GUIDANCE_VERIFICATION_STATUSES = ["verified", "partial", "unverified"] as const;
+export const GUIDANCE_VERIFICATION_STATUSES = ["verified", "partial", "unverified", "registered"] as const;
 export type GuidanceVerificationStatus = (typeof GUIDANCE_VERIFICATION_STATUSES)[number];
 
 /**
@@ -158,6 +163,18 @@ export interface GuidanceSource
     "id" | "status" | "retrievedAt" | "retrievalError" | "publishedDateSelector" | "expectedFinalUrl" | "resolveFrom"
   > {
   status: GuidanceSourceStatus;
+  // ---- Portal provenance (issue #215; absent on seeded sources) ----
+  // `addedVia: "portal"` marks a source an admin registered through the API.
+  // It is what (a) makes the crawl refuse a redirect to an unconfirmed host,
+  // (b) makes the seed leave the doc alone, (c) lets a revoked host pause it.
+  addedVia?: "portal";
+  addedBy?: string; // uid of the admin
+  addedAt?: Timestamp;
+  // Language the admin declared for the page (a code from the supported list).
+  language?: string;
+  // Why a source was paused by the system rather than by an admin's PATCH
+  // (for example "host_revoked"); cleared when an admin sets it active again.
+  pausedReason?: string | null;
   // The seed's optional fields are stored as null when absent (so a re-seed
   // that drops one clears it).
   publishedDateSelector: string | null;

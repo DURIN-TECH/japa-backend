@@ -254,6 +254,14 @@ export async function fakeRunTransaction<T>(fn: (tx: any) => Promise<T>): Promis
       pending.push(() => doSet(ref.path, data, opts?.merge));
       return tx;
     },
+    // create(): like the real transaction, fails when the doc exists (#215 audit trail).
+    create(ref: any, data: Data) {
+      pending.push(() => {
+        if (store.has(ref.path)) throw Object.assign(new Error(`ALREADY_EXISTS: ${ref.path}`), { code: 6 });
+        doSet(ref.path, data);
+      });
+      return tx;
+    },
     update(ref: any, data: Data) {
       pending.push(() => doUpdate(ref.path, data));
       return tx;
@@ -279,6 +287,11 @@ export async function installFakes(): Promise<void> {
   firebase.collections.appConfig = fakeCollection("appConfig");
   firebase.collections.visaSources = fakeCollection("visaSources");
   firebase.collections.guidanceSources = fakeCollection("guidanceSources");
+  // Issue #215: the source registry safeguards (all backend-only collections).
+  firebase.collections.officialDomains = fakeCollection("officialDomains");
+  firebase.collections.officialDomainPreviews = fakeCollection("officialDomainPreviews");
+  firebase.collections.sourceRegistryAudit = fakeCollection("sourceRegistryAudit");
+  firebase.collections.sourceRegistryRateLimits = fakeCollection("sourceRegistryRateLimits");
   firebase.collections.countries = fakeCollection("countries");
   firebase.collections.pendingVisaChanges = fakeCollection("pendingVisaChanges");
   // Issue #81: run records + the news registry (source health, news runs).
