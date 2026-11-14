@@ -2,9 +2,10 @@ import { randomUUID } from "crypto";
 import { Timestamp } from "firebase-admin/firestore";
 import type { ChargeSnapshot, CurrencyCode, Money, QuoteLock } from "../types/money";
 import type { SupersededCheckout } from "../types";
-import { collections, db } from "../utils/firebase";
+import { db } from "../utils/firebase";
 import { quote, toChargeSnapshot } from "../money/quote";
-import { resolveChargeCurrency } from "../money/config";
+// Issue #286: the one quote/charge currency rule, shared with the reads.
+import { payerCurrency, readProfileCountry } from "../money/payer-currency";
 import { getCurrencyInfo } from "../money/currencies";
 import { isMoneyError } from "../money/errors";
 import type { RateService } from "../money/rate.service";
@@ -76,10 +77,8 @@ export const chargeRuntime: {
 } = {
   // Lazy import: money/index wires the production providers on load.
   rates: async () => (await import("../money/index")).rateService,
-  profileCountry: async (uid) => {
-    const snap = await collections.users.doc(uid).get();
-    return snap.exists ? (snap.data() as { residentialCountry?: string }).residentialCountry : undefined;
-  },
+  // The one production profile reader (shared with the reads, #286).
+  profileCountry: readProfileCountry,
   now: () => new Date(),
   runTransaction: (fn) => db.runTransaction(fn),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -103,9 +102,10 @@ export type LockedCharge = ChargeSnapshot & QuoteLock;
 export async function chargeCurrencyForPayer(uid: string | undefined): Promise<CurrencyCode> {
   const service = await chargeRuntime.rates();
   const config = await service.getConfig();
-  if (!uid) return config.defaultCurrency;
-  const country = await chargeRuntime.profileCountry(uid);
-  return resolveChargeCurrency(country, config);
+  // Issue #286: the SAME rule the public reads quote with (payer-currency.ts).
+  // Unlike a read, a profile read failure here throws: never guess a charge
+  // currency.
+  return payerCurrency(uid, config, chargeRuntime.profileCountry);
 }
 
 /**

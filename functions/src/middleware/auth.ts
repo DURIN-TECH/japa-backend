@@ -177,7 +177,33 @@ export async function verifyAuth(
 }
 
 /**
- * Optional auth - sets user if token is valid, but doesn't block request
+ * Forget everything a request may have learned about a caller, so it is
+ * served as an anonymous guest. Used by `optionalAuth` when a token cannot be
+ * trusted (issue #286): no half-set identity may leak to the handler.
+ */
+function clearIdentity(req: AuthenticatedRequest): void {
+  delete req.user;
+  delete req.userId;
+  delete req.authz;
+  delete req.ability;
+  delete req.entitlements;
+}
+
+/**
+ * Optional auth for PUBLIC routes: a valid Firebase ID token identifies the
+ * caller (`req.user`, `req.userId`, `req.authz`, `req.ability`), but nothing
+ * here ever blocks the request.
+ *
+ * Security (issue #286): anything short of a valid token is a GUEST, never an
+ * error and never trusted:
+ *  - no `Authorization` header, or not `Bearer <token>`: guest;
+ *  - a token that fails verification (bad signature, expired, wrong project,
+ *    garbage): guest, with no identity set at all (`clearIdentity`);
+ *  - a token carrying the `disabled` claim (a suspended / rejected account,
+ *    which `verifyAuth` answers 403): guest too, so a public read never
+ *    serves a disabled account as signed in.
+ * The handler therefore only ever sees a `userId` taken from a verified,
+ * enabled token. Used by the public visa, news, agent and agency reads.
  */
 export async function optionalAuth(
   req: AuthenticatedRequest,
@@ -190,11 +216,17 @@ export async function optionalAuth(
     const token = authHeader.split("Bearer ")[1];
     try {
       const decodedToken = await auth.verifyIdToken(token);
-      req.user = decodedToken;
-      req.userId = decodedToken.uid;
-      await attachAuthz(req);
+      if (decodedToken.disabled === true) {
+        // A disabled account is not served as signed in (see above).
+        clearIdentity(req);
+      } else {
+        req.user = decodedToken;
+        req.userId = decodedToken.uid;
+        await attachAuthz(req);
+      }
     } catch {
-      // Token invalid, but we don't block the request
+      // Token invalid: serve the request as a guest, with no identity set.
+      clearIdentity(req);
       console.log("Optional auth: invalid token provided");
     }
   }

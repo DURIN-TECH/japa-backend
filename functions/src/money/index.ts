@@ -2,8 +2,6 @@ import { firestoreConfigStore, firestoreRateStore } from "./stores";
 import { RateService } from "./rate.service";
 import { CbnRateProvider } from "./providers/cbn.provider";
 import { OandaRateProvider } from "./providers/oanda.provider";
-import { collections } from "../utils/firebase";
-import { resolveChargeCurrency } from "./config";
 
 // ============================================
 // MONEY MODULE ENTRY (issue #178)
@@ -18,6 +16,9 @@ export { RateService } from "./rate.service";
 // Issue #179: dollar price input/stored reading and the local figure on reads.
 export * from "./usd-price";
 export * from "./local-price";
+// Issue #286: the one quote/charge currency rule (replaces the unused
+// `resolveChargeCurrencyForUser`, a third copy of it).
+export * from "./payer-currency";
 
 /**
  * Secrets the scheduled rate refresh binds. EMPTY on purpose: the default
@@ -35,13 +36,3 @@ export const rateService = new RateService({
   rates: firestoreRateStore,
   providers: { cbn: new CbnRateProvider(), oanda: new OandaRateProvider() },
 });
-
-/**
- * The charge currency for a user: from their stored profile country, never
- * from a request. See `resolveChargeCurrency` for the rules.
- */
-export async function resolveChargeCurrencyForUser(uid: string): Promise<string> {
-  const [config, snap] = await Promise.all([rateService.getConfig(), collections.users.doc(uid).get()]);
-  const country = snap.exists ? (snap.data() as { residentialCountry?: string }).residentialCountry : undefined;
-  return resolveChargeCurrency(country, config);
-}
