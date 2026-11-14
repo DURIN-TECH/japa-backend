@@ -430,19 +430,19 @@ service cloud.firestore {
                      get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
                     isAdmin();
       
-      // Users can create consultations
-      allow create: if isAuthenticated() && 
-                      request.resource.data.userId == request.auth.uid;
-      
-      // Users and agents can update consultations
-      allow update: if isOwner(resource.data.userId) ||
-                      (isAgent() &&
-                       exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
-                       get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
-                      isAdmin();
-      
-      // Only admins can delete consultations
-      allow delete: if isAdmin();
+      // WRITES ARE BACKEND ONLY (issue #180). A consultation carries the
+      // money the client is charged (priceUsdCents, chargedCurrency,
+      // chargedAmountMinor, the fx snapshot, the quote lock), the Paystack
+      // reference that settles it, the superseded checkouts and the
+      // payment status. A client-side create or update could book a
+      // consultation already `paymentStatus: "paid"`, lower the amount
+      // Paystack is asked for, or plant a superseded reference, bypassing the
+      // server-side price, quote lock and Paystack check entirely. Every
+      // write therefore goes through the API (POST /consultations, the
+      // public booking route, PUT/DELETE /consultations/:id, checkout and
+      // verify), which authorizes with CASL; admins too. No portal or app
+      // code writes this collection through the client SDK.
+      allow create, update, delete: if false;
     }
     
     // =====================================    // TRANSACTIONS COLLECTION
