@@ -13,6 +13,8 @@ import {
   RUBRIC_CITATION_FIELDS,
   RUBRIC_SCHEMA_VERSION,
   type AssessmentCriterion,
+  type CompetenceBlock,
+  type CompetenceStep,
   type EvidenceItem,
   type IntakeMeta,
   type IntakeQuestion,
@@ -42,6 +44,7 @@ import {
   type RawEvidenceItem,
   type RawIntakeQuestion,
   type RawRuleTrigger,
+  type RawCompetenceStep,
   type RawApplicantGroup,
   type RawRubricOutput,
   type AcceptedCriterionView,
@@ -80,6 +83,8 @@ import type { StartJobInput, StartJobResult } from "./rubric-extraction-job";
 // (#225) The guard that defers the automatic re-draft to an active onboarding run (pure module: no cycle).
 import { deferredResult, GUARD_UNAVAILABLE_REASON_CODE, type RedraftGuard } from "../onboarding/onboarding-redraft";
 import { validateCriterionShape, validateVisaRubric } from "./rubric-validate";
+// (#235) The one code check of a competence block, and of destination questions.
+import { competenceProblems, storedCountryOptions } from "./rubric-competence";
 
 // ============================================
 // RUBRIC — EXTRACTION SERVICE (issue #40)
@@ -385,6 +390,9 @@ export interface ChunkAssessment {
   // (#207) The model's proposed rule triggers (call 2). Resolved and checked
   // at merge time, when every question of the rubric is known. Absent = none.
   ruleTriggers?: RawRuleTrigger[];
+  // (#235) The model's proposed competence steps (call 2), in the excerpt's
+  // order. Resolved and checked at merge time. Absent = none.
+  competenceSteps?: RawCompetenceStep[];
   // Counts of things done to criteria (see CriterionNotes), for flags.
   counters: { judgementChecksStripped: number; ruleRefsRemoved: number; ruleRefsDerived: number };
 }
@@ -400,6 +408,7 @@ export function combineAssessments(criteriaPart: ChunkAssessment, intakePart: Ch
     intakeQuestions: intakePart.intakeQuestions,
     evidenceItems: intakePart.evidenceItems,
     ruleTriggers: intakePart.ruleTriggers ?? [],
+    competenceSteps: intakePart.competenceSteps ?? [],
     counters: {
       judgementChecksStripped: criteriaPart.counters.judgementChecksStripped + intakePart.counters.judgementChecksStripped,
       ruleRefsRemoved: criteriaPart.counters.ruleRefsRemoved + intakePart.counters.ruleRefsRemoved,
@@ -614,7 +623,7 @@ export function assessChunkOutput(
     else evidenceItems.push({ raw: e, source: cite(found.matched, found.page) });
   }
 
-  return { criteria, discards, suspiciousPassages, polarity, intake: cleanIntakeMeta(raw.intake), intakeQuestions: raw.intakeQuestions, evidenceItems, ruleTriggers: raw.ruleTriggers, counters };
+  return { criteria, discards, suspiciousPassages, polarity, intake: cleanIntakeMeta(raw.intake), intakeQuestions: raw.intakeQuestions, evidenceItems, ruleTriggers: raw.ruleTriggers, competenceSteps: raw.competenceSteps ?? [], counters };
 }
 
 /** Drop null / blank fields of the model's intake headings; null when none is left. */
@@ -851,6 +860,9 @@ export interface MergedRubricContent {
   intake: IntakeMeta | null;
   intakeQuestions: IntakeQuestion[];
   evidenceItems: EvidenceItem[];
+  // (#235) The competence steps, when every drafted step passed the code
+  // check (rubric-competence.ts); absent otherwise (never a partial block).
+  competence?: CompetenceBlock;
   intentPolarityProposal: IntentPolarityProposal | null;
   suspiciousPassages: RubricCitation[];
   discards: RubricDiscard[];
@@ -896,6 +908,12 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
   // each is for. Checked once every question of the rubric is known (the
   // question may be asked in another excerpt than the rule).
   const pendingTriggers: { criterionId: string; raw: RawRuleTrigger }[] = [];
+  // (#235) Competence steps the model proposed, in document order, with the
+  // stable id of the rule each rests on (undefined when that rule did not
+  // survive: the whole block then goes). Checked once every question is in.
+  const pendingSteps: { criterionId: string | undefined; raw: RawCompetenceStep }[] = [];
+  // (#235) Country options the model typed into a destination question (never kept).
+  let countryOptionsDropped = 0;
 
   for (const { chunk, assessment } of parts) {
     discards.push(...assessment.discards);
@@ -965,6 +983,8 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
       const id = refToId.get(t.criterionRef);
       if (id !== undefined) pendingTriggers.push({ criterionId: id, raw: t });
     }
+    // (#235) Remember this excerpt's competence steps against stable ids.
+    for (const st of assessment.competenceSteps ?? []) pendingSteps.push({ criterionId: refToId.get(st.criterionRef), raw: st });
     /** Stable ids of the surviving criteria a list of handles points at. */
     const resolve = (refs: string[]) => [...new Set(refs.map((r) => refToId.get(r)).filter((id): id is string => id !== undefined))];
 
@@ -982,13 +1002,21 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
     if (!intake && assessment.intake) intake = assessment.intake;
 
     // ---- intake questions ----
-    for (const q of assessment.intakeQuestions) {
+    for (const q0 of assessment.intakeQuestions) {
+      // (#235) A destination question never keeps a country option the model
+      // typed in: the member countries are listed from membership data when
+      // the question is asked. Only non-country options (for example "I can't
+      // say") stay.
+      const destinations = q0.optionsFrom === "route_destinations" && (q0.answerType === "single_choice" || q0.answerType === "multi_choice");
+      const countryOpts = destinations ? storedCountryOptions({ optionsFrom: "route_destinations", options: q0.options.map((o) => ({ value: o.value, label: o.label })) }) : [];
+      countryOptionsDropped += countryOpts.length;
+      const q = countryOpts.length > 0 ? { ...q0, options: q0.options.filter((o) => !countryOpts.includes(o.value)) } : q0;
       const ids = resolve(q.criterionRefs);
       if (!SLUG_RE.test(q.id)) {
         discard("intake_question", "invalid_shape", "id is not a slug", q.label);
       } else if (ids.length === 0) {
         discard("intake_question", "unresolved_reference", "none of the criteria it names survived validation", q.label);
-      } else if ((q.answerType === "single_choice" || q.answerType === "multi_choice") && q.options.length === 0) {
+      } else if (!destinations && (q.answerType === "single_choice" || q.answerType === "multi_choice") && q.options.length === 0) {
         discard("intake_question", "invalid_shape", "a choice question with no options", q.label);
       } else if (questions.has(q.id)) {
         // Same question asked for another part of the document: keep the
@@ -1020,6 +1048,8 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
             : {}),
           ...(q.dateRelativeToToday ? { dateLimits: { relativeToToday: q.dateRelativeToToday } } : {}),
           ...(typeof q.textMaxLength === "number" && Number.isInteger(q.textMaxLength) && q.textMaxLength > 0 ? { textLimits: { maxLength: q.textMaxLength } } : {}),
+          // (#235) Its options are the route's member countries, listed when asked.
+          ...(destinations ? { optionsFrom: "route_destinations" as const } : {}),
         });
         conditions.set(q.id, q.showWhenAnyOf);
       }
@@ -1124,6 +1154,62 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
     q.criterionIds = [...new Set([...q.criterionIds, criterionId])];
   }
 
+  // ---- competence steps (#235) ----
+  // "Which member country examines the application". The model proposes the
+  // steps; CODE builds them: each step's quote and URL are COPIED from the
+  // rule it rests on (never the model's text), and the block is kept only
+  // when EVERY step passes the one code check (rubric-competence.ts): the rule
+  // survived, the words it applies are in that rule's quote, its question is
+  // a destination question of this rubric, its conditions read questions of
+  // this rubric. One failing step drops the WHOLE block (the order matters:
+  // see rubric-competence.ts), and a flag says so. No block = the applicant
+  // simply picks.
+  let competence: CompetenceBlock | undefined;
+  if (pendingSteps.length > 0) {
+    const steps: CompetenceStep[] = [];
+    let broken = false;
+    for (const { criterionId, raw: st } of pendingSteps) {
+      const c = criterionId !== undefined ? byId.get(criterionId) : undefined;
+      if (!c) {
+        broken = true;
+        break;
+      }
+      const when = (st.whenAllOf ?? []).map((w) => ({ questionId: w.questionId, op: w.op, value: w.value }));
+      steps.push({
+        criterionId: c.criterionId,
+        questionId: st.questionId,
+        ...(when.length > 0 ? { when } : {}),
+        resultFrom: "answer",
+        restsOn: normalizeForQuoteMatch(st.restsOn ?? ""),
+        source: c.source,
+      });
+    }
+    const candidate = broken ? undefined : { steps };
+    const problems = candidate ? competenceProblems({ competence: candidate, criteria, intakeQuestions: [...questions.values()] }) : [{ code: "competence_rule_unknown" }];
+    if (candidate && problems.length === 0) {
+      competence = candidate;
+      // The rule a step rests on reads its question: link them, so the
+      // question is never removed as unjustified and the joins hold.
+      for (const st of candidate.steps) {
+        const q = questions.get(st.questionId) as IntakeQuestion;
+        q.criterionIds = [...new Set([...q.criterionIds, st.criterionId])];
+      }
+    } else {
+      flags.push({
+        code: "competence_dropped",
+        message: `the draft proposed ${pendingSteps.length} step(s) for which member country examines an application, but code could not confirm every one (${[...new Set(problems.map((p) => p.code))].join(", ")}). No competence steps were kept, so the applicant will simply pick the country. Read the source before approving.`,
+        target: "rubric",
+      });
+    }
+  }
+  if (countryOptionsDropped > 0) {
+    flags.push({
+      code: "destination_country_options_dropped",
+      message: `${countryOptionsDropped} country option(s) were typed into a question whose options are the route's member countries; they were dropped (the countries are listed from membership data when the question is asked).`,
+      target: "rubric",
+    });
+  }
+
   // ---- back-links: which questions each criterion reads ----
   const intakeQuestions = [...questions.values()];
   for (const q of intakeQuestions) {
@@ -1183,7 +1269,7 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
   }
   flags.push(...possibleDuplicateFlags(criteria));
 
-  return { criteria, intake, intakeQuestions, evidenceItems: [...evidence.values()], intentPolarityProposal, suspiciousPassages, discards, flags };
+  return { criteria, intake, intakeQuestions, evidenceItems: [...evidence.values()], ...(competence ? { competence } : {}), intentPolarityProposal, suspiciousPassages, discards, flags };
 }
 
 /** Share of words two criteria must have in common to be flagged as possible duplicates. */
@@ -1463,6 +1549,11 @@ export function assembleDraft(input: AssembleInput, parts: readonly { chunk: Pic
     return { ok: false, reasonCode: "no_criteria_accepted", error: "no criterion survived validation", discardedCount: merged.discards.length, discardedByReason };
   }
   const keptQuoteTranslations = keptTranslations(translations, merged.criteria);
+  // (#235) Is this a bloc / treaty rulebook (the only kind with members)?
+  const sharedTarget = rulebookTargetOf(input).shape === "group";
+  if (merged.competence && !sharedTarget) {
+    merged.flags.push({ code: "competence_dropped", message: "the draft proposed steps for which member country examines an application, but this is a country's own rulebook (it has no members to choose between), so none were kept.", target: "rubric" });
+  }
   const draft: RubricDraft = {
     schemaVersion: RUBRIC_SCHEMA_VERSION,
     // (#233) routeKey + authorityId + routeSlug, and countryCode + visaTypeId
@@ -1484,6 +1575,9 @@ export function assembleDraft(input: AssembleInput, parts: readonly { chunk: Pic
     ...(merged.intake ? { intake: merged.intake } : {}),
     intakeQuestions: merged.intakeQuestions,
     evidenceItems: merged.evidenceItems,
+    // (#235) Only a SHARED (bloc / treaty) rulebook says which member examines
+    // an application; on a country's own rulebook the block is never stored.
+    ...(merged.competence && sharedTarget ? { competence: merged.competence } : {}),
     sourceSnapshots: input.sources.map((s) => s.snapshot),
     // (#220) What language each source is written in: the publish gate holds a
     // version unless every one of these is a supported language.

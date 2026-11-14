@@ -486,6 +486,61 @@ export interface IntakeQuestion {
   layerKey?: string;
   // amount questions: the allowed ISO 4217 codes (#113). Any code when absent.
   currencies?: string[];
+  // (#235, P6 of #228) Choice questions only: where the country options come
+  // from. `route_destinations` = the member countries of the shared route this
+  // question's layer belongs to, read from MEMBERSHIP DATA (`expandDestinations`)
+  // on the day the question is asked. The stored version never holds a country
+  // option (the validator refuses one): the intake service adds them when it
+  // serves the question, so an option list is never typed into code or into a
+  // rulebook. Any stored `options` are non-country answers (for example "I
+  // can't say") shown after the countries. Absent on every other question.
+  optionsFrom?: IntakeOptionsSource;
+}
+
+/** (#235) Where a choice question's options come from at the time of asking (see `IntakeQuestion.optionsFrom`). */
+export const INTAKE_OPTIONS_SOURCES = ["route_destinations"] as const;
+export type IntakeOptionsSource = (typeof INTAKE_OPTIONS_SOURCES)[number];
+
+// ============================================
+// Which country do I apply through (issue #235, P6 of #228)
+// ============================================
+
+/**
+ * One step of a shared rulebook's competence rule: "which member country
+ * examines the application". Steps are tried IN ORDER; the first step whose
+ * `when` holds and whose answer names exactly one country decides (see
+ * services/competence.service.ts `resolveCompetence`).
+ *
+ * Everything a step claims rests on the guidance: it points at a rule of the
+ * SAME layer (`criterionId`), carries that rule's verbatim quote and URL
+ * (`source`, copied by code from the rule, never from the model), and the
+ * words of the quote the step applies (`restsOn`, which code checks are in the
+ * quote). The result is read from the applicant's ANSWER only: code never
+ * works out a country from dates, lengths of stay or anything else.
+ */
+export interface CompetenceStep {
+  // The rule of the same layer the step rests on (its own verbatim quote and URL).
+  criterionId: string;
+  // The intake question of the same layer whose answer names the country.
+  // A choice question with `optionsFrom: "route_destinations"`.
+  questionId: string;
+  // Plain-words condition: the step applies only when ALL of these hold
+  // (absent or empty = always). Reuses the intake condition shape.
+  when?: IntakeCondition[];
+  // Where the country comes from: always the answer to `questionId`.
+  resultFrom: "answer";
+  // The words of the quote this step applies, copied from it (for example the
+  // phrase that names the case it covers). Code checks they are in `source.quote`.
+  restsOn: string;
+  // The quote and URL, exactly like any rule's (copied from the rule `criterionId`).
+  source: RubricCitation;
+  // (#233-style) SERVED-SIDE ONLY: on a merged stack view, the layer the step came from.
+  layerKey?: string;
+}
+
+/** (#235) The competence block of a SHARED rulebook. Absent when the guidance states no such rule. */
+export interface CompetenceBlock {
+  steps: CompetenceStep[];
 }
 
 /** Headings of the intake section as a whole. */
@@ -829,6 +884,13 @@ export interface VisaRubric extends RulebookKeyFields {
   intake?: IntakeMeta;
   intakeQuestions: IntakeQuestion[];
   evidenceItems: EvidenceItem[];
+  // (#235, P6 of #228) Only on a SHARED (bloc / treaty) rulebook whose guidance
+  // states which member country examines an application: the ordered steps
+  // that propose the country to apply through. Absent on every other rulebook
+  // (and on every version written before #235): the applicant then simply
+  // picks, nothing is guessed. Served only while every step still passes the
+  // code check (scrapers/rubric/rubric-competence.ts), else left out whole.
+  competence?: CompetenceBlock;
   // Set by an admin (never by extraction); absent until then.
   outcomeStatistics?: OutcomeStatisticsMapping;
   // Admin-set tag (#116): ids of the criteria for which extra supporting

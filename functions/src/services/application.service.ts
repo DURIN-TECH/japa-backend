@@ -22,7 +22,9 @@ import { canStartCaseOnVisa } from "../agency-visas/agency-visa-access";
 import { resolveRouteStackFor, routeStackKeys } from "../shared-routes/route-stack";
 // Issue #234: the applicant's holdings, copied onto the application when it starts.
 import { applicantFactsFromUser } from "./applicant-holdings.service";
-import type { User } from "../types";
+import type { ThroughCountryChoice, User } from "../types";
+// Issue #235: the answers given in the "apply through" step seed the intake.
+import { intakeService } from "./intake.service";
 
 export interface CreateApplicationInput {
   visaTypeId: string;
@@ -47,6 +49,13 @@ export interface CreateApplicationInput {
   createdByAdminId?: string;
   createdByAdminName?: string;
   adminCreationReason?: string;
+  // Issue #235 (P6 of #228): set when the application is on a SHARED route and
+  // the applicant confirmed the member country to apply through. `countryCode`
+  // and `visaTypeId` above are then that member's own inheriting record
+  // (checked by services/competence.service.ts `resolveForCreate`). The answers
+  // the proposal was worked out from seed the intake, so they are not asked
+  // again. Absent for every other application.
+  throughCountry?: { choice: ThroughCountryChoice; answers: Record<string, unknown> };
 }
 
 export interface UpdateApplicationInput {
@@ -210,6 +219,20 @@ class ApplicationService {
       createdAt: now,
       updatedAt: now,
     };
+
+    // Issue #235: a shared-route application records the confirmed member
+    // country, who chose it and the rule shown at the time, and starts its
+    // intake with the answers already given (only those whose question is in
+    // this application's stack; nothing is ever dropped silently: anything
+    // else is set aside on the intake, see rebuildIntake).
+    if (input.throughCountry) {
+      application.throughCountryCode = input.throughCountry.choice.countryCode;
+      application.throughCountry = input.throughCountry.choice;
+      if (Object.keys(input.throughCountry.answers).length > 0) {
+        const seeded = await intakeService.rebuildIntake({ countryCode: input.countryCode, visaTypeId: input.visaTypeId, routeStack }, { answers: input.throughCountry.answers }, now);
+        if (seeded.intake) application.intake = seeded.intake;
+      }
+    }
 
     await docRef.set(application);
 

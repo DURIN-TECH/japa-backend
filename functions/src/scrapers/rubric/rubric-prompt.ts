@@ -107,8 +107,17 @@ import { KIND_WORDING_SENTENCE } from "./rubric-kind-wording";
  *    (code refuses any other); a member that cannot be coded so still goes to `uncoded`.
  *    The user message carries that list only when the platform has one, so a request for a
  *    platform with no blocs is the v10 frame. The intake prompt (call 2) is unchanged.
+ *  - "2026-11-rubric-v12" (#235, P6 of #228): the intake call (call 2) may draft the
+ *    COMPETENCE steps of a shared route ("which member country examines the application"),
+ *    only when the excerpt states it: one `competenceSteps` entry per case, in the excerpt's
+ *    order, each resting on an accepted rule (`criterionRef`) and on words copied from its
+ *    quote (`restsOn`, checked in code), reading the answer to a question whose options are
+ *    the route's member countries (`optionsFrom: "route_destinations"`, no country typed in).
+ *    A basis the excerpt leaves to the applicant ("length or purpose") is asked, never chosen.
+ *    The criteria prompt (call 1) is byte-for-byte v11's, so the re-draft prompt (which reuses
+ *    it) is unchanged.
  */
-export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v11";
+export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v12";
 
 /** Instructions shared by both calls: what the excerpt is, and how to treat it. */
 const COMMON_INSTRUCTIONS = [
@@ -180,6 +189,8 @@ export const RUBRIC_INTAKE_SYSTEM_PROMPT = [
   "`evidenceItems`: documents the excerpt itself names as evidence, each with the verbatim passage naming it (`quote`, copied character for character from one paragraph of the excerpt), the `documentType`, whose document it is (`party`), the `ref` of the criteria it evidences and, when it is asked for only after a certain answer, `showWhenAnyOf` naming the intake question and the value that triggers it. Do not add documents the excerpt does not name.",
   "",
   "`ruleTriggers`: some accepted criteria carry an `applicability` of `specialist` or `conditional` and a `condition`, the words of the source that say when the rule applies. For each such criterion, say which answer establishes that it applies: give its `criterionRef`, the `questionId` of an intake question, and `answerValues`, the option values of that question for which the rule applies. The question must be one of your `intakeQuestions` or one listed under \"Questions already asked\". Where the source distinguishes applicants by activity, sub-category or purpose (the conditions name them), include one `single_choice` question (or `multi_choice` when an applicant can be in several) that establishes it, with one option per activity or sub-category the source names, the option `label` in the source's own words and the `value` a short lowercase slug. Reuse that same question, with the same `id`, for every rule of that kind, and add an option to it when the source names another one; reuse a question listed under \"Questions already asked\" the same way. For a yes_no question the `answerValues` are \"true\" or \"false\". Use only activities, sub-categories and circumstances the excerpt itself names: never add one from general knowledge. If no question could establish when a rule applies, leave it out of `ruleTriggers`.",
+  "",
+  "`competenceSteps`: only when the excerpt itself states which member country is responsible for examining an application (for example the country that is the only destination, or the main destination, or the country whose border is crossed first). Give one entry per case the excerpt names, IN THE ORDER the excerpt applies them. Each entry gives `criterionRef`, the `ref` of the accepted criterion whose quote states that case; `restsOn`, the words of that quote that name the case, copied character for character; `questionId`, the intake question whose answer names the country for that case; and `whenAllOf`, the earlier answers that must ALL hold for this case to apply (empty when it applies whenever the cases before it did not decide). Every such question is a `single_choice` question (`multi_choice` when the applicant may name several countries) with `optionsFrom` set to `route_destinations`: list NO country among its options, because the program lists the member countries when the question is asked; you may list options that are not a country (for example that the applicant cannot say). Ask each such question once. When the excerpt lets a case rest on more than one basis (one reason OR another), the question names every basis, or another question asks which basis applies to the applicant: never choose a basis for them, and never work a country out from other answers such as dates or lengths. Never name a country in a question, an option or a step. If the excerpt does not state which member country is responsible, return an empty `competenceSteps` list.",
   "",
   "`intake`: a short title, card title and introduction for the questions, in plain words, only if you list questions.",
   "",
@@ -323,6 +334,9 @@ export function buildIntakeOutputSchema(): Record<string, unknown> {
     dateRelativeToToday: optional({ type: "string", enum: ["past_only", "future_only"] }),
     // Shown when ANY of these holds; empty = always shown.
     showWhenAnyOf: { type: "array", items: condition },
+    // (#235) A choice question whose options are the route's member countries,
+    // listed by the program when it is asked (never by the model).
+    optionsFrom: optional({ type: "string", enum: ["route_destinations"] }),
   });
 
   const evidenceItem = object({
@@ -337,11 +351,18 @@ export function buildIntakeOutputSchema(): Record<string, unknown> {
     showWhenAnyOf: { type: "array", items: condition },
   });
 
+  // (#235) One case of the competence rule, in the excerpt's order. No union
+  // types here (the provider caps those): the conditions reuse `condition`.
+  const competenceStep = object({ criterionRef: STRING, restsOn: STRING, questionId: STRING, whenAllOf: { type: "array", items: condition } });
+
   return object({
     intake: optional(object({ title: optional(STRING), cardTitle: optional(STRING), intro: optional(STRING) })),
     intakeQuestions: { type: "array", items: intakeQuestion },
     evidenceItems: { type: "array", items: evidenceItem },
     ruleTriggers: { type: "array", items: ruleTrigger },
+    // Optional: an answer that leaves it out (every excerpt with no competence
+    // rule, and every answer recorded before v12) reads as "none".
+    competenceSteps: optional({ type: "array", items: competenceStep }),
     suspiciousPassages: SUSPICIOUS,
   });
 }
@@ -700,6 +721,19 @@ export interface RawIntakeQuestion {
   textMaxLength: number | null;
   dateRelativeToToday: "past_only" | "future_only" | null;
   showWhenAnyOf: { questionId: string; op: "eq" | "neq"; value: string | number | boolean }[];
+  // (#235) Options are the route's member countries (listed by the program). Absent / null otherwise.
+  optionsFrom?: "route_destinations" | null;
+}
+
+/**
+ * (#235) One competence step as the model proposes it (call 2). Checked in
+ * code before anything is kept (rubric-extraction.service.ts `mergeAssessments`).
+ */
+export interface RawCompetenceStep {
+  criterionRef: string;
+  restsOn: string;
+  questionId: string;
+  whenAllOf: { questionId: string; op: "eq" | "neq"; value: string | number | boolean }[];
 }
 
 /** One evidence item as the model proposes it. */
@@ -742,6 +776,8 @@ export interface RawRubricOutput {
   evidenceItems: RawEvidenceItem[];
   // (#207) Empty for call 1's answer.
   ruleTriggers: RawRuleTrigger[];
+  // (#235) Empty for call 1's answer, and when the excerpt states no competence rule.
+  competenceSteps?: RawCompetenceStep[];
   suspiciousPassages: { quote: string }[];
 }
 
@@ -781,6 +817,9 @@ export function parseRubricOutput(text: string, schema: Record<string, unknown>)
   const out = parsed as Record<string, unknown>;
   for (const key of ["criteria", "intakeQuestions", "evidenceItems", "ruleTriggers", "suspiciousPassages"]) if (!(key in out)) out[key] = [];
   for (const key of ["intentPolarity", "intake"]) if (!(key in out)) out[key] = null;
+  // (#235) No competence steps is the same as an empty list: leave the key out
+  // so an answer without them reads exactly as before v12.
+  if (out.competenceSteps === null) delete out.competenceSteps;
   // `citations` (reviewer aids) are not asked for any more.
   for (const c of (out.criteria as Record<string, unknown>[])) c.citations = [];
   return parsed as RawRubricOutput;

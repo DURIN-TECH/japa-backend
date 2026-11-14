@@ -106,6 +106,9 @@ scrapers/
                                        served view; a missing layer is reported; a single layer is
                                        served unchanged. Consumers reach it through
                                        services/ai/application-rulebook.ts
+    rubric-competence.ts               (#235) the one code check of a shared rulebook's competence
+                                       steps ("which member country examines the application"),
+                                       used by drafting, the validator and the read side
     rubric-settings.ts                 appConfig/rubricExtractionSettings: kill switch + caps
     rubric-publish-settings.ts         appConfig/rubricPublishSettings: auto-publish mode (fails
                                        closed to `manual`), allowlist, gate numbers (#201)
@@ -196,6 +199,15 @@ Two defects found by the first real run (a "protected" bar rejected by the indep
 - **Fact triggers.** `criterion.factTrigger = { fact: nationality | residence | holds, anyOf }` (holds values `kind:issuer`), beside the question trigger, read by `resolveApplicability` with an `ApplicantContext`. With both triggers the rule applies only when both hold. Extraction does not draft fact triggers yet.
 - **Drafting.** The drafting prompt (`2026-11-rubric-v11`) may propose `groups` members only with the quote's own wording; codes only when the quote names that country; authority ids only from the "Blocs and treaties" list the criteria call carries (active bloc / treaty authorities, pinned on the job; `rawGroupProblem` refuses any other). Anything else stays in `uncoded`. The check (`2026-11-checker-v7`) is shown `groups` (only on rules that have them) and judges them under `group_matches_codes`; re-draft `2026-11-repair-v5`. The intake call is unchanged.
 - **What reaches the model.** `factsSummaryForModel`: nationality codes (as before, now all of them); residence and VALID held documents (kind, issuer, date) only when an applicable rule reads them or a judged bar exists. The applicant's note never.
+
+## Which country do I apply through (issue #235, P6 of #228)
+
+- **The block.** A SHARED (bloc / treaty) rulebook may carry `competence: { steps }` (types/rubric.ts `CompetenceStep`): an ordered list, each step resting on a rule of the same layer (`criterionId`, its verbatim `source` quote and URL copied by code), the words of that quote it applies (`restsOn`, checked verbatim), a `questionId`, an optional `when` (all conditions must hold, `IntakeCondition` shape) and `resultFrom: "answer"`. Absent on every existing rulebook and on any country's own rulebook (refused there).
+- **Questions with member options.** A step reads a choice question with `optionsFrom: "route_destinations"`. Its stored version holds NO country option (the validator refuses one; drafting drops any the model typed in). The intake service and the "apply through" service list the members from membership data on the day of asking (`services/route-destinations.ts`, through `sharedRouteService.destinationsOn` / `expandDestinations`), then the question's own non-country options.
+- **Drafting.** The intake call (`2026-11-rubric-v12`) may return `competenceSteps` only when the excerpt states which member examines an application; a basis the excerpt leaves to the applicant ("length or purpose") is asked, never chosen. Code builds the block in `mergeAssessments` and keeps it only when EVERY step passes `competenceProblems` (one failing step drops the whole block: the steps are an order). The criteria call is unchanged, so the re-draft prompt (`2026-11-repair-v5`) and the rule check (`2026-11-checker-v7`) are unchanged.
+- **Checked like any rule.** The rule a step rests on is an ordinary rule of the draft, so the independent check reads it; on the read side `applyExclusions` serves the block only while every step still passes against the served view (its rule kept and unchanged, its question asked). Otherwise there is no block and the applicant simply picks. The wording check is shown one fixed data line for a destination question's member options.
+- **Stacks.** `rubric-stack.ts` scopes a shared layer's steps like its questions and serves the block of the ONE shared layer that has one (two: none).
+- **Resolver and API.** `services/competence.service.ts`: `resolveCompetence` (pure), `GET|POST /shared-routes/:id/apply-through`, `POST /applications` with `sharedRouteId` + `throughCountryCode`, `PUT /applications/:id/through-country`.
 
 ## Non-English sources (`language/`, `rubric-translation.ts`, `rubric-language-eval.ts`; issue #220, part P5 of #211)
 

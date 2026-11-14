@@ -4,6 +4,7 @@ import {
   DECISION_STAGES,
   EVIDENCE_PARTIES,
   INTAKE_ANSWER_TYPES,
+  INTAKE_OPTIONS_SOURCES,
   INTENT_POLARITIES,
   RUBRIC_REVIEW_STATUSES,
   type AssessmentCriterion,
@@ -17,6 +18,8 @@ import { HELD_DOCUMENT_KINDS } from "../../types/applicant-facts";
 import { checkAuthorityId, isCountryCode } from "../../authorities/authority-ids";
 import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA } from "./rubric-exclusions";
 import { rulebookPartsOf } from "./rubric-key";
+// (#235) The one code check of a competence block and of destination questions.
+import { competenceProblems, storedCountryOptions } from "./rubric-competence";
 
 // ============================================
 // RUBRIC — STRUCTURAL VALIDATOR (issue #40)
@@ -287,7 +290,13 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
       if (!criterionIds.has(id)) err("intake_criterion_unknown", `intake question names criterion ${id}, which is not in the rubric`, target);
     }
     if (q.party !== undefined && !EVIDENCE_PARTIES.includes(q.party)) err("intake_party_invalid", "intake question party is not a known value", target);
-    if ((q.answerType === "single_choice" || q.answerType === "multi_choice") && (!Array.isArray(q.options) || q.options.length === 0)) {
+    // (#235) A question whose options come from the route's member countries
+    // (`optionsFrom`) stores no country: its options are added when it is asked.
+    if (q.optionsFrom !== undefined) {
+      if (!(INTAKE_OPTIONS_SOURCES as readonly string[]).includes(q.optionsFrom)) err("intake_options_from_invalid", "optionsFrom is not a known source", target);
+      else if (q.answerType !== "single_choice" && q.answerType !== "multi_choice") err("intake_options_from_not_choice", "only a choice question can take its options from the route's member countries", target);
+      if (storedCountryOptions(q).length > 0) err("intake_options_from_country_stored", "a question whose options are the route's member countries must not store a country option", target);
+    } else if ((q.answerType === "single_choice" || q.answerType === "multi_choice") && (!Array.isArray(q.options) || q.options.length === 0)) {
       err("intake_options_missing", "a choice question needs options", target);
     }
     if (q.options && duplicates(q.options.map((o) => o.value)).length > 0) err("intake_option_duplicate", "option values must be unique within a question", target);
@@ -337,6 +346,16 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
     }
     if (e.when && !questionIds.has(e.when.questionId)) err("evidence_condition_unknown", `evidence item depends on question ${e.when.questionId}, which is not in the rubric`, target);
     if (!e.source || !filled(e.source.quote)) err("evidence_quote_empty", "an evidence item needs the quote that names the document", target);
+  }
+
+  // ---- (#235) competence block: which member country examines the application ----
+  // Extraction only stores a block that passed this same check, so a failure
+  // here means damaged data: the rubric is not stored or approved. A block on
+  // a COUNTRY's own rulebook is refused (it has no members to choose between).
+  if (rubric.competence !== undefined) {
+    for (const p of competenceProblems(rubric, { sharedRulebook: parts ? parts.shape === "group" : undefined })) {
+      err(p.code, p.message, p.stepIndex >= 0 ? `competence.steps[${p.stepIndex}]` : "competence");
+    }
   }
 
   // ---- outcome statistics mapping (admin-set; only checked when present) ----

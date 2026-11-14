@@ -37,7 +37,24 @@ export interface ApplicationIntake {
    * Only answers to VISIBLE questions are stored.
    */
   answers: Record<string, unknown>;
+  /**
+   * (#235) Answers SET ASIDE when the country applied through changed before
+   * submission: their question is not part of the new route's rulebook. Kept,
+   * never deleted, never validated or served as answers; every later save
+   * carries them over. Absent when nothing was set aside.
+   */
+  orphanedAnswers?: OrphanedIntakeAnswer[];
   updatedAt: Timestamp;
+}
+
+/** (#235) One answer set aside (see `ApplicationIntake.orphanedAnswers`). */
+export interface OrphanedIntakeAnswer {
+  questionId: string;
+  value: unknown;
+  /** The rulebook the answer was given against, when known. */
+  routeKey?: string;
+  rubricVersion?: number;
+  setAsideAt: Timestamp;
 }
 
 /**
