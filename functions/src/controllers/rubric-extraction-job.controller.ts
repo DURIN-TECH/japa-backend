@@ -65,22 +65,22 @@ export function parseStartBody(raw: unknown): { ok: true; input: StartJobInput }
 /** HTTP status and error code of a refused start, from the stop code (the service's own codes). */
 function refusal(result: StartJobResult): { status: number; code: string } {
   switch (result.reasonCode) {
-    case "visa_type_not_found":
-    case "source_not_found":
-      return { status: 404, code: "NOT_FOUND" };
-    case "invalid_route":
-    case "no_sources":
-    case "no_text":
-    case "source_has_no_snapshot":
-    case "snapshot_meta_missing":
-      return { status: 400, code: "VALIDATION_ERROR" };
-    case "settings_unavailable":
-      return { status: 503, code: "SERVICE_UNAVAILABLE" };
-    case "unexpected_error":
-      return { status: 500, code: "INTERNAL_ERROR" };
+  case "visa_type_not_found":
+  case "source_not_found":
+    return { status: 404, code: "NOT_FOUND" };
+  case "invalid_route":
+  case "no_sources":
+  case "no_text":
+  case "source_has_no_snapshot":
+  case "snapshot_meta_missing":
+    return { status: 400, code: "VALIDATION_ERROR" };
+  case "settings_unavailable":
+    return { status: 503, code: "SERVICE_UNAVAILABLE" };
+  case "unexpected_error":
+    return { status: 500, code: "INTERNAL_ERROR" };
     // disabled, run_cap_exceeded, daily_cap_reached, run_record_unavailable: the request is fine, the state refuses it.
-    default:
-      return { status: 409, code: "CONFLICT" };
+  default:
+    return { status: 409, code: "CONFLICT" };
   }
 }
 

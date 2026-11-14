@@ -210,7 +210,8 @@ export class RubricExtractionJobStore {
     const pieces: string[] = [];
     for (let at = 0; at < json.length; at += STEP_DOC_CHARS) pieces.push(json.slice(at, at + STEP_DOC_CHARS));
     if (pieces.length === 0) pieces.push("");
-    const { result: _result, ...header } = step;
+    // The header is the step without its result (the result goes in `data` / the parts).
+    const header: Omit<StoredStep, "result"> = { stepId: step.stepId, position: step.position, phase: step.phase, sourceId: step.sourceId, chunkIndex: step.chunkIndex, usage: step.usage, failedAttempts: step.failedAttempts, createdAt: step.createdAt };
     const doc: StepDoc = pieces.length === 1 ? { ...header, parts: 1, data: pieces[0] } : { ...header, parts: pieces.length };
     tx.set(subcollections.rubricExtractionSteps(jobId).doc(step.stepId), doc as unknown as Record<string, unknown>);
     if (pieces.length > 1) {
@@ -238,8 +239,17 @@ export class RubricExtractionJobStore {
         }
         json = pieces.join("");
       }
-      const { parts: _parts, data: _data, ...header } = doc;
-      out.set(doc.stepId, { ...header, result: JSON.parse(json ?? "null") as ChunkAssessment });
+      out.set(doc.stepId, {
+        stepId: doc.stepId,
+        position: doc.position,
+        phase: doc.phase,
+        sourceId: doc.sourceId,
+        chunkIndex: doc.chunkIndex,
+        usage: doc.usage,
+        failedAttempts: doc.failedAttempts,
+        createdAt: doc.createdAt,
+        result: JSON.parse(json ?? "null") as ChunkAssessment,
+      });
     }
     return out;
   }

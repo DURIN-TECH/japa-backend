@@ -22,6 +22,7 @@ import { delimiterTag } from "../../../src/scrapers/rubric/rubric-prompt";
 import { chunkSnapshot } from "../../../src/scrapers/rubric/rubric-chunk";
 import { STEP_DOC_CHARS, stepIdOf, type RubricExtractionJob } from "../../../src/scrapers/rubric/rubric-extraction-job.store";
 import { jobIdOf, replaySteps, type AdvanceOutcome } from "../../../src/scrapers/rubric/rubric-extraction-job";
+import { DEFAULT_RUBRIC_SETTINGS, resolveRubricSettings } from "../../../src/scrapers/rubric/rubric-settings";
 import { assessChunkOutput, type ChunkAssessment } from "../../../src/scrapers/rubric/rubric-extraction.service";
 import { SnapshotQuoteIndex } from "../../../src/scrapers/rubric/rubric-quote";
 import { DEFAULT_SEVERITY_LEVELS } from "../../../src/types/rubric";
@@ -170,7 +171,7 @@ describe("steps", () => {
 
   test("the saved results are plain JSON (no Map, Set or class instance) and round-trip unchanged", async () => {
     const setup = await setUpMulti(h, 1, 4);
-    const hash = (store.get(`guidanceSources/src-1`) as any).latestSnapshotId as string;
+    const hash = (store.get("guidanceSources/src-1") as any).latestSnapshotId as string;
     const content = await snapshotStore.read("src-1", hash);
     const chunk = chunkSnapshot(content, h.settings.maxChunkChars)[0];
     const { quotes } = textOf(1, 4);
@@ -1005,5 +1006,32 @@ describe("status", () => {
     assert.equal(typeof view?.createdAt, "string");
     assert.doesNotMatch(JSON.stringify(view), /The applicant must provide evidence/);
     assert.equal(await jh.jobs.getStatus("XA_nothing__0123456789abcdef"), null);
+  });
+});
+
+// ============================================
+// Settings
+// ============================================
+
+describe("job settings", () => {
+  test("defaults leave a margin under the 540 s cut-off, and a bad value falls back to its default", () => {
+    assert.ok(DEFAULT_RUBRIC_SETTINGS.invocationBudgetMs <= 540_000 - 60_000, "at least a minute under the function limit");
+    assert.ok(DEFAULT_RUBRIC_SETTINGS.leaseMs > DEFAULT_RUBRIC_SETTINGS.invocationBudgetMs, "the lease outlives an invocation");
+    const r = resolveRubricSettings({ stepAttemptsMax: 5, invocationBudgetMs: 900_000, leaseMs: "long", jobMaxAgeMs: 3_600_000 });
+    assert.equal(r.settings.stepAttemptsMax, 5);
+    assert.equal(r.settings.invocationBudgetMs, DEFAULT_RUBRIC_SETTINGS.invocationBudgetMs);
+    assert.equal(r.settings.leaseMs, DEFAULT_RUBRIC_SETTINGS.leaseMs);
+    assert.equal(r.settings.jobMaxAgeMs, 3_600_000);
+    assert.equal(r.problems.length, 2);
+  });
+
+  test("a job older than its bound fails job_timed_out at the next worker invocation", async () => {
+    const setup = await setUpMulti(h, 1, 4);
+    jh = makeJobHarness(h);
+    const id = (await start(setup.sourceIds)).result.jobId as string;
+    h.state.nowMs += h.settings.jobMaxAgeMs + 1;
+    assert.deepEqual(await advance(id), { kind: "finished", status: "failed", stepsRun: 0, reasonCode: "job_timed_out" });
+    assert.equal(jh.calls.length, 0);
+    assert.equal(versionPaths().length, 0);
   });
 });
