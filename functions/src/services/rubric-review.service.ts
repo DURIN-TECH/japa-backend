@@ -770,6 +770,9 @@ export interface RubricReviewAuditEntry {
   confirmedPrimaryExclusions?: string[];
   // (#223) Protected rules replaced by their one automatic re-draft with this approval (the replacements are on the version as `ruleRepairs`).
   repairedCriterionIds?: string[];
+  // (#244) Originals that a repaired ordinary rule also stands for (several items of one definition that came back
+  // as the same rule): left out as covered, listed so the audit says which rule replaced which.
+  coveredCriterionIds?: string[];
   // The version serving before this decision.
   previousApprovedVersion: number | null;
   // The version serving after it.
@@ -1703,6 +1706,7 @@ export class RubricReviewService {
         confirmedPrimaryExclusions: confirmedPrimary,
         // (#223) Protected rules swapped for their automatic re-draft with this approval (empty when none).
         ...(plannerFields.ruleRepairs && plannerFields.ruleRepairs.length > 0 ? { repairedCriterionIds: plannerFields.ruleRepairs.map((r) => r.criterionId) } : {}),
+        ...(plannerFields.ruleRepairs && plannerFields.ruleRepairs.some((r) => (r.alsoReplaced ?? []).length > 0) ? { coveredCriterionIds: plannerFields.ruleRepairs.flatMap((r) => r.alsoReplaced ?? []) } : {}),
         approvedVersion: version,
       };
       tx.set(auditRef, audit as unknown as Record<string, unknown>);

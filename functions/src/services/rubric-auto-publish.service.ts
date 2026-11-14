@@ -47,6 +47,8 @@ import {
   type RubricPublishRun,
   type RubricPublishTrigger,
   type RubricReviewActor,
+  type RubricOrdinaryRepair,
+  type RubricOrdinaryRepairCounts,
   type RubricRuleRepair,
   type VisaRubric,
 } from "../types/rubric";
@@ -141,6 +143,9 @@ export type RubricCheckOutcome =
     // replacements to record on the version (`ruleRepairs`), and the record of every attempt.
     repairs?: RubricRuleRepair[];
     protectedFailures?: RubricProtectedFailure[];
+    // (#244) The automatic re-draft of ordinary rules the check found wrong: counts and a line per eligible
+    // rule. The replacements that passed are in `repairs` (the same record as the bars').
+    ordinaryRepairs?: { counts: RubricOrdinaryRepairCounts; records: RubricOrdinaryRepair[] };
     requests?: { total: number; repair: number };
   }
   | {
@@ -206,6 +211,8 @@ export interface RunOptions {
 interface RunExtras {
   protectedFailures?: RubricProtectedFailure[];
   checkerRequests?: { total: number; repair: number };
+  // (#244) The ordinary re-draft's counts and per-rule lines, and how it ended when a cap or the clock cut it short.
+  ordinaryRepairs?: { counts: RubricOrdinaryRepairCounts; records: RubricOrdinaryRepair[] };
 }
 
 /** The report of one run (also what the admin endpoint and the script return). */
@@ -237,6 +244,8 @@ export interface RubricPublishReport {
   droppedTriggerIds?: string[];
   // (#223) Protected rules the check did not confirm, with the repair attempt of each (also on the run record).
   protectedFailures?: RubricProtectedFailure[];
+  // (#244) One line per ordinary rule eligible for the automatic re-draft, with how it ended.
+  ordinaryRepairs?: RubricOrdinaryRepair[];
   // (#223) Model requests the check made, repair requests shown apart.
   checkerRequests?: { total: number; repair: number };
   // The audit entry of a publish.
@@ -275,6 +284,42 @@ function findingInWords(f: RubricProtectedFailure): string {
   const aspects = f.failedAspects.length > 0 ? `failed ${f.failedAspects.join(", ")}` : "not confirmed";
   const detail = f.repair.detail ? ` (${f.repair.detail})` : "";
   return `${f.title}${f.ruleRef ? ` [${f.ruleRef}]` : ""}: ${aspects}; ${REPAIR_IN_WORDS[f.repair.status] ?? f.repair.status}${detail}. Rule id ${f.criterionId}.`;
+}
+
+/** The two leave-out budget reasons (#201). */
+const isBudgetReason = (code: string): boolean => code === "leave_out_budget_exceeded" || code === "primary_leave_out_budget_exceeded";
+
+/**
+ * (#244) The retryable hold reason for an ordinary re-draft that a cap, the clock or the provider cut short
+ * (see the pipeline). `checker_capped` and `checker_unavailable:*` are in `RETRYABLE_REASONS`, so the hourly
+ * sweep runs the version again; the next run reuses every stored attempt and has its own request budget.
+ */
+function retryReasonOfCutOff(cutOff: RubricOrdinaryRepairCounts["cutOff"] | undefined): string | null {
+  if (cutOff === "capped") return "checker_capped";
+  if (cutOff === "deadline") return "checker_unavailable:deadline";
+  if (cutOff === "provider") return "checker_unavailable:provider";
+  return null;
+}
+
+/**
+ * (#244) The ordinary re-draft as one gate line of the run record, in codes and counts. A guard skip is
+ * recorded as `ordinary_repair_skipped:too_many`. Never blocks (`passed: true`): nothing in this step can hold
+ * a draft; the leave-out budget judges the result.
+ */
+function ordinaryRepairGate(c: RubricOrdinaryRepairCounts, rules: number): RubricPublishGateResult {
+  const spent = `${c.requests.redraft} re-draft + ${c.requests.check} check requests`;
+  if (c.skipped) return { gate: "ordinary_repair", passed: true, detail: `ordinary_repair_skipped:${c.skipped} (${c.eligible} eligible of ${rules} rules; no ordinary rule was re-drafted)` };
+  return {
+    gate: "ordinary_repair",
+    passed: true,
+    detail: `${c.eligible} eligible: ${c.repaired} repaired, ${c.mergedDuplicates} covered by another rule, ${c.failedCheck} failed the check, ${c.invalid} refused or unrepairable, ${c.checkPending} check pending, ${c.notAttempted} not attempted${c.cutOff ? ` (cut off: ${c.cutOff})` : ""}; ${spent}`,
+  };
+}
+
+/** The same counts as one sentence for the alert. */
+function ordinaryRepairSummaryInWords(c: RubricOrdinaryRepairCounts): string {
+  if (c.skipped) return `Ordinary rules found wrong: ${c.eligible} (too many for an automatic re-draft: none was tried).`;
+  return `Ordinary rules found wrong: ${c.eligible}; re-drafted once and confirmed ${c.repaired}, covered by another rule ${c.mergedDuplicates}, not confirmed ${c.failedCheck}, refused or unrepairable ${c.invalid}, not tried ${c.notAttempted + c.checkPending}${c.cutOff ? ` (cut off: ${c.cutOff})` : ""}.`;
 }
 
 /** The system actor, as the review service takes it. */
@@ -583,6 +628,8 @@ export class RubricAutoPublishService {
           } else {
             checker = "passed";
             polarity = outcome.intentPolarity;
+            // (#244) What the ordinary rules' automatic re-draft did, for the run record and the alert.
+            if (outcome.ordinaryRepairs) extras.ordinaryRepairs = outcome.ordinaryRepairs;
             // (#223) A failed bar the check REPAIRED: from here on the rulebook is the one WITH the
             // replacement (what the check verified), for the gates, the planner and the approval.
             if (outcome.repairs && outcome.repairs.length > 0) {
@@ -600,6 +647,15 @@ export class RubricAutoPublishService {
             // has run. It is evaluated again below, once the plan has answered.
             for (const code of report.reasonCodes) if (code !== PLAN_RESOLVED_FLAG_REASON && !reasons.includes(code)) reasons.push(code);
             if (polarity === null && !reasons.includes("polarity_unverified")) reasons.push("polarity_unverified");
+            // (#244) The ordinary re-draft was CUT OFF (a cap, the clock or the provider) and the budget fails on
+            // its own: the draft is held for the retryable reason instead, so the sweep finishes the job (the
+            // stored attempts are reused, nothing is paid for twice, the next run has its own caps) rather than
+            // leaving a draft held for a budget that the unfinished repairs might still have met. A run whose
+            // budget passes publishes as it is: the rules not yet re-drafted are simply left out, as before #244.
+            const retry = retryReasonOfCutOff(outcome.ordinaryRepairs?.counts.cutOff);
+            if (retry && reasons.length > 0 && reasons.every(isBudgetReason)) {
+              reasons.splice(0, reasons.length, retry);
+            }
             if (reasons.length === 0) {
               droppedTriggerIds = outcome.droppedTriggerIds ?? [];
               const plan = await this.callPlanner(this.deps.planner, { routeKey, version, runId, rubric: effective, excludedCriterionIds: report.excludedCriterionIds, checkerLeftOut: outcome.leftOut, droppedTriggerIds });
@@ -876,6 +932,11 @@ export class RubricAutoPublishService {
       settingsUnreadable: false,
       attempt: finished.attempts,
       ...(finished.protectedFailures && finished.protectedFailures.length > 0 ? { protectedFindings: finished.protectedFailures.map(findingInWords) } : {}),
+      // (#244) What the ordinary rules' automatic re-draft did; the rules now served as their replacement are listed by title.
+      ...(finished.counts.ordinaryRepairs ? { ordinaryRepairSummary: ordinaryRepairSummaryInWords(finished.counts.ordinaryRepairs) } : {}),
+      ...(finished.ordinaryRepairs && finished.ordinaryRepairs.some((r) => r.repair.status === "repaired")
+        ? { ordinaryRepairedRules: finished.ordinaryRepairs.filter((r) => r.repair.status === "repaired").map((r) => `${r.title}${r.ruleRef ? ` [${r.ruleRef}]` : ""} (rule id ${r.criterionId}, failed ${r.failedAspects.join(", ")})`) }
+        : {}),
     };
   }
 
@@ -920,6 +981,12 @@ export class RubricAutoPublishService {
     if (!extras) return;
     if (extras.protectedFailures !== undefined) finished.protectedFailures = extras.protectedFailures;
     if (extras.checkerRequests !== undefined) finished.checkerRequests = extras.checkerRequests;
+    // (#244) The ordinary re-draft: counts on the run's counts, a line per eligible rule, and a gate line.
+    if (extras.ordinaryRepairs !== undefined) {
+      finished.counts = { ...finished.counts, ordinaryRepairs: extras.ordinaryRepairs.counts };
+      finished.ordinaryRepairs = extras.ordinaryRepairs.records;
+      finished.gates = [...finished.gates, ordinaryRepairGate(extras.ordinaryRepairs.counts, finished.counts.rules)];
+    }
   }
 
   /** A failed bar with no check detail (an older checker, or a hold before any spend): id, title and ref only. */
@@ -1022,6 +1089,7 @@ export class RubricAutoPublishService {
       questionPlan: report.questionPlan,
       ...(report.droppedTriggerIds !== undefined ? { droppedTriggerIds: report.droppedTriggerIds } : {}),
       ...(report.protectedFailures !== undefined ? { protectedFailures: report.protectedFailures } : {}),
+      ...(report.ordinaryRepairs !== undefined ? { ordinaryRepairs: report.ordinaryRepairs } : {}),
       ...(report.checkerRequests !== undefined ? { checkerRequests: report.checkerRequests } : {}),
       auditId: report.auditId,
       previousApprovedVersion: report.previousApprovedVersion,

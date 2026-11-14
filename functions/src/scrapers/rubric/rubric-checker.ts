@@ -1,11 +1,11 @@
 import { collections } from "../../utils/firebase";
 import { AnthropicNotConfiguredError } from "../../services/ai/anthropic-client";
 import { AnthropicLlmProvider, LlmProviderError, emptyLlmUsage, llmRequestHash, type LlmProvider, type LlmRequest, type LlmUsage } from "../../services/ai/llm-provider";
-import type { AssessmentCriterion, IntentPolarity, LeaveOutBasis, RubricProtectedFailure, RubricRepairStatus, RubricRuleRepair, VisaRubric } from "../../types/rubric";
+import type { AssessmentCriterion, IntentPolarity, LeaveOutBasis, RubricOrdinaryRepair, RubricOrdinaryRepairCounts, RubricProtectedFailure, RubricRepairStatus, RubricRuleRepair, VisaRubric } from "../../types/rubric";
 import { isValidTrigger } from "../../utils/rubric-trigger";
 import { guidanceSnapshotStore } from "../guidance/guidance-snapshot.store";
 import type { GuidanceSnapshotContent } from "../guidance/types";
-import { isProtectedRule } from "./rubric-gates";
+import { isProtectedRule, sameScope } from "./rubric-gates";
 import {
   CHECKER_ASPECTS,
   CHECKER_BATCH_SIZE,
@@ -39,9 +39,9 @@ import { loadPublishSettings, type LoadedPublishSettings, type RubricPublishSett
 import { lexiconFor } from "../language/language-lexicon";
 import { SnapshotQuoteIndex, type QuoteLookup } from "./rubric-quote";
 import { quoteIsLeadIn, verifyListItems } from "./rubric-list-items";
-import { RubricExtractionService, RunStop, isTransientProviderError, type RedraftOutcome } from "./rubric-extraction.service";
+import { RubricExtractionService, RunStop, isTransientProviderError, possibleDuplicateFlags, type RedraftOutcome } from "./rubric-extraction.service";
 import { RUBRIC_REPAIR_PROMPT_VERSION, RUBRIC_SYSTEM_PROMPT } from "./rubric-prompt";
-import { REPAIR_WINDOW_CHARS, ruleHashOf } from "./rubric-repair";
+import { REDRAFT_DUPLICATE_REASON, REPAIR_WINDOW_CHARS, ruleHashOf } from "./rubric-repair";
 
 // ============================================
 // INDEPENDENT RULE CHECK — VERDICTS TO ACTIONS, AND THE RUN (issue #202, part of #200)
@@ -242,6 +242,30 @@ export function leaveOutBasis(rule: RuleShape, row: VerdictRow | undefined): Lea
 }
 
 /**
+ * (#244) The aspects whose `no` makes an ORDINARY rule eligible for the one automatic re-draft: the four
+ * that say the rule's own words are wrong (title, kind, condition, check). `stage_right` is not here (it is
+ * not judged for judgement rules and a re-draft would not fix it), and neither is `group_matches_codes`
+ * (only bars have a group).
+ */
+export const ORDINARY_REPAIR_ASPECTS: readonly CheckerAspect[] = ["title_faithful", "kind_right", "condition_faithful", "check_faithful"];
+
+/**
+ * (#244) Whether an ordinary rule the check LEFT OUT is eligible for its one re-draft, and what it is told.
+ * Returns every aspect the rule failed (the re-draft is told all of them, in the checker's order) when at
+ * least one FAILING verdict is a `no` on `ORDINARY_REPAIR_ASPECTS`; null otherwise: a rule that passes, a
+ * protected rule (its own path), a rule with no verdict, and a rule with only `unsure` / `na` verdicts (the
+ * check could not confirm it; a re-draft cannot add the context it lacked). Uses `aspectFails`, the one test
+ * of what counts as a failure, so it cannot disagree with the leave-out itself.
+ */
+export function ordinaryRepairAspects(rule: AssessmentCriterion, row: VerdictRow | undefined): CheckerAspect[] | null {
+  if (!row || isProtectedRule(rule)) return null;
+  const applicable = applicableAspects(rule);
+  const unjudged = unjudgedAspects(rule);
+  const wrong = ORDINARY_REPAIR_ASPECTS.some((a) => row[a] === "no" && aspectFails(rule, a, row[a], applicable, unjudged));
+  return wrong ? failedAspectsOf(rule, row) : null;
+}
+
+/**
  * (#223) EVERY aspect a rule failed, from either model's row, in the checker's
  * fixed order (the held report and the re-draft are told all of them, not just
  * the first). A missing row fails the first aspect, like `judgeRule` treats it.
@@ -354,6 +378,9 @@ export type RubricCheckOutcomeShape =
     // records on the version (`ruleRepairs`), and the record of each attempt for the run record.
     repairs?: RubricRuleRepair[];
     protectedFailures?: RubricProtectedFailure[];
+    // (#244) The automatic re-draft of ordinary rules the check found wrong: the counts and a line per
+    // eligible rule. Their replacements that passed are in `repairs` above (the same record as the bars').
+    ordinaryRepairs?: { counts: RubricOrdinaryRepairCounts; records: RubricOrdinaryRepair[] };
     requests?: { total: number; repair: number };
   }
   | {
@@ -432,6 +459,14 @@ export interface StoredRedraft {
   // Requests the re-draft used (its transient retry included).
   requests: number;
   promptVersion: string;
+  // (#244) True when the replacement quotes the same line as the original (ordinary rules only; see `redraftRule`).
+  sameLine?: boolean;
+  // (#244) The verification model's reading of an ORDINARY rule's replacement, stored the moment it is known:
+  // the six verdict letters (and the trigger verdict, when the replacement carries a usable trigger), the
+  // model that gave them and the checker prompt version. A later run reuses it WITHOUT asking again, whatever
+  // batch the replacement would now fall into (a request is a function of its batch, so batching alone could
+  // not make a replay free). Reused only for the same model and checker prompt version.
+  ordinaryCheck?: { model: string; checkerPromptVersion: string; row: string; trigger?: string };
 }
 
 /** Where the check keeps its record. A property of the deps so tests use memory. */
@@ -486,6 +521,58 @@ export interface RubricRunUsageShape {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+}
+
+/**
+ * (#244) Estimates used to decide how many ordinary re-drafts a run can still afford (see `affordableRedrafts`):
+ * characters of one re-draft request (the drafting prompt plus a bounded window plus the rule), of one check
+ * request, and the requests kept back for a split batch. Estimates, not limits: the run counts what it really sends.
+ */
+const REDRAFT_EST_CHARS = RUBRIC_SYSTEM_PROMPT.length + 2 * REPAIR_WINDOW_CHARS + 5_000;
+const CHECK_REQUEST_EST_CHARS = 20_000;
+const ORDINARY_CHECK_RESERVE_SLACK = 2;
+
+/** What the verification model's reading of one replacement amounts to (see `replacementResult`). */
+interface ReplacementCheck {
+  row: VerdictRow;
+  // Aspects the replacement still fails (empty = it passes every aspect).
+  aspectsFailed: CheckerAspect[];
+  // True when it carries a usable trigger that the trigger check did not confirm.
+  triggerFailed: boolean;
+}
+
+/** What `repairOrdinary` is given. */
+interface OrdinaryRepairInput {
+  // Eligible rules in rulebook order, each with every aspect it failed.
+  eligible: readonly { rule: AssessmentCriterion; aspects: CheckerAspect[] }[];
+  // Rules that stay served exactly as drafted (a bar through its replacement): what a replacement may duplicate.
+  servedAsDrafted: readonly AssessmentCriterion[];
+  // The verification model's verdicts on the ORIGINAL ordinary rules (the record's audit letters).
+  ordinaryVerdicts: ReadonlyMap<string, VerdictRow>;
+  questions: NonNullable<VisaRubric["intakeQuestions"]>;
+  routeName: string;
+}
+
+/** What `repairOrdinary` decides: replacements to serve, originals no longer left out, originals left out as covered, the record. */
+interface OrdinaryRepairResult {
+  repairs: RubricRuleRepair[];
+  repairedIds: string[];
+  // Covered original id -> the id of the rule served instead.
+  coveredIds: Map<string, string>;
+  records: RubricOrdinaryRepair[];
+  counts: RubricOrdinaryRepairCounts;
+}
+
+/**
+ * (#244) Whether a confirmed replacement is the SAME RULE as `other`, which is served too: the duplicate gate's own
+ * test (`possibleDuplicateFlags`: at least 80 % of the quote's words in common) and the same scope (`sameScope`).
+ * A PROTECTED `other` covers the replacement whatever the scope, because the gate would otherwise hold the whole
+ * draft over a pair that includes a bar. Pure.
+ */
+export function sameRuleAs(replacement: AssessmentCriterion, other: AssessmentCriterion): boolean {
+  if (replacement.criterionId === other.criterionId) return false;
+  if (possibleDuplicateFlags([replacement, other]).length === 0) return false;
+  return isProtectedRule(other) || sameScope(replacement, other);
 }
 
 /** Requests in flight at once (rule batches are independent of each other). */
@@ -673,6 +760,8 @@ export class RubricCheckerService {
       // (#223) Re-drafts stored by an earlier run of this version: reused, never asked for again.
       repairs: { ...(previous?.repairs ?? {}) },
       repairRequests: 0,
+      ordinaryRedraftRequests: 0,
+      ordinaryCheckRequests: 0,
       reusable,
     };
     const stop = async (reasonCodes: string[], extra: { protectedRuleIds?: string[]; protectedFailures?: RubricProtectedFailure[]; leftOut?: { criterionId: string; reason: string; basis?: LeaveOutBasis }[] } = {}): Promise<RubricCheckOutcomeShape> => {
@@ -736,15 +825,20 @@ export class RubricCheckerService {
     // (#240) Each leave-out also records WHY: `found_wrong` (a failing verdict is a `no`) or
     // `not_confirmed` (every failing verdict is unsure / na, or there is no verdict to read). A quote
     // that cannot be found in its snapshot was never confirmed by anyone: `not_confirmed`.
-    const decided = new Map<string, { reason: string; basis: LeaveOutBasis }>();
+    const decided = new Map<string, { reason: string; basis?: LeaveOutBasis }>();
     for (const r of unreadableOrdinary) decided.set(r.criterionId, { reason: "checker:source_text", basis: "not_confirmed" });
     for (const r of readableOrdinary) {
       const row = ordinaryVerdicts.get(r.criterionId);
       const action = judgeRule(r, { verification: row });
       if (action.action !== "keep") decided.set(r.criterionId, { reason: `checker:${action.aspect}`, basis: leaveOutBasis(r, row) });
     }
-    // Rulebook order, so the result is stable.
-    const leftOut = rules.filter((r) => decided.has(r.criterionId)).map((r) => ({ criterionId: r.criterionId, ...(decided.get(r.criterionId) as { reason: string; basis: LeaveOutBasis }) }));
+    // Rulebook order, so the result is stable. (#244) A leave-out has a basis unless it is a covered duplicate.
+    const leftOutOf = (map: ReadonlyMap<string, { reason: string; basis?: LeaveOutBasis }>) =>
+      rules.filter((r) => map.has(r.criterionId)).map((r) => {
+        const d = map.get(r.criterionId) as { reason: string; basis?: LeaveOutBasis };
+        return { criterionId: r.criterionId, reason: d.reason, ...(d.basis !== undefined ? { basis: d.basis } : {}) };
+      });
+    const leftOut = leftOutOf(decided);
 
     // ---- flag codes this check has fully verified ----
     // Every kept rule's title got `yes` (title always applies), so the title
@@ -758,27 +852,60 @@ export class RubricCheckerService {
       .filter((r) => !decided.has(r.criterionId) && judgeTrigger(r, { verification: ordinaryTriggerVerdicts.get(r.criterionId) }) === "drop")
       .map((r) => r.criterionId);
 
-    if (failedIds.length === 0) {
-      await this.persist(ctx, "completed", []);
-      // (no `requests` here: with no failed bar there was no repair, and the checker's own record holds the spend)
-      return { ok: true, leftOut, resolvedFlagCodes, intentPolarity, droppedTriggerIds };
+    // ---- (#223) a protected rule failed: ONE bounded repair of each, then hold unless every bar was repaired ----
+    // (#244) PROTECTED repairs run first: a draft held for a bar that could not be repaired spends nothing
+    // on the ordinary rules' re-drafts (it is held either way).
+    let protectedRepaired: { failures: RubricProtectedFailure[]; repairs: RubricRuleRepair[] } | null = null;
+    if (failedIds.length > 0) {
+      const rulesById = new Map(protectedRules.map((r) => [r.criterionId, r]));
+      const repaired = await this.repairFailed(ctx, { failedIds, aspectFailures, rulesById, questions, routeName: rubric.routeKey });
+      const unrepaired = repaired.failures.filter((f) => f.repair.status !== "repaired");
+      if (unrepaired.length > 0 || extraHoldReasons.length > 0) {
+        // Held. When a repair could not FINISH (the provider, or a cap) the reason is that retryable one, so the
+        // sweep may finish the job (the stored attempts are reused, nothing is paid for twice); otherwise each
+        // bar that is still not confirmed is named. The held report carries everything either way.
+        const reasons = repaired.infra ? [reasonOf(repaired.infra)] : unrepaired.map((f) => `protected_rule_failed:${f.criterionId}`);
+        for (const r of extraHoldReasons) if (!reasons.includes(r)) reasons.push(r);
+        return stop(reasons, { protectedRuleIds: unrepaired.map((f) => f.criterionId), protectedFailures: repaired.failures, leftOut });
+      }
+      // Every failed bar has a replacement that BOTH models confirmed and code validated: the run goes on.
+      protectedRepaired = { failures: repaired.failures, repairs: repaired.repairs };
     }
 
-    // ---- (#223) a protected rule failed: ONE bounded repair of each, then hold unless every bar was repaired ----
-    const rulesById = new Map(protectedRules.map((r) => [r.criterionId, r]));
-    const repaired = await this.repairFailed(ctx, { failedIds, aspectFailures, rulesById, questions, routeName: rubric.routeKey });
-    const unrepaired = repaired.failures.filter((f) => f.repair.status !== "repaired");
-    if (unrepaired.length === 0 && extraHoldReasons.length === 0) {
-      // Every failed bar has a replacement that BOTH models confirmed and code validated: the run goes on.
-      await this.persist(ctx, "completed", []);
-      return { ok: true, leftOut, resolvedFlagCodes, intentPolarity, droppedTriggerIds, repairs: repaired.repairs, protectedFailures: repaired.failures, requests: this.requestsOf(ctx) };
+    // ---- (#244) the ONE re-draft of each ordinary rule the check found WRONG ----
+    // Eligible: a leave-out of the check with at least one `no` on title, kind, condition or check, that code did
+    // not already leave out (a code leave-out keeps its own reason). A rule with only `unsure` verdicts is not
+    // re-drafted: a re-draft cannot add the context the check lacked.
+    const codeLeft = new Set(input.codeLeftOutIds);
+    const eligible: { rule: AssessmentCriterion; aspects: CheckerAspect[] }[] = [];
+    for (const r of readableOrdinary) {
+      if (!decided.has(r.criterionId) || codeLeft.has(r.criterionId)) continue;
+      const aspects = ordinaryRepairAspects(r, ordinaryVerdicts.get(r.criterionId));
+      if (aspects) eligible.push({ rule: r, aspects });
     }
-    // Held. When a repair could not FINISH (the provider, or a cap) the reason is that retryable one, so the
-    // sweep may finish the job (the stored attempts are reused, nothing is paid for twice); otherwise each
-    // bar that is still not confirmed is named. The held report carries everything either way.
-    const reasons = repaired.infra ? [reasonOf(repaired.infra)] : unrepaired.map((f) => `protected_rule_failed:${f.criterionId}`);
-    for (const r of extraHoldReasons) if (!reasons.includes(r)) reasons.push(r);
-    return stop(reasons, { protectedRuleIds: unrepaired.map((f) => f.criterionId), protectedFailures: repaired.failures, leftOut });
+    // The rules that stay served exactly as drafted: what a replacement is compared with for duplicates (a
+    // protected rule counts through its replacement).
+    const protectedReplacement = new Map((protectedRepaired?.repairs ?? []).map((x) => [x.criterionId, x.replacement]));
+    const eligibleIds = new Set(eligible.map((e) => e.rule.criterionId));
+    const servedAsDrafted = rules.filter((r) => !decided.has(r.criterionId) && !codeLeft.has(r.criterionId) && !eligibleIds.has(r.criterionId)).map((r) => protectedReplacement.get(r.criterionId) ?? r);
+    const ordinary = await this.repairOrdinary(ctx, { eligible, servedAsDrafted, ordinaryVerdicts, questions, routeName: rubric.routeKey });
+    // A repaired rule is no longer left out; a covered one is left out as a (not counted) duplicate.
+    for (const id of ordinary.repairedIds) decided.delete(id);
+    for (const [id] of ordinary.coveredIds) decided.set(id, { reason: REDRAFT_DUPLICATE_REASON });
+
+    await this.persist(ctx, "completed", []);
+    return {
+      ok: true,
+      leftOut: leftOutOf(decided),
+      resolvedFlagCodes,
+      intentPolarity,
+      droppedTriggerIds,
+      ...(protectedRepaired || ordinary.repairs.length > 0 ? { repairs: [...(protectedRepaired?.repairs ?? []), ...ordinary.repairs] } : {}),
+      ...(protectedRepaired ? { protectedFailures: protectedRepaired.failures } : {}),
+      ...(eligible.length > 0 ? { ordinaryRepairs: { counts: ordinary.counts, records: ordinary.records } } : {}),
+      // (no `requests` when nothing was repaired: the checker's own record holds the spend)
+      ...(protectedRepaired || ctx.repairRequests > 0 ? { requests: this.requestsOf(ctx) } : {}),
+    };
   }
 
   /** `{total, repair}` requests of this run (the request counter includes repair requests). */
@@ -948,7 +1075,7 @@ export class RubricCheckerService {
    * estimate before, the real figure after). Returns the finished attempt to
    * store, or the infrastructure failure that stopped it (nothing is stored then).
    */
-  private async redraftOnce(ctx: RunContext, rule: AssessmentCriterion, aspects: readonly CheckerAspect[], routeName: string): Promise<{ kind: "done"; stored: StoredRedraft } | { kind: "infra"; failure: JobFailure; requests: number }> {
+  private async redraftOnce(ctx: RunContext, rule: AssessmentCriterion, aspects: readonly CheckerAspect[], routeName: string, tally?: { n: number }): Promise<{ kind: "done"; stored: StoredRedraft } | { kind: "infra"; failure: JobFailure; requests: number }> {
     if (this.deps.nowMs() - ctx.startedMs > CHECKER_START_DEADLINE_MS) return { kind: "infra", failure: "unavailable_deadline", requests: 0 };
     // The request cap counts the re-draft; so does the input cap (the prompt is the drafting prompt plus a bounded window).
     const estimateChars = RUBRIC_SYSTEM_PROMPT.length + 2 * REPAIR_WINDOW_CHARS + 5_000;
@@ -973,6 +1100,7 @@ export class RubricCheckerService {
       const n = used.requests + attempts.failed + (lastFailed ? 1 : 0);
       ctx.usage.requests += n;
       ctx.repairRequests += n;
+      if (tally) tally.n += n;
       ctx.usage.inputChars += args.sent.chars;
       addUsage(ctx.usage, { inputTokens: used.inputTokens, outputTokens: used.outputTokens, cacheReadTokens: used.cacheReadTokens, cacheWriteTokens: used.cacheWriteTokens });
       return n;
@@ -986,6 +1114,8 @@ export class RubricCheckerService {
         ...(outcome.kind === "replacement" ? { replacement: outcome.criterion } : {}),
         requests,
         promptVersion: RUBRIC_REPAIR_PROMPT_VERSION,
+        // (#244) Whether the replacement quotes the original's own line (only an ordinary rule can differ).
+        ...(outcome.kind === "replacement" && outcome.sameLine !== undefined ? { sameLine: outcome.sameLine } : {}),
       },
     });
     try {
@@ -1002,6 +1132,342 @@ export class RubricCheckerService {
       }
       throw err;
     }
+  }
+
+  // ---------- (#244) the one repair of each ordinary rule the check found wrong ----------
+
+  /**
+   * Re-draft each eligible ordinary rule ONCE, check only the replacements, serve the ones that pass.
+   *
+   * The same machinery as a bar's repair (the drafting path of `redraftRule`, the stored-attempt ledger, the
+   * same `judgeRule` / `judgeTrigger` tables) with three differences, all because an ordinary rule is not a bar:
+   *   - ONE model reads the replacement (the verification model, as it read the original), not two;
+   *   - a replacement may quote the lead-in of the list its original was one item of (`redraftRule` allows it
+   *     for ordinary rules, never for bars), so replacements can COINCIDE: see "duplicates" below;
+   *   - nothing here can HOLD the draft. Whatever goes wrong (a refused re-draft, a failed re-check, a cap, the
+   *     clock, the provider) the original stays left out EXACTLY as before this step existed: never served,
+   *     still counted against the budget. A run never fails because of this step; it only keeps fewer rules.
+   *
+   * STAGES, in an order chosen so that nothing is paid for twice and the check of replacements always has room:
+   *   0. guard: eligible rules over `ordinaryRepairMaxShare` of the draft, or over `ordinaryRepairMaxRules`,
+   *      are a systemic fault, not single wrong rules: NO ordinary rule is re-drafted (`skipped: too_many`).
+   *   1. a stored attempt of this version (same rule hash, same repair prompt version) is REUSED: a stored
+   *      refusal is not asked again, a stored replacement is checked from its stored verdicts (or, when those
+   *      were never stored, checked now). A re-delivered trigger, a sweep retry and an admin re-run therefore
+   *      never re-draft a rule twice. Only a FINISHED attempt is stored; a provider that could not be reached
+   *      stores nothing, so it is not the rule's one attempt.
+   *   2. fresh re-drafts, in waves of `CHECKER_CONCURRENCY`, only as many as the request cap and the input cap
+   *      leave room for INCLUDING the check of their replacements (`affordableRedrafts`); each wave is stored
+   *      before the next starts, and no wave starts after `CHECKER_START_DEADLINE_MS`. The rest are
+   *      `notAttempted`, with `cutOff` saying why; the sweep resumes them (see the pipeline).
+   *   3. the fresh replacements are checked, in batches, by the verification model, and their triggers by the
+   *      trigger check; each result is stored on the attempt the moment it is known.
+   *   4. duplicates (below), then the verdict of each rule.
+   *
+   * DUPLICATES. Several items of one definition can all come back as the same lead-in rule, and a replacement
+   * can say what a rule that is already served says. A confirmed replacement that is the SAME RULE as another
+   * served rule is NOT served twice: "the same rule" is the duplicate gate's own test (`possibleDuplicateFlags`:
+   * quotes with at least 80 % of their words in common) AND the same scope (`sameScope`: the same applicability,
+   * trigger or condition; a rule that applies to other applicants is another rule). A PROTECTED rule covers a
+   * replacement whatever its scope (the gate would otherwise hold the draft over the pair). Candidates are
+   * taken in rulebook order, the first one is served, every later one is covered by it:
+   *   - covered by a rule served as drafted: its original is left out as `checker:redraft_duplicate`;
+   *   - covered by an earlier replacement: same, and the surviving repair records `alsoReplaced` (the question
+   *     and evidence links of the covered original are re-pointed by `applyRuleRepairs`).
+   * A covered original is NOT counted against the leave-out budget (like `possible_duplicate`: the rule that
+   * stays says the same, so no information is lost). Never silently merged: each is a line of the run record.
+   *
+   * Returns what to change in the check's decisions; mutates nothing but the context's counters and ledger.
+   */
+  private async repairOrdinary(ctx: RunContext, p: OrdinaryRepairInput): Promise<OrdinaryRepairResult> {
+    const counts: RubricOrdinaryRepairCounts = { eligible: p.eligible.length, attempted: 0, repaired: 0, failedCheck: 0, invalid: 0, mergedDuplicates: 0, checkPending: 0, notAttempted: 0, requests: { redraft: 0, check: 0 } };
+    const records = new Map<string, RubricOrdinaryRepair>();
+    if (p.eligible.length === 0) return { repairs: [], repairedIds: [], coveredIds: new Map(), records: [], counts };
+
+    const aspectsOf = new Map(p.eligible.map((e) => [e.rule.criterionId, e.aspects]));
+    const ruleOf = new Map(p.eligible.map((e) => [e.rule.criterionId, e.rule]));
+    /** One rule's line of the run record (the last write for a rule wins). */
+    const note = (id: string, status: RubricOrdinaryRepair["repair"]["status"], extra: Partial<RubricOrdinaryRepair["repair"]> = {}): void => {
+      records.set(id, this.ordinaryLine(ctx, p, id, status, extra));
+    };
+    /** The cause of a cut-off, from the job failure that stopped the work (the first one stays). */
+    const cut = (f: JobFailure): void => {
+      counts.cutOff ??= f === "capped" ? "capped" : f === "unavailable_deadline" ? "deadline" : "provider";
+    };
+    /** Rules without a finished re-draft: recorded as not attempted, with the reason. */
+    const skipRest = (ids: readonly string[], detail: string): void => {
+      for (const id of ids) note(id, "not_attempted", { detail });
+    };
+
+    // ---- 0. the systemic guard ----
+    if (p.eligible.length > ctx.rules.length * ctx.caps.ordinaryRepairMaxShare || p.eligible.length > ctx.caps.ordinaryRepairMaxRules) {
+      counts.skipped = "too_many";
+      skipRest([...ruleOf.keys()], "too_many");
+      return this.finishOrdinary(ctx, p, records, counts, [], new Map());
+    }
+
+    // ---- 1. stored attempts of this version ----
+    const replacements = new Map<string, AssessmentCriterion>();
+    const fresh: string[] = [];
+    for (const { rule } of p.eligible) {
+      const id = rule.criterionId;
+      const stored = ctx.repairs[id];
+      // A stored attempt is reused for the same rule hash under the CURRENT repair prompt version. One made
+      // under an OLDER version that gave no replacement (the guard and the prompt have changed since) gets
+      // ONE more try, stored with the current version. A stored REPLACEMENT is always reused: its check is
+      // stored with it, and a rule must not be re-drafted just because the prompt text moved on.
+      const stale = stored !== undefined && stored.promptVersion !== RUBRIC_REPAIR_PROMPT_VERSION && stored.kind !== "replacement";
+      if (!stored || stored.ruleHash !== ruleHashOf(rule) || stale) {
+        fresh.push(id);
+        continue;
+      }
+      if (stored.kind === "cannot_be_repaired") note(id, "cannot_be_repaired");
+      else if (stored.kind === "invalid") note(id, "invalid_redraft", { detail: stored.detail });
+      else replacements.set(id, stored.replacement as AssessmentCriterion);
+    }
+
+    // ---- the check of replacements an earlier run stored (free when their verdicts are stored with them) ----
+    const checked = new Map<string, ReplacementCheck>();
+    if (replacements.size > 0) {
+      const done = await this.checkReplacements(ctx, [...replacements.values()], p.questions);
+      for (const [id, c] of done.results) checked.set(id, c);
+      for (const id of done.unverifiable) note(id, "invalid_redraft", { detail: "quote_unverifiable" });
+      if (done.failure) cut(done.failure);
+    }
+
+    // ---- 2. fresh re-drafts, in waves, within what the caps and the clock leave ----
+    const allowed = Math.min(fresh.length, this.affordableRedrafts(ctx, fresh.length));
+    const queue = fresh.slice(0, allowed);
+    if (allowed < fresh.length) {
+      cut("capped");
+      skipRest(fresh.slice(allowed), "cap_exceeded");
+    }
+    const drafted = new Set<string>();
+    const tally = { n: 0 };
+    let stopped = false;
+    for (let i = 0; i < queue.length && !stopped; i += CHECKER_CONCURRENCY) {
+      if (this.deps.nowMs() - ctx.startedMs > CHECKER_START_DEADLINE_MS) {
+        cut("unavailable_deadline");
+        skipRest(queue.slice(i), "deadline");
+        break;
+      }
+      const wave = queue.slice(i, i + CHECKER_CONCURRENCY);
+      const results = await Promise.all(wave.map((id) => this.redraftOnce(ctx, ruleOf.get(id) as AssessmentCriterion, aspectsOf.get(id) ?? [], p.routeName, tally)));
+      wave.forEach((id, k) => {
+        const result = results[k];
+        if (result.kind === "infra") {
+          // Nothing is stored for a provider failure or a cap: it was not the rule's one attempt.
+          cut(result.failure);
+          stopped = true;
+          note(id, "not_attempted", { detail: result.failure });
+          return;
+        }
+        ctx.repairs[id] = result.stored;
+        drafted.add(id);
+        if (result.stored.kind === "cannot_be_repaired") note(id, "cannot_be_repaired");
+        else if (result.stored.kind === "invalid") note(id, "invalid_redraft", { detail: result.stored.detail });
+        else replacements.set(id, result.stored.replacement as AssessmentCriterion);
+      });
+      // The finished attempts are stored NOW (a crash after this line never re-drafts these rules again).
+      await this.persist(ctx, "failed", []);
+      // The rest of the queue was never started.
+      if (stopped) skipRest(queue.slice(i + CHECKER_CONCURRENCY), "provider");
+    }
+    ctx.ordinaryRedraftRequests += tally.n;
+    counts.requests.redraft = tally.n;
+
+    // ---- 3. the check of the fresh replacements ----
+    const freshReplacements = [...replacements].filter(([id]) => drafted.has(id)).map(([, r]) => r);
+    if (freshReplacements.length > 0) {
+      const done = await this.checkReplacements(ctx, freshReplacements, p.questions);
+      for (const [id, c] of done.results) checked.set(id, c);
+      for (const id of done.unverifiable) note(id, "invalid_redraft", { detail: "quote_unverifiable" });
+      if (done.failure) cut(done.failure);
+      await this.persist(ctx, "failed", []);
+    }
+
+    return this.finishOrdinary(ctx, p, records, counts, [...replacements], checked);
+  }
+
+  /** One rule's line of the ordinary-repair record (see `RubricOrdinaryRepair`). */
+  private ordinaryLine(ctx: RunContext, p: OrdinaryRepairInput, id: string, status: RubricOrdinaryRepair["repair"]["status"], extra: Partial<RubricOrdinaryRepair["repair"]> = {}): RubricOrdinaryRepair {
+    const entry = p.eligible.find((e) => e.rule.criterionId === id) as { rule: AssessmentCriterion; aspects: CheckerAspect[] };
+    const row = p.ordinaryVerdicts.get(id);
+    const sameLine = ctx.repairs[id]?.sameLine;
+    return {
+      criterionId: id,
+      ruleRef: entry.rule.ruleRef ?? null,
+      title: entry.rule.title,
+      failedAspects: [...entry.aspects],
+      verdicts: { ...(row ? { verification: encodeRow(row) } : {}) },
+      repair: { status, ruleHash: ruleHashOf(entry.rule), requests: ctx.repairs[id]?.requests ?? 0, ...(sameLine !== undefined && status !== "not_attempted" ? { sameLine } : {}), ...extra },
+    };
+  }
+
+  /**
+   * Stage 4 of `repairOrdinary`: decide each replacement from its check, apply the duplicate rule, fill in the
+   * counts. A replacement with no check result yet is `attempt_unfinished` (a stored attempt, a rule that stays
+   * left out for now).
+   */
+  private finishOrdinary(
+    ctx: RunContext,
+    p: OrdinaryRepairInput,
+    records: Map<string, RubricOrdinaryRepair>,
+    counts: RubricOrdinaryRepairCounts,
+    replacementEntries: readonly (readonly [string, AssessmentCriterion])[],
+    checked: ReadonlyMap<string, ReplacementCheck>
+  ): OrdinaryRepairResult {
+    const repairs: RubricRuleRepair[] = [];
+    const repairedIds: string[] = [];
+    const coveredIds = new Map<string, string>();
+    const put = (id: string, status: RubricOrdinaryRepair["repair"]["status"], extra: Partial<RubricOrdinaryRepair["repair"]> = {}): void => {
+      records.set(id, this.ordinaryLine(ctx, p, id, status, extra));
+    };
+    // The rules a confirmed replacement may duplicate: rules served as drafted first, then earlier replacements.
+    const served: AssessmentCriterion[] = [...p.servedAsDrafted];
+    const surviving = new Map<string, RubricRuleRepair>();
+    // Rulebook order: the first of several coinciding replacements is the one served.
+    const order = new Map(ctx.rules.map((r, i) => [r.criterionId, i]));
+    const entries = [...replacementEntries].sort((a, b) => (order.get(a[0]) ?? 0) - (order.get(b[0]) ?? 0));
+    for (const [id, replacement] of entries) {
+      // A replacement that turned protected, or that does not keep its id, is never served (defence in depth:
+      // `redraftRule` already refuses both for an ordinary original).
+      if (isProtectedRule(replacement) || replacement.criterionId !== id) {
+        put(id, "invalid_redraft", { detail: "became_protected" });
+        continue;
+      }
+      const c = checked.get(id);
+      if (!c) {
+        put(id, "attempt_unfinished", { detail: "check_unfinished" });
+        continue;
+      }
+      const replacementVerdicts = { verification: encodeRow(c.row) };
+      if (c.aspectsFailed.length > 0 || c.triggerFailed) {
+        put(id, "failed_check", { replacementFailedAspects: c.aspectsFailed, replacementVerdicts, ...(c.aspectsFailed.length === 0 ? { detail: "trigger_not_confirmed" } : {}) });
+        continue;
+      }
+      // ---- confirmed: is it the same rule as one that is already served? ----
+      const twin = served.find((other) => sameRuleAs(replacement, other));
+      if (twin) {
+        coveredIds.set(id, twin.criterionId);
+        // Covered by an earlier replacement: that one stands for this original too.
+        const keeper = surviving.get(twin.criterionId);
+        if (keeper) keeper.alsoReplaced = [...(keeper.alsoReplaced ?? []), id];
+        put(id, "merged_duplicate", { coveredBy: twin.criterionId, replacementVerdicts });
+        continue;
+      }
+      served.push(replacement);
+      const original = p.eligible.find((e) => e.rule.criterionId === id)?.rule as AssessmentCriterion;
+      const repair: RubricRuleRepair = { criterionId: id, replacement, originalRuleHash: ruleHashOf(original), runId: ctx.input.runId };
+      repairs.push(repair);
+      repairedIds.push(id);
+      surviving.set(id, repair);
+      put(id, "repaired", { replacementVerdicts });
+    }
+    // A rule the run never reached has no line yet (a wave cut short): record it, so every eligible rule has one.
+    for (const { rule } of p.eligible) if (!records.has(rule.criterionId)) records.set(rule.criterionId, this.ordinaryLine(ctx, p, rule.criterionId, "not_attempted"));
+    // ---- the counts, from the records (the one source) ----
+    const lines = [...records.values()];
+    const n = (...s: RubricOrdinaryRepair["repair"]["status"][]): number => lines.filter((l) => s.includes(l.repair.status)).length;
+    counts.repaired = n("repaired");
+    counts.failedCheck = n("failed_check");
+    counts.invalid = n("invalid_redraft", "cannot_be_repaired");
+    counts.mergedDuplicates = n("merged_duplicate");
+    counts.checkPending = n("attempt_unfinished");
+    counts.attempted = counts.repaired + counts.failedCheck + counts.invalid + counts.mergedDuplicates + counts.checkPending;
+    counts.notAttempted = counts.eligible - counts.attempted;
+    counts.requests.check = ctx.ordinaryCheckRequests;
+    // Rulebook order, like every other list of this run.
+    return { repairs, repairedIds, coveredIds, records: p.eligible.map((e) => records.get(e.rule.criterionId) as RubricOrdinaryRepair), counts };
+  }
+
+  /**
+   * How many fresh re-drafts this run can still afford: each needs one request, and the replacements they
+   * produce need their check (one batch per `CHECKER_BATCH_SIZE`, one trigger batch per
+   * `CHECKER_TRIGGER_BATCH_SIZE`, plus a little slack for a batch split), all inside the request cap; the
+   * same in prompt characters inside the input cap. Reserving the check's share up front is what keeps a run
+   * from spending its whole budget on re-drafts it then cannot check (the replacement would be stored but
+   * unused until a later run).
+   */
+  private affordableRedrafts(ctx: RunContext, wanted: number): number {
+    const capRequests = ctx.caps.checkerMaxRequestsPerRun;
+    const capChars = ctx.caps.checkerMaxInputCharsPerRun;
+    for (let n = wanted; n > 0; n--) {
+      const checkRequests = Math.ceil(n / CHECKER_BATCH_SIZE) + Math.ceil(n / CHECKER_TRIGGER_BATCH_SIZE) + ORDINARY_CHECK_RESERVE_SLACK;
+      const requestsOk = ctx.usage.requests + n + checkRequests <= capRequests;
+      const charsOk = ctx.usage.inputChars + n * REDRAFT_EST_CHARS + checkRequests * CHECK_REQUEST_EST_CHARS <= capChars;
+      if (requestsOk && charsOk) return n;
+    }
+    return 0;
+  }
+
+  /**
+   * The verification model's reading of ordinary replacements (and of their triggers), with every guard the
+   * checker's own requests have. A reading stored on the attempt (same model, same checker prompt version) is
+   * used WITHOUT a request; the rest are asked in batches of `CHECKER_BATCH_SIZE` in rulebook order, reusing
+   * any answer of this version already stored under the same request hash. Returns each replacement's result,
+   * the replacements whose quote cannot be found again (`unverifiable`), and the first failure that stopped
+   * the asking. A replacement whose answer did not arrive has no result (the caller records it unfinished).
+   */
+  private async checkReplacements(
+    ctx: RunContext,
+    replacements: readonly AssessmentCriterion[],
+    questions: NonNullable<VisaRubric["intakeQuestions"]>
+  ): Promise<{ results: Map<string, ReplacementCheck>; unverifiable: string[]; failure: JobFailure | null }> {
+    const results = new Map<string, ReplacementCheck>();
+    const unverifiable: string[] = [];
+    // ---- readings already stored on the attempt ----
+    const needed: AssessmentCriterion[] = [];
+    for (const r of replacements) {
+      const stored = ctx.repairs[r.criterionId]?.ordinaryCheck;
+      const row = stored && stored.model === ctx.models.verification && stored.checkerPromptVersion === CHECKER_PROMPT_VERSION ? decodeRow(stored.row) : null;
+      if (stored && row) {
+        const trig = stored.trigger === "yes" || stored.trigger === "no" || stored.trigger === "unsure" ? stored.trigger : undefined;
+        results.set(r.criterionId, this.replacementResult(r, row, trig, trig !== undefined));
+      } else needed.push(r);
+    }
+    if (needed.length === 0) return { results, unverifiable, failure: null };
+
+    const views = await this.at(ctx.stage, "snapshot_read", () => this.buildViews(needed, ctx.indexes, ctx.input.rubric));
+    const checkable = needed.filter((r) => views.has(r.criterionId));
+    for (const r of needed) if (!views.has(r.criterionId)) unverifiable.push(r.criterionId);
+    const triggered = checkable.filter((r) => r.trigger !== undefined && isValidTrigger(r.trigger, questions));
+    const jobs: Job[] = [...this.batchJobs("verification", checkable, views, ctx.limits), ...this.triggerJobs("verification", triggered, views, questions, ctx.limits)];
+    // An answer of an earlier run of this version under the same request hash is reused, never asked again.
+    for (const j of jobs) {
+      const hit = ctx.reusable[j.hash];
+      if (!ctx.responses[j.hash] && hit && hit.model === ctx.models[j.role] && hit.role === j.role) ctx.responses[j.hash] = hit;
+    }
+    const before = ctx.usage.requests;
+    const failure = await this.runJobs(
+      jobs.filter((j) => !ctx.responses[j.hash]),
+      ctx
+    );
+    const spent = ctx.usage.requests - before;
+    ctx.repairRequests += spent;
+    ctx.ordinaryCheckRequests += spent;
+    // Whatever answered is used, even when a later batch failed.
+    const rows = this.rowsFrom("verification", jobs, ctx.responses);
+    const trig = this.triggerVerdictsFrom("verification", jobs, ctx.responses);
+    for (const r of checkable) {
+      const row = rows.get(r.criterionId);
+      const isTriggered = triggered.includes(r);
+      const tv = trig.get(r.criterionId);
+      if (!row || (isTriggered && tv === undefined)) continue;
+      results.set(r.criterionId, this.replacementResult(r, row, tv, isTriggered));
+      // Stored on the attempt now: the next run reads it without asking.
+      const attempt = ctx.repairs[r.criterionId];
+      if (attempt) attempt.ordinaryCheck = { model: ctx.models.verification, checkerPromptVersion: CHECKER_PROMPT_VERSION, row: encodeRow(row), ...(tv !== undefined ? { trigger: tv } : {}) };
+    }
+    return { results, unverifiable, failure };
+  }
+
+  /** What the checker's table says about one replacement: the aspects it still fails, and whether its trigger was not confirmed. */
+  private replacementResult(r: AssessmentCriterion, row: VerdictRow, trigger: TriggerVerdict | undefined, triggered: boolean): ReplacementCheck {
+    const aspectsFailed = judgeRule(r, { verification: row }).action === "keep" ? [] : failedAspectsOf(r, row);
+    // A replacement with a usable trigger must have it confirmed too (`judgeTrigger`: ordinary rule, `yes` only).
+    const triggerFailed = triggered && judgeTrigger(r, { verification: trigger }) !== "keep";
+    return { row, aspectsFailed, triggerFailed };
   }
 
   // ---------- windows ----------
@@ -1296,6 +1762,9 @@ interface RunContext {
   repairs: Record<string, StoredRedraft>;
   // Model requests of this run spent on repair (re-drafts and the check of replacements).
   repairRequests: number;
+  // (#244) Of those, the ordinary rules' re-drafts and the check of their replacements (the run record shows them).
+  ordinaryRedraftRequests: number;
+  ordinaryCheckRequests: number;
   // The stored answers of an earlier run of this version that may be reused (same prompt version).
   reusable: Record<string, StoredResponse>;
 }

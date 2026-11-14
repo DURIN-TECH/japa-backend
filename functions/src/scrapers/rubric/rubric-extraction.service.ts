@@ -2028,6 +2028,19 @@ export class RubricExtractionService {
     const scoped = (c: AssessmentCriterion): boolean => c.applicability === "conditional" || c.applicability === "specialist";
     const applicabilitySwap = scoped(rule) && scoped(accepted.criterion);
     if (rule.trigger !== undefined && normApplicability(rule) !== normApplicability(accepted.criterion) && !applicabilitySwap) return { kind: "invalid", detail: "applicability_changed" };
+    // (#244) An ORDINARY rule keeps what the check did NOT fault. The independent check judged six aspects; a
+    // re-draft may change only the ones that failed, because the replacement is confirmed on the same table and
+    // an aspect nobody faulted must not drift (a rule the check read as a plain fact must not come back a
+    // judgement, nor an everyone-rule a scoped one, unless the check said that part was wrong).
+    //   kind kept        unless `kind_right` failed;
+    //   applicability kept unless `condition_faithful` failed (the conditional <-> specialist swap above is
+    //                    always allowed: it changes nothing for any applicant).
+    // A bar keeps its own, stricter rules above (same line, still a bar), so this is for ordinary rules only.
+    if (ordinaryOriginal) {
+      const failed = new Set(input.aspects);
+      if (accepted.criterion.kind !== rule.kind && !failed.has("kind_right")) return { kind: "invalid", detail: "kind_changed" };
+      if (normApplicability(rule) !== normApplicability(accepted.criterion) && !applicabilitySwap && !failed.has("condition_faithful")) return { kind: "invalid", detail: "applicability_changed" };
+    }
     const criterion: AssessmentCriterion = {
       ...accepted.criterion,
       criterionId: rule.criterionId,

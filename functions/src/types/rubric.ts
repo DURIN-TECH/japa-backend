@@ -809,6 +809,11 @@ export interface RubricRuleRepair {
   originalRuleHash: string;
   // The publish run that decided it (`{routeKey}__v{version}`).
   runId: string;
+  // (#244) Ids of OTHER originals this one replacement also stands for: several found-wrong items of one
+  // definition can all come back as the same lead-in rule, and the draft serves it ONCE (never two copies).
+  // Those originals are left out of the served rulebook (reason `checker:redraft_duplicate`); the question
+  // and evidence links that named them are re-pointed to this rule by `applyRuleRepairs`.
+  alsoReplaced?: string[];
 }
 
 /** How the one automatic repair of a failed protected rule ended. */
@@ -825,6 +830,68 @@ export type RubricRepairStatus =
   | "not_attempted"
   // The attempt could not finish (provider unavailable, or a request cap was reached).
   | "attempt_unfinished";
+
+/**
+ * (#244) How the one automatic repair of an ORDINARY rule the check found wrong ended: the protected
+ * statuses, plus `merged_duplicate` (the replacement was confirmed but says what another served rule, or
+ * another replacement, already says, so ONE rule is served and this original is left out as covered).
+ */
+export type RubricOrdinaryRepairStatus = RubricRepairStatus | "merged_duplicate";
+
+/** (#244) The run record's line for one ordinary rule that was eligible for the automatic re-draft. */
+export interface RubricOrdinaryRepair {
+  criterionId: string;
+  ruleRef: string | null;
+  title: string;
+  // Aspects the check failed on the ORIGINAL (at least one a `no` on title, kind, condition or check).
+  failedAspects: string[];
+  // The six verdict letters of the verification model on the ORIGINAL (an audit trail, never rule content).
+  verdicts: { verification?: string };
+  repair: {
+    status: RubricOrdinaryRepairStatus;
+    // A short code (never model text): `too_many`, `cap_exceeded`, `deadline`, `quote_not_found`, ...
+    detail?: string;
+    // sha256 of the original rule (with `criterionId`, the key that makes the attempt happen once).
+    ruleHash: string;
+    // Model requests this attempt's re-draft used (a replayed attempt shows what it used when it was made).
+    requests: number;
+    replacementFailedAspects?: string[];
+    replacementVerdicts?: { verification?: string };
+    // True when the replacement quotes the same line as the original; false when it quotes another
+    // (a definition item that came back as its lead-in).
+    sameLine?: boolean;
+    // `merged_duplicate`: the id of the rule that is served instead (another rule, or the first replacement).
+    coveredBy?: string;
+  };
+}
+
+/** (#244) The run record's counts of the ordinary re-draft. */
+export interface RubricOrdinaryRepairCounts {
+  // Rules left out by the check with at least one `no` on title, kind, condition or check (not code leave-outs).
+  eligible: number;
+  // Eligible rules whose ONE re-draft finished (this run's or an earlier run's):
+  // `repaired + failedCheck + invalid + mergedDuplicates + checkPending`.
+  attempted: number;
+  // Re-drafted, validated, confirmed by the check: served as the replacement.
+  repaired: number;
+  // Re-drafted and validated, but the check did not confirm the replacement.
+  failedCheck: number;
+  // The model said it cannot be repaired, code refused the re-draft, or the replacement's quote could not be found again.
+  invalid: number;
+  // Confirmed, but served as another rule (see `merged_duplicate`); not counted as left out.
+  mergedDuplicates: number;
+  // Re-drafted, but the check of the replacement could not finish (a cap, the clock or the provider): the
+  // attempt is stored, the rule stays left out for now, and a later run checks the stored replacement.
+  checkPending: number;
+  // Eligible rules with no finished re-draft: skipped by the guard, cut off by a cap or the clock, or the provider failed.
+  notAttempted: number;
+  // Requests spent: re-drafts, and the check of the replacements.
+  requests: { redraft: number; check: number };
+  // Set when the guard skipped every re-draft (`too_many`), recorded as `ordinary_repair_skipped:too_many`.
+  skipped?: "too_many";
+  // Set when a request cap, the input cap or the clock stopped the repair before every eligible rule was tried.
+  cutOff?: "capped" | "deadline" | "provider";
+}
 
 /** What the held record and the alert say about one protected rule that failed the check. */
 export interface RubricProtectedFailure {
@@ -876,6 +943,8 @@ export interface RubricPublishRun {
     // Optional: records written before #240 have neither.
     leftOutFoundWrong?: number;
     leftOutNotConfirmed?: number;
+    // (#244) The automatic re-draft of ordinary rules the check found wrong. Absent on records written before #244.
+    ordinaryRepairs?: RubricOrdinaryRepairCounts;
     // Rules that made the draft HOLD (a protected rule that failed a gate).
     held: number;
     informationalFlags: Record<string, number>;
@@ -896,8 +965,10 @@ export interface RubricPublishRun {
   // original rule stays in the draft; a repaired rule that passed is listed here too (status
   // `repaired`) and is the one recorded on the version as `ruleRepairs`.
   protectedFailures?: RubricProtectedFailure[];
+  // (#244) One line per ordinary rule that was eligible for the automatic re-draft, with how it ended.
+  ordinaryRepairs?: RubricOrdinaryRepair[];
   // (#223) Model requests the independent check made in this run, repair requests shown apart
-  // (both count against `checkerMaxRequestsPerRun`).
+  // (both count against `checkerMaxRequestsPerRun`; since #244 `repair` also holds the ordinary re-drafts).
   checkerRequests?: { total: number; repair: number };
   // Set when published: the audit entry and the version it replaced.
   auditId: string | null;
