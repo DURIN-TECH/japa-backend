@@ -52,7 +52,49 @@ export interface UpdateApplicationInput {
   mode?: "self" | "agent";
 }
 
+/**
+ * Statuses that end an application (#253). Same set the plan-limit count
+ * treats as "not active" (application.controller `countActiveApplications`).
+ * A finished or abandoned application never counts as a duplicate.
+ */
+const TERMINAL_STATUSES: ApplicationStatus[] = [
+  "approved",
+  "rejected",
+  "withdrawn",
+  "expired",
+];
+
 class ApplicationService {
+  /**
+   * Find the user's live application for this exact country + visa (#253).
+   *
+   * Query shape: three equality filters only (userId, countryCode,
+   * visaTypeId), which Firestore serves by merging single-field indexes, so
+   * no composite index is needed. Status is filtered in memory (a `not-in`
+   * on top would need one). The result set is tiny (one user, one visa).
+   *
+   * Returns the most recently updated live match, or null.
+   */
+  async findActiveDuplicate(
+    userId: string,
+    countryCode: string,
+    visaTypeId: string
+  ): Promise<Application | null> {
+    const snap = await collections.applications
+      .where("userId", "==", userId)
+      .where("countryCode", "==", countryCode)
+      .where("visaTypeId", "==", visaTypeId)
+      .get();
+    const live = snap.docs
+      .map((d) => d.data() as Application)
+      .filter((a) => !TERMINAL_STATUSES.includes(a.status));
+    if (live.length === 0) return null;
+    // Newest activity first (Timestamps; fall back to 0 if one is missing).
+    const ms = (a: Application) => a.lastUpdated?.toMillis?.() ?? 0;
+    live.sort((a, b) => ms(b) - ms(a));
+    return live[0];
+  }
+
   /**
    * Create a new application
    */

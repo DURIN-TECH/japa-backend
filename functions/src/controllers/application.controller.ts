@@ -47,7 +47,8 @@ export class ApplicationController {
   ): Promise<void> {
     try {
       const userId = req.userId!;
-      const { visaTypeId, countryCode, mode, agentId, userNotes } = req.body;
+      const { visaTypeId, countryCode, mode, agentId, userNotes, confirmNew } =
+        req.body;
 
       // Validate required fields
       if (!visaTypeId || !countryCode || !mode) {
@@ -80,6 +81,31 @@ export class ApplicationController {
           400
         );
         return;
+      }
+
+      // Duplicate guard (#253): the user already has a live application for
+      // this exact country + visa. Answer 409 with that application so the
+      // client can offer "continue it" vs "start another". Creation is never
+      // blocked outright: the client re-sends with `confirmNew: true` (strictly
+      // the boolean `true`, so a stray "false" string can't bypass) to proceed.
+      // Runs BEFORE the plan limit so the user sees the existing application
+      // rather than an upgrade wall.
+      if (confirmNew !== true) {
+        const existing = await applicationService.findActiveDuplicate(
+          userId,
+          countryCode,
+          visaTypeId
+        );
+        if (existing) {
+          res.status(409).json({
+            success: false,
+            error: "DUPLICATE_ACTIVE_APPLICATION",
+            message:
+              "You already have an active application for this visa. Continue it, or confirm to start a new one.",
+            data: { existingApplication: existing },
+          });
+          return;
+        }
       }
 
       // Enforce the per-plan active-application limit (self-serve → the client's own

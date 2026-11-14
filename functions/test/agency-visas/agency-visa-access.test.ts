@@ -552,7 +552,9 @@ describe("case start: POST /applications (applicant self-serve)", () => {
   test("a global visa can still be started by anyone (self or any agency)", async () => {
     assert.equal((await startSelf(applicantNone(), { visaTypeId: "uk-sw", countryCode: CC, mode: "self" })).status, 201);
     assert.equal(
-      (await startSelf(applicantNone(), { visaTypeId: "uk-sw", countryCode: CC, mode: "agent", agentId: "uid-agent-b" })).status,
+      // confirmNew: the first call just made an active application for this
+      // same user + visa, so the #253 duplicate guard would answer 409.
+      (await startSelf(applicantNone(), { visaTypeId: "uk-sw", countryCode: CC, mode: "agent", agentId: "uid-agent-b", confirmNew: true })).status,
       201
     );
   });
