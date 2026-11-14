@@ -178,8 +178,12 @@ export const GUIDANCE_QUOTE_CHECKS: GuidanceQuoteCheck[] = [
   {
     id: "appendix-fm-e-ecp-3-1-a-income",
     label: "E-ECP.3.1(a)",
-    // Pinned so a change to the published figure fails the check loudly.
-    passage: "(a) a specified gross annual income of at least £29,000",
+    // Pinned so a change to the published figure fails the check loudly. The
+    // E-ECP.3.1 lead-in is included because the "(a) ... £29,000" line on its
+    // own appears four times in Appendix FM (E-ECP, E-LTRP, E-ECC, E-LTRC):
+    // with it, the passage can only match the entry clearance partner rule.
+    passage:
+      "E-ECP.3.1. The applicant must provide specified evidence, from the sources listed in paragraph E-ECP.3.2., of: (a) a specified gross annual income of at least £29,000",
     sourceIds: ["gb-appendix-fm-family-members"],
   },
 

@@ -363,9 +363,10 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
   //  - Appendix Skilled Worker (the route's own rules)               -> primary
   //  - the Skilled Worker caseworker guidance, web + PDF             -> route_guidance
   //  - Appendix English Language (SW 7.2 names it)                   -> secondary
-  //  - Appendix Skilled Occupations (SW 4.2, SW 8.1: eligible codes
-  //    and going rates)                                              -> secondary
-  //  - Appendix Immigration Salary List (SW 8.1(b))                  -> secondary
+  //  - Appendix Skilled Occupations (SW 6.1(a): eligible codes; SW 4.2
+  //    and SW 8.1: the tables the options and going rates come from) -> secondary
+  //  - Appendix Immigration Salary List (SW 6.1(b); options D and I in
+  //    the SW 4.2 table, detailed in SW 11.1)                        -> secondary
   // Reused by id: gb-part-suitability (SW 2.1) and gb-appendix-finance
   // (SW 15.3, funds "as specified in Appendix Finance").
   //
@@ -487,8 +488,9 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
     verificationNote:
       "Retrieved in full on 2026-11-14 (12:07 UTC) through the shared fetch service: HTTP 200, no redirect, " +
       "199,859 characters of cleaned text, sha256 572db9d4776411c55da3f2100f42775fe14c4d8bd72ea3a473133ae215a73b5b. " +
-      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 4.2 and " +
-      "SW 8.1 of Appendix Skilled Worker take eligible occupation codes and going rates from its tables. The text runs " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 6.1(a) " +
+      "of Appendix Skilled Worker takes eligible occupation codes from its tables, and SW 4.2 and SW 8.1 take the " +
+      "going rates from them. The text runs " +
       "from the title to the last occupation listed (9269; it is not cut short); it is mostly tables. Read closely: " +
       "the title and the table headings only; the tables were retrieved, not read line by line. " +
       "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
@@ -508,8 +510,9 @@ export const GUIDANCE_SOURCE_SEEDS: GuidanceSourceSeed[] = [
     verificationNote:
       "Retrieved in full on 2026-11-14 (12:08 UTC) through the shared fetch service: HTTP 200, no redirect, " +
       "5,076 characters of cleaned text, sha256 b3f2651bf6a288e11f55c96f2130ae1f3fd9b3b260f764bec4819fd8461f55f0. " +
-      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 8.1(b) " +
-      "of Appendix Skilled Worker refers to it. The text runs from the title to the last table row (it is not cut " +
+      "The address is the one the publisher's index of the rules linked to on that day. Registered because SW 6.1(b) " +
+      "of Appendix Skilled Worker refers to it, and options D and I of the SW 4.2 points table (SW 11.1) are for a job " +
+      "on the Immigration Salary List. The text runs from the title to the last table row (it is not cut " +
       "short). Read closely: the two opening paragraphs; the table was retrieved and skimmed, not read line by line. " +
       "The cleaned text carries no published or updated date, so publishedDate is not recorded for this entry.",
     retrievedAt: "2026-11-14T12:08:16Z",
