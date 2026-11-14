@@ -294,7 +294,7 @@ export const MAX_SWEEP_ATTEMPTS = 3;
 export const SUPERSEDED_REASON = "superseded_by_newer_version";
 
 /** An empty counts block (no gate ran). */
-const emptyCounts = (): RubricPublishRun["counts"] => ({ rules: 0, kept: 0, leftOut: 0, leftOutByReason: {}, held: 0, informationalFlags: {} });
+const emptyCounts = (): RubricPublishRun["counts"] => ({ rules: 0, kept: 0, leftOut: 0, leftOutByReason: {}, leftOutFoundWrong: 0, leftOutNotConfirmed: 0, held: 0, informationalFlags: {} });
 
 // ============================================
 // Dependencies (replaceable in tests)
@@ -865,6 +865,8 @@ export class RubricAutoPublishService {
       rules: report.counts.rules,
       kept: report.counts.kept,
       leftOutByReason: report.counts.leftOutByReason,
+      leftOutFoundWrong: report.counts.leftOutFoundWrong,
+      leftOutNotConfirmed: report.counts.leftOutNotConfirmed,
       held: report.heldRuleIds.length,
       primaryLeftOut: report.primaryLeftOutIds.map(ruleOf),
       informationalFlags: report.informationalFlags,
@@ -1076,7 +1078,7 @@ export class RubricAutoPublishService {
       protectedHold: false,
       informationalFlags: {},
       flagResolutions: {},
-      counts: { rules: rubric.criteria.length, kept: rubric.criteria.length, leftOut: 0, leftOutByReason: {}, primaryRules: 0 },
+      counts: { rules: rubric.criteria.length, kept: rubric.criteria.length, leftOut: 0, leftOutByReason: {}, primaryRules: 0, leftOutFoundWrong: 0, leftOutNotConfirmed: 0 },
     };
   }
 
@@ -1099,6 +1101,8 @@ export class RubricAutoPublishService {
         kept: report.counts.kept,
         leftOut: report.counts.leftOut,
         leftOutByReason: report.counts.leftOutByReason,
+        leftOutFoundWrong: report.counts.leftOutFoundWrong,
+        leftOutNotConfirmed: report.counts.leftOutNotConfirmed,
         held: report.heldRuleIds.length,
         informationalFlags: report.informationalFlags,
       },

@@ -1138,6 +1138,10 @@ export interface RubricPublishAlertFacts {
   rules: number;
   kept: number;
   leftOutByReason: Record<string, number>;
+  // (#240) The independent check's leave-outs split by why (found wrong / not confirmed). Optional so
+  // facts built without them (older callers) read as before.
+  leftOutFoundWrong?: number;
+  leftOutNotConfirmed?: number;
   // Rules that made the draft hold.
   held: number;
   primaryLeftOut: RubricAlertRule[];
@@ -1176,6 +1180,16 @@ function countsLine(by: Record<string, number>): string {
   return parts.length > 0 ? parts.join(", ") : "none";
 }
 
+/**
+ * (#240) " Of the independent check's leave-outs, N were found wrong and M could not be confirmed."
+ * or "" when the run recorded neither (no check leave-outs, or a record from before #240).
+ */
+function checkSplitWords(facts: Pick<RubricPublishAlertFacts, "leftOutFoundWrong" | "leftOutNotConfirmed">): string {
+  const wrong = facts.leftOutFoundWrong ?? 0;
+  const unconfirmed = facts.leftOutNotConfirmed ?? 0;
+  return wrong + unconfirmed > 0 ? ` Of the independent check's leave-outs, ${wrong} were found wrong and ${unconfirmed} could not be confirmed.` : "";
+}
+
 /** Clip a string to `max` characters with an ellipsis. */
 const clipText = (v: string, max: number) => (v.length > max ? `${v.slice(0, max - 1)}\u2026` : v);
 
@@ -1189,7 +1203,7 @@ export function evaluateRubricAutoPublished(facts: RubricPublishAlertFacts, conf
   const leftOut = Object.values(facts.leftOutByReason).reduce((a, b) => a + b, 0);
   const lines: string[] = [
     `Published ${facts.routeKey} version ${facts.version}${facts.previousVersion !== null ? ` (replacing version ${facts.previousVersion})` : " (first rulebook for this route)"} with no person approving it.`,
-    `Rules: ${facts.kept} kept, ${leftOut} left out (${countsLine(facts.leftOutByReason)}), ${facts.held} held, of ${facts.rules}.`,
+    `Rules: ${facts.kept} kept, ${leftOut} left out (${countsLine(facts.leftOutByReason)}), ${facts.held} held, of ${facts.rules}.${checkSplitWords(facts)}`,
   ];
   if (facts.primaryLeftOut.length > 0) {
     lines.push(
@@ -1249,7 +1263,7 @@ export function evaluateRubricDraftHeld(facts: RubricPublishAlertFacts, config: 
   const lines: string[] = [
     `Held ${facts.routeKey} version ${facts.version}: it was NOT published${facts.previousVersion !== null ? `, version ${facts.previousVersion} keeps serving` : ", the route stays unavailable"}.`,
     `Why: ${facts.reasons.length > 0 ? facts.reasons.join("; ") : "see the run record"}.`,
-    `Rules: ${facts.kept} would be kept, ${Object.values(facts.leftOutByReason).reduce((a, b) => a + b, 0)} left out (${countsLine(facts.leftOutByReason)}), ${facts.held} held, of ${facts.rules}.`,
+    `Rules: ${facts.kept} would be kept, ${Object.values(facts.leftOutByReason).reduce((a, b) => a + b, 0)} left out (${countsLine(facts.leftOutByReason)}), ${facts.held} held, of ${facts.rules}.${checkSplitWords(facts)}`,
   ];
   if (facts.primaryLeftOut.length > 0) {
     lines.push(`Would leave out from the main official source: ${facts.primaryLeftOut.slice(0, MAX_LISTED_PRIMARY_LEAVE_OUTS).map((r) => `${r.title}${r.ruleRef ? ` [${r.ruleRef}]` : ""}`).join("; ")}.`);

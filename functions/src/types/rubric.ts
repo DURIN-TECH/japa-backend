@@ -774,12 +774,25 @@ export interface RubricPublishGateResult {
   detail?: string;
 }
 
+/**
+ * (#240) Why the independent check left an ordinary rule out:
+ *  - `found_wrong`: at least one failing verdict is a `no` (the model said the rule is wrong);
+ *  - `not_confirmed`: every failing verdict is `unsure` / `na`, or there was nothing to read (the
+ *    check could not confirm the rule, nobody said it is wrong).
+ * Both leave the rule out and both count against the leave-out budget; the split only tells the
+ * owner which kind of problem a held draft has.
+ */
+export type LeaveOutBasis = "found_wrong" | "not_confirmed";
+
 /** One rule the run left out of the served rulebook, and why (a flag code, or `checker:<aspect>`). */
 export interface RubricPublishLeftOut {
   criterionId: string;
   reason: string;
   // The extraction flag that caused it; null for a checker leave-out (part B).
   flagCode: string | null;
+  // (#240) Only on a `checker:*` leave-out: found wrong, or not confirmed. Absent on code leave-outs
+  // (they keep their own reasons) and on records written before #240.
+  basis?: LeaveOutBasis;
 }
 
 /**
@@ -858,6 +871,11 @@ export interface RubricPublishRun {
     kept: number;
     leftOut: number;
     leftOutByReason: Record<string, number>;
+    // (#240) The `checker:*` leave-outs split by why: found wrong (a `no`) vs not confirmed (only
+    // unsure / na). Code leave-outs are in neither; they keep their own reasons in `leftOutByReason`.
+    // Optional: records written before #240 have neither.
+    leftOutFoundWrong?: number;
+    leftOutNotConfirmed?: number;
     // Rules that made the draft HOLD (a protected rule that failed a gate).
     held: number;
     informationalFlags: Record<string, number>;
