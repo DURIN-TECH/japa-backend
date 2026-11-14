@@ -20,19 +20,19 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { resolveCompetence, competenceQuestions, COMPETENCE_MESSAGES } from "../../src/services/competence.service";
-import { competenceProblems, servableCompetence, storedCountryOptions } from "../../src/scrapers/rubric/rubric-competence";
-import { validateVisaRubric } from "../../src/scrapers/rubric/rubric-validate";
-import { applyExclusions } from "../../src/scrapers/rubric/rubric-exclusions";
-import { mergeRulebookStack, scopedId } from "../../src/scrapers/rubric/rubric-stack";
-import { assessChunkOutput, mergeAssessments } from "../../src/scrapers/rubric/rubric-extraction.service";
-import { RUBRIC_INTAKE_SYSTEM_PROMPT, RUBRIC_PROMPT_VERSION, RUBRIC_REPAIR_PROMPT_VERSION, buildIntakeOutputSchema, parseRubricOutput } from "../../src/scrapers/rubric/rubric-prompt";
-import { CHECKER_PROMPT_VERSION } from "../../src/scrapers/rubric/rubric-checker-prompt";
-import { SnapshotQuoteIndex } from "../../src/scrapers/rubric/rubric-quote";
-import { membersOn } from "../../src/authorities/authority-ids";
-import { DEFAULT_SEVERITY_LEVELS, type AssessmentCriterion, type CompetenceBlock, type IntakeQuestion, type VisaRubric } from "../../src/types/rubric";
-import type { GuidanceSnapshotContent } from "../../src/scrapers/guidance/types";
-import { answer, crit } from "../scrapers/rubric/rubric-harness";
+import { resolveCompetence, competenceQuestions, COMPETENCE_MESSAGES } from "../../../src/services/competence.service";
+import { competenceProblems, servableCompetence, storedCountryOptions } from "../../../src/scrapers/rubric/rubric-competence";
+import { validateVisaRubric } from "../../../src/scrapers/rubric/rubric-validate";
+import { applyExclusions } from "../../../src/scrapers/rubric/rubric-exclusions";
+import { mergeRulebookStack, scopedId } from "../../../src/scrapers/rubric/rubric-stack";
+import { assessChunkOutput, mergeAssessments } from "../../../src/scrapers/rubric/rubric-extraction.service";
+import { RUBRIC_INTAKE_SYSTEM_PROMPT, RUBRIC_PROMPT_VERSION, RUBRIC_REPAIR_PROMPT_VERSION, buildIntakeOutputSchema, parseRubricOutput } from "../../../src/scrapers/rubric/rubric-prompt";
+import { CHECKER_PROMPT_VERSION } from "../../../src/scrapers/rubric/rubric-checker-prompt";
+import { SnapshotQuoteIndex } from "../../../src/scrapers/rubric/rubric-quote";
+import { membersOn } from "../../../src/authorities/authority-ids";
+import { DEFAULT_SEVERITY_LEVELS, type AssessmentCriterion, type CompetenceBlock, type IntakeQuestion, type VisaRubric } from "../../../src/types/rubric";
+import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
+import { answer, crit } from "./rubric-harness";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
