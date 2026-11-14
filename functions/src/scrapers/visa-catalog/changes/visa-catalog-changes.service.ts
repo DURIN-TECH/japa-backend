@@ -273,6 +273,10 @@ class VisaChangeService {
       if (acknowledgedMissing) {
         (update as Record<string, unknown>).missingItemsAcknowledgedBy = reviewerUid;
         (update as Record<string, unknown>).missingItemsAcknowledgedAt = now;
+      } else if (live.missingItemsAcknowledgedBy !== undefined) {
+        // Nothing is missing in this proposal: an earlier acknowledgement must not linger.
+        (update as Record<string, unknown>).missingItemsAcknowledgedBy = FieldValue.delete();
+        (update as Record<string, unknown>).missingItemsAcknowledgedAt = FieldValue.delete();
       }
       tx.update(visaRef, update as FsUpdate);
       tx.update(rowRef, {

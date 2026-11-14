@@ -1,7 +1,7 @@
 import { collections, db } from "../../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import { VisaSource, VisaSourcePage } from "./types";
-import { EXTRACTION_PIPELINE_VERSION, visaCatalogExtractor } from "./visa-catalog-extract.service";
+import { extractionVersionFor, visaCatalogExtractor } from "./visa-catalog-extract.service";
 import { visaCatalogService } from "./visa-catalog.service";
 import type { FxFetcher } from "./visa-catalog-fx";
 // Fetching goes through the source adapter picked from `source.adapter`
@@ -660,6 +660,8 @@ class VisaCatalogCrawlService {
         // Issue #82: the priced usage of this page's LLM call, set by the
         // extractor's onUsage callback (stays undefined when no call is made).
         let callUsage: PricedUsage | undefined;
+        // Issue #212: the stamp of this page's adapter, set once the page is fetched.
+        let stamp = extractionVersionFor(undefined);
         try {
           // ---- Resolve the record id FIRST (registry-owned identity) ----
           // From the page's pinned `visaId`, else its URL path — never from
@@ -691,6 +693,7 @@ class VisaCatalogCrawlService {
             allowedHost = (h: string) => hosts.has(h.toLowerCase());
           }
           const fetched = await adapter.fetch(page, allowedHost ? { allowedHost } : undefined);
+          stamp = extractionVersionFor(fetched.sourceProvider);
           if (allowedHost) {
             // Belt and braces for adapters that ignore the policy: the
             // document's own canonical address must be on a confirmed host.
@@ -770,7 +773,7 @@ class VisaCatalogCrawlService {
           // ---- Hash gate (+ prompt-version re-extract, issue #71) ----
           // Same text as last crawl → normally skip the LLM. Exception: the
           // doc at `visaId` is a scraped visa extracted by an older
-          // EXTRACTION_PIPELINE_VERSION — re-extract it so a prompt change
+          // stamp — re-extract it so a prompt change
           // reaches it without a manual --force. A PENDING doc is refreshed in
           // place; an APPROVED one that lists documents (issue #187) only ever
           // gets a proposal, and is skipped once a proposal row of any status
@@ -782,7 +785,7 @@ class VisaCatalogCrawlService {
           if (!changed) {
             const promptStale = await visaCatalogService.needsPromptReextract(source.countryCode, visaId, {
               doc: restored.doc, // same doc, already read by markRestored (no second read)
-            }, gateHash);
+            }, gateHash, stamp);
             if (!promptStale) {
               notePage(page, "unchanged", { visaId });
               continue; // nothing new, skip the LLM
@@ -861,7 +864,7 @@ class VisaCatalogCrawlService {
           else if (outcome === "skipped") summary.skipped++;
           else if (outcome === "proposed") summary.proposed++;
           if (outcome !== "unchanged") ingested++;
-          notePage(page, outcome, { visaId, ...pageUsageFields(callUsage, EXTRACTION_PIPELINE_VERSION) });
+          notePage(page, outcome, { visaId, ...pageUsageFields(callUsage, stamp) });
         } catch (err) {
           pageErrors++;
           summary.errors++;
@@ -870,7 +873,7 @@ class VisaCatalogCrawlService {
           // Usage fields too when the failure came after a billed LLM call (#82).
           notePage(page, "error", {
             error: (err as Error)?.message ?? String(err),
-            ...pageUsageFields(callUsage, EXTRACTION_PIPELINE_VERSION),
+            ...pageUsageFields(callUsage, stamp),
           });
           // ---- 429/503: back off from the host (issue #64) ----
           // Record it for the rest of the run (and for persisting below)

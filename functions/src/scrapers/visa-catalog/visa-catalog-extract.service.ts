@@ -131,6 +131,17 @@ export const ITEM_COVERAGE_VERSION = "items-v1";
  */
 export const EXTRACTION_PIPELINE_VERSION = `${EXTRACTOR_PROMPT_VERSION}+${ITEM_COVERAGE_VERSION}`;
 
+/**
+ * The stamp for a visa extracted through source adapter `provider`. The coverage
+ * check only runs for adapters that read list structure (govuk-content-api, i.e.
+ * GB), so only those carry the `+items-v1` stamp. Every other visa keeps the plain
+ * prompt version: a coverage-code bump must not make non-GB visas re-extract (a
+ * paid call each) for a result that cannot change.
+ */
+export function extractionVersionFor(provider: string | undefined): string {
+  return provider === "govuk-content-api" ? EXTRACTION_PIPELINE_VERSION : EXTRACTOR_PROMPT_VERSION;
+}
+
 // A duration phrase: a number (digits or a word) followed by year(s)/month(s),
 // e.g. "up to 5 years", "2 years and 9 months", "five years", "12-month".
 const DURATION_RE =

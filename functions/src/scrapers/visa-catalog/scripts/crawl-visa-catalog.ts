@@ -183,7 +183,7 @@ async function main() {
   const { pickSourceAdapter, sourceMetaFromDocument } = await import(
     "../adapters"
   );
-  const { visaCatalogExtractor, EXTRACTION_PIPELINE_VERSION } = await import(
+  const { visaCatalogExtractor, extractionVersionFor } = await import(
     "../visa-catalog-extract.service"
   );
   // Issue #212: append + record the page items the extraction missed.
@@ -372,6 +372,8 @@ async function main() {
       let promptReextract = false;
       // Issue #82: priced usage of this page's LLM call (set by onUsage).
       let callUsage: PricedUsage | undefined;
+      // Issue #212: this page's adapter stamp, set once fetched (GB carries +items-v1).
+      let EXTRACTION_PIPELINE_VERSION = extractionVersionFor(undefined);
       try {
         console.log(`\n[${source.countryCode}] ${page.routeName}\n  ${page.url}`);
         // Resolve the record id BEFORE fetching/extracting (same rule as the
@@ -385,6 +387,7 @@ async function main() {
         // Fetch through the source's adapter (same choice as the orchestrator).
         const adapter = pickSourceAdapter(source.adapter, page.url);
         const fetched = await adapter.fetch(page);
+        EXTRACTION_PIPELINE_VERSION = extractionVersionFor(fetched.sourceProvider);
         totals.fetched++;
         src.fetched++;
         console.log(
@@ -659,7 +662,7 @@ function describeUsage(p: PricedUsage): string {
  */
 async function printEstimate(args: ReturnType<typeof parseArgs>): Promise<void> {
   const { collections, subcollections } = await import("../../../utils/firebase");
-  const { visaCatalogExtractor, EXTRACTION_PIPELINE_VERSION } = await import("../visa-catalog-extract.service");
+  const { visaCatalogExtractor, extractionVersionFor } = await import("../visa-catalog-extract.service");
   const { visaCatalogService } = await import("../visa-catalog.service");
   const { isPendingPromptStale } = await import("../visa-catalog-diff");
   const { scrapeCostService } = await import("../../shared/cost/scrape-cost.service");
@@ -670,7 +673,7 @@ async function printEstimate(args: ReturnType<typeof parseArgs>): Promise<void> 
     : await collections.visaSources.get();
   let queued = 0;
   let extractable = 0;
-  console.log(`\nRe-extract estimate (prompt ${EXTRACTION_PIPELINE_VERSION}${args.assumeBump ? ", assuming a version bump" : ""})`);
+  console.log(`\nRe-extract estimate (prompt ${extractionVersionFor("govuk-content-api")}${args.assumeBump ? ", assuming a version bump" : ""})`);
   for (const doc of sourcesSnap.docs) {
     const source = doc.data() as Pick<VisaSource, "countryCode" | "pages">;
     // Same page filter as a crawl: no supplement-only rows, optional --visa.
@@ -701,7 +704,7 @@ async function printEstimate(args: ReturnType<typeof parseArgs>): Promise<void> 
                 !existing.staleSince &&
                 Array.isArray(existing.requiredDocuments) &&
                 existing.requiredDocuments.length > 0))
-          : isPendingPromptStale(existing, EXTRACTION_PIPELINE_VERSION);
+          : isPendingPromptStale(existing, extractionVersionFor(source.countryCode === "GB" ? "govuk-content-api" : undefined));
       if (stale) srcQueued++;
     }
     queued += srcQueued;

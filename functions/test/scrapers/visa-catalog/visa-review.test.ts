@@ -641,9 +641,15 @@ describe("approve — missingFromExtraction acknowledgement (issue #212)", () =>
   /** A scraped visa whose scrapeMeta records `missing` (undefined = field absent). */
   function withMissing(missing: unknown[] | undefined): Record<string, unknown> {
     const v = scrapedVisa(400, freshFx()) as Record<string, unknown>;
-    return { ...v, scrapeMeta: { ...(v.scrapeMeta as object), ...(missing ? { missingFromExtraction: missing } : {}) } };
+    return {
+      ...v,
+      scrapeMeta: { ...(v.scrapeMeta as object), extractedAt: Timestamp.fromMillis(SEEN_MS), ...(missing ? { missingFromExtraction: missing } : {}) },
+    };
   }
   const one = [{ text: "a passport", leadIn: "", section: "s", appended: true }];
+  // The extraction the admin saw (echoed back as `acknowledgedExtractedAt`).
+  const SEEN_MS = 1_700_000_000_000;
+  const seenBody = { _seconds: SEEN_MS / 1000, _nanoseconds: 0 };
 
   test("non-empty and not acknowledged: 409 MISSING_ITEMS_UNACKNOWLEDGED, nothing written (service + controller)", async () => {
     seedLiveCountry();
@@ -680,7 +686,7 @@ describe("approve — missingFromExtraction acknowledgement (issue #212)", () =>
     const { res, out } = fakeRes();
     await captureErrors(() =>
       controller.reviewVisa(
-        { params: { id: "gb-m" }, body: { action: "approve", countryCode: "GB", acknowledgeMissingItems: true }, userId: "admin-1" },
+        { params: { id: "gb-m" }, body: { action: "approve", countryCode: "GB", acknowledgeMissingItems: true, acknowledgedExtractedAt: seenBody }, userId: "admin-1" },
         res
       )
     );
@@ -689,6 +695,32 @@ describe("approve — missingFromExtraction acknowledgement (issue #212)", () =>
     assert.equal(payload.reviewStatus, "approved");
     assert.equal(payload.missingItemsAcknowledgedBy, "admin-1");
     assert.ok(payload.missingItemsAcknowledgedAt instanceof FieldValue);
+  });
+
+  test("the extraction changed after the admin looked (or no timestamp sent): 409 MISSING_ITEMS_CHANGED, nothing written", async () => {
+    seedLiveCountry();
+    store.set(visaPath("gb-m"), withMissing(one));
+    for (const acknowledgedExtractedAt of [{ _seconds: SEEN_MS / 1000 - 60, _nanoseconds: 0 }, undefined]) {
+      const { res, out } = fakeRes();
+      await captureErrors(() =>
+        controller.reviewVisa(
+          { params: { id: "gb-m" }, body: { action: "approve", countryCode: "GB", acknowledgeMissingItems: true, acknowledgedExtractedAt }, userId: "admin-1" },
+          res
+        )
+      );
+      assert.equal(out.status, 409);
+      assert.equal(out.body.error, "MISSING_ITEMS_CHANGED");
+    }
+    assert.equal(updateLog.length, 0);
+  });
+
+  test("an approve with nothing missing clears an old acknowledgement", async () => {
+    seedLiveCountry();
+    store.set(visaPath("gb-old"), { ...withMissing([]), missingItemsAcknowledgedBy: "someone", missingItemsAcknowledgedAt: Timestamp.now() });
+    await visaSvc.updateVisaReviewStatus("GB", "gb-old", "approve", "admin-1");
+    const p = onlyVisaUpdate("gb-old");
+    assert.ok(p.missingItemsAcknowledgedBy instanceof FieldValue);
+    assert.ok(p.missingItemsAcknowledgedAt instanceof FieldValue);
   });
 
   test("[] and an absent field approve as today, with no acknowledgement fields", async () => {

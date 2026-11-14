@@ -26,6 +26,20 @@ export class MissingItemsUnacknowledgedError extends Error {
   }
 }
 
+/**
+ * 409 when the missing items changed after the admin looked (a crawl refreshed
+ * the pending visa between opening it and approving): the acknowledgement was for
+ * a list they did not see.
+ */
+export class MissingItemsChangedError extends Error {
+  readonly code = "MISSING_ITEMS_CHANGED";
+  readonly httpStatus = 409;
+  constructor() {
+    super("The extraction changed after you opened this visa. Reload it, check the missing items again, then approve.");
+    this.name = "MissingItemsChangedError";
+  }
+}
+
 /** How many missing items a scrapeMeta records (0 when absent or []). */
 export function missingItemCount(meta: Pick<VisaScrapeMeta, "missingFromExtraction"> | undefined): number {
   return Array.isArray(meta?.missingFromExtraction) ? meta!.missingFromExtraction!.length : 0;
@@ -39,10 +53,16 @@ export function missingItemCount(meta: Pick<VisaScrapeMeta, "missingFromExtracti
  */
 export function assertMissingItemsAcknowledged(
   meta: Pick<VisaScrapeMeta, "missingFromExtraction"> | undefined,
-  acknowledged: boolean | undefined
+  acknowledged: boolean | undefined,
+  // Visa-review path only: when the extraction the admin saw (`seenAtMs`, the
+  // `scrapeMeta.extractedAt` they were shown, null = not sent) differs from the
+  // current one (`currentAtMs`), the acknowledgement is for another list: 409
+  // MISSING_ITEMS_CHANGED. Omit both (proposal path: `expectedRevision` does this).
+  seen?: { seenAtMs: number | null; currentAtMs: number | null }
 ): boolean {
   const n = missingItemCount(meta);
   if (n === 0) return false;
   if (acknowledged !== true) throw new MissingItemsUnacknowledgedError(n);
+  if (seen && (seen.seenAtMs === null || seen.seenAtMs !== seen.currentAtMs)) throw new MissingItemsChangedError();
   return true;
 }

@@ -863,6 +863,14 @@ describe("approveChange — missingFromExtraction acknowledgement (issue #212)",
     assert.deepEqual((after.scrapeMeta as any).missingFromExtraction, missing);
   });
 
+  test("an approve with nothing missing clears an old acknowledgement", async () => {
+    const id = await proposedWithMissing([]);
+    store.set(VISA_PATH, { ...store.get(VISA_PATH)!, missingItemsAcknowledgedBy: "someone", missingItemsAcknowledgedAt: Timestamp.now() });
+    await changes.approveChange(id, "admin-1");
+    assert.equal("missingItemsAcknowledgedBy" in store.get(VISA_PATH)!, false);
+    assert.equal("missingItemsAcknowledgedAt" in store.get(VISA_PATH)!, false);
+  });
+
   test("[] and an absent field approve as today", async () => {
     for (const list of [[], undefined]) {
       resetStore();

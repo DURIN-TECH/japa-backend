@@ -11,7 +11,7 @@ import { VisaCategory, VisaType } from "../types";
 // Agency drafts can't be reviewed (issue #100).
 import { VisaIsDraftError } from "../services/visa.service";
 // Typed error from the approval guard (fee not converted to USD, issue #59).
-import { MissingItemsUnacknowledgedError, VisaFeeNotConvertibleError } from "../scrapers";
+import { MissingItemsChangedError, MissingItemsUnacknowledgedError, VisaFeeNotConvertibleError } from "../scrapers";
 // Manual USD cost (issue #70): CASL gate, body validation, typed errors.
 import { asSubject, can, forbidden } from "../middleware/authz";
 import { ManualCostError, parseManualCostInput } from "../scrapers";
@@ -509,7 +509,9 @@ export class VisaController {
         action,
         req.userId!,
         reason,
-        ackMissing === true
+        ackMissing === true,
+        // The extraction the admin saw, echoed as received (same pattern as revisionUpdatedAt).
+        parseExpectedTimestamp(req.body?.acknowledgedExtractedAt)
       );
 
       sendSuccess(res, updatedVisa, `Visa ${action === "approve" ? "approved" : "rejected"} successfully`);
@@ -532,7 +534,7 @@ export class VisaController {
         return;
       }
       // Issue #212: page items the extractor missed were not acknowledged.
-      if (error instanceof MissingItemsUnacknowledgedError) {
+      if (error instanceof MissingItemsUnacknowledgedError || error instanceof MissingItemsChangedError) {
         sendError(res, error.code, error.message, error.httpStatus);
         return;
       }

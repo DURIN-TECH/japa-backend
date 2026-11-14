@@ -930,6 +930,19 @@ describe("checklist_shrink", () => {
     assert.equal(shrinkAlerts().length, 1);
   });
 
+  test("past the read cap the rule is skipped, so live alerts are NOT auto-resolved", async () => {
+    seedRow("c1");
+    await quiet(() => svc.runHourlyCheck(NOW));
+    assert.equal(shrinkAlerts().filter((a) => a.status === "open").length, 1);
+    // Far more open rows than the cap (rows without a documents diff are cheap).
+    for (let i = 0; i < 2001; i++) {
+      store.set(`pendingVisaChanges/filler${i}`, { countryCode: "GB", visaId: `f${i}`, status: "open", revision: 1, diff: [], createdAt: Timestamp.fromMillis(NOW) });
+    }
+    const r = await quiet(() => svc.runHourlyCheck(NOW));
+    assert.ok(r.skippedRules.includes("checklist_shrink"));
+    assert.equal(shrinkAlerts().filter((a) => a.status === "open").length, 1);
+  });
+
   test("it can be disabled in the rules config", () => {
     const e = rules.evaluateChecklistShrink([], cfg({ rules: { checklist_shrink: { enabled: false } } }));
     assert.equal(rules.ruleEnabled(cfg({ rules: { checklist_shrink: { enabled: false } } }), "checklist_shrink"), false);

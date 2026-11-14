@@ -20,6 +20,7 @@ import {
   EXTRACTION_PIPELINE_VERSION,
   EXTRACTOR_PROMPT_VERSION,
   ITEM_COVERAGE_VERSION,
+  extractionVersionFor,
   normForQuote,
 } from "../../../src/scrapers/visa-catalog/visa-catalog-extract.service";
 import { isPendingPromptStale } from "../../../src/scrapers/visa-catalog/visa-catalog-diff";
@@ -241,5 +242,57 @@ describe("pipeline version stamp (re-extract without a paid eval)", () => {
       ({ source: "scraped", reviewStatus: "approved", requiredDocuments: ["x"], scrapeMeta: { extractorPromptVersion: v } }) as never;
     assert.equal(isPendingPromptStale(visa(EXTRACTOR_PROMPT_VERSION), EXTRACTION_PIPELINE_VERSION), true);
     assert.equal(isPendingPromptStale(visa(EXTRACTION_PIPELINE_VERSION), EXTRACTION_PIPELINE_VERSION), false);
+  });
+});
+
+describe("prose requirements are not appended twice (review fix)", () => {
+  const passport = {
+    text: "You must have a passport or travel document that is valid for the whole of your stay in the UK.",
+    leadIn: "",
+    section: "apply-standard-visitor-visa",
+  };
+  const ex = (doc: string, quote: string) =>
+    ({
+      requiredDocuments: [doc],
+      citations: { "requiredDocuments.0": quote },
+      requiredDocumentMeta: [{ item: doc, kind: "document", need: "required" }],
+    }) as unknown as ExtractedVisa;
+
+  test("a passport cited from the eligibility sentence: nothing missing, nothing appended", () => {
+    const e = ex(
+      "a passport or travel document",
+      "You must have a passport or travel document to enter the UK. It should be valid for the whole of your stay."
+    );
+    assert.deepEqual(findMissingItems(e, [passport]), []);
+    const out = applyItemCoverage(e, [passport]);
+    assert.deepEqual(out.requiredDocuments, e.requiredDocuments);
+    assert.deepEqual(out.missingFromExtraction, []);
+  });
+  test("a quote without the trailing full stop still matches the page sentence", () => {
+    const e = ex("a passport", passport.text.replace(/\.$/, ""));
+    assert.deepEqual(findMissingItems(e, [passport]), []);
+  });
+  test("conservative: another requirement, or no passport at all, is still missing", () => {
+    assert.equal(findMissingItems(ex("a photo", "a photo"), [passport]).length, 1);
+    const other = { ...passport, text: "You must have a job offer before you apply." };
+    assert.equal(findMissingItems(ex("a passport", "You must have a passport or travel document to enter the UK."), [other]).length, 1);
+  });
+  test("a list item is never matched by head (only prose has one)", () => {
+    const li = { text: "a passport that is valid", leadIn: "You’ll need to provide:", section: "s" };
+    assert.equal(findMissingItems(ex("a photo", "a photo"), [li]).length, 1);
+  });
+});
+
+describe("version stamp is scoped to adapters that run the coverage check (review fix)", () => {
+  test("GB (govuk-content-api) carries +items-v1; everything else keeps the plain prompt version", () => {
+    assert.equal(extractionVersionFor("govuk-content-api"), EXTRACTION_PIPELINE_VERSION);
+    assert.equal(extractionVersionFor("generic-html"), EXTRACTOR_PROMPT_VERSION);
+    assert.equal(extractionVersionFor(undefined), EXTRACTOR_PROMPT_VERSION);
+  });
+  test("a non-GB visa stamped with the plain prompt version is NOT stale; a GB one is", () => {
+    const visa = (v: string) =>
+      ({ source: "scraped", reviewStatus: "approved", requiredDocuments: ["x"], scrapeMeta: { extractorPromptVersion: v } }) as never;
+    assert.equal(isPendingPromptStale(visa(EXTRACTOR_PROMPT_VERSION), extractionVersionFor("generic-html")), false);
+    assert.equal(isPendingPromptStale(visa(EXTRACTOR_PROMPT_VERSION), extractionVersionFor("govuk-content-api")), true);
   });
 });

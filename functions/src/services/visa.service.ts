@@ -708,7 +708,10 @@ class VisaService {
     rejectionReason?: string,
     // Issue #212: approve past the page items the extractor missed
     // (`scrapeMeta.missingFromExtraction`); without it a non-empty list is a 409.
-    acknowledgeMissingItems?: boolean
+    acknowledgeMissingItems?: boolean,
+    // The `scrapeMeta.extractedAt` (millis) the admin was shown; the acknowledgement
+    // is only valid for that extraction (null = not sent).
+    seenExtractedAtMs?: number | null
   ): Promise<VisaType> {
     // Country docs are keyed by the upper-case code; use it for the visa ref
     // AND the stats recompute so both hit the same country.
@@ -736,7 +739,12 @@ class VisaService {
     // Issue #212: missing page items must be acknowledged before approval
     // (throws MissingItemsUnacknowledgedError, nothing written).
     const acknowledgedMissing =
-      action === "approve" ? assertMissingItemsAcknowledged(current.scrapeMeta, acknowledgeMissingItems) : false;
+      action === "approve"
+        ? assertMissingItemsAcknowledged(current.scrapeMeta, acknowledgeMissingItems, {
+          seenAtMs: seenExtractedAtMs ?? null,
+          currentAtMs: current.scrapeMeta?.extractedAt?.toMillis?.() ?? null,
+        })
+        : false;
 
     // ---- Review fields (both actions) ----
     const updates: Record<string, unknown> = {
@@ -753,6 +761,10 @@ class VisaService {
     if (acknowledgedMissing) {
       updates.missingItemsAcknowledgedBy = reviewedBy;
       updates.missingItemsAcknowledgedAt = serverTimestamp();
+    } else if (action === "approve" && current.missingItemsAcknowledgedBy !== undefined) {
+      // Nothing is missing now: an acknowledgement from an earlier version must not linger.
+      updates.missingItemsAcknowledgedBy = FieldValue.delete();
+      updates.missingItemsAcknowledgedAt = FieldValue.delete();
     }
 
     // Issue #68: an admin review (either action) resolves a restored-guide

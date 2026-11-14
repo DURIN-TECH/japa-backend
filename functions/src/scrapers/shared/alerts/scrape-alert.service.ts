@@ -108,6 +108,8 @@ const BACKOFF_LOOKBACK_RUNS = 20;
 const LATEST_RUN_LOOKBACK = 10;
 /** Open review-queue changes read at most (they are counted, not listed). */
 const REVIEW_QUEUE_MAX_CHANGES = 500;
+// Issue #212: most open proposal rows the shrink rule reads in one pass.
+const CHECKLIST_SHRINK_MAX_ROWS = 2000;
 /** Admin list defaults (GET /admin/scrape-alerts). */
 export const SCRAPE_ALERT_LIST_DEFAULT_LIMIT = 25;
 export const SCRAPE_ALERT_LIST_MAX_LIMIT = 100;
@@ -360,7 +362,9 @@ export class ScrapeAlertService {
       // run's own), so the alert appears now instead of at :45.
       if (run.kind === "visa") {
         await this.isolated("checklist_shrink", skippedRules, async () => {
-          evals.push(evaluateChecklistShrink(await this.checklistShrinkRows(), config));
+          const rows = await this.checklistShrinkRows();
+          if (!rows) throw new Error("too many open visa change rows to evaluate checklist_shrink safely");
+          evals.push(evaluateChecklistShrink(rows, config));
         });
       }
       return await this.finish(evals, config, nowMs, skippedRules, false, deferEmail);
@@ -469,7 +473,9 @@ export class ScrapeAlertService {
 
       // ---- Issue #212: proposals that would shrink a visa's checklist ----
       await this.isolated("checklist_shrink", skippedRules, async () => {
-        evals.push(evaluateChecklistShrink(await this.checklistShrinkRows(), config));
+        const rows = await this.checklistShrinkRows();
+        if (!rows) throw new Error("too many open visa change rows to evaluate checklist_shrink safely");
+        evals.push(evaluateChecklistShrink(rows, config));
       });
 
       const result = await this.finish(evals, config, nowMs, skippedRules, true);
@@ -1023,21 +1029,16 @@ export class ScrapeAlertService {
   }
 
   /**
-   * The review queue's ageing items:
-   *  - scraped visas pending review, per registry country (equality query,
-   *    no index); queued at max(createdAt, restoredAt) — a #68 restore puts
-   *    an old doc back in the queue, its wait starts then;
-   *  - open pendingVisaChanges created on/before the age cutoff (served by
-   *    the existing status+createdAt DESC index), capped.
-   */
-  /**
    * Issue #212: the open pendingVisaChanges rows that carry a requiredDocuments
    * diff, as plain facts for evaluateChecklistShrink. One equality query
    * (`status == "open"`), served by the single-field index like the other
-   * open-row reads; capped so a flood of rows cannot blow the check.
+   * open-row reads; never read partially: past CHECKLIST_SHRINK_MAX_ROWS it returns undefined and the rule is skipped (not cleared).
    */
-  private async checklistShrinkRows(): Promise<ChecklistShrinkRow[]> {
-    const snap = await collections.pendingVisaChanges.where("status", "==", "open").limit(500).get();
+  private async checklistShrinkRows(): Promise<ChecklistShrinkRow[] | undefined> {
+    const snap = await collections.pendingVisaChanges.where("status", "==", "open").limit(CHECKLIST_SHRINK_MAX_ROWS + 1).get();
+    // More open rows than we read: the scope ("every shrink key") would auto-resolve
+    // live alerts for rows we never saw, so skip this evaluation (the caller logs it).
+    if (snap.size > CHECKLIST_SHRINK_MAX_ROWS) return undefined;
     const rows: ChecklistShrinkRow[] = [];
     for (const d of snap.docs) {
       const row = d.data() as {
@@ -1065,6 +1066,14 @@ export class ScrapeAlertService {
     return rows;
   }
 
+  /**
+   * The review queue's ageing items:
+   *  - scraped visas pending review, per registry country (equality query,
+   *    no index); queued at max(createdAt, restoredAt) — a #68 restore puts
+   *    an old doc back in the queue, its wait starts then;
+   *  - open pendingVisaChanges created on/before the age cutoff (served by
+   *    the existing status+createdAt DESC index), capped.
+   */
   private async reviewQueueItems(nowMs: number, config: ScrapeAlertsConfig): Promise<ReviewQueueItem[]> {
     const items: ReviewQueueItem[] = [];
     const sources = await collections.visaSources.get();
