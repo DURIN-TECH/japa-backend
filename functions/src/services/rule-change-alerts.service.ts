@@ -467,13 +467,23 @@ export class RuleChangeAlertsService {
   async recordRubricApproval(auditId: string, entry: RubricReviewAuditEntry): Promise<"recorded" | "skipped" | "duplicate" | "ignored"> {
     // Only an approval that now serves a version is a change. A reject changes nothing.
     if (entry.action !== "approve" || entry.approvedVersion === null || entry.approvedVersion === undefined) return "ignored";
+    // (#233) SEAM FOR P4b. A SHARED layer's approval (a bloc / treaty rulebook:
+    // no country pair) needs one alert per affected MEMBER route, keyed by
+    // the member's layer key; that is built in P4b. Nothing is recorded for it
+    // here, so no half-formed event (no country, no visa) is ever stored.
+    if (entry.countryCode === undefined || entry.visaTypeId === undefined) {
+      console.log(`Rule-change alerts: approval ${auditId} is for the shared layer ${entry.routeKey}; member-route alerts are not built yet (P4b)`);
+      return "ignored";
+    }
+    const countryCode = entry.countryCode;
+    const visaTypeId = entry.visaTypeId;
     const version = entry.approvedVersion;
     const event = this.blankEvent({
       id: guidanceEventId(entry.routeKey, version),
       sourceKind: "guidance",
       sourceId: auditId,
-      countryCode: entry.countryCode,
-      visaTypeId: entry.visaTypeId,
+      countryCode,
+      visaTypeId,
       routeKey: entry.routeKey,
       approvedBy: entry.by,
     });

@@ -4,7 +4,8 @@
  * Reads the newest snapshot of each named guidance source, sends it to the
  * model chunk by chunk, validates every proposed criterion in code against
  * the stored text, and writes the result as a NEW `pending_review` version
- * under `visaRubrics/{countryCode}_{visaTypeId}/rubricVersions`. It never
+ * under `visaRubrics/{authorityId}_{routeSlug}/rubricVersions` (for a country:
+ * `{countryCode}_{visaTypeId}`). It never
  * approves anything: review is a separate step.
  *
  * SAFETY
@@ -22,12 +23,20 @@
  *   # one route (the sources are remembered on the route after the first run)
  *   GCLOUD_PROJECT=<project> node lib/scrapers/rubric/scripts/extract-rubric.js --country=<cc> --visa=<visaTypeId> --sources=<id>,<id>
  *   GCLOUD_PROJECT=<project> node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/extract-rubric.js --country=<cc> --visa=<visaTypeId> --apply
+ *   # (#233) a bloc or treaty's SHARED layer: the authority id and the shared route id
+ *   GCLOUD_PROJECT=<project> node lib/scrapers/rubric/scripts/extract-rubric.js --authority=<authorityId> --slug=<sharedRouteId> --sources=<id>,<id>
+ *   #   (or the whole key: --key=<authorityId>_<sharedRouteId>)
  *   # every route whose newest snapshots have no rubric version yet
  *   GCLOUD_PROJECT=<project> node lib/scrapers/rubric/scripts/extract-rubric.js --pending
  * or `npm run extract:rubric -- [flags]`.
  *
  * Flags:
- *   --country=<cc> --visa=<id>   the route
+ *   --country=<cc> --visa=<id>   the route (a country's own rulebook)
+ *   --authority=<id> --slug=<id> (#233) any authority's rulebook: for a bloc or
+ *                                treaty, the shared route id is the slug; the
+ *                                shared route must exist, be active and be
+ *                                issued by that authority
+ *   --key=<authorityId>_<slug>   (#233) the same, as one rulebook key
  *   --sources=<id>,<id>          guidance source ids (first run, or to change them)
  *   --pending                    all stale routes instead of one
  *   --apply                      extract and write (default: plan only)
@@ -55,6 +64,21 @@ async function main(): Promise<void> {
   const pending = args.includes("--pending");
   const countryCode = flag(args, "country");
   const visaTypeId = flag(args, "visa");
+  // (#233) Any authority's rulebook, by its parts or by its whole key.
+  const key = flag(args, "key");
+  let authorityId = flag(args, "authority");
+  let routeSlug = flag(args, "slug");
+  if (key) {
+    const at = key.indexOf("_");
+    if (at <= 0 || authorityId || routeSlug) {
+      console.error(`${TAG} --key is <authorityId>_<slug>, and is given instead of --authority / --slug.`);
+      process.exitCode = 1;
+      return;
+    }
+    authorityId = key.slice(0, at);
+    routeSlug = key.slice(at + 1);
+  }
+  const general = authorityId !== undefined || routeSlug !== undefined;
   const sourceIds = flag(args, "sources")?.split(",").map((s) => s.trim()).filter(Boolean);
 
   const project = process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "";
@@ -64,8 +88,13 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  if (!pending && (!countryCode || !visaTypeId)) {
-    console.error(`${TAG} give a route (--country=<cc> --visa=<visaTypeId>) or --pending.`);
+  if (general && (countryCode || visaTypeId)) {
+    console.error(`${TAG} name the rulebook by --country/--visa OR by --authority/--slug (or --key), not both.`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!pending && (general ? !authorityId || !routeSlug : !countryCode || !visaTypeId)) {
+    console.error(`${TAG} give a route (--country=<cc> --visa=<visaTypeId>, or --authority=<id> --slug=<id>, or --key=<authorityId>_<slug>) or --pending.`);
     process.exitCode = 1;
     return;
   }
@@ -80,7 +109,16 @@ async function main(): Promise<void> {
   const { rubricExtractionService } = await import("../rubric-extraction.service");
   const results = pending
     ? await rubricExtractionService.runPending({ dryRun: !apply })
-    : [await rubricExtractionService.extractRoute({ countryCode: countryCode as string, visaTypeId: visaTypeId as string, sourceIds, force, dryRun: !apply, trigger: "manual" })];
+    : [
+      await rubricExtractionService.extractRoute({
+        // (#233) Either naming pair; the service checks it (rulebookTargetOf) and refuses bad parts.
+        ...(general ? { authorityId: authorityId as string, routeSlug: routeSlug as string } : { countryCode: countryCode as string, visaTypeId: visaTypeId as string }),
+        sourceIds,
+        force,
+        dryRun: !apply,
+        trigger: "manual",
+      }),
+    ];
 
   if (results.length === 0) console.log(`${TAG} nothing to do: every route's rubric is up to date with its snapshots.`);
   // Ids, counts, hash prefixes and token totals only.

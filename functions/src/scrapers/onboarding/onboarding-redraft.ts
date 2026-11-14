@@ -59,8 +59,14 @@ import { isTerminalRun, type RunStatus } from "./onboarding-types";
 /** One deferral of the automatic re-draft, kept on the onboarding head until settled. */
 export interface DeferredRedraft {
   // The route, as the trigger would start it (the rulebook head's ids).
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) A country's rulebook keeps `countryCode` + `visaTypeId` as before; a
+  // bloc / treaty rulebook (shared layer) has `authorityId` + `routeSlug`
+  // only. Every deferral written since #233 has the general pair; one written
+  // before has the country pair (`rulebookPartsOf` reads either).
+  countryCode?: string;
+  visaTypeId?: string;
+  authorityId?: string;
+  routeSlug?: string;
   // The changed sources the trigger saw while the run was active (deduplicated, in arrival order).
   sourceIds: string[];
   // The active run the trigger deferred to (the latest one, when several runs came and went).
@@ -94,8 +100,11 @@ export type GuardedRedraftOutcome =
 /** The input of one guarded re-draft. */
 export interface GuardedRedraftInput {
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) The key parts: the general pair always, the country pair for a country (see DeferredRedraft).
+  countryCode?: string;
+  visaTypeId?: string;
+  authorityId?: string;
+  routeSlug?: string;
   // The changed source (the trigger), or null for the re-evaluation after a run ended.
   sourceId: string | null;
 }
@@ -138,14 +147,17 @@ export function hasLiveClaim(claims: Record<string, Timestamp> | undefined | nul
 /** The deferral after one more deferred change (a new record, or the previous one extended). */
 export function mergeDeferral(
   prev: DeferredRedraft | null | undefined,
-  input: { countryCode: string; visaTypeId: string; sourceId: string | null; runId: string },
+  input: { countryCode?: string; visaTypeId?: string; authorityId?: string; routeSlug?: string; sourceId: string | null; runId: string },
   now: Timestamp
 ): DeferredRedraft {
   const sourceIds = [...(prev?.sourceIds ?? [])];
   if (input.sourceId && !sourceIds.includes(input.sourceId)) sourceIds.push(input.sourceId);
   return {
-    countryCode: input.countryCode,
-    visaTypeId: input.visaTypeId,
+    // (#233) Only the parts the input has (a shared layer has no country pair).
+    ...(input.countryCode !== undefined ? { countryCode: input.countryCode } : {}),
+    ...(input.visaTypeId !== undefined ? { visaTypeId: input.visaTypeId } : {}),
+    ...(input.authorityId !== undefined ? { authorityId: input.authorityId } : {}),
+    ...(input.routeSlug !== undefined ? { routeSlug: input.routeSlug } : {}),
     sourceIds,
     runId: input.runId,
     firstAt: prev?.firstAt ?? now,

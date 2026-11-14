@@ -106,7 +106,14 @@ export type { JobView, StartJobInput, StartJobResult } from "./rubric/rubric-ext
  * is never returned by it); the `...ForReview` reads are for the admin review
  * API (#125).
  */
-export { rubricStore, rubricRouteKey } from "./rubric/rubric.store";
+export { rubricStore, rubricRouteKey, rulebookKeyOf } from "./rubric/rubric.store";
+/**
+ * (#233) Rulebook keys for ANY issuing authority (`{authorityId}_{routeSlug}`):
+ * build a checked target, read the parts of a stored document whichever shape
+ * it was written in.
+ */
+export { rulebookTargetOf, rulebookTargetOfKey, rulebookPartsOf, keyFieldsOf, targetInputOf, withKeyParts, isCountryRulebookKey, RulebookKeyError } from "./rubric/rubric-key";
+export type { RulebookTarget, RulebookTargetInput } from "./rubric/rubric-key";
 /** Structural rubric validator (the review API re-runs it before approving). */
 export { validateVisaRubric } from "./rubric/rubric-validate";
 /** Criterion exclusions (#161): the pure read-side filter, the preview and the limits. */

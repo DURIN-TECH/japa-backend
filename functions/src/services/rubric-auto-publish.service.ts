@@ -1112,6 +1112,12 @@ export class RubricAutoPublishService {
     const record: RubricPublishRun = {
       runId: report.runId,
       routeKey: rubric.routeKey,
+      // (#233) Every publish run carries the rulebook's authorityId + routeSlug
+      // (the store fills them in for a version written before #233); the
+      // country pair stays for a country's rulebook and is absent on a bloc /
+      // treaty layer. The gates are the same for both.
+      authorityId: rubric.authorityId,
+      routeSlug: rubric.routeSlug,
       countryCode: rubric.countryCode,
       visaTypeId: rubric.visaTypeId,
       version: rubric.version,

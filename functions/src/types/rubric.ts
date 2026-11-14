@@ -16,6 +16,18 @@ import type { Timestamp } from "firebase-admin/firestore";
 // Nothing in this file (or in the validator and extractor built on it) names a
 // country, a route, a publisher or a nationality.
 //
+// (#233, P4 of #228) A rulebook is owned by an ISSUING AUTHORITY: its key is
+// `{authorityId}_{routeSlug}` (see authorities/authority-ids.ts). For a
+// COUNTRY authority that is exactly today's `{countryCode}_{visaTypeId}`, so
+// every stored rulebook keeps its key and nothing moves. For a BLOC or TREATY
+// authority the key is `{issuingAuthorityId}_{sharedRouteId}` (a shared route,
+// types/shared-route.ts) and the document carries NO `countryCode` /
+// `visaTypeId`: there is no single country. Documents written since #233 carry
+// `authorityId` + `routeSlug`; documents written before only carry
+// `countryCode` + `visaTypeId`, and every read fills the two new fields in
+// from them (rubric-key.ts `rulebookPartsOf`, applied by the store), so old
+// documents read unchanged without any data move.
+//
 // Storage (all backend-only: no firestore.rules match, so client SDKs are
 // denied; see scrapers/rubric/rubric.store.ts):
 //
@@ -556,18 +568,41 @@ export interface RubricFlag {
 }
 
 /**
+ * (#233) The key fields every rulebook document carries (head, version,
+ * extraction run, publish run). `routeKey` is the document key
+ * `{authorityId}_{routeSlug}`.
+ *
+ *  - `authorityId` / `routeSlug`: written on every document since #233.
+ *    OPTIONAL in the type only because documents written before #233 do not
+ *    have them; the store fills them in on every read (`rulebookPartsOf`), and
+ *    code that needs them calls `rulebookPartsOf` rather than reading the
+ *    fields directly.
+ *  - `countryCode` / `visaTypeId`: present ONLY on a country authority's
+ *    rulebook, where they equal `authorityId` / `routeSlug` (today's shape).
+ *    A bloc or treaty rulebook has neither: code that needs a country must
+ *    not invent one.
+ */
+export interface RulebookKeyFields {
+  // `${authorityId}_${routeSlug}`: the head doc id.
+  routeKey: string;
+  authorityId?: string;
+  routeSlug?: string;
+  countryCode?: string;
+  visaTypeId?: string;
+}
+
+/**
  * One VERSION of a route's rubric:
- * `visaRubrics/{countryCode}_{visaTypeId}/rubricVersions/{version}`.
+ * `visaRubrics/{authorityId}_{routeSlug}/rubricVersions/{version}` (for a
+ * country: `{countryCode}_{visaTypeId}`, unchanged).
  *
  * Content is immutable once written. The only fields that may change after
  * creation are the REVIEW fields (RUBRIC_REVIEW_FIELDS), written by #125.
  */
-export interface VisaRubric {
+export interface VisaRubric extends RulebookKeyFields {
   schemaVersion: number;
-  // `${countryCode}_${visaTypeId}`: the head doc id.
-  routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) Key fields (`routeKey`, `authorityId`, `routeSlug`, and for a
+  // country authority `countryCode` + `visaTypeId`): see RulebookKeyFields.
   // Monotonic per route, starting at 1. Also the doc id (as a string).
   version: number;
 
@@ -959,11 +994,9 @@ export const JUDGED_BAR_NOTE = "its trigger was not confirmed by the independent
  * is deterministic, so a re-delivered trigger finds the record and does not run
  * (or publish) twice; it is written with `create()`.
  */
-export interface RubricPublishRun {
+export interface RubricPublishRun extends RulebookKeyFields {
   runId: string;
-  routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) routeKey / authorityId / routeSlug (+ countryCode / visaTypeId for a country): RulebookKeyFields.
   version: number;
   outcome: RubricPublishOutcome;
   // Machine-readable reasons for a hold / skip (empty when published).
@@ -1018,13 +1051,12 @@ export interface RubricPublishRun {
 }
 
 /**
- * `visaRubrics/{countryCode}_{visaTypeId}`: the head of one route's rubric.
+ * `visaRubrics/{authorityId}_{routeSlug}`: the head of one route's rubric (for
+ * a country: `{countryCode}_{visaTypeId}`, unchanged).
  * Consumers read the head, then the version `approvedVersion` points at.
  */
-export interface RubricHead {
-  routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+export interface RubricHead extends RulebookKeyFields {
+  // (#233) routeKey / authorityId / routeSlug (+ countryCode / visaTypeId for a country): RulebookKeyFields.
   // The guidance sources this route's rubric is extracted from. Set when the
   // route is first extracted; this is what lets a later run find "the newest
   // snapshots have no rubric version yet".
@@ -1068,11 +1100,9 @@ export interface RubricRunUsage {
 export type RubricRunStatus = "started" | "succeeded" | "unchanged" | "skipped" | "failed";
 
 /** `rubricExtractionRuns/{runId}`: the record of one run (cost + audit). */
-export interface RubricExtractionRun {
+export interface RubricExtractionRun extends RulebookKeyFields {
   runId: string;
-  routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
+  // (#233) routeKey / authorityId / routeSlug (+ countryCode / visaTypeId for a country): RulebookKeyFields.
   status: RubricRunStatus;
   // True once the run was about to make its first model call. The daily cap
   // counts exactly these runs.

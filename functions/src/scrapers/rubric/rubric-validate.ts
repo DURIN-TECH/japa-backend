@@ -13,6 +13,7 @@ import {
 
 import { isValidTrigger } from "../../services/ai/rule-applicability";
 import { EXCLUSION_NOTE_MAX, MAX_EXCLUDED_CRITERIA } from "./rubric-exclusions";
+import { rulebookPartsOf } from "./rubric-key";
 
 // ============================================
 // RUBRIC — STRUCTURAL VALIDATOR (issue #40)
@@ -187,8 +188,28 @@ export function validateVisaRubric(rubric: VisaRubric, options: ValidateRubricOp
   const err = (code: string, message: string, target = "rubric") => errors.push({ code, message, target });
 
   // ---- identity and review state ----
-  if (!filled(rubric.countryCode) || !filled(rubric.visaTypeId)) err("route_missing", "countryCode and visaTypeId are required");
-  if (rubric.routeKey !== `${rubric.countryCode}_${rubric.visaTypeId}`) err("route_key_mismatch", "routeKey must be `${countryCode}_${visaTypeId}`");
+  // (#233) The key is `{authorityId}_{routeSlug}` for ANY issuing authority
+  // (a country, a bloc or a treaty). A version names its parts either as
+  // `authorityId` + `routeSlug` (written since #233) or, as every version
+  // written before, `countryCode` + `visaTypeId`; `rulebookPartsOf` reads
+  // either and checks them against the authority id rules. Then:
+  //   - route_missing:      neither pair is there (or the parts are invalid);
+  //   - route_key_mismatch: `routeKey` is not exactly `{authorityId}_{routeSlug}`,
+  //     or a document carrying BOTH pairs has them disagree, or a bloc/treaty
+  //     rulebook carries country fields (it has no single country).
+  const hasGeneralPair = filled(rubric.authorityId) && filled(rubric.routeSlug);
+  const hasCountryPair = filled(rubric.countryCode) && filled(rubric.visaTypeId);
+  const parts = hasGeneralPair || hasCountryPair ? rulebookPartsOf({ routeKey: rubric.routeKey, authorityId: rubric.authorityId, routeSlug: rubric.routeSlug, countryCode: rubric.countryCode, visaTypeId: rubric.visaTypeId }) : null;
+  if (!parts) err("route_missing", "authorityId and routeSlug (or, for a country, countryCode and visaTypeId) are required");
+  else {
+    if (rubric.routeKey !== `${parts.authorityId}_${parts.routeSlug}`) err("route_key_mismatch", "routeKey must be `${authorityId}_${routeSlug}`");
+    if (hasGeneralPair && hasCountryPair && (rubric.countryCode !== rubric.authorityId || rubric.visaTypeId !== rubric.routeSlug)) {
+      err("route_key_mismatch", "countryCode and visaTypeId must equal authorityId and routeSlug");
+    }
+    if (parts.shape === "group" && (filled(rubric.countryCode) || filled(rubric.visaTypeId))) {
+      err("route_key_mismatch", "a bloc or treaty rulebook has no countryCode or visaTypeId");
+    }
+  }
   if (!Number.isInteger(rubric.version) || rubric.version < 1) err("version_invalid", "version must be a positive integer");
   if (!RUBRIC_REVIEW_STATUSES.includes(rubric.reviewStatus)) err("review_status_invalid", `reviewStatus must be one of ${RUBRIC_REVIEW_STATUSES.join(", ")}`);
   if (rubric.intentPolarity !== null && !INTENT_POLARITIES.includes(rubric.intentPolarity)) err("intent_polarity_invalid", "intentPolarity is not a known value");

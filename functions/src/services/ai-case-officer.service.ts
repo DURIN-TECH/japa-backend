@@ -819,6 +819,10 @@ export class AiCaseOfficerService {
         .filter((id) => byId.has(id))
         .map((id) => ({ id, label: byId.get(id) as string }));
 
+      // (#233) Statistics are per destination COUNTRY: a rubric with no country
+      // (a bloc / treaty layer read on its own) has none to show. A merged stack
+      // view always carries its own layer's country (rubric-stack.ts).
+      if (!rubric.countryCode) return undefined;
       const build = this.deps.buildCountryContext ?? buildCountryContext;
       const result = await build({
         destination: rubric.countryCode,

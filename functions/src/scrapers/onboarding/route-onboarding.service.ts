@@ -9,6 +9,7 @@ import { rubricExtractionJobService, type RubricExtractionJobService, type Start
 import { loadRubricSettings, type LoadedRubricSettings } from "../rubric/rubric-settings";
 import { loadPublishSettings, addRouteToAllowlist, type AllowlistAddResult, type LoadedPublishSettings } from "../rubric/rubric-publish-settings";
 import { rubricRouteKey } from "../rubric/rubric.store";
+import { rulebookPartsOf, targetInputOf } from "../rubric/rubric-key";
 import type { RubricHead, VisaRubric } from "../../types/rubric";
 import { appendRegistryAudit } from "../shared/registry/registry-audit";
 import {
@@ -1263,7 +1264,8 @@ export class RouteOnboardingService implements RedraftGuard {
         // DEFER. Only a trigger records it; a re-evaluation (sourceId null)
         // leaves the pending deferral as it is, for this new run's end.
         if (input.sourceId !== null) {
-          const deferredRedraft = mergeDeferral(head?.deferredRedraft, { countryCode: input.countryCode, visaTypeId: input.visaTypeId, sourceId: input.sourceId, runId: active.runId }, now);
+          // (#233) The key parts as given (the general pair; the country pair for a country only).
+          const deferredRedraft = mergeDeferral(head?.deferredRedraft, { countryCode: input.countryCode, visaTypeId: input.visaTypeId, authorityId: input.authorityId, routeSlug: input.routeSlug, sourceId: input.sourceId, runId: active.runId }, now);
           const next: RouteOnboardingHead = { ...base, redraftClaims: liveClaims(base.redraftClaims, nowMs), deferredRedraft, redraftDeferredPending: true, updatedAt: now };
           tx.set(headRef, next as unknown as Record<string, unknown>);
         }
@@ -1347,9 +1349,17 @@ export class RouteOnboardingService implements RedraftGuard {
       const head = snap.exists ? (snap.data() as RouteOnboardingHead) : null;
       const d = head?.redraftDeferredPending ? head.deferredRedraft : null;
       if (!d) return "none";
+      // (#233) The rulebook key's parts, whichever shape the deferral was
+      // stored in (a shared layer's deferral has no country pair). A deferral
+      // whose key cannot be read is left for the sweep and logged.
+      const parts = rulebookPartsOf({ routeKey, countryCode: d.countryCode, visaTypeId: d.visaTypeId, authorityId: d.authorityId, routeSlug: d.routeSlug });
+      if (!parts) {
+        console.error(`${TAG} ${routeKey}: the deferred re-draft names no readable rulebook key; kept for the sweep`);
+        return "pending";
+      }
       const out = await this.guardedRedraft(
-        { routeKey, countryCode: d.countryCode, visaTypeId: d.visaTypeId, sourceId: null },
-        () => this.d.jobs().startJob({ countryCode: d.countryCode, visaTypeId: d.visaTypeId, trigger: "guidance_changed" })
+        { routeKey, ...targetInputOf(parts), sourceId: null },
+        () => this.d.jobs().startJob({ ...targetInputOf(parts), trigger: "guidance_changed" })
       );
       if (out.kind === "deferred") return "deferred";
       console.log(`${TAG} ${routeKey}: deferred re-draft re-evaluated: ${out.result.outcome}${out.result.reasonCode ? ` (${out.result.reasonCode})` : ""}${out.settled ? "" : ", kept for the sweep"}`);

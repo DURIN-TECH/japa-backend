@@ -2,7 +2,7 @@ import { createHash } from "crypto";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { collections, db } from "../utils/firebase";
-import { applyExclusions, rubricRouteKey, rubricStore, type VisaRubric } from "../scrapers";
+import { applyExclusions, rubricStore, type VisaRubric } from "../scrapers";
 import type { Application } from "../types";
 import {
   READINESS_BANDS,
@@ -394,13 +394,27 @@ export class BulkReassessmentService {
     // Only an approval that now serves a version starts anything. A reject
     // changes nothing about what is served.
     if (entry.action !== "approve" || entry.approvedVersion === null || entry.approvedVersion === undefined) return "ignored";
+    // (#233) SEAM FOR P4b. An approval of a SHARED layer (a bloc / treaty
+    // rulebook, no country pair) is not fanned out here yet: the open
+    // applications whose `routeStack` includes the layer are found and queued
+    // by P4b (through this same bulk path, within the same spend limits and
+    // the estimate confirmation). Until then nothing is queued for it; an
+    // application on that stack still re-assesses on its own next request,
+    // and its stored assessment reports `rules_updated` (staleReasonOf
+    // compares every layer's version). A country's own layer is unchanged.
+    if (entry.countryCode === undefined || entry.visaTypeId === undefined) {
+      console.log(`[bulk-reassess] approval ${auditId} is for the shared layer ${entry.routeKey}: fan-out to member routes is not built yet (P4b), nothing queued`);
+      return "ignored";
+    }
+    const countryCode = entry.countryCode;
+    const visaTypeId = entry.visaTypeId;
 
     const now = Timestamp.fromDate(this.deps.now());
     const run: BulkReassessmentRun = {
       id: auditId,
       routeKey: entry.routeKey,
-      countryCode: entry.countryCode,
-      visaTypeId: entry.visaTypeId,
+      countryCode,
+      visaTypeId,
       rubricVersion: entry.approvedVersion,
       previousApprovedVersion: entry.previousApprovedVersion ?? null,
       approvedBy: entry.by,
@@ -892,7 +906,9 @@ export class BulkReassessmentService {
 
   /** A stored rubric version of the same route, or null when it cannot be read (cached per sweep). */
   private async rubricVersionOf(current: VisaRubric, version: number): Promise<VisaRubric | null> {
-    const routeKey = rubricRouteKey(current.countryCode, current.visaTypeId);
+    // (#233) The version's own key (any authority). For a merged stack view the
+    // key is the own layer's; `changeSummaryOf` does not diff a stack (see there).
+    const routeKey = current.routeKey;
     const key = `${routeKey}#${version}`;
     if (this.rubricVersionCache.has(key)) return this.rubricVersionCache.get(key) ?? null;
     let found: VisaRubric | null = null;

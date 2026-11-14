@@ -67,7 +67,9 @@ import { TranslationError, buildTranslationRequest, parseTranslationOutput, toQu
 import { listNotReadableFlag, readLeadInList, unreadableListReason, verifyListItems } from "./rubric-list-items";
 import { spansSiblingMarkers } from "./rubric-marker-chain";
 import { loadRubricSettings, type LoadedRubricSettings, type RubricExtractionSettings } from "./rubric-settings";
-import { rubricRouteKey, rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
+import { rubricStore, type RubricDraft, type RubricStore } from "./rubric.store";
+import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, targetInputOf, type RulebookTarget, type RulebookTargetInput } from "./rubric-key";
+import type { SharedRoute } from "../../types/shared-route";
 import type { RubricHead } from "../../types/rubric";
 import type { StartJobInput, StartJobResult } from "./rubric-extraction-job";
 // (#225) The guard that defers the automatic re-draft to an active onboarding run (pure module: no cycle).
@@ -131,10 +133,15 @@ const MAX_STORED_DISCARDS = 200;
 // Public shapes
 // ============================================
 
-/** What to extract. */
-export interface ExtractRouteInput {
-  countryCode: string;
-  visaTypeId: string;
+/**
+ * What to extract.
+ *
+ * (#233) The rulebook is named EITHER by `authorityId` + `routeSlug` (any
+ * issuing authority: a country, or a bloc / treaty whose route slug is a
+ * shared route id) OR, as before, by `countryCode` + `visaTypeId` (a country's
+ * own rulebook). `rulebookTargetOf` checks the pair and builds the key.
+ */
+export interface ExtractRouteInput extends RulebookTargetInput {
   // Guidance sources to extract from. Required the first time a route is
   // extracted; afterwards the head remembers them (pass again to change them).
   sourceIds?: string[];
@@ -185,6 +192,10 @@ export interface RubricExtractionDeps {
   visaTypeExists?: (countryCode: string, visaTypeId: string) => Promise<boolean>;
   // The route's display name (default: the visa type document's `name`).
   visaTypeName?: (countryCode: string, visaTypeId: string) => Promise<string>;
+  // (#233) A bloc / treaty rulebook's route: the ACTIVE shared route
+  // `sharedRoutes/{routeSlug}` issued by `authorityId`, or null (default: a
+  // Firestore read). A rubric is only ever attached to a real route.
+  sharedRoute?: (authorityId: string, routeSlug: string) => Promise<Pick<SharedRoute, "id" | "name" | "issuingAuthorityId" | "status"> | null>;
   now?: () => Timestamp;
   // (#216) Starts a route's drafting job (default: the job service, resolved at call time).
   startJob?: (input: StartJobInput) => Promise<StartJobResult>;
@@ -1359,10 +1370,9 @@ export type AssembledDraft =
   | { ok: true; draft: RubricDraft; merged: MergedRubricContent; discardedByReason: Record<string, number> };
 
 /** What `assembleDraft` needs besides the parts. */
-export interface AssembleInput {
+export interface AssembleInput extends RulebookTargetInput {
+  // (#233) The key, and its parts as `authorityId` + `routeSlug` or (country) `countryCode` + `visaTypeId`.
   routeKey: string;
-  countryCode: string;
-  visaTypeId: string;
   sources: readonly LoadedSource[];
   sourceSetHash: string;
   model: string;
@@ -1393,9 +1403,11 @@ export function assembleDraft(input: AssembleInput, parts: readonly { chunk: Pic
   const keptQuoteTranslations = keptTranslations(translations, merged.criteria);
   const draft: RubricDraft = {
     schemaVersion: RUBRIC_SCHEMA_VERSION,
+    // (#233) routeKey + authorityId + routeSlug, and countryCode + visaTypeId
+    // for a country only (a bloc / treaty rulebook has no country). The
+    // routeKey is the one the caller computed; the store re-checks it.
+    ...keyFieldsOf(rulebookTargetOf(input)),
     routeKey: input.routeKey,
-    countryCode: input.countryCode,
-    visaTypeId: input.visaTypeId,
     // Governance: always pending, never decided, by construction.
     reviewStatus: "pending_review",
     intentPolarity: null,
@@ -1515,6 +1527,30 @@ export class RubricExtractionService {
   }
 
   /**
+   * (#233) The ACTIVE shared route a bloc / treaty rulebook belongs to, or
+   * null. The route must be issued by the rulebook's own authority: a key
+   * `{authorityId}_{routeSlug}` whose shared route belongs to another
+   * authority names no real route.
+   */
+  private async sharedRouteOf(authorityId: string, routeSlug: string): Promise<Pick<SharedRoute, "id" | "name" | "issuingAuthorityId" | "status"> | null> {
+    const route = this.deps.sharedRoute
+      ? await this.deps.sharedRoute(authorityId, routeSlug)
+      : await collections.sharedRoutes.doc(routeSlug).get().then((snap) => (snap.exists ? (snap.data() as SharedRoute) : null));
+    if (!route || route.status !== "active" || route.issuingAuthorityId !== authorityId) return null;
+    return route;
+  }
+
+  /**
+   * (#233) Does the rulebook's route exist? A country's rulebook needs its
+   * visa record (unchanged); a bloc / treaty rulebook needs its active shared
+   * route, issued by that authority.
+   */
+  private async routeExists(target: RulebookTarget): Promise<boolean> {
+    if (target.shape === "country") return this.visaTypeExists(target.authorityId, target.routeSlug);
+    return (await this.sharedRouteOf(target.authorityId, target.routeSlug)) !== null;
+  }
+
+  /**
    * Read a source's registry entry and the metadata of its newest snapshot.
    * No document text is read here (that waits until after the hash gate).
    */
@@ -1549,6 +1585,22 @@ export class RubricExtractionService {
    * sent to the model so it knows which category it is extracting for. Falls
    * back to the visa type id (data either way, never code).
    */
+  /**
+   * (#233) The display name of ANY rulebook's route: the visa record's name
+   * for a country (exactly `routeName`), the shared route's name for a bloc
+   * or treaty. Falls back to the route slug.
+   */
+  async routeNameOf(input: RulebookTargetInput): Promise<string> {
+    const target = rulebookTargetOf(input);
+    if (target.shape === "country") return this.routeName(target.authorityId, target.routeSlug);
+    try {
+      const route = await this.sharedRouteOf(target.authorityId, target.routeSlug);
+      return typeof route?.name === "string" && route.name.trim() ? route.name.trim() : target.routeSlug;
+    } catch {
+      return target.routeSlug;
+    }
+  }
+
   async routeName(countryCode: string, visaTypeId: string): Promise<string> {
     if (this.deps.visaTypeName) return this.deps.visaTypeName(countryCode, visaTypeId);
     try {
@@ -1565,7 +1617,9 @@ export class RubricExtractionService {
    */
   async extractRoute(input: ExtractRouteInput): Promise<ExtractRouteResult> {
     const startedAt = this.now();
-    const routeKey = rubricRouteKey(input.countryCode, input.visaTypeId);
+    // (#233) Any authority's rulebook; throws for invalid parts, as rubricRouteKey did.
+    const target = rulebookTargetOf(input);
+    const routeKey = target.routeKey;
     const trigger = input.trigger ?? "manual";
     const model = this.provider.modelFor("judgement");
     const usage = emptyRunUsage();
@@ -1584,9 +1638,8 @@ export class RubricExtractionService {
       r: Pick<ExtractRouteResult, "reasonCode" | "error" | "version" | "criteriaAccepted" | "specialistKept" | "discardedCount" | "discardedByReason" | "costUsd">
     ): RubricExtractionRun => ({
       runId,
-      routeKey,
-      countryCode: input.countryCode,
-      visaTypeId: input.visaTypeId,
+      // (#233) routeKey + authorityId + routeSlug (+ the country pair for a country).
+      ...keyFieldsOf(target),
       status,
       reachedModel,
       reasonCode: r.reasonCode,
@@ -1668,7 +1721,7 @@ export class RubricExtractionService {
       }
 
       // ---- 4. plan: read the snapshot text, cut it, check the caps ----
-      const routeName = await this.routeName(input.countryCode, input.visaTypeId);
+      const routeName = await this.routeNameOf(target);
       const ctx = await this.buildRunContext(sources, settings, routeName);
       plan = ctx.plan;
       chunkCount = ctx.chunks.length;
@@ -1731,7 +1784,7 @@ export class RubricExtractionService {
       }
 
       // ---- 7 + 8. merge, build the draft, validate its structure ----
-      const assembled = assembleDraft({ routeKey, countryCode: input.countryCode, visaTypeId: input.visaTypeId, sources, sourceSetHash: sourceSetHash as string, model, runId, severityLevels: ctx.severityLevels, chunkCount, midSentence: ctx.midSentence, createdAt: this.now() }, parts, translations);
+      const assembled = assembleDraft({ routeKey, authorityId: target.authorityId, routeSlug: target.routeSlug, sources, sourceSetHash: sourceSetHash as string, model, runId, severityLevels: ctx.severityLevels, chunkCount, midSentence: ctx.midSentence, createdAt: this.now() }, parts, translations);
       if (!assembled.ok) {
         return await finish("failed", { reasonCode: assembled.reasonCode, error: assembled.error, discardedCount: assembled.discardedCount, discardedByReason: assembled.discardedByReason }, true);
       }
@@ -1762,12 +1815,15 @@ export class RubricExtractionService {
    * Throws `RunStop` for an expected problem. The hash gate itself is left to
    * the caller (it differs: the job also compares against running jobs).
    */
-  async resolveRoute(input: Pick<ExtractRouteInput, "countryCode" | "visaTypeId" | "sourceIds">, head: RubricHead | null): Promise<{ sourceIds: string[]; sources: LoadedSource[]; sourceSetHash: string }> {
+  async resolveRoute(input: RulebookTargetInput & Pick<ExtractRouteInput, "sourceIds">, head: RubricHead | null): Promise<{ sourceIds: string[]; sources: LoadedSource[]; sourceSetHash: string }> {
+    const target = rulebookTargetOf(input);
     const sourceIds = [...new Set(input.sourceIds && input.sourceIds.length > 0 ? input.sourceIds : head?.sourceIds ?? [])].sort();
     if (sourceIds.length === 0) throw new RunStop("failed", "no_sources", "no guidance sources given, and the route has none recorded");
-    // A rubric is only ever attached to a real visa type.
-    if (!(await this.visaTypeExists(input.countryCode, input.visaTypeId))) {
-      throw new RunStop("failed", "visa_type_not_found", `no visa type ${input.visaTypeId} under ${input.countryCode}`);
+    // A rubric is only ever attached to a real route: a country's visa type
+    // (unchanged), or (#233) a bloc / treaty's active shared route.
+    if (!(await this.routeExists(target))) {
+      if (target.shape === "country") throw new RunStop("failed", "visa_type_not_found", `no visa type ${target.routeSlug} under ${target.authorityId}`);
+      throw new RunStop("failed", "shared_route_not_found", `no active shared route ${target.routeSlug} issued by ${target.authorityId}`);
     }
     const sources: LoadedSource[] = [];
     for (const id of sourceIds) sources.push(await this.loadSource(id));
@@ -2143,8 +2199,8 @@ export class RubricExtractionService {
    * The routes whose newest snapshots have NO rubric version derived from
    * them. Reads registry docs only (no document text, no model).
    */
-  async findStaleRoutes(): Promise<{ routeKey: string; countryCode: string; visaTypeId: string }[]> {
-    const stale: { routeKey: string; countryCode: string; visaTypeId: string }[] = [];
+  async findStaleRoutes(): Promise<(RulebookTargetInput & { routeKey: string })[]> {
+    const stale: (RulebookTargetInput & { routeKey: string })[] = [];
     for (const head of await this.store.listHeads()) {
       const pairs: { sourceId: string; contentHash: string }[] = [];
       for (const sourceId of head.sourceIds ?? []) {
@@ -2154,7 +2210,10 @@ export class RubricExtractionService {
       }
       // A source that vanished or has no snapshot also makes the set differ.
       if (pairs.length !== (head.sourceIds ?? []).length || sourceSetHashOf(pairs) !== head.latestSourceSetHash) {
-        stale.push({ routeKey: head.routeKey, countryCode: head.countryCode, visaTypeId: head.visaTypeId });
+        // (#233) Any authority's head: named by its key parts (a country head
+        // also keeps its country pair). A head whose key cannot be read is skipped.
+        const parts = rulebookPartsOf(head);
+        if (parts) stale.push({ routeKey: head.routeKey, ...targetInputOf(parts) });
       }
     }
     return stale;
@@ -2167,7 +2226,9 @@ export class RubricExtractionService {
   async runPending(opts: { dryRun?: boolean } = {}): Promise<ExtractRouteResult[]> {
     const results: ExtractRouteResult[] = [];
     for (const route of await this.findStaleRoutes()) {
-      results.push(await this.extractRoute({ countryCode: route.countryCode, visaTypeId: route.visaTypeId, trigger: "pending_sweep", dryRun: opts.dryRun }));
+      const { routeKey: _key, ...naming } = route;
+      void _key;
+      results.push(await this.extractRoute({ ...naming, trigger: "pending_sweep", dryRun: opts.dryRun }));
     }
     return results;
   }
@@ -2198,7 +2259,10 @@ export class RubricExtractionService {
     }
     for (const head of heads) {
       if (!(head.sourceIds ?? []).includes(event.sourceId)) continue;
-      const input: StartJobInput = { countryCode: head.countryCode, visaTypeId: head.visaTypeId, trigger: "guidance_changed" };
+      // (#233) Any authority's rulebook: started by its key parts.
+      const parts = rulebookPartsOf(head);
+      if (!parts) continue;
+      const input: StartJobInput = { ...targetInputOf(parts), trigger: "guidance_changed" };
       // (#225) Every start goes through the onboarding guard: while a route
       // onboarding run is active for this route, nothing is started (the run
       // drafts after an admin confirms its estimate) and the deferral is
@@ -2206,7 +2270,7 @@ export class RubricExtractionService {
       // With no active run the start is exactly the one above.
       try {
         const guard = await this.redraftGuard();
-        const out = await guard.guardedRedraft({ routeKey: head.routeKey, countryCode: head.countryCode, visaTypeId: head.visaTypeId, sourceId: event.sourceId }, () => this.startJob(input));
+        const out = await guard.guardedRedraft({ routeKey: head.routeKey, ...targetInputOf(parts), sourceId: event.sourceId }, () => this.startJob(input));
         results.push(out.kind === "deferred" ? deferredResult(head.routeKey, out.runId, out.status) : out.result);
       } catch (err) {
         // The guard could not be read: FAIL CLOSED (money). Nothing is started;
