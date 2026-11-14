@@ -198,8 +198,9 @@ A professional profile linked to a User. May belong to an Agency or operate inde
 | totalReviews       | number                 | Denormalized count                                   |
 | totalApplications  | number                 | Denormalized count                                   |
 | successRate        | number                 | Percentage                                           |
-| consultationFee    | number                 | Whole naira (#148)                                   |
-| serviceFees        | Record<string, number> | visaTypeId → fee                                     |
+| consultationFeeUsd | Money                  | `{ amountMinor, currency: "USD" }`, US cents (#179); new agents start at 0 |
+| migratedFrom       | map?                   | #179 audit: `{ consultationFee: PriceMigrationRecord }` |
+| serviceFees        | Record<string, number>? | Deprecated, never used or written (#103)            |
 | isAvailable        | boolean                |                                                      |
 | availableSlots     | AvailabilitySlot[]?    | Embedded: dayOfWeek, startTime, endTime              |
 
@@ -235,8 +236,9 @@ A company that employs multiple agents. Owns applications through its agents.
 | address, state          | string?         |                                 |
 | description             | string?         |                                 |
 | logoUrl                 | string?         |                                 |
-| consultationFee         | number?         | Agency-level default (naira)    |
-| services                | AgencyService[] | Embedded: id, name, price       |
+| consultationFeeUsd      | Money?          | Agency-level default, US cents (#179); absent = no fee |
+| services                | AgencyService[] | Embedded: id, name, priceUsd (Money, US cents) |
+| migratedFrom            | map?            | #179 audit: `{ consultationFee?, services?: { [serviceId]: PriceMigrationRecord } }` |
 | totalAgents             | number          | Denormalized                    |
 | totalCases, activeCases | number          | Denormalized                    |
 
@@ -489,6 +491,22 @@ Effective rate: active override, else provider rate within `freshnessHours`, els
 **Charge snapshot.** Bookings, payment requests and transactions that are charged in local currency store (type `ChargeSnapshot`, names fixed): `priceUsdCents`, `chargedCurrency`, `chargedAmountMinor`, `fxRate` (margin not included), `fxRateAsOf`, `fxRateSource`, `fxMarginBps`. The existing visa-fee FX (`appConfig/fx`, Frankfurter/ECB) is a separate flow and is unchanged.
 
 Public view: `GET /rates` (no auth, cacheable) returns only currency, exponent, availability, rate and asOf.
+
+#### Agent and agency prices in US dollars (#179)
+
+Every price an agent or agency owner sets is stored as a `Money` in US cents, never a bare number:
+
+| Where | Field | Was (naira) |
+| ----- | ----- | ----------- |
+| `agents/{id}` | `consultationFeeUsd` | `consultationFee` (+ #148 `consultationFeeUnit` marker) |
+| `agencies/{id}` | `consultationFeeUsd` | `consultationFee` |
+| `agencies/{id}.services[]` | `priceUsd` | `price` |
+| `agencies/{id}/visaPrices/{cc}__{visaTypeId}` | `priceUsd` | `price` |
+
+- **Writes** go through the API only (`PUT /agents/me`, `POST /agents`, `POST /agencies`, `PUT /agencies/me`, `PUT /agency/visa-prices/:cc/:visaTypeId`). The body sends dollars, `{ "amount": "12.50", "currency": "USD" }` (currency optional; anything other than USD is a 400). Rules (`parseUsdPriceInput`, `functions/src/money/usd-price.ts`): finite, not negative, whole cents (at most 2 decimals, never rounded), at most **$100,000.00** (`MAX_PRICE_USD_CENTS` = 10,000,000 cents), no other keys. The old naira keys (`consultationFee`, `services[].price`, visa `price`) are refused with a 400. Writing a dollar price removes the old naira field from the doc. `firestore.rules` lets no client write any money field (agents: `consultationFeeUsd`, `consultationFee`, `consultationFeeUnit`, `serviceFees`, `migratedFrom`; agencies: `consultationFeeUsd`, `consultationFee`, `services`, `migratedFrom`; `visaPrices` is backend-only).
+- **Reads** (`GET /agents`, `/agents/top`, `/agents/:id`, `/agents/visa/:id`, `/agencies/browse*`, `/agencies/public/:slug`) return each price as the stored dollar `Money` plus its local figure, `{ amountMinor, currency, rate, asOf, available }` (type `LocalPriceQuote`), next to it: `consultationFeeUsd` + `consultationFeeLocal`, services `priceUsd` + `priceLocal`, visa prices `priceUsd` + `priceLocal`. One rate lookup per request; the currency is the signed-in viewer's profile currency, else the default (NGN). If the rate is missing or stale the read still succeeds: `available: false` with null amount, rate and asOf. A doc without a valid dollar price shows `null` (never an old naira number). `migratedFrom` is never returned publicly.
+- **Charging** from the dollar price is #180 (bookings) and #181 (payment requests). Until #180 lands, a guest booking with an agency whose fee is above zero answers `503 PRICING_UNAVAILABLE` and creates nothing.
+- **Migration** (`npm run migrate:prices-usd -- --project <id> --rate <naira per USD> --cutoff <#148 deploy ISO time> [--apply]`, `functions/src/scripts/migrate-prices-to-usd.ts`) replaces the #148 naira migration (do not run both). The rate is required (no built-in number); the script prints `exchangeRates/NGN` for reference. Half-up rounding to a whole cent. Each converted value records `migratedFrom.<old field>` = `PriceMigrationRecord` `{ amount (whole naira), currency: "NGN", rate, storedValue, storedUnit: "naira"|"kobo", migratedAt }`. Values that are not whole naira (or kobo of whole naira), would round to $0.00, or docs that hold both a naira and a dollar price are listed and left alone. Historical `consultations.fee` rows stay naira.
 
 ---
 

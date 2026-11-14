@@ -5,8 +5,13 @@ agency charges to handle the application. It is separate from the visa's
 **government fee** (`VisaType.baseCostUsd`, in USD). Setting a price never
 reads into or writes the visa doc.
 
-**Unit: whole NAIRA.** ₦12,500 is sent, stored and returned as `12500`.
-There is no kobo or cents conversion anywhere. Never multiply or divide by 100.
+**Unit: US dollars (issue #179).** The price is sent as
+`{ "priceUsd": { "amount": "125.00", "currency": "USD" } }` and stored and
+returned as a `Money` in cents, `{ "amountMinor": 12500, "currency": "USD" }`.
+The dollar -> cents step is `parseUsdPriceInput` (`src/money/usd-price.ts`,
+factors from the currency table). Public reads add the local figure
+`priceLocal` (see below). The old whole-naira `price` was converted by
+`scripts/migrate-prices-to-usd.ts`; sending `price` is a 400.
 
 Code: `agency-visa-price.validation.ts` (pure body and path rules),
 `agency-visa-price.service.ts` (storage and the "which visas" rule),
@@ -24,7 +29,8 @@ in `src/types/index.ts`):
   "id": "GB__uk-skilled-worker",
   "agencyId": "…",
   "visaTypeId": "uk-skilled-worker", "countryCode": "GB",
-  "price": 12500,                 // whole naira, integer, 0..100000000
+  "priceUsd": { "amountMinor": 12500, "currency": "USD" }, // $125.00; 0..10000000 cents
+  "migratedFrom": { "price": { "amount": 187500, "currency": "NGN", "rate": 1500, "…": "…" } }, // only if migrated
   "updatedBy": "uid",
   "createdAt": Timestamp, "updatedAt": Timestamp
 }
@@ -54,8 +60,8 @@ it:
 - `UpdateAgentInput` no longer has the field.
 - `PUT /agents/me` drops `serviceFees` from the body.
 
-Old docs still carry an empty `{}`, which is harmless and never read. Nothing
-reads a cents value as naira.
+Old docs still carry an empty `{}`, which is harmless and never read. Since
+#179 no client may write it directly either (`firestore.rules`).
 
 ## Which visas an agency can price
 
@@ -108,10 +114,10 @@ Agency A cannot address agency B's prices.
 | Method and path | Success | Errors |
 | --- | --- | --- |
 | `GET /agency/visa-prices` | 200 `AgencyVisaPriceView[]` | 403 |
-| `GET /agency/visa-prices?include=global` | 200, the same list plus every public visa not yet priced (`price: null`), for the portal picker | 403 |
-| `PUT /agency/visa-prices/:countryCode/:visaTypeId` with body `{ "price": 12500 }` | 200 `AgencyVisaPriceView` | 400, 403, 404 |
-| `PUT …` with body `{ "price": null }` | 200 `{ countryCode, visaTypeId, price: null }` (clears the price) | 400, 403 |
-| `DELETE /agency/visa-prices/:countryCode/:visaTypeId` | 200 `{ countryCode, visaTypeId, price: null }`. Idempotent: if no price is set, nothing is written | 400, 403 |
+| `GET /agency/visa-prices?include=global` | 200, the same list plus every public visa not yet priced (`priceUsd: null`), for the portal picker | 403 |
+| `PUT /agency/visa-prices/:countryCode/:visaTypeId` with body `{ "priceUsd": { "amount": "125.00", "currency": "USD" } }` | 200 `AgencyVisaPriceView` | 400, 403, 404 |
+| `PUT …` with body `{ "priceUsd": null }` | 200 `{ countryCode, visaTypeId, priceUsd: null }` (clears the price) | 400, 403 |
+| `DELETE /agency/visa-prices/:countryCode/:visaTypeId` | 200 `{ countryCode, visaTypeId, priceUsd: null }`. Idempotent: if no price is set, nothing is written | 400, 403 |
 
 **List order:**
 
@@ -124,13 +130,16 @@ twice.
 
 **Validation (400, `field` names the offending key):**
 
-- **The body** must be exactly `{ price }`. Any other key gets
-  `UNKNOWN_FIELD`. A missing `price` or a non-object body gets
+- **The body** must be exactly `{ priceUsd }`. Any other key (the old naira
+  `price` included) gets `UNKNOWN_FIELD`. A missing `priceUsd` or a
+  non-object body gets `VALIDATION_ERROR`.
+- **`priceUsd`** must be `{ amount, currency? }` or `null`. `amount` is a
+  decimal string or JSON number of US dollars: finite, not negative, at most
+  2 decimals (whole cents, never rounded), at most $100,000.00
+  (`MAX_VISA_SERVICE_PRICE_USD_CENTS` = `MAX_PRICE_USD_CENTS`). `currency`, if
+  sent, must be `USD`. A bare number, other keys (`amountMinor`, `rate`),
+  NaN, Infinity, sub-cent amounts, negatives and values above the cap get
   `VALIDATION_ERROR`.
-- **`price`** must be a JSON number that is an integer, with
-  `0 <= price <= 100000000` (`MAX_VISA_SERVICE_PRICE_NAIRA`), or `null`.
-  Strings (even `"12500"`), booleans, NaN, Infinity, fractions, negative
-  numbers and values above the cap get `VALIDATION_ERROR`.
 - **`:countryCode`** must be 2 letters; it is upper-cased.
 - **`:visaTypeId`** must be non-empty, at most 200 characters, with no `/`,
   and must not be `.` or `..`.
@@ -145,7 +154,7 @@ twice.
   "visibility": "global",       // "global" | "agency"; missing on the doc = "global"
   "isOwnVisa": false,           // true when THIS agency created the visa
   "baseCostUsd": 719,           // GOVERNMENT fee, USD, read-only here; null when unset
-  "price": 12500,               // THIS agency's service price, whole naira; null = unset
+  "priceUsd": { "amountMinor": 12500, "currency": "USD" }, // THIS agency's price; null = unset
   "priceUpdatedAt": Timestamp   // null when unset; { _seconds, _nanoseconds } over JSON
 }
 ```
@@ -161,7 +170,8 @@ priced. It does not include the whole global catalog.
   {
     // ---- #103 ----
     "visaTypeId": "own-1", "countryCode": "GB", "visaName": "…", "category": "work",
-    "price": null,                       // whole NAIRA; null = "Contact for pricing"
+    "priceUsd": null,                    // US dollars (Money); null = "Contact for pricing"
+    "priceLocal": null,                  // local figure { amountMinor, currency, rate, asOf, available }; null when no price
     // ---- #102: applicant-safe visa detail (same entries, not a second list) ----
     "isAgencyVisa": true,                // this agency's OWN visa (agency-only or made global)
     "visibility": "agency",              // "agency" = only reachable through this agency; else "global"
@@ -174,7 +184,9 @@ priced. It does not include the whole global catalog.
     "sponsor": { "organisationName": "Acme Ltd", "website": "https://…" }  // or null
   },
   { "visaTypeId": "uk-student", "countryCode": "GB", "visaName": "…", "category": "student",
-    "price": 12500, "isAgencyVisa": false, "visibility": "global", "…": "…" }
+    "priceUsd": { "amountMinor": 12500, "currency": "USD" },
+    "priceLocal": { "amountMinor": 18750000, "currency": "NGN", "rate": 1500, "asOf": "…", "available": true },
+    "isAgencyVisa": false, "visibility": "global", "…": "…" }
 ]
 ```
 
@@ -186,8 +198,12 @@ visas never appear. The sponsor licence number and contact, `createdBy`, the
 review fields, `ownerAgencyId` and `agentIds` are never exposed. The page
 still 404s for an unknown slug or an agency that is not `approved`.
 
-- **Units and empty values.** `price` is in whole naira. `null` means the page
-  shows "Contact for pricing".
+- **Units and empty values.** `priceUsd` is US dollars; `priceLocal` is the
+  same price in the viewer's currency at the current rate (signed-in viewer's
+  profile currency, else NGN). When the rate is missing or stale,
+  `priceLocal.available` is `false` with null amount / rate / asOf, and the
+  page still loads with the dollar price. `null` means the page shows
+  "Contact for pricing".
 - **Only this agency.** Only this agency's prices are listed, and no owner or
   review fields are exposed.
 - **No priced visas.** An agency with no priced visas gets `[]`.
@@ -220,8 +236,11 @@ Three read-only routes for the mobile Explorer's agency screens. No
   "id": "agency-a", "name": "Acme Visas", "slug": "acme",   // slug null until backfilled
   "ownerName": "Ada Owner", "state": "Lagos", "address": "…", // optional fields omitted when unset
   "description": "…", "logoUrl": "https://…",
-  "consultationFee": 15000,                                  // whole NAIRA, as stored
-  "services": [{ "id": "svc-1", "name": "CV review", "price": 25000 }], // whole NAIRA
+  // Issue #179: US dollars as stored + the local figure; both null when unset.
+  "consultationFeeUsd": { "amountMinor": 10000, "currency": "USD" },
+  "consultationFeeLocal": { "amountMinor": 15000000, "currency": "NGN", "rate": 1500, "asOf": "…", "available": true },
+  "services": [{ "id": "svc-1", "name": "CV review",
+    "priceUsd": { "amountMinor": 2500, "currency": "USD" }, "priceLocal": { "…": "…" } }],
   "agentCount": 3, "totalCases": 12,
   "status": "approved",
   "verified": false,       // compliance badge only; approved + unverified agencies are still listed
@@ -230,7 +249,8 @@ Three read-only routes for the mobile Explorer's agency screens. No
 ```
 
 Never present: `ownerId`, `compliance`, `reviewedBy`, `reviewedAt`,
-`rejectionReason`, `activeCases`, bank / BVN / NIN data.
+`rejectionReason`, `activeCases`, bank / BVN / NIN data, `migratedFrom`, and
+any old naira `consultationFee` / service `price`.
 
 `visaPrices[]` on `/browse/:id` is built by the same
 `agencyVisaPriceService.listPublic(agency.id)` call as the slug page, so each

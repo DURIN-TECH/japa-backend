@@ -70,7 +70,7 @@ const ALLOWED_INPUT_KEYS = new Set(["amount", "currency"]);
  */
 export function parseUsdPriceInput(value: unknown, field: string): Money {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new PriceInputError(field, 'send an object like { "amount": "12.50", "currency": "USD" }');
+    throw new PriceInputError(field, "send an object like { \"amount\": \"12.50\", \"currency\": \"USD\" }");
   }
   const record = value as Record<string, unknown>;
 
