@@ -12,6 +12,7 @@ import {
 } from "./visa-catalog-changes.service";
 import { VisaFeeNotConvertibleError } from "../visa-catalog-fx";
 import { ManualCostError } from "../visa-manual-cost";
+import { MissingItemsUnacknowledgedError } from "../missing-items-gate";
 import { parseProposalManualCostInput } from "./visa-change-manual-cost";
 
 // ============================================
@@ -68,6 +69,11 @@ class VisaChangeController {
     }
     if (error instanceof VisaFeeNotConvertibleError) {
       sendError(res, error.code, error.message, 409);
+      return;
+    }
+    // Issue #212: 409 MISSING_ITEMS_UNACKNOWLEDGED.
+    if (error instanceof MissingItemsUnacknowledgedError) {
+      sendError(res, error.code, error.message, error.httpStatus);
       return;
     }
     console.error(`Error ${what}:`, error);
@@ -161,8 +167,15 @@ class VisaChangeController {
       sendError(res, "VALIDATION_ERROR", "expectedRevision must be a positive integer", 400);
       return;
     }
+    // Issue #212: `acknowledgeMissingItems: true` approves past the page items the
+    // extraction missed; only a boolean is accepted.
+    const ack = req.body?.acknowledgeMissingItems;
+    if (ack !== undefined && typeof ack !== "boolean") {
+      sendError(res, "VALIDATION_ERROR", "acknowledgeMissingItems must be true or false", 400);
+      return;
+    }
     try {
-      const visa = await visaChangeService.approveChange(id, req.userId!, expectedRevision);
+      const visa = await visaChangeService.approveChange(id, req.userId!, expectedRevision, ack === true);
       sendSuccess(res, visa, "Visa change approved");
     } catch (error) {
       this.sendServiceError(res, error, "approving visa change");

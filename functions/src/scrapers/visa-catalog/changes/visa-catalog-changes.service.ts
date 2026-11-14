@@ -13,6 +13,7 @@ import {
   planProposalFeeReconvert,
   planProposalWrite,
 } from "../visa-catalog-diff";
+import { assertMissingItemsAcknowledged } from "../missing-items-gate";
 import { ProposalManualCostInput, planProposalManualCost } from "./visa-change-manual-cost";
 // Canonical country-stats recompute. One-way import: visa.service.ts must
 // never import this module or the catalog service (no circular import).
@@ -223,7 +224,13 @@ class VisaChangeService {
    * @param expectedRevision optional: the revision the admin reviewed
    * @returns the updated visa doc
    */
-  async approveChange(id: string, reviewerUid: string, expectedRevision?: number): Promise<VisaType> {
+  async approveChange(
+    id: string,
+    reviewerUid: string,
+    expectedRevision?: number,
+    // Issue #212: approve past the page items the proposal's extraction missed.
+    acknowledgeMissingItems?: boolean
+  ): Promise<VisaType> {
     if (!isValidDocId(id)) throw changeNotFound();
     const rowRef = collections.pendingVisaChanges.doc(id);
 
@@ -255,9 +262,18 @@ class VisaChangeService {
       const eligibility = eligibilityRemovalReason(live, change);
       if (eligibility) throw new VisaChangeError("ELIGIBILITY_REMOVED", eligibility, 409);
 
+      // ---- Issue #212: the proposal's missing page items must be acknowledged ----
+      // (throws MissingItemsUnacknowledgedError, nothing written, row stays open)
+      const acknowledgedMissing = assertMissingItemsAcknowledged(change.proposedScrapeMeta, acknowledgeMissingItems);
+
       // ---- Writes ----
       const now = Timestamp.now();
       const { update, appliedFields } = buildApprovalUpdate(change, reviewerUid, now, Array.isArray(live.requiredDocuments) ? live.requiredDocuments : []);
+      // Who acknowledged the missing items, and when (only when there were any).
+      if (acknowledgedMissing) {
+        (update as Record<string, unknown>).missingItemsAcknowledgedBy = reviewerUid;
+        (update as Record<string, unknown>).missingItemsAcknowledgedAt = now;
+      }
       tx.update(visaRef, update as FsUpdate);
       tx.update(rowRef, {
         status: "approved",

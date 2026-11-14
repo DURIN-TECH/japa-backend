@@ -503,6 +503,11 @@ export interface VisaType {
   // scrape), so a re-withdrawal before review can put it back to approved.
   // Cleared by an admin review (approve or reject) and by that re-withdrawal.
   restoredAt?: Timestamp;
+  // Issue #212: set when an admin approved this scraped visa (or a re-crawl
+  // proposal for it) while `scrapeMeta.missingFromExtraction` listed items the
+  // extractor missed: who acknowledged them and when.
+  missingItemsAcknowledgedBy?: string;
+  missingItemsAcknowledgedAt?: Timestamp;
 
   // Stats
   successRate?: number;

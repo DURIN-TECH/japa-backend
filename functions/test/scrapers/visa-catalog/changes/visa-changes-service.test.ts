@@ -822,3 +822,52 @@ describe("requiredDocuments diff — shrink guard (issue #212)", () => {
     }
   });
 });
+
+// ============================================
+// Issue #212: approving a proposal with missing items needs the acknowledgement
+// ============================================
+
+describe("approveChange — missingFromExtraction acknowledgement (issue #212)", () => {
+  const missing = [{ text: "a passport", leadIn: "", section: "s", appended: true }];
+  /** Propose a change whose scrapeMeta records `missingFromExtraction`. */
+  async function proposedWithMissing(list: unknown[] | undefined): Promise<string> {
+    await seedLive();
+    await ingest(extraction({ processingDaysMax: 30, ...(list ? { missingFromExtraction: list as any } : {}) }), "h2");
+    return onlyRow()[0];
+  }
+
+  test("non-empty and not acknowledged: 409 MISSING_ITEMS_UNACKNOWLEDGED, nothing written, row stays open", async () => {
+    const id = await proposedWithMissing(missing);
+    const mark = writes.length;
+    await assert.rejects(changes.approveChange(id, "admin-1"), { code: "MISSING_ITEMS_UNACKNOWLEDGED", httpStatus: 409 });
+    assert.equal(visaWritesSince(mark).length, 0);
+    assert.equal(store.get(`pendingVisaChanges/${id}`)!.status, "open");
+    // Through the controller.
+    const out = await call("approve", req(ROLES.ADMIN, { params: { id } }));
+    assert.equal(out.status, 409);
+    assert.equal(out.body.error, "MISSING_ITEMS_UNACKNOWLEDGED");
+    // A non-boolean flag is a 400.
+    const bad = await call("approve", req(ROLES.ADMIN, { params: { id }, body: { acknowledgeMissingItems: 1 } }));
+    assert.equal(bad.status, 400);
+  });
+
+  test("acknowledged: approves, stores who and when on the visa", async () => {
+    const id = await proposedWithMissing(missing);
+    const out = await call("approve", req(ROLES.ADMIN, { params: { id }, body: { acknowledgeMissingItems: true } }));
+    assert.equal(out.status, 200);
+    const after = store.get(VISA_PATH)!;
+    assert.equal(typeof after.missingItemsAcknowledgedBy, "string");
+    assert.ok((after.missingItemsAcknowledgedBy as string).length > 0);
+    assert.ok(after.missingItemsAcknowledgedAt instanceof Timestamp);
+    assert.deepEqual((after.scrapeMeta as any).missingFromExtraction, missing);
+  });
+
+  test("[] and an absent field approve as today", async () => {
+    for (const list of [[], undefined]) {
+      resetStore();
+      const id = await proposedWithMissing(list as any);
+      await changes.approveChange(id, "admin-1");
+      assert.equal("missingItemsAcknowledgedBy" in store.get(VISA_PATH)!, false);
+    }
+  });
+});

@@ -632,3 +632,81 @@ describe("single stats function", () => {
     assert.ok(logged.some((args) => String(args[0]).includes("stats recompute failed")));
   });
 });
+
+// ============================================
+// Issue #212: missing items must be acknowledged before approval
+// ============================================
+
+describe("approve — missingFromExtraction acknowledgement (issue #212)", () => {
+  /** A scraped visa whose scrapeMeta records `missing` (undefined = field absent). */
+  function withMissing(missing: unknown[] | undefined): Record<string, unknown> {
+    const v = scrapedVisa(400, freshFx()) as Record<string, unknown>;
+    return { ...v, scrapeMeta: { ...(v.scrapeMeta as object), ...(missing ? { missingFromExtraction: missing } : {}) } };
+  }
+  const one = [{ text: "a passport", leadIn: "", section: "s", appended: true }];
+
+  test("non-empty and not acknowledged: 409 MISSING_ITEMS_UNACKNOWLEDGED, nothing written (service + controller)", async () => {
+    seedLiveCountry();
+    store.set(visaPath("gb-m"), withMissing(one));
+    const before = JSON.parse(JSON.stringify(store.get(visaPath("gb-m"))));
+    await assert.rejects(visaSvc.updateVisaReviewStatus("GB", "gb-m", "approve", "admin-1"), { code: "MISSING_ITEMS_UNACKNOWLEDGED" });
+    assert.equal(updateLog.length, 0);
+    const { res, out } = fakeRes();
+    await captureErrors(() =>
+      controller.reviewVisa({ params: { id: "gb-m" }, body: { action: "approve", countryCode: "GB" }, userId: "admin-1" }, res)
+    );
+    assert.equal(out.status, 409);
+    assert.equal(out.body.error, "MISSING_ITEMS_UNACKNOWLEDGED");
+    assert.equal(updateLog.length, 0);
+    assert.deepEqual(JSON.parse(JSON.stringify(store.get(visaPath("gb-m")))), before);
+  });
+
+  test("a non-boolean flag is a 400", async () => {
+    seedLiveCountry();
+    store.set(visaPath("gb-m"), withMissing(one));
+    const { res, out } = fakeRes();
+    await captureErrors(() =>
+      controller.reviewVisa(
+        { params: { id: "gb-m" }, body: { action: "approve", countryCode: "GB", acknowledgeMissingItems: "yes" }, userId: "admin-1" },
+        res
+      )
+    );
+    assert.equal(out.status, 400);
+  });
+
+  test("acknowledged: approves and stamps who and when", async () => {
+    seedLiveCountry();
+    store.set(visaPath("gb-m"), withMissing(one));
+    const { res, out } = fakeRes();
+    await captureErrors(() =>
+      controller.reviewVisa(
+        { params: { id: "gb-m" }, body: { action: "approve", countryCode: "GB", acknowledgeMissingItems: true }, userId: "admin-1" },
+        res
+      )
+    );
+    assert.equal(out.status, 200);
+    const payload = onlyVisaUpdate("gb-m");
+    assert.equal(payload.reviewStatus, "approved");
+    assert.equal(payload.missingItemsAcknowledgedBy, "admin-1");
+    assert.ok(payload.missingItemsAcknowledgedAt instanceof FieldValue);
+  });
+
+  test("[] and an absent field approve as today, with no acknowledgement fields", async () => {
+    seedLiveCountry();
+    store.set(visaPath("gb-e"), withMissing([]));
+    store.set(visaPath("gb-a"), withMissing(undefined));
+    await visaSvc.updateVisaReviewStatus("GB", "gb-e", "approve", "admin-1");
+    await visaSvc.updateVisaReviewStatus("GB", "gb-a", "approve", "admin-1");
+    for (const id of ["gb-e", "gb-a"]) {
+      const p = updateLog.find((u: any) => u.path === visaPath(id))?.data ?? onlyVisaUpdate(id);
+      assert.equal("missingItemsAcknowledgedBy" in p, false, id);
+    }
+  });
+
+  test("reject is never gated", async () => {
+    seedLiveCountry();
+    store.set(visaPath("gb-m"), withMissing(one));
+    await visaSvc.updateVisaReviewStatus("GB", "gb-m", "reject", "admin-1", "no");
+    assert.equal(store.get(visaPath("gb-m"))!.reviewStatus, "rejected");
+  });
+});

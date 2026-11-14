@@ -17,6 +17,7 @@ import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 // Approval guard for visas with no usable USD cost (issue #59).
 import { deriveRequirementsFromScrape } from "./visa-requirements-derive";
 import { assertVisaApprovable } from "../scrapers";
+import { assertMissingItemsAcknowledged } from "../scrapers/visa-catalog/missing-items-gate";
 // Finite-only min for the denormalized country stats.
 import { finiteMin } from "../scrapers";
 // Manual USD cost on a pending scraped visa (issue #70): pure rules.
@@ -705,7 +706,10 @@ class VisaService {
     visaTypeId: string,
     action: "approve" | "reject",
     reviewedBy: string,
-    rejectionReason?: string
+    rejectionReason?: string,
+    // Issue #212: approve past the page items the extractor missed
+    // (`scrapeMeta.missingFromExtraction`); without it a non-empty list is a 409.
+    acknowledgeMissingItems?: boolean
   ): Promise<VisaType> {
     // Country docs are keyed by the upper-case code; use it for the visa ref
     // AND the stats recompute so both hit the same country.
@@ -730,6 +734,10 @@ class VisaService {
     if (action === "approve") {
       assertVisaApprovable(current);
     }
+    // Issue #212: missing page items must be acknowledged before approval
+    // (throws MissingItemsUnacknowledgedError, nothing written).
+    const acknowledgedMissing =
+      action === "approve" ? assertMissingItemsAcknowledged(current.scrapeMeta, acknowledgeMissingItems) : false;
 
     // ---- Review fields (both actions) ----
     const updates: Record<string, unknown> = {
@@ -741,6 +749,11 @@ class VisaService {
 
     if (action === "reject" && rejectionReason) {
       updates.rejectionReason = rejectionReason;
+    }
+    // Issue #212: who acknowledged the missing items, and when.
+    if (acknowledgedMissing) {
+      updates.missingItemsAcknowledgedBy = reviewedBy;
+      updates.missingItemsAcknowledgedAt = serverTimestamp();
     }
 
     // Issue #68: an admin review (either action) resolves a restored-guide
