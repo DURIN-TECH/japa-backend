@@ -306,7 +306,18 @@ export async function issueCheckout(input: {
  */
 export async function reissueCheckout(
   c: Consultation,
-  opts: { fallbackCallbackUrl: string; metadata?: Record<string, unknown> }
+  opts: {
+    fallbackCallbackUrl: string;
+    /**
+     * Issue #285: a return URL the caller asked for explicitly on THIS call
+     * (`returnTo: "app"` on POST /consultations/:id/checkout). When given it
+     * wins over the stored one and is stored in its place (the claim writes
+     * `checkoutCallbackUrl`), so later re-issues keep it too. Omitted, the
+     * booking's stored `checkoutCallbackUrl` is kept, else the fallback.
+     */
+    callbackUrl?: string;
+    metadata?: Record<string, unknown>;
+  }
 ): Promise<CheckoutState> {
   const usd: Money = { amountMinor: c.priceUsdCents!, currency: "USD" };
   const charge = await lockQuote(usd, c.chargedCurrency!);
@@ -315,7 +326,8 @@ export async function reissueCheckout(
     observedReference: c.transactionId ?? null,
     charge,
     email: c.clientEmail,
-    callbackUrl: c.checkoutCallbackUrl || opts.fallbackCallbackUrl,
+    // Explicit choice on this call > the one stored on the booking > default.
+    callbackUrl: opts.callbackUrl || c.checkoutCallbackUrl || opts.fallbackCallbackUrl,
     metadata: opts.metadata,
   });
 }

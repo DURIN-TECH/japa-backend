@@ -6,6 +6,9 @@ import { agencyService } from "../services/agency.service";
 import { userService } from "../services/user.service";
 import { paystackProvider } from "../services/billing/paystack.provider";
 import { EMAIL_BRANDING } from "../services/email/branding";
+// Issue #285: the mobile app's `returnTo: "app"` opt-in (shared with #252's
+// subscription checkout and payment-request approve).
+import { parseReturnTo, selectCallbackUrl } from "../services/billing/payment-return";
 // Issue #181 review round 2: the shared Paystack lookup that treats a
 // never-opened checkout of ours as final unpaid (see lookupCheckoutState).
 import { lookupCheckoutState } from "../services/charge-checkout.service";
@@ -233,6 +236,13 @@ export class ConsultationController {
    * missing or $0 fee books free (scheduled/paid, no Paystack). A malformed
    * fee, or no usable rate / an unsupported currency, is 503
    * PRICING_UNAVAILABLE with nothing written and no Paystack call.
+   *
+   * Issue #285: optional body `returnTo`. `"app"` (sent by the mobile app)
+   * makes Paystack return to the API's app return page (#252), which hands
+   * the payer back to the app; no value keeps the web confirm page; any other
+   * value is 400 VALIDATION_ERROR before anything is read or written. The
+   * choice is stored on the booking (`checkoutCallbackUrl`) and kept by every
+   * re-priced checkout.
    */
   async createConsultation(
     req: AuthenticatedRequest,
@@ -253,7 +263,18 @@ export class ConsultationController {
         timezone,
         meetingPlatform,
         meetingLink,
+        returnTo: rawReturnTo,
       } = req.body;
+
+      // Issue #285: `returnTo: "app"` (the mobile app) sends Paystack back to
+      // the app return page; no value keeps the web confirm page. Checked
+      // FIRST, before any read or write, so a bad value is a plain 400 with
+      // nothing booked and nothing sent to Paystack.
+      const returnTo = parseReturnTo(rawReturnTo);
+      if (!returnTo.ok) {
+        sendError(res, "VALIDATION_ERROR", "returnTo must be \"app\" when given", 400);
+        return;
+      }
 
       if (!type || !scheduledDate || !scheduledTime) {
         sendError(
@@ -389,6 +410,20 @@ export class ConsultationController {
         }
       }
 
+      // Issue #285: resolve the Paystack return URL BEFORE the booking is
+      // written. With `returnTo: "app"` it is built from the running
+      // project's API base, which throws when that cannot be built (no
+      // project id / a bad API_PUBLIC_URL); that must fail the request with
+      // nothing written rather than leave a pending booking with no
+      // checkout. The issued checkout stores it as `checkoutCallbackUrl`, so
+      // a re-priced checkout later (POST /:id/checkout after the lock, or the
+      // re-issue from POST /consultations/public/verify) returns to the same
+      // place. (`selectCallbackUrl` types its fallback as optional; `??`
+      // only narrows the type, the fallback is always given here.)
+      const callbackUrl = charge
+        ? selectCallbackUrl(returnTo.value, this.signedInCallbackUrl()) ?? this.signedInCallbackUrl()
+        : undefined;
+
       const { Timestamp } = await import("firebase-admin/firestore");
 
       const consultation = await consultationService.createConsultation({
@@ -427,7 +462,8 @@ export class ConsultationController {
         observedReference: null,
         charge: null, // the snapshot was locked a moment ago, at create
         email: client.email,
-        callbackUrl: this.signedInCallbackUrl(),
+        // #285: the app return page on `returnTo: "app"`, else the web page.
+        callbackUrl: callbackUrl!,
       });
       if (state.kind !== "checkout") {
         this.sendNoCheckout(res, state);
@@ -471,10 +507,30 @@ export class ConsultationController {
    *    verify or retry can never produce a second one (review fix): a lost
    *    race answers with the booking's current state instead. No usable rate:
    *    503, no Paystack call.
+   *
+   * Issue #285: optional body `returnTo` (`"app"` only, else 400 before
+   * anything happens). It sets the return URL of a NEW checkout issued here
+   * (and stores it on the booking); without it the stored one is kept.
    */
   async checkoutConsultation(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
       const { id } = req.params;
+
+      // Issue #285: optional `returnTo: "app"`, validated before anything is
+      // read or written (a bad value is 400; nothing re-priced, no Paystack).
+      // The URL itself is resolved here too, so an unbuildable app return
+      // URL fails (500) before any settle or re-price. It only applies to a
+      // NEW checkout issued below: a checkout still live inside its quote
+      // lock was opened at Paystack with its own return URL, and handing
+      // back that same checkout (never a second one) wins. Without
+      // `returnTo`, a new checkout keeps the booking's stored return URL.
+      const returnTo = parseReturnTo((req.body as { returnTo?: unknown } | undefined)?.returnTo);
+      if (!returnTo.ok) {
+        sendError(res, "VALIDATION_ERROR", "returnTo must be \"app\" when given", 400);
+        return;
+      }
+      const requestedCallbackUrl = selectCallbackUrl(returnTo.value);
+
       const consultation = await consultationService.getConsultationById(id);
       if (!consultation) {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
@@ -533,7 +589,12 @@ export class ConsultationController {
       // Lock passed (or no checkout opened): a fresh quote and a new checkout.
       let state: CheckoutState;
       try {
-        state = await reissueCheckout(consultation, { fallbackCallbackUrl: this.signedInCallbackUrl() });
+        state = await reissueCheckout(consultation, {
+          fallbackCallbackUrl: this.signedInCallbackUrl(),
+          // #285: the app return page when asked for on this call; else
+          // (undefined) the booking's stored return URL is kept.
+          callbackUrl: requestedCallbackUrl,
+        });
       } catch (err) {
         if (!isPricingFailure(err)) throw err;
         this.sendPricingUnavailable(res);
