@@ -137,6 +137,8 @@ export async function useHarness(): Promise<void> {
     // Issue #246: the agent-initiated booking looks for an existing
     // relationship with the client in these (plus consultations).
     "applications", "conversations",
+    // Issue #288: the per-pair lock of the find-or-create transaction.
+    "consultationBookingLocks",
   ]) {
     firebase.collections[name] = fakeCollection(name);
   }
