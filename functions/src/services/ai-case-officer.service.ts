@@ -49,6 +49,10 @@ import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-saf
 import type { AssessmentTier, StaleReason } from "./ai/tier-serializer";
 import { aiActionService } from "./ai-action.service";
 import { notAssessedItems, splitByApplicability } from "./ai/rule-applicability";
+// (#309) The intake's own required-question rule (the one the intake screen's
+// counter uses), read by the "enough to review" gate. Called, never copied.
+import { intakeService } from "./intake.service";
+import type { IntakeResponse } from "../types/intake";
 
 // ============================================
 // AI CASE-OFFICER ASSESSMENT — JOB AND I/O (issue #42)
@@ -117,11 +121,50 @@ export interface AssessmentDeps {
   // (#234) Every member ever recorded for an authority (`authorities/{id}/members`).
   // Optional so existing fakes keep working; defaults to the Firestore read.
   loadAuthorityMembers?: (authorityId: string) => Promise<AuthorityMember[]>;
+  // (#309) The application's intake, as the intake screen sees it (only
+  // `available` and `openRequiredIds` are read). Optional so existing fakes
+  // keep working; defaults to `intakeService.getIntake`.
+  readIntake?: (app: Application) => Promise<Pick<IntakeResponse, "available" | "openRequiredIds">>;
+}
+
+// ----------------------------------------------------------------
+// (#309) "Enough to review"
+// ----------------------------------------------------------------
+
+/**
+ * A part of the application a review needs and that is still missing:
+ *  - "intake":    the route has an intake and a required, visible question is open;
+ *  - "documents": no document is uploaded (the refusal letter does not count:
+ *                 the review never reads it).
+ * The statement is not required: the judgement stage can run on documents alone.
+ */
+export type ReviewMissingPart = "intake" | "documents";
+
+/** What the gate found: the missing parts (empty = enough to review) and the open required count. */
+export interface ReviewContentGaps {
+  missing: ReviewMissingPart[];
+  openRequiredCount: number;
+}
+
+/**
+ * (#309) Was this stored result made with NO model call and no mandatory-bar
+ * hit? That is the "nothing to read" result (execute(), stage "nothing to
+ * read"): it cost nothing and told the applicant nothing, so it must not count
+ * as a free caller's one review. A bar hit is also zero-call, but it is a real
+ * answer ("you cannot get this visa"), so it still counts.
+ */
+export function isNoModelCallResult(a: Pick<ApplicationAssessment, "usage" | "hasBlockingRule">): boolean {
+  const extract = a.usage?.extract?.requests ?? 0;
+  const judge = a.usage?.judge?.requests ?? 0;
+  return extract === 0 && judge === 0 && a.hasBlockingRule !== true;
 }
 
 /** What a POST resolved to. */
 export type RequestOutcome =
   | { kind: "no_rubric"; routeKey: string }
+  // (#309) Only when the caller set `requireContent` (the manual POST): the
+  // application has not enough in it to review. Nothing was written or queued.
+  | { kind: "not_enough"; missing: ReviewMissingPart[]; openRequiredCount: number }
   | { kind: "upgrade_required" }
   // Only when the caller set `maxAttempts` (the #117 auto-run): the failed job
   // for these inputs has used its attempts, so it is NOT queued again.
@@ -487,10 +530,16 @@ export class AiCaseOfficerService {
    *
    * `tier` is decided by the handler from the caller's entitlement. The status
    * trigger passes "full": it is the system, not an applicant's request.
+   *
+   * (#309) `requireContent` (set by the manual POST only): an application
+   * without enough in it to review is `not_enough`, decided after the rubric
+   * check and BEFORE anything is written and before the tier / free re-run
+   * check, so free and paid callers get the same answer. The status trigger
+   * and the #117 auto-run do not set it and behave exactly as before.
    */
   async requestAssessment(
     app: Application,
-    opts: { tier: AssessmentTier; trigger: AssessmentTrigger; requestedBy: string; maxAttempts?: number }
+    opts: { tier: AssessmentTier; trigger: AssessmentTrigger; requestedBy: string; maxAttempts?: number; requireContent?: boolean }
   ): Promise<RequestOutcome> {
     // (#233) The application's rulebook STACK (its own layer alone for a route
     // without inheritance: exactly the approved rubric read before). A stack
@@ -504,11 +553,22 @@ export class AiCaseOfficerService {
     const rulebookLayers = layerVersions ? rubric.stackLayers : undefined;
 
     const loaded = await this.loadInputs(app);
+
+    // (#309) The "enough to review" gate, manual requests only. Refused here,
+    // before the transaction: no assessment document, no job, no model call,
+    // and the free review is not touched.
+    if (opts.requireContent) {
+      const gaps = await this.contentGapsOf(app, loaded);
+      if (gaps.missing.length > 0) return { kind: "not_enough", missing: gaps.missing, openRequiredCount: gaps.openRequiredCount };
+    }
+
     const inputHash = computeInputHash(this.inputsFor(loaded, rubric.version, layerVersions));
     const assessmentId = assessmentIdFor(app.id, inputHash);
     const now = this.deps.now();
 
     // A re-run by a free caller needs a previous result for a DIFFERENT input set.
+    // (#309) `latestSucceeded` skips a "nothing to read" result (no model call),
+    // so a review spent on an empty application does not use up the free one.
     const previous = await this.latestSucceeded(app.id);
     const isRerunOfChanged = previous !== null && previous.inputHash !== inputHash;
 
@@ -596,10 +656,33 @@ export class AiCaseOfficerService {
     return null;
   }
 
-  /** The newest succeeded assessment for an application, or null (filtered in code). */
+  /**
+   * (#309) What an application still needs before it can be reviewed.
+   *  - intake: only when the route has one (`available`); open = the intake
+   *    service's own `openRequiredIds` (required, visible, unanswered).
+   *  - documents: `loaded.documents`, which already leaves the refusal letter out.
+   * The statement is not required.
+   */
+  async contentGapsOf(app: Application, loaded: Pick<LoadedInputs, "documents">): Promise<ReviewContentGaps> {
+    const readIntake = this.deps.readIntake ?? ((a: Application) => intakeService.getIntake(a));
+    const intake = await readIntake(app);
+    const openRequiredCount = intake.available ? intake.openRequiredIds.length : 0;
+    const missing: ReviewMissingPart[] = [];
+    if (openRequiredCount > 0) missing.push("intake");
+    if (loaded.documents.length === 0) missing.push("documents");
+    return { missing, openRequiredCount };
+  }
+
+  /**
+   * The newest succeeded assessment for an application, or null (filtered in code).
+   * Used only by the free re-run check. (#309) A "nothing to read" result (no
+   * model call, no bar hit: `isNoModelCallResult`) is skipped: it is not a review.
+   */
   private async latestSucceeded(applicationId: string): Promise<ApplicationAssessment | null> {
     const snap = await collections.applicationAssessments.where("applicationId", "==", applicationId).get();
-    const done = snap.docs.map((d) => d.data() as ApplicationAssessment).filter((a) => a.status === "succeeded");
+    const done = snap.docs
+      .map((d) => d.data() as ApplicationAssessment)
+      .filter((a) => a.status === "succeeded" && !isNoModelCallResult(a));
     done.sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
     return done[0] ?? null;
   }
