@@ -122,6 +122,12 @@ export interface InsufficientItem {
   // when the application runs on a stack of more than one layer. Copied from
   // the rubric in code, never from model text.
   layerKey?: string;
+  // (#308) Set only on an item that is about an UPLOAD, not a rule: a document
+  // that could not be read (unreadable, failed or flagged). `criterionId` is
+  // then `document:<documentId>` (no rule), `title` is the upload's label and
+  // `reason` is a fixed sentence written for the applicant. It never carries
+  // `notAssessed`: the applicant can act on it (upload a clearer copy).
+  documentId?: string;
 }
 
 /**
@@ -299,6 +305,8 @@ export interface ApplicationAssessment {
   // Full tier and staff only: the free whitelist does not include it.
   countryContext?: AvailableCountryContext;
   // Stored, stripped from every client-role response (see tier-serializer).
+  // (#308) Also null on a FINISHED assessment when no objective rule could be
+  // checked from the documents and nothing refuses: no call is made.
   internalCall: "would_approve" | "would_refuse" | null;
 
   models: { extract: string | null; judge: string | null };
@@ -396,6 +404,8 @@ export interface ProposedAction {
   // action becomes a DocumentRequest when accepted.
   blocking: boolean;
   // Resolves to a criterion in the rubric version the assessment used (checked at write time).
+  // (#308) The one exception: an action for an upload that could not be read
+  // carries `document:<documentId>` here (no rule is involved).
   criterionId: string;
   evidenceNeeded: string;
   estEffort: ProposedActionEffort;

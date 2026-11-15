@@ -118,7 +118,9 @@ export interface AssessmentContent {
   score: number | null;
   readiness: ReadinessBand;
   confidence: "high" | "medium" | "low";
-  internalCall: "would_approve" | "would_refuse";
+  // (#308) Null when NO objective rule could be checked from the documents and
+  // nothing refuses: code has no basis for a call either way, so it makes none.
+  internalCall: "would_approve" | "would_refuse" | null;
   // A mandatory bar applies (code-decided). Served to the free tier as a boolean.
   hasBlockingRule: boolean;
   droppedCount: number;
@@ -1012,6 +1014,64 @@ export function parseJudgement(
 }
 
 // ============================================
+// Uploads that were not read (#308)
+// ============================================
+
+/**
+ * The `failure` text the job gives a document it did NOT send to a model
+ * because the rulebook has no document field to read at all. Such an upload is
+ * not "unreadable" (nobody tried to read it), so it is never reported to the
+ * applicant as one. The job uses this constant; the bulk path writes the same
+ * text (services/ai-bulk-reassessment.service.ts), so keep the two equal.
+ */
+export const NO_FIELD_TO_READ = "no field to read";
+
+/** Prefix of the id an unread-upload item carries in place of a rule id. */
+const UNREAD_DOCUMENT_ID_PREFIX = "document:";
+
+/** What the applicant is told about an upload that could not be read. Fixed text, never model text. */
+export const UNREAD_DOCUMENT_REASON = "We couldn't read this upload, so nothing in it was checked. Upload a clearer copy.";
+
+/** The same for an upload whose content cannot be relied on (it addressed the reader instead of stating facts). */
+export const UNUSABLE_DOCUMENT_REASON = "We couldn't use this upload, so nothing in it was checked. Upload a clean copy of the original document.";
+
+/** Longest document label copied into an item title. */
+const MAX_DOCUMENT_LABEL = 80;
+
+/**
+ * (#308) The uploads whose content reached NO check: unreadable (too large,
+ * unsupported, password protected, not readable), failed (the reading broke
+ * its contract or the call failed) or flagged suspicious. An upload that was
+ * simply not sent because the rulebook reads no document field is left out.
+ */
+export function unreadDocumentsOf(documents: readonly DocumentExtraction[]): DocumentExtraction[] {
+  return documents.filter((d) => (!d.readable || d.failed || d.suspicious) && d.failure !== NO_FIELD_TO_READ);
+}
+
+/**
+ * (#308) One applicant-facing item per unread upload, independent of any rule.
+ * WHY: before #308 an applicant heard about an unreadable upload only through
+ * rules going "could not be read". Rules no document item names no longer do
+ * that, so without this item an unreadable upload could go unmentioned.
+ *
+ *  - `criterionId` is `document:<documentId>` (no rule is involved; the id is
+ *    unique per upload, so two unread uploads never share a key);
+ *  - `title` is the upload's own label (what the applicant recognises it by);
+ *  - `documentId` marks the item as being about an upload, not a rule;
+ *  - NO `notAssessed` marker: the applicant CAN act on it (upload again), so it
+ *    is listed, gets one proposed action, and counts against the band and the
+ *    confidence like any other open item.
+ */
+export function unreadDocumentItems(documents: readonly DocumentExtraction[]): InsufficientItem[] {
+  return unreadDocumentsOf(documents).map((d) => ({
+    criterionId: `${UNREAD_DOCUMENT_ID_PREFIX}${d.documentId}`,
+    title: (d.label || "document").slice(0, MAX_DOCUMENT_LABEL),
+    reason: d.suspicious ? UNUSABLE_DOCUMENT_REASON : UNREAD_DOCUMENT_REASON,
+    documentId: d.documentId,
+  }));
+}
+
+// ============================================
 // Assembly: containment and citations (code only)
 // ============================================
 
@@ -1095,6 +1155,11 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   let droppedCount = input.judgement?.dropped ?? 0;
   const unanchoredCount = input.judgement?.unanchored ?? 0;
   const statementRef = input.statement ?? null;
+
+  // (#308) An upload that could not be read is always said, first in the list,
+  // whether or not any rule names the document.
+  const unreadItems = unreadDocumentItems(input.documents);
+  insufficient.push(...unreadItems);
 
   const seenRefusal = new Set<string>();
   for (const c of input.mandatoryHits) {
@@ -1233,10 +1298,20 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   // counts as a check that came out clear.
   const objectiveChecked = input.objective.filter((r) => !r.notAssessed);
   const objectiveFail = objectiveChecked.some((r) => r.outcome === "fail");
+  const objectiveFromChecks: StageOutcomes["objective"] =
+    objectiveFail ? "fail" : objectiveChecked.some((r) => r.outcome === "insufficient") ? "insufficient" : objectiveChecked.length > 0 ? "clear" : "not_applicable";
+  // (#308) While any upload is unread the stage cannot read "clear" (nor
+  // "nothing to check"): what that upload holds was never compared.
+  const objectiveOutcome: StageOutcomes["objective"] =
+    unreadItems.length > 0 && (objectiveFromChecks === "clear" || objectiveFromChecks === "not_applicable") ? "insufficient" : objectiveFromChecks;
+  // (#308) The rulebook HAS objective rules and not one could be checked from
+  // the documents (every one is "not in documents": typically an older
+  // rulebook with no document items). The result must not then read better
+  // than what was checked: see the three caps below.
+  const nothingChecked = input.objective.length > 0 && objectiveChecked.length === 0;
   const stageOutcomes: StageOutcomes = {
     mandatoryBar: input.mandatoryHits.length > 0 ? "hit" : rubric.criteria.some((c) => c.kind === "mandatory_bar") ? "clear" : "not_applicable",
-    objective:
-      objectiveFail ? "fail" : objectiveChecked.some((r) => r.outcome === "insufficient") ? "insufficient" : objectiveChecked.length > 0 ? "clear" : "not_applicable",
+    objective: objectiveOutcome,
     judgement: judgementOutcome,
     credibility: credibilityFlags.length > 0 ? "at_risk" : "clear",
   };
@@ -1249,7 +1324,9 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   // ("not_in_documents"): no upload or answer of the applicant's can settle
   // it, so it must not cap the band or the confidence either.
   const countable = insufficient.filter((i) => !isNotActionableMarker(i.notAssessed));
-  const readiness = readinessFor({
+  // An unread upload's item has no marker, so it is in `countable`: it caps a
+  // "strong" band at "competitive" and keeps the confidence below "high".
+  const bandFromFacts = readinessFor({
     hit: input.mandatoryHits.length > 0,
     refusalCount: refusalGrounds.length,
     score: input.score,
@@ -1257,9 +1334,13 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     flagCount: credibilityFlags.length,
     documentCount: input.documents.length,
   });
+  // (#308) Cap 1: nothing was checked from the documents, so never "strong".
+  const readiness: ReadinessBand = nothingChecked && bandFromFacts === "strong" ? "competitive" : bandFromFacts;
 
-  const confidence: AssessmentContent["confidence"] =
+  const confidenceFromItems: AssessmentContent["confidence"] =
     countable.length === 0 && input.documents.length > 0 ? "high" : countable.length <= 2 ? "medium" : "low";
+  // (#308) Cap 2: nothing was checked from the documents, so never "high".
+  const confidence: AssessmentContent["confidence"] = nothingChecked && confidenceFromItems === "high" ? "medium" : confidenceFromItems;
 
   return {
     stageOutcomes,
@@ -1273,7 +1354,9 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     score: input.score,
     readiness,
     confidence,
-    internalCall: refusalGrounds.length > 0 ? "would_refuse" : "would_approve",
+    // (#308) Cap 3: with no objective rule checked, "no refusal ground" is not
+    // a basis for "would approve": no call is made (null), for staff to see.
+    internalCall: refusalGrounds.length > 0 ? "would_refuse" : nothingChecked ? null : "would_approve",
     hasBlockingRule: input.mandatoryHits.length > 0,
     droppedCount,
     unanchoredCount,

@@ -31,6 +31,8 @@ import {
   isJudgedBar,
   judgementCriteriaOf,
   mergeJudgementOutputs,
+  // (#308) The one "unread" reason that is not reported to the applicant.
+  NO_FIELD_TO_READ,
   numberStatementBlocks,
   parseJudgement,
   planJudgementBatches,
@@ -813,7 +815,7 @@ export class AiCaseOfficerService {
         continue;
       }
       if (fields.length === 0) {
-        extractions.push(unreadable(base, "no field to read"));
+        extractions.push(unreadable(base, NO_FIELD_TO_READ));
         continue;
       }
       if (this.deps.now().getTime() - started > JOB_BUDGET_MS) throw new JobStop("timed_out", "the assessment ran out of time");
