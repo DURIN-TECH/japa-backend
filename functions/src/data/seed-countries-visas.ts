@@ -11,9 +11,11 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { buildVisaTypeDoc } from "./seed-visa-doc";
 // #239: which shared routes a record inherits comes from the DATA FILE, never from this seed.
-import { inheritsFromFor, loadSharedVisaData, routeFeesFor } from "./shared-visa-data-format";
+import { inheritsFromFor, loadSharedVisaData, routeFactsFor, routeFeesFor } from "./shared-visa-data-format";
 // #299: the fee of a shared route, converted with the stored rate (pure rules in seed-sourced-fee.ts).
 import { effectiveSeedCost, planSourcedFee, seedFeeProblems, sourcedFeeFields, type SourcedFeeDecision } from "./seed-sourced-fee";
+// #339: the processing time and stay limit of a shared route (pure rules in seed-route-facts.ts).
+import { planRouteFacts, routeFactFields, seedRouteFactProblems, type RouteFactsDecision } from "./seed-route-facts";
 import type { FxRatesDoc } from "../types";
 
 const db = getFirestore();
@@ -966,22 +968,23 @@ const VISA_TYPES: SeedVisaType[] = [
     description:
       "For tourism, business visits, or family visits to the Netherlands for a short stay.",
     category: "tourist",
-    processingTime: "2-4 weeks",
-    processingDaysMin: 14,
-    processingDaysMax: 28,
+    // #339 REMOVED (no official source on record): processingTime "2-4 weeks",
+    //   processingDaysMin 14, processingDaysMax 28. The processing time and the
+    //   stay limit now come from the shared route this record inherits (the
+    //   data file's `processing` / `validity` blocks, each with its verbatim
+    //   quote), written by the seed through seed-route-facts.ts. Setting them
+    //   here again would be refused as a second source (seedRouteFactProblems).
     // #239 REMOVED (no official source on record): baseCostUsd: 90.
     // #239 REMOVED (no official source on record): validityPeriod:
     //   "Up to 90 days within 180-day period".
-    isExtendable: false,
-    eligibilityCriteria: [
-      "Valid passport (3+ months beyond planned stay)",
-      // #239 REMOVED the figure "(EUR 30,000 coverage)": no official source on record.
-      "Travel health insurance",
-      "Proof of accommodation",
-      "Sufficient funds for stay",
-      "Return travel booking",
-      "Purpose of visit documentation",
-    ],
+    // #339 REMOVED (no official source on record): isExtendable: false. Whether
+    //   and when the visa can be extended is left to #344; until then the
+    //   record says nothing (never `false`).
+    // #339 REMOVED six unsourced eligibility lines (passport validity, health
+    //   insurance, accommodation, funds, return booking, purpose of visit):
+    //   requirements come from the published shared rulebook, as for the 28
+    //   other short-stay records.
+    eligibilityCriteria: [],
   },
 
   // ============================================
@@ -993,10 +996,14 @@ const VISA_TYPES: SeedVisaType[] = [
   //   - no `baseCostUsd`: the price is the route's sourced fee, which the seed
   //     converts and writes (#299); a fee of its own would be refused as a
   //     second fee source (seedFeeProblems),
-  //   - no `validityPeriod`, `maxExtensions`, `isExtendable`, processing time
-  //     (`processingTime`, `processingDaysMin`, `processingDaysMax`),
-  //     `applicationUrl` or `applicationInstructions`: all optional since
-  //     #239 / #306, and left out of the stored doc,
+  //   - no `validityPeriod` or processing time (`processingTime`,
+  //     `processingDaysMin`, `processingDaysMax`): since #339 these come from
+  //     the route's sourced `processing` / `validity` blocks, which the seed
+  //     writes (seed-route-facts.ts); one of its own would be refused as a
+  //     second source (seedRouteFactProblems),
+  //   - no `maxExtensions`, `isExtendable`, `applicationUrl` or
+  //     `applicationInstructions`: all optional since #239 / #306, and left
+  //     out of the stored doc,
   //   - `eligibilityCriteria: []`: requirements come from the published
   //     shared rulebook the record inherits, not from seed text,
   //   - the description only names the visa and the country.
@@ -1499,6 +1506,12 @@ export async function seedCountriesAndVisas(options: SeedCountriesAndVisasOption
   if (feeProblems.length > 0) {
     throw new Error(`The seed's visa fees conflict with the shared visa data file:\n - ${feeProblems.join("\n - ")}`);
   }
+  // #339: the same two-sources rule for the route's processing time and stay
+  // limit, also before ANY write.
+  const factProblems = seedRouteFactProblems(visaTypes, sharedVisaData);
+  if (factProblems.length > 0) {
+    throw new Error(`The seed's visa facts conflict with the shared visa data file:\n - ${factProblems.join("\n - ")}`);
+  }
 
   // Group visa types by country for stats computation
   const visasByCountry: Record<string, SeedVisaType[]> = {};
@@ -1567,6 +1580,42 @@ export async function seedCountriesAndVisas(options: SeedCountriesAndVisasOption
     }
   }
 
+  // ---- #339: the sourced processing time and stay limit ----
+  // Only records listed under a route's `inheritedBy` with a `processing` or
+  // `validity` block are looked at; every other record is written exactly
+  // as its seed entry says.
+  const factDecisions = new Map<string, RouteFactsDecision>();
+  const visasWithRouteFacts = visaTypes.filter((v) => routeFactsFor(sharedVisaData, v.countryCode, v.id).length > 0);
+  if (visasWithRouteFacts.length > 0) {
+    // Which of the official sources the facts cite are on record (READ ONLY).
+    const factSourceIds = [
+      ...new Set(
+        visasWithRouteFacts.flatMap((v) =>
+          routeFactsFor(sharedVisaData, v.countryCode, v.id).flatMap((r) => [r.processing?.guidanceSourceId, r.validity?.guidanceSourceId].filter((id): id is string => !!id))
+        )
+      ),
+    ];
+    const factSourceSnaps = factSourceIds.length > 0 ? await db.getAll(...factSourceIds.map((id) => db.collection("guidanceSources").doc(id))) : [];
+    const factSourcesOnRecord = new Set(factSourceSnaps.filter((snap) => snap.exists).map((snap) => snap.id));
+
+    for (const visa of visasWithRouteFacts) {
+      const decision = planRouteFacts({
+        routeFacts: routeFactsFor(sharedVisaData, visa.countryCode, visa.id),
+        existing: existingByKey.get(keyOf(visa)),
+        guidanceSourceExists: (id) => factSourcesOnRecord.has(id),
+      });
+      factDecisions.set(keyOf(visa), decision);
+      // Every outcome is logged, so a deploy log says why a fact is or is not there.
+      if (decision.action === "write") {
+        const written = Object.keys(decision.fields.sourcedFacts).join(", ");
+        const skipped = decision.skipped.length > 0 ? `; NOT written: ${decision.skipped.join("; ")}` : "";
+        console.log(`[seed] ${keyOf(visa)}: sourced route facts written (${written})${skipped}`);
+      } else if (decision.action === "omit") {
+        console.log(`[seed] ${keyOf(visa)}: NO sourced route facts written: ${decision.reason}`);
+      }
+    }
+  }
+
   // ============================================
   // WRITES
   // ============================================
@@ -1578,7 +1627,14 @@ export async function seedCountriesAndVisas(options: SeedCountriesAndVisasOption
     // #306: only visas that state a processing time count (an entry may omit
     // it). With none, the minimum is 0 as for a country with no visas: never
     // NaN (Math.min of `undefined`) and never Infinity (Math.min of nothing).
-    const processingMins = visas.map((v) => v.processingDaysMin).filter((d): d is number => typeof d === "number");
+    // #339: a route's sourced minimum counts like an entry's own one; a route
+    // that states no minimum adds nothing (no made-up 0 enters the minimum).
+    const processingMins = visas
+      .map((v) => {
+        const facts = factDecisions.get(keyOf(v));
+        return (facts && routeFactFields(facts)?.processingDaysMin) ?? v.processingDaysMin;
+      })
+      .filter((d): d is number => typeof d === "number");
     const minProcessingDays = processingMins.length > 0 ? Math.min(...processingMins) : 0;
     // #239: a visa with no recorded fee does not count towards the minimum.
     // #299: a sourced fee counts exactly like a seed entry's own fee.
@@ -1614,6 +1670,7 @@ export async function seedCountriesAndVisas(options: SeedCountriesAndVisasOption
       // `inheritsFrom` (this is a whole-document set, which would drop it) and
       // adds the data file's shared routes to a record that has none.
       // #299: plus the record's sourced fee, when the decision carries one.
+      // #339: and its sourced route facts, when that decision carries any.
       visaBatch.set(
         visaRef(visa),
         buildVisaTypeDoc(
@@ -1621,7 +1678,9 @@ export async function seedCountriesAndVisas(options: SeedCountriesAndVisasOption
           existing,
           now,
           inheritsFromFor(sharedVisaData, visa.countryCode, visa.id),
-          decision ? sourcedFeeFields(decision) : undefined
+          decision ? sourcedFeeFields(decision) : undefined,
+          // #339: plus the route's processing time and stay limit, when the decision carries them.
+          factDecisions.has(keyOf(visa)) ? routeFactFields(factDecisions.get(keyOf(visa))!) : undefined
         )
       );
     }
