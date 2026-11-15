@@ -68,7 +68,7 @@ function txn(
   } as Transaction;
 }
 
-/** A withdrawal fixture (always the agent's own user id, like createWithdrawal). */
+/** A withdrawal fixture (always the agent's own user id, like buildWithdrawal). */
 function withdrawal(amount: number, status: TransactionStatus, currency = "NGN"): Transaction {
   return txn(amount, currency, status, { type: "withdrawal", userId: "agent1" });
 }

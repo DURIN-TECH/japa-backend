@@ -13,6 +13,11 @@ router.post("/", verifyAuth, (req, res) =>
   bankAccountController.createAccount(req, res)
 );
 
+// Withdrawal (issue #287). `verifyAuth` only: the role gate lives in the
+// controller, because the usual `verifyAgent` middleware lets admins through
+// and an admin has no payout balance. The controller refuses every role but
+// agent and owner with 403, validates the body, and checks the balance and
+// writes the withdrawal in one Firestore transaction.
 router.post("/withdraw", verifyAuth, (req, res) =>
   bankAccountController.withdraw(req, res)
 );

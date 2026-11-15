@@ -1,6 +1,7 @@
-import { collections } from "../utils/firebase";
+import { collections, db } from "../utils/firebase";
 import { Transaction, TransactionStatus, BankAccount, PaymentRequest } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
+import type { Transaction as FirestoreTransaction } from "firebase-admin/firestore";
 import type { ChargeSnapshot, CurrencyCode } from "../types/money";
 import {
   CurrencyBuckets,
@@ -18,7 +19,7 @@ export interface TransactionFilters {
 
 /**
  * Currency that agent withdrawals are paid out in. Payouts go to a Nigerian
- * bank account (Paystack NGN), so `createWithdrawal` writes this currency and
+ * bank account (Paystack NGN), so `buildWithdrawal` writes this currency and
  * the withdrawal balance check compares against this currency's balance only.
  */
 export const WITHDRAWAL_CURRENCY: CurrencyCode = "NGN";
@@ -73,7 +74,39 @@ export function availableBalanceIn(stats: TransactionStats, currency: CurrencyCo
   return stats.byCurrency.find((row) => row.currency === currency)?.availableBalance ?? 0;
 }
 
+/**
+ * Thrown by `withdrawWithBalanceCheck` (issue #287) when the amount asked for
+ * is more than the agent's available balance in WITHDRAWAL_CURRENCY at the
+ * moment the transaction reads it. Thrown INSIDE the Firestore transaction,
+ * so nothing is written. The controller answers 400 "Insufficient balance".
+ */
+export class InsufficientBalanceError extends Error {
+  constructor() {
+    super("Insufficient balance");
+    this.name = "InsufficientBalanceError";
+  }
+}
+
+/**
+ * Whether a stored transaction amount can be summed (issue #287): a safe
+ * integer in minor units. A string ("abc", "5000"), a fraction, NaN,
+ * Infinity, null or a missing value is NOT usable: adding one to a running
+ * sum gives NaN (or a string), which then poisons every figure built on it.
+ */
+export function isUsableAmount(amount: unknown): amount is number {
+  return typeof amount === "number" && Number.isSafeInteger(amount);
+}
+
 class TransactionService {
+  /**
+   * Firestore transaction runner (issue #287). A property, like
+   * `visaService.runTransaction`, so unit tests can swap it for the in-memory
+   * one (writes buffered until the callback resolves, a throw writes
+   * nothing: the same all-or-nothing contract as Firestore).
+   */
+  runTransaction: <T>(fn: (tx: FirestoreTransaction) => Promise<T>) => Promise<T> = (fn) =>
+    db.runTransaction(fn);
+
   /**
    * Get transactions where the user is the assigned agent.
    */
@@ -104,7 +137,7 @@ class TransactionService {
    * ownership rule here: nothing is derived from a case, an agency or an
    * agent, so a client can never be handed another client's row.
    *
-   * Withdrawals are left out. An agent's payout row (`createWithdrawal`)
+   * Withdrawals are left out. An agent's payout row (`buildWithdrawal`)
    * also stores the agent's own uid in `userId`, but it is money going OUT
    * to the agent's bank, not a payment the caller made, so it does not
    * belong in a payment history. (It only matters when an agent-side user
@@ -233,8 +266,16 @@ class TransactionService {
    *    is seen (even one that adds 0, e.g. a failed charge), so the list is
    *    empty only when there are no transactions at all.
    *
+   *  - (issue #287) a stored row whose `amount` is not a safe integer (a
+   *    string such as "abc", a fraction, NaN, a missing value) is SKIPPED
+   *    whole and logged with its id. Before #287 one such row turned the
+   *    sums into NaN (JSON `null`), and `amount > NaN` is always false, so
+   *    every later withdrawal passed the balance check. A skipped row adds
+   *    nothing anywhere: no revenue, no pending payment, no withdrawal hold,
+   *    no pending client and no currency row of its own.
+   *
    * Used by GET /transactions/stats for every role, and by the withdrawal
-   * balance check (via getStatsForAgent), so both always agree.
+   * balance check (withdrawWithBalanceCheck), so both always agree.
    */
   computeStats(transactions: Transaction[]): TransactionStats {
     // Separate running sums per currency for each figure.
@@ -245,6 +286,16 @@ class TransactionService {
     const pendingUserIds = new Set<string>();
 
     for (const txn of transactions) {
+      // (#287) Never sum an amount that is not a safe integer: skip the row
+      // and say which one, so the bad data can be found and repaired.
+      if (!isUsableAmount(txn.amount)) {
+        console.warn(
+          `computeStats: skipping transaction ${txn.id} with a non-integer amount ` +
+            `(type ${typeof txn.amount})`
+        );
+        continue;
+      }
+
       const currency = transactionCurrency(txn);
       // Give the currency a row even if this transaction adds nothing.
       revenue.touch(currency);
@@ -279,9 +330,12 @@ class TransactionService {
   }
 
   /**
-   * Convenience: stats for one agent (by user uid), as used by the
-   * withdrawal balance check. Withdrawals are already subtracted per
-   * currency inside computeStats.
+   * Convenience: stats for one agent (by user uid). Withdrawals are already
+   * subtracted per currency inside computeStats.
+   *
+   * NOT what the withdrawal endpoint uses to decide (issue #287): a balance
+   * read outside a transaction can be stale by the time the withdrawal is
+   * written. `withdrawWithBalanceCheck` re-reads inside its transaction.
    */
   async getStatsForAgent(agentUserId: string): Promise<TransactionStats> {
     const transactions = await this.getTransactionsForAgent(agentUserId);
@@ -289,18 +343,26 @@ class TransactionService {
   }
 
   /**
-   * Create a withdrawal transaction
+   * Build (but do not write) a pending withdrawal Transaction: the agent's
+   * request to be paid `amount` (kobo) into `bankAccount`. Payouts are done
+   * by hand today, hence `paymentProvider: "manual"`.
+   *
+   * @param id the new transaction's document id
+   * @param now the creation time (also `updatedAt`)
+   * @param agentUserId the agent's (or owner's) user uid; stored as both the
+   *   `userId` and the `agentId`, which is what the balance query filters on
+   * @param amount safe positive integer in minor units of WITHDRAWAL_CURRENCY
+   * @param bankAccount the caller's own account the money goes to
    */
-  async createWithdrawal(
+  buildWithdrawal(
+    id: string,
+    now: Timestamp,
     agentUserId: string,
     amount: number,
     bankAccount: BankAccount
-  ): Promise<Transaction> {
-    const ref = collections.transactions.doc();
-    const now = Timestamp.now();
-
-    const transaction: Transaction = {
-      id: ref.id,
+  ): Transaction {
+    return {
+      id,
       userId: agentUserId,
       agentId: agentUserId,
       type: "withdrawal",
@@ -320,9 +382,98 @@ class TransactionService {
       createdAt: now,
       updatedAt: now,
     };
+  }
 
-    await ref.set(transaction);
-    return transaction;
+  /**
+   * Check the agent's balance and write the withdrawal in ONE Firestore
+   * transaction (issue #287). Replaces the old `createWithdrawal`, which
+   * wrote without checking; there is deliberately no unchecked way to write
+   * a withdrawal any more.
+   *
+   * Why: before #287 the controller read the balance, then wrote the
+   * withdrawal in a separate step. Two requests sent at the same time both
+   * read the same balance, both passed, and both were written: the agent was
+   * owed twice what they had.
+   *
+   * How it is made atomic:
+   *  1. the transaction first reads the agent's LOCK document
+   *     (`withdrawalLocks/{agentUserId}`) and, on success, writes it. Two
+   *     withdrawals of one agent therefore always touch the same document,
+   *     so Firestore runs them one after the other: the second one is
+   *     retried on fresh data and sees the first one's withdrawal. A query
+   *     alone is not relied on for this, because a query inside a
+   *     transaction does not have to block a concurrent INSERT of a new row;
+   *  2. the agent's transactions are read THROUGH the transaction (`tx.get`)
+   *     and the balance is computed with the same `computeStats` that
+   *     GET /transactions/stats uses, so the check and the screen agree;
+   *  3. the balance compared is the one in WITHDRAWAL_CURRENCY only (#282):
+   *     revenue in another currency never makes a naira withdrawal possible;
+   *  4. if the amount is more than the balance, InsufficientBalanceError is
+   *     thrown and NOTHING is written (no withdrawal, no lock). An amount
+   *     exactly equal to the balance is allowed.
+   *
+   * All reads happen before any write, as Firestore requires.
+   *
+   * The lock only orders one agent's WITHDRAWALS against each other. Incoming
+   * payments do not take it: they only ever raise the balance, so a
+   * withdrawal that passed the check stays valid.
+   *
+   * The caller validates `amount` (safe positive integer, kobo) and that
+   * `bankAccount` is the agent's own BEFORE calling this.
+   *
+   * @param agentUserId the agent's (or agency owner's) user uid
+   * @param amount safe positive integer in kobo
+   * @param bankAccount the caller's own bank account
+   * @returns the pending withdrawal that was written
+   * @throws InsufficientBalanceError when `amount` exceeds the NGN balance
+   */
+  async withdrawWithBalanceCheck(
+    agentUserId: string,
+    amount: number,
+    bankAccount: BankAccount
+  ): Promise<Transaction> {
+    // Defence in depth: the controller validates first, but a non-integer
+    // amount must never be stored whoever calls this.
+    if (!isUsableAmount(amount) || amount <= 0) {
+      throw new Error("withdrawWithBalanceCheck: amount must be a safe positive integer");
+    }
+
+    // One lock document per agent, keyed by their user uid.
+    const lockRef = collections.withdrawalLocks.doc(agentUserId);
+    // Same query as getTransactionsForAgent (uses the existing
+    // agentId + createdAt index), but read through the transaction below.
+    const agentTransactions = collections.transactions
+      .where("agentId", "==", agentUserId)
+      .orderBy("createdAt", "desc");
+
+    return this.runTransaction(async (tx) => {
+      // ---- Reads (before any write) ----
+      // The lock read is what makes two withdrawals of one agent conflict.
+      const lockSnap = await tx.get(lockRef);
+      const snapshot = await tx.get(agentTransactions);
+
+      // ---- Decide (a throw here writes nothing) ----
+      const stats = this.computeStats(snapshot.docs.map((doc) => doc.data() as Transaction));
+      if (amount > availableBalanceIn(stats, WITHDRAWAL_CURRENCY)) {
+        throw new InsufficientBalanceError();
+      }
+
+      // ---- Writes (both or neither) ----
+      const ref = collections.transactions.doc();
+      const now = Timestamp.now();
+      const transaction = this.buildWithdrawal(ref.id, now, agentUserId, amount, bankAccount);
+      tx.set(ref, transaction);
+      // Writing the lock is what forces a concurrent withdrawal of the same
+      // agent to be retried. The fields are for a human reading the console.
+      const previousCount = lockSnap.exists ? Number(lockSnap.data()?.withdrawalCount) || 0 : 0;
+      tx.set(lockRef, {
+        agentUserId,
+        lastWithdrawalId: ref.id,
+        withdrawalCount: previousCount + 1,
+        updatedAt: now,
+      });
+      return transaction;
+    });
   }
 
   /**

@@ -47,6 +47,11 @@ const COLLECTIONS = [
   // Payment-request payments held for refund (issue #181): amounts and
   // references. Never read or forged by a client.
   "paymentRequestExceptions",
+  // Withdrawal locks (issue #287): one doc per agent, read and written inside
+  // the withdrawal transaction (POST /bank-accounts/withdraw) so two
+  // withdrawals cannot both pass the balance check. Explicit deny in
+  // firestore.rules; a client that could write one could block payouts.
+  "withdrawalLocks",
   // Agency listing screening results (issue #120): admin-only through the API.
   "listingScreenings",
   "rubricReviewHistory",
