@@ -11,16 +11,24 @@ import assert from "node:assert/strict";
 
 import {
   E2E_FIXTURE,
+  FIXTURE_RUBRIC_SCHEMA_VERSION,
+  FIXTURE_SEVERITY_LEVELS,
   buildE2eClientUserDoc,
   buildE2eRubricHead,
   buildE2eRubricVersion,
 } from "../../src/scripts/e2e/e2e-fixture-data";
-import { validateVisaRubric } from "../../src/scrapers/rubric/rubric-validate";
-import { applyExclusions } from "../../src/scrapers/rubric/rubric-exclusions";
+// The rubric module through its public entry point (lint boundary).
+import { applyExclusions, validateVisaRubric } from "../../src/scrapers";
+import { DEFAULT_SEVERITY_LEVELS, RUBRIC_SCHEMA_VERSION } from "../../src/types/rubric";
 import { effectiveIntakeQuestions } from "../../src/services/ai/rule-applicability";
 import { buildChecklist } from "../../src/services/ai/checklist-builder";
 
 describe("e2e fixture rulebook", () => {
+  test("its copied constants still equal the rubric module's own", () => {
+    assert.equal(FIXTURE_RUBRIC_SCHEMA_VERSION, RUBRIC_SCHEMA_VERSION);
+    assert.deepEqual([...FIXTURE_SEVERITY_LEVELS], [...DEFAULT_SEVERITY_LEVELS]);
+  });
+
   test("passes the structural validator with no errors and no flags", () => {
     const v = validateVisaRubric(buildE2eRubricVersion());
     assert.deepEqual(v.errors, []);

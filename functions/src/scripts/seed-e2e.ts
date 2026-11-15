@@ -68,7 +68,7 @@ async function writeFixture(): Promise<void> {
   const { claimsService } = await import("../services/claims.service");
 
   // ---- 1. The visa must exist (seeded by seed-countries-visas). ----
-  const visaSnap = await collections.countries.doc(E2E_FIXTURE.countryCode).collection("visaTypes").doc(E2E_FIXTURE.visaTypeId).get();
+  const visaSnap = await subcollections.visaTypes(E2E_FIXTURE.countryCode).doc(E2E_FIXTURE.visaTypeId).get();
   if (!visaSnap.exists) {
     throw new Error(`visa ${E2E_FIXTURE.countryCode}/${E2E_FIXTURE.visaTypeId} is not seeded: run the full seed first (drop --fixture-only)`);
   }

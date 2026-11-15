@@ -25,16 +25,22 @@
 
 import { createHash } from "node:crypto";
 import { Timestamp } from "firebase-admin/firestore";
-import {
-  DEFAULT_SEVERITY_LEVELS,
-  RUBRIC_SCHEMA_VERSION,
-  type AssessmentCriterion,
-  type EvidenceItem,
-  type IntakeQuestion,
-  type RubricCitation,
-  type RubricHead,
-  type VisaRubric,
+// TYPE imports only: the rubric module's boundary (test rubric-generic) allows
+// no value import from outside it. The two constants it would give are copied
+// below, and the unit test checks they still equal the module's own.
+import type {
+  AssessmentCriterion,
+  EvidenceItem,
+  IntakeQuestion,
+  RubricCitation,
+  RubricHead,
+  VisaRubric,
 } from "../../types/rubric";
+
+/** = `RUBRIC_SCHEMA_VERSION` (types/rubric.ts); the unit test keeps them equal. */
+export const FIXTURE_RUBRIC_SCHEMA_VERSION = 1;
+/** = `DEFAULT_SEVERITY_LEVELS` (types/rubric.ts), most severe first; kept equal by the unit test. */
+export const FIXTURE_SEVERITY_LEVELS: readonly string[] = ["critical", "high", "medium", "low"];
 
 // ============================================
 // Ids (flows deep-link and assert on these)
@@ -252,7 +258,7 @@ export function buildE2eRubricVersion(): VisaRubric {
     routeSlug: E2E_FIXTURE.visaTypeId,
     countryCode: E2E_FIXTURE.countryCode,
     visaTypeId: E2E_FIXTURE.visaTypeId,
-    schemaVersion: RUBRIC_SCHEMA_VERSION,
+    schemaVersion: FIXTURE_RUBRIC_SCHEMA_VERSION,
     version: E2E_FIXTURE.rubricVersion,
 
     // ---- review: approved, attributable, polarity decided ----
@@ -266,7 +272,7 @@ export function buildE2eRubricVersion(): VisaRubric {
 
     // ---- content ----
     intentPolarityProposal: null,
-    severityLevels: [...DEFAULT_SEVERITY_LEVELS],
+    severityLevels: [...FIXTURE_SEVERITY_LEVELS],
     criteria: buildE2eCriteria(),
     intake: {
       title: "About your visit",
