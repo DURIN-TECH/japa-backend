@@ -1,6 +1,7 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { transactionService, TransactionFilters } from "../services/transaction.service";
+import { toClientTransaction } from "../transactions/client-transaction";
 import { collections } from "../utils/firebase";
 import { Agent } from "../types";
 import { ROLES } from "@durin-tech/authz";
@@ -35,6 +36,17 @@ export class TransactionController {
    *
    * Money is returned as stored: `amount` in minor units of each row's own
    * `currency` (see money/totals.ts). Nothing is converted or summed.
+   *
+   * Response shape (issue #329). It depends on the SCOPE, not on the row:
+   *  - client scope: each row is a `ClientTransaction`, an explicit
+   *    allow-list (transactions/client-transaction.ts): id, type, status,
+   *    description / service name, the amount charged, the dollar price, the
+   *    related case / booking id and the dates. Seli's exchange-rate markup
+   *    (`fxMarginBps`), the raw rate, agent ids and Paystack references are
+   *    NOT returned. This also holds for an agent-side caller who asks for
+   *    `role=client`: they are then a paying customer like any other;
+   *  - agent, owner and admin scopes: the full stored `Transaction`, as
+   *    before.
    */
   async getTransactions(
     req: AuthenticatedRequest,
@@ -73,7 +85,10 @@ export class TransactionController {
           userId,
           filters
         );
-        sendSuccess(res, own);
+        // (#329) Never the stored documents: project every row onto the
+        // client allow-list, so the markup, the raw rate and internal ids
+        // stay on the server.
+        sendSuccess(res, own.map(toClientTransaction));
         return;
       }
 

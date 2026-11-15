@@ -182,8 +182,12 @@ describe("GET /transactions as a client (issue #292)", () => {
   test("no role: the client's paid consultation and payment-request charges, newest first", async () => {
     const out = await list(clientNg);
     assert.deepEqual(ids(out), [TX.ngRequestAgentB, TX.ngRequest, TX.ngConsultation]);
-    // Every row is the caller's own.
-    for (const t of out.body.data as Transaction[]) assert.equal(t.userId, clientNg.uid);
+    // Every row is the caller's own. (#329) The response no longer carries
+    // `userId` (it is an allow-listed view), so the payer is checked on the
+    // stored rows the response was built from.
+    const stored = await transactionService.getTransactionsForClient(clientNg.uid);
+    assert.deepEqual(stored.map((t) => t.id), ids(out));
+    for (const t of stored) assert.equal(t.userId, clientNg.uid);
   });
 
   test("role=client returns the same rows as no role", async () => {
@@ -197,7 +201,10 @@ describe("GET /transactions as a client (issue #292)", () => {
     assert.equal(consultation.type, "consultation_fee");
     assert.equal(consultation.consultationId, "consult-ng");
     assert.equal(charge.type, "escrow_release");
-    assert.equal(charge.paymentRequestId, "pr-ng");
+    // (#329) The charge is tied to the client's case; the internal
+    // payment-request id is not part of the client view.
+    assert.equal(charge.applicationId, APP_A);
+    assert.equal("paymentRequestId" in charge, false);
   });
 
   test("money is returned per row in its own currency, untouched", async () => {
@@ -250,8 +257,9 @@ describe("GET /transactions never leaks across clients (issue #292)", () => {
   for (const role of roleValues) {
     test(`a client passing role=${JSON.stringify(role)} still gets only their own rows`, async () => {
       const out = await list(clientGh, { role });
+      // The ids are exactly the Ghanaian client's own two rows (the seed
+      // gives every other row another payer), so no wider scope was reached.
       assert.deepEqual(ids(out), [TX.ghRequest, TX.ghConsultation]);
-      for (const t of out.body.data as Transaction[]) assert.equal(t.userId, clientGh.uid);
     });
   }
 

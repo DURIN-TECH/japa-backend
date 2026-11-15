@@ -152,6 +152,11 @@ class TransactionService {
    * Money is returned as stored: `amount` in minor units of the row's own
    * `currency`. Nothing is converted or summed here.
    *
+   * These are the FULL stored documents (markup, raw rate, agent ids and
+   * Paystack references included). They must not be sent to the client as
+   * they are: the controller projects each one through
+   * `toClientTransaction` (transactions/client-transaction.ts, issue #329).
+   *
    * @param clientUserId the paying client's user uid (always the caller's own)
    * @param filters optional list filters, same meaning as for the agent view
    * @returns the client's own transactions, newest first

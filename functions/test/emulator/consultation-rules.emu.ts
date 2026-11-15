@@ -22,7 +22,9 @@
 //     (`paymentStatus: "paid"`, `chargedAmountMinor`, `supersededCheckouts`)
 //     and a create that claims to be paid;
 //  3. the stored booking is unchanged afterwards;
-//  4. transactions stay read-only for clients (the fee Transaction).
+//  4. the fee Transaction cannot be read or written by the client at all
+//     (issue #329: transactions are backend-only; the app reads its payment
+//     history through GET /transactions).
 
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -159,13 +161,16 @@ describe("consultation writes are backend only", () => {
 });
 
 // ============================================
-// 3. Transactions stay read-only for clients
+// 3. Transactions are closed to clients
 // ============================================
 
-describe("fee transactions stay read-only for clients", () => {
-  test("the client reads their own transaction but cannot write one", async () => {
+describe("fee transactions are closed to clients", () => {
+  test("the client can neither read their own transaction nor write one", async () => {
     const db = await as(CLIENT);
-    assert.equal((await db.collection("transactions").doc("cr-tx").get()).data().amount, 1_500_000);
+    // (#329) Before: the payer could read the whole document (markup, raw
+    // rate, agent ids). Now a direct read is refused, own document or not.
+    assert.equal(await isDenied(db.collection("transactions").doc("cr-tx").get()), true);
+    assert.equal(await isDenied(db.collection("transactions").where("userId", "==", CLIENT).get()), true);
     assert.equal(await isDenied(db.collection("transactions").doc("cr-tx").update({ amount: 1 })), true);
     assert.equal(
       await isDenied(db.collection("transactions").doc("cr-tx2").set({ id: "cr-tx2", userId: CLIENT, amount: 1 })),
