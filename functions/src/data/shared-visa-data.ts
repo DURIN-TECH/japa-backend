@@ -60,6 +60,28 @@
 //           guidanceSourceId: "<id of the stored official source (guidanceSources)>",
 //           // ruleRef: { routeKey: "<rulebook key>", version: 1, criterionId: "<rule id>" },  // optional
 //         },
+//         // OPTIONAL (issue #339): the processing time and the stay limit the
+//         // route's official source sets for every member. The seed writes the
+//         // text (and any day count) on each record under `inheritedBy`, which
+//         // must then set none of those fields itself in the seed. `quote` is a
+//         // LIST of verbatim sentences copied from the source by script; every
+//         // number in the text and the day counts must be stated in it, or the
+//         // file is refused. A figure the source does not state is left out
+//         // (never written as 0).
+//         processing: {
+//           processingTime: "Up to 10 days",  // the text the app shows
+//           processingDaysMax: 10,            // optional, whole days, 1 or more
+//           // processingDaysMin: 5,          // optional, only when the source states it
+//           quote: ["<verbatim sentence stating the 10 days>"],
+//           url: "https://www.gov.example.org/processing",
+//           guidanceSourceId: "<id of the stored official source>",
+//         },
+//         validity: {
+//           validityPeriod: "Stays of up to 30 days",   // shown under "Valid for"
+//           quote: ["<verbatim sentence stating the 30 days>"],
+//           url: "https://www.gov.example.org/stay",
+//           guidanceSourceId: "<id of the stored official source>",
+//         },
 //       },
 //     ],
 //   };
@@ -471,6 +493,46 @@ export const SHARED_VISA_DATA: unknown = {
         url: "https://publications.europa.eu/resource/celex/02009R0810-20240628",
         guidanceSourceId: "schengen-area-visa-code-regulation-ec-no-810-2009-consolidated-text-of-28-june-2024",
         ruleRef: { routeKey: "schengen-area_schengen-area-short-stay", version: 1, criterionId: "crit_1cd0c13dfe34a0ff" },
+      },
+      // ---- The route's processing time and stay limit (issue #339) ----
+      // Read on 2026-11-15 from the Visa Code's consolidated text (the same
+      // official source as the fee: same `url`, same `guidanceSourceId`),
+      // fetched with `Accept: application/xhtml+xml` and `Accept-Language: eng`
+      // by test/data/fixtures/fetch-visa-code-text.ts. Every `quote` sentence
+      // was COPIED BY SCRIPT from that text, never retyped; \u00a0 is the
+      // non-breaking space the publisher puts there, kept so the sentence
+      // matches the source character for character (a unit test checks each
+      // sentence against the stored copy of the text). Amendment markers such
+      // as "▼M5" are not part of the text.
+      // The seed writes these on every record under `inheritedBy`
+      // (seed-route-facts.ts), with one citation per fact (`sourcedFacts`).
+      // Whether and when the visa can be extended (Article 33) is NOT recorded
+      // here: it is conditional, and is tracked in #344.
+      processing: {
+        // Article 23(1) and 23(2). The source states no minimum, so none is
+        // recorded (`processingDaysMin` absent, never 0).
+        processingTime: "Up to 15 calendar days (up to 45 in individual cases)",
+        processingDaysMax: 45,
+        quote: [
+          // Article 23(1).
+          "Applications shall be decided on within 15 calendar days of the date of the lodging of an application which is admissible in accordance with Article 19.",
+          // Article 23(2).
+          "That period may be extended up to a maximum of\u00a045 calendar days in individual cases, notably when further scrutiny of the application is needed.",
+        ],
+        url: "https://publications.europa.eu/resource/celex/02009R0810-20240628",
+        guidanceSourceId: "schengen-area-visa-code-regulation-ec-no-810-2009-consolidated-text-of-28-june-2024",
+      },
+      validity: {
+        // Article 1(1): the stay limit. The Visa Code sets no single validity
+        // period for the visa itself, so "Valid for" shows the stay limit
+        // (orchestrator decision of 2026-11-15 on #339).
+        validityPeriod: "Stays of up to 90 days in any 180-day period",
+        quote: [
+          // Article 1(1).
+          "This Regulation establishes the procedures and conditions for issuing visas for intended stays on the territory of the Member\u00a0States not exceeding\u00a090 days in any\u00a0180-day period.",
+        ],
+        url: "https://publications.europa.eu/resource/celex/02009R0810-20240628",
+        guidanceSourceId: "schengen-area-visa-code-regulation-ec-no-810-2009-consolidated-text-of-28-june-2024",
       },
     },
   ],
