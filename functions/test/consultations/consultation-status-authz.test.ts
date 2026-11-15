@@ -40,6 +40,7 @@ import {
   CONSULTATION_STATUSES,
   STATUS_TRANSITIONS,
   decideStatusChange,
+  isPaymentInFlight,
 } from "../../src/services/consultation.service";
 import { notificationService } from "../../src/services/notification.service";
 import type { ConsultationStatus } from "../../src/types";
@@ -284,6 +285,77 @@ describe("PUT /consultations/:id/status — validation and non-parties", () => {
 });
 
 // ============================================
+// Former agents (issue #321)
+// ============================================
+//
+// `booking.agentId` is never cleared, so a user who is no longer an agent
+// (their resolved role is back to `client`) must not keep agent-side rights
+// on their old bookings.
+
+describe("PUT /consultations/:id/status — a former agent (#321)", () => {
+  /** The booking's `agentId`, whose role has gone back to client. */
+  const formerAgent: AuthzSubject = { uid: "uid-agent1", role: ROLES.CLIENT, agencyId: null };
+  /** The agent-only targets, each with a status it may be reached from. */
+  const AGENT_ONLY: Array<[ConsultationStatus, ConsultationStatus]> = [
+    ["confirmed", "scheduled"],
+    ["in_progress", "confirmed"],
+    ["completed", "in_progress"],
+    ["no_show", "confirmed"],
+  ];
+
+  test("role client on the booking's agentId: 403 for every agent-only target, nothing written", async () => {
+    for (const [target, from] of AGENT_ONLY) {
+      harness.reset();
+      await seedBooking(from);
+      // The same move is allowed for the same uid while they ARE an agent...
+      assert.deepEqual(
+        decideStatusChange(CONSULTATION_ACTORS.AGENT_SIDE, { status: from }, target, harness.clock.now()),
+        { ok: true },
+        `${from} -> ${target} is a legal agent-side move`
+      );
+      // ...and refused once their role is client.
+      assertRefused(await setStatus(formerAgent, target), 403, "FORBIDDEN", `former agent ${from} -> ${target}`);
+      assert.equal(statusOf(), from);
+    }
+  });
+
+  test("a former agent cannot cancel their old booking either (they are no party of it)", async () => {
+    await seedBooking("scheduled");
+    assertRefused(await setStatus(formerAgent, "cancelled"), 403, "FORBIDDEN", "former agent cancel");
+    assert.equal(statusOf(), "scheduled");
+  });
+
+  test("the same uid with role agent or owner is still agent side", async () => {
+    for (const role of [ROLES.AGENT, ROLES.OWNER]) {
+      harness.reset();
+      await seedBooking("scheduled");
+      // No agency on the principal: only `booking.agentId === uid` can match.
+      assertOk(await setStatus({ uid: "uid-agent1", role, agencyId: null }, "confirmed"), role);
+      assert.equal(statusOf(), "confirmed", role);
+    }
+  });
+
+  test("a former agent who is also the booking's userId is its CLIENT: may cancel, nothing else", async () => {
+    // A booking the former agent holds as a client of themselves (both ids).
+    await seedBooking("scheduled", { userId: "uid-agent1" });
+    for (const [target] of AGENT_ONLY) {
+      assertRefused(await setStatus(formerAgent, target), 403, "FORBIDDEN", `as client -> ${target}`);
+    }
+    assertOk(await setStatus(formerAgent, "cancelled"), "as client -> cancelled");
+    assert.equal(statusOf(), "cancelled");
+  });
+
+  test("admins and the owner of the booking's agency are unchanged", async () => {
+    for (const p of [admin, ownerA]) {
+      harness.reset();
+      await seedBooking("scheduled");
+      assertOk(await setStatus(p, "confirmed"), p.uid);
+      assert.equal(statusOf(), "confirmed", p.uid);
+    }
+  });
+});
+
+// ============================================
 // Allowed changes: response, stored fields, notification
 // ============================================
 
@@ -381,6 +453,20 @@ describe("PUT /consultations/:id/status — cancelling while a payment is in fli
     assert.equal(statusOf(), "cancelled");
   });
 
+  test("#321: a failed Paystack start (a transactionId, no checkoutUrl) can be cancelled inside the lock: 200", async () => {
+    // The charge path claimed its reference, then Paystack refused to open
+    // the checkout: the booking has a reference and a live quote lock, but
+    // nobody was ever shown a page to pay on.
+    for (const p of [client, agent, ownerA, admin]) {
+      harness.reset();
+      await seedInFlight({ checkoutUrl: undefined });
+      const out = await setStatus(p, "cancelled");
+      assertOk(out, p.uid);
+      assert.equal(out.status, 200, p.uid);
+      assert.equal(statusOf(), "cancelled", p.uid);
+    }
+  });
+
   test("a legacy pending booking (a reference, no quote lock) can be cancelled", async () => {
     await seedBooking("pending_payment", { transactionId: "ref-legacy", fee: 50_000 });
     assertOk(await setStatus(agent, "cancelled"), "legacy");
@@ -460,11 +546,27 @@ describe("decideStatusChange", () => {
 
   test("the in-flight rule is exact at the lock boundary", () => {
     const expires = Timestamp.fromDate(new Date("2026-11-13T09:30:00Z"));
-    const booking = { status: "pending_payment" as ConsultationStatus, transactionId: "ref", quoteExpiresAt: expires };
+    const booking = {
+      status: "pending_payment" as ConsultationStatus, transactionId: "ref",
+      // Issue #321: in flight needs a checkout that was really opened.
+      checkoutUrl: "https://checkout.paystack.test/ref", quoteExpiresAt: expires,
+    };
     const at = (iso: string) => decideStatusChange(CONSULTATION_ACTORS.CLIENT, booking, "cancelled", new Date(iso));
     assert.equal((at("2026-11-13T09:29:59Z") as any).code, "PAYMENT_IN_PROGRESS");
     assert.equal((at("2026-11-13T09:30:00Z") as any).code, "PAYMENT_IN_PROGRESS");
     assert.deepEqual(at("2026-11-13T09:30:01Z"), { ok: true });
+  });
+
+  test("#321: a reference with no checkoutUrl is not in flight, even inside the lock", () => {
+    const expires = Timestamp.fromDate(new Date("2026-11-13T09:30:00Z"));
+    const booking = { status: "pending_payment" as ConsultationStatus, transactionId: "ref", quoteExpiresAt: expires };
+    const inside = new Date("2026-11-13T09:10:00Z");
+    assert.equal(isPaymentInFlight(booking, inside), false);
+    assert.equal(isPaymentInFlight({ ...booking, checkoutUrl: "" }, inside), false);
+    assert.equal(isPaymentInFlight({ ...booking, checkoutUrl: "https://checkout.paystack.test/ref" }, inside), true);
+    for (const actor of [CONSULTATION_ACTORS.CLIENT, CONSULTATION_ACTORS.AGENT_SIDE]) {
+      assert.deepEqual(decideStatusChange(actor, booking, "cancelled", inside), { ok: true }, actor);
+    }
   });
 });
 

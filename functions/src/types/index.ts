@@ -1270,6 +1270,9 @@ export type ConsultationType =
   | "follow_up"
   | "general";
 
+/** Issue #321: how a consultation was booked (see `Consultation.bookedVia`). */
+export type ConsultationBookedVia = "client" | "agent" | "public_page";
+
 /**
  * A consultation booking.
  *
@@ -1288,6 +1291,22 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   agentId: string;
   agencyId?: string;
   applicationId?: string;
+
+  // Issue #321: HOW the booking was made, written once at creation and never
+  // changed. It decides whether an UNPAID booking proves that the client
+  // chose this agent (see `isClientOfAgent` in consultation.controller.ts):
+  //  - "client":      the client booked it themselves while signed in
+  //                   (client flow of POST /consultations). Counts as a
+  //                   relationship even when free or still unpaid.
+  //  - "agent":       an agent or owner booked it for the client (agent flow
+  //                   of POST /consultations). Counts only once PAID.
+  //  - "public_page": a guest booked it on an agency's public page by typing
+  //                   an email (POST /agencies/public/:slug/consultations).
+  //                   Anyone can type anyone's email, so it counts only once
+  //                   PAID.
+  // Absent on bookings made before #321: those count only once paid (no
+  // backfill; nothing had been released to real users).
+  bookedVia?: ConsultationBookedVia;
 
   // Denormalized display fields
   clientName: string;
@@ -1771,11 +1790,24 @@ export interface Message {
   createdAt: Timestamp;
 }
 
+/** Issue #321: which side opened a conversation (see `Conversation.startedBy`). */
+export type ConversationStartedBy = "user" | "agent";
+
 export interface Conversation {
   id: string;
   userId: string;
   agentId: string;
   applicationId?: string;
+
+  // Issue #321: WHICH SIDE opened the conversation, written once when it is
+  // created and never changed. "user" = the client opened it themselves;
+  // "agent" = the agent side (or the backend on the agent's behalf, e.g. when
+  // an agent creates an application) opened it. An agent can open a
+  // conversation with any uid, so only a "user"-started conversation, or one
+  // the client has sent a message in, proves the client knows the agent (see
+  // `isClientOfAgent` in consultation.controller.ts). Absent on conversations
+  // made before #321: those count only through the client-message check.
+  startedBy?: ConversationStartedBy;
 
   lastMessageAt: Timestamp;
   lastMessage?: string;

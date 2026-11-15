@@ -1,5 +1,5 @@
 import { collections, subcollections, db, increment } from "../utils/firebase";
-import { Conversation, Message } from "../types";
+import { Conversation, ConversationStartedBy, Message } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 
 class MessagingService {
@@ -46,11 +46,31 @@ class MessagingService {
 
   /**
    * Create or get existing conversation between a user and agent.
+   *
+   * Issue #321: a NEW conversation records which side opened it
+   * (`startedBy`). An agent can open a conversation with any uid, so the
+   * agent-booking relationship check (`isClientOfAgent`, consultation
+   * controller) counts a conversation only when the CLIENT started it or has
+   * sent a message in it.
+   *
+   * `startedBy` is written ONLY when the conversation is created. An existing
+   * conversation is returned untouched, so an agent-started one never turns
+   * into a client-started one because the client later opened the same chat
+   * (it starts to count when the client sends a message).
+   *
+   * @param userId the client's user uid
+   * @param agentId the agent DOCUMENT id (not a user uid)
+   * @param applicationId the application the chat is about, if any
+   * @param startedBy which side is opening it. Defaults to "agent", the side
+   *   that does NOT count as a relationship, so a caller that does not say
+   *   can never create one by accident. Only the client-initiated path of
+   *   POST /conversations passes "user".
    */
   async getOrCreateConversation(
     userId: string,
     agentId: string,
-    applicationId?: string
+    applicationId?: string,
+    startedBy: ConversationStartedBy = "agent"
   ): Promise<Conversation> {
     // Check for existing conversation
     let query = collections.conversations
@@ -63,6 +83,7 @@ class MessagingService {
 
     const existing = await query.limit(1).get();
     if (!existing.empty) {
+      // Returned as stored: `startedBy` is never rewritten (see above).
       return existing.docs[0].data() as Conversation;
     }
 
@@ -74,6 +95,8 @@ class MessagingService {
       userId,
       agentId,
       applicationId,
+      // Issue #321: who opened it, fixed at creation.
+      startedBy,
       lastMessageAt: now,
       unreadCountUser: 0,
       unreadCountAgent: 0,
