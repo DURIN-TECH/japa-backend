@@ -122,9 +122,9 @@ export interface AssessmentDeps {
   // Optional so existing fakes keep working; defaults to the Firestore read.
   loadAuthorityMembers?: (authorityId: string) => Promise<AuthorityMember[]>;
   // (#309) The application's intake, as the intake screen sees it (only
-  // `available` and `openRequiredIds` are read). Optional so existing fakes
-  // keep working; defaults to `intakeService.getIntake`.
-  readIntake?: (app: Application) => Promise<Pick<IntakeResponse, "available" | "openRequiredIds">>;
+  // `available`, `editable` and `openRequiredIds` are read). Optional so
+  // existing fakes keep working; defaults to `intakeService.getIntake`.
+  readIntake?: (app: Application) => Promise<Pick<IntakeResponse, "available" | "editable" | "openRequiredIds">>;
 }
 
 // ----------------------------------------------------------------
@@ -658,15 +658,20 @@ export class AiCaseOfficerService {
 
   /**
    * (#309) What an application still needs before it can be reviewed.
-   *  - intake: only when the route has one (`available`); open = the intake
-   *    service's own `openRequiredIds` (required, visible, unanswered).
+   *  - intake: only when the route has one (`available`) AND it can still be
+   *    answered (`editable`: draft, pending_payment, pending_documents); open =
+   *    the intake service's own `openRequiredIds` (required, visible, unanswered).
+   *    Past those statuses a save is refused (409 NOT_EDITABLE), so asking for
+   *    answers would block the review for good: the review runs instead and
+   *    reports those rules as "could not be assessed", as before #309.
    *  - documents: `loaded.documents`, which already leaves the refusal letter out.
    * The statement is not required.
    */
   async contentGapsOf(app: Application, loaded: Pick<LoadedInputs, "documents">): Promise<ReviewContentGaps> {
     const readIntake = this.deps.readIntake ?? ((a: Application) => intakeService.getIntake(a));
     const intake = await readIntake(app);
-    const openRequiredCount = intake.available ? intake.openRequiredIds.length : 0;
+    // 0 (and no "intake" entry) when there is no intake or it can no longer be edited.
+    const openRequiredCount = intake.available && intake.editable ? intake.openRequiredIds.length : 0;
     const missing: ReviewMissingPart[] = [];
     if (openRequiredCount > 0) missing.push("intake");
     if (loaded.documents.length === 0) missing.push("documents");
