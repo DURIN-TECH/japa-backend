@@ -11,6 +11,9 @@ import {
   // Issue #316: the value checks and the "did it really move" test of the edit route.
   parseEditBody,
   scheduleChanged,
+  // Issues #316 / #288: a booking's time is stored as 24-hour `HH:mm`, on
+  // create as well as on edit, so "the same slot" compares like with like.
+  normalizeScheduledTime,
 } from "../services/consultation.service";
 import { notificationService } from "../services/notification.service";
 import { agencyService } from "../services/agency.service";
@@ -95,6 +98,19 @@ function isUsableDocId(id: unknown): id is string {
  * answers "no relationship through conversations" (it fails closed).
  */
 const CONVERSATIONS_CHECKED = 20;
+
+/**
+ * Issue #288: the two body shapes a pending booking's checkout is answered in
+ * (see `answerPendingCheckout`):
+ *  - "checkout": `POST /consultations/:id/checkout`: the checkout fields next
+ *    to a payer-safe `consultation` summary;
+ *  - "create": a RESUMED `POST /consultations`: the booking's own fields at
+ *    the top level, as a fresh create answers, plus `resumed: true`.
+ */
+type PendingCheckoutShape = "checkout" | "create";
+
+/** The 400 message for a `scheduledTime` that is neither accepted form (same wording as the edit route, #316). */
+const BAD_SCHEDULED_TIME = "scheduledTime must be a 24-hour HH:mm or a 12-hour h:mm AM/PM time";
 
 export class ConsultationController {
   /**
@@ -300,6 +316,33 @@ export class ConsultationController {
    * value is 400 VALIDATION_ERROR before anything is read or written. The
    * choice is stored on the booking (`checkoutCallbackUrl`) and kept by every
    * re-priced checkout.
+   *
+   * Issue #288 (both flows): `scheduledTime` may be 24-hour `HH:mm` or
+   * 12-hour `h:mm AM/PM` and is always STORED as `HH:mm`; anything else, or a
+   * `scheduledDate` that is not a date, is 400 VALIDATION_ERROR before any
+   * read or write.
+   *
+   * Issue #288, RESUME (client-initiated flow only): when the caller already
+   * has an unpaid (`pending_payment`) booking with the same agent, the same
+   * `scheduledDate` (same instant) and the same `scheduledTime`, NO new
+   * booking is written. The newest such booking is answered exactly as
+   * `POST /consultations/:id/checkout` would answer it (`answerPendingCheckout`):
+   *  - 200 (not 201) with the booking's fields, `requiresPayment`,
+   *    `authorizationUrl`, `reference` and `resumed: true`: the SAME checkout
+   *    inside the quote lock, a fresh quote and checkout after it;
+   *  - 200 with `requiresPayment: false` and `resumed: true` when Paystack
+   *    says that checkout was in fact paid (it is settled here);
+   *  - 409 PAYMENT_IN_PROGRESS (with `data.consultation.id`) when Paystack
+   *    reports it in progress: nothing written, nothing re-priced;
+   *  - 409 CHECKOUT_OPENING (with `data.consultation.id`) when another
+   *    request is opening the checkout right now.
+   * A resume is not a new booking, so it is decided BEFORE the monthly limit
+   * and the pricing and counts against neither. `returnTo: "app"` applies to
+   * any NEW checkout a resume issues. A booking of that slot that is paid,
+   * free or cancelled is not resumed: a new one is created as before. The
+   * find-or-create is one Firestore transaction
+   * (`createOrResumePendingBooking`), so two requests that arrive together
+   * leave exactly one booking. The agent-initiated flow never resumes.
    */
   async createConsultation(
     req: AuthenticatedRequest,
@@ -341,6 +384,25 @@ export class ConsultationController {
         );
         return;
       }
+
+      // Issue #288 (add-on from #316): the time is stored as 24-hour `HH:mm`
+      // whichever accepted form was sent, so a later request for "the same
+      // slot" matches it. A value that is neither form is a plain 400.
+      const normalizedTime = normalizeScheduledTime(scheduledTime);
+      if (normalizedTime === null) {
+        sendError(res, "VALIDATION_ERROR", BAD_SCHEDULED_TIME);
+        return;
+      }
+      // The day, parsed once: it is stored below and compared (as an instant)
+      // with the client's unpaid bookings. An unparseable value used to throw
+      // inside Timestamp.fromDate and answer 500.
+      const scheduledAt = new Date(scheduledDate);
+      if (Number.isNaN(scheduledAt.getTime())) {
+        sendError(res, "VALIDATION_ERROR", "scheduledDate must be a valid date");
+        return;
+      }
+      const { Timestamp } = await import("firebase-admin/firestore");
+      const scheduledTimestamp = Timestamp.fromDate(scheduledAt);
 
       // Determine if auth'd user is an agent or a client
       const agentProfile = await this.getAgentForUser(authUserId);
@@ -458,6 +520,28 @@ export class ConsultationController {
       }
       const client = clientDoc.data()!;
 
+      // --- Issue #288: resume the client's unpaid booking of this slot ------
+      // Client flow only. Done BEFORE the monthly limit and the pricing: a
+      // resume writes no new booking, so it neither counts against the limit
+      // nor needs a rate (inside the quote lock the same checkout is simply
+      // handed back). `returnTo` is passed on as on POST /:id/checkout: it
+      // sets the return URL of a NEW checkout only.
+      if (!agentProfile) {
+        const pending = await consultationService.findResumableBooking({
+          userId: resolvedClientId,
+          agentId: resolvedAgentUserId,
+          scheduledDate: scheduledTimestamp,
+          scheduledTime: normalizedTime,
+        });
+        if (pending) {
+          await this.answerPendingCheckout(res, pending, {
+            requestedCallbackUrl: selectCallbackUrl(returnTo.value),
+            shape: "create",
+          });
+          return;
+        }
+      }
+
       // Enforce the per-plan monthly consultation limit for the booking subscriber
       // (agency / independent agent / client — matches whose entitlements loaded).
       // No-op until a plan with this limit is assigned.
@@ -525,9 +609,9 @@ export class ConsultationController {
         ? selectCallbackUrl(returnTo.value, this.signedInCallbackUrl()) ?? this.signedInCallbackUrl()
         : undefined;
 
-      const { Timestamp } = await import("firebase-admin/firestore");
-
-      const consultation = await consultationService.createConsultation({
+      // The booking to store (the same fields for a plain create and for the
+      // find-or-create below).
+      const booking = {
         userId: resolvedClientId,
         agentId: resolvedAgentUserId,
         // Firestore rejects undefined: only set the optional links when known.
@@ -541,8 +625,9 @@ export class ConsultationController {
         clientEmail: client.email,
         agentName: agentDisplayName,
         type,
-        scheduledDate: Timestamp.fromDate(new Date(scheduledDate)),
-        scheduledTime,
+        scheduledDate: scheduledTimestamp,
+        // #288: always the normalised 24-hour `HH:mm`.
+        scheduledTime: normalizedTime,
         durationMinutes: durationMinutes || 30,
         timezone: timezone || "Africa/Lagos",
         ...(meetingPlatform ? { meetingPlatform } : {}),
@@ -551,7 +636,29 @@ export class ConsultationController {
         ...(charge
           ? { ...charge, status: "pending_payment" as const, paymentStatus: "pending" as const }
           : { priceUsdCents: 0, status: "scheduled" as const, paymentStatus: "paid" as const }),
-      });
+      };
+
+      let consultation: Consultation;
+      if (charge && !agentProfile) {
+        // Issue #288: a client's PAID booking is find-or-create in ONE
+        // transaction. The early look above found nothing, but a second
+        // request for the same slot (a double tap, two devices) may have
+        // written its booking since; then that one is resumed here and
+        // nothing is written, so the two requests leave exactly one booking.
+        const outcome = await consultationService.createOrResumePendingBooking(booking);
+        if (outcome.kind === "existing") {
+          await this.answerPendingCheckout(res, outcome.consultation, {
+            requestedCallbackUrl: selectCallbackUrl(returnTo.value),
+            shape: "create",
+          });
+          return;
+        }
+        consultation = outcome.consultation;
+      } else {
+        // A free booking, or one an agent makes: created as before (#288
+        // leaves the agent flow unchanged; a free booking is never pending).
+        consultation = await consultationService.createConsultation(booking);
+      }
 
       if (!charge) {
         sendCreated(res, { ...consultation, requiresPayment: false });
@@ -646,75 +753,9 @@ export class ConsultationController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
-      if (consultation.paymentStatus === "paid") {
-        sendSuccess(res, { requiresPayment: false, consultation: bookingSummary(consultation) });
-        return;
-      }
-      // Only a #180-priced pending booking can be (re)charged; a legacy row
-      // is never re-priced and a cancelled one is closed.
-      if (consultation.status !== "pending_payment" || !hasChargeSnapshot(consultation)) {
-        sendError(res, "BOOKING_NOT_PAYABLE", "This booking cannot be paid", 409);
-        return;
-      }
-
-      // A current checkout: what does Paystack say about it?
-      //
-      // Issue #181 review round 2 (shared with payment requests): asked
-      // whenever the booking carries a reference, not only when a URL was
-      // published, so a checkout that opened at Paystack but whose publish
-      // never landed is still checked for a payment before it is replaced.
-      // A `cons-` reference we claimed that Paystack never opened (initialize
-      // failed after the claim) answers `final_unpaid` (lookupCheckoutState)
-      // instead of a 502 on every retry; an outage is still 502.
-      if (consultation.transactionId) {
-        const { state, result } = await lookupCheckoutState(consultation.transactionId);
-        // Paid after all: settle it, never re-charge.
-        if (state === "paid") {
-          const outcome = await settlePayment(id, consultation.transactionId, result!);
-          this.sendSettleOutcome(res, outcome, consultation.transactionId, "retry");
-          return;
-        }
-        // A payment may still land on it: keep it, do not re-price.
-        if (state === "in_progress") {
-          this.sendPaymentInProgress(res, consultation);
-          return;
-        }
-        // Inside the lock, with a published URL: hand back the same checkout.
-        if (consultation.checkoutUrl && !isQuoteExpired(consultation)) {
-          sendSuccess(res, {
-            requiresPayment: true,
-            authorizationUrl: consultation.checkoutUrl,
-            reference: consultation.transactionId,
-            consultation: bookingSummary(consultation),
-          });
-          return;
-        }
-      }
-
-      // Lock passed (or no checkout opened): a fresh quote and a new checkout.
-      let state: CheckoutState;
-      try {
-        state = await reissueCheckout(consultation, {
-          fallbackCallbackUrl: this.signedInCallbackUrl(),
-          // #285: the app return page when asked for on this call; else
-          // (undefined) the booking's stored return URL is kept.
-          callbackUrl: requestedCallbackUrl,
-        });
-      } catch (err) {
-        if (!isPricingFailure(err)) throw err;
-        this.sendPricingUnavailable(res);
-        return;
-      }
-      if (state.kind === "checkout") {
-        sendSuccess(res, {
-          requiresPayment: true,
-          authorizationUrl: state.authorizationUrl,
-          reference: state.reference,
-          consultation: bookingSummary(state.consultation),
-        });
-        return;
-      }
-      this.sendNoCheckout(res, state);
+      // Everything from here on is shared with a resumed POST /consultations
+      // (issue #288): see `answerPendingCheckout`.
+      await this.answerPendingCheckout(res, consultation, { requestedCallbackUrl, shape: "checkout" });
     } catch (error) {
       if (this.sendIfProviderError(res, error, "consultation checkout retry")) return;
       console.error("Error resuming consultation checkout:", error);
@@ -1084,6 +1125,11 @@ export class ConsultationController {
    * `chargedCurrency`. Free only when the fee is missing or a valid $0. A
    * malformed fee, or no usable rate, is 503 PRICING_UNAVAILABLE BEFORE any
    * account, booking or checkout is created.
+   *
+   * Issue #288: `scheduledTime` is stored as 24-hour `HH:mm` (12-hour
+   * `h:mm AM/PM` is converted; anything else is 400). A guest booking is
+   * NEVER resumed here (each submit makes its own booking); an unpaid one is
+   * closed by the hourly cleanup like any other.
    */
   async createPublicConsultation(
     req: AuthenticatedRequest,
@@ -1121,6 +1167,15 @@ export class ConsultationController {
       const normalizedEmail = clientEmail.trim().toLowerCase();
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedEmail)) {
         sendError(res, "VALIDATION_ERROR", "A valid clientEmail is required", 400);
+        return;
+      }
+      // Issue #288 (add-on from #316): the time is stored as 24-hour `HH:mm`
+      // on this path too (the page's time input already sends that; 12-hour
+      // `h:mm AM/PM` is converted). Anything else is a 400 before the agency
+      // is read, an account is made or a price is locked.
+      const normalizedTime = normalizeScheduledTime(scheduledTime);
+      if (normalizedTime === null) {
+        sendError(res, "VALIDATION_ERROR", BAD_SCHEDULED_TIME, 400);
         return;
       }
       // Constrain the free-text type to the known set; default to "initial".
@@ -1219,7 +1274,8 @@ export class ConsultationController {
         agentName: agency.ownerName,
         type: consultType,
         scheduledDate: Timestamp.fromDate(new Date(scheduledDate)),
-        scheduledTime,
+        // #288: always the normalised 24-hour `HH:mm`.
+        scheduledTime: normalizedTime,
         durationMinutes: 30,
         timezone: timezone || "Africa/Lagos",
         // Paid: the locked snapshot; free: priceUsdCents 0 and no Paystack.
@@ -1420,6 +1476,133 @@ export class ConsultationController {
   // ============================================
 
   /**
+   * Answer where a client's own booking stands with its payment, issuing a
+   * checkout when one is needed. The ONE implementation behind both
+   * `POST /consultations/:id/checkout` (issue #180) and a resumed
+   * `POST /consultations` (issue #288), so the two can never disagree. The
+   * caller has already checked that the booking is the caller's own.
+   *
+   *  - Already paid: `requiresPayment: false` with the booking.
+   *  - Not `pending_payment`, or a legacy row with no charge snapshot (never
+   *    re-priced): 409 BOOKING_NOT_PAYABLE.
+   *  - The current checkout (`transactionId`) is asked about at Paystack:
+   *     * paid after all: settled here (`settlePayment`), never re-charged;
+   *     * in progress: 409 PAYMENT_IN_PROGRESS with the SAME checkout;
+   *       nothing written, nothing re-priced;
+   *     * otherwise, inside the quote lock with a published URL: the SAME
+   *       checkout is handed back (no second charge is opened).
+   *  - Lock passed, or no checkout was ever opened: a FRESH quote and a new
+   *    checkout (`reissueCheckout`, race-safe). No usable rate: 503. A lost
+   *    race answers with the booking's current state (`sendNoCheckout`; 409
+   *    CHECKOUT_OPENING carries `data.consultation.id`).
+   *
+   * Provider failures throw (`PAYSTACK_ERROR: ...`); the calling route's
+   * catch answers 502.
+   *
+   * @param opts.requestedCallbackUrl issue #285: the return URL asked for on
+   *   THIS call (`returnTo: "app"`), applied to a NEW checkout only;
+   *   undefined keeps the booking's stored one
+   * @param opts.shape the body shape of the answer (see PendingCheckoutShape)
+   */
+  private async answerPendingCheckout(
+    res: Response,
+    consultation: Consultation,
+    opts: { requestedCallbackUrl?: string; shape: PendingCheckoutShape }
+  ): Promise<void> {
+    const { shape } = opts;
+    const id = consultation.id;
+
+    if (consultation.paymentStatus === "paid") {
+      this.sendBooking(res, shape, consultation, { requiresPayment: false });
+      return;
+    }
+    // Only a #180-priced pending booking can be (re)charged; a legacy row
+    // is never re-priced and a cancelled one is closed.
+    if (consultation.status !== "pending_payment" || !hasChargeSnapshot(consultation)) {
+      sendError(res, "BOOKING_NOT_PAYABLE", "This booking cannot be paid", 409);
+      return;
+    }
+
+    // A current checkout: what does Paystack say about it?
+    //
+    // Issue #181 review round 2 (shared with payment requests): asked
+    // whenever the booking carries a reference, not only when a URL was
+    // published, so a checkout that opened at Paystack but whose publish
+    // never landed is still checked for a payment before it is replaced.
+    // A `cons-` reference we claimed that Paystack never opened (initialize
+    // failed after the claim) answers `final_unpaid` (lookupCheckoutState)
+    // instead of a 502 on every retry; an outage is still 502.
+    if (consultation.transactionId) {
+      const { state, result } = await lookupCheckoutState(consultation.transactionId);
+      // Paid after all: settle it, never re-charge.
+      if (state === "paid") {
+        const outcome = await settlePayment(id, consultation.transactionId, result!);
+        this.sendSettleOutcome(res, outcome, consultation.transactionId, shape === "create" ? "resume" : "retry");
+        return;
+      }
+      // A payment may still land on it: keep it, do not re-price.
+      if (state === "in_progress") {
+        this.sendPaymentInProgress(res, consultation);
+        return;
+      }
+      // Inside the lock, with a published URL: hand back the same checkout.
+      if (consultation.checkoutUrl && !isQuoteExpired(consultation)) {
+        this.sendBooking(res, shape, consultation, {
+          requiresPayment: true,
+          authorizationUrl: consultation.checkoutUrl,
+          reference: consultation.transactionId,
+        });
+        return;
+      }
+    }
+
+    // Lock passed (or no checkout opened): a fresh quote and a new checkout.
+    let state: CheckoutState;
+    try {
+      state = await reissueCheckout(consultation, {
+        fallbackCallbackUrl: this.signedInCallbackUrl(),
+        // #285: the app return page when asked for on this call; else
+        // (undefined) the booking's stored return URL is kept.
+        callbackUrl: opts.requestedCallbackUrl,
+      });
+    } catch (err) {
+      if (!isPricingFailure(err)) throw err;
+      this.sendPricingUnavailable(res);
+      return;
+    }
+    if (state.kind === "checkout") {
+      this.sendBooking(res, shape, state.consultation, {
+        requiresPayment: true,
+        authorizationUrl: state.authorizationUrl,
+        reference: state.reference,
+      });
+      return;
+    }
+    this.sendNoCheckout(res, state, shape);
+  }
+
+  /**
+   * 200 with a booking and its payment fields, in the asked shape (issue
+   * #288, see PendingCheckoutShape):
+   *  - "checkout": `{ ...fields, consultation: <payer-safe summary> }`;
+   *  - "create": `{ ...<the booking>, ...fields, resumed: true }`, the shape
+   *    of a fresh create (which answers 201), so the app handles both alike.
+   *    The booking is the caller's own, as on a fresh create.
+   */
+  private sendBooking(
+    res: Response,
+    shape: PendingCheckoutShape,
+    c: Consultation,
+    fields: Record<string, unknown>
+  ): void {
+    if (shape === "create") {
+      sendSuccess(res, { ...c, ...fields, resumed: true });
+      return;
+    }
+    sendSuccess(res, { ...fields, consultation: bookingSummary(c) });
+  }
+
+  /**
    * Re-price on verify (issue #180) and answer: a checkout (new, or the
    * winner's after a lost race) is 409 `code` with it; a booking paid
    * meanwhile is 200 verified; anything else as sendNoCheckout. No usable
@@ -1488,15 +1671,37 @@ export class ConsultationController {
     );
   }
 
-  /** Answer a checkout state that is not a usable checkout (paid, closed, or still opening). */
-  private sendNoCheckout(res: Response, state: Exclude<CheckoutState, { kind: "checkout" }>): void {
+  /**
+   * Answer a checkout state that is not a usable checkout (paid, closed, or
+   * still opening).
+   *
+   * Issue #288: EVERY 409 CHECKOUT_OPENING (fresh create, resumed create,
+   * `/:id/checkout`, the guest booking) names the booking in
+   * `data.consultation` (the payer-safe `bookingSummary`, so
+   * `data.consultation.id` is the booking). The app keeps that id and retries
+   * through `POST /consultations/:id/checkout` instead of creating again.
+   *
+   * @param shape how a `paid` state is answered (see PendingCheckoutShape);
+   *   only a resumed create passes "create"
+   */
+  private sendNoCheckout(
+    res: Response,
+    state: Exclude<CheckoutState, { kind: "checkout" }>,
+    shape: PendingCheckoutShape = "checkout"
+  ): void {
     switch (state.kind) {
     case "paid":
-      sendSuccess(res, { requiresPayment: false, consultation: bookingSummary(state.consultation) });
+      this.sendBooking(res, shape, state.consultation, { requiresPayment: false });
       return;
     case "opening":
-      // Another request is opening the checkout right now.
-      sendError(res, "CHECKOUT_OPENING", "Your checkout is being prepared. Please try again in a moment.", 409);
+      // Another request is opening the checkout right now. No checkout to
+      // hand out yet, only which booking it is for.
+      res.status(409).json({
+        success: false,
+        error: "CHECKOUT_OPENING",
+        message: "Your checkout is being prepared. Please try again in a moment.",
+        data: { consultation: bookingSummary(state.consultation) },
+      });
       return;
     case "not_payable":
     default:
@@ -1508,20 +1713,25 @@ export class ConsultationController {
   /**
    * Answer the result of settling a successful Paystack payment (issue
    * #180). `mode` picks the success shape: verify answers `{ verified }`,
-   * the retry route `{ requiresPayment: false }`.
+   * the retry route `{ requiresPayment: false }`, both next to a payer-safe
+   * `consultation` summary. Issue #288: `resume` (a resumed
+   * `POST /consultations` that found its checkout paid) answers in the create
+   * shape: the booking's own fields, `requiresPayment: false`, `resumed: true`.
    */
   private sendSettleOutcome(
     res: Response,
     outcome: SettleOutcome | null,
     reference: string,
-    mode: "verify" | "retry"
+    mode: "verify" | "retry" | "resume"
   ): void {
     const ok = (c: Consultation, extra: Record<string, unknown> = {}) =>
-      sendSuccess(res, {
-        ...(mode === "verify" ? { verified: true } : { requiresPayment: false }),
-        ...extra,
-        consultation: bookingSummary(c),
-      });
+      mode === "resume"
+        ? this.sendBooking(res, "create", c, { requiresPayment: false, ...extra })
+        : sendSuccess(res, {
+          ...(mode === "verify" ? { verified: true } : { requiresPayment: false }),
+          ...extra,
+          consultation: bookingSummary(c),
+        });
     if (!outcome) {
       sendError(res, "NOT_FOUND", "Consultation not found", 404);
       return;

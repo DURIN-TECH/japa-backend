@@ -722,5 +722,17 @@ service cloud.firestore {
     match /withdrawalLocks/{agentUserId} {
       allow read, write: if false;
     }
+
+    // ---- Consultation booking locks (issue #288), explicit deny ----
+    // consultationBookingLocks/{hash of client uid + agent uid}: one document
+    // per client and agent pair, read and written by the backend inside the
+    // find-or-create transaction of POST /consultations (client flow), so two
+    // creates for the same slot can never both write a booking. Backend
+    // (Admin SDK) only: it names who books whom, and a client that could
+    // write it could make another client's bookings fail. Denied for every
+    // client, admins included.
+    match /consultationBookingLocks/{lockId} {
+      allow read, write: if false;
+    }
   }
 }
