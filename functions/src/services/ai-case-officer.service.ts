@@ -854,6 +854,10 @@ export class AiCaseOfficerService {
     };
 
     // ---- stage 2 evaluation: code decides ----
+    // (#308) `rubric` is the WHOLE rulebook narrowed to the applicable criteria
+    // (`{ ...fullRubric, criteria }` above), so it carries the rulebook's
+    // `evidenceItems`: a missing field fails a rule only when one of those
+    // document items names the rule; otherwise it is "not in documents".
     const objective = evaluateObjective(rubric, facts, extractions);
 
     // ---- stage 3: judgement, in as many calls as the rules need (#207) ----

@@ -124,6 +124,11 @@ export function deriveProposedActions(
     ...content.credibilityFlags.map((f) => ({ criterionId: f.criterionId, origin: "credibility_flag" as const, whatWouldHelp: f.whatWouldHelp ?? "" })),
     // (#207) A rule that could not be told to apply is waiting on an intake
     // answer, not on a document: no evidence action is proposed for it.
+    // (#308) The same filter drops a rule marked `not_in_documents` (its field
+    // is in no document and the rulebook names no document item for it): there
+    // is no document to ask for, so NO action of any kind is proposed. Only an
+    // unmarked item (a document that could not be read, a judgement check that
+    // could not be completed) reaches the list below.
     ...content.insufficientInformation.filter((i) => !i.notAssessed).map((i) => ({ criterionId: i.criterionId, origin: "insufficient_information" as const, whatWouldHelp: "" })),
   ];
 

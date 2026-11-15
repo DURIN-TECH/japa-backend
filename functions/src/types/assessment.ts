@@ -110,7 +110,14 @@ export interface InsufficientItem {
   // document, so no evidence request or proposed action is made for it, and it
   // is never one of the free tier's top issues.
   // (#234) `missing_fact`: a rule decided from what the applicant holds needs a fact they have not stated.
-  notAssessed?: "unanswered" | "no_trigger" | "missing_fact";
+  // (#308) `not_in_documents`: an objective rule whose checked field is in no
+  // uploaded document, and for which the rulebook names NO document item
+  // (`evidenceItems[].criterionIds`), so no upload could settle it (an
+  // exclusion order, a paid fee, biometrics). Stored for staff. Like
+  // `no_trigger` it is never a refusal ground or a top issue, makes no proposed
+  // action, and does not lower the band or the confidence. Clients must not
+  // list it to the applicant as something to act on.
+  notAssessed?: "unanswered" | "no_trigger" | "missing_fact" | "not_in_documents";
   // (#233) The rulebook layer the rule came from (its rulebook key), set only
   // when the application runs on a stack of more than one layer. Copied from
   // the rubric in code, never from model text.
