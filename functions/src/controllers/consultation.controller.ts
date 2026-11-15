@@ -8,6 +8,9 @@ import {
   CONSULTATION_ACTORS,
   CONSULTATION_STATUSES,
   SYSTEM_ONLY_STATUSES,
+  // Issue #316: the value checks and the schedule test of the edit route.
+  isScheduleEdit,
+  parseEditBody,
 } from "../services/consultation.service";
 import { notificationService } from "../services/notification.service";
 import { agencyService } from "../services/agency.service";
@@ -675,6 +678,54 @@ export class ConsultationController {
 
   /**
    * PUT /consultations/:id
+   *
+   * Issue #316: an edit is allowed only for the AGENT SIDE of the booking,
+   * and only for the fields that make sense in the booking's status. (It
+   * used to need only READ access, so the client, or anyone else who could
+   * read the booking, could move its time or rewrite its meeting link, and a
+   * booking could be rescheduled while its checkout was open.)
+   *
+   * Parties (see `consultationActor`): the AGENT SIDE is the booking's
+   * `agentId`, the owner of its agency, or an admin. The CLIENT (`userId`)
+   * edits nothing here: clients cancel through `PUT /consultations/:id/status`.
+   * An agent of the same agency who is not the booking's agent is not a party.
+   *
+   * Editable fields (anything else in the body is ignored):
+   *  - schedule: `scheduledDate`, `scheduledTime`, `durationMinutes`, `timezone`
+   *  - meeting:  `meetingLink`, `meetingPlatform`, `type`
+   *  - `summary`
+   *
+   * The rules live in ONE helper, `decideEdit` (consultation.service.ts):
+   *
+   *   status           | schedule fields          | meeting fields | summary
+   *   -----------------|--------------------------|----------------|--------
+   *   pending_payment  | yes, unless a payment is | yes            | yes
+   *                    | in flight (409           |                |
+   *                    | PAYMENT_IN_PROGRESS)     |                |
+   *   scheduled        | yes                      | yes            | yes
+   *   confirmed        | yes                      | yes            | yes
+   *   in_progress      | 409                      | yes            | yes
+   *   completed        | 409                      | 409            | yes
+   *   cancelled        | 409                      | 409            | 409
+   *   no_show          | 409                      | 409            | 409
+   *
+   * Answers, in the order they are checked:
+   *  - 400 VALIDATION_ERROR: no editable field in the body, or a bad value
+   *    (see `parseEditBody` for the rule per field), whoever asks;
+   *  - 404: unknown id;
+   *  - 403 FORBIDDEN: the caller is the client, or not a party at all;
+   *  - 409 BOOKING_NOT_EDITABLE: a field that is closed in the booking's
+   *    status (a plain "409" in the table);
+   *  - 409 PAYMENT_IN_PROGRESS: a schedule field on a `pending_payment`
+   *    booking whose checkout (`transactionId`) is still inside its quote
+   *    lock (`quoteExpiresAt` in the future). Meeting fields and `summary`
+   *    are still saved then.
+   *
+   * One body is all or nothing: a single refused field refuses the whole
+   * edit. EVERY refusal writes nothing and notifies nobody. A saved edit
+   * answers the updated booking; when it changed the schedule the client is
+   * told (`consultation_rescheduled`), and so is the booking's agent when
+   * the agency's owner or an admin made the change.
    */
   async updateConsultation(
     req: AuthenticatedRequest,
@@ -684,60 +735,62 @@ export class ConsultationController {
       const userId = req.userId!;
       const { id } = req.params;
 
-      const existing = await consultationService.getConsultationById(id);
-      if (!existing) {
+      // 400 first, before the booking is read: the body must name at least
+      // one editable field and every value must be well formed.
+      const parsed = parseEditBody(req.body);
+      if (!parsed.ok) {
+        sendError(res, "VALIDATION_ERROR", parsed.message);
+        return;
+      }
+
+      // Decide and write in one transaction (see editConsultation): the
+      // caller's party and the field table are judged on the freshly read
+      // booking, so a payment cannot land between the check and the write.
+      const outcome = await consultationService.editConsultation(
+        id,
+        (booking) => this.consultationActor(req, booking),
+        parsed.updates
+      );
+
+      if (outcome.kind === "not_found") {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
-
-      const hasAccess = can(
-        req,
-        "read",
-        asSubject("Consultation", existing as unknown as Record<string, unknown>)
-      );
-      if (!hasAccess) {
-        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+      if (outcome.kind === "refused") {
+        // Nothing was written; no notification is sent for a refusal.
+        const { code, httpStatus, message } = outcome.refusal;
+        sendError(res, code, code === "FORBIDDEN" ? ErrorMessages.FORBIDDEN : message, httpStatus);
         return;
       }
 
-      // Only allow updating certain fields
-      const allowedFields = [
-        "scheduledDate", "scheduledTime", "durationMinutes", "timezone",
-        "meetingLink", "meetingPlatform", "type", "summary",
-      ];
-      const updates: Record<string, unknown> = {};
-      for (const field of allowedFields) {
-        if (req.body[field] !== undefined) {
-          updates[field] = req.body[field];
+      const existing = outcome.before;
+
+      // A saved schedule change: tell the client, and also the booking's
+      // agent when someone else on the agent side (owner, admin) made it.
+      // The person who made the change is never told about their own edit.
+      if (isScheduleEdit(parsed.fieldNames)) {
+        const recipients = [...new Set([existing.userId, existing.agentId])].filter(
+          (uid): uid is string => !!uid && uid !== userId
+        );
+        for (const recipient of recipients) {
+          await notificationService
+            .notifyUser({
+              userId: recipient,
+              type: "consultation_rescheduled",
+              title: "Consultation rescheduled",
+              body:
+                recipient === existing.userId
+                  ? "Your consultation has been rescheduled — check the new time."
+                  : "A consultation with your client has been rescheduled — check the new time.",
+              relatedEntityType: "consultation",
+              relatedEntityId: id,
+            })
+            // A failed notification must not fail the edit that was saved.
+            .catch((e) => console.error("[consultation] reschedule notify failed:", e));
         }
       }
 
-      // Convert scheduledDate string to Timestamp
-      if (updates.scheduledDate && typeof updates.scheduledDate === "string") {
-        const { Timestamp } = await import("firebase-admin/firestore");
-        updates.scheduledDate = Timestamp.fromDate(new Date(updates.scheduledDate as string));
-      }
-
-      const updated = await consultationService.updateConsultation(id, updates as Partial<Consultation>);
-
-      // If the time changed, notify the other party it was rescheduled.
-      const rescheduled =
-        req.body.scheduledDate !== undefined || req.body.scheduledTime !== undefined;
-      const recipient = userId === existing.userId ? existing.agentId : existing.userId;
-      if (rescheduled && recipient) {
-        await notificationService
-          .notifyUser({
-            userId: recipient,
-            type: "consultation_rescheduled",
-            title: "Consultation rescheduled",
-            body: "Your consultation has been rescheduled — check the new time.",
-            relatedEntityType: "consultation",
-            relatedEntityId: id,
-          })
-          .catch((e) => console.error("[consultation] reschedule notify failed:", e));
-      }
-
-      sendSuccess(res, updated);
+      sendSuccess(res, outcome.consultation);
     } catch (error) {
       console.error("Error updating consultation:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);

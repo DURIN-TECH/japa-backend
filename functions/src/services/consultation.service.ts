@@ -1,5 +1,5 @@
 import { collections } from "../utils/firebase";
-import { Consultation, ConsultationStatus } from "../types";
+import { Consultation, ConsultationStatus, ConsultationType } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 import { ROLES } from "@durin-tech/authz";
 // Issue #151: the shared clock and Firestore transaction runner of the charge
@@ -13,8 +13,9 @@ import { chargeRuntime, isQuoteExpired } from "./charge-checkout.service";
 // ============================================
 //
 // Who may move a consultation to which status, and from which status. This is
-// the ONE place the rules live: `PUT /consultations/:id/status` uses it today
-// and the `PUT /consultations/:id` follow-up (#316) is meant to reuse it.
+// the ONE place the rules live for `PUT /consultations/:id/status`. The edit
+// route, `PUT /consultations/:id`, has its own table further down (#316) and
+// shares the parties and `isPaymentInFlight` with this one.
 //
 // The two parties of a booking:
 //  - the CLIENT: the booking's `userId`;
@@ -148,6 +149,272 @@ export function decideStatusChange(
   }
   return { ok: true };
 }
+
+// ============================================
+// EDIT RULES (issue #316)
+// ============================================
+//
+// `PUT /consultations/:id` used to need only READ access, so the client (or
+// anyone who could read the booking) could move its time or rewrite its
+// meeting link, and a booking could be rescheduled while its checkout was
+// open. The rules below are the ONE place that says who may edit which
+// field, and when.
+//
+// WHO: only the AGENT SIDE (the booking's agent, its agency's owner, an
+// admin; see `consultationActor` in the controller). The client cancels
+// through the status route and edits nothing here.
+//
+// WHAT, by the booking's status:
+//
+//   status           | schedule fields         | meeting fields | summary
+//   -----------------|-------------------------|----------------|--------
+//   pending_payment  | yes, unless a payment   | yes            | yes
+//                    | is in flight (409       |                |
+//                    | PAYMENT_IN_PROGRESS)    |                |
+//   scheduled        | yes                     | yes            | yes
+//   confirmed        | yes                     | yes            | yes
+//   in_progress      | no (409)                | yes            | yes
+//   completed        | no (409)                | no (409)       | yes
+//   cancelled        | no (409)                | no (409)       | no (409)
+//   no_show          | no (409)                | no (409)       | no (409)
+//
+// "no (409)" is 409 BOOKING_NOT_EDITABLE.
+
+/**
+ * The fields `PUT /consultations/:id` can change, by group. Anything else in
+ * a request body (`status`, `userId`, `agentId`, every money field, ...) is
+ * ignored and never reaches Firestore.
+ */
+export const EDIT_FIELD_GROUPS = {
+  /** When the consultation happens. Changing one is a RESCHEDULE. */
+  schedule: ["scheduledDate", "scheduledTime", "durationMinutes", "timezone"],
+  /** How and about what the two meet. */
+  meeting: ["meetingLink", "meetingPlatform", "type"],
+  /** The agent's notes on the consultation. */
+  summary: ["summary"],
+} as const;
+export type EditFieldGroup = keyof typeof EDIT_FIELD_GROUPS;
+/** One editable field name. */
+export type EditableField = (typeof EDIT_FIELD_GROUPS)[EditFieldGroup][number];
+
+/** Every editable field, in one flat list (the old `allowedFields`). */
+export const EDITABLE_FIELDS: readonly EditableField[] = [
+  ...EDIT_FIELD_GROUPS.schedule,
+  ...EDIT_FIELD_GROUPS.meeting,
+  ...EDIT_FIELD_GROUPS.summary,
+];
+
+/**
+ * The status x field table: for each status, the field groups the agent
+ * side may still edit. An empty list means the booking is closed to edits.
+ */
+export const EDITABLE_GROUPS_BY_STATUS: Record<ConsultationStatus, readonly EditFieldGroup[]> = {
+  // Unpaid: everything, but `decideEdit` also blocks a reschedule while a payment is in flight.
+  pending_payment: ["schedule", "meeting", "summary"],
+  scheduled: ["schedule", "meeting", "summary"],
+  confirmed: ["schedule", "meeting", "summary"],
+  // Already started: the time is history, the link and notes are still useful.
+  in_progress: ["meeting", "summary"],
+  // Done: only the notes can still be written up.
+  completed: ["summary"],
+  // Closed for good.
+  cancelled: [],
+  no_show: [],
+};
+
+/** The group an editable field belongs to. */
+function groupOfField(field: EditableField): EditFieldGroup {
+  const groups = Object.keys(EDIT_FIELD_GROUPS) as EditFieldGroup[];
+  // Every EditableField is in exactly one group, so this always finds one.
+  return groups.find((g) => (EDIT_FIELD_GROUPS[g] as readonly string[]).includes(field)) as EditFieldGroup;
+}
+
+/** True when `fields` holds at least one schedule field (the edit is a reschedule). */
+export function isScheduleEdit(fields: readonly string[]): boolean {
+  return fields.some((f) => (EDIT_FIELD_GROUPS.schedule as readonly string[]).includes(f));
+}
+
+/** Why an edit was refused: the API error code and its HTTP status. */
+export interface EditRefusal {
+  ok: false;
+  code: "FORBIDDEN" | "VALIDATION_ERROR" | "BOOKING_NOT_EDITABLE" | "PAYMENT_IN_PROGRESS";
+  httpStatus: 400 | 403 | 409;
+  message: string;
+}
+export type EditDecision = { ok: true } | EditRefusal;
+
+/**
+ * Decide whether `actor` may change the fields `fieldNames` of `booking` at
+ * time `at`. Pure: reads nothing, writes nothing. Checks run in this order,
+ * and the first that fails is the answer:
+ *
+ *  1. No editable field is named: 400 VALIDATION_ERROR (the controller
+ *     answers this before the booking is read; this is the second line).
+ *  2. `actor` is not the agent side (the client, or not a party): 403.
+ *  3. A named field's group is closed in the booking's status (see
+ *     `EDITABLE_GROUPS_BY_STATUS`): 409 BOOKING_NOT_EDITABLE.
+ *  4. A schedule field is named while a payment is in flight (see
+ *     `isPaymentInFlight`): 409 PAYMENT_IN_PROGRESS. The client is paying
+ *     for the time they were shown, so it must not move under them.
+ *
+ * @param fieldNames the editable fields present in the request body
+ */
+export function decideEdit(
+  actor: ConsultationActor | null,
+  booking: Pick<Consultation, "status" | "transactionId" | "quoteExpiresAt">,
+  fieldNames: readonly EditableField[],
+  at: Date
+): EditDecision {
+  if (fieldNames.length === 0) {
+    return { ok: false, code: "VALIDATION_ERROR", httpStatus: 400, message: "No editable field was provided" };
+  }
+  if (actor !== CONSULTATION_ACTORS.AGENT_SIDE) {
+    return { ok: false, code: "FORBIDDEN", httpStatus: 403, message: "You do not have permission to perform this action" };
+  }
+  // A status missing from the table (bad data) is treated as closed.
+  const open = EDITABLE_GROUPS_BY_STATUS[booking.status] ?? [];
+  const closed = fieldNames.filter((f) => !open.includes(groupOfField(f)));
+  if (closed.length > 0) {
+    return {
+      ok: false,
+      code: "BOOKING_NOT_EDITABLE",
+      httpStatus: 409,
+      message: `A consultation that is ${booking.status} cannot have ${closed.join(", ")} changed`,
+    };
+  }
+  if (isScheduleEdit(fieldNames) && isPaymentInFlight(booking, at)) {
+    return {
+      ok: false,
+      code: "PAYMENT_IN_PROGRESS",
+      httpStatus: 409,
+      message: "A payment for this booking may still be in progress. Try again once the checkout has expired.",
+    };
+  }
+  return { ok: true };
+}
+
+// ---- Value checks for an edit (issue #316) ----
+
+/** The consultation types a booking can hold (`ConsultationType`). */
+export const CONSULTATION_TYPES: ConsultationType[] = [
+  "initial", "document_review", "interview_prep", "follow_up", "general",
+];
+/** The meeting platforms a booking can name. */
+export const MEETING_PLATFORMS: NonNullable<Consultation["meetingPlatform"]>[] = ["zoom", "google_meet", "teams"];
+/** Shortest and longest consultation an edit may set, in minutes. */
+export const MIN_DURATION_MINUTES = 5;
+export const MAX_DURATION_MINUTES = 480;
+/** Longest `summary` an edit may store, in characters. */
+export const MAX_SUMMARY_LENGTH = 5000;
+/** 24-hour `HH:mm`, e.g. "09:05" or "23:59". */
+const HH_MM = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/** A checked edit: the values to store, keyed by editable field. */
+export type EditUpdates = Partial<Record<EditableField, unknown>>;
+export type ParsedEdit =
+  | { ok: true; updates: EditUpdates; fieldNames: EditableField[] }
+  | { ok: false; message: string };
+
+/** True for an absolute `https://` URL. */
+function isHttpsUrl(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false; // not a URL at all
+  }
+}
+
+/**
+ * Read the editable fields out of a `PUT /consultations/:id` body and check
+ * their values. Pure. Fields outside `EDITABLE_FIELDS` are dropped; a field
+ * that is `undefined` counts as not sent (as before). The result is either
+ * the values to store (`scheduledDate` already a Timestamp) or the message
+ * for a 400 VALIDATION_ERROR:
+ *
+ *  - no editable field at all;
+ *  - `scheduledDate` not a string that parses as a date (this used to
+ *    throw inside Timestamp.fromDate and answer 500);
+ *  - `scheduledTime` not 24-hour `HH:mm`;
+ *  - `durationMinutes` not a whole number from 5 to 480;
+ *  - `timezone` not a non-empty string;
+ *  - `meetingPlatform` not zoom / google_meet / teams;
+ *  - `type` not a ConsultationType;
+ *  - `meetingLink` not an `https://` URL;
+ *  - `summary` not a string, or longer than 5000 characters.
+ */
+export function parseEditBody(body: unknown): ParsedEdit {
+  // A missing or non-object body (or an array) carries no fields.
+  const source: Record<string, unknown> =
+    body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+  const updates: EditUpdates = {};
+  const fieldNames: EditableField[] = [];
+  /** Shorthand for a refusal. */
+  const bad = (message: string): ParsedEdit => ({ ok: false, message });
+
+  for (const field of EDITABLE_FIELDS) {
+    const value = source[field];
+    if (value === undefined) continue;
+    switch (field) {
+    case "scheduledDate": {
+      const ms = typeof value === "string" && value.trim() ? Date.parse(value) : NaN;
+      if (Number.isNaN(ms)) return bad("scheduledDate must be a valid date");
+      // Stored as a Firestore Timestamp, like every other booking date.
+      updates.scheduledDate = Timestamp.fromMillis(ms);
+      break;
+    }
+    case "scheduledTime":
+      if (typeof value !== "string" || !HH_MM.test(value)) return bad("scheduledTime must be a 24-hour HH:mm time");
+      updates.scheduledTime = value;
+      break;
+    case "durationMinutes":
+      if (
+        typeof value !== "number" || !Number.isInteger(value) ||
+        value < MIN_DURATION_MINUTES || value > MAX_DURATION_MINUTES
+      ) {
+        return bad(`durationMinutes must be a whole number from ${MIN_DURATION_MINUTES} to ${MAX_DURATION_MINUTES}`);
+      }
+      updates.durationMinutes = value;
+      break;
+    case "timezone":
+      if (typeof value !== "string" || !value.trim()) return bad("timezone must be a non-empty string");
+      updates.timezone = value;
+      break;
+    case "meetingLink":
+      if (!isHttpsUrl(value)) return bad("meetingLink must be an https:// URL");
+      updates.meetingLink = value;
+      break;
+    case "meetingPlatform":
+      if (!(MEETING_PLATFORMS as unknown[]).includes(value)) {
+        return bad(`meetingPlatform must be one of: ${MEETING_PLATFORMS.join(", ")}`);
+      }
+      updates.meetingPlatform = value;
+      break;
+    case "type":
+      if (!(CONSULTATION_TYPES as unknown[]).includes(value)) {
+        return bad(`type must be one of: ${CONSULTATION_TYPES.join(", ")}`);
+      }
+      updates.type = value;
+      break;
+    case "summary":
+      if (typeof value !== "string" || value.length > MAX_SUMMARY_LENGTH) {
+        return bad(`summary must be text of at most ${MAX_SUMMARY_LENGTH} characters`);
+      }
+      updates.summary = value;
+      break;
+    }
+    fieldNames.push(field);
+  }
+
+  if (fieldNames.length === 0) return bad("No editable field was provided");
+  return { ok: true, updates, fieldNames };
+}
+
+/** What `editConsultation` did. `refused` and `not_found` wrote nothing. */
+export type EditConsultationOutcome =
+  | { kind: "not_found" }
+  | { kind: "refused"; refusal: EditRefusal }
+  | { kind: "edited"; before: Consultation; consultation: Consultation };
 
 /** What `changeStatus` did. `refused` and `not_found` wrote nothing. */
 export type ChangeStatusOutcome =
@@ -299,27 +566,49 @@ class ConsultationService {
   }
 
   /**
-   * Update a consultation.
+   * Edit a consultation's schedule, meeting details or summary, if the rules
+   * allow it (issue #316). Replaces the old unchecked `updateConsultation`.
+   *
+   * ONE Firestore transaction, like `changeStatus`: the booking is re-read,
+   * the caller's party is worked out from that fresh copy (`actorFor`), the
+   * status x field table is applied (`decideEdit`), and only then are the
+   * fields written. A payment confirmed by `settlePayment` (same transaction
+   * runner) can therefore not slip in between the check and the write.
+   *
+   * Only the editable fields in `updates` and `updatedAt` are written: `id`,
+   * `createdAt`, the parties, the status and every money field are never
+   * touched. A refused edit (or an unknown id) writes NOTHING.
+   *
+   * @param actorFor which party of the booking the caller is, or null when
+   *   they are neither (answered 403 by the decision)
+   * @param updates checked values from `parseEditBody`
    */
-  async updateConsultation(
+  async editConsultation(
     id: string,
-    data: Partial<Consultation>
-  ): Promise<Consultation | null> {
+    actorFor: (booking: Consultation) => ConsultationActor | null,
+    updates: EditUpdates
+  ): Promise<EditConsultationOutcome> {
     const ref = collections.consultations.doc(id);
-    const doc = await ref.get();
-    if (!doc.exists) return null;
+    // Second line of defence: whatever the caller passed, only editable
+    // fields with a value can be written.
+    const fieldNames = EDITABLE_FIELDS.filter((f) => updates[f] !== undefined);
+    return chargeRuntime.runTransaction<EditConsultationOutcome>(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return { kind: "not_found" };
+      const current = snap.data() as Consultation;
+      // The same clock as the quote lock the decision reads.
+      const at = chargeRuntime.now();
 
-    const updates = {
-      ...data,
-      updatedAt: Timestamp.now(),
-    };
-    // Don't allow overwriting id or createdAt
-    delete updates.id;
-    delete updates.createdAt;
+      const decision = decideEdit(actorFor(current), current, fieldNames, at);
+      if (!decision.ok) return { kind: "refused", refusal: decision };
 
-    await ref.update(updates);
-    const updated = await ref.get();
-    return updated.data() as Consultation;
+      const write: Record<string, unknown> = { updatedAt: Timestamp.fromDate(at) };
+      for (const field of fieldNames) write[field] = updates[field];
+
+      tx.update(ref, write);
+      // The stored doc after the commit: the fresh copy plus what was written.
+      return { kind: "edited", before: current, consultation: { ...current, ...write } as Consultation };
+    });
   }
 
   /**
