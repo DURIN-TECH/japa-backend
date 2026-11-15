@@ -117,10 +117,15 @@ export class EntitlementController {
         sendSuccess(res, { subscription: null, entitlements: null, unlimited: true });
         return;
       }
-      const [subscription, entitlements] = await Promise.all([
-        entitlementService.getActiveSubscription(subscriber.id),
-        entitlementService.getEntitlements(subscriber.id),
-      ]);
+      // Entitlements are the ones this request already resolved in the
+      // sign-in middleware (`attachAuthz`), not a second read of the cache
+      // (issue #311). That keeps this answer identical to what the gates on
+      // this very request enforce and to `GET /users/me/authorization`: a
+      // client with no record sees the default client plan that was just
+      // saved for them, instead of `null`. `subscription` can still be null
+      // (the free plan needs no subscription record).
+      const subscription = await entitlementService.getActiveSubscription(subscriber.id);
+      const entitlements = req.entitlements ?? null;
       sendSuccess(res, { subscriberType: subscriber.type, subscription, entitlements });
     } catch (error) {
       console.error("Error getting subscription:", error);

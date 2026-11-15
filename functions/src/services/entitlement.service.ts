@@ -19,7 +19,48 @@ import {
  *   - RBAC (role/ownership) lives in claims + the CASL ability factory.
  *   - Entitlements (what the plan unlocks) live here, in Firestore.
  */
+// ============================================
+// Lazy default plan (issue #311)
+// ============================================
+
+/**
+ * How long one instance remembers that an audience has NO default plan.
+ *
+ * The lazy first-request path (`resolveMissingEntitlements`) runs for every
+ * request of a subscriber with no record. In an environment where no default
+ * plan is seeded nothing can ever be written, so without this memo each of
+ * those requests would repeat the `plans` query for the same empty answer.
+ * Short on purpose: once a default plan is seeded, every instance picks it up
+ * within this window with no redeploy.
+ */
+const MISSING_DEFAULT_PLAN_TTL_MS = 60_000;
+
+/** gRPC status code Firestore's `create()` rejects with when the doc exists. */
+const GRPC_ALREADY_EXISTS = 6;
+
+/** True when `error` is Firestore's "document already exists" rejection. */
+function isAlreadyExists(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === GRPC_ALREADY_EXISTS;
+}
+
+/** Options for `recomputeEntitlements`. */
+interface RecomputeOptions {
+  /**
+   * Lazy mode (issue #311): only ever CREATE the cache document, never
+   * overwrite one. Used on the request path for a subscriber with no record.
+   * See `resolveMissingEntitlements` for why an overwrite would be wrong there.
+   */
+  createOnly?: boolean;
+}
+
 class EntitlementService {
+  /**
+   * Per-audience "no default plan until <epoch ms>" memo for the lazy path
+   * (see MISSING_DEFAULT_PLAN_TTL_MS). Instance state, never persisted.
+   * Public so a test can clear it between cases.
+   */
+  missingDefaultPlanUntil: Partial<Record<SubscriberType, number>> = {};
+
   /**
    * Resolve which subscriber entity a principal draws entitlements from:
    *   - owner/agent in an agency → the agency's subscription
@@ -64,6 +105,55 @@ class EntitlementService {
     return this.recomputeEntitlements(subscriber.type, subscriber.id);
   }
 
+  /**
+   * Lazy first-request resolution (issue #311): give a subscriber who has NO
+   * `entitlements/{id}` record the entitlements of their plan (in practice the
+   * audience's default free plan) and save them, so every later request finds
+   * the stored record with a single read.
+   *
+   * The caller (the sign-in middleware) has ALREADY read the cache and found
+   * nothing; this does not read it again. It differs from a plain
+   * `recomputeEntitlements` in two ways, both about running on the hot path:
+   *
+   *  1. The write is create-only. Two first requests can arrive together, and
+   *     a plan change (admin assignment, billing webhook) can land between
+   *     this call's reads and its write. A plain `set()` here could then put
+   *     the free plan back OVER a paid record that was written a moment
+   *     earlier. With `create()` exactly one writer wins; everyone else gets
+   *     "already exists" and returns the stored record instead. So concurrent
+   *     first requests all succeed and leave one document, and this path can
+   *     never downgrade or otherwise replace an existing record.
+   *  2. "This audience has no default plan" is remembered for a short time
+   *     (MISSING_DEFAULT_PLAN_TTL_MS), so an environment with no default plan
+   *     does not re-run the `plans` query on every request.
+   *
+   * Returns null, and writes nothing, when no plan can be resolved (no
+   * subscription plan and no default plan). Errors are NOT swallowed: the
+   * caller decides what an outage means (the middleware keeps today's
+   * behaviour, entitlements unresolved).
+   */
+  async resolveMissingEntitlements(
+    subscriberType: SubscriberType,
+    subscriberId: string
+  ): Promise<Entitlements | null> {
+    return this.recomputeEntitlements(subscriberType, subscriberId, { createOnly: true });
+  }
+
+  /**
+   * `getDefaultPlan` for the lazy path, with the short negative memo. Only a
+   * MISSING plan is remembered: a plan that exists is read fresh every time
+   * (that read happens once per subscriber, since the record is then saved),
+   * and a failed read is not remembered at all (it throws).
+   */
+  private async getDefaultPlanForLazyPath(audience: SubscriberType): Promise<Plan | null> {
+    const until = this.missingDefaultPlanUntil[audience];
+    if (until !== undefined && Date.now() < until) return null;
+    const plan = await this.getDefaultPlan(audience);
+    if (plan) delete this.missingDefaultPlanUntil[audience];
+    else this.missingDefaultPlanUntil[audience] = Date.now() + MISSING_DEFAULT_PLAN_TTL_MS;
+    return plan;
+  }
+
   async getPlan(planId: string): Promise<Plan | null> {
     const doc = await collections.plans.doc(planId).get();
     return doc.exists ? (doc.data() as Plan) : null;
@@ -89,10 +179,16 @@ class EntitlementService {
    * subscription's plan (falling back to the audience's default free plan).
    * Call this whenever a subscription changes (manual assignment or, later, a
    * billing webhook).
+   *
+   * `options.createOnly` (issue #311) is the lazy request-path mode: the same
+   * plan resolution, but the cache document is only created, never replaced,
+   * and when it turns out to exist already the STORED record is returned. Use
+   * it through `resolveMissingEntitlements`, which explains why.
    */
   async recomputeEntitlements(
     subscriberType: SubscriberType,
-    subscriberId: string
+    subscriberId: string,
+    options: RecomputeOptions = {}
   ): Promise<Entitlements | null> {
     const subscription = await this.getActiveSubscription(subscriberId);
     let plan: Plan | null = null;
@@ -103,7 +199,11 @@ class EntitlementService {
       status = subscription.status;
     }
     if (!plan) {
-      plan = await this.getDefaultPlan(subscriberType);
+      // Lazy mode remembers a missing default plan briefly (hot path); the
+      // normal mode always reads it fresh.
+      plan = options.createOnly
+        ? await this.getDefaultPlanForLazyPath(subscriberType)
+        : await this.getDefaultPlan(subscriberType);
       status = "active"; // default free plan is always active
     }
     if (!plan) return null; // no plans seeded yet
@@ -118,10 +218,25 @@ class EntitlementService {
       entitlements.limits = { ...entitlements.limits, max_agents: paidSeats };
     }
 
-    await collections.entitlements.doc(subscriberId).set({
-      ...entitlements,
-      updatedAt: Timestamp.now(),
-    });
+    const ref = collections.entitlements.doc(subscriberId);
+    const record = { ...entitlements, updatedAt: Timestamp.now() };
+
+    if (options.createOnly) {
+      // Lazy mode (#311): create, never overwrite. Losing the race is not an
+      // error: someone else (a parallel first request, or a plan change) has
+      // just written the record, and theirs is the one to use.
+      try {
+        await ref.create(record);
+      } catch (error) {
+        if (!isAlreadyExists(error)) throw error;
+        // Fall back to what we computed only if the record vanished again
+        // between the failed create and this read (not expected).
+        return (await this.getEntitlements(subscriberId)) ?? entitlements;
+      }
+      return entitlements;
+    }
+
+    await ref.set(record);
     return entitlements;
   }
 

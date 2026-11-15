@@ -6,6 +6,8 @@ import {
   AuthzSubject,
   Entitlements,
   Role,
+  ROLES,
+  SubscriberType,
   defineAbilitiesFor,
   isReadOnly,
 } from "@durin-tech/authz";
@@ -25,10 +27,35 @@ export interface AuthenticatedRequest extends Request {
 }
 
 /**
+ * True when a stored entitlements record is a CLIENT-plan record sitting under
+ * an independent agent's id, i.e. it does not belong to this subscriber.
+ *
+ * Why this can happen (issue #311): a client and an independent agent are
+ * both keyed by their own uid in `entitlements`. Every account is a client
+ * until agent onboarding completes, so the client record that #311 now saves
+ * on a new user's first request is still there, under the same id, once that
+ * user becomes an independent agent. Honouring it would put the agent on the
+ * client plan's features and limits. Agents with no record of their own are
+ * out of scope here (#315) and must stay as they were: ungated.
+ *
+ * Deliberately narrow: only "agent subscriber, client record". An agency is
+ * keyed by its agency id, so it cannot collide with a user's record.
+ */
+function isForeignClientRecord(
+  subscriberType: SubscriberType,
+  stored: Entitlements
+): boolean {
+  return subscriberType === "agent" && stored.subscriberType === "client";
+}
+
+/**
  * Build `req.authz` + `req.ability` from the token's custom claims. When the role
  * claim isn't present yet (pre-migration user), fall back to resolving from the DB
  * and lazily backfill the claims so subsequent tokens carry them. Fail-safe: on
  * any error, default to least-privilege `client` rather than blocking the request.
+ *
+ * Also loads the principal's entitlements. A client with no stored record gets
+ * the default client plan resolved and saved here, once (issue #311).
  */
 async function attachAuthz(req: AuthenticatedRequest): Promise<void> {
   const decoded = req.user;
@@ -49,24 +76,67 @@ async function attachAuthz(req: AuthenticatedRequest): Promise<void> {
     const authz: AuthzSubject = { uid, role, agencyId };
     req.authz = authz;
 
-    // Load the subscriber's entitlements cache (read-only hot path; no writes).
-    // Gating only activates once the cache is populated (admin plan assignment /
-    // migration / billing webhook) — until then `undefined` keeps it RBAC-only.
+    // ============================================
+    // Entitlements (what the subscriber's plan unlocks)
+    // ============================================
+    //
+    // Hot path: ONE read of the stored `entitlements/{subscriberId}` record.
+    // Whoever has a record (free or paid) is served from it and nothing is
+    // written. Admins have no subscriber and are never gated.
+    //
+    // `null` entitlements mean "no plan resolved": `requireFeature` and
+    // `checkWithinLimit` then let the request through (RBAC only). That is
+    // still the outcome for agencies and agents with no record (issue #315),
+    // and for anyone when the lookup fails.
     let entitlements: Entitlements | undefined;
-    if (role !== "admin") {
+    if (role !== ROLES.ADMIN) {
       const subscriber = entitlementService.resolveSubscriber(authz);
       if (subscriber) {
-        const ent = await entitlementService
+        // A failed read must stay distinguishable from "no record": only a
+        // confirmed absence may trigger the default-plan write below.
+        let lookupFailed = false;
+        const stored = await entitlementService
           .getEntitlements(subscriber.id)
-          .catch(() => null);
-        if (ent) entitlements = ent;
+          .catch(() => {
+            lookupFailed = true;
+            return null;
+          });
+
+        if (stored && isForeignClientRecord(subscriber.type, stored)) {
+          // Not this subscriber's record (see isForeignClientRecord): treated
+          // as "no record", which for an agent means ungated, as before #311.
+        } else if (stored) {
+          entitlements = stored;
+        } else if (!lookupFailed && role === ROLES.CLIENT) {
+          // Issue #311: a CLIENT with no record is on the free client plan
+          // from this request on. Resolve it and save it once; the next
+          // request takes the single-read branch above. Clients only: agents
+          // and agencies with no record stay ungated (#315).
+          //
+          // Fail-safe: if this throws (plan read or write failed), or there is
+          // no default client plan, entitlements stay unresolved exactly as
+          // before this change. Nothing is granted on top of that, and the
+          // AI chat gate still answers 403 ENTITLEMENTS_UNAVAILABLE.
+          try {
+            const resolved = await entitlementService.resolveMissingEntitlements(
+              subscriber.type,
+              subscriber.id
+            );
+            if (resolved) entitlements = resolved;
+          } catch (error) {
+            console.error(
+              "attachAuthz: could not resolve the default client plan; entitlements stay unresolved:",
+              error
+            );
+          }
+        }
       }
     }
     req.entitlements = entitlements ?? null;
     req.ability = defineAbilitiesFor(authz, entitlements);
   } catch (error) {
     console.error("attachAuthz failed; defaulting to least-privilege:", error);
-    const authz: AuthzSubject = { uid, role: "client", agencyId: null };
+    const authz: AuthzSubject = { uid, role: ROLES.CLIENT, agencyId: null };
     req.authz = authz;
     req.entitlements = null;
     req.ability = defineAbilitiesFor(authz);
