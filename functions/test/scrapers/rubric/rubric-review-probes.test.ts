@@ -547,6 +547,8 @@ describe("prompt version pin", () => {
     "2026-11-rubric-v11": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
     // v12 (#235): the criteria call is unchanged, so its hash is v11's.
     "2026-11-rubric-v12": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
+    // v13 (#335): the criteria call is unchanged again (only call 2 moved), so its hash is v11's.
+    "2026-11-rubric-v13": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
   };
   // v5 onwards: the intake prompt and its schema are pinned too (call 2),
   // so a change to either also needs a version bump.
@@ -567,6 +569,8 @@ describe("prompt version pin", () => {
     "2026-11-rubric-v11": "c13a6c6236fef82fea10928454e975b6012affa247c9e34af00b3bb1fb7beea9",
     // v12 (#235): the intake call may draft competence steps and destination questions (`optionsFrom`).
     "2026-11-rubric-v12": "71aae5b23c5e0671f8d95841c65e4ccce8707cab634e01cb7044af6fe60fbbec",
+    // v13 (#335): a competence step's `restsOn` may be copied from one of a rule's `listItems`.
+    "2026-11-rubric-v13": "9356da7c858e3a4d5b6975da14addd177ce0b2562219330f33aac06b3bf17534",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {

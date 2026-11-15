@@ -26,7 +26,14 @@ import { normalizeForQuoteMatch } from "../shared/fetch/pdf-text";
 //    is exactly that rule's verbatim quote and URL. The rule itself is read by
 //    the independent rule check like any other rule, so the quote is checked
 //    like any rule's.
-//  - The words it applies (`restsOn`) are in that quote, verbatim.
+//  - The words it applies (`restsOn`) are in that quote, verbatim, or (#335)
+//    verbatim in ONE of that rule's stored list lines (`source.listItems`).
+//    A rule whose quote is a lead-in ("... shall be:") holds its cases in the
+//    list under it ("(a) ... the sole destination ..."); those lines are
+//    attached by CODE from the stored snapshot (rubric-list-items.ts) and
+//    re-proved verbatim by the independent check, so they are the official
+//    words just as much as the quote is. The words must still sit inside one
+//    line (the quote or one item): never stitched across two.
 //  - It reads ONE answer: a choice question of the same layer whose options
 //    are the route's member countries from membership data at the time of
 //    asking (`optionsFrom: "route_destinations"`), so no country is ever typed
@@ -61,6 +68,38 @@ const CHOICE_TYPES: readonly string[] = ["single_choice", "multi_choice"];
 export function quoteContains(quote: string, words: string): boolean {
   const w = normalizeForQuoteMatch(words);
   return w.length >= MIN_RESTS_ON_CHARS && normalizeForQuoteMatch(quote).includes(w);
+}
+
+/**
+ * (#335) Where a step's words are: "quote" when they are in the quote itself,
+ * else the index of the FIRST list line (`source.listItems`) that holds them,
+ * else undefined (not in the rule's official words at all: refused).
+ */
+export function restsOnSite(source: { quote: string; listItems?: readonly string[] }, words: string): "quote" | number | undefined {
+  if (quoteContains(source.quote, words)) return "quote";
+  const items = Array.isArray(source.listItems) ? source.listItems : [];
+  const at = items.findIndex((item) => typeof item === "string" && quoteContains(item, words));
+  return at >= 0 ? at : undefined;
+}
+
+/**
+ * (#335) The official words SHOWN for a step: its rule's quote, followed by
+ * the list line the step rests on when its words are in a list line (the
+ * lead-in alone, "... shall be:", says nothing about the case). Every line is
+ * a stored verbatim line of the rule (quote or `listItems`), joined by a line
+ * break, the same way `quoteWithItems` joins the whole list. Nothing is
+ * reworded. When the words are in the quote, the quote alone.
+ */
+export function stepQuoteShown(source: { quote: string; listItems?: readonly string[] }, words: string): string {
+  const site = restsOnSite(source, words);
+  return typeof site === "number" ? `${source.quote}\n${(source.listItems as readonly string[])[site]}` : source.quote;
+}
+
+/** Same stored list lines (both absent counts as the same)? */
+function sameListItems(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+  const x = a ?? [];
+  const y = b ?? [];
+  return x.length === y.length && x.every((line, i) => line === y[i]);
 }
 
 /** Is this a question whose options come from the route's member countries? */
@@ -113,11 +152,15 @@ export function competenceProblems(
       return add("competence_source_missing", "a step needs the quote and URL of the rule it rests on", i);
     }
     // The step's quote IS its rule's quote (copied by code), never different words.
-    if (s.source.quote !== rule.source?.quote || s.source.url !== rule.source?.url) {
-      return add("competence_source_mismatch", "a step's quote and URL must be exactly those of the rule it rests on", i);
+    // (#335) Its list lines too: a step may rest on a list line, so the lines it
+    // carries must be exactly the rule's (which the independent check re-proves
+    // against the snapshot), never others.
+    if (s.source.quote !== rule.source?.quote || s.source.url !== rule.source?.url || !sameListItems(s.source.listItems, rule.source?.listItems)) {
+      return add("competence_source_mismatch", "a step's quote, list lines and URL must be exactly those of the rule it rests on", i);
     }
-    if (typeof s.restsOn !== "string" || !quoteContains(s.source.quote, s.restsOn)) {
-      return add("competence_rests_on_not_in_quote", "the words a step applies must be in its quote, verbatim", i);
+    // (#335) The words are in the quote, or in one of its list lines, verbatim.
+    if (typeof s.restsOn !== "string" || restsOnSite(s.source, s.restsOn) === undefined) {
+      return add("competence_rests_on_not_in_quote", "the words a step applies must be in its quote or one of its list lines, verbatim", i);
     }
     // ---- where the result comes from: the answer, never anything else ----
     if (s.resultFrom !== "answer") return add("competence_result_from_invalid", "a step's result comes from the applicant's answer", i);

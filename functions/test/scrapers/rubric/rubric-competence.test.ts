@@ -385,8 +385,9 @@ describe("drafting (mergeAssessments)", () => {
 // ============================================
 
 describe("prompt", () => {
-  test("versions: drafting moved to v12; re-draft and check unchanged", () => {
-    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v12");
+  // (#335) v13: call 2 is shown list lines and a step may rest on one; re-draft and check still unchanged.
+  test("versions: drafting moved to v13; re-draft and check unchanged", () => {
+    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v13");
     assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v5");
     assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v7");
   });

@@ -1,0 +1,21 @@
+{
+  "_comment": "Issue #335. Verbatim lines copied BY CODE from the stored snapshot of Regulation (EC) No 810/2009 (Visa Code), consolidated text of 28 June 2024, Article 5(1), as stored on durin-seli-dev (sourceId and contentHash below). Each line is one line of the snapshot's text, unchanged (no-break spaces kept). Do not edit by hand.",
+  "sourceId": "schengen-area-visa-code-regulation-ec-no-810-2009-consolidated-text-of-28-june-2024",
+  "contentHash": "81bb40570a4e9eaf56f62b2bd1a8a7f7e728270fe0a52c107b79dbac54b5d1c3",
+  "url": "http://publications.europa.eu/resource/cellar/2356e285-9098-11ef-a130-01aa75ed71a1.0007.03/DOC_1",
+  "celexUrl": "https://publications.europa.eu/resource/celex/02009R0810-20240628",
+  "fetchedAt": "2026-11-14T14:31:30.138Z",
+  "lines": [
+    "Article 5",
+    "Member State competent for examining and deciding on an application",
+    "1.  ",
+    "The Member State competent for examining and deciding on an application for a uniform visa shall be:",
+    "(a) ",
+    "the Member State whose territory constitutes the sole destination of the visit(s);",
+    "(b) ",
+    "if the visit includes more than one destination, or if several separate visits are to be carried out within a period of two months, the Member State whose territory constitutes the main destination of the visit(s) in terms of the length of stay, counted in days, or the purpose of stay; or",
+    "(c) ",
+    "if no main destination can be determined, the Member State whose external border the applicant intends to cross in order to enter the territory of the Member States.",
+    "2.  "
+  ]
+}

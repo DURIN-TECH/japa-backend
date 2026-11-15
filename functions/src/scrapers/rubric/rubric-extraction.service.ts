@@ -1439,6 +1439,8 @@ export function acceptedViewOf(criteriaPart: ChunkAssessment): AcceptedCriterion
     ref: a.ref,
     title: a.criterion.title,
     quote: a.criterion.source.quote,
+    // (#335) A lead-in rule's cases are its list lines: shown so a competence step can rest on one.
+    ...(a.criterion.source.listItems && a.criterion.source.listItems.length > 0 ? { listItems: [...a.criterion.source.listItems] } : {}),
     ...(a.criterion.applicability === "specialist" || a.criterion.applicability === "conditional"
       ? { applicability: a.criterion.applicability, ...(a.criterion.applicabilityCondition ? { condition: a.criterion.applicabilityCondition } : {}) }
       : {}),

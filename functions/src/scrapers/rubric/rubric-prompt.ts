@@ -116,8 +116,14 @@ import { KIND_WORDING_SENTENCE } from "./rubric-kind-wording";
  *    A basis the excerpt leaves to the applicant ("length or purpose") is asked, never chosen.
  *    The criteria prompt (call 1) is byte-for-byte v11's, so the re-draft prompt (which reuses
  *    it) is unchanged.
+ *  - "2026-11-rubric-v13" (#335): the intake call (call 2) is shown each accepted rule's
+ *    `listItems` (the list lines code attached under a lead-in quote), and a competence step's
+ *    `restsOn` may be copied from ONE of those lines as well as from the quote (the cases of a
+ *    "... shall be:" rule are its list lines). Code checks it verbatim either way
+ *    (rubric-competence.ts `restsOnSite`). The criteria prompt (call 1) is byte-for-byte v12's,
+ *    so the re-draft prompt (which reuses it) and its version are unchanged.
  */
-export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v12";
+export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v13";
 
 /** Instructions shared by both calls: what the excerpt is, and how to treat it. */
 const COMMON_INSTRUCTIONS = [
@@ -190,7 +196,7 @@ export const RUBRIC_INTAKE_SYSTEM_PROMPT = [
   "",
   "`ruleTriggers`: some accepted criteria carry an `applicability` of `specialist` or `conditional` and a `condition`, the words of the source that say when the rule applies. For each such criterion, say which answer establishes that it applies: give its `criterionRef`, the `questionId` of an intake question, and `answerValues`, the option values of that question for which the rule applies. The question must be one of your `intakeQuestions` or one listed under \"Questions already asked\". Where the source distinguishes applicants by activity, sub-category or purpose (the conditions name them), include one `single_choice` question (or `multi_choice` when an applicant can be in several) that establishes it, with one option per activity or sub-category the source names, the option `label` in the source's own words and the `value` a short lowercase slug. Reuse that same question, with the same `id`, for every rule of that kind, and add an option to it when the source names another one; reuse a question listed under \"Questions already asked\" the same way. For a yes_no question the `answerValues` are \"true\" or \"false\". Use only activities, sub-categories and circumstances the excerpt itself names: never add one from general knowledge. If no question could establish when a rule applies, leave it out of `ruleTriggers`.",
   "",
-  "`competenceSteps`: only when the excerpt itself states which member country is responsible for examining an application (for example the country that is the only destination, or the main destination, or the country whose border is crossed first). Give one entry per case the excerpt names, IN THE ORDER the excerpt applies them. Each entry gives `criterionRef`, the `ref` of the accepted criterion whose quote states that case; `restsOn`, the words of that quote that name the case, copied character for character; `questionId`, the intake question whose answer names the country for that case; and `whenAllOf`, the earlier answers that must ALL hold for this case to apply (empty when it applies whenever the cases before it did not decide). Every such question is a `single_choice` question (`multi_choice` when the applicant may name several countries) with `optionsFrom` set to `route_destinations`: list NO country among its options, because the program lists the member countries when the question is asked; you may list options that are not a country (for example that the applicant cannot say). Ask each such question once. When the excerpt lets a case rest on more than one basis (one reason OR another), the question names every basis, or another question asks which basis applies to the applicant: never choose a basis for them, and never work a country out from other answers such as dates or lengths. Never name a country in a question, an option or a step. If the excerpt does not state which member country is responsible, return an empty `competenceSteps` list.",
+  "`competenceSteps`: only when the excerpt itself states which member country is responsible for examining an application (for example the country that is the only destination, or the main destination, or the country whose border is crossed first). Give one entry per case the excerpt names, IN THE ORDER the excerpt applies them. Each entry gives `criterionRef`, the `ref` of the accepted criterion whose quote states that case; `restsOn`, the words that name the case, copied character for character from that criterion's `quote` or, when the criterion has `listItems` (the list lines that follow a quote ending with a lead-in such as \"shall be:\"), from ONE of those lines; `questionId`, the intake question whose answer names the country for that case; and `whenAllOf`, the earlier answers that must ALL hold for this case to apply (empty when it applies whenever the cases before it did not decide). Every such question is a `single_choice` question (`multi_choice` when the applicant may name several countries) with `optionsFrom` set to `route_destinations`: list NO country among its options, because the program lists the member countries when the question is asked; you may list options that are not a country (for example that the applicant cannot say). Ask each such question once. When the excerpt lets a case rest on more than one basis (one reason OR another), the question names every basis, or another question asks which basis applies to the applicant: never choose a basis for them, and never work a country out from other answers such as dates or lengths. Never name a country in a question, an option or a step. If the excerpt does not state which member country is responsible, return an empty `competenceSteps` list.",
   "",
   "`intake`: a short title, card title and introduction for the questions, in plain words, only if you list questions.",
   "",
@@ -393,6 +399,9 @@ export interface AcceptedCriterionView {
   ref: string;
   title: string;
   quote: string;
+  // (#335) The list lines code attached under a lead-in quote (verbatim lines of the
+  // stored text). Present only when the rule has them, so every other rule is shown as before.
+  listItems?: string[];
   applicability?: "conditional" | "specialist";
   condition?: string;
 }

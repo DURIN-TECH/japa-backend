@@ -127,7 +127,8 @@ export type { RulebookTarget, RulebookTargetInput } from "./rubric/rubric-key";
  */
 export { loadRulebookStack, mergeRulebookStack, stackFromReads, layerVersionsOf, sameStackVersions, scopedId, sharedLayerView, STACK_ID_SEPARATOR } from "./rubric/rubric-stack";
 // (#235) The code check of a competence block (which member country examines an application).
-export { competenceProblems, servableCompetence, isDestinationQuestion, quoteContains } from "./rubric/rubric-competence";
+// (#335) `stepQuoteShown`: the official words served for a step (the quote, plus the list line it rests on).
+export { competenceProblems, servableCompetence, isDestinationQuestion, quoteContains, restsOnSite, stepQuoteShown } from "./rubric/rubric-competence";
 export type { RulebookStack, StackLayerRead, StackLayerReader, StackUnusableReason } from "./rubric/rubric-stack";
 // (#233 P4b) The layer check: an own layer's rules against its shared layer(s) (restates links, conflicts).
 export { RubricLayerChecker, runLayerCheck, decideLayerLinks, linkRefusal, notCheckedRecord, LAYER_CHECK_PROMPT_VERSION, DEFAULT_LAYER_CHECK_LIMITS } from "./rubric/rubric-layer-check";

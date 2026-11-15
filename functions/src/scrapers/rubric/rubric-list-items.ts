@@ -23,7 +23,19 @@ import type { RubricFlag } from "../../types/rubric";
 // WHERE THE LIST ENDS. Two layouts exist in the stored text:
 //
 //  1. MARKED items: lines that begin with a bracketed marker, "(a)", "(ii)",
-//     "(3)". The list is the run of marked lines. When the lead-in line is
+//     "(3)". The list is the run of marked lines. (#335) Some official pages
+//     (EUR-Lex) set each marker in a cell of its own, so the cleaned text has
+//     the marker ALONE on a line and the item's words on the NEXT line:
+//         (a)
+//         the Member State whose territory constitutes the sole destination ...
+//     Such a bare marker line is joined with the one line that follows it,
+//     with one space ("(a) the Member State ..."), which is how the page reads
+//     and how the snapshot's whitespace-normalised text reads. Both halves are
+//     whole lines of the snapshot, verbatim; nothing is added or cut. Before
+//     #335 the reader stored the bare "(a)" and stopped at the words, a list
+//     silently cut to its first marker. A bare marker with no words after it
+//     (the end of the page, another marker, a reference label) is refused as
+//     `marker_without_text`, never stored half. When the lead-in line is
 //     itself marked ("(c) ... all of the following apply:"), its items are the
 //     deeper markers under it, and the list ends at the next marker of the
 //     lead-in's own level ("(d)") or shallower (the depth is decided by
@@ -62,6 +74,7 @@ export const LIST_UNREADABLE_REASONS = [
   "nested_unmarked_lead_in", // an unmarked item is itself a lead-in ("...the following:")
   "pdf_layout_lost", // PDF page text has no reliable line layout
   "items_not_in_snapshot", // stored items do not match the snapshot (verification only)
+  "marker_without_text", // (#335) a marker alone on its line with no item words on the next line
 ] as const;
 export type ListUnreadableReason = (typeof LIST_UNREADABLE_REASONS)[number];
 
@@ -82,6 +95,7 @@ export const LIST_UNREADABLE_DETAIL: Record<ListUnreadableReason, string> = {
   nested_unmarked_lead_in: "an unmarked list line after the lead-in is itself a lead-in (ends with a colon), so the nesting cannot be told",
   pdf_layout_lost: "the quote ends with a lead-in on a PDF page, whose line layout is lost, so its list lines cannot be read",
   items_not_in_snapshot: "the stored list lines are not the lines that follow the lead-in in the stored text",
+  marker_without_text: "a list marker stands alone on its line and no item words follow it in the stored text, so the item cannot be read",
 };
 
 /** True when a line is an item of a MARKED list ("(a) ...", "(iv) ..."). */
@@ -89,6 +103,24 @@ const isMarked = (line: string): boolean => LIMB_RE.test(line);
 
 /** Inner text of a line's list marker ("a" for "(a) ..."), or undefined. */
 const markerOf = (line: string): string | undefined => LIMB_RE.exec(line)?.[1];
+
+/**
+ * (#335) True when a line is a list marker and NOTHING else ("(a)"): the
+ * page set the marker apart from the item's words, which are on the next
+ * line. The lines reach the reader already whitespace-normalised, so a
+ * trailing no-break space is gone.
+ */
+export const isBareMarker = (line: string): boolean => {
+  const m = LIMB_RE.exec(line);
+  return m !== null && line.slice(m[0].length).trim() === "";
+};
+
+/**
+ * (#335) True when a line is only a paragraph number ("2.", "3)", "4.1"): the
+ * EUR-Lex layout sets a paragraph's number alone on its line too, so it is the
+ * start of the NEXT paragraph, never the words of a bare marker before it.
+ */
+const isBareNumber = (line: string): boolean => /^\d+(?:\.\d+)*[.)]?$/u.test(line);
 
 /** True when a line ends a sentence ("... 1971."): an unmarked list stops after such an item. */
 const endsSentence = (line: string): boolean => /[.!?]["'’”)]*$/u.test(line);
@@ -122,15 +154,31 @@ export function readListLines(leadLine: string, following: readonly string[], LI
     // the chain, so its own level is level 0 and an item that is back at
     // level 0 is the lead-in's sibling: the list is over.
     const markers: string[] = leadMarker !== undefined ? [leadMarker] : [];
-    for (const line of following) {
+    // An index loop (not for-of): a bare marker line consumes the line after it too.
+    for (let i = 0; i < following.length; i++) {
+      const line = following[i];
       if (!isMarked(line)) break;
       if (leadMarker !== undefined) {
         const chain = composeMarkerChain([...markers, markerOf(line) as string]);
         if (chain.length <= 1) break;
       }
-      if (line.length > LIST_ITEM_MAX_CHARS) return { kind: "unreadable", reason: "item_too_long" };
+      // (#335) A bare marker ("(a)" alone): the item's words are the NEXT line.
+      // That line must be words, not another marker or a reference label
+      // ("2.", the next paragraph), and must exist: otherwise the item cannot
+      // be read and the list is refused with a named reason (never stored as
+      // the bare marker, which is what happened before #335).
+      let item = line;
+      if (isBareMarker(line)) {
+        const words = following[i + 1];
+        if (words === undefined || isMarked(words) || LINE_LABEL_RE.test(words) || isBareNumber(words)) return { kind: "unreadable", reason: "marker_without_text" };
+        // One space between the two whole, verbatim lines: what the page shows
+        // and what the snapshot's normalised text (lines joined by a space) holds.
+        item = `${line} ${words}`;
+        i += 1;
+      }
+      if (item.length > LIST_ITEM_MAX_CHARS) return { kind: "unreadable", reason: "item_too_long" };
       markers.push(markerOf(line) as string);
-      items.push(line);
+      items.push(item);
     }
   } else {
     // ---- unmarked list ----
@@ -187,7 +235,8 @@ export function readLeadInList(index: SnapshotQuoteIndex, found: Extract<QuoteLo
 
 /**
  * Prove that `items` are exactly the list lines the snapshot has after the
- * located quote: each is a whole line of the stored text, verbatim, in order,
+ * located quote: each is a whole line of the stored text, verbatim, in order
+ * (or, #335, a bare marker line and the line after it joined by one space),
  * and the list ends where the reader says it ends (no line missing, none
  * added). This is what a stored `source.listItems` is checked with, at
  * extraction and wherever the rule is looked at again. An altered, reordered,

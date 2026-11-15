@@ -49,7 +49,8 @@ import { sharedRulebookKey } from "../shared-routes/shared-route-rules";
 import { resolveRouteStackFor, routeStackKeys } from "../shared-routes/route-stack";
 import type { SharedRoute } from "../types/shared-route";
 import { canStartCaseOnVisa } from "../agency-visas/agency-visa-access";
-import { rubricStore, sharedLayerView } from "../scrapers";
+// (#335) `stepQuoteShown`: a step's served quote is its rule's quote plus the list line it rests on.
+import { rubricStore, sharedLayerView, stepQuoteShown } from "../scrapers";
 import type { CompetenceBlock, IntakeQuestion, VisaRubric } from "../types/rubric";
 import type { ApplicantFacts } from "../types/applicant-facts";
 import type { Application, ThroughCountryChoice, VisaType } from "../types";
@@ -164,7 +165,10 @@ export function resolveCompetence(stack: CompetenceStack, answers: Record<string
     const outside = codes.find((c) => !members.has(c));
     if (outside) return { status: "unknown", reason: "NOT_A_MEMBER", why: COMPETENCE_MESSAGES.notMember(outside), countryCode: outside };
     if (codes.length === 1) {
-      return { status: "country", countryCode: codes[0], stepIndex: i, restsOn: step.restsOn, quote: step.source.quote, url: step.source.url };
+      // (#335) The quote served is the rule's official words FOR THIS CASE: the
+      // quote, plus the stored list line the step rests on when the quote is a
+      // lead-in ("... shall be:" alone names no case). Verbatim stored lines only.
+      return { status: "country", countryCode: codes[0], stepIndex: i, restsOn: step.restsOn, quote: stepQuoteShown(step.source, step.restsOn), url: step.source.url };
     }
     // None or several: this step does not decide; the next one may.
   }
@@ -352,7 +356,8 @@ class CompetenceService {
       message: options.length > 0 ? null : COMPETENCE_MESSAGES.noOffer,
       options,
       questions: rules.questions,
-      competence: rules.block ? { steps: rules.block.steps.map((s) => ({ questionId: s.questionId, restsOn: s.restsOn, quote: s.source.quote, url: s.source.url })) } : null,
+      // (#335) Each step's quote as shown: its rule's quote plus the list line it rests on (see `stepQuoteShown`).
+      competence: rules.block ? { steps: rules.block.steps.map((s) => ({ questionId: s.questionId, restsOn: s.restsOn, quote: stepQuoteShown(s.source, s.restsOn), url: s.source.url })) } : null,
       result,
       proposal,
       answers,
