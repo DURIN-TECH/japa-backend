@@ -117,10 +117,15 @@ export class EntitlementController {
         sendSuccess(res, { subscription: null, entitlements: null, unlimited: true });
         return;
       }
-      const [subscription, entitlements] = await Promise.all([
-        entitlementService.getActiveSubscription(subscriber.id),
-        entitlementService.getEntitlements(subscriber.id),
-      ]);
+      // Entitlements are the ones this request already resolved in the
+      // sign-in middleware (`attachAuthz`), not a second read of the cache
+      // (issue #311). That keeps this answer identical to what the gates on
+      // this very request enforce and to `GET /users/me/authorization`: a
+      // client with no record sees the default client plan that was just
+      // saved for them, instead of `null`. `subscription` can still be null
+      // (the free plan needs no subscription record).
+      const subscription = await entitlementService.getActiveSubscription(subscriber.id);
+      const entitlements = req.entitlements ?? null;
       sendSuccess(res, { subscriberType: subscriber.type, subscription, entitlements });
     } catch (error) {
       console.error("Error getting subscription:", error);
@@ -194,6 +199,8 @@ export class EntitlementController {
       const now = Timestamp.now().toDate().toISOString();
       const stored: StoredPlan = { id, ...plan, createdAt: now, updatedAt: now };
       await collections.plans.doc(id).set(stored);
+      // A new plan may be the default for its audience (#311, see updatePlan).
+      entitlementService.clearDefaultPlanMemo();
       sendSuccess(res, stored, "Plan created");
     } catch (error) {
       console.error("Error creating plan:", error);
@@ -222,6 +229,16 @@ export class EntitlementController {
       };
       await ref.set(updated, { merge: true });
 
+      // Issue #311: records saved from an audience's DEFAULT plan have no
+      // subscription, so the recompute below does not find them. They are not
+      // rewritten here (that could be every client there is, far too many for
+      // one request): each one is compared with the current default plan on
+      // its owner's next request and refreshed then
+      // (entitlementService.followDefaultPlan). Forgetting the memoized
+      // default plan makes that immediate on this instance; other instances
+      // pick the edit up when their memo expires (at most a minute).
+      entitlementService.clearDefaultPlanMemo();
+
       // Re-resolve entitlements for everyone currently on this plan so edits apply.
       const subs = await collections.subscriptions.where("planId", "==", id).get();
       await Promise.all(
@@ -247,6 +264,8 @@ export class EntitlementController {
         return;
       }
       await collections.plans.doc(id).delete();
+      // The deleted plan may have been an audience's default (#311, see updatePlan).
+      entitlementService.clearDefaultPlanMemo();
       sendSuccess(res, { id }, "Plan deleted");
     } catch (error) {
       console.error("Error deleting plan:", error);
