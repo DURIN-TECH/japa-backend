@@ -247,10 +247,12 @@ describe("shared visa data: the shipped file", () => {
   test("#331: IT and AT carry exactly the DK entry's quote and link, and the 2001-03-25 date", () => {
     const bloc = loadSharedVisaData().authorities.find((a) => a.id === "schengen-area");
     assert.ok(bloc, "the bloc is in the file");
-    const dk = bloc.members.find((m) => m.countryCode === "DK");
+    // Typed explicitly for the test type check (as in the #322 test).
+    const members: DataMember[] = bloc.members;
+    const dk: DataMember | undefined = members.find((x: DataMember) => x.countryCode === "DK");
     assert.ok(dk, "DK is a member");
     for (const cc of CODES_331) {
-      const m = bloc.members.filter((x) => x.countryCode === cc);
+      const m: DataMember[] = members.filter((x: DataMember) => x.countryCode === cc);
       assert.equal(m.length, 1, `${cc} is listed once`);
       assert.equal(m[0].joinedOn, "2001-03-25", `${cc} joinedOn`);
       assert.equal(m[0].joinedOn, dk.joinedOn, `${cc} joinedOn is DK's`);
