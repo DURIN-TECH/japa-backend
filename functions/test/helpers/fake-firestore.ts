@@ -383,6 +383,14 @@ export async function installFakes(): Promise<void> {
   // attachAuthz reads the caller's resolved-entitlements cache for every
   // non-admin token (null means RBAC-only, which is what these tests want).
   firebase.collections.entitlements = fakeCollection("entitlements");
+  // Issue #311: for a CLIENT with no entitlements record, attachAuthz now looks
+  // for a plan to put them on (their subscription's plan, else the default
+  // client plan). Both collections are empty here, so nothing is found and
+  // nothing is written: such a client stays "unresolved" (RBAC-only), which
+  // is what these suites were written against. A suite that wants a plan
+  // seeds `plans/<id>` in the store.
+  firebase.collections.subscriptions = fakeCollection("subscriptions");
+  firebase.collections.plans = fakeCollection("plans");
   // Issue #172: the conversation list/response reads the caller's AI message
   // access record (approval, account-wide setting) for the `aiAccess` view.
   firebase.collections.aiMessageAccess = fakeCollection("aiMessageAccess");

@@ -62,6 +62,10 @@ before(async () => {
   };
   const { entitlementService }: any = await import("../../src/services/entitlement.service");
   entitlementService.getEntitlements = async () => null;
+  // Issue #311: a client with no record would now be looked up a default
+  // plan (a Firestore read this suite does not fake). None exists here, so
+  // the client stays unresolved, as this suite expects.
+  entitlementService.resolveMissingEntitlements = async () => null;
   const { claimsService }: any = await import("../../src/services/claims.service");
   claimsService.resolveRoleFromDb = async () => ({ role: ROLES.CLIENT, agencyId: null });
   claimsService.setRoleClaims = async () => undefined;
