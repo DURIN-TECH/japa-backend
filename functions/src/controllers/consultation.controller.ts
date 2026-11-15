@@ -8,9 +8,9 @@ import {
   CONSULTATION_ACTORS,
   CONSULTATION_STATUSES,
   SYSTEM_ONLY_STATUSES,
-  // Issue #316: the value checks and the schedule test of the edit route.
-  isScheduleEdit,
+  // Issue #316: the value checks and the "did it really move" test of the edit route.
   parseEditBody,
+  scheduleChanged,
 } from "../services/consultation.service";
 import { notificationService } from "../services/notification.service";
 import { agencyService } from "../services/agency.service";
@@ -711,7 +711,9 @@ export class ConsultationController {
    *
    * Answers, in the order they are checked:
    *  - 400 VALIDATION_ERROR: no editable field in the body, or a bad value
-   *    (see `parseEditBody` for the rule per field), whoever asks;
+   *    (see `parseEditBody` for the rule per field), whoever asks.
+   *    `scheduledTime` may be 24-hour `HH:mm` or 12-hour `h:mm AM/PM` (what
+   *    the portal's time picker sends); it is always stored as `HH:mm`;
    *  - 404: unknown id;
    *  - 403 FORBIDDEN: the caller is the client, or not a party at all;
    *  - 409 BOOKING_NOT_EDITABLE: a field that is closed in the booking's
@@ -723,9 +725,10 @@ export class ConsultationController {
    *
    * One body is all or nothing: a single refused field refuses the whole
    * edit. EVERY refusal writes nothing and notifies nobody. A saved edit
-   * answers the updated booking; when it changed the schedule the client is
-   * told (`consultation_rescheduled`), and so is the booking's agent when
-   * the agency's owner or an admin made the change.
+   * answers the updated booking; when a stored schedule value really changed
+   * the client is told (`consultation_rescheduled`), and so is the booking's
+   * agent when the agency's owner or an admin made the change. Resending the
+   * values the booking already holds saves without notifying anyone.
    */
   async updateConsultation(
     req: AuthenticatedRequest,
@@ -768,7 +771,9 @@ export class ConsultationController {
       // A saved schedule change: tell the client, and also the booking's
       // agent when someone else on the agent side (owner, admin) made it.
       // The person who made the change is never told about their own edit.
-      if (isScheduleEdit(parsed.fieldNames)) {
+      // Only a stored value that really changed counts: resending the time
+      // a booking already has saves, but is not a reschedule.
+      if (scheduleChanged(existing, outcome.consultation)) {
         const recipients = [...new Set([existing.userId, existing.agentId])].filter(
           (uid): uid is string => !!uid && uid !== userId
         );

@@ -25,10 +25,12 @@
 //      * a save writes only the editable fields and `updatedAt`;
 //      * every refusal leaves the stored doc unchanged and calls
 //        `notifyUser` zero times;
-//      * a saved reschedule notifies the client, and the booking's agent
+//      * a saved schedule CHANGE notifies the client, and the booking's agent
 //        too when the owner or an admin made it;
-//      * the portal's reschedule body (`{ scheduledDate, scheduledTime }`)
-//        works for the booking's agent and for the agency owner.
+//      * the portal's reschedule body (`{ scheduledDate, scheduledTime }`
+//        with the time picker's 12-hour labels, e.g. "12:00 PM") works for
+//        the booking's agent and for the agency owner, stored as HH:mm;
+//      * resending the schedule a booking already has notifies nobody.
 import { test, describe, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { Timestamp } from "firebase-admin/firestore";
@@ -46,6 +48,7 @@ import {
   EDIT_FIELD_GROUPS,
   EditableField,
   decideEdit,
+  normalizeScheduledTime,
   parseEditBody,
 } from "../../src/services/consultation.service";
 import { notificationService } from "../../src/services/notification.service";
@@ -305,7 +308,11 @@ describe("decideEdit", () => {
 /** Bad values per field: each must be answered 400, never stored, never a 500. */
 const BAD_VALUES: Record<EditableField, unknown[]> = {
   scheduledDate: ["not a date", "", "   ", "2026-13-45", 1764547200000, null, {}, true],
-  scheduledTime: ["9:30", "24:00", "12:60", "2pm", "10:30:00", " 10:30", 1030, null],
+  scheduledTime: [
+    "9:30", "24:00", "12:60", "2pm", "10:30:00", " 10:30", 1030, null,
+    // 12-hour forms that are still wrong.
+    "13:00 PM", "0:30 AM", "00:30 AM", "12:60 PM", "12:00  PM", "12:00 XM", "12:00 P.M.", "12 PM", "9:30 AM ", "AM 9:30",
+  ],
   durationMinutes: [4, 481, 0, -30, 30.5, "30", NaN, Infinity, null],
   timezone: ["", "   ", 1, null, {}],
   meetingLink: ["http://meet.example.test/x", "meet.example.test/x", "javascript:alert(1)", "", 5, null],
@@ -325,6 +332,24 @@ describe("parseEditBody", () => {
     const { scheduledDate: _date, ...rest } = parsed.updates;
     const { scheduledDate: _validDate, ...validRest } = VALID;
     assert.deepEqual(rest, validRest);
+  });
+
+  test("scheduledTime: 24-hour is kept, 12-hour is stored as 24-hour HH:mm", () => {
+    const cases: Array<[string, string]> = [
+      ["00:00", "00:00"], ["09:05", "09:05"], ["23:59", "23:59"],
+      ["12:00 AM", "00:00"], ["12:30 AM", "00:30"], ["12:00 PM", "12:00"], ["12:45 PM", "12:45"],
+      ["1:00 AM", "01:00"], ["9:30 AM", "09:30"], ["11:59 AM", "11:59"],
+      ["1:05 PM", "13:05"], ["6:00 PM", "18:00"], ["11:59 PM", "23:59"],
+      // Leading zero, letter case and the space are all optional.
+      ["09:30 AM", "09:30"], ["9:30 am", "09:30"], ["9:30AM", "09:30"], ["03:15pm", "15:15"], ["3:15 Pm", "15:15"],
+    ];
+    for (const [sent, storedAs] of cases) {
+      assert.equal(normalizeScheduledTime(sent), storedAs, sent);
+      const parsed = parseEditBody({ scheduledTime: sent });
+      assert.equal(parsed.ok, true, sent);
+      if (parsed.ok) assert.equal(parsed.updates.scheduledTime, storedAs, sent);
+    }
+    for (const bad of BAD_VALUES.scheduledTime) assert.equal(normalizeScheduledTime(bad), null, String(bad));
   });
 
   test("the limits themselves are accepted", () => {
@@ -769,6 +794,41 @@ describe("PUT /consultations/:id — notifications", () => {
     }
   });
 
+  test("resending the schedule the booking already has saves, but notifies nobody", async () => {
+    // Same instant, same time (24-hour and its 12-hour label), same length, same zone.
+    const same = [
+      { scheduledDate: T0.toDate().toISOString(), scheduledTime: "10:00" },
+      { scheduledDate: T0.toDate().toISOString(), scheduledTime: "10:00 AM" },
+      { scheduledTime: "10:00 am", durationMinutes: 30, timezone: "Africa/Lagos" },
+    ];
+    for (const p of AGENT_SIDE) {
+      for (const body of same) {
+        harness.reset();
+        notified.length = 0;
+        await seedBooking("scheduled");
+        harness.clock.advanceHours(1);
+        assertOk(await edit(p, body), `${p.uid} ${JSON.stringify(body)}`);
+        // It was saved (updatedAt moved, the time is stored as HH:mm) ...
+        assert.equal(writes.length, 1);
+        assert.equal(stored().updatedAt.toMillis(), harness.clock.now().getTime());
+        assert.equal(stored().scheduledTime, "10:00");
+        // ... but nothing moved, so nobody is told it was rescheduled.
+        assert.deepEqual(notified, [], `${p.uid} ${JSON.stringify(body)}`);
+      }
+    }
+  });
+
+  test("one schedule value that really changes, next to unchanged ones, still notifies", async () => {
+    await seedBooking("scheduled");
+    // The portal always sends date and time together: same day, new time.
+    assertOk(await edit(ownerA, { scheduledDate: T0.toDate().toISOString(), scheduledTime: "2:30 PM" }), "new time");
+    assert.equal(stored().scheduledTime, "14:30");
+    assert.deepEqual(notified, [
+      { userId: "uid-client1", type: "consultation_rescheduled" },
+      { userId: "uid-agent1", type: "consultation_rescheduled" },
+    ]);
+  });
+
   test("an edit that is not a schedule change notifies nobody", async () => {
     await seedBooking("scheduled");
     assertOk(await edit(ownerA, { meetingLink: VALID.meetingLink, type: "general", summary: "x" }), "meeting");
@@ -794,22 +854,50 @@ describe("PUT /consultations/:id — notifications", () => {
 // The portal's reschedule
 // ============================================
 
+/**
+ * The portal's time picker options, copied from `TIME_OPTIONS` in
+ * seli-portal/src/components/appointments/AppointmentDetailsModal.tsx, each
+ * with the 24-hour value it must be stored as.
+ */
+const PORTAL_TIME_OPTIONS: Array<[label: string, storedAs: string]> = [
+  ["8:00 AM", "08:00"], ["8:30 AM", "08:30"], ["9:00 AM", "09:00"], ["9:30 AM", "09:30"],
+  ["10:00 AM", "10:00"], ["10:30 AM", "10:30"], ["11:00 AM", "11:00"], ["11:30 AM", "11:30"],
+  ["12:00 PM", "12:00"], ["12:30 PM", "12:30"], ["1:00 PM", "13:00"], ["1:30 PM", "13:30"],
+  ["2:00 PM", "14:00"], ["2:30 PM", "14:30"], ["3:00 PM", "15:00"], ["3:30 PM", "15:30"],
+  ["4:00 PM", "16:00"], ["4:30 PM", "16:30"], ["5:00 PM", "17:00"], ["5:30 PM", "17:30"],
+  ["6:00 PM", "18:00"],
+];
+
 describe("PUT /consultations/:id — the portal appointments page reschedule", () => {
-  // seli-portal: updateConsultation(id, { scheduledDate, scheduledTime }) with
-  // the values of a date input ("YYYY-MM-DD") and a time input ("HH:mm").
-  test("works for the booking's agent and for the agency owner", async () => {
+  // seli-portal: updateConsultation(id, { scheduledDate, scheduledTime }).
+  // The date is an <input type="date"> ("YYYY-MM-DD"); the time is a
+  // <select> over TIME_OPTIONS, so a 12-hour LABEL ("12:00 PM" by default).
+  test("every time the picker offers is saved as HH:mm, for the booking's agent and the agency owner", async () => {
     for (const p of [agent, ownerA]) {
-      for (const status of ["scheduled", "confirmed"] as ConsultationStatus[]) {
+      for (const [label, storedAs] of PORTAL_TIME_OPTIONS) {
         harness.reset();
-        await seedBooking(status);
-        const out = await edit(p, { scheduledDate: "2026-11-20", scheduledTime: "15:45" });
-        assertOk(out, `${p.uid} ${status}`);
+        notified.length = 0;
+        await seedBooking("scheduled");
+        const out = await edit(p, { scheduledDate: "2026-11-20", scheduledTime: label });
+        assertOk(out, `${p.uid} ${label}`);
         const after = stored();
         assert.ok(after.scheduledDate instanceof Timestamp);
         assert.equal(after.scheduledDate.toMillis(), Date.parse("2026-11-20"));
-        assert.equal(after.scheduledTime, "15:45");
-        assert.equal(out.body.data.scheduledTime, "15:45");
+        assert.equal(after.scheduledTime, storedAs, label);
+        assert.equal(out.body.data.scheduledTime, storedAs, label);
+        // The client is told; the agent too when the owner did it.
+        assert.equal(notified.filter((n) => n.userId === "uid-client1").length, 1, label);
+        assert.equal(notified.filter((n) => n.userId === "uid-agent1").length, p === ownerA ? 1 : 0, label);
       }
+    }
+  });
+
+  test("the same body on a confirmed booking works too", async () => {
+    for (const p of [agent, ownerA]) {
+      harness.reset();
+      await seedBooking("confirmed");
+      assertOk(await edit(p, { scheduledDate: "2026-11-20", scheduledTime: "12:00 PM" }), p.uid);
+      assert.equal(stored().scheduledTime, "12:00");
     }
   });
 });

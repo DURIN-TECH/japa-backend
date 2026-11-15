@@ -306,8 +306,58 @@ export const MIN_DURATION_MINUTES = 5;
 export const MAX_DURATION_MINUTES = 480;
 /** Longest `summary` an edit may store, in characters. */
 export const MAX_SUMMARY_LENGTH = 5000;
-/** 24-hour `HH:mm`, e.g. "09:05" or "23:59". */
+/** 24-hour `HH:mm`, e.g. "09:05" or "23:59". This is the STORED format. */
 const HH_MM = /^([01]\d|2[0-3]):[0-5]\d$/;
+/**
+ * 12-hour `h:mm AM/PM`, e.g. "9:30 AM", "09:30am" or "12:00 PM": hour 1-12
+ * with an optional leading zero, then at most one space, then AM or PM in
+ * any letter case. The portal's time picker sends these labels.
+ */
+const H_MM_AM_PM = /^(0?[1-9]|1[0-2]):([0-5]\d) ?(AM|PM)$/i;
+
+/**
+ * Turn a request's `scheduledTime` into the stored 24-hour `HH:mm`, or null
+ * when it is neither accepted form (issue #316, criterion update):
+ *
+ *  - 24-hour `HH:mm` is kept as it is;
+ *  - 12-hour `h:mm AM/PM` is converted: "12:00 AM" -> "00:00",
+ *    "12:30 PM" -> "12:30", "1:05 PM" -> "13:05", "9:30 am" -> "09:30".
+ *
+ * Pure. Anything else (a non-string, "9:30", "13:00 PM", "2pm") is null.
+ */
+export function normalizeScheduledTime(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  if (HH_MM.test(value)) return value;
+  const match = H_MM_AM_PM.exec(value);
+  if (!match) return null;
+  const isPm = match[3].toUpperCase() === "PM";
+  // 12 AM is hour 0 and 12 PM is hour 12; every other PM hour is 12 later.
+  const hour = (Number(match[1]) % 12) + (isPm ? 12 : 0);
+  return `${String(hour).padStart(2, "0")}:${match[2]}`;
+}
+
+/** A stored date as milliseconds, or null when the field holds no Timestamp. */
+function millisOf(value: unknown): number | null {
+  return value && typeof (value as Timestamp).toMillis === "function" ? (value as Timestamp).toMillis() : null;
+}
+
+/**
+ * True when an edit really MOVED the booking: at least one stored schedule
+ * value differs between `before` and `after` (the date compared by instant,
+ * the others by value). Resending the values a booking already holds is
+ * therefore not a reschedule, and nobody is told it was one.
+ */
+export function scheduleChanged(
+  before: Pick<Consultation, "scheduledDate" | "scheduledTime" | "durationMinutes" | "timezone">,
+  after: Pick<Consultation, "scheduledDate" | "scheduledTime" | "durationMinutes" | "timezone">
+): boolean {
+  return (
+    millisOf(before.scheduledDate) !== millisOf(after.scheduledDate) ||
+    before.scheduledTime !== after.scheduledTime ||
+    before.durationMinutes !== after.durationMinutes ||
+    before.timezone !== after.timezone
+  );
+}
 
 /** A checked edit: the values to store, keyed by editable field. */
 export type EditUpdates = Partial<Record<EditableField, unknown>>;
@@ -335,7 +385,8 @@ function isHttpsUrl(value: unknown): boolean {
  *  - no editable field at all;
  *  - `scheduledDate` not a string that parses as a date (this used to
  *    throw inside Timestamp.fromDate and answer 500);
- *  - `scheduledTime` not 24-hour `HH:mm`;
+ *  - `scheduledTime` neither 24-hour `HH:mm` nor 12-hour `h:mm AM/PM`
+ *    (either is stored as `HH:mm`, see `normalizeScheduledTime`);
  *  - `durationMinutes` not a whole number from 5 to 480;
  *  - `timezone` not a non-empty string;
  *  - `meetingPlatform` not zoom / google_meet / teams;
@@ -363,10 +414,13 @@ export function parseEditBody(body: unknown): ParsedEdit {
       updates.scheduledDate = Timestamp.fromMillis(ms);
       break;
     }
-    case "scheduledTime":
-      if (typeof value !== "string" || !HH_MM.test(value)) return bad("scheduledTime must be a 24-hour HH:mm time");
-      updates.scheduledTime = value;
+    case "scheduledTime": {
+      // Either accepted form is stored the same way, as 24-hour HH:mm.
+      const time = normalizeScheduledTime(value);
+      if (time === null) return bad("scheduledTime must be a 24-hour HH:mm or a 12-hour h:mm AM/PM time");
+      updates.scheduledTime = time;
       break;
+    }
     case "durationMinutes":
       if (
         typeof value !== "number" || !Number.isInteger(value) ||
