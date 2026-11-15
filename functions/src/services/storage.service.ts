@@ -351,7 +351,18 @@ export class StorageService {
   }
 
   /**
-   * Get file metadata
+   * The stored object's metadata, or null when there is no such object.
+   *
+   * `size` is the object's REAL byte length as Cloud Storage recorded it when
+   * the upload finished. Document registration (issue #310) reads the size from
+   * here and never from the request body, because a signed upload URL carries
+   * no size range and a client can declare any number it likes.
+   *
+   * One request: a missing object is a 404 from `getMetadata`, which is turned
+   * into null here (no separate `exists()` round trip). Any other failure is
+   * rethrown for the caller to report as a server error. `size` is NaN-safe:
+   * a value that is not a whole number of bytes comes back as null too, so a
+   * caller can never store or compare a non-number.
    */
   async getFileMetadata(storagePath: string): Promise<{
     size: number;
@@ -359,17 +370,23 @@ export class StorageService {
     created: Date;
   } | null> {
     const file = this.bucket.file(storagePath);
-    const [exists] = await file.exists();
 
-    if (!exists) {
-      return null;
+    let metadata: { size?: string | number; contentType?: string; timeCreated?: string };
+    try {
+      [metadata] = await file.getMetadata();
+    } catch (error) {
+      // 404 = "No such object": the client registered a path it never uploaded.
+      if ((error as { code?: number }).code === 404) return null;
+      throw error;
     }
 
-    const [metadata] = await file.getMetadata();
+    // The JSON API reports `size` as a decimal string.
+    const size = Number(metadata.size);
+    if (!Number.isInteger(size) || size < 0) return null;
 
     return {
-      size: parseInt(metadata.size as string, 10),
-      contentType: metadata.contentType as string,
+      size,
+      contentType: typeof metadata.contentType === "string" ? metadata.contentType : "",
       created: new Date(metadata.timeCreated as string),
     };
   }

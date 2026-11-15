@@ -1,7 +1,7 @@
 import { aiActionService } from "../services/ai-action.service";
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { documentService, UploadActor } from "../services/document.service";
+import { documentService, FileTooLargeError, UploadActor } from "../services/document.service";
 import { documentRequestService } from "../services/document-request.service";
 import { documentCheckService } from "../services/ai/document-check.service";
 import { tierFor } from "../services/ai/tier-serializer";
@@ -199,7 +199,8 @@ export class DocumentController {
         requirementId,
         fileName,
         fileType,
-        fileSizeMb,
+        // `fileSizeMb` in the body is ignored since #310 (older clients still
+        // send it): the stored size is read from Cloud Storage by the service.
         storagePath,
         // Optional: the durable agent ask this upload satisfies. When present we
         // close that request out automatically (see below) so the client's to-do
@@ -227,13 +228,12 @@ export class DocumentController {
         !resolvedRequirementId ||
         !fileName ||
         !fileType ||
-        fileSizeMb === undefined ||
         !storagePath
       ) {
         sendError(
           res,
           "VALIDATION_ERROR",
-          "applicationId, requirementId (or documentRequestId), fileName, fileType, fileSizeMb, and storagePath are required",
+          "applicationId, requirementId (or documentRequestId), fileName, fileType, and storagePath are required",
           400
         );
         return;
@@ -298,7 +298,6 @@ export class DocumentController {
         requirementId: resolvedRequirementId,
         fileName,
         fileType,
-        fileSizeMb,
         storagePath,
         documentType,
         displayName,
@@ -413,6 +412,24 @@ export class DocumentController {
             `(caller ${req.userId ?? "unknown"}, application ${loggedApplicationId})`
         );
         sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      // (#310) The uploaded object is over the size the product supports. The
+      // service has already deleted the object and written no record, so the
+      // client can pick a smaller copy and start again from the upload URL.
+      // 413 with its own code, so the app can show the size message instead of
+      // a generic upload failure. `maxBytes` is the limit that applied to this
+      // file (lower for an image than for a PDF) and `sizeBytes` its real size.
+      if (error instanceof FileTooLargeError) {
+        console.warn(
+          `[document] registration refused: file too large (${error.sizeBytes} > ${error.maxBytes} bytes, caller ${req.userId ?? "unknown"})`
+        );
+        res.status(413).json({
+          success: false,
+          error: "FILE_TOO_LARGE",
+          message: error.message,
+          details: { maxBytes: error.maxBytes, sizeBytes: error.sizeBytes, isImage: error.isImage },
+        });
         return;
       }
       console.error("Error creating document:", error);
