@@ -70,8 +70,9 @@ export interface AiSettings {
  *
  * `maxRequestsPerAssessment` is 30 (#310; it was 12). One review makes one
  * extraction call per document plus one judgement call per batch of rules
- * (UK Standard Visitor v2 needs 5). At 12, an application with more than 7
- * documents could not be reviewed at all. 30 covers 15 documents + 5 judgement
+ * (the largest approved rulebook when this was set needs 5; no route is named
+ * here on purpose, the engine's sources stay route-free). At 12, an
+ * application with more than 7 documents could not be reviewed at all. 30 covers 15 documents + 5 judgement
  * calls with room for 10 more of either (so up to 25 documents on that
  * rulebook). The allowed range stays 1-50, and a stored value in that range
  * still overrides this default. Raising it raises the most ONE review can
