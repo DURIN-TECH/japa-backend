@@ -340,6 +340,51 @@ Content-Type: application/json
 
 { "reference": "{{paystackReference}}" }
 
+### Book a consultation as an agent / agency owner for a client (issue #246).
+### The client (userId) must ALREADY be the caller's or their agency's client:
+### an application (agentId = caller uid, or the caller's agency), a
+### conversation (agentId = the caller's agent DOC id) or an earlier
+### consultation (any status). Otherwise 403 FORBIDDEN with nothing written,
+### no quote, no checkout; a userId that does not exist gets the same 403.
+### applicationId (optional) must be that client's application with this agent
+### or agency, else 403.
+POST {{baseUrl}}/consultations
+Content-Type: application/json
+Authorization: Bearer {{agent1Token}}
+
+{
+  "userId": "{{loginClient.response.body.localId}}",
+  "type": "initial",
+  "scheduledDate": "2026-12-01",
+  "scheduledTime": "10:00"
+}
+
+### Change a consultation's status (issue #151). Who may set what, and from where:
+###   client (the booking's userId): cancelled only, from pending_payment / scheduled / confirmed
+###   agent side (the booking's agent, its agency's owner, an admin):
+###     confirmed   from scheduled
+###     in_progress from scheduled / confirmed
+###     completed   from scheduled / confirmed / in_progress
+###     no_show     from scheduled / confirmed / in_progress
+###     cancelled   from pending_payment / scheduled / confirmed
+### 400 VALIDATION_ERROR: unknown status, or pending_payment / scheduled as the target (anyone).
+### 403 FORBIDDEN: not a party, or a client asking for anything but cancelled.
+### 409 INVALID_STATUS_TRANSITION: a move not in the table (incl. out of completed / cancelled / no_show).
+### 409 PAYMENT_IN_PROGRESS: cancelling a pending_payment booking whose checkout
+### (transactionId) is still inside its quote lock (quoteExpiresAt in the future).
+### Every refusal writes nothing and notifies nobody.
+PUT {{baseUrl}}/consultations/{{consultationId}}/status
+Content-Type: application/json
+Authorization: Bearer {{clientToken}}
+
+{ "status": "cancelled", "cancellationReason": "Travel moved" }
+
+### Delete a consultation (issue #151): ADMINS ONLY (everyone else 403; they
+### cancel with the status route above). 409 BOOKING_HAS_PAYMENT, nothing
+### removed, when the booking has a transactionId or paymentStatus "paid".
+DELETE {{baseUrl}}/consultations/{{consultationId}}
+Authorization: Bearer {{adminToken}}
+
 # ============================================================
 # PAYMENT REQUESTS (issue #181) — the agent asks in US dollars, the
 # client pays the local amount quoted at checkout start
