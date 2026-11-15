@@ -117,6 +117,8 @@ export interface InsufficientItem {
   // `no_trigger` it is never a refusal ground or a top issue, makes no proposed
   // action, and does not lower the band or the confidence. Clients must not
   // list it to the applicant as something to act on.
+  // NOTE: the app hides any marker it does not know. A NEW marker the
+  // applicant can act on therefore needs an app change before it is served.
   notAssessed?: "unanswered" | "no_trigger" | "missing_fact" | "not_in_documents";
   // (#233) The rulebook layer the rule came from (its rulebook key), set only
   // when the application runs on a stack of more than one layer. Copied from
@@ -305,8 +307,9 @@ export interface ApplicationAssessment {
   // Full tier and staff only: the free whitelist does not include it.
   countryContext?: AvailableCountryContext;
   // Stored, stripped from every client-role response (see tier-serializer).
-  // (#308) Also null on a FINISHED assessment when no objective rule could be
-  // checked from the documents and nothing refuses: no call is made.
+  // (#308) Also null on a FINISHED assessment when nothing refuses and the
+  // objective checks could not be made (the rulebook names no document for
+  // them, an upload is unread, or a field could not be read): no call is made.
   internalCall: "would_approve" | "would_refuse" | null;
 
   models: { extract: string | null; judge: string | null };

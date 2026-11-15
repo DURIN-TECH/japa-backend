@@ -118,8 +118,9 @@ export interface AssessmentContent {
   score: number | null;
   readiness: ReadinessBand;
   confidence: "high" | "medium" | "low";
-  // (#308) Null when NO objective rule could be checked from the documents and
-  // nothing refuses: code has no basis for a call either way, so it makes none.
+  // (#308) Null when nothing refuses and the objective checks could not be
+  // made (the rulebook names no document for them, an upload is unread, or a
+  // field could not be read): code has no basis for a call, so it makes none.
   internalCall: "would_approve" | "would_refuse" | null;
   // A mandatory bar applies (code-decided). Served to the free tier as a boolean.
   hasBlockingRule: boolean;
@@ -1029,11 +1030,20 @@ export const NO_FIELD_TO_READ = "no field to read";
 /** Prefix of the id an unread-upload item carries in place of a rule id. */
 const UNREAD_DOCUMENT_ID_PREFIX = "document:";
 
+/**
+ * The `failure` text the job gives a file over the size limit (it is never
+ * sent to a model). The bulk path writes the same text, so keep the two equal.
+ */
+export const FILE_TOO_LARGE = "file is larger than the limit";
+
 /** What the applicant is told about an upload that could not be read. Fixed text, never model text. */
 export const UNREAD_DOCUMENT_REASON = "We couldn't read this upload, so nothing in it was checked. Upload a clearer copy.";
 
 /** The same for an upload whose content cannot be relied on (it addressed the reader instead of stating facts). */
 export const UNUSABLE_DOCUMENT_REASON = "We couldn't use this upload, so nothing in it was checked. Upload a clean copy of the original document.";
+
+/** The same for a file over the size limit: a clearer copy would not help, a smaller file does. */
+export const TOO_LARGE_DOCUMENT_REASON = "This file is too large for us to read, so nothing in it was checked. Upload a smaller file.";
 
 /** Longest document label copied into an item title. */
 const MAX_DOCUMENT_LABEL = 80;
@@ -1056,17 +1066,23 @@ export function unreadDocumentsOf(documents: readonly DocumentExtraction[]): Doc
  *
  *  - `criterionId` is `document:<documentId>` (no rule is involved; the id is
  *    unique per upload, so two unread uploads never share a key);
- *  - `title` is the upload's own label (what the applicant recognises it by);
+ *  - `title` is what the applicant recognises the upload by: the name the
+ *    caller gives for it in `names` (checklist item, display name or file
+ *    name), else the upload's code label, else "document";
  *  - `documentId` marks the item as being about an upload, not a rule;
  *  - NO `notAssessed` marker: the applicant CAN act on it (upload again), so it
  *    is listed, gets one proposed action, and counts against the band and the
  *    confidence like any other open item.
+ *
+ * @param names applicant-facing name per document id. Kept apart from
+ *   `DocumentExtraction.label`, which is a code label sent to the model and
+ *   must never be the name the applicant typed.
  */
-export function unreadDocumentItems(documents: readonly DocumentExtraction[]): InsufficientItem[] {
+export function unreadDocumentItems(documents: readonly DocumentExtraction[], names: Readonly<Record<string, string>> = {}): InsufficientItem[] {
   return unreadDocumentsOf(documents).map((d) => ({
     criterionId: `${UNREAD_DOCUMENT_ID_PREFIX}${d.documentId}`,
-    title: (d.label || "document").slice(0, MAX_DOCUMENT_LABEL),
-    reason: d.suspicious ? UNUSABLE_DOCUMENT_REASON : UNREAD_DOCUMENT_REASON,
+    title: ((names[d.documentId] ?? "").trim() || d.label || "document").slice(0, MAX_DOCUMENT_LABEL),
+    reason: d.suspicious ? UNUSABLE_DOCUMENT_REASON : d.failure === FILE_TOO_LARGE ? TOO_LARGE_DOCUMENT_REASON : UNREAD_DOCUMENT_REASON,
     documentId: d.documentId,
   }));
 }
@@ -1082,7 +1098,9 @@ export function criterionById(rubric: Pick<VisaRubric, "criteria">, id: string):
 
 /** Inputs to the assembly step. Everything here is code output or rubric data. */
 export interface AssembleInput {
-  rubric: Pick<VisaRubric, "criteria" | "intentPolarity" | "severityLevels">;
+  // (#308) `evidenceItems` (optional) tells assembly whether the rulebook names
+  // a document for ANY objective rule; absent is read as "names none".
+  rubric: Pick<VisaRubric, "criteria" | "intentPolarity" | "severityLevels"> & Partial<Pick<VisaRubric, "evidenceItems">>;
   mandatoryHits: AssessmentCriterion[];
   objective: ObjectiveResult[];
   judgement: JudgementOutput | null;
@@ -1104,6 +1122,11 @@ export interface AssembleInput {
   // trigger). They are in the rubric, so they are reported here as "could not
   // be assessed", not as a failure and not as a pass.
   notAssessed?: InsufficientItem[];
+  // (#308) Applicant-facing name of each upload, by document id (the checklist
+  // item it was uploaded to, its display name or its file name). Used only as
+  // the title of a "we couldn't read this upload" item. Optional: without it
+  // the upload's code label is used.
+  documentNames?: Record<string, string>;
 }
 
 /**
@@ -1158,7 +1181,7 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
 
   // (#308) An upload that could not be read is always said, first in the list,
   // whether or not any rule names the document.
-  const unreadItems = unreadDocumentItems(input.documents);
+  const unreadItems = unreadDocumentItems(input.documents, input.documentNames);
   insufficient.push(...unreadItems);
 
   const seenRefusal = new Set<string>();
@@ -1304,11 +1327,25 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   // "nothing to check"): what that upload holds was never compared.
   const objectiveOutcome: StageOutcomes["objective"] =
     unreadItems.length > 0 && (objectiveFromChecks === "clear" || objectiveFromChecks === "not_applicable") ? "insufficient" : objectiveFromChecks;
-  // (#308) The rulebook HAS objective rules and not one could be checked from
-  // the documents (every one is "not in documents": typically an older
-  // rulebook with no document items). The result must not then read better
-  // than what was checked: see the three caps below.
-  const nothingChecked = input.objective.length > 0 && objectiveChecked.length === 0;
+  // (#308) THE DOCUMENTS ARE UNGUARDED: at least one objective rule came out
+  // "not in documents", and the rulebook names a document for NONE of the
+  // objective rules this applicant is assessed on (an older rulebook with no
+  // document items at all, or one whose items name only other rules). On such
+  // a rulebook code can never say "a document you were asked for is missing":
+  // every missing field, core ones included, is only ever marked. One field
+  // that happens to be read and pass says nothing about the rest, so the
+  // result must not read better than what was checked: see the three caps
+  // below. (This also covers "not one rule could be checked".)
+  //
+  // Why this boundary and not "any marked rule": on a rulebook that DOES name
+  // documents for its objective rules, the named rules guard the documents it
+  // asks for (a missing one is a refusal ground) and the marked ones are side
+  // rules nobody can evidence; capping there would hold back every applicant,
+  // however complete. A fully checked application (no marked rule) is never
+  // capped on any rulebook.
+  const namedByAnItem = new Set((rubric.evidenceItems ?? []).flatMap((e) => e.criterionIds ?? []));
+  const anyObjectiveRuleNamed = rubric.criteria.some((c) => c.kind === "objective" && c.check && namedByAnItem.has(c.criterionId));
+  const documentsUnguarded = !anyObjectiveRuleNamed && input.objective.some((r) => r.notAssessed === "not_in_documents");
   const stageOutcomes: StageOutcomes = {
     mandatoryBar: input.mandatoryHits.length > 0 ? "hit" : rubric.criteria.some((c) => c.kind === "mandatory_bar") ? "clear" : "not_applicable",
     objective: objectiveOutcome,
@@ -1334,13 +1371,13 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     flagCount: credibilityFlags.length,
     documentCount: input.documents.length,
   });
-  // (#308) Cap 1: nothing was checked from the documents, so never "strong".
-  const readiness: ReadinessBand = nothingChecked && bandFromFacts === "strong" ? "competitive" : bandFromFacts;
+  // (#308) Cap 1: the documents are unguarded, so never "strong".
+  const readiness: ReadinessBand = documentsUnguarded && bandFromFacts === "strong" ? "competitive" : bandFromFacts;
 
   const confidenceFromItems: AssessmentContent["confidence"] =
     countable.length === 0 && input.documents.length > 0 ? "high" : countable.length <= 2 ? "medium" : "low";
-  // (#308) Cap 2: nothing was checked from the documents, so never "high".
-  const confidence: AssessmentContent["confidence"] = nothingChecked && confidenceFromItems === "high" ? "medium" : confidenceFromItems;
+  // (#308) Cap 2: the documents are unguarded, so never "high".
+  const confidence: AssessmentContent["confidence"] = documentsUnguarded && confidenceFromItems === "high" ? "medium" : confidenceFromItems;
 
   return {
     stageOutcomes,
@@ -1354,9 +1391,12 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     score: input.score,
     readiness,
     confidence,
-    // (#308) Cap 3: with no objective rule checked, "no refusal ground" is not
-    // a basis for "would approve": no call is made (null), for staff to see.
-    internalCall: refusalGrounds.length > 0 ? "would_refuse" : nothingChecked ? null : "would_approve",
+    // (#308) Cap 3: "no refusal ground" is a basis for "would approve" only
+    // when the objective checks could be made. No call is made (null, for
+    // staff to see) when the documents are unguarded, and when the objective
+    // stage is "insufficient": an upload is unread, or a checked field could
+    // not be read, so nothing says the applicant passes.
+    internalCall: refusalGrounds.length > 0 ? "would_refuse" : documentsUnguarded || objectiveOutcome === "insufficient" ? null : "would_approve",
     hasBlockingRule: input.mandatoryHits.length > 0,
     droppedCount,
     unanchoredCount,

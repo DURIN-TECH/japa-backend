@@ -33,6 +33,8 @@ import {
   mergeJudgementOutputs,
   // (#308) The one "unread" reason that is not reported to the applicant.
   NO_FIELD_TO_READ,
+  // (#308) The "unread" reason that gets its own wording (a smaller file helps).
+  FILE_TOO_LARGE,
   numberStatementBlocks,
   parseJudgement,
   planJudgementBatches,
@@ -144,7 +146,12 @@ export interface LoadedInputs {
   eligibilityScore: number | null;
   eligibilityAnswers: Record<string, unknown> | null;
   intake: Record<string, unknown>;
-  documents: Array<{ id: string; path: string; updatedAtMs: number; sizeMb: number; label: string }>;
+  // `label` is a code label and is what the model is shown. (#308) `name` is
+  // what the APPLICANT recognises the upload by (display name, document type or
+  // file name) and `requirementId` the checklist item it was uploaded to: both
+  // are used only to title a "we couldn't read this upload" item, never sent
+  // to a model and not part of the input hash.
+  documents: Array<{ id: string; path: string; updatedAtMs: number; sizeMb: number; label: string; name?: string; requirementId?: string }>;
   // `blocks` is one plain-text string per TOP-LEVEL ProseMirror block, in
   // document order (index = the block's index in `content`); `contentHash`
   // hashes the content itself so the input hash ignores bare version bumps.
@@ -382,6 +389,9 @@ export class AiCaseOfficerService {
         updatedAtMs: data.updatedAt ? data.updatedAt.toMillis() : 0,
         sizeMb: data.fileSizeMb ?? 0,
         label: data.documentType ?? data.displayName ?? "document",
+        // (#308) Self-service uploads send neither field above, only the file.
+        name: data.displayName ?? data.documentType ?? data.fileName,
+        requirementId: data.requirementId,
       };
     });
     documents.sort((a, b) => (a.id < b.id ? -1 : 1));
@@ -811,7 +821,7 @@ export class AiCaseOfficerService {
     for (const d of loaded.documents) {
       const base = { documentId: d.id, label: d.label };
       if (d.sizeMb * 1024 * 1024 > settings.maxFileBytes) {
-        extractions.push(unreadable(base, "file is larger than the limit"));
+        extractions.push(unreadable(base, FILE_TOO_LARGE));
         continue;
       }
       if (fields.length === 0) {
@@ -946,6 +956,7 @@ export class AiCaseOfficerService {
       judgementFailed,
       unjudgedCriterionIds: judgement ? unjudgedCriterionIds : [],
       notAssessed,
+      documentNames: documentNamesFor(loaded.documents, fullRubric),
     });
     await this.storeContent(
       cur.id,
@@ -1091,6 +1102,27 @@ export class AiCaseOfficerService {
 /** A document that could not be read: its criteria become insufficient. */
 export function unreadable(base: { documentId: string; label: string }, reason: string): DocumentExtraction {
   return { ...base, mediaType: "", readable: false, values: [], failed: false, failure: reason, suspicious: false };
+}
+
+/**
+ * (#308) What the applicant recognises each upload by, for the title of a "we
+ * couldn't read this upload" item. In order: the title of the rulebook's
+ * document item it was uploaded to (checklist ids are `ev-<item key>`), else
+ * the upload's display name, document type or file name. An upload with none
+ * of these is left out (the engine then falls back to its code label).
+ */
+export function documentNamesFor(
+  documents: ReadonlyArray<{ id: string; name?: string; requirementId?: string }>,
+  rubric: Partial<Pick<VisaRubric, "evidenceItems">>
+): Record<string, string> {
+  const names: Record<string, string> = {};
+  for (const d of documents) {
+    const key = d.requirementId?.startsWith("ev-") ? d.requirementId.slice(3) : null;
+    const item = key ? (rubric.evidenceItems ?? []).find((e) => e.key === key) : undefined;
+    const name = item?.title ?? d.name;
+    if (name && name.trim()) names[d.id] = name.trim();
+  }
+  return names;
 }
 
 /** A document whose extraction failed: counted as unread, never as a pass. */
