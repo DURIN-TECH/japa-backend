@@ -43,7 +43,9 @@ import {
 } from "../services/consultation-charge.service";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
 import { authController } from "./auth.controller";
-import { collections, auth } from "../utils/firebase";
+// Issue #321: `subcollections.messages` is read by the relationship check
+// (has the client written in a conversation with this agent?).
+import { collections, subcollections, auth } from "../utils/firebase";
 import {
   Agent,
   Application,
@@ -65,6 +67,34 @@ import {
   sendNoContent,
   ErrorMessages,
 } from "../utils/response";
+
+/**
+ * Issue #321: true when `id` can be used as ONE Firestore document id. The
+ * Firestore client throws (which would be a 500) on an empty id, an id with a
+ * "/", "." and "..", a reserved `__x__` id, and an id over 1500 bytes. Such a
+ * value can never name a user or an application, so the agent flow of
+ * `POST /consultations` answers 400 VALIDATION_ERROR before any read.
+ */
+function isUsableDocId(id: unknown): id is string {
+  return (
+    typeof id === "string" &&
+    id.length > 0 &&
+    !id.includes("/") &&
+    id !== "." &&
+    id !== ".." &&
+    !/^__.*__$/.test(id) &&
+    Buffer.byteLength(id, "utf8") <= 1500
+  );
+}
+
+/**
+ * Issue #321: how many conversations of one client with one agent the
+ * relationship check looks through for a message the client sent. There is
+ * one conversation per application the two share (plus one general chat), so
+ * a real pair has a handful. The cap only bounds the reads: past it the check
+ * answers "no relationship through conversations" (it fails closed).
+ */
+const CONVERSATIONS_CHECKED = 20;
 
 export class ConsultationController {
   /**
@@ -240,6 +270,14 @@ export class ConsultationController {
    * a `userId` that does not exist gets the same 403. The client-initiated
    * flow is unchanged.
    *
+   * Issue #321: only a link the agent could NOT have made alone counts (a
+   * conversation the client started or wrote in; a consultation the client
+   * booked themselves or paid for: see `isClientOfAgent`). Every booking
+   * stores how it was made (`bookedVia`: "agent" here for the agent flow,
+   * "client" for the client flow). A `userId` or `applicationId` that cannot
+   * be a Firestore document id (`.`, `..`, `__x__`, a "/", over 1500 bytes)
+   * is 400 VALIDATION_ERROR before any read.
+   *
    * PRICE (issue #180, folds #166): the SERVER decides it. The fee is the
    * booking agent's own `consultationFeeUsd` (US dollars, #179), read from
    * the agent record; any `fee`, `amount`, `rate` or `currency` in the body is
@@ -323,13 +361,17 @@ export class ConsultationController {
         }
         // Issue #246: the ids are used in queries and as a document id below,
         // so they must be plain non-empty strings.
-        if (typeof bodyClientId !== "string" || !bodyClientId.trim() || bodyClientId.includes("/")) {
+        // Issue #321: and they must be USABLE document ids. Firestore throws
+        // on `doc(".")`, `doc("..")`, a reserved `__x__` id and an id over
+        // 1500 bytes, which used to surface as a 500; such an id can never
+        // name a user or an application, so it is a plain 400 before any read.
+        if (typeof bodyClientId !== "string" || !bodyClientId.trim() || !isUsableDocId(bodyClientId)) {
           sendError(res, "VALIDATION_ERROR", "userId (client) must be a user id");
           return;
         }
         if (
           applicationId !== undefined && applicationId !== null && applicationId !== "" &&
-          (typeof applicationId !== "string" || applicationId.includes("/"))
+          !isUsableDocId(applicationId)
         ) {
           sendError(res, "VALIDATION_ERROR", "applicationId must be an application id");
           return;
@@ -491,6 +533,10 @@ export class ConsultationController {
         // Firestore rejects undefined: only set the optional links when known.
         ...(agentAgencyId ? { agencyId: agentAgencyId } : {}),
         ...(applicationId ? { applicationId } : {}),
+        // Issue #321: how the booking was made, fixed at creation. An
+        // agent-made booking is a relationship only once paid; one the
+        // signed-in client made themselves is one straight away.
+        bookedVia: agentProfile ? ("agent" as const) : ("client" as const),
         clientName: `${client.firstName || ""} ${client.lastName || ""}`.trim(),
         clientEmail: client.email,
         agentName: agentDisplayName,
@@ -1164,6 +1210,10 @@ export class ConsultationController {
         userId: clientUid,
         agentId: agency.ownerId, // owner acts as the booking agent for guest flow
         agencyId: agency.id,
+        // Issue #321: a guest typed this email on the public page. Anyone can
+        // type anyone's email, so this booking is a relationship with the
+        // agency only once it is paid (see `isClientOfAgent`).
+        bookedVia: "public_page" as const,
         clientName: clientName.trim(),
         clientEmail: normalizedEmail,
         agentName: agency.ownerName,
@@ -1559,24 +1609,40 @@ export class ConsultationController {
   /**
    * Issue #151: which party of `booking` the caller is, or null when neither.
    *
-   *  - AGENT SIDE: the booking's agent (`agentId` is a user uid), the OWNER
-   *    whose resolved agency (`req.authz.agencyId`) is the booking's agency,
-   *    or an admin. Checked first: it may do everything a client may.
+   *  - AGENT SIDE: the booking's agent (`agentId` is a user uid) WHILE their
+   *    current role is `agent` or `owner`, the OWNER whose resolved agency
+   *    (`req.authz.agencyId`) is the booking's agency, or an admin. Checked
+   *    first: it may do everything a client may.
    *  - CLIENT: the booking's `userId`.
    *
    * An agent of the same agency who is not the booking's own agent is NOT a
    * party (they may read it, not change its status).
+   *
+   * Issue #321 (former agents): `booking.agentId` is written once and never
+   * cleared, so on its own it would keep giving agent-side rights to a user
+   * who has since been removed as an agent (their role is back to `client`).
+   * The booking's agent is therefore agent side only while the role resolved
+   * for THIS request (`req.authz.role`) is `agent` or `owner`. A former agent
+   * is no party of their old bookings (403), unless they are also the
+   * booking's `userId`, in which case they are its CLIENT and nothing more.
+   * Admins and the owner of the booking's agency are unchanged.
+   *
+   * Used by BOTH `PUT /consultations/:id/status` (#151) and
+   * `PUT /consultations/:id` (#316, `decideEdit`), so the two routes always
+   * agree on who the agent side is.
    */
   private consultationActor(req: AuthenticatedRequest, booking: Consultation): ConsultationActor | null {
     const uid = req.userId;
     if (!uid) return null;
-    const isAdmin = req.authz?.role === ROLES.ADMIN;
-    const isBookingAgent = booking.agentId === uid;
+    const role = req.authz?.role;
+    const isAdmin = role === ROLES.ADMIN;
+    // #321: named on the booking AND still on the agent side today.
+    const isBookingAgent = booking.agentId === uid && (role === ROLES.AGENT || role === ROLES.OWNER);
     // Both sides must NAME an agency: an owner with none must never match a
     // booking that merely has no `agencyId`.
     const isAgencyOwner =
-      req.authz?.role === ROLES.OWNER &&
-      !!req.authz.agencyId &&
+      role === ROLES.OWNER &&
+      !!req.authz?.agencyId &&
       !!booking.agencyId &&
       booking.agencyId === req.authz.agencyId;
     if (isAdmin || isBookingAgent || isAgencyOwner) return CONSULTATION_ACTORS.AGENT_SIDE;
@@ -1585,19 +1651,47 @@ export class ConsultationController {
   }
 
   /**
-   * Issue #246: does the calling agent (or their agency) already work with
-   * this client? True when at least one of these exists:
+   * Issues #246 and #321: does the calling agent (or their agency) already
+   * work with this client? The link must be one the agent could NOT have
+   * made alone from a typed email or a uid (#321). True when at least one of
+   * these exists:
    *
    *  - an APPLICATION of the client that is assigned to the caller
    *    (`agentId` = the caller's uid) or belongs to the caller's agency;
-   *  - a CONVERSATION between the client and the caller. NOTE: on
-   *    conversations `agentId` is the agent DOCUMENT id, not a user uid;
+   *  - a CONVERSATION between the client and the caller that the client
+   *    STARTED (`startedBy: "user"`) or has SENT A MESSAGE in (a message with
+   *    `senderType: "user"` and `senderId` = the client). An agent can open a
+   *    conversation with any uid and write in it, so the agent's own side of
+   *    a chat proves nothing. NOTE: on conversations `agentId` is the agent
+   *    DOCUMENT id, not a user uid;
    *  - an earlier CONSULTATION of the client with the caller (`agentId` = the
-   *    caller's uid) or with the caller's agency, in ANY status.
+   *    caller's uid) or with the caller's agency, in any status, that the
+   *    client BOOKED THEMSELVES while signed in (`bookedVia: "client"`, free
+   *    or not) or that was PAID through Paystack (`paymentStatus: "paid"`
+   *    with `paidAt`, which only `settlePayment` writes). A guest booking
+   *    from the public page and a booking an agent made count only once
+   *    paid: both can be made for anyone's email or uid, and a FREE one is
+   *    stored `paymentStatus: "paid"` with no `paidAt`, so it never counts.
    *
-   * Every query is two equality filters and `limit(1)` (no composite index),
-   * and none of them reads the client's user document, so the answer is the
-   * same for a stranger and for a uid that does not exist.
+   * Rows from before #321 have neither `bookedVia` nor `startedBy`: they
+   * count only through the paid check or the client-message check (no
+   * backfill; nothing had been released to real users).
+   *
+   * QUERIES. Every relationship query is equality filters with `limit(1)`:
+   *  - applications, the `bookedVia` consultations and the `startedBy`
+   *    conversations: equality filters only, no composite index;
+   *  - the PAID consultations: equality filters plus `orderBy("paidAt")`.
+   *    Firestore leaves a document that lacks the ordered field out of the
+   *    result, so the `limit(1)` answer is always a booking that really has
+   *    `paidAt` (a free booking next to a paid one cannot hide it). This one
+   *    needs a composite index: see `firestore.indexes.json` (consultations:
+   *    userId, agentId | agencyId, paymentStatus, paidAt);
+   *  - the client-message check: the conversations of the pair are read
+   *    (bounded, see CONVERSATIONS_CHECKED), then one two-equality `limit(1)`
+   *    query on each one's `messages`.
+   *
+   * None of them reads the client's user document, so the answer is the same
+   * for a stranger and for a uid that does not exist.
    *
    * @param agentUid the caller's user uid
    * @param agentDocId the caller's agent document id
@@ -1609,24 +1703,78 @@ export class ConsultationController {
     agentDocId: string,
     agencyId: string | undefined
   ): Promise<boolean> {
-    /** One "does a doc with these two fields exist" lookup. */
+    /** "Does a doc of this client exist with ALL of these field values?" */
     const exists = async (
       collection: FirebaseFirestore.CollectionReference,
-      field: string,
-      value: string
-    ): Promise<boolean> =>
-      !(await collection.where("userId", "==", clientId).where(field, "==", value).limit(1).get()).empty;
+      equals: Record<string, string>
+    ): Promise<boolean> => {
+      let query = collection.where("userId", "==", clientId);
+      for (const [field, value] of Object.entries(equals)) query = query.where(field, "==", value);
+      return !(await query.limit(1).get()).empty;
+    };
+
+    /**
+     * An earlier consultation that counts (#321), with the caller
+     * (`agentId`) or the caller's agency (`agencyId`): one the client booked
+     * themselves, or one that was paid through Paystack.
+     */
+    const consultationCounts = async (field: "agentId" | "agencyId", value: string): Promise<boolean> => {
+      const [bookedByClient, paid] = await Promise.all([
+        exists(collections.consultations, { [field]: value, bookedVia: "client" }),
+        // `orderBy("paidAt")` keeps only bookings that HAVE `paidAt` (see the
+        // QUERIES note above); the in-memory check below is a second guard.
+        collections.consultations
+          .where("userId", "==", clientId)
+          .where(field, "==", value)
+          .where("paymentStatus", "==", "paid")
+          .orderBy("paidAt", "desc")
+          .limit(1)
+          .get()
+          .then((snap) => snap.docs.some((d) => !!(d.data() as Consultation).paidAt)),
+      ]);
+      return bookedByClient || paid;
+    };
+
+    /**
+     * A conversation with the caller that counts (#321): one the client
+     * started, or one the client has sent at least one message in.
+     */
+    const conversationCounts = async (): Promise<boolean> => {
+      if (await exists(collections.conversations, { agentId: agentDocId, startedBy: "user" })) return true;
+      // Not client-started (or made before #321): look for a message the
+      // CLIENT sent. `senderId` cannot be forged by the agent: the API writes
+      // the caller's own uid, and the Firestore rules allow a client-side
+      // message only with `senderId == request.auth.uid`.
+      const pair = await collections.conversations
+        .where("userId", "==", clientId)
+        .where("agentId", "==", agentDocId)
+        .limit(CONVERSATIONS_CHECKED)
+        .get();
+      const clientWrote = await Promise.all(
+        pair.docs.map(async (conversation) =>
+          !(
+            await subcollections
+              .messages(conversation.id)
+              .where("senderType", "==", "user")
+              .where("senderId", "==", clientId)
+              .limit(1)
+              .get()
+          ).empty
+        )
+      );
+      return clientWrote.some(Boolean);
+    };
 
     const checks: Promise<boolean>[] = [
-      exists(collections.applications, "agentId", agentUid),
-      exists(collections.conversations, "agentId", agentDocId),
-      exists(collections.consultations, "agentId", agentUid),
+      exists(collections.applications, { agentId: agentUid }),
+      conversationCounts(),
+      consultationCounts("agentId", agentUid),
     ];
     // The agency-wide links apply only to a caller who is in an agency.
     if (agencyId) {
       checks.push(
-        exists(collections.applications, "agencyId", agencyId),
-        exists(collections.consultations, "agencyId", agencyId)
+        exists(collections.applications, { agencyId }),
+        consultationCounts("agencyId", agencyId)
       );
     }
     return (await Promise.all(checks)).some(Boolean);

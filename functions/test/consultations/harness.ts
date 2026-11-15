@@ -15,7 +15,7 @@
 // `beforeEach` clears the store, the Paystack recorders and the clock.
 
 import { Timestamp } from "firebase-admin/firestore";
-import { installFakes, resetStore, fakeCollection, fakeRunTransaction, store } from "../helpers/fake-firestore";
+import { installFakes, resetStore, fakeCollection, fakeRunTransaction, store, fakeBehaviour } from "../helpers/fake-firestore";
 import { makeService, fakeClock } from "../money/helpers";
 import { consultationCharging } from "../../src/services/consultation-charge.service";
 import { PaystackApiError, paystackProvider, PaystackTransactionLookup } from "../../src/services/billing/paystack.provider";
@@ -140,6 +140,13 @@ export async function useHarness(): Promise<void> {
   ]) {
     firebase.collections[name] = fakeCollection(name);
   }
+  // Issue #321: order like real Firestore (a doc without the ordered field is
+  // left out), so `orderBy("paidAt")` finds only bookings that were paid.
+  fakeBehaviour.orderByDropsMissingField = true;
+  // Issue #321: the relationship check looks for a message the CLIENT sent
+  // in a conversation with the agent (`conversations/{id}/messages`).
+  firebase.subcollections.messages = (conversationId: string) =>
+    fakeCollection(`conversations/${conversationId}/messages`);
   // The shared fake transaction neither isolates nor retries. Real Firestore
   // transactions are serializable (a conflicting one is retried on fresh
   // data), so run ours one at a time: an interleaving the real database

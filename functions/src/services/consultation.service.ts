@@ -82,16 +82,26 @@ export type StatusChangeDecision = { ok: true } | StatusChangeRefusal;
 
 /**
  * True while a Paystack payment may still land on an unpaid booking: it is
- * `pending_payment`, a checkout was opened (`transactionId`), and that
- * checkout's quote lock (`quoteExpiresAt`) has not passed. The lock is used
- * rather than a Paystack lookup so the rule is the same on the emulators.
- * A booking with no lock at all (legacy naira rows) counts as expired.
+ * `pending_payment`, a checkout was really OPENED (`transactionId` AND
+ * `checkoutUrl`), and that checkout's quote lock (`quoteExpiresAt`) has not
+ * passed. The lock is used rather than a Paystack lookup so the rule is the
+ * same on the emulators. A booking with no lock at all (legacy naira rows)
+ * counts as expired.
+ *
+ * Issue #321: `checkoutUrl` is required too. The charge path first claims its
+ * own reference (`transactionId`) and only then asks Paystack to open the
+ * checkout; when that Paystack call fails the booking keeps the reference but
+ * has no `checkoutUrl`, and nobody was ever shown a page to pay on. Such a
+ * booking is NOT in flight: it can be cancelled (and rescheduled, #316)
+ * straight away. Should a payment still land on it after a cancel,
+ * `settlePayment` records it as `booking_not_payable` in
+ * `consultationPaymentExceptions`, as for any cancelled booking.
  */
 export function isPaymentInFlight(
-  c: Pick<Consultation, "status" | "transactionId" | "quoteExpiresAt">,
+  c: Pick<Consultation, "status" | "transactionId" | "checkoutUrl" | "quoteExpiresAt">,
   at: Date
 ): boolean {
-  return c.status === "pending_payment" && !!c.transactionId && !isQuoteExpired(c, at);
+  return c.status === "pending_payment" && !!c.transactionId && !!c.checkoutUrl && !isQuoteExpired(c, at);
 }
 
 /**
@@ -112,7 +122,7 @@ export function isPaymentInFlight(
  */
 export function decideStatusChange(
   actor: ConsultationActor | null,
-  booking: Pick<Consultation, "status" | "transactionId" | "quoteExpiresAt">,
+  booking: Pick<Consultation, "status" | "transactionId" | "checkoutUrl" | "quoteExpiresAt">,
   target: ConsultationStatus,
   at: Date
 ): StatusChangeDecision {
@@ -261,7 +271,7 @@ export type EditDecision = { ok: true } | EditRefusal;
  */
 export function decideEdit(
   actor: ConsultationActor | null,
-  booking: Pick<Consultation, "status" | "transactionId" | "quoteExpiresAt">,
+  booking: Pick<Consultation, "status" | "transactionId" | "checkoutUrl" | "quoteExpiresAt">,
   fieldNames: readonly EditableField[],
   at: Date
 ): EditDecision {

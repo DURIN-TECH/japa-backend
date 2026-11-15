@@ -41,6 +41,18 @@ export function resetStore(): void {
   writes.length = 0;
 }
 
+/**
+ * Opt-in behaviours of the fake (each test file runs in its own process, so
+ * a suite that sets one does not affect the others).
+ *
+ * `orderByDropsMissingField` (issue #321): real Firestore leaves a document
+ * that lacks the ordered field OUT of an `orderBy` query. The agent-booking
+ * relationship check relies on that (`orderBy("paidAt")` returns only
+ * bookings that were really paid), so the consultation harness turns it on.
+ * Off by default: older suites seed docs without their ordered field.
+ */
+export const fakeBehaviour = { orderByDropsMissingField: false };
+
 let autoId = 0;
 
 /** Deep-copy plain objects/arrays; keep class instances (Timestamp,
@@ -221,6 +233,11 @@ export function fakeCollection(
           })
         );
       if (order) {
+        // Real Firestore leaves a document that does not HAVE the ordered
+        // field out of an orderBy query. Opt-in here (see `fakeBehaviour`).
+        if (fakeBehaviour.orderByDropsMissingField) {
+          entries = entries.filter(([, d]) => getPath(d, order.field) !== undefined);
+        }
         const sign = order.dir === "desc" ? -1 : 1;
         entries = entries.sort(([, a], [, b]) => {
           const x = cmpValue(getPath(a, order.field)) as any;

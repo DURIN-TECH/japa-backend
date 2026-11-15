@@ -250,6 +250,8 @@ describe("decideEdit", () => {
     const booking = {
       status: "pending_payment" as ConsultationStatus,
       transactionId: "ref",
+      // Issue #321: in flight needs a checkout that was really opened.
+      checkoutUrl: "https://checkout.paystack.test/ref",
       quoteExpiresAt: Timestamp.fromDate(new Date("2026-11-13T09:30:00Z")),
     };
     for (const field of SCHEDULE) {
@@ -274,12 +276,20 @@ describe("decideEdit", () => {
       decideEdit(CONSULTATION_ACTORS.AGENT_SIDE, { ...booking, quoteExpiresAt: undefined }, ["scheduledDate"], AT),
       { ok: true }
     );
+    // Issue #321: a reference but NO checkoutUrl (the Paystack start failed,
+    // nobody was shown a page to pay on): not in flight either.
+    assert.deepEqual(
+      decideEdit(CONSULTATION_ACTORS.AGENT_SIDE, { ...booking, checkoutUrl: undefined }, ["scheduledDate"], AT),
+      { ok: true }
+    );
   });
 
   test("the in-flight rule is exact at the lock boundary", () => {
     const booking = {
       status: "pending_payment" as ConsultationStatus,
       transactionId: "ref",
+      // Issue #321: in flight needs a checkout that was really opened.
+      checkoutUrl: "https://checkout.paystack.test/ref",
       quoteExpiresAt: Timestamp.fromDate(new Date("2026-11-13T09:30:00Z")),
     };
     const at = (iso: string) => decideEdit(CONSULTATION_ACTORS.AGENT_SIDE, booking, ["scheduledDate"], new Date(iso));
@@ -501,6 +511,38 @@ describe("PUT /consultations/:id — the client and non-parties", () => {
     await seedBooking("scheduled");
     for (const p of [client, ...AGENT_SIDE, ...OUTSIDERS]) {
       assertRefused(await edit(p, { summary: "x" }, "nope"), 404, "NOT_FOUND", p.uid);
+    }
+  });
+});
+
+// ============================================
+// Former agents (issue #321): the edit route uses the same party rule
+// ============================================
+
+describe("PUT /consultations/:id — a former agent (#321)", () => {
+  /** The booking's `agentId`, whose role has gone back to client. */
+  const formerAgent: AuthzSubject = { uid: "uid-agent1", role: ROLES.CLIENT, agencyId: null };
+
+  test("role client on the booking's agentId: 403 for every field, nothing written", async () => {
+    await seedBooking("scheduled");
+    const before = stored();
+    for (const field of ALL_FIELDS) {
+      assertRefused(await edit(formerAgent, { [field]: VALID[field] }), 403, "FORBIDDEN", `former agent ${field}`, before);
+    }
+  });
+
+  test("a former agent who is also the booking's userId is its client: still 403 (a client edits nothing)", async () => {
+    await seedBooking("scheduled", { userId: "uid-agent1" });
+    const before = stored();
+    assertRefused(await edit(formerAgent, { summary: "x" }), 403, "FORBIDDEN", "former agent as client", before);
+  });
+
+  test("the same uid with role agent or owner (no agency on the principal) still edits", async () => {
+    for (const role of [ROLES.AGENT, ROLES.OWNER]) {
+      harness.reset();
+      await seedBooking("scheduled");
+      assertOk(await edit({ uid: "uid-agent1", role, agencyId: null }, { summary: "new notes" }), role);
+      assert.equal(stored().summary, "new notes", role);
     }
   });
 });
