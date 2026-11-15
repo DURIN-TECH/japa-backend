@@ -29,6 +29,9 @@ import {
   isNotActionableMarker,
   topIssuesOf,
   NOT_CHECKABLE_REASON,
+  NO_FIELD_TO_READ,
+  UNREAD_DOCUMENT_REASON,
+  UNUSABLE_DOCUMENT_REASON,
   type AssessmentContent,
   type DocumentExtraction,
   type Facts,
@@ -223,8 +226,11 @@ describe("#308 a missing field fails a rule only when the rulebook names a docum
       assert.ok(content.insufficientInformation.every((i) => i.notAssessed === "not_in_documents"));
       assert.deepEqual(top, []);
       assert.deepEqual(actions, []);
-      assert.equal(content.readiness, "strong");
       assert.equal(content.stageOutcomes.objective, "not_applicable", "nothing was checked, so the stage does not read clear");
+      // Nothing was checked from the documents: never strong / high / would approve (see the fix-round suite below).
+      assert.equal(content.readiness, "competitive");
+      assert.equal(content.confidence, "medium");
+      assert.equal(content.internalCall, null);
     }
   });
 
@@ -237,7 +243,8 @@ describe("#308 a missing field fails a rule only when the rulebook names a docum
     // The rules a document item names are unmarked "could not be read" (never a fail on a partial read).
     const passport = objective.find((r) => r.criterionId === "r-passport");
     assert.deepEqual([passport?.outcome, passport?.notAssessed], ["insufficient", undefined]);
-    assert.deepEqual(actions.map((a) => a.criterionId).sort(), ["r-funds", "r-passport"]);
+    // The two rules a document item names, plus (fix round) one action for the unread upload itself.
+    assert.deepEqual(actions.map((a) => a.criterionId).sort(), ["document:d2", "r-funds", "r-passport"]);
     assert.deepEqual(top.map((t) => t.criterionId), ["r-passport", "r-funds"]);
   });
 
@@ -296,21 +303,25 @@ describe("#308 mandatory bars and judgement flags are unchanged", () => {
 const NOT_FOR_APPLICANT = /exclusion|excluded|deport|fee|biometric|specified form|foster|marriage|civil partnership|transit|replacement passport|NHS/i;
 
 /** Replay the stored inputs through the engine as the job does. */
-function replayFixture(): { rubric: VisaRubric; content: AssessmentContent; top: ReturnType<typeof topIssuesOf>; actions: ReturnType<typeof deriveProposedActions>["actions"] } {
+function replayFixture(opts: { docs?: DocumentExtraction[]; concerns?: boolean; score?: number | null; everyQuestionAnswered?: boolean } = {}): { rubric: VisaRubric; content: AssessmentContent; top: ReturnType<typeof topIssuesOf>; actions: ReturnType<typeof deriveProposedActions>["actions"] } {
   const fullRubric = fixture.rubric as unknown as VisaRubric;
   const facts = fixture.applicantFacts as any;
   // Which rules apply to this applicant (unchanged by #308).
   const split = splitByApplicability(fullRubric, fixture.intakeAnswers as Record<string, unknown>, { facts, onDate: fixture.barDate });
   const rubric = { ...fullRubric, criteria: split.applicable } as VisaRubric;
   const bars = decideMandatoryBars(rubric, facts, fixture.barDate, {});
-  const notAssessed = [...notAssessedItems(split), ...barNotAssessedItems(bars.unknown)];
-  // The uploads: read cleanly, none of the checked fields in them.
-  const docs = Array.from({ length: fixture.documentsUploaded }, (_, i) => doc(`d${i + 1}`));
+  const everyItem = [...notAssessedItems(split), ...barNotAssessedItems(bars.unknown)];
+  // `everyQuestionAnswered`: as if the applicant had answered every open
+  // trigger question and stated every fact in a way that rules those rules out
+  // (the 10 "unanswered" and 2 "missing_fact" items go; nothing else changes).
+  const notAssessed = opts.everyQuestionAnswered ? everyItem.filter((i) => i.notAssessed === "no_trigger") : everyItem;
+  // The uploads: by default read cleanly, none of the checked fields in them.
+  const docs = opts.docs ?? Array.from({ length: fixture.documentsUploaded }, (_, i) => doc(`d${i + 1}`));
   const intakeFacts: Facts = Object.fromEntries(Object.entries(fixture.intakeAnswers).map(([k, v]) => [`intake.${k}`, v as Facts[string]]));
   const objective = evaluateObjective(rubric, intakeFacts, docs);
-  const judgement: JudgementOutput = { ...QUIET, findings: fixture.concernCriterionIds.map((criterionId) => ({ criterionId, detail: "A concern (fixture).", whatWouldHelp: "Add supporting evidence.", concern: true })) };
+  const judgement: JudgementOutput = opts.concerns === false ? QUIET : { ...QUIET, findings: fixture.concernCriterionIds.map((criterionId) => ({ criterionId, detail: "A concern (fixture).", whatWouldHelp: "Add supporting evidence.", concern: true })) };
   const content = assembleContent({
-    rubric, mandatoryHits: bars.hits, objective, judgement, documents: docs, statementReadable: true, score: fixture.before.score, suspiciousDocumentIds: [], judgementFailed: false, notAssessed,
+    rubric, mandatoryHits: bars.hits, objective, judgement, documents: docs, statementReadable: true, score: opts.score === undefined ? fixture.before.score : opts.score, suspiciousDocumentIds: [], judgementFailed: false, notAssessed,
   });
   const top = topIssuesOf(fullRubric, content);
   const { actions } = deriveProposedActions({ id: "assess-308", applicationId: "app-308", userId: "client-308", agencyId: null } as any, fullRubric, content);
@@ -408,5 +419,125 @@ describe("#308 UK Standard Visitor v2, application wyPrIGfPVSMs8VbPivs9 (fixture
     assert.equal(content.credibilityFlags.length, fixture.before.credibilityFlagCount);
     // Confidence stays low: 12 rules still wait on an answer or a fact of the applicant's.
     assert.equal(content.confidence, fixture.before.confidence);
+  });
+});
+
+// ============================================
+// Part 3: a review never reads better than what was checked (fix round, QA findings 1 and 2)
+// ============================================
+//
+// Two cases QA found after the first build, where the result read "strong"
+// with high confidence although something was NOT checked:
+//   1. one of the uploads could not be read, and no rule said so any more;
+//   2. the rulebook has no document items, so no objective rule was checked.
+
+/** The two fields the real rulebook's document items ask for, as a cleanly read upload. */
+const BOTH_ASKED_FOR = [{ field: "identityDocument", value: "P1234567" }, { field: "financialEvidence.mostRecentDaysBeforeApplication", value: 10, unit: "days" }];
+
+describe("#308 an upload that could not be read is always said, and holds the result back", () => {
+  test("QA reproduction 1 (fixture): one clean upload, one unreadable, every question answered, score 90, no concerns", () => {
+    const clean = doc("d1", BOTH_ASKED_FOR);
+    const unreadable = doc("d2", [], { label: "Bank statement", readable: false, failure: "file could not be read" });
+
+    // Control: without the unreadable upload this applicant IS strong / high / clear.
+    const control = replayFixture({ docs: [clean], concerns: false, score: 90, everyQuestionAnswered: true }).content;
+    assert.deepEqual([control.readiness, control.confidence, control.stageOutcomes.objective], ["strong", "high", "clear"]);
+
+    const { content, top, actions } = replayFixture({ docs: [clean, unreadable], concerns: false, score: 90, everyQuestionAnswered: true });
+    assert.deepEqual(content.refusalGrounds, []);
+
+    // One item for the upload, first in the list, with no marker the app hides.
+    const shown = content.insufficientInformation.filter((i) => i.notAssessed !== "no_trigger" && i.notAssessed !== "not_in_documents");
+    assert.deepEqual(shown, [{ criterionId: "document:d2", title: "Bank statement", reason: UNREAD_DOCUMENT_REASON, documentId: "d2" }]);
+    assert.equal(content.insufficientInformation[0].criterionId, "document:d2");
+    assert.ok(!("notAssessed" in content.insufficientInformation[0]));
+
+    // The result is held back.
+    assert.equal(content.readiness, "competitive", "not strong while an upload is unread");
+    assert.equal(content.confidence, "medium", "not high while an upload is unread");
+    assert.equal(content.stageOutcomes.objective, "insufficient", "not clear while an upload is unread");
+
+    // Exactly one proposed action, for the upload; no rule action comes back.
+    assert.deepEqual(
+      actions.map((a) => [a.criterionId, a.title, a.evidenceNeeded, a.ownerRole, a.blocking, a.origin, a.estEffort]),
+      [["document:d2", "Clearer copy of: Bank statement", UNREAD_DOCUMENT_REASON, "client", true, "insufficient_information", "quick"]]
+    );
+    // It is not a rule, so it is not ranked among the top issues (which rank rules by severity).
+    assert.deepEqual(top, []);
+  });
+
+  test("failed and flagged uploads are said too, one item and one action each; two uploads never share an id", () => {
+    const docs = [
+      doc("d1", [{ field: "identityDocument", value: "P1234567" }, { field: "funds.balance", value: 5000, unit: "GBP" }]),
+      doc("d2", [], { label: "Payslip", readable: false, failed: true, failure: "the model call failed" }),
+      doc("d3", [{ field: "funds.balance", value: 99999, unit: "GBP" }], { label: "Payslip", suspicious: true }),
+    ];
+    const { content, actions } = run(smallRubric(SMALL_ITEMS), docs, QUIET);
+    assert.deepEqual(
+      content.insufficientInformation.filter((i) => i.documentId).map((i) => [i.criterionId, i.title, i.reason, i.notAssessed]),
+      [["document:d2", "Payslip", UNREAD_DOCUMENT_REASON, undefined], ["document:d3", "Payslip", UNUSABLE_DOCUMENT_REASON, undefined]]
+    );
+    assert.deepEqual(actions.map((a) => a.criterionId), ["document:d2", "document:d3"]);
+    assert.equal(new Set(actions.map((a) => a.id)).size, 2);
+    assert.notEqual(content.readiness, "strong");
+    assert.notEqual(content.confidence, "high");
+    assert.equal(content.stageOutcomes.objective, "insufficient");
+  });
+
+  test("an upload that was simply not sent (the rulebook reads no document field) is not reported as unreadable", () => {
+    const rubric = smallRubric([]);
+    rubric.criteria = rubric.criteria.filter((c) => c.kind !== "objective");
+    const docs = [doc("d1", [], { readable: false, failure: NO_FIELD_TO_READ })];
+    const { content, actions } = run(rubric, docs, QUIET);
+    assert.deepEqual(content.insufficientInformation, []);
+    assert.deepEqual(actions, []);
+    assert.equal(content.readiness, "strong");
+    assert.equal(content.stageOutcomes.objective, "not_applicable");
+  });
+
+  test("cleanly read uploads add no item: the stored-assessment replay is unchanged by the fix round", () => {
+    const { content, actions } = replayFixture();
+    assert.ok(content.insufficientInformation.every((i) => !i.documentId));
+    assert.equal(content.refusalGrounds.length, 2);
+    assert.equal(actions.filter((a) => a.blocking).length, 2);
+    assert.equal(content.insufficientInformation.length, 217);
+  });
+});
+
+describe("#308 nothing checked from documents is never a strong result", () => {
+  test("QA reproduction 2 (small rulebook, no document items, score 90): a clean upload with none of the fields", () => {
+    for (const items of [[] as EvidenceItem[], undefined]) {
+      const { content, actions } = run(smallRubric(items), [doc("d1")], QUIET);
+      assert.equal(content.stageOutcomes.objective, "not_applicable");
+      assert.ok(content.insufficientInformation.every((i) => i.notAssessed === "not_in_documents"));
+      assert.equal(content.readiness, "competitive", "not strong: no objective rule was checked");
+      assert.equal(content.confidence, "medium", "not high: no objective rule was checked");
+      assert.equal(content.internalCall, null, "no staff call: there is no basis for would_approve");
+      // A rulebook stored without the field at all no longer breaks the action step.
+      assert.deepEqual(actions, []);
+    }
+  });
+
+  test("QA reproduction 2, the only upload unreadable: said, held back, and no staff call", () => {
+    const { content, actions } = run(smallRubric([]), [doc("d1", [], { label: "Passport scan", readable: false })], QUIET);
+    assert.deepEqual(content.insufficientInformation[0], { criterionId: "document:d1", title: "Passport scan", reason: UNREAD_DOCUMENT_REASON, documentId: "d1" });
+    assert.equal(content.readiness, "competitive");
+    assert.equal(content.confidence, "medium");
+    assert.equal(content.stageOutcomes.objective, "insufficient");
+    assert.equal(content.internalCall, null);
+    assert.deepEqual(actions.map((a) => [a.criterionId, a.blocking]), [["document:d1", true]]);
+  });
+
+  test("a lower score is not raised by the cap, and a read value that fails still refuses", () => {
+    const low = assembleContent({ rubric: smallRubric([]), mandatoryHits: [], objective: evaluateObjective(smallRubric([]), {}, [doc("d1")]), judgement: QUIET, documents: [doc("d1")], statementReadable: true, score: 40, suspiciousDocumentIds: [], judgementFailed: false });
+    assert.equal(low.readiness, "weak");
+    const failing = run(smallRubric([]), [doc("d1", [{ field: "feePaid", value: false }])], QUIET).content;
+    assert.deepEqual([failing.readiness, failing.internalCall], ["not_ready", "would_refuse"]);
+  });
+
+  test("one rule checked and passing is enough for a call: the caps apply only when NOTHING was checked", () => {
+    const { content } = run(smallRubric([]), [doc("d1", [{ field: "feePaid", value: true }])], QUIET);
+    assert.equal(content.stageOutcomes.objective, "clear");
+    assert.deepEqual([content.readiness, content.confidence, content.internalCall], ["strong", "high", "would_approve"]);
   });
 });
