@@ -447,12 +447,18 @@ service cloud.firestore {
     
     // =====================================    // TRANSACTIONS COLLECTION
     // =====================================    
+    // Backend (Admin SDK) only, explicit deny (issue #329). A transaction
+    // document holds Seli's exchange-rate markup (fxMarginBps), the raw rate,
+    // internal agent ids and Paystack references. Before #329 the payer could
+    // read their own document straight from Firestore with their token, and
+    // so see all of that, bypassing the API. Neither the app nor the portal
+    // reads this collection directly: both go through GET /transactions,
+    // which gives a client an allow-listed view (toClientTransaction) and
+    // applies the role checks for agents, owners and admins. Denied for
+    // every client, admins included. Pinned by
+    // test/emulator/backend-only-collections.emu.ts.
     match /transactions/{transactionId} {
-      // Users can read their own transactions
-      allow read: if isOwner(resource.data.userId) || isAdmin();
-      
-      // Only system (via Cloud Functions) can create/update transactions
-      allow write: if false;
+      allow read, write: if false;
     }
     
     // =====================================    // NOTIFICATIONS COLLECTION

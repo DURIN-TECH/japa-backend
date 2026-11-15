@@ -30,6 +30,13 @@ import { anonymousDb, clientDb, isDenied, resetEmulators, rulesEnv, withoutRules
 /** Top-level backend-only collections (names from src/utils/firebase.ts). */
 const COLLECTIONS = [
   "riskSignals",
+  // Transactions (issue #329): the stored document holds Seli's exchange-rate
+  // markup (fxMarginBps), the raw rate, internal agent ids and Paystack
+  // references. Before #329 the payer could read their own document directly.
+  // Explicit deny in firestore.rules now: the seed below names the actor as
+  // `userId`, so "my own transaction" is tried and must be refused, for the
+  // client and for an admin alike. Everyone reads through GET /transactions.
+  "transactions",
   // In-app tester feedback (issue #257): user ids, emails and device details.
   // Explicit deny in firestore.rules; backend (Admin SDK) only.
   "feedback",
