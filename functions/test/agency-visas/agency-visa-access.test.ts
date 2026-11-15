@@ -25,10 +25,18 @@
 //  - case start (POST /applications and /applications/for-client): owning
 //    agency only; non-approved / inactive never; nothing written on refusal
 //    (and for-client provisions nobody);
-//  - the public lists still leave agency-only visas out (#99).
+//  - the public lists still leave agency-only visas out (#99);
+//  - issue #289, through the REAL router and `optionalAuthFresh` (last
+//    section): a suspended admin, a demoted admin and a suspended member of
+//    the owning agency, each holding the token issued before the change,
+//    get the same 404 as an unknown id on hidden visas, while current admins
+//    and members are unchanged.
 
-import { test, describe, before, beforeEach } from "node:test";
+import { test, describe, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+import express from "express";
 import { Timestamp } from "firebase-admin/firestore";
 import { ROLES, defineAbilitiesFor } from "@durin-tech/authz";
 
@@ -605,5 +613,288 @@ describe("case start: POST /applications/for-client (agent / admin)", () => {
     const noB = await startForClient(admin(), { visaTypeId: "a-own", agentId: "uid-agent-b", agencyId: AGENCY_B });
     assert.equal(noB.status, 404);
     assert.equal(applicationWrites().length, writesBefore);
+  });
+});
+
+// ============================================
+// Issue #289: suspended / demoted callers holding an OLD token
+// ============================================
+//
+// Unlike the sections above (handlers called directly with a ready-made
+// principal), these go through the real `countryRoutes` router on a local
+// HTTP server, so the middleware that BUILDS the principal is under test:
+// `optionalAuthFresh` re-checks an agent-side token against the account's
+// current state. Firebase Auth is an in-memory fake:
+//  - `OLD_TOKENS`: what each token said when it was issued (never changes,
+//    like a real ID token, which lives up to an hour);
+//  - `accounts`: each account's CURRENT custom claims / disabled / revoked
+//    state, which the tests change the way `claimsService.setAccountDisabled`
+//    (suspension: `disabled` claim + revoked refresh tokens) and
+//    `claimsService.setAdmin(uid, false)` (demotion: lower role, nothing
+//    revoked) do.
+
+describe("issue #289: old tokens of suspended or demoted admins and agency members", () => {
+  /** Current state of one fake Auth account. */
+  interface Account {
+    customClaims: Data;
+    /** Firebase's own disabled switch. */
+    disabled?: boolean;
+    /** Refresh tokens revoked: tokens issued before fail checkRevoked. */
+    revoked?: boolean;
+  }
+
+  /** token -> the claims baked in at issue time. */
+  const OLD_TOKENS: Record<string, Data> = {
+    "tok-admin": { uid: "uid-admin", role: ROLES.ADMIN, admin: true, agencyId: null },
+    "tok-owner-a": { uid: "uid-owner-a", role: ROLES.OWNER, agencyId: AGENCY_A },
+    "tok-agent-a": { uid: "uid-agent-a", role: ROLES.AGENT, agencyId: AGENCY_A },
+    "tok-app-a": { uid: "uid-app-a", role: ROLES.CLIENT, agencyId: null },
+  };
+
+  /** uid -> current account; rebuilt before each test from the tokens. */
+  let accounts: Record<string, Account> = {};
+  /** When set, the account lookup fails with it (network / quota). */
+  let lookupFailure: Error | null = null;
+  /** uids `auth.getUser` was called for (the "extra lookup"). */
+  let getUserCalls: string[] = [];
+
+  let server: http.Server;
+  let base = "";
+  /** The real Auth methods, restored afterwards. */
+  let savedAuth: { verifyIdToken: unknown; getUser: unknown };
+  const savedLog = console.log;
+
+  /** An error shaped like the Admin SDK's. */
+  const authError = (code: string) => Object.assign(new Error(code), { code });
+
+  before(async () => {
+    const firebase: any = await import("../../src/utils/firebase");
+    savedAuth = { verifyIdToken: firebase.auth.verifyIdToken, getUser: firebase.auth.getUser };
+    // verifyIdToken: with checkRevoked it consults the account like the SDK.
+    firebase.auth.verifyIdToken = async (token: string, checkRevoked = false) => {
+      const decoded = OLD_TOKENS[token];
+      if (!decoded) throw authError("auth/argument-error");
+      if (checkRevoked) {
+        const account = accounts[decoded.uid as string];
+        if (!account) throw authError("auth/user-not-found");
+        if (account.disabled) throw authError("auth/user-disabled");
+        if (account.revoked) throw authError("auth/id-token-revoked");
+      }
+      return decoded;
+    };
+    firebase.auth.getUser = async (uid: string) => {
+      getUserCalls.push(uid);
+      if (lookupFailure) throw lookupFailure;
+      const account = accounts[uid];
+      if (!account) throw authError("auth/user-not-found");
+      return { uid, customClaims: account.customClaims, disabled: account.disabled === true };
+    };
+    // attachAuthz: no entitlements cache (RBAC only), as in the sections above.
+    const { entitlementService }: any = await import("../../src/services/entitlement.service");
+    entitlementService.getEntitlements = async () => null;
+
+    // The real router, mounted as app.ts does.
+    const { countryRoutes } = await import("../../src/routes/visa.routes");
+    const app = express();
+    app.use(express.json());
+    app.use("/countries", countryRoutes);
+    server = app.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve) => server.once("listening", () => resolve()));
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    server.close();
+    const firebase: any = await import("../../src/utils/firebase");
+    firebase.auth.verifyIdToken = savedAuth.verifyIdToken;
+    firebase.auth.getUser = savedAuth.getUser;
+    console.log = savedLog;
+  });
+
+  beforeEach(() => {
+    // Every account starts in step with its token (nobody suspended / demoted).
+    accounts = {};
+    for (const claims of Object.values(OLD_TOKENS)) {
+      const { uid, ...custom } = claims;
+      accounts[uid as string] = { customClaims: { ...custom } };
+    }
+    lookupFailure = null;
+    getUserCalls = [];
+    // The middleware logs each guest fallback; keep the output quiet.
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    console.log = () => {};
+  });
+
+  /** What `claimsService.setAccountDisabled(uid, true)` does to an account. */
+  function suspend(uid: string): void {
+    accounts[uid].customClaims.disabled = true;
+    accounts[uid].revoked = true;
+  }
+
+  /** What `claimsService.setAdmin(uid, false)` does: a lower role, nothing revoked. */
+  function demote(uid: string, role: (typeof ROLES)[keyof typeof ROLES], agencyId: string | null = null): void {
+    accounts[uid].customClaims = { role, agencyId, admin: false };
+  }
+
+  /** The three single-visa reads, as URL suffixes. */
+  const READS = ["", "/full", "/requirements"] as const;
+
+  /** GET one of the reads for visa `id`, with an optional bearer token. */
+  async function get(id: string, suffix: string, token?: string): Promise<Captured> {
+    const r = await fetch(`${base}/countries/${CC}/visas/${id}${suffix}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    return { status: r.status, body: await r.json() };
+  }
+
+  /** Every kind of hidden visa (agency-only, pending, rejected, inactive, hidden scrape). */
+  const HIDDEN = ["a-own", "a-draft", "a-pending", "a-rejected", "a-inactive", "b-own", "scraped-pending"];
+
+  /** Assert `token` gets, on every read of every visa in `ids`, the unknown-id 404. */
+  async function assert404Everywhere(token: string, ids: string[], label: string): Promise<void> {
+    for (const suffix of READS) {
+      const unknown = await get("does-not-exist", suffix);
+      assert.equal(unknown.status, 404);
+      assert.equal(unknown.body.error.code ?? unknown.body.error, "NOT_FOUND");
+      for (const id of ids) {
+        const r = await get(id, suffix, token);
+        assert.equal(r.status, 404, `${label}: ${id}${suffix}`);
+        assert.deepEqual(r.body, unknown.body, `${label}: ${id}${suffix} body must equal an unknown id's`);
+      }
+    }
+  }
+
+  /** Assert `token` gets exactly what an anonymous guest gets on a public visa. */
+  async function assertGuestShapeOnPublic(token: string, label: string): Promise<void> {
+    for (const id of ["uk-sw", "a-global"]) {
+      for (const suffix of READS) {
+        const guest = await get(id, suffix);
+        const r = await get(id, suffix, token);
+        assert.equal(r.status, 200, `${label}: ${id}${suffix}`);
+        assert.deepEqual(r.body, guest.body, `${label}: ${id}${suffix} must be the guest answer`);
+        // The agency-created public visa is the applicant-safe projection
+        // (the seed visa has no private fields and is served as stored).
+        if (id === "a-global") assertNoPrivateFields(r.body);
+      }
+    }
+  }
+
+  test("baseline: a current admin gets the stored doc of every hidden visa (unchanged)", async () => {
+    for (const id of HIDDEN) {
+      const d = await get(id, "", "tok-admin");
+      assert.equal(d.status, 200, id);
+      assert.equal(d.body.data.id, id);
+      assert.equal((await get(id, "/full", "tok-admin")).status, 200, `${id}/full`);
+      assert.equal((await get(id, "/requirements", "tok-admin")).status, 200, `${id}/requirements`);
+    }
+    // The stored (not applicant-safe) doc: the private sponsor field is there.
+    assert.equal((await get("a-own", "", "tok-admin")).body.data.sponsor.sponsorLicenceNumber, LICENCE);
+    assert.ok(JSON.stringify((await get("a-own", "/full", "tok-admin")).body).includes(LICENCE));
+  });
+
+  test("baseline: current owner and agent of A get A's agency-only and pending visas in full (unchanged)", async () => {
+    for (const token of ["tok-owner-a", "tok-agent-a"]) {
+      for (const id of ["a-own", "a-pending", "a-draft", "a-rejected", "a-inactive"]) {
+        for (const suffix of READS) {
+          assert.equal((await get(id, suffix, token)).status, 200, `${token} ${id}${suffix}`);
+        }
+      }
+      assert.equal((await get("a-own", "", token)).body.data.sponsor.sponsorLicenceNumber, LICENCE, token);
+      // Still nothing of agency B's.
+      assert.equal((await get("b-own", "", token)).status, 404, token);
+    }
+  });
+
+  test("suspended admin, old token: 404 on every hidden visa, guest shape on public ones", async () => {
+    suspend("uid-admin");
+    await assert404Everywhere("tok-admin", HIDDEN, "suspended admin");
+    await assertGuestShapeOnPublic("tok-admin", "suspended admin");
+  });
+
+  test("suspended admin whose token is not caught by the revocation check: the current `disabled` claim still makes them a guest", async () => {
+    // A token minted in the same second as the revocation is not "revoked".
+    accounts["uid-admin"].customClaims.disabled = true;
+    await assert404Everywhere("tok-admin", HIDDEN, "disabled claim only");
+    // And Firebase's own disabled switch (no claim at all).
+    accounts["uid-admin"] = { customClaims: { role: ROLES.ADMIN, admin: true }, disabled: true };
+    await assert404Everywhere("tok-admin", HIDDEN, "disabled Firebase user");
+  });
+
+  test("demoted admin, old token still saying admin: answered as their current role", async () => {
+    demote("uid-admin", ROLES.CLIENT);
+    await assert404Everywhere("tok-admin", HIDDEN, "admin demoted to client");
+    await assertGuestShapeOnPublic("tok-admin", "admin demoted to client");
+
+    // Their current role still counts: as a client with a case at agency A
+    // they reach A's approved agency-only visa, applicant-safe (never the
+    // stored doc an admin would get), and nothing else hidden.
+    store.set("applications/app-ex-admin", {
+      id: "app-ex-admin", userId: "uid-admin", visaTypeId: "uk-sw", countryCode: CC,
+      mode: "agent", agentId: "uid-agent-a", agencyId: AGENCY_A, status: "draft",
+    });
+    for (const suffix of READS) {
+      const r = await get("a-own", suffix, "tok-admin");
+      assert.equal(r.status, 200, `a-own${suffix}`);
+      assertNoPrivateFields(r.body);
+    }
+    await assert404Everywhere("tok-admin", HIDDEN.filter((id) => id !== "a-own"), "ex-admin with a case at A");
+  });
+
+  test("admin demoted to an agent of agency B: B's visas only, A's stay 404", async () => {
+    demote("uid-admin", ROLES.AGENT, AGENCY_B);
+    const own = await get("b-own", "", "tok-admin");
+    assert.equal(own.status, 200);
+    await assert404Everywhere("tok-admin", HIDDEN.filter((id) => id !== "b-own"), "admin demoted to agent of B");
+  });
+
+  test("suspended owner and agent of the owning agency, old tokens: 404 on its agency-only and pending visas", async () => {
+    // The agent has an assigned case on the visa too: a suspended account is
+    // a guest, so that route in is closed as well.
+    store.set("applications/app-on-a-own", {
+      id: "app-on-a-own", userId: "uid-app-none", visaTypeId: "a-own", countryCode: CC,
+      mode: "agent", agentId: "uid-agent-a", agencyId: AGENCY_A, status: "in_progress",
+    });
+    for (const [uid, token] of [["uid-owner-a", "tok-owner-a"], ["uid-agent-a", "tok-agent-a"]] as const) {
+      suspend(uid);
+      await assert404Everywhere(token, HIDDEN, `suspended ${uid}`);
+      await assertGuestShapeOnPublic(token, `suspended ${uid}`);
+    }
+  });
+
+  test("an agent removed from agency A (claims no longer name it), old token: 404 on A's hidden visas", async () => {
+    accounts["uid-agent-a"].customClaims = { role: ROLES.AGENT, agencyId: null };
+    await assert404Everywhere("tok-agent-a", HIDDEN, "agent removed from A");
+  });
+
+  test("the account lookup fails or the user is gone: guest (404 on hidden, 200 on public), never a 500", async () => {
+    lookupFailure = new Error("ECONNRESET");
+    await assert404Everywhere("tok-admin", HIDDEN, "lookup failure");
+    await assertGuestShapeOnPublic("tok-admin", "lookup failure");
+    lookupFailure = null;
+    delete accounts["uid-admin"];
+    await assert404Everywhere("tok-admin", HIDDEN, "deleted user");
+    await assertGuestShapeOnPublic("tok-admin", "deleted user");
+  });
+
+  test("a client token skips the lookup and is answered as before (reach through their own case)", async () => {
+    for (const suffix of READS) {
+      const r = await get("a-own", suffix, "tok-app-a");
+      assert.equal(r.status, 200, `a-own${suffix}`);
+      assertNoPrivateFields(r.body);
+    }
+    assert.equal((await get("a-pending", "", "tok-app-a")).status, 404);
+    assert.equal((await get("uk-sw", "", "tok-app-a")).status, 200);
+    assert.deepEqual(getUserCalls, [], "a client token must not trigger the account lookup");
+    // An agent-side token does trigger it (the strict path is really on).
+    await get("a-own", "", "tok-admin");
+    assert.deepEqual(getUserCalls, ["uid-admin"]);
+  });
+
+  test("an invalid token and no token at all: guest", async () => {
+    for (const token of [undefined, "garbage"]) {
+      assert.equal((await get("a-own", "", token)).status, 404);
+      assert.equal((await get("uk-sw", "", token)).status, 200);
+    }
+    assert.deepEqual(getUserCalls, []);
   });
 });
