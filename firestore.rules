@@ -711,5 +711,16 @@ service cloud.firestore {
     match /feedbackUploadLimits/{limitId} {
       allow read, write: if false;
     }
+
+    // ---- Withdrawal locks (issue #287), explicit deny ----
+    // withdrawalLocks/{agentUserId}: one document per agent, read and written
+    // by the backend inside the withdrawal transaction so that two
+    // withdrawals of one agent can never both pass the balance check
+    // (POST /bank-accounts/withdraw). Backend (Admin SDK) only: a client that
+    // could write it could make an agent's withdrawals fail. Denied for every
+    // client, admins included.
+    match /withdrawalLocks/{agentUserId} {
+      allow read, write: if false;
+    }
   }
 }

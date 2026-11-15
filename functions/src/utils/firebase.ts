@@ -86,6 +86,11 @@ export const collections = {
   // clients are denied and go through the API, which authorizes via CASL.
   documents: db.collection("documents"),
   transactions: db.collection("transactions"),
+  // (#287) One lock doc per agent (`{agentUserId}`), read and written inside
+  // the withdrawal transaction so two withdrawals of one agent run one after
+  // the other (TransactionService.withdrawWithBalanceCheck). Backend only:
+  // denied to every client in firestore.rules.
+  withdrawalLocks: db.collection("withdrawalLocks"),
   consultations: db.collection("consultations"),
   // Issue #180 (review fix): consultation payments we hold but cannot apply
   // (a second charge on a superseded checkout of an already-paid booking, or a
