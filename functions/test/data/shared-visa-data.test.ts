@@ -14,6 +14,7 @@ import path from "node:path";
 import { Timestamp } from "firebase-admin/firestore";
 
 import {
+  type DataMember,
   EMPTY_SHARED_VISA_DATA,
   inheritsFromFor,
   loadSharedVisaData,
@@ -162,15 +163,22 @@ describe("shared visa data: the shipped file", () => {
     assert.deepEqual(Object.keys(NAMES_322), CODES_322, "the names list follows the fixture's order");
     for (const cc of ["IT", "AT"]) assert.equal(bloc.members.some((m) => m.countryCode === cc), false, `${cc} is not a member`);
     for (const g of GROUPS_322) {
-      const shipped = g.countryCodes.map((cc) => bloc.members.find((m) => m.countryCode === cc));
-      for (const [i, m] of shipped.entries()) {
+      // The shipped entries of this group's members, in the group's order.
+      const members: DataMember[] = bloc.members;
+      const shipped: DataMember[] = [];
+      for (const cc of g.countryCodes) {
+        const found: DataMember | undefined = members.find((x: DataMember) => x.countryCode === cc);
+        assert.ok(found, `${cc} is a member`);
+        shipped.push(found);
+      }
+      for (const [i, m] of shipped.entries() as Iterable<[number, DataMember]>) {
         const cc = g.countryCodes[i];
         assert.ok(m, `${cc} is a member`);
         assert.equal(m.joinedOn, g.joinedOn, `${cc} joinedOn`);
         assert.equal(m.sourceUrl, g.sourceUrl, `${cc} sourceUrl`);
         assert.equal(m.sourceQuote, g.sourceQuote, `${cc} sourceQuote, character for character`);
         // Members of one group share the same three values.
-        assert.deepEqual([m.joinedOn, m.sourceUrl, m.sourceQuote], [shipped[0]!.joinedOn, shipped[0]!.sourceUrl, shipped[0]!.sourceQuote]);
+        assert.deepEqual([m.joinedOn, m.sourceUrl, m.sourceQuote], [shipped[0].joinedOn, shipped[0].sourceUrl, shipped[0].sourceQuote]);
       }
     }
     // The Liechtenstein quote keeps its typographic apostrophe (U+2019).
