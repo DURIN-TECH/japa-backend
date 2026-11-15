@@ -41,5 +41,9 @@ npm-debug.log*
 
 key.json
 
+# Emulator-only secret values (functions emulator reads them instead of Secret
+# Manager). The e2e runner (#361) writes dummy values here; never commit it.
+functions/.secret.local
+
 # Claude Code local settings + session logs (any depth) — machine-local, may contain prod ids
 .claude/

@@ -135,7 +135,10 @@ const AUTH_USERS = [
   { uid: IDS.client10User, email: EMAILS.client10User, displayName: "Miguel Santos" },
 ];
 
-const SEED_PASSWORD = "password123";
+// The one password of every seeded (emulator / dev) account. Exported so the
+// e2e fixture (scripts/seed-e2e.ts, #361) gives its account the same one rather
+// than a second place for credentials.
+export const SEED_PASSWORD = "password123";
 
 async function seedAuthUsers(): Promise<number> {
   const auth = getAuth();
