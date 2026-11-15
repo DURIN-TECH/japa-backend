@@ -173,7 +173,8 @@ export const SHARED_VISA_DATA: unknown = {
         // marker are left out of the quotes; nothing else is changed.
         // Italy and Austria are NOT here: their bringing-into-force decisions are
         // not published in the Official Journal, so no official sentence with a
-        // start date is on record (owner decision pending, separate issue).
+        // start date is on record. They were added later, under #331, with the
+        // 2001 date by owner decision (see the #331 block at the end of this list).
         // -- #322 group: GR (from 2000-01-01) --
         // Source: Council Decision 1999/848/EC, Article 1, first sentence.
         // Editing note (GR date): the date is the first day of the period Article 1
