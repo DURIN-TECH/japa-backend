@@ -18,6 +18,8 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+// #322: the shared rule for the country-code check (comments and sentences are ignored).
+import { findCountryCode } from "../../helpers/country-code-guard";
 
 const SRC = path.join(__dirname, "..", "..", "..", "src");
 
@@ -87,7 +89,15 @@ describe("rubric module: names no country, route or publisher", () => {
     assert.ok(codes.length >= 12, "the seed was parsed");
     for (const code of codes) {
       // Case-sensitive, whole word: "IE" the code, not "ie" inside a word.
-      assert.deepEqual(offenders(new RegExp(`\\b${code}\\b`)), [], `country code ${code}`);
+      // #322: searched in the CODE only (test/helpers/country-code-guard.ts):
+      // a code inside a comment or a sentence string ("There is NO ...") is an
+      // English word, not a hard-coded country; an identifier, a whole string
+      // literal or a string with no space still fails.
+      const hits = [...sources].flatMap(([file, text]) => {
+        const line = findCountryCode(text, code);
+        return line === null ? [] : [`${file}: ${line}`];
+      });
+      assert.deepEqual(hits, [], `country code ${code}`);
     }
   });
 
