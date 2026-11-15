@@ -29,7 +29,9 @@ import {
   isNotActionableMarker,
   topIssuesOf,
   NOT_CHECKABLE_REASON,
+  FILE_TOO_LARGE,
   NO_FIELD_TO_READ,
+  TOO_LARGE_DOCUMENT_REASON,
   UNREAD_DOCUMENT_REASON,
   UNUSABLE_DOCUMENT_REASON,
   type AssessmentContent,
@@ -39,6 +41,7 @@ import {
 } from "../../src/services/ai/assessment-engine";
 import { notAssessedItems, splitByApplicability } from "../../src/services/ai/rule-applicability";
 import { deriveProposedActions } from "../../src/services/ai-action.service";
+import { documentNamesFor } from "../../src/services/ai-case-officer.service";
 import type { EvidenceItem, VisaRubric } from "../../src/types/rubric";
 import { criterion, fictionalRubric } from "./harness";
 import fixture from "./fixtures/uk-standard-visitor-v2-308.json";
@@ -535,9 +538,108 @@ describe("#308 nothing checked from documents is never a strong result", () => {
     assert.deepEqual([failing.readiness, failing.internalCall], ["not_ready", "would_refuse"]);
   });
 
-  test("one rule checked and passing is enough for a call: the caps apply only when NOTHING was checked", () => {
-    const { content } = run(smallRubric([]), [doc("d1", [{ field: "feePaid", value: true }])], QUIET);
-    assert.equal(content.stageOutcomes.objective, "clear");
-    assert.deepEqual([content.readiness, content.confidence, content.internalCall], ["strong", "high", "would_approve"]);
+  // (Review round) This test used to pin the OPPOSITE: "one rule checked and
+  // passing is enough for a call". Changed on purpose: on a rulebook that
+  // names no document for any objective rule, one field that happens to be
+  // read says nothing about the rules that were only marked.
+  test("review scenario: no document items, only a passport uploaded, one field read and passing, score 90", () => {
+    // Shaped like an older rulebook: core rules (funds, fee, exclusion) have
+    // no document item. Only the passport field is read; it passes.
+    for (const items of [[] as EvidenceItem[], undefined]) {
+      const { objective, content, top, actions } = run(smallRubric(items), [doc("d1", [{ field: "identityDocument", value: "P1234567" }])], QUIET);
+      assert.equal(objective.find((r) => r.criterionId === "r-passport")?.outcome, "pass");
+      assert.deepEqual(content.insufficientInformation.map((i) => [i.criterionId, i.notAssessed]), [["r-exclusion", "not_in_documents"], ["r-fee", "not_in_documents"], ["r-funds", "not_in_documents"]]);
+      assert.equal(content.stageOutcomes.objective, "clear", "the one check that was made is reported as it came out");
+      assert.equal(content.readiness, "competitive", "not strong");
+      assert.equal(content.confidence, "medium", "not high");
+      assert.equal(content.internalCall, null, "not would_approve");
+      assert.deepEqual(content.refusalGrounds, []);
+      assert.deepEqual(top, []);
+      assert.deepEqual(actions, []);
+    }
+  });
+
+  test("the same holds when the rulebook's document items name no objective rule the applicant is assessed on", () => {
+    // An item that names only a judgement rule guards no document check either.
+    const { content } = run(smallRubric([item("plan", "Travel plan", ["r-genuine"])]), [doc("d1", [{ field: "identityDocument", value: "P1234567" }])], QUIET);
+    assert.deepEqual([content.readiness, content.confidence, content.internalCall], ["competitive", "medium", null]);
+  });
+
+  test("a fully checked application is never capped, with or without document items", () => {
+    const everything = [doc("d1", [{ field: "exclusionOrder", value: "none recorded" }, { field: "feePaid", value: true }, { field: "identityDocument", value: "P1234567" }, { field: "funds.balance", value: 5000, unit: "GBP" }])];
+    for (const items of [[] as EvidenceItem[], undefined, SMALL_ITEMS]) {
+      const { content } = run(smallRubric(items), everything, QUIET);
+      assert.deepEqual(content.insufficientInformation, []);
+      assert.deepEqual([content.readiness, content.confidence, content.internalCall, content.stageOutcomes.objective], ["strong", "high", "would_approve", "clear"]);
+    }
+  });
+
+  test("a rulebook that names documents for its objective rules is not capped by its marked side rules", () => {
+    // Small rulebook: passport and funds are named and read; exclusion and fee are only marked.
+    const named = run(smallRubric(SMALL_ITEMS), [doc("d1", [{ field: "identityDocument", value: "P1234567" }, { field: "funds.balance", value: 5000, unit: "GBP" }])], QUIET).content;
+    assert.deepEqual([named.readiness, named.confidence, named.internalCall], ["strong", "high", "would_approve"]);
+    // The real rulebook, both asked-for documents read, every question answered, score 90: 33 marked rules, still strong / high.
+    const real = replayFixture({ docs: [doc("d1", BOTH_ASKED_FOR)], concerns: false, score: 90, everyQuestionAnswered: true }).content;
+    assert.equal(real.insufficientInformation.filter((i) => i.notAssessed === "not_in_documents").length, 33);
+    assert.deepEqual([real.readiness, real.confidence, real.internalCall, real.stageOutcomes.objective], ["strong", "high", "would_approve", "clear"]);
+  });
+});
+
+describe("#308 review round: the unread-upload item names the upload, says why, and stops the staff call", () => {
+  test("the title is the applicant-facing name when the caller gives one, else the code label, else 'document'", () => {
+    const docs = [
+      doc("d1", [], { label: "document", readable: false }),
+      doc("d2", [], { label: "bank_statement", readable: false }),
+      doc("d3", [], { label: "", readable: false }),
+    ];
+    const rubric = smallRubric(SMALL_ITEMS);
+    const content = assembleContent({ rubric, mandatoryHits: [], objective: [], judgement: QUIET, documents: docs, statementReadable: true, score: 90, suspiciousDocumentIds: [], judgementFailed: false, documentNames: { d1: "  Passport  ", d3: "   " } });
+    assert.deepEqual(content.insufficientInformation.map((i) => [i.documentId, i.title]), [["d1", "Passport"], ["d2", "bank_statement"], ["d3", "document"]]);
+    const { actions } = deriveProposedActions({ id: "a", applicationId: "b", userId: "c", agencyId: null } as any, rubric, content);
+    assert.equal(actions[0].title, "Clearer copy of: Passport");
+  });
+
+  test("the job's names: the checklist item's title, else display name, document type or file name", () => {
+    const rubric = { evidenceItems: [item("passport", "Passport or identity document", ["r-passport"])] };
+    assert.deepEqual(
+      documentNamesFor(
+        [
+          { id: "d1", requirementId: "ev-passport", name: "IMG_0042.jpg" },
+          { id: "d2", requirementId: "ev-gone", name: "IMG_0043.jpg" },
+          { id: "d3", requirementId: "vr-abc123", name: "Payslip March" },
+          { id: "d4", requirementId: "ev-other" },
+          { id: "d5", name: "  " },
+        ],
+        rubric
+      ),
+      { d1: "Passport or identity document", d2: "IMG_0043.jpg", d3: "Payslip March" }
+    );
+    // A rulebook stored without document items.
+    assert.deepEqual(documentNamesFor([{ id: "d1", requirementId: "ev-passport", name: "scan.pdf" }], {}), { d1: "scan.pdf" });
+  });
+
+  test("a file over the size limit is told to upload a smaller file, not a clearer copy", () => {
+    const { content, actions } = run(smallRubric(SMALL_ITEMS), [doc("d1", [], { label: "Bank statement", readable: false, failure: FILE_TOO_LARGE })], QUIET);
+    assert.equal(content.insufficientInformation[0].reason, TOO_LARGE_DOCUMENT_REASON);
+    assert.ok(!TOO_LARGE_DOCUMENT_REASON.includes("clearer"));
+    assert.equal(actions.find((a) => a.criterionId === "document:d1")?.evidenceNeeded, TOO_LARGE_DOCUMENT_REASON);
+    // The job writes this exact failure text for an oversized file.
+    assert.equal(FILE_TOO_LARGE, "file is larger than the limit");
+    assert.equal(NO_FIELD_TO_READ, "no field to read");
+  });
+
+  test("no staff call while an upload is unread or a checked field could not be read; a refusal still refuses", () => {
+    // Everything asked for is read and passes, but a second upload is unread.
+    const clean = doc("d1", [{ field: "exclusionOrder", value: "none recorded" }, { field: "feePaid", value: true }, { field: "identityDocument", value: "P1234567" }, { field: "funds.balance", value: 5000, unit: "GBP" }]);
+    const unread = run(smallRubric(SMALL_ITEMS), [clean, doc("d2", [], { readable: false })], QUIET).content;
+    assert.deepEqual([unread.internalCall, unread.readiness, unread.stageOutcomes.objective], [null, "competitive", "insufficient"]);
+    // A field listed with no readable value: the stage is insufficient, so no call.
+    const unreadField = run(smallRubric(SMALL_ITEMS), [doc("d1", [{ field: "identityDocument", value: null }, { field: "funds.balance", value: 5000, unit: "GBP" }])], QUIET).content;
+    assert.equal(unreadField.internalCall, null);
+    // A read value that fails beside an unread upload is still a refusal call.
+    const refused = run(smallRubric(SMALL_ITEMS), [doc("d1", [{ field: "identityDocument", value: "P1" }, { field: "funds.balance", value: 5, unit: "GBP" }]), doc("d2", [], { readable: false })], QUIET).content;
+    assert.equal(refused.internalCall, "would_refuse");
+    // The stored-assessment replay keeps its call.
+    assert.equal(replayFixture().content.internalCall, "would_refuse");
   });
 });
