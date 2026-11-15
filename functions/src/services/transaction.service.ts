@@ -91,6 +91,62 @@ class TransactionService {
   }
 
   /**
+   * Get the transactions a CLIENT paid: their payment history (issue #292).
+   *
+   * Who the payer is: every incoming Transaction stores the paying client's
+   * user uid in `userId`:
+   *  - a consultation booking fee (`buildConsultationFee`: `userId` =
+   *    `clientUserId`, type "consultation_fee");
+   *  - a payment-request charge (`buildPaymentRequestPayment`: `userId` =
+   *    the request's `clientId`, type "escrow_release");
+   *  - a refund of either goes back to the same `userId`.
+   * So the scope is exactly `userId == clientUserId`. This is the ONLY
+   * ownership rule here: nothing is derived from a case, an agency or an
+   * agent, so a client can never be handed another client's row.
+   *
+   * Withdrawals are left out. An agent's payout row (`createWithdrawal`)
+   * also stores the agent's own uid in `userId`, but it is money going OUT
+   * to the agent's bank, not a payment the caller made, so it does not
+   * belong in a payment history. (It only matters when an agent-side user
+   * asks for their own client view; a real client has no withdrawals.)
+   *
+   * Filters (`status`, `applicationId`, `startDate`, `endDate`) are applied
+   * IN MEMORY after the query, unlike the agent-side queries that push them
+   * into Firestore. A client has few rows, and this way the query needs one
+   * composite index only (`userId` + `createdAt` desc, in
+   * firestore.indexes.json) instead of one per filter combination.
+   *
+   * Money is returned as stored: `amount` in minor units of the row's own
+   * `currency`. Nothing is converted or summed here.
+   *
+   * @param clientUserId the paying client's user uid (always the caller's own)
+   * @param filters optional list filters, same meaning as for the agent view
+   * @returns the client's own transactions, newest first
+   */
+  async getTransactionsForClient(
+    clientUserId: string,
+    filters?: TransactionFilters
+  ): Promise<Transaction[]> {
+    // Fail closed: with no uid there is no payer to scope to. (An empty
+    // string must never reach the query as a "match anything" value.)
+    if (!clientUserId) return [];
+
+    const snapshot = await collections.transactions
+      .where("userId", "==", clientUserId)
+      .orderBy("createdAt", "desc")
+      .get();
+
+    return snapshot.docs
+      .map((doc) => doc.data() as Transaction)
+      // Belt and braces: re-check the payer on every row, so a query change
+      // (or a fake that ignores a filter) can never leak a stranger's row.
+      .filter((txn) => txn.userId === clientUserId)
+      // Payouts are not payments the caller made (see above).
+      .filter((txn) => txn.type !== "withdrawal")
+      .filter((txn) => this.matchesFilters(txn, filters));
+  }
+
+  /**
    * Get all transactions for agents in an agency.
    * Fetches agent userIds first, then queries transactions.
    */
@@ -430,6 +486,33 @@ class TransactionService {
     }
 
     return query;
+  }
+
+  /**
+   * In-memory version of `applyFilters`, for a list that is already loaded
+   * (the client view, `getTransactionsForClient`). Same meaning per filter:
+   * exact `status`, exact `applicationId`, `createdAt` within
+   * [`startDate`, `endDate`] inclusive. A date that does not parse is
+   * ignored rather than hiding every row.
+   */
+  private matchesFilters(txn: Transaction, filters?: TransactionFilters): boolean {
+    if (!filters) return true;
+
+    if (filters.status && txn.status !== filters.status) return false;
+    if (filters.applicationId && txn.applicationId !== filters.applicationId) return false;
+
+    // Compare by milliseconds: `createdAt` is a Firestore Timestamp.
+    const createdMs = txn.createdAt.toMillis();
+    if (filters.startDate) {
+      const startMs = new Date(filters.startDate).getTime();
+      if (!Number.isNaN(startMs) && createdMs < startMs) return false;
+    }
+    if (filters.endDate) {
+      const endMs = new Date(filters.endDate).getTime();
+      if (!Number.isNaN(endMs) && createdMs > endMs) return false;
+    }
+
+    return true;
   }
 
   private chunkArray<T>(arr: T[], size: number): T[][] {

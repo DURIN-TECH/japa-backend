@@ -12,7 +12,29 @@ import {
 
 export class TransactionController {
   /**
-   * GET /transactions?role=agent|owner|admin&status=...&applicationId=...&startDate=...&endDate=...
+   * GET /transactions?role=client|agent|owner|admin&status=...&applicationId=...&startDate=...&endDate=...
+   *
+   * Scoping (issue #292). The scope is decided from the caller's OWN role
+   * (`req.authz.role`, resolved by verifyAuth from the token's custom claims),
+   * never from the `role` query parameter alone:
+   *
+   *  - caller is a CLIENT: always their own payment history (the rows whose
+   *    payer `userId` is the caller: consultation booking fees and
+   *    payment-request charges they paid). `role` is IGNORED, so the result
+   *    is the same with no `role`, `role=client`, or `role=agent|owner|admin`:
+   *    a client cannot widen their scope by asking for another role. Before
+   *    #292 a role-less client fell into the agent branch, which looks for
+   *    rows where the caller is the AGENT, and so always got `[]`;
+   *  - caller is agent-side or an admin: unchanged. `role=admin` needs the
+   *    admin role (else 403), `role=owner` needs the owner role and an agency
+   *    (else 403), and `role=agent` or no `role` returns the rows where the
+   *    caller is the agent;
+   *  - any caller may pass `role=client` to get their own payer rows (an
+   *    agent who also booked a consultation as a customer). It is scoped to
+   *    the caller's own uid, so it grants nothing extra.
+   *
+   * Money is returned as stored: `amount` in minor units of each row's own
+   * `currency` (see money/totals.ts). Nothing is converted or summed.
    */
   async getTransactions(
     req: AuthenticatedRequest,
@@ -20,7 +42,22 @@ export class TransactionController {
   ): Promise<void> {
     try {
       const userId = req.userId!;
-      const role = (req.query.role as string) || "agent";
+      // The caller's real role. verifyAuth always sets req.authz (falling
+      // back to least-privilege "client" on any resolution error).
+      const callerRole = req.authz?.role;
+      const requestedRole = req.query.role as string | undefined;
+
+      // The client view: forced for a client (whatever `role` says), and
+      // also when there is no resolved principal at all (fail to the
+      // own-rows-only scope rather than to an agent-side one); available to
+      // anyone who asks for it explicitly.
+      const clientScope =
+        !callerRole ||
+        callerRole === ROLES.CLIENT ||
+        requestedRole === ROLES.CLIENT;
+
+      // Agent-side callers keep the old default: no `role` means "agent".
+      const role = requestedRole || ROLES.AGENT;
 
       const filters: TransactionFilters = {
         status: req.query.status as TransactionFilters["status"],
@@ -28,6 +65,17 @@ export class TransactionController {
         startDate: req.query.startDate as string,
         endDate: req.query.endDate as string,
       };
+
+      // Client scope: the caller's own payer rows only. Returns before the
+      // role switch, so no `role` value can reach an agent/owner/admin query.
+      if (clientScope) {
+        const own = await transactionService.getTransactionsForClient(
+          userId,
+          filters
+        );
+        sendSuccess(res, own);
+        return;
+      }
 
       let transactions;
 
