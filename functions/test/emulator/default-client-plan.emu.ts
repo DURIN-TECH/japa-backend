@@ -434,4 +434,50 @@ describe("admins, owners and agents", () => {
     assert.equal(sub.entitlements, null);
     assert.equal(gated.status, 400, JSON.stringify(gated.body));
   });
+
+  // ---- QA round 1: a client plan somebody chose keeps applying to the agent ----
+
+  /** An independent agent (role claim set) and a token for them. */
+  async function independentAgent(name: string): Promise<{ uid: string; token: string }> {
+    const agent = await seedIndependentAgent(name);
+    const token = await withClaims(agent.account, { role: ROLES.AGENT, agencyId: null, admin: false });
+    return { uid: agent.account.uid, token };
+  }
+
+  test("independent agent with an assigned client plan lacking messaging: still 402 on POST /conversations", async () => {
+    const { uid, token } = await independentAgent("assigned-client-plan");
+    const { entitlementService } = await import("../../src/services/entitlement.service");
+    await entitlementService.assignPlan("client", uid, LIMITED_PLAN.id);
+
+    const authz = await authorizationOf(token);
+    const gated = await api.call("POST", "/conversations", token, {});
+
+    assert.equal(authz.role, ROLES.AGENT);
+    assert.equal(authz.entitlements.planId, LIMITED_PLAN.id);
+    assert.equal(gated.status, 402, JSON.stringify(gated.body));
+    assert.equal(gated.body.error, "UPGRADE_REQUIRED");
+  });
+
+  test("independent agent on a paid client plan: full AI tier, and /users/me/ai-message-access agrees", async () => {
+    const paid = {
+      ...LIMITED_PLAN, id: "test_client_paid", isDefault: false,
+      features: [...LIMITED_PLAN.features, FEATURES.AI_CASE_OFFICER],
+    };
+    await put("plans", paid.id, paid);
+    const { uid, token } = await independentAgent("paid-client-plan");
+    const { entitlementService } = await import("../../src/services/entitlement.service");
+    await entitlementService.assignPlan("client", uid, paid.id);
+
+    const authz = await authorizationOf(token);
+    const access = await api.call("GET", "/users/me/ai-message-access", token);
+    // The fail-closed AI gate (full tier only) lets this agent through to the
+    // handler: the made-up assessment is then simply not found.
+    const actions = await api.call("GET", "/ai/assessments/does-not-exist/actions", token);
+
+    assert.equal(authz.entitlements.planId, paid.id);
+    assert.equal(authz.entitlements.features.includes(FEATURES.AI_CASE_OFFICER), true);
+    assert.equal(access.status, 200, JSON.stringify(access.body));
+    assert.equal(access.body.data.hasAiPlan, true);
+    assert.notEqual(actions.status, 402, JSON.stringify(actions.body));
+  });
 });

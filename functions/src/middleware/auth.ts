@@ -27,25 +27,58 @@ export interface AuthenticatedRequest extends Request {
 }
 
 /**
- * True when a stored entitlements record is a CLIENT-plan record sitting under
- * an independent agent's id, i.e. it does not belong to this subscriber.
+ * True when a stored entitlements record under an independent agent's id is
+ * the leftover of the lazy client default (issue #311) and must therefore not
+ * gate the agent.
  *
- * Why this can happen (issue #311): a client and an independent agent are
- * both keyed by their own uid in `entitlements`. Every account is a client
- * until agent onboarding completes, so the client record that #311 now saves
- * on a new user's first request is still there, under the same id, once that
- * user becomes an independent agent. Honouring it would put the agent on the
- * client plan's features and limits. Agents with no record of their own are
- * out of scope here (#315) and must stay as they were: ungated.
+ * Why this can happen: a client and an independent agent are both keyed by
+ * their own uid in `entitlements`. Every account is a client until agent
+ * onboarding completes, so the client record that #311 saves on a new user's
+ * first request is still there, under the same id, once that user becomes an
+ * independent agent. Honouring it would put the agent on the free client
+ * plan's features and limits. Agents with no record of their own are out of
+ * scope here (#315) and must stay as they were: ungated.
+ *
+ * But a client-type record under an agent's uid can ALSO be one somebody chose:
+ * an admin assigned a client plan, or the person bought one while still a
+ * client. Those gated (or unlocked paid AI for) the agent before #311 and must
+ * keep doing so. The two are told apart by `subscriptions/{uid}`:
+ *
+ *  - the lazy path writes the entitlements record ONLY, never a subscription;
+ *  - every assigned or bought plan writes `subscriptions/{uid}` before its
+ *    entitlements record (`assignPlan`, the billing webhook, the subscription
+ *    seed), and nothing deletes a subscription document.
+ *
+ * So: client-type record + no subscription document = lazily created = ignore.
+ * Any subscription document = somebody's decision = honour the record, as
+ * before #311.
+ *
+ * Cost: the common cases return before any read (not an agent subscriber, or
+ * the record is the agent's own). Only an independent agent who still carries
+ * a client-type record pays one extra read per request.
+ *
+ * If the subscription read fails we cannot tell which kind it is. The record
+ * is then honoured: that is what happened to every such record before #311,
+ * and it is the choice that never removes a gate.
  *
  * Deliberately narrow: only "agent subscriber, client record". An agency is
  * keyed by its agency id, so it cannot collide with a user's record.
  */
-function isForeignClientRecord(
-  subscriberType: SubscriberType,
+async function isLeftoverLazyClientRecord(
+  subscriber: { type: SubscriberType; id: string },
   stored: Entitlements
-): boolean {
-  return subscriberType === "agent" && stored.subscriberType === "client";
+): Promise<boolean> {
+  if (subscriber.type !== "agent" || stored.subscriberType !== "client") return false;
+  try {
+    const subscription = await entitlementService.getActiveSubscription(subscriber.id);
+    return subscription === null;
+  } catch (error) {
+    console.error(
+      "attachAuthz: could not read the subscription behind a client record on an agent; honouring the record:",
+      error
+    );
+    return false;
+  }
 }
 
 /**
@@ -102,9 +135,10 @@ async function attachAuthz(req: AuthenticatedRequest): Promise<void> {
             return null;
           });
 
-        if (stored && isForeignClientRecord(subscriber.type, stored)) {
-          // Not this subscriber's record (see isForeignClientRecord): treated
-          // as "no record", which for an agent means ungated, as before #311.
+        if (stored && (await isLeftoverLazyClientRecord(subscriber, stored))) {
+          // The lazy client default left under an independent agent's uid
+          // (see isLeftoverLazyClientRecord): treated as "no record", which
+          // for an agent means ungated, as before #311.
         } else if (stored) {
           entitlements = stored;
         } else if (!lookupFailed && role === ROLES.CLIENT) {

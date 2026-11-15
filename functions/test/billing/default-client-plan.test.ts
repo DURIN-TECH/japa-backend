@@ -519,6 +519,93 @@ describe("admins, owners and agents are not given a default plan", () => {
     // The client record is left alone (no write, no delete).
     assert.equal(entitlementWrites().length, 1);
   });
+
+  // ---- QA round 1: a client record somebody CHOSE keeps applying ----
+  //
+  // An assigned or bought client plan always has `subscriptions/{uid}` (the
+  // real `assignPlan` is used below, so that claim is exercised, not assumed).
+  // Such a record gated the agent before #311 and must keep doing so.
+
+  test("independent agent with an ASSIGNED client plan lacking messaging is still gated (402)", async () => {
+    await entitlementService.assignPlan("client", "uid-solo", FREE_PLAN.id);
+    assert.equal(store.has("subscriptions/uid-solo"), true, "assignment writes a subscription document");
+
+    const req = await signIn("tok-solo-agent");
+
+    assert.equal(req.entitlements?.planId, FREE_PLAN.id);
+    assert.equal(gate(req, FEATURES.MESSAGING), 402);
+    assert.equal(tierFor(req.authz?.role, req.entitlements), "free");
+  });
+
+  test("independent agent on a paid client plan keeps the full AI tier, in step with the AI-access check", async () => {
+    seedPlans(PAID_PLAN);
+    await entitlementService.assignPlan("client", "uid-solo", PAID_PLAN.id);
+    const { aiMessageAccessService }: any = await import("../../src/services/ai-message-access.service");
+
+    const req = await signIn("tok-solo-agent");
+
+    assert.equal(req.entitlements?.planId, PAID_PLAN.id);
+    assert.equal(tierFor(req.authz?.role, req.entitlements), "full");
+    // `GET /users/me/ai-message-access` answers `hasAiPlan` from this check,
+    // which reads the stored record directly: the two must agree.
+    assert.equal(await aiMessageAccessService.subjectHasAiPlan(req.authz), true);
+  });
+
+  test("the lazy leftover and the AI-access check agree too (no AI plan either way)", async () => {
+    TOKENS["tok-solo-as-client"] = { ...TOKENS["tok-solo-agent"], role: ROLES.CLIENT };
+    await signIn("tok-solo-as-client");
+    assert.equal(store.has("subscriptions/uid-solo"), false, "the lazy path writes no subscription");
+    const { aiMessageAccessService }: any = await import("../../src/services/ai-message-access.service");
+
+    const req = await signIn("tok-solo-agent");
+
+    assert.equal(req.entitlements, null);
+    assert.equal(tierFor(req.authz?.role, req.entitlements), "free");
+    assert.equal(await aiMessageAccessService.subjectHasAiPlan(req.authz), false);
+  });
+
+  test("if the subscription cannot be read, the client record is honoured (no gate is dropped)", async () => {
+    store.set("entitlements/uid-solo", {
+      subscriberType: "client", subscriberId: "uid-solo", planId: FREE_PLAN.id,
+      status: "active", features: FREE_PLAN.features, limits: FREE_PLAN.limits,
+    });
+    firebase.collections.subscriptions = {
+      doc: () => ({
+        get: async () => {
+          throw new Error("firestore unavailable");
+        },
+      }),
+    };
+
+    const req = await signIn("tok-solo-agent");
+
+    assert.equal(req.entitlements?.planId, FREE_PLAN.id);
+    assert.equal(gate(req, FEATURES.MESSAGING), 402);
+  });
+
+  test("the subscription is read only for an agent carrying a client record", async () => {
+    // Everyone else must not pay for the check: any subscription read fails.
+    const failing = () => {
+      throw new Error("no subscription read is needed here");
+    };
+    store.set("entitlements/uid-solo", {
+      subscriberType: "agent", subscriberId: "uid-solo", planId: "agent_plan",
+      status: "active", features: [], limits: {},
+    });
+    store.set("entitlements/uid-client", {
+      subscriberType: "client", subscriberId: "uid-client", planId: FREE_PLAN.id,
+      status: "active", features: [], limits: {},
+    });
+    store.set("entitlements/agency-1", {
+      subscriberType: "agency", subscriberId: "agency-1", planId: "agency_plan",
+      status: "active", features: [], limits: {},
+    });
+    firebase.collections.subscriptions = { doc: failing };
+
+    assert.equal((await signIn("tok-solo-agent")).entitlements?.planId, "agent_plan");
+    assert.equal((await signIn("tok-client")).entitlements?.planId, FREE_PLAN.id);
+    assert.equal((await signIn("tok-owner")).entitlements?.planId, "agency_plan");
+  });
 });
 
 // ============================================
