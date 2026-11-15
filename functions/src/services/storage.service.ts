@@ -390,6 +390,25 @@ export class StorageService {
       created: new Date(metadata.timeCreated as string),
     };
   }
+
+  /**
+   * The first `length` bytes of a stored object (fewer when the object is
+   * shorter). A ranged read: the rest of the object is not downloaded.
+   *
+   * Used by document registration (issue #310) to decide the file's size limit
+   * from what the file really is, not from the content type the client
+   * declared. Callers pass a path they have already validated and found to
+   * exist; an empty object has no bytes to range over, so it is answered
+   * without a request.
+   */
+  async readFileHead(storagePath: string, length: number, knownSize?: number): Promise<Buffer> {
+    if (length <= 0 || knownSize === 0) return Buffer.alloc(0);
+    const file = this.bucket.file(storagePath);
+    // `end` is inclusive.
+    const [bytes] = await file.download({ start: 0, end: length - 1 });
+    // Belt and braces: never hand back more than was asked for.
+    return bytes.subarray(0, length);
+  }
 }
 
 export const storageService = new StorageService();

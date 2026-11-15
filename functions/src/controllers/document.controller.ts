@@ -419,7 +419,9 @@ export class DocumentController {
       // client can pick a smaller copy and start again from the upload URL.
       // 413 with its own code, so the app can show the size message instead of
       // a generic upload failure. `maxBytes` is the limit that applied to this
-      // file (lower for an image than for a PDF) and `sizeBytes` its real size.
+      // file and `sizeBytes` its real size. `isPdf` says which limit that was:
+      // true = the file's bytes are a PDF (the full limit), false = anything
+      // else (the lower limit the model accepts for an image).
       if (error instanceof FileTooLargeError) {
         console.warn(
           `[document] registration refused: file too large (${error.sizeBytes} > ${error.maxBytes} bytes, caller ${req.userId ?? "unknown"})`
@@ -428,7 +430,7 @@ export class DocumentController {
           success: false,
           error: "FILE_TOO_LARGE",
           message: error.message,
-          details: { maxBytes: error.maxBytes, sizeBytes: error.sizeBytes, isImage: error.isImage },
+          details: { maxBytes: error.maxBytes, sizeBytes: error.sizeBytes, isPdf: error.isPdf },
         });
         return;
       }

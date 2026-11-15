@@ -15,13 +15,17 @@
 //   checks three things: the HTTP answer, whether the object is still there,
 //   and what was written to Firestore.
 //
-// PART 2 — the acceptance case: an application holding 1 passport PDF, 3
-//   bank-statement PDFs and 6 JPEG photos of 2-4 MB, on a rulebook that needs
-//   five judgement calls (as UK Standard Visitor v2 did), is reviewed to
-//   `succeeded` with the default settings (no `appConfig/aiSettings` document
-//   exists in the emulator). The files are registered through the real
-//   endpoint and read back from the Storage emulator by the real job. The
-//   rulebook is a fictional fixture: nothing is drafted, extracted or published.
+// PART 2 — the review, run by the real job over the service's own default
+//   dependencies (real Storage and Firestore reads), with only the model and
+//   the rulebook faked. The rulebook is a fictional fixture needing five
+//   judgement calls: nothing is drafted, extracted or published. Three cases:
+//   - the acceptance case: 1 passport PDF, statements of 3, 6 and 9.5 MB and 6
+//     photos of 2-4 MB (about 40 MB) end `succeeded` at the default settings
+//     (no `appConfig/aiSettings` document exists in the emulator);
+//   - files the upload accepted under a wrong label are all read: the upload
+//     limit and the review limit are one decision, from the file's own bytes;
+//   - files adding up to more than the total attached-bytes limit end
+//     `review_too_large` before any model call.
 
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -65,10 +69,12 @@ async function adminBucket(): Promise<any> {
  * document a request holds. Zero padding after that: only the header and the
  * length matter here.
  */
-function fileBytes(kind: "pdf" | "jpeg", key: string, size: number): Buffer {
+function fileBytes(kind: "pdf" | "jpeg" | "heic", key: string, size: number): Buffer {
   const out = Buffer.alloc(size);
   if (kind === "pdf") out.write("%PDF-1.4 ", 0, "latin1");
-  else out.set([0xff, 0xd8, 0xff, 0xe0], 0);
+  else if (kind === "jpeg") out.set([0xff, 0xd8, 0xff, 0xe0], 0);
+  // HEIC: an ISO media file, "ftypheic" after a four-byte box length.
+  else out.write("\u0000\u0000\u0000\u0018ftypheic", 0, "latin1");
   out.write(` KEY:${key} `, 10, "latin1");
   return out;
 }
@@ -174,7 +180,7 @@ describe("POST /documents: the size comes from Cloud Storage, never from the req
           success: false,
           error: "FILE_TOO_LARGE",
           message: "This file is larger than 10 MB. Upload a smaller copy, for example a scan at a lower resolution.",
-          details: { maxBytes: 10 * MB, sizeBytes: 10 * MB + 1, isImage: false },
+          details: { maxBytes: 10 * MB, sizeBytes: 10 * MB + 1, isPdf: true },
         },
         objectStillThere: false,
         recordsAdded: 0,
@@ -232,7 +238,7 @@ describe("POST /documents: the size comes from Cloud Storage, never from the req
         status: 413,
         error: "FILE_TOO_LARGE",
         message: "This file is larger than 7 MB. Upload a smaller copy, for example a scan at a lower resolution.",
-        details: { maxBytes: 7 * MB, sizeBytes: 8 * MB, isImage: true },
+        details: { maxBytes: 7 * MB, sizeBytes: 8 * MB, isPdf: false },
         objectStillThere: false,
         record: undefined,
       }
@@ -244,14 +250,54 @@ describe("POST /documents: the size comes from Cloud Storage, never from the req
     assert.equal((await recordFor(APP, fine)).fileSizeMb, 4);
   });
 
-  test("the image limit follows what Storage recorded, not only what the request declares", async () => {
-    // Uploaded as a JPEG, registered as if it were a PDF: still an image.
-    const path = await upload(APP, "photo-as-pdf.jpg", fileBytes("jpeg", "sneaky", 8 * MB), "image/jpeg");
-    const res = await api.call("POST", "/documents", token, registration(APP, path, { fileType: "application/pdf" }));
-    assert.equal(res.status, 413);
-    assert.equal(res.body.details.isImage, true);
-    assert.equal(await objectExists(path), false);
-  });
+  // ---- The limit follows what the file IS, never how it was labelled ----
+  // Registration and the review must agree about every file, so both decide
+  // from the file's own first bytes. Each row: the real bytes, the content type
+  // the object was stored with (what the client asked the upload URL for), the
+  // `fileType` the registration declares, the size, and the answer.
+  const LABELLED: Array<{ name: string; kind: "pdf" | "jpeg" | "heic"; contentType: string; fileType: string; mb: number; status: 201 | 413; maxMb?: number }> = [
+    // The reported defect: a photo stored and declared as a PDF.
+    { name: "a JPEG labelled application/pdf, 8 MB", kind: "jpeg", contentType: "application/pdf", fileType: "application/pdf", mb: 8, status: 413, maxMb: 7 },
+    // What the mobile picker sends when it has no type.
+    { name: "a JPEG labelled application/octet-stream, 8 MB", kind: "jpeg", contentType: "application/octet-stream", fileType: "application/octet-stream", mb: 8, status: 413, maxMb: 7 },
+    { name: "a JPEG labelled application/octet-stream, 4 MB", kind: "jpeg", contentType: "application/octet-stream", fileType: "application/octet-stream", mb: 4, status: 201 },
+    { name: "a PDF labelled application/octet-stream, 9 MB", kind: "pdf", contentType: "application/octet-stream", fileType: "application/octet-stream", mb: 9, status: 201 },
+    { name: "a PDF labelled application/octet-stream, 11 MB", kind: "pdf", contentType: "application/octet-stream", fileType: "application/octet-stream", mb: 11, status: 413, maxMb: 10 },
+    // The other way round: a real PDF labelled as an image keeps the PDF limit.
+    { name: "a PDF labelled image/jpeg, 8 MB", kind: "pdf", contentType: "image/jpeg", fileType: "image/jpeg", mb: 8, status: 201 },
+    { name: "a PDF labelled image/jpeg, 11 MB", kind: "pdf", contentType: "image/jpeg", fileType: "image/jpeg", mb: 11, status: 413, maxMb: 10 },
+    // HEIC: accepted at upload, not a PDF, so the lower limit.
+    { name: "a HEIC photo, 6 MB", kind: "heic", contentType: "image/heic", fileType: "image/heic", mb: 6, status: 201 },
+    { name: "a HEIC photo, 8 MB", kind: "heic", contentType: "image/heic", fileType: "image/heic", mb: 8, status: 413, maxMb: 7 },
+    { name: "a HEIC photo labelled application/pdf, 8 MB", kind: "heic", contentType: "application/pdf", fileType: "application/pdf", mb: 8, status: 413, maxMb: 7 },
+    // The storage label and the declared type disagreeing changes nothing.
+    { name: "a JPEG stored as application/pdf but declared image/jpeg, 8 MB", kind: "jpeg", contentType: "application/pdf", fileType: "image/jpeg", mb: 8, status: 413, maxMb: 7 },
+  ];
+  for (const row of LABELLED) {
+    test(`${row.name}: ${row.status}`, async () => {
+      const path = await upload(APP, "labelled.bin", fileBytes(row.kind, "labelled", row.mb * MB), row.contentType);
+      const res = await api.call("POST", "/documents", token, registration(APP, path, { fileType: row.fileType }));
+      const record = await recordFor(APP, path);
+      if (row.status === 201) {
+        assert.deepEqual(
+          { status: res.status, objectStillThere: await objectExists(path), storedMb: record?.fileSizeMb },
+          { status: 201, objectStillThere: true, storedMb: row.mb }
+        );
+      } else {
+        assert.deepEqual(
+          { status: res.status, error: res.body.error, message: res.body.message, details: res.body.details, objectStillThere: await objectExists(path), record },
+          {
+            status: 413,
+            error: "FILE_TOO_LARGE",
+            message: `This file is larger than ${row.maxMb} MB. Upload a smaller copy, for example a scan at a lower resolution.`,
+            details: { maxBytes: row.maxMb! * MB, sizeBytes: row.mb * MB, isPdf: row.kind === "pdf" },
+            objectStillThere: false,
+            record: undefined,
+          }
+        );
+      }
+    });
+  }
 
   test("the same check applies to an upload made against a document request", async () => {
     // No `requirementId`: the upload answers an agent's ask (`documentRequestId`).
@@ -296,40 +342,99 @@ describe("POST /documents: the size comes from Cloud Storage, never from the req
 });
 
 // ============================================
-// PART 2 — an ordinary application is reviewed
+// PART 2 — the review, on the same emulators
 // ============================================
 
-describe("readiness review of a normal-sized application, on the emulators", () => {
-  test("1 passport PDF, 3 bank statements and 6 photos of 2-4 MB: succeeded, every document read, no cap code", async () => {
-    // ---- the application, on a fictional route whose rulebook needs 5 judgement calls ----
-    await seedApplication(APP_REVIEW, {
-      countryCode: "AA",
-      visaTypeId: "route-a",
-      mode: "self_service",
-      status: "in_progress",
-      title: "Review 310",
-      intake: { answers: {} },
-    });
-    const stages = ["validity", "suitability", "eligibility", "credibility"] as const;
-    const base = routeARubric();
-    const rubric = fictionalRubric({
-      countryCode: "AA",
-      visaTypeId: "route-a",
-      intentPolarity: "immigrant_intent_penalised",
-      criteria: [
-        ...base.criteria,
-        ...Array.from({ length: 160 }, (_, i) =>
-          criterion({ criterionId: `j${String(i).padStart(3, "0")}`, title: `Judgement rule ${i}`, kind: "judgement", stage: stages[i % 4], severity: "low", probeFactors: ["f"] })
-        ),
-      ],
-    });
+/** A fictional route-A rulebook that needs FIVE judgement calls. */
+function fiveBatchRubric() {
+  const stages = ["validity", "suitability", "eligibility", "credibility"] as const;
+  return fictionalRubric({
+    countryCode: "AA",
+    visaTypeId: "route-a",
+    intentPolarity: "immigrant_intent_penalised",
+    criteria: [
+      ...routeARubric().criteria,
+      ...Array.from({ length: 160 }, (_, i) =>
+        criterion({ criterionId: `j${String(i).padStart(3, "0")}`, title: `Judgement rule ${i}`, kind: "judgement", stage: stages[i % 4], severity: "low", probeFactors: ["f"] })
+      ),
+    ],
+  });
+}
 
-    // ---- the ten files, uploaded to the Storage emulator and registered through the real endpoint ----
-    const uploads: Array<{ key: string; kind: "pdf" | "jpeg"; mb: number }> = [
-      { key: "passport", kind: "pdf", mb: 1 },
-      { key: "bank1", kind: "pdf", mb: 1.5 },
-      { key: "bank2", kind: "pdf", mb: 2 },
-      { key: "bank3", kind: "pdf", mb: 1.5 },
+/** One file to upload, register and review. */
+interface ReviewFile {
+  key: string;
+  kind: "pdf" | "jpeg" | "heic";
+  mb: number;
+  /** The content type to store and declare. Default: the true one. */
+  label?: string;
+}
+
+/**
+ * Seed a self-service application on the fictional route, upload each file to
+ * the Storage emulator, register it through the real `POST /documents`, then
+ * run the REAL review job over the service's own default dependencies (real
+ * Storage download and metadata reads, real Firestore, the real settings
+ * read), with only the model provider and the rulebook swapped for fakes.
+ */
+async function registerAndReview(applicationId: string, uploads: ReviewFile[], rubric = fiveBatchRubric()) {
+  await seedApplication(applicationId, { countryCode: "AA", visaTypeId: "route-a", mode: "self_service", title: applicationId, intake: { answers: {} } });
+  const statuses: number[] = [];
+  for (const u of uploads) {
+    const trueType = u.kind === "pdf" ? "application/pdf" : u.kind === "jpeg" ? "image/jpeg" : "image/heic";
+    const path = await upload(applicationId, `${u.key}.bin`, fileBytes(u.kind, u.key, Math.round(u.mb * MB)), u.label ?? trueType);
+    const res = await api.call("POST", "/documents", token, {
+      applicationId,
+      requirementId: `req-${u.key}`,
+      fileName: `${u.key}.bin`,
+      fileType: u.label ?? trueType,
+      storagePath: path,
+    });
+    statuses.push(res.status);
+  }
+
+  const firebase: any = await import("../../src/utils/firebase");
+  const { AiCaseOfficerService, defaultDeps } = await import("../../src/services/ai-case-officer.service");
+  assert.equal((await firebase.collections.appConfig.doc("aiSettings").get()).exists, false, "no settings document: the code defaults are what runs");
+
+  const provider = new ScriptedProvider((req) =>
+    req.role === "extraction"
+      ? JSON.stringify({ readable: true, values: [] })
+      : JSON.stringify({ findings: [], strengths: [], statementNotes: [], suspiciousPassages: [] })
+  );
+  const service = new AiCaseOfficerService({
+    ...defaultDeps(),
+    provider,
+    rubrics: { getApprovedRubric: async () => rubric, approvedVersionOf: async () => rubric.version },
+  });
+
+  const appSnap = await firebase.collections.applications.doc(applicationId).get();
+  const out: any = await service.requestAssessment({ id: appSnap.id, ...appSnap.data() }, { tier: "full", trigger: "manual", requestedBy: client.uid });
+  assert.ok(out.assessmentId, `the review was queued (got ${out.kind})`);
+  const result = await service.runJob(out.assessmentId);
+  const stored = (await firebase.collections.applicationAssessments.doc(out.assessmentId).get()).data();
+  // The key of every document that was sent to the model for extraction.
+  const read = provider.requests
+    .filter((r) => r.role === "extraction")
+    .map((r) => /KEY:([A-Za-z0-9_-]+)/.exec(Buffer.from(r.documents![0].data, "base64").subarray(0, 64).toString("latin1"))![1])
+    .sort();
+  return { statuses, result, stored, provider, read };
+}
+
+/** Today's count of reviews that reached a model, or 0. */
+async function reviewsCountedToday(): Promise<number> {
+  const day = new Date().toISOString().slice(0, 10);
+  const snap = await (await adminDb()).collection("aiCosts").doc(day).get();
+  return snap.exists ? Number(snap.data().assessments ?? 0) : 0;
+}
+
+describe("readiness review on the emulators", () => {
+  test("1 passport PDF, statements of 3, 6 and 9.5 MB and 6 photos of 2-4 MB (about 40 MB): succeeded, every document read, no cap code", async () => {
+    const uploads: ReviewFile[] = [
+      { key: "passport", kind: "pdf", mb: 2.2 },
+      { key: "bank1", kind: "pdf", mb: 3 },
+      { key: "bank2", kind: "pdf", mb: 6 },
+      { key: "bank3", kind: "pdf", mb: 9.5 },
       { key: "photo1", kind: "jpeg", mb: 2 },
       { key: "photo2", kind: "jpeg", mb: 2.5 },
       { key: "photo3", kind: "jpeg", mb: 3 },
@@ -337,60 +442,50 @@ describe("readiness review of a normal-sized application, on the emulators", () 
       { key: "photo5", kind: "jpeg", mb: 4 },
       { key: "photo6", kind: "jpeg", mb: 4 },
     ];
-    for (const u of uploads) {
-      const contentType = u.kind === "pdf" ? "application/pdf" : "image/jpeg";
-      const path = await upload(APP_REVIEW, `${u.key}.${u.kind === "pdf" ? "pdf" : "jpg"}`, fileBytes(u.kind, u.key, u.mb * MB), contentType);
-      const res = await api.call("POST", "/documents", token, {
-        applicationId: APP_REVIEW,
-        requirementId: `req-${u.key}`,
-        fileName: `${u.key}.${u.kind === "pdf" ? "pdf" : "jpg"}`,
-        fileType: contentType,
-        storagePath: path,
-      });
-      assert.equal(res.status, 201, `registering ${u.key}`);
-    }
+    const before = await reviewsCountedToday();
+    const { statuses, result, stored, provider, read } = await registerAndReview(APP_REVIEW, uploads);
+
+    assert.deepEqual(statuses, uploads.map(() => 201));
     const registered = await documentsOf(APP_REVIEW);
-    assert.equal(registered.length, 10);
     assert.deepEqual(registered.map((d) => d.fileSizeMb).sort((a, b) => a - b), uploads.map((u) => u.mb).sort((a, b) => a - b), "each record holds its real size");
 
-    // ---- the real job: real Firestore + Storage (emulators), real settings read, scripted model ----
-    const firebase: any = await import("../../src/utils/firebase");
-    const { AiCaseOfficerService } = await import("../../src/services/ai-case-officer.service");
-    const { readAiSettings } = await import("../../src/services/ai/ai-settings");
-    assert.equal((await firebase.collections.appConfig.doc("aiSettings").get()).exists, false, "no settings document: the code defaults are what runs");
-
-    const provider = new ScriptedProvider((req) =>
-      req.role === "extraction"
-        ? JSON.stringify({ readable: true, values: [] })
-        : JSON.stringify({ findings: [], strengths: [], statementNotes: [], suspiciousPassages: [] })
-    );
-    const service = new AiCaseOfficerService({
-      provider,
-      rubrics: { getApprovedRubric: async () => rubric, approvedVersionOf: async () => rubric.version },
-      loadBytes: async (storagePath: string) => (await firebase.storage.bucket().file(storagePath).download())[0],
-      runTransaction: (fn: any) => firebase.db.runTransaction(fn),
-      readSettings: readAiSettings,
-      now: () => new Date(),
-    });
-
-    const appSnap = await firebase.collections.applications.doc(APP_REVIEW).get();
-    const app = { id: appSnap.id, ...appSnap.data() };
-    const out: any = await service.requestAssessment(app, { tier: "full", trigger: "manual", requestedBy: client.uid });
-    assert.ok(out.assessmentId, `the review was queued (got ${out.kind})`);
-    const result = await service.runJob(out.assessmentId);
-    const stored = (await firebase.collections.applicationAssessments.doc(out.assessmentId).get()).data();
-
     assert.deepEqual({ result, status: stored.status, error: stored.error }, { result: "succeeded", status: "succeeded", error: null });
-    // Every document got an extraction call, carrying that document's bytes.
-    const read = provider.requests
-      .filter((r) => r.role === "extraction")
-      .map((r) => /KEY:([A-Za-z0-9_-]+)/.exec(Buffer.from(r.documents![0].data, "base64").subarray(0, 64).toString("latin1"))![1])
-      .sort();
-    assert.deepEqual(read, uploads.map((u) => u.key).sort());
+    assert.deepEqual(read, uploads.map((u) => u.key).sort(), "every document got an extraction call");
     assert.equal(provider.callsFor("judgement"), 5);
     assert.equal(provider.requests.length, 15, "inside the default cap of 30");
     // The 4 MB photos went out whole, and under what the provider accepts for one image.
     const largestImage = Math.max(...provider.requests.filter((r) => r.documents?.[0]?.mediaType === "image/jpeg").map((r) => r.documents![0].data.length));
     assert.ok(largestImage > 5_000_000 && largestImage < 10_000_000);
+    assert.equal(await reviewsCountedToday(), before + 1, "counted once against today's reviews");
+  });
+
+  test("every mislabelled file the upload accepted is read by the review; none is left out for its size", async () => {
+    // The largest of each kind that registration accepts under a wrong label.
+    const uploads: ReviewFile[] = [
+      { key: "pdf-as-image", kind: "pdf", mb: 9.5, label: "image/jpeg" },
+      { key: "pdf-as-binary", kind: "pdf", mb: 9.5, label: "application/octet-stream" },
+      { key: "jpeg-as-pdf", kind: "jpeg", mb: 7, label: "application/pdf" },
+      { key: "jpeg-as-binary", kind: "jpeg", mb: 7, label: "application/octet-stream" },
+      { key: "heic", kind: "heic", mb: 7 },
+    ];
+    const { statuses, stored, read } = await registerAndReview("app-labels-310", uploads);
+    assert.deepEqual(statuses, uploads.map(() => 201));
+    assert.equal(stored.status, "succeeded");
+    // Everything the review can read was sent. The HEIC is not a readable type
+    // (a known gap, not a size problem), so it is the only one missing.
+    assert.deepEqual(read, ["jpeg-as-binary", "jpeg-as-pdf", "pdf-as-binary", "pdf-as-image"]);
+    assert.equal(JSON.stringify(stored).includes("file is larger than the limit"), false, "no document is reported as too large");
+  });
+
+  test("files adding up to more than 60 MB: review_too_large before any model call, and today's count does not move", async () => {
+    // Seven PDFs of 9.5 MB: each is within its own limit, together 66.5 MB.
+    const uploads: ReviewFile[] = Array.from({ length: 7 }, (_, i) => ({ key: `big${i}`, kind: "pdf" as const, mb: 9.5 }));
+    const before = await reviewsCountedToday();
+    const { statuses, result, stored, provider } = await registerAndReview("app-total-310", uploads);
+    assert.deepEqual(statuses, uploads.map(() => 201), "each file is accepted at upload");
+    assert.deepEqual(
+      { result, status: stored.status, error: stored.error, modelCalls: provider.requests.length, countedToday: (await reviewsCountedToday()) - before },
+      { result: "failed", status: "failed", error: { code: "review_too_large", message: "the application is larger than one review can read" }, modelCalls: 0, countedToday: 0 }
+    );
   });
 });

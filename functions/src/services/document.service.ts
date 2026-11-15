@@ -10,10 +10,12 @@ import { noteService } from "./note.service";
 import { userService } from "./user.service";
 import {
   DEFAULT_AI_SETTINGS,
-  fileByteLimitFor,
-  isImageType,
+  FILE_HEAD_BYTES,
+  fileByteLimitForBytes,
   megabytesLabel,
   readAiSettings,
+  smallestFileByteLimit,
+  startsLikePdf,
 } from "./ai/ai-settings";
 import {
   requireRequestedPath,
@@ -36,8 +38,8 @@ const BYTES_PER_MB = 1024 * 1024;
  * no document record exists. The controller maps it to 413 `FILE_TOO_LARGE`.
  *
  * `message` is the plain line shown to the person who uploaded the file. It
- * names the limit that applied to THIS file (10 MB, or the lower image limit),
- * so a client can show it as is.
+ * names the limit that applied to THIS file (10 MB for a real PDF, the lower
+ * limit for anything else), so a client can show it as is.
  */
 export class FileTooLargeError extends Error {
   constructor(
@@ -45,8 +47,8 @@ export class FileTooLargeError extends Error {
     readonly maxBytes: number,
     /** The object's real size, in bytes, as Cloud Storage reported it. */
     readonly sizeBytes: number,
-    /** True when the lower image limit applied. */
-    readonly isImage: boolean
+    /** True when the file's bytes are a PDF (so the higher limit applied). */
+    readonly isPdf: boolean
   ) {
     super(
       `This file is larger than ${megabytesLabel(maxBytes)}. ` +
@@ -240,20 +242,29 @@ export class DocumentService {
       throw new Error("File not found in storage");
     }
 
-    // The limit is the SAME number the readiness review applies to each file
-    // (`maxFileBytes`, lower for an image: ai-settings.ts, fileByteLimitFor),
-    // read from the same settings, so a file accepted here is never "too
-    // large" for the review. A failed settings read falls back to the code
-    // defaults: unlike the review (which fails closed so an admin's "off" is
-    // respected), an upload must not be blocked because Firestore blinked, and
-    // the review re-checks every file's bytes anyway.
+    // The limit is decided by the SAME function the readiness review applies
+    // to each file (ai-settings.ts, fileByteLimitForBytes), from the same
+    // settings and from the file's OWN first bytes, so a file accepted here is
+    // never "too large" for the review. The declared type (the content type
+    // the upload URL was signed for, or the request's `fileType`) is not used:
+    // a client can label a photo as a PDF, or send no usable type at all.
+    //
+    // A failed settings read falls back to the code defaults: unlike the
+    // review (which fails closed so an admin's "off" is respected), an upload
+    // must not be blocked because Firestore blinked, and the review re-checks
+    // every file's bytes anyway.
     const settingsRead = await readAiSettings();
     const limitSettings = settingsRead.ok ? settingsRead.settings : DEFAULT_AI_SETTINGS;
-    // An image by what Storage recorded at upload (the content type the upload
-    // URL was signed for) or by what the client now declares: either is enough
-    // to apply the lower limit.
-    const isImage = isImageType(stored.contentType) || isImageType(fileType);
-    const maxBytes = fileByteLimitFor(limitSettings, isImage);
+    // A file at or under the smallest limit passes whatever it is, so its
+    // bytes are only read (one small ranged request) when the answer or the
+    // message depends on them.
+    let maxBytes = smallestFileByteLimit(limitSettings);
+    let isPdf = false;
+    if (stored.size > maxBytes) {
+      const head = await storageService.readFileHead(validatedPath, FILE_HEAD_BYTES, stored.size);
+      isPdf = startsLikePdf(head);
+      maxBytes = fileByteLimitForBytes(limitSettings, head);
+    }
     if (stored.size > maxBytes) {
       // Remove the oversized object so it does not sit in the bucket with no
       // record pointing at it. One guard first: if a document record already
@@ -267,7 +278,7 @@ export class DocumentService {
       if (alreadyRegistered.empty) {
         await storageService.deleteFile(validatedPath);
       }
-      throw new FileTooLargeError(maxBytes, stored.size, isImage);
+      throw new FileTooLargeError(maxBytes, stored.size, isPdf);
     }
     // What is stored from here on is the real size.
     const fileSizeMb = megabytesFromBytes(stored.size);

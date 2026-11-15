@@ -52,8 +52,9 @@ export const ASSESSMENT_ERROR_CODES = [
   //   too_many_documents  more documents than the request cap leaves room for
   //                       (one extraction call each, after the judgement calls);
   //   review_too_large    the review would pass a per-review cap for another
-  //                       reason (the rules alone need every request, or the
-  //                       TEXT of the requests passes the input-size cap).
+  //                       reason (the rules alone need every request, the
+  //                       TEXT of the requests passes the input-size cap, or
+  //                       all the files together pass the attached-bytes cap).
   "too_many_documents",
   "review_too_large",
   "settings_unavailable",

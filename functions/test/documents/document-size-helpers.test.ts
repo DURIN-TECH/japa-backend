@@ -33,11 +33,11 @@ describe("megabytesFromBytes", () => {
 
 describe("FileTooLargeError", () => {
   test("the message is the plain line the app shows, naming the limit that applied", () => {
-    const pdf = new FileTooLargeError(10 * MB, 21 * MB, false);
+    const pdf = new FileTooLargeError(10 * MB, 21 * MB, true);
     assert.equal(pdf.message, "This file is larger than 10 MB. Upload a smaller copy, for example a scan at a lower resolution.");
-    assert.deepEqual([pdf.maxBytes, pdf.sizeBytes, pdf.isImage], [10 * MB, 21 * MB, false]);
+    assert.deepEqual([pdf.maxBytes, pdf.sizeBytes, pdf.isPdf], [10 * MB, 21 * MB, true]);
 
-    const image = new FileTooLargeError(MODEL_IMAGE_MAX_BYTES, 8 * MB, true);
+    const image = new FileTooLargeError(MODEL_IMAGE_MAX_BYTES, 8 * MB, false);
     assert.equal(image.message, "This file is larger than 7 MB. Upload a smaller copy, for example a scan at a lower resolution.");
   });
 });

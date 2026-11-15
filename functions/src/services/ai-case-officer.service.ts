@@ -43,7 +43,7 @@ import {
 } from "./ai/assessment-engine";
 import { extractOneDocument, sniffMediaType } from "./ai/document-extraction";
 import { costOfUsage } from "./ai/ai-pricing";
-import { fileByteLimitFor, isImageType, readAiSettings, type AiSettings, type AiSettingsRead } from "./ai/ai-settings";
+import { fileByteLimitForBytes, readAiSettings, type AiSettings, type AiSettingsRead } from "./ai/ai-settings";
 import { AnthropicLlmProvider, type LlmProvider, type LlmUsage } from "./ai/llm-provider";
 import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-safety";
 import type { AssessmentTier, StaleReason } from "./ai/tier-serializer";
@@ -79,7 +79,8 @@ import type { IntakeResponse } from "../types/intake";
 // per-review caps have their own codes (`too_many_documents`,
 // `review_too_large`), decided from counts before the first call; only the
 // platform-wide daily limit is `daily_cap_exceeded`. An attached file is
-// bounded by its real byte length, not counted as input characters.
+// bounded by its real byte length, not counted as input characters, and all of
+// a review's files together by `maxAttachedBytesPerAssessment`.
 //
 // NOTHING ELSE SENDS. Model output is never used as a storage path, a user id,
 // an application id or a criterion that the rubric does not contain.
@@ -123,6 +124,12 @@ export interface AssessmentDeps {
   provider: LlmProvider;
   rubrics: RubricReader;
   loadBytes(storagePath: string): Promise<Buffer>;
+  // (#310) The stored object's real byte length, or null when there is no such
+  // object, WITHOUT downloading it: the total-attached-bytes brake adds these
+  // up before any model call. Optional so existing fakes keep working; without
+  // it the size is taken from `loadBytes` (fine for a fake, wasteful for real
+  // Storage, which is why the default deps read the metadata instead).
+  sizeOfFile?: (storagePath: string) => Promise<number | null>;
   runTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>;
   readSettings(): Promise<AiSettingsRead>;
   now(): Date;
@@ -306,7 +313,13 @@ async function defaultLoadAuthorityMembers(authorityId: string): Promise<Authori
 }
 
 /** The default deps: Firestore, Cloud Storage, the Anthropic provider and the settings doc. */
-function defaultDeps(): AssessmentDeps {
+/**
+ * The real dependencies: the Anthropic provider, the rubric store, Cloud
+ * Storage, Firestore and the stored settings. Exported (#310) so an emulator
+ * test can run the job over the REAL Storage reads (`loadBytes`, `sizeOfFile`)
+ * while swapping only the model provider and the rulebook.
+ */
+export function defaultDeps(): AssessmentDeps {
   return {
     provider: new AnthropicLlmProvider(),
     rubrics: {
@@ -320,6 +333,18 @@ function defaultDeps(): AssessmentDeps {
     loadBytes: async (storagePath) => {
       const [bytes] = await getStorage().bucket().file(storagePath).download();
       return bytes;
+    },
+    // One metadata request per document, no download. A missing object (404)
+    // is null; any other failure is thrown and counted as 0 by the caller.
+    sizeOfFile: async (storagePath) => {
+      try {
+        const [metadata] = await getStorage().bucket().file(storagePath).getMetadata();
+        const size = Number(metadata.size);
+        return Number.isInteger(size) && size >= 0 ? size : null;
+      } catch (error) {
+        if ((error as { code?: number }).code === 404) return null;
+        throw error;
+      }
     },
     runTransaction: (fn) => db.runTransaction(fn),
     readSettings: readAiSettings,
@@ -932,6 +957,35 @@ export class AiCaseOfficerService {
     const statementChars = loaded.statements.reduce((n, st) => n + st.text.length, 0);
     if (statementChars > settings.maxInputCharsPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
 
+    // ---- (#310) the spend brake: all the files together ----
+    // Each file is bounded on its own, and the number of files by the request
+    // cap, but 30 files of 10 MB is still 300 MB in one review. The total of
+    // the files this review would attach is therefore bounded too
+    // (`maxAttachedBytesPerAssessment`), from the REAL size of each stored
+    // object (Storage metadata, never the record's `fileSizeMb`), here: before
+    // any model call and before one of today's reviews is used. Over it is
+    // `review_too_large`, the same answer on every run for the same files.
+    //
+    // What is counted: every document whose object is no larger than
+    // `maxFileBytes`. A larger one is never sent (it is reported as "larger
+    // than the limit" below), so it costs nothing. An object whose size cannot
+    // be read counts as 0 here; if it then downloads after all, the running
+    // total in the loop below catches it.
+    if (plannedExtractionCalls > 0) {
+      const sizeOf = this.deps.sizeOfFile ?? (async (path: string) => (await this.deps.loadBytes(path)).length);
+      const sizes = await Promise.all(
+        loaded.documents.map(async (d) => {
+          try {
+            return (await sizeOf(d.path)) ?? 0;
+          } catch {
+            return 0;
+          }
+        })
+      );
+      const plannedAttachedBytes = sizes.filter((n) => n <= settings.maxFileBytes).reduce((sum, n) => sum + n, 0);
+      if (plannedAttachedBytes > settings.maxAttachedBytesPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+    }
+
     // ---- the daily cap, counted only for jobs that reach a model ----
     await this.claimDailyCap(settings);
 
@@ -942,6 +996,7 @@ export class AiCaseOfficerService {
     let extractUsage = zeroUsage();
     let requests = 0;
     let chars = 0;
+    let attachedBytes = 0;
     let extractUsed = false;
 
     for (const d of loaded.documents) {
@@ -961,14 +1016,23 @@ export class AiCaseOfficerService {
       }
       // (#310) The size check uses the REAL byte length just downloaded, never
       // the stored `fileSizeMb` (which the uploading client used to supply, so
-      // it could be anything). The limit depends on the kind of file, sniffed
-      // from the bytes: an image is also bounded by what the model accepts
-      // (ai-settings.ts, fileByteLimitFor). A file over the limit is reported
-      // for THIS document only; the job carries on with the others.
-      if (bytes.length > fileByteLimitFor(settings, isImageType(sniffMediaType(bytes)))) {
+      // it could be anything). The limit is decided from the file's own bytes
+      // by the SAME function document registration uses (ai-settings.ts,
+      // fileByteLimitForBytes: the full limit for a real PDF, the lower one the
+      // model accepts for anything else), so a file accepted at upload is never
+      // left out here for its size. Only a document registered before that
+      // check existed can still be over; it is reported for THIS document only
+      // and the job carries on with the others.
+      if (bytes.length > fileByteLimitForBytes(settings, bytes)) {
         extractions.push(unreadable(base, "file is larger than the limit"));
         continue;
       }
+      // Backstop for the total-bytes brake decided before the daily cap: the
+      // bytes really downloaded are added up, so a file that grew or whose
+      // size could not be read beforehand still cannot take the review past
+      // the limit.
+      attachedBytes += bytes.length;
+      if (attachedBytes > settings.maxAttachedBytesPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
       // The shared single-document extraction (document-extraction.ts, also used
       // by the per-upload check #115): sniff, guards, request, call, parse.
       // The cost caps run just before the call, through `beforeCall`.

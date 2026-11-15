@@ -15,6 +15,8 @@
 //  - an application that is too big for one review fails with its own code
 //    (`too_many_documents` / `review_too_large`) BEFORE any model call, and
 //    never with the daily-cap code;
+//  - all of a review's files together are bounded (60 MB by default), from
+//    their real sizes, before any model call: the spend brake;
 //  - `daily_cap_exceeded` behaves as before;
 //  - all of it is the same with or without a stored `appConfig/aiSettings`.
 
@@ -24,15 +26,18 @@ import { store } from "../helpers/fake-firestore";
 import { AiCaseOfficerService } from "../../src/services/ai-case-officer.service";
 import {
   DEFAULT_AI_SETTINGS,
+  FILE_HEAD_BYTES,
   MODEL_IMAGE_MAX_BYTES,
-  fileByteLimitFor,
-  isImageType,
+  fileByteLimitForBytes,
   megabytesLabel,
+  smallestFileByteLimit,
+  startsLikePdf,
   mergeAiSettings,
   readAiSettings,
 } from "../../src/services/ai/ai-settings";
 import { ASSESSMENT_ERROR_CODES } from "../../src/types/assessment";
 import { planJudgementBatches } from "../../src/services/ai/assessment-engine";
+import { sniffMediaType } from "../../src/services/ai/document-extraction";
 import {
   criterion,
   fictionalRubric,
@@ -61,10 +66,12 @@ const MB = 1024 * 1024;
  * document a request carries. The rest is zero padding: only the header and
  * the length matter to the code under test.
  */
-function fileBytes(kind: "pdf" | "jpeg", key: string, size: number): Buffer {
+function fileBytes(kind: "pdf" | "jpeg" | "heic", key: string, size: number): Buffer {
   const out = Buffer.alloc(size);
   if (kind === "pdf") out.write("%PDF-1.4 ", 0, "latin1");
-  else out.set([0xff, 0xd8, 0xff, 0xe0], 0);
+  else if (kind === "jpeg") out.set([0xff, 0xd8, 0xff, 0xe0], 0);
+  // HEIC: an ISO media file, "ftypheic" after a four-byte box length.
+  else out.write("\u0000\u0000\u0000\u0018ftypheic", 0, "latin1");
   out.write(` KEY:${key} `, 10, "latin1");
   return out;
 }
@@ -171,28 +178,66 @@ describe("defaults and the per-file limit", () => {
     assert.ok(15 + judgementCalls < DEFAULT_AI_SETTINGS.maxRequestsPerAssessment);
   });
 
-  test("one file is bounded by maxFileBytes; an image also by what the model accepts", () => {
+  test("one file is bounded by maxFileBytes; anything that is not really a PDF also by what the model accepts", () => {
     const s = mergeAiSettings(undefined);
-    assert.equal(fileByteLimitFor(s, false), 10 * MB, "a PDF: maxFileBytes");
-    assert.equal(fileByteLimitFor(s, true), MODEL_IMAGE_MAX_BYTES, "an image: the model's limit, which is lower");
+    const pdf = fileBytes("pdf", "x", 64);
+    const jpeg = fileBytes("jpeg", "x", 64);
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const heic = fileBytes("heic", "x", 64);
+    const unknown = Buffer.from("hello, world");
+    assert.equal(fileByteLimitForBytes(s, pdf), 10 * MB, "a real PDF: maxFileBytes");
+    for (const notPdf of [jpeg, png, heic, unknown, Buffer.alloc(0)]) {
+      assert.equal(fileByteLimitForBytes(s, notPdf), MODEL_IMAGE_MAX_BYTES, "anything else: the model's image limit, which is lower");
+    }
+    assert.equal(smallestFileByteLimit(s), MODEL_IMAGE_MAX_BYTES);
     // The provider refuses an image over 10 MB of base64 text: the raw limit must encode to less.
     assert.ok(Math.ceil(MODEL_IMAGE_MAX_BYTES / 3) * 4 < 10_000_000);
     // A 2-4 MB phone photo is inside it.
     assert.ok(4 * MB < MODEL_IMAGE_MAX_BYTES);
-    // A stored maxFileBytes below the image limit applies to images too.
-    assert.equal(fileByteLimitFor(mergeAiSettings({ maxFileBytes: 5 * MB }), true), 5 * MB);
-    assert.equal(fileByteLimitFor(mergeAiSettings({ maxFileBytes: 20 * MB }), true), MODEL_IMAGE_MAX_BYTES);
-    assert.equal(fileByteLimitFor(mergeAiSettings({ maxFileBytes: 20 * MB }), false), 20 * MB);
+    // A stored maxFileBytes below the image limit applies to every file.
+    assert.equal(fileByteLimitForBytes(mergeAiSettings({ maxFileBytes: 5 * MB }), jpeg), 5 * MB);
+    assert.equal(smallestFileByteLimit(mergeAiSettings({ maxFileBytes: 5 * MB })), 5 * MB);
+    assert.equal(fileByteLimitForBytes(mergeAiSettings({ maxFileBytes: 20 * MB }), jpeg), MODEL_IMAGE_MAX_BYTES);
+    assert.equal(fileByteLimitForBytes(mergeAiSettings({ maxFileBytes: 20 * MB }), pdf), 20 * MB);
   });
 
-  test("image types are recognised by MIME type only", () => {
-    assert.equal(isImageType("image/jpeg"), true);
-    assert.equal(isImageType(" IMAGE/HEIC "), true);
-    assert.equal(isImageType("application/pdf"), false);
-    assert.equal(isImageType("jpeg"), false);
-    assert.equal(isImageType(undefined), false);
+  test("the limit needs only the file's first bytes, and gives the same answer for the head as for the whole file", () => {
+    const s = mergeAiSettings(undefined);
+    for (const kind of ["pdf", "jpeg", "heic"] as const) {
+      const whole = fileBytes(kind, "x", 4_096);
+      // Registration reads FILE_HEAD_BYTES from Storage; the review has the whole file.
+      assert.equal(fileByteLimitForBytes(s, whole.subarray(0, FILE_HEAD_BYTES)), fileByteLimitForBytes(s, whole), kind);
+    }
+  });
+
+  test("'starts like a PDF' is the same test the extraction's type sniff uses", () => {
+    const samples = [
+      fileBytes("pdf", "x", 64),
+      fileBytes("jpeg", "x", 64),
+      fileBytes("heic", "x", 64),
+      Buffer.from("%PDF"),
+      Buffer.from("%PD"),
+      Buffer.from(" %PDF-1.4"), // a prefix before the header: not a PDF to either
+      Buffer.from("%pdf-1.4"),
+      Buffer.alloc(0),
+    ];
+    for (const b of samples) assert.equal(startsLikePdf(b), sniffMediaType(b) === "application/pdf", JSON.stringify(b.toString("latin1")));
+  });
+
+  test("megabyte labels for the messages", () => {
     assert.equal(megabytesLabel(10 * MB), "10 MB");
     assert.equal(megabytesLabel(MODEL_IMAGE_MAX_BYTES), "7 MB");
+  });
+
+  test("the total attached-bytes limit: 60 MB by default, a stored value in range overrides it", () => {
+    assert.equal(DEFAULT_AI_SETTINGS.maxAttachedBytesPerAssessment, 60 * MB);
+    assert.equal(mergeAiSettings(undefined).maxAttachedBytesPerAssessment, 60 * MB, "no settings document: the default");
+    assert.equal(mergeAiSettings({}).maxAttachedBytesPerAssessment, 60 * MB);
+    assert.equal(mergeAiSettings({ maxAttachedBytesPerAssessment: 20 * MB }).maxAttachedBytesPerAssessment, 20 * MB);
+    assert.equal(mergeAiSettings({ maxAttachedBytesPerAssessment: 300 * MB }).maxAttachedBytesPerAssessment, 300 * MB);
+    assert.equal(mergeAiSettings({ maxAttachedBytesPerAssessment: 300 * MB + 1 }).maxAttachedBytesPerAssessment, 60 * MB, "over the range: the default");
+    assert.equal(mergeAiSettings({ maxAttachedBytesPerAssessment: 1000 }).maxAttachedBytesPerAssessment, 60 * MB, "under the range: the default");
+    assert.equal(mergeAiSettings({ maxAttachedBytesPerAssessment: "60" }).maxAttachedBytesPerAssessment, 60 * MB, "wrong type: the default");
   });
 
   test("the new codes are stored codes, and the old one is kept for old failures", () => {
@@ -267,6 +312,19 @@ describe("the file-size check reads the real bytes, not the stored fileSizeMb", 
     assert.deepEqual(keysSent(p), ["bank"]);
   });
 
+  test("a file the review cannot read is never reported as too large when it is within the shared limit", async () => {
+    seedApplicant();
+    // HEIC is accepted at upload but is not a type the review can send.
+    seedFile("heic", fileBytes("heic", "heic", 6 * MB));
+    seedFile("bank", fileBytes("pdf", "bank", 1_000));
+    const p = provider();
+    const stored = await review(serviceWith(p, {}, { loadBytes }));
+    assert.equal(stored.status, "succeeded");
+    assert.deepEqual(keysSent(p), ["bank"]);
+    // Its reason is the type, not the size (the size was fine at upload and is fine here).
+    assert.equal(JSON.stringify(stored).includes("file is larger than the limit"), false);
+  });
+
   test("a PDF of exactly the limit is sent; an image is held to the lower model limit", async () => {
     seedApplicant();
     seedFile("pdf-at-limit", fileBytes("pdf", "pdf-at-limit", 10 * MB));
@@ -331,6 +389,32 @@ describe("an application that passes a per-review cap", () => {
     assert.equal(store.has("aiCosts/2026-11-11"), false, "the daily count is untouched");
   });
 
+  test("a rulebook with no judgement rule leaves the whole cap for documents: 30 are read, 31 are refused", async () => {
+    // Route A without its two judgement rules: no judgement call is needed.
+    const base = routeARubric();
+    const noJudgement = () => rubricBook.set("AA_route-a", fictionalRubric({ countryCode: "AA", visaTypeId: "route-a", intentPolarity: "immigrant_intent_penalised", criteria: base.criteria.filter((c) => c.kind !== "judgement") }));
+    noJudgement();
+    seedApplicant();
+    seedDocs(30);
+    const p = provider();
+    const ok = await review(serviceWith(p, {}, { loadBytes }));
+    assert.equal(ok.status, "succeeded");
+    assert.equal(p.callsFor("extraction"), 30);
+    assert.equal(p.requests.length, 30);
+
+    resetAll();
+    files.clear();
+    await installAssessmentFakes();
+    noJudgement();
+    seedApplicant();
+    seedDocs(31);
+    const p2 = provider();
+    const refused = await review(serviceWith(p2, {}, { loadBytes }));
+    assert.equal(refused.error.code, "too_many_documents");
+    assert.match(refused.error.message, /\(31\).*\(30\)/);
+    assert.equal(p2.requests.length, 0);
+  });
+
   test("exactly as many documents as there is room for: succeeded, using the whole cap", async () => {
     seedApplicant();
     seedDocs(29);
@@ -378,6 +462,122 @@ describe("an application that passes a per-review cap", () => {
     seedDocs(2);
     await review(serviceWith(provider(), {}, { loadBytes }));
     assert.deepEqual(store.get("aiCosts/2026-11-11"), { assessments: 1 });
+  });
+});
+
+// ============================================
+// The spend brake: all of a review's files together
+// ============================================
+
+describe("the total attached-bytes limit", () => {
+  /** Seed `n` PDFs of `mb` megabytes each. */
+  function seedPdfs(n: number, mb: number): void {
+    for (let i = 0; i < n; i++) seedFile(`p${i}`, fileBytes("pdf", `p${i}`, mb * MB));
+  }
+  /** `sizeOfFile` over the files map, counting how often it is asked. */
+  function sizer() {
+    const asked: string[] = [];
+    return {
+      asked,
+      sizeOfFile: async (path: string) => {
+        asked.push(path);
+        return files.get(path)?.length ?? null;
+      },
+    };
+  }
+
+  test("files adding up to more than 60 MB: review_too_large, zero calls, no download, no daily slot used", async () => {
+    seedApplicant();
+    seedPdfs(7, 9); // 63 MB, each file within its own limit
+    const p = provider();
+    const s = sizer();
+    let downloads = 0;
+    const stored = await review(
+      serviceWith(p, {}, { sizeOfFile: s.sizeOfFile, loadBytes: async (path) => (downloads++, loadBytes(path)) })
+    );
+    assert.equal(stored.status, "failed");
+    assert.deepEqual(stored.error, { code: "review_too_large", message: "the application is larger than one review can read" });
+    assert.equal(p.requests.length, 0, "decided before any model call");
+    assert.equal(downloads, 0, "from the stored sizes, without downloading a file");
+    assert.equal(s.asked.length, 7);
+    assert.equal(store.has("aiCosts/2026-11-11"), false, "and before one of today's reviews is used");
+  });
+
+  test("files adding up to exactly 60 MB are reviewed", async () => {
+    seedApplicant();
+    seedPdfs(6, 10);
+    const p = provider();
+    const stored = await review(serviceWith(p, {}, { loadBytes, sizeOfFile: sizer().sizeOfFile }));
+    assert.equal(stored.status, "succeeded");
+    assert.equal(p.callsFor("extraction"), 6);
+  });
+
+  test("it is never the daily-cap code, even when today's reviews are used up", async () => {
+    seedApplicant();
+    seedPdfs(7, 9);
+    store.set("aiCosts/2026-11-11", { assessments: 200 });
+    const stored = await review(serviceWith(provider(), {}, { loadBytes, sizeOfFile: sizer().sizeOfFile }));
+    assert.equal(stored.error.code, "review_too_large");
+    assert.deepEqual(store.get("aiCosts/2026-11-11"), { assessments: 200 });
+  });
+
+  test("a file over its own limit is never sent, so it does not count toward the total", async () => {
+    seedApplicant();
+    seedPdfs(6, 10); // exactly 60 MB
+    seedFile("legacy", fileBytes("pdf", "legacy", 12 * MB)); // registered before the upload check existed
+    const p = provider();
+    const stored = await review(serviceWith(p, {}, { loadBytes, sizeOfFile: sizer().sizeOfFile }));
+    assert.equal(stored.status, "succeeded");
+    assert.equal(p.callsFor("extraction"), 6, "the six files that fit; the 12 MB one is reported, not sent");
+  });
+
+  test("a stored limit in range overrides the default; out of range is ignored", async () => {
+    seedApplicant();
+    seedPdfs(3, 9); // 27 MB
+    const lower = await review(serviceWith(provider(), { maxAttachedBytesPerAssessment: 20 * MB }, { loadBytes, sizeOfFile: sizer().sizeOfFile }));
+    assert.equal(lower.error.code, "review_too_large");
+
+    resetAll();
+    await installAssessmentFakes();
+    rubricBook.set("AA_route-a", routeARubric());
+    seedApplicant();
+    seedPdfs(3, 9);
+    const ignored = await review(serviceWith(provider(), { maxAttachedBytesPerAssessment: 5 }, { loadBytes, sizeOfFile: sizer().sizeOfFile }));
+    assert.equal(ignored.status, "succeeded");
+  });
+
+  test("without a size reader the sizes come from the bytes, with the same answer (older fakes)", async () => {
+    seedApplicant();
+    seedPdfs(7, 9);
+    const p = provider();
+    const stored = await review(serviceWith(p, {}, { loadBytes }));
+    assert.equal(stored.error.code, "review_too_large");
+    assert.equal(p.requests.length, 0);
+  });
+
+  test("backstop: sizes that could not be read beforehand are still added up from the real downloads", async () => {
+    seedApplicant();
+    seedPdfs(7, 9);
+    const p = provider();
+    // The size reader fails for every file, so the check before the daily cap sees 0 bytes.
+    const stored = await review(serviceWith(p, {}, { loadBytes, sizeOfFile: async () => { throw new Error("storage blinked"); } }));
+    assert.equal(stored.status, "failed");
+    assert.equal(stored.error.code, "review_too_large");
+    assert.equal(p.callsFor("extraction"), 6, "six files (54 MB) are sent; the seventh would pass 60 MB and is not");
+  });
+
+  test("the ordinary application (about 40 MB) is inside the limit", async () => {
+    rubricBook.set("AA_route-a", fiveBatchRubric());
+    seedApplicant();
+    const sizes: Array<["pdf" | "jpeg", number]> = [["pdf", 2.2], ["pdf", 3], ["pdf", 6], ["pdf", 9.5], ["jpeg", 2], ["jpeg", 2.5], ["jpeg", 3], ["jpeg", 3.5], ["jpeg", 4], ["jpeg", 4]];
+    sizes.forEach(([kind, mb], i) => seedFile(`f${i}`, fileBytes(kind, `f${i}`, Math.round(mb * MB))));
+    const total = sizes.reduce((n, [, mb]) => n + mb, 0);
+    assert.ok(total > 39 && total < 60, `${total} MB`);
+    const p = provider();
+    const stored = await review(serviceWith(p, {}, { loadBytes, sizeOfFile: sizer().sizeOfFile }));
+    assert.equal(stored.status, "succeeded");
+    assert.equal(p.callsFor("extraction"), 10);
+    assert.equal(p.callsFor("judgement"), 5);
   });
 });
 
