@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { visaController } from "../controllers/visa.controller";
-import { verifyAuth, verifyAdmin, optionalAuth } from "../middleware/auth";
+import { verifyAuth, verifyAdmin, optionalAuthFresh } from "../middleware/auth";
 
 // Routes mounted at /countries
 const countryRoutes = Router();
@@ -16,12 +16,19 @@ countryRoutes.get("/:code/visas", (req, res) =>
   visaController.getVisaTypes(req, res)
 );
 // Single-visa reads (issue #99): public, but a non-visible visa is 404 unless
-// the caller's ability allows reading it. `optionalAuth` attaches the ability
-// when a valid token is sent and never blocks an anonymous request.
-countryRoutes.get("/:code/visas/:visaId", optionalAuth, (req, res) =>
+// the caller's ability allows reading it. `optionalAuthFresh` attaches the
+// ability when a valid token is sent and never blocks an anonymous request.
+// Issue #289: these three reads (detail, /full, /requirements) serve hidden
+// visas to admins and the owning agency's members, so they use the STRICTER
+// optional auth: an agent-side token is checked for revocation and the
+// ability is built from the account's current claims, which turns a
+// suspended or demoted admin / agency member into a guest (or their current
+// role) at once instead of when the old token expires. Client tokens and
+// anonymous callers cost nothing extra.
+countryRoutes.get("/:code/visas/:visaId", optionalAuthFresh, (req, res) =>
   visaController.getVisaType(req, res)
 );
-countryRoutes.get("/:code/visas/:visaId/full", optionalAuth, (req, res) =>
+countryRoutes.get("/:code/visas/:visaId/full", optionalAuthFresh, (req, res) =>
   visaController.getVisaTypeWithRequirements(req, res)
 );
 countryRoutes.post("/:code/visas", verifyAuth, verifyAdmin, (req, res) =>
@@ -29,8 +36,9 @@ countryRoutes.post("/:code/visas", verifyAuth, verifyAdmin, (req, res) =>
 );
 
 // Requirements under visa types. Issue #102: gated like the detail and /full
-// routes (optionalAuth attaches the caller's ability when a token is sent).
-countryRoutes.get("/:code/visas/:visaId/requirements", optionalAuth, (req, res) =>
+// routes (optionalAuthFresh attaches the caller's ability when a token is
+// sent; strict for agent-side tokens, see the #289 note above).
+countryRoutes.get("/:code/visas/:visaId/requirements", optionalAuthFresh, (req, res) =>
   visaController.getRequirements(req, res)
 );
 countryRoutes.post(
