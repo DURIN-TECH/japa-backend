@@ -70,7 +70,7 @@ async function setPlans(...plans: Array<Record<string, any>>): Promise<void> {
   // The middleware remembers "no default plan" for a minute per instance; the
   // API runs in this process, so forget it whenever the plans change.
   const { entitlementService } = await import("../../src/services/entitlement.service");
-  entitlementService.missingDefaultPlanUntil = {};
+  entitlementService.clearDefaultPlanMemo();
 }
 
 /** Give an account role claims the way the backend does, and a token with them. */
@@ -326,6 +326,156 @@ describe("default plan with a real limit and without messaging", () => {
     assert.equal(res.status, 402, JSON.stringify(res.body));
     assert.equal(res.body.error, "UPGRADE_REQUIRED");
     assert.equal(res.body.message, `Your plan does not include "${FEATURES.MESSAGING}". Upgrade to unlock it.`);
+  });
+});
+
+// ============================================
+// The default plan is edited after clients were put on it (review round 2)
+// ============================================
+//
+// Through the real admin endpoints. The saved record has no subscription, so
+// the endpoint's own recompute does not reach it; the client's next request
+// must.
+
+describe("an admin edits the default client plan", () => {
+  /** The default plan as it stands when the clients first sign in: no limit. */
+  const OPEN_PLAN = {
+    ...LIMITED_PLAN, id: "test_client_open",
+    features: [FEATURES.APPLICATIONS_CREATE, FEATURES.DOCUMENTS_UPLOAD],
+    limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: -1 },
+  };
+  let adminToken: string;
+
+  before(async () => {
+    adminToken = await makeAdmin(await signUp("plan-admin"));
+  });
+
+  beforeEach(async () => {
+    await setPlans(OPEN_PLAN);
+  });
+
+  /** `PUT /admin/plans/:id` with the whole plan, asserting 200. */
+  async function editPlan(plan: Record<string, any>): Promise<void> {
+    const res = await api.call("PUT", `/admin/plans/${plan.id}`, adminToken, plan);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+  }
+
+  /** `POST /applications` for a made-up visa: 402 only if the plan limit refuses it. */
+  const secondApplication = (token: string) =>
+    api.call("POST", "/applications", token, { visaTypeId: "visa-other", countryCode: "IE", mode: "self", confirmNew: true });
+
+  test("limit added (unlimited, then max 1): a second application is refused, and /subscriptions/me shows it", async () => {
+    const user = await seedClient("edit-limit");
+    await seedApplication("app-edit-limit", { userId: user.uid, mode: "self", status: "draft" });
+    // Signed in before the edit: saved with the unlimited plan, not refused.
+    assert.equal((await subscriptionOf(user.idToken)).entitlements.limits[LIMITS.MAX_ACTIVE_APPLICATIONS], -1);
+    assert.notEqual((await secondApplication(user.idToken)).status, 402);
+
+    await editPlan({ ...OPEN_PLAN, limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 1 } });
+
+    // The very next request is the one that must be refused.
+    const refused = await secondApplication(user.idToken);
+    assert.equal(refused.status, 402, JSON.stringify(refused.body));
+    assert.equal(refused.body.message, "You've reached your plan's active application limit. Upgrade to start more.");
+    assert.equal((await subscriptionOf(user.idToken)).entitlements.limits[LIMITS.MAX_ACTIVE_APPLICATIONS], 1);
+    const record = await recordOf(user.uid);
+    assert.equal(record.limits[LIMITS.MAX_ACTIVE_APPLICATIONS], 1);
+    assert.equal(await stored("subscriptions", user.uid), undefined, "still no subscription record");
+
+    // Refreshed once: further requests leave the record alone.
+    const writtenAt = await recordUpdateTime(user.uid);
+    await subscriptionOf(user.idToken);
+    await authorizationOf(user.idToken);
+    assert.equal(await recordUpdateTime(user.uid), writtenAt);
+  });
+
+  test("feature added, then removed again", async () => {
+    const user = await seedClient("edit-feature");
+    assert.equal((await api.call("POST", "/conversations", user.idToken, {})).status, 402, "messaging is not in the plan");
+
+    await editPlan({ ...OPEN_PLAN, features: [...OPEN_PLAN.features, FEATURES.MESSAGING] });
+    const unlocked = await api.call("POST", "/conversations", user.idToken, {});
+    assert.equal(unlocked.status, 400, JSON.stringify(unlocked.body)); // through the gate, to validation
+    assert.equal((await authorizationOf(user.idToken)).entitlements.features.includes(FEATURES.MESSAGING), true);
+
+    await editPlan(OPEN_PLAN);
+    const locked = await api.call("POST", "/conversations", user.idToken, {});
+    assert.equal(locked.status, 402, JSON.stringify(locked.body));
+    assert.equal((await authorizationOf(user.idToken)).entitlements.features.includes(FEATURES.MESSAGING), false);
+  });
+
+  test("isDefault moves to another plan: the client moves with it", async () => {
+    const user = await seedClient("move-default");
+    assert.equal((await subscriptionOf(user.idToken)).entitlements.planId, OPEN_PLAN.id);
+
+    const next = { ...LIMITED_PLAN, id: "test_client_next", isDefault: true };
+    await editPlan({ ...OPEN_PLAN, isDefault: false });
+    const created = await api.call("POST", "/admin/plans", adminToken, next);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+
+    const sub = await subscriptionOf(user.idToken);
+    assert.equal(sub.entitlements.planId, next.id);
+    assert.equal(sub.entitlements.limits[LIMITS.MAX_ACTIVE_APPLICATIONS], 1);
+    assert.equal((await recordOf(user.uid)).planId, next.id);
+  });
+
+  test("a client with a paid record is untouched by an edit to the free plan", async () => {
+    const paid = {
+      ...LIMITED_PLAN, id: "test_client_paid_edit", isDefault: false, priceKobo: 250000, interval: "month",
+      features: [FEATURES.MESSAGING, FEATURES.AI_CASE_OFFICER], limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: -1 },
+    };
+    await put("plans", paid.id, paid);
+    const user = await seedClient("paid-untouched");
+    const { entitlementService } = await import("../../src/services/entitlement.service");
+    await entitlementService.assignPlan("client", user.uid, paid.id);
+    const before = await recordOf(user.uid);
+    const writtenAt = await recordUpdateTime(user.uid);
+
+    await editPlan({ ...OPEN_PLAN, features: [], limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 0 } });
+    const sub = await subscriptionOf(user.idToken);
+    await authorizationOf(user.idToken);
+
+    assert.equal(sub.entitlements.planId, paid.id);
+    assert.equal(sub.subscription.planId, paid.id);
+    assert.deepEqual(await recordOf(user.uid), before);
+    assert.equal(await recordUpdateTime(user.uid), writtenAt);
+  });
+
+  test("a client ASSIGNED the default plan still follows it through the edit's own recompute", async () => {
+    const user = await seedClient("assigned-default");
+    const { entitlementService } = await import("../../src/services/entitlement.service");
+    await entitlementService.assignPlan("client", user.uid, OPEN_PLAN.id);
+
+    await editPlan({ ...OPEN_PLAN, limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 2 } });
+
+    // Updated by the endpoint itself, before this client makes any request.
+    assert.equal((await recordOf(user.uid)).limits[LIMITS.MAX_ACTIVE_APPLICATIONS], 2);
+  });
+
+  test("many requests right after an edit all succeed and agree; a paid plan assigned meanwhile wins", async () => {
+    const user = await seedClient("edit-race");
+    await subscriptionOf(user.idToken);
+    await editPlan({ ...OPEN_PLAN, limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 1 } });
+
+    const results = await Promise.all(
+      Array.from({ length: 6 }, (_, i) => api.call("GET", i % 2 ? "/subscriptions/me" : "/users/me/authorization", user.idToken))
+    );
+    for (const res of results) {
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.equal(res.body.data.entitlements.limits[LIMITS.MAX_ACTIVE_APPLICATIONS], 1);
+    }
+
+    // Now race a refresh against an assignment: the assigned plan must stand.
+    const paid = { ...LIMITED_PLAN, id: "test_client_paid_race", isDefault: false, features: [FEATURES.MESSAGING] };
+    await put("plans", paid.id, paid);
+    await editPlan({ ...OPEN_PLAN, limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 4 } });
+    const { entitlementService } = await import("../../src/services/entitlement.service");
+    await Promise.all([
+      entitlementService.assignPlan("client", user.uid, paid.id),
+      ...Array.from({ length: 6 }, () => api.call("GET", "/users/me/authorization", user.idToken)),
+    ]);
+    assert.equal((await recordOf(user.uid)).planId, paid.id);
+    assert.equal((await subscriptionOf(user.idToken)).entitlements.planId, paid.id);
   });
 });
 

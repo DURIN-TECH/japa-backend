@@ -199,6 +199,8 @@ export class EntitlementController {
       const now = Timestamp.now().toDate().toISOString();
       const stored: StoredPlan = { id, ...plan, createdAt: now, updatedAt: now };
       await collections.plans.doc(id).set(stored);
+      // A new plan may be the default for its audience (#311, see updatePlan).
+      entitlementService.clearDefaultPlanMemo();
       sendSuccess(res, stored, "Plan created");
     } catch (error) {
       console.error("Error creating plan:", error);
@@ -227,6 +229,16 @@ export class EntitlementController {
       };
       await ref.set(updated, { merge: true });
 
+      // Issue #311: records saved from an audience's DEFAULT plan have no
+      // subscription, so the recompute below does not find them. They are not
+      // rewritten here (that could be every client there is, far too many for
+      // one request): each one is compared with the current default plan on
+      // its owner's next request and refreshed then
+      // (entitlementService.followDefaultPlan). Forgetting the memoized
+      // default plan makes that immediate on this instance; other instances
+      // pick the edit up when their memo expires (at most a minute).
+      entitlementService.clearDefaultPlanMemo();
+
       // Re-resolve entitlements for everyone currently on this plan so edits apply.
       const subs = await collections.subscriptions.where("planId", "==", id).get();
       await Promise.all(
@@ -252,6 +264,8 @@ export class EntitlementController {
         return;
       }
       await collections.plans.doc(id).delete();
+      // The deleted plan may have been an audience's default (#311, see updatePlan).
+      entitlementService.clearDefaultPlanMemo();
       sendSuccess(res, { id }, "Plan deleted");
     } catch (error) {
       console.error("Error deleting plan:", error);

@@ -1,5 +1,5 @@
-import { collections } from "../utils/firebase";
-import { Timestamp } from "firebase-admin/firestore";
+import { collections, db } from "../utils/firebase";
+import { Timestamp, Transaction } from "firebase-admin/firestore";
 import {
   AuthzSubject,
   Entitlements,
@@ -22,18 +22,43 @@ import {
 // ============================================
 // Lazy default plan (issue #311)
 // ============================================
+//
+// A subscriber with no `entitlements/{id}` record gets the audience's default
+// plan saved on their first request (see `resolveMissingEntitlements`). Such a
+// record has no subscription behind it, so nothing would ever recompute it:
+// it is stamped as a FOLLOWER of the default plan (`resolvedFrom`), and the
+// request path keeps it in step with whatever the default plan is NOW (see
+// `followDefaultPlan`).
 
 /**
- * How long one instance remembers that an audience has NO default plan.
+ * How long one instance reuses its answer to "what is this audience's default
+ * plan?" (the plan, or the fact that there is none).
  *
- * The lazy first-request path (`resolveMissingEntitlements`) runs for every
- * request of a subscriber with no record. In an environment where no default
- * plan is seeded nothing can ever be written, so without this memo each of
- * those requests would repeat the `plans` query for the same empty answer.
- * Short on purpose: once a default plan is seeded, every instance picks it up
- * within this window with no redeploy.
+ * The request path needs that answer for every client who follows the default
+ * plan, on every request. Reading `plans` each time would add a query to every
+ * request; with this memo it is one query per audience, per instance, per
+ * window. The price is the window itself: an edit to the default plan (or a
+ * new default) reaches a given instance at most this long after it is saved.
+ * The admin plan endpoints clear the memo on the instance that served them.
  */
-const MISSING_DEFAULT_PLAN_TTL_MS = 60_000;
+const DEFAULT_PLAN_MEMO_TTL_MS = 60_000;
+
+/** Value of `resolvedFrom` on a record saved from the audience's default plan. */
+const RESOLVED_FROM_DEFAULT_PLAN = "default_plan";
+
+/**
+ * An entitlements record as stored. `resolvedFrom` is present ONLY on a record
+ * the lazy path saved from the default plan with no subscription behind it.
+ * Every other writer (`assignPlan`, the billing webhook, a plan-edit
+ * recompute) replaces the whole document, which drops the stamp.
+ */
+type StoredEntitlements = Entitlements & { resolvedFrom?: string };
+
+/** One memo entry: the default plan (null = none) and when the answer expires. */
+interface DefaultPlanMemoEntry {
+  plan: Plan | null;
+  until: number;
+}
 
 /** gRPC status code Firestore's `create()` rejects with when the doc exists. */
 const GRPC_ALREADY_EXISTS = 6;
@@ -43,23 +68,62 @@ function isAlreadyExists(error: unknown): boolean {
   return (error as { code?: unknown } | null)?.code === GRPC_ALREADY_EXISTS;
 }
 
+/** True when the stored record is a follower of the default plan (see above). */
+function followsDefaultPlan(stored: Entitlements): boolean {
+  return (stored as StoredEntitlements).resolvedFrom === RESOLVED_FROM_DEFAULT_PLAN;
+}
+
+/**
+ * True when two entitlement sets grant exactly the same thing: same plan, same
+ * status, the same features (order ignored) and the same limits. This is what
+ * decides whether a follower record is out of date. It compares CONTENT, not a
+ * version or timestamp, so it holds however the plan was changed (admin
+ * endpoint, seed script, console) and whatever fields that writer set.
+ */
+function sameGrant(a: Entitlements, b: Entitlements): boolean {
+  if (a.planId !== b.planId || a.status !== b.status) return false;
+  const featuresA = [...new Set(a.features ?? [])].sort();
+  const featuresB = [...new Set(b.features ?? [])].sort();
+  if (featuresA.length !== featuresB.length) return false;
+  if (featuresA.some((feature, i) => feature !== featuresB[i])) return false;
+  const limitsA = (a.limits ?? {}) as Record<string, number | undefined>;
+  const limitsB = (b.limits ?? {}) as Record<string, number | undefined>;
+  const keys = new Set([...Object.keys(limitsA), ...Object.keys(limitsB)]);
+  for (const key of keys) if (limitsA[key] !== limitsB[key]) return false;
+  return true;
+}
+
 /** Options for `recomputeEntitlements`. */
 interface RecomputeOptions {
   /**
-   * Lazy mode (issue #311): only ever CREATE the cache document, never
-   * overwrite one. Used on the request path for a subscriber with no record.
-   * See `resolveMissingEntitlements` for why an overwrite would be wrong there.
+   * Request-path modes (issue #311). Both resolve the plan exactly like the
+   * normal mode; they differ in how the record is written:
+   *  - "create": only ever CREATE the document (subscriber with no record);
+   *  - "refresh": replace the document only if it is STILL a follower of the
+   *    default plan (follower whose default plan changed).
+   * Neither can overwrite a record that was assigned or bought. Use them
+   * through `resolveMissingEntitlements` / `followDefaultPlan`.
    */
-  createOnly?: boolean;
+  lazy?: "create" | "refresh";
 }
 
 class EntitlementService {
   /**
-   * Per-audience "no default plan until <epoch ms>" memo for the lazy path
-   * (see MISSING_DEFAULT_PLAN_TTL_MS). Instance state, never persisted.
-   * Public so a test can clear it between cases.
+   * Per-audience memo of the default plan for the request path (see
+   * DEFAULT_PLAN_MEMO_TTL_MS). Instance state, never persisted. Public so the
+   * admin plan endpoints and tests can clear it (`clearDefaultPlanMemo`).
    */
-  missingDefaultPlanUntil: Partial<Record<SubscriberType, number>> = {};
+  defaultPlanMemo: Partial<Record<SubscriberType, DefaultPlanMemoEntry>> = {};
+
+  /**
+   * Default-plan reads in flight, per audience, so that requests arriving
+   * together when the memo has just expired share ONE `plans` query instead
+   * of each running their own.
+   */
+  private defaultPlanReads: Partial<Record<SubscriberType, Promise<Plan | null>>> = {};
+
+  /** Transaction runner as a property so a hermetic test can swap in an in-memory one. */
+  runTransaction: <T>(fn: (tx: Transaction) => Promise<T>) => Promise<T> = (fn) => db.runTransaction(fn);
 
   /**
    * Resolve which subscriber entity a principal draws entitlements from:
@@ -123,35 +187,102 @@ class EntitlementService {
    *     "already exists" and returns the stored record instead. So concurrent
    *     first requests all succeed and leave one document, and this path can
    *     never downgrade or otherwise replace an existing record.
-   *  2. "This audience has no default plan" is remembered for a short time
-   *     (MISSING_DEFAULT_PLAN_TTL_MS), so an environment with no default plan
-   *     does not re-run the `plans` query on every request.
+   *  2. The default plan comes from the short memo (DEFAULT_PLAN_MEMO_TTL_MS),
+   *     and when the memo says the audience has NO default plan the call
+   *     returns before reading anything. An environment with no default plan
+   *     therefore pays no read here at all (one `plans` query per window).
    *
-   * Returns null, and writes nothing, when no plan can be resolved (no
-   * subscription plan and no default plan). Errors are NOT swallowed: the
-   * caller decides what an outage means (the middleware keeps today's
-   * behaviour, entitlements unresolved).
+   * A record saved from the default plan is stamped as a follower of it, so
+   * later edits to that plan reach it (`followDefaultPlan`).
+   *
+   * Returns null, and writes nothing, when no plan can be resolved. Errors are
+   * NOT swallowed: the caller decides what an outage means (the middleware
+   * keeps today's behaviour, entitlements unresolved).
    */
   async resolveMissingEntitlements(
     subscriberType: SubscriberType,
     subscriberId: string
   ): Promise<Entitlements | null> {
-    return this.recomputeEntitlements(subscriberType, subscriberId, { createOnly: true });
+    // No default plan for this audience: nothing to put the subscriber on, as
+    // before #311. Checked first so this case costs no Firestore read. (A
+    // subscriber who has a subscription but no record, which only a failed
+    // earlier recompute can leave behind, stays unresolved in such an
+    // environment, exactly as before #311.)
+    if (!(await this.getDefaultPlanMemoized(subscriberType))) return null;
+    return this.recomputeEntitlements(subscriberType, subscriberId, { lazy: "create" });
   }
 
   /**
-   * `getDefaultPlan` for the lazy path, with the short negative memo. Only a
-   * MISSING plan is remembered: a plan that exists is read fresh every time
-   * (that read happens once per subscriber, since the record is then saved),
-   * and a failed read is not remembered at all (it throws).
+   * Keep a FOLLOWER record in step with the audience's default plan (issue
+   * #311, review round 2). Called by the sign-in middleware with the record it
+   * has just read; returns the entitlements the request should use.
+   *
+   * Why it exists: a plan edit recomputes the subscribers found through
+   * `subscriptions`. A record saved by the lazy path has no subscription, so
+   * without this it would stay a copy of the default plan as it was on that
+   * person's first request, for ever: a limit added later would not bind, a
+   * feature added later would stay locked, and moving `isDefault` to another
+   * plan would change nothing for them.
+   *
+   * How: the record carries `resolvedFrom: "default_plan"`. For such a record
+   * the CURRENT default plan (from the memo, so normally no read) is flattened
+   * and compared with what is stored. Same grant: return the stored record,
+   * nothing else happens. Different (limits or features edited, or another
+   * plan is now the default): re-resolve and save, once; the next request
+   * compares equal again.
+   *
+   * What it never does:
+   *  - touch a record without the stamp. An assigned or bought plan follows
+   *    its own plan through `subscriptions`, exactly as before;
+   *  - replace a record that stopped being a follower in the meantime (the
+   *    write is a transaction that re-checks the stamp, see
+   *    `recomputeEntitlements` "refresh");
+   *  - remove a record. If the audience has NO default plan any more, the
+   *    stored record is kept as it is: dropping it would un-gate the client.
+   *
+   * Errors are not swallowed; the middleware falls back to the stored record.
    */
-  private async getDefaultPlanForLazyPath(audience: SubscriberType): Promise<Plan | null> {
-    const until = this.missingDefaultPlanUntil[audience];
-    if (until !== undefined && Date.now() < until) return null;
-    const plan = await this.getDefaultPlan(audience);
-    if (plan) delete this.missingDefaultPlanUntil[audience];
-    else this.missingDefaultPlanUntil[audience] = Date.now() + MISSING_DEFAULT_PLAN_TTL_MS;
-    return plan;
+  async followDefaultPlan(
+    subscriberType: SubscriberType,
+    subscriberId: string,
+    stored: Entitlements
+  ): Promise<Entitlements> {
+    if (!followsDefaultPlan(stored)) return stored;
+    const plan = await this.getDefaultPlanMemoized(subscriberType);
+    if (!plan) return stored;
+    const current = entitlementsFromPlan(plan, subscriberType, subscriberId, "active");
+    if (sameGrant(stored, current)) return stored;
+    const refreshed = await this.recomputeEntitlements(subscriberType, subscriberId, { lazy: "refresh" });
+    return refreshed ?? stored;
+  }
+
+  /** Forget the memoized default plans (after a plan was created, edited or deleted). */
+  clearDefaultPlanMemo(): void {
+    this.defaultPlanMemo = {};
+  }
+
+  /**
+   * `getDefaultPlan` through the short per-instance memo. Both answers are
+   * remembered (a plan, or "none"); a failed read is not (it throws, and the
+   * next call tries again). Concurrent callers share one read.
+   */
+  private async getDefaultPlanMemoized(audience: SubscriberType): Promise<Plan | null> {
+    const memo = this.defaultPlanMemo[audience];
+    if (memo && Date.now() < memo.until) return memo.plan;
+
+    const inFlight = this.defaultPlanReads[audience];
+    if (inFlight) return inFlight;
+
+    const read = this.getDefaultPlan(audience)
+      .then((plan) => {
+        this.defaultPlanMemo[audience] = { plan, until: Date.now() + DEFAULT_PLAN_MEMO_TTL_MS };
+        return plan;
+      })
+      .finally(() => {
+        delete this.defaultPlanReads[audience];
+      });
+    this.defaultPlanReads[audience] = read;
+    return read;
   }
 
   async getPlan(planId: string): Promise<Plan | null> {
@@ -180,10 +311,10 @@ class EntitlementService {
    * Call this whenever a subscription changes (manual assignment or, later, a
    * billing webhook).
    *
-   * `options.createOnly` (issue #311) is the lazy request-path mode: the same
-   * plan resolution, but the cache document is only created, never replaced,
-   * and when it turns out to exist already the STORED record is returned. Use
-   * it through `resolveMissingEntitlements`, which explains why.
+   * `options.lazy` (issue #311) selects a request-path mode: the same plan
+   * resolution, but a write that cannot replace an assigned or bought record.
+   * See `resolveMissingEntitlements` ("create") and `followDefaultPlan`
+   * ("refresh"), which are the only callers that pass it.
    */
   async recomputeEntitlements(
     subscriberType: SubscriberType,
@@ -193,18 +324,23 @@ class EntitlementService {
     const subscription = await this.getActiveSubscription(subscriberId);
     let plan: Plan | null = null;
     let status: SubscriptionStatus = "active";
+    // True when the plan below is the audience default, i.e. the subscriber
+    // has no (resolvable) plan of their own.
+    let fromDefaultPlan = false;
 
     if (subscription) {
       plan = await this.getPlan(subscription.planId);
       status = subscription.status;
     }
     if (!plan) {
-      // Lazy mode remembers a missing default plan briefly (hot path); the
-      // normal mode always reads it fresh.
-      plan = options.createOnly
-        ? await this.getDefaultPlanForLazyPath(subscriberType)
+      // The request-path modes use the memoized default plan (hot path, and
+      // the same answer `followDefaultPlan` compared against); the normal
+      // mode always reads it fresh.
+      plan = options.lazy
+        ? await this.getDefaultPlanMemoized(subscriberType)
         : await this.getDefaultPlan(subscriberType);
       status = "active"; // default free plan is always active
+      fromDefaultPlan = true;
     }
     if (!plan) return null; // no plans seeded yet
 
@@ -221,19 +357,50 @@ class EntitlementService {
     const ref = collections.entitlements.doc(subscriberId);
     const record = { ...entitlements, updatedAt: Timestamp.now() };
 
-    if (options.createOnly) {
-      // Lazy mode (#311): create, never overwrite. Losing the race is not an
-      // error: someone else (a parallel first request, or a plan change) has
-      // just written the record, and theirs is the one to use.
-      try {
-        await ref.create(record);
-      } catch (error) {
-        if (!isAlreadyExists(error)) throw error;
-        // Fall back to what we computed only if the record vanished again
-        // between the failed create and this read (not expected).
-        return (await this.getEntitlements(subscriberId)) ?? entitlements;
+    if (options.lazy) {
+      // Request-path write (#311). Stamp the record as a follower of the
+      // default plan ONLY when that is where it came from and no subscription
+      // exists: a subscriber with a subscription is recomputed through it.
+      const lazyRecord: StoredEntitlements & { updatedAt: Timestamp } =
+        fromDefaultPlan && !subscription
+          ? { ...record, resolvedFrom: RESOLVED_FROM_DEFAULT_PLAN }
+          : record;
+
+      if (options.lazy === "create") {
+        // Create, never overwrite. Losing the race is not an error: someone
+        // else (a parallel first request, or a plan change) has just written
+        // the record, and theirs is the one to use.
+        try {
+          await ref.create(lazyRecord);
+        } catch (error) {
+          if (!isAlreadyExists(error)) throw error;
+          // Fall back to what we computed only if the record vanished again
+          // between the failed create and this read (not expected).
+          return (await this.getEntitlements(subscriberId)) ?? entitlements;
+        }
+        return lazyRecord;
       }
-      return entitlements;
+
+      // "refresh": replace the record only if it is STILL a follower of the
+      // default plan. Read and write are one transaction, so a plan change
+      // (assignment, billing webhook) that lands in between makes Firestore
+      // re-run this, the stamp is then gone, and that record is returned
+      // untouched. If it lands after, its own `set()` replaces ours. Either
+      // way the assigned or bought record wins; the free plan is never put
+      // back over it. Parallel refreshes of one record just write the same
+      // content one after the other.
+      return this.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists) {
+          // The record was removed meanwhile: start again as a new one.
+          tx.create(ref, lazyRecord);
+          return lazyRecord;
+        }
+        const current = snap.data() as Entitlements;
+        if (!followsDefaultPlan(current)) return current;
+        tx.set(ref, lazyRecord);
+        return lazyRecord;
+      });
     }
 
     await ref.set(record);

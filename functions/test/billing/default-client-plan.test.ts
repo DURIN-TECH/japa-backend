@@ -30,7 +30,7 @@ import assert from "node:assert/strict";
 import { FEATURES, LIMITS, ROLES } from "@durin-tech/authz";
 import type { Entitlements } from "@durin-tech/authz";
 
-import { fakeCollection, resetStore, store, writes } from "../helpers/fake-firestore";
+import { fakeCollection, fakeRunTransaction, resetStore, store, writes } from "../helpers/fake-firestore";
 import type { AuthenticatedRequest } from "../../src/middleware/auth";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -134,8 +134,10 @@ beforeEach(() => {
   firebase.collections.entitlements = fakeCollection("entitlements");
   firebase.collections.subscriptions = fakeCollection("subscriptions");
   firebase.collections.plans = fakeCollection("plans");
-  // The "no default plan" memo is per instance: start every test without it.
-  entitlementService.missingDefaultPlanUntil = {};
+  // The default-plan memo is per instance: start every test without it.
+  entitlementService.clearDefaultPlanMemo();
+  // The follower refresh writes in a transaction: run it in memory.
+  entitlementService.runTransaction = fakeRunTransaction;
   // eslint-disable-next-line @typescript-eslint/no-empty-function
   console.error = () => {};
 });
@@ -215,6 +217,9 @@ describe("client with no entitlements record", () => {
     assert.equal(req.entitlements?.subscriberType, "client");
     assert.equal(req.entitlements?.subscriberId, "uid-client");
     assert.deepEqual(req.entitlements?.features, FREE_PLAN.features);
+    // The saved record is stamped as a follower of the default plan, so later
+    // edits to that plan reach it (see "the default plan changes" below).
+    assert.equal(store.get("entitlements/uid-client")?.resolvedFrom, "default_plan");
     // One write, to the client's own record, and no subscription record.
     assert.equal(entitlementWrites().length, 1);
     assert.equal(entitlementWrites()[0].path, "entitlements/uid-client");
@@ -378,7 +383,7 @@ describe("failures leave entitlements unresolved", () => {
     assert.ok(req.ability, "the role-only ability is still built");
     assert.equal(writes.length, 0);
     // A failure is not remembered as "no default plan".
-    assert.deepEqual(entitlementService.missingDefaultPlanUntil, {});
+    assert.deepEqual(entitlementService.defaultPlanMemo, {});
   });
 
   test("the write throws: null for this request (retried on the next one)", async () => {
@@ -428,10 +433,10 @@ describe("failures leave entitlements unresolved", () => {
 
     // Once the memo has run out, a default plan seeded meanwhile is picked up.
     seedPlans(FREE_PLAN);
-    entitlementService.missingDefaultPlanUntil = { client: Date.now() - 1 };
+    entitlementService.defaultPlanMemo = { client: { plan: null, until: Date.now() - 1 } };
     const req = await signIn("tok-client");
     assert.equal(req.entitlements?.planId, FREE_PLAN.id);
-    assert.deepEqual(entitlementService.missingDefaultPlanUntil, {});
+    assert.equal(entitlementService.defaultPlanMemo.client.plan.id, FREE_PLAN.id);
   });
 
   test("with entitlements unresolved the gates behave as before (ungated; AI tier free)", async () => {
@@ -609,6 +614,287 @@ describe("admins, owners and agents are not given a default plan", () => {
 });
 
 // ============================================
+// The default plan changes after the record was saved (review round 2)
+// ============================================
+//
+// A lazily saved record has no subscription, so a plan edit's recompute (which
+// goes through `subscriptions`) never finds it. It must still follow the
+// default client plan: an edit to that plan, or another plan becoming the
+// default, reaches it on the client's next request.
+
+describe("a saved default-plan record follows the default plan", () => {
+  /** A default client plan as it stands before the admin edits anything: no limit. */
+  const UNLIMITED = { ...FREE_PLAN, limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: -1 } };
+
+  /**
+   * Change a plan the way ANY writer would (admin endpoint, seed, console):
+   * just the document. `seenByInstance` = this instance's memo has expired or
+   * was cleared (what the admin endpoint does on the instance it runs on).
+   */
+  function editPlan(plan: Record<string, unknown>, seenByInstance = true): void {
+    store.set(`plans/${plan.id}`, { ...plan });
+    if (seenByInstance) entitlementService.clearDefaultPlanMemo();
+  }
+
+  test("limits edited: the reviewer's scenario (unlimited, then max 1) binds on the next request", async () => {
+    seedPlans(UNLIMITED);
+    const before = await signIn("tok-client");
+    assert.equal(checkWithinLimit(before, LIMITS.MAX_ACTIVE_APPLICATIONS, 5), true);
+
+    editPlan({ ...UNLIMITED, limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 1 } });
+    const after = await signIn("tok-client");
+
+    assert.equal(checkWithinLimit(after, LIMITS.MAX_ACTIVE_APPLICATIONS, 1), false, "a second application is refused");
+    assert.equal((store.get("entitlements/uid-client")?.limits as any)[LIMITS.MAX_ACTIVE_APPLICATIONS], 1);
+    assert.equal(store.get("entitlements/uid-client")?.resolvedFrom, "default_plan", "still a follower");
+    assert.equal(store.has("subscriptions/uid-client"), false);
+    // Refreshed once: the next request compares equal and writes nothing.
+    assert.equal(entitlementWrites().length, 2);
+    await signIn("tok-client");
+    await signIn("tok-client", "POST");
+    assert.equal(entitlementWrites().length, 2);
+  });
+
+  test("a feature added to the plan unlocks it; a feature removed locks it", async () => {
+    seedPlans(FREE_PLAN);
+    const before = await signIn("tok-client");
+    assert.equal(gate(before, FEATURES.MESSAGING), 402);
+    assert.equal(gate(before, FEATURES.DOCUMENTS_UPLOAD), "next");
+
+    editPlan({ ...FREE_PLAN, features: [FEATURES.APPLICATIONS_CREATE, FEATURES.MESSAGING] });
+    const after = await signIn("tok-client");
+
+    assert.equal(gate(after, FEATURES.MESSAGING), "next", "added feature");
+    assert.equal(gate(after, FEATURES.DOCUMENTS_UPLOAD), 402, "removed feature");
+    assert.equal(gate(after, FEATURES.APPLICATIONS_CREATE), "next", "kept feature");
+  });
+
+  test("isDefault moves to another plan: the client moves with it", async () => {
+    seedPlans(FREE_PLAN);
+    assert.equal((await signIn("tok-client")).entitlements?.planId, FREE_PLAN.id);
+
+    const NEW_DEFAULT = {
+      ...FREE_PLAN, id: "test_client_free_v2", features: [FEATURES.MESSAGING],
+      limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 3 },
+    };
+    editPlan({ ...FREE_PLAN, isDefault: false });
+    editPlan(NEW_DEFAULT);
+    const after = await signIn("tok-client");
+
+    assert.equal(after.entitlements?.planId, NEW_DEFAULT.id);
+    assert.equal(gate(after, FEATURES.MESSAGING), "next");
+    assert.equal(gate(after, FEATURES.APPLICATIONS_CREATE), 402);
+    assert.equal(store.get("entitlements/uid-client")?.planId, NEW_DEFAULT.id);
+    assert.equal(store.get("entitlements/uid-client")?.resolvedFrom, "default_plan");
+  });
+
+  test("the edit is seen when the instance's memo runs out, with no plans query before that", async () => {
+    seedPlans(UNLIMITED);
+    await signIn("tok-client");
+    let planQueries = 0;
+    const plans = fakeCollection("plans");
+    firebase.collections.plans = {
+      doc: (id: string) => plans.doc(id),
+      where: (...args: [string, string, unknown]) => {
+        planQueries++;
+        return plans.where(...args);
+      },
+    };
+
+    // Edited by another instance / the seed: this instance's memo is still warm.
+    editPlan({ ...UNLIMITED, limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 1 } }, false);
+    const stale = await signIn("tok-client");
+    await signIn("tok-client");
+    assert.equal(checkWithinLimit(stale, LIMITS.MAX_ACTIVE_APPLICATIONS, 1), true, "old plan until the memo expires");
+    assert.equal(planQueries, 0, "a request with a warm memo reads no plan");
+
+    // The memo expires (at most DEFAULT_PLAN_MEMO_TTL_MS after it was filled).
+    entitlementService.defaultPlanMemo.client.until = Date.now() - 1;
+    const fresh = await signIn("tok-client");
+    await signIn("tok-client");
+    assert.equal(checkWithinLimit(fresh, LIMITS.MAX_ACTIVE_APPLICATIONS, 1), false);
+    assert.equal(planQueries, 1, "one plans query per memo window, not per request");
+  });
+
+  test("requests arriving together on an expired memo share one plans query", async () => {
+    seedPlans(FREE_PLAN);
+    await signIn("tok-client");
+    let planQueries = 0;
+    const plans = fakeCollection("plans");
+    firebase.collections.plans = {
+      doc: (id: string) => plans.doc(id),
+      where: (...args: [string, string, unknown]) => {
+        planQueries++;
+        return plans.where(...args);
+      },
+    };
+    entitlementService.clearDefaultPlanMemo();
+
+    await Promise.all([signIn("tok-client"), signIn("tok-client"), signIn("tok-client")]);
+
+    assert.equal(planQueries, 1);
+  });
+
+  test("a paid record is untouched by an edit to the free plan (no plan read, no write)", async () => {
+    seedPlans(FREE_PLAN, PAID_PLAN);
+    await entitlementService.assignPlan("client", "uid-client", PAID_PLAN.id);
+    const paidRecord = { ...store.get("entitlements/uid-client") };
+    const writesBefore = entitlementWrites().length;
+    editPlan({ ...FREE_PLAN, features: [], limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 0 } });
+    // An assigned record must not even look at the default plan.
+    const failing = () => {
+      throw new Error("an assigned record follows its own plan, not the default");
+    };
+    firebase.collections.plans = { doc: failing, where: failing };
+
+    const req = await signIn("tok-client");
+
+    assert.equal(req.entitlements?.planId, PAID_PLAN.id);
+    assert.equal(tierFor(req.authz?.role, req.entitlements), "full");
+    assert.deepEqual(store.get("entitlements/uid-client"), paidRecord);
+    assert.equal(entitlementWrites().length, writesBefore);
+  });
+
+  test("a client ASSIGNED the default plan (has a subscription) is not a follower: untouched here", async () => {
+    // Test user E on dev. Their record changes through the plan edit's own
+    // recompute over `subscriptions`, exactly as before this issue.
+    seedPlans(FREE_PLAN);
+    await entitlementService.assignPlan("client", "uid-client", FREE_PLAN.id);
+    assert.equal(store.get("entitlements/uid-client")?.resolvedFrom, undefined);
+    const writesBefore = entitlementWrites().length;
+    editPlan({ ...FREE_PLAN, features: [FEATURES.MESSAGING] });
+
+    const req = await signIn("tok-client");
+
+    assert.deepEqual(req.entitlements?.features, FREE_PLAN.features, "not refreshed by the request path");
+    assert.equal(entitlementWrites().length, writesBefore);
+  });
+
+  test("a follower who then gets a plan assigned stops following the default", async () => {
+    seedPlans(FREE_PLAN, PAID_PLAN);
+    await signIn("tok-client");
+    await entitlementService.assignPlan("client", "uid-client", PAID_PLAN.id);
+    assert.equal(store.get("entitlements/uid-client")?.resolvedFrom, undefined, "assignment replaces the whole record");
+
+    editPlan({ ...FREE_PLAN, features: [] });
+    const req = await signIn("tok-client");
+
+    assert.equal(req.entitlements?.planId, PAID_PLAN.id);
+  });
+
+  test("a stamped record that has a subscription after all resolves to the subscription's plan and loses the stamp", async () => {
+    // The subscription seed script merges into an existing record, which keeps
+    // the stamp. The refresh resolves through the subscription first, so the
+    // subscriber still ends up on their own plan.
+    seedPlans(FREE_PLAN, PAID_PLAN);
+    await signIn("tok-client");
+    store.set("subscriptions/uid-client", {
+      id: "uid-client", subscriberType: "client", subscriberId: "uid-client",
+      planId: PAID_PLAN.id, status: "active",
+    });
+    store.set("entitlements/uid-client", {
+      ...store.get("entitlements/uid-client"), planId: PAID_PLAN.id,
+      features: PAID_PLAN.features, limits: PAID_PLAN.limits,
+    });
+
+    const req = await signIn("tok-client");
+
+    assert.equal(req.entitlements?.planId, PAID_PLAN.id);
+    assert.equal(store.get("entitlements/uid-client")?.planId, PAID_PLAN.id);
+    assert.equal(store.get("entitlements/uid-client")?.resolvedFrom, undefined);
+  });
+
+  test("a paid record written while the refresh is under way is kept (the write re-checks the stamp)", async () => {
+    seedPlans(UNLIMITED, PAID_PLAN);
+    await signIn("tok-client");
+    editPlan({ ...UNLIMITED, limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 1 } });
+    // The refresh reads "no subscription"; before its transaction, a plan
+    // change (assignment / billing webhook) replaces the record.
+    const subscriptions = fakeCollection("subscriptions");
+    firebase.collections.subscriptions = {
+      doc: (id: string) => {
+        const ref = subscriptions.doc(id);
+        return {
+          ...ref,
+          get: async () => {
+            const snap = await ref.get();
+            store.set("entitlements/uid-client", {
+              subscriberType: "client", subscriberId: "uid-client", planId: PAID_PLAN.id,
+              status: "active", features: PAID_PLAN.features, limits: PAID_PLAN.limits,
+            });
+            return snap;
+          },
+        };
+      },
+    };
+
+    const req = await signIn("tok-client");
+
+    assert.equal(store.get("entitlements/uid-client")?.planId, PAID_PLAN.id, "the paid record is not overwritten");
+    assert.equal(req.entitlements?.planId, PAID_PLAN.id);
+  });
+
+  test("the default plan is removed altogether: the saved record is kept, nothing is un-gated", async () => {
+    seedPlans(FREE_PLAN);
+    await signIn("tok-client");
+    editPlan({ ...FREE_PLAN, isDefault: false });
+
+    const req = await signIn("tok-client");
+
+    assert.equal(req.entitlements?.planId, FREE_PLAN.id);
+    assert.equal(gate(req, FEATURES.MESSAGING), 402);
+    assert.equal(entitlementWrites().length, 1);
+  });
+
+  test("the plan read fails: the stored record is used as it is", async () => {
+    seedPlans(FREE_PLAN);
+    await signIn("tok-client");
+    entitlementService.clearDefaultPlanMemo();
+    firebase.collections.plans = {
+      where: () => {
+        throw new Error("firestore unavailable");
+      },
+    };
+
+    const req = await signIn("tok-client");
+
+    assert.equal(req.entitlements?.planId, FREE_PLAN.id);
+    assert.equal(gate(req, FEATURES.MESSAGING), 402);
+    assert.equal(entitlementWrites().length, 1);
+  });
+
+  test("the refresh write fails: the stored record is used, and the next request tries again", async () => {
+    seedPlans(UNLIMITED);
+    await signIn("tok-client");
+    editPlan({ ...UNLIMITED, limits: { [LIMITS.MAX_ACTIVE_APPLICATIONS]: 1 } });
+    entitlementService.runTransaction = async () => {
+      throw new Error("firestore unavailable");
+    };
+
+    const failed = await signIn("tok-client");
+    assert.equal(checkWithinLimit(failed, LIMITS.MAX_ACTIVE_APPLICATIONS, 1), true, "still the stored (old) record");
+
+    entitlementService.runTransaction = fakeRunTransaction;
+    const retried = await signIn("tok-client");
+    assert.equal(checkWithinLimit(retried, LIMITS.MAX_ACTIVE_APPLICATIONS, 1), false);
+  });
+
+  test("the leftover record under an independent agent is still ignored, and never refreshed", async () => {
+    seedPlans(FREE_PLAN);
+    TOKENS["tok-solo-as-client"] = { ...TOKENS["tok-solo-agent"], role: ROLES.CLIENT };
+    await signIn("tok-solo-as-client");
+    editPlan({ ...FREE_PLAN, features: [] });
+
+    const req = await signIn("tok-solo-agent");
+
+    assert.equal(req.entitlements, null);
+    assert.equal(gate(req, FEATURES.PAYMENTS_REQUEST), "next");
+    assert.equal(entitlementWrites().length, 1, "the agent's request does not rewrite the client record");
+    assert.deepEqual(store.get("entitlements/uid-solo")?.features, FREE_PLAN.features);
+  });
+});
+
+// ============================================
 // Concurrency
 // ============================================
 
@@ -632,16 +918,22 @@ describe("two first requests at once", () => {
     // assignment / billing webhook) saves the paid record. A plain set() would
     // put the free plan back over it.
     seedPlans(FREE_PLAN, PAID_PLAN);
-    const plans = fakeCollection("plans");
-    firebase.collections.plans = {
-      doc: (id: string) => plans.doc(id),
-      where: (...args: [string, string, unknown]) => {
-        // Lands after the lazy path's subscription read, before its write.
-        store.set("entitlements/uid-client", {
-          subscriberType: "client", subscriberId: "uid-client", planId: PAID_PLAN.id,
-          status: "active", features: PAID_PLAN.features, limits: PAID_PLAN.limits,
-        });
-        return plans.where(...args);
+    const subscriptions = fakeCollection("subscriptions");
+    firebase.collections.subscriptions = {
+      doc: (id: string) => {
+        const ref = subscriptions.doc(id);
+        return {
+          ...ref,
+          get: async () => {
+            const snap = await ref.get(); // "no subscription", as read by the lazy path
+            // Lands after that read and before the lazy path's write.
+            store.set("entitlements/uid-client", {
+              subscriberType: "client", subscriberId: "uid-client", planId: PAID_PLAN.id,
+              status: "active", features: PAID_PLAN.features, limits: PAID_PLAN.limits,
+            });
+            return snap;
+          },
+        };
       },
     };
 

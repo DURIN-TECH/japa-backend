@@ -53,9 +53,12 @@ export interface AuthenticatedRequest extends Request {
  * Any subscription document = somebody's decision = honour the record, as
  * before #311.
  *
- * Cost: the common cases return before any read (not an agent subscriber, or
- * the record is the agent's own). Only an independent agent who still carries
- * a client-type record pays one extra read per request.
+ * Cost: most callers return before any read (not an agent subscriber, or the
+ * record is the agent's own). An independent agent who still carries a
+ * client-type record pays one extra read on EVERY request. That is not a rare
+ * case going forward: every new account gets the lazy client record on its
+ * first request, so every future independent agent pays this read until they
+ * have a record of their own (agents with no record: issue #315).
  *
  * If the subscription read fails we cannot tell which kind it is. The record
  * is then honoured: that is what happened to every such record before #311,
@@ -115,7 +118,9 @@ async function attachAuthz(req: AuthenticatedRequest): Promise<void> {
     //
     // Hot path: ONE read of the stored `entitlements/{subscriberId}` record.
     // Whoever has a record (free or paid) is served from it and nothing is
-    // written. Admins have no subscriber and are never gated.
+    // written, except a client whose saved default plan has changed since
+    // (rewritten once, see below). Admins have no subscriber and are never
+    // gated.
     //
     // `null` entitlements mean "no plan resolved": `requireFeature` and
     // `checkWithinLimit` then let the request through (RBAC only). That is
@@ -139,6 +144,27 @@ async function attachAuthz(req: AuthenticatedRequest): Promise<void> {
           // The lazy client default left under an independent agent's uid
           // (see isLeftoverLazyClientRecord): treated as "no record", which
           // for an agent means ungated, as before #311.
+        } else if (stored && role === ROLES.CLIENT) {
+          // A client's record. If it is one this middleware saved from the
+          // default client plan (no subscription behind it), keep it in step
+          // with that plan as it is NOW: a later edit to the plan, or another
+          // plan becoming the default, would otherwise never reach it (#311,
+          // see entitlementService.followDefaultPlan). Normally this costs no
+          // read (the default plan is memoized) and returns `stored` as is.
+          // An assigned or bought record is returned untouched.
+          //
+          // Fail-safe: if the check or the refresh fails, the stored record is
+          // used as it is. That is the plan the client was last resolved to,
+          // so no gate is dropped and nothing new is granted.
+          entitlements = await entitlementService
+            .followDefaultPlan(subscriber.type, subscriber.id, stored)
+            .catch((error) => {
+              console.error(
+                "attachAuthz: could not check the stored record against the default client plan; using it as stored:",
+                error
+              );
+              return stored;
+            });
         } else if (stored) {
           entitlements = stored;
         } else if (!lookupFailed && role === ROLES.CLIENT) {
@@ -258,7 +284,7 @@ export async function verifyAuth(
     if (
       isWrite &&
       !isAccountSecurityWrite &&
-      req.authz?.role !== "admin" &&
+      req.authz?.role !== ROLES.ADMIN &&
       isReadOnly(req.entitlements)
     ) {
       res.status(402).json({
