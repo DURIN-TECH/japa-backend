@@ -84,8 +84,12 @@ export interface UpdateApplicationInput {
  * Statuses that end an application (#253). Same set the plan-limit count
  * treats as "not active" (application.controller `countActiveApplications`).
  * A finished or abandoned application never counts as a duplicate.
+ *
+ * Exported for the applicant's withdraw guard (#259, application.controller
+ * `updateStatus`): these are the "closed" statuses an applicant can no longer
+ * withdraw from. One list, so "closed" cannot mean two things.
  */
-const TERMINAL_STATUSES: ApplicationStatus[] = [
+export const TERMINAL_STATUSES: ApplicationStatus[] = [
   "approved",
   "rejected",
   "withdrawn",
