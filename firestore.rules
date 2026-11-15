@@ -422,10 +422,23 @@ service cloud.firestore {
     // =====================================    // CONSULTATIONS COLLECTION
     // =====================================    
     match /consultations/{consultationId} {
-      // Users can read their own consultations
-      // Agents can read their consultations
-      allow read: if isOwner(resource.data.userId) ||
-                    (isAgent() && 
+      // The booking's CLIENT cannot read it directly (issue #332). A
+      // consultation document holds Seli's exchange-rate markup
+      // (fxMarginBps) and the raw rate it is added to (fxRate, fxRateAsOf,
+      // fxRateSource), on the booking itself and again on every entry of
+      // supersededCheckouts. Firestore rules allow or deny a whole document,
+      // never single fields, so "the client may read their own booking"
+      // meant "the client may read the markup", bypassing the API. Neither
+      // the app nor the portal reads this collection through the client
+      // SDK: clients go through GET /consultations, which answers them with
+      // an allow-listed view (toClientConsultation: the amount charged, the
+      // dollar price and the effective rate only).
+      //
+      // The agent side is unchanged: the booking's agent (agent claim + the
+      // agents doc's userId) and an admin may still read it; they see these
+      // fields through the API as well. Pinned by
+      // test/emulator/consultation-rules.emu.ts.
+      allow read: if (isAgent() && 
                      exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
                      get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
                     isAdmin();
