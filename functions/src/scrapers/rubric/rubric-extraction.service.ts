@@ -1652,6 +1652,77 @@ export interface LoadedSource {
 // when the rule was one item of a definition and came back as the definition's lead-in.
 export type RedraftOutcome = { kind: "replacement"; criterion: AssessmentCriterion; sameLine?: boolean } | { kind: "cannot_be_repaired" } | { kind: "invalid"; detail: string };
 
+// ============================================
+// (#335) THE COMPETENCE STEPS OF ONE RULE
+// ============================================
+//
+// The one-rule fix of a published shared rulebook (scripts/redraft-competence-rule.ts)
+// needs call 2 ("intake") for ONE rule only, without re-drafting the rulebook:
+// the questions and the competence steps that rest on that rule. It is the
+// production call 2, byte for byte: the same system prompt, the same user
+// message builder (`buildIntakeRequest`), the same validation of the answer
+// (`assessChunkOutput`) and the same merge (`mergeAssessments`, which builds the
+// block, copies each step's source from the rule and keeps the block only when
+// EVERY step passes `competenceProblems`). The only difference is the excerpt:
+// the rule's own passage window (the window the re-draft is shown), not a whole
+// chunk, so one request is enough.
+
+/** What the one-rule competence call returned, once validated in code. */
+export type CompetenceDraftOutcome =
+  // A block that passed every code check, with the questions it reads (merged, ids stable).
+  | { kind: "steps"; competence: CompetenceBlock; intakeQuestions: IntakeQuestion[]; flags: RubricFlag[] }
+  // The model proposed no step (the excerpt states no competence rule, as it read it).
+  | { kind: "none"; flags: RubricFlag[] }
+  // Steps were proposed and code refused the block (`competence_dropped`), or the answer was unusable.
+  | { kind: "invalid"; detail: string; flags: RubricFlag[] };
+
+/**
+ * The excerpt and request of the one-rule competence call (pure: builds, never sends).
+ * The dry run uses it to show what would be sent; the live call sends exactly this.
+ *
+ * @param rule   the rule the steps rest on (its validated quote and list lines)
+ * @param index  the rule's stored snapshot, prepared
+ * @param known  questions the rulebook already asks (so the model may reuse an id)
+ */
+export function competenceStepsRequest(
+  rule: AssessmentCriterion,
+  index: SnapshotQuoteIndex,
+  routeName: string,
+  limits: { maxOutputTokens: number; timeoutMs: number },
+  known: readonly KnownQuestionView[]
+): { request: LlmRequest; chunk: SourceChunk } | { notFound: string } {
+  const found = index.locate(rule.source.quote);
+  if (!found.ok) return { notFound: found.reason };
+  // The same bounded window of verbatim lines a re-draft of this rule is shown.
+  const window = index.passageWindow(found, REPAIR_WINDOW_LINES_BEFORE, REPAIR_WINDOW_LINES_AFTER, REPAIR_WINDOW_CHARS);
+  const chunk: SourceChunk = {
+    sourceId: rule.source.sourceId,
+    contentHash: rule.source.contentHash,
+    docType: index.snapshot.docType,
+    chunkIndex: 0,
+    chunkCount: 1,
+    ...(window.page !== undefined ? { pageStart: window.page, pageEnd: window.page } : {}),
+    text: window.page !== undefined ? `${pageMarker(window.page)}\n${window.text}` : window.text,
+  };
+  // The ONE accepted rule, shown as call 2 shows every accepted rule (list lines included, #335).
+  const accepted = acceptedViewOf({ criteria: [acceptedOf(rule)] } as Pick<ChunkAssessment, "criteria"> as ChunkAssessment);
+  const route: RubricRouteContext = { routeName, sourceRole: "unspecified" };
+  return { request: buildIntakeRequest(chunk, accepted, limits, route, known), chunk };
+}
+
+/** A stored rule in the shape call 2's validation and the merge work on (handle "c1"; nothing flagged). */
+function acceptedOf(rule: AssessmentCriterion): AcceptedCriterion {
+  return {
+    ref: "c1",
+    criterion: rule,
+    notes: { checkStripped: false, refRemoved: false, refDerived: false },
+    startsMidSentence: false,
+    endsMidSentence: false,
+    multipleDates: false,
+    combinedSubConditions: false,
+  };
+}
+
 export class RubricExtractionService {
   /** @param deps overrides for tests; production passes nothing. */
   constructor(private readonly deps: RubricExtractionDeps = {}) {}
@@ -2304,6 +2375,37 @@ export class RubricExtractionService {
       ...(rule.intakeQuestionIds !== undefined ? { intakeQuestionIds: rule.intakeQuestionIds } : {}),
     };
     return { kind: "replacement", criterion, sameLine: sameLineOf(accepted) };
+  }
+
+  /**
+   * (#335) Call 2 for ONE rule: its questions and competence steps (see
+   * `competenceStepsRequest`). Exactly one request (plus the one retry every
+   * call gets for a transient provider failure). Nothing is stored here; the
+   * caller decides what to do with the outcome.
+   */
+  async draftCompetenceSteps(
+    input: { rule: AssessmentCriterion; index: SnapshotQuoteIndex; routeName: string; limits: { maxOutputTokens: number; timeoutMs: number }; known: readonly KnownQuestionView[] },
+    usage: RubricRunUsage,
+    attempts: CallAttempts,
+    opts: CallOptions = {}
+  ): Promise<CompetenceDraftOutcome> {
+    const built = competenceStepsRequest(input.rule, input.index, input.routeName, input.limits, input.known);
+    if ("notFound" in built) return { kind: "invalid", detail: `quote_${built.notFound}`, flags: [] };
+    const raw = await this.callModel(built.request, usage, attempts, opts);
+    // The SAME validation as any call 2 answer; citations come from the rule's own source.
+    const base: CitationBase = {
+      sourceId: input.rule.source.sourceId,
+      url: input.rule.source.url,
+      contentHash: input.rule.source.contentHash,
+      retrievedAt: input.rule.source.retrievedAt,
+      ...(input.rule.source.publishedDate ? { publishedDate: input.rule.source.publishedDate } : {}),
+    };
+    const intakePart = assessChunkOutput(raw, built.chunk, input.index, base, [...DEFAULT_SEVERITY_LEVELS]);
+    // The merge builds the block exactly as drafting does (one failing step drops the whole block).
+    const merged = mergeAssessments([{ chunk: built.chunk, assessment: { ...intakePart, criteria: [acceptedOf(input.rule)] } }]);
+    if (merged.competence) return { kind: "steps", competence: merged.competence, intakeQuestions: merged.intakeQuestions, flags: merged.flags };
+    if (merged.flags.some((f) => f.code === "competence_dropped")) return { kind: "invalid", detail: "competence_dropped", flags: merged.flags };
+    return { kind: "none", flags: merged.flags };
   }
 
   /** Refuse the run when its plan would pass a per-run cap. (#216: public, the job start checks the same caps.) */
