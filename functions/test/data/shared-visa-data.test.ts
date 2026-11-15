@@ -4,7 +4,9 @@
 // Pure: no Firestore. Every id, name and country code below is made up (user-assigned
 // codes XA..XC): no real bloc, member, quote or fee appears anywhere, EXCEPT the two
 // "#306" tests on the shipped file, which check the real members and records the
-// issue names (comparing them with the file's own NL entry, never a typed-out fact).
+// issue names (comparing them with the file's own NL entry, never a typed-out fact),
+// and the "#322" tests, which compare the twenty members #322 added with a copy of
+// the issue's JSON block (fixtures/schengen-members-322.json, written by script).
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -26,6 +28,28 @@ import { seedFeeProblems } from "../../src/data/seed-sourced-fee";
 // must be initialised first (no Firestore call is made: the test guard would fail it).
 import "../../src/utils/firebase";
 import { SEED_COUNTRIES, SEED_VISA_TYPES } from "../../src/data/seed-countries-visas";
+
+// ---- #322: the expected member data, as the issue gives it ----
+// The JSON block of issue #322, copied into the fixture BY SCRIPT (never typed):
+// one entry per group of members, with the group's official sentence, link and
+// date. This test states no legal fact of its own beyond this file.
+interface MemberGroup {
+  countryCodes: string[];
+  joinedOn: string;
+  sourceUrl: string;
+  sourceQuote: string;
+}
+const GROUPS_322: MemberGroup[] = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "schengen-members-322.json"), "utf8"));
+/** The twenty #322 member codes, in the issue's order (taken from the fixture). */
+const CODES_322 = GROUPS_322.flatMap((g) => g.countryCodes);
+/** The country names #322 seeds (names and flags are not legal facts). */
+const NAMES_322: Record<string, string> = {
+  GR: "Greece", DK: "Denmark", FI: "Finland", SE: "Sweden", IS: "Iceland", NO: "Norway", CZ: "Czechia",
+  EE: "Estonia", LV: "Latvia", LT: "Lithuania", HU: "Hungary", MT: "Malta", PL: "Poland", SI: "Slovenia",
+  SK: "Slovakia", CH: "Switzerland", LI: "Liechtenstein", HR: "Croatia", BG: "Bulgaria", RO: "Romania",
+};
+/** The seven members recorded before #322 (#239 + #306). */
+const CODES_306 = ["NL", "BE", "DE", "FR", "LU", "ES", "PT"];
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
@@ -55,13 +79,16 @@ describe("shared visa data: the shipped file", () => {
   // asks for exactly these. It still states no legal fact of its own: the
   // quote, link and date of the new members are compared with the NL entry
   // that is already in the file, never typed out here.
-  test("#306: seven members and seven inheriting records, each matching the seed", () => {
+  // #322: the counts are now 27 members and 27 inheriting records (the seven
+  // of #306 plus the twenty of #322); the #306 checks on the seven are kept.
+  test("#306/#322: 27 members and 27 inheriting records, each matching the seed", () => {
     const data = loadSharedVisaData();
     const bloc = data.authorities.find((a) => a.id === "schengen-area");
     assert.ok(bloc, "the bloc is in the file");
-    assert.deepEqual(bloc.members.map((m) => m.countryCode).sort(), ["BE", "DE", "ES", "FR", "LU", "NL", "PT"]);
+    assert.deepEqual(bloc.members.map((m) => m.countryCode).sort(), [...CODES_306, ...CODES_322].sort());
+    assert.equal(bloc.members.length, 27);
     const nl = bloc.members.find((m) => m.countryCode === "NL")!;
-    for (const m of bloc.members.filter((x) => x.countryCode !== "NL")) {
+    for (const m of bloc.members.filter((x) => CODES_306.includes(x.countryCode) && x.countryCode !== "NL")) {
       assert.equal(m.joinedOn, nl.joinedOn, `${m.countryCode} joinedOn`);
       assert.equal(m.joinedOn, "1995-03-26", `${m.countryCode} joinedOn`);
       assert.equal(m.sourceQuote, nl.sourceQuote, `${m.countryCode} quote is NL's, character for character`);
@@ -72,13 +99,19 @@ describe("shared visa data: the shipped file", () => {
     assert.ok(route, "the route is in the file");
     assert.deepEqual(
       route.inheritedBy.map((x) => `${x.countryCode}/${x.visaTypeId}`).sort(),
-      ["BE/be-visitor", "DE/de-visitor", "ES/es-visitor", "FR/fr-visitor", "LU/lu-visitor", "NL/nl-visitor", "PT/pt-visitor"]
+      [
+        "BE/be-visitor", "DE/de-visitor", "ES/es-visitor", "FR/fr-visitor", "LU/lu-visitor", "NL/nl-visitor", "PT/pt-visitor",
+        ...CODES_322.map((cc) => `${cc}/${cc.toLowerCase()}-visitor`),
+      ].sort()
     );
-    // The route itself is unchanged by #306 (its fee came with #299).
+    assert.equal(route.inheritedBy.length, 27);
+    // The route itself is unchanged by #306 and #322 (its fee came with #299).
     assert.equal(route.name, "Schengen short-stay visa");
     assert.equal(route.category, "tourist");
     assert.equal(route.fee?.amount, 90);
     assert.equal(route.fee?.currency, "EUR");
+    assert.equal(route.id, "schengen-area-short-stay");
+    assert.deepEqual(route.destinations, { mode: "members_of", authorityId: "schengen-area" });
 
     // Every member is a seed country; every inheriting record is a seed visa of that country.
     const countryCodes = new Set(SEED_COUNTRIES.map((c) => c.code));
@@ -115,6 +148,75 @@ describe("shared visa data: the shipped file", () => {
       assert.equal(c.isSupported, true);
     }
     // No two countries share a rank (the new ranks did not displace an existing one).
+    const ranks = SEED_COUNTRIES.map((c) => c.popularityRank);
+    assert.equal(new Set(ranks).size, ranks.length);
+  });
+
+  // ---- #322: the twenty members, compared with the issue's JSON block ----
+  test("#322: each new member carries its group's date, link and quote, character for character", () => {
+    const bloc = loadSharedVisaData().authorities.find((a) => a.id === "schengen-area");
+    assert.ok(bloc, "the bloc is in the file");
+    // The fixture is the issue's block: seven groups, twenty distinct codes, no IT, no AT.
+    assert.equal(GROUPS_322.length, 7);
+    assert.equal(new Set(CODES_322).size, 20);
+    assert.deepEqual(Object.keys(NAMES_322), CODES_322, "the names list follows the fixture's order");
+    for (const cc of ["IT", "AT"]) assert.equal(bloc.members.some((m) => m.countryCode === cc), false, `${cc} is not a member`);
+    for (const g of GROUPS_322) {
+      const shipped = g.countryCodes.map((cc) => bloc.members.find((m) => m.countryCode === cc));
+      for (const [i, m] of shipped.entries()) {
+        const cc = g.countryCodes[i];
+        assert.ok(m, `${cc} is a member`);
+        assert.equal(m.joinedOn, g.joinedOn, `${cc} joinedOn`);
+        assert.equal(m.sourceUrl, g.sourceUrl, `${cc} sourceUrl`);
+        assert.equal(m.sourceQuote, g.sourceQuote, `${cc} sourceQuote, character for character`);
+        // Members of one group share the same three values.
+        assert.deepEqual([m.joinedOn, m.sourceUrl, m.sourceQuote], [shipped[0]!.joinedOn, shipped[0]!.sourceUrl, shipped[0]!.sourceQuote]);
+      }
+    }
+    // The Liechtenstein quote keeps its typographic apostrophe (U+2019).
+    const li = bloc.members.find((m) => m.countryCode === "LI")!;
+    assert.ok(li.sourceQuote.includes("\u2019"), "LI quote keeps U+2019");
+    assert.equal(li.sourceQuote.includes("'"), false, "no straight apostrophe in its place");
+    // Every quote fits the validator's limit (SOURCE_QUOTE_MAX = 2000).
+    for (const m of bloc.members) assert.ok(m.sourceQuote.length < 2000, `${m.countryCode} quote length ${m.sourceQuote.length}`);
+  });
+
+  test("#322: the twenty new short-stay records and countries state no unsourced fact", () => {
+    const UNSOURCED = ["baseCostUsd", "validityPeriod", "maxExtensions", "applicationUrl", "applicationInstructions", "processingTime", "processingDaysMin", "processingDaysMax", "isExtendable"];
+    for (const [i, cc] of CODES_322.entries()) {
+      const name = NAMES_322[cc];
+      // The record: same shape as be-visitor, nothing beyond the visa and country name.
+      const v = SEED_VISA_TYPES.find((s) => s.id === `${cc.toLowerCase()}-visitor`);
+      assert.ok(v, `${cc} record exists`);
+      for (const key of UNSOURCED) assert.equal(key in v, false, `${v.id} has no ${key}`);
+      assert.deepEqual(v.eligibilityCriteria, [], `${v.id} eligibilityCriteria`);
+      assert.equal(v.countryCode, cc);
+      assert.equal(v.name, "Short Stay Visa");
+      assert.equal(v.code, "SHORT-STAY");
+      assert.equal(v.category, "tourist");
+      assert.equal(v.description, `Short stay visa for ${name}.`);
+      // The country: a name, a flag, supported, ranks 15-34 in the issue's order.
+      const c = SEED_COUNTRIES.find((x) => x.code === cc);
+      assert.ok(c, `${cc} is a seed country`);
+      assert.equal(c.name, name);
+      assert.equal(c.flagUrl, `https://flagcdn.com/w320/${cc.toLowerCase()}.png`);
+      assert.equal(c.isSupported, true);
+      assert.equal(c.popularityRank, 15 + i, `${cc} rank`);
+    }
+    // Exactly twenty new records shaped like be-visitor (one per new member, no more).
+    assert.equal(SEED_VISA_TYPES.filter((v) => CODES_322.includes(v.countryCode)).length, 20);
+    // No IT and no AT were added.
+    for (const cc of ["IT", "AT"]) assert.equal(SEED_COUNTRIES.some((c) => c.code === cc), false, `${cc} is not seeded`);
+    // The countries seeded before #322 keep their ranks. (The issue says
+    // "fourteen"; the seed on origin/dev has seventeen: twelve from before
+    // #306 plus #306's five. All seventeen are checked, ranks as on origin/dev.)
+    const BEFORE_322: Record<string, number> = {
+      IE: 1, GB: 2, US: 3, CA: 4, AU: 5, DE: 6, NL: 7, AE: 8, ZA: 9, NG: 99, GH: 100, KE: 101,
+      BE: 10, FR: 11, LU: 12, ES: 13, PT: 14,
+    };
+    const others = SEED_COUNTRIES.filter((c) => !CODES_322.includes(c.code));
+    assert.deepEqual(Object.fromEntries(others.map((c) => [c.code, c.popularityRank])), BEFORE_322);
+    // No two countries share a rank.
     const ranks = SEED_COUNTRIES.map((c) => c.popularityRank);
     assert.equal(new Set(ranks).size, ranks.length);
   });
