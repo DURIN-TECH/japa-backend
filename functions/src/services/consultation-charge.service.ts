@@ -26,6 +26,8 @@ import {
   snapshotOf,
   supersededSwap,
 } from "./charge-checkout.service";
+// Issue #332: the charge fields a payer may see (no raw rate, no margin).
+import { clientChargeFields } from "../money/client-charge";
 
 export {
   CHECKOUT_WAIT_ATTEMPTS,
@@ -519,12 +521,27 @@ export async function settlePayment(
 // ============================================
 
 /**
- * What a payer sees of their booking (verify response). Allow-listed field by
- * field: no ids of other people, no checkout internals. A #180 booking
- * carries its snapshot (the amount charged, the rate and when the quote
- * expires); a legacy one carries its naira `fee`.
+ * What a payer sees of their booking (checkout and verify answers, and the
+ * 409 bodies that name a booking). Allow-listed field by field: no ids of
+ * other people, no checkout internals. A #180 booking carries what it is
+ * charged and until when the quote holds; a legacy one its naira `fee`.
+ *
+ * Issue #332: the charge is the PAYER-SAFE one (`clientChargeFields`):
+ * `priceUsdCents`, `chargedCurrency`, `chargedAmountMinor` and
+ * `effectiveRate` (amount charged ÷ dollar price, markup included). The raw
+ * `fxRate`, `fxRateAsOf`, `fxRateSource` and `fxMarginBps` that used to be
+ * copied here are no longer sent: every caller of this summary is a payer
+ * (a signed-in client or a guest).
  */
 export function bookingSummary(c: Consultation): Record<string, unknown> {
+  /** The payer-safe charge of a priced booking, with the expiry always named (as before #332). */
+  const payerCharge = (b: Consultation): Record<string, unknown> => {
+    // `quoteLockedAt` was never part of this summary; it stays out so the
+    // summary's keys only lose the raw-rate fields and gain `effectiveRate`.
+    const { quoteLockedAt: _lockedAt, ...charge } = clientChargeFields(b);
+    void _lockedAt;
+    return { ...charge, quoteExpiresAt: b.quoteExpiresAt };
+  };
   return {
     id: c.id,
     agentName: c.agentName,
@@ -535,7 +552,7 @@ export function bookingSummary(c: Consultation): Record<string, unknown> {
     status: c.status,
     paymentStatus: c.paymentStatus,
     ...(hasChargeSnapshot(c)
-      ? { ...snapshotOf(c), quoteExpiresAt: c.quoteExpiresAt }
+      ? payerCharge(c)
       : c.fee !== undefined
         ? { fee: c.fee, feeCurrency: "NGN" }
         : { priceUsdCents: c.priceUsdCents ?? 0 }),

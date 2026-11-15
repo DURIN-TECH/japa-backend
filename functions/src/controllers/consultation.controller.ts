@@ -42,8 +42,11 @@ import {
   reissueCheckout,
   settlePayment,
   SettleOutcome,
-  snapshotOf,
 } from "../services/consultation-charge.service";
+// Issue #332: what a booking's CLIENT may see of it (no FX markup, no raw
+// rate), and the one rule for who gets that view.
+import { consultationFor, toClientConsultation } from "../consultations/client-consultation";
+import { clientChargeFields } from "../money/client-charge";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
 import { authController } from "./auth.controller";
 // Issue #321: `subcollections.messages` is read by the relationship check
@@ -114,7 +117,15 @@ const BAD_SCHEDULED_TIME = "scheduledTime must be a 24-hour HH:mm or a 12-hour h
 
 export class ConsultationController {
   /**
-   * GET /consultations?role=agent|owner|admin&status=...&type=...&startDate=...&endDate=...
+   * GET /consultations?role=agent|owner|admin|client&status=...&type=...&startDate=...&endDate=...
+   *
+   * Response shape (issue #332), decided PER BOOKING by `bookingFor`:
+   *  - a client (and anyone listing bookings they are the client of, e.g.
+   *    `role=client`) gets the allow-listed client view
+   *    (consultations/client-consultation.ts): no `fxMarginBps`, no raw
+   *    `fxRate` / `fxRateAsOf` / `fxRateSource`, no `supersededCheckouts`;
+   *    the charge comes with `effectiveRate` (amount charged ÷ dollar price);
+   *  - agents, owners and admins get the full stored booking, as before.
    */
   async getConsultations(
     req: AuthenticatedRequest,
@@ -177,7 +188,9 @@ export class ConsultationController {
       }
       }
 
-      sendSuccess(res, consultations);
+      // (#332) Never the stored documents for a client: each booking is
+      // answered in the shape this caller may see.
+      sendSuccess(res, consultations.map((c) => this.bookingFor(req, c)));
     } catch (error) {
       console.error("Error getting consultations:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -237,6 +250,10 @@ export class ConsultationController {
 
   /**
    * GET /consultations/:id
+   *
+   * Issue #332: the booking's client gets the allow-listed client view (no
+   * FX markup, no raw rate; see `bookingFor`); the agent side gets the full
+   * stored booking, as before.
    */
   async getConsultation(
     req: AuthenticatedRequest,
@@ -261,7 +278,8 @@ export class ConsultationController {
         return;
       }
 
-      sendSuccess(res, consultation);
+      // (#332) The shape depends on who is asking.
+      sendSuccess(res, this.bookingFor(req, consultation));
     } catch (error) {
       console.error("Error getting consultation:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -343,6 +361,14 @@ export class ConsultationController {
    * find-or-create is one Firestore transaction
    * (`createOrResumePendingBooking`), so two requests that arrive together
    * leave exactly one booking. The agent-initiated flow never resumes.
+   *
+   * Issue #332, RESPONSE SHAPE: a client who books (201, and the resumed
+   * 200) gets the allow-listed client view of the booking
+   * (consultations/client-consultation.ts) plus the checkout fields: no
+   * `fxMarginBps`, no raw `fxRate` / `fxRateAsOf` / `fxRateSource`; the
+   * charge comes with `effectiveRate` (amount charged ÷ dollar price, markup
+   * included). An agent or owner who books for a client still gets the full
+   * stored booking.
    */
   async createConsultation(
     req: AuthenticatedRequest,
@@ -660,8 +686,13 @@ export class ConsultationController {
         consultation = await consultationService.createConsultation(booking);
       }
 
+      // (#332) The booking in the shape this caller may see: the client view
+      // for a client booking for themselves, the stored document for an
+      // agent or owner booking for a client.
+      const answered = this.bookingFor(req, consultation);
+
       if (!charge) {
-        sendCreated(res, { ...consultation, requiresPayment: false });
+        sendCreated(res, { ...answered, requiresPayment: false });
         return;
       }
 
@@ -683,7 +714,7 @@ export class ConsultationController {
       }
       const { authorizationUrl, reference } = state;
       sendCreated(res, {
-        ...consultation,
+        ...answered,
         transactionId: reference,
         checkoutUrl: authorizationUrl,
         requiresPayment: true,
@@ -1020,7 +1051,9 @@ export class ConsultationController {
           .catch((e) => console.error("[consultation] status notify failed:", e));
       }
 
-      sendSuccess(res, updated);
+      // (#332) A client cancelling their own booking gets the client view
+      // (no FX markup, no raw rate); the agent side the full booking.
+      sendSuccess(res, this.bookingFor(req, updated));
     } catch (error) {
       console.error("Error updating consultation status:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -1320,8 +1353,10 @@ export class ConsultationController {
           authorizationUrl,
           reference,
           // What the guest is about to pay, and until when this price holds.
-          ...snapshotOf(charge),
-          quoteExpiresAt: charge.quoteExpiresAt,
+          // (#332) Only the payer-safe charge fields: the dollar price, the
+          // amount charged, the effective rate and the lock times. Never
+          // the raw rate or the margin (a guest is a client too).
+          ...clientChargeFields(charge),
         });
         return;
       }
@@ -1587,7 +1622,9 @@ export class ConsultationController {
    *  - "checkout": `{ ...fields, consultation: <payer-safe summary> }`;
    *  - "create": `{ ...<the booking>, ...fields, resumed: true }`, the shape
    *    of a fresh create (which answers 201), so the app handles both alike.
-   *    The booking is the caller's own, as on a fresh create.
+   *    The booking is the caller's own, as on a fresh create, so it is
+   *    ALWAYS the client view (issue #332: `toClientConsultation`, no FX
+   *    markup and no raw rate). Only the client-initiated flow resumes.
    */
   private sendBooking(
     res: Response,
@@ -1596,7 +1633,7 @@ export class ConsultationController {
     fields: Record<string, unknown>
   ): void {
     if (shape === "create") {
-      sendSuccess(res, { ...c, ...fields, resumed: true });
+      sendSuccess(res, { ...toClientConsultation(c), ...fields, resumed: true });
       return;
     }
     sendSuccess(res, { ...fields, consultation: bookingSummary(c) });
@@ -1806,6 +1843,19 @@ export class ConsultationController {
       502
     );
     return true;
+  }
+
+  /**
+   * Issue #332: `booking` in the shape THIS caller may receive. The agent
+   * side (an agent, owner or admin who is not the booking's own client) gets
+   * the full stored document; everyone else, first of all the booking's
+   * client, gets the allow-listed client view, which carries no
+   * `fxMarginBps` and no raw rate. The rule itself lives in
+   * `seesFullConsultation` (consultations/client-consultation.ts). It only
+   * picks the shape: each route has already decided the caller may read it.
+   */
+  private bookingFor(req: AuthenticatedRequest, booking: Consultation) {
+    return consultationFor({ uid: req.userId, role: req.authz?.role }, booking);
   }
 
   /**

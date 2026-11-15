@@ -14,9 +14,14 @@
 // paying). That bypassed the whole server-side charge path.
 //
 // Pinned here:
-//  1. reads are unchanged: the booking's client, its agent (agent claim +
-//     the agents doc's userId) and an admin can read it; another client and
-//     a signed-out visitor cannot;
+//  1. reads (issue #332): the booking's CLIENT can no longer read it
+//     directly, by id or by a query on their own `userId`. The document
+//     holds Seli's exchange-rate markup (fxMarginBps) and the raw rate, on
+//     the booking and on every `supersededCheckouts` entry, and rules cannot
+//     hide single fields; clients read through GET /consultations, which
+//     gives the allow-listed view. Its agent (agent claim + the agents doc's
+//     userId) and an admin can still read it; another client, another agent
+//     and a signed-out visitor cannot;
 //  2. create, update and delete are refused for the client, the agent, an
 //     admin and a signed-out visitor, including the money-path updates
 //     (`paymentStatus: "paid"`, `chargedAmountMinor`, `supersededCheckouts`)
@@ -42,6 +47,8 @@ const CLIENT = "cr-client";
 const AGENT_UID = "cr-agent";
 const OTHER = "cr-other";
 const ADMIN = "cr-admin";
+/** (#332) An agent who is NOT this booking's agent (their own agents doc). */
+const OTHER_AGENT_UID = "cr-other-agent";
 /** The agent DOC id (a consultation's `agentId` is the agents doc id). */
 const AGENT_DOC = "cr-agent-doc";
 const BOOKING = "cr-booking";
@@ -52,6 +59,7 @@ const CLAIMS: Record<string, Record<string, unknown>> = {
   [OTHER]: { role: "client", agencyId: null, admin: false },
   [AGENT_UID]: { role: "agent", agencyId: "cr-agency", admin: false, agent: true },
   [ADMIN]: { role: "admin", agencyId: null, admin: true },
+  [OTHER_AGENT_UID]: { role: "agent", agencyId: "cr-agency-2", admin: false, agent: true },
 };
 
 /** A pending #180 booking awaiting payment. */
@@ -69,6 +77,14 @@ const PENDING = {
   priceUsdCents: 1_000,
   chargedCurrency: "NGN",
   chargedAmountMinor: 1_500_000,
+  // (#332) What a direct client read would give away: the raw rate and
+  // Seli's markup, on the booking and on a replaced checkout.
+  fxRate: 1463.41,
+  fxRateSource: "cbn",
+  fxMarginBps: 250,
+  supersededCheckouts: [
+    { reference: "cons-crbooking-old", priceUsdCents: 1_000, chargedCurrency: "NGN", chargedAmountMinor: 1_490_000, fxRate: 1453.66, fxMarginBps: 250 },
+  ],
   transactionId: "cons-crbooking-ref",
 };
 
@@ -79,6 +95,7 @@ before(async () => {
   await resetEmulators();
   await withoutRules(async (db) => {
     await db.collection("agents").doc(AGENT_DOC).set({ id: AGENT_DOC, userId: AGENT_UID });
+    await db.collection("agents").doc("cr-other-agent-doc").set({ id: "cr-other-agent-doc", userId: OTHER_AGENT_UID });
     await db.collection("consultations").doc(BOOKING).set(PENDING);
     await db.collection("transactions").doc("cr-tx").set({ id: "cr-tx", userId: CLIENT, amount: 1_500_000, currency: "NGN" });
   });
@@ -89,19 +106,46 @@ after(async () => {
 });
 
 // ============================================
-// 1. Reads unchanged
+// 1. Reads: closed to the client, unchanged for the agent side (issue #332)
 // ============================================
 
-describe("consultation reads are unchanged", () => {
-  for (const [who, uid] of [["the booking's client", CLIENT], ["its agent", AGENT_UID], ["an admin", ADMIN]] as const) {
-    test(`${who} can read the booking`, async () => {
+describe("consultation reads: the client is refused, the agent side is unchanged", () => {
+  test("the booking's client cannot read their own booking by id", async () => {
+    // Before #332 this read succeeded and returned fxMarginBps and fxRate.
+    assert.equal(await isDenied((await as(CLIENT)).collection("consultations").doc(BOOKING).get()), true);
+  });
+
+  test("the booking's client cannot list or query their own bookings either", async () => {
+    const db = await as(CLIENT);
+    // The query a client SDK would use for "my consultations".
+    assert.equal(await isDenied(db.collection("consultations").where("userId", "==", CLIENT).get()), true);
+    assert.equal(await isDenied(db.collection("consultations").get()), true);
+    // A filter on the hidden field must not work as an oracle for it.
+    assert.equal(
+      await isDenied(db.collection("consultations").where("userId", "==", CLIENT).where("fxMarginBps", "==", 250).get()),
+      true
+    );
+  });
+
+  test("a client holding a forged-looking role claim but no agent claim is still refused", async () => {
+    // The agent branch needs the `agent` claim AND the agents doc's userId;
+    // the client has neither for this booking.
+    const db = await clientDb(CLIENT, { role: "client", agencyId: null, admin: false, agent: false });
+    assert.equal(await isDenied(db.collection("consultations").doc(BOOKING).get()), true);
+  });
+
+  for (const [who, uid] of [["its agent", AGENT_UID], ["an admin", ADMIN]] as const) {
+    test(`${who} can still read the booking, snapshot included`, async () => {
       const snap = await (await as(uid)).collection("consultations").doc(BOOKING).get();
       assert.equal(snap.data().chargedAmountMinor, 1_500_000);
+      // The agent side keeps the full document (unchanged by #332).
+      assert.equal(snap.data().fxMarginBps, 250);
     });
   }
 
-  test("another client and a signed-out visitor cannot read it", async () => {
+  test("another client, another agent and a signed-out visitor cannot read it", async () => {
     assert.equal(await isDenied((await as(OTHER)).collection("consultations").doc(BOOKING).get()), true);
+    assert.equal(await isDenied((await as(OTHER_AGENT_UID)).collection("consultations").doc(BOOKING).get()), true);
     assert.equal(await isDenied((await anonymousDb()).collection("consultations").doc(BOOKING).get()), true);
   });
 });

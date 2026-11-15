@@ -370,7 +370,10 @@ describe("PUT /consultations/:id/status — an allowed change", () => {
     assert.equal(stored.cancellationReason, "Travel moved");
     assert.ok(stored.cancelledAt instanceof Timestamp);
     assert.equal(out.body.data.id, "c1");
-    assert.equal(out.body.data.cancelledBy, "uid-client1");
+    // (#332) The client is answered with the client view: why and when it
+    // was cancelled, not the stored `cancelledBy` user id.
+    assert.equal(out.body.data.cancellationReason, "Travel moved");
+    assert.equal("cancelledBy" in out.body.data, false);
     assert.deepEqual(notified, [{ userId: "uid-agent1", type: "consultation_cancelled" }]);
   });
 
