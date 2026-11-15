@@ -80,6 +80,9 @@
 // Austria (GR, DK, FI, SE, IS, NO, CZ, EE, LV, LT, HU, MT, PL, SI, SK, CH, LI,
 // HR, BG, RO), in seven groups, each from its own official decision; their
 // short-stay records inherit the same route.
+// Issue #331 (2026-11-15) added Italy and Austria, the last two members, with
+// the date and the official sentence already stored for Denmark (see the note
+// next to their entries); their short-stay records inherit the same route.
 export const SHARED_VISA_DATA: unknown = {
   authorities: [
     {
@@ -361,6 +364,37 @@ export const SHARED_VISA_DATA: unknown = {
             "From 31 March 2024, checks on persons at internal air and sea borders with and between Bulgaria and Romania shall be lifted and the provisions of the Schengen acquis referred to in the Annex shall apply to Bulgaria and Romania between themselves and in their relations with the Kingdom of Belgium, the Czech Republic, the Kingdom of Denmark, the Federal Republic of Germany, the Republic of Estonia, the Hellenic Republic, the Kingdom of Spain, the French Republic, the Republic of Croatia, the Italian Republic, the Republic of Latvia, the Republic of Lithuania, the Grand Duchy of Luxembourg, Hungary, Malta, the Kingdom of the Netherlands, the Republic of Austria, the Republic of Poland, the Portuguese Republic, the Republic of Slovenia, the Slovak Republic, the Republic of Finland and the Kingdom of Sweden, as well as Iceland, the Principality of Liechtenstein, the Kingdom of Norway and the Swiss Confederation.",
           sourceUrl: "https://publications.europa.eu/resource/celex/32024D0210",
         },
+        // ---- #331: Italy and Austria (from 2001-03-25) ----
+        // Owner decision of 2026-11-15 ("add italy and austria with the 2001 date").
+        // This supersedes the #322 note above saying Italy and Austria are not here.
+        // Source: Council Decision 2000/777/EC, Article 1: the SAME quote, link and
+        // date as the DK entry of the #322 group above, COPIED BY SCRIPT from that
+        // entry (never retyped); a unit test checks they equal DK's.
+        // Why this date: their own bringing-into-force decisions (SCH/Com-ex (97)
+        // 27 and 28) are not published in the Official Journal. 25 March 2001 is
+        // the EARLIEST date a published official sentence proves both were
+        // applying the rules, by owner decision of 2026-11-15. Both joined
+        // EARLIER: the quote lists Italy and Austria among the states already
+        // applying the provisions ("in their relations between each other and
+        // with ... Italy ... Austria ..."). Replace this date (and the quote and
+        // link) if a published official sentence with their own start date is
+        // found.
+        {
+          // Italy: named in the quoted sentence among the states already applying.
+          countryCode: "IT",
+          joinedOn: "2001-03-25",
+          sourceQuote:
+            "As from 25 March 2001, and subject to Article 3(2): (a) all the provisions of the Schengen acquis referred to in Annexes A, B, C and D to Council Decision 1999/436/EC of 20 May 1999 determining, in conformity with the relevant provisions of the Treaty establishing the European Community and the Treaty on European Union, the legal basis for each of the provisions or decisions which constitute the Schengen acquis, and any act adopted by the Council establishing an instrument which has entered into force and constitutes a further development of one or more of these provisions, shall apply to Denmark, Finland and Sweden, in their relations between each other and with Belgium, Germany, Greece, Spain, France, Italy, Luxembourg, Netherlands, Austria and Portugal; (b) all the provisions referred to in Annexes A and B to the Agreement of 18 May 1999 concluded by the Council of the European Union, the Republic of Iceland and the Kingdom of Norway concerning the latters' association with the implementation, application, and development of the Schengen acquis, and any act adopted by the Council establishing an instrument which has entered into force and constitutes a further development of one or more of these provisions, shall apply to Iceland and Norway, in their relations between each other and with Belgium, Denmark, Germany, Greece, Spain, France, Italy, Luxembourg, Netherlands, Austria, Portugal, Finland and Sweden.",
+          sourceUrl: "https://publications.europa.eu/resource/celex/32000D0777",
+        },
+        {
+          // Austria: named in the quoted sentence among the states already applying.
+          countryCode: "AT",
+          joinedOn: "2001-03-25",
+          sourceQuote:
+            "As from 25 March 2001, and subject to Article 3(2): (a) all the provisions of the Schengen acquis referred to in Annexes A, B, C and D to Council Decision 1999/436/EC of 20 May 1999 determining, in conformity with the relevant provisions of the Treaty establishing the European Community and the Treaty on European Union, the legal basis for each of the provisions or decisions which constitute the Schengen acquis, and any act adopted by the Council establishing an instrument which has entered into force and constitutes a further development of one or more of these provisions, shall apply to Denmark, Finland and Sweden, in their relations between each other and with Belgium, Germany, Greece, Spain, France, Italy, Luxembourg, Netherlands, Austria and Portugal; (b) all the provisions referred to in Annexes A and B to the Agreement of 18 May 1999 concluded by the Council of the European Union, the Republic of Iceland and the Kingdom of Norway concerning the latters' association with the implementation, application, and development of the Schengen acquis, and any act adopted by the Council establishing an instrument which has entered into force and constitutes a further development of one or more of these provisions, shall apply to Iceland and Norway, in their relations between each other and with Belgium, Denmark, Germany, Greece, Spain, France, Italy, Luxembourg, Netherlands, Austria, Portugal, Finland and Sweden.",
+          sourceUrl: "https://publications.europa.eu/resource/celex/32000D0777",
+        },
       ],
     },
   ],
@@ -406,6 +440,10 @@ export const SHARED_VISA_DATA: unknown = {
         { countryCode: "HR", visaTypeId: "hr-visitor" },
         { countryCode: "BG", visaTypeId: "bg-visitor" },
         { countryCode: "RO", visaTypeId: "ro-visitor" },
+        // #331: Italy and Austria, same ids `<code>-visitor`, same rule: no fee
+        // of their own.
+        { countryCode: "IT", visaTypeId: "it-visitor" },
+        { countryCode: "AT", visaTypeId: "at-visitor" },
       ],
       // ---- The route's government fee (issue #299) ----
       // Read on 2026-11-14 from the dev project (durin-seli-dev), not typed
