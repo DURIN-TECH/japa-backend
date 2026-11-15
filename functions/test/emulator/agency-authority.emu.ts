@@ -736,6 +736,10 @@ describe("E. server flows keep role claims and the consultation agency in step w
       verificationStatus: "verified",
     });
     const client = await seedClient("e2-client");
+    // Issue #246: an agent books only for a client they already work with.
+    // The link is an application assigned to the agent THEMSELVES (by uid),
+    // with no agency on it, so it says nothing about the claimed agency.
+    await seedApplication(`app-e2-${Date.now()}`, { userId: client.uid, agentId: agent.account.uid });
 
     const principal = await resolved(agent.account.idToken);
     const res = await api.call("POST", "/consultations", agent.account.idToken, {
@@ -757,6 +761,10 @@ describe("E. server flows keep role claims and the consultation agency in step w
     const agency = await seedAgency("e3");
     const member = await seedMember(agency, "e3-member");
     const client = await seedClient("e3-client");
+    // Issue #246: the client is already the member's (an application assigned
+    // to them, by uid). It carries NO agencyId, so the agency asserted below
+    // can only have come from the resolved principal.
+    await seedApplication(`app-e3-${Date.now()}`, { userId: client.uid, agentId: member.account.uid });
 
     const res = await api.call("POST", "/consultations", member.account.idToken, {
       userId: client.uid,
