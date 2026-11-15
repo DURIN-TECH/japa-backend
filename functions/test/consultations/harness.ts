@@ -134,6 +134,9 @@ export async function useHarness(): Promise<void> {
     "consultations", "transactions", "agents", "agencies", "users", "notifications",
     // Issue #180 review fix: payments held for refund.
     "consultationPaymentExceptions",
+    // Issue #246: the agent-initiated booking looks for an existing
+    // relationship with the client in these (plus consultations).
+    "applications", "conversations",
   ]) {
     firebase.collections[name] = fakeCollection(name);
   }
