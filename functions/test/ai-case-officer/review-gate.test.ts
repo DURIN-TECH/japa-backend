@@ -23,6 +23,8 @@ import { defineAbilitiesFor, ROLES, type Entitlements } from "@durin-tech/authz"
 import { aiCaseOfficerController } from "../../src/controllers/ai-case-officer.controller";
 import { aiCaseOfficerService, isNoModelCallResult } from "../../src/services/ai-case-officer.service";
 import type { VisaRubric } from "../../src/types/rubric";
+import type { ApplicationStatus } from "../../src/types";
+import { INTAKE_EDITABLE_STATUSES } from "../../src/services/intake.service";
 import { store } from "../helpers/fake-firestore";
 import {
   installAssessmentFakes,
@@ -119,8 +121,13 @@ function answeringProvider() {
 }
 
 /** An application on route A for client-1, in agency-1, with no documents yet. */
-function seedEmptyCase(appId = "app-1") {
+// (#309 fix round) The status decides whether the intake can still be edited
+// (INTAKE_EDITABLE_STATUSES). The default is an editable one, where the gate
+// asks for the intake; past those statuses only the documents part applies.
+function seedEmptyCase(appId = "app-1", status: ApplicationStatus = "pending_documents") {
   seedApplication({ id: appId, agencyId: "agency-1", agentId: "agent-1" });
+  const cur = store.get(`applications/${appId}`) as Record<string, unknown>;
+  store.set(`applications/${appId}`, { ...cur, status });
   seedUser("client-1", "Ada", "Lovelace");
   seedEligibility({ nationality: "IN", score: 80 });
 }
@@ -230,6 +237,45 @@ describe("POST /assess: the enough-to-review gate (#309)", () => {
     const res = await post("app-1");
     assert.equal(res.statusCode, 202);
   });
+
+  // ----- Only an editable intake can be missing (#309 fix round) -----
+
+  // Every status the intake can still be saved in: an open required question
+  // blocks the review, exactly as above.
+  for (const status of INTAKE_EDITABLE_STATUSES) {
+    test(`${status}: an open required question with a document gets 422 with intake missing`, async () => {
+      seedEmptyCase("app-1", status);
+      answerIntake("app-1", { "q-purpose": "Tourism" });
+      seedDocument({ id: "doc-1", applicationId: "app-1", key: "bank" });
+      const provider = answeringProvider();
+      useProvider(provider);
+      assertNotEnough(await post("app-1"), provider, ["intake"], 1);
+    });
+  }
+
+  // Every status past them: a save would be refused (409 NOT_EDITABLE), so
+  // open questions never block; the review runs and reports those rules as
+  // "could not be assessed". The documents part still applies.
+  const NOT_EDITABLE: ApplicationStatus[] = ["under_review", "submitted_to_embassy", "interview_scheduled", "approved", "rejected", "withdrawn", "expired"];
+  for (const status of NOT_EDITABLE) {
+    test(`${status}: open required questions with a document are accepted`, async () => {
+      seedEmptyCase("app-1", status);
+      seedDocument({ id: "doc-1", applicationId: "app-1", key: "bank" });
+      useProvider(answeringProvider());
+      const res = await post("app-1", OWNER, PAID);
+      assert.equal(res.statusCode, 202);
+      assert.equal(assessmentDocs("app-1").length, 1);
+    });
+
+    test(`${status}: open required questions and no document get 422 with only documents missing`, async () => {
+      seedEmptyCase("app-1", status);
+      const provider = answeringProvider();
+      useProvider(provider);
+      const res = await post("app-1", OWNER, PAID);
+      assertNotEnough(res, provider, ["documents"], 0);
+      assert.doesNotMatch(res.body.message, /question/);
+    });
+  }
 
   // ----- Same answer for every tier; access and missing checks first -----
 
