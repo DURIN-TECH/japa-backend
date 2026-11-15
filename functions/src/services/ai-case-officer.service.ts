@@ -43,7 +43,7 @@ import {
 } from "./ai/assessment-engine";
 import { extractOneDocument, sniffMediaType } from "./ai/document-extraction";
 import { costOfUsage } from "./ai/ai-pricing";
-import { readAiSettings, type AiSettings, type AiSettingsRead } from "./ai/ai-settings";
+import { fileByteLimitFor, isImageType, readAiSettings, type AiSettings, type AiSettingsRead } from "./ai/ai-settings";
 import { AnthropicLlmProvider, type LlmProvider, type LlmUsage } from "./ai/llm-provider";
 import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-safety";
 import type { AssessmentTier, StaleReason } from "./ai/tier-serializer";
@@ -75,7 +75,11 @@ import type { IntakeResponse } from "../types/intake";
 // `queued -> running` in a transaction. No response is ever streamed.
 //
 // THE CAPS. Checked before each model call (ai-settings.ts). A job that would
-// pass a cap fails with its code instead of running unbounded.
+// pass a cap fails with its code instead of running unbounded. Since #310 the
+// per-review caps have their own codes (`too_many_documents`,
+// `review_too_large`), decided from counts before the first call; only the
+// platform-wide daily limit is `daily_cap_exceeded`. An attached file is
+// bounded by its real byte length, not counted as input characters.
 //
 // NOTHING ELSE SENDS. Model output is never used as a storage path, a user id,
 // an application id or a criterion that the rubric does not contain.
@@ -84,6 +88,13 @@ import type { IntakeResponse } from "../types/intake";
 const JOB_BUDGET_MS = 480_000;
 /** No judgement call starts after this much time has gone. */
 const JUDGEMENT_START_LIMIT_MS = 360_000;
+
+/**
+ * (#310) The stored message for `review_too_large`: the review would pass a
+ * per-review cap for a reason other than the number of documents (see the
+ * check before the daily cap in `execute`). Fixed and secret-free.
+ */
+const REVIEW_TOO_LARGE_MESSAGE = "the application is larger than one review can read";
 
 /** A job failure with a stable code. Caught by runJob, which stores it. */
 class JobStop extends Error {
@@ -877,6 +888,45 @@ export class AiCaseOfficerService {
       return;
     }
 
+    // ---- (#310) is this application too big for ONE review? ----
+    // Decided here, from counts alone, BEFORE the daily cap is claimed and
+    // before any model call: a review that cannot finish must not spend on the
+    // documents it does reach, and must not use up one of today's reviews.
+    //
+    // One review makes at most one extraction call per document (stage 2) and
+    // one judgement call per batch of rules (stage 3). The judgement calls are
+    // fixed by the rulebook, so what is left of the request cap is the room
+    // for documents:
+    //   no room for even one document  -> `review_too_large` (the rules alone
+    //                                     need every request; adding or removing
+    //                                     documents cannot change that);
+    //   more documents than the room   -> `too_many_documents`.
+    // Neither is the platform-wide daily limit (`daily_cap_exceeded`), and the
+    // app must not call either a pause: the same inputs fail the same way
+    // tomorrow. The count is an upper bound (a file that turns out to be
+    // unreadable makes no call), which keeps the answer the same every time for
+    // the same application.
+    const plannedJudgementCalls = planJudgementBatches(judgementCriteriaOf(rubric)).length;
+    const plannedExtractionCalls = documentFieldsFor(rubric).length > 0 ? loaded.documents.length : 0;
+    if (plannedExtractionCalls > 0) {
+      const roomForDocuments = settings.maxRequestsPerAssessment - plannedJudgementCalls;
+      if (roomForDocuments < 1) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+      if (plannedExtractionCalls > roomForDocuments) {
+        throw new JobStop("too_many_documents", `the application has more documents (${plannedExtractionCalls}) than one review can read (${roomForDocuments})`);
+      }
+    } else if (plannedJudgementCalls > settings.maxRequestsPerAssessment) {
+      // No document to read (a statement only), and the rules alone pass the cap.
+      throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+    }
+
+    // The input-size cap counts TEXT only (#310), and the statements are the
+    // one part of that text an applicant can make arbitrarily long. They go
+    // into every judgement call, so statements longer than the whole cap can
+    // never fit: refuse now rather than after paying for the extractions. (The
+    // per-call checks below still add up the real text of every request.)
+    const statementChars = loaded.statements.reduce((n, st) => n + st.text.length, 0);
+    if (statementChars > settings.maxInputCharsPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+
     // ---- the daily cap, counted only for jobs that reach a model ----
     await this.claimDailyCap(settings);
 
@@ -891,10 +941,6 @@ export class AiCaseOfficerService {
 
     for (const d of loaded.documents) {
       const base = { documentId: d.id, label: d.label };
-      if (d.sizeMb * 1024 * 1024 > settings.maxFileBytes) {
-        extractions.push(unreadable(base, "file is larger than the limit"));
-        continue;
-      }
       if (fields.length === 0) {
         extractions.push(unreadable(base, "no field to read"));
         continue;
@@ -908,6 +954,16 @@ export class AiCaseOfficerService {
         extractions.push(unreadable(base, "file could not be read"));
         continue;
       }
+      // (#310) The size check uses the REAL byte length just downloaded, never
+      // the stored `fileSizeMb` (which the uploading client used to supply, so
+      // it could be anything). The limit depends on the kind of file, sniffed
+      // from the bytes: an image is also bounded by what the model accepts
+      // (ai-settings.ts, fileByteLimitFor). A file over the limit is reported
+      // for THIS document only; the job carries on with the others.
+      if (bytes.length > fileByteLimitFor(settings, isImageType(sniffMediaType(bytes)))) {
+        extractions.push(unreadable(base, "file is larger than the limit"));
+        continue;
+      }
       // The shared single-document extraction (document-extraction.ts, also used
       // by the per-upload check #115): sniff, guards, request, call, parse.
       // The cost caps run just before the call, through `beforeCall`.
@@ -919,9 +975,15 @@ export class AiCaseOfficerService {
         fields,
         beforeCall: (request) => {
           requests++;
-          chars += request.user.length + (request.documents?.[0]?.data.length ?? 0);
-          if (requests > settings.maxRequestsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its request cap");
-          if (chars > settings.maxInputCharsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its input size cap");
+          // (#310) TEXT only. The attached file's base64 data is not counted
+          // here any more: it is bounded per file by the byte check above, and
+          // the number of files by the request cap.
+          chars += request.user.length;
+          // Backstops: the count-based check before the daily cap already
+          // refused an application with too many documents, so these only fire
+          // if that arithmetic and this loop ever disagree.
+          if (requests > settings.maxRequestsPerAssessment) throw new JobStop("too_many_documents", "the application has more documents than one review can read");
+          if (chars > settings.maxInputCharsPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
         },
       });
       if (result.called) extractUsed = true;
@@ -946,7 +1008,8 @@ export class AiCaseOfficerService {
     // each call's answer is checked against that batch's own ids and the
     // answers are combined in code. The request and input caps are checked
     // before EACH call: a rulebook that would pass them fails the job with
-    // `cost_cap_exceeded` instead of being assessed in part.
+    // `review_too_large` (#310; it was `cost_cap_exceeded`) instead of being
+    // assessed in part.
     const judgementCriteria = judgementCriteriaOf(rubric);
     const batches = planJudgementBatches(judgementCriteria);
     let judgement: JudgementOutput | null = null;
@@ -970,7 +1033,7 @@ export class AiCaseOfficerService {
       for (const batch of batches) {
         if (this.deps.now().getTime() - started > JUDGEMENT_START_LIMIT_MS) throw new JobStop("timed_out", "the assessment ran out of time before judgement");
         requests++;
-        if (requests > settings.maxRequestsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its request cap");
+        if (requests > settings.maxRequestsPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
         const request = buildJudgementRequest({
           rubric: { criteria: batch, intentPolarity: rubric.intentPolarity },
           statementText: numbered ? numbered.text : statementText || null,
@@ -986,7 +1049,7 @@ export class AiCaseOfficerService {
         });
         // The characters of every call count toward the same cap.
         chars += request.user.length;
-        if (chars > settings.maxInputCharsPerAssessment) throw new JobStop("cost_cap_exceeded", "the assessment would pass its input size cap");
+        if (chars > settings.maxInputCharsPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
         judgeUsed = true;
         const batchIds = batch.map((c) => c.criterionId);
         try {

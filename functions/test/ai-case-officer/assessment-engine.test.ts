@@ -558,7 +558,7 @@ describe("identity and settings", () => {
   test("a missing or unreadable settings value falls back to its default, and a bad range is refused", () => {
     const merged = mergeAiSettings({ maxRequestsPerAssessment: 0, enabled: false, maxFileBytes: "big" });
     assert.equal(merged.enabled, false);
-    assert.equal(merged.maxRequestsPerAssessment, 12, "0 is out of range, so the default applies");
+    assert.equal(merged.maxRequestsPerAssessment, 30, "0 is out of range, so the default applies (30 since #310)");
     assert.equal(merged.maxFileBytes, 10 * 1024 * 1024);
   });
 });

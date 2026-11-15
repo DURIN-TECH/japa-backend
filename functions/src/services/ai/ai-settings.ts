@@ -13,11 +13,20 @@ import { collections } from "../../utils/firebase";
 // a cost in dollars cannot be checked yet. The caps are in units known before a
 // call is made:
 //   maxRequestsPerAssessment    model calls one assessment may make
-//   maxInputCharsPerAssessment  characters (text and attached bytes) it may send
+//   maxInputCharsPerAssessment  characters of TEXT it may send (prompts, the
+//                               statement, intake and extraction summaries)
 //   maxAssessmentsPerDay        assessments that reached the model, per UTC day
-//   maxFileBytes                size of one attached file
+//   maxFileBytes                size of one attached file, in real bytes
 // A job that would pass a per-assessment cap is failed BEFORE the call. Switch to
 // dollar caps once the prices are confirmed and recorded in ai-pricing.ts.
+//
+// ATTACHED FILES ARE NOT TEXT (#310). A file's base64 data used to be added to
+// the character count, so one 1.5 MB scan used the whole 2,000,000 character
+// budget and an ordinary application failed. Attached bytes are now bounded per
+// file instead (`fileByteLimitFor` below), and the number of files by the
+// request cap (one extraction call per document). The same limit is applied
+// when a document is REGISTERED (services/document.service.ts), from the size
+// Cloud Storage reports, so the upload limit and the review limit are one number.
 
 /** The `appConfig` doc id. */
 export const AI_SETTINGS_DOC_ID = "aiSettings";
@@ -56,10 +65,22 @@ export interface AiSettings {
   listingScreeningsPerAgencyPerDay: number;
 }
 
-/** Defaults. Sized for one application with a handful of documents. */
+/**
+ * Defaults. Sized for one ordinary self-service application.
+ *
+ * `maxRequestsPerAssessment` is 30 (#310; it was 12). One review makes one
+ * extraction call per document plus one judgement call per batch of rules
+ * (UK Standard Visitor v2 needs 5). At 12, an application with more than 7
+ * documents could not be reviewed at all. 30 covers 15 documents + 5 judgement
+ * calls with room for 10 more of either (so up to 25 documents on that
+ * rulebook). The allowed range stays 1-50, and a stored value in that range
+ * still overrides this default. Raising it raises the most ONE review can
+ * spend; the daily cap (`maxAssessmentsPerDay`) and the per-user limits are
+ * unchanged.
+ */
 export const DEFAULT_AI_SETTINGS: Readonly<AiSettings> = Object.freeze({
   enabled: true,
-  maxRequestsPerAssessment: 12,
+  maxRequestsPerAssessment: 30,
   maxInputCharsPerAssessment: 2_000_000,
   maxAssessmentsPerDay: 200,
   maxFileBytes: 10 * 1024 * 1024,
@@ -89,6 +110,50 @@ const RANGES: Record<Exclude<keyof AiSettings, "enabled" | "chatEnabled">, [numb
   listingScreeningsPerDay: [1, 10_000],
   listingScreeningsPerAgencyPerDay: [1, 1_000],
 };
+
+// ============================================
+// Per-file size limit (issue #310)
+// ============================================
+
+/**
+ * The most bytes of ONE image the model provider accepts, as a raw file.
+ *
+ * The Claude API refuses an image whose BASE64 text is over 10 MB (vision
+ * guide, "The maximum size per image": "10 MB (base64-encoded) on the Claude
+ * API"). Base64 is 4 characters per 3 bytes, so the raw file must stay under
+ * 7.5 MB; 7 MB (9.79 million base64 characters) leaves a margin whichever way
+ * the provider counts a megabyte. A 2-4 MB phone photo is well inside it.
+ *
+ * A PDF has no per-file limit of its own: it is bounded by the request size
+ * (128 MB) and the page count (600), so `maxFileBytes` (10 MB) applies as is.
+ *
+ * Not a stored setting: it is a fact about the provider, not a choice. If the
+ * provider changes, change it here (and in the mobile app's size check).
+ */
+export const MODEL_IMAGE_MAX_BYTES = 7 * 1024 * 1024;
+
+/**
+ * The size limit, in real bytes, for one file of the given kind: the ONE place
+ * the upload check (document registration) and the review read it from, so the
+ * two cannot drift apart.
+ *
+ *  - an image: the smaller of `maxFileBytes` and what the model accepts;
+ *  - anything else (a PDF): `maxFileBytes`.
+ */
+export function fileByteLimitFor(settings: Pick<AiSettings, "maxFileBytes">, isImage: boolean): number {
+  return isImage ? Math.min(settings.maxFileBytes, MODEL_IMAGE_MAX_BYTES) : settings.maxFileBytes;
+}
+
+/** True for a MIME type that names an image ("image/jpeg", "image/png", "image/heic", ...). */
+export function isImageType(type: string | null | undefined): boolean {
+  return typeof type === "string" && type.trim().toLowerCase().startsWith("image/");
+}
+
+/** A byte count as whole megabytes for a message ("10 MB"), at most one decimal. */
+export function megabytesLabel(bytes: number): string {
+  const mb = Math.round((bytes / (1024 * 1024)) * 10) / 10;
+  return `${mb} MB`;
+}
 
 /** Result of a settings read. */
 export type AiSettingsRead = { ok: true; settings: AiSettings } | { ok: false; reason: string };

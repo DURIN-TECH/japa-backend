@@ -42,8 +42,20 @@ export const ASSESSMENT_ERROR_CODES = [
   "inputs_changed",
   "rubric_changed",
   "timed_out",
+  // Kept for failures stored before #310 and for the bulk path (#37). The
+  // single-application review no longer writes it: see the two codes below.
   "cost_cap_exceeded",
+  // The PLATFORM-WIDE daily limit is used up. True "try again tomorrow".
   "daily_cap_exceeded",
+  // (#310) The application itself is too big for ONE review. Neither is a
+  // pause and neither is fixed by waiting: the same inputs fail the same way.
+  //   too_many_documents  more documents than the request cap leaves room for
+  //                       (one extraction call each, after the judgement calls);
+  //   review_too_large    the review would pass a per-review cap for another
+  //                       reason (the rules alone need every request, or the
+  //                       TEXT of the requests passes the input-size cap).
+  "too_many_documents",
+  "review_too_large",
   "settings_unavailable",
   "disabled",
   "provider_error",

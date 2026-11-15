@@ -241,14 +241,16 @@ describe("injection, partial failure and the caps", () => {
     assert.equal(stored.refusalGrounds.filter((g: any) => g.criterionId === "a-funds").length, 0);
   });
 
-  test("a per-assessment request cap fails the job before the call that would pass it", async () => {
+  test("a per-assessment request cap fails the job before ANY call, with its own code (#310)", async () => {
     seedStandardCase();
     seedDocument({ id: "doc-2", key: "bank2", label: "Second statement" });
     const provider = scripted({ byKey: { bank: extraction(BANK_VALUES), bank2: extraction([]) } });
-    const stored = await assessOnce(serviceWith(provider, { maxRequestsPerAssessment: 1 }));
+    // 2 documents + 1 judgement call needed; a cap of 2 leaves room for 1 document.
+    const stored = await assessOnce(serviceWith(provider, { maxRequestsPerAssessment: 2 }));
     assert.equal(stored.status, "failed");
-    assert.equal(stored.error.code, "cost_cap_exceeded");
-    assert.equal(provider.callsFor("extraction"), 1, "the second call never happens");
+    // Not `cost_cap_exceeded` (which the app showed as "reviews are paused").
+    assert.equal(stored.error.code, "too_many_documents");
+    assert.equal(provider.requests.length, 0, "no call is made for a review that cannot finish");
   });
 
   test("the daily cap fails a job that would reach a model, with zero calls", async () => {
@@ -352,7 +354,7 @@ describe("requests: idempotent, free re-run, retry, and no approved rubric", () 
   });
 
   test("the merged default settings are what a job uses when the doc is absent", () => {
-    assert.equal(mergeAiSettings(undefined).maxRequestsPerAssessment, 12);
+    assert.equal(mergeAiSettings(undefined).maxRequestsPerAssessment, 30); // #310: was 12
     assert.ok(NOW.getTime() > 0);
     void resetStore;
   });

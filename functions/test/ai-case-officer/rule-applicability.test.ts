@@ -417,7 +417,10 @@ describe("a 500-rule rulebook is assessed without truncation", () => {
     // 1 document call + 2 judgement batches needed, cap 2.
     const stored = await assess(serviceWith(provider, { maxRequestsPerAssessment: 2 }));
     assert.equal(stored.status, "failed");
-    assert.equal(stored.error.code, "cost_cap_exceeded");
+    // (#310) The rules alone use the whole cap, so no document fits: the
+    // "too large for one review" code, not the old cost-cap code.
+    assert.equal(stored.error.code, "review_too_large");
+    assert.equal(provider.requests.length, 0, "decided before any model call");
     assert.equal(stored.strengths?.length ?? 0, 0, "nothing is stored for a subset");
     assert.ok(storedAssessments("app-1").length === 1);
   });
