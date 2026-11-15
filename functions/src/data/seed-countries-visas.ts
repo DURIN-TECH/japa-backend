@@ -333,6 +333,26 @@ const COUNTRIES: SeedCountry[] = [
     isSupported: true,
     popularityRank: 34,
   },
+  // ---- #331: Italy and Austria, the last two members of the bloc NL belongs to ----
+  // Same rule as the #306 and #322 entries above: the membership and its
+  // official source are recorded in the data file (shared-visa-data.ts), not
+  // here; these are only the country records the app needs to list each one
+  // (a name and a flag, not legal facts). Ranks 35 and 36, after #322's 15-34
+  // and before the unsupported ones (99+), so no existing country's rank changes.
+  {
+    code: "IT",
+    name: "Italy",
+    flagUrl: "https://flagcdn.com/w320/it.png",
+    isSupported: true,
+    popularityRank: 35,
+  },
+  {
+    code: "AT",
+    name: "Austria",
+    flagUrl: "https://flagcdn.com/w320/at.png",
+    isSupported: true,
+    popularityRank: 36,
+  },
 ];
 
 // ============================================
@@ -1265,6 +1285,36 @@ const VISA_TYPES: SeedVisaType[] = [
     name: "Short Stay Visa",
     code: "SHORT-STAY",
     description: "Short stay visa for Romania.",
+    category: "tourist",
+    eligibilityCriteria: [],
+  },
+
+  // ============================================
+  // #331 SHORT-STAY RECORDS (Italy and Austria)
+  // ============================================
+  // Exactly the shape of the #306 and #322 records above (see the "#306
+  // SHORT-STAY RECORDS" note for why each states so little). Each one is listed
+  // under the shared route's `inheritedBy` in the data file and takes its price
+  // from the route's sourced fee.
+
+  // ---- ITALY ----
+  {
+    id: "it-visitor",
+    countryCode: "IT",
+    name: "Short Stay Visa",
+    code: "SHORT-STAY",
+    description: "Short stay visa for Italy.",
+    category: "tourist",
+    eligibilityCriteria: [],
+  },
+
+  // ---- AUSTRIA ----
+  {
+    id: "at-visitor",
+    countryCode: "AT",
+    name: "Short Stay Visa",
+    code: "SHORT-STAY",
+    description: "Short stay visa for Austria.",
     category: "tourist",
     eligibilityCriteria: [],
   },
