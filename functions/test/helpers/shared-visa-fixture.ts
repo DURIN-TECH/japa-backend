@@ -49,3 +49,28 @@ export function fixtureDataWithFee(): typeof FIXTURE_DATA & { sharedRoutes: Arra
   copy.sharedRoutes[0].fee = JSON.parse(JSON.stringify(FIXTURE_FEE));
   return copy;
 }
+
+// ---- Issue #339: a MADE-UP processing time and stay limit for the fixture route ----
+// Placeholder sentences, figures and ids: nothing here is a real legal fact.
+// The figures in each text are stated in its quote, so the blocks are valid.
+export const FIXTURE_PROCESSING = {
+  processingTime: "Up to 10 days (up to 30 in some cases)",
+  processingDaysMax: 30,
+  quote: ["Placeholder sentence stating a decision within 10 days.", "Placeholder sentence stating up to 30 days in some cases."],
+  url: `https://${BLOC_HOST}/processing`,
+  guidanceSourceId: "example-area-processing-source",
+};
+export const FIXTURE_VALIDITY = {
+  validityPeriod: "Stays of up to 30 days in any 60-day period",
+  quote: ["Placeholder sentence stating stays of 30 days in any 60-day period."],
+  url: `https://${BLOC_HOST}/stay`,
+  guidanceSourceId: "example-area-stay-source",
+};
+
+/** FIXTURE_DATA with the made-up processing time and stay limit on its one route (a fresh copy every call). */
+export function fixtureDataWithFacts(): typeof FIXTURE_DATA & { sharedRoutes: Array<{ processing: typeof FIXTURE_PROCESSING; validity: typeof FIXTURE_VALIDITY }> } {
+  const copy = JSON.parse(JSON.stringify(FIXTURE_DATA));
+  copy.sharedRoutes[0].processing = JSON.parse(JSON.stringify(FIXTURE_PROCESSING));
+  copy.sharedRoutes[0].validity = JSON.parse(JSON.stringify(FIXTURE_VALIDITY));
+  return copy;
+}

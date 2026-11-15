@@ -485,6 +485,35 @@ export interface Country {
 //
 // Fields are absent (never `undefined`) when they do not apply, like
 // `VisaFeeMeta`.
+/**
+ * Issue #339: the citation of ONE fact of a shared route a record inherits
+ * (its processing time or its stay limit), shaped like `VisaSourcedFee`
+ * without the conversion block. `quote` is a list because one fact can need
+ * several sentences that are separate paragraphs in the source.
+ */
+export interface VisaSourcedFact {
+  /** The shared route whose source states the fact. */
+  sharedRouteId: string;
+  /** The sentence(s) of the official source that state the fact, word for word, in the source's order. */
+  quote: string[];
+  /** The official document the quote is from (https). */
+  url: string;
+  /** The stored official source the quote is in (`guidanceSources/{id}`). */
+  guidanceSourceId: string;
+}
+
+/**
+ * Issue #339: one citation per sourced fact on a record. A key is present
+ * only when the record carries that fact from a shared route:
+ *   - `processing` cites `processingTime` (and `processingDaysMin` /
+ *     `processingDaysMax` when the route states them),
+ *   - `validity` cites `validityPeriod`.
+ */
+export interface VisaSourcedFacts {
+  processing?: VisaSourcedFact;
+  validity?: VisaSourcedFact;
+}
+
 export interface VisaSourcedFee {
   /** The shared route whose source states the fee. */
   sharedRouteId: string;
@@ -577,6 +606,13 @@ export interface VisaType {
   // Written and removed ONLY by the countries/visas seed, together with
   // `baseCostUsd`; absent on every record whose fee has another origin.
   sourcedFee?: VisaSourcedFee;
+
+  // Issue #339: where `processingTime` / `processingDaysMax` and
+  // `validityPeriod` come from when they are facts of a shared route this
+  // record inherits (see `VisaSourcedFacts` below). Written and removed ONLY
+  // by the countries/visas seed, together with the fields they cite; absent
+  // on every record whose facts have another origin.
+  sourcedFacts?: VisaSourcedFacts;
 
   // Availability
   isActive: boolean;
