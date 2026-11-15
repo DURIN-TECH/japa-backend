@@ -52,6 +52,11 @@ const COLLECTIONS = [
   // withdrawals cannot both pass the balance check. Explicit deny in
   // firestore.rules; a client that could write one could block payouts.
   "withdrawalLocks",
+  // Consultation booking locks (issue #288): one doc per client + agent pair,
+  // read and written inside the find-or-create transaction of a client's paid
+  // booking (POST /consultations) so two creates for one slot leave one
+  // booking. Explicit deny in firestore.rules; it names who books whom.
+  "consultationBookingLocks",
   // Agency listing screening results (issue #120): admin-only through the API.
   "listingScreenings",
   "rubricReviewHistory",

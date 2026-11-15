@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { collections } from "../utils/firebase";
 import { Consultation, ConsultationStatus, ConsultationType } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
@@ -6,7 +7,18 @@ import { ROLES } from "@durin-tech/authz";
 // path (tests swap both through the consultations harness). The status change
 // uses the SAME clock as the quote lock it reads, and the same runner as
 // `settlePayment`, so a cancel and a payment can never interleave.
-import { chargeRuntime, isQuoteExpired } from "./charge-checkout.service";
+import {
+  chargeRuntime,
+  isQuoteExpired,
+  // Issue #288: a booking is resumed, or swept, only when it was priced by
+  // #180 (a well-formed charge snapshot); the sweep asks Paystack about the
+  // booking's current checkout before it closes it.
+  hasChargeSnapshot,
+  lookupCheckoutState,
+  PaystackState,
+} from "./charge-checkout.service";
+// Issue #288: a booking the sweep finds PAID at Paystack is settled, not cancelled.
+import { settlePayment } from "./consultation-charge.service";
 
 // ============================================
 // STATUS TRANSITION RULES (issue #151)
@@ -521,6 +533,182 @@ export function bookingHasPayment(
   );
 }
 
+// ============================================
+// RESUME A PENDING BOOKING (issue #288)
+// ============================================
+//
+// The mobile pay screen calls `POST /consultations` every time the client
+// taps Pay. Without a check, a client who leaves and comes back piled up one
+// `pending_payment` booking per visit for the same agent and time. The client
+// flow of `POST /consultations` now FINDS the unpaid booking of that slot and
+// resumes it; it only creates one when there is none.
+
+/**
+ * The slot a client books: who, with which agent, and when. Two bookings are
+ * "the same slot" when all four agree.
+ */
+export interface BookingSlot {
+  /** The client (the booking's `userId`). */
+  userId: string;
+  /** The agent's USER uid (the booking's `agentId`), not the agent doc id. */
+  agentId: string;
+  /** The day, compared as an instant (milliseconds). */
+  scheduledDate: Timestamp;
+  /** The time of day, already normalised to 24-hour `HH:mm`. */
+  scheduledTime: string;
+}
+
+/**
+ * True when `c` is an unpaid booking of exactly this slot that can still be
+ * paid: `pending_payment`, not paid, priced by #180 (a legacy naira row is
+ * never re-priced, so it can not be resumed either), same client, same agent,
+ * same day (same instant) and same time. Pure.
+ *
+ * The STORED time is normalised before it is compared: rows written before
+ * this issue may hold "10:00 AM" where the request now says "10:00".
+ */
+export function isResumableForSlot(c: Consultation, slot: BookingSlot): boolean {
+  return (
+    c.status === "pending_payment" &&
+    c.paymentStatus !== "paid" &&
+    hasChargeSnapshot(c) &&
+    c.userId === slot.userId &&
+    c.agentId === slot.agentId &&
+    millisOf(c.scheduledDate) === slot.scheduledDate.toMillis() &&
+    (normalizeScheduledTime(c.scheduledTime) ?? c.scheduledTime) === slot.scheduledTime
+  );
+}
+
+/**
+ * The booking to resume for a slot, out of `candidates`: the NEWEST by
+ * `createdAt` of those that match (`isResumableForSlot`), or null when none
+ * does. Pure. Older duplicates (made before this issue) are left alone: the
+ * cleanup sweep below cancels them once they are a day past their quote lock.
+ */
+export function pickResumableBooking(candidates: Consultation[], slot: BookingSlot): Consultation | null {
+  const matches = candidates.filter((c) => isResumableForSlot(c, slot));
+  if (matches.length === 0) return null;
+  // Newest first; a row with no `createdAt` (bad data) sorts last.
+  matches.sort((a, b) => (millisOf(b.createdAt) ?? 0) - (millisOf(a.createdAt) ?? 0));
+  return matches[0];
+}
+
+/**
+ * The id of the lock document of one client + agent pair
+ * (`consultationBookingLocks`, see `createOrResumePendingBooking`): a SHA-256
+ * of the two uids, so the id is always a usable Firestore document id
+ * whatever characters a uid holds, and the same pair always gets the same
+ * document. Pure.
+ */
+export function bookingLockId(userId: string, agentId: string): string {
+  // The newline cannot occur inside a uid, so ("ab","c") and ("a","bc") differ.
+  return createHash("sha256").update(`${userId}\n${agentId}`).digest("hex");
+}
+
+/** What `createOrResumePendingBooking` did: wrote a new booking, or found the slot's unpaid one. */
+export type CreateOrResumeOutcome =
+  | { kind: "created"; consultation: Consultation }
+  | { kind: "existing"; consultation: Consultation };
+
+// ============================================
+// CLEANUP OF ABANDONED BOOKINGS (issue #288)
+// ============================================
+//
+// Nothing used to close a `pending_payment` booking its client walked away
+// from. An hourly job (`sweepAbandonedConsultations` in index.ts) now cancels
+// those whose quote lock ended more than a day ago, after asking Paystack
+// whether the booking's checkout was paid after all.
+
+/** How long after its quote lock ended an unpaid booking is cancelled, in hours. */
+export const ABANDONED_BOOKING_GRACE_HOURS = 24;
+/** The most bookings one sweep run looks at. */
+export const ABANDONED_SWEEP_BATCH_SIZE = 200;
+/** `cancelledBy` of a booking the sweep closed (no user did it). */
+export const SYSTEM_CANCEL_ACTOR = "system";
+/** `cancellationReason` of a booking the sweep closed: a sentence the client can read. */
+export const SYSTEM_CANCELLATION_REASON = "Cancelled by Seli: this booking wasn't paid in time. Please book again.";
+
+/** Milliseconds in an hour (kept named so the cutoff maths reads plainly). */
+const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * The latest `quoteExpiresAt` a booking may have and still be swept at time
+ * `at`: bookings whose lock ended BEFORE this instant are abandoned. Pure.
+ */
+export function abandonedCutoff(at: Date): Date {
+  return new Date(at.getTime() - ABANDONED_BOOKING_GRACE_HOURS * HOUR_MS);
+}
+
+/**
+ * True when `c` is an unpaid booking the sweep may close at time `at`:
+ * `pending_payment`, not paid, and its quote lock ended more than
+ * ABANDONED_BOOKING_GRACE_HOURS ago. Pure.
+ *
+ * A LEGACY row (before #180: no `quoteExpiresAt`) is never abandoned in this
+ * sense: the one-off `cancel:legacy-consultations` script covers those.
+ */
+export function isAbandonedBooking(
+  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt">,
+  at: Date
+): boolean {
+  const expiresAt = millisOf(c.quoteExpiresAt);
+  return (
+    c.status === "pending_payment" &&
+    c.paymentStatus !== "paid" &&
+    expiresAt !== null &&
+    expiresAt < abandonedCutoff(at).getTime()
+  );
+}
+
+/**
+ * What the sweep does with one booking:
+ *  - `skip`:   not abandoned (paid or cancelled meanwhile, legacy, too recent);
+ *  - `settle`: Paystack says its checkout was PAID: confirm it, never cancel;
+ *  - `leave`:  a payment may still land on it (or Paystack was not asked): try again next run;
+ *  - `cancel`: nobody paid and nobody can any more: close it.
+ */
+export type AbandonedBookingDecision = "skip" | "settle" | "leave" | "cancel";
+
+/**
+ * Decide what the sweep does with one booking. Pure: reads nothing, writes
+ * nothing, so tests (and the emulators) can run it at any clock time.
+ *
+ * @param paystack what Paystack reports about the booking's CURRENT checkout
+ *   (`lookupCheckoutState`), or null when it was not asked. A booking with no
+ *   `transactionId` has no checkout to ask about and is cancelled; a booking
+ *   WITH one that was not looked up is left alone (fail closed).
+ * @param at the time of the decision (the charge path's clock)
+ */
+export function decideAbandonedBooking(
+  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt" | "transactionId">,
+  paystack: PaystackState | null,
+  at: Date
+): AbandonedBookingDecision {
+  if (!isAbandonedBooking(c, at)) return "skip";
+  // No checkout was ever claimed: there is nothing anyone could have paid.
+  if (!c.transactionId) return "cancel";
+  if (paystack === "paid") return "settle";
+  if (paystack === "final_unpaid") return "cancel";
+  // `in_progress` (a bank transfer may still complete), or not looked up.
+  return "leave";
+}
+
+/** What one sweep run did, for the function's log line. */
+export interface AbandonedSweepResult {
+  /** Bookings the query returned (at most ABANDONED_SWEEP_BATCH_SIZE). */
+  scanned: number;
+  /** Closed: `status: "cancelled"`, `cancelledBy: "system"`. */
+  cancelled: number;
+  /** Found paid at Paystack and confirmed through `settlePayment`. */
+  settled: number;
+  /** Left for a later run: a payment may still land (Paystack `in_progress`). */
+  leftInProgress: number;
+  /** Not touched: changed between the query and the write, or paid money that could not be applied. */
+  skipped: number;
+  /** A Paystack or Firestore failure on one booking (logged; the run goes on). */
+  errors: number;
+}
+
 export interface ConsultationFilters {
   status?: ConsultationStatus;
   applicationId?: string;
@@ -627,6 +815,217 @@ class ConsultationService {
 
     await ref.set(consultation);
     return consultation;
+  }
+
+  /**
+   * The unpaid bookings of one client with one agent (issue #288): three
+   * equality filters, so Firestore answers it from its single-field indexes
+   * (no composite index). The day and time are matched in memory
+   * (`pickResumableBooking`), because the stored time of an older row may not
+   * be normalised and a client rarely has more than a few of these.
+   */
+  private pendingBookingsQuery(slot: BookingSlot): FirebaseFirestore.Query {
+    return collections.consultations
+      .where("userId", "==", slot.userId)
+      .where("agentId", "==", slot.agentId)
+      .where("status", "==", "pending_payment");
+  }
+
+  /**
+   * The unpaid booking to resume for a slot, or null (issue #288). A plain
+   * read, used BEFORE the monthly limit and the pricing so that a resume
+   * needs neither. The find-or-create decision that must not race is
+   * `createOrResumePendingBooking`.
+   */
+  async findResumableBooking(slot: BookingSlot): Promise<Consultation | null> {
+    const snapshot = await this.pendingBookingsQuery(slot).get();
+    return pickResumableBooking(snapshot.docs.map((doc) => doc.data() as Consultation), slot);
+  }
+
+  /**
+   * Create a `pending_payment` booking, UNLESS the client already has an
+   * unpaid one for the same agent, day and time (issue #288). Then that
+   * booking is returned and nothing is written.
+   *
+   * ONE Firestore transaction (the charge path's runner):
+   *  1. it first reads the pair's LOCK document
+   *     (`consultationBookingLocks/{bookingLockId}`) and, when it creates a
+   *     booking, writes it. Two creates of one client with one agent
+   *     therefore always touch the same document, so Firestore runs them one
+   *     after the other: the second is retried on fresh data and finds the
+   *     first one's booking. A query alone is not relied on for this, because
+   *     a query inside a transaction does not have to block a concurrent
+   *     INSERT of a new row (the same reasoning as `withdrawalLocks`, #287);
+   *  2. the pair's unpaid bookings are read THROUGH the transaction and the
+   *     slot is matched (`pickResumableBooking`);
+   *  3. only when none matches are the new booking and the lock written, in
+   *     the same commit.
+   * So two requests for the same slot that arrive together leave exactly one
+   * booking. The lock is per PAIR, not per slot: two different slots of one
+   * pair also run one after the other, which costs nothing and keeps one
+   * small document per pair.
+   *
+   * @param data the new booking as `createConsultation` takes it; its
+   *   `scheduledTime` must already be normalised (`normalizeScheduledTime`)
+   */
+  async createOrResumePendingBooking(
+    data: Omit<Consultation, "id" | "createdAt" | "updatedAt">
+  ): Promise<CreateOrResumeOutcome> {
+    const slot: BookingSlot = {
+      userId: data.userId,
+      agentId: data.agentId,
+      scheduledDate: data.scheduledDate,
+      scheduledTime: data.scheduledTime,
+    };
+    // The id is chosen outside the transaction body: a retried body then
+    // writes the same document rather than a second one.
+    const ref = collections.consultations.doc();
+    const lockRef = collections.consultationBookingLocks.doc(bookingLockId(slot.userId, slot.agentId));
+    return chargeRuntime.runTransaction<CreateOrResumeOutcome>(async (tx) => {
+      // ---- Reads (before any write, as Firestore requires) ----
+      // The lock read is what makes two creates of one pair conflict.
+      const lockSnap = await tx.get(lockRef);
+      const snapshot = await tx.get(this.pendingBookingsQuery(slot));
+
+      // ---- Decide ----
+      const existing = pickResumableBooking(snapshot.docs.map((doc) => doc.data() as Consultation), slot);
+      // Resumed: nothing is written, not even the lock.
+      if (existing) return { kind: "existing", consultation: existing };
+
+      // ---- Writes (both or neither) ----
+      // Same timestamps as `createConsultation` (the wall clock).
+      const now = Timestamp.now();
+      const consultation: Consultation = { ...data, id: ref.id, createdAt: now, updatedAt: now };
+      tx.set(ref, consultation);
+      // Writing the lock is what forces a concurrent create of the same pair
+      // to be retried. The fields are for a human reading the console.
+      const previousCount = lockSnap.exists ? Number(lockSnap.data()?.bookingCount) || 0 : 0;
+      tx.set(lockRef, {
+        userId: slot.userId,
+        agentId: slot.agentId,
+        lastConsultationId: ref.id,
+        bookingCount: previousCount + 1,
+        updatedAt: now,
+      });
+      return { kind: "created", consultation };
+    });
+  }
+
+  /**
+   * Cancel unpaid bookings that were abandoned (issue #288): `pending_payment`
+   * with a quote lock that ended more than ABANDONED_BOOKING_GRACE_HOURS ago.
+   * Run hourly by `sweepAbandonedConsultations` (index.ts). Guest bookings
+   * are the same rows and are covered too.
+   *
+   * For each booking (at most ABANDONED_SWEEP_BATCH_SIZE per run, oldest lock
+   * first), see `decideAbandonedBooking`:
+   *  - its current checkout (`transactionId`), if any, is checked at Paystack
+   *    (`lookupCheckoutState`);
+   *  - PAID: settled through `settlePayment` (the booking is confirmed);
+   *  - IN PROGRESS: left alone for a later run;
+   *  - final unpaid, or no checkout at all: cancelled, in a transaction of
+   *    its own that re-reads the booking and writes only if it is STILL
+   *    abandoned and still carries the reference that was checked (a payment
+   *    or a re-price that landed meanwhile wins).
+   *
+   * A cancel writes `status`, `cancelledAt`, `cancelledBy: "system"`,
+   * `cancellationReason` and `updatedAt`, and NOBODY IS NOTIFIED. A payment
+   * that still lands on the cancelled booking is recorded for refund by
+   * `settlePayment` (`consultationPaymentExceptions`, `booking_not_payable`).
+   *
+   * The clock is the charge path's (`chargeRuntime.now()`), so tests and the
+   * emulators can move it instead of waiting a day. One failing booking (a
+   * Paystack outage) is logged and counted; the others still run.
+   *
+   * Needs the composite index consultations(status, quoteExpiresAt), see
+   * firestore.indexes.json. A legacy row has no `quoteExpiresAt`, so the
+   * query never returns it.
+   */
+  async sweepAbandonedBookings(): Promise<AbandonedSweepResult> {
+    const result: AbandonedSweepResult = {
+      scanned: 0, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 0,
+    };
+    const cutoff = Timestamp.fromDate(abandonedCutoff(chargeRuntime.now()));
+    const snapshot = await collections.consultations
+      .where("status", "==", "pending_payment")
+      .where("quoteExpiresAt", "<", cutoff)
+      .orderBy("quoteExpiresAt", "asc")
+      .limit(ABANDONED_SWEEP_BATCH_SIZE)
+      .get();
+    result.scanned = snapshot.size;
+
+    for (const doc of snapshot.docs) {
+      const booking = doc.data() as Consultation;
+      try {
+        // Ask Paystack about the current checkout, when there is one.
+        const reference = booking.transactionId ?? null;
+        const lookup = reference ? await lookupCheckoutState(reference) : null;
+        const decision = decideAbandonedBooking(booking, lookup?.state ?? null, chargeRuntime.now());
+
+        if (decision === "settle") {
+          // Paid after all: confirm it (all checks re-done on the fresh booking).
+          const outcome = await settlePayment(doc.id, reference!, lookup!.result!);
+          if (outcome?.kind === "confirmed" || outcome?.kind === "already_paid") {
+            result.settled++;
+          } else {
+            // Paid, but not applicable (wrong amount, ...): a human looks at it.
+            console.error(
+              `[consultation sweep] ${doc.id} is paid at Paystack (${reference}) but could not be settled ` +
+                `(${outcome?.kind ?? "booking gone"}); left as it is for review`
+            );
+            result.skipped++;
+          }
+          continue;
+        }
+        if (decision === "leave") {
+          result.leftInProgress++;
+          continue;
+        }
+        if (decision === "skip") {
+          result.skipped++;
+          continue;
+        }
+        // decision === "cancel"
+        if (await this.cancelAbandonedBooking(doc.id, reference)) result.cancelled++;
+        else result.skipped++;
+      } catch (error) {
+        // One booking must not stop the run (e.g. Paystack is down: nothing
+        // is cancelled without its answer).
+        console.error(`[consultation sweep] ${doc.id} failed; left as it is:`, error);
+        result.errors++;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Close ONE abandoned booking as the system (issue #288), in its own
+   * transaction: the booking is re-read and written only if it is still
+   * `pending_payment`, unpaid, past the cutoff, and still on the checkout
+   * reference the sweep asked Paystack about (`observedReference`, null when
+   * it had none). So a payment settled, or a checkout re-issued, between the
+   * Paystack check and this write is never overwritten.
+   *
+   * @returns true when the booking was cancelled, false when it was left
+   */
+  private async cancelAbandonedBooking(id: string, observedReference: string | null): Promise<boolean> {
+    const ref = collections.consultations.doc(id);
+    return chargeRuntime.runTransaction<boolean>(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return false;
+      const fresh = snap.data() as Consultation;
+      const at = chargeRuntime.now();
+      if (!isAbandonedBooking(fresh, at) || (fresh.transactionId ?? null) !== observedReference) return false;
+      const now = Timestamp.fromDate(at);
+      tx.update(ref, {
+        status: "cancelled",
+        cancelledAt: now,
+        cancelledBy: SYSTEM_CANCEL_ACTOR,
+        cancellationReason: SYSTEM_CANCELLATION_REASON,
+        updatedAt: now,
+      });
+      return true;
+    });
   }
 
   /**

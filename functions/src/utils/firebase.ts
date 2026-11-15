@@ -92,6 +92,12 @@ export const collections = {
   // denied to every client in firestore.rules.
   withdrawalLocks: db.collection("withdrawalLocks"),
   consultations: db.collection("consultations"),
+  // (#288) One lock doc per client + agent pair (id: a hash of the two uids),
+  // read and written inside the find-or-create transaction of a client's
+  // paid booking, so two creates for the same slot run one after the other
+  // (ConsultationService.createOrResumePendingBooking). Backend only: denied
+  // to every client in firestore.rules.
+  consultationBookingLocks: db.collection("consultationBookingLocks"),
   // Issue #180 (review fix): consultation payments we hold but cannot apply
   // (a second charge on a superseded checkout of an already-paid booking, or a
   // payment on a cancelled booking), for a human to refund. Doc id = the
