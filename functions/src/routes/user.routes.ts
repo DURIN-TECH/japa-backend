@@ -3,6 +3,7 @@ import { userController } from "../controllers/user.controller";
 import { clientVerificationController } from "../controllers/client-verification.controller";
 import { aiMessageAccessController } from "../controllers/ai-message-access.controller";
 import { applicantHoldingsController } from "../controllers/applicant-holdings.controller";
+import { savedDestinationsController } from "../controllers/saved-destinations.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
 
 const router = Router();
@@ -68,6 +69,26 @@ router.post("/me/holdings/documents", verifyAuth, (req, res) =>
 );
 router.delete("/me/holdings/documents/:documentId", verifyAuth, (req, res) =>
   applicantHoldingsController.removeDocument(req, res)
+);
+
+// Saved destinations (issue #146): the visas the caller saved with the heart
+// on a destination screen. ALWAYS the caller's own list (/me): no route takes
+// a user id, so nobody can read or change another user's saves. verifyAuth
+// answers 401 without a token and applies the read-only-plan write block to
+// PUT and DELETE (no exemption here); GET works on a read-only plan.
+//   GET    /me/saved-destinations                        -> SavedDestinationItem[], newest first
+//   PUT    /me/saved-destinations/:countryCode/:visaId   -> the saved item (idempotent;
+//            404 NOT_FOUND unknown / hidden visa, 409 SAVED_LIMIT_REACHED at 200 saves)
+//   DELETE /me/saved-destinations/:countryCode/:visaId   -> { countryCode, visaId, saved: false } (idempotent)
+// The country code matches in any case ("gb" and "GB" are the same save).
+router.get("/me/saved-destinations", verifyAuth, (req, res) =>
+  savedDestinationsController.list(req, res)
+);
+router.put("/me/saved-destinations/:countryCode/:visaId", verifyAuth, (req, res) =>
+  savedDestinationsController.save(req, res)
+);
+router.delete("/me/saved-destinations/:countryCode/:visaId", verifyAuth, (req, res) =>
+  savedDestinationsController.remove(req, res)
 );
 
 // Notification channel preferences (email/push on-off). PATCH a partial body to

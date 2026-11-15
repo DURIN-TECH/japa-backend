@@ -2088,3 +2088,60 @@ export interface Feedback {
   status: "new";
   createdAt: Timestamp;
 }
+
+// ============================================
+// SAVED DESTINATIONS (issue #146)
+// ============================================
+//
+// A client "saves" a destination (one visa in one country) with the heart on
+// its screen. Each save is ONE document under the user:
+//   users/{uid}/savedDestinations/{COUNTRYCODE}_{visaId}
+// Backend only (firestore.rules denies every client read and write); the app
+// goes through GET / PUT / DELETE /users/me/saved-destinations.
+
+/**
+ * The stored save. It holds only the key and the time: the visa's name, fee
+ * and so on are read from the visa when the list is served, so a tile never
+ * shows stale data and a visa that is hidden later drops out of the list.
+ */
+export interface SavedDestination {
+  /** ISO 3166-1 alpha-2, always UPPER CASE ("GB"), whatever case was sent. */
+  countryCode: string;
+  /** Id of the visa: countries/{countryCode}/visaTypes/{visaId}. */
+  visaId: string;
+  /** When the user first saved it. Saving again does not move it. */
+  savedAt: Timestamp;
+}
+
+/**
+ * The part of a visa a destination tile draws. An allow-list on purpose: the
+ * saved list never returns a visa's internal fields (review state, scrape
+ * provenance, owning agency...). The names match `VisaType`, so the mobile
+ * tile mapper takes this object as it takes a visa.
+ */
+export interface SavedDestinationVisa {
+  id: string;
+  /** UPPER CASE, same as the item's `countryCode`. */
+  countryCode: string;
+  name: string;
+  description: string;
+  category: VisaCategory;
+  /** Display text, e.g. "3 weeks". */
+  processingTime: string;
+  /** Government fee in US dollars. */
+  baseCostUsd: number;
+  /** Percent, or null when not known. */
+  successRate: number | null;
+  /** Null when not counted yet. */
+  totalApplications: number | null;
+  /** Where the visa record came from ("scraped", "agency"...), or null for a seed. */
+  source: VisaType["source"] | null;
+}
+
+/** One saved destination as the API returns it (list item and PUT result). */
+export interface SavedDestinationItem extends SavedDestination {
+  /** The country's display name ("United Kingdom"); the code when the country record is missing. */
+  countryName: string;
+  /** What the tile needs, read from the visa at request time. */
+  visa: SavedDestinationVisa;
+}
