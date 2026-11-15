@@ -33,15 +33,22 @@ interface SeedVisaType {
   code: string;
   description: string;
   category: string;
-  processingTime: string;
-  processingDaysMin: number;
-  processingDaysMax: number;
+  // #306: all three optional. An entry with no official source on record for
+  // the processing time omits them (the short-stay records of the bloc's
+  // members added in #306 state none). buildVisaTypeDoc then leaves the keys
+  // out of the stored doc, exactly like a scraped visa whose page states no
+  // processing time, and the country's `minProcessingDays` skips the entry.
+  processingTime?: string;
+  processingDaysMin?: number;
+  processingDaysMax?: number;
   // #239: both optional. An entry with no official source on record for the
   // fee / validity omits it, so what applicants see comes from the rulebook
   // and the scrape, not from seed text nobody can trace to a page.
   baseCostUsd?: number;
   validityPeriod?: string;
-  isExtendable: boolean;
+  // #306: optional for the same reason. With no official source on record for
+  // whether the visa can be extended, the entry says nothing (never `false`).
+  isExtendable?: boolean;
   maxExtensions?: number;
   eligibilityCriteria: string[];
   applicationUrl?: string;
@@ -136,6 +143,48 @@ const COUNTRIES: SeedCountry[] = [
     flagUrl: "https://flagcdn.com/w320/ke.png",
     isSupported: false,
     popularityRank: 101,
+  },
+
+  // ---- #306: the other first members of the bloc NL belongs to ----
+  // The membership itself (and its official source) is recorded in the data
+  // file (shared-visa-data.ts), not here. These entries are only the country
+  // records the app needs to list each one: a name and a flag (not legal
+  // facts). Ranks 10-14 sit after the existing supported countries and before
+  // the unsupported ones (99+), so no existing country's rank changes.
+  {
+    code: "BE",
+    name: "Belgium",
+    flagUrl: "https://flagcdn.com/w320/be.png",
+    isSupported: true,
+    popularityRank: 10,
+  },
+  {
+    code: "FR",
+    name: "France",
+    flagUrl: "https://flagcdn.com/w320/fr.png",
+    isSupported: true,
+    popularityRank: 11,
+  },
+  {
+    code: "LU",
+    name: "Luxembourg",
+    flagUrl: "https://flagcdn.com/w320/lu.png",
+    isSupported: true,
+    popularityRank: 12,
+  },
+  {
+    code: "ES",
+    name: "Spain",
+    flagUrl: "https://flagcdn.com/w320/es.png",
+    isSupported: true,
+    popularityRank: 13,
+  },
+  {
+    code: "PT",
+    name: "Portugal",
+    flagUrl: "https://flagcdn.com/w320/pt.png",
+    isSupported: true,
+    popularityRank: 14,
   },
 ];
 
@@ -679,6 +728,18 @@ const VISA_TYPES: SeedVisaType[] = [
       "Language proficiency (German or English depending on course)",
     ],
   },
+  // #306: the short-stay record that inherits the shared route (data file,
+  // `inheritedBy`). Same shape as the BE/FR/LU/ES/PT records below: see the
+  // "#306 SHORT-STAY RECORDS" note there for why it states so little.
+  {
+    id: "de-visitor",
+    countryCode: "DE",
+    name: "Short Stay Visa",
+    code: "SHORT-STAY",
+    description: "Short stay visa for Germany.",
+    category: "tourist",
+    eligibilityCriteria: [],
+  },
 
   // ---- NETHERLANDS ----
   {
@@ -754,6 +815,80 @@ const VISA_TYPES: SeedVisaType[] = [
       "Return travel booking",
       "Purpose of visit documentation",
     ],
+  },
+
+  // ============================================
+  // #306 SHORT-STAY RECORDS (BE, FR, LU, ES, PT; DE's is in its own section)
+  // ============================================
+  // One record per country the data file (shared-visa-data.ts) lists under
+  // the shared route's `inheritedBy`. The record states NOTHING that would be
+  // a legal or immigration fact without an official source on record here:
+  //   - no `baseCostUsd`: the price is the route's sourced fee, which the seed
+  //     converts and writes (#299); a fee of its own would be refused as a
+  //     second fee source (seedFeeProblems),
+  //   - no `validityPeriod`, `maxExtensions`, `isExtendable`, processing time
+  //     (`processingTime`, `processingDaysMin`, `processingDaysMax`),
+  //     `applicationUrl` or `applicationInstructions`: all optional since
+  //     #239 / #306, and left out of the stored doc,
+  //   - `eligibilityCriteria: []`: requirements come from the published
+  //     shared rulebook the record inherits, not from seed text,
+  //   - the description only names the visa and the country.
+  // The bloc is not named in this file: the route's name, members and sources
+  // come from the data file through `inheritsFromFor`.
+
+  // ---- BELGIUM ----
+  {
+    id: "be-visitor",
+    countryCode: "BE",
+    name: "Short Stay Visa",
+    code: "SHORT-STAY",
+    description: "Short stay visa for Belgium.",
+    category: "tourist",
+    eligibilityCriteria: [],
+  },
+
+  // ---- FRANCE ----
+  {
+    id: "fr-visitor",
+    countryCode: "FR",
+    name: "Short Stay Visa",
+    code: "SHORT-STAY",
+    description: "Short stay visa for France.",
+    category: "tourist",
+    eligibilityCriteria: [],
+  },
+
+  // ---- LUXEMBOURG ----
+  {
+    id: "lu-visitor",
+    countryCode: "LU",
+    name: "Short Stay Visa",
+    code: "SHORT-STAY",
+    description: "Short stay visa for Luxembourg.",
+    category: "tourist",
+    eligibilityCriteria: [],
+  },
+
+  // ---- SPAIN ----
+  {
+    id: "es-visitor",
+    countryCode: "ES",
+    name: "Short Stay Visa",
+    code: "SHORT-STAY",
+    description: "Short stay visa for Spain.",
+    category: "tourist",
+    eligibilityCriteria: [],
+  },
+
+  // ---- PORTUGAL ----
+  {
+    id: "pt-visitor",
+    countryCode: "PT",
+    name: "Short Stay Visa",
+    code: "SHORT-STAY",
+    description: "Short stay visa for Portugal.",
+    category: "tourist",
+    eligibilityCriteria: [],
   },
 
   // ---- UAE ----
@@ -916,6 +1051,9 @@ export interface SeedCountriesAndVisasOptions {
 }
 
 export type { SeedCountry, SeedVisaType };
+// #306: the shipped lists, read by the unit tests to check that every member
+// country and every inheriting record in the data file exists in the seed.
+export { COUNTRIES as SEED_COUNTRIES, VISA_TYPES as SEED_VISA_TYPES };
 
 export async function seedCountriesAndVisas(options: SeedCountriesAndVisasOptions = {}): Promise<{
   countries: number;
@@ -1009,10 +1147,11 @@ export async function seedCountriesAndVisas(options: SeedCountriesAndVisasOption
   const countryBatch = db.batch();
   for (const country of countries) {
     const visas = visasByCountry[country.code] || [];
-    const minProcessingDays =
-      visas.length > 0
-        ? Math.min(...visas.map((v) => v.processingDaysMin))
-        : 0;
+    // #306: only visas that state a processing time count (an entry may omit
+    // it). With none, the minimum is 0 as for a country with no visas: never
+    // NaN (Math.min of `undefined`) and never Infinity (Math.min of nothing).
+    const processingMins = visas.map((v) => v.processingDaysMin).filter((d): d is number => typeof d === "number");
+    const minProcessingDays = processingMins.length > 0 ? Math.min(...processingMins) : 0;
     // #239: a visa with no recorded fee does not count towards the minimum.
     // #299: a sourced fee counts exactly like a seed entry's own fee.
     const costs = visas.map((v) => effectiveSeedCost(v, feeDecisions.get(keyOf(v)))).filter((c): c is number => c !== undefined);

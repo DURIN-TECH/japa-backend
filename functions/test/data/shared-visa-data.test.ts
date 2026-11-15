@@ -2,7 +2,9 @@
 // Unit tests — the shared visa data file, its loader, and the re-seeded record (issue #239)
 // ============================================
 // Pure: no Firestore. Every id, name and country code below is made up (user-assigned
-// codes XA..XC): no real bloc, member, quote or fee appears anywhere.
+// codes XA..XC): no real bloc, member, quote or fee appears anywhere, EXCEPT the two
+// "#306" tests on the shipped file, which check the real members and records the
+// issue names (comparing them with the file's own NL entry, never a typed-out fact).
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -19,6 +21,11 @@ import {
 import { buildVisaTypeDoc, type SeedVisaFields } from "../../src/data/seed-visa-doc";
 import { FIXTURE_DATA, FIXTURE_FEE, fixtureDataWithFee } from "../helpers/shared-visa-fixture";
 import { routeFeesFor } from "../../src/data/shared-visa-data-format";
+import { seedFeeProblems } from "../../src/data/seed-sourced-fee";
+// #306: the seed module calls getFirestore() when it loads, so the Admin app
+// must be initialised first (no Firestore call is made: the test guard would fail it).
+import "../../src/utils/firebase";
+import { SEED_COUNTRIES, SEED_VISA_TYPES } from "../../src/data/seed-countries-visas";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
@@ -41,6 +48,75 @@ describe("shared visa data: the shipped file", () => {
       assert.ok(issuer, `${route.id} is issued by an authority in this file`);
       for (const x of route.inheritedBy) assert.ok(issuer.members.some((m) => m.countryCode === x.countryCode));
     }
+  });
+
+  // ---- #306: the six other first members, and their short-stay records ----
+  // This one test names real country codes and record ids, because the issue
+  // asks for exactly these. It still states no legal fact of its own: the
+  // quote, link and date of the new members are compared with the NL entry
+  // that is already in the file, never typed out here.
+  test("#306: seven members and seven inheriting records, each matching the seed", () => {
+    const data = loadSharedVisaData();
+    const bloc = data.authorities.find((a) => a.id === "schengen-area");
+    assert.ok(bloc, "the bloc is in the file");
+    assert.deepEqual(bloc.members.map((m) => m.countryCode).sort(), ["BE", "DE", "ES", "FR", "LU", "NL", "PT"]);
+    const nl = bloc.members.find((m) => m.countryCode === "NL")!;
+    for (const m of bloc.members.filter((x) => x.countryCode !== "NL")) {
+      assert.equal(m.joinedOn, nl.joinedOn, `${m.countryCode} joinedOn`);
+      assert.equal(m.joinedOn, "1995-03-26", `${m.countryCode} joinedOn`);
+      assert.equal(m.sourceQuote, nl.sourceQuote, `${m.countryCode} quote is NL's, character for character`);
+      assert.equal(m.sourceUrl, "https://publications.europa.eu/resource/celex/41994D0029", `${m.countryCode} sourceUrl`);
+    }
+
+    const route = data.sharedRoutes.find((r) => r.id === "schengen-area-short-stay");
+    assert.ok(route, "the route is in the file");
+    assert.deepEqual(
+      route.inheritedBy.map((x) => `${x.countryCode}/${x.visaTypeId}`).sort(),
+      ["BE/be-visitor", "DE/de-visitor", "ES/es-visitor", "FR/fr-visitor", "LU/lu-visitor", "NL/nl-visitor", "PT/pt-visitor"]
+    );
+    // The route itself is unchanged by #306 (its fee came with #299).
+    assert.equal(route.name, "Schengen short-stay visa");
+    assert.equal(route.category, "tourist");
+    assert.equal(route.fee?.amount, 90);
+    assert.equal(route.fee?.currency, "EUR");
+
+    // Every member is a seed country; every inheriting record is a seed visa of that country.
+    const countryCodes = new Set(SEED_COUNTRIES.map((c) => c.code));
+    for (const m of bloc.members) assert.ok(countryCodes.has(m.countryCode), `${m.countryCode} is a seed country`);
+    for (const x of route.inheritedBy) {
+      const v = SEED_VISA_TYPES.find((s) => s.id === x.visaTypeId);
+      assert.ok(v, `${x.visaTypeId} is a seed visa`);
+      assert.equal(v.countryCode, x.countryCode, `${x.visaTypeId} belongs to ${x.countryCode}`);
+      assert.equal("baseCostUsd" in v, false, `${x.visaTypeId} has no fee of its own`);
+    }
+    // ...so the seed's fee check finds no record with two fee sources.
+    assert.deepEqual(seedFeeProblems(SEED_VISA_TYPES, data), []);
+  });
+
+  test("#306: the six new short-stay records state no unsourced fact", () => {
+    const UNSOURCED = ["baseCostUsd", "validityPeriod", "maxExtensions", "applicationUrl", "applicationInstructions", "processingTime", "processingDaysMin", "processingDaysMax", "isExtendable"];
+    const names: Record<string, string> = { BE: "Belgium", DE: "Germany", FR: "France", LU: "Luxembourg", ES: "Spain", PT: "Portugal" };
+    for (const [cc, name] of Object.entries(names)) {
+      const v = SEED_VISA_TYPES.find((s) => s.id === `${cc.toLowerCase()}-visitor`);
+      assert.ok(v, `${cc} record exists`);
+      for (const key of UNSOURCED) assert.equal(key in v, false, `${v.id} has no ${key}`);
+      assert.deepEqual(v.eligibilityCriteria, []);
+      assert.equal(v.countryCode, cc);
+      assert.equal(v.name, "Short Stay Visa");
+      assert.equal(v.code, "SHORT-STAY");
+      assert.equal(v.category, "tourist");
+      assert.equal(v.description, `Short stay visa for ${name}.`);
+    }
+    // The five new countries are listed with a flag; NL and DE keep their entries.
+    for (const cc of ["BE", "FR", "LU", "ES", "PT"]) {
+      const c = SEED_COUNTRIES.find((x) => x.code === cc);
+      assert.ok(c, `${cc} is a seed country`);
+      assert.equal(c.flagUrl, `https://flagcdn.com/w320/${cc.toLowerCase()}.png`);
+      assert.equal(c.isSupported, true);
+    }
+    // No two countries share a rank (the new ranks did not displace an existing one).
+    const ranks = SEED_COUNTRIES.map((c) => c.popularityRank);
+    assert.equal(new Set(ranks).size, ranks.length);
   });
 
   test("the seed names no bloc (the data file does)", () => {
@@ -254,6 +330,23 @@ describe("buildVisaTypeDoc (the seed's whole-document write)", () => {
     assert.equal(doc.isActive, false);
     assert.deepEqual(doc.agentIds, ["a1"]);
     assert.equal((doc.createdAt as Timestamp).toMillis(), 1);
+  });
+
+  // #306: an entry with no processing time and no extension flag on record.
+  test("#306: processing fields and isExtendable the entry does not state are omitted, and no key is undefined", () => {
+    const { processingTime, processingDaysMin, processingDaysMax, isExtendable, ...bare } = visa;
+    void processingTime; void processingDaysMin; void processingDaysMax; void isExtendable;
+    const doc = buildVisaTypeDoc(bare, undefined, NOW);
+    for (const key of ["processingTime", "processingDaysMin", "processingDaysMax", "isExtendable"]) {
+      assert.equal(key in doc, false, `${key} is omitted`);
+    }
+    assert.deepEqual(Object.entries(doc).filter(([, v]) => v === undefined), []);
+    // An entry that states them is written exactly as before (false stays false).
+    const full = buildVisaTypeDoc(visa, undefined, NOW);
+    assert.equal(full.processingTime, "2-4 weeks");
+    assert.equal(full.processingDaysMin, 14);
+    assert.equal(full.processingDaysMax, 28);
+    assert.equal(full.isExtendable, false);
   });
 
   test("inheritsFrom comes from the data file only for a record that has none, and is never an empty list", () => {

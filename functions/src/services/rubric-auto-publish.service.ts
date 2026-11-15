@@ -1177,7 +1177,7 @@ export class RubricAutoPublishService {
    * or to run the check is a visible `not_checked` record, and nothing is
    * linked (the rules simply stay duplicated).
    *
-   * Compared: the own rules AS THEY WILL BE SERVED (the repaired rules swapped
+   * Compared: the own rules as they will be SERVED (the repaired rules swapped
    * in, the leave-outs taken out) against each shared layer's APPROVED served
    * rules. The spend is capped by the check's own hard caps and by the publish
    * settings' `checkerMaxRequestsPerRun` / `checkerRequestTimeoutMs`.

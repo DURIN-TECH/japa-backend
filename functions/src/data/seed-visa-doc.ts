@@ -28,14 +28,20 @@ export interface SeedVisaFields {
   code: string;
   description: string;
   category: string;
-  processingTime: string;
-  processingDaysMin: number;
-  processingDaysMax: number;
+  /**
+   * #306: the three processing fields are optional. Absent when no official
+   * source for the processing time is recorded: the key is then left out of
+   * the stored doc (never `""` or `0`), like a scraped visa whose page states none.
+   */
+  processingTime?: string;
+  processingDaysMin?: number;
+  processingDaysMax?: number;
   /** Absent when no official source for the fee is recorded: the displayed fee then comes from the rulebook / scrape, not the seed. */
   baseCostUsd?: number;
   /** Absent when no official source for the validity is recorded. */
   validityPeriod?: string;
-  isExtendable: boolean;
+  /** #306: absent when no official source says whether the visa can be extended (never written as `false`). */
+  isExtendable?: boolean;
   maxExtensions?: number;
   eligibilityCriteria: string[];
   applicationUrl?: string;
@@ -76,16 +82,20 @@ export function buildVisaTypeDoc(
     code: visa.code,
     description: visa.description,
     category: visa.category,
-    processingTime: visa.processingTime,
-    processingDaysMin: visa.processingDaysMin,
-    processingDaysMax: visa.processingDaysMax,
+    // #306: each processing field is written only when the entry states it
+    // (omitted, not "" / 0 / undefined). An entry that states them is written
+    // exactly as before.
+    ...(visa.processingTime !== undefined && { processingTime: visa.processingTime }),
+    ...(visa.processingDaysMin !== undefined && { processingDaysMin: visa.processingDaysMin }),
+    ...(visa.processingDaysMax !== undefined && { processingDaysMax: visa.processingDaysMax }),
     // Omitted (not 0, not ""), exactly like a scraped visa whose page states no fee.
     ...(visa.baseCostUsd !== undefined && { baseCostUsd: visa.baseCostUsd }),
     // #299: the shared route's fee in whole USD, with its source and dated
     // rate beside it. Written together or not at all (never `undefined`).
     ...(sourced && { baseCostUsd: sourced.baseCostUsd, sourcedFee: sourced.sourcedFee }),
     ...(visa.validityPeriod !== undefined && { validityPeriod: visa.validityPeriod }),
-    isExtendable: visa.isExtendable,
+    // #306: same rule: no source on record, no key (never `false`).
+    ...(visa.isExtendable !== undefined && { isExtendable: visa.isExtendable }),
     ...(visa.maxExtensions !== undefined && { maxExtensions: visa.maxExtensions }),
     eligibilityCriteria: visa.eligibilityCriteria,
     ...(visa.applicationUrl && { applicationUrl: visa.applicationUrl }),
