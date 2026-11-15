@@ -1,6 +1,14 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { consultationService, ConsultationFilters } from "../services/consultation.service";
+import {
+  consultationService,
+  ConsultationFilters,
+  // Issue #151: the parties of a booking and the status rules they act under.
+  ConsultationActor,
+  CONSULTATION_ACTORS,
+  CONSULTATION_STATUSES,
+  SYSTEM_ONLY_STATUSES,
+} from "../services/consultation.service";
 import { notificationService } from "../services/notification.service";
 import { agencyService } from "../services/agency.service";
 import { userService } from "../services/user.service";
@@ -35,8 +43,8 @@ import { authController } from "./auth.controller";
 import { collections, auth } from "../utils/firebase";
 import {
   Agent,
+  Application,
   Consultation,
-  ConsultationStatus,
   ConsultationType,
   NotificationType,
 } from "../types";
@@ -221,6 +229,14 @@ export class ConsultationController {
    * The controller detects which flow by checking if the auth'd user has an agent profile.
    * If not, the auth'd user is treated as the client and `agentId` from the body is used.
    *
+   * Issue #246 (agent-initiated only): the client must ALREADY be a client of
+   * the caller or the caller's agency (an application, a conversation or an
+   * earlier consultation: see `isClientOfAgent`), and a sent `applicationId`
+   * must be that client's application with this agent or agency. Otherwise
+   * 403 FORBIDDEN with nothing written, no quote, no checkout and no email;
+   * a `userId` that does not exist gets the same 403. The client-initiated
+   * flow is unchanged.
+   *
    * PRICE (issue #180, folds #166): the SERVER decides it. The fee is the
    * booking agent's own `consultationFeeUsd` (US dollars, #179), read from
    * the agent record; any `fee`, `amount`, `rate` or `currency` in the body is
@@ -302,6 +318,19 @@ export class ConsultationController {
           sendError(res, "VALIDATION_ERROR", "userId (client) is required when booking as agent");
           return;
         }
+        // Issue #246: the ids are used in queries and as a document id below,
+        // so they must be plain non-empty strings.
+        if (typeof bodyClientId !== "string" || !bodyClientId.trim() || bodyClientId.includes("/")) {
+          sendError(res, "VALIDATION_ERROR", "userId (client) must be a user id");
+          return;
+        }
+        if (
+          applicationId !== undefined && applicationId !== null && applicationId !== "" &&
+          (typeof applicationId !== "string" || applicationId.includes("/"))
+        ) {
+          sendError(res, "VALIDATION_ERROR", "applicationId must be an application id");
+          return;
+        }
         resolvedClientId = bodyClientId;
         resolvedAgentUserId = authUserId;
         // The agency comes from the RESOLVED PRINCIPAL (issue #138), not from
@@ -313,6 +342,33 @@ export class ConsultationController {
         agentAgencyId = req.authz?.agencyId ?? undefined;
         agentDisplayName = agentProfile.displayName;
         pricingAgent = agentProfile;
+
+        // Issue #246: an agent (or agency owner) may book only for a client
+        // they or their agency ALREADY work with. Without this, any agent
+        // could name any uid: the booking would send a real Paystack checkout
+        // to a stranger's email and the response would hand back that
+        // person's name and email.
+        //
+        // This runs BEFORE the client's user document is read, and a stranger
+        // and a uid that does not exist get the SAME 403, so the route never
+        // tells the caller which users exist. Nothing has been written, no
+        // quote locked, no checkout opened and no email sent at this point.
+        const related = await this.isClientOfAgent(
+          resolvedClientId,
+          authUserId,
+          agentProfile.id,
+          agentAgencyId
+        );
+        // A linked application must be one of THIS client's with this agent
+        // or agency (same 403: a foreign id must not be told apart either).
+        const applicationOk =
+          !related || !applicationId
+            ? true
+            : await this.isApplicationOfClientWithAgent(applicationId, resolvedClientId, authUserId, agentAgencyId);
+        if (!related || !applicationOk) {
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
+        }
       } else {
         // Client-initiated flow: auth'd user is the client, body has agentId
         if (!bodyAgentId) {
@@ -690,6 +746,45 @@ export class ConsultationController {
 
   /**
    * PUT /consultations/:id/status
+   *
+   * Issue #151: a status change is allowed only for the party and the
+   * starting status it makes sense for (it used to need only READ access, so
+   * either party could mark an unpaid booking scheduled/confirmed, a client
+   * could mark one completed, and a booking could be cancelled mid-payment).
+   *
+   * Parties (see `consultationActor`): the CLIENT is the booking's `userId`;
+   * the AGENT SIDE is its `agentId`, the owner of its agency, or an admin.
+   * The rules live in ONE helper, `decideStatusChange`
+   * (consultation.service.ts):
+   *
+   *   target       | client from                 | agent side from
+   *   -------------|-----------------------------|--------------------------------------
+   *   confirmed    | never (403)                 | scheduled
+   *   in_progress  | never (403)                 | scheduled, confirmed
+   *   completed    | never (403)                 | scheduled, confirmed, in_progress
+   *   no_show      | never (403)                 | scheduled, confirmed, in_progress
+   *   cancelled    | pending_payment, scheduled, | pending_payment, scheduled, confirmed
+   *                | confirmed                   |
+   *
+   * Answers, in the order they are checked:
+   *  - 400 VALIDATION_ERROR: no `status`, an unknown one, or `pending_payment`
+   *    / `scheduled` as the target (only booking creation and payment verify
+   *    write those), whoever asks;
+   *  - 404: unknown id;
+   *  - 403 FORBIDDEN: the caller is not a party, or is the client asking for
+   *    anything but `cancelled`;
+   *  - 409 INVALID_STATUS_TRANSITION: a move not in the table (wrong starting
+   *    status, out of a terminal `completed` / `cancelled` / `no_show`, or an
+   *    unpaid `pending_payment` booking to anything but `cancelled`);
+   *  - 409 PAYMENT_IN_PROGRESS: cancelling a `pending_payment` booking whose
+   *    checkout (`transactionId`) is still inside its quote lock
+   *    (`quoteExpiresAt` in the future). After the lock (or with no checkout)
+   *    the cancel goes through; a payment that still lands on the cancelled
+   *    booking is recorded for refund by `settlePayment`
+   *    (`consultationPaymentExceptions`, reason `booking_not_payable`).
+   *
+   * EVERY refusal writes nothing and notifies nobody. An allowed change
+   * answers as before (the updated booking) and notifies the other party.
    */
   async updateStatus(
     req: AuthenticatedRequest,
@@ -705,36 +800,49 @@ export class ConsultationController {
         return;
       }
 
-      const validStatuses: ConsultationStatus[] = [
-        "pending_payment", "scheduled", "confirmed", "in_progress",
-        "completed", "cancelled", "no_show",
-      ];
-      if (!validStatuses.includes(status)) {
+      if (!CONSULTATION_STATUSES.includes(status)) {
         sendError(res, "VALIDATION_ERROR", `Invalid status: ${status}`);
         return;
       }
 
-      const existing = await consultationService.getConsultationById(id);
-      if (!existing) {
+      // Issue #151: `pending_payment` and `scheduled` are never accepted from
+      // a caller. Answered here, before the booking is read, so it is a plain
+      // 400 for anyone (the helper refuses them too, as a second line).
+      if (SYSTEM_ONLY_STATUSES.includes(status)) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          `A consultation cannot be set to ${status}: that status is set when it is booked or paid`
+        );
+        return;
+      }
+
+      // Decide and write in one transaction (see changeStatus): the caller's
+      // party and the transition are judged on the freshly read booking.
+      const outcome = await consultationService.changeStatus(
+        id,
+        (booking) => this.consultationActor(req, booking),
+        status,
+        {
+          cancelledBy: status === "cancelled" ? userId : undefined,
+          cancellationReason,
+          summary,
+        }
+      );
+
+      if (outcome.kind === "not_found") {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
-
-      const hasAccess = can(
-        req,
-        "read",
-        asSubject("Consultation", existing as unknown as Record<string, unknown>)
-      );
-      if (!hasAccess) {
-        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+      if (outcome.kind === "refused") {
+        // Nothing was written; no notification is sent for a refusal.
+        const { code, httpStatus, message } = outcome.refusal;
+        sendError(res, code, code === "FORBIDDEN" ? ErrorMessages.FORBIDDEN : message, httpStatus);
         return;
       }
 
-      const updated = await consultationService.updateStatus(id, status, {
-        cancelledBy: status === "cancelled" ? userId : undefined,
-        cancellationReason,
-        summary,
-      });
+      const existing = outcome.before;
+      const updated = outcome.consultation;
 
       // Notify the OTHER party of a meaningful status transition.
       const typeByStatus: Record<string, NotificationType> = {
@@ -743,6 +851,8 @@ export class ConsultationController {
         cancelled: "consultation_cancelled",
       };
       const notifType = typeByStatus[status];
+      // The client acting: tell the agent. Anyone on the agent side (the
+      // agent, the agency's owner, an admin): tell the client.
       const recipient = userId === existing.userId ? existing.agentId : existing.userId;
       if (notifType && recipient) {
         const copy: Record<string, { title: string; body: string }> = {
@@ -774,6 +884,23 @@ export class ConsultationController {
 
   /**
    * DELETE /consultations/:id
+   *
+   * Issue #151: a hard delete is for ADMINS ONLY. It used to need only read
+   * access, so either party could remove a booking, even one being paid for.
+   * The client and the agent side cancel instead
+   * (`PUT /consultations/:id/status { status: "cancelled" }`), which keeps
+   * the record. Neither the portal nor the mobile app calls this route.
+   *
+   *  - not an admin: 403 FORBIDDEN, before the booking is even read (so the
+   *    route does not tell a non-admin which ids exist);
+   *  - unknown id: 404;
+   *  - the booking has a `transactionId` or is `paymentStatus: "paid"`:
+   *    409 BOOKING_HAS_PAYMENT, nothing removed, even for an admin. A
+   *    payment landing on a deleted booking could not be recorded at all
+   *    (`settlePayment` returns null for a missing booking).
+   *
+   * A refusal removes nothing and notifies nobody. A delete answers 204 and
+   * tells the client the consultation was cancelled, as before.
    */
   async deleteConsultation(
     req: AuthenticatedRequest,
@@ -783,23 +910,28 @@ export class ConsultationController {
       const userId = req.userId!;
       const { id } = req.params;
 
-      const existing = await consultationService.getConsultationById(id);
-      if (!existing) {
-        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
-        return;
-      }
-
-      const hasAccess = can(
-        req,
-        "read",
-        asSubject("Consultation", existing as unknown as Record<string, unknown>)
-      );
-      if (!hasAccess) {
+      // Admins only. Checked first: no read, no write for anyone else.
+      if (req.authz?.role !== ROLES.ADMIN) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
 
-      await consultationService.deleteConsultation(id);
+      // The payment check and the delete are one transaction (see the service).
+      const outcome = await consultationService.deleteUnpaidConsultation(id);
+      if (outcome.kind === "not_found") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (outcome.kind === "has_payment") {
+        sendError(
+          res,
+          "BOOKING_HAS_PAYMENT",
+          "This consultation has a payment or an open checkout and cannot be deleted. Cancel it instead.",
+          409
+        );
+        return;
+      }
+      const existing = outcome.consultation;
 
       // Notify the other party that the consultation was cancelled.
       const recipient = userId === existing.userId ? existing.agentId : existing.userId;
@@ -1364,6 +1496,105 @@ export class ConsultationController {
     return `${EMAIL_BRANDING.appUrl}/consultations/confirm`;
   }
 
+  /**
+   * Issue #151: which party of `booking` the caller is, or null when neither.
+   *
+   *  - AGENT SIDE: the booking's agent (`agentId` is a user uid), the OWNER
+   *    whose resolved agency (`req.authz.agencyId`) is the booking's agency,
+   *    or an admin. Checked first: it may do everything a client may.
+   *  - CLIENT: the booking's `userId`.
+   *
+   * An agent of the same agency who is not the booking's own agent is NOT a
+   * party (they may read it, not change its status).
+   */
+  private consultationActor(req: AuthenticatedRequest, booking: Consultation): ConsultationActor | null {
+    const uid = req.userId;
+    if (!uid) return null;
+    const isAdmin = req.authz?.role === ROLES.ADMIN;
+    const isBookingAgent = booking.agentId === uid;
+    // Both sides must NAME an agency: an owner with none must never match a
+    // booking that merely has no `agencyId`.
+    const isAgencyOwner =
+      req.authz?.role === ROLES.OWNER &&
+      !!req.authz.agencyId &&
+      !!booking.agencyId &&
+      booking.agencyId === req.authz.agencyId;
+    if (isAdmin || isBookingAgent || isAgencyOwner) return CONSULTATION_ACTORS.AGENT_SIDE;
+    if (booking.userId === uid) return CONSULTATION_ACTORS.CLIENT;
+    return null;
+  }
+
+  /**
+   * Issue #246: does the calling agent (or their agency) already work with
+   * this client? True when at least one of these exists:
+   *
+   *  - an APPLICATION of the client that is assigned to the caller
+   *    (`agentId` = the caller's uid) or belongs to the caller's agency;
+   *  - a CONVERSATION between the client and the caller. NOTE: on
+   *    conversations `agentId` is the agent DOCUMENT id, not a user uid;
+   *  - an earlier CONSULTATION of the client with the caller (`agentId` = the
+   *    caller's uid) or with the caller's agency, in ANY status.
+   *
+   * Every query is two equality filters and `limit(1)` (no composite index),
+   * and none of them reads the client's user document, so the answer is the
+   * same for a stranger and for a uid that does not exist.
+   *
+   * @param agentUid the caller's user uid
+   * @param agentDocId the caller's agent document id
+   * @param agencyId the caller's RESOLVED agency (`req.authz.agencyId`), if any
+   */
+  private async isClientOfAgent(
+    clientId: string,
+    agentUid: string,
+    agentDocId: string,
+    agencyId: string | undefined
+  ): Promise<boolean> {
+    /** One "does a doc with these two fields exist" lookup. */
+    const exists = async (
+      collection: FirebaseFirestore.CollectionReference,
+      field: string,
+      value: string
+    ): Promise<boolean> =>
+      !(await collection.where("userId", "==", clientId).where(field, "==", value).limit(1).get()).empty;
+
+    const checks: Promise<boolean>[] = [
+      exists(collections.applications, "agentId", agentUid),
+      exists(collections.conversations, "agentId", agentDocId),
+      exists(collections.consultations, "agentId", agentUid),
+    ];
+    // The agency-wide links apply only to a caller who is in an agency.
+    if (agencyId) {
+      checks.push(
+        exists(collections.applications, "agencyId", agencyId),
+        exists(collections.consultations, "agencyId", agencyId)
+      );
+    }
+    return (await Promise.all(checks)).some(Boolean);
+  }
+
+  /**
+   * Issue #246: is `applicationId` an application of THIS client with the
+   * calling agent or their agency? False for an unknown id, another client's
+   * application, or one that belongs to a different agent / agency.
+   */
+  private async isApplicationOfClientWithAgent(
+    applicationId: string,
+    clientId: string,
+    agentUid: string,
+    agencyId: string | undefined
+  ): Promise<boolean> {
+    const doc = await collections.applications.doc(applicationId).get();
+    if (!doc.exists) return false;
+    const application = doc.data() as Application;
+    if (application.userId !== clientId) return false;
+    return application.agentId === agentUid || (!!agencyId && application.agencyId === agencyId);
+  }
+
+  /**
+   * The caller's agent profile, or null when they have none (a client).
+   * `id` is always the agent DOCUMENT id (issue #246 matches conversations
+   * on it), taken from the snapshot in case the stored data lacks it.
+   */
   private async getAgentForUser(userId: string): Promise<Agent | null> {
     const snapshot = await collections.agents
       .where("userId", "==", userId)
@@ -1371,7 +1602,8 @@ export class ConsultationController {
       .get();
 
     if (snapshot.empty) return null;
-    return snapshot.docs[0].data() as Agent;
+    const doc = snapshot.docs[0];
+    return { ...(doc.data() as Agent), id: doc.id };
   }
 }
 
