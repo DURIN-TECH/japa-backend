@@ -162,14 +162,32 @@ export type DeleteConsultationOutcome =
   | { kind: "deleted"; consultation: Consultation };
 
 /**
- * True when a booking has, or may still receive, a payment: a Paystack
- * checkout was opened for it (`transactionId`, kept after it is paid) or it
- * is marked paid. Such a booking must never be hard-deleted (issue #151): a
- * payment that lands afterwards would find no booking and `settlePayment`
- * would return null, leaving the money unrecorded.
+ * True when a booking CARRIES MONEY, or may still receive some (issue #151):
+ *
+ *  - a Paystack checkout was opened for it (`transactionId`, kept after it is
+ *    paid), whatever its status; or
+ *  - it is marked paid AND was charged something: a non-zero dollar price
+ *    (`priceUsdCents`), a non-zero local charge (`chargedAmountMinor`), or,
+ *    on a legacy row from before #180, a non-zero naira `fee`.
+ *
+ * A FREE booking is also stored `paymentStatus: "paid"` (with
+ * `priceUsdCents: 0` and no transaction): it carries no money, so it is NOT
+ * a booking with a payment and an admin may delete it.
+ *
+ * A booking with a payment must never be hard-deleted: a payment that lands
+ * afterwards would find no booking and `settlePayment` would return null,
+ * leaving the money unrecorded.
  */
-export function bookingHasPayment(c: Pick<Consultation, "transactionId" | "paymentStatus">): boolean {
-  return !!c.transactionId || c.paymentStatus === "paid";
+export function bookingHasPayment(
+  c: Pick<Consultation, "transactionId" | "paymentStatus" | "priceUsdCents" | "chargedAmountMinor" | "fee">
+): boolean {
+  if (c.transactionId) return true;
+  /** A stored amount that is a real, positive number. */
+  const positive = (v: unknown): boolean => typeof v === "number" && v > 0;
+  return (
+    c.paymentStatus === "paid" &&
+    (positive(c.priceUsdCents) || positive(c.chargedAmountMinor) || positive(c.fee))
+  );
 }
 
 export interface ConsultationFilters {

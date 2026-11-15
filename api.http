@@ -381,7 +381,8 @@ Authorization: Bearer {{clientToken}}
 
 ### Delete a consultation (issue #151): ADMINS ONLY (everyone else 403; they
 ### cancel with the status route above). 409 BOOKING_HAS_PAYMENT, nothing
-### removed, when the booking has a transactionId or paymentStatus "paid".
+### removed, when the booking has a transactionId, or paymentStatus "paid" with a
+### non-zero charge. A free booking ($0, no transaction) can be deleted.
 DELETE {{baseUrl}}/consultations/{{consultationId}}
 Authorization: Bearer {{adminToken}}
 

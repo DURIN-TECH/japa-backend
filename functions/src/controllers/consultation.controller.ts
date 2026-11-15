@@ -894,7 +894,9 @@ export class ConsultationController {
    *  - not an admin: 403 FORBIDDEN, before the booking is even read (so the
    *    route does not tell a non-admin which ids exist);
    *  - unknown id: 404;
-   *  - the booking has a `transactionId` or is `paymentStatus: "paid"`:
+   *  - the booking carries a payment (a `transactionId`, or
+   *    `paymentStatus: "paid"` with a non-zero charge; a FREE booking, paid
+   *    at $0 with no transaction, does not and can be deleted):
    *    409 BOOKING_HAS_PAYMENT, nothing removed, even for an admin. A
    *    payment landing on a deleted booking could not be recorded at all
    *    (`settlePayment` returns null for a missing booking).

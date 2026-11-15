@@ -22,8 +22,10 @@
 //    recorded in consultationPaymentExceptions (`booking_not_payable`);
 //  - every refusal writes nothing and notifies nobody; an allowed change
 //    notifies the other party;
-//  - DELETE /consultations/:id: admins only, and never a booking with a
-//    `transactionId` or `paymentStatus: "paid"` (409 BOOKING_HAS_PAYMENT).
+//  - DELETE /consultations/:id: admins only, and never a booking that
+//    carries a payment: a `transactionId`, or `paymentStatus: "paid"` with a
+//    non-zero charge (409 BOOKING_HAS_PAYMENT). A free booking ($0, marked
+//    paid, no transaction) can be deleted by an admin.
 import { test, describe, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { Timestamp } from "firebase-admin/firestore";
@@ -515,11 +517,42 @@ describe("DELETE /consultations/:id", () => {
     }
   });
 
-  test("an admin cannot delete a booking marked paid, even with no reference", async () => {
-    await seedBooking("completed", { paymentStatus: "paid" });
-    const out = await del(admin);
-    assertRefused(out, 409, "BOOKING_HAS_PAYMENT", "paid");
-    assert.equal(docsIn("consultations").length, 1);
+  test("an admin cannot delete a booking paid a non-zero charge, even with no reference", async () => {
+    // A dollar price, a local charge, or a legacy naira fee: each is money.
+    const charges: Array<Record<string, unknown>> = [
+      { priceUsdCents: 1_000 },
+      { priceUsdCents: undefined, chargedAmountMinor: 1_500_000, chargedCurrency: "NGN" },
+      { priceUsdCents: undefined, fee: 50_000 },
+    ];
+    for (const charge of charges) {
+      harness.reset();
+      await seedBooking("completed", { paymentStatus: "paid", ...charge });
+      const out = await del(admin);
+      assertRefused(out, 409, "BOOKING_HAS_PAYMENT", JSON.stringify(charge));
+      assert.equal(docsIn("consultations").length, 1);
+    }
+  });
+
+  test("an admin CAN delete a free booking ($0, marked paid, no transaction)", async () => {
+    // Exactly what a free booking is stored as at creation.
+    for (const status of ["scheduled", "completed"] as ConsultationStatus[]) {
+      harness.reset();
+      notified.length = 0;
+      await seedBooking(status, { paymentStatus: "paid", priceUsdCents: 0 });
+      const out = await del(admin);
+      assert.equal(out.status, 204, status);
+      assert.equal(docsIn("consultations").length, 0, status);
+      assert.deepEqual(notified, [{ userId: "uid-client1", type: "consultation_cancelled" }], status);
+    }
+  });
+
+  test("a free booking is still not deletable by its client, agent or agency owner", async () => {
+    for (const p of [client, agent, ownerA]) {
+      harness.reset();
+      await seedBooking("scheduled", { paymentStatus: "paid", priceUsdCents: 0 });
+      assertRefused(await del(p), 403, "FORBIDDEN", p.uid);
+      assert.equal(docsIn("consultations").length, 1, p.uid);
+    }
   });
 
   test("an unknown id is 404 for an admin", async () => {
