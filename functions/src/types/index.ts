@@ -1412,7 +1412,7 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   // row's status by the refund engine (services/consultation-refund.service.ts).
   // The booking's `paymentStatus` stays "paid": the client DID pay, and the
   // #321 relationship check reads it. The refund is its own Transaction.
-  /** Doc id of the refund Transaction (`refund_<Paystack reference>`). */
+  /** Doc id of the refund Transaction (`refund_<sha256 of the Paystack reference>`, see refundDocId). */
   refundId?: string;
   /** Mirror of the refund Transaction's status. */
   refundStatus?: RefundStatus;

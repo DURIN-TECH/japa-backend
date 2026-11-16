@@ -38,7 +38,7 @@
 //  - The refund row copies `amount` + `currency` from the fee Transaction
 //    (minor units of the charged currency, FX markup included). Paystack is
 //    called with exactly those, never a recomputed or converted figure.
-//  - The row's doc id is `refund_<fee Paystack reference>` (`refundDocId`):
+//  - The row's doc id is `refund_<sha256 of the fee's Paystack reference>` (`refundDocId`):
 //    one charge can only ever have ONE refund row. A second cancel, a client
 //    retry or two admins at once find it and create nothing.
 //  - The row, the booking update and the fee's hold update are written in
@@ -59,6 +59,7 @@
 // (`consultationPaymentExceptions`, #354), the mobile and portal screens
 // (#356, #357).
 
+import { createHash } from "crypto";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import type { Transaction as FirestoreTransaction } from "firebase-admin/firestore";
 import type {
@@ -111,13 +112,15 @@ const CLIENT_CANCELLABLE = ["pending_payment", "scheduled", "confirmed"];
 // ============================================
 
 /**
- * The refund row's doc id for one charge (issue #317): `refund_<reference>`.
- * Deterministic, so one Paystack charge can only ever have one refund row.
- * A "/" (impossible in our own `cons-<id>-<uuid>` references, but a doc id
- * must never contain one) is replaced, so the id is always one document.
+ * The refund row's doc id for one charge (issue #317): `refund_` + the
+ * SHA-256 of the charge's Paystack reference. Deterministic, so one Paystack
+ * charge can only ever have one refund row. Hashed rather than the raw
+ * reference so that (a) it is always a valid single document id whatever
+ * the reference holds, and (b) the client's payment history, which shows
+ * each row's `id`, never carries a Paystack reference (#329 allow-list).
  */
 export function refundDocId(reference: string): string {
-  return `refund_${reference.replace(/\//g, "_")}`;
+  return `refund_${createHash("sha256").update(reference).digest("hex")}`;
 }
 
 /**

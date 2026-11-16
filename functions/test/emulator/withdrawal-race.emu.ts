@@ -191,7 +191,7 @@ describe("a stored withdrawal with amount 'abc' no longer breaks the balance (#2
     const r = await api.call("GET", "/transactions/stats", tokens.badrow);
     assert.equal(r.status, 200);
     const ngn = r.body.data.byCurrency.find((row: any) => row.currency === "NGN");
-    assert.deepEqual(ngn, { currency: "NGN", totalRevenue: BALANCE, pendingPayments: 0, availableBalance: BALANCE });
+    assert.deepEqual(ngn, { currency: "NGN", totalRevenue: BALANCE, pendingPayments: 0, availableBalance: BALANCE, heldBalance: 0 });
     for (const key of ["totalRevenue", "pendingPayments", "availableBalance"] as const) {
       assert.equal(Number.isSafeInteger(ngn[key]), true, `${key} must be an integer, got ${ngn[key]}`);
     }
