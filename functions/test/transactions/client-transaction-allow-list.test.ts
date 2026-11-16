@@ -127,6 +127,27 @@ const FULL_ROW: Required<Transaction> = {
   clientName: "HIDDEN Client Name",
   clientEmail: "delivered+hidden-client@resend.dev",
   updatedAt: Timestamp.fromMillis(1_733_333_333_000),
+  // ---- Issue #317: fee hold and refund bookkeeping (hidden) ----
+  feeHold: {
+    state: "held",
+    slotStartAt: Timestamp.fromMillis(1_755_555_555_000),
+    releaseAt: Timestamp.fromMillis(1_755_555_556_000),
+  },
+  refundOf: "HIDDEN-refunded-fee-id",
+  reason: "admin_other",
+  initiatedBy: "HIDDEN-initiating-uid",
+  refundNote: "HIDDEN-admin-note",
+  refundFundedFrom: "available",
+  balanceShortfallMinor: 13_579,
+  providerRefundId: "HIDDEN-paystack-refund-id",
+  providerRefundStatus: "HIDDEN-paystack-refund-status",
+  refundAttempts: 3,
+  refundProviderCalls: 3,
+  refundNextAttemptAt: Timestamp.fromMillis(1_755_555_557_000),
+  refundLeaseUntil: Timestamp.fromMillis(1_755_555_558_000),
+  refundLastError: "HIDDEN-paystack-error",
+  refundedAt: Timestamp.fromMillis(1_755_555_559_000),
+  refundFailedAt: Timestamp.fromMillis(1_755_555_560_000),
 };
 
 /**
@@ -180,6 +201,24 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   "clientName",
   "clientEmail",
   "updatedAt",
+  // Issue #317: the fee hold and the refund engine's bookkeeping. A refund
+  // row reaches the client as type "refund" + status + amount only.
+  "feeHold",
+  "refundOf",
+  "reason",
+  "initiatedBy",
+  "refundNote",
+  "refundFundedFrom",
+  "balanceShortfallMinor",
+  "providerRefundId",
+  "providerRefundStatus",
+  "refundAttempts",
+  "refundProviderCalls",
+  "refundNextAttemptAt",
+  "refundLeaseUntil",
+  "refundLastError",
+  "refundedAt",
+  "refundFailedAt",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */
@@ -189,6 +228,9 @@ const HIDDEN_VALUES: readonly string[] = [
   "1711111111", // fxRateAsOf seconds
   "1722222222", // escrowReleasedAt seconds
   "1733333333", // updatedAt seconds
+  "1755555", // the #317 hold / refund timestamps
+  "13579", // balanceShortfallMinor
+  "admin_other", // reason
   "hold", // fxRateSource
   "delivered+hidden-client@resend.dev",
   "NOT-IN-THE-TYPE", // the undeclared fields seeded below

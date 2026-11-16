@@ -4,6 +4,8 @@ import { entitlementService } from "../services/entitlement.service";
 import { billingService } from "../services/billing/billing.service";
 import { paystackProvider, toTransactionLookup } from "../services/billing/paystack.provider";
 import { settlePaymentRequest } from "../services/payment-request-settlement.service";
+// Issue #317: consultation refund webhooks (refund.pending/processing/processed/failed).
+import { consultationRefundService } from "../services/consultation-refund.service";
 import { collections } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import {
@@ -557,6 +559,23 @@ export class EntitlementController {
       // forged payload AND for a valid non-subscription charge, so its null
       // cannot be treated as "unauthentic" here.
       if (paystackProvider.verifyWebhookSignature(headers, raw)) {
+        // ── Consultation refunds (issue #317) ─────────────────────────────
+        // Handled first, before payment requests and subscriptions: a
+        // `refund.*` event is never one of theirs. The signature was
+        // verified just above. A repeated or out-of-order event, or one for
+        // a refund we do not know, writes nothing and still answers 200.
+        let parsed: { event?: unknown; data?: unknown } | null = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = null;
+        }
+        if (parsed && typeof parsed.event === "string" && parsed.event.startsWith("refund.")) {
+          const outcome = await consultationRefundService.handleWebhook(parsed);
+          res.status(200).json({ received: true, applied: outcome === "applied" });
+          return;
+        }
+
         const settled = await this.settlePaymentRequestFromWebhook(raw);
         if (settled) {
           res.status(200).json({ received: true, applied: true });

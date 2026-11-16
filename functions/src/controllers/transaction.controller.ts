@@ -3,7 +3,7 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { transactionService, TransactionFilters } from "../services/transaction.service";
 import { toClientTransaction } from "../transactions/client-transaction";
 import { collections } from "../utils/firebase";
-import { Agent } from "../types";
+import { Agent, Transaction } from "../types";
 import { ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -11,9 +11,18 @@ import {
   ErrorMessages,
 } from "../utils/response";
 
+/** Every Transaction type, for the `type` list filter (issue #317). */
+const TRANSACTION_TYPES: Transaction["type"][] = [
+  "consultation_fee", "service_fee", "government_fee", "refund", "escrow_release", "withdrawal",
+];
+
 export class TransactionController {
   /**
-   * GET /transactions?role=client|agent|owner|admin&status=...&applicationId=...&startDate=...&endDate=...
+   * GET /transactions?role=client|agent|owner|admin&type=...&status=...&applicationId=...&startDate=...&endDate=...
+   *
+   * Issue #317: `type` narrows the list to one Transaction type. The admin
+   * refund screen (#357) uses `role=admin&type=refund&status=failed` to list
+   * refunds that need a human.
    *
    * Scoping (issue #292). The scope is decided from the caller's OWN role
    * (`req.authz.role`, resolved by verifyAuth from the token's custom claims),
@@ -71,7 +80,14 @@ export class TransactionController {
       // Agent-side callers keep the old default: no `role` means "agent".
       const role = requestedRole || ROLES.AGENT;
 
+      // (#317) `type` (e.g. `type=refund` for the admin refund list): only a
+      // known transaction type is used; anything else is ignored.
+      const typeParam = req.query.type as string | undefined;
+      const type = typeParam && (TRANSACTION_TYPES as string[]).includes(typeParam)
+        ? (typeParam as TransactionFilters["type"])
+        : undefined;
       const filters: TransactionFilters = {
+        type,
         status: req.query.status as TransactionFilters["status"],
         applicationId: req.query.applicationId as string,
         startDate: req.query.startDate as string,
@@ -145,6 +161,10 @@ export class TransactionController {
    *     byCurrency: [{ currency, totalRevenue, pendingPayments, availableBalance }],
    *     pendingClientsCount
    *   }
+   * Issue #317: each row also has `heldBalance` (consultation fees still held
+   * until the meeting has happened; never withdrawable), and
+   * `availableBalance` excludes them and MAY BE NEGATIVE (a refund of an
+   * already-released fee, #351; withdrawals are blocked until positive).
    * Amounts are integer minor units of each row's `currency`; rows are sorted
    * by code; `byCurrency` is empty when the scope has no transactions. Role
    * scoping is unchanged (admin: all; owner: own agency's agents; agent: own).

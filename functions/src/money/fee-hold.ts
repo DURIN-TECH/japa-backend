@@ -1,0 +1,138 @@
+// ============================================
+// Consultation fee hold (issue #317, "hold consultation fees")
+// ============================================
+//
+// WHY: without a hold an agent could book a paid consultation, withdraw the
+// fee straight away, then cancel; the client is owed a full refund, and the
+// money to pay it would have to come from Seli. So a paid consultation fee is
+// HELD (counted in the agent's `heldBalance`, never in `availableBalance`,
+// never withdrawable) until the meeting has happened:
+//
+//   released when EITHER
+//    - the clock passes `releaseAt` (slot end + FEE_HOLD_AFTER_SLOT_HOURS), or
+//    - the agent side marked the booking `completed` / `no_show`
+//      (`meetingClosedAt`) AND the clock has passed the slot start (a booking
+//      marked complete before its slot started keeps its hold until then);
+//   never released when the held fee was refunded (`state: "refunded"`).
+//
+// A refund while the fee is held is paid OUT OF THE HOLD: the agent's
+// available balance does not move (they never had the money). Only an admin
+// can refund a fee that was already released; that refund comes off the
+// agent's available balance, which may then go below zero (#351 reversal):
+// the shortfall is carried forward and withdrawals are blocked until the
+// balance is positive again. Seli never absorbs it.
+//
+// The clock rule is ONE pure function, `feeHoldStatusAt`, used by the stats
+// (GET /transactions/stats), the withdrawal check, the cancel path (an agent
+// may not cancel once the fee is released) and the admin refund path.
+
+import { Timestamp } from "firebase-admin/firestore";
+import type { Consultation, FeeHold, Transaction } from "../types";
+import { hoursAfter, slotEndsAt, slotStartsAt } from "../consultations/slot-time";
+
+/** How long after the slot ENDS a fee releases by itself, in hours. */
+export const FEE_HOLD_AFTER_SLOT_HOURS = 24;
+
+/** Where a consultation fee stands at one moment. */
+export type FeeHoldStatus =
+  /** Not withdrawable: counted in `heldBalance`. */
+  | "held"
+  /** Withdrawable: counted in `availableBalance`. */
+  | "released"
+  /** Given back to the client out of the hold: counted nowhere. */
+  | "refunded";
+
+/** Milliseconds of a stored Timestamp, or null when the value is not one. */
+function millisOf(value: unknown): number | null {
+  return value && typeof (value as Timestamp).toMillis === "function" ? (value as Timestamp).toMillis() : null;
+}
+
+/**
+ * Where a consultation fee Transaction stands at time `at`. Pure.
+ *
+ *  - no `feeHold` (a fee written before #317 and not yet backfilled): HELD.
+ *    The safe reading: it can be refunded from the hold, never withdrawn
+ *    then cancelled. `npm run backfill:fee-holds` stamps every such fee
+ *    (released when its meeting is over, held otherwise);
+ *  - `state: "refunded"` / `"released"`: as stored (final);
+ *  - `state: "held"`: released once `at` reaches `releaseAt`, or once the
+ *    meeting was closed (`meetingClosedAt`) and `at` has reached
+ *    `slotStartAt`; held otherwise. A hold with an unreadable time is held.
+ *
+ * @param fee the stored fee Transaction (only `feeHold` is read)
+ * @param at the server clock
+ */
+export function feeHoldStatusAt(fee: Pick<Transaction, "feeHold">, at: Date): FeeHoldStatus {
+  const hold = fee.feeHold;
+  if (!hold) return "held";
+  if (hold.state === "refunded") return "refunded";
+  if (hold.state === "released") return "released";
+  const now = at.getTime();
+  const releaseAt = millisOf(hold.releaseAt);
+  if (releaseAt !== null && now >= releaseAt) return "released";
+  const slotStart = millisOf(hold.slotStartAt);
+  if (millisOf(hold.meetingClosedAt) !== null && slotStart !== null && now >= slotStart) return "released";
+  return "held";
+}
+
+/**
+ * The hold to stamp on a fee Transaction when its booking is paid
+ * (`settlePayment`). Pure. Starts "held"; releases at slot end + 24 h.
+ *
+ * @param booking the booking as it is being settled (its slot fields)
+ */
+export function initialFeeHold(
+  booking: Pick<Consultation, "scheduledDate" | "scheduledTime" | "timezone" | "durationMinutes">
+): FeeHold {
+  return {
+    state: "held",
+    slotStartAt: Timestamp.fromDate(slotStartsAt(booking)),
+    releaseAt: Timestamp.fromDate(hoursAfter(slotEndsAt(booking), FEE_HOLD_AFTER_SLOT_HOURS)),
+  };
+}
+
+/**
+ * The hold after a RESCHEDULE (issue #317). Pure. Both times can only move
+ * LATER: moving a booking earlier (or into the past) must never release its
+ * fee sooner, or an agent could reschedule a paid booking to yesterday,
+ * withdraw the fee, and cancel. Everything else is kept as it was.
+ *
+ * @returns the new hold, or null when nothing changes (an ended hold, or a
+ *   move that is not later)
+ */
+export function rescheduledFeeHold(
+  hold: FeeHold,
+  booking: Pick<Consultation, "scheduledDate" | "scheduledTime" | "timezone" | "durationMinutes">
+): FeeHold | null {
+  if (hold.state !== "held") return null;
+  const next = initialFeeHold(booking);
+  const slotStartAt = next.slotStartAt.toMillis() > (millisOf(hold.slotStartAt) ?? 0) ? next.slotStartAt : hold.slotStartAt;
+  const releaseAt = next.releaseAt.toMillis() > (millisOf(hold.releaseAt) ?? 0) ? next.releaseAt : hold.releaseAt;
+  if (slotStartAt === hold.slotStartAt && releaseAt === hold.releaseAt) return null;
+  return { ...hold, slotStartAt, releaseAt };
+}
+
+/**
+ * The hold a fee written BEFORE #317 gets from the one-off backfill
+ * (`npm run backfill:fee-holds`). Pure. The decision for existing balances:
+ *  - the booking is `completed` or `no_show`, or its slot ended more than
+ *    24 hours ago: "released" (the meeting has happened, the agent keeps it);
+ *  - otherwise (still to come, or cancelled less than a day after its slot):
+ *    "held", with the normal release time, exactly as a new payment.
+ * A fee whose booking is gone, or has no readable slot, is left alone by the
+ * script (it stays held: the safe reading) and is reported.
+ *
+ * @param booking the fee's booking
+ * @param at the clock of the backfill run
+ */
+export function legacyFeeHold(
+  booking: Pick<Consultation, "status" | "scheduledDate" | "scheduledTime" | "timezone" | "durationMinutes">,
+  at: Date
+): FeeHold {
+  const hold = initialFeeHold(booking);
+  const meetingOver =
+    booking.status === "completed" || booking.status === "no_show" || at.getTime() >= hold.releaseAt.toMillis();
+  if (!meetingOver) return hold;
+  const now = Timestamp.fromDate(at);
+  return { ...hold, state: "released", endedAt: now, endedBy: "legacy_backfill" };
+}

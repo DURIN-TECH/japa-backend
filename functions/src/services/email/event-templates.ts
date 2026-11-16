@@ -183,6 +183,17 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     actionLabel: "Open dashboard",
     path: () => "/dashboard",
   },
+  // Issue #317: consultation refunds.
+  consultation_refunded: {
+    subject: "Your consultation refund",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
+  consultation_refund_delayed: {
+    subject: "Your refund is delayed",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
 
   // Subscriptions / billing
   subscription_activated: {

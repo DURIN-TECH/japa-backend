@@ -26,6 +26,9 @@ import {
   snapshotOf,
   supersededSwap,
 } from "./charge-checkout.service";
+// Issue #317: a paid fee is held until the meeting has happened.
+import { initialFeeHold } from "../money/fee-hold";
+import type { FeeHold } from "../types";
 // Issue #332: the charge fields a payer may see (no raw rate, no margin).
 import { clientChargeFields } from "../money/client-charge";
 
@@ -347,6 +350,22 @@ export function checkReportedCharge(c: Consultation, reported: PaystackTransacti
   return checkAgainst(expectedCharge(c), expiresAt, reported, at);
 }
 
+/**
+ * The hold to stamp on a booking's fee Transaction (issue #317), or
+ * undefined when the booking's slot cannot be read. A payment must never
+ * fail because of a bad date, and a fee with no `feeHold` is counted as
+ * HELD anyway (money/fee-hold.ts), so the safe reading still applies; the
+ * booking is logged so the data can be fixed.
+ */
+function holdFor(booking: Consultation, consultationId: string): FeeHold | undefined {
+  try {
+    return initialFeeHold(booking);
+  } catch (error) {
+    console.error(`[consultation] ${consultationId}: no readable slot, fee recorded without a hold time (held):`, error);
+    return undefined;
+  }
+}
+
 /** What settling a successful Paystack payment did. */
 export type SettleOutcome =
   /** The booking is now paid by this payment and its fee Transaction is written. */
@@ -494,6 +513,8 @@ export async function settlePayment(
       clientName: current.clientName,
       clientEmail: current.clientEmail,
       snapshot: snapshotOf(settled),
+      // Issue #317: the fee is HELD until the meeting has happened.
+      feeHold: holdFor(settled, consultationId),
     });
     // The review fields ride on the Transaction too.
     const recorded: Transaction = { ...transaction, ...review };

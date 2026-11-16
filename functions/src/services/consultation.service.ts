@@ -19,6 +19,20 @@ import {
 } from "./charge-checkout.service";
 // Issue #288: a booking the sweep finds PAID at Paystack is settled, not cancelled.
 import { settlePayment } from "./consultation-charge.service";
+// Issue #317: the refund rule, the refund write (same transaction as the
+// cancel), and the fee hold.
+import {
+  bookingRefundFields,
+  decideCancellationRefund,
+  isPaidWithMoney,
+  readFeeTransaction,
+  readRefundContext,
+  writeRefund,
+} from "./consultation-refund.service";
+import { feeHoldStatusAt, rescheduledFeeHold } from "../money/fee-hold";
+import type { Transaction } from "../types";
+// Issue #317: when a slot starts, in ONE helper (re-exported below).
+export { slotStartsAt, slotEndsAt } from "../consultations/slot-time";
 
 // ============================================
 // STATUS TRANSITION RULES (issue #151)
@@ -86,7 +100,10 @@ export const STATUS_TRANSITIONS: Record<
 /** Why a status change was refused: the API error code and its HTTP status. */
 export interface StatusChangeRefusal {
   ok: false;
-  code: "FORBIDDEN" | "VALIDATION_ERROR" | "INVALID_STATUS_TRANSITION" | "PAYMENT_IN_PROGRESS";
+  // FEE_RELEASED (issue #317): the agent side cancelling a paid booking
+  // whose fee was already released (the meeting has happened). Refunds of a
+  // released fee are an admin decision (POST /consultations/:id/refund).
+  code: "FORBIDDEN" | "VALIDATION_ERROR" | "INVALID_STATUS_TRANSITION" | "PAYMENT_IN_PROGRESS" | "FEE_RELEASED";
   httpStatus: 400 | 403 | 409;
   message: string;
 }
@@ -492,11 +509,25 @@ export type EditConsultationOutcome =
   | { kind: "refused"; refusal: EditRefusal }
   | { kind: "edited"; before: Consultation; consultation: Consultation };
 
-/** What `changeStatus` did. `refused` and `not_found` wrote nothing. */
+/**
+ * What `changeStatus` did. `refused` and `not_found` wrote nothing.
+ *
+ * Issue #317, on `changed`:
+ *  - `refund`: the booking's refund row after this change: the one this
+ *    cancel just wrote (`refundCreated: true`), one that already existed
+ *    (an admin refunded first), or null (no refund: free, late client
+ *    cancel, not a cancel, or legacy data with no fee Transaction).
+ */
 export type ChangeStatusOutcome =
   | { kind: "not_found" }
   | { kind: "refused"; refusal: StatusChangeRefusal }
-  | { kind: "changed"; before: Consultation; consultation: Consultation };
+  | {
+      kind: "changed";
+      before: Consultation;
+      consultation: Consultation;
+      refund: Transaction | null;
+      refundCreated: boolean;
+    };
 
 /** What `deleteUnpaidConsultation` did. Only `deleted` removed anything. */
 export type DeleteConsultationOutcome =
@@ -1068,6 +1099,28 @@ class ConsultationService {
       const write: Record<string, unknown> = { updatedAt: Timestamp.fromDate(at) };
       for (const field of fieldNames) write[field] = updates[field];
 
+      // Issue #317: a reschedule of a PAID booking moves its fee hold too,
+      // but only ever LATER (`rescheduledFeeHold`): moving a booking earlier,
+      // or into the past, never releases its fee sooner. Read before any write.
+      const after = { ...current, ...write } as Consultation;
+      const fee =
+        isScheduleEdit(fieldNames) && isPaidWithMoney(current) ? await readFeeTransaction(tx, current) : null;
+      if (fee?.feeHold) {
+        try {
+          const moved = rescheduledFeeHold(fee.feeHold, after);
+          if (moved) {
+            tx.update(collections.transactions.doc(fee.id), {
+              "feeHold.slotStartAt": moved.slotStartAt,
+              "feeHold.releaseAt": moved.releaseAt,
+              updatedAt: write.updatedAt,
+            });
+          }
+        } catch (error) {
+          // An unreadable new slot keeps the old hold (it never releases sooner).
+          console.error(`[consultation] ${id}: reschedule kept the fee hold (slot unreadable):`, error);
+        }
+      }
+
       tx.update(ref, write);
       // The stored doc after the commit: the fresh copy plus what was written.
       return { kind: "edited", before: current, consultation: { ...current, ...write } as Consultation };
@@ -1104,7 +1157,8 @@ class ConsultationService {
       const current = snap.data() as Consultation;
       const at = chargeRuntime.now();
 
-      const decision = decideStatusChange(actorFor(current), current, status, at);
+      const actor = actorFor(current);
+      const decision = decideStatusChange(actor, current, status, at);
       if (!decision.ok) return { kind: "refused", refusal: decision };
 
       const now = Timestamp.fromDate(at);
@@ -1118,9 +1172,88 @@ class ConsultationService {
         updates.summary = extra.summary;
       }
 
+      // ---- Issue #317: money on a cancel of a PAID booking ----
+      // All reads happen here, before any write. The refund row, the fee's
+      // hold, the agent's withdrawal lock and the booking are written in THIS
+      // transaction, so they commit together or not at all.
+      let refund: Transaction | null = null;
+      let refundCreated = false;
+      let writeRefundRow: (() => void) | null = null;
+      if (status === "cancelled" && isPaidWithMoney(current)) {
+        const ctx = await readRefundContext(tx, current, at);
+        if (!ctx.fee) {
+          // Legacy data: paid, but no settled Paystack fee Transaction to
+          // refund against. The cancel goes through; a human looks at it.
+          console.error(
+            `[consultation] ${id} is paid but has no settled Paystack consultation_fee Transaction: ` +
+              "cancelled without a refund row"
+          );
+        } else if (ctx.existingRefund) {
+          // Already refunded (an admin refunded first): nothing new.
+          refund = ctx.existingRefund;
+        } else {
+          // Once the fee is released the meeting has happened: the agent
+          // side can no longer cancel it (only an admin refund can give it back).
+          if (actor === CONSULTATION_ACTORS.AGENT_SIDE && ctx.feeHold === "released") {
+            return {
+              kind: "refused",
+              refusal: {
+                ok: false,
+                code: "FEE_RELEASED",
+                httpStatus: 409,
+                message:
+                  "This consultation's fee has been released because the meeting has happened, so it can no longer be cancelled.",
+              },
+            };
+          }
+          const money = decideCancellationRefund(
+            actor === CONSULTATION_ACTORS.AGENT_SIDE ? "agent_side" : "client",
+            current,
+            at
+          );
+          if (money.kind === "full") {
+            writeRefundRow = () => {
+              refund = writeRefund(tx, ctx, {
+                booking: current,
+                reason: money.reason,
+                initiatedBy: extra?.cancelledBy ?? "unknown",
+                at,
+              });
+              Object.assign(updates, bookingRefundFields(refund));
+              refundCreated = true;
+            };
+          }
+          // late_client_cancel: no row; the agent keeps the fee (it stays
+          // held until slot end + 24 h, then releases as usual).
+        }
+      }
+
+      // ---- Issue #317: the meeting is closed, so its fee may release ----
+      // Completed / no_show (the client did not show: the agent keeps the
+      // fee) stamp `meetingClosedAt` on a held fee; it releases once the
+      // slot has started (see feeHoldStatusAt).
+      let closeFee: Transaction | null = null;
+      if ((status === "completed" || status === "no_show") && isPaidWithMoney(current)) {
+        const fee = await readFeeTransaction(tx, current);
+        if (fee?.feeHold && fee.feeHold.state === "held" && feeHoldStatusAt(fee, at) === "held" && !fee.feeHold.meetingClosedAt) {
+          closeFee = fee;
+        }
+      }
+
+      // ---- Writes ----
+      if (writeRefundRow) writeRefundRow();
+      if (closeFee) {
+        tx.update(collections.transactions.doc(closeFee.id), { "feeHold.meetingClosedAt": now, updatedAt: now });
+      }
       tx.update(ref, updates);
       // The stored doc after the commit: the fresh copy plus what was written.
-      return { kind: "changed", before: current, consultation: { ...current, ...updates } as Consultation };
+      return {
+        kind: "changed",
+        before: current,
+        consultation: { ...current, ...updates } as Consultation,
+        refund,
+        refundCreated,
+      };
     });
   }
 
