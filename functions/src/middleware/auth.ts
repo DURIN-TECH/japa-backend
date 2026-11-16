@@ -98,6 +98,65 @@ async function attachAuthz(req: AuthenticatedRequest, claims?: RoleClaims): Prom
 }
 
 /**
+ * Issue #345 (product owner decision, 2026-11-15): money an agent or agency
+ * owner EARNED while their plan was active stays theirs after the plan lapses.
+ * So two money writes are exempt from the read-only (lapsed plan) write block
+ * in `verifyAuth`, the same way password change and account deletion are:
+ *
+ *  1. `POST /bank-accounts/withdraw`: withdraw the balance already earned.
+ *  2. `PUT /payment-requests/<id>/status` with a JSON body whose `status` is
+ *     exactly the string `"cancelled"`: cancel (withdraw) one's own unpaid
+ *     payment request (noted in the #283 review).
+ *
+ * The match is deliberately narrow, because anything it lets through skips
+ * the plan check:
+ *  - method AND the whole path must match (anchored regex, NOT `endsWith`),
+ *    so `PUT /applications/<id>/status`, `POST /applications/<id>/withdraw`
+ *    or `/x/bank-accounts/withdraw` are NOT exempt. Like the feedback
+ *    exemption, only the optional `/api` function prefix and one trailing
+ *    slash are tolerated. The match is case-sensitive: a differently-cased
+ *    URL is simply not exempt (it fails closed with the usual 402);
+ *  - `<id>` is exactly one non-empty path segment (no `/`);
+ *  - for the cancel, the body must be a plain JSON object with
+ *    `status === "cancelled"`. A missing body, a non-object body (string,
+ *    array, null) or any other / missing status (`"paid"`, `"pending"`,
+ *    `"CANCELLED"`, `["cancelled"]`...) is NOT exempt. `express.json()` runs
+ *    before the routers (`app.ts`), so `req.body` is already parsed here.
+ *
+ * This only skips the PLAN check. Every check inside the two handlers still
+ * runs (role, amount, own bank account, balance; creating agent, unpaid,
+ * no payment in flight). Adding / choosing / removing a bank account stays
+ * blocked on a lapsed plan (#359).
+ *
+ * Exported (pure, no I/O) so the near misses can be unit tested directly.
+ *
+ * @param method the HTTP method (any case)
+ * @param path   the app-root path with the query string already stripped
+ * @param body   the parsed request body (`req.body`), whatever it is
+ * @returns true only for the two writes above
+ */
+export function isEarnedMoneyWrite(method: string, path: string, body: unknown): boolean {
+  const verb = method.toUpperCase();
+
+  // 1. Withdraw earned balance: POST, exact path. The body (bank account,
+  //    amount) is validated by the controller, not here.
+  if (verb === "POST" && /^(\/api)?\/bank-accounts\/withdraw\/?$/.test(path)) {
+    return true;
+  }
+
+  // 2. Cancel one's own unpaid payment request: PUT, exact path with a
+  //    single-segment id, and a body that asks for exactly "cancelled".
+  if (verb === "PUT" && /^(\/api)?\/payment-requests\/[^/]+\/status\/?$/.test(path)) {
+    // A missing or non-object body is never exempt (arrays are objects in
+    // JS, so they are ruled out by name).
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return false;
+    return (body as Record<string, unknown>).status === "cancelled";
+  }
+
+  return false;
+}
+
+/**
  * Middleware to verify Firebase ID token from Authorization header
  * Expects: Authorization: Bearer <token>
  */
@@ -173,7 +232,14 @@ export async function verifyAuth(
       // Listed route by route and method (granting approval stays plan-gated).
       (method === "DELETE" && path.endsWith("/users/me/ai-message-access/approval")) ||
       (method === "PUT" && path.endsWith("/users/me/ai-message-access/account-wide-off")) ||
-      (method === "POST" && path.endsWith("/users/me/ai-message-access/notice-dismissed"));
+      (method === "POST" && path.endsWith("/users/me/ai-message-access/notice-dismissed")) ||
+      // Earned money (#345, product owner decision 2026-11-15): withdrawing
+      // the balance already earned (`POST /bank-accounts/withdraw`) and
+      // cancelling one's own unpaid payment request
+      // (`PUT /payment-requests/<id>/status` with body status "cancelled")
+      // still work on a lapsed plan. Method + EXACT path (+ body for the
+      // cancel); see `isEarnedMoneyWrite` for the near misses that stay 402.
+      isEarnedMoneyWrite(method, path, req.body);
 
     if (
       isWrite &&
