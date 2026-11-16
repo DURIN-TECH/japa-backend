@@ -1482,7 +1482,8 @@ export interface ConsultationPaymentException {
    * exception recorded before #354 that has no refund yet); `refunded` once
    * Paystack reports it processed; `refund_failed` once the engine gave up
    * (the refund row is `failed` and listed for an admin retry, which moves
-   * this back to `open`).
+   * this back to `open`). Also `refund_failed`, with NO refund row, while the
+   * refund is held for an admin (`refundFailureReason`).
    */
   status: "open" | "refunded" | "refund_failed";
   /**
@@ -1490,6 +1491,33 @@ export interface ConsultationPaymentException {
    * written in the SAME Firestore transaction as this record.
    */
   refundId?: string;
+  /**
+   * Issue #354 (decision 2026-11-16): Paystack's processing fee on THIS
+   * charge, in minor units of `currency`, exactly as Paystack reported it for
+   * the reference (`data.fees` of verify / `charge.success`, or a fresh
+   * lookup). Never estimated. Absent while Paystack has not reported a
+   * well-formed figure: the refund is then held (`refundFailureReason:
+   * "paystack_fee_unknown"`).
+   */
+  paystackFeeMinor?: number;
+  /**
+   * Issue #354: why the refund is HELD for an admin with no refund row
+   * written (`status: "refund_failed"`):
+   *  - "paystack_fee_unknown": Paystack's data for the reference has no
+   *    well-formed `fees`, so who-pays-what cannot be worked out. Nothing is
+   *    guessed; an admin retry re-reads the reference at Paystack;
+   *  - "fee_not_less_than_amount": a client-caused refund where Paystack's
+   *    fee is the whole charge or more, so nothing is left to refund.
+   * Cleared once the refund row is written.
+   */
+  refundFailureReason?: "paystack_fee_unknown" | "fee_not_less_than_amount";
+  /**
+   * Issue #354: the agent's fee-debit Transaction (`feeDebitDocId(reference)`)
+   * of an agent-caused refund (`paid_for_rescheduled_slot`), written in the
+   * SAME Firestore transaction as the refund row. Absent for client-caused
+   * refunds and when Paystack's fee was 0.
+   */
+  feeDebitId?: string;
   createdAt: Timestamp;
   /** Last change of `status` / `refundId` (absent until the first change). */
   updatedAt?: Timestamp;
@@ -1532,7 +1560,14 @@ export type TransactionType =
   | "government_fee"
   | "refund"
   | "escrow_release"
-  | "withdrawal";
+  | "withdrawal"
+  // Issue #354 (decision 2026-11-16): Paystack's processing fee on a refunded
+  // payment the AGENT side caused (a reschedule after the quote lock, then
+  // the client paid the old checkout), taken from the agent's balance. An
+  // outflow: lowers revenue and the available balance of its currency from
+  // the moment it is written, never `heldBalance`; may take it below zero.
+  // Never shown to the client.
+  | "paystack_fee_debit";
 
 export type TransactionStatus = 
   | "pending"
@@ -1689,6 +1724,9 @@ export interface Transaction extends Partial<ChargeSnapshot> {
    * reference). The refund engine mirrors the row's status onto THAT record,
    * never onto the booking (whose `refundId` / `refundStatus` belong to the
    * booking's own fee).
+   *
+   * Also set on a `paystack_fee_debit` row (issue #354): the exception whose
+   * Paystack fee it debits the agent for.
    */
   paymentExceptionId?: string;
   /** Why it was refunded. */
@@ -1705,6 +1743,13 @@ export interface Transaction extends Partial<ChargeSnapshot> {
    * moment the row was written. 0 when the balance covered it. Admin-visible.
    */
   balanceShortfallMinor?: number;
+  /**
+   * Issue #354: on the refund of a CLIENT-caused unapplied payment, the part
+   * of the charge Paystack kept as its processing fee (minor units of
+   * `currency`). `amount` + this = what the client was charged, so Seli
+   * carries none of it.
+   */
+  paystackFeeKeptMinor?: number;
   /** Paystack's id of the refund, once Paystack has one. */
   providerRefundId?: string;
   /** Paystack's own refund status as last seen ("pending", "processed", ...). */

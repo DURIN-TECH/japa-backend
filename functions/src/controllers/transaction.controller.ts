@@ -14,6 +14,8 @@ import {
 /** Every Transaction type, for the `type` list filter (issue #317). */
 const TRANSACTION_TYPES: Transaction["type"][] = [
   "consultation_fee", "service_fee", "government_fee", "refund", "escrow_release", "withdrawal",
+  // Issue #354: Paystack's fee on a refunded payment, taken from the agent.
+  "paystack_fee_debit",
 ];
 
 export class TransactionController {

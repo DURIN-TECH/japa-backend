@@ -25,6 +25,13 @@ router.post("/", verifyAuth, requireFeature(FEATURES.CONSULTATIONS_BOOK), (req, 
   consultationController.createConsultation(req, res)
 );
 
+// Issue #354: admin list of unapplied-payment refunds that need an admin
+// (held, or failed at Paystack). Before /:id, so "payment-exceptions" is
+// never read as a booking id.
+router.get("/payment-exceptions", verifyAuth, (req, res) =>
+  consultationController.listPaymentExceptions(req, res)
+);
+
 router.get("/:id", verifyAuth, (req, res) =>
   consultationController.getConsultation(req, res)
 );

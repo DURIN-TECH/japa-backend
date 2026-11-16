@@ -42,6 +42,8 @@ import {
   reissueCheckout,
   settlePayment,
   SettleOutcome,
+  // Issue #354: start a held refund once an admin retry finds Paystack's fee.
+  startUnappliedRefund,
 } from "../services/consultation-charge.service";
 // Issue #332: what a booking's CLIENT may see of it (no FX markup, no raw
 // rate), and the one rule for who gets that view.
@@ -1113,6 +1115,37 @@ export class ConsultationController {
   }
 
   /**
+   * GET /consultations/payment-exceptions (issue #354), ADMIN only.
+   *
+   * Refunds of payments that could not be applied to a booking and need an
+   * admin: every `consultationPaymentExceptions` record with status
+   * `refund_failed`, newest first. That is both
+   *  - HELD refunds, with no refund row (`refundFailureReason`:
+   *    `paystack_fee_unknown` = Paystack reported no well-formed fee;
+   *    `fee_not_less_than_amount` = a client-caused fee leaves nothing to
+   *    refund), and
+   *  - refunds whose row failed at Paystack (also listed in
+   *    `GET /transactions?role=admin&type=refund&status=failed`).
+   * Each item carries `retryRefundId`: retry it with
+   * `POST /consultations/:consultationId/refund { "refundId": retryRefundId }`.
+   * Amounts are minor units of each item's own `currency`.
+   */
+  async listPaymentExceptions(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      // Admins only: these records name Paystack references and clients' money.
+      if (req.authz?.role !== ROLES.ADMIN) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const items = await consultationRefundService.listExceptionRefundsNeedingAdmin();
+      sendSuccess(res, items);
+    } catch (error) {
+      console.error("Error listing consultation payment exceptions:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * POST /consultations/:id/refund  (issue #317, admins only)
    *
    * Body `{ reason: "agent_no_show" | "goodwill" | "other", note? }`; `note`
@@ -1167,6 +1200,36 @@ export class ConsultationController {
         }
         if (retry.kind === "already_refunded") {
           sendError(res, "ALREADY_REFUNDED", "This refund is not failed, so there is nothing to retry.", 409);
+          return;
+        }
+        // Issue #354 (Paystack's fee): a HELD refund whose fee Paystack
+        // still does not report. Nothing was written; nothing is guessed.
+        if (retry.kind === "fee_unknown") {
+          sendError(
+            res,
+            "PAYSTACK_FEE_UNKNOWN",
+            "Paystack still reports no processing fee for this payment, so the refund cannot be worked out yet.",
+            409
+          );
+          return;
+        }
+        if (retry.kind === "fee_not_less_than_amount") {
+          sendError(
+            res,
+            "FEE_NOT_LESS_THAN_AMOUNT",
+            "Paystack's processing fee is not less than the amount charged, so there is nothing left to refund.",
+            409
+          );
+          return;
+        }
+        if (retry.kind === "paystack_unavailable") {
+          sendError(res, "PAYSTACK_ERROR", "Paystack could not be reached. Try again in a moment.", 502);
+          return;
+        }
+        // A held refund started now: send it, tell the client (and a debited agent).
+        if (retry.kind === "started") {
+          const started = await startUnappliedRefund(retry.written);
+          sendSuccess(res, { refund: refundSummary(started), refundId: started.id, retried: true });
           return;
         }
         // Send it to Paystack now (a lookup comes first); a failure leaves it for the retry job.
@@ -1970,7 +2033,7 @@ export class ConsultationController {
       res.status(409).json({
         success: false,
         error: "CONSULTATION_RESCHEDULED",
-        message: "Your consultation moved, so we've refunded your payment. Please pay again for the new time.",
+        message: "Your consultation moved, so we've refunded your payment in full. Please pay again for the new time.",
         data: { refundPending: true, consultation: bookingSummary(outcome.consultation) },
       });
       return;

@@ -21,3 +21,14 @@ import { createHash } from "crypto";
 export function refundDocId(reference: string): string {
   return `refund_${createHash("sha256").update(reference).digest("hex")}`;
 }
+
+/**
+ * Issue #354 (decision 2026-11-16): the doc id of the agent's Paystack-fee
+ * debit for one charge: `feedebit_` + the SHA-256 of the charge's Paystack
+ * reference. Deterministic, like `refundDocId`, so one charge can only ever
+ * debit an agent ONCE, however many verifies or webhooks settle it. Hashed
+ * for the same reasons (a valid doc id; no raw Paystack reference in ids).
+ */
+export function feeDebitDocId(reference: string): string {
+  return `feedebit_${createHash("sha256").update(reference).digest("hex")}`;
+}
