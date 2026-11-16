@@ -134,6 +134,8 @@ const FULL_ROW: Required<Transaction> = {
     releaseAt: Timestamp.fromMillis(1_755_555_556_000),
   },
   refundOf: "HIDDEN-refunded-fee-id",
+  // Issue #354: the exception an unapplied-payment refund gives back (= a Paystack reference). Hidden.
+  paymentExceptionId: "HIDDEN-payment-exception-reference",
   reason: "admin_other",
   initiatedBy: "HIDDEN-initiating-uid",
   refundNote: "HIDDEN-admin-note",
@@ -205,6 +207,8 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   // row reaches the client as type "refund" + status + amount only.
   "feeHold",
   "refundOf",
+  // Issue #354: names a Paystack reference, so never shown to the client.
+  "paymentExceptionId",
   "reason",
   "initiatedBy",
   "refundNote",
