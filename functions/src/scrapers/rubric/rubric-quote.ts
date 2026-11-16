@@ -235,6 +235,26 @@ export function conditionParts(condition: string): string[] {
   return out.length === norm.split(/\s*(?:\.{3}|\u2026)\s*/u).filter((x) => x.trim()).length ? out : [];
 }
 
+/**
+ * (#242) True for a short, unpunctuated line that does not look like a list
+ * item or a sentence continuation: the shape of an UNLABELLED heading. No
+ * language word is involved. Exported since #335: the lead-in list reader
+ * (rubric-list-items.ts) uses the SAME test to decide that the line after a
+ * list is a heading, so the index and the reader cannot disagree on it.
+ */
+export function looksLikeTitle(line: string): boolean {
+  return line.length <= MAX_HEADING_TITLE_CHARS && HAS_WORDS_RE.test(line) && !SENTENCE_END_RE.test(line) && !LIMB_RE.test(line) && !/^\p{Ll}/u.test(line);
+}
+
+/**
+ * (#242) True for a short line with no sentence or clause mark at its end. A
+ * title-shaped line directly followed by such a line is part of a RUN of short
+ * lines (a list or a table), not a heading. Exported since #335, see above.
+ */
+export function isShortRunLine(line: string | undefined): boolean {
+  return line !== undefined && line.length <= MAX_HEADING_TITLE_CHARS && !SENTENCE_END_RE.test(line);
+}
+
 /** A label with its trailing full stop removed and spaces collapsed. */
 function normalizeRefLabel(label: string): string {
   return label.replace(/\s+/gu, " ").replace(/\.$/u, "").trim();
@@ -663,9 +683,8 @@ export class SnapshotQuoteIndex {
       if (!m || !isHeadingLine(line, m[0].length) || !HAS_WORDS_RE.test(line.slice(m[0].length))) return undefined;
       return (m[0].match(/\d+/gu) ?? []).length || 1;
     };
-    /** True for a short, unpunctuated line that does not look like a list item or a sentence continuation. */
-    const looksLikeTitle = (line: string): boolean => line.length <= MAX_HEADING_TITLE_CHARS && HAS_WORDS_RE.test(line) && !SENTENCE_END_RE.test(line) && !LIMB_RE.test(line) && !/^\p{Ll}/u.test(line);
-    const isShortRunLine = (line: string | undefined): boolean => line !== undefined && line.length <= MAX_HEADING_TITLE_CHARS && !SENTENCE_END_RE.test(line);
+    // The two line tests are module functions (`looksLikeTitle`, `isShortRunLine`, above the class)
+    // since #335, so the lead-in list reader decides "this line is a heading" with the SAME test.
 
     const chain: string[] = [];
     let depth: number | undefined; // depth of the last labelled heading taken (undefined: none yet)

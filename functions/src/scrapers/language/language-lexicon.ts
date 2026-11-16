@@ -63,6 +63,20 @@ export interface RawLexicon {
   dateTemplates: string[];
   scopeWords: string[];
   referenceWords: string[];
+  /**
+   * (#335) The words that may stand ALONE on a line between two items of a
+   * list ("or", "and", "and/or"), lower case. The lead-in list reader keeps
+   * such a line, verbatim, between the two items; in a language with none, a
+   * line of that kind makes the list unreadable (refused, never cut short).
+   */
+  listConnectors: string[];
+  /**
+   * (#335) The words that name a DIVISION of a legal text ("Article",
+   * "Chapter", "Annex"), as written at the start of a sentence. A line made of
+   * one of them and its number ("Article 7", "CHAPTER III", "ANNEX II") is a
+   * heading: it ends a list, and it is never the words of a list item.
+   */
+  headingWords: string[];
 }
 
 /** A compiled date template: where the three parts are, as named groups. */
@@ -94,6 +108,14 @@ export interface Lexicon {
   scopeWords: readonly string[];
   /** Regex source of the reference words ("Art|Arts"), or "" when there are none. */
   referenceWordsAlt: string;
+  /** (#335) The connector words a list may set alone on a line between two items, lower case. Empty: none is recognised. */
+  listConnectors: ReadonlySet<string>;
+  /**
+   * (#335) "This whole line is a division heading": a heading word (as written
+   * in the file, or in capitals) followed by its number, numeral or letter and
+   * nothing else. `null` when the language lists no heading word.
+   */
+  divisionHeadingRe: RegExp | null;
 }
 
 /** Where the lexicon files live: next to the compiled code too (the build copies them). */
@@ -153,6 +175,9 @@ export function lexiconProblems(raw: unknown): string[] {
   }
   if (!isStringList(r.scopeWords)) problems.push("scopeWords: a list of words");
   if (!Array.isArray(r.referenceWords) || !r.referenceWords.every((x) => typeof x === "string" && x.length > 0)) problems.push("referenceWords: a list of words");
+  // (#335) Connector lines are compared lower-case, so an upper-case word could never match.
+  if (!isStringList(r.listConnectors) || r.listConnectors.some((x) => x !== x.toLowerCase() || /\s/.test(x))) problems.push("listConnectors: a list of single lower-case words");
+  if (!isStringList(r.headingWords) || r.headingWords.some((x) => /\s/.test(x))) problems.push("headingWords: a list of single words");
   return problems;
 }
 
@@ -189,7 +214,28 @@ export function compileLexicon(raw: RawLexicon, strict = false): Lexicon {
     dateTemplates: raw.dateTemplates.map((t) => ({ re: new RegExp(t.split("{months}").join(monthAlt), "gu") })),
     scopeWords: raw.scopeWords,
     referenceWordsAlt: alternation(raw.referenceWords),
+    listConnectors: new Set(raw.listConnectors),
+    divisionHeadingRe: divisionHeadingRe(raw.headingWords),
   };
+}
+
+/**
+ * (#335) The "whole line is a division heading" expression of a language:
+ * one of its heading words, written as in the file ("Article") or all in
+ * capitals ("ARTICLE"), then a space and the division's own designator: a
+ * number with an optional letter ("25a"), a roman numeral in capitals ("IV")
+ * or one capital letter ("B"). Nothing may follow on the line. Case is NOT
+ * ignored as a whole: a lower-case word that happens to be made of numeral
+ * letters ("Title civil") must not read as a heading.
+ */
+function divisionHeadingRe(words: readonly string[]): RegExp | null {
+  if (words.length === 0) return null;
+  const forms = new Set<string>();
+  for (const w of words) {
+    forms.add(w);
+    forms.add(w.toLocaleUpperCase());
+  }
+  return new RegExp(String.raw`^(?:${alternation(forms)})\s(?:\d+[a-z]{0,2}|[IVXLCDM]+|[A-Z])$`, "u");
 }
 
 /**
@@ -208,6 +254,9 @@ function strictRaw(code: string): RawLexicon {
     dateTemplates: [],
     scopeWords: [],
     referenceWords: [],
+    // (#335) No connector and no heading word: the list reader then refuses what it cannot place.
+    listConnectors: [],
+    headingWords: [],
   };
 }
 

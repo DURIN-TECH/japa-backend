@@ -23,11 +23,17 @@
 /** The three kinds of marker a list level can use. */
 export type MarkerKind = "digit" | "roman" | "letter";
 
-/** One level of the chain being built: the marker's inner text and its kind. */
-interface Level {
+/**
+ * One level of the chain being built: the marker's inner text and its kind.
+ * Exported (#335) so the lead-in list reader (rubric-list-items.ts) can keep
+ * the SAME levels this module decides and test each new marker against them.
+ */
+export interface MarkerLevel {
   kind: MarkerKind;
   inner: string;
 }
+/** Local short name (the module was written with it). */
+type Level = MarkerLevel;
 
 /**
  * Roman numerals up to 39 written in lower case. Used only for markers of two
@@ -58,6 +64,14 @@ function romanValue(inner: string): number {
   }
   return total;
 }
+
+/**
+ * True when `inner` directly follows `previous` in a list of the given kind.
+ * Exported (#335) as `markerFollows`: the list reader uses it to prove that a
+ * marker is the NEXT one of its list ("(b)" after "(a)", "(iii)" after "(ii)"),
+ * so a marker that is out of order is refused, never read as an item.
+ */
+export const markerFollows = (kind: MarkerKind, previous: string, inner: string): boolean => follows(kind, previous, inner);
 
 /** True when `inner` directly follows `previous` in a list of the given kind. */
 function follows(kind: MarkerKind, previous: string, inner: string): boolean {
@@ -98,17 +112,32 @@ function ambiguousKind(inner: string, levels: readonly Level[]): MarkerKind {
  * ("(i)" is the letter after "(h)"); a, i, iv, v -> ["(a)", "(v)"].
  */
 export function composeMarkerChain(markers: readonly string[]): string[] {
-  // One level per kind: a list never nests inside a list of its own kind.
+  // One step per marker, in document order (see `nextMarkerLevels`).
   let levels: Level[] = [];
-  for (const inner of markers) {
-    const kind = plainKind(inner) ?? ambiguousKind(inner, levels);
-    const at = levels.findIndex((l) => l.kind === kind);
-    // A marker of a kind already on the chain is a later sibling of that
-    // level: it replaces it and ends every deeper list. A new kind opens a
-    // list one level deeper.
-    levels = at === -1 ? [...levels, { kind, inner }] : [...levels.slice(0, at), { kind, inner }];
-  }
+  for (const inner of markers) levels = nextMarkerLevels(levels, inner);
   return levels.map((l) => `(${l.inner})`);
+}
+
+/**
+ * ONE step of the chain: the levels after the marker `inner` is met, given the
+ * levels before it. This is the body `composeMarkerChain` always had, split out
+ * (#335) so the lead-in list reader can walk a list marker by marker and look
+ * at the levels in between (did this marker open a deeper list, or replace a
+ * level that was already open?). `composeMarkerChain` is this step folded over
+ * the markers, so the two can never disagree.
+ *
+ * @param levels the levels before the marker, outermost first (not changed)
+ * @param inner the marker's inner text, without brackets ("a", "ii", "3")
+ * @returns the levels after it, outermost first; its own level is the last
+ */
+export function nextMarkerLevels(levels: readonly MarkerLevel[], inner: string): MarkerLevel[] {
+  // One level per kind: a list never nests inside a list of its own kind.
+  const kind = plainKind(inner) ?? ambiguousKind(inner, levels);
+  const at = levels.findIndex((l) => l.kind === kind);
+  // A marker of a kind already on the chain is a later sibling of that
+  // level: it replaces it and ends every deeper list. A new kind opens a
+  // list one level deeper.
+  return at === -1 ? [...levels, { kind, inner }] : [...levels.slice(0, at), { kind, inner }];
 }
 
 /**
