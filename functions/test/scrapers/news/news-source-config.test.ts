@@ -32,7 +32,11 @@ let newsController: any;
 let newsRoutes: any;
 
 const DAY = 24 * 60 * 60 * 1000;
-const NOW = Date.parse("2026-11-10T12:00:00Z");
+// The test clock. It must be the REAL current time, not a fixed date: the
+// PATCH route works out articlesLast7d from the server's own clock (it takes
+// no `nowMs`), so articles seeded relative to a fixed date drift out of the
+// 7-day window once that date is more than a week in the past.
+const NOW = Date.now();
 
 before(async () => {
   await installFakes();
