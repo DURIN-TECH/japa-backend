@@ -46,6 +46,10 @@ import { containsTokenBounded } from "./rubric-quote";
 //    (`containsTokenBounded`, rubric-quote.ts): words cut out of the middle of
 //    longer words do not count; and the words must be at least
 //    MIN_RESTS_ON_CHARS long, so "the" or "or" can never be a step's basis.
+//  - (#335, fix round 2) When the rule HAS list lines, that one line must be
+//    a LIST LINE, never the quote: a lead-in ("... shall be:") names no case,
+//    and a step resting on it would show the applicant only the lead-in as
+//    the official words for its proposal (`competence_rests_on_lead_in`).
 //  - It reads ONE answer: a choice question of the same layer whose options
 //    are the route's member countries from membership data at the time of
 //    asking (`optionsFrom: "route_destinations"`), so no country is ever typed
@@ -132,7 +136,9 @@ export function restsOnSite(source: { quote: string; listItems?: readonly string
  * lead-in alone, "... shall be:", says nothing about the case). Every line is
  * a stored verbatim line of the rule (quote or `listItems`), joined by a line
  * break, the same way `quoteWithItems` joins the whole list. Nothing is
- * reworded. When the words are in the quote, the quote alone. A step whose
+ * reworded. When the words are in the quote, the quote alone (fix round 2:
+ * only reachable for a rule WITHOUT list lines; on a rule with list lines a
+ * step resting on the quote is refused as `competence_rests_on_lead_in`). A step whose
  * words name no single line never reaches an applicant (`competenceProblems`
  * refuses it and the block is not served); for such a step this returns the
  * quote alone, never a guessed line.
@@ -216,6 +222,18 @@ export function competenceProblems(
     // would be shown a line picked by position. Refused, never resolved.
     if (sites.length > 1) {
       return add("competence_rests_on_ambiguous", `the words a step applies are in ${sites.length} lines of its rule (its quote and list lines); they must be in exactly one, so the step names one case`, i);
+    }
+    // (#335, fix round 2) A rule WITH list lines is a lead-in rule: its quote
+    // ("The Member State competent ... shall be:") names no case at all; the
+    // cases are its list lines. A step that rests on the quote alone would be
+    // shown to the applicant as just the lead-in (`stepQuoteShown` adds a list
+    // line only when the words are in one), so it says nothing about why that
+    // country was proposed. The one site must therefore be a LIST LINE (a
+    // number), never "quote". A rule with no list lines is unchanged: its quote
+    // is the whole rule and the words may sit there.
+    const ruleItems = Array.isArray(s.source.listItems) ? s.source.listItems : [];
+    if (ruleItems.length > 0 && sites[0] === "quote") {
+      return add("competence_rests_on_lead_in", "the step's rule ends with a lead-in and has list lines, so the words a step applies must be in exactly one of those list lines (the case it applies), never in the lead-in quote alone", i);
     }
     // ---- where the result comes from: the answer, never anything else ----
     if (s.resultFrom !== "answer") return add("competence_result_from_invalid", "a step's result comes from the applicant's answer", i);

@@ -573,7 +573,9 @@ describe("prompt version pin", () => {
     // Re-pinned in fix round 1 of #335 (the step words must be whole words, 8+ characters, in ONE
     // line only). Same version on purpose: v13 exists only on the unmerged #335 branch and was never
     // sent to a model or deployed, so no stored draft carries the earlier v13 text.
-    "2026-11-rubric-v13": "79f00adaedc57487229ac207bfea592129a81a35f824ea846aec6ce2c7a04144",
+    // Re-pinned again in fix round 2 of #335 (a rule with list lines: the step words come from one
+    // list line, never the lead-in quote). Same version for the same reason: still unpushed, never sent.
+    "2026-11-rubric-v13": "f70a8d439510944655f8ead19cc26edbe8cc12274f2b25b685bba6ff492c47f3",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {

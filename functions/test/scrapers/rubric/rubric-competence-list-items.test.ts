@@ -31,6 +31,7 @@ import { assessChunkOutput, mergeAssessments } from "../../../src/scrapers/rubri
 import { DEFAULT_SEVERITY_LEVELS, type AssessmentCriterion, type CompetenceBlock, type IntakeQuestion } from "../../../src/types/rubric";
 import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
 import { answer, crit } from "./rubric-harness";
+import { RUBRIC_INTAKE_SYSTEM_PROMPT } from "../../../src/scrapers/rubric/rubric-prompt";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -316,6 +317,55 @@ describe("competenceProblems: words found in two or more lines are refused, neve
     assert.deepEqual([SOLE, MAIN, BORDER].map((w) => restsOnSites(RULE.source, w)), [[0], [1], [2]]);
     assert.equal(stepQuoteShown(RULE.source, MAIN), `${LEAD_IN}\n${ITEMS[1]}`);
     assert.equal(stepQuoteShown(RULE.source, BORDER), `${LEAD_IN}\n${ITEMS[2]}`);
+  });
+});
+
+// ============================================
+// 2c. Fix round 2: on a rule WITH list lines, the one line must be a LIST LINE
+// ============================================
+//
+// Review round 2 (blocking 2): on this rule, `restsOn` = "The Member State
+// competent" (and other words of the lead-in only) gave sites ["quote"], so
+// `competenceProblems` passed, and `stepQuoteShown` served only the lead-in
+// ("... shall be:") as the official words of the proposal. A lead-in names no
+// case. Now refused as `competence_rests_on_lead_in`. Every phrase is cut out
+// of the stored lead-in by position, never typed.
+
+describe("competenceProblems: a step of a lead-in rule may not rest on the lead-in alone", () => {
+  /** A step for the case at `stepIndex` resting on `restsOn`, in the otherwise sound block. */
+  const withWords = (stepIndex: number, restsOn: string) => ({ ...RUBRIC, competence: { steps: BLOCK.steps.map((s, i) => (i === stepIndex ? { ...s, restsOn } : s)) } });
+  const codes = (rubric: Parameters<typeof competenceProblems>[0]) => competenceProblems(rubric, { sharedRulebook: true }).map((p) => `${p.stepIndex}:${p.code}`);
+  /** Words of the lead-in quote, found in it by position. */
+  const leadWords = (re: RegExp): string => (LEAD_IN.match(re) as RegExpMatchArray)[0];
+
+  for (const re of [/The\s+Member\s+State\s+competent/u, /competent\s+for\s+examining\s+and\s+deciding/u, /uniform\s+visa\s+shall\s+be/u]) {
+    test(`refused: words found only in the lead-in (${re.source})`, () => {
+      const words = leadWords(re);
+      // The words really are in the quote, and in no list line.
+      assert.deepEqual(restsOnSites(RULE.source, words), ["quote"]);
+      for (const stepIndex of [0, 1, 2]) {
+        assert.deepEqual(codes(withWords(stepIndex, words)), [`${stepIndex}:competence_rests_on_lead_in`]);
+      }
+      // A block with such a step is not servable (the whole block goes).
+      assert.equal(competenceProblems(withWords(1, words)).length, 1);
+    });
+  }
+
+  test("accepted: words in exactly one list line, on every step (the sound block)", () => {
+    assert.deepEqual(codes(RUBRIC), []);
+  });
+
+  test("a rule WITHOUT list lines may still rest on its quote", () => {
+    // Same rule, same lead-in words, but no list lines stored: the quote is the whole rule.
+    const plain = { ...RULE, source: { ...RULE.source, listItems: undefined } } as AssessmentCriterion;
+    const words = leadWords(/The\s+Member\s+State\s+competent/u);
+    const steps = [{ ...BLOCK.steps[0], restsOn: words, source: plain.source }];
+    assert.deepEqual(competenceProblems({ ...RUBRIC, criteria: [plain], competence: { steps } }, { sharedRulebook: true }), []);
+    assert.equal(stepQuoteShown(plain.source, words), LEAD_IN);
+  });
+
+  test("the call 2 instruction says the words come from a list line, never the quote, when there are list lines", () => {
+    assert.ok(RUBRIC_INTAKE_SYSTEM_PROMPT.includes("copied from ONE of those list lines, never from the quote"));
   });
 });
 
