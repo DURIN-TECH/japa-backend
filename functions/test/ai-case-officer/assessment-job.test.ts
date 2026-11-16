@@ -152,6 +152,32 @@ describe("code decides, and judgement is contained", () => {
     assert.equal(stored.internalCall, "would_approve");
   });
 
+  test("(#308) the job passes the rulebook's document items through: a missing field fails only a rule a document item names", async () => {
+    // The uploaded document is read cleanly and has the funds and the holder,
+    // but no statement end date and (new rule below) no fee field.
+    //  - `a-period` is named by a document item -> refusal ground, detail names the item;
+    //  - `a-fee` is named by NO document item   -> stored "not_in_documents": not a
+    //    ground, not a top issue, no proposed action.
+    const rubric = routeARubric();
+    const source = rubric.criteria[0].source;
+    rubric.criteria.push({ ...rubric.criteria.find((c) => c.criterionId === "a-period")!, criterionId: "a-fee", title: "Fee paid", severity: "critical", check: { field: "feePaid", op: "eq", value: true } });
+    rubric.evidenceItems = [{ key: "statement", title: "Bank statement", party: "applicant", criterionIds: ["a-period"], source }];
+    book(rubric);
+    seedStandardCase();
+    const provider = scripted({ byKey: { bank: extraction(BANK_VALUES.filter((v) => v.field !== "statement.endDate")) } });
+    const stored = await assessOnce(serviceWith(provider));
+
+    assert.equal(stored.status, "succeeded");
+    assert.deepEqual(stored.refusalGrounds.map((g: any) => [g.criterionId, g.detail]), [["a-period", "We couldn't find this in your documents: Bank statement"]]);
+    assert.deepEqual(stored.insufficientInformation.map((i: any) => [i.criterionId, i.notAssessed]), [["a-fee", "not_in_documents"]]);
+    // `a-fee` is the most severe rule of the route, and still not a top issue.
+    assert.deepEqual(stored.topIssues.map((t: any) => t.criterionId), ["a-period"]);
+    assert.equal(stored.readiness, "not_ready");
+    // Proposed actions written by the job: one, for the real ground.
+    const actions = [...store.entries()].filter(([path]) => path.includes("/proposedActions/")).map(([, value]) => value as any);
+    assert.deepEqual(actions.map((a) => [a.criterionId, a.blocking, a.title]), [["a-period", true, "Bank statement"]]);
+  });
+
   test("the same recorded answers flip the outcome when only the code-side rule value changes", async () => {
     book(routeARubric({ fundsMinimum: 2000 }));
     seedStandardCase();
@@ -241,14 +267,16 @@ describe("injection, partial failure and the caps", () => {
     assert.equal(stored.refusalGrounds.filter((g: any) => g.criterionId === "a-funds").length, 0);
   });
 
-  test("a per-assessment request cap fails the job before the call that would pass it", async () => {
+  test("a per-assessment request cap fails the job before ANY call, with its own code (#310)", async () => {
     seedStandardCase();
     seedDocument({ id: "doc-2", key: "bank2", label: "Second statement" });
     const provider = scripted({ byKey: { bank: extraction(BANK_VALUES), bank2: extraction([]) } });
-    const stored = await assessOnce(serviceWith(provider, { maxRequestsPerAssessment: 1 }));
+    // 2 documents + 1 judgement call needed; a cap of 2 leaves room for 1 document.
+    const stored = await assessOnce(serviceWith(provider, { maxRequestsPerAssessment: 2 }));
     assert.equal(stored.status, "failed");
-    assert.equal(stored.error.code, "cost_cap_exceeded");
-    assert.equal(provider.callsFor("extraction"), 1, "the second call never happens");
+    // Not `cost_cap_exceeded` (which the app showed as "reviews are paused").
+    assert.equal(stored.error.code, "too_many_documents");
+    assert.equal(provider.requests.length, 0, "no call is made for a review that cannot finish");
   });
 
   test("the daily cap fails a job that would reach a model, with zero calls", async () => {
@@ -352,7 +380,7 @@ describe("requests: idempotent, free re-run, retry, and no approved rubric", () 
   });
 
   test("the merged default settings are what a job uses when the doc is absent", () => {
-    assert.equal(mergeAiSettings(undefined).maxRequestsPerAssessment, 12);
+    assert.equal(mergeAiSettings(undefined).maxRequestsPerAssessment, 30); // #310: was 12
     assert.ok(NOW.getTime() > 0);
     void resetStore;
   });

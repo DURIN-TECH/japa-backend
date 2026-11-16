@@ -42,8 +42,21 @@ export const ASSESSMENT_ERROR_CODES = [
   "inputs_changed",
   "rubric_changed",
   "timed_out",
+  // Kept for failures stored before #310 and for the bulk path (#37). The
+  // single-application review no longer writes it: see the two codes below.
   "cost_cap_exceeded",
+  // The PLATFORM-WIDE daily limit is used up. True "try again tomorrow".
   "daily_cap_exceeded",
+  // (#310) The application itself is too big for ONE review. Neither is a
+  // pause and neither is fixed by waiting: the same inputs fail the same way.
+  //   too_many_documents  more documents than the request cap leaves room for
+  //                       (one extraction call each, after the judgement calls);
+  //   review_too_large    the review would pass a per-review cap for another
+  //                       reason (the rules alone need every request, the
+  //                       TEXT of the requests passes the input-size cap, or
+  //                       all the files together pass the attached-bytes cap).
+  "too_many_documents",
+  "review_too_large",
   "settings_unavailable",
   "disabled",
   "provider_error",
@@ -110,11 +123,26 @@ export interface InsufficientItem {
   // document, so no evidence request or proposed action is made for it, and it
   // is never one of the free tier's top issues.
   // (#234) `missing_fact`: a rule decided from what the applicant holds needs a fact they have not stated.
-  notAssessed?: "unanswered" | "no_trigger" | "missing_fact";
+  // (#308) `not_in_documents`: an objective rule whose checked field is in no
+  // uploaded document, and for which the rulebook names NO document item
+  // (`evidenceItems[].criterionIds`), so no upload could settle it (an
+  // exclusion order, a paid fee, biometrics). Stored for staff. Like
+  // `no_trigger` it is never a refusal ground or a top issue, makes no proposed
+  // action, and does not lower the band or the confidence. Clients must not
+  // list it to the applicant as something to act on.
+  // NOTE: the app hides any marker it does not know. A NEW marker the
+  // applicant can act on therefore needs an app change before it is served.
+  notAssessed?: "unanswered" | "no_trigger" | "missing_fact" | "not_in_documents";
   // (#233) The rulebook layer the rule came from (its rulebook key), set only
   // when the application runs on a stack of more than one layer. Copied from
   // the rubric in code, never from model text.
   layerKey?: string;
+  // (#308) Set only on an item that is about an UPLOAD, not a rule: a document
+  // that could not be read (unreadable, failed or flagged). `criterionId` is
+  // then `document:<documentId>` (no rule), `title` is the upload's label and
+  // `reason` is a fixed sentence written for the applicant. It never carries
+  // `notAssessed`: the applicant can act on it (upload a clearer copy).
+  documentId?: string;
 }
 
 /**
@@ -292,6 +320,9 @@ export interface ApplicationAssessment {
   // Full tier and staff only: the free whitelist does not include it.
   countryContext?: AvailableCountryContext;
   // Stored, stripped from every client-role response (see tier-serializer).
+  // (#308) Also null on a FINISHED assessment when nothing refuses and the
+  // objective checks could not be made (the rulebook names no document for
+  // them, an upload is unread, or a field could not be read): no call is made.
   internalCall: "would_approve" | "would_refuse" | null;
 
   models: { extract: string | null; judge: string | null };
@@ -389,6 +420,8 @@ export interface ProposedAction {
   // action becomes a DocumentRequest when accepted.
   blocking: boolean;
   // Resolves to a criterion in the rubric version the assessment used (checked at write time).
+  // (#308) The one exception: an action for an upload that could not be read
+  // carries `document:<documentId>` here (no rule is involved).
   criterionId: string;
   evidenceNeeded: string;
   estEffort: ProposedActionEffort;

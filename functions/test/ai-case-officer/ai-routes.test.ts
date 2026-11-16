@@ -17,7 +17,7 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import { defineAbilitiesFor, ROLES, type Entitlements } from "@durin-tech/authz";
 import { aiCaseOfficerController } from "../../src/controllers/ai-case-officer.controller";
 import { aiCaseOfficerService } from "../../src/services/ai-case-officer.service";
-import { routeARubric, rubricBook, ScriptedProvider, seedApplication, seedDocument, seedEligibility, seedStatement, seedUser, serviceWith, installAssessmentFakes, resetAll, storedAssessments, allKeys } from "./harness";
+import { routeARubric, rubricBook, ScriptedProvider, seedApplication, seedDocument, seedEligibility, seedStatement, seedUser, serviceWith, installAssessmentFakes, installIntakeFake, resetAll, storedAssessments, allKeys } from "./harness";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -69,6 +69,8 @@ const OTHER_AGENCY = { uid: "agent-9", role: ROLES.AGENT, agencyId: "agency-2" }
 const ADMIN = { uid: "admin-1", role: ROLES.ADMIN, agencyId: null };
 
 const originalDeps = (aiCaseOfficerService as any).deps;
+/** (#309) Puts the real intake reader back after the suite. */
+let restoreIntake: () => void = () => {};
 
 /** Point the singleton (the one the controller uses) at a scripted provider. */
 function useProvider(provider: ScriptedProvider, settings: Record<string, unknown> = {}) {
@@ -95,11 +97,14 @@ describe("the /ai handlers", () => {
   before(() => {});
   after(() => {
     Object.assign(aiCaseOfficerService, { deps: originalDeps });
+    restoreIntake();
   });
 
   beforeEach(async () => {
     resetAll();
     await installAssessmentFakes();
+    // (#309) The POST's enough-to-review gate reads the intake through the book.
+    restoreIntake = await installIntakeFake();
     rubricBook.set("AA_route-a", routeARubric());
   });
 
