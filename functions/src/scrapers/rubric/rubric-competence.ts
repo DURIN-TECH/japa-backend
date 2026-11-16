@@ -1,6 +1,7 @@
 import type { AssessmentCriterion, CompetenceBlock, CompetenceStep, IntakeCondition, IntakeQuestion, VisaRubric } from "../../types/rubric";
 import { isCountryCode } from "../../authorities/authority-ids";
 import { normalizeForQuoteMatch } from "../shared/fetch/pdf-text";
+import { containsTokenBounded } from "./rubric-quote";
 
 // ============================================
 // COMPETENCE STEPS — THE CODE CHECK (issue #235, P6 of #228)
@@ -34,6 +35,17 @@ import { normalizeForQuoteMatch } from "../shared/fetch/pdf-text";
 //    re-proved verbatim by the independent check, so they are the official
 //    words just as much as the quote is. The words must still sit inside one
 //    line (the quote or one item): never stitched across two.
+//  - (#335, fix round 1) The words name EXACTLY ONE of those lines. A lead-in
+//    rule's steps are told apart only by the line each rests on, and that line
+//    is what the applicant is shown as the official words for the proposal.
+//    Words that are in two or more lines ("the Member State", which every
+//    case of such a rule repeats) do not say which case the step applies, so
+//    the step is refused with its own code (`competence_rests_on_ambiguous`)
+//    and, like any failing step, takes the whole block with it. The first
+//    matching line is never picked for it. The match is on TOKEN BOUNDARIES
+//    (`containsTokenBounded`, rubric-quote.ts): words cut out of the middle of
+//    longer words do not count; and the words must be at least
+//    MIN_RESTS_ON_CHARS long, so "the" or "or" can never be a step's basis.
 //  - It reads ONE answer: a choice question of the same layer whose options
 //    are the route's member countries from membership data at the time of
 //    asking (`optionsFrom: "route_destinations"`), so no country is ever typed
@@ -51,8 +63,15 @@ import { normalizeForQuoteMatch } from "../shared/fetch/pdf-text";
 
 /** Most steps one block may hold (a sanity cap, not a legal rule). */
 export const MAX_COMPETENCE_STEPS = 10;
-/** Shortest `restsOn` accepted: a word or phrase, never a single letter. */
-export const MIN_RESTS_ON_CHARS = 3;
+/**
+ * Shortest `restsOn` accepted, in characters after whitespace normalisation.
+ * (#335, fix round 1: raised from 3.) Eight is the length the quote code
+ * already uses for "the shortest part of a condition that can be located"
+ * (`MIN_CONDITION_PART_CHARS`): anything shorter is a stray word ("the",
+ * "stay", "border") that matches almost anywhere and says nothing about which
+ * case of the rule a step applies.
+ */
+export const MIN_RESTS_ON_CHARS = 8;
 
 /** One problem with a block (code + plain words, and the step it is about, -1 for the block). */
 export interface CompetenceProblem {
@@ -64,22 +83,47 @@ export interface CompetenceProblem {
 /** The answer types a step's question may have (the answer must name countries from a list). */
 const CHOICE_TYPES: readonly string[] = ["single_choice", "multi_choice"];
 
-/** Does a quote contain these words (whitespace-normalised, exact otherwise)? */
+/**
+ * Does a line (a quote or one list line) contain these words? Verbatim,
+ * whitespace-normalised, case-sensitive, and (#335, fix round 1) on TOKEN
+ * BOUNDARIES: the words may not begin or end inside a longer word or number
+ * ("destination" is not in "destinations"; see `containsTokenBounded`). Words
+ * shorter than MIN_RESTS_ON_CHARS are never contained.
+ */
 export function quoteContains(quote: string, words: string): boolean {
-  const w = normalizeForQuoteMatch(words);
-  return w.length >= MIN_RESTS_ON_CHARS && normalizeForQuoteMatch(quote).includes(w);
+  return normalizeForQuoteMatch(words).length >= MIN_RESTS_ON_CHARS && containsTokenBounded(quote, words);
+}
+
+/** Where a step's words can sit: the rule's quote, or one of its list lines (by position). */
+export type RestsOnSite = "quote" | number;
+
+/**
+ * (#335, fix round 1) EVERY place a step's words are found among its rule's
+ * official lines: "quote" for the quote itself, and the index of each list
+ * line (`source.listItems`) that holds them. Empty: the words are not the
+ * rule's. One entry: the step names that line. Two or more: the words do not
+ * tell the rule's cases apart (ambiguous).
+ */
+export function restsOnSites(source: { quote: string; listItems?: readonly string[] }, words: string): RestsOnSite[] {
+  const sites: RestsOnSite[] = [];
+  if (typeof source.quote === "string" && quoteContains(source.quote, words)) sites.push("quote");
+  const items = Array.isArray(source.listItems) ? source.listItems : [];
+  items.forEach((item, at) => {
+    if (typeof item === "string" && quoteContains(item, words)) sites.push(at);
+  });
+  return sites;
 }
 
 /**
- * (#335) Where a step's words are: "quote" when they are in the quote itself,
- * else the index of the FIRST list line (`source.listItems`) that holds them,
- * else undefined (not in the rule's official words at all: refused).
+ * (#335) THE one place a step's words are: "quote", or the index of the one
+ * list line that holds them. Undefined when they are nowhere in the rule's
+ * official words, AND when they are in two or more places (fix round 1: the
+ * first match is never taken; see the header). Callers that need to tell the
+ * two apart use `restsOnSites`.
  */
-export function restsOnSite(source: { quote: string; listItems?: readonly string[] }, words: string): "quote" | number | undefined {
-  if (quoteContains(source.quote, words)) return "quote";
-  const items = Array.isArray(source.listItems) ? source.listItems : [];
-  const at = items.findIndex((item) => typeof item === "string" && quoteContains(item, words));
-  return at >= 0 ? at : undefined;
+export function restsOnSite(source: { quote: string; listItems?: readonly string[] }, words: string): RestsOnSite | undefined {
+  const sites = restsOnSites(source, words);
+  return sites.length === 1 ? sites[0] : undefined;
 }
 
 /**
@@ -88,7 +132,10 @@ export function restsOnSite(source: { quote: string; listItems?: readonly string
  * lead-in alone, "... shall be:", says nothing about the case). Every line is
  * a stored verbatim line of the rule (quote or `listItems`), joined by a line
  * break, the same way `quoteWithItems` joins the whole list. Nothing is
- * reworded. When the words are in the quote, the quote alone.
+ * reworded. When the words are in the quote, the quote alone. A step whose
+ * words name no single line never reaches an applicant (`competenceProblems`
+ * refuses it and the block is not served); for such a step this returns the
+ * quote alone, never a guessed line.
  */
 export function stepQuoteShown(source: { quote: string; listItems?: readonly string[] }, words: string): string {
   const site = restsOnSite(source, words);
@@ -158,9 +205,17 @@ export function competenceProblems(
     if (s.source.quote !== rule.source?.quote || s.source.url !== rule.source?.url || !sameListItems(s.source.listItems, rule.source?.listItems)) {
       return add("competence_source_mismatch", "a step's quote, list lines and URL must be exactly those of the rule it rests on", i);
     }
-    // (#335) The words are in the quote, or in one of its list lines, verbatim.
-    if (typeof s.restsOn !== "string" || restsOnSite(s.source, s.restsOn) === undefined) {
-      return add("competence_rests_on_not_in_quote", "the words a step applies must be in its quote or one of its list lines, verbatim", i);
+    // (#335) The words are in the quote, or in one of its list lines, verbatim
+    // and on token boundaries, and at least MIN_RESTS_ON_CHARS long.
+    const sites = typeof s.restsOn === "string" ? restsOnSites(s.source, s.restsOn) : [];
+    if (sites.length === 0) {
+      return add("competence_rests_on_not_in_quote", `the words a step applies must be in its quote or one of its list lines, verbatim, as whole words, and at least ${MIN_RESTS_ON_CHARS} characters long`, i);
+    }
+    // (#335, fix round 1) ... and in exactly ONE of them. Words found in two
+    // or more lines do not say which case the step applies; the applicant
+    // would be shown a line picked by position. Refused, never resolved.
+    if (sites.length > 1) {
+      return add("competence_rests_on_ambiguous", `the words a step applies are in ${sites.length} lines of its rule (its quote and list lines); they must be in exactly one, so the step names one case`, i);
     }
     // ---- where the result comes from: the answer, never anything else ----
     if (s.resultFrom !== "answer") return add("competence_result_from_invalid", "a step's result comes from the applicant's answer", i);

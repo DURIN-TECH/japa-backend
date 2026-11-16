@@ -531,7 +531,9 @@ export interface CompetenceStep {
   resultFrom: "answer";
   // The words of the quote this step applies, copied from it (for example the
   // phrase that names the case it covers). Code checks they are in `source.quote`
-  // or (#335) in one of `source.listItems` (the cases of a lead-in quote).
+  // or (#335) in one of `source.listItems` (the cases of a lead-in quote): as
+  // whole words, at least 8 characters, and in EXACTLY ONE of those lines
+  // (words two cases share name neither; `competence_rests_on_ambiguous`).
   // A step's SHOWN quote is the quote plus that list line (`stepQuoteShown`).
   restsOn: string;
   // The quote and URL, exactly like any rule's (copied from the rule `criterionId`).
