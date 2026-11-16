@@ -1434,6 +1434,15 @@ export interface SupersededCheckout extends ChargeSnapshot, Partial<QuoteLock> {
   reference: string;
   /** When it was replaced. */
   supersededAt: Timestamp;
+  /**
+   * Issue #354: set when the checkout was RETIRED because its booking was
+   * rescheduled (`PUT /consultations/:id` moved a `pending_payment` booking
+   * after its quote lock). Such a checkout was issued for the OLD slot, so a
+   * payment that lands on it later never confirms the booking: `settlePayment`
+   * records it as `paid_for_rescheduled_slot` and refunds it in full.
+   * Absent on a checkout replaced by an ordinary re-price.
+   */
+  retiredBy?: "reschedule";
 }
 
 /**
@@ -1457,10 +1466,33 @@ export interface ConsultationPaymentException {
   currency: string;
   /** Paystack's own payment time (`paid_at`), when it reported one. */
   paystackPaidAt: Timestamp | null;
-  reason: "paid_on_superseded_reference_after_booking_paid" | "booking_not_payable";
-  /** Open until a human refunds it (no automated refund yet). */
-  status: "open";
+  /**
+   * Why the payment cannot be applied:
+   *  - "paid_on_superseded_reference_after_booking_paid": a second charge on
+   *    a booking another reference had already paid;
+   *  - "booking_not_payable": paid after the booking stopped awaiting
+   *    payment (cancelled while the payer was paying);
+   *  - "paid_for_rescheduled_slot" (issue #354): paid on a checkout that was
+   *    retired when the booking was rescheduled after its quote lock.
+   */
+  reason: "paid_on_superseded_reference_after_booking_paid" | "booking_not_payable" | "paid_for_rescheduled_slot";
+  /**
+   * Issue #354: every exception is refunded in full, automatically, through
+   * the #317 refund engine. `open` while that refund is on its way (or for an
+   * exception recorded before #354 that has no refund yet); `refunded` once
+   * Paystack reports it processed; `refund_failed` once the engine gave up
+   * (the refund row is `failed` and listed for an admin retry, which moves
+   * this back to `open`).
+   */
+  status: "open" | "refunded" | "refund_failed";
+  /**
+   * Issue #354: the refund Transaction's doc id (`refundDocId(reference)`),
+   * written in the SAME Firestore transaction as this record.
+   */
+  refundId?: string;
   createdAt: Timestamp;
+  /** Last change of `status` / `refundId` (absent until the first change). */
+  updatedAt?: Timestamp;
 }
 
 /**
@@ -1525,7 +1557,10 @@ export type RefundReason =
   | "client_cancelled"
   | "admin_agent_no_show"
   | "admin_goodwill"
-  | "admin_other";
+  | "admin_other"
+  // Issue #354: an automatic refund of a payment that could not be applied
+  // to its booking (a `consultationPaymentExceptions` record).
+  | "payment_not_applied";
 
 /**
  * Where a refund row stands (issue #317). It only ever moves forward:
@@ -1545,9 +1580,15 @@ export type RefundStatus = Extract<TransactionStatus, "pending" | "processing" |
  *  - "available": the fee had already been RELEASED to the agent (admin
  *    override only), so the refund comes off the agent's available balance,
  *    which may go below zero (withdrawals are then blocked until it is back
- *    above zero). Seli never absorbs the shortfall.
+ *    above zero). Seli never absorbs the shortfall;
+ *  - "unapplied_payment" (issue #354): the refund of a payment that never
+ *    confirmed the booking (a `consultationPaymentExceptions` record). No
+ *    fee Transaction was written for it, so nothing was ever credited to the
+ *    agent: the refund touches neither the agent's balances nor revenue, and
+ *    the row carries no `agentId` at all. The money given back is exactly
+ *    the money that came in on that reference.
  */
-export type RefundFundedFrom = "hold" | "available";
+export type RefundFundedFrom = "hold" | "available" | "unapplied_payment";
 
 /**
  * The hold on a consultation fee (issue #317, "hold consultation fees").
@@ -1642,6 +1683,14 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   // client). `amount` + `currency` equal the refunded fee's, in minor units.
   /** Doc id of the consultation_fee Transaction this refund gives back. */
   refundOf?: string;
+  /**
+   * Issue #354: on the refund of a payment that could not be applied, the
+   * `consultationPaymentExceptions` doc id it refunds (= the Paystack
+   * reference). The refund engine mirrors the row's status onto THAT record,
+   * never onto the booking (whose `refundId` / `refundStatus` belong to the
+   * booking's own fee).
+   */
+  paymentExceptionId?: string;
   /** Why it was refunded. */
   reason?: RefundReason;
   /** Uid of who started it (the cancelling user, or the admin). */

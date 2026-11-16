@@ -658,7 +658,8 @@ describe("verify: Paystack's amount and currency must match the stored charge", 
     paystackPaid(reference, id, { amountMinor: AGENCY_FEE_KOBO, currency: "NGN" });
     const out = await verify(reference);
     assert.equal(out.status, 409);
-    assert.equal(docsIn("transactions").length, 0);
+    // Issue #354: not confirmed (no fee Transaction); the payment is refunded instead.
+    assert.equal(docsIn("transactions").filter(([, t]) => t.type !== "refund").length, 0);
   });
 });
 

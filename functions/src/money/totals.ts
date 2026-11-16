@@ -140,9 +140,27 @@ export function isSettled(txn: Pick<Transaction, "status">): boolean {
  * transaction's own currency: +amount for a settled incoming payment,
  * -amount for a settled refund, 0 otherwise (unsettled rows, withdrawals).
  */
-export function revenueEffect(txn: Pick<Transaction, "type" | "status" | "amount">): number {
+export function revenueEffect(
+  txn: Pick<Transaction, "type" | "status" | "amount"> & Partial<Pick<Transaction, "refundFundedFrom">>
+): number {
   if (txn.type === "withdrawal" || !isSettled(txn)) return 0;
+  // Issue #354: the refund of a payment that never confirmed its booking
+  // gives back money that was never counted as revenue (no fee Transaction
+  // was written for it), so it subtracts nothing either.
+  if (isUnappliedPaymentRefund(txn)) return 0;
   return txn.type === "refund" ? -txn.amount : txn.amount;
+}
+
+/**
+ * Issue #354: true for the refund of a payment that could not be applied to
+ * its booking (`refundFundedFrom: "unapplied_payment"`). Such a refund is
+ * neutral for every balance and revenue figure: the payment it gives back
+ * was never credited to anyone. Pure.
+ */
+export function isUnappliedPaymentRefund(
+  txn: Pick<Transaction, "type"> & Partial<Pick<Transaction, "refundFundedFrom">>
+): boolean {
+  return txn.type === "refund" && txn.refundFundedFrom === "unapplied_payment";
 }
 
 /**

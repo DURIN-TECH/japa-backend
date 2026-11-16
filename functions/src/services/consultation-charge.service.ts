@@ -31,6 +31,9 @@ import { initialFeeHold } from "../money/fee-hold";
 import type { FeeHold } from "../types";
 // Issue #332: the charge fields a payer may see (no raw rate, no margin).
 import { clientChargeFields } from "../money/client-charge";
+// Issue #354: the refund row id of a Paystack reference (pure, no cycle:
+// refund-id.ts imports nothing from the charge path).
+import { refundDocId } from "../money/refund-id";
 
 export {
   CHECKOUT_WAIT_ATTEMPTS,
@@ -374,11 +377,19 @@ export type SettleOutcome =
   | { kind: "already_paid"; consultation: Consultation }
   /**
    * A SECOND payment: the booking was already paid by another reference.
-   * Recorded in consultationPaymentExceptions for a refund; no Transaction.
+   * Recorded in consultationPaymentExceptions and refunded (issue #354); no
+   * fee Transaction.
    */
-  | { kind: "refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException }
-  /** The booking is no longer awaiting payment (cancelled...): recorded for a refund; no Transaction. */
-  | { kind: "not_payable_recorded"; consultation: Consultation; exception: ConsultationPaymentException }
+  | { kind: "refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null }
+  /** The booking is no longer awaiting payment (cancelled...): recorded and refunded (#354); no fee Transaction. */
+  | { kind: "not_payable_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null }
+  /**
+   * Issue #354: paid on a checkout RETIRED when the booking was rescheduled
+   * after its quote lock (`retiredBy: "reschedule"`). The booking is NOT
+   * confirmed and stays `pending_payment`; the payment is recorded and
+   * refunded in full. The client pays again for the new time.
+   */
+  | { kind: "rescheduled_refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null }
   /** Paystack's amount or currency differs from what that checkout asked: nothing written. */
   | { kind: "mismatch" }
   /** Nothing chargeable stored for that checkout: nothing written. */
@@ -404,12 +415,27 @@ export type SettleOutcome =
  *     error-level log, and NEVER a second Transaction.
  *  4. Booking no longer awaiting payment (cancelled while paying): an
  *     exception record (reason `booking_not_payable`), no Transaction.
+ *  4b. (issue #354) Paid on a checkout RETIRED by a reschedule
+ *     (`retiredBy: "reschedule"`): the booking is NOT confirmed (it moved
+ *     since that checkout was issued); an exception record (reason
+ *     `paid_for_rescheduled_slot`), no Transaction, booking unchanged.
  *  5. Otherwise confirm: paid/scheduled plus the fee Transaction in the same
  *     commit. Settled on a superseded reference, the booking takes THAT
  *     checkout's snapshot and lock (so booking and Transaction agree), its
  *     then-current checkout moves to the superseded list (a later payment on
  *     it is a second charge, step 3), and both records carry
  *     `paidOnSupersededReference: true`.
+ *
+ * REFUNDS (issue #354). Every exception (3, 4, 4b) gets its refund row in
+ * the SAME transaction, through the #317 engine's row shape
+ * (`buildUnappliedPaymentRefund`): doc id `refundDocId(reference)` (one
+ * refund ever per Paystack reference), amount and currency exactly the
+ * exception's `amountMinor` / `currency` (what Paystack charged, never
+ * re-converted), no agentId (the agent was never credited). A second verify,
+ * a webhook retry, or two calls at once find the exception (and the row)
+ * already there and create nothing. After the commit, the row that THIS call
+ * created is sent to Paystack (`processRefund`; on failure the 15-minute
+ * retry job picks it up) and the client is told.
  *
  * A late exact payment is honoured and flagged `paidAfterQuoteExpiry`
  * against the lock of the checkout that was paid; Paystack's `paid_at` is
@@ -424,12 +450,19 @@ export async function settlePayment(
 ): Promise<SettleOutcome | null> {
   const ref = collections.consultations.doc(consultationId);
   const exceptionRef = collections.consultationPaymentExceptions.doc(reference);
+  // Issue #354: the ONE refund row this reference can ever have.
+  const refundRef = collections.transactions.doc(refundDocId(reference));
   const txRef = collections.transactions.doc();
-  return consultationCharging.runTransaction(async (tx) => {
+  /** Set inside the transaction when THIS call wrote a new refund row (sent to Paystack after the commit). */
+  let created: { refund: Transaction; exception: ConsultationPaymentException } | null = null;
+  const outcome = await consultationCharging.runTransaction<SettleOutcome | null>(async (tx) => {
+    // A retried transaction starts again from fresh reads.
+    created = null;
     // All reads first (Firestore transactions require reads before writes).
     const snap = await tx.get(ref);
     if (!snap.exists) return null;
     const exceptionSnap = await tx.get(exceptionRef);
+    const refundSnap = await tx.get(refundRef);
     const current = snap.data() as Consultation;
     const at = consultationCharging.now();
 
@@ -447,26 +480,68 @@ export async function settlePayment(
     const { isCurrent, entry, check } = match;
     if (!check.ok) return { kind: check.reason };
 
-    /** Record money we hold but cannot apply (idempotent: doc id = reference). */
-    const recordException = (reason: ConsultationPaymentException["reason"]): ConsultationPaymentException => {
-      if (exceptionSnap.exists) return exceptionSnap.data() as ConsultationPaymentException;
-      const exception: ConsultationPaymentException = {
-        id: reference,
-        consultationId,
-        reference,
-        amountMinor: check.charged.amountMinor,
-        currency: check.charged.currency,
-        paystackPaidAt: check.providerPaidAt ? Timestamp.fromDate(check.providerPaidAt) : null,
-        reason,
-        status: "open",
-        createdAt: Timestamp.fromDate(at),
-      };
+    /**
+     * Record money we hold but cannot apply, and its refund (issue #354).
+     * Idempotent: the exception's doc id is the reference and the refund
+     * row's is `refundDocId(reference)`, both read above in THIS transaction.
+     *
+     *  - neither exists: both are written now (the usual case);
+     *  - the exception exists WITH its refund row: nothing is written (a
+     *    second verify, a webhook retry, the loser of a concurrent call);
+     *  - the exception exists WITHOUT a refund row (recorded before #354):
+     *    the refund row is written now and linked, from the STORED
+     *    exception's amount and currency.
+     * A refund row that exists is never written again, whatever its status.
+     */
+    const recordException = (
+      reason: ConsultationPaymentException["reason"]
+    ): { exception: ConsultationPaymentException; refund: Transaction | null } => {
+      const now = Timestamp.fromDate(at);
+      const existingRefund = refundSnap.exists ? (refundSnap.data() as Transaction) : null;
+      let exception: ConsultationPaymentException;
+      if (exceptionSnap.exists) {
+        exception = exceptionSnap.data() as ConsultationPaymentException;
+        if (existingRefund) return { exception, refund: existingRefund };
+      } else {
+        exception = {
+          id: reference,
+          consultationId,
+          reference,
+          // What Paystack charged on THIS reference (the exact-match check
+          // above guarantees it equals what that checkout asked).
+          amountMinor: check.charged.amountMinor,
+          currency: check.charged.currency,
+          paystackPaidAt: check.providerPaidAt ? Timestamp.fromDate(check.providerPaidAt) : null,
+          reason,
+          status: "open",
+          createdAt: now,
+        };
+      }
+      if (existingRefund) {
+        // A refund row but no exception (cannot happen through this code):
+        // link it, never write a second one.
+        exception = { ...exception, refundId: refundRef.id };
+        tx.set(exceptionRef, exception);
+        return { exception, refund: existingRefund };
+      }
+      const refund = transactionService.buildUnappliedPaymentRefund(refundRef.id, now, {
+        exception,
+        clientUserId: current.userId,
+        clientName: current.clientName,
+        clientEmail: current.clientEmail,
+      });
+      exception = { ...exception, refundId: refund.id, ...(exceptionSnap.exists ? { updatedAt: now } : {}) };
       tx.set(exceptionRef, exception);
+      // create(), not set(): should a concurrent writer ever get past the
+      // read above, this commit fails instead of overwriting its row.
+      tx.create(refundRef, refund);
+      created = { refund, exception };
       console.error(
         `[consultation] Paystack charge ${reference} on ${consultationId} cannot be applied (${reason}): ` +
-          `${check.charged.amountMinor} ${check.charged.currency} recorded in consultationPaymentExceptions for refund`
+          `${exception.amountMinor} ${exception.currency} recorded in consultationPaymentExceptions; ` +
+          `full refund ${refund.id} started`
       );
-      return exception;
+      return { exception, refund };
     };
 
     // (3) Already paid.
@@ -475,12 +550,22 @@ export async function settlePayment(
       return {
         kind: "refund_recorded",
         consultation: current,
-        exception: recordException("paid_on_superseded_reference_after_booking_paid"),
+        ...recordException("paid_on_superseded_reference_after_booking_paid"),
       };
     }
     // (4) No longer awaiting payment.
     if (current.status !== "pending_payment") {
-      return { kind: "not_payable_recorded", consultation: current, exception: recordException("booking_not_payable") };
+      return { kind: "not_payable_recorded", consultation: current, ...recordException("booking_not_payable") };
+    }
+    // (4b) Issue #354: a checkout retired by a reschedule was for the OLD
+    // slot. Never confirm the booking with it: give the money back, and the
+    // booking stays pending_payment for a fresh checkout priced now.
+    if (entry?.retiredBy === "reschedule") {
+      return {
+        kind: "rescheduled_refund_recorded",
+        consultation: current,
+        ...recordException("paid_for_rescheduled_slot"),
+      };
     }
 
     // (5) Confirm + record, in this same commit.
@@ -535,6 +620,40 @@ export async function settlePayment(
     tx.set(txRef, recorded);
     return { kind: "confirmed", consultation: settled, transaction: recorded, viaSuperseded: !!entry };
   });
+
+  // ---- After the commit (issue #354): send the refund THIS call created ----
+  // Only the call whose transaction wrote the row does this; every other
+  // caller found it existing and created nothing. `created` is reassigned
+  // inside the callback, so TypeScript's narrowing is widened back here.
+  const fresh = created as { refund: Transaction; exception: ConsultationPaymentException } | null;
+  if (fresh && outcome && "refund" in outcome) {
+    const sent = await startUnappliedRefund(fresh.refund, fresh.exception);
+    return { ...outcome, refund: sent };
+  }
+  return outcome;
+}
+
+/**
+ * Send a just-written refund of an unapplied payment to Paystack and tell
+ * the client (issue #354). Never throws: a Paystack failure leaves the row
+ * `pending` for the 15-minute retry job (`retryConsultationRefunds`), which
+ * looks the charge's refunds up before any repeat call.
+ *
+ * The refund service is loaded lazily: it imports this module
+ * (`expectedCharge`), so a top-level import would be circular.
+ *
+ * @returns the row as it stands after the first Paystack try
+ */
+async function startUnappliedRefund(refund: Transaction, exception: ConsultationPaymentException): Promise<Transaction> {
+  const { consultationRefundService } = await import("./consultation-refund.service");
+  let row = refund;
+  try {
+    row = (await consultationRefundService.processRefund(refund.id)) ?? refund;
+  } catch (error) {
+    console.error(`[consultation] refund ${refund.id} could not be sent yet; the retry job will:`, error);
+  }
+  await consultationRefundService.notifyUnappliedRefund(row, exception);
+  return row;
 }
 
 // ============================================

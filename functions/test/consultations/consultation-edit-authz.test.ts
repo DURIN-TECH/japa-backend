@@ -597,7 +597,7 @@ describe("PUT /consultations/:id — input", () => {
     assert.equal(after.summary, "kept");
   });
 
-  test("a save sets updatedAt to now and leaves id, createdAt and the money fields alone", async () => {
+  test("a save sets updatedAt to now and leaves id, createdAt and the money fields alone (the open checkout is retired, #354)", async () => {
     await seedInFlight(-1_000); // unpaid, lock already passed: every field is editable
     const before = stored();
     harness.clock.advanceHours(2);
@@ -605,12 +605,21 @@ describe("PUT /consultations/:id — input", () => {
     const after = stored();
     assert.equal(after.updatedAt.toMillis(), harness.clock.now().getTime());
     for (const untouched of [
-      "id", "createdAt", "status", "userId", "agentId", "agencyId", "paymentStatus", "transactionId", "checkoutUrl",
+      "id", "createdAt", "status", "userId", "agentId", "agencyId", "paymentStatus",
       "priceUsdCents", "chargedCurrency", "chargedAmountMinor", "quoteLockedAt", "quoteExpiresAt",
     ]) {
       assert.deepEqual(after[untouched], before[untouched], untouched);
     }
-    assert.deepEqual(Object.keys(writes[0].data).sort(), [...ALL_FIELDS, "updatedAt"].sort());
+    // Issue #354: this is a reschedule of an unpaid booking after its lock,
+    // so its checkout is retired in the same write (no checkout for the old slot stays open).
+    assert.equal(after.transactionId, undefined);
+    assert.equal(after.checkoutUrl, undefined);
+    assert.equal(after.supersededCheckouts.at(-1).reference, before.transactionId);
+    assert.equal(after.supersededCheckouts.at(-1).retiredBy, "reschedule");
+    assert.deepEqual(
+      Object.keys(writes[0].data).sort(),
+      [...ALL_FIELDS, "updatedAt", "supersededCheckouts", "transactionId", "checkoutUrl"].sort()
+    );
   });
 });
 

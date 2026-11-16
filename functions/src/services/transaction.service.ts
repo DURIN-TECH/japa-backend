@@ -384,7 +384,12 @@ class TransactionService {
 
       // ---- Issue #317: available vs held ----
       if (txn.type === "refund") {
-        if (txn.refundFundedFrom === "hold") {
+        if (txn.refundFundedFrom === "unapplied_payment") {
+          // Issue #354: a payment that never confirmed its booking, given
+          // back. It was never credited, so it is debited from nothing.
+          // (Such a row has no agentId, so it is not even in an agent's
+          // query; this keeps an all-rows admin total right too.)
+        } else if (txn.refundFundedFrom === "hold") {
           // Paid out of a held fee: that fee is already out of both balances.
         } else if (txn.refundFundedFrom === "available") {
           // A released fee given back: owed from the moment it is written.
@@ -775,6 +780,82 @@ class TransactionService {
       },
       ...(fee.clientName !== undefined ? { clientName: fee.clientName } : {}),
       ...(fee.clientEmail !== undefined ? { clientEmail: fee.clientEmail } : {}),
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  /**
+   * Build (but do not write) the REFUND Transaction of a payment that could
+   * not be applied to its booking (issue #354): a `consultationPaymentExceptions`
+   * record. Written by `settlePayment` in the SAME Firestore transaction that
+   * records the exception, under the deterministic id `refundDocId(reference)`.
+   *
+   * MONEY: `amount` and `currency` are the exception's `amountMinor` /
+   * `currency`, i.e. exactly what Paystack charged on that reference, copied
+   * and never re-converted. The refund engine (`processRefund`) sends that to
+   * Paystack against the same reference.
+   *
+   * NOT THE AGENT'S MONEY: no fee Transaction was ever written for such a
+   * payment, so nothing was credited to the agent. The row therefore has NO
+   * `agentId` (it is in no agent's balance query and takes no withdrawal
+   * lock), `refundFundedFrom: "unapplied_payment"` (neutral in computeStats
+   * and `revenueEffect`), and no `refundOf`. It links back to the exception
+   * by `paymentExceptionId`, so the engine mirrors its status onto the
+   * exception, never onto the booking.
+   *
+   * `userId` is the client (it shows in their payment history as a refund).
+   * The row starts `pending`, due for its first Paystack call now.
+   */
+  buildUnappliedPaymentRefund(
+    id: string,
+    now: Timestamp,
+    input: {
+      /** The exception being refunded (its money is what Paystack charged). */
+      exception: {
+        id: string;
+        consultationId: string;
+        reference: string;
+        amountMinor: number;
+        currency: string;
+      };
+      /** The client's user uid (who paid, and who gets the money back). */
+      clientUserId: string;
+      /** Denormalised for the client's history and admin lists, when known. */
+      clientName?: string;
+      clientEmail?: string;
+    }
+  ): Transaction {
+    const ex = input.exception;
+    return {
+      id,
+      userId: input.clientUserId,
+      consultationId: ex.consultationId,
+      type: "refund",
+      // Exactly what Paystack charged on this reference (minor units).
+      amount: ex.amountMinor,
+      currency: ex.currency,
+      status: "pending",
+      isEscrow: false,
+      paymentProvider: "paystack",
+      // The CHARGE's Paystack reference: what POST /refund is called with.
+      providerTransactionId: ex.reference,
+      description: "Refund: consultation payment that could not be applied",
+      paymentExceptionId: ex.id,
+      reason: "payment_not_applied",
+      // Started by the system, not by a person.
+      initiatedBy: "system",
+      refundFundedFrom: "unapplied_payment",
+      balanceShortfallMinor: 0,
+      refundAttempts: 0,
+      refundProviderCalls: 0,
+      refundNextAttemptAt: now,
+      metadata: {
+        consultationId: ex.consultationId,
+        reference: ex.reference,
+      },
+      ...(input.clientName !== undefined ? { clientName: input.clientName } : {}),
+      ...(input.clientEmail !== undefined ? { clientEmail: input.clientEmail } : {}),
       createdAt: now,
       updatedAt: now,
     };

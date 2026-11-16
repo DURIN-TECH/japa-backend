@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import { collections } from "../utils/firebase";
 import { Consultation, ConsultationStatus, ConsultationType } from "../types";
-import { Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { ROLES } from "@durin-tech/authz";
 // Issue #151: the shared clock and Firestore transaction runner of the charge
 // path (tests swap both through the consultations harness). The status change
@@ -16,6 +16,8 @@ import {
   hasChargeSnapshot,
   lookupCheckoutState,
   PaystackState,
+  // Issue #354: a reschedule retires the open checkout into the superseded list.
+  supersededEntryOf,
 } from "./charge-checkout.service";
 // Issue #288: a booking the sweep finds PAID at Paystack is settled, not cancelled.
 import { settlePayment } from "./consultation-charge.service";
@@ -30,7 +32,7 @@ import {
   writeRefund,
 } from "./consultation-refund.service";
 import { feeHoldStatusAt, rescheduledFeeHold } from "../money/fee-hold";
-import type { Transaction } from "../types";
+import type { SupersededCheckout, Transaction } from "../types";
 // Issue #317: when a slot starts, in ONE helper (re-exported below).
 export { slotStartsAt, slotEndsAt } from "../consultations/slot-time";
 import { slotStartsAt } from "../consultations/slot-time";
@@ -541,6 +543,61 @@ export function parseEditBody(body: unknown): ParsedEdit {
   return { ok: true, updates, fieldNames };
 }
 
+// ============================================
+// RETIRING THE CHECKOUT ON A RESCHEDULE (issue #354)
+// ============================================
+
+/**
+ * The fields that retire an unpaid booking's checkouts when it is
+ * rescheduled (issue #354), or null when there is nothing to retire. Pure.
+ *
+ * A `pending_payment` booking can only be rescheduled when no payment is in
+ * flight (`decideEdit`: its quote lock has passed, or its checkout never
+ * opened). Every checkout it still carries was issued for the OLD slot, so
+ * none may stay open:
+ *  - the CURRENT one (`transactionId`) moves to `supersededCheckouts` with
+ *    its own snapshot and `retiredBy: "reschedule"`, and `transactionId` /
+ *    `checkoutUrl` are cleared, so `POST /consultations/:id/checkout` opens a
+ *    fresh checkout priced NOW;
+ *  - every checkout ALREADY in `supersededCheckouts` (older re-prices, also
+ *    for the old slot) is marked `retiredBy: "reschedule"` too. Without this
+ *    a late payment on one of them would still confirm the booking for the
+ *    new slot at an old price.
+ * A payment that lands on any of them later is refunded by `settlePayment`
+ * (reason `paid_for_rescheduled_slot`) and never confirms the booking.
+ *
+ * Not retired: a paid or non-pending booking (nothing open), and a LEGACY
+ * row with no charge snapshot (it can never be re-priced, so retiring its
+ * only checkout would leave it unpayable; such rows are swept instead).
+ *
+ * @param booking the booking as read in the edit's transaction
+ * @param at the server clock
+ * @returns the update to merge into the edit, plus the stored list for the
+ *   returned copy of the booking
+ */
+export function retireCheckoutsForReschedule(
+  booking: Consultation,
+  at: Date
+): { update: Record<string, unknown>; supersededCheckouts: SupersededCheckout[] } | null {
+  if (booking.status !== "pending_payment" || booking.paymentStatus === "paid") return null;
+  if (!hasChargeSnapshot(booking)) return null;
+  const older = booking.supersededCheckouts ?? [];
+  const current = booking.transactionId ?? null;
+  if (!current && older.length === 0) return null;
+  const retired: SupersededCheckout[] = [
+    ...older.map((s) => ({ ...s, retiredBy: "reschedule" as const })),
+    ...(current ? [{ ...supersededEntryOf(booking, current, at), retiredBy: "reschedule" as const }] : []),
+  ];
+  return {
+    update: {
+      supersededCheckouts: retired,
+      transactionId: FieldValue.delete(),
+      checkoutUrl: FieldValue.delete(),
+    },
+    supersededCheckouts: retired,
+  };
+}
+
 /** What `editConsultation` did. `refused` and `not_found` wrote nothing. */
 export type EditConsultationOutcome =
   | { kind: "not_found" }
@@ -1037,7 +1094,9 @@ class ConsultationService {
           if (outcome?.kind === "confirmed" || outcome?.kind === "already_paid") {
             result.settled++;
           } else {
-            // Paid, but not applicable (wrong amount, ...): a human looks at it.
+            // Paid, but not applicable. A recorded exception is already being
+            // refunded (issue #354); anything else (wrong amount, ...) is
+            // left for a human.
             console.error(
               `[consultation sweep] ${doc.id} is paid at Paystack (${reference}) but could not be settled ` +
                 `(${outcome?.kind ?? "booking gone"}); left as it is for review`
@@ -1175,9 +1234,29 @@ class ConsultationService {
         }
       }
 
+      // Issue #354: a reschedule of an unpaid booking retires its open
+      // checkout(s) in THIS transaction, so no checkout for the old slot
+      // stays open. (decideEdit already refused it while a payment may be in
+      // flight: 409 PAYMENT_IN_PROGRESS.)
+      const retire = isScheduleEdit(fieldNames) ? retireCheckoutsForReschedule(current, at) : null;
+      if (retire) {
+        Object.assign(write, retire.update);
+        console.warn(
+          `[consultation] ${id} rescheduled while unpaid: checkout ${current.transactionId ?? "(none)"} ` +
+            `and ${(current.supersededCheckouts ?? []).length} older one(s) retired; a payment on them is refunded`
+        );
+      }
+
       tx.update(ref, write);
-      // The stored doc after the commit: the fresh copy plus what was written.
-      return { kind: "edited", before: current, consultation: { ...current, ...write } as Consultation };
+      // The stored doc after the commit: the fresh copy plus what was written
+      // (the cleared checkout fields left out, as Firestore stores them).
+      const stored = { ...current, ...write } as Record<string, unknown>;
+      if (retire) {
+        delete stored.transactionId;
+        delete stored.checkoutUrl;
+        stored.supersededCheckouts = retire.supersededCheckouts;
+      }
+      return { kind: "edited", before: current, consultation: stored as unknown as Consultation };
     });
   }
 

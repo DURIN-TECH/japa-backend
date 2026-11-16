@@ -1130,6 +1130,14 @@ export class ConsultationController {
    *    `refund` and the booking. The booking's status is not changed.
    * The refund of a fee still held comes out of the hold; of a released fee,
    * off the agent's available balance (may go negative, #351).
+   *
+   * Issue #354: body `{ refundId }` instead retries a FAILED refund of a
+   * payment that could not be applied to this booking (a
+   * `consultationPaymentExceptions` record): that same row goes back to
+   * pending and is sent to Paystack (200, `retried: true`). Not failed: 409
+   * ALREADY_REFUNDED; not such a refund of THIS booking: 404. Such refunds
+   * are never created here (settlePayment creates them) and never touch the
+   * agent's balance.
    */
   async refundConsultation(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
@@ -1138,7 +1146,40 @@ export class ConsultationController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
-      const body = (req.body ?? {}) as { reason?: unknown; note?: unknown };
+      const body = (req.body ?? {}) as { reason?: unknown; note?: unknown; refundId?: unknown };
+
+      // ---- Issue #354: retry a FAILED refund of an unapplied payment ----
+      // Those refunds are created automatically (settlePayment); an admin
+      // only retries one, by its row id (from the admin refund list). No
+      // reason is asked for: the reason is fixed (`payment_not_applied`).
+      if (body.refundId !== undefined) {
+        if (typeof body.refundId !== "string" || !/^refund_[0-9a-f]{64}$/.test(body.refundId)) {
+          sendError(res, "VALIDATION_ERROR", "refundId must be a refund id");
+          return;
+        }
+        const retry = await consultationRefundService.adminRetryExceptionRefund({
+          consultationId: req.params.id,
+          refundId: body.refundId,
+        });
+        if (retry.kind === "not_found") {
+          sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+          return;
+        }
+        if (retry.kind === "already_refunded") {
+          sendError(res, "ALREADY_REFUNDED", "This refund is not failed, so there is nothing to retry.", 409);
+          return;
+        }
+        // Send it to Paystack now (a lookup comes first); a failure leaves it for the retry job.
+        let refund = retry.refund;
+        try {
+          refund = (await consultationRefundService.processRefund(refund.id)) ?? refund;
+        } catch (e) {
+          console.error(`[consultation] admin retry of ${refund.id} could not be sent yet; the retry job will:`, e);
+        }
+        sendSuccess(res, { refund: refundSummary(refund), refundId: refund.id, retried: true });
+        return;
+      }
+
       const reason = typeof body.reason === "string" ? ADMIN_REFUND_REASONS[body.reason] : undefined;
       if (!reason || !Object.prototype.hasOwnProperty.call(ADMIN_REFUND_REASONS, body.reason as string)) {
         sendError(res, "VALIDATION_ERROR", `reason must be one of: ${Object.keys(ADMIN_REFUND_REASONS).join(", ")}`);
@@ -1918,7 +1959,20 @@ export class ConsultationController {
       ok(outcome.consultation, { refundPending: true });
       return;
     case "not_payable_recorded":
+      // Issue #354: that payment is being refunded in full, automatically.
       sendError(res, "BOOKING_NOT_PAYABLE", "This booking is no longer awaiting payment", 409);
+      return;
+    case "rescheduled_refund_recorded":
+      // Issue #354: paid on a checkout retired by a reschedule. The booking
+      // is NOT confirmed (still pending_payment); the payment is refunded in
+      // full and the client pays again for the new time
+      // (POST /consultations/:id/checkout opens a checkout priced now).
+      res.status(409).json({
+        success: false,
+        error: "CONSULTATION_RESCHEDULED",
+        message: "Your consultation moved, so we've refunded your payment. Please pay again for the new time.",
+        data: { refundPending: true, consultation: bookingSummary(outcome.consultation) },
+      });
       return;
     case "mismatch":
       this.sendChargeRefused(res, "mismatch", reference);

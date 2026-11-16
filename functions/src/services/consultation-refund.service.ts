@@ -55,15 +55,29 @@
 //    webhooks write nothing. Only an admin retry moves failed -> pending,
 //    on the SAME row.
 //
-// Out of scope here: payments that cannot be applied to a booking
-// (`consultationPaymentExceptions`, #354), the mobile and portal screens
-// (#356, #357).
+// PAYMENTS THAT CANNOT BE APPLIED (issue #354)
+//
+// A payment `settlePayment` cannot apply to its booking (a second charge, a
+// payment after a cancel, a payment on a checkout retired by a reschedule)
+// is recorded in `consultationPaymentExceptions` AND gets a refund row in the
+// same Firestore transaction (`buildUnappliedPaymentRefund`, same
+// deterministic id `refundDocId(reference)`). That row goes through THIS
+// engine unchanged (processRefund, the retry job, the webhook), with three
+// differences, all keyed on `paymentExceptionId`:
+//  - its status is mirrored onto the EXCEPTION (`refunded` /
+//    `refund_failed`), never onto the booking, whose `refundId` /
+//    `refundStatus` belong to the booking's own fee;
+//  - it has no agentId and `refundFundedFrom: "unapplied_payment"`: no
+//    agent balance, no withdrawal lock, no revenue effect;
+//  - an admin retries a failed one by naming it (`adminRetryExceptionRefund`).
+//
+// Out of scope here: the mobile and portal screens (#356, #357).
 
-import { createHash } from "crypto";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import type { Transaction as FirestoreTransaction } from "firebase-admin/firestore";
 import type {
   Consultation,
+  ConsultationPaymentException,
   RefundFundedFrom,
   RefundReason,
   RefundStatus,
@@ -79,6 +93,7 @@ import { PaystackApiError, PaystackRefund, paystackProvider } from "./billing/pa
 import { feeHoldStatusAt, FeeHoldStatus } from "../money/fee-hold";
 import { formatWithCode } from "../money/money";
 import { slotStartsAt } from "../consultations/slot-time";
+import { refundDocId } from "../money/refund-id";
 
 // ============================================
 // Constants
@@ -112,16 +127,11 @@ const CLIENT_CANCELLABLE = ["pending_payment", "scheduled", "confirmed"];
 // ============================================
 
 /**
- * The refund row's doc id for one charge (issue #317): `refund_` + the
- * SHA-256 of the charge's Paystack reference. Deterministic, so one Paystack
- * charge can only ever have one refund row. Hashed rather than the raw
- * reference so that (a) it is always a valid single document id whatever
- * the reference holds, and (b) the client's payment history, which shows
- * each row's `id`, never carries a Paystack reference (#329 allow-list).
+ * The refund row's doc id for one charge (`refund_<sha256 of the reference>`).
+ * Defined in money/refund-id.ts since issue #354 (so the charge path can use
+ * it without a circular import) and re-exported here, where #317 put it.
  */
-export function refundDocId(reference: string): string {
-  return `refund_${createHash("sha256").update(reference).digest("hex")}`;
-}
+export { refundDocId } from "../money/refund-id";
 
 /**
  * True when a booking carries money that could be refunded: marked paid AND
@@ -269,6 +279,44 @@ export function refundStatusFromPaystack(status: string): RefundStatus {
   if (status === "processed") return "completed";
   if (status === "failed") return "failed";
   return "processing";
+}
+
+/**
+ * Issue #354: what a refund status means for the exception it refunds, or
+ * null when the exception keeps its status (`pending` / `processing`: the
+ * money is still on its way, the exception stays `open`). Pure.
+ */
+export function exceptionStatusFor(status: RefundStatus): ConsultationPaymentException["status"] | null {
+  if (status === "completed") return "refunded";
+  if (status === "failed") return "refund_failed";
+  return null;
+}
+
+/**
+ * Where a refund row's status is mirrored (issue #354): the exception doc for
+ * the refund of an unapplied payment, else the booking (issue #317). Either
+ * may be absent (bad data): then nothing is mirrored.
+ */
+function mirrorTarget(row: Transaction): { kind: "exception" | "booking"; ref: FirebaseFirestore.DocumentReference } | null {
+  if (row.paymentExceptionId) {
+    return { kind: "exception", ref: collections.consultationPaymentExceptions.doc(row.paymentExceptionId) };
+  }
+  return row.consultationId ? { kind: "booking", ref: collections.consultations.doc(row.consultationId) } : null;
+}
+
+/**
+ * The mirror update for `target` (issue #354 / #317), or null when there is
+ * nothing to write: a booking takes `refundStatus`; an exception takes its
+ * own status only on a final outcome (see `exceptionStatusFor`).
+ */
+function mirrorUpdate(
+  kind: "exception" | "booking",
+  status: RefundStatus,
+  now: Timestamp
+): Record<string, unknown> | null {
+  if (kind === "booking") return { refundStatus: status, updatedAt: now };
+  const exceptionStatus = exceptionStatusFor(status);
+  return exceptionStatus ? { status: exceptionStatus, updatedAt: now } : null;
 }
 
 /** A money amount for notification copy, with its ISO code ("NGN 15,000.00"). */
@@ -568,6 +616,57 @@ class ConsultationRefundService {
   }
 
   /**
+   * Admin retry of a FAILED refund of an unapplied payment (issue #354),
+   * `POST /consultations/:id/refund` with `{ refundId }`. WHO may call it
+   * (admins only) is the controller's check.
+   *
+   * These refunds are created automatically by `settlePayment`; an admin
+   * never creates one by hand, only retries one the engine gave up on. One
+   * Firestore transaction:
+   *  - no such row, not a refund of an unapplied payment, or one of another
+   *    booking: not_found (404; never another booking's money);
+   *  - the row is not `failed`: already_refunded (409);
+   *  - otherwise THAT row goes back to `pending` (attempts reset, due now),
+   *    never a new row, and its exception back to `open`.
+   * The Paystack call follows the commit (`processRefund`, which looks the
+   * charge's refunds up first), started by the controller.
+   */
+  async adminRetryExceptionRefund(input: {
+    consultationId: string;
+    refundId: string;
+  }): Promise<{ kind: "not_found" } | { kind: "already_refunded"; refund: Transaction } | { kind: "retried"; refund: Transaction }> {
+    const ref = collections.transactions.doc(input.refundId);
+    return chargeRuntime.runTransaction(async (tx) => {
+      // ---- Reads ----
+      const snap = await tx.get(ref);
+      if (!snap.exists) return { kind: "not_found" as const };
+      const row = snap.data() as Transaction;
+      if (row.type !== "refund" || !row.paymentExceptionId || row.consultationId !== input.consultationId) {
+        return { kind: "not_found" as const };
+      }
+      const exceptionRef = collections.consultationPaymentExceptions.doc(row.paymentExceptionId);
+      const exceptionSnap = await tx.get(exceptionRef);
+      if (row.status !== "failed") return { kind: "already_refunded" as const, refund: row };
+
+      // ---- The ONE backward move: failed -> pending, on the same row ----
+      const now = Timestamp.fromDate(chargeRuntime.now());
+      tx.update(ref, {
+        status: "pending",
+        refundAttempts: 0,
+        refundNextAttemptAt: now,
+        refundLeaseUntil: FieldValue.delete(),
+        refundFailedAt: FieldValue.delete(),
+        updatedAt: now,
+      });
+      if (exceptionSnap.exists) tx.update(exceptionRef, { status: "open", updatedAt: now });
+      const next = { ...row, status: "pending", refundAttempts: 0, refundNextAttemptAt: now, updatedAt: now } as Transaction;
+      delete next.refundLeaseUntil;
+      delete next.refundFailedAt;
+      return { kind: "retried" as const, refund: next };
+    });
+  }
+
+  /**
    * Send one refund row to Paystack (issue #317). Safe to call any number of
    * times, from anywhere (the cancel handler, the admin endpoint, the retry
    * job): only a `pending` row whose lease is free is worked on, and only one
@@ -679,12 +778,14 @@ class ConsultationRefundService {
       const now = Timestamp.fromDate(at);
       const message = error.slice(0, 500);
       if ((Number(row.refundAttempts) || 0) >= MAX_REFUND_ATTEMPTS) {
-        // Out of tries: failed, listed for admins, booking mirrored.
-        const bookingRef = row.consultationId ? collections.consultations.doc(row.consultationId) : null;
-        const bookingSnap = bookingRef ? await tx.get(bookingRef) : null;
+        // Out of tries: failed, listed for admins, booking (or, for an
+        // unapplied payment, its exception: #354) mirrored. Read first.
+        const mirror = mirrorTarget(row);
+        const mirrorSnap = mirror ? await tx.get(mirror.ref) : null;
         const update = { status: "failed" as const, refundFailedAt: now, refundLastError: message, refundLeaseUntil: FieldValue.delete(), updatedAt: now };
         tx.update(ref, update);
-        if (bookingRef && bookingSnap?.exists) tx.update(bookingRef, { refundStatus: "failed", updatedAt: now });
+        const mirrored = mirror ? mirrorUpdate(mirror.kind, "failed", now) : null;
+        if (mirror && mirrorSnap?.exists && mirrored) tx.update(mirror.ref, mirrored);
         console.error(`[refund] ${refundId} failed after ${row.refundAttempts} attempts: ${message}`);
         const next = { ...row, status: "failed", refundFailedAt: now, refundLastError: message, updatedAt: now } as Transaction;
         delete next.refundLeaseUntil;
@@ -726,8 +827,9 @@ class ConsultationRefundService {
       const snap = await tx.get(ref);
       if (!snap.exists) return { changed: false, row: null };
       const row = snap.data() as Transaction;
-      const bookingRef = row.consultationId ? collections.consultations.doc(row.consultationId) : null;
-      const bookingSnap = bookingRef ? await tx.get(bookingRef) : null;
+      // The booking (#317), or the exception of an unapplied payment (#354).
+      const mirror = mirrorTarget(row);
+      const mirrorSnap = mirror ? await tx.get(mirror.ref) : null;
       const current = row.status as RefundStatus;
       const now = Timestamp.fromDate(chargeRuntime.now());
       const forward = (STATUS_RANK[target] ?? -1) > (STATUS_RANK[current] ?? 0);
@@ -750,7 +852,8 @@ class ConsultationRefundService {
         ...(target === "failed" ? { refundFailedAt: now } : {}),
       };
       tx.update(ref, update);
-      if (bookingRef && bookingSnap?.exists) tx.update(bookingRef, { refundStatus: target, updatedAt: now });
+      const mirrored = mirror ? mirrorUpdate(mirror.kind, target, now) : null;
+      if (mirror && mirrorSnap?.exists && mirrored) tx.update(mirror.ref, mirrored);
       const next = { ...row, ...update } as unknown as Transaction;
       delete next.refundLeaseUntil;
       return { changed: true, row: next };
@@ -869,6 +972,37 @@ class ConsultationRefundService {
     await notificationService
       .notifyUser({ ...common, userId: booking.agentId, title: "Consultation fee refunded", body: agentBody })
       .catch((e) => console.error("[refund] agent notify failed:", e));
+  }
+
+  /**
+   * Tell the client a payment we could not apply is being given back (issue
+   * #354). Only the CLIENT: the agent never had this money, so their balance
+   * and their notices are untouched. A failed notification never fails the
+   * refund.
+   *
+   *  - paid on a checkout retired by a reschedule: the booking moved, so the
+   *    client is asked to pay again for the new time;
+   *  - otherwise (a second charge, a payment after a cancel): the amount is
+   *    on its way back.
+   */
+  async notifyUnappliedRefund(row: Transaction, exception: ConsultationPaymentException): Promise<void> {
+    const amount = describe({ amountMinor: row.amount, currency: row.currency as Money["currency"] });
+    const body =
+      exception.reason === "paid_for_rescheduled_slot"
+        ? "Your consultation moved, so we've refunded your payment. Please pay again for the new time."
+        : exception.reason === "booking_not_payable"
+          ? `This consultation was no longer awaiting payment, so we've refunded your payment of ${amount}.`
+          : `This consultation was already paid for, so we've refunded your extra payment of ${amount}.`;
+    await notificationService
+      .notifyUser({
+        userId: row.userId,
+        type: "consultation_refunded",
+        title: "Payment refunded",
+        body,
+        relatedEntityType: "consultation",
+        relatedEntityId: exception.consultationId,
+      })
+      .catch((e) => console.error("[refund] unapplied-payment notify failed:", e));
   }
 
   /** Tell the client their refund is delayed (a row became `failed`). */
