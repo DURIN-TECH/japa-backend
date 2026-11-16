@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
-import { defineAbilitiesFor, ROLES, type Entitlements } from "@durin-tech/authz";
+import { defineAbilitiesFor, FEATURES, ROLES, type Entitlements } from "@durin-tech/authz";
 import { aiCaseOfficerController } from "../../src/controllers/ai-case-officer.controller";
 import { aiCaseOfficerService } from "../../src/services/ai-case-officer.service";
 import { routeARubric, rubricBook, ScriptedProvider, seedApplication, seedDocument, seedEligibility, seedStatement, seedUser, serviceWith, installAssessmentFakes, installIntakeFake, resetAll, storedAssessments, allKeys } from "./harness";
@@ -38,6 +38,9 @@ const PAID: Entitlements = {
   features: ["ai.case_officer"],
   limits: {},
 } as unknown as Entitlements;
+
+/** (#384) A paid client who also holds the rule-by-rule working. */
+const PAID_WORKING: Entitlements = { ...PAID, features: [FEATURES.AI_CASE_OFFICER, FEATURES.AI_REVIEW_WORKING] } as unknown as Entitlements;
 
 /** A response that records what the handler sent. */
 function mockRes() {
@@ -143,16 +146,19 @@ describe("the /ai handlers", () => {
     assert.equal(got.body.data.data.refusalGrounds, undefined);
   });
 
-  test("a paid owner gets the full body, and the client view has no internalCall at any depth", async () => {
+  test("a paid owner WITH the working gets the full body, and the client view has no internalCall at any depth", async () => {
+    // (#384) The full body (stage outcomes, findings) now needs ai.review_working
+    // as well for a client-role caller; see narrative-tiers.test.ts for the rest.
     seedCase();
     const provider = new ScriptedProvider((r) => (r.role === "extraction" ? BANK : JSON.stringify({ findings: [], strengths: [], statementNotes: [], suspiciousPassages: [] })));
     useProvider(provider);
     const posted = mockRes();
-    await aiCaseOfficerController.assess(req({ id: "app-1" }, OWNER, PAID), posted);
+    await aiCaseOfficerController.assess(req({ id: "app-1" }, OWNER, PAID_WORKING), posted);
     await work(posted.body.data.assessmentId);
     const got = mockRes();
-    await aiCaseOfficerController.latest(req({ id: "app-1" }, OWNER, PAID), got);
+    await aiCaseOfficerController.latest(req({ id: "app-1" }, OWNER, PAID_WORKING), got);
     assert.equal(got.body.data.meta.tier, "full");
+    assert.equal(got.body.data.meta.working, true);
     assert.ok(got.body.data.data.stageOutcomes, "the full body carries the stage outcomes");
     assert.ok(!allKeys(got.body.data).includes("internalCall"), "no internalCall reaches the client");
   });

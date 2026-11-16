@@ -363,7 +363,9 @@ describe("an ordinary application is reviewed at the default settings", () => {
     assert.equal(p.callsFor("extraction"), 10, "one extraction per document");
     assert.deepEqual(keysSent(p), ["bank1", "bank2", "bank3", "passport", "photo1", "photo2", "photo3", "photo4", "photo5", "photo6"]);
     assert.equal(p.callsFor("judgement"), 5);
-    assert.equal(p.requests.length, 15, "well inside the cap of 30");
+    // (#384) Plus the one narrative call after assembly.
+    assert.equal(p.callsFor("narrative"), 1);
+    assert.equal(p.requests.length, 16, "well inside the cap of 30");
   });
 });
 
@@ -422,6 +424,9 @@ describe("an application that passes a per-review cap", () => {
     const stored = await review(serviceWith(p, {}, { loadBytes }));
     assert.equal(stored.status, "succeeded");
     assert.equal(p.requests.length, 30);
+    // (#384) The cap is used up, so the narrative is SKIPPED (no call), and the review still succeeds.
+    assert.equal(p.callsFor("narrative"), 0);
+    assert.equal(stored.narrative, null);
   });
 
   test("the rules alone need every request: review_too_large (removing documents would not help), zero calls", async () => {

@@ -9,7 +9,8 @@ import { stackLayersField } from "../shared-routes/stack-layers-view";
 import type { ApplicationAssessment } from "../types/assessment";
 import { rubricRouteKey } from "../scrapers";
 import { aiCaseOfficerService, type ReviewMissingPart } from "../services/ai-case-officer.service";
-import { envelope, tierFor } from "../services/ai/tier-serializer";
+import { ROLES } from "@durin-tech/authz";
+import { envelope, tierFor, workingFor } from "../services/ai/tier-serializer";
 
 // ============================================
 // AI CASE-OFFICER — HANDLERS (issue #42)
@@ -24,6 +25,11 @@ import { envelope, tierFor } from "../services/ai/tier-serializer";
 //      There is no blanket requireFeature in front of the free response: a free
 //      caller gets the band and the top three, not a 402;
 //   3. answer through the tier serializer, the only path to a response body.
+//      (#384) Beside the tier it decides the WORKING (`workingFor`): whether
+//      `data` carries the rule-by-rule findings. A client-role caller needs
+//      `ai.case_officer` AND `ai.review_working` for it; staff keep it on the
+//      full tier. Without it a client gets the reading body (band, blocking
+//      rule, top issues, narrative, country context). `meta.working` says which.
 //
 // The tier is decided here, in the handler, and not in middleware, so that the
 // unresolved-entitlement rule (fail closed to the free response) applies to these
@@ -178,7 +184,9 @@ export class AiCaseOfficerController {
     // Staff only (#43): a display name for who asked, never the uid. Applicants
     // get nothing, so the lookup is skipped for them.
     const requestedByName = await this.requesterNameFor(assessment, tier, req.authz?.role);
-    const env = envelope(assessment, tier, req.authz?.role, staleReason, requestedByName);
+    // (#384) The working is decided here, from the same role and entitlements as the tier.
+    const working = workingFor(req.authz?.role, req.entitlements, tier);
+    const env = envelope(assessment, tier, req.authz?.role, staleReason, requestedByName, working);
     // (#237) Which layers of the rulebook stack the assessment ran on (keys =
     // the findings' `layerKey`), with names and ready / missing. Layer names
     // and status only, so it is served on every tier. Omitted on one layer.
@@ -193,7 +201,7 @@ export class AiCaseOfficerController {
    */
   private async requesterNameFor(assessment: ApplicationAssessment, tier: "free" | "full", role: string | undefined): Promise<string | null> {
     if (tier !== "full" || assessment.status !== "succeeded") return null;
-    if (role !== "agent" && role !== "owner" && role !== "admin") return null;
+    if (role !== ROLES.AGENT && role !== ROLES.OWNER && role !== ROLES.ADMIN) return null;
     if (assessment.trigger !== "manual" || !assessment.requestedBy || assessment.requestedBy === "system") return "System";
     try {
       const agentSnap = await collections.agents.where("userId", "==", assessment.requestedBy).limit(1).get();

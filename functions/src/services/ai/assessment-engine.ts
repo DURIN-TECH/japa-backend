@@ -2,6 +2,8 @@ import { createHash } from "crypto";
 import type { AssessmentCriterion, VisaRubric, IntentPolarity } from "../../scrapers";
 import type { DecisionStage } from "../../types/rubric";
 import type {
+  AssessmentNarrative,
+  BlockingRule,
   CredibilityFlag,
   InsufficientItem,
   ReadinessBand,
@@ -1470,6 +1472,421 @@ export function topIssuesOf(rubric: Pick<VisaRubric, "criteria" | "severityLevel
     .filter((r) => r.title !== null)
     .sort((a, b) => a.sevRank - b.sevRank || a.order - b.order);
   return ranked.slice(0, 3).map((r) => ({ criterionId: r.id, title: r.title as string }));
+}
+
+// ============================================
+// Blocking rule (#384): never paywalled, never model text
+// ============================================
+
+/**
+ * The mandatory bar that stops the review, copied from the FIRST mandatory-bar
+ * refusal ground. Every field is rubric text that `groundFrom` copied from the
+ * criterion, so nothing here is model-written. Null when no bar applies.
+ *
+ * Used twice: by the job when it stores a result, and by the serializer for a
+ * document stored before #384 (no `blockingRule` key), so both agree.
+ */
+export function blockingRuleOf(refusalGrounds: ReadonlyArray<Pick<RefusalGround, "criterionId" | "title" | "isMandatoryBar" | "ruleRef" | "sourceQuote" | "sourceUrl">> | null | undefined): BlockingRule | null {
+  const bar = (refusalGrounds ?? []).find((g) => g && g.isMandatoryBar === true);
+  if (!bar) return null;
+  // A whitelist copy: exactly the five keys, whatever else the ground carries.
+  return { criterionId: bar.criterionId, title: bar.title, ruleRef: bar.ruleRef ?? null, sourceQuote: bar.sourceQuote, sourceUrl: bar.sourceUrl };
+}
+
+// ============================================
+// Narrative (#384): one call after assembly, checked in code
+// ============================================
+//
+// After the findings are assembled, the interactive worker makes ONE more
+// model call that writes a short, plain-English reading of the applicant's
+// own application in a caseworker's reasoning style: what they told us, what
+// their documents show, where the two conflict or fall short, how convincing
+// the whole picture is, a conclusion that agrees with the band, and what would
+// change it. The rule-by-rule working stays in the findings (which a client
+// caller only gets with `ai.review_working`, see tier-serializer.ts).
+//
+// "Grounded or not shown": the model's answer is never trusted as is. Every
+// string (paragraph, conclusion, next step) goes through four code checks and
+// is DROPPED when it fails one:
+//   1. banned wording (findBannedWording, the #43 list, unchanged);
+//   2. injection (findInjectionSignals; counted as suspicious content);
+//   3. figures: every number in it must appear in the applicant inputs or the
+//      rubric text sent to the call (no conversion, no estimate, no rounding);
+//   4. quotations: text in double or curly quotes must be a verbatim substring
+//      of a rule's quoted wording or of the applicant inputs.
+// The conclusion has one more check: it must open with the form its band asks
+// for (so it always agrees with the band). No conclusion or no paragraph left
+// means no narrative at all (null). A shape mismatch is also null.
+
+/** The narrative's limits. Enforced in code (the schema sent does not carry them). */
+export const NARRATIVE_LIMITS = {
+  minParagraphs: 1,
+  maxParagraphs: 6,
+  maxParagraphChars: 700,
+  maxConclusionChars: 400,
+  maxNextSteps: 5,
+  maxNextStepChars: 200,
+} as const;
+
+/**
+ * The opening each band's conclusion must use. The negative form is the one
+ * the founder chose on #384: the #43 banned-wording guard rejects "is
+ * unlikely", so "an officer is unlikely to be satisfied" is NOT used. Neither
+ * form names an outcome, a likelihood or a verdict.
+ */
+export const NARRATIVE_CONCLUSION_LEADS: Readonly<Record<ReadinessBand, string>> = {
+  not_ready: "As things stand, what you have sent is not yet enough for an officer to be satisfied that",
+  weak: "As things stand, what you have sent is not yet enough for an officer to be satisfied that",
+  competitive: "As things stand, what you have sent goes a long way towards satisfying an officer that",
+  strong: "As things stand, what you have sent gives an officer a clear basis to be satisfied that",
+};
+
+/**
+ * The narrative output schema: exactly three keys. Lengths and counts are NOT
+ * in the schema (structured output does not reliably enforce them); they are
+ * stated in the prompt and checked in `parseNarrative`.
+ */
+export function narrativeSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["paragraphs", "conclusion", "nextSteps"],
+    properties: {
+      paragraphs: { type: "array", items: { type: "string" } },
+      conclusion: { type: "string" },
+      nextSteps: { type: "array", items: { type: "string" } },
+    },
+  };
+}
+
+/**
+ * The system prompt. Stable (no per-request data), so it can be cached. It
+ * asks for the reasoning style of a caseworker's refusal-letter reasoning
+ * (statements set against documents, conflicts and gaps, whether the evidence
+ * is conclusive, comprehensive and convincing), never for a decision.
+ */
+export const NARRATIVE_SYSTEM =
+  "You write, for an applicant, a short reading of their OWN visa application in the way an " +
+  "experienced entry clearance officer reasons when weighing one. You do not decide it.\n" +
+  "How to reason:\n" +
+  "- Start from what the applicant told us (their answers, profile and statement), then set it " +
+  "against what their documents show. Say plainly where the two agree, where they conflict, and " +
+  "where something an officer would expect to see is missing. For example: the applicant says they " +
+  "spend a fixed amount each month, but their bank statements show spending well above it; or they " +
+  "say they have rented for years, but there is no tenancy agreement and no rent payments on the " +
+  "statements.\n" +
+  "- Weigh whether the evidence, taken together, is conclusive, comprehensive and convincing. Say " +
+  "which parts are and which are not, and why.\n" +
+  "- Reason about the applicant's own facts and documents. Name or briefly quote a rule only where it " +
+  "matters to the point you are making, at most once. Never list the rules or go through them one by " +
+  "one: the reading is about the applicant, not the rulebook.\n" +
+  "- Use only the facts given below. Copy every figure, date and amount exactly as given, in the " +
+  "currency it was given in. Never convert a currency, estimate, round, add up or work out an amount " +
+  "that is not written in the data.\n" +
+  "- Put text in double quotes only when it is copied word for word from the data or from a rule's " +
+  "quoted wording.\n" +
+  "How to write:\n" +
+  `- Second person ("you", "your"), plain English, short sentences. ${NARRATIVE_LIMITS.minParagraphs} to ${NARRATIVE_LIMITS.maxParagraphs} paragraphs, ` +
+  `each at most ${NARRATIVE_LIMITS.maxParagraphChars} characters.\n` +
+  "- Never say or suggest that the application will or would be refused, approved or granted. Never " +
+  "mention chances, odds, likelihood, probability, a score, a verdict or a prediction, and do not use " +
+  "the words likely or unlikely.\n" +
+  `- conclusion: one or two sentences, at most ${NARRATIVE_LIMITS.maxConclusionChars} characters, that agree with the readiness ` +
+  "band you are given. It MUST begin with the exact opening for that band and then finish the sentence " +
+  "with the main point (for a not_ready or weak band: the main thing not yet shown):\n" +
+  `  not_ready or weak: "${NARRATIVE_CONCLUSION_LEADS.not_ready} ..."\n` +
+  `  competitive: "${NARRATIVE_CONCLUSION_LEADS.competitive} ..."\n` +
+  `  strong: "${NARRATIVE_CONCLUSION_LEADS.strong} ..."\n` +
+  `- nextSteps: up to ${NARRATIVE_LIMITS.maxNextSteps} concrete things the applicant could do that would change this reading, ` +
+  `each at most ${NARRATIVE_LIMITS.maxNextStepChars} characters, taken from the gaps you described. An empty list when nothing would.\n` +
+  "- Do not number the paragraphs or the steps, and use no headings or markdown.\n" +
+  DATA_ONLY_RULE;
+
+/** The findings the narrative is given: the assembled content, as stored. */
+export type NarrativeFindings = Pick<AssessmentContent, "refusalGrounds" | "credibilityFlags" | "statementFindings" | "insufficientInformation" | "strengths">;
+
+/** Inputs for the narrative request. Everything applicant-derived is wrapped. */
+export interface NarrativeRequestInput {
+  // The band the code decided. The conclusion must agree with it.
+  readiness: ReadinessBand;
+  findings: NarrativeFindings;
+  // The same summaries the judgement call was given (applicant-derived).
+  profileSummary: string;
+  intakeSummary: string;
+  extractionSummary: string;
+  // Every statement's plain text (null when none).
+  statementText: string | null;
+}
+
+/** The trusted rule text of one finding: rubric wording only. */
+function ruleLine(tag: string, f: { title: string; ruleRef?: string | null; sourceQuote?: string }): string {
+  return `[${tag}] rule: ${f.title}${f.ruleRef ? ` | ref: ${f.ruleRef}` : ""}${f.sourceQuote ? ` | published wording: "${f.sourceQuote}"` : ""}`;
+}
+
+/**
+ * The open items the narrative may talk about: the insufficient-information
+ * items the applicant can act on. Items with a not-actionable marker
+ * (`no_trigger`, `not_in_documents`) are left out, as on every other
+ * applicant surface (they are stored for staff).
+ */
+function actionableInsufficient(items: readonly InsufficientItem[]): InsufficientItem[] {
+  return items.filter((i) => !isNotActionableMarker(i.notAssessed));
+}
+
+/**
+ * Build the narrative request. Rubric text (titles, rule refs, published
+ * wording) is trusted data and goes in the plain part. Everything derived from
+ * the applicant (their answers, profile, documents, statement, and the finding
+ * details, which describe the applicant's facts) goes through `wrapUntrusted`,
+ * and the system prompt carries DATA_ONLY_RULE.
+ */
+export function buildNarrativeRequest(input: NarrativeRequestInput): LlmRequest {
+  const f = input.findings;
+  const ruleLines: string[] = [];
+  const detailLines: string[] = [];
+  // Refusal grounds and credibility flags: what does not meet a rule, and what an officer would doubt.
+  f.refusalGrounds.forEach((g, i) => {
+    ruleLines.push(`${ruleLine(`R${i + 1}`, g)} | kind: does not meet the rule yet`);
+    detailLines.push(`[R${i + 1}] what we found: ${g.detail} | what would help: ${g.whatWouldHelp}`);
+  });
+  f.credibilityFlags.forEach((c, i) => {
+    ruleLines.push(`${ruleLine(`C${i + 1}`, c)} | kind: a point an officer would weigh`);
+    detailLines.push(`[C${i + 1}] what we found: ${c.detail} | what would help: ${c.whatWouldHelp}`);
+  });
+  f.statementFindings.forEach((s, i) => {
+    ruleLines.push(`${ruleLine(`N${i + 1}`, s)} | kind: about the statement`);
+    detailLines.push(`[N${i + 1}] what we found: ${s.comment}`);
+  });
+  actionableInsufficient(f.insufficientInformation).forEach((u, i) => {
+    ruleLines.push(`[U${i + 1}] could not be told yet: ${u.title}`);
+    detailLines.push(`[U${i + 1}] why: ${u.reason}`);
+  });
+  f.strengths.forEach((s, i) => {
+    ruleLines.push(`[S${i + 1}] a strength: ${s.title}`);
+    detailLines.push(`[S${i + 1}] what we found: ${s.detail}`);
+  });
+  const user =
+    `Readiness band (decided by code; the conclusion must agree with it): ${input.readiness}\n` +
+    `Required opening of the conclusion: "${NARRATIVE_CONCLUSION_LEADS[input.readiness]}"\n\n` +
+    `Findings, with the rule each one is about (rule wording copied from the published guidance):\n${ruleLines.join("\n") || "(none)"}\n\n` +
+    wrapUntrusted(detailLines.join("\n") || "(none)", "findings") +
+    "\n" +
+    wrapUntrusted(input.profileSummary, "profile") +
+    "\n" +
+    wrapUntrusted(input.intakeSummary, "intake") +
+    "\n" +
+    wrapUntrusted(input.extractionSummary || "(no values read from documents)", "extraction") +
+    "\n" +
+    wrapUntrusted(input.statementText ?? "(no statement)", "statement");
+  return {
+    role: "narrative",
+    system: NARRATIVE_SYSTEM,
+    user,
+    schema: narrativeSchema(),
+    maxOutputTokens: 4_000,
+    timeoutMs: NARRATIVE_TIMEOUT_MS,
+    effort: "medium",
+  };
+}
+
+/** Wall-clock budget of the narrative call. The job skips the call when less than this is left. */
+export const NARRATIVE_TIMEOUT_MS = 90_000;
+
+/**
+ * What a narrative string may be grounded in:
+ *  - `figureSources`: the applicant inputs AND the rubric text sent to the call
+ *    (titles, rule refs, published wording). A number in the narrative must be
+ *    in one of these;
+ *  - `quoteSources`: the rubric's published wording (`sourceQuote`) AND the
+ *    applicant inputs. Quoted text must be a verbatim substring of one.
+ * Model-written finding details are deliberately NOT a source: they were
+ * written by a model too, so a figure in them is not proof of anything.
+ */
+export interface NarrativeGrounding {
+  figureSources: string[];
+  quoteSources: string[];
+}
+
+/** The grounding for one narrative request, from the same inputs the request was built from. */
+export function narrativeGroundingOf(input: NarrativeRequestInput): NarrativeGrounding {
+  const f = input.findings;
+  const ruled = [...f.refusalGrounds, ...f.credibilityFlags, ...f.statementFindings];
+  const applicant = [input.profileSummary, input.intakeSummary, input.extractionSummary, input.statementText ?? ""];
+  const quotes = ruled.map((r) => r.sourceQuote).filter(Boolean);
+  const rubricText = [
+    ...ruled.flatMap((r) => [r.title, r.ruleRef ?? ""]),
+    ...actionableInsufficient(f.insufficientInformation).map((u) => u.title),
+    ...f.strengths.map((s) => s.title),
+    ...quotes,
+  ];
+  return { figureSources: [...applicant, ...rubricText], quoteSources: [...quotes, ...applicant] };
+}
+
+// ----- Figures -----
+
+/** Currency signs read next to a number, by ISO code. */
+const CURRENCY_SIGNS: Record<string, string> = { "£": "GBP", $: "USD", "€": "EUR", "₦": "NGN" };
+/** Currency codes read next to a number (before or after it). */
+const CURRENCY_CODES = ["GBP", "USD", "EUR", "NGN", "CAD", "AUD"];
+
+/** One number found in text: its value in a canonical form, and its currency when one is written next to it. */
+interface FoundFigure {
+  value: string;
+  currency: string | null;
+}
+
+/**
+ * Every number in a text: digits, with or without thousands separators, with
+ * or without decimals, with or without a currency sign or code next to it.
+ * `value` is canonical (no separators, no trailing decimal zeros), so
+ * "₦399,367" and "399367" are the same figure and "3,000.00" equals "3000".
+ */
+export function figuresIn(text: string): FoundFigure[] {
+  const out: FoundFigure[] = [];
+  // sign? then 1-3 digits with ,ddd groups, or a plain digit run; then an optional decimal part.
+  const re = /([£$€₦])?\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const whole = m[2].replace(/,/g, "");
+    const decimals = (m[3] ?? "").replace(/0+$/, "");
+    const value = `${whole.replace(/^0+(?=\d)/, "")}${decimals ? `.${decimals}` : ""}`;
+    let currency: string | null = m[1] ? CURRENCY_SIGNS[m[1]] : null;
+    if (!currency) {
+      // A code written right after ("3000 GBP") or right before ("GBP 3000").
+      const after = text.slice(m.index + m[0].length, m.index + m[0].length + 5);
+      const before = text.slice(Math.max(0, m.index - 5), m.index);
+      const code = CURRENCY_CODES.find((c) => new RegExp(`^\\s?${c}\\b`).test(after) || new RegExp(`\\b${c}\\s?$`).test(before));
+      currency = code ?? null;
+    }
+    out.push({ value, currency });
+  }
+  return out;
+}
+
+/**
+ * True when every number in `text` is grounded: the same value appears in a
+ * source, and, when the narrative writes a currency next to it, a source has
+ * that value in the same currency or with no currency at all. A figure the
+ * sources hold ONLY in another currency is a conversion (or a mislabel) and
+ * fails. Nothing is rounded or converted to make a match.
+ */
+export function figuresAreGrounded(text: string, sources: readonly string[]): boolean {
+  const known = new Map<string, Set<string | null>>();
+  for (const s of sources) {
+    for (const fig of figuresIn(s)) {
+      const set = known.get(fig.value) ?? new Set<string | null>();
+      set.add(fig.currency);
+      known.set(fig.value, set);
+    }
+  }
+  return figuresIn(text).every((fig) => {
+    const currencies = known.get(fig.value);
+    if (!currencies) return false;
+    if (fig.currency === null) return true;
+    return currencies.has(fig.currency) || currencies.has(null);
+  });
+}
+
+// ----- Quotations -----
+
+/** Whitespace collapsed and curly apostrophes made straight, for a fair verbatim comparison. */
+function normaliseForQuote(text: string): string {
+  return text.replace(/[‘’]/g, "'").replace(/\s+/g, " ").trim();
+}
+
+/** The quoted passages in a text: inside "straight" or “curly” double quotes. */
+export function quotationsIn(text: string): string[] {
+  const out: string[] = [];
+  const re = /"([^"\n]+)"|“([^”\n]+)”/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    // Trailing punctuation the writer put inside the quotes is not part of the source.
+    const q = normaliseForQuote(m[1] ?? m[2] ?? "").replace(/[.,;:!?]+$/, "");
+    if (q) out.push(q);
+  }
+  return out;
+}
+
+/** True when every quotation in `text` is a verbatim substring of a source. */
+export function quotationsAreGrounded(text: string, sources: readonly string[]): boolean {
+  const normalised = sources.map(normaliseForQuote);
+  return quotationsIn(text).every((q) => normalised.some((s) => s.includes(q)));
+}
+
+// ----- Parse + checks -----
+
+/** Result of checking one narrative answer. */
+export interface NarrativeParse {
+  // The narrative to store, or null (shape mismatch, no conclusion, no paragraph).
+  narrative: AssessmentNarrative | null;
+  // Strings dropped by the banned-wording, figure, quote or lead checks.
+  dropped: number;
+  // Strings dropped because they addressed a model (stored as suspicious content).
+  suspicious: number;
+  // Why the whole narrative is null (for the count-only log). Null when kept.
+  reason: string | null;
+}
+
+const NARRATIVE_KEYS = new Set(["paragraphs", "conclusion", "nextSteps"]);
+
+/** Every string in a list is a string, non-empty after trimming, and within the cap. */
+function stringsWithin(list: unknown, max: number): list is string[] {
+  return Array.isArray(list) && list.every((s) => typeof s === "string" && s.trim().length > 0 && s.length <= max);
+}
+
+/**
+ * Check a narrative answer in code. Shape first (exact keys, counts and
+ * lengths: any mismatch is null), then each string on its own: a string that
+ * fails a check is dropped. Then: no conclusion, or no paragraph, is null.
+ *
+ * @param band the band the code decided (the conclusion's opening must match)
+ * @param grounding what figures and quotations may come from
+ */
+export function parseNarrative(text: string, band: ReadinessBand, grounding: NarrativeGrounding): NarrativeParse {
+  const fail = (reason: string, dropped = 0, suspicious = 0): NarrativeParse => ({ narrative: null, dropped, suspicious, reason });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return fail("answer is not JSON");
+  }
+  if (!isRecord(parsed)) return fail("answer is not an object");
+  const keys = Object.keys(parsed);
+  if (keys.length !== NARRATIVE_KEYS.size || !keys.every((k) => NARRATIVE_KEYS.has(k))) return fail("answer does not have exactly the three keys");
+  const { paragraphs, conclusion, nextSteps } = parsed as { paragraphs: unknown; conclusion: unknown; nextSteps: unknown };
+  if (!stringsWithin(paragraphs, NARRATIVE_LIMITS.maxParagraphChars) || paragraphs.length < NARRATIVE_LIMITS.minParagraphs || paragraphs.length > NARRATIVE_LIMITS.maxParagraphs) {
+    return fail("paragraphs break the shape");
+  }
+  if (typeof conclusion !== "string" || conclusion.trim().length === 0 || conclusion.length > NARRATIVE_LIMITS.maxConclusionChars) return fail("conclusion breaks the shape");
+  if (!stringsWithin(nextSteps, NARRATIVE_LIMITS.maxNextStepChars) || nextSteps.length > NARRATIVE_LIMITS.maxNextSteps) return fail("nextSteps break the shape");
+
+  let dropped = 0;
+  let suspicious = 0;
+  /** The four string checks, in order. Injection is counted apart (it is stored as suspicious content). */
+  const keep = (s: string): boolean => {
+    if (findInjectionSignals(s)) {
+      suspicious++;
+      return false;
+    }
+    if (findBannedWording(s) || !figuresAreGrounded(s, grounding.figureSources) || !quotationsAreGrounded(s, grounding.quoteSources)) {
+      dropped++;
+      return false;
+    }
+    return true;
+  };
+  const keptParagraphs = paragraphs.map((p) => p.trim()).filter(keep);
+  // The conclusion: the four checks, then its opening must be the band's own
+  // (so a conclusion can never read better or worse than the band).
+  const c = conclusion.trim();
+  let keptConclusion: string | null = keep(c) ? c : null;
+  if (keptConclusion !== null && !normaliseForQuote(keptConclusion).toLowerCase().startsWith(NARRATIVE_CONCLUSION_LEADS[band].toLowerCase())) {
+    dropped++;
+    keptConclusion = null;
+  }
+  const keptSteps = nextSteps.map((s) => s.trim()).filter(keep);
+  if (keptConclusion === null) return fail("the conclusion was dropped", dropped, suspicious);
+  if (keptParagraphs.length === 0) return fail("every paragraph was dropped", dropped, suspicious);
+  return { narrative: { paragraphs: keptParagraphs, conclusion: keptConclusion, nextSteps: keptSteps }, dropped, suspicious, reason: null };
 }
 
 // ============================================
