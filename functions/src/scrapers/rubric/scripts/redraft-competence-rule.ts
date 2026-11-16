@@ -20,7 +20,10 @@
  *      rule's own passage): ONE request. Code builds the block and keeps it only when EVERY step
  *      passes `competenceProblems` (each step rests on this rule; its words are verbatim in the
  *      quote or one list line; its question lists the route's members from membership data; its
- *      result comes from the applicant's answer, never worked out).
+ *      result comes from the applicant's answer, never worked out). The call returns EVERY
+ *      question the model drafted for the passage, not only the block's; code keeps the ones the
+ *      block reads (and the ones their conditions read), and re-uses a question the version
+ *      already asks instead of adding a copy (`questionsTheBlockNeeds`, `placeQuestions`).
  *   3. the independent check of the rule (`RubricCheckerService.check`, production table): ONE
  *      request for an ordinary rule (two for a protected rule, which both models read).
  *   Every call gets the production's one retry for a transient provider failure, so the most a
@@ -43,7 +46,11 @@
  *   --verdicts the check's six stored letters for the rule (`rubricCheckerRuns/{key}__v{n}`,
  *              `ruleVerdicts.<id>.verification`); absent = every aspect is sent as not confirmed
  *   --route    the route name shown to the model (default "the route")
- *   --out      live only: where to write the result JSON (default: print a summary only)
+ *   --out      REQUIRED with --live: where the outcome JSON is written. It must NOT exist yet and
+ *              must be writable: both are tested BEFORE the first request, so a paid answer is
+ *              never lost to a bad path and an earlier result is never overwritten. The file is
+ *              written whatever the outcome (kept, refused by code, check not passed), with the
+ *              number of requests made.
  *
  * Run (from functions/):
  *   npm run redraft:competence-rule -- --page <snapshot.json> --version <v1.json> --rule <id> --verdicts <letters> [--route <name>] [--live --out <result.json>]
@@ -53,7 +60,7 @@
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import type { AssessmentCriterion, CompetenceBlock, IntakeQuestion, VisaRubric } from "../../../types/rubric";
 import type { GuidanceSnapshotContent } from "../../guidance/types";
 import type { LlmProvider, LlmRequest, LlmResponse } from "../../../services/ai/llm-provider";
@@ -61,6 +68,7 @@ import type { AiModelRole } from "../../../services/ai/ai-models";
 import { SnapshotQuoteIndex } from "../rubric-quote";
 import { readLeadInList, verifyListItems } from "../rubric-list-items";
 import { competenceProblems } from "../rubric-competence";
+import { splitRulebookKey } from "../../../authorities/authority-ids";
 import { REPAIR_WINDOW_CHARS, REPAIR_WINDOW_LINES_AFTER, REPAIR_WINDOW_LINES_BEFORE, isBar } from "../rubric-repair";
 import { aspectsToRepair } from "./repair-saved-rule";
 
@@ -129,6 +137,12 @@ export interface CompetenceRuleRunSummary {
   competenceProblems: string[];
   checkLetters: string | null;
   checkPasses: boolean | null;
+  // Live only: how many questions the competence call returned that the block does not read (not added).
+  questionsNotNeeded: number;
+  // Live only: block questions that are the SAME as one the version already asks (re-used, not added): new id -> the version's id.
+  reusedQuestionIds: Record<string, string>;
+  // Live only: added questions whose wording equals a version question of ANOTHER answer type (added; for the reader to look at): new id -> the version's id.
+  similarQuestionIds: Record<string, string>;
   // Live only: the result a person reviews (the replacement rule, the questions the block reads, the block).
   result: { rule: AssessmentCriterion; intakeQuestions: IntakeQuestion[]; competence: CompetenceBlock; renamedQuestionIds: Record<string, string> } | null;
 }
@@ -150,19 +164,68 @@ class CountingProvider implements LlmProvider {
 // Composition (pure)
 // ============================================
 
+/** A question's wording, for comparing two questions: whitespace collapsed, case ignored. */
+const wordingOf = (q: Pick<IntakeQuestion, "label">): string => String(q.label ?? "").replace(/\s+/gu, " ").trim().toLocaleLowerCase();
+
+/**
+ * The questions the block NEEDS, out of everything the competence call returned: the questions its
+ * steps read, the questions their conditions (`when`) read, and the questions those questions' own
+ * show conditions read, and so on. The call is the production "questions and evidence" call on the
+ * rule's passage, so it may also return questions that have nothing to do with the block (a
+ * document question, a dates question); those are NOT added to the version by this script.
+ * Order is kept as the call returned it.
+ */
+export function questionsTheBlockNeeds(added: readonly IntakeQuestion[], block: CompetenceBlock): IntakeQuestion[] {
+  const byId = new Map(added.map((q) => [q.id, q]));
+  const needed = new Set<string>();
+  /** Take a question id and everything its show conditions read. */
+  const take = (id: string): void => {
+    if (needed.has(id)) return;
+    needed.add(id);
+    for (const c of byId.get(id)?.showWhen?.anyOf ?? []) take(c.questionId);
+  };
+  for (const s of block.steps) {
+    take(s.questionId);
+    for (const c of s.when ?? []) take(c.questionId);
+  }
+  return added.filter((q) => needed.has(q.id));
+}
+
 /**
  * Put the new questions next to the version's own, without ever changing one of the version's
- * questions. A new question whose id is already taken by a DIFFERENT question of the version gets
- * a fresh id (`<id>__c`, `<id>__c2`, ...), and every reference to it in the new questions' show
- * conditions and in the block's steps is renamed with it. Ids are internal handles: renaming one
- * changes no wording, option or rule.
+ * questions.
+ *
+ *  - A new question that IS a question the version already asks (same wording, same answer type,
+ *    same source of options) is not added a second time: the version's question is re-used, and
+ *    every reference to the new one (show conditions, the block's steps) points at it (`reused`).
+ *  - A new question whose id is already taken by a DIFFERENT question of the version gets a fresh
+ *    id (`<id>__c`, `<id>__c2`, ...), renamed everywhere the same way (`renamed`).
+ *  - A new question whose wording equals a version question of another answer type is still added
+ *    (a free-text question cannot feed a step), and reported (`similar`) for the reader.
+ * Ids are internal handles: renaming one changes no wording, option or rule.
  */
-export function placeQuestions(existing: readonly IntakeQuestion[], added: readonly IntakeQuestion[], block: CompetenceBlock): { intakeQuestions: IntakeQuestion[]; competence: CompetenceBlock; renamed: Record<string, string> } {
+export function placeQuestions(
+  existing: readonly IntakeQuestion[],
+  added: readonly IntakeQuestion[],
+  block: CompetenceBlock
+): { intakeQuestions: IntakeQuestion[]; competence: CompetenceBlock; renamed: Record<string, string>; reused: Record<string, string>; similar: Record<string, string> } {
   const taken = new Set(existing.map((q) => q.id));
   const renamed: Record<string, string> = {};
+  const reused: Record<string, string> = {};
+  const similar: Record<string, string> = {};
+  const kept: IntakeQuestion[] = [];
   for (const q of added) {
+    const sameWording = existing.filter((e) => wordingOf(e) === wordingOf(q) && wordingOf(q) !== "");
+    // The very same question: re-use the version's, add nothing.
+    const same = sameWording.find((e) => e.answerType === q.answerType && (e.optionsFrom ?? null) === (q.optionsFrom ?? null));
+    if (same) {
+      reused[q.id] = same.id;
+      continue;
+    }
+    kept.push(q);
     if (!taken.has(q.id)) {
       taken.add(q.id);
+      if (sameWording.length > 0) similar[q.id] = sameWording[0].id;
       continue;
     }
     let n = 1;
@@ -170,9 +233,11 @@ export function placeQuestions(existing: readonly IntakeQuestion[], added: reado
     while (taken.has(id)) id = `${q.id}__c${++n}`;
     renamed[q.id] = id;
     taken.add(id);
+    if (sameWording.length > 0) similar[id] = sameWording[0].id;
   }
-  const ren = (id: string): string => renamed[id] ?? id;
-  const questions = added.map((q) => ({
+  // A re-used question keeps the version's id; a clashing one gets its fresh id.
+  const ren = (id: string): string => reused[id] ?? renamed[id] ?? id;
+  const questions = kept.map((q) => ({
     ...q,
     id: ren(q.id),
     ...(q.showWhen ? { showWhen: { anyOf: q.showWhen.anyOf.map((c) => ({ ...c, questionId: ren(c.questionId) })) } } : {}),
@@ -180,7 +245,7 @@ export function placeQuestions(existing: readonly IntakeQuestion[], added: reado
   const competence: CompetenceBlock = {
     steps: block.steps.map((s) => ({ ...s, questionId: ren(s.questionId), ...(s.when ? { when: s.when.map((c) => ({ ...c, questionId: ren(c.questionId) })) } : {}) })),
   };
-  return { intakeQuestions: [...existing, ...questions], competence, renamed };
+  return { intakeQuestions: [...existing, ...questions], competence, renamed, reused, similar };
 }
 
 // ============================================
@@ -194,7 +259,8 @@ export function placeQuestions(existing: readonly IntakeQuestion[], added: reado
 export async function runCompetenceRule(snapshot: GuidanceSnapshotContent, version: VisaRubric, ruleId: string, opts: CompetenceRuleRunOptions): Promise<CompetenceRuleRunSummary> {
   const summary: CompetenceRuleRunSummary = {
     refusedOffline: null, listLinesStored: 0, listLinesRead: 0, storedListVerifies: false, aspects: [], planned: [],
-    requests: 0, redraft: null, competence: null, competenceProblems: [], checkLetters: null, checkPasses: null, result: null,
+    requests: 0, redraft: null, competence: null, competenceProblems: [], checkLetters: null, checkPasses: null,
+    questionsNotNeeded: 0, reusedQuestionIds: {}, similarQuestionIds: {}, result: null,
   };
   const stop = (code: string): CompetenceRuleRunSummary => {
     summary.refusedOffline = code;
@@ -207,7 +273,12 @@ export async function runCompetenceRule(snapshot: GuidanceSnapshotContent, versi
   const stored = (version.criteria ?? []).find((c) => c.criterionId === ruleId);
   if (!stored) return stop("rule_not_in_version");
   if (stored.source.contentHash !== snapshot.contentHash || stored.source.sourceId !== snapshot.sourceId) return stop("rule_cites_another_snapshot");
-  if (!version.authorityId) return stop("not_a_shared_rulebook");
+  // A competence block belongs on a SHARED (bloc or treaty) rulebook only. `authorityId` is on every
+  // rulebook (a country's too), so it cannot tell; the rulebook KEY can: its authority part is a
+  // group id for a shared rulebook and a country code for a country's own (the same reading the
+  // structural validator uses, rubric-validate.ts). Refused here, before any spend.
+  const keyParts = splitRulebookKey(version.routeKey);
+  if (!keyParts.ok || keyParts.authorityIdKind !== "group") return stop("not_a_shared_rulebook");
   if (version.competence) return stop("version_already_has_a_competence_block");
 
   // ---- 0b. the quote, and its list lines read from the snapshot by code ----
@@ -297,17 +368,26 @@ export async function runCompetenceRule(snapshot: GuidanceSnapshotContent, versi
       return done();
     }
     block = outcome.competence;
-    // Only the questions the block (or a question it shows) needs; nothing else is added to the version.
-    added = outcome.intakeQuestions;
-    summary.competence = `${block.steps.length} step(s), ${added.length} question(s)`;
+    // `outcome.intakeQuestions` is EVERY question the call drafted for the passage. Only the ones
+    // the block reads (and the ones their conditions read) are kept; the rest are counted, not added.
+    added = questionsTheBlockNeeds(outcome.intakeQuestions, block);
+    summary.questionsNotNeeded = outcome.intakeQuestions.length - added.length;
+    summary.competence = `${block.steps.length} step(s), ${added.length} question(s) the block reads, ${summary.questionsNotNeeded} other question(s) not added`;
   } catch (e) {
     summary.competence = `failed:${(e as Error).constructor.name}`;
     return done();
   }
+  // A question the version already asks is re-used, never added a second time (see `placeQuestions`).
   const placed = placeQuestions(version.intakeQuestions ?? [], added, block);
+  summary.reusedQuestionIds = placed.reused;
+  summary.similarQuestionIds = placed.similar;
+  if (Object.keys(placed.reused).length + Object.keys(placed.similar).length > 0) {
+    opts.print(`  questions: ${Object.keys(placed.reused).length} re-used from the version (not added again); ${Object.keys(placed.similar).length} added with the same wording as a version question of another answer type (read them in the result file).`);
+  }
   // The rule reads the block's questions (as drafting links them), so neither is removed as unjustified.
   const linked: AssessmentCriterion = { ...replacement, intakeQuestionIds: [...new Set([...(replacement.intakeQuestionIds ?? []), ...placed.competence.steps.map((s) => s.questionId)])] };
   const candidate = { criteria: (version.criteria ?? []).map((c) => (c.criterionId === ruleId ? linked : c)), intakeQuestions: placed.intakeQuestions, competence: placed.competence };
+  // `sharedRulebook: true` is what step 0a established from the rulebook key (never assumed).
   summary.competenceProblems = competenceProblems(candidate, { sharedRulebook: true }).map((p) => p.code);
   if (summary.competenceProblems.length > 0) {
     summary.competence += `; refused on the version: ${[...new Set(summary.competenceProblems)].join(",")}`;
@@ -348,27 +428,57 @@ const arg = (name: string): string | undefined => {
 /** Print one report line (ids, roles, counts, sizes, code words and letters only; see the header). */
 const printLine = (line: string): void => console.log(line);
 
-/** The command line: read the files, build the real provider only for `--live`, write the result only with `--out`. */
+/**
+ * Why the `--out` file cannot be used, or null when it can. Tested BEFORE any request is sent:
+ *  - `out_required`: a live run without `--out` would spend and keep nothing;
+ *  - `out_exists`: the file is already there (an earlier result is never overwritten);
+ *  - `out_not_writable`: the file cannot be created (no such folder, no permission).
+ * The test creates the file (exclusively) and removes it again, so a usable path is left as it was.
+ */
+export function outFileProblem(out: string | undefined): "out_required" | "out_exists" | "out_not_writable" | null {
+  if (!out) return "out_required";
+  try {
+    // "wx": create for writing, fail if it exists. Proves both "not there yet" and "can be written".
+    closeSync(openSync(out, "wx"));
+    unlinkSync(out);
+    return null;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EEXIST" ? "out_exists" : "out_not_writable";
+  }
+}
+
+/** The command line: read the files, build the real provider only for `--live`, write the outcome to `--out`. */
 async function main(): Promise<void> {
   const pagePath = arg("page");
   const versionPath = arg("version");
   const ruleId = arg("rule");
   if (!pagePath || !versionPath || !ruleId) {
-    console.error("usage: --page <stored-page.json> --version <version.json> --rule <criterionId> [--verdicts <letters>] [--route <name>] [--live [--out <result.json>]]");
+    console.error("usage: --page <stored-page.json> --version <version.json> --rule <criterionId> [--verdicts <letters>] [--route <name>] [--live --out <result.json>]");
     process.exit(2);
+  }
+  const live = process.argv.includes("--live");
+  const out = arg("out");
+  // BEFORE anything that could spend: a live run needs a result file it can certainly write.
+  if (live) {
+    const problem = outFileProblem(out);
+    if (problem) {
+      console.error(`redraft-competence-rule: refused before any spend (${problem}). A live run needs --out <a new file in a writable folder>.`);
+      process.exit(2);
+    }
   }
   // The service modules resolve a storage bucket when loaded, though this script never touches
   // storage or Firestore. A PLACEHOLDER project id (never a real one) lets them load.
   process.env.GCLOUD_PROJECT ??= "one-rule-offline";
   const snapshot = fromFirestoreRest(JSON.parse(readFileSync(pagePath, "utf8"))) as GuidanceSnapshotContent;
   const version = fromFirestoreRest(JSON.parse(readFileSync(versionPath, "utf8"))) as VisaRubric;
-  const live = process.argv.includes("--live");
   const provider = live ? new (await import("../../../services/ai/llm-provider")).AnthropicLlmProvider() : undefined;
   const summary = await runCompetenceRule(snapshot, version, ruleId, { live, routeName: arg("route"), verdicts: arg("verdicts"), print: printLine, provider });
-  const out = arg("out");
-  if (live && out && summary.result) {
-    writeFileSync(out, JSON.stringify({ ruleId, requests: summary.requests, checkLetters: summary.checkLetters, checkPasses: summary.checkPasses, ...summary.result }, null, 2));
-    console.log("result written to the --out file (nothing was written to any project).");
+  if (live && out) {
+    // Written whatever the outcome, so the requests spent and the reason are on file even when
+    // nothing can be kept (`result` is then null). "wx" again: never over another file.
+    const { result, planned, ...outcome } = summary;
+    writeFileSync(out, JSON.stringify({ ruleId, planned: planned.length, ...outcome, ...(result ?? { rule: null, intakeQuestions: [], competence: null, renamedQuestionIds: {} }) }, null, 2), { flag: "wx" });
+    console.log(`outcome written to the --out file (${result ? "a result to review" : "no result kept"}; nothing was written to any project).`);
   }
 }
 

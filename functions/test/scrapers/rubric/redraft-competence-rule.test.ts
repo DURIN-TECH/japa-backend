@@ -21,9 +21,11 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fromFirestoreRest, placeQuestions, runCompetenceRule } from "../../../src/scrapers/rubric/scripts/redraft-competence-rule";
+import { spawnSync } from "node:child_process";
+import { fromFirestoreRest, outFileProblem, placeQuestions, questionsTheBlockNeeds, runCompetenceRule } from "../../../src/scrapers/rubric/scripts/redraft-competence-rule";
 import { RUBRIC_INTAKE_SYSTEM_PROMPT } from "../../../src/scrapers/rubric/rubric-prompt";
 import { competenceProblems } from "../../../src/scrapers/rubric/rubric-competence";
 import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
@@ -127,7 +129,13 @@ describe("offline (the default): nothing is sent, the plan is printed", () => {
     assert.equal((await runCompetenceRule(PAGE, version(), "crit_missing", { live: false, ...quiet })).refusedOffline, "rule_not_in_version");
     const elsewhere = version({ criteria: [{ ...STORED, source: { ...STORED.source, contentHash: "f".repeat(64) } }] as any });
     assert.equal((await runCompetenceRule(PAGE, elsewhere, ID, { live: false, ...quiet })).refusedOffline, "rule_cites_another_snapshot");
-    assert.equal((await runCompetenceRule(PAGE, version({ authorityId: undefined } as any), ID, { live: false, ...quiet })).refusedOffline, "not_a_shared_rulebook");
+    // (#335 fix round 1) Shared or a country's own is read from the rulebook KEY (a group id or a country code),
+    // the way the structural validator reads it. `authorityId` is on every rulebook, so it cannot tell:
+    // a country's rulebook that carries one is still refused, and so is a key that cannot be read.
+    assert.equal((await runCompetenceRule(PAGE, version({ routeKey: "QM_route-one", authorityId: "QM" } as any), ID, { live: false, ...quiet })).refusedOffline, "not_a_shared_rulebook");
+    assert.equal((await runCompetenceRule(PAGE, version({ routeKey: undefined } as any), ID, { live: false, ...quiet })).refusedOffline, "not_a_shared_rulebook");
+    // The shared rulebook is accepted whatever its `authorityId` field holds.
+    assert.equal((await runCompetenceRule(PAGE, version({ authorityId: undefined } as any), ID, { live: false, ...quiet })).refusedOffline, null);
     assert.equal((await runCompetenceRule(PAGE, version({ competence: { steps: [] } } as any), ID, { live: false, ...quiet })).refusedOffline, "version_already_has_a_competence_block");
   });
 
@@ -209,5 +217,80 @@ describe("placeQuestions", () => {
     assert.deepEqual(r.intakeQuestions.slice(0, 2), existing);
     assert.equal(r.intakeQuestions[3].showWhen?.anyOf[0].questionId, "destinations__c2");
     assert.equal(r.competence.steps[0].when?.[0].questionId, "destinations__c2");
+  });
+});
+
+// ============================================
+// Fix round 1 (#335): only the block's questions, no copy of a version question, the result file before any spend
+// ============================================
+
+describe("questionsTheBlockNeeds / placeQuestions: nothing but the block's questions is added", () => {
+  const q = (id: string, over: Partial<IntakeQuestion> = {}): IntakeQuestion => ({ id, label: `Question ${id}`, answerType: "single_choice", required: true, criterionIds: [ID], optionsFrom: "route_destinations", ...over }) as IntakeQuestion;
+  const step = (questionId: string, when?: { questionId: string; op: "eq"; value: string }[]) => ({ criterionId: ID, questionId, resultFrom: "answer" as const, restsOn: "w", source: STORED.source, ...(when ? { when } : {}) });
+
+  test("keeps the questions the steps read, their conditions' questions and those questions' show conditions; drops the rest", () => {
+    const returned = [q("visit"), q("gate"), q("main", { showWhen: { anyOf: [{ questionId: "gate", op: "eq", value: "yes" }] } }), q("passport-scan", { answerType: "text", optionsFrom: undefined }), q("deep")];
+    const block = { steps: [step("visit"), step("main", [{ questionId: "deep", op: "eq", value: "x" }])] };
+    assert.deepEqual(questionsTheBlockNeeds(returned, block).map((x) => x.id), ["visit", "gate", "main", "deep"]);
+  });
+
+  test("a question the version already asks (same wording, type and options source) is re-used, not added again", () => {
+    const existing = [q("where", { label: "Which countries on this route will you visit?", answerType: "multi_choice" })];
+    const added = [q("destinations", { label: "which countries on this route  will you visit?", answerType: "multi_choice" }), q("main", { showWhen: { anyOf: [{ questionId: "destinations", op: "eq", value: "x" }] } })];
+    const r = placeQuestions(existing, added, { steps: [step("destinations"), step("main", [{ questionId: "destinations", op: "eq", value: "x" }])] });
+    assert.deepEqual(r.reused, { destinations: "where" });
+    // One question added (main), none copied; every reference points at the version's own question.
+    assert.deepEqual(r.intakeQuestions.map((x) => x.id), ["where", "main"]);
+    assert.equal(r.intakeQuestions[1].showWhen?.anyOf[0].questionId, "where");
+    assert.deepEqual(r.competence.steps.map((s) => s.questionId), ["where", "main"]);
+    assert.equal(r.competence.steps[1].when?.[0].questionId, "where");
+  });
+
+  test("the same wording with another answer type cannot feed a step: it is added, and reported as similar", () => {
+    const existing = [q("destinations", { label: "Which countries will you visit?", answerType: "text", optionsFrom: undefined })];
+    const added = [q("destinations", { label: "Which countries will you visit?", answerType: "multi_choice" })];
+    const r = placeQuestions(existing, added, { steps: [step("destinations")] });
+    assert.deepEqual(r.reused, {});
+    assert.deepEqual(r.renamed, { destinations: "destinations__c" });
+    assert.deepEqual(r.similar, { destinations__c: "destinations" });
+    assert.deepEqual(r.intakeQuestions.map((x) => x.id), ["destinations", "destinations__c"]);
+  });
+});
+
+describe("the --out file is settled before any spend", () => {
+  const dir = mkdtempSync(join(tmpdir(), "one-rule-out-"));
+
+  test("a live run without --out is refused", () => {
+    assert.equal(outFileProblem(undefined), "out_required");
+    assert.equal(outFileProblem(""), "out_required");
+  });
+
+  test("a file that already exists is never overwritten", () => {
+    const there = join(dir, "earlier-result.json");
+    writeFileSync(there, "{\"kept\":true}");
+    assert.equal(outFileProblem(there), "out_exists");
+    assert.equal(readFileSync(there, "utf8"), "{\"kept\":true}");
+  });
+
+  test("a path that cannot be written is refused", () => {
+    assert.equal(outFileProblem(join(dir, "no-such-folder", "result.json")), "out_not_writable");
+  });
+
+  test("a new file in a writable folder is accepted, and the test leaves nothing behind", () => {
+    const fresh = join(dir, "result.json");
+    assert.equal(outFileProblem(fresh), null);
+    assert.equal(existsSync(fresh), false);
+  });
+
+  test("the command line refuses --live without --out before reading anything (exit 2, no request possible)", () => {
+    // The built-in provider is only constructed after this check, so nothing can be sent; the page and
+    // version paths do not even exist. `tsx` runs the script source directly.
+    const script = join(__dirname, "..", "..", "..", "src", "scrapers", "rubric", "scripts", "redraft-competence-rule.ts");
+    const run = spawnSync(process.execPath, ["--import", "tsx", script, "--page", join(dir, "none.json"), "--version", join(dir, "none.json"), "--rule", ID, "--live"], { encoding: "utf8", env: { ...process.env, ANTHROPIC_API_KEY: "" } });
+    assert.equal(run.status, 2);
+    assert.match(run.stderr, /refused before any spend \(out_required\)/);
+    const taken = spawnSync(process.execPath, ["--import", "tsx", script, "--page", join(dir, "none.json"), "--version", join(dir, "none.json"), "--rule", ID, "--live", "--out", join(dir, "earlier-result.json")], { encoding: "utf8", env: { ...process.env, ANTHROPIC_API_KEY: "" } });
+    assert.equal(taken.status, 2);
+    assert.match(taken.stderr, /refused before any spend \(out_exists\)/);
   });
 });
