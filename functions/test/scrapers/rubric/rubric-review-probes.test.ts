@@ -570,7 +570,10 @@ describe("prompt version pin", () => {
     // v12 (#235): the intake call may draft competence steps and destination questions (`optionsFrom`).
     "2026-11-rubric-v12": "71aae5b23c5e0671f8d95841c65e4ccce8707cab634e01cb7044af6fe60fbbec",
     // v13 (#335): a competence step's `restsOn` may be copied from one of a rule's `listItems`.
-    "2026-11-rubric-v13": "9356da7c858e3a4d5b6975da14addd177ce0b2562219330f33aac06b3bf17534",
+    // Re-pinned in fix round 1 of #335 (the step words must be whole words, 8+ characters, in ONE
+    // line only). Same version on purpose: v13 exists only on the unmerged #335 branch and was never
+    // sent to a model or deployed, so no stored draft carries the earlier v13 text.
+    "2026-11-rubric-v13": "79f00adaedc57487229ac207bfea592129a81a35f824ea846aec6ce2c7a04144",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {
