@@ -124,12 +124,61 @@ export function deriveProposedActions(
     ...content.credibilityFlags.map((f) => ({ criterionId: f.criterionId, origin: "credibility_flag" as const, whatWouldHelp: f.whatWouldHelp ?? "" })),
     // (#207) A rule that could not be told to apply is waiting on an intake
     // answer, not on a document: no evidence action is proposed for it.
-    ...content.insufficientInformation.filter((i) => !i.notAssessed).map((i) => ({ criterionId: i.criterionId, origin: "insufficient_information" as const, whatWouldHelp: "" })),
+    // (#308) The same filter drops a rule marked `not_in_documents` (its field
+    // is in no document and the rulebook names no document item for it): there
+    // is no document to ask for, so NO action of any kind is proposed. Only an
+    // unmarked item (a document that could not be read, a judgement check that
+    // could not be completed) reaches the list below.
+    // (#308) An item about an unread UPLOAD (`documentId`) cites no rule: it is
+    // handled on its own below, not through the criterion lookup.
+    ...content.insufficientInformation.filter((i) => !i.notAssessed && !i.documentId).map((i) => ({ criterionId: i.criterionId, origin: "insufficient_information" as const, whatWouldHelp: "" })),
   ];
 
   const actions: DerivedActions["actions"] = [];
   const seen = new Set<string>();
   let droppedCount = 0;
+
+  // ---- (#308) one action per upload that could not be read ----
+  // The single exception to rule 2 (every action cites a rubric criterion):
+  // what is missing here is a readable copy of a document the applicant already
+  // uploaded, whatever the rules say. Client-owned and BLOCKING, like every
+  // other "a document is what is missing" action, so accepting it makes a
+  // document request for the clearer copy. Code-written text plus the upload's
+  // label; the wording rules still apply.
+  for (const i of content.insufficientInformation) {
+    if (!i.documentId || i.notAssessed) continue;
+    const origin = "insufficient_information" as const;
+    const id = actionIdFor(assessment.id, i.criterionId, origin);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const title = clip(`Clearer copy of: ${i.title}`, MAX_TITLE);
+    const evidenceNeeded = clip(i.reason, MAX_EVIDENCE);
+    if (breaksWordingRules(title) || breaksWordingRules(evidenceNeeded)) {
+      droppedCount++;
+      continue;
+    }
+    actions.push({
+      id,
+      assessmentId: assessment.id,
+      applicationId: assessment.applicationId,
+      userId: assessment.userId,
+      agencyId: assessment.agencyId ?? null,
+      title,
+      ownerRole: "client",
+      blocking: true,
+      criterionId: i.criterionId,
+      evidenceNeeded,
+      estEffort: "quick",
+      status: "proposed",
+      origin,
+      acceptedBy: null,
+      acceptedAt: null,
+      rejectedBy: null,
+      rejectedAt: null,
+      rejectReason: null,
+      documentRequestId: null,
+    });
+  }
 
   for (const f of findings) {
     // Rule 2: the cited criterion must exist in the rubric version used.
@@ -143,7 +192,8 @@ export function deriveProposedActions(
     seen.add(id);
 
     // Evidence items of the rubric that name this criterion (applicant's first).
-    const items = rubric.evidenceItems
+    // (`?? []`: a rulebook stored before document items existed has no such field.)
+    const items = (rubric.evidenceItems ?? [])
       .filter((e) => e.criterionIds.includes(f.criterionId))
       .sort((a, b) => Number(b.party === "applicant") - Number(a.party === "applicant"));
 

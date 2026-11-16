@@ -83,6 +83,12 @@ export interface ObjectiveResult {
   criterionId: string;
   outcome: "pass" | "fail" | "insufficient";
   reason: string;
+  // (#308) Only ever set with `outcome: "insufficient"`: the checked field is
+  // in no document AND the rulebook names no document item for the rule, so
+  // nothing the applicant uploads could settle it. `assembleContent` copies it
+  // onto the stored item (`InsufficientItem.notAssessed`), which keeps the rule
+  // out of the top issues, the proposed actions, the band and the confidence.
+  notAssessed?: "not_in_documents";
 }
 
 /** Model output for stage 3, after shape and code validation. */
@@ -112,7 +118,10 @@ export interface AssessmentContent {
   score: number | null;
   readiness: ReadinessBand;
   confidence: "high" | "medium" | "low";
-  internalCall: "would_approve" | "would_refuse";
+  // (#308) Null when nothing refuses and the objective checks could not be
+  // made (the rulebook names no document for them, an upload is unread, or a
+  // field could not be read): code has no basis for a call, so it makes none.
+  internalCall: "would_approve" | "would_refuse" | null;
   // A mandatory bar applies (code-decided). Served to the free tier as a boolean.
   hasBlockingRule: boolean;
   droppedCount: number;
@@ -459,30 +468,92 @@ function lookup(
 }
 
 /**
+ * (#308) The titles of the rulebook's document items that name each rule
+ * (`evidenceItems[].criterionIds`), by criterion id. An applicant's own
+ * documents come first (the same order the proposed action uses for its
+ * title), then rulebook order; a title is listed once. A rule that is not a
+ * key of this map has NO document item: the rulebook never asks anyone for a
+ * document that would show it. A rubric with no `evidenceItems` (older
+ * versions) gives an empty map.
+ */
+function documentItemTitlesByCriterion(rubric: Partial<Pick<VisaRubric, "evidenceItems">>): Map<string, string[]> {
+  const items = [...(rubric.evidenceItems ?? [])]
+    // Stable sort: applicant items first, rulebook order kept inside each party.
+    .sort((a, b) => Number(b.party === "applicant") - Number(a.party === "applicant"));
+  const byCriterion = new Map<string, string[]>();
+  for (const item of items) {
+    for (const id of item.criterionIds ?? []) {
+      const titles = byCriterion.get(id) ?? [];
+      if (!titles.includes(item.title)) titles.push(item.title);
+      byCriterion.set(id, titles);
+    }
+  }
+  return byCriterion;
+}
+
+/** (#308) The stored reason of a rule that no document item names and no document mentions. */
+export const NOT_CHECKABLE_REASON = "not checked: the guidance names no document that would show this";
+
+/**
  * Evaluate every objective criterion's `check` in code.
  *
  * Outcome rules, in order:
  *  - the fact is present and comparable: pass or fail by the operator;
- *  - the fact is absent and every document was read cleanly: fail;
+ *  - (#308) the fact is absent and the rulebook names NO document item for the
+ *    rule (`evidenceItems[].criterionIds`): insufficient, marked
+ *    `notAssessed: "not_in_documents"`, whatever state the documents are in.
+ *    WHY: "it is not in your documents" is only a fair failure when the
+ *    rulebook asked for a document that would contain it. Rules about an
+ *    exclusion order, a paid fee or biometrics name no document, so before
+ *    #308 EVERY applicant who uploaded readable documents failed all of them
+ *    (35 refusal grounds on one ordinary applicant). Such a rule is recorded as not
+ *    checkable from documents, for staff; it is never a refusal ground;
+ *  - the fact is absent, a document item names the rule, and every document
+ *    was read cleanly: fail, and the reason names the document item(s) by
+ *    title, in plain words (never the raw field id);
  *  - the fact is absent and at least one document was unreadable, failed or
  *    suspicious, or there are no documents at all: insufficient (never a fail);
+ *  - a document listed the field but its value could not be read: insufficient
+ *    (unchanged, with or without a document item: the applicant can re-upload);
  *  - the value is not a number where a number is needed, the unit differs from
  *    the criterion's unit, or the unit cannot be converted: insufficient (a
  *    balance in a currency with no stated conversion is not a fail).
+ *
+ * A value that WAS read and fails its comparison is a fail exactly as before:
+ * only the "field missing" path depends on the document items.
+ *
+ * @param rubric the criteria to check, and (#308) the rulebook's document
+ *   items. `evidenceItems` is optional so a criteria-only caller still
+ *   compiles; absent or empty, no missing field can fail.
  */
 export function evaluateObjective(
-  rubric: Pick<VisaRubric, "criteria">,
+  rubric: Pick<VisaRubric, "criteria"> & Partial<Pick<VisaRubric, "evidenceItems">>,
   facts: Facts,
   docs: readonly DocumentExtraction[]
 ): ObjectiveResult[] {
   const complete = docs.length > 0 && docs.every((d) => d.readable && !d.failed && !d.suspicious);
+  // (#308) Which rules the rulebook asks a document for, and that document's title.
+  const itemTitles = documentItemTitlesByCriterion(rubric);
   return rubric.criteria
     .filter((c) => c.kind === "objective" && c.check)
     .map((c) => {
       const check = c.check!;
       const got = lookup(check.field, facts, docs);
       if (!got.found) {
-        if (complete && !got.unreadable) return { criterionId: c.criterionId, outcome: "fail" as const, reason: `${check.field} is not in the documents` };
+        // The field was listed by a document (or given as a fact) with no
+        // readable value: something was there, so this stays "could not be
+        // read" (the applicant can act on it), as before #308.
+        if (got.unreadable) return { criterionId: c.criterionId, outcome: "insufficient" as const, reason: `${check.field} could not be read` };
+        const titles = itemTitles.get(c.criterionId);
+        // (#308) No document item names this rule: not checkable from
+        // documents. Decided before `complete`, so an unreadable upload does
+        // not turn these rules into evidence requests either.
+        if (!titles || titles.length === 0) {
+          return { criterionId: c.criterionId, outcome: "insufficient" as const, reason: NOT_CHECKABLE_REASON, notAssessed: "not_in_documents" as const };
+        }
+        // A document item names the rule and every upload was read cleanly:
+        // the document the rulebook asks for is missing. A refusal ground.
+        if (complete) return { criterionId: c.criterionId, outcome: "fail" as const, reason: `We couldn't find this in your documents: ${titles.join("; ")}` };
         return { criterionId: c.criterionId, outcome: "insufficient" as const, reason: `${check.field} could not be read` };
       }
       return compareCheck(c.criterionId, check, got);
@@ -944,6 +1015,79 @@ export function parseJudgement(
 }
 
 // ============================================
+// Uploads that were not read (#308)
+// ============================================
+
+/**
+ * The `failure` text the job gives a document it did NOT send to a model
+ * because the rulebook has no document field to read at all. Such an upload is
+ * not "unreadable" (nobody tried to read it), so it is never reported to the
+ * applicant as one. The job uses this constant; the bulk path writes the same
+ * text (services/ai-bulk-reassessment.service.ts), so keep the two equal.
+ */
+export const NO_FIELD_TO_READ = "no field to read";
+
+/** Prefix of the id an unread-upload item carries in place of a rule id. */
+const UNREAD_DOCUMENT_ID_PREFIX = "document:";
+
+/**
+ * The `failure` text the job gives a file over the size limit (it is never
+ * sent to a model). The bulk path writes the same text, so keep the two equal.
+ */
+export const FILE_TOO_LARGE = "file is larger than the limit";
+
+/** What the applicant is told about an upload that could not be read. Fixed text, never model text. */
+export const UNREAD_DOCUMENT_REASON = "We couldn't read this upload, so nothing in it was checked. Upload a clearer copy.";
+
+/** The same for an upload whose content cannot be relied on (it addressed the reader instead of stating facts). */
+export const UNUSABLE_DOCUMENT_REASON = "We couldn't use this upload, so nothing in it was checked. Upload a clean copy of the original document.";
+
+/** The same for a file over the size limit: a clearer copy would not help, a smaller file does. */
+export const TOO_LARGE_DOCUMENT_REASON = "This file is too large for us to read, so nothing in it was checked. Upload a smaller file.";
+
+/** Longest document label copied into an item title. */
+const MAX_DOCUMENT_LABEL = 80;
+
+/**
+ * (#308) The uploads whose content reached NO check: unreadable (too large,
+ * unsupported, password protected, not readable), failed (the reading broke
+ * its contract or the call failed) or flagged suspicious. An upload that was
+ * simply not sent because the rulebook reads no document field is left out.
+ */
+export function unreadDocumentsOf(documents: readonly DocumentExtraction[]): DocumentExtraction[] {
+  return documents.filter((d) => (!d.readable || d.failed || d.suspicious) && d.failure !== NO_FIELD_TO_READ);
+}
+
+/**
+ * (#308) One applicant-facing item per unread upload, independent of any rule.
+ * WHY: before #308 an applicant heard about an unreadable upload only through
+ * rules going "could not be read". Rules no document item names no longer do
+ * that, so without this item an unreadable upload could go unmentioned.
+ *
+ *  - `criterionId` is `document:<documentId>` (no rule is involved; the id is
+ *    unique per upload, so two unread uploads never share a key);
+ *  - `title` is what the applicant recognises the upload by: the name the
+ *    caller gives for it in `names` (checklist item, display name or file
+ *    name), else the upload's code label, else "document";
+ *  - `documentId` marks the item as being about an upload, not a rule;
+ *  - NO `notAssessed` marker: the applicant CAN act on it (upload again), so it
+ *    is listed, gets one proposed action, and counts against the band and the
+ *    confidence like any other open item.
+ *
+ * @param names applicant-facing name per document id. Kept apart from
+ *   `DocumentExtraction.label`, which is a code label sent to the model and
+ *   must never be the name the applicant typed.
+ */
+export function unreadDocumentItems(documents: readonly DocumentExtraction[], names: Readonly<Record<string, string>> = {}): InsufficientItem[] {
+  return unreadDocumentsOf(documents).map((d) => ({
+    criterionId: `${UNREAD_DOCUMENT_ID_PREFIX}${d.documentId}`,
+    title: ((names[d.documentId] ?? "").trim() || d.label || "document").slice(0, MAX_DOCUMENT_LABEL),
+    reason: d.suspicious ? UNUSABLE_DOCUMENT_REASON : d.failure === FILE_TOO_LARGE ? TOO_LARGE_DOCUMENT_REASON : UNREAD_DOCUMENT_REASON,
+    documentId: d.documentId,
+  }));
+}
+
+// ============================================
 // Assembly: containment and citations (code only)
 // ============================================
 
@@ -954,7 +1098,9 @@ export function criterionById(rubric: Pick<VisaRubric, "criteria">, id: string):
 
 /** Inputs to the assembly step. Everything here is code output or rubric data. */
 export interface AssembleInput {
-  rubric: Pick<VisaRubric, "criteria" | "intentPolarity" | "severityLevels">;
+  // (#308) `evidenceItems` (optional) tells assembly whether the rulebook names
+  // a document for ANY objective rule; absent is read as "names none".
+  rubric: Pick<VisaRubric, "criteria" | "intentPolarity" | "severityLevels"> & Partial<Pick<VisaRubric, "evidenceItems">>;
   mandatoryHits: AssessmentCriterion[];
   objective: ObjectiveResult[];
   judgement: JudgementOutput | null;
@@ -976,6 +1122,11 @@ export interface AssembleInput {
   // trigger). They are in the rubric, so they are reported here as "could not
   // be assessed", not as a failure and not as a pass.
   notAssessed?: InsufficientItem[];
+  // (#308) Applicant-facing name of each upload, by document id (the checklist
+  // item it was uploaded to, its display name or its file name). Used only as
+  // the title of a "we couldn't read this upload" item. Optional: without it
+  // the upload's code label is used.
+  documentNames?: Record<string, string>;
 }
 
 /**
@@ -1028,6 +1179,11 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   const unanchoredCount = input.judgement?.unanchored ?? 0;
   const statementRef = input.statement ?? null;
 
+  // (#308) An upload that could not be read is always said, first in the list,
+  // whether or not any rule names the document.
+  const unreadItems = unreadDocumentItems(input.documents, input.documentNames);
+  insufficient.push(...unreadItems);
+
   const seenRefusal = new Set<string>();
   for (const c of input.mandatoryHits) {
     if (seenRefusal.has(c.criterionId)) continue;
@@ -1045,7 +1201,9 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
       seenRefusal.add(c.criterionId);
       refusalGrounds.push(groundFrom(c, r.reason, "Provide evidence that meets this requirement."));
     } else if (r.outcome === "insufficient") {
-      insufficient.push({ criterionId: c.criterionId, title: c.title, reason: r.reason, ...layerOf(c) });
+      // (#308) A rule that is not checkable from documents keeps its marker,
+      // so it is stored for staff but never treated as something to fix.
+      insufficient.push({ criterionId: c.criterionId, title: c.title, reason: r.reason, ...(r.notAssessed ? { notAssessed: r.notAssessed } : {}), ...layerOf(c) });
     }
   }
 
@@ -1156,11 +1314,41 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     }
   }
 
-  const objectiveFail = input.objective.some((r) => r.outcome === "fail");
+  // (#308) The objective stage is read from the checks code could actually
+  // make. A rule marked "not in documents" was not checked at all (like a rule
+  // split out as "could not tell whether it applies", which never reaches
+  // `input.objective`), so it neither makes the stage "insufficient" nor
+  // counts as a check that came out clear.
+  const objectiveChecked = input.objective.filter((r) => !r.notAssessed);
+  const objectiveFail = objectiveChecked.some((r) => r.outcome === "fail");
+  const objectiveFromChecks: StageOutcomes["objective"] =
+    objectiveFail ? "fail" : objectiveChecked.some((r) => r.outcome === "insufficient") ? "insufficient" : objectiveChecked.length > 0 ? "clear" : "not_applicable";
+  // (#308) While any upload is unread the stage cannot read "clear" (nor
+  // "nothing to check"): what that upload holds was never compared.
+  const objectiveOutcome: StageOutcomes["objective"] =
+    unreadItems.length > 0 && (objectiveFromChecks === "clear" || objectiveFromChecks === "not_applicable") ? "insufficient" : objectiveFromChecks;
+  // (#308) THE DOCUMENTS ARE UNGUARDED: at least one objective rule came out
+  // "not in documents", and the rulebook names a document for NONE of the
+  // objective rules this applicant is assessed on (an older rulebook with no
+  // document items at all, or one whose items name only other rules). On such
+  // a rulebook code can never say "a document you were asked for is missing":
+  // every missing field, core ones included, is only ever marked. One field
+  // that happens to be read and pass says nothing about the rest, so the
+  // result must not read better than what was checked: see the three caps
+  // below. (This also covers "not one rule could be checked".)
+  //
+  // Why this boundary and not "any marked rule": on a rulebook that DOES name
+  // documents for its objective rules, the named rules guard the documents it
+  // asks for (a missing one is a refusal ground) and the marked ones are side
+  // rules nobody can evidence; capping there would hold back every applicant,
+  // however complete. A fully checked application (no marked rule) is never
+  // capped on any rulebook.
+  const namedByAnItem = new Set((rubric.evidenceItems ?? []).flatMap((e) => e.criterionIds ?? []));
+  const anyObjectiveRuleNamed = rubric.criteria.some((c) => c.kind === "objective" && c.check && namedByAnItem.has(c.criterionId));
+  const documentsUnguarded = !anyObjectiveRuleNamed && input.objective.some((r) => r.notAssessed === "not_in_documents");
   const stageOutcomes: StageOutcomes = {
     mandatoryBar: input.mandatoryHits.length > 0 ? "hit" : rubric.criteria.some((c) => c.kind === "mandatory_bar") ? "clear" : "not_applicable",
-    objective:
-      objectiveFail ? "fail" : input.objective.some((r) => r.outcome === "insufficient") ? "insufficient" : input.objective.length > 0 ? "clear" : "not_applicable",
+    objective: objectiveOutcome,
     judgement: judgementOutcome,
     credibility: credibilityFlags.length > 0 ? "at_risk" : "clear",
   };
@@ -1169,8 +1357,13 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
   // is listed, but cannot be resolved by the applicant either, so it does not
   // lower the band or the confidence (else every applicant on a route with
   // unlinked specialist rules would be capped for something nobody can fix).
-  const countable = insufficient.filter((i) => i.notAssessed !== "no_trigger");
-  const readiness = readinessFor({
+  // (#308) The same holds for a rule no document item names
+  // ("not_in_documents"): no upload or answer of the applicant's can settle
+  // it, so it must not cap the band or the confidence either.
+  const countable = insufficient.filter((i) => !isNotActionableMarker(i.notAssessed));
+  // An unread upload's item has no marker, so it is in `countable`: it caps a
+  // "strong" band at "competitive" and keeps the confidence below "high".
+  const bandFromFacts = readinessFor({
     hit: input.mandatoryHits.length > 0,
     refusalCount: refusalGrounds.length,
     score: input.score,
@@ -1178,9 +1371,13 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     flagCount: credibilityFlags.length,
     documentCount: input.documents.length,
   });
+  // (#308) Cap 1: the documents are unguarded, so never "strong".
+  const readiness: ReadinessBand = documentsUnguarded && bandFromFacts === "strong" ? "competitive" : bandFromFacts;
 
-  const confidence: AssessmentContent["confidence"] =
+  const confidenceFromItems: AssessmentContent["confidence"] =
     countable.length === 0 && input.documents.length > 0 ? "high" : countable.length <= 2 ? "medium" : "low";
+  // (#308) Cap 2: the documents are unguarded, so never "high".
+  const confidence: AssessmentContent["confidence"] = documentsUnguarded && confidenceFromItems === "high" ? "medium" : confidenceFromItems;
 
   return {
     stageOutcomes,
@@ -1194,11 +1391,27 @@ export function assembleContent(input: AssembleInput): AssessmentContent {
     score: input.score,
     readiness,
     confidence,
-    internalCall: refusalGrounds.length > 0 ? "would_refuse" : "would_approve",
+    // (#308) Cap 3: "no refusal ground" is a basis for "would approve" only
+    // when the objective checks could be made. No call is made (null, for
+    // staff to see) when the documents are unguarded, and when the objective
+    // stage is "insufficient": an upload is unread, or a checked field could
+    // not be read, so nothing says the applicant passes.
+    internalCall: refusalGrounds.length > 0 ? "would_refuse" : documentsUnguarded || objectiveOutcome === "insufficient" ? null : "would_approve",
     hasBlockingRule: input.mandatoryHits.length > 0,
     droppedCount,
     unanchoredCount,
   };
+}
+
+/**
+ * (#207, #308) True for the two "could not assess" markers the applicant can do
+ * NOTHING about: a specialist rule the guidance did not tie to a question
+ * (`no_trigger`) and a rule no document item names (`not_in_documents`). Items
+ * with either marker are stored, but do not lower the band or the confidence.
+ * (`unanswered` and `missing_fact` items DO count: the applicant can answer.)
+ */
+export function isNotActionableMarker(marker: InsufficientItem["notAssessed"]): boolean {
+  return marker === "no_trigger" || marker === "not_in_documents";
 }
 
 /**
@@ -1243,6 +1456,8 @@ export function topIssuesOf(rubric: Pick<VisaRubric, "criteria" | "severityLevel
     ...content.refusalGrounds.map((g) => g.criterionId),
     ...content.credibilityFlags.map((f) => f.criterionId),
     // (#207) A rule that could not be told to apply is not an "issue" to show.
+    // (#308) Nor is a rule that is not checkable from documents
+    // (`notAssessed: "not_in_documents"`): ANY marker keeps an item out.
     ...content.insufficientInformation.filter((i) => !i.notAssessed).map((i) => i.criterionId),
   ]);
   const ranked = [...candidates]

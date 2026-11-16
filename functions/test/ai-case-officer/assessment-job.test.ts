@@ -152,6 +152,32 @@ describe("code decides, and judgement is contained", () => {
     assert.equal(stored.internalCall, "would_approve");
   });
 
+  test("(#308) the job passes the rulebook's document items through: a missing field fails only a rule a document item names", async () => {
+    // The uploaded document is read cleanly and has the funds and the holder,
+    // but no statement end date and (new rule below) no fee field.
+    //  - `a-period` is named by a document item -> refusal ground, detail names the item;
+    //  - `a-fee` is named by NO document item   -> stored "not_in_documents": not a
+    //    ground, not a top issue, no proposed action.
+    const rubric = routeARubric();
+    const source = rubric.criteria[0].source;
+    rubric.criteria.push({ ...rubric.criteria.find((c) => c.criterionId === "a-period")!, criterionId: "a-fee", title: "Fee paid", severity: "critical", check: { field: "feePaid", op: "eq", value: true } });
+    rubric.evidenceItems = [{ key: "statement", title: "Bank statement", party: "applicant", criterionIds: ["a-period"], source }];
+    book(rubric);
+    seedStandardCase();
+    const provider = scripted({ byKey: { bank: extraction(BANK_VALUES.filter((v) => v.field !== "statement.endDate")) } });
+    const stored = await assessOnce(serviceWith(provider));
+
+    assert.equal(stored.status, "succeeded");
+    assert.deepEqual(stored.refusalGrounds.map((g: any) => [g.criterionId, g.detail]), [["a-period", "We couldn't find this in your documents: Bank statement"]]);
+    assert.deepEqual(stored.insufficientInformation.map((i: any) => [i.criterionId, i.notAssessed]), [["a-fee", "not_in_documents"]]);
+    // `a-fee` is the most severe rule of the route, and still not a top issue.
+    assert.deepEqual(stored.topIssues.map((t: any) => t.criterionId), ["a-period"]);
+    assert.equal(stored.readiness, "not_ready");
+    // Proposed actions written by the job: one, for the real ground.
+    const actions = [...store.entries()].filter(([path]) => path.includes("/proposedActions/")).map(([, value]) => value as any);
+    assert.deepEqual(actions.map((a) => [a.criterionId, a.blocking, a.title]), [["a-period", true, "Bank statement"]]);
+  });
+
   test("the same recorded answers flip the outcome when only the code-side rule value changes", async () => {
     book(routeARubric({ fundsMinimum: 2000 }));
     seedStandardCase();
