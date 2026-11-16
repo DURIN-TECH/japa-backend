@@ -95,7 +95,7 @@ afterEach(() => {
 // ============================================
 
 /** The copy the client gets when their payment was for a slot that moved. */
-const RESCHEDULED_COPY = "Your consultation moved, so we've refunded your payment. Please pay again for the new time.";
+const RESCHEDULED_COPY = "Your consultation moved, so we've refunded your payment in full. Please pay again for the new time.";
 
 /**
  * Seed an UNPAID, priced booking `id` with an OPEN checkout (`refOf(id)`,
@@ -590,6 +590,7 @@ describe("these refunds never touch the agent's balance or revenue", () => {
     const row = transactionService.buildUnappliedPaymentRefund("refund_x", T0, {
       exception: { id: "r", consultationId: "c1", reference: "r", amountMinor: 900_000, currency: "NGN" },
       clientUserId: client.uid,
+      refundAmountMinor: 900_000,
     });
     const completed = { ...row, status: "completed" as const };
     assert.equal(revenueEffect(completed), 0);

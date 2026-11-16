@@ -35,6 +35,8 @@ let restore: () => void = () => undefined;
 
 /** The charge of every booking here: ₦9,000.00 in kobo. */
 const FEE = 900_000;
+/** Paystack's processing fee on that charge (issue #354): ₦150.00 in kobo, as Paystack reports it. */
+const PAYSTACK_FEE = 15_000;
 
 /** A signed-in account with role claims and a user doc. */
 async function principal(name: string, claims: Record<string, unknown>): Promise<void> {
@@ -70,17 +72,26 @@ async function seedPendingPastLock(id: string): Promise<string> {
   reports.set(reference, {
     status: "success", metadata: { purpose: "consultation", consultationId: id },
     amount: FEE, currency: "NGN", paidAt: new Date().toISOString(),
+    // Issue #354: Paystack's own fee for this reference.
+    fees: PAYSTACK_FEE,
   });
   return reference;
 }
 
 /** The stored booking, every refund row and every exception for booking `id`. */
-async function stateOf(id: string): Promise<{ booking: any; refunds: any[]; fees: any[]; exceptions: any[] }> {
+async function stateOf(id: string): Promise<{ booking: any; refunds: any[]; fees: any[]; debits: any[]; exceptions: any[] }> {
   const { collections } = await import("../../src/utils/firebase");
   const booking = (await collections.consultations.doc(id).get()).data();
   const txs = (await collections.transactions.where("consultationId", "==", id).get()).docs.map((d) => d.data());
   const exceptions = (await collections.consultationPaymentExceptions.where("consultationId", "==", id).get()).docs.map((d) => d.data());
-  return { booking, refunds: txs.filter((t) => t.type === "refund"), fees: txs.filter((t) => t.type === "consultation_fee"), exceptions };
+  return {
+    booking,
+    refunds: txs.filter((t) => t.type === "refund"),
+    fees: txs.filter((t) => t.type === "consultation_fee"),
+    // Issue #354: the agent's Paystack-fee debit (agent-caused refunds only).
+    debits: txs.filter((t) => t.type === "paystack_fee_debit"),
+    exceptions,
+  };
 }
 
 before(async () => {
@@ -154,6 +165,16 @@ describe("unapplied payments under concurrent settles (#354)", () => {
     assert.equal(s.refunds[0].agentId, undefined);
     assert.equal(s.exceptions[0].refundId, s.refunds[0].id);
     assert.deepEqual(refundCalls.slice(before), [[reference, FEE, "NGN"]], "one Paystack refund, of exactly what was charged");
+    // Issue #354: agent-caused, so the agent is debited Paystack's fee ONCE.
+    assert.equal(s.debits.length, 1, "one fee debit");
+    assert.equal(s.debits[0].amount, PAYSTACK_FEE);
+    assert.equal(s.debits[0].currency, "NGN");
+    assert.equal(s.debits[0].agentId, accounts.uagent.uid);
+    assert.equal(s.exceptions[0].feeDebitId, s.debits[0].id);
+    // The agent's balance shows it, below zero (no earnings here).
+    const stats = await api.call("GET", "/transactions/stats", tokens.uagent);
+    const ngn = (stats.body.data.byCurrency as any[]).find((r) => r.currency === "NGN");
+    assert.equal(ngn.availableBalance, -PAYSTACK_FEE);
   });
 
   test("a payment after a cancel, settled 4 times at once: one refund row and one Paystack call", async () => {
@@ -168,6 +189,11 @@ describe("unapplied payments under concurrent settles (#354)", () => {
     assert.equal(s.exceptions.length, 1);
     assert.equal(s.exceptions[0].reason, "booking_not_payable");
     assert.equal(s.refunds.length, 1);
+    // Issue #354: client-caused, so Paystack's fee comes out of the refund; no debit.
+    assert.equal(s.refunds[0].amount, FEE - PAYSTACK_FEE);
+    assert.equal(s.refunds[0].paystackFeeKeptMinor, PAYSTACK_FEE);
+    assert.equal(s.debits.length, 0);
     assert.equal(refundCalls.length - before, 1);
+    assert.deepEqual(refundCalls[refundCalls.length - 1], [reference, FEE - PAYSTACK_FEE, "NGN"]);
   });
 });
