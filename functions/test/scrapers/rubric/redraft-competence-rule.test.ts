@@ -199,6 +199,26 @@ describe("live (scripted provider, no network)", () => {
     assert.equal(s.result, null);
   });
 
+  test("(#335 fix round 2) a throw inside the check still ends in a summary (requests were spent), never escapes", async () => {
+    const p = provider();
+    // `RubricCheckerService.check` catches every error itself and returns `ok: false`; the
+    // script's own try around it is defence in depth. Either way the run must end in a
+    // summary that says the check did not pass, never escape to `main` with nothing written.
+    // The throw: naming the model of the check's role (only the check uses `verification`).
+    const modelFor = p.modelFor.bind(p);
+    p.modelFor = (role) => {
+      if (role === "verification") throw new TypeError("unexpected");
+      return modelFor(role);
+    };
+    const s = await runCompetenceRule(PAGE, version(), ID, { live: true, verdicts: "uyayaa", provider: p, ...quiet });
+    assert.equal(s.checkPasses, false);
+    // "none" (the checker swallowed it: no verdict) or "failed:TypeError" (the script's catch).
+    assert.match(String(s.checkLetters), /^(none|failed:TypeError)$/);
+    // The re-draft and the competence call were spent and are still reported.
+    assert.equal(s.redraft, "replacement");
+    assert.ok(s.requests >= 2);
+  });
+
   test("the check not confirming the rule is reported, never bypassed", async () => {
     const p = provider();
     p.policy = () => ({ title_faithful: "unsure" });

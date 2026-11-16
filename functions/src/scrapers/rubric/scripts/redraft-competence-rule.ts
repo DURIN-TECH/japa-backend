@@ -403,7 +403,19 @@ export async function runCompetenceRule(snapshot: GuidanceSnapshotContent, versi
     ledger: { load: async (id) => records.get(id) ?? null, save: async (rec) => void records.set(rec.runId, rec), countRunsOnDay: async () => 0 },
   });
   const runId = `ONE-RULE_${ruleId}__v1`;
-  await checker.check({ routeKey: "ONE-RULE", version: 1, runId, rubric: { routeKey: "ONE-RULE", version: 1, criteria: [linked], intentPolarityProposal: null } as any, codeLeftOutIds: [] });
+  // (#335, fix round 2) Wrapped like steps 1 and 2: a throw here comes AFTER up to
+  // three requests were spent, so it must still end in `done()`, which prints the
+  // summary and lets the caller write the `--out` file, instead of escaping to
+  // `main`'s catch with nothing written. The check counts as not passing.
+  // (`RubricCheckerService.check` already catches its own errors and returns
+  // `ok: false`; this guard is defence in depth against a future change there.)
+  try {
+    await checker.check({ routeKey: "ONE-RULE", version: 1, runId, rubric: { routeKey: "ONE-RULE", version: 1, criteria: [linked], intentPolarityProposal: null } as any, codeLeftOutIds: [] });
+  } catch (e) {
+    summary.checkLetters = `failed:${(e as Error).constructor.name}`;
+    summary.checkPasses = false;
+    return done();
+  }
   const v = records.get(runId)?.ruleVerdicts?.[ruleId] as { verification?: string; judgement?: string } | undefined;
   summary.checkLetters = v ? `${v.verification ?? "none"}${isProtectedRule(linked) ? `/${v.judgement ?? "none"}` : ""}` : "none";
   const rows = isProtectedRule(linked) ? [decodeRow(v?.verification), decodeRow(v?.judgement)] : [decodeRow(v?.verification)];
