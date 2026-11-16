@@ -206,6 +206,33 @@ describe("plan seed: ai.case_officer (#30)", () => {
 });
 
 // ============================================
+// 1b. The seed: ai.review_working (#384) is in NO plan yet
+// ============================================
+//
+// The rule-by-rule working of the AI review is paid-only (so no free plan can
+// get it through FREE_PLAN_FEATURES), and its price and plan placement come
+// later (#385), so no paid plan lists it either. When #385 puts it in a plan,
+// this block changes with it.
+
+describe("plan seed: ai.review_working (#384)", () => {
+  test("ai.review_working is a catalog key and is listed as paid-only", () => {
+    assert.ok((FEATURE_KEYS as readonly string[]).includes("ai.review_working"));
+    assert.equal(FEATURES.AI_REVIEW_WORKING, "ai.review_working");
+    assert.ok(PAID_ONLY_FEATURES.includes(FEATURES.AI_REVIEW_WORKING));
+  });
+
+  test("no free plan holds it (it is not in FREE_PLAN_FEATURES)", () => {
+    assert.equal(FREE_PLAN_FEATURES.includes(FEATURES.AI_REVIEW_WORKING), false);
+    for (const id of FREE_PLAN_IDS) assert.equal(plan(id).features.includes(FEATURES.AI_REVIEW_WORKING), false, id);
+  });
+
+  test("no plan at all holds it yet, paid or yearly (pricing is #385)", () => {
+    const holders = ALL_PLANS.filter((p) => p.features.includes(FEATURES.AI_REVIEW_WORKING)).map((p) => p.id);
+    assert.deepEqual(holders, []);
+  });
+});
+
+// ============================================
 // 2. The gate: requireFeature("ai.case_officer") with seeded plans
 // ============================================
 
