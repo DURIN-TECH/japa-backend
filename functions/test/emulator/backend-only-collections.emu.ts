@@ -30,6 +30,13 @@ import { anonymousDb, clientDb, isDenied, resetEmulators, rulesEnv, withoutRules
 /** Top-level backend-only collections (names from src/utils/firebase.ts). */
 const COLLECTIONS = [
   "riskSignals",
+  // Transactions (issue #329): the stored document holds Seli's exchange-rate
+  // markup (fxMarginBps), the raw rate, internal agent ids and Paystack
+  // references. Before #329 the payer could read their own document directly.
+  // Explicit deny in firestore.rules now: the seed below names the actor as
+  // `userId`, so "my own transaction" is tried and must be refused, for the
+  // client and for an admin alike. Everyone reads through GET /transactions.
+  "transactions",
   // In-app tester feedback (issue #257): user ids, emails and device details.
   // Explicit deny in firestore.rules; backend (Admin SDK) only.
   "feedback",
@@ -47,6 +54,16 @@ const COLLECTIONS = [
   // Payment-request payments held for refund (issue #181): amounts and
   // references. Never read or forged by a client.
   "paymentRequestExceptions",
+  // Withdrawal locks (issue #287): one doc per agent, read and written inside
+  // the withdrawal transaction (POST /bank-accounts/withdraw) so two
+  // withdrawals cannot both pass the balance check. Explicit deny in
+  // firestore.rules; a client that could write one could block payouts.
+  "withdrawalLocks",
+  // Consultation booking locks (issue #288): one doc per client + agent pair,
+  // read and written inside the find-or-create transaction of a client's paid
+  // booking (POST /consultations) so two creates for one slot leave one
+  // booking. Explicit deny in firestore.rules; it names who books whom.
+  "consultationBookingLocks",
   // Agency listing screening results (issue #120): admin-only through the API.
   "listingScreenings",
   "rubricReviewHistory",

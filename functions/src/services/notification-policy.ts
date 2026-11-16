@@ -54,6 +54,9 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   consultation_rescheduled: FULL,
   consultation_cancelled: FULL,
   consultation_completed: FULL,
+  // Issue #317: refunds are money moving back to the client: every channel.
+  consultation_refunded: FULL,
+  consultation_refund_delayed: FULL,
   // Payments
   payment_received: FULL,
   payment_request: FULL,

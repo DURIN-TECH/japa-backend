@@ -377,6 +377,9 @@ describe("signed-in booking: server price, client's own currency, real checkout"
   test("agent-initiated: priced from the agent's OWN record, not the body", async () => {
     await seedClient();
     await seedAgent({ consultationFeeUsd: { amountMinor: 2_000, currency: "USD" } }, "agent1", "uid-agent1");
+    // Issue #246: an agent books only for a client they already work with
+    // (here: an application of the client assigned to this agent).
+    await seed("applications", "app1", { userId: "uid-client1", agentId: "uid-agent1", createdAt: T0 });
     const out = await signedInBook("uid-agent1", { userId: "uid-client1", fee: 1 });
     assert.equal(out.status, 201);
     const b = onlyBooking();

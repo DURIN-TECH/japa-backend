@@ -226,11 +226,202 @@ describe("seedCountriesAndVisas: the sourced fee of a shared route (#299)", () =
     assert.deepEqual(d.inheritsFrom, [{ sharedRouteId: "example-short-stay" }]);
   });
 
+  // ---- #306: an entry that states no processing time and no extension flag ----
+  // Like the real short-stay records #306 adds, but made up: xa-visitor here
+  // has no processingTime / processingDaysMin / processingDaysMax /
+  // isExtendable, and is the ONLY visa of country XA.
+  test("#306: an entry with no processing fields or isExtendable is stored without them, and still gets the route fee", async () => {
+    await writeFx();
+    await writeSource();
+    const { processingTime, processingDaysMin, processingDaysMax, isExtendable, ...bare } = visaBase;
+    void processingTime; void processingDaysMin; void processingDaysMax; void isExtendable;
+    const onlyBare = [
+      { ...bare, id: "xa-visitor", countryCode: "XA" },
+      { ...visaBase, id: "xb-visitor", countryCode: "XB", baseCostUsd: 55 },
+    ];
+    await run({ visaTypes: onlyBare });
+    const d = await visa("XA", "xa-visitor");
+    for (const key of ["processingTime", "processingDaysMin", "processingDaysMax", "isExtendable"]) {
+      assert.equal(key in d, false, `${key} is not stored`);
+    }
+    // The route's fee is written as for any inheriting record.
+    assert.equal(d.baseCostUsd, Math.round(FIXTURE_FEE.amount / SEK_PER_USD));
+    assert.equal(d.sourcedFee.quote, FIXTURE_FEE.quote);
+    assert.deepEqual(d.inheritsFrom, [{ sharedRouteId: "example-short-stay" }]);
+    // The country minimum is a number (0: no visa of XA states one), never NaN.
+    const xa = await country("XA");
+    assert.equal(typeof xa.minProcessingDays, "number");
+    assert.equal(Number.isNaN(xa.minProcessingDays), false);
+    assert.equal(xa.minProcessingDays, 0);
+    // A country whose visas state one keeps the old rule.
+    assert.equal((await country("XB")).minProcessingDays, 5);
+  });
+
+  test("#306: the minimum processing time counts only the visas that state one", async () => {
+    const { processingTime, processingDaysMin, processingDaysMax, ...noProcessing } = visaBase;
+    void processingTime; void processingDaysMin; void processingDaysMax;
+    await run({
+      visaTypes: [
+        { ...noProcessing, id: "xa-visitor", countryCode: "XA" },
+        { ...visaBase, id: "xa-work", countryCode: "XA", baseCostUsd: 400, processingDaysMin: 12 },
+      ],
+    });
+    assert.equal((await country("XA")).minProcessingDays, 12);
+  });
+
   test("an entry with its own baseCostUsd that inherits a route with a fee stops the seed before any write", async () => {
     await writeFx();
     await writeSource();
     const conflicting = visaTypes.map((v) => (v.id === "xa-visitor" ? { ...v, baseCostUsd: 40 } : v));
     await assert.rejects(run({ visaTypes: conflicting }), /XA\/xa-visitor.*two fee sources/s);
     assert.equal((await db.collection("countries").doc("XA").get()).exists, false);
+  });
+});
+
+// ============================================
+// Issue #339: the sourced processing time and stay limit of a shared route
+// ============================================
+//
+// Same approach as #299 above: MADE-UP countries, visas and shared visa data
+// (no real bloc, quote or figure). What is real is the wiring under test: the
+// `guidanceSources/{id}` reads, the whole-document write, the stored
+// `inheritsFrom` rule, the two-sources guard and the country's minimum.
+describe("seedCountriesAndVisas: the sourced processing time and stay limit (#339)", () => {
+  let fixtureDataWithFacts: () => any;
+  let FIXTURE_DATA: any;
+  let FIXTURE_PROCESSING: any;
+  let FIXTURE_VALIDITY: any;
+
+  const countries = [
+    { code: "XA", name: "Country XA", flagUrl: "https://flags.example.org/xa.png", isSupported: true, popularityRank: 1 },
+    { code: "XB", name: "Country XB", flagUrl: "https://flags.example.org/xb.png", isSupported: true, popularityRank: 2 },
+  ];
+  /** xa-visitor inherits the route and states no processing time or validity of its own; xb-visitor has its own. */
+  const visaTypes = [
+    { id: "xa-visitor", countryCode: "XA", name: "Visa", code: "V", description: "d", category: "tourist", eligibilityCriteria: [] },
+    { id: "xb-visitor", countryCode: "XB", name: "Visa", code: "V", description: "d", category: "tourist", processingTime: "1 week", processingDaysMin: 5, processingDaysMax: 7, validityPeriod: "30 days", isExtendable: false, eligibilityCriteria: [] },
+  ];
+  const run = (over: Record<string, unknown> = {}) => seed({ countries, visaTypes, sharedVisaData: fixtureDataWithFacts(), ...over } as any);
+  const ref = (cc: string, id: string) => db.collection("countries").doc(cc).collection("visaTypes").doc(id);
+  const visa = async (cc: string, id: string) => (await ref(cc, id).get()).data();
+  const writeSources = () =>
+    Promise.all([
+      db.collection("guidanceSources").doc(FIXTURE_PROCESSING.guidanceSourceId).set({ title: "Placeholder processing source", url: FIXTURE_PROCESSING.url }),
+      db.collection("guidanceSources").doc(FIXTURE_VALIDITY.guidanceSourceId).set({ title: "Placeholder stay source", url: FIXTURE_VALIDITY.url }),
+    ]);
+
+  before(async () => {
+    ({ fixtureDataWithFacts, FIXTURE_DATA, FIXTURE_PROCESSING, FIXTURE_VALIDITY } = await import("../helpers/shared-visa-fixture"));
+  });
+
+  test("writes the route's values and one citation per fact; no unstated minimum; other records untouched", async () => {
+    await writeSources();
+    await run();
+    const d = await visa("XA", "xa-visitor");
+    assert.equal(d.processingTime, FIXTURE_PROCESSING.processingTime);
+    assert.equal(d.processingDaysMax, FIXTURE_PROCESSING.processingDaysMax);
+    assert.equal("processingDaysMin" in d, false);
+    assert.equal(d.validityPeriod, FIXTURE_VALIDITY.validityPeriod);
+    assert.equal("isExtendable" in d, false);
+    assert.equal("maxExtensions" in d, false);
+    assert.deepEqual(d.sourcedFacts, {
+      processing: { sharedRouteId: "example-short-stay", quote: FIXTURE_PROCESSING.quote, url: FIXTURE_PROCESSING.url, guidanceSourceId: FIXTURE_PROCESSING.guidanceSourceId },
+      validity: { sharedRouteId: "example-short-stay", quote: FIXTURE_VALIDITY.quote, url: FIXTURE_VALIDITY.url, guidanceSourceId: FIXTURE_VALIDITY.guidanceSourceId },
+    });
+    // XA's only visa states no minimum: the country's minimum is the existing
+    // "none" value 0, not a figure taken from the route.
+    assert.equal((await db.collection("countries").doc("XA").get()).data().minProcessingDays, 0);
+    // A record the data file does not list is exactly as its seed entry says.
+    const b = await visa("XB", "xb-visitor");
+    assert.equal(b.processingTime, "1 week");
+    assert.equal(b.validityPeriod, "30 days");
+    assert.equal("sourcedFacts" in b, false);
+  });
+
+  test("a second run changes nothing but updatedAt", async () => {
+    await writeSources();
+    await run();
+    const a = await visa("XA", "xa-visitor");
+    await run();
+    const b = await visa("XA", "xa-visitor");
+    assert.deepEqual({ ...b, updatedAt: null }, { ...a, updatedAt: null });
+  });
+
+  test("the stored inheritsFrom wins: a record pointed at another route gets no route facts", async () => {
+    await writeSources();
+    await run();
+    await ref("XA", "xa-visitor").update({ inheritsFrom: [{ sharedRouteId: "another-route" }] });
+    await run();
+    const d = await visa("XA", "xa-visitor");
+    for (const k of ["processingTime", "processingDaysMax", "validityPeriod", "sourcedFacts"]) assert.equal(k in d, false, `${k} is not stored`);
+    assert.deepEqual(d.inheritsFrom, [{ sharedRouteId: "another-route" }]);
+  });
+
+  test("a fact whose official source is not on record is not written", async () => {
+    await db.collection("guidanceSources").doc(FIXTURE_VALIDITY.guidanceSourceId).set({ title: "Placeholder stay source" });
+    await run();
+    const d = await visa("XA", "xa-visitor");
+    assert.equal("processingTime" in d, false);
+    assert.equal(d.validityPeriod, FIXTURE_VALIDITY.validityPeriod);
+    assert.deepEqual(Object.keys(d.sourcedFacts), ["validity"]);
+  });
+
+  test("removing the blocks from the data file removes the facts on the next run", async () => {
+    await writeSources();
+    await run();
+    await run({ sharedVisaData: FIXTURE_DATA });
+    const d = await visa("XA", "xa-visitor");
+    for (const k of ["processingTime", "processingDaysMax", "validityPeriod", "sourcedFacts"]) assert.equal(k in d, false, `${k} is not stored`);
+  });
+
+  test("an inheriting entry with its own processing time or validity stops the seed before any write", async () => {
+    await writeSources();
+    const conflicting = visaTypes.map((v) => (v.id === "xa-visitor" ? { ...v, processingTime: "2 weeks", validityPeriod: "60 days" } : v));
+    await assert.rejects(run({ visaTypes: conflicting }), /XA\/xa-visitor has its own processingTime.*XA\/xa-visitor has its own validityPeriod/s);
+    assert.equal((await db.collection("countries").doc("XA").get()).exists, false);
+  });
+});
+
+// ============================================
+// Issue #339: the SHIPPED data file, end to end through the public visa read
+// ============================================
+//
+// The deploy seed (no options: the repo's countries, visas and data file),
+// then `GET /countries/:code/visas/:visaId` for every record the data file
+// lists under a route with a processing time and stay limit. The values
+// asserted are the issue's acceptance criteria; the codes, ids, quotes and
+// source ids are read from the data file, never typed here.
+describe("seedCountriesAndVisas: the shipped route facts through GET /countries/:code/visas/:visaId (#339)", () => {
+  test("every inheriting record serves the issue's values and its citations, twice in a row", async () => {
+    const { loadSharedVisaData } = await import("../../src/data/shared-visa-data-format");
+    const { startApi } = await import("./helpers");
+    const data = loadSharedVisaData();
+    const routes = data.sharedRoutes.filter((r) => r.processing && r.validity);
+    assert.equal(routes.length, 1, "one shipped route records both facts");
+    const route = routes[0];
+    // The cited official source is on record (as on dev, where the fee needs it too).
+    await db.collection("guidanceSources").doc(route.processing!.guidanceSourceId).set({ title: "Visa Code (test copy of the id only)", url: route.processing!.url });
+
+    await seed();
+    await seed(); // idempotent: the second run writes the same values
+
+    const api = await startApi();
+    try {
+      assert.equal(route.inheritedBy.length, 29);
+      for (const x of route.inheritedBy) {
+        const { status, body } = await api.call("GET", `/countries/${x.countryCode}/visas/${x.visaTypeId}`);
+        assert.equal(status, 200, `${x.visaTypeId}: ${JSON.stringify(body)}`);
+        const v = body.data;
+        assert.equal(v.processingTime, "Up to 15 calendar days (up to 45 in individual cases)", x.visaTypeId);
+        assert.equal(v.processingDaysMax, 45, x.visaTypeId);
+        assert.equal(v.validityPeriod, "Stays of up to 90 days in any 180-day period", x.visaTypeId);
+        for (const k of ["processingDaysMin", "isExtendable", "maxExtensions"]) assert.equal(k in v, false, `${x.visaTypeId} has no ${k}`);
+        assert.deepEqual(v.eligibilityCriteria, [], x.visaTypeId);
+        assert.deepEqual(v.sourcedFacts.processing, { sharedRouteId: route.id, quote: route.processing!.quote, url: route.processing!.url, guidanceSourceId: route.processing!.guidanceSourceId });
+        assert.deepEqual(v.sourcedFacts.validity, { sharedRouteId: route.id, quote: route.validity!.quote, url: route.validity!.url, guidanceSourceId: route.validity!.guidanceSourceId });
+      }
+    } finally {
+      await api.close();
+    }
   });
 });

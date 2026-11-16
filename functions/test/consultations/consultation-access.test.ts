@@ -69,13 +69,20 @@ describe("GET /consultations/:id with the snapshot fields", () => {
     await consultationController.getConsultation(reqFor(client1, { params: { id: "c-a" } }), res);
     assert.ok(out.status === 0 || out.status === 200);
     assert.equal(out.body.data.chargedAmountMinor, 15_000_000);
-    assert.equal(out.body.data.fxRate, 1500);
+    // (#332) The client gets the EFFECTIVE rate (₦150,000 ÷ $100), never the
+    // raw rate or the markup.
+    assert.equal(out.body.data.effectiveRate, 1500);
+    assert.equal("fxRate" in out.body.data, false);
+    assert.equal("fxMarginBps" in out.body.data, false);
   });
 
   test("its agency's owner sees it", async () => {
     const { out, res } = captureRes();
     await consultationController.getConsultation(reqFor(ownerA, { params: { id: "c-a" } }), res);
     assert.ok(out.status === 0 || out.status === 200);
+    // (#332) The agent side still gets the stored snapshot, raw rate included.
+    assert.equal(out.body.data.fxRate, 1500);
+    assert.equal(out.body.data.fxMarginBps, 0);
   });
 
   test("another client, another agency's owner and agent get 403", async () => {

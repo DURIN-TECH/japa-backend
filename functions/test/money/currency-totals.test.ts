@@ -68,7 +68,7 @@ function txn(
   } as Transaction;
 }
 
-/** A withdrawal fixture (always the agent's own user id, like createWithdrawal). */
+/** A withdrawal fixture (always the agent's own user id, like buildWithdrawal). */
 function withdrawal(amount: number, status: TransactionStatus, currency = "NGN"): Transaction {
   return txn(amount, currency, status, { type: "withdrawal", userId: "agent1" });
 }
@@ -93,7 +93,9 @@ describe("TransactionService.computeStats (per currency)", () => {
     ]);
     assert.deepEqual(stats, {
       byCurrency: [
-        { currency: "NGN", totalRevenue: 750_000, pendingPayments: 100_000, availableBalance: 750_000 },
+        // (#317) The consultation fee is revenue but HELD: a fee row with no
+        // `feeHold` (written before #317, not backfilled) counts as held.
+        { currency: "NGN", totalRevenue: 750_000, pendingPayments: 100_000, availableBalance: 500_000, heldBalance: 250_000 },
       ],
       pendingClientsCount: 1,
     });
@@ -107,7 +109,7 @@ describe("TransactionService.computeStats (per currency)", () => {
     ]);
     assert.deepEqual(stats, {
       byCurrency: [
-        { currency: "USD", totalRevenue: 12_500, pendingPayments: 5_000, availableBalance: 12_500 },
+        { currency: "USD", totalRevenue: 12_500, pendingPayments: 5_000, availableBalance: 12_500, heldBalance: 0 },
       ],
       // Same client twice counts once.
       pendingClientsCount: 1,
@@ -124,9 +126,9 @@ describe("TransactionService.computeStats (per currency)", () => {
       txn(1_000, "GHS", "failed"),
     ]);
     assert.deepEqual(stats.byCurrency, [
-      { currency: "GHS", totalRevenue: 0, pendingPayments: 0, availableBalance: 0 },
-      { currency: "NGN", totalRevenue: 500_000, pendingPayments: 80_000, availableBalance: 500_000 },
-      { currency: "USD", totalRevenue: 12_500, pendingPayments: 7_000, availableBalance: 12_500 },
+      { currency: "GHS", totalRevenue: 0, pendingPayments: 0, availableBalance: 0, heldBalance: 0 },
+      { currency: "NGN", totalRevenue: 500_000, pendingPayments: 80_000, availableBalance: 500_000, heldBalance: 0 },
+      { currency: "USD", totalRevenue: 12_500, pendingPayments: 7_000, availableBalance: 12_500, heldBalance: 0 },
     ]);
     assert.equal(stats.pendingClientsCount, 2);
   });
@@ -136,7 +138,7 @@ describe("TransactionService.computeStats (per currency)", () => {
     delete (legacy as Partial<Transaction>).currency;
     const stats = transactionService.computeStats([legacy, txn(5_000, "ngn", "completed")]);
     assert.deepEqual(stats.byCurrency, [
-      { currency: "NGN", totalRevenue: 15_000, pendingPayments: 0, availableBalance: 15_000 },
+      { currency: "NGN", totalRevenue: 15_000, pendingPayments: 0, availableBalance: 15_000, heldBalance: 0 },
     ]);
   });
 
@@ -153,29 +155,31 @@ describe("TransactionService.computeStats (per currency)", () => {
     assert.deepEqual(stats, {
       byCurrency: [
         // Withdrawals are not revenue and not pending client payments.
-        { currency: "NGN", totalRevenue: 500_000, pendingPayments: 0, availableBalance: 325_000 },
+        { currency: "NGN", totalRevenue: 500_000, pendingPayments: 0, availableBalance: 325_000, heldBalance: 0 },
         // USD untouched by the naira withdrawals.
-        { currency: "USD", totalRevenue: 20_000, pendingPayments: 0, availableBalance: 20_000 },
+        { currency: "USD", totalRevenue: 20_000, pendingPayments: 0, availableBalance: 20_000, heldBalance: 0 },
       ],
       // A pending withdrawal is not a pending client.
       pendingClientsCount: 0,
     });
   });
 
-  test("NGN balance never goes below 0, and USD revenue does not cover it", () => {
+  // Issue #317 / #351 reversal: the balance is no longer floored at 0. A
+  // negative balance is money owed and refuses every withdrawal.
+  test("NGN balance may go below 0, and USD revenue does not cover it", () => {
     const stats = transactionService.computeStats([
       txn(10_000, "NGN", "released"),
       txn(1_000_000, "USD", "released"),
       withdrawal(50_000, "completed"),
     ]);
-    assert.equal(availableBalanceIn(stats, "NGN"), 0);
+    assert.equal(availableBalanceIn(stats, "NGN"), -40_000);
     assert.equal(availableBalanceIn(stats, "USD"), 1_000_000);
   });
 
-  test("withdrawals only (no revenue): NGN row with a 0 balance", () => {
+  test("withdrawals only (no revenue): NGN row with a negative balance (#317, not floored)", () => {
     const stats = transactionService.computeStats([withdrawal(5_000, "pending")]);
     assert.deepEqual(stats.byCurrency, [
-      { currency: "NGN", totalRevenue: 0, pendingPayments: 0, availableBalance: 0 },
+      { currency: "NGN", totalRevenue: 0, pendingPayments: 0, availableBalance: -5_000, heldBalance: 0 },
     ]);
   });
 });
@@ -189,18 +193,18 @@ describe("TransactionService.computeStats: refunds (shared revenue rule)", () =>
       withdrawal(100_000, "completed"),
     ]);
     assert.deepEqual(stats.byCurrency, [
-      { currency: "NGN", totalRevenue: 500_000, pendingPayments: 0, availableBalance: 400_000 },
-      { currency: "USD", totalRevenue: 15_000, pendingPayments: 0, availableBalance: 15_000 },
+      { currency: "NGN", totalRevenue: 500_000, pendingPayments: 0, availableBalance: 400_000, heldBalance: 0 },
+      { currency: "USD", totalRevenue: 15_000, pendingPayments: 0, availableBalance: 15_000, heldBalance: 0 },
     ]);
   });
 
-  test("refunds above revenue: revenue goes negative, balance stays at 0", () => {
+  test("refunds above revenue: revenue and balance both go negative (#317, not floored)", () => {
     const stats = transactionService.computeStats([
       txn(10_000, "NGN", "completed"),
       txn(25_000, "NGN", "completed", { type: "refund" }),
     ]);
     assert.deepEqual(stats.byCurrency, [
-      { currency: "NGN", totalRevenue: -15_000, pendingPayments: 0, availableBalance: 0 },
+      { currency: "NGN", totalRevenue: -15_000, pendingPayments: 0, availableBalance: -15_000, heldBalance: 0 },
     ]);
   });
 
@@ -211,7 +215,7 @@ describe("TransactionService.computeStats: refunds (shared revenue rule)", () =>
     ]);
     assert.deepEqual(stats, {
       byCurrency: [
-        { currency: "NGN", totalRevenue: 10_000, pendingPayments: 0, availableBalance: 10_000 },
+        { currency: "NGN", totalRevenue: 10_000, pendingPayments: 0, availableBalance: 10_000, heldBalance: 0 },
       ],
       pendingClientsCount: 0,
     });

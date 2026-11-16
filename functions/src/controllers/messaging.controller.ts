@@ -5,7 +5,7 @@ import { notificationService } from "../services/notification.service";
 import { userService } from "../services/user.service";
 import { sendSuccess, sendCreated, sendError, sendNotFound, sendForbidden } from "../utils/response";
 import { collections } from "../utils/firebase";
-import { Conversation, Agent, AiMessageAccessRecord } from "../types";
+import { Conversation, ConversationStartedBy, Agent, AiMessageAccessRecord } from "../types";
 import {
   aiMessageAccessService,
   type ConversationAiAccessView,
@@ -225,21 +225,31 @@ export async function createConversation(req: AuthenticatedRequest, res: Respons
     const callerAgentId = await getAgentId(userId);
     let convUserId: string;
     let convAgentId: string;
+    // Issue #321: which side is opening the conversation. Stored on a NEW
+    // conversation only (`startedBy`). An agent can name any uid as
+    // `participantId`, so a conversation the agent opened is not proof that
+    // the client knows them: the agent-booking check counts it only once the
+    // client has sent a message in it.
+    let startedBy: ConversationStartedBy;
 
     if (callerAgentId) {
       // Caller is an agent, participantId is a user
       convAgentId = callerAgentId;
       convUserId = participantId;
+      startedBy = "agent";
     } else {
-      // Caller is a user, participantId should be an agent
+      // Caller is a user, participantId should be an agent. The client is
+      // always the caller's own uid here, never a value from the body.
       convUserId = userId;
       convAgentId = participantId;
+      startedBy = "user";
     }
 
     const conversation = await messagingService.getOrCreateConversation(
       convUserId,
       convAgentId,
-      applicationId
+      applicationId,
+      startedBy
     );
 
     // Same shape as the list: own AI-access view in, old per-side fields out.

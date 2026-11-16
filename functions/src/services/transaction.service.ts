@@ -1,16 +1,36 @@
-import { collections } from "../utils/firebase";
-import { Transaction, TransactionStatus, BankAccount, PaymentRequest } from "../types";
+import { collections, db } from "../utils/firebase";
+import {
+  Transaction,
+  TransactionStatus,
+  BankAccount,
+  PaymentRequest,
+  // Issue #317: fee holds and consultation refunds.
+  FeeHold,
+  RefundFundedFrom,
+  RefundReason,
+} from "../types";
 import { Timestamp } from "firebase-admin/firestore";
+import type { Transaction as FirestoreTransaction } from "firebase-admin/firestore";
 import type { ChargeSnapshot, CurrencyCode } from "../types/money";
 import {
   CurrencyBuckets,
   isPendingIncoming,
+  isSettled,
   revenueEffect,
   transactionCurrency,
 } from "../money/totals";
+// Issue #317: a consultation fee is HELD until the meeting has happened.
+import { feeHoldStatusAt } from "../money/fee-hold";
 
 export interface TransactionFilters {
   status?: TransactionStatus;
+  /**
+   * Issue #317: only rows of this type (the admin refund list,
+   * `GET /transactions?role=admin&type=refund&status=failed`). Pushed into
+   * the Firestore query for the admin scope (composite indexes type+createdAt
+   * and type+status+createdAt); applied in memory for the other scopes.
+   */
+  type?: Transaction["type"];
   applicationId?: string;
   startDate?: string;
   endDate?: string;
@@ -18,7 +38,7 @@ export interface TransactionFilters {
 
 /**
  * Currency that agent withdrawals are paid out in. Payouts go to a Nigerian
- * bank account (Paystack NGN), so `createWithdrawal` writes this currency and
+ * bank account (Paystack NGN), so `buildWithdrawal` writes this currency and
  * the withdrawal balance check compares against this currency's balance only.
  */
 export const WITHDRAWAL_CURRENCY: CurrencyCode = "NGN";
@@ -39,11 +59,21 @@ export interface CurrencyTransactionStats {
   /** Sum of pending / processing / held-in-escrow incoming transactions in this currency (refunds and withdrawals excluded). */
   pendingPayments: number;
   /**
-   * `totalRevenue` minus the withdrawals (pending, processing or completed)
-   * in this currency, never below 0. Withdrawals only ever reduce the
-   * balance of their own currency.
+   * What the agent may withdraw in this currency (issue #317 changed it):
+   * settled incoming money that is NOT a held consultation fee, minus
+   * refunds paid from the available balance, minus settled refunds of older
+   * kinds, minus withdrawals (pending, processing or completed). MAY BE
+   * NEGATIVE (#351 reversal): a refund of an already-released fee is carried
+   * forward as money owed, and every withdrawal is refused until it is above
+   * zero again. Withdrawals only ever reduce the balance of their own currency.
    */
   availableBalance: number;
+  /**
+   * Issue #317: consultation fees in this currency that are still HELD
+   * (the meeting has not happened yet; see money/fee-hold.ts). Never
+   * withdrawable. A fee refunded out of the hold leaves it.
+   */
+  heldBalance: number;
 }
 
 /**
@@ -73,7 +103,46 @@ export function availableBalanceIn(stats: TransactionStats, currency: CurrencyCo
   return stats.byCurrency.find((row) => row.currency === currency)?.availableBalance ?? 0;
 }
 
+/**
+ * Thrown by `withdrawWithBalanceCheck` (issue #287) when the amount asked for
+ * is more than the agent's available balance in WITHDRAWAL_CURRENCY at the
+ * moment the transaction reads it. Thrown INSIDE the Firestore transaction,
+ * so nothing is written. The controller answers 400 "Insufficient balance".
+ */
+export class InsufficientBalanceError extends Error {
+  constructor() {
+    super("Insufficient balance");
+    this.name = "InsufficientBalanceError";
+  }
+}
+
+/**
+ * Whether a stored transaction amount can be summed (issue #287): a safe
+ * integer in minor units. A string ("abc", "5000"), a fraction, NaN,
+ * Infinity, null or a missing value is NOT usable: adding one to a running
+ * sum gives NaN (or a string), which then poisons every figure built on it.
+ */
+export function isUsableAmount(amount: unknown): amount is number {
+  return typeof amount === "number" && Number.isSafeInteger(amount);
+}
+
 class TransactionService {
+  /**
+   * Firestore transaction runner (issue #287). A property, like
+   * `visaService.runTransaction`, so unit tests can swap it for the in-memory
+   * one (writes buffered until the callback resolves, a throw writes
+   * nothing: the same all-or-nothing contract as Firestore).
+   */
+  runTransaction: <T>(fn: (tx: FirestoreTransaction) => Promise<T>) => Promise<T> = (fn) =>
+    db.runTransaction(fn);
+
+  /**
+   * The server clock the balances are worked out at (issue #317: whether a
+   * consultation fee is still held depends on the time). A property so tests
+   * can move it; the caller's clock is never used.
+   */
+  now: () => Date = () => new Date();
+
   /**
    * Get transactions where the user is the assigned agent.
    */
@@ -87,7 +156,71 @@ class TransactionService {
 
     query = this.applyFilters(query, filters);
     const snapshot = await query.get();
-    return snapshot.docs.map((doc) => doc.data() as Transaction);
+    // (#317) `type` is applied in memory here (no extra composite index).
+    return snapshot.docs
+      .map((doc) => doc.data() as Transaction)
+      .filter((txn) => !filters?.type || txn.type === filters.type);
+  }
+
+  /**
+   * Get the transactions a CLIENT paid: their payment history (issue #292).
+   *
+   * Who the payer is: every incoming Transaction stores the paying client's
+   * user uid in `userId`:
+   *  - a consultation booking fee (`buildConsultationFee`: `userId` =
+   *    `clientUserId`, type "consultation_fee");
+   *  - a payment-request charge (`buildPaymentRequestPayment`: `userId` =
+   *    the request's `clientId`, type "escrow_release");
+   *  - a refund of either goes back to the same `userId`.
+   * So the scope is exactly `userId == clientUserId`. This is the ONLY
+   * ownership rule here: nothing is derived from a case, an agency or an
+   * agent, so a client can never be handed another client's row.
+   *
+   * Withdrawals are left out. An agent's payout row (`buildWithdrawal`)
+   * also stores the agent's own uid in `userId`, but it is money going OUT
+   * to the agent's bank, not a payment the caller made, so it does not
+   * belong in a payment history. (It only matters when an agent-side user
+   * asks for their own client view; a real client has no withdrawals.)
+   *
+   * Filters (`status`, `applicationId`, `startDate`, `endDate`) are applied
+   * IN MEMORY after the query, unlike the agent-side queries that push them
+   * into Firestore. A client has few rows, and this way the query needs one
+   * composite index only (`userId` + `createdAt` desc, in
+   * firestore.indexes.json) instead of one per filter combination.
+   *
+   * Money is returned as stored: `amount` in minor units of the row's own
+   * `currency`. Nothing is converted or summed here.
+   *
+   * These are the FULL stored documents (markup, raw rate, agent ids and
+   * Paystack references included). They must not be sent to the client as
+   * they are: the controller projects each one through
+   * `toClientTransaction` (transactions/client-transaction.ts, issue #329).
+   *
+   * @param clientUserId the paying client's user uid (always the caller's own)
+   * @param filters optional list filters, same meaning as for the agent view
+   * @returns the client's own transactions, newest first
+   */
+  async getTransactionsForClient(
+    clientUserId: string,
+    filters?: TransactionFilters
+  ): Promise<Transaction[]> {
+    // Fail closed: with no uid there is no payer to scope to. (An empty
+    // string must never reach the query as a "match anything" value.)
+    if (!clientUserId) return [];
+
+    const snapshot = await collections.transactions
+      .where("userId", "==", clientUserId)
+      .orderBy("createdAt", "desc")
+      .get();
+
+    return snapshot.docs
+      .map((doc) => doc.data() as Transaction)
+      // Belt and braces: re-check the payer on every row, so a query change
+      // (or a fake that ignores a filter) can never leak a stranger's row.
+      .filter((txn) => txn.userId === clientUserId)
+      // Payouts are not payments the caller made (see above).
+      .filter((txn) => txn.type !== "withdrawal")
+      .filter((txn) => this.matchesFilters(txn, filters));
   }
 
   /**
@@ -121,7 +254,10 @@ class TransactionService {
       query = this.applyFilters(query, filters);
       const snapshot = await query.get();
       results.push(
-        ...snapshot.docs.map((doc) => doc.data() as Transaction)
+        ...snapshot.docs
+          .map((doc) => doc.data() as Transaction)
+          // (#317) `type` is applied in memory here (no extra composite index).
+          .filter((txn) => !filters?.type || txn.type === filters.type)
       );
     }
 
@@ -139,6 +275,9 @@ class TransactionService {
     let query = collections.transactions
       .orderBy("createdAt", "desc") as FirebaseFirestore.Query;
 
+    // (#317) The admin refund list filters by type IN Firestore (indexes
+    // transactions(type, createdAt desc) and (type, status, createdAt desc)).
+    if (filters?.type) query = query.where("type", "==", filters.type);
     query = this.applyFilters(query, filters);
     const snapshot = await query.get();
     return snapshot.docs.map((doc) => doc.data() as Transaction);
@@ -173,22 +312,57 @@ class TransactionService {
    *    the `availableBalance` of ITS currency only (clamped at 0). Before
    *    #282 a completed withdrawal was counted as revenue and a pending one
    *    as a pending client payment;
+   *  - (issue #317) HELD consultation fees: a settled `consultation_fee`
+   *    still held at time `at` (`feeHoldStatusAt`) counts in revenue as
+   *    before, but in `heldBalance`, NOT in `availableBalance`. A fee refunded
+   *    out of the hold (`feeHold.state: "refunded"`) counts in neither
+   *    balance, and neither does its refund row (`refundFundedFrom: "hold"`):
+   *    the agent never had that money;
+   *  - (issue #317) a refund row paid from the AVAILABLE balance
+   *    (`refundFundedFrom: "available"`, an admin refund of a released fee)
+   *    lowers `availableBalance` from the moment it is written, whatever its
+   *    status: the client is owed it. A refund row of an older kind (no
+   *    `refundFundedFrom`) lowers it once settled, as before;
+   *  - (#351 reversal) `availableBalance` is no longer floored at 0: a
+   *    negative figure is money the agent owes, and blocks withdrawals;
    *  - a currency appears in `byCurrency` as soon as any transaction in it
    *    is seen (even one that adds 0, e.g. a failed charge), so the list is
    *    empty only when there are no transactions at all.
    *
+   *  - (issue #287) a stored row whose `amount` is not a safe integer (a
+   *    string such as "abc", a fraction, NaN, a missing value) is SKIPPED
+   *    whole and logged with its id. Before #287 one such row turned the
+   *    sums into NaN (JSON `null`), and `amount > NaN` is always false, so
+   *    every later withdrawal passed the balance check. A skipped row adds
+   *    nothing anywhere: no revenue, no pending payment, no withdrawal hold,
+   *    no pending client and no currency row of its own.
+   *
    * Used by GET /transactions/stats for every role, and by the withdrawal
-   * balance check (via getStatsForAgent), so both always agree.
+   * balance check (withdrawWithBalanceCheck), so both always agree.
    */
-  computeStats(transactions: Transaction[]): TransactionStats {
+  computeStats(transactions: Transaction[], at: Date = this.now()): TransactionStats {
     // Separate running sums per currency for each figure.
     const revenue = new CurrencyBuckets();
     const pending = new CurrencyBuckets();
     const withdrawn = new CurrencyBuckets();
+    // Issue #317: the available balance is built on its own (not derived
+    // from revenue), because held fees are revenue but not available.
+    const available = new CurrencyBuckets();
+    const held = new CurrencyBuckets();
     // Distinct paying clients with a pending payment (count, not money).
     const pendingUserIds = new Set<string>();
 
     for (const txn of transactions) {
+      // (#287) Never sum an amount that is not a safe integer: skip the row
+      // and say which one, so the bad data can be found and repaired.
+      if (!isUsableAmount(txn.amount)) {
+        console.warn(
+          `computeStats: skipping transaction ${txn.id} with a non-integer amount ` +
+            `(type ${typeof txn.amount})`
+        );
+        continue;
+      }
+
       const currency = transactionCurrency(txn);
       // Give the currency a row even if this transaction adds nothing.
       revenue.touch(currency);
@@ -207,6 +381,30 @@ class TransactionService {
         pending.add(currency, txn.amount);
         pendingUserIds.add(txn.userId);
       }
+
+      // ---- Issue #317: available vs held ----
+      if (txn.type === "refund") {
+        if (txn.refundFundedFrom === "hold") {
+          // Paid out of a held fee: that fee is already out of both balances.
+        } else if (txn.refundFundedFrom === "available") {
+          // A released fee given back: owed from the moment it is written.
+          available.add(currency, -txn.amount);
+        } else if (isSettled(txn)) {
+          // Older refund kinds: as before, once the money has moved.
+          available.add(currency, -txn.amount);
+        }
+        continue;
+      }
+      if (!isSettled(txn)) continue;
+      if (txn.type === "consultation_fee") {
+        const hold = feeHoldStatusAt(txn, at);
+        if (hold === "held") held.add(currency, txn.amount);
+        else if (hold === "released") available.add(currency, txn.amount);
+        // "refunded": given back out of the hold, counted nowhere.
+        continue;
+      }
+      // Any other settled incoming payment is available straight away.
+      available.add(currency, txn.amount);
     }
 
     // One row per currency seen, sorted by code (CurrencyBuckets sorts).
@@ -214,18 +412,22 @@ class TransactionService {
       currency,
       totalRevenue: revenue.get(currency),
       pendingPayments: pending.get(currency),
-      // Refunds already lowered revenue; withdrawals come off here. The
-      // balance is the only figure clamped at 0.
-      availableBalance: Math.max(0, revenue.get(currency) - withdrawn.get(currency)),
+      // Withdrawals come off here. NOT floored (#351 reversal): below zero is
+      // money owed, and the withdrawal check then refuses every amount.
+      availableBalance: available.get(currency) - withdrawn.get(currency),
+      heldBalance: held.get(currency),
     }));
 
     return { byCurrency, pendingClientsCount: pendingUserIds.size };
   }
 
   /**
-   * Convenience: stats for one agent (by user uid), as used by the
-   * withdrawal balance check. Withdrawals are already subtracted per
-   * currency inside computeStats.
+   * Convenience: stats for one agent (by user uid). Withdrawals are already
+   * subtracted per currency inside computeStats.
+   *
+   * NOT what the withdrawal endpoint uses to decide (issue #287): a balance
+   * read outside a transaction can be stale by the time the withdrawal is
+   * written. `withdrawWithBalanceCheck` re-reads inside its transaction.
    */
   async getStatsForAgent(agentUserId: string): Promise<TransactionStats> {
     const transactions = await this.getTransactionsForAgent(agentUserId);
@@ -233,18 +435,26 @@ class TransactionService {
   }
 
   /**
-   * Create a withdrawal transaction
+   * Build (but do not write) a pending withdrawal Transaction: the agent's
+   * request to be paid `amount` (kobo) into `bankAccount`. Payouts are done
+   * by hand today, hence `paymentProvider: "manual"`.
+   *
+   * @param id the new transaction's document id
+   * @param now the creation time (also `updatedAt`)
+   * @param agentUserId the agent's (or owner's) user uid; stored as both the
+   *   `userId` and the `agentId`, which is what the balance query filters on
+   * @param amount safe positive integer in minor units of WITHDRAWAL_CURRENCY
+   * @param bankAccount the caller's own account the money goes to
    */
-  async createWithdrawal(
+  buildWithdrawal(
+    id: string,
+    now: Timestamp,
     agentUserId: string,
     amount: number,
     bankAccount: BankAccount
-  ): Promise<Transaction> {
-    const ref = collections.transactions.doc();
-    const now = Timestamp.now();
-
-    const transaction: Transaction = {
-      id: ref.id,
+  ): Transaction {
+    return {
+      id,
       userId: agentUserId,
       agentId: agentUserId,
       type: "withdrawal",
@@ -264,9 +474,103 @@ class TransactionService {
       createdAt: now,
       updatedAt: now,
     };
+  }
 
-    await ref.set(transaction);
-    return transaction;
+  /**
+   * Check the agent's balance and write the withdrawal in ONE Firestore
+   * transaction (issue #287). Replaces the old `createWithdrawal`, which
+   * wrote without checking; there is deliberately no unchecked way to write
+   * a withdrawal any more.
+   *
+   * Why: before #287 the controller read the balance, then wrote the
+   * withdrawal in a separate step. Two requests sent at the same time both
+   * read the same balance, both passed, and both were written: the agent was
+   * owed twice what they had.
+   *
+   * How it is made atomic:
+   *  1. the transaction first reads the agent's LOCK document
+   *     (`withdrawalLocks/{agentUserId}`) and, on success, writes it. Two
+   *     withdrawals of one agent therefore always touch the same document,
+   *     so Firestore runs them one after the other: the second one is
+   *     retried on fresh data and sees the first one's withdrawal. A query
+   *     alone is not relied on for this, because a query inside a
+   *     transaction does not have to block a concurrent INSERT of a new row;
+   *  2. the agent's transactions are read THROUGH the transaction (`tx.get`)
+   *     and the balance is computed with the same `computeStats` that
+   *     GET /transactions/stats uses, so the check and the screen agree;
+   *  3. the balance compared is the one in WITHDRAWAL_CURRENCY only (#282):
+   *     revenue in another currency never makes a naira withdrawal possible;
+   *  4. if the amount is more than the balance, InsufficientBalanceError is
+   *     thrown and NOTHING is written (no withdrawal, no lock). An amount
+   *     exactly equal to the balance is allowed.
+   *
+   * All reads happen before any write, as Firestore requires.
+   *
+   * The lock orders one agent's WITHDRAWALS against each other, and (issue
+   * #317) against consultation REFUNDS: the refund engine writes its refund
+   * row under the same lock, so a withdrawal can never spend money that is
+   * being refunded. Incoming payments do not take it: they only ever raise
+   * the balance, so a withdrawal that passed the check stays valid.
+   *
+   * The caller validates `amount` (safe positive integer, kobo) and that
+   * `bankAccount` is the agent's own BEFORE calling this.
+   *
+   * @param agentUserId the agent's (or agency owner's) user uid
+   * @param amount safe positive integer in kobo
+   * @param bankAccount the caller's own bank account
+   * @returns the pending withdrawal that was written
+   * @throws InsufficientBalanceError when `amount` exceeds the NGN balance
+   */
+  async withdrawWithBalanceCheck(
+    agentUserId: string,
+    amount: number,
+    bankAccount: BankAccount
+  ): Promise<Transaction> {
+    // Defence in depth: the controller validates first, but a non-integer
+    // amount must never be stored whoever calls this.
+    if (!isUsableAmount(amount) || amount <= 0) {
+      throw new Error("withdrawWithBalanceCheck: amount must be a safe positive integer");
+    }
+
+    // One lock document per agent, keyed by their user uid.
+    const lockRef = collections.withdrawalLocks.doc(agentUserId);
+    // Same query as getTransactionsForAgent (uses the existing
+    // agentId + createdAt index), but read through the transaction below.
+    const agentTransactions = collections.transactions
+      .where("agentId", "==", agentUserId)
+      .orderBy("createdAt", "desc");
+
+    return this.runTransaction(async (tx) => {
+      // ---- Reads (before any write) ----
+      // The lock read is what makes two withdrawals of one agent conflict.
+      const lockSnap = await tx.get(lockRef);
+      const snapshot = await tx.get(agentTransactions);
+
+      // ---- Decide (a throw here writes nothing) ----
+      // (#317) At the server clock: a consultation fee still held is not in
+      // the available balance, so it can never be withdrawn; a negative
+      // balance (a refund of a released fee, #351) refuses every amount.
+      const stats = this.computeStats(snapshot.docs.map((doc) => doc.data() as Transaction), this.now());
+      if (amount > availableBalanceIn(stats, WITHDRAWAL_CURRENCY)) {
+        throw new InsufficientBalanceError();
+      }
+
+      // ---- Writes (both or neither) ----
+      const ref = collections.transactions.doc();
+      const now = Timestamp.now();
+      const transaction = this.buildWithdrawal(ref.id, now, agentUserId, amount, bankAccount);
+      tx.set(ref, transaction);
+      // Writing the lock is what forces a concurrent withdrawal of the same
+      // agent to be retried. The fields are for a human reading the console.
+      const previousCount = lockSnap.exists ? Number(lockSnap.data()?.withdrawalCount) || 0 : 0;
+      tx.set(lockRef, {
+        agentUserId,
+        lastWithdrawalId: ref.id,
+        withdrawalCount: previousCount + 1,
+        updatedAt: now,
+      });
+      return transaction;
+    });
   }
 
   /**
@@ -369,12 +673,16 @@ class TransactionService {
       clientEmail?: string;
       /** The booking's charge snapshot (empty for a legacy naira booking). */
       snapshot?: Partial<ChargeSnapshot>;
+      /** Issue #317: the hold on the fee until the meeting has happened (see money/fee-hold.ts). */
+      feeHold?: FeeHold;
     }
   ): Transaction {
     return {
       // Snapshot first, so the explicit fields below always win.
       ...(input.snapshot ?? {}),
       id,
+      // (#317) Held until the meeting has happened; never withdrawable before.
+      ...(input.feeHold ? { feeHold: input.feeHold } : {}),
       userId: input.clientUserId,
       // Undefined is not a valid Firestore value: only set the agent when known.
       ...(input.agentUserId ? { agentId: input.agentUserId } : {}),
@@ -393,6 +701,80 @@ class TransactionService {
       },
       ...(input.clientName !== undefined ? { clientName: input.clientName } : {}),
       ...(input.clientEmail !== undefined ? { clientEmail: input.clientEmail } : {}),
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  /**
+   * Build (but do not write) a consultation REFUND Transaction (issue #317).
+   * Written by the refund engine (services/consultation-refund.service.ts)
+   * inside the Firestore transaction that also updates the booking and
+   * takes the agent's withdrawal lock.
+   *
+   * The money is COPIED from the fee Transaction it refunds, never
+   * recomputed or re-converted: `amount` and `currency` are the fee's (minor
+   * units of the charged currency, FX markup included), so Paystack is asked
+   * to give back exactly what it took.
+   *
+   * `userId` is the client (it shows in their payment history as a refund),
+   * `agentId` the agent (it counts in their balance). The row starts
+   * `pending`, due for its first Paystack call now.
+   *
+   * @param id the deterministic doc id (`refundDocId(reference)`)
+   * @param now the creation time
+   */
+  buildConsultationRefund(
+    id: string,
+    now: Timestamp,
+    input: {
+      /** The fee Transaction being refunded. */
+      fee: Transaction;
+      /** The booking's agent user uid (the lock and the balance are keyed by it). */
+      agentUserId: string;
+      /** The booking id. */
+      consultationId: string;
+      reason: RefundReason;
+      /** Uid of who started the refund. */
+      initiatedBy: string;
+      fundedFrom: RefundFundedFrom;
+      /** #351: how far below zero this takes the available balance (0 when it does not). */
+      balanceShortfallMinor: number;
+      /** Admin note, when given. */
+      note?: string;
+    }
+  ): Transaction {
+    const fee = input.fee;
+    return {
+      id,
+      userId: fee.userId,
+      agentId: input.agentUserId,
+      consultationId: input.consultationId,
+      type: "refund",
+      // Exactly the fee's amount and currency (minor units).
+      amount: fee.amount,
+      currency: fee.currency,
+      status: "pending",
+      isEscrow: false,
+      paymentProvider: "paystack",
+      // The CHARGE's Paystack reference: what POST /refund is called with.
+      providerTransactionId: fee.providerTransactionId,
+      description: "Refund: consultation fee",
+      refundOf: fee.id,
+      reason: input.reason,
+      initiatedBy: input.initiatedBy,
+      ...(input.note ? { refundNote: input.note } : {}),
+      refundFundedFrom: input.fundedFrom,
+      balanceShortfallMinor: input.balanceShortfallMinor,
+      refundAttempts: 0,
+      refundProviderCalls: 0,
+      refundNextAttemptAt: now,
+      metadata: {
+        consultationId: input.consultationId,
+        reference: fee.providerTransactionId,
+      },
+      ...(fee.clientName !== undefined ? { clientName: fee.clientName } : {}),
+      ...(fee.clientEmail !== undefined ? { clientEmail: fee.clientEmail } : {}),
       createdAt: now,
       updatedAt: now,
     };
@@ -430,6 +812,35 @@ class TransactionService {
     }
 
     return query;
+  }
+
+  /**
+   * In-memory version of `applyFilters`, for a list that is already loaded
+   * (the client view, `getTransactionsForClient`). Same meaning per filter:
+   * exact `status`, exact `applicationId`, `createdAt` within
+   * [`startDate`, `endDate`] inclusive. A date that does not parse is
+   * ignored rather than hiding every row.
+   */
+  private matchesFilters(txn: Transaction, filters?: TransactionFilters): boolean {
+    if (!filters) return true;
+
+    if (filters.status && txn.status !== filters.status) return false;
+    // (#317) The type filter, as the other scopes apply it.
+    if (filters.type && txn.type !== filters.type) return false;
+    if (filters.applicationId && txn.applicationId !== filters.applicationId) return false;
+
+    // Compare by milliseconds: `createdAt` is a Firestore Timestamp.
+    const createdMs = txn.createdAt.toMillis();
+    if (filters.startDate) {
+      const startMs = new Date(filters.startDate).getTime();
+      if (!Number.isNaN(startMs) && createdMs < startMs) return false;
+    }
+    if (filters.endDate) {
+      const endMs = new Date(filters.endDate).getTime();
+      if (!Number.isNaN(endMs) && createdMs > endMs) return false;
+    }
+
+    return true;
   }
 
   private chunkArray<T>(arr: T[], size: number): T[][] {

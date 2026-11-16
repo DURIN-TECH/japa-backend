@@ -97,6 +97,10 @@ import type { Application, PaymentRequest } from "./types";
 import { applicationStatusMessage } from "./utils/application-status-copy";
 import { isSelfServiceApplication } from "./utils/self-service";
 import { unreadMessageReminderService } from "./services/unread-message-reminder.service";
+// Issue #288: the hourly cleanup of unpaid bookings nobody came back to.
+import { consultationService } from "./services/consultation.service";
+// Issue #317: the refund retry job.
+import { consultationRefundService } from "./services/consultation-refund.service";
 import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
 import { scrapeRunWorker } from "./scrapers";
@@ -494,6 +498,73 @@ export const sendUnreadMessageReminders = functions
       );
     } catch (error) {
       console.error("Unread-message reminder sweep failed:", error);
+    }
+  });
+
+/**
+ * Hourly: cancel consultation bookings that were never paid (issue #288).
+ *
+ * A `pending_payment` booking whose quote lock (`quoteExpiresAt`) ended more
+ * than 24 hours ago is closed as the system (`cancelledBy: "system"`), guest
+ * bookings included, at most 200 per run. Before a booking is cancelled its
+ * current checkout is checked at Paystack: one that was PAID is settled
+ * instead (the booking is confirmed), one still IN PROGRESS is left for a
+ * later run. Nobody is notified of a system cancel. The rules and the writes
+ * live in `consultationService.sweepAbandonedBookings`.
+ *
+ * Secrets: PAYSTACK_SECRET_KEY, for the Paystack lookup (the same key the
+ * `api` function uses). No email secrets: this job sends nothing.
+ * Timeout: one Paystack call per booking, so the full 9 minutes are allowed.
+ * Index: consultations(status, quoteExpiresAt) in firestore.indexes.json.
+ */
+export const sweepAbandonedConsultations = functions
+  .runWith({ timeoutSeconds: 540, memory: "256MB", secrets: ["PAYSTACK_SECRET_KEY"] })
+  .pubsub.schedule("20 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    console.log("Sweeping abandoned consultation bookings...");
+    try {
+      const result = await consultationService.sweepAbandonedBookings();
+      console.log(
+        `Abandoned consultation sweep: ${result.scanned} scanned, ${result.cancelled} cancelled, ` +
+          `${result.settled} settled as paid, ${result.leftInProgress} left in progress, ` +
+          `${result.skipped} skipped, ${result.errors} errors`
+      );
+    } catch (error) {
+      // Logged, never thrown: a failed run is simply retried by the next one.
+      console.error("Abandoned consultation sweep failed:", error);
+    }
+  });
+
+/**
+ * Every 15 minutes: retry consultation refunds that Paystack has not taken
+ * yet (issue #317).
+ *
+ * A refund row stays `pending` when its Paystack call failed or timed out.
+ * Each due row (`refundNextAttemptAt` passed) is sent again through
+ * `consultationRefundService.processRefund`, which FIRST looks the charge's
+ * refunds up at Paystack and adopts one it finds, so a call that did go
+ * through is never repeated. After 5 tries a row is `failed` (the client is
+ * told it is delayed) and admins list it with
+ * `GET /transactions?role=admin&type=refund&status=failed`.
+ *
+ * Secrets: PAYSTACK_SECRET_KEY (refund API), EMAIL_SECRETS (the "delayed"
+ * notice). Index: transactions(status, refundNextAttemptAt).
+ */
+export const retryConsultationRefunds = functions
+  .runWith({ timeoutSeconds: 300, memory: "256MB", secrets: ["PAYSTACK_SECRET_KEY", ...EMAIL_SECRETS] })
+  .pubsub.schedule("*/15 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    try {
+      const r = await consultationRefundService.retryDueRefunds();
+      console.log(
+        `Consultation refund retry: ${r.scanned} due, ${r.processing} processing, ${r.completed} completed, ` +
+          `${r.stillPending} still pending, ${r.failed} failed, ${r.errors} errors`
+      );
+    } catch (error) {
+      // Logged, never thrown: the next run retries.
+      console.error("Consultation refund retry failed:", error);
     }
   });
 

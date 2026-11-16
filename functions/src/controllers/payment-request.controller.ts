@@ -21,6 +21,15 @@
  *  - POST   /payment-requests/:id/verify  — Client returns from Paystack: settle
  *  - PUT    /payment-requests/:id/reject  — Client rejects with reason + auto-chat
  *  - DELETE /payment-requests/:id         — Delete a payment request
+ *
+ * Issue #332, RESPONSE SHAPE (every endpoint above, and the 409 bodies that
+ * carry `data.paymentRequest`): a request is answered through
+ * `presentPaymentRequestFor`. The request's CLIENT gets the allow-listed
+ * client view (payment-requests/client-payment-request.ts): no
+ * `fxMarginBps`, no raw `fxRate` / `fxRateAsOf` / `fxRateSource`, no
+ * `supersededCheckouts`; the charge comes with `effectiveRate` (amount
+ * charged ÷ dollar price, markup included). Agents, owners and admins get
+ * the full stored request, as before.
  */
 
 import { Response } from "express";
@@ -61,6 +70,13 @@ import { isPriceInputError, parseUsdPriceInput } from "../money/usd-price";
 import { Application, PaymentRequest, PaymentRequestCategory, PaymentRequestStatus } from "../types";
 import { ROLES } from "@durin-tech/authz";
 import { sendSuccess, sendError, sendNotFound, sendForbidden } from "../utils/response";
+// Issue #332: what a request's CLIENT may see of it (no FX markup, no raw
+// rate), and the one rule for who gets that view.
+import {
+  ClientPaymentRequest,
+  seesFullPaymentRequest,
+  toClientPaymentRequest,
+} from "../payment-requests/client-payment-request";
 
 /** The categories a payment request may carry (body `category`; default "other"). */
 const PAYMENT_REQUEST_CATEGORIES: ReadonlySet<PaymentRequestCategory> = new Set<PaymentRequestCategory>([
@@ -84,6 +100,31 @@ const MAX_DESCRIPTION_LENGTH = 500;
  */
 export function presentPaymentRequest(r: PaymentRequest): PaymentRequest & Record<string, unknown> {
   return { ...r, ...requestChargeSummary(r) };
+}
+
+/**
+ * Issue #332: a request in the shape THIS caller may receive.
+ *  - The agent side (an agent, owner or admin who is not the request's own
+ *    client): the full stored request plus the display fields
+ *    (`presentPaymentRequest`), exactly as before.
+ *  - Everyone else, first of all the request's client: the allow-listed
+ *    client view (`toClientPaymentRequest`), which carries no `fxMarginBps`,
+ *    no raw `fxRate` / `fxRateAsOf` / `fxRateSource` and no
+ *    `supersededCheckouts`; the charge comes with `effectiveRate` (amount
+ *    charged ÷ dollar price, markup included).
+ * The rule lives in `seesFullPaymentRequest`. It only picks the shape: each
+ * route has already decided that the caller may see or act on the request.
+ *
+ * @param req - The request as the auth middleware left it
+ * @param r - The full stored payment request
+ */
+export function presentPaymentRequestFor(
+  req: AuthenticatedRequest,
+  r: PaymentRequest
+): ClientPaymentRequest | (PaymentRequest & Record<string, unknown>) {
+  return seesFullPaymentRequest({ uid: req.user?.uid, role: req.authz?.role }, r)
+    ? presentPaymentRequest(r)
+    : toClientPaymentRequest(r);
 }
 
 /** Where Paystack returns the client after paying a request (unchanged by #181). */
@@ -169,7 +210,7 @@ class PaymentRequestController {
       }
 
       // Issue #181: each with its dollar price / charge and an explicit-currency display string.
-      return sendSuccess(res, requests.map(presentPaymentRequest));
+      return sendSuccess(res, requests.map((r) => presentPaymentRequestFor(req, r)));
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Unknown error";
       return sendError(res, "INTERNAL_ERROR", message, 500);
@@ -317,7 +358,7 @@ class PaymentRequestController {
         console.error("[payment-request] client notify failed:", e);
       }
 
-      return sendSuccess(res, presentPaymentRequest(request), "Payment request created", 201);
+      return sendSuccess(res, presentPaymentRequestFor(req, request), "Payment request created", 201);
     } catch (error: unknown) {
       console.error("[payment-request] create failed:", error);
       return sendError(res, "INTERNAL_ERROR", "Could not create the payment request", 500);
@@ -347,7 +388,7 @@ class PaymentRequestController {
 
       // Check if user is an admin
       if (req.authz?.role === ROLES.ADMIN) {
-        return sendSuccess(res, presentPaymentRequest(request));
+        return sendSuccess(res, presentPaymentRequestFor(req, request));
       }
 
       // Check if user is the creating agent or belongs to the same agency
@@ -365,11 +406,11 @@ class PaymentRequestController {
         // email, checkout URL, rate snapshot).
         //  1. the agent who created it (profile ids are doc ids: always set);
         if (request.agentId && request.agentId === agent.id) {
-          return sendSuccess(res, presentPaymentRequest(request));
+          return sendSuccess(res, presentPaymentRequestFor(req, request));
         }
         //  2. a member of the agency it is billed under (both ids present);
         if (request.agencyId && callerAgencyId && request.agencyId === callerAgencyId) {
-          return sendSuccess(res, presentPaymentRequest(request));
+          return sendSuccess(res, presentPaymentRequestFor(req, request));
         }
         //  3. the case's current assignee (`Application.agentId` is the
         //     agent's USER uid), e.g. after the case was reassigned.
@@ -377,14 +418,14 @@ class PaymentRequestController {
           const appSnap = await collections.applications.doc(request.applicationId).get();
           const assignee = appSnap.exists ? (appSnap.data() as Application).agentId : undefined;
           if (assignee && assignee === userId) {
-            return sendSuccess(res, presentPaymentRequest(request));
+            return sendSuccess(res, presentPaymentRequestFor(req, request));
           }
         }
       }
 
       // Check if user is the client on the request
       if (request.clientId === userId) {
-        return sendSuccess(res, presentPaymentRequest(request));
+        return sendSuccess(res, presentPaymentRequestFor(req, request));
       }
 
       // No matching access role found
@@ -492,7 +533,7 @@ class PaymentRequestController {
       // and is answered 502 below, with nothing written.
       if (checkedReference) {
         const { state, result } = await lookupCheckoutState(checkedReference);
-        if (state === "in_progress") return this.sendPaymentInProgress(res, request);
+        if (state === "in_progress") return this.sendPaymentInProgress(req, res, request);
         if (state === "paid") {
           // The client has paid: record it (the settlement checks the exact
           // amount; a mismatch is logged and left for a human), never cancel.
@@ -510,7 +551,7 @@ class PaymentRequestController {
       const outcome = await paymentRequestService.cancelByAgent(id, checkedReference);
       switch (outcome.kind) {
       case "cancelled":
-        return sendSuccess(res, presentPaymentRequest(outcome.request));
+        return sendSuccess(res, presentPaymentRequestFor(req, outcome.request));
       case "not_found":
         return sendNotFound(res, "Payment request not found");
       case "already_paid":
@@ -664,7 +705,7 @@ class PaymentRequestController {
         if (!published) return this.sendApproveLost(res);
         return sendSuccess(
           res,
-          { ...presentPaymentRequest(published), paystackReference: reference, authorizationUrl },
+          { ...presentPaymentRequestFor(req, published), paystackReference: reference, authorizationUrl },
           "Payment request approved — continue to payment"
         );
       }
@@ -697,14 +738,14 @@ class PaymentRequestController {
         return sendSuccess(
           res,
           {
-            ...presentPaymentRequest(state.paymentRequest),
+            ...presentPaymentRequestFor(req, state.paymentRequest),
             paystackReference: state.reference,
             authorizationUrl: state.authorizationUrl,
           },
           "Payment request approved — continue to payment"
         );
       }
-      return this.sendNoCheckout(res, state);
+      return this.sendNoCheckout(req, res, state);
     } catch (error: unknown) {
       if (this.sendIfProviderError(res, error, "payment request approve")) return;
       console.error("[payment-request] approve failed:", error);
@@ -747,7 +788,7 @@ class PaymentRequestController {
         return sendForbidden(res, "Only the client or admin can pay this request");
       }
       if (request.status === "paid") {
-        return sendSuccess(res, { requiresPayment: false, paymentRequest: presentPaymentRequest(request) });
+        return sendSuccess(res, { requiresPayment: false, paymentRequest: presentPaymentRequestFor(req, request) });
       }
       if (request.status !== "approved" || !isUsdPaymentRequest(request)) {
         return sendError(res, "REQUEST_NOT_PAYABLE", "This payment request cannot be paid", 409);
@@ -766,17 +807,17 @@ class PaymentRequestController {
         // Paid after all: settle it, never re-charge.
         if (state === "paid") {
           const outcome = await settlePaymentRequest(id, request.paystackReference, result!);
-          return this.sendSettleOutcome(res, outcome, request.paystackReference, "retry");
+          return this.sendSettleOutcome(req, res, outcome, request.paystackReference, "retry");
         }
         // A payment may still land on it: keep it, do not re-quote.
-        if (state === "in_progress") return this.sendPaymentInProgress(res, request);
+        if (state === "in_progress") return this.sendPaymentInProgress(req, res, request);
         // Inside the lock, with a published URL: hand back the same checkout.
         if (request.checkoutUrl && !isQuoteExpired(request)) {
           return sendSuccess(res, {
             requiresPayment: true,
             authorizationUrl: request.checkoutUrl,
             reference: request.paystackReference,
-            paymentRequest: presentPaymentRequest(request),
+            paymentRequest: presentPaymentRequestFor(req, request),
           });
         }
       }
@@ -794,10 +835,10 @@ class PaymentRequestController {
           requiresPayment: true,
           authorizationUrl: state.authorizationUrl,
           reference: state.reference,
-          paymentRequest: presentPaymentRequest(state.paymentRequest),
+          paymentRequest: presentPaymentRequestFor(req, state.paymentRequest),
         });
       }
-      return this.sendNoCheckout(res, state);
+      return this.sendNoCheckout(req, res, state);
     } catch (error: unknown) {
       if (this.sendIfProviderError(res, error, "payment request checkout")) return;
       console.error("[payment-request] checkout failed:", error);
@@ -854,7 +895,7 @@ class PaymentRequestController {
 
       // Already settled by this very reference — a refreshed callback URL is harmless.
       if (request.status === "paid" && request.paystackReference === reference) {
-        return sendSuccess(res, presentPaymentRequest(request), "Payment already completed");
+        return sendSuccess(res, presentPaymentRequestFor(req, request), "Payment already completed");
       }
 
       // ---- (1) The reference must be one WE issued for THIS request --------
@@ -881,12 +922,12 @@ class PaymentRequestController {
       const state = paystackState(result);
       if (state === "paid") {
         const outcome = await settlePaymentRequest(id, reference, result);
-        return this.sendSettleOutcome(res, outcome, reference, "verify");
+        return this.sendSettleOutcome(req, res, outcome, reference, "verify");
       }
 
       // Not paid.
       if (request.status === "paid") {
-        return sendSuccess(res, presentPaymentRequest(request), "Payment already completed");
+        return sendSuccess(res, presentPaymentRequestFor(req, request), "Payment already completed");
       }
       const awaiting = request.status === "approved" || (!isUsdPaymentRequest(request) && request.status === "pending");
       if (!awaiting) {
@@ -894,7 +935,7 @@ class PaymentRequestController {
       }
 
       // ---- (3) A payment may still land on this reference -------------------
-      if (state === "in_progress") return this.sendPaymentInProgress(res, request);
+      if (state === "in_progress") return this.sendPaymentInProgress(req, res, request);
 
       // ---- (4) Failed / abandoned on the CURRENT checkout -------------------
       if (isCurrent || legacyUnbound) {
@@ -903,23 +944,23 @@ class PaymentRequestController {
           // rather than stranding it in a terminal state (as before #181).
           return sendSuccess(
             res,
-            { ...presentPaymentRequest(request), paymentStatus: result.status },
+            { ...presentPaymentRequestFor(req, request), paymentStatus: result.status },
             "Payment not completed"
           );
         }
-        return this.answerReissue(res, request);
+        return this.answerReissue(req, res, request);
       }
 
       // ---- (5) Failed / abandoned on a SUPERSEDED checkout -------------------
       if (request.paystackReference && request.checkoutUrl) {
-        return this.sendCheckoutConflict(res, "CHECKOUT_REPLACED", "This checkout was replaced by a newer one.", {
+        return this.sendCheckoutConflict(req, res, "CHECKOUT_REPLACED", "This checkout was replaced by a newer one.", {
           authorizationUrl: request.checkoutUrl,
           reference: request.paystackReference,
           paymentRequest: request,
         });
       }
       // The current checkout never opened (a Paystack outage): issue one.
-      return this.answerReissue(res, request);
+      return this.answerReissue(req, res, request);
     } catch (error: unknown) {
       if (this.sendIfProviderError(res, error, "payment request verify")) return;
       console.error("[payment-request] verify failed:", error);
@@ -1021,10 +1062,10 @@ class PaymentRequestController {
         );
 
         // Return the rejected request along with the conversation ID for client navigation
-        return sendSuccess(res, { ...presentPaymentRequest(rejected), conversationId: conversation.id }, "Payment request rejected");
+        return sendSuccess(res, { ...presentPaymentRequestFor(req, rejected), conversationId: conversation.id }, "Payment request rejected");
       }
 
-      return sendSuccess(res, presentPaymentRequest(rejected), "Payment request rejected");
+      return sendSuccess(res, presentPaymentRequestFor(req, rejected), "Payment request rejected");
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Unknown error";
       return sendError(res, "INTERNAL_ERROR", message, 500);
@@ -1123,7 +1164,7 @@ class PaymentRequestController {
    * request paid meanwhile is 200; anything else as sendNoCheckout. No usable
    * rate: 503 before any Paystack call.
    */
-  private async answerReissue(res: Response, request: PaymentRequest): Promise<void> {
+  private async answerReissue(req: AuthenticatedRequest, res: Response, request: PaymentRequest): Promise<void> {
     let state: PaymentRequestCheckoutState;
     try {
       state = await reissuePaymentRequestCheckout(request, paymentRequestCallbackUrl());
@@ -1133,20 +1174,21 @@ class PaymentRequestController {
     }
     if (state.kind === "checkout") {
       return this.sendCheckoutConflict(
-        res,
+        req, res,
         "QUOTE_EXPIRED",
         "The price quote expired, so it was refreshed. Please pay the new amount.",
         state
       );
     }
     if (state.kind === "paid") {
-      return sendSuccess(res, presentPaymentRequest(state.paymentRequest), "Payment already completed");
+      return sendSuccess(res, presentPaymentRequestFor(req, state.paymentRequest), "Payment already completed");
     }
-    return this.sendNoCheckout(res, state);
+    return this.sendNoCheckout(req, res, state);
   }
 
   /** A 409 that carries a checkout the payer should use instead (QUOTE_EXPIRED, CHECKOUT_REPLACED, PAYMENT_IN_PROGRESS). */
   private sendCheckoutConflict(
+    req: AuthenticatedRequest,
     res: Response,
     code: string,
     message: string,
@@ -1159,7 +1201,7 @@ class PaymentRequestController {
       data: {
         authorizationUrl: checkout.authorizationUrl ?? null,
         reference: checkout.reference ?? null,
-        paymentRequest: presentPaymentRequest(checkout.paymentRequest),
+        paymentRequest: presentPaymentRequestFor(req, checkout.paymentRequest),
       },
     });
   }
@@ -1169,9 +1211,9 @@ class PaymentRequestController {
    * final (a bank transfer or USSD payment may still complete on it).
    * Nothing is re-quoted; the current checkout is returned unchanged.
    */
-  private sendPaymentInProgress(res: Response, r: PaymentRequest): void {
+  private sendPaymentInProgress(req: AuthenticatedRequest, res: Response, r: PaymentRequest): void {
     this.sendCheckoutConflict(
-      res,
+      req, res,
       "PAYMENT_IN_PROGRESS",
       "A payment for this request is still being processed. Please wait a few minutes and check again.",
       { authorizationUrl: r.checkoutUrl, reference: r.paystackReference, paymentRequest: r }
@@ -1179,10 +1221,10 @@ class PaymentRequestController {
   }
 
   /** Answer a checkout state that is not a usable checkout (paid, closed, or still opening). */
-  private sendNoCheckout(res: Response, state: Exclude<PaymentRequestCheckoutState, { kind: "checkout" }>): void {
+  private sendNoCheckout(req: AuthenticatedRequest, res: Response, state: Exclude<PaymentRequestCheckoutState, { kind: "checkout" }>): void {
     switch (state.kind) {
     case "paid":
-      sendSuccess(res, { requiresPayment: false, paymentRequest: presentPaymentRequest(state.paymentRequest) });
+      sendSuccess(res, { requiresPayment: false, paymentRequest: presentPaymentRequestFor(req, state.paymentRequest) });
       return;
     case "opening":
       // Another request is opening the checkout right now.
@@ -1201,6 +1243,7 @@ class PaymentRequestController {
    * #181), the checkout route `{ requiresPayment: false, paymentRequest }`.
    */
   private sendSettleOutcome(
+    req: AuthenticatedRequest,
     res: Response,
     outcome: PaymentRequestSettleOutcome | null,
     reference: string,
@@ -1208,8 +1251,8 @@ class PaymentRequestController {
   ): void {
     const ok = (r: PaymentRequest, message: string, extra: Record<string, unknown> = {}) =>
       mode === "verify"
-        ? sendSuccess(res, { ...presentPaymentRequest(r), ...extra }, message)
-        : sendSuccess(res, { requiresPayment: false, ...extra, paymentRequest: presentPaymentRequest(r) }, message);
+        ? sendSuccess(res, { ...presentPaymentRequestFor(req, r), ...extra }, message)
+        : sendSuccess(res, { requiresPayment: false, ...extra, paymentRequest: presentPaymentRequestFor(req, r) }, message);
     if (!outcome) return sendNotFound(res, "Payment request not found");
     switch (outcome.kind) {
     case "confirmed":

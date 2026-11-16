@@ -1722,7 +1722,7 @@ export class RubricReviewService {
       // computed under the PROPOSAL: a key from either set is accepted (a key
       // the decision resolves is simply not recorded as acknowledged), and
       // only a key that belongs to neither is refused.
-      // (#223) The flags of the rulebook AS IT WILL BE SERVED: a repaired protected rule is judged as its replacement.
+      // (#223) The flags of the rulebook as it will be SERVED: a repaired protected rule is judged as its replacement.
       const served = applyRuleRepairs({ ...rubric, ...plannerFields } as VisaRubric);
       const flags = reviewFlagsFor(served, input.intentPolarity);
       const proposedFlags = reviewFlagsFor(served, null);

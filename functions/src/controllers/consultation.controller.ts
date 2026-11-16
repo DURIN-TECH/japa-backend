@@ -1,6 +1,20 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { consultationService, ConsultationFilters } from "../services/consultation.service";
+import {
+  consultationService,
+  ConsultationFilters,
+  // Issue #151: the parties of a booking and the status rules they act under.
+  ConsultationActor,
+  CONSULTATION_ACTORS,
+  CONSULTATION_STATUSES,
+  SYSTEM_ONLY_STATUSES,
+  // Issue #316: the value checks and the "did it really move" test of the edit route.
+  parseEditBody,
+  scheduleChanged,
+  // Issues #316 / #288: a booking's time is stored as 24-hour `HH:mm`, on
+  // create as well as on edit, so "the same slot" compares like with like.
+  normalizeScheduledTime,
+} from "../services/consultation.service";
 import { notificationService } from "../services/notification.service";
 import { agencyService } from "../services/agency.service";
 import { userService } from "../services/user.service";
@@ -28,15 +42,31 @@ import {
   reissueCheckout,
   settlePayment,
   SettleOutcome,
-  snapshotOf,
 } from "../services/consultation-charge.service";
+// Issue #332: what a booking's CLIENT may see of it (no FX markup, no raw
+// rate), and the one rule for who gets that view.
+import { consultationFor, seesFullConsultation, toClientConsultation } from "../consultations/client-consultation";
+// Issue #317: the refund engine (rule preview, admin refund, Paystack call).
+import {
+  ADMIN_REFUND_REASONS,
+  cancellationRefundPreview,
+  consultationRefundService,
+  findFeeTransaction,
+  isPaidWithMoney,
+  MAX_REFUND_NOTE_LENGTH,
+  refundSummary,
+} from "../services/consultation-refund.service";
+import { chargeRuntime } from "../services/charge-checkout.service";
+import { clientChargeFields } from "../money/client-charge";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
 import { authController } from "./auth.controller";
-import { collections, auth } from "../utils/firebase";
+// Issue #321: `subcollections.messages` is read by the relationship check
+// (has the client written in a conversation with this agent?).
+import { collections, subcollections, auth } from "../utils/firebase";
 import {
   Agent,
+  Application,
   Consultation,
-  ConsultationStatus,
   ConsultationType,
   NotificationType,
 } from "../types";
@@ -55,9 +85,58 @@ import {
   ErrorMessages,
 } from "../utils/response";
 
+/**
+ * Issue #321: true when `id` can be used as ONE Firestore document id. The
+ * Firestore client throws (which would be a 500) on an empty id, an id with a
+ * "/", "." and "..", a reserved `__x__` id, and an id over 1500 bytes. Such a
+ * value can never name a user or an application, so the agent flow of
+ * `POST /consultations` answers 400 VALIDATION_ERROR before any read.
+ */
+function isUsableDocId(id: unknown): id is string {
+  return (
+    typeof id === "string" &&
+    id.length > 0 &&
+    !id.includes("/") &&
+    id !== "." &&
+    id !== ".." &&
+    !/^__.*__$/.test(id) &&
+    Buffer.byteLength(id, "utf8") <= 1500
+  );
+}
+
+/**
+ * Issue #321: how many conversations of one client with one agent the
+ * relationship check looks through for a message the client sent. There is
+ * one conversation per application the two share (plus one general chat), so
+ * a real pair has a handful. The cap only bounds the reads: past it the check
+ * answers "no relationship through conversations" (it fails closed).
+ */
+const CONVERSATIONS_CHECKED = 20;
+
+/**
+ * Issue #288: the two body shapes a pending booking's checkout is answered in
+ * (see `answerPendingCheckout`):
+ *  - "checkout": `POST /consultations/:id/checkout`: the checkout fields next
+ *    to a payer-safe `consultation` summary;
+ *  - "create": a RESUMED `POST /consultations`: the booking's own fields at
+ *    the top level, as a fresh create answers, plus `resumed: true`.
+ */
+type PendingCheckoutShape = "checkout" | "create";
+
+/** The 400 message for a `scheduledTime` that is neither accepted form (same wording as the edit route, #316). */
+const BAD_SCHEDULED_TIME = "scheduledTime must be a 24-hour HH:mm or a 12-hour h:mm AM/PM time";
+
 export class ConsultationController {
   /**
-   * GET /consultations?role=agent|owner|admin&status=...&type=...&startDate=...&endDate=...
+   * GET /consultations?role=agent|owner|admin|client&status=...&type=...&startDate=...&endDate=...
+   *
+   * Response shape (issue #332), decided PER BOOKING by `bookingFor`:
+   *  - a client (and anyone listing bookings they are the client of, e.g.
+   *    `role=client`) gets the allow-listed client view
+   *    (consultations/client-consultation.ts): no `fxMarginBps`, no raw
+   *    `fxRate` / `fxRateAsOf` / `fxRateSource`, no `supersededCheckouts`;
+   *    the charge comes with `effectiveRate` (amount charged ÷ dollar price);
+   *  - agents, owners and admins get the full stored booking, as before.
    */
   async getConsultations(
     req: AuthenticatedRequest,
@@ -120,7 +199,9 @@ export class ConsultationController {
       }
       }
 
-      sendSuccess(res, consultations);
+      // (#332) Never the stored documents for a client: each booking is
+      // answered in the shape this caller may see.
+      sendSuccess(res, consultations.map((c) => this.bookingFor(req, c)));
     } catch (error) {
       console.error("Error getting consultations:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -180,6 +261,10 @@ export class ConsultationController {
 
   /**
    * GET /consultations/:id
+   *
+   * Issue #332: the booking's client gets the allow-listed client view (no
+   * FX markup, no raw rate; see `bookingFor`); the agent side gets the full
+   * stored booking, as before.
    */
   async getConsultation(
     req: AuthenticatedRequest,
@@ -204,7 +289,22 @@ export class ConsultationController {
         return;
       }
 
-      sendSuccess(res, consultation);
+      // (#332) The shape depends on who is asking.
+      const view = this.bookingFor(req, consultation);
+      // (#317) The client view of a paid, not cancelled booking says what
+      // cancelling would give back (the mobile cancel screen reads this and
+      // never computes the rule itself). Server clock.
+      if (!seesFullConsultation({ uid: req.userId, role: req.authz?.role }, consultation)) {
+        // The fee's hold holds the slot the client PAID for (review fix:
+        // the window is never measured from a slot the agent moved earlier).
+        const fee = isPaidWithMoney(consultation) ? await findFeeTransaction(consultation) : null;
+        const preview = cancellationRefundPreview(consultation, chargeRuntime.now(), fee);
+        if (preview) {
+          sendSuccess(res, { ...view, cancellationRefund: preview });
+          return;
+        }
+      }
+      sendSuccess(res, view);
     } catch (error) {
       console.error("Error getting consultation:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -220,6 +320,22 @@ export class ConsultationController {
    *
    * The controller detects which flow by checking if the auth'd user has an agent profile.
    * If not, the auth'd user is treated as the client and `agentId` from the body is used.
+   *
+   * Issue #246 (agent-initiated only): the client must ALREADY be a client of
+   * the caller or the caller's agency (an application, a conversation or an
+   * earlier consultation: see `isClientOfAgent`), and a sent `applicationId`
+   * must be that client's application with this agent or agency. Otherwise
+   * 403 FORBIDDEN with nothing written, no quote, no checkout and no email;
+   * a `userId` that does not exist gets the same 403. The client-initiated
+   * flow is unchanged.
+   *
+   * Issue #321: only a link the agent could NOT have made alone counts (a
+   * conversation the client started or wrote in; a consultation the client
+   * booked themselves or paid for: see `isClientOfAgent`). Every booking
+   * stores how it was made (`bookedVia`: "agent" here for the agent flow,
+   * "client" for the client flow). A `userId` or `applicationId` that cannot
+   * be a Firestore document id (`.`, `..`, `__x__`, a "/", over 1500 bytes)
+   * is 400 VALIDATION_ERROR before any read.
    *
    * PRICE (issue #180, folds #166): the SERVER decides it. The fee is the
    * booking agent's own `consultationFeeUsd` (US dollars, #179), read from
@@ -243,6 +359,41 @@ export class ConsultationController {
    * value is 400 VALIDATION_ERROR before anything is read or written. The
    * choice is stored on the booking (`checkoutCallbackUrl`) and kept by every
    * re-priced checkout.
+   *
+   * Issue #288 (both flows): `scheduledTime` may be 24-hour `HH:mm` or
+   * 12-hour `h:mm AM/PM` and is always STORED as `HH:mm`; anything else, or a
+   * `scheduledDate` that is not a date, is 400 VALIDATION_ERROR before any
+   * read or write.
+   *
+   * Issue #288, RESUME (client-initiated flow only): when the caller already
+   * has an unpaid (`pending_payment`) booking with the same agent, the same
+   * `scheduledDate` (same instant) and the same `scheduledTime`, NO new
+   * booking is written. The newest such booking is answered exactly as
+   * `POST /consultations/:id/checkout` would answer it (`answerPendingCheckout`):
+   *  - 200 (not 201) with the booking's fields, `requiresPayment`,
+   *    `authorizationUrl`, `reference` and `resumed: true`: the SAME checkout
+   *    inside the quote lock, a fresh quote and checkout after it;
+   *  - 200 with `requiresPayment: false` and `resumed: true` when Paystack
+   *    says that checkout was in fact paid (it is settled here);
+   *  - 409 PAYMENT_IN_PROGRESS (with `data.consultation.id`) when Paystack
+   *    reports it in progress: nothing written, nothing re-priced;
+   *  - 409 CHECKOUT_OPENING (with `data.consultation.id`) when another
+   *    request is opening the checkout right now.
+   * A resume is not a new booking, so it is decided BEFORE the monthly limit
+   * and the pricing and counts against neither. `returnTo: "app"` applies to
+   * any NEW checkout a resume issues. A booking of that slot that is paid,
+   * free or cancelled is not resumed: a new one is created as before. The
+   * find-or-create is one Firestore transaction
+   * (`createOrResumePendingBooking`), so two requests that arrive together
+   * leave exactly one booking. The agent-initiated flow never resumes.
+   *
+   * Issue #332, RESPONSE SHAPE: a client who books (201, and the resumed
+   * 200) gets the allow-listed client view of the booking
+   * (consultations/client-consultation.ts) plus the checkout fields: no
+   * `fxMarginBps`, no raw `fxRate` / `fxRateAsOf` / `fxRateSource`; the
+   * charge comes with `effectiveRate` (amount charged ÷ dollar price, markup
+   * included). An agent or owner who books for a client still gets the full
+   * stored booking.
    */
   async createConsultation(
     req: AuthenticatedRequest,
@@ -285,6 +436,25 @@ export class ConsultationController {
         return;
       }
 
+      // Issue #288 (add-on from #316): the time is stored as 24-hour `HH:mm`
+      // whichever accepted form was sent, so a later request for "the same
+      // slot" matches it. A value that is neither form is a plain 400.
+      const normalizedTime = normalizeScheduledTime(scheduledTime);
+      if (normalizedTime === null) {
+        sendError(res, "VALIDATION_ERROR", BAD_SCHEDULED_TIME);
+        return;
+      }
+      // The day, parsed once: it is stored below and compared (as an instant)
+      // with the client's unpaid bookings. An unparseable value used to throw
+      // inside Timestamp.fromDate and answer 500.
+      const scheduledAt = new Date(scheduledDate);
+      if (Number.isNaN(scheduledAt.getTime())) {
+        sendError(res, "VALIDATION_ERROR", "scheduledDate must be a valid date");
+        return;
+      }
+      const { Timestamp } = await import("firebase-admin/firestore");
+      const scheduledTimestamp = Timestamp.fromDate(scheduledAt);
+
       // Determine if auth'd user is an agent or a client
       const agentProfile = await this.getAgentForUser(authUserId);
 
@@ -302,6 +472,23 @@ export class ConsultationController {
           sendError(res, "VALIDATION_ERROR", "userId (client) is required when booking as agent");
           return;
         }
+        // Issue #246: the ids are used in queries and as a document id below,
+        // so they must be plain non-empty strings.
+        // Issue #321: and they must be USABLE document ids. Firestore throws
+        // on `doc(".")`, `doc("..")`, a reserved `__x__` id and an id over
+        // 1500 bytes, which used to surface as a 500; such an id can never
+        // name a user or an application, so it is a plain 400 before any read.
+        if (typeof bodyClientId !== "string" || !bodyClientId.trim() || !isUsableDocId(bodyClientId)) {
+          sendError(res, "VALIDATION_ERROR", "userId (client) must be a user id");
+          return;
+        }
+        if (
+          applicationId !== undefined && applicationId !== null && applicationId !== "" &&
+          !isUsableDocId(applicationId)
+        ) {
+          sendError(res, "VALIDATION_ERROR", "applicationId must be an application id");
+          return;
+        }
         resolvedClientId = bodyClientId;
         resolvedAgentUserId = authUserId;
         // The agency comes from the RESOLVED PRINCIPAL (issue #138), not from
@@ -313,6 +500,33 @@ export class ConsultationController {
         agentAgencyId = req.authz?.agencyId ?? undefined;
         agentDisplayName = agentProfile.displayName;
         pricingAgent = agentProfile;
+
+        // Issue #246: an agent (or agency owner) may book only for a client
+        // they or their agency ALREADY work with. Without this, any agent
+        // could name any uid: the booking would send a real Paystack checkout
+        // to a stranger's email and the response would hand back that
+        // person's name and email.
+        //
+        // This runs BEFORE the client's user document is read, and a stranger
+        // and a uid that does not exist get the SAME 403, so the route never
+        // tells the caller which users exist. Nothing has been written, no
+        // quote locked, no checkout opened and no email sent at this point.
+        const related = await this.isClientOfAgent(
+          resolvedClientId,
+          authUserId,
+          agentProfile.id,
+          agentAgencyId
+        );
+        // A linked application must be one of THIS client's with this agent
+        // or agency (same 403: a foreign id must not be told apart either).
+        const applicationOk =
+          !related || !applicationId
+            ? true
+            : await this.isApplicationOfClientWithAgent(applicationId, resolvedClientId, authUserId, agentAgencyId);
+        if (!related || !applicationOk) {
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
+        }
       } else {
         // Client-initiated flow: auth'd user is the client, body has agentId
         if (!bodyAgentId) {
@@ -356,6 +570,28 @@ export class ConsultationController {
         return;
       }
       const client = clientDoc.data()!;
+
+      // --- Issue #288: resume the client's unpaid booking of this slot ------
+      // Client flow only. Done BEFORE the monthly limit and the pricing: a
+      // resume writes no new booking, so it neither counts against the limit
+      // nor needs a rate (inside the quote lock the same checkout is simply
+      // handed back). `returnTo` is passed on as on POST /:id/checkout: it
+      // sets the return URL of a NEW checkout only.
+      if (!agentProfile) {
+        const pending = await consultationService.findResumableBooking({
+          userId: resolvedClientId,
+          agentId: resolvedAgentUserId,
+          scheduledDate: scheduledTimestamp,
+          scheduledTime: normalizedTime,
+        });
+        if (pending) {
+          await this.answerPendingCheckout(res, pending, {
+            requestedCallbackUrl: selectCallbackUrl(returnTo.value),
+            shape: "create",
+          });
+          return;
+        }
+      }
 
       // Enforce the per-plan monthly consultation limit for the booking subscriber
       // (agency / independent agent / client — matches whose entitlements loaded).
@@ -424,20 +660,25 @@ export class ConsultationController {
         ? selectCallbackUrl(returnTo.value, this.signedInCallbackUrl()) ?? this.signedInCallbackUrl()
         : undefined;
 
-      const { Timestamp } = await import("firebase-admin/firestore");
-
-      const consultation = await consultationService.createConsultation({
+      // The booking to store (the same fields for a plain create and for the
+      // find-or-create below).
+      const booking = {
         userId: resolvedClientId,
         agentId: resolvedAgentUserId,
         // Firestore rejects undefined: only set the optional links when known.
         ...(agentAgencyId ? { agencyId: agentAgencyId } : {}),
         ...(applicationId ? { applicationId } : {}),
+        // Issue #321: how the booking was made, fixed at creation. An
+        // agent-made booking is a relationship only once paid; one the
+        // signed-in client made themselves is one straight away.
+        bookedVia: agentProfile ? ("agent" as const) : ("client" as const),
         clientName: `${client.firstName || ""} ${client.lastName || ""}`.trim(),
         clientEmail: client.email,
         agentName: agentDisplayName,
         type,
-        scheduledDate: Timestamp.fromDate(new Date(scheduledDate)),
-        scheduledTime,
+        scheduledDate: scheduledTimestamp,
+        // #288: always the normalised 24-hour `HH:mm`.
+        scheduledTime: normalizedTime,
         durationMinutes: durationMinutes || 30,
         timezone: timezone || "Africa/Lagos",
         ...(meetingPlatform ? { meetingPlatform } : {}),
@@ -446,10 +687,37 @@ export class ConsultationController {
         ...(charge
           ? { ...charge, status: "pending_payment" as const, paymentStatus: "pending" as const }
           : { priceUsdCents: 0, status: "scheduled" as const, paymentStatus: "paid" as const }),
-      });
+      };
+
+      let consultation: Consultation;
+      if (charge && !agentProfile) {
+        // Issue #288: a client's PAID booking is find-or-create in ONE
+        // transaction. The early look above found nothing, but a second
+        // request for the same slot (a double tap, two devices) may have
+        // written its booking since; then that one is resumed here and
+        // nothing is written, so the two requests leave exactly one booking.
+        const outcome = await consultationService.createOrResumePendingBooking(booking);
+        if (outcome.kind === "existing") {
+          await this.answerPendingCheckout(res, outcome.consultation, {
+            requestedCallbackUrl: selectCallbackUrl(returnTo.value),
+            shape: "create",
+          });
+          return;
+        }
+        consultation = outcome.consultation;
+      } else {
+        // A free booking, or one an agent makes: created as before (#288
+        // leaves the agent flow unchanged; a free booking is never pending).
+        consultation = await consultationService.createConsultation(booking);
+      }
+
+      // (#332) The booking in the shape this caller may see: the client view
+      // for a client booking for themselves, the stored document for an
+      // agent or owner booking for a client.
+      const answered = this.bookingFor(req, consultation);
 
       if (!charge) {
-        sendCreated(res, { ...consultation, requiresPayment: false });
+        sendCreated(res, { ...answered, requiresPayment: false });
         return;
       }
 
@@ -471,7 +739,7 @@ export class ConsultationController {
       }
       const { authorizationUrl, reference } = state;
       sendCreated(res, {
-        ...consultation,
+        ...answered,
         transactionId: reference,
         checkoutUrl: authorizationUrl,
         requiresPayment: true,
@@ -541,75 +809,9 @@ export class ConsultationController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
-      if (consultation.paymentStatus === "paid") {
-        sendSuccess(res, { requiresPayment: false, consultation: bookingSummary(consultation) });
-        return;
-      }
-      // Only a #180-priced pending booking can be (re)charged; a legacy row
-      // is never re-priced and a cancelled one is closed.
-      if (consultation.status !== "pending_payment" || !hasChargeSnapshot(consultation)) {
-        sendError(res, "BOOKING_NOT_PAYABLE", "This booking cannot be paid", 409);
-        return;
-      }
-
-      // A current checkout: what does Paystack say about it?
-      //
-      // Issue #181 review round 2 (shared with payment requests): asked
-      // whenever the booking carries a reference, not only when a URL was
-      // published, so a checkout that opened at Paystack but whose publish
-      // never landed is still checked for a payment before it is replaced.
-      // A `cons-` reference we claimed that Paystack never opened (initialize
-      // failed after the claim) answers `final_unpaid` (lookupCheckoutState)
-      // instead of a 502 on every retry; an outage is still 502.
-      if (consultation.transactionId) {
-        const { state, result } = await lookupCheckoutState(consultation.transactionId);
-        // Paid after all: settle it, never re-charge.
-        if (state === "paid") {
-          const outcome = await settlePayment(id, consultation.transactionId, result!);
-          this.sendSettleOutcome(res, outcome, consultation.transactionId, "retry");
-          return;
-        }
-        // A payment may still land on it: keep it, do not re-price.
-        if (state === "in_progress") {
-          this.sendPaymentInProgress(res, consultation);
-          return;
-        }
-        // Inside the lock, with a published URL: hand back the same checkout.
-        if (consultation.checkoutUrl && !isQuoteExpired(consultation)) {
-          sendSuccess(res, {
-            requiresPayment: true,
-            authorizationUrl: consultation.checkoutUrl,
-            reference: consultation.transactionId,
-            consultation: bookingSummary(consultation),
-          });
-          return;
-        }
-      }
-
-      // Lock passed (or no checkout opened): a fresh quote and a new checkout.
-      let state: CheckoutState;
-      try {
-        state = await reissueCheckout(consultation, {
-          fallbackCallbackUrl: this.signedInCallbackUrl(),
-          // #285: the app return page when asked for on this call; else
-          // (undefined) the booking's stored return URL is kept.
-          callbackUrl: requestedCallbackUrl,
-        });
-      } catch (err) {
-        if (!isPricingFailure(err)) throw err;
-        this.sendPricingUnavailable(res);
-        return;
-      }
-      if (state.kind === "checkout") {
-        sendSuccess(res, {
-          requiresPayment: true,
-          authorizationUrl: state.authorizationUrl,
-          reference: state.reference,
-          consultation: bookingSummary(state.consultation),
-        });
-        return;
-      }
-      this.sendNoCheckout(res, state);
+      // Everything from here on is shared with a resumed POST /consultations
+      // (issue #288): see `answerPendingCheckout`.
+      await this.answerPendingCheckout(res, consultation, { requestedCallbackUrl, shape: "checkout" });
     } catch (error) {
       if (this.sendIfProviderError(res, error, "consultation checkout retry")) return;
       console.error("Error resuming consultation checkout:", error);
@@ -619,6 +821,57 @@ export class ConsultationController {
 
   /**
    * PUT /consultations/:id
+   *
+   * Issue #316: an edit is allowed only for the AGENT SIDE of the booking,
+   * and only for the fields that make sense in the booking's status. (It
+   * used to need only READ access, so the client, or anyone else who could
+   * read the booking, could move its time or rewrite its meeting link, and a
+   * booking could be rescheduled while its checkout was open.)
+   *
+   * Parties (see `consultationActor`): the AGENT SIDE is the booking's
+   * `agentId`, the owner of its agency, or an admin. The CLIENT (`userId`)
+   * edits nothing here: clients cancel through `PUT /consultations/:id/status`.
+   * An agent of the same agency who is not the booking's agent is not a party.
+   *
+   * Editable fields (anything else in the body is ignored):
+   *  - schedule: `scheduledDate`, `scheduledTime`, `durationMinutes`, `timezone`
+   *  - meeting:  `meetingLink`, `meetingPlatform`, `type`
+   *  - `summary`
+   *
+   * The rules live in ONE helper, `decideEdit` (consultation.service.ts):
+   *
+   *   status           | schedule fields          | meeting fields | summary
+   *   -----------------|--------------------------|----------------|--------
+   *   pending_payment  | yes, unless a payment is | yes            | yes
+   *                    | in flight (409           |                |
+   *                    | PAYMENT_IN_PROGRESS)     |                |
+   *   scheduled        | yes                      | yes            | yes
+   *   confirmed        | yes                      | yes            | yes
+   *   in_progress      | 409                      | yes            | yes
+   *   completed        | 409                      | 409            | yes
+   *   cancelled        | 409                      | 409            | 409
+   *   no_show          | 409                      | 409            | 409
+   *
+   * Answers, in the order they are checked:
+   *  - 400 VALIDATION_ERROR: no editable field in the body, or a bad value
+   *    (see `parseEditBody` for the rule per field), whoever asks.
+   *    `scheduledTime` may be 24-hour `HH:mm` or 12-hour `h:mm AM/PM` (what
+   *    the portal's time picker sends); it is always stored as `HH:mm`;
+   *  - 404: unknown id;
+   *  - 403 FORBIDDEN: the caller is the client, or not a party at all;
+   *  - 409 BOOKING_NOT_EDITABLE: a field that is closed in the booking's
+   *    status (a plain "409" in the table);
+   *  - 409 PAYMENT_IN_PROGRESS: a schedule field on a `pending_payment`
+   *    booking whose checkout (`transactionId`) is still inside its quote
+   *    lock (`quoteExpiresAt` in the future). Meeting fields and `summary`
+   *    are still saved then.
+   *
+   * One body is all or nothing: a single refused field refuses the whole
+   * edit. EVERY refusal writes nothing and notifies nobody. A saved edit
+   * answers the updated booking; when a stored schedule value really changed
+   * the client is told (`consultation_rescheduled`), and so is the booking's
+   * agent when the agency's owner or an admin made the change. Resending the
+   * values the booking already holds saves without notifying anyone.
    */
   async updateConsultation(
     req: AuthenticatedRequest,
@@ -628,60 +881,64 @@ export class ConsultationController {
       const userId = req.userId!;
       const { id } = req.params;
 
-      const existing = await consultationService.getConsultationById(id);
-      if (!existing) {
+      // 400 first, before the booking is read: the body must name at least
+      // one editable field and every value must be well formed.
+      const parsed = parseEditBody(req.body);
+      if (!parsed.ok) {
+        sendError(res, "VALIDATION_ERROR", parsed.message);
+        return;
+      }
+
+      // Decide and write in one transaction (see editConsultation): the
+      // caller's party and the field table are judged on the freshly read
+      // booking, so a payment cannot land between the check and the write.
+      const outcome = await consultationService.editConsultation(
+        id,
+        (booking) => this.consultationActor(req, booking),
+        parsed.updates
+      );
+
+      if (outcome.kind === "not_found") {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
-
-      const hasAccess = can(
-        req,
-        "read",
-        asSubject("Consultation", existing as unknown as Record<string, unknown>)
-      );
-      if (!hasAccess) {
-        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+      if (outcome.kind === "refused") {
+        // Nothing was written; no notification is sent for a refusal.
+        const { code, httpStatus, message } = outcome.refusal;
+        sendError(res, code, code === "FORBIDDEN" ? ErrorMessages.FORBIDDEN : message, httpStatus);
         return;
       }
 
-      // Only allow updating certain fields
-      const allowedFields = [
-        "scheduledDate", "scheduledTime", "durationMinutes", "timezone",
-        "meetingLink", "meetingPlatform", "type", "summary",
-      ];
-      const updates: Record<string, unknown> = {};
-      for (const field of allowedFields) {
-        if (req.body[field] !== undefined) {
-          updates[field] = req.body[field];
+      const existing = outcome.before;
+
+      // A saved schedule change: tell the client, and also the booking's
+      // agent when someone else on the agent side (owner, admin) made it.
+      // The person who made the change is never told about their own edit.
+      // Only a stored value that really changed counts: resending the time
+      // a booking already has saves, but is not a reschedule.
+      if (scheduleChanged(existing, outcome.consultation)) {
+        const recipients = [...new Set([existing.userId, existing.agentId])].filter(
+          (uid): uid is string => !!uid && uid !== userId
+        );
+        for (const recipient of recipients) {
+          await notificationService
+            .notifyUser({
+              userId: recipient,
+              type: "consultation_rescheduled",
+              title: "Consultation rescheduled",
+              body:
+                recipient === existing.userId
+                  ? "Your consultation has been rescheduled — check the new time."
+                  : "A consultation with your client has been rescheduled — check the new time.",
+              relatedEntityType: "consultation",
+              relatedEntityId: id,
+            })
+            // A failed notification must not fail the edit that was saved.
+            .catch((e) => console.error("[consultation] reschedule notify failed:", e));
         }
       }
 
-      // Convert scheduledDate string to Timestamp
-      if (updates.scheduledDate && typeof updates.scheduledDate === "string") {
-        const { Timestamp } = await import("firebase-admin/firestore");
-        updates.scheduledDate = Timestamp.fromDate(new Date(updates.scheduledDate as string));
-      }
-
-      const updated = await consultationService.updateConsultation(id, updates as Partial<Consultation>);
-
-      // If the time changed, notify the other party it was rescheduled.
-      const rescheduled =
-        req.body.scheduledDate !== undefined || req.body.scheduledTime !== undefined;
-      const recipient = userId === existing.userId ? existing.agentId : existing.userId;
-      if (rescheduled && recipient) {
-        await notificationService
-          .notifyUser({
-            userId: recipient,
-            type: "consultation_rescheduled",
-            title: "Consultation rescheduled",
-            body: "Your consultation has been rescheduled — check the new time.",
-            relatedEntityType: "consultation",
-            relatedEntityId: id,
-          })
-          .catch((e) => console.error("[consultation] reschedule notify failed:", e));
-      }
-
-      sendSuccess(res, updated);
+      sendSuccess(res, outcome.consultation);
     } catch (error) {
       console.error("Error updating consultation:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -690,6 +947,56 @@ export class ConsultationController {
 
   /**
    * PUT /consultations/:id/status
+   *
+   * Issue #151: a status change is allowed only for the party and the
+   * starting status it makes sense for (it used to need only READ access, so
+   * either party could mark an unpaid booking scheduled/confirmed, a client
+   * could mark one completed, and a booking could be cancelled mid-payment).
+   *
+   * Parties (see `consultationActor`): the CLIENT is the booking's `userId`;
+   * the AGENT SIDE is its `agentId`, the owner of its agency, or an admin.
+   * The rules live in ONE helper, `decideStatusChange`
+   * (consultation.service.ts):
+   *
+   *   target       | client from                 | agent side from
+   *   -------------|-----------------------------|--------------------------------------
+   *   confirmed    | never (403)                 | scheduled
+   *   in_progress  | never (403)                 | scheduled, confirmed
+   *   completed    | never (403)                 | scheduled, confirmed, in_progress
+   *   no_show      | never (403)                 | scheduled, confirmed, in_progress
+   *   cancelled    | pending_payment, scheduled, | pending_payment, scheduled, confirmed
+   *                | confirmed                   |
+   *
+   * Answers, in the order they are checked:
+   *  - 400 VALIDATION_ERROR: no `status`, an unknown one, or `pending_payment`
+   *    / `scheduled` as the target (only booking creation and payment verify
+   *    write those), whoever asks;
+   *  - 404: unknown id;
+   *  - 403 FORBIDDEN: the caller is not a party, or is the client asking for
+   *    anything but `cancelled`;
+   *  - 409 INVALID_STATUS_TRANSITION: a move not in the table (wrong starting
+   *    status, out of a terminal `completed` / `cancelled` / `no_show`, or an
+   *    unpaid `pending_payment` booking to anything but `cancelled`);
+   *  - 409 PAYMENT_IN_PROGRESS: cancelling a `pending_payment` booking whose
+   *    checkout (`transactionId`) is still inside its quote lock
+   *    (`quoteExpiresAt` in the future). After the lock (or with no checkout)
+   *    the cancel goes through; a payment that still lands on the cancelled
+   *    booking is recorded for refund by `settlePayment`
+   *    (`consultationPaymentExceptions`, reason `booking_not_payable`).
+   *
+   *  - 409 FEE_RELEASED (issue #317): the agent side cancelling a PAID
+   *    booking whose fee was already released (the meeting has happened).
+   *
+   * EVERY refusal writes nothing and notifies nobody. An allowed change
+   * answers as before (the updated booking) and notifies the other party.
+   *
+   * Issue #317, REFUNDS on a cancel of a PAID booking (rule in
+   * services/consultation-refund.service.ts): the agent side, or the client
+   * 24 h or more before the slot, gets a full refund: a `refund` Transaction
+   * is written in the same Firestore transaction as the cancel (under the
+   * agent's withdrawal lock), then sent to Paystack. A client cancelling less
+   * than 24 h before gets none. Every allowed answer carries `refund`:
+   * `{ status, amount: { amountMinor, currency } }`, or null.
    */
   async updateStatus(
     req: AuthenticatedRequest,
@@ -705,36 +1012,64 @@ export class ConsultationController {
         return;
       }
 
-      const validStatuses: ConsultationStatus[] = [
-        "pending_payment", "scheduled", "confirmed", "in_progress",
-        "completed", "cancelled", "no_show",
-      ];
-      if (!validStatuses.includes(status)) {
+      if (!CONSULTATION_STATUSES.includes(status)) {
         sendError(res, "VALIDATION_ERROR", `Invalid status: ${status}`);
         return;
       }
 
-      const existing = await consultationService.getConsultationById(id);
-      if (!existing) {
+      // Issue #151: `pending_payment` and `scheduled` are never accepted from
+      // a caller. Answered here, before the booking is read, so it is a plain
+      // 400 for anyone (the helper refuses them too, as a second line).
+      if (SYSTEM_ONLY_STATUSES.includes(status)) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          `A consultation cannot be set to ${status}: that status is set when it is booked or paid`
+        );
+        return;
+      }
+
+      // Decide and write in one transaction (see changeStatus): the caller's
+      // party and the transition are judged on the freshly read booking.
+      const outcome = await consultationService.changeStatus(
+        id,
+        (booking) => this.consultationActor(req, booking),
+        status,
+        {
+          cancelledBy: status === "cancelled" ? userId : undefined,
+          cancellationReason,
+          summary,
+        }
+      );
+
+      if (outcome.kind === "not_found") {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
-
-      const hasAccess = can(
-        req,
-        "read",
-        asSubject("Consultation", existing as unknown as Record<string, unknown>)
-      );
-      if (!hasAccess) {
-        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+      if (outcome.kind === "refused") {
+        // Nothing was written; no notification is sent for a refusal.
+        const { code, httpStatus, message } = outcome.refusal;
+        sendError(res, code, code === "FORBIDDEN" ? ErrorMessages.FORBIDDEN : message, httpStatus);
         return;
       }
 
-      const updated = await consultationService.updateStatus(id, status, {
-        cancelledBy: status === "cancelled" ? userId : undefined,
-        cancellationReason,
-        summary,
-      });
+      const existing = outcome.before;
+      let updated = outcome.consultation;
+
+      // ---- Issue #317: send a new refund to Paystack (after the commit) ----
+      // A Paystack failure never fails the cancel: the row stays `pending`
+      // and the 15-minute job retries it.
+      let refund = outcome.refund;
+      if (outcome.refundCreated && refund) {
+        try {
+          refund = (await consultationRefundService.processRefund(refund.id)) ?? refund;
+        } catch (e) {
+          console.error(`[consultation] refund ${refund.id} could not be sent yet; the retry job will:`, e);
+        }
+        // The booking mirrors the row's latest status.
+        updated = { ...updated, refundStatus: refund.status as typeof updated.refundStatus };
+        await consultationRefundService.notifyCreated(refund, updated);
+      }
 
       // Notify the OTHER party of a meaningful status transition.
       const typeByStatus: Record<string, NotificationType> = {
@@ -743,6 +1078,8 @@ export class ConsultationController {
         cancelled: "consultation_cancelled",
       };
       const notifType = typeByStatus[status];
+      // The client acting: tell the agent. Anyone on the agent side (the
+      // agent, the agency's owner, an admin): tell the client.
       const recipient = userId === existing.userId ? existing.agentId : existing.userId;
       if (notifType && recipient) {
         const copy: Record<string, { title: string; body: string }> = {
@@ -765,7 +1102,10 @@ export class ConsultationController {
           .catch((e) => console.error("[consultation] status notify failed:", e));
       }
 
-      sendSuccess(res, updated);
+      // (#332) A client cancelling their own booking gets the client view
+      // (no FX markup, no raw rate); the agent side the full booking.
+      // (#317) Plus the refund outcome: a summary, or null.
+      sendSuccess(res, { ...this.bookingFor(req, updated), refund: refund ? refundSummary(refund) : null });
     } catch (error) {
       console.error("Error updating consultation status:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -773,7 +1113,109 @@ export class ConsultationController {
   }
 
   /**
+   * POST /consultations/:id/refund  (issue #317, admins only)
+   *
+   * Body `{ reason: "agent_no_show" | "goodwill" | "other", note? }`; `note`
+   * is required for "other" (at most 1000 characters).
+   *
+   *  - not an admin: 403 FORBIDDEN, before the booking is read;
+   *  - a bad body: 400 VALIDATION_ERROR, before the booking is read;
+   *  - unknown id: 404;
+   *  - free or unpaid (or paid with no settled Paystack fee): 409 NOTHING_TO_REFUND;
+   *  - a refund that is pending / processing / completed: 409 ALREADY_REFUNDED;
+   *  - a refund that FAILED: that same row is retried (back to pending,
+   *    then sent to Paystack, which is first asked whether it already holds
+   *    one): 200 with `refund` and `retried: true`;
+   *  - otherwise a full refund through the same path as a cancel: 201 with
+   *    `refund` and the booking. The booking's status is not changed.
+   * The refund of a fee still held comes out of the hold; of a released fee,
+   * off the agent's available balance (may go negative, #351).
+   */
+  async refundConsultation(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      // Admins only, checked first: no read for anyone else.
+      if (req.authz?.role !== ROLES.ADMIN) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const body = (req.body ?? {}) as { reason?: unknown; note?: unknown };
+      const reason = typeof body.reason === "string" ? ADMIN_REFUND_REASONS[body.reason] : undefined;
+      if (!reason || !Object.prototype.hasOwnProperty.call(ADMIN_REFUND_REASONS, body.reason as string)) {
+        sendError(res, "VALIDATION_ERROR", `reason must be one of: ${Object.keys(ADMIN_REFUND_REASONS).join(", ")}`);
+        return;
+      }
+      if (body.note !== undefined && (typeof body.note !== "string" || body.note.length > MAX_REFUND_NOTE_LENGTH)) {
+        sendError(res, "VALIDATION_ERROR", `note must be text of at most ${MAX_REFUND_NOTE_LENGTH} characters`);
+        return;
+      }
+      const note = typeof body.note === "string" && body.note.trim() ? body.note.trim() : undefined;
+      if (body.reason === "other" && !note) {
+        sendError(res, "VALIDATION_ERROR", "note is required when reason is other");
+        return;
+      }
+
+      const outcome = await consultationRefundService.adminRefund({
+        consultationId: req.params.id,
+        adminUid: req.userId!,
+        reason,
+        note,
+      });
+      switch (outcome.kind) {
+      case "not_found":
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      case "nothing_to_refund":
+        sendError(res, "NOTHING_TO_REFUND", outcome.message, 409);
+        return;
+      case "already_refunded":
+        sendError(res, "ALREADY_REFUNDED", "This consultation already has a refund.", 409);
+        return;
+      case "retried":
+      case "created": {
+        // Send it to Paystack now; a failure leaves it for the retry job.
+        let refund = outcome.refund;
+        try {
+          refund = (await consultationRefundService.processRefund(refund.id)) ?? refund;
+        } catch (e) {
+          console.error(`[consultation] admin refund ${refund.id} could not be sent yet; the retry job will:`, e);
+        }
+        const booking = { ...outcome.booking, refundStatus: refund.status as typeof outcome.booking.refundStatus };
+        if (outcome.kind === "created") {
+          await consultationRefundService.notifyCreated(refund, booking);
+          sendCreated(res, { refund: refundSummary(refund), refundId: refund.id, consultation: booking }, "Refund started");
+          return;
+        }
+        sendSuccess(res, { refund: refundSummary(refund), refundId: refund.id, retried: true, consultation: booking });
+        return;
+      }
+      }
+    } catch (error) {
+      console.error("Error refunding consultation:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * DELETE /consultations/:id
+   *
+   * Issue #151: a hard delete is for ADMINS ONLY. It used to need only read
+   * access, so either party could remove a booking, even one being paid for.
+   * The client and the agent side cancel instead
+   * (`PUT /consultations/:id/status { status: "cancelled" }`), which keeps
+   * the record. Neither the portal nor the mobile app calls this route.
+   *
+   *  - not an admin: 403 FORBIDDEN, before the booking is even read (so the
+   *    route does not tell a non-admin which ids exist);
+   *  - unknown id: 404;
+   *  - the booking carries a payment (a `transactionId`, or
+   *    `paymentStatus: "paid"` with a non-zero charge; a FREE booking, paid
+   *    at $0 with no transaction, does not and can be deleted):
+   *    409 BOOKING_HAS_PAYMENT, nothing removed, even for an admin. A
+   *    payment landing on a deleted booking could not be recorded at all
+   *    (`settlePayment` returns null for a missing booking).
+   *
+   * A refusal removes nothing and notifies nobody. A delete answers 204 and
+   * tells the client the consultation was cancelled, as before.
    */
   async deleteConsultation(
     req: AuthenticatedRequest,
@@ -783,23 +1225,28 @@ export class ConsultationController {
       const userId = req.userId!;
       const { id } = req.params;
 
-      const existing = await consultationService.getConsultationById(id);
-      if (!existing) {
-        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
-        return;
-      }
-
-      const hasAccess = can(
-        req,
-        "read",
-        asSubject("Consultation", existing as unknown as Record<string, unknown>)
-      );
-      if (!hasAccess) {
+      // Admins only. Checked first: no read, no write for anyone else.
+      if (req.authz?.role !== ROLES.ADMIN) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
 
-      await consultationService.deleteConsultation(id);
+      // The payment check and the delete are one transaction (see the service).
+      const outcome = await consultationService.deleteUnpaidConsultation(id);
+      if (outcome.kind === "not_found") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (outcome.kind === "has_payment") {
+        sendError(
+          res,
+          "BOOKING_HAS_PAYMENT",
+          "This consultation has a payment or an open checkout and cannot be deleted. Cancel it instead.",
+          409
+        );
+        return;
+      }
+      const existing = outcome.consultation;
 
       // Notify the other party that the consultation was cancelled.
       const recipient = userId === existing.userId ? existing.agentId : existing.userId;
@@ -846,6 +1293,11 @@ export class ConsultationController {
    * `chargedCurrency`. Free only when the fee is missing or a valid $0. A
    * malformed fee, or no usable rate, is 503 PRICING_UNAVAILABLE BEFORE any
    * account, booking or checkout is created.
+   *
+   * Issue #288: `scheduledTime` is stored as 24-hour `HH:mm` (12-hour
+   * `h:mm AM/PM` is converted; anything else is 400). A guest booking is
+   * NEVER resumed here (each submit makes its own booking); an unpaid one is
+   * closed by the hourly cleanup like any other.
    */
   async createPublicConsultation(
     req: AuthenticatedRequest,
@@ -883,6 +1335,15 @@ export class ConsultationController {
       const normalizedEmail = clientEmail.trim().toLowerCase();
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedEmail)) {
         sendError(res, "VALIDATION_ERROR", "A valid clientEmail is required", 400);
+        return;
+      }
+      // Issue #288 (add-on from #316): the time is stored as 24-hour `HH:mm`
+      // on this path too (the page's time input already sends that; 12-hour
+      // `h:mm AM/PM` is converted). Anything else is a 400 before the agency
+      // is read, an account is made or a price is locked.
+      const normalizedTime = normalizeScheduledTime(scheduledTime);
+      if (normalizedTime === null) {
+        sendError(res, "VALIDATION_ERROR", BAD_SCHEDULED_TIME, 400);
         return;
       }
       // Constrain the free-text type to the known set; default to "initial".
@@ -972,12 +1433,17 @@ export class ConsultationController {
         userId: clientUid,
         agentId: agency.ownerId, // owner acts as the booking agent for guest flow
         agencyId: agency.id,
+        // Issue #321: a guest typed this email on the public page. Anyone can
+        // type anyone's email, so this booking is a relationship with the
+        // agency only once it is paid (see `isClientOfAgent`).
+        bookedVia: "public_page" as const,
         clientName: clientName.trim(),
         clientEmail: normalizedEmail,
         agentName: agency.ownerName,
         type: consultType,
         scheduledDate: Timestamp.fromDate(new Date(scheduledDate)),
-        scheduledTime,
+        // #288: always the normalised 24-hour `HH:mm`.
+        scheduledTime: normalizedTime,
         durationMinutes: 30,
         timezone: timezone || "Africa/Lagos",
         // Paid: the locked snapshot; free: priceUsdCents 0 and no Paystack.
@@ -1022,8 +1488,10 @@ export class ConsultationController {
           authorizationUrl,
           reference,
           // What the guest is about to pay, and until when this price holds.
-          ...snapshotOf(charge),
-          quoteExpiresAt: charge.quoteExpiresAt,
+          // (#332) Only the payer-safe charge fields: the dollar price, the
+          // amount charged, the effective rate and the lock times. Never
+          // the raw rate or the margin (a guest is a client too).
+          ...clientChargeFields(charge),
         });
         return;
       }
@@ -1178,6 +1646,135 @@ export class ConsultationController {
   // ============================================
 
   /**
+   * Answer where a client's own booking stands with its payment, issuing a
+   * checkout when one is needed. The ONE implementation behind both
+   * `POST /consultations/:id/checkout` (issue #180) and a resumed
+   * `POST /consultations` (issue #288), so the two can never disagree. The
+   * caller has already checked that the booking is the caller's own.
+   *
+   *  - Already paid: `requiresPayment: false` with the booking.
+   *  - Not `pending_payment`, or a legacy row with no charge snapshot (never
+   *    re-priced): 409 BOOKING_NOT_PAYABLE.
+   *  - The current checkout (`transactionId`) is asked about at Paystack:
+   *     * paid after all: settled here (`settlePayment`), never re-charged;
+   *     * in progress: 409 PAYMENT_IN_PROGRESS with the SAME checkout;
+   *       nothing written, nothing re-priced;
+   *     * otherwise, inside the quote lock with a published URL: the SAME
+   *       checkout is handed back (no second charge is opened).
+   *  - Lock passed, or no checkout was ever opened: a FRESH quote and a new
+   *    checkout (`reissueCheckout`, race-safe). No usable rate: 503. A lost
+   *    race answers with the booking's current state (`sendNoCheckout`; 409
+   *    CHECKOUT_OPENING carries `data.consultation.id`).
+   *
+   * Provider failures throw (`PAYSTACK_ERROR: ...`); the calling route's
+   * catch answers 502.
+   *
+   * @param opts.requestedCallbackUrl issue #285: the return URL asked for on
+   *   THIS call (`returnTo: "app"`), applied to a NEW checkout only;
+   *   undefined keeps the booking's stored one
+   * @param opts.shape the body shape of the answer (see PendingCheckoutShape)
+   */
+  private async answerPendingCheckout(
+    res: Response,
+    consultation: Consultation,
+    opts: { requestedCallbackUrl?: string; shape: PendingCheckoutShape }
+  ): Promise<void> {
+    const { shape } = opts;
+    const id = consultation.id;
+
+    if (consultation.paymentStatus === "paid") {
+      this.sendBooking(res, shape, consultation, { requiresPayment: false });
+      return;
+    }
+    // Only a #180-priced pending booking can be (re)charged; a legacy row
+    // is never re-priced and a cancelled one is closed.
+    if (consultation.status !== "pending_payment" || !hasChargeSnapshot(consultation)) {
+      sendError(res, "BOOKING_NOT_PAYABLE", "This booking cannot be paid", 409);
+      return;
+    }
+
+    // A current checkout: what does Paystack say about it?
+    //
+    // Issue #181 review round 2 (shared with payment requests): asked
+    // whenever the booking carries a reference, not only when a URL was
+    // published, so a checkout that opened at Paystack but whose publish
+    // never landed is still checked for a payment before it is replaced.
+    // A `cons-` reference we claimed that Paystack never opened (initialize
+    // failed after the claim) answers `final_unpaid` (lookupCheckoutState)
+    // instead of a 502 on every retry; an outage is still 502.
+    if (consultation.transactionId) {
+      const { state, result } = await lookupCheckoutState(consultation.transactionId);
+      // Paid after all: settle it, never re-charge.
+      if (state === "paid") {
+        const outcome = await settlePayment(id, consultation.transactionId, result!);
+        this.sendSettleOutcome(res, outcome, consultation.transactionId, shape === "create" ? "resume" : "retry");
+        return;
+      }
+      // A payment may still land on it: keep it, do not re-price.
+      if (state === "in_progress") {
+        this.sendPaymentInProgress(res, consultation);
+        return;
+      }
+      // Inside the lock, with a published URL: hand back the same checkout.
+      if (consultation.checkoutUrl && !isQuoteExpired(consultation)) {
+        this.sendBooking(res, shape, consultation, {
+          requiresPayment: true,
+          authorizationUrl: consultation.checkoutUrl,
+          reference: consultation.transactionId,
+        });
+        return;
+      }
+    }
+
+    // Lock passed (or no checkout opened): a fresh quote and a new checkout.
+    let state: CheckoutState;
+    try {
+      state = await reissueCheckout(consultation, {
+        fallbackCallbackUrl: this.signedInCallbackUrl(),
+        // #285: the app return page when asked for on this call; else
+        // (undefined) the booking's stored return URL is kept.
+        callbackUrl: opts.requestedCallbackUrl,
+      });
+    } catch (err) {
+      if (!isPricingFailure(err)) throw err;
+      this.sendPricingUnavailable(res);
+      return;
+    }
+    if (state.kind === "checkout") {
+      this.sendBooking(res, shape, state.consultation, {
+        requiresPayment: true,
+        authorizationUrl: state.authorizationUrl,
+        reference: state.reference,
+      });
+      return;
+    }
+    this.sendNoCheckout(res, state, shape);
+  }
+
+  /**
+   * 200 with a booking and its payment fields, in the asked shape (issue
+   * #288, see PendingCheckoutShape):
+   *  - "checkout": `{ ...fields, consultation: <payer-safe summary> }`;
+   *  - "create": `{ ...<the booking>, ...fields, resumed: true }`, the shape
+   *    of a fresh create (which answers 201), so the app handles both alike.
+   *    The booking is the caller's own, as on a fresh create, so it is
+   *    ALWAYS the client view (issue #332: `toClientConsultation`, no FX
+   *    markup and no raw rate). Only the client-initiated flow resumes.
+   */
+  private sendBooking(
+    res: Response,
+    shape: PendingCheckoutShape,
+    c: Consultation,
+    fields: Record<string, unknown>
+  ): void {
+    if (shape === "create") {
+      sendSuccess(res, { ...toClientConsultation(c), ...fields, resumed: true });
+      return;
+    }
+    sendSuccess(res, { ...fields, consultation: bookingSummary(c) });
+  }
+
+  /**
    * Re-price on verify (issue #180) and answer: a checkout (new, or the
    * winner's after a lost race) is 409 `code` with it; a booking paid
    * meanwhile is 200 verified; anything else as sendNoCheckout. No usable
@@ -1246,15 +1843,37 @@ export class ConsultationController {
     );
   }
 
-  /** Answer a checkout state that is not a usable checkout (paid, closed, or still opening). */
-  private sendNoCheckout(res: Response, state: Exclude<CheckoutState, { kind: "checkout" }>): void {
+  /**
+   * Answer a checkout state that is not a usable checkout (paid, closed, or
+   * still opening).
+   *
+   * Issue #288: EVERY 409 CHECKOUT_OPENING (fresh create, resumed create,
+   * `/:id/checkout`, the guest booking) names the booking in
+   * `data.consultation` (the payer-safe `bookingSummary`, so
+   * `data.consultation.id` is the booking). The app keeps that id and retries
+   * through `POST /consultations/:id/checkout` instead of creating again.
+   *
+   * @param shape how a `paid` state is answered (see PendingCheckoutShape);
+   *   only a resumed create passes "create"
+   */
+  private sendNoCheckout(
+    res: Response,
+    state: Exclude<CheckoutState, { kind: "checkout" }>,
+    shape: PendingCheckoutShape = "checkout"
+  ): void {
     switch (state.kind) {
     case "paid":
-      sendSuccess(res, { requiresPayment: false, consultation: bookingSummary(state.consultation) });
+      this.sendBooking(res, shape, state.consultation, { requiresPayment: false });
       return;
     case "opening":
-      // Another request is opening the checkout right now.
-      sendError(res, "CHECKOUT_OPENING", "Your checkout is being prepared. Please try again in a moment.", 409);
+      // Another request is opening the checkout right now. No checkout to
+      // hand out yet, only which booking it is for.
+      res.status(409).json({
+        success: false,
+        error: "CHECKOUT_OPENING",
+        message: "Your checkout is being prepared. Please try again in a moment.",
+        data: { consultation: bookingSummary(state.consultation) },
+      });
       return;
     case "not_payable":
     default:
@@ -1266,20 +1885,25 @@ export class ConsultationController {
   /**
    * Answer the result of settling a successful Paystack payment (issue
    * #180). `mode` picks the success shape: verify answers `{ verified }`,
-   * the retry route `{ requiresPayment: false }`.
+   * the retry route `{ requiresPayment: false }`, both next to a payer-safe
+   * `consultation` summary. Issue #288: `resume` (a resumed
+   * `POST /consultations` that found its checkout paid) answers in the create
+   * shape: the booking's own fields, `requiresPayment: false`, `resumed: true`.
    */
   private sendSettleOutcome(
     res: Response,
     outcome: SettleOutcome | null,
     reference: string,
-    mode: "verify" | "retry"
+    mode: "verify" | "retry" | "resume"
   ): void {
     const ok = (c: Consultation, extra: Record<string, unknown> = {}) =>
-      sendSuccess(res, {
-        ...(mode === "verify" ? { verified: true } : { requiresPayment: false }),
-        ...extra,
-        consultation: bookingSummary(c),
-      });
+      mode === "resume"
+        ? this.sendBooking(res, "create", c, { requiresPayment: false, ...extra })
+        : sendSuccess(res, {
+          ...(mode === "verify" ? { verified: true } : { requiresPayment: false }),
+          ...extra,
+          consultation: bookingSummary(c),
+        });
     if (!outcome) {
       sendError(res, "NOT_FOUND", "Consultation not found", 404);
       return;
@@ -1357,6 +1981,19 @@ export class ConsultationController {
   }
 
   /**
+   * Issue #332: `booking` in the shape THIS caller may receive. The agent
+   * side (an agent, owner or admin who is not the booking's own client) gets
+   * the full stored document; everyone else, first of all the booking's
+   * client, gets the allow-listed client view, which carries no
+   * `fxMarginBps` and no raw rate. The rule itself lives in
+   * `seesFullConsultation` (consultations/client-consultation.ts). It only
+   * picks the shape: each route has already decided the caller may read it.
+   */
+  private bookingFor(req: AuthenticatedRequest, booking: Consultation) {
+    return consultationFor({ uid: req.userId, role: req.authz?.role }, booking);
+  }
+
+  /**
    * Where Paystack returns a signed-in payer. The app's pay screen (#183)
    * intercepts this URL and posts the reference to /consultations/public/verify.
    */
@@ -1364,6 +2001,203 @@ export class ConsultationController {
     return `${EMAIL_BRANDING.appUrl}/consultations/confirm`;
   }
 
+  /**
+   * Issue #151: which party of `booking` the caller is, or null when neither.
+   *
+   *  - AGENT SIDE: the booking's agent (`agentId` is a user uid) WHILE their
+   *    current role is `agent` or `owner`, the OWNER whose resolved agency
+   *    (`req.authz.agencyId`) is the booking's agency, or an admin. Checked
+   *    first: it may do everything a client may.
+   *  - CLIENT: the booking's `userId`.
+   *
+   * An agent of the same agency who is not the booking's own agent is NOT a
+   * party (they may read it, not change its status).
+   *
+   * Issue #321 (former agents): `booking.agentId` is written once and never
+   * cleared, so on its own it would keep giving agent-side rights to a user
+   * who has since been removed as an agent (their role is back to `client`).
+   * The booking's agent is therefore agent side only while the role resolved
+   * for THIS request (`req.authz.role`) is `agent` or `owner`. A former agent
+   * is no party of their old bookings (403), unless they are also the
+   * booking's `userId`, in which case they are its CLIENT and nothing more.
+   * Admins and the owner of the booking's agency are unchanged.
+   *
+   * Used by BOTH `PUT /consultations/:id/status` (#151) and
+   * `PUT /consultations/:id` (#316, `decideEdit`), so the two routes always
+   * agree on who the agent side is.
+   */
+  private consultationActor(req: AuthenticatedRequest, booking: Consultation): ConsultationActor | null {
+    const uid = req.userId;
+    if (!uid) return null;
+    const role = req.authz?.role;
+    const isAdmin = role === ROLES.ADMIN;
+    // #321: named on the booking AND still on the agent side today.
+    const isBookingAgent = booking.agentId === uid && (role === ROLES.AGENT || role === ROLES.OWNER);
+    // Both sides must NAME an agency: an owner with none must never match a
+    // booking that merely has no `agencyId`.
+    const isAgencyOwner =
+      role === ROLES.OWNER &&
+      !!req.authz?.agencyId &&
+      !!booking.agencyId &&
+      booking.agencyId === req.authz.agencyId;
+    if (isAdmin || isBookingAgent || isAgencyOwner) return CONSULTATION_ACTORS.AGENT_SIDE;
+    if (booking.userId === uid) return CONSULTATION_ACTORS.CLIENT;
+    return null;
+  }
+
+  /**
+   * Issues #246 and #321: does the calling agent (or their agency) already
+   * work with this client? The link must be one the agent could NOT have
+   * made alone from a typed email or a uid (#321). True when at least one of
+   * these exists:
+   *
+   *  - an APPLICATION of the client that is assigned to the caller
+   *    (`agentId` = the caller's uid) or belongs to the caller's agency;
+   *  - a CONVERSATION between the client and the caller that the client
+   *    STARTED (`startedBy: "user"`) or has SENT A MESSAGE in (a message with
+   *    `senderType: "user"` and `senderId` = the client). An agent can open a
+   *    conversation with any uid and write in it, so the agent's own side of
+   *    a chat proves nothing. NOTE: on conversations `agentId` is the agent
+   *    DOCUMENT id, not a user uid;
+   *  - an earlier CONSULTATION of the client with the caller (`agentId` = the
+   *    caller's uid) or with the caller's agency, in any status, that the
+   *    client BOOKED THEMSELVES while signed in (`bookedVia: "client"`, free
+   *    or not) or that was PAID through Paystack (`paymentStatus: "paid"`
+   *    with `paidAt`, which only `settlePayment` writes). A guest booking
+   *    from the public page and a booking an agent made count only once
+   *    paid: both can be made for anyone's email or uid, and a FREE one is
+   *    stored `paymentStatus: "paid"` with no `paidAt`, so it never counts.
+   *
+   * Rows from before #321 have neither `bookedVia` nor `startedBy`: they
+   * count only through the paid check or the client-message check (no
+   * backfill; nothing had been released to real users).
+   *
+   * QUERIES. Every relationship query is equality filters with `limit(1)`:
+   *  - applications, the `bookedVia` consultations and the `startedBy`
+   *    conversations: equality filters only, no composite index;
+   *  - the PAID consultations: equality filters plus `orderBy("paidAt")`.
+   *    Firestore leaves a document that lacks the ordered field out of the
+   *    result, so the `limit(1)` answer is always a booking that really has
+   *    `paidAt` (a free booking next to a paid one cannot hide it). This one
+   *    needs a composite index: see `firestore.indexes.json` (consultations:
+   *    userId, agentId | agencyId, paymentStatus, paidAt);
+   *  - the client-message check: the conversations of the pair are read
+   *    (bounded, see CONVERSATIONS_CHECKED), then one two-equality `limit(1)`
+   *    query on each one's `messages`.
+   *
+   * None of them reads the client's user document, so the answer is the same
+   * for a stranger and for a uid that does not exist.
+   *
+   * @param agentUid the caller's user uid
+   * @param agentDocId the caller's agent document id
+   * @param agencyId the caller's RESOLVED agency (`req.authz.agencyId`), if any
+   */
+  private async isClientOfAgent(
+    clientId: string,
+    agentUid: string,
+    agentDocId: string,
+    agencyId: string | undefined
+  ): Promise<boolean> {
+    /** "Does a doc of this client exist with ALL of these field values?" */
+    const exists = async (
+      collection: FirebaseFirestore.CollectionReference,
+      equals: Record<string, string>
+    ): Promise<boolean> => {
+      let query = collection.where("userId", "==", clientId);
+      for (const [field, value] of Object.entries(equals)) query = query.where(field, "==", value);
+      return !(await query.limit(1).get()).empty;
+    };
+
+    /**
+     * An earlier consultation that counts (#321), with the caller
+     * (`agentId`) or the caller's agency (`agencyId`): one the client booked
+     * themselves, or one that was paid through Paystack.
+     */
+    const consultationCounts = async (field: "agentId" | "agencyId", value: string): Promise<boolean> => {
+      const [bookedByClient, paid] = await Promise.all([
+        exists(collections.consultations, { [field]: value, bookedVia: "client" }),
+        // `orderBy("paidAt")` keeps only bookings that HAVE `paidAt` (see the
+        // QUERIES note above); the in-memory check below is a second guard.
+        collections.consultations
+          .where("userId", "==", clientId)
+          .where(field, "==", value)
+          .where("paymentStatus", "==", "paid")
+          .orderBy("paidAt", "desc")
+          .limit(1)
+          .get()
+          .then((snap) => snap.docs.some((d) => !!(d.data() as Consultation).paidAt)),
+      ]);
+      return bookedByClient || paid;
+    };
+
+    /**
+     * A conversation with the caller that counts (#321): one the client
+     * started, or one the client has sent at least one message in.
+     */
+    const conversationCounts = async (): Promise<boolean> => {
+      if (await exists(collections.conversations, { agentId: agentDocId, startedBy: "user" })) return true;
+      // Not client-started (or made before #321): look for a message the
+      // CLIENT sent. `senderId` cannot be forged by the agent: the API writes
+      // the caller's own uid, and the Firestore rules allow a client-side
+      // message only with `senderId == request.auth.uid`.
+      const pair = await collections.conversations
+        .where("userId", "==", clientId)
+        .where("agentId", "==", agentDocId)
+        .limit(CONVERSATIONS_CHECKED)
+        .get();
+      const clientWrote = await Promise.all(
+        pair.docs.map(async (conversation) =>
+          !(
+            await subcollections
+              .messages(conversation.id)
+              .where("senderType", "==", "user")
+              .where("senderId", "==", clientId)
+              .limit(1)
+              .get()
+          ).empty
+        )
+      );
+      return clientWrote.some(Boolean);
+    };
+
+    const checks: Promise<boolean>[] = [
+      exists(collections.applications, { agentId: agentUid }),
+      conversationCounts(),
+      consultationCounts("agentId", agentUid),
+    ];
+    // The agency-wide links apply only to a caller who is in an agency.
+    if (agencyId) {
+      checks.push(
+        exists(collections.applications, { agencyId }),
+        consultationCounts("agencyId", agencyId)
+      );
+    }
+    return (await Promise.all(checks)).some(Boolean);
+  }
+
+  /**
+   * Issue #246: is `applicationId` an application of THIS client with the
+   * calling agent or their agency? False for an unknown id, another client's
+   * application, or one that belongs to a different agent / agency.
+   */
+  private async isApplicationOfClientWithAgent(
+    applicationId: string,
+    clientId: string,
+    agentUid: string,
+    agencyId: string | undefined
+  ): Promise<boolean> {
+    const doc = await collections.applications.doc(applicationId).get();
+    if (!doc.exists) return false;
+    const application = doc.data() as Application;
+    if (application.userId !== clientId) return false;
+    return application.agentId === agentUid || (!!agencyId && application.agencyId === agencyId);
+  }
+
+  /**
+   * The caller's agent profile, or null when they have none (a client).
+   * `id` is always the agent DOCUMENT id (issue #246 matches conversations
+   * on it), taken from the snapshot in case the stored data lacks it.
+   */
   private async getAgentForUser(userId: string): Promise<Agent | null> {
     const snapshot = await collections.agents
       .where("userId", "==", userId)
@@ -1371,7 +2205,8 @@ export class ConsultationController {
       .get();
 
     if (snapshot.empty) return null;
-    return snapshot.docs[0].data() as Agent;
+    const doc = snapshot.docs[0];
+    return { ...(doc.data() as Agent), id: doc.id };
   }
 }
 

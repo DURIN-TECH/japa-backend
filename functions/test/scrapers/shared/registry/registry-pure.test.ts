@@ -10,6 +10,8 @@ import { ROLES } from "@durin-tech/authz";
 import { lookupRegionName, parseRegistryHost, parseRegistryUrl } from "../../../../src/scrapers/shared/registry/registry-address";
 import { DEFAULT_REGISTRY_SETTINGS, resolveRegistrySettings } from "../../../../src/scrapers/shared/registry/registry-settings";
 import { leastLoadedWeekday, parseRegisterRouteBody } from "../../../../src/scrapers/shared/registry/route-registration.service";
+// #322: the shared rule for the country-code check (comments and sentences are ignored).
+import { hasCountryCode } from "../../../helpers/country-code-guard";
 
 describe("parseRegistryUrl / parseRegistryHost", () => {
   test("a plain https address passes and is normalised; query strings are kept", () => {
@@ -116,7 +118,10 @@ describe("the registry code is generic", () => {
     assert.ok(names.length >= 12);
     for (const n of names) assert.deepEqual(offenders(new RegExp(`\\b${esc(n)}\\b`, "i")), [], n);
     const codes = values(path.join("data", "seed-countries-visas.ts"), ["code", "countryCode"]).filter((c) => /^[A-Z]{2}$/.test(c));
-    for (const c of codes) assert.deepEqual(offenders(new RegExp(`\\b${c}\\b`)), [], c);
+    // #322: a code is searched in the CODE only (test/helpers/country-code-guard.ts):
+    // inside a comment or a sentence string it is an English word ("NO", "IS");
+    // an identifier, a whole string literal or a string with no space still fails.
+    for (const c of codes) assert.deepEqual([...text].filter(([, t]) => hasCountryCode(t, c)).map(([f]) => f), [], c);
     const md = fs.readFileSync(path.join(SRC, "scrapers", "visa-catalog", "data", "official_visa_links_verified_v3.md"), "utf8");
     for (const m of md.matchAll(/^##\s+\d+\.\s+(.+?)\s*$/gm)) assert.deepEqual(offenders(new RegExp(`\\b${esc(m[1])}\\b`, "i")), [], m[1]);
   });

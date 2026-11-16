@@ -1,0 +1,71 @@
+[
+ {
+  "countryCodes": [
+   "GR"
+  ],
+  "joinedOn": "2000-01-01",
+  "sourceUrl": "https://publications.europa.eu/resource/celex/31999D0848",
+  "sourceQuote": "Controls on persons at internal borders between Greece and the Member States which fully apply the Schengen acquis shall be lifted in the period from 1 January 2000 to 26 March 2000."
+ },
+ {
+  "countryCodes": [
+   "DK",
+   "FI",
+   "SE",
+   "IS",
+   "NO"
+  ],
+  "joinedOn": "2001-03-25",
+  "sourceUrl": "https://publications.europa.eu/resource/celex/32000D0777",
+  "sourceQuote": "As from 25 March 2001, and subject to Article 3(2): (a) all the provisions of the Schengen acquis referred to in Annexes A, B, C and D to Council Decision 1999/436/EC of 20 May 1999 determining, in conformity with the relevant provisions of the Treaty establishing the European Community and the Treaty on European Union, the legal basis for each of the provisions or decisions which constitute the Schengen acquis, and any act adopted by the Council establishing an instrument which has entered into force and constitutes a further development of one or more of these provisions, shall apply to Denmark, Finland and Sweden, in their relations between each other and with Belgium, Germany, Greece, Spain, France, Italy, Luxembourg, Netherlands, Austria and Portugal; (b) all the provisions referred to in Annexes A and B to the Agreement of 18 May 1999 concluded by the Council of the European Union, the Republic of Iceland and the Kingdom of Norway concerning the latters' association with the implementation, application, and development of the Schengen acquis, and any act adopted by the Council establishing an instrument which has entered into force and constitutes a further development of one or more of these provisions, shall apply to Iceland and Norway, in their relations between each other and with Belgium, Denmark, Germany, Greece, Spain, France, Italy, Luxembourg, Netherlands, Austria, Portugal, Finland and Sweden."
+ },
+ {
+  "countryCodes": [
+   "CZ",
+   "EE",
+   "LV",
+   "LT",
+   "HU",
+   "MT",
+   "PL",
+   "SI",
+   "SK"
+  ],
+  "joinedOn": "2007-12-21",
+  "sourceUrl": "https://publications.europa.eu/resource/celex/32007D0801",
+  "sourceQuote": "COUNCIL DECISION of 6 December 2007 on the full application of the provisions of the Schengen acquis in the Czech Republic, the Republic of Estonia, the Republic of Latvia, the Republic of Lithuania, the Republic of Hungary, the Republic of Malta, the Republic of Poland, the Republic of Slovenia and the Slovak Republic [...] The provisions of the Schengen acquis referred to in Annex I shall apply to the Member States concerned amongst themselves and in their relations with the Kingdom of Belgium, the Kingdom of Denmark, the Federal Republic of Germany, the Hellenic Republic, the Kingdom of Spain, the Republic of France, the Italian Republic, the Grand Duchy of Luxembourg, the Kingdom of the Netherlands, the Republic of Austria, the Portuguese Republic, the Republic of Finland and the Kingdom of Sweden, as well as with the Republic of Iceland and the Kingdom of Norway as from 21 December 2007."
+ },
+ {
+  "countryCodes": [
+   "CH"
+  ],
+  "joinedOn": "2008-12-12",
+  "sourceUrl": "https://publications.europa.eu/resource/celex/32008D0903",
+  "sourceQuote": "All the provisions referred to in Annexes A and B to the Agreement and any act constituting a further development of one or more of these provisions, shall apply to the Swiss Confederation, in its relations with Kingdom of Belgium, the Czech Republic, the Kingdom of Denmark, the Federal Republic of Germany, the Republic of Estonia, the Hellenic Republic, the Kingdom of Spain, the French Republic, the Italian Republic, the Republic of Latvia, the Republic of Lithuania, the Grand Duchy of Luxembourg, the Republic of Hungary, the Republic of Malta, the Kingdom of the Netherlands, the Republic of Austria, the Republic of Poland, the Portuguese Republic, the Republic of Slovenia, the Slovak Republic, the Republic of Finland, and the Kingdom of Sweden as from 12 December 2008."
+ },
+ {
+  "countryCodes": [
+   "LI"
+  ],
+  "joinedOn": "2011-12-19",
+  "sourceUrl": "https://publications.europa.eu/resource/celex/32011D0842",
+  "sourceQuote": "All the provisions referred to in Annexes A and B to the Agreement between the European Union, the European Community and the Swiss Confederation on the Swiss Confederation’s association with the implementation, application and development of the Schengen acquis and all the provisions listed in the Annex to the Protocol to that Agreement and any act constituting a further development of one or more of these provisions, shall apply to the Principality of Liechtenstein, in its relations with the Kingdom of Belgium, the Czech Republic, the Kingdom of Denmark, the Federal Republic of Germany, the Republic of Estonia, the Hellenic Republic, the Kingdom of Spain, the French Republic, the Italian Republic, the Republic of Latvia, the Republic of Lithuania, the Grand Duchy of Luxembourg, Hungary, Malta, the Kingdom of the Netherlands, the Republic of Austria, the Republic of Poland, the Portuguese Republic, the Republic of Slovenia, the Slovak Republic, the Republic of Finland, and the Kingdom of Sweden as from 19 December 2011."
+ },
+ {
+  "countryCodes": [
+   "HR"
+  ],
+  "joinedOn": "2023-01-01",
+  "sourceUrl": "https://publications.europa.eu/resource/celex/32022D2451",
+  "sourceQuote": "From 1 January 2023, checks on persons at internal land and sea borders with Croatia shall be lifted and the provisions of the Schengen acquis referred to in the Annex shall apply to Croatia in its relations with the Kingdom of Belgium, the Czech Republic, the Kingdom of Denmark, the Federal Republic of Germany, the Republic of Estonia, the Hellenic Republic, the Kingdom of Spain, the French Republic, the Italian Republic, the Republic of Latvia, the Republic of Lithuania, the Grand Duchy of Luxembourg, Hungary, Malta, the Kingdom of the Netherlands, the Republic of Austria, the Republic of Poland, the Portuguese Republic, the Republic of Slovenia, the Slovak Republic, the Republic of Finland and the Kingdom of Sweden, as well as Iceland, the Principality of Liechtenstein, the Kingdom of Norway and the Swiss Confederation."
+ },
+ {
+  "countryCodes": [
+   "BG",
+   "RO"
+  ],
+  "joinedOn": "2024-03-31",
+  "sourceUrl": "https://publications.europa.eu/resource/celex/32024D0210",
+  "sourceQuote": "From 31 March 2024, checks on persons at internal air and sea borders with and between Bulgaria and Romania shall be lifted and the provisions of the Schengen acquis referred to in the Annex shall apply to Bulgaria and Romania between themselves and in their relations with the Kingdom of Belgium, the Czech Republic, the Kingdom of Denmark, the Federal Republic of Germany, the Republic of Estonia, the Hellenic Republic, the Kingdom of Spain, the French Republic, the Republic of Croatia, the Italian Republic, the Republic of Latvia, the Republic of Lithuania, the Grand Duchy of Luxembourg, Hungary, Malta, the Kingdom of the Netherlands, the Republic of Austria, the Republic of Poland, the Portuguese Republic, the Republic of Slovenia, the Slovak Republic, the Republic of Finland and the Kingdom of Sweden, as well as Iceland, the Principality of Liechtenstein, the Kingdom of Norway and the Swiss Confederation."
+ }
+]
