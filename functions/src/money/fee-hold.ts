@@ -97,14 +97,24 @@ export function initialFeeHold(
  * fee sooner, or an agent could reschedule a paid booking to yesterday,
  * withdraw the fee, and cancel. Everything else is kept as it was.
  *
- * @returns the new hold, or null when nothing changes (an ended hold, or a
- *   move that is not later)
+ * Review fix (round 1): a hold that is no longer HELD at `at` (released by
+ * the clock or by a closed meeting, or refunded) is NEVER moved. The stored
+ * `state` stays "held" after a clock release, so checking `state` alone let
+ * a reschedule put a released (and maybe withdrawn) fee back on hold, after
+ * which the agent could cancel and the refund came "from the hold" that no
+ * longer existed. The edit route refuses such a reschedule outright
+ * (409 FEE_RELEASED); this is the second line.
+ *
+ * @param at the server clock
+ * @returns the new hold, or null when nothing changes (not held at `at`,
+ *   or a move that is not later)
  */
 export function rescheduledFeeHold(
   hold: FeeHold,
-  booking: Pick<Consultation, "scheduledDate" | "scheduledTime" | "timezone" | "durationMinutes">
+  booking: Pick<Consultation, "scheduledDate" | "scheduledTime" | "timezone" | "durationMinutes">,
+  at: Date
 ): FeeHold | null {
-  if (hold.state !== "held") return null;
+  if (hold.state !== "held" || feeHoldStatusAt({ feeHold: hold }, at) !== "held") return null;
   const next = initialFeeHold(booking);
   const slotStartAt = next.slotStartAt.toMillis() > (millisOf(hold.slotStartAt) ?? 0) ? next.slotStartAt : hold.slotStartAt;
   const releaseAt = next.releaseAt.toMillis() > (millisOf(hold.releaseAt) ?? 0) ? next.releaseAt : hold.releaseAt;

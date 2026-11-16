@@ -111,6 +111,22 @@ function daysAgo(days: number): Timestamp {
   return Timestamp.fromDate(new Date(Date.now() - days * 86400000));
 }
 
+/**
+ * Issue #317: the fee hold of a seeded consultation fee. Every seeded fee is
+ * for a meeting long past (paid N days ago), so it is RELEASED, as the
+ * backfill would stamp it: the agent can see and withdraw it. Without a hold
+ * a fee counts as held for good and seeded agents would show 0 available.
+ */
+function releasedFeeHold(paidDaysAgo: number) {
+  return {
+    state: "released" as const,
+    slotStartAt: daysAgo(paidDaysAgo),
+    releaseAt: daysAgo(paidDaysAgo - 1),
+    endedAt: daysAgo(paidDaysAgo - 1),
+    endedBy: "legacy_backfill" as const,
+  };
+}
+
 function daysFromNow(days: number): Timestamp {
   return Timestamp.fromDate(new Date(Date.now() + days * 86400000));
 }
@@ -2301,6 +2317,8 @@ async function seedTransactions(): Promise<number> {
       isEscrow: false,
       paymentProvider: "stripe",
       description: "Initial consultation fee for Short Stay C Visa",
+      // Issue #317: a past meeting, so the fee is released (withdrawable).
+      feeHold: releasedFeeHold(25),
       clientName: "John Doe",
       clientEmail: EMAILS.client1User,
       visaTypeName: "Short Stay 'C' Visa",
@@ -2337,6 +2355,8 @@ async function seedTransactions(): Promise<number> {
       isEscrow: false,
       paymentProvider: "stripe",
       description: "Consultation fee for Employment Permit",
+      // Issue #317: a past meeting, so the fee is released (withdrawable).
+      feeHold: releasedFeeHold(18),
       clientName: "Jane Smith",
       clientEmail: EMAILS.client2User,
       visaTypeName: "General Employment Permit",
@@ -2392,6 +2412,8 @@ async function seedTransactions(): Promise<number> {
       isEscrow: false,
       paymentProvider: "stripe",
       description: "Consultation fee refunded (application rejected)",
+      // Issue #317: a past meeting, so the fee is released (withdrawable).
+      feeHold: releasedFeeHold(35),
       clientName: "Lisa Wong",
       clientEmail: EMAILS.client4User,
       visaTypeName: "Student Visa (D)",

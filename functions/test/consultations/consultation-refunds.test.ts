@@ -167,13 +167,61 @@ describe("fee hold: Seli never funds a refund an agent can trigger", () => {
     assert.equal((await withdraw(900_000)).status, 201);
   });
 
-  test("a booking marked completed BEFORE its slot started keeps its hold until the slot starts", async () => {
+  // Review fix (round 1): the agent side cannot mark a meeting under way,
+  // done or missed before its slot has started (that used to stop the
+  // client from cancelling and start the fee's release).
+  for (const target of ["in_progress", "completed", "no_show"]) {
+    test(`agent side cannot set ${target} before the slot starts: 409 SLOT_NOT_STARTED, nothing written`, async () => {
+      await bookAndPay("c1");
+      harness.clock.advanceHours(HOURS_TO_SLOT - 1 / 60); // one minute before the slot
+      writes.length = 0;
+      for (const who of [agent, ownerA, admin]) {
+        const out = await setStatus(who, target, "c1");
+        assert.equal(out.status, 409);
+        assert.equal(out.body.error, "SLOT_NOT_STARTED");
+      }
+      assert.deepEqual(writes, [], "nothing written");
+      assert.equal(bookingOf("c1")!.status, "scheduled");
+      assert.equal((await balanceOf(agent)).heldBalance, 900_000, "still held");
+      // From the slot start it is allowed.
+      harness.clock.advanceHours(1 / 60);
+      assert.equal((await setStatus(agent, target, "c1")).status, 200);
+    });
+  }
+
+  test("a client whose meeting was not marked early can still cancel 24 h+ before and is refunded", async () => {
     await bookAndPay("c1");
-    assert.equal((await setStatus(agent, "completed", "c1")).status, 200);
-    assert.equal((await balanceOf(agent)).heldBalance, 900_000, "not released early");
-    assert.equal((await withdraw(900_000)).status, 400);
-    harness.clock.advanceHours(HOURS_TO_SLOT);
-    assert.equal((await balanceOf(agent)).availableBalance, 900_000, "released at the slot start");
+    assert.equal((await setStatus(agent, "completed", "c1")).body.error, "SLOT_NOT_STARTED");
+    const out = await setStatus(client, "cancelled", "c1");
+    assert.equal(out.status, 200);
+    assert.equal(out.body.data.refund.status, "processing");
+  });
+
+  test("review fix: released by the clock -> withdraw -> reschedule refused -> cancel refused (never a refund 'from the hold')", async () => {
+    await bookAndPay("c1");
+    harness.clock.advanceHours(HOURS_TO_SLOT + 0.5 + 24);
+    assert.equal((await withdraw(900_000)).status, 201, "the released fee is withdrawn");
+    const holdBefore = feeOf("c1")!.feeHold;
+
+    writes.length = 0;
+    const moved = await edit(agent, { scheduledDate: "2026-12-04" });
+    assert.equal(moved.status, 409);
+    assert.equal(moved.body.error, "FEE_RELEASED");
+    assert.deepEqual(writes, [], "the reschedule wrote nothing");
+    assert.deepEqual(feeOf("c1")!.feeHold, holdBefore, "the hold did not move");
+
+    const cancel = await setStatus(agent, "cancelled", "c1");
+    assert.equal(cancel.status, 409);
+    assert.equal(cancel.body.error, "FEE_RELEASED");
+    assert.equal(refundRows().length, 0, "no refund row at all");
+    assert.equal(harness.refundCalls.length, 0, "Paystack never asked");
+    assert.equal((await balanceOf(agent)).availableBalance, 0);
+  });
+
+  test("review fix: a meeting-only edit of a released booking is still allowed", async () => {
+    await bookAndPay("c1");
+    harness.clock.advanceHours(HOURS_TO_SLOT + 0.5 + 24);
+    assert.equal((await edit(agent, { meetingLink: "https://meet.example.test/x" })).status, 200);
   });
 
   test("a client no_show releases the fee like a completion (the agent keeps it)", async () => {
@@ -253,6 +301,7 @@ describe("refund on cancel: the rule table", () => {
   test("agent side marks completed or no_show: no refund row", async () => {
     await bookAndPay("c1");
     await bookAndPay("c2");
+    harness.clock.advanceHours(HOURS_TO_SLOT);
     assert.equal((await setStatus(agent, "completed", "c1")).body.data.refund, null);
     assert.equal((await setStatus(agent, "no_show", "c2")).body.data.refund, null);
     assert.equal(refundRows().length, 0);
@@ -283,6 +332,41 @@ describe("refund on cancel: the rule table", () => {
     assert.equal(out.body.data.refund, null);
     assert.equal(refundRows().length, 0);
     assert.ok(errors.some((e) => e.includes("legacy1")), "an error-level log names the booking");
+  });
+});
+
+// ============================================
+// Review fix: the client's window is measured from the slot they paid for
+// ============================================
+
+describe("an agent moving a paid booking earlier never costs the client their refund", () => {
+  test("rescheduled to 2 hours from now: the client cancels and is fully refunded", async () => {
+    await bookAndPay("c1");
+    // 12:00 Lagos today = 11:00Z, two hours after the harness's now.
+    assert.equal((await edit(agent, { scheduledDate: "2026-11-13", scheduledTime: "12:00" })).status, 200);
+    const preview = (await getBooking(client)).body.data.cancellationRefund;
+    assert.equal(preview.refundable, true, "the preview still says refundable");
+    assert.equal(preview.refundableUntil, new Date(new Date(SLOT_START_ISO).getTime() - 24 * 3_600_000).toISOString());
+    const out = await setStatus(client, "cancelled", "c1");
+    assert.equal(out.status, 200);
+    assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN });
+    assert.equal(refundRows()[0].reason, "client_cancelled");
+  });
+
+  test("rescheduled into the past: the client cancels and is fully refunded", async () => {
+    await bookAndPay("c1");
+    assert.equal((await edit(agent, { scheduledDate: "2026-11-01" })).status, 200);
+    const out = await setStatus(client, "cancelled", "c1");
+    assert.equal(out.status, 200);
+    assert.equal(out.body.data.refund?.status, "processing");
+  });
+
+  test("still late inside the last 24 h of the slot they paid for", async () => {
+    await bookAndPay("c1");
+    assert.equal((await edit(agent, { scheduledDate: "2026-11-13", scheduledTime: "12:00" })).status, 200);
+    harness.clock.advanceHours(HOURS_TO_SLOT - 23);
+    const out = await setStatus(client, "cancelled", "c1");
+    assert.equal(out.body.data.refund, null);
   });
 });
 

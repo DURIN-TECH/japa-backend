@@ -51,6 +51,8 @@ import {
   ADMIN_REFUND_REASONS,
   cancellationRefundPreview,
   consultationRefundService,
+  findFeeTransaction,
+  isPaidWithMoney,
   MAX_REFUND_NOTE_LENGTH,
   refundSummary,
 } from "../services/consultation-refund.service";
@@ -293,7 +295,10 @@ export class ConsultationController {
       // cancelling would give back (the mobile cancel screen reads this and
       // never computes the rule itself). Server clock.
       if (!seesFullConsultation({ uid: req.userId, role: req.authz?.role }, consultation)) {
-        const preview = cancellationRefundPreview(consultation, chargeRuntime.now());
+        // The fee's hold holds the slot the client PAID for (review fix:
+        // the window is never measured from a slot the agent moved earlier).
+        const fee = isPaidWithMoney(consultation) ? await findFeeTransaction(consultation) : null;
+        const preview = cancellationRefundPreview(consultation, chargeRuntime.now(), fee);
         if (preview) {
           sendSuccess(res, { ...view, cancellationRefund: preview });
           return;

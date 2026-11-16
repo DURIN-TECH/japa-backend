@@ -106,10 +106,20 @@ describe("feeHoldStatusAt", () => {
   });
 
   test("a reschedule only ever moves the hold LATER", () => {
-    assert.equal(rescheduledFeeHold(hold, booking("2026-11-01")), null, "earlier: unchanged");
-    const later = rescheduledFeeHold(hold, booking("2026-11-27"))!;
+    const at = d("2026-11-16T00:00:00Z");
+    assert.equal(rescheduledFeeHold(hold, booking("2026-11-01"), at), null, "earlier: unchanged");
+    const later = rescheduledFeeHold(hold, booking("2026-11-27"), at)!;
     assert.equal(later.releaseAt.toDate().toISOString(), "2026-11-28T09:30:00.000Z");
-    assert.equal(rescheduledFeeHold({ ...hold, state: "refunded" }, booking("2026-11-27")), null, "ended holds never move");
+    assert.equal(rescheduledFeeHold({ ...hold, state: "refunded" }, booking("2026-11-27"), at), null, "ended holds never move");
+  });
+
+  test("review fix: a hold RELEASED by the clock (stored state still 'held') is never moved back on hold", () => {
+    const afterRelease = d("2026-11-21T09:30:00Z");
+    assert.equal(feeHoldStatusAt({ feeHold: hold }, afterRelease), "released");
+    assert.equal(rescheduledFeeHold(hold, booking("2026-11-27"), afterRelease), null);
+    // Released by a closed meeting, too.
+    const closed = { ...hold, meetingClosedAt: Timestamp.fromDate(d("2026-11-20T09:10:00Z")) };
+    assert.equal(rescheduledFeeHold(closed, booking("2026-11-27"), d("2026-11-20T09:20:00Z")), null);
   });
 });
 
@@ -166,6 +176,23 @@ describe("existing balances: legacyFeeHold / the backfill", () => {
       const again = await backfillFeeHolds({ apply: true, at: now });
       assert.equal(again.skipped, 2);
     });
+
+    test("review fix: a fee with a refund row is never stamped; the target project is printed", async () => {
+      const lines: string[] = [];
+      console.log = (...args: unknown[]) => {
+        lines.push(args.map(String).join(" "));
+      };
+      await seed("consultations", "soon", { ...booking("2026-11-20"), id: "soon" });
+      await seed("transactions", "fee-soon", {
+        type: "consultation_fee", consultationId: "soon", amount: 900_000, currency: "NGN",
+        status: "completed", providerTransactionId: "cons-soon-ref",
+      });
+      await seed("transactions", refundDocId("cons-soon-ref"), { type: "refund", status: "processing", amount: 900_000, currency: "NGN" });
+      const result = await backfillFeeHolds({ apply: true, at: now });
+      assert.equal(result.skipped, 1);
+      assert.equal(docsIn("transactions").find(([id]) => id === "fee-soon")![1].feeHold, undefined);
+      assert.match(lines[0], /^Fee hold backfill against /);
+    });
   });
 });
 
@@ -190,6 +217,17 @@ describe("decideCancellationRefund (pure)", () => {
       decideCancellationRefund("client", booking("2026-11-20", "10:00", "Africa/Lagos", { paymentStatus: "pending" }), d("2026-11-13T00:00:00Z")),
       { kind: "nothing" }
     );
+  });
+
+  test("review fix: the client's window counts from the PAID slot when the agent moved it earlier", () => {
+    const paid = { feeHold: initialFeeHold(booking("2026-11-20")) }; // paid for 2026-11-20T09:00Z
+    const movedEarlier = booking("2026-11-13", "12:00"); // now 2026-11-13T11:00Z
+    const at = d("2026-11-13T10:00:00Z"); // 1 h before the moved slot
+    assert.deepEqual(decideCancellationRefund("client", movedEarlier, at), { kind: "late_client_cancel" }, "without the hold");
+    assert.deepEqual(decideCancellationRefund("client", movedEarlier, at, paid), { kind: "full", reason: "client_cancelled" });
+    // Moved LATER: the later slot counts (the client gets more time).
+    const movedLater = booking("2026-11-27");
+    assert.deepEqual(decideCancellationRefund("client", movedLater, d("2026-11-25T00:00:00Z"), paid), { kind: "full", reason: "client_cancelled" });
   });
 
   test("the refund doc id is deterministic and hides the reference", () => {

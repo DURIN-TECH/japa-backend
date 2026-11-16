@@ -151,7 +151,34 @@ export type CancellationRefundDecision =
   | { kind: "late_client_cancel" };
 
 /**
+ * When the client's 24-hour refund window is measured FROM (issue #317
+ * review fix): the LATER of the booking's current slot start and the fee
+ * hold's `slotStartAt`. The hold's time is set when the client pays and only
+ * ever moves later (`rescheduledFeeHold`), so an agent who moves a paid
+ * booking EARLIER (to an hour from now, or into the past) can never turn a
+ * client's refundable cancel into a late one. A later move gives the client
+ * more time, as it should. Pure.
+ *
+ * @returns null when neither time can be read
+ */
+export function refundWindowStartsAt(booking: Consultation, fee: Pick<Transaction, "feeHold"> | null): Date | null {
+  const candidates: number[] = [];
+  try {
+    candidates.push(slotStartsAt(booking).getTime());
+  } catch {
+    // An unreadable current slot: the paid slot alone decides.
+  }
+  const held = fee?.feeHold?.slotStartAt as unknown as { toMillis?: () => number } | undefined;
+  if (held && typeof held.toMillis === "function") candidates.push(held.toMillis());
+  return candidates.length ? new Date(Math.max(...candidates)) : null;
+}
+
+/**
  * The refund a cancel gives (the rule table in the header). Pure.
+ *
+ * The client's 24 hours are counted back from `refundWindowStartsAt` (the
+ * later of the current slot and the slot the client paid for), never from a
+ * slot the agent moved earlier.
  *
  * A client booking whose slot cannot be read (bad stored data) is treated as
  * refundable: the fee is held at that point, so the refund costs neither the
@@ -165,16 +192,14 @@ export type CancellationRefundDecision =
 export function decideCancellationRefund(
   actor: RefundActor,
   booking: Consultation,
-  at: Date
+  at: Date,
+  fee: Pick<Transaction, "feeHold"> | null = null
 ): CancellationRefundDecision {
   if (!isPaidWithMoney(booking)) return { kind: "nothing" };
   if (actor === "agent_side") return { kind: "full", reason: "agent_cancelled" };
-  let startMs: number;
-  try {
-    startMs = slotStartsAt(booking).getTime();
-  } catch {
-    return { kind: "full", reason: "client_cancelled" };
-  }
+  const start = refundWindowStartsAt(booking, fee);
+  if (!start) return { kind: "full", reason: "client_cancelled" };
+  const startMs = start.getTime();
   // Exactly 24 hours before the slot still counts as "24 hours or more".
   return startMs - at.getTime() >= CLIENT_REFUND_WINDOW_HOURS * HOUR_MS
     ? { kind: "full", reason: "client_cancelled" }
@@ -201,16 +226,18 @@ export interface CancellationRefundPreview {
  * confirmed), no refund was written yet, and `at` is no later than
  * `refundableUntil`.
  */
-export function cancellationRefundPreview(booking: Consultation, at: Date): CancellationRefundPreview | null {
+export function cancellationRefundPreview(
+  booking: Consultation,
+  at: Date,
+  fee: Pick<Transaction, "feeHold"> | null = null
+): CancellationRefundPreview | null {
   if (booking.status === "cancelled" || !isPaidWithMoney(booking)) return null;
   const amount = expectedCharge(booking);
   if (!amount) return null;
-  let until: Date;
-  try {
-    until = new Date(slotStartsAt(booking).getTime() - CLIENT_REFUND_WINDOW_HOURS * HOUR_MS);
-  } catch {
-    return null;
-  }
+  // Same start as the cancel itself uses (review fix): never a slot the agent moved earlier.
+  const start = refundWindowStartsAt(booking, fee);
+  if (!start) return null;
+  const until = new Date(start.getTime() - CLIENT_REFUND_WINDOW_HOURS * HOUR_MS);
   const refundable =
     CLIENT_CANCELLABLE.includes(booking.status) && !booking.refundId && at.getTime() <= until.getTime();
   return { refundable, amount, refundableUntil: until.toISOString() };
@@ -293,6 +320,16 @@ function pickFee(rows: Transaction[], booking: Consultation): Transaction | null
       t.providerTransactionId !== ""
   );
   return fees.find((t) => t.providerTransactionId === booking.transactionId) ?? fees[0] ?? null;
+}
+
+/**
+ * Read the booking's fee Transaction OUTSIDE a transaction, or null (the
+ * client's refund preview on GET /consultations/:id). Same query and pick
+ * as `readFeeTransaction`.
+ */
+export async function findFeeTransaction(booking: Consultation): Promise<Transaction | null> {
+  const snap = await collections.transactions.where("consultationId", "==", booking.id).get();
+  return pickFee(snap.docs.map((d) => d.data() as Transaction), booking);
 }
 
 /**
