@@ -104,6 +104,18 @@ service cloud.firestore {
 
       // Only admins can delete users
       allow delete: if isAdmin();
+
+      // ---- Saved destinations (issue #146), explicit deny ----
+      // users/{userId}/savedDestinations/{COUNTRYCODE}_{visaId}: one document
+      // per destination the user saved. Read and written ONLY by the backend
+      // (Admin SDK) behind GET / PUT / DELETE /users/me/saved-destinations,
+      // which checks that the visa is publicly visible and enforces the
+      // 200-save cap and the read-only-plan write block. A client that could
+      // write here directly would skip all three, so every client is denied,
+      // the owner and admins included.
+      match /savedDestinations/{saveId} {
+        allow read, write: if false;
+      }
     }
     
     // =====================================    // AGENTS COLLECTION
