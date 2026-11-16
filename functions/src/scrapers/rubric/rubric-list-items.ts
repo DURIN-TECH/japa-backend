@@ -94,7 +94,9 @@ import type { RubricFlag } from "../../types/rubric";
 //     after an item that ends with a sentence-ending mark, or at the end of the
 //     page. A list whose first item begins with a capital letter cannot be told
 //     from a run of headings and paragraphs, and is reported as ambiguous.
-//     (This layout is unchanged by #335.)
+//     (Unchanged by #335, except fix round 2: a line that is only a
+//     connector word, "or", is lower case but is never an item; it is refused
+//     as `connector_out_of_place`.)
 //
 // NEVER A GUESS. Anything the reader cannot decide cleanly returns
 // `unreadable` with a NAMED reason, and the caller holds a protected rule /
@@ -107,9 +109,20 @@ import type { RubricFlag } from "../../types/rubric";
 // stop, see `placeMarker`).
 //
 // A SECOND PROOF. `verifyListItems` does not only re-run the reader: it also
-// walks the snapshot's lines itself (`proveStoredList`), with no knowledge of
-// list levels, and requires that the line after the last stored item is a
-// known end. A cut list fails that walk even if the reader were wrong again.
+// walks the snapshot's lines itself (`proveStoredList`). That walk SHARES some
+// line tests with the reader (what a connector, an amendment mark, a hard
+// start and a heading-shaped line look like, and the lead-in's own marker), so
+// on its own it would only restate the reader's decision. (#335, fix round 2:
+// review round 2 fuzzed ~54,000 marked lists and the walk refused none.) What
+// it adds that the reader does NOT do: after a HEADING-SHAPED end (the one
+// judgement most likely to be wrong), it looks on to the next hard start or the
+// end of the page, and refuses the list when the first marker met there would
+// continue it (its own marker arithmetic, `successorsOf`, not the reader's).
+// What this does NOT guarantee: a list cut at a heading where no continuing
+// marker follows before the next hard start (closing words with no marker, or
+// up to three heading-shaped lines followed by a hard start) is not caught;
+// nor is a cut whose end is a hard start or the lead-in's sibling, which both
+// proofs take as ends by shape.
 //
 // Pure functions over the snapshot's lines. Nothing here knows what any
 // document is about, which route, country or nationality it concerns.
@@ -134,6 +147,7 @@ export const LIST_UNREADABLE_REASONS = [
   "line_after_item_not_recognised", // (#335) a line after an item that is no marker, connector or known end
   "editorial_mark_in_item", // (#335) a publisher's amendment mark inside an item's words
   "list_end_not_proven", // (#335) the line after the last stored item is not a known end (verification only)
+  "connector_out_of_place", // (#335, fix round 2) a connector word ("or") read as a list line of an unmarked list
 ] as const;
 export type ListUnreadableReason = (typeof LIST_UNREADABLE_REASONS)[number];
 
@@ -158,7 +172,8 @@ export const LIST_UNREADABLE_DETAIL: Record<ListUnreadableReason, string> = {
   marker_out_of_order: "a list marker after the lead-in does not follow the marker before it and does not start a deeper list at its first marker, so which list it belongs to cannot be told",
   line_after_item_not_recognised: "a line after a list item is not the next marker, a connector word between two items, or a known end of the list (the end of the page, a paragraph number, a reference label or a heading), so where the list ends cannot be told; the list was not cut there",
   editorial_mark_in_item: "a list line holds the publisher's amendment mark, which is not part of the official words, so the item cannot be stored verbatim",
-  list_end_not_proven: "the line after the last stored list line is not a known end of the list (the end of the page, a paragraph number, a reference label, a heading or the lead-in's next sibling), so the stored list may be cut short",
+  list_end_not_proven: "the line after the last stored list line is not a known end of the list (the end of the page, a paragraph number, a reference label, a heading or the lead-in's next sibling), or a list marker that would continue the list comes after a heading-shaped end before the next paragraph, so the stored list may be cut short",
+  connector_out_of_place: "a line that is only a connector word (such as \"or\" or \"and\") stands where an unmarked list line should be, for example straight after the lead-in, so which items it joins cannot be told",
 };
 
 // ============================================
@@ -520,6 +535,11 @@ export function readListLines(leadLine: string, following: readonly string[], ct
     for (const line of following.slice(start)) {
       // A capital letter, a label ("2.4 ...") or a marker ends the list.
       if (!startsLower(line) || t.isLabel(line)) break;
+      // (#335, fix round 2) A line that is only a connector word ("or") is
+      // lower case, so it would pass as an item. It joins two items, it is not
+      // one; straight after a lead-in it means the list's shape is not what
+      // this reader sees ("shall be:" / "or" / "(a) one;"). Refused.
+      if (t.isConnector(line)) return { kind: "unreadable", reason: "connector_out_of_place" };
       if (line.length > LIST_ITEM_MAX_CHARS) return { kind: "unreadable", reason: "item_too_long" };
       // An unmarked item that is itself a lead-in: its own list would follow
       // as more unmarked lines and the nesting is invisible.
@@ -538,10 +558,14 @@ export function readListLines(leadLine: string, following: readonly string[], ct
 // ============================================
 
 /**
- * (#335) Prove, WITHOUT the reader above, that stored list lines are the
- * snapshot's lines after the lead-in and that the list is whole. This is a
- * plain walk over the lines. It knows nothing about list levels or marker
- * order, so a mistake in that logic cannot hide here too:
+ * (#335) Prove, without RE-RUNNING the reader above, that stored list lines are
+ * the snapshot's lines after the lead-in, and check where the list ends. This
+ * is a plain walk over the lines. It does not use the reader's level logic
+ * (`placeMarker`, `nextMarkerLevels`), but it does share its line tests
+ * (`lineTestsFor`: connectors, hard starts, `isKnownEnd` for heading-shaped
+ * lines) and `leadMarkerOf` / `markerFollows` for the lead-in's sibling, so for
+ * those judgements it agrees with the reader by construction. Point 4 is the
+ * check the reader does not make. The steps:
  *
  *  1. every stored line is, in order, a whole line of the snapshot, or a bare
  *     marker line and the line after it joined by one space; only amendment
@@ -553,7 +577,16 @@ export function readListLines(leadLine: string, following: readonly string[], ct
  *     has its own marker) the marker that directly follows the lead-in's,
  *     possibly after one connector word. A marker that is not the lead-in's
  *     next sibling, a connector with no such marker after it, or any other
- *     line means the stored list may be cut short: `list_end_not_proven`.
+ *     line means the stored list may be cut short: `list_end_not_proven`;
+ *  4. (#335, fix round 2) WHEN THAT END IS ONLY HEADING-SHAPED (not the end of
+ *     the page, a hard start or the lead-in's sibling), the walk goes on to the
+ *     next hard start or the end of the page, and the FIRST list marker met
+ *     there must not continue the stored list (a successor of any stored
+ *     marker or of the lead-in's, by `successorsOf`): otherwise
+ *     `list_end_not_proven`. This catches "(a) ...;" / "Exceptions for
+ *     minors" / a sentence / "(b) ...", which both earlier checks accepted.
+ *     It does not catch a cut with no continuing marker before the next hard
+ *     start (see the header).
  *
  * An unmarked list has no markers to prove an end with, so point 3 is the
  * reader's own strict rule restated (the last line ends its sentence, or the
@@ -579,7 +612,13 @@ export function proveStoredList(leadLine: string, following: readonly string[], 
 
   if (!marked) {
     // ---- unmarked list: consecutive whole lines, then the reader's own end rule ----
+    // (#335, fix round 2) Amendment marks straight after the lead-in are layout,
+    // stepped over exactly as the reader steps over them (they disagreed before:
+    // the reader skipped them and this walk did not, so such a list never verified).
+    at = skipMarks(0);
     for (const item of items) {
+      // A connector word is never an unmarked item (see the reader).
+      if (t.isConnector(item)) return no("connector_out_of_place");
       if (following[at] !== item) return no("items_not_in_snapshot");
       at += 1;
     }
@@ -628,7 +667,123 @@ export function proveStoredList(leadLine: string, following: readonly string[], 
     return end !== undefined && isLeadSibling(end) ? { ok: true } : no("list_end_not_proven");
   }
   if (isMarked(end)) return isLeadSibling(end) ? { ok: true } : no("list_end_not_proven");
-  return t.isKnownEnd(following, at) ? { ok: true } : no("list_end_not_proven");
+  // A hard start (paragraph number, reference label, division heading) is an
+  // end by its SHAPE alone: nothing of this paragraph can follow it.
+  if (t.isHardStart(end)) return { ok: true };
+  // Only a HEADING-SHAPED end is left ("Exceptions for minors"). That is the
+  // one judgement most likely to be wrong, and the reader makes it with this
+  // same `isKnownEnd`, so agreeing with the reader here proves nothing.
+  if (!t.isKnownEnd(following, at)) return no("list_end_not_proven");
+  // 4. (#335, fix round 2) THE CHECK THE READER DOES NOT MAKE: look PAST the
+  // heading-shaped end, up to the next hard start or the end of the page. If
+  // the first list marker met there would CONTINUE the stored list, the
+  // "heading" was in the middle of the list and the stored list is cut short.
+  return continuesAfterSoftEnd(following, at, items, leadMarker, t.isHardStart) ? no("list_end_not_proven") : { ok: true };
+}
+
+// ============================================
+// The second proof's own marker arithmetic (independent of the reader)
+// ============================================
+//
+// (#335, fix round 2) Review round 2 found that `proveStoredList` refused
+// none of ~54,000 fuzzed marked lists: it stopped the same three ways the
+// reader stops, with the same functions. The helpers below are deliberately
+// NOT `markerFollows` / `nextMarkerLevels` / `placeMarker`: they know no list
+// levels and no marker order. They only answer "which markers could come
+// straight after some marker already stored?", generously (every reading of
+// an ambiguous marker: "i" as a letter AND as a roman numeral). Generous is the
+// safe direction: a bigger set only ever refuses more.
+
+/** Lower-case roman numerals the second proof can read (1 to 39 is ample for list items). */
+const ROMAN_RE = /^(x{0,3})(ix|iv|v?i{0,3})$/u;
+
+/** The value of a lower-case roman numeral ("iv" -> 4), or undefined when it is not one. */
+function romanValue(s: string): number | undefined {
+  if (s === "" || !ROMAN_RE.test(s)) return undefined;
+  const v: Record<string, number> = { i: 1, v: 5, x: 10 };
+  let total = 0;
+  for (let k = 0; k < s.length; k++) {
+    const cur = v[s[k]];
+    const nxt = k + 1 < s.length ? v[s[k + 1]] : 0;
+    // Subtractive notation: "iv", "ix".
+    total += cur < nxt ? -cur : cur;
+  }
+  return total;
+}
+
+/** The lower-case roman numeral for 1..39 (enough for any list), or undefined. */
+function romanOf(n: number): string | undefined {
+  if (n < 1 || n > 39) return undefined;
+  const units = ["", "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix"];
+  return "x".repeat(Math.floor(n / 10)) + units[n % 10];
+}
+
+/**
+ * Every marker that could DIRECTLY follow `inner` in some list: the next
+ * letter, the next number, the next roman numeral, and the inserted forms
+ * ("ii" -> "iia"; "iia" -> "iib", and the base's successors, "iii"). Each
+ * reading of an ambiguous marker is included.
+ */
+function successorsOf(inner: string): string[] {
+  const out: string[] = [];
+  // Letter: "a" -> "b" (single letters only, as the markers read here are).
+  if (/^[a-y]$/u.test(inner)) out.push(String.fromCharCode(inner.charCodeAt(0) + 1));
+  // Number: "3" -> "4".
+  if (/^\d+$/u.test(inner)) out.push(String(Number(inner) + 1));
+  // Roman: "iv" -> "v".
+  const r = romanValue(inner);
+  if (r !== undefined) {
+    const next = romanOf(r + 1);
+    if (next !== undefined) out.push(next);
+  }
+  // Inserted after this marker: "ii" -> "iia".
+  out.push(`${inner}a`);
+  // This marker is itself inserted ("iia" = "ii" + "a"): the next insertion
+  // ("iib") and whatever follows the base ("iii").
+  const ins = /^(.+?)([a-y])$/u.exec(inner);
+  if (ins !== null && ins[1] !== "" && (romanValue(ins[1]) !== undefined || /^\d+$/u.test(ins[1]) || /^[a-z]$/u.test(ins[1]))) {
+    out.push(`${ins[1]}${String.fromCharCode(ins[2].charCodeAt(0) + 1)}`);
+    out.push(...successorsOf(ins[1]).filter((m) => m !== inner));
+  }
+  return out;
+}
+
+/** Every list marker at the start of a stored line, in order ("(a) (i) the ..." gives "a", "i"). */
+function leadingMarkers(line: string): string[] {
+  const out: string[] = [];
+  let rest = line;
+  for (let m = LIMB_RE.exec(rest); m !== null; m = LIMB_RE.exec(rest)) {
+    out.push(m[1]);
+    rest = rest.slice(m[0].length).trimStart();
+  }
+  return out;
+}
+
+/**
+ * (#335, fix round 2) After a HEADING-SHAPED end at `from`, walk on to the
+ * next hard start (or the end of the page) and return true when the FIRST list
+ * marker met on the way would continue the stored list: it is a successor of a
+ * marker already stored (any level, see `successorsOf`) or of the lead-in's own
+ * marker, and is not itself one of the stored markers. Such a marker means the
+ * "heading" sat inside the list ("(a) ...;" / "Exceptions for minors" / a long
+ * sentence / "(b) ..."), so the stored list is cut short. The first marker
+ * decides: a new list that opens with a marker of its own ("(a)" again) under
+ * the heading is a different list, and the walk stops there.
+ */
+function continuesAfterSoftEnd(following: readonly string[], from: number, items: readonly string[], leadMarker: string | undefined, isHardStart: (line: string) => boolean): boolean {
+  // The markers already stored, and every marker that could come next after one of them.
+  const stored = new Set(items.flatMap(leadingMarkers));
+  const continuing = new Set([...stored, ...(leadMarker !== undefined ? [leadMarker] : [])].flatMap(successorsOf).filter((m) => !stored.has(m)));
+  for (let k = from; k < following.length; k++) {
+    const line = following[k];
+    // A hard start: what comes after it belongs to another paragraph or division.
+    // (The heading-shaped line at `from` itself is never a hard start: checked before.)
+    if (isHardStart(line)) return false;
+    const inner = markerOf(line);
+    if (inner !== undefined) return continuing.has(inner);
+  }
+  // The end of the page: no marker continued the list.
+  return false;
 }
 
 // ============================================
@@ -688,12 +843,16 @@ export function readLeadInList(index: SnapshotQuoteIndex, found: Extract<QuoteLo
  * `source.listItems` is checked with, at extraction and wherever the rule is
  * looked at again. An altered, reordered, truncated or extended list fails.
  *
- * TWO proofs, and both must hold (#335, fix round 1):
+ * TWO proofs, and both must hold (#335, fix rounds 1 and 2):
  *  1. the reader, run again on the snapshot, returns exactly these lines;
- *  2. `proveStoredList`, a separate walk that does not use the reader, finds
- *     each line in the snapshot and a KNOWN END right after the last one.
- * Before this round only the first existed, so a list the reader cut short
- * was confirmed by the same reader.
+ *  2. `proveStoredList`, a separate walk (it shares the reader's line tests,
+ *     not its level logic), finds each line in the snapshot and a known end
+ *     after the last one, and, after a heading-shaped end, no marker that
+ *     would continue the list before the next hard start.
+ * Before fix round 1 only the first existed. In fix round 1 the second
+ * restated the reader's ends and caught no cut; the look-past-the-heading
+ * check of fix round 2 is what makes it catch the heading-shaped cut. It is
+ * not a proof that every list is whole (see the header for what it misses).
  */
 export function verifyListItems(index: SnapshotQuoteIndex, found: Extract<QuoteLookup, { ok: true }>, items: readonly string[]): { ok: true } | { ok: false; reason: ListUnreadableReason } {
   const read = readLeadInList(index, found);
