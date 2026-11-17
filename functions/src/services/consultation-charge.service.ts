@@ -407,6 +407,29 @@ export function isAgentCausedException(reason: ConsultationPaymentException["rea
   return reason === "paid_for_rescheduled_slot";
 }
 
+/**
+ * WHICH agent pays Paystack's fee on an agent-caused exception (issue #354
+ * fix round, orchestrator decision 2026-11-17: whoever caused it pays). In
+ * order:
+ *  1. the agent already fixed on the exception (`causedByAgentId`), so a
+ *     held refund retried later debits the same agent as first decided;
+ *  2. the agent who moved the booking, recorded on the retired checkout that
+ *     was paid (`retiredByAgentId` of the `supersededCheckouts` entry with
+ *     this reference);
+ *  3. FALLBACK for a checkout retired before `retiredByAgentId` existed: the
+ *     booking's `agentId` now. If the case was reassigned in between, that
+ *     is the new agent; nothing better is recorded for such old entries.
+ * Pure.
+ */
+export function feeDebitAgentFor(
+  exception: Pick<ConsultationPaymentException, "reference" | "causedByAgentId">,
+  booking: Pick<Consultation, "agentId" | "supersededCheckouts">
+): string {
+  if (exception.causedByAgentId) return exception.causedByAgentId;
+  const retired = (booking.supersededCheckouts ?? []).find((s) => s.reference === exception.reference);
+  return retired?.retiredByAgentId ?? booking.agentId;
+}
+
 /** What to do with an unapplied payment, money-wise (issue #354). */
 export type UnappliedRefundPlan =
   /** Nothing is refunded or debited yet: an admin must look (see the reason). */
@@ -514,6 +537,13 @@ export interface UnappliedRefundWrite {
   refund: Transaction | null;
   /** The agent's fee debit written now (null when none). */
   debit: Transaction | null;
+  /**
+   * Issue #354 fix round: whether the booking was still awaiting payment
+   * when this was written. An agent-caused refund on a booking that is still
+   * `pending_payment` tells the client to pay again for the new time; on one
+   * that was paid since (another checkout) or cancelled, it must not.
+   */
+  bookingAwaitingPayment: boolean;
 }
 
 /**
@@ -539,8 +569,11 @@ export function writeUnappliedRefund(
     /** Whether the exception doc already existed (an update, not a create). */
     exceptionExisted: boolean;
     plan: UnappliedRefundPlan;
-    /** The booking's parties. */
-    booking: Pick<Consultation, "userId" | "agentId" | "clientName" | "clientEmail">;
+    /** The booking's parties and state (as read in this transaction). */
+    booking: Pick<
+      Consultation,
+      "userId" | "agentId" | "clientName" | "clientEmail" | "status" | "paymentStatus" | "supersededCheckouts"
+    >;
     now: Timestamp;
   }
 ): UnappliedRefundWrite {
@@ -548,9 +581,22 @@ export function writeUnappliedRefund(
   const { plan, now } = input;
   // Rebuilt without the hold fields, so a refund that goes ahead clears them
   // (tx.set replaces the whole doc).
-  const { refundFailureReason: _held, ...base } = input.exception;
+  const { refundFailureReason: _held, ...rest } = input.exception;
   void _held;
+  // Issue #354 fix round: an agent-caused exception names the agent who pays
+  // Paystack's fee, fixed now (see feeDebitAgentFor) and stored, so a held
+  // refund retried later, or a re-settle after a reassignment, still debits
+  // the agent who moved the booking. The lock read in readUnappliedRefund was
+  // taken for this same agent.
+  const debitAgentId = isAgentCausedException(input.exception.reason)
+    ? feeDebitAgentFor(input.exception, input.booking)
+    : null;
+  const base: ConsultationPaymentException = debitAgentId ? { ...rest, causedByAgentId: debitAgentId } : rest;
   const touched = input.exceptionExisted ? { updatedAt: now } : {};
+  // Whether the booking is still waiting to be paid (for the client's copy:
+  // only then do they need to "pay again for the new time").
+  const bookingAwaitingPayment =
+    input.booking.status === "pending_payment" && input.booking.paymentStatus !== "paid";
 
   if (plan.kind === "hold") {
     const exception: ConsultationPaymentException = {
@@ -565,7 +611,7 @@ export function writeUnappliedRefund(
       `[consultation] refund of ${input.exception.reference} on ${input.exception.consultationId} HELD for an admin ` +
         `(${plan.reason}): no refund row, no Paystack call, no agent debit`
     );
-    return { exception, refund: null, debit: null };
+    return { exception, refund: null, debit: null, bookingAwaitingPayment };
   }
 
   const refund = transactionService.buildUnappliedPaymentRefund(reads.refundRef.id, now, {
@@ -580,9 +626,11 @@ export function writeUnappliedRefund(
 
   // The agent's fee debit (agent-caused, a fee above 0, not written before).
   let debit: Transaction | null = null;
-  if (plan.debitMinor > 0 && !reads.debitExists) {
+  if (plan.debitMinor > 0 && !reads.debitExists && debitAgentId) {
     debit = transactionService.buildPaystackFeeDebit(reads.debitRef.id, now, {
-      agentUserId: input.booking.agentId,
+      // The agent who CAUSED it (moved the booking), not necessarily the
+      // booking's agent now (fix round, reassignment decision).
+      agentUserId: debitAgentId,
       consultationId: input.exception.consultationId,
       reference: input.exception.reference,
       feeMinor: plan.debitMinor,
@@ -595,7 +643,7 @@ export function writeUnappliedRefund(
       const count = Number(reads.lockData?.feeDebitCount) || 0;
       tx.set(
         reads.lockRef,
-        { agentUserId: input.booking.agentId, lastFeeDebitId: debit.id, feeDebitCount: count + 1, updatedAt: now },
+        { agentUserId: debitAgentId, lastFeeDebitId: debit.id, feeDebitCount: count + 1, updatedAt: now },
         { merge: true }
       );
     }
@@ -615,9 +663,9 @@ export function writeUnappliedRefund(
       `(${input.exception.reason}): ${input.exception.amountMinor} ${input.exception.currency} charged, ` +
       `recorded in consultationPaymentExceptions; refund ${refund.id} of ${refund.amount} started` +
       (plan.feeKeptMinor !== undefined ? `, Paystack fee ${plan.feeKeptMinor} kept from the client` : "") +
-      (debit ? `, Paystack fee ${debit.amount} debited from agent ${input.booking.agentId} (${debit.id})` : "")
+      (debit ? `, Paystack fee ${debit.amount} debited from agent ${debitAgentId} (${debit.id})` : "")
   );
-  return { exception, refund, debit };
+  return { exception, refund, debit, bookingAwaitingPayment };
 }
 
 /** What settling a successful Paystack payment did. */
@@ -670,6 +718,10 @@ export type SettleOutcome =
  *     (`retiredBy: "reschedule"`): the booking is NOT confirmed (it moved
  *     since that checkout was issued); an exception record (reason
  *     `paid_for_rescheduled_slot`), no Transaction, booking unchanged.
+ *     Review fix (fix round): such a payment is ALWAYS recorded
+ *     `paid_for_rescheduled_slot` (agent-caused), also when (3) or (4)
+ *     answers because the booking was paid or cancelled since; only the
+ *     outcome kind follows the booking's state.
  *  5. Otherwise confirm: paid/scheduled plus the fee Transaction in the same
  *     commit. Settled on a superseded reference, the booking takes THAT
  *     checkout's snapshot and lock (so booking and Transaction agree), its
@@ -686,7 +738,8 @@ export type SettleOutcome =
  * `fees` for this reference (`reported.fees`, stored on the exception as
  * `paystackFeeMinor`): a client-caused exception (3, 4) refunds the charge
  * minus that fee; an agent-caused one (4b) refunds the charge in full and
- * debits the fee from the booking's agent (`paystack_fee_debit`, doc id
+ * debits the fee from the agent who moved the booking (`feeDebitAgentFor`;
+ * `paystack_fee_debit`, doc id
  * `feeDebitDocId(reference)`, `tx.create`, under the agent's withdrawal
  * lock), all in this same transaction. Fee unknown, or a client-caused fee
  * that leaves nothing to refund: the exception is HELD (`refund_failed` with
@@ -762,14 +815,21 @@ export async function settlePayment(
     ): Promise<{ exception: ConsultationPaymentException; refund: Transaction | null }> => {
       const now = Timestamp.fromDate(at);
       const stored = exceptionSnap.exists ? (exceptionSnap.data() as ConsultationPaymentException) : null;
+      // Issue #354 fix round: an exception an admin CLOSED as
+      // `nothing_to_refund` is final. A later settle of the same reference
+      // (a late verify, a webhook retry) writes nothing and never reopens it.
+      if (stored?.status === "nothing_to_refund") return { exception: stored, refund: null };
       // The STORED reason wins: it was decided when the payment first landed.
       const effectiveReason = stored?.reason ?? reason;
       // Reads (still before any write): the refund row, the debit, and the
-      // agent's lock when the agent side caused it.
+      // lock of the agent who pays the fee when the agent side caused it
+      // (the agent who moved the booking: feeDebitAgentFor).
       const reads = await readUnappliedRefund(
         tx,
         reference,
-        isAgentCausedException(effectiveReason) ? current.agentId : null
+        isAgentCausedException(effectiveReason)
+          ? feeDebitAgentFor(stored ?? { reference, causedByAgentId: undefined }, current)
+          : null
       );
       if (reads.existingRefund) {
         if (stored) return { exception: stored, refund: reads.existingRefund };
@@ -812,23 +872,42 @@ export async function settlePayment(
       ...extra,
     });
 
+    // Issue #354 review fix (blocking, fix round 2026-11-17): WHO CAUSED the
+    // refund is decided by the checkout that was paid, not by what happened
+    // to the booking since. A payment on a checkout RETIRED by a reschedule
+    // (the agent side moved the booking after its quote lock) is ALWAYS
+    // agent-caused (`paid_for_rescheduled_slot`), even when the booking was
+    // paid since through a fresh checkout (3) or cancelled / swept since (4).
+    // Without this, those orders recorded it as client-caused and the client
+    // paid Paystack's fee for the agent's move. The booking-state outcome
+    // still follows (3) / (4) / (4b) below; only the exception's reason (and
+    // so who pays the fee) is fixed here. A stored reason still wins on a
+    // re-settle (recordException), so idempotency is unchanged.
+    const retiredByReschedule = !isCurrent && entry?.retiredBy === "reschedule";
+
     // (3) Already paid.
     if (current.paymentStatus === "paid") {
       if (isCurrent) return { kind: "already_paid", consultation: current };
       return {
         kind: "refund_recorded",
         consultation: current,
-        ...(await recordException("paid_on_superseded_reference_after_booking_paid")),
+        ...(await recordException(
+          retiredByReschedule ? "paid_for_rescheduled_slot" : "paid_on_superseded_reference_after_booking_paid"
+        )),
       };
     }
     // (4) No longer awaiting payment.
     if (current.status !== "pending_payment") {
-      return { kind: "not_payable_recorded", consultation: current, ...(await recordException("booking_not_payable")) };
+      return {
+        kind: "not_payable_recorded",
+        consultation: current,
+        ...(await recordException(retiredByReschedule ? "paid_for_rescheduled_slot" : "booking_not_payable")),
+      };
     }
     // (4b) Issue #354: a checkout retired by a reschedule was for the OLD
     // slot. Never confirm the booking with it: give the money back, and the
     // booking stays pending_payment for a fresh checkout priced now.
-    if (entry?.retiredBy === "reschedule") {
+    if (retiredByReschedule) {
       return {
         kind: "rescheduled_refund_recorded",
         consultation: current,
@@ -925,7 +1004,9 @@ export async function startUnappliedRefund(written: UnappliedRefundWrite): Promi
   } catch (error) {
     console.error(`[consultation] refund ${refund.id} could not be sent yet; the retry job will:`, error);
   }
-  await consultationRefundService.notifyUnappliedRefund(row, written.exception);
+  await consultationRefundService.notifyUnappliedRefund(row, written.exception, {
+    bookingAwaitingPayment: written.bookingAwaitingPayment,
+  });
   if (written.debit) await consultationRefundService.notifyFeeDebit(written.debit);
   return row;
 }

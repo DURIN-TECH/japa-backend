@@ -99,6 +99,7 @@ import { collections } from "../utils/firebase";
 import { chargeRuntime } from "./charge-checkout.service";
 import {
   expectedCharge,
+  feeDebitAgentFor,
   // Issue #354: who carries Paystack's fee on an unapplied payment's refund.
   feeForException,
   planUnappliedRefund,
@@ -567,7 +568,26 @@ export type ExceptionRetryOutcome =
   /** A client-caused fee >= the charge: still held, nothing to refund (409). */
   | { kind: "fee_not_less_than_amount" }
   /** Paystack could not be asked for the fee: nothing written (502). */
-  | { kind: "paystack_unavailable" };
+  | { kind: "paystack_unavailable" }
+  /** Issue #354 fix round: an admin closed it as nothing_to_refund; nothing to retry (409). */
+  | { kind: "closed" };
+
+/**
+ * What closing an unapplied-payment exception as `nothing_to_refund` did
+ * (issue #354 fix round, `closeExceptionNothingToRefund`).
+ */
+export type CloseExceptionOutcome =
+  /** No such exception of THIS booking: 404 (never another booking's record). */
+  | { kind: "not_found" }
+  /** Closed now: status `nothing_to_refund`. */
+  | { kind: "closed"; exception: ConsultationPaymentException }
+  /** It was already closed: nothing written (a repeat is a no-op, 200). */
+  | { kind: "already_closed"; exception: ConsultationPaymentException }
+  /**
+   * Not a case the client is owed nothing on: 409 NOT_CLOSABLE, nothing
+   * written. `why` names the first rule that failed.
+   */
+  | { kind: "not_closable"; why: "agent_caused" | "not_held_fee_not_less_than_amount" | "refund_exists" };
 
 /** What a refund webhook did. */
 export type RefundWebhookOutcome = "not_refund_event" | "unknown_refund" | "unchanged" | "applied";
@@ -738,6 +758,8 @@ class ConsultationRefundService {
       .map((d) => d.data() as ConsultationPaymentException)
       .find((ex) => ex.consultationId === input.consultationId && refundDocId(ex.reference) === input.refundId);
     if (!found) return { kind: "not_found" };
+    // Issue #354 fix round: closed as nothing_to_refund is final.
+    if (found.status === "nothing_to_refund") return { kind: "closed" };
 
     // ---- Ask Paystack again, FIRST (never inside a transaction) ----
     let lookup: Awaited<ReturnType<typeof paystackProvider.getTransactionMetadata>>;
@@ -763,10 +785,14 @@ class ConsultationRefundService {
       if (!exceptionSnap.exists || !bookingSnap.exists) return { kind: "not_found" };
       const exception = exceptionSnap.data() as ConsultationPaymentException;
       const booking = bookingSnap.data() as Consultation;
+      // Closed between the read above and this transaction: still final.
+      if (exception.status === "nothing_to_refund") return { kind: "closed" };
+      // Issue #354 fix round: the lock (and the debit) is the agent who
+      // CAUSED it (moved the booking), not the booking's agent now.
       const reads = await readUnappliedRefund(
         tx,
         exception.reference,
-        isAgentCausedException(exception.reason) ? booking.agentId : null
+        isAgentCausedException(exception.reason) ? feeDebitAgentFor(exception, booking) : null
       );
       // A concurrent retry (or a settle) wrote the row first: never a second one.
       if (reads.existingRefund) return { kind: "already_refunded", refund: reads.existingRefund };
@@ -780,6 +806,89 @@ class ConsultationRefundService {
   }
 
   /**
+   * Close a client-caused exception as `nothing_to_refund` (issue #354 fix
+   * round, orchestrator decision 2026-11-17), for
+   * `POST /consultations/:id/payment-exceptions/:exceptionId/close`. WHO may
+   * call it (admins only) is the controller's check.
+   *
+   * Under the fee rule a client-caused refund is the charge minus Paystack's
+   * fee. When that fee is the whole charge or more, the client is owed
+   * nothing and Paystack would refuse a non-positive refund, so the exception
+   * sits `refund_failed` / `fee_not_less_than_amount` for ever. This lets an
+   * admin close it, so it leaves `GET /consultations/payment-exceptions`.
+   *
+   * NO money moves: no Paystack call, no refund row, no Transaction of any
+   * kind. Only the exception doc changes (status, closedAt, closedBy). Seli
+   * carries nothing: the client paid X, Paystack kept a fee >= X.
+   *
+   * One Firestore transaction re-reads the exception and its ONE possible
+   * refund row (`refundDocId(reference)`), then:
+   *  - not an exception of THIS booking: not_found (404);
+   *  - already `nothing_to_refund`: already_closed (200, nothing written:
+   *    a repeat, or two admins at once, is a no-op);
+   *  - agent-caused (`paid_for_rescheduled_slot`): not_closable. The client
+   *    is owed the whole charge there whatever the fee;
+   *  - not held as `fee_not_less_than_amount`, or the STORED Paystack fee
+   *    (the only fee ever used: never estimated, no fresh lookup) does not
+   *    give that hold again under `planUnappliedRefund`: not_closable;
+   *  - a refund row exists for the reference: not_closable (money is already
+   *    on its way; never closed over it);
+   *  - otherwise: closed.
+   *
+   * @param input.exceptionId the exception's id (= its Paystack reference)
+   * @param input.adminUid the admin closing it (stored as `closedBy`)
+   */
+  async closeExceptionNothingToRefund(input: {
+    consultationId: string;
+    exceptionId: string;
+    adminUid: string;
+  }): Promise<CloseExceptionOutcome> {
+    const exceptionRef = collections.consultationPaymentExceptions.doc(input.exceptionId);
+    return chargeRuntime.runTransaction<CloseExceptionOutcome>(async (tx) => {
+      // ---- Reads (all before the one write) ----
+      const exceptionSnap = await tx.get(exceptionRef);
+      if (!exceptionSnap.exists) return { kind: "not_found" };
+      const exception = exceptionSnap.data() as ConsultationPaymentException;
+      // Scoped to the booking in the path: never another booking's record.
+      if (exception.consultationId !== input.consultationId) return { kind: "not_found" };
+      const refundSnap = await tx.get(collections.transactions.doc(refundDocId(exception.reference)));
+
+      // ---- Idempotent: closed is final, a repeat writes nothing ----
+      if (exception.status === "nothing_to_refund") return { kind: "already_closed", exception };
+
+      // ---- Only a client-caused case where the client is owed nothing ----
+      if (isAgentCausedException(exception.reason)) return { kind: "not_closable", why: "agent_caused" };
+      const plan = planUnappliedRefund(exception, exception.paystackFeeMinor);
+      if (
+        exception.status !== "refund_failed" ||
+        exception.refundFailureReason !== "fee_not_less_than_amount" ||
+        plan.kind !== "hold" ||
+        plan.reason !== "fee_not_less_than_amount"
+      ) {
+        return { kind: "not_closable", why: "not_held_fee_not_less_than_amount" };
+      }
+      if (refundSnap.exists || exception.refundId) return { kind: "not_closable", why: "refund_exists" };
+
+      // ---- Close: the exception doc only, no money ----
+      const now = Timestamp.fromDate(chargeRuntime.now());
+      const closed: ConsultationPaymentException = {
+        ...exception,
+        status: "nothing_to_refund",
+        closedAt: now,
+        closedBy: input.adminUid,
+        updatedAt: now,
+      };
+      tx.update(exceptionRef, { status: closed.status, closedAt: now, closedBy: input.adminUid, updatedAt: now });
+      console.warn(
+        `[refund] exception ${exception.reference} on ${exception.consultationId} closed as nothing_to_refund by ` +
+          `admin ${input.adminUid}: Paystack fee ${exception.paystackFeeMinor} >= charge ${exception.amountMinor} ` +
+          `${exception.currency}; no refund, no Transaction`
+      );
+      return { kind: "closed", exception: closed };
+    });
+  }
+
+  /**
    * Refunds of unapplied payments that need an admin (issue #354), for
    * `GET /consultations/payment-exceptions`: every exception whose status is
    * `refund_failed`, newest first. Each comes with `retryRefundId`, the id
@@ -788,7 +897,9 @@ class ConsultationRefundService {
    *    will take;
    *  - the row failed at Paystack: that row's id (it is also in
    *    `GET /transactions?role=admin&type=refund&status=failed`).
-   * Single-equality query (no composite index); sorted in memory.
+   * Single-equality query (no composite index); sorted in memory. An
+   * exception closed as `nothing_to_refund` (fix round) is no longer
+   * `refund_failed`, so it drops out of this list.
    */
   async listExceptionRefundsNeedingAdmin(): Promise<Array<ConsultationPaymentException & { retryRefundId: string }>> {
     const snap = await collections.consultationPaymentExceptions.where("status", "==", "refund_failed").get();
@@ -1119,14 +1230,25 @@ class ConsultationRefundService {
    *    (refunded + kept = charged). With a fee of 0 the second sentence is
    *    left out (nothing was kept).
    */
-  async notifyUnappliedRefund(row: Transaction, exception: ConsultationPaymentException): Promise<void> {
+  async notifyUnappliedRefund(
+    row: Transaction,
+    exception: ConsultationPaymentException,
+    /**
+     * Issue #354 fix round: whether the booking still awaits payment. An
+     * agent-caused refund only asks the client to pay again when it does;
+     * after the booking was paid through a fresh checkout, or cancelled, the
+     * "pay again" sentence would be wrong. Defaults to true (the #354 copy).
+     */
+    opts: { bookingAwaitingPayment?: boolean } = {}
+  ): Promise<void> {
     const currency = row.currency as Money["currency"];
     const amount = describe({ amountMinor: row.amount, currency });
     const kept = Number(row.paystackFeeKeptMinor) || 0;
     const keptLine = kept > 0 ? ` The payment provider kept a processing fee of ${describe({ amountMinor: kept, currency })}.` : "";
+    const payAgain = opts.bookingAwaitingPayment !== false ? " Please pay again for the new time." : "";
     const body =
       exception.reason === "paid_for_rescheduled_slot"
-        ? "Your consultation moved, so we've refunded your payment in full. Please pay again for the new time."
+        ? `Your consultation moved, so we've refunded your payment in full.${payAgain}`
         : exception.reason === "booking_not_payable"
           ? `This consultation was no longer awaiting payment, so we've refunded ${amount}.${keptLine}`
           : `This consultation was already paid for, so we've refunded your extra payment of ${amount}.${keptLine}`;

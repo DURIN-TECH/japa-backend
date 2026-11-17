@@ -548,6 +548,54 @@ export function parseEditBody(body: unknown): ParsedEdit {
 // ============================================
 
 /**
+ * A schedule value as a comparable primitive (issue #354 fix round): a date
+ * (Firestore Timestamp, a serialized `{ _seconds, _nanoseconds }`, a Date or
+ * an ISO string) as epoch milliseconds, anything else as itself. A value
+ * that cannot be read stays as it is, so it compares unequal to a readable
+ * one (the safe side: an unreadable stored slot counts as moved). Pure.
+ */
+function comparableSlotValue(value: unknown): unknown {
+  if (value instanceof Timestamp) return value.toMillis();
+  if (value instanceof Date) return value.getTime();
+  if (value && typeof value === "object") {
+    const v = value as { toMillis?: () => number; _seconds?: number; seconds?: number; _nanoseconds?: number; nanoseconds?: number };
+    if (typeof v.toMillis === "function") return v.toMillis();
+    const seconds = v._seconds ?? v.seconds;
+    const nanos = v._nanoseconds ?? v.nanoseconds ?? 0;
+    if (typeof seconds === "number") return seconds * 1000 + Math.floor(nanos / 1e6);
+  }
+  if (typeof value === "string") {
+    const ms = Date.parse(value);
+    // A date string compares by its instant; other strings (a time, a zone) as text.
+    if (!Number.isNaN(ms) && /^\d{4}-\d{2}-\d{2}/.test(value)) return ms;
+  }
+  return value;
+}
+
+/**
+ * Whether an edit actually MOVES the booking's slot (issue #354 review fix,
+ * fix round 2026-11-17): some schedule field in `updates` holds a value that
+ * differs from the stored one. Only then is the checkout for the old slot
+ * retired. Naming `scheduledDate` / `scheduledTime` / `durationMinutes` /
+ * `timezone` with the value already stored is not a move.
+ *
+ * `timezone` counts: the same wall-clock date and time in another zone is a
+ * different instant, so the client's checkout was issued for another slot.
+ * Pure.
+ *
+ * @param current the booking as read in the edit's transaction
+ * @param updates the checked values from `parseEditBody`
+ */
+export function slotChanges(current: Consultation, updates: EditUpdates): boolean {
+  return EDIT_FIELD_GROUPS.schedule.some((field) => {
+    const next = updates[field];
+    if (next === undefined) return false; // not part of this edit
+    const stored = (current as unknown as Record<string, unknown>)[field];
+    return comparableSlotValue(next) !== comparableSlotValue(stored);
+  });
+}
+
+/**
  * The fields that retire an unpaid booking's checkouts when it is
  * rescheduled (issue #354), or null when there is nothing to retire. Pure.
  *
@@ -584,9 +632,16 @@ export function retireCheckoutsForReschedule(
   const older = booking.supersededCheckouts ?? [];
   const current = booking.transactionId ?? null;
   if (!current && older.length === 0) return null;
+  // Issue #354 fix round: each newly retired entry records WHO moved the
+  // booking (its `agentId` now, the agent side making this edit), so a later
+  // payment on it debits Paystack's fee from that agent even if the case is
+  // reassigned before the payment lands. An entry an EARLIER reschedule
+  // already retired keeps its own record untouched: that earlier move is what
+  // retired it, so its agent is the one who caused a payment on it.
+  const retiredNow = { retiredBy: "reschedule" as const, retiredByAgentId: booking.agentId };
   const retired: SupersededCheckout[] = [
-    ...older.map((s) => ({ ...s, retiredBy: "reschedule" as const })),
-    ...(current ? [{ ...supersededEntryOf(booking, current, at), retiredBy: "reschedule" as const }] : []),
+    ...older.map((s) => (s.retiredBy === "reschedule" ? s : { ...s, ...retiredNow })),
+    ...(current ? [{ ...supersededEntryOf(booking, current, at), ...retiredNow }] : []),
   ];
   return {
     update: {
@@ -1238,7 +1293,11 @@ class ConsultationService {
       // checkout(s) in THIS transaction, so no checkout for the old slot
       // stays open. (decideEdit already refused it while a payment may be in
       // flight: 409 PAYMENT_IN_PROGRESS.)
-      const retire = isScheduleEdit(fieldNames) ? retireCheckoutsForReschedule(current, at) : null;
+      // Review fix (fix round): only a REAL move retires the checkout. Naming
+      // a schedule field with the value it already has is not a reschedule
+      // (the client's checkout is still for the same slot), so it must not
+      // turn their later payment into a refund and a fee debit on the agent.
+      const retire = slotChanges(current, updates) ? retireCheckoutsForReschedule(current, at) : null;
       if (retire) {
         Object.assign(write, retire.update);
         console.warn(

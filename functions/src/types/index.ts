@@ -1443,6 +1443,16 @@ export interface SupersededCheckout extends ChargeSnapshot, Partial<QuoteLock> {
    * Absent on a checkout replaced by an ordinary re-price.
    */
   retiredBy?: "reschedule";
+  /**
+   * Issue #354 review fix (fix round, 2026-11-17): the booking's `agentId`
+   * at the moment the reschedule retired this checkout, i.e. the agent whose
+   * move caused a later payment on it to be refunded. Paystack's fee on that
+   * refund is debited from THIS agent, not from whoever holds the booking
+   * when the payment lands (the case may be reassigned in between): whoever
+   * caused it pays. Entries retired before this field existed have none; the
+   * debit then falls back to the booking's agent at settle time.
+   */
+  retiredByAgentId?: string;
 }
 
 /**
@@ -1484,8 +1494,15 @@ export interface ConsultationPaymentException {
    * (the refund row is `failed` and listed for an admin retry, which moves
    * this back to `open`). Also `refund_failed`, with NO refund row, while the
    * refund is held for an admin (`refundFailureReason`).
+   *
+   * Issue #354 fix round: `nothing_to_refund` once an admin has CLOSED a
+   * client-caused exception whose Paystack fee is the whole charge or more
+   * (`refundFailureReason: "fee_not_less_than_amount"`): under the fee rule
+   * the client is owed nothing, so there is no refund row, no Paystack call
+   * and no Transaction. A closed exception is final: it leaves the admin
+   * list and a later settle of the same reference never reopens it.
    */
-  status: "open" | "refunded" | "refund_failed";
+  status: "open" | "refunded" | "refund_failed" | "nothing_to_refund";
   /**
    * Issue #354: the refund Transaction's doc id (`refundDocId(reference)`),
    * written in the SAME Firestore transaction as this record.
@@ -1518,6 +1535,20 @@ export interface ConsultationPaymentException {
    * refunds and when Paystack's fee was 0.
    */
   feeDebitId?: string;
+  /**
+   * Issue #354 fix round: the agent who CAUSED an agent-caused exception
+   * (`paid_for_rescheduled_slot`), and so pays Paystack's fee: the
+   * `retiredByAgentId` of the retired checkout that was paid (the booking's
+   * agent when it was moved). Falls back to the booking's `agentId` at
+   * settle time for a checkout retired before that field existed. Fixed the
+   * first time the exception is planned, so a held refund retried later still
+   * debits the same agent. Absent for client-caused exceptions.
+   */
+  causedByAgentId?: string;
+  /** Issue #354 fix round: when an admin closed it as `nothing_to_refund`. */
+  closedAt?: Timestamp;
+  /** Issue #354 fix round: the admin (uid) who closed it as `nothing_to_refund`. */
+  closedBy?: string;
   createdAt: Timestamp;
   /** Last change of `status` / `refundId` (absent until the first change). */
   updatedAt?: Timestamp;
