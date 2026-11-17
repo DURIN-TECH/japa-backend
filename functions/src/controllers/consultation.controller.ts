@@ -1146,6 +1146,68 @@ export class ConsultationController {
   }
 
   /**
+   * POST /consultations/:id/payment-exceptions/:exceptionId/close
+   * (issue #354 fix round, ADMIN only; decision 2026-11-17).
+   *
+   * Closes a CLIENT-caused unapplied-payment exception as `nothing_to_refund`
+   * when Paystack's fee on that charge is the whole charge or more
+   * (`refundFailureReason: "fee_not_less_than_amount"`): under the fee rule
+   * the client is owed nothing. No Paystack call, no refund row, no
+   * Transaction; the exception leaves `GET /consultations/payment-exceptions`.
+   * `exceptionId` is the exception's `id` from that list (its Paystack
+   * reference).
+   *
+   *  - no token: 401 (verifyAuth, before this runs);
+   *  - not an admin: 403 FORBIDDEN, before anything is read;
+   *  - a malformed id: 400 VALIDATION_ERROR;
+   *  - no such exception of THIS booking: 404;
+   *  - already closed: 200 with `alreadyClosed: true`, nothing written
+   *    (idempotent: a repeat is a no-op);
+   *  - agent-caused, not held as `fee_not_less_than_amount`, or a refund
+   *    already exists: 409 NOT_CLOSABLE, nothing written;
+   *  - otherwise: 200 with the closed exception.
+   */
+  async closePaymentException(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      // Admins only, checked first: no read for anyone else.
+      if (req.authz?.role !== ROLES.ADMIN) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const exceptionId = req.params.exceptionId;
+      // A Paystack reference as we issue them: a bounded run of safe
+      // characters (and never a path: Firestore ids cannot hold "/").
+      if (typeof exceptionId !== "string" || !/^[A-Za-z0-9_.:=-]{1,200}$/.test(exceptionId)) {
+        sendError(res, "VALIDATION_ERROR", "exceptionId must be a payment exception id");
+        return;
+      }
+      const outcome = await consultationRefundService.closeExceptionNothingToRefund({
+        consultationId: req.params.id,
+        exceptionId,
+        adminUid: req.userId!,
+      });
+      if (outcome.kind === "not_found") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (outcome.kind === "not_closable") {
+        const message =
+          outcome.why === "agent_caused"
+            ? "The client is owed this payment in full, so it cannot be closed without a refund."
+            : outcome.why === "refund_exists"
+              ? "A refund already exists for this payment, so it cannot be closed."
+              : "Only a payment whose processing fee is not less than the amount charged can be closed with nothing to refund.";
+        sendError(res, "NOT_CLOSABLE", message, 409);
+        return;
+      }
+      sendSuccess(res, { exception: outcome.exception, closed: true, alreadyClosed: outcome.kind === "already_closed" });
+    } catch (error) {
+      console.error("Error closing consultation payment exception:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * POST /consultations/:id/refund  (issue #317, admins only)
    *
    * Body `{ reason: "agent_no_show" | "goodwill" | "other", note? }`; `note`
@@ -1220,6 +1282,11 @@ export class ConsultationController {
             "Paystack's processing fee is not less than the amount charged, so there is nothing left to refund.",
             409
           );
+          return;
+        }
+        // Issue #354 fix round: an admin closed it as nothing_to_refund.
+        if (retry.kind === "closed") {
+          sendError(res, "EXCEPTION_CLOSED", "This payment was closed with nothing to refund, so there is nothing to retry.", 409);
           return;
         }
         if (retry.kind === "paystack_unavailable") {

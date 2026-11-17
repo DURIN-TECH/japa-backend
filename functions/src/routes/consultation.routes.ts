@@ -57,6 +57,14 @@ router.post("/:id/refund", verifyAuth, (req, res) =>
   consultationController.refundConsultation(req, res)
 );
 
+// Issue #354 fix round: an admin closes a client-caused unapplied-payment
+// exception as nothing_to_refund (Paystack's fee >= the charge). No money
+// moves. 401 without a token (verifyAuth); the controller answers 403 for
+// anyone but an admin, before anything is read.
+router.post("/:id/payment-exceptions/:exceptionId/close", verifyAuth, (req, res) =>
+  consultationController.closePaymentException(req, res)
+);
+
 router.delete("/:id", verifyAuth, (req, res) =>
   consultationController.deleteConsultation(req, res)
 );
