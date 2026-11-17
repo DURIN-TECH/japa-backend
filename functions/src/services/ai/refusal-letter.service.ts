@@ -442,8 +442,14 @@ export class RefusalLetterService {
 
     // ---- the one model call: values only ----
     const request = buildRefusalRequest({ mediaType, data: bytes.toString("base64") });
-    if (request.documents![0].data.length > settings.maxInputCharsPerAssessment) {
-      throw new JobStop("cost_cap_exceeded", "the file would pass the input size cap");
+    // (#310) The input-size cap counts the TEXT of the request only. The
+    // letter's base64 data used to be compared with it, so a 1.5 MB scan was
+    // refused as "over the cost cap"; the file is bounded by the byte check
+    // above instead. The text here is a short fixed prompt, so this cannot
+    // fire unless the cap is set very low: it keeps the rule "no request
+    // leaves past the cap" true for this job too.
+    if (request.user.length > settings.maxInputCharsPerAssessment) {
+      throw new JobStop("cost_cap_exceeded", "the request would pass the input size cap");
     }
     let res;
     try {

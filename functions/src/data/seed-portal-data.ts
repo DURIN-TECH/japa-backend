@@ -10,6 +10,8 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
 import { seedCountriesAndVisas } from "./seed-countries-visas";
+// Type-only: the shape of the compliance file written on the seeded agency (#337).
+import type { AgencyCompliance } from "../types";
 
 const db = getFirestore();
 
@@ -107,6 +109,22 @@ const EMAILS = {
 // ============================================
 function daysAgo(days: number): Timestamp {
   return Timestamp.fromDate(new Date(Date.now() - days * 86400000));
+}
+
+/**
+ * Issue #317: the fee hold of a seeded consultation fee. Every seeded fee is
+ * for a meeting long past (paid N days ago), so it is RELEASED, as the
+ * backfill would stamp it: the agent can see and withdraw it. Without a hold
+ * a fee counts as held for good and seeded agents would show 0 available.
+ */
+function releasedFeeHold(paidDaysAgo: number) {
+  return {
+    state: "released" as const,
+    slotStartAt: daysAgo(paidDaysAgo),
+    releaseAt: daysAgo(paidDaysAgo - 1),
+    endedAt: daysAgo(paidDaysAgo - 1),
+    endedBy: "legacy_backfill" as const,
+  };
 }
 
 function daysFromNow(days: number): Timestamp {
@@ -420,6 +438,55 @@ async function seedUsers() {
   return users.length;
 }
 
+// ============================================
+// SEEDED AGENCY: COMPLIANCE FILE (issue #337)
+// ============================================
+/** The seeded demo agency's document id (`agencies/seed-agency-001`). */
+export const SEED_AGENCY_ID = IDS.agency;
+
+/**
+ * The seeded admin recorded as the reviewer of the demo agency's compliance
+ * file. `seedAuthUsers` gives this account the `admin: true` claim, which is
+ * what `npm run audit:agencies` checks (`COMPLIANCE_REVIEWER_NOT_ADMIN`).
+ */
+export const SEED_COMPLIANCE_REVIEWER_UID = IDS.admin1User;
+
+/**
+ * The compliance file of the seeded demo agency: VERIFIED, with the review
+ * record an admin decision leaves behind.
+ *
+ * Why it exists: `POST /payment-requests` is behind `requireAgencyVerified`,
+ * which reads `agency.compliance.status`. The agency was seeded
+ * `status: "approved"` with NO compliance file, so every member (owner
+ * included) got 403 COMPLIANCE_REQUIRED, and because `seed:dev` rewrites the
+ * agency on every dev deploy an admin approval on dev never stuck.
+ *
+ * What is in it, and what is deliberately not:
+ *  - `status: "verified"`: what the money gates read.
+ *  - `submittedAt`, `reviewedAt`, `reviewedBy`: the review metadata. A
+ *    decided file without them is reported by the agency audit as
+ *    `COMPLIANCE_DECISION_WITHOUT_REVIEW`; a reviewer who is not an admin as
+ *    `COMPLIANCE_REVIEWER_NOT_ADMIN`.
+ *  - NO KYC/KYB/payout values (BVN, ID number, RC number, TIN, bank account,
+ *    document paths): this is demo data, and inventing identity numbers
+ *    would be made-up personal data. Every other `AgencyCompliance` field is
+ *    optional, so the file is valid without them.
+ *
+ * Exported (and pure apart from the clock) so the tests can run the real
+ * compliance gate against exactly what the seed writes.
+ */
+export function buildSeedAgencyCompliance(): AgencyCompliance {
+  return {
+    status: "verified",
+    // The agency was created 90 days ago (see `seedAgency`): it submitted its
+    // file two days later and an admin verified it three days after that, the
+    // same day the owner's agent profile was verified (`verifiedAt`, 85 days ago).
+    submittedAt: daysAgo(88),
+    reviewedAt: daysAgo(85),
+    reviewedBy: SEED_COMPLIANCE_REVIEWER_UID,
+  };
+}
+
 async function seedAgency() {
   const now = Timestamp.now();
 
@@ -445,6 +512,10 @@ async function seedAgency() {
     totalCases: 10,
     activeCases: 5,
     status: "approved" as const,
+    // Issue #337: the demo agency is compliance-verified, so its members can
+    // request payment (and be assigned platform clients) straight after a
+    // seed. `status: "approved"` above is a SEPARATE gate (the agency itself).
+    compliance: buildSeedAgencyCompliance(),
     createdAt: daysAgo(90),
     updatedAt: now,
   };
@@ -2249,6 +2320,8 @@ async function seedTransactions(): Promise<number> {
       isEscrow: false,
       paymentProvider: "stripe",
       description: "Initial consultation fee for Short Stay C Visa",
+      // Issue #317: a past meeting, so the fee is released (withdrawable).
+      feeHold: releasedFeeHold(25),
       clientName: "John Doe",
       clientEmail: EMAILS.client1User,
       visaTypeName: "Short Stay 'C' Visa",
@@ -2285,6 +2358,8 @@ async function seedTransactions(): Promise<number> {
       isEscrow: false,
       paymentProvider: "stripe",
       description: "Consultation fee for Employment Permit",
+      // Issue #317: a past meeting, so the fee is released (withdrawable).
+      feeHold: releasedFeeHold(18),
       clientName: "Jane Smith",
       clientEmail: EMAILS.client2User,
       visaTypeName: "General Employment Permit",
@@ -2340,6 +2415,8 @@ async function seedTransactions(): Promise<number> {
       isEscrow: false,
       paymentProvider: "stripe",
       description: "Consultation fee refunded (application rejected)",
+      // Issue #317: a past meeting, so the fee is released (withdrawable).
+      feeHold: releasedFeeHold(35),
       clientName: "Lisa Wong",
       clientEmail: EMAILS.client4User,
       visaTypeName: "Student Visa (D)",

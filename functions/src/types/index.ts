@@ -485,6 +485,35 @@ export interface Country {
 //
 // Fields are absent (never `undefined`) when they do not apply, like
 // `VisaFeeMeta`.
+/**
+ * Issue #339: the citation of ONE fact of a shared route a record inherits
+ * (its processing time or its stay limit), shaped like `VisaSourcedFee`
+ * without the conversion block. `quote` is a list because one fact can need
+ * several sentences that are separate paragraphs in the source.
+ */
+export interface VisaSourcedFact {
+  /** The shared route whose source states the fact. */
+  sharedRouteId: string;
+  /** The sentence(s) of the official source that state the fact, word for word, in the source's order. */
+  quote: string[];
+  /** The official document the quote is from (https). */
+  url: string;
+  /** The stored official source the quote is in (`guidanceSources/{id}`). */
+  guidanceSourceId: string;
+}
+
+/**
+ * Issue #339: one citation per sourced fact on a record. A key is present
+ * only when the record carries that fact from a shared route:
+ *   - `processing` cites `processingTime` (and `processingDaysMin` /
+ *     `processingDaysMax` when the route states them),
+ *   - `validity` cites `validityPeriod`.
+ */
+export interface VisaSourcedFacts {
+  processing?: VisaSourcedFact;
+  validity?: VisaSourcedFact;
+}
+
 export interface VisaSourcedFee {
   /** The shared route whose source states the fee. */
   sharedRouteId: string;
@@ -577,6 +606,13 @@ export interface VisaType {
   // Written and removed ONLY by the countries/visas seed, together with
   // `baseCostUsd`; absent on every record whose fee has another origin.
   sourcedFee?: VisaSourcedFee;
+
+  // Issue #339: where `processingTime` / `processingDaysMax` and
+  // `validityPeriod` come from when they are facts of a shared route this
+  // record inherits (see `VisaSourcedFacts` below). Written and removed ONLY
+  // by the countries/visas seed, together with the fields they cite; absent
+  // on every record whose facts have another origin.
+  sourcedFacts?: VisaSourcedFacts;
 
   // Availability
   isActive: boolean;
@@ -1370,6 +1406,16 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   cancelledAt?: Timestamp;
   cancelledBy?: string;
   cancellationReason?: string;
+
+  // Refund (issue #317). Set when a refund row is written for this booking's
+  // fee (on a refundable cancel, or by an admin), and kept in step with that
+  // row's status by the refund engine (services/consultation-refund.service.ts).
+  // The booking's `paymentStatus` stays "paid": the client DID pay, and the
+  // #321 relationship check reads it. The refund is its own Transaction.
+  /** Doc id of the refund Transaction (`refund_<sha256 of the Paystack reference>`, see refundDocId). */
+  refundId?: string;
+  /** Mirror of the refund Transaction's status. */
+  refundStatus?: RefundStatus;
   
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -1465,6 +1511,75 @@ export type TransactionStatus =
   | "held_in_escrow"
   | "released";
 
+// ============================================
+// CONSULTATION REFUNDS AND FEE HOLDS (issue #317)
+// ============================================
+
+/**
+ * Why a consultation fee was refunded (issue #317). The first two come from a
+ * cancel (`PUT /consultations/:id/status`), the `admin_*` ones from the admin
+ * endpoint `POST /consultations/:id/refund`.
+ */
+export type RefundReason =
+  | "agent_cancelled"
+  | "client_cancelled"
+  | "admin_agent_no_show"
+  | "admin_goodwill"
+  | "admin_other";
+
+/**
+ * Where a refund row stands (issue #317). It only ever moves forward:
+ * `pending` (row written, Paystack not yet accepted) -> `processing`
+ * (Paystack accepted it) -> `completed` (Paystack `refund.processed`, final),
+ * or `failed` (Paystack `refund.failed`, or our retries ran out). Only an
+ * admin retry moves a `failed` row back to `pending`, and it re-uses the
+ * SAME row.
+ */
+export type RefundStatus = Extract<TransactionStatus, "pending" | "processing" | "completed" | "failed">;
+
+/**
+ * Where the money of a refund comes from (issue #317, #351 reversal):
+ *  - "hold": the fee was still HELD (the meeting had not happened yet), so
+ *    the refund is paid out of that held fee; the agent's available balance
+ *    does not move and the agent never had the money;
+ *  - "available": the fee had already been RELEASED to the agent (admin
+ *    override only), so the refund comes off the agent's available balance,
+ *    which may go below zero (withdrawals are then blocked until it is back
+ *    above zero). Seli never absorbs the shortfall.
+ */
+export type RefundFundedFrom = "hold" | "available";
+
+/**
+ * The hold on a consultation fee (issue #317, "hold consultation fees").
+ * Stored on the fee Transaction (`type: "consultation_fee"`) as `feeHold`.
+ *
+ * A paid fee is HELD (not withdrawable) until the meeting has happened:
+ *  - released at `releaseAt` (slot end + 24 hours) by the clock alone, or
+ *  - earlier, once the booking is marked `completed` (or the client
+ *    `no_show`) AND the slot has started (`meetingClosedAt` set and the clock
+ *    past `slotStartAt`). A booking marked complete before its slot even
+ *    started keeps its hold until the slot starts.
+ * `state` only ever records the two events the clock cannot see:
+ *  - "held": nothing happened yet (release is worked out from the times);
+ *  - "released": released for good (the legacy backfill writes this);
+ *  - "refunded": the held fee was refunded to the client (the refund row's
+ *    `refundFundedFrom` is "hold"); it is never released to the agent.
+ * The clock rule lives in ONE function, `feeHoldStatusAt` (money/fee-hold.ts).
+ */
+export interface FeeHold {
+  state: "held" | "released" | "refunded";
+  /** The slot start the hold was last computed for (only ever moves LATER). */
+  slotStartAt: Timestamp;
+  /** When the fee releases by itself: slot end + 24 hours (only ever moves LATER). */
+  releaseAt: Timestamp;
+  /** When the booking was marked completed / no_show (agent side). */
+  meetingClosedAt?: Timestamp;
+  /** When the hold was ended for good (`state` "released" or "refunded"). */
+  endedAt?: Timestamp;
+  /** What ended it: a refund, or the one-off legacy backfill. */
+  endedBy?: "refund" | "legacy_backfill";
+}
+
 /**
  * One financial event.
  *
@@ -1517,6 +1632,52 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   clientName?: string;
   clientEmail?: string;
   visaTypeName?: string;
+
+  // ---- Issue #317: the hold on a consultation fee (type "consultation_fee") ----
+  /** See `FeeHold`. Absent on a fee written before #317 (counted as held until backfilled). */
+  feeHold?: FeeHold;
+
+  // ---- Issue #317: a consultation refund (type "refund") ----
+  // Refund rows are written by the backend only (firestore.rules deny every
+  // client). `amount` + `currency` equal the refunded fee's, in minor units.
+  /** Doc id of the consultation_fee Transaction this refund gives back. */
+  refundOf?: string;
+  /** Why it was refunded. */
+  reason?: RefundReason;
+  /** Uid of who started it (the cancelling user, or the admin). */
+  initiatedBy?: string;
+  /** The admin's note (required for reason `admin_other`). */
+  refundNote?: string;
+  /** Held fee or available balance (see RefundFundedFrom). */
+  refundFundedFrom?: RefundFundedFrom;
+  /**
+   * #351: when a released fee is refunded, how far the refund took the
+   * agent's available balance below zero (minor units of `currency`), at the
+   * moment the row was written. 0 when the balance covered it. Admin-visible.
+   */
+  balanceShortfallMinor?: number;
+  /** Paystack's id of the refund, once Paystack has one. */
+  providerRefundId?: string;
+  /** Paystack's own refund status as last seen ("pending", "processed", ...). */
+  providerRefundStatus?: string;
+  /** How many times the engine has tried (claimed) the Paystack call. */
+  refundAttempts?: number;
+  /**
+   * How many times a Paystack create-refund call was really STARTED for
+   * this row. Above 0, any further try first looks the refund up at
+   * Paystack (a call may have gone through before a crash or a timeout).
+   */
+  refundProviderCalls?: number;
+  /** When a pending row is next due for a retry (the 15-minute job reads it). */
+  refundNextAttemptAt?: Timestamp;
+  /** While set in the future, another worker is talking to Paystack for this row. */
+  refundLeaseUntil?: Timestamp;
+  /** The last error from Paystack, for admins. */
+  refundLastError?: string;
+  /** When Paystack reported the refund processed. */
+  refundedAt?: Timestamp;
+  /** When the row became `failed`. */
+  refundFailedAt?: Timestamp;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -1684,6 +1845,10 @@ export type NotificationType =
   | "consultation_rescheduled"
   | "consultation_cancelled"
   | "consultation_completed"
+  // Issue #317: a consultation fee was refunded (client: "on its way"; agent:
+  // the fee was given back), and a refund that is delayed (failed at Paystack).
+  | "consultation_refunded"
+  | "consultation_refund_delayed"
   // Payments
   | "payment_received"
   | "payment_request"
@@ -2087,4 +2252,61 @@ export interface Feedback {
   /** Triage state; the team edits this in the console. */
   status: "new";
   createdAt: Timestamp;
+}
+
+// ============================================
+// SAVED DESTINATIONS (issue #146)
+// ============================================
+//
+// A client "saves" a destination (one visa in one country) with the heart on
+// its screen. Each save is ONE document under the user:
+//   users/{uid}/savedDestinations/{COUNTRYCODE}_{visaId}
+// Backend only (firestore.rules denies every client read and write); the app
+// goes through GET / PUT / DELETE /users/me/saved-destinations.
+
+/**
+ * The stored save. It holds only the key and the time: the visa's name, fee
+ * and so on are read from the visa when the list is served, so a tile never
+ * shows stale data and a visa that is hidden later drops out of the list.
+ */
+export interface SavedDestination {
+  /** ISO 3166-1 alpha-2, always UPPER CASE ("GB"), whatever case was sent. */
+  countryCode: string;
+  /** Id of the visa: countries/{countryCode}/visaTypes/{visaId}. */
+  visaId: string;
+  /** When the user first saved it. Saving again does not move it. */
+  savedAt: Timestamp;
+}
+
+/**
+ * The part of a visa a destination tile draws. An allow-list on purpose: the
+ * saved list never returns a visa's internal fields (review state, scrape
+ * provenance, owning agency...). The names match `VisaType`, so the mobile
+ * tile mapper takes this object as it takes a visa.
+ */
+export interface SavedDestinationVisa {
+  id: string;
+  /** UPPER CASE, same as the item's `countryCode`. */
+  countryCode: string;
+  name: string;
+  description: string;
+  category: VisaCategory;
+  /** Display text, e.g. "3 weeks". */
+  processingTime: string;
+  /** Government fee in US dollars. */
+  baseCostUsd: number;
+  /** Percent, or null when not known. */
+  successRate: number | null;
+  /** Null when not counted yet. */
+  totalApplications: number | null;
+  /** Where the visa record came from ("scraped", "agency"...), or null for a seed. */
+  source: VisaType["source"] | null;
+}
+
+/** One saved destination as the API returns it (list item and PUT result). */
+export interface SavedDestinationItem extends SavedDestination {
+  /** The country's display name ("United Kingdom"); the code when the country record is missing. */
+  countryName: string;
+  /** What the tile needs, read from the visa at request time. */
+  visa: SavedDestinationVisa;
 }

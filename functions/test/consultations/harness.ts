@@ -18,7 +18,8 @@ import { Timestamp } from "firebase-admin/firestore";
 import { installFakes, resetStore, fakeCollection, fakeRunTransaction, store, fakeBehaviour } from "../helpers/fake-firestore";
 import { makeService, fakeClock } from "../money/helpers";
 import { consultationCharging } from "../../src/services/consultation-charge.service";
-import { PaystackApiError, paystackProvider, PaystackTransactionLookup } from "../../src/services/billing/paystack.provider";
+import { PaystackApiError, paystackProvider, PaystackRefund, PaystackTransactionLookup } from "../../src/services/billing/paystack.provider";
+import { transactionService } from "../../src/services/transaction.service";
 import { notificationService } from "../../src/services/notification.service";
 import type { Money } from "../../src/types/money";
 
@@ -55,8 +56,34 @@ export interface ChargeCall {
   reference?: string;
 }
 
+/** One recorded Paystack `createRefund` call (issue #317). */
+export interface RefundCall {
+  reference: string;
+  amount: Money;
+  merchantNote?: string;
+}
+
 /** Shared state the tests read and drive. */
 export const harness = {
+  // ---- Issue #317: the Paystack refund API, never the network ----
+  /** Every `createRefund` call that reached "Paystack", in order. */
+  refundCalls: [] as RefundCall[],
+  /** Every `findRefundsForTransaction` call (the charge reference), in order. */
+  refundLookups: [] as string[],
+  /** charge reference -> the refunds "Paystack" holds for it. */
+  paystackRefunds: new Map<string, PaystackRefund[]>(),
+  /**
+   * What the next `createRefund` calls do, one entry per call (FIFO); an
+   * empty queue means "accept". "network": no response (timeout);
+   * "reached_then_network": Paystack CREATED the refund but the answer was
+   * lost (a crash/timeout after the call); "already_reversed": HTTP 400
+   * "Transaction has been fully reversed".
+   */
+  refundBehaviour: [] as Array<"network" | "reached_then_network" | "already_reversed">,
+  /** Throw a network failure from the next refund lookup. */
+  failNextRefundLookup: false,
+  /** Paystack's refund ids, counted from 1 in every test. */
+  refundCounter: 0,
   /** Every Paystack initialize call, in order. */
   charges: [] as ChargeCall[],
   /** reference -> what Paystack's verify reports (set by the test). */
@@ -96,6 +123,12 @@ export const harness = {
     this.realisticNotFound = false;
     this.failNextLookup = false;
     this.onLookup = undefined;
+    this.refundCalls.length = 0;
+    this.refundLookups.length = 0;
+    this.paystackRefunds.clear();
+    this.refundBehaviour.length = 0;
+    this.failNextRefundLookup = false;
+    this.refundCounter = 0;
     const clock = fakeClock(NOW_ISO);
     this.clock = clock;
     const { service, store: rates } = makeService({ config: HARNESS_CONFIG, clock });
@@ -105,6 +138,8 @@ export const harness = {
     setRate("KES", 130);
     consultationCharging.rates = async () => service;
     consultationCharging.now = () => harness.clock.now();
+    // Issue #317: the balances (held vs available) use the same clock.
+    transactionService.now = () => harness.clock.now();
   },
 };
 
@@ -139,6 +174,9 @@ export async function useHarness(): Promise<void> {
     "applications", "conversations",
     // Issue #288: the per-pair lock of the find-or-create transaction.
     "consultationBookingLocks",
+    // Issue #317: the refund rows take the agent's withdrawal lock, and the
+    // hold tests withdraw (bank accounts).
+    "withdrawalLocks", "bankAccounts",
   ]) {
     firebase.collections[name] = fakeCollection(name);
   }
@@ -159,6 +197,9 @@ export async function useHarness(): Promise<void> {
     txChain = run.catch(() => undefined);
     return run;
   }) as any;
+  // Issue #317: withdrawals run on the SAME one-at-a-time chain, as real
+  // Firestore serialises a withdrawal and a refund that share the agent's lock.
+  transactionService.runTransaction = consultationCharging.runTransaction as any;
   // A caller that lost a checkout race re-reads without a real pause.
   consultationCharging.sleep = () => new Promise((resolve) => setImmediate(resolve));
   consultationCharging.profileCountry = async (uid: string) => harness.countries[uid];
@@ -201,6 +242,38 @@ export async function useHarness(): Promise<void> {
       if (replaced !== undefined) return replaced;
     }
     return seen;
+  };
+
+  // ---- Issue #317: Paystack refunds, recorders only ----
+  ps.createRefund = async (input: RefundCall) => {
+    await new Promise((resolve) => setImmediate(resolve));
+    const behaviour = harness.refundBehaviour.shift();
+    if (behaviour === "network") throw new PaystackApiError("PAYSTACK_ERROR: connect ETIMEDOUT", {});
+    if (behaviour === "already_reversed") {
+      throw new PaystackApiError("PAYSTACK_ERROR: Transaction has been fully reversed (HTTP 400)", {
+        httpStatus: 400,
+        providerMessage: "Transaction has been fully reversed",
+      });
+    }
+    harness.refundCalls.push(input);
+    const refund: PaystackRefund = {
+      id: String(++harness.refundCounter),
+      status: "pending",
+      transactionReference: input.reference,
+      amount: input.amount.amountMinor,
+      currency: input.amount.currency,
+    };
+    harness.paystackRefunds.set(input.reference, [...(harness.paystackRefunds.get(input.reference) ?? []), refund]);
+    if (behaviour === "reached_then_network") throw new PaystackApiError("PAYSTACK_ERROR: socket hang up", {});
+    return refund;
+  };
+  ps.findRefundsForTransaction = async (reference: string) => {
+    harness.refundLookups.push(reference);
+    if (harness.failNextRefundLookup) {
+      harness.failNextRefundLookup = false;
+      throw new PaystackApiError("PAYSTACK_ERROR: connect ETIMEDOUT", {});
+    }
+    return [...(harness.paystackRefunds.get(reference) ?? [])];
   };
 
   // ---- Guest account provisioning: a fake Auth user + no claim email ----

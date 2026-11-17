@@ -2,6 +2,8 @@ import type { Timestamp } from "firebase-admin/firestore";
 import type { SharedRouteRef } from "../types/shared-route";
 // #299: the fee of a shared route, already converted by the pure helper.
 import type { SourcedFeeFields } from "./seed-sourced-fee";
+// #339: the processing time and stay limit of a shared route, decided by the pure helper.
+import type { RouteFactFields } from "./seed-route-facts";
 
 // ============================================
 // SEED VISA DOCUMENT BUILDER (issue #239, P10 of #228)
@@ -19,6 +21,12 @@ import type { SourcedFeeFields } from "./seed-sourced-fee";
 // route with a fee are SEED-OWNED too. The seed decides them on every run
 // (seed-sourced-fee.ts) and passes the result in; when it passes none, the
 // whole-document set drops both, which is how a removed fee disappears.
+//
+// Issue #339: the same holds for a shared route's processing time and stay
+// limit (`processingTime` / `processingDaysMin` / `processingDaysMax`,
+// `validityPeriod`, and their `sourcedFacts` citations), decided by
+// seed-route-facts.ts. The seed refuses an entry that sets any of them itself
+// while its route supplies it, so the two never compete here.
 
 /** The seed-owned fields of one visa record (the optional ones may be absent: see seed-countries-visas.ts). */
 export interface SeedVisaFields {
@@ -60,6 +68,8 @@ export interface SeedVisaFields {
  *                  seed's decision), or undefined when it has none. The seed
  *                  refuses an entry that has both this and its own
  *                  `baseCostUsd`, so the two never compete here.
+ * @param facts     #339: the record's route facts (`routeFactFields` of the
+ *                  seed's decision), or undefined when it has none.
  *
  * `inheritsFrom`: a stored value always wins (it was set deliberately by the
  * admin API or the migration, and may have been changed since); the data
@@ -71,7 +81,8 @@ export function buildVisaTypeDoc(
   existing: Record<string, unknown> | undefined,
   now: Timestamp,
   fromData: SharedRouteRef[] = [],
-  sourced?: SourcedFeeFields
+  sourced?: SourcedFeeFields,
+  facts?: RouteFactFields
 ): Record<string, unknown> {
   const storedInherits = Array.isArray(existing?.inheritsFrom) ? (existing!.inheritsFrom as SharedRouteRef[]) : undefined;
   const inheritsFrom = storedInherits && storedInherits.length > 0 ? storedInherits : fromData.length > 0 ? fromData : undefined;
@@ -97,6 +108,15 @@ export function buildVisaTypeDoc(
     // #306: same rule: no source on record, no key (never `false`).
     ...(visa.isExtendable !== undefined && { isExtendable: visa.isExtendable }),
     ...(visa.maxExtensions !== undefined && { maxExtensions: visa.maxExtensions }),
+    // #339: the shared route's processing time and stay limit, with one
+    // citation per fact. Each key is written only when the decision carries
+    // it (an unstated minimum stays absent, never 0). Placed after the entry's
+    // own fields; the seed guarantees the entry sets none of these itself.
+    ...(facts?.processingTime !== undefined && { processingTime: facts.processingTime }),
+    ...(facts?.processingDaysMin !== undefined && { processingDaysMin: facts.processingDaysMin }),
+    ...(facts?.processingDaysMax !== undefined && { processingDaysMax: facts.processingDaysMax }),
+    ...(facts?.validityPeriod !== undefined && { validityPeriod: facts.validityPeriod }),
+    ...(facts && { sourcedFacts: facts.sourcedFacts }),
     eligibilityCriteria: visa.eligibilityCriteria,
     ...(visa.applicationUrl && { applicationUrl: visa.applicationUrl }),
     ...(visa.applicationInstructions && { applicationInstructions: visa.applicationInstructions }),

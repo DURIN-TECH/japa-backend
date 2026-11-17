@@ -174,6 +174,9 @@ const FULL_BOOKING: Required<Consultation> = {
     },
   ],
   cancelledBy: "HIDDEN-cancelling-user-uid",
+  // Issue #317: the refund row's id is internal; its status is shown.
+  refundId: "HIDDEN-refund-row-id",
+  refundStatus: "processing",
 };
 
 /**
@@ -212,6 +215,8 @@ const SHOWN_FROM: Partial<Record<keyof Consultation, readonly string[]>> = {
   recordingUrl: ["recordingUrl"],
   cancelledAt: ["cancelledAt"],
   cancellationReason: ["cancellationReason"],
+  // Issue #317: where the refund stands (no ids).
+  refundStatus: ["refundStatus"],
   createdAt: ["createdAt"],
   updatedAt: ["updatedAt"],
 };
@@ -237,6 +242,8 @@ const HIDDEN_FIELDS: readonly (keyof Consultation)[] = [
   // Internal: how it was booked, and the uid of whoever cancelled it.
   "bookedVia",
   "cancelledBy",
+  // Issue #317: the refund row id (`refund_<Paystack reference>`).
+  "refundId",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */
@@ -447,6 +454,8 @@ describe("client consultation allow-list (issue #332)", () => {
       recordingUrl: "https://recordings.example.test/full",
       cancelledAt: at(4),
       cancellationReason: "Travel moved",
+      // Issue #317: the refund's status (its id stays hidden).
+      refundStatus: "processing",
       createdAt: at(1),
       updatedAt: at(2),
     });
@@ -582,7 +591,11 @@ describe("consultation endpoints answer the client with the allow-list only (iss
     );
     assert.equal(out.status, 200, JSON.stringify(out.body));
     assert.equal(out.body.data.status, "cancelled");
-    assertNoLeak(out.body.data, CLIENT_CONSULTATION_FIELDS);
+    // Issue #317: every cancel answer also carries the refund outcome
+    // (`{ status, amount }` or null). Here there is no fee Transaction
+    // (legacy data), so there is no refund.
+    assert.equal(out.body.data.refund, null);
+    assertNoLeak(out.body.data, [...CLIENT_CONSULTATION_FIELDS, "refund"]);
   });
 
   test("POST /consultations/:id/checkout inside the lock: the same checkout and a payer-safe summary", async () => {

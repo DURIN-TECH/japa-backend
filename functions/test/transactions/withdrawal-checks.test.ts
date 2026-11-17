@@ -440,7 +440,7 @@ describe("computeStats skips stored rows whose amount is not a safe integer (#28
     ]);
     assert.deepEqual(stats, {
       byCurrency: [
-        { currency: "NGN", totalRevenue: 500_000, pendingPayments: 0, availableBalance: 500_000 },
+        { currency: "NGN", totalRevenue: 500_000, pendingPayments: 0, availableBalance: 500_000, heldBalance: 0 },
       ],
       pendingClientsCount: 0,
     });
@@ -460,7 +460,7 @@ describe("computeStats skips stored rows whose amount is not a safe integer (#28
     ]);
     assert.deepEqual(stats, {
       byCurrency: [
-        { currency: "NGN", totalRevenue: 300_000, pendingPayments: 40_000, availableBalance: 300_000 },
+        { currency: "NGN", totalRevenue: 300_000, pendingPayments: 40_000, availableBalance: 300_000, heldBalance: 0 },
       ],
       // The client whose only pending row was unusable is not counted.
       pendingClientsCount: 1,
@@ -506,6 +506,7 @@ describe("computeStats skips stored rows whose amount is not a safe integer (#28
       totalRevenue: BALANCE,
       pendingPayments: 0,
       availableBalance: BALANCE,
+      heldBalance: 0,
     });
   });
 

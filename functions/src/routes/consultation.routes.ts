@@ -44,6 +44,12 @@ router.put("/:id/status", verifyAuth, (req, res) =>
   consultationController.updateStatus(req, res)
 );
 
+// Issue #317: admin manual refund / retry of a failed refund. The controller
+// answers 403 for anyone but an admin, before the booking is read.
+router.post("/:id/refund", verifyAuth, (req, res) =>
+  consultationController.refundConsultation(req, res)
+);
+
 router.delete("/:id", verifyAuth, (req, res) =>
   consultationController.deleteConsultation(req, res)
 );

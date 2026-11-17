@@ -264,6 +264,28 @@ export async function installAssessmentFakes(): Promise<void> {
   void subcollections;
 }
 
+/**
+ * (#309) The manual POST's "enough to review" gate calls the REAL
+ * `intakeService.getIntake` (its own required-question rule). Point that
+ * service's rulebook read at the in-memory rubric book, so no Firestore is
+ * reached. Opt-in (suites that drive the controller's POST call it), because
+ * other suites that share this harness install their own intake reader.
+ * Returns a function that puts the real reader back. Safe to call in every
+ * `beforeEach`: the real reader is captured once, never the fake.
+ */
+export async function installIntakeFake(): Promise<() => void> {
+  const intake: any = await import("../../src/services/intake.service");
+  const stacks: any = await import("../../src/services/ai/application-rulebook");
+  if (!realIntakeRead) realIntakeRead = intake.intakeRulebookReader.read;
+  intake.intakeRulebookReader.read = (app: any) => stacks.rulebookStackFor(app, bookReader);
+  return () => {
+    if (realIntakeRead) intake.intakeRulebookReader.read = realIntakeRead;
+  };
+}
+
+/** (#309) The intake service's real rulebook read, kept by installIntakeFake. */
+let realIntakeRead: ((app: unknown) => Promise<unknown>) | null = null;
+
 /** A rubric reader over the book. */
 export const bookReader: RubricReader = {
   async getApprovedRubric(cc, vt) {

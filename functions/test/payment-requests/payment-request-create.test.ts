@@ -13,8 +13,14 @@
 //    case with no agency, and a read-only colleague get 403 and nothing is
 //    written;
 //  - the compliance gate (requireAgencyVerified) still guards the route;
-//  - the copy: explicit currency codes, no hard-coded naira sign.
+//  - the copy: explicit currency codes, no hard-coded naira sign;
+//  - issue #337 (an owner bills a case assigned to someone else): the owner
+//    of the case's agency may, the owner of ANOTHER agency may not, an owner
+//    of an unverified agency is stopped by the compliance gate, and the
+//    compliance file the seed writes on the demo agency passes that gate.
 import { test, describe, before, beforeEach } from "node:test";
+import { ROLES } from "@durin-tech/authz";
+import type { AuthzSubject } from "@durin-tech/authz";
 import assert from "node:assert/strict";
 
 import {
@@ -32,12 +38,21 @@ import {
   APP_B,
   APP_NONE,
   harness,
+  seed,
 } from "./helpers";
 import { captureRes, docsIn } from "../consultations/harness";
 import { writes } from "../helpers/fake-firestore";
 import { paymentRequestController } from "../../src/controllers/payment-request.controller";
 import { requireAgencyVerified } from "../../src/middleware/authz";
 import { complianceService } from "../../src/services/compliance.service";
+// Issue #337: the compliance file the seed writes on the demo agency. Imported
+// AFTER the controller on purpose: the seed module calls getFirestore() when
+// it loads, which needs the Admin app utils/firebase initialises.
+import {
+  buildSeedAgencyCompliance,
+  SEED_AGENCY_ID,
+  SEED_COMPLIANCE_REVIEWER_UID,
+} from "../../src/data/seed-portal-data";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -65,6 +80,35 @@ const valid = (extra: Record<string, unknown> = {}) => ({
   category: "visa_fee",
   ...extra,
 });
+
+// ============================================
+// Issue #337: owners
+// ============================================
+
+/**
+ * The OWNER of agency B (the helpers only have B's member agent). Has an
+ * agent profile of their own (seeded per test by `seedOwnerB`), so a refusal
+ * is the case rule speaking, not the "no agent profile" check before it.
+ */
+const ownerB: AuthzSubject = { uid: "uid-owner-b", role: ROLES.OWNER, agencyId: "agency-b" };
+
+/** Agency B's owner agent profile (doc id = profile id). */
+async function seedOwnerB(): Promise<void> {
+  await seed("agents", "prof-owner-b", { userId: ownerB.uid, agencyId: "agency-b", displayName: "Bisi Owner" });
+}
+
+/**
+ * Run the route's compliance gate (`requireAgencyVerified`) as `who`, with
+ * the REAL `complianceService.isVerified` reading the fake `agencies`
+ * collection. Returns whether the request was let through and the response.
+ */
+async function runComplianceGate(who: AuthzSubject) {
+  const gate = requireAgencyVerified("request or receive payments");
+  const { out, res } = captureRes();
+  let nextCalled = false;
+  await gate(reqFor(who), res, () => { nextCalled = true; });
+  return { out, nextCalled };
+}
 
 describe("POST /payment-requests: the dollar amount", () => {
   test("stores priceUsd Money and mirrors it as US cents in amount/currency, with the ids", async () => {
@@ -153,13 +197,60 @@ describe("POST /payment-requests: per-agency isolation", () => {
   test("a same-agency colleague who is not assigned has read access only: 403", async () => {
     const out = await create(colleagueA, valid());
     assert.equal(out.status, 403);
+    // #337: the wording the portal and QA see for a read-only colleague.
+    assert.equal(out.body.message, "Not authorized for this application");
     assert.equal(docsIn("paymentRequests").length, 0);
+    assert.equal(sent.length, 0);
   });
 
   test("the agency's owner may bill the agency's case", async () => {
     const out = await create(ownerA, valid());
     assert.equal(out.status, 201, JSON.stringify(out.body));
     assert.equal(docsIn("paymentRequests")[0][1].agentId, "prof-owner-a");
+  });
+
+  // Issue #337: the case here (APP_A) is assigned to agentA, NOT to the
+  // owner. The owner still bills it, under their OWN agent profile, and the
+  // case's client is told.
+  test("#337: the owner bills a case assigned to another agent; the request carries the owner's profile and the agency, and the client is notified", async () => {
+    const out = await create(ownerA, valid({ amount: "50.00", description: "Document review" }));
+    assert.equal(out.status, 201, JSON.stringify(out.body));
+    const stored = docsIn("paymentRequests");
+    assert.equal(stored.length, 1);
+    const [, pr] = stored[0];
+    assert.equal(pr.agentId, "prof-owner-a"); // the owner's profile, not the assigned agent's
+    assert.notEqual(pr.agentId, "prof-agent-a");
+    assert.equal(pr.agencyId, "agency-a");
+    assert.equal(pr.applicationId, APP_A);
+    assert.equal(pr.clientId, clientNg.uid);
+    assert.deepEqual(pr.priceUsd, { amountMinor: 5_000, currency: "USD" });
+    // One payment_request notification, to the case's client.
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].userId, clientNg.uid);
+    assert.equal(sent[0].type, "payment_request");
+  });
+
+  // Issue #337: being an owner is not enough; it must be the owner of the
+  // CASE'S agency. Agency B's owner has an agent profile and a verified role,
+  // and is still refused on agency A's case, with nothing written or sent.
+  test("#337: the owner of another agency gets 403 on this agency's case and nothing is written", async () => {
+    await seedOwnerB();
+    const before = writes.length;
+    const out = await create(ownerB, valid());
+    assert.equal(out.status, 403, JSON.stringify(out.body));
+    assert.equal(out.body.message, "Not authorized for this application");
+    assert.equal(docsIn("paymentRequests").length, 0);
+    assert.equal(writes.length, before);
+    assert.equal(sent.length, 0);
+  });
+
+  test("#337: that same owner may bill their own agency's case (the refusal above is about the agency, not the role)", async () => {
+    await seedOwnerB();
+    const out = await create(ownerB, valid({ applicationId: APP_B }));
+    assert.equal(out.status, 201, JSON.stringify(out.body));
+    const [, pr] = docsIn("paymentRequests")[0];
+    assert.equal(pr.agentId, "prof-owner-b");
+    assert.equal(pr.agencyId, "agency-b");
   });
 
   test("a user with no agent profile gets 403", async () => {
@@ -211,6 +302,70 @@ describe("POST /payment-requests: the compliance gate still applies", () => {
     } finally {
       (complianceService as any).isVerified = original;
     }
+  });
+});
+
+// ============================================
+// Issue #337: the compliance gate for OWNERS, on stored agency documents
+// ============================================
+// The test above replaces `isVerified`. These run the real one against the
+// fake `agencies` collection, so they pin what the gate reads off the agency
+// document: `compliance.status === "verified"`, nothing else.
+describe("POST /payment-requests: #337 an owner and the compliance gate", () => {
+  // Every way an agency can be "not verified", including the shape the seed
+  // used to write: approved, with NO compliance field at all.
+  for (const [label, agencyDoc] of [
+    ["no compliance field (the seeded agency before #337)", { status: "approved" }],
+    ["not_started", { status: "approved", compliance: { status: "not_started" } }],
+    ["in_progress", { status: "approved", compliance: { status: "in_progress" } }],
+    ["under_review", { status: "approved", compliance: { status: "under_review" } }],
+    ["rejected", { status: "approved", compliance: { status: "rejected" } }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    test(`an owner of an unverified agency gets 403 COMPLIANCE_REQUIRED: ${label}`, async () => {
+      await seed("agencies", "agency-a", { name: "Agency A", ownerId: ownerA.uid, ...agencyDoc });
+      const { out, nextCalled } = await runComplianceGate(ownerA);
+      assert.equal(nextCalled, false);
+      assert.equal(out.status, 403);
+      assert.equal(out.body.error, "COMPLIANCE_REQUIRED");
+    });
+  }
+
+  test("an owner whose agency document does not exist is refused too", async () => {
+    const { out, nextCalled } = await runComplianceGate(ownerA);
+    assert.equal(nextCalled, false);
+    assert.equal(out.body.error, "COMPLIANCE_REQUIRED");
+  });
+
+  test("the compliance file the seed writes on the demo agency lets its owner AND its member agents through", async () => {
+    // Exactly what `seedAgency()` stores under `compliance`.
+    await seed("agencies", SEED_AGENCY_ID, {
+      name: "Seli Immigration Services",
+      status: "approved",
+      compliance: buildSeedAgencyCompliance(),
+    });
+    const seedOwner: AuthzSubject = { uid: "seed-user-owner-001", role: ROLES.OWNER, agencyId: SEED_AGENCY_ID };
+    const seedMember: AuthzSubject = { uid: "seed-user-agent-001", role: ROLES.AGENT, agencyId: SEED_AGENCY_ID };
+    assert.equal((await runComplianceGate(seedOwner)).nextCalled, true);
+    // The gate is per agency: members pass it too (the CASE rule, not this
+    // gate, is what keeps a colleague read-only).
+    assert.equal((await runComplianceGate(seedMember)).nextCalled, true);
+    assert.equal(await complianceService.isVerified(SEED_AGENCY_ID), true);
+  });
+
+  test("the seeded compliance file is a verified file with a full admin review record and no invented KYC data", () => {
+    const file = buildSeedAgencyCompliance() as unknown as Record<string, any>;
+    assert.equal(file.status, "verified");
+    // What `npm run audit:agencies` needs for a decided file
+    // (COMPLIANCE_DECISION_WITHOUT_REVIEW / COMPLIANCE_REVIEWER_NOT_ADMIN).
+    assert.equal(file.reviewedBy, SEED_COMPLIANCE_REVIEWER_UID);
+    assert.equal(SEED_COMPLIANCE_REVIEWER_UID, "seed-user-admin-001");
+    assert.ok(file.submittedAt && file.reviewedAt);
+    // Submitted before it was reviewed, both in the past.
+    assert.ok(file.submittedAt.toMillis() < file.reviewedAt.toMillis());
+    assert.ok(file.reviewedAt.toMillis() < Date.now());
+    // Only the four review fields: no BVN, ID number, RC number, TIN, bank
+    // account or document path is made up for demo data.
+    assert.deepEqual(Object.keys(file).sort(), ["reviewedAt", "reviewedBy", "status", "submittedAt"]);
   });
 });
 

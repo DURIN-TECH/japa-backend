@@ -73,6 +73,8 @@ export const CLIENT_CONSULTATION_FIELDS = [
   "recordingUrl",
   "cancelledAt",
   "cancellationReason",
+  // Issue #317: where the booking's refund stands (no ids, no Paystack data).
+  "refundStatus",
   "createdAt",
   "updatedAt",
 ] as const;
@@ -136,6 +138,9 @@ export interface ClientConsultation extends ClientChargeFields {
   /** When and why it was cancelled (not by whom: that is a user id). */
   cancelledAt?: Timestamp;
   cancellationReason?: string;
+
+  /** Issue #317: where the refund of this booking's fee stands, if one was started. */
+  refundStatus?: Consultation["refundStatus"];
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -201,6 +206,9 @@ export function toClientConsultation(c: Consultation): ClientConsultation {
   // Cancellation: when and why.
   if (c.cancelledAt !== undefined) out.cancelledAt = c.cancelledAt;
   if (c.cancellationReason !== undefined) out.cancellationReason = c.cancellationReason;
+
+  // Refund status only (issue #317): never the refund id or Paystack data.
+  if (c.refundStatus !== undefined) out.refundStatus = c.refundStatus;
 
   return out;
 }
