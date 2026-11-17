@@ -101,6 +101,21 @@ import type { IntakeResponse } from "../types/intake";
 const JOB_BUDGET_MS = 480_000;
 /** No judgement call starts after this much time has gone. */
 const JUDGEMENT_START_LIMIT_MS = 360_000;
+/**
+ * (#384) Time kept back, after the narrative's hard bound, for what the job
+ * still does once the narrative is settled: the country-context lookup and the
+ * `storeContent` write. The narrative's bound is
+ * `min(NARRATIVE_TIMEOUT_MS, JOB_BUDGET_MS - elapsed - NARRATIVE_MARGIN_MS)`,
+ * so a slow narrative can never push the job past its budget and lose the
+ * findings that are already final.
+ */
+const NARRATIVE_MARGIN_MS = 20_000;
+/**
+ * (#384) The shortest bound worth a narrative call. With less time than this
+ * left the call is not made at all (`narrative: null`, no usage): a call that
+ * would almost surely be cut off is paid for and gives nothing.
+ */
+const NARRATIVE_MIN_MS = 20_000;
 
 /**
  * (#310) The stored message for `review_too_large`: the review would pass a
@@ -1234,8 +1249,11 @@ export class AiCaseOfficerService {
    *
    * Skipped, with no call, when the call would pass `maxRequestsPerAssessment`
    * or `maxInputCharsPerAssessment` (counted the same way as every other call:
-   * one request, the user text's characters), or when the job has less time
-   * left than the call's own timeout. A provider error, a timeout, a refusal,
+   * one request, the user text's characters), or when the job has less than
+   * `NARRATIVE_MIN_MS` left for it. The call has a HARD wall-clock bound
+   * (`min(NARRATIVE_TIMEOUT_MS, JOB_BUDGET_MS - elapsed - NARRATIVE_MARGIN_MS)`):
+   * past it the request is aborted, a late answer is ignored, and the review
+   * is stored with `narrative: null`. No retry. A provider error, a timeout, a refusal,
    * a cut-off answer or an answer that fails the code checks is null too.
    * Never throws: the review succeeds with its findings either way.
    *
@@ -1256,16 +1274,45 @@ export class AiCaseOfficerService {
       // The caps: a narrative that does not fit is skipped, the review is not failed.
       if (args.requestsSoFar + 1 > args.settings.maxRequestsPerAssessment) return skipped;
       if (args.charsSoFar + request.user.length > args.settings.maxInputCharsPerAssessment) return skipped;
-      // Not enough of the job's time left for the call's own timeout.
-      if (this.deps.now().getTime() - args.started + NARRATIVE_TIMEOUT_MS > JOB_BUDGET_MS) return skipped;
+      // (#384, fix round 1) The HARD wall-clock bound of this call: the
+      // narrative's own budget, or what is left of the job's budget after the
+      // margin kept for storing the review, whichever is less. With less than
+      // NARRATIVE_MIN_MS left the call is not made.
+      const elapsed = this.deps.now().getTime() - args.started;
+      const boundMs = Math.min(NARRATIVE_TIMEOUT_MS, JOB_BUDGET_MS - elapsed - NARRATIVE_MARGIN_MS);
+      if (boundMs < NARRATIVE_MIN_MS) return skipped;
 
       let usage = zeroUsage();
+      // The SDK's `timeout` alone is NOT a bound: it is cleared once the
+      // response headers arrive, and the body can stream for much longer. So
+      // the call also gets an abort signal, no retry (a retry would restart
+      // the clock), and is raced against a timer of the same length below.
+      const controller = new AbortController();
+      const call = this.deps.provider.complete({ ...request, timeoutMs: boundMs, maxRetries: 0, signal: controller.signal });
+      // A late answer (or the rejection the abort causes) is ignored: without
+      // this handler it would surface as an unhandled rejection after the race.
+      call.catch(() => undefined);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<"timed_out">((resolve) => {
+        timer = setTimeout(() => resolve("timed_out"), boundMs);
+      });
       let res: LlmResponse;
       try {
-        res = await this.deps.provider.complete(request);
+        const winner = await Promise.race([call, timedOut]);
+        if (winner === "timed_out") {
+          // Past the bound: stop the request and store the review without a
+          // narrative. The call was attempted (it may have cost), so it is recorded.
+          controller.abort();
+          console.warn(`[ai-case-officer] narrative not written: no answer within ${boundMs} ms`);
+          return { ...skipped, called: true };
+        }
+        res = winner;
       } catch {
-        // Provider error or timeout: the call was attempted (it may have cost), so it is recorded.
+        // Provider error: the call was attempted (it may have cost), so it is recorded.
         return { ...skipped, called: true };
+      } finally {
+        // The timer never outlives the race (it would keep the worker alive).
+        if (timer !== undefined) clearTimeout(timer);
       }
       usage = addUsage(usage, res.usage);
       // A refusal or a cut-off answer is not a narrative.

@@ -5,6 +5,8 @@
 // No Firestore, no provider: the request builder, the output schema, the
 // code checks of `parseNarrative` (shape, banned wording, injection, figures,
 // quotations, the band's conclusion opening) and the blocking-rule copy.
+// Fix round 1 adds: the rule-citation caps, currency labels against the
+// intake's own currency, and single-curly / mixed-pair quotations.
 //
 // The figures in these fixtures follow the founder's example on #384 (a
 // declared monthly income in naira, 15 days to visit a brother, 13 years of
@@ -16,12 +18,15 @@ import {
   blockingRuleOf,
   buildNarrativeRequest,
   figuresAreGrounded,
+  labelIntakeAmounts,
   NARRATIVE_CONCLUSION_LEADS,
   NARRATIVE_LIMITS,
   narrativeGroundingOf,
   narrativeSchema,
   parseNarrative,
   quotationsAreGrounded,
+  quotationsIn,
+  ruleCitationsIn,
   type NarrativeRequestInput,
 } from "../../src/services/ai/assessment-engine";
 import { DATA_ONLY_RULE, UNTRUSTED_TAG } from "../../src/services/ai/prompt-safety";
@@ -321,6 +326,121 @@ describe("parseNarrative: the conclusion and what is left", () => {
     assert.equal(p.narrative, null);
     assert.equal(p.reason, "every paragraph was dropped");
     assert.equal(p.dropped, 2);
+  });
+});
+
+// ============================================
+// Fix round 1 (#384 review): rule citations, currency, quote forms
+// ============================================
+
+/** Three rules with refs and wording, as the reviewer's probe used. Fictional. */
+const PROBE_RULES = [
+  { ruleRef: "V 4.2", sourceQuote: "visitors must leave at the end", criterionId: "a-leave" },
+  { ruleRef: "V 4.3", sourceQuote: "visitors must have funds", criterionId: "a-funds" },
+  { ruleRef: "V 4.4", sourceQuote: "visitors must not work", criterionId: "a-work" },
+];
+
+/** The fixture input with the three probe rules as refusal grounds. */
+const PROBE_GROUNDING = narrativeGroundingOf(input({ findings: { ...input().findings, refusalGrounds: PROBE_RULES.map((r) => ground(r)) } }));
+
+describe("parseNarrative: rule citations are capped in code", () => {
+  test("the reviewer's probe: 'Rule X says “…”' three times in one paragraph is dropped", () => {
+    const listing = "Rule V 4.2 says “visitors must leave at the end”. Rule V 4.3 says “visitors must have funds”. Rule V 4.4 says “visitors must not work”.";
+    assert.equal(ruleCitationsIn(listing, PROBE_GROUNDING.rules), 3);
+    const p = parseNarrative(answer({ paragraphs: [listing, "You say you are visiting your brother for 15 days."] }), "weak", PROBE_GROUNDING);
+    assert.deepEqual(p.narrative?.paragraphs, ["You say you are visiting your brother for 15 days."]);
+    assert.equal(p.dropped, 1);
+    // As the only paragraph, the narrative is null (the usual null rule).
+    assert.equal(parseNarrative(answer({ paragraphs: [listing] }), "weak", PROBE_GROUNDING).narrative, null);
+  });
+
+  test("a rule named AND quoted is ONE citation; a ref alone or a quote alone is one too", () => {
+    assert.equal(ruleCitationsIn("Rule V 4.2 says “visitors must leave at the end”.", PROBE_GROUNDING.rules), 1);
+    assert.equal(ruleCitationsIn("Under V 4.3 you need to show money.", PROBE_GROUNDING.rules), 1);
+    assert.equal(ruleCitationsIn("The guidance says “visitors must not work”.", PROBE_GROUNDING.rules), 1);
+    assert.equal(ruleCitationsIn("You say you are visiting your brother.", PROBE_GROUNDING.rules), 0);
+    // A quote of the applicant's own words is not a rule citation.
+    assert.equal(ruleCitationsIn("You wrote “I will return home to my job.”", PROBE_GROUNDING.rules), 0);
+    // "V 4.21" is not "V 4.2" (but is still a generic rule reference when written as one).
+    assert.equal(ruleCitationsIn("see V 4.21", [{ ref: "V 4.2", quote: null }]), 0);
+  });
+
+  test("generic rule references count even when the rubric did not send them", () => {
+    assert.equal(ruleCitationsIn("Paragraph 9.8.1 and section 4 apply.", []), 2);
+    assert.equal(ruleCitationsIn("Appendix FM 2(a) asks for this.", []), 1);
+  });
+
+  test("two citations in two strings are kept; a third citation anywhere is dropped", () => {
+    const p = parseNarrative(
+      answer({
+        paragraphs: ["Under V 4.2 an officer looks at whether you will leave.", "Under V 4.3 they look at your money.", "V 4.4 is about work."],
+      }),
+      "weak",
+      PROBE_GROUNDING
+    );
+    assert.deepEqual(p.narrative?.paragraphs, ["Under V 4.2 an officer looks at whether you will leave.", "Under V 4.3 they look at your money."]);
+    assert.equal(p.dropped, 1);
+  });
+
+  test("the conclusion gets the first claim on the narrative's citation budget", () => {
+    const p = parseNarrative(
+      answer({
+        paragraphs: ["Under V 4.2 an officer looks at whether you will leave.", "Under V 4.3 they look at your money.", "You are visiting your brother."],
+        conclusion: `${NARRATIVE_CONCLUSION_LEADS.weak} you meet V 4.4.`,
+      }),
+      "weak",
+      PROBE_GROUNDING
+    );
+    assert.ok(p.narrative);
+    assert.equal(p.narrative.conclusion, `${NARRATIVE_CONCLUSION_LEADS.weak} you meet V 4.4.`);
+    assert.deepEqual(p.narrative.paragraphs, ["Under V 4.2 an officer looks at whether you will leave.", "You are visiting your brother."]);
+  });
+});
+
+describe("figures: a currency label must match the source's own currency", () => {
+  /** The intake as the job really sends it: amount answers are { amount, currency } (types/intake.ts). */
+  const nairaIntake = input({ intakeSummary: JSON.stringify({ monthlyIncome: { amount: 399367, currency: "NGN" }, stayDays: 15 }) });
+  const sources = narrativeGroundingOf(nairaIntake).figureSources;
+
+  test("intake amounts are labelled with their currency for the figure check", () => {
+    assert.equal(labelIntakeAmounts(nairaIntake.intakeSummary), "monthlyIncome: 399367 NGN\nstayDays: 15");
+    // Not JSON: unchanged.
+    assert.equal(labelIntakeAmounts("not json"), "not json");
+  });
+
+  test("'£399,367' against a naira intake is dropped; '₦399,367' and '399,367 NGN' are kept", () => {
+    assert.equal(figuresAreGrounded("You earn £399,367 a month.", sources), false);
+    assert.equal(figuresAreGrounded("You earn ₦399,367 a month.", sources), true);
+    assert.equal(figuresAreGrounded("You earn 399,367 NGN a month.", sources), true);
+    assert.equal(figuresAreGrounded("You earn 399,367 a month.", sources), true, "a bare figure still matches");
+    const p = parseNarrative(answer({ paragraphs: ["You earn £399,367 a month.", "You are visiting for 15 days."] }), "weak", narrativeGroundingOf(nairaIntake));
+    assert.deepEqual(p.narrative?.paragraphs, ["You are visiting for 15 days."]);
+  });
+
+  test("a currency-labelled figure never matches a bare source number", () => {
+    assert.equal(figuresAreGrounded("£15", sources), false, "15 is a count of days, not money");
+    assert.equal(figuresAreGrounded("£399,367", [JSON.stringify({ monthlyIncome: 399367 })]), false);
+  });
+});
+
+describe("quotations: single curly quotes and mixed pairs are checked", () => {
+  test("an invented ‘…’ quote is dropped; a verbatim one is kept", () => {
+    assert.equal(quotationsAreGrounded("The rule says ‘you must leave the UK’.", GROUNDING.quoteSources), false);
+    assert.equal(quotationsAreGrounded(`The guidance says ‘${RULE_QUOTE}’`, GROUNDING.quoteSources), true);
+    const p = parse(answer({ paragraphs: ["The rule says ‘you must leave the UK’.", "You say you are visiting your brother for 15 days."] }));
+    assert.deepEqual(p.narrative?.paragraphs, ["You say you are visiting your brother for 15 days."]);
+    assert.equal(p.dropped, 1);
+  });
+
+  test("an apostrophe inside or after a word does not end or start a quotation", () => {
+    assert.deepEqual(quotationsIn("You wrote ‘I don’t plan to stay’ and it’s clear."), ["I don't plan to stay"]);
+    assert.deepEqual(quotationsIn("Your brother’s letter and the applicant’s plan."), []);
+  });
+
+  test("mixed double-quote pairs are checked", () => {
+    assert.deepEqual(quotationsIn("It says “you must leave the UK\" and \"so on”."), ["you must leave the UK", "so on"]);
+    assert.equal(quotationsAreGrounded("The rule says “you must leave the UK\".", GROUNDING.quoteSources), false);
+    assert.equal(quotationsAreGrounded("The rule says „you must leave the UK”.", GROUNDING.quoteSources), false);
   });
 });
 

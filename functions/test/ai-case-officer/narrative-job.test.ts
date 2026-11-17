@@ -14,15 +14,19 @@
 //  - a provider error, a refusal, a cut-off answer, a shape mismatch, an
 //    injected string, every paragraph dropped: `narrative: null` (or the
 //    string dropped), the review succeeds with its findings;
-//  - `blockingRule` copied in code from the bar's refusal ground.
+//  - `blockingRule` copied in code from the bar's refusal ground;
+//  - (fix round 1) the HARD wall-clock bound: a provider that never answers
+//    is cut off at min(90 s, budget left - margin), with no retry, and the
+//    review is stored with its findings and `narrative: null`. Fake timers
+//    and an injected clock: no test waits in real time.
 
 import assert from "node:assert/strict";
-import { beforeEach, describe, test } from "node:test";
+import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { store } from "../helpers/fake-firestore";
 import type { AiCaseOfficerService } from "../../src/services/ai-case-officer.service";
 import type { LlmRequest } from "../../src/services/ai/llm-provider";
 import { NARRATIVE_CONCLUSION_LEADS } from "../../src/services/ai/assessment-engine";
-import { routeARubric, rubricBook, ScriptedProvider, seedApplication, seedDocument, seedEligibility, seedStatement, seedUser, serviceWith, installAssessmentFakes, resetAll } from "./harness";
+import { NOW, routeARubric, rubricBook, ScriptedProvider, seedApplication, seedDocument, seedEligibility, seedStatement, seedUser, serviceWith, installAssessmentFakes, resetAll } from "./harness";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -255,5 +259,108 @@ describe("the narrative call in the job (#384)", () => {
     const stored = await assessOnce(serviceWith(provider));
     assert.equal(stored.status, "succeeded");
     assert.equal(stored.narrative, null);
+  });
+
+  // ----- Fix round 1: the hard wall-clock bound -----
+
+  describe("a narrative that never answers (hard bound, fake timers)", () => {
+    afterEach(() => mock.timers.reset());
+
+    /**
+     * Run the job with a narrative call that never settles. `elapsedAtNarrative`
+     * is how far into the job the injected clock reads once the judgement
+     * starts (so the narrative's bound is computed from it). Returns the
+     * narrative request, its signal, and whether the job finished after
+     * `beforeMs` and after `boundMs` of fake time.
+     */
+    async function runNeverSettling(elapsedAtNarrative: number, boundMs: number) {
+      mock.timers.enable({ apis: ["setTimeout"] });
+      seedCase();
+      let offset = 0;
+      let narrativeStarted!: () => void;
+      const started = new Promise<void>((resolve) => (narrativeStarted = resolve));
+      const provider = scripted(() => {
+        narrativeStarted();
+        return new Promise<string>(() => undefined); // never settles
+      });
+      // The judgement is scripted to move the clock on, AFTER its own start check.
+      const respond = provider.complete.bind(provider);
+      provider.complete = async (req) => {
+        if (req.role === "judgement") offset = elapsedAtNarrative;
+        return respond(req);
+      };
+      const svc = serviceWith(provider, {}, { now: () => new Date(NOW.getTime() + offset) });
+      let done = false;
+      const job = assessOnce(svc).then((stored) => {
+        done = true;
+        return stored;
+      });
+      await started;
+      const req = provider.requests.find((r) => r.role === "narrative")!;
+      // Just before the bound: still waiting.
+      mock.timers.tick(boundMs - 1);
+      await new Promise((r) => setImmediate(r));
+      const doneBefore = done;
+      assert.equal(req.signal?.aborted, false, "not aborted before the bound");
+      // At the bound: cut off, stored.
+      mock.timers.tick(1);
+      const stored = await job;
+      return { stored, req, doneBefore, provider };
+    }
+
+    test("cut off at 90 s with plenty of budget left: stored with findings and narrative null", async () => {
+      const { stored, req, doneBefore, provider } = await runNeverSettling(0, 90_000);
+      assert.equal(doneBefore, false, "the job waits up to the bound");
+      assert.equal(stored.status, "succeeded");
+      assert.equal(stored.error, null);
+      assert.equal(stored.narrative, null);
+      assert.equal(stored.credibilityFlags.length, 1, "the findings are kept");
+      // The attempt is recorded (it may have cost); one call, never retried.
+      assert.equal(stored.models.narrative, "scripted-narrative");
+      assert.equal(provider.callsFor("narrative"), 1);
+      assert.equal(req.maxRetries, 0, "no retry for the narrative");
+      assert.equal(req.timeoutMs, 90_000);
+      assert.equal(req.signal?.aborted, true, "the request is aborted at the bound");
+    });
+
+    test("late in the job the bound shrinks to the budget left minus the margin", async () => {
+      // 480 s budget - 400 s elapsed - 20 s margin = 60 s.
+      const { stored, req, doneBefore } = await runNeverSettling(400_000, 60_000);
+      assert.equal(doneBefore, false);
+      assert.equal(req.timeoutMs, 60_000);
+      assert.equal(stored.status, "succeeded");
+      assert.equal(stored.narrative, null);
+      assert.equal(stored.credibilityFlags.length, 1);
+    });
+  });
+
+  test("too little of the budget left for a useful call: NO narrative call, review succeeded", async () => {
+    seedCase();
+    let offset = 0;
+    const provider = scripted();
+    const respond = provider.complete.bind(provider);
+    provider.complete = async (req) => {
+      // 480 s budget - 445 s - 20 s margin = 15 s, under the 20 s minimum.
+      if (req.role === "judgement") offset = 445_000;
+      return respond(req);
+    };
+    const stored = await assessOnce(serviceWith(provider, {}, { now: () => new Date(NOW.getTime() + offset) }));
+    assert.equal(stored.status, "succeeded");
+    assert.equal(provider.callsFor("narrative"), 0);
+    assert.equal(stored.narrative, null);
+  });
+
+  test("an answer within the bound is used, and the timer is cleared", async () => {
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      seedCase();
+      const provider = scripted();
+      const stored = await assessOnce(serviceWith(provider));
+      assert.ok(stored.narrative, "answered before the bound");
+      const req = provider.requests.find((r) => r.role === "narrative")!;
+      assert.equal(req.signal?.aborted, false, "a prompt answer is never aborted");
+    } finally {
+      mock.timers.reset();
+    }
   });
 });

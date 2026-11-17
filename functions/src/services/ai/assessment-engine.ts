@@ -1705,6 +1705,19 @@ export const NARRATIVE_TIMEOUT_MS = 90_000;
 export interface NarrativeGrounding {
   figureSources: string[];
   quoteSources: string[];
+  // (#384, fix round 1) The rubric rules the narrative was given, by their
+  // ref and published wording. Used to COUNT rule citations (see
+  // `ruleCitationsIn`): the narrative must explain, not list the rulebook,
+  // which is what `ai.review_working` sells. Optional so a caller that only
+  // checks figures and quotes can leave it out (no rule is then recognised by
+  // ref or wording; generic "rule 4.2" patterns are still counted).
+  rules?: NarrativeRuleRef[];
+}
+
+/** (#384) One rubric rule a narrative might cite: its ref and its published wording (either may be absent). */
+export interface NarrativeRuleRef {
+  ref: string | null;
+  quote: string | null;
 }
 
 /** The grounding for one narrative request, from the same inputs the request was built from. */
@@ -1719,15 +1732,60 @@ export function narrativeGroundingOf(input: NarrativeRequestInput): NarrativeGro
     ...f.strengths.map((s) => s.title),
     ...quotes,
   ];
-  return { figureSources: [...applicant, ...rubricText], quoteSources: [...quotes, ...applicant] };
+  // (#384, fix round 1) The intake is sent as JSON, where an amount answer is
+  // `{"amount":399367,"currency":"NGN"}`: the number and its currency are not
+  // next to each other, so `figuresIn` would read the number with NO currency
+  // and any currency label in the narrative would pass. For the FIGURE check
+  // the intake is therefore re-written with each amount labelled
+  // ("399367 NGN"). The quote check keeps the text exactly as sent.
+  const figureApplicant = [input.profileSummary, labelIntakeAmounts(input.intakeSummary), input.extractionSummary, input.statementText ?? ""];
+  const rules: NarrativeRuleRef[] = ruled.map((r) => ({ ref: r.ruleRef ?? null, quote: r.sourceQuote || null }));
+  return { figureSources: [...figureApplicant, ...rubricText], quoteSources: [...quotes, ...applicant], rules };
+}
+
+/**
+ * (#384) The intake summary with every amount answer written as
+ * "<amount> <CURRENCY>" so its currency sits next to its number.
+ *
+ * The summary is `JSON.stringify(intake answers)`; an amount answer is
+ * `{ amount: number, currency: string }` (types/intake.ts). Every other value
+ * is written as it is (a bare number stays bare: it has no currency). Not JSON
+ * (should not happen): the text is returned unchanged, so nothing is lost.
+ */
+export function labelIntakeAmounts(intakeSummary: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(intakeSummary);
+  } catch {
+    return intakeSummary;
+  }
+  const lines: string[] = [];
+  /** Walk the answers; `path` is the key chain, for a readable line. */
+  const walk = (v: unknown, path: string): void => {
+    if (isRecord(v) && typeof v.amount === "number" && typeof v.currency === "string") {
+      lines.push(`${path}: ${v.amount} ${v.currency.toUpperCase()}`);
+    } else if (Array.isArray(v)) {
+      v.forEach((item, i) => walk(item, `${path}[${i}]`));
+    } else if (isRecord(v)) {
+      for (const [k, item] of Object.entries(v)) walk(item, path ? `${path}.${k}` : k);
+    } else {
+      lines.push(`${path}: ${String(v)}`);
+    }
+  };
+  walk(parsed, "");
+  return lines.join("\n");
 }
 
 // ----- Figures -----
 
 /** Currency signs read next to a number, by ISO code. */
-const CURRENCY_SIGNS: Record<string, string> = { "£": "GBP", $: "USD", "€": "EUR", "₦": "NGN" };
-/** Currency codes read next to a number (before or after it). */
-const CURRENCY_CODES = ["GBP", "USD", "EUR", "NGN", "CAD", "AUD"];
+const CURRENCY_SIGNS: Record<string, string> = { "£": "GBP", $: "USD", "€": "EUR", "₦": "NGN", "₹": "INR", "¥": "JPY", "₵": "GHS" };
+/**
+ * Currency codes read next to a number (before or after it). (#384, fix round
+ * 1) Widened to the codes Seli's applicants and routes use, so an intake
+ * amount in one of them is read WITH its currency.
+ */
+const CURRENCY_CODES = ["GBP", "USD", "EUR", "NGN", "CAD", "AUD", "NZD", "INR", "ZAR", "KES", "GHS", "CHF", "JPY", "CNY", "AED", "SGD"];
 
 /** One number found in text: its value in a canonical form, and its currency when one is written next to it. */
 interface FoundFigure {
@@ -1744,7 +1802,7 @@ interface FoundFigure {
 export function figuresIn(text: string): FoundFigure[] {
   const out: FoundFigure[] = [];
   // sign? then 1-3 digits with ,ddd groups, or a plain digit run; then an optional decimal part.
-  const re = /([£$€₦])?\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?/g;
+  const re = /([£$€₦₹¥₵])?\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const whole = m[2].replace(/,/g, "");
@@ -1766,9 +1824,16 @@ export function figuresIn(text: string): FoundFigure[] {
 /**
  * True when every number in `text` is grounded: the same value appears in a
  * source, and, when the narrative writes a currency next to it, a source has
- * that value in the same currency or with no currency at all. A figure the
- * sources hold ONLY in another currency is a conversion (or a mislabel) and
- * fails. Nothing is rounded or converted to make a match.
+ * that value IN THAT SAME CURRENCY. Nothing is rounded or converted to make a
+ * match.
+ *
+ * (#384, fix round 1) A currency-labelled figure no longer matches a bare
+ * source number: "£399,367" against a naira intake of 399367 is a mislabel,
+ * and a bare source figure (a count, an id, a date part) is no proof of any
+ * currency. Money sources carry their currency: intake amounts through
+ * `labelIntakeAmounts`, document values through their unit, rubric text
+ * through its own sign. A bare figure in the narrative still matches any
+ * source holding that value.
  */
 export function figuresAreGrounded(text: string, sources: readonly string[]): boolean {
   const known = new Map<string, Set<string | null>>();
@@ -1783,7 +1848,7 @@ export function figuresAreGrounded(text: string, sources: readonly string[]): bo
     const currencies = known.get(fig.value);
     if (!currencies) return false;
     if (fig.currency === null) return true;
-    return currencies.has(fig.currency) || currencies.has(null);
+    return currencies.has(fig.currency);
   });
 }
 
@@ -1794,10 +1859,22 @@ function normaliseForQuote(text: string): string {
   return text.replace(/[‘’]/g, "'").replace(/\s+/g, " ").trim();
 }
 
-/** The quoted passages in a text: inside "straight" or “curly” double quotes. */
+/**
+ * The quoted passages in a text.
+ *
+ *  - Double quotes: any opening mark (straight ", curly “ or low „) up to the
+ *    next closing mark (straight " or curly ”), so a mixed pair like “…" is
+ *    checked too (#384, fix round 1).
+ *  - Single curly quotes ‘…’ (#384, fix round 1). The closing ’ is also the
+ *    apostrophe, so it only closes a quotation when no letter follows it
+ *    ("‘you don’t qualify’" is ONE quotation, not "you don").
+ *
+ * Straight single quotes are not read: they are apostrophes far more often
+ * than quotation marks.
+ */
 export function quotationsIn(text: string): string[] {
   const out: string[] = [];
-  const re = /"([^"\n]+)"|“([^”\n]+)”/g;
+  const re = /["“„]([^"“”„\n]+)["”]|‘([^‘\n]+?)’(?![A-Za-z])/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     // Trailing punctuation the writer put inside the quotes is not part of the source.
@@ -1813,13 +1890,70 @@ export function quotationsAreGrounded(text: string, sources: readonly string[]):
   return quotationsIn(text).every((q) => normalised.some((s) => s.includes(q)));
 }
 
+// ----- Rule citations (#384, fix round 1) -----
+
+/**
+ * The most rule citations one narrative string may carry, and the most across
+ * the whole narrative. The founder's rule: the narrative explains the case in
+ * a caseworker's words, it does not list the rulebook (the rules ARE the
+ * working that `ai.review_working` sells). The prompt asks for this; these
+ * caps make it hold in code. A string over a cap is dropped.
+ */
+export const NARRATIVE_CITATION_LIMITS = { perString: 1, perNarrative: 2 } as const;
+
+/**
+ * A rule reference written in the generic way ("rule 4.2", "paragraph V 4.3",
+ * "section 9", "Appendix FM 2"): one of these words, then an optional short
+ * letter prefix, then a number. Catches refs the rubric did not send, too.
+ */
+const GENERIC_RULE_REF_RE = /\b(?:rules?|paragraphs?|paras?|sections?|appendix|annex|clauses?)\s+(?:[A-Z]{1,4}[-\s]?)?\d+(?:\.\d+)*(?:\([a-z0-9]+\))?/gi;
+
+/** A rubric ref shorter than this (after removing spaces) is too vague to look for ("1", "A"). */
+const MIN_RULE_REF_CHARS = 3;
+
+/** Escape a string for use inside a RegExp. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * How many rule citations a narrative string carries. A citation is:
+ *  - a rubric rule named by its ref ("V 4.2") or quoted from its published
+ *    wording. One rule named AND quoted ("Rule V 4.2 says “…”") is ONE
+ *    citation; each distinct rule counts once per string;
+ *  - plus every generic rule reference ("paragraph 9.8") left once the
+ *    rubric's own refs are taken out (so "Rule V 4.2" is not counted twice).
+ */
+export function ruleCitationsIn(text: string, rules: readonly NarrativeRuleRef[] = []): number {
+  const cited = new Set<number>();
+  let rest = text;
+  rules.forEach((r, i) => {
+    const ref = r.ref?.trim();
+    if (!ref || ref.replace(/\s+/g, "").length < MIN_RULE_REF_CHARS) return;
+    // The ref as a whole token: whitespace-flexible, case-insensitive, not inside a longer id ("V 4.21").
+    const re = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(ref).replace(/\s+/g, "\\s+")}(?![A-Za-z0-9])`, "gi");
+    if (re.test(rest)) {
+      cited.add(i);
+      rest = rest.replace(re, " ");
+    }
+  });
+  // A quotation inside a rule's published wording cites that rule.
+  const normalisedQuotes = rules.map((r) => (r.quote ? normaliseForQuote(r.quote) : null));
+  for (const q of quotationsIn(text)) {
+    const i = normalisedQuotes.findIndex((rq) => rq !== null && rq.includes(q));
+    if (i >= 0) cited.add(i);
+  }
+  const generic = rest.match(GENERIC_RULE_REF_RE)?.length ?? 0;
+  return cited.size + generic;
+}
+
 // ----- Parse + checks -----
 
 /** Result of checking one narrative answer. */
 export interface NarrativeParse {
   // The narrative to store, or null (shape mismatch, no conclusion, no paragraph).
   narrative: AssessmentNarrative | null;
-  // Strings dropped by the banned-wording, figure, quote or lead checks.
+  // Strings dropped by the banned-wording, figure, quote, lead or rule-citation checks.
   dropped: number;
   // Strings dropped because they addressed a model (stored as suspicious content).
   suspicious: number;
@@ -1874,16 +2008,35 @@ export function parseNarrative(text: string, band: ReadinessBand, grounding: Nar
     }
     return true;
   };
-  const keptParagraphs = paragraphs.map((p) => p.trim()).filter(keep);
-  // The conclusion: the four checks, then its opening must be the band's own
-  // (so a conclusion can never read better or worse than the band).
+  // (#384, fix round 1) The rule-citation caps. `citationsUsed` counts the
+  // citations of the strings KEPT so far; a string that has more than
+  // `perString`, or that would take the narrative past `perNarrative`, is
+  // dropped like any other failed string. Run after the other checks, so a
+  // string dropped for another reason uses none of the budget.
+  let citationsUsed = 0;
+  const withinCitationCaps = (s: string): boolean => {
+    const n = ruleCitationsIn(s, grounding.rules ?? []);
+    if (n > NARRATIVE_CITATION_LIMITS.perString || citationsUsed + n > NARRATIVE_CITATION_LIMITS.perNarrative) {
+      dropped++;
+      return false;
+    }
+    citationsUsed += n;
+    return true;
+  };
+  // The conclusion is checked FIRST (it is shown last): without it the whole
+  // narrative is null, so it gets the first claim on the citation budget.
+  // Its opening must be the band's own (so a conclusion can never read better
+  // or worse than the band).
   const c = conclusion.trim();
   let keptConclusion: string | null = keep(c) ? c : null;
   if (keptConclusion !== null && !normaliseForQuote(keptConclusion).toLowerCase().startsWith(NARRATIVE_CONCLUSION_LEADS[band].toLowerCase())) {
     dropped++;
     keptConclusion = null;
   }
-  const keptSteps = nextSteps.map((s) => s.trim()).filter(keep);
+  if (keptConclusion !== null && !withinCitationCaps(keptConclusion)) keptConclusion = null;
+  // Then the paragraphs and the steps, in the order they are shown.
+  const keptParagraphs = paragraphs.map((p) => p.trim()).filter((p) => keep(p) && withinCitationCaps(p));
+  const keptSteps = nextSteps.map((s) => s.trim()).filter((st) => keep(st) && withinCitationCaps(st));
   if (keptConclusion === null) return fail("the conclusion was dropped", dropped, suspicious);
   if (keptParagraphs.length === 0) return fail("every paragraph was dropped", dropped, suspicious);
   return { narrative: { paragraphs: keptParagraphs, conclusion: keptConclusion, nextSteps: keptSteps }, dropped, suspicious, reason: null };
