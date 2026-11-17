@@ -177,6 +177,49 @@ describe("unapplied payments under concurrent settles (#354)", () => {
     assert.equal(ngn.availableBalance, -PAYSTACK_FEE);
   });
 
+  // Issue #354 review fix (blocking, fix round): the ORDER of events must not
+  // change who caused it. Rescheduled after the lock, the client pays the
+  // FRESH checkout (booking confirmed), then the old, retired checkout's
+  // payment lands from several settles at once. It is still the agent's
+  // doing: one exception `paid_for_rescheduled_slot`, one FULL refund, one
+  // fee debit from the agent who moved it, never a second fee Transaction.
+  test("rescheduled, then paid on a fresh checkout, then the retired checkout settled x4 at once: agent-caused once", async () => {
+    const r1 = await seedPendingPastLock("ub3");
+    const moved = await api.call("PUT", "/consultations/ub3", tokens.uagent, { scheduledTime: "13:00" });
+    assert.equal(moved.status, 200, JSON.stringify(moved.body));
+    const { settlePayment } = await import("../../src/services/consultation-charge.service");
+    const { collections } = await import("../../src/utils/firebase");
+
+    // The fresh checkout R2, paid: stood in by a stored current checkout and
+    // a settle of it (the checkout-opening path is covered elsewhere).
+    const r2 = "cons-ub3-fresh";
+    await collections.consultations.doc("ub3").update({
+      transactionId: r2,
+      quoteLockedAt: Timestamp.now(),
+      quoteExpiresAt: Timestamp.fromMillis(Date.now() + 30 * 60_000),
+    });
+    reports.set(r2, { ...reports.get(r1), paidAt: new Date().toISOString() });
+    const paid = await settlePayment("ub3", r2, reports.get(r2));
+    assert.equal(paid?.kind, "confirmed");
+
+    const before = refundCalls.length;
+    const outcomes = await Promise.all([0, 1, 2, 3].map(() => settlePayment("ub3", r1, reports.get(r1))));
+    for (const o of outcomes as any[]) assert.equal(o.kind, "refund_recorded", "the booking is paid: an extra payment");
+
+    const s = await stateOf("ub3");
+    assert.equal(s.booking.paymentStatus, "paid");
+    assert.equal(s.fees.length, 1, "only R2's fee Transaction");
+    assert.equal(s.exceptions.length, 1);
+    assert.equal(s.exceptions[0].reason, "paid_for_rescheduled_slot", "agent-caused, whatever settled first");
+    assert.equal(s.exceptions[0].causedByAgentId, accounts.uagent.uid);
+    assert.equal(s.refunds.length, 1, "one refund row");
+    assert.equal(s.refunds[0].amount, FEE, "refunded in full");
+    assert.deepEqual(refundCalls.slice(before), [[r1, FEE, "NGN"]], "one Paystack refund, in full");
+    assert.equal(s.debits.length, 1, "one fee debit");
+    assert.equal(s.debits[0].amount, PAYSTACK_FEE);
+    assert.equal(s.debits[0].agentId, accounts.uagent.uid);
+  });
+
   test("a payment after a cancel, settled 4 times at once: one refund row and one Paystack call", async () => {
     const reference = await seedPendingPastLock("ub2");
     const cancelled = await api.call("PUT", "/consultations/ub2/status", tokens.uagent, { status: "cancelled" });
