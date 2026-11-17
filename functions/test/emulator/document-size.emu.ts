@@ -452,7 +452,10 @@ describe("readiness review on the emulators", () => {
     assert.deepEqual({ result, status: stored.status, error: stored.error }, { result: "succeeded", status: "succeeded", error: null });
     assert.deepEqual(read, uploads.map((u) => u.key).sort(), "every document got an extraction call");
     assert.equal(provider.callsFor("judgement"), 5);
-    assert.equal(provider.requests.length, 15, "inside the default cap of 30");
+    // (#384) 10 extractions + 5 judgement batches + the one narrative call
+    // written after the findings are assembled.
+    assert.equal(provider.callsFor("narrative"), 1);
+    assert.equal(provider.requests.length, 16, "inside the default cap of 30");
     // The 4 MB photos went out whole, and under what the provider accepts for one image.
     const largestImage = Math.max(...provider.requests.filter((r) => r.documents?.[0]?.mediaType === "image/jpeg").map((r) => r.documents![0].data.length));
     assert.ok(largestImage > 5_000_000 && largestImage < 10_000_000);

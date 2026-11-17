@@ -103,5 +103,8 @@ export function findBannedWording(text: string): boolean {
   return BANNED_WORDING.some((re) => re.test(text));
 }
 
-/** Version of the prompts in this module and the engine. Recorded on every assessment. */
-export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-11.2";
+/**
+ * Version of the prompts in this module and the engine. Recorded on every assessment.
+ * (#384) Bumped for the new narrative prompt (buildNarrativeRequest).
+ */
+export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-16.1";

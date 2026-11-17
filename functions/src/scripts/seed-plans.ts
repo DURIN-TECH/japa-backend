@@ -29,10 +29,18 @@ import { StoredPlan } from "../types/billing";
  *   derived yearly variants. No paid tier is excluded today; to drop a tier,
  *   remove the key from that plan and update the expected list in the test.
  *
+ * - `ai.review_working` (#384): the rule-by-rule working of the AI review
+ *   (each criterion, its published wording and how it was applied). A client
+ *   caller gets it only together with `ai.case_officer`; staff callers do not
+ *   need it. Paid-only so no free plan gets it, and deliberately in NO paid
+ *   plan yet either: its price and plan placement come with #385. Until then
+ *   paying clients get the written reading of their application without the
+ *   per-rule working (accepted on #384: no public release yet).
+ *
  * `test/billing/plan-entitlements.test.ts` fails if a free plan holds any of
  * these, so adding a paid-only key means adding it here first.
  */
-export const PAID_ONLY_FEATURES: readonly FeatureKey[] = [FEATURES.AI_CASE_OFFICER];
+export const PAID_ONLY_FEATURES: readonly FeatureKey[] = [FEATURES.AI_CASE_OFFICER, FEATURES.AI_REVIEW_WORKING];
 
 /**
  * What every free default plan grants. Until subscription billing launches the

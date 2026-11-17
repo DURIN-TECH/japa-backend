@@ -65,6 +65,17 @@ export interface LlmRequest {
   // recording hash are unchanged (the hash ignores this flag: it changes the
   // price, not the answer).
   cacheSystem?: boolean;
+  // (#384) Abort signal for this request. When it fires, the provider stops
+  // the HTTP request (the SDK aborts the fetch AND the body stream), so a
+  // caller can put a hard wall-clock bound on a call: the SDK's own `timeout`
+  // only covers the wait for the response headers, not a body that keeps
+  // streaming. Absent for every caller that does not need it; ignored by the
+  // recording hash (it changes when the answer is cut, not what it says).
+  signal?: AbortSignal;
+  // (#384) SDK retries for this request (connection errors, 429, 5xx).
+  // Absent = the provider default (`MAX_RETRIES`). The narrative sends 0: a
+  // retry would restart the clock its hard bound is measured on.
+  maxRetries?: number;
 }
 
 /** Token counts of one call, as the API reported them (never estimated). */
@@ -185,7 +196,13 @@ export class AnthropicLlmProvider implements LlmProvider {
     const model = this.modelFor(request.role);
     try {
       const message = await client.messages
-        .stream(messageParamsFor(request, model), { timeout: request.timeoutMs, maxRetries: MAX_RETRIES })
+        .stream(messageParamsFor(request, model), {
+          timeout: request.timeoutMs,
+          // (#384) A per-request retry count when the caller set one, else the default.
+          maxRetries: request.maxRetries ?? MAX_RETRIES,
+          // (#384) Only passed when set, so every other request keeps its exact options.
+          ...(request.signal ? { signal: request.signal } : {}),
+        })
         .finalMessage();
 
       // Join the text blocks; thinking blocks are ignored.

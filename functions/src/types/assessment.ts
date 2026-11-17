@@ -237,9 +237,50 @@ export interface StatementRef {
 
 /** A passage that addressed the model (injection). Stored, never shown. */
 export interface SuspiciousContentFlag {
-  source: "document" | "statement";
+  // (#384) `narrative`: a string of the model-written narrative that addressed
+  // a reader (it was dropped by code, never stored in `narrative`).
+  source: "document" | "statement" | "narrative";
   documentId: string | null;
   page: number | null;
+}
+
+/**
+ * (#384) The caseworker-style reading of the applicant's own application: what
+ * they told us, what their documents show, where the two conflict or fall
+ * short, how convincing the whole is, a conclusion that agrees with the band,
+ * and what would change it.
+ *
+ * Written by ONE model call after the findings are assembled
+ * (`buildNarrativeRequest` in services/ai/assessment-engine.ts) and then
+ * checked string by string in code (`parseNarrative`): banned wording,
+ * injection, every figure and every quotation must be grounded in what was
+ * sent. A string that fails is dropped; when the conclusion is dropped or no
+ * paragraph is left the whole narrative is null. Null also when the call was
+ * skipped (a mandatory bar, nothing to weigh, a cap) or failed, and on every
+ * assessment written by the bulk path (#386) or before #384.
+ */
+export interface AssessmentNarrative {
+  // 1 to 6 short paragraphs, each at most 700 characters, in order.
+  paragraphs: string[];
+  // The readiness conclusion in an officer's reasoning voice (at most 400
+  // characters). Its opening agrees with the band (checked in code).
+  conclusion: string;
+  // 0 to 5 things that would change the reading, each at most 200 characters.
+  nextSteps: string[];
+}
+
+/**
+ * (#384) The mandatory bar that stops the review, for the full tier whatever
+ * the working entitlement: blocking rules are never paywalled. Copied in code
+ * from the FIRST mandatory-bar refusal ground (rubric text, never model text).
+ * The free tier never gets it (only `hasBlockingRule`, as decided on #43).
+ */
+export interface BlockingRule {
+  criterionId: string;
+  title: string;
+  ruleRef: string | null;
+  sourceQuote: string;
+  sourceUrl: string;
 }
 
 /** Usage of one stage, as the API reported it. */
@@ -319,13 +360,24 @@ export interface ApplicationAssessment {
   // it, it is not part of the input hash, and it is never sent to a model.
   // Full tier and staff only: the free whitelist does not include it.
   countryContext?: AvailableCountryContext;
+  // (#384) The caseworker-style reading (see AssessmentNarrative). Null when
+  // it was not written or did not pass the code checks. Documents stored
+  // before #384 have no key at all; the serializer reads that as null.
+  narrative: AssessmentNarrative | null;
+  // (#384) The mandatory bar that applies, copied from the first mandatory-bar
+  // refusal ground (never model text); null when none applies. Documents
+  // stored before #384 have no key; the serializer derives it from
+  // `refusalGrounds` at read time.
+  blockingRule: BlockingRule | null;
   // Stored, stripped from every client-role response (see tier-serializer).
   // (#308) Also null on a FINISHED assessment when nothing refuses and the
   // objective checks could not be made (the rulebook names no document for
   // them, an upload is unread, or a field could not be read): no call is made.
   internalCall: "would_approve" | "would_refuse" | null;
 
-  models: { extract: string | null; judge: string | null };
+  // (#384) `narrative`: the model that wrote the narrative, when the call was
+  // made (absent on documents without a narrative call).
+  models: { extract: string | null; judge: string | null; narrative?: string | null };
   promptVersion: string;
 
   // ---- bulk re-assessment (issue #37). All optional: documents written
@@ -359,7 +411,9 @@ export interface ApplicationAssessment {
   // When the reviewer was notified. Null until then (and for ever when no
   // review is required).
   reviewNotifiedAt?: Timestamp | null;
-  usage: { extract: AssessmentUsage; judge: AssessmentUsage };
+  // (#384) `narrative`: usage of the one narrative call, when it was made.
+  // Absent on the bulk path and on documents written before #384.
+  usage: { extract: AssessmentUsage; judge: AssessmentUsage; narrative?: AssessmentUsage };
   // Null while the model has no price entry (see services/ai/ai-pricing.ts).
   costUsd: number | null;
 }

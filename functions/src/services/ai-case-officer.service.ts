@@ -12,6 +12,7 @@ import { buildCountryContext, type CountryContextResult } from "./outcome-statis
 import type {
   ApplicationAssessment,
   AssessmentErrorCode,
+  AssessmentNarrative,
   AssessmentStatus,
   AssessmentTrigger,
   AssessmentUsage,
@@ -39,6 +40,13 @@ import {
   parseJudgement,
   planJudgementBatches,
   topIssuesOf,
+  // (#384) The narrative: request, code checks, and the blocking-rule copy.
+  blockingRuleOf,
+  buildNarrativeRequest,
+  narrativeGroundingOf,
+  parseNarrative,
+  NARRATIVE_TIMEOUT_MS,
+  type NarrativeRequestInput,
   type AssessmentContent,
   type AssessmentInputs,
   type DocumentExtraction,
@@ -48,7 +56,7 @@ import {
 import { extractOneDocument, sniffMediaType } from "./ai/document-extraction";
 import { costOfUsage } from "./ai/ai-pricing";
 import { fileByteLimitForBytes, readAiSettings, type AiSettings, type AiSettingsRead } from "./ai/ai-settings";
-import { AnthropicLlmProvider, type LlmProvider, type LlmUsage } from "./ai/llm-provider";
+import { AnthropicLlmProvider, type LlmProvider, type LlmResponse, type LlmUsage } from "./ai/llm-provider";
 import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-safety";
 import type { AssessmentTier, StaleReason } from "./ai/tier-serializer";
 import { aiActionService } from "./ai-action.service";
@@ -93,6 +101,21 @@ import type { IntakeResponse } from "../types/intake";
 const JOB_BUDGET_MS = 480_000;
 /** No judgement call starts after this much time has gone. */
 const JUDGEMENT_START_LIMIT_MS = 360_000;
+/**
+ * (#384) Time kept back, after the narrative's hard bound, for what the job
+ * still does once the narrative is settled: the country-context lookup and the
+ * `storeContent` write. The narrative's bound is
+ * `min(NARRATIVE_TIMEOUT_MS, JOB_BUDGET_MS - elapsed - NARRATIVE_MARGIN_MS)`,
+ * so a slow narrative can never push the job past its budget and lose the
+ * findings that are already final.
+ */
+const NARRATIVE_MARGIN_MS = 20_000;
+/**
+ * (#384) The shortest bound worth a narrative call. With less time than this
+ * left the call is not made at all (`narrative: null`, no usage): a call that
+ * would almost surely be cut off is paid for and gives nothing.
+ */
+const NARRATIVE_MIN_MS = 20_000;
 
 /**
  * (#310) The stored message for `review_too_large`: the review would pass a
@@ -409,6 +432,9 @@ export function newAssessmentDoc(args: {
     confidence: null,
     topIssues: [],
     hasBlockingRule: false,
+    // (#384) Not written until the job finishes (storeContent sets both).
+    narrative: null,
+    blockingRule: null,
     internalCall: null,
     models: { extract: null, judge: null },
     promptVersion: ASSESSMENT_PROMPT_VERSION,
@@ -1115,6 +1141,16 @@ export class AiCaseOfficerService {
     if (statementText && findInjectionSignals(statementText)) {
       suspiciousContent.push({ source: "statement", documentId: null, page: null });
     }
+    // The applicant-derived summaries every judgement call is given. Built once
+    // here (#384) because the narrative call after assembly is given the same
+    // ones, so it reasons about exactly what the judgement saw.
+    // (#234) Only the facts the rules need reach the model (see factsSummaryForModel).
+    const profileSummary = `Applicant name: ${loaded.applicantName ?? "not given"}. ${factsSummaryForModel(loaded.facts, rubric.criteria, barDate, rubric.criteria.some(isJudgedBar))}`;
+    const intakeSummary = JSON.stringify(loaded.intake);
+    const extractionSummary = extractions
+      .filter((e) => e.readable && !e.failed && !e.suspicious)
+      .flatMap((e) => e.values.map((v) => `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`))
+      .join("\n");
     if (batches.length > 0 && (extractions.length > 0 || statementText.trim().length > 0)) {
       const outputs: JudgementOutput[] = [];
       for (const batch of batches) {
@@ -1125,13 +1161,9 @@ export class AiCaseOfficerService {
           rubric: { criteria: batch, intentPolarity: rubric.intentPolarity },
           statementText: numbered ? numbered.text : statementText || null,
           otherStatementsText: otherText || null,
-          // (#234) Only the facts the rules need reach the model (see factsSummaryForModel).
-          profileSummary: `Applicant name: ${loaded.applicantName ?? "not given"}. ${factsSummaryForModel(loaded.facts, rubric.criteria, barDate, rubric.criteria.some(isJudgedBar))}`,
-          intakeSummary: JSON.stringify(loaded.intake),
-          extractionSummary: extractions
-            .filter((e) => e.readable && !e.failed && !e.suspicious)
-            .flatMap((e) => e.values.map((v) => `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`))
-            .join("\n"),
+          profileSummary,
+          intakeSummary,
+          extractionSummary,
           objectiveSummary: objective.map((r) => `${r.criterionId}: ${r.outcome}`).join("\n"),
         });
         // The characters of every call count toward the same cap.
@@ -1175,14 +1207,126 @@ export class AiCaseOfficerService {
       notAssessed,
       documentNames: documentNamesFor(loaded.documents, fullRubric),
     });
+
+    // ---- (#384) the narrative: ONE more call, after assembly ----
+    // Within the same per-review caps as every call above, but a narrative that
+    // would pass a cap, or that fails in any way, is SKIPPED (null): it never
+    // fails the review, whose findings are already final.
+    const narrativeRun = await this.writeNarrative({
+      settings,
+      started,
+      requestsSoFar: requests,
+      charsSoFar: chars,
+      input: {
+        readiness: content.readiness,
+        findings: content,
+        profileSummary,
+        intakeSummary,
+        extractionSummary,
+        statementText: statementText.trim() ? statementText : null,
+      },
+    });
+    // A narrative string that addressed a model is stored as suspicious content (never shown).
+    for (let i = 0; i < narrativeRun.suspicious; i++) suspiciousContent.push({ source: "narrative", documentId: null, page: null });
+
     await this.storeContent(
       cur.id,
       fullRubric,
       content,
-      { extract: extractUsage, judge: judgeUsage },
-      { extract: extractUsed ? this.deps.provider.modelFor("extraction") : null, judge: judgeUsed ? this.deps.provider.modelFor("judgement") : null },
-      suspiciousContent
+      { extract: extractUsage, judge: judgeUsage, ...(narrativeRun.called ? { narrative: narrativeRun.usage } : {}) },
+      {
+        extract: extractUsed ? this.deps.provider.modelFor("extraction") : null,
+        judge: judgeUsed ? this.deps.provider.modelFor("judgement") : null,
+        ...(narrativeRun.called ? { narrative: this.deps.provider.modelFor("narrative") } : {}),
+      },
+      suspiciousContent,
+      { narrative: narrativeRun.narrative }
     );
+  }
+
+  /**
+   * (#384) Write the narrative for an assembled review, or return null.
+   *
+   * Skipped, with no call, when the call would pass `maxRequestsPerAssessment`
+   * or `maxInputCharsPerAssessment` (counted the same way as every other call:
+   * one request, the user text's characters), or when the job has less than
+   * `NARRATIVE_MIN_MS` left for it. The call has a HARD wall-clock bound
+   * (`min(NARRATIVE_TIMEOUT_MS, JOB_BUDGET_MS - elapsed - NARRATIVE_MARGIN_MS)`):
+   * past it the request is aborted, a late answer is ignored, and the review
+   * is stored with `narrative: null`. No retry. A provider error, a timeout, a refusal,
+   * a cut-off answer or an answer that fails the code checks is null too.
+   * Never throws: the review succeeds with its findings either way.
+   *
+   * Only the interactive worker calls this. The mandatory-bar and nothing-to-
+   * read paths return before it (no call, null), and the bulk path (#386) does
+   * not call it at all.
+   */
+  private async writeNarrative(args: {
+    settings: AiSettings;
+    started: number;
+    requestsSoFar: number;
+    charsSoFar: number;
+    input: NarrativeRequestInput;
+  }): Promise<{ narrative: AssessmentNarrative | null; called: boolean; usage: AssessmentUsage; suspicious: number }> {
+    const skipped = { narrative: null, called: false, usage: zeroUsage(), suspicious: 0 };
+    try {
+      const request = buildNarrativeRequest(args.input);
+      // The caps: a narrative that does not fit is skipped, the review is not failed.
+      if (args.requestsSoFar + 1 > args.settings.maxRequestsPerAssessment) return skipped;
+      if (args.charsSoFar + request.user.length > args.settings.maxInputCharsPerAssessment) return skipped;
+      // (#384, fix round 1) The HARD wall-clock bound of this call: the
+      // narrative's own budget, or what is left of the job's budget after the
+      // margin kept for storing the review, whichever is less. With less than
+      // NARRATIVE_MIN_MS left the call is not made.
+      const elapsed = this.deps.now().getTime() - args.started;
+      const boundMs = Math.min(NARRATIVE_TIMEOUT_MS, JOB_BUDGET_MS - elapsed - NARRATIVE_MARGIN_MS);
+      if (boundMs < NARRATIVE_MIN_MS) return skipped;
+
+      let usage = zeroUsage();
+      // The SDK's `timeout` alone is NOT a bound: it is cleared once the
+      // response headers arrive, and the body can stream for much longer. So
+      // the call also gets an abort signal, no retry (a retry would restart
+      // the clock), and is raced against a timer of the same length below.
+      const controller = new AbortController();
+      const call = this.deps.provider.complete({ ...request, timeoutMs: boundMs, maxRetries: 0, signal: controller.signal });
+      // A late answer (or the rejection the abort causes) is ignored: without
+      // this handler it would surface as an unhandled rejection after the race.
+      call.catch(() => undefined);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<"timed_out">((resolve) => {
+        timer = setTimeout(() => resolve("timed_out"), boundMs);
+      });
+      let res: LlmResponse;
+      try {
+        const winner = await Promise.race([call, timedOut]);
+        if (winner === "timed_out") {
+          // Past the bound: stop the request and store the review without a
+          // narrative. The call was attempted (it may have cost), so it is recorded.
+          controller.abort();
+          console.warn(`[ai-case-officer] narrative not written: no answer within ${boundMs} ms`);
+          return { ...skipped, called: true };
+        }
+        res = winner;
+      } catch {
+        // Provider error: the call was attempted (it may have cost), so it is recorded.
+        return { ...skipped, called: true };
+      } finally {
+        // The timer never outlives the race (it would keep the worker alive).
+        if (timer !== undefined) clearTimeout(timer);
+      }
+      usage = addUsage(usage, res.usage);
+      // A refusal or a cut-off answer is not a narrative.
+      if (res.stopReason === "refusal" || res.stopReason === "max_tokens") return { ...skipped, called: true, usage };
+      const parsed = parseNarrative(res.text, args.input.readiness, narrativeGroundingOf(args.input));
+      // Counts only, never the text: it may carry an applicant's words.
+      if (parsed.dropped > 0 || parsed.suspicious > 0) {
+        console.warn(`[ai-case-officer] narrative: ${parsed.dropped} string(s) dropped by code checks, ${parsed.suspicious} suspicious`);
+      }
+      return { narrative: parsed.narrative, called: true, usage, suspicious: parsed.suspicious };
+    } catch (err) {
+      console.warn(`[ai-case-officer] narrative not written: ${err instanceof Error ? err.name : "error"}`);
+      return skipped;
+    }
   }
 
   /**
@@ -1242,9 +1386,13 @@ export class AiCaseOfficerService {
     id: string,
     rubric: VisaRubric,
     content: AssessmentContent,
-    usage: { extract: AssessmentUsage; judge: AssessmentUsage },
-    models: { extract: string | null; judge: string | null },
+    // (#384) `narrative` usage/model only when the narrative call was made.
+    usage: { extract: AssessmentUsage; judge: AssessmentUsage; narrative?: AssessmentUsage },
+    models: { extract: string | null; judge: string | null; narrative?: string | null },
     suspiciousContent: ApplicationAssessment["suspiciousContent"] = [],
+    // (#384) The interactive worker passes `{ narrative }` here; every other
+    // caller (the bar and nothing-to-read paths, the bulk path) leaves it out
+    // and the result is stored with `narrative: null`.
     extra: Partial<ApplicationAssessment> = {}
   ): Promise<void> {
     // Items dropped by code (a criterion id the rubric does not contain, or model
@@ -1260,6 +1408,9 @@ export class AiCaseOfficerService {
     // Cost from the price table; null while a role has no confirmed price.
     const extractCost = costOfUsage("extraction", this.usageAsLlm(usage.extract));
     const judgeCost = costOfUsage("judgement", this.usageAsLlm(usage.judge));
+    // (#384) The narrative's cost, only when its call was made (0 otherwise, so
+    // a review without one is priced exactly as before).
+    const narrativeCost = usage.narrative ? costOfUsage("narrative", this.usageAsLlm(usage.narrative)) : 0;
     // Computed AFTER the content above is final, from nothing in it (#116).
     const countryContext = await this.countryContextFor(rubric, id);
     await this.finish(id, {
@@ -1278,6 +1429,11 @@ export class AiCaseOfficerService {
       confidence: content.confidence,
       topIssues: topIssuesOf(rubric, content),
       hasBlockingRule: content.hasBlockingRule,
+      // (#384) The bar that stops the review, copied in code from the first
+      // mandatory-bar refusal ground (never model text); null when none.
+      blockingRule: blockingRuleOf(content.refusalGrounds),
+      // (#384) Null unless the interactive worker wrote one (it passes it in `extra`).
+      narrative: null,
       internalCall: content.internalCall,
       // Spread only when present: an absent note is an absent field, not null.
       ...(countryContext ? { countryContext } : {}),
@@ -1285,7 +1441,7 @@ export class AiCaseOfficerService {
       model: models.judge ?? models.extract ?? null,
       usage,
       // A total only when both stages are priced: a part-priced total would understate the spend.
-      costUsd: extractCost === null || judgeCost === null ? null : extractCost + judgeCost,
+      costUsd: extractCost === null || judgeCost === null || narrativeCost === null ? null : extractCost + judgeCost + narrativeCost,
       ...extra,
     });
     // Proposed actions (issue #44): derived from the findings just stored and

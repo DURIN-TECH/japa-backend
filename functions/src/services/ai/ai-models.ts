@@ -34,13 +34,23 @@
  *    against its own quoted sentence and answers closed verdicts only. It is
  *    its own role, on the mid tier, so it is never the extractor's model
  *    (`judgement` drafts the rulebook) and its tier can be changed on its own.
+ *  - `narrative`:  (#384) the caseworker-style reading of an applicant's own
+ *    review, written after the findings are assembled. It reasons about the
+ *    applicant's facts against their documents, so it runs on the SAME model
+ *    as `judgement` (issue #384: reuse the judgement model, no new provider).
+ *    Its own role so its calls are counted, recorded and priced apart.
  */
-export type AiModelRole = "extraction" | "drafting" | "judgement" | "verification";
+export type AiModelRole = "extraction" | "drafting" | "judgement" | "verification" | "narrative";
+
+/** The judgement-tier model id, shared by `judgement` and `narrative` (#384). */
+const JUDGEMENT_TIER_MODEL = "claude-opus-5-5";
 
 /** Role -> Claude model id. The single source of truth for model ids. */
 export const AI_MODELS: Readonly<Record<AiModelRole, string>> = Object.freeze({
   extraction: "claude-haiku-5-5",
   drafting: "claude-sonnet-5-5",
-  judgement: "claude-opus-5-5",
+  judgement: JUDGEMENT_TIER_MODEL,
   verification: "claude-sonnet-5-5",
+  // (#384) Always the judgement model: see the role list above.
+  narrative: JUDGEMENT_TIER_MODEL,
 });
