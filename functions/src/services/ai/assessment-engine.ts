@@ -1824,7 +1824,7 @@ export function figuresIn(text: string): FoundFigure[] {
 /**
  * True when every number in `text` is grounded: the same value appears in a
  * source, and, when the narrative writes a currency next to it, a source has
- * that value IN THAT SAME CURRENCY. Nothing is rounded or converted to make a
+ * that value in that same currency. Nothing is rounded or converted to make a
  * match.
  *
  * (#384, fix round 1) A currency-labelled figure no longer matches a bare
