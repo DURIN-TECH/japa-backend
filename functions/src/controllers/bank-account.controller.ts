@@ -6,6 +6,8 @@ import type { Role } from "@durin-tech/authz";
 import {
   transactionService,
   InsufficientBalanceError,
+  // Issue #354: money owed in any currency blocks withdrawals.
+  NegativeBalanceError,
 } from "../services/transaction.service";
 import {
   sendSuccess,
@@ -231,6 +233,17 @@ class BankAccountController {
       sendCreated(res, transaction, "Withdrawal initiated");
     } catch (error) {
       // Thrown inside the transaction, so nothing was written.
+      // Issue #354: a balance below zero in any currency (money owed, e.g.
+      // Paystack's fee on a refunded payment) blocks every withdrawal.
+      if (error instanceof NegativeBalanceError) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          `Your ${error.currency} balance is below zero. Withdrawals are paused until it is back to zero or above.`,
+          400
+        );
+        return;
+      }
       if (error instanceof InsufficientBalanceError) {
         sendError(
           res,

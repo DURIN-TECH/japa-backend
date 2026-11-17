@@ -329,6 +329,11 @@ export function paystackPaid(
     amount: amount.amountMinor,
     currency: amount.currency,
     paidAt: paidAt.toISOString(),
+    // Issue #354: Paystack's processing fee on the charge. 0 by default, so
+    // a test that is not about the fee sees the amounts it always did (a
+    // client-caused refund of the whole charge, no agent debit). Fee tests
+    // pass `{ fees: n }`, or `{ fees: undefined }` for "Paystack reported none".
+    fees: 0,
     ...extra,
   });
 }

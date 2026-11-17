@@ -346,6 +346,8 @@ export class PaystackProvider implements BillingProvider {
         currency?: unknown;
         paid_at?: unknown;
         paidAt?: unknown;
+        // Issue #354: Paystack's processing fee on this charge (minor units).
+        fees?: unknown;
       };
     }>(`/transaction/verify/${encodeURIComponent(reference)}`);
     const data = res.data.data;
@@ -573,6 +575,14 @@ export interface PaystackTransactionLookup {
   currency?: string;
   /** When the payment completed (ISO 8601), when Paystack reports it. */
   paidAt?: string;
+  /**
+   * Issue #354: Paystack's processing fee on this charge (`data.fees`), in
+   * minor units of `currency`. Set ONLY when Paystack reported a safe
+   * integer >= 0; absent means UNKNOWN (missing, null, negative, a string, a
+   * fraction...), and the refund paths then hold the refund rather than
+   * guess. Never estimated from a rate.
+   */
+  fees?: number;
 }
 
 /**
@@ -591,6 +601,7 @@ export function toTransactionLookup(data: {
   currency?: unknown;
   paid_at?: unknown;
   paidAt?: unknown;
+  fees?: unknown;
 }): PaystackTransactionLookup {
   const paidAtRaw = data.paid_at ?? data.paidAt;
   const metadata = data.metadata && typeof data.metadata === "object" ? (data.metadata as Record<string, unknown>) : {};
@@ -608,7 +619,20 @@ export function toTransactionLookup(data: {
       : {}),
     currency: typeof data.currency === "string" ? data.currency.toUpperCase() : undefined,
     paidAt: typeof paidAtRaw === "string" && paidAtRaw ? paidAtRaw : undefined,
+    // Issue #354: Paystack's fee, only when it is a well-formed figure (a
+    // safe integer >= 0). Anything else is left out = unknown, so no caller
+    // can mistake a bad value for a fee of 0.
+    ...(isWellFormedFee(data.fees) ? { fees: data.fees } : {}),
   };
+}
+
+/**
+ * Issue #354: whether a reported Paystack fee can be used as money: a safe
+ * integer of minor units, zero or more. `null`, a negative number, a
+ * fraction, NaN, a numeric string ("150") are all NOT usable. Pure.
+ */
+export function isWellFormedFee(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** One refund as Paystack reports it (issue #317). */

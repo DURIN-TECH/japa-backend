@@ -512,7 +512,8 @@ describe("PUT /consultations/:id/status — cancelling while a payment is in fli
     await consultationController.verifyPublicConsultation({ body: { reference } } as any, verified.res);
     assert.equal(verified.out.status, 409);
     assert.equal(verified.out.body.error, "BOOKING_NOT_PAYABLE");
-    assert.equal(docsIn("transactions").length, 0);
+    // Issue #354: never a fee Transaction; the automatic refund row only.
+    assert.equal(docsIn("transactions").filter(([, t]) => t.type !== "refund").length, 0);
     const exceptions = docsIn("consultationPaymentExceptions");
     assert.equal(exceptions.length, 1);
     assert.equal(exceptions[0][1].reason, "booking_not_payable");

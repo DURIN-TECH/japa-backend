@@ -472,7 +472,9 @@ describe("a payment landing on a system-cancelled booking", () => {
     assert.equal(exceptions[0][1].amountMinor, FEE_KOBO);
     assert.equal(exceptions[0][1].currency, "NGN");
     assert.equal(exceptions[0][1].status, "open");
-    assert.equal(docsIn("transactions").length, 0, "never a fee Transaction");
+    // Issue #354: never a fee Transaction; the payment is refunded automatically (one refund row).
+    assert.equal(docsIn("transactions").filter(([, t]) => t.type !== "refund").length, 0, "never a fee Transaction");
+    assert.equal(docsIn("transactions").filter(([, t]) => t.type === "refund").length, 1);
     assert.equal(booking("b1").status, "cancelled");
     assert.equal(booking("b1").paymentStatus, "pending");
   });

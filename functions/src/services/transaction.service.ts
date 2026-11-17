@@ -14,6 +14,8 @@ import type { Transaction as FirestoreTransaction } from "firebase-admin/firesto
 import type { ChargeSnapshot, CurrencyCode } from "../types/money";
 import {
   CurrencyBuckets,
+  // Issue #354: Paystack-fee debits from the agent.
+  isAgentDebit,
   isPendingIncoming,
   isSettled,
   revenueEffect,
@@ -113,6 +115,25 @@ export class InsufficientBalanceError extends Error {
   constructor() {
     super("Insufficient balance");
     this.name = "InsufficientBalanceError";
+  }
+}
+
+/**
+ * Thrown by `withdrawWithBalanceCheck` (issue #354, orchestrator decision
+ * 2026-11-16) when the agent's available balance is below zero in ANY
+ * currency. A debit in GHS or USD (Paystack's fee on a refunded payment, or a
+ * #351 refund of a released fee) must not be dodged by withdrawing naira, so
+ * EVERY withdrawal is refused until each currency is back to zero or above.
+ * A subclass of InsufficientBalanceError, so any caller that only knows the
+ * parent still refuses the withdrawal (fails closed).
+ */
+export class NegativeBalanceError extends InsufficientBalanceError {
+  /** The currency whose available balance is below zero (the first one, by code). */
+  readonly currency: CurrencyCode;
+  constructor(currency: CurrencyCode) {
+    super();
+    this.name = "NegativeBalanceError";
+    this.currency = currency;
   }
 }
 
@@ -220,6 +241,10 @@ class TransactionService {
       .filter((txn) => txn.userId === clientUserId)
       // Payouts are not payments the caller made (see above).
       .filter((txn) => txn.type !== "withdrawal")
+      // Issue #354: an agent's Paystack-fee debit is the AGENT's money (its
+      // `userId` is the agent, so the query above never returns it to a
+      // client); filtered again so no future change can show it to one.
+      .filter((txn) => txn.type !== "paystack_fee_debit")
       .filter((txn) => this.matchesFilters(txn, filters));
   }
 
@@ -325,6 +350,9 @@ class TransactionService {
    *    `refundFundedFrom`) lowers it once settled, as before;
    *  - (#351 reversal) `availableBalance` is no longer floored at 0: a
    *    negative figure is money the agent owes, and blocks withdrawals;
+   *  - (issue #354) a `paystack_fee_debit` lowers `totalRevenue` (shared
+   *    `revenueEffect`) and `availableBalance` of its own currency from the
+   *    moment it is written, never `heldBalance`, never pending payments;
    *  - a currency appears in `byCurrency` as soon as any transaction in it
    *    is seen (even one that adds 0, e.g. a failed charge), so the list is
    *    empty only when there are no transactions at all.
@@ -382,9 +410,24 @@ class TransactionService {
         pendingUserIds.add(txn.userId);
       }
 
+      // ---- Issue #354: Paystack's fee taken from the agent ----
+      // Owed from the moment it is written (it is written `completed`), in
+      // its own currency, and NOT floored: it may take the available
+      // balance below zero, which then blocks every withdrawal. The held
+      // balance is never touched (the fee was not paid out of a hold).
+      if (isAgentDebit(txn)) {
+        available.add(currency, -txn.amount);
+        continue;
+      }
+
       // ---- Issue #317: available vs held ----
       if (txn.type === "refund") {
-        if (txn.refundFundedFrom === "hold") {
+        if (txn.refundFundedFrom === "unapplied_payment") {
+          // Issue #354: a payment that never confirmed its booking, given
+          // back. It was never credited, so it is debited from nothing.
+          // (Such a row has no agentId, so it is not even in an agent's
+          // query; this keeps an all-rows admin total right too.)
+        } else if (txn.refundFundedFrom === "hold") {
           // Paid out of a held fee: that fee is already out of both balances.
         } else if (txn.refundFundedFrom === "available") {
           // A released fee given back: owed from the moment it is written.
@@ -520,6 +563,8 @@ class TransactionService {
    * @param bankAccount the caller's own bank account
    * @returns the pending withdrawal that was written
    * @throws InsufficientBalanceError when `amount` exceeds the NGN balance
+   * @throws NegativeBalanceError (issue #354) when the available balance is
+   *   below zero in any currency, whatever the amount
    */
   async withdrawWithBalanceCheck(
     agentUserId: string,
@@ -551,6 +596,10 @@ class TransactionService {
       // the available balance, so it can never be withdrawn; a negative
       // balance (a refund of a released fee, #351) refuses every amount.
       const stats = this.computeStats(snapshot.docs.map((doc) => doc.data() as Transaction), this.now());
+      // (#354) Money owed in ANY currency blocks every withdrawal: a GHS or
+      // USD debit cannot be dodged by withdrawing NGN.
+      const owing = stats.byCurrency.find((row) => row.availableBalance < 0);
+      if (owing) throw new NegativeBalanceError(owing.currency);
       if (amount > availableBalanceIn(stats, WITHDRAWAL_CURRENCY)) {
         throw new InsufficientBalanceError();
       }
@@ -775,6 +824,177 @@ class TransactionService {
       },
       ...(fee.clientName !== undefined ? { clientName: fee.clientName } : {}),
       ...(fee.clientEmail !== undefined ? { clientEmail: fee.clientEmail } : {}),
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  /**
+   * Build (but do not write) the REFUND Transaction of a payment that could
+   * not be applied to its booking (issue #354): a `consultationPaymentExceptions`
+   * record. Written by `settlePayment` in the SAME Firestore transaction that
+   * records the exception, under the deterministic id `refundDocId(reference)`.
+   *
+   * MONEY (decision 2026-11-16, Seli never carries Paystack's fee): the
+   * `currency` is the exception's, exactly what Paystack charged in, never
+   * re-converted. The `amount` is decided by the caller from Paystack's own
+   * fee for the reference (`refundAmountMinor`):
+   *  - client-caused (`booking_not_payable`, `paid_on_superseded_...`): the
+   *    amount charged minus Paystack's fee, with the fee kept recorded as
+   *    `paystackFeeKeptMinor` (refunded + kept = charged);
+   *  - agent-caused (`paid_for_rescheduled_slot`): the full amount charged
+   *    (the agent is debited the fee in a separate row).
+   * The refund engine (`processRefund`) sends exactly `amount` to Paystack
+   * against the same reference.
+   *
+   * NOT THE AGENT'S MONEY: no fee Transaction was ever written for such a
+   * payment, so nothing was credited to the agent. The row therefore has NO
+   * `agentId` (it is in no agent's balance query and takes no withdrawal
+   * lock), `refundFundedFrom: "unapplied_payment"` (neutral in computeStats
+   * and `revenueEffect`), and no `refundOf`. It links back to the exception
+   * by `paymentExceptionId`, so the engine mirrors its status onto the
+   * exception, never onto the booking.
+   *
+   * `userId` is the client (it shows in their payment history as a refund).
+   * The row starts `pending`, due for its first Paystack call now.
+   */
+  buildUnappliedPaymentRefund(
+    id: string,
+    now: Timestamp,
+    input: {
+      /** The exception being refunded (its money is what Paystack charged). */
+      exception: {
+        id: string;
+        consultationId: string;
+        reference: string;
+        amountMinor: number;
+        currency: string;
+      };
+      /** The client's user uid (who paid, and who gets the money back). */
+      clientUserId: string;
+      /**
+       * Minor units of the exception's currency to give back: a safe
+       * positive integer, at most `exception.amountMinor`.
+       */
+      refundAmountMinor: number;
+      /**
+       * Client-caused refunds only: Paystack's fee kept out of the charge
+       * (`amountMinor - refundAmountMinor`). Omitted for agent-caused ones.
+       */
+      paystackFeeKeptMinor?: number;
+      /** Denormalised for the client's history and admin lists, when known. */
+      clientName?: string;
+      clientEmail?: string;
+    }
+  ): Transaction {
+    const ex = input.exception;
+    // Defence in depth: never a refund row of a non-positive amount, of more
+    // than was charged, or whose parts do not add up to the charge.
+    const refund = input.refundAmountMinor;
+    const kept = input.paystackFeeKeptMinor;
+    if (!isUsableAmount(refund) || refund <= 0 || refund > ex.amountMinor) {
+      throw new Error(`buildUnappliedPaymentRefund: refund ${refund} is not within the charge ${ex.amountMinor}`);
+    }
+    if (kept !== undefined && (!isUsableAmount(kept) || kept < 0 || refund + kept !== ex.amountMinor)) {
+      throw new Error(`buildUnappliedPaymentRefund: refund ${refund} + fee kept ${kept} != charge ${ex.amountMinor}`);
+    }
+    return {
+      id,
+      userId: input.clientUserId,
+      consultationId: ex.consultationId,
+      type: "refund",
+      // Minor units of the charged currency (see MONEY above).
+      amount: refund,
+      currency: ex.currency,
+      ...(kept !== undefined ? { paystackFeeKeptMinor: kept } : {}),
+      status: "pending",
+      isEscrow: false,
+      paymentProvider: "paystack",
+      // The CHARGE's Paystack reference: what POST /refund is called with.
+      providerTransactionId: ex.reference,
+      description: "Refund: consultation payment that could not be applied",
+      paymentExceptionId: ex.id,
+      reason: "payment_not_applied",
+      // Started by the system, not by a person.
+      initiatedBy: "system",
+      refundFundedFrom: "unapplied_payment",
+      balanceShortfallMinor: 0,
+      refundAttempts: 0,
+      refundProviderCalls: 0,
+      refundNextAttemptAt: now,
+      metadata: {
+        consultationId: ex.consultationId,
+        reference: ex.reference,
+      },
+      ...(input.clientName !== undefined ? { clientName: input.clientName } : {}),
+      ...(input.clientEmail !== undefined ? { clientEmail: input.clientEmail } : {}),
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  /**
+   * Build (but do not write) the DEBIT of Paystack's processing fee from an
+   * agent (issue #354, decision 2026-11-16): the agent side rescheduled a
+   * `pending_payment` booking after its quote lock, the client then paid the
+   * old checkout, and that payment is refunded to the client IN FULL.
+   * Paystack keeps its fee on a refunded charge; Seli never carries it, so
+   * the agent who caused the refund does.
+   *
+   * Written by the refund-of-an-unapplied-payment path in the SAME Firestore
+   * transaction as the exception and the refund row, under the deterministic
+   * id `feeDebitDocId(reference)` with `tx.create` (one debit ever per
+   * charge), and with the agent's `withdrawalLocks/{agentUid}` lock read and
+   * written (#287), so no concurrent withdrawal spends the money.
+   *
+   * MONEY: `amount` = Paystack's reported fee for that reference, in minor
+   * units of the CHARGE currency (never converted). `status: "completed"`:
+   * owed from the moment it is written. computeStats / `revenueEffect` take
+   * it off the agent's `totalRevenue` and `availableBalance` in that
+   * currency (may go below zero); `heldBalance` is untouched.
+   *
+   * `userId` and `agentId` are the AGENT (it is their money; a client's
+   * history query, `userId == client`, never returns it).
+   */
+  buildPaystackFeeDebit(
+    id: string,
+    now: Timestamp,
+    input: {
+      /** The booking's agent (user uid), who is debited. */
+      agentUserId: string;
+      /** The booking the refunded payment was for. */
+      consultationId: string;
+      /** The charge's Paystack reference (= the exception's doc id). */
+      reference: string;
+      /** Paystack's fee on that charge: a safe positive integer of minor units. */
+      feeMinor: number;
+      /** The charge currency. */
+      currency: string;
+    }
+  ): Transaction {
+    if (!isUsableAmount(input.feeMinor) || input.feeMinor <= 0) {
+      throw new Error(`buildPaystackFeeDebit: fee ${input.feeMinor} must be a safe positive integer`);
+    }
+    return {
+      id,
+      userId: input.agentUserId,
+      agentId: input.agentUserId,
+      consultationId: input.consultationId,
+      type: "paystack_fee_debit",
+      amount: input.feeMinor,
+      currency: input.currency,
+      status: "completed",
+      isEscrow: false,
+      paymentProvider: "paystack",
+      // The charge whose fee this is (admin traceability; agents only).
+      providerTransactionId: input.reference,
+      paymentExceptionId: input.reference,
+      description: "Payment processing fee on a refunded payment (consultation rescheduled)",
+      initiatedBy: "system",
+      metadata: {
+        consultationId: input.consultationId,
+        reference: input.reference,
+      },
       createdAt: now,
       updatedAt: now,
     };

@@ -134,11 +134,16 @@ const FULL_ROW: Required<Transaction> = {
     releaseAt: Timestamp.fromMillis(1_755_555_556_000),
   },
   refundOf: "HIDDEN-refunded-fee-id",
+  // Issue #354: the exception an unapplied-payment refund gives back (= a Paystack reference). Hidden.
+  paymentExceptionId: "HIDDEN-payment-exception-reference",
   reason: "admin_other",
   initiatedBy: "HIDDEN-initiating-uid",
   refundNote: "HIDDEN-admin-note",
   refundFundedFrom: "available",
   balanceShortfallMinor: 13_579,
+  // Issue #354: Paystack's fee kept out of a client-caused refund. Not on the
+  // client allow-list (the client is told it in the refund notification).
+  paystackFeeKeptMinor: 24_680,
   providerRefundId: "HIDDEN-paystack-refund-id",
   providerRefundStatus: "HIDDEN-paystack-refund-status",
   refundAttempts: 3,
@@ -205,11 +210,14 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   // row reaches the client as type "refund" + status + amount only.
   "feeHold",
   "refundOf",
+  // Issue #354: names a Paystack reference, so never shown to the client.
+  "paymentExceptionId",
   "reason",
   "initiatedBy",
   "refundNote",
   "refundFundedFrom",
   "balanceShortfallMinor",
+  "paystackFeeKeptMinor",
   "providerRefundId",
   "providerRefundStatus",
   "refundAttempts",
@@ -230,6 +238,7 @@ const HIDDEN_VALUES: readonly string[] = [
   "1733333333", // updatedAt seconds
   "1755555", // the #317 hold / refund timestamps
   "13579", // balanceShortfallMinor
+  "24680", // paystackFeeKeptMinor (#354)
   "admin_other", // reason
   "hold", // fxRateSource
   "delivered+hidden-client@resend.dev",
