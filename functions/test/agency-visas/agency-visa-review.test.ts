@@ -47,6 +47,7 @@ import { visaController } from "../../src/controllers/visa.controller";
 import { visaService } from "../../src/services/visa.service";
 import { agencyVisaService } from "../../src/agency-visas/agency-visa.service";
 import { parseAgencyVisaBody } from "../../src/agency-visas/agency-visa.validation";
+import { agencyVisaController } from "../../src/agency-visas/agency-visa.controller";
 import {
   agencyVisaReviewService,
   applyRevision,
@@ -620,13 +621,38 @@ describe("reject, then a new edit (#154)", () => {
     assert.equal(row.pendingRevision.reviewStatus, "rejected");
     assert.deepEqual(row.pendingRevision.changes, {});
 
-    // Admin list: the revision is not an open proposal any more.
+    // Admin list: the row is still the live visa, and it has NO open
+    // proposal. The admin list only attaches revisions that are
+    // `pending_review` (listForAdmin queries on that status), so a rejected
+    // revision gives `pendingRevision: null` here.
     const adminList = await list(admin());
+    assert.equal(adminList.status, 200);
     const adminRow = adminList.body.data.find((v: any) => v.id === id);
-    if (adminRow?.pendingRevision) {
-      assert.deepEqual(adminRow.pendingRevision.changes, {});
-      assert.notEqual(adminRow.pendingRevision.reviewStatus, "pending_review");
-    }
+    assert.ok(adminRow, "the approved visa is listed for the admin");
+    assert.equal(adminRow.name, "Visa c1");
+    assert.equal(adminRow.reviewStatus, "approved");
+    assert.equal(adminRow.pendingRevision, null);
+  });
+
+  test("GET /agency/visas/:id after a rejection: live values, revision carries the reason and no changes", async () => {
+    const id = seedApprovedWithRevision("c3", { name: "Edit A name" });
+    await review(admin(), id, { action: "reject", reason: "Name must match the CoS", revisionUpdatedAt: loaded });
+
+    // The agency's single-visa read, through the real controller + CASL.
+    const C = agencyVisaController;
+    const r = await call(C.get.bind(C), ownerA(), { params: { id } });
+    assert.equal(r.status, 200);
+    // Live values, not the rejected proposal.
+    assert.equal(r.body.data.name, "Visa c3");
+    assert.equal(r.body.data.reviewStatus, "approved");
+    assert.equal(r.body.data.isActive, true);
+    // The rejection reaches the agency with nothing left to go live.
+    const rev = r.body.data.pendingRevision;
+    assert.equal(rev.reviewStatus, "rejected");
+    assert.deepEqual(rev.changes, {});
+    assert.equal(rev.rejectionReason, "Name must match the CoS");
+    assert.equal(rev.reviewedBy, "uid-admin");
+    assert.ok(rev.reviewedAt);
   });
 
   test("reject edit A, submit edit B, approve B: only B's fields go live", async () => {

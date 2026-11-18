@@ -515,6 +515,54 @@ describe("clearing a price on a visa the agency can't see (#154)", () => {
     assert.deepEqual(writes, []);
   });
 
+  // ---- Review follow-ups: deleted visa, hidden catalog visa ----
+
+  test("a visa doc deleted after it was priced: own stale price is cleared (200); then 404 like an unknown id", async () => {
+    const id = seedGlobal("uk-gone");
+    await setPrice(ownerA(), id, usdBody(100));
+    store.delete(visaPath(id));
+    assert.equal((await clearPrice(ownerA(), id)).status, 200);
+    assert.equal(store.has(pricePath(AGENCY_A, id)), false);
+    // Nothing left to clear: same 404 body as an unknown id, nothing written.
+    writes.length = 0;
+    const again = await clearPrice(ownerA(), id);
+    const unknown = await clearPrice(ownerA(), "does-not-exist");
+    assert.equal(again.status, 404);
+    assert.deepEqual(again.body, unknown.body);
+    assert.deepEqual(writes, []);
+  });
+
+  test("a hidden catalog visa (inactive / unapproved scraped) with no price: 404 like setPrice and like unknown, nothing written", async () => {
+    seedGlobal("scraped-pending", { source: "scraped", reviewStatus: "pending_review", isActive: false });
+    seedGlobal("seed-inactive", { isActive: false });
+    const unknown = await clearPrice(ownerA(), "does-not-exist");
+    writes.length = 0;
+    for (const id of ["scraped-pending", "seed-inactive"]) {
+      const set = await setPrice(ownerA(), id, usdBody(1));
+      const del = await clearPrice(ownerA(), id);
+      const putNull = await setPrice(ownerA(), id, { priceUsd: null });
+      assert.equal(set.status, 404, `set ${id}`);
+      assert.equal(del.status, 404, `DELETE ${id}`);
+      assert.equal(putNull.status, 404, `PUT null ${id}`);
+      // Unknown and hidden are indistinguishable.
+      assert.deepEqual(del.body, unknown.body, id);
+      assert.deepEqual(putNull.body, unknown.body, id);
+    }
+    assert.deepEqual(writes, []);
+  });
+
+  test("a hidden catalog visa with the caller's own stale price: cleared (200), other agency's doc untouched", async () => {
+    const id = seedGlobal("seed-later-hidden");
+    await setPrice(ownerA(), id, usdBody(100));
+    await setPrice(ownerB(), id, usdBody(200));
+    const bPrice = clone(store.get(pricePath(AGENCY_B, id)));
+    (store.get(visaPath(id)) as any).isActive = false;
+    const r = await setPrice(ownerA(), id, { priceUsd: null });
+    assert.equal(r.status, 200);
+    assert.equal(store.has(pricePath(AGENCY_A, id)), false);
+    assert.deepEqual(store.get(pricePath(AGENCY_B, id)), bPrice);
+  });
+
   test("a visa the agency CAN see stays clearable and idempotent: own non-approved / inactive visa, public visa, no price set", async () => {
     // Own visas in every non-live state, each with a stale price.
     for (const [vid, over] of [

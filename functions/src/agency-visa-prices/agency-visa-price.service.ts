@@ -406,17 +406,18 @@ class AgencyVisaPriceService {
 
   /**
    * Clear this agency's price on one visa (the public page then says
-   * "Contact for pricing"). Deletes the price doc.
+   * "Contact for pricing"). Deletes the CALLER's price doc only, so it can
+   * never affect another agency.
    *
-   * Same visibility rule as `setPrice` (#154): an unknown visa, or one the
-   * agency may not see (another agency's agency visa that is not publicly
-   * visible), is a 404 NOT_FOUND with the same body as `setPrice`, and
-   * nothing is written. Exception: if the caller already holds its own
-   * (stale) price on that hidden visa, from when it was global, the clear
-   * removes it (200), so a stale price can always be removed. For a visa the agency CAN see (including its own non-approved
-   * visa) it is idempotent: clearing a price that is not set succeeds and
-   * writes nothing, so a stale price can still be removed. It only ever
-   * touches the CALLER's own subcollection, so it can't affect another agency.
+   * Visibility (#154), the same 404 rule as `setPrice`:
+   *  - Visible to the caller (publicly visible, or its OWN agency visa in any
+   *    state): 200, idempotent. A price that is not set writes nothing.
+   *  - Not visible (unknown id, deleted visa, another agency's agency-only
+   *    visa, a hidden catalog visa such as an inactive or unapproved one):
+   *    404 NOT_FOUND with the same body as an unknown id, nothing written...
+   *  - ...unless the caller already holds its own (stale) price doc there.
+   *    That doc proves the caller knew the visa, so deleting it leaks
+   *    nothing, and a stale price can always be removed (200).
    */
   async clearPrice(agencyId: string, target: VisaPriceTarget): Promise<void> {
     const visaRef = subcollections.visaTypes(target.countryCode).doc(target.visaTypeId);
@@ -424,27 +425,30 @@ class AgencyVisaPriceService {
       .agencyVisaPrices(agencyId)
       .doc(agencyVisaPriceId(target.countryCode, target.visaTypeId));
     await this.runTransaction(async (tx) => {
+      // ---- Reads first (Firestore transactions need them before writes) ----
       const [visaSnap, priceSnap] = await Promise.all([tx.get(visaRef), tx.get(priceRef)]);
-      if (!visaSnap.exists) throw visaNotFound();
-      const visa = { id: visaSnap.id, ...visaSnap.data() } as VisaType;
-      visa.countryCode = target.countryCode;
-      // Hidden = ANOTHER agency's agency visa that is not publicly visible.
-      // Its existence must not leak, so it gets the same 404 as an unknown
-      // id. Everything else (public visas, the agency's own visa in any
-      // state, a catalog visa that was deactivated since it was priced) stays
-      // clearable so a stale price can always be removed.
-      const hidden =
-        visa.source === AGENCY_VISA_SOURCE && !isOwnAgencyVisa(visa, agencyId) && !isVisaPubliclyVisible(visa);
-      if (hidden) {
-        // One exception, so a stale price is never stuck: the caller priced
-        // this visa while it was global and its owner has since taken it back
-        // to agency-only. The caller's OWN price doc proves it already knows
-        // the visa, so removing that doc leaks nothing. Without such a doc it
-        // is the plain 404 (nothing written), exactly like an unknown id.
+
+      // ---- Decide: can the caller see this visa? ----
+      // A missing visa doc counts as not visible (it may have been deleted
+      // after the caller priced it).
+      let visible = false;
+      if (visaSnap.exists) {
+        const visa = { id: visaSnap.id, ...visaSnap.data() } as VisaType;
+        // Trust the path over the doc's own countryCode field.
+        visa.countryCode = target.countryCode;
+        visible = isOwnAgencyVisa(visa, agencyId) || isVisaPubliclyVisible(visa);
+      }
+
+      // ---- Not visible: only the caller's own stale price can be removed ----
+      // With no price doc, unknown and hidden answer the same 404 body, so the
+      // response never tells whether a hidden visa exists.
+      if (!visible) {
         if (!priceSnap.exists) throw visaNotFound();
         tx.delete(priceRef);
         return;
       }
+
+      // ---- Visible: idempotent clear ----
       if (priceSnap.exists) tx.delete(priceRef);
     });
   }
