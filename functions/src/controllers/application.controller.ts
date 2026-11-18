@@ -1,6 +1,6 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { applicationService } from "../services/application.service";
+import { applicationService, TERMINAL_STATUSES } from "../services/application.service";
 import { userService } from "../services/user.service";
 import { messagingService } from "../services/messaging.service";
 import { notificationService } from "../services/notification.service";
@@ -1095,6 +1095,10 @@ export class ApplicationController {
    * PUT /applications/:id/status
    * Update application status.
    * Owner can only withdraw. Agent/admin can set any status.
+   *
+   * Applicant path (#259): only `withdrawn`, only while the application is
+   * still open (409 INVALID_STATUS_TRANSITION once it is closed), and the
+   * body's `currentStep` / `nextStep` / `rejectionReason` are ignored.
    */
   async updateStatus(
     req: AuthenticatedRequest,
@@ -1126,10 +1130,20 @@ export class ApplicationController {
         return;
       }
 
-      // Applicants can only withdraw their own applications
-      if (isApplicant && !isAdmin && status !== "withdrawn") {
-        const isAgentToo = application.agentId === userId;
-        if (!isAgentToo) {
+      // ============================================
+      // Applicant path (issue #259)
+      // ============================================
+      // The caller is the application's own applicant, and is neither an admin
+      // nor the application's agent. (An agent who is also the applicant of
+      // their own case keeps the agent path, as before.) Everything in this
+      // block applies ONLY to that caller: agents and admins fall straight
+      // through to the unchanged call below.
+      const isApplicantPath =
+        isApplicant && !isAdmin && application.agentId !== userId;
+
+      if (isApplicantPath) {
+        // 1. The only status an applicant may set is `withdrawn` (unchanged rule).
+        if (status !== "withdrawn") {
           sendError(
             res,
             "FORBIDDEN",
@@ -1138,14 +1152,34 @@ export class ApplicationController {
           );
           return;
         }
+
+        // 2. A closed application cannot be withdrawn: not one that was
+        //    decided (approved / rejected), one that lapsed (expired), nor one
+        //    already withdrawn. Without this an applicant could turn a granted
+        //    visa into "withdrawn", and a repeated withdraw added a second
+        //    timeline entry. Checked BEFORE any write, so a refusal stores
+        //    nothing (no status, no timeline entry, no activity note).
+        if (TERMINAL_STATUSES.includes(application.status)) {
+          sendError(
+            res,
+            "INVALID_STATUS_TRANSITION",
+            "This application is already closed.",
+            409
+          );
+          return;
+        }
       }
 
-      // Resolve the acting agent's name so the activity note attributes the change.
+      // Resolve the acting user's name so the activity note attributes the change.
       const actorName = await userService.getDisplayName(userId);
       const updated = await applicationService.updateStatus(id, status, {
-        currentStep,
-        nextStep,
-        rejectionReason,
+        // 3. Applicant path: the body's `currentStep`, `nextStep` and
+        //    `rejectionReason` are dropped. Those are the handler's fields (an
+        //    agent or admin records a step or a refusal reason); an applicant
+        //    must not be able to write them onto their own case, and the
+        //    reason would otherwise land in the activity note as "Reason: …".
+        //    Agents and admins: passed through exactly as before.
+        ...(isApplicantPath ? {} : { currentStep, nextStep, rejectionReason }),
         actorId: userId,
         actorName,
       });
