@@ -337,6 +337,12 @@ The portal seed creates:
 
 All IDs are deterministic (`seed-*`) so the script is idempotent.
 
+### E2E emulators and fixture (mobile Maestro suite)
+
+`firebase.e2e.json` (non-default ports, UI off) and `npm run seed:e2e`
+(emulator-only: full seed plus an approved rulebook and a free-plan client) are
+described in [docs/e2e-emulators.md](docs/e2e-emulators.md).
+
 ## API Testing (`api.http`)
 
 Test endpoints directly in VS Code using the [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension.

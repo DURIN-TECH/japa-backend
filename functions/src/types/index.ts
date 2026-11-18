@@ -485,6 +485,35 @@ export interface Country {
 //
 // Fields are absent (never `undefined`) when they do not apply, like
 // `VisaFeeMeta`.
+/**
+ * Issue #339: the citation of ONE fact of a shared route a record inherits
+ * (its processing time or its stay limit), shaped like `VisaSourcedFee`
+ * without the conversion block. `quote` is a list because one fact can need
+ * several sentences that are separate paragraphs in the source.
+ */
+export interface VisaSourcedFact {
+  /** The shared route whose source states the fact. */
+  sharedRouteId: string;
+  /** The sentence(s) of the official source that state the fact, word for word, in the source's order. */
+  quote: string[];
+  /** The official document the quote is from (https). */
+  url: string;
+  /** The stored official source the quote is in (`guidanceSources/{id}`). */
+  guidanceSourceId: string;
+}
+
+/**
+ * Issue #339: one citation per sourced fact on a record. A key is present
+ * only when the record carries that fact from a shared route:
+ *   - `processing` cites `processingTime` (and `processingDaysMin` /
+ *     `processingDaysMax` when the route states them),
+ *   - `validity` cites `validityPeriod`.
+ */
+export interface VisaSourcedFacts {
+  processing?: VisaSourcedFact;
+  validity?: VisaSourcedFact;
+}
+
 export interface VisaSourcedFee {
   /** The shared route whose source states the fee. */
   sharedRouteId: string;
@@ -577,6 +606,13 @@ export interface VisaType {
   // Written and removed ONLY by the countries/visas seed, together with
   // `baseCostUsd`; absent on every record whose fee has another origin.
   sourcedFee?: VisaSourcedFee;
+
+  // Issue #339: where `processingTime` / `processingDaysMax` and
+  // `validityPeriod` come from when they are facts of a shared route this
+  // record inherits (see `VisaSourcedFacts` below). Written and removed ONLY
+  // by the countries/visas seed, together with the fields they cite; absent
+  // on every record whose facts have another origin.
+  sourcedFacts?: VisaSourcedFacts;
 
   // Availability
   isActive: boolean;
@@ -1270,6 +1306,9 @@ export type ConsultationType =
   | "follow_up"
   | "general";
 
+/** Issue #321: how a consultation was booked (see `Consultation.bookedVia`). */
+export type ConsultationBookedVia = "client" | "agent" | "public_page";
+
 /**
  * A consultation booking.
  *
@@ -1288,6 +1327,22 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   agentId: string;
   agencyId?: string;
   applicationId?: string;
+
+  // Issue #321: HOW the booking was made, written once at creation and never
+  // changed. It decides whether an UNPAID booking proves that the client
+  // chose this agent (see `isClientOfAgent` in consultation.controller.ts):
+  //  - "client":      the client booked it themselves while signed in
+  //                   (client flow of POST /consultations). Counts as a
+  //                   relationship even when free or still unpaid.
+  //  - "agent":       an agent or owner booked it for the client (agent flow
+  //                   of POST /consultations). Counts only once PAID.
+  //  - "public_page": a guest booked it on an agency's public page by typing
+  //                   an email (POST /agencies/public/:slug/consultations).
+  //                   Anyone can type anyone's email, so it counts only once
+  //                   PAID.
+  // Absent on bookings made before #321: those count only once paid (no
+  // backfill; nothing had been released to real users).
+  bookedVia?: ConsultationBookedVia;
 
   // Denormalized display fields
   clientName: string;
@@ -1351,6 +1406,16 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   cancelledAt?: Timestamp;
   cancelledBy?: string;
   cancellationReason?: string;
+
+  // Refund (issue #317). Set when a refund row is written for this booking's
+  // fee (on a refundable cancel, or by an admin), and kept in step with that
+  // row's status by the refund engine (services/consultation-refund.service.ts).
+  // The booking's `paymentStatus` stays "paid": the client DID pay, and the
+  // #321 relationship check reads it. The refund is its own Transaction.
+  /** Doc id of the refund Transaction (`refund_<sha256 of the Paystack reference>`, see refundDocId). */
+  refundId?: string;
+  /** Mirror of the refund Transaction's status. */
+  refundStatus?: RefundStatus;
   
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -1369,6 +1434,25 @@ export interface SupersededCheckout extends ChargeSnapshot, Partial<QuoteLock> {
   reference: string;
   /** When it was replaced. */
   supersededAt: Timestamp;
+  /**
+   * Issue #354: set when the checkout was RETIRED because its booking was
+   * rescheduled (`PUT /consultations/:id` moved a `pending_payment` booking
+   * after its quote lock). Such a checkout was issued for the OLD slot, so a
+   * payment that lands on it later never confirms the booking: `settlePayment`
+   * records it as `paid_for_rescheduled_slot` and refunds it in full.
+   * Absent on a checkout replaced by an ordinary re-price.
+   */
+  retiredBy?: "reschedule";
+  /**
+   * Issue #354 review fix (fix round, 2026-11-17): the booking's `agentId`
+   * at the moment the reschedule retired this checkout, i.e. the agent whose
+   * move caused a later payment on it to be refunded. Paystack's fee on that
+   * refund is debited from THIS agent, not from whoever holds the booking
+   * when the payment lands (the case may be reassigned in between): whoever
+   * caused it pays. Entries retired before this field existed have none; the
+   * debit then falls back to the booking's agent at settle time.
+   */
+  retiredByAgentId?: string;
 }
 
 /**
@@ -1392,10 +1476,82 @@ export interface ConsultationPaymentException {
   currency: string;
   /** Paystack's own payment time (`paid_at`), when it reported one. */
   paystackPaidAt: Timestamp | null;
-  reason: "paid_on_superseded_reference_after_booking_paid" | "booking_not_payable";
-  /** Open until a human refunds it (no automated refund yet). */
-  status: "open";
+  /**
+   * Why the payment cannot be applied:
+   *  - "paid_on_superseded_reference_after_booking_paid": a second charge on
+   *    a booking another reference had already paid;
+   *  - "booking_not_payable": paid after the booking stopped awaiting
+   *    payment (cancelled while the payer was paying);
+   *  - "paid_for_rescheduled_slot" (issue #354): paid on a checkout that was
+   *    retired when the booking was rescheduled after its quote lock.
+   */
+  reason: "paid_on_superseded_reference_after_booking_paid" | "booking_not_payable" | "paid_for_rescheduled_slot";
+  /**
+   * Issue #354: every exception is refunded in full, automatically, through
+   * the #317 refund engine. `open` while that refund is on its way (or for an
+   * exception recorded before #354 that has no refund yet); `refunded` once
+   * Paystack reports it processed; `refund_failed` once the engine gave up
+   * (the refund row is `failed` and listed for an admin retry, which moves
+   * this back to `open`). Also `refund_failed`, with NO refund row, while the
+   * refund is held for an admin (`refundFailureReason`).
+   *
+   * Issue #354 fix round: `nothing_to_refund` once an admin has CLOSED a
+   * client-caused exception whose Paystack fee is the whole charge or more
+   * (`refundFailureReason: "fee_not_less_than_amount"`): under the fee rule
+   * the client is owed nothing, so there is no refund row, no Paystack call
+   * and no Transaction. A closed exception is final: it leaves the admin
+   * list and a later settle of the same reference never reopens it.
+   */
+  status: "open" | "refunded" | "refund_failed" | "nothing_to_refund";
+  /**
+   * Issue #354: the refund Transaction's doc id (`refundDocId(reference)`),
+   * written in the SAME Firestore transaction as this record.
+   */
+  refundId?: string;
+  /**
+   * Issue #354 (decision 2026-11-16): Paystack's processing fee on THIS
+   * charge, in minor units of `currency`, exactly as Paystack reported it for
+   * the reference (`data.fees` of verify / `charge.success`, or a fresh
+   * lookup). Never estimated. Absent while Paystack has not reported a
+   * well-formed figure: the refund is then held (`refundFailureReason:
+   * "paystack_fee_unknown"`).
+   */
+  paystackFeeMinor?: number;
+  /**
+   * Issue #354: why the refund is HELD for an admin with no refund row
+   * written (`status: "refund_failed"`):
+   *  - "paystack_fee_unknown": Paystack's data for the reference has no
+   *    well-formed `fees`, so who-pays-what cannot be worked out. Nothing is
+   *    guessed; an admin retry re-reads the reference at Paystack;
+   *  - "fee_not_less_than_amount": a client-caused refund where Paystack's
+   *    fee is the whole charge or more, so nothing is left to refund.
+   * Cleared once the refund row is written.
+   */
+  refundFailureReason?: "paystack_fee_unknown" | "fee_not_less_than_amount";
+  /**
+   * Issue #354: the agent's fee-debit Transaction (`feeDebitDocId(reference)`)
+   * of an agent-caused refund (`paid_for_rescheduled_slot`), written in the
+   * SAME Firestore transaction as the refund row. Absent for client-caused
+   * refunds and when Paystack's fee was 0.
+   */
+  feeDebitId?: string;
+  /**
+   * Issue #354 fix round: the agent who CAUSED an agent-caused exception
+   * (`paid_for_rescheduled_slot`), and so pays Paystack's fee: the
+   * `retiredByAgentId` of the retired checkout that was paid (the booking's
+   * agent when it was moved). Falls back to the booking's `agentId` at
+   * settle time for a checkout retired before that field existed. Fixed the
+   * first time the exception is planned, so a held refund retried later still
+   * debits the same agent. Absent for client-caused exceptions.
+   */
+  causedByAgentId?: string;
+  /** Issue #354 fix round: when an admin closed it as `nothing_to_refund`. */
+  closedAt?: Timestamp;
+  /** Issue #354 fix round: the admin (uid) who closed it as `nothing_to_refund`. */
+  closedBy?: string;
   createdAt: Timestamp;
+  /** Last change of `status` / `refundId` (absent until the first change). */
+  updatedAt?: Timestamp;
 }
 
 /**
@@ -1435,7 +1591,14 @@ export type TransactionType =
   | "government_fee"
   | "refund"
   | "escrow_release"
-  | "withdrawal";
+  | "withdrawal"
+  // Issue #354 (decision 2026-11-16): Paystack's processing fee on a refunded
+  // payment the AGENT side caused (a reschedule after the quote lock, then
+  // the client paid the old checkout), taken from the agent's balance. An
+  // outflow: lowers revenue and the available balance of its currency from
+  // the moment it is written, never `heldBalance`; may take it below zero.
+  // Never shown to the client.
+  | "paystack_fee_debit";
 
 export type TransactionStatus = 
   | "pending"
@@ -1445,6 +1608,84 @@ export type TransactionStatus =
   | "refunded"
   | "held_in_escrow"
   | "released";
+
+// ============================================
+// CONSULTATION REFUNDS AND FEE HOLDS (issue #317)
+// ============================================
+
+/**
+ * Why a consultation fee was refunded (issue #317). The first two come from a
+ * cancel (`PUT /consultations/:id/status`), the `admin_*` ones from the admin
+ * endpoint `POST /consultations/:id/refund`.
+ */
+export type RefundReason =
+  | "agent_cancelled"
+  | "client_cancelled"
+  | "admin_agent_no_show"
+  | "admin_goodwill"
+  | "admin_other"
+  // Issue #354: an automatic refund of a payment that could not be applied
+  // to its booking (a `consultationPaymentExceptions` record).
+  | "payment_not_applied";
+
+/**
+ * Where a refund row stands (issue #317). It only ever moves forward:
+ * `pending` (row written, Paystack not yet accepted) -> `processing`
+ * (Paystack accepted it) -> `completed` (Paystack `refund.processed`, final),
+ * or `failed` (Paystack `refund.failed`, or our retries ran out). Only an
+ * admin retry moves a `failed` row back to `pending`, and it re-uses the
+ * SAME row.
+ */
+export type RefundStatus = Extract<TransactionStatus, "pending" | "processing" | "completed" | "failed">;
+
+/**
+ * Where the money of a refund comes from (issue #317, #351 reversal):
+ *  - "hold": the fee was still HELD (the meeting had not happened yet), so
+ *    the refund is paid out of that held fee; the agent's available balance
+ *    does not move and the agent never had the money;
+ *  - "available": the fee had already been RELEASED to the agent (admin
+ *    override only), so the refund comes off the agent's available balance,
+ *    which may go below zero (withdrawals are then blocked until it is back
+ *    above zero). Seli never absorbs the shortfall;
+ *  - "unapplied_payment" (issue #354): the refund of a payment that never
+ *    confirmed the booking (a `consultationPaymentExceptions` record). No
+ *    fee Transaction was written for it, so nothing was ever credited to the
+ *    agent: the refund touches neither the agent's balances nor revenue, and
+ *    the row carries no `agentId` at all. The money given back is exactly
+ *    the money that came in on that reference.
+ */
+export type RefundFundedFrom = "hold" | "available" | "unapplied_payment";
+
+/**
+ * The hold on a consultation fee (issue #317, "hold consultation fees").
+ * Stored on the fee Transaction (`type: "consultation_fee"`) as `feeHold`.
+ *
+ * A paid fee is HELD (not withdrawable) until the meeting has happened:
+ *  - released at `releaseAt` (slot end + 24 hours) by the clock alone, or
+ *  - earlier, once the booking is marked `completed` (or the client
+ *    `no_show`) AND the slot has started (`meetingClosedAt` set and the clock
+ *    past `slotStartAt`). A booking marked complete before its slot even
+ *    started keeps its hold until the slot starts.
+ * `state` only ever records the two events the clock cannot see:
+ *  - "held": nothing happened yet (release is worked out from the times);
+ *  - "released": released for good (the legacy backfill writes this);
+ *  - "refunded": the held fee was refunded to the client (the refund row's
+ *    `refundFundedFrom` is "hold"); it is never released to the agent.
+ * The clock rule lives in ONE function, `feeHoldStatusAt` (money/fee-hold.ts).
+ */
+export interface FeeHold {
+  state: "held" | "released" | "refunded";
+  /** The slot start the hold was last computed for (only ever moves LATER). */
+  slotStartAt: Timestamp;
+  /** When the fee releases by itself: slot end + 24 hours (only ever moves LATER). */
+  releaseAt: Timestamp;
+  /** When the booking was marked completed / no_show (agent side). */
+  meetingClosedAt?: Timestamp;
+  /** When the hold was ended for good (`state` "released" or "refunded"). */
+  endedAt?: Timestamp;
+  /** What ended it: a refund, or the one-off legacy backfill. */
+  endedBy?: "refund" | "legacy_backfill";
+}
 
 /**
  * One financial event.
@@ -1498,6 +1739,70 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   clientName?: string;
   clientEmail?: string;
   visaTypeName?: string;
+
+  // ---- Issue #317: the hold on a consultation fee (type "consultation_fee") ----
+  /** See `FeeHold`. Absent on a fee written before #317 (counted as held until backfilled). */
+  feeHold?: FeeHold;
+
+  // ---- Issue #317: a consultation refund (type "refund") ----
+  // Refund rows are written by the backend only (firestore.rules deny every
+  // client). `amount` + `currency` equal the refunded fee's, in minor units.
+  /** Doc id of the consultation_fee Transaction this refund gives back. */
+  refundOf?: string;
+  /**
+   * Issue #354: on the refund of a payment that could not be applied, the
+   * `consultationPaymentExceptions` doc id it refunds (= the Paystack
+   * reference). The refund engine mirrors the row's status onto THAT record,
+   * never onto the booking (whose `refundId` / `refundStatus` belong to the
+   * booking's own fee).
+   *
+   * Also set on a `paystack_fee_debit` row (issue #354): the exception whose
+   * Paystack fee it debits the agent for.
+   */
+  paymentExceptionId?: string;
+  /** Why it was refunded. */
+  reason?: RefundReason;
+  /** Uid of who started it (the cancelling user, or the admin). */
+  initiatedBy?: string;
+  /** The admin's note (required for reason `admin_other`). */
+  refundNote?: string;
+  /** Held fee or available balance (see RefundFundedFrom). */
+  refundFundedFrom?: RefundFundedFrom;
+  /**
+   * #351: when a released fee is refunded, how far the refund took the
+   * agent's available balance below zero (minor units of `currency`), at the
+   * moment the row was written. 0 when the balance covered it. Admin-visible.
+   */
+  balanceShortfallMinor?: number;
+  /**
+   * Issue #354: on the refund of a CLIENT-caused unapplied payment, the part
+   * of the charge Paystack kept as its processing fee (minor units of
+   * `currency`). `amount` + this = what the client was charged, so Seli
+   * carries none of it.
+   */
+  paystackFeeKeptMinor?: number;
+  /** Paystack's id of the refund, once Paystack has one. */
+  providerRefundId?: string;
+  /** Paystack's own refund status as last seen ("pending", "processed", ...). */
+  providerRefundStatus?: string;
+  /** How many times the engine has tried (claimed) the Paystack call. */
+  refundAttempts?: number;
+  /**
+   * How many times a Paystack create-refund call was really STARTED for
+   * this row. Above 0, any further try first looks the refund up at
+   * Paystack (a call may have gone through before a crash or a timeout).
+   */
+  refundProviderCalls?: number;
+  /** When a pending row is next due for a retry (the 15-minute job reads it). */
+  refundNextAttemptAt?: Timestamp;
+  /** While set in the future, another worker is talking to Paystack for this row. */
+  refundLeaseUntil?: Timestamp;
+  /** The last error from Paystack, for admins. */
+  refundLastError?: string;
+  /** When Paystack reported the refund processed. */
+  refundedAt?: Timestamp;
+  /** When the row became `failed`. */
+  refundFailedAt?: Timestamp;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -1665,6 +1970,10 @@ export type NotificationType =
   | "consultation_rescheduled"
   | "consultation_cancelled"
   | "consultation_completed"
+  // Issue #317: a consultation fee was refunded (client: "on its way"; agent:
+  // the fee was given back), and a refund that is delayed (failed at Paystack).
+  | "consultation_refunded"
+  | "consultation_refund_delayed"
   // Payments
   | "payment_received"
   | "payment_request"
@@ -1771,11 +2080,24 @@ export interface Message {
   createdAt: Timestamp;
 }
 
+/** Issue #321: which side opened a conversation (see `Conversation.startedBy`). */
+export type ConversationStartedBy = "user" | "agent";
+
 export interface Conversation {
   id: string;
   userId: string;
   agentId: string;
   applicationId?: string;
+
+  // Issue #321: WHICH SIDE opened the conversation, written once when it is
+  // created and never changed. "user" = the client opened it themselves;
+  // "agent" = the agent side (or the backend on the agent's behalf, e.g. when
+  // an agent creates an application) opened it. An agent can open a
+  // conversation with any uid, so only a "user"-started conversation, or one
+  // the client has sent a message in, proves the client knows the agent (see
+  // `isClientOfAgent` in consultation.controller.ts). Absent on conversations
+  // made before #321: those count only through the client-message check.
+  startedBy?: ConversationStartedBy;
 
   lastMessageAt: Timestamp;
   lastMessage?: string;
@@ -2055,4 +2377,61 @@ export interface Feedback {
   /** Triage state; the team edits this in the console. */
   status: "new";
   createdAt: Timestamp;
+}
+
+// ============================================
+// SAVED DESTINATIONS (issue #146)
+// ============================================
+//
+// A client "saves" a destination (one visa in one country) with the heart on
+// its screen. Each save is ONE document under the user:
+//   users/{uid}/savedDestinations/{COUNTRYCODE}_{visaId}
+// Backend only (firestore.rules denies every client read and write); the app
+// goes through GET / PUT / DELETE /users/me/saved-destinations.
+
+/**
+ * The stored save. It holds only the key and the time: the visa's name, fee
+ * and so on are read from the visa when the list is served, so a tile never
+ * shows stale data and a visa that is hidden later drops out of the list.
+ */
+export interface SavedDestination {
+  /** ISO 3166-1 alpha-2, always UPPER CASE ("GB"), whatever case was sent. */
+  countryCode: string;
+  /** Id of the visa: countries/{countryCode}/visaTypes/{visaId}. */
+  visaId: string;
+  /** When the user first saved it. Saving again does not move it. */
+  savedAt: Timestamp;
+}
+
+/**
+ * The part of a visa a destination tile draws. An allow-list on purpose: the
+ * saved list never returns a visa's internal fields (review state, scrape
+ * provenance, owning agency...). The names match `VisaType`, so the mobile
+ * tile mapper takes this object as it takes a visa.
+ */
+export interface SavedDestinationVisa {
+  id: string;
+  /** UPPER CASE, same as the item's `countryCode`. */
+  countryCode: string;
+  name: string;
+  description: string;
+  category: VisaCategory;
+  /** Display text, e.g. "3 weeks". */
+  processingTime: string;
+  /** Government fee in US dollars. */
+  baseCostUsd: number;
+  /** Percent, or null when not known. */
+  successRate: number | null;
+  /** Null when not counted yet. */
+  totalApplications: number | null;
+  /** Where the visa record came from ("scraped", "agency"...), or null for a seed. */
+  source: VisaType["source"] | null;
+}
+
+/** One saved destination as the API returns it (list item and PUT result). */
+export interface SavedDestinationItem extends SavedDestination {
+  /** The country's display name ("United Kingdom"); the code when the country record is missing. */
+  countryName: string;
+  /** What the tile needs, read from the visa at request time. */
+  visa: SavedDestinationVisa;
 }

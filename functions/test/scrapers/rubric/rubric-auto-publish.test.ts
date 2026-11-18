@@ -60,6 +60,8 @@ import { adminRubricRoutes } from "../../../src/routes/rubric-review.routes";
 import { A_LINES, A_TEXT, ROUTE_A, SOURCE_A_ID, SOURCE_A_URL, SOURCE_B_ID, SOURCE_B_URL, B_PAGES } from "./fixtures/synthetic-guidance";
 import { headDoc, installRubricFakes, quiet, resetBucket, seedSource, snapshotStore, versionDoc } from "./rubric-harness";
 import { A2_POLARITY_QUOTE, A2_TEXT, A_POLARITY_QUOTE, KEY_A, KEY_B, REVIEW_T0, body, criterion, draft, routeBV1, sourceA } from "./rubric-review-fixtures";
+// #322: the shared rule for the country-code check (comments and sentences are ignored).
+import { findCountryCode } from "../../helpers/country-code-guard";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -1255,7 +1257,10 @@ describe("auto-publish: no second approval path, and the new files are generic",
     const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     for (const [file, text] of sources) {
       for (const n of names) assert.doesNotMatch(text, new RegExp(`\\b${esc(n)}\\b`, "i"), `${file}: ${n}`);
-      for (const c of codes) assert.doesNotMatch(text, new RegExp(`\\b${c}\\b`), `${file}: ${c}`);
+      // #322: a code is searched in the CODE only (test/helpers/country-code-guard.ts):
+      // inside a comment or a sentence string it is an English word ("NO", "IS");
+      // an identifier, a whole string literal or a string with no space still fails.
+      for (const c of codes) assert.equal(findCountryCode(text, c), null, `${file}: ${c}`);
       assert.doesNotMatch(text, /https?:\/\/[a-z0-9.-]+\.[a-z]{2,}/i, `${file} has a URL`);
     }
   });

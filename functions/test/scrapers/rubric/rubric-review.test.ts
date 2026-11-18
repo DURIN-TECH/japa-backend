@@ -46,6 +46,8 @@ import { diffRubricVersions } from "../../../src/services/rubric-diff";
 import { A_LINES, A_TEXT, B_PAGES, ROUTE_A, ROUTE_B, SOURCE_A_ID, SOURCE_A_URL, SOURCE_B_ID, SOURCE_B_URL } from "./fixtures/synthetic-guidance";
 import { installRubricFakes, quiet, resetBucket, seedSource, snapshotStore, objects, headDoc, versionDoc } from "./rubric-harness";
 import { A2_TEXT, KEY_A, KEY_B, REVIEW_T0, body, criterion, draft, routeAV1, routeAV2, routeBV1, sourceA } from "./rubric-review-fixtures";
+// #322: the shared rule for the country-code check (comments and sentences are ignored).
+import { hasCountryCode } from "../../helpers/country-code-guard";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -1631,7 +1633,10 @@ describe("rubric review: names no country, route, nationality or role literal", 
     for (const name of names) assert.deepEqual(offenders(new RegExp(`\\b${esc(name)}\\b`, "i")), [], `name "${name}"`);
     const codes = seedValues(COUNTRY_SEED, ["code", "countryCode"]).filter((c) => /^[A-Z]{2}$/.test(c));
     assert.ok(codes.length >= 12, "the seed was parsed");
-    for (const code of codes) assert.deepEqual(offenders(new RegExp(`\\b${code}\\b`)), [], `country code ${code}`);
+    // #322: a code is searched in the CODE only (test/helpers/country-code-guard.ts):
+    // inside a comment or a sentence string it is an English word ("NO", "IS");
+    // an identifier, a whole string literal or a string with no space still fails.
+    for (const code of codes) assert.deepEqual([...sources].filter(([, text]) => hasCountryCode(text, code)).map(([file]) => file), [], `country code ${code}`);
     const ids = seedValues(COUNTRY_SEED, ["id", "code"]).filter((v) => v.length >= 5 && /[-\d]/.test(v));
     for (const id of ids) assert.deepEqual(offenders(new RegExp(`(^|[^a-z0-9-])${esc(id)}([^a-z0-9-]|$)`, "i")), [], `visa id "${id}"`);
   });

@@ -124,11 +124,18 @@ describe("stage 2 evaluation is code, not the model", () => {
     assert.ok(results.every((r) => r.outcome === "insufficient"));
   });
 
-  test("a field that is absent from fully read documents is a fail", () => {
-    const result = evaluateObjective(routeARubric(), {}, [doc("d1", [{ field: "funds.balance", value: 3000, unit: "GBP" }])]).find(
-      (r) => r.criterionId === "a-period"
-    );
+  test("a field that is absent from fully read documents is a fail when the rulebook names a document for the rule", () => {
+    // (#308) A missing field fails only a rule that a document item of the
+    // rulebook names; the full set of cases is in review-inapplicable-rules.test.ts.
+    const rubric = routeARubric();
+    rubric.evidenceItems = [{ key: "statement", title: "Bank statement", party: "applicant", criterionIds: ["a-period"], source: criterion({ criterionId: "x", kind: "objective", stage: "eligibility", severity: "low", title: "x" }).source }];
+    const docs = [doc("d1", [{ field: "funds.balance", value: 3000, unit: "GBP" }])];
+    const result = evaluateObjective(rubric, {}, docs).find((r) => r.criterionId === "a-period");
     assert.equal(result?.outcome, "fail");
+    assert.equal(result?.reason, "We couldn't find this in your documents: Bank statement");
+    // Without a document item the same missing field is "not in documents", never a fail.
+    const unnamed = evaluateObjective(routeARubric(), {}, docs).find((r) => r.criterionId === "a-period");
+    assert.deepEqual([unnamed?.outcome, unnamed?.notAssessed], ["insufficient", "not_in_documents"]);
   });
 
   test("a document that addressed the model cannot satisfy any criterion", () => {
@@ -558,7 +565,7 @@ describe("identity and settings", () => {
   test("a missing or unreadable settings value falls back to its default, and a bad range is refused", () => {
     const merged = mergeAiSettings({ maxRequestsPerAssessment: 0, enabled: false, maxFileBytes: "big" });
     assert.equal(merged.enabled, false);
-    assert.equal(merged.maxRequestsPerAssessment, 12, "0 is out of range, so the default applies");
+    assert.equal(merged.maxRequestsPerAssessment, 30, "0 is out of range, so the default applies (30 since #310)");
     assert.equal(merged.maxFileBytes, 10 * 1024 * 1024);
   });
 });

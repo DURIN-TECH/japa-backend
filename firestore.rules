@@ -104,6 +104,18 @@ service cloud.firestore {
 
       // Only admins can delete users
       allow delete: if isAdmin();
+
+      // ---- Saved destinations (issue #146), explicit deny ----
+      // users/{userId}/savedDestinations/{COUNTRYCODE}_{visaId}: one document
+      // per destination the user saved. Read and written ONLY by the backend
+      // (Admin SDK) behind GET / PUT / DELETE /users/me/saved-destinations,
+      // which checks that the visa is publicly visible and enforces the
+      // 200-save cap and the read-only-plan write block. A client that could
+      // write here directly would skip all three, so every client is denied,
+      // the owner and admins included.
+      match /savedDestinations/{saveId} {
+        allow read, write: if false;
+      }
     }
     
     // =====================================    // AGENTS COLLECTION
@@ -422,10 +434,23 @@ service cloud.firestore {
     // =====================================    // CONSULTATIONS COLLECTION
     // =====================================    
     match /consultations/{consultationId} {
-      // Users can read their own consultations
-      // Agents can read their consultations
-      allow read: if isOwner(resource.data.userId) ||
-                    (isAgent() && 
+      // The booking's CLIENT cannot read it directly (issue #332). A
+      // consultation document holds Seli's exchange-rate markup
+      // (fxMarginBps) and the raw rate it is added to (fxRate, fxRateAsOf,
+      // fxRateSource), on the booking itself and again on every entry of
+      // supersededCheckouts. Firestore rules allow or deny a whole document,
+      // never single fields, so "the client may read their own booking"
+      // meant "the client may read the markup", bypassing the API. Neither
+      // the app nor the portal reads this collection through the client
+      // SDK: clients go through GET /consultations, which answers them with
+      // an allow-listed view (toClientConsultation: the amount charged, the
+      // dollar price and the effective rate only).
+      //
+      // The agent side is unchanged: the booking's agent (agent claim + the
+      // agents doc's userId) and an admin may still read it; they see these
+      // fields through the API as well. Pinned by
+      // test/emulator/consultation-rules.emu.ts.
+      allow read: if (isAgent() && 
                      exists(/databases/$(database)/documents/agents/$(resource.data.agentId)) &&
                      get(/databases/$(database)/documents/agents/$(resource.data.agentId)).data.userId == request.auth.uid) ||
                     isAdmin();
@@ -447,12 +472,18 @@ service cloud.firestore {
     
     // =====================================    // TRANSACTIONS COLLECTION
     // =====================================    
+    // Backend (Admin SDK) only, explicit deny (issue #329). A transaction
+    // document holds Seli's exchange-rate markup (fxMarginBps), the raw rate,
+    // internal agent ids and Paystack references. Before #329 the payer could
+    // read their own document straight from Firestore with their token, and
+    // so see all of that, bypassing the API. Neither the app nor the portal
+    // reads this collection directly: both go through GET /transactions,
+    // which gives a client an allow-listed view (toClientTransaction) and
+    // applies the role checks for agents, owners and admins. Denied for
+    // every client, admins included. Pinned by
+    // test/emulator/backend-only-collections.emu.ts.
     match /transactions/{transactionId} {
-      // Users can read their own transactions
-      allow read: if isOwner(resource.data.userId) || isAdmin();
-      
-      // Only system (via Cloud Functions) can create/update transactions
-      allow write: if false;
+      allow read, write: if false;
     }
     
     // =====================================    // NOTIFICATIONS COLLECTION
@@ -709,6 +740,29 @@ service cloud.firestore {
     // feedbackUploadLimits/{uid}__{hour}: rate-limit counters for feedback
     // screenshot upload URLs (issue #257). Backend only.
     match /feedbackUploadLimits/{limitId} {
+      allow read, write: if false;
+    }
+
+    // ---- Withdrawal locks (issue #287), explicit deny ----
+    // withdrawalLocks/{agentUserId}: one document per agent, read and written
+    // by the backend inside the withdrawal transaction so that two
+    // withdrawals of one agent can never both pass the balance check
+    // (POST /bank-accounts/withdraw). Backend (Admin SDK) only: a client that
+    // could write it could make an agent's withdrawals fail. Denied for every
+    // client, admins included.
+    match /withdrawalLocks/{agentUserId} {
+      allow read, write: if false;
+    }
+
+    // ---- Consultation booking locks (issue #288), explicit deny ----
+    // consultationBookingLocks/{hash of client uid + agent uid}: one document
+    // per client and agent pair, read and written by the backend inside the
+    // find-or-create transaction of POST /consultations (client flow), so two
+    // creates for the same slot can never both write a booking. Backend
+    // (Admin SDK) only: it names who books whom, and a client that could
+    // write it could make another client's bookings fail. Denied for every
+    // client, admins included.
+    match /consultationBookingLocks/{lockId} {
       allow read, write: if false;
     }
   }

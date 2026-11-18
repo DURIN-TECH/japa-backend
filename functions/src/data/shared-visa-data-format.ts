@@ -32,7 +32,9 @@ import { SHARED_VISA_DATA } from "./shared-visa-data";
 //   sharedRoutes  the shared visa routes those authorities issue, and which
 //                 visa records (country + visa id) inherit each one; and,
 //                 optionally, the government FEE the route's source sets
-//                 for every member (issue #299), with its verbatim quote
+//                 for every member (issue #299), with its verbatim quote;
+//                 and, optionally, its PROCESSING time and stay limit
+//                 (`validity`), each with its verbatim quote (issue #339)
 //
 // The file shipped in the repo is EMPTY (`{ authorities: [], sharedRoutes: [] }`):
 // the real contents are entered by the owner, never invented by code. The
@@ -111,6 +113,50 @@ export interface DataRouteFee {
   ruleRef?: DataFeeRuleRef;
 }
 
+// ---- Issue #339: the route's processing time and stay limit ----
+//
+// Like the fee, these are LEGAL FACTS the route's official source states once
+// for every member. Each is recorded once, on the route, with the verbatim
+// sentence(s) that state it, and the seed writes the display value on every
+// record listed under `inheritedBy` (see seed-route-facts.ts).
+//
+// What a block "writes" is its display text plus any day count it carries.
+// Every number in those is a figure, and the validator refuses the file when
+// a figure is not stated in the block's quote: a value can never be typed
+// next to a quote that says something else.
+
+/** Where a route fact comes from: the same three things a fee's source has. */
+export interface DataRouteFactSource {
+  /**
+   * The sentence(s) of the official source that state the fact, word for
+   * word, in the source's order. A list because one fact may need several
+   * sentences that are separate paragraphs in the source (for example a
+   * normal period and its extended maximum); each one is found on its own,
+   * character for character, in the source.
+   */
+  quote: string[];
+  /** The official document the quote is from (https). */
+  url: string;
+  /** The stored official source the quote is in (`guidanceSources/{id}`). The seed writes no fact while that document does not exist. */
+  guidanceSourceId: string;
+}
+
+/** The route's processing time (#339). */
+export interface DataRouteProcessing extends DataRouteFactSource {
+  /** The text the app shows, written as the record's `processingTime`. */
+  processingTime: string;
+  /** Optional: the shortest processing time in days, when the source states one. Never written as 0. */
+  processingDaysMin?: number;
+  /** Optional: the longest processing time in days, when the source states one. */
+  processingDaysMax?: number;
+}
+
+/** The route's stay limit / validity (#339). */
+export interface DataRouteValidity extends DataRouteFactSource {
+  /** The text the app shows under "Valid for", written as the record's `validityPeriod`. */
+  validityPeriod: string;
+}
+
 /** A shared visa route and the records that inherit it. */
 export interface DataSharedRoute {
   id: string;
@@ -123,6 +169,10 @@ export interface DataSharedRoute {
   inheritedBy: DataInheritor[];
   /** #299: the fee the route's source sets for every member. Absent when none is recorded (the field is never written empty). */
   fee?: DataRouteFee;
+  /** #339: the processing time the route's source sets for every member. Absent when none is recorded. */
+  processing?: DataRouteProcessing;
+  /** #339: the stay limit the route's source sets for every member. Absent when none is recorded. */
+  validity?: DataRouteValidity;
 }
 
 /** The whole file. */
@@ -245,6 +295,133 @@ function readRouteFee(raw: unknown, at: string, errors: string[]): DataRouteFee 
 
   if (errors.length > before) return undefined;
   return { amount: amount as number, currency: currency as string, label, quote, url, guidanceSourceId, ...(ruleRef ? { ruleRef } : {}) };
+}
+
+// ---- The processing time and stay limit of a shared route (issue #339) ----
+
+/** The only fields a `processing` block may have. */
+const PROCESSING_FIELDS = ["processingTime", "processingDaysMin", "processingDaysMax", "quote", "url", "guidanceSourceId"];
+/** The only fields a `validity` block may have. */
+const VALIDITY_FIELDS = ["validityPeriod", "quote", "url", "guidanceSourceId"];
+
+/** True for an https address (the same rule as a fee's and a member's address). */
+function isHttpsUrl(url: string): boolean {
+  try {
+    return new URL(url).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every number a display text states, read the way `quoteStatesAmount` reads
+ * a quote ("15", "1,500", "2.5"). "180-day" gives 180: the hyphen ends the number.
+ */
+export function figuresIn(text: string): number[] {
+  return (text.match(/\d+(?:[.,]\d+)*/g) ?? []).map((n) => Number(n.replace(/,/g, "")));
+}
+
+/**
+ * Check the source half of a fact block (`quote`, `url`, `guidanceSourceId`).
+ * Pushes every problem onto `errors` and returns the trimmed sentences, plus
+ * the normalised source when it has no problem. Each sentence is only trimmed: its characters (including any
+ * non-breaking space the source uses) are kept exactly as copied.
+ */
+function readFactSource(raw: Record<string, unknown>, at: string, errors: string[]): { source?: DataRouteFactSource; quote: string[] } {
+  const before = errors.length;
+  // The quote: a non-empty list of non-empty sentences.
+  const rawQuote = raw.quote;
+  const quote = Array.isArray(rawQuote) ? rawQuote.map((s) => (typeof s === "string" ? s.trim() : "")) : [];
+  if (!Array.isArray(rawQuote) || quote.length === 0) errors.push(`${at}.quote is required (a list of one or more sentences of the official source, word for word)`);
+  else quote.forEach((s, i) => s === "" && errors.push(`${at}.quote[${i}] must be a non-empty sentence`));
+
+  const url = typeof raw.url === "string" ? raw.url.trim() : "";
+  if (!isHttpsUrl(url)) errors.push(`${at}.url must be an https address`);
+
+  const guidanceSourceId = typeof raw.guidanceSourceId === "string" ? raw.guidanceSourceId.trim() : "";
+  if (!guidanceSourceId) errors.push(`${at}.guidanceSourceId is required (the id of the stored official source the quote is in)`);
+
+  // The quote is returned even when the url or id has a problem, so the
+  // figure check still runs and every problem is listed in one pass.
+  return { quote, ...(errors.length > before ? {} : { source: { quote, url, guidanceSourceId } }) };
+}
+
+/**
+ * Refuse every figure the block writes that its quote does not state.
+ * `written` is the display text; `days` are the day counts the block writes.
+ */
+function checkFiguresStated(quote: string[], written: string, days: number[], at: string, errors: string[]): void {
+  // A missing or empty sentence is already reported; check against what is there.
+  if (quote.length === 0 || quote.some((s) => s === "")) return;
+  const figures = [...new Set([...figuresIn(written), ...days])];
+  for (const f of figures) {
+    if (!quote.some((sentence) => quoteStatesAmount(sentence, f))) errors.push(`${at}.quote does not state the figure ${f} that the block writes`);
+  }
+}
+
+/**
+ * Check one route's `processing` block. Returns the normalised block, or
+ * undefined when it has any problem (every problem is in `errors`).
+ */
+function readRouteProcessing(raw: unknown, at: string, errors: string[]): DataRouteProcessing | undefined {
+  if (!isObject(raw)) {
+    errors.push(`${at} must be an object { processingTime, processingDaysMax?, processingDaysMin?, quote, url, guidanceSourceId }`);
+    return undefined;
+  }
+  const before = errors.length;
+  for (const k of Object.keys(raw)) if (!PROCESSING_FIELDS.includes(k)) errors.push(`${at}.${k} is not a known field`);
+
+  const processingTime = typeof raw.processingTime === "string" ? raw.processingTime.trim() : "";
+  if (!processingTime) errors.push(`${at}.processingTime is required (the text the app shows)`);
+
+  // Day counts: optional, but a present one is a whole number of at least 1
+  // (an unstated minimum is LEFT OUT, never written as 0).
+  const readDays = (field: "processingDaysMin" | "processingDaysMax"): number | undefined => {
+    const v = raw[field];
+    if (v === undefined) return undefined;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1) {
+      errors.push(`${at}.${field} must be a whole number of days, 1 or more (leave it out when the source states none)`);
+      return undefined;
+    }
+    return v;
+  };
+  const processingDaysMin = readDays("processingDaysMin");
+  const processingDaysMax = readDays("processingDaysMax");
+  if (processingDaysMin !== undefined && processingDaysMax !== undefined && processingDaysMin > processingDaysMax) {
+    errors.push(`${at}.processingDaysMin must be less than or equal to processingDaysMax`);
+  }
+
+  const { source, quote } = readFactSource(raw, at, errors);
+  const days = [processingDaysMin, processingDaysMax].filter((d): d is number => d !== undefined);
+  checkFiguresStated(quote, processingTime, days, at, errors);
+
+  if (errors.length > before || !source) return undefined;
+  return {
+    processingTime,
+    // Absent stays absent (no `undefined` key reaches the seed's doc).
+    ...(processingDaysMin !== undefined ? { processingDaysMin } : {}),
+    ...(processingDaysMax !== undefined ? { processingDaysMax } : {}),
+    ...source,
+  };
+}
+
+/** Check one route's `validity` block (same rules as `processing`, without day counts). */
+function readRouteValidity(raw: unknown, at: string, errors: string[]): DataRouteValidity | undefined {
+  if (!isObject(raw)) {
+    errors.push(`${at} must be an object { validityPeriod, quote, url, guidanceSourceId }`);
+    return undefined;
+  }
+  const before = errors.length;
+  for (const k of Object.keys(raw)) if (!VALIDITY_FIELDS.includes(k)) errors.push(`${at}.${k} is not a known field`);
+
+  const validityPeriod = typeof raw.validityPeriod === "string" ? raw.validityPeriod.trim() : "";
+  if (!validityPeriod) errors.push(`${at}.validityPeriod is required (the text the app shows under "Valid for")`);
+
+  const { source, quote } = readFactSource(raw, at, errors);
+  checkFiguresStated(quote, validityPeriod, [], at, errors);
+
+  if (errors.length > before || !source) return undefined;
+  return { validityPeriod, ...source };
 }
 
 /**
@@ -382,8 +559,21 @@ export function validateSharedVisaData(raw: unknown): SharedVisaDataCheck {
     // #299: the optional fee. Absent stays absent; a present one must be complete
     // (any problem is in `errors`, so the whole file is refused).
     const fee = r.fee === undefined ? undefined : readRouteFee(r.fee, `${rt}.fee`, errors);
+    // #339: the optional processing time and stay limit, same rule as the fee.
+    const processing = r.processing === undefined ? undefined : readRouteProcessing(r.processing, `${rt}.processing`, errors);
+    const validity = r.validity === undefined ? undefined : readRouteValidity(r.validity, `${rt}.validity`, errors);
     if (idCheck.ok && name && category && issuer && destinations) {
-      sharedRoutes.push({ id: idCheck.id, name, category, issuingAuthorityId: issuer.id, destinations, inheritedBy, ...(fee ? { fee } : {}) });
+      sharedRoutes.push({
+        id: idCheck.id,
+        name,
+        category,
+        issuingAuthorityId: issuer.id,
+        destinations,
+        inheritedBy,
+        ...(fee ? { fee } : {}),
+        ...(processing ? { processing } : {}),
+        ...(validity ? { validity } : {}),
+      });
     }
   });
 
@@ -427,4 +617,26 @@ export function routeFeesFor(data: SharedVisaData, countryCode: string, visaType
   return data.sharedRoutes
     .filter((r) => r.fee !== undefined && r.inheritedBy.some((x) => x.countryCode === countryCode && x.visaTypeId === visaTypeId))
     .map((r) => ({ sharedRouteId: r.id, fee: r.fee as DataRouteFee }));
+}
+
+/** The route facts of one shared route, with the route they belong to (issue #339). */
+export interface RouteFactsFor {
+  sharedRouteId: string;
+  /** Absent when the route records no processing time. */
+  processing?: DataRouteProcessing;
+  /** Absent when the route records no stay limit. */
+  validity?: DataRouteValidity;
+}
+
+/**
+ * The route facts (processing time, stay limit) a visa record takes on,
+ * according to the data file: one entry per shared route that lists the
+ * record under `inheritedBy` AND records at least one fact. `[]` for every
+ * other record, so the seed's fact logic never touches a record the data
+ * file does not list (issue #339, same rule as `routeFeesFor`).
+ */
+export function routeFactsFor(data: SharedVisaData, countryCode: string, visaTypeId: string): RouteFactsFor[] {
+  return data.sharedRoutes
+    .filter((r) => (r.processing !== undefined || r.validity !== undefined) && r.inheritedBy.some((x) => x.countryCode === countryCode && x.visaTypeId === visaTypeId))
+    .map((r) => ({ sharedRouteId: r.id, ...(r.processing ? { processing: r.processing } : {}), ...(r.validity ? { validity: r.validity } : {}) }));
 }

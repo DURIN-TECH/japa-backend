@@ -346,11 +346,89 @@ export class PaystackProvider implements BillingProvider {
         currency?: unknown;
         paid_at?: unknown;
         paidAt?: unknown;
+        // Issue #354: Paystack's processing fee on this charge (minor units).
+        fees?: unknown;
       };
     }>(`/transaction/verify/${encodeURIComponent(reference)}`);
     const data = res.data.data;
     if (!data) return null;
     return toTransactionLookup(data);
+  }
+
+  // ============================================
+  // Refunds (issue #317)
+  // ============================================
+  //
+  // Checked against Paystack's API reference (PaystackOSS/openapi:
+  // paths/refund.yaml, schemas/RefundCreate.yaml, RefundCreateResponse.yaml,
+  // RefundListResponseArray.yaml):
+  //  - POST /refund { transaction: <reference of a completed transaction>,
+  //    amount?: integer minor units, currency?: ISO code, customer_note?,
+  //    merchant_note? } -> data { id (integer), status, amount, currency, ... };
+  //  - GET /refund (list) -> data: [{ id, transaction (integer transaction
+  //    id), transaction_reference, status, amount, currency, ... }];
+  //    `transaction` (the transaction's id) narrows the list;
+  //  - refund statuses: pending, processing, needs-attention, failed, processed.
+
+  /**
+   * Ask Paystack to refund a charge (issue #317). The amount and currency are
+   * passed EXACTLY as given (the refund row's `amount` / `currency`, copied
+   * from the fee): nothing is converted here. A non-positive or fractional
+   * amount is refused before any call.
+   *
+   * @param input.reference the CHARGE's Paystack reference
+   * @returns Paystack's refund id and status
+   * @throws PaystackApiError (`PAYSTACK_ERROR: ...`) when Paystack refuses or
+   *   cannot be reached
+   */
+  async createRefund(input: {
+    reference: string;
+    amount: Money;
+    merchantNote?: string;
+    customerNote?: string;
+  }): Promise<PaystackRefund> {
+    if (!Number.isSafeInteger(input.amount.amountMinor) || input.amount.amountMinor <= 0) {
+      throw new Error("PAYSTACK_ERROR: refusing to refund a non-positive amount");
+    }
+    const res = await this.client().post<{ data: Record<string, unknown> }>("/refund", {
+      transaction: input.reference,
+      amount: input.amount.amountMinor,
+      currency: input.amount.currency,
+      ...(input.merchantNote ? { merchant_note: input.merchantNote } : {}),
+      ...(input.customerNote ? { customer_note: input.customerNote } : {}),
+    });
+    const refund = toPaystackRefund(res.data.data, input.reference);
+    if (!refund) throw new PaystackApiError("PAYSTACK_ERROR: refund response had no refund id");
+    return refund;
+  }
+
+  /**
+   * The refunds Paystack already holds for one charge (issue #317), so a
+   * retry ADOPTS an existing refund instead of asking for a second one.
+   * Two calls: transaction/verify gives the charge's numeric id, then the
+   * refund list is narrowed by it. Every returned row is checked again
+   * against the charge (`transaction` id or `transaction_reference`), so a
+   * filter Paystack ignored can never make a stranger's refund ours.
+   *
+   * @param reference the CHARGE's Paystack reference
+   */
+  async findRefundsForTransaction(reference: string): Promise<PaystackRefund[]> {
+    const verify = await this.client().get<{ data?: { id?: unknown } }>(
+      `/transaction/verify/${encodeURIComponent(reference)}`
+    );
+    const transactionId = verify.data.data?.id;
+    const res = await this.client().get<{ data?: unknown }>("/refund", {
+      params: { ...(transactionId !== undefined ? { transaction: transactionId } : {}), perPage: 100 },
+    });
+    const rows = Array.isArray(res.data.data) ? (res.data.data as Record<string, unknown>[]) : [];
+    return rows
+      .filter(
+        (row) =>
+          row.transaction_reference === reference ||
+          (transactionId !== undefined && String(row.transaction) === String(transactionId))
+      )
+      .map((row) => toPaystackRefund(row, reference))
+      .filter((r): r is PaystackRefund => r !== null);
   }
 
   async cancelSubscription(providerRef: string): Promise<void> {
@@ -497,6 +575,14 @@ export interface PaystackTransactionLookup {
   currency?: string;
   /** When the payment completed (ISO 8601), when Paystack reports it. */
   paidAt?: string;
+  /**
+   * Issue #354: Paystack's processing fee on this charge (`data.fees`), in
+   * minor units of `currency`. Set ONLY when Paystack reported a safe
+   * integer >= 0; absent means UNKNOWN (missing, null, negative, a string, a
+   * fraction...), and the refund paths then hold the refund rather than
+   * guess. Never estimated from a rate.
+   */
+  fees?: number;
 }
 
 /**
@@ -515,6 +601,7 @@ export function toTransactionLookup(data: {
   currency?: unknown;
   paid_at?: unknown;
   paidAt?: unknown;
+  fees?: unknown;
 }): PaystackTransactionLookup {
   const paidAtRaw = data.paid_at ?? data.paidAt;
   const metadata = data.metadata && typeof data.metadata === "object" ? (data.metadata as Record<string, unknown>) : {};
@@ -532,6 +619,60 @@ export function toTransactionLookup(data: {
       : {}),
     currency: typeof data.currency === "string" ? data.currency.toUpperCase() : undefined,
     paidAt: typeof paidAtRaw === "string" && paidAtRaw ? paidAtRaw : undefined,
+    // Issue #354: Paystack's fee, only when it is a well-formed figure (a
+    // safe integer >= 0). Anything else is left out = unknown, so no caller
+    // can mistake a bad value for a fee of 0.
+    ...(isWellFormedFee(data.fees) ? { fees: data.fees } : {}),
+  };
+}
+
+/**
+ * Issue #354: whether a reported Paystack fee can be used as money: a safe
+ * integer of minor units, zero or more. `null`, a negative number, a
+ * fraction, NaN, a numeric string ("150") are all NOT usable. Pure.
+ */
+export function isWellFormedFee(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** One refund as Paystack reports it (issue #317). */
+export interface PaystackRefund {
+  /** Paystack's refund id (a number in its API, kept as a string). */
+  id: string;
+  /** Paystack's refund status: pending, processing, needs-attention, failed, processed. */
+  status: string;
+  /** The charge it refunds (our reference). */
+  transactionReference: string;
+  /** Minor units, when reported. */
+  amount?: number;
+  /** Upper-case code, when reported. */
+  currency?: string;
+}
+
+/**
+ * Read one refund object of Paystack's (the create answer, a list row or a
+ * refund webhook's `data`) into `PaystackRefund`, or null when it carries no
+ * id. Pure. `fallbackReference` is used when the object does not name its
+ * charge (the create answer nests it under `transaction`).
+ */
+export function toPaystackRefund(data: unknown, fallbackReference = ""): PaystackRefund | null {
+  if (!data || typeof data !== "object") return null;
+  const d = data as Record<string, unknown>;
+  const id = d.id;
+  if ((typeof id !== "number" && typeof id !== "string") || String(id) === "") return null;
+  const nested = d.transaction && typeof d.transaction === "object" ? (d.transaction as Record<string, unknown>) : undefined;
+  const reference =
+    (typeof d.transaction_reference === "string" && d.transaction_reference) ||
+    (typeof nested?.reference === "string" && nested.reference) ||
+    fallbackReference;
+  // Webhooks may send the amount as a string of digits.
+  const rawAmount = typeof d.amount === "string" && /^\d+$/.test(d.amount) ? Number(d.amount) : d.amount;
+  return {
+    id: String(id),
+    status: typeof d.status === "string" ? d.status.toLowerCase() : "",
+    transactionReference: reference,
+    ...(typeof rawAmount === "number" && Number.isSafeInteger(rawAmount) ? { amount: rawAmount } : {}),
+    ...(typeof d.currency === "string" ? { currency: d.currency.toUpperCase() } : {}),
   };
 }
 

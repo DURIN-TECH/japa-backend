@@ -31,6 +31,15 @@ exports.FEATURE_KEYS = [
     // never put a blanket `requireFeature("ai.case_officer")` in front of the
     // assessment response itself; gate only the paid parts.
     "ai.case_officer",
+    // AI review working (#384): unlocks the rule-by-rule working of the AI
+    // review: each criterion checked, its published wording (quote + link) and
+    // how it was applied to the applicant. With `ai.case_officer` alone a client
+    // gets the caseworker-style narrative, the top issues and any blocking rule,
+    // but NOT the per-rule findings. Only meaningful together with
+    // `ai.case_officer`; the backend decides it server-side and fails closed
+    // (unresolved entitlements never get the working). Staff callers (agent,
+    // owner, admin) keep the working without it.
+    "ai.review_working",
 ];
 /**
  * Named constants for every feature key. **Always reference features through this
@@ -52,6 +61,8 @@ exports.FEATURES = {
     // Paid AI review (full cited review, per-upload checks, re-runs). The free
     // readiness band + top three issues are served without it; see FEATURE_KEYS.
     AI_CASE_OFFICER: "ai.case_officer",
+    // Rule-by-rule working of the AI review (#384); see FEATURE_KEYS.
+    AI_REVIEW_WORKING: "ai.review_working",
 };
 /**
  * Numeric ceilings a plan can impose. Enforced by counting current usage and

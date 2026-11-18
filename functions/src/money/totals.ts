@@ -118,7 +118,14 @@ export function unionCurrencies(...sets: CurrencyBuckets[]): CurrencyCode[] {
 //    separate refund transaction is written); a separate "refund"
 //    transaction is a different record, so nothing is subtracted twice;
 //  - a "withdrawal" is a payout to the agent, never revenue: it only reduces
-//    the available balance of its own currency (see computeStats).
+//    the available balance of its own currency (see computeStats);
+//  - (issue #354) a "paystack_fee_debit" (Paystack's fee on a refunded
+//    payment the agent side caused) SUBTRACTS its amount from revenue in its
+//    own currency, like a refund; it is written `completed`, so it counts
+//    from the moment it exists. computeStats takes it off the available
+//    balance too, never off `heldBalance`;
+//  - (issue #354) the refund of an UNAPPLIED payment (`refundFundedFrom:
+//    "unapplied_payment"`) is neutral: that payment was never revenue.
 
 /** Statuses at which a transaction's money has actually moved. */
 export const SETTLED_STATUSES: readonly TransactionStatus[] = ["completed", "released"];
@@ -140,9 +147,40 @@ export function isSettled(txn: Pick<Transaction, "status">): boolean {
  * transaction's own currency: +amount for a settled incoming payment,
  * -amount for a settled refund, 0 otherwise (unsettled rows, withdrawals).
  */
-export function revenueEffect(txn: Pick<Transaction, "type" | "status" | "amount">): number {
+export function revenueEffect(
+  txn: Pick<Transaction, "type" | "status" | "amount"> & Partial<Pick<Transaction, "refundFundedFrom">>
+): number {
   if (txn.type === "withdrawal" || !isSettled(txn)) return 0;
+  // Issue #354: the refund of a payment that never confirmed its booking
+  // gives back money that was never counted as revenue (no fee Transaction
+  // was written for it), so it subtracts nothing either.
+  if (isUnappliedPaymentRefund(txn)) return 0;
+  // Issue #354: Paystack's fee on a refunded payment the agent side caused,
+  // taken from the agent. An outflow, like a refund: it lowers revenue in its
+  // own currency (computeStats takes it off the available balance too).
+  if (isAgentDebit(txn)) return -txn.amount;
   return txn.type === "refund" ? -txn.amount : txn.amount;
+}
+
+/**
+ * Issue #354: true for a debit of Paystack's processing fee from the agent
+ * (`paystack_fee_debit`). Money going OUT of the agent's balance: never an
+ * incoming payment, never pending revenue. Pure.
+ */
+export function isAgentDebit(txn: Pick<Transaction, "type">): boolean {
+  return txn.type === "paystack_fee_debit";
+}
+
+/**
+ * Issue #354: true for the refund of a payment that could not be applied to
+ * its booking (`refundFundedFrom: "unapplied_payment"`). Such a refund is
+ * neutral for every balance and revenue figure: the payment it gives back
+ * was never credited to anyone. Pure.
+ */
+export function isUnappliedPaymentRefund(
+  txn: Pick<Transaction, "type"> & Partial<Pick<Transaction, "refundFundedFrom">>
+): boolean {
+  return txn.type === "refund" && txn.refundFundedFrom === "unapplied_payment";
 }
 
 /**
@@ -151,7 +189,8 @@ export function revenueEffect(txn: Pick<Transaction, "type" | "status" | "amount
  * are outflows, so they are never pending payments.
  */
 export function isPendingIncoming(txn: Pick<Transaction, "type" | "status">): boolean {
-  if (txn.type === "withdrawal" || txn.type === "refund") return false;
+  // Issue #354: a fee debit is an outflow too.
+  if (txn.type === "withdrawal" || txn.type === "refund" || isAgentDebit(txn)) return false;
   return PENDING_STATUSES.includes(txn.status);
 }
 

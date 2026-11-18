@@ -386,7 +386,13 @@ describe("payments on superseded references", () => {
     assert.equal(ex.paystackPaidAt.toMillis(), paidAt.getTime());
     assert.equal(ex.reason, "paid_on_superseded_reference_after_booking_paid");
     assert.equal(ex.status, "open");
-    assert.equal(docsIn("transactions").length, 1, "no second Transaction");
+    // Issue #354: no second fee Transaction; the extra payment gets ONE refund row, of exactly what was charged.
+    assert.equal(docsIn("transactions").filter(([, t]) => t.type !== "refund").length, 1, "no second Transaction");
+    const refunds = docsIn("transactions").filter(([, t]) => t.type === "refund");
+    assert.equal(refunds.length, 1);
+    assert.equal(refunds[0][1].amount, AGENCY_FEE_KOBO);
+    assert.equal(refunds[0][1].providerTransactionId, oldRef);
+    assert.equal(ex.refundId, refunds[0][0]);
     const b = onlyBooking();
     assert.equal(b.transactionId, newRef, "the booking keeps the payment that settled it");
     assert.equal(b.chargedAmountMinor, 16_000_000);
@@ -394,7 +400,8 @@ describe("payments on superseded references", () => {
     // A second verify of the same payment records nothing new.
     await verify(oldRef);
     assert.equal(docsIn("consultationPaymentExceptions").length, 1);
-    assert.equal(docsIn("transactions").length, 1);
+    assert.equal(docsIn("transactions").length, 2, "the fee and the one refund row, nothing new");
+    assert.equal(harness.refundCalls.length, 1, "one Paystack refund call");
   });
 
   test("a short payment on a superseded reference is a mismatch: nothing recorded", async () => {
@@ -441,7 +448,8 @@ describe("payments on superseded references", () => {
     const out = await verify(reference);
     assert.equal(out.status, 409);
     assert.equal(out.body.error, "BOOKING_NOT_PAYABLE");
-    assert.equal(docsIn("transactions").length, 0);
+    // Issue #354: no fee Transaction; only the automatic refund row.
+    assert.equal(docsIn("transactions").filter(([, t]) => t.type !== "refund").length, 0);
     const ex = docsIn("consultationPaymentExceptions");
     assert.equal(ex.length, 1);
     assert.equal(ex[0][1].reason, "booking_not_payable");

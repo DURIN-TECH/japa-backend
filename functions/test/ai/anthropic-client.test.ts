@@ -145,8 +145,11 @@ describe("AI_MODELS — one config module for model ids", () => {
         drafting: "claude-sonnet-5-5",
         judgement: "claude-opus-5-5",
         verification: "claude-sonnet-5-5",
+        // (#384) The narrative reuses the judgement model.
+        narrative: "claude-opus-5-5",
       }
     );
+    assert.equal(AI_MODELS.narrative, AI_MODELS.judgement);
   });
 
   test("no other file in functions/src writes a claude-* model id", () => {

@@ -4,6 +4,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { Role, Subscription } from "@durin-tech/authz";
 import { StoredPlan } from "../types/billing";
 import { pickAllowedFields } from "../utils/pick-allowed-fields";
+import { savedDestinationsService } from "./saved-destinations.service";
 
 /**
  * Flattened admin view of a user, joining Firebase Auth (identity + role claims +
@@ -338,6 +339,13 @@ class UserService {
    * Delete user (soft delete or hard delete based on requirements)
    */
   async deleteUser(userId: string): Promise<void> {
+    // Saved destinations first (issue #146). Firestore does not delete a
+    // subcollection with its parent document, so the user's saves would be
+    // left behind under a deleted profile. They go BEFORE the profile: if
+    // this step fails the request fails with the profile still there, and
+    // the user can ask again (nothing is orphaned).
+    await savedDestinationsService.removeAllForUser(userId);
+
     // For now, we'll do a hard delete
     // In production, you might want to soft delete or anonymize
     await collections.users.doc(userId).delete();

@@ -43,8 +43,9 @@ const SEED_IDS = {
 /**
  * Look up the default plan for an audience from the plans collection.
  * Throws if none is found (plans must be seeded first via seedPlans).
+ * Exported for the e2e fixture (scripts/seed-e2e.ts, #361).
  */
-async function getDefaultPlan(audience: SubscriberType): Promise<Plan> {
+export async function getDefaultPlan(audience: SubscriberType): Promise<Plan> {
   const snap = await collections.plans
     .where("audience", "==", audience)
     .where("isDefault", "==", true)
@@ -62,8 +63,9 @@ async function getDefaultPlan(audience: SubscriberType): Promise<Plan> {
 
 /**
  * Upsert a subscription + recompute the entitlements cache for one subscriber.
+ * Exported for the e2e fixture (scripts/seed-e2e.ts, #361).
  */
-async function upsertSubscription(
+export async function upsertSubscription(
   subscriberType: SubscriberType,
   subscriberId: string,
   plan: Plan
