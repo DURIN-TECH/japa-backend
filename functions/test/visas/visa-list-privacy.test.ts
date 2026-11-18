@@ -222,6 +222,43 @@ describe("seeded and scraped visas are unchanged (#153)", () => {
   });
 });
 
+// ---- Rebase onto #237 (shared routes on public visa reads) ----
+// The list handlers attach `sharedRoute` on the FULL record (the lookup needs
+// `inheritsFrom`, which the applicant-safe whitelist drops) and project
+// afterwards, so the projection must carry `sharedRoute` over.
+describe("projection keeps the public sharedRoute (#153 on top of #237)", () => {
+  test("toPublicListVisa keeps an attached sharedRoute on an agency visa", () => {
+    const route = { id: "route-1", name: "Schengen", covers: [{ countryCode: CC, countryName: "United Kingdom" }] };
+    const v = { ...visaDoc("agencyglobal", AGENCY_GLOBAL), sharedRoute: route } as unknown as VisaType;
+    const out: any = toPublicListVisa(v);
+    // Still projected: none of the seven private fields...
+    assertNoPrivateFields(out);
+    // ...and the route the app shows ("one route, several countries") survives.
+    assert.deepEqual(out.sharedRoute, route);
+  });
+
+  test("an explicit sharedRoute: null is kept as null", () => {
+    const v = { ...visaDoc("agencyglobal", AGENCY_GLOBAL), sharedRoute: null } as unknown as VisaType;
+    const out: any = toPublicListVisa(v);
+    assert.equal("sharedRoute" in out, true);
+    assert.equal(out.sharedRoute, null);
+  });
+
+  test("no sharedRoute key is added when the caller did not attach one", () => {
+    const out: any = toPublicListVisa(visaDoc("agencyglobal", AGENCY_GLOBAL) as unknown as VisaType);
+    assert.equal("sharedRoute" in out, false);
+  });
+
+  test("GET /countries/:code/visas: the projected agency visa carries sharedRoute: null", async () => {
+    // No visa in the seed inherits a route, so attachSharedRoutes takes its
+    // fast path (sharedRoute: null) and the projection must keep that key.
+    const r = await call((q, s) => visaController.getVisaTypes(q, s), { params: { code: CC } });
+    const agency = byId(listOf(r), "agencyglobal");
+    assertNoPrivateFields(agency);
+    assert.equal(agency.sharedRoute, null);
+  });
+});
+
 describe("admin list is unchanged (#153)", () => {
   test("GET /admin/visas still returns every private field", async () => {
     const r = await call(visaController.getAdminVisas.bind(visaController), {
