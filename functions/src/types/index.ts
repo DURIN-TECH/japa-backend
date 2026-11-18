@@ -706,7 +706,8 @@ export type VisaReviewStatus = "draft" | "pending_review" | "approved" | "reject
  *
  * One revision per visa: further edits merge into it. The admin approve /
  * reject of a revision is #101 (approve applies `changes` to the live doc and
- * deletes this doc; reject sets `reviewStatus: "rejected"` + reason). See
+ * deletes this doc; reject sets `reviewStatus: "rejected"` + reason and
+ * empties `changes`, so a rejected edit can never go live later, #154). See
  * `src/agency-visas/agency-visas.md` for the full contract.
  */
 export interface VisaRevision {

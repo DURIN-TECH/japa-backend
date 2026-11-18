@@ -409,9 +409,11 @@ class AgencyVisaPriceService {
    * "Contact for pricing"). Deletes the price doc.
    *
    * Same visibility rule as `setPrice` (#154): an unknown visa, or one the
-   * agency may not see (another agency's agency-only visa, a hidden
-   * non-agency visa), is a 404 NOT_FOUND with the same body, and nothing is
-   * written. For a visa the agency CAN see (including its own non-approved
+   * agency may not see (another agency's agency visa that is not publicly
+   * visible), is a 404 NOT_FOUND with the same body as `setPrice`, and
+   * nothing is written. Exception: if the caller already holds its own
+   * (stale) price on that hidden visa, from when it was global, the clear
+   * removes it (200), so a stale price can always be removed. For a visa the agency CAN see (including its own non-approved
    * visa) it is idempotent: clearing a price that is not set succeeds and
    * writes nothing, so a stale price can still be removed. It only ever
    * touches the CALLER's own subcollection, so it can't affect another agency.
@@ -431,8 +433,17 @@ class AgencyVisaPriceService {
       // id. Everything else (public visas, the agency's own visa in any
       // state, a catalog visa that was deactivated since it was priced) stays
       // clearable so a stale price can always be removed.
-      if (visa.source === AGENCY_VISA_SOURCE && !isOwnAgencyVisa(visa, agencyId) && !isVisaPubliclyVisible(visa)) {
-        throw visaNotFound();
+      const hidden =
+        visa.source === AGENCY_VISA_SOURCE && !isOwnAgencyVisa(visa, agencyId) && !isVisaPubliclyVisible(visa);
+      if (hidden) {
+        // One exception, so a stale price is never stuck: the caller priced
+        // this visa while it was global and its owner has since taken it back
+        // to agency-only. The caller's OWN price doc proves it already knows
+        // the visa, so removing that doc leaks nothing. Without such a doc it
+        // is the plain 404 (nothing written), exactly like an unknown id.
+        if (!priceSnap.exists) throw visaNotFound();
+        tx.delete(priceRef);
+        return;
       }
       if (priceSnap.exists) tx.delete(priceRef);
     });

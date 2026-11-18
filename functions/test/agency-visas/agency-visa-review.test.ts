@@ -46,6 +46,7 @@ import { fakeCollectionGroup } from "../helpers/fake-collection-group";
 import { visaController } from "../../src/controllers/visa.controller";
 import { visaService } from "../../src/services/visa.service";
 import { agencyVisaService } from "../../src/agency-visas/agency-visa.service";
+import { parseAgencyVisaBody } from "../../src/agency-visas/agency-visa.validation";
 import {
   agencyVisaReviewService,
   applyRevision,
@@ -582,6 +583,76 @@ describe("review of a pending revision", () => {
     const again = await review(admin(), id, { action: "approve", revisionUpdatedAt: loaded });
     assert.equal(again.body.data.reviewOutcome, "unchanged");
     assert.equal(store.get(visaPath(id))!.name, before!.name);
+  });
+});
+
+// ============================================
+// #154: a rejected edit never goes live with a later one
+// ============================================
+
+describe("reject, then a new edit (#154)", () => {
+  /** What the admin loaded: the seeded revision's updatedAt, as JSON serialises it. */
+  const loaded = { _seconds: T1.seconds, _nanoseconds: T1.nanoseconds };
+  /** The agency (owner of A) edits the visa through the real edit service. */
+  const agencyEdit = (id: string, body: Data) =>
+    agencyVisaService.update(id, parseAgencyVisaBody(body, "update"), { agencyId: AGENCY_A, uid: OWNER_A_UID }, () => true);
+
+  test("reject empties the revision's changes but keeps reason, reviewer and time for the agency", async () => {
+    const id = seedApprovedWithRevision("c1", { name: "Edit A name" });
+    const r = await review(admin(), id, { action: "reject", reason: "Name must match the CoS", revisionUpdatedAt: loaded });
+    assert.equal(r.status, 200);
+    const rev = store.get(revPath(id))!;
+    // The rejected proposal is discarded...
+    assert.deepEqual(rev.changes, {});
+    // ...but the agency still learns why, from whom and when.
+    assert.equal(rev.reviewStatus, "rejected");
+    assert.equal(rev.rejectionReason, "Name must match the CoS");
+    assert.equal(rev.reviewedBy, "uid-admin");
+    assert.ok(rev.reviewedAt);
+    // The reject email still goes out.
+    assert.equal(emails.length, 1);
+    assert.equal(emails[0].type, "agency_visa_rejected");
+
+    // Agency reads: pendingRevision carries the rejection with no proposal.
+    const own = await agencyVisaService.list(AGENCY_A, () => true);
+    const row: any = own.find((v) => v.id === id);
+    assert.equal(row.name, "Visa c1");
+    assert.equal(row.pendingRevision.reviewStatus, "rejected");
+    assert.deepEqual(row.pendingRevision.changes, {});
+
+    // Admin list: the revision is not an open proposal any more.
+    const adminList = await list(admin());
+    const adminRow = adminList.body.data.find((v: any) => v.id === id);
+    if (adminRow?.pendingRevision) {
+      assert.deepEqual(adminRow.pendingRevision.changes, {});
+      assert.notEqual(adminRow.pendingRevision.reviewStatus, "pending_review");
+    }
+  });
+
+  test("reject edit A, submit edit B, approve B: only B's fields go live", async () => {
+    const id = seedApprovedWithRevision("c2", { name: "Edit A name" });
+    await review(admin(), id, { action: "reject", reason: "No", revisionUpdatedAt: loaded });
+
+    // Edit B touches ANOTHER field only.
+    await agencyEdit(id, { baseCostUsd: 250 });
+    const rev = store.get(revPath(id))!;
+    assert.equal(rev.reviewStatus, "pending_review");
+    assert.deepEqual(rev.changes, { baseCostUsd: 250 });
+
+    // Approve B with the updatedAt the admin would have loaded.
+    const updatedAt = rev.updatedAt as Timestamp;
+    const r = await review(admin(), id, {
+      action: "approve",
+      revisionUpdatedAt: { _seconds: updatedAt.seconds, _nanoseconds: updatedAt.nanoseconds },
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.data.reviewOutcome, "revision_approved");
+
+    const live = store.get(visaPath(id))!;
+    assert.equal(live.baseCostUsd, 250);
+    // Edit A's value never went live.
+    assert.equal(live.name, "Visa c2");
+    assert.equal(store.has(revPath(id)), false);
   });
 });
 
