@@ -1,5 +1,5 @@
 // ============================================
-// Rules unit tests — users, agents, agencyInvitations (issue #135)
+// Rules unit tests — users, agents, agencyInvitations (issue #135), visaTypes (#153)
 // ============================================
 //
 // Run with `npm run test:emulator`. Uses @firebase/rules-unit-testing against
@@ -413,5 +413,101 @@ describe("agencyInvitations: backend-only writes", () => {
 
   test("ALLOW the inviter to read their invitation (reads are unchanged)", async () => {
     await assertSucceeds((await alice()).collection("agencyInvitations").doc("invite-1").get());
+  });
+});
+
+// ============================================
+// countries/{cc}/visaTypes/{id} (issue #153)
+// ============================================
+//
+// Direct client reads of a visa doc are denied for EVERY visa: an agency visa
+// holds private fields (sponsor licence / contact, createdBy, reviewedBy, ...)
+// and a rule cannot hide single fields. Apps read visas through the API.
+
+describe("visaTypes: direct client reads are denied (#153)", () => {
+  const VISA = "countries/GB/visaTypes/agency-global";
+  const SEED_VISA = "countries/GB/visaTypes/seed-visa";
+
+  /** Put a global agency visa (with private fields), a seed visa and a requirement in place. */
+  async function seedVisas(): Promise<void> {
+    await withoutRules(async (db) => {
+      await db.doc("countries/GB").set({ code: "GB", name: "United Kingdom", isSupported: true });
+      await db.doc(VISA).set({
+        id: "agency-global",
+        isActive: true,
+        source: "agency",
+        reviewStatus: "approved",
+        visibility: "global",
+        sponsor: { organisationName: "Acme", sponsorLicenceNumber: "ABC123", contact: { name: "Jo" } },
+        createdBy: "uid-owner",
+        reviewedBy: "uid-admin",
+        submittedBy: "uid-owner",
+        madeGlobalBy: "uid-admin",
+        agentIds: ["a1"],
+      });
+      await db.doc(SEED_VISA).set({ id: "seed-visa", isActive: true });
+      await db.doc(`${VISA}/requirements/r1`).set({ title: "Passport" });
+    });
+  }
+
+  test("DENY an anonymous get of a global approved agency visa (it returned 200 before)", async () => {
+    await seedVisas();
+    await assertFails((await anonymousDb()).doc(VISA).get());
+  });
+
+  test("DENY a signed-in get of a global approved agency visa", async () => {
+    await seedVisas();
+    await assertFails((await alice()).doc(VISA).get());
+  });
+
+  test("DENY get of a seed visa, anonymous and signed-in", async () => {
+    await seedVisas();
+    await assertFails((await anonymousDb()).doc(SEED_VISA).get());
+    await assertFails((await alice()).doc(SEED_VISA).get());
+  });
+
+  test("DENY listing the visaTypes collection, anonymous and signed-in", async () => {
+    await seedVisas();
+    await assertFails((await anonymousDb()).collection("countries/GB/visaTypes").get());
+    await assertFails((await alice()).collection("countries/GB/visaTypes").get());
+    await assertFails((await alice()).collection("countries/GB/visaTypes").where("isActive", "==", true).get());
+  });
+
+  test("ALLOW an admin to read a visa and list the collection", async () => {
+    await seedVisas();
+    const admin = await clientDb("admin-uid", { admin: true, role: "admin" });
+    await assertSucceeds(admin.doc(VISA).get());
+    await assertSucceeds(admin.collection("countries/GB/visaTypes").get());
+  });
+
+  test("DENY client writes to a visa from non-admins (anonymous and signed-in)", async () => {
+    await seedVisas();
+    await assertFails((await anonymousDb()).doc(VISA).update({ isActive: false }));
+    await assertFails((await alice()).doc(VISA).update({ isActive: false }));
+    await assertFails((await alice()).doc("countries/GB/visaTypes/new").set({ isActive: true }));
+  });
+
+  test("requirements of a publicly visible visa stay readable (rule unchanged)", async () => {
+    await seedVisas();
+    await assertSucceeds((await anonymousDb()).doc(`${VISA}/requirements/r1`).get());
+  });
+
+  test("requirements of a hidden visa stay denied (consistent with isVisaPubliclyVisible)", async () => {
+    await withoutRules(async (db) => {
+      await db.doc("countries/GB/visaTypes/hidden").set({ isActive: true, visibility: "agency", reviewStatus: "approved" });
+      await db.doc("countries/GB/visaTypes/hidden/requirements/r1").set({ title: "x" });
+    });
+    await assertFails((await anonymousDb()).doc("countries/GB/visaTypes/hidden/requirements/r1").get());
+  });
+
+  test("visaRevisions and agencies/*/visaPrices stay denied to clients", async () => {
+    await withoutRules(async (db) => {
+      await db.doc("visaRevisions/GB__agency-global").set({ countryCode: "GB", visaId: "agency-global" });
+      await db.doc("agencies/agency-1/visaPrices/p1").set({ priceNgn: 1 });
+    });
+    await assertFails((await anonymousDb()).doc("visaRevisions/GB__agency-global").get());
+    await assertFails((await alice()).doc("visaRevisions/GB__agency-global").get());
+    await assertFails((await anonymousDb()).doc("agencies/agency-1/visaPrices/p1").get());
+    await assertFails((await alice()).doc("agencies/agency-1/visaPrices/p1").get());
   });
 });

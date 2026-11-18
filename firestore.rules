@@ -220,13 +220,27 @@ service cloud.firestore {
             data.get('reviewStatus', null) in [null, 'approved'];
         }
 
-        allow read: if isPubliclyVisibleVisa(resource.data) || isAdmin();
+        // Issue #153: DIRECT CLIENT READS OF A VISA DOC ARE DENIED (get and
+        // list, anonymous and signed-in) for every visa, global approved ones
+        // included. An agency-created visa carries private fields (sponsor
+        // licence number / contact, createdBy, reviewedBy, submittedBy,
+        // madeGlobalBy, agentIds) and a rule cannot hide single fields, so the
+        // whole doc is backend-only: the apps read visas through the API
+        // (GET /countries/:code/visas, /visas, ...), which projects agency
+        // visas to applicant-safe fields. Verified: seli-mobile and seli-portal
+        // have no Firestore reads of visaTypes. Admins keep direct reads.
+        allow read: if isAdmin();
         
         // Only admins can write visa types
         allow write: if isAdmin();
         
         // Requirements subcollection
         match /requirements/{requirementId} {
+          // Issue #153: left as is. The parent-visa lookup below is a rules-side
+          // get(), independent of the visa doc's own read rule (now admin
+          // only), so this keeps working, still gated on
+          // isPubliclyVisibleVisa (= isVisaPubliclyVisible). Requirements hold
+          // no private agency fields, and no client reads them directly.
           // Issue #102: requirements follow their visa. Readable only when the
           // parent visa is publicly visible (same rule as above), or by an
           // admin. Before #102 this was `if true`, so a hidden visa's
