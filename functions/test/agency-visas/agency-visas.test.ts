@@ -628,6 +628,61 @@ describe("editing an approved visa", () => {
     assert.equal(rev.submittedBy, "uid-agent-a");
   });
 
+  // ---- #154: a rejected edit's changes never carry into the next edit ----
+  // The reject path now empties `changes`, but a rejected revision written
+  // before that fix (or by any other path) may still hold them. The edit
+  // service must ignore them, so the next proposal is live + new body only.
+  test("a rejected revision's leftover changes are not carried into the next edit (#154)", async () => {
+    const id = seedApproved();
+    store.set(revPath(id), {
+      id: `${CC}__${id}`,
+      visaId: id,
+      countryCode: CC,
+      ownerAgencyId: AGENCY_A,
+      // Leftover from a rejection: `title`-like content field (`name`).
+      changes: { name: "X" },
+      reviewStatus: "rejected",
+      rejectionReason: "Name misleading",
+      reviewedBy: "uid-admin",
+      reviewedAt: T0,
+      submittedBy: "uid-owner-a",
+      submittedAt: T0,
+      createdAt: T0,
+      updatedAt: T0,
+    });
+    // Edit ANOTHER field: the proposal holds only that field.
+    const r = await update(ownerA(), id, { baseCostUsd: 120 });
+    assert.equal(r.status, 200);
+    const rev = store.get(revPath(id))!;
+    assert.deepEqual(rev.changes, { baseCostUsd: 120 });
+    assert.equal("name" in rev.changes, false);
+    assert.equal(rev.reviewStatus, "pending_review");
+    // The live visa still has its approved name.
+    assert.equal(store.get(visaPath(id))!.name, "Live name");
+  });
+
+  test("an edit that only repeats live values after a rejection removes the revision (#154)", async () => {
+    // With the rejected changes ignored, an edit equal to the live visa
+    // differs from nothing, so no revision is left behind.
+    const id = seedApproved();
+    store.set(revPath(id), {
+      id: `${CC}__${id}`,
+      visaId: id,
+      countryCode: CC,
+      ownerAgencyId: AGENCY_A,
+      changes: { name: "X" },
+      reviewStatus: "rejected",
+      rejectionReason: "Name misleading",
+      submittedBy: "uid-owner-a",
+      submittedAt: T0,
+      createdAt: T0,
+      updatedAt: T0,
+    });
+    const r = await update(ownerA(), id, { baseCostUsd: 100 });
+    assert.equal(r.status, 200);
+    assert.equal(store.has(revPath(id)), false);
+  });
+
   test("B can't stage a revision on A's approved visa", async () => {
     const id = seedApproved();
     assert.equal((await update(ownerB(), id, { name: "x" })).status, 404);

@@ -87,8 +87,22 @@ Every other visa is refused, and nothing is written:
 
 **Stale prices.** A price can become stale when its visa is deactivated,
 deleted, or taken back to agency-only. The price is kept in storage, but it
-is left out of every read, so it is never shown. The agency can still clear
-it.
+is left out of every read, so it is never shown. The agency can always clear
+its own stale price, whatever happened to the visa (deactivated, unapproved,
+deleted, or another agency's visa taken back to agency-only): the price doc
+shows the caller already knew the visa, so the clear deletes it and answers
+200 (#154).
+
+**Clearing on a visa you can't see (#154).** `DELETE` and `PUT { "priceUsd":
+null }` follow the same 404 rule as setting a price. When the caller holds
+**no** price on it, a visa it can't see is a 404 `NOT_FOUND` with the same
+body as an unknown id, and nothing is written. "Can't see" means: unknown or
+deleted, another agency's agency-only visa, or a hidden catalog visa
+(inactive or not approved). Unknown and hidden answer identically, so the
+response never reveals that a hidden visa exists. A visa the caller can see
+(publicly visible, or its own agency visa in any state) is a 200, idempotent
+clear. Only the caller's own price doc is ever deleted, never another
+agency's.
 
 ## Endpoints
 
@@ -143,8 +157,8 @@ non-admin who sends `?agencyId=` for any agency other than their own gets
 | `GET /agency/visa-prices` | 200 `AgencyVisaPriceView[]` | 400 / 404 (admin `agencyId`), 403 |
 | `GET /agency/visa-prices?include=global` | 200, the same list plus every public visa not yet priced (`priceUsd: null`), for the portal picker | 403 |
 | `PUT /agency/visa-prices/:countryCode/:visaTypeId` with body `{ "priceUsd": { "amount": "125.00", "currency": "USD" } }` | 200 `AgencyVisaPriceView` | 400, 403 (incl. member agents), 404 |
-| `PUT …` with body `{ "priceUsd": null }` | 200 `{ countryCode, visaTypeId, priceUsd: null }` (clears the price) | 400, 403 (incl. member agents) |
-| `DELETE /agency/visa-prices/:countryCode/:visaTypeId` | 200 `{ countryCode, visaTypeId, priceUsd: null }`. Idempotent: if no price is set, nothing is written | 400, 403 (incl. member agents) |
+| `PUT …` with body `{ "priceUsd": null }` | 200 `{ countryCode, visaTypeId, priceUsd: null }` (clears the price) | 400, 403 (incl. member agents), 404 |
+| `DELETE /agency/visa-prices/:countryCode/:visaTypeId` | 200 `{ countryCode, visaTypeId, priceUsd: null }`. Idempotent: if no price is set, nothing is written. 404 `NOT_FOUND` (same body as `PUT`, nothing written) for a visa the caller can't see (unknown, deleted, another agency's agency-only visa, hidden catalog visa) when it holds no price there (#154) | 400, 403 (incl. member agents), 404 |
 
 **List order:**
 

@@ -294,7 +294,10 @@ class AgencyVisaService {
         const live = pickContent(visa);
         // Proposal = live + earlier revision changes (null = removed) + body.
         const base: Record<string, unknown> = { ...live };
-        for (const [k, v] of Object.entries(prior?.changes ?? {})) {
+        // A REJECTED prior revision's changes are never carried over (#154):
+        // the reject path empties them; this also covers older rejected docs.
+        const priorChanges = prior && prior.reviewStatus !== "rejected" ? prior.changes ?? {} : {};
+        for (const [k, v] of Object.entries(priorChanges)) {
           if (v === null) delete base[k];
           else base[k] = v;
         }
