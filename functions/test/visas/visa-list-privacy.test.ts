@@ -11,12 +11,12 @@
 //   GET /countries/:code/visas (all + ?category=), GET /visas,
 //   GET /visas/search?q=, GET /visas/popular, and (unchanged) GET /admin/visas.
 
-import { test, describe, before, beforeEach } from "node:test";
+import { test, describe, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { Timestamp } from "firebase-admin/firestore";
 import { defineAbilitiesFor, ROLES } from "@durin-tech/authz";
 
-import { installFakes, resetStore, store } from "../helpers/fake-firestore";
+import { clone, fakeCollection, fakeDoc, installFakes, resetStore, store } from "../helpers/fake-firestore";
 import type { Data } from "../helpers/fake-firestore";
 import { visaController } from "../../src/controllers/visa.controller";
 import { toPublicListVisa } from "../../src/agency-visas/agency-visa-access";
@@ -256,6 +256,105 @@ describe("projection keeps the public sharedRoute (#153 on top of #237)", () => 
     const agency = byId(listOf(r), "agencyglobal");
     assertNoPrivateFields(agency);
     assert.equal(agency.sharedRoute, null);
+  });
+});
+
+// ---- Review finding 3: a REAL shared route through a list route ----
+// The tests above only see `sharedRoute: null` (nothing inherits a route).
+// Here the global agency visa inherits an ACTIVE shared route, so
+// attachSharedRoutes does its full lookup on the unprojected record
+// (`inheritsFrom` present), and the handler then projects the visa. The
+// response must carry the real { id, name, covers } AND none of the seven
+// private fields.
+describe("agency visa on an active shared route, through GET /countries/:code/visas (#153 + #237)", () => {
+  /**
+   * A minimal collection-group fake over the store: `where(field, op, value)`
+   * chains with "==" and "array-contains" (deep-equal on objects, which is
+   * how `inheritsFrom` entries are matched), then `get()`. Same approach as
+   * shared-route-on-visa-reads.test.ts.
+   */
+  function groupFake(collectionId: string, filters: Array<[string, string, unknown]> = []): any {
+    return {
+      where: (f: string, op: string, v: unknown) => groupFake(collectionId, [...filters, [f, op, v]]),
+      async get() {
+        const docs = [...store.entries()]
+          // Docs (even path length) directly under a `collectionId` collection.
+          .filter(([path]) => {
+            const parts = path.split("/");
+            return parts.length % 2 === 0 && parts[parts.length - 2] === collectionId;
+          })
+          .filter(([, d]: [string, any]) =>
+            filters.every(([f, op, v]) =>
+              op === "=="
+                ? d[f] === v
+                : Array.isArray(d[f]) && d[f].some((x: unknown) => JSON.stringify(x) === JSON.stringify(v))
+            )
+          )
+          .map(([path, d]) => ({ id: fakeDoc(path).id, exists: true, ref: fakeDoc(path), data: () => clone(d) }));
+        return { docs, empty: docs.length === 0, size: docs.length };
+      },
+    };
+  }
+
+  // The real refs this suite swaps out, restored in after() so the other
+  // suites in this file keep the setup installFakes() gave them.
+  let firebase: any;
+  let savedSharedRoutes: unknown;
+  let savedVisaTypesGroup: unknown;
+
+  before(async () => {
+    firebase = await import("../../src/utils/firebase");
+    savedSharedRoutes = firebase.collections.sharedRoutes;
+    savedVisaTypesGroup = firebase.collectionGroups.visaTypes;
+    firebase.collections.sharedRoutes = fakeCollection("sharedRoutes");
+    firebase.collectionGroups.visaTypes = () => groupFake("visaTypes");
+  });
+
+  after(() => {
+    firebase.collections.sharedRoutes = savedSharedRoutes;
+    firebase.collectionGroups.visaTypes = savedVisaTypesGroup;
+  });
+
+  beforeEach(() => {
+    // An ACTIVE shared route whose only destination is GB.
+    store.set("sharedRoutes/route-gb", {
+      id: "route-gb",
+      name: "GB work route",
+      category: "work",
+      issuingAuthorityId: "test-authority",
+      destinations: { mode: "listed", countryCodes: [CC] },
+      status: "active",
+      createdBy: "uid-admin",
+      createdAt: T0,
+      updatedBy: "uid-admin",
+      updatedAt: T0,
+    });
+    // The global agency visa (every private field set) now inherits it.
+    store.set(
+      `countries/${CC}/visaTypes/agencyglobal`,
+      visaDoc("agencyglobal", { ...AGENCY_GLOBAL, inheritsFrom: [{ sharedRouteId: "route-gb" }] })
+    );
+  });
+
+  test("sharedRoute is the real { id, name, covers } and no private field leaks", async () => {
+    const r = await call((q, s) => visaController.getVisaTypes(q, s), { params: { code: CC } });
+    assert.equal(r.status, 200);
+    const agency = byId(listOf(r), "agencyglobal");
+    assert.ok(agency, "the global agency visa is still listed");
+
+    // The route lookup ran on the full record: real route, not the null
+    // fallback. GB is covered because this publicly visible record inherits it.
+    assert.deepEqual(agency.sharedRoute, {
+      id: "route-gb",
+      name: "GB work route",
+      covers: [{ countryCode: CC, countryName: "United Kingdom" }],
+    });
+
+    // ...and the visa is still projected: none of the seven private fields,
+    // and `inheritsFrom` (not on the applicant-safe whitelist) is gone too.
+    assertNoPrivateFields(agency);
+    assert.equal("inheritsFrom" in agency, false);
+    assert.equal(agency.sponsor.organisationName, "Acme Ltd");
   });
 });
 
