@@ -1616,6 +1616,28 @@ export interface NarrativeRequestInput {
   extractionSummary: string;
   // Every statement's plain text (null when none).
   statementText: string | null;
+  // (#408) Extra facts for the FIGURE check only. `buildNarrativeRequest`
+  // never reads this field, so the text sent to the model (and its recorded
+  // request hash) is the same with or without it. Optional: without it the
+  // figure check reads `extractionSummary` as sent (unitless document values
+  // stay bare, which fails closed).
+  figureFacts?: NarrativeFigureFacts;
+}
+
+/**
+ * (#408) What the figure check needs about the document values, beyond the
+ * extraction summary's text: each value with its field and unit, and which
+ * fields hold money. With these, a unitless value on a money field is read in
+ * the application's declared currency (see `declaredCurrencyOf`), and a unit
+ * written in lowercase or as a sign ("gbp", "£") is read as its ISO code.
+ */
+export interface NarrativeFigureFacts {
+  // The values the extraction summary was built from, in the same order and
+  // with the same filter (readable, not failed, not suspicious documents).
+  values: ReadonlyArray<Pick<ExtractedValue, "field" | "value" | "unit" | "page">>;
+  // The document fields an objective rubric check reads with a currency unit
+  // (`moneyFieldsFor`). Only these take the declared currency.
+  moneyFields: readonly string[];
 }
 
 /** The trusted rule text of one finding: rubric wording only. */
@@ -1738,9 +1760,117 @@ export function narrativeGroundingOf(input: NarrativeRequestInput): NarrativeGro
   // and any currency label in the narrative would pass. For the FIGURE check
   // the intake is therefore re-written with each amount labelled
   // ("399367 NGN"). The quote check keeps the text exactly as sent.
-  const figureApplicant = [input.profileSummary, labelIntakeAmounts(input.intakeSummary), input.extractionSummary, input.statementText ?? ""];
+  // (#408) The document values the same way: when the caller gave the values
+  // with their fields and units, the figure check reads a labelled copy of
+  // the extraction summary (see `labelExtractedValues`) INSTEAD of the text as
+  // sent, so a money value carries its currency. Without them, the summary is
+  // read as sent (unitless values stay bare: fail closed).
+  const figureExtraction = input.figureFacts
+    ? labelExtractedValues(input.figureFacts, declaredCurrencyOf(input.intakeSummary))
+    : input.extractionSummary;
+  const figureApplicant = [input.profileSummary, labelIntakeAmounts(input.intakeSummary), figureExtraction, input.statementText ?? ""];
   const rules: NarrativeRuleRef[] = ruled.map((r) => ({ ref: r.ruleRef ?? null, quote: r.sourceQuote || null }));
   return { figureSources: [...figureApplicant, ...rubricText], quoteSources: [...quotes, ...applicant], rules };
+}
+
+/**
+ * (#408) Every amount answer in the intake (`{ amount: number, currency:
+ * string }`, types/intake.ts), nested ones included: the same walk as
+ * `labelIntakeAmounts`. Returns each answer's currency, trimmed and
+ * upper-cased ("gbp" reads as "GBP"). Not JSON: none.
+ */
+function intakeAmountCurrencies(intakeSummary: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(intakeSummary);
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  /** Walk the answers depth-first, collecting each amount answer's currency. */
+  const walk = (v: unknown): void => {
+    if (isRecord(v) && typeof v.amount === "number" && typeof v.currency === "string") {
+      out.push(v.currency.trim().toUpperCase());
+    } else if (Array.isArray(v)) {
+      v.forEach(walk);
+    } else if (isRecord(v)) {
+      Object.values(v).forEach(walk);
+    }
+  };
+  walk(parsed);
+  return out;
+}
+
+/**
+ * (#408) The declared currency of an application: the ONE currency every
+ * intake amount answer uses. Null when there is no amount answer, or when they
+ * use two or more currencies (no guess is made, so a unitless document value
+ * then stays bare: fail closed). The profile country is deliberately NOT a
+ * fallback: where someone lives says nothing about the currency of a bank
+ * letter, and the charge-currency mapping falls back to NGN.
+ *
+ * @param intakeSummary the intake as sent to the model (`JSON.stringify` of the answers)
+ */
+export function declaredCurrencyOf(intakeSummary: string): string | null {
+  const currencies = new Set(intakeAmountCurrencies(intakeSummary).filter(Boolean));
+  return currencies.size === 1 ? [...currencies][0] : null;
+}
+
+/**
+ * (#408) The ISO code a unit names, when it names a currency: an ISO code in
+ * `CURRENCY_CODES` compared case-insensitively ("GBP", "gbp", "Gbp"), or a
+ * sign in `CURRENCY_SIGNS` ("£" is GBP). Null for anything else (a duration,
+ * a count, an unknown word): such a unit is never read as money.
+ */
+export function currencyOfUnit(unit: string | null | undefined): string | null {
+  const u = unit?.trim();
+  if (!u) return null;
+  if (CURRENCY_SIGNS[u]) return CURRENCY_SIGNS[u];
+  const code = u.toUpperCase();
+  return CURRENCY_CODES.includes(code) ? code : null;
+}
+
+/**
+ * (#408) The MONEY fields of a rubric: the document fields an objective
+ * criterion's check reads with a currency unit (`currencyOfUnit`). Intake and
+ * applicant fields are not document fields (they are left out exactly as in
+ * `documentFieldsFor`), and a derived fact is read from another field that is
+ * not money (`accountHolder`), so it is left out too.
+ */
+export function moneyFieldsFor(rubric: Pick<VisaRubric, "criteria">): string[] {
+  const fields = new Set<string>();
+  for (const c of rubric.criteria) {
+    if (c.kind !== "objective" || !c.check) continue;
+    const field = c.check.field;
+    if (field.startsWith("intake.") || field.startsWith("applicant.") || field in DERIVED_FACTS) continue;
+    if (currencyOfUnit(c.check.unit) !== null) fields.add(field);
+  }
+  return [...fields].sort();
+}
+
+/**
+ * (#408) The extraction summary re-written for the FIGURE check, one line per
+ * value in the same shape the model is sent (`field: value unit (page n)`),
+ * with the unit made readable by `figuresIn`:
+ *  - a currency unit, in any case or as a sign, is written as its ISO code
+ *    ("gbp" and "£" become "GBP");
+ *  - NO unit on a money field: the application's declared currency, when it
+ *    has one (a bank letter that prints "1,500,000" for a naira applicant);
+ *  - anything else is written as it is (no unit stays bare, "months" stays
+ *    "months"), so it is never read as money.
+ * Never converts or rounds a value. Only used for grounding: the model is sent
+ * the summary exactly as before.
+ */
+export function labelExtractedValues(facts: NarrativeFigureFacts, declaredCurrency: string | null): string {
+  const money = new Set(facts.moneyFields);
+  return facts.values
+    .map((v) => {
+      const rawUnit = v.unit?.trim() ? v.unit.trim() : null;
+      const currency = currencyOfUnit(rawUnit) ?? (rawUnit === null && money.has(v.field) ? declaredCurrency : null);
+      const unit = currency ?? rawUnit;
+      return `${v.field}: ${String(v.value)}${unit ? ` ${unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`;
+    })
+    .join("\n");
 }
 
 /**
@@ -1811,9 +1941,12 @@ export function figuresIn(text: string): FoundFigure[] {
     let currency: string | null = m[1] ? CURRENCY_SIGNS[m[1]] : null;
     if (!currency) {
       // A code written right after ("3000 GBP") or right before ("GBP 3000").
+      // (#408) Matched case-insensitively: "399,367 gbp" is pounds, not a bare
+      // number (a bare number would match any source currency). The code is
+      // READ from the text, never guessed, so no string is kept by guessing.
       const after = text.slice(m.index + m[0].length, m.index + m[0].length + 5);
       const before = text.slice(Math.max(0, m.index - 5), m.index);
-      const code = CURRENCY_CODES.find((c) => new RegExp(`^\\s?${c}\\b`).test(after) || new RegExp(`\\b${c}\\s?$`).test(before));
+      const code = CURRENCY_CODES.find((c) => new RegExp(`^\\s?${c}\\b`, "i").test(after) || new RegExp(`\\b${c}\\s?$`, "i").test(before));
       currency = code ?? null;
     }
     out.push({ value, currency });
@@ -1902,11 +2035,46 @@ export function quotationsAreGrounded(text: string, sources: readonly string[]):
 export const NARRATIVE_CITATION_LIMITS = { perString: 1, perNarrative: 2 } as const;
 
 /**
- * A rule reference written in the generic way ("rule 4.2", "paragraph V 4.3",
- * "section 9", "Appendix FM 2"): one of these words, then an optional short
- * letter prefix, then a number. Catches refs the rubric did not send, too.
+ * (#408) A regex source in which every lower-case letter also matches its
+ * capital ("rules?" matches "Rule" and "RULES"), so it can sit inside a regex
+ * that is otherwise case-SENSITIVE (the letter prefix of a ref must be
+ * capitalised). Only for sources written with plain letters, `?`, `|` and
+ * spaces: an escape like `\s` would be broken by it.
  */
-const GENERIC_RULE_REF_RE = /\b(?:rules?|paragraphs?|paras?|sections?|appendix|annex|clauses?)\s+(?:[A-Z]{1,4}[-\s]?)?\d+(?:\.\d+)*(?:\([a-z0-9]+\))?/gi;
+function anyCase(src: string): string {
+  return src.replace(/[a-z]/g, (ch) => `[${ch}${ch.toUpperCase()}]`);
+}
+
+/**
+ * (#408) The unit words that turn a number into a quantity, not a rule ref:
+ * "2.3 times", "2.3 x" / "2.3×", "2.3%", "2.3 percent" / "per cent", and the
+ * durations (day, week, month, year, singular or plural). Any letter case; a
+ * word unit must end there ("2.3 xyz" is not "2.3 x").
+ */
+const UNIT_WORD_SRC = `(?:%|×|(?:${anyCase(["times", "x", "percent", "per +cent", "days?", "weeks?", "months?", "years?"].join("|"))})(?![A-Za-z]))`;
+
+/** (#408) "No unit word follows": optional spaces, then a unit word, must NOT come next. */
+const NO_UNIT_AFTER_SRC = `(?!\\s*${UNIT_WORD_SRC})`;
+
+/**
+ * A rule reference written in the generic way: one of these keywords (any
+ * case), then the ref. Catches refs the rubric did not send, too.
+ *
+ * (#408) Only real ref shapes count, so everyday wording about the
+ * applicant's own documents is not a citation:
+ *  - a CAPITALISED letter prefix then a number ("paragraph V 4.3",
+ *    "Appendix FM 2"; case-sensitive, so "rules in 2025" is not one), or
+ *  - a DOTTED number ("rule 4.2", "paragraph 9.8.1").
+ * A bare whole number ("Section 3 of your bank letter", "Paragraph 2 of your
+ * statement", "the rule of 28 days") does not count. Nor does a ref followed
+ * by a unit word ("section 2.3 times"). The `(?![\d.])` stops the number from
+ * backtracking to a shorter ref ("9.8.1 years" must not count as "9.8").
+ */
+const GENERIC_RULE_REF_RE = new RegExp(
+  `\\b(?:${anyCase(["rules?", "paragraphs?", "paras?", "sections?", "appendix", "annex", "clauses?"].join("|"))})` +
+    `\\s+(?:[A-Z]{1,4}[-\\s]?\\d+(?:\\.\\d+)*|\\d+(?:\\.\\d+)+)(?:\\([a-z0-9]+\\))?(?![\\d.]?\\d)${NO_UNIT_AFTER_SRC}`,
+  "g"
+);
 
 /** A rubric ref shorter than this (after removing spaces) is too vague to look for ("1", "A"). */
 const MIN_RULE_REF_CHARS = 3;
@@ -1923,6 +2091,11 @@ function escapeRegExp(text: string): string {
  *    citation; each distinct rule counts once per string;
  *  - plus every generic rule reference ("paragraph 9.8") left once the
  *    rubric's own refs are taken out (so "Rule V 4.2" is not counted twice).
+ *
+ * (#408) Everyday wording no longer counts: rubric refs are matched in the
+ * rubric's own letter case, a numeric-only rubric ref followed by a unit word
+ * is a quantity, and a generic ref needs a capitalised letter prefix or a
+ * dotted number (see `GENERIC_RULE_REF_RE`).
  */
 export function ruleCitationsIn(text: string, rules: readonly NarrativeRuleRef[] = []): number {
   const cited = new Set<number>();
@@ -1930,8 +2103,14 @@ export function ruleCitationsIn(text: string, rules: readonly NarrativeRuleRef[]
   rules.forEach((r, i) => {
     const ref = r.ref?.trim();
     if (!ref || ref.replace(/\s+/g, "").length < MIN_RULE_REF_CHARS) return;
-    // The ref as a whole token: whitespace-flexible, case-insensitive, not inside a longer id ("V 4.21").
-    const re = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(ref).replace(/\s+/g, "\\s+")}(?![A-Za-z0-9])`, "gi");
+    // The ref as a whole token: whitespace-flexible, not inside a longer id ("V 4.21").
+    // (#408) Case-SENSITIVE, written as the rubric writes it: "Appendix V"
+    // is the rubric's ref, "appendix v" in a sentence is not.
+    // (#408) A ref that is only a number ("2.3") is not a citation when a
+    // unit word follows it: "2.3 times the amount", "2.3 years", "2.3%" are
+    // quantities. "Under 2.3 you need a sponsor" still counts.
+    const numericOnly = /^\d+(?:\.\d+)*$/.test(ref);
+    const re = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(ref).replace(/\s+/g, "\\s+")}(?![A-Za-z0-9])${numericOnly ? NO_UNIT_AFTER_SRC : ""}`, "g");
     if (re.test(rest)) {
       cited.add(i);
       rest = rest.replace(re, " ");
