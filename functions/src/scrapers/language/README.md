@@ -36,6 +36,8 @@ language, never immigration content.
 | `dateTemplates` | regular expressions (JSON-escaped) with the named groups `day`, `month`, `year` and the placeholder `{months}`; run on lower-cased, NFKC-folded text |
 | `scopeWords` | the words that introduce an appendix or part ("Appendix", "Part") |
 | `referenceWords` | the words that start a legal reference; `Word. 12` is then a reference label and a paragraph number |
+| `listConnectors` | (#335) the lower-case words a list may set alone on a line between two items ("or", "and", "and/or"); the lead-in list reader keeps such a line between the items, and refuses a list holding any other unmarked line |
+| `headingWords` | (#335) the words that name a division of a legal text ("Article", "Chapter", "Annex"); a line of one of them (as written or in capitals) and its number, numeral or letter is a heading: it ends a list and is never an item's words |
 
 A digit run in a shape the file does not list is UNREADABLE, and an unreadable
 number is rejected, never guessed. Leave a word out when it is ambiguous (the

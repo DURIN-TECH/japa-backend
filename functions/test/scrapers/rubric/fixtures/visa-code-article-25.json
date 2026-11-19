@@ -1,0 +1,33 @@
+{
+  "_comment": "Issue #335. Verbatim lines copied BY CODE (build-visa-code-fixtures.mjs) from the stored snapshot of Regulation (EC) No 810/2009 (Visa Code), consolidated text of 28 June 2024, Article 25(1) and the rest of its article, as stored on durin-seli-dev (sourceId and contentHash below). Each line is one line of the snapshot's text, unchanged (no-break spaces kept). Do not edit by hand.",
+  "sourceId": "schengen-area-visa-code-regulation-ec-no-810-2009-consolidated-text-of-28-june-2024",
+  "contentHash": "81bb40570a4e9eaf56f62b2bd1a8a7f7e728270fe0a52c107b79dbac54b5d1c3",
+  "url": "http://publications.europa.eu/resource/cellar/2356e285-9098-11ef-a130-01aa75ed71a1.0007.03/DOC_1",
+  "celexUrl": "https://publications.europa.eu/resource/celex/02009R0810-20240628",
+  "fetchedAt": "2026-11-14T14:31:30.138Z",
+  "lines": [
+    "Article 25",
+    "Issuing of a visa with limited territorial validity",
+    "1.  ",
+    "A visa with limited territorial validity shall be issued exceptionally, in the following cases:",
+    "(a) ",
+    "when the Member State concerned considers it necessary on humanitarian grounds, for reasons of national interest or because of international obligations,",
+    "(i) ",
+    "to derogate from the principle that the entry conditions laid down in Article 5(1)(a), (c), (d) and (e) of the Schengen Borders Code must be fulfilled;",
+    "(ii) ",
+    "to issue a visa despite an objection by the Member State consulted in accordance with Article 22 to the issuing of a uniform visa; or",
+    "(iii) ",
+    "to issue a visa for reasons of urgency, although the prior consultation in accordance with Article 22 has not been carried out;",
+    "or",
+    "(b) ",
+    "when for reasons deemed justified by the consulate, a new visa is issued for a stay during the same 180-day period to an applicant who, over this 180-day period, has already used a uniform visa or a visa with limited territorial validity allowing for a stay of 90 days.",
+    "2.  ",
+    "A visa with limited territorial validity shall be valid for the territory of the issuing Member State. It may exceptionally be valid for the territory of more than one Member State, subject to the consent of each such Member State.",
+    "3.  ",
+    "If the applicant holds a travel document that is not recognised by one or more, but not all Member States, a visa valid for the territory of the Member States recognising the travel document shall be issued. If the issuing Member State does not recognise the applicant’s travel document, the visa issued shall only be valid for that Member State.",
+    "4.  ",
+    "When a visa with limited territorial validity has been issued in the cases described in paragraph 1(a), the central authorities of the issuing Member State shall circulate the relevant information to the central authorities of the other Member States without delay, by means of the procedure referred to in Article 16(3) of the VIS Regulation.",
+    "5.  ",
+    "The data set out in Article 10(1) of the VIS Regulation shall be entered into the VIS when a decision on issuing such a visa has been taken."
+  ]
+}

@@ -33,5 +33,7 @@
     "\\b(?<day>\\d{1,2})(?:o|a|º|ª)?(?:\\s+de)?\\s+(?<month>{months})\\b\\.?,?(?:\\s+del?)?\\s+(?<year>\\d{4})\\b"
   ],
   "scopeWords": ["Anexo", "Apéndice", "Apendice", "Parte"],
-  "referenceWords": ["Art", "Arts", "Artículo", "Artículos", "Articulo", "Articulos"]
+  "referenceWords": ["Art", "Arts", "Artículo", "Artículos", "Articulo", "Articulos"],
+  "listConnectors": ["o", "u", "y", "e", "y/o"],
+  "headingWords": ["Artículo", "Articulo", "Anexo", "Capítulo", "Capitulo", "Sección", "Seccion", "Título", "Titulo", "Parte", "Apéndice", "Apendice"]
 }

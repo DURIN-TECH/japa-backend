@@ -547,6 +547,8 @@ describe("prompt version pin", () => {
     "2026-11-rubric-v11": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
     // v12 (#235): the criteria call is unchanged, so its hash is v11's.
     "2026-11-rubric-v12": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
+    // v13 (#335): the criteria call is unchanged again (only call 2 moved), so its hash is v11's.
+    "2026-11-rubric-v13": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
   };
   // v5 onwards: the intake prompt and its schema are pinned too (call 2),
   // so a change to either also needs a version bump.
@@ -567,6 +569,13 @@ describe("prompt version pin", () => {
     "2026-11-rubric-v11": "c13a6c6236fef82fea10928454e975b6012affa247c9e34af00b3bb1fb7beea9",
     // v12 (#235): the intake call may draft competence steps and destination questions (`optionsFrom`).
     "2026-11-rubric-v12": "71aae5b23c5e0671f8d95841c65e4ccce8707cab634e01cb7044af6fe60fbbec",
+    // v13 (#335): a competence step's `restsOn` may be copied from one of a rule's `listItems`.
+    // Re-pinned in fix round 1 of #335 (the step words must be whole words, 8+ characters, in ONE
+    // line only). Same version on purpose: v13 exists only on the unmerged #335 branch and was never
+    // sent to a model or deployed, so no stored draft carries the earlier v13 text.
+    // Re-pinned again in fix round 2 of #335 (a rule with list lines: the step words come from one
+    // list line, never the lead-in quote). Same version for the same reason: still unpushed, never sent.
+    "2026-11-rubric-v13": "f70a8d439510944655f8ead19cc26edbe8cc12274f2b25b685bba6ff492c47f3",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {

@@ -247,6 +247,28 @@ describe("the loader", () => {
     assert.ok(compileLexicon(JSON.parse(fs.readFileSync(path.join(LEXICON_DIR, "es.json"), "utf8"))).months.size > 12);
   });
 
+  test("(#335) list connectors and division-heading words are language data, validated like the rest", () => {
+    const en = lexiconFor("en");
+    // The words a list may set alone on a line between two items.
+    assert.deepEqual([...en.listConnectors].sort(), ["and", "and/or", "or"]);
+    // A heading word (as written or in capitals) and its number, numeral or letter: the whole line.
+    for (const heading of ["Article 7", "Article 25a", "ARTICLE 7", "CHAPTER III", "Annex XII", "ANNEX II", "Section 2", "TITLE IV", "Part B"]) assert.ok(en.divisionHeadingRe?.test(heading), heading);
+    // Not a heading: a sentence that starts with the word, the word alone, lower-case words made of numeral letters.
+    for (const not of ["Article 7 applies to parcels.", "Article", "Title civil", "article 7", "Chapter and verse"]) assert.equal(en.divisionHeadingRe?.test(not), false, not);
+    // Another language has its own words; a language with no file has none (the reader then refuses).
+    assert.ok(lexiconFor("es").listConnectors.has("o") && !lexiconFor("es").listConnectors.has("or"));
+    assert.ok(lexiconFor("es").divisionHeadingRe?.test("Artículo 12"));
+    assert.equal(lexiconFor("zz").listConnectors.size, 0);
+    assert.equal(lexiconFor("zz").divisionHeadingRe, null);
+    // The validator: both fields are required lists; a connector is one lower-case word.
+    const good = JSON.parse(fs.readFileSync(path.join(LEXICON_DIR, "en.json"), "utf8"));
+    assert.deepEqual(lexiconProblems(good), []);
+    assert.ok(lexiconProblems({ ...good, listConnectors: undefined }).some((p) => /listConnectors/.test(p)));
+    assert.ok(lexiconProblems({ ...good, listConnectors: ["Or"] }).some((p) => /listConnectors/.test(p)));
+    assert.ok(lexiconProblems({ ...good, headingWords: "Article" }).some((p) => /headingWords/.test(p)));
+    assert.ok(lexiconProblems({ ...good, headingWords: ["Article of"] }).some((p) => /headingWords/.test(p)));
+  });
+
   test("a separator cannot be both decimal and thousands", () => {
     const good = JSON.parse(fs.readFileSync(path.join(LEXICON_DIR, "en.json"), "utf8"));
     assert.ok(lexiconProblems({ ...good, thousandsSeparators: ["."] }).some((p) => /both/.test(p)));

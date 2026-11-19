@@ -28,5 +28,7 @@
     "\\b(?<month>{months})\\b\\.?\\s+(?<day>\\d{1,2})(?:st|nd|rd|th)?,?\\s+(?<year>\\d{4})\\b"
   ],
   "scopeWords": ["Appendix", "Part"],
-  "referenceWords": []
+  "referenceWords": [],
+  "listConnectors": ["or", "and", "and/or"],
+  "headingWords": ["Article", "Annex", "Chapter", "Section", "Title", "Part", "Appendix", "Schedule"]
 }

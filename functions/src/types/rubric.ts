@@ -530,7 +530,13 @@ export interface CompetenceStep {
   // Where the country comes from: always the answer to `questionId`.
   resultFrom: "answer";
   // The words of the quote this step applies, copied from it (for example the
-  // phrase that names the case it covers). Code checks they are in `source.quote`.
+  // phrase that names the case it covers). Code checks they are in `source.quote`
+  // or (#335) in one of `source.listItems` (the cases of a lead-in quote): as
+  // whole words, at least 8 characters, and in EXACTLY ONE of those lines
+  // (words two cases share name neither; `competence_rests_on_ambiguous`).
+  // (#335, fix round 2) When the rule HAS list lines, that one line must be a
+  // list line, never the lead-in quote (`competence_rests_on_lead_in`).
+  // A step's SHOWN quote is the quote plus that list line (`stepQuoteShown`).
   restsOn: string;
   // The quote and URL, exactly like any rule's (copied from the rule `criterionId`).
   source: RubricCitation;
