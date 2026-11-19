@@ -37,6 +37,8 @@ import { clientChargeFields } from "../money/client-charge";
 import { feeDebitDocId, refundDocId } from "../money/refund-id";
 import type { Transaction as FirestoreTransaction } from "firebase-admin/firestore";
 import { isWellFormedFee } from "./billing/paystack.provider";
+// Issue #395: Paystack's fee on a CONFIRMED payment is the agent's (credit A - F).
+import { classifyPaystackFee } from "../money/paystack-fee";
 
 export {
   CHECKOUT_WAIT_ATTEMPTS,
@@ -371,6 +373,10 @@ function holdFor(booking: Consultation, consultationId: string): FeeHold | undef
     return undefined;
   }
 }
+
+// (Issue #395: on a payment that DOES confirm its booking, step 5 of
+// settlePayment, Paystack's fee is the agent's: the fee Transaction records
+// it and the agent is credited A - F. See money/paystack-fee.ts.)
 
 // ============================================
 // 4a. Who carries Paystack's fee on an unapplied payment (issue #354)
@@ -723,7 +729,12 @@ export type SettleOutcome =
  *     answers because the booking was paid or cancelled since; only the
  *     outcome kind follows the booking's state.
  *  5. Otherwise confirm: paid/scheduled plus the fee Transaction in the same
- *     commit. Settled on a superseded reference, the booking takes THAT
+ *     commit. (Issue #395) The Transaction records Paystack's fee for this
+ *     reference from `reported` (`fees`, only when well-formed and in the
+ *     charged currency): `amount` stays A, the agent is credited A - F; an
+ *     unknown fee (or one not less than A) is stored as such and credited
+ *     nowhere. A second verify or the webhook find the booking paid
+ *     (`already_paid`), so the fee is written once with the row. Settled on a superseded reference, the booking takes THAT
  *     checkout's snapshot and lock (so booking and Transaction agree), its
  *     then-current checkout moves to the superseded list (a later payment on
  *     it is a second charge, step 3), and both records carry
@@ -935,6 +946,18 @@ export async function settlePayment(
       updatedAt: now,
     };
     const settled = { ...current, ...updates } as Consultation;
+    // Issue #395 (decision 2026-11-17: the agent pays Paystack's fee): the
+    // fee for THIS reference, from THIS report, counted only when it is
+    // well-formed and in the charged currency. Unknown, or not less than
+    // what was charged: the booking is still confirmed (the client paid),
+    // but the row says so and credits the agent nothing until it is known.
+    const paystackFee = classifyPaystackFee(check.charged.amountMinor, check.charged.currency, reported);
+    if (paystackFee.status !== "known") {
+      console.warn(
+        `[consultation] ${consultationId} confirmed, but Paystack's fee on ${reference} is ${paystackFee.status}: ` +
+          "the fee is credited to the agent nowhere until it is known (lookup job / admin refresh)"
+      );
+    }
     const transaction = transactionService.buildConsultationFee(txRef.id, now, {
       consultationId,
       clientUserId: current.userId,
@@ -947,6 +970,8 @@ export async function settlePayment(
       snapshot: snapshotOf(settled),
       // Issue #317: the fee is HELD until the meeting has happened.
       feeHold: holdFor(settled, consultationId),
+      // Issue #395: Paystack's fee, stored in this same commit as the flip.
+      paystackFee,
     });
     // The review fields ride on the Transaction too.
     const recorded: Transaction = { ...transaction, ...review };

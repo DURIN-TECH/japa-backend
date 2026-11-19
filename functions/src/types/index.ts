@@ -1696,6 +1696,25 @@ export interface FeeHold {
 }
 
 /**
+ * Issue #395: where Paystack's fee on a consultation fee Transaction stands.
+ *  - "known": Paystack reported a well-formed fee in the charge currency,
+ *    below the amount charged. The agent is credited `amount - fee` under
+ *    the normal hold rules;
+ *  - "unknown": Paystack reported no well-formed fee in the charge currency
+ *    (missing, null, negative, a string, a fraction, another currency). The
+ *    booking is confirmed (the client paid), but the row is credited NOWHERE
+ *    (not held, not available, not revenue) until the fee is known. The
+ *    scheduled job and the admin refresh look it up again;
+ *  - "fee_not_less_than_amount": Paystack's fee is the whole charge or more,
+ *    so the credit would be zero or negative. The fee is stored, nothing is
+ *    credited automatically, and the row is listed for an admin.
+ */
+export type PaystackFeeStatus = "known" | "unknown" | "fee_not_less_than_amount";
+
+/** Issue #395: what stored Paystack's fee on a consultation fee Transaction. */
+export type PaystackFeeResolvedBy = "settle" | "job" | "admin_refresh" | "refund";
+
+/**
  * One financial event.
  *
  * Issue #180: a consultation-fee transaction also records the charge
@@ -1751,6 +1770,32 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   // ---- Issue #317: the hold on a consultation fee (type "consultation_fee") ----
   /** See `FeeHold`. Absent on a fee written before #317 (counted as held until backfilled). */
   feeHold?: FeeHold;
+
+  // ---- Issue #395: Paystack's fee on a consultation fee (type "consultation_fee") ----
+  // Decision (user, 2026-11-17): on a paid consultation the AGENT pays
+  // Paystack's fee. `amount` stays what the client was charged (A); the agent
+  // is credited A - F, where F is Paystack's own `fees` for this reference in
+  // the charge currency. F is never estimated, never a rate, never a default.
+  // All three fields are absent on a fee written before #395 (a LEGACY row):
+  // it keeps counting as A (money/paystack-fee.ts `consultationFeeCredit`).
+  /**
+   * Paystack's processing fee on this charge, in minor units of `currency`,
+   * exactly as Paystack reported it. Set when `paystackFeeStatus` is "known"
+   * or "fee_not_less_than_amount"; absent while it is "unknown".
+   */
+  paystackFeeMinor?: number;
+  /** Where Paystack's fee for this charge stands (see PaystackFeeStatus). */
+  paystackFeeStatus?: PaystackFeeStatus;
+  /**
+   * What the agent is credited: `amount - paystackFeeMinor`, in minor units
+   * of `currency`. Set only when `paystackFeeStatus` is "known" (shown to
+   * the agent side next to the fee; the balances recompute it from the fee).
+   */
+  agentCreditMinor?: number;
+  /** When Paystack's fee was stored (at settle, or later by the job / an admin refresh / a refund). */
+  paystackFeeResolvedAt?: Timestamp;
+  /** What stored Paystack's fee (see PaystackFeeResolvedBy). */
+  paystackFeeResolvedBy?: PaystackFeeResolvedBy;
 
   // ---- Issue #317: a consultation refund (type "refund") ----
   // Refund rows are written by the backend only (firestore.rules deny every

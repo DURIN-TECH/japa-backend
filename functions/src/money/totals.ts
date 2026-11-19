@@ -1,6 +1,8 @@
 import type { CurrencyCode } from "../types/money";
 import type { Transaction, TransactionStatus } from "../types";
 import { normalizeCurrencyCode } from "./currencies";
+// Issue #395: what a consultation fee credits the agent (A - Paystack's fee).
+import { consultationFeeCredit } from "./paystack-fee";
 
 // ============================================
 // PER-CURRENCY TOTALS (issue #282)
@@ -126,6 +128,12 @@ export function unionCurrencies(...sets: CurrencyBuckets[]): CurrencyCode[] {
 //    balance too, never off `heldBalance`;
 //  - (issue #354) the refund of an UNAPPLIED payment (`refundFundedFrom:
 //    "unapplied_payment"`) is neutral: that payment was never revenue.
+//  - (issue #395) a settled "consultation_fee" adds what it CREDITS the
+//    agent, not what the client was charged: A - Paystack's fee F
+//    (`consultationFeeCredit`, money/paystack-fee.ts). A row whose fee is
+//    unknown (or not less than A) adds 0 until the fee is known. A legacy
+//    row (no fee status, written before #395) adds A as before. So the
+//    agent's `totalRevenue` and the analytics revenue are NET of the fee.
 
 /** Statuses at which a transaction's money has actually moved. */
 export const SETTLED_STATUSES: readonly TransactionStatus[] = ["completed", "released"];
@@ -148,7 +156,8 @@ export function isSettled(txn: Pick<Transaction, "status">): boolean {
  * -amount for a settled refund, 0 otherwise (unsettled rows, withdrawals).
  */
 export function revenueEffect(
-  txn: Pick<Transaction, "type" | "status" | "amount"> & Partial<Pick<Transaction, "refundFundedFrom">>
+  txn: Pick<Transaction, "type" | "status" | "amount"> &
+    Partial<Pick<Transaction, "refundFundedFrom" | "paystackFeeStatus" | "paystackFeeMinor">>
 ): number {
   if (txn.type === "withdrawal" || !isSettled(txn)) return 0;
   // Issue #354: the refund of a payment that never confirmed its booking
@@ -159,6 +168,9 @@ export function revenueEffect(
   // taken from the agent. An outflow, like a refund: it lowers revenue in its
   // own currency (computeStats takes it off the available balance too).
   if (isAgentDebit(txn)) return -txn.amount;
+  // Issue #395: a consultation fee counts what it credits the agent
+  // (A - Paystack's fee), or nothing while that cannot be worked out.
+  if (txn.type === "consultation_fee") return consultationFeeCredit(txn) ?? 0;
   return txn.type === "refund" ? -txn.amount : txn.amount;
 }
 

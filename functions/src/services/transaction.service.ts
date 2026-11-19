@@ -6,6 +6,8 @@ import {
   PaymentRequest,
   // Issue #317: fee holds and consultation refunds.
   FeeHold,
+  // Issue #395: Paystack's fee on a consultation fee.
+  PaystackFeeStatus,
   RefundFundedFrom,
   RefundReason,
 } from "../types";
@@ -23,6 +25,8 @@ import {
 } from "../money/totals";
 // Issue #317: a consultation fee is HELD until the meeting has happened.
 import { feeHoldStatusAt } from "../money/fee-hold";
+// Issue #395: the agent is credited A - Paystack's fee (one shared rule).
+import { consultationFeeCredit, PaystackFeeClassification, paystackFeeFields } from "../money/paystack-fee";
 
 export interface TransactionFilters {
   status?: TransactionStatus;
@@ -33,6 +37,14 @@ export interface TransactionFilters {
    * and type+status+createdAt); applied in memory for the other scopes.
    */
   type?: Transaction["type"];
+  /**
+   * Issue #395: only consultation fee rows whose Paystack fee stands so
+   * (the admin list of unknown fees,
+   * `GET /transactions?role=admin&type=consultation_fee&paystackFeeStatus=unknown`).
+   * Admin scope only (the controller refuses it for anyone else); pushed into
+   * the Firestore query (composite index type + paystackFeeStatus + createdAt).
+   */
+  paystackFeeStatus?: PaystackFeeStatus;
   applicationId?: string;
   startDate?: string;
   endDate?: string;
@@ -76,6 +88,17 @@ export interface CurrencyTransactionStats {
    * withdrawable. A fee refunded out of the hold leaves it.
    */
   heldBalance: number;
+  /**
+   * Issue #395 (orchestrator decision 2026-11-17: admin and platform views
+   * show gross, the fee and net side by side). ADMIN stats only
+   * (`computeStats(..., { feeBreakdown: true })`): Paystack's fees taken off
+   * the consultation fees counted in `totalRevenue`, in this currency.
+   * `totalRevenue` is the NET figure; `grossRevenue` = `totalRevenue` +
+   * `paystackFees`. A fee row whose fee is unknown is in none of the three.
+   */
+  paystackFees?: number;
+  /** Issue #395, admin stats only: `totalRevenue` before Paystack's fees (see `paystackFees`). */
+  grossRevenue?: number;
 }
 
 /**
@@ -177,10 +200,12 @@ class TransactionService {
 
     query = this.applyFilters(query, filters);
     const snapshot = await query.get();
-    // (#317) `type` is applied in memory here (no extra composite index).
+    // (#317) `type` is applied in memory here (no extra composite index),
+    // and so is (#395) `paystackFeeStatus`.
     return snapshot.docs
       .map((doc) => doc.data() as Transaction)
-      .filter((txn) => !filters?.type || txn.type === filters.type);
+      .filter((txn) => !filters?.type || txn.type === filters.type)
+      .filter((txn) => !filters?.paystackFeeStatus || txn.paystackFeeStatus === filters.paystackFeeStatus);
   }
 
   /**
@@ -281,8 +306,10 @@ class TransactionService {
       results.push(
         ...snapshot.docs
           .map((doc) => doc.data() as Transaction)
-          // (#317) `type` is applied in memory here (no extra composite index).
+          // (#317) `type` is applied in memory here (no extra composite index),
+          // and so is (#395) `paystackFeeStatus`.
           .filter((txn) => !filters?.type || txn.type === filters.type)
+          .filter((txn) => !filters?.paystackFeeStatus || txn.paystackFeeStatus === filters.paystackFeeStatus)
       );
     }
 
@@ -303,6 +330,9 @@ class TransactionService {
     // (#317) The admin refund list filters by type IN Firestore (indexes
     // transactions(type, createdAt desc) and (type, status, createdAt desc)).
     if (filters?.type) query = query.where("type", "==", filters.type);
+    // (#395) The admin list of consultation fees whose Paystack fee is still
+    // unknown: index transactions(type, paystackFeeStatus, createdAt desc).
+    if (filters?.paystackFeeStatus) query = query.where("paystackFeeStatus", "==", filters.paystackFeeStatus);
     query = this.applyFilters(query, filters);
     const snapshot = await query.get();
     return snapshot.docs.map((doc) => doc.data() as Transaction);
@@ -353,6 +383,14 @@ class TransactionService {
    *  - (issue #354) a `paystack_fee_debit` lowers `totalRevenue` (shared
    *    `revenueEffect`) and `availableBalance` of its own currency from the
    *    moment it is written, never `heldBalance`, never pending payments;
+   *  - (issue #395) a settled `consultation_fee` counts what it CREDITS the
+   *    agent: A - Paystack's fee F (`consultationFeeCredit`), in `heldBalance`
+   *    while held and in `availableBalance` once released. A fee whose
+   *    Paystack fee is unknown (or not less than A) counts in NEITHER
+   *    balance, nor in revenue, and releasing the meeting hold does not make
+   *    it withdrawable. A legacy fee (no fee status) counts A, as before.
+   *    With `opts.feeBreakdown` (admin stats) each row also carries
+   *    `paystackFees` and `grossRevenue` (gross, fee and net side by side);
    *  - a currency appears in `byCurrency` as soon as any transaction in it
    *    is seen (even one that adds 0, e.g. a failed charge), so the list is
    *    empty only when there are no transactions at all.
@@ -368,7 +406,12 @@ class TransactionService {
    * Used by GET /transactions/stats for every role, and by the withdrawal
    * balance check (withdrawWithBalanceCheck), so both always agree.
    */
-  computeStats(transactions: Transaction[], at: Date = this.now()): TransactionStats {
+  computeStats(
+    transactions: Transaction[],
+    at: Date = this.now(),
+    /** Issue #395: `feeBreakdown` adds `paystackFees` + `grossRevenue` per currency (admin stats). */
+    opts: { feeBreakdown?: boolean } = {}
+  ): TransactionStats {
     // Separate running sums per currency for each figure.
     const revenue = new CurrencyBuckets();
     const pending = new CurrencyBuckets();
@@ -377,6 +420,9 @@ class TransactionService {
     // from revenue), because held fees are revenue but not available.
     const available = new CurrencyBuckets();
     const held = new CurrencyBuckets();
+    // Issue #395: Paystack's fees taken off the consultation fees counted in
+    // revenue (for the admin's gross / fee / net breakdown).
+    const paystackFees = new CurrencyBuckets();
     // Distinct paying clients with a pending payment (count, not money).
     const pendingUserIds = new Set<string>();
 
@@ -440,9 +486,15 @@ class TransactionService {
       }
       if (!isSettled(txn)) continue;
       if (txn.type === "consultation_fee") {
+        // Issue #395: the agent's credit is A - Paystack's fee. A fee that
+        // cannot be worked out yet credits nothing, held or released.
+        const credit = consultationFeeCredit(txn);
+        if (credit === null) continue;
+        // The fee Paystack kept, for the admin breakdown (0 on a legacy row).
+        paystackFees.add(currency, txn.amount - credit);
         const hold = feeHoldStatusAt(txn, at);
-        if (hold === "held") held.add(currency, txn.amount);
-        else if (hold === "released") available.add(currency, txn.amount);
+        if (hold === "held") held.add(currency, credit);
+        else if (hold === "released") available.add(currency, credit);
         // "refunded": given back out of the hold, counted nowhere.
         continue;
       }
@@ -459,6 +511,10 @@ class TransactionService {
       // money owed, and the withdrawal check then refuses every amount.
       availableBalance: available.get(currency) - withdrawn.get(currency),
       heldBalance: held.get(currency),
+      // Issue #395: admin stats show gross, Paystack's fee and net together.
+      ...(opts.feeBreakdown
+        ? { paystackFees: paystackFees.get(currency), grossRevenue: revenue.get(currency) + paystackFees.get(currency) }
+        : {}),
     }));
 
     return { byCurrency, pendingClientsCount: pendingUserIds.size };
@@ -704,6 +760,11 @@ class TransactionService {
    * `chargedAmountMinor`). A LEGACY booking has no snapshot: its naira fee in
    * kobo is recorded with an empty one. The currency is always explicit:
    * there is no naira default here any more.
+   *
+   * Issue #395: the row also records Paystack's fee for the reference
+   * (`paystackFeeMinor`, `paystackFeeStatus`, `agentCreditMinor` = A - F).
+   * `amount` stays A. While the fee is unknown the status says so and no fee
+   * is stored, and no `paystackFeeResolvedAt` either.
    */
   buildConsultationFee(
     id: string,
@@ -724,6 +785,13 @@ class TransactionService {
       snapshot?: Partial<ChargeSnapshot>;
       /** Issue #317: the hold on the fee until the meeting has happened (see money/fee-hold.ts). */
       feeHold?: FeeHold;
+      /**
+       * Issue #395: Paystack's fee for this reference, as classified from
+       * Paystack's own report (`classifyPaystackFee`): known, unknown, or
+       * not less than the amount. Required: a fee row is never written
+       * without saying where Paystack's fee stands (no silent full credit).
+       */
+      paystackFee: PaystackFeeClassification;
     }
   ): Transaction {
     return {
@@ -737,8 +805,17 @@ class TransactionService {
       ...(input.agentUserId ? { agentId: input.agentUserId } : {}),
       consultationId: input.consultationId,
       type: "consultation_fee",
+      // A: what the client was charged. Never the net (the client's history,
+      // the refund engine's base and Paystack all use this figure).
       amount: input.amount,
       currency: input.currency,
+      // Issue #395: Paystack's fee and the agent's credit (A - F), or the
+      // "unknown" / "fee_not_less_than_amount" status, stored with the row.
+      ...paystackFeeFields(input.amount, input.paystackFee),
+      // When and by what the fee was stored (absent while it is unknown).
+      ...(input.paystackFee.status !== "unknown"
+        ? { paystackFeeResolvedAt: now, paystackFeeResolvedBy: "settle" as const }
+        : {}),
       status: "completed",
       isEscrow: false,
       paymentProvider: "paystack",
@@ -1047,6 +1124,8 @@ class TransactionService {
     if (filters.status && txn.status !== filters.status) return false;
     // (#317) The type filter, as the other scopes apply it.
     if (filters.type && txn.type !== filters.type) return false;
+    // (#395) The Paystack-fee filter, as the other scopes apply it.
+    if (filters.paystackFeeStatus && txn.paystackFeeStatus !== filters.paystackFeeStatus) return false;
     if (filters.applicationId && txn.applicationId !== filters.applicationId) return false;
 
     // Compare by milliseconds: `createdAt` is a Firestore Timestamp.

@@ -3,7 +3,9 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { transactionService, TransactionFilters } from "../services/transaction.service";
 import { toClientTransaction } from "../transactions/client-transaction";
 import { collections } from "../utils/firebase";
-import { Agent, Transaction } from "../types";
+import { Agent, PaystackFeeStatus, Transaction } from "../types";
+// Issue #395: looking an unknown Paystack fee up again (admin only).
+import { paystackFeeService } from "../services/paystack-fee.service";
 import { ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
@@ -18,6 +20,9 @@ const TRANSACTION_TYPES: Transaction["type"][] = [
   "paystack_fee_debit",
 ];
 
+/** Issue #395: every Paystack-fee status, for the admin `paystackFeeStatus` list filter. */
+const PAYSTACK_FEE_STATUSES: PaystackFeeStatus[] = ["known", "unknown", "fee_not_less_than_amount"];
+
 export class TransactionController {
   /**
    * GET /transactions?role=client|agent|owner|admin&type=...&status=...&applicationId=...&startDate=...&endDate=...
@@ -25,6 +30,17 @@ export class TransactionController {
    * Issue #317: `type` narrows the list to one Transaction type. The admin
    * refund screen (#357) uses `role=admin&type=refund&status=failed` to list
    * refunds that need a human.
+   *
+   * Issue #395: `paystackFeeStatus` (`known` | `unknown` |
+   * `fee_not_less_than_amount`) narrows the list to consultation fees whose
+   * Paystack fee stands so. ADMIN ONLY: the admin list of fees still waiting
+   * for Paystack is
+   * `GET /transactions?role=admin&type=consultation_fee&paystackFeeStatus=unknown`.
+   * Any other caller passing it (client, agent, owner; whatever `role` says)
+   * gets 403 before anything is read; an unknown value is 400. Agent-side
+   * rows carry `paystackFeeMinor`, `agentCreditMinor` and `paystackFeeStatus`
+   * themselves (the fee, the net, and "waiting for the payment provider's
+   * fee"); the client allow-list never does.
    *
    * Scoping (issue #292). The scope is decided from the caller's OWN role
    * (`req.authz.role`, resolved by verifyAuth from the token's custom claims),
@@ -88,8 +104,22 @@ export class TransactionController {
       const type = typeParam && (TRANSACTION_TYPES as string[]).includes(typeParam)
         ? (typeParam as TransactionFilters["type"])
         : undefined;
+      // (#395) The admin-only Paystack-fee filter: checked against the
+      // caller's REAL role before any scope is chosen or anything is read.
+      const feeStatusParam = req.query.paystackFeeStatus as string | undefined;
+      if (feeStatusParam !== undefined) {
+        if (callerRole !== ROLES.ADMIN) {
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
+        }
+        if (!(PAYSTACK_FEE_STATUSES as string[]).includes(feeStatusParam)) {
+          sendError(res, "VALIDATION_ERROR", `paystackFeeStatus must be one of: ${PAYSTACK_FEE_STATUSES.join(", ")}`);
+          return;
+        }
+      }
       const filters: TransactionFilters = {
         type,
+        paystackFeeStatus: feeStatusParam as PaystackFeeStatus | undefined,
         status: req.query.status as TransactionFilters["status"],
         applicationId: req.query.applicationId as string,
         startDate: req.query.startDate as string,
@@ -170,6 +200,10 @@ export class TransactionController {
    * Amounts are integer minor units of each row's `currency`; rows are sorted
    * by code; `byCurrency` is empty when the scope has no transactions. Role
    * scoping is unchanged (admin: all; owner: own agency's agents; agent: own).
+   * Issue #395: `totalRevenue`, `heldBalance` and `availableBalance` count a
+   * consultation fee NET of Paystack's fee (A - F), and a fee whose Paystack
+   * fee is unknown not at all. `role=admin` rows also carry `paystackFees`
+   * and `grossRevenue` (gross = net + Paystack's fees).
    */
   async getStats(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
@@ -177,6 +211,8 @@ export class TransactionController {
       const role = (req.query.role as string) || "agent";
 
       let transactions;
+      // Issue #395: admin stats show gross, Paystack's fee and net side by side.
+      let feeBreakdown = false;
 
       switch (role) {
       case ROLES.ADMIN: {
@@ -185,6 +221,7 @@ export class TransactionController {
           return;
         }
         transactions = await transactionService.getAllTransactions();
+        feeBreakdown = true;
         break;
       }
       case ROLES.OWNER: {
@@ -212,7 +249,7 @@ export class TransactionController {
       }
 
       // Per-currency aggregation (see TransactionService.computeStats).
-      const stats = transactionService.computeStats(transactions);
+      const stats = transactionService.computeStats(transactions, transactionService.now(), { feeBreakdown });
       sendSuccess(res, stats);
     } catch (error) {
       console.error("Error getting transaction stats:", error);
@@ -265,6 +302,67 @@ export class TransactionController {
       sendSuccess(res, transaction);
     } catch (error) {
       console.error("Error getting transaction:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /transactions/:id/paystack-fee/refresh (issue #395, admins only).
+   *
+   * Looks the consultation fee's Paystack reference up again and stores
+   * Paystack's fee when it is now known (well-formed, in the charge
+   * currency). Admins never type a fee in. Answers:
+   *  - not an admin: 403 before anything is read (no token: 401, verifyAuth);
+   *  - no such Transaction, or not a consultation fee: 404;
+   *  - written before #395 (no fee status, credited A): 409 FEE_NOT_TRACKED;
+   *  - the fee was already stored: 200 `{ refreshed: false, transaction }`,
+   *    nothing written (a known fee is never overwritten);
+   *  - Paystack still has no well-formed fee: 409 PAYSTACK_FEE_UNKNOWN,
+   *    nothing written;
+   *  - Paystack could not be reached: 502 PAYSTACK_ERROR, nothing written;
+   *  - stored now: 200 `{ refreshed: true, transaction }` (status "known", or
+   *    "fee_not_less_than_amount", which still credits nothing).
+   * Two refreshes at once store the fee once (paystack-fee.service.ts).
+   */
+  async refreshPaystackFee(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      if (req.authz?.role !== ROLES.ADMIN) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const outcome = await paystackFeeService.resolveOne(req.params.id, "admin_refresh");
+      switch (outcome.kind) {
+      case "not_found":
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      case "not_tracked":
+        sendError(
+          res,
+          "FEE_NOT_TRACKED",
+          "This payment was recorded before Paystack's fee was tracked, so there is no fee to look up.",
+          409
+        );
+        return;
+      case "still_unknown":
+        sendError(
+          res,
+          "PAYSTACK_FEE_UNKNOWN",
+          "Paystack still reports no processing fee for this payment. Try again later.",
+          409
+        );
+        return;
+      case "paystack_unavailable":
+        sendError(res, "PAYSTACK_ERROR", "Paystack could not be reached. Try again in a moment.", 502);
+        return;
+      case "already_resolved":
+        sendSuccess(res, { refreshed: false, transaction: outcome.transaction });
+        return;
+      case "resolved":
+        sendSuccess(res, { refreshed: true, transaction: outcome.transaction });
+        return;
+      }
+    } catch (error) {
+      console.error("Error refreshing Paystack fee:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }
