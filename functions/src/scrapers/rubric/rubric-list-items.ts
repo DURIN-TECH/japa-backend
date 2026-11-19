@@ -127,9 +127,13 @@ import type { RubricFlag } from "../../types/rubric";
 // follows before the next hard start (closing words with no marker, or up to
 // three heading-shaped lines followed by a hard start) is not caught; nor is a
 // cut whose end is a hard start or the lead-in's sibling, which both proofs
-// take as ends by shape; nor a cut followed, under the heading, by a new list
-// that opens with a first marker ("(a)", "(1)", "(i)") and is then followed in
-// order, where the stored list's own next marker never appears.
+// take as ends by shape (except that a last line ending "; or" / "; and" is
+// refused unless the lead-in's sibling follows, review round 4); nor a cut
+// followed, before the next hard start, by a new list that opens with a first
+// marker ("(a)", "(1)", "(i)") and then runs in order, even when the stored
+// list's own next marker appears and reads as that new list's next item
+// ("(a) one;" / "(b) two;" / a heading / a sentence / "(a) new one;" /
+// "(b) new two;" / "(c) old three." proves with only (a) and (b) stored).
 //
 // Pure functions over the snapshot's lines. Nothing here knows what any
 // document is about, which route, country or nationality it concerns.
@@ -179,7 +183,7 @@ export const LIST_UNREADABLE_DETAIL: Record<ListUnreadableReason, string> = {
   marker_out_of_order: "a list marker after the lead-in does not follow the marker before it and does not start a deeper list at its first marker, so which list it belongs to cannot be told",
   line_after_item_not_recognised: "a line after a list item is not the next marker, a connector word between two items, or a known end of the list (the end of the page, a paragraph number, a reference label or a heading), so where the list ends cannot be told; the list was not cut there",
   editorial_mark_in_item: "a list line holds the publisher's amendment mark, which is not part of the official words, so the item cannot be stored verbatim",
-  list_end_not_proven: "the line after the last stored list line is not a known end of the list (the end of the page, a paragraph number, a reference label, a heading or the lead-in's next sibling), or, after a heading-shaped end and before the next paragraph, a list marker would continue the list or cannot be read as part of a new list opened under the heading, so the stored list may be cut short",
+  list_end_not_proven: "the line after the last stored list line is not a known end of the list (the end of the page, a paragraph number, a reference label, a heading or the lead-in's next sibling), or the last stored line ends with a connector word after its semicolon (as in ; or) and the lead-in's next sibling does not follow, or, after a heading-shaped end and before the next paragraph, a list marker would continue the list or cannot be read as part of a new list opened under the heading, so the stored list may be cut short",
   connector_out_of_place: "a line that is only a connector word (such as \"or\" or \"and\") stands where an unmarked list line should be, for example straight after the lead-in, so which items it joins cannot be told",
 };
 
@@ -272,6 +276,8 @@ interface LineTests {
   isLabel: (line: string) => boolean;
   /** The line is only a connector word between two items ("or", "and", "and/or"). */
   isConnector: (line: string) => boolean;
+  /** (#335, review round 4) True when a line ends with a connector word after its last semicolon ("...; or"). */
+  endsWithConnector: (line: string) => boolean;
   /** The whole line is a division heading ("Article 7", "CHAPTER III", "ANNEX II"). */
   isDivisionHeading: (line: string) => boolean;
   /** The line is a HARD start of something else: a paragraph number, a label or a division heading. */
@@ -351,7 +357,12 @@ function lineTestsFor(lexicon: Lexicon): LineTests {
   };
   const isItemWords = (line: string | undefined): line is string =>
     line !== undefined && !isMarked(line) && !isNumberOnly(line) && !isLabel(line) && !isDivisionHeading(line) && !isAmendmentMark(line) && !isConnector(line) && /[\p{L}\p{N}]/u.test(line);
-  return { isLabel, isConnector, isDivisionHeading, isHardStart, isKnownEnd, isItemWords };
+  /** The words after the line's LAST semicolon, when they are one connector ("(b) two; or" -> "or"). */
+  const endsWithConnector = (line: string): boolean => {
+    const semi = line.lastIndexOf(";");
+    return semi >= 0 && isConnector(line.slice(semi + 1));
+  };
+  return { isLabel, isConnector, endsWithConnector, isDivisionHeading, isHardStart, isKnownEnd, isItemWords };
 }
 
 /**
@@ -596,7 +607,10 @@ export function readListLines(leadLine: string, following: readonly string[], ct
  *     "(a) ...;" / "Exceptions for minors" / a sentence / "(b) ...", which both
  *     earlier checks accepted, a cut inside a second sub-list that repeats the
  *     first one's markers, and a footnote line before the continuing marker.
- *     It does not catch a cut with no marker before the next hard start (see
+ *     It does not catch a cut with no marker before the next hard start, nor
+ *     a cut followed, before the next hard start, by a new list that opens
+ *     with a first marker and then runs in order, even when the stored list's
+ *     own next marker appears and reads as that new list's next item (see
  *     the header).
  *
  * An unmarked list has no markers to prove an end with, so point 3 is the
@@ -663,7 +677,6 @@ export function proveStoredList(leadLine: string, following: readonly string[], 
   if (endsWithColon(items[items.length - 1])) return no("list_end_not_proven");
   at = skipMarks(at);
   let end: string | undefined = following[at];
-  if (end === undefined) return { ok: true }; // the end of the page
   const leadMarker = leadMarkerOf(leadLine, ctx.before);
   /** Is this line the marker that directly follows the lead-in's own (in any kind of list, or as an inserted marker)? */
   const isLeadSibling = (line: string): boolean => {
@@ -671,6 +684,15 @@ export function proveStoredList(leadLine: string, following: readonly string[], 
     if (inner === undefined || leadMarker === undefined) return false;
     return (["letter", "roman", "digit"] as const).some((kind) => markerFollows(kind, leadMarker, inner)) || inner === `${leadMarker}a`;
   };
+  // (#335, review round 4) A last stored line that ENDS WITH A CONNECTOR after
+  // its semicolon ("(b) two; or", "; and", words from the language file's
+  // `listConnectors`) promises another item. It is a whole list only when that
+  // next item is the lead-in's own sibling (a nested lead-in's last sub-item
+  // may end "; or" right before the parent's next point). Anywhere else (a
+  // paragraph number, a heading, the end of the page) the list was cut there:
+  // this closes most of the "cut at a hard start" class the header names.
+  if (t.endsWithConnector(items[items.length - 1]) && !(end !== undefined && isLeadSibling(end))) return no("list_end_not_proven");
+  if (end === undefined) return { ok: true }; // the end of the page
   // One connector word may join the lead-in to its sibling ("...; or" / "(b)").
   if (t.isConnector(end)) {
     at = skipMarks(at + 1);

@@ -245,3 +245,42 @@ describe("fuzz: nested, repeated sub-lists and non-continuing markers never let 
     assert.ok(accepted > 3000 && wholeAccepted === accepted, `the proof accepted only ${accepted} lists`);
   });
 });
+
+// ============================================
+// D. Review round 4: a last line ending "; or" / "; and" promises another item
+// ============================================
+
+describe("review round 4: a stored last line that ends with a connector is a cut unless the lead-in's sibling follows", () => {
+  test("(a) one; / (b) two; or / 2. is refused (a cut at a hard start)", () => {
+    const following = ["(a) one;", "(b) two; or", "2.", LONG];
+    assert.deepEqual(proveStoredList(LEAD, following, ["(a) one;", "(b) two; or"]), REFUSED);
+  });
+
+  test("every connector of the language file, after the semicolon, is refused at a hard start, a heading and the end of the page", () => {
+    for (const word of ["or", "and", "and/or", "OR"]) {
+      const last = `(b) two; ${word}`;
+      for (const tail of [["2."], ["Article 9"], [HEADING, LONG], []]) {
+        const following = ["(a) one;", last, ...tail];
+        assert.deepEqual(proveStoredList(LEAD, following, ["(a) one;", last]), REFUSED, `${word} / ${JSON.stringify(tail)}`);
+      }
+    }
+  });
+
+  test("the lead-in's sibling right after it is a whole list: a nested lead-in's last sub-item may end '; or'", () => {
+    const lead = "(a) the fictional cases where:";
+    const following = ["(i) one;", "(ii) two; or", "(b) the next case of the parent."];
+    assert.deepEqual(proveStoredList(lead, following, ["(i) one;", "(ii) two; or"], { before: "1." }), { ok: true });
+    // An amendment mark between them is layout and changes nothing.
+    assert.deepEqual(proveStoredList(lead, ["(i) one;", "(ii) two; or", "▼M5", "(b) the next case."], ["(i) one;", "(ii) two; or"], { before: "1." }), { ok: true });
+  });
+
+  test("words that only contain a connector are not one ('; order', '; or the next')", () => {
+    for (const last of ["(b) two; order.", "(b) two; or the next one."]) {
+      assert.deepEqual(proveStoredList(LEAD, ["(a) one;", last, "2."], ["(a) one;", last]), { ok: true }, last);
+    }
+  });
+
+  test("a whole list ending with a full stop still proves at a hard start", () => {
+    assert.deepEqual(proveStoredList(LEAD, ["(a) one; or", "(b) two.", "2."], ["(a) one; or", "(b) two."]), { ok: true });
+  });
+});

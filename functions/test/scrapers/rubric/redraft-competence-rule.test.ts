@@ -219,6 +219,41 @@ describe("live (scripted provider, no network)", () => {
     assert.ok(s.requests >= 2);
   });
 
+  test("(#335 review round 4) every request goes out with the SDK retry off, so the count is the number of sends", async () => {
+    const p = provider();
+    const s = await runCompetenceRule(PAGE, version(), ID, { live: true, verdicts: "uyayaa", provider: p, ...quiet });
+    // One `complete` = one HTTP send (the SDK sends once); only `callModel`'s own retry, which is counted, is left.
+    assert.equal(p.requests.length, 3);
+    assert.ok(p.requests.every((r) => r.maxRetries === 0), "every request has maxRetries 0");
+    assert.equal(s.requests, p.requests.length);
+  });
+
+  test("(#335 review round 4) the printed ceiling stays 'at most twice the planned figure' and is exact", async () => {
+    const lines: string[] = [];
+    await runCompetenceRule(PAGE, version(), ID, { live: false, verdicts: "uyayaa", print: (l) => lines.push(l) });
+    assert.ok(lines.some((l) => /planned: 3 request\(s\); at most 6 /.test(l)));
+  });
+
+  test("(#335 review round 4) a throw in the code BETWEEN the model calls still ends in a summary with the requests made", async () => {
+    const p = provider();
+    // `placeQuestions` reads the version's questions after the re-draft and the competence call
+    // (2 paid requests). Make that read throw: the run must not escape to `main` with nothing on file.
+    const v = version();
+    Object.defineProperty(v, "intakeQuestions", { get: () => { throw new TypeError("unexpected"); } });
+    const s = await runCompetenceRule(PAGE, v, ID, { live: true, verdicts: "uyayaa", provider: p, ...quiet });
+    assert.equal(s.liveFailed, "failed:TypeError");
+    assert.equal(s.requests, 2);
+    assert.equal(p.requests.length, 2);
+    assert.equal(s.redraft, "replacement");
+    assert.equal(s.checkLetters, null);
+    assert.equal(s.result, null);
+  });
+
+  test("a run with no throw reports no live failure", async () => {
+    const s = await runCompetenceRule(PAGE, version(), ID, { live: true, verdicts: "uyayaa", provider: provider(), ...quiet });
+    assert.equal(s.liveFailed, null);
+  });
+
   test("the check not confirming the rule is reported, never bypassed", async () => {
     const p = provider();
     p.policy = () => ({ title_faithful: "unsure" });

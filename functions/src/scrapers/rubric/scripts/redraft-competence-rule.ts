@@ -27,7 +27,9 @@
  *   3. the independent check of the rule (`RubricCheckerService.check`, production table): ONE
  *      request for an ordinary rule (two for a protected rule, which both models read).
  *   Every call gets the production's one retry for a transient provider failure, so the most a
- *   live run can send is twice the planned figure. A refused or unrepairable re-draft, or a block
+ *   live run can send is twice the planned figure. (Review round 4) The SDK's own retry is turned
+ *   off for this script (`maxRetries: 0`, see `CountingProvider`), so that ceiling counts every
+ *   HTTP send, and the request count on file is the number of sends. A refused or unrepairable re-draft, or a block
  *   code refuses, STOPS the run: nothing after it is sent.
  *
  * OFFLINE BY DEFAULT: without `--live` no model is called (0 requests) and the planned requests
@@ -137,6 +139,9 @@ export interface CompetenceRuleRunSummary {
   competenceProblems: string[];
   checkLetters: string | null;
   checkPasses: boolean | null;
+  // (#335, review round 4) Live only: the class of a throw ANYWHERE in the live half that no step
+  // caught (code between or after the model calls), so the requests spent are still on file. Null when none.
+  liveFailed: string | null;
   // Live only: how many questions the competence call returned that the block does not read (not added).
   questionsNotNeeded: number;
   // Live only: block questions that are the SAME as one the version already asks (re-used, not added): new id -> the version's id.
@@ -154,9 +159,17 @@ class CountingProvider implements LlmProvider {
   modelFor(role: AiModelRole): string {
     return this.inner.modelFor(role);
   }
+  /**
+   * (#335, review round 4) Every request goes out with `maxRetries: 0`: the SDK sends it ONCE, so
+   * one `complete` is one HTTP send and this count is the number of sends. The only retry left is
+   * the production `callModel`'s one retry, which comes back through here and is counted. That is
+   * what makes the printed ceiling ("at most twice the planned figure") exact: without this, the
+   * SDK's own retry (`MAX_RETRIES` in services/ai/llm-provider.ts) could double every count unseen,
+   * and a request that timed out after the server finished it can be billed.
+   */
   complete(request: LlmRequest): Promise<LlmResponse> {
     this.requests += 1;
-    return this.inner.complete(request);
+    return this.inner.complete({ ...request, maxRetries: 0 });
   }
 }
 
@@ -259,7 +272,7 @@ export function placeQuestions(
 export async function runCompetenceRule(snapshot: GuidanceSnapshotContent, version: VisaRubric, ruleId: string, opts: CompetenceRuleRunOptions): Promise<CompetenceRuleRunSummary> {
   const summary: CompetenceRuleRunSummary = {
     refusedOffline: null, listLinesStored: 0, listLinesRead: 0, storedListVerifies: false, aspects: [], planned: [],
-    requests: 0, redraft: null, competence: null, competenceProblems: [], checkLetters: null, checkPasses: null,
+    requests: 0, redraft: null, competence: null, competenceProblems: [], checkLetters: null, checkPasses: null, liveFailed: null,
     questionsNotNeeded: 0, reusedQuestionIds: {}, similarQuestionIds: {}, result: null,
   };
   const stop = (code: string): CompetenceRuleRunSummary => {
@@ -337,91 +350,104 @@ export async function runCompetenceRule(snapshot: GuidanceSnapshotContent, versi
   const usage = { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
   const done = (): CompetenceRuleRunSummary => {
     summary.requests = provider.requests;
-    opts.print(`\n${ruleId}: re-draft ${summary.redraft ?? "not sent"}; competence ${summary.competence ?? "not sent"}; check ${summary.checkLetters ?? "not sent"}${summary.checkPasses === null ? "" : summary.checkPasses ? " (passes)" : " (does NOT pass)"}; ${summary.requests} request(s) made.`);
+    opts.print(`\n${ruleId}: re-draft ${summary.redraft ?? "not sent"}; competence ${summary.competence ?? "not sent"}; check ${summary.checkLetters ?? "not sent"}${summary.checkPasses === null ? "" : summary.checkPasses ? " (passes)" : " (does NOT pass)"}; ${summary.liveFailed ? `; live half ${summary.liveFailed}` : ""}; ${summary.requests} request(s) made.`);
     return summary;
   };
 
-  // 1. the re-draft (only when an aspect failed): a refusal stops the run.
-  let replacement = rule;
-  if (summary.aspects.length > 0) {
-    try {
-      const outcome = await drafter.redraftRule({ rule, aspects: summary.aspects, index, routeName, limits, sent: { chars: 0 } }, usage as any, { failed: 0, cap: 3 });
-      if (outcome.kind !== "replacement") {
-        summary.redraft = outcome.kind === "invalid" ? `refused:${outcome.detail}` : outcome.kind;
+  // (#335, review round 4) ONE guard around the WHOLE live half. Each model call has its own
+  // try block, but the code between and after them (`placeQuestions`, `competenceProblems` on the
+  // candidate, `decodeRow`, `failedAspectsOf`) runs after up to three paid requests. A throw there
+  // must still end in `done()`, so the summary prints the requests made and the caller writes the
+  // `--out` file, instead of escaping to `main`'s catch with nothing on file.
+  try {
+    // 1. the re-draft (only when an aspect failed): a refusal stops the run.
+    let replacement = rule;
+    if (summary.aspects.length > 0) {
+      try {
+        const outcome = await drafter.redraftRule({ rule, aspects: summary.aspects, index, routeName, limits, sent: { chars: 0 } }, usage as any, { failed: 0, cap: 3 });
+        if (outcome.kind !== "replacement") {
+          summary.redraft = outcome.kind === "invalid" ? `refused:${outcome.detail}` : outcome.kind;
+          return done();
+        }
+        replacement = outcome.criterion;
+        summary.redraft = "replacement";
+      } catch (e) {
+        summary.redraft = `failed:${(e as Error).constructor.name}`;
         return done();
       }
-      replacement = outcome.criterion;
-      summary.redraft = "replacement";
+    }
+
+    // 2. the competence steps on the replacement: a block code refuses stops the run.
+    let block: CompetenceBlock;
+    let added: IntakeQuestion[];
+    try {
+      const outcome = await drafter.draftCompetenceSteps({ rule: replacement, index, routeName, limits, known: [] }, usage as any, { failed: 0, cap: 3 });
+      if (outcome.kind !== "steps") {
+        summary.competence = outcome.kind === "invalid" ? `refused:${outcome.detail}` : "no_steps_proposed";
+        return done();
+      }
+      block = outcome.competence;
+      // `outcome.intakeQuestions` is EVERY question the call drafted for the passage. Only the ones
+      // the block reads (and the ones their conditions read) are kept; the rest are counted, not added.
+      added = questionsTheBlockNeeds(outcome.intakeQuestions, block);
+      summary.questionsNotNeeded = outcome.intakeQuestions.length - added.length;
+      summary.competence = `${block.steps.length} step(s), ${added.length} question(s) the block reads, ${summary.questionsNotNeeded} other question(s) not added`;
     } catch (e) {
-      summary.redraft = `failed:${(e as Error).constructor.name}`;
+      summary.competence = `failed:${(e as Error).constructor.name}`;
       return done();
     }
-  }
-
-  // 2. the competence steps on the replacement: a block code refuses stops the run.
-  let block: CompetenceBlock;
-  let added: IntakeQuestion[];
-  try {
-    const outcome = await drafter.draftCompetenceSteps({ rule: replacement, index, routeName, limits, known: [] }, usage as any, { failed: 0, cap: 3 });
-    if (outcome.kind !== "steps") {
-      summary.competence = outcome.kind === "invalid" ? `refused:${outcome.detail}` : "no_steps_proposed";
+    // A question the version already asks is re-used, never added a second time (see `placeQuestions`).
+    const placed = placeQuestions(version.intakeQuestions ?? [], added, block);
+    summary.reusedQuestionIds = placed.reused;
+    summary.similarQuestionIds = placed.similar;
+    if (Object.keys(placed.reused).length + Object.keys(placed.similar).length > 0) {
+      opts.print(`  questions: ${Object.keys(placed.reused).length} re-used from the version (not added again); ${Object.keys(placed.similar).length} added with the same wording as a version question of another answer type (read them in the result file).`);
+    }
+    // The rule reads the block's questions (as drafting links them), so neither is removed as unjustified.
+    const linked: AssessmentCriterion = { ...replacement, intakeQuestionIds: [...new Set([...(replacement.intakeQuestionIds ?? []), ...placed.competence.steps.map((s) => s.questionId)])] };
+    const candidate = { criteria: (version.criteria ?? []).map((c) => (c.criterionId === ruleId ? linked : c)), intakeQuestions: placed.intakeQuestions, competence: placed.competence };
+    // `sharedRulebook: true` is what step 0a established from the rulebook key (never assumed).
+    summary.competenceProblems = competenceProblems(candidate, { sharedRulebook: true }).map((p) => p.code);
+    if (summary.competenceProblems.length > 0) {
+      summary.competence += `; refused on the version: ${[...new Set(summary.competenceProblems)].join(",")}`;
       return done();
     }
-    block = outcome.competence;
-    // `outcome.intakeQuestions` is EVERY question the call drafted for the passage. Only the ones
-    // the block reads (and the ones their conditions read) are kept; the rest are counted, not added.
-    added = questionsTheBlockNeeds(outcome.intakeQuestions, block);
-    summary.questionsNotNeeded = outcome.intakeQuestions.length - added.length;
-    summary.competence = `${block.steps.length} step(s), ${added.length} question(s) the block reads, ${summary.questionsNotNeeded} other question(s) not added`;
-  } catch (e) {
-    summary.competence = `failed:${(e as Error).constructor.name}`;
-    return done();
-  }
-  // A question the version already asks is re-used, never added a second time (see `placeQuestions`).
-  const placed = placeQuestions(version.intakeQuestions ?? [], added, block);
-  summary.reusedQuestionIds = placed.reused;
-  summary.similarQuestionIds = placed.similar;
-  if (Object.keys(placed.reused).length + Object.keys(placed.similar).length > 0) {
-    opts.print(`  questions: ${Object.keys(placed.reused).length} re-used from the version (not added again); ${Object.keys(placed.similar).length} added with the same wording as a version question of another answer type (read them in the result file).`);
-  }
-  // The rule reads the block's questions (as drafting links them), so neither is removed as unjustified.
-  const linked: AssessmentCriterion = { ...replacement, intakeQuestionIds: [...new Set([...(replacement.intakeQuestionIds ?? []), ...placed.competence.steps.map((s) => s.questionId)])] };
-  const candidate = { criteria: (version.criteria ?? []).map((c) => (c.criterionId === ruleId ? linked : c)), intakeQuestions: placed.intakeQuestions, competence: placed.competence };
-  // `sharedRulebook: true` is what step 0a established from the rulebook key (never assumed).
-  summary.competenceProblems = competenceProblems(candidate, { sharedRulebook: true }).map((p) => p.code);
-  if (summary.competenceProblems.length > 0) {
-    summary.competence += `; refused on the version: ${[...new Set(summary.competenceProblems)].join(",")}`;
-    return done();
-  }
 
-  // 3. the production check of the replacement (no repair of its own: cap 0).
-  const records = new Map<string, any>();
-  const checker = new RubricCheckerService({
-    provider: () => provider,
-    readSnapshot: async () => snapshot,
-    loadSettings: async () => ({ settings: { ...DEFAULT_PUBLISH_SETTINGS, mode: "auto", repairMaxRulesPerRun: 0 }, exists: true, problems: [] }),
-    ledger: { load: async (id) => records.get(id) ?? null, save: async (rec) => void records.set(rec.runId, rec), countRunsOnDay: async () => 0 },
-  });
-  const runId = `ONE-RULE_${ruleId}__v1`;
-  // (#335, fix round 2) Wrapped like steps 1 and 2: a throw here comes AFTER up to
-  // three requests were spent, so it must still end in `done()`, which prints the
-  // summary and lets the caller write the `--out` file, instead of escaping to
-  // `main`'s catch with nothing written. The check counts as not passing.
-  // (`RubricCheckerService.check` already catches its own errors and returns
-  // `ok: false`; this guard is defence in depth against a future change there.)
-  try {
-    await checker.check({ routeKey: "ONE-RULE", version: 1, runId, rubric: { routeKey: "ONE-RULE", version: 1, criteria: [linked], intentPolarityProposal: null } as any, codeLeftOutIds: [] });
+    // 3. the production check of the replacement (no repair of its own: cap 0).
+    const records = new Map<string, any>();
+    const checker = new RubricCheckerService({
+      provider: () => provider,
+      readSnapshot: async () => snapshot,
+      loadSettings: async () => ({ settings: { ...DEFAULT_PUBLISH_SETTINGS, mode: "auto", repairMaxRulesPerRun: 0 }, exists: true, problems: [] }),
+      ledger: { load: async (id) => records.get(id) ?? null, save: async (rec) => void records.set(rec.runId, rec), countRunsOnDay: async () => 0 },
+    });
+    const runId = `ONE-RULE_${ruleId}__v1`;
+    // (#335, fix round 2) Wrapped like steps 1 and 2: a throw here comes AFTER up to
+    // three requests were spent, so it must still end in `done()`, which prints the
+    // summary and lets the caller write the `--out` file, instead of escaping to
+    // `main`'s catch with nothing written. The check counts as not passing.
+    // (`RubricCheckerService.check` already catches its own errors and returns
+    // `ok: false`; this guard is defence in depth against a future change there.)
+    try {
+      await checker.check({ routeKey: "ONE-RULE", version: 1, runId, rubric: { routeKey: "ONE-RULE", version: 1, criteria: [linked], intentPolarityProposal: null } as any, codeLeftOutIds: [] });
+    } catch (e) {
+      summary.checkLetters = `failed:${(e as Error).constructor.name}`;
+      summary.checkPasses = false;
+      return done();
+    }
+    const v = records.get(runId)?.ruleVerdicts?.[ruleId] as { verification?: string; judgement?: string } | undefined;
+    summary.checkLetters = v ? `${v.verification ?? "none"}${isProtectedRule(linked) ? `/${v.judgement ?? "none"}` : ""}` : "none";
+    const rows = isProtectedRule(linked) ? [decodeRow(v?.verification), decodeRow(v?.judgement)] : [decodeRow(v?.verification)];
+    summary.checkPasses = v !== undefined && failedAspectsOf(linked, ...rows.map((r) => r ?? undefined)).length === 0;
+    summary.result = { rule: linked, intakeQuestions: placed.intakeQuestions.slice((version.intakeQuestions ?? []).length), competence: placed.competence, renamedQuestionIds: placed.renamed };
+    return done();
   } catch (e) {
-    summary.checkLetters = `failed:${(e as Error).constructor.name}`;
-    summary.checkPasses = false;
+    summary.liveFailed = `failed:${(e as Error).constructor.name}`;
+    // A run that broke cannot be kept: a check that already ran counts as not passing, and no result is set.
+    if (summary.checkPasses !== null) summary.checkPasses = false;
+    summary.result = null;
     return done();
   }
-  const v = records.get(runId)?.ruleVerdicts?.[ruleId] as { verification?: string; judgement?: string } | undefined;
-  summary.checkLetters = v ? `${v.verification ?? "none"}${isProtectedRule(linked) ? `/${v.judgement ?? "none"}` : ""}` : "none";
-  const rows = isProtectedRule(linked) ? [decodeRow(v?.verification), decodeRow(v?.judgement)] : [decodeRow(v?.verification)];
-  summary.checkPasses = v !== undefined && failedAspectsOf(linked, ...rows.map((r) => r ?? undefined)).length === 0;
-  summary.result = { rule: linked, intakeQuestions: placed.intakeQuestions.slice((version.intakeQuestions ?? []).length), competence: placed.competence, renamedQuestionIds: placed.renamed };
-  return done();
 }
 
 // ============================================
