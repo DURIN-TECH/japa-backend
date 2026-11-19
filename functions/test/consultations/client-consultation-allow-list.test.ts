@@ -159,6 +159,8 @@ const FULL_BOOKING: Required<Consultation> = {
   paystackPaidAt: Timestamp.fromMillis(1_722_222_222_000),
   paidAfterQuoteExpiry: true,
   paidOnSupersededReference: true,
+  // Issue #405: the sweep's payment-grace clock after a reschedule (internal).
+  paymentGraceStartsAt: Timestamp.fromMillis(1_755_555_555_000),
   supersededCheckouts: [
     {
       reference: "HIDDEN-superseded-reference",
@@ -239,6 +241,8 @@ const HIDDEN_FIELDS: readonly (keyof Consultation)[] = [
   "paystackPaidAt",
   "paidAfterQuoteExpiry",
   "paidOnSupersededReference",
+  // Issue #405: when the sweep's 24-hour payment grace restarted (internal clock).
+  "paymentGraceStartsAt",
   // Internal: how it was booked, and the uid of whoever cancelled it.
   "bookedVia",
   "cancelledBy",

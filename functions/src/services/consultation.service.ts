@@ -21,6 +21,8 @@ import {
 } from "./charge-checkout.service";
 // Issue #288: a booking the sweep finds PAID at Paystack is settled, not cancelled.
 import { settlePayment } from "./consultation-charge.service";
+// Issue #397: the sweep reads settle outcomes to decide whether to cancel.
+import type { SettleOutcome } from "./consultation-charge.service";
 // Issue #317: the refund rule, the refund write (same transaction as the
 // cancel), and the fee hold.
 import {
@@ -822,23 +824,55 @@ export function abandonedCutoff(at: Date): Date {
 
 /**
  * True when `c` is an unpaid booking the sweep may close at time `at`:
- * `pending_payment`, not paid, and its quote lock ended more than
+ * `pending_payment`, not paid, and its payment grace started more than
  * ABANDONED_BOOKING_GRACE_HOURS ago. Pure.
+ *
+ * The grace starts at the LATER of (issue #405):
+ *  - `quoteExpiresAt`: the end of the booking's quote lock (as before);
+ *  - `paymentGraceStartsAt`: the last time the agent side moved the booking
+ *    while it was unpaid (`gracePeriodRestartForReschedule`). A move after
+ *    the lock restarts the 24 hours, so the client always gets a full day
+ *    to pay for the new time.
  *
  * A LEGACY row (before #180: no `quoteExpiresAt`) is never abandoned in this
  * sense: the one-off `cancel:legacy-consultations` script covers those.
  */
 export function isAbandonedBooking(
-  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt">,
+  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt" | "paymentGraceStartsAt">,
   at: Date
 ): boolean {
   const expiresAt = millisOf(c.quoteExpiresAt);
+  if (expiresAt === null) return false; // legacy row
+  // Issue #405: a reschedule after the lock pushes the start of the grace.
+  const rescheduledAt = millisOf(c.paymentGraceStartsAt);
+  const graceStart = rescheduledAt !== null ? Math.max(expiresAt, rescheduledAt) : expiresAt;
   return (
     c.status === "pending_payment" &&
     c.paymentStatus !== "paid" &&
-    expiresAt !== null &&
-    expiresAt < abandonedCutoff(at).getTime()
+    graceStart < abandonedCutoff(at).getTime()
   );
+}
+
+/**
+ * The field that restarts an unpaid booking's 24-hour payment grace when the
+ * agent side moves it (issue #405), or null when it does not apply. Pure.
+ *
+ * Applies to a `pending_payment`, unpaid booking whose slot REALLY changes
+ * (the caller checks `slotChanges`, as for `retireCheckoutsForReschedule`),
+ * whether or not it had a checkout to retire: a booking moved after its
+ * quote lock could otherwise be swept before the client could pay for the
+ * new time. Within the lock it is harmless (the later of the two wins).
+ * No money moves here: it only moves the sweep's clock.
+ *
+ * @param booking the booking as read in the edit's transaction
+ * @param at the server clock of the edit
+ */
+export function gracePeriodRestartForReschedule(
+  booking: Pick<Consultation, "status" | "paymentStatus">,
+  at: Date
+): { paymentGraceStartsAt: Timestamp } | null {
+  if (booking.status !== "pending_payment" || booking.paymentStatus === "paid") return null;
+  return { paymentGraceStartsAt: Timestamp.fromDate(at) };
 }
 
 /**
@@ -861,7 +895,7 @@ export type AbandonedBookingDecision = "skip" | "settle" | "leave" | "cancel";
  * @param at the time of the decision (the charge path's clock)
  */
 export function decideAbandonedBooking(
-  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt" | "transactionId">,
+  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt" | "paymentGraceStartsAt" | "transactionId">,
   paystack: PaystackState | null,
   at: Date
 ): AbandonedBookingDecision {
@@ -872,6 +906,169 @@ export function decideAbandonedBooking(
   if (paystack === "final_unpaid") return "cancel";
   // `in_progress` (a bank transfer may still complete), or not looked up.
   return "leave";
+}
+
+// ---- Every checkout of a booking, not just the live one (issue #397) ----
+//
+// `decideAbandonedBooking` above only knows about the LIVE checkout
+// (`transactionId`). A booking can also carry older checkouts in
+// `supersededCheckouts`: ones replaced by an ordinary re-price, and ones
+// RETIRED when the agent side rescheduled the booking after its quote lock
+// (#354, `retiredBy: "reschedule"`, which also clears `transactionId`). A
+// bank transfer still running on any of them can land later, so the sweep
+// now asks Paystack about EVERY checkout and decides on all the answers at
+// once (`decideAbandonedCheckouts`). `decideAbandonedBooking` is kept as it
+// was for its callers and tests (it is the live-checkout-only case).
+
+/**
+ * What the sweep learned about ONE checkout reference of a booking:
+ * Paystack's classified state (`lookupCheckoutState`, which already turns
+ * "not found" on one of OUR references into `final_unpaid`), or
+ * `lookup_failed` when asking Paystack threw (network, 5xx, 401, or "not
+ * found" for a reference Paystack itself generated). Fail closed: a failed
+ * lookup never lets the booking be cancelled.
+ */
+export type SweepCheckoutState = PaystackState | "lookup_failed";
+
+/**
+ * Every checkout reference a booking carries, live first (`transactionId`),
+ * then each `supersededCheckouts` entry in stored order, with duplicates
+ * dropped. Pure. These are exactly the references the sweep looks up (one
+ * Paystack call each) and that `cancelAbandonedBooking` checks again before
+ * it writes.
+ */
+export function sweepCheckoutReferences(
+  c: Pick<Consultation, "transactionId" | "supersededCheckouts">
+): string[] {
+  const refs = [
+    ...(c.transactionId ? [c.transactionId] : []),
+    ...(c.supersededCheckouts ?? []).map((s) => s.reference).filter((r): r is string => !!r),
+  ];
+  return [...new Set(refs)];
+}
+
+/**
+ * What the sweep does with one booking once every checkout was looked up:
+ *  - `skip`:   not abandoned (paid, cancelled, legacy, too recent, or its
+ *              payment grace restarted by a recent reschedule, #405);
+ *  - `error`:  at least one lookup failed: nothing written (fail closed);
+ *  - `leave`:  a payment may still land on at least one checkout (Paystack
+ *              `in_progress`), or a checkout was not looked up: nothing
+ *              written, a later run tries again;
+ *  - `settle`: every checkout is known and none is in flight, and these
+ *              `references` are PAID: each goes through `settlePayment`,
+ *              whose outcomes decide the rest (`decideAfterSweepSettles`);
+ *  - `cancel`: every checkout is final and unpaid (or there is none).
+ */
+export type AbandonedCheckoutsDecision =
+  | { kind: "skip" }
+  | { kind: "error" }
+  | { kind: "leave" }
+  | { kind: "settle"; references: string[] }
+  | { kind: "cancel" };
+
+/**
+ * Decide what the sweep does with one booking from the state of EVERY one
+ * of its checkouts (issue #397). Pure: reads nothing, writes nothing.
+ *
+ * Order of the rules (the first that applies is the answer):
+ *  1. not abandoned (`isAbandonedBooking`): `skip`. The sweep checks this
+ *     BEFORE any lookup, so such a booking costs no Paystack call;
+ *  2. no checkout at all: `cancel` (nobody could have paid);
+ *  3. any lookup failed: `error` (never cancel without Paystack's answer);
+ *  4. any checkout `in_progress`, or one that was not looked up: `leave`.
+ *     This wins over a `paid` one on purpose: the sweep writes only on a
+ *     complete, settled picture. A paid checkout is still settled by the
+ *     payer's verify, or by a later run once the other one is final;
+ *  5. any checkout `paid`: `settle` those references (live first);
+ *  6. otherwise (all `final_unpaid`): `cancel`.
+ *
+ * @param states reference -> what the sweep learned about it. A reference
+ *   of the booking that is missing here counts as not looked up (rule 4).
+ * @param at the time of the decision (the charge path's clock)
+ */
+export function decideAbandonedCheckouts(
+  c: Pick<
+    Consultation,
+    "status" | "paymentStatus" | "quoteExpiresAt" | "paymentGraceStartsAt" | "transactionId" | "supersededCheckouts"
+  >,
+  states: ReadonlyMap<string, SweepCheckoutState>,
+  at: Date
+): AbandonedCheckoutsDecision {
+  // (1) Not abandoned: nothing to decide (and nothing was asked).
+  if (!isAbandonedBooking(c, at)) return { kind: "skip" };
+  const references = sweepCheckoutReferences(c);
+  // (2) No checkout was ever claimed, live or older: nothing could be paid.
+  if (references.length === 0) return { kind: "cancel" };
+  const seen = references.map((reference) => ({ reference, state: states.get(reference) }));
+  // (3) Fail closed on any lookup error.
+  if (seen.some((s) => s.state === "lookup_failed")) return { kind: "error" };
+  // (4) A payment may still land somewhere (or we do not know): wait.
+  if (seen.some((s) => s.state === undefined || s.state === "in_progress")) return { kind: "leave" };
+  // (5) Paid somewhere: hand every paid reference to settlePayment.
+  const paid = seen.filter((s) => s.state === "paid").map((s) => s.reference);
+  if (paid.length > 0) return { kind: "settle", references: paid };
+  // (6) Every checkout is final and unpaid.
+  return { kind: "cancel" };
+}
+
+/**
+ * Settle outcomes after which a paid reference no longer stands in the way
+ * of the cancel (issue #397): the payment is recorded as an exception and
+ * refunded under #354's rules INSIDE `settlePayment` (one refund per
+ * reference, one fee debit per reference). The booking itself was not
+ * confirmed by it.
+ */
+const SWEEP_HANDLED_SETTLES: ReadonlySet<string> = new Set([
+  "rescheduled_refund_recorded",
+  "refund_recorded",
+  "not_payable_recorded",
+]);
+
+/**
+ * What the sweep does with a booking after it settled each of its paid
+ * checkouts (issue #397). Pure.
+ *  - `settled`: at least one settle confirmed the booking (`confirmed`), or
+ *    found it already paid by that very reference (`already_paid`). Never
+ *    cancelled;
+ *  - `review`:  a paid reference could not be applied or recorded
+ *    (`mismatch`, `not_chargeable`, `unknown_reference`, or null: the
+ *    booking is gone). Left exactly as it is for a human; never cancelled;
+ *  - `cancel`:  every paid reference was recorded as an exception and
+ *    refunded (`rescheduled_refund_recorded`, `refund_recorded`,
+ *    `not_payable_recorded`), and the decision already found every OTHER
+ *    checkout final and unpaid: the booking is cancelled in this run (the
+ *    cancel still re-checks everything in its own transaction). A paid,
+ *    refunded retired checkout therefore never keeps a booking alive.
+ *
+ * @param outcomes one per paid reference, in the order they were settled
+ */
+export function decideAfterSweepSettles(
+  outcomes: ReadonlyArray<SettleOutcome | null>
+): "settled" | "review" | "cancel" {
+  if (outcomes.some((o) => o?.kind === "confirmed" || o?.kind === "already_paid")) return "settled";
+  if (outcomes.some((o) => !o || !SWEEP_HANDLED_SETTLES.has(o.kind))) return "review";
+  return "cancel";
+}
+
+/**
+ * The references in a booking's `supersededCheckouts`, in stored order.
+ * Pure. The sweep remembers this list from the booking it looked up, and
+ * the cancel compares it with the fresh booking (`sameReferenceSet`): a
+ * checkout opened, re-priced or retired after the lookups changes it.
+ */
+function supersededReferencesOf(c: Pick<Consultation, "supersededCheckouts">): string[] {
+  return (c.supersededCheckouts ?? []).map((s) => s.reference);
+}
+
+/**
+ * True when two lists of checkout references hold the same references,
+ * whatever their order. Pure.
+ */
+function sameReferenceSet(a: readonly string[], b: readonly string[]): boolean {
+  const left = new Set(a);
+  const right = new Set(b);
+  return left.size === right.size && [...left].every((r) => right.has(r));
 }
 
 /** What one sweep run did, for the function's log line. */
@@ -1099,15 +1296,23 @@ class ConsultationService {
    * are the same rows and are covered too.
    *
    * For each booking (at most ABANDONED_SWEEP_BATCH_SIZE per run, oldest lock
-   * first), see `decideAbandonedBooking`:
-   *  - its current checkout (`transactionId`), if any, is checked at Paystack
-   *    (`lookupCheckoutState`);
-   *  - PAID: settled through `settlePayment` (the booking is confirmed);
-   *  - IN PROGRESS: left alone for a later run;
-   *  - final unpaid, or no checkout at all: cancelled, in a transaction of
-   *    its own that re-reads the booking and writes only if it is STILL
-   *    abandoned and still carries the reference that was checked (a payment
-   *    or a re-price that landed meanwhile wins).
+   * first), see `decideAbandonedCheckouts` (issue #397):
+   *  - not abandoned: skipped before any Paystack call;
+   *  - EVERY checkout it carries is checked at Paystack
+   *    (`lookupCheckoutState`, one call per reference): the live one
+   *    (`transactionId`) and each `supersededCheckouts` entry, whether
+   *    retired by a reschedule (#354) or replaced by a re-price;
+   *  - a lookup failed: not cancelled (counted in `errors`);
+   *  - any checkout IN PROGRESS: left alone for a later run;
+   *  - PAID ones: each settled through `settlePayment` (the ONLY writer of
+   *    money rows here). Confirmed: settled, never cancelled. Recorded as an
+   *    exception and refunded (#354): it no longer blocks the cancel. Not
+   *    applicable (mismatch, ...): left for review (`decideAfterSweepSettles`);
+   *  - all final unpaid (or handled as above), or no checkout at all:
+   *    cancelled, in a transaction of its own that re-reads the booking and
+   *    writes only if it is STILL abandoned and still carries the same live
+   *    reference AND the same superseded references that were checked (a
+   *    payment, a re-price or a reschedule that landed meanwhile wins).
    *
    * A cancel writes `status`, `cancelledAt`, `cancelledBy: "system"`,
    * `cancellationReason` and `updatedAt`, and NOBODY IS NOTIFIED. A payment
@@ -1121,6 +1326,14 @@ class ConsultationService {
    * Needs the composite index consultations(status, quoteExpiresAt), see
    * firestore.indexes.json. A legacy row has no `quoteExpiresAt`, so the
    * query never returns it.
+   *
+   * Issue #405: a booking the agent side moved while unpaid carries
+   * `paymentGraceStartsAt`, and its grace runs from the later of that and
+   * `quoteExpiresAt`. The query (and its index) is unchanged: it still
+   * selects on `quoteExpiresAt`, a superset, and `isAbandonedBooking` skips
+   * a booking whose grace restarted less than 24 hours ago BEFORE any
+   * Paystack call. Such a booking stops being skipped within 24 hours of its
+   * move, so it can hold a batch slot for at most a day.
    */
   async sweepAbandonedBookings(): Promise<AbandonedSweepResult> {
     const result: AbandonedSweepResult = {
@@ -1138,42 +1351,91 @@ class ConsultationService {
     for (const doc of snapshot.docs) {
       const booking = doc.data() as Consultation;
       try {
-        // Ask Paystack about the current checkout, when there is one.
-        const reference = booking.transactionId ?? null;
-        const lookup = reference ? await lookupCheckoutState(reference) : null;
-        const decision = decideAbandonedBooking(booking, lookup?.state ?? null, chargeRuntime.now());
-
-        if (decision === "settle") {
-          // Paid after all: confirm it (all checks re-done on the fresh booking).
-          const outcome = await settlePayment(doc.id, reference!, lookup!.result!);
-          if (outcome?.kind === "confirmed" || outcome?.kind === "already_paid") {
-            result.settled++;
-          } else {
-            // Paid, but not applicable. A recorded exception is already being
-            // refunded (issue #354); anything else (wrong amount, ...) is
-            // left for a human.
-            console.error(
-              `[consultation sweep] ${doc.id} is paid at Paystack (${reference}) but could not be settled ` +
-                `(${outcome?.kind ?? "booking gone"}); left as it is for review`
-            );
-            result.skipped++;
-          }
-          continue;
-        }
-        if (decision === "leave") {
-          result.leftInProgress++;
-          continue;
-        }
-        if (decision === "skip") {
+        // ---- 1. Not abandoned: skipped BEFORE any Paystack call ----
+        // (paid meanwhile, or legacy data the query cannot exclude.)
+        if (!isAbandonedBooking(booking, chargeRuntime.now())) {
           result.skipped++;
           continue;
         }
-        // decision === "cancel"
-        if (await this.cancelAbandonedBooking(doc.id, reference)) result.cancelled++;
-        else result.skipped++;
+
+        // ---- 2. Ask Paystack about EVERY checkout (issue #397) ----
+        // The live one (`transactionId`) and each `supersededCheckouts`
+        // entry, retired by a reschedule or replaced by a re-price: one
+        // lookup per reference, at most. A lookup that throws stops the
+        // lookups for this booking (fail closed: it is not cancelled).
+        const references = sweepCheckoutReferences(booking);
+        const states = new Map<string, SweepCheckoutState>();
+        const lookups = new Map<string, Awaited<ReturnType<typeof lookupCheckoutState>>>();
+        for (const reference of references) {
+          try {
+            const lookup = await lookupCheckoutState(reference);
+            states.set(reference, lookup.state);
+            lookups.set(reference, lookup);
+          } catch (error) {
+            console.error(`[consultation sweep] ${doc.id}: Paystack lookup of ${reference} failed; not cancelled:`, error);
+            states.set(reference, "lookup_failed");
+            break;
+          }
+        }
+
+        // ---- 3. Decide on all the answers at once (pure) ----
+        const decision = decideAbandonedCheckouts(booking, states, chargeRuntime.now());
+        if (decision.kind === "skip") {
+          result.skipped++;
+          continue;
+        }
+        if (decision.kind === "error") {
+          result.errors++;
+          continue;
+        }
+        if (decision.kind === "leave") {
+          result.leftInProgress++;
+          continue;
+        }
+
+        if (decision.kind === "settle") {
+          // ---- 4. Paid somewhere: settle each paid reference ----
+          // ONLY through settlePayment: it re-reads the booking in its own
+          // transaction and is the one place that confirms a booking or
+          // records an exception with its refund and fee debit (#354:
+          // one refund per reference, one debit per reference). The sweep
+          // itself never writes money rows.
+          const outcomes: Array<SettleOutcome | null> = [];
+          for (const reference of decision.references) {
+            const outcome = await settlePayment(doc.id, reference, lookups.get(reference)!.result!);
+            outcomes.push(outcome);
+            const kind = outcome?.kind ?? null;
+            if (kind === null || !["confirmed", "already_paid", ...SWEEP_HANDLED_SETTLES].includes(kind)) {
+              // Paid, but neither applied nor recorded (wrong amount, ...):
+              // left for a human, never cancelled.
+              console.error(
+                `[consultation sweep] ${doc.id} is paid at Paystack (${reference}) but could not be settled ` +
+                  `(${kind ?? "booking gone"}); left as it is for review`
+              );
+            }
+          }
+          const after = decideAfterSweepSettles(outcomes);
+          if (after === "settled") {
+            result.settled++;
+            continue;
+          }
+          if (after === "review") {
+            result.skipped++;
+            continue;
+          }
+          // after === "cancel": every paid reference was recorded and
+          // refunded; every other checkout is final unpaid. Fall through.
+        }
+
+        // ---- 5. Cancel, re-checked in its own transaction ----
+        if (await this.cancelAbandonedBooking(doc.id, booking.transactionId ?? null, supersededReferencesOf(booking))) {
+          result.cancelled++;
+        } else {
+          result.skipped++;
+        }
       } catch (error) {
-        // One booking must not stop the run (e.g. Paystack is down: nothing
-        // is cancelled without its answer).
+        // One booking must not stop the run (e.g. a Firestore failure in a
+        // settle: nothing is cancelled without the full answer).
         console.error(`[consultation sweep] ${doc.id} failed; left as it is:`, error);
         result.errors++;
       }
@@ -1186,12 +1448,18 @@ class ConsultationService {
    * transaction: the booking is re-read and written only if it is still
    * `pending_payment`, unpaid, past the cutoff, and still on the checkout
    * reference the sweep asked Paystack about (`observedReference`, null when
-   * it had none). So a payment settled, or a checkout re-issued, between the
-   * Paystack check and this write is never overwritten.
+   * it had none) and on the same set of superseded references
+   * (`observedSuperseded`, issue #397). So a payment settled, or a checkout
+   * re-issued, re-priced or retired, between the Paystack checks and this
+   * write is never overwritten.
    *
    * @returns true when the booking was cancelled, false when it was left
    */
-  private async cancelAbandonedBooking(id: string, observedReference: string | null): Promise<boolean> {
+  private async cancelAbandonedBooking(
+    id: string,
+    observedReference: string | null,
+    observedSuperseded: readonly string[]
+  ): Promise<boolean> {
     const ref = collections.consultations.doc(id);
     return chargeRuntime.runTransaction<boolean>(async (tx) => {
       const snap = await tx.get(ref);
@@ -1199,6 +1467,10 @@ class ConsultationService {
       const fresh = snap.data() as Consultation;
       const at = chargeRuntime.now();
       if (!isAbandonedBooking(fresh, at) || (fresh.transactionId ?? null) !== observedReference) return false;
+      // Issue #397: the older checkouts must be the very ones the sweep
+      // asked Paystack about. A checkout re-priced or retired after the
+      // lookups (a new entry) means an unchecked payment could land: leave it.
+      if (!sameReferenceSet(supersededReferencesOf(fresh), observedSuperseded)) return false;
       const now = Timestamp.fromDate(at);
       tx.update(ref, {
         status: "cancelled",
@@ -1305,6 +1577,12 @@ class ConsultationService {
             `and ${(current.supersededCheckouts ?? []).length} older one(s) retired; a payment on them is refunded`
         );
       }
+
+      // Issue #405: a real move of an unpaid booking restarts its 24-hour
+      // payment grace from now, so the abandoned-booking sweep cannot cancel
+      // it before the client has had a full day to pay for the new time.
+      const graceRestart = slotChanges(current, updates) ? gracePeriodRestartForReschedule(current, at) : null;
+      if (graceRestart) Object.assign(write, graceRestart);
 
       tx.update(ref, write);
       // The stored doc after the commit: the fresh copy plus what was written

@@ -616,9 +616,11 @@ describe("PUT /consultations/:id — input", () => {
     assert.equal(after.checkoutUrl, undefined);
     assert.equal(after.supersededCheckouts.at(-1).reference, before.transactionId);
     assert.equal(after.supersededCheckouts.at(-1).retiredBy, "reschedule");
+    // Issue #405: the move also restarts the 24-hour payment grace, from now.
+    assert.equal(after.paymentGraceStartsAt.toMillis(), harness.clock.now().getTime());
     assert.deepEqual(
       Object.keys(writes[0].data).sort(),
-      [...ALL_FIELDS, "updatedAt", "supersededCheckouts", "transactionId", "checkoutUrl"].sort()
+      [...ALL_FIELDS, "updatedAt", "supersededCheckouts", "transactionId", "checkoutUrl", "paymentGraceStartsAt"].sort()
     );
   });
 });

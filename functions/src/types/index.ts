@@ -1398,6 +1398,13 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   // Issue #180 (review fix): true when the booking was settled by an exact
   // payment on a superseded reference (also on the Transaction).
   paidOnSupersededReference?: boolean;
+  // Issue #405: when the agent side last MOVED this booking while it was
+  // unpaid (`PUT /consultations/:id` changing the slot of a
+  // `pending_payment` booking). The abandoned-booking sweep's 24-hour payment
+  // grace runs from the LATER of this and `quoteExpiresAt`, so a booking
+  // moved after its quote lock gives the client the full 24 hours to pay for
+  // the new time. Absent on a booking never moved while unpaid.
+  paymentGraceStartsAt?: Timestamp;
   
   // After consultation
   summary?: string;

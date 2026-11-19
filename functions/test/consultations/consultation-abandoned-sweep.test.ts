@@ -48,6 +48,11 @@ import {
   consultationService,
   abandonedCutoff,
   decideAbandonedBooking,
+  decideAbandonedCheckouts,
+  decideAfterSweepSettles,
+  sweepCheckoutReferences,
+  gracePeriodRestartForReschedule,
+  CONSULTATION_ACTORS,
   isAbandonedBooking,
   ABANDONED_BOOKING_GRACE_HOURS,
   ABANDONED_SWEEP_BATCH_SIZE,
@@ -512,5 +517,477 @@ describe("the sweep's wiring", () => {
     assert.match(body, /\.pubsub\.schedule\("20 \* \* \* \*"\)/, "once an hour");
     assert.match(body, /consultationService\.sweepAbandonedBookings\(\)/);
     assert.match(body, /PAYSTACK_SECRET_KEY/, "the Paystack lookup needs its key");
+  });
+});
+
+// ============================================
+// Issue #397: every checkout is asked about, not just the live one
+// ============================================
+//
+// After a reschedule past the quote lock (#354) the booking has NO live
+// `transactionId`, only retired entries in `supersededCheckouts`; a
+// re-priced booking also keeps its older checkouts there. A payment can
+// still land on any of them, so the sweep looks each one up and decides on
+// all the answers. Paystack is the harness stub throughout.
+
+/**
+ * A `supersededCheckouts` entry priced exactly like `seedPending`'s booking
+ * (so a paid entry matches what it asked), optionally retired by a
+ * reschedule by `uid-agent1`.
+ */
+function entry(reference: string, retired: boolean, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    reference,
+    priceUsdCents: 1_000, chargedCurrency: "NGN", chargedAmountMinor: FEE_KOBO,
+    fxRate: 1500, fxRateAsOf: T0, fxRateSource: "cbn", fxMarginBps: 0,
+    quoteLockedAt: Timestamp.fromMillis(harness.clock.now().getTime() - 80 * HOUR_MS),
+    quoteExpiresAt: Timestamp.fromMillis(harness.clock.now().getTime() - 79.5 * HOUR_MS),
+    supersededAt: T0,
+    ...(retired ? { retiredBy: "reschedule", retiredByAgentId: "uid-agent1" } : {}),
+    ...overrides,
+  };
+}
+
+/** Stored rows of a kind for booking `id`. */
+const refundsOf = (id: string) =>
+  docsIn("transactions").map(([, t]) => t).filter((t) => t.type === "refund" && t.consultationId === id);
+const debitsOf = () => docsIn("transactions").map(([, t]) => t).filter((t) => t.type === "paystack_fee_debit");
+const feesOf = () => docsIn("transactions").map(([, t]) => t).filter((t) => t.type === "consultation_fee");
+
+/** Count the Paystack lookups of a run, by reference. */
+function countLookups(): string[] {
+  const seen: string[] = [];
+  harness.onLookup = async (reference: string) => {
+    seen.push(reference);
+    return undefined;
+  };
+  return seen;
+}
+
+describe("decideAbandonedCheckouts (pure, issue #397)", () => {
+  const at = new Date("2026-11-20T12:00:00Z");
+  const DAY = ABANDONED_BOOKING_GRACE_HOURS * HOUR_MS;
+  /** An abandoned booking with the given live reference and superseded references. */
+  const row = (live: string | null, superseded: string[], overrides: Record<string, unknown> = {}): any => ({
+    status: "pending_payment", paymentStatus: "pending",
+    quoteExpiresAt: Timestamp.fromMillis(at.getTime() - 2 * DAY),
+    ...(live ? { transactionId: live } : {}),
+    supersededCheckouts: superseded.map((reference) => ({ reference })),
+    ...overrides,
+  });
+  type S = "in_progress" | "final_unpaid" | "paid" | "lookup_failed";
+  const SUPERSEDED_STATES: S[] = ["in_progress", "final_unpaid", "paid", "lookup_failed"];
+  /** What one superseded state alone (beside an unpaid or absent live checkout) must give. */
+  const expectedFor = (state: S): any =>
+    state === "lookup_failed" ? { kind: "error" }
+      : state === "in_progress" ? { kind: "leave" }
+        : state === "paid" ? { kind: "settle", references: ["old"] }
+          : { kind: "cancel" };
+
+  test("no live checkout x each superseded state", () => {
+    for (const state of SUPERSEDED_STATES) {
+      const d = decideAbandonedCheckouts(row(null, ["old"]), new Map([["old", state]]), at);
+      assert.deepEqual(d, expectedFor(state), state);
+    }
+  });
+
+  test("a final-unpaid live checkout x each superseded state", () => {
+    for (const state of SUPERSEDED_STATES) {
+      const d = decideAbandonedCheckouts(
+        row("live", ["old"]), new Map<string, S>([["live", "final_unpaid"], ["old", state]]), at
+      );
+      assert.deepEqual(d, expectedFor(state), state);
+    }
+  });
+
+  test("a live checkout in each state x each superseded state: error > in progress > paid > cancel", () => {
+    const rank = (s: S) => ["final_unpaid", "paid", "in_progress", "lookup_failed"].indexOf(s);
+    for (const live of SUPERSEDED_STATES) {
+      for (const old of SUPERSEDED_STATES) {
+        const d = decideAbandonedCheckouts(row("live", ["old"]), new Map<string, S>([["live", live], ["old", old]]), at);
+        const worst = rank(live) >= rank(old) ? live : old;
+        const expected =
+          worst === "lookup_failed" ? { kind: "error" }
+            : worst === "in_progress" ? { kind: "leave" }
+              : worst === "paid"
+                ? { kind: "settle", references: [live, old].map((st, i) => (st === "paid" ? ["live", "old"][i] : null)).filter(Boolean) }
+                : { kind: "cancel" };
+        assert.deepEqual(d, expected, `live ${live}, superseded ${old}`);
+      }
+    }
+  });
+
+  test("two superseded entries in different states (no live checkout)", () => {
+    const two = row(null, ["a", "b"]);
+    const decide = (a: S, b: S) => decideAbandonedCheckouts(two, new Map<string, S>([["a", a], ["b", b]]), at);
+    assert.deepEqual(decide("final_unpaid", "final_unpaid"), { kind: "cancel" });
+    assert.deepEqual(decide("paid", "final_unpaid"), { kind: "settle", references: ["a"] });
+    assert.deepEqual(decide("final_unpaid", "paid"), { kind: "settle", references: ["b"] });
+    assert.deepEqual(decide("paid", "paid"), { kind: "settle", references: ["a", "b"] });
+    assert.deepEqual(decide("paid", "in_progress"), { kind: "leave" }, "nothing written while one is in flight");
+    assert.deepEqual(decide("final_unpaid", "in_progress"), { kind: "leave" });
+    assert.deepEqual(decide("in_progress", "lookup_failed"), { kind: "error" });
+    assert.deepEqual(decide("paid", "lookup_failed"), { kind: "error" }, "fail closed");
+    assert.deepEqual(decide("lookup_failed", "final_unpaid"), { kind: "error" });
+  });
+
+  test("no checkout at all: cancel; a reference not looked up: leave; not abandoned: skip", () => {
+    assert.deepEqual(decideAbandonedCheckouts(row(null, []), new Map(), at), { kind: "cancel" });
+    assert.deepEqual(decideAbandonedCheckouts(row(null, ["a", "b"]), new Map([["a", "final_unpaid" as S]]), at), { kind: "leave" });
+    assert.deepEqual(decideAbandonedCheckouts(row("live", []), new Map(), at), { kind: "leave" });
+    for (const over of [{ paymentStatus: "paid" }, { status: "cancelled" }, { quoteExpiresAt: Timestamp.fromMillis(at.getTime() - HOUR_MS) }]) {
+      assert.deepEqual(
+        decideAbandonedCheckouts(row("live", ["old"], over), new Map<string, S>([["live", "paid"], ["old", "paid"]]), at),
+        { kind: "skip" }
+      );
+    }
+  });
+
+  test("sweepCheckoutReferences: live first, then superseded in order, no duplicates", () => {
+    assert.deepEqual(sweepCheckoutReferences({ transactionId: "l", supersededCheckouts: [{ reference: "a" }, { reference: "l" }, { reference: "b" }] } as any), ["l", "a", "b"]);
+    assert.deepEqual(sweepCheckoutReferences({} as any), []);
+  });
+
+  test("decideAfterSweepSettles: confirmed wins, unapplicable is review, recorded-and-refunded cancels", () => {
+    const o = (kind: string): any => ({ kind });
+    assert.equal(decideAfterSweepSettles([o("confirmed")]), "settled");
+    assert.equal(decideAfterSweepSettles([o("already_paid")]), "settled");
+    assert.equal(decideAfterSweepSettles([o("rescheduled_refund_recorded"), o("confirmed")]), "settled");
+    for (const kind of ["rescheduled_refund_recorded", "refund_recorded", "not_payable_recorded"]) {
+      assert.equal(decideAfterSweepSettles([o(kind)]), "cancel", kind);
+    }
+    assert.equal(decideAfterSweepSettles([o("rescheduled_refund_recorded"), o("not_payable_recorded")]), "cancel");
+    for (const bad of [o("mismatch"), o("not_chargeable"), o("unknown_reference"), null]) {
+      assert.equal(decideAfterSweepSettles([bad]), "review", String(bad?.kind));
+      assert.equal(decideAfterSweepSettles([o("rescheduled_refund_recorded"), bad]), "review");
+    }
+  });
+});
+
+describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)", () => {
+  test("every checkout is looked up once: the live one and each superseded entry", async () => {
+    await seedPending("b1", 30, {
+      transactionId: "live-1",
+      supersededCheckouts: [entry("old-1", false), entry("old-2", true)],
+    });
+    paystackAbandoned("live-1", "b1");
+    paystackAbandoned("old-1", "b1");
+    paystackStatus("old-2", "b1", "failed");
+    const seen = countLookups();
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(seen, ["live-1", "old-1", "old-2"]);
+    assert.deepEqual(result, { scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 });
+    assertSystemCancelled("b1");
+  });
+
+  test("a retired checkout IN PROGRESS: left (nothing written, leftInProgress 1)", async () => {
+    await seedPending("b1", 30, { supersededCheckouts: [entry("old-1", true)] });
+    paystackStatus("old-1", "b1", "ongoing");
+    const before = JSON.stringify(booking("b1"));
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 1, skipped: 0, errors: 0 });
+    assert.equal(JSON.stringify(booking("b1")), before);
+    assert.equal(docsIn("transactions").length, 0);
+    assert.equal(docsIn("consultationPaymentExceptions").length, 0);
+  });
+
+  test("an older re-priced checkout in progress beside a final live one: left too", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1", false)] });
+    paystackAbandoned("live-1", "b1");
+    paystackStatus("old-1", "b1", "pending");
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.leftInProgress, 1);
+    assert.equal(booking("b1").status, "pending_payment");
+  });
+
+  test("a retired checkout PAID: one settlePayment, one exception, one refund (full), one fee debit, then cancelled; a second run adds nothing", async () => {
+    await seedPending("b1", 30, { supersededCheckouts: [entry("old-1", true)] });
+    paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" }, harness.clock.now(), { fees: 20_000 });
+
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(result, { scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 });
+    assertSystemCancelled("b1");
+
+    const exceptions = docsIn("consultationPaymentExceptions");
+    assert.equal(exceptions.length, 1);
+    assert.equal(exceptions[0][0], "old-1");
+    assert.equal(exceptions[0][1].reason, "paid_for_rescheduled_slot", "agent-caused, as #354 decided");
+    const refunds = refundsOf("b1");
+    assert.equal(refunds.length, 1);
+    assert.equal(refunds[0].amount, FEE_KOBO, "refunded in full");
+    const debits = debitsOf();
+    assert.equal(debits.length, 1);
+    assert.equal(debits[0].amount, 20_000);
+    assert.equal(debits[0].agentId, "uid-agent1", "debited from retiredByAgentId");
+    assert.equal(feesOf().length, 0, "never a fee Transaction");
+    assert.equal(harness.refundCalls.length, 1, "one Paystack refund");
+
+    // Second run: the booking is cancelled, so not scanned; nothing new.
+    const again = await consultationService.sweepAbandonedBookings();
+    assert.equal(again.scanned, 0);
+    assert.equal(refundsOf("b1").length, 1, "no second refund");
+    assert.equal(debitsOf().length, 1, "no second debit");
+    assert.equal(harness.refundCalls.length, 1);
+    assert.equal(booking("b1").status, "cancelled");
+  });
+
+  test("a paid retired checkout recorded on an EARLIER run is cancelled once the other checkout is final", async () => {
+    await seedPending("b1", 30, { supersededCheckouts: [entry("old-1", true), entry("old-2", true)] });
+    paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" });
+    paystackStatus("old-2", "b1", "ongoing");
+
+    // Run 1: old-2 is in flight, so nothing at all is written.
+    const first = await consultationService.sweepAbandonedBookings();
+    assert.equal(first.leftInProgress, 1);
+    assert.equal(docsIn("consultationPaymentExceptions").length, 0);
+
+    // Meanwhile the payer's verify records old-1 (exception + refund).
+    const out = await verify("old-1");
+    assert.equal(out.status, 409, JSON.stringify(out.body));
+    assert.equal(docsIn("consultationPaymentExceptions").length, 1);
+    assert.equal(refundsOf("b1").length, 1);
+
+    // Run 2: old-2 failed for good. old-1 is paid again at Paystack, settled
+    // again (idempotent: nothing new), and no longer keeps the booking alive.
+    paystackStatus("old-2", "b1", "abandoned");
+    const second = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(second, { scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 });
+    assertSystemCancelled("b1");
+    assert.equal(docsIn("consultationPaymentExceptions").length, 1);
+    assert.equal(refundsOf("b1").length, 1, "still one refund");
+  });
+
+  test("an ordinary re-priced superseded checkout PAID on a pending booking: confirmed at its price, not cancelled", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1", false)] });
+    paystackAbandoned("live-1", "b1");
+    paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" });
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 1, leftInProgress: 0, skipped: 0, errors: 0 });
+    const b = booking("b1");
+    assert.equal(b.status, "scheduled");
+    assert.equal(b.paymentStatus, "paid");
+    assert.equal(b.transactionId, "old-1");
+    assert.equal(b.paidOnSupersededReference, true);
+    assert.equal(feesOf().length, 1);
+    assert.equal(docsIn("consultationPaymentExceptions").length, 0);
+  });
+
+  test("a superseded checkout paid with the WRONG amount: left for review (skipped), never cancelled", async () => {
+    await seedPending("b1", 30, { supersededCheckouts: [entry("old-1", true)] });
+    paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO - 1, currency: "NGN" });
+    const before = JSON.stringify(booking("b1"));
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    assert.equal(JSON.stringify(booking("b1")), before);
+    assert.equal(docsIn("transactions").length, 0);
+  });
+
+  test("a lookup error on a superseded checkout: not cancelled, errors 1, nothing written", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1", true)] });
+    paystackAbandoned("live-1", "b1");
+    paystackAbandoned("old-1", "b1");
+    // The live one answers, then the superseded one fails.
+    let calls = 0;
+    harness.onLookup = async (reference: string) => {
+      calls++;
+      if (reference === "old-1") throw new Error("PAYSTACK_ERROR: 502 Bad Gateway");
+      return undefined;
+    };
+    const before = JSON.stringify(booking("b1"));
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 1 });
+    assert.equal(JSON.stringify(booking("b1")), before);
+    assert.equal(calls, 2);
+  });
+
+  test("a superseded reference of OURS that Paystack never saw counts as final unpaid", async () => {
+    harness.realisticNotFound = true;
+    const ours = "cons-b1-123e4567-e89b-42d3-a456-426614174000";
+    await seedPending("b1", 30, { supersededCheckouts: [entry(ours, true)] });
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.cancelled, 1);
+    assertSystemCancelled("b1");
+  });
+
+  test("a superseded reference Paystack generated and answers 'not found': fail closed (errors 1)", async () => {
+    harness.realisticNotFound = true;
+    await seedPending("b1", 30, { supersededCheckouts: [entry("T123paystackmade", false)] });
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.errors, 1);
+    assert.equal(booking("b1").status, "pending_payment");
+  });
+
+  test("the superseded list changes between the lookups and the cancel: not cancelled (skipped)", async () => {
+    await seedPending("b1", 30, { supersededCheckouts: [entry("old-1", true)] });
+    paystackAbandoned("old-1", "b1");
+    harness.onLookup = async () => {
+      harness.onLookup = undefined;
+      // A re-price / retire meanwhile appends another (unchecked) checkout.
+      await fakeCollection("consultations").doc("b1").update({
+        supersededCheckouts: [entry("old-1", true), entry("old-2", true)],
+      });
+      return undefined;
+    };
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    assert.equal(booking("b1").status, "pending_payment");
+  });
+
+  test("a booking that is not abandoned costs no Paystack call at all", async () => {
+    await seedPending("paid", 72, {
+      paymentStatus: "paid", transactionId: "live-p", supersededCheckouts: [entry("old-p", true)],
+    });
+    const seen = countLookups();
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.scanned, 1);
+    assert.equal(result.skipped, 1);
+    assert.deepEqual(seen, []);
+  });
+});
+
+// ============================================
+// Issue #405: a reschedule of an unpaid booking restarts its payment grace
+// ============================================
+//
+// Decision (orchestrator, 2026-11-19): when the agent side moves an unpaid
+// booking after its quote lock, the 24-hour payment grace restarts from the
+// reschedule. The edit stores `paymentGraceStartsAt` (server clock), and the
+// sweep measures 24 hours from the LATER of it and `quoteExpiresAt`.
+
+/** Edit booking `id` as its agent side (the only party that may edit). */
+function editAsAgent(id: string, updates: Record<string, unknown>) {
+  return consultationService.editConsultation(id, () => CONSULTATION_ACTORS.AGENT_SIDE, updates as any);
+}
+
+describe("payment grace after a reschedule (pure, issue #405)", () => {
+  const at = new Date("2026-11-20T12:00:00Z");
+  const DAY = ABANDONED_BOOKING_GRACE_HOURS * HOUR_MS;
+  /** A pending booking whose lock ended 3 days before `at`, moved `movedMsAgo` before `at`. */
+  const row = (movedMsAgo: number | null, overrides: Record<string, unknown> = {}): any => ({
+    status: "pending_payment", paymentStatus: "pending",
+    quoteExpiresAt: Timestamp.fromMillis(at.getTime() - 3 * DAY),
+    ...(movedMsAgo === null ? {} : { paymentGraceStartsAt: Timestamp.fromMillis(at.getTime() - movedMsAgo) }),
+    ...overrides,
+  });
+
+  test("the grace runs from the later of the lock and the reschedule", () => {
+    assert.equal(isAbandonedBooking(row(null), at), true, "never moved: 24 hours from the lock, as before");
+    assert.equal(isAbandonedBooking(row(HOUR_MS), at), false, "moved an hour ago");
+    assert.equal(isAbandonedBooking(row(DAY), at), false, "exactly 24 hours after the move is not yet past");
+    assert.equal(isAbandonedBooking(row(DAY + 1), at), true);
+    // A move BEFORE the lock ended (impossible through the edit, but bad data) does not shorten the grace.
+    const lockRecent = row(5 * DAY, { quoteExpiresAt: Timestamp.fromMillis(at.getTime() - HOUR_MS) });
+    assert.equal(isAbandonedBooking(lockRecent, at), false);
+    // Legacy rows (no lock) stay out of the sweep whatever the move says.
+    assert.equal(isAbandonedBooking(row(5 * DAY, { quoteExpiresAt: undefined }), at), false);
+    // The decisions follow it: skipped before any lookup.
+    assert.equal(decideAbandonedBooking(row(HOUR_MS, { transactionId: "x" }), "final_unpaid", at), "skip");
+    assert.deepEqual(decideAbandonedCheckouts(row(HOUR_MS), new Map(), at), { kind: "skip" });
+  });
+
+  test("gracePeriodRestartForReschedule: only for an unpaid pending_payment booking", () => {
+    assert.deepEqual(
+      gracePeriodRestartForReschedule({ status: "pending_payment", paymentStatus: "pending" } as any, at),
+      { paymentGraceStartsAt: Timestamp.fromDate(at) }
+    );
+    assert.equal(gracePeriodRestartForReschedule({ status: "pending_payment", paymentStatus: "paid" } as any, at), null);
+    for (const status of ["scheduled", "confirmed", "cancelled"]) {
+      assert.equal(gracePeriodRestartForReschedule({ status, paymentStatus: "pending" } as any, at), null, status);
+    }
+  });
+});
+
+describe("sweepAbandonedBookings after an agent-side reschedule (issue #405)", () => {
+  test("moved 30 hours after its lock: not swept for 24 hours from the move, then swept as usual", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1", checkoutUrl: "https://checkout.paystack.test/live-1" });
+    paystackAbandoned("live-1", "b1");
+    const moved = await editAsAgent("b1", { scheduledTime: "15:00" });
+    assert.equal(moved.kind, "edited");
+    const movedAt = harness.clock.now().getTime();
+    assert.equal(booking("b1").paymentGraceStartsAt.toMillis(), movedAt, "stored at the server clock of the edit");
+    assert.equal(booking("b1").transactionId, undefined, "#354: the checkout was retired");
+
+    // Right after the move, and 24 hours later: skipped, no Paystack call.
+    const seen = countLookups();
+    const first = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(first, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    harness.clock.advanceHours(24);
+    const atDay = await consultationService.sweepAbandonedBookings();
+    assert.equal(atDay.skipped, 1);
+    assert.equal(booking("b1").status, "pending_payment");
+    assert.deepEqual(seen, [], "no Paystack call while the grace runs");
+
+    // Past 24 hours from the move: swept under #397's rules (retired checkout asked about).
+    harness.clock.advanceHours(1);
+    const after = await consultationService.sweepAbandonedBookings();
+    assert.equal(after.cancelled, 1);
+    assert.deepEqual(seen, ["live-1"]);
+    assertSystemCancelled("b1");
+  });
+
+  test("a booking with no checkout, moved after its lock, gets the full grace too", async () => {
+    await seedPending("b1", 48);
+    const moved = await editAsAgent("b1", { scheduledDate: "2026-12-03" });
+    assert.equal(moved.kind, "edited");
+    assert.ok(booking("b1").paymentGraceStartsAt);
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.cancelled, 0);
+    assert.equal(result.skipped, 1);
+    harness.clock.advanceHours(25);
+    assert.equal((await consultationService.sweepAbandonedBookings()).cancelled, 1);
+  });
+
+  test("a fresh checkout after the move: the later of its lock and the move wins", async () => {
+    await seedPending("b1", 30);
+    await editAsAgent("b1", { scheduledTime: "16:00" });
+    // The client opens a new checkout 10 hours later (lock 30 min).
+    harness.clock.advanceHours(10);
+    const lockEnd = harness.clock.now().getTime() + 30 * 60_000;
+    await fakeCollection("consultations").doc("b1").update({
+      transactionId: "fresh-1", checkoutUrl: "https://checkout.paystack.test/fresh-1",
+      quoteExpiresAt: Timestamp.fromMillis(lockEnd),
+    });
+    paystackAbandoned("fresh-1", "b1");
+    // 24h after the move, but not 24h after the new lock: kept.
+    harness.clock.advanceHours(15);
+    assert.equal((await consultationService.sweepAbandonedBookings()).cancelled, 0);
+    // Past 24h after the new lock: cancelled.
+    harness.clock.advanceHours(10);
+    assert.equal((await consultationService.sweepAbandonedBookings()).cancelled, 1);
+  });
+
+  test("not restarted: an edit that does not move the slot, a same-value schedule edit, or a paid booking", async () => {
+    await seedPending("notes", 30);
+    await editAsAgent("notes", { summary: "Bring your passport" });
+    assert.equal(booking("notes").paymentGraceStartsAt, undefined);
+
+    await seedPending("same", 30);
+    await editAsAgent("same", { scheduledTime: "10:00" }); // the stored value
+    assert.equal(booking("same").paymentGraceStartsAt, undefined);
+
+    await seedPending("paid", 30, { status: "scheduled", paymentStatus: "paid", paidAt: T0 });
+    await editAsAgent("paid", { scheduledTime: "11:00" });
+    assert.equal(booking("paid").paymentGraceStartsAt, undefined);
+
+    // The two unpaid ones are still swept as before.
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.cancelled, 2);
+  });
+
+  test("a reschedule landing between the sweep's lookups and its cancel wins: not cancelled", async () => {
+    await seedPending("b1", 30, { supersededCheckouts: [entry("old-1", true)] });
+    paystackAbandoned("old-1", "b1");
+    harness.onLookup = async () => {
+      harness.onLookup = undefined;
+      // The agent moves it again while the sweep is mid-flight (the set of
+      // superseded references stays the same: only the grace changes).
+      const moved = await editAsAgent("b1", { scheduledTime: "17:00" });
+      assert.equal(moved.kind, "edited");
+      return undefined;
+    };
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    assert.equal(booking("b1").status, "pending_payment");
+    assert.ok(booking("b1").paymentGraceStartsAt);
   });
 });
