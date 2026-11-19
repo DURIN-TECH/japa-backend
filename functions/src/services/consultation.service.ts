@@ -824,23 +824,55 @@ export function abandonedCutoff(at: Date): Date {
 
 /**
  * True when `c` is an unpaid booking the sweep may close at time `at`:
- * `pending_payment`, not paid, and its quote lock ended more than
+ * `pending_payment`, not paid, and its payment grace started more than
  * ABANDONED_BOOKING_GRACE_HOURS ago. Pure.
+ *
+ * The grace starts at the LATER of (issue #405):
+ *  - `quoteExpiresAt`: the end of the booking's quote lock (as before);
+ *  - `paymentGraceStartsAt`: the last time the agent side moved the booking
+ *    while it was unpaid (`gracePeriodRestartForReschedule`). A move after
+ *    the lock restarts the 24 hours, so the client always gets a full day
+ *    to pay for the new time.
  *
  * A LEGACY row (before #180: no `quoteExpiresAt`) is never abandoned in this
  * sense: the one-off `cancel:legacy-consultations` script covers those.
  */
 export function isAbandonedBooking(
-  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt">,
+  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt" | "paymentGraceStartsAt">,
   at: Date
 ): boolean {
   const expiresAt = millisOf(c.quoteExpiresAt);
+  if (expiresAt === null) return false; // legacy row
+  // Issue #405: a reschedule after the lock pushes the start of the grace.
+  const rescheduledAt = millisOf(c.paymentGraceStartsAt);
+  const graceStart = rescheduledAt !== null ? Math.max(expiresAt, rescheduledAt) : expiresAt;
   return (
     c.status === "pending_payment" &&
     c.paymentStatus !== "paid" &&
-    expiresAt !== null &&
-    expiresAt < abandonedCutoff(at).getTime()
+    graceStart < abandonedCutoff(at).getTime()
   );
+}
+
+/**
+ * The field that restarts an unpaid booking's 24-hour payment grace when the
+ * agent side moves it (issue #405), or null when it does not apply. Pure.
+ *
+ * Applies to a `pending_payment`, unpaid booking whose slot REALLY changes
+ * (the caller checks `slotChanges`, as for `retireCheckoutsForReschedule`),
+ * whether or not it had a checkout to retire: a booking moved after its
+ * quote lock could otherwise be swept before the client could pay for the
+ * new time. Within the lock it is harmless (the later of the two wins).
+ * No money moves here: it only moves the sweep's clock.
+ *
+ * @param booking the booking as read in the edit's transaction
+ * @param at the server clock of the edit
+ */
+export function gracePeriodRestartForReschedule(
+  booking: Pick<Consultation, "status" | "paymentStatus">,
+  at: Date
+): { paymentGraceStartsAt: Timestamp } | null {
+  if (booking.status !== "pending_payment" || booking.paymentStatus === "paid") return null;
+  return { paymentGraceStartsAt: Timestamp.fromDate(at) };
 }
 
 /**
@@ -863,7 +895,7 @@ export type AbandonedBookingDecision = "skip" | "settle" | "leave" | "cancel";
  * @param at the time of the decision (the charge path's clock)
  */
 export function decideAbandonedBooking(
-  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt" | "transactionId">,
+  c: Pick<Consultation, "status" | "paymentStatus" | "quoteExpiresAt" | "paymentGraceStartsAt" | "transactionId">,
   paystack: PaystackState | null,
   at: Date
 ): AbandonedBookingDecision {
@@ -917,7 +949,8 @@ export function sweepCheckoutReferences(
 
 /**
  * What the sweep does with one booking once every checkout was looked up:
- *  - `skip`:   not abandoned (paid, cancelled, legacy, too recent);
+ *  - `skip`:   not abandoned (paid, cancelled, legacy, too recent, or its
+ *              payment grace restarted by a recent reschedule, #405);
  *  - `error`:  at least one lookup failed: nothing written (fail closed);
  *  - `leave`:  a payment may still land on at least one checkout (Paystack
  *              `in_progress`), or a checkout was not looked up: nothing
@@ -957,7 +990,7 @@ export type AbandonedCheckoutsDecision =
 export function decideAbandonedCheckouts(
   c: Pick<
     Consultation,
-    "status" | "paymentStatus" | "quoteExpiresAt" | "transactionId" | "supersededCheckouts"
+    "status" | "paymentStatus" | "quoteExpiresAt" | "paymentGraceStartsAt" | "transactionId" | "supersededCheckouts"
   >,
   states: ReadonlyMap<string, SweepCheckoutState>,
   at: Date
@@ -1293,6 +1326,14 @@ class ConsultationService {
    * Needs the composite index consultations(status, quoteExpiresAt), see
    * firestore.indexes.json. A legacy row has no `quoteExpiresAt`, so the
    * query never returns it.
+   *
+   * Issue #405: a booking the agent side moved while unpaid carries
+   * `paymentGraceStartsAt`, and its grace runs from the later of that and
+   * `quoteExpiresAt`. The query (and its index) is unchanged: it still
+   * selects on `quoteExpiresAt`, a superset, and `isAbandonedBooking` skips
+   * a booking whose grace restarted less than 24 hours ago BEFORE any
+   * Paystack call. Such a booking stops being skipped within 24 hours of its
+   * move, so it can hold a batch slot for at most a day.
    */
   async sweepAbandonedBookings(): Promise<AbandonedSweepResult> {
     const result: AbandonedSweepResult = {
@@ -1536,6 +1577,12 @@ class ConsultationService {
             `and ${(current.supersededCheckouts ?? []).length} older one(s) retired; a payment on them is refunded`
         );
       }
+
+      // Issue #405: a real move of an unpaid booking restarts its 24-hour
+      // payment grace from now, so the abandoned-booking sweep cannot cancel
+      // it before the client has had a full day to pay for the new time.
+      const graceRestart = slotChanges(current, updates) ? gracePeriodRestartForReschedule(current, at) : null;
+      if (graceRestart) Object.assign(write, graceRestart);
 
       tx.update(ref, write);
       // The stored doc after the commit: the fresh copy plus what was written

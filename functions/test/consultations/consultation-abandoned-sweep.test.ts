@@ -51,6 +51,8 @@ import {
   decideAbandonedCheckouts,
   decideAfterSweepSettles,
   sweepCheckoutReferences,
+  gracePeriodRestartForReschedule,
+  CONSULTATION_ACTORS,
   isAbandonedBooking,
   ABANDONED_BOOKING_GRACE_HOURS,
   ABANDONED_SWEEP_BATCH_SIZE,
@@ -840,5 +842,152 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
     assert.equal(result.scanned, 1);
     assert.equal(result.skipped, 1);
     assert.deepEqual(seen, []);
+  });
+});
+
+// ============================================
+// Issue #405: a reschedule of an unpaid booking restarts its payment grace
+// ============================================
+//
+// Decision (orchestrator, 2026-11-19): when the agent side moves an unpaid
+// booking after its quote lock, the 24-hour payment grace restarts from the
+// reschedule. The edit stores `paymentGraceStartsAt` (server clock), and the
+// sweep measures 24 hours from the LATER of it and `quoteExpiresAt`.
+
+/** Edit booking `id` as its agent side (the only party that may edit). */
+function editAsAgent(id: string, updates: Record<string, unknown>) {
+  return consultationService.editConsultation(id, () => CONSULTATION_ACTORS.AGENT_SIDE, updates as any);
+}
+
+describe("payment grace after a reschedule (pure, issue #405)", () => {
+  const at = new Date("2026-11-20T12:00:00Z");
+  const DAY = ABANDONED_BOOKING_GRACE_HOURS * HOUR_MS;
+  /** A pending booking whose lock ended 3 days before `at`, moved `movedMsAgo` before `at`. */
+  const row = (movedMsAgo: number | null, overrides: Record<string, unknown> = {}): any => ({
+    status: "pending_payment", paymentStatus: "pending",
+    quoteExpiresAt: Timestamp.fromMillis(at.getTime() - 3 * DAY),
+    ...(movedMsAgo === null ? {} : { paymentGraceStartsAt: Timestamp.fromMillis(at.getTime() - movedMsAgo) }),
+    ...overrides,
+  });
+
+  test("the grace runs from the later of the lock and the reschedule", () => {
+    assert.equal(isAbandonedBooking(row(null), at), true, "never moved: 24 hours from the lock, as before");
+    assert.equal(isAbandonedBooking(row(HOUR_MS), at), false, "moved an hour ago");
+    assert.equal(isAbandonedBooking(row(DAY), at), false, "exactly 24 hours after the move is not yet past");
+    assert.equal(isAbandonedBooking(row(DAY + 1), at), true);
+    // A move BEFORE the lock ended (impossible through the edit, but bad data) does not shorten the grace.
+    const lockRecent = row(5 * DAY, { quoteExpiresAt: Timestamp.fromMillis(at.getTime() - HOUR_MS) });
+    assert.equal(isAbandonedBooking(lockRecent, at), false);
+    // Legacy rows (no lock) stay out of the sweep whatever the move says.
+    assert.equal(isAbandonedBooking(row(5 * DAY, { quoteExpiresAt: undefined }), at), false);
+    // The decisions follow it: skipped before any lookup.
+    assert.equal(decideAbandonedBooking(row(HOUR_MS, { transactionId: "x" }), "final_unpaid", at), "skip");
+    assert.deepEqual(decideAbandonedCheckouts(row(HOUR_MS), new Map(), at), { kind: "skip" });
+  });
+
+  test("gracePeriodRestartForReschedule: only for an unpaid pending_payment booking", () => {
+    assert.deepEqual(
+      gracePeriodRestartForReschedule({ status: "pending_payment", paymentStatus: "pending" } as any, at),
+      { paymentGraceStartsAt: Timestamp.fromDate(at) }
+    );
+    assert.equal(gracePeriodRestartForReschedule({ status: "pending_payment", paymentStatus: "paid" } as any, at), null);
+    for (const status of ["scheduled", "confirmed", "cancelled"]) {
+      assert.equal(gracePeriodRestartForReschedule({ status, paymentStatus: "pending" } as any, at), null, status);
+    }
+  });
+});
+
+describe("sweepAbandonedBookings after an agent-side reschedule (issue #405)", () => {
+  test("moved 30 hours after its lock: not swept for 24 hours from the move, then swept as usual", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1", checkoutUrl: "https://checkout.paystack.test/live-1" });
+    paystackAbandoned("live-1", "b1");
+    const moved = await editAsAgent("b1", { scheduledTime: "15:00" });
+    assert.equal(moved.kind, "edited");
+    const movedAt = harness.clock.now().getTime();
+    assert.equal(booking("b1").paymentGraceStartsAt.toMillis(), movedAt, "stored at the server clock of the edit");
+    assert.equal(booking("b1").transactionId, undefined, "#354: the checkout was retired");
+
+    // Right after the move, and 24 hours later: skipped, no Paystack call.
+    const seen = countLookups();
+    const first = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(first, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    harness.clock.advanceHours(24);
+    const atDay = await consultationService.sweepAbandonedBookings();
+    assert.equal(atDay.skipped, 1);
+    assert.equal(booking("b1").status, "pending_payment");
+    assert.deepEqual(seen, [], "no Paystack call while the grace runs");
+
+    // Past 24 hours from the move: swept under #397's rules (retired checkout asked about).
+    harness.clock.advanceHours(1);
+    const after = await consultationService.sweepAbandonedBookings();
+    assert.equal(after.cancelled, 1);
+    assert.deepEqual(seen, ["live-1"]);
+    assertSystemCancelled("b1");
+  });
+
+  test("a booking with no checkout, moved after its lock, gets the full grace too", async () => {
+    await seedPending("b1", 48);
+    const moved = await editAsAgent("b1", { scheduledDate: "2026-12-03" });
+    assert.equal(moved.kind, "edited");
+    assert.ok(booking("b1").paymentGraceStartsAt);
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.cancelled, 0);
+    assert.equal(result.skipped, 1);
+    harness.clock.advanceHours(25);
+    assert.equal((await consultationService.sweepAbandonedBookings()).cancelled, 1);
+  });
+
+  test("a fresh checkout after the move: the later of its lock and the move wins", async () => {
+    await seedPending("b1", 30);
+    await editAsAgent("b1", { scheduledTime: "16:00" });
+    // The client opens a new checkout 10 hours later (lock 30 min).
+    harness.clock.advanceHours(10);
+    const lockEnd = harness.clock.now().getTime() + 30 * 60_000;
+    await fakeCollection("consultations").doc("b1").update({
+      transactionId: "fresh-1", checkoutUrl: "https://checkout.paystack.test/fresh-1",
+      quoteExpiresAt: Timestamp.fromMillis(lockEnd),
+    });
+    paystackAbandoned("fresh-1", "b1");
+    // 24h after the move, but not 24h after the new lock: kept.
+    harness.clock.advanceHours(15);
+    assert.equal((await consultationService.sweepAbandonedBookings()).cancelled, 0);
+    // Past 24h after the new lock: cancelled.
+    harness.clock.advanceHours(10);
+    assert.equal((await consultationService.sweepAbandonedBookings()).cancelled, 1);
+  });
+
+  test("not restarted: an edit that does not move the slot, a same-value schedule edit, or a paid booking", async () => {
+    await seedPending("notes", 30);
+    await editAsAgent("notes", { summary: "Bring your passport" });
+    assert.equal(booking("notes").paymentGraceStartsAt, undefined);
+
+    await seedPending("same", 30);
+    await editAsAgent("same", { scheduledTime: "10:00" }); // the stored value
+    assert.equal(booking("same").paymentGraceStartsAt, undefined);
+
+    await seedPending("paid", 30, { status: "scheduled", paymentStatus: "paid", paidAt: T0 });
+    await editAsAgent("paid", { scheduledTime: "11:00" });
+    assert.equal(booking("paid").paymentGraceStartsAt, undefined);
+
+    // The two unpaid ones are still swept as before.
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.cancelled, 2);
+  });
+
+  test("a reschedule landing between the sweep's lookups and its cancel wins: not cancelled", async () => {
+    await seedPending("b1", 30, { supersededCheckouts: [entry("old-1", true)] });
+    paystackAbandoned("old-1", "b1");
+    harness.onLookup = async () => {
+      harness.onLookup = undefined;
+      // The agent moves it again while the sweep is mid-flight (the set of
+      // superseded references stays the same: only the grace changes).
+      const moved = await editAsAgent("b1", { scheduledTime: "17:00" });
+      assert.equal(moved.kind, "edited");
+      return undefined;
+    };
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    assert.equal(booking("b1").status, "pending_payment");
+    assert.ok(booking("b1").paymentGraceStartsAt);
   });
 });
