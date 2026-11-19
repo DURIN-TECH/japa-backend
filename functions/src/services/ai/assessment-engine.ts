@@ -2104,8 +2104,8 @@ export function ruleCitationsIn(text: string, rules: readonly NarrativeRuleRef[]
     const ref = r.ref?.trim();
     if (!ref || ref.replace(/\s+/g, "").length < MIN_RULE_REF_CHARS) return;
     // The ref as a whole token: whitespace-flexible, not inside a longer id ("V 4.21").
-    // (#408) Case-SENSITIVE, written as the rubric writes it: "Appendix V"
-    // is the rubric's ref, "appendix v" in a sentence is not.
+    // (#408) Case-SENSITIVE, written as the rubric writes it: "Annex Q" is
+    // the rubric's ref, "annex q" in a sentence is not.
     // (#408) A ref that is only a number ("2.3") is not a citation when a
     // unit word follows it: "2.3 times the amount", "2.3 years", "2.3%" are
     // quantities. "Under 2.3 you need a sponsor" still counts.
