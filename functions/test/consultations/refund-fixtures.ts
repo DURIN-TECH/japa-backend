@@ -17,6 +17,7 @@ import type { AuthzSubject } from "@durin-tech/authz";
 
 import { harness, captureRes, docsIn, seed, paystackPaid, T0 } from "./harness";
 import { settlePayment } from "../../src/services/consultation-charge.service";
+import { toTransactionLookup } from "../../src/services/billing/paystack.provider";
 import { consultationController } from "../../src/controllers/consultation.controller";
 import { transactionController } from "../../src/controllers/transaction.controller";
 import { bankAccountController } from "../../src/controllers/bank-account.controller";
@@ -78,7 +79,17 @@ export function refOf(id: string): string {
  */
 export async function bookAndPay(
   id = "c1",
-  opts: { charge?: Money; over?: Record<string, unknown> } = {}
+  opts: {
+    charge?: Money;
+    over?: Record<string, unknown>;
+    /**
+     * Issue #395: Paystack's processing fee for the charge, as Paystack's RAW
+     * `data.fees` (parsed through the real `toTransactionLookup`, so a
+     * string, null, negative or fraction is dropped = unknown). Omitted: the
+     * harness default of 0. `null` in the key's place is passed through as is.
+     */
+    fees?: unknown;
+  } = {}
 ): Promise<Record<string, any>> {
   const charge = opts.charge ?? FEE_NGN;
   const reference = refOf(id);
@@ -112,6 +123,11 @@ export async function bookAndPay(
     ...(opts.over ?? {}),
   });
   paystackPaid(reference, id, charge);
+  if ("fees" in opts) {
+    // Re-parse the report the way verify does, with Paystack's raw fee.
+    const seen = harness.paystack.get(reference)!;
+    harness.paystack.set(reference, toTransactionLookup({ ...seen, paid_at: seen.paidAt, fees: opts.fees }));
+  }
   const outcome = await settlePayment(id, reference, harness.paystack.get(reference)!);
   assert.equal(outcome?.kind, "confirmed", "the payment settles the booking");
   return feeOf(id)!;

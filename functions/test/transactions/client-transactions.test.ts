@@ -98,6 +98,8 @@ async function seedTransactions(): Promise<void> {
       amount: 7_500_000,
       currency: "NGN",
       reference: "ref-ng-consult",
+      // Issue #395: Paystack's fee as settle classifies it (hidden from clients).
+      paystackFee: { status: "known", feeMinor: 112_500 },
     }),
     // Nigerian client: a paid payment request from agent A on their case.
     transactionService.buildPaymentRequestPayment(TX.ngRequest, at(2), {
@@ -123,6 +125,8 @@ async function seedTransactions(): Promise<void> {
       amount: 75_000,
       currency: "GHS",
       reference: "ref-gh-consult",
+      // Issue #395: a fee Paystack did not report (hidden from clients too).
+      paystackFee: { status: "unknown" },
     }),
     // Ghanaian client: a payment request from agent A's colleague.
     transactionService.buildPaymentRequestPayment(TX.ghRequest, at(5), {
@@ -333,6 +337,7 @@ describe("GET /transactions for agent-side callers is unchanged (issue #292)", (
     const own = transactionService.buildConsultationFee("tx-agent-as-payer", at(7), {
       consultationId: "consult-agent", clientUserId: agentA.uid, agentUserId: agentB.uid,
       amount: 100, currency: "NGN", reference: "ref-agent-payer",
+      paystackFee: { status: "known", feeMinor: 2 },
     });
     await seed("transactions", own.id, own as unknown as Record<string, unknown>);
     // The withdrawal (userId = agent A) is a payout, not a payment made.
