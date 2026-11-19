@@ -134,6 +134,11 @@ export function unionCurrencies(...sets: CurrencyBuckets[]): CurrencyCode[] {
 //    unknown (or not less than A) adds 0 until the fee is known. A legacy
 //    row (no fee status, written before #395) adds A as before. So the
 //    agent's `totalRevenue` and the analytics revenue are NET of the fee.
+//  - (issue #390) a settled consultation "refund" subtracts what it takes
+//    off the AGENT (`agentReversalMinor`): the fee's whole credit when paid
+//    out of the hold, at least the refund when paid from available. With
+//    the agent's fee debit, the agent's total per reference is A - F (kept),
+//    0 (client-caused refund) or -F (agent-caused), once everything settled.
 
 /** Statuses at which a transaction's money has actually moved. */
 export const SETTLED_STATUSES: readonly TransactionStatus[] = ["completed", "released"];
@@ -157,7 +162,7 @@ export function isSettled(txn: Pick<Transaction, "status">): boolean {
  */
 export function revenueEffect(
   txn: Pick<Transaction, "type" | "status" | "amount"> &
-    Partial<Pick<Transaction, "refundFundedFrom" | "paystackFeeStatus" | "paystackFeeMinor">>
+    Partial<Pick<Transaction, "refundFundedFrom" | "paystackFeeStatus" | "paystackFeeMinor" | "agentReversalMinor">>
 ): number {
   if (txn.type === "withdrawal" || !isSettled(txn)) return 0;
   // Issue #354: the refund of a payment that never confirmed its booking
@@ -171,7 +176,14 @@ export function revenueEffect(
   // Issue #395: a consultation fee counts what it credits the agent
   // (A - Paystack's fee), or nothing while that cannot be worked out.
   if (txn.type === "consultation_fee") return consultationFeeCredit(txn) ?? 0;
-  return txn.type === "refund" ? -txn.amount : txn.amount;
+  // Issue #390: a refund takes off revenue what it takes off the AGENT
+  // (`agentReversalMinor`), which may differ from what the client got back
+  // (Paystack keeps its fee). Older rows have none: `amount`, as before.
+  if (txn.type === "refund") {
+    const reversal = txn.agentReversalMinor;
+    return -(typeof reversal === "number" && Number.isSafeInteger(reversal) ? reversal : txn.amount);
+  }
+  return txn.amount;
 }
 
 /**

@@ -4,7 +4,8 @@
 //
 // When a PAID consultation is cancelled, this decides the refund by the
 // product rule, writes it as its own `refund` Transaction, and sends it back
-// through Paystack's refund API for the full amount charged. Admins can issue
+// through Paystack's refund API (the amount charged, minus Paystack's fee
+// when the client caused it: issue #390, below). Admins can issue
 // or retry one by hand (`POST /consultations/:id/refund`).
 //
 // THE RULE (paid bookings only; see `decideCancellationRefund`)
@@ -35,9 +36,11 @@
 //
 // MONEY AND IDEMPOTENCY (must hold)
 //
-//  - The refund row copies `amount` + `currency` from the fee Transaction
-//    (minor units of the charged currency, FX markup included). Paystack is
-//    called with exactly those, never a recomputed or converted figure.
+//  - The refund row copies `currency` from the fee Transaction (minor units
+//    of the charged currency, FX markup included); its `amount` is the fee's
+//    `amount`, or (issue #390, client-caused) that minus Paystack's own fee.
+//    Paystack is called with exactly the row's amount and currency, never a
+//    converted figure.
 //  - The row's doc id is `refund_<sha256 of the fee's Paystack reference>` (`refundDocId`):
 //    one charge can only ever have ONE refund row. A second cancel, a client
 //    retry or two admins at once find it and create nothing.
@@ -82,6 +85,42 @@
 // (`GET /consultations/payment-exceptions`), and retry a held one with the
 // same `{ refundId }` call: Paystack is asked for the fee again first.
 //
+// PAYSTACK'S FEE ON CANCEL REFUNDS (issue #390, decision 2026-11-16;
+// interaction with #395, where the agent is credited A - F at settle)
+//
+// Paystack keeps its processing fee F when a charge A is refunded. Seli
+// never carries it: whoever caused the refund does (`planCancellationRefund`).
+//
+//   refund reason                         | fee borne by | client gets | agent's total for the reference
+//   --------------------------------------|--------------|-------------|--------------------------------
+//   client_cancelled                      | client       | A - F       | 0
+//   agent_cancelled, admin_agent_no_show  | agent        | A           | -F (the fee once, never 2F)
+//   admin_goodwill, admin_other           | `feeBorneBy` (required, no default): as the row above
+//
+// The agent's total is reached whether the refund is paid out of the hold
+// or from the available balance. The refund row records what it takes off
+// the agent (`agentReversalMinor`), and the agent is debited F
+// (`paystack_fee_debit`, doc id `feeDebitDocId(reference)`, `tx.create`, in
+// the SAME transaction as the refund row, the booking and the agent's
+// withdrawal lock) ONLY when the funding path did not already take F:
+//  - out of the hold, the fee's whole credit leaves (agent at 0): an
+//    agent-caused refund writes the one debit of F;
+//  - from available on a net-credited fee (A - F): the agent-caused refund
+//    takes A off (agent already at -F): NO debit;
+//  - an older full-credit fee (credited A, before #395) from available,
+//    client-caused: the agent gives back the FULL A (user decision
+//    2026-11-17) while the client gets A - F; agent-caused: A off A, so the
+//    debit of F is written.
+// F is read from the fee Transaction (`paystackFeeMinor`) first; only when it
+// is not stored there (an older row, or #395 "unknown") is Paystack asked for
+// the reference, OUTSIDE the Firestore transaction. Never estimated: when no
+// well-formed fee is found, or a client-caused fee is not less than A, the
+// booking still cancels but the refund is HELD (a `failed` row of amount 0
+// with `refundHeldReason`, no Paystack call, no debit), listed in
+// `GET /transactions?role=admin&type=refund&status=failed`. An admin retry
+// (`POST /consultations/:id/refund`) re-reads the fee: known, it proceeds
+// once under the rule; still unknown, 409 PAYSTACK_FEE_UNKNOWN, nothing written.
+//
 // Out of scope here: the mobile and portal screens (#356, #357).
 
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
@@ -89,7 +128,10 @@ import type { Transaction as FirestoreTransaction } from "firebase-admin/firesto
 import type {
   Consultation,
   ConsultationPaymentException,
+  // Issue #390: who carries Paystack's fee, and why a refund is held.
+  PaystackFeeBorneBy,
   RefundFundedFrom,
+  RefundHeldReason,
   RefundReason,
   RefundStatus,
   Transaction,
@@ -109,12 +151,16 @@ import {
   writeUnappliedRefund,
 } from "./consultation-charge.service";
 import { availableBalanceIn, transactionService } from "./transaction.service";
+// Issue #390 / #395: Paystack's fee on the refunded charge.
+import { consultationFeeCredit, isWellFormedFee } from "../money/paystack-fee";
+import { resolvedFeeFields } from "./paystack-fee.service";
+import type { PaystackTransactionLookup } from "./billing/paystack.provider";
 import { notificationService } from "./notification.service";
 import { PaystackApiError, PaystackRefund, paystackProvider } from "./billing/paystack.provider";
 import { feeHoldStatusAt, FeeHoldStatus } from "../money/fee-hold";
 import { formatWithCode } from "../money/money";
 import { slotStartsAt } from "../consultations/slot-time";
-import { refundDocId } from "../money/refund-id";
+import { feeDebitDocId, refundDocId } from "../money/refund-id";
 
 // ============================================
 // Constants
@@ -237,12 +283,151 @@ export function decideCancellationRefund(
     : { kind: "late_client_cancel" };
 }
 
+// ============================================
+// Issue #390: who carries Paystack's fee, and how much moves
+// ============================================
+
+/**
+ * Who carries Paystack's fee for a refund reason (issue #390). Pure.
+ *  - `client_cancelled`: the client;
+ *  - `agent_cancelled`, `admin_agent_no_show`: the agent side;
+ *  - `admin_goodwill`, `admin_other`: whatever the admin chose
+ *    (`feeBorneBy`, required: null when it is missing, so the caller refuses).
+ * Any other reason (an unapplied payment, #354): null.
+ */
+export function feeBorneByFor(reason: RefundReason, chosen?: PaystackFeeBorneBy | null): PaystackFeeBorneBy | null {
+  if (reason === "client_cancelled") return "client";
+  if (reason === "agent_cancelled" || reason === "admin_agent_no_show") return "agent";
+  if (reason === "admin_goodwill" || reason === "admin_other") return chosen === "client" || chosen === "agent" ? chosen : null;
+  return null;
+}
+
+/** What one consultation refund does with the money (issue #390). */
+export type CancellationRefundPlan =
+  /** Nothing is refunded or debited: an admin must look (no figure is guessed). */
+  | { kind: "hold"; reason: RefundHeldReason; feeMinor?: number }
+  /**
+   * Refund `refundAmountMinor` to the client, take `agentReversalMinor` off
+   * the agent with the refund row, and debit `debitMinor` (0 = no debit row),
+   * all in the fee's currency. `feeKeptMinor`: client-caused only.
+   */
+  | {
+      kind: "refund";
+      feeMinor: number;
+      refundAmountMinor: number;
+      feeKeptMinor?: number;
+      agentReversalMinor: number;
+      debitMinor: number;
+    };
+
+/**
+ * Decide the money of one consultation refund (issue #390, the rule table in
+ * the header). Pure.
+ *
+ * Inputs: A = the fee Transaction's `amount`; C = what that fee credits the
+ * agent (`consultationFeeCredit`: A - F since #395, A on an older row, 0 when
+ * it credits nothing); F = Paystack's fee (unknown unless well-formed).
+ *
+ *  - client gets P: A - F (client-caused; held when F >= A) or A (agent-caused);
+ *  - the refund row takes R off the agent: out of the hold, the whole credit
+ *    (R = C); from available, R = max(P, C) (a net-credited fee gives back
+ *    what the client gets; an older full-credit one the whole A);
+ *  - the agent's total must end at T = 0 (client-caused) or -F
+ *    (agent-caused), so the debit is D = C - R - T, which is always 0 or F.
+ *
+ * Invariants (thrown on violation, never written): D is 0 or F; Seli's net
+ * (A - F) - P - (C - R - D) is 0; client-caused, P + F = A.
+ *
+ * @param input.fundedFrom "hold" or "available", as the engine decided it
+ */
+export function planCancellationRefund(input: {
+  amountMinor: number;
+  creditMinor: number;
+  feeMinor: unknown;
+  feeBorneBy: PaystackFeeBorneBy;
+  fundedFrom: Extract<RefundFundedFrom, "hold" | "available">;
+}): CancellationRefundPlan {
+  const { amountMinor: A, creditMinor: C, feeBorneBy, fundedFrom } = input;
+  if (!isWellFormedFee(input.feeMinor)) return { kind: "hold", reason: "paystack_fee_unknown" };
+  const F = input.feeMinor;
+  // Client-caused: nothing left to give back when Paystack kept it all.
+  if (feeBorneBy === "client" && F >= A) return { kind: "hold", reason: "fee_not_less_than_amount", feeMinor: F };
+  const P = feeBorneBy === "client" ? A - F : A;
+  const R = fundedFrom === "hold" ? C : Math.max(P, C);
+  const T = feeBorneBy === "client" ? 0 : -F;
+  const D = C - R - T;
+  if (D !== 0 && D !== F) {
+    throw new Error(`planCancellationRefund: debit ${D} is neither 0 nor the fee ${F} (A ${A}, C ${C}, ${fundedFrom})`);
+  }
+  if (A - F - P - (C - R - D) !== 0) {
+    throw new Error(`planCancellationRefund: Seli's net is not 0 (A ${A}, F ${F}, P ${P}, C ${C}, R ${R}, D ${D})`);
+  }
+  return {
+    kind: "refund",
+    feeMinor: F,
+    refundAmountMinor: P,
+    ...(feeBorneBy === "client" ? { feeKeptMinor: F } : {}),
+    agentReversalMinor: R,
+    debitMinor: D,
+  };
+}
+
+/**
+ * Paystack's fee for a refund of `fee` (issue #390), or undefined when it is
+ * unknown. Pure. The fee Transaction's STORED fee first (#395 "known" or
+ * "fee_not_less_than_amount"); only when none is stored (an older row, or
+ * #395 "unknown") the fresh Paystack report of the reference, and only in
+ * the fee's own currency. Never estimated.
+ */
+export function feeForRefund(
+  fee: Pick<Transaction, "currency"> & Partial<Pick<Transaction, "paystackFeeMinor" | "paystackFeeStatus">>,
+  lookup: Pick<PaystackTransactionLookup, "fees" | "currency"> | null
+): number | undefined {
+  if (fee.paystackFeeStatus !== "unknown" && isWellFormedFee(fee.paystackFeeMinor)) return fee.paystackFeeMinor;
+  if (lookup && lookup.currency === fee.currency && isWellFormedFee(lookup.fees)) return lookup.fees;
+  return undefined;
+}
+
+/**
+ * Whether a refund of `fee` has to ask Paystack for the fee first (issue
+ * #390): no well-formed fee is stored on it. Pure.
+ */
+export function refundNeedsFeeLookup(fee: Transaction | null): boolean {
+  if (!fee) return false;
+  return fee.paystackFeeStatus === "unknown" || !isWellFormedFee(fee.paystackFeeMinor);
+}
+
+/**
+ * Ask Paystack for the fee of `fee`'s reference, when the fee is not stored
+ * (issue #390). Called OUTSIDE any Firestore transaction. Never throws:
+ * `unavailable` says Paystack could not be reached (the cancel then holds the
+ * refund; an admin call answers 502).
+ */
+export async function lookUpRefundFee(
+  fee: Transaction | null
+): Promise<{ lookup: PaystackTransactionLookup | null; unavailable: boolean }> {
+  if (!refundNeedsFeeLookup(fee) || !fee?.providerTransactionId) return { lookup: null, unavailable: false };
+  try {
+    return { lookup: await paystackProvider.getTransactionMetadata(fee.providerTransactionId), unavailable: false };
+  } catch (error) {
+    console.error(`[refund] Paystack lookup of ${fee.id}'s fee failed:`, error);
+    return { lookup: null, unavailable: true };
+  }
+}
+
 /** What `GET /consultations/:id` tells the client before they cancel. */
 export interface CancellationRefundPreview {
   /** Whether cancelling NOW gives the fee back. */
   refundable: boolean;
-  /** The full amount charged, in minor units of the charged currency. */
-  amount: Money;
+  /**
+   * What cancelling now would give back, in minor units of the charged
+   * currency: the amount charged minus Paystack's fee (issue #390). Null
+   * when Paystack's fee is not known yet (or leaves nothing to give back):
+   * never the full amount as a guess.
+   */
+  amount: Money | null;
+  /** Issue #390: Paystack's processing fee the client would not get back, or null while unknown. */
+  processingFee: Money | null;
   /** ISO time: slot start minus 24 hours (cancel by then for a refund). */
   refundableUntil: string;
 }
@@ -256,35 +441,63 @@ export interface CancellationRefundPreview {
  * `refundable` is true only when the client may still cancel (scheduled /
  * confirmed), no refund was written yet, and `at` is no later than
  * `refundableUntil`.
+ *
+ * Issue #390: a client cancel is client-caused, so the amount is the charge
+ * minus Paystack's fee STORED on the fee Transaction (no Paystack call on a
+ * read). Not stored yet (or not less than the charge): `amount: null`
+ * (and `processingFee: null` while unknown).
  */
 export function cancellationRefundPreview(
   booking: Consultation,
   at: Date,
-  fee: Pick<Transaction, "feeHold"> | null = null
+  fee: Transaction | null = null
 ): CancellationRefundPreview | null {
   if (booking.status === "cancelled" || !isPaidWithMoney(booking)) return null;
-  const amount = expectedCharge(booking);
-  if (!amount) return null;
+  const charged = expectedCharge(booking);
+  if (!charged) return null;
   // Same start as the cancel itself uses (review fix): never a slot the agent moved earlier.
   const start = refundWindowStartsAt(booking, fee);
   if (!start) return null;
   const until = new Date(start.getTime() - CLIENT_REFUND_WINDOW_HOURS * HOUR_MS);
   const refundable =
     CLIENT_CANCELLABLE.includes(booking.status) && !booking.refundId && at.getTime() <= until.getTime();
-  return { refundable, amount, refundableUntil: until.toISOString() };
+  // The fee Transaction's own money when there is one (what a refund would copy).
+  const base: Money = fee ? { amountMinor: fee.amount, currency: fee.currency as Money["currency"] } : charged;
+  const feeMinor = fee ? feeForRefund(fee, null) : undefined;
+  const processingFee = feeMinor !== undefined ? { amountMinor: feeMinor, currency: base.currency } : null;
+  const amount =
+    feeMinor !== undefined && feeMinor < base.amountMinor
+      ? { amountMinor: base.amountMinor - feeMinor, currency: base.currency }
+      : null;
+  return { refundable, amount, processingFee, refundableUntil: until.toISOString() };
 }
 
 /** The refund outcome a cancel (and the admin endpoint) answers with. */
 export interface RefundSummary {
   status: RefundStatus;
-  amount: Money;
+  /** What the client gets back; null while the refund is HELD (issue #390). */
+  amount: Money | null;
+  /**
+   * Issue #390: on a client-caused refund, Paystack's processing fee kept
+   * out of the charge (`{ amountMinor, currency }`); null when the agent
+   * carries it, or while held.
+   */
+  processingFee: Money | null;
+  /** Issue #390: why the refund is held for an admin (only while it is). */
+  heldReason?: RefundHeldReason;
 }
 
 /** A refund row as the API summarises it: its status and its money. Pure. */
 export function refundSummary(row: Transaction): RefundSummary {
+  const currency = row.currency as Money["currency"];
+  if (row.refundHeldReason) {
+    return { status: row.status as RefundStatus, amount: null, processingFee: null, heldReason: row.refundHeldReason };
+  }
+  const kept = row.paystackFeeKeptMinor;
   return {
     status: row.status as RefundStatus,
-    amount: { amountMinor: row.amount, currency: row.currency },
+    amount: { amountMinor: row.amount, currency },
+    processingFee: typeof kept === "number" ? { amountMinor: kept, currency } : null,
   };
 }
 
@@ -366,6 +579,10 @@ export interface RefundContext {
   refundRef: FirebaseFirestore.DocumentReference | null;
   /** That row, when it exists. */
   existingRefund: Transaction | null;
+  /** Issue #390: the ONE fee-debit row this charge can have (`feeDebitDocId(reference)`). */
+  debitRef: FirebaseFirestore.DocumentReference | null;
+  /** Issue #390: whether that debit already exists (never written twice, across #354 and #390). */
+  debitExists: boolean;
   /** The agent's withdrawal lock (#287). */
   lockRef: FirebaseFirestore.DocumentReference;
   /** Whether the lock doc exists (for its counter). */
@@ -393,8 +610,9 @@ function pickFee(rows: Transaction[], booking: Consultation): Transaction | null
 
 /**
  * Read the booking's fee Transaction OUTSIDE a transaction, or null (the
- * client's refund preview on GET /consultations/:id). Same query and pick
- * as `readFeeTransaction`.
+ * client's refund preview on GET /consultations/:id, and, issue #390, the
+ * check whether Paystack must be asked for the fee before a refund). Same
+ * query and pick as `readFeeTransaction`.
  */
 export async function findFeeTransaction(booking: Consultation): Promise<Transaction | null> {
   const snap = await collections.transactions.where("consultationId", "==", booking.id).get();
@@ -418,7 +636,8 @@ export async function readFeeTransaction(tx: FirestoreTransaction, booking: Cons
  * `writeRefund`), so a concurrent withdrawal of the same agent conflicts and
  * is retried on fresh data. The agent's transactions are read only when the
  * fee is already released (only then does the refund touch the available
- * balance and its shortfall matter).
+ * balance and its shortfall matter). Issue #390: also reads the charge's ONE
+ * possible fee debit, so it is never written twice.
  */
 export async function readRefundContext(
   tx: FirestoreTransaction,
@@ -428,14 +647,22 @@ export async function readRefundContext(
   const fee = await readFeeTransaction(tx, booking);
   const lockRef = collections.withdrawalLocks.doc(booking.agentId);
   if (!fee) {
-    return { fee: null, feeHold: null, refundRef: null, existingRefund: null, lockRef, lockData: null, availableInFeeCurrency: null };
+    return {
+      fee: null, feeHold: null, refundRef: null, existingRefund: null, debitRef: null, debitExists: false,
+      lockRef, lockData: null, availableInFeeCurrency: null,
+    };
   }
   const refundRef = collections.transactions.doc(refundDocId(fee.providerTransactionId!));
+  const debitRef = collections.transactions.doc(feeDebitDocId(fee.providerTransactionId!));
   const refundSnap = await tx.get(refundRef);
+  const debitSnap = await tx.get(debitRef);
   const lockSnap = await tx.get(lockRef);
   const feeHold = feeHoldStatusAt(fee, at);
+  const existingRefund = refundSnap.exists ? (refundSnap.data() as Transaction) : null;
   let availableInFeeCurrency: number | null = null;
-  if (feeHold === "released" && !refundSnap.exists) {
+  // A row HELD for an admin (#390) is still to be worked out: it may come
+  // off the available balance when it goes ahead, so read it then too.
+  if (feeHold === "released" && (!existingRefund || existingRefund.refundHeldReason)) {
     // Same query as the withdrawal check, read through this transaction.
     const agentRows = await tx.get(
       collections.transactions.where("agentId", "==", booking.agentId).orderBy("createdAt", "desc")
@@ -447,21 +674,99 @@ export async function readRefundContext(
     fee,
     feeHold,
     refundRef,
-    existingRefund: refundSnap.exists ? (refundSnap.data() as Transaction) : null,
+    existingRefund,
+    debitRef,
+    debitExists: debitSnap.exists,
     lockRef,
     lockData: lockSnap.exists ? (lockSnap.data() as Record<string, unknown>) : null,
     availableInFeeCurrency,
   };
 }
 
+/** What `planRefund` decided for one refund (issue #390), before anything is written. */
+export interface PlannedRefund {
+  plan: CancellationRefundPlan;
+  feeBorneBy: PaystackFeeBorneBy;
+  /** Out of the hold, or from the available balance. */
+  fundedFrom: Extract<RefundFundedFrom, "hold" | "available">;
+  /**
+   * The fee fields to store on the fee Transaction in the same commit: a #395
+   * "unknown" fee whose Paystack fee the refund's lookup just found (stored
+   * once, like the job would). Null when nothing changes.
+   */
+  resolveFee: Partial<Transaction> | null;
+}
+
 /**
- * Write a refund row for `ctx.fee` through `tx` (issue #317), together with
- * the fee's hold update and the agent's withdrawal lock. The caller writes
- * the booking in the SAME transaction, with `bookingRefundFields(row)`.
+ * Work out a refund of `ctx.fee` (issue #390), without writing: who carries
+ * Paystack's fee, where the money comes from, and the plan. Pure (given the
+ * context read in the transaction and the lookup made before it).
  *
- * Call only after `readRefundContext` found a fee and no existing row.
+ *  - Paystack's fee: stored on the fee row first, else the lookup
+ *    (`feeForRefund`). A #395 "unknown" row the lookup resolves is credited
+ *    A - F from now on (`resolveFee`), and planned on that credit;
+ *  - funded from "available" only when the fee is released AND credits the
+ *    agent something; a fee credited nowhere (#395 fee >= A) is refunded as
+ *    "hold" (nothing of it reached the agent);
+ *  - C (the credit) is `consultationFeeCredit` of the fee row as it will be.
  *
- * @returns the row as written
+ * @throws when the reason has no `feeBorneBy` (a goodwill / other refund
+ *   without one; the controller refuses that first)
+ */
+export function planRefund(
+  ctx: RefundContext,
+  input: { reason: RefundReason; feeBorneBy?: PaystackFeeBorneBy | null; lookup: PaystackTransactionLookup | null; at: Date }
+): PlannedRefund {
+  const fee = ctx.fee!;
+  const feeBorneBy = feeBorneByFor(input.reason, input.feeBorneBy);
+  if (!feeBorneBy) throw new Error(`planRefund: no feeBorneBy for reason ${input.reason}`);
+  // A #395 "unknown" fee the lookup now knows: stored in this same commit.
+  const resolveFee =
+    fee.paystackFeeStatus === "unknown"
+      ? resolvedFeeFields(fee, input.lookup, "refund", Timestamp.fromDate(input.at))
+      : null;
+  const effective = { ...fee, ...(resolveFee ?? {}) } as Transaction;
+  const credit = consultationFeeCredit(effective);
+  const fundedFrom = ctx.feeHold === "released" && credit !== null ? "available" : "hold";
+  const plan = planCancellationRefund({
+    amountMinor: fee.amount,
+    creditMinor: credit ?? 0,
+    feeMinor: feeForRefund(effective, input.lookup),
+    feeBorneBy,
+    fundedFrom,
+  });
+  return { plan, feeBorneBy, fundedFrom, resolveFee };
+}
+
+/** What `writeRefund` wrote (issue #390). */
+export interface RefundWrite {
+  /** The refund row as written: live (`pending`), or HELD (`failed`, `refundHeldReason`). */
+  row: Transaction;
+  /** The agent's fee debit written now (null when none). */
+  debit: Transaction | null;
+}
+
+/**
+ * Write a refund of `ctx.fee` through `tx` (issue #317), together with the
+ * fee's hold update and the agent's withdrawal lock. The caller writes the
+ * booking in the SAME transaction, with `bookingRefundFields(row)`.
+ *
+ * Call only after `readRefundContext` found a fee and either no row, or a
+ * row HELD for an admin (which is then rewritten in place, keeping its
+ * `createdAt`).
+ *
+ * Issue #390: the money follows `planned` (see `planRefund`):
+ *  - HOLD: a `failed` row of amount 0 with `refundHeldReason` (no Paystack
+ *    call, no debit, the fee's hold untouched); the fee found, if any, is on
+ *    the row. Only a cancel writes this (an admin call answers instead);
+ *  - REFUND: the row with what the client gets (`amount`), what it takes off
+ *    the agent (`agentReversalMinor`) and Paystack's fee; out of the hold the
+ *    fee's hold becomes "refunded"; a #395 unknown fee just found is stored
+ *    on the fee row in the same update; and the agent's fee debit (`tx.create`
+ *    at `feeDebitDocId(reference)`) when the plan needs one and the charge
+ *    has none yet.
+ *
+ * @returns the row (and the debit) as written
  */
 export function writeRefund(
   tx: FirestoreTransaction,
@@ -472,16 +777,58 @@ export function writeRefund(
     initiatedBy: string;
     note?: string;
     at: Date;
+    planned: PlannedRefund;
   }
-): Transaction {
+): RefundWrite {
   const fee = ctx.fee!;
   const now = Timestamp.fromDate(input.at);
-  // A held fee pays its own refund; a released one comes off the balance.
-  const fundedFrom: RefundFundedFrom = ctx.feeHold === "released" ? "available" : "hold";
+  const { plan, feeBorneBy, fundedFrom, resolveFee } = input.planned;
+  const replacing = ctx.existingRefund?.refundHeldReason ? ctx.existingRefund : null;
+
+  // ---- HELD for an admin: nothing is guessed, nothing moves ----
+  if (plan.kind === "hold") {
+    const row = transactionService.buildHeldConsultationRefund(ctx.refundRef!.id, now, {
+      fee,
+      agentUserId: input.booking.agentId,
+      consultationId: input.booking.id,
+      reason: input.reason,
+      initiatedBy: input.initiatedBy,
+      feeBorneBy,
+      heldReason: plan.reason,
+      ...(plan.feeMinor !== undefined ? { paystackFeeMinor: plan.feeMinor } : {}),
+      note: input.note,
+    });
+    tx.set(ctx.refundRef!, row);
+    // A #395 unknown fee found but not less than the charge: stored all the same.
+    if (resolveFee) tx.update(collections.transactions.doc(fee.id), resolveFee);
+    console.error(
+      `[refund] ${row.id} of ${input.booking.id} HELD for an admin (${plan.reason}): no Paystack call, no agent debit`
+    );
+    return { row, debit: null };
+  }
+
+  // ---- The refund, under the fee rule ----
   // #351: how far below zero this refund takes the available balance.
   const available = ctx.availableInFeeCurrency ?? 0;
-  const shortfall = fundedFrom === "available" ? Math.max(0, Math.min(fee.amount, fee.amount - available)) : 0;
-  const row = transactionService.buildConsultationRefund(ctx.refundRef!.id, now, {
+  const reversal = plan.agentReversalMinor;
+  const shortfall = fundedFrom === "available" ? Math.max(0, Math.min(reversal, reversal - available)) : 0;
+  // The agent's fee debit: only when the plan needs one and this charge was
+  // never debited (one per reference, across #354 and #390).
+  const debit =
+    plan.debitMinor > 0 && !ctx.debitExists
+      ? transactionService.buildPaystackFeeDebit(ctx.debitRef!.id, now, {
+        agentUserId: input.booking.agentId,
+        consultationId: input.booking.id,
+        reference: fee.providerTransactionId!,
+        feeMinor: plan.debitMinor,
+        currency: fee.currency,
+        refundId: ctx.refundRef!.id,
+      })
+      : null;
+  if (plan.debitMinor > 0 && ctx.debitExists) {
+    console.warn(`[refund] ${ctx.refundRef!.id}: the charge's fee debit already exists; not written again`);
+  }
+  const built = transactionService.buildConsultationRefund(ctx.refundRef!.id, now, {
     fee,
     agentUserId: input.booking.agentId,
     consultationId: input.booking.id,
@@ -490,18 +837,31 @@ export function writeRefund(
     fundedFrom,
     balanceShortfallMinor: shortfall,
     note: input.note,
+    refundAmountMinor: plan.refundAmountMinor,
+    feeBorneBy,
+    paystackFeeMinor: plan.feeMinor,
+    ...(plan.feeKeptMinor !== undefined ? { paystackFeeKeptMinor: plan.feeKeptMinor } : {}),
+    agentReversalMinor: reversal,
+    ...(debit || (plan.debitMinor > 0 && ctx.debitExists) ? { feeDebitId: ctx.debitRef!.id } : {}),
   });
-  tx.set(ctx.refundRef!, row);
+  // A held row rewritten keeps when it was first written.
+  const row: Transaction = replacing ? { ...built, createdAt: replacing.createdAt } : built;
+  if (replacing) tx.set(ctx.refundRef!, row);
+  else tx.create(ctx.refundRef!, row);
+  if (debit) tx.create(ctx.debitRef!, debit);
 
-  // A held fee is now refunded out of its hold: it is never released.
+  // The fee row: a held fee is now refunded out of its hold (never released),
+  // and a #395 unknown fee just found is stored, in ONE update.
+  const feeUpdate: Record<string, unknown> = { ...(resolveFee ?? {}) };
   if (fundedFrom === "hold") {
-    tx.update(collections.transactions.doc(fee.id), {
+    Object.assign(feeUpdate, {
       "feeHold.state": "refunded",
       "feeHold.endedAt": now,
       "feeHold.endedBy": "refund",
       updatedAt: now,
     });
   }
+  if (Object.keys(feeUpdate).length > 0) tx.update(collections.transactions.doc(fee.id), feeUpdate);
   if (shortfall > 0) {
     console.error(
       `[refund] ${row.id}: refund of a released fee takes agent ${input.booking.agentId} ` +
@@ -511,12 +871,19 @@ export function writeRefund(
 
   // The #287 lock: merged, so the withdrawal's own fields are kept.
   const refundCount = Number(ctx.lockData?.refundCount) || 0;
+  const debitCount = Number(ctx.lockData?.feeDebitCount) || 0;
   tx.set(
     ctx.lockRef,
-    { agentUserId: input.booking.agentId, lastRefundId: row.id, refundCount: refundCount + 1, updatedAt: now },
+    {
+      agentUserId: input.booking.agentId,
+      lastRefundId: row.id,
+      refundCount: refundCount + 1,
+      ...(debit ? { lastFeeDebitId: debit.id, feeDebitCount: debitCount + 1 } : {}),
+      updatedAt: now,
+    },
     { merge: true }
   );
-  return row;
+  return { row, debit };
 }
 
 /** The booking fields that mirror a refund row. */
@@ -533,8 +900,19 @@ export type AdminRefundOutcome =
   | { kind: "not_found" }
   | { kind: "nothing_to_refund"; message: string }
   | { kind: "already_refunded"; refund: Transaction }
-  | { kind: "created"; refund: Transaction; booking: Consultation }
-  | { kind: "retried"; refund: Transaction; booking: Consultation };
+  /** A new refund row (and, issue #390, the agent's fee debit when one was written). */
+  | { kind: "created"; refund: Transaction; booking: Consultation; debit: Transaction | null }
+  /**
+   * A failed row back to pending, or (issue #390, `fromHeld`) a HELD row now
+   * worked out under the fee rule and rewritten (with its debit, if any).
+   */
+  | { kind: "retried"; refund: Transaction; booking: Consultation; debit: Transaction | null; fromHeld: boolean }
+  /** Issue #390: Paystack's fee is still unknown: nothing written (409 PAYSTACK_FEE_UNKNOWN). */
+  | { kind: "fee_unknown" }
+  /** Issue #390: a client-borne fee >= the charge: nothing to give back, nothing written (409). */
+  | { kind: "fee_not_less_than_amount" }
+  /** Issue #390: Paystack could not be asked for the fee: nothing written (502). */
+  | { kind: "paystack_unavailable" };
 
 /** The admin reasons the endpoint takes, and the row reason each one is stored as. */
 export const ADMIN_REFUND_REASONS: Record<string, RefundReason> = {
@@ -598,16 +976,27 @@ class ConsultationRefundService {
    * WHO may call it (admins only) is the controller's check, made before
    * this is called.
    *
-   * One Firestore transaction:
+   * Issue #390: Paystack's fee. Before the transaction, when the fee
+   * Transaction has no stored fee, Paystack is asked for the reference
+   * (`lookUpRefundFee`, never inside a transaction; unreachable: 502, nothing
+   * written). Then one Firestore transaction:
    *  - unknown booking: not_found (404);
    *  - free / unpaid, or no settled Paystack fee (legacy): nothing_to_refund (409);
    *  - a refund row exists and is `failed`: THAT row goes back to `pending`
    *    (attempts reset, due now), never a new row (`retried`);
+   *  - (issue #390) a row exists HELD for an admin (fee was unknown): it is
+   *    worked out again with the fee now found, under the STORED reason and
+   *    `feeBorneBy` (what the cancel decided), and rewritten in place with at
+   *    most one fee debit (`retried`, `fromHeld`);
    *  - a row exists in any other status: already_refunded (409);
-   *  - otherwise a full refund is written exactly as a cancel writes it
-   *    (`writeRefund`, under the agent's lock). The booking's STATUS is not
-   *    changed (any status may be refunded: an agent no-show is usually
-   *    `scheduled` or `completed`).
+   *  - otherwise a refund is written exactly as a cancel writes it
+   *    (`writeRefund`, under the agent's lock), with `feeBorneBy` deciding
+   *    who carries Paystack's fee (`agent_no_show`: always the agent). The
+   *    booking's STATUS is not changed (any status may be refunded: an
+   *    agent no-show is usually `scheduled` or `completed`).
+   * Fee still unknown (or, client-borne, not less than the charge): NOTHING
+   * is written (`fee_unknown` / `fee_not_less_than_amount`, 409): an admin
+   * call never leaves a held row behind.
    * The Paystack call follows the commit (`processRefund`), started by the
    * controller.
    */
@@ -616,8 +1005,18 @@ class ConsultationRefundService {
     adminUid: string;
     reason: RefundReason;
     note?: string;
+    /** Issue #390: who carries Paystack's fee (required for goodwill / other; agent for no-show). */
+    feeBorneBy?: PaystackFeeBorneBy;
   }): Promise<AdminRefundOutcome> {
     const ref = collections.consultations.doc(input.consultationId);
+
+    // ---- Issue #390: ask Paystack for the fee first, outside any transaction ----
+    const pre = await ref.get();
+    const preBooking = pre.exists ? (pre.data() as Consultation) : null;
+    const preFee = preBooking && isPaidWithMoney(preBooking) ? await findFeeTransaction(preBooking) : null;
+    const { lookup, unavailable } = await lookUpRefundFee(preFee);
+    if (unavailable) return { kind: "paystack_unavailable" };
+
     return chargeRuntime.runTransaction<AdminRefundOutcome>(async (tx) => {
       // ---- Reads ----
       const snap = await tx.get(ref);
@@ -636,10 +1035,12 @@ class ConsultationRefundService {
         };
       }
       const now = Timestamp.fromDate(at);
+      // The lookup was made for this fee row; a different row (bad data) gets none.
+      const feeLookup = preFee?.id === ctx.fee.id ? lookup : null;
 
       // ---- An existing row: retry a failed one, else refuse ----
-      if (ctx.existingRefund) {
-        const existing = ctx.existingRefund;
+      const existing = ctx.existingRefund;
+      if (existing && !existing.refundHeldReason) {
         if (existing.status !== "failed") return { kind: "already_refunded", refund: existing };
         // The ONE backward move: an admin retry of a failed row (same row).
         const retry = {
@@ -655,20 +1056,40 @@ class ConsultationRefundService {
         const row = { ...existing, status: "pending", refundAttempts: 0, refundNextAttemptAt: now, updatedAt: now } as Transaction;
         delete row.refundLeaseUntil;
         delete row.refundFailedAt;
-        return { kind: "retried", refund: row, booking: { ...booking, refundStatus: "pending", updatedAt: now } };
+        return {
+          kind: "retried", refund: row, booking: { ...booking, refundStatus: "pending", updatedAt: now }, debit: null, fromHeld: false,
+        };
       }
 
-      // ---- A new full refund ----
-      const row = writeRefund(tx, ctx, {
-        booking,
-        reason: input.reason,
-        initiatedBy: input.adminUid,
-        note: input.note,
+      // ---- A new refund, or a HELD one worked out again (issue #390) ----
+      // A held row keeps what the cancel decided: its reason, who carries
+      // the fee, who started it and its note.
+      const reason = existing?.reason ?? input.reason;
+      const planned = planRefund(ctx, {
+        reason,
+        feeBorneBy: existing?.feeBorneBy ?? input.feeBorneBy,
+        lookup: feeLookup,
         at,
       });
-      const fields = bookingRefundFields(row);
+      if (planned.plan.kind === "hold") {
+        // Nothing is written: no guessed figure, no new held row.
+        console.warn(`[refund] admin refund of ${booking.id}: ${planned.plan.reason}; nothing written`);
+        return planned.plan.reason === "paystack_fee_unknown" ? { kind: "fee_unknown" } : { kind: "fee_not_less_than_amount" };
+      }
+      const written = writeRefund(tx, ctx, {
+        booking,
+        reason,
+        initiatedBy: existing?.initiatedBy ?? input.adminUid,
+        note: existing ? existing.refundNote : input.note,
+        at,
+        planned,
+      });
+      const fields = bookingRefundFields(written.row);
       tx.update(ref, { ...fields, updatedAt: now });
-      return { kind: "created", refund: row, booking: { ...booking, ...fields, updatedAt: now } };
+      const updated = { ...booking, ...fields, updatedAt: now };
+      return existing
+        ? { kind: "retried", refund: written.row, booking: updated, debit: written.debit, fromHeld: true }
+        : { kind: "created", refund: written.row, booking: updated, debit: written.debit };
     });
   }
 
@@ -1071,6 +1492,12 @@ class ConsultationRefundService {
       const snap = await tx.get(ref);
       if (!snap.exists) return { changed: false, row: null };
       const row = snap.data() as Transaction;
+      // Issue #390: a row HELD for an admin was never sent to Paystack and
+      // has no figure yet; no event may move it (only an admin retry does).
+      if (row.refundHeldReason) {
+        console.warn(`[refund] ${refundId} is held for an admin (${row.refundHeldReason}); status event ignored`);
+        return { changed: false, row };
+      }
       // The booking (#317), or the exception of an unapplied payment (#354).
       const mirror = mirrorTarget(row);
       const mirrorSnap = mirror ? await tx.get(mirror.ref) : null;
@@ -1201,18 +1628,40 @@ class ConsultationRefundService {
    * Tell both sides a refund was written (issue #317): the client that it is
    * on its way, the agent that the fee was refunded (and from where). A
    * failed notification never fails the refund.
+   *
+   * Issue #390 copy:
+   *  - client-caused, Paystack kept a fee above 0: "Your refund of <refund>
+   *    is on its way. The payment provider kept a processing fee of <fee>.";
+   *  - the agent was debited Paystack's fee (`debit`): the agent's message
+   *    adds "The <fee> payment processing fee was taken from your balance.";
+   *  - a refund HELD for an admin (fee unknown): the client is told it is
+   *    delayed; the agent is told nothing has moved yet.
    */
-  async notifyCreated(row: Transaction, booking: Consultation): Promise<void> {
-    const amount = describe({ amountMinor: row.amount, currency: row.currency as Money["currency"] });
+  async notifyCreated(row: Transaction, booking: Consultation, debit: Transaction | null = null): Promise<void> {
+    const currency = row.currency as Money["currency"];
     const common = { type: "consultation_refunded" as const, relatedEntityType: "consultation" as const, relatedEntityId: booking.id };
+    if (row.refundHeldReason) {
+      await this.notifyDelayed(row);
+      return;
+    }
+    const amount = describe({ amountMinor: row.amount, currency });
+    const kept = Number(row.paystackFeeKeptMinor) || 0;
+    const keptLine = kept > 0 ? ` The payment provider kept a processing fee of ${describe({ amountMinor: kept, currency })}.` : "";
     await notificationService
-      .notifyUser({ ...common, userId: booking.userId, title: "Refund on its way", body: `Your refund of ${amount} is on its way.` })
+      .notifyUser({ ...common, userId: booking.userId, title: "Refund on its way", body: `Your refund of ${amount} is on its way.${keptLine}` })
       .catch((e) => console.error("[refund] client notify failed:", e));
+    const debitLine = debit
+      ? ` The ${describe({ amountMinor: debit.amount, currency: debit.currency as Money["currency"] })} payment processing fee was taken from your balance.`
+      : "";
+    // The agent is told about the CHARGE (refund + any fee kept = what the client paid).
+    const charged = describe({ amountMinor: row.amount + kept, currency });
+    const client = booking.clientName || "your client";
     const agentBody =
       row.refundFundedFrom === "available"
-        ? `The ${amount} consultation fee from ${booking.clientName || "your client"} was refunded to them and taken off your balance.`
-        : `The ${amount} consultation fee from ${booking.clientName || "your client"} was refunded to them. ` +
-          "It was still held until your meeting, so it came off your held balance; your available balance is unchanged.";
+        ? `The ${charged} consultation fee from ${client} was refunded to them and taken off your balance.${debitLine}`
+        : `The ${charged} consultation fee from ${client} was refunded to them. ` +
+          "It was still held until your meeting, so it came off your held balance." +
+          (debit ? debitLine : " Your available balance is unchanged.");
     await notificationService
       .notifyUser({ ...common, userId: booking.agentId, title: "Consultation fee refunded", body: agentBody })
       .catch((e) => console.error("[refund] agent notify failed:", e));

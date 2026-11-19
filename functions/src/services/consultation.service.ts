@@ -32,6 +32,10 @@ import {
   readFeeTransaction,
   readRefundContext,
   writeRefund,
+  // Issue #390: Paystack's fee on the refund (who carries it, looked up first).
+  findFeeTransaction,
+  lookUpRefundFee,
+  planRefund,
 } from "./consultation-refund.service";
 import { feeHoldStatusAt, rescheduledFeeHold } from "../money/fee-hold";
 import type { SupersededCheckout, Transaction } from "../types";
@@ -679,6 +683,8 @@ export type ChangeStatusOutcome =
       consultation: Consultation;
       refund: Transaction | null;
       refundCreated: boolean;
+      /** Issue #390: the agent's Paystack-fee debit written with the refund (agent-caused, out of the hold). */
+      feeDebit: Transaction | null;
     };
 
 /** What `deleteUnpaidConsultation` did. Only `deleted` removed anything. */
@@ -1621,6 +1627,25 @@ class ConsultationService {
     extra?: { cancelledBy?: string; cancellationReason?: string; summary?: string }
   ): Promise<ChangeStatusOutcome> {
     const ref = collections.consultations.doc(id);
+
+    // ---- Issue #390: Paystack's fee, asked for BEFORE the transaction ----
+    // A cancel of a paid booking may refund it, and the refund depends on
+    // Paystack's fee for the charge. When the fee Transaction has none stored
+    // (an older row, or #395 "unknown"), Paystack is asked now, never inside
+    // the transaction. A failed lookup just means "unknown": the cancel still
+    // goes through and the refund is held for an admin.
+    let feeLookup: Awaited<ReturnType<typeof lookUpRefundFee>>["lookup"] = null;
+    let lookedUpFeeId: string | null = null;
+    if (status === "cancelled") {
+      const pre = await ref.get();
+      const booking = pre.exists ? (pre.data() as Consultation) : null;
+      if (booking && isPaidWithMoney(booking)) {
+        const fee = await findFeeTransaction(booking);
+        feeLookup = (await lookUpRefundFee(fee)).lookup;
+        lookedUpFeeId = fee?.id ?? null;
+      }
+    }
+
     return chargeRuntime.runTransaction<ChangeStatusOutcome>(async (tx) => {
       const snap = await tx.get(ref);
       if (!snap.exists) return { kind: "not_found" };
@@ -1648,6 +1673,7 @@ class ConsultationService {
       // transaction, so they commit together or not at all.
       let refund: Transaction | null = null;
       let refundCreated = false;
+      let feeDebit: Transaction | null = null;
       let writeRefundRow: (() => void) | null = null;
       if (status === "cancelled" && isPaidWithMoney(current)) {
         const ctx = await readRefundContext(tx, current, at);
@@ -1684,14 +1710,25 @@ class ConsultationService {
             ctx.fee
           );
           if (money.kind === "full") {
+            // Issue #390: who carries Paystack's fee (the reason says) and
+            // how much moves, from the fee stored on the row or the lookup
+            // made before this transaction. Unknown: a HELD row, no money.
+            const planned = planRefund(ctx, {
+              reason: money.reason,
+              lookup: lookedUpFeeId === ctx.fee.id ? feeLookup : null,
+              at,
+            });
             writeRefundRow = () => {
-              refund = writeRefund(tx, ctx, {
+              const written = writeRefund(tx, ctx, {
                 booking: current,
                 reason: money.reason,
                 initiatedBy: extra?.cancelledBy ?? "unknown",
                 at,
+                planned,
               });
-              Object.assign(updates, bookingRefundFields(refund));
+              refund = written.row;
+              feeDebit = written.debit;
+              Object.assign(updates, bookingRefundFields(written.row));
               refundCreated = true;
             };
           }
@@ -1725,6 +1762,7 @@ class ConsultationService {
         consultation: { ...current, ...updates } as Consultation,
         refund,
         refundCreated,
+        feeDebit,
       };
     });
   }

@@ -641,6 +641,8 @@ export function writeUnappliedRefund(
       reference: input.exception.reference,
       feeMinor: plan.debitMinor,
       currency: input.exception.currency,
+      // The exception it debits for (its id is the reference).
+      exceptionId: input.exception.reference,
     });
     tx.create(reads.debitRef, debit);
     // The #287 lock (read in readUnappliedRefund): merged, so the
