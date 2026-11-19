@@ -165,6 +165,9 @@ const FULL_ROW: Required<Transaction> = {
   refundHeldReason: "paystack_fee_unknown",
   feeDebitId: "HIDDEN-fee-debit-id",
   refundId: "HIDDEN-refund-id",
+  // Issue #390: the freeze of a fee whose refund is held (hidden).
+  feeHoldFrozenByRefundId: "HIDDEN-frozen-by-refund-id",
+  feeHoldFrozenAt: Timestamp.fromMillis(1_755_555_562_000),
 };
 
 /**
@@ -252,6 +255,8 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   "refundHeldReason",
   "feeDebitId",
   "refundId",
+  "feeHoldFrozenByRefundId",
+  "feeHoldFrozenAt",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */

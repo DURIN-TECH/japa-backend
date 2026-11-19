@@ -50,6 +50,8 @@ function millisOf(value: unknown): number | null {
 /**
  * Where a consultation fee Transaction stands at time `at`. Pure.
  *
+ *  - (issue #390) frozen by a refund HELD for an admin
+ *    (`feeHoldFrozenByRefundId`): HELD, unless it was already refunded;
  *  - no `feeHold` (a fee written before #317 and not yet backfilled): HELD.
  *    The safe reading: it can be refunded from the hold, never withdrawn
  *    then cancelled. `npm run backfill:fee-holds` stamps every such fee
@@ -59,13 +61,19 @@ function millisOf(value: unknown): number | null {
  *    meeting was closed (`meetingClosedAt`) and `at` has reached
  *    `slotStartAt`; held otherwise. A hold with an unreadable time is held.
  *
- * @param fee the stored fee Transaction (only `feeHold` is read)
+ * @param fee the stored fee Transaction (only `feeHold` and `feeHoldFrozenByRefundId` are read)
  * @param at the server clock
  */
-export function feeHoldStatusAt(fee: Pick<Transaction, "feeHold">, at: Date): FeeHoldStatus {
+export function feeHoldStatusAt(
+  fee: Pick<Transaction, "feeHold"> & Partial<Pick<Transaction, "feeHoldFrozenByRefundId">>,
+  at: Date
+): FeeHoldStatus {
   const hold = fee.feeHold;
+  if (hold?.state === "refunded") return "refunded";
+  // Issue #390: a fee whose refund is HELD for an admin is frozen: held,
+  // whatever the clock or a closed meeting say, until the refund is worked out.
+  if (fee.feeHoldFrozenByRefundId) return "held";
   if (!hold) return "held";
-  if (hold.state === "refunded") return "refunded";
   if (hold.state === "released") return "released";
   const now = at.getTime();
   const releaseAt = millisOf(hold.releaseAt);

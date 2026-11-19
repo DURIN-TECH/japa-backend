@@ -721,3 +721,85 @@ describe("older refund rows", () => {
     assert.ok(feeOf("c1")!.paystackFeeResolvedAt instanceof Timestamp);
   });
 });
+
+// ============================================
+// A held refund FREEZES its fee (orchestrator decision 2026-11-19)
+// ============================================
+//
+// While a refund is held for an admin (Paystack's fee unknown), the fee it
+// would give back must not release by the clock, nor by a closed meeting,
+// nor count as available or withdrawable, nor be stamped released by the
+// legacy hold backfill, until the admin retry works the refund out.
+
+describe("a held refund freezes the fee", () => {
+  test("older row, fee unknown: frozen past its release time; the retry refunds it out of the hold and unfreezes it", async () => {
+    await seedLegacyPaid("c1");
+    paystackNowReports("c1", undefined);
+    await setStatus(client, "cancelled");
+    const [held] = refundRows();
+    assert.equal(held.refundHeldReason, "paystack_fee_unknown");
+    const frozen = feeOf("c1")!;
+    assert.equal(frozen.feeHoldFrozenByRefundId, held.id);
+    assert.ok(frozen.feeHoldFrozenAt instanceof Timestamp);
+
+    // Long past the slot end + 24 h, and with the meeting marked closed: still held.
+    releaseHold();
+    const stored = docsIn("transactions").find(([id]) => id === frozen.id)![1];
+    stored.feeHold = { ...stored.feeHold, meetingClosedAt: T0 };
+    const bal = await balanceOf(agent);
+    assert.equal(bal.heldBalance, A, "counted held, not available");
+    assert.equal(bal.availableBalance, 0);
+    assert.equal((await withdraw(1)).status, 400, "never withdrawable");
+
+    // The admin retry, once Paystack reports the fee: out of the hold, unfrozen.
+    paystackNowReports("c1", F);
+    const go = await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" });
+    assert.equal(go.status, 200, JSON.stringify(go.body));
+    const [row] = refundRows();
+    assert.equal(row.refundFundedFrom, "hold");
+    assert.equal(row.amount, A - F);
+    assert.equal(row.agentReversalMinor, A);
+    const after = feeOf("c1")!;
+    assert.equal(after.feeHoldFrozenByRefundId, undefined);
+    assert.equal(after.feeHoldFrozenAt, undefined);
+    assert.equal(after.feeHold.state, "refunded");
+    assert.equal(await agentTotal(), 0);
+    assert.equal(await seliNet(A - F), 0);
+  });
+
+  test("a retry that is still 409 leaves the fee frozen", async () => {
+    await seedLegacyPaid("c1");
+    paystackNowReports("c1", null);
+    await setStatus(client, "cancelled");
+    releaseHold();
+    assert.equal((await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" })).status, 409);
+    assert.ok(feeOf("c1")!.feeHoldFrozenByRefundId);
+    assert.equal((await balanceOf(agent)).availableBalance, 0);
+  });
+
+  test("feeHoldStatusAt: frozen is held whatever the clock says; a refunded fee stays refunded", async () => {
+    const { feeHoldStatusAt } = await import("../../src/money/fee-hold");
+    const past = Timestamp.fromMillis(T0.toMillis() - 86_400_000);
+    const hold = { state: "held" as const, slotStartAt: past, releaseAt: past, meetingClosedAt: past };
+    assert.equal(feeHoldStatusAt({ feeHold: hold }, new Date()), "released");
+    assert.equal(feeHoldStatusAt({ feeHold: hold, feeHoldFrozenByRefundId: "r" }, new Date()), "held");
+    assert.equal(feeHoldStatusAt({ feeHold: { ...hold, state: "released" }, feeHoldFrozenByRefundId: "r" }, new Date()), "held");
+    assert.equal(feeHoldStatusAt({ feeHold: { ...hold, state: "refunded" }, feeHoldFrozenByRefundId: "r" }, new Date()), "refunded");
+    assert.equal(feeHoldStatusAt({ feeHoldFrozenByRefundId: "r" } as any, new Date()), "held");
+  });
+
+  test("the hold backfill (release job) skips a frozen fee, even one with no hold yet", async () => {
+    const { decideFeeHoldBackfill } = await import("../../src/scripts/backfill-fee-holds");
+    await seedLegacyPaid("c1");
+    paystackNowReports("c1", undefined);
+    await setStatus(client, "cancelled");
+    const fee = { ...feeOf("c1")! } as any;
+    delete fee.feeHold; // a pre-#317 row: the backfill would otherwise stamp it
+    const booking = { ...bookingOf("c1")!, status: "completed" } as any;
+    const later = new Date(T0.toMillis() + 400 * 3_600_000);
+    assert.deepEqual(decideFeeHoldBackfill(fee, booking, later), { kind: "skip_frozen" });
+    // Without the freeze (and no refund row) it would have been released.
+    delete fee.feeHoldFrozenByRefundId;
+    assert.equal(decideFeeHoldBackfill(fee, booking, later).kind, "stamp");
+  });
+});

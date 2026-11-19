@@ -1793,6 +1793,17 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   // ---- Issue #317: the hold on a consultation fee (type "consultation_fee") ----
   /** See `FeeHold`. Absent on a fee written before #317 (counted as held until backfilled). */
   feeHold?: FeeHold;
+  /**
+   * Issue #390 (orchestrator decision 2026-11-19): set while a refund of this
+   * fee is HELD for an admin (`refundHeldReason` on that refund row, whose id
+   * this is). The fee is FROZEN: it counts as held whatever the clock or a
+   * closed meeting says (`feeHoldStatusAt`), so it is never available or
+   * withdrawable, and the legacy hold backfill never stamps it. Cleared when
+   * the admin retry works the refund out (it is then refunded out of the hold).
+   */
+  feeHoldFrozenByRefundId?: string;
+  /** Issue #390: when the fee was frozen (see `feeHoldFrozenByRefundId`). */
+  feeHoldFrozenAt?: Timestamp;
 
   // ---- Issue #395: Paystack's fee on a consultation fee (type "consultation_fee") ----
   // Decision (user, 2026-11-17): on a paid consultation the AGENT pays

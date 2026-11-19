@@ -757,8 +757,9 @@ export interface RefundWrite {
  *
  * Issue #390: the money follows `planned` (see `planRefund`):
  *  - HOLD: a `failed` row of amount 0 with `refundHeldReason` (no Paystack
- *    call, no debit, the fee's hold untouched); the fee found, if any, is on
- *    the row. Only a cancel writes this (an admin call answers instead);
+ *    call, no debit); the fee row is FROZEN (`feeHoldFrozenByRefundId`:
+ *    counted held, never released or withdrawable) until the retry; the fee
+ *    found, if any, is on the row. Only a cancel writes this (an admin call answers instead);
  *  - REFUND: the row with what the client gets (`amount`), what it takes off
  *    the agent (`agentReversalMinor`) and Paystack's fee; out of the hold the
  *    fee's hold becomes "refunded"; a #395 unknown fee just found is stored
@@ -799,8 +800,16 @@ export function writeRefund(
       note: input.note,
     });
     tx.set(ctx.refundRef!, row);
-    // A #395 unknown fee found but not less than the charge: stored all the same.
-    if (resolveFee) tx.update(collections.transactions.doc(fee.id), resolveFee);
+    // Orchestrator decision 2026-11-19: the fee is FROZEN while its refund is
+    // held, so it can never release by the clock or be withdrawn before the
+    // admin retry (`feeHoldStatusAt` counts it held). In the same update, a
+    // #395 unknown fee found but not less than the charge is stored.
+    tx.update(collections.transactions.doc(fee.id), {
+      ...(resolveFee ?? {}),
+      feeHoldFrozenByRefundId: row.id,
+      feeHoldFrozenAt: now,
+      updatedAt: now,
+    });
     console.error(
       `[refund] ${row.id} of ${input.booking.id} HELD for an admin (${plan.reason}): no Paystack call, no agent debit`
     );
@@ -853,6 +862,11 @@ export function writeRefund(
   // The fee row: a held fee is now refunded out of its hold (never released),
   // and a #395 unknown fee just found is stored, in ONE update.
   const feeUpdate: Record<string, unknown> = { ...(resolveFee ?? {}) };
+  // A fee frozen by this refund's held row is unfrozen now that it is worked
+  // out (frozen means held, so it is refunded out of the hold just below).
+  if (fee.feeHoldFrozenByRefundId) {
+    Object.assign(feeUpdate, { feeHoldFrozenByRefundId: FieldValue.delete(), feeHoldFrozenAt: FieldValue.delete(), updatedAt: now });
+  }
   if (fundedFrom === "hold") {
     Object.assign(feeUpdate, {
       "feeHold.state": "refunded",
