@@ -101,6 +101,8 @@ import { unreadMessageReminderService } from "./services/unread-message-reminder
 import { consultationService } from "./services/consultation.service";
 // Issue #317: the refund retry job.
 import { consultationRefundService } from "./services/consultation-refund.service";
+// Issue #395: look up Paystack's fee on consultation payments where it is unknown.
+import { paystackFeeService } from "./services/paystack-fee.service";
 import { scrapeRunService } from "./scrapers";
 import { scrapeAlertService } from "./scrapers";
 import { scrapeRunWorker } from "./scrapers";
@@ -565,6 +567,41 @@ export const retryConsultationRefunds = functions
     } catch (error) {
       // Logged, never thrown: the next run retries.
       console.error("Consultation refund retry failed:", error);
+    }
+  });
+
+/**
+ * Every 15 minutes (same cadence as the refund retry): look Paystack's fee
+ * up again for consultation payments whose fee was unknown at settle time
+ * (issue #395).
+ *
+ * Such a fee Transaction (`paystackFeeStatus: "unknown"`) is credited to the
+ * agent NOWHERE until Paystack reports a well-formed fee in the charge
+ * currency. Each run asks Paystack for every such reference
+ * (`paystackFeeService.resolveUnknownFees`) and stores the fee once, in a
+ * transaction that re-checks the row is still unknown, so a known fee is
+ * never overwritten. From then on the row counts as A - F under the normal
+ * hold rules. Still unknown: nothing written, tried again next run; admins
+ * list them with
+ * `GET /transactions?role=admin&type=consultation_fee&paystackFeeStatus=unknown`.
+ *
+ * Secrets: PAYSTACK_SECRET_KEY (transaction verify). Query: single-field
+ * equality on `paystackFeeStatus` (automatic index).
+ */
+export const resolveConsultationPaystackFees = functions
+  .runWith({ timeoutSeconds: 300, memory: "256MB", secrets: ["PAYSTACK_SECRET_KEY"] })
+  .pubsub.schedule("*/15 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    try {
+      const r = await paystackFeeService.resolveUnknownFees();
+      console.log(
+        `Consultation Paystack fee lookup: ${r.scanned} unknown, ${r.resolved} resolved, ` +
+          `${r.stillUnknown} still unknown, ${r.errors} errors`
+      );
+    } catch (error) {
+      // Logged, never thrown: the next run tries again.
+      console.error("Consultation Paystack fee lookup failed:", error);
     }
   });
 

@@ -8,6 +8,8 @@ import {
   SubscriberType,
 } from "@durin-tech/authz";
 import type { Money } from "../../types/money";
+// Issue #395: the fee check lives in money/ (see the re-export below).
+import { isWellFormedFee } from "../../money/paystack-fee";
 
 /**
  * Paystack implementation of the provider-agnostic `BillingProvider`. The rest of
@@ -627,13 +629,12 @@ export function toTransactionLookup(data: {
 }
 
 /**
- * Issue #354: whether a reported Paystack fee can be used as money: a safe
- * integer of minor units, zero or more. `null`, a negative number, a
- * fraction, NaN, a numeric string ("150") are all NOT usable. Pure.
+ * Issue #354: whether a reported Paystack fee can be used as money (a safe
+ * integer of minor units, zero or more). Moved to money/paystack-fee.ts in
+ * #395 so the balance and revenue rules can use it without importing a
+ * service; re-exported here so every #354 caller keeps working unchanged.
  */
-export function isWellFormedFee(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
+export { isWellFormedFee } from "../../money/paystack-fee";
 
 /** One refund as Paystack reports it (issue #317). */
 export interface PaystackRefund {

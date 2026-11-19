@@ -54,6 +54,8 @@ export type FeeHoldBackfillAction =
   | { kind: "skip_bad_slot" }
   /** Review fix: the fee was already refunded (a refund row exists): never stamped. */
   | { kind: "skip_refunded" }
+  /** Issue #390: frozen by a refund held for an admin: never stamped (never released). */
+  | { kind: "skip_frozen" }
   | { kind: "stamp"; hold: FeeHold };
 
 /**
@@ -69,6 +71,8 @@ export function decideFeeHoldBackfill(
   at: Date,
   hasRefundRow = false
 ): FeeHoldBackfillAction {
+  // Issue #390: a fee frozen by a held refund must never be released here.
+  if (fee.feeHoldFrozenByRefundId) return { kind: "skip_frozen" };
   if (fee.feeHold) return { kind: "skip_has_hold" };
   // A refund was written against this fee: its hold belongs to the refund.
   if (hasRefundRow) return { kind: "skip_refunded" };

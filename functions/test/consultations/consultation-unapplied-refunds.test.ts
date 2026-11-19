@@ -531,7 +531,7 @@ describe("exception status: open -> refunded / refund_failed", () => {
     assert.deepEqual((list.body.data as any[]).map((t) => t.id), [row.id]);
 
     // The booking-level refund has nothing to give (never paid): the admin names the row.
-    assert.equal((await adminRefund(admin, { reason: "goodwill" })).body.error, "NOTHING_TO_REFUND");
+    assert.equal((await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" })).body.error, "NOTHING_TO_REFUND");
     assert.equal((await adminRefund(agent, { refundId: row.id })).status, 403, "admins only");
     const retry = await adminRefund(admin, { refundId: row.id });
     assert.equal(retry.status, 200, JSON.stringify(retry.body));

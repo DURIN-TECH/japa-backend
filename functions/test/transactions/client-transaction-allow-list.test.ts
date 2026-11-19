@@ -153,6 +153,21 @@ const FULL_ROW: Required<Transaction> = {
   refundLastError: "HIDDEN-paystack-error",
   refundedAt: Timestamp.fromMillis(1_755_555_559_000),
   refundFailedAt: Timestamp.fromMillis(1_755_555_560_000),
+  // ---- Issue #395: Paystack's fee and the agent's net (hidden: the client sees A only) ----
+  paystackFeeMinor: 11_357,
+  paystackFeeStatus: "known",
+  agentCreditMinor: 97_531,
+  paystackFeeResolvedAt: Timestamp.fromMillis(1_755_555_561_000),
+  paystackFeeResolvedBy: "job",
+  // ---- Issue #390: who carries the fee, and the refund engine's fee bookkeeping (hidden) ----
+  feeBorneBy: "agent",
+  agentReversalMinor: 86_421,
+  refundHeldReason: "paystack_fee_unknown",
+  feeDebitId: "HIDDEN-fee-debit-id",
+  refundId: "HIDDEN-refund-id",
+  // Issue #390: the freeze of a fee whose refund is held (hidden).
+  feeHoldFrozenByRefundId: "HIDDEN-frozen-by-refund-id",
+  feeHoldFrozenAt: Timestamp.fromMillis(1_755_555_562_000),
 };
 
 /**
@@ -227,6 +242,21 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   "refundLastError",
   "refundedAt",
   "refundFailedAt",
+  // Issue #395: Paystack's fee and the agent's credit. The client's history
+  // shows the amount charged only, never the fee or the net.
+  "paystackFeeMinor",
+  "paystackFeeStatus",
+  "agentCreditMinor",
+  "paystackFeeResolvedAt",
+  "paystackFeeResolvedBy",
+  // Issue #390: the refund engine's fee bookkeeping and the agent's debit link.
+  "feeBorneBy",
+  "agentReversalMinor",
+  "refundHeldReason",
+  "feeDebitId",
+  "refundId",
+  "feeHoldFrozenByRefundId",
+  "feeHoldFrozenAt",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */

@@ -1665,6 +1665,29 @@ export type RefundStatus = Extract<TransactionStatus, "pending" | "processing" |
 export type RefundFundedFrom = "hold" | "available" | "unapplied_payment";
 
 /**
+ * Issue #390 (decision 2026-11-16, "whoever caused the refund carries
+ * Paystack's fee"): who carries Paystack's processing fee on a consultation
+ * refund. Paystack keeps its fee when a charge is refunded; Seli never does.
+ *  - "client": the client caused it (`client_cancelled`, or an admin
+ *    goodwill / other refund with `feeBorneBy: "client"`): they get back the
+ *    amount charged minus Paystack's fee;
+ *  - "agent": the agent side caused it (`agent_cancelled`,
+ *    `admin_agent_no_show`, or an admin refund with `feeBorneBy: "agent"`):
+ *    the client gets everything back and the agent carries the fee once.
+ */
+export type PaystackFeeBorneBy = "client" | "agent";
+
+/**
+ * Issue #390: why a consultation refund is HELD for an admin, with no
+ * Paystack call and no agent debit (the row is `failed`, amount 0):
+ *  - "paystack_fee_unknown": neither the fee Transaction nor a fresh
+ *    Paystack lookup gives a well-formed fee for the reference;
+ *  - "fee_not_less_than_amount": a client-caused refund whose Paystack fee is
+ *    the whole charge or more (nothing left to give back).
+ */
+export type RefundHeldReason = "paystack_fee_unknown" | "fee_not_less_than_amount";
+
+/**
  * The hold on a consultation fee (issue #317, "hold consultation fees").
  * Stored on the fee Transaction (`type: "consultation_fee"`) as `feeHold`.
  *
@@ -1694,6 +1717,25 @@ export interface FeeHold {
   /** What ended it: a refund, or the one-off legacy backfill. */
   endedBy?: "refund" | "legacy_backfill";
 }
+
+/**
+ * Issue #395: where Paystack's fee on a consultation fee Transaction stands.
+ *  - "known": Paystack reported a well-formed fee in the charge currency,
+ *    below the amount charged. The agent is credited `amount - fee` under
+ *    the normal hold rules;
+ *  - "unknown": Paystack reported no well-formed fee in the charge currency
+ *    (missing, null, negative, a string, a fraction, another currency). The
+ *    booking is confirmed (the client paid), but the row is credited NOWHERE
+ *    (not held, not available, not revenue) until the fee is known. The
+ *    scheduled job and the admin refresh look it up again;
+ *  - "fee_not_less_than_amount": Paystack's fee is the whole charge or more,
+ *    so the credit would be zero or negative. The fee is stored, nothing is
+ *    credited automatically, and the row is listed for an admin.
+ */
+export type PaystackFeeStatus = "known" | "unknown" | "fee_not_less_than_amount";
+
+/** Issue #395: what stored Paystack's fee on a consultation fee Transaction. */
+export type PaystackFeeResolvedBy = "settle" | "job" | "admin_refresh" | "refund";
 
 /**
  * One financial event.
@@ -1751,6 +1793,43 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   // ---- Issue #317: the hold on a consultation fee (type "consultation_fee") ----
   /** See `FeeHold`. Absent on a fee written before #317 (counted as held until backfilled). */
   feeHold?: FeeHold;
+  /**
+   * Issue #390 (orchestrator decision 2026-11-19): set while a refund of this
+   * fee is HELD for an admin (`refundHeldReason` on that refund row, whose id
+   * this is). The fee is FROZEN: it counts as held whatever the clock or a
+   * closed meeting says (`feeHoldStatusAt`), so it is never available or
+   * withdrawable, and the legacy hold backfill never stamps it. Cleared when
+   * the admin retry works the refund out (it is then refunded out of the hold).
+   */
+  feeHoldFrozenByRefundId?: string;
+  /** Issue #390: when the fee was frozen (see `feeHoldFrozenByRefundId`). */
+  feeHoldFrozenAt?: Timestamp;
+
+  // ---- Issue #395: Paystack's fee on a consultation fee (type "consultation_fee") ----
+  // Decision (user, 2026-11-17): on a paid consultation the AGENT pays
+  // Paystack's fee. `amount` stays what the client was charged (A); the agent
+  // is credited A - F, where F is Paystack's own `fees` for this reference in
+  // the charge currency. F is never estimated, never a rate, never a default.
+  // All three fields are absent on a fee written before #395 (a LEGACY row):
+  // it keeps counting as A (money/paystack-fee.ts `consultationFeeCredit`).
+  /**
+   * Paystack's processing fee on this charge, in minor units of `currency`,
+   * exactly as Paystack reported it. Set when `paystackFeeStatus` is "known"
+   * or "fee_not_less_than_amount"; absent while it is "unknown".
+   */
+  paystackFeeMinor?: number;
+  /** Where Paystack's fee for this charge stands (see PaystackFeeStatus). */
+  paystackFeeStatus?: PaystackFeeStatus;
+  /**
+   * What the agent is credited: `amount - paystackFeeMinor`, in minor units
+   * of `currency`. Set only when `paystackFeeStatus` is "known" (shown to
+   * the agent side next to the fee; the balances recompute it from the fee).
+   */
+  agentCreditMinor?: number;
+  /** When Paystack's fee was stored (at settle, or later by the job / an admin refresh / a refund). */
+  paystackFeeResolvedAt?: Timestamp;
+  /** What stored Paystack's fee (see PaystackFeeResolvedBy). */
+  paystackFeeResolvedBy?: PaystackFeeResolvedBy;
 
   // ---- Issue #317: a consultation refund (type "refund") ----
   // Refund rows are written by the backend only (firestore.rules deny every
@@ -1789,6 +1868,43 @@ export interface Transaction extends Partial<ChargeSnapshot> {
    * carries none of it.
    */
   paystackFeeKeptMinor?: number;
+  // ---- Issue #390: Paystack's fee on a consultation refund ----
+  /**
+   * Who carries Paystack's fee on this refund (see PaystackFeeBorneBy). Set
+   * on every consultation refund row written since #390 (live or held).
+   * (Also `paystackFeeMinor`, declared with the #395 fields above: on a
+   * refund row it is Paystack's fee on the refunded charge, the value the
+   * refund was worked out with, from the fee Transaction or a fresh lookup.)
+   */
+  feeBorneBy?: PaystackFeeBorneBy;
+  /**
+   * How much this refund row takes off the AGENT, in minor units of
+   * `currency` (issue #390): what `availableBalance` (from the moment it is
+   * written, `refundFundedFrom: "available"`) and `totalRevenue` (once
+   * settled) lose. It can differ from `amount` (what the client gets back):
+   *  - out of the hold: the fee's whole credit (A - F, or A on a legacy row);
+   *  - from available: the larger of the refund and the credit (an older
+   *    full-credit row refunded on the client's fault gives back A while the
+   *    client gets A - F, user decision 2026-11-17).
+   * Absent on rows written before #390: `amount` is used, as before.
+   */
+  agentReversalMinor?: number;
+  /**
+   * Issue #390: set while the refund is HELD for an admin (see
+   * RefundHeldReason). Such a row is `failed`, has `amount` 0 (no figure is
+   * ever guessed), no `refundFundedFrom`, and counts nowhere; it is never
+   * sent to Paystack. An admin retry re-reads the fee and, once known,
+   * rewrites the row under the rule (the field is then removed).
+   */
+  refundHeldReason?: RefundHeldReason;
+  /**
+   * Issue #390: on a refund row, the agent's `paystack_fee_debit` written
+   * with it (`feeDebitDocId(reference)`); on a `paystack_fee_debit`, the
+   * refund row it belongs to (`refundId`).
+   */
+  feeDebitId?: string;
+  /** Issue #390: on a `paystack_fee_debit` of a consultation refund, that refund row's id. */
+  refundId?: string;
   /** Paystack's id of the refund, once Paystack has one. */
   providerRefundId?: string;
   /** Paystack's own refund status as last seen ("pending", "processed", ...). */

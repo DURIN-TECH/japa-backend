@@ -71,6 +71,8 @@ import {
   Consultation,
   ConsultationType,
   NotificationType,
+  // Issue #390: who carries Paystack's fee on an admin refund.
+  PaystackFeeBorneBy,
 } from "../types";
 import {
   can,
@@ -1070,7 +1072,8 @@ export class ConsultationController {
         }
         // The booking mirrors the row's latest status.
         updated = { ...updated, refundStatus: refund.status as typeof updated.refundStatus };
-        await consultationRefundService.notifyCreated(refund, updated);
+        // (#390) With the agent's Paystack-fee debit, when one was written.
+        await consultationRefundService.notifyCreated(refund, updated, outcome.feeDebit);
       }
 
       // Notify the OTHER party of a meaningful status transition.
@@ -1233,6 +1236,19 @@ export class ConsultationController {
    * ALREADY_REFUNDED; not such a refund of THIS booking: 404. Such refunds
    * are never created here (settlePayment creates them) and never touch the
    * agent's balance.
+   *
+   * Issue #390 (whoever caused the refund carries Paystack's fee): body
+   * `feeBorneBy: "client" | "agent"` is REQUIRED for goodwill / other (400
+   * when missing or anything else; no default). `agent_no_show` is always
+   * agent-caused: `feeBorneBy` may be omitted or "agent"; "client" (or any
+   * other value) is refused with 400. Client-borne: the client gets the
+   * amount charged minus Paystack's fee; agent-borne: everything, and the
+   * agent is debited the fee once when the funding path did not already take
+   * it. Paystack's fee unknown: 409 PAYSTACK_FEE_UNKNOWN, nothing written
+   * (also when retrying a refund a cancel HELD for that reason: the held row
+   * is worked out again under the reason and `feeBorneBy` it was held with).
+   * Client-borne fee >= the charge: 409 FEE_NOT_LESS_THAN_AMOUNT. Paystack
+   * unreachable while asking for the fee: 502 PAYSTACK_ERROR.
    */
   async refundConsultation(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
@@ -1241,7 +1257,7 @@ export class ConsultationController {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
-      const body = (req.body ?? {}) as { reason?: unknown; note?: unknown; refundId?: unknown };
+      const body = (req.body ?? {}) as { reason?: unknown; note?: unknown; refundId?: unknown; feeBorneBy?: unknown };
 
       // ---- Issue #354: retry a FAILED refund of an unapplied payment ----
       // Those refunds are created automatically (settlePayment); an admin
@@ -1324,12 +1340,31 @@ export class ConsultationController {
         sendError(res, "VALIDATION_ERROR", "note is required when reason is other");
         return;
       }
+      // ---- Issue #390: who carries Paystack's fee on this refund ----
+      // goodwill / other: the admin MUST choose ("client" | "agent"), no
+      // default. agent_no_show: always the agent; "agent" is accepted, any
+      // other value is refused (400) rather than silently ignored.
+      let feeBorneBy: PaystackFeeBorneBy;
+      if (body.reason === "agent_no_show") {
+        if (body.feeBorneBy !== undefined && body.feeBorneBy !== "agent") {
+          sendError(res, "VALIDATION_ERROR", "feeBorneBy cannot be set for agent_no_show: the agent always carries Paystack's fee");
+          return;
+        }
+        feeBorneBy = "agent";
+      } else {
+        if (body.feeBorneBy !== "client" && body.feeBorneBy !== "agent") {
+          sendError(res, "VALIDATION_ERROR", "feeBorneBy is required and must be client or agent");
+          return;
+        }
+        feeBorneBy = body.feeBorneBy;
+      }
 
       const outcome = await consultationRefundService.adminRefund({
         consultationId: req.params.id,
         adminUid: req.userId!,
         reason,
         note,
+        feeBorneBy,
       });
       switch (outcome.kind) {
       case "not_found":
@@ -1341,6 +1376,26 @@ export class ConsultationController {
       case "already_refunded":
         sendError(res, "ALREADY_REFUNDED", "This consultation already has a refund.", 409);
         return;
+      // ---- Issue #390: Paystack's fee could not be used: nothing written ----
+      case "fee_unknown":
+        sendError(
+          res,
+          "PAYSTACK_FEE_UNKNOWN",
+          "Paystack still reports no processing fee for this payment, so the refund cannot be worked out yet.",
+          409
+        );
+        return;
+      case "fee_not_less_than_amount":
+        sendError(
+          res,
+          "FEE_NOT_LESS_THAN_AMOUNT",
+          "Paystack's processing fee is not less than the amount charged, so there is nothing left to refund.",
+          409
+        );
+        return;
+      case "paystack_unavailable":
+        sendError(res, "PAYSTACK_ERROR", "Paystack could not be reached. Try again in a moment.", 502);
+        return;
       case "retried":
       case "created": {
         // Send it to Paystack now; a failure leaves it for the retry job.
@@ -1351,8 +1406,12 @@ export class ConsultationController {
           console.error(`[consultation] admin refund ${refund.id} could not be sent yet; the retry job will:`, e);
         }
         const booking = { ...outcome.booking, refundStatus: refund.status as typeof outcome.booking.refundStatus };
+        // (#390) A new refund, or a held one now worked out: both sides told
+        // (with the agent's Paystack-fee debit, when one was written).
+        if (outcome.kind === "created" || outcome.fromHeld) {
+          await consultationRefundService.notifyCreated(refund, booking, outcome.debit);
+        }
         if (outcome.kind === "created") {
-          await consultationRefundService.notifyCreated(refund, booking);
           sendCreated(res, { refund: refundSummary(refund), refundId: refund.id, consultation: booking }, "Refund started");
           return;
         }
