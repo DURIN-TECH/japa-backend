@@ -116,13 +116,20 @@ import type { RubricFlag } from "../../types/rubric";
 // review round 2 fuzzed ~54,000 marked lists and the walk refused none.) What
 // it adds that the reader does NOT do: after a HEADING-SHAPED end (the one
 // judgement most likely to be wrong), it looks on to the next hard start or the
-// end of the page, and refuses the list when the first marker met there would
-// continue it (its own marker arithmetic, `successorsOf`, not the reader's).
-// What this does NOT guarantee: a list cut at a heading where no continuing
-// marker follows before the next hard start (closing words with no marker, or
-// up to three heading-shaped lines followed by a hard start) is not caught;
-// nor is a cut whose end is a hard start or the lead-in's sibling, which both
-// proofs take as ends by shape.
+// end of the page, and refuses the list when ANY marker met there would
+// continue it, or cannot be explained as a new list opened under the heading
+// (its own marker arithmetic, `successorsOf` and the open LEVELS at the last
+// stored item, not the reader's). (#335, fix round 4: QA round 3 found a
+// repeated sub-list marker, "(i)", "(ii)" under both (a) and (b), and a
+// footnote "(1)" before the continuing marker, both slipped through when only
+// the first marker met decided and every stored marker was "already seen".)
+// What this does NOT guarantee: a list cut at a heading where no marker at all
+// follows before the next hard start (closing words with no marker, or up to
+// three heading-shaped lines followed by a hard start) is not caught; nor is a
+// cut whose end is a hard start or the lead-in's sibling, which both proofs
+// take as ends by shape; nor a cut followed, under the heading, by a new list
+// that opens with a first marker ("(a)", "(1)", "(i)") and is then followed in
+// order, where the stored list's own next marker never appears.
 //
 // Pure functions over the snapshot's lines. Nothing here knows what any
 // document is about, which route, country or nationality it concerns.
@@ -172,7 +179,7 @@ export const LIST_UNREADABLE_DETAIL: Record<ListUnreadableReason, string> = {
   marker_out_of_order: "a list marker after the lead-in does not follow the marker before it and does not start a deeper list at its first marker, so which list it belongs to cannot be told",
   line_after_item_not_recognised: "a line after a list item is not the next marker, a connector word between two items, or a known end of the list (the end of the page, a paragraph number, a reference label or a heading), so where the list ends cannot be told; the list was not cut there",
   editorial_mark_in_item: "a list line holds the publisher's amendment mark, which is not part of the official words, so the item cannot be stored verbatim",
-  list_end_not_proven: "the line after the last stored list line is not a known end of the list (the end of the page, a paragraph number, a reference label, a heading or the lead-in's next sibling), or a list marker that would continue the list comes after a heading-shaped end before the next paragraph, so the stored list may be cut short",
+  list_end_not_proven: "the line after the last stored list line is not a known end of the list (the end of the page, a paragraph number, a reference label, a heading or the lead-in's next sibling), or, after a heading-shaped end and before the next paragraph, a list marker would continue the list or cannot be read as part of a new list opened under the heading, so the stored list may be cut short",
   connector_out_of_place: "a line that is only a connector word (such as \"or\" or \"and\") stands where an unmarked list line should be, for example straight after the lead-in, so which items it joins cannot be told",
 };
 
@@ -580,13 +587,17 @@ export function readListLines(leadLine: string, following: readonly string[], ct
  *     line means the stored list may be cut short: `list_end_not_proven`;
  *  4. (#335, fix round 2) WHEN THAT END IS ONLY HEADING-SHAPED (not the end of
  *     the page, a hard start or the lead-in's sibling), the walk goes on to the
- *     next hard start or the end of the page, and the FIRST list marker met
- *     there must not continue the stored list (a successor of any stored
- *     marker or of the lead-in's, by `successorsOf`): otherwise
- *     `list_end_not_proven`. This catches "(a) ...;" / "Exceptions for
- *     minors" / a sentence / "(b) ...", which both earlier checks accepted.
- *     It does not catch a cut with no continuing marker before the next hard
- *     start (see the header).
+ *     next hard start or the end of the page, and NO list marker met
+ *     there may continue the stored list (a successor of a marker at a
+ *     level still OPEN at the last stored item, or of the lead-in's, see
+ *     `continuingAfter`), and every marker met must be explained by a new
+ *     list opened under the heading (fix round 4, see
+ *     `continuesAfterSoftEnd`): otherwise `list_end_not_proven`. This catches
+ *     "(a) ...;" / "Exceptions for minors" / a sentence / "(b) ...", which both
+ *     earlier checks accepted, a cut inside a second sub-list that repeats the
+ *     first one's markers, and a footnote line before the continuing marker.
+ *     It does not catch a cut with no marker before the next hard start (see
+ *     the header).
  *
  * An unmarked list has no markers to prove an end with, so point 3 is the
  * reader's own strict rule restated (the last line ends its sentence, or the
@@ -760,29 +771,150 @@ function leadingMarkers(line: string): string[] {
 }
 
 /**
- * (#335, fix round 2) After a HEADING-SHAPED end at `from`, walk on to the
- * next hard start (or the end of the page) and return true when the FIRST list
- * marker met on the way would continue the stored list: it is a successor of a
- * marker already stored (any level, see `successorsOf`) or of the lead-in's own
- * marker, and is not itself one of the stored markers. Such a marker means the
- * "heading" sat inside the list ("(a) ...;" / "Exceptions for minors" / a long
- * sentence / "(b) ..."), so the stored list is cut short. The first marker
- * decides: a new list that opens with a marker of its own ("(a)" again) under
- * the heading is a different list, and the walk stops there.
+ * (#335, fix round 4) The markers of a list, as the second proof sees its
+ * LEVELS: index 0 is the outermost level, and each level holds the marker(s)
+ * last placed at it. Built by the proof's own arithmetic (`successorsOf`), not
+ * the reader's `placeMarker` / `nextMarkerLevels`.
+ *
+ * Placing one marker `m` (in the order the lines give them):
+ *  - CONTINUES a level when `m` is a successor of a marker held at that level.
+ *    The deepest such level wins (a "(ii)" continues the open "(i)" sub-list
+ *    rather than anything further out), and every level inside it CLOSES
+ *    ("(b)" after "(a) ... (i) (ii)" closes the roman sub-list);
+ *  - otherwise OPENS a new level inside the deepest one ("(i)" under "(a)").
+ *
+ * AMBIGUITY, resolved generously: a marker that both continues a level AND is
+ * a first marker ("i" after "h": the letter i, or a roman sub-list's (i)) is
+ * placed BOTH ways: added to the level it continues (keeping what was there,
+ * so the letter level still expects what follows "h") and opened as a new
+ * level. A bigger set of open levels only makes `continuingAfter` bigger,
+ * and a bigger continuing set only ever refuses more.
+ */
+type ProofLevels = Set<string>[];
+
+/** The markers that open a list or a sub-list: "a", "1" and "i" (every reading of "i"). */
+const isFirstMarker = (inner: string): boolean => inner === "a" || inner === "1" || inner === "i";
+
+/** The deepest level of `levels` that `inner` continues, or -1 when it continues none. */
+function levelContinued(levels: ProofLevels, inner: string): number {
+  for (let d = levels.length - 1; d >= 0; d--) {
+    for (const held of levels[d]) if (successorsOf(held).includes(inner)) return d;
+  }
+  return -1;
+}
+
+/** Place one marker (see `ProofLevels`). Mutates and returns `levels`. */
+function placeInLevels(levels: ProofLevels, inner: string): ProofLevels {
+  const d = levelContinued(levels, inner);
+  if (d < 0) {
+    // Opens a new level inside the deepest open one.
+    levels.push(new Set([inner]));
+    return levels;
+  }
+  // Continues level d: every level inside it closes.
+  levels.length = d + 1;
+  if (isFirstMarker(inner)) {
+    // Ambiguous ("i" after "h"): keep what level d held, AND open a sub-list.
+    levels[d].add(inner);
+    levels.push(new Set([inner]));
+  } else {
+    levels[d] = new Set([inner]);
+  }
+  return levels;
+}
+
+/**
+ * (#335, fix round 4) Every marker that would CONTINUE the stored list after
+ * its last line: the successors of the marker(s) held at EACH level still open
+ * at the last stored item, and of the lead-in's own marker. QA round 3 found
+ * the round 2 set ("successors of every stored marker, minus every stored
+ * marker") lost a marker that a second sub-list repeats: with "(a) (i) (ii)
+ * (b) (i)" stored, the next "(ii)" was dropped because the FIRST sub-list had
+ * already stored one. Here only the levels open at the end count, so the open
+ * "(i)" of (b)'s sub-list expects "(ii)", and the closed one under (a) does not
+ * interfere.
+ */
+function continuingAfter(items: readonly string[], leadMarker: string | undefined): { continuing: Set<string>; held: Set<string> } {
+  const levels: ProofLevels = [];
+  // The lead-in's own marker is the level outside the list ("(3) ... shall be:"
+  // expects "(4)" next): it sits at the bottom, so it is always open.
+  if (leadMarker !== undefined) levels.push(new Set([leadMarker]));
+  for (const item of items) for (const inner of leadingMarkers(item)) placeInLevels(levels, inner);
+  return {
+    // What would come next at any open level.
+    continuing: new Set(levels.flatMap((level) => [...level].flatMap(successorsOf))),
+    // What the open levels end with (used to refuse a "new list" that only
+    // repeats an open level's own marker, see `continuesAfterSoftEnd`).
+    held: new Set(levels.flatMap((level) => [...level])),
+  };
+}
+
+/**
+ * (#335, fix round 2, rewritten in fix round 4) After a HEADING-SHAPED end at
+ * `from`, walk on to the next hard start (or the end of the page) and return
+ * true when the stored list may have been cut there.
+ *
+ * Round 2 let the FIRST marker met decide. QA round 3 found that a marker
+ * that is not this list's at all (a footnote "(1) OJ L 243 ..." inside the
+ * list, or a fresh "(i)") ended the walk, so a continuing "(b)" after it was
+ * never seen. Now EVERY marker up to the hard start must be explained:
+ *
+ *  - before any new list has opened, a marker that continues the stored list
+ *    (`continuingAfter`) means the list was cut: true;
+ *  - a FIRST marker ("a", "1", "i") that does not continue it opens a NEW list
+ *    under the heading ("Under this heading the rules are:" / "(a) ...");
+ *  - once a new list is open, each marker must follow it by the same level
+ *    arithmetic (continue one of its levels, or open a sub-list with a first
+ *    marker). A marker that does not follow it is not explained by the new
+ *    list: if it would continue the stored list, the stored list was cut;
+ *    either way the page is not the clean layout the proof can vouch for, so
+ *    it is refused too (true). That is how the footnote layout
+ *    "(1) OJ L ..." / "(b) two." is refused: "(1)" opens a "new list" that
+ *    "(b)" does not follow, and "(b)" continues the stored "(a)";
+ *  - any other marker (neither continuing nor a first marker, before a new
+ *    list opened) is refused as well: the proof cannot say whose it is;
+ *  - a first marker that REPEATS what an open level of the stored list ends
+ *    with ("(i)" when the stored list stops on an open "(i)") is refused: a
+ *    "new list" from it would explain the stored list's own next marker.
+ *
+ * Refusing is the safe direction here: a refused list is held or left out,
+ * never published cut (rulebooks publish with no human sign-off).
  */
 function continuesAfterSoftEnd(following: readonly string[], from: number, items: readonly string[], leadMarker: string | undefined, isHardStart: (line: string) => boolean): boolean {
-  // The markers already stored, and every marker that could come next after one of them.
-  const stored = new Set(items.flatMap(leadingMarkers));
-  const continuing = new Set([...stored, ...(leadMarker !== undefined ? [leadMarker] : [])].flatMap(successorsOf).filter((m) => !stored.has(m)));
+  const { continuing, held } = continuingAfter(items, leadMarker);
+  /** The levels of a new list opened under the heading, once one has. */
+  let fresh: ProofLevels | undefined;
   for (let k = from; k < following.length; k++) {
     const line = following[k];
     // A hard start: what comes after it belongs to another paragraph or division.
     // (The heading-shaped line at `from` itself is never a hard start: checked before.)
     if (isHardStart(line)) return false;
     const inner = markerOf(line);
-    if (inner !== undefined) return continuing.has(inner);
+    if (inner === undefined) continue;
+    if (fresh === undefined) {
+      // No new list yet: a continuing marker means the stored list was cut.
+      if (continuing.has(inner)) return true;
+      // A first marker opens a new list under the heading; anything else is unexplained.
+      if (!isFirstMarker(inner)) return true;
+      // ...unless it REPEATS the marker an open level of the stored list ends
+      // with: "(d) ...:" / "(i) ...;" / heading / "(i) ..." / "(ii) ...". The
+      // second "(i)" would open a "new list" that "(ii)" then follows, while
+      // "(ii)" is exactly what the stored "(i)" expects. A new list that
+      // starts with the very marker the cut list stopped on cannot be told
+      // from a cut, so it is refused (the safe direction).
+      if (held.has(inner)) return true;
+      fresh = placeInLevels([], inner);
+      continue;
+    }
+    // A new list is open: the marker must follow it (continue a level, or open a sub-list).
+    if (levelContinued(fresh, inner) >= 0 || isFirstMarker(inner)) {
+      placeInLevels(fresh, inner);
+      continue;
+    }
+    // Not the new list's: continuing the stored list or unexplained, refused either way.
+    return true;
   }
-  // The end of the page: no marker continued the list.
+  // The end of the page: every marker met was explained by a new list (or none was met).
   return false;
 }
 
