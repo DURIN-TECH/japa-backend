@@ -114,7 +114,7 @@ describe("fee hold: Seli never funds a refund an agent can trigger", () => {
     const out = await setStatus(agent, "cancelled", "c1", { cancellationReason: "Something came up" });
     assert.equal(out.status, 200, JSON.stringify(out.body));
     assert.equal(out.body.data.status, "cancelled");
-    assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN });
+    assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN, processingFee: null });
 
     const [row] = refundRows();
     assert.equal(row.id, refundDocId(refOf("c1")), "deterministic id from the Paystack reference");
@@ -256,7 +256,7 @@ describe("refund on cancel: the rule table", () => {
       await bookAndPay("c1");
       const out = await setStatus(who, "cancelled", "c1");
       assert.equal(out.status, 200, JSON.stringify(out.body));
-      assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN });
+      assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN, processingFee: null });
       const [row] = refundRows();
       assert.equal(row.reason, "agent_cancelled");
       assert.equal(row.initiatedBy, who.uid);
@@ -267,7 +267,7 @@ describe("refund on cancel: the rule table", () => {
     await bookAndPay("c1");
     const out = await setStatus(client, "cancelled", "c1");
     assert.equal(out.status, 200);
-    assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN });
+    assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN, processingFee: { amountMinor: 0, currency: "NGN" } });
     assert.equal(refundRows()[0].reason, "client_cancelled");
   });
 
@@ -349,7 +349,7 @@ describe("an agent moving a paid booking earlier never costs the client their re
     assert.equal(preview.refundableUntil, new Date(new Date(SLOT_START_ISO).getTime() - 24 * 3_600_000).toISOString());
     const out = await setStatus(client, "cancelled", "c1");
     assert.equal(out.status, 200);
-    assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN });
+    assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN, processingFee: { amountMinor: 0, currency: "NGN" } });
     assert.equal(refundRows()[0].reason, "client_cancelled");
   });
 
@@ -382,6 +382,8 @@ describe("GET /consultations/:id: the client's cancellationRefund preview", () =
     assert.deepEqual(out.body.data.cancellationRefund, {
       refundable: true,
       amount: FEE_NGN,
+      // Issue #390: Paystack's fee (0 in the harness) is shown with the amount.
+      processingFee: { amountMinor: 0, currency: "NGN" },
       refundableUntil: new Date(new Date(SLOT_START_ISO).getTime() - 24 * 3_600_000).toISOString(),
     });
   });
@@ -504,7 +506,7 @@ describe("agent balance effect", () => {
     await bookAndPay("g1", { charge: { amountMinor: 9_000, currency: "GHS" } });
     harness.clock.advanceHours(HOURS_TO_SLOT + 0.5 + 25);
     assert.equal((await balanceOf(agent, "GHS")).availableBalance, 9_000);
-    const out = await adminRefund(admin, { reason: "goodwill" }, "g1");
+    const out = await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" }, "g1");
     assert.equal(out.status, 201);
     assert.deepEqual(out.body.data.refund.amount, { amountMinor: 9_000, currency: "GHS" });
     assert.deepEqual(harness.refundCalls[0].amount, { amountMinor: 9_000, currency: "GHS" }, "Paystack gets GHS minor units");
@@ -530,8 +532,8 @@ describe("idempotency: one charge, at most one refund", () => {
   test("two admins refund at once: one refund, one 409 ALREADY_REFUNDED, one Paystack call", async () => {
     await bookAndPay("c1");
     const [a, b] = await Promise.all([
-      adminRefund(admin, { reason: "goodwill" }),
-      adminRefund(admin, { reason: "other", note: "Client complained" }),
+      adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" }),
+      adminRefund(admin, { reason: "other", note: "Client complained", feeBorneBy: "agent" }),
     ]);
     assert.deepEqual([a.status, b.status].sort(), [201, 409]);
     assert.equal([a, b].find((o) => o.status === 409)!.body.error, "ALREADY_REFUNDED");
@@ -541,7 +543,7 @@ describe("idempotency: one charge, at most one refund", () => {
 
   test("cancel after an admin refund: the cancel goes through and reuses the existing refund", async () => {
     await bookAndPay("c1");
-    assert.equal((await adminRefund(admin, { reason: "goodwill" })).status, 201);
+    assert.equal((await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" })).status, 201);
     const out = await setStatus(client, "cancelled", "c1");
     assert.equal(out.status, 200);
     assert.equal(out.body.data.refund.status, "processing");
@@ -554,7 +556,7 @@ describe("idempotency: one charge, at most one refund", () => {
     harness.refundBehaviour.push("network");
     const out = await setStatus(client, "cancelled", "c1");
     assert.equal(out.status, 200);
-    assert.deepEqual(out.body.data.refund, { status: "pending", amount: FEE_NGN });
+    assert.deepEqual(out.body.data.refund, { status: "pending", amount: FEE_NGN, processingFee: { amountMinor: 0, currency: "NGN" } });
     const [row] = refundRows();
     assert.equal(row.status, "pending");
     assert.match(row.refundLastError, /ETIMEDOUT/);
@@ -617,7 +619,7 @@ describe("idempotency: one charge, at most one refund", () => {
     assert.deepEqual((list.body.data as any[]).map((t) => t.id), [row.id]);
 
     // An admin retry re-attempts THAT row (looked up first), not a new one.
-    const retry = await adminRefund(admin, { reason: "goodwill" });
+    const retry = await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" });
     assert.equal(retry.status, 200, JSON.stringify(retry.body));
     assert.equal(retry.body.data.retried, true);
     assert.equal(retry.body.data.refund.status, "processing");
@@ -704,7 +706,7 @@ describe("POST /consultations/:id/refund (admin)", () => {
     await bookAndPay("c1");
     writes.length = 0;
     for (const who of [client, agent, ownerA]) {
-      const out = await adminRefund(who, { reason: "goodwill" });
+      const out = await adminRefund(who, { reason: "goodwill", feeBorneBy: "agent" });
       assert.equal(out.status, 403);
     }
     assert.deepEqual(writes, []);
@@ -715,33 +717,33 @@ describe("POST /consultations/:id/refund (admin)", () => {
     assert.equal((await adminRefund(admin, {})).status, 400);
     assert.equal((await adminRefund(admin, { reason: "admin_goodwill" })).status, 400);
     assert.equal((await adminRefund(admin, { reason: "toString" })).status, 400);
-    assert.equal((await adminRefund(admin, { reason: "other" })).status, 400);
-    assert.equal((await adminRefund(admin, { reason: "other", note: "  " })).status, 400);
+    assert.equal((await adminRefund(admin, { reason: "other", feeBorneBy: "agent" })).status, 400);
+    assert.equal((await adminRefund(admin, { reason: "other", note: "  ", feeBorneBy: "agent" })).status, 400);
     assert.equal(refundRows().length, 0);
   });
 
   test("404 unknown id; 409 NOTHING_TO_REFUND on free and unpaid bookings", async () => {
-    assert.equal((await adminRefund(admin, { reason: "goodwill" }, "nope")).status, 404);
+    assert.equal((await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" }, "nope")).status, 404);
     await bookFree("free1");
-    const free = await adminRefund(admin, { reason: "goodwill" }, "free1");
+    const free = await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" }, "free1");
     assert.equal(free.status, 409);
     assert.equal(free.body.error, "NOTHING_TO_REFUND");
     await bookFree("p1", { status: "pending_payment", paymentStatus: "pending", priceUsdCents: 600 });
-    assert.equal((await adminRefund(admin, { reason: "goodwill" }, "p1")).body.error, "NOTHING_TO_REFUND");
+    assert.equal((await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" }, "p1")).body.error, "NOTHING_TO_REFUND");
   });
 
   test("a held fee: full refund out of the hold, status unchanged, note stored", async () => {
     await bookAndPay("c1");
-    const out = await adminRefund(admin, { reason: "other", note: "Client could not join" });
+    const out = await adminRefund(admin, { reason: "other", note: "Client could not join", feeBorneBy: "agent" });
     assert.equal(out.status, 201);
-    assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN });
+    assert.deepEqual(out.body.data.refund, { status: "processing", amount: FEE_NGN, processingFee: null });
     const [row] = refundRows();
     assert.equal(row.reason, "admin_other");
     assert.equal(row.refundNote, "Client could not join");
     assert.equal(row.refundFundedFrom, "hold");
     assert.equal(bookingOf("c1")!.status, "scheduled");
     // Pending / processing / completed: ALREADY_REFUNDED.
-    assert.equal((await adminRefund(admin, { reason: "goodwill" })).body.error, "ALREADY_REFUNDED");
+    assert.equal((await adminRefund(admin, { reason: "goodwill", feeBorneBy: "agent" })).body.error, "ALREADY_REFUNDED");
   });
 });
 

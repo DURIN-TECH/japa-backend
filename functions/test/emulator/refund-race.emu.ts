@@ -71,6 +71,10 @@ async function seedPaidBooking(id: string, agentName: string, clientName: string
     id: `fee-${id}`, userId: accounts[clientName].uid, agentId: agentUid, consultationId: id,
     type: "consultation_fee", amount: FEE, currency: "NGN", status: "completed", isEscrow: false,
     paymentProvider: "paystack", providerTransactionId: reference, description: "Consultation fee",
+    // Issue #395: as settle writes it today, with Paystack's fee stored (0
+    // here, so the #317 races below move the amounts they always did and
+    // the refund never has to ask Paystack for the fee).
+    paystackFeeStatus: "known", paystackFeeMinor: 0, agentCreditMinor: FEE,
     feeHold: {
       state: "held",
       slotStartAt: dayUtc,
@@ -105,7 +109,11 @@ before(async () => {
   // ---- Paystack refunds: in-process recorders, never the network ----
   const { paystackProvider } = await import("../../src/services/billing/paystack.provider");
   const ps = paystackProvider as any;
-  const saved = { createRefund: ps.createRefund, findRefundsForTransaction: ps.findRefundsForTransaction };
+  const saved = {
+    createRefund: ps.createRefund,
+    findRefundsForTransaction: ps.findRefundsForTransaction,
+    getTransactionMetadata: ps.getTransactionMetadata,
+  };
   let counter = 0;
   ps.createRefund = async (input: { reference: string; amount: { amountMinor: number; currency: string } }) => {
     refundCalls.push(input.reference);
@@ -114,9 +122,12 @@ before(async () => {
     return { id: String(++counter), status: "pending", transactionReference: input.reference, amount: input.amount.amountMinor, currency: input.amount.currency };
   };
   ps.findRefundsForTransaction = async () => [];
+  // Issue #390: a refund may look Paystack's fee up; never the network here.
+  ps.getTransactionMetadata = async () => null;
   restore = () => {
     ps.createRefund = saved.createRefund;
     ps.findRefundsForTransaction = saved.findRefundsForTransaction;
+    ps.getTransactionMetadata = saved.getTransactionMetadata;
   };
 
   for (const n of ["ragent1", "ragent2", "ragent3", "ragent4"]) await principal(n, { role: "agent", agencyId: null, admin: false });
@@ -135,7 +146,7 @@ describe("refunds under concurrent requests (#317)", () => {
     await seedPaidBooking("rb1", "ragent1", "rclient");
     const before = refundCalls.length;
     const results = await Promise.all(
-      [0, 1, 2].map(() => api.call("POST", "/consultations/rb1/refund", tokens.radmin, { reason: "goodwill" }))
+      [0, 1, 2].map(() => api.call("POST", "/consultations/rb1/refund", tokens.radmin, { reason: "goodwill", feeBorneBy: "agent" }))
     );
     assert.deepEqual(results.map((r) => r.status).sort(), [201, 409, 409], JSON.stringify(results.map((r) => r.body)));
     for (const r of results.filter((x) => x.status === 409)) assert.equal(r.body.error, "ALREADY_REFUNDED");
