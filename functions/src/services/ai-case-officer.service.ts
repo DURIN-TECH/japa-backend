@@ -25,6 +25,7 @@ import {
   computeInputHash,
   deriveHolderFact,
   documentFieldsFor,
+  moneyFieldsFor,
   evaluateObjective,
   hashStatementContent,
   barNotAssessedItems,
@@ -1147,9 +1148,12 @@ export class AiCaseOfficerService {
     // (#234) Only the facts the rules need reach the model (see factsSummaryForModel).
     const profileSummary = `Applicant name: ${loaded.applicantName ?? "not given"}. ${factsSummaryForModel(loaded.facts, rubric.criteria, barDate, rubric.criteria.some(isJudgedBar))}`;
     const intakeSummary = JSON.stringify(loaded.intake);
-    const extractionSummary = extractions
-      .filter((e) => e.readable && !e.failed && !e.suspicious)
-      .flatMap((e) => e.values.map((v) => `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`))
+    // (#408) The values the extraction summary is built from, kept as values
+    // (field, unit) so the narrative's FIGURE check can read a money value in
+    // its currency. The summary text itself is built exactly as before.
+    const summarisedValues = extractions.filter((e) => e.readable && !e.failed && !e.suspicious).flatMap((e) => e.values);
+    const extractionSummary = summarisedValues
+      .map((v) => `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`)
       .join("\n");
     if (batches.length > 0 && (extractions.length > 0 || statementText.trim().length > 0)) {
       const outputs: JudgementOutput[] = [];
@@ -1224,6 +1228,10 @@ export class AiCaseOfficerService {
         intakeSummary,
         extractionSummary,
         statementText: statementText.trim() ? statementText : null,
+        // (#408) Grounding only: `buildNarrativeRequest` never reads it, so
+        // the narrative request (and its recorded hash) is unchanged. The
+        // money fields come from the rubric the documents were read for.
+        figureFacts: { values: summarisedValues, moneyFields: moneyFieldsFor(rubric) },
       },
     });
     // A narrative string that addressed a model is stored as suspicious content (never shown).

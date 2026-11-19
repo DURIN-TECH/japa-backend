@@ -366,7 +366,10 @@ describe("parseNarrative: rule citations are capped in code", () => {
   });
 
   test("generic rule references count even when the rubric did not send them", () => {
-    assert.equal(ruleCitationsIn("Paragraph 9.8.1 and section 4 apply.", []), 2);
+    // (#408) Changed on purpose: "section 4" (a bare whole number) is no longer
+    // a citation, because "Section 3 of your bank letter" is everyday wording.
+    // Only the dotted "Paragraph 9.8.1" counts now.
+    assert.equal(ruleCitationsIn("Paragraph 9.8.1 and section 4 apply.", []), 1);
     assert.equal(ruleCitationsIn("Appendix FM 2(a) asks for this.", []), 1);
   });
 
