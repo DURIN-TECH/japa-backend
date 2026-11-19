@@ -1,4 +1,4 @@
-import { collections, messaging } from "../utils/firebase";
+import { collections, messaging, arrayRemove } from "../utils/firebase";
 import {
   Notification,
   NotificationType,
@@ -25,12 +25,32 @@ export interface NotifyUserInput {
   actionUrl?: string;
   // Extra string key/values merged into the FCM data payload (must be strings).
   data?: Record<string, string>;
+  // Case context used ONLY to pick the agency whose logo co-brands the email
+  // header. Needed when the notification is about something other than an
+  // application (a chat thread, say) but still belongs to a specific case — a
+  // client working with two agencies would otherwise get whichever logo their
+  // most recent application happens to carry.
+  brandApplicationId?: string;
   // Security-critical notifications (e.g. "your password was changed") set this so
   // their EMAIL is delivered even if the user has switched email notifications off
   // in their preferences. The user should never be able to silence a security
   // alert about their own account. Does not affect push/in_app.
   critical?: boolean;
 }
+
+// FCM error codes that mean the device token is permanently dead (app
+// uninstalled, token rotated, token malformed). Only these are pruned from
+// `users/{uid}.fcmTokens`; transient failures (quota, unavailable, internal)
+// keep the token so a later send can still reach the device.
+const DEAD_TOKEN_ERROR_CODES = new Set([
+  "messaging/registration-token-not-registered",
+  "messaging/invalid-registration-token",
+]);
+
+// Android notification channel id. MUST match the channel the mobile app creates
+// (agreed with mobile #264) — a push naming a channel that does not exist on the
+// device is delivered silently / at default importance on Android 8+.
+export const ANDROID_PUSH_CHANNEL_ID = "default";
 
 class NotificationService {
   /**
@@ -140,6 +160,10 @@ class NotificationService {
     });
 
     // --- in_app ---------------------------------------------------------------
+    // Tracks whether the inbox record was actually written: the push badge below
+    // is the unread count INCLUDING this notice, so it is only meaningful (and
+    // only computed) when the record exists.
+    let inAppWritten = false;
     if (channels.includes("in_app")) {
       try {
         await this.createNotification({
@@ -151,6 +175,7 @@ class NotificationService {
           relatedEntityType: input.relatedEntityType,
           relatedEntityId: input.relatedEntityId,
         });
+        inAppWritten = true;
       } catch (err) {
         console.error("[notifyUser] in_app delivery failed:", err);
       }
@@ -158,10 +183,23 @@ class NotificationService {
 
     // --- push (REAL FCM) ------------------------------------------------------
     if (channels.includes("push")) {
-      const tokens = user?.fcmTokens ?? [];
+      const tokens: string[] = user?.fcmTokens ?? [];
       if (tokens.length > 0) {
         try {
-          await messaging.sendEachForMulticast({
+          // iOS app-icon badge = unread count including the notice just written.
+          // Omitted (undefined) when in_app was not written (push-only call, or
+          // the write failed) or the count query fails: a guessed number would be
+          // wrong, and omitting `badge` leaves the icon badge untouched.
+          let badge: number | undefined;
+          if (inAppWritten) {
+            try {
+              badge = await this.getUnreadCount(input.userId);
+            } catch (err) {
+              console.error("[notifyUser] unread count for badge failed:", err);
+            }
+          }
+
+          const response = await messaging.sendEachForMulticast({
             tokens,
             notification: { title: input.title, body: input.body },
             // All FCM data values must be strings.
@@ -175,7 +213,29 @@ class NotificationService {
                 : {}),
               ...(input.data ?? {}),
             },
+            // Android: high priority wakes the device; the channel id + sound make
+            // the notice audible on Android 8+ (sound is a channel property there).
+            android: {
+              priority: "high",
+              notification: {
+                channelId: ANDROID_PUSH_CHANNEL_ID,
+                sound: "default",
+              },
+            },
+            // iOS: play the default sound and (when known) set the badge.
+            apns: {
+              payload: {
+                aps: {
+                  sound: "default",
+                  ...(badge !== undefined ? { badge } : {}),
+                },
+              },
+            },
           });
+
+          // Prune dead tokens. Isolated in its own try/catch (inside the helper)
+          // so a pruning failure can never fail the delivery path below.
+          await this.pruneDeadTokens(input.userId, tokens, response?.responses);
         } catch (err) {
           // Never fail the request because a push couldn't be delivered.
           console.error("[notifyUser] push delivery failed:", err);
@@ -195,6 +255,40 @@ class NotificationService {
         user?.phone,
         input
       );
+    }
+  }
+
+  /**
+   * Remove permanently-dead FCM tokens from `users/{uid}.fcmTokens`.
+   *
+   * `responses[i]` corresponds to `tokens[i]` (sendEachForMulticast preserves
+   * order). Only the two "this token will never work again" codes are pruned;
+   * quota/unavailable/etc. keep the token. Uses an atomic `arrayRemove` rather
+   * than read-modify-write so a token the device registered concurrently is not
+   * clobbered. Never throws: a failure is logged and the caller carries on.
+   */
+  private async pruneDeadTokens(
+    userId: string,
+    tokens: string[],
+    responses: { success: boolean; error?: { code?: string } }[] | undefined
+  ): Promise<void> {
+    try {
+      if (!responses) return;
+      const dead = tokens.filter((_, i) => {
+        const r = responses[i];
+        return (
+          r !== undefined &&
+          !r.success &&
+          r.error?.code !== undefined &&
+          DEAD_TOKEN_ERROR_CODES.has(r.error.code)
+        );
+      });
+      if (dead.length === 0) return;
+      await collections.users
+        .doc(userId)
+        .update({ fcmTokens: arrayRemove(...dead) });
+    } catch (err) {
+      console.error("[notifyUser] pruning dead FCM tokens failed:", err);
     }
   }
 
@@ -235,6 +329,18 @@ class NotificationService {
         body: input.body,
         actionUrl: event.actionUrl,
         actionLabel: event.actionLabel,
+        // Co-brand the header with the agency this notification concerns. When
+        // the event is about a case we hand over that case's id, so a client
+        // working with more than one agency sees the RIGHT logo rather than
+        // whichever agency they last dealt with.
+        brandFor: {
+          userId: input.userId,
+          applicationId:
+            input.brandApplicationId ??
+            (input.relatedEntityType === "application"
+              ? input.relatedEntityId
+              : undefined),
+        },
       });
       status = result.status === "sent" ? "sent" : "failed";
       providerId = result.providerId ?? null;

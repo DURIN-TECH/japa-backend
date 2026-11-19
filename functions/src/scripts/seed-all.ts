@@ -111,8 +111,8 @@ async function main() {
     await import("../utils/firebase");
     const { seedPortalData } = await import("../data/seed-portal-data");
     const { seedNigeriaIrelandEligibility } = await import("../data/eligibility-seed-nigeria-ireland");
-    const { seedNewsSources } = await import("../data/seed-news-sources");
-    const { seedVisaSources } = await import("../data/seed-visa-sources");
+    const { seedNewsSources } = await import("../scrapers");
+    const { seedVisaSources } = await import("../scrapers");
     const { seedDocumentTemplates } = await import("../data/seed-document-templates");
     const { seedPlans } = await import("./seed-plans");
     const { seedSubscriptions } = await import("./seed-subscriptions");
@@ -126,7 +126,7 @@ async function main() {
     const portal = await seedPortalData();
 
     // 2. Eligibility questions — static question/exemption data for the
-    //    Nigeria → Ireland flow. Independent of portal data.
+    //    Nigeria → Ireland flow (the exemption row was retired in #239). Independent of portal data.
     console.log("→ Seeding eligibility questions...");
     const eligibility = await seedNigeriaIrelandEligibility();
 
@@ -135,9 +135,19 @@ async function main() {
     const newsCount = await seedNewsSources();
 
     // 3a2. Visa-catalog sources — the official per-country immigration URLs the
-    //      visa-catalog scraper crawls (seeded from official_visa_links_verified_v3.md).
+    //      visa-catalog scraper crawls (seeded from the copy of
+    //      official_visa_links_verified_v3.md vendored in src/scrapers/visa-catalog/data/, #78).
+    //      Throws in CI if that file is missing, which fails the seed step.
     console.log("→ Seeding visa-catalog sources...");
     const visaSourceCount = await seedVisaSources();
+
+    // 3a3. Scrape cost price table (issue #82): `appConfig/llmPricing` from
+    //      DEFAULT_LLM_PRICING (numbers quoted from the provider's pricing
+    //      page), only when the doc is ABSENT — a table an admin updated is
+    //      never overwritten by a re-seed.
+    console.log("→ Seeding the LLM price table (if absent)...");
+    const { scrapeCostService } = await import("../scrapers");
+    const pricingSeeded = await scrapeCostService.seedPricingIfAbsent();
 
     // 3b. Document templates — the global rich-text catalog agents clone from.
     //     Independent of portal data; safe to run any time after admin init.
@@ -183,11 +193,11 @@ async function main() {
     console.log(`  - Bank accounts:   ${portal.bankAccounts}`);
     console.log("Eligibility:");
     console.log(`  - Questions:       ${eligibility.questionsSeeded}`);
-    console.log(`  - Exemptions:      ${eligibility.exemptionsSeeded}`);
     console.log("News:");
     console.log(`  - Sources:         ${newsCount}`);
     console.log("Visa catalog:");
     console.log(`  - Visa sources:    ${visaSourceCount} countries`);
+    console.log(`  - LLM price table: ${pricingSeeded ? "seeded" : "kept (already present)"}`);
     console.log("Documents:");
     console.log(`  - Templates:       ${documentTemplatesCount}`);
     console.log("Billing / RBAC:");
@@ -195,8 +205,8 @@ async function main() {
     console.log(`  - Subscriptions:   ${subCounts.agency + subCounts.clients} (agency + ${subCounts.clients} clients)`);
     console.log("  - Role claims:     backfilled for all auth users");
     console.log("\nLogin credentials (all seed users): password123");
-    console.log("  admin@selitest.com / admin2@selitest.com / owner@selitest.com");
-    console.log("  agent1@selitest.com / agent2@selitest.com\n");
+    console.log("  delivered+admin@resend.dev / delivered+admin2@resend.dev / delivered+owner@resend.dev");
+    console.log("  delivered+agent1@resend.dev / delivered+agent2@resend.dev\n");
 
     process.exit(0);
   } catch (error) {

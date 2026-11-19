@@ -8,7 +8,7 @@ import {
   SubscriberType,
 } from "@durin-tech/authz";
 import { entitlementService } from "../entitlement.service";
-import { paystackProvider, PaystackChargeRaw } from "./paystack.provider";
+import { paystackProvider, PaystackChargeRaw, PaystackCheckoutInput } from "./paystack.provider";
 import { notificationService } from "../notification.service";
 import { StoredPlan } from "../../types/billing";
 import { NotificationType } from "../../types";
@@ -52,12 +52,17 @@ class BillingService {
    * move to a free plan (e.g. downgrading from a paid tier) is applied directly —
    * no checkout redirect — and the caller gets `{ applied: true }` instead of a
    * hosted checkout URL.
+   *
+   * Issue #252: `options.callbackUrl` (optional) is the per-request Paystack
+   * return URL; the mobile app passes the app return page here. Omitted, the
+   * provider's default `PAYSTACK_CALLBACK_URL` applies (portal unchanged).
    */
   async createCheckout(
     subscriberType: SubscriberType,
     subscriberId: string,
     planId: string,
-    email: string
+    email: string,
+    options: { callbackUrl?: string } = {}
   ): Promise<CheckoutSession | AppliedSwitch> {
     const planDoc = await collections.plans.doc(planId).get();
     if (!planDoc.exists) throw new Error("Plan not found");
@@ -84,14 +89,19 @@ class BillingService {
       return { applied: true, planId, provider: "manual" };
     }
 
-    return this.provider.createCheckout({
+    // Built as a typed variable (not an inline literal) because the shared
+    // `BillingProvider.createCheckout` contract has no `callbackUrl`; the
+    // Paystack provider reads it, any other provider ignores the extra field.
+    const input: PaystackCheckoutInput = {
       subscriberType,
       subscriberId,
       planId,
       email,
       amountKobo: plan.priceKobo,
       metadata: plan.paystackPlanCode ? { paystackPlanCode: plan.paystackPlanCode } : undefined,
-    });
+      ...(options.callbackUrl ? { callbackUrl: options.callbackUrl } : {}),
+    };
+    return this.provider.createCheckout(input);
   }
 
   /**

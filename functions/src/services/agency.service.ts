@@ -7,12 +7,25 @@ import {
   Agency,
   AgencyInvitation,
   AgencyService as AgencyServiceType,
+  AgencyStatus,
   Agent,
   User,
 } from "../types";
-import { Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { claimsService } from "./claims.service";
+// Issue #179: prices are US dollars (validated input, tolerant stored reads,
+// and the local figure on public reads).
+import type { LocalPriceQuote, Money } from "../types/money";
+import {
+  isPriceInputError,
+  parseUsdPriceInput,
+  PriceInputError,
+  readStoredUsd,
+  type LocalPricer,
+} from "../money";
+import { zeroUsd } from "../money/usd-price";
 import { entitlementService } from "./entitlement.service";
+import { AuthzSubject, ROLES } from "@durin-tech/authz";
 
 /** Thrown when an agency has no free paid seats to add another agent. */
 export class SeatLimitError extends Error {
@@ -24,30 +37,360 @@ export class SeatLimitError extends Error {
   }
 }
 
-export interface CreateAgencyInput {
-  name: string;
-  address?: string;
-  state?: string;
-  description?: string;
-  logoUrl?: string;
-  consultationFee?: number;
+/**
+ * Thrown by `removeAgentFromAgency` when the agent is not a member of the
+ * agency the caller is acting on (issue #138). Controllers answer it like a
+ * missing member, so nothing is revealed about other agencies.
+ */
+export class NotAgencyMemberError extends Error {
+  constructor() {
+    super("Agent is not a member of this agency");
+    this.name = "NotAgencyMemberError";
+  }
+}
+
+/**
+ * The ONLY fields an agency owner may set on their agency record, through
+ * `POST /agencies` (create) and `PUT /agencies/me` (update) (issue #138).
+ *
+ * Why an allow-list: the request body comes straight from the client and the
+ * Admin SDK bypasses firestore.rules. Everything else on the record is a
+ * decision somebody else makes, or is relied on as an authority, and must
+ * never be copied from a request:
+ *  - `ownerId` / `ownerName`: the ownership anchor read by the role lookup
+ *    (claims.service.ts) and by the owner endpoints;
+ *  - `status`, `reviewedBy`, `reviewedAt`, `rejectionReason`: the admin's
+ *    admission decision (PUT /agencies/:id/approval);
+ *  - `compliance`: the KYC/KYB/payout file and its review state, which gates
+ *    payment requests and platform-client assignment. Edited only through
+ *    /agencies/me/compliance (field allow-list + lock once submitted) and
+ *    decided only by an admin;
+ *  - `totalAgents` (the seat check counts from it), `totalCases`,
+ *    `activeCases`: maintained by the member / case flows;
+ *  - `slug`, `id`, `createdAt`: fixed at creation;
+ *  - `logoUrl`: set only by POST /agencies/me/logo, which checks that the
+ *    file is an upload issued for this agency (issue #141).
+ *
+ * firestore.rules makes the whole collection backend-only, so this list is
+ * the single statement of what an owner can edit.
+ */
+export const AGENCY_OWNER_EDITABLE_FIELDS = [
+  "name",
+  "address",
+  "state",
+  "description",
+  // Issue #179: the dollar fee replaces the naira `consultationFee`; both
+  // prices (this and each service's `priceUsd`) are validated by
+  // readAgencyProfileInput before they reach this list.
+  "consultationFeeUsd",
+  "services",
+] as const;
+
+/**
+ * Body keys of the old naira prices (#144/#148). Sending one is a 400 (not a
+ * silent drop), so a client still on the naira screen learns the field moved.
+ */
+const RETIRED_AGENCY_PRICE_FIELDS = ["consultationFee"] as const;
+
+/** The owner-editable profile of an agency (see AGENCY_OWNER_EDITABLE_FIELDS). */
+export interface AgencyProfileInput {
+  name?: string;
+  address?: string | null;
+  state?: string | null;
+  description?: string | null;
+  /** Validated dollar fee; null clears it (issue #179). */
+  consultationFeeUsd?: Money | null;
+  /** Each entry's `priceUsd` is a validated dollar price (issue #179). */
   services?: AgencyServiceType[];
 }
 
-export interface UpdateAgencyInput {
-  name?: string;
-  address?: string;
+/** Creating an agency needs a name; the rest of the profile is optional. */
+export interface CreateAgencyInput extends AgencyProfileInput {
+  name: string;
+}
+
+/**
+ * What the server itself may write on an agency besides the owner-editable
+ * profile. Deliberately NOT reachable from a request body: only server code
+ * passes these (today: the logo endpoint, after validating the upload).
+ */
+export interface AgencyServerWrittenFields {
+  logoUrl?: string;
+}
+
+/** Result of checking a request body against the owner-editable profile. */
+export type AgencyProfileCheck =
+  | { ok: true; profile: AgencyProfileInput }
+  | { ok: false; message: string };
+
+/**
+ * Read the owner-editable agency profile out of an untrusted request body
+ * (issue #138). Only the keys in AGENCY_OWNER_EDITABLE_FIELDS are looked at;
+ * every other key is ignored. A key that IS on the list but carries a value
+ * of the wrong type is an error (the request is refused with a 400) rather
+ * than being stored as it came:
+ *  - `name`: a non-empty string;
+ *  - `address`, `state`, `description`: a string, or null to clear;
+ *  - `consultationFeeUsd` (issue #179): a dollar price
+ *    `{ amount: "100.00", currency?: "USD" }` (see `parseUsdPriceInput`:
+ *    finite, >= 0, whole cents, capped, USD only), or null to clear. The old
+ *    naira `consultationFee` key is refused;
+ *  - `services`: an array of `{ id, name, priceUsd }`, `priceUsd` the same
+ *    dollar price shape. An entry with the old naira `price` is refused.
+ *    Only those three keys of each entry are kept (the public agency page
+ *    shows this list).
+ * Keys that are absent stay absent, so a partial update changes only what it
+ * names.
+ */
+export function readAgencyProfileInput(body: unknown): AgencyProfileCheck {
+  const raw = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+  const profile: AgencyProfileInput = {};
+
+  if (raw.name !== undefined) {
+    if (typeof raw.name !== "string" || raw.name.trim() === "") {
+      return { ok: false, message: "Agency name must be a non-empty string" };
+    }
+    profile.name = raw.name.trim();
+  }
+
+  // Optional free-text fields: a string, or null to clear.
+  for (const field of ["address", "state", "description"] as const) {
+    const value = raw[field];
+    if (value === undefined) continue;
+    if (value !== null && typeof value !== "string") {
+      return { ok: false, message: `${field} must be a string` };
+    }
+    profile[field] = value;
+  }
+
+  // ---- Prices (issue #179): US dollars only, validated in one place ----
+  for (const retired of RETIRED_AGENCY_PRICE_FIELDS) {
+    if (raw[retired] !== undefined) {
+      return {
+        ok: false,
+        message: `${retired}: was replaced by consultationFeeUsd (US dollars), e.g. { "amount": "100.00", "currency": "USD" }`,
+      };
+    }
+  }
+  if (raw.consultationFeeUsd !== undefined) {
+    if (raw.consultationFeeUsd === null) {
+      profile.consultationFeeUsd = null;
+    } else {
+      const fee = tryParsePrice(raw.consultationFeeUsd, "consultationFeeUsd");
+      if (!fee.ok) return fee;
+      profile.consultationFeeUsd = fee.money;
+    }
+  }
+
+  if (raw.services !== undefined) {
+    if (!Array.isArray(raw.services)) {
+      return { ok: false, message: "services must be an array" };
+    }
+    const services: AgencyServiceType[] = [];
+    for (const entry of raw.services as unknown[]) {
+      const service = entry as Record<string, unknown> | null;
+      if (
+        !service ||
+        typeof service !== "object" ||
+        (typeof service.id !== "string" && typeof service.id !== "number") ||
+        typeof service.name !== "string"
+      ) {
+        return {
+          ok: false,
+          message: "Each service needs an id, a name and a priceUsd",
+        };
+      }
+      // The old naira `price` is refused (issue #179), never stored as dollars.
+      if (service.price !== undefined) {
+        return {
+          ok: false,
+          message: "services[].price: was replaced by priceUsd (US dollars), e.g. { \"amount\": \"50.00\", \"currency\": \"USD\" }",
+        };
+      }
+      const price = tryParsePrice(service.priceUsd, "services[].priceUsd");
+      if (!price.ok) return price;
+      // Copy the three known keys only; anything else on the entry is dropped.
+      services.push({ id: String(service.id), name: service.name, priceUsd: price.money });
+    }
+    profile.services = services;
+  }
+
+  return { ok: true, profile };
+}
+
+/**
+ * `parseUsdPriceInput` as an AgencyProfileCheck-style result, so
+ * readAgencyProfileInput keeps answering `{ ok: false, message }` (a 400).
+ */
+function tryParsePrice(
+  value: unknown,
+  field: string
+): { ok: true; money: Money } | { ok: false; message: string } {
+  try {
+    return { ok: true, money: parseUsdPriceInput(value, field) };
+  } catch (error) {
+    if (isPriceInputError(error)) return { ok: false, message: (error as PriceInputError).message };
+    throw error;
+  }
+}
+
+// ============================================
+// PUBLIC AGENCY DIRECTORY (issue #144)
+// ============================================
+
+/** Hard cap on `GET /agencies/browse?limit=` (and the default page size). */
+export const PUBLIC_AGENCY_LIST_MAX = 100;
+
+/**
+ * Public-safe projection of an Agency for the UNAUTHENTICATED directory
+ * (`GET /agencies/browse` and `GET /agencies/browse/:id`, the mobile
+ * Explorer's agency screens; matches mobile `ApiAgency` in
+ * `src/hooks/useAgencies.ts`).
+ *
+ * This is a deliberate ALLOW-LIST: it carries ONLY fields that are safe to
+ * show to any anonymous browser, copied one by one in `toPublicAgency()`.
+ * It intentionally EXCLUDES every private / compliance / internal field:
+ *   - `ownerId`            (internal user id, a leak vector)
+ *   - `compliance`         (owner KYC/KYB PII: BVN, NIN, ID docs, settlement bank)
+ *   - `reviewedBy` / `reviewedAt` / `rejectionReason` (admin review metadata)
+ *   - `activeCases`        (operational load, not for public consumption)
+ *
+ * `consultationFeeUsd` and `services` ARE included: they are customer-facing
+ * pricing, not financial internals. Issue #179: each price is the stored
+ * US-dollar Money plus its local figure at the current rate (`...Local`,
+ * `available: false` when there is no usable rate). The `migratedFrom`
+ * audit and any old naira field are never included.
+ */
+export interface PublicAgency {
+  id: string;
+  name: string;
+  /** Public slug of the `/a/<slug>` landing page; null until backfilled. */
+  slug: string | null;
+  /** Display name only, never the owner's user id. */
+  ownerName: string;
+  /** Region / location. Omitted from the JSON when unset. */
   state?: string;
+  /** Business address (public contact info). Omitted when unset. */
+  address?: string;
   description?: string;
   logoUrl?: string;
-  consultationFee?: number;
-  services?: AgencyServiceType[];
+  /** Default consultation fee in US dollars; null when unset (issue #179). */
+  consultationFeeUsd: Money | null;
+  /** The fee in the viewer's local currency; null when there is no fee. */
+  consultationFeeLocal: LocalPriceQuote | null;
+  /** Public service menu: id, name and the dollar price + local figure only. */
+  services: PublicAgencyServiceEntry[];
+  /** Denormalized member count (the agency's `totalAgents`). */
+  agentCount: number;
+  /** Track-record stat (the agency's `totalCases`). */
+  totalCases: number;
+  /** Always "approved": nothing else is ever returned publicly. */
+  status: AgencyStatus;
+  /** Compliance-verified badge (boolean only, never the compliance file). */
+  verified: boolean;
+  /** Serializes as `{ _seconds, _nanoseconds }` over JSON. */
+  createdAt: Timestamp;
+}
+
+/** One public service entry (issue #179: dollar price + local figure). */
+export interface PublicAgencyServiceEntry {
+  id: string;
+  name: string;
+  /** The stored dollar price; null when the entry has none (not migrated / corrupt). */
+  priceUsd: Money | null;
+  /** The price in the viewer's local currency; null when there is no price. */
+  priceLocal: LocalPriceQuote | null;
+}
+
+/**
+ * Is this agency publicly visible (directory, public pages)?
+ *
+ * "Public" == admitted to the platform (`status === "approved"`).
+ * `pending_review`, `rejected` and `suspended` agencies are never public.
+ * Compliance verification is a SEPARATE gate (it unlocks payments and
+ * platform-client assignment) and is shown as the `verified` badge instead,
+ * so an approved but unverified agency is still listed. Shared by the slug
+ * page and the browse endpoints so both gate the same way.
+ */
+export function isAgencyPubliclyVisible(agency: Pick<Agency, "status"> | null | undefined): boolean {
+  return agency?.status === "approved";
+}
+
+/**
+ * The public trust badge: true only when the agency's compliance file
+ * (KYC/KYB/payout) was verified by an admin. Only this boolean is ever
+ * exposed, never the file itself. Shared with the slug page.
+ */
+export function isAgencyComplianceVerified(agency: Pick<Agency, "compliance">): boolean {
+  return agency.compliance?.status === "verified";
+}
+
+/**
+ * The public service menu: id, name and the dollar price with its local
+ * figure only, so any extra field ever added to a stored service (or an old
+ * naira `price` on a not-yet-migrated entry) can't leak. Shared with the
+ * slug page.
+ */
+export function toPublicAgencyServices(
+  services: AgencyServiceType[] | undefined,
+  pricer: LocalPricer
+): PublicAgencyServiceEntry[] {
+  return (services || []).map((s) => {
+    const priceUsd = readStoredUsd(s.priceUsd);
+    return { id: s.id, name: s.name, priceUsd, priceLocal: priceUsd ? pricer.price(priceUsd) : null };
+  });
+}
+
+/**
+ * The agency's public consultation fee: stored dollars + local figure, or
+ * both null when no valid dollar fee is stored. Shared with the slug page.
+ */
+export function toPublicAgencyFee(
+  agency: Pick<Agency, "consultationFeeUsd">,
+  pricer: LocalPricer
+): { consultationFeeUsd: Money | null; consultationFeeLocal: LocalPriceQuote | null } {
+  const fee = readStoredUsd(agency.consultationFeeUsd);
+  return { consultationFeeUsd: fee, consultationFeeLocal: fee ? pricer.price(fee) : null };
+}
+
+/**
+ * Map a full Agency doc down to its public-safe projection (allow-list).
+ * Centralized so every browse endpoint returns an identical, minimal shape
+ * and no private / compliance field can accidentally leak. Optional profile
+ * fields stay `undefined` when unset (dropped from the JSON), as mobile's
+ * `ApiAgency` expects.
+ */
+export function toPublicAgency(agency: Agency, pricer: LocalPricer): PublicAgency {
+  return {
+    id: agency.id,
+    name: agency.name,
+    slug: agency.slug ?? null,
+    ownerName: agency.ownerName,
+    state: agency.state,
+    address: agency.address,
+    description: agency.description,
+    logoUrl: agency.logoUrl,
+    // Issue #179: dollars as stored + the local figure (one rate per request).
+    ...toPublicAgencyFee(agency, pricer),
+    services: toPublicAgencyServices(agency.services, pricer),
+    agentCount: agency.totalAgents ?? 0,
+    totalCases: agency.totalCases ?? 0,
+    status: agency.status,
+    verified: isAgencyComplianceVerified(agency),
+    createdAt: agency.createdAt,
+  };
 }
 
 class AgencyService {
   /**
    * Create a new agency. The creator becomes the owner.
-   * Also updates the agent's document with agencyId and agencyRole.
+   * Also updates the agent's document with agencyId and agencyRole, and
+   * promotes the creator to the owner role in their custom claims.
+   *
+   * `input` must be the result of `readAgencyProfileInput` (owner-editable
+   * fields only). Everything else on the record is set here: the agency
+   * always starts `pending_review`, with no compliance file, one member (the
+   * owner) and no logo.
    */
   async createAgency(
     ownerUserId: string,
@@ -91,11 +434,12 @@ class AgencyService {
       slug,
       ownerId: ownerUserId,
       ownerName,
-      address: input.address,
-      state: input.state,
-      description: input.description,
-      logoUrl: input.logoUrl,
-      consultationFee: input.consultationFee,
+      // Optional profile fields: null ("cleared") is stored as absent.
+      address: input.address ?? undefined,
+      state: input.state ?? undefined,
+      description: input.description ?? undefined,
+      // Issue #179: dollars (validated); null/absent = no fee set.
+      consultationFeeUsd: input.consultationFeeUsd ?? undefined,
       services: input.services || [],
       totalAgents: 1, // Owner counts as the first member
       totalCases: 0,
@@ -113,6 +457,17 @@ class AgencyService {
       agencyRole: "owner",
       updatedAt: serverTimestamp(),
     });
+
+    // Promote the creator to agency owner in their custom claims, exactly as
+    // owner onboarding does (issue #138). Owner views and owner endpoints
+    // read the role from the claims, so without this the new owner would be
+    // treated as an independent agent until something else rewrote their
+    // claims. Best-effort, like onboarding: a claims failure must not undo
+    // the agency that was just created (the audit script lists agencies whose
+    // owner has no owner claim).
+    await claimsService
+      .setRoleClaims(ownerUserId, ROLES.OWNER, agency.id)
+      .catch((e) => console.error("Failed to set owner claims on agency creation:", e));
 
     return agency;
   }
@@ -137,6 +492,33 @@ class AgencyService {
 
     if (snapshot.empty) return null;
     return snapshot.docs[0].data() as Agency;
+  }
+
+  /**
+   * The agency this principal OWNS, or null (issue #138).
+   *
+   * This is the check every owner-only endpoint uses. Two server-written
+   * records have to agree:
+   *  - the resolved principal (`req.authz`, from the custom claims, or from
+   *    the role lookup when the token has no role claim yet) says the caller
+   *    is an owner of agency X; and
+   *  - agency X's own record names the caller as `ownerId`.
+   * Looking the agency up by `ownerId` alone is not enough: an agency record
+   * that names a user is only an authority when the role lookup agrees, and
+   * that lookup also requires the user's agent document to say so. (Records
+   * written before `agencies` became backend-only in firestore.rules could
+   * name anybody.)
+   */
+  async getOwnedAgencyForPrincipal(
+    authz: Pick<AuthzSubject, "uid" | "role" | "agencyId"> | undefined
+  ): Promise<Agency | null> {
+    if (!authz || authz.role !== ROLES.OWNER) return null;
+    const { agencyId } = authz;
+    // A usable document id, nothing else (never let doc() throw on bad data).
+    if (typeof agencyId !== "string" || !agencyId || agencyId.includes("/")) return null;
+    const agency = await this.getAgencyById(agencyId);
+    if (!agency || agency.ownerId !== authz.uid) return null;
+    return agency;
   }
 
   /**
@@ -222,11 +604,19 @@ class AgencyService {
   }
 
   /**
-   * Update agency profile
+   * Update agency profile.
+   *
+   * `profile` is the owner-editable part and must be the result of
+   * `readAgencyProfileInput`; it is filtered through
+   * AGENCY_OWNER_EDITABLE_FIELDS once more here, so nothing else can ride
+   * along even if a future caller passes a wider object. `serverFields` is
+   * for values the server itself decided (see AgencyServerWrittenFields) and
+   * is never built from a request body.
    */
   async updateAgency(
     agencyId: string,
-    updates: UpdateAgencyInput
+    profile: AgencyProfileInput,
+    serverFields: AgencyServerWrittenFields = {}
   ): Promise<Agency> {
     const agencyRef = collections.agencies.doc(agencyId);
     const doc = await agencyRef.get();
@@ -234,6 +624,20 @@ class AgencyService {
     if (!doc.exists) {
       throw new Error("Agency not found");
     }
+
+    // Copy the allow-listed keys that are present (undefined = "not sent").
+    const updates: Record<string, unknown> = {};
+    for (const field of AGENCY_OWNER_EDITABLE_FIELDS) {
+      if (profile[field] !== undefined) updates[field] = profile[field];
+    }
+    // Issue #179: writing (or clearing, null) the dollar fee also REMOVES the
+    // old naira `consultationFee`, so a doc never holds two prices. A cleared
+    // fee is removed, not stored as null (absent = no fee).
+    if (profile.consultationFeeUsd !== undefined) {
+      if (profile.consultationFeeUsd === null) updates.consultationFeeUsd = FieldValue.delete();
+      updates.consultationFee = FieldValue.delete();
+    }
+    if (serverFields.logoUrl !== undefined) updates.logoUrl = serverFields.logoUrl;
 
     await agencyRef.update({
       ...updates,
@@ -256,57 +660,39 @@ class AgencyService {
     return snapshot.docs.map((doc) => doc.data() as Agent);
   }
 
-  /**
-   * Add an existing agent to an agency
-   */
-  async addAgentToAgency(
-    agencyId: string,
-    agentId: string
-  ): Promise<void> {
-    const agencyRef = collections.agencies.doc(agencyId);
-    const agentRef = collections.agents.doc(agentId);
-
-    const [agencyDoc, agentDoc] = await Promise.all([
-      agencyRef.get(),
-      agentRef.get(),
-    ]);
-
-    if (!agencyDoc.exists) throw new Error("Agency not found");
-    if (!agentDoc.exists) throw new Error("Agent not found");
-
-    const agent = agentDoc.data() as Agent;
-    if (agent.agencyId) {
-      throw new Error("Agent is already part of an agency");
-    }
-
-    // Update agent with agency membership
-    await agentRef.update({
-      agencyId,
-      agencyRole: "agent",
-      updatedAt: serverTimestamp(),
-    });
-
-    // Increment agency's agent count
-    await agencyRef.update({
-      totalAgents: increment(1),
-      updatedAt: serverTimestamp(),
-    });
-  }
+  // NOTE (issue #138): there is deliberately no "add an existing agent to
+  // an agency" method any more. Attaching an agent to an agency without the
+  // agent saying yes is not something an owner may do; the one way in is an
+  // invitation the agent accepts (inviteAgent + acceptInvitation below, or
+  // POST /onboarding/join-agency for a new account). POST /agencies/:id/members
+  // now sends such an invitation.
 
   /**
    * Remove an agent from an agency.
    * Cases stay with the agency (agencyId on applications is NOT cleared).
    * The agent's agentId on those applications can be cleared or reassigned separately.
+   *
+   * `agencyId` is the agency the caller is acting on (the controller has
+   * already checked that the caller is its owner, or an admin). The agent
+   * MUST currently be a member of exactly that agency (issue #138): the
+   * agent id comes from the URL, so without this check the owner of one
+   * agency could detach a member of any other. A missing agent, an agent
+   * with no agency and an agent of a different agency are all answered the
+   * same way (NotAgencyMemberError).
    */
-  async removeAgentFromAgency(agentId: string): Promise<void> {
+  async removeAgentFromAgency(agencyId: string, agentId: string): Promise<void> {
+    // Malformed ids can never name a member (and must not make doc() throw).
+    if (typeof agentId !== "string" || !agentId || agentId.includes("/")) {
+      throw new NotAgencyMemberError();
+    }
     const agentRef = collections.agents.doc(agentId);
     const agentDoc = await agentRef.get();
 
-    if (!agentDoc.exists) throw new Error("Agent not found");
+    if (!agentDoc.exists) throw new NotAgencyMemberError();
 
     const agent = agentDoc.data() as Agent;
-    if (!agent.agencyId) {
-      throw new Error("Agent is not part of any agency");
+    if (!agencyId || agent.agencyId !== agencyId) {
+      throw new NotAgencyMemberError();
     }
 
     if (agent.agencyRole === "owner") {
@@ -420,6 +806,31 @@ class AgencyService {
   }
 
   /**
+   * Whether an invitation was really issued by the owner of the agency it
+   * names (issue #135). Redeeming an invitation turns it into agency
+   * membership, so an invitation document is only an authority when it agrees
+   * with the agency's own record: the agency must exist and its `ownerId`
+   * must be the invitation's `invitedBy`. That is exactly what the one server
+   * flow that creates invitations guarantees (POST /agencies/:id/invitations
+   * refuses anyone but the agency's owner; admins do not invite).
+   *
+   * Both redemption paths (acceptInvitation below and POST
+   * /onboarding/join-agency) call this BEFORE doing anything else with the
+   * invitation, and treat `false` as "invitation not found".
+   */
+  async isInvitationIssuedByAgencyOwner(
+    invitation: Pick<AgencyInvitation, "agencyId" | "invitedBy">
+  ): Promise<boolean> {
+    const { agencyId, invitedBy } = invitation;
+    // Malformed references can never match an agency owner.
+    if (typeof agencyId !== "string" || !agencyId || agencyId.includes("/")) return false;
+    if (typeof invitedBy !== "string" || !invitedBy) return false;
+    const agencyDoc = await collections.agencies.doc(agencyId).get();
+    if (!agencyDoc.exists) return false;
+    return (agencyDoc.data() as Agency).ownerId === invitedBy;
+  }
+
+  /**
    * Accept an invitation
    */
   async acceptInvitation(
@@ -433,8 +844,27 @@ class AgencyService {
     if (!invitationDoc.exists) throw new Error("Invitation not found");
 
     const invitation = invitationDoc.data() as AgencyInvitation;
+
+    // Only an invitation issued by the agency's owner is an invitation at all
+    // (issue #135; see isInvitationIssuedByAgencyOwner). Same answer as for a
+    // missing document, so nothing is revealed about why.
+    if (!(await this.isInvitationIssuedByAgencyOwner(invitation))) {
+      throw new Error("Invitation not found");
+    }
+
     if (invitation.status !== "pending") {
       throw new Error("Invitation is no longer pending");
+    }
+
+    // The invitation may only be redeemed by the address it was sent to.
+    // ALWAYS enforced (issue #135): whether or not the caller already has an
+    // agent profile, and a caller whose token carries no email is refused.
+    if (
+      !userEmail ||
+      typeof invitation.invitedEmail !== "string" ||
+      invitation.invitedEmail.toLowerCase() !== userEmail.toLowerCase()
+    ) {
+      throw new Error("This invitation was sent to a different email address.");
     }
 
     // Check expiry
@@ -463,12 +893,8 @@ class AgencyService {
     }
 
     if (agentSnapshot.empty) {
-      // No profile yet → create one as a verified, available member. Guard with
-      // an email match (when the caller's email is known) so an invite can only
-      // be redeemed by its intended recipient — same rule as join-agency.
-      if (userEmail && invitation.invitedEmail.toLowerCase() !== userEmail.toLowerCase()) {
-        throw new Error("This invitation was sent to a different email address.");
-      }
+      // No profile yet → create one as a verified, available member. (The
+      // invited-email match was already enforced above, for every caller.)
 
       const userDoc = await collections.users.doc(agentUserId).get();
       const u = userDoc.data() as User | undefined;
@@ -493,8 +919,7 @@ class AgencyService {
         totalApplications: 0,
         successRate: 0,
         responseTime: "N/A",
-        consultationFee: 0,
-        serviceFees: {},
+        consultationFeeUsd: zeroUsd(), // issue #179: new agents start at zero US dollars
         isAvailable: true,
         createdAt: now,
         updatedAt: now,
@@ -542,15 +967,28 @@ class AgencyService {
   }
 
   /**
-   * Decline an invitation
+   * Decline an invitation.
+   *
+   * Only the address the invitation was sent to may decline it (issue #138),
+   * the same match that accepting requires: `userEmail` is the email on the
+   * caller's token. Anyone else, and a caller whose token carries no email,
+   * gets the same answer as for a missing invitation. (The inviting owner
+   * withdraws an invitation with cancelInvitation instead.)
    */
-  async declineInvitation(invitationId: string): Promise<void> {
+  async declineInvitation(invitationId: string, userEmail?: string): Promise<void> {
     const invitationRef = collections.agencyInvitations.doc(invitationId);
     const invitationDoc = await invitationRef.get();
 
     if (!invitationDoc.exists) throw new Error("Invitation not found");
 
     const invitation = invitationDoc.data() as AgencyInvitation;
+    if (
+      !userEmail ||
+      typeof invitation.invitedEmail !== "string" ||
+      invitation.invitedEmail.toLowerCase() !== userEmail.toLowerCase()
+    ) {
+      throw new Error("Invitation not found");
+    }
     if (invitation.status !== "pending") {
       throw new Error("Invitation is no longer pending");
     }
@@ -692,6 +1130,59 @@ class AgencyService {
       .get();
 
     return snapshot.docs.map((doc) => doc.data() as Agency);
+  }
+
+  // ============================================
+  // PUBLIC BROWSING (unauthenticated directory, issue #144)
+  // ============================================
+
+  /**
+   * List the publicly visible (approved) agencies, newest first, as the
+   * public projection. No `visaPrices` here: the list stays one query.
+   *
+   * Query: `status == "approved"` ordered by `createdAt desc`, served by the
+   * existing `agencies (status ASC, createdAt DESC)` composite index.
+   *
+   * @param options.search case-insensitive substring match on the agency
+   *   name. Applied in memory (Firestore has no "contains"), so with a
+   *   search we read every approved agency, filter, THEN apply the limit.
+   * @param options.limit max results, clamped to 1..PUBLIC_AGENCY_LIST_MAX
+   *   (default: the max). Pushed into the query only when there is no
+   *   search, else it would truncate before the name filter runs.
+   */
+  async listPublicAgencies(
+    options: { limit?: number; search?: string; pricer: LocalPricer }
+  ): Promise<PublicAgency[]> {
+    const search = options?.search?.trim().toLowerCase() || undefined;
+    const requested = options?.limit;
+    const limit =
+      requested !== undefined && Number.isInteger(requested) && requested > 0
+        ? Math.min(requested, PUBLIC_AGENCY_LIST_MAX)
+        : PUBLIC_AGENCY_LIST_MAX;
+
+    let query = collections.agencies.where("status", "==", "approved").orderBy("createdAt", "desc");
+    if (!search) query = query.limit(limit);
+
+    const snapshot = await query.get();
+    let agencies = snapshot.docs.map((doc) => doc.data() as Agency);
+
+    if (search) {
+      agencies = agencies.filter((a) => (a.name ?? "").toLowerCase().includes(search)).slice(0, limit);
+    }
+
+    return agencies.map((a) => toPublicAgency(a, options.pricer));
+  }
+
+  /**
+   * One agency's public projection, or null when it does not exist or is
+   * not publicly visible (not approved). Callers 404 on null with the SAME
+   * body either way, so a non-approved agency's existence never leaks.
+   */
+  async getPublicAgencyById(agencyId: string, pricer: LocalPricer): Promise<PublicAgency | null> {
+    const agency = await this.getAgencyById(agencyId);
+    if (!agency || !isAgencyPubliclyVisible(agency)) return null;
+    // A doc missing its own `id` field would be corrupt; trust the path.
+    return toPublicAgency({ ...agency, id: agency.id ?? agencyId }, pricer);
   }
 }
 

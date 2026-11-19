@@ -1,4 +1,5 @@
 import { EMAIL_BRANDING } from "./branding";
+import type { AgencyBrand } from "./agency-brand";
 
 /**
  * Email templates — pure, layout-only render functions. All brand values come from
@@ -18,6 +19,13 @@ export interface NotificationEmailOptions {
   actionLabel?: string;
   /** Short inbox-preview text (hidden in the rendered email). */
   preheader?: string;
+  /**
+   * Agency to co-brand this email with — its logo renders beside Seli's in the
+   * header. Resolved per recipient by `resolveAgencyBrand`. Omit (or pass null)
+   * when there is no agency or it has no logo: the header then falls back to the
+   * Seli mark alone.
+   */
+  agency?: AgencyBrand | null;
 }
 
 /** Escape user-controlled strings before interpolating into HTML. */
@@ -30,9 +38,51 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
+/**
+ * Render the email header's logo row.
+ *
+ * With an agency: the agency's mark sits on the left, a hairline divider, then
+ * the Seli mark — the email is from the agency, delivered on Seli. Without one
+ * (no agency, no uploaded logo, or a failed lookup) it degrades to the centred
+ * Seli mark alone.
+ *
+ * Built as a nested `<table>` rather than flexbox because Outlook ignores modern
+ * layout entirely; `valign="middle"` on the cells is what actually aligns two
+ * logos of differing aspect ratios. The agency logo is height-capped AND
+ * width-capped so a wide banner-style upload can't blow out the 560px shell.
+ */
+function renderLogoHeader(agency: AgencyBrand | null | undefined): string {
+  const { appName, logoUrl, appUrl } = EMAIL_BRANDING;
+
+  const seliMark = `<a href="${escapeHtml(appUrl)}" style="text-decoration:none;">
+      <img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(appName)}" height="28"
+           style="display:block;height:28px;width:auto;border:0;outline:none;text-decoration:none;"/>
+    </a>`;
+
+  // No co-brand — the original single, centred logo.
+  if (!agency) return seliMark;
+
+  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center">
+    <tr>
+      <!-- Agency mark -->
+      <td valign="middle" style="padding-right:14px;">
+        <img src="${escapeHtml(agency.logoUrl)}" alt="${escapeHtml(agency.name)}" height="28"
+             style="display:block;height:28px;width:auto;max-width:150px;border:0;outline:none;"/>
+      </td>
+      <!-- Hairline divider between the two marks -->
+      <td valign="middle" style="width:1px;background:#D6DEE9;font-size:0;line-height:0;">
+        <div style="width:1px;height:24px;font-size:0;line-height:0;">&nbsp;</div>
+      </td>
+      <!-- Seli mark -->
+      <td valign="middle" style="padding-left:14px;">${seliMark}</td>
+    </tr>
+  </table>`;
+}
+
 /** Render the branded HTML notification email. */
 export function renderNotificationEmail(opts: NotificationEmailOptions): string {
-  const { appName, brandColor, logoUrl, appUrl, supportEmail } = EMAIL_BRANDING;
+  // `logoUrl`/`appUrl` are consumed by `renderLogoHeader`, not here.
+  const { appName, brandColor, supportEmail } = EMAIL_BRANDING;
 
   const title = escapeHtml(opts.title);
   const body = escapeHtml(opts.body).replace(/\n/g, "<br/>");
@@ -61,12 +111,9 @@ export function renderNotificationEmail(opts: NotificationEmailOptions): string 
     <tr><td align="center">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;">
 
-        <!-- Logo -->
+        <!-- Logos: the agency's mark beside Seli's (Seli alone when unbranded) -->
         <tr><td align="center" style="padding-bottom:20px;">
-          <a href="${escapeHtml(appUrl)}" style="text-decoration:none;">
-            <img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(appName)}" height="30"
-                 style="display:block;height:30px;width:auto;border:0;outline:none;text-decoration:none;"/>
-          </a>
+          ${renderLogoHeader(opts.agency)}
         </td></tr>
 
         <!-- Card -->

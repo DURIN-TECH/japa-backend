@@ -1,0 +1,38 @@
+{
+  "route": "skilled-worker-visa",
+  "sourceUrl": "https://www.gov.uk/skilled-worker-visa",
+  "fixtureRecordedAt": "2026-11-09",
+  "draftedBy": "ai-team software-engineer, from guide.json only (not from seed data), 2026-11-09",
+  "verifiedBy": "pending",
+  "verifiedOn": "pending",
+  "notes": [
+    "Fee rule (#59): longest standard outside-UK option is 'more than 3 years - £1,618'; the visa can last up to 5 years, so IHS £1,035 x 5.",
+    "processingDaysMin: the page only says 'within 3 weeks' (outside the UK), so any minimum from 0 to 21 days is consistent with it.",
+    "applicationUrlHost is the host of the 'Start now' button on the apply-from-outside-the-uk part (an href; the extractor only sees text, so this is expected to be hard to get)."
+  ],
+  "name": { "value": "Skilled Worker", "source": "A Skilled Worker visa allows you to come to or stay in the UK to do an eligible job with an approved employer." },
+  "category": { "value": "work", "source": "A Skilled Worker visa allows you to come to or stay in the UK to do an eligible job with an approved employer." },
+  "processingDaysMin": { "range": [0, 21], "source": "you’ll usually get a decision within 3 weeks." },
+  "processingDaysMax": { "value": 21, "source": "you’ll usually get a decision within 3 weeks." },
+  "validityPeriod": {
+    "durations": [{ "amount": 5, "unit": "year" }],
+    "source": "Your visa can last for up to 5 years before you need to extend it."
+  },
+  "isExtendable": { "value": true, "source": "You can apply to extend your visa as many times as you like as long as you still meet the eligibility requirements." },
+  "eligibility": {
+    "themes": [
+      { "theme": "work for a Home Office approved UK employer", "anyOf": ["employer", "sponsor", "sponsoring", "approved by the home office"], "source": "work for a UK employer that’s been approved by the Home Office" },
+      { "theme": "certificate of sponsorship", "anyOf": ["certificate of sponsorship", "cos"], "source": "have a ‘certificate of sponsorship’ (CoS) from your employer with information about the role you’ve been offered in the UK" },
+      { "theme": "eligible occupation", "anyOf": ["eligible occupation", "eligible occupations", "eligible job", "occupation", "occupations"], "source": "do a job that’s on the list of eligible occupations" },
+      { "theme": "minimum salary", "anyOf": ["salary", "paid a minimum"], "source": "be paid a minimum salary - how much depends on the type of work you do and the date you got your CoS" },
+      { "theme": "knowledge of English", "anyOf": ["english"], "source": "You must be able to speak, read, write and understand English." }
+    ]
+  },
+  "applicationUrlHost": { "value": "apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk", "source": "https://apply-to-visit-or-stay-in-the-uk.homeoffice.gov.uk/sort/start/skilled_worker_out_uk" },
+  "feeComponents": {
+    "components": [
+      { "kind": "application", "amount": 1618, "currency": "GBP", "per": "application", "source": "more than 3 years - £1,618 per person" },
+      { "kind": "surcharge", "amount": 1035, "currency": "GBP", "per": "year", "years": 5, "source": "pay the healthcare surcharge - this is usually £1,035 per year", "yearsSource": "Your visa can last for up to 5 years before you need to extend it." }
+    ]
+  }
+}

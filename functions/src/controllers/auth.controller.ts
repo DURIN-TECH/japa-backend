@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { auth } from "../utils/firebase";
-import { emailService } from "../services/email/email.service";
+import { emailService, LOCAL_SUPPRESSED_REASON } from "../services/email/email.service";
 import { EMAIL_BRANDING } from "../services/email/branding";
 import { EmailResult } from "../services/email/email.types";
 import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
@@ -18,7 +18,14 @@ import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
  */
 function logEmailOutcome(flow: string, to: string, result: EmailResult): boolean {
   if (result.status === "sent") return true;
-  if (result.status === "skipped") {
+  if (result.status === "skipped" && result.error === LOCAL_SUPPRESSED_REASON) {
+    // Deliberate local suppression (EMAIL_SENDING_ENABLED off under the emulator):
+    // not a configuration problem, so don't report missing secrets.
+    console.info(
+      `[auth:${flow}] email to ${to} not sent — local email sending is off ` +
+        "(set EMAIL_SENDING_ENABLED=true in functions/.env.local to enable)."
+    );
+  } else if (result.status === "skipped") {
     // Email provider not configured (missing RESEND_API_KEY / EMAIL_FROM secret).
     console.error(
       `[auth:${flow}] email NOT sent to ${to} — provider is not configured ` +
@@ -141,6 +148,9 @@ class AuthController {
         actionUrl: resetUrl,
         actionLabel: "Reset password",
         preheader: `Reset your ${EMAIL_BRANDING.appName} password`,
+        // Only the address is known here (no session), so the co-branding agency
+        // is resolved from it. Fail-soft: unresolvable => Seli mark alone.
+        brandFor: {},
       });
       // Surface (but don't leak) a delivery failure: the response stays generic
       // for the user, but ops can see in the logs that nothing was actually sent.
@@ -231,6 +241,7 @@ class AuthController {
         actionUrl: verifyUrl,
         actionLabel: "Verify email",
         preheader: `Confirm your ${EMAIL_BRANDING.appName} email address`,
+        brandFor: {},
       });
       logEmailOutcome("resend-verification", email, result);
 
@@ -308,11 +319,17 @@ class AuthController {
    * @param agencyName Optional agency name — naming who invited them is what
    *                   stops this reading like a phishing email to someone who has
    *                   never heard of Seli.
+   * @param agencyId   Optional agency id, used to co-brand the header with that
+   *                   agency's logo. Passed explicitly because this email is sent
+   *                   while the client is being provisioned — their application
+   *                   may not exist yet, so the address-based fallback lookup has
+   *                   nothing to find.
    */
   async sendClaimEmail(
     email: string,
     clientName?: string,
-    agencyName?: string
+    agencyName?: string,
+    agencyId?: string
   ): Promise<boolean> {
     const appUrl = EMAIL_BRANDING.appUrl;
 
@@ -359,6 +376,9 @@ class AuthController {
       actionUrl: claimUrl,
       actionLabel: "Set your password",
       preheader: `Set up your ${EMAIL_BRANDING.appName} account`,
+      // Co-brand with the inviting agency when the caller knows it; otherwise
+      // fall back to whatever the recipient's address resolves to.
+      brandFor: { agencyId },
     });
 
     return logEmailOutcome("claim-account", email, result);
@@ -446,6 +466,7 @@ class AuthController {
         actionUrl: signInUrl,
         actionLabel: "Sign in",
         preheader: `Your one-time ${EMAIL_BRANDING.appName} sign-in link`,
+        brandFor: {},
       });
       logEmailOutcome("magic-link", email, result);
 

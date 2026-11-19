@@ -1,0 +1,11 @@
+{
+  "_fixture": {
+    "sourceUrl": "https://www.gov.uk/api/content/seli-does-not-exist-fixture",
+    "recordedAt": "2026-11-09",
+    "recordedBy": "Seli-VisaCatalogBot/1.0 (+https://weareseli.com/bot), Accept: application/json",
+    "notes": "Real 404: GOV.UK returns an HTML (not JSON) error page; body trimmed to its <title>."
+  },
+  "status": 404,
+  "contentType": "text/html; charset=utf-8",
+  "body": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Page not found - GOV.UK</title></head><body><h1>Page not found</h1></body></html>"
+}

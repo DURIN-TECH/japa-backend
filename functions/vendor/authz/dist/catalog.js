@@ -24,6 +24,22 @@ exports.FEATURE_KEYS = [
     "priority_support", // priority support tier
     "news.alerts", // visa news alert subscriptions
     "payments.request", // agents requesting payments from clients
+    // AI case officer (#30): unlocks the FULL cited review, the per-upload
+    // document checks and re-runs of an assessment. The free readiness band and
+    // the top three issues do NOT need this key: the assessment handlers (#42)
+    // serve them to callers without it, trimmed server-side in the handler. So
+    // never put a blanket `requireFeature("ai.case_officer")` in front of the
+    // assessment response itself; gate only the paid parts.
+    "ai.case_officer",
+    // AI review working (#384): unlocks the rule-by-rule working of the AI
+    // review: each criterion checked, its published wording (quote + link) and
+    // how it was applied to the applicant. With `ai.case_officer` alone a client
+    // gets the caseworker-style narrative, the top issues and any blocking rule,
+    // but NOT the per-rule findings. Only meaningful together with
+    // `ai.case_officer`; the backend decides it server-side and fails closed
+    // (unresolved entitlements never get the working). Staff callers (agent,
+    // owner, admin) keep the working without it.
+    "ai.review_working",
 ];
 /**
  * Named constants for every feature key. **Always reference features through this
@@ -42,6 +58,11 @@ exports.FEATURES = {
     PRIORITY_SUPPORT: "priority_support",
     NEWS_ALERTS: "news.alerts",
     PAYMENTS_REQUEST: "payments.request",
+    // Paid AI review (full cited review, per-upload checks, re-runs). The free
+    // readiness band + top three issues are served without it; see FEATURE_KEYS.
+    AI_CASE_OFFICER: "ai.case_officer",
+    // Rule-by-rule working of the AI review (#384); see FEATURE_KEYS.
+    AI_REVIEW_WORKING: "ai.review_working",
 };
 /**
  * Numeric ceilings a plan can impose. Enforced by counting current usage and

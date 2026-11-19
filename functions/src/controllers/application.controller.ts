@@ -1,6 +1,6 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { applicationService } from "../services/application.service";
+import { applicationService, TERMINAL_STATUSES } from "../services/application.service";
 import { userService } from "../services/user.service";
 import { messagingService } from "../services/messaging.service";
 import { notificationService } from "../services/notification.service";
@@ -9,9 +9,17 @@ import { documentRequestService } from "../services/document-request.service";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
 import { authController } from "./auth.controller";
 import { collections, auth } from "../utils/firebase";
-import { can, asSubject, checkWithinLimit, paymentRequired } from "../middleware/authz";
+import { checkWithinLimit, paymentRequired } from "../middleware/authz";
+// Shared application access check (#29): admin > applicant > assigned agent >
+// same agency, decided by the CASL ability on `req.ability`. See utils/access.ts.
+import { checkApplicationAccessForRequest } from "../utils/access";
 import { complianceService } from "../services/compliance.service";
-import { LIMITS } from "@durin-tech/authz";
+import { intakeService, IntakeValidationError } from "../services/intake.service";
+// Issue #235: which member country a shared-route application goes through.
+import { competenceService, CompetenceError } from "../services/competence.service";
+import { answersService, AnswerValidationError } from "../services/answers.service";
+import { isWithinApplicantEditWindow } from "../utils/editable-window";
+import { LIMITS, ROLES } from "@durin-tech/authz";
 import {
   sendSuccess,
   sendError,
@@ -19,17 +27,38 @@ import {
   sendNoContent,
   ErrorMessages,
 } from "../utils/response";
+import type { RulebookStackLayer } from "../types/rubric";
+import { withThroughCountryFlag } from "../shared-routes/through-country-rule";
+import { stackLayersField, type PublicStackLayer } from "../shared-routes/stack-layers-view";
 import {
   Application,
   ApplicationStatus,
-  Agent,
   NotificationChannel,
+  ThroughCountryChoice,
 } from "../types";
+
+/**
+ * Issue #234: an application WITHOUT its copy of the applicant's holdings
+ * (`applicantFacts`: nationalities, residence, held documents; personal data).
+ * Used on case lists, which are not behind `checkApplicationAccess`; the copy
+ * is only returned by GET /applications/:id. Exported for tests.
+ */
+export function withoutApplicantFacts(app: Application): Application {
+  if (app.applicantFacts === undefined) return app;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { applicantFacts: _omitted, ...rest } = app;
+  return rest as Application;
+}
 
 export class ApplicationController {
   /**
    * POST /applications
-   * Create a new application
+   * Create a new application (applicant self-serve).
+   *
+   * Issue #102: the service refuses a visa that may not be used for this case
+   * (draft / pending / rejected / inactive, or agency-only when the case does
+   * not belong to the owning agency, i.e. no `agentId` of that agency) with
+   * the same 404 as an unknown visa, and writes nothing.
    */
   async createApplication(
     req: AuthenticatedRequest,
@@ -37,14 +66,30 @@ export class ApplicationController {
   ): Promise<void> {
     try {
       const userId = req.userId!;
-      const { visaTypeId, countryCode, mode, agentId, userNotes } = req.body;
+      const { mode, agentId, userNotes, confirmNew, sharedRouteId, throughCountryCode, competenceAnswers } =
+        req.body;
+      // Issue #235: on a SHARED route the client sends `sharedRouteId` +
+      // `throughCountryCode` (the member country the applicant confirmed)
+      // instead of a country and visa; both are then taken from that member's
+      // own inheriting record below.
+      let { visaTypeId, countryCode } = req.body;
+      const viaSharedRoute = sharedRouteId !== undefined;
 
       // Validate required fields
-      if (!visaTypeId || !countryCode || !mode) {
+      if (viaSharedRoute && (visaTypeId !== undefined || countryCode !== undefined)) {
         sendError(
           res,
           "VALIDATION_ERROR",
-          "visaTypeId, countryCode, and mode are required",
+          "Send either sharedRouteId and throughCountryCode, or visaTypeId and countryCode, not both",
+          400
+        );
+        return;
+      }
+      if (viaSharedRoute ? !throughCountryCode || !mode : !visaTypeId || !countryCode || !mode) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          viaSharedRoute ? "sharedRouteId, throughCountryCode, and mode are required" : "visaTypeId, countryCode, and mode are required",
           400
         );
         return;
@@ -72,6 +117,64 @@ export class ApplicationController {
         return;
       }
 
+      // Issue #235: check the confirmed member country (a destination of the
+      // route TODAY, with a record this case may use: 422 otherwise) and take
+      // the country and visa from that member's own record. The case's agency
+      // (from its agent) decides which records may be used, exactly as for any
+      // case, so an agency-only record of another agency is never used.
+      let throughCountry: { choice: ThroughCountryChoice; answers: Record<string, unknown>; routeName?: string } | undefined;
+      if (viaSharedRoute) {
+        const caseAgencyId = await applicationService.resolveAgentAgencyId(mode === "agent" ? agentId : undefined);
+        const resolved = await competenceService.resolveForCreate(
+          { sharedRouteId, throughCountryCode, answers: competenceAnswers },
+          caseAgencyId,
+          { uid: userId, role: req.authz?.role }
+        );
+        countryCode = resolved.countryCode;
+        visaTypeId = resolved.visaTypeId;
+        throughCountry = { choice: resolved.choice, answers: resolved.answers, routeName: resolved.routeName };
+      }
+
+      // Duplicate guard (#253): the user already has a live application for
+      // this exact country + visa. Answer 409 with that application so the
+      // client can offer "continue it" vs "start another". Creation is never
+      // blocked outright: the client re-sends with `confirmNew: true` (strictly
+      // the boolean `true`, so a stray "false" string can't bypass) to proceed.
+      // Runs BEFORE the plan limit so the user sees the existing application
+      // rather than an upgrade wall.
+      // Self mode only: an agent-mode start is a deliberate choice of agent and
+      // is not guarded.
+      if (mode === "self" && confirmNew !== true) {
+        const existing = await applicationService.findActiveDuplicate(
+          userId,
+          countryCode,
+          visaTypeId
+        );
+        if (existing) {
+          res.status(409).json({
+            success: false,
+            error: "DUPLICATE_ACTIVE_APPLICATION",
+            message:
+              "You already have an active application for this visa. Continue it, or confirm to start a new one.",
+            // Slim summary only (#253 review): no notes, admin fields,
+            // contact details or cost leave the server here.
+            data: {
+              existingApplication: {
+                id: existing.id,
+                visaTypeName: existing.visaTypeName,
+                countryName: existing.countryName,
+                ...(existing.routeName ? { routeName: existing.routeName } : {}),
+                status: existing.status,
+                progress: existing.progress,
+                mode: existing.mode,
+                lastUpdated: existing.lastUpdated,
+              },
+            },
+          });
+          return;
+        }
+      }
+
       // Enforce the per-plan active-application limit (self-serve → the client's own
       // active applications). No-op until the client has a plan with this limit.
       const activeCount = await this.countActiveApplications("userId", userId);
@@ -89,10 +192,20 @@ export class ApplicationController {
         mode,
         agentId,
         userNotes,
+        throughCountry,
       });
 
-      sendCreated(res, application, "Application created successfully");
+      sendCreated(res, withThroughCountryFlag(application), "Application created successfully");
     } catch (error) {
+      // Issue #235: the "apply through" refusals carry their own status and plain message.
+      if (error instanceof CompetenceError) {
+        sendError(res, error.code, error.message, error.status);
+        return;
+      }
+      if (error instanceof IntakeValidationError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
       console.error("Error creating application:", error);
       if ((error as Error).message === "Visa type not found") {
         sendError(res, "NOT_FOUND", "Visa type not found", 404);
@@ -170,6 +283,11 @@ export class ApplicationController {
 
       let ownerAgentUid: string;
       let agentDocId: string;
+      // The agency the new case will belong to (issue #102): the admin's
+      // chosen agency, or the calling agent's own agency (from the agent doc,
+      // the same source createApplication uses). Decides whether the case
+      // may be started on an agency-only visa.
+      let caseAgencyId: string | undefined;
       // Admin provenance passed through to the created application (undefined for
       // the agent flow, so no admin fields are written).
       let adminProvenance:
@@ -214,6 +332,7 @@ export class ApplicationController {
         }
         ownerAgentUid = ownerAgentId;
         agentDocId = ownerDoc.id;
+        caseAgencyId = ownerAgencyId;
 
         // Build the "which admin" audit fields from the admin's own profile.
         const adminDoc = await collections.users.doc(callerUid).get();
@@ -249,7 +368,17 @@ export class ApplicationController {
         }
         ownerAgentUid = callerUid;
         agentDocId = agentSnapshot.docs[0].id;
+        caseAgencyId =
+          (agentSnapshot.docs[0].data() as { agencyId?: string }).agencyId || undefined;
       }
+
+      // --- Visa check BEFORE anything is provisioned (issue #102) ------------
+      // An unknown visa, a draft / pending / rejected / inactive visa, or an
+      // agency-only visa of ANOTHER agency is refused here with the same 404
+      // as an unknown id (thrown as "Visa type not found", handled below), so
+      // no client account, invite email, application or conversation is
+      // created. createApplication re-checks the same rule itself.
+      await applicationService.getStartableVisa(countryCode, visaTypeId, caseAgencyId);
 
       // Enforce the active-application limit for the agency (or independent agent)
       // before provisioning anything. No-op until a plan with the limit is assigned.
@@ -331,11 +460,18 @@ export class ApplicationController {
       // act on it. Best-effort and deliberately not awaited into the failure path:
       // an email problem must never fail an application that was already created.
       if (!clientExisted) {
-        const agencyName = await this.resolveAgencyName(
-          isAdmin ? ownerAgencyId : req.authz?.agencyId
-        );
+        const invitingAgencyId = isAdmin ? ownerAgencyId : req.authz?.agencyId;
+        const agencyName = await this.resolveAgencyName(invitingAgencyId);
         void authController
-          .sendClaimEmail(normalizedEmail, firstName, agencyName)
+          .sendClaimEmail(
+            normalizedEmail,
+            firstName,
+            agencyName,
+            // Co-brands the invite with the agency's logo. Passed explicitly:
+            // the application below doesn't exist yet, so there is nothing for
+            // the fallback lookup to resolve from the client's address.
+            invitingAgencyId ?? undefined
+          )
           .catch((e) =>
             console.error("[application] claim-account invite failed:", e)
           );
@@ -433,13 +569,14 @@ export class ApplicationController {
         }
         applications = await applicationService.getAllApplications();
       } else if (role === "owner") {
-        // Agency owner: see all agency cases
-        const agent = await this.getAgentForUser(userId);
-        if (!agent?.agencyId || agent.agencyRole !== "owner") {
+        // Agency owner: see all agency cases. The owner role AND the agency
+        // come from the resolved principal (req.authz, built from custom
+        // claims), never from the caller's agent document (issue #135).
+        if (req.authz?.role !== ROLES.OWNER || !req.authz.agencyId) {
           sendError(res, "FORBIDDEN", "Agency owner access required", 403);
           return;
         }
-        applications = await applicationService.getAgencyApplications(agent.agencyId);
+        applications = await applicationService.getAgencyApplications(req.authz.agencyId);
       } else if (role === "agent") {
         // Agent: see cases assigned to them
         applications = await applicationService.getAgentApplications(userId);
@@ -460,8 +597,14 @@ export class ApplicationController {
         applications = applications.filter((app) => app.mode === mode);
       }
 
+      // Issue #234: a case LIST never carries the applicant's holdings copy
+      // (`applicantFacts`, personal data): the lists above are not filtered by
+      // `checkApplicationAccess`, so the copy is returned only by
+      // GET /applications/:id, which is.
+      applications = applications.map(withoutApplicantFacts);
+
       // Resolve who is handling each case so client-facing UIs can name them.
-      sendSuccess(res, await this.withHandlerNames(applications));
+      sendSuccess(res, (await this.withHandlerNames(applications)).map(withThroughCountryFlag));
     } catch (error) {
       console.error("Error getting applications:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -487,16 +630,193 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
 
       const [enriched] = await this.withHandlerNames([application]);
-      sendSuccess(res, enriched);
+      sendSuccess(res, withThroughCountryFlag(enriched));
     } catch (error) {
       console.error("Error getting application:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /applications/:id/intake  (issue #113)
+   * The route's intake questions (from the approved rubric), the saved
+   * answers and which required questions are still open. `available: false`
+   * when the route has no approved intake. Needs `read` access.
+   */
+  async getIntake(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "read")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      sendSuccess(res, await this.withStackLayers(await intakeService.getIntake(application)));
+    } catch (error) {
+      console.error("Error getting application intake:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /applications/:id/intake  (issue #113)
+   * Save the applicant's answers (body: `{ answers: { [questionId]: value } }`).
+   * Needs `update` access (a same-agency agent colleague or a lapsed plan can
+   * read but not write). 409 NOT_EDITABLE once the application is past
+   * `pending_documents`; 400 with the question named when an answer is bad.
+   */
+  async saveIntake(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "update")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      sendSuccess(res, await this.withStackLayers(await intakeService.saveIntake(application, req.body?.answers)));
+    } catch (error) {
+      if (error instanceof IntakeValidationError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      if (error instanceof Error && error.message === "NOT_EDITABLE") {
+        sendError(res, "NOT_EDITABLE", "This application has been submitted, so these answers can't be changed.", 409);
+        return;
+      }
+      if (error instanceof Error && error.message === "NO_INTAKE") {
+        sendError(res, "NOT_FOUND", "This application has no intake questions", 404);
+        return;
+      }
+      // Never log the answers: they are personal data.
+      console.error("Error saving application intake:", error instanceof Error ? error.message : "unknown");
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /applications/:id/through-country  (issue #235, P6 of #228)
+   * Body `{ throughCountryCode }`. Change the member country a shared-route
+   * application goes through, BEFORE submission. Needs `update` access.
+   * Answers `{ changed, application, answersKept, answersSetAside }`.
+   * 404 unknown application or route; 403 no access; 400 bad code or body;
+   * 409 NOT_SHARED_ROUTE / NOT_EDITABLE / ALREADY_PAID; 422
+   * COUNTRY_NOT_A_DESTINATION (not a member of the route today) /
+   * COUNTRY_NOT_OFFERED (no record this case may use).
+   */
+  async changeThroughCountry(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "update")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? (req.body as Record<string, unknown>) : {};
+      const extra = Object.keys(body).find((k) => k !== "throughCountryCode");
+      if (extra) {
+        sendError(res, "VALIDATION_ERROR", `"${extra}" is not a known field`, 400);
+        return;
+      }
+      const result = await competenceService.changeThroughCountry(application, body.throughCountryCode, { uid: req.userId!, role: req.authz?.role });
+      sendSuccess(res, { ...result, application: withThroughCountryFlag(result.application) });
+    } catch (error) {
+      if (error instanceof CompetenceError) {
+        sendError(res, error.code, error.message, error.status);
+        return;
+      }
+      // Never log answers: they are personal data.
+      console.error("Error changing the country applied through:", error instanceof Error ? error.message : "unknown");
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /applications/:id/answers  (issue #187)
+   * `{ answers: { [checklistItemId]: { answerType, value, text, legacy?, updatedAt } } }`
+   * (shapes in services/answer-values.ts; a legacy plain-string answer is
+   * re-read as the item's type with `legacy: true`). Needs `read` access. Not
+   * affected by the edit window.
+   */
+  async getAnswers(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "read")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      sendSuccess(res, { answers: await answersService.getAnswers(application) });
+    } catch (error) {
+      console.error("Error getting application answers:", error instanceof Error ? error.message : "unknown");
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /applications/:id/answers/:itemId  (issue #187)
+   * Body `{ value }` whose shape follows the item's `answerType` (date,
+   * date_range, money, address, list, text; see services/answer-values.ts);
+   * `{ text }` is still accepted as the value (back-compat). An empty value
+   * clears. Needs `update` access. 400 VALIDATION_ERROR (message names the bad
+   * field) for a bad value / unknown item / document item;
+   * 409 ANSWERS_LOCKED once the application is past the same editable window
+   * the statement uses (STATEMENT_LOCKED). The plan read-only block is the
+   * global one in verifyAuth (402).
+   */
+  async saveAnswer(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await applicationService.getApplicationById(req.params.id);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      if (!checkApplicationAccessForRequest(req, application, "update")) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      if (!isWithinApplicantEditWindow(application.status)) {
+        sendError(
+          res,
+          "ANSWERS_LOCKED",
+          "Your answers can no longer be edited because your application is already under review.",
+          409
+        );
+        return;
+      }
+      // `value` is the contract; `text` is the pre-types body, still accepted.
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      if (!("value" in body) && !("text" in body)) {
+        sendError(res, "VALIDATION_ERROR", "\"value\" is required", 400);
+        return;
+      }
+      const raw = "value" in body ? body.value : body.text;
+      sendSuccess(res, await answersService.saveAnswer(application, req.params.itemId, raw, req.userId!));
+    } catch (error) {
+      if (error instanceof AnswerValidationError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      // Never log the answer text: it is personal data.
+      console.error("Error saving application answer:", error instanceof Error ? error.message : "unknown");
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }
@@ -522,7 +842,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -562,6 +882,12 @@ export class ApplicationController {
       // assigned such a case. Admins bypass; the applicant editing their own
       // notes is unaffected (no assignment change).
       const isAdmin = req.user?.admin === true || req.authz?.role === "admin";
+      // A non-admin may place a case only in their OWN agency (the resolved
+      // principal's), never in one named freely in the request (issue #138).
+      if (!isAdmin && updates.agencyId !== undefined && updates.agencyId !== req.authz?.agencyId) {
+        sendError(res, "FORBIDDEN", "You can only assign a case to your own agency", 403);
+        return;
+      }
       const isAssigning =
         updates.agencyId !== undefined ||
         updates.agentId !== undefined ||
@@ -627,7 +953,7 @@ export class ApplicationController {
           .catch((e) => console.error("[application] assign notify failed:", e));
       }
 
-      sendSuccess(res, updated, "Application updated successfully");
+      sendSuccess(res, updated ? withThroughCountryFlag(updated) : updated, "Application updated successfully");
     } catch (error) {
       console.error("Error updating application:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -668,7 +994,7 @@ export class ApplicationController {
 
       // Only the case's agent/owner/admin can request documents — not the client.
       const isApplicant = application.userId === userId;
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess || isApplicant) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -769,6 +1095,10 @@ export class ApplicationController {
    * PUT /applications/:id/status
    * Update application status.
    * Owner can only withdraw. Agent/admin can set any status.
+   *
+   * Applicant path (#259): only `withdrawn`, only while the application is
+   * still open (409 INVALID_STATUS_TRANSITION once it is closed), and the
+   * body's `currentStep` / `nextStep` / `rejectionReason` are ignored.
    */
   async updateStatus(
     req: AuthenticatedRequest,
@@ -793,17 +1123,27 @@ export class ApplicationController {
 
       const isApplicant = application.userId === userId;
       const isAdmin = !!req.user?.admin;
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
 
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
 
-      // Applicants can only withdraw their own applications
-      if (isApplicant && !isAdmin && status !== "withdrawn") {
-        const isAgentToo = application.agentId === userId;
-        if (!isAgentToo) {
+      // ============================================
+      // Applicant path (issue #259)
+      // ============================================
+      // The caller is the application's own applicant, and is neither an admin
+      // nor the application's agent. (An agent who is also the applicant of
+      // their own case keeps the agent path, as before.) Everything in this
+      // block applies ONLY to that caller: agents and admins fall straight
+      // through to the unchanged call below.
+      const isApplicantPath =
+        isApplicant && !isAdmin && application.agentId !== userId;
+
+      if (isApplicantPath) {
+        // 1. The only status an applicant may set is `withdrawn` (unchanged rule).
+        if (status !== "withdrawn") {
           sendError(
             res,
             "FORBIDDEN",
@@ -812,19 +1152,39 @@ export class ApplicationController {
           );
           return;
         }
+
+        // 2. A closed application cannot be withdrawn: not one that was
+        //    decided (approved / rejected), one that lapsed (expired), nor one
+        //    already withdrawn. Without this an applicant could turn a granted
+        //    visa into "withdrawn", and a repeated withdraw added a second
+        //    timeline entry. Checked BEFORE any write, so a refusal stores
+        //    nothing (no status, no timeline entry, no activity note).
+        if (TERMINAL_STATUSES.includes(application.status)) {
+          sendError(
+            res,
+            "INVALID_STATUS_TRANSITION",
+            "This application is already closed.",
+            409
+          );
+          return;
+        }
       }
 
-      // Resolve the acting agent's name so the activity note attributes the change.
+      // Resolve the acting user's name so the activity note attributes the change.
       const actorName = await userService.getDisplayName(userId);
       const updated = await applicationService.updateStatus(id, status, {
-        currentStep,
-        nextStep,
-        rejectionReason,
+        // 3. Applicant path: the body's `currentStep`, `nextStep` and
+        //    `rejectionReason` are dropped. Those are the handler's fields (an
+        //    agent or admin records a step or a refusal reason); an applicant
+        //    must not be able to write them onto their own case, and the
+        //    reason would otherwise land in the activity note as "Reason: …".
+        //    Agents and admins: passed through exactly as before.
+        ...(isApplicantPath ? {} : { currentStep, nextStep, rejectionReason }),
         actorId: userId,
         actorName,
       });
 
-      sendSuccess(res, updated, "Status updated successfully");
+      sendSuccess(res, updated ? withThroughCountryFlag(updated) : updated, "Status updated successfully");
     } catch (error) {
       console.error("Error updating status:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -849,7 +1209,7 @@ export class ApplicationController {
         return;
       }
 
-      const hasAccess = this.checkApplicationAccess(req, application);
+      const hasAccess = checkApplicationAccessForRequest(req, application);
       if (!hasAccess) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -867,22 +1227,11 @@ export class ApplicationController {
   // HELPER METHODS
   // ============================================
 
-  /**
-   * Check if the request's principal can access an application.
-   *
-   * Now delegates to the shared CASL ability (`req.ability`, built from the role
-   * claim in `verifyAuth`) instead of re-deriving access ad-hoc. The "read" grant
-   * encodes the same rule that used to be inlined here: admin (manage all),
-   * applicant (own `userId`), assigned agent (`agentId`), and same-agency members
-   * (owner/agent on matching `agencyId`).
-   */
-  private checkApplicationAccess(
-    req: AuthenticatedRequest,
-    application: Application,
-    action: "read" | "update" | "delete" = "read"
-  ): boolean {
-    return can(req, action, asSubject("Application", application as unknown as Record<string, unknown>));
-  }
+  // NOTE (#29): the application access check that used to live here as a
+  // private method is now the shared `checkApplicationAccess` in
+  // `utils/access.ts` (same rule, same CASL ability). Handlers call it through
+  // `checkApplicationAccessForRequest(req, application)`, which reads
+  // `req.ability`; triggers and the AI routes call it without a request.
 
   /**
    * Count non-terminal ("active") applications for a scope, used for the
@@ -917,6 +1266,11 @@ export class ApplicationController {
    * NOTE `Application.agentId` is a USER uid (unlike Conversation.agentId, which
    * is an agent DOC id), so agents are resolved by querying on `userId`.
    */
+  /** (#237) Add the app-facing `stackLayers` to an intake response (from its `layers`; omitted on a single-layer route). */
+  private async withStackLayers<T extends { layers?: RulebookStackLayer[] }>(intake: T): Promise<T & { stackLayers?: PublicStackLayer[] }> {
+    return { ...intake, ...(await stackLayersField(intake.layers)) };
+  }
+
   private async withHandlerNames(
     applications: Application[]
   ): Promise<Application[]> {
@@ -991,19 +1345,6 @@ export class ApplicationController {
     } catch {
       return undefined;
     }
-  }
-
-  /**
-   * Get agent document for a userId
-   */
-  private async getAgentForUser(userId: string): Promise<Agent | null> {
-    const snapshot = await collections.agents
-      .where("userId", "==", userId)
-      .limit(1)
-      .get();
-
-    if (snapshot.empty) return null;
-    return snapshot.docs[0].data() as Agent;
   }
 }
 

@@ -1,9 +1,14 @@
 /**
  * Document instance routes — editable documents cloned from templates.
  *
- * All routes require an authenticated agent-side user (agent/owner/admin).
- * Per-document ownership is enforced in the controller via the shared CASL
- * "Document" ability; the read-only-plan 402 gate is applied in `verifyAuth`.
+ * Agent-side routes require an authenticated agent-side user (agent/owner/admin);
+ * per-document ownership is enforced in the controller via the shared CASL
+ * "Document" ability, and the read-only-plan 402 gate is applied in `verifyAuth`.
+ *
+ * The `/shared` routes are the exception: they are read-only and CLIENT-facing,
+ * returning only documents an agent has explicitly shared on a case the caller
+ * owns. See the controller's "client-facing reads" section for why they don't
+ * reuse the CASL ability.
  *
  * NOTE: the static `/:id/versions` route is registered before the bare `/:id`
  * handlers by virtue of Express matching the more specific path first for GET;
@@ -15,13 +20,35 @@ import { verifyAuth, verifyAgent } from "../middleware/auth";
 
 const router = Router();
 
+// --- Client-facing reads ----------------------------------------------------
+// Registered FIRST so `/shared` is matched literally instead of being swallowed
+// by the `/:id` handlers below. `verifyAgent` is deliberately absent: these are
+// the routes a CLIENT uses to read documents their agency shared with them, and
+// the controller authorizes by ownership of the linked application.
+
+// GET /document-instances/shared?applicationId= — documents shared with the client
+router.get("/shared", verifyAuth, (req, res) =>
+  documentInstanceController.listShared(req, res)
+);
+
+// GET /document-instances/shared/:id — one shared document, with content
+router.get("/shared/:id", verifyAuth, (req, res) =>
+  documentInstanceController.getShared(req, res)
+);
+
+// The next four routes (list, create, get-one, save) are open to authenticated
+// APPLICANTS as well as agent-side users: `verifyAgent` is intentionally absent
+// and the controller branches on the caller. An applicant is held to their own
+// statement only (#43); agent-side behaviour is unchanged. Link, share, delete
+// and versions below stay agent-only.
+
 // GET /document-instances — list (scoped by role / applicationId)
-router.get("/", verifyAuth, verifyAgent, (req, res) =>
+router.get("/", verifyAuth, (req, res) =>
   documentInstanceController.list(req, res)
 );
 
 // POST /document-instances — clone a template into an editable instance
-router.post("/", verifyAuth, verifyAgent, (req, res) =>
+router.post("/", verifyAuth, (req, res) =>
   documentInstanceController.clone(req, res)
 );
 
@@ -31,12 +58,12 @@ router.get("/:id/versions", verifyAuth, verifyAgent, (req, res) =>
 );
 
 // GET /document-instances/:id — one instance (with content)
-router.get("/:id", verifyAuth, verifyAgent, (req, res) =>
+router.get("/:id", verifyAuth, (req, res) =>
   documentInstanceController.getOne(req, res)
 );
 
 // PUT /document-instances/:id — save (optimistic concurrency)
-router.put("/:id", verifyAuth, verifyAgent, (req, res) =>
+router.put("/:id", verifyAuth, (req, res) =>
   documentInstanceController.save(req, res)
 );
 

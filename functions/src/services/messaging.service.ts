@@ -1,5 +1,5 @@
 import { collections, subcollections, db, increment } from "../utils/firebase";
-import { Conversation, Message } from "../types";
+import { Conversation, ConversationStartedBy, Message } from "../types";
 import { Timestamp } from "firebase-admin/firestore";
 
 class MessagingService {
@@ -46,11 +46,31 @@ class MessagingService {
 
   /**
    * Create or get existing conversation between a user and agent.
+   *
+   * Issue #321: a NEW conversation records which side opened it
+   * (`startedBy`). An agent can open a conversation with any uid, so the
+   * agent-booking relationship check (`isClientOfAgent`, consultation
+   * controller) counts a conversation only when the CLIENT started it or has
+   * sent a message in it.
+   *
+   * `startedBy` is written ONLY when the conversation is created. An existing
+   * conversation is returned untouched, so an agent-started one never turns
+   * into a client-started one because the client later opened the same chat
+   * (it starts to count when the client sends a message).
+   *
+   * @param userId the client's user uid
+   * @param agentId the agent DOCUMENT id (not a user uid)
+   * @param applicationId the application the chat is about, if any
+   * @param startedBy which side is opening it. Defaults to "agent", the side
+   *   that does NOT count as a relationship, so a caller that does not say
+   *   can never create one by accident. Only the client-initiated path of
+   *   POST /conversations passes "user".
    */
   async getOrCreateConversation(
     userId: string,
     agentId: string,
-    applicationId?: string
+    applicationId?: string,
+    startedBy: ConversationStartedBy = "agent"
   ): Promise<Conversation> {
     // Check for existing conversation
     let query = collections.conversations
@@ -63,6 +83,7 @@ class MessagingService {
 
     const existing = await query.limit(1).get();
     if (!existing.empty) {
+      // Returned as stored: `startedBy` is never rewritten (see above).
       return existing.docs[0].data() as Conversation;
     }
 
@@ -74,6 +95,8 @@ class MessagingService {
       userId,
       agentId,
       applicationId,
+      // Issue #321: who opened it, fixed at creation.
+      startedBy,
       lastMessageAt: now,
       unreadCountUser: 0,
       unreadCountAgent: 0,
@@ -145,6 +168,51 @@ class MessagingService {
 
     await batch.commit();
     return message;
+  }
+
+  /**
+   * Conversations whose most recent message landed inside `[notBefore, olderThan]`
+   * — the window the unread-message reminder scheduler sweeps.
+   *
+   * WHY A WINDOW AND NOT JUST "OLDER THAN AN HOUR": an open-ended `<=` would match
+   * every conversation ever, and the sweep would grow without bound as the product
+   * ages. The lower bound keeps each run proportional to recent traffic instead.
+   * It also caps how late a nudge can arrive: if the scheduler is down for longer
+   * than the window, those conversations age out rather than producing a burst of
+   * stale "you have a new message" emails days after the fact.
+   *
+   * Both bounds are on the SAME field, so this needs no composite index. Unread
+   * counts and per-side reminder stamps are filtered by the caller in memory.
+   */
+  async findConversationsWithRecentMessages(
+    notBefore: Date,
+    olderThan: Date
+  ): Promise<Conversation[]> {
+    const snapshot = await collections.conversations
+      .where("lastMessageAt", ">=", Timestamp.fromDate(notBefore))
+      .where("lastMessageAt", "<=", Timestamp.fromDate(olderThan))
+      .get();
+
+    return snapshot.docs.map((doc) => doc.data() as Conversation);
+  }
+
+  /**
+   * Stamp that the unread-message reminder was emailed to one side.
+   *
+   * Written AFTER a successful send so a crash mid-run retries next tick rather
+   * than silently swallowing the nudge. Deliberately does NOT touch `updatedAt`:
+   * this is scheduler bookkeeping, not conversation activity, and bumping the
+   * timestamp would reorder the user's thread list for no reason.
+   */
+  async recordUnreadReminderSent(
+    conversationId: string,
+    side: "user" | "agent"
+  ): Promise<void> {
+    const field =
+      side === "agent" ? "unreadReminderSentAtAgent" : "unreadReminderSentAtUser";
+    await collections.conversations.doc(conversationId).update({
+      [field]: Timestamp.now(),
+    });
   }
 
   /**

@@ -28,8 +28,19 @@ export interface ResolvedEventEmail {
 }
 
 interface EventTemplate {
-  subject: string;
+  /**
+   * Fixed inbox subject. Optional (issue #101): when omitted, the call site's
+   * `title` is the subject, for events whose subject must name something
+   * dynamic (e.g. the agency visa a review decision is about).
+   */
+  subject?: string;
   actionLabel: string;
+  /**
+   * When true the email carries NO button or link (resolved `actionUrl` is "").
+   * For events a mobile-only applicant gets: the portal paths above would not
+   * work for them, and no mobile universal link exists yet (issue #266).
+   */
+  noLink?: boolean;
   /** Relative path (joined to APP_URL) for the CTA, derived from the context. */
   path?: (ctx: EventEmailContext) => string | undefined;
 }
@@ -49,6 +60,13 @@ const agencyReviewPath = (ctx: EventEmailContext): string =>
   ctx.relatedEntityType === "agency" && ctx.relatedEntityId
     ? `/admin/agencies/${ctx.relatedEntityId}`
     : "/admin/agencies";
+
+/**
+ * Portal path of the agency's "Our visas" screen (issue #104), the CTA target
+ * of the agency visa review emails (issue #101). Keep in step with the
+ * portal route.
+ */
+export const AGENCY_VISAS_PATH = "/our-visas";
 
 /**
  * Subject + CTA per event type. Keep subjects specific (they're what users scan in
@@ -102,10 +120,29 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     actionLabel: "View case",
     path: casePath,
   },
+  assessment_rules_updated: {
+    subject: "Rules changed: a case needs your review",
+    actionLabel: "View case",
+    path: casePath,
+  },
+  // No fixed subject: the call site's title names the route the change is about.
+  rule_change_alert: {
+    actionLabel: "View case",
+    path: casePath,
+  },
   application_withdrawn: {
     subject: "An application was withdrawn",
     actionLabel: "View case",
     path: casePath,
+  },
+
+  // Self-service readiness review (#266). The applicant uses the mobile app, so
+  // there is no web link: the body tells them to open the Seli app. Only this
+  // type has an email; the document-check notices are app-only.
+  readiness_review_ready: {
+    subject: "Your readiness review is ready",
+    actionLabel: "Open Seli",
+    noLink: true,
   },
 
   // Documents
@@ -143,6 +180,17 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
   },
   consultation_completed: {
     subject: "Your consultation is complete",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
+  // Issue #317: consultation refunds.
+  consultation_refunded: {
+    subject: "Your consultation refund",
+    actionLabel: "Open dashboard",
+    path: () => "/dashboard",
+  },
+  consultation_refund_delayed: {
+    subject: "Your refund is delayed",
     actionLabel: "Open dashboard",
     path: () => "/dashboard",
   },
@@ -226,6 +274,22 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     path: () => "/account-settings?tab=agencyProfile",
   },
 
+  // Agency-created visas (issue #101). No fixed subject: the title names the
+  // visa ("Seli approved <visa name>"), so it is the subject. The CTA opens
+  // the agency's "Our visas" screen in the portal (#104).
+  agency_visa_approved: {
+    actionLabel: "View your visas",
+    path: () => AGENCY_VISAS_PATH,
+  },
+  agency_visa_rejected: {
+    actionLabel: "Edit your visa",
+    path: () => AGENCY_VISAS_PATH,
+  },
+  agency_visa_made_global: {
+    actionLabel: "View your visas",
+    path: () => AGENCY_VISAS_PATH,
+  },
+
   // Compliance (agency KYC/KYB/payout)
   compliance_submitted: {
     // Sent to admins when an owner submits their compliance file for review.
@@ -286,6 +350,15 @@ const TEMPLATES: Partial<Record<NotificationType, EventTemplate>> = {
     path: () => "/dashboard",
   },
 
+  // Messaging — the "you have an unread message" nudge. The CTA has no `path`
+  // because the right destination differs per recipient (clients read threads at
+  // /client/messages, agents at /messaging); the scheduler resolves the correct
+  // one and passes it as an explicit `actionUrl`, which wins over any path here.
+  message_unread_reminder: {
+    subject: "You have a new message",
+    actionLabel: "Read message",
+  },
+
   // Account security — "your password was changed" heads-up (via notifyUser). The
   // CTA is intentionally generic (there's no in-app deep link that fits every
   // client): it just opens Seli so a user who didn't make the change can react.
@@ -314,6 +387,7 @@ export function resolveEventEmail(
     subject: template?.subject ?? ctx.title,
     actionLabel: template?.actionLabel ?? `Open ${EMAIL_BRANDING.appName}`,
     // Caller's explicit deep link wins; else the template's path; else app home.
-    actionUrl: ctx.actionUrl ?? toUrl(template?.path?.(ctx)) ?? EMAIL_BRANDING.appUrl,
+    // `noLink` templates never carry a link, even if the caller passed one.
+    actionUrl: template?.noLink ? "" : ctx.actionUrl ?? toUrl(template?.path?.(ctx)) ?? EMAIL_BRANDING.appUrl,
   };
 }

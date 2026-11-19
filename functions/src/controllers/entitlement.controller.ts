@@ -2,8 +2,10 @@ import { Response, Request } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { entitlementService } from "../services/entitlement.service";
 import { billingService } from "../services/billing/billing.service";
-import { paystackProvider } from "../services/billing/paystack.provider";
+import { paystackProvider, toTransactionLookup } from "../services/billing/paystack.provider";
 import { settlePaymentRequest } from "../services/payment-request-settlement.service";
+// Issue #317: consultation refund webhooks (refund.pending/processing/processed/failed).
+import { consultationRefundService } from "../services/consultation-refund.service";
 import { collections } from "../utils/firebase";
 import { Timestamp } from "firebase-admin/firestore";
 import {
@@ -16,6 +18,8 @@ import {
   PlanInterval,
 } from "@durin-tech/authz";
 import { StoredPlan } from "../types/billing";
+// Issue #252: optional `returnTo: "app"` → Paystack returns to the app return page.
+import { parseReturnTo, selectCallbackUrl } from "../services/billing/payment-return";
 import { sendSuccess, sendError, ErrorMessages } from "../utils/response";
 
 const SUBSCRIBER_TYPES: SubscriberType[] = ["agency", "agent", "client"];
@@ -265,9 +269,16 @@ export class EntitlementController {
         sendError(res, "UNAUTHORIZED", "Not authenticated", 401);
         return;
       }
-      const { planId } = req.body as { planId?: string };
+      const { planId, returnTo: rawReturnTo } = req.body as { planId?: string; returnTo?: unknown };
       if (!planId) {
         sendError(res, "VALIDATION_ERROR", "planId is required", 400);
+        return;
+      }
+      // Issue #252: the mobile app opts in with `returnTo: "app"`. Absent =
+      // the portal flow, unchanged (provider default PAYSTACK_CALLBACK_URL).
+      const returnTo = parseReturnTo(rawReturnTo);
+      if (!returnTo.ok) {
+        sendError(res, "VALIDATION_ERROR", "returnTo must be \"app\" when given", 400);
         return;
       }
       const subscriber = entitlementService.resolveSubscriber(req.authz);
@@ -280,11 +291,14 @@ export class EntitlementController {
         sendError(res, "VALIDATION_ERROR", "A billing email is required", 400);
         return;
       }
+      // `callbackUrl` undefined (no returnTo) → provider default applies.
+      const callbackUrl = selectCallbackUrl(returnTo.value);
       const session = await billingService.createCheckout(
         subscriber.type,
         subscriber.id,
         planId,
-        email
+        email,
+        { callbackUrl }
       );
       // A free-plan switch is applied immediately (no redirect); a paid plan
       // returns a hosted checkout URL to send the user to.
@@ -465,6 +479,10 @@ export class EntitlementController {
           reference?: string;
           status?: string;
           metadata?: Record<string, unknown>;
+          amount?: unknown;
+          requested_amount?: unknown;
+          currency?: unknown;
+          paid_at?: unknown;
         };
       };
 
@@ -489,16 +507,29 @@ export class EntitlementController {
       // status is checked anyway rather than trusting the event name alone.
       if (body.data?.status && body.data.status !== "success") return false;
 
-      const outcome = await settlePaymentRequest(paymentRequestId, reference);
-      if (outcome.alreadySettled) {
+      // Issue #181: what Paystack charged (amount / requested_amount,
+      // currency, paid_at) is read from the SIGNED payload exactly as verify
+      // reads its lookup, and the settlement only settles when it equals
+      // what the paid checkout asked. A missing amount or currency is a
+      // mismatch, never a match.
+      const reported = toTransactionLookup({ ...body.data, status: "success" });
+      const outcome = await settlePaymentRequest(paymentRequestId, reference, reported);
+      if (!outcome) {
+        console.error(
+          `[webhook] payment request ${paymentRequestId} not found for reference ${reference}.`
+        );
+      } else if (outcome.kind === "already_paid") {
         // Expected whenever the client DID return — verify-on-return got there
         // first. Not an error.
         console.log(
           `[webhook] payment request ${paymentRequestId} already settled; ignoring.`
         );
-      } else if (!outcome.request) {
+      } else if (outcome.kind === "mismatch" || outcome.kind === "not_chargeable" || outcome.kind === "unknown_reference") {
+        // Not settled and not marked paid: money we cannot place. Logged for
+        // a human (the payload amount is in the log; no secrets).
         console.error(
-          `[webhook] payment request ${paymentRequestId} not found for reference ${reference}.`
+          `[webhook] payment request ${paymentRequestId} charge ${reference} NOT settled (${outcome.kind}): ` +
+            `Paystack reported ${reported.requestedAmount ?? reported.amount ?? "no amount"} ${reported.currency ?? "no currency"}`
         );
       }
       return true;
@@ -528,6 +559,23 @@ export class EntitlementController {
       // forged payload AND for a valid non-subscription charge, so its null
       // cannot be treated as "unauthentic" here.
       if (paystackProvider.verifyWebhookSignature(headers, raw)) {
+        // ── Consultation refunds (issue #317) ─────────────────────────────
+        // Handled first, before payment requests and subscriptions: a
+        // `refund.*` event is never one of theirs. The signature was
+        // verified just above. A repeated or out-of-order event, or one for
+        // a refund we do not know, writes nothing and still answers 200.
+        let parsed: { event?: unknown; data?: unknown } | null = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = null;
+        }
+        if (parsed && typeof parsed.event === "string" && parsed.event.startsWith("refund.")) {
+          const outcome = await consultationRefundService.handleWebhook(parsed);
+          res.status(200).json({ received: true, applied: outcome === "applied" });
+          return;
+        }
+
         const settled = await this.settlePaymentRequestFromWebhook(raw);
         if (settled) {
           res.status(200).json({ received: true, applied: true });

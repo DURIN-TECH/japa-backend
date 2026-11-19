@@ -8,15 +8,76 @@ import {
 import { storageService } from "./storage.service";
 import { noteService } from "./note.service";
 import { userService } from "./user.service";
+import {
+  DEFAULT_AI_SETTINGS,
+  FILE_HEAD_BYTES,
+  fileByteLimitForBytes,
+  megabytesLabel,
+  readAiSettings,
+  smallestFileByteLimit,
+  startsLikePdf,
+} from "./ai/ai-settings";
+import {
+  requireRequestedPath,
+  requireStoredPath,
+  validateStoragePath,
+} from "../utils/storage-paths";
 
 const db = getFirestore();
+
+// ============================================
+// Upload size limit (issue #310)
+// ============================================
+
+/** Bytes in one megabyte, for the stored `fileSizeMb`. */
+const BYTES_PER_MB = 1024 * 1024;
+
+/**
+ * Thrown by `createDocument` when the uploaded object is larger than the
+ * product supports. By the time it is thrown the object has been deleted and
+ * no document record exists. The controller maps it to 413 `FILE_TOO_LARGE`.
+ *
+ * `message` is the plain line shown to the person who uploaded the file. It
+ * names the limit that applied to THIS file (10 MB for a real PDF, the lower
+ * limit for anything else), so a client can show it as is.
+ */
+export class FileTooLargeError extends Error {
+  constructor(
+    /** The limit that applied to this file, in bytes. */
+    readonly maxBytes: number,
+    /** The object's real size, in bytes, as Cloud Storage reported it. */
+    readonly sizeBytes: number,
+    /** True when the file's bytes are a PDF (so the higher limit applied). */
+    readonly isPdf: boolean
+  ) {
+    super(
+      `This file is larger than ${megabytesLabel(maxBytes)}. ` +
+        "Upload a smaller copy, for example a scan at a lower resolution."
+    );
+    this.name = "FileTooLargeError";
+  }
+}
+
+/**
+ * A real byte length as the megabytes stored on the document: three decimals
+ * (1 KB steps), and never 0 for a file that has bytes, so a tiny file does not
+ * read as "empty".
+ */
+export function megabytesFromBytes(bytes: number): number {
+  if (bytes <= 0) return 0;
+  return Math.max(0.001, Math.round((bytes / BYTES_PER_MB) * 1000) / 1000);
+}
 
 export interface CreateDocumentInput {
   applicationId: string;
   requirementId: string;
   fileName: string;
   fileType: string;
-  fileSizeMb: number;
+  /**
+   * IGNORED since #310. Older clients still send the size they measured; the
+   * stored `fileSizeMb` is always the real size read from Cloud Storage.
+   */
+  fileSizeMb?: number;
   storagePath: string;
 
   // Optional descriptive metadata. Self-serve client uploads send none of this;
@@ -143,7 +204,7 @@ export class DocumentService {
       requirementId,
       fileName,
       fileType,
-      fileSizeMb,
+      // `input.fileSizeMb` is deliberately not read: see the size check below.
       storagePath,
       documentType,
       displayName,
@@ -155,11 +216,72 @@ export class DocumentService {
     const applicationRef = db.collection("applications").doc(applicationId);
     const { ownerUserId } = await this.resolveUploadTarget(applicationId, actor);
 
-    // Verify the file exists in storage
-    const fileExists = await storageService.fileExists(storagePath);
-    if (!fileExists) {
+    // The path comes from the request, so it is validated like any other
+    // input (issue #141): it must be exactly an object the upload-url endpoint
+    // would have issued for THIS application — i.e. inside the client's own
+    // folder for this application (`documents/{clientUid}/{applicationId}/`).
+    // `ownerUserId` is read from the application document above, and the
+    // caller has already been authorised for that application, so the same
+    // rule covers self-uploads and uploads by staff on the client's behalf.
+    // Throws StoragePathRejectedError (→ 400) BEFORE anything is looked up in
+    // the bucket or written, for every role including admin.
+    const validatedPath = requireRequestedPath(storagePath, {
+      purpose: "application-document",
+      ownerUserId,
+      applicationId,
+    });
+
+    // ---- The object must exist, and its REAL size must be within the limit (#310) ----
+    // The size comes from Cloud Storage's own metadata, never from the request:
+    // the signed upload URL carries no size range, and a client-supplied
+    // `fileSizeMb` was stored as sent (a 21 MB object was once registered as
+    // 0.001 MB). A missing object (a path that was issued but never uploaded
+    // to) is the caller's mistake: "File not found in storage" -> 400.
+    const stored = await storageService.getFileMetadata(validatedPath);
+    if (!stored) {
       throw new Error("File not found in storage");
     }
+
+    // The limit is decided by the SAME function the readiness review applies
+    // to each file (ai-settings.ts, fileByteLimitForBytes), from the same
+    // settings and from the file's OWN first bytes, so a file accepted here is
+    // never "too large" for the review. The declared type (the content type
+    // the upload URL was signed for, or the request's `fileType`) is not used:
+    // a client can label a photo as a PDF, or send no usable type at all.
+    //
+    // A failed settings read falls back to the code defaults: unlike the
+    // review (which fails closed so an admin's "off" is respected), an upload
+    // must not be blocked because Firestore blinked, and the review re-checks
+    // every file's bytes anyway.
+    const settingsRead = await readAiSettings();
+    const limitSettings = settingsRead.ok ? settingsRead.settings : DEFAULT_AI_SETTINGS;
+    // A file at or under the smallest limit passes whatever it is, so its
+    // bytes are only read (one small ranged request) when the answer or the
+    // message depends on them.
+    let maxBytes = smallestFileByteLimit(limitSettings);
+    let isPdf = false;
+    if (stored.size > maxBytes) {
+      const head = await storageService.readFileHead(validatedPath, FILE_HEAD_BYTES, stored.size);
+      isPdf = startsLikePdf(head);
+      maxBytes = fileByteLimitForBytes(limitSettings, head);
+    }
+    if (stored.size > maxBytes) {
+      // Remove the oversized object so it does not sit in the bucket with no
+      // record pointing at it. One guard first: if a document record already
+      // points at this exact object (it was registered before this check
+      // existed), deleting it would break that record's download, so it is
+      // left alone and only this registration is refused.
+      const alreadyRegistered = await this.collection
+        .where("storageUrl", "==", validatedPath)
+        .limit(1)
+        .get();
+      if (alreadyRegistered.empty) {
+        await storageService.deleteFile(validatedPath);
+      }
+      throw new FileTooLargeError(maxBytes, stored.size, isPdf);
+    }
+    // What is stored from here on is the real size.
+    const fileSizeMb = megabytesFromBytes(stored.size);
 
     // Staff uploading for a client must say why — this is the whole point of the
     // audit trail, so it is enforced here rather than left to the form.
@@ -180,7 +302,9 @@ export class DocumentService {
       fileName,
       fileType,
       fileSizeMb,
-      storageUrl: storagePath,
+      // Despite the field name this is the bucket-relative object path, and
+      // only ever a validated one.
+      storageUrl: validatedPath,
       status: "uploaded",
       resubmissionCount: 0,
       uploadedAt: now,
@@ -396,11 +520,32 @@ export class DocumentService {
       throw new Error("Cannot delete document in current status");
     }
 
-    // Delete from storage
-    await storageService.deleteFile(document.storageUrl);
+    // Delete from storage — but only an object that really is this
+    // document's upload (issue #141). The stored path is re-validated against
+    // the record's owner and application; if it does not pass (a record
+    // written before paths were validated, or a seeded placeholder), the
+    // record is still removed so the user can clear it, and the object it
+    // pointed at is left untouched.
+    const stored = validateStoragePath(document.storageUrl, {
+      purpose: "application-document",
+      ownerUserId: document.userId,
+      applicationId: document.applicationId,
+    });
+    if (stored.ok) {
+      await storageService.deleteFile(stored.key);
+    } else {
+      console.warn(
+        `[document] ${documentId}: stored path failed validation (${stored.issue}); ` +
+          "deleting the record only, not the object"
+      );
+    }
 
     // Delete the document record
     await docRef.delete();
+
+    // Its per-upload check (issue #115) holds values read from the file: it goes
+    // with the document. Best effort: a missing check is not an error.
+    await db.collection("documentChecks").doc(documentId).delete().catch((e) => console.error("[document] deleting its check failed:", e));
 
     // Update application document counts
     const applicationRef = db.collection("applications").doc(document.applicationId);
@@ -451,7 +596,19 @@ export class DocumentService {
       throw new Error("Unauthorized");
     }
 
-    return storageService.getSignedDownloadUrl(document.storageUrl);
+    // Re-validate the STORED path at read time (issue #141). Access to the
+    // record was decided above; this decides whether the record points at an
+    // object that belongs to it: inside the document owner's folder for this
+    // application. A record that fails (written before registration validated
+    // paths, or a seeded placeholder) is never signed, for any caller —
+    // throws StoredPathInvalidError (→ 409).
+    const validatedPath = requireStoredPath(document.storageUrl, {
+      purpose: "application-document",
+      ownerUserId: document.userId,
+      applicationId: document.applicationId,
+    });
+
+    return storageService.getSignedDownloadUrl(validatedPath);
   }
 }
 

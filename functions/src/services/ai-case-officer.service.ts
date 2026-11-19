@@ -1,0 +1,1507 @@
+import { Timestamp, type Transaction } from "firebase-admin/firestore";
+import { getStorage } from "firebase-admin/storage";
+import { collections, db, subcollections } from "../utils/firebase";
+// (#234) Membership on a date (pure) for `members_of` groups; the AuthorityMember shape.
+import { membersOn } from "../authorities/authority-ids";
+import type { AuthorityMember } from "../types/authority";
+import { factsFromApplicantFacts, factsFromNationality, factsSummaryForModel, membershipAuthorityIdsOf, type FactsForRules, type MembershipOnDate } from "./ai/applicant-groups";
+import { layerVersionsOf, rubricRouteKey, rubricStore, sameStackVersions, type RulebookStack, type VisaRubric } from "../scrapers";
+import { defaultRulebookStack, rulebookStackFor, type ApplicationStackRef } from "./ai/application-rulebook";
+import type { Application, Document, DocumentInstance, EligibilityCheck, ProseMirrorDoc, User } from "../types";
+import { buildCountryContext, type CountryContextResult } from "./outcome-statistics/country-context";
+import type {
+  ApplicationAssessment,
+  AssessmentErrorCode,
+  AssessmentNarrative,
+  AssessmentStatus,
+  AssessmentTrigger,
+  AssessmentUsage,
+  AvailableCountryContext,
+} from "../types/assessment";
+import {
+  assembleContent,
+  assessmentIdFor,
+  buildJudgementRequest,
+  computeInputHash,
+  deriveHolderFact,
+  documentFieldsFor,
+  evaluateObjective,
+  hashStatementContent,
+  barNotAssessedItems,
+  decideMandatoryBars,
+  isJudgedBar,
+  judgementCriteriaOf,
+  mergeJudgementOutputs,
+  // (#308) The one "unread" reason that is not reported to the applicant.
+  NO_FIELD_TO_READ,
+  // (#308) The "unread" reason that gets its own wording (a smaller file helps).
+  FILE_TOO_LARGE,
+  numberStatementBlocks,
+  parseJudgement,
+  planJudgementBatches,
+  topIssuesOf,
+  // (#384) The narrative: request, code checks, and the blocking-rule copy.
+  blockingRuleOf,
+  buildNarrativeRequest,
+  narrativeGroundingOf,
+  parseNarrative,
+  NARRATIVE_TIMEOUT_MS,
+  type NarrativeRequestInput,
+  type AssessmentContent,
+  type AssessmentInputs,
+  type DocumentExtraction,
+  type Facts,
+  type JudgementOutput,
+} from "./ai/assessment-engine";
+import { extractOneDocument, sniffMediaType } from "./ai/document-extraction";
+import { costOfUsage } from "./ai/ai-pricing";
+import { fileByteLimitForBytes, readAiSettings, type AiSettings, type AiSettingsRead } from "./ai/ai-settings";
+import { AnthropicLlmProvider, type LlmProvider, type LlmResponse, type LlmUsage } from "./ai/llm-provider";
+import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-safety";
+import type { AssessmentTier, StaleReason } from "./ai/tier-serializer";
+import { aiActionService } from "./ai-action.service";
+import { notAssessedItems, splitByApplicability } from "./ai/rule-applicability";
+// (#309) The intake's own required-question rule (the one the intake screen's
+// counter uses), read by the "enough to review" gate. Called, never copied.
+import { intakeService } from "./intake.service";
+import type { IntakeResponse } from "../types/intake";
+
+// ============================================
+// AI CASE-OFFICER ASSESSMENT — JOB AND I/O (issue #42)
+// ============================================
+//
+// The engine itself is pure and lives in services/ai/assessment-engine.ts. This
+// file does the I/O around it and runs the job in three stages, cheapest and
+// most certain first:
+//
+//   stage 1  mandatory bars   code only, ZERO model calls; a hit short-circuits
+//   stage 2  objective        one extraction call per document (values only);
+//                             CODE evaluates every check
+//   stage 3  judgement        one call over the statement, profile, intake and
+//                             the stage 2 values; findings are concerns only
+//
+// THE JOB. A request writes `applicationAssessments/{id}` with status `queued`;
+// the id is derived from the inputs, so a second request for the same inputs
+// finds the same document and starts nothing. The Firestore-triggered worker
+// (index.ts, processAssessmentJob) calls `runJob`, which claims the document
+// `queued -> running` in a transaction. No response is ever streamed.
+//
+// THE CAPS. Checked before each model call (ai-settings.ts). A job that would
+// pass a cap fails with its code instead of running unbounded. Since #310 the
+// per-review caps have their own codes (`too_many_documents`,
+// `review_too_large`), decided from counts before the first call; only the
+// platform-wide daily limit is `daily_cap_exceeded`. An attached file is
+// bounded by its real byte length, not counted as input characters, and all of
+// a review's files together by `maxAttachedBytesPerAssessment`.
+//
+// NOTHING ELSE SENDS. Model output is never used as a storage path, a user id,
+// an application id or a criterion that the rubric does not contain.
+
+/** Fixed time budget for the whole job, under the worker's 540 s timeout. */
+const JOB_BUDGET_MS = 480_000;
+/** No judgement call starts after this much time has gone. */
+const JUDGEMENT_START_LIMIT_MS = 360_000;
+/**
+ * (#384) Time kept back, after the narrative's hard bound, for what the job
+ * still does once the narrative is settled: the country-context lookup and the
+ * `storeContent` write. The narrative's bound is
+ * `min(NARRATIVE_TIMEOUT_MS, JOB_BUDGET_MS - elapsed - NARRATIVE_MARGIN_MS)`,
+ * so a slow narrative can never push the job past its budget and lose the
+ * findings that are already final.
+ */
+const NARRATIVE_MARGIN_MS = 20_000;
+/**
+ * (#384) The shortest bound worth a narrative call. With less time than this
+ * left the call is not made at all (`narrative: null`, no usage): a call that
+ * would almost surely be cut off is paid for and gives nothing.
+ */
+const NARRATIVE_MIN_MS = 20_000;
+
+/**
+ * (#310) The stored message for `review_too_large`: the review would pass a
+ * per-review cap for a reason other than the number of documents (see the
+ * check before the daily cap in `execute`). Fixed and secret-free.
+ */
+const REVIEW_TOO_LARGE_MESSAGE = "the application is larger than one review can read";
+
+/** A job failure with a stable code. Caught by runJob, which stores it. */
+class JobStop extends Error {
+  constructor(
+    readonly code: AssessmentErrorCode,
+    message: string
+  ) {
+    super(message);
+    this.name = "JobStop";
+  }
+}
+
+/** The approved-rubric read the service needs. Injected so tests can swap it. */
+export interface RubricReader {
+  getApprovedRubric(countryCode: string, visaTypeId: string): Promise<VisaRubric | null>;
+  approvedVersionOf(countryCode: string, visaTypeId: string): Promise<number | null>;
+  // (#233) The application's whole rulebook STACK (shared layer(s) + its own),
+  // merged (services/ai/application-rulebook.ts). Set by the default deps; a
+  // reader without it reads the own layer alone (every route without
+  // inheritance), which is how fakes written before #233 behave.
+  getRulebookStack?(app: ApplicationStackRef): Promise<RulebookStack>;
+}
+
+/** Everything the service reaches outside Firestore. Injected for tests. */
+export interface AssessmentDeps {
+  provider: LlmProvider;
+  rubrics: RubricReader;
+  loadBytes(storagePath: string): Promise<Buffer>;
+  // (#310) The stored object's real byte length, or null when there is no such
+  // object, WITHOUT downloading it: the total-attached-bytes brake adds these
+  // up before any model call. Optional so existing fakes keep working; without
+  // it the size is taken from `loadBytes` (fine for a fake, wasteful for real
+  // Storage, which is why the default deps read the metadata instead).
+  sizeOfFile?: (storagePath: string) => Promise<number | null>;
+  runTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>;
+  readSettings(): Promise<AiSettingsRead>;
+  now(): Date;
+  // Country-context lookup (#116). Optional so existing fakes keep working;
+  // defaults to the real builder. Reads published statistics only, no model.
+  buildCountryContext?: (input: Parameters<typeof buildCountryContext>[0]) => Promise<CountryContextResult>;
+  // (#234) Every member ever recorded for an authority (`authorities/{id}/members`).
+  // Optional so existing fakes keep working; defaults to the Firestore read.
+  loadAuthorityMembers?: (authorityId: string) => Promise<AuthorityMember[]>;
+  // (#309) The application's intake, as the intake screen sees it (only
+  // `available`, `editable` and `openRequiredIds` are read). Optional so
+  // existing fakes keep working; defaults to `intakeService.getIntake`.
+  readIntake?: (app: Application) => Promise<Pick<IntakeResponse, "available" | "editable" | "openRequiredIds">>;
+}
+
+// ----------------------------------------------------------------
+// (#309) "Enough to review"
+// ----------------------------------------------------------------
+
+/**
+ * A part of the application a review needs and that is still missing:
+ *  - "intake":    the route has an intake and a required, visible question is open;
+ *  - "documents": no document is uploaded (the refusal letter does not count:
+ *                 the review never reads it).
+ * The statement is not required: the judgement stage can run on documents alone.
+ */
+export type ReviewMissingPart = "intake" | "documents";
+
+/** What the gate found: the missing parts (empty = enough to review) and the open required count. */
+export interface ReviewContentGaps {
+  missing: ReviewMissingPart[];
+  openRequiredCount: number;
+}
+
+/**
+ * (#309) Was this stored result made with NO model call and no mandatory-bar
+ * hit? That is the "nothing to read" result (execute(), stage "nothing to
+ * read"): it cost nothing and told the applicant nothing, so it must not count
+ * as a free caller's one review. A bar hit is also zero-call, but it is a real
+ * answer ("you cannot get this visa"), so it still counts.
+ */
+export function isNoModelCallResult(a: Pick<ApplicationAssessment, "usage" | "hasBlockingRule">): boolean {
+  const extract = a.usage?.extract?.requests ?? 0;
+  const judge = a.usage?.judge?.requests ?? 0;
+  return extract === 0 && judge === 0 && a.hasBlockingRule !== true;
+}
+
+/** What a POST resolved to. */
+export type RequestOutcome =
+  | { kind: "no_rubric"; routeKey: string }
+  // (#309) Only when the caller set `requireContent` (the manual POST): the
+  // application has not enough in it to review. Nothing was written or queued.
+  | { kind: "not_enough"; missing: ReviewMissingPart[]; openRequiredCount: number }
+  | { kind: "upgrade_required" }
+  // Only when the caller set `maxAttempts` (the #117 auto-run): the failed job
+  // for these inputs has used its attempts, so it is NOT queued again.
+  | { kind: "attempts_exhausted"; assessmentId: string }
+  | { kind: "stored" | "running" | "queued" | "created"; assessmentId: string; status: AssessmentStatus; rubricVersion: number };
+
+/** Inputs the job and the request both read, loaded once. */
+export interface LoadedInputs {
+  applicantName: string | null;
+  // The first stated nationality (kept for callers that read one value).
+  nationality: string | null;
+  // (#234) What the applicant holds, as rules read it: the APPLICATION'S COPY
+  // (`applicantFacts`) when it has one, else (applications started before
+  // #234, dev data only) the latest eligibility check's nationality alone.
+  facts: FactsForRules;
+  // True when `facts` came from the application's copy (it is then in the input hash).
+  factsFromCopy: boolean;
+  eligibilityScore: number | null;
+  eligibilityAnswers: Record<string, unknown> | null;
+  intake: Record<string, unknown>;
+  // `label` is a code label and is what the model is shown. (#308) `name` is
+  // what the APPLICANT recognises the upload by (display name, document type or
+  // file name) and `requirementId` the checklist item it was uploaded to: both
+  // are used only to title a "we couldn't read this upload" item, never sent
+  // to a model and not part of the input hash.
+  documents: Array<{ id: string; path: string; updatedAtMs: number; sizeMb: number; label: string; name?: string; requirementId?: string }>;
+  // `blocks` is one plain-text string per TOP-LEVEL ProseMirror block, in
+  // document order (index = the block's index in `content`); `contentHash`
+  // hashes the content itself so the input hash ignores bare version bumps.
+  statements: Array<{ instanceId: string; version: number; text: string; blocks: string[]; contentHash: string }>;
+}
+
+/** Statement categories that count as a statement. Template-level, never free text. */
+const STATEMENT_CATEGORIES = new Set(["sop", "cover_letter"]);
+
+/** Read the plain text out of a ProseMirror document, depth first. */
+function plainTextOf(node: unknown): string {
+  if (!node || typeof node !== "object") return "";
+  const n = node as { text?: unknown; content?: unknown };
+  const own = typeof n.text === "string" ? n.text : "";
+  const kids = Array.isArray(n.content) ? n.content.map(plainTextOf).join(n.content.length ? " " : "") : "";
+  return `${own}${kids ? ` ${kids}` : ""}`.replace(/\s+/g, " ").trim();
+}
+
+// Re-exported from the shared extraction module so existing imports keep working.
+export { sniffMediaType };
+
+/** A blank usage record. Exported for the bulk path (#37). */
+export function zeroUsage(): AssessmentUsage {
+  return { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+}
+
+/** Add one call's usage to a total. Exported for the bulk path (#37). */
+export function addUsage(total: AssessmentUsage, u: LlmUsage): AssessmentUsage {
+  return {
+    requests: total.requests + 1,
+    inputTokens: total.inputTokens + u.inputTokens,
+    outputTokens: total.outputTokens + u.outputTokens,
+    cacheReadTokens: total.cacheReadTokens + u.cacheReadTokens,
+    cacheWriteTokens: total.cacheWriteTokens + u.cacheWriteTokens,
+  };
+}
+
+/** The UTC day key used for the daily cap. */
+export function dayKey(now: Date): string {
+  return now.toISOString().slice(0, 10);
+}
+
+/** ISO date (YYYY-MM-DD) for the bar comparison. */
+function isoDate(now: Date): string {
+  return now.toISOString().slice(0, 10);
+}
+
+/**
+ * (#234) The application's START date ("YYYY-MM-DD"): `startDate`, else
+ * `createdAt`, else today. `members_of` groups resolve their membership on this
+ * date (the applicant's facts were copied at this moment too).
+ */
+export function startDateOf(app: Pick<Application, "startDate" | "createdAt">, now: Date): string {
+  for (const ts of [app.startDate, app.createdAt] as Array<{ toDate?: () => Date } | undefined>) {
+    if (ts && typeof ts.toDate === "function") {
+      const d = ts.toDate();
+      if (d instanceof Date && !Number.isNaN(d.getTime())) return isoDate(d);
+    }
+  }
+  return isoDate(now);
+}
+
+/**
+ * (#234) The facts as the input hash holds them: codes, kinds, issuers and
+ * dates in a stable order (never the applicant's note, which no rule reads).
+ */
+export function hashableFacts(facts: FactsForRules): NonNullable<AssessmentInputs["applicantFacts"]> {
+  return {
+    nationalities: [...facts.nationalities].sort(),
+    residentialCountry: facts.residentialCountry,
+    heldDocuments: facts.heldDocuments === null
+      ? null
+      : facts.heldDocuments
+        .map((d) => ({ kind: d.kind, issuer: d.issuerCountryCode ?? d.issuerAuthorityId ?? null, validUntil: d.validUntil }))
+        .sort((a, b) => `${a.kind}|${a.issuer}|${a.validUntil}`.localeCompare(`${b.kind}|${b.issuer}|${b.validUntil}`)),
+  };
+}
+
+/**
+ * The date a mandatory bar is checked against.
+ *
+ * - `submittedAt`, when the application has one: a rule in force when the
+ *   applicant applied governs their application, so a rule change after
+ *   submission must not change a re-run's outcome.
+ * - Otherwise the ASSESSMENT date (`now`). Never `startDate`: that is when the
+ *   draft was created, not when the application is made, and a bar that came
+ *   into force after a long-lived draft was started would be silently skipped.
+ *
+ * It never returns "no date". Skipping a mandatory bar because a date is
+ * missing would tell an applicant nothing blocks them when something may; the
+ * safe direction is to check the bar against today. (A missing or malformed
+ * `submittedAt` therefore also falls back to `now`.)
+ */
+export function barDateOf(app: Pick<Application, "submittedAt">, now: Date): string {
+  const ts = app.submittedAt as { toDate?: () => Date } | undefined;
+  if (ts && typeof ts.toDate === "function") {
+    const d = ts.toDate();
+    if (d instanceof Date && !Number.isNaN(d.getTime())) return isoDate(d);
+  }
+  return isoDate(now);
+}
+
+/** (#234) Every member ever recorded for an authority, from Firestore (`authorities/{id}/members`). */
+async function defaultLoadAuthorityMembers(authorityId: string): Promise<AuthorityMember[]> {
+  const snap = await subcollections.authorityMembers(authorityId).get();
+  return snap.docs.map((d) => d.data() as AuthorityMember);
+}
+
+/** The default deps: Firestore, Cloud Storage, the Anthropic provider and the settings doc. */
+/**
+ * The real dependencies: the Anthropic provider, the rubric store, Cloud
+ * Storage, Firestore and the stored settings. Exported (#310) so an emulator
+ * test can run the job over the REAL Storage reads (`loadBytes`, `sizeOfFile`)
+ * while swapping only the model provider and the rulebook.
+ */
+export function defaultDeps(): AssessmentDeps {
+  return {
+    provider: new AnthropicLlmProvider(),
+    rubrics: {
+      getApprovedRubric: (cc, vt) => rubricStore.getApprovedRubric(cc, vt),
+      getRulebookStack: (app) => defaultRulebookStack(app),
+      async approvedVersionOf(cc, vt) {
+        const head = await rubricStore.getHead(rubricRouteKey(cc, vt));
+        return head?.approvedVersion ?? null;
+      },
+    },
+    loadBytes: async (storagePath) => {
+      const [bytes] = await getStorage().bucket().file(storagePath).download();
+      return bytes;
+    },
+    // One metadata request per document, no download. A missing object (404)
+    // is null; any other failure is thrown and counted as 0 by the caller.
+    sizeOfFile: async (storagePath) => {
+      try {
+        const [metadata] = await getStorage().bucket().file(storagePath).getMetadata();
+        const size = Number(metadata.size);
+        return Number.isInteger(size) && size >= 0 ? size : null;
+      } catch (error) {
+        if ((error as { code?: number }).code === 404) return null;
+        throw error;
+      }
+    },
+    runTransaction: (fn) => db.runTransaction(fn),
+    readSettings: readAiSettings,
+    now: () => new Date(),
+  };
+}
+
+/** A blank stored record, before the job has run. */
+export function newAssessmentDoc(args: {
+  id: string;
+  app: Application;
+  rubricVersion: number;
+  // (#233) Only for a stack of more than one layer: every layer's version, and
+  // the layer list (approved / missing). Absent for a single-layer route.
+  layerVersions?: Record<string, number | null>;
+  rulebookLayers?: ApplicationAssessment["rulebookLayers"];
+  inputHash: string;
+  trigger: AssessmentTrigger;
+  requestedBy: string;
+  now: Date;
+}): ApplicationAssessment {
+  return {
+    id: args.id,
+    applicationId: args.app.id,
+    userId: args.app.userId,
+    agencyId: args.app.agencyId ?? null,
+    countryCode: args.app.countryCode,
+    visaTypeId: args.app.visaTypeId,
+    rubricVersion: args.rubricVersion,
+    // (#233) Spread only when present: a single-layer assessment is unchanged.
+    ...(args.layerVersions ? { layerVersions: args.layerVersions } : {}),
+    ...(args.rulebookLayers ? { rulebookLayers: args.rulebookLayers } : {}),
+    inputHash: args.inputHash,
+    model: null,
+    createdAt: Timestamp.fromDate(args.now),
+    status: "queued",
+    error: null,
+    attempt: 1,
+    trigger: args.trigger,
+    requestedBy: args.requestedBy,
+    startedAt: null,
+    finishedAt: null,
+    stageOutcomes: { mandatoryBar: "not_applicable", objective: "not_applicable", judgement: "not_run", credibility: "clear" },
+    score: null,
+    readiness: null,
+    refusalGrounds: [],
+    credibilityFlags: [],
+    strengths: [],
+    statementFindings: [],
+    statement: null,
+    insufficientInformation: [],
+    suspiciousContent: [],
+    confidence: null,
+    topIssues: [],
+    hasBlockingRule: false,
+    // (#384) Not written until the job finishes (storeContent sets both).
+    narrative: null,
+    blockingRule: null,
+    internalCall: null,
+    models: { extract: null, judge: null },
+    promptVersion: ASSESSMENT_PROMPT_VERSION,
+    usage: { extract: zeroUsage(), judge: zeroUsage() },
+    costUsd: null,
+  };
+}
+
+export class AiCaseOfficerService {
+  constructor(private readonly deps: AssessmentDeps = defaultDeps()) {}
+
+  // ----------------------------------------------------------------
+  // Inputs
+  // ----------------------------------------------------------------
+
+  /**
+   * Load every input the assessment reads. Applicant-derived strings are only
+   * ever passed on wrapped in delimiters (services/ai/prompt-safety.ts).
+   */
+  // Public since #37: the bulk re-assessment service reads the same inputs.
+  async loadInputs(app: Application): Promise<LoadedInputs> {
+    const userSnap = await collections.users.doc(app.userId).get();
+    const user = userSnap.exists ? (userSnap.data() as User) : null;
+    const applicantName = user ? `${user.firstName ?? ""} ${user.lastName ?? ""}`.trim() || null : null;
+
+    const checkSnap = await collections.eligibilityChecks
+      .where("userId", "==", app.userId)
+      .where("visaTypeId", "==", app.visaTypeId)
+      .orderBy("createdAt", "desc")
+      .limit(1)
+      .get();
+    const check = checkSnap.empty ? null : ({ id: checkSnap.docs[0].id, ...checkSnap.docs[0].data() } as EligibilityCheck & { id: string });
+    // (#234) The applicant's facts come from the application's COPY of their
+    // holdings (taken when the application started), never the live profile.
+    // The eligibility check's nationality is the fallback ONLY for an
+    // application that has no copy (started before #234: dev data only).
+    const copy = (app as Application).applicantFacts;
+    const facts: FactsForRules = copy
+      ? factsFromApplicantFacts(copy)
+      : factsFromNationality(check && /^[A-Z]{2}$/.test(check.nationality ?? "") ? check.nationality : null);
+    const nationality = facts.nationalities[0] ?? null;
+    const eligibilityAnswers = check
+      ? Object.fromEntries(
+        (check.answers ?? []).map((a) => [String((a as { questionId: string }).questionId), (a as { answer?: unknown }).answer ?? null])
+      )
+      : null;
+
+    const docSnap = await collections.documents.where("applicationId", "==", app.id).get();
+    // A refusal letter (issue #122) is read by its own analysis, never by the
+    // assessment: leave it out, so it is not sent to extraction here and
+    // uploading one does not change the assessment's input hash.
+    const documents = docSnap.docs.filter((d) => (d.data() as Document).requirementId !== "refusal-letter").map((d) => {
+      const data = d.data() as Document;
+      return {
+        id: d.id,
+        path: data.storageUrl,
+        updatedAtMs: data.updatedAt ? data.updatedAt.toMillis() : 0,
+        sizeMb: data.fileSizeMb ?? 0,
+        label: data.documentType ?? data.displayName ?? "document",
+        // (#308) Self-service uploads send neither field above, only the file.
+        name: data.displayName ?? data.documentType ?? data.fileName,
+        requirementId: data.requirementId,
+      };
+    });
+    documents.sort((a, b) => (a.id < b.id ? -1 : 1));
+
+    const instanceSnap = await collections.documentInstances.where("applicationId", "==", app.id).get();
+    const statements: LoadedInputs["statements"] = [];
+    for (const d of instanceSnap.docs) {
+      const inst = d.data() as DocumentInstance;
+      const tpl = inst.templateId ? await collections.documentTemplates.doc(inst.templateId).get() : null;
+      const category = tpl && tpl.exists ? (tpl.data() as { category?: string }).category : undefined;
+      if (!category || !STATEMENT_CATEGORIES.has(category)) continue;
+      const doc = inst.content as ProseMirrorDoc | undefined;
+      // Top-level children only: the portal resolves `nodePath: [i]` as
+      // doc.content[i], so the numbering must use exactly this array.
+      const top = doc && Array.isArray((doc as { content?: unknown }).content) ? ((doc as { content: unknown[] }).content) : [];
+      statements.push({
+        instanceId: d.id,
+        version: inst.version ?? 0,
+        text: plainTextOf(doc),
+        blocks: top.map((b) => plainTextOf(b)),
+        contentHash: hashStatementContent(doc ?? null),
+      });
+    }
+    statements.sort((a, b) => (a.instanceId < b.instanceId ? -1 : 1));
+
+    // The applicant's intake ANSWERS, keyed by question id (#113 stores them at
+    // `application.intake.answers`, beside the route key, rubric version and
+    // time of the save). (#207) This used to read the whole `intake` object, so
+    // the facts were named `intake.answers` and a save's timestamp changed the
+    // input hash; rule triggers need the answers by question id.
+    const savedIntake = (app as Application & { intake?: { answers?: Record<string, unknown> } }).intake;
+    const intake = (savedIntake?.answers ?? {}) as Record<string, unknown>;
+
+    return {
+      applicantName,
+      nationality,
+      facts,
+      factsFromCopy: copy !== undefined,
+      eligibilityScore: check && typeof check.score === "number" ? check.score : null,
+      eligibilityAnswers,
+      intake,
+      documents,
+      statements,
+    };
+  }
+
+  /**
+   * (#234) Membership, ON `onDate`, of every authority the rubric's
+   * `members_of` groups name (no read at all when none does, which is every
+   * rulebook stored before #234). An authority with NO recorded members (or
+   * one that does not exist) is left out, so its groups resolve to "could not
+   * tell", never to "nobody"; one whose recorded members are all past or
+   * future is an empty list (known: nobody current). A failed read is treated
+   * the same as no record (unknown), never as an empty membership.
+   * Public: the bulk re-assessment reads the same membership.
+   */
+  async membershipFor(rubric: Pick<VisaRubric, "criteria">, onDate: string): Promise<MembershipOnDate> {
+    const ids = membershipAuthorityIdsOf(rubric.criteria);
+    if (ids.length === 0) return {};
+    const load = this.deps.loadAuthorityMembers ?? defaultLoadAuthorityMembers;
+    const out: Record<string, string[] | null> = {};
+    for (const id of ids) {
+      try {
+        const recorded = await load(id);
+        out[id] = recorded.length === 0 ? null : membersOn(recorded, onDate).map((m) => m.countryCode);
+      } catch {
+        // Unknown, not "nobody": the bar is reported "could not be assessed".
+        out[id] = null;
+      }
+    }
+    return out;
+  }
+
+  /** The hash inputs for a loaded set and rubric version. */
+  // Public since #37 (bulk re-assessment recomputes the same hash).
+  // (#233) `layerVersions` only for a stack of more than one layer: a new
+  // version of ANY layer then changes the hash. Absent (undefined) it leaves
+  // the hash of every single-layer route exactly as before (the canonical form
+  // skips undefined fields).
+  inputsFor(loaded: LoadedInputs, rubricVersion: number, layerVersions?: Record<string, number | null>): AssessmentInputs {
+    return {
+      rubricVersion,
+      ...(layerVersions ? { layerVersions } : {}),
+      documents: loaded.documents.map((d) => ({ path: `${d.id}:${d.path}`, updatedAtMs: d.updatedAtMs })),
+      statements: loaded.statements.map((s) => ({ instanceId: s.instanceId, contentHash: s.contentHash })),
+      eligibilityAnswers: loaded.eligibilityAnswers,
+      intake: loaded.intake,
+      // (#234) Only with a copy: a changed copy changes the hash; old applications hash as before.
+      ...(loaded.factsFromCopy ? { applicantFacts: hashableFacts(loaded.facts) } : {}),
+    };
+  }
+
+  // ----------------------------------------------------------------
+  // Request (the POST path and the status trigger)
+  // ----------------------------------------------------------------
+
+  /**
+   * Ask for an assessment of an application against its approved rubric.
+   *
+   *  - no approved rubric for the route: `no_rubric` (never a partial result);
+   *  - the same inputs already stored: their status (`stored`, `running`, `queued`);
+   *  - a re-run whose inputs changed, by a free caller: `upgrade_required`;
+   *  - a failed job with the same inputs: queued again, in the same document;
+   *  - otherwise a new `queued` document.
+   *
+   * `tier` is decided by the handler from the caller's entitlement. The status
+   * trigger passes "full": it is the system, not an applicant's request.
+   *
+   * (#309) `requireContent` (set by the manual POST only): an application
+   * without enough in it to review is `not_enough`, decided after the rubric
+   * check and BEFORE anything is written and before the tier / free re-run
+   * check, so free and paid callers get the same answer. The status trigger
+   * and the #117 auto-run do not set it and behave exactly as before.
+   */
+  async requestAssessment(
+    app: Application,
+    opts: { tier: AssessmentTier; trigger: AssessmentTrigger; requestedBy: string; maxAttempts?: number; requireContent?: boolean }
+  ): Promise<RequestOutcome> {
+    // (#233) The application's rulebook STACK (its own layer alone for a route
+    // without inheritance: exactly the approved rubric read before). A stack
+    // with no approved layer, or one the stack plan refuses, is `no_rubric`:
+    // never a partial result. A stack with SOME layer approved is assessed,
+    // and the missing layer is recorded on the assessment (`rulebookLayers`).
+    const stack = await this.rulebookStackOf(app);
+    const rubric = stack.usable ? stack.rubric : null;
+    if (!rubric) return { kind: "no_rubric", routeKey: rubricRouteKey(app.countryCode, app.visaTypeId) };
+    const layerVersions = layerVersionsOf(rubric);
+    const rulebookLayers = layerVersions ? rubric.stackLayers : undefined;
+
+    const loaded = await this.loadInputs(app);
+
+    // (#309) The "enough to review" gate, manual requests only. Refused here,
+    // before the transaction: no assessment document, no job, no model call,
+    // and the free review is not touched.
+    if (opts.requireContent) {
+      const gaps = await this.contentGapsOf(app, loaded);
+      if (gaps.missing.length > 0) return { kind: "not_enough", missing: gaps.missing, openRequiredCount: gaps.openRequiredCount };
+    }
+
+    const inputHash = computeInputHash(this.inputsFor(loaded, rubric.version, layerVersions));
+    const assessmentId = assessmentIdFor(app.id, inputHash);
+    const now = this.deps.now();
+
+    // A re-run by a free caller needs a previous result for a DIFFERENT input set.
+    // (#309) `latestSucceeded` skips a "nothing to read" result (no model call),
+    // so a review spent on an empty application does not use up the free one.
+    const previous = await this.latestSucceeded(app.id);
+    const isRerunOfChanged = previous !== null && previous.inputHash !== inputHash;
+
+    const outcome = await this.deps.runTransaction(async (tx): Promise<RequestOutcome> => {
+      const ref = collections.applicationAssessments.doc(assessmentId);
+      const snap = await tx.get(ref);
+      if (snap.exists) {
+        const cur = snap.data() as ApplicationAssessment;
+        if (cur.status === "succeeded") return { kind: "stored", assessmentId, status: cur.status, rubricVersion: cur.rubricVersion };
+        if (cur.status === "queued" || cur.status === "running") {
+          return { kind: cur.status, assessmentId, status: cur.status, rubricVersion: cur.rubricVersion };
+        }
+        // Failed: a retry on the same inputs is free on both tiers, unless the
+        // caller caps attempts (#117 auto-run: one automatic retry, then stop).
+        if (opts.maxAttempts !== undefined && (cur.attempt ?? 1) >= opts.maxAttempts) {
+          return { kind: "attempts_exhausted", assessmentId };
+        }
+        tx.update(ref, {
+          status: "queued",
+          error: null,
+          attempt: (cur.attempt ?? 1) + 1,
+          trigger: opts.trigger,
+          requestedBy: opts.requestedBy,
+          // A failed BULK job retried by a person runs on the interactive path
+          // (the interactive worker skips viaBatch jobs), and leaves its batch.
+          viaBatch: false,
+          batchId: null,
+          batchPhase: null,
+          startedAt: null,
+          finishedAt: null,
+        });
+        return { kind: "queued", assessmentId, status: "queued", rubricVersion: rubric.version };
+      }
+      if (opts.tier === "free" && isRerunOfChanged) return { kind: "upgrade_required" };
+      tx.set(
+        ref,
+        newAssessmentDoc({ id: assessmentId, app, rubricVersion: rubric.version, layerVersions, rulebookLayers, inputHash, trigger: opts.trigger, requestedBy: opts.requestedBy, now })
+      );
+      return { kind: "created", assessmentId, status: "queued", rubricVersion: rubric.version };
+    });
+    return outcome;
+  }
+
+  /** Status-change trigger: enqueue for an application that moved to under review. Never throws. */
+  async enqueueForStatusChange(applicationId: string): Promise<void> {
+    try {
+      const snap = await collections.applications.doc(applicationId).get();
+      if (!snap.exists) return;
+      const app = { id: snap.id, ...snap.data() } as Application;
+      const outcome = await this.requestAssessment(app, { tier: "full", trigger: "status_change", requestedBy: "system" });
+      console.log(`[ai-case-officer] status trigger for ${applicationId}: ${outcome.kind}`);
+    } catch (err) {
+      console.error(`[ai-case-officer] status trigger failed for ${applicationId}: ${(err as Error).name}`);
+    }
+  }
+
+  // ----------------------------------------------------------------
+  // Reads
+  // ----------------------------------------------------------------
+
+  /** One stored assessment, or null. The caller checks access on its application. */
+  async getById(assessmentId: string): Promise<ApplicationAssessment | null> {
+    const snap = await collections.applicationAssessments.doc(assessmentId).get();
+    return snap.exists ? (snap.data() as ApplicationAssessment) : null;
+  }
+
+  /**
+   * The newest assessment for an application, or null.
+   *
+   * A bulk re-assessment job (#37) that has not succeeded is background work: it
+   * may wait hours in a provider batch. It must not hide the applicant's current
+   * result, so a `viaBatch` job in any state but `succeeded` is skipped here.
+   */
+  async latestFor(applicationId: string): Promise<ApplicationAssessment | null> {
+    const snap = await collections.applicationAssessments
+      .where("applicationId", "==", applicationId)
+      .orderBy("createdAt", "desc")
+      .limit(10)
+      .get();
+    for (const d of snap.docs) {
+      const a = d.data() as ApplicationAssessment;
+      if (a.viaBatch === true && a.status !== "succeeded") continue;
+      return a;
+    }
+    return null;
+  }
+
+  /**
+   * (#309) What an application still needs before it can be reviewed.
+   *  - intake: only when the route has one (`available`) AND it can still be
+   *    answered (`editable`: draft, pending_payment, pending_documents); open =
+   *    the intake service's own `openRequiredIds` (required, visible, unanswered).
+   *    Past those statuses a save is refused (409 NOT_EDITABLE), so asking for
+   *    answers would block the review for good: the review runs instead and
+   *    reports those rules as "could not be assessed", as before #309.
+   *  - documents: `loaded.documents`, which already leaves the refusal letter out.
+   * The statement is not required.
+   */
+  async contentGapsOf(app: Application, loaded: Pick<LoadedInputs, "documents">): Promise<ReviewContentGaps> {
+    const readIntake = this.deps.readIntake ?? ((a: Application) => intakeService.getIntake(a));
+    const intake = await readIntake(app);
+    // 0 (and no "intake" entry) when there is no intake or it can no longer be edited.
+    const openRequiredCount = intake.available && intake.editable ? intake.openRequiredIds.length : 0;
+    const missing: ReviewMissingPart[] = [];
+    if (openRequiredCount > 0) missing.push("intake");
+    if (loaded.documents.length === 0) missing.push("documents");
+    return { missing, openRequiredCount };
+  }
+
+  /**
+   * The newest succeeded assessment for an application, or null (filtered in code).
+   * Used only by the free re-run check. (#309) A "nothing to read" result (no
+   * model call, no bar hit: `isNoModelCallResult`) is skipped: it is not a review.
+   */
+  private async latestSucceeded(applicationId: string): Promise<ApplicationAssessment | null> {
+    const snap = await collections.applicationAssessments.where("applicationId", "==", applicationId).get();
+    const done = snap.docs
+      .map((d) => d.data() as ApplicationAssessment)
+      .filter((a) => a.status === "succeeded" && !isNoModelCallResult(a));
+    done.sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+    return done[0] ?? null;
+  }
+
+  /**
+   * Why a stored assessment is out of date, or null when it is current. Done on
+   * the server because the client cannot compute the input hash.
+   *
+   * `inputs_changed` wins: the applicant's own changes are what they can act on.
+   * Otherwise `rules_updated` when the approved rubric version differs from the
+   * one the assessment used.
+   */
+  async staleReasonOf(app: Application, assessment: ApplicationAssessment): Promise<StaleReason | null> {
+    const loaded = await this.loadInputs(app);
+    if (computeInputHash(this.inputsFor(loaded, assessment.rubricVersion, assessment.layerVersions)) !== assessment.inputHash) return "inputs_changed";
+    // (#233) An assessment made on a STACK compares the version of EVERY layer:
+    // a new version of the shared layer is "the rules changed" too. A stack
+    // that is no longer usable is treated like "no approved rubric" (not stale),
+    // as below.
+    if (assessment.layerVersions) {
+      const stack = await this.rulebookStackOf(app);
+      if (!stack.usable || !stack.rubric) return null;
+      const same = sameStackVersions({ version: assessment.rubricVersion, layerVersions: assessment.layerVersions }, { version: stack.rubric.version, layerVersions: layerVersionsOf(stack.rubric) });
+      return same ? null : "rules_updated";
+    }
+    const approved = await this.approvedVersionOf(assessment.countryCode, assessment.visaTypeId);
+    if (approved !== null && approved !== assessment.rubricVersion) return "rules_updated";
+    return null;
+  }
+
+  /** The approved version of a route. */
+  async approvedVersionOf(countryCode: string, visaTypeId: string): Promise<number | null> {
+    return this.deps.rubrics.approvedVersionOf(countryCode, visaTypeId);
+  }
+
+  /** (#233) The application's rulebook stack, through the injected reader (services/ai/application-rulebook.ts). */
+  async rulebookStackOf(app: ApplicationStackRef): Promise<RulebookStack> {
+    return rulebookStackFor(app, this.deps.rubrics);
+  }
+
+  /**
+   * (#233) Can this application be assessed at all? For a single-layer route
+   * exactly the old test (the head has an approved version); for a stack, at
+   * least one layer is approved and the stack plan accepts it.
+   */
+  async hasApprovedRulebook(app: Application): Promise<boolean> {
+    const stack = await this.rulebookStackOf(app);
+    if (stack.layers.length <= 1) return (await this.approvedVersionOf(app.countryCode, app.visaTypeId)) !== null;
+    return stack.usable;
+  }
+
+  // ----------------------------------------------------------------
+  // The job
+  // ----------------------------------------------------------------
+
+  /**
+   * Run one queued assessment. Called by the Firestore worker. Claims the
+   * document `queued -> running` in a transaction, so a duplicate delivery of
+   * the same event does nothing. Never throws: every failure is stored.
+   */
+  async runJob(assessmentId: string): Promise<"skipped" | "succeeded" | "failed"> {
+    const claimed = await this.deps.runTransaction(async (tx) => {
+      const ref = collections.applicationAssessments.doc(assessmentId);
+      const snap = await tx.get(ref);
+      if (!snap.exists) return null;
+      const cur = snap.data() as ApplicationAssessment;
+      if (cur.status !== "queued") return null;
+      tx.update(ref, { status: "running", startedAt: Timestamp.fromDate(this.deps.now()) });
+      return cur;
+    });
+    if (!claimed) return "skipped";
+
+    const started = this.deps.now().getTime();
+    try {
+      await this.execute(claimed, started);
+      console.log(`[ai-case-officer] assessment ${assessmentId} succeeded`);
+      return "succeeded";
+    } catch (err) {
+      const stop =
+        err instanceof JobStop
+          ? err
+          : new JobStop("internal_error", "the assessment stopped unexpectedly");
+      await this.finish(assessmentId, { status: "failed", error: { code: stop.code, message: stop.message } });
+      console.log(`[ai-case-officer] assessment ${assessmentId} failed: ${stop.code}`);
+      return "failed";
+    }
+  }
+
+  /** Write a stored result or failure. Only the worker writes these fields. */
+  // Public since #37 (the bulk path writes failures through it).
+  async finish(assessmentId: string, patch: Partial<ApplicationAssessment> & { status: AssessmentStatus }): Promise<void> {
+    await collections.applicationAssessments.doc(assessmentId).update({
+      ...patch,
+      finishedAt: Timestamp.fromDate(this.deps.now()),
+    } as Record<string, unknown>);
+  }
+
+  /** The job: stages 1 to 3, then assembly. Throws JobStop to fail the job. */
+  private async execute(cur: ApplicationAssessment, started: number): Promise<void> {
+    // ---- settings (fail closed) ----
+    const settingsRead = await this.deps.readSettings();
+    if (!settingsRead.ok) throw new JobStop("settings_unavailable", settingsRead.reason);
+    const settings: AiSettings = settingsRead.settings;
+    if (!settings.enabled) throw new JobStop("disabled", "AI assessments are switched off");
+
+    // ---- the inputs must still be the ones the request hashed ----
+    const appSnap = await collections.applications.doc(cur.applicationId).get();
+    if (!appSnap.exists) throw new JobStop("inputs_changed", "the application no longer exists");
+    const app = { id: appSnap.id, ...appSnap.data() } as Application;
+
+    // (#233) The same stack the request read; ANY layer's new version means the
+    // rules changed (a single-layer route compares `version` alone, as before).
+    const stack = await this.rulebookStackOf(app);
+    const fullRubric = stack.usable ? stack.rubric : null;
+    if (!fullRubric || !sameStackVersions({ version: fullRubric.version, layerVersions: layerVersionsOf(fullRubric) }, { version: cur.rubricVersion, layerVersions: cur.layerVersions })) {
+      throw new JobStop("rubric_changed", "the approved rubric changed after this assessment was requested");
+    }
+    const loaded = await this.loadInputs(app);
+    if (computeInputHash(this.inputsFor(loaded, fullRubric.version, layerVersionsOf(fullRubric))) !== cur.inputHash) {
+      throw new JobStop("inputs_changed", "the application's inputs changed after this assessment was requested");
+    }
+
+    // ---- which rules apply to THIS applicant (#207) ----
+    // A rulebook keeps specialist-activity and conditional rules; each is
+    // assessed only for applicants whose intake answers trigger it. Three
+    // lists, every criterion in exactly one:
+    //   applicable      -> everything below (bars, objective checks, judgement)
+    //                      runs on `rubric`, the rulebook narrowed to these;
+    //   not applicable  -> nothing at all: no finding, question or action;
+    //   unknown         -> "could not be assessed: we need to know X", added to
+    //                      the insufficient-information list (never a failure).
+    // The intake answers are part of the input hash, so this is a pure function
+    // of inputs the hash already covers. `fullRubric` is kept for what needs the
+    // WHOLE rulebook (titles of could-not-assess rules, top issues, actions).
+    // (#234) A rule triggered by what the applicant holds is decided from the
+    // application's copy of their facts, on the bar date (held documents must
+    // still be valid on it); a fact not stated is "could not be assessed".
+    const now = this.deps.now();
+    const barDate = barDateOf(app, now);
+    const split = splitByApplicability(fullRubric, loaded.intake, { facts: loaded.facts, onDate: barDate });
+    const rubric: VisaRubric = { ...fullRubric, criteria: split.applicable };
+
+    // ---- stage 1 input (#234): bars decided from the applicant's facts ----
+    // `members_of` groups resolve through membership data on the application's
+    // START date; an authority with no recorded members is "could not tell".
+    // A bar code cannot decide because a fact is missing is reported "could not
+    // be assessed: we need to know ...", beside the rules split out above.
+    const membership = await this.membershipFor(rubric, startDateOf(app, now));
+    const bars = decideMandatoryBars(rubric, loaded.facts, barDate, membership);
+    const notAssessed = [...notAssessedItems(split), ...barNotAssessedItems(bars.unknown)];
+
+    const score = loaded.eligibilityScore;
+
+    // ---- stage 1: mandatory bars (no model call) ----
+    // The bar is checked against the date the application was SUBMITTED when
+    // there is one, else today (see barDateOf for why never startDate and why
+    // a missing date never means "skip the bar").
+    const hits = bars.hits;
+    if (hits.length > 0) {
+      const content = assembleContent({
+        rubric,
+        mandatoryHits: hits,
+        objective: [],
+        judgement: null,
+        documents: [],
+        statementReadable: loaded.statements.length > 0,
+        score,
+        suspiciousDocumentIds: [],
+        judgementFailed: false,
+        notAssessed,
+      });
+      await this.storeContent(cur.id, fullRubric, content, { extract: zeroUsage(), judge: zeroUsage() }, { extract: null, judge: null });
+      return;
+    }
+
+    // ---- nothing to read: a valid low-readiness result, no model call ----
+    const hasContent = loaded.documents.length > 0 || loaded.statements.some((s) => s.text.trim().length > 0);
+    if (!hasContent) {
+      const content = assembleContent({
+        rubric,
+        mandatoryHits: [],
+        objective: [],
+        judgement: null,
+        documents: [],
+        statementReadable: false,
+        score,
+        suspiciousDocumentIds: [],
+        judgementFailed: false,
+        notAssessed,
+      });
+      await this.storeContent(cur.id, fullRubric, content, { extract: zeroUsage(), judge: zeroUsage() }, { extract: null, judge: null });
+      return;
+    }
+
+    // ---- (#310) is this application too big for ONE review? ----
+    // Decided here, from counts alone, BEFORE the daily cap is claimed and
+    // before any model call: a review that cannot finish must not spend on the
+    // documents it does reach, and must not use up one of today's reviews.
+    //
+    // One review makes at most one extraction call per document (stage 2) and
+    // one judgement call per batch of rules (stage 3). The judgement calls are
+    // fixed by the rulebook, so what is left of the request cap is the room
+    // for documents:
+    //   no room for even one document  -> `review_too_large` (the rules alone
+    //                                     need every request; adding or removing
+    //                                     documents cannot change that);
+    //   more documents than the room   -> `too_many_documents`.
+    // Neither is the platform-wide daily limit (`daily_cap_exceeded`), and the
+    // app must not call either a pause: the same inputs fail the same way
+    // tomorrow. The count is an upper bound (a file that turns out to be
+    // unreadable makes no call), which keeps the answer the same every time for
+    // the same application.
+    const plannedJudgementCalls = planJudgementBatches(judgementCriteriaOf(rubric)).length;
+    const plannedExtractionCalls = documentFieldsFor(rubric).length > 0 ? loaded.documents.length : 0;
+    if (plannedExtractionCalls > 0) {
+      const roomForDocuments = settings.maxRequestsPerAssessment - plannedJudgementCalls;
+      if (roomForDocuments < 1) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+      if (plannedExtractionCalls > roomForDocuments) {
+        throw new JobStop("too_many_documents", `the application has more documents (${plannedExtractionCalls}) than one review can read (${roomForDocuments})`);
+      }
+    } else if (plannedJudgementCalls > settings.maxRequestsPerAssessment) {
+      // No document to read (a statement only), and the rules alone pass the cap.
+      throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+    }
+
+    // The input-size cap counts TEXT only (#310), and the statements are the
+    // one part of that text an applicant can make arbitrarily long. They go
+    // into every judgement call, so statements longer than the whole cap can
+    // never fit: refuse now rather than after paying for the extractions. (The
+    // per-call checks below still add up the real text of every request.)
+    const statementChars = loaded.statements.reduce((n, st) => n + st.text.length, 0);
+    if (statementChars > settings.maxInputCharsPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+
+    // ---- (#310) the spend brake: all the files together ----
+    // Each file is bounded on its own, and the number of files by the request
+    // cap, but 30 files of 10 MB is still 300 MB in one review. The total of
+    // the files this review would attach is therefore bounded too
+    // (`maxAttachedBytesPerAssessment`), from the REAL size of each stored
+    // object (Storage metadata, never the record's `fileSizeMb`), here: before
+    // any model call and before one of today's reviews is used. Over it is
+    // `review_too_large`, the same answer on every run for the same files.
+    //
+    // What is counted: every document whose object is no larger than
+    // `maxFileBytes`. A larger one is never sent (it is reported as "larger
+    // than the limit" below), so it costs nothing. An object whose size cannot
+    // be read counts as 0 here; if it then downloads after all, the running
+    // total in the loop below catches it.
+    if (plannedExtractionCalls > 0) {
+      const sizeOf = this.deps.sizeOfFile ?? (async (path: string) => (await this.deps.loadBytes(path)).length);
+      const sizes = await Promise.all(
+        loaded.documents.map(async (d) => {
+          try {
+            return (await sizeOf(d.path)) ?? 0;
+          } catch {
+            return 0;
+          }
+        })
+      );
+      const plannedAttachedBytes = sizes.filter((n) => n <= settings.maxFileBytes).reduce((sum, n) => sum + n, 0);
+      if (plannedAttachedBytes > settings.maxAttachedBytesPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+    }
+
+    // ---- the daily cap, counted only for jobs that reach a model ----
+    await this.claimDailyCap(settings);
+
+    // ---- stage 2: extraction, one call per document ----
+    const fields = documentFieldsFor(rubric);
+    const extractions: DocumentExtraction[] = [];
+    const suspiciousContent: ApplicationAssessment["suspiciousContent"] = [];
+    let extractUsage = zeroUsage();
+    let requests = 0;
+    let chars = 0;
+    let attachedBytes = 0;
+    let extractUsed = false;
+
+    for (const d of loaded.documents) {
+      const base = { documentId: d.id, label: d.label };
+      if (fields.length === 0) {
+        extractions.push(unreadable(base, NO_FIELD_TO_READ));
+        continue;
+      }
+      if (this.deps.now().getTime() - started > JOB_BUDGET_MS) throw new JobStop("timed_out", "the assessment ran out of time");
+
+      let bytes: Buffer;
+      try {
+        bytes = await this.deps.loadBytes(d.path);
+      } catch {
+        extractions.push(unreadable(base, "file could not be read"));
+        continue;
+      }
+      // (#310) The size check uses the REAL byte length just downloaded, never
+      // the stored `fileSizeMb` (which the uploading client used to supply, so
+      // it could be anything). The limit is decided from the file's own bytes
+      // by the SAME function document registration uses (ai-settings.ts,
+      // fileByteLimitForBytes: the full limit for a real PDF, the lower one the
+      // model accepts for anything else), so a file accepted at upload is never
+      // left out here for its size. Only a document registered before that
+      // check existed can still be over; it is reported for THIS document only
+      // and the job carries on with the others.
+      if (bytes.length > fileByteLimitForBytes(settings, bytes)) {
+        // (#308 + #310) The shared FILE_TOO_LARGE reason, so the applicant gets
+        // the "a smaller file helps" wording for this document.
+        extractions.push(unreadable(base, FILE_TOO_LARGE));
+        continue;
+      }
+      // Backstop for the total-bytes brake decided before the daily cap: the
+      // bytes really downloaded are added up, so a file that grew or whose
+      // size could not be read beforehand still cannot take the review past
+      // the limit.
+      attachedBytes += bytes.length;
+      if (attachedBytes > settings.maxAttachedBytesPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+      // The shared single-document extraction (document-extraction.ts, also used
+      // by the per-upload check #115): sniff, guards, request, call, parse.
+      // The cost caps run just before the call, through `beforeCall`.
+      const result = await extractOneDocument({
+        provider: this.deps.provider,
+        documentId: d.id,
+        label: d.label,
+        bytes,
+        fields,
+        beforeCall: (request) => {
+          requests++;
+          // (#310) TEXT only. The attached file's base64 data is not counted
+          // here any more: it is bounded per file by the byte check above, and
+          // the number of files by the request cap.
+          chars += request.user.length;
+          // Backstops: the count-based check before the daily cap already
+          // refused an application with too many documents, so these only fire
+          // if that arithmetic and this loop ever disagree.
+          if (requests > settings.maxRequestsPerAssessment) throw new JobStop("too_many_documents", "the application has more documents than one review can read");
+          if (chars > settings.maxInputCharsPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+        },
+      });
+      if (result.called) extractUsed = true;
+      if (result.usage) extractUsage = addUsage(extractUsage, result.usage);
+      if (result.extraction.suspicious) suspiciousContent.push({ source: "document", documentId: d.id, page: null });
+      extractions.push(result.extraction);
+    }
+
+    // ---- facts the checks may read ----
+    const facts: Facts = {
+      ...Object.fromEntries(Object.entries(loaded.intake).map(([k, v]) => [`intake.${k}`, v as Facts[string]])),
+      ...deriveHolderFact(loaded.applicantName, extractions),
+    };
+
+    // ---- stage 2 evaluation: code decides ----
+    // (#308) `rubric` is the WHOLE rulebook narrowed to the applicable criteria
+    // (`{ ...fullRubric, criteria }` above), so it carries the rulebook's
+    // `evidenceItems`: a missing field fails a rule only when one of those
+    // document items names the rule; otherwise it is "not in documents".
+    const objective = evaluateObjective(rubric, facts, extractions);
+
+    // ---- stage 3: judgement, in as many calls as the rules need (#207) ----
+    // The judgement rules that apply to this applicant are split by decision
+    // stage into batches (planJudgementBatches). A short list is ONE call, as
+    // before; a long one becomes several. Every rule is in exactly one batch,
+    // each call's answer is checked against that batch's own ids and the
+    // answers are combined in code. The request and input caps are checked
+    // before EACH call: a rulebook that would pass them fails the job with
+    // `review_too_large` (#310; it was `cost_cap_exceeded`) instead of being
+    // assessed in part.
+    const judgementCriteria = judgementCriteriaOf(rubric);
+    const batches = planJudgementBatches(judgementCriteria);
+    let judgement: JudgementOutput | null = null;
+    let judgementFailed = false;
+    const unjudgedCriterionIds: string[] = [];
+    let judgeUsage = zeroUsage();
+    let judgeUsed = false;
+    const statementText = loaded.statements.map((s) => s.text).filter(Boolean).join("\n\n");
+    // The ONE statement whose blocks are numbered and anchorable: the first (by
+    // instance id) that has any block. Others are sent unnumbered, so a note on
+    // them is stored without a position. `statement` records what was read.
+    const primary = loaded.statements.find((s) => s.blocks.length > 0) ?? null;
+    const numbered = primary ? numberStatementBlocks(primary.blocks) : null;
+    const otherText = loaded.statements.filter((s) => s !== primary).map((s) => s.text).filter(Boolean).join("\n\n");
+    const statementRef = primary ? { instanceId: primary.instanceId, version: primary.version } : null;
+    if (statementText && findInjectionSignals(statementText)) {
+      suspiciousContent.push({ source: "statement", documentId: null, page: null });
+    }
+    // The applicant-derived summaries every judgement call is given. Built once
+    // here (#384) because the narrative call after assembly is given the same
+    // ones, so it reasons about exactly what the judgement saw.
+    // (#234) Only the facts the rules need reach the model (see factsSummaryForModel).
+    const profileSummary = `Applicant name: ${loaded.applicantName ?? "not given"}. ${factsSummaryForModel(loaded.facts, rubric.criteria, barDate, rubric.criteria.some(isJudgedBar))}`;
+    const intakeSummary = JSON.stringify(loaded.intake);
+    const extractionSummary = extractions
+      .filter((e) => e.readable && !e.failed && !e.suspicious)
+      .flatMap((e) => e.values.map((v) => `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`))
+      .join("\n");
+    if (batches.length > 0 && (extractions.length > 0 || statementText.trim().length > 0)) {
+      const outputs: JudgementOutput[] = [];
+      for (const batch of batches) {
+        if (this.deps.now().getTime() - started > JUDGEMENT_START_LIMIT_MS) throw new JobStop("timed_out", "the assessment ran out of time before judgement");
+        requests++;
+        if (requests > settings.maxRequestsPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+        const request = buildJudgementRequest({
+          rubric: { criteria: batch, intentPolarity: rubric.intentPolarity },
+          statementText: numbered ? numbered.text : statementText || null,
+          otherStatementsText: otherText || null,
+          profileSummary,
+          intakeSummary,
+          extractionSummary,
+          objectiveSummary: objective.map((r) => `${r.criterionId}: ${r.outcome}`).join("\n"),
+        });
+        // The characters of every call count toward the same cap.
+        chars += request.user.length;
+        if (chars > settings.maxInputCharsPerAssessment) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
+        judgeUsed = true;
+        const batchIds = batch.map((c) => c.criterionId);
+        try {
+          const res = await this.deps.provider.complete(request);
+          judgeUsage = addUsage(judgeUsage, res.usage);
+          if (res.stopReason === "refusal") {
+            unjudgedCriterionIds.push(...batchIds);
+          } else {
+            const parsed = parseJudgement(res.text, batchIds, numbered ? numbered.sentCount : 0);
+            if (parsed.ok) outputs.push(parsed.output);
+            else unjudgedCriterionIds.push(...batchIds);
+          }
+        } catch {
+          unjudgedCriterionIds.push(...batchIds);
+        }
+      }
+      // Every call failed: the whole stage failed (as before). Some failed:
+      // their rules are recorded as insufficient and the rest keep their findings.
+      if (outputs.length === 0) judgementFailed = true;
+      else judgement = mergeJudgementOutputs(outputs);
+    }
+
+    // ---- assembly: containment and citations in code ----
+    const content = assembleContent({
+      rubric,
+      mandatoryHits: [],
+      objective,
+      judgement,
+      documents: extractions,
+      statementReadable: statementText.trim().length > 0,
+      statement: statementRef,
+      score,
+      suspiciousDocumentIds: suspiciousContent.map((s) => s.documentId ?? "statement"),
+      judgementFailed,
+      unjudgedCriterionIds: judgement ? unjudgedCriterionIds : [],
+      notAssessed,
+      documentNames: documentNamesFor(loaded.documents, fullRubric),
+    });
+
+    // ---- (#384) the narrative: ONE more call, after assembly ----
+    // Within the same per-review caps as every call above, but a narrative that
+    // would pass a cap, or that fails in any way, is SKIPPED (null): it never
+    // fails the review, whose findings are already final.
+    const narrativeRun = await this.writeNarrative({
+      settings,
+      started,
+      requestsSoFar: requests,
+      charsSoFar: chars,
+      input: {
+        readiness: content.readiness,
+        findings: content,
+        profileSummary,
+        intakeSummary,
+        extractionSummary,
+        statementText: statementText.trim() ? statementText : null,
+      },
+    });
+    // A narrative string that addressed a model is stored as suspicious content (never shown).
+    for (let i = 0; i < narrativeRun.suspicious; i++) suspiciousContent.push({ source: "narrative", documentId: null, page: null });
+
+    await this.storeContent(
+      cur.id,
+      fullRubric,
+      content,
+      { extract: extractUsage, judge: judgeUsage, ...(narrativeRun.called ? { narrative: narrativeRun.usage } : {}) },
+      {
+        extract: extractUsed ? this.deps.provider.modelFor("extraction") : null,
+        judge: judgeUsed ? this.deps.provider.modelFor("judgement") : null,
+        ...(narrativeRun.called ? { narrative: this.deps.provider.modelFor("narrative") } : {}),
+      },
+      suspiciousContent,
+      { narrative: narrativeRun.narrative }
+    );
+  }
+
+  /**
+   * (#384) Write the narrative for an assembled review, or return null.
+   *
+   * Skipped, with no call, when the call would pass `maxRequestsPerAssessment`
+   * or `maxInputCharsPerAssessment` (counted the same way as every other call:
+   * one request, the user text's characters), or when the job has less than
+   * `NARRATIVE_MIN_MS` left for it. The call has a HARD wall-clock bound
+   * (`min(NARRATIVE_TIMEOUT_MS, JOB_BUDGET_MS - elapsed - NARRATIVE_MARGIN_MS)`):
+   * past it the request is aborted, a late answer is ignored, and the review
+   * is stored with `narrative: null`. No retry. A provider error, a timeout, a refusal,
+   * a cut-off answer or an answer that fails the code checks is null too.
+   * Never throws: the review succeeds with its findings either way.
+   *
+   * Only the interactive worker calls this. The mandatory-bar and nothing-to-
+   * read paths return before it (no call, null), and the bulk path (#386) does
+   * not call it at all.
+   */
+  private async writeNarrative(args: {
+    settings: AiSettings;
+    started: number;
+    requestsSoFar: number;
+    charsSoFar: number;
+    input: NarrativeRequestInput;
+  }): Promise<{ narrative: AssessmentNarrative | null; called: boolean; usage: AssessmentUsage; suspicious: number }> {
+    const skipped = { narrative: null, called: false, usage: zeroUsage(), suspicious: 0 };
+    try {
+      const request = buildNarrativeRequest(args.input);
+      // The caps: a narrative that does not fit is skipped, the review is not failed.
+      if (args.requestsSoFar + 1 > args.settings.maxRequestsPerAssessment) return skipped;
+      if (args.charsSoFar + request.user.length > args.settings.maxInputCharsPerAssessment) return skipped;
+      // (#384, fix round 1) The HARD wall-clock bound of this call: the
+      // narrative's own budget, or what is left of the job's budget after the
+      // margin kept for storing the review, whichever is less. With less than
+      // NARRATIVE_MIN_MS left the call is not made.
+      const elapsed = this.deps.now().getTime() - args.started;
+      const boundMs = Math.min(NARRATIVE_TIMEOUT_MS, JOB_BUDGET_MS - elapsed - NARRATIVE_MARGIN_MS);
+      if (boundMs < NARRATIVE_MIN_MS) return skipped;
+
+      let usage = zeroUsage();
+      // The SDK's `timeout` alone is NOT a bound: it is cleared once the
+      // response headers arrive, and the body can stream for much longer. So
+      // the call also gets an abort signal, no retry (a retry would restart
+      // the clock), and is raced against a timer of the same length below.
+      const controller = new AbortController();
+      const call = this.deps.provider.complete({ ...request, timeoutMs: boundMs, maxRetries: 0, signal: controller.signal });
+      // A late answer (or the rejection the abort causes) is ignored: without
+      // this handler it would surface as an unhandled rejection after the race.
+      call.catch(() => undefined);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<"timed_out">((resolve) => {
+        timer = setTimeout(() => resolve("timed_out"), boundMs);
+      });
+      let res: LlmResponse;
+      try {
+        const winner = await Promise.race([call, timedOut]);
+        if (winner === "timed_out") {
+          // Past the bound: stop the request and store the review without a
+          // narrative. The call was attempted (it may have cost), so it is recorded.
+          controller.abort();
+          console.warn(`[ai-case-officer] narrative not written: no answer within ${boundMs} ms`);
+          return { ...skipped, called: true };
+        }
+        res = winner;
+      } catch {
+        // Provider error: the call was attempted (it may have cost), so it is recorded.
+        return { ...skipped, called: true };
+      } finally {
+        // The timer never outlives the race (it would keep the worker alive).
+        if (timer !== undefined) clearTimeout(timer);
+      }
+      usage = addUsage(usage, res.usage);
+      // A refusal or a cut-off answer is not a narrative.
+      if (res.stopReason === "refusal" || res.stopReason === "max_tokens") return { ...skipped, called: true, usage };
+      const parsed = parseNarrative(res.text, args.input.readiness, narrativeGroundingOf(args.input));
+      // Counts only, never the text: it may carry an applicant's words.
+      if (parsed.dropped > 0 || parsed.suspicious > 0) {
+        console.warn(`[ai-case-officer] narrative: ${parsed.dropped} string(s) dropped by code checks, ${parsed.suspicious} suspicious`);
+      }
+      return { narrative: parsed.narrative, called: true, usage, suspicious: parsed.suspicious };
+    } catch (err) {
+      console.warn(`[ai-case-officer] narrative not written: ${err instanceof Error ? err.name : "error"}`);
+      return skipped;
+    }
+  }
+
+  /**
+   * The country-context note for a finished assessment (#116), or undefined.
+   *
+   * Called ONLY from storeContent, after `content` (band, score, findings) is
+   * fully assembled, and its result goes into the stored doc beside them. It
+   * does not feed back: nothing here is passed to assembleContent, topIssuesOf,
+   * the input hash or any model request. Undefined (so the field is absent)
+   * when the rubric has no outcome-statistics mapping, the applicant has no
+   * passport country, no figure was found, or ANYTHING fails: the assessment
+   * never fails because of this note.
+   */
+  private async countryContextFor(rubric: VisaRubric, assessmentId: string): Promise<AvailableCountryContext | undefined> {
+    const mapping = rubric.outcomeStatistics;
+    if (!mapping) return undefined; // a rubric without the mapping produces no note
+    try {
+      // Nationality = the PASSPORT country on the profile, not residence.
+      const assessmentSnap = await collections.applicationAssessments.doc(assessmentId).get();
+      const applicationId = (assessmentSnap.data() as ApplicationAssessment | undefined)?.applicationId;
+      const appSnap = applicationId ? await collections.applications.doc(applicationId).get() : null;
+      const userId = appSnap && appSnap.exists ? (appSnap.data() as Application).userId : null;
+      const userSnap = userId ? await collections.users.doc(userId).get() : null;
+      const passportCountry = userSnap && userSnap.exists ? (userSnap.data() as User).passportCountry : undefined;
+
+      // Rubric-tagged "extra evidence helps" criteria, by their own titles.
+      const byId = new Map(rubric.criteria.map((c) => [c.criterionId, c.title]));
+      const evidenceAreas = (rubric.evidenceHelpsCriterionIds ?? [])
+        .filter((id) => byId.has(id))
+        .map((id) => ({ id, label: byId.get(id) as string }));
+
+      // (#233) Statistics are per destination COUNTRY: a rubric with no country
+      // (a bloc / treaty layer read on its own) has none to show. A merged stack
+      // view always carries its own layer's country (rubric-stack.ts).
+      if (!rubric.countryCode) return undefined;
+      const build = this.deps.buildCountryContext ?? buildCountryContext;
+      const result = await build({
+        destination: rubric.countryCode,
+        categoryKey: mapping.categoryKey,
+        categoryLabel: mapping.categoryLabel,
+        passportCountry,
+        evidenceAreas,
+      });
+      return result.status === "available" ? result : undefined;
+    } catch (err) {
+      // Counted, never fatal; no applicant data in the log.
+      console.warn(`[ai-case-officer] country context not built for assessment ${assessmentId}: ${err instanceof Error ? err.name : "error"}`);
+      return undefined;
+    }
+  }
+
+  /** Store the result of a finished job. */
+  // Public since #37. `extra` is merged into the same write (the bulk path adds its
+  // supersede links, change summary and review flag), so a result and its bulk
+  // fields land in ONE update and a reader never sees one without the other.
+  async storeContent(
+    id: string,
+    rubric: VisaRubric,
+    content: AssessmentContent,
+    // (#384) `narrative` usage/model only when the narrative call was made.
+    usage: { extract: AssessmentUsage; judge: AssessmentUsage; narrative?: AssessmentUsage },
+    models: { extract: string | null; judge: string | null; narrative?: string | null },
+    suspiciousContent: ApplicationAssessment["suspiciousContent"] = [],
+    // (#384) The interactive worker passes `{ narrative }` here; every other
+    // caller (the bar and nothing-to-read paths, the bulk path) leaves it out
+    // and the result is stored with `narrative: null`.
+    extra: Partial<ApplicationAssessment> = {}
+  ): Promise<void> {
+    // Items dropped by code (a criterion id the rubric does not contain, or model
+    // text that broke the banned-wording list) are logged as a COUNT. The text is
+    // never logged: it may carry an applicant's words.
+    if (content.unanchoredCount > 0) {
+      // A count only: never the text or the model's index values.
+      console.warn(`[ai-case-officer] assessment ${id}: ${content.unanchoredCount} statement finding(s) stored without a position`);
+    }
+    if (content.droppedCount > 0) {
+      console.warn(`[ai-case-officer] assessment ${id}: ${content.droppedCount} model item(s) dropped by code checks`);
+    }
+    // Cost from the price table; null while a role has no confirmed price.
+    const extractCost = costOfUsage("extraction", this.usageAsLlm(usage.extract));
+    const judgeCost = costOfUsage("judgement", this.usageAsLlm(usage.judge));
+    // (#384) The narrative's cost, only when its call was made (0 otherwise, so
+    // a review without one is priced exactly as before).
+    const narrativeCost = usage.narrative ? costOfUsage("narrative", this.usageAsLlm(usage.narrative)) : 0;
+    // Computed AFTER the content above is final, from nothing in it (#116).
+    const countryContext = await this.countryContextFor(rubric, id);
+    await this.finish(id, {
+      status: "succeeded",
+      error: null,
+      stageOutcomes: content.stageOutcomes,
+      score: content.score,
+      readiness: content.readiness,
+      refusalGrounds: content.refusalGrounds,
+      credibilityFlags: content.credibilityFlags,
+      strengths: content.strengths,
+      statementFindings: content.statementFindings,
+      statement: content.statement,
+      insufficientInformation: content.insufficientInformation,
+      suspiciousContent,
+      confidence: content.confidence,
+      topIssues: topIssuesOf(rubric, content),
+      hasBlockingRule: content.hasBlockingRule,
+      // (#384) The bar that stops the review, copied in code from the first
+      // mandatory-bar refusal ground (never model text); null when none.
+      blockingRule: blockingRuleOf(content.refusalGrounds),
+      // (#384) Null unless the interactive worker wrote one (it passes it in `extra`).
+      narrative: null,
+      internalCall: content.internalCall,
+      // Spread only when present: an absent note is an absent field, not null.
+      ...(countryContext ? { countryContext } : {}),
+      models,
+      model: models.judge ?? models.extract ?? null,
+      usage,
+      // A total only when both stages are priced: a part-priced total would understate the spend.
+      costUsd: extractCost === null || judgeCost === null || narrativeCost === null ? null : extractCost + judgeCost + narrativeCost,
+      ...extra,
+    });
+    // Proposed actions (issue #44): derived from the findings just stored and
+    // checked against THIS rubric version. They are inert proposals (nothing is
+    // created for the applicant until a human accepts one). Best-effort inside
+    // the service: it never throws, so it cannot fail a stored verdict.
+    const stored = await this.getById(id);
+    if (stored) await aiActionService.writeForAssessment(stored, rubric, content);
+  }
+
+  /** Stored usage in the shape the price function takes. */
+  private usageAsLlm(u: AssessmentUsage): LlmUsage {
+    return { inputTokens: u.inputTokens, outputTokens: u.outputTokens, cacheReadTokens: u.cacheReadTokens, cacheWriteTokens: u.cacheWriteTokens };
+  }
+
+  /**
+   * Count one assessment against today's cap, in a transaction, before its first
+   * model call. A job over the cap is failed with `daily_cap_exceeded`.
+   */
+  private async claimDailyCap(settings: AiSettings): Promise<void> {
+    const ref = collections.aiCosts.doc(dayKey(this.deps.now()));
+    await this.deps.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const used = snap.exists ? Number((snap.data() as { assessments?: number }).assessments ?? 0) : 0;
+      if (used >= settings.maxAssessmentsPerDay) throw new JobStop("daily_cap_exceeded", "today's assessment cap is used up");
+      tx.set(ref, { assessments: used + 1 }, { merge: true });
+    });
+  }
+}
+
+/** A document that could not be read: its criteria become insufficient. */
+export function unreadable(base: { documentId: string; label: string }, reason: string): DocumentExtraction {
+  return { ...base, mediaType: "", readable: false, values: [], failed: false, failure: reason, suspicious: false };
+}
+
+/**
+ * (#308) What the applicant recognises each upload by, for the title of a "we
+ * couldn't read this upload" item. In order: the title of the rulebook's
+ * document item it was uploaded to (checklist ids are `ev-<item key>`), else
+ * the upload's display name, document type or file name. An upload with none
+ * of these is left out (the engine then falls back to its code label).
+ */
+export function documentNamesFor(
+  documents: ReadonlyArray<{ id: string; name?: string; requirementId?: string }>,
+  rubric: Partial<Pick<VisaRubric, "evidenceItems">>
+): Record<string, string> {
+  const names: Record<string, string> = {};
+  for (const d of documents) {
+    const key = d.requirementId?.startsWith("ev-") ? d.requirementId.slice(3) : null;
+    const item = key ? (rubric.evidenceItems ?? []).find((e) => e.key === key) : undefined;
+    const name = item?.title ?? d.name;
+    if (name && name.trim()) names[d.id] = name.trim();
+  }
+  return names;
+}
+
+/** A document whose extraction failed: counted as unread, never as a pass. */
+export function failed(base: { documentId: string; label: string }, reason: string): DocumentExtraction {
+  return { ...base, mediaType: "", readable: false, values: [], failed: true, failure: reason, suspicious: false };
+}
+
+/** Singleton over the real provider, Storage, Firestore and settings. */
+export const aiCaseOfficerService = new AiCaseOfficerService();

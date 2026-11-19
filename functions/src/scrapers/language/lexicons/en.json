@@ -1,0 +1,32 @@
+{
+  "_about": "Language facts for reading numbers, dates, durations and reference shapes in a quote. DATA, not code: see ../README.md for the format and how to add a language. Only standard facts about the language belong here, never immigration content.",
+  "code": "en",
+  "name": "English",
+  "isProductLanguage": true,
+  "decimalSeparator": ".",
+  "thousandsSeparators": [","],
+  "numberWords": {
+    "units": {
+      "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+      "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19
+    },
+    "tens": { "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90 },
+    "hundreds": {},
+    "scales": { "hundred": 100, "thousand": 1000, "million": 1000000, "billion": 1000000000 },
+    "scaleJoiners": ["and"],
+    "tensUnitsJoiners": [],
+    "tensUnitsNeedJoiner": false,
+    "loneOneWords": ["one"]
+  },
+  "durationWords": ["day", "days", "week", "weeks", "month", "months", "year", "years"],
+  "months": {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3, "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9, "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12
+  },
+  "dateTemplates": [
+    "\\b(?<day>\\d{1,2})(?:st|nd|rd|th)?(?:\\s+of)?\\s+(?<month>{months})\\b\\.?,?\\s+(?<year>\\d{4})\\b",
+    "\\b(?<month>{months})\\b\\.?\\s+(?<day>\\d{1,2})(?:st|nd|rd|th)?,?\\s+(?<year>\\d{4})\\b"
+  ],
+  "scopeWords": ["Appendix", "Part"],
+  "referenceWords": []
+}

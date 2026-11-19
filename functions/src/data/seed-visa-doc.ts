@@ -1,0 +1,133 @@
+import type { Timestamp } from "firebase-admin/firestore";
+import type { SharedRouteRef } from "../types/shared-route";
+// #299: the fee of a shared route, already converted by the pure helper.
+import type { SourcedFeeFields } from "./seed-sourced-fee";
+// #339: the processing time and stay limit of a shared route, decided by the pure helper.
+import type { RouteFactFields } from "./seed-route-facts";
+
+// ============================================
+// SEED VISA DOCUMENT BUILDER (issue #239, P10 of #228)
+// ============================================
+//
+// Pure (no Firebase call) so the seed's rules are unit tested: what the seed
+// owns and refreshes, what it keeps from the stored doc, and `inheritsFrom`.
+//
+// The seed writes each visa record with a WHOLE-DOCUMENT `set`, so any field
+// it does not name is dropped from an existing doc. `inheritsFrom` (written by
+// the shared-routes admin API, or by the migration script from the data file)
+// must therefore survive a re-seed, which runs on every dev deploy.
+//
+// Issue #299: `baseCostUsd` + `sourcedFee` of a record that inherits a shared
+// route with a fee are SEED-OWNED too. The seed decides them on every run
+// (seed-sourced-fee.ts) and passes the result in; when it passes none, the
+// whole-document set drops both, which is how a removed fee disappears.
+//
+// Issue #339: the same holds for a shared route's processing time and stay
+// limit (`processingTime` / `processingDaysMin` / `processingDaysMax`,
+// `validityPeriod`, and their `sourcedFacts` citations), decided by
+// seed-route-facts.ts. The seed refuses an entry that sets any of them itself
+// while its route supplies it, so the two never compete here.
+
+/** The seed-owned fields of one visa record (the optional ones may be absent: see seed-countries-visas.ts). */
+export interface SeedVisaFields {
+  id: string;
+  countryCode: string;
+  name: string;
+  code: string;
+  description: string;
+  category: string;
+  /**
+   * #306: the three processing fields are optional. Absent when no official
+   * source for the processing time is recorded: the key is then left out of
+   * the stored doc (never `""` or `0`), like a scraped visa whose page states none.
+   */
+  processingTime?: string;
+  processingDaysMin?: number;
+  processingDaysMax?: number;
+  /** Absent when no official source for the fee is recorded: the displayed fee then comes from the rulebook / scrape, not the seed. */
+  baseCostUsd?: number;
+  /** Absent when no official source for the validity is recorded. */
+  validityPeriod?: string;
+  /** #306: absent when no official source says whether the visa can be extended (never written as `false`). */
+  isExtendable?: boolean;
+  maxExtensions?: number;
+  eligibilityCriteria: string[];
+  applicationUrl?: string;
+  applicationInstructions?: string;
+}
+
+/**
+ * Build the document the seed writes for one visa record.
+ *
+ * @param visa      the seed entry
+ * @param existing  the stored doc, if any (runtime-owned fields are kept from it)
+ * @param now       timestamp for createdAt (new doc) and updatedAt
+ * @param fromData  shared routes the DATA FILE says this record inherits
+ *                  (`inheritsFromFor`); the seed itself names none
+ * @param sourced   #299: the record's sourced fee (`sourcedFeeFields` of the
+ *                  seed's decision), or undefined when it has none. The seed
+ *                  refuses an entry that has both this and its own
+ *                  `baseCostUsd`, so the two never compete here.
+ * @param facts     #339: the record's route facts (`routeFactFields` of the
+ *                  seed's decision), or undefined when it has none.
+ *
+ * `inheritsFrom`: a stored value always wins (it was set deliberately by the
+ * admin API or the migration, and may have been changed since); the data
+ * file's value is used only for a record that has none. Absent and empty
+ * stay absent: the field is never written as `[]`.
+ */
+export function buildVisaTypeDoc(
+  visa: SeedVisaFields,
+  existing: Record<string, unknown> | undefined,
+  now: Timestamp,
+  fromData: SharedRouteRef[] = [],
+  sourced?: SourcedFeeFields,
+  facts?: RouteFactFields
+): Record<string, unknown> {
+  const storedInherits = Array.isArray(existing?.inheritsFrom) ? (existing!.inheritsFrom as SharedRouteRef[]) : undefined;
+  const inheritsFrom = storedInherits && storedInherits.length > 0 ? storedInherits : fromData.length > 0 ? fromData : undefined;
+  return {
+    id: visa.id,
+    countryCode: visa.countryCode,
+    name: visa.name,
+    code: visa.code,
+    description: visa.description,
+    category: visa.category,
+    // #306: each processing field is written only when the entry states it
+    // (omitted, not "" / 0 / undefined). An entry that states them is written
+    // exactly as before.
+    ...(visa.processingTime !== undefined && { processingTime: visa.processingTime }),
+    ...(visa.processingDaysMin !== undefined && { processingDaysMin: visa.processingDaysMin }),
+    ...(visa.processingDaysMax !== undefined && { processingDaysMax: visa.processingDaysMax }),
+    // Omitted (not 0, not ""), exactly like a scraped visa whose page states no fee.
+    ...(visa.baseCostUsd !== undefined && { baseCostUsd: visa.baseCostUsd }),
+    // #299: the shared route's fee in whole USD, with its source and dated
+    // rate beside it. Written together or not at all (never `undefined`).
+    ...(sourced && { baseCostUsd: sourced.baseCostUsd, sourcedFee: sourced.sourcedFee }),
+    ...(visa.validityPeriod !== undefined && { validityPeriod: visa.validityPeriod }),
+    // #306: same rule: no source on record, no key (never `false`).
+    ...(visa.isExtendable !== undefined && { isExtendable: visa.isExtendable }),
+    ...(visa.maxExtensions !== undefined && { maxExtensions: visa.maxExtensions }),
+    // #339: the shared route's processing time and stay limit, with one
+    // citation per fact. Each key is written only when the decision carries
+    // it (an unstated minimum stays absent, never 0). Placed after the entry's
+    // own fields; the seed guarantees the entry sets none of these itself.
+    ...(facts?.processingTime !== undefined && { processingTime: facts.processingTime }),
+    ...(facts?.processingDaysMin !== undefined && { processingDaysMin: facts.processingDaysMin }),
+    ...(facts?.processingDaysMax !== undefined && { processingDaysMax: facts.processingDaysMax }),
+    ...(facts?.validityPeriod !== undefined && { validityPeriod: facts.validityPeriod }),
+    ...(facts && { sourcedFacts: facts.sourcedFacts }),
+    eligibilityCriteria: visa.eligibilityCriteria,
+    ...(visa.applicationUrl && { applicationUrl: visa.applicationUrl }),
+    ...(visa.applicationInstructions && { applicationInstructions: visa.applicationInstructions }),
+    // #239: keep the shared-route inheritance across a whole-document re-seed.
+    ...(inheritsFrom && { inheritsFrom }),
+    // Runtime-owned fields. A NEW doc starts active, with no agents and
+    // createdAt = now. An EXISTING doc keeps what is stored; the `??` default
+    // covers a legacy doc missing the field. Everything above is seed-owned.
+    isActive: existing ? (existing.isActive as boolean | undefined) ?? true : true,
+    agentIds: existing ? (existing.agentIds as string[] | undefined) ?? [] : [],
+    createdAt: existing ? (existing.createdAt as Timestamp | undefined) ?? now : now,
+    updatedAt: now,
+  };
+}

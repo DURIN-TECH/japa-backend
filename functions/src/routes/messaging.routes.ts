@@ -9,6 +9,7 @@ import {
   sendMessage,
   markAsRead,
   deleteConversation,
+  getConversation,
 } from "../controllers/messaging.controller";
 
 const router = Router();
@@ -20,6 +21,11 @@ router.use(verifyAuth);
 // "messaging" entitlement.
 router.get("/", listConversations);
 router.post("/", requireFeature(FEATURES.MESSAGING), createConversation);
+
+// One conversation (with the caller's AI-access view). There is no per-chat AI
+// switch route any more (retired in #209): AI access is off only through the
+// account-wide setting.
+router.get("/:id", getConversation);
 
 // Message routes (nested under conversation)
 router.get("/:id/messages", getMessages);

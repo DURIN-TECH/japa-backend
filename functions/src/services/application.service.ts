@@ -2,7 +2,6 @@ import {
   collections,
   subcollections,
   serverTimestamp,
-  increment,
 } from "../utils/firebase";
 import {
   Application,
@@ -15,6 +14,31 @@ import {
 import { Timestamp } from "firebase-admin/firestore";
 import { visaService } from "./visa.service";
 import { noteService } from "./note.service";
+// Case-start rule for agency visas (issue #102). Imported from its file, not
+// the agency-visas index, so this service does not pull in routes.
+import { canStartCaseOnVisa } from "../agency-visas/agency-visa-access";
+// Issue #231: the rulebook stack fixed on a new application (light import: no authorities service).
+import { resolveRouteStackFor, routeStackKeys } from "../shared-routes/route-stack";
+// Issue #234: the applicant's holdings, copied onto the application when it starts.
+import { applicantFactsFromUser } from "./applicant-holdings.service";
+import type { ThroughCountryChoice, User } from "../types";
+// Issue #235: the answers given in the "apply through" step seed the intake.
+import { intakeService } from "./intake.service";
+import { fromMajor } from "../money/money";
+import { getCurrencyInfo } from "../money/currencies";
+
+/**
+ * A dollar figure from a visa record (`baseCostUsd`, a plain number of
+ * dollars) as US cents, through the currency table (issue #181: no literal
+ * `* 100`). A value with more decimals than USD has is rounded to the cent
+ * first (it is a published fee, not a payment); anything that is not a
+ * finite, non-negative number counts as 0 (no total yet).
+ */
+export function usdCentsFromDollars(dollars: unknown): number {
+  if (typeof dollars !== "number" || !Number.isFinite(dollars) || dollars < 0) return 0;
+  const exponent = getCurrencyInfo("USD")!.exponent;
+  return fromMajor(dollars.toFixed(exponent), "USD").amountMinor;
+}
 
 export interface CreateApplicationInput {
   visaTypeId: string;
@@ -39,6 +63,13 @@ export interface CreateApplicationInput {
   createdByAdminId?: string;
   createdByAdminName?: string;
   adminCreationReason?: string;
+  // Issue #235 (P6 of #228): set when the application is on a SHARED route and
+  // the applicant confirmed the member country to apply through. `countryCode`
+  // and `visaTypeId` above are then that member's own inheriting record
+  // (checked by services/competence.service.ts `resolveForCreate`). The answers
+  // the proposal was worked out from seed the intake, so they are not asked
+  // again. Absent for every other application.
+  throughCountry?: { choice: ThroughCountryChoice; answers: Record<string, unknown>; routeName?: string };
 }
 
 export interface UpdateApplicationInput {
@@ -49,7 +80,53 @@ export interface UpdateApplicationInput {
   mode?: "self" | "agent";
 }
 
+/**
+ * Statuses that end an application (#253). Same set the plan-limit count
+ * treats as "not active" (application.controller `countActiveApplications`).
+ * A finished or abandoned application never counts as a duplicate.
+ *
+ * Exported for the applicant's withdraw guard (#259, application.controller
+ * `updateStatus`): these are the "closed" statuses an applicant can no longer
+ * withdraw from. One list, so "closed" cannot mean two things.
+ */
+export const TERMINAL_STATUSES: ApplicationStatus[] = [
+  "approved",
+  "rejected",
+  "withdrawn",
+  "expired",
+];
+
 class ApplicationService {
+  /**
+   * Find the user's live application for this exact country + visa (#253).
+   *
+   * Query shape: three equality filters only (userId, countryCode,
+   * visaTypeId), which Firestore serves by merging single-field indexes, so
+   * no composite index is needed. Status is filtered in memory (a `not-in`
+   * on top would need one). The result set is tiny (one user, one visa).
+   *
+   * Returns the most recently updated live match, or null.
+   */
+  async findActiveDuplicate(
+    userId: string,
+    countryCode: string,
+    visaTypeId: string
+  ): Promise<Application | null> {
+    const snap = await collections.applications
+      .where("userId", "==", userId)
+      .where("countryCode", "==", countryCode)
+      .where("visaTypeId", "==", visaTypeId)
+      .get();
+    const live = snap.docs
+      .map((d) => d.data() as Application)
+      .filter((a) => !TERMINAL_STATUSES.includes(a.status));
+    if (live.length === 0) return null;
+    // Newest activity first (Timestamps; fall back to 0 if one is missing).
+    const ms = (a: Application) => a.lastUpdated?.toMillis?.() ?? 0;
+    live.sort((a, b) => ms(b) - ms(a));
+    return live[0];
+  }
+
   /**
    * Create a new application
    */
@@ -57,14 +134,30 @@ class ApplicationService {
     userId: string,
     input: CreateApplicationInput
   ): Promise<Application> {
-    // Verify visa type exists
-    const visaType = await visaService.getVisaType(
+    // Resolve agencyId from the agent if mode is "agent". Done FIRST (issue
+    // #102): which agency the case belongs to decides whether it may be
+    // started on an agency-only visa.
+    const agencyId = await this.resolveAgentAgencyId(input.agentId);
+
+    // Verify the visa exists AND may be used for this case (issue #102):
+    // refused when the visa is draft / pending / rejected / inactive, or
+    // agency-only and the case does not belong to the owning agency. The
+    // refusal is the same error as an unknown id (controllers answer 404),
+    // so a hidden visa's existence never leaks. Nothing is written.
+    const visaType = await this.getStartableVisa(
       input.countryCode,
-      input.visaTypeId
+      input.visaTypeId,
+      agencyId
     );
-    if (!visaType) {
-      throw new Error("Visa type not found");
-    }
+
+    // Issue #231 (P2 of #228): fix the rulebook stack this application runs on
+    // NOW (shared layer(s) first, the country's own layer last), so a later
+    // change of the visa's `inheritsFrom` does not rewrite a running
+    // application. A visa that inherits nothing costs no extra read and gets
+    // just its own key `{countryCode}_{visaTypeId}`.
+    const routeStack = routeStackKeys(
+      await resolveRouteStackFor(input.countryCode, input.visaTypeId, visaType.inheritsFrom)
+    );
 
     // Get requirements to count required documents
     const requirements = await visaService.getRequirements(
@@ -92,18 +185,6 @@ class ApplicationService {
         : "");
     const clientEmail = input.clientEmailOverride || userData?.email || "";
     const clientPhone = input.clientPhoneOverride || userData?.phone || undefined;
-
-    // Resolve agencyId from the agent if mode is "agent"
-    let agencyId: string | undefined;
-    if (input.agentId) {
-      const agentSnapshot = await collections.agents
-        .where("userId", "==", input.agentId)
-        .limit(1)
-        .get();
-      if (!agentSnapshot.empty) {
-        agencyId = (agentSnapshot.docs[0].data()).agencyId;
-      }
-    }
 
     const docRef = collections.applications.doc();
     const now = Timestamp.now();
@@ -134,8 +215,11 @@ class ApplicationService {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: visaType.baseCostUsd * 100, // Convert to cents
+      // Issue #181: US cents with an explicit currency (see Application in
+      // types/index.ts). Converted through the currency table, never `* 100`.
+      totalCost: usdCentsFromDollars(visaType.baseCostUsd),
       amountPaid: 0,
+      costCurrency: "USD",
       paymentStatus: "pending",
       userNotes: input.userNotes,
       agentNotes: input.agentNotes,
@@ -145,9 +229,34 @@ class ApplicationService {
       clientPhone,
       visaTypeName: visaType.name,
       countryName: country?.name || input.countryCode,
+      routeStack,
+      // Issue #234 (P5 of #228): what the applicant holds (nationalities,
+      // country of residence, held visas and permits), COPIED from their
+      // profile now, with the time taken (same pattern as the intake answers).
+      // Assessment reads this copy, never the live profile, so a later profile
+      // edit does not change what this application is assessed on. Facts the
+      // applicant has not stated are copied as "not stated", never guessed.
+      applicantFacts: applicantFactsFromUser(userData as Partial<User> | null, now),
       createdAt: now,
       updatedAt: now,
     };
+
+    // Issue #235: a shared-route application records the confirmed member
+    // country, who chose it and the rule shown at the time, and starts its
+    // intake with the answers already given (only those whose question is in
+    // this application's stack; nothing is ever dropped silently: anything
+    // else is set aside on the intake, see rebuildIntake).
+    if (input.throughCountry) {
+      application.throughCountryCode = input.throughCountry.choice.countryCode;
+      application.throughCountry = input.throughCountry.choice;
+      // (#237) The shared route's name at creation, beside `countryName` (the
+      // country applied through), so screens can say "<route> through <country>".
+      if (input.throughCountry.routeName) application.routeName = input.throughCountry.routeName;
+      if (Object.keys(input.throughCountry.answers).length > 0) {
+        const seeded = await intakeService.rebuildIntake({ countryCode: input.countryCode, visaTypeId: input.visaTypeId, routeStack }, { answers: input.throughCountry.answers }, now);
+        if (seeded.intake) application.intake = seeded.intake;
+      }
+    }
 
     await docRef.set(application);
 
@@ -160,6 +269,45 @@ class ApplicationService {
     });
 
     return application;
+  }
+
+  /**
+   * The agency a case belongs to, from its agent: the `agencyId` of the
+   * agent doc whose `userId` is `agentUid`. Undefined for a case with no
+   * agent, an unknown agent, or an independent agent (no agency).
+   */
+  async resolveAgentAgencyId(agentUid: string | undefined): Promise<string | undefined> {
+    if (!agentUid) return undefined;
+    const agentSnapshot = await collections.agents
+      .where("userId", "==", agentUid)
+      .limit(1)
+      .get();
+    if (agentSnapshot.empty) return undefined;
+    return (agentSnapshot.docs[0].data()).agencyId || undefined;
+  }
+
+  /**
+   * Read the visa a new case is for and check it may be used (issue #102,
+   * `canStartCaseOnVisa`): public visas for any case; an approved, active,
+   * agency-only visa only for a case of the owning agency; nothing else.
+   *
+   * Throws `Error("Visa type not found")` both for an unknown id and for a
+   * refused visa, so callers answer the same 404 and existence never leaks.
+   * Also used by `POST /applications/for-client` BEFORE it provisions a
+   * client account, so a refused visa creates nothing at all.
+   *
+   * @param caseAgencyId the agency the new case will belong to (or none)
+   */
+  async getStartableVisa(
+    countryCode: string,
+    visaTypeId: string,
+    caseAgencyId: string | null | undefined
+  ) {
+    const visaType = await visaService.getVisaType(countryCode, visaTypeId);
+    if (!visaType || !canStartCaseOnVisa(visaType, caseAgencyId)) {
+      throw new Error("Visa type not found");
+    }
+    return visaType;
   }
 
   /**
@@ -339,7 +487,12 @@ class ApplicationService {
     if (status === "approved" || status === "rejected") {
       updateData.completedAt = serverTimestamp() as unknown as Timestamp;
     }
-    if (status === "submitted_to_embassy" && !application.submittedAt) {
+    // `submittedAt` pins the date the application was made. It is set once, on
+    // the FIRST move to under_review (the applicant's submission) or to
+    // submitted_to_embassy, never overwritten, and only here on the server: no
+    // client-supplied field reaches it (UpdateApplicationInput does not carry it).
+    // The AI assessment checks mandatory bars against this date (#42).
+    if ((status === "under_review" || status === "submitted_to_embassy") && !application.submittedAt) {
       updateData.submittedAt = serverTimestamp() as unknown as Timestamp;
     }
 
@@ -443,40 +596,6 @@ class ApplicationService {
     }
 
     await collections.applications.doc(applicationId).update(updates);
-  }
-
-  /**
-   * Atomically increment the amountPaid on an application
-   * and recalculate paymentStatus based on totalCost.
-   */
-  async incrementAmountPaid(applicationId: string, amount: number): Promise<void> {
-    const appRef = collections.applications.doc(applicationId);
-    const doc = await appRef.get();
-
-    if (!doc.exists) {
-      throw new Error("Application not found");
-    }
-
-    const application = doc.data() as Application;
-    const newAmountPaid = (application.amountPaid || 0) + amount;
-    const totalCost = application.totalCost || 0;
-
-    // Determine new payment status
-    let paymentStatus: PaymentStatus;
-    if (newAmountPaid >= totalCost && totalCost > 0) {
-      paymentStatus = "paid";
-    } else if (newAmountPaid > 0) {
-      paymentStatus = "partial";
-    } else {
-      paymentStatus = "pending";
-    }
-
-    await appRef.update({
-      amountPaid: increment(amount),
-      paymentStatus,
-      updatedAt: serverTimestamp(),
-      lastUpdated: serverTimestamp(),
-    });
   }
 
   // ============================================

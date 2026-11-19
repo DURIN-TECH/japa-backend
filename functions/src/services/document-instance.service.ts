@@ -32,6 +32,10 @@ export interface CloneInput {
   createdByName?: string; // denormalized display name
   agencyId?: string | null; // owning agency (null for independent agents)
   applicationId?: string | null; // optional link at creation time
+  // Optional deterministic doc id. When set the instance is written with
+  // `create()` (fails if the id exists) so a duplicate request cannot make a
+  // second instance: used for the applicant's one-per-application statement (#43).
+  fixedId?: string;
 }
 
 // Inputs for a save (PUT). `expectedVersion` is the version the editor last
@@ -86,6 +90,23 @@ class DocumentInstanceService {
     return this.sortStripped(snap);
   }
 
+  /**
+   * Instances linked to an application AND actually shared with its client.
+   *
+   * The client-facing counterpart of `listForApplication`. Sharing is a per-
+   * document decision an agent makes (`PATCH /:id/share`), so a draft an agent is
+   * still working on must never appear here — `shareStatus` is filtered in memory
+   * to keep the query to the single equality filter this service standardises on.
+   */
+  async listSharedForApplication(
+    applicationId: string
+  ): Promise<DocumentInstance[]> {
+    const snap = await collections.documentInstances
+      .where("applicationId", "==", applicationId)
+      .get();
+    return this.sortStripped(snap).filter((i) => i.shareStatus === "shared");
+  }
+
   /** All instances (admin only). */
   async listAll(): Promise<DocumentInstance[]> {
     const snap = await collections.documentInstances.get();
@@ -114,7 +135,9 @@ class DocumentInstanceService {
    */
   async clone(input: CloneInput): Promise<DocumentInstance> {
     const now = Timestamp.now();
-    const ref = collections.documentInstances.doc();
+    const ref = input.fixedId
+      ? collections.documentInstances.doc(input.fixedId)
+      : collections.documentInstances.doc();
 
     const instance: DocumentInstance = {
       id: ref.id,
@@ -140,7 +163,10 @@ class DocumentInstanceService {
 
     // Write the instance and its first version snapshot together.
     const batch = db.batch();
-    batch.set(ref, instance);
+    // `create` (not `set`) for a fixed id: it rejects with ALREADY_EXISTS instead
+    // of overwriting, so a racing duplicate cannot replace an edited statement.
+    if (input.fixedId) batch.create(ref, instance);
+    else batch.set(ref, instance);
     const versionRef = subcollections.documentVersions(ref.id).doc();
     batch.set(
       versionRef,

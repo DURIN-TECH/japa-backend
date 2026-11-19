@@ -222,6 +222,7 @@ The `role` query parameter controls which applications are returned:
 | `transactions` | Payment records |
 | `notifications` | Push notification records |
 | `conversations` | Agent-user chat conversations |
+| `documents` | Uploaded application documents, linked by `applicationId` (top-level; there is no `applications/{id}/documents` subcollection) |
 
 ### Subcollections
 
@@ -229,7 +230,6 @@ The `role` query parameter controls which applications are returned:
 |------|-------------|
 | `countries/{code}/visaTypes/{id}` | Visa types for a country |
 | `countries/{code}/visaTypes/{id}/requirements/{id}` | Required documents per visa |
-| `applications/{id}/documents/{id}` | Uploaded documents for an application |
 | `applications/{id}/timeline/{id}` | Status timeline entries |
 | `applications/{id}/notes/{id}` | Agent/owner case notes |
 | `agents/{id}/reviews/{id}` | Client reviews for an agent |
@@ -252,12 +252,12 @@ All seeded with password `password123`:
 
 | Role | Email | UID | Custom Claims |
 |------|-------|-----|---------------|
-| Admin | admin@japatest.com | seed-user-admin-001 | `admin: true` |
-| Admin 2 | admin2@japatest.com | seed-user-admin-002 | `admin: true` |
-| Agency Owner | owner@japatest.com | seed-user-owner-001 | — |
-| Agent 1 | agent1@japatest.com | seed-user-agent-001 | — |
-| Agent 2 | agent2@japatest.com | seed-user-agent-002 | — |
-| Client | john.doe@example.com | seed-user-client-001 | — |
+| Admin | delivered+admin@resend.dev | seed-user-admin-001 | `admin: true` |
+| Admin 2 | delivered+admin2@resend.dev | seed-user-admin-002 | `admin: true` |
+| Agency Owner | delivered+owner@resend.dev | seed-user-owner-001 | — |
+| Agent 1 | delivered+agent1@resend.dev | seed-user-agent-001 | — |
+| Agent 2 | delivered+agent2@resend.dev | seed-user-agent-002 | — |
+| Client | delivered+john.doe@resend.dev | seed-user-client-001 | — |
 
 Additional clients (jane.smith, ahmed.ali, etc.) are also seeded for case data.
 
@@ -336,6 +336,12 @@ The portal seed creates:
 - Conversations, payment requests, bank accounts
 
 All IDs are deterministic (`seed-*`) so the script is idempotent.
+
+### E2E emulators and fixture (mobile Maestro suite)
+
+`firebase.e2e.json` (non-default ports, UI off) and `npm run seed:e2e`
+(emulator-only: full seed plus an approved rulebook and a free-plan client) are
+described in [docs/e2e-emulators.md](docs/e2e-emulators.md).
 
 ## API Testing (`api.http`)
 

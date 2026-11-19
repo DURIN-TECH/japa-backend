@@ -10,7 +10,15 @@ export type SourceStatus = "active" | "paused" | "broken" | "retired";
 
 export type ArticleImportance = "breaking" | "high" | "normal" | "low";
 
-export type SupportedCountryCode = "CA" | "AU" | "IE" | "GB";
+/**
+ * The ONE list of country codes news sources and articles may carry (issue
+ * #17). `SupportedCountryCode` is derived from it, and the news-source config
+ * validation checks edits against it, so widening the list (issue #26) is a
+ * one-line change here.
+ */
+export const SUPPORTED_COUNTRY_CODES = ["CA", "AU", "IE", "GB"] as const;
+
+export type SupportedCountryCode = (typeof SUPPORTED_COUNTRY_CODES)[number];
 
 export type ScrapeRunStatus = "running" | "success" | "partial" | "failed";
 
@@ -54,6 +62,14 @@ export interface ScrapingConfig {
 
   /** Custom HTTP headers (e.g., for Accept or User-Agent) */
   customHeaders?: Record<string, string>;
+
+  /**
+   * Issue #107: per-request timeout in ms for this source's requests (feed,
+   * listing page, article pages). Absent = the news HTTP client's default
+   * (NEWS_HTTP_TIMEOUT_MS, 15000). Clamped to NEWS_MAX_REQUEST_TIMEOUT_MS
+   * (60000) by the scraper. Set in seed-news-sources.ts (e.g. cic-news).
+   */
+  requestTimeoutMs?: number;
 }
 
 // ============================================
@@ -86,6 +102,29 @@ export interface NewsSource {
   successfulRuns: number;
   lastErrorMessage?: string;
   lastErrorAt?: Timestamp;
+
+  // Issue #17: zero-yield streak. `zeroYieldRuns` counts consecutive
+  // SUCCESSFUL runs whose `articlesFound` was 0 (reset by a run that found
+  // any article; a failed run leaves it alone). `zeroYieldSince` is when the
+  // streak began (cleared on reset). Both are maintained by
+  // news-source-health.ts and feed the `source_no_yield` alert. Optional:
+  // docs written before #17 lack them (= 0 / none).
+  zeroYieldRuns?: number;
+  zeroYieldSince?: Timestamp | null;
+
+  // Issue #107: set by the CRAWLER when it pauses the source itself
+  // (scrapers/shared/runs/source-health.ts): `broken` after
+  // `news.consecutiveFailureLimit` consecutive failures (cause
+  // "failure_limit"), or `paused` when a news_api provider key is missing
+  // (cause "missing_api_key"). Cleared on recovery / admin reset.
+  autoPaused?: boolean;
+  autoPausedAt?: Timestamp | null;
+  autoPausedReason?: string | null;
+  autoPauseCause?: "failure_limit" | "missing_api_key" | null;
+  // Issue #107: why the REGISTRY (seed-news-sources.ts) ships the source
+  // paused / retired, e.g. "domain does not resolve". Admin reasons live in
+  // `adminOverrides.reason`.
+  statusReason?: string;
 
   // Metadata
   isOfficial: boolean;
@@ -139,6 +178,12 @@ export interface NewsArticle {
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
+
+  // Retention (issue #19): max(publishedAt, createdAt) + 90 days. Firestore
+  // TTL deletes the doc after this; policy = the `newsArticles` / `expireAt`
+  // entry in `fieldOverrides` of firestore.indexes.json. Docs written before
+  // #19 get it from `npm run backfill:expireat`.
+  expireAt: Timestamp;
 }
 
 // ============================================
@@ -148,6 +193,10 @@ export interface NewsArticle {
 export interface ScrapeRun {
   id: string;
   sourceId: string;
+  // Issue #81: the run-wide `scrapeRuns/{runId}` record this source run
+  // belongs to (absent on logs written before #81, or for a standalone
+  // scrapeSource() call outside an orchestrator run).
+  runId?: string;
 
   status: ScrapeRunStatus;
 
@@ -169,6 +218,11 @@ export interface ScrapeRun {
   // Debug
   httpStatusCode?: number;
   responseTimeMs?: number;
+
+  // Retention (issue #19): startedAt + 30 days. Covered by the `scrapeRuns`
+  // `expireAt` TTL entry in `fieldOverrides` of firestore.indexes.json (its
+  // collection-group scope also matches newsSources/{id}/scrapeRuns).
+  expireAt: Timestamp;
 }
 
 // ============================================
@@ -204,8 +258,28 @@ export interface RawArticle {
   tags?: string[];
 }
 
+/**
+ * One news orchestrator run's summary. Logged by the scheduled function and
+ * stored verbatim as `summary` on the run's `scrapeRuns/{runId}` doc (#81).
+ */
 export interface OrchestratorResult {
-  sourcesProcessed: number;
+  sourcesProcessed: number; // sources scraped without throwing
   newArticles: number;
-  errors: number;
+  errors: number; // sources that failed or were skipped for a backoff
+  // ---- Issue #81: the rest of the run's counters ----
+  articlesFound: number; // raw articles returned by feeds / pages / APIs
+  articlesDuplicate: number;
+  articlesFailed: number; // articles that failed to normalise
+  sourcesDeferred: number; // skipped without a request: host backed off this run
+  hostsBackedOff: number; // sources whose host answered 429/503 this run
+  requestsAttempted: number; // listing / feed / article / API requests tried
+  // Issue #96 review: sources skipped because another run held their crawl
+  // lease (recorded as `deferred` source lines; not errors). Absent = 0.
+  sourcesLeased?: number;
+  // Issue #107: news_api sources skipped and paused because their provider
+  // key secret is missing (`deferred` lines, not errors). Absent = 0.
+  sourcesPaused?: number;
+  // Issue #107: sources THIS run auto-paused (streak reached
+  // news.consecutiveFailureLimit). Absent = 0.
+  sourcesAutoPaused?: number;
 }

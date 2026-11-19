@@ -1,0 +1,37 @@
+{
+  "_about": "Language facts for reading numbers, dates, durations and reference shapes in a quote. DATA, not code: see ../README.md for the format and how to add a language. Only standard facts about the language belong here, never immigration content. Deliberately left out because they are ambiguous or rare: the word for 10^12 (it differs between standards), thousands written with a space or an apostrophe (a digit run in any shape not listed here is unreadable, and an unreadable number is rejected, never guessed), and a bare 'un'/'una' as a number (it is an article; it counts only before a duration word).",
+  "code": "es",
+  "name": "Spanish",
+  "decimalSeparator": ",",
+  "thousandsSeparators": ["."],
+  "numberWords": {
+    "units": {
+      "cero": 0, "uno": 1, "un": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10,
+      "once": 11, "doce": 12, "trece": 13, "catorce": 14, "quince": 15,
+      "dieciséis": 16, "dieciseis": 16, "diecisiete": 17, "dieciocho": 18, "diecinueve": 19,
+      "veintiuno": 21, "veintiún": 21, "veintiun": 21, "veintiuna": 21, "veintidós": 22, "veintidos": 22, "veintitrés": 23, "veintitres": 23,
+      "veinticuatro": 24, "veinticinco": 25, "veintiséis": 26, "veintiseis": 26, "veintisiete": 27, "veintiocho": 28, "veintinueve": 29
+    },
+    "tens": { "veinte": 20, "treinta": 30, "cuarenta": 40, "cincuenta": 50, "sesenta": 60, "setenta": 70, "ochenta": 80, "noventa": 90 },
+    "hundreds": {
+      "cien": 100, "ciento": 100, "doscientos": 200, "doscientas": 200, "trescientos": 300, "trescientas": 300, "cuatrocientos": 400, "cuatrocientas": 400,
+      "quinientos": 500, "quinientas": 500, "seiscientos": 600, "seiscientas": 600, "setecientos": 700, "setecientas": 700,
+      "ochocientos": 800, "ochocientas": 800, "novecientos": 900, "novecientas": 900
+    },
+    "scales": { "mil": 1000, "millón": 1000000, "millon": 1000000, "millones": 1000000 },
+    "scaleJoiners": [],
+    "tensUnitsJoiners": ["y"],
+    "tensUnitsNeedJoiner": true,
+    "loneOneWords": ["un", "uno", "una"]
+  },
+  "durationWords": ["día", "días", "dia", "dias", "semana", "semanas", "mes", "meses", "año", "años", "ano", "anos"],
+  "months": {
+    "enero": 1, "ene": 1, "febrero": 2, "feb": 2, "marzo": 3, "mar": 3, "abril": 4, "abr": 4, "mayo": 5, "may": 5, "junio": 6, "jun": 6, "julio": 7, "jul": 7,
+    "agosto": 8, "ago": 8, "septiembre": 9, "setiembre": 9, "sep": 9, "sept": 9, "set": 9, "octubre": 10, "oct": 10, "noviembre": 11, "nov": 11, "diciembre": 12, "dic": 12
+  },
+  "dateTemplates": [
+    "\\b(?<day>\\d{1,2})(?:o|a|º|ª)?(?:\\s+de)?\\s+(?<month>{months})\\b\\.?,?(?:\\s+del?)?\\s+(?<year>\\d{4})\\b"
+  ],
+  "scopeWords": ["Anexo", "Apéndice", "Apendice", "Parte"],
+  "referenceWords": ["Art", "Arts", "Artículo", "Artículos", "Articulo", "Articulos"]
+}

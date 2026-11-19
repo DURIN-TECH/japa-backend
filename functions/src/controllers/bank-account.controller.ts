@@ -1,7 +1,14 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { bankAccountService } from "../services/bank-account.service";
-import { transactionService } from "../services/transaction.service";
+import { ROLES } from "@durin-tech/authz";
+import type { Role } from "@durin-tech/authz";
+import {
+  transactionService,
+  InsufficientBalanceError,
+  // Issue #354: money owed in any currency blocks withdrawals.
+  NegativeBalanceError,
+} from "../services/transaction.service";
 import {
   sendSuccess,
   sendError,
@@ -9,6 +16,13 @@ import {
   sendNotFound,
   ErrorMessages,
 } from "../utils/response";
+
+/**
+ * Roles that may ask for a payout (issue #287): the ones that earn money on
+ * the platform. Admins are deliberately NOT in the list: an admin has no
+ * payout balance of their own. Clients never earn here.
+ */
+const WITHDRAWAL_ROLES: readonly Role[] = [ROLES.AGENT, ROLES.OWNER];
 
 class BankAccountController {
   /**
@@ -125,27 +139,81 @@ class BankAccountController {
 
   /**
    * POST /bank-accounts/withdraw
-   * Create a withdrawal transaction
+   * Ask for a payout of `amount` (kobo, NGN) into one of the caller's own
+   * bank accounts. Writes a pending, manual withdrawal transaction.
+   *
+   * Body: `{ bankAccountId: string, amount: number }`.
+   *
+   * Checks, in this order (issue #287). Every refusal writes NOTHING:
+   *  1. role: only an agent or an agency owner has a payout balance. A
+   *     client, an admin, or a request with no resolved role gets 403
+   *     FORBIDDEN. (`verifyAgent` is not used: it lets admins through.)
+   *  2. `amount` must be a safe positive INTEGER number of kobo, else 400
+   *     VALIDATION_ERROR. A string is refused even when it looks numeric
+   *     ("5000"): before #287 `{ amount: "abc" }` was stored and turned the
+   *     agent's balance into NaN, after which every withdrawal passed.
+   *  3. `bankAccountId` must be a non-empty string, else 400
+   *     VALIDATION_ERROR.
+   *  4. the bank account must be one of the caller's own, else 404.
+   *  5. the amount must not exceed the caller's NGN available balance, else
+   *     400 VALIDATION_ERROR "Insufficient balance". This check and the write
+   *     run in ONE Firestore transaction
+   *     (`transactionService.withdrawWithBalanceCheck`), so two requests sent
+   *     at the same time can never both be paid from the same balance.
+   *
+   * Success: 201 with the transaction (`type: "withdrawal"`,
+   * `status: "pending"`, `currency: "NGN"`, `paymentProvider: "manual"`).
    */
   async withdraw(
     req: AuthenticatedRequest,
     res: Response
   ): Promise<void> {
     try {
-      const userId = req.userId!;
-      const { bankAccountId, amount } = req.body;
+      // ---- 1. Role: agents and agency owners only (admins refused) ----
+      // Fail closed: a missing role is treated as not allowed.
+      const role = req.authz?.role;
+      if (!role || !WITHDRAWAL_ROLES.includes(role)) {
+        sendError(
+          res,
+          "FORBIDDEN",
+          "Only agents and agency owners can withdraw",
+          403
+        );
+        return;
+      }
 
-      if (!bankAccountId || !amount || amount <= 0) {
+      const userId = req.userId!;
+      // `?? {}`: a request with no JSON body is a validation error, not a 500.
+      const { bankAccountId, amount } = (req.body ?? {}) as {
+        bankAccountId?: unknown;
+        amount?: unknown;
+      };
+
+      // ---- 2. Amount: a safe positive integer in kobo ----
+      // `typeof` first: Number.isSafeInteger is already false for strings,
+      // but the explicit check also narrows the type for the calls below.
+      if (typeof amount !== "number" || !Number.isSafeInteger(amount) || amount <= 0) {
         sendError(
           res,
           "VALIDATION_ERROR",
-          "bankAccountId and a positive amount are required",
+          "amount must be a positive whole number of kobo",
           400
         );
         return;
       }
 
-      // Verify the bank account belongs to the user
+      // ---- 3. Bank account id: a non-empty string ----
+      if (typeof bankAccountId !== "string" || bankAccountId.trim() === "") {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          "bankAccountId is required",
+          400
+        );
+        return;
+      }
+
+      // ---- 4. The bank account must belong to the caller ----
       const accounts = await bankAccountService.getAccounts(userId);
       const account = accounts.find((a) => a.id === bankAccountId);
       if (!account) {
@@ -153,9 +221,30 @@ class BankAccountController {
         return;
       }
 
-      // Check available balance
-      const stats = await transactionService.getStatsForAgent(userId);
-      if (amount > stats.availableBalance) {
+      // ---- 5. Balance check + write, in one Firestore transaction ----
+      // The balance compared is the one in WITHDRAWAL_CURRENCY only (#282):
+      // revenue in another currency never makes a naira withdrawal possible.
+      const transaction = await transactionService.withdrawWithBalanceCheck(
+        userId,
+        amount,
+        account
+      );
+
+      sendCreated(res, transaction, "Withdrawal initiated");
+    } catch (error) {
+      // Thrown inside the transaction, so nothing was written.
+      // Issue #354: a balance below zero in any currency (money owed, e.g.
+      // Paystack's fee on a refunded payment) blocks every withdrawal.
+      if (error instanceof NegativeBalanceError) {
+        sendError(
+          res,
+          "VALIDATION_ERROR",
+          `Your ${error.currency} balance is below zero. Withdrawals are paused until it is back to zero or above.`,
+          400
+        );
+        return;
+      }
+      if (error instanceof InsufficientBalanceError) {
         sendError(
           res,
           "VALIDATION_ERROR",
@@ -164,16 +253,6 @@ class BankAccountController {
         );
         return;
       }
-
-      // Create withdrawal transaction
-      const transaction = await transactionService.createWithdrawal(
-        userId,
-        amount,
-        account
-      );
-
-      sendCreated(res, transaction, "Withdrawal initiated");
-    } catch (error) {
       console.error("Error processing withdrawal:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }

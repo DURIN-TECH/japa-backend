@@ -10,6 +10,8 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
 import { seedCountriesAndVisas } from "./seed-countries-visas";
+// Type-only: the shape of the compliance file written on the seeded agency (#337).
+import type { AgencyCompliance } from "../types";
 
 const db = getFirestore();
 
@@ -65,10 +67,64 @@ const IDS = {
 };
 
 // ============================================
+// SEED EMAILS (Resend test addresses)
+// ============================================
+// Every seed user gets a Resend test inbox instead of a fake domain, so any
+// email the app sends to seed data (reset links, notifications, payment
+// requests) is accepted by Resend and simulated as delivered — no bounces
+// against our sending reputation, and nothing reaches a real person.
+//
+// Resend supports "+label" tagging on its test addresses, so the label is the
+// user's old seed local-part (admin, agent1, john.doe, ...):
+// delivered+admin@resend.dev. Short enough to type at login, and still tells
+// you in the Resend dashboard which seed user an email was sent to.
+// See https://resend.com/docs/dashboard/emails/send-test-emails
+//
+// NOTE: these are also the LOGIN emails for the seeded auth accounts.
+export function resendTestEmail(label: string): string {
+  return `delivered+${label}@resend.dev`;
+}
+
+/** Seed user key (same keys as IDS) -> that user's Resend test email. */
+const EMAILS = {
+  admin1User: resendTestEmail("admin"),
+  admin2User: resendTestEmail("admin2"),
+  ownerUser: resendTestEmail("owner"),
+  agent1User: resendTestEmail("agent1"),
+  agent2User: resendTestEmail("agent2"),
+  client1User: resendTestEmail("john.doe"),
+  client2User: resendTestEmail("jane.smith"),
+  client3User: resendTestEmail("ahmed.ali"),
+  client4User: resendTestEmail("lisa.wong"),
+  client5User: resendTestEmail("tunde.bakare"),
+  client6User: resendTestEmail("kwame.asante"),
+  client7User: resendTestEmail("wanjiku.mwangi"),
+  client8User: resendTestEmail("sipho.ndlovu"),
+  client9User: resendTestEmail("priya.sharma"),
+  client10User: resendTestEmail("miguel.santos"),
+};
+
+// ============================================
 // HELPERS
 // ============================================
 function daysAgo(days: number): Timestamp {
   return Timestamp.fromDate(new Date(Date.now() - days * 86400000));
+}
+
+/**
+ * Issue #317: the fee hold of a seeded consultation fee. Every seeded fee is
+ * for a meeting long past (paid N days ago), so it is RELEASED, as the
+ * backfill would stamp it: the agent can see and withdraw it. Without a hold
+ * a fee counts as held for good and seeded agents would show 0 available.
+ */
+function releasedFeeHold(paidDaysAgo: number) {
+  return {
+    state: "released" as const,
+    slotStartAt: daysAgo(paidDaysAgo),
+    releaseAt: daysAgo(paidDaysAgo - 1),
+    endedAt: daysAgo(paidDaysAgo - 1),
+    endedBy: "legacy_backfill" as const,
+  };
 }
 
 function daysFromNow(days: number): Timestamp {
@@ -80,24 +136,27 @@ function daysFromNow(days: number): Timestamp {
 // ============================================
 
 const AUTH_USERS = [
-  { uid: IDS.admin1User, email: "admin@selitest.com", displayName: "Olu Adeyemi", isAdmin: true },
-  { uid: IDS.admin2User, email: "admin2@selitest.com", displayName: "Ngozi Ibe", isAdmin: true },
-  { uid: IDS.ownerUser, email: "owner@selitest.com", displayName: "Adaeze Okonkwo" },
-  { uid: IDS.agent1User, email: "agent1@selitest.com", displayName: "Chinedu Eze" },
-  { uid: IDS.agent2User, email: "agent2@selitest.com", displayName: "Fatima Bello" },
-  { uid: IDS.client1User, email: "john.doe@example.com", displayName: "John Doe" },
-  { uid: IDS.client2User, email: "jane.smith@example.com", displayName: "Jane Smith" },
-  { uid: IDS.client3User, email: "ahmed.ali@example.com", displayName: "Ahmed Ali" },
-  { uid: IDS.client4User, email: "lisa.wong@example.com", displayName: "Lisa Wong" },
-  { uid: IDS.client5User, email: "tunde.bakare@example.com", displayName: "Tunde Bakare" },
-  { uid: IDS.client6User, email: "kwame.asante@example.com", displayName: "Kwame Asante" },
-  { uid: IDS.client7User, email: "wanjiku.mwangi@example.com", displayName: "Wanjiku Mwangi" },
-  { uid: IDS.client8User, email: "sipho.ndlovu@example.com", displayName: "Sipho Ndlovu" },
-  { uid: IDS.client9User, email: "priya.sharma@example.com", displayName: "Priya Sharma" },
-  { uid: IDS.client10User, email: "miguel.santos@example.com", displayName: "Miguel Santos" },
+  { uid: IDS.admin1User, email: EMAILS.admin1User, displayName: "Olu Adeyemi", isAdmin: true },
+  { uid: IDS.admin2User, email: EMAILS.admin2User, displayName: "Ngozi Ibe", isAdmin: true },
+  { uid: IDS.ownerUser, email: EMAILS.ownerUser, displayName: "Adaeze Okonkwo" },
+  { uid: IDS.agent1User, email: EMAILS.agent1User, displayName: "Chinedu Eze" },
+  { uid: IDS.agent2User, email: EMAILS.agent2User, displayName: "Fatima Bello" },
+  { uid: IDS.client1User, email: EMAILS.client1User, displayName: "John Doe" },
+  { uid: IDS.client2User, email: EMAILS.client2User, displayName: "Jane Smith" },
+  { uid: IDS.client3User, email: EMAILS.client3User, displayName: "Ahmed Ali" },
+  { uid: IDS.client4User, email: EMAILS.client4User, displayName: "Lisa Wong" },
+  { uid: IDS.client5User, email: EMAILS.client5User, displayName: "Tunde Bakare" },
+  { uid: IDS.client6User, email: EMAILS.client6User, displayName: "Kwame Asante" },
+  { uid: IDS.client7User, email: EMAILS.client7User, displayName: "Wanjiku Mwangi" },
+  { uid: IDS.client8User, email: EMAILS.client8User, displayName: "Sipho Ndlovu" },
+  { uid: IDS.client9User, email: EMAILS.client9User, displayName: "Priya Sharma" },
+  { uid: IDS.client10User, email: EMAILS.client10User, displayName: "Miguel Santos" },
 ];
 
-const SEED_PASSWORD = "password123";
+// The one password of every seeded (emulator / dev) account. Exported so the
+// e2e fixture (scripts/seed-e2e.ts, #361) gives its account the same one rather
+// than a second place for credentials.
+export const SEED_PASSWORD = "password123";
 
 async function seedAuthUsers(): Promise<number> {
   const auth = getAuth();
@@ -106,7 +165,12 @@ async function seedAuthUsers(): Promise<number> {
   for (const user of AUTH_USERS) {
     try {
       // Try to get existing user first (idempotent)
-      await auth.getUser(user.uid);
+      const existing = await auth.getUser(user.uid);
+      // Migrate accounts seeded before the switch to Resend test emails, so a
+      // re-seed moves them onto the new address instead of leaving the old one.
+      if (existing.email !== user.email) {
+        await auth.updateUser(user.uid, { email: user.email, emailVerified: true });
+      }
     } catch {
       // User doesn't exist, create it
       await auth.createUser({
@@ -139,7 +203,7 @@ async function seedUsers() {
   const users = [
     {
       id: IDS.admin1User,
-      email: "admin@selitest.com",
+      email: EMAILS.admin1User,
       firstName: "Olu",
       lastName: "Adeyemi",
       phone: "+2348001111111",
@@ -154,7 +218,7 @@ async function seedUsers() {
     },
     {
       id: IDS.admin2User,
-      email: "admin2@selitest.com",
+      email: EMAILS.admin2User,
       firstName: "Ngozi",
       lastName: "Ibe",
       phone: "+2348002222222",
@@ -169,7 +233,7 @@ async function seedUsers() {
     },
     {
       id: IDS.ownerUser,
-      email: "owner@selitest.com",
+      email: EMAILS.ownerUser,
       firstName: "Adaeze",
       lastName: "Okonkwo",
       phone: "+2348012345678",
@@ -183,7 +247,7 @@ async function seedUsers() {
     },
     {
       id: IDS.agent1User,
-      email: "agent1@selitest.com",
+      email: EMAILS.agent1User,
       firstName: "Chinedu",
       lastName: "Eze",
       phone: "+2348023456789",
@@ -197,7 +261,7 @@ async function seedUsers() {
     },
     {
       id: IDS.agent2User,
-      email: "agent2@selitest.com",
+      email: EMAILS.agent2User,
       firstName: "Fatima",
       lastName: "Bello",
       phone: "+2348034567890",
@@ -211,7 +275,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client1User,
-      email: "john.doe@example.com",
+      email: EMAILS.client1User,
       firstName: "John",
       lastName: "Doe",
       phone: "+2348045678901",
@@ -225,7 +289,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client2User,
-      email: "jane.smith@example.com",
+      email: EMAILS.client2User,
       firstName: "Jane",
       lastName: "Smith",
       phone: "+2348056789012",
@@ -239,7 +303,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client3User,
-      email: "ahmed.ali@example.com",
+      email: EMAILS.client3User,
       firstName: "Ahmed",
       lastName: "Ali",
       phone: "+2348067890123",
@@ -253,7 +317,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client4User,
-      email: "lisa.wong@example.com",
+      email: EMAILS.client4User,
       firstName: "Lisa",
       lastName: "Wong",
       phone: "+2348078901234",
@@ -267,7 +331,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client5User,
-      email: "tunde.bakare@example.com",
+      email: EMAILS.client5User,
       firstName: "Tunde",
       lastName: "Bakare",
       phone: "+2348089012345",
@@ -281,7 +345,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client6User,
-      email: "kwame.asante@example.com",
+      email: EMAILS.client6User,
       firstName: "Kwame",
       lastName: "Asante",
       phone: "+233201234567",
@@ -302,7 +366,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client7User,
-      email: "wanjiku.mwangi@example.com",
+      email: EMAILS.client7User,
       firstName: "Wanjiku",
       lastName: "Mwangi",
       phone: "+254712345678",
@@ -316,7 +380,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client8User,
-      email: "sipho.ndlovu@example.com",
+      email: EMAILS.client8User,
       firstName: "Sipho",
       lastName: "Ndlovu",
       phone: "+27821234567",
@@ -337,7 +401,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client9User,
-      email: "priya.sharma@example.com",
+      email: EMAILS.client9User,
       firstName: "Priya",
       lastName: "Sharma",
       phone: "+919876543210",
@@ -351,7 +415,7 @@ async function seedUsers() {
     },
     {
       id: IDS.client10User,
-      email: "miguel.santos@example.com",
+      email: EMAILS.client10User,
       firstName: "Miguel",
       lastName: "Santos",
       phone: "+639171234567",
@@ -374,6 +438,55 @@ async function seedUsers() {
   return users.length;
 }
 
+// ============================================
+// SEEDED AGENCY: COMPLIANCE FILE (issue #337)
+// ============================================
+/** The seeded demo agency's document id (`agencies/seed-agency-001`). */
+export const SEED_AGENCY_ID = IDS.agency;
+
+/**
+ * The seeded admin recorded as the reviewer of the demo agency's compliance
+ * file. `seedAuthUsers` gives this account the `admin: true` claim, which is
+ * what `npm run audit:agencies` checks (`COMPLIANCE_REVIEWER_NOT_ADMIN`).
+ */
+export const SEED_COMPLIANCE_REVIEWER_UID = IDS.admin1User;
+
+/**
+ * The compliance file of the seeded demo agency: VERIFIED, with the review
+ * record an admin decision leaves behind.
+ *
+ * Why it exists: `POST /payment-requests` is behind `requireAgencyVerified`,
+ * which reads `agency.compliance.status`. The agency was seeded
+ * `status: "approved"` with NO compliance file, so every member (owner
+ * included) got 403 COMPLIANCE_REQUIRED, and because `seed:dev` rewrites the
+ * agency on every dev deploy an admin approval on dev never stuck.
+ *
+ * What is in it, and what is deliberately not:
+ *  - `status: "verified"`: what the money gates read.
+ *  - `submittedAt`, `reviewedAt`, `reviewedBy`: the review metadata. A
+ *    decided file without them is reported by the agency audit as
+ *    `COMPLIANCE_DECISION_WITHOUT_REVIEW`; a reviewer who is not an admin as
+ *    `COMPLIANCE_REVIEWER_NOT_ADMIN`.
+ *  - NO KYC/KYB/payout values (BVN, ID number, RC number, TIN, bank account,
+ *    document paths): this is demo data, and inventing identity numbers
+ *    would be made-up personal data. Every other `AgencyCompliance` field is
+ *    optional, so the file is valid without them.
+ *
+ * Exported (and pure apart from the clock) so the tests can run the real
+ * compliance gate against exactly what the seed writes.
+ */
+export function buildSeedAgencyCompliance(): AgencyCompliance {
+  return {
+    status: "verified",
+    // The agency was created 90 days ago (see `seedAgency`): it submitted its
+    // file two days later and an admin verified it three days after that, the
+    // same day the owner's agent profile was verified (`verifiedAt`, 85 days ago).
+    submittedAt: daysAgo(88),
+    reviewedAt: daysAgo(85),
+    reviewedBy: SEED_COMPLIANCE_REVIEWER_UID,
+  };
+}
+
 async function seedAgency() {
   const now = Timestamp.now();
 
@@ -386,17 +499,23 @@ async function seedAgency() {
     state: "Lagos",
     description:
       "Premier immigration consulting agency specializing in Irish, UK, and Canadian visas for Nigerian applicants.",
-    consultationFee: 5000_00, // ₦50,000 in cents
+    // Issue #179: every price is US dollars, a Money in whole CENTS with an
+    // explicit currency (shown in local currency at the current rate).
+    consultationFeeUsd: { amountMinor: 10000, currency: "USD" }, // $100.00
     services: [
-      { id: "svc-1", name: "Visa Application Processing", price: 15000_00 },
-      { id: "svc-2", name: "Document Review & Verification", price: 5000_00 },
-      { id: "svc-3", name: "Interview Preparation", price: 8000_00 },
-      { id: "svc-4", name: "Embassy Submission Support", price: 10000_00 },
+      { id: "svc-1", name: "Visa Application Processing", priceUsd: { amountMinor: 5000, currency: "USD" } }, // $50.00
+      { id: "svc-2", name: "Document Review & Verification", priceUsd: { amountMinor: 2000, currency: "USD" } }, // $20.00
+      { id: "svc-3", name: "Interview Preparation", priceUsd: { amountMinor: 3000, currency: "USD" } }, // $30.00
+      { id: "svc-4", name: "Embassy Submission Support", priceUsd: { amountMinor: 4000, currency: "USD" } }, // $40.00
     ],
     totalAgents: 2,
     totalCases: 10,
     activeCases: 5,
     status: "approved" as const,
+    // Issue #337: the demo agency is compliance-verified, so its members can
+    // request payment (and be assigned platform clients) straight after a
+    // seed. `status: "approved"` above is a SEPARATE gate (the agency itself).
+    compliance: buildSeedAgencyCompliance(),
     createdAt: daysAgo(90),
     updatedAt: now,
   };
@@ -428,8 +547,7 @@ async function seedAgents() {
       totalApplications: 156,
       successRate: 92,
       responseTime: "2-4 hours",
-      consultationFee: 5000_00,
-      serviceFees: {},
+      consultationFeeUsd: { amountMinor: 1000, currency: "USD" }, // $10.00 (issue #179: US cents)
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "09:00", endTime: "17:00" },
@@ -459,8 +577,7 @@ async function seedAgents() {
       totalApplications: 63,
       successRate: 87,
       responseTime: "4-8 hours",
-      consultationFee: 3000_00,
-      serviceFees: {},
+      consultationFeeUsd: { amountMinor: 600, currency: "USD" }, // $6.00 (issue #179: US cents)
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "10:00", endTime: "18:00" },
@@ -490,8 +607,7 @@ async function seedAgents() {
       totalApplications: 28,
       successRate: 85,
       responseTime: "6-12 hours",
-      consultationFee: 2500_00,
-      serviceFees: {},
+      consultationFeeUsd: { amountMinor: 500, currency: "USD" }, // $5.00 (issue #179: US cents)
       isAvailable: true,
       availableSlots: [
         { dayOfWeek: 1, startTime: "09:00", endTime: "15:00" },
@@ -513,8 +629,30 @@ async function seedAgents() {
   return agents.length;
 }
 
-async function seedApplications() {
-  const applications = [
+/**
+ * The seeded applications, as plain data (no Firestore access).
+ *
+ * Split out from seedApplications() and exported so a unit test can check the
+ * denormalized document counters (`documentsUploaded` / `documentsVerified` /
+ * `documentsRejected`) against the documents buildSeedDocuments() actually
+ * seeds (issue #28).
+ *
+ * COUNTERS — which are real and which are aspirational:
+ *  - app1, app2, app3, app4, app7, app8 have seeded documents, and their
+ *    uploaded / verified / rejected counters match those documents exactly
+ *    (pinned by test/data/seed-documents.test.ts).
+ *  - app5, app6, ssApp2, ssApp3 have zero counters and no documents: agree.
+ *  - app9, app10, ssApp1, ssApp4 carry NON-ZERO counters but have NO seeded
+ *    documents (SEED_APPS_WITH_ASPIRATIONAL_DOCUMENT_COUNTERS). The counters
+ *    are kept so portal/mobile list and progress screens show varied states
+ *    (expired, withdrawn, self-service mid-upload, completed); the documents
+ *    API returns an empty list for them. Do not treat those four as
+ *    assessable fixtures.
+ *  - `documentsRequired` is aspirational everywhere: it is a hand-written
+ *    number, not derived from the visa type's seeded requirements.
+ */
+export function buildSeedApplications() {
+  return [
     {
       id: IDS.app1,
       userId: IDS.client1User,
@@ -533,11 +671,12 @@ async function seedApplications() {
       documentsUploaded: 5,
       documentsVerified: 4,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 15000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 150_00, // US cents, same currency as totalCost
       paymentStatus: "partial",
       clientName: "John Doe",
-      clientEmail: "john.doe@example.com",
+      clientEmail: EMAILS.client1User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       agentNotes: "Client documents mostly in order. Awaiting updated bank statement.",
@@ -562,11 +701,12 @@ async function seedApplications() {
       documentsUploaded: 3,
       documentsVerified: 2,
       documentsRejected: 1,
-      totalCost: 35000_00,
-      amountPaid: 35000_00,
+      totalCost: 350_00, // US cents ($350.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 350_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Jane Smith",
-      clientEmail: "jane.smith@example.com",
+      clientEmail: EMAILS.client2User,
       visaTypeName: "General Employment Permit",
       countryName: "Ireland",
       userNotes: "My employer will send the contract by next week.",
@@ -592,11 +732,12 @@ async function seedApplications() {
       documentsUploaded: 6,
       documentsVerified: 6,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 250_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Ahmed Ali",
-      clientEmail: "ahmed.ali@example.com",
+      clientEmail: EMAILS.client3User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       createdAt: daysAgo(60),
@@ -621,12 +762,13 @@ async function seedApplications() {
       documentsUploaded: 7,
       documentsVerified: 5,
       documentsRejected: 2,
-      totalCost: 30000_00,
-      amountPaid: 30000_00,
+      totalCost: 300_00, // US cents ($300.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 300_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       rejectionReason: "Insufficient proof of funds and weak ties to home country.",
       clientName: "Lisa Wong",
-      clientEmail: "lisa.wong@example.com",
+      clientEmail: EMAILS.client4User,
       visaTypeName: "Student Visa (D)",
       countryName: "Ireland",
       createdAt: daysAgo(50),
@@ -650,11 +792,12 @@ async function seedApplications() {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Tunde Bakare",
-      clientEmail: "tunde.bakare@example.com",
+      clientEmail: EMAILS.client5User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       createdAt: daysAgo(3),
@@ -678,11 +821,12 @@ async function seedApplications() {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 30000_00,
+      totalCost: 300_00, // US cents ($300.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Kwame Asante",
-      clientEmail: "kwame.asante@example.com",
+      clientEmail: EMAILS.client6User,
       visaTypeName: "Student Visa (D)",
       countryName: "Ireland",
       userNotes: "Planning to study MSc Computer Science at Trinity College Dublin.",
@@ -707,11 +851,12 @@ async function seedApplications() {
       documentsUploaded: 6,
       documentsVerified: 6,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 250_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Wanjiku Mwangi",
-      clientEmail: "wanjiku.mwangi@example.com",
+      clientEmail: EMAILS.client7User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       agentNotes: "Strong application — well-documented travel history to UK and Schengen.",
@@ -738,11 +883,12 @@ async function seedApplications() {
       documentsUploaded: 7,
       documentsVerified: 6,
       documentsRejected: 0,
-      totalCost: 35000_00,
-      amountPaid: 35000_00,
+      totalCost: 350_00, // US cents ($350.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 350_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Sipho Ndlovu",
-      clientEmail: "sipho.ndlovu@example.com",
+      clientEmail: EMAILS.client8User,
       visaTypeName: "General Employment Permit",
       countryName: "Ireland",
       agentNotes: "Interview scheduled for next week. Client is well-prepared.",
@@ -767,11 +913,12 @@ async function seedApplications() {
       documentsUploaded: 3,
       documentsVerified: 2,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 15000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 150_00, // US cents, same currency as totalCost
       paymentStatus: "partial",
       clientName: "Priya Sharma",
-      clientEmail: "priya.sharma@example.com",
+      clientEmail: EMAILS.client9User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       userNotes: "Travel plans changed, no longer need visa for this period.",
@@ -796,11 +943,12 @@ async function seedApplications() {
       documentsUploaded: 4,
       documentsVerified: 3,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 250_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Miguel Santos",
-      clientEmail: "miguel.santos@example.com",
+      clientEmail: EMAILS.client10User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       agentNotes: "Client became unresponsive. Missing documents never provided. Application expired after 90 days.",
@@ -827,11 +975,12 @@ async function seedApplications() {
       documentsUploaded: 3,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Kwame Asante",
-      clientEmail: "kwame.asante@example.com",
+      clientEmail: EMAILS.client6User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       createdAt: daysAgo(10),
@@ -852,11 +1001,12 @@ async function seedApplications() {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 35000_00,
+      totalCost: 350_00, // US cents ($350.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Wanjiku Mwangi",
-      clientEmail: "wanjiku.mwangi@example.com",
+      clientEmail: EMAILS.client7User,
       visaTypeName: "Work Permit (General)",
       countryName: "Ireland",
       createdAt: daysAgo(5),
@@ -877,11 +1027,12 @@ async function seedApplications() {
       documentsUploaded: 0,
       documentsVerified: 0,
       documentsRejected: 0,
-      totalCost: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
       amountPaid: 0,
       paymentStatus: "pending",
       clientName: "Sipho Ndlovu",
-      clientEmail: "sipho.ndlovu@example.com",
+      clientEmail: EMAILS.client8User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       userNotes: "Started but got busy with work",
@@ -904,17 +1055,36 @@ async function seedApplications() {
       documentsUploaded: 6,
       documentsVerified: 6,
       documentsRejected: 0,
-      totalCost: 25000_00,
-      amountPaid: 25000_00,
+      totalCost: 250_00, // US cents ($250.00); issue #181
+      costCurrency: "USD",
+      amountPaid: 250_00, // US cents, same currency as totalCost
       paymentStatus: "paid",
       clientName: "Priya Sharma",
-      clientEmail: "priya.sharma@example.com",
+      clientEmail: EMAILS.client9User,
       visaTypeName: "Short Stay 'C' Visa",
       countryName: "Ireland",
       createdAt: daysAgo(60),
       updatedAt: daysAgo(5),
     },
   ];
+}
+
+/**
+ * Seeded applications whose non-zero document counters are intentionally
+ * aspirational: they have NO seeded documents behind them (see the note on
+ * buildSeedApplications). Listed explicitly so the unit test fails if a new
+ * mismatch is introduced by accident instead of on purpose.
+ */
+export const SEED_APPS_WITH_ASPIRATIONAL_DOCUMENT_COUNTERS: readonly string[] = [
+  IDS.app9,
+  IDS.app10,
+  IDS.ssApp1,
+  IDS.ssApp4,
+];
+
+/** Write the seeded applications (deterministic ids, so a re-run overwrites). */
+async function seedApplications() {
+  const applications = buildSeedApplications();
 
   const batch = db.batch();
   for (const app of applications) {
@@ -1303,7 +1473,32 @@ async function seedTimelines() {
   return allTimelines.length;
 }
 
-async function seedDocuments() {
+/**
+ * Deterministic id for a seeded document: `<applicationId>-doc-<requirement>`,
+ * e.g. `seed-app-001-doc-passport`. Each seeded application has at most one
+ * document per requirement, so the pair is unique (pinned by a unit test).
+ * A fixed id is what makes the seed idempotent: a second run overwrites the
+ * same docs instead of adding 34 more (issue #28).
+ */
+export function seedDocumentId(applicationId: string, requirementId: string): string {
+  return `${applicationId}-doc-${requirementId.replace(/^req-/, "")}`;
+}
+
+/**
+ * The seeded documents, as plain data (no Firestore access), each with its
+ * deterministic `id` and its `applicationId`.
+ *
+ * STORAGE PATHS ARE PLACEHOLDERS: every `storageUrl` below is a made-up
+ * `gs://japa-platform.firebasestorage.app/documents/<app>/<file>` string. No
+ * object is uploaded for it in any environment (emulator, dev or prod), and it
+ * is a gs:// URL rather than the bucket-relative path real uploads store
+ * (`documents/{userId}/{applicationId}/...`). So `GET /documents/:id/download`
+ * cannot return a working file for a seeded document, and anything that
+ * fetches the bytes (e.g. vision extraction) must tolerate a missing file for
+ * seeded documents. Real fixtures with real files belong with the visitor
+ * fixtures (#35/#42), not here.
+ */
+export function buildSeedDocuments() {
   // Documents for app1 (under_review — 5 uploaded, 4 verified)
   const app1Docs = [
     {
@@ -1840,17 +2035,71 @@ async function seedDocuments() {
 
   const allDocs = [...app1Docs, ...app2Docs, ...app3Docs, ...app4Docs, ...app7Docs, ...app8Docs];
 
-  const batch = db.batch();
+  // Stamp each document with its deterministic id (see seedDocumentId).
+  return allDocs.map((doc) => ({
+    id: seedDocumentId(doc.applicationId, doc.requirementId),
+    ...doc,
+  }));
+}
+
+/** Max writes per Firestore batch is 500; stay well under it. */
+const SEED_BATCH_SIZE = 400;
+
+/**
+ * Seed the application documents into the TOP-LEVEL `documents` collection —
+ * the canonical path that services/document.service.ts reads (see the comment
+ * on `collections.documents` in utils/firebase.ts).
+ *
+ * Before issue #28 this wrote to `applications/{id}/documents` with random
+ * ids, which no API read ("split-brain"), and every run added another copy.
+ * Now:
+ *  1. each document is written at `documents/{deterministic id}`, so running
+ *     the seed twice overwrites instead of duplicating;
+ *  2. the copies earlier seed runs left in the dead
+ *     `applications/{seedAppId}/documents` subcollections are deleted. This
+ *     only touches the SEEDED application ids (`seed-app-*` / `seed-ss-app-*`),
+ *     never any other application.
+ *
+ * @param firestore Injected for unit tests; defaults to the Admin SDK db.
+ * @returns the number of documents seeded.
+ */
+export async function seedDocuments(
+  firestore: FirebaseFirestore.Firestore = db
+): Promise<number> {
+  const allDocs = buildSeedDocuments();
+
+  // ---- 1. Write to the canonical top-level collection (idempotent ids).
+  const batch = firestore.batch();
   for (const doc of allDocs) {
-    const ref = db
-      .collection("applications")
-      .doc(doc.applicationId)
-      .collection("documents")
-      .doc();
-    batch.set(ref, { id: ref.id, ...doc });
+    batch.set(firestore.collection("documents").doc(doc.id), doc);
   }
   await batch.commit();
-  console.log(`✅ Seeded ${allDocs.length} documents`);
+
+  // ---- 2. Remove the legacy subcollection copies under the seeded apps.
+  const seededAppIds = buildSeedApplications().map((app) => app.id);
+  const legacyRefs: FirebaseFirestore.DocumentReference[] = [];
+  for (const appId of seededAppIds) {
+    const legacy = await firestore
+      .collection("applications")
+      .doc(appId)
+      .collection("documents")
+      .get();
+    for (const snap of legacy.docs) legacyRefs.push(snap.ref);
+  }
+  // Earlier runs each added a full copy, so there can be more than one
+  // batch's worth: delete in chunks.
+  for (let i = 0; i < legacyRefs.length; i += SEED_BATCH_SIZE) {
+    const cleanup = firestore.batch();
+    for (const ref of legacyRefs.slice(i, i + SEED_BATCH_SIZE)) cleanup.delete(ref);
+    await cleanup.commit();
+  }
+
+  console.log(
+    `✅ Seeded ${allDocs.length} documents` +
+      (legacyRefs.length > 0
+        ? ` (removed ${legacyRefs.length} legacy subcollection copies)`
+        : "")
+  );
   return allDocs.length;
 }
 
@@ -2071,8 +2320,10 @@ async function seedTransactions(): Promise<number> {
       isEscrow: false,
       paymentProvider: "stripe",
       description: "Initial consultation fee for Short Stay C Visa",
+      // Issue #317: a past meeting, so the fee is released (withdrawable).
+      feeHold: releasedFeeHold(25),
       clientName: "John Doe",
-      clientEmail: "john.doe@example.com",
+      clientEmail: EMAILS.client1User,
       visaTypeName: "Short Stay 'C' Visa",
       createdAt: daysAgo(25),
       updatedAt: daysAgo(25),
@@ -2090,7 +2341,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "stripe",
       description: "Visa application service fee",
       clientName: "John Doe",
-      clientEmail: "john.doe@example.com",
+      clientEmail: EMAILS.client1User,
       visaTypeName: "Short Stay 'C' Visa",
       createdAt: daysAgo(20),
       updatedAt: daysAgo(20),
@@ -2107,8 +2358,10 @@ async function seedTransactions(): Promise<number> {
       isEscrow: false,
       paymentProvider: "stripe",
       description: "Consultation fee for Employment Permit",
+      // Issue #317: a past meeting, so the fee is released (withdrawable).
+      feeHold: releasedFeeHold(18),
       clientName: "Jane Smith",
-      clientEmail: "jane.smith@example.com",
+      clientEmail: EMAILS.client2User,
       visaTypeName: "General Employment Permit",
       createdAt: daysAgo(18),
       updatedAt: daysAgo(18),
@@ -2127,7 +2380,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "stripe",
       description: "Employment Permit service fee (held in escrow)",
       clientName: "Jane Smith",
-      clientEmail: "jane.smith@example.com",
+      clientEmail: EMAILS.client2User,
       visaTypeName: "General Employment Permit",
       createdAt: daysAgo(15),
       updatedAt: daysAgo(15),
@@ -2145,7 +2398,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "paypal",
       description: "Short Stay C Visa processing fee",
       clientName: "Ahmed Ali",
-      clientEmail: "ahmed.ali@example.com",
+      clientEmail: EMAILS.client3User,
       visaTypeName: "Short Stay 'C' Visa",
       createdAt: daysAgo(30),
       updatedAt: daysAgo(30),
@@ -2162,8 +2415,10 @@ async function seedTransactions(): Promise<number> {
       isEscrow: false,
       paymentProvider: "stripe",
       description: "Consultation fee refunded (application rejected)",
+      // Issue #317: a past meeting, so the fee is released (withdrawable).
+      feeHold: releasedFeeHold(35),
       clientName: "Lisa Wong",
-      clientEmail: "lisa.wong@example.com",
+      clientEmail: EMAILS.client4User,
       visaTypeName: "Student Visa (D)",
       createdAt: daysAgo(35),
       updatedAt: daysAgo(10),
@@ -2181,7 +2436,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "manual",
       description: "Embassy application fee for Short Stay C Visa",
       clientName: "Wanjiku Mwangi",
-      clientEmail: "wanjiku.mwangi@example.com",
+      clientEmail: EMAILS.client7User,
       visaTypeName: "Short Stay 'C' Visa",
       createdAt: daysAgo(12),
       updatedAt: daysAgo(12),
@@ -2200,7 +2455,7 @@ async function seedTransactions(): Promise<number> {
       paymentProvider: "stripe",
       description: "Employment Permit service fee (pending interview)",
       clientName: "Sipho Ndlovu",
-      clientEmail: "sipho.ndlovu@example.com",
+      clientEmail: EMAILS.client8User,
       visaTypeName: "General Employment Permit",
       createdAt: daysAgo(8),
       updatedAt: daysAgo(8),
@@ -2230,7 +2485,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app1,
       clientName: "John Doe",
-      clientEmail: "john.doe@example.com",
+      clientEmail: EMAILS.client1User,
       agentName: "Chinedu Eze",
       type: "initial",
       scheduledDate: daysAgo(20),
@@ -2238,7 +2493,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 30,
       timezone: "Africa/Lagos",
       status: "completed",
-      fee: 500000,
+      fee: 5000, // whole naira (#148)
       paymentStatus: "paid",
       meetingPlatform: "zoom",
       summary: "Discussed visa requirements and document checklist. Client has strong financials.",
@@ -2252,7 +2507,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app2,
       clientName: "Jane Smith",
-      clientEmail: "jane.smith@example.com",
+      clientEmail: EMAILS.client2User,
       agentName: "Chinedu Eze",
       type: "document_review",
       scheduledDate: daysAgo(5),
@@ -2260,7 +2515,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 45,
       timezone: "Africa/Lagos",
       status: "completed",
-      fee: 300000,
+      fee: 3000, // whole naira (#148)
       paymentStatus: "paid",
       meetingPlatform: "google_meet",
       summary: "Reviewed employment contract and qualification documents. Degree certificate needs re-scan.",
@@ -2274,7 +2529,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app8,
       clientName: "Sipho Ndlovu",
-      clientEmail: "sipho.ndlovu@example.com",
+      clientEmail: EMAILS.client8User,
       agentName: "Chinedu Eze",
       type: "interview_prep",
       scheduledDate: daysFromNow(3),
@@ -2282,7 +2537,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 60,
       timezone: "Africa/Lagos",
       status: "confirmed",
-      fee: 800000,
+      fee: 8000, // whole naira (#148)
       paymentStatus: "paid",
       meetingPlatform: "zoom",
       meetingLink: "https://zoom.us/j/1234567890",
@@ -2296,7 +2551,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app7,
       clientName: "Wanjiku Mwangi",
-      clientEmail: "wanjiku.mwangi@example.com",
+      clientEmail: EMAILS.client7User,
       agentName: "Fatima Bello",
       type: "follow_up",
       scheduledDate: daysFromNow(7),
@@ -2317,7 +2572,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app3,
       clientName: "Ahmed Ali",
-      clientEmail: "ahmed.ali@example.com",
+      clientEmail: EMAILS.client3User,
       agentName: "Fatima Bello",
       type: "initial",
       scheduledDate: daysAgo(55),
@@ -2325,7 +2580,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 30,
       timezone: "Africa/Lagos",
       status: "completed",
-      fee: 250000,
+      fee: 2500, // whole naira (#148)
       paymentStatus: "paid",
       summary: "Initial consultation for Short Stay C Visa. Discussed travel history and documentation plan.",
       createdAt: daysAgo(57),
@@ -2338,7 +2593,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app9,
       clientName: "Priya Sharma",
-      clientEmail: "priya.sharma@example.com",
+      clientEmail: EMAILS.client9User,
       agentName: "Fatima Bello",
       type: "general",
       scheduledDate: daysAgo(25),
@@ -2346,7 +2601,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 30,
       timezone: "Asia/Kolkata",
       status: "cancelled",
-      fee: 250000,
+      fee: 2500, // whole naira (#148)
       paymentStatus: "refunded",
       cancelledAt: daysAgo(26),
       cancelledBy: IDS.client9User,
@@ -2361,7 +2616,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app6,
       clientName: "Kwame Asante",
-      clientEmail: "kwame.asante@example.com",
+      clientEmail: EMAILS.client6User,
       agentName: "Chinedu Eze",
       type: "initial",
       scheduledDate: daysFromNow(1),
@@ -2369,7 +2624,7 @@ async function seedConsultations(): Promise<number> {
       durationMinutes: 30,
       timezone: "Africa/Accra",
       status: "confirmed",
-      fee: 500000,
+      fee: 5000, // whole naira (#148)
       paymentStatus: "paid",
       meetingPlatform: "zoom",
       meetingLink: "https://zoom.us/j/9876543210",
@@ -2383,7 +2638,7 @@ async function seedConsultations(): Promise<number> {
       agencyId: IDS.agency,
       applicationId: IDS.app4,
       clientName: "Lisa Wong",
-      clientEmail: "lisa.wong@example.com",
+      clientEmail: EMAILS.client4User,
       agentName: "Chinedu Eze",
       type: "follow_up",
       scheduledDate: daysAgo(12),
@@ -2715,6 +2970,13 @@ async function seedNotifications(): Promise<number> {
 // MAIN EXPORT
 // ============================================
 
+/**
+ * Seed payment requests. Issue #181: new requests are in US DOLLARS
+ * (`priceUsd` Money, mirrored as US cents in `amount` + `currency: "USD"`);
+ * the client's local amount is only worked out when they pay. Three LEGACY
+ * naira rows (kobo, "NGN", no `priceUsd`) are kept on purpose, so the portal
+ * and the app keep showing old requests the way they are stored in real data.
+ */
 async function seedPaymentRequests(): Promise<number> {
   const now = Timestamp.now();
   const paymentRequests = [
@@ -2725,8 +2987,8 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client1User,
       clientName: "Adaeze Okafor",
-      clientEmail: "adaeze@email.com",
-      amount: 75000_00, // ₦75,000 in kobo
+      clientEmail: EMAILS.client1User,
+      amount: 75000_00, // LEGACY: ₦75,000 in kobo (pre-#181 row)
       currency: "NGN",
       description: "Visa Processing Fee",
       status: "paid",
@@ -2741,9 +3003,10 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client1User,
       clientName: "Adaeze Okafor",
-      clientEmail: "adaeze@email.com",
-      amount: 25000_00, // ₦25,000 in kobo
-      currency: "NGN",
+      clientEmail: EMAILS.client1User,
+      priceUsd: { amountMinor: 40_00, currency: "USD" }, // $40.00 (issue #181)
+      amount: 40_00, // US cents, mirrors priceUsd
+      currency: "USD",
       description: "Document Authentication Fee",
       status: "pending",
       createdAt: Timestamp.fromDate(new Date("2025-12-01")),
@@ -2756,9 +3019,10 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client2User,
       clientName: "Kwame Mensah",
-      clientEmail: "kwame@email.com",
-      amount: 150000_00, // ₦150,000 in kobo
-      currency: "NGN",
+      clientEmail: EMAILS.client2User,
+      priceUsd: { amountMinor: 120_00, currency: "USD" }, // $120.00 (issue #181)
+      amount: 120_00, // US cents, mirrors priceUsd
+      currency: "USD",
       description: "Embassy Application Fee",
       status: "pending",
       createdAt: Timestamp.fromDate(new Date("2025-11-20")),
@@ -2771,8 +3035,8 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client5User,
       clientName: "Aisha Bello",
-      clientEmail: "aisha@email.com",
-      amount: 50000_00, // ₦50,000 in kobo
+      clientEmail: EMAILS.client5User,
+      amount: 50000_00, // LEGACY: ₦50,000 in kobo (pre-#181 row)
       currency: "NGN",
       description: "Consultation Fee",
       status: "cancelled",
@@ -2787,8 +3051,8 @@ async function seedPaymentRequests(): Promise<number> {
       agencyId: IDS.agency,
       clientId: IDS.client3User,
       clientName: "Amara Njoku",
-      clientEmail: "amara@email.com",
-      amount: 100000_00, // ₦100,000 in kobo
+      clientEmail: EMAILS.client3User,
+      amount: 100000_00, // LEGACY: ₦100,000 in kobo (pre-#181 row)
       currency: "NGN",
       description: "Visa Service Fee",
       status: "paid",

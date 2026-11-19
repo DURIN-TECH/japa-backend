@@ -24,6 +24,26 @@ router.get("/", verifyAuth, (req, res) =>
 router.get("/:id", verifyAuth, (req, res) =>
   applicationController.getApplication(req, res)
 );
+// Intake answers (#113): questions come from the approved rubric. Declared
+// with the other "/:id/..." routes; authz is checked in the handlers.
+router.get("/:id/intake", verifyAuth, (req, res) =>
+  applicationController.getIntake(req, res)
+);
+router.put("/:id/intake", verifyAuth, (req, res) =>
+  applicationController.saveIntake(req, res)
+);
+// Answers to information checklist items (#187). Access is checked in the handlers.
+router.get("/:id/answers", verifyAuth, (req, res) =>
+  applicationController.getAnswers(req, res)
+);
+router.put("/:id/answers/:itemId", verifyAuth, (req, res) =>
+  applicationController.saveAnswer(req, res)
+);
+// Issue #235: change the member country a shared-route application goes
+// through, before submission. Access (update) is checked in the handler.
+router.put("/:id/through-country", verifyAuth, (req, res) =>
+  applicationController.changeThroughCountry(req, res)
+);
 router.put("/:id", verifyAuth, (req, res) =>
   applicationController.updateApplication(req, res)
 );

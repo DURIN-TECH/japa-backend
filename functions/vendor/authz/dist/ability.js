@@ -36,6 +36,77 @@ const FEATURE_CAPABILITIES = {
     "payments.request": [["create", "PaymentRequest"]],
 };
 /**
+ * Agency visas (#98): grant an agency role (owner or agent) the right to
+ * create, read, update and delete the visas its own agency created, and
+ * nothing more. Shared by the owner and agent branches so the two roles can
+ * never drift apart. See the `Visa` entry of `SubjectType` for the contract.
+ *
+ * @param builder  the `can` / `cannot` pair of the ability being built
+ * @param agencyId the principal's agency, possibly undefined/null/empty
+ */
+function grantAgencyVisas(builder, agencyId) {
+    // No agency, no visa grant. Without this guard the condition would be
+    // `{ ownerAgencyId: undefined }`, which matches any visa document that
+    // lacks `ownerAgencyId` (undefined === undefined), i.e. every scraped visa.
+    if (!agencyId)
+        return;
+    // Both conditions are required: the visa belongs to this agency AND it is
+    // an agency-created visa. A scraped or legacy "agent" visa that happens to
+    // carry a matching `ownerAgencyId` is still off-limits.
+    builder.can([...types_1.AGENCY_VISA_ACTIONS], "Visa", {
+        ownerAgencyId: agencyId,
+        source: types_1.AGENCY_VISA_SOURCE,
+    });
+    // Field-level denial, layered after the grant so it wins: agencies edit a
+    // visa's content but never its review state, visibility (make-global),
+    // activation or ownership. CASL only applies a field-scoped `cannot` when
+    // the caller passes a field, so callers check each field they write:
+    //   ability.can("update", subject("Visa", doc), "visibility") === false
+    builder.cannot("update", "Visa", [...types_1.VISA_PROTECTED_FIELDS]);
+}
+/**
+ * True when the principal really belongs to an agency: `agencyId` is a
+ * non-empty string. Absent, `null`, the empty string and any non-string value
+ * (a number, an array, an object that CASL would read as a Mongo operator)
+ * all count as "no agency".
+ *
+ * @param agencyId the principal's `agencyId`, as resolved from its claims
+ */
+function hasAgency(agencyId) {
+    return typeof agencyId === "string" && agencyId.length > 0;
+}
+/**
+ * Agency grant on applications (fix for DURIN-TECH/japa#131): what a
+ * principal may do with the cases of its OWN agency, i.e. applications whose
+ * `agencyId` equals the principal's `agencyId`.
+ *   - owner: `manage` (every action) on the agency's cases;
+ *   - agent: `read` only (writes come from the assigned-agent grant, which
+ *     is keyed on `agentId` and is NOT touched here).
+ *
+ * The grant is added ONLY when the principal has an agency. Without this
+ * guard the condition would be `{ agencyId: undefined }`, and CASL matches
+ * that against any application that has NO `agencyId` field
+ * (undefined === undefined). Self-serve applications are stored without the
+ * field, so before the fix an independent agent could read every client's
+ * self-serve application, and an owner-role user with no agency could read,
+ * update and delete them (plus the cases of independent agents, which carry
+ * an `agentId` but no `agencyId`).
+ *
+ * Same idea as the guard in `grantAgencyVisas` above.
+ *
+ * @param can      the `can` of the ability being built
+ * @param actions  the action(s) the role holds on its agency's applications
+ * @param agencyId the principal's agency, possibly undefined/null/empty
+ */
+function grantAgencyApplications(can, actions, agencyId) {
+    // No agency, no agency grant: the principal must never match an
+    // application through `agencyId`, whatever the document does or does not
+    // carry in that field.
+    if (!hasAgency(agencyId))
+        return;
+    can(actions, "Application", { agencyId });
+}
+/**
  * Build the ability for a principal. Pass resolved `entitlements` to apply
  * subscription gating; omit them to get role/ownership-only rules (Phase 1).
  */
@@ -47,23 +118,52 @@ function defineAbilitiesFor(principal, entitlements) {
         case "admin":
             // Admins can perform every operation on everything.
             can("manage", "all");
+            // `VisaChange` (pending scraped-visa edits) is deliberately admin-only via
+            // `manage all`; never grant it to another role (ability.test.ts guards this).
+            // `Visa` (catalog visa types, #70) is admin-wide via `manage all` too:
+            // admins edit the live catalog, approve/reject any visa and make agency
+            // visas global. Agency roles only get a narrow, condition- and
+            // field-restricted grant on their own agency's visas (#98, see
+            // `grantAgencyVisas`); clients get none.
+            // Likewise `ScrapeRun` (scraper run records + source health, #81): an
+            // operational view for admins only, never granted to another role.
             break;
         case "owner":
             // Agency owners manage everything scoped to their agency.
             can(["read", "update"], "Agency", { id: agencyId });
             can("manage", "Agent", { agencyId });
-            can("manage", ["Application", "Document", "Consultation", "PaymentRequest", "Note", "Conversation"], { agencyId });
+            // Applications of the owner's own agency: every action. Guarded (#131):
+            // an owner with no agency gets NO application grant at all.
+            grantAgencyApplications(can, "manage", agencyId);
+            // The other case resources keep their agency grant exactly as it was.
+            // Split from the Application grant above only because that one is now
+            // guarded. NOTE: these (and the Agency / Agent / Transaction / Analytics
+            // grants in this branch) still become `{ agencyId: undefined }` for an
+            // owner with no agency; #131 fixes Application only ("any other rule
+            // change" is out of its scope) and the rest is reported as a follow-up.
+            can("manage", ["Document", "Consultation", "PaymentRequest", "Note", "Conversation"], { agencyId });
             can("read", "Transaction", { agencyId });
             can("read", "Analytics", { agencyId });
             can(["read", "update"], "User", { id: uid });
+            // Own agency's agency-created visas (#98): create/read/update/delete,
+            // with review, visibility and ownership fields locked.
+            grantAgencyVisas({ can, cannot }, agencyId);
             break;
         case "agent":
             // Agents manage resources assigned to them; read their agency's cases.
-            can("read", "Application", { agencyId });
+            // The agency read grant is guarded (#131): an independent agent (no
+            // agency) gets none, so it cannot read applications that merely lack an
+            // `agencyId` (self-serve applications).
+            grantAgencyApplications(can, "read", agencyId);
+            // Assigned-agent grant, keyed on `agentId`: unchanged by #131. An
+            // independent agent keeps full access to the cases assigned to them.
             can("manage", ["Application", "Document", "Consultation", "PaymentRequest", "Note", "Conversation"], { agentId: uid });
             can("read", "Agent", { agencyId });
             can(["read", "update"], "Agent", { userId: uid });
             can(["read", "update"], "User", { id: uid });
+            // Agents get the same agency-visa grant as owners (#98), scoped to the
+            // agent's own `agencyId`; an independent agent (no agency) gets none.
+            grantAgencyVisas({ can, cannot }, agencyId);
             break;
         case "client":
             // Clients manage only their own resources (mobile).
@@ -90,7 +190,9 @@ function defineAbilitiesFor(principal, entitlements) {
         // all writes. Layered last so these `cannot` rules override the role grants.
         // Skipped when entitlements are omitted/null (RBAC-only / grant-all default).
         if (entitlements && !types_1.ACTIVE_SUBSCRIPTION_STATUSES.includes(entitlements.status)) {
-            cannot(["create", "update", "delete", "assign", "approve"], "all");
+            // `reject` is a write like `approve` (e.g. rejecting a pending change), so
+            // a lapsed plan blocks it too.
+            cannot(["create", "update", "delete", "assign", "approve", "reject"], "all");
         }
     }
     return build();

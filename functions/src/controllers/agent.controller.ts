@@ -1,6 +1,14 @@
 import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { agentService } from "../services/agent.service";
+import {
+  agentService,
+  AgentNotVerifiedError,
+  InvalidAvailabilityError,
+  readAgentFeeInput,
+} from "../services/agent.service";
+import { toPublicAgent } from "../agents/public-agent";
+// Issue #179: dollar fee input errors, and the local figure on public reads.
+import { isPriceInputError, loadLocalPricer } from "../money";
 import { agencyService } from "../services/agency.service";
 import { notificationService } from "../services/notification.service";
 import {
@@ -35,7 +43,10 @@ export class AgentController {
       };
 
       const agents = await agentService.getAgents(filters);
-      sendSuccess(res, agents);
+      // Issue #179: one rate lookup for the whole list (never fails the read).
+      const pricer = await loadLocalPricer({ uid: (req as AuthenticatedRequest).userId });
+      // Issue #147: anonymous route -> allow-listed shape only
+      sendSuccess(res, agents.map((a) => toPublicAgent(a, pricer)));
     } catch (error) {
       console.error("Error getting agents:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -50,8 +61,10 @@ export class AgentController {
     try {
       const limit = parseInt(req.query.limit as string) || 10;
       const agents = await agentService.getTopAgents(limit);
+      const pricer = await loadLocalPricer({ uid: (req as AuthenticatedRequest).userId });
 
-      sendSuccess(res, agents);
+      // Issue #147: allow-listed shape only (+ #179 dollar fee and local figure)
+      sendSuccess(res, agents.map((a) => toPublicAgent(a, pricer)));
     } catch (error) {
       console.error("Error getting top agents:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -78,7 +91,10 @@ export class AgentController {
         return;
       }
 
-      sendSuccess(res, agent);
+      // Issue #147: allow-listed shape only (the full doc stays on /agents/me).
+      // Issue #179: dollar fee + local figure; an unavailable rate still serves.
+      const pricer = await loadLocalPricer({ uid: (req as AuthenticatedRequest).userId });
+      sendSuccess(res, toPublicAgent(agent, pricer));
     } catch (error) {
       console.error("Error getting agent:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -110,8 +126,10 @@ export class AgentController {
     try {
       const { visaTypeId } = req.params;
       const agents = await agentService.getAgentsForVisaType(visaTypeId);
+      const pricer = await loadLocalPricer({ uid: (req as AuthenticatedRequest).userId });
 
-      sendSuccess(res, agents);
+      // Issue #147: allow-listed shape only (+ #179 dollar fee and local figure)
+      sendSuccess(res, agents.map((a) => toPublicAgent(a, pricer)));
     } catch (error) {
       console.error("Error getting agents for visa type:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -129,16 +147,16 @@ export class AgentController {
   async createAgent(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
       const userId = req.userId!;
-      const input = req.body;
+      const input = (req.body ?? {}) as Record<string, unknown>;
 
-      // Validate required fields
+      // Validate required fields. Issue #179: the fee is no longer required
+      // (a new agent starts at $0) and is no longer a naira number.
       const requiredFields = [
         "displayName",
         "bio",
         "yearsOfExperience",
         "specializations",
         "languages",
-        "consultationFee",
       ];
 
       const missing = requiredFields.filter((f) => !input[f]);
@@ -152,8 +170,22 @@ export class AgentController {
         return;
       }
 
+      // Issue #179: the dollar fee, validated (400 on a bad value or an old
+      // naira `consultationFee` key). Never the raw body value.
+      let consultationFeeUsd;
+      try {
+        consultationFeeUsd = readAgentFeeInput(input);
+      } catch (error) {
+        if (isPriceInputError(error)) {
+          sendError(res, "VALIDATION_ERROR", error.message, 400);
+          return;
+        }
+        throw error;
+      }
+
       const agent = await agentService.createAgent({
-        ...input,
+        ...(input as unknown as Parameters<typeof agentService.createAgent>[0]),
+        consultationFeeUsd,
         userId,
       });
 
@@ -214,7 +246,12 @@ export class AgentController {
   ): Promise<void> {
     try {
       const userId = req.userId!;
-      const updates = req.body;
+      // Issue #103: the legacy per-agent `serviceFees` (documented as cents,
+      // never used) is superseded by the agency-level per-visa price (US
+      // dollars since #179, `/agency/visa-prices`). Drop it from the body so nothing can write a
+      // second, conflicting price source onto the agent doc.
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { serviceFees: _legacyServiceFees, ...updates } = (req.body ?? {}) as Record<string, unknown>;
 
       // Get agent by user ID
       const agent = await agentService.getAgentByUserId(userId);
@@ -226,6 +263,27 @@ export class AgentController {
       const updatedAgent = await agentService.updateAgent(agent.id, updates);
       sendSuccess(res, updatedAgent, "Profile updated successfully");
     } catch (error) {
+      // Issue #179: a bad dollar fee, or an old naira fee key. Nothing written.
+      if (isPriceInputError(error)) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      // `isAvailable` in a profile update passes the same rule as
+      // PUT /agents/me/availability (issue #138), with the same answers.
+      // Nothing was written when either of these is thrown.
+      if (error instanceof InvalidAvailabilityError) {
+        sendError(res, "VALIDATION_ERROR", error.message, 400);
+        return;
+      }
+      if (error instanceof AgentNotVerifiedError) {
+        sendError(
+          res,
+          "FORBIDDEN",
+          "Agent must be verified before becoming available",
+          403
+        );
+        return;
+      }
       console.error("Error updating agent profile:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
@@ -466,8 +524,10 @@ export class AgentController {
         return;
       }
 
-      // Verify the caller owns an agency
-      const agency = await agencyService.getAgencyByOwnerId(ownerUserId);
+      // Verify the caller owns an agency: the resolved principal says owner
+      // and the agency's own record names them (issue #138, see
+      // agencyService.getOwnedAgencyForPrincipal).
+      const agency = await agencyService.getOwnedAgencyForPrincipal(req.authz);
       if (!agency) {
         sendForbidden(res, "Only agency owners can manage agent status");
         return;

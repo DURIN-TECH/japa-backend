@@ -13,6 +13,13 @@ import { NotificationChannel, NotificationType } from "../types";
 const FULL: NotificationChannel[] = ["in_app", "push", "email"];
 /** Ephemeral/high-frequency events — in-app + push only (email would be noisy). */
 const APP_ONLY: NotificationChannel[] = ["in_app", "push"];
+/**
+ * Follow-up nudges that exist BECAUSE the in-app/push channels went unnoticed.
+ * Re-delivering to those channels would be pure noise, so email is the only one.
+ */
+/** Good news that needs no interruption: the inbox record only, no push, no email. */
+const IN_APP_ONLY: NotificationChannel[] = ["in_app"];
+const EMAIL_ONLY: NotificationChannel[] = ["email"];
 
 export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChannel[]> = {
   // Applications
@@ -20,6 +27,21 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   application_created: FULL,
   application_assigned: FULL,
   application_withdrawn: FULL,
+  // Bulk re-assessment found a worse result after a rule change (#37): the
+  // reviewing agent should hear about it on every channel.
+  assessment_rules_updated: FULL,
+  // Approved rule / published-detail change on a route with in-flight cases (#123).
+  rule_change_alert: FULL,
+  // Self-service applicant notices (#266). The readiness review is the one
+  // moment worth an email too (the applicant may not have the app open). Document
+  // checks are frequent (one per upload), so problems and "could not check" are
+  // in-app + push only, and a pass is a quiet inbox line: no push, no email.
+  readiness_review_ready: FULL,
+  document_check_problems: APP_ONLY,
+  document_check_could_not_check: APP_ONLY,
+  document_check_passed: IN_APP_ONLY,
+  // Refusal-letter analysis (#268): in-app + push, no email (the applicant is in the app).
+  refusal_analysis_ready: APP_ONLY,
   // Documents
   document_status: FULL,
   document_uploaded: FULL,
@@ -32,6 +54,9 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   consultation_rescheduled: FULL,
   consultation_cancelled: FULL,
   consultation_completed: FULL,
+  // Issue #317: refunds are money moving back to the client: every channel.
+  consultation_refunded: FULL,
+  consultation_refund_delayed: FULL,
   // Payments
   payment_received: FULL,
   payment_request: FULL,
@@ -53,6 +78,11 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   agency_pending_review: FULL,
   agency_approved: FULL,
   agency_rejected: FULL,
+  // Agency-created visas (issue #101): review decisions + make-global go to
+  // the agency owner. Transactional, so worth an email.
+  agency_visa_approved: FULL,
+  agency_visa_rejected: FULL,
+  agency_visa_made_global: FULL,
   // Verification
   verification_approved: FULL,
   verification_rejected: FULL,
@@ -78,7 +108,19 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   account_deleted: FULL,
   // Other — in-app/push only (email would be noisy)
   message_received: APP_ONLY,
+  // The hourly "still unread" nudge is EMAIL ONLY. The recipient already got the
+  // in-app record and the push when the message landed — repeating them is what
+  // makes a reminder feel like spam. Email is the channel that was missed, so
+  // email is the only one this adds.
+  message_unread_reminder: EMAIL_ONLY,
   visa_news: APP_ONLY,
+  // Pre-review insights (issue #117): in-app + push to the assigned agent. No
+  // email: an auto-run can fire after every upload burst, which would be noisy.
+  assessment_insights: APP_ONLY,
+  // Scraper alerts (issue #83) go to admins by EMAIL only: the point is that
+  // admins find out without watching the portal. No in-app/push record (the
+  // alerts themselves live in scrapeAlerts and the #84 dashboard).
+  scrape_alert: EMAIL_ONLY,
   system: APP_ONLY,
 };
 

@@ -15,9 +15,17 @@ import {
   documentTemplateService,
   TemplateFilters,
 } from "../services/document-template.service";
-import { Agent, DocumentTemplate, ProseMirrorDoc, TemplateCategory } from "../types";
+import { Agent, Application, DocumentTemplate, ProseMirrorDoc, TemplateCategory } from "../types";
 import { collections } from "../utils/firebase";
 import { ROLES } from "@durin-tech/authz";
+import { checkApplicationAccessForRequest } from "../utils/access";
+import {
+  DRAFT_CATEGORIES,
+  MAX_DESCRIPTION_CHARS,
+  TemplateDraftError,
+  draftAccessFor,
+  templateDraftService,
+} from "../services/ai/template-draft";
 import {
   sendSuccess,
   sendCreated,
@@ -63,6 +71,83 @@ export class DocumentTemplateController {
       sendSuccess(res, templates);
     } catch (error) {
       console.error("Error listing document templates:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /document-templates/draft  { description, category, applicationId? } (issue #118)
+   *
+   * Returns an AI-written DRAFT { draft: true, title, description, content }.
+   * READ-ONLY: nothing is saved or sent; the agent edits and then saves through
+   * the normal create route. Order of checks:
+   *   1. feature gate, FAIL CLOSED (unresolved entitlements are refused)
+   *   2. input validation (description 1..1000 chars, valid category)
+   *   3. application access via checkApplicationAccess when applicationId is given
+   *   4. the service (kill switch, caps, model call, output validation)
+   */
+  async draft(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      // 1. Entitlement gate. 402 = plan lacks the feature; 503 = could not resolve.
+      const access = draftAccessFor(req.authz?.role, req.entitlements);
+      if (access === "unresolved") {
+        sendError(res, "ENTITLEMENTS_UNAVAILABLE", "We could not check your plan, so AI drafting is unavailable. Try again shortly.", 503);
+        return;
+      }
+      if (access === "upgrade") {
+        sendError(res, "UPGRADE_REQUIRED", "Your plan does not include AI drafting. Upgrade to unlock it.", 402);
+        return;
+      }
+
+      // 2. Validate input.
+      const { description, category, applicationId } = req.body ?? {};
+      if (typeof description !== "string" || description.trim().length === 0) {
+        sendError(res, "VALIDATION_ERROR", "description is required");
+        return;
+      }
+      if (description.length > MAX_DESCRIPTION_CHARS) {
+        sendError(res, "VALIDATION_ERROR", `description must be at most ${MAX_DESCRIPTION_CHARS} characters`);
+        return;
+      }
+      if (!DRAFT_CATEGORIES.includes(category)) {
+        sendError(res, "VALIDATION_ERROR", `category must be one of: ${DRAFT_CATEGORIES.join(", ")}`);
+        return;
+      }
+      if (applicationId !== undefined && (typeof applicationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(applicationId))) {
+        sendError(res, "VALIDATION_ERROR", "applicationId must be a valid id");
+        return;
+      }
+
+      // 3. Application access. The model only ever gets the app after this passes.
+      let application = null;
+      if (applicationId) {
+        const snap = await collections.applications.doc(applicationId).get();
+        if (!snap.exists) {
+          sendError(res, "NOT_FOUND", "Application not found", 404);
+          return;
+        }
+        const loaded = { id: snap.id, ...snap.data() } as Application;
+        if (!checkApplicationAccessForRequest(req, loaded, "read")) {
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
+        }
+        application = loaded;
+      }
+
+      // 4. Draft.
+      const result = await templateDraftService.draft({
+        description: description.trim(),
+        category,
+        application,
+        requestedBy: req.userId!,
+      });
+      sendSuccess(res, result);
+    } catch (error) {
+      if (error instanceof TemplateDraftError) {
+        sendError(res, error.code, error.message, error.status);
+        return;
+      }
+      console.error("Error drafting document template:", error instanceof Error ? error.message : "unexpected error");
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
   }

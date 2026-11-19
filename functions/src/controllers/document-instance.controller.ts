@@ -13,9 +13,15 @@
  * Authorization reuses the shared CASL "Document" ability: agency owners manage
  * every instance in their agency; agents manage the instances they authored.
  * The read-only-plan 402 gate is applied globally in `verifyAuth`.
+ *
+ * APPLICANT EXCEPTION (#43): list / create / get-one / save are also open to the
+ * applicant, but ONLY for their own statement (see the "applicant statement"
+ * section). Every other route stays agent-only in routes/document-instance.routes.ts.
  */
 import { Response } from "express";
-import { AuthenticatedRequest } from "../middleware/auth";
+import { AuthenticatedRequest, isAgentSideRequest } from "../middleware/auth";
+import { checkApplicationAccessForRequest } from "../utils/access";
+import { APPLICANT_EDITABLE_STATUSES } from "../utils/editable-window";
 import { documentInstanceService } from "../services/document-instance.service";
 import { documentTemplateService } from "../services/document-template.service";
 import { applicationService } from "../services/application.service";
@@ -30,6 +36,21 @@ import { can, asSubject } from "../middleware/authz";
 import { ROLES } from "@durin-tech/authz";
 import { sendSuccess, sendCreated, sendError, ErrorMessages } from "../utils/response";
 
+// ============================================
+// APPLICANT STATEMENT CONSTANTS (#43)
+// ============================================
+
+// The ONLY template an applicant may instantiate. Fixed server-side; the client's
+// `templateId` is compared against it, never trusted to select a template.
+const STATEMENT_TEMPLATE_ID = "global-sop";
+
+// The editable window is shared with the answers API (#187): see utils/editable-window.ts.
+const STATEMENT_EDITABLE_STATUSES = APPLICANT_EDITABLE_STATUSES;
+
+// Upper bound on a saved statement body (serialised JSON chars), so an applicant
+// cannot store megabytes in a document they control. Firestore's hard limit is 1 MiB.
+const STATEMENT_MAX_CHARS = 200_000;
+
 export class DocumentInstanceController {
   /**
    * GET /document-instances?role=agent|owner|admin&applicationId=...&status=...&search=...
@@ -42,6 +63,8 @@ export class DocumentInstanceController {
    * Optional `status`/`search` are applied in memory on top.
    */
   async list(req: AuthenticatedRequest, res: Response): Promise<void> {
+    // Applicants take the narrow path; staff behaviour below is unchanged.
+    if (!isAgentSideRequest(req)) return this.applicantList(req, res);
     try {
       const userId = req.userId!;
       const role = (req.query.role as string) || ROLES.AGENT;
@@ -107,10 +130,138 @@ export class DocumentInstanceController {
     }
   }
 
+  // ============================================
+  // CLIENT-FACING READS
+  // ============================================
+  //
+  // Everything above is agent-side (`verifyAgent`). Sharing a document with a
+  // client was previously a dead end because of that: an agent could flip
+  // `shareStatus` to "shared" and the client had no endpoint that would return
+  // it. These two handlers are the missing read path.
+  //
+  // They deliberately do NOT go through the CASL "Document" ability, which
+  // models agency-side ownership (author / agency owner / admin) and has no
+  // notion of "the client this document is about". Access here is the narrower,
+  // explicit rule: the caller must own the linked APPLICATION, and the document
+  // must actually be shared.
+
+  /**
+   * Confirm the caller is the client on `applicationId`.
+   *
+   * Ownership is checked against `application.userId` rather than CASL because
+   * that is exactly the relationship being authorized — and because an agent
+   * calling these endpoints should fall through to the agent-side routes, not
+   * get a second, laxer path to the same documents.
+   */
+  private async ownsApplication(
+    userId: string,
+    applicationId: string
+  ): Promise<boolean> {
+    const appDoc = await collections.applications.doc(applicationId).get();
+    if (!appDoc.exists) return false;
+    return (appDoc.data() as Application).userId === userId;
+  }
+
+  /**
+   * GET /document-instances/shared?applicationId=...
+   *
+   * Documents an agency has shared with the authenticated client. With
+   * `applicationId` it's scoped to that case; without one it spans every
+   * application the client owns, which is what the "shared with you" list on a
+   * client's home view needs.
+   *
+   * Content is stripped (as in every list response) — the client fetches a
+   * single document's body via `GET /document-instances/shared/:id`.
+   */
+  async listShared(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const applicationId = req.query.applicationId as string | undefined;
+
+      // Resolve which applications to look at: the requested one (after an
+      // ownership check) or all of the caller's.
+      let applicationIds: string[];
+      if (applicationId) {
+        if (!(await this.ownsApplication(userId, applicationId))) {
+          // 403 rather than 404: the caller asked about a specific case, and
+          // whether it exists isn't theirs to learn.
+          sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+          return;
+        }
+        applicationIds = [applicationId];
+      } else {
+        const applications = await applicationService.getUserApplications(userId);
+        applicationIds = applications.map((a) => a.id);
+      }
+
+      if (applicationIds.length === 0) {
+        sendSuccess(res, []);
+        return;
+      }
+
+      // One query per case, in parallel. A client has a handful of applications,
+      // so this stays well inside a single request's budget — and it keeps each
+      // query to the single equality filter the service standardises on.
+      const perApplication = await Promise.all(
+        applicationIds.map((id) =>
+          documentInstanceService.listSharedForApplication(id)
+        )
+      );
+
+      const instances = perApplication
+        .flat()
+        .sort((a, b) => b.updatedAt.toMillis() - a.updatedAt.toMillis());
+
+      sendSuccess(res, instances);
+    } catch (error) {
+      console.error("Error listing shared document instances:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /document-instances/shared/:id
+   *
+   * A single shared document, WITH its content, for the client it was shared
+   * with. Both conditions are re-checked here rather than trusted from the list
+   * response: an agent can un-share a document at any moment, and this is the
+   * request that actually hands over the body.
+   */
+  async getShared(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { id } = req.params;
+
+      const instance = await documentInstanceService.getById(id);
+      if (!instance) {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+
+      // Unshared, or never linked to a case — indistinguishable from "doesn't
+      // exist" as far as a client is concerned, and answered the same way so the
+      // endpoint can't be used to probe for document ids.
+      if (
+        instance.shareStatus !== "shared" ||
+        !instance.applicationId ||
+        !(await this.ownsApplication(userId, instance.applicationId))
+      ) {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+
+      sendSuccess(res, instance);
+    } catch (error) {
+      console.error("Error getting shared document instance:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
   /**
    * GET /document-instances/:id
    */
   async getOne(req: AuthenticatedRequest, res: Response): Promise<void> {
+    if (!isAgentSideRequest(req)) return this.applicantGetOne(req, res);
     try {
       const { id } = req.params;
       const instance = await documentInstanceService.getById(id);
@@ -118,7 +269,17 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
-      if (!can(req, "read", this.documentSubject(instance))) {
+      // Applicant statement: read-only for staff with read access to the case.
+      // Cross-agency staff get 404, indistinguishable from a missing id.
+      const statementRead = await this.staffStatementRead(req, instance);
+      if (statementRead === "denied") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (
+        statementRead !== "allowed" &&
+        !can(req, "read", this.documentSubject(instance))
+      ) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
@@ -135,6 +296,7 @@ export class DocumentInstanceController {
    * Clones a template into a new editable instance owned by the caller.
    */
   async clone(req: AuthenticatedRequest, res: Response): Promise<void> {
+    if (!isAgentSideRequest(req)) return this.applicantClone(req, res);
     try {
       const userId = req.userId!;
       const { templateId, applicationId, title } = req.body ?? {};
@@ -226,6 +388,7 @@ export class DocumentInstanceController {
    * with the current version + last editor so the editor can prompt the user.
    */
   async save(req: AuthenticatedRequest, res: Response): Promise<void> {
+    if (!isAgentSideRequest(req)) return this.applicantSave(req, res);
     try {
       const userId = req.userId!;
       const { id } = req.params;
@@ -242,6 +405,7 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
+      if (await this.denyStaffStatementWrite(existing, res)) return;
       if (!can(req, "update", this.documentSubject(existing))) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -305,6 +469,7 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
+      if (await this.denyStaffStatementWrite(existing, res)) return;
       if (!can(req, "update", this.documentSubject(existing))) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -379,6 +544,7 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
+      if (await this.denyStaffStatementWrite(existing, res)) return;
       if (!can(req, "update", this.documentSubject(existing))) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -418,6 +584,7 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
+      if (await this.denyStaffStatementWrite(existing, res)) return;
       if (!can(req, "delete", this.documentSubject(existing))) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
@@ -452,7 +619,16 @@ export class DocumentInstanceController {
         sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
         return;
       }
-      if (!can(req, "read", this.documentSubject(existing))) {
+      // Same read-only staff rule as getOne for an applicant statement.
+      const statementRead = await this.staffStatementRead(req, existing);
+      if (statementRead === "denied") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (
+        statementRead !== "allowed" &&
+        !can(req, "read", this.documentSubject(existing))
+      ) {
         sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
         return;
       }
@@ -463,6 +639,335 @@ export class DocumentInstanceController {
       console.error("Error listing document versions:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
     }
+  }
+
+  // ============================================
+  // APPLICANT STATEMENT (#43)
+  // ============================================
+  //
+  // The applicant's own statement of purpose, nothing else. Every handler below
+  // is reached only when `isAgentSideRequest` is false, and each one re-derives
+  // authority from server-side data:
+  //
+  //   - the caller is `req.userId` (the verified token), never a body/query id;
+  //   - the application is loaded from Firestore and must satisfy BOTH
+  //     `application.userId === caller` (the applicant, not a same-agency
+  //     colleague, which `checkApplicationAccess` read alone would let through)
+  //     AND the shared `checkApplicationAccessForRequest` read check;
+  //   - an instance counts as "the caller's statement" only if it was created by
+  //     the caller, is from the statement template, and is linked to an
+  //     application the caller owns (`isOwnStatement`);
+  //   - anything that is not theirs answers 404, the same as "does not exist",
+  //     so ids and application ids cannot be probed.
+
+  /**
+   * The application when it exists and the caller is its applicant, else null.
+   * Callers answer 404 for null (missing and not-yours are indistinguishable).
+   */
+  private async loadOwnApplication(
+    req: AuthenticatedRequest,
+    applicationId: unknown
+  ): Promise<Application | null> {
+    if (typeof applicationId !== "string" || !applicationId) return null;
+    const snap = await collections.applications.doc(applicationId).get();
+    if (!snap.exists) return null;
+    const application = { id: snap.id, ...snap.data() } as Application;
+    if (application.userId !== req.userId) return null;
+    if (!checkApplicationAccessForRequest(req, application, "read")) return null;
+    return application;
+  }
+
+  /**
+   * True when `instance` is the caller's own statement: created by them, from the
+   * statement template, linked to the given (already owner-checked) application.
+   */
+  private isOwnStatement(
+    req: AuthenticatedRequest,
+    instance: DocumentInstance,
+    application: Application
+  ): boolean {
+    return (
+      instance.createdBy === req.userId &&
+      instance.templateId === STATEMENT_TEMPLATE_ID &&
+      instance.applicationId === application.id
+    );
+  }
+
+  /**
+   * The caller's statement for an owner-checked application (at most one by
+   * construction: the deterministic id), or null.
+   */
+  private async findOwnStatement(
+    req: AuthenticatedRequest,
+    application: Application
+  ): Promise<DocumentInstance | null> {
+    const instance = await documentInstanceService.getById(
+      this.statementIdFor(application.id)
+    );
+    return instance && this.isOwnStatement(req, instance, application)
+      ? instance
+      : null;
+  }
+
+  /** One statement per application: the id is derived, so a duplicate create collides. */
+  private statementIdFor(applicationId: string): string {
+    return `statement_${applicationId}`;
+  }
+
+  /**
+   * Load the instance for a path id AND the application it is linked to, and
+   * require that it is the caller's statement. Null means answer 404.
+   */
+  private async loadOwnStatementById(
+    req: AuthenticatedRequest,
+    id: string
+  ): Promise<{ instance: DocumentInstance; application: Application } | null> {
+    const instance = await documentInstanceService.getById(id);
+    if (!instance || instance.createdBy !== req.userId) return null;
+    const application = await this.loadOwnApplication(req, instance.applicationId);
+    if (!application || !this.isOwnStatement(req, instance, application)) return null;
+    return { instance, application };
+  }
+
+  /** Respond 409 STATEMENT_LOCKED when the application is past the editable window. */
+  private statementLocked(application: Application, res: Response): boolean {
+    if (STATEMENT_EDITABLE_STATUSES.has(application.status)) return false;
+    sendError(
+      res,
+      "STATEMENT_LOCKED",
+      "Your statement can no longer be edited because your application is already under review.",
+      409
+    );
+    return true;
+  }
+
+  /** Display name for an applicant (their user profile), else "Applicant". */
+  private async resolveApplicantName(userId: string): Promise<string> {
+    const userDoc = await collections.users.doc(userId).get();
+    if (userDoc.exists) {
+      const u = userDoc.data() as { firstName?: string; lastName?: string };
+      const name = `${u.firstName || ""} ${u.lastName || ""}`.trim();
+      if (name) return name;
+    }
+    return "Applicant";
+  }
+
+  /**
+   * GET /document-instances?applicationId=
+   * The caller's own statement on their own application: zero or one entry
+   * (content stripped, as in every list). `applicationId` is required: there is
+   * no applicant-wide listing, and `role`/`status`/`search` are ignored.
+   */
+  private async applicantList(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const application = await this.loadOwnApplication(req, req.query.applicationId);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+      const statement = await this.findOwnStatement(req, application);
+      // Strip content like the shared list responses do.
+      const list = statement ? [(({ content: _c, ...rest }) => rest)(statement)] : [];
+      sendSuccess(res, list);
+    } catch (error) {
+      console.error("Error listing applicant statement:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /** GET /document-instances/:id, applicant path: only their own statement, with content. */
+  private async applicantGetOne(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const own = await this.loadOwnStatementById(req, req.params.id);
+      if (!own) {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      sendSuccess(res, own.instance);
+    } catch (error) {
+      console.error("Error getting applicant statement:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /document-instances { templateId: "global-sop", applicationId }, applicant path.
+   *
+   * Idempotent: a second create returns the existing statement (200) and never a
+   * second one. Only `templateId` (must equal the statement template) and
+   * `applicationId` are read; `title`, owner, visibility, status, agency etc. in
+   * the body are ignored. Creating a NEW statement is refused (409) once the
+   * application is under review or later.
+   */
+  private async applicantClone(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.userId!;
+      const { templateId, applicationId } = req.body ?? {};
+
+      // Template swapping: only the statement template, compared to a constant.
+      if (templateId !== STATEMENT_TEMPLATE_ID) {
+        sendError(res, "FORBIDDEN", "You can only create your statement of purpose.", 403);
+        return;
+      }
+      const application = await this.loadOwnApplication(req, applicationId);
+      if (!application) {
+        sendError(res, "NOT_FOUND", "Application not found", 404);
+        return;
+      }
+
+      // Idempotent: return the existing one (even when locked, so the app can read it).
+      const existing = await this.findOwnStatement(req, application);
+      if (existing) {
+        sendSuccess(res, existing);
+        return;
+      }
+      if (this.statementLocked(application, res)) return;
+
+      // Re-check the template server-side: it must exist and be the global SOP.
+      const template = await documentTemplateService.getById(STATEMENT_TEMPLATE_ID, true);
+      if (!template || template.scope !== "global" || template.category !== "sop") {
+        sendError(res, "NOT_FOUND", "Template not found", 404);
+        return;
+      }
+
+      const createdByName = await this.resolveApplicantName(userId);
+      try {
+        const instance = await documentInstanceService.clone({
+          template,
+          title: template.title, // never client-supplied
+          createdBy: userId,
+          createdByName,
+          agencyId: null, // no agency ownership: see the CASL notes in the hand-back
+          applicationId: application.id,
+          fixedId: this.statementIdFor(application.id),
+        });
+        sendCreated(res, instance);
+      } catch (error) {
+        // Lost a create race (the deterministic id already exists): return the winner.
+        const winner = await this.findOwnStatement(req, application);
+        if (winner) {
+          sendSuccess(res, winner);
+          return;
+        }
+        throw error;
+      }
+    } catch (error) {
+      console.error("Error creating applicant statement:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * PUT /document-instances/:id { content, version }, applicant path.
+   *
+   * Field whitelist: ONLY `content` and the concurrency `version` are read. A
+   * `title`, `applicationId`, `templateId`, `shareStatus`, `status`, `createdBy`
+   * or `agencyId` in the body is ignored (the service writes only content,
+   * version and editor name). 409 STATEMENT_LOCKED once under review or later.
+   */
+  private async applicantSave(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      const { content, version } = req.body ?? {};
+      if (
+        content === null ||
+        typeof content !== "object" ||
+        Array.isArray(content) ||
+        (content as { type?: unknown }).type !== "doc" ||
+        typeof version !== "number"
+      ) {
+        sendError(res, "VALIDATION_ERROR", "content (a document) and numeric version are required");
+        return;
+      }
+      if (JSON.stringify(content).length > STATEMENT_MAX_CHARS) {
+        sendError(res, "VALIDATION_ERROR", "Your statement is too long.", 413);
+        return;
+      }
+
+      const own = await this.loadOwnStatementById(req, req.params.id);
+      if (!own) {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (this.statementLocked(own.application, res)) return;
+
+      const result = await documentInstanceService.save(own.instance.id, {
+        content,
+        expectedVersion: version,
+        // title deliberately omitted: an applicant cannot rename the document.
+        editorName: own.instance.createdByName,
+      });
+
+      if (result.status === "notFound") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (result.status === "conflict") {
+        res.status(409).json({
+          success: false,
+          error: "VERSION_CONFLICT",
+          message: "This statement was updated elsewhere. Reload to continue.",
+          data: { currentVersion: result.current.version, updatedAt: result.current.updatedAt },
+        });
+        return;
+      }
+      sendSuccess(res, result.instance);
+    } catch (error) {
+      console.error("Error saving applicant statement:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  // ---- staff READ-ONLY path to an applicant statement (#43) ----
+
+  /**
+   * The linked application when `instance` is an APPLICANT STATEMENT, else null.
+   * Shape: statement template, the derived `statement_<applicationId>` id, and
+   * `createdBy` equal to the application's applicant. An agent-authored instance
+   * from the same template never matches (different id, different creator).
+   */
+  private async applicantStatementApplication(
+    instance: DocumentInstance
+  ): Promise<Application | null> {
+    if (
+      instance.templateId !== STATEMENT_TEMPLATE_ID ||
+      !instance.applicationId ||
+      instance.id !== this.statementIdFor(instance.applicationId)
+    ) {
+      return null;
+    }
+    const snap = await collections.applications.doc(instance.applicationId).get();
+    if (!snap.exists) return null;
+    const application = { id: snap.id, ...snap.data() } as Application;
+    return application.userId === instance.createdBy ? application : null;
+  }
+
+  /**
+   * Staff READ gate for an applicant statement: the caller must pass the shared
+   * read check on the linked application (assigned agent, same-agency staff,
+   * admin). Returns "not_statement" when the instance is not an applicant
+   * statement (caller falls through to the normal Document ability),
+   * "allowed", or "denied" (answer 404, as for a missing id).
+   */
+  private async staffStatementRead(
+    req: AuthenticatedRequest,
+    instance: DocumentInstance
+  ): Promise<"not_statement" | "allowed" | "denied"> {
+    const application = await this.applicantStatementApplication(instance);
+    if (!application) return "not_statement";
+    return checkApplicationAccessForRequest(req, application, "read") ? "allowed" : "denied";
+  }
+
+  /**
+   * Staff may never write an applicant statement (save, link, share, delete),
+   * admin included. Responds 403 and returns true when the instance is one.
+   */
+  private async denyStaffStatementWrite(
+    instance: DocumentInstance,
+    res: Response
+  ): Promise<boolean> {
+    if (!(await this.applicantStatementApplication(instance))) return false;
+    sendError(res, "FORBIDDEN", "A client's statement can only be edited by the client.", 403);
+    return true;
   }
 
   // ============================================

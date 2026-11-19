@@ -1,6 +1,9 @@
 import { Router } from "express";
 import { userController } from "../controllers/user.controller";
 import { clientVerificationController } from "../controllers/client-verification.controller";
+import { aiMessageAccessController } from "../controllers/ai-message-access.controller";
+import { applicantHoldingsController } from "../controllers/applicant-holdings.controller";
+import { savedDestinationsController } from "../controllers/saved-destinations.controller";
 import { verifyAuth, verifyAdmin } from "../middleware/auth";
 
 const router = Router();
@@ -11,6 +14,12 @@ const router = Router();
 const adminUsersRouter = Router();
 adminUsersRouter.get("/", verifyAuth, verifyAdmin, (req, res) =>
   userController.listAllUsers(req, res)
+);
+
+// Admin-only: read one person's AI message access audit trail (issue #172).
+// Read-only by design: there is no route that edits or deletes audit records.
+adminUsersRouter.get("/:uid/ai-message-access-audit", verifyAuth, verifyAdmin, (req, res) =>
+  aiMessageAccessController.listAudit(req, res)
 );
 
 // Admin-only: manage a user's RBAC role/claims.
@@ -40,10 +49,72 @@ router.post("/me/change-email", verifyAuth, (req, res) =>
   userController.changeEmail(req, res)
 );
 
+// What the applicant holds (issue #234, P5 of #228): nationalities, country of
+// residence and held visas / permits / travel authorisations. ALWAYS the
+// caller's own profile (/me): no route names another user, so nobody else can
+// read or change them. The agent side sees an application's COPY only, through
+// GET /applications/:id (checkApplicationAccess).
+//   GET    /me/holdings                          -> HoldingsView
+//   PUT    /me/holdings                          -> replace any of the three fields
+//   POST   /me/holdings/documents                -> add one held document (201)
+//   DELETE /me/holdings/documents/:documentId    -> remove one held document
+router.get("/me/holdings", verifyAuth, (req, res) =>
+  applicantHoldingsController.get(req, res)
+);
+router.put("/me/holdings", verifyAuth, (req, res) =>
+  applicantHoldingsController.update(req, res)
+);
+router.post("/me/holdings/documents", verifyAuth, (req, res) =>
+  applicantHoldingsController.addDocument(req, res)
+);
+router.delete("/me/holdings/documents/:documentId", verifyAuth, (req, res) =>
+  applicantHoldingsController.removeDocument(req, res)
+);
+
+// Saved destinations (issue #146): the visas the caller saved with the heart
+// on a destination screen. ALWAYS the caller's own list (/me): no route takes
+// a user id, so nobody can read or change another user's saves. verifyAuth
+// answers 401 without a token and applies the read-only-plan write block to
+// PUT and DELETE (no exemption here); GET works on a read-only plan.
+//   GET    /me/saved-destinations                        -> SavedDestinationItem[], newest first
+//   PUT    /me/saved-destinations/:countryCode/:visaId   -> the saved item (idempotent;
+//            404 NOT_FOUND unknown / hidden visa, 409 SAVED_LIMIT_REACHED at 200 saves)
+//   DELETE /me/saved-destinations/:countryCode/:visaId   -> { countryCode, visaId, saved: false } (idempotent)
+// The country code matches in any case ("gb" and "GB" are the same save).
+router.get("/me/saved-destinations", verifyAuth, (req, res) =>
+  savedDestinationsController.list(req, res)
+);
+router.put("/me/saved-destinations/:countryCode/:visaId", verifyAuth, (req, res) =>
+  savedDestinationsController.save(req, res)
+);
+router.delete("/me/saved-destinations/:countryCode/:visaId", verifyAuth, (req, res) =>
+  savedDestinationsController.remove(req, res)
+);
+
 // Notification channel preferences (email/push on-off). PATCH a partial body to
 // toggle one or both channels.
 router.patch("/me/notification-preferences", verifyAuth, (req, res) =>
   userController.updateNotificationPreferences(req, res)
+);
+
+// AI message access (issue #172): the caller's own approval for intelligent
+// analysis of their messages, the account-wide "off" setting and the one-time
+// notice dismissal. Always the caller's own data (/me); a request naming another
+// user id is refused with 403.
+router.get("/me/ai-message-access", verifyAuth, (req, res) =>
+  aiMessageAccessController.getState(req, res)
+);
+router.post("/me/ai-message-access/approval", verifyAuth, (req, res) =>
+  aiMessageAccessController.approve(req, res)
+);
+router.delete("/me/ai-message-access/approval", verifyAuth, (req, res) =>
+  aiMessageAccessController.revoke(req, res)
+);
+router.put("/me/ai-message-access/account-wide-off", verifyAuth, (req, res) =>
+  aiMessageAccessController.setAccountWideOff(req, res)
+);
+router.post("/me/ai-message-access/notice-dismissed", verifyAuth, (req, res) =>
+  aiMessageAccessController.dismissNotice(req, res)
 );
 
 // Profile photo (avatar) upload — two-step signed-URL flow:

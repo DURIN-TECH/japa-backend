@@ -120,6 +120,9 @@ Authorization: Bearer {{adminToken}}
 # ============================================================
 
 ### Get all agents (public)
+# Issue #179: each agent carries consultationFeeUsd { amountMinor (US cents), currency: "USD" }
+# and consultationFeeLocal { amountMinor, currency, rate, asOf, available }.
+# available:false (rate stale/missing) -> show the dollar price only.
 GET {{baseUrl}}/agents
 
 ### Get agent profile (as agent1)
@@ -130,13 +133,61 @@ Authorization: Bearer {{agent1Token}}
 GET {{baseUrl}}/agents/seed-user-agent-001
 Authorization: Bearer {{adminToken}}
 
+### Set my consultation fee in US dollars (issue #179). Whole cents, at most
+### $100,000.00, currency USD only (optional). The old naira `consultationFee` is a 400.
+PUT {{baseUrl}}/agents/me
+Content-Type: application/json
+Authorization: Bearer {{agent1Token}}
+
+{ "consultationFeeUsd": { "amount": "10.00", "currency": "USD" } }
+
 # ============================================================
 # AGENCIES
 # ============================================================
 
+### Public agency directory (no auth, #144): approved agencies, newest first
+GET {{baseUrl}}/agencies/browse
+
+### Public agency directory: search by name, capped list (limit max 100)
+GET {{baseUrl}}/agencies/browse?search=acme&limit=10
+
+### Public agency profile by id, with visaPrices[] (no auth; 404 unless approved)
+GET {{baseUrl}}/agencies/browse/seed-agency-001
+
+### Public agency's verified + available agents (no auth; 404 unless approved)
+GET {{baseUrl}}/agencies/browse/seed-agency-001/agents
+
+### Public agency landing page by slug, with visaPrices[] (no auth)
+GET {{baseUrl}}/agencies/public/acme
+
 ### Get my agency (as owner)
 GET {{baseUrl}}/agencies/me
 Authorization: Bearer {{ownerToken}}
+
+### Set the agency fee and services in US dollars (issue #179, owner only).
+### consultationFeeUsd: null clears the fee. Old naira keys (consultationFee,
+### services[].price) are a 400.
+PUT {{baseUrl}}/agencies/me
+Content-Type: application/json
+Authorization: Bearer {{ownerToken}}
+
+{
+  "consultationFeeUsd": { "amount": "100.00", "currency": "USD" },
+  "services": [
+    { "id": "svc-1", "name": "Visa Application Processing", "priceUsd": { "amount": "50.00" } }
+  ]
+}
+
+### List this agency's visa service prices (priceUsd, US cents)
+GET {{baseUrl}}/agency/visa-prices
+Authorization: Bearer {{ownerToken}}
+
+### Set one visa's service price in US dollars ({ "priceUsd": null } clears it)
+PUT {{baseUrl}}/agency/visa-prices/GB/uk-student
+Content-Type: application/json
+Authorization: Bearer {{ownerToken}}
+
+{ "priceUsd": { "amount": "125.00", "currency": "USD" } }
 
 ### Get all agencies (admin)
 GET {{baseUrl}}/agencies
@@ -220,6 +271,189 @@ Authorization: Bearer {{agent1Token}}
 GET {{baseUrl}}/consultations
 Authorization: Bearer {{agent1Token}}
 
+### Book a consultation as a signed-in client (issue #180). The price is the
+### agent's own consultationFeeUsd, quoted in the client's profile currency and
+### locked for 30 minutes; any fee/amount/rate/currency sent here is IGNORED.
+### Paid: 201 with the booking + snapshot (priceUsdCents, chargedCurrency,
+### chargedAmountMinor, fxRate, fxRateAsOf, fxRateSource, fxMarginBps,
+### quoteLockedAt, quoteExpiresAt) and requiresPayment: true, authorizationUrl,
+### reference. $0 / no fee: 201, scheduled, requiresPayment: false.
+### No usable rate, unsupported currency or a malformed stored fee: 503 PRICING_UNAVAILABLE.
+### Agent not verified/available (or agency not approved): 404.
+POST {{baseUrl}}/consultations
+Content-Type: application/json
+Authorization: Bearer {{clientToken}}
+
+{
+  "agentId": "seed-agent-001",
+  "type": "initial",
+  "scheduledDate": "2026-12-01",
+  "scheduledTime": "10:00"
+}
+
+### Resume paying a pending booking (issue #180, the booking's own client only).
+### Inside the 30-minute lock: the same checkout. After it: a fresh quote and a
+### new checkout, issued race-safely (concurrent calls all get the ONE new
+### checkout). If the current reference was in fact paid (even after the
+### lock, exactly) it is confirmed; a late payment is flagged paidAfterQuoteExpiry.
+### 409 PAYMENT_IN_PROGRESS when Paystack reports the current checkout as not
+### final (ongoing / pending / processing / queued): nothing is re-priced and
+### data carries the current authorizationUrl/reference. 409 CHECKOUT_OPENING
+### when another request is opening the checkout right now (try again).
+POST {{baseUrl}}/consultations/{{consultationId}}/checkout
+Authorization: Bearer {{clientToken}}
+
+### Guest booking from the public agency page (no auth). The agency's
+### consultationFeeUsd is quoted in the default currency (NGN) and locked;
+### the response carries authorizationUrl, reference and the snapshot.
+POST {{baseUrl}}/agencies/public/acme/consultations
+Content-Type: application/json
+
+{
+  "clientName": "Gina Guest",
+  "clientEmail": "delivered+guest@resend.dev",
+  "scheduledDate": "2026-12-01",
+  "scheduledTime": "10:00"
+}
+
+### Verify a consultation payment on return from Paystack (no auth).
+### 200 { verified, consultation } when Paystack's amount AND currency equal
+### the stored chargedAmountMinor / chargedCurrency (idempotent: a second call
+### writes nothing). 400 PAYMENT_MISMATCH on an underpayment or wrong currency
+### (booking stays pending, nothing recorded). An exact payment that landed
+### after the 30-minute lock is still confirmed (200) and flagged
+### paidAfterQuoteExpiry on the booking and transaction for review.
+### The amount compared is Paystack's requested_amount when reported (fees
+### passed to the customer inflate amount), else amount.
+### 409 QUOTE_EXPIRED only for an UNPAID booking past its lock whose checkout
+### Paystack reports failed/abandoned: data has a fresh authorizationUrl/reference.
+### 409 PAYMENT_IN_PROGRESS when Paystack reports it not final: nothing re-priced.
+### SUPERSEDED references (booking.supersededCheckouts, each with its own
+### snapshot): an exact payment settles a still-unpaid booking at that price
+### (paidOnSupersededReference); on a booking already paid it is recorded in
+### consultationPaymentExceptions for refund: 200 { verified, refundPending: true },
+### no second transaction. Unpaid superseded: 409 CHECKOUT_REPLACED with the
+### current checkout. A reference that was never this booking's is 400 and logged.
+### 502 BILLING_PROVIDER_ERROR when Paystack fails while re-pricing.
+POST {{baseUrl}}/consultations/public/verify
+Content-Type: application/json
+
+{ "reference": "{{paystackReference}}" }
+
+### Book a consultation as an agent / agency owner for a client (issue #246).
+### The client (userId) must ALREADY be the caller's or their agency's client:
+### an application (agentId = caller uid, or the caller's agency), a
+### conversation (agentId = the caller's agent DOC id) or an earlier
+### consultation (any status). Otherwise 403 FORBIDDEN with nothing written,
+### no quote, no checkout; a userId that does not exist gets the same 403.
+### applicationId (optional) must be that client's application with this agent
+### or agency, else 403.
+POST {{baseUrl}}/consultations
+Content-Type: application/json
+Authorization: Bearer {{agent1Token}}
+
+{
+  "userId": "{{loginClient.response.body.localId}}",
+  "type": "initial",
+  "scheduledDate": "2026-12-01",
+  "scheduledTime": "10:00"
+}
+
+### Change a consultation's status (issue #151). Who may set what, and from where:
+###   client (the booking's userId): cancelled only, from pending_payment / scheduled / confirmed
+###   agent side (the booking's agent, its agency's owner, an admin):
+###     confirmed   from scheduled
+###     in_progress from scheduled / confirmed
+###     completed   from scheduled / confirmed / in_progress
+###     no_show     from scheduled / confirmed / in_progress
+###     cancelled   from pending_payment / scheduled / confirmed
+### 400 VALIDATION_ERROR: unknown status, or pending_payment / scheduled as the target (anyone).
+### 403 FORBIDDEN: not a party, or a client asking for anything but cancelled.
+### 409 INVALID_STATUS_TRANSITION: a move not in the table (incl. out of completed / cancelled / no_show).
+### 409 PAYMENT_IN_PROGRESS: cancelling a pending_payment booking whose checkout
+### (transactionId) is still inside its quote lock (quoteExpiresAt in the future).
+### Every refusal writes nothing and notifies nobody.
+PUT {{baseUrl}}/consultations/{{consultationId}}/status
+Content-Type: application/json
+Authorization: Bearer {{clientToken}}
+
+{ "status": "cancelled", "cancellationReason": "Travel moved" }
+
+### Delete a consultation (issue #151): ADMINS ONLY (everyone else 403; they
+### cancel with the status route above). 409 BOOKING_HAS_PAYMENT, nothing
+### removed, when the booking has a transactionId, or paymentStatus "paid" with a
+### non-zero charge. A free booking ($0, no transaction) can be deleted.
+DELETE {{baseUrl}}/consultations/{{consultationId}}
+Authorization: Bearer {{adminToken}}
+
+# ============================================================
+# PAYMENT REQUESTS (issue #181) — the agent asks in US dollars, the
+# client pays the local amount quoted at checkout start
+# ============================================================
+
+### Create a payment request (agent assigned to the case, or its agency's
+### owner; agency must be compliance-verified). `amount` is US DOLLARS
+### ("150.00" or 150), whole cents, > 0, at most $100,000.00; `currency` is
+### "USD" or absent (anything else 400). Stored: priceUsd { amountMinor: 15000,
+### currency: "USD" } mirrored as amount 15000 / currency "USD". No rate is read
+### here. Response adds amountDisplay ("USD 150.00"), legacy (false), priceUsd,
+### charge (null until priced). Another agency's agent: 403, nothing written.
+POST {{baseUrl}}/payment-requests
+Authorization: Bearer {{agent1Token}}
+Content-Type: application/json
+
+{
+  "applicationId": "seed-app-001",
+  "amount": "150.00",
+  "currency": "USD",
+  "description": "Visa Processing Fee",
+  "category": "visa_fee"
+}
+
+### List (role=agent|owner|admin|client). Each row carries amountDisplay with
+### explicit codes ("USD 150.00 (NGN 225,000.00)" once priced; a legacy naira
+### row: "NGN 25,000.00", legacy: true).
+GET {{baseUrl}}/payment-requests?role=client
+Authorization: Bearer {{clientToken}}
+
+### Approve and start checkout (the request's client). The server quotes the
+### dollar price in the client's profile currency, locks it for 30 minutes and
+### stores priceUsdCents, chargedCurrency, chargedAmountMinor, fxRate,
+### fxRateAsOf, fxRateSource, fxMarginBps, quoteLockedAt, quoteExpiresAt on the
+### request; Paystack is charged exactly chargedAmountMinor in chargedCurrency
+### under our reference (preq-<id>-<uuid>). Response: the request plus
+### authorizationUrl and paystackReference. 503 PRICING_UNAVAILABLE when no
+### usable rate (request stays pending). 502 BILLING_PROVIDER_ERROR on a
+### Paystack failure (then use /checkout). A legacy naira request opens a
+### naira checkout for its own stored kobo amount, as before.
+PUT {{baseUrl}}/payment-requests/{{paymentRequestId}}/approve
+Authorization: Bearer {{clientToken}}
+
+### Resume / re-issue the checkout of an approved, unpaid request (issue #152).
+### 200 { requiresPayment, authorizationUrl, reference, paymentRequest }:
+### inside the lock the same checkout; after it a fresh quote of the same
+### dollar price and a new checkout (old reference kept in supersededCheckouts).
+### Paid already: { requiresPayment: false }. 409 PAYMENT_IN_PROGRESS while
+### Paystack reports the checkout ongoing/pending/processing/queued (nothing
+### re-quoted). 409 REQUEST_NOT_PAYABLE for a pending, cancelled or legacy one.
+POST {{baseUrl}}/payment-requests/{{paymentRequestId}}/checkout
+Authorization: Bearer {{clientToken}}
+
+### Verify on return from Paystack. Settles ONLY when Paystack's
+### requested_amount (else amount) and currency equal what that checkout asked;
+### else 400 PAYMENT_MISMATCH and nothing is written (not marked paid). One
+### Transaction ever (amount = charged minor units, plus priceUsdCents and the
+### rate snapshot); the case's amountPaid moves by the dollar price in US
+### cents. Not paid inside the lock: 200 "Payment not completed"; after it:
+### 409 QUOTE_EXPIRED with a fresh checkout. Superseded reference: an exact
+### payment settles an unpaid request at that price; on a paid request it is
+### held in paymentRequestExceptions (200 refundPending: true).
+POST {{baseUrl}}/payment-requests/{{paymentRequestId}}/verify
+Authorization: Bearer {{clientToken}}
+Content-Type: application/json
+
+{ "reference": "{{paystackReference}}" }
+
 # ============================================================
 # CONVERSATIONS
 # ============================================================
@@ -227,6 +461,68 @@ Authorization: Bearer {{agent1Token}}
 ### Get all conversations
 GET {{baseUrl}}/conversations
 Authorization: Bearer {{agent1Token}}
+
+# ============================================================
+# EXCHANGE RATES (issue #178) — prices are USD, charged in local currency
+# ============================================================
+
+### Public: current rate per supported currency (no auth, cacheable)
+# Returns { base: "USD", currencies: [{ currency, exponent, available, rate, asOf }] }.
+# `available: false` means the rate is stale or missing: show no local amount.
+GET {{baseUrl}}/rates
+
+### Admin: stored rates, active override and override history
+GET {{baseUrl}}/admin/exchange-rates
+Authorization: Bearer {{adminToken}}
+
+### Admin: set a manual rate (naira per US dollar). Must be within the band
+### (default 10%) of the last provider rate. ttlHours optional (1-168).
+PUT {{baseUrl}}/admin/exchange-rates/NGN
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "rate": 1500, "reason": "CBN site unreachable, using bank quote", "ttlHours": 24 }
+
+### Admin: clear the manual rate (the provider rate serves again)
+DELETE {{baseUrl}}/admin/exchange-rates/NGN
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "reason": "CBN is back" }
+
+### Admin: accept a genuine large provider move (drops the stored provider
+### rate, audited; the next refresh sets the new level, held to the plausible range)
+POST {{baseUrl}}/admin/exchange-rates/NGN/reset-reference
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "reason": "Genuine devaluation confirmed against CBN notice" }
+
+### Admin: refresh one currency from the provider now (issue #214). Same
+### checks as the 6-hourly schedule; audited; one call per currency per 5 minutes
+### (429 with Retry-After otherwise). reason is optional.
+POST {{baseUrl}}/admin/exchange-rates/NGN/refresh
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "reason": "Undo a mistaken reset-reference" }
+
+### Admin: hold (pin) a rate while the provider lags a real move (issue #241).
+### While held it is THE rate (outranks any override); refreshes still store the
+### provider rate for comparison. rate must be inside the plausible range (NGN
+### 200-5000); reason 5-500 chars; ttlHours required, 1-168. Audited (hold_set).
+PUT {{baseUrl}}/admin/exchange-rates/NGN/hold
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "rate": 1800, "reason": "CBN lags the market after the devaluation", "ttlHours": 48 }
+
+### Admin: clear the hold (normal rules resume). Audited (hold_cleared).
+DELETE {{baseUrl}}/admin/exchange-rates/NGN/hold
+Content-Type: application/json
+Authorization: Bearer {{adminToken}}
+
+{ "reason": "CBN caught up with the market" }
 
 # ============================================================
 # DEV — Seed endpoints (emulator only)

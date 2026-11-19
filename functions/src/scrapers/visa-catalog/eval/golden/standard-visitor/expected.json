@@ -1,0 +1,247 @@
+{
+  "route": "standard-visitor",
+  "sourceUrl": "https://www.gov.uk/standard-visitor",
+  "fixtureRecordedAt": "2026-11-09",
+  "draftedBy": "ai-team software-engineer, from guide.json only (not from seed data), 2026-11-09",
+  "verifiedBy": "wrightkhlebisol",
+  "verifiedOn": "2026-11-09",
+  "notes": [
+    "QA checked all fields vs live Content API 2026-11-09; user spot-checked fee lines",
+    "Fee rule (#59): the standard (up to 6 months) Standard Visitor visa is £135. Long-term (2/5/10 year), medical and academic variants and the £1,172 in-UK extension are excluded. No IHS for visitors.",
+    "isExtendable: true — a stay under 6 months can be extended up to a total of 6 months (and longer for medical treatment / academics).",
+    "Processing time (user decision, 2026-11-09): FULL RANGE: min = outside-UK visa decision (3 weeks), max = inside-UK extension decision, standard service (8 weeks).",
+    "documentKinds (#187) scores 14 items: the passport / travel document sentence (document, required) plus the 13 items of the page's two lists ('information in your online application' = required unless an inline 'if'; 'Depending on your circumstances' = conditional). Only the passport and the TB certificate are documents; every other item is information. The extractor lists the passport sentence as an item, so it is scored.",
+    "answerTypes (#187 regroom): the 12 information items carry the type their own words give: travel dates date_range; trip cost and earnings money; where you'll be staying, home address and employer's address address; parents' names and dates of birth, offences, travel history, anyone paying and family members list; partner's name, date of birth and passport number text (it asks several fields at once)."
+  ],
+  "name": {
+    "value": "Standard Visitor",
+    "source": "You can visit the UK as a Standard Visitor for tourism, business, study (courses up to 6 months) and other permitted activities."
+  },
+  "category": {
+    "value": "tourist",
+    "source": "You can visit the UK as a Standard Visitor for tourism, business, study (courses up to 6 months) and other permitted activities."
+  },
+  "processingDaysMin": {
+    "value": 21,
+    "source": "you’ll usually get a decision on your visa within 3 weeks."
+  },
+  "processingDaysMax": {
+    "value": 56,
+    "source": "If you use the standard service, a decision will usually be made within 8 weeks of providing your supporting documents and proving your identity."
+  },
+  "validityPeriod": {
+    "durations": [
+      {
+        "amount": 6,
+        "unit": "month"
+      }
+    ],
+    "source": "You can usually stay in the UK for up to 6 months."
+  },
+  "isExtendable": {
+    "value": true,
+    "source": "You may be able to extend your stay if you have permission to be in the UK for less than 6 months. You can extend your stay up to a total of 6 months."
+  },
+  "eligibility": {
+    "themes": [
+      {
+        "theme": "will leave the UK at the end of the visit",
+        "anyOf": [
+          "leave the uk",
+          "leave at the end",
+          "end of your visit",
+          "end of the visit",
+          "return home",
+          "intend to leave"
+        ],
+        "source": "you’ll leave the UK at the end of your visit"
+      },
+      {
+        "theme": "can support yourself during the trip",
+        "anyOf": [
+          "support yourself",
+          "support themselves",
+          "enough money",
+          "sufficient money",
+          "sufficient funds",
+          "funds to support",
+          "financially support"
+        ],
+        "source": "you’re able to support yourself and your dependants during your trip (or have funding from someone else to support you)"
+      },
+      {
+        "theme": "can pay for the return or onward journey",
+        "anyOf": [
+          "return or onward",
+          "return journey",
+          "onward journey",
+          "return travel",
+          "return trip"
+        ],
+        "source": "you’re able to pay for your return or onward journey (or have funding from someone else to pay for the journey)"
+      },
+      {
+        "theme": "valid passport or travel document",
+        "anyOf": [
+          "passport",
+          "travel document"
+        ],
+        "source": "You must have a passport or travel document to enter the UK. It should be valid for the whole of your stay."
+      },
+      {
+        "theme": "will not live in the UK through frequent or successive visits",
+        "anyOf": [
+          "frequent or successive",
+          "successive visits",
+          "frequent visits",
+          "main home",
+          "extended periods"
+        ],
+        "source": "you’ll not live in the UK for extended periods through frequent or successive visits, or make the UK your main home"
+      }
+    ]
+  },
+  "applicationUrlHost": {
+    "value": "visas-immigration.service.gov.uk",
+    "source": "https://visas-immigration.service.gov.uk/apply-visa-type/visit"
+  },
+  "feeComponents": {
+    "components": [
+      {
+        "kind": "application",
+        "amount": 135,
+        "currency": "GBP",
+        "per": "application",
+        "source": "A Standard Visitor visa costs £135 for up to 6 months."
+      }
+    ]
+  },
+  "documentKinds": {
+    "items": [
+      {
+        "match": [
+          "travel document"
+        ],
+        "kind": "document",
+        "need": "required",
+        "source": "You must have a passport or travel document that is valid for the whole of your stay in the UK."
+      },
+      {
+        "match": [
+          "planning to travel"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "the dates you’re planning to travel to the UK",
+        "answerType": "date_range"
+      },
+      {
+        "match": [
+          "staying"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "where you’ll be staying during your visit",
+        "answerType": "address"
+      },
+      {
+        "match": [
+          "trip will cost"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "how much you think your trip will cost",
+        "answerType": "money"
+      },
+      {
+        "match": [
+          "home address"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "your current home address and how long you’ve lived there",
+        "answerType": "address"
+      },
+      {
+        "match": [
+          "parents"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "your parents’ names and dates of birth (if known)",
+        "answerType": "list"
+      },
+      {
+        "match": [
+          "earn"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "how much you earn in a year (if you have an income)",
+        "answerType": "money"
+      },
+      {
+        "match": [
+          "offences"
+        ],
+        "kind": "information",
+        "need": "required",
+        "source": "details of any criminal, civil or immigration offences you may have committed",
+        "answerType": "list"
+      },
+      {
+        "match": [
+          "travel history"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "details of your travel history for the past 10 years",
+        "answerType": "list"
+      },
+      {
+        "match": [
+          "employer"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "your employer’s address and telephone number",
+        "answerType": "address"
+      },
+      {
+        "match": [
+          "partner"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "your partner’s name, date of birth and passport number",
+        "answerType": "text"
+      },
+      {
+        "match": [
+          "anyone paying"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "the name and address of anyone paying for your trip",
+        "answerType": "list"
+      },
+      {
+        "match": [
+          "family members"
+        ],
+        "kind": "information",
+        "need": "conditional",
+        "source": "the name, address and passport number of any family members you have in the UK",
+        "answerType": "list"
+      },
+      {
+        "match": [
+          "tuberculosis"
+        ],
+        "kind": "document",
+        "need": "conditional",
+        "source": "a certificate proving that you’ve had a tuberculosis (TB) test if you’re visiting for more than 6 months"
+      }
+    ]
+  }
+}

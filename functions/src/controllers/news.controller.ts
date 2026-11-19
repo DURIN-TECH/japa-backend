@@ -1,11 +1,11 @@
 import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
+import { asSubject, can, forbidden } from "../middleware/authz";
 import { newsService } from "../services/news.service";
 import {
   sendSuccess,
   sendError,
   sendNotFound,
-  sendForbidden,
   ErrorMessages,
 } from "../utils/response";
 import { SupportedCountryCode } from "../types/news";
@@ -99,36 +99,20 @@ class NewsController {
   }
 
   /**
-   * GET /news/admin/sources
-   */
-  async getSources(
-    req: AuthenticatedRequest,
-    res: Response
-  ): Promise<void> {
-    try {
-      if (!req.user?.admin) {
-        sendForbidden(res);
-        return;
-      }
-
-      const sources = await newsService.getActiveSources();
-      sendSuccess(res, sources);
-    } catch (error) {
-      console.error("Error getting sources:", error);
-      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
-    }
-  }
-
-  /**
-   * GET /news/admin/sources/:sourceId/runs
+   * GET /news/admin/sources/:sourceId/runs (admin only, CASL `read ScrapeRun`).
+   * (GET /news/admin/sources was removed in issue #17: use
+   * GET /admin/scrape-sources?kind=news.)
    */
   async getScrapeRuns(
     req: AuthenticatedRequest,
     res: Response
   ): Promise<void> {
     try {
-      if (!req.user?.admin) {
-        sendForbidden(res);
+      // Issue #17: the standard CASL gate (admin-only via the ScrapeRun
+      // subject), replacing the hand-rolled `req.user?.admin` check. Runs
+      // before any read so non-admins learn nothing.
+      if (!can(req, "read", asSubject("ScrapeRun", {}))) {
+        forbidden(res);
         return;
       }
 

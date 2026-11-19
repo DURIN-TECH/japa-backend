@@ -5,14 +5,50 @@ import cors from "cors";
 import { authRoutes } from "./routes/auth.routes";
 import { userRoutes, adminUsersRouter } from "./routes/user.routes";
 import { countryRoutes, visaSearchRoutes, adminVisaRoutes } from "./routes/visa.routes";
+// Proposed edits to approved scraped visas (pendingVisaChanges, issue #61)
+import { adminVisaChangeRoutes } from "./scrapers";
+// Scraper run records + source health (issue #81, CASL `ScrapeRun`).
+import { adminScrapeCostRoutes, adminScrapeRunRoutes, adminScrapeSourceRoutes } from "./scrapers";
+// Scraper alerts: list / acknowledge / resolve (issue #83)
+import { adminScrapeAlertRoutes } from "./scrapers";
+// Scraper settings, per-source controls and manual "Run now" (issue #96).
+import {
+  adminScrapeRunRequestRoutes,
+  adminScrapeSourceControlRoutes,
+  adminScraperRunRoutes,
+  adminScraperSettingsRoutes,
+} from "./scrapers";
+// Caseworker-guidance source registry: admin list (issue #39).
+import { adminGuidanceSourceRoutes } from "./scrapers";
+// Source registry API (issue #215): confirmed hosts + route registration.
+import { adminOfficialDomainRoutes, adminRouteSourceRoutes } from "./scrapers";
+// Issuing authorities and bloc membership (issue #230): admin-only API.
+import { adminAuthorityRoutes } from "./authorities";
+// Shared routes and inheriting visa records (issue #231): admin-only API.
+import { adminSharedRouteRoutes } from "./shared-routes";
+// Route onboarding runs (issue #217).
+import { adminRouteOnboardingRoutes } from "./scrapers";
+// Rubric review (issue #125): admin queue, detail with diff, approve / reject.
+import { adminRubricRoutes } from "./routes/rubric-review.routes";
+import { adminRubricExtractionJobRoutes } from "./routes/rubric-extraction-job.routes";
+// Published outcome statistics imports: admin run list + Run now (issue #116).
+import { adminOutcomeStatisticsRoutes } from "./scrapers";
+// Agency-scoped visa drafts / edits / submit (issue #100).
+import { agencyVisaRoutes } from "./agency-visas";
+// Agency per-visa service prices, in whole naira (issue #103).
+import { agencyVisaPriceRoutes } from "./agency-visa-prices";
+import { feedbackRoutes } from "./routes/feedback.routes";
 import { agentRoutes } from "./routes/agent.routes";
 import { agencyRoutes, invitationRoutes } from "./routes/agency.routes";
 import { applicationRoutes } from "./routes/application.routes";
+// Issue #235: "which country do I apply through" for a shared route (applicant-facing, read-only).
+import { applyThroughRoutes } from "./routes/apply-through.routes";
 import { documentRoutes } from "./routes/document.routes";
 // Document templates feature (rich-text templates + editable case-linked instances)
 import { documentTemplateRoutes } from "./routes/document-template.routes";
 import { documentInstanceRoutes } from "./routes/document-instance.routes";
 // Durable agent→client document asks (backs the client web workspace to-do list)
+import { checklistRoutes } from "./routes/checklist.routes";
 import { documentRequestRoutes } from "./routes/document-request.routes";
 import {
   eligibilityRoutes,
@@ -27,13 +63,22 @@ import { newsRoutes } from "./routes/news.routes";
 import { bankAccountRoutes } from "./routes/bank-account.routes";
 import { onboardingRoutes } from "./routes/onboarding.routes";
 import { analyticsRoutes } from "./routes/analytics.routes";
+import { aiRoutes } from "./routes/ai.routes";
 import {
   plansRouter,
   subscriptionsRouter,
   adminPlansRouter,
   webhooksRouter,
 } from "./routes/entitlement.routes";
+// Public exchange rates + admin rate overrides (issue #178).
+import { publicRatesRoutes, adminExchangeRateRoutes } from "./routes/exchange-rate.routes";
 import { verificationWebhookRoutes } from "./routes/verification-webhook.routes";
+// Public Paystack return page that bounces the in-app browser back to the mobile app (issue #252).
+import { paymentReturnRoutes } from "./routes/payment-return.routes";
+// Admin review queue for trafficking / scam risk signals (issue #119).
+import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
+// Issue #236: entry requirements ("do you need a visa at all") and their admin review data.
+import { entryRequirementsRoutes, adminEntryRuleRoutes } from "./entry-requirements";
 
 // Create Express app
 const app = express();
@@ -65,12 +110,26 @@ app.get("/health", (req: Request, res: Response) => {
 app.use("/users", userRoutes);
 app.use("/countries", countryRoutes);
 app.use("/visas", visaSearchRoutes);
+// Public Paystack return page (issue #252) — no verifyAuth: Paystack's browser
+// redirect carries no token. It only redirects to the fixed app deep link
+// `durintech://payment-return`; payment is confirmed by the authenticated
+// verify endpoints, never by this page.
+app.use("/payments", paymentReturnRoutes);
 // Public auth flows (forgot-password) — no verifyAuth (user isn't signed in).
 app.use("/auth", authRoutes);
 app.use("/agents", agentRoutes);
 app.use("/agencies", agencyRoutes);
+// Agency visas (issue #100): the caller's OWN agency's visas. Singular
+// "/agency" = "my agency" (the agency comes from the token, never the URL).
+app.use("/agency/visas", agencyVisaRoutes);
+// Agency per-visa service prices (issue #103): the caller's OWN agency's
+// prices (agency from the token). Contract: src/agency-visa-prices/agency-visa-prices.md.
+app.use("/agency/visa-prices", agencyVisaPriceRoutes);
 app.use("/invitations", invitationRoutes);
+// Personal document checklist (issue #114): extra-segment paths on /applications.
+app.use("/applications", checklistRoutes);
 app.use("/applications", applicationRoutes);
+app.use("/shared-routes", applyThroughRoutes);
 app.use("/documents", documentRoutes);
 // Document templates: catalog (read-only) + editable instances cloned from them
 app.use("/document-templates", documentTemplateRoutes);
@@ -79,6 +138,8 @@ app.use("/document-requests", documentRequestRoutes);
 app.use("/transactions", transactionRoutes);
 app.use("/consultations", consultationRoutes);
 app.use("/notifications", notificationRoutes);
+// In-app tester feedback (issue #257).
+app.use("/feedback", feedbackRoutes);
 app.use("/payment-requests", paymentRequestRoutes);
 app.use("/conversations", messagingRoutes);
 app.use("/bank-accounts", bankAccountRoutes);
@@ -86,8 +147,59 @@ app.use("/onboarding", onboardingRoutes);
 app.use("/analytics", analyticsRoutes);
 app.use("/news", newsRoutes);
 app.use("/eligibility", eligibilityRoutes);
+// Issue #236: GET /entry-requirements (signed in, free: stored sourced data, no AI call).
+app.use("/entry-requirements", entryRequirementsRoutes);
+// AI case-officer assessments (issue #42): async jobs, tier decided in the handler.
+app.use("/ai", aiRoutes);
 app.use("/admin/eligibility", adminEligibilityRoutes);
 app.use("/admin/visas", adminVisaRoutes);
+// Admin queue of proposed edits to live scraped visas (CASL `VisaChange`).
+app.use("/admin/visa-changes", adminVisaChangeRoutes);
+// Admin-only review queue for trafficking / scam risk signals (issue #119).
+// Signals are raised by backend code, never through HTTP; this mount only
+// lists, reads and records an admin decision.
+app.use("/admin/risk-signals", adminRiskSignalRoutes);
+// Scraper monitoring (issue #81): run records + per-source health (CASL `ScrapeRun`).
+app.use("/admin/scrape-runs", adminScrapeRunRoutes);
+app.use("/admin/scrape-sources", adminScrapeSourceRoutes);
+// Issue #96: per-source edits + Run now on the same path (PATCH /:kind/:id,
+// POST /:kind/:id/run; the #81 router above only serves GET /).
+app.use("/admin/scrape-sources", adminScrapeSourceControlRoutes);
+// Issue #96: settings (read = `read ScrapeRun`, edits / runs = `update ScrapeRun`).
+app.use("/admin/scraper-settings", adminScraperSettingsRoutes);
+app.use("/admin/scrapers", adminScraperRunRoutes);
+app.use("/admin/scrape-run-requests", adminScrapeRunRequestRoutes);
+// Scraper alerts (issue #83): read = CASL `read ScrapeRun`, ack/resolve = `update ScrapeRun`.
+app.use("/admin/scrape-alerts", adminScrapeAlertRoutes);
+// Scraping cost report from the monthly rollup (issue #82; CASL `ScrapeRun`).
+app.use("/admin/scrape-costs", adminScrapeCostRoutes);
+// Caseworker-guidance source registry (issue #39): read-only admin list
+// (CASL `read ScrapeRun`, admin-only). No route serves snapshot text.
+app.use("/admin/guidance-sources", adminGuidanceSourceRoutes);
+// Issue #215: admin-only (verifyAuth + the ScrapeRun admin gate on every route).
+app.use("/admin/official-domains", adminOfficialDomainRoutes);
+app.use("/admin/route-sources", adminRouteSourceRoutes);
+// Issue #230: issuing authorities (country, bloc, treaty) and bloc members.
+// Admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route.
+app.use("/admin/authorities", adminAuthorityRoutes);
+// Issue #236: entry rules, their sources and drafting runs (admin review data, read-only).
+app.use("/admin/entry-rules", adminEntryRuleRoutes);
+// Issue #231: shared routes (a visa defined once by a bloc) and the visa records that inherit them.
+app.use("/admin/shared-routes", adminSharedRouteRoutes);
+// Issue #217: route onboarding runs (admin-only: verifyAuth, verifyAdmin and the ScrapeRun gate on every route).
+app.use("/admin/route-onboarding", adminRouteOnboardingRoutes);
+// Rubric review (issue #125): admin-only (verifyAuth + admin gate on every
+// route). The only routes that read an unapproved rubric version.
+app.use("/admin/rubrics", adminRubricRoutes);
+// Rulebook drafting jobs (issue #216): start, status and cancel of the
+// resumable background job. Admin-only, the same gate as /admin/rubrics.
+app.use("/admin/rubric-extraction-jobs", adminRubricExtractionJobRoutes);
+// Outcome statistics imports (issue #116): admin-only run records + manual run.
+app.use("/admin/outcome-statistics", adminOutcomeStatisticsRoutes);
+// Public, unauthenticated, cacheable local-currency rates (issue #178).
+app.use("/rates", publicRatesRoutes);
+// Admin-only rate overrides + audit history (issue #178).
+app.use("/admin/exchange-rates", adminExchangeRateRoutes);
 app.use("/plans", plansRouter);
 app.use("/subscriptions", subscriptionsRouter);
 app.use("/admin/plans", adminPlansRouter);

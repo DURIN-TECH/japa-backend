@@ -12,6 +12,7 @@
  * The scope a caller gets is decided here from `req.authz.role`, never from a
  * query parameter — a client cannot widen their own query.
  */
+import { aiActionService } from "../services/ai-action.service";
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { documentRequestService } from "../services/document-request.service";
@@ -248,6 +249,10 @@ export class DocumentRequestController {
         status as "waived" | "cancelled",
         userId
       );
+
+      // A request made from an AI proposed action withdraws that action, so the
+      // plan stops asking for it (issue #44). No-op otherwise; never throws.
+      await aiActionService.syncFromRequest(existing, "withdrawn");
 
       // Audit the withdrawal on the case notes feed (best-effort).
       const actorName = (await userService.getDisplayName(userId)) || "An agent";

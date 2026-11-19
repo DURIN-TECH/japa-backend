@@ -1,9 +1,22 @@
 import { getStorage } from "firebase-admin/storage";
 import { randomUUID } from "crypto";
+import { assertClientReachableKey, buildIssuedPath } from "../utils/storage-paths";
 
 // Service that brokers all Cloud Storage access for the backend.
 // File uploads are NOT proxied through Cloud Functions; instead, this service
 // mints short-lived v4 signed URLs that clients use to PUT/GET objects directly.
+//
+// WHERE PATHS COME FROM (issue #141): every upload path is assembled by
+// `buildIssuedPath()` in utils/storage-paths.ts, the same module the register /
+// download / delete code uses to VALIDATE a path. This service does not decide
+// whose object a path is — its callers must have validated the path against
+// the right owner first (`validateStoragePath`) — but the methods that sign a
+// download, publish or delete an object refuse, as a last line of defence, any
+// value that is not a plain bucket-relative key or that sits under a
+// backend-only prefix (`assertClientReachableKey`).
+/** Largest feedback screenshot the signed upload URL accepts (5 MB). */
+export const FEEDBACK_SCREENSHOT_MAX_BYTES = 5 * 1024 * 1024;
+
 export class StorageService {
   // Resolve the default bucket for the active Firebase project.
   //
@@ -32,9 +45,13 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `documents/${userId}/${applicationId}/${fileId}_${sanitizedFileName}`;
+    // documents/{clientUid}/{applicationId}/{uuid}_{file} — `userId` here is
+    // the application's CLIENT (see DocumentService.getUploadUrl), whoever is
+    // uploading.
+    const storagePath = buildIssuedPath(
+      { purpose: "application-document", ownerUserId: userId, applicationId },
+      fileName
+    );
 
     const file = this.bucket.file(storagePath);
 
@@ -67,9 +84,8 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `verification/${userId}/${fileId}_${sanitizedFileName}`;
+    // verification/{agentUserUid}/{uuid}_{file}
+    const storagePath = buildIssuedPath({ purpose: "agent-verification", userId }, fileName);
 
     const file = this.bucket.file(storagePath);
 
@@ -108,10 +124,13 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedSlot = slot.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `compliance/${agencyId}/${sanitizedSlot}/${fileId}_${sanitizedFileName}`;
+    // compliance/{agencyId}/{slot}/{uuid}_{file}. The controller has already
+    // checked `slot` against the known slots; `buildIssuedPath` throws rather
+    // than issue a path if it is not usable as a single path segment.
+    const storagePath = buildIssuedPath(
+      { purpose: "compliance-document", agencyId, slots: [slot] },
+      fileName
+    );
 
     const file = this.bucket.file(storagePath);
 
@@ -149,9 +168,8 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `agency-logos/${agencyId}/${fileId}_${sanitizedFileName}`;
+    // agency-logos/{agencyId}/{uuid}_{file}
+    const storagePath = buildIssuedPath({ purpose: "agency-logo", agencyId }, fileName);
 
     const file = this.bucket.file(storagePath);
 
@@ -192,9 +210,8 @@ export class StorageService {
     storagePath: string;
     expiresAt: Date;
   }> {
-    const fileId = randomUUID();
-    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `users/${userId}/profile/${fileId}_${sanitizedFileName}`;
+    // users/{uid}/profile/{uuid}_{file}
+    const storagePath = buildIssuedPath({ purpose: "profile-photo", userId }, fileName);
 
     const file = this.bucket.file(storagePath);
 
@@ -216,6 +233,48 @@ export class StorageService {
   }
 
   /**
+   * Generate a signed upload URL for a feedback screenshot (issue #257).
+   *
+   * Same two-step flow as the profile photo: the client PUTs the image to this
+   * short-lived URL, then sends the returned `storagePath` with the feedback
+   * note. Unlike a profile photo the object is NEVER made public: the team
+   * reads it through a signed download link in the feedback email, and
+   * storage.rules has no match for `users/{uid}/feedback/` (deny by default).
+   */
+  async getSignedFeedbackScreenshotUploadUrl(
+    userId: string,
+    fileName: string,
+    contentType: string
+  ): Promise<{
+    uploadUrl: string;
+    storagePath: string;
+    expiresAt: Date;
+    uploadHeaders: Record<string, string>;
+  }> {
+    // users/{uid}/feedback/{uuid}_{file}
+    const storagePath = buildIssuedPath({ purpose: "feedback-screenshot", userId }, fileName);
+
+    const file = this.bucket.file(storagePath);
+
+    // Short-lived (15 min) write URL, bound to the declared content type.
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    // The size cap is part of the signature: a PUT without this header, or with
+    // a body outside the range, is refused by Cloud Storage. The client must
+    // send the returned `uploadHeaders` with the PUT.
+    const uploadHeaders = { "x-goog-content-length-range": `0,${FEEDBACK_SCREENSHOT_MAX_BYTES}` };
+    const [uploadUrl] = await file.getSignedUrl({
+      version: "v4",
+      action: "write",
+      expires: expiresAt,
+      contentType,
+      extensionHeaders: uploadHeaders,
+    });
+
+    return { uploadUrl, storagePath, expiresAt, uploadHeaders };
+  }
+
+  /**
    * Mint a durable, publicly-fetchable download URL for an uploaded object.
    *
    * Agency logos are rendered persistently in the portal chrome (sidebar) on
@@ -230,7 +289,9 @@ export class StorageService {
    * of UBLA, never expires, and is the standard Firebase download mechanism.
    */
   async makeFilePublic(storagePath: string): Promise<string> {
-    const file = this.bucket.file(storagePath);
+    // Never publish a backend-only object or a non-key value (issue #141).
+    // Callers validate ownership first; this only backstops them.
+    const file = this.bucket.file(assertClientReachableKey(storagePath));
 
     // A random token gates access; anyone with the URL can read the object,
     // which is exactly what we want for a public logo.
@@ -246,13 +307,18 @@ export class StorageService {
   }
 
   /**
-   * Generate a signed download URL for a file
+   * Generate a signed download URL for a file.
+   *
+   * CALLERS MUST VALIDATE FIRST: pass only a path that `validateStoragePath`
+   * accepted for the record's owner (issue #141). As a backstop this method
+   * throws `StoredPathInvalidError` for anything that is not a plain
+   * bucket-relative key, and for every backend-only prefix, whoever asks.
    */
   async getSignedDownloadUrl(
     storagePath: string,
     expirationMinutes = 60
   ): Promise<string> {
-    const file = this.bucket.file(storagePath);
+    const file = this.bucket.file(assertClientReachableKey(storagePath));
 
     const [downloadUrl] = await file.getSignedUrl({
       version: "v4",
@@ -264,10 +330,14 @@ export class StorageService {
   }
 
   /**
-   * Delete a file from storage
+   * Delete a file from storage.
+   *
+   * Same contract as `getSignedDownloadUrl`: callers validate ownership of the
+   * path first; this method additionally refuses backend-only prefixes and
+   * non-key values, so a bad record can never delete a backend object.
    */
   async deleteFile(storagePath: string): Promise<void> {
-    const file = this.bucket.file(storagePath);
+    const file = this.bucket.file(assertClientReachableKey(storagePath));
     await file.delete({ ignoreNotFound: true });
   }
 
@@ -281,7 +351,18 @@ export class StorageService {
   }
 
   /**
-   * Get file metadata
+   * The stored object's metadata, or null when there is no such object.
+   *
+   * `size` is the object's REAL byte length as Cloud Storage recorded it when
+   * the upload finished. Document registration (issue #310) reads the size from
+   * here and never from the request body, because a signed upload URL carries
+   * no size range and a client can declare any number it likes.
+   *
+   * One request: a missing object is a 404 from `getMetadata`, which is turned
+   * into null here (no separate `exists()` round trip). Any other failure is
+   * rethrown for the caller to report as a server error. `size` is NaN-safe:
+   * a value that is not a whole number of bytes comes back as null too, so a
+   * caller can never store or compare a non-number.
    */
   async getFileMetadata(storagePath: string): Promise<{
     size: number;
@@ -289,19 +370,44 @@ export class StorageService {
     created: Date;
   } | null> {
     const file = this.bucket.file(storagePath);
-    const [exists] = await file.exists();
 
-    if (!exists) {
-      return null;
+    let metadata: { size?: string | number; contentType?: string; timeCreated?: string };
+    try {
+      [metadata] = await file.getMetadata();
+    } catch (error) {
+      // 404 = "No such object": the client registered a path it never uploaded.
+      if ((error as { code?: number }).code === 404) return null;
+      throw error;
     }
 
-    const [metadata] = await file.getMetadata();
+    // The JSON API reports `size` as a decimal string.
+    const size = Number(metadata.size);
+    if (!Number.isInteger(size) || size < 0) return null;
 
     return {
-      size: parseInt(metadata.size as string, 10),
-      contentType: metadata.contentType as string,
+      size,
+      contentType: typeof metadata.contentType === "string" ? metadata.contentType : "",
       created: new Date(metadata.timeCreated as string),
     };
+  }
+
+  /**
+   * The first `length` bytes of a stored object (fewer when the object is
+   * shorter). A ranged read: the rest of the object is not downloaded.
+   *
+   * Used by document registration (issue #310) to decide the file's size limit
+   * from what the file really is, not from the content type the client
+   * declared. Callers pass a path they have already validated and found to
+   * exist; an empty object has no bytes to range over, so it is answered
+   * without a request.
+   */
+  async readFileHead(storagePath: string, length: number, knownSize?: number): Promise<Buffer> {
+    if (length <= 0 || knownSize === 0) return Buffer.alloc(0);
+    const file = this.bucket.file(storagePath);
+    // `end` is inclusive.
+    const [bytes] = await file.download({ start: 0, end: length - 1 });
+    // Belt and braces: never hand back more than was asked for.
+    return bytes.subarray(0, length);
   }
 }
 

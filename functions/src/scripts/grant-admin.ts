@@ -13,7 +13,14 @@
  *   npm run admin:grant -- --project durin-seli-dev someone@example.com
  *   npm run admin:grant -- --project japa-platform someone@example.com --confirm-prod
  *   npm run admin:revoke -- --project durin-seli-dev someone@example.com
- *   node lib/scripts/grant-admin.js <uid|email> --project <id> [--revoke] [--confirm-prod]
+ *   node lib/scripts/grant-admin.js <uid|email> --project <id> [--revoke] [--revoke-tokens] [--confirm-prod]
+ *
+ * `--revoke-tokens` (opt-in, only with --revoke): also revoke the user's refresh
+ * tokens, which signs them out everywhere at once. Without it, an ID token that
+ * was issued while they were an admin keeps its admin claim until it expires
+ * (up to an hour). Use it whenever admin is being removed because it should
+ * never have been held:
+ *   npm run admin:revoke -- --project <id> someone@example.com --revoke-tokens
  *
  * The target may be given as a Firebase Auth UID or an email (resolved via
  * getUserByEmail). Project selection + the production guard mirror seed-all.ts
@@ -30,31 +37,42 @@ const PROD_PROJECT_IDS = ["japa-platform"];
 
 /**
  * Minimal CLI parsing: the first non-flag argument is the target (uid|email).
- * Flags: --project <id> | --project=<id> | -p <id>, --revoke, --confirm-prod|--yes.
+ * Flags: --project <id> | --project=<id> | -p <id>, --revoke, --revoke-tokens,
+ * --confirm-prod|--yes.
  */
 function parseArgs(argv: string[]): {
   target?: string;
   project?: string;
   revoke: boolean;
+  revokeTokens: boolean;
   confirmProd: boolean;
 } {
   let target: string | undefined;
   let project: string | undefined;
   let revoke = false;
+  let revokeTokens = false;
   let confirmProd = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--project" || a === "-p") project = argv[++i];
     else if (a.startsWith("--project=")) project = a.slice("--project=".length);
     else if (a === "--revoke") revoke = true;
+    else if (a === "--revoke-tokens") revokeTokens = true;
     else if (a === "--confirm-prod" || a === "--yes") confirmProd = true;
     else if (!a.startsWith("-") && !target) target = a; // first positional = target
   }
-  return { target, project, revoke, confirmProd };
+  return { target, project, revoke, revokeTokens, confirmProd };
 }
 
 const args = parseArgs(process.argv.slice(2));
 const onEmulator = Boolean(process.env.FIRESTORE_EMULATOR_HOST);
+
+// --revoke-tokens signs the user out; it only makes sense when removing admin.
+// Refuse it on a grant rather than silently ignore it.
+if (args.revokeTokens && !args.revoke) {
+  console.error("\n❌ --revoke-tokens can only be used together with --revoke.\n");
+  process.exit(1);
+}
 
 if (!args.target) {
   console.error(
@@ -141,6 +159,18 @@ async function main() {
     console.log(
       `✅ Admin revoked from ${user.email || user.uid}. New role: "${resolved.role}".`
     );
+    if (args.revokeTokens) {
+      // Opt-in: kill every session now. verifyAuth checks revocation on each
+      // request, so an already-issued ID token (still carrying the admin
+      // claim) stops working immediately instead of at its expiry.
+      await auth.revokeRefreshTokens(user.uid);
+      console.log("   Refresh tokens revoked: the user is signed out everywhere and must sign in again.");
+    } else {
+      console.log(
+        "   Note: ID tokens already issued keep the admin claim until they expire (up to 1 hour).\n" +
+        "   Re-run with --revoke-tokens to sign the user out everywhere now."
+      );
+    }
   } else {
     // Promote: write the admin role claim (setRoleClaims keeps legacy `admin` in sync).
     await claimsService.setRoleClaims(user.uid, ROLES.ADMIN);
