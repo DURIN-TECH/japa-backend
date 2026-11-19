@@ -1817,15 +1817,27 @@ export function declaredCurrencyOf(intakeSummary: string): string | null {
 }
 
 /**
+ * (#408, fix round 1) The signs that name exactly ONE currency, by ISO code.
+ * `$` (USD, CAD, AUD, NZD, SGD...) and `¥` (JPY and CNY) are left out on
+ * purpose: a document unit of "$" says nothing about WHICH dollar, so it must
+ * not be labelled USD for the figure check (that would keep a "$1,500" or
+ * "1,500 USD" string by guessing the currency). Such a unit is written as it
+ * is ("1500 $"), which `figuresIn` reads as a bare number: fail closed.
+ */
+const SINGLE_CURRENCY_SIGNS: Record<string, string> = { "£": "GBP", "€": "EUR", "₦": "NGN", "₹": "INR", "₵": "GHS" };
+
+/**
  * (#408) The ISO code a unit names, when it names a currency: an ISO code in
  * `CURRENCY_CODES` compared case-insensitively ("GBP", "gbp", "Gbp"), or a
- * sign in `CURRENCY_SIGNS` ("£" is GBP). Null for anything else (a duration,
- * a count, an unknown word): such a unit is never read as money.
+ * sign that names one currency (`SINGLE_CURRENCY_SIGNS`: "£" is GBP). Null for
+ * anything else (a duration, a count, an unknown word, a shared sign such as
+ * "$" or "¥"): such a unit is never read as a specific currency.
  */
 export function currencyOfUnit(unit: string | null | undefined): string | null {
   const u = unit?.trim();
   if (!u) return null;
-  if (CURRENCY_SIGNS[u]) return CURRENCY_SIGNS[u];
+  // (#408, fix round 1) Only single-currency signs map to a code; "$" and "¥" return null.
+  if (SINGLE_CURRENCY_SIGNS[u]) return SINGLE_CURRENCY_SIGNS[u];
   const code = u.toUpperCase();
   return CURRENCY_CODES.includes(code) ? code : null;
 }
@@ -2069,12 +2081,74 @@ const NO_UNIT_AFTER_SRC = `(?!\\s*${UNIT_WORD_SRC})`;
  * statement", "the rule of 28 days") does not count. Nor does a ref followed
  * by a unit word ("section 2.3 times"). The `(?![\d.])` stops the number from
  * backtracking to a shorter ref ("9.8.1 years" must not count as "9.8").
+ *
+ * (#408, fix round 1) A letter prefix in ANY case counts when a DOTTED number
+ * follows it ("rule v 4.2", "paragraph fm 2.1"): a dotted number after a
+ * letter group is never everyday wording, and "rules in 2025" still does not
+ * count because 2025 is not dotted. An undotted number still needs a
+ * capitalised prefix ("Appendix FM 2").
+ *
+ * `GENERIC_REF_SRC` is ONE ref (no keyword); it is used both after the keyword
+ * and for every further item of a list (see `GENERIC_RULE_LIST_RE`).
  */
-const GENERIC_RULE_REF_RE = new RegExp(
+const GENERIC_REF_SRC =
+  "(?:[A-Z]{1,4}[-\\s]?\\d+(?:\\.\\d+)*|[A-Za-z]{1,4}[-\\s]?\\d+(?:\\.\\d+)+|\\d+(?:\\.\\d+)+)" +
+  `(?:\\([a-z0-9]+\\))?(?![\\d.]?\\d)${NO_UNIT_AFTER_SRC}`;
+
+/**
+ * (#408, fix round 1) What joins the items of a list of refs: a comma
+ * (optionally followed by "and" / "or"), a bare "and" / "or", or "&".
+ * Each option needs a fixed character or word, so the list repetition below
+ * cannot backtrack badly.
+ */
+const LIST_SEP_SRC = `(?:\\s*,\\s*(?:(?:${anyCase("and|or")})\\s+)?|\\s+(?:${anyCase("and|or")})\\s+|\\s*&\\s*)`;
+
+/**
+ * A generic keyword followed by one ref or a LIST of refs. (#408, fix round 1)
+ * The whole list is matched so EVERY ref in it is counted ("Paragraphs 9.8.1,
+ * 9.8.2, 9.8.3 apply." is 3 citations, not 1); group 1 is the list part.
+ */
+const GENERIC_RULE_LIST_RE = new RegExp(
   `\\b(?:${anyCase(["rules?", "paragraphs?", "paras?", "sections?", "appendix", "annex", "clauses?"].join("|"))})` +
-    `\\s+(?:[A-Z]{1,4}[-\\s]?\\d+(?:\\.\\d+)*|\\d+(?:\\.\\d+)+)(?:\\([a-z0-9]+\\))?(?![\\d.]?\\d)${NO_UNIT_AFTER_SRC}`,
+    `\\s+(${GENERIC_REF_SRC}(?:${LIST_SEP_SRC}${GENERIC_REF_SRC})*)`,
   "g"
 );
+
+/**
+ * (#408, fix round 1) One ref inside a matched list, for counting the items.
+ * The look-behind keeps it from starting in the middle of a word or number.
+ */
+const GENERIC_REF_ITEM_RE = new RegExp(`(?<![A-Za-z0-9.])${GENERIC_REF_SRC}`, "g");
+
+/**
+ * (#408, fix round 1) How many generic rule refs a text carries: for every
+ * keyword-led match, one per ref in its list.
+ */
+function genericRuleRefCount(text: string): number {
+  let count = 0;
+  for (const m of text.matchAll(GENERIC_RULE_LIST_RE)) {
+    // Every list item counts; a match always holds at least one (the first ref).
+    count += Math.max(1, m[1].match(GENERIC_REF_ITEM_RE)?.length ?? 0);
+  }
+  return count;
+}
+
+/**
+ * (#408, fix round 1) A rubric ref as a regex source: whitespace-flexible
+ * between words, and the space between a letter group and a number may be
+ * left out ("V 4.2" also matches "V4.2"), so writing the ref without its
+ * internal space is not a way past the cap.
+ */
+function rubricRefSrc(ref: string): string {
+  const tokens = ref.split(/\s+/);
+  let src = escapeRegExp(tokens[0]);
+  for (let i = 1; i < tokens.length; i++) {
+    // Letter group then number ("V" + "4.2"): the space is optional. Otherwise one or more spaces.
+    const optional = /[A-Za-z]$/.test(tokens[i - 1]) && /^\d/.test(tokens[i]);
+    src += (optional ? "\\s*" : "\\s+") + escapeRegExp(tokens[i]);
+  }
+  return src;
+}
 
 /** A rubric ref shorter than this (after removing spaces) is too vague to look for ("1", "A"). */
 const MIN_RULE_REF_CHARS = 3;
@@ -2092,25 +2166,56 @@ function escapeRegExp(text: string): string {
  *  - plus every generic rule reference ("paragraph 9.8") left once the
  *    rubric's own refs are taken out (so "Rule V 4.2" is not counted twice).
  *
- * (#408) Everyday wording no longer counts: rubric refs are matched in the
- * rubric's own letter case, a numeric-only rubric ref followed by a unit word
- * is a quantity, and a generic ref needs a capitalised letter prefix or a
- * dotted number (see `GENERIC_RULE_REF_RE`).
+ * (#408) Everyday wording no longer counts: a letters-only rubric ref is
+ * matched in the rubric's own letter case, a numeric-only rubric ref followed
+ * by a unit word is a quantity, and a generic ref needs a capitalised letter
+ * prefix or a dotted number (see `GENERIC_RULE_LIST_RE`).
+ *
+ * (#408, fix round 1) Closing the ways to list the rulebook past the cap:
+ *  - a rubric ref that holds a DIGIT is matched in any case ("v 4.2" counts
+ *    for "V 4.2"; it is never everyday wording). Only letters-only refs
+ *    ("Annex Q") stay case-sensitive;
+ *  - a rubric ref written without its internal space ("V4.2") counts like the
+ *    spaced form (`rubricRefSrc`);
+ *  - the unit-word exemption for numeric-only rubric refs applies only when
+ *    at most ONE of the rubric's numeric-only refs appears in the string. The
+ *    rule: count the distinct numeric-only rubric refs present (unit word or
+ *    not); with two or more, every one is a citation. So "2.3 times" alone is
+ *    a quantity (0), but "9.8.1 years, 9.8.2 days and 9.8.3 months" is a list
+ *    of rules (3). Several rule numbers in one string are a listing however
+ *    they are dressed up; at worst a real quantity is dropped (fail closed);
+ *  - a generic keyword followed by a list counts every ref in the list.
  */
 export function ruleCitationsIn(text: string, rules: readonly NarrativeRuleRef[] = []): number {
   const cited = new Set<number>();
   let rest = text;
+
+  // A usable ref: not blank, and long enough to look for.
+  const usable = (ref: string | undefined | null): ref is string => !!ref && ref.replace(/\s+/g, "").length >= MIN_RULE_REF_CHARS;
+  // A ref that is only a number ("2.3", "9.8.1").
+  const isNumericOnly = (ref: string): boolean => /^\d+(?:\.\d+)*$/.test(ref);
+  // The ref as a whole token, not inside a longer id ("V 4.21"). Any case when
+  // it holds a digit; the rubric's own case when it is letters only.
+  const refBody = (ref: string): string => `(?<![A-Za-z0-9])${rubricRefSrc(ref)}(?![A-Za-z0-9])`;
+  const refFlags = (ref: string): string => (/\d/.test(ref) ? "gi" : "g");
+
+  // (#408, fix round 1) How many distinct numeric-only rubric refs appear at
+  // all, unit word or not. Two or more: the unit-word exemption is off.
+  const numericPresent = rules.filter((r) => {
+    const ref = r.ref?.trim();
+    return usable(ref) && isNumericOnly(ref) && new RegExp(refBody(ref), "g").test(text);
+  }).length;
+  const unitExemption = numericPresent <= 1;
+
   rules.forEach((r, i) => {
     const ref = r.ref?.trim();
-    if (!ref || ref.replace(/\s+/g, "").length < MIN_RULE_REF_CHARS) return;
-    // The ref as a whole token: whitespace-flexible, not inside a longer id ("V 4.21").
-    // (#408) Case-SENSITIVE, written as the rubric writes it: "Annex Q" is
-    // the rubric's ref, "annex q" in a sentence is not.
-    // (#408) A ref that is only a number ("2.3") is not a citation when a
-    // unit word follows it: "2.3 times the amount", "2.3 years", "2.3%" are
-    // quantities. "Under 2.3 you need a sponsor" still counts.
-    const numericOnly = /^\d+(?:\.\d+)*$/.test(ref);
-    const re = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(ref).replace(/\s+/g, "\\s+")}(?![A-Za-z0-9])${numericOnly ? NO_UNIT_AFTER_SRC : ""}`, "g");
+    if (!usable(ref)) return;
+    // (#408) A numeric-only ref followed by a unit word is a quantity ("2.3
+    // times the amount", "2.3 years", "2.3%"), unless the string names two or
+    // more numeric rubric refs (see above). "Under 2.3 you need a sponsor"
+    // still counts.
+    const skipUnits = isNumericOnly(ref) && unitExemption;
+    const re = new RegExp(`${refBody(ref)}${skipUnits ? NO_UNIT_AFTER_SRC : ""}`, refFlags(ref));
     if (re.test(rest)) {
       cited.add(i);
       rest = rest.replace(re, " ");
@@ -2122,7 +2227,8 @@ export function ruleCitationsIn(text: string, rules: readonly NarrativeRuleRef[]
     const i = normalisedQuotes.findIndex((rq) => rq !== null && rq.includes(q));
     if (i >= 0) cited.add(i);
   }
-  const generic = rest.match(GENERIC_RULE_REF_RE)?.length ?? 0;
+  // Generic refs left once the rubric's own refs are taken out; a list counts every item.
+  const generic = genericRuleRefCount(rest);
   return cited.size + generic;
 }
 

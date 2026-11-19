@@ -139,9 +139,11 @@ describe("#408 rule citations: real citations still count", () => {
     assert.equal(ruleCitationsIn("Appendix V asks for this.", [{ ref: "Appendix V", quote: null }]), 1);
   });
 
-  test("the letter prefix is case-sensitive: 'v 4.2' and 'appendix v' are not the rubric's refs", () => {
-    assert.equal(ruleCitationsIn("see v 4.2", [UNRELATED_RULE]), 0);
+  // (#408, fix round 1) A ref holding a digit is matched in any case ("v 4.2"
+  // is never everyday wording); only a letters-only ref stays case-sensitive.
+  test("a letters-only ref is case-sensitive ('appendix v' is not 'Appendix V'); a ref with a digit is not", () => {
     assert.equal(ruleCitationsIn("the appendix v copy", [{ ref: "Appendix V", quote: null }]), 0);
+    assert.equal(ruleCitationsIn("see v 4.2", [UNRELATED_RULE]), 1);
   });
 
   test("'V 4.21' does not count for rubric ref 'V 4.2' (unchanged)", () => {
@@ -190,6 +192,80 @@ describe("#408 rule citations: real citations still count", () => {
     const p = parseNarrative(answer(["You say you are visiting your brother."], `${NARRATIVE_CONCLUSION_LEADS.weak} you meet V 4.2 and V 4.3.`), "weak", narrativeGroundingOf(input()));
     assert.equal(p.narrative, null);
     assert.equal(p.reason, "the conclusion was dropped");
+  });
+});
+
+// ============================================
+// Rule citations: no way to list the rulebook past the cap (fix round 1)
+// ============================================
+
+describe("#408 fix round 1: listing the rulebook is still caught", () => {
+  /** Letter-prefixed rubric refs other than the #384 probe's. */
+  const FM_RULES: NarrativeRuleRef[] = [
+    { ref: "FM 2.1", quote: null },
+    { ref: "FM 2.2", quote: null },
+    { ref: "FM 2.3", quote: null },
+  ];
+  /** Numeric-only rubric refs. */
+  const NUMERIC_RULES: NarrativeRuleRef[] = [
+    { ref: "9.8.1", quote: null },
+    { ref: "9.8.2", quote: null },
+    { ref: "9.8.3", quote: null },
+  ];
+
+  /**
+   * A listing string is dropped by `parseNarrative`, and the plain paragraph
+   * and the conclusion are kept. The rubric refs are in the grounding's
+   * rubric text, so only the citation cap can drop the listing.
+   */
+  function assertListingDropped(listing: string, rules: NarrativeRuleRef[]): void {
+    const base = narrativeGroundingOf(input());
+    const grounding: NarrativeGrounding = { ...base, rules, figureSources: [...base.figureSources, rules.map((r) => r.ref).join(" ")] };
+    const kept = "You say you are visiting your brother.";
+    const p = parseNarrative(answer([listing, kept]), "weak", grounding);
+    assert.ok(p.narrative);
+    assert.deepEqual(p.narrative.paragraphs, [kept]);
+    assert.equal(p.dropped, 1);
+  }
+
+  test("lowercase rubric refs count: 'v 4.2, v 4.3 and v 4.4' is 3 and dropped", () => {
+    const listing = "You meet v 4.2, v 4.3 and v 4.4.";
+    assert.equal(ruleCitationsIn(listing, PROBE_RULES), 3);
+    assert.equal(ruleCitationsIn("Rules v 4.2, v 4.3 and v 4.4 are met.", PROBE_RULES), 3);
+    assertListingDropped(listing, PROBE_RULES);
+  });
+
+  test("lowercase 'fm 2.1, fm 2.2 and fm 2.3' is 3 and dropped", () => {
+    const listing = "Under fm 2.1, fm 2.2 and fm 2.3 you qualify.";
+    assert.equal(ruleCitationsIn(listing, FM_RULES), 3);
+    assertListingDropped(listing, FM_RULES);
+  });
+
+  test("a rubric ref without its internal space counts like the spaced form", () => {
+    assert.equal(ruleCitationsIn("V4.2, V4.3 and V4.4 are met.", PROBE_RULES), 3);
+    assert.equal(ruleCitationsIn("Rule v4.2 is met.", PROBE_RULES), 1);
+    assertListingDropped("V4.2, V4.3 and V4.4 are met.", PROBE_RULES);
+  });
+
+  test("unit words do not hide a list of numeric rubric refs", () => {
+    assert.equal(ruleCitationsIn("You meet 9.8.1 x, 9.8.2 x and 9.8.3 x.", NUMERIC_RULES), 3);
+    assert.equal(ruleCitationsIn("You meet 9.8.1 years, 9.8.2 days and 9.8.3 months.", NUMERIC_RULES), 3);
+    assertListingDropped("You meet 9.8.1 years, 9.8.2 days and 9.8.3 months.", NUMERIC_RULES);
+  });
+
+  test("one numeric rubric ref before a unit word is still a quantity", () => {
+    assert.equal(ruleCitationsIn("Your savings are 2.3 times the amount needed.", [{ ref: "2.3", quote: null }, ...NUMERIC_RULES]), 0);
+    assert.equal(ruleCitationsIn("You have lived there 9.8.1 years.", NUMERIC_RULES), 0);
+  });
+
+  test("a generic keyword followed by a list counts every ref in it", () => {
+    assert.equal(ruleCitationsIn("Paragraphs 9.8.1, 9.8.2, 9.8.3 apply.", []), 3);
+    assert.equal(ruleCitationsIn("Paragraph 9.8.1, 9.8.2 and 9.8.3 apply.", []), 3);
+    assert.equal(ruleCitationsIn("Paragraphs v 4.2, v 4.3, v 4.4 apply.", []), 3);
+    assert.equal(ruleCitationsIn("Rules 4.2 or 4.3 & 4.4 apply.", []), 3);
+    // A lowercase prefix needs a dotted number; an undotted one is still everyday wording.
+    assert.equal(ruleCitationsIn("Under rule v 4.2 you need funds.", []), 1);
+    assert.equal(ruleCitationsIn("The rules in 2025 changed how this works.", []), 0);
   });
 });
 
@@ -249,6 +325,22 @@ describe("#408 figures: correct money is no longer dropped", () => {
 // ============================================
 
 describe("#408 figures: wrong currency and invented figures are still dropped", () => {
+  // (#408, fix round 1) "$" is the sign of many dollars (USD, CAD, AUD...) and
+  // "¥" of two currencies: a document unit written that way is NOT labelled
+  // with a guessed ISO code, so a "$" or "USD" figure is not kept on it.
+  test("a shared sign as the unit ($, ¥) is not turned into a currency: '$1,500' and '1,500 USD' are dropped", () => {
+    assert.equal(currencyOfUnit("$"), null);
+    assert.equal(currencyOfUnit("¥"), null);
+    // Single-currency signs still map.
+    for (const [sign, code] of [["£", "GBP"], ["€", "EUR"], ["₦", "NGN"], ["₹", "INR"], ["₵", "GHS"]]) assert.equal(currencyOfUnit(sign), code);
+    const sources = sourcesFor(NAIRA_INTAKE, facts([{ field: "closingBalance", value: 1500, unit: "$", page: 1 }]));
+    assert.equal(figuresAreGrounded("You hold $1,500.", sources), false);
+    assert.equal(figuresAreGrounded("You hold 1,500 USD.", sources), false);
+    assert.equal(figuresAreGrounded("You hold 1,500 CAD.", sources), false);
+    // The bare figure is still grounded (it matches the value, no currency claimed).
+    assert.equal(figuresAreGrounded("You hold 1,500.", sources), true);
+  });
+
   test("#384 probe: '£399,367' against a naira intake is dropped", () => {
     const sources = narrativeGroundingOf(input({ intakeSummary: JSON.stringify({ monthlyIncome: { amount: 399367, currency: "NGN" } }) })).figureSources;
     assert.equal(figuresAreGrounded("You earn £399,367 a month.", sources), false);
