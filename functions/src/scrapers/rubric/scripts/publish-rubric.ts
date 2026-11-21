@@ -21,7 +21,7 @@
  *  - (#440) `--reuse-check-from <n>` lets the independent check reuse the answers
  *    it gave on version n for the rules (and the intention-to-stay reading) that
  *    did not change, so only changed rules are sent to the model. The check
- *    allows it for ONE rulebook and ONE pair of versions (rubric-check-reuse-pair.ts)
+ *    allows it for ONE rulebook and ONE pair of versions (services/rubric-check-reuse-pair.ts)
  *    and holds anything else before any spend. It skips no gate and no check:
  *    a reused answer is judged exactly like a fresh one. The check's run record
  *    says, per rule, what was reused and what was asked.

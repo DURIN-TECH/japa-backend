@@ -46,7 +46,7 @@ import { RubricExtractionService, RunStop, isTransientProviderError, possibleDup
 import { RUBRIC_REPAIR_PROMPT_VERSION, RUBRIC_SYSTEM_PROMPT } from "./rubric-prompt";
 import { REDRAFT_DUPLICATE_REASON, REPAIR_WINDOW_CHARS, ruleHashOf } from "./rubric-repair";
 // (#440) The one rulebook and version pair whose check answers may be reused (see that module).
-import { CHECK_REUSE_PAIR } from "./rubric-check-reuse-pair";
+import { CHECK_REUSE_PAIR } from "../../services/rubric-check-reuse-pair";
 
 // ============================================
 // INDEPENDENT RULE CHECK — VERDICTS TO ACTIONS, AND THE RUN (issue #202, part of #200)
@@ -540,7 +540,7 @@ export interface StoredRedraft {
 // through exactly the same table, repair and gates as a fresh one: reuse decides nothing new.
 //
 // ONE PAIR ONLY (owner decision, #440): the rulebook and the from/to versions in `CHECK_REUSE_PAIR`
-// (rubric-check-reuse-pair.ts, kept apart so this module stays generic). Not a setting, no override.
+// (services/rubric-check-reuse-pair.ts, kept out of this generic module). Not a setting, no override.
 export { CHECK_REUSE_PAIR };
 
 /**

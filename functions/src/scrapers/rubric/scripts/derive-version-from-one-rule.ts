@@ -1,5 +1,6 @@
 /**
- * Build version 2 of the shared Schengen short-stay rulebook from its approved version 1 plus the
+ * Build version 2 of the one shared rulebook named in `CHECK_REUSE_PAIR` (services/rubric-check-reuse-pair.ts;
+ * owner decision on #440) from its approved version 1 plus the
  * one-rule result of `redraft-competence-rule` (#335), and (with `--write`) store it as a PENDING draft,
  * without a whole-rulebook extraction (issue #440). It never calls a model, in any mode.
  *
@@ -21,7 +22,7 @@
  * REFUSALS (a code word; nothing is written): see `DeriveRefusal`. Among them: a snapshot whose sha256 is not
  * its `contentHash`, or not the hash its rules cite; a `--out` file that is not a kept result; a rule id that
  * version 1 does not have; a block that fails `competenceProblems` on the built version; any rulebook other
- * than the one in `CHECK_REUSE_PAIR` (rubric-check-reuse-pair.ts); a head that moved (version 1 is no longer
+ * than the one in `CHECK_REUSE_PAIR`; a head that moved (version 1 is no longer
  * both the approved and the latest version); the production project; no project named.
  *
  * STORING (`--write`): through `RubricStore.writeDerivedPendingVersion`, the narrow write next to
@@ -63,7 +64,7 @@ import { lexiconFor } from "../../language/language-lexicon";
 import { SnapshotQuoteIndex } from "../rubric-quote";
 import { readLeadInList, verifyListItems } from "../rubric-list-items";
 import { competenceProblems } from "../rubric-competence";
-import { CHECK_REUSE_PAIR } from "../rubric-check-reuse-pair";
+import { CHECK_REUSE_PAIR } from "../../../services/rubric-check-reuse-pair";
 import { ruleHashOf } from "../rubric-repair";
 import { fromFirestoreRest, placeQuestions } from "./redraft-competence-rule";
 
@@ -517,7 +518,7 @@ async function main(): Promise<void> {
   const outPath = arg("out");
   const pagePath = arg("page");
   if (!versionPath || !outPath || !pagePath || (offline && (!arg("head") || !arg("checker")))) {
-    console.error("usage: --project <id> --version <v1.json> --out <result.json> --page <snapshot.json> [--offline --head <head.json> --checker <checker-v1.json>] [--write]");
+    console.error("usage: --project <id> --version <v1.json> --out <result.json> --page <page.json> [--offline --head <head.json> --checker <check-record.json>] [--write]");
     process.exit(2);
   }
   // Set BEFORE Firebase Admin loads, so it can never initialise against an unintended default. Offline, a

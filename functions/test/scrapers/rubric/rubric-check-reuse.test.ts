@@ -19,7 +19,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { RubricCheckerService, type RubricCheckerRun, type RubricCheckInputShape } from "../../../src/scrapers/rubric/rubric-checker";
-import { CHECK_REUSE_PAIR } from "../../../src/scrapers/rubric/rubric-check-reuse-pair";
+import { CHECK_REUSE_PAIR } from "../../../src/services/rubric-check-reuse-pair";
 import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
 import type { AssessmentCriterion, IntakeQuestion, VisaRubric } from "../../../src/types/rubric";
 import { MemoryLedger, ScriptedProvider, SRC_HASH, SRC_ID, barOf, isRepairRequest, isTriggerRequest, pageOf, ruleOf, seenRules, settingsWith, type RowPolicy } from "./checker-fakes";

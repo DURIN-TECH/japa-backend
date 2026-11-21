@@ -10,9 +10,10 @@
 // short-stay rulebook, from version 1 to version 2, built from version 1 plus
 // the one-rule result of `redraft-competence-rule` (#335).
 //
-// Why a module of its own: the checker is generic and names no country, route
-// or publisher (a containment test greps it). This constant is the only place
-// the permitted pair is written. It is NOT a setting, has no override and no
+// Why a module of its own, outside `scrapers/rubric/`: that module is generic and
+// names no country, route or publisher (containment tests grep every file of it).
+// This constant is the only place the permitted pair is written; the checker and
+// the version 2 builder import it from here. It is NOT a setting, has no override and no
 // admin edit: changing it is a reviewed code change.
 
 /** The only rulebook, and the only from/to versions, a check may reuse answers between. */

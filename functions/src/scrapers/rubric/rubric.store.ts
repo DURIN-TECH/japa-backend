@@ -439,7 +439,7 @@ export class RubricStore {
    *  - the draft passes the same governance guard as an extracted one
    *    (`pending_review`, every review field at its initial value, no
    *    exclusions) AND carries no other approval field (`questionPlan`,
-   *    `ruleRepairs`, `layerCheck`, `layerConflicts`): a derived version is
+   *    recorded replacements, the layer check): a derived version is
    *    decided again from scratch by the publish pipeline;
    *  - inside ONE transaction: the head exists, its `approvedVersion` AND its
    *    `latestVersion` are both `baseVersion` (nothing newer was drafted, the

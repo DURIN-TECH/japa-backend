@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { CHECK_REUSE_PAIR } from "../../../src/scrapers/rubric/rubric-check-reuse-pair";
+import { CHECK_REUSE_PAIR } from "../../../src/services/rubric-check-reuse-pair";
 import type { AssessmentCriterion, IntakeQuestion, RubricHead, VisaRubric } from "../../../src/types/rubric";
 import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
 import { oneRuleOutFile } from "./one-rule-out-fixture";
