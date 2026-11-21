@@ -222,12 +222,22 @@ export function deriveVersion(v1: VisaRubric, out: any, snapshot: GuidanceSnapsh
   if (!foundNew.ok) return refuse("out_rule_not_in_snapshot");
   if (newRule.source.listItems !== undefined && !verifyListItems(index, foundNew, newRule.source.listItems).ok) return refuse("out_rule_not_in_snapshot");
 
-  // ---- the questions: the `--out` file's were placed on THIS version 1 by the one-rule script ----
-  // Placing them again must change nothing: no question is the same as one of version 1 (it would have been
-  // reused there, not added), and no id clashes (it would have been renamed there). Anything else means the
-  // file was made against another version: refused rather than guessed.
+  // ---- the questions: placed on version 1 by the same code the one-rule script uses ----
+  // `placeQuestions` never changes a question of version 1. A new question that IS one version 1 already asks
+  // (same wording, answer type and option source) is reused, not copied: the block and the re-drafted rule
+  // then point at version 1's question. A new question whose id is taken by a DIFFERENT question of version 1
+  // would have been renamed by the one-rule script when it was run on this version 1; one here means the file
+  // was made against another version, and the rule's own links could not be told apart: refused, not guessed.
   const placed = placeQuestions(v1.intakeQuestions ?? [], outQuestions, outBlock);
-  if (Object.keys(placed.reused).length > 0 || Object.keys(placed.renamed).length > 0) return refuse("out_questions_not_placed");
+  if (Object.keys(placed.renamed).length > 0) return refuse("out_questions_not_placed");
+  const reusedId = (id: string): string => placed.reused[id] ?? id;
+  const linkedRule: AssessmentCriterion = Object.keys(placed.reused).length === 0
+    ? newRule
+    : {
+      ...newRule,
+      ...(newRule.intakeQuestionIds ? { intakeQuestionIds: [...new Set(newRule.intakeQuestionIds.map(reusedId))] } : {}),
+      ...(newRule.trigger ? { trigger: { ...newRule.trigger, questionId: reusedId(newRule.trigger.questionId) } } : {}),
+    };
 
   // ---- the other rules: re-read the lists that no longer match the snapshot ----
   const changes: DerivedChange[] = [];
@@ -259,7 +269,7 @@ export function deriveVersion(v1: VisaRubric, out: any, snapshot: GuidanceSnapsh
   const criteria = v1.criteria.map((c) => {
     if (c.criterionId === ruleId) {
       changes.push({ criterionId: c.criterionId, why: "redrafted" });
-      return newRule;
+      return linkedRule;
     }
     const r = reread.get(c.criterionId);
     if (r) {
