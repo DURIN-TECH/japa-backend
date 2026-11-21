@@ -1436,7 +1436,7 @@ export class ConsultationController {
         return;
       }
       const body = (req.body ?? {}) as { refundId?: unknown; carriedBy?: unknown };
-      if (typeof body.refundId !== "string" || !/^refund_[0-9a-f]{64}$/.test(body.refundId)) {
+      if (typeof body.refundId !== "string" || !/^refund(topup)?_[0-9a-f]{64}$/.test(body.refundId)) {
         sendError(res, "VALIDATION_ERROR", "refundId must be a refund id");
         return;
       }
@@ -1629,7 +1629,7 @@ export class ConsultationController {
       // only retries one, by its row id (from the admin refund list). No
       // reason is asked for: the reason is fixed (`payment_not_applied`).
       if (body.refundId !== undefined) {
-        if (typeof body.refundId !== "string" || !/^refund_[0-9a-f]{64}$/.test(body.refundId)) {
+        if (typeof body.refundId !== "string" || !/^refund(topup)?_[0-9a-f]{64}$/.test(body.refundId)) {
           sendError(res, "VALIDATION_ERROR", "refundId must be a refund id");
           return;
         }

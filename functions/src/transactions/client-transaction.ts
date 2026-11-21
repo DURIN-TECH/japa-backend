@@ -34,6 +34,14 @@ import { transactionCurrency } from "../money/totals";
 import { PRICE_CURRENCY } from "../money/usd-price";
 
 /**
+ * Review round 1 of #413: the description of a refund an admin CLOSED with
+ * nothing to refund (#413 B). The close writes it on the row; the client
+ * view below also shows it for any closed refund row (one closed before
+ * the close wrote it still said "held").
+ */
+export const CLOSED_REFUND_DESCRIPTION = "Refund: consultation fee (nothing to refund)";
+
+/**
  * The exact key set of a client transaction response. Exported so tests
  * assert against the same list. Keys marked optional on `ClientTransaction`
  * appear only when the stored row has them.
@@ -188,7 +196,9 @@ export function toClientTransaction(txn: Transaction): ClientTransaction {
     id: txn.id,
     type: txn.type,
     status: txn.status,
-    description: txn.description,
+    // Review round 1 of #413: a refund closed with nothing to refund never
+    // reads "held" to the client (rows closed before the close rewrote it).
+    description: txn.type === "refund" && txn.status === "closed" ? CLOSED_REFUND_DESCRIPTION : txn.description,
     amountCharged: { amountMinor: txn.amount, currency },
     amount: txn.amount,
     currency,

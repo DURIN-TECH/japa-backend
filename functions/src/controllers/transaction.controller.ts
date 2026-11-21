@@ -148,6 +148,18 @@ export class TransactionController {
         return;
       }
 
+      // Review round 1 of #413 (E: "never a 500"): on the agent, owner and
+      // admin lists a date filter that does not parse is a 400 naming it,
+      // before anything is read (their Firestore query would otherwise throw
+      // on an Invalid Date). The client view keeps ignoring it (in memory).
+      for (const name of ["startDate", "endDate"] as const) {
+        const raw = req.query[name];
+        if (raw === undefined) continue;
+        if (typeof raw !== "string" || raw.trim() === "" || Number.isNaN(new Date(raw).getTime())) {
+          sendError(res, "VALIDATION_ERROR", `${name} must be a date (ISO 8601, e.g. 2026-11-21)`);
+          return;
+        }
+      }
       let transactions;
 
       switch (role) {

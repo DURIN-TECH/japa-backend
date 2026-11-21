@@ -158,9 +158,11 @@ import { consultationFeeCredit, isUnresolvedFeeStatus, isWellFormedFee } from ".
 import { resolvedFeeFields } from "./paystack-fee.service";
 import type { PaystackTransactionLookup } from "./billing/paystack.provider";
 import { notificationService } from "./notification.service";
-import { PaystackApiError, PaystackRefund, paystackProvider } from "./billing/paystack.provider";
+import { PaystackApiError, PaystackRefund, paystackProvider, toPaystackRefund } from "./billing/paystack.provider";
 import { feeHoldStatusAt, FeeHoldStatus, refundFundableFromHold } from "../money/fee-hold";
 import { formatWithCode } from "../money/money";
+// Review round 1 of #413: what a closed refund reads as (shared with the client view).
+import { CLOSED_REFUND_DESCRIPTION } from "../transactions/client-transaction";
 import { slotStartsAt } from "../consultations/slot-time";
 import { feeDebitDocId, mismatchAdjustmentDocId, mismatchTopUpDocId, refundDocId } from "../money/refund-id";
 
@@ -622,6 +624,58 @@ export function matchProviderRefund(
   if (notOurs) return { kind: "mismatch", refund: notOurs };
   if (live.length > 1) return { kind: "mismatch", refund: live[1] };
   return { kind: "match", refund: live[0] };
+}
+
+/**
+ * Issue #413 (A): flag `row` for an admin, through `tx`, because Paystack
+ * holds a refund `refund` of its charge that is not exactly the row's
+ * (amount and currency, `matchProviderRefund`). Shared by the engine
+ * (`flagProviderMismatch`) and, review round 1, the webhook path
+ * (`advanceRefundStatus` with source "webhook"), so both write the same:
+ *  - `failed`, `refundFailureReason: "provider_refund_mismatch"`, the refund
+ *    as seen (`providerRefundMismatch`); NO `providerRefundId` is taken from it;
+ *  - the booking (or #354 exception) mirrors `failed`.
+ * The caller has read `mirrorSnap` (reads before writes) and checked that the
+ * row may be flagged. No money moves.
+ *
+ * @returns the row as written, and whether the client is to be told the
+ *   refund is delayed (once per Paystack refund: a re-flag of the same one is silent)
+ */
+function flagMismatchInTx(
+  tx: FirestoreTransaction,
+  ref: FirebaseFirestore.DocumentReference,
+  row: Transaction,
+  refund: PaystackRefund,
+  mirror: { kind: "exception" | "booking"; ref: FirebaseFirestore.DocumentReference } | null,
+  mirrorSnap: FirebaseFirestore.DocumentSnapshot | null,
+  now: Timestamp
+): { row: Transaction; notify: boolean } {
+  const seen = {
+    id: refund.id,
+    amountMinor: typeof refund.amount === "number" ? refund.amount : null,
+    currency: typeof refund.currency === "string" ? refund.currency : null,
+    status: refund.status,
+    seenAt: now,
+  };
+  const update = {
+    status: "failed" as const,
+    refundFailureReason: "provider_refund_mismatch" as const,
+    providerRefundMismatch: seen,
+    refundFailedAt: now,
+    refundLastError: "provider_refund_mismatch",
+    refundLeaseUntil: FieldValue.delete(),
+    updatedAt: now,
+  };
+  tx.update(ref, update);
+  const mirrored = mirror ? mirrorUpdate(mirror.kind, "failed", now) : null;
+  if (mirror && mirrorSnap?.exists && mirrored) tx.update(mirror.ref, mirrored);
+  console.error(
+    `[refund] ${row.id}: Paystack refund ${refund.id} (${seen.amountMinor ?? "?"} ${seen.currency ?? "?"}, ` +
+      `${refund.status}) does not match the row (${row.amount} ${row.currency}); not adopted, none created, flagged for an admin`
+  );
+  const next = { ...row, ...update } as unknown as Transaction;
+  delete next.refundLeaseUntil;
+  return { row: next, notify: row.providerRefundMismatch?.id !== refund.id };
 }
 
 /**
@@ -1580,6 +1634,21 @@ class ConsultationRefundService {
   }): Promise<{ kind: "booking"; outcome: AdminRefundOutcome } | { kind: "exception"; outcome: ExceptionRetryOutcome }> {
     const snap = await collections.transactions.doc(input.refundId).get();
     const row = snap.exists ? (snap.data() as Transaction) : null;
+    // Review round 1: a mismatch TOP-UP (its own row, `refundTopUpOf`) is
+    // retried on that row: back to pending with its failure fields cleared,
+    // then sent (lookup first). Never a second top-up; a live one: 409.
+    if (row && row.type === "refund" && row.refundTopUpOf && row.consultationId === input.consultationId) {
+      if (row.status !== "failed") return { kind: "booking", outcome: { kind: "already_refunded", refund: row } };
+      const requeued = await this.requeueFailedTopUp(row.id);
+      if (!requeued || !requeued.booking) {
+        const again = (await collections.transactions.doc(row.id).get()).data() as Transaction | undefined;
+        return { kind: "booking", outcome: again ? { kind: "already_refunded", refund: again } : { kind: "not_found" } };
+      }
+      return {
+        kind: "booking",
+        outcome: { kind: "retried", refund: requeued.row, booking: requeued.booking, debit: null, fromHeld: false },
+      };
+    }
     if (row && row.type === "refund" && !row.paymentExceptionId && row.consultationId === input.consultationId) {
       const outcome = await this.adminRefund({
         consultationId: input.consultationId,
@@ -1667,6 +1736,9 @@ class ConsultationRefundService {
         refundClosedAt: now,
         refundClosedBy: input.adminUid,
         refundClosedOutcome: "nothing_to_refund" as const,
+        // Review round 1: the held row's "(held: Paystack's fee needed)"
+        // description would still read as held to the client once closed.
+        description: CLOSED_REFUND_DESCRIPTION,
         updatedAt: now,
       };
       tx.update(refundRef, rowUpdate);
@@ -1949,7 +2021,9 @@ class ConsultationRefundService {
     const preSnap = await rowRef.get();
     if (!preSnap.exists) return { kind: "not_found" };
     const pre = preSnap.data() as Transaction;
-    if (pre.type !== "refund" || pre.consultationId !== input.consultationId || pre.refundTopUpOf) return { kind: "not_found" };
+    if (pre.type !== "refund" || pre.consultationId !== input.consultationId) return { kind: "not_found" };
+    // Review round 1: a flagged TOP-UP is resolvable too, on its own money.
+    if (pre.refundTopUpOf) return this.resolveTopUpMismatch(pre, input);
     if (pre.refundMismatchResolution) return this.alreadyResolved(pre);
     if (pre.status !== "failed" || pre.refundFailureReason !== "provider_refund_mismatch" || !pre.providerRefundMismatch) {
       return { kind: "not_mismatch" };
@@ -2005,7 +2079,12 @@ class ConsultationRefundService {
       const adjustmentRef = collections.transactions.doc(mismatchAdjustmentDocId(reference));
       const topUpSnap = await tx.get(topUpRef);
       const adjustmentSnap = await tx.get(adjustmentRef);
-      const lockRef = collections.withdrawalLocks.doc(booking.agentId);
+      // Review round 1: the agent the refund was taken from (`row.agentId`,
+      // set by `writeRefund` from the booking at the time), not the
+      // booking's agent NOW: after a reassignment the adjustment (and its
+      // lock) must reach whoever gave R back.
+      const refundAgentId = row.agentId ?? booking.agentId;
+      const lockRef = collections.withdrawalLocks.doc(refundAgentId);
       const lockSnap = await tx.get(lockRef);
       // Once ever per reference, whatever happened before.
       if (topUpSnap.exists || adjustmentSnap.exists) return { kind: "needs_manual", why: "a top-up or adjustment already exists for this charge" };
@@ -2073,8 +2152,8 @@ class ConsultationRefundService {
       if (plan.agentAdjustmentMinor !== 0) {
         adjustment = {
           id: adjustmentRef.id,
-          userId: booking.agentId,
-          agentId: booking.agentId,
+          userId: refundAgentId,
+          agentId: refundAgentId,
           consultationId: booking.id,
           type: "refund_adjustment",
           amount: Math.abs(plan.agentAdjustmentMinor),
@@ -2112,6 +2191,11 @@ class ConsultationRefundService {
         status: "completed" as const,
         amount: X,
         plannedAmountMinor: P,
+        // Review round 1: R written explicitly. A row from before #390 has no
+        // `agentReversalMinor`, and `agentReversalOf` falls back to `amount`,
+        // which becomes X here: without this the agent's R would silently
+        // change from P to X after the net check above was made with R.
+        agentReversalMinor: agentReversalOf(row),
         providerRefundId: adopted.id,
         providerRefundStatus: adopted.status,
         refundedAt: now,
@@ -2133,7 +2217,7 @@ class ConsultationRefundService {
         tx.set(
           lockRef,
           {
-            agentUserId: booking.agentId,
+            agentUserId: refundAgentId,
             lastRefundAdjustmentId: adjustment.id,
             refundAdjustmentCount: (Number(lockSnap.exists ? lockSnap.data()?.refundAdjustmentCount : 0) || 0) + 1,
             updatedAt: now,
@@ -2174,22 +2258,11 @@ class ConsultationRefundService {
     const topUpId = row.refundMismatchResolution?.topUpRefundId;
     if (!topUpId) return { kind: "already_resolved", refund: row, topUp: null };
     const ref = collections.transactions.doc(topUpId);
-    const requeued = await chargeRuntime.runTransaction<boolean>(async (tx) => {
-      const snap = await tx.get(ref);
-      if (!snap.exists || (snap.data() as Transaction).status !== "failed") return false;
-      const now = Timestamp.fromDate(chargeRuntime.now());
-      tx.update(ref, {
-        status: "pending",
-        refundAttempts: 0,
-        refundNextAttemptAt: now,
-        refundLeaseUntil: FieldValue.delete(),
-        refundFailedAt: FieldValue.delete(),
-        ...retireAttempt(snap.data() as Transaction),
-        processingSince: FieldValue.delete(),
-        updatedAt: now,
-      });
-      return true;
-    });
+    // Review round 1: requeued with its failure (and flag) fields cleared.
+    // A flagged top-up whose refund is still live at Paystack is flagged
+    // again by the lookup (nothing created); it is resolved with the same
+    // route and the top-up's own id (`resolveTopUpMismatch`).
+    const requeued = (await this.requeueFailedTopUp(topUpId)) !== null;
     let topUp = (await ref.get()).data() as Transaction | undefined;
     if (topUp && (requeued || topUp.status === "pending")) {
       try {
@@ -2199,6 +2272,234 @@ class ConsultationRefundService {
       }
     }
     return { kind: "already_resolved", refund: row, topUp: topUp ?? null };
+  }
+
+  /**
+   * Review round 1 of #413: put a FAILED top-up refund (a Paystack failure,
+   * or flagged `provider_refund_mismatch`) back to `pending`, on the same
+   * row, clearing its failure fields (so a pending top-up never carries a
+   * stale flag), and mirror `pending` on the booking. Its current Paystack
+   * attempt, if any, is retired (#383). `processRefund` then looks the
+   * charge up FIRST (every try does): a top-up Paystack already holds is
+   * adopted, a refund that is not exactly the top-up flags it again, and
+   * one is created only when Paystack holds none. Never a second top-up row.
+   *
+   * @returns the row as requeued, or null when it is not a failed top-up
+   */
+  private async requeueFailedTopUp(topUpId: string): Promise<{ row: Transaction; booking: Consultation | null } | null> {
+    const ref = collections.transactions.doc(topUpId);
+    return chargeRuntime.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return null;
+      const row = snap.data() as Transaction;
+      if (!row.refundTopUpOf || row.status !== "failed") return null;
+      const bookingRef = row.consultationId ? collections.consultations.doc(row.consultationId) : null;
+      const bookingSnap = bookingRef ? await tx.get(bookingRef) : null;
+      const now = Timestamp.fromDate(chargeRuntime.now());
+      tx.update(ref, {
+        status: "pending",
+        refundAttempts: 0,
+        refundNextAttemptAt: now,
+        refundLeaseUntil: FieldValue.delete(),
+        refundFailedAt: FieldValue.delete(),
+        // The flag fields go with the failure: the next lookup flags it
+        // again (and tells nobody twice for the same refund) if it still is.
+        refundFailureReason: FieldValue.delete(),
+        refundLastError: FieldValue.delete(),
+        ...retireAttempt(row),
+        processingSince: FieldValue.delete(),
+        updatedAt: now,
+      });
+      if (bookingRef && bookingSnap?.exists) tx.update(bookingRef, { refundStatus: "pending", updatedAt: now });
+      const next = { ...retiredInMemory(row), status: "pending", refundAttempts: 0, refundNextAttemptAt: now, updatedAt: now } as Transaction;
+      delete next.refundLeaseUntil;
+      delete next.refundFailedAt;
+      delete next.refundFailureReason;
+      delete next.refundLastError;
+      const booking = bookingSnap?.exists ? ({ ...(bookingSnap.data() as Consultation), refundStatus: "pending", updatedAt: now } as Consultation) : null;
+      return { row: next, booking };
+    });
+  }
+
+  /**
+   * Review round 1 of #413: resolve a TOP-UP flagged `provider_refund_mismatch`
+   * (Paystack refunded Y on the charge for the top-up where it planned G).
+   * Same rules as the original's resolve (Paystack's own `processed` figure,
+   * never typed in; no default; Seli never carries any part), applied to the
+   * top-up's own money: Seli was to send G, it sent Y.
+   *
+   *   case                        | effect                         | client ends with
+   *   ----------------------------|--------------------------------|-----------------
+   *   Y < G, carriedBy client     | agent credited G - Y           | P - (G - Y)
+   *   Y < G, carriedBy agent      | 409 NEEDS_MANUAL_RESOLUTION    | (would need a second top-up; a charge gets ONE)
+   *   Y = G (count issue cleared) | nothing                        | P
+   *   Y > G, agent caused, agent  | agent debited Y - G            | P + (Y - G)
+   *   Y > G, agent caused, client | 409 CARRIED_BY_NOT_ALLOWED     |
+   *   Y > G, client caused        | 409 NEEDS_MANUAL_RESOLUTION    |
+   *
+   * The agent adjustment is the charge's ONE adjustment
+   * (`mismatchAdjustmentDocId`, `tx.create`): if the original's resolve
+   * already wrote one, any non-zero effect here is left for a person.
+   * `planMismatchResolution` checks the top-up's own ledger nets to 0 (it is
+   * given A = P = G and no fee, credit, reversal or debit: the original
+   * resolve already netted everything else).
+   */
+  private async resolveTopUpMismatch(
+    pre: Transaction,
+    input: { consultationId: string; carriedBy: MismatchCarriedBy; adminUid: string }
+  ): Promise<MismatchResolveOutcome> {
+    if (pre.refundMismatchResolution) return { kind: "already_resolved", refund: pre, topUp: null };
+    if (pre.status !== "failed" || pre.refundFailureReason !== "provider_refund_mismatch" || !pre.providerRefundMismatch) {
+      return { kind: "not_mismatch" };
+    }
+    const reference = pre.providerTransactionId ?? "";
+    let found: PaystackRefund | null;
+    let all: PaystackRefund[];
+    try {
+      found = await paystackProvider.fetchRefund(pre.providerRefundMismatch.id);
+      all = reference ? await paystackProvider.findRefundsForTransaction(reference) : [];
+    } catch (error) {
+      console.error(`[refund] resolve top-up ${pre.id}: Paystack lookup failed:`, error);
+      return { kind: "paystack_unavailable" };
+    }
+    if (!found || found.id !== pre.providerRefundMismatch.id) return { kind: "needs_manual", why: "Paystack no longer reports that refund" };
+    if (found.transactionReference && reference && found.transactionReference !== reference) {
+      return { kind: "needs_manual", why: "Paystack's refund names another charge" };
+    }
+    if (found.status !== "processed") return { kind: "not_processed", providerStatus: found.status };
+    if (typeof found.amount !== "number" || found.currency !== pre.currency) {
+      return { kind: "needs_manual", why: "Paystack's refund has no amount, or is in another currency" };
+    }
+    // Only the top-up's own refunds count (the original's and its earlier
+    // attempts are excluded, as everywhere else for a top-up).
+    if (withoutExcluded(pre, all).some((r) => r.status !== "failed" && r.id !== found!.id)) {
+      return { kind: "needs_manual", why: "the charge has more than one refund at Paystack for the top-up" };
+    }
+    const Y = found.amount;
+    const adopted = found;
+    const rowRef = collections.transactions.doc(pre.id);
+    const bookingRef = collections.consultations.doc(input.consultationId);
+
+    return chargeRuntime.runTransaction<MismatchResolveOutcome>(async (tx) => {
+      const snap = await tx.get(rowRef);
+      if (!snap.exists) return { kind: "not_found" };
+      const row = snap.data() as Transaction;
+      if (row.refundMismatchResolution) return { kind: "already_resolved", refund: row, topUp: null };
+      if (row.status !== "failed" || row.refundFailureReason !== "provider_refund_mismatch" || row.providerRefundMismatch?.id !== adopted.id) {
+        return { kind: "not_mismatch" };
+      }
+      const originalSnap = await tx.get(collections.transactions.doc(row.refundTopUpOf!));
+      const original = originalSnap.exists ? (originalSnap.data() as Transaction) : null;
+      if (!original || original.refundMismatchResolution?.topUpRefundId !== row.id) {
+        return { kind: "needs_manual", why: "the top-up's original refund cannot be found" };
+      }
+      const bookingSnap = await tx.get(bookingRef);
+      if (!bookingSnap.exists) return { kind: "not_found" };
+      const adjustmentRef = collections.transactions.doc(mismatchAdjustmentDocId(reference));
+      const adjustmentSnap = await tx.get(adjustmentRef);
+      // The agent the money was taken from (the original refund's).
+      const refundAgentId = original.agentId ?? row.agentId ?? (bookingSnap.data() as Consultation).agentId;
+      const lockRef = collections.withdrawalLocks.doc(refundAgentId);
+      const lockSnap = await tx.get(lockRef);
+
+      const G = row.plannedAmountMinor ?? row.amount;
+      const plan = planMismatchResolution({
+        amountMinor: G,
+        paystackFeeMinor: 0,
+        creditMinor: 0,
+        plannedMinor: G,
+        reversalMinor: 0,
+        debitMinor: 0,
+        refundedMinor: Y,
+        agentCaused: original.feeBorneBy === "agent",
+        carriedBy: input.carriedBy,
+      });
+      if (plan.kind === "refuse") {
+        return plan.code === "CARRIED_BY_NOT_ALLOWED"
+          ? { kind: "carried_by_not_allowed" }
+          : { kind: "needs_manual", why: "Paystack refunded more than planned on a refund the client caused" };
+      }
+      if (plan.topUpMinor > 0) {
+        return { kind: "needs_manual", why: "the agent carrying it would need a second top-up, and a charge gets only one" };
+      }
+      if (plan.agentAdjustmentMinor !== 0 && adjustmentSnap.exists) {
+        return { kind: "needs_manual", why: "an adjustment already exists for this charge" };
+      }
+
+      const now = Timestamp.fromDate(chargeRuntime.now());
+      let adjustment: Transaction | null = null;
+      if (plan.agentAdjustmentMinor !== 0) {
+        adjustment = {
+          id: adjustmentRef.id,
+          userId: refundAgentId,
+          agentId: refundAgentId,
+          consultationId: input.consultationId,
+          type: "refund_adjustment",
+          amount: Math.abs(plan.agentAdjustmentMinor),
+          adjustmentDirection: plan.agentAdjustmentMinor > 0 ? "credit" : "debit",
+          currency: row.currency,
+          status: "completed",
+          isEscrow: false,
+          paymentProvider: "paystack",
+          providerTransactionId: reference,
+          refundId: row.id,
+          description:
+            plan.agentAdjustmentMinor > 0
+              ? "Refund difference: the client was refunded less than planned"
+              : "Refund difference: the client was refunded more than planned",
+          initiatedBy: input.adminUid,
+          metadata: { consultationId: input.consultationId, reference },
+          createdAt: now,
+          updatedAt: now,
+        };
+        tx.create(adjustmentRef, adjustment);
+        tx.set(
+          lockRef,
+          {
+            agentUserId: refundAgentId,
+            lastRefundAdjustmentId: adjustment.id,
+            refundAdjustmentCount: (Number(lockSnap.exists ? lockSnap.data()?.refundAdjustmentCount : 0) || 0) + 1,
+            updatedAt: now,
+          },
+          { merge: true }
+        );
+      }
+      const resolution = {
+        carriedBy: input.carriedBy,
+        providerRefundId: adopted.id,
+        refundedMinor: Y,
+        plannedMinor: G,
+        ...(adjustment ? { adjustmentId: adjustment.id } : {}),
+        agentAdjustmentMinor: plan.agentAdjustmentMinor,
+        resolvedBy: input.adminUid,
+        resolvedAt: now,
+      };
+      const rowUpdate = {
+        status: "completed" as const,
+        amount: Y,
+        plannedAmountMinor: G,
+        agentReversalMinor: agentReversalOf(row),
+        providerRefundId: adopted.id,
+        providerRefundStatus: adopted.status,
+        refundedAt: now,
+        refundMismatchResolution: resolution,
+        refundFailureReason: FieldValue.delete(),
+        refundFailedAt: FieldValue.delete(),
+        refundLeaseUntil: FieldValue.delete(),
+        updatedAt: now,
+      };
+      tx.update(rowRef, rowUpdate);
+      tx.update(bookingRef, { refundStatus: "completed", updatedAt: now });
+      console.warn(
+        `[refund] top-up ${row.id}: mismatch resolved by admin ${input.adminUid} (${input.carriedBy}): Paystack refunded ${Y}, ` +
+          `planned ${G} ${row.currency}; agent ${plan.agentAdjustmentMinor}; Seli net 0`
+      );
+      const next = { ...row, ...rowUpdate } as unknown as Transaction;
+      delete next.refundFailureReason;
+      delete next.refundFailedAt;
+      delete next.refundLeaseUntil;
+      return { kind: "resolved", refund: next, topUp: null, adjustment };
+    });
   }
 
   /**
@@ -2231,11 +2532,13 @@ class ConsultationRefundService {
    *
    *  1. CLAIM (a transaction): the row must be `pending` and not leased;
    *     its lease is taken, `refundAttempts` and `refundProviderCalls` go up.
-   *     Whether to LOOK UP first is decided from the calls made BEFORE this
-   *     claim: any earlier call may have reached Paystack (a timeout, a crash
-   *     after the call), so it is looked up, never blindly repeated.
-   *  2. LOOK UP (repeat tries only): a Paystack refund of this charge that
-   *     did not fail is ADOPTED (status mapped, id stored). None: go on.
+   *  2. LOOK UP, on EVERY try (review round 1 of #413, was repeat tries
+   *     only): a refund Paystack already holds for the charge (an earlier
+   *     call of ours that reached it, or a manual dashboard refund made
+   *     before the first try) is ADOPTED when it is exactly the row's money,
+   *     and flags the row otherwise. Only when Paystack holds no live refund
+   *     does the run go on to create one, so an earlier dashboard refund can
+   *     never be followed by a second refund to the client.
    *  3. CREATE: Paystack POST /refund with the charge's reference and the
    *     row's own `amount` / `currency`. Accepted: `processing` (or
    *     `completed` when Paystack already says processed). Refused by
@@ -2269,7 +2572,9 @@ class ConsultationRefundService {
         updatedAt: Timestamp.fromDate(at),
       };
       tx.update(ref, update);
-      return { kind: "go", row: { ...row, ...update }, lookUpFirst: calls > 0 };
+      // Review round 1 of #413 (money leak): always look up first, the
+      // first try included (a lookup is cheap; a second refund is not).
+      return { kind: "go", row: { ...row, ...update }, lookUpFirst: true };
     });
     if (claim.kind === "skip") return claim.row;
     const row = claim.row;
@@ -2365,34 +2670,7 @@ class ConsultationRefundService {
       if (row.status !== "pending") return { row, notify: false };
       const mirror = mirrorTarget(row);
       const mirrorSnap = mirror ? await tx.get(mirror.ref) : null;
-      const now = Timestamp.fromDate(chargeRuntime.now());
-      const seen = {
-        id: refund.id,
-        amountMinor: typeof refund.amount === "number" ? refund.amount : null,
-        currency: typeof refund.currency === "string" ? refund.currency : null,
-        status: refund.status,
-        seenAt: now,
-      };
-      const update = {
-        status: "failed" as const,
-        refundFailureReason: "provider_refund_mismatch" as const,
-        providerRefundMismatch: seen,
-        refundFailedAt: now,
-        refundLastError: "provider_refund_mismatch",
-        refundLeaseUntil: FieldValue.delete(),
-        updatedAt: now,
-      };
-      tx.update(ref, update);
-      const mirrored = mirror ? mirrorUpdate(mirror.kind, "failed", now) : null;
-      if (mirror && mirrorSnap?.exists && mirrored) tx.update(mirror.ref, mirrored);
-      console.error(
-        `[refund] ${refundId}: Paystack refund ${refund.id} (${seen.amountMinor ?? "?"} ${seen.currency ?? "?"}, ` +
-          `${refund.status}) does not match the row (${row.amount} ${row.currency}); not adopted, none created, flagged for an admin`
-      );
-      const next = { ...row, ...update } as unknown as Transaction;
-      delete next.refundLeaseUntil;
-      // Told once per Paystack refund: a re-flag of the same one is silent.
-      return { row: next, notify: row.providerRefundMismatch?.id !== refund.id };
+      return flagMismatchInTx(tx, ref, row, refund, mirror, mirrorSnap, Timestamp.fromDate(chargeRuntime.now()));
     });
     if (result.notify && result.row) await this.notifyDelayed(result.row);
     return result.row;
@@ -2471,10 +2749,18 @@ class ConsultationRefundService {
        *  - omitted (internal callers, tests): as before #383.
        */
       source?: "engine" | "webhook";
+      /**
+       * Review round 1 (#413 A on the webhook path): the event's refund as
+       * Paystack sent it (`data.amount` in minor units, `data.currency`).
+       * Required for a webhook to ADOPT a refund on a row with no current
+       * attempt: it must be exactly the row's money (`matchProviderRefund`).
+       */
+      providerAmountMinor?: number;
+      providerCurrency?: string;
     } = {}
   ): Promise<{ changed: boolean; row: Transaction | null }> {
     const ref = collections.transactions.doc(refundId);
-    const result = await chargeRuntime.runTransaction<{ changed: boolean; row: Transaction | null }>(async (tx) => {
+    const result = await chargeRuntime.runTransaction<{ changed: boolean; row: Transaction | null; notify?: boolean }>(async (tx) => {
       const snap = await tx.get(ref);
       if (!snap.exists) return { changed: false, row: null };
       const row = snap.data() as Transaction;
@@ -2487,6 +2773,18 @@ class ConsultationRefundService {
       // Issue #383: a webhook for an EARLIER attempt of this row (or for a
       // refund that is not the current one) is ours, but changes nothing:
       // a late `refund.failed` of attempt 1 must not fail attempt 2.
+      // Review round 1 (#413 A): a row flagged for a Paystack refund that is
+      // not exactly ours waits for an admin (resolve or retry). No webhook
+      // moves it, whatever refund it names: the flag never stores an id, so
+      // without this any event for the charge would "complete" it at the
+      // planned amount and pre-empt the resolve.
+      if (extra.source === "webhook" && row.refundFailureReason === "provider_refund_mismatch") {
+        console.warn(
+          `[refund] ${refundId} is flagged provider_refund_mismatch; webhook for Paystack refund ` +
+            `${extra.providerRefundId ?? "(no id)"} ignored (an admin resolves it)`
+        );
+        return { changed: false, row };
+      }
       if (extra.source === "webhook" && !isCurrentAttempt(row, extra.providerRefundId)) {
         console.warn(
           `[refund] ${refundId}: webhook for Paystack refund ${extra.providerRefundId ?? "(no id)"} is not the current ` +
@@ -2499,27 +2797,70 @@ class ConsultationRefundService {
       const mirrorSnap = mirror ? await tx.get(mirror.ref) : null;
       const current = row.status as RefundStatus;
       const now = Timestamp.fromDate(chargeRuntime.now());
+      // Review round 1 (#413 A on the webhook path): a webhook on a row with
+      // NO current attempt would record a new refund id. It is applied only
+      // when the event's refund is exactly the row's money (amount AND
+      // currency, both reported: `matchProviderRefund`, as the engine and
+      // the poll do). Otherwise:
+      //  - an event naming no refund id, or for a refund Paystack reports
+      //    `failed`: nothing written (the engine's next attempt looks the
+      //    charge up first and creates only when nothing live is there);
+      //  - a refund that is not exactly ours (a manual dashboard refund):
+      //    a `pending` row is flagged for an admin, exactly as the engine
+      //    flags it; a row in any other status is left as it is.
+      if (extra.source === "webhook" && !row.providerRefundId) {
+        if (!extra.providerRefundId) {
+          console.warn(`[refund] ${refundId}: webhook names no Paystack refund id and the row has none yet; unchanged`);
+          return { changed: false, row };
+        }
+        const seen: PaystackRefund = {
+          id: extra.providerRefundId,
+          status: extra.providerRefundStatus ?? target,
+          transactionReference: row.providerTransactionId ?? "",
+          ...(typeof extra.providerAmountMinor === "number" ? { amount: extra.providerAmountMinor } : {}),
+          ...(typeof extra.providerCurrency === "string" ? { currency: extra.providerCurrency } : {}),
+        };
+        // A top-up row never takes a refund it excludes (the original's).
+        const match = matchProviderRefund(row, withoutExcluded(row, [seen]));
+        if (match.kind === "none") {
+          console.warn(`[refund] ${refundId}: webhook for Paystack refund ${seen.id} (${seen.status}) not adopted; unchanged`);
+          return { changed: false, row };
+        }
+        if (match.kind === "mismatch") {
+          if (row.status !== "pending") {
+            console.error(
+              `[refund] ${refundId}: webhook for Paystack refund ${seen.id} does not match the row ` +
+                `(${row.amount} ${row.currency}) and the row is ${row.status}; unchanged`
+            );
+            return { changed: false, row };
+          }
+          const flagged = flagMismatchInTx(tx, ref, row, match.refund, mirror, mirrorSnap, now);
+          return { changed: true, row: flagged.row, notify: flagged.notify };
+        }
+      }
       const forward = (STATUS_RANK[target] ?? -1) > (STATUS_RANK[current] ?? 0);
       // A refund id to store: one we never had, or (issue #383) the engine's
       // new current attempt replacing an older one, which is kept.
       const replacing =
         extra.source === "engine" && !!extra.providerRefundId && !!row.providerRefundId && row.providerRefundId !== extra.providerRefundId;
       const newId = !!extra.providerRefundId && row.providerRefundId !== extra.providerRefundId && (!row.providerRefundId || replacing);
+      // Review round 1: the earlier attempts after this write. An id the
+      // engine adopts AGAIN (a retry retired it, then the lookup found it
+      // live) leaves the list, or `isCurrentAttempt` would refuse every
+      // webhook and poll answer for the row's own current attempt.
+      const previousAfter = (): string[] | null => {
+        if (!newId) return null;
+        const base = replacing ? withPreviousId(row, row.providerRefundId!) : row.previousProviderRefundIds ?? [];
+        const kept = base.filter((x) => x !== extra.providerRefundId);
+        return replacing || kept.length !== (row.previousProviderRefundIds ?? []).length ? kept : null;
+      };
+      const previous = previousAfter();
       const idFields: Record<string, unknown> = newId
-        ? {
-          providerRefundId: extra.providerRefundId,
-          ...(replacing ? { previousProviderRefundIds: withPreviousId(row, row.providerRefundId!) } : {}),
-        }
+        ? { providerRefundId: extra.providerRefundId, ...(previous ? { previousProviderRefundIds: previous } : {}) }
         : {};
       /** The row in memory with the id fields applied. */
       const withId = (base: Transaction): Transaction =>
-        newId
-          ? {
-            ...base,
-            providerRefundId: extra.providerRefundId,
-            ...(replacing ? { previousProviderRefundIds: withPreviousId(row, row.providerRefundId!) } : {}),
-          }
-          : base;
+        newId ? { ...base, providerRefundId: extra.providerRefundId, ...(previous ? { previousProviderRefundIds: previous } : {}) } : base;
 
       if (!forward) {
         // Nothing moves backward. Only store a refund id (see above).
@@ -2546,8 +2887,10 @@ class ConsultationRefundService {
       delete next.refundLeaseUntil;
       return { changed: true, row: next };
     });
-    if (result.changed && result.row?.status === "failed") await this.notifyDelayed(result.row);
-    return result;
+    // A row that became failed tells the client once (a webhook-flagged
+    // mismatch: once per Paystack refund, as the engine's flag).
+    if (result.changed && result.row?.status === "failed" && result.notify !== false) await this.notifyDelayed(result.row);
+    return { changed: result.changed, row: result.row };
   }
 
   /**
@@ -2610,9 +2953,15 @@ class ConsultationRefundService {
     const status = typeof refund.status === "string" ? refund.status.toLowerCase() : event.slice("refund.".length);
     // Issue #383: only the row's CURRENT attempt moves it (checked inside
     // the transaction, so a retry that just started attempt 2 always wins).
+    // Review round 1 (#413 A): the event's own figures, read exactly as the
+    // lookups read Paystack's refunds (`toPaystackRefund`), so a webhook can
+    // only adopt a refund that is exactly the row's money.
+    const parsed = toPaystackRefund(refund, reference);
     const outcome = await this.advanceRefundStatus(rowId, target, {
       ...(providerId ? { providerRefundId: providerId } : {}),
       providerRefundStatus: status,
+      ...(typeof parsed?.amount === "number" ? { providerAmountMinor: parsed.amount } : {}),
+      ...(typeof parsed?.currency === "string" ? { providerCurrency: parsed.currency } : {}),
       source: "webhook",
     });
     return outcome.changed ? "applied" : "unchanged";

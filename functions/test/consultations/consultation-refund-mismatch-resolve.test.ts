@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 
 import { useHarness, harness, docsIn, captureRes } from "./harness";
 import {
-  admin, agent, balanceOf, bookAndPay, bookingOf, client, ownerA, refOf, refundRows, reqFor, setStatus,
+  admin, adminRefund, agent, balanceOf, bookAndPay, bookingOf, client, ownerA, refOf, refundRows, reqFor, setStatus,
   webhook, refundEvent, TEST_PAYSTACK_SECRET,
 } from "./refund-fixtures";
 import { notificationService } from "../../src/services/notification.service";
@@ -347,5 +347,159 @@ describe("POST /consultations/:id/refund/resolve-mismatch", () => {
     const s = transactionService.computeStats(rows, harness.clock.now(), { feeBreakdown: true }).byCurrency[0];
     // Net revenue = what Seli owes the agent for the reference = A - F - X.
     assert.equal(s.totalRevenue, A - F - 500_000);
+  });
+});
+
+// ============================================
+// Review round 1: the top-up's webhook check and admin paths, the agent the
+// adjustment reaches, and R written on the resolve
+// ============================================
+
+describe("review round 1: top-ups, the refund's agent, and R", () => {
+  /** Mutate a stored doc in place (stands for data written by an older build, or a reassignment). */
+  function patchDoc(collection: string, id: string, patch: Record<string, unknown>): void {
+    const doc = docsIn(collection).find(([docId]) => docId === id)![1];
+    Object.assign(doc, patch);
+  }
+
+  /** X < P resolved with the agent carrying it, whose top-up create got no answer: the top-up is pending with no id. */
+  async function pendingTopUp(): Promise<{ row: Record<string, any>; topUpId: string; G: number }> {
+    const row = await flagged({ cause: "agent", X: 500_000 });
+    harness.refundBehaviour.push("network");
+    assert.equal((await resolveMismatch(admin, { refundId: row.id, carriedBy: "agent" })).status, 200);
+    const topUpId = mismatchTopUpDocId(refOf("c1"));
+    assert.equal(txOf(topUpId)!.status, "pending");
+    assert.equal(txOf(topUpId)!.providerRefundId, undefined);
+    return { row, topUpId, G: A - 500_000 };
+  }
+
+  test("a later dashboard refund d2 reaching a top-up with no id never completes it: the top-up is flagged", async () => {
+    const { row, topUpId } = await pendingTopUp();
+    const d2 = { id: "manual-d2", status: "processed", transactionReference: refOf("c1"), amount: 100_000, currency: "NGN" };
+    harness.paystackRefunds.get(refOf("c1"))!.push(d2);
+    await webhook(refundEvent("refund.processed", refOf("c1"), { id: d2.id, amount: d2.amount }));
+    const topUp = txOf(topUpId)!;
+    assert.equal(topUp.status, "failed");
+    assert.equal(topUp.refundFailureReason, "provider_refund_mismatch");
+    assert.equal(topUp.providerRefundMismatch.id, "manual-d2");
+    assert.equal(topUp.providerRefundId, undefined);
+    assert.equal(txOf(row.id)!.status, "completed", "the original row is untouched");
+    // A further event for d2 changes nothing on the flagged top-up.
+    const before = JSON.stringify(txOf(topUpId));
+    await webhook(refundEvent("refund.processed", refOf("c1"), { id: d2.id, amount: d2.amount }));
+    assert.equal(JSON.stringify(txOf(topUpId)), before);
+  });
+
+  test("a flagged top-up is resolvable on its own money: carriedBy client credits the agent G - Y; Seli 0", async () => {
+    const { topUpId, G } = await pendingTopUp();
+    const Y = 100_000;
+    harness.paystackRefunds.get(refOf("c1"))!.push({ id: "manual-d2", status: "processed", transactionReference: refOf("c1"), amount: Y, currency: "NGN" });
+    await webhook(refundEvent("refund.processed", refOf("c1"), { id: "manual-d2", amount: Y }));
+    assert.equal(txOf(topUpId)!.refundFailureReason, "provider_refund_mismatch");
+
+    // The agent carrying it would need a second top-up: left for a person.
+    const agentOut = await resolveMismatch(admin, { refundId: topUpId, carriedBy: "agent" });
+    assert.equal(agentOut.status, 409);
+    assert.equal(agentOut.body.error, "NEEDS_MANUAL_RESOLUTION");
+
+    const out = await resolveMismatch(admin, { refundId: topUpId, carriedBy: "client" });
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    const topUp = txOf(topUpId)!;
+    assert.equal(topUp.status, "completed");
+    assert.equal(topUp.amount, Y);
+    assert.equal(topUp.plannedAmountMinor, G);
+    assert.equal(topUp.providerRefundId, "manual-d2");
+    assert.equal(topUp.refundMismatchResolution.carriedBy, "client");
+    const adj = txOf(mismatchAdjustmentDocId(refOf("c1")))!;
+    assert.equal(adj.adjustmentDirection, "credit");
+    assert.equal(adj.amount, G - Y);
+    assert.equal(adj.agentId, agent.uid);
+    assert.equal(bookingOf("c1")!.refundStatus, "completed");
+    assert.equal(await seliNet(), 0);
+    // Asked again: already resolved, nothing new.
+    const again = await resolveMismatch(admin, { refundId: topUpId, carriedBy: "client" });
+    assert.equal(again.body.data.alreadyResolved, true);
+    assert.equal(docsIn("transactions").filter(([, d]) => d.type === "refund_adjustment").length, 1);
+  });
+
+  test("retry by id works on a failed top-up: same row, flags cleared, looked up first, one live top-up", async () => {
+    const row = await flagged({ cause: "agent", X: 500_000 });
+    assert.equal((await resolveMismatch(admin, { refundId: row.id, carriedBy: "agent" })).status, 200);
+    const topUpId = mismatchTopUpDocId(refOf("c1"));
+    const sent = txOf(topUpId)!;
+    assert.equal(sent.status, "processing");
+    // Paystack fails the top-up.
+    const live = harness.paystackRefunds.get(refOf("c1"))!.find((r) => r.id === sent.providerRefundId)!;
+    live.status = "failed";
+    await webhook(refundEvent("refund.failed", refOf("c1"), { id: live.id, amount: live.amount }));
+    assert.equal(txOf(topUpId)!.status, "failed");
+
+    const out = await adminRefund(admin, { refundId: topUpId });
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(out.body.data.retried, true);
+    const topUp = txOf(topUpId)!;
+    assert.equal(topUp.status, "processing");
+    assert.equal(topUp.refundFailureReason, undefined);
+    assert.deepEqual(topUp.previousProviderRefundIds, [live.id]);
+    assert.equal(refundRows().filter((r) => r.refundTopUpOf).length, 1, "one top-up row ever");
+    const liveTopUps = harness.paystackRefunds.get(refOf("c1"))!.filter((r) => r.id !== "manual-c1" && r.status !== "failed");
+    assert.equal(liveTopUps.length, 1);
+    assert.equal(await seliNet(), 0);
+    // A live top-up is not retried again.
+    assert.equal((await adminRefund(admin, { refundId: topUpId })).status, 409);
+  });
+
+  test("the requeue on a repeated resolve clears a top-up's failure and flag fields", async () => {
+    const { row, topUpId } = await pendingTopUp();
+    harness.paystackRefunds.get(refOf("c1"))!.push({ id: "manual-d2", status: "processed", transactionReference: refOf("c1"), amount: 100_000, currency: "NGN" });
+    await webhook(refundEvent("refund.processed", refOf("c1"), { id: "manual-d2", amount: 100_000 }));
+    assert.equal(txOf(topUpId)!.refundFailureReason, "provider_refund_mismatch");
+    // d2 is reversed at Paystack (failed): a repeat resolve of the ORIGINAL
+    // requeues the top-up with its flag cleared, and it is sent.
+    harness.paystackRefunds.get(refOf("c1"))!.find((r) => r.id === "manual-d2")!.status = "failed";
+    const again = await resolveMismatch(admin, { refundId: row.id, carriedBy: "agent" });
+    assert.equal(again.body.data.alreadyResolved, true);
+    const topUp = txOf(topUpId)!;
+    assert.equal(topUp.refundFailureReason, undefined);
+    assert.equal(topUp.status, "processing");
+    assert.equal(await seliNet(), 0);
+  });
+
+  test("the adjustment and its lock reach the agent the refund was taken from (row.agentId), not the booking's new agent", async () => {
+    const row = await flagged({ cause: "client", X: 500_000 });
+    // The booking is reassigned after the refund was written.
+    patchDoc("consultations", "c1", { agentId: "uid-agent-new" });
+    const out = await resolveMismatch(admin, { refundId: row.id, carriedBy: "client" });
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    const adj = txOf(mismatchAdjustmentDocId(refOf("c1")))!;
+    assert.equal(adj.agentId, agent.uid);
+    assert.equal(adj.userId, agent.uid);
+    const locks = docsIn("withdrawalLocks");
+    assert.ok(locks.some(([id, d]) => id === agent.uid && d.lastRefundAdjustmentId === adj.id));
+    assert.ok(!locks.some(([id]) => id === "uid-agent-new"));
+  });
+
+  test("the resolve writes R explicitly: a row from before #390 (no agentReversalMinor) keeps R = P, not X", async () => {
+    // A charge with no Paystack fee (as before #390: credit C = A, R = P = A),
+    // whose refund row was written without `agentReversalMinor`.
+    await bookAndPay("c1", { fees: 0 });
+    harness.refundBehaviour.push("network");
+    await setStatus(agent, "cancelled", "c1");
+    harness.paystackRefunds.set(refOf("c1"), [
+      { id: "manual-c1", status: "processed", transactionReference: refOf("c1"), amount: 500_000, currency: "NGN" },
+    ]);
+    harness.clock.advanceHours(0.25);
+    await consultationRefundService.retryDueRefunds();
+    const row = refundRows()[0];
+    assert.equal(row.refundFailureReason, "provider_refund_mismatch");
+    assert.equal(row.agentReversalMinor, row.amount, "R = P on such a charge");
+    const P = row.amount;
+    delete txOf(row.id)!.agentReversalMinor;
+    const before = await agentTotal();
+    assert.equal((await resolveMismatch(admin, { refundId: row.id, carriedBy: "agent" })).status, 200);
+    const resolved = txOf(row.id)!;
+    assert.equal(resolved.amount, 500_000);
+    assert.equal(resolved.agentReversalMinor, P, "R stays what the row took off the agent");
+    assert.equal(await agentTotal(), before, "the agent's total does not move on the resolve");
   });
 });

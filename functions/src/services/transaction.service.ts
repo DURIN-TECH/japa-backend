@@ -790,17 +790,31 @@ class TransactionService {
       // Writing the lock is what forces a concurrent withdrawal of the same
       // agent to be retried. The fields are for a human reading the console.
       const previousCount = lockSnap.exists ? Number(lockSnap.data()?.withdrawalCount) || 0 : 0;
-      tx.set(lockRef, {
-        agentUserId,
-        lastWithdrawalId: ref.id,
-        withdrawalCount: previousCount + 1,
-        // Issue #383: WHEN this instance withdrew, on the balance clock. A
-        // refund (on another instance, maybe a slightly different clock)
-        // reads it in its own transaction and does not fund itself from a
-        // hold this withdrawal may have seen as released.
-        lastWithdrawalAt: Timestamp.fromDate(this.now()),
-        updatedAt: now,
-      });
+      // Issue #383 review round 1: the LATER of the stored time and this
+      // instance's clock. An instance running slow must never stamp an
+      // earlier time over a fast one's, or a cancel could again fund itself
+      // from a hold a withdrawal already saw released.
+      const balanceNow = Timestamp.fromDate(this.now());
+      const stored = lockSnap.exists ? (lockSnap.data()?.lastWithdrawalAt as Timestamp | undefined) : undefined;
+      const storedMs = stored && typeof stored.toMillis === "function" ? stored.toMillis() : null;
+      const lastWithdrawalAt = storedMs !== null && storedMs > balanceNow.toMillis() ? stored! : balanceNow;
+      // Merged (review round 1): the refund paths keep their own counters on
+      // this lock (`refundCount`, `feeDebitCount`, ...); a withdrawal must not wipe them.
+      tx.set(
+        lockRef,
+        {
+          agentUserId,
+          lastWithdrawalId: ref.id,
+          withdrawalCount: previousCount + 1,
+          // Issue #383: WHEN the agent last withdrew, on the balance clock. A
+          // refund (on another instance, maybe a slightly different clock)
+          // reads it in its own transaction and does not fund itself from a
+          // hold this withdrawal may have seen as released.
+          lastWithdrawalAt,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
       return transaction;
     });
   }

@@ -114,8 +114,9 @@ export const RELEASE_SKEW_MARGIN_MS = 2 * 60 * 1000;
  *
  *  - not held at `at` (released, refunded): false;
  *  - frozen (by a held refund, #390, or an open no-show report, #382) since
- *    before `releaseAt - margin`: true. The fee has counted as held ever
- *    since, so no withdrawal, on any clock, can have taken it;
+ *    before `releaseAt - margin`: true, unless the agent's last withdrawal
+ *    is at or after `releaseAt - margin` (review round 1: a withdrawal on a
+ *    clock running ahead, made before the freeze, may have taken it);
  *  - no readable `releaseAt` (a pre-#317 fee not backfilled): true (held,
  *    the safe reading, as `feeHoldStatusAt`);
  *  - otherwise true only when `at < releaseAt - margin` AND the agent's last
@@ -135,16 +136,22 @@ export function refundFundableFromHold(
   const releaseAt = millisOf(fee.feeHold?.releaseAt);
   if (releaseAt === null) return true;
   const cutoff = releaseAt - RELEASE_SKEW_MARGIN_MS;
-  // Frozen before the cutoff: held ever since, whatever the clocks say.
   const frozenAt = [
     fee.feeHoldFrozenByRefundId ? millisOf(fee.feeHoldFrozenAt) : null,
     // Issue #382: an open no-show report freezes the fee too.
     fee.feeHoldFrozenByReportId ? millisOf(fee.feeHoldFrozenByReportAt) : null,
   ].filter((v): v is number => v !== null);
-  if (frozenAt.some((ms) => ms < cutoff)) return true;
+  // The agent's last withdrawal, at or after the cutoff: it may have seen
+  // the fee released (on a clock running ahead) and paid it out, even when
+  // the fee was frozen before the cutoff on this one (review round 1, from
+  // #382 QA: a freeze only stops withdrawals AFTER it; it cannot tell a
+  // withdrawal stamped late by a fast clock from one made later). Planned
+  // from available then: the agent carries it, never Seli.
+  const withdrewNearRelease = !!lastWithdrawalAt && lastWithdrawalAt.getTime() >= cutoff;
+  // Frozen before the cutoff: held ever since, whatever this clock says.
+  if (frozenAt.some((ms) => ms < cutoff)) return !withdrewNearRelease;
   if (at.getTime() >= cutoff) return false;
-  if (lastWithdrawalAt && lastWithdrawalAt.getTime() >= cutoff) return false;
-  return true;
+  return !withdrewNearRelease;
 }
 
 /**

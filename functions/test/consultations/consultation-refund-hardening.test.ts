@@ -31,7 +31,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { useHarness, harness, docsIn, captureRes, T0 } from "./harness";
 import {
   admin, adminRefund, agent, balanceOf, bookAndPay, bookingOf, client, feeOf, getBooking, listTransactions,
-  ownerA, refOf, refundRows, reqFor, seedEarned, setStatus, TEST_PAYSTACK_SECRET,
+  ownerA, refOf, refundEvent, refundRows, reqFor, seedEarned, setStatus, TEST_PAYSTACK_SECRET, webhook,
 } from "./refund-fixtures";
 import { notificationService } from "../../src/services/notification.service";
 import {
@@ -43,7 +43,7 @@ import { consultationRoutes } from "../../src/routes/consultation.routes";
 import { agentReversalOf as reversalFromService, transactionService } from "../../src/services/transaction.service";
 import { agentReversalOf as reversalFromTotals } from "../../src/money/totals";
 import { paystackFeeJobConfig, paystackFeeService, PAYSTACK_FEE_LOOKUP_BATCH_SIZE, PAYSTACK_FEE_MAX_JOB_LOOKUPS } from "../../src/services/paystack-fee.service";
-import { toTransactionLookup, PaystackRefund } from "../../src/services/billing/paystack.provider";
+import { toTransactionLookup, PaystackRefund, paystackProvider } from "../../src/services/billing/paystack.provider";
 import { toClientTransaction } from "../../src/transactions/client-transaction";
 import type { Transaction } from "../../src/types";
 
@@ -211,9 +211,10 @@ describe("A: a Paystack refund is adopted only on an exact amount and currency m
     assert.equal(delayedNotices(), 1);
   });
 
-  test("refused path: after Paystack refuses a create, a mismatched refund it holds is not adopted and no second create is made", async () => {
+  test("a refund in another currency already at Paystack: the first try's lookup flags it; no create is made", async () => {
     await bookAndPay("c1");
-    // A refund in ANOTHER currency is already there; Paystack refuses ours.
+    // A refund in ANOTHER currency is already there (review round 1: the
+    // first try looks it up before any create, so Paystack is never asked).
     paystackHolds("c1", [paystackRefund("c1", { currency: "USD", amount: 600 })]);
     harness.refundBehaviour.push("already_reversed");
     assert.equal((await setStatus(agent, "cancelled", "c1")).status, 200);
@@ -222,7 +223,7 @@ describe("A: a Paystack refund is adopted only on an exact amount and currency m
     assert.equal(row.refundFailureReason, "provider_refund_mismatch");
     assert.equal(row.providerRefundMismatch.currency, "USD");
     assert.equal(harness.refundCalls.length, 0);
-    assert.equal(harness.refundLookups.length, 1, "looked up once, after the refusal");
+    assert.equal(harness.refundLookups.length, 1, "looked up once, before any create");
     assert.equal(delayedNotices(), 1);
   });
 
@@ -268,6 +269,265 @@ describe("A: a Paystack refund is adopted only on an exact amount and currency m
 });
 
 // ============================================
+// A on the webhook path (review round 1): a webhook adopts only an exact
+// refund, and never moves a mismatch-flagged row
+// ============================================
+
+describe("A (webhook path, review round 1): a refund webhook adopts only an exact match and never moves a flagged row", () => {
+  /** The signed webhook for Paystack refund `refund` of booking `id`'s charge. */
+  async function refundHook(event: string, refund: PaystackRefund, id = "c1") {
+    const out = await webhook(refundEvent(event, refOf(id), { id: refund.id, amount: refund.amount, currency: refund.currency }));
+    assert.equal(out.status, 200, "Paystack always gets 200");
+  }
+
+  test("QA repro (A5): P = ₦9,000, a manual ₦5,000 dashboard refund flags the row; its signed refund.processed changes nothing and the resolve still runs", async () => {
+    await bookAndPay("c1", { fees: F });
+    const manual = paystackRefund("c1", { amount: 500_000, status: "pending" });
+    paystackHolds("c1", [manual]);
+    // Every try looks up first, the first one too: flagged, nothing created.
+    assert.equal((await setStatus(agent, "cancelled", "c1")).status, 200);
+    let [row] = refundRows();
+    assert.equal(row.refundFailureReason, "provider_refund_mismatch");
+    assert.equal(harness.refundCalls.length, 0);
+    const before = JSON.stringify(row);
+
+    // Paystack finishes the manual refund and tells us.
+    manual.status = "processed";
+    await refundHook("refund.processed", manual);
+    [row] = refundRows();
+    assert.equal(JSON.stringify(row), before, "the flagged row is untouched");
+    assert.equal(row.status, "failed");
+    assert.equal(row.providerRefundId, undefined);
+    assert.equal(bookingOf("c1")!.refundStatus, "failed");
+    // Other events for it change nothing either.
+    for (const event of ["refund.pending", "refund.failed"]) await refundHook(event, manual);
+    assert.equal(JSON.stringify(refundRows()[0]), before);
+    assert.equal(delayedNotices(), 1, "told once");
+
+    // The resolve can still run (it was pre-empted before this fix).
+    const { out, res } = captureRes();
+    await consultationController.resolveRefundMismatch(
+      reqFor(admin, { params: { id: "c1" }, body: { refundId: row.id, carriedBy: "agent" } }),
+      res
+    );
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(refundRows().find((r) => r.id === row.id)!.amount, 500_000, "the row says what Paystack refunded");
+  });
+
+  test("QA repro (A6): the manual refund's webhook reaches a PENDING row with no id: flagged, never completed at the planned amount", async () => {
+    await bookAndPay("c1", { fees: F });
+    harness.refundBehaviour.push("network");
+    await setStatus(agent, "cancelled", "c1");
+    assert.equal(refundRows()[0].status, "pending");
+    assert.equal(refundRows()[0].providerRefundId, undefined);
+
+    const manual = paystackRefund("c1", { amount: 500_000 });
+    paystackHolds("c1", [manual]);
+    await refundHook("refund.processed", manual);
+    const [row] = refundRows();
+    assert.equal(row.status, "failed");
+    assert.equal(row.refundFailureReason, "provider_refund_mismatch");
+    assert.equal(row.providerRefundMismatch.id, "manual-1");
+    assert.equal(row.providerRefundMismatch.amountMinor, 500_000);
+    assert.equal(row.providerRefundId, undefined);
+    assert.equal(row.amount, A, "the planned figure is left as it was");
+    assert.equal(bookingOf("c1")!.refundStatus, "failed");
+    assert.equal(delayedNotices(), 1);
+    const listed = await listTransactions(admin, { role: "admin", type: "refund", status: "failed" });
+    assert.deepEqual(listed.body.data.map((t: any) => t.id), [row.id]);
+    // The engine's next run creates nothing while it is flagged.
+    await runRetryJob();
+    assert.equal(harness.refundCalls.length, 0);
+  });
+
+  test("after an admin retry clears the flag (Paystack unreachable for its lookup), the manual refund's webhook flags it again; nothing completes", async () => {
+    await bookAndPay("c1", { fees: F });
+    const manual = paystackRefund("c1", { amount: 500_000 });
+    paystackHolds("c1", [manual]);
+    await setStatus(agent, "cancelled", "c1");
+    const flagged = refundRows()[0];
+    assert.equal(flagged.refundFailureReason, "provider_refund_mismatch");
+    // The retry's lookup fails: the row is left pending, with no id and no flag.
+    harness.failNextRefundLookup = true;
+    assert.equal((await adminRefund(admin, { refundId: flagged.id })).status, 200);
+    assert.equal(refundRows()[0].status, "pending");
+    assert.equal(refundRows()[0].refundFailureReason, undefined);
+    assert.equal(harness.refundCalls.length, 0, "no create after a failed lookup");
+
+    await refundHook("refund.processed", manual);
+    const [row] = refundRows();
+    assert.equal(row.status, "failed");
+    assert.equal(row.refundFailureReason, "provider_refund_mismatch");
+    assert.equal(row.providerRefundId, undefined);
+    assert.equal(delayedNotices(), 1, "the same Paystack refund is not announced twice");
+  });
+
+  test("a webhook of EXACTLY the row's money still adopts on a row with no id (the lost-answer case)", async () => {
+    await bookAndPay("c1", { fees: F });
+    harness.refundBehaviour.push("reached_then_network");
+    await setStatus(agent, "cancelled", "c1");
+    const ours = harness.paystackRefunds.get(refOf("c1"))![0];
+    assert.equal(refundRows()[0].providerRefundId, undefined);
+    await refundHook("refund.processed", { ...ours, status: "processed" });
+    const [row] = refundRows();
+    assert.equal(row.status, "completed");
+    assert.equal(row.providerRefundId, ours.id);
+  });
+
+  test("on a row with no id: another currency, a missing amount, no refund id, or a failed refund: nothing adopted", async () => {
+    await bookAndPay("c1", { fees: F });
+    harness.refundBehaviour.push("network");
+    await setStatus(agent, "cancelled", "c1");
+    const id = refundRows()[0].id;
+    // A refund Paystack reports failed: not adopted, the row stays pending.
+    assert.equal(
+      await consultationRefundService.handleWebhook(refundEvent("refund.failed", refOf("c1"), { id: "x1", amount: A })),
+      "unchanged"
+    );
+    // No refund id at all.
+    assert.equal(
+      await consultationRefundService.handleWebhook({ event: "refund.processed", data: { transaction_reference: refOf("c1"), amount: A, currency: "NGN", status: "processed" } }),
+      "unchanged"
+    );
+    assert.equal(refundRows()[0].status, "pending");
+    assert.equal(refundRows()[0].providerRefundId, undefined);
+    // Another currency / no amount: flagged (a pending row), never adopted.
+    assert.equal(
+      await consultationRefundService.handleWebhook(refundEvent("refund.processed", refOf("c1"), { id: "x2", currency: "USD" })),
+      "applied"
+    );
+    const row = refundRows().find((r) => r.id === id)!;
+    assert.equal(row.refundFailureReason, "provider_refund_mismatch");
+    assert.equal(row.providerRefundMismatch.currency, "USD");
+    assert.equal(row.providerRefundId, undefined);
+  });
+
+  test("a webhook for a refund that is not exactly ours never moves a row that is already processing with its own id", async () => {
+    await bookAndPay("c1", { fees: F });
+    await setStatus(agent, "cancelled", "c1");
+    const [row] = refundRows();
+    assert.equal(row.status, "processing");
+    await refundHook("refund.processed", paystackRefund("c1", { id: "manual-9", amount: 500_000 }));
+    assert.equal(refundRows()[0].status, "processing");
+    assert.equal(refundRows()[0].providerRefundId, row.providerRefundId);
+  });
+});
+
+// ============================================
+// Review round 1: the first try looks up before it creates (money leak)
+// ============================================
+
+describe("review round 1: the first try looks Paystack up before it creates a refund", () => {
+  test("an earlier dashboard refund (X <= F) on a client-caused refund is never followed by a second refund to the client", async () => {
+    await bookAndPay("c1", { fees: F });
+    // A small manual refund someone made BEFORE the cancel.
+    paystackHolds("c1", [paystackRefund("c1", { amount: F })]);
+    assert.equal((await setStatus(client, "cancelled", "c1")).status, 200);
+    const [row] = refundRows();
+    assert.equal(harness.refundCalls.length, 0, "no second refund");
+    assert.equal(harness.refundLookups.length, 1, "looked up on the first try");
+    assert.equal(row.status, "failed");
+    assert.equal(row.refundFailureReason, "provider_refund_mismatch");
+  });
+
+  test("an exact refund already at Paystack on the first try is adopted, not created again", async () => {
+    await bookAndPay("c1", { fees: F });
+    paystackHolds("c1", [paystackRefund("c1", { id: "77", status: "processing" })]);
+    await setStatus(agent, "cancelled", "c1");
+    const [row] = refundRows();
+    assert.equal(row.providerRefundId, "77");
+    assert.equal(harness.refundCalls.length, 0);
+  });
+
+  test("refused path still works: the first lookup sees nothing, Paystack refuses the create, the lookup after it flags a mismatch (no second create)", async () => {
+    await bookAndPay("c1", { fees: F });
+    const ps = paystackProvider as any;
+    const real = ps.findRefundsForTransaction;
+    let lookups = 0;
+    // The manual refund lands between our first lookup and our create.
+    ps.findRefundsForTransaction = async (reference: string) => (lookups++ === 0 ? [] : real(reference));
+    try {
+      paystackHolds("c1", [paystackRefund("c1", { currency: "USD", amount: 600 })]);
+      harness.refundBehaviour.push("already_reversed");
+      await setStatus(agent, "cancelled", "c1");
+    } finally {
+      ps.findRefundsForTransaction = real;
+    }
+    const [row] = refundRows();
+    assert.equal(lookups, 2, "before the create, and after the refusal");
+    assert.equal(row.refundFailureReason, "provider_refund_mismatch");
+    assert.equal(row.providerRefundMismatch.currency, "USD");
+    assert.equal(harness.refundCalls.length, 0);
+  });
+
+  test("a first-try lookup that fails creates nothing and leaves the row due again", async () => {
+    await bookAndPay("c1", { fees: F });
+    harness.failNextRefundLookup = true;
+    await setStatus(agent, "cancelled", "c1");
+    const [row] = refundRows();
+    assert.equal(row.status, "pending");
+    assert.equal(harness.refundCalls.length, 0);
+    await runRetryJob();
+    assert.equal(refundRows()[0].status, "processing");
+    assert.equal(harness.refundCalls.length, 1);
+  });
+});
+
+// ============================================
+// Review round 1: a re-adopted id leaves previousProviderRefundIds
+// ============================================
+
+describe("review round 1: an attempt id the engine adopts again is current, and no longer an earlier attempt", () => {
+  test("retired by a retry, found live again by the lookup: adopted; its webhooks move the row", async () => {
+    await bookAndPay("c1", { fees: F });
+    await setStatus(agent, "cancelled", "c1");
+    const first = refundRows()[0];
+    const id = first.providerRefundId;
+    // Paystack says it failed; the admin retries (the id is retired) ...
+    await webhook(refundEvent("refund.failed", refOf("c1"), { id }));
+    const live = harness.paystackRefunds.get(refOf("c1"))![0];
+    live.status = "failed";
+    harness.failNextRefundLookup = true;
+    await adminRefund(admin, { refundId: first.id });
+    assert.deepEqual(refundRows()[0].previousProviderRefundIds, [id]);
+    // ... and Paystack later reports the SAME refund live again.
+    live.status = "processing";
+    await runRetryJob();
+    const row = refundRows()[0];
+    assert.equal(row.providerRefundId, id);
+    assert.deepEqual(row.previousProviderRefundIds ?? [], [], "no longer listed as an earlier attempt");
+    await webhook(refundEvent("refund.processed", refOf("c1"), { id }));
+    assert.equal(refundRows()[0].status, "completed");
+  });
+});
+
+// ============================================
+// Review round 1: small fixes (closed copy, bad dates)
+// ============================================
+
+describe("review round 1: a closed refund never reads 'held'; a bad date filter is a 400", () => {
+  test("the client's view of a closed refund says nothing to refund", () => {
+    const view = toClientTransaction({
+      id: "r", userId: client.uid, type: "refund", amount: 0, currency: "NGN", status: "closed", isEscrow: false,
+      paymentProvider: "paystack", description: "Refund: consultation fee (held: Paystack's fee needed)",
+      createdAt: T0, updatedAt: T0,
+    } as unknown as Transaction);
+    assert.equal(view.description, "Refund: consultation fee (nothing to refund)");
+  });
+
+  test("GET /transactions?role=admin&startDate=not-a-date (or endDate) is 400 VALIDATION_ERROR, never 500", async () => {
+    for (const query of [{ startDate: "not-a-date" }, { endDate: "nope" }, { startDate: "" }]) {
+      const out = await listTransactions(admin, { role: "admin", ...query });
+      assert.equal(out.status, 400, JSON.stringify(query));
+      assert.equal(out.body.error, "VALIDATION_ERROR");
+    }
+    const agentOut = await listTransactions(agent, { startDate: "not-a-date" });
+    assert.equal(agentOut.status, 400);
+    assert.equal((await listTransactions(admin, { role: "admin", startDate: "2026-11-01" })).status, 200);
+  });
+});
+
+// ============================================
 // B. Admin close of a held client-caused refund where Paystack's fee >= the charge
 // ============================================
 
@@ -305,6 +565,8 @@ describe("B: an admin closes a held client-cancel refund (fee >= charge) as noth
     assert.equal(row.status, "closed");
     assert.equal(row.amount, 0, "still 0");
     assert.equal(row.refundClosedOutcome, "nothing_to_refund");
+    // Review round 1: no longer reads "held" once closed.
+    assert.equal(row.description, "Refund: consultation fee (nothing to refund)");
     assert.equal(row.refundClosedBy, admin.uid);
     assert.ok(row.refundClosedAt instanceof Timestamp);
     const fee = feeOf("c1")!;

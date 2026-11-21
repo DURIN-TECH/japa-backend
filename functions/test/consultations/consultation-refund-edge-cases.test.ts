@@ -159,7 +159,7 @@ describe("late refund.failed: only the row's current attempt moves it", () => {
     assert.equal(refundRows()[0].status, "processing");
   });
 
-  test("a row with no Paystack id yet takes the event as before (and stores its id)", async () => {
+  test("a row with no Paystack id yet takes an event of exactly its money (and stores its id)", async () => {
     await bookAndPay("c1", { fees: F });
     harness.refundBehaviour.push("network");
     await setStatus(agent, "cancelled", "c1");
@@ -252,6 +252,43 @@ describe("clock skew at release: from the hold only when the fee is clearly held
     // Frozen only inside the margin: not clearly held.
     const late = { ...fee, feeHoldFrozenByRefundId: "r", feeHoldFrozenAt: Timestamp.fromMillis(RELEASE_AT_MS - 1_000) };
     assert.equal(refundFundableFromHold(late, new Date(RELEASE_AT_MS + 3_600_000), null), false);
+    // Review round 1 (from #382 QA): frozen early, but the agent's last
+    // withdrawal is at or after the cutoff (a clock running ahead, maybe
+    // before the freeze): never from the hold. An older withdrawal: still the hold.
+    for (const frozenFee of [
+      frozen,
+      { ...fee, feeHoldFrozenByReportId: "rep", feeHoldFrozenByReportAt: Timestamp.fromMillis(RELEASE_AT_MS - 3_600_000) },
+    ]) {
+      assert.equal(refundFundableFromHold(frozenFee, before, new Date(RELEASE_AT_MS - RELEASE_SKEW_MARGIN_MS)), false);
+      assert.equal(refundFundableFromHold(frozenFee, new Date(RELEASE_AT_MS + 3_600_000), new Date(RELEASE_AT_MS + 60_000)), false);
+      assert.equal(refundFundableFromHold(frozenFee, new Date(RELEASE_AT_MS + 3_600_000), new Date(RELEASE_AT_MS - 3_600_000)), true);
+    }
+  });
+
+  test("review round 1: lastWithdrawalAt keeps the LATER time (a slow instance never stamps over a fast one), and the lock is merged", async () => {
+    await seedEarned("earned1", 200_000);
+    clockTo(RELEASE_AT_MS - 10 * 60_000);
+    const real = transactionService.now;
+    // A fast instance (11 min ahead) withdraws first ...
+    transactionService.now = () => new Date(harness.clock.now().getTime() + 11 * 60_000);
+    try {
+      assert.equal((await withdraw(50_000)).status, 201);
+    } finally {
+      transactionService.now = real;
+    }
+    // ... a refund path's counter on the same lock ...
+    const lockDoc = docsIn("withdrawalLocks").find(([uid]) => uid === agent.uid)![1];
+    lockDoc.refundCount = 3;
+    // ... then an instance with the right clock withdraws.
+    assert.equal((await withdraw(10_000)).status, 201);
+    const lock = docsIn("withdrawalLocks").find(([uid]) => uid === agent.uid)![1];
+    assert.equal(lock.lastWithdrawalAt.toMillis(), RELEASE_AT_MS + 60_000, "the later stamp is kept");
+    assert.equal(lock.withdrawalCount, 2);
+    assert.equal(lock.refundCount, 3, "merged: the refund counters survive a withdrawal");
+    // A later withdrawal on a correct clock moves it forward.
+    clockTo(RELEASE_AT_MS + 3_600_000);
+    assert.equal((await withdraw(10_000)).status, 201);
+    assert.equal(docsIn("withdrawalLocks").find(([uid]) => uid === agent.uid)![1].lastWithdrawalAt.toMillis(), RELEASE_AT_MS + 3_600_000);
   });
 
   test("an agent cancel 1 ms before releaseAt is funded from available (the agent carries it, -F)", async () => {

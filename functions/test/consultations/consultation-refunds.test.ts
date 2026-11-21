@@ -584,7 +584,9 @@ describe("idempotency: one charge, at most one refund", () => {
     harness.clock.advanceHours(0.25);
     run = await consultationRefundService.retryDueRefunds();
     assert.equal(run.processing, 1);
-    assert.deepEqual(harness.refundLookups, [refOf("c1")], "looked up before any repeat call");
+    // Review round 1 of #413: every try looks up first, the first one too
+    // (nothing there yet then), and the retry finds the lost one.
+    assert.deepEqual(harness.refundLookups, [refOf("c1"), refOf("c1")], "looked up before every call");
     assert.equal(harness.refundCalls.length, 1, "no second refund at Paystack");
     const [row] = refundRows();
     assert.equal(row.status, "processing");
