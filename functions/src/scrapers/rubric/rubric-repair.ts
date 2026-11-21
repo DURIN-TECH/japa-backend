@@ -62,8 +62,11 @@ export function isBar(c: Pick<AssessmentCriterion, "kind" | "appliesTo">): boole
   return c.kind === "mandatory_bar" || c.appliesTo !== undefined;
 }
 
-/** JSON with object keys sorted at every level, so equal rules always serialise equally. */
-function stableJson(value: unknown): string {
+/**
+ * JSON with object keys sorted at every level, so equal rules always serialise equally.
+ * (#440) Exported for the content fingerprint of a derived version's base (rubric.store.ts).
+ */
+export function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value && typeof value === "object") {
     const o = value as Record<string, unknown>;
