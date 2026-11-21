@@ -1972,8 +1972,18 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   feeDebitId?: string;
   /** Issue #390: on a `paystack_fee_debit` of a consultation refund, that refund row's id. */
   refundId?: string;
-  /** Paystack's id of the refund, once Paystack has one. */
+  /**
+   * Paystack's id of the refund, once Paystack has one. Issue #383: the
+   * row's CURRENT attempt: every refund the engine creates or adopts for the
+   * row replaces it, so only that attempt's webhooks move the row.
+   */
   providerRefundId?: string;
+  /**
+   * Issue #383: Paystack refund ids of the row's EARLIER attempts (replaced
+   * by a newer one, or retired by an admin retry of a failed row). Their
+   * webhooks are still recognised as ours, but change nothing.
+   */
+  previousProviderRefundIds?: string[];
   /** Paystack's own refund status as last seen ("pending", "processed", ...). */
   providerRefundStatus?: string;
   /** How many times the engine has tried (claimed) the Paystack call. */

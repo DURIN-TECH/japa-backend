@@ -157,7 +157,7 @@ import { resolvedFeeFields } from "./paystack-fee.service";
 import type { PaystackTransactionLookup } from "./billing/paystack.provider";
 import { notificationService } from "./notification.service";
 import { PaystackApiError, PaystackRefund, paystackProvider } from "./billing/paystack.provider";
-import { feeHoldStatusAt, FeeHoldStatus } from "../money/fee-hold";
+import { feeHoldStatusAt, FeeHoldStatus, refundFundableFromHold } from "../money/fee-hold";
 import { formatWithCode } from "../money/money";
 import { slotStartsAt } from "../consultations/slot-time";
 import { feeDebitDocId, refundDocId } from "../money/refund-id";
@@ -509,6 +509,57 @@ export function refundSummary(row: Transaction): RefundSummary {
  */
 const STATUS_RANK: Record<RefundStatus, number> = { pending: 0, processing: 1, failed: 2, completed: 3, closed: 4 };
 
+/**
+ * Issue #383: whether a refund webhook naming Paystack refund `id` is about
+ * the row's CURRENT attempt. Pure.
+ *  - the id is one of the row's earlier attempts: no;
+ *  - the row has a current id: only that id;
+ *  - the row has none yet: yes (applied as before #383), unless the event
+ *    names no id at all while the row has one.
+ */
+export function isCurrentAttempt(
+  row: Pick<Transaction, "providerRefundId" | "previousProviderRefundIds">,
+  id: string | undefined
+): boolean {
+  if (id && (row.previousProviderRefundIds ?? []).includes(id)) return false;
+  if (row.providerRefundId) return id === row.providerRefundId;
+  return true;
+}
+
+/**
+ * Issue #383: the update that retires a failed row's current Paystack
+ * attempt on an admin retry: its id moves to `previousProviderRefundIds`
+ * (still recognised as ours, never applied) and the row has no current
+ * attempt until the engine records the next one. Empty when there is none.
+ */
+function retireAttempt(row: Pick<Transaction, "providerRefundId" | "previousProviderRefundIds">): Record<string, unknown> {
+  if (!row.providerRefundId) return {};
+  return {
+    providerRefundId: FieldValue.delete(),
+    providerRefundStatus: FieldValue.delete(),
+    // The whole list, written from the row read in the same transaction
+    // (so it is exact without needing arrayUnion).
+    previousProviderRefundIds: withPreviousId(row, row.providerRefundId),
+  };
+}
+
+/** The row's earlier attempt ids plus `id`, once, in order. Pure. */
+function withPreviousId(row: Pick<Transaction, "previousProviderRefundIds">, id: string): string[] {
+  return [...(row.previousProviderRefundIds ?? []).filter((x) => x !== id), id];
+}
+
+/** `retireAttempt` applied to the row in memory (for the answer). */
+function retiredInMemory(row: Transaction): Transaction {
+  if (!row.providerRefundId) return row;
+  const next: Transaction = {
+    ...row,
+    previousProviderRefundIds: withPreviousId(row, row.providerRefundId),
+  };
+  delete next.providerRefundId;
+  delete next.providerRefundStatus;
+  return next;
+}
+
 /** How a Paystack refund for a charge compares with our row (issue #413 A, see `matchProviderRefund`). */
 export type ProviderRefundMatch =
   /** No refund of the charge that did not fail: nothing to adopt. */
@@ -653,6 +704,14 @@ export interface RefundContext {
   fee: Transaction | null;
   /** The fee's hold at the server clock. */
   feeHold: FeeHoldStatus | null;
+  /**
+   * Issue #383: whether a refund written now may be paid OUT OF THE HOLD
+   * (`refundFundableFromHold`: clearly held, not within the skew margin of
+   * `releaseAt`, and no withdrawal of the agent's at or after that margin).
+   * False: it is planned from the available balance, exactly as a released
+   * fee. The agent side's cancel refusal still reads `feeHold`.
+   */
+  fundFromHold: boolean;
   /** The deterministic refund row (exists when this charge was refunded already). */
   refundRef: FirebaseFirestore.DocumentReference | null;
   /** That row, when it exists. */
@@ -731,7 +790,7 @@ export async function readRefundContext(
   const lockRef = collections.withdrawalLocks.doc(booking.agentId);
   if (!fee) {
     return {
-      fee: null, feeHold: null, refundRef: null, existingRefund: null, debitRef: null, debitExists: false,
+      fee: null, feeHold: null, fundFromHold: false, refundRef: null, existingRefund: null, debitRef: null, debitExists: false,
       lockRef, lockData: null, availableInFeeCurrency: null,
     };
   }
@@ -742,6 +801,13 @@ export async function readRefundContext(
   const lockSnap = await tx.get(lockRef);
   const feeHold = feeHoldStatusAt(fee, at);
   const existingRefund = refundSnap.exists ? (refundSnap.data() as Transaction) : null;
+  const lockData = lockSnap.exists ? (lockSnap.data() as Record<string, unknown>) : null;
+  // Issue #383: one clock (`at`, read once by the caller's transaction) and
+  // the agent's last withdrawal from the lock read just above.
+  const lastWithdrawal = lockData?.lastWithdrawalAt as { toMillis?: () => number } | undefined;
+  const lastWithdrawalAt =
+    lastWithdrawal && typeof lastWithdrawal.toMillis === "function" ? new Date(lastWithdrawal.toMillis()) : null;
+  const fundFromHold = refundFundableFromHold(fee, at, lastWithdrawalAt);
   let availableInFeeCurrency: number | null = null;
   // A row HELD for an admin (#390) is still to be worked out: it may come
   // off the available balance when it goes ahead, so read it then too.
@@ -760,12 +826,13 @@ export async function readRefundContext(
   return {
     fee,
     feeHold,
+    fundFromHold,
     refundRef,
     existingRefund,
     debitRef,
     debitExists: debitSnap.exists,
     lockRef,
-    lockData: lockSnap.exists ? (lockSnap.data() as Record<string, unknown>) : null,
+    lockData,
     availableInFeeCurrency,
   };
 }
@@ -792,7 +859,8 @@ export interface PlannedRefund {
  *  - Paystack's fee: stored on the fee row first, else the lookup
  *    (`feeForRefund`). A #395 "unknown" row the lookup resolves is credited
  *    A - F from now on (`resolveFee`), and planned on that credit;
- *  - funded from "available" only when the fee is released AND credits the
+ *  - funded from "available" only when the fee is not CLEARLY held (released,
+ *    or, issue #383, within the skew margin of its release) AND credits the
  *    agent something; a fee credited nowhere (#395 fee >= A) is refunded as
  *    "hold" (nothing of it reached the agent);
  *  - C (the credit) is `consultationFeeCredit` of the fee row as it will be.
@@ -815,7 +883,10 @@ export function planRefund(
       : null;
   const effective = { ...fee, ...(resolveFee ?? {}) } as Transaction;
   const credit = consultationFeeCredit(effective);
-  const fundedFrom = ctx.feeHold === "released" && credit !== null ? "available" : "hold";
+  // Issue #383: from the hold only when it is CLEARLY held (`fundFromHold`);
+  // a fee at or near its release, or one a withdrawal may have seen
+  // released, is planned from available exactly as a released one.
+  const fundedFrom = !ctx.fundFromHold && credit !== null ? "available" : "hold";
   const plan = planCancellationRefund({
     amountMinor: fee.amount,
     creditMinor: credit ?? 0,
@@ -1236,11 +1307,14 @@ class ConsultationRefundService {
           refundLeaseUntil: FieldValue.delete(),
           refundFailedAt: FieldValue.delete(),
           refundFailureReason: FieldValue.delete(),
+          // Issue #383: the failed attempt is over; its id is kept as an
+          // earlier attempt, so its late webhooks change nothing.
+          ...retireAttempt(existing),
           updatedAt: now,
         };
         tx.update(ctx.refundRef!, retry);
         tx.update(ref, { refundStatus: "pending", updatedAt: now });
-        const row = { ...existing, status: "pending", refundAttempts: 0, refundNextAttemptAt: now, updatedAt: now } as Transaction;
+        const row = { ...retiredInMemory(existing), status: "pending", refundAttempts: 0, refundNextAttemptAt: now, updatedAt: now } as Transaction;
         delete row.refundLeaseUntil;
         delete row.refundFailedAt;
         delete row.refundFailureReason;
@@ -1480,10 +1554,14 @@ class ConsultationRefundService {
         refundNextAttemptAt: now,
         refundLeaseUntil: FieldValue.delete(),
         refundFailedAt: FieldValue.delete(),
+        // Issue #413 (A) / #383: as for a booking's refund.
+        refundFailureReason: FieldValue.delete(),
+        ...retireAttempt(row),
         updatedAt: now,
       });
       if (exceptionSnap.exists) tx.update(exceptionRef, { status: "open", updatedAt: now });
-      const next = { ...row, status: "pending", refundAttempts: 0, refundNextAttemptAt: now, updatedAt: now } as Transaction;
+      const next = { ...retiredInMemory(row), status: "pending", refundAttempts: 0, refundNextAttemptAt: now, updatedAt: now } as Transaction;
+      delete next.refundFailureReason;
       delete next.refundLeaseUntil;
       delete next.refundFailedAt;
       return { kind: "retried" as const, refund: next };
@@ -1746,9 +1824,12 @@ class ConsultationRefundService {
 
     if (mismatch) return this.flagProviderMismatch(refundId, mismatch);
     if (found) {
+      // Issue #383: whatever was created or adopted is the row's CURRENT
+      // attempt; an older id is kept in `previousProviderRefundIds`.
       const outcome = await this.advanceRefundStatus(refundId, refundStatusFromPaystack(found.status), {
         providerRefundId: found.id,
         providerRefundStatus: found.status,
+        source: "engine",
       });
       return outcome.row;
     }
@@ -1882,7 +1963,21 @@ class ConsultationRefundService {
   async advanceRefundStatus(
     refundId: string,
     target: RefundStatus,
-    extra: { providerRefundId?: string; providerRefundStatus?: string } = {}
+    extra: {
+      providerRefundId?: string;
+      providerRefundStatus?: string;
+      /**
+       * Issue #383: who reports it.
+       *  - "engine": a refund `processRefund` just created or adopted: it
+       *    becomes the row's CURRENT attempt (`providerRefundId` replaced, the
+       *    older id kept in `previousProviderRefundIds`);
+       *  - "webhook": a Paystack event. It moves the row only when its refund
+       *    id IS the current attempt (or the row has none yet and the id is
+       *    not an earlier attempt's); anything else changes nothing;
+       *  - omitted (internal callers, tests): as before #383.
+       */
+      source?: "engine" | "webhook";
+    } = {}
   ): Promise<{ changed: boolean; row: Transaction | null }> {
     const ref = collections.transactions.doc(refundId);
     const result = await chargeRuntime.runTransaction<{ changed: boolean; row: Transaction | null }>(async (tx) => {
@@ -1895,26 +1990,55 @@ class ConsultationRefundService {
         console.warn(`[refund] ${refundId} is held for an admin (${row.refundHeldReason}); status event ignored`);
         return { changed: false, row };
       }
+      // Issue #383: a webhook for an EARLIER attempt of this row (or for a
+      // refund that is not the current one) is ours, but changes nothing:
+      // a late `refund.failed` of attempt 1 must not fail attempt 2.
+      if (extra.source === "webhook" && !isCurrentAttempt(row, extra.providerRefundId)) {
+        console.warn(
+          `[refund] ${refundId}: webhook for Paystack refund ${extra.providerRefundId ?? "(no id)"} is not the current ` +
+            `attempt (${row.providerRefundId ?? "none"}); unchanged`
+        );
+        return { changed: false, row };
+      }
       // The booking (#317), or the exception of an unapplied payment (#354).
       const mirror = mirrorTarget(row);
       const mirrorSnap = mirror ? await tx.get(mirror.ref) : null;
       const current = row.status as RefundStatus;
       const now = Timestamp.fromDate(chargeRuntime.now());
       const forward = (STATUS_RANK[target] ?? -1) > (STATUS_RANK[current] ?? 0);
-      const newId = !!extra.providerRefundId && row.providerRefundId !== extra.providerRefundId && !row.providerRefundId;
+      // A refund id to store: one we never had, or (issue #383) the engine's
+      // new current attempt replacing an older one, which is kept.
+      const replacing =
+        extra.source === "engine" && !!extra.providerRefundId && !!row.providerRefundId && row.providerRefundId !== extra.providerRefundId;
+      const newId = !!extra.providerRefundId && row.providerRefundId !== extra.providerRefundId && (!row.providerRefundId || replacing);
+      const idFields: Record<string, unknown> = newId
+        ? {
+          providerRefundId: extra.providerRefundId,
+          ...(replacing ? { previousProviderRefundIds: withPreviousId(row, row.providerRefundId!) } : {}),
+        }
+        : {};
+      /** The row in memory with the id fields applied. */
+      const withId = (base: Transaction): Transaction =>
+        newId
+          ? {
+            ...base,
+            providerRefundId: extra.providerRefundId,
+            ...(replacing ? { previousProviderRefundIds: withPreviousId(row, row.providerRefundId!) } : {}),
+          }
+          : base;
 
       if (!forward) {
-        // Nothing moves backward. Only fill in a refund id we never had.
+        // Nothing moves backward. Only store a refund id (see above).
         if (!newId) return { changed: false, row };
-        tx.update(ref, { providerRefundId: extra.providerRefundId, updatedAt: now });
-        return { changed: false, row: { ...row, providerRefundId: extra.providerRefundId, updatedAt: now } };
+        tx.update(ref, { ...idFields, updatedAt: now });
+        return { changed: false, row: withId({ ...row, updatedAt: now }) };
       }
 
       const update: Record<string, unknown> = {
         status: target,
         refundLeaseUntil: FieldValue.delete(),
         updatedAt: now,
-        ...(newId ? { providerRefundId: extra.providerRefundId } : {}),
+        ...idFields,
         ...(extra.providerRefundStatus ? { providerRefundStatus: extra.providerRefundStatus } : {}),
         ...(target === "completed" ? { refundedAt: now } : {}),
         ...(target === "failed" ? { refundFailedAt: now } : {}),
@@ -1968,14 +2092,22 @@ class ConsultationRefundService {
       const q = await collections.transactions.where("providerRefundId", "==", providerId).limit(1).get();
       if (!q.empty) rowId = q.docs[0].id;
     }
+    // Issue #383: an earlier attempt's id is still ours (it changes nothing).
+    if (!rowId && providerId) {
+      const q = await collections.transactions.where("previousProviderRefundIds", "array-contains", providerId).limit(1).get();
+      if (!q.empty) rowId = q.docs[0].id;
+    }
     if (!rowId) {
       console.warn(`[refund webhook] ${event} for an unknown refund (reference ${reference || "-"}, id ${providerId || "-"}); ignored`);
       return "unknown_refund";
     }
     const status = typeof refund.status === "string" ? refund.status.toLowerCase() : event.slice("refund.".length);
+    // Issue #383: only the row's CURRENT attempt moves it (checked inside
+    // the transaction, so a retry that just started attempt 2 always wins).
     const outcome = await this.advanceRefundStatus(rowId, target, {
       ...(providerId ? { providerRefundId: providerId } : {}),
       providerRefundStatus: status,
+      source: "webhook",
     });
     return outcome.changed ? "applied" : "unchanged";
   }

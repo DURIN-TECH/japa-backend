@@ -780,6 +780,11 @@ class TransactionService {
         agentUserId,
         lastWithdrawalId: ref.id,
         withdrawalCount: previousCount + 1,
+        // Issue #383: WHEN this instance withdrew, on the balance clock. A
+        // refund (on another instance, maybe a slightly different clock)
+        // reads it in its own transaction and does not fund itself from a
+        // hold this withdrawal may have seen as released.
+        lastWithdrawalAt: Timestamp.fromDate(this.now()),
         updatedAt: now,
       });
       return transaction;

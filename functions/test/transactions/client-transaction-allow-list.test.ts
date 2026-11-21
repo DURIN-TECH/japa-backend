@@ -180,6 +180,8 @@ const FULL_ROW: Required<Transaction> = {
   refundClosedOutcome: "nothing_to_refund",
   paystackFeeLookupAttempts: 7,
   paystackFeeSetAsideAt: Timestamp.fromMillis(1_755_555_565_000),
+  // ---- Issue #383: Paystack ids of the row's earlier refund attempts (hidden) ----
+  previousProviderRefundIds: ["HIDDEN-earlier-refund-id"],
 };
 
 /**
@@ -280,6 +282,8 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   "refundClosedOutcome",
   "paystackFeeLookupAttempts",
   "paystackFeeSetAsideAt",
+  // Issue #383: Paystack refund ids.
+  "previousProviderRefundIds",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */

@@ -83,6 +83,62 @@ export function feeHoldStatusAt(
   return "held";
 }
 
+// ============================================
+// Issue #383: clock skew at release
+// ============================================
+//
+// Two server instances' clocks can disagree by a little. A cancel on an
+// instance whose clock is a minute BEHIND could see a fee still "held" that a
+// withdrawal on an instance a minute AHEAD already saw "released" and paid
+// out. Funding that refund "from the hold" would then give back money that
+// is no longer there (Seli would carry it). So a refund is funded from the
+// hold only when the fee is clearly held: the transaction's own clock is
+// more than a margin before `releaseAt`, AND the agent's last withdrawal
+// (stamped on `withdrawalLocks/{agentUid}`, read in the same transaction) is
+// not at or after `releaseAt - margin`. Otherwise it is planned exactly as a
+// released fee: from the agent's available balance (#351, the agent carries
+// it; never Seli).
+
+/** Issue #383: how close to `releaseAt` a held fee stops funding a refund from the hold, in ms. */
+export const RELEASE_SKEW_MARGIN_MS = 2 * 60 * 1000;
+
+/**
+ * Whether a refund of `fee` at time `at` may be paid OUT OF THE HOLD (issue
+ * #383). Pure. One clock: `at` is the time read once by the transaction.
+ *
+ *  - not held at `at` (released, refunded): false;
+ *  - frozen (by a held refund, #390) since
+ *    before `releaseAt - margin`: true. The fee has counted as held ever
+ *    since, so no withdrawal, on any clock, can have taken it;
+ *  - no readable `releaseAt` (a pre-#317 fee not backfilled): true (held,
+ *    the safe reading, as `feeHoldStatusAt`);
+ *  - otherwise true only when `at < releaseAt - margin` AND the agent's last
+ *    withdrawal is not at or after `releaseAt - margin`.
+ *
+ * @param fee the stored fee Transaction
+ * @param at the transaction's clock
+ * @param lastWithdrawalAt when the agent last withdrew (from their withdrawal lock), or null
+ */
+export function refundFundableFromHold(
+  fee: Pick<Transaction, "feeHold"> &
+    Partial<Pick<Transaction, "feeHoldFrozenByRefundId" | "feeHoldFrozenAt">>,
+  at: Date,
+  lastWithdrawalAt: Date | null
+): boolean {
+  if (feeHoldStatusAt(fee, at) !== "held") return false;
+  const releaseAt = millisOf(fee.feeHold?.releaseAt);
+  if (releaseAt === null) return true;
+  const cutoff = releaseAt - RELEASE_SKEW_MARGIN_MS;
+  // Frozen before the cutoff: held ever since, whatever the clocks say.
+  const frozenAt = [
+    fee.feeHoldFrozenByRefundId ? millisOf(fee.feeHoldFrozenAt) : null,
+  ].filter((v): v is number => v !== null);
+  if (frozenAt.some((ms) => ms < cutoff)) return true;
+  if (at.getTime() >= cutoff) return false;
+  if (lastWithdrawalAt && lastWithdrawalAt.getTime() >= cutoff) return false;
+  return true;
+}
+
 /**
  * The hold to stamp on a fee Transaction when its booking is paid
  * (`settlePayment`). Pure. Starts "held"; releases at slot end + 24 h.
