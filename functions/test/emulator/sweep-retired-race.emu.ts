@@ -70,6 +70,8 @@ async function seedRetiredPaid(id: string): Promise<string> {
     clientEmail: accounts.uclient.email, agentName: "uagent", type: "initial", scheduledDate: dayUtc,
     scheduledTime: "12:00", durationMinutes: 30, timezone: "Africa/Lagos", status: "pending_payment",
     paymentStatus: "pending", bookedVia: "client", ...snapshot,
+    // Issue #411: what booking creation writes (the sweep selects on it).
+    sweepSetAside: false,
     supersededCheckouts: [{
       ...snapshot, reference, supersededAt: Timestamp.fromMillis(now - 29 * HOUR_MS),
       retiredBy: "reschedule", retiredByAgentId: accounts.uagent.uid,
