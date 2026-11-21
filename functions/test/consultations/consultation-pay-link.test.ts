@@ -365,6 +365,8 @@ describe("only the hash is stored", () => {
     assert.equal(link.agencySlug, SLUG);
     assert.equal(link.usedAt, null);
     assert.equal(link.supersededAt, null);
+    // Issue #411 hand-off: the booking carries the live link's expiry.
+    assert.equal(bookingOf("c1")!.payLinkExpiresAt.toMillis(), link.expiresAt.toMillis());
     assert.ok(!allStoredText().includes(token), "not in Firestore");
     assert.ok(!JSON.stringify(notified).includes(token), "not in any notification");
     // Use it, then check the logs and the answers too.
@@ -409,6 +411,7 @@ describe("expiry and replacement", () => {
     await lateGuestPayment({ to: { date: "2026-11-14", time: "11:00" } });
     const [[, link]] = links();
     assert.equal(link.expiresAt.toDate().toISOString(), "2026-11-14T10:00:00.000Z");
+    assert.equal(bookingOf("c1")!.payLinkExpiresAt.toDate().toISOString(), "2026-11-14T10:00:00.000Z");
   });
 
   test("a newer link kills the older one (at most one live link)", async () => {
@@ -422,6 +425,8 @@ describe("expiry and replacement", () => {
     assert.equal(byId.get(hashPayLinkToken(second))!.supersededAt, null);
     assert.equal((await getLink(first)).status, 410);
     assert.equal((await getLink(second)).status, 200);
+    // The booking's payLinkExpiresAt follows the NEW link (same commit as the mint).
+    assert.equal(bookingOf("c1")!.payLinkExpiresAt.toMillis(), minted!.link.expiresAt.toMillis());
   });
 });
 
@@ -586,6 +591,8 @@ describe("used up only by a confirming payment", () => {
     assert.ok(link.usedAt, "usedAt set");
     assert.equal(link.usedAt.toMillis(), b.paidAt.toMillis(), "same commit as the confirmation");
     assert.equal(link.usedByReference, paidRef);
+    // Issue #411: left as it was when the link is used (the booking is paid).
+    assert.equal(b.payLinkExpiresAt.toMillis(), link.expiresAt.toMillis());
     assert.equal((await getLink(token)).status, 410);
     assert.equal((await payLinkCheckout(token)).status, 410);
   });

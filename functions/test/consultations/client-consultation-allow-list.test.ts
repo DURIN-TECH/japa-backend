@@ -267,7 +267,7 @@ const HIDDEN_FIELDS: readonly (keyof Consultation)[] = [
   "paidOnSupersededReference",
   // Issue #405: when the sweep's 24-hour payment grace restarted (internal clock).
   "paymentGraceStartsAt",
-  // Issue #411: the sweep's bookkeeping and a guest's pay-link expiry.
+  // Issue #411: the sweep's bookkeeping; issue #391 / #411: a guest's pay-link expiry.
   "graceRestartCount",
   "sweepSetAside",
   "sweepReview",
@@ -292,7 +292,7 @@ const HIDDEN_VALUES: readonly string[] = [
   "1733333333", // supersededAt seconds
   "1744444444", // the superseded checkout's fxRateAsOf seconds
   "1766666666", // issue #411: the sweep's bookkeeping times
-  "1777777777", // issue #411: payLinkExpiresAt seconds
+  "1777777777", // issue #391 / #411: payLinkExpiresAt seconds
   "hold", // fxRateSource
   "public_page", // bookedVia
   "NOT-IN-THE-TYPE", // the undeclared fields seeded below

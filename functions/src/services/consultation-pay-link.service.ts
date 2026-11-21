@@ -21,6 +21,9 @@
 //    start (`slotStartsAt`). A slot that already started gets no link.
 //  - ONE LIVE LINK PER BOOKING: minting a new link marks every older unused
 //    one `supersededAt` in the SAME Firestore transaction.
+//  - SWEEP HAND-OFF (#411): that transaction also sets the booking's
+//    `payLinkExpiresAt` to the new link's `expiresAt`, so the abandoned-
+//    booking sweep does not cancel the booking while the link still works.
 //  - USED UP only by a successful payment: `settlePayment` confirming the
 //    booking sets `usedAt` in its own transaction (see `readLivePayLinks` /
 //    `markPayLinksUsed`). Opening a checkout does NOT use it, so a guest who
@@ -254,7 +257,14 @@ export async function mintPayLink(
       supersededAt: null,
     };
     tx.create(linkRef, link);
-    return { token, link, booking, agencyName: agency.name };
+    // Issue #411 hand-off (decision 2026-11-21): the booking carries the live
+    // link's expiry, in this same commit, so the abandoned-booking sweep keeps
+    // a guest's booking open until the link the guest was emailed has expired
+    // (never past the slot start). A replaced link moves it to the new
+    // expiry. When the link is USED the field is left as it is: the booking
+    // is paid then, and the sweep skips paid bookings.
+    tx.update(bookingRef, { payLinkExpiresAt: link.expiresAt });
+    return { token, link, booking: { ...booking, payLinkExpiresAt: link.expiresAt }, agencyName: agency.name };
   });
 }
 
