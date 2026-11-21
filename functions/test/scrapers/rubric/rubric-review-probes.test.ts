@@ -549,6 +549,8 @@ describe("prompt version pin", () => {
     "2026-11-rubric-v12": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
     // v13 (#335): the criteria call is unchanged again (only call 2 moved), so its hash is v11's.
     "2026-11-rubric-v13": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
+    // v14 (#456): only the intake schema and prompt changed (call 2), so the criteria hash is v11's.
+    "2026-11-rubric-v14": "bed9a76d5c604471cb788d74033288b1ba3948207f73cedbac1569c5227b0a06",
   };
   // v5 onwards: the intake prompt and its schema are pinned too (call 2),
   // so a change to either also needs a version bump.
@@ -576,6 +578,9 @@ describe("prompt version pin", () => {
     // Re-pinned again in fix round 2 of #335 (a rule with list lines: the step words come from one
     // list line, never the lead-in quote). Same version for the same reason: still unpushed, never sent.
     "2026-11-rubric-v13": "f70a8d439510944655f8ead19cc26edbe8cc12274f2b25b685bba6ff492c47f3",
+    // v14 (#456): the intake schema fits the provider's grammar limit (string condition values,
+    // required `competenceSteps` and `optionsFrom`); the prompt says how to write them.
+    "2026-11-rubric-v14": "a35ad4c1919b1e99be8139375f377f504270c8893d2dc9382791d8766b1d24ef",
   };
 
   test("the system prompt and output schema match the hash pinned for RUBRIC_PROMPT_VERSION", () => {

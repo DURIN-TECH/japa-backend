@@ -38,6 +38,8 @@ import {
   buildRepairRequest,
   buildRubricRequest,
   parseRubricOutput,
+  conditionValueFor,
+  typeConditionValues,
   type RepairRuleView,
   type RubricRouteContext,
   type RawCriterion,
@@ -1094,12 +1096,24 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
         discards.push({ itemType: "intake_question", reason: "unresolved_reference", detail: "its show-when condition names a question that is not in the rubric", label: safeLabel(q.label), sourceId: "", chunkIndex: -1 });
         questions.delete(id);
         removed = true;
+      } else if (conds.some((c) => conditionValueFor(c.value, (questions.get(c.questionId) as IntakeQuestion).answerType) === undefined)) {
+        // (#456) The value does not fit the answer type of the question it
+        // reads (only reachable for a condition on a question of a LATER
+        // excerpt: every other one was typed and checked when its answer
+        // arrived, `typeConditionValues`). It is handled like a condition on
+        // an unknown question: the question goes, never with a mistyped value.
+        const q = questions.get(id) as IntakeQuestion;
+        discards.push({ itemType: "intake_question", reason: "unresolved_reference", detail: "its show-when condition value does not fit the question it reads", label: safeLabel(q.label), sourceId: "", chunkIndex: -1 });
+        questions.delete(id);
+        removed = true;
       }
     }
   }
+  /** (#456) The stored value of a condition on a question that is in the rubric (checked to fit above / below). */
+  const typed = (c: { questionId: string; value: string | number | boolean }) => conditionValueFor(c.value, (questions.get(c.questionId) as IntakeQuestion).answerType) as string | number | boolean;
   for (const [id, conds] of conditions) {
     const q = questions.get(id);
-    if (q && conds.length > 0) q.showWhen = { anyOf: conds.map((c) => ({ questionId: c.questionId, op: c.op, value: c.value })) };
+    if (q && conds.length > 0) q.showWhen = { anyOf: conds.map((c) => ({ questionId: c.questionId, op: c.op, value: typed(c) })) };
   }
 
   // ---- evidence triggers ----
@@ -1115,11 +1129,18 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
       evidence.delete(key);
       continue;
     }
+    // (#456) Same rule as for show-when conditions above: a value that does not
+    // fit its question (a later excerpt's question) is never stored.
+    if (conds.some((c) => conditionValueFor(c.value, (questions.get(c.questionId) as IntakeQuestion).answerType) === undefined)) {
+      discards.push({ itemType: "evidence_item", reason: "unresolved_reference", detail: "its trigger value does not fit the question it reads", label: safeLabel(item.title), sourceId: "", chunkIndex: -1 });
+      evidence.delete(key);
+      continue;
+    }
     const sameQuestion = conds.every((c) => c.questionId === conds[0].questionId && c.op === "eq");
-    if (conds.length === 1) item.when = { questionId: conds[0].questionId, op: conds[0].op, value: conds[0].value };
-    else if (sameQuestion) item.when = { questionId: conds[0].questionId, op: "in", value: conds.map((c) => String(c.value)) };
+    if (conds.length === 1) item.when = { questionId: conds[0].questionId, op: conds[0].op, value: typed(conds[0]) };
+    else if (sameQuestion) item.when = { questionId: conds[0].questionId, op: "in", value: conds.map((c) => String(typed(c))) };
     else {
-      item.when = { questionId: conds[0].questionId, op: conds[0].op, value: conds[0].value };
+      item.when = { questionId: conds[0].questionId, op: conds[0].op, value: typed(conds[0]) };
       simplifiedTriggers++;
     }
   }
@@ -1167,14 +1188,31 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
   let competence: CompetenceBlock | undefined;
   if (pendingSteps.length > 0) {
     const steps: CompetenceStep[] = [];
-    let broken = false;
+    // The code word of the first step that cannot even be built (none = every step built).
+    let broken: string | undefined;
     for (const { criterionId, raw: st } of pendingSteps) {
       const c = criterionId !== undefined ? byId.get(criterionId) : undefined;
       if (!c) {
-        broken = true;
+        broken = "competence_rule_unknown";
         break;
       }
-      const when = (st.whenAllOf ?? []).map((w) => ({ questionId: w.questionId, op: w.op, value: w.value }));
+      // (#456) Each condition's value is typed against the question it reads.
+      // A value that does not fit (a later excerpt's question: every other one
+      // was checked when its answer arrived) breaks the step, and so the whole
+      // block, under the condition code `competenceProblems` uses. A condition
+      // on a question that is not in the rubric keeps its value as written and
+      // is refused by `competenceProblems` (competence_condition_invalid), as before.
+      const when: CompetenceStep["when"] & object = [];
+      for (const w of st.whenAllOf ?? []) {
+        const q = questions.get(w.questionId);
+        const value = q ? conditionValueFor(w.value, q.answerType) : w.value;
+        if (value === undefined) {
+          broken = "competence_condition_invalid";
+          break;
+        }
+        when.push({ questionId: w.questionId, op: w.op, value });
+      }
+      if (broken) break;
       steps.push({
         criterionId: c.criterionId,
         questionId: st.questionId,
@@ -1185,7 +1223,7 @@ export function mergeAssessments(parts: readonly { chunk: Pick<SourceChunk, "sou
       });
     }
     const candidate = broken ? undefined : { steps };
-    const problems = candidate ? competenceProblems({ competence: candidate, criteria, intakeQuestions: [...questions.values()] }) : [{ code: "competence_rule_unknown" }];
+    const problems = candidate ? competenceProblems({ competence: candidate, criteria, intakeQuestions: [...questions.values()] }) : [{ code: broken as string }];
     if (candidate && problems.length === 0) {
       competence = candidate;
       // The rule a step rests on reads its question: link them, so the
@@ -1723,6 +1761,22 @@ function acceptedOf(rule: AssessmentCriterion): AcceptedCriterion {
   };
 }
 
+/**
+ * (#456) Type the condition values of a call 2 answer (`typeConditionValues`)
+ * and turn a refusal into the stop a schema mismatch gives (`callModelOnce`):
+ * `RunStop("failed", "invalid_model_output")` with the same detail format
+ * (message plus at most 3 problem PATHS, never the model's text). The answer's
+ * tokens were already counted by the call.
+ */
+function typedIntakeAnswer(raw: RawRubricOutput, known: readonly KnownQuestionView[]): RawRubricOutput {
+  try {
+    return typeConditionValues(raw, known);
+  } catch (err) {
+    if (!(err instanceof RubricOutputError)) throw err;
+    throw new RunStop("failed", "invalid_model_output", `${err.message}${err.problems.length > 0 ? `: ${err.problems.slice(0, 3).join("; ")}` : ""}`);
+  }
+}
+
 export class RubricExtractionService {
   /** @param deps overrides for tests; production passes nothing. */
   constructor(private readonly deps: RubricExtractionDeps = {}) {}
@@ -2181,7 +2235,10 @@ export class RubricExtractionService {
     // and the questions asked in earlier excerpts go too, so the question
     // that establishes an activity is asked once and reused.
     const raw = await this.callModel(buildIntakeRequest(chunk, acceptedViewOf(criteriaPart), ctx.limits, route, known), usage, attempts, opts);
-    return assessChunkOutput(raw, chunk, index, base, ctx.severityLevels);
+    // (#456) The condition values the v14 schema no longer types: typed and
+    // checked here, before anything is built from the answer (a misfit is a
+    // failed answer, `invalid_model_output`, as a schema mismatch is).
+    return assessChunkOutput(typedIntakeAnswer(raw, known), chunk, index, base, ctx.severityLevels);
   }
 
   /**
@@ -2391,7 +2448,8 @@ export class RubricExtractionService {
   ): Promise<CompetenceDraftOutcome> {
     const built = competenceStepsRequest(input.rule, input.index, input.routeName, input.limits, input.known);
     if ("notFound" in built) return { kind: "invalid", detail: `quote_${built.notFound}`, flags: [] };
-    const raw = await this.callModel(built.request, usage, attempts, opts);
+    // (#456) Condition values typed and checked exactly as in drafting (`runIntakeStep`).
+    const raw = typedIntakeAnswer(await this.callModel(built.request, usage, attempts, opts), input.known);
     // The SAME validation as any call 2 answer; citations come from the rule's own source.
     const base: CitationBase = {
       sourceId: input.rule.source.sourceId,

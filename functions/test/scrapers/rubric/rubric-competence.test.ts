@@ -386,8 +386,9 @@ describe("drafting (mergeAssessments)", () => {
 
 describe("prompt", () => {
   // (#335) v13: call 2 is shown list lines and a step may rest on one; re-draft and check still unchanged.
-  test("versions: drafting moved to v13; re-draft and check unchanged", () => {
-    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v13");
+  // (#456) v14: the intake schema fits the provider's grammar limit (call 2 only).
+  test("versions: drafting moved to v14; re-draft and check unchanged", () => {
+    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v14");
     assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v5");
     assert.equal(CHECKER_PROMPT_VERSION, "2026-11-checker-v7");
   });
@@ -399,8 +400,17 @@ describe("prompt", () => {
     for (const w of ["Schengen", "European", "EU", "Union", "Member State"]) assert.ok(!new RegExp(`\\b${w}\\b`).test(RUBRIC_INTAKE_SYSTEM_PROMPT), `names ${w}`);
   });
 
-  test("an intake answer without competenceSteps (every recording before v12) parses exactly as before", () => {
-    const out = parseRubricOutput(JSON.stringify({ intakeQuestions: [], evidenceItems: [], ruleTriggers: [], suspiciousPassages: [] }), buildIntakeOutputSchema());
+  // (#456) From v14 the list is REQUIRED (one optional parameter fewer): "none" is an empty list,
+  // which reads exactly as an answer without steps did before.
+  test("an intake answer with an EMPTY competenceSteps list parses exactly as one without steps did before v14", () => {
+    const out = parseRubricOutput(JSON.stringify({ intakeQuestions: [], evidenceItems: [], ruleTriggers: [], competenceSteps: [], suspiciousPassages: [] }), buildIntakeOutputSchema());
     assert.equal("competenceSteps" in out, false);
+  });
+
+  test("(#456) an intake answer that leaves competenceSteps out is refused (it is required from v14)", () => {
+    assert.throws(
+      () => parseRubricOutput(JSON.stringify({ intakeQuestions: [], evidenceItems: [], ruleTriggers: [], suspiciousPassages: [] }), buildIntakeOutputSchema()),
+      (err: Error & { problems?: string[] }) => (err.problems ?? []).includes("$.competenceSteps: missing")
+    );
   });
 });

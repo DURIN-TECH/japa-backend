@@ -368,6 +368,29 @@ describe("rubric extraction: nothing the model writes reaches a log or a stored 
     assert.doesNotMatch(everything, /LEAK-/);
     assert.match(result.error as string, /\$\.criteria\[0\]: has a property that is not allowed/);
   });
+
+  // (#456) A condition value is a string in the v14 schema; code checks it fits its question.
+  // A misfit is a FAILED answer, exactly as a schema mismatch: same stop code, paths only.
+  test("an intake answer whose condition value does not fit its yes_no question fails the run like a schema mismatch", async () => {
+    const out: any = routeAAnswer();
+    out.intakeQuestions.find((q: any) => q.id === "sponsor_full_name").showWhenAnyOf[0].value = "LEAK-VALUE-4561";
+    await setUpRouteA(h, out);
+    const { result, lines } = await runA(h);
+    assert.equal(result.reasonCode, "invalid_model_output");
+    assert.match(result.error as string, /\$\.intakeQuestions\[2\]\.showWhenAnyOf\[0\]\.value: does not fit the answer type of the question it reads/);
+    const everything = `${lines.join("\n")}\n${JSON.stringify(result)}\n${JSON.stringify(runDocs())}`;
+    assert.doesNotMatch(everything, /LEAK-/);
+    // Never a partial pass: no version was written.
+    assert.deepEqual(versionPaths(), []);
+  });
+
+  test("(#456) the stored show-when value of a yes_no question is still a boolean", async () => {
+    await setUpRouteA(h);
+    await runA(h);
+    const rubric = versionDoc(KEY_A, 1) as VisaRubric;
+    const q = rubric.intakeQuestions.find((x) => x.id === "sponsor_full_name");
+    assert.deepEqual(q?.showWhen, { anyOf: [{ questionId: "has_sponsor", op: "eq", value: true }] });
+  });
 });
 
 describe("rubric extraction: a PDF source", () => {

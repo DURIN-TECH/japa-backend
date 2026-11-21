@@ -215,16 +215,38 @@ export function criteriaWire(a: RawRubricOutput): string {
   return wire({ criteria, ...(a.intentPolarity ? { intentPolarity: a.intentPolarity } : {}), suspiciousPassages: a.suspiciousPassages });
 }
 
-/** The intake half of an answer (call 2). */
+/**
+ * (#456) An intake answer (call 2) written the way the v14 schema asks for it,
+ * from the typed shape tests describe answers in: every condition `value` as a
+ * STRING (`true` -> "true", `3` -> "3"), `optionsFrom` given on every question
+ * ("none" unless it is a destination question) and `competenceSteps` always
+ * present (an empty list = none). The MEANING of the answer is unchanged: code
+ * types each value back (`typeConditionValues`), so the stored rulebook is the
+ * one the typed answer produced before v14. Mutates nothing; returns a copy.
+ */
+export function v14IntakeAnswer<T extends Record<string, any>>(a: T): T {
+  /** One condition list with its values written as strings. */
+  const conds = (list: unknown) => (Array.isArray(list) ? list.map((c: any) => ({ ...c, value: String(c.value) })) : list);
+  return {
+    ...a,
+    intakeQuestions: (a.intakeQuestions ?? []).map((q: any) => ({ ...q, showWhenAnyOf: conds(q.showWhenAnyOf), optionsFrom: q.optionsFrom ?? "none" })),
+    evidenceItems: (a.evidenceItems ?? []).map((e: any) => ({ ...e, ...(e.showWhenAnyOf ? { showWhenAnyOf: conds(e.showWhenAnyOf) } : {}) })),
+    competenceSteps: (a.competenceSteps ?? []).map((st: any) => ({ ...st, whenAllOf: conds(st.whenAllOf) })),
+  };
+}
+
+/** The intake half of an answer (call 2), in the v14 wire form (see `v14IntakeAnswer`). */
 export function intakeWire(a: RawRubricOutput): string {
-  return wire({
+  return wire(v14IntakeAnswer({
     ...(a.intake ? { intake: a.intake } : {}),
     intakeQuestions: a.intakeQuestions,
     evidenceItems: a.evidenceItems.map((e) => ({ ...e, showWhenAnyOf: e.showWhenAnyOf ?? [] })),
     // (#207) The schema requires the list; an empty one is a valid answer.
     ruleTriggers: a.ruleTriggers ?? [],
+    // (#456) Required from v14: an answer that drafts none gives an empty list.
+    competenceSteps: a.competenceSteps ?? [],
     suspiciousPassages: [],
-  });
+  }));
 }
 
 /**
