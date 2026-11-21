@@ -2,8 +2,14 @@
 // Public pay-link routes (issue #391) — NO AUTH
 // ============================================
 //
-//   GET  /consultations/public/pay-links/:token           the booking summary + today's price
-//   POST /consultations/public/pay-links/:token/checkout  open (or reuse) a checkout on it
+//   POST /consultations/public/pay-links/lookup    { token }  the booking summary + today's price
+//   POST /consultations/public/pay-links/checkout  { token }  open (or reuse) a checkout on it
+//
+// THE TOKEN IS IN THE BODY, NEVER IN A URL (orchestrator decision
+// 2026-11-21): a path or query string lands in Cloud Run and hosting request
+// logs; a JSON body does not, and nothing here logs a request body. The
+// email links to the portal with the token in the URL fragment
+// (`/a/<slug>/pay#t=<token>`), which the browser never sends anywhere.
 //
 // A guest whose payment was refunded after the agent moved the booking
 // (#354, `paid_for_rescheduled_slot`) gets a one-time link by email
@@ -14,8 +20,8 @@
 //
 // ANSWERS (in the order they are checked, both routes)
 //  - 429 RATE_LIMITED: too many requests from this IP (routes file);
-//  - 400 VALIDATION_ERROR: the token is not 43 base64url characters. No
-//    Firestore read at all;
+//  - 400 VALIDATION_ERROR: `body.token` is missing, not a string, or not 43
+//    base64url characters. No Firestore read at all;
 //  - 410 PAY_LINK_INVALID, ONE body for every dead case (unknown, expired,
 //    used, superseded, or the booking is no longer `pending_payment`): never
 //    says which, and nothing is written;
@@ -110,6 +116,12 @@ export function payLinkSummary(resolved: ResolvedPayLink): Record<string, unknow
   };
 }
 
+/** The token from a JSON body (`{ token }`); anything else is undefined. Never logged. */
+function tokenFrom(req: Request): unknown {
+  const body = req.body as { token?: unknown } | undefined;
+  return body && typeof body === "object" ? body.token : undefined;
+}
+
 /** True when the booking carries a checkout the guest can still use as is. */
 function hasLiveCheckout(c: Consultation): boolean {
   return !!c.transactionId && !!c.checkoutUrl && !isQuoteExpired(c);
@@ -145,7 +157,7 @@ function sendIfProviderError(res: Response, error: unknown): boolean {
 
 export class ConsultationPayLinkController {
   /**
-   * GET /consultations/public/pay-links/:token
+   * POST /consultations/public/pay-links/lookup  `{ token }`
    *
    * 200 `{ ...summary, price: { ...payLinkPrice, locked } }`:
    *  - a checkout opened from the link is still inside its quote lock: the
@@ -158,7 +170,7 @@ export class ConsultationPayLinkController {
    */
   async getPayLink(req: Request, res: Response): Promise<void> {
     try {
-      const { token } = req.params;
+      const token = tokenFrom(req);
       if (!isWellFormedPayLinkToken(token)) {
         sendMalformed(res);
         return;
@@ -192,7 +204,7 @@ export class ConsultationPayLinkController {
   }
 
   /**
-   * POST /consultations/public/pay-links/:token/checkout
+   * POST /consultations/public/pay-links/checkout  `{ token }`
    *
    * Opens a checkout on the link's booking by the SAME rules as
    * `POST /consultations/:id/checkout` (issue #180), with the same shared
@@ -213,7 +225,7 @@ export class ConsultationPayLinkController {
    */
   async checkout(req: Request, res: Response): Promise<void> {
     try {
-      const { token } = req.params;
+      const token = tokenFrom(req);
       if (!isWellFormedPayLinkToken(token)) {
         sendMalformed(res);
         return;

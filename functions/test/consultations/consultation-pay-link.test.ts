@@ -30,7 +30,11 @@
 //  - CONCURRENCY: two checkouts at once give one; two settlements give one
 //    usedAt and one paid booking; two payments on one link (two checkouts)
 //    give one confirmation and the other follows #354's rules;
-//  - the rate limiter and the log redaction.
+//  - NO TOKEN IN A URL THE SERVER SEES (decision 2026-11-21): the email link
+//    carries it in the fragment (`/pay#t=`), both routes are POSTs with the
+//    token in the body (no route has a token in its path), and neither the
+//    request logger nor the error handler logs a body;
+//  - the rate limiter.
 
 import { test, describe, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -56,7 +60,6 @@ import {
   payLinkExpiry,
   payLinkRuntime,
   PayLinkEmail,
-  redactPayLinkPath,
 } from "../../src/services/consultation-pay-link.service";
 import { createPublicRateLimit } from "../../src/middleware/public-rate-limit";
 import { EMAIL_BRANDING } from "../../src/services/email/branding";
@@ -143,17 +146,17 @@ async function verify(reference: string) {
   return out;
 }
 
-/** GET /consultations/public/pay-links/:token. */
-async function getLink(token: string) {
+/** POST /consultations/public/pay-links/lookup `{ token }` (the token in the BODY). */
+async function getLink(token: unknown) {
   const { out, res } = captureRes();
-  await consultationPayLinkController.getPayLink({ params: { token } } as any, res);
+  await consultationPayLinkController.getPayLink({ params: {}, body: { token } } as any, res);
   return out;
 }
 
-/** POST /consultations/public/pay-links/:token/checkout. */
-async function payLinkCheckout(token: string) {
+/** POST /consultations/public/pay-links/checkout `{ token }`. */
+async function payLinkCheckout(token: unknown) {
   const { out, res } = captureRes();
-  await consultationPayLinkController.checkout({ params: { token }, body: {} } as any, res);
+  await consultationPayLinkController.checkout({ params: {}, body: { token } } as any, res);
   return out;
 }
 
@@ -175,10 +178,10 @@ async function lateGuestPayment(opts: { id?: string; fees?: number | undefined; 
   return reference;
 }
 
-/** The raw token of the last pay-again email (from its URL). */
+/** The raw token of the last pay-again email (from its URL fragment `#t=`). */
 function lastToken(): string {
   const url = emails.at(-1)!.url;
-  return url.slice(url.lastIndexOf("/") + 1);
+  return url.slice(url.indexOf("#t=") + 3);
 }
 
 /** Every stored pay link, as [id, data]. */
@@ -214,7 +217,10 @@ describe("minting the link when a guest's late payment is recorded", () => {
     const token = lastToken();
     assert.ok(isWellFormedPayLinkToken(token), "43 base64url chars (32 random bytes)");
     assert.equal(Buffer.from(token, "base64url").length, 32);
-    assert.equal(email.url, `${EMAIL_BRANDING.appUrl.replace(/\/+$/, "")}/a/${SLUG}/pay/${token}`);
+    // The token is in the FRAGMENT (never sent to a server), not the path.
+    assert.equal(email.url, `${EMAIL_BRANDING.appUrl.replace(/\/+$/, "")}/a/${SLUG}/pay#t=${token}`);
+    assert.ok(!new URL(email.url).pathname.includes(token), "not in the path");
+    assert.equal(new URL(email.url).search, "", "not in a query string");
 
     // The refund still runs as #354 built it (in full).
     assert.equal(refundRows().length, 1);
@@ -325,9 +331,10 @@ describe("the pay-again email", () => {
       await lateGuestPayment();
       assert.equal(sent.length, 1);
       const m = sent[0];
-      const token = m.actionUrl.slice(m.actionUrl.lastIndexOf("/") + 1);
+      const token = m.actionUrl.slice(m.actionUrl.indexOf("#t=") + 3);
+      assert.ok(isWellFormedPayLinkToken(token));
       assert.equal(m.to, "delivered+guest1@resend.dev");
-      assert.equal(m.actionUrl, `${EMAIL_BRANDING.appUrl.replace(/\/+$/, "")}/a/${SLUG}/pay/${token}`);
+      assert.equal(m.actionUrl, `${EMAIL_BRANDING.appUrl.replace(/\/+$/, "")}/a/${SLUG}/pay#t=${token}`);
       assert.equal(m.actionLabel, "Pay for the new time");
       assert.deepEqual(m.brandFor, { agencyId: "agency-a" });
       assert.match(m.body, /we're refunding your payment in full\. Your refund is on its way\./);
@@ -660,10 +667,10 @@ describe("dead links", () => {
       },
     });
     try {
-      for (const bad of ["short", "A".repeat(44), "A".repeat(42) + "=", "A".repeat(42) + "/", "A".repeat(42) + ".", ""]) {
+      for (const bad of ["short", "A".repeat(44), "A".repeat(42) + "=", "A".repeat(42) + "/", "A".repeat(42) + ".", "", undefined, null, 43, ["A".repeat(43)], { t: "A".repeat(43) }]) {
         for (const call of [getLink, payLinkCheckout]) {
           const out = await call(bad);
-          assert.equal(out.status, 400, bad);
+          assert.equal(out.status, 400, String(bad));
           assert.equal(out.body.error, "VALIDATION_ERROR");
         }
       }
@@ -755,7 +762,7 @@ describe("concurrency", () => {
 });
 
 // ============================================
-// The rate limit and the log redaction
+// The rate limit, and no token in a path or a log
 // ============================================
 
 describe("protections", () => {
@@ -775,13 +782,50 @@ describe("protections", () => {
     assert.equal(run("1.1.1.1"), 200, "a new window");
   });
 
-  test("the request log never shows a token", () => {
+  test("no route carries a token in its path: the two pay-link routes are POSTs with the token in the body", async () => {
+    const { consultationRoutes } = await import("../../src/routes/consultation.routes");
+    const routes = (consultationRoutes as any).stack
+      .filter((layer: any) => layer.route)
+      .map((layer: any) => ({ path: layer.route.path as string, methods: Object.keys(layer.route.methods) }));
+    const payLink = routes.filter((r: any) => r.path.includes("pay-link"));
+    assert.deepEqual(payLink, [
+      { path: "/public/pay-links/lookup", methods: ["post"] },
+      { path: "/public/pay-links/checkout", methods: ["post"] },
+    ]);
+    // No parameter of ANY route is a token.
+    assert.ok(routes.every((r: any) => !/:token\b/.test(r.path)), JSON.stringify(routes));
+  });
+
+  test("a token in the path or query is never read: only the body counts", async () => {
+    await lateGuestPayment();
+    const token = lastToken();
+    const viaParams = captureRes();
+    await consultationPayLinkController.getPayLink({ params: { token }, query: { token }, body: {} } as any, viaParams.res);
+    assert.equal(viaParams.out.status, 400, "path/query tokens are ignored");
+    assert.equal((await getLink(token)).status, 200, "the body token works");
+  });
+
+  test("the request logger logs method and path only, never the body", async () => {
+    const { app } = await import("../../src/app");
+    const logger = (app as any)._router.stack.find((l: any) => l.handle && l.handle.length === 3 && /console\.log/.test(String(l.handle)));
+    assert.ok(logger, "the request logger");
     const token = "A".repeat(43);
-    assert.equal(redactPayLinkPath(`/consultations/public/pay-links/${token}`), "/consultations/public/pay-links/[token]");
-    assert.equal(
-      redactPayLinkPath(`/consultations/public/pay-links/${token}/checkout`),
-      "/consultations/public/pay-links/[token]/checkout"
-    );
-    assert.equal(redactPayLinkPath("/consultations/public/verify"), "/consultations/public/verify");
+    logs.length = 0;
+    logger.handle({ method: "POST", path: "/consultations/public/pay-links/lookup", body: { token } }, {}, () => undefined);
+    assert.deepEqual(logs, ["POST /consultations/public/pay-links/lookup"]);
+  });
+
+  test("a malformed JSON body is logged without its content", async () => {
+    const { app } = await import("../../src/app");
+    const handler = (app as any)._router.stack.find((l: any) => l.handle && l.handle.length === 4);
+    const token = "A".repeat(43);
+    const err: any = new SyntaxError(`Unexpected token, "{"token":"${token}" is not valid JSON`);
+    err.type = "entity.parse.failed";
+    err.body = `{"token":"${token}"`;
+    const { res } = captureRes();
+    logs.length = 0;
+    handler.handle(err, {}, res, () => undefined);
+    assert.ok(logs.length > 0);
+    assert.ok(!logs.join("\n").includes(token));
   });
 });

@@ -2,7 +2,8 @@
 // A small per-IP rate limit for public, unauthenticated routes (issue #391)
 // ============================================
 //
-// The pay-link routes (`/consultations/public/pay-links/:token`) need no
+// The pay-link routes (`POST /consultations/public/pay-links/lookup` and
+// `/checkout`) need no
 // sign-in. A 256-bit token cannot be guessed, but a caller hammering the
 // routes would still cost Firestore reads (and, on the checkout route, a
 // Paystack lookup). This caps each client IP at a fixed number of requests

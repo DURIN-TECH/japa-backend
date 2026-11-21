@@ -80,9 +80,6 @@ import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
 // Issue #236: entry requirements ("do you need a visa at all") and their admin review data.
 import { entryRequirementsRoutes, adminEntryRuleRoutes } from "./entry-requirements";
 
-// Issue #391: keeps pay-link tokens out of the request log.
-import { redactPayLinkPath } from "./services/consultation-pay-link.service";
-
 // Create Express app
 const app = express();
 
@@ -98,10 +95,9 @@ app.use("/webhooks", webhooksRouter);
 app.use("/webhooks", verificationWebhookRoutes);
 app.use(express.json());
 
-// Request logging. Issue #391: a guest pay-link token in the path is
-// replaced by "[token]", so a raw token never reaches the logs.
+// Request logging
 app.use((req: Request, res: Response, next: NextFunction) => {
-  console.log(`${req.method} ${redactPayLinkPath(req.path)}`);
+  console.log(`${req.method} ${req.path}`);
   next();
 });
 
@@ -211,7 +207,15 @@ app.use("/admin/users", adminUsersRouter);
 
 // Error handling
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-  console.error("Unhandled error:", err);
+  // Issue #391: a body that is not valid JSON reaches here from
+  // express.json(). Its error carries the raw body (`err.body`) and V8's
+  // message quotes part of it, which could be a guest's pay-link token: log
+  // only that it happened, never the body.
+  if ((err as { type?: string }).type === "entity.parse.failed") {
+    console.error("Unhandled error: request body is not valid JSON (body not logged)");
+  } else {
+    console.error("Unhandled error:", err);
+  }
   res.status(500).json({
     success: false,
     error: "INTERNAL_ERROR",

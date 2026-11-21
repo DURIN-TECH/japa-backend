@@ -92,7 +92,7 @@ async function linksOf(id: string): Promise<any[]> {
 /** The raw token of the last pay-again email. */
 function lastToken(): string {
   const url = emails.at(-1)!.url;
-  return url.slice(url.lastIndexOf("/") + 1);
+  return url.slice(url.indexOf("#t=") + 3);
 }
 
 before(async () => {
@@ -178,65 +178,90 @@ describe("guest pay-again links under concurrency (#391)", () => {
     assert.equal(links.length, 1, "one link");
     assert.equal(emails.length, 1, "one email");
     const token = lastToken();
-    assert.ok(!JSON.stringify(links).includes(token), "only the hash is stored");
+    assert.ok(emails[0].url.includes(`/a/${SLUG}/pay#t=`), "the token rides in the URL fragment");
+    // From here on, every log line is captured (the request logger included).
+    const lines: string[] = [];
+    const realLog = console.log;
+    const realErr = console.error;
+    const realWarn = console.warn;
+    const grab = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    console.log = grab;
+    console.error = grab;
+    console.warn = grab;
+    try {
+      assert.ok(!JSON.stringify(links).includes(token), "only the hash is stored");
 
-    // ---- The token is not a sign-in token anywhere ----
-    const asBearer = await api.call("GET", "/consultations/pl1", token);
-    assert.equal(asBearer.status, 401, "refused by an authenticated route");
+      // ---- The token is not a sign-in token anywhere ----
+      const asBearer = await api.call("GET", "/consultations/pl1", token);
+      assert.equal(asBearer.status, 401, "refused by an authenticated route");
 
-    // ---- GET over HTTP ----
-    const got = await api.call("GET", `/consultations/public/pay-links/${token}`);
-    assert.equal(got.status, 200, JSON.stringify(got.body));
-    assert.equal(got.body.data.agencyName, "Emu Sunrise");
-    assert.equal(got.body.data.scheduledTime, "12:00");
+      // ---- GET over HTTP ----
+      const got = await api.call("POST", "/consultations/public/pay-links/lookup", undefined, { token });
+      assert.equal(got.status, 200, JSON.stringify(got.body));
+      assert.equal(got.body.data.agencyName, "Emu Sunrise");
+      assert.equal(got.body.data.scheduledTime, "12:00");
 
-    // ---- Two checkouts at once: one Paystack checkout ----
-    const before = charges.length;
-    const [a, b] = await Promise.all([
-      api.call("POST", `/consultations/public/pay-links/${token}/checkout`),
-      api.call("POST", `/consultations/public/pay-links/${token}/checkout`),
-    ]);
-    assert.equal(a.status, 200, JSON.stringify(a.body));
-    assert.equal(b.status, 200, JSON.stringify(b.body));
-    assert.equal(charges.length - before, 1, "one checkout");
-    assert.equal(a.body.data.authorizationUrl, b.body.data.authorizationUrl);
+      // ---- Two checkouts at once: one Paystack checkout ----
+      const before = charges.length;
+      const [a, b] = await Promise.all([
+        api.call("POST", "/consultations/public/pay-links/checkout", undefined, { token }),
+        api.call("POST", "/consultations/public/pay-links/checkout", undefined, { token }),
+      ]);
+      assert.equal(a.status, 200, JSON.stringify(a.body));
+      assert.equal(b.status, 200, JSON.stringify(b.body));
+      assert.equal(charges.length - before, 1, "one checkout");
+      assert.equal(a.body.data.authorizationUrl, b.body.data.authorizationUrl);
 
-    // ---- The guest pays it; it settles from four places at once ----
-    const newRef = charges.at(-1)!;
-    reports.set(newRef, {
-      status: "success", metadata: { purpose: "consultation", consultationId: "pl1", agencySlug: SLUG },
-      amount: a.body.data.chargedAmountMinor, currency: a.body.data.chargedCurrency, paidAt: clock.now().toISOString(), fees: 15_000,
-    });
-    const outcomes = await Promise.all([
-      api.call("POST", "/consultations/public/verify", undefined, { reference: newRef }),
-      api.call("POST", "/consultations/public/verify", undefined, { reference: newRef }),
-      settlePayment("pl1", newRef, reports.get(newRef)),
-      settlePayment("pl1", newRef, reports.get(newRef)),
-    ]);
-    const kinds = (outcomes.slice(2) as any[]).map((o) => o.kind);
-    assert.ok(kinds.every((k) => k === "confirmed" || k === "already_paid"));
-    const { collections } = await import("../../src/utils/firebase");
-    const booking = (await collections.consultations.doc("pl1").get()).data()!;
-    assert.equal(booking.paymentStatus, "paid");
-    const fees = (await collections.transactions.where("consultationId", "==", "pl1").get()).docs
-      .map((d) => d.data())
-      .filter((t) => t.type === "consultation_fee");
-    assert.equal(fees.length, 1, "one confirmation");
-    links = await linksOf("pl1");
-    assert.ok(links[0].usedAt, "used");
-    assert.equal(links[0].usedByReference, newRef);
+      // ---- The guest pays it; it settles from four places at once ----
+      const newRef = charges.at(-1)!;
+      reports.set(newRef, {
+        status: "success", metadata: { purpose: "consultation", consultationId: "pl1", agencySlug: SLUG },
+        amount: a.body.data.chargedAmountMinor, currency: a.body.data.chargedCurrency, paidAt: clock.now().toISOString(), fees: 15_000,
+      });
+      const outcomes = await Promise.all([
+        api.call("POST", "/consultations/public/verify", undefined, { reference: newRef }),
+        api.call("POST", "/consultations/public/verify", undefined, { reference: newRef }),
+        settlePayment("pl1", newRef, reports.get(newRef)),
+        settlePayment("pl1", newRef, reports.get(newRef)),
+      ]);
+      const kinds = (outcomes.slice(2) as any[]).map((o) => o.kind);
+      assert.ok(kinds.every((k) => k === "confirmed" || k === "already_paid"));
+      const { collections } = await import("../../src/utils/firebase");
+      const booking = (await collections.consultations.doc("pl1").get()).data()!;
+      assert.equal(booking.paymentStatus, "paid");
+      const fees = (await collections.transactions.where("consultationId", "==", "pl1").get()).docs
+        .map((d) => d.data())
+        .filter((t) => t.type === "consultation_fee");
+      assert.equal(fees.length, 1, "one confirmation");
+      links = await linksOf("pl1");
+      assert.ok(links[0].usedAt, "used");
+      assert.equal(links[0].usedByReference, newRef);
 
-    // ---- Dead now: the same 410 on both routes ----
-    const dead = await api.call("GET", `/consultations/public/pay-links/${token}`);
-    const deadPost = await api.call("POST", `/consultations/public/pay-links/${token}/checkout`);
-    const unknown = await api.call("GET", `/consultations/public/pay-links/${"B".repeat(43)}`);
-    for (const r of [dead, deadPost, unknown]) {
-      assert.equal(r.status, 410);
-      assert.deepEqual(r.body, dead.body);
+      // ---- Dead now: the same 410 on both routes ----
+      const dead = await api.call("POST", "/consultations/public/pay-links/lookup", undefined, { token });
+      const deadPost = await api.call("POST", "/consultations/public/pay-links/checkout", undefined, { token });
+      const unknown = await api.call("POST", "/consultations/public/pay-links/lookup", undefined, { token: "B".repeat(43) });
+      for (const r of [dead, deadPost, unknown]) {
+        assert.equal(r.status, 410);
+        assert.deepEqual(r.body, dead.body);
+      }
+      assert.equal(dead.body.error, "PAY_LINK_INVALID");
+      const malformed = await api.call("POST", "/consultations/public/pay-links/lookup", undefined, { token: "nope" });
+      assert.equal(malformed.status, 400);
+      // The old path shapes no longer exist.
+      const oldPath = await api.call("GET", `/consultations/public/pay-links/${token}`);
+      assert.equal(oldPath.status, 404);
+    } finally {
+      console.log = realLog;
+      console.error = realErr;
+      console.warn = realWarn;
     }
-    assert.equal(dead.body.error, "PAY_LINK_INVALID");
-    const malformed = await api.call("GET", "/consultations/public/pay-links/nope");
-    assert.equal(malformed.status, 400);
+    assert.ok(lines.some((l) => l.includes("POST /consultations/public/pay-links/lookup")), "the request logger ran");
+    // The 404 above logged its own path (it was a test of the old shape); every other line is token-free.
+    const others = lines.filter((l) => !l.startsWith("GET /consultations/public/pay-links/"));
+    assert.ok(!others.join("\n").includes(token), "no token in any log line");
   });
 
   test("three mints at once leave exactly one live link", async () => {
@@ -250,7 +275,7 @@ describe("guest pay-again links under concurrency (#391)", () => {
     assert.equal(links.length, 3);
     assert.equal(links.filter((l) => !l.usedAt && !l.supersededAt).length, 1, "one live link");
     // Only the live one answers 200.
-    const answers = await Promise.all(minted.map((m) => api.call("GET", `/consultations/public/pay-links/${m!.token}`)));
+    const answers = await Promise.all(minted.map((m) => api.call("POST", "/consultations/public/pay-links/lookup", undefined, { token: m!.token })));
     assert.deepEqual(answers.map((r) => r.status).sort(), [200, 410, 410]);
   });
 });

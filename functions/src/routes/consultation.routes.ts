@@ -17,13 +17,15 @@ router.post("/public/verify", (req, res) =>
 
 // Issue #391: PUBLIC — no auth. A guest's one-time pay-again link (emailed
 // after a refund caused by a reschedule): read that ONE booking's summary
-// and today's price, and open a checkout on it. Defined before "/:id" (both
-// are multi-segment "/public/..." paths, so "/:id" could never match them
-// anyway). Rate-limited per IP; the token never signs anyone in.
-router.get("/public/pay-links/:token", payLinkRateLimit, (req, res) =>
+// and today's price (`lookup`), and open a checkout on it (`checkout`). The
+// token is in the JSON BODY (`{ token }`), never in the path or query
+// (decision 2026-11-21: a path lands in Cloud Run request logs). Defined
+// before "/:id" (multi-segment "/public/..." paths, so "/:id" could never
+// match them anyway). Rate-limited per IP; the token never signs anyone in.
+router.post("/public/pay-links/lookup", payLinkRateLimit, (req, res) =>
   consultationPayLinkController.getPayLink(req, res)
 );
-router.post("/public/pay-links/:token/checkout", payLinkRateLimit, (req, res) =>
+router.post("/public/pay-links/checkout", payLinkRateLimit, (req, res) =>
   consultationPayLinkController.checkout(req, res)
 );
 

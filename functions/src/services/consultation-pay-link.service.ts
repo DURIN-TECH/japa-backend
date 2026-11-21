@@ -29,6 +29,11 @@
 //    refund itself is held for an admin (Paystack's fee unknown). Later, when
 //    a held refund starts (admin retry or a re-settle), a new link is minted
 //    only if the booking has no live one any more.
+//  - NEVER IN A URL THE SERVER SEES (decision 2026-11-21): the email links
+//    to `/a/<slug>/pay#t=<token>` (a fragment), and the API takes the token
+//    in a POST body (`/consultations/public/pay-links/lookup` and
+//    `/checkout`), so it is in no Cloud Run or hosting request log. The
+//    request logger (app.ts) logs only method + path, never a body.
 //  - DEAD LINKS: unknown, expired, used, superseded, or a booking that is no
 //    longer `pending_payment` all answer ONE identical 410
 //    `PAY_LINK_INVALID`. The answer never says which, and nothing is written.
@@ -75,9 +80,6 @@ export const PAY_LINK_INVALID = "PAY_LINK_INVALID";
 
 /** The one message every dead link answers with (issue #391 copy). */
 export const PAY_LINK_INVALID_MESSAGE = "This payment link is no longer valid. Please contact the agency.";
-
-/** The path prefix of the public pay-link routes (used to redact request logs). */
-export const PAY_LINK_ROUTE_PREFIX = "/consultations/public/pay-links/";
 
 // ============================================
 // 2. Swappable dependencies (tests inject in-memory ones)
@@ -126,19 +128,6 @@ function sameHash(a: string, b: string): boolean {
 /** A fresh raw token (32 random bytes, base64url, no padding). */
 function newToken(): string {
   return payLinkRuntime.randomBytes(PAY_LINK_TOKEN_BYTES).toString("base64url");
-}
-
-/**
- * Replace a raw token in a request path with a placeholder, so the request
- * logger (app.ts) never writes one to the logs. Pure.
- */
-export function redactPayLinkPath(path: string): string {
-  const at = path.indexOf(PAY_LINK_ROUTE_PREFIX);
-  if (at === -1) return path;
-  const start = at + PAY_LINK_ROUTE_PREFIX.length;
-  const rest = path.slice(start);
-  const slash = rest.indexOf("/");
-  return path.slice(0, start) + "[token]" + (slash === -1 ? "" : rest.slice(slash));
 }
 
 // ============================================
@@ -283,10 +272,16 @@ export interface PayLinkEmail {
   expiresText: string;
 }
 
-/** The portal page a link opens: `<APP_URL>/a/<slug>/pay/<token>` (APP_URL per project). */
+/**
+ * The portal page a link opens: `<APP_URL>/a/<slug>/pay#t=<token>` (APP_URL
+ * per project). Orchestrator decision 2026-11-21: the token rides in the URL
+ * FRAGMENT, which browsers never send to a server, so it cannot land in the
+ * portal's hosting logs; the page reads it and POSTs it in a request body
+ * (never in a path or query string, so not in Cloud Run request logs either).
+ */
 export function payLinkUrl(slug: string, token: string): string {
   const base = EMAIL_BRANDING.appUrl.replace(/\/+$/, "");
-  return `${base}/a/${encodeURIComponent(slug)}/pay/${token}`;
+  return `${base}/a/${encodeURIComponent(slug)}/pay#t=${token}`;
 }
 
 /**
