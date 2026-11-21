@@ -106,5 +106,10 @@ export function findBannedWording(text: string): boolean {
 /**
  * Version of the prompts in this module and the engine. Recorded on every assessment.
  * (#384) Bumped for the new narrative prompt (buildNarrativeRequest).
+ * (#418) Bumped for the caseworker read (general fields and the document kind
+ * in the extraction call), the document list in the judgement and narrative
+ * prompts, and their new rules. NOTE: the per-upload document check (#115)
+ * records this same version, so its stored checks carry the new one too,
+ * although the request it sends is unchanged.
  */
-export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-16.1";
+export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-21.1";

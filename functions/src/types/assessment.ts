@@ -283,6 +283,85 @@ export interface BlockingRule {
   sourceUrl: string;
 }
 
+// ============================================
+// (#418) What the review read in each upload
+// ============================================
+
+/**
+ * (#418) The kinds of document the extraction call may say an upload is,
+ * read by the model from the document's CONTENT (never from its label or
+ * file name). A fixed list, so the schema can carry it as an `enum` and the
+ * parser can reject anything else. `other` is the catch-all. Kept generic: no
+ * kind names a country, a route or a nationality.
+ *
+ * Used by: the extraction schema and parser (assessment-engine.ts), the
+ * document list the judgement and narrative calls are given, the narrative's
+ * "a read document is never said to be missing" check, and the stored
+ * `documentsRead` record below.
+ */
+export const DOCUMENT_KINDS = [
+  "passport", //               a passport or travel document
+  "identity_card", //          a national identity card or residence card
+  "bank_statement", //         a bank or account statement
+  "payslip", //                a payslip or salary slip
+  "employment_letter", //      a letter from an employer, or an employment contract
+  "tenancy_agreement", //      a tenancy, lease or rental agreement
+  "property_document", //      a title deed or other proof of owning property
+  "sponsor_letter", //         a letter from someone paying for or supporting the applicant
+  "invitation_letter", //      a letter inviting the applicant
+  "study_acceptance", //       an offer, acceptance or confirmation of a place on a course
+  "academic_record", //        a transcript, certificate or award letter
+  "tax_document", //           a tax return, tax certificate or tax clearance
+  "business_document", //      a business registration or company document
+  "relationship_document", //  a birth, marriage or other civil-status certificate
+  "travel_booking", //         a flight, hotel or travel booking
+  "insurance", //              an insurance policy or certificate
+  "utility_bill", //           a utility bill
+  "photo", //                  a photograph of the applicant
+  "other", //                  anything else
+] as const;
+export type DocumentKind = (typeof DOCUMENT_KINDS)[number];
+
+/**
+ * (#418) Why an upload was NOT read, in plain fixed words. Code-written,
+ * never model text and never internal wording ("the answer broke the
+ * contract"): the judgement and narrative calls are given these, and the
+ * narrative may repeat them to the applicant.
+ */
+export const DOCUMENT_UNREAD_REASONS = {
+  // The file could not be downloaded, the model said it could not read it,
+  // the call failed or the answer broke the output contract.
+  unreadable: "could not be opened or read",
+  // An encrypted PDF (never sent to a model).
+  passwordProtected: "password protected",
+  // Not a PDF, JPEG or PNG by its bytes (never sent to a model).
+  unsupportedType: "file type not supported",
+  // Over the per-file size limit (never sent to a model).
+  tooLarge: "too large",
+  // Flagged suspicious: it addressed the reader instead of stating facts, so
+  // nothing in it is used.
+  unusable: "could not be used",
+} as const;
+export type DocumentUnreadReason = (typeof DOCUMENT_UNREAD_REASONS)[keyof typeof DOCUMENT_UNREAD_REASONS];
+
+/**
+ * (#418) One upload as the review saw it, stored on the assessment for STAFF
+ * (`ApplicationAssessment.documentsRead`). Deliberately holds NO read value
+ * (no balance, no salary, no name): only whether it was read, what kind it
+ * is, why not when it was not, and how many values were kept.
+ */
+export interface DocumentReadRecord {
+  documentId: string;
+  // The kind the model read from the content; null when unread (or not given).
+  documentKind: DocumentKind | null;
+  // True only when the upload was read cleanly (readable, not failed, not suspicious).
+  readable: boolean;
+  // The fixed reason when not read; null when read.
+  reason: DocumentUnreadReason | null;
+  // How many read values were kept for this upload (after the per-document cap).
+  valueCount: number;
+}
+
 /** Usage of one stage, as the API reported it. */
 export interface AssessmentUsage {
   requests: number;
@@ -374,6 +453,11 @@ export interface ApplicationAssessment {
   // objective checks could not be made (the rulebook names no document for
   // them, an upload is unread, or a field could not be read): no call is made.
   internalCall: "would_approve" | "would_refuse" | null;
+  // (#418) Staff only: one entry per upload the interactive review looked at
+  // (see DocumentReadRecord). No read values are stored here. Stripped from
+  // every client-role response (tier-serializer.ts); absent on the bar and
+  // nothing-to-read paths, on the bulk path and on documents stored before #418.
+  documentsRead?: DocumentReadRecord[];
 
   // (#384) `narrative`: the model that wrote the narrative, when the call was
   // made (absent on documents without a narrative call).
